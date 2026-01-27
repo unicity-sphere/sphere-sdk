@@ -21,10 +21,9 @@ new Sphere(config?: SphereConfig)
 | Property | Type | Description |
 |----------|------|-------------|
 | `identity` | `FullIdentity` | Current wallet identity (after load) |
-| `wallet` | `WalletManager` | Wallet operations |
-| `payments` | `PaymentsModule` | L3 token operations |
-| `l1` | `L1PaymentsModule` | L1 ALPHA operations |
-| `comms` | `CommunicationsModule` | Messaging operations |
+| `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
+| `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
+| `communications` | `CommunicationsModule` | Messaging operations |
 
 ### Methods
 
@@ -347,6 +346,39 @@ Clear all completed, rejected, or expired outgoing requests.
 
 ## L1PaymentsModule
 
+L1 (ALPHA blockchain) payments are accessed via `sphere.payments.l1`.
+
+### Configuration
+
+L1 is configured through `Sphere.init()`, `Sphere.create()`, or `Sphere.load()`:
+
+```typescript
+const sphere = await Sphere.init({
+  storage, transport, oracle,
+  l1: {
+    electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
+    defaultFeeRate: 10,    // sat/byte, default
+    enableVesting: true,   // classify coins as vested/unvested, default
+  },
+});
+
+// Access L1 via payments module
+const balance = await sphere.payments.l1.getBalance();
+```
+
+### L1Config
+
+```typescript
+interface L1Config {
+  /** Fulcrum WebSocket URL (default: wss://fulcrum.alpha.unicity.network:50004) */
+  electrumUrl?: string;
+  /** Default fee rate in sat/byte (default: 10) */
+  defaultFeeRate?: number;
+  /** Enable vesting classification (default: true) */
+  enableVesting?: boolean;
+}
+```
+
 ### Methods
 
 #### `getBalance(): Promise<L1Balance>`
@@ -440,15 +472,21 @@ interface DirectMessage {
 
 ### FullIdentity
 
+**Single Identity Model**: L1 and L3 share the same secp256k1 key pair. The same `privateKey`/`publicKey` is used for:
+- L1 blockchain transactions (via `address`)
+- L3 token ownership and transfers (via `publicKey`)
+- Nostr P2P messaging (same key, different encoding)
+
 ```typescript
-interface FullIdentity {
-  address: string;           // L1 address
-  publicKey: string;         // secp256k1 public key (hex)
+interface Identity {
+  publicKey: string;         // secp256k1 compressed public key (hex)
+  address: string;           // L1 bech32 address = alpha1... (hash160 of publicKey)
+  ipnsName?: string;         // IPNS identifier for storage
+  nametag?: string;          // Registered @name alias
+}
+
+interface FullIdentity extends Identity {
   privateKey: string;        // secp256k1 private key (hex)
-  nostrPublicKey: string;    // Nostr npub
-  nostrPrivateKey: string;   // Nostr nsec
-  nametag?: string;          // Registered @name
-  ipnsName?: string;         // IPNS identifier
 }
 ```
 
@@ -538,6 +576,7 @@ createUnicityAggregatorProvider(config?: UnicityAggregatorProviderConfig): Unici
 
 // Payments
 createPaymentsModule(config?: PaymentsModuleConfig): PaymentsModule
+// PaymentsModuleConfig includes optional l1?: L1PaymentsModuleConfig
 createL1PaymentsModule(config?: L1PaymentsModuleConfig): L1PaymentsModule
 
 // Communications

@@ -5,8 +5,8 @@
  *
  * @example
  * ```ts
- * import { Sphere } from '@/sdk2';
- * import { createLocalStorageProvider, createNostrTransportProvider, createUnicityAggregatorProvider } from '@/sdk2/impl/browser';
+ * import { Sphere } from '@unicitylabs/sphere-sdk';
+ * import { createLocalStorageProvider, createNostrTransportProvider, createUnicityAggregatorProvider } from '@unicitylabs/sphere-sdk/impl/browser';
  *
  * const storage = createLocalStorageProvider();
  * const transport = createNostrTransportProvider();
@@ -108,6 +108,8 @@ export interface SphereCreateOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /** L1 (ALPHA blockchain) configuration */
+  l1?: L1Config;
 }
 
 /** Options for loading existing wallet */
@@ -120,6 +122,8 @@ export interface SphereLoadOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /** L1 (ALPHA blockchain) configuration */
+  l1?: L1Config;
 }
 
 /** Options for importing a wallet */
@@ -146,6 +150,18 @@ export interface SphereImportOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
+  /** L1 (ALPHA blockchain) configuration */
+  l1?: L1Config;
+}
+
+/** L1 (ALPHA blockchain) configuration */
+export interface L1Config {
+  /** Fulcrum WebSocket URL (default: wss://fulcrum.alpha.unicity.network:50004) */
+  electrumUrl?: string;
+  /** Default fee rate in sat/byte (default: 10) */
+  defaultFeeRate?: number;
+  /** Enable vesting classification (default: true) */
+  enableVesting?: boolean;
 }
 
 /** Options for unified init (auto-create or load) */
@@ -166,6 +182,8 @@ export interface SphereInitOptions {
   derivationPath?: string;
   /** Optional nametag to register (only on create) */
   nametag?: string;
+  /** L1 (ALPHA blockchain) configuration */
+  l1?: L1Config;
 }
 
 /** Result of init operation */
@@ -225,14 +243,15 @@ export class Sphere {
     storage: StorageProvider,
     transport: TransportProvider,
     oracle: OracleProvider,
-    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>
+    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
+    l1Config?: L1Config
   ) {
     this._storage = storage;
     this._tokenStorage = tokenStorage;
     this._transport = transport;
     this._oracle = oracle;
 
-    this._payments = createPaymentsModule();
+    this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule();
   }
 
@@ -345,7 +364,8 @@ export class Sphere {
       options.storage,
       options.transport,
       options.oracle,
-      options.tokenStorage
+      options.tokenStorage,
+      options.l1
     );
 
     // Store encrypted mnemonic
@@ -382,7 +402,8 @@ export class Sphere {
       options.storage,
       options.transport,
       options.oracle,
-      options.tokenStorage
+      options.tokenStorage,
+      options.l1
     );
 
     // Load identity from storage
@@ -413,7 +434,8 @@ export class Sphere {
       options.storage,
       options.transport,
       options.oracle,
-      options.tokenStorage
+      options.tokenStorage,
+      options.l1
     );
 
     if (options.mnemonic) {
@@ -1669,6 +1691,8 @@ export class Sphere {
       transport: this._transport,
       oracle: this._oracle,
       emitEvent,
+      // Pass chain code for L1 HD derivation
+      chainCode: this._masterKey?.chainCode,
     });
 
     this._communications.initialize({

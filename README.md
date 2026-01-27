@@ -98,6 +98,50 @@ sphere.payments.onPaymentRequest((request) => {
 });
 ```
 
+## L1 (ALPHA Blockchain) Operations
+
+Access L1 payments through `sphere.payments.l1`:
+
+```typescript
+// L1 configuration is optional (has defaults)
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  l1: {
+    electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
+    defaultFeeRate: 10,  // sat/byte, default
+    enableVesting: true, // default
+  },
+});
+
+// Get L1 balance
+const balance = await sphere.payments.l1.getBalance();
+console.log('L1 Balance:', balance.total);
+console.log('Vested:', balance.vested);
+console.log('Unvested:', balance.unvested);
+
+// Get UTXOs
+const utxos = await sphere.payments.l1.getUtxos();
+console.log('UTXOs:', utxos.length);
+
+// Send L1 transaction
+const result = await sphere.payments.l1.send({
+  to: 'alpha1qxyz...',
+  amount: '100000',  // in satoshis
+  feeRate: 5,        // optional, sat/byte
+});
+
+if (result.success) {
+  console.log('TX Hash:', result.txHash);
+}
+
+// Get transaction history
+const history = await sphere.payments.l1.getHistory(10);
+
+// Estimate fee
+const { fee, feeRate } = await sphere.payments.l1.estimateFee('alpha1...', '50000');
+```
+
 ## Alternative: Manual Create/Load
 
 ```typescript
@@ -313,11 +357,30 @@ const { spentTokens, errors } = await validator.checkSpentTokens(tokens, publicK
 
 ## Architecture
 
+**Single Identity Model**: L1 and L3 share the same secp256k1 key pair. One mnemonic = one wallet for both layers.
+
+```
+mnemonic → master key → BIP32 derivation → identity
+                                              ↓
+                        ┌─────────────────────┴─────────────────────┐
+                        │              shared keys                  │
+                        │  privateKey: "abc..."  (hex secp256k1)    │
+                        │  publicKey:  "02def..." (compressed)      │
+                        │  address:    "alpha1..." (bech32)         │
+                        └─────────────────────┬─────────────────────┘
+                                              ↓
+              ┌───────────────────────────────┼───────────────────────────────┐
+              ↓                               ↓                               ↓
+         L1 (ALPHA)                     L3 (Unicity)                      Nostr
+     sphere.payments.l1              sphere.payments               sphere.communications
+      UTXOs, blockchain              Tokens, aggregator              P2P messaging
+```
+
 ```
 Sphere (main entry point)
 ├── identity    - Wallet identity (address, publicKey, nametag)
 ├── payments    - L3 token operations
-├── l1          - L1 ALPHA transactions (coming soon)
+│   └── l1      - L1 ALPHA transactions (via sphere.payments.l1)
 └── communications - Direct messages & broadcasts
 
 Providers (injectable dependencies)

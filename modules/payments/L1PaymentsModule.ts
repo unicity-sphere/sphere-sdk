@@ -1,45 +1,33 @@
 /**
  * L1 Payments Sub-Module
- * Handles Layer 1 (ALPHA blockchain) transactions
  *
- * Integrates with existing L1 SDK:
- * - network.ts: getBalance, getUtxo, broadcast, getTransactionHistory
- * - tx.ts: sendAlpha, createTransactionPlan
+ * Handles Layer 1 (ALPHA blockchain) transactions including:
+ * - Balance queries
+ * - UTXO management
+ * - Transaction sending
+ * - Vesting classification
+ * - Transaction history
  */
 
 import type { FullIdentity } from '../../types';
-
-// Import from existing L1 SDK
 import {
+  connect as l1Connect,
+  disconnect as l1Disconnect,
+  isWebSocketConnected,
   getUtxo,
   getBalance as l1GetBalance,
   getTransactionHistory,
   getTransaction as l1GetTransaction,
   getCurrentBlockHeight,
-  connect as l1Connect,
-  isWebSocketConnected,
+  sendAlpha as l1SendAlpha,
+  createTransactionPlan as l1CreateTransactionPlan,
+  vestingClassifier,
+  VESTING_THRESHOLD,
+  type UTXO,
+  type Wallet,
   type TransactionHistoryItem,
   type TransactionDetail,
-} from '../../../components/wallet/L1/sdk/network';
-import {
-  sendAlpha,
-  createTransactionPlan,
-} from '../../../components/wallet/L1/sdk/tx';
-import type {
-  Wallet as L1Wallet,
-  UTXO,
-  Transaction as L1TxPlanItem,
-} from '../../../components/wallet/L1/sdk/types';
-
-// Import vesting classifier
-import {
-  VestingClassifier,
-  VESTING_THRESHOLD,
-  type ClassifiedUTXO,
-  InMemoryCacheProvider,
-} from '../../../components/wallet/sdk/transaction/vesting';
-// VestingClassifier only uses getTransaction and getCurrentBlockHeight
-// We create a minimal adapter that satisfies those methods
+} from '../../l1';
 
 // =============================================================================
 // Types
@@ -88,7 +76,6 @@ export interface L1Transaction {
   type: 'send' | 'receive';
   amount: string;
   fee?: string;
-  /** Counterparty address (recipient for send, sender for receive) */
   address: string;
   confirmations: number;
   timestamp: number;
@@ -116,490 +103,399 @@ export interface L1PaymentsModuleConfig {
 
 export interface L1PaymentsModuleDependencies {
   identity: FullIdentity;
-  /** Chain code for BIP32 derivation (optional) */
   chainCode?: string;
-  /** Additional addresses to track */
   addresses?: string[];
-}
-
-// =============================================================================
-// Network Provider Adapter
-// =============================================================================
-
-/**
- * Minimal network provider interface for VestingClassifier
- * Only includes the methods actually used by the classifier
- */
-interface VestingNetworkProvider {
-  getTransaction(txid: string): Promise<TransactionDetail>;
-  getCurrentBlockHeight(): Promise<number>;
-}
-
-/**
- * Adapts existing L1 SDK network functions for VestingClassifier
- */
-function createNetworkProviderAdapter(): VestingNetworkProvider {
-  return {
-    async getTransaction(txid: string): Promise<TransactionDetail> {
-      const tx = await l1GetTransaction(txid);
-      if (!tx) {
-        throw new Error(`Transaction not found: ${txid}`);
-      }
-      return tx as TransactionDetail;
-    },
-    async getCurrentBlockHeight(): Promise<number> {
-      return getCurrentBlockHeight();
-    },
-  };
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-/**
- * Convert SDK2 FullIdentity to L1 Wallet format
- * Creates a minimal wallet structure compatible with L1 SDK
- */
-function identityToL1Wallet(identity: FullIdentity): L1Wallet {
-  return {
-    masterPrivateKey: identity.privateKey,
-    addresses: [
-      {
-        address: identity.address,
-        publicKey: identity.publicKey,
-        privateKey: identity.privateKey,
-        path: "m/84'/0'/0'/0/0",
-        index: 0,
-      },
-    ],
-    isBIP32: true,
-  };
-}
-
-/**
- * Extract addresses from transaction outputs
- */
-function getOutputAddresses(vout: TransactionDetail['vout']): string[] {
-  const addresses: string[] = [];
-  for (const output of vout) {
-    if (output.scriptPubKey.address) {
-      addresses.push(output.scriptPubKey.address);
-    } else if (output.scriptPubKey.addresses?.length) {
-      addresses.push(...output.scriptPubKey.addresses);
-    }
-  }
-  return addresses;
-}
-
-/**
- * Calculate amount received by address from transaction outputs
- */
-function calculateReceivedAmount(
-  vout: TransactionDetail['vout'],
-  address: string
-): number {
-  let amount = 0;
-  for (const output of vout) {
-    const outputAddresses = output.scriptPubKey.address
-      ? [output.scriptPubKey.address]
-      : output.scriptPubKey.addresses ?? [];
-    if (outputAddresses.includes(address)) {
-      amount += output.value;
-    }
-  }
-  return amount;
 }
 
 // =============================================================================
 // Implementation
 // =============================================================================
 
+/**
+ * L1 Payments Module - Full Implementation
+ *
+ * Handles all L1 (ALPHA blockchain) operations including balance queries,
+ * transaction sending, UTXO management, and vesting classification.
+ */
 export class L1PaymentsModule {
-  private config: Required<L1PaymentsModuleConfig>;
-  private deps: L1PaymentsModuleDependencies | null = null;
-  private vestingClassifier: VestingClassifier | null = null;
-  private addressSet: Set<string> = new Set();
+  private _initialized = false;
+  private _config: L1PaymentsModuleConfig;
+  private _identity?: FullIdentity;
+  private _chainCode?: string;
+  private _addresses: string[] = [];
+  private _wallet?: Wallet;
 
   constructor(config?: L1PaymentsModuleConfig) {
-    this.config = {
-      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.unicity.network:50004',
+    this._config = {
+      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.alpha.unicity.network:50004',
       network: config?.network ?? 'mainnet',
       defaultFeeRate: config?.defaultFeeRate ?? 10,
       enableVesting: config?.enableVesting ?? true,
     };
   }
 
-  // ===========================================================================
-  // Lifecycle
-  // ===========================================================================
-
   async initialize(deps: L1PaymentsModuleDependencies): Promise<void> {
-    this.deps = deps;
+    this._identity = deps.identity;
+    this._chainCode = deps.chainCode;
+    this._addresses = deps.addresses ?? [];
 
-    // Build address set for transaction analysis
-    this.addressSet.clear();
-    this.addressSet.add(deps.identity.address);
-    if (deps.addresses) {
-      for (const addr of deps.addresses) {
-        this.addressSet.add(addr);
+    // Build wallet object for L1 SDK functions
+    this._wallet = {
+      masterPrivateKey: deps.identity.privateKey,
+      chainCode: deps.chainCode,
+      addresses: [
+        {
+          address: deps.identity.address,
+          publicKey: deps.identity.publicKey,
+          privateKey: deps.identity.privateKey,
+          path: 'm/0',
+          index: 0,
+        },
+      ],
+    };
+
+    // Add additional addresses
+    for (const addr of this._addresses) {
+      if (addr !== deps.identity.address) {
+        this._wallet.addresses.push({
+          address: addr,
+          path: null,
+          index: this._wallet.addresses.length,
+        });
       }
     }
 
-    // Initialize vesting classifier if enabled
-    if (this.config.enableVesting) {
-      // VestingClassifier only uses getTransaction and getCurrentBlockHeight internally
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const networkAdapter = createNetworkProviderAdapter() as any;
-      const cacheProvider = new InMemoryCacheProvider();
-      this.vestingClassifier = new VestingClassifier(networkAdapter, cacheProvider);
-      await this.vestingClassifier.init();
+    // Connect to Fulcrum WebSocket
+    if (this._config.electrumUrl) {
+      await l1Connect(this._config.electrumUrl);
     }
+
+    this._initialized = true;
   }
 
   destroy(): void {
-    this.deps = null;
-    this.vestingClassifier = null;
-    this.addressSet.clear();
-  }
-
-  // ===========================================================================
-  // Network Connection
-  // ===========================================================================
-
-  private async ensureConnected(): Promise<void> {
-    if (!isWebSocketConnected()) {
-      await l1Connect(this.config.electrumUrl);
+    if (isWebSocketConnected()) {
+      l1Disconnect();
     }
+    this._initialized = false;
+    this._identity = undefined;
+    this._chainCode = undefined;
+    this._addresses = [];
+    this._wallet = undefined;
   }
 
-  // ===========================================================================
-  // Public API
-  // ===========================================================================
-
-  /**
-   * Send L1 transaction
-   */
   async send(request: L1SendRequest): Promise<L1SendResult> {
     this.ensureInitialized();
 
+    if (!this._wallet || !this._identity) {
+      return { success: false, error: 'No wallet available' };
+    }
+
     try {
-      await this.ensureConnected();
+      // Convert amount from satoshis to ALPHA
+      const amountAlpha = parseInt(request.amount, 10) / 100_000_000;
 
-      const l1Wallet = identityToL1Wallet(this.deps!.identity);
-
-      // Convert amount from satoshis string to ALPHA number
-      const amountSats = BigInt(request.amount);
-      const amountAlpha = Number(amountSats) / 100_000_000;
-
-      // Use existing L1 SDK to send
-      const results = await sendAlpha(
-        l1Wallet,
+      // Send using the L1 SDK
+      const results = await l1SendAlpha(
+        this._wallet,
         request.to,
         amountAlpha,
-        this.deps!.identity.address
+        this._identity.address
       );
 
-      if (results.length === 0) {
+      if (results && results.length > 0) {
+        // Calculate total fee from all transactions
+        const txids = results.map((r) => r.txid);
+        return {
+          success: true,
+          txHash: txids[0], // Return first txid (usually only one)
+        };
+      } else {
         return {
           success: false,
-          error: 'No transactions created',
+          error: 'Transaction failed - no results returned',
         };
       }
-
-      const firstResult = results[0];
-      return {
-        success: true,
-        txHash: firstResult.txid,
-        fee: '10000',
-      };
     } catch (error) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: error instanceof Error ? error.message : 'Unknown error',
       };
     }
   }
 
-  /**
-   * Get L1 balance with vesting classification
-   */
   async getBalance(): Promise<L1Balance> {
     this.ensureInitialized();
-    await this.ensureConnected();
 
-    const address = this.deps!.identity.address;
+    const addresses = this._getWatchedAddresses();
+    let totalAlpha = 0;
+    let vestedSats = BigInt(0);
+    let unvestedSats = BigInt(0);
 
-    // Get raw balance for confirmed amount
-    const balanceAlpha = await l1GetBalance(address);
-    const confirmedSats = Math.floor(balanceAlpha * 100_000_000);
-
-    // Get UTXOs for vesting classification
-    if (this.config.enableVesting && this.vestingClassifier) {
-      const utxos = await this.getUtxos();
-
-      let vestedSats = 0;
-      let unvestedSats = 0;
-
-      for (const utxo of utxos) {
-        const amount = BigInt(utxo.amount);
-        if (utxo.isVested) {
-          vestedSats += Number(amount);
-        } else {
-          unvestedSats += Number(amount);
-        }
-      }
-
-      return {
-        confirmed: confirmedSats.toString(),
-        unconfirmed: '0',
-        vested: vestedSats.toString(),
-        unvested: unvestedSats.toString(),
-        total: confirmedSats.toString(),
-      };
+    // Get balance for all addresses
+    for (const address of addresses) {
+      const balance = await l1GetBalance(address);
+      totalAlpha += balance;
     }
 
-    // Without vesting classification
+    const totalSats = BigInt(Math.floor(totalAlpha * 100_000_000));
+
+    // Calculate vesting if enabled
+    if (this._config.enableVesting) {
+      await vestingClassifier.initDB();
+      const allUtxos = await this._getAllUtxos();
+      const classified = await vestingClassifier.classifyUtxos(allUtxos);
+
+      for (const utxo of classified.vested) {
+        vestedSats += BigInt(utxo.value);
+      }
+      for (const utxo of classified.unvested) {
+        unvestedSats += BigInt(utxo.value);
+      }
+    }
+
     return {
-      confirmed: confirmedSats.toString(),
-      unconfirmed: '0',
-      vested: '0',
-      unvested: confirmedSats.toString(),
-      total: confirmedSats.toString(),
+      confirmed: totalSats.toString(),
+      unconfirmed: '0', // Simplified - would need separate tracking
+      vested: vestedSats.toString(),
+      unvested: unvestedSats.toString(),
+      total: totalSats.toString(),
     };
   }
 
-  /**
-   * Get L1 UTXOs with vesting classification
-   */
   async getUtxos(): Promise<L1Utxo[]> {
     this.ensureInitialized();
-    await this.ensureConnected();
 
-    const address = this.deps!.identity.address;
-    const utxos: UTXO[] = await getUtxo(address);
-
-    // Classify UTXOs if vesting is enabled
-    if (this.config.enableVesting && this.vestingClassifier) {
-      const { vested, unvested } = await this.vestingClassifier.classifyUtxos(utxos);
-
-      const mapClassified = (classified: ClassifiedUTXO[], isVested: boolean): L1Utxo[] =>
-        classified.map((utxo) => ({
-          txid: utxo.txid ?? utxo.tx_hash ?? '',
-          vout: utxo.vout ?? utxo.tx_pos ?? 0,
-          amount: utxo.value.toString(),
-          address: utxo.address ?? address,
-          isVested,
-          confirmations: utxo.height ? 1 : 0,
-          coinbaseHeight: utxo.coinbaseHeight ?? undefined,
-        }));
-
-      return [...mapClassified(vested, true), ...mapClassified(unvested, false)];
-    }
-
-    // Without vesting classification
-    return utxos.map((utxo) => ({
-      txid: utxo.txid ?? utxo.tx_hash ?? '',
-      vout: utxo.vout ?? utxo.tx_pos ?? 0,
-      amount: utxo.value.toString(),
-      address: utxo.address ?? address,
-      isVested: false,
-      confirmations: utxo.height ? 1 : 0,
-    }));
-  }
-
-  /**
-   * Get L1 transaction history with full details
-   */
-  async getHistory(limit?: number): Promise<L1Transaction[]> {
-    this.ensureInitialized();
-    await this.ensureConnected();
-
-    const address = this.deps!.identity.address;
-    const history = await getTransactionHistory(address);
+    const result: L1Utxo[] = [];
     const currentHeight = await getCurrentBlockHeight();
+    const allUtxos = await this._getAllUtxos();
 
-    // Fetch full details for each transaction
-    const transactions: L1Transaction[] = [];
+    // Classify if vesting is enabled
+    let classifiedVested: Set<string> = new Set();
+    let classifiedCoinbaseHeights: Map<string, number | null> = new Map();
 
-    const itemsToProcess = limit ? history.slice(0, limit) : history;
+    if (this._config.enableVesting) {
+      await vestingClassifier.initDB();
+      const classified = await vestingClassifier.classifyUtxos(allUtxos);
 
-    for (const item of itemsToProcess) {
-      try {
-        const txDetail = await l1GetTransaction(item.tx_hash) as TransactionDetail;
-        if (!txDetail) continue;
-
-        const tx = this.parseTransaction(txDetail, address, currentHeight, item);
-        transactions.push(tx);
-      } catch {
-        // Skip failed transactions
-        continue;
+      for (const utxo of classified.vested) {
+        const key = `${utxo.tx_hash}:${utxo.tx_pos}`;
+        classifiedVested.add(key);
+        classifiedCoinbaseHeights.set(key, utxo.coinbaseHeight ?? null);
+      }
+      for (const utxo of classified.unvested) {
+        const key = `${utxo.tx_hash}:${utxo.tx_pos}`;
+        classifiedCoinbaseHeights.set(key, utxo.coinbaseHeight ?? null);
       }
     }
 
-    return transactions;
+    for (const utxo of allUtxos) {
+      const key = `${utxo.tx_hash}:${utxo.tx_pos}`;
+      const isVested = classifiedVested.has(key);
+      const coinbaseHeight = classifiedCoinbaseHeights.get(key) ?? undefined;
+
+      result.push({
+        txid: utxo.tx_hash ?? utxo.txid ?? '',
+        vout: utxo.tx_pos ?? utxo.vout ?? 0,
+        amount: utxo.value.toString(),
+        address: utxo.address ?? '',
+        isVested,
+        confirmations: currentHeight - (utxo.height || currentHeight),
+        coinbaseHeight: coinbaseHeight ?? undefined,
+      });
+    }
+
+    return result;
   }
 
-  /**
-   * Get specific transaction with full details
-   */
+  async getHistory(limit?: number): Promise<L1Transaction[]> {
+    this.ensureInitialized();
+
+    const addresses = this._getWatchedAddresses();
+    const transactions: L1Transaction[] = [];
+    const seenTxids = new Set<string>();
+    const currentHeight = await getCurrentBlockHeight();
+
+    for (const address of addresses) {
+      const history = await getTransactionHistory(address);
+
+      for (const item of history) {
+        if (seenTxids.has(item.tx_hash)) continue;
+        seenTxids.add(item.tx_hash);
+
+        const tx = (await l1GetTransaction(item.tx_hash)) as TransactionDetail | null;
+        if (!tx) continue;
+
+        // Determine if this is a send or receive
+        const isSend = tx.vin?.some((vin) =>
+          addresses.includes(vin.txid ?? '')
+        );
+
+        // Calculate amount from outputs going to our addresses
+        let amount = '0';
+        let txAddress = address;
+        if (tx.vout) {
+          for (const vout of tx.vout) {
+            const voutAddresses = vout.scriptPubKey?.addresses ?? [];
+            if (vout.scriptPubKey?.address) {
+              voutAddresses.push(vout.scriptPubKey.address);
+            }
+            const matchedAddr = voutAddresses.find((a) => addresses.includes(a));
+            if (matchedAddr) {
+              amount = Math.floor((vout.value ?? 0) * 100_000_000).toString();
+              txAddress = matchedAddr;
+              break;
+            }
+          }
+        }
+
+        transactions.push({
+          txid: item.tx_hash,
+          type: isSend ? 'send' : 'receive',
+          amount,
+          address: txAddress,
+          confirmations: item.height > 0 ? currentHeight - item.height : 0,
+          timestamp: tx.time ? tx.time * 1000 : Date.now(),
+          blockHeight: item.height > 0 ? item.height : undefined,
+        });
+      }
+    }
+
+    // Sort by block height descending
+    transactions.sort((a, b) => (b.blockHeight ?? 0) - (a.blockHeight ?? 0));
+
+    return limit ? transactions.slice(0, limit) : transactions;
+  }
+
   async getTransaction(txid: string): Promise<L1Transaction | null> {
     this.ensureInitialized();
-    await this.ensureConnected();
 
-    try {
-      const txDetail = await l1GetTransaction(txid) as TransactionDetail;
-      if (!txDetail) return null;
+    const tx = (await l1GetTransaction(txid)) as TransactionDetail | null;
+    if (!tx) return null;
 
-      const currentHeight = await getCurrentBlockHeight();
-      const address = this.deps!.identity.address;
+    const addresses = this._getWatchedAddresses();
+    const currentHeight = await getCurrentBlockHeight();
 
-      return this.parseTransaction(txDetail, address, currentHeight);
-    } catch {
-      return null;
+    // Determine if this is a send (our address in inputs)
+    const isSend = tx.vin?.some((vin) =>
+      addresses.includes(vin.txid ?? '')
+    );
+
+    let amount = '0';
+    let txAddress = '';
+    if (tx.vout) {
+      for (const vout of tx.vout) {
+        const voutAddresses = vout.scriptPubKey?.addresses ?? [];
+        if (vout.scriptPubKey?.address) {
+          voutAddresses.push(vout.scriptPubKey.address);
+        }
+        const matchedAddr = voutAddresses.find((a) => addresses.includes(a));
+        if (matchedAddr) {
+          amount = Math.floor((vout.value ?? 0) * 100_000_000).toString();
+          txAddress = matchedAddr;
+          break;
+        }
+      }
     }
+
+    return {
+      txid,
+      type: isSend ? 'send' : 'receive',
+      amount,
+      address: txAddress,
+      confirmations: tx.confirmations ?? 0,
+      timestamp: tx.time ? tx.time * 1000 : Date.now(),
+      blockHeight: tx.confirmations ? currentHeight - tx.confirmations + 1 : undefined,
+    };
   }
 
-  /**
-   * Estimate fee for transaction
-   */
   async estimateFee(
     to: string,
     amount: string
   ): Promise<{ fee: string; feeRate: number }> {
     this.ensureInitialized();
-    await this.ensureConnected();
 
-    const FIXED_FEE = 10_000;
-
-    const l1Wallet = identityToL1Wallet(this.deps!.identity);
-    const amountSats = BigInt(amount);
-    const amountAlpha = Number(amountSats) / 100_000_000;
+    if (!this._wallet) {
+      return { fee: '0', feeRate: this._config.defaultFeeRate ?? 10 };
+    }
 
     try {
-      const plan = await createTransactionPlan(
-        l1Wallet,
+      // Convert satoshis to ALPHA
+      const amountAlpha = parseInt(amount, 10) / 100_000_000;
+
+      const plan = await l1CreateTransactionPlan(
+        this._wallet,
         to,
-        amountAlpha,
-        this.deps!.identity.address
+        amountAlpha
       );
 
       if (!plan.success) {
-        throw new Error(plan.error ?? 'Cannot create transaction plan');
+        return { fee: '0', feeRate: this._config.defaultFeeRate ?? 10 };
       }
 
-      const totalFee = plan.transactions.reduce(
-        (sum: number, tx: L1TxPlanItem) => sum + tx.fee,
-        0
-      );
+      // Sum fees from all transactions
+      const totalFee = plan.transactions.reduce((sum, tx) => sum + tx.fee, 0);
 
       return {
         fee: totalFee.toString(),
-        feeRate: this.config.defaultFeeRate,
+        feeRate: this._config.defaultFeeRate ?? 10,
       };
     } catch {
-      return {
-        fee: FIXED_FEE.toString(),
-        feeRate: this.config.defaultFeeRate,
-      };
+      return { fee: '10000', feeRate: this._config.defaultFeeRate ?? 10 };
     }
   }
 
-  /**
-   * Get current addresses
-   */
   getAddresses(): string[] {
-    this.ensureInitialized();
-    return Array.from(this.addressSet);
+    return [...this._addresses];
   }
 
-  /**
-   * Add address to track
-   */
   addAddress(address: string): void {
-    this.addressSet.add(address);
+    if (!this._addresses.includes(address)) {
+      this._addresses.push(address);
+
+      // Also add to wallet object
+      if (this._wallet) {
+        this._wallet.addresses.push({
+          address,
+          path: null,
+          index: this._wallet.addresses.length,
+        });
+      }
+    }
   }
 
-  /**
-   * Get vesting threshold constant
-   */
   getVestingThreshold(): number {
     return VESTING_THRESHOLD;
   }
 
-  // ===========================================================================
-  // Private
-  // ===========================================================================
-
-  /**
-   * Parse transaction detail into L1Transaction format
-   */
-  private parseTransaction(
-    txDetail: TransactionDetail,
-    primaryAddress: string,
-    currentHeight: number,
-    historyItem?: TransactionHistoryItem
-  ): L1Transaction {
-    // Calculate received amount to our addresses
-    const receivedAmount = calculateReceivedAmount(txDetail.vout, primaryAddress);
-
-    // Calculate total input value (for sends)
-    // Note: We can't directly determine sent amount without fetching input transactions
-    // For simplicity, if we received coins, it's a receive; otherwise check if we're in inputs
-
-    // Get output addresses that are NOT ours (counterparty for sends)
-    const outputAddresses = getOutputAddresses(txDetail.vout);
-    const externalAddresses = outputAddresses.filter(
-      (addr) => !this.addressSet.has(addr)
-    );
-
-    // Determine transaction type
-    // If we received coins, it's likely a receive
-    // This is simplified - full implementation would trace inputs
-    const isReceive = receivedAmount > 0;
-    const type: 'send' | 'receive' = isReceive ? 'receive' : 'send';
-
-    // Amount in satoshis
-    const amountSats = Math.floor(receivedAmount * 100_000_000);
-
-    // Counterparty address
-    const counterpartyAddress = isReceive
-      ? txDetail.vin[0]?.txid
-        ? 'unknown' // Would need to trace input to get sender
-        : 'coinbase'
-      : externalAddresses[0] ?? 'unknown';
-
-    // Block height and confirmations
-    const blockHeight = historyItem?.height ?? (txDetail.confirmations
-      ? currentHeight - txDetail.confirmations + 1
-      : 0);
-    const confirmations = txDetail.confirmations ?? (historyItem?.height
-      ? currentHeight - historyItem.height + 1
-      : 0);
-
-    // Timestamp from block time
-    const timestamp = txDetail.blocktime
-      ? txDetail.blocktime * 1000
-      : txDetail.time
-        ? txDetail.time * 1000
-        : Date.now();
-
-    return {
-      txid: txDetail.txid,
-      type,
-      amount: amountSats.toString(),
-      fee: historyItem?.fee?.toString(),
-      address: counterpartyAddress,
-      confirmations,
-      timestamp,
-      blockHeight: blockHeight > 0 ? blockHeight : undefined,
-    };
+  isConnected(): boolean {
+    return isWebSocketConnected();
   }
 
   private ensureInitialized(): void {
-    if (!this.deps) {
+    if (!this._initialized) {
       throw new Error('L1PaymentsModule not initialized');
     }
+  }
+
+  private _getWatchedAddresses(): string[] {
+    const addresses = [...this._addresses];
+    if (this._identity?.address && !addresses.includes(this._identity.address)) {
+      addresses.unshift(this._identity.address);
+    }
+    return addresses;
+  }
+
+  private async _getAllUtxos(): Promise<UTXO[]> {
+    const addresses = this._getWatchedAddresses();
+    const allUtxos: UTXO[] = [];
+
+    for (const addr of addresses) {
+      const utxos = await getUtxo(addr);
+      allUtxos.push(...utxos);
+    }
+
+    return allUtxos;
   }
 }
 

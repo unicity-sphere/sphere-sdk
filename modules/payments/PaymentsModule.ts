@@ -358,6 +358,8 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
+  /** L1 (ALPHA blockchain) configuration */
+  l1?: L1PaymentsModuleConfig;
 }
 
 // =============================================================================
@@ -371,6 +373,10 @@ export interface PaymentsModuleDependencies {
   transport: TransportProvider;
   oracle: OracleProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /** Chain code for BIP32 HD derivation (for L1 multi-address support) */
+  chainCode?: string;
+  /** Additional L1 addresses to watch */
+  l1Addresses?: string[];
 }
 
 // =============================================================================
@@ -378,7 +384,7 @@ export interface PaymentsModuleDependencies {
 // =============================================================================
 
 export class PaymentsModule {
-  private readonly moduleConfig: Required<PaymentsModuleConfig>;
+  private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1'>;
   private deps: PaymentsModuleDependencies | null = null;
 
   /** L1 (ALPHA blockchain) payments sub-module */
@@ -413,7 +419,7 @@ export class PaymentsModule {
   private unsubscribePaymentRequests: (() => void) | null = null;
   private unsubscribePaymentRequestResponses: (() => void) | null = null;
 
-  constructor(config?: PaymentsModuleConfig & { l1?: L1PaymentsModuleConfig }) {
+  constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
       autoValidate: config?.autoValidate ?? true,
@@ -427,7 +433,7 @@ export class PaymentsModule {
   }
 
   /** Get module configuration */
-  getConfig(): Required<PaymentsModuleConfig> {
+  getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
     return this.moduleConfig;
   }
 
@@ -447,8 +453,12 @@ export class PaymentsModule {
   initialize(deps: PaymentsModuleDependencies): void {
     this.deps = deps;
 
-    // Initialize L1 sub-module
-    this.l1.initialize({ identity: deps.identity });
+    // Initialize L1 sub-module with chain code and addresses
+    this.l1.initialize({
+      identity: deps.identity,
+      chainCode: deps.chainCode,
+      addresses: deps.l1Addresses,
+    });
 
     // Subscribe to incoming transfers
     this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) => {

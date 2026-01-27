@@ -30,12 +30,12 @@ import { bootstrap } from '@libp2p/bootstrap';
 import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PrivateKey } from '@libp2p/interface';
-import { hkdf } from '@noble/hashes/hkdf';
-import { sha256 } from '@noble/hashes/sha256';
+import { hkdf } from '@noble/hashes/hkdf.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 
-/** HKDF info string for IPNS key derivation */
-const HKDF_INFO = 'ipfs-storage-key';
+/** HKDF info for IPNS key derivation */
+const HKDF_INFO = new TextEncoder().encode('ipfs-storage-key');
 
 // =============================================================================
 // Configuration

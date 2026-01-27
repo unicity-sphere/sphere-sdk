@@ -8,6 +8,7 @@
 import * as bip39 from 'bip39';
 import CryptoJS from 'crypto-js';
 import elliptic from 'elliptic';
+import { encodeBech32 } from './bech32';
 
 // =============================================================================
 // Constants
@@ -295,6 +296,49 @@ export function doubleSha256(data: string, inputEncoding: 'hex' | 'utf8' = 'hex'
   return sha256(first, 'hex');
 }
 
+/**
+ * Alias for hash160 (L1 SDK compatibility)
+ */
+export const computeHash160 = hash160;
+
+/**
+ * Convert hex string to Uint8Array for witness program
+ */
+export function hash160ToBytes(hash160Hex: string): Uint8Array {
+  const matches = hash160Hex.match(/../g);
+  if (!matches) return new Uint8Array(0);
+  return Uint8Array.from(matches.map((x) => parseInt(x, 16)));
+}
+
+/**
+ * Generate bech32 address from public key
+ * @param publicKey - Compressed public key as hex string
+ * @param prefix - Address prefix (default: "alpha")
+ * @param witnessVersion - Witness version (default: 0 for P2WPKH)
+ * @returns Bech32 encoded address
+ */
+export function publicKeyToAddress(
+  publicKey: string,
+  prefix: string = 'alpha',
+  witnessVersion: number = 0
+): string {
+  const pubKeyHash = hash160(publicKey);
+  const programBytes = hash160ToBytes(pubKeyHash);
+  return encodeBech32(prefix, witnessVersion, programBytes);
+}
+
+/**
+ * Get address info from private key
+ */
+export function privateKeyToAddressInfo(
+  privateKey: string,
+  prefix: string = 'alpha'
+): { address: string; publicKey: string } {
+  const publicKey = getPublicKey(privateKey);
+  const address = publicKeyToAddress(publicKey, prefix);
+  return { address, publicKey };
+}
+
 // =============================================================================
 // Utility Functions
 // =============================================================================
@@ -362,29 +406,51 @@ export function identityFromMnemonicSync(
 
 /**
  * Derive address info at a specific path
+ * @param masterKey - Master key with privateKey and chainCode
+ * @param basePath - Base derivation path (e.g., "m/44'/0'/0'")
+ * @param index - Address index
+ * @param isChange - Whether this is a change address (chain 1 vs 0)
+ * @param prefix - Address prefix (default: "alpha")
  */
 export function deriveAddressInfo(
   masterKey: MasterKey,
   basePath: string,
   index: number,
-  isChange: boolean = false
+  isChange: boolean = false,
+  prefix: string = 'alpha'
 ): AddressInfo {
   const chain = isChange ? 1 : 0;
   const fullPath = `${basePath}/${chain}/${index}`;
 
   const derived = deriveKeyAtPath(masterKey.privateKey, masterKey.chainCode, fullPath);
   const publicKey = getPublicKey(derived.privateKey);
-
-  // Note: Address generation is platform-specific (bech32 encoding)
-  // This returns the hash160 as address placeholder
-  // Platform implementations should override with proper address encoding
-  const address = hash160(publicKey);
+  const address = publicKeyToAddress(publicKey, prefix);
 
   return {
     privateKey: derived.privateKey,
     publicKey,
     address,
     path: fullPath,
+    index,
+  };
+}
+
+/**
+ * Generate full address info from private key with index and path
+ * (L1 SDK compatibility)
+ */
+export function generateAddressInfo(
+  privateKey: string,
+  index: number,
+  path: string,
+  prefix: string = 'alpha'
+): AddressInfo {
+  const { address, publicKey } = privateKeyToAddressInfo(privateKey, prefix);
+  return {
+    privateKey,
+    publicKey,
+    address,
+    path,
     index,
   };
 }

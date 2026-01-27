@@ -213,3 +213,12 @@ export function getAddressHrp(addr: string): string | null {
   const result = decodeBech32(addr);
   return result?.hrp ?? null;
 }
+
+// =============================================================================
+// Aliases for L1 SDK compatibility
+// =============================================================================
+
+/**
+ * Alias for encodeBech32 (L1 SDK compatibility)
+ */
+export const createBech32 = encodeBech32;
