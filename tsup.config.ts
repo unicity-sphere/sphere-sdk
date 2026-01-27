@@ -11,10 +11,9 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
-    // Bundle @unicitylabs packages for Node.js compatibility
-    noExternal: [/^@unicitylabs\//],
     external: [
       /^@noble\//,
+      /^@unicitylabs\//,
       'bip39',
       'buffer',
       'crypto-js',
@@ -22,6 +21,7 @@ export default defineConfig([
       'helia',
       '@helia/ipns',
       '@helia/json',
+      'ws',
     ],
   },
   // Core only (no browser impl with helia) - for Node.js projects
@@ -34,14 +34,14 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
-    // Bundle @unicitylabs packages for Node.js compatibility
-    noExternal: [/^@unicitylabs\//],
     external: [
       /^@noble\//,
+      /^@unicitylabs\//,
       'bip39',
       'buffer',
       'crypto-js',
       'elliptic',
+      'ws',
     ],
   },
   // L1 module (for direct crypto operations)
@@ -90,12 +90,13 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
-    noExternal: [/^@unicitylabs\//],
     external: [
       /^@noble\//,
+      /^@unicitylabs\//,
       'helia',
       '@helia/ipns',
       '@helia/json',
+      'ws',
     ],
   },
 ]);

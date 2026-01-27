@@ -3,8 +3,7 @@
  * Re-exports shared transport with Node.js WebSocket
  */
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const WebSocket = require('ws');
+import WebSocket from 'ws';
 
 import {
   NostrTransportProvider,

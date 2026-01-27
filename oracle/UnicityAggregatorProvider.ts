@@ -48,6 +48,8 @@ interface SdkMintCommitment {
 export interface UnicityAggregatorProviderConfig {
   /** Aggregator URL */
   url: string;
+  /** API key for authentication */
+  apiKey?: string;
   /** Request timeout (ms) */
   timeout?: number;
   /** Skip trust base verification (dev only) */
@@ -88,11 +90,6 @@ interface RpcTokenStateResponse {
     spent?: boolean;
     roundNumber?: number;
   };
-}
-
-interface RpcRoundResponse {
-  round?: number;
-  roundNumber?: number;
 }
 
 interface RpcMintResponse {
@@ -146,6 +143,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
   constructor(config: UnicityAggregatorProviderConfig) {
     this.config = {
       url: config.url,
+      apiKey: config.apiKey ?? '',
       timeout: config.timeout ?? DEFAULT_AGGREGATOR_TIMEOUT,
       skipVerification: config.skipVerification ?? false,
       debug: config.debug ?? false,
@@ -162,16 +160,12 @@ export class UnicityAggregatorProvider implements OracleProvider {
 
     this.status = 'connecting';
 
-    try {
-      // Test connection
-      await this.getCurrentRound();
-      this.status = 'connected';
-      this.emitEvent({ type: 'oracle:connected', timestamp: Date.now() });
-      this.log('Connected to oracle:', this.config.url);
-    } catch (error) {
-      this.status = 'error';
-      throw new Error(`Oracle connection failed: ${error}`);
-    }
+    // Mark as connected - actual connectivity will be verified on first operation
+    // The aggregator requires requestId in params even for status checks,
+    // which the SDK client doesn't support directly
+    this.status = 'connected';
+    this.emitEvent({ type: 'oracle:connected', timestamp: Date.now() });
+    this.log('Connected to oracle:', this.config.url);
   }
 
   async disconnect(): Promise<void> {
@@ -193,8 +187,11 @@ export class UnicityAggregatorProvider implements OracleProvider {
   // ===========================================================================
 
   async initialize(trustBase?: RootTrustBase): Promise<void> {
-    // Initialize SDK clients
-    this.aggregatorClient = new AggregatorClient(this.config.url);
+    // Initialize SDK clients with optional API key
+    this.aggregatorClient = new AggregatorClient(
+      this.config.url,
+      this.config.apiKey || null
+    );
     this.stateTransitionClient = new StateTransitionClient(this.aggregatorClient);
 
     if (trustBase) {
@@ -483,8 +480,11 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async getCurrentRound(): Promise<number> {
-    const response = await this.rpcCall<RpcRoundResponse>('getCurrentRound', {});
-    return response.round ?? response.roundNumber ?? 0;
+    if (this.aggregatorClient) {
+      const blockHeight = await this.aggregatorClient.getBlockHeight();
+      return Number(blockHeight);
+    }
+    return 0;
   }
 
   async mint(params: MintParams): Promise<MintResult> {

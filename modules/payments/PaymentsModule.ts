@@ -387,8 +387,8 @@ export class PaymentsModule {
   private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1'>;
   private deps: PaymentsModuleDependencies | null = null;
 
-  /** L1 (ALPHA blockchain) payments sub-module */
-  readonly l1: L1PaymentsModule;
+  /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
+  readonly l1: L1PaymentsModule | null;
 
   // Token State
   private tokens: Map<string, Token> = new Map();
@@ -428,8 +428,9 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
-    // Initialize L1 sub-module
-    this.l1 = new L1PaymentsModule(config?.l1);
+    // Initialize L1 sub-module only if electrumUrl is provided
+    const l1Enabled = config?.l1?.electrumUrl && config.l1.electrumUrl.length > 0;
+    this.l1 = l1Enabled ? new L1PaymentsModule(config?.l1) : null;
   }
 
   /** Get module configuration */
@@ -453,12 +454,14 @@ export class PaymentsModule {
   initialize(deps: PaymentsModuleDependencies): void {
     this.deps = deps;
 
-    // Initialize L1 sub-module with chain code and addresses
-    this.l1.initialize({
-      identity: deps.identity,
-      chainCode: deps.chainCode,
-      addresses: deps.l1Addresses,
-    });
+    // Initialize L1 sub-module with chain code and addresses (if enabled)
+    if (this.l1) {
+      this.l1.initialize({
+        identity: deps.identity,
+        chainCode: deps.chainCode,
+        addresses: deps.l1Addresses,
+      });
+    }
 
     // Subscribe to incoming transfers
     this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) => {
@@ -570,7 +573,9 @@ export class PaymentsModule {
     }
     this.pendingResponseResolvers.clear();
 
-    this.l1.destroy();
+    if (this.l1) {
+      this.l1.destroy();
+    }
   }
 
   // ===========================================================================

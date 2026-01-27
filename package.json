@@ -88,6 +88,7 @@
     "url": "https://github.com/unicitylabs/sphere-sdk.git"
   },
   "dependencies": {
+    "@noble/curves": "^1.9.7",
     "@noble/hashes": "^2.0.1",
     "@unicitylabs/nostr-js-sdk": "^0.3.2",
     "@unicitylabs/state-transition-sdk": "1.6.0",
@@ -105,6 +106,7 @@
     "@types/crypto-js": "^4.2.2",
     "@types/elliptic": "^6.4.18",
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "fake-indexeddb": "^6.2.5",
     "tsup": "^8.5.1",
     "typescript": "~5.6.0",

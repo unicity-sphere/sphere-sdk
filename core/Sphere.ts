@@ -312,6 +312,7 @@ export class Sphere {
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
+        l1: options.l1,
       });
       return { sphere, created: false };
     }
@@ -341,6 +342,7 @@ export class Sphere {
       tokenStorage: options.tokenStorage,
       derivationPath: options.derivationPath,
       nametag: options.nametag,
+      l1: options.l1,
     });
 
     return { sphere, created: true, generatedMnemonic };
