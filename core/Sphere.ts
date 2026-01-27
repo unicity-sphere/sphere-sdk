@@ -1,0 +1,1736 @@
+/**
+ * Sphere - Main SDK Entry Point
+ *
+ * Handles wallet existence checking, creation, and loading.
+ *
+ * @example
+ * ```ts
+ * import { Sphere } from '@/sdk2';
+ * import { createLocalStorageProvider, createNostrTransportProvider, createUnicityAggregatorProvider } from '@/sdk2/impl/browser';
+ *
+ * const storage = createLocalStorageProvider();
+ * const transport = createNostrTransportProvider();
+ * const oracle = createUnicityAggregatorProvider({ url: '/rpc' });
+ *
+ * // Option 1: Unified init (recommended)
+ * const { sphere, created, generatedMnemonic } = await Sphere.init({
+ *   storage,
+ *   transport,
+ *   oracle,
+ *   mnemonic: 'your twelve words...', // optional - will load if wallet exists
+ *   autoGenerate: true, // generate new mnemonic if needed
+ * });
+ *
+ * if (created && generatedMnemonic) {
+ *   console.log('Save this mnemonic:', generatedMnemonic);
+ * }
+ *
+ * // Option 2: Manual create/load
+ * if (await Sphere.exists(storage)) {
+ *   const sphere = await Sphere.load({ storage, transport, oracle });
+ * } else {
+ *   const sphere = await Sphere.create({ mnemonic, storage, transport, oracle });
+ * }
+ *
+ * // Use the wallet
+ * await sphere.payments.send({ coinId: 'ALPHA', amount: '1000', recipient: '@alice' });
+ * ```
+ */
+
+import type {
+  Identity,
+  FullIdentity,
+  SphereEventType,
+  SphereEventMap,
+  SphereEventHandler,
+  DerivationMode,
+  WalletSource,
+  WalletInfo,
+  WalletJSON,
+  WalletJSONExportOptions,
+} from '../types';
+import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
+import type { TransportProvider } from '../transport';
+import type { OracleProvider } from '../oracle';
+import { PaymentsModule, createPaymentsModule } from '../modules/payments';
+import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
+import { STORAGE_KEYS, DEFAULT_DERIVATION_PATH, DEFAULT_BASE_PATH, LIMITS, DEFAULT_ENCRYPTION_KEY } from '../constants';
+import {
+  generateMnemonic as generateBip39Mnemonic,
+  validateMnemonic as validateBip39Mnemonic,
+  identityFromMnemonicSync,
+  deriveKeyAtPath,
+  deriveAddressInfo,
+  getPublicKey,
+  hash160,
+  sha256,
+  type MasterKey,
+  type AddressInfo,
+} from './crypto';
+import { encryptSimple, decryptSimple } from './encryption';
+import {
+  parseWalletText,
+  parseAndDecryptWalletText,
+  isWalletTextFormat,
+  isTextWalletEncrypted,
+  serializeWalletToText,
+  serializeEncryptedWalletToText,
+  encryptForTextFormat,
+} from '../serialization/wallet-text';
+import {
+  parseWalletDat,
+  parseAndDecryptWalletDat,
+  isSQLiteDatabase,
+  isWalletDatEncrypted,
+} from '../serialization/wallet-dat';
+import type {
+  LegacyFileType,
+  DecryptionProgressCallback,
+} from '../serialization/types';
+
+// =============================================================================
+// Options Types
+// =============================================================================
+
+/** Options for creating a new wallet */
+export interface SphereCreateOptions {
+  /** BIP39 mnemonic (12 or 24 words) */
+  mnemonic: string;
+  /** Custom derivation path (default: m/44'/0'/0') */
+  derivationPath?: string;
+  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice) */
+  nametag?: string;
+  /** Storage provider instance */
+  storage: StorageProvider;
+  /** Optional token storage provider (for IPFS sync) */
+  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** Transport provider instance */
+  transport: TransportProvider;
+  /** Oracle provider instance */
+  oracle: OracleProvider;
+}
+
+/** Options for loading existing wallet */
+export interface SphereLoadOptions {
+  /** Storage provider instance */
+  storage: StorageProvider;
+  /** Optional token storage provider (for IPFS sync) */
+  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** Transport provider instance */
+  transport: TransportProvider;
+  /** Oracle provider instance */
+  oracle: OracleProvider;
+}
+
+/** Options for importing a wallet */
+export interface SphereImportOptions {
+  /** BIP39 mnemonic to import */
+  mnemonic?: string;
+  /** Or master private key (hex) */
+  masterKey?: string;
+  /** Chain code for BIP32 (optional) */
+  chainCode?: string;
+  /** Custom derivation path */
+  derivationPath?: string;
+  /** Base path for BIP32 derivation (e.g., "m/84'/1'/0'" from wallet.dat) */
+  basePath?: string;
+  /** Derivation mode: bip32, wif_hmac, legacy_hmac */
+  derivationMode?: DerivationMode;
+  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice) */
+  nametag?: string;
+  /** Storage provider instance */
+  storage: StorageProvider;
+  /** Optional token storage provider */
+  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** Transport provider instance */
+  transport: TransportProvider;
+  /** Oracle provider instance */
+  oracle: OracleProvider;
+}
+
+/** Options for unified init (auto-create or load) */
+export interface SphereInitOptions {
+  /** Storage provider instance */
+  storage: StorageProvider;
+  /** Transport provider instance */
+  transport: TransportProvider;
+  /** Oracle provider instance */
+  oracle: OracleProvider;
+  /** Optional token storage provider (for IPFS sync) */
+  tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** BIP39 mnemonic - if wallet doesn't exist, use this to create */
+  mnemonic?: string;
+  /** Auto-generate mnemonic if wallet doesn't exist and no mnemonic provided */
+  autoGenerate?: boolean;
+  /** Custom derivation path (default: m/44'/0'/0') */
+  derivationPath?: string;
+  /** Optional nametag to register (only on create) */
+  nametag?: string;
+}
+
+/** Result of init operation */
+export interface SphereInitResult {
+  /** The initialized Sphere instance */
+  sphere: Sphere;
+  /** Whether wallet was newly created */
+  created: boolean;
+  /** Generated mnemonic (only if autoGenerate was used) */
+  generatedMnemonic?: string;
+}
+
+// =============================================================================
+// Mutable Identity (internal use only)
+// =============================================================================
+
+/** Mutable version of FullIdentity for internal state management */
+type MutableFullIdentity = {
+  -readonly [K in keyof FullIdentity]: FullIdentity[K];
+};
+
+// =============================================================================
+// Sphere Class
+// =============================================================================
+
+export class Sphere {
+  // Singleton
+  private static instance: Sphere | null = null;
+
+  // State
+  private _initialized = false;
+  private _identity: MutableFullIdentity | null = null;
+  private _masterKey: MasterKey | null = null;
+  private _mnemonic: string | null = null;
+  private _source: WalletSource = 'unknown';
+  private _derivationMode: DerivationMode = 'bip32';
+  private _basePath: string = DEFAULT_BASE_PATH;
+
+  // Providers
+  private _storage: StorageProvider;
+  private _tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  private _transport: TransportProvider;
+  private _oracle: OracleProvider;
+
+  // Modules
+  private _payments: PaymentsModule;
+  private _communications: CommunicationsModule;
+
+  // Events
+  private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
+
+  // ===========================================================================
+  // Constructor (private)
+  // ===========================================================================
+
+  private constructor(
+    storage: StorageProvider,
+    transport: TransportProvider,
+    oracle: OracleProvider,
+    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>
+  ) {
+    this._storage = storage;
+    this._tokenStorage = tokenStorage;
+    this._transport = transport;
+    this._oracle = oracle;
+
+    this._payments = createPaymentsModule();
+    this._communications = createCommunicationsModule();
+  }
+
+  // ===========================================================================
+  // Static Methods - Wallet Management
+  // ===========================================================================
+
+  /**
+   * Check if wallet exists in storage
+   */
+  static async exists(storage: StorageProvider): Promise<boolean> {
+    try {
+      const exists = await storage.get(STORAGE_KEYS.WALLET_EXISTS);
+      if (exists === 'true') {
+        // Double check - verify we have actual data
+        const mnemonic = await storage.get(STORAGE_KEYS.MNEMONIC);
+        const masterKey = await storage.get(STORAGE_KEYS.MASTER_KEY);
+        return !!(mnemonic || masterKey);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Initialize wallet - auto-loads existing or creates new
+   *
+   * @example
+   * ```ts
+   * // Load existing or create with provided mnemonic
+   * const { sphere, created } = await Sphere.init({
+   *   storage,
+   *   transport,
+   *   oracle,
+   *   mnemonic: 'your twelve words...',
+   * });
+   *
+   * // Load existing or auto-generate new mnemonic
+   * const { sphere, created, generatedMnemonic } = await Sphere.init({
+   *   storage,
+   *   transport,
+   *   oracle,
+   *   autoGenerate: true,
+   * });
+   * if (generatedMnemonic) {
+   *   console.log('Save this mnemonic:', generatedMnemonic);
+   * }
+   * ```
+   */
+  static async init(options: SphereInitOptions): Promise<SphereInitResult> {
+    const walletExists = await Sphere.exists(options.storage);
+
+    if (walletExists) {
+      // Load existing wallet
+      const sphere = await Sphere.load({
+        storage: options.storage,
+        transport: options.transport,
+        oracle: options.oracle,
+        tokenStorage: options.tokenStorage,
+      });
+      return { sphere, created: false };
+    }
+
+    // Need to create new wallet
+    let mnemonic = options.mnemonic;
+    let generatedMnemonic: string | undefined;
+
+    if (!mnemonic) {
+      if (options.autoGenerate) {
+        // Auto-generate mnemonic
+        mnemonic = Sphere.generateMnemonic();
+        generatedMnemonic = mnemonic;
+      } else {
+        throw new Error(
+          'No wallet exists and no mnemonic provided. ' +
+          'Provide a mnemonic or set autoGenerate: true.'
+        );
+      }
+    }
+
+    const sphere = await Sphere.create({
+      mnemonic,
+      storage: options.storage,
+      transport: options.transport,
+      oracle: options.oracle,
+      tokenStorage: options.tokenStorage,
+      derivationPath: options.derivationPath,
+      nametag: options.nametag,
+    });
+
+    return { sphere, created: true, generatedMnemonic };
+  }
+
+  /**
+   * Create new wallet with mnemonic
+   */
+  static async create(options: SphereCreateOptions): Promise<Sphere> {
+    // Validate mnemonic
+    if (!options.mnemonic || !Sphere.validateMnemonic(options.mnemonic)) {
+      throw new Error('Invalid mnemonic');
+    }
+
+    // Check if wallet already exists
+    if (await Sphere.exists(options.storage)) {
+      throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
+    }
+
+    const sphere = new Sphere(
+      options.storage,
+      options.transport,
+      options.oracle,
+      options.tokenStorage
+    );
+
+    // Store encrypted mnemonic
+    await sphere.storeMnemonic(options.mnemonic, options.derivationPath);
+
+    // Initialize identity from mnemonic
+    await sphere.initializeIdentityFromMnemonic(options.mnemonic, options.derivationPath);
+
+    // Initialize everything
+    await sphere.initializeProviders();
+    await sphere.initializeModules();
+
+    sphere._initialized = true;
+    Sphere.instance = sphere;
+
+    // Register nametag if provided
+    if (options.nametag) {
+      await sphere.registerNametag(options.nametag);
+    }
+
+    return sphere;
+  }
+
+  /**
+   * Load existing wallet from storage
+   */
+  static async load(options: SphereLoadOptions): Promise<Sphere> {
+    // Check if wallet exists
+    if (!(await Sphere.exists(options.storage))) {
+      throw new Error('No wallet found. Use Sphere.create() to create a new wallet.');
+    }
+
+    const sphere = new Sphere(
+      options.storage,
+      options.transport,
+      options.oracle,
+      options.tokenStorage
+    );
+
+    // Load identity from storage
+    await sphere.loadIdentityFromStorage();
+
+    // Initialize everything
+    await sphere.initializeProviders();
+    await sphere.initializeModules();
+
+    sphere._initialized = true;
+    Sphere.instance = sphere;
+
+    return sphere;
+  }
+
+  /**
+   * Import wallet from mnemonic or master key
+   */
+  static async import(options: SphereImportOptions): Promise<Sphere> {
+    if (!options.mnemonic && !options.masterKey) {
+      throw new Error('Either mnemonic or masterKey is required');
+    }
+
+    // Clear existing wallet if any
+    await Sphere.clear(options.storage);
+
+    const sphere = new Sphere(
+      options.storage,
+      options.transport,
+      options.oracle,
+      options.tokenStorage
+    );
+
+    if (options.mnemonic) {
+      // Validate and store mnemonic
+      if (!Sphere.validateMnemonic(options.mnemonic)) {
+        throw new Error('Invalid mnemonic');
+      }
+      await sphere.storeMnemonic(options.mnemonic, options.derivationPath, options.basePath);
+      await sphere.initializeIdentityFromMnemonic(options.mnemonic, options.derivationPath);
+    } else if (options.masterKey) {
+      // Store master key directly
+      await sphere.storeMasterKey(
+        options.masterKey,
+        options.chainCode,
+        options.derivationPath,
+        options.basePath,
+        options.derivationMode
+      );
+      await sphere.initializeIdentityFromMasterKey(
+        options.masterKey,
+        options.chainCode,
+        options.derivationPath
+      );
+    }
+
+    // Initialize everything
+    await sphere.initializeProviders();
+    await sphere.initializeModules();
+
+    sphere._initialized = true;
+    Sphere.instance = sphere;
+
+    // Register nametag if provided
+    if (options.nametag) {
+      await sphere.registerNametag(options.nametag);
+    }
+
+    return sphere;
+  }
+
+  /**
+   * Clear wallet data from storage
+   */
+  static async clear(storage: StorageProvider): Promise<void> {
+    // Clear all wallet data
+    await storage.remove(STORAGE_KEYS.MNEMONIC);
+    await storage.remove(STORAGE_KEYS.MASTER_KEY);
+    await storage.remove(STORAGE_KEYS.CHAIN_CODE);
+    await storage.remove(STORAGE_KEYS.DERIVATION_PATH);
+    await storage.remove(STORAGE_KEYS.BASE_PATH);
+    await storage.remove(STORAGE_KEYS.DERIVATION_MODE);
+    await storage.remove(STORAGE_KEYS.WALLET_SOURCE);
+    await storage.remove(STORAGE_KEYS.WALLET_EXISTS);
+    await storage.remove(STORAGE_KEYS.NAMETAG);
+    await storage.remove(STORAGE_KEYS.TOKENS);
+    await storage.remove(STORAGE_KEYS.PENDING_TRANSFERS);
+    await storage.remove(STORAGE_KEYS.OUTBOX);
+
+    if (Sphere.instance) {
+      await Sphere.instance.destroy();
+    }
+  }
+
+  /**
+   * Get current instance
+   */
+  static getInstance(): Sphere | null {
+    return Sphere.instance;
+  }
+
+  /**
+   * Check if initialized
+   */
+  static isInitialized(): boolean {
+    return Sphere.instance?._initialized ?? false;
+  }
+
+  /**
+   * Validate mnemonic using BIP39
+   */
+  static validateMnemonic(mnemonic: string): boolean {
+    return validateBip39Mnemonic(mnemonic);
+  }
+
+  /**
+   * Generate new BIP39 mnemonic
+   * @param strength - 128 for 12 words, 256 for 24 words
+   */
+  static generateMnemonic(strength: 128 | 256 = 128): string {
+    return generateBip39Mnemonic(strength);
+  }
+
+  // ===========================================================================
+  // Public Properties - Modules
+  // ===========================================================================
+
+  /** Payments module (L3 + L1) */
+  get payments(): PaymentsModule {
+    this.ensureReady();
+    return this._payments;
+  }
+
+  /** Communications module */
+  get communications(): CommunicationsModule {
+    this.ensureReady();
+    return this._communications;
+  }
+
+  // ===========================================================================
+  // Public Properties - State
+  // ===========================================================================
+
+  /** Current identity (public info only) */
+  get identity(): Identity | null {
+    if (!this._identity) return null;
+    return {
+      publicKey: this._identity.publicKey,
+      address: this._identity.address,
+      ipnsName: this._identity.ipnsName,
+      nametag: this._identity.nametag,
+    };
+  }
+
+  /** Is ready */
+  get isReady(): boolean {
+    return this._initialized;
+  }
+
+  // ===========================================================================
+  // Public Methods - Providers Access
+  // ===========================================================================
+
+  getStorage(): StorageProvider {
+    return this._storage;
+  }
+
+  getTokenStorage(): TokenStorageProvider<TxfStorageDataBase> | undefined {
+    return this._tokenStorage;
+  }
+
+  getTransport(): TransportProvider {
+    return this._transport;
+  }
+
+  getAggregator(): OracleProvider {
+    return this._oracle;
+  }
+
+  /**
+   * Check if wallet has BIP32 master key for HD derivation
+   */
+  hasMasterKey(): boolean {
+    return this._masterKey !== null;
+  }
+
+  // ===========================================================================
+  // Public Methods - Multi-Address Derivation
+  // ===========================================================================
+
+  /**
+   * Get the base derivation path used by this wallet (e.g., "m/44'/0'/0'")
+   */
+  getBasePath(): string {
+    return this._basePath;
+  }
+
+  /**
+   * Get the default address path (first external address)
+   * Returns path like "m/44'/0'/0'/0/0"
+   */
+  getDefaultAddressPath(): string {
+    return `${this._basePath}/0/0`;
+  }
+
+  /**
+   * Get current derivation mode
+   */
+  getDerivationMode(): DerivationMode {
+    return this._derivationMode;
+  }
+
+  /**
+   * Get the mnemonic phrase (for backup purposes)
+   * Returns null if wallet was imported from file (masterKey only)
+   */
+  getMnemonic(): string | null {
+    return this._mnemonic;
+  }
+
+  /**
+   * Get wallet info for backup/export purposes
+   */
+  getWalletInfo(): WalletInfo {
+    let address0: string | null = null;
+    try {
+      if (this._masterKey) {
+        address0 = this.deriveAddress(0).address;
+      } else if (this._identity) {
+        address0 = this._identity.address;
+      }
+    } catch {
+      // Ignore errors
+    }
+
+    return {
+      source: this._source,
+      hasMnemonic: this._mnemonic !== null,
+      hasChainCode: this._masterKey?.chainCode !== undefined,
+      derivationMode: this._derivationMode,
+      basePath: this._basePath,
+      address0,
+    };
+  }
+
+  /**
+   * Export wallet to JSON format for backup
+   *
+   * @example
+   * ```ts
+   * // Export with mnemonic (if available)
+   * const json = sphere.exportToJSON();
+   *
+   * // Export with encryption
+   * const encrypted = sphere.exportToJSON({ password: 'secret' });
+   *
+   * // Export multiple addresses
+   * const multi = sphere.exportToJSON({ addressCount: 5 });
+   * ```
+   */
+  exportToJSON(options: WalletJSONExportOptions = {}): WalletJSON {
+    this.ensureReady();
+
+    if (!this._masterKey && !this._identity) {
+      throw new Error('Wallet not initialized');
+    }
+
+    // Build addresses array
+    const addressCount = options.addressCount || 1;
+    const addresses: Array<{
+      address: string;
+      publicKey: string;
+      path: string;
+      index: number;
+    }> = [];
+
+    for (let i = 0; i < addressCount; i++) {
+      try {
+        const addr = this.deriveAddress(i, false);
+        addresses.push({
+          address: addr.address,
+          publicKey: addr.publicKey,
+          path: addr.path,
+          index: addr.index,
+        });
+      } catch {
+        // Stop if we can't derive more addresses (e.g., no masterKey)
+        if (i === 0 && this._identity) {
+          addresses.push({
+            address: this._identity.address,
+            publicKey: this._identity.publicKey,
+            path: this.getDefaultAddressPath(),
+            index: 0,
+          });
+        }
+        break;
+      }
+    }
+
+    // Build wallet data
+    let masterPrivateKey: string | undefined;
+    let chainCode: string | undefined;
+
+    if (this._masterKey) {
+      masterPrivateKey = this._masterKey.privateKey;
+      chainCode = this._masterKey.chainCode;
+    }
+
+    // Prepare mnemonic (optionally encrypt)
+    let mnemonic: string | undefined;
+    let encrypted = false;
+
+    if (this._mnemonic && options.includeMnemonic !== false) {
+      if (options.password) {
+        mnemonic = encryptSimple(this._mnemonic, options.password);
+        encrypted = true;
+      } else {
+        mnemonic = this._mnemonic;
+      }
+    }
+
+    // Encrypt master key if password provided
+    if (masterPrivateKey && options.password) {
+      masterPrivateKey = encryptSimple(masterPrivateKey, options.password);
+      encrypted = true;
+    }
+
+    return {
+      version: '1.0',
+      type: 'sphere-wallet',
+      createdAt: new Date().toISOString(),
+      wallet: {
+        masterPrivateKey,
+        chainCode,
+        addresses,
+        isBIP32: this._derivationMode === 'bip32',
+        descriptorPath: this._basePath.replace(/^m\//, ''),
+      },
+      mnemonic,
+      encrypted,
+      source: this._source,
+      derivationMode: this._derivationMode,
+    };
+  }
+
+  /**
+   * Export wallet to text format for backup
+   *
+   * @example
+   * ```ts
+   * // Export unencrypted
+   * const text = sphere.exportToTxt();
+   *
+   * // Export with encryption
+   * const encrypted = sphere.exportToTxt({ password: 'secret' });
+   *
+   * // Export multiple addresses
+   * const multi = sphere.exportToTxt({ addressCount: 5 });
+   * ```
+   */
+  exportToTxt(options: { password?: string; addressCount?: number } = {}): string {
+    this.ensureReady();
+
+    if (!this._masterKey && !this._identity) {
+      throw new Error('Wallet not initialized');
+    }
+
+    // Build addresses array
+    const addressCount = options.addressCount || 1;
+    const addresses: Array<{
+      index: number;
+      address: string;
+      path: string;
+      isChange: boolean;
+    }> = [];
+
+    for (let i = 0; i < addressCount; i++) {
+      try {
+        const addr = this.deriveAddress(i, false);
+        addresses.push({
+          address: addr.address,
+          path: addr.path,
+          index: addr.index,
+          isChange: false,
+        });
+      } catch {
+        // Stop if we can't derive more addresses
+        if (i === 0 && this._identity) {
+          addresses.push({
+            address: this._identity.address,
+            path: this.getDefaultAddressPath(),
+            index: 0,
+            isChange: false,
+          });
+        }
+        break;
+      }
+    }
+
+    const masterPrivateKey = this._masterKey?.privateKey || '';
+    const chainCode = this._masterKey?.chainCode;
+    const isBIP32 = this._derivationMode === 'bip32';
+    const descriptorPath = this._basePath.replace(/^m\//, '');
+
+    // If password provided, encrypt
+    if (options.password) {
+      const encryptedMasterKey = encryptForTextFormat(masterPrivateKey, options.password);
+      return serializeEncryptedWalletToText({
+        encryptedMasterKey,
+        chainCode,
+        descriptorPath,
+        isBIP32,
+        addresses,
+      });
+    }
+
+    // Unencrypted export
+    return serializeWalletToText({
+      masterPrivateKey,
+      chainCode,
+      descriptorPath,
+      isBIP32,
+      addresses,
+    });
+  }
+
+  /**
+   * Import wallet from JSON backup
+   *
+   * @returns Object with success status and optionally recovered mnemonic
+   *
+   * @example
+   * ```ts
+   * const json = '{"version":"1.0",...}';
+   * const { success, mnemonic } = await Sphere.importFromJSON({
+   *   jsonContent: json,
+   *   password: 'secret', // if encrypted
+   *   storage, transport, oracle,
+   * });
+   * ```
+   */
+  static async importFromJSON(options: {
+    jsonContent: string;
+    password?: string;
+    storage: StorageProvider;
+    transport: TransportProvider;
+    oracle: OracleProvider;
+    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
+    try {
+      const data = JSON.parse(options.jsonContent) as WalletJSON;
+
+      if (data.version !== '1.0' || data.type !== 'sphere-wallet') {
+        return { success: false, error: 'Invalid wallet format' };
+      }
+
+      // Decrypt if needed
+      let mnemonic = data.mnemonic;
+      let masterKey = data.wallet.masterPrivateKey;
+
+      if (data.encrypted && options.password) {
+        if (mnemonic) {
+          const decrypted = decryptSimple(mnemonic, options.password);
+          if (!decrypted) {
+            return { success: false, error: 'Failed to decrypt mnemonic - wrong password?' };
+          }
+          mnemonic = decrypted;
+        }
+        if (masterKey) {
+          const decrypted = decryptSimple(masterKey, options.password);
+          if (!decrypted) {
+            return { success: false, error: 'Failed to decrypt master key - wrong password?' };
+          }
+          masterKey = decrypted;
+        }
+      } else if (data.encrypted && !options.password) {
+        return { success: false, error: 'Password required for encrypted wallet' };
+      }
+
+      // Determine base path
+      const basePath = data.wallet.descriptorPath
+        ? `m/${data.wallet.descriptorPath}`
+        : DEFAULT_BASE_PATH;
+
+      // Import using mnemonic if available (preferred)
+      if (mnemonic) {
+        await Sphere.import({
+          mnemonic,
+          basePath,
+          storage: options.storage,
+          transport: options.transport,
+          oracle: options.oracle,
+          tokenStorage: options.tokenStorage,
+        });
+        return { success: true, mnemonic };
+      }
+
+      // Otherwise import using master key
+      if (masterKey) {
+        await Sphere.import({
+          masterKey,
+          chainCode: data.wallet.chainCode,
+          basePath,
+          derivationMode: data.derivationMode || (data.wallet.isBIP32 ? 'bip32' : 'wif_hmac'),
+          storage: options.storage,
+          transport: options.transport,
+          oracle: options.oracle,
+          tokenStorage: options.tokenStorage,
+        });
+        return { success: true };
+      }
+
+      return { success: false, error: 'No mnemonic or master key in wallet data' };
+    } catch (e) {
+      return {
+        success: false,
+        error: e instanceof Error ? e.message : 'Failed to parse wallet JSON',
+      };
+    }
+  }
+
+  /**
+   * Import wallet from legacy file (.dat, .txt, or mnemonic text)
+   *
+   * Supports:
+   * - Bitcoin Core wallet.dat files (SQLite format, encrypted or unencrypted)
+   * - Text backup files (UNICITY WALLET DETAILS format)
+   * - Plain mnemonic text (12 or 24 words)
+   *
+   * @returns Object with success status, created Sphere instance, and optionally recovered mnemonic
+   *
+   * @example
+   * ```ts
+   * // Import from .dat file
+   * const fileBuffer = await file.arrayBuffer();
+   * const result = await Sphere.importFromLegacyFile({
+   *   fileContent: new Uint8Array(fileBuffer),
+   *   fileName: 'wallet.dat',
+   *   password: 'wallet-password', // if encrypted
+   *   storage, transport, oracle,
+   * });
+   *
+   * // Import from .txt file
+   * const textContent = await file.text();
+   * const result = await Sphere.importFromLegacyFile({
+   *   fileContent: textContent,
+   *   fileName: 'backup.txt',
+   *   storage, transport, oracle,
+   * });
+   * ```
+   */
+  static async importFromLegacyFile(options: {
+    /** File content - Uint8Array for .dat, string for .txt */
+    fileContent: string | Uint8Array;
+    /** File name (used for type detection) */
+    fileName: string;
+    /** Password for encrypted files */
+    password?: string;
+    /** Progress callback for long decryption operations */
+    onDecryptProgress?: DecryptionProgressCallback;
+    /** Storage provider instance */
+    storage: StorageProvider;
+    /** Transport provider instance */
+    transport: TransportProvider;
+    /** Oracle provider instance */
+    oracle: OracleProvider;
+    /** Optional token storage provider */
+    tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+    /** Optional nametag to register */
+    nametag?: string;
+  }): Promise<{
+    success: boolean;
+    sphere?: Sphere;
+    mnemonic?: string;
+    needsPassword?: boolean;
+    error?: string;
+  }> {
+    const { fileContent, fileName, password, onDecryptProgress } = options;
+
+    // Detect file type
+    const fileType = Sphere.detectLegacyFileType(fileName, fileContent);
+
+    if (fileType === 'unknown') {
+      return { success: false, error: 'Unknown file format' };
+    }
+
+    // Handle mnemonic text
+    if (fileType === 'mnemonic') {
+      const mnemonic = (fileContent as string).trim().toLowerCase().split(/\s+/).join(' ');
+      if (!Sphere.validateMnemonic(mnemonic)) {
+        return { success: false, error: 'Invalid mnemonic phrase' };
+      }
+
+      const sphere = await Sphere.import({
+        mnemonic,
+        storage: options.storage,
+        transport: options.transport,
+        oracle: options.oracle,
+        tokenStorage: options.tokenStorage,
+        nametag: options.nametag,
+      });
+
+      return { success: true, sphere, mnemonic };
+    }
+
+    // Handle .dat file
+    if (fileType === 'dat') {
+      const data = fileContent instanceof Uint8Array
+        ? fileContent
+        : new TextEncoder().encode(fileContent);
+
+      let parseResult;
+
+      if (password) {
+        parseResult = await parseAndDecryptWalletDat(data, password, onDecryptProgress);
+      } else {
+        parseResult = parseWalletDat(data);
+      }
+
+      if (parseResult.needsPassword && !password) {
+        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+      }
+
+      if (!parseResult.success || !parseResult.data) {
+        return { success: false, error: parseResult.error };
+      }
+
+      const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
+
+      // Build base path from descriptor path
+      const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
+
+      const sphere = await Sphere.import({
+        masterKey,
+        chainCode,
+        basePath,
+        derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
+        storage: options.storage,
+        transport: options.transport,
+        oracle: options.oracle,
+        tokenStorage: options.tokenStorage,
+        nametag: options.nametag,
+      });
+
+      return { success: true, sphere };
+    }
+
+    // Handle .txt file
+    if (fileType === 'txt') {
+      const content = typeof fileContent === 'string'
+        ? fileContent
+        : new TextDecoder().decode(fileContent);
+
+      let parseResult;
+
+      if (password) {
+        parseResult = parseAndDecryptWalletText(content, password);
+      } else if (isTextWalletEncrypted(content)) {
+        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+      } else {
+        parseResult = parseWalletText(content);
+      }
+
+      if (parseResult.needsPassword && !password) {
+        return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+      }
+
+      if (!parseResult.success || !parseResult.data) {
+        return { success: false, error: parseResult.error };
+      }
+
+      const { masterKey, chainCode, descriptorPath, derivationMode } = parseResult.data;
+
+      const basePath = descriptorPath ? `m/${descriptorPath}` : DEFAULT_BASE_PATH;
+
+      const sphere = await Sphere.import({
+        masterKey,
+        chainCode,
+        basePath,
+        derivationMode: derivationMode || (chainCode ? 'bip32' : 'wif_hmac'),
+        storage: options.storage,
+        transport: options.transport,
+        oracle: options.oracle,
+        tokenStorage: options.tokenStorage,
+        nametag: options.nametag,
+      });
+
+      return { success: true, sphere };
+    }
+
+    // Handle JSON (redirect to importFromJSON)
+    if (fileType === 'json') {
+      const content = typeof fileContent === 'string'
+        ? fileContent
+        : new TextDecoder().decode(fileContent);
+
+      const result = await Sphere.importFromJSON({
+        jsonContent: content,
+        password,
+        storage: options.storage,
+        transport: options.transport,
+        oracle: options.oracle,
+        tokenStorage: options.tokenStorage,
+      });
+
+      if (result.success) {
+        const sphere = Sphere.getInstance();
+        return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
+      }
+
+      return result;
+    }
+
+    return { success: false, error: 'Unsupported file type' };
+  }
+
+  /**
+   * Detect legacy file type from filename and content
+   */
+  static detectLegacyFileType(fileName: string, content: string | Uint8Array): LegacyFileType {
+    // .dat files are binary
+    if (fileName.endsWith('.dat')) {
+      return 'dat';
+    }
+
+    // Check content for type detection
+    const textContent = typeof content === 'string'
+      ? content
+      : (content.length < 1000 ? new TextDecoder().decode(content) : '');
+
+    // Check for JSON
+    if (fileName.endsWith('.json')) {
+      return 'json';
+    }
+
+    try {
+      const trimmed = textContent.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        JSON.parse(trimmed);
+        return 'json';
+      }
+    } catch {
+      // Not JSON
+    }
+
+    // Check for mnemonic (12 or 24 words)
+    const words = textContent.trim().split(/\s+/);
+    if (
+      (words.length === 12 || words.length === 24) &&
+      words.every((w) => /^[a-z]+$/.test(w.toLowerCase()))
+    ) {
+      return 'mnemonic';
+    }
+
+    // Check for text wallet format
+    if (isWalletTextFormat(textContent)) {
+      return 'txt';
+    }
+
+    // Check for SQLite (binary .dat)
+    if (content instanceof Uint8Array && isSQLiteDatabase(content)) {
+      return 'dat';
+    }
+
+    return 'unknown';
+  }
+
+  /**
+   * Check if a legacy file is encrypted
+   */
+  static isLegacyFileEncrypted(fileName: string, content: string | Uint8Array): boolean {
+    const fileType = Sphere.detectLegacyFileType(fileName, content);
+
+    if (fileType === 'dat' && content instanceof Uint8Array) {
+      return isWalletDatEncrypted(content);
+    }
+
+    if (fileType === 'txt') {
+      const textContent = typeof content === 'string'
+        ? content
+        : new TextDecoder().decode(content);
+      return isTextWalletEncrypted(textContent);
+    }
+
+    if (fileType === 'json') {
+      try {
+        const textContent = typeof content === 'string'
+          ? content
+          : new TextDecoder().decode(content);
+        const data = JSON.parse(textContent);
+        return !!data.encrypted;
+      } catch {
+        return false;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Derive address at a specific index
+   *
+   * @param index - Address index (0, 1, 2, ...)
+   * @param isChange - Whether this is a change address (default: false)
+   * @returns Address info with privateKey, publicKey, address, path, index
+   *
+   * @example
+   * ```ts
+   * // Derive first receiving address
+   * const addr0 = sphere.deriveAddress(0);
+   * console.log(addr0.address); // alpha1...
+   *
+   * // Derive second receiving address
+   * const addr1 = sphere.deriveAddress(1);
+   *
+   * // Derive change address
+   * const change = sphere.deriveAddress(0, true);
+   * ```
+   */
+  deriveAddress(index: number, isChange: boolean = false): AddressInfo {
+    this.ensureReady();
+
+    if (!this._masterKey) {
+      throw new Error('HD derivation requires master key with chain code');
+    }
+
+    const info = deriveAddressInfo(
+      this._masterKey,
+      this._basePath,
+      index,
+      isChange
+    );
+
+    // Convert hash160 to proper address format
+    return {
+      ...info,
+      address: 'alpha1' + info.address.slice(0, 38),
+    };
+  }
+
+  /**
+   * Derive address at a full BIP32 path
+   *
+   * @param path - Full BIP32 path like "m/44'/0'/0'/0/5"
+   * @returns Address info
+   *
+   * @example
+   * ```ts
+   * const addr = sphere.deriveAddressAtPath("m/44'/0'/0'/0/5");
+   * ```
+   */
+  deriveAddressAtPath(path: string): AddressInfo {
+    this.ensureReady();
+
+    if (!this._masterKey) {
+      throw new Error('HD derivation requires master key with chain code');
+    }
+
+    // Parse path to extract index
+    const match = path.match(/\/(\d+)$/);
+    const index = match ? parseInt(match[1], 10) : 0;
+
+    const derived = deriveKeyAtPath(
+      this._masterKey.privateKey,
+      this._masterKey.chainCode,
+      path
+    );
+
+    const publicKey = getPublicKey(derived.privateKey);
+    const addressHash = hash160(publicKey);
+
+    return {
+      privateKey: derived.privateKey,
+      publicKey,
+      address: 'alpha1' + addressHash.slice(0, 38),
+      path,
+      index,
+    };
+  }
+
+  /**
+   * Derive multiple addresses starting from index 0
+   *
+   * @param count - Number of addresses to derive
+   * @param includeChange - Include change addresses (default: false)
+   * @returns Array of address info
+   *
+   * @example
+   * ```ts
+   * // Get first 5 receiving addresses
+   * const addresses = sphere.deriveAddresses(5);
+   *
+   * // Get 5 receiving + 5 change addresses
+   * const allAddresses = sphere.deriveAddresses(5, true);
+   * ```
+   */
+  deriveAddresses(count: number, includeChange: boolean = false): AddressInfo[] {
+    const addresses: AddressInfo[] = [];
+
+    for (let i = 0; i < count; i++) {
+      addresses.push(this.deriveAddress(i, false));
+    }
+
+    if (includeChange) {
+      for (let i = 0; i < count; i++) {
+        addresses.push(this.deriveAddress(i, true));
+      }
+    }
+
+    return addresses;
+  }
+
+  // ===========================================================================
+  // Public Methods - Status
+  // ===========================================================================
+
+  getStatus(): {
+    storage: { connected: boolean };
+    transport: { connected: boolean };
+    oracle: { connected: boolean };
+  } {
+    return {
+      storage: { connected: this._storage.isConnected() },
+      transport: { connected: this._transport.isConnected() },
+      oracle: { connected: this._oracle.isConnected() },
+    };
+  }
+
+  async reconnect(): Promise<void> {
+    await this._transport.disconnect();
+    await this._transport.connect();
+
+    this.emitEvent('connection:changed', {
+      provider: 'transport',
+      connected: true,
+    });
+  }
+
+  // ===========================================================================
+  // Public Methods - Events
+  // ===========================================================================
+
+  on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void {
+    if (!this.eventHandlers.has(type)) {
+      this.eventHandlers.set(type, new Set());
+    }
+    this.eventHandlers.get(type)!.add(handler as SphereEventHandler<SphereEventType>);
+
+    return () => {
+      this.eventHandlers.get(type)?.delete(handler as SphereEventHandler<SphereEventType>);
+    };
+  }
+
+  off<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): void {
+    this.eventHandlers.get(type)?.delete(handler as SphereEventHandler<SphereEventType>);
+  }
+
+  // ===========================================================================
+  // Public Methods - Sync
+  // ===========================================================================
+
+  async sync(): Promise<void> {
+    this.ensureReady();
+    await this._payments.sync();
+  }
+
+  // ===========================================================================
+  // Public Methods - Nametag
+  // ===========================================================================
+
+  /**
+   * Get current nametag (if registered)
+   */
+  getNametag(): string | undefined {
+    return this._identity?.nametag;
+  }
+
+  /**
+   * Check if nametag is registered
+   */
+  hasNametag(): boolean {
+    return !!this._identity?.nametag;
+  }
+
+  /**
+   * Register a nametag for this wallet
+   * Can be called after wallet creation if nametag wasn't provided in config
+   *
+   * @example
+   * ```ts
+   * // Create wallet without nametag
+   * const sphere = await Sphere.create({ mnemonic, storage, transport, oracle });
+   *
+   * // Later, register nametag
+   * await sphere.registerNametag('alice');
+   * console.log(sphere.getNametag()); // 'alice'
+   * ```
+   */
+  async registerNametag(nametag: string): Promise<void> {
+    this.ensureReady();
+
+    // Validate nametag format
+    const cleanNametag = nametag.startsWith('@') ? nametag.slice(1) : nametag;
+    if (!this.validateNametag(cleanNametag)) {
+      throw new Error('Invalid nametag format. Use alphanumeric characters, 3-20 chars.');
+    }
+
+    // Check if already registered
+    if (this._identity?.nametag) {
+      throw new Error(`Nametag already registered: @${this._identity.nametag}`);
+    }
+
+    // Register with transport provider
+    if (this._transport.registerNametag) {
+      const success = await this._transport.registerNametag(cleanNametag, this._identity!.publicKey);
+      if (!success) {
+        throw new Error('Failed to register nametag. It may already be taken.');
+      }
+    }
+
+    // Update identity
+    this._identity!.nametag = cleanNametag;
+
+    // Persist to storage
+    await this._storage.set(STORAGE_KEYS.NAMETAG, cleanNametag);
+
+    this.emitEvent('nametag:registered', { nametag: cleanNametag });
+    console.log('[Sphere] Nametag registered:', cleanNametag);
+  }
+
+  /**
+   * Validate nametag format
+   */
+  private validateNametag(nametag: string): boolean {
+    // Alphanumeric characters and underscores allowed
+    const pattern = new RegExp(
+      `^[a-zA-Z0-9_]{${LIMITS.NAMETAG_MIN_LENGTH},${LIMITS.NAMETAG_MAX_LENGTH}}$`
+    );
+    return pattern.test(nametag);
+  }
+
+  // ===========================================================================
+  // Public Methods - Lifecycle
+  // ===========================================================================
+
+  async destroy(): Promise<void> {
+    this._payments.destroy();
+    this._communications.destroy();
+
+    await this._transport.disconnect();
+    await this._storage.disconnect();
+    await this._oracle.disconnect();
+
+    this._initialized = false;
+    this._identity = null;
+    this.eventHandlers.clear();
+
+    if (Sphere.instance === this) {
+      Sphere.instance = null;
+    }
+  }
+
+  // ===========================================================================
+  // Private: Storage
+  // ===========================================================================
+
+  private async storeMnemonic(mnemonic: string, derivationPath?: string, basePath?: string): Promise<void> {
+    // TODO: Encrypt with user password/PIN
+    const encrypted = this.encrypt(mnemonic);
+    await this._storage.set(STORAGE_KEYS.MNEMONIC, encrypted);
+
+    // Store mnemonic in memory for getMnemonic()
+    this._mnemonic = mnemonic;
+    this._source = 'mnemonic';
+    this._derivationMode = 'bip32';
+
+    if (derivationPath) {
+      await this._storage.set(STORAGE_KEYS.DERIVATION_PATH, derivationPath);
+    }
+
+    const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
+    this._basePath = effectiveBasePath;
+    await this._storage.set(STORAGE_KEYS.BASE_PATH, effectiveBasePath);
+    await this._storage.set(STORAGE_KEYS.DERIVATION_MODE, this._derivationMode);
+    await this._storage.set(STORAGE_KEYS.WALLET_SOURCE, this._source);
+    await this._storage.set(STORAGE_KEYS.WALLET_EXISTS, 'true');
+  }
+
+  private async storeMasterKey(
+    masterKey: string,
+    chainCode?: string,
+    derivationPath?: string,
+    basePath?: string,
+    derivationMode?: DerivationMode
+  ): Promise<void> {
+    const encrypted = this.encrypt(masterKey);
+    await this._storage.set(STORAGE_KEYS.MASTER_KEY, encrypted);
+
+    // Set source and derivation mode
+    this._source = 'file';
+    this._mnemonic = null;
+
+    // Determine derivation mode from chain code if not specified
+    if (derivationMode) {
+      this._derivationMode = derivationMode;
+    } else {
+      this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
+    }
+
+    if (chainCode) {
+      await this._storage.set(STORAGE_KEYS.CHAIN_CODE, chainCode);
+    }
+
+    if (derivationPath) {
+      await this._storage.set(STORAGE_KEYS.DERIVATION_PATH, derivationPath);
+    }
+
+    const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
+    this._basePath = effectiveBasePath;
+    await this._storage.set(STORAGE_KEYS.BASE_PATH, effectiveBasePath);
+    await this._storage.set(STORAGE_KEYS.DERIVATION_MODE, this._derivationMode);
+    await this._storage.set(STORAGE_KEYS.WALLET_SOURCE, this._source);
+    await this._storage.set(STORAGE_KEYS.WALLET_EXISTS, 'true');
+  }
+
+  // ===========================================================================
+  // Private: Identity Initialization
+  // ===========================================================================
+
+  private async loadIdentityFromStorage(): Promise<void> {
+    const encryptedMnemonic = await this._storage.get(STORAGE_KEYS.MNEMONIC);
+    const encryptedMasterKey = await this._storage.get(STORAGE_KEYS.MASTER_KEY);
+    const chainCode = await this._storage.get(STORAGE_KEYS.CHAIN_CODE);
+    const derivationPath = await this._storage.get(STORAGE_KEYS.DERIVATION_PATH);
+    const savedNametag = await this._storage.get(STORAGE_KEYS.NAMETAG);
+    const savedBasePath = await this._storage.get(STORAGE_KEYS.BASE_PATH);
+    const savedDerivationMode = await this._storage.get(STORAGE_KEYS.DERIVATION_MODE);
+    const savedSource = await this._storage.get(STORAGE_KEYS.WALLET_SOURCE);
+
+    // Restore wallet metadata
+    this._basePath = savedBasePath ?? DEFAULT_BASE_PATH;
+    this._derivationMode = (savedDerivationMode as DerivationMode) ?? 'bip32';
+    this._source = (savedSource as WalletSource) ?? 'unknown';
+
+    if (encryptedMnemonic) {
+      const mnemonic = this.decrypt(encryptedMnemonic);
+      if (!mnemonic) {
+        throw new Error('Failed to decrypt mnemonic');
+      }
+      this._mnemonic = mnemonic;
+      this._source = 'mnemonic';
+      await this.initializeIdentityFromMnemonic(mnemonic, derivationPath ?? undefined);
+    } else if (encryptedMasterKey) {
+      const masterKey = this.decrypt(encryptedMasterKey);
+      if (!masterKey) {
+        throw new Error('Failed to decrypt master key');
+      }
+      this._mnemonic = null;
+      if (this._source === 'unknown') {
+        this._source = 'file';
+      }
+      await this.initializeIdentityFromMasterKey(
+        masterKey,
+        chainCode ?? undefined,
+        derivationPath ?? undefined
+      );
+    } else {
+      throw new Error('No wallet data found in storage');
+    }
+
+    // Restore saved nametag
+    if (savedNametag && this._identity) {
+      this._identity.nametag = savedNametag;
+      console.log('[Sphere] Restored nametag:', savedNametag);
+    }
+  }
+
+  private async initializeIdentityFromMnemonic(
+    mnemonic: string,
+    derivationPath?: string
+  ): Promise<void> {
+    const path = derivationPath ?? DEFAULT_DERIVATION_PATH;
+
+    // Generate master key from mnemonic using BIP39/BIP32
+    const masterKey = identityFromMnemonicSync(mnemonic);
+
+    // Derive key at path (e.g., m/44'/0'/0'/0/0)
+    const derivedKey = deriveKeyAtPath(
+      masterKey.privateKey,
+      masterKey.chainCode,
+      `${path}/0/0`
+    );
+
+    // Get public key from derived private key
+    const publicKey = getPublicKey(derivedKey.privateKey);
+
+    // Generate address hash (platform implementations will do bech32 encoding)
+    const addressHash = hash160(publicKey);
+
+    // Generate IPNS name from public key hash
+    const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
+
+    this._identity = {
+      privateKey: derivedKey.privateKey,
+      publicKey,
+      address: 'alpha1' + addressHash.slice(0, 38),
+      ipnsName: '12D3KooW' + ipnsHash,
+    };
+
+    // Store master key info for future derivations
+    this._masterKey = masterKey;
+
+    console.log('[Sphere] Identity initialized from mnemonic, path:', path);
+  }
+
+  private async initializeIdentityFromMasterKey(
+    masterKey: string,
+    chainCode?: string,
+    derivationPath?: string
+  ): Promise<void> {
+    const path = derivationPath ?? DEFAULT_DERIVATION_PATH;
+
+    let privateKey: string;
+
+    if (chainCode) {
+      // Full BIP32 derivation with chain code
+      const derivedKey = deriveKeyAtPath(masterKey, chainCode, `${path}/0/0`);
+      privateKey = derivedKey.privateKey;
+
+      this._masterKey = {
+        privateKey: masterKey,
+        chainCode,
+      };
+    } else {
+      // Direct master key usage (legacy wallets)
+      privateKey = masterKey;
+      this._masterKey = null;
+    }
+
+    const publicKey = getPublicKey(privateKey);
+    const addressHash = hash160(publicKey);
+    const ipnsHash = sha256(publicKey, 'hex').slice(0, 40);
+
+    this._identity = {
+      privateKey,
+      publicKey,
+      address: 'alpha1' + addressHash.slice(0, 38),
+      ipnsName: '12D3KooW' + ipnsHash,
+    };
+
+    console.log('[Sphere] Identity initialized from master key, path:', path, 'chainCode:', !!chainCode);
+  }
+
+  // ===========================================================================
+  // Private: Provider & Module Initialization
+  // ===========================================================================
+
+  private async initializeProviders(): Promise<void> {
+    // Set identity on providers
+    this._storage.setIdentity(this._identity!);
+    this._transport.setIdentity(this._identity!);
+
+    if (this._tokenStorage) {
+      this._tokenStorage.setIdentity(this._identity!);
+    }
+
+    // Connect providers
+    await this._storage.connect();
+    await this._transport.connect();
+    await this._oracle.initialize();
+
+    if (this._tokenStorage) {
+      await this._tokenStorage.initialize();
+    }
+  }
+
+  private async initializeModules(): Promise<void> {
+    const emitEvent = this.emitEvent.bind(this);
+
+    this._payments.initialize({
+      identity: this._identity!,
+      storage: this._storage,
+      tokenStorage: this._tokenStorage,
+      transport: this._transport,
+      oracle: this._oracle,
+      emitEvent,
+    });
+
+    this._communications.initialize({
+      identity: this._identity!,
+      storage: this._storage,
+      transport: this._transport,
+      emitEvent,
+    });
+
+    await this._payments.load();
+    await this._communications.load();
+  }
+
+  // ===========================================================================
+  // Private: Helpers
+  // ===========================================================================
+
+  private ensureReady(): void {
+    if (!this._initialized) {
+      throw new Error('Sphere not initialized');
+    }
+  }
+
+  private emitEvent<T extends SphereEventType>(type: T, data: SphereEventMap[T]): void {
+    const handlers = this.eventHandlers.get(type);
+    if (!handlers) return;
+
+    for (const handler of handlers) {
+      try {
+        (handler as SphereEventHandler<T>)(data);
+      } catch (error) {
+        console.error('[Sphere] Event handler error:', error);
+      }
+    }
+  }
+
+  // ===========================================================================
+  // Private: Encryption
+  // ===========================================================================
+
+  private encrypt(data: string): string {
+    // Use AES-256 encryption with default key
+    // TODO: Add password parameter to create/load for user-provided encryption
+    return encryptSimple(data, DEFAULT_ENCRYPTION_KEY);
+  }
+
+  private decrypt(encrypted: string): string | null {
+    try {
+      return decryptSimple(encrypted, DEFAULT_ENCRYPTION_KEY);
+    } catch {
+      return null;
+    }
+  }
+}
+
+// =============================================================================
+// Convenience Exports
+// =============================================================================
+
+export const createSphere = Sphere.create.bind(Sphere);
+export const loadSphere = Sphere.load.bind(Sphere);
+export const importSphere = Sphere.import.bind(Sphere);
+export const initSphere = Sphere.init.bind(Sphere);
+export const getSphere = Sphere.getInstance.bind(Sphere);
+export const sphereExists = Sphere.exists.bind(Sphere);
