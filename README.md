@@ -1,4 +1,4 @@
-# Sphere SDK2
+# Sphere SDK
 
 A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (ALPHA blockchain) and Layer 3 (Unicity state transition network).
 
@@ -25,9 +25,10 @@ npm install @unicitylabs/sphere-sdk
 ## Quick Start
 
 ```typescript
-import { Sphere, createBrowserProviders } from '@unicitylabs/sphere-sdk';
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 
-// Create providers
+// Create providers (browser)
 const providers = createBrowserProviders({
   oracle: { url: '/rpc' },
 });
@@ -145,12 +146,12 @@ const { fee, feeRate } = await sphere.payments.l1.estimateFee('alpha1...', '5000
 ## Alternative: Manual Create/Load
 
 ```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
 import {
-  Sphere,
   createLocalStorageProvider,
   createNostrTransportProvider,
   createUnicityAggregatorProvider,
-} from '@unicitylabs/sphere-sdk';
+} from '@unicitylabs/sphere-sdk/impl/browser';
 
 const storage = createLocalStorageProvider();
 const transport = createNostrTransportProvider();
@@ -276,7 +277,7 @@ const isEncrypted = Sphere.isLegacyFileEncrypted(fileName, content);
 
 ## Core Utilities
 
-SDK2 exports commonly needed utility functions:
+The SDK exports commonly needed utility functions:
 
 ```typescript
 import {
@@ -400,11 +401,10 @@ Core Utilities
 
 - [Integration Guide](./docs/INTEGRATION.md)
 - [API Reference](./docs/API.md)
-- [Implementation Plan](./IMPLEMENTATION_PLAN.md)
 
 ## Browser Providers
 
-SDK2 includes browser-ready provider implementations:
+The SDK includes browser-ready provider implementations:
 
 | Provider | Description |
 |----------|-------------|

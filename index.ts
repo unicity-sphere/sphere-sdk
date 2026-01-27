@@ -1,7 +1,7 @@
 /**
- * Sphere SDK v2
+ * Sphere SDK
  *
- * A clean, modular SDK for the Unicity network with proper abstraction layers.
+ * A modular TypeScript SDK for the Unicity network with proper abstraction layers.
  *
  * Architecture:
  * - Core types and interfaces are platform-independent
@@ -14,14 +14,14 @@
  * import {
  *   createLocalStorageProvider,
  *   createNostrTransportProvider,
- *   createUnicityOracleProvider,
+ *   createUnicityAggregatorProvider,
  * } from '@unicitylabs/sphere-sdk/impl/browser';
  *
  * const sphere = await Sphere.create({
  *   identity: { mnemonic: 'your twelve words...' },
  *   storage: createLocalStorageProvider(),
  *   transport: createNostrTransportProvider(),
- *   oracle: createUnicityOracleProvider({ url: '/rpc' }),
+ *   oracle: createUnicityAggregatorProvider({ url: '/rpc' }),
  * });
  *
  * // Payments
