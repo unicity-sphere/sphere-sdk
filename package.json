@@ -32,7 +32,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "lint": "eslint . --ext .ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "cli": "npx tsx cli.ts"
   },
   "keywords": [
     "unicity",
