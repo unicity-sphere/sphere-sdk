@@ -31,6 +31,7 @@ import type {
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import { TokenSplitCalculator } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
+import { NametagMinter, type MintNametagResult } from './NametagMinter';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type {
   TransportProvider,
@@ -1696,6 +1697,117 @@ export class PaymentsModule {
     this.ensureInitialized();
     this.nametag = null;
     await this.save();
+  }
+
+  /**
+   * Mint a nametag token on-chain (like Sphere wallet and lottery)
+   * This creates the nametag token required for receiving tokens via PROXY addresses
+   *
+   * @param nametag - The nametag to mint (e.g., "alice" or "@alice")
+   * @returns MintNametagResult with success status and token if successful
+   */
+  async mintNametag(nametag: string): Promise<MintNametagResult> {
+    this.ensureInitialized();
+
+    // Get state transition client and trust base
+    const stClient = this.deps!.oracle.getStateTransitionClient?.();
+    if (!stClient) {
+      return {
+        success: false,
+        error: 'State transition client not available. Oracle provider must implement getStateTransitionClient()',
+      };
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!trustBase) {
+      return {
+        success: false,
+        error: 'Trust base not available. Oracle provider must implement getTrustBase()',
+      };
+    }
+
+    try {
+      // Create signing service
+      const signingService = await this.createSigningService();
+
+      // Create owner address using UnmaskedPredicateReference (same pattern as TokenSplitExecutor)
+      const { UnmaskedPredicateReference } = await import('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference');
+      const { TokenType } = await import('@unicitylabs/state-transition-sdk/lib/token/TokenType');
+
+      // Use a dummy token type for address creation (like Sphere wallet does)
+      const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+      const tokenType = new TokenType(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
+
+      const addressRef = await UnmaskedPredicateReference.create(
+        tokenType,
+        signingService.algorithm,
+        signingService.publicKey,
+        HashAlgorithm.SHA256
+      );
+      const ownerAddress = await addressRef.toAddress();
+
+      // Create NametagMinter
+      const minter = new NametagMinter({
+        stateTransitionClient: stClient,
+        trustBase,
+        signingService,
+        debug: this.moduleConfig.debug,
+      });
+
+      // Mint the nametag
+      const result = await minter.mintNametag(nametag, ownerAddress);
+
+      if (result.success && result.nametagData) {
+        // Save the nametag data
+        await this.setNametag(result.nametagData);
+        this.log(`Nametag minted and saved: ${result.nametagData.name}`);
+
+        // Emit event (use existing nametag:registered event type)
+        this.deps!.emitEvent('nametag:registered', {
+          nametag: result.nametagData.name,
+          addressIndex: 0, // Primary address
+        });
+      }
+
+      return result;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      this.log('mintNametag failed:', errorMsg);
+      return {
+        success: false,
+        error: errorMsg,
+      };
+    }
+  }
+
+  /**
+   * Check if a nametag is available for minting
+   * @param nametag - The nametag to check (e.g., "alice" or "@alice")
+   */
+  async isNametagAvailable(nametag: string): Promise<boolean> {
+    this.ensureInitialized();
+
+    const stClient = this.deps!.oracle.getStateTransitionClient?.();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+    if (!stClient || !trustBase) {
+      return false;
+    }
+
+    try {
+      const signingService = await this.createSigningService();
+      const minter = new NametagMinter({
+        stateTransitionClient: stClient,
+        trustBase,
+        signingService,
+      });
+
+      return await minter.isNametagAvailable(nametag);
+    } catch {
+      return false;
+    }
   }
 
   // ===========================================================================

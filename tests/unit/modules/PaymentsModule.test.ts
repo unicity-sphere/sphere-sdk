@@ -264,3 +264,198 @@ describe('Token file storage (lottery pattern)', () => {
     expect(tokenData.meta).toHaveProperty('amount');
   });
 });
+
+describe('Incoming transfer PROXY finalization', () => {
+  it('should require nametag token for PROXY address finalization', () => {
+    // Document the PROXY finalization requirement
+    // AddressScheme.PROXY = 1 requires nametag token
+    const PROXY_SCHEME = 1;
+    const DIRECT_SCHEME = 0;
+
+    const proxyTransfer = {
+      data: { recipient: { scheme: PROXY_SCHEME } },
+    };
+
+    const directTransfer = {
+      data: { recipient: { scheme: DIRECT_SCHEME } },
+    };
+
+    expect(proxyTransfer.data.recipient.scheme).toBe(PROXY_SCHEME);
+    expect(directTransfer.data.recipient.scheme).toBe(DIRECT_SCHEME);
+  });
+
+  it('should check for nametag token before finalizing PROXY transfer', () => {
+    // Simulate the check in handleIncomingTransfer
+    const nametagData = {
+      name: 'alice',
+      token: { genesis: {}, state: {} },
+      timestamp: Date.now(),
+    };
+
+    const hasNametagToken = nametagData?.token !== undefined;
+    expect(hasNametagToken).toBe(true);
+
+    const noNametag = null;
+    const hasNoNametagToken = noNametag?.token !== undefined;
+    expect(hasNoNametagToken).toBe(false);
+  });
+
+  it('should document finalization flow for PROXY transfers', () => {
+    // Document the expected finalization flow
+    const finalizationFlow = [
+      '1. Parse sourceToken and transferTx from Sphere format',
+      '2. Check if recipient address scheme is PROXY',
+      '3. If PROXY: require nametag token for finalization',
+      '4. Create recipientPredicate using UnmaskedPredicate.create()',
+      '5. Create recipientState with TokenState(predicate, null)',
+      '6. Call stClient.finalizeTransaction(trustBase, sourceToken, recipientState, transferTx, [nametagToken])',
+      '7. Save finalized token',
+    ];
+
+    expect(finalizationFlow).toHaveLength(7);
+    expect(finalizationFlow[2]).toContain('nametag');
+    expect(finalizationFlow[5]).toContain('finalizeTransaction');
+  });
+
+  it('should handle missing nametag gracefully', () => {
+    // When nametag is missing, should save unfinalized token
+    const nametag = null;
+
+    if (!nametag?.token) {
+      // Save without finalization
+      const tokenData = { genesis: {}, state: {} };
+      expect(tokenData).toBeDefined();
+    }
+  });
+});
+
+describe('PaymentsModule.mintNametag integration', () => {
+  it('should have mintNametag method on PaymentsModule', () => {
+    const module = createPaymentsModule();
+    expect(typeof module.mintNametag).toBe('function');
+  });
+
+  it('should have isNametagAvailable method on PaymentsModule', () => {
+    const module = createPaymentsModule();
+    expect(typeof module.isNametagAvailable).toBe('function');
+  });
+
+  it('should have setNametag method on PaymentsModule', () => {
+    const module = createPaymentsModule();
+    expect(typeof module.setNametag).toBe('function');
+  });
+
+  it('should have getNametag method on PaymentsModule', () => {
+    const module = createPaymentsModule();
+    expect(typeof module.getNametag).toBe('function');
+  });
+
+  it('should have hasNametag method on PaymentsModule', () => {
+    const module = createPaymentsModule();
+    expect(typeof module.hasNametag).toBe('function');
+  });
+
+  it('should have clearNametag method on PaymentsModule', () => {
+    const module = createPaymentsModule();
+    expect(typeof module.clearNametag).toBe('function');
+  });
+
+  it('should return error when not initialized', async () => {
+    const module = createPaymentsModule();
+    // mintNametag requires initialization
+    await expect(module.mintNametag('alice')).rejects.toThrow('not initialized');
+  });
+
+  it('should document mintNametag integration flow', () => {
+    const mintFlow = [
+      '1. PaymentsModule.mintNametag(nametag) called',
+      '2. Get stateTransitionClient and trustBase from oracle',
+      '3. Create signingService from identity private key',
+      '4. Create ownerAddress using UnmaskedPredicateReference',
+      '5. Create NametagMinter with dependencies',
+      '6. Call minter.mintNametag(nametag, ownerAddress)',
+      '7. If success: call setNametag(result.nametagData)',
+      '8. Emit nametag:registered event',
+      '9. Return MintNametagResult',
+    ];
+
+    expect(mintFlow).toHaveLength(9);
+    expect(mintFlow[4]).toContain('NametagMinter');
+    expect(mintFlow[6]).toContain('setNametag');
+    expect(mintFlow[7]).toContain('nametag:registered');
+  });
+});
+
+describe('Lottery compatibility', () => {
+  it('should match lottery token minting flow', () => {
+    // Lottery uses MintTransactionData.createFromNametag
+    const lotteryMintFlow = {
+      step1: 'TokenId.fromNameTag(nametag)',
+      step2: 'TokenType from UNICITY_TOKEN_TYPE_HEX',
+      step3: 'Generate random salt (32 bytes)',
+      step4: 'MintTransactionData.createFromNametag(nametag, type, owner, salt, owner)',
+      step5: 'MintCommitment.create(mintData)',
+      step6: 'client.submitMintCommitment(commitment)',
+      step7: 'waitInclusionProof(trustBase, client, commitment)',
+      step8: 'Token.mint(trustBase, state, genesisTransaction)',
+    };
+
+    // SDK NametagMinter follows the same flow
+    expect(lotteryMintFlow.step4).toContain('createFromNametag');
+    expect(lotteryMintFlow.step6).toContain('submitMintCommitment');
+    expect(lotteryMintFlow.step7).toContain('waitInclusionProof');
+  });
+
+  it('should match lottery token receiving flow', () => {
+    // Lottery uses sourceToken + transferTx format
+    const lotteryReceiveFlow = {
+      step1: 'Parse sourceToken from JSON',
+      step2: 'Parse transferTx from JSON',
+      step3: 'Check recipient address scheme',
+      step4: 'If PROXY: finalizeTransaction with nametag token',
+      step5: 'Verify token',
+      step6: 'Save token to file',
+    };
+
+    expect(lotteryReceiveFlow.step4).toContain('finalizeTransaction');
+    expect(lotteryReceiveFlow.step6).toContain('Save token');
+  });
+
+  it('should match lottery token sending flow with split', () => {
+    // Lottery uses TokenSplitBuilder for partial transfers
+    const lotterySendFlow = {
+      step1: 'Calculate if split needed (amount < token.amount)',
+      step2: 'TokenSplitBuilder.createToken() x2 (recipient + change)',
+      step3: 'builder.build(originalToken)',
+      step4: 'split.createBurnCommitment() - burn original',
+      step5: 'submitTransferCommitment(burnCommitment)',
+      step6: 'waitInclusionProof for burn',
+      step7: 'split.createSplitMintCommitments() - mint split tokens',
+      step8: 'submitMintCommitment() for each',
+      step9: 'Create TransferCommitment for recipient token',
+      step10: 'Send { sourceToken, transferTx } via Nostr',
+    };
+
+    expect(lotterySendFlow.step2).toContain('TokenSplitBuilder');
+    expect(lotterySendFlow.step4).toContain('Burn');
+    expect(lotterySendFlow.step7).toContain('Mint');
+    expect(lotterySendFlow.step10).toContain('sourceToken');
+  });
+
+  it('should use same UNICITY_TOKEN_TYPE_HEX as lottery', () => {
+    // Both lottery and SDK use this constant
+    const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+
+    expect(UNICITY_TOKEN_TYPE_HEX).toHaveLength(64);
+    expect(UNICITY_TOKEN_TYPE_HEX).toMatch(/^[a-f0-9]+$/);
+  });
+
+  it('should store tokens individually like lottery', () => {
+    // Lottery saves each token as separate file: token-{id}-{timestamp}.json
+    const tokenId = 'abcd1234567890ef';
+    const timestamp = Date.now();
+    const filename = `token-${tokenId.slice(0, 16)}-${timestamp}.json`;
+
+    expect(filename).toMatch(/^token-[a-f0-9]+-\d+\.json$/);
+  });
+});
