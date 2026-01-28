@@ -535,6 +535,110 @@ type SphereEventType =
 
 ---
 
+## Nametag Minting
+
+Mint nametag tokens on-chain for PROXY address support (required for receiving tokens via @nametag).
+
+### Sphere Methods
+
+```typescript
+// Mint nametag token on-chain
+const result = await sphere.mintNametag('alice');
+
+if (result.success) {
+  console.log('Token minted:', result.nametagData?.name);
+} else {
+  console.error('Failed:', result.error);
+}
+
+// Check if nametag is available
+const available = await sphere.isNametagAvailable('alice');
+```
+
+### MintNametagResult
+
+```typescript
+interface MintNametagResult {
+  success: boolean;
+  token?: Token;           // The minted nametag token
+  nametagData?: NametagData;  // Nametag metadata
+  error?: string;          // Error message if failed
+}
+
+interface NametagData {
+  name: string;            // Nametag without @ prefix
+  token: object;           // Token JSON (genesis + state)
+  timestamp: number;       // Mint timestamp
+  format?: string;         // 'txf'
+  version?: string;        // '2.0'
+}
+```
+
+### NametagMinter Class
+
+For advanced usage, create a NametagMinter directly:
+
+```typescript
+import { NametagMinter, createNametagMinter } from '@unicitylabs/sphere-sdk';
+
+const minter = createNametagMinter({
+  stateTransitionClient: client,
+  trustBase: trustBase,
+  signingService: signingService,
+  debug: false,
+  skipVerification: false,
+});
+
+// Mint nametag
+const result = await minter.mintNametag('alice', ownerAddress);
+
+// Check availability
+const available = await minter.isNametagAvailable('alice');
+```
+
+### NametagMinterConfig
+
+```typescript
+interface NametagMinterConfig {
+  stateTransitionClient: StateTransitionClient;  // Required
+  trustBase: TrustBase;                          // Required
+  signingService: SigningService;                // Required
+  debug?: boolean;                               // Default: false
+  skipVerification?: boolean;                    // Default: false
+}
+```
+
+### Auto-mint on Registration
+
+The SDK automatically mints the nametag token on-chain whenever `registerNametag()` is called:
+
+```typescript
+// Option 1: During init (new wallet)
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your words...',
+  nametag: 'alice',  // Registers on Nostr AND mints token on-chain
+});
+
+// Option 2: Manual registration (e.g., for new derived address)
+await sphere.switchToAddress(1);
+await sphere.registerNametag('bob');  // Also mints token automatically
+
+// Option 3: On wallet load (auto-mint if token missing)
+const { sphere } = await Sphere.init({ ...providers });
+// If nametag exists but token is missing, it will be minted automatically
+```
+
+**When minting happens:**
+- `Sphere.create()` with nametag → mints via `registerNametag()`
+- `Sphere.load()` → mints if nametag exists but token is missing
+- `Sphere.import()` with nametag → mints via `registerNametag()`
+- `registerNametag()` → always mints if token not present
+
+Nametag token is required for receiving tokens via PROXY addresses (`finalizeTransaction` requires nametag token for PROXY scheme).
+
+---
+
 ## Token Split Calculator
 
 Utility for calculating optimal token splits for partial transfers.

@@ -567,6 +567,100 @@ unsubscribe();
 
 ---
 
+## Nametags
+
+Nametags provide human-readable addresses (e.g., `@alice`) for receiving tokens.
+
+### Registration Flow
+
+```typescript
+// Register during wallet creation
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your twelve words...',
+  nametag: 'alice',
+});
+
+// Or register after wallet is created
+await sphere.registerNametag('alice');
+
+// Mint nametag token on-chain (required for PROXY address transfers)
+const result = await sphere.mintNametag('alice');
+```
+
+### Multi-Address Nametags
+
+Each derived address can have its own nametag:
+
+```typescript
+// Register @alice for address 0
+await sphere.registerNametag('alice');
+
+// Switch to address 1 and register @bob
+await sphere.switchToAddress(1);
+await sphere.registerNametag('bob');
+
+// Query nametags
+sphere.getNametagForAddress(0);  // 'alice'
+sphere.getNametagForAddress(1);  // 'bob'
+sphere.getAllAddressNametags();  // Map { 0 => 'alice', 1 => 'bob' }
+```
+
+### Troubleshooting: "Nametag already taken"
+
+**Error:**
+```
+Failed to register nametag. It may already be taken.
+[NostrTransportProvider] Nametag already taken: myname - owner: f124f93ae6...
+```
+
+**Cause:** The nametag is registered to a different public key. This happens when:
+
+1. **Storage cleared or inaccessible** → `Sphere.exists()` returns `false` → new wallet created
+2. **Different mnemonic provided** on subsequent runs
+
+**Note:** `autoGenerate: true` does NOT generate new mnemonic every restart. It only generates if `Sphere.exists()` returns `false`.
+
+**Solution:**
+
+```typescript
+// ✅ Use persistent file storage (recommended for backend)
+import { FileStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const storage = new FileStorageProvider('./wallet-data');
+const { sphere } = await Sphere.init({
+  storage,  // Persists mnemonic to disk
+  autoGenerate: true,
+  nametag: 'myservice',
+});
+
+// ✅ Or use fixed mnemonic from environment
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: process.env.WALLET_MNEMONIC,
+  nametag: 'myservice',
+});
+```
+
+**Debug storage issues:**
+```typescript
+const exists = await Sphere.exists(storage);
+console.log('Wallet exists:', exists);  // Should be true after first run
+```
+
+### Nametag Sync on Load
+
+When loading an existing wallet, the SDK automatically syncs the nametag with Nostr:
+
+```typescript
+// On Sphere.load(), if local nametag exists:
+// 1. Checks if nametag is registered on Nostr
+// 2. If not registered or owned by this pubkey, re-publishes it
+// 3. Logs warning if owned by different pubkey
+```
+
+---
+
 ## Error Handling
 
 ### Error Types
@@ -685,19 +779,27 @@ npm test -- --coverage
 |--------|-------|-------------|
 | `core/crypto` | 43 | BIP39, BIP32, hashing, address generation |
 | `core/bech32` | 30 | Bech32 encoding/decoding |
-| `core/currency` | 34 | Amount conversion and formatting |
-| `core/encryption` | 30 | AES-256-CBC encryption |
-| `core/utils` | 32 | Base58, validation, utilities |
+| `core/currency` | 37 | Amount conversion and formatting |
+| `core/encryption` | 39 | AES-256-CBC encryption |
+| `core/utils` | 40 | Base58, validation, utilities |
 | `l1/address` | 18 | HD key derivation |
 | `l1/addressToScriptHash` | 7 | Electrum scripthash |
 | `l1/tx` | 23 | SegWit transactions, UTXO selection |
 | `l1/crypto` | 22 | Wallet encryption, WIF conversion |
 | `l1/addressHelpers` | 36 | Address management utilities |
+| `l1/vesting` | 16 | Vesting classification |
 | `serialization/txf` | 44 | TXF token format |
 | `serialization/wallet-text` | 32 | Text wallet backup format |
 | `serialization/wallet-dat` | 18 | SQLite wallet.dat parsing |
 | `modules/TokenSplitCalculator` | 23 | Token split optimization |
-| **Total** | **392** | All passing |
+| `modules/TokenSplitExecutor` | 16 | Token split execution |
+| `modules/PaymentsModule` | 36 | Payments, nametag, PROXY |
+| `modules/NametagMinter` | 22 | On-chain nametag minting |
+| `transport/NostrTransportProvider` | 24 | Nostr P2P messaging |
+| `integration/wallet-import-export` | 20 | Wallet import/export |
+| `integration/nametag-roundtrip` | 9 | Nametag serialization |
+| `impl/shared/resolvers` | 41 | Config resolution utilities |
+| **Total** | **611** | All passing |
 
 ### Writing Tests
 
@@ -711,19 +813,33 @@ tests/
 │   │   ├── bech32.test.ts
 │   │   ├── currency.test.ts
 │   │   ├── encryption.test.ts
-│   │   └── utils.test.ts
+│   │   ├── utils.test.ts
+│   │   ├── Sphere.providers.test.ts
+│   │   └── Sphere.nametag-sync.test.ts
 │   ├── l1/
 │   │   ├── address.test.ts
 │   │   ├── addressHelpers.test.ts
 │   │   ├── addressToScriptHash.test.ts
 │   │   ├── crypto.test.ts
-│   │   └── tx.test.ts
+│   │   ├── tx.test.ts
+│   │   └── vesting.test.ts
 │   ├── modules/
-│   │   └── TokenSplitCalculator.test.ts
-│   └── serialization/
-│       ├── txf-serializer.test.ts
-│       ├── wallet-text.test.ts
-│       └── wallet-dat.test.ts
+│   │   ├── TokenSplitCalculator.test.ts
+│   │   ├── TokenSplitExecutor.test.ts
+│   │   ├── PaymentsModule.test.ts
+│   │   └── NametagMinter.test.ts
+│   ├── transport/
+│   │   └── NostrTransportProvider.test.ts
+│   ├── serialization/
+│   │   ├── txf-serializer.test.ts
+│   │   ├── wallet-text.test.ts
+│   │   └── wallet-dat.test.ts
+│   └── impl/
+│       └── shared/
+│           └── resolvers.test.ts
+├── integration/
+│   ├── wallet-import-export.test.ts
+│   └── nametag-roundtrip.test.ts
 └── fixtures/
     └── test-vectors.ts
 ```

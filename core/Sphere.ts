@@ -439,21 +439,9 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
-    // Register nametag if provided
+    // Register nametag if provided (includes on-chain token minting)
     if (options.nametag) {
       await sphere.registerNametag(options.nametag);
-
-      // Always mint nametag token on-chain if not already minted
-      // Required for receiving tokens via @nametag (PROXY address finalization)
-      if (!sphere._payments.hasNametag()) {
-        console.log(`[Sphere] Minting nametag token for @${options.nametag}...`);
-        const result = await sphere.mintNametag(options.nametag);
-        if (!result.success) {
-          console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
-        } else {
-          console.log(`[Sphere] Nametag token minted successfully`);
-        }
-      }
     }
 
     return sphere;
@@ -485,6 +473,18 @@ export class Sphere {
 
     // Sync nametag with Nostr (re-register if missing)
     await sphere.syncNametagWithNostr();
+
+    // Mint nametag token if nametag exists but token is missing
+    // Required for receiving tokens via @nametag (PROXY address finalization)
+    if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
+      console.log(`[Sphere] Minting missing nametag token for @${sphere._identity.nametag}...`);
+      const result = await sphere.mintNametag(sphere._identity.nametag);
+      if (!result.success) {
+        console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
+      } else {
+        console.log(`[Sphere] Nametag token minted successfully`);
+      }
+    }
 
     sphere._initialized = true;
     Sphere.instance = sphere;
@@ -1703,7 +1703,7 @@ export class Sphere {
       throw new Error(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`);
     }
 
-    // Register with transport provider
+    // Register with transport provider (Nostr)
     if (this._transport.registerNametag) {
       const success = await this._transport.registerNametag(cleanNametag, this._identity!.publicKey);
       if (!success) {
@@ -1720,6 +1720,19 @@ export class Sphere {
     // Persist to storage (both legacy and new format)
     await this._storage.set(STORAGE_KEYS.NAMETAG, cleanNametag);
     await this.persistAddressNametags();
+
+    // Mint nametag token on-chain if not already minted
+    // Required for receiving tokens via @nametag (PROXY address finalization)
+    if (!this._payments.hasNametag()) {
+      console.log(`[Sphere] Minting nametag token for @${cleanNametag}...`);
+      const result = await this.mintNametag(cleanNametag);
+      if (!result.success) {
+        console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
+        // Don't throw - nametag is registered on Nostr, token can be minted later
+      } else {
+        console.log(`[Sphere] Nametag token minted successfully`);
+      }
+    }
 
     this.emitEvent('nametag:registered', {
       nametag: cleanNametag,
