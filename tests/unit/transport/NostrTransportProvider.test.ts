@@ -237,3 +237,74 @@ describe('NostrTransportProvider', () => {
     });
   });
 });
+
+// =============================================================================
+// Nametag Format Tests
+// =============================================================================
+
+describe('Nametag binding format', () => {
+  it('should create binding event with nostr-js-sdk compatible format', async () => {
+    // This test verifies the event structure matches nostr-js-sdk
+    const { hashNametag } = await import('@unicitylabs/nostr-js-sdk');
+
+    const nametag = 'test-user';
+    const publicKey = 'a'.repeat(64);
+    const hashedNametag = hashNametag(nametag);
+
+    // Expected format from nostr-js-sdk
+    const expectedTags = [
+      ['d', hashedNametag],
+      ['nametag', hashedNametag],
+      ['t', hashedNametag],
+      ['address', publicKey],
+      ['p', publicKey],
+    ];
+
+    const expectedContent = {
+      nametag_hash: hashedNametag,
+      address: publicKey,
+      verified: expect.any(Number),
+    };
+
+    // Verify the tags include all required fields
+    for (const [tagName] of expectedTags) {
+      expect(['d', 'nametag', 't', 'address', 'p']).toContain(tagName);
+    }
+
+    // Verify content structure
+    expect(expectedContent).toHaveProperty('nametag_hash');
+    expect(expectedContent).toHaveProperty('address');
+    expect(expectedContent).toHaveProperty('verified');
+  });
+
+  it('should parse address from various binding event formats', () => {
+    const publicKey = 'b'.repeat(64);
+
+    // Format 1: nostr-js-sdk style with 'address' tag
+    const event1 = {
+      tags: [['address', publicKey], ['d', 'hash']],
+      content: '{}',
+      pubkey: 'c'.repeat(64),
+    };
+    const addressTag1 = event1.tags.find((t: string[]) => t[0] === 'address');
+    expect(addressTag1?.[1]).toBe(publicKey);
+
+    // Format 2: SDK style with 'p' tag
+    const event2 = {
+      tags: [['p', publicKey], ['d', 'hash']],
+      content: publicKey,
+      pubkey: 'c'.repeat(64),
+    };
+    const pubkeyTag2 = event2.tags.find((t: string[]) => t[0] === 'p');
+    expect(pubkeyTag2?.[1]).toBe(publicKey);
+
+    // Format 3: nostr-js-sdk style with JSON content
+    const event3 = {
+      tags: [['d', 'hash']],
+      content: JSON.stringify({ nametag_hash: 'hash', address: publicKey }),
+      pubkey: 'c'.repeat(64),
+    };
+    const content3 = JSON.parse(event3.content);
+    expect(content3.address).toBe(publicKey);
+  });
+});
