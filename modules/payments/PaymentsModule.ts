@@ -544,6 +544,12 @@ export class PaymentsModule {
       }
     }
 
+    // Load tokens from file storage providers (lottery compatibility)
+    await this.loadTokensFromFileStorage();
+
+    // Load nametag from file storage (lottery compatibility)
+    await this.loadNametagFromFileStorage();
+
     // Load transaction history
     const historyData = await this.deps!.storage.get(STORAGE_KEYS.TRANSACTION_HISTORY);
     if (historyData) {
@@ -1361,6 +1367,90 @@ export class PaymentsModule {
   }
 
   /**
+   * Load tokens from file storage providers (lottery compatibility)
+   * This loads tokens from file-based storage that may have been saved
+   * by other applications using the same storage directory.
+   */
+  private async loadTokensFromFileStorage(): Promise<void> {
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) return;
+
+    for (const [providerId, provider] of providers) {
+      if (!provider.listTokenIds || !provider.getToken) continue;
+
+      try {
+        const tokenIds = await provider.listTokenIds();
+        this.log(`Found ${tokenIds.length} token files in ${providerId}`);
+
+        for (const tokenId of tokenIds) {
+          try {
+            const fileData = await provider.getToken(tokenId);
+            if (!fileData || typeof fileData !== 'object') continue;
+
+            // Handle lottery format: { token, receivedAt } or { token, receivedAt, meta }
+            const data = fileData as Record<string, unknown>;
+            const tokenJson = data.token;
+            if (!tokenJson) continue;
+
+            // Check if already loaded from key-value storage
+            let sdkTokenId: string | undefined;
+            if (typeof tokenJson === 'object' && tokenJson !== null) {
+              const tokenObj = tokenJson as Record<string, unknown>;
+              const genesis = tokenObj.genesis as Record<string, unknown> | undefined;
+              const genesisData = genesis?.data as Record<string, unknown> | undefined;
+              sdkTokenId = genesisData?.tokenId as string | undefined;
+            }
+
+            if (sdkTokenId) {
+              // Check if this token already exists
+              let exists = false;
+              for (const existing of this.tokens.values()) {
+                const existingId = extractTokenIdFromSdkData(existing.sdkData);
+                if (existingId === sdkTokenId) {
+                  exists = true;
+                  break;
+                }
+              }
+              if (exists) continue;
+            }
+
+            // Parse token info
+            const tokenInfo = await parseTokenInfo(tokenJson);
+
+            // Create token entry
+            const token: Token = {
+              id: tokenInfo.tokenId ?? tokenId,
+              coinId: tokenInfo.coinId,
+              symbol: tokenInfo.symbol,
+              name: tokenInfo.name,
+              amount: tokenInfo.amount,
+              status: 'confirmed',
+              createdAt: (data.receivedAt as number) || Date.now(),
+              updatedAt: Date.now(),
+              sdkData: typeof tokenJson === 'string'
+                ? tokenJson
+                : JSON.stringify(tokenJson),
+            };
+
+            // Add to in-memory storage (skip file save since it's already in file)
+            this.tokens.set(token.id, token);
+            this.log(`Loaded token from file: ${tokenId}`);
+          } catch (tokenError) {
+            console.warn(`[Payments] Failed to load token ${tokenId}:`, tokenError);
+          }
+        }
+      } catch (error) {
+        console.warn(`[Payments] Failed to load tokens from ${providerId}:`, error);
+      }
+    }
+
+    // Save to key-value storage to sync
+    if (this.tokens.size > 0) {
+      await this.save();
+    }
+  }
+
+  /**
    * Update an existing token
    */
   async updateToken(token: Token): Promise<void> {
@@ -1673,6 +1763,8 @@ export class PaymentsModule {
     this.ensureInitialized();
     this.nametag = nametag;
     await this.save();
+    // Save to file storage for lottery compatibility
+    await this.saveNametagToFileStorage(nametag);
     this.log(`Nametag set: ${nametag.name}`);
   }
 
@@ -1697,6 +1789,81 @@ export class PaymentsModule {
     this.ensureInitialized();
     this.nametag = null;
     await this.save();
+  }
+
+  /**
+   * Save nametag to file storage for lottery compatibility
+   * Creates file: nametag-{name}.json
+   */
+  private async saveNametagToFileStorage(nametag: NametagData): Promise<void> {
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) return;
+
+    const filename = `nametag-${nametag.name}`;
+
+    // Lottery-compatible format
+    const fileData = {
+      nametag: nametag.name,
+      token: nametag.token,
+      timestamp: nametag.timestamp || Date.now(),
+    };
+
+    for (const [providerId, provider] of providers) {
+      try {
+        if (provider.saveToken) {
+          await provider.saveToken(filename, fileData);
+          this.log(`Saved nametag file ${filename} to ${providerId}`);
+        }
+      } catch (error) {
+        console.warn(`[Payments] Failed to save nametag to ${providerId}:`, error);
+      }
+    }
+  }
+
+  /**
+   * Load nametag from file storage (lottery compatibility)
+   * Looks for file: nametag-{name}.json
+   */
+  private async loadNametagFromFileStorage(): Promise<void> {
+    if (this.nametag) return; // Already loaded from key-value storage
+
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) return;
+
+    for (const [providerId, provider] of providers) {
+      if (!provider.listTokenIds || !provider.getToken) continue;
+
+      try {
+        const tokenIds = await provider.listTokenIds();
+        const nametagFiles = tokenIds.filter(id => id.startsWith('nametag-'));
+
+        for (const nametagFile of nametagFiles) {
+          try {
+            const fileData = await provider.getToken(nametagFile);
+            if (!fileData || typeof fileData !== 'object') continue;
+
+            const data = fileData as Record<string, unknown>;
+            if (!data.token || !data.nametag) continue;
+
+            // Convert to NametagData format
+            this.nametag = {
+              name: data.nametag as string,
+              token: data.token as object,
+              timestamp: (data.timestamp as number) || Date.now(),
+              format: 'lottery',
+              version: '1.0',
+            };
+
+            this.log(`Loaded nametag from file: ${nametagFile}`);
+            return; // Found one, stop searching
+          } catch (fileError) {
+            console.warn(`[Payments] Failed to load nametag file ${nametagFile}:`, fileError);
+          }
+        }
+      } catch (error) {
+        console.warn(`[Payments] Failed to search nametag files in ${providerId}:`, error);
+      }
+    }
   }
 
   /**
@@ -2062,10 +2229,10 @@ export class PaymentsModule {
         if (addressScheme === AddressScheme.PROXY) {
           // Need to finalize with nametag token
           if (!this.nametag?.token) {
-            console.warn('[Payments] Cannot finalize PROXY transfer - no nametag token');
-            // Try to save without finalization
-            tokenData = sourceTokenInput;
-          } else {
+            console.error('[Payments] Cannot finalize PROXY transfer - no nametag token. Token rejected.');
+            return; // Reject token - cannot spend without finalization
+          }
+          {
             try {
               const nametagToken = await SdkToken.fromJSON(this.nametag.token);
               const signingService = await this.createSigningService();
@@ -2086,22 +2253,22 @@ export class PaymentsModule {
               const trustBase = (this.deps!.oracle as any).getTrustBase?.();
 
               if (!stClient || !trustBase) {
-                console.warn('[Payments] Cannot finalize - missing state transition client or trust base');
-                tokenData = sourceTokenInput;
-              } else {
-                finalizedSdkToken = await stClient.finalizeTransaction(
-                  trustBase,
-                  sourceToken,
-                  recipientState,
-                  transferTx,
-                  [nametagToken]
-                );
-                tokenData = finalizedSdkToken.toJSON();
-                this.log('Token finalized successfully');
+                console.error('[Payments] Cannot finalize - missing state transition client or trust base. Token rejected.');
+                return; // Reject token - cannot spend without finalization
               }
+
+              finalizedSdkToken = await stClient.finalizeTransaction(
+                trustBase,
+                sourceToken,
+                recipientState,
+                transferTx,
+                [nametagToken]
+              );
+              tokenData = finalizedSdkToken.toJSON();
+              this.log('Token finalized successfully');
             } catch (finalizeError) {
               console.error('[Payments] Finalization failed:', finalizeError);
-              tokenData = sourceTokenInput;
+              return; // Reject token - cannot spend without finalization
             }
           }
         } else {
