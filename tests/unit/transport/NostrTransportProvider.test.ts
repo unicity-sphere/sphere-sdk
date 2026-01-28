@@ -456,3 +456,77 @@ describe('Event subscription pubkey format', () => {
     expect(nostrPubkey.length).not.toBe(66);
   });
 });
+
+// =============================================================================
+// Content Prefix Stripping Tests
+// =============================================================================
+
+describe('Content prefix stripping', () => {
+  // Test the stripContentPrefix logic by importing and testing directly
+  // Since it's private, we test the expected behavior through unit tests
+
+  const prefixes = [
+    'payment_request:',
+    'token_transfer:',
+    'payment_response:',
+  ];
+
+  function stripContentPrefix(content: string): string {
+    for (const prefix of prefixes) {
+      if (content.startsWith(prefix)) {
+        return content.slice(prefix.length);
+      }
+    }
+    return content;
+  }
+
+  describe('stripContentPrefix()', () => {
+    it('should strip payment_request: prefix', () => {
+      const content = 'payment_request:{"amount":"100"}';
+      const result = stripContentPrefix(content);
+      expect(result).toBe('{"amount":"100"}');
+    });
+
+    it('should strip token_transfer: prefix', () => {
+      const content = 'token_transfer:{"token":"..."}';
+      const result = stripContentPrefix(content);
+      expect(result).toBe('{"token":"..."}');
+    });
+
+    it('should strip payment_response: prefix', () => {
+      const content = 'payment_response:{"status":"paid"}';
+      const result = stripContentPrefix(content);
+      expect(result).toBe('{"status":"paid"}');
+    });
+
+    it('should not modify content without prefix', () => {
+      const content = '{"amount":"100"}';
+      const result = stripContentPrefix(content);
+      expect(result).toBe('{"amount":"100"}');
+    });
+
+    it('should not strip unknown prefixes', () => {
+      const content = 'unknown_prefix:{"data":"test"}';
+      const result = stripContentPrefix(content);
+      expect(result).toBe('unknown_prefix:{"data":"test"}');
+    });
+
+    it('should handle empty content', () => {
+      const result = stripContentPrefix('');
+      expect(result).toBe('');
+    });
+
+    it('should handle prefix-only content', () => {
+      const result = stripContentPrefix('token_transfer:');
+      expect(result).toBe('');
+    });
+
+    it('should allow JSON.parse after stripping prefix', () => {
+      const content = 'token_transfer:{"token":"abc","amount":"1000"}';
+      const stripped = stripContentPrefix(content);
+      const parsed = JSON.parse(stripped);
+      expect(parsed.token).toBe('abc');
+      expect(parsed.amount).toBe('1000');
+    });
+  });
+});

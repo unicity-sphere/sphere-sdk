@@ -63,6 +63,7 @@ import {
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
+import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import { TransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
@@ -117,31 +118,81 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
     // If it's a string, try to parse as JSON
     const data = typeof tokenData === 'string' ? JSON.parse(tokenData) : tokenData;
 
-    // Try to create SDK token and convert to JSON to extract data
+    // Try to create SDK token and extract coin info using SDK methods
     try {
       const sdkToken = await SdkToken.fromJSON(data);
-      const tokenJson = sdkToken.toJSON() as unknown as Record<string, unknown>;
 
       // Try to get token ID
       if (sdkToken.id) {
         defaultInfo.tokenId = sdkToken.id.toString();
       }
 
-      // Extract coin data from the JSON representation
+      // Extract coinId from SDK token's coins structure (lottery-compatible)
+      if (sdkToken.coins && sdkToken.coins.coins) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rawCoins = sdkToken.coins.coins as any[];
+        if (rawCoins.length > 0) {
+          const firstCoin = rawCoins[0];
+          // Format: [[CoinId, amount]] or [CoinId, amount]
+          let coinIdObj: unknown;
+          let amount: unknown;
+
+          if (Array.isArray(firstCoin) && firstCoin.length === 2) {
+            [coinIdObj, amount] = firstCoin;
+          }
+
+          // Extract hex string from CoinId object
+          if (coinIdObj instanceof CoinId) {
+            const coinIdHex = coinIdObj.toJSON() as string;
+            return {
+              coinId: coinIdHex,
+              symbol: coinIdHex.slice(0, 8),
+              name: `Token ${coinIdHex.slice(0, 8)}`,
+              amount: String(amount ?? '0'),
+              tokenId: defaultInfo.tokenId,
+            };
+          } else if (coinIdObj && typeof coinIdObj === 'object' && 'bytes' in coinIdObj) {
+            // CoinId stored as object with bytes
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const bytes = (coinIdObj as any).bytes;
+            const coinIdHex = Buffer.isBuffer(bytes)
+              ? bytes.toString('hex')
+              : Array.isArray(bytes)
+                ? Buffer.from(bytes).toString('hex')
+                : String(bytes);
+            return {
+              coinId: coinIdHex,
+              symbol: coinIdHex.slice(0, 8),
+              name: `Token ${coinIdHex.slice(0, 8)}`,
+              amount: String(amount ?? '0'),
+              tokenId: defaultInfo.tokenId,
+            };
+          }
+        }
+      }
+
+      // Fallback: Extract from JSON representation
+      const tokenJson = sdkToken.toJSON() as unknown as Record<string, unknown>;
       const genesisData = tokenJson.genesis as Record<string, unknown> | undefined;
       if (genesisData?.data) {
         const gData = genesisData.data as Record<string, unknown>;
         if (gData.coinData && typeof gData.coinData === 'object') {
-          const coinEntries = Object.entries(gData.coinData as Record<string, unknown>);
-          if (coinEntries.length > 0) {
-            const [coinId, amount] = coinEntries[0];
-            return {
-              coinId,
-              symbol: coinId,
-              name: `${coinId} Token`,
-              amount: String(amount),
-              tokenId: defaultInfo.tokenId,
-            };
+          // coinData might be array: [[coinIdHex, amount]]
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const coinData = gData.coinData as any;
+          if (Array.isArray(coinData) && coinData.length > 0) {
+            const firstEntry = coinData[0];
+            if (Array.isArray(firstEntry) && firstEntry.length === 2) {
+              const [coinIdHex, amount] = firstEntry;
+              const coinIdStr = typeof coinIdHex === 'string' ? coinIdHex : String(coinIdHex);
+              return {
+                coinId: coinIdStr,
+                symbol: coinIdStr.slice(0, 8),
+                name: `Token ${coinIdStr.slice(0, 8)}`,
+                amount: String(amount),
+                tokenId: defaultInfo.tokenId,
+              };
+            }
           }
         }
       }
@@ -149,21 +200,37 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
       // SDK parsing failed, try manual extraction
     }
 
-    // Manual extraction from TXF format
+    // Manual extraction from TXF format - handle array structure
     if (data.genesis?.data) {
       const genesis = data.genesis.data;
       if (genesis.coinData) {
-        // Extract from coinData structure
-        const coinEntries = Object.entries(genesis.coinData);
-        if (coinEntries.length > 0) {
-          const [coinId, amount] = coinEntries[0] as [string, unknown];
-          return {
-            coinId,
-            symbol: coinId,
-            name: `${coinId} Token`,
-            amount: String(amount),
-            tokenId: genesis.tokenId,
-          };
+        // coinData can be: [[coinIdHex, amount]] or {coinIdHex: amount}
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const coinData = genesis.coinData as any;
+        if (Array.isArray(coinData) && coinData.length > 0) {
+          const firstEntry = coinData[0];
+          if (Array.isArray(firstEntry) && firstEntry.length === 2) {
+            const [coinIdHex, amount] = firstEntry;
+            return {
+              coinId: String(coinIdHex),
+              symbol: String(coinIdHex).slice(0, 8),
+              name: `Token ${String(coinIdHex).slice(0, 8)}`,
+              amount: String(amount),
+              tokenId: genesis.tokenId,
+            };
+          }
+        } else if (typeof coinData === 'object') {
+          const coinEntries = Object.entries(coinData);
+          if (coinEntries.length > 0) {
+            const [coinId, amount] = coinEntries[0] as [string, unknown];
+            return {
+              coinId,
+              symbol: coinId.slice(0, 8),
+              name: `Token ${coinId.slice(0, 8)}`,
+              amount: String(amount),
+              tokenId: genesis.tokenId,
+            };
+          }
         }
       }
       if (genesis.tokenId) {
@@ -173,16 +240,32 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 
     // Try to extract from state if available
     if (data.state?.coinData) {
-      const coinEntries = Object.entries(data.state.coinData);
-      if (coinEntries.length > 0) {
-        const [coinId, amount] = coinEntries[0] as [string, unknown];
-        return {
-          coinId,
-          symbol: coinId,
-          name: `${coinId} Token`,
-          amount: String(amount),
-          tokenId: defaultInfo.tokenId,
-        };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const coinData = data.state.coinData as any;
+      if (Array.isArray(coinData) && coinData.length > 0) {
+        const firstEntry = coinData[0];
+        if (Array.isArray(firstEntry) && firstEntry.length === 2) {
+          const [coinIdHex, amount] = firstEntry;
+          return {
+            coinId: String(coinIdHex),
+            symbol: String(coinIdHex).slice(0, 8),
+            name: `Token ${String(coinIdHex).slice(0, 8)}`,
+            amount: String(amount),
+            tokenId: defaultInfo.tokenId,
+          };
+        }
+      } else if (typeof coinData === 'object') {
+        const coinEntries = Object.entries(coinData);
+        if (coinEntries.length > 0) {
+          const [coinId, amount] = coinEntries[0] as [string, unknown];
+          return {
+            coinId,
+            symbol: coinId.slice(0, 8),
+            name: `Token ${coinId.slice(0, 8)}`,
+            amount: String(amount),
+            tokenId: defaultInfo.tokenId,
+          };
+        }
       }
     }
   } catch (error) {
