@@ -981,6 +981,117 @@ function getRelayStatuses() {
 }
 ```
 
+## Nametags
+
+Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments.
+
+### Registering a Nametag
+
+```typescript
+// During wallet creation
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your twelve words...',
+  nametag: 'alice',  // Will register @alice
+});
+
+// Or after creation
+await sphere.registerNametag('alice');
+
+// Mint on-chain nametag token (required for receiving via PROXY addresses)
+const result = await sphere.mintNametag('alice');
+if (result.success) {
+  console.log('Nametag minted:', result.nametagData?.name);
+}
+```
+
+### Common Pitfall: Nametag Already Taken
+
+If you see this error:
+```
+Failed to register nametag. It may already be taken.
+[NostrTransportProvider] Nametag already taken: myname - owner: f124f93ae6946ffd...
+```
+
+This means the nametag is registered to a **different public key**. Common causes:
+
+1. **Storage cleared or not persisting**:
+   - `Sphere.exists()` returns `false` because storage is empty/inaccessible
+   - SDK creates a new wallet with new keypair
+   - Nametag registration fails because old pubkey owns it on Nostr
+
+2. **Different mnemonic provided**:
+   ```typescript
+   // ❌ WRONG: Random mnemonic each time
+   const mnemonic = Sphere.generateMnemonic();
+   const { sphere } = await Sphere.init({
+     mnemonic,
+     nametag: 'myservice',  // Fails after first run
+   });
+   ```
+
+**Note:** `autoGenerate: true` does NOT generate a new mnemonic on every restart. It only generates one if `Sphere.exists()` returns `false` (wallet not found in storage).
+
+### Solution: Persistent Storage or Fixed Mnemonic
+
+**Option 1: Persistent file storage** (recommended for backend):
+
+```typescript
+import { FileStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const storage = new FileStorageProvider('./wallet-data');  // Persists to disk
+
+const { sphere } = await Sphere.init({
+  storage,
+  autoGenerate: true,  // OK: mnemonic saved to disk, reused on restart
+  nametag: 'myservice',
+});
+```
+
+**Option 2: Fixed mnemonic from environment**:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: process.env.WALLET_MNEMONIC,  // Same mnemonic every time
+  nametag: 'myservice',
+});
+```
+
+### Debugging Storage Issues
+
+If nametag fails unexpectedly, check if wallet exists:
+
+```typescript
+const exists = await Sphere.exists(storage);
+console.log('Wallet exists:', exists);  // Should be true after first run
+
+// If false - storage is not persisting properly
+```
+
+### Multi-Address Nametags
+
+Each derived address can have its own independent nametag:
+
+```typescript
+// Address 0: @alice
+await sphere.registerNametag('alice');
+
+// Switch to address 1 and register different nametag
+await sphere.switchToAddress(1);
+await sphere.registerNametag('bob');
+
+// Now:
+// - Address 0 → @alice
+// - Address 1 → @bob
+
+// Get nametag for specific address
+const aliceTag = sphere.getNametagForAddress(0);  // 'alice'
+const bobTag = sphere.getNametagForAddress(1);    // 'bob'
+```
+
+---
+
 ## Known Limitations / TODO
 
 ### Wallet Encryption
