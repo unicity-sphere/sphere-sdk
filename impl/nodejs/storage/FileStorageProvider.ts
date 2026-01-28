@@ -115,6 +115,10 @@ export class FileStorageProvider implements StorageProvider {
   }
 
   private async save(): Promise<void> {
+    // Ensure directory exists before writing
+    if (!fs.existsSync(this.dataDir)) {
+      fs.mkdirSync(this.dataDir, { recursive: true });
+    }
     fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
   }
 }
