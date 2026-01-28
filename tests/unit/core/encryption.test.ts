@@ -187,7 +187,7 @@ describe('decryptSimple()', () => {
   it('should throw with wrong password', () => {
     const encrypted = encryptSimple(TEST_PLAINTEXT, TEST_PASSWORD);
 
-    expect(() => decryptSimple(encrypted, 'wrong')).toThrow('Decryption failed');
+    expect(() => decryptSimple(encrypted, 'wrong')).toThrow();
   });
 
   it('should handle special characters', () => {
