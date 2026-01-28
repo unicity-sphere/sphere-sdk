@@ -14,13 +14,14 @@ export default defineConfig([
     external: [
       /^@noble\//,
       /^@unicitylabs\//,
+      /^@libp2p\//,
+      /^@helia\//,
       'bip39',
       'buffer',
       'crypto-js',
       'elliptic',
       'helia',
-      '@helia/ipns',
-      '@helia/json',
+      'multiformats',
       'ws',
     ],
   },
@@ -63,10 +64,11 @@ export default defineConfig([
     ],
   },
   // Browser implementation (keep @unicitylabs external - browser uses bundler)
+  // Note: dts disabled due to @libp2p version conflicts - types come from helia peer deps
   {
     entry: { 'impl/browser/index': 'impl/browser/index.ts' },
     format: ['esm', 'cjs'],
-    dts: true,
+    dts: false,
     clean: false,
     splitting: false,
     sourcemap: true,
@@ -75,9 +77,10 @@ export default defineConfig([
     external: [
       /^@noble\//,
       /^@unicitylabs\//,
+      /^@libp2p\//,
+      /^@helia\//,
       'helia',
-      '@helia/ipns',
-      '@helia/json',
+      'multiformats',
     ],
   },
   // Node.js implementation
@@ -93,9 +96,10 @@ export default defineConfig([
     external: [
       /^@noble\//,
       /^@unicitylabs\//,
+      /^@libp2p\//,
+      /^@helia\//,
       'helia',
-      '@helia/ipns',
-      '@helia/json',
+      'multiformats',
       'ws',
     ],
   },

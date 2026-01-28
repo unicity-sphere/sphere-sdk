@@ -18,14 +18,8 @@
       }
     },
     "./impl/browser": {
-      "import": {
-        "types": "./dist/impl/browser/index.d.ts",
-        "default": "./dist/impl/browser/index.js"
-      },
-      "require": {
-        "types": "./dist/impl/browser/index.d.cts",
-        "default": "./dist/impl/browser/index.cjs"
-      }
+      "import": "./dist/impl/browser/index.js",
+      "require": "./dist/impl/browser/index.cjs"
     },
     "./impl/nodejs": {
       "import": {
