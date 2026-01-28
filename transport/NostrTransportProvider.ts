@@ -302,12 +302,25 @@ export class NostrTransportProvider implements TransportProvider {
     const secretKey = Buffer.from(identity.privateKey, 'hex');
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
-    this.log('Identity set:', identity.publicKey.slice(0, 16) + '...');
+    // Use Nostr-format pubkey (32 bytes / 64 hex chars) from keyManager
+    const nostrPubkey = this.keyManager.getPublicKeyHex();
+    this.log('Identity set, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
 
     // Re-subscribe if already connected
     if (this.isConnected()) {
       this.subscribeToEvents();
     }
+  }
+
+  /**
+   * Get the Nostr-format public key (32 bytes / 64 hex chars)
+   * This is the x-coordinate only, without the 02/03 prefix.
+   */
+  getNostrPubkey(): string {
+    if (!this.keyManager) {
+      throw new Error('KeyManager not initialized - call setIdentity first');
+    }
+    return this.keyManager.getPublicKeyHex();
   }
 
   async sendMessage(recipientPubkey: string, content: string): Promise<string> {
@@ -482,27 +495,22 @@ export class NostrTransportProvider implements TransportProvider {
 
     if (events.length === 0) return null;
 
-    // Parse binding event - try multiple formats for compatibility
+    // Parse binding event
     const bindingEvent = events[0];
 
-    // 1. Try 'address' tag (nostr-js-sdk format)
-    const addressTag = bindingEvent.tags.find((t: string[]) => t[0] === 'address');
-    if (addressTag?.[1]) return addressTag[1];
+    // For Nostr messaging (NIP-04 encryption), we MUST use the event author's pubkey.
+    // The 'address' tag contains the Unicity blockchain address (not a hex pubkey),
+    // which cannot be used for Nostr encryption.
+    // The event.pubkey is always the hex pubkey of the nametag owner.
+    if (bindingEvent.pubkey) {
+      return bindingEvent.pubkey;
+    }
 
-    // 2. Try 'p' tag (SDK format)
+    // Fallback: try 'p' tag (our SDK format uses hex pubkey here)
     const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'p');
     if (pubkeyTag?.[1]) return pubkeyTag[1];
 
-    // 3. Try content JSON (nostr-js-sdk format)
-    try {
-      const content = JSON.parse(bindingEvent.content);
-      if (content.address) return content.address;
-    } catch {
-      // Content is not JSON, might be raw pubkey
-    }
-
-    // 4. Fallback to content as raw value or event author
-    return bindingEvent.content || bindingEvent.pubkey || null;
+    return null;
   }
 
   async publishNametag(nametag: string, address: string): Promise<void> {
@@ -519,28 +527,32 @@ export class NostrTransportProvider implements TransportProvider {
     this.log('Published nametag binding:', nametag);
   }
 
-  async registerNametag(nametag: string, publicKey: string): Promise<boolean> {
+  async registerNametag(nametag: string, _publicKey: string): Promise<boolean> {
     this.ensureReady();
 
-    // Check if nametag is already taken
+    // Always use 32-byte Nostr-format pubkey from keyManager (not the 33-byte compressed key)
+    const nostrPubkey = this.getNostrPubkey();
+
+    // Check if nametag is already taken by someone else
     const existing = await this.resolveNametag(nametag);
-    this.log('registerNametag:', nametag, 'existing:', existing, 'myPubkey:', publicKey);
-    if (existing && existing !== publicKey) {
+
+    this.log('registerNametag:', nametag, 'existing:', existing, 'myPubkey:', nostrPubkey);
+
+    if (existing && existing !== nostrPubkey) {
       this.log('Nametag already taken:', nametag, '- owner:', existing);
       return false;
     }
 
-    // If already registered to this pubkey, success
-    if (existing === publicKey) {
-      this.log('Nametag already registered to this pubkey:', nametag);
-      return true;
-    }
+    // Always (re)publish to ensure event has correct format with all required tags
+    // This is a parameterized replaceable event (kind 30078), so publishing with same 'd' tag
+    // will replace any old event. This ensures the event has ['t', hash] tag for nostr-js-sdk.
 
     // Publish nametag binding matching nostr-js-sdk format
+    // Use Nostr pubkey (32 bytes) for all fields
     const hashedNametag = hashNametag(nametag);
     const content = JSON.stringify({
       nametag_hash: hashedNametag,
-      address: publicKey,
+      address: nostrPubkey,
       verified: Date.now(),
     });
 
@@ -548,11 +560,11 @@ export class NostrTransportProvider implements TransportProvider {
       ['d', hashedNametag],
       ['nametag', hashedNametag],
       ['t', hashedNametag],
-      ['address', publicKey],
+['address', nostrPubkey],
     ]);
 
     await this.publishEvent(event);
-    this.log('Registered nametag:', nametag, 'for pubkey:', publicKey.slice(0, 16) + '...');
+    this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
     return true;
   }
 
