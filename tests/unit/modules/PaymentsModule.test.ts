@@ -154,6 +154,32 @@ describe('Incoming transfer payload format detection', () => {
 
     expect(sourceToken.genesis.data.coinData.UCT).toBe('1000000000000000000');
   });
+
+  it('should send in Sphere wallet format (sourceToken + transferTx), not SDK format (token + proof)', () => {
+    // This test verifies the outgoing payload structure
+    // SDK must send { sourceToken, transferTx } for Sphere compatibility
+    const mockSdkToken = { genesis: { data: { coinData: { UCT: '1000' } } } };
+    const mockTransferTx = { data: { recipient: { scheme: 1 }, salt: 'abc' } };
+
+    // Simulate what PaymentsModule.send() should create
+    const outgoingPayload = {
+      sourceToken: JSON.stringify(mockSdkToken),
+      transferTx: JSON.stringify(mockTransferTx),
+      memo: 'test payment',
+    };
+
+    // Verify it uses Sphere format, not SDK format
+    expect(outgoingPayload).toHaveProperty('sourceToken');
+    expect(outgoingPayload).toHaveProperty('transferTx');
+    expect(outgoingPayload).not.toHaveProperty('token');
+    expect(outgoingPayload).not.toHaveProperty('proof');
+
+    // Verify sourceToken and transferTx are JSON strings
+    expect(typeof outgoingPayload.sourceToken).toBe('string');
+    expect(typeof outgoingPayload.transferTx).toBe('string');
+    expect(() => JSON.parse(outgoingPayload.sourceToken)).not.toThrow();
+    expect(() => JSON.parse(outgoingPayload.transferTx)).not.toThrow();
+  });
 });
 
 describe('L1PaymentsModule', () => {

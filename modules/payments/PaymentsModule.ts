@@ -672,18 +672,13 @@ export class PaymentsModule {
           : token;
         const sdkToken = await SdkToken.fromJSON(tokenData);
 
-        // Build payload for Nostr delivery
-        const payload = {
+        // Build payload for Nostr delivery (Sphere wallet format)
+        // Send via transport (Nostr) - use Sphere-compatible format
+        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
           sourceToken: JSON.stringify(sdkToken.toJSON()),
           transferTx: JSON.stringify(transferTx.toJSON()),
-        };
-
-        // Send via transport (Nostr)
-        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-          token: payload.sourceToken,
-          proof: payload.transferTx,
           memo: request.memo,
-        });
+        } as unknown as import('../../transport').TokenTransferPayload);
 
         this.log(`Token ${token.id} transferred, txHash: ${result.txHash}`);
       }
