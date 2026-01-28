@@ -6,6 +6,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { Token } from '../../types';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
+import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 
 // =============================================================================
 // Types
@@ -55,22 +56,33 @@ export class TokenSplitCalculator {
     console.log(
       `[SplitCalculator] Calculating split for ${targetAmount} of ${targetCoinIdHex}`
     );
+    console.log(`[SplitCalculator] Available tokens: ${availableTokens.length}`);
 
     const candidates: TokenWithAmount[] = [];
 
     // Build candidate list from available tokens
     for (const t of availableTokens) {
-      if (t.coinId !== targetCoinIdHex) continue;
-      if (t.status !== 'confirmed') continue;
-      if (!t.sdkData) continue;
+      console.log(`[SplitCalculator] Token ${t.id}: coinId=${t.coinId}, status=${t.status}, hasSdkData=${!!t.sdkData}`);
+      if (t.coinId !== targetCoinIdHex) {
+        console.log(`[SplitCalculator] Skipping token ${t.id}: coinId mismatch (${t.coinId} !== ${targetCoinIdHex})`);
+        continue;
+      }
+      if (t.status !== 'confirmed') {
+        console.log(`[SplitCalculator] Skipping token ${t.id}: status is ${t.status}`);
+        continue;
+      }
+      if (!t.sdkData) {
+        console.log(`[SplitCalculator] Skipping token ${t.id}: no sdkData`);
+        continue;
+      }
 
       try {
         const parsed = JSON.parse(t.sdkData);
         const sdkToken = await SdkToken.fromJSON(parsed);
-        const realAmount = this.getAmountFromSdkToken(sdkToken);
+        const realAmount = this.getTokenBalance(sdkToken, targetCoinIdHex);
 
         if (realAmount <= 0n) {
-          console.warn(`[SplitCalculator] Token ${t.id} has 0 balance`);
+          console.warn(`[SplitCalculator] Token ${t.id} has 0 balance for coinId ${targetCoinIdHex}`);
           continue;
         }
 
@@ -154,32 +166,22 @@ export class TokenSplitCalculator {
   }
 
   /**
-   * Extract real amount from SDK token structure
+   * Get balance of a specific coin from token (lottery-compatible)
    */
-  private getAmountFromSdkToken(sdkToken: SdkToken<any>): bigint {
+  private getTokenBalance(sdkToken: SdkToken<any>, coinIdHex: string): bigint {
     try {
-      const coinsOpt = sdkToken.coins;
-      const coinData = coinsOpt;
-
-      if (coinData && coinData.coins) {
-        const rawCoins = coinData.coins;
-        let val: any = null;
-
-        const firstItem = rawCoins[0];
-        if (Array.isArray(firstItem) && firstItem.length === 2) {
-          val = firstItem[1];
-        }
-
-        if (Array.isArray(val)) {
-          return BigInt(val[1]?.toString() || '0');
-        } else if (val) {
-          return BigInt(val.toString());
-        }
+      if (!sdkToken.coins) {
+        console.log('[SplitCalculator] Token has no coins');
+        return 0n;
       }
+      const coinId = CoinId.fromJSON(coinIdHex);
+      const balance = sdkToken.coins.get(coinId);
+      console.log(`[SplitCalculator] Token balance for ${coinIdHex.slice(0, 8)}...: ${balance ?? 0n}`);
+      return balance ?? 0n;
     } catch (e) {
-      console.error('[SplitCalculator] Error extracting amount from SDK token', e);
+      console.error('[SplitCalculator] Error getting token balance:', e);
+      return 0n;
     }
-    return 0n;
   }
 
   /**

@@ -15,12 +15,22 @@ import type { Token } from '../../../types';
 // Mock Setup
 // =============================================================================
 
-// Mock the SDK Token class
+// Mock the CoinId class
+vi.mock('@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId', () => ({
+  CoinId: {
+    fromJSON: vi.fn().mockImplementation((hex: string) => ({ hex })),
+  },
+}));
+
+// Mock the SDK Token class with coins.get() method (lottery-compatible)
 vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
   Token: {
     fromJSON: vi.fn().mockImplementation((data) => ({
       coins: {
-        coins: [[data.coinId, [data.coinId, data.amount]]],
+        get: vi.fn().mockImplementation(() => {
+          // Return the amount from parsed data
+          return data.amount ? BigInt(data.amount) : 0n;
+        }),
       },
     })),
   },
