@@ -471,6 +471,9 @@ export class Sphere {
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
+    // Sync nametag with Nostr (re-register if missing)
+    await sphere.syncNametagWithNostr();
+
     sphere._initialized = true;
     Sphere.instance = sphere;
 
@@ -1739,6 +1742,50 @@ export class Sphere {
       }
     } catch {
       // Ignore parse errors - start fresh
+    }
+  }
+
+  /**
+   * Sync nametag with Nostr on wallet load
+   * If local nametag exists but not registered on Nostr, re-register it
+   */
+  private async syncNametagWithNostr(): Promise<void> {
+    const nametag = this._identity?.nametag;
+    if (!nametag) {
+      return; // No nametag to sync
+    }
+
+    if (!this._transport.resolveNametag || !this._transport.registerNametag) {
+      return; // Transport doesn't support nametag operations
+    }
+
+    try {
+      // Check if nametag is registered on Nostr
+      const existingPubkey = await this._transport.resolveNametag(nametag);
+
+      if (existingPubkey === this._identity!.publicKey) {
+        // Already registered correctly
+        console.log(`[Sphere] Nametag @${nametag} verified on Nostr`);
+        return;
+      }
+
+      if (existingPubkey && existingPubkey !== this._identity!.publicKey) {
+        // Registered to someone else - this is a conflict
+        console.warn(`[Sphere] Nametag @${nametag} is registered to different pubkey on Nostr`);
+        return;
+      }
+
+      // Not registered on Nostr - re-register
+      console.log(`[Sphere] Nametag @${nametag} not found on Nostr, re-registering...`);
+      const success = await this._transport.registerNametag(nametag, this._identity!.publicKey);
+      if (success) {
+        console.log(`[Sphere] Nametag @${nametag} re-registered on Nostr`);
+      } else {
+        console.warn(`[Sphere] Failed to re-register nametag @${nametag}`);
+      }
+    } catch (error) {
+      // Don't fail wallet load on nametag sync errors
+      console.warn(`[Sphere] Nametag sync failed:`, error);
     }
   }
 

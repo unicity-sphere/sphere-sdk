@@ -14,7 +14,7 @@ import type { FullIdentity, ProviderStatus } from '../../../types';
 class MockTokenStorageProvider implements TokenStorageProvider<TxfStorageDataBase> {
   readonly id: string;
   readonly name: string;
-  readonly type = 'remote' as const;
+  readonly type = 'cloud' as const;
 
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
