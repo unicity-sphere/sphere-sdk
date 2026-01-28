@@ -22,14 +22,8 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install optional dependencies for type checking
-        run: npm install helia @helia/json @helia/ipns @libp2p/bootstrap @libp2p/crypto @libp2p/peer-id @libp2p/interface multiformats --no-save
-
-      - name: Type check
-        run: npm run typecheck
+      - name: Install dependencies (including optional)
+        run: npm install --include=optional
 
       - name: Build
         run: npm run build

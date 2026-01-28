@@ -34,11 +34,8 @@ jobs:
       - name: Update package version
         run: npm version ${{ inputs.version }} --no-git-tag-version
 
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install optional dependencies
-        run: npm install helia @helia/json @helia/ipns @libp2p/bootstrap @libp2p/crypto @libp2p/peer-id @libp2p/interface multiformats --no-save
+      - name: Install dependencies (including optional)
+        run: npm install --include=optional
 
       - name: Run tests
         run: npm run test:run
