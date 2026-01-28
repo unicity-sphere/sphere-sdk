@@ -307,3 +307,152 @@ describe('Nametag binding format', () => {
     expect(content3.address).toBe(publicKey);
   });
 });
+
+// =============================================================================
+// Event Subscription Pubkey Format Tests
+// =============================================================================
+
+describe('Event subscription pubkey format', () => {
+  // Extended MockWebSocket to track sent messages
+  class TrackingMockWebSocket implements IWebSocket {
+    readyState: number = WebSocketReadyState.CONNECTING;
+    onopen: ((event: unknown) => void) | null = null;
+    onmessage: ((event: IMessageEvent) => void) | null = null;
+    onerror: ((event: unknown) => void) | null = null;
+    onclose: ((event: unknown) => void) | null = null;
+    sentMessages: string[] = [];
+
+    constructor() {
+      setTimeout(() => {
+        this.readyState = WebSocketReadyState.OPEN;
+        this.onopen?.(new Event('open'));
+      }, 10);
+    }
+
+    send(data: string): void {
+      this.sentMessages.push(data);
+    }
+
+    close(): void {
+      this.readyState = WebSocketReadyState.CLOSED;
+    }
+  }
+
+  it('should use 32-byte Nostr pubkey in subscription filter, not 33-byte compressed key', async () => {
+    let createdWs: TrackingMockWebSocket | null = null;
+
+    const provider = new NostrTransportProvider({
+      relays: ['wss://test.relay'],
+      createWebSocket: () => {
+        createdWs = new TrackingMockWebSocket();
+        return createdWs;
+      },
+      timeout: 100,
+      autoReconnect: false,
+    });
+
+    // 33-byte compressed public key (with 02/03 prefix)
+    const compressedPubkey = '02' + 'a'.repeat(64);
+
+    // Set identity with 33-byte compressed key
+    provider.setIdentity({
+      privateKey: 'b'.repeat(64),
+      publicKey: compressedPubkey, // 33-byte compressed
+      address: 'alpha1test',
+    });
+
+    await provider.connect();
+
+    // Wait for subscription to be sent
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(createdWs).not.toBeNull();
+    expect(createdWs!.sentMessages.length).toBeGreaterThan(0);
+
+    // Find the REQ message (subscription)
+    const reqMessage = createdWs!.sentMessages.find(msg => msg.includes('REQ'));
+    expect(reqMessage).toBeDefined();
+
+    const parsed = JSON.parse(reqMessage!);
+    expect(parsed[0]).toBe('REQ');
+
+    const filter = parsed[2];
+    expect(filter['#p']).toBeDefined();
+
+    const subscribedPubkey = filter['#p'][0];
+
+    // Should be 64 hex chars (32 bytes), NOT 66 hex chars (33 bytes)
+    expect(subscribedPubkey).toHaveLength(64);
+
+    // Should NOT start with 02 or 03 (compressed key prefix)
+    expect(subscribedPubkey.startsWith('02')).toBe(false);
+    expect(subscribedPubkey.startsWith('03')).toBe(false);
+
+    // Should NOT equal the 33-byte compressed key we passed in
+    expect(subscribedPubkey).not.toBe(compressedPubkey);
+
+    // Should be derived from the private key (via keyManager.getPublicKeyHex())
+    // The actual value depends on the private key, but we verify the format is correct
+    expect(subscribedPubkey).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('should include all required event kinds in subscription', async () => {
+    let createdWs: TrackingMockWebSocket | null = null;
+
+    const provider = new NostrTransportProvider({
+      relays: ['wss://test.relay'],
+      createWebSocket: () => {
+        createdWs = new TrackingMockWebSocket();
+        return createdWs;
+      },
+      timeout: 100,
+      autoReconnect: false,
+    });
+
+    provider.setIdentity({
+      privateKey: 'b'.repeat(64),
+      publicKey: '02' + 'a'.repeat(64),
+      address: 'alpha1test',
+    });
+
+    await provider.connect();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const reqMessage = createdWs!.sentMessages.find(msg => msg.includes('REQ'));
+    const parsed = JSON.parse(reqMessage!);
+    const filter = parsed[2];
+
+    // Should subscribe to all 4 event kinds (from NOSTR_EVENT_KINDS)
+    expect(filter.kinds).toContain(4);     // DIRECT_MESSAGE
+    expect(filter.kinds).toContain(31113); // TOKEN_TRANSFER
+    expect(filter.kinds).toContain(31115); // PAYMENT_REQUEST
+    expect(filter.kinds).toContain(31116); // PAYMENT_REQUEST_RESPONSE
+  });
+
+  it('getNostrPubkey should return 32-byte hex, different from identity.publicKey', async () => {
+    const provider = new NostrTransportProvider({
+      relays: ['wss://test.relay'],
+      createWebSocket: () => new TrackingMockWebSocket(),
+      timeout: 100,
+      autoReconnect: false,
+    });
+
+    const compressedPubkey = '03' + 'c'.repeat(64); // 33-byte with 03 prefix
+
+    provider.setIdentity({
+      privateKey: 'd'.repeat(64),
+      publicKey: compressedPubkey,
+      address: 'alpha1test',
+    });
+
+    const nostrPubkey = provider.getNostrPubkey();
+
+    // Should be 32 bytes (64 hex chars)
+    expect(nostrPubkey).toHaveLength(64);
+    expect(nostrPubkey).toMatch(/^[0-9a-f]{64}$/);
+
+    // Should NOT be the 33-byte compressed key
+    expect(nostrPubkey).not.toBe(compressedPubkey);
+    expect(nostrPubkey.length).not.toBe(66);
+  });
+});
