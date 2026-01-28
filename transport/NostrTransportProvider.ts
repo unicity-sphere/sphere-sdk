@@ -356,13 +356,15 @@ export class NostrTransportProvider implements TransportProvider {
     this.ensureReady();
 
     // Create encrypted token transfer event
-    const content = JSON.stringify(payload);
+    // Content must have "token_transfer:" prefix for nostr-js-sdk compatibility
+    const content = 'token_transfer:' + JSON.stringify(payload);
     const event = await this.createEncryptedEvent(
       EVENT_KINDS.TOKEN_TRANSFER,
       content,
       [
         ['p', recipientPubkey],
         ['d', 'token-transfer'],
+        ['type', 'token_transfer'],
       ]
     );
 
@@ -447,7 +449,8 @@ export class NostrTransportProvider implements TransportProvider {
     };
 
     // Create encrypted payment request response event
-    const content = JSON.stringify(responseContent);
+    // Content must have "payment_response:" prefix for nostr-js-sdk compatibility
+    const content = 'payment_response:' + JSON.stringify(responseContent);
     const event = await this.createEncryptedEvent(
       EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
       content,
@@ -455,6 +458,7 @@ export class NostrTransportProvider implements TransportProvider {
         ['p', recipientPubkey],
         ['e', payload.requestId], // Reference to original request
         ['d', 'payment-request-response'],
+        ['type', 'payment_response'],
       ]
     );
 
