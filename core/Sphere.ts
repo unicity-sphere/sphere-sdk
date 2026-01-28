@@ -1760,28 +1760,12 @@ export class Sphere {
     }
 
     try {
-      // Check if nametag is registered on Nostr
-      const existingPubkey = await this._transport.resolveNametag(nametag);
-
-      if (existingPubkey === this._identity!.publicKey) {
-        // Already registered correctly
-        console.log(`[Sphere] Nametag @${nametag} verified on Nostr`);
-        return;
-      }
-
-      if (existingPubkey && existingPubkey !== this._identity!.publicKey) {
-        // Registered to someone else - this is a conflict
-        console.warn(`[Sphere] Nametag @${nametag} is registered to different pubkey on Nostr`);
-        return;
-      }
-
-      // Not registered on Nostr - re-register
-      console.log(`[Sphere] Nametag @${nametag} not found on Nostr, re-registering...`);
+      // Register nametag (will check if already registered and re-publish if needed)
       const success = await this._transport.registerNametag(nametag, this._identity!.publicKey);
       if (success) {
-        console.log(`[Sphere] Nametag @${nametag} re-registered on Nostr`);
+        console.log(`[Sphere] Nametag @${nametag} synced with Nostr`);
       } else {
-        console.warn(`[Sphere] Failed to re-register nametag @${nametag}`);
+        console.warn(`[Sphere] Nametag @${nametag} is taken by another pubkey`);
       }
     } catch (error) {
       // Don't fail wallet load on nametag sync errors

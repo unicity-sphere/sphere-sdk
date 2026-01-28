@@ -911,22 +911,38 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   private async queryEvents(filter: NostrFilter): Promise<NostrEvent[]> {
+    if (this.connections.size === 0) {
+      throw new Error('No connected relays');
+    }
+
+    // Query all relays in parallel and return first non-empty result
+    const queryPromises = Array.from(this.connections.values()).map(ws =>
+      this.queryEventsFromRelay(ws, filter)
+    );
+
+    // Wait for first relay that returns events, or all to complete
+    const results = await Promise.allSettled(queryPromises);
+
+    // Find first successful result with events
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value.length > 0) {
+        return result.value;
+      }
+    }
+
+    // No events found on any relay
+    return [];
+  }
+
+  private async queryEventsFromRelay(ws: IWebSocket, filter: NostrFilter): Promise<NostrEvent[]> {
     const subId = this.config.generateUUID().slice(0, 8);
     const events: NostrEvent[] = [];
 
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        this.unsubscribe(subId);
+        this.unsubscribeFromRelay(ws, subId);
         resolve(events);
       }, 5000);
-
-      // Subscribe to first connected relay
-      const ws = this.connections.values().next().value;
-      if (!ws) {
-        clearTimeout(timeout);
-        reject(new Error('No connected relays'));
-        return;
-      }
 
       const originalHandler = ws.onmessage;
       ws.onmessage = (event: IMessageEvent) => {
@@ -943,13 +959,19 @@ export class NostrTransportProvider implements TransportProvider {
         } else if (type === 'EOSE') {
           clearTimeout(timeout);
           ws.onmessage = originalHandler;
-          this.unsubscribe(subId);
+          this.unsubscribeFromRelay(ws, subId);
           resolve(events);
         }
       };
 
       ws.send(JSON.stringify(['REQ', subId, filter]));
     });
+  }
+
+  private unsubscribeFromRelay(ws: IWebSocket, subId: string): void {
+    if (ws.readyState === WebSocketReadyState.OPEN) {
+      ws.send(JSON.stringify(['CLOSE', subId]));
+    }
   }
 
   // ===========================================================================
@@ -1000,18 +1022,6 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     this.subscriptions.set(subId, Array.from(this.connections.keys()));
-  }
-
-  private unsubscribe(subId: string): void {
-    const message = JSON.stringify(['CLOSE', subId]);
-
-    for (const ws of this.connections.values()) {
-      if (ws.readyState === WebSocketReadyState.OPEN) {
-        ws.send(message);
-      }
-    }
-
-    this.subscriptions.delete(subId);
   }
 
   // ===========================================================================
