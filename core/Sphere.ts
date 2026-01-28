@@ -102,7 +102,7 @@ export interface SphereCreateOptions {
   mnemonic: string;
   /** Custom derivation path (default: m/44'/0'/0') */
   derivationPath?: string;
-  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice) */
+  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice). Token is auto-minted. */
   nametag?: string;
   /** Storage provider instance */
   storage: StorageProvider;
@@ -156,7 +156,7 @@ export interface SphereImportOptions {
   basePath?: string;
   /** Derivation mode: bip32, wif_hmac, legacy_hmac */
   derivationMode?: DerivationMode;
-  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice) */
+  /** Optional nametag to register for this wallet (e.g., 'alice' for @alice). Token is auto-minted. */
   nametag?: string;
   /** Storage provider instance */
   storage: StorageProvider;
@@ -196,7 +196,7 @@ export interface SphereInitOptions {
   autoGenerate?: boolean;
   /** Custom derivation path (default: m/44'/0'/0') */
   derivationPath?: string;
-  /** Optional nametag to register (only on create) */
+  /** Optional nametag to register (only on create). Token is auto-minted. */
   nametag?: string;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
@@ -442,6 +442,18 @@ export class Sphere {
     // Register nametag if provided
     if (options.nametag) {
       await sphere.registerNametag(options.nametag);
+
+      // Always mint nametag token on-chain if not already minted
+      // Required for receiving tokens via @nametag (PROXY address finalization)
+      if (!sphere._payments.hasNametag()) {
+        console.log(`[Sphere] Minting nametag token for @${options.nametag}...`);
+        const result = await sphere.mintNametag(options.nametag);
+        if (!result.success) {
+          console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
+        } else {
+          console.log(`[Sphere] Nametag token minted successfully`);
+        }
+      }
     }
 
     return sphere;
