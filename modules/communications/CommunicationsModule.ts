@@ -304,6 +304,7 @@ export class CommunicationsModule {
     const message: DirectMessage = {
       id: msg.id,
       senderPubkey: msg.senderPubkey,
+      senderNametag: msg.senderNametag,
       recipientPubkey: this.deps!.identity.publicKey,
       content: msg.content,
       timestamp: msg.timestamp,

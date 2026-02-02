@@ -143,6 +143,7 @@ export interface TransportProvider extends BaseProvider {
 export interface IncomingMessage {
   id: string;
   senderPubkey: string;
+  senderNametag?: string;
   content: string;
   timestamp: number;
   encrypted: boolean;

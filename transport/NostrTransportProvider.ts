@@ -14,7 +14,9 @@ import { Buffer } from 'buffer';
 import {
   NostrKeyManager,
   NIP04,
+  NIP17,
   Event as NostrEventClass,
+  EventKinds,
   hashNametag,
 } from '@unicitylabs/nostr-js-sdk';
 import type { ProviderStatus, FullIdentity } from '../types';
@@ -326,14 +328,16 @@ export class NostrTransportProvider implements TransportProvider {
   async sendMessage(recipientPubkey: string, content: string): Promise<string> {
     this.ensureReady();
 
-    // Create NIP-04 encrypted DM event
-    const event = await this.createEncryptedEvent(
-      EVENT_KINDS.DIRECT_MESSAGE,
-      content,
-      [['p', recipientPubkey]]
-    );
+    // Wrap content with sender nametag for Sphere app compatibility
+    const senderNametag = this.identity?.nametag;
+    const wrappedContent = senderNametag
+      ? JSON.stringify({ senderNametag, text: content })
+      : content;
 
-    await this.publishEvent(event);
+    // Create NIP-17 gift-wrapped message (kind 1059)
+    const giftWrap = NIP17.createGiftWrap(this.keyManager!, recipientPubkey, wrappedContent);
+
+    await this.publishEvent(giftWrap);
 
     this.emitEvent({
       type: 'message:sent',
@@ -341,7 +345,7 @@ export class NostrTransportProvider implements TransportProvider {
       data: { recipient: recipientPubkey },
     });
 
-    return event.id;
+    return giftWrap.id;
   }
 
   onMessage(handler: MessageHandler): () => void {
@@ -706,6 +710,9 @@ export class NostrTransportProvider implements TransportProvider {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
           break;
+        case EventKinds.GIFT_WRAP:
+          await this.handleGiftWrap(event);
+          break;
         case EVENT_KINDS.TOKEN_TRANSFER:
           await this.handleTokenTransfer(event);
           break;
@@ -749,6 +756,50 @@ export class NostrTransportProvider implements TransportProvider {
       } catch (error) {
         this.log('Message handler error:', error);
       }
+    }
+  }
+
+  private async handleGiftWrap(event: NostrEvent): Promise<void> {
+    if (!this.identity || !this.keyManager) return;
+
+    try {
+      const pm = NIP17.unwrap(event as any, this.keyManager);
+      if (pm.senderPubkey === this.keyManager.getPublicKeyHex()) return;
+      if (pm.kind !== EventKinds.CHAT_MESSAGE) return;
+
+      // Sphere app wraps DM content as JSON: {senderNametag, text}
+      let content = pm.content;
+      let senderNametag: string | undefined;
+      try {
+        const parsed = JSON.parse(content);
+        if (typeof parsed === 'object' && parsed.text !== undefined) {
+          content = parsed.text;
+          senderNametag = parsed.senderNametag || undefined;
+        }
+      } catch {
+        // Plain text — use as-is
+      }
+
+      const message: IncomingMessage = {
+        id: pm.eventId,
+        senderPubkey: pm.senderPubkey,
+        senderNametag,
+        content,
+        timestamp: pm.timestamp * 1000,
+        encrypted: true,
+      };
+
+      this.emitEvent({ type: 'message:received', timestamp: Date.now() });
+
+      for (const handler of this.messageHandlers) {
+        try {
+          handler(message);
+        } catch (error) {
+          this.log('Message handler error:', error);
+        }
+      }
+    } catch {
+      // Expected for gift wraps meant for other recipients
     }
   }
 
@@ -1039,6 +1090,7 @@ export class NostrTransportProvider implements TransportProvider {
     const filter: NostrFilter = {
       kinds: [
         EVENT_KINDS.DIRECT_MESSAGE,
+        EventKinds.GIFT_WRAP,
         EVENT_KINDS.TOKEN_TRANSFER,
         EVENT_KINDS.PAYMENT_REQUEST,
         EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
