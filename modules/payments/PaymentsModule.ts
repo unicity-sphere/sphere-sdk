@@ -31,7 +31,16 @@ import type {
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import { TokenSplitCalculator } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
+import { InstantSplitExecutor, type InstantSplitExecutorDependencies } from './InstantSplitExecutor';
+import { InstantSplitProcessor } from './InstantSplitProcessor';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
+import type {
+  InstantSplitBundleV5,
+  InstantSplitResult,
+  InstantSplitOptions,
+  InstantSplitProcessResult,
+} from '../../types/instant-split';
+import type { SplitPaymentSession } from '../../types/payment-session';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type {
   TransportProvider,
@@ -874,6 +883,310 @@ export class PaymentsModule {
 
       this.deps!.emitEvent('transfer:failed', result);
       throw error;
+    }
+  }
+
+  // ===========================================================================
+  // Public API - Instant Send (INSTANT_SPLIT V5)
+  // ===========================================================================
+
+  /**
+   * Send tokens using INSTANT_SPLIT V5 protocol for ~2.3s latency.
+   *
+   * This method achieves dramatically faster transfers by:
+   * 1. Only waiting for burn proof (~2s) - required for SplitMintReason
+   * 2. Creating transfer commitment WITHOUT mint proof (key optimization!)
+   * 3. Sending bundle via Nostr immediately
+   * 4. Processing mints and storage sync in background
+   *
+   * @param request - Transfer request (same as send())
+   * @param options - Optional instant split options
+   * @returns Result with session ID, Nostr event ID, and timing info
+   */
+  async sendInstant(
+    request: TransferRequest,
+    options?: InstantSplitOptions
+  ): Promise<InstantSplitResult & { transferId: string }> {
+    this.ensureInitialized();
+
+    const transferId = crypto.randomUUID();
+
+    try {
+      // Resolve recipient pubkey for Nostr delivery
+      const recipientPubkey = await this.resolveRecipient(request.recipient);
+
+      // Resolve recipient address for on-chain transfer
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient);
+
+      // Create signing service
+      const signingService = await this.createSigningService();
+
+      // Get state transition client and trust base
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        throw new Error('State transition client not available');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!trustBase) {
+        throw new Error('Trust base not available');
+      }
+
+      // Calculate optimal split plan
+      const calculator = new TokenSplitCalculator();
+      const availableTokens = Array.from(this.tokens.values());
+      const splitPlan = await calculator.calculateOptimalSplit(
+        availableTokens,
+        BigInt(request.amount),
+        request.coinId
+      );
+
+      if (!splitPlan) {
+        throw new Error('Insufficient balance');
+      }
+
+      // Instant mode only supports splits (for now)
+      if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
+        // Fall back to regular send for direct transfers
+        this.log('Instant mode: falling back to regular send (no split needed)');
+        const regularResult = await this.send(request);
+        return {
+          success: regularResult.status === 'completed',
+          sessionId: transferId,
+          splitGroupId: transferId,
+          criticalPathDurationMs: 0,
+          backgroundStarted: false,
+          transferId,
+          nostrEventId: regularResult.txHash,
+        };
+      }
+
+      this.log(`Instant split: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
+
+      // Mark token as transferring
+      const tokenToSplit = splitPlan.tokenToSplit.uiToken;
+      tokenToSplit.status = 'transferring';
+      this.tokens.set(tokenToSplit.id, tokenToSplit);
+
+      // Create instant split executor
+      const executor = new InstantSplitExecutor({
+        stateTransitionClient: stClient,
+        trustBase,
+        signingService,
+        debug: this.moduleConfig.debug,
+      });
+
+      // Create dependencies for instant split
+      const deps: InstantSplitExecutorDependencies = {
+        sendViaNostr: async (pubkey: string, bundle: InstantSplitBundleV5) => {
+          // Send as token transfer with instant split type
+          const eventId = await this.deps!.transport.sendTokenTransfer(pubkey, {
+            type: 'INSTANT_SPLIT_V5',
+            bundle: JSON.stringify(bundle),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          return eventId;
+        },
+        saveChangeToken: async (sdkToken: unknown) => {
+          // Save change token to wallet
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const tokenData = (sdkToken as any).toJSON();
+          const changeToken: Token = {
+            id: crypto.randomUUID(),
+            coinId: request.coinId,
+            symbol: this.getCoinSymbol(request.coinId),
+            name: this.getCoinName(request.coinId),
+            amount: splitPlan.remainderAmount!.toString(),
+            status: 'confirmed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: JSON.stringify(tokenData),
+          };
+          await this.addToken(changeToken, true);
+          this.log(`Instant: Change token saved: ${changeToken.id}`);
+        },
+        triggerStorageSync: async () => {
+          // Save to local storage
+          await this.save();
+
+          // Note: Full sync to external providers (IPFS, etc.) happens
+          // through the normal sync flow. This is just a trigger to save.
+          this.log('Instant: Local storage saved, external sync will follow');
+          return true;
+        },
+      };
+
+      // Execute instant split
+      const result = await executor.executeSplitInstant(
+        splitPlan.tokenToSplit.sdkToken,
+        splitPlan.splitAmount!,
+        splitPlan.remainderAmount!,
+        splitPlan.coinId,
+        recipientAddress,
+        deps,
+        options
+      );
+
+      if (result.success) {
+        // Remove the original token that was split
+        const recipientNametag = request.recipient.startsWith('@')
+          ? request.recipient.slice(1)
+          : undefined;
+        await this.removeToken(tokenToSplit.id, recipientNametag);
+
+        // Add to transaction history
+        await this.addToHistory({
+          type: 'SENT',
+          amount: request.amount,
+          coinId: request.coinId,
+          symbol: this.getCoinSymbol(request.coinId),
+          timestamp: Date.now(),
+          recipientNametag,
+          txHash: result.nostrEventId,
+        });
+
+        this.deps!.emitEvent('transfer:confirmed', {
+          id: transferId,
+          status: 'completed',
+          tokens: [tokenToSplit],
+          txHash: result.nostrEventId,
+        });
+      } else {
+        // Restore token on failure
+        tokenToSplit.status = 'confirmed';
+        this.tokens.set(tokenToSplit.id, tokenToSplit);
+
+        this.deps!.emitEvent('transfer:failed', {
+          id: transferId,
+          status: 'failed',
+          tokens: [tokenToSplit],
+          error: result.error,
+        });
+      }
+
+      return {
+        ...result,
+        transferId,
+      };
+
+    } catch (error) {
+      this.log('Instant send failed:', error);
+      return {
+        success: false,
+        sessionId: transferId,
+        splitGroupId: transferId,
+        criticalPathDurationMs: 0,
+        backgroundStarted: false,
+        error: error instanceof Error ? error.message : String(error),
+        transferId,
+      };
+    }
+  }
+
+  /**
+   * Process a received INSTANT_SPLIT bundle.
+   *
+   * Called when receiving tokens via the instant split protocol.
+   * Handles bundle verification, proof fetching, and token finalization.
+   *
+   * @param bundleJson - The received bundle JSON
+   * @param nametagTokens - Optional nametag tokens for PROXY address verification
+   * @returns Result with finalized token
+   */
+  async processInstantSplitBundle(
+    bundleJson: string | object,
+    nametagTokens?: unknown[]
+  ): Promise<InstantSplitProcessResult> {
+    this.ensureInitialized();
+
+    try {
+      // Create signing service for recipient
+      const signingService = await this.createSigningService();
+
+      // Get state transition client and trust base
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        throw new Error('State transition client not available');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!trustBase) {
+        throw new Error('Trust base not available');
+      }
+
+      // Create processor
+      const processor = new InstantSplitProcessor({
+        stateTransitionClient: stClient,
+        trustBase,
+        signingService,
+        debug: this.moduleConfig.debug,
+      });
+
+      // Process the bundle
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await processor.processReceivedBundle(bundleJson, {
+        nametagTokens: nametagTokens as any,
+        onProgress: (stage, message) => {
+          this.log(`InstantSplit progress: ${stage} - ${message}`);
+        },
+      });
+
+      if (result.success && result.token) {
+        // Parse bundle to get metadata
+        const bundle = typeof bundleJson === 'string'
+          ? JSON.parse(bundleJson)
+          : bundleJson;
+
+        // Create UI token from SDK token
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const sdkToken = result.token as any;
+        const tokenData = sdkToken.toJSON();
+
+        const uiToken: Token = {
+          id: crypto.randomUUID(),
+          coinId: bundle.coinId || 'ALPHA',
+          symbol: this.getCoinSymbol(bundle.coinId || 'ALPHA'),
+          name: this.getCoinName(bundle.coinId || 'ALPHA'),
+          amount: bundle.amount || '0',
+          status: 'confirmed',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          sdkData: JSON.stringify(tokenData),
+        };
+
+        // Add token to wallet
+        await this.addToken(uiToken, false);
+
+        // Add to transaction history
+        await this.addToHistory({
+          type: 'RECEIVED',
+          amount: uiToken.amount,
+          coinId: uiToken.coinId,
+          symbol: uiToken.symbol,
+          timestamp: Date.now(),
+          senderPubkey: bundle.senderPubkey,
+        });
+
+        // Emit event
+        this.deps!.emitEvent('transfer:incoming', {
+          id: crypto.randomUUID(),
+          tokens: [uiToken],
+          senderPubkey: bundle.senderPubkey,
+          receivedAt: Date.now(),
+        });
+
+        this.log(`Instant split bundle processed: ${uiToken.id}`);
+      }
+
+      return result;
+
+    } catch (error) {
+      this.log('Failed to process instant split bundle:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+        durationMs: 0,
+      };
     }
   }
 

@@ -4,6 +4,7 @@
  */
 
 import type { BaseProvider, FullIdentity } from '../types';
+import type { InstantSplitBundleV5 } from '../types/instant-split';
 
 // =============================================================================
 // Transport Provider Interface
@@ -134,6 +135,33 @@ export interface TransportProvider extends BaseProvider {
    * Check if a relay is currently connected
    */
   isRelayConnected?(relayUrl: string): boolean;
+
+  // ===========================================================================
+  // Instant Split V5 (optional - for optimized transfers)
+  // ===========================================================================
+
+  /**
+   * Send an INSTANT_SPLIT V5 bundle to a recipient.
+   * This is a specialized method for ~2.3s latency token transfers.
+   *
+   * @param recipientPubkey - Recipient's public key (32-byte Nostr format)
+   * @param bundle - The InstantSplitBundleV5 payload
+   * @returns Nostr event ID
+   */
+  sendInstantSplitBundle?(
+    recipientPubkey: string,
+    bundle: InstantSplitBundleV5
+  ): Promise<string>;
+
+  /**
+   * Subscribe to incoming INSTANT_SPLIT V5 bundles.
+   *
+   * @param handler - Handler function for incoming bundles
+   * @returns Unsubscribe function
+   */
+  onInstantSplitReceived?(
+    handler: InstantSplitBundleHandler
+  ): () => void;
 }
 
 // =============================================================================
@@ -264,6 +292,23 @@ export interface IncomingBroadcast {
 export type BroadcastHandler = (broadcast: IncomingBroadcast) => void;
 
 // =============================================================================
+// Instant Split Types
+// =============================================================================
+
+export interface IncomingInstantSplitBundle {
+  /** Nostr event ID */
+  id: string;
+  /** Sender's public key */
+  senderPubkey: string;
+  /** The InstantSplitBundleV5 payload */
+  bundle: InstantSplitBundleV5;
+  /** Timestamp */
+  timestamp: number;
+}
+
+export type InstantSplitBundleHandler = (incoming: IncomingInstantSplitBundle) => void;
+
+// =============================================================================
 // Transport Events
 // =============================================================================
 
@@ -277,7 +322,9 @@ export type TransportEventType =
   | 'message:received'
   | 'message:sent'
   | 'transfer:received'
-  | 'transfer:sent';
+  | 'transfer:sent'
+  | 'instant_split:received'
+  | 'instant_split:sent';
 
 export interface TransportEvent {
   type: TransportEventType;
