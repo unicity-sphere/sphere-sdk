@@ -1098,7 +1098,7 @@ export class PaymentsModule {
     // Convert transport request to IncomingPaymentRequest
     const request: IncomingPaymentRequest = {
       id: transportRequest.id,
-      senderPubkey: transportRequest.senderPubkey,
+      senderPubkey: transportRequest.senderTransportPubkey,
       amount: transportRequest.request.amount,
       coinId: transportRequest.request.coinId,
       symbol: transportRequest.request.coinId, // Use coinId as symbol for now
@@ -1236,7 +1236,7 @@ export class PaymentsModule {
     // Convert transport response to PaymentRequestResponse
     const response: PaymentRequestResponse = {
       id: transportResponse.id,
-      responderPubkey: transportResponse.responderPubkey,
+      responderPubkey: transportResponse.responderTransportPubkey,
       requestId: transportResponse.response.requestId,
       responseType: transportResponse.response.responseType,
       message: transportResponse.response.message,
@@ -2339,12 +2339,12 @@ export class PaymentsModule {
       return null;
     }
 
-    if (!info.publicKey) {
-      this.log(`Nametag "${nametag}" has no 33-byte publicKey (legacy event)`);
+    if (!info.chainPubkey) {
+      this.log(`Nametag "${nametag}" has no 33-byte chainPubkey (legacy event)`);
       return null;
     }
 
-    return info.publicKey;
+    return info.chainPubkey;
   }
 
   /**
@@ -2553,7 +2553,7 @@ export class PaymentsModule {
 
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
-        senderPubkey: transfer.senderPubkey,
+        senderPubkey: transfer.senderTransportPubkey,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
@@ -2641,7 +2641,7 @@ export class PaymentsModule {
       tokens,
       {
         version: 1,
-        address: this.deps!.identity.address,
+        address: this.deps!.identity.l1Address,
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {

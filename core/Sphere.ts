@@ -634,9 +634,9 @@ export class Sphere {
   get identity(): Identity | null {
     if (!this._identity) return null;
     return {
-      publicKey: this._identity.publicKey,
-      address: this._identity.address,
-      predicateAddress: this._identity.predicateAddress,
+      chainPubkey: this._identity.chainPubkey,
+      l1Address: this._identity.l1Address,
+      directAddress: this._identity.directAddress,
       ipnsName: this._identity.ipnsName,
       nametag: this._identity.nametag,
     };
@@ -781,7 +781,7 @@ export class Sphere {
       if (this._masterKey) {
         address0 = this.deriveAddress(0).address;
       } else if (this._identity) {
-        address0 = this._identity.address;
+        address0 = this._identity.l1Address;
       }
     } catch {
       // Ignore errors
@@ -841,8 +841,8 @@ export class Sphere {
         // Stop if we can't derive more addresses (e.g., no masterKey)
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.address,
-            publicKey: this._identity.publicKey,
+            address: this._identity.l1Address,
+            publicKey: this._identity.chainPubkey,
             path: this.getDefaultAddressPath(),
             index: 0,
           });
@@ -941,7 +941,7 @@ export class Sphere {
         // Stop if we can't derive more addresses
         if (i === 0 && this._identity) {
           addresses.push({
-            address: this._identity.address,
+            address: this._identity.l1Address,
             path: this.getDefaultAddressPath(),
             index: 0,
             isChange: false,
@@ -1432,9 +1432,9 @@ export class Sphere {
     // Update identity
     this._identity = {
       privateKey: addressInfo.privateKey,
-      publicKey: addressInfo.publicKey,
-      address: addressInfo.address,
-      predicateAddress,
+      chainPubkey: addressInfo.publicKey,
+      l1Address: addressInfo.address,
+      directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
       nametag,
     };
@@ -1458,14 +1458,14 @@ export class Sphere {
     await this.reinitializeModulesForNewAddress();
 
     this.emitEvent('identity:changed', {
-      address: this._identity.address,
-      predicateAddress: this._identity.predicateAddress,
-      publicKey: this._identity.publicKey,
+      l1Address: this._identity.l1Address,
+      directAddress: this._identity.directAddress,
+      chainPubkey: this._identity.chainPubkey,
       nametag: this._identity.nametag,
       addressIndex: index,
     });
 
-    console.log(`[Sphere] Switched to address ${index}:`, this._identity.address);
+    console.log(`[Sphere] Switched to address ${index}:`, this._identity.l1Address);
   }
 
   /**
@@ -1736,7 +1736,11 @@ export class Sphere {
 
     // Register with transport provider (Nostr)
     if (this._transport.registerNametag) {
-      const success = await this._transport.registerNametag(cleanNametag, this._identity!.publicKey);
+      const success = await this._transport.registerNametag(
+        cleanNametag,
+        this._identity!.chainPubkey,
+        this._identity!.directAddress || ''
+      );
       if (!success) {
         throw new Error('Failed to register nametag. It may already be taken.');
       }
@@ -1850,7 +1854,11 @@ export class Sphere {
 
     try {
       // Register nametag (will check if already registered and re-publish if needed)
-      const success = await this._transport.registerNametag(nametag, this._identity!.publicKey);
+      const success = await this._transport.registerNametag(
+        nametag,
+        this._identity!.chainPubkey,
+        this._identity!.directAddress || ''
+      );
       if (success) {
         console.log(`[Sphere] Nametag @${nametag} synced with Nostr`);
       } else {
@@ -1894,7 +1902,11 @@ export class Sphere {
 
         // Re-register to ensure event has latest format with all fields
         if (this._transport.registerNametag) {
-          await this._transport.registerNametag(recoveredNametag, this._identity!.publicKey);
+          await this._transport.registerNametag(
+            recoveredNametag,
+            this._identity!.chainPubkey,
+            this._identity!.directAddress || ''
+          );
         }
 
         this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
@@ -2074,15 +2086,15 @@ export class Sphere {
 
       this._identity = {
         privateKey: addressInfo.privateKey,
-        publicKey: addressInfo.publicKey,
-        address: addressInfo.address,
-        predicateAddress,
+        chainPubkey: addressInfo.publicKey,
+        l1Address: addressInfo.address,
+        directAddress: predicateAddress,
         ipnsName: '12D3KooW' + ipnsHash,
         nametag,
       };
       // Update storage identity for correct address
       this._storage.setIdentity(this._identity);
-      console.log(`[Sphere] Restored to address ${this._currentAddressIndex}:`, this._identity.address);
+      console.log(`[Sphere] Restored to address ${this._currentAddressIndex}:`, this._identity.l1Address);
     } else {
       // Restore saved nametag for address 0 (legacy support)
       if (savedNametag && this._identity) {
@@ -2143,9 +2155,9 @@ export class Sphere {
 
     this._identity = {
       privateKey: derivedKey.privateKey,
-      publicKey,
-      address,
-      predicateAddress,
+      chainPubkey: publicKey,
+      l1Address: address,
+      directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
 
@@ -2188,9 +2200,9 @@ export class Sphere {
 
     this._identity = {
       privateKey,
-      publicKey,
-      address,
-      predicateAddress,
+      chainPubkey: publicKey,
+      l1Address: address,
+      directAddress: predicateAddress,
       ipnsName: '12D3KooW' + ipnsHash,
     };
   }

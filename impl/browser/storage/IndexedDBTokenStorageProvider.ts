@@ -34,7 +34,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
     // Scope database to address
-    this.dbName = `${DB_NAME}-${identity.address.slice(0, 20)}`;
+    this.dbName = `${DB_NAME}-${identity.l1Address.slice(0, 20)}`;
   }
 
   async initialize(): Promise<boolean> {

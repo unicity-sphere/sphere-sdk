@@ -645,10 +645,11 @@ export class NostrTransportProvider implements TransportProvider {
 
         return {
           nametag,
-          pubkey: bindingEvent.pubkey,
-          publicKey: content.public_key,
+          transportPubkey: bindingEvent.pubkey,
+          chainPubkey: content.public_key,
           l1Address: content.l1_address,
-          l3Address,
+          directAddress: content.direct_address || '',
+          proxyAddress: l3Address,
           timestamp: bindingEvent.created_at * 1000,
         };
       }
@@ -665,10 +666,11 @@ export class NostrTransportProvider implements TransportProvider {
         const l3Address = `PROXY:${hashedNametag}`;
         return {
           nametag,
-          pubkey: bindingEvent.pubkey,
-          publicKey: pubkeyTag[1],
+          transportPubkey: bindingEvent.pubkey,
+          chainPubkey: pubkeyTag[1],
           l1Address: l1Tag[1],
-          l3Address,
+          directAddress: '',
+          proxyAddress: l3Address,
           timestamp: bindingEvent.created_at * 1000,
         };
       }
@@ -676,20 +678,22 @@ export class NostrTransportProvider implements TransportProvider {
       // Return partial info with empty addresses for legacy events
       return {
         nametag,
-        pubkey: bindingEvent.pubkey,
-        publicKey: '', // Cannot derive from 32-byte Nostr pubkey
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '', // Cannot derive from 32-byte Nostr pubkey
         l1Address: '', // Cannot derive without 33-byte pubkey
-        l3Address: `PROXY:${hashedNametag}`,
+        directAddress: '',
+        proxyAddress: `PROXY:${hashedNametag}`,
         timestamp: bindingEvent.created_at * 1000,
       };
     } catch {
       // If content is not JSON, try legacy format
       return {
         nametag,
-        pubkey: bindingEvent.pubkey,
-        publicKey: '',
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '',
         l1Address: '',
-        l3Address: `PROXY:${hashedNametag}`,
+        directAddress: '',
+        proxyAddress: `PROXY:${hashedNametag}`,
         timestamp: bindingEvent.created_at * 1000,
       };
     }
@@ -763,7 +767,7 @@ export class NostrTransportProvider implements TransportProvider {
     this.log('Published nametag binding:', nametag);
   }
 
-  async registerNametag(nametag: string, _publicKey: string): Promise<boolean> {
+  async registerNametag(nametag: string, _publicKey: string, directAddress: string = ''): Promise<boolean> {
     this.ensureReady();
 
     if (!this.identity) {
@@ -806,6 +810,7 @@ export class NostrTransportProvider implements TransportProvider {
       encrypted_nametag: encryptedNametag,
       public_key: compressedPubkey,
       l1_address: l1Address,
+      direct_address: directAddress,
     });
 
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, [
@@ -986,7 +991,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const message: IncomingMessage = {
       id: event.id,
-      senderPubkey: event.pubkey,
+      senderTransportPubkey: event.pubkey,
       content,
       timestamp: event.created_at * 1000,
       encrypted: true,
@@ -1012,7 +1017,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const transfer: IncomingTokenTransfer = {
       id: event.id,
-      senderPubkey: event.pubkey,
+      senderTransportPubkey: event.pubkey,
       payload,
       timestamp: event.created_at * 1000,
     };
@@ -1045,7 +1050,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const request: IncomingPaymentRequest = {
         id: event.id,
-        senderPubkey: event.pubkey,
+        senderTransportPubkey: event.pubkey,
         request: {
           requestId: requestData.requestId,
           amount: requestData.amount,
@@ -1086,7 +1091,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const response: IncomingPaymentRequestResponse = {
         id: event.id,
-        responderPubkey: event.pubkey,
+        responderTransportPubkey: event.pubkey,
         response: {
           requestId: responseData.requestId,
           responseType: responseData.responseType,
@@ -1117,7 +1122,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const broadcast: IncomingBroadcast = {
       id: event.id,
-      authorPubkey: event.pubkey,
+      authorTransportPubkey: event.pubkey,
       content: event.content,
       tags,
       timestamp: event.created_at * 1000,

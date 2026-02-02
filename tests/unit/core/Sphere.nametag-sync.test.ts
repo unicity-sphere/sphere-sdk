@@ -127,8 +127,8 @@ describe('Sphere.syncNametagWithNostr', () => {
       // Simulate syncNametagWithNostr logic
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -139,7 +139,7 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       // Should register since not found
       if (!existingPubkey) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.publicKey);
+        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey);
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
@@ -157,8 +157,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -168,8 +168,8 @@ describe('Sphere.syncNametagWithNostr', () => {
       expect(existingPubkey).toBe(TEST_PUBKEY);
 
       // Should not register since already registered to same pubkey
-      if (existingPubkey !== identity.publicKey) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.publicKey);
+      if (existingPubkey !== identity.chainPubkey) {
+        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey);
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
@@ -183,8 +183,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -194,12 +194,12 @@ describe('Sphere.syncNametagWithNostr', () => {
       expect(existingPubkey).toBe(OTHER_PUBKEY);
 
       // Should not register since owned by someone else
-      const isConflict = existingPubkey && existingPubkey !== identity.publicKey;
+      const isConflict = existingPubkey && existingPubkey !== identity.chainPubkey;
       expect(isConflict).toBe(true);
 
       // Simulate: do not register on conflict
       if (!isConflict) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.publicKey);
+        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey);
       }
 
       expect(transport._registerCalls).toHaveLength(0);
@@ -212,8 +212,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         // no nametag
       };
@@ -240,8 +240,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -264,8 +264,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };

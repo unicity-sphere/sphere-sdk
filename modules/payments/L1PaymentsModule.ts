@@ -150,8 +150,8 @@ export class L1PaymentsModule {
       chainCode: deps.chainCode,
       addresses: [
         {
-          address: deps.identity.address,
-          publicKey: deps.identity.publicKey,
+          address: deps.identity.l1Address,
+          publicKey: deps.identity.chainPubkey,
           privateKey: deps.identity.privateKey,
           path: 'm/0',
           index: 0,
@@ -161,7 +161,7 @@ export class L1PaymentsModule {
 
     // Add additional addresses
     for (const addr of this._addresses) {
-      if (addr !== deps.identity.address) {
+      if (addr !== deps.identity.l1Address) {
         this._wallet.addresses.push({
           address: addr,
           path: null,
@@ -266,7 +266,7 @@ export class L1PaymentsModule {
         this._wallet,
         recipientAddress,
         amountAlpha,
-        this._identity.address
+        this._identity.l1Address
       );
 
       if (results && results.length > 0) {
@@ -546,8 +546,8 @@ export class L1PaymentsModule {
 
   private _getWatchedAddresses(): string[] {
     const addresses = [...this._addresses];
-    if (this._identity?.address && !addresses.includes(this._identity.address)) {
-      addresses.unshift(this._identity.address);
+    if (this._identity?.l1Address && !addresses.includes(this._identity.l1Address)) {
+      addresses.unshift(this._identity.l1Address);
     }
     return addresses;
   }

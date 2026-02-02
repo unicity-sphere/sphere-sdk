@@ -28,11 +28,12 @@ export interface BaseProvider extends ProviderMetadata {
 // =============================================================================
 
 export interface Identity {
-  readonly publicKey: string;
+  /** 33-byte compressed secp256k1 public key (for L3 chain) */
+  readonly chainPubkey: string;
   /** L1 address (alpha1...) */
-  readonly address: string;
-  /** L3 predicate address (DIRECT://...) */
-  readonly predicateAddress?: string;
+  readonly l1Address: string;
+  /** L3 DIRECT address (DIRECT://...) */
+  readonly directAddress?: string;
   readonly ipnsName?: string;
   readonly nametag?: string;
 }
@@ -312,7 +313,7 @@ export interface SphereEventMap {
   'connection:changed': { provider: string; connected: boolean };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
-  'identity:changed': { address: string; predicateAddress?: string; publicKey: string; nametag?: string; addressIndex: number };
+  'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
