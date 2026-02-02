@@ -11,7 +11,7 @@ import type { StorageProvider } from '../../../storage';
 // =============================================================================
 
 export interface LocalStorageProviderConfig {
-  /** Key prefix (default: 'sphere_sdk2_') */
+  /** Key prefix (default: 'sphere_') */
   prefix?: string;
   /** Custom storage instance (for testing/SSR) */
   storage?: Storage;
@@ -40,7 +40,7 @@ export class LocalStorageProvider implements StorageProvider {
     const storage = config?.storage ?? this.getStorageSafe();
 
     this.config = {
-      prefix: config?.prefix ?? 'sphere_sdk2_',
+      prefix: config?.prefix ?? 'sphere_',
       storage,
       debug: config?.debug ?? false,
     };
