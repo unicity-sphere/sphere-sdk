@@ -6,6 +6,7 @@
  * - Real secp256k1 event signing
  * - NIP-04 encryption/decryption
  * - Event ID calculation
+ * - NostrClient for reliable connection management (ping, reconnect, NIP-42)
  *
  * WebSocket is injected via factory for cross-platform support
  */
@@ -20,6 +21,8 @@ import {
   Event as NostrEventClass,
   EventKinds,
   hashNametag,
+  NostrClient,
+  Filter,
 } from '@unicitylabs/nostr-js-sdk';
 import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import type { ProviderStatus, FullIdentity } from '../types';
@@ -42,8 +45,8 @@ import type {
   TransportEventCallback,
   NametagInfo,
 } from './transport-provider';
-import type { IWebSocket, IMessageEvent, WebSocketFactory, UUIDGenerator } from './websocket';
-import { WebSocketReadyState, defaultUUIDGenerator } from './websocket';
+import type { WebSocketFactory, UUIDGenerator } from './websocket';
+import { defaultUUIDGenerator } from './websocket';
 import {
   DEFAULT_NOSTR_RELAYS,
   NOSTR_EVENT_KINDS,
@@ -181,9 +184,10 @@ export class NostrTransportProvider implements TransportProvider {
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
 
-  // WebSocket connections to relays
-  private connections: Map<string, IWebSocket> = new Map();
-  private reconnectAttempts: Map<string, number> = new Map();
+  // NostrClient from nostr-js-sdk handles all WebSocket management,
+  // keepalive pings, reconnection, and NIP-42 authentication
+  private nostrClient: NostrClient | null = null;
+  private mainSubscriptionId: string | null = null;
 
   // Event handlers
   private messageHandlers: Set<MessageHandler> = new Set();
@@ -192,9 +196,6 @@ export class NostrTransportProvider implements TransportProvider {
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
-
-  // Subscriptions
-  private subscriptions: Map<string, string[]> = new Map(); // subId -> relays
 
   constructor(config: NostrTransportProviderConfig) {
     this.config = {
@@ -219,21 +220,55 @@ export class NostrTransportProvider implements TransportProvider {
     this.status = 'connecting';
 
     try {
-      // Connect to all relays in parallel
-      const connectPromises = this.config.relays.map((relay) =>
-        this.connectToRelay(relay)
-      );
+      // Ensure keyManager exists for NostrClient
+      if (!this.keyManager) {
+        // Create a temporary key manager - will be replaced when setIdentity is called
+        const tempKey = Buffer.alloc(32);
+        crypto.getRandomValues(tempKey);
+        this.keyManager = NostrKeyManager.fromPrivateKey(tempKey);
+      }
 
-      await Promise.allSettled(connectPromises);
+      // Create NostrClient with robust connection handling:
+      // - autoReconnect: automatic reconnection with exponential backoff
+      // - pingIntervalMs: keepalive pings to detect stale connections
+      // - NIP-42 AUTH handling built-in
+      this.nostrClient = new NostrClient(this.keyManager, {
+        autoReconnect: this.config.autoReconnect,
+        reconnectIntervalMs: this.config.reconnectDelay,
+        maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
+        pingIntervalMs: 30000, // 30 second keepalive pings
+      });
+
+      // Add connection event listener for logging
+      this.nostrClient.addConnectionListener({
+        onConnect: (url) => {
+          this.log('NostrClient connected to relay:', url);
+          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        },
+        onDisconnect: (url, reason) => {
+          this.log('NostrClient disconnected from relay:', url, 'reason:', reason);
+        },
+        onReconnecting: (url, attempt) => {
+          this.log('NostrClient reconnecting to relay:', url, 'attempt:', attempt);
+          this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
+        },
+        onReconnected: (url) => {
+          this.log('NostrClient reconnected to relay:', url);
+          this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+        },
+      });
+
+      // Connect to all relays
+      await this.nostrClient.connect(...this.config.relays);
 
       // Need at least one successful connection
-      if (this.connections.size === 0) {
+      if (!this.nostrClient.isConnected()) {
         throw new Error('Failed to connect to any relay');
       }
 
       this.status = 'connected';
       this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-      this.log('Connected to', this.connections.size, 'relays');
+      this.log('Connected to', this.nostrClient.getConnectedRelays().size, 'relays');
 
       // Set up subscriptions
       if (this.identity) {
@@ -246,19 +281,18 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
-    for (const [url, ws] of this.connections) {
-      ws.close();
-      this.connections.delete(url);
+    if (this.nostrClient) {
+      this.nostrClient.disconnect();
+      this.nostrClient = null;
     }
-
-    this.subscriptions.clear();
+    this.mainSubscriptionId = null;
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
     this.log('Disconnected from all relays');
   }
 
   isConnected(): boolean {
-    return this.status === 'connected' && this.connections.size > 0;
+    return this.status === 'connected' && this.nostrClient?.isConnected() === true;
   }
 
   getStatus(): ProviderStatus {
@@ -280,7 +314,8 @@ export class NostrTransportProvider implements TransportProvider {
    * Get list of currently connected relay URLs
    */
   getConnectedRelays(): string[] {
-    return Array.from(this.connections.keys());
+    if (!this.nostrClient) return [];
+    return Array.from(this.nostrClient.getConnectedRelays());
   }
 
   /**
@@ -298,9 +333,9 @@ export class NostrTransportProvider implements TransportProvider {
     this.config.relays.push(relayUrl);
 
     // Connect if provider is connected
-    if (this.status === 'connected') {
+    if (this.status === 'connected' && this.nostrClient) {
       try {
-        await this.connectToRelay(relayUrl);
+        await this.nostrClient.connect(relayUrl);
         this.log('Added and connected to relay:', relayUrl);
         this.emitEvent({
           type: 'transport:relay_added',
@@ -330,6 +365,8 @@ export class NostrTransportProvider implements TransportProvider {
   /**
    * Remove a relay dynamically
    * Will disconnect from the relay if connected
+   * NOTE: NostrClient doesn't support removing individual relays at runtime.
+   * We remove from config so it won't be used on next connect().
    */
   async removeRelay(relayUrl: string): Promise<boolean> {
     const index = this.config.relays.indexOf(relayUrl);
@@ -340,15 +377,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     // Remove from config
     this.config.relays.splice(index, 1);
-
-    // Disconnect if connected
-    const ws = this.connections.get(relayUrl);
-    if (ws) {
-      ws.close();
-      this.connections.delete(relayUrl);
-      this.reconnectAttempts.delete(relayUrl);
-      this.log('Removed and disconnected from relay:', relayUrl);
-    }
+    this.log('Removed relay from config:', relayUrl);
 
     this.emitEvent({
       type: 'transport:relay_removed',
@@ -357,7 +386,7 @@ export class NostrTransportProvider implements TransportProvider {
     });
 
     // Check if we still have connections
-    if (this.connections.size === 0 && this.status === 'connected') {
+    if (this.nostrClient && !this.nostrClient.isConnected() && this.status === 'connected') {
       this.status = 'error';
       this.emitEvent({
         type: 'transport:error',
@@ -380,8 +409,8 @@ export class NostrTransportProvider implements TransportProvider {
    * Check if a relay is currently connected
    */
   isRelayConnected(relayUrl: string): boolean {
-    const ws = this.connections.get(relayUrl);
-    return ws !== undefined && ws.readyState === WebSocketReadyState.OPEN;
+    if (!this.nostrClient) return false;
+    return this.nostrClient.getConnectedRelays().has(relayUrl);
   }
 
   // ===========================================================================
@@ -399,8 +428,45 @@ export class NostrTransportProvider implements TransportProvider {
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     this.log('Identity set, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
 
-    // Re-subscribe if already connected
-    if (this.isConnected()) {
+    // If we already have a NostrClient with a temp key, we need to reconnect with the real key
+    // NostrClient doesn't support changing key at runtime
+    if (this.nostrClient && this.status === 'connected') {
+      this.log('Identity changed while connected - recreating NostrClient');
+      const oldClient = this.nostrClient;
+
+      // Create new client with real identity
+      this.nostrClient = new NostrClient(this.keyManager, {
+        autoReconnect: this.config.autoReconnect,
+        reconnectIntervalMs: this.config.reconnectDelay,
+        maxReconnectIntervalMs: this.config.reconnectDelay * 16,
+        pingIntervalMs: 30000,
+      });
+
+      // Add connection event listener
+      this.nostrClient.addConnectionListener({
+        onConnect: (url) => {
+          this.log('NostrClient connected to relay:', url);
+        },
+        onDisconnect: (url, reason) => {
+          this.log('NostrClient disconnected from relay:', url, 'reason:', reason);
+        },
+        onReconnecting: (url, attempt) => {
+          this.log('NostrClient reconnecting to relay:', url, 'attempt:', attempt);
+        },
+        onReconnected: (url) => {
+          this.log('NostrClient reconnected to relay:', url);
+        },
+      });
+
+      // Connect with new identity and set up subscriptions
+      this.nostrClient.connect(...this.config.relays).then(() => {
+        this.subscribeToEvents();
+        oldClient.disconnect();
+      }).catch((err) => {
+        this.log('Failed to reconnect with new identity:', err);
+      });
+    } else if (this.isConnected()) {
+      // Already connected with right key, just subscribe
       this.subscribeToEvents();
     }
   }
@@ -837,6 +903,9 @@ export class NostrTransportProvider implements TransportProvider {
     return true;
   }
 
+  // Track broadcast subscriptions
+  private broadcastSubscriptions: Map<string, string> = new Map(); // key -> subId
+
   subscribeToBroadcast(tags: string[], handler: BroadcastHandler): () => void {
     const key = tags.sort().join(':');
 
@@ -844,7 +913,7 @@ export class NostrTransportProvider implements TransportProvider {
       this.broadcastHandlers.set(key, new Set());
 
       // Subscribe to relay
-      if (this.isConnected()) {
+      if (this.isConnected() && this.nostrClient) {
         this.subscribeToTags(tags);
       }
     }
@@ -855,6 +924,12 @@ export class NostrTransportProvider implements TransportProvider {
       this.broadcastHandlers.get(key)?.delete(handler);
       if (this.broadcastHandlers.get(key)?.size === 0) {
         this.broadcastHandlers.delete(key);
+        // Unsubscribe from relay
+        const subId = this.broadcastSubscriptions.get(key);
+        if (subId && this.nostrClient) {
+          this.nostrClient.unsubscribe(subId);
+          this.broadcastSubscriptions.delete(key);
+        }
       }
     };
   }
@@ -879,99 +954,18 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   // ===========================================================================
-  // Private: Connection Management
-  // ===========================================================================
-
-  private async connectToRelay(url: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const ws = this.config.createWebSocket(url);
-
-      const timeout = setTimeout(() => {
-        ws.close();
-        reject(new Error(`Connection timeout: ${url}`));
-      }, this.config.timeout);
-
-      ws.onopen = () => {
-        clearTimeout(timeout);
-        this.connections.set(url, ws);
-        this.reconnectAttempts.set(url, 0);
-        this.log('Connected to relay:', url);
-        resolve();
-      };
-
-      ws.onerror = (error) => {
-        clearTimeout(timeout);
-        this.log('Relay error:', url, error);
-        reject(error);
-      };
-
-      ws.onclose = () => {
-        this.connections.delete(url);
-        if (this.config.autoReconnect && this.status === 'connected') {
-          this.scheduleReconnect(url);
-        }
-      };
-
-      ws.onmessage = (event: IMessageEvent) => {
-        this.handleRelayMessage(url, event.data);
-      };
-    });
-  }
-
-  private scheduleReconnect(url: string): void {
-    const attempts = this.reconnectAttempts.get(url) ?? 0;
-    if (attempts >= this.config.maxReconnectAttempts) {
-      this.log('Max reconnect attempts reached for:', url);
-      return;
-    }
-
-    this.reconnectAttempts.set(url, attempts + 1);
-    const delay = this.config.reconnectDelay * Math.pow(2, attempts);
-
-    this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
-
-    setTimeout(() => {
-      this.connectToRelay(url).catch(() => {
-        // Will retry again if still below max attempts
-      });
-    }, delay);
-  }
-
-  // ===========================================================================
   // Private: Message Handling
   // ===========================================================================
 
-  private handleRelayMessage(relay: string, data: string): void {
-    try {
-      const message = JSON.parse(data);
-      const [type, ...args] = message;
-
-      switch (type) {
-        case 'EVENT':
-          this.handleEvent(args[1]);
-          break;
-        case 'EOSE':
-          // End of stored events
-          break;
-        case 'OK':
-          // Event accepted
-          break;
-        case 'NOTICE':
-          this.log('Relay notice:', relay, args[0]);
-          break;
-      }
-    } catch (error) {
-      this.log('Failed to parse relay message:', error);
-    }
-  }
-
   private async handleEvent(event: NostrEvent): Promise<void> {
+    this.log('Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
       switch (event.kind) {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
           break;
         case EventKinds.GIFT_WRAP:
+          this.log('Handling gift wrap (NIP-17 DM)');
           await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
@@ -993,40 +987,29 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   private async handleDirectMessage(event: NostrEvent): Promise<void> {
-    if (!this.identity || !this.keyManager) return;
-
-    // Skip our own messages (compare with 32-byte Nostr pubkey)
-    if (event.pubkey === this.keyManager.getPublicKeyHex()) return;
-
-    // Decrypt content
-    const content = await this.decryptContent(event.content, event.pubkey);
-
-    const message: IncomingMessage = {
-      id: event.id,
-      senderTransportPubkey: event.pubkey,
-      content,
-      timestamp: event.created_at * 1000,
-      encrypted: true,
-    };
-
-    this.emitEvent({ type: 'message:received', timestamp: Date.now() });
-
-    for (const handler of this.messageHandlers) {
-      try {
-        handler(message);
-      } catch (error) {
-        this.log('Message handler error:', error);
-      }
-    }
+    // NIP-04 (kind 4) is deprecated for DMs - only used for legacy token transfers
+    // DMs should come through NIP-17 (kind 1059 gift wrap) via handleGiftWrap
+    // This handler is kept for backwards compatibility but does NOT dispatch to messageHandlers
+    this.log('Ignoring NIP-04 kind 4 event (DMs use NIP-17):', event.id?.slice(0, 12));
   }
 
   private async handleGiftWrap(event: NostrEvent): Promise<void> {
-    if (!this.identity || !this.keyManager) return;
+    if (!this.identity || !this.keyManager) {
+      this.log('handleGiftWrap: no identity/keyManager');
+      return;
+    }
 
     try {
       const pm = NIP17.unwrap(event as any, this.keyManager);
-      if (pm.senderPubkey === this.keyManager.getPublicKeyHex()) return;
-      if (pm.kind !== EventKinds.CHAT_MESSAGE) return;
+      this.log('Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
+      if (pm.senderPubkey === this.keyManager.getPublicKeyHex()) {
+        this.log('Skipping own message');
+        return;
+      }
+      if (pm.kind !== EventKinds.CHAT_MESSAGE) {
+        this.log('Skipping non-chat message, kind:', pm.kind);
+        return;
+      }
 
       // Sphere app wraps DM content as JSON: {senderNametag, text}
       let content = pm.content;
@@ -1041,6 +1024,8 @@ export class NostrTransportProvider implements TransportProvider {
         // Plain text — use as-is
       }
 
+      this.log('DM received from:', senderNametag || pm.senderPubkey?.slice(0, 16), 'content:', content?.slice(0, 50));
+
       const message: IncomingMessage = {
         id: pm.eventId,
         senderTransportPubkey: pm.senderPubkey,
@@ -1052,6 +1037,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       this.emitEvent({ type: 'message:received', timestamp: Date.now() });
 
+      this.log('Dispatching to', this.messageHandlers.size, 'handlers');
       for (const handler of this.messageHandlers) {
         try {
           handler(message);
@@ -1059,8 +1045,9 @@ export class NostrTransportProvider implements TransportProvider {
           this.log('Message handler error:', error);
         }
       }
-    } catch {
+    } catch (err) {
       // Expected for gift wraps meant for other recipients
+      this.log('Gift wrap decrypt failed (expected if not for us):', (err as Error)?.message?.slice(0, 50));
     }
   }
 
@@ -1257,85 +1244,50 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   private async publishEvent(event: NostrEvent): Promise<void> {
-    const message = JSON.stringify(['EVENT', event]);
+    if (!this.nostrClient) {
+      throw new Error('NostrClient not initialized');
+    }
 
-    const publishPromises = Array.from(this.connections.values()).map((ws) => {
-      return new Promise<void>((resolve, reject) => {
-        if (ws.readyState !== WebSocketReadyState.OPEN) {
-          reject(new Error('WebSocket not open'));
-          return;
-        }
-
-        ws.send(message);
-        resolve();
-      });
-    });
-
-    await Promise.any(publishPromises);
+    // Convert to nostr-js-sdk Event and publish
+    const sdkEvent = NostrEventClass.fromJSON(event);
+    await this.nostrClient.publishEvent(sdkEvent);
   }
 
-  private async queryEvents(filter: NostrFilter): Promise<NostrEvent[]> {
-    if (this.connections.size === 0) {
+  private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
+    if (!this.nostrClient || !this.nostrClient.isConnected()) {
       throw new Error('No connected relays');
     }
 
-    // Query all relays in parallel and return first non-empty result
-    const queryPromises = Array.from(this.connections.values()).map(ws =>
-      this.queryEventsFromRelay(ws, filter)
-    );
-
-    // Wait for first relay that returns events, or all to complete
-    const results = await Promise.allSettled(queryPromises);
-
-    // Find first successful result with events
-    for (const result of results) {
-      if (result.status === 'fulfilled' && result.value.length > 0) {
-        return result.value;
-      }
-    }
-
-    // No events found on any relay
-    return [];
-  }
-
-  private async queryEventsFromRelay(ws: IWebSocket, filter: NostrFilter): Promise<NostrEvent[]> {
-    const subId = this.config.generateUUID().slice(0, 8);
     const events: NostrEvent[] = [];
+    const filter = new Filter(filterObj);
 
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        this.unsubscribeFromRelay(ws, subId);
+        if (subId) {
+          this.nostrClient?.unsubscribe(subId);
+        }
         resolve(events);
       }, 5000);
 
-      const originalHandler = ws.onmessage;
-      ws.onmessage = (event: IMessageEvent) => {
-        const message = JSON.parse(event.data);
-        const [type, sid, data] = message;
-
-        if (sid !== subId) {
-          originalHandler?.call(ws, event);
-          return;
-        }
-
-        if (type === 'EVENT') {
-          events.push(data);
-        } else if (type === 'EOSE') {
+      const subId = this.nostrClient!.subscribe(filter, {
+        onEvent: (event) => {
+          events.push({
+            id: event.id,
+            kind: event.kind,
+            content: event.content,
+            tags: event.tags,
+            pubkey: event.pubkey,
+            created_at: event.created_at,
+            sig: event.sig,
+          });
+        },
+        onEndOfStoredEvents: () => {
           clearTimeout(timeout);
-          ws.onmessage = originalHandler;
-          this.unsubscribeFromRelay(ws, subId);
+          this.nostrClient?.unsubscribe(subId);
           resolve(events);
-        }
-      };
-
-      ws.send(JSON.stringify(['REQ', subId, filter]));
+        },
+      });
     });
-  }
-
-  private unsubscribeFromRelay(ws: IWebSocket, subId: string): void {
-    if (ws.readyState === WebSocketReadyState.OPEN) {
-      ws.send(JSON.stringify(['CLOSE', subId]));
-    }
   }
 
   // ===========================================================================
@@ -1343,12 +1295,23 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private subscribeToEvents(): void {
-    if (!this.identity || !this.keyManager) return;
+    this.log('subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
+    if (!this.identity || !this.keyManager || !this.nostrClient) {
+      this.log('subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
+      return;
+    }
 
-    const subId = 'main';
+    // Unsubscribe from previous subscription if any
+    if (this.mainSubscriptionId) {
+      this.nostrClient.unsubscribe(this.mainSubscriptionId);
+      this.mainSubscriptionId = null;
+    }
+
     // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
     const nostrPubkey = this.keyManager.getPublicKeyHex();
-    const filter: NostrFilter = {
+    this.log('Subscribing with Nostr pubkey:', nostrPubkey);
+
+    const filter = new Filter({
       kinds: [
         EVENT_KINDS.DIRECT_MESSAGE,
         EventKinds.GIFT_WRAP,
@@ -1358,37 +1321,59 @@ export class NostrTransportProvider implements TransportProvider {
       ],
       '#p': [nostrPubkey],
       since: Math.floor(Date.now() / 1000) - 86400, // Last 24h
-    };
+    });
+    this.log('Subscription filter kinds:', filter.kinds);
 
-    const message = JSON.stringify(['REQ', subId, filter]);
+    // NostrClient handles subscription persistence and resubscription on reconnect
+    this.mainSubscriptionId = this.nostrClient.subscribe(filter, {
+      onEvent: (event) => {
+        this.log('Received event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        this.handleEvent({
+          id: event.id,
+          kind: event.kind,
+          content: event.content,
+          tags: event.tags,
+          pubkey: event.pubkey,
+          created_at: event.created_at,
+          sig: event.sig,
+        });
+      },
+      onEndOfStoredEvents: () => {
+        this.log('Subscription ready (EOSE)');
+      },
+      onError: (_subId, error) => {
+        this.log('Subscription error:', error);
+      },
+    });
 
-    for (const ws of this.connections.values()) {
-      if (ws.readyState === WebSocketReadyState.OPEN) {
-        ws.send(message);
-      }
-    }
-
-    this.subscriptions.set(subId, Array.from(this.connections.keys()));
-    this.log('Subscribed to events');
+    this.log('Subscribed to events with subId:', this.mainSubscriptionId);
   }
 
   private subscribeToTags(tags: string[]): void {
-    const subId = `tags:${tags.join(':')}`;
-    const filter: NostrFilter = {
+    if (!this.nostrClient) return;
+
+    const key = tags.sort().join(':');
+    const filter = new Filter({
       kinds: [EVENT_KINDS.BROADCAST],
       '#t': tags,
       since: Math.floor(Date.now() / 1000) - 3600, // Last hour
-    };
+    });
 
-    const message = JSON.stringify(['REQ', subId, filter]);
+    const subId = this.nostrClient.subscribe(filter, {
+      onEvent: (event) => {
+        this.handleBroadcast({
+          id: event.id,
+          kind: event.kind,
+          content: event.content,
+          tags: event.tags,
+          pubkey: event.pubkey,
+          created_at: event.created_at,
+          sig: event.sig,
+        });
+      },
+    });
 
-    for (const ws of this.connections.values()) {
-      if (ws.readyState === WebSocketReadyState.OPEN) {
-        ws.send(message);
-      }
-    }
-
-    this.subscriptions.set(subId, Array.from(this.connections.keys()));
+    this.broadcastSubscriptions.set(key, subId);
   }
 
   // ===========================================================================

@@ -149,7 +149,7 @@ describe('NIP-17 DM end-to-end', () => {
     await new Promise((r) => setTimeout(r, 3000));
 
     // First: Alice -> Bob
-    const bobDmPromise = waitForDM(bob);
+    const bobDmPromise = waitForDM(bob, 30000);
     await new Promise((r) => setTimeout(r, 3000));
 
     const msg1 = `Round-trip A->B ${Date.now()}`;
@@ -160,10 +160,10 @@ describe('NIP-17 DM end-to-end', () => {
     expect(received1.senderNametag).toBe(aliceTag);
 
     // Wait for state to settle before second exchange
-    await new Promise((r) => setTimeout(r, 3000));
+    await new Promise((r) => setTimeout(r, 5000));
 
     // Second: Bob -> Alice
-    const aliceDmPromise = waitForDM(alice);
+    const aliceDmPromise = waitForDM(alice, 30000);
     await new Promise((r) => setTimeout(r, 3000));
 
     const msg2 = `Round-trip B->A ${Date.now()}`;
