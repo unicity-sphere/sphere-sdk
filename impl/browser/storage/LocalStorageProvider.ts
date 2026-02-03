@@ -88,7 +88,7 @@ export class LocalStorageProvider implements StorageProvider {
 
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
-    this.log('Identity set:', identity.address);
+    this.log('Identity set:', identity.l1Address);
   }
 
   async get(key: string): Promise<string | null> {
@@ -169,7 +169,7 @@ export class LocalStorageProvider implements StorageProvider {
   // ===========================================================================
 
   private getFullKey(key: string): string {
-    const addressPart = this.identity?.address ?? 'default';
+    const addressPart = this.identity?.l1Address ?? 'default';
     return `${this.config.prefix}${addressPart}_${key}`;
   }
 

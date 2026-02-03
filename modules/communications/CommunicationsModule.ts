@@ -129,7 +129,7 @@ export class CommunicationsModule {
     // Create message record
     const message: DirectMessage = {
       id: eventId,
-      senderPubkey: this.deps!.identity.publicKey,
+      senderPubkey: this.deps!.identity.chainPubkey,
       senderNametag: this.deps!.identity.nametag,
       recipientPubkey,
       content,
@@ -165,7 +165,7 @@ export class CommunicationsModule {
 
     for (const message of this.messages.values()) {
       const peer =
-        message.senderPubkey === this.deps?.identity.publicKey
+        message.senderPubkey === this.deps?.identity.chainPubkey
           ? message.recipientPubkey
           : message.senderPubkey;
 
@@ -204,7 +204,7 @@ export class CommunicationsModule {
    */
   getUnreadCount(peerPubkey?: string): number {
     let messages = Array.from(this.messages.values()).filter(
-      (m) => !m.isRead && m.senderPubkey !== this.deps?.identity.publicKey
+      (m) => !m.isRead && m.senderPubkey !== this.deps?.identity.chainPubkey
     );
 
     if (peerPubkey) {
@@ -236,7 +236,7 @@ export class CommunicationsModule {
 
     const message: BroadcastMessage = {
       id: eventId ?? crypto.randomUUID(),
-      authorPubkey: this.deps!.identity.publicKey,
+      authorPubkey: this.deps!.identity.chainPubkey,
       authorNametag: this.deps!.identity.nametag,
       content,
       timestamp: Date.now(),
@@ -299,13 +299,13 @@ export class CommunicationsModule {
 
   private handleIncomingMessage(msg: IncomingMessage): void {
     // Skip own messages
-    if (msg.senderPubkey === this.deps?.identity.publicKey) return;
+    if (msg.senderTransportPubkey === this.deps?.identity.chainPubkey) return;
 
     const message: DirectMessage = {
       id: msg.id,
-      senderPubkey: msg.senderPubkey,
+      senderPubkey: msg.senderTransportPubkey,
       senderNametag: msg.senderNametag,
-      recipientPubkey: this.deps!.identity.publicKey,
+      recipientPubkey: this.deps!.identity.chainPubkey,
       content: msg.content,
       timestamp: msg.timestamp,
       isRead: false,
@@ -337,7 +337,7 @@ export class CommunicationsModule {
   private handleIncomingBroadcast(incoming: IncomingBroadcast): void {
     const message: BroadcastMessage = {
       id: incoming.id,
-      authorPubkey: incoming.authorPubkey,
+      authorPubkey: incoming.authorTransportPubkey,
       content: incoming.content,
       timestamp: incoming.timestamp,
       tags: incoming.tags,

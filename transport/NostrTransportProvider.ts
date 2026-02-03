@@ -11,6 +11,8 @@
  */
 
 import { Buffer } from 'buffer';
+import { hkdf } from '@noble/hashes/hkdf.js';
+import { sha256 as sha256Noble } from '@noble/hashes/sha2.js';
 import {
   NostrKeyManager,
   NIP04,
@@ -19,6 +21,7 @@ import {
   EventKinds,
   hashNametag,
 } from '@unicitylabs/nostr-js-sdk';
+import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
@@ -37,6 +40,7 @@ import type {
   PaymentRequestResponsePayload,
   TransportEvent,
   TransportEventCallback,
+  NametagInfo,
 } from './transport-provider';
 import type { IWebSocket, IMessageEvent, WebSocketFactory, UUIDGenerator } from './websocket';
 import { WebSocketReadyState, defaultUUIDGenerator } from './websocket';
@@ -71,6 +75,93 @@ export interface NostrTransportProviderConfig {
 
 // Alias for backward compatibility
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
+
+// =============================================================================
+// Nametag Encryption Utilities
+// =============================================================================
+
+/**
+ * Derive encryption key from private key using HKDF
+ * @param privateKeyHex - 32-byte private key as hex
+ * @returns 32-byte derived key as Uint8Array
+ */
+function deriveNametagEncryptionKey(privateKeyHex: string): Uint8Array {
+  const privateKeyBytes = Buffer.from(privateKeyHex, 'hex');
+  // Use HKDF with SHA-256, salt derived from constant, info = "nametag-encryption"
+  const saltInput = new TextEncoder().encode('sphere-nametag-salt');
+  const salt = sha256Noble(saltInput);
+  const info = new TextEncoder().encode('nametag-encryption');
+  return hkdf(sha256Noble, privateKeyBytes, salt, info, 32);
+}
+
+/**
+ * Encrypt nametag with AES-GCM using derived key
+ * @param nametag - Plain text nametag
+ * @param privateKeyHex - Private key for key derivation
+ * @returns Base64 encoded encrypted data (iv + ciphertext + tag)
+ */
+async function encryptNametag(nametag: string, privateKeyHex: string): Promise<string> {
+  const key = deriveNametagEncryptionKey(privateKeyHex);
+  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV for AES-GCM
+  const encoder = new TextEncoder();
+  const data = encoder.encode(nametag);
+
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    new Uint8Array(key).buffer as ArrayBuffer,
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt']
+  );
+
+  const encrypted = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
+    cryptoKey,
+    new Uint8Array(data).buffer as ArrayBuffer
+  );
+
+  // Combine IV + ciphertext (includes auth tag)
+  const combined = new Uint8Array(iv.length + encrypted.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(encrypted), iv.length);
+
+  return Buffer.from(combined).toString('base64');
+}
+
+/**
+ * Decrypt nametag with AES-GCM using derived key
+ * @param encryptedBase64 - Base64 encoded encrypted data (iv + ciphertext + tag)
+ * @param privateKeyHex - Private key for key derivation
+ * @returns Decrypted nametag or null if decryption fails
+ */
+async function decryptNametag(encryptedBase64: string, privateKeyHex: string): Promise<string | null> {
+  try {
+    const key = deriveNametagEncryptionKey(privateKeyHex);
+    const combined = Buffer.from(encryptedBase64, 'base64');
+
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw',
+      new Uint8Array(key).buffer as ArrayBuffer,
+      { name: 'AES-GCM' },
+      false,
+      ['decrypt']
+    );
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
+      cryptoKey,
+      new Uint8Array(ciphertext).buffer as ArrayBuffer
+    );
+
+    const decoder = new TextDecoder();
+    return decoder.decode(decrypted);
+  } catch {
+    return null;
+  }
+}
 
 // =============================================================================
 // Implementation
@@ -526,6 +617,151 @@ export class NostrTransportProvider implements TransportProvider {
     return null;
   }
 
+  async resolveNametagInfo(nametag: string): Promise<NametagInfo | null> {
+    this.ensureReady();
+
+    // Query for nametag binding events using hashed nametag (privacy-preserving)
+    const hashedNametag = hashNametag(nametag);
+
+    // First try '#t' tag (nostr-js-sdk format)
+    let events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      '#t': [hashedNametag],
+      limit: 1,
+    });
+
+    // Fallback to '#d' tag (legacy format)
+    if (events.length === 0) {
+      events = await this.queryEvents({
+        kinds: [EVENT_KINDS.NAMETAG_BINDING],
+        '#d': [hashedNametag],
+        limit: 1,
+      });
+    }
+
+    if (events.length === 0) return null;
+
+    const bindingEvent = events[0];
+
+    try {
+      const content = JSON.parse(bindingEvent.content);
+
+      // Check if event has extended fields
+      if (content.public_key && content.l1_address) {
+        // Full info available
+        // Compute L3 address from nametag token ID (PROXY:nametagTokenIdHex)
+        const l3Address = `PROXY:${hashedNametag}`;
+
+        return {
+          nametag,
+          transportPubkey: bindingEvent.pubkey,
+          chainPubkey: content.public_key,
+          l1Address: content.l1_address,
+          directAddress: content.direct_address || '',
+          proxyAddress: l3Address,
+          timestamp: bindingEvent.created_at * 1000,
+        };
+      }
+
+      // Legacy event - only has Nostr pubkey
+      // Cannot derive l1_address or l3_address without 33-byte pubkey
+      this.log('Legacy nametag event without extended fields:', nametag);
+
+      // Try to get info from tags as fallback
+      const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'pubkey');
+      const l1Tag = bindingEvent.tags.find((t: string[]) => t[0] === 'l1');
+
+      if (pubkeyTag?.[1] && l1Tag?.[1]) {
+        const l3Address = `PROXY:${hashedNametag}`;
+        return {
+          nametag,
+          transportPubkey: bindingEvent.pubkey,
+          chainPubkey: pubkeyTag[1],
+          l1Address: l1Tag[1],
+          directAddress: '',
+          proxyAddress: l3Address,
+          timestamp: bindingEvent.created_at * 1000,
+        };
+      }
+
+      // Return partial info with empty addresses for legacy events
+      return {
+        nametag,
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '', // Cannot derive from 32-byte Nostr pubkey
+        l1Address: '', // Cannot derive without 33-byte pubkey
+        directAddress: '',
+        proxyAddress: `PROXY:${hashedNametag}`,
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    } catch {
+      // If content is not JSON, try legacy format
+      return {
+        nametag,
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '',
+        l1Address: '',
+        directAddress: '',
+        proxyAddress: `PROXY:${hashedNametag}`,
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    }
+  }
+
+  /**
+   * Recover nametag for the current identity by searching for encrypted nametag events
+   * Used after wallet import to recover associated nametag
+   * @returns Decrypted nametag or null if none found
+   */
+  async recoverNametag(): Promise<string | null> {
+    this.ensureReady();
+
+    if (!this.identity || !this.keyManager) {
+      throw new Error('Identity not set');
+    }
+
+    const nostrPubkey = this.getNostrPubkey();
+    this.log('Searching for nametag events for pubkey:', nostrPubkey.slice(0, 16) + '...');
+
+    // Query for nametag binding events authored by this pubkey
+    const events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      authors: [nostrPubkey],
+      limit: 10, // Get recent events in case of updates
+    });
+
+    if (events.length === 0) {
+      this.log('No nametag events found for this pubkey');
+      return null;
+    }
+
+    // Sort by timestamp descending to get most recent
+    events.sort((a, b) => b.created_at - a.created_at);
+
+    // Try to decrypt nametag from events
+    for (const event of events) {
+      try {
+        const content = JSON.parse(event.content);
+        if (content.encrypted_nametag) {
+          const decrypted = await decryptNametag(
+            content.encrypted_nametag,
+            this.identity.privateKey
+          );
+          if (decrypted) {
+            this.log('Recovered nametag:', decrypted);
+            return decrypted;
+          }
+        }
+      } catch {
+        // Try next event
+        continue;
+      }
+    }
+
+    this.log('Could not decrypt nametag from any event');
+    return null;
+  }
+
   async publishNametag(nametag: string, address: string): Promise<void> {
     this.ensureReady();
 
@@ -540,8 +776,12 @@ export class NostrTransportProvider implements TransportProvider {
     this.log('Published nametag binding:', nametag);
   }
 
-  async registerNametag(nametag: string, _publicKey: string): Promise<boolean> {
+  async registerNametag(nametag: string, _publicKey: string, directAddress: string = ''): Promise<boolean> {
     this.ensureReady();
+
+    if (!this.identity) {
+      throw new Error('Identity not set');
+    }
 
     // Always use 32-byte Nostr-format pubkey from keyManager (not the 33-byte compressed key)
     const nostrPubkey = this.getNostrPubkey();
@@ -560,24 +800,40 @@ export class NostrTransportProvider implements TransportProvider {
     // This is a parameterized replaceable event (kind 30078), so publishing with same 'd' tag
     // will replace any old event. This ensures the event has ['t', hash] tag for nostr-js-sdk.
 
-    // Publish nametag binding matching nostr-js-sdk format
-    // Use Nostr pubkey (32 bytes) for all fields
+    // Derive extended address info for full nametag support:
+    // - encrypted_nametag: AES-GCM encrypted nametag for recovery
+    // - public_key: 33-byte compressed public key for L3 operations
+    // - l1_address: L1 address (alpha1...) for L1 transfers
+    const privateKeyHex = this.identity.privateKey;
+    const compressedPubkey = getPublicKey(privateKeyHex, true); // 33-byte compressed
+    const l1Address = publicKeyToAddress(compressedPubkey, 'alpha'); // alpha1...
+    const encryptedNametag = await encryptNametag(nametag, privateKeyHex);
+
+    // Publish nametag binding with extended info
     const hashedNametag = hashNametag(nametag);
     const content = JSON.stringify({
       nametag_hash: hashedNametag,
       address: nostrPubkey,
       verified: Date.now(),
+      // Extended fields for nametag recovery and address lookup
+      encrypted_nametag: encryptedNametag,
+      public_key: compressedPubkey,
+      l1_address: l1Address,
+      direct_address: directAddress,
     });
 
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, [
       ['d', hashedNametag],
       ['nametag', hashedNametag],
       ['t', hashedNametag],
-['address', nostrPubkey],
+      ['address', nostrPubkey],
+      // Extended tags for indexing
+      ['pubkey', compressedPubkey],
+      ['l1', l1Address],
     ]);
 
     await this.publishEvent(event);
-    this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+    this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
     return true;
   }
 
@@ -747,7 +1003,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const message: IncomingMessage = {
       id: event.id,
-      senderPubkey: event.pubkey,
+      senderTransportPubkey: event.pubkey,
       content,
       timestamp: event.created_at * 1000,
       encrypted: true,
@@ -787,7 +1043,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const message: IncomingMessage = {
         id: pm.eventId,
-        senderPubkey: pm.senderPubkey,
+        senderTransportPubkey: pm.senderPubkey,
         senderNametag,
         content,
         timestamp: pm.timestamp * 1000,
@@ -817,7 +1073,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const transfer: IncomingTokenTransfer = {
       id: event.id,
-      senderPubkey: event.pubkey,
+      senderTransportPubkey: event.pubkey,
       payload,
       timestamp: event.created_at * 1000,
     };
@@ -850,7 +1106,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const request: IncomingPaymentRequest = {
         id: event.id,
-        senderPubkey: event.pubkey,
+        senderTransportPubkey: event.pubkey,
         request: {
           requestId: requestData.requestId,
           amount: requestData.amount,
@@ -891,7 +1147,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       const response: IncomingPaymentRequestResponse = {
         id: event.id,
-        responderPubkey: event.pubkey,
+        responderTransportPubkey: event.pubkey,
         response: {
           requestId: responseData.requestId,
           responseType: responseData.responseType,
@@ -922,7 +1178,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const broadcast: IncomingBroadcast = {
       id: event.id,
-      authorPubkey: event.pubkey,
+      authorTransportPubkey: event.pubkey,
       content: event.content,
       tags,
       timestamp: event.created_at * 1000,

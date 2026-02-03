@@ -62,12 +62,10 @@ import {
 
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import { TransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { ProxyAddress } from '@unicitylabs/state-transition-sdk/lib/address/ProxyAddress';
 import { AddressScheme } from '@unicitylabs/state-transition-sdk/lib/address/AddressScheme';
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -548,12 +546,13 @@ export class PaymentsModule {
   initialize(deps: PaymentsModuleDependencies): void {
     this.deps = deps;
 
-    // Initialize L1 sub-module with chain code and addresses (if enabled)
+    // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
       this.l1.initialize({
         identity: deps.identity,
         chainCode: deps.chainCode,
         addresses: deps.l1Addresses,
+        transport: deps.transport,
       });
     }
 
@@ -1099,7 +1098,7 @@ export class PaymentsModule {
     // Convert transport request to IncomingPaymentRequest
     const request: IncomingPaymentRequest = {
       id: transportRequest.id,
-      senderPubkey: transportRequest.senderPubkey,
+      senderPubkey: transportRequest.senderTransportPubkey,
       amount: transportRequest.request.amount,
       coinId: transportRequest.request.coinId,
       symbol: transportRequest.request.coinId, // Use coinId as symbol for now
@@ -1237,7 +1236,7 @@ export class PaymentsModule {
     // Convert transport response to PaymentRequestResponse
     const response: PaymentRequestResponse = {
       id: transportResponse.id,
-      responderPubkey: transportResponse.responderPubkey,
+      responderPubkey: transportResponse.responderTransportPubkey,
       requestId: transportResponse.response.requestId,
       responseType: transportResponse.response.responseType,
       message: transportResponse.response.message,
@@ -2203,7 +2202,28 @@ export class PaymentsModule {
   // Private: Transfer Operations
   // ===========================================================================
 
+  /**
+   * Detect if a string is an L3 address (not a nametag)
+   * Returns true for: hex pubkeys (64+ chars), PROXY:, DIRECT: prefixed addresses
+   */
+  private isL3Address(value: string): boolean {
+    // PROXY: or DIRECT: prefixed addresses
+    if (value.startsWith('PROXY:') || value.startsWith('DIRECT:')) {
+      return true;
+    }
+    // Hex pubkey (64+ hex chars)
+    if (value.length >= 64 && /^[0-9a-fA-F]+$/.test(value)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Resolve recipient to Nostr pubkey for messaging
+   * Supports: nametag (with or without @), hex pubkey
+   */
   private async resolveRecipient(recipient: string): Promise<string> {
+    // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
       const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
@@ -2212,7 +2232,26 @@ export class PaymentsModule {
       }
       return pubkey;
     }
-    return recipient;
+
+    // If it looks like an L3 address, return as-is (it's a pubkey)
+    if (this.isL3Address(recipient)) {
+      return recipient;
+    }
+
+    // Smart detection: try as nametag first
+    if (this.deps?.transport.resolveNametag) {
+      const pubkey = await this.deps.transport.resolveNametag(recipient);
+      if (pubkey) {
+        this.log(`Resolved "${recipient}" as nametag to pubkey`);
+        return pubkey;
+      }
+    }
+
+    // If not found as nametag and doesn't look like an address, throw error
+    throw new Error(
+      `Recipient "${recipient}" is not a valid nametag or address. ` +
+      `Use @nametag for explicit nametag or a valid hex pubkey/PROXY:/DIRECT: address.`
+    );
   }
 
   /**
@@ -2258,22 +2297,97 @@ export class PaymentsModule {
   }
 
   /**
-   * Resolve recipient to IAddress
+   * Create DirectAddress from a public key using UnmaskedPredicateReference
    */
-  private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
-    // If it's a nametag, resolve via TokenId
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const tokenId = await TokenId.fromNameTag(nametag);
-      return ProxyAddress.fromTokenId(tokenId);
+  private async createDirectAddressFromPubkey(pubkeyHex: string): Promise<IAddress> {
+    const { UnmaskedPredicateReference } = await import('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference');
+    const { TokenType } = await import('@unicitylabs/state-transition-sdk/lib/token/TokenType');
+
+    // Same token type used for address creation throughout the SDK
+    const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+    const tokenType = new TokenType(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
+
+    // Convert hex pubkey to bytes
+    const pubkeyBytes = new Uint8Array(
+      pubkeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    );
+
+    // Create predicate reference with secp256k1 algorithm
+    const addressRef = await UnmaskedPredicateReference.create(
+      tokenType,
+      'secp256k1',
+      pubkeyBytes,
+      HashAlgorithm.SHA256
+    );
+
+    return addressRef.toAddress();
+  }
+
+  /**
+   * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
+   * Returns null if nametag not found or publicKey not available
+   */
+  private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
+    if (!this.deps?.transport.resolveNametagInfo) {
+      this.log('resolveNametagInfo not available on transport');
+      return null;
     }
 
-    // If it's a pubkey, create proxy address from it
-    const pubkeyBytes = new Uint8Array(
-      recipient.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    const info = await this.deps.transport.resolveNametagInfo(nametag);
+    if (!info) {
+      this.log(`Nametag "${nametag}" not found`);
+      return null;
+    }
+
+    if (!info.chainPubkey) {
+      this.log(`Nametag "${nametag}" has no 33-byte chainPubkey (legacy event)`);
+      return null;
+    }
+
+    return info.chainPubkey;
+  }
+
+  /**
+   * Resolve recipient to IAddress for L3 transfers
+   * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
+   */
+  private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
+    const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
+
+    // Explicit nametag with @ - resolve to 33-byte pubkey and use DirectAddress
+    if (recipient.startsWith('@')) {
+      const nametag = recipient.slice(1);
+      const publicKey = await this.resolveNametagToPublicKey(nametag);
+      if (publicKey) {
+        this.log(`Resolved @${nametag} to 33-byte publicKey for DirectAddress`);
+        return this.createDirectAddressFromPubkey(publicKey);
+      }
+      throw new Error(`Nametag "${nametag}" not found or missing publicKey`);
+    }
+
+    // PROXY: or DIRECT: prefixed - parse using AddressFactory
+    if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
+      return AddressFactory.createAddress(recipient);
+    }
+
+    // If it looks like a hex pubkey (66 chars = 33 bytes compressed), create DirectAddress
+    if (recipient.length === 66 && /^[0-9a-fA-F]+$/.test(recipient)) {
+      this.log(`Creating DirectAddress from 33-byte compressed pubkey`);
+      return this.createDirectAddressFromPubkey(recipient);
+    }
+
+    // Smart detection: try as nametag - resolve to 33-byte pubkey and use DirectAddress
+    const publicKey = await this.resolveNametagToPublicKey(recipient);
+    if (publicKey) {
+      this.log(`Resolved "${recipient}" as nametag to 33-byte publicKey for DirectAddress`);
+      return this.createDirectAddressFromPubkey(publicKey);
+    }
+
+    // Not found as nametag and doesn't look like an address
+    throw new Error(
+      `Recipient "${recipient}" is not a valid nametag or L3 address. ` +
+      `Use @nametag for explicit nametag or a valid 33-byte hex pubkey/PROXY:/DIRECT: address.`
     );
-    const tokenId = new TokenId(pubkeyBytes.slice(0, 32));
-    return ProxyAddress.fromTokenId(tokenId);
   }
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
@@ -2355,8 +2469,44 @@ export class PaymentsModule {
             }
           }
         } else {
-          // Direct address - no finalization needed
-          tokenData = sourceTokenInput;
+          // Direct address - finalize to generate local state for tracking
+          this.log('Finalizing DIRECT address transfer for state tracking...');
+          try {
+            const signingService = await this.createSigningService();
+            const transferSalt = transferTx.data.salt;
+
+            const recipientPredicate = await UnmaskedPredicate.create(
+              sourceToken.id,
+              sourceToken.type,
+              signingService,
+              HashAlgorithm.SHA256,
+              transferSalt
+            );
+
+            const recipientState = new TokenState(recipientPredicate, null);
+
+            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+            if (!stClient || !trustBase) {
+              this.log('Cannot finalize DIRECT transfer - missing client, using source token');
+              tokenData = sourceTokenInput;
+            } else {
+              finalizedSdkToken = await stClient.finalizeTransaction(
+                trustBase,
+                sourceToken,
+                recipientState,
+                transferTx,
+                []  // No nametag tokens needed for DIRECT
+              );
+              tokenData = finalizedSdkToken.toJSON();
+              this.log('DIRECT transfer finalized successfully');
+            }
+          } catch (finalizeError) {
+            this.log('DIRECT finalization failed, using source token:', finalizeError);
+            tokenData = sourceTokenInput;
+          }
         }
       } else if (payload.token) {
         // SDK format
@@ -2403,7 +2553,7 @@ export class PaymentsModule {
 
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
-        senderPubkey: transfer.senderPubkey,
+        senderPubkey: transfer.senderTransportPubkey,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
@@ -2491,7 +2641,7 @@ export class PaymentsModule {
       tokens,
       {
         version: 1,
-        address: this.deps!.identity.address,
+        address: this.deps!.identity.l1Address,
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {

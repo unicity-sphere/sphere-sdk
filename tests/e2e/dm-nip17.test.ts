@@ -94,8 +94,8 @@ describe('NIP-17 DM end-to-end', () => {
     const dmPromise = waitForDM(bob);
     await new Promise((r) => setTimeout(r, 3000));
 
-    // Use 32-byte x-only pubkey
-    const bobPubkey = bob.identity!.publicKey;
+    // Use 32-byte x-only pubkey (chainPubkey is 33-byte compressed)
+    const bobPubkey = bob.identity!.chainPubkey;
     const bobNostrPubkey = bobPubkey.length === 66 ? bobPubkey.slice(2) : bobPubkey;
 
     const text = `pubkey test ${Date.now()}`;

@@ -11,7 +11,7 @@ import type { FullIdentity, ProviderStatus } from '../../../types';
 // Mock Providers
 // =============================================================================
 
-function createMockStorage(): StorageProvider {
+function createMockStorage(): StorageProvider & { _data: Map<string, string> } {
   const data = new Map<string, string>();
 
   return {
@@ -32,12 +32,28 @@ function createMockStorage(): StorageProvider {
       data.delete(key);
       return Promise.resolve();
     }),
-    clear: vi.fn(() => {
-      data.clear();
+    has: vi.fn((key: string) => Promise.resolve(data.has(key))),
+    keys: vi.fn((prefix?: string) => {
+      const allKeys = Array.from(data.keys());
+      if (prefix) {
+        return Promise.resolve(allKeys.filter(k => k.startsWith(prefix)));
+      }
+      return Promise.resolve(allKeys);
+    }),
+    clear: vi.fn((prefix?: string) => {
+      if (prefix) {
+        for (const key of data.keys()) {
+          if (key.startsWith(prefix)) {
+            data.delete(key);
+          }
+        }
+      } else {
+        data.clear();
+      }
       return Promise.resolve();
     }),
     _data: data,
-  } as StorageProvider & { _data: Map<string, string> };
+  };
 }
 
 function createMockOracle(): OracleProvider {
@@ -58,7 +74,7 @@ function createMockOracle(): OracleProvider {
 interface MockTransportProvider extends TransportProvider {
   _resolveResult: string | null;
   _registerResult: boolean;
-  _registerCalls: Array<{ nametag: string; publicKey: string }>;
+  _registerCalls: Array<{ nametag: string; chainPubkey: string; directAddress: string }>;
   _resolveCalls: string[];
 }
 
@@ -67,7 +83,7 @@ function createMockTransport(options: {
   registerResult?: boolean;
 } = {}): MockTransportProvider {
   const resolveCalls: string[] = [];
-  const registerCalls: Array<{ nametag: string; publicKey: string }> = [];
+  const registerCalls: Array<{ nametag: string; chainPubkey: string; directAddress: string }> = [];
 
   return {
     id: 'mock-transport',
@@ -98,8 +114,8 @@ function createMockTransport(options: {
       return Promise.resolve(options.resolveResult ?? null);
     }),
 
-    registerNametag: vi.fn((nametag: string, publicKey: string) => {
-      registerCalls.push({ nametag, publicKey });
+    registerNametag: vi.fn((nametag: string, chainPubkey: string, directAddress: string) => {
+      registerCalls.push({ nametag, chainPubkey, directAddress });
       return Promise.resolve(options.registerResult ?? true);
     }),
 
@@ -127,8 +143,9 @@ describe('Sphere.syncNametagWithNostr', () => {
       // Simulate syncNametagWithNostr logic
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+        directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -139,14 +156,15 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       // Should register since not found
       if (!existingPubkey) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.publicKey);
+        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey, identity.directAddress || '');
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
       expect(transport._registerCalls).toHaveLength(1);
       expect(transport._registerCalls[0]).toEqual({
         nametag: TEST_NAMETAG,
-        publicKey: TEST_PUBKEY,
+        chainPubkey: TEST_PUBKEY,
+        directAddress: 'DIRECT://test',
       });
     });
   });
@@ -157,8 +175,9 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+        directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -168,8 +187,8 @@ describe('Sphere.syncNametagWithNostr', () => {
       expect(existingPubkey).toBe(TEST_PUBKEY);
 
       // Should not register since already registered to same pubkey
-      if (existingPubkey !== identity.publicKey) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.publicKey);
+      if (existingPubkey !== identity.chainPubkey) {
+        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey, identity.directAddress || '');
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
@@ -183,8 +202,9 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+        directAddress: 'DIRECT://test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -194,12 +214,12 @@ describe('Sphere.syncNametagWithNostr', () => {
       expect(existingPubkey).toBe(OTHER_PUBKEY);
 
       // Should not register since owned by someone else
-      const isConflict = existingPubkey && existingPubkey !== identity.publicKey;
+      const isConflict = existingPubkey && existingPubkey !== identity.chainPubkey;
       expect(isConflict).toBe(true);
 
       // Simulate: do not register on conflict
       if (!isConflict) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.publicKey);
+        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey, identity.directAddress || '');
       }
 
       expect(transport._registerCalls).toHaveLength(0);
@@ -212,8 +232,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         // no nametag
       };
@@ -240,8 +260,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -264,8 +284,8 @@ describe('Sphere.syncNametagWithNostr', () => {
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
-        publicKey: TEST_PUBKEY,
-        address: 'alpha1test',
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
         ipnsName: '12D3KooWtest',
         nametag: TEST_NAMETAG,
       };
@@ -279,6 +299,238 @@ describe('Sphere.syncNametagWithNostr', () => {
       }
 
       expect(errorCaught).toBe(true);
+    });
+  });
+});
+
+// =============================================================================
+// Tests: Nametag Recovery
+// =============================================================================
+
+describe('Sphere.recoverNametagFromNostr (simulated)', () => {
+  const TEST_PUBKEY = 'a'.repeat(64);
+  const TEST_NAMETAG = 'recovered-user';
+
+  interface MockTransportWithRecovery extends TransportProvider {
+    _recoverResult: string | null;
+    _recoverCalls: number;
+    _registerCalls: Array<{ nametag: string; chainPubkey: string; directAddress: string }>;
+  }
+
+  function createMockTransportWithRecovery(options: {
+    recoverResult?: string | null;
+  } = {}): MockTransportWithRecovery {
+    const registerCalls: Array<{ nametag: string; chainPubkey: string; directAddress: string }> = [];
+    let recoverCalls = 0;
+
+    return {
+      id: 'mock-transport-recovery',
+      name: 'Mock Transport with Recovery',
+      type: 'p2p' as const,
+      description: 'Mock transport for recovery testing',
+
+      setIdentity: vi.fn(),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected' as ProviderStatus),
+
+      sendMessage: vi.fn().mockResolvedValue('event-id'),
+      onMessage: vi.fn().mockReturnValue(() => {}),
+      sendTokenTransfer: vi.fn().mockResolvedValue('transfer-id'),
+      onTokenTransfer: vi.fn().mockReturnValue(() => {}),
+      sendPaymentRequest: vi.fn().mockResolvedValue('request-id'),
+      onPaymentRequest: vi.fn().mockReturnValue(() => {}),
+      sendPaymentRequestResponse: vi.fn().mockResolvedValue('response-id'),
+      onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
+      subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
+      publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
+      onEvent: vi.fn().mockReturnValue(() => {}),
+
+      resolveNametag: vi.fn().mockResolvedValue(null),
+
+      recoverNametag: vi.fn(() => {
+        recoverCalls++;
+        return Promise.resolve(options.recoverResult ?? null);
+      }),
+
+      registerNametag: vi.fn((nametag: string, chainPubkey: string, directAddress: string) => {
+        registerCalls.push({ nametag, chainPubkey, directAddress });
+        return Promise.resolve(true);
+      }),
+
+      // Test helpers
+      _recoverResult: options.recoverResult ?? null,
+      _recoverCalls: recoverCalls,
+      get recoverCallCount() { return recoverCalls; },
+      _registerCalls: registerCalls,
+    } as MockTransportWithRecovery;
+  }
+
+  describe('when nametag can be recovered from Nostr', () => {
+    it('should call recoverNametag on transport', async () => {
+      const transport = createMockTransportWithRecovery({ recoverResult: TEST_NAMETAG });
+
+      // Simulate recoverNametagFromNostr logic
+      const identity: FullIdentity = {
+        privateKey: 'c'.repeat(64),
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+        directAddress: 'DIRECT://test',
+        // No nametag initially
+      };
+
+      // Only recover if no nametag
+      if (!identity.nametag && transport.recoverNametag) {
+        const recovered = await transport.recoverNametag();
+
+        if (recovered) {
+          // Update identity
+          (identity as { nametag?: string }).nametag = recovered;
+
+          // Re-register to ensure event has latest format
+          if (transport.registerNametag) {
+            await transport.registerNametag(
+              recovered,
+              identity.chainPubkey,
+              identity.directAddress || ''
+            );
+          }
+        }
+      }
+
+      expect(identity.nametag).toBe(TEST_NAMETAG);
+      expect(transport._registerCalls).toHaveLength(1);
+      expect(transport._registerCalls[0]).toEqual({
+        nametag: TEST_NAMETAG,
+        chainPubkey: TEST_PUBKEY,
+        directAddress: 'DIRECT://test',
+      });
+    });
+
+    it('should not recover if identity already has nametag', async () => {
+      const transport = createMockTransportWithRecovery({ recoverResult: 'should-not-use' });
+
+      const identity: FullIdentity = {
+        privateKey: 'c'.repeat(64),
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+        nametag: 'existing-nametag', // Already has nametag
+      };
+
+      // Skip if already has nametag
+      if (!identity.nametag && transport.recoverNametag) {
+        const recovered = await transport.recoverNametag();
+        if (recovered) {
+          (identity as { nametag?: string }).nametag = recovered;
+        }
+      }
+
+      // Should still have original nametag
+      expect(identity.nametag).toBe('existing-nametag');
+      expect(transport.recoverNametag).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('when nametag cannot be recovered', () => {
+    it('should not set nametag when recovery returns null', async () => {
+      const transport = createMockTransportWithRecovery({ recoverResult: null });
+
+      const identity: FullIdentity = {
+        privateKey: 'c'.repeat(64),
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+      };
+
+      if (!identity.nametag && transport.recoverNametag) {
+        const recovered = await transport.recoverNametag();
+        if (recovered) {
+          (identity as { nametag?: string }).nametag = recovered;
+        }
+      }
+
+      expect(identity.nametag).toBeUndefined();
+      expect(transport._registerCalls).toHaveLength(0);
+    });
+  });
+
+  describe('when transport does not support recovery', () => {
+    it('should handle missing recoverNametag method gracefully', async () => {
+      const transport = createMockTransportWithRecovery();
+      // Remove recovery method
+      delete (transport as Partial<MockTransportWithRecovery>).recoverNametag;
+
+      const identity: FullIdentity = {
+        privateKey: 'c'.repeat(64),
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+      };
+
+      // Check if method exists before calling
+      if (!identity.nametag && transport.recoverNametag) {
+        const recovered = await transport.recoverNametag();
+        if (recovered) {
+          (identity as { nametag?: string }).nametag = recovered;
+        }
+      }
+
+      // Should not throw, nametag remains undefined
+      expect(identity.nametag).toBeUndefined();
+    });
+  });
+
+  describe('event emission (simulated)', () => {
+    it('should emit nametag:recovered event when recovery succeeds', async () => {
+      const transport = createMockTransportWithRecovery({ recoverResult: TEST_NAMETAG });
+      const emittedEvents: Array<{ type: string; data: unknown }> = [];
+
+      // Simulate event emission
+      const emitEvent = (type: string, data: unknown) => {
+        emittedEvents.push({ type, data });
+      };
+
+      const identity: FullIdentity = {
+        privateKey: 'c'.repeat(64),
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+      };
+
+      if (!identity.nametag && transport.recoverNametag) {
+        const recovered = await transport.recoverNametag();
+        if (recovered) {
+          (identity as { nametag?: string }).nametag = recovered;
+          emitEvent('nametag:recovered', { nametag: recovered });
+        }
+      }
+
+      expect(emittedEvents).toHaveLength(1);
+      expect(emittedEvents[0].type).toBe('nametag:recovered');
+      expect(emittedEvents[0].data).toEqual({ nametag: TEST_NAMETAG });
+    });
+
+    it('should not emit event when recovery fails', async () => {
+      const transport = createMockTransportWithRecovery({ recoverResult: null });
+      const emittedEvents: Array<{ type: string; data: unknown }> = [];
+
+      const emitEvent = (type: string, data: unknown) => {
+        emittedEvents.push({ type, data });
+      };
+
+      const identity: FullIdentity = {
+        privateKey: 'c'.repeat(64),
+        chainPubkey: TEST_PUBKEY,
+        l1Address: 'alpha1test',
+      };
+
+      if (!identity.nametag && transport.recoverNametag) {
+        const recovered = await transport.recoverNametag();
+        if (recovered) {
+          (identity as { nametag?: string }).nametag = recovered;
+          emitEvent('nametag:recovered', { nametag: recovered });
+        }
+      }
+
+      expect(emittedEvents).toHaveLength(0);
     });
   });
 });

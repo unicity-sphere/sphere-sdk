@@ -10,6 +10,7 @@
  */
 
 import type { FullIdentity } from '../../types';
+import type { TransportProvider } from '../../transport';
 import {
   connect as l1Connect,
   disconnect as l1Disconnect,
@@ -105,6 +106,8 @@ export interface L1PaymentsModuleDependencies {
   identity: FullIdentity;
   chainCode?: string;
   addresses?: string[];
+  /** Transport provider for nametag resolution (optional) */
+  transport?: TransportProvider;
 }
 
 // =============================================================================
@@ -124,6 +127,7 @@ export class L1PaymentsModule {
   private _chainCode?: string;
   private _addresses: string[] = [];
   private _wallet?: Wallet;
+  private _transport?: TransportProvider;
 
   constructor(config?: L1PaymentsModuleConfig) {
     this._config = {
@@ -138,6 +142,7 @@ export class L1PaymentsModule {
     this._identity = deps.identity;
     this._chainCode = deps.chainCode;
     this._addresses = deps.addresses ?? [];
+    this._transport = deps.transport;
 
     // Build wallet object for L1 SDK functions
     this._wallet = {
@@ -145,8 +150,8 @@ export class L1PaymentsModule {
       chainCode: deps.chainCode,
       addresses: [
         {
-          address: deps.identity.address,
-          publicKey: deps.identity.publicKey,
+          address: deps.identity.l1Address,
+          publicKey: deps.identity.chainPubkey,
           privateKey: deps.identity.privateKey,
           path: 'm/0',
           index: 0,
@@ -156,7 +161,7 @@ export class L1PaymentsModule {
 
     // Add additional addresses
     for (const addr of this._addresses) {
-      if (addr !== deps.identity.address) {
+      if (addr !== deps.identity.l1Address) {
         this._wallet.addresses.push({
           address: addr,
           path: null,
@@ -184,6 +189,64 @@ export class L1PaymentsModule {
     this._wallet = undefined;
   }
 
+  /**
+   * Check if a string looks like an L1 address (alpha1... or alphat1...)
+   */
+  private isL1Address(value: string): boolean {
+    return value.startsWith('alpha1') || value.startsWith('alphat1');
+  }
+
+  /**
+   * Resolve recipient to L1 address
+   * Supports: L1 address (alpha1...), nametag (with or without @)
+   */
+  private async resolveL1Address(recipient: string): Promise<string> {
+    // Explicit nametag with @
+    if (recipient.startsWith('@')) {
+      const nametag = recipient.slice(1);
+      return this.resolveNametagToL1Address(nametag);
+    }
+
+    // If it looks like an L1 address, return as-is
+    if (this.isL1Address(recipient)) {
+      return recipient;
+    }
+
+    // Smart detection: try as nametag
+    try {
+      const l1Address = await this.resolveNametagToL1Address(recipient);
+      return l1Address;
+    } catch {
+      throw new Error(
+        `Recipient "${recipient}" is not a valid nametag or L1 address. ` +
+        `Use @nametag for explicit nametag or a valid alpha1... address.`
+      );
+    }
+  }
+
+  /**
+   * Resolve nametag to L1 address using transport provider
+   */
+  private async resolveNametagToL1Address(nametag: string): Promise<string> {
+    if (!this._transport?.resolveNametagInfo) {
+      throw new Error('Transport provider does not support nametag resolution');
+    }
+
+    const info = await this._transport.resolveNametagInfo(nametag);
+    if (!info) {
+      throw new Error(`Nametag not found: ${nametag}`);
+    }
+
+    if (!info.l1Address) {
+      throw new Error(
+        `Nametag @${nametag} does not have L1 address information. ` +
+        `The owner needs to update their nametag registration.`
+      );
+    }
+
+    return info.l1Address;
+  }
+
   async send(request: L1SendRequest): Promise<L1SendResult> {
     this.ensureInitialized();
 
@@ -192,15 +255,18 @@ export class L1PaymentsModule {
     }
 
     try {
+      // Resolve recipient to L1 address (supports nametag)
+      const recipientAddress = await this.resolveL1Address(request.to);
+
       // Convert amount from satoshis to ALPHA
       const amountAlpha = parseInt(request.amount, 10) / 100_000_000;
 
       // Send using the L1 SDK
       const results = await l1SendAlpha(
         this._wallet,
-        request.to,
+        recipientAddress,
         amountAlpha,
-        this._identity.address
+        this._identity.l1Address
       );
 
       if (results && results.length > 0) {
@@ -480,8 +546,8 @@ export class L1PaymentsModule {
 
   private _getWatchedAddresses(): string[] {
     const addresses = [...this._addresses];
-    if (this._identity?.address && !addresses.includes(this._identity.address)) {
-      addresses.unshift(this._identity.address);
+    if (this._identity?.l1Address && !addresses.includes(this._identity.l1Address)) {
+      addresses.unshift(this._identity.l1Address);
     }
     return addresses;
   }

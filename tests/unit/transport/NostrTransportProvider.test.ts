@@ -357,8 +357,8 @@ describe('Event subscription pubkey format', () => {
     // Set identity with 33-byte compressed key
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
-      publicKey: compressedPubkey, // 33-byte compressed
-      address: 'alpha1test',
+      chainPubkey: compressedPubkey, // 33-byte compressed
+      l1Address: 'alpha1test',
     });
 
     await provider.connect();
@@ -411,8 +411,8 @@ describe('Event subscription pubkey format', () => {
 
     provider.setIdentity({
       privateKey: 'b'.repeat(64),
-      publicKey: '02' + 'a'.repeat(64),
-      address: 'alpha1test',
+      chainPubkey: '02' + 'a'.repeat(64),
+      l1Address: 'alpha1test',
     });
 
     await provider.connect();
@@ -429,7 +429,7 @@ describe('Event subscription pubkey format', () => {
     expect(filter.kinds).toContain(31116); // PAYMENT_REQUEST_RESPONSE
   });
 
-  it('getNostrPubkey should return 32-byte hex, different from identity.publicKey', async () => {
+  it('getNostrPubkey should return 32-byte hex, different from identity.chainPubkey', async () => {
     const provider = new NostrTransportProvider({
       relays: ['wss://test.relay'],
       createWebSocket: () => new TrackingMockWebSocket(),
@@ -441,8 +441,8 @@ describe('Event subscription pubkey format', () => {
 
     provider.setIdentity({
       privateKey: 'd'.repeat(64),
-      publicKey: compressedPubkey,
-      address: 'alpha1test',
+      chainPubkey: compressedPubkey,
+      l1Address: 'alpha1test',
     });
 
     const nostrPubkey = provider.getNostrPubkey();
