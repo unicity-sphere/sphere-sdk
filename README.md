@@ -1001,6 +1001,8 @@ function getRelayStatuses() {
 
 Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments.
 
+> **Note:** Nametag minting requires an aggregator API key for proof verification. Configure it via the `oracle.apiKey` option when creating providers. Contact Unicity to obtain an API key.
+
 ### Registering a Nametag
 
 ```typescript
