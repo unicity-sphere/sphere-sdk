@@ -5,3 +5,4 @@
 
 export * from './config';
 export * from './resolvers';
+export * from './trustbase-loader';

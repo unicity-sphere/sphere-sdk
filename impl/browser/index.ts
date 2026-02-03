@@ -351,6 +351,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       timeout: oracleConfig.timeout,
       skipVerification: oracleConfig.skipVerification,
       debug: oracleConfig.debug,
+      network,
     }),
     tokenStorage: createIndexedDBTokenStorageProvider(),
     l1: l1Config,

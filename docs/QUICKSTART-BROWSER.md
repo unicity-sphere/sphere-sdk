@@ -15,6 +15,8 @@ npm install @unicitylabs/sphere-sdk
 
 **That's it!** No additional dependencies for basic usage. Browser uses native WebSocket.
 
+> **API Key Required:** Nametag minting and L3 token operations require an aggregator API key. Configure via `oracle: { apiKey: 'your-key' }` in provider options. Contact Unicity to obtain a key.
+
 **Optional** (for IPFS token sync):
 ```bash
 npm install helia @helia/json @helia/ipns @libp2p/bootstrap multiformats

@@ -9,6 +9,8 @@ import {
   type UnicityAggregatorProviderConfig,
 } from '../../../oracle/UnicityAggregatorProvider';
 import type { TrustBaseLoader } from '../../../oracle/oracle-provider';
+import { BaseTrustBaseLoader } from '../../shared/trustbase-loader';
+import type { NetworkType } from '../../../constants';
 
 // Re-export shared types and classes
 export {
@@ -25,23 +27,32 @@ export type { TrustBaseLoader } from '../../../oracle/oracle-provider';
 // =============================================================================
 
 /**
- * Node.js TrustBase loader using fs
+ * Node.js TrustBase loader - loads from file or uses embedded data
  */
-export class NodeTrustBaseLoader implements TrustBaseLoader {
-  private filePath: string;
+export class NodeTrustBaseLoader extends BaseTrustBaseLoader {
+  private filePath?: string;
 
-  constructor(filePath: string = './trustbase-testnet.json') {
-    this.filePath = filePath;
+  constructor(filePathOrNetwork?: string | NetworkType) {
+    if (!filePathOrNetwork) {
+      super('testnet');
+    } else if (filePathOrNetwork.includes('/') || filePathOrNetwork.includes('.')) {
+      super('testnet');
+      this.filePath = filePathOrNetwork;
+    } else {
+      super(filePathOrNetwork as NetworkType);
+    }
   }
 
-  async load(): Promise<unknown | null> {
+  protected async loadFromExternal(): Promise<unknown | null> {
+    if (!this.filePath) return null;
+
     try {
       if (fs.existsSync(this.filePath)) {
         const content = fs.readFileSync(this.filePath, 'utf-8');
         return JSON.parse(content);
       }
     } catch {
-      // Ignore file errors
+      // Fall through to embedded
     }
     return null;
   }
@@ -50,8 +61,8 @@ export class NodeTrustBaseLoader implements TrustBaseLoader {
 /**
  * Create Node.js TrustBase loader
  */
-export function createNodeTrustBaseLoader(filePath?: string): TrustBaseLoader {
-  return new NodeTrustBaseLoader(filePath);
+export function createNodeTrustBaseLoader(filePathOrNetwork?: string | NetworkType): TrustBaseLoader {
+  return new NodeTrustBaseLoader(filePathOrNetwork);
 }
 
 // =============================================================================
@@ -64,12 +75,13 @@ export function createNodeTrustBaseLoader(filePath?: string): TrustBaseLoader {
 export function createUnicityAggregatorProvider(
   config: Omit<UnicityAggregatorProviderConfig, 'trustBaseLoader'> & {
     trustBasePath?: string;
+    network?: NetworkType;
   }
 ): UnicityAggregatorProvider {
-  const { trustBasePath, ...restConfig } = config;
+  const { trustBasePath, network, ...restConfig } = config;
   return new UnicityAggregatorProvider({
     ...restConfig,
-    trustBaseLoader: createNodeTrustBaseLoader(trustBasePath),
+    trustBaseLoader: createNodeTrustBaseLoader(trustBasePath ?? network ?? 'testnet'),
   });
 }
 

@@ -15,6 +15,8 @@ npm install @unicitylabs/sphere-sdk ws
 
 **Node.js version:** 18.0.0 or higher
 
+> **API Key Required:** Nametag minting and L3 token operations require an aggregator API key. Configure via `oracle: { apiKey: 'your-key' }` in provider options. Contact Unicity to obtain a key.
+
 ## Storage
 
 Node.js implementation uses **file-based storage**:
