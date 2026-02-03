@@ -354,7 +354,7 @@ describe('Event subscription pubkey format', () => {
     expect(subscribedPubkey).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it('should include all required event kinds in subscription', async () => {
+  it('should include all required event kinds in subscriptions (wallet and chat)', async () => {
     const provider = createProvider(['wss://test.relay']);
 
     provider.setIdentity({
@@ -366,16 +366,23 @@ describe('Event subscription pubkey format', () => {
     await provider.connect();
     await new Promise(resolve => setTimeout(resolve, 50));
 
-    expect(mockSubscribe).toHaveBeenCalled();
-    const [filterArg] = mockSubscribe.mock.calls[0];
-    const filter = filterArg.toJSON();
+    // Should create two subscriptions: wallet and chat
+    expect(mockSubscribe).toHaveBeenCalledTimes(2);
 
-    // Should subscribe to all required event kinds
-    expect(filter.kinds).toContain(4);     // DIRECT_MESSAGE
-    expect(filter.kinds).toContain(1059);  // GIFT_WRAP (NIP-17)
-    expect(filter.kinds).toContain(31113); // TOKEN_TRANSFER
-    expect(filter.kinds).toContain(31115); // PAYMENT_REQUEST
-    expect(filter.kinds).toContain(31116); // PAYMENT_REQUEST_RESPONSE
+    // First subscription: wallet events (with since filter)
+    const [walletFilterArg] = mockSubscribe.mock.calls[0];
+    const walletFilter = walletFilterArg.toJSON();
+    expect(walletFilter.kinds).toContain(4);     // DIRECT_MESSAGE
+    expect(walletFilter.kinds).toContain(31113); // TOKEN_TRANSFER
+    expect(walletFilter.kinds).toContain(31115); // PAYMENT_REQUEST
+    expect(walletFilter.kinds).toContain(31116); // PAYMENT_REQUEST_RESPONSE
+    expect(walletFilter.since).toBeDefined();    // Wallet has since filter
+
+    // Second subscription: chat events (GIFT_WRAP, no since filter)
+    const [chatFilterArg] = mockSubscribe.mock.calls[1];
+    const chatFilter = chatFilterArg.toJSON();
+    expect(chatFilter.kinds).toContain(1059);  // GIFT_WRAP (NIP-17)
+    expect(chatFilter.since).toBeUndefined();  // Chat has NO since filter for real-time
   });
 
   it('getNostrPubkey should return 32-byte hex, different from identity.chainPubkey', async () => {

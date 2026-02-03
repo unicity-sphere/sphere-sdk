@@ -236,7 +236,7 @@ export class NostrTransportProvider implements TransportProvider {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
-        pingIntervalMs: 30000, // 30 second keepalive pings
+        pingIntervalMs: 15000, // 15 second keepalive pings (more aggressive to prevent drops)
       });
 
       // Add connection event listener for logging
@@ -286,6 +286,8 @@ export class NostrTransportProvider implements TransportProvider {
       this.nostrClient = null;
     }
     this.mainSubscriptionId = null;
+    this.walletSubscriptionId = null;
+    this.chatSubscriptionId = null;
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
     this.log('Disconnected from all relays');
@@ -439,7 +441,7 @@ export class NostrTransportProvider implements TransportProvider {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16,
-        pingIntervalMs: 30000,
+        pingIntervalMs: 15000, // 15 second keepalive pings
       });
 
       // Add connection event listener
@@ -1294,6 +1296,10 @@ export class NostrTransportProvider implements TransportProvider {
   // Private: Subscriptions
   // ===========================================================================
 
+  // Track subscription IDs for cleanup
+  private walletSubscriptionId: string | null = null;
+  private chatSubscriptionId: string | null = null;
+
   private subscribeToEvents(): void {
     this.log('subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
     if (!this.identity || !this.keyManager || !this.nostrClient) {
@@ -1301,7 +1307,15 @@ export class NostrTransportProvider implements TransportProvider {
       return;
     }
 
-    // Unsubscribe from previous subscription if any
+    // Unsubscribe from previous subscriptions if any
+    if (this.walletSubscriptionId) {
+      this.nostrClient.unsubscribe(this.walletSubscriptionId);
+      this.walletSubscriptionId = null;
+    }
+    if (this.chatSubscriptionId) {
+      this.nostrClient.unsubscribe(this.chatSubscriptionId);
+      this.chatSubscriptionId = null;
+    }
     if (this.mainSubscriptionId) {
       this.nostrClient.unsubscribe(this.mainSubscriptionId);
       this.mainSubscriptionId = null;
@@ -1311,23 +1325,21 @@ export class NostrTransportProvider implements TransportProvider {
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     this.log('Subscribing with Nostr pubkey:', nostrPubkey);
 
-    const filter = new Filter({
-      kinds: [
-        EVENT_KINDS.DIRECT_MESSAGE,
-        EventKinds.GIFT_WRAP,
-        EVENT_KINDS.TOKEN_TRANSFER,
-        EVENT_KINDS.PAYMENT_REQUEST,
-        EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
-      ],
-      '#p': [nostrPubkey],
-      since: Math.floor(Date.now() / 1000) - 86400, // Last 24h
-    });
-    this.log('Subscription filter kinds:', filter.kinds);
+    // Subscribe to wallet events (token transfers, payment requests) with since filter
+    // Matches Sphere app's approach
+    const walletFilter = new Filter();
+    walletFilter.kinds = [
+      EVENT_KINDS.DIRECT_MESSAGE,
+      EVENT_KINDS.TOKEN_TRANSFER,
+      EVENT_KINDS.PAYMENT_REQUEST,
+      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+    ];
+    walletFilter['#p'] = [nostrPubkey];
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400; // Last 24h
 
-    // NostrClient handles subscription persistence and resubscription on reconnect
-    this.mainSubscriptionId = this.nostrClient.subscribe(filter, {
+    this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
       onEvent: (event) => {
-        this.log('Received event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        this.log('Received wallet event kind:', event.kind, 'id:', event.id?.slice(0, 12));
         this.handleEvent({
           id: event.id,
           kind: event.kind,
@@ -1339,14 +1351,42 @@ export class NostrTransportProvider implements TransportProvider {
         });
       },
       onEndOfStoredEvents: () => {
-        this.log('Subscription ready (EOSE)');
+        this.log('Wallet subscription ready (EOSE)');
       },
       onError: (_subId, error) => {
-        this.log('Subscription error:', error);
+        this.log('Wallet subscription error:', error);
       },
     });
+    this.log('Wallet subscription created, subId:', this.walletSubscriptionId);
 
-    this.log('Subscribed to events with subId:', this.mainSubscriptionId);
+    // Subscribe to chat events (NIP-17 gift wrap) WITHOUT since filter
+    // This matches Sphere app's approach - chat messages rely on deduplication
+    const chatFilter = new Filter();
+    chatFilter.kinds = [EventKinds.GIFT_WRAP];
+    chatFilter['#p'] = [nostrPubkey];
+    // NO since filter for chat - we want real-time messages
+
+    this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
+      onEvent: (event) => {
+        this.log('Received chat event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        this.handleEvent({
+          id: event.id,
+          kind: event.kind,
+          content: event.content,
+          tags: event.tags,
+          pubkey: event.pubkey,
+          created_at: event.created_at,
+          sig: event.sig,
+        });
+      },
+      onEndOfStoredEvents: () => {
+        this.log('Chat subscription ready (EOSE)');
+      },
+      onError: (_subId, error) => {
+        this.log('Chat subscription error:', error);
+      },
+    });
+    this.log('Chat subscription created, subId:', this.chatSubscriptionId);
   }
 
   private subscribeToTags(tags: string[]): void {
