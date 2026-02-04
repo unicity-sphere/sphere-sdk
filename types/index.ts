@@ -473,3 +473,9 @@ export type { AddressInfo } from '../core/crypto';
 
 // Re-export TXF types
 export * from './txf';
+
+// Re-export instant split types
+export * from './instant-split';
+
+// Re-export payment session types
+export * from './payment-session';

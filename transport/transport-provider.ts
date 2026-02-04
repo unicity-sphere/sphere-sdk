@@ -154,7 +154,70 @@ export interface TransportProvider extends BaseProvider {
    * Check if a relay is currently connected
    */
   isRelayConnected?(relayUrl: string): boolean;
+
+  // ===========================================================================
+  // Instant Split Support (optional)
+  // ===========================================================================
+
+  /**
+   * Send an instant split bundle to a recipient.
+   * This is a specialized method for INSTANT_SPLIT V5 bundles.
+   *
+   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
+   * @param bundle - The InstantSplitBundleV5 to send
+   * @returns Event ID
+   */
+  sendInstantSplitBundle?(
+    recipientTransportPubkey: string,
+    bundle: InstantSplitBundlePayload
+  ): Promise<string>;
+
+  /**
+   * Subscribe to incoming instant split bundles.
+   *
+   * @param handler - Handler for received bundles
+   * @returns Unsubscribe function
+   */
+  onInstantSplitReceived?(handler: InstantSplitBundleHandler): () => void;
 }
+
+// =============================================================================
+// Instant Split Types
+// =============================================================================
+
+/**
+ * Payload for sending instant split bundles
+ */
+export interface InstantSplitBundlePayload {
+  /** The bundle JSON string (InstantSplitBundleV5 serialized) */
+  bundle: string;
+  /** Optional memo */
+  memo?: string;
+  /** Sender info */
+  sender?: {
+    transportPubkey: string;
+    nametag?: string;
+  };
+}
+
+/**
+ * Incoming instant split bundle
+ */
+export interface IncomingInstantSplitBundle {
+  /** Event ID */
+  id: string;
+  /** Transport-specific pubkey of sender */
+  senderTransportPubkey: string;
+  /** The bundle JSON string */
+  bundle: string;
+  /** Timestamp */
+  timestamp: number;
+}
+
+/**
+ * Handler for instant split bundles
+ */
+export type InstantSplitBundleHandler = (bundle: IncomingInstantSplitBundle) => void;
 
 // =============================================================================
 // Message Types
