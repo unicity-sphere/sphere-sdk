@@ -5,6 +5,7 @@
 
 import type { ProviderStatus, FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
+import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants';
 
 // =============================================================================
 // Configuration
@@ -169,8 +170,17 @@ export class LocalStorageProvider implements StorageProvider {
   // ===========================================================================
 
   private getFullKey(key: string): string {
-    const addressPart = this.identity?.l1Address ?? 'default';
-    return `${this.config.prefix}${addressPart}_${key}`;
+    // Check if this is a per-address key
+    const isPerAddressKey = Object.values(STORAGE_KEYS_ADDRESS).includes(key as typeof STORAGE_KEYS_ADDRESS[keyof typeof STORAGE_KEYS_ADDRESS]);
+
+    if (isPerAddressKey && this.identity?.directAddress) {
+      // Add address ID prefix for per-address data
+      const addressId = getAddressId(this.identity.directAddress);
+      return `${this.config.prefix}${addressId}_${key}`;
+    }
+
+    // Global key - no address prefix
+    return `${this.config.prefix}${key}`;
   }
 
   private ensureConnected(): void {

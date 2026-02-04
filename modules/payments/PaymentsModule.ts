@@ -52,13 +52,14 @@ import type {
   PaymentRequestResponse,
   PaymentRequestResponseHandler,
 } from '../../types';
-import { STORAGE_KEYS } from '../../constants';
+import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   tokenToTxf,
   getCurrentStateHash,
   buildTxfStorageData,
   parseTxfStorageData,
 } from '../../serialization/txf-serializer';
+import { TokenRegistry } from '../../registry';
 
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
@@ -97,8 +98,28 @@ interface ParsedTokenInfo {
   coinId: string;
   symbol: string;
   name: string;
+  decimals: number;
+  iconUrl?: string;
   amount: string;
   tokenId?: string;
+}
+
+/**
+ * Enrich token info with data from TokenRegistry
+ */
+function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
+  const registry = TokenRegistry.getInstance();
+  const def = registry.getDefinition(info.coinId);
+  if (def) {
+    return {
+      ...info,
+      symbol: def.symbol || info.symbol,
+      name: def.name.charAt(0).toUpperCase() + def.name.slice(1),
+      decimals: def.decimals ?? 0,
+      iconUrl: registry.getIconUrl(info.coinId) ?? undefined,
+    };
+  }
+  return info;
 }
 
 /**
@@ -109,6 +130,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
     coinId: 'ALPHA',
     symbol: 'ALPHA',
     name: 'Alpha Token',
+    decimals: 0,
     amount: '0',
   };
 
@@ -142,13 +164,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
           // Extract hex string from CoinId object
           if (coinIdObj instanceof CoinId) {
             const coinIdHex = coinIdObj.toJSON() as string;
-            return {
+            return enrichWithRegistry({
               coinId: coinIdHex,
               symbol: coinIdHex.slice(0, 8),
               name: `Token ${coinIdHex.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount ?? '0'),
               tokenId: defaultInfo.tokenId,
-            };
+            });
           } else if (coinIdObj && typeof coinIdObj === 'object' && 'bytes' in coinIdObj) {
             // CoinId stored as object with bytes
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -158,13 +181,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
               : Array.isArray(bytes)
                 ? Buffer.from(bytes).toString('hex')
                 : String(bytes);
-            return {
+            return enrichWithRegistry({
               coinId: coinIdHex,
               symbol: coinIdHex.slice(0, 8),
               name: `Token ${coinIdHex.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount ?? '0'),
               tokenId: defaultInfo.tokenId,
-            };
+            });
           }
         }
       }
@@ -183,13 +207,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
             if (Array.isArray(firstEntry) && firstEntry.length === 2) {
               const [coinIdHex, amount] = firstEntry;
               const coinIdStr = typeof coinIdHex === 'string' ? coinIdHex : String(coinIdHex);
-              return {
+              return enrichWithRegistry({
                 coinId: coinIdStr,
                 symbol: coinIdStr.slice(0, 8),
                 name: `Token ${coinIdStr.slice(0, 8)}`,
+                decimals: 0,
                 amount: String(amount),
                 tokenId: defaultInfo.tokenId,
-              };
+              });
             }
           }
         }
@@ -209,25 +234,27 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
           const firstEntry = coinData[0];
           if (Array.isArray(firstEntry) && firstEntry.length === 2) {
             const [coinIdHex, amount] = firstEntry;
-            return {
+            return enrichWithRegistry({
               coinId: String(coinIdHex),
               symbol: String(coinIdHex).slice(0, 8),
               name: `Token ${String(coinIdHex).slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount),
               tokenId: genesis.tokenId,
-            };
+            });
           }
         } else if (typeof coinData === 'object') {
           const coinEntries = Object.entries(coinData);
           if (coinEntries.length > 0) {
             const [coinId, amount] = coinEntries[0] as [string, unknown];
-            return {
+            return enrichWithRegistry({
               coinId,
               symbol: coinId.slice(0, 8),
               name: `Token ${coinId.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount),
               tokenId: genesis.tokenId,
-            };
+            });
           }
         }
       }
@@ -244,25 +271,27 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
         const firstEntry = coinData[0];
         if (Array.isArray(firstEntry) && firstEntry.length === 2) {
           const [coinIdHex, amount] = firstEntry;
-          return {
+          return enrichWithRegistry({
             coinId: String(coinIdHex),
             symbol: String(coinIdHex).slice(0, 8),
             name: `Token ${String(coinIdHex).slice(0, 8)}`,
+            decimals: 0,
             amount: String(amount),
             tokenId: defaultInfo.tokenId,
-          };
+          });
         }
       } else if (typeof coinData === 'object') {
         const coinEntries = Object.entries(coinData);
         if (coinEntries.length > 0) {
           const [coinId, amount] = coinEntries[0] as [string, unknown];
-          return {
+          return enrichWithRegistry({
             coinId,
             symbol: coinId.slice(0, 8),
             name: `Token ${coinId.slice(0, 8)}`,
+            decimals: 0,
             amount: String(amount),
             tokenId: defaultInfo.tokenId,
-          };
+          });
         }
       }
     }
@@ -582,58 +611,32 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
-    // Load from key-value storage
-    const data = await this.deps!.storage.get(STORAGE_KEYS.TOKENS);
-    if (data) {
+    // Load from TokenStorageProviders (IndexedDB/files)
+    const providers = this.getTokenStorageProviders();
+    for (const [id, provider] of providers) {
       try {
-        const parsed = JSON.parse(data);
-
-        // Load tokens
-        const tokens = parsed.tokens as Token[] || [];
-        this.tokens.clear();
-        for (const token of tokens) {
-          this.tokens.set(token.id, token);
+        const result = await provider.load();
+        if (result.success && result.data) {
+          this.loadFromStorageData(result.data);
+          this.log(`Loaded from provider ${id}: ${this.tokens.size} tokens`);
+          break; // Use first successful provider
         }
-
-        // Load tombstones
-        if (Array.isArray(parsed.tombstones)) {
-          this.tombstones = parsed.tombstones.filter(
-            (t: unknown) =>
-              typeof t === 'object' && t !== null &&
-              typeof (t as TombstoneEntry).tokenId === 'string' &&
-              typeof (t as TombstoneEntry).stateHash === 'string'
-          );
-        }
-
-        // Load archived tokens
-        if (parsed.archivedTokens && typeof parsed.archivedTokens === 'object') {
-          this.archivedTokens = new Map(Object.entries(parsed.archivedTokens));
-        }
-
-        // Load forked tokens
-        if (parsed.forkedTokens && typeof parsed.forkedTokens === 'object') {
-          this.forkedTokens = new Map(Object.entries(parsed.forkedTokens));
-        }
-
-        // Load nametag
-        if (parsed.nametag) {
-          this.nametag = parsed.nametag;
-        }
-
-        this.log(`Loaded ${this.tokens.size} tokens, ${this.tombstones.length} tombstones, ${this.archivedTokens.size} archived`);
       } catch (err) {
-        console.error('[Payments] Failed to parse stored data:', err);
+        console.error(`[Payments] Failed to load from provider ${id}:`, err);
       }
     }
 
-    // Load tokens from file storage providers (lottery compatibility)
-    await this.loadTokensFromFileStorage();
+    // Legacy: Load tokens from file storage (lottery compatibility)
+    if (this.tokens.size === 0) {
+      await this.loadTokensFromFileStorage();
+    }
 
-    // Load nametag from file storage (lottery compatibility)
+    // Load nametag from file storage (nametag-{name}.json)
+    // This is the primary source for nametag data now
     await this.loadNametagFromFileStorage();
 
     // Load transaction history
-    const historyData = await this.deps!.storage.get(STORAGE_KEYS.TRANSACTION_HISTORY);
+    const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
     if (historyData) {
       try {
         this.transactionHistory = JSON.parse(historyData);
@@ -643,7 +646,7 @@ export class PaymentsModule {
     }
 
     // Load pending transfers
-    const pending = await this.deps!.storage.get(STORAGE_KEYS.PENDING_TRANSFERS);
+    const pending = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
     if (pending) {
       const transfers = JSON.parse(pending) as TransferResult[];
       for (const transfer of transfers) {
@@ -776,6 +779,8 @@ export class PaymentsModule {
           coinId: request.coinId,
           symbol: this.getCoinSymbol(request.coinId),
           name: this.getCoinName(request.coinId),
+          decimals: this.getCoinDecimals(request.coinId),
+          iconUrl: this.getCoinIconUrl(request.coinId),
           amount: splitPlan.remainderAmount!.toString(),
           status: 'confirmed',
           createdAt: Date.now(),
@@ -880,22 +885,28 @@ export class PaymentsModule {
    * Get coin symbol from coinId
    */
   private getCoinSymbol(coinId: string): string {
-    // Common coin mappings
-    const symbols: Record<string, string> = {
-      'UCT': 'UCT',
-      // Add more as needed
-    };
-    return symbols[coinId] || coinId.slice(0, 6).toUpperCase();
+    return TokenRegistry.getInstance().getSymbol(coinId);
   }
 
   /**
    * Get coin name from coinId
    */
   private getCoinName(coinId: string): string {
-    const names: Record<string, string> = {
-      'UCT': 'Unicity Token',
-    };
-    return names[coinId] || coinId;
+    return TokenRegistry.getInstance().getName(coinId);
+  }
+
+  /**
+   * Get coin decimals from coinId
+   */
+  private getCoinDecimals(coinId: string): number {
+    return TokenRegistry.getInstance().getDecimals(coinId);
+  }
+
+  /**
+   * Get coin icon URL from coinId
+   */
+  private getCoinIconUrl(coinId: string): string | undefined {
+    return TokenRegistry.getInstance().getIconUrl(coinId) ?? undefined;
   }
 
   // ===========================================================================
@@ -1505,6 +1516,8 @@ export class PaymentsModule {
               coinId: tokenInfo.coinId,
               symbol: tokenInfo.symbol,
               name: tokenInfo.name,
+              decimals: tokenInfo.decimals,
+              iconUrl: tokenInfo.iconUrl,
               amount: tokenInfo.amount,
               status: 'confirmed',
               createdAt: (data.receivedAt as number) || Date.now(),
@@ -1829,7 +1842,7 @@ export class PaymentsModule {
     this.transactionHistory.push(historyEntry);
 
     await this.deps!.storage.set(
-      STORAGE_KEYS.TRANSACTION_HISTORY,
+      STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
       JSON.stringify(this.transactionHistory)
     );
   }
@@ -2532,6 +2545,8 @@ export class PaymentsModule {
         coinId: tokenInfo.coinId,
         symbol: tokenInfo.symbol,
         name: tokenInfo.name,
+        decimals: tokenInfo.decimals,
+        iconUrl: tokenInfo.iconUrl,
         amount: tokenInfo.amount,
         status: 'confirmed',
         createdAt: Date.now(),
@@ -2600,43 +2615,45 @@ export class PaymentsModule {
   // ===========================================================================
 
   private async save(): Promise<void> {
-    const tokens = Array.from(this.tokens.values());
+    // Save to TokenStorageProviders (IndexedDB/files)
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) {
+      this.log('No token storage providers - tokens not persisted');
+      return;
+    }
 
-    const data = {
-      tokens,
-      tombstones: this.tombstones.length > 0 ? this.tombstones : undefined,
-      archivedTokens: this.archivedTokens.size > 0
-        ? Object.fromEntries(this.archivedTokens)
-        : undefined,
-      forkedTokens: this.forkedTokens.size > 0
-        ? Object.fromEntries(this.forkedTokens)
-        : undefined,
-      nametag: this.nametag || undefined,
-    };
-
-    await this.deps!.storage.set(STORAGE_KEYS.TOKENS, JSON.stringify(data));
+    const data = await this.createStorageData();
+    for (const [id, provider] of providers) {
+      try {
+        await provider.save(data);
+      } catch (err) {
+        console.error(`[Payments] Failed to save to provider ${id}:`, err);
+      }
+    }
   }
 
   private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
     const outbox = await this.loadOutbox();
     outbox.push({ transfer, recipient, createdAt: Date.now() });
-    await this.deps!.storage.set(STORAGE_KEYS.OUTBOX, JSON.stringify(outbox));
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(outbox));
   }
 
   private async removeFromOutbox(transferId: string): Promise<void> {
     const outbox = await this.loadOutbox();
     const filtered = outbox.filter((e) => e.transfer.id !== transferId);
-    await this.deps!.storage.set(STORAGE_KEYS.OUTBOX, JSON.stringify(filtered));
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(filtered));
   }
 
   private async loadOutbox(): Promise<Array<{ transfer: TransferResult; recipient: string; createdAt: number }>> {
-    const data = await this.deps!.storage.get(STORAGE_KEYS.OUTBOX);
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
     return data ? JSON.parse(data) : [];
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
     const tokens = Array.from(this.tokens.values());
 
+    // Note: nametag is NOT passed here - it's saved separately via saveNametagToFileStorage()
+    // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
       tokens,
       {
@@ -2645,7 +2662,6 @@ export class PaymentsModule {
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {
-        nametag: this.nametag || undefined,
         tombstones: this.tombstones,
         archivedTokens: this.archivedTokens,
         forkedTokens: this.forkedTokens,

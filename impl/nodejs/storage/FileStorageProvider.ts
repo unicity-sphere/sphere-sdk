@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
+import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */
@@ -82,21 +83,25 @@ export class FileStorageProvider implements StorageProvider {
   }
 
   async get(key: string): Promise<string | null> {
-    return this.data[key] ?? null;
+    const fullKey = this.getFullKey(key);
+    return this.data[fullKey] ?? null;
   }
 
   async set(key: string, value: string): Promise<void> {
-    this.data[key] = value;
+    const fullKey = this.getFullKey(key);
+    this.data[fullKey] = value;
     await this.save();
   }
 
   async remove(key: string): Promise<void> {
-    delete this.data[key];
+    const fullKey = this.getFullKey(key);
+    delete this.data[fullKey];
     await this.save();
   }
 
   async has(key: string): Promise<boolean> {
-    return key in this.data;
+    const fullKey = this.getFullKey(key);
+    return fullKey in this.data;
   }
 
   async keys(prefix?: string): Promise<string[]> {
@@ -117,6 +122,25 @@ export class FileStorageProvider implements StorageProvider {
       this.data = {};
     }
     await this.save();
+  }
+
+  /**
+   * Get full storage key with address prefix for per-address keys
+   */
+  private getFullKey(key: string): string {
+    // Check if this is a per-address key
+    const isPerAddressKey = Object.values(STORAGE_KEYS_ADDRESS).includes(
+      key as (typeof STORAGE_KEYS_ADDRESS)[keyof typeof STORAGE_KEYS_ADDRESS]
+    );
+
+    if (isPerAddressKey && this._identity?.directAddress) {
+      // Add address ID prefix for per-address data
+      const addressId = getAddressId(this._identity.directAddress);
+      return `${addressId}_${key}`;
+    }
+
+    // Global key - no address prefix
+    return key;
   }
 
   private async save(): Promise<void> {

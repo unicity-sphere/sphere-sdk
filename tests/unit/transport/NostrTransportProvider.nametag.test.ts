@@ -6,7 +6,7 @@
  * delegates WebSocket management to NostrClient.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Buffer } from 'buffer';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 as sha256Noble } from '@noble/hashes/sha2.js';
@@ -436,6 +436,14 @@ describe('NostrTransportProvider.recoverNametag()', () => {
     });
 
     nostrPubkey = provider.getNostrPubkey();
+  });
+
+  afterEach(async () => {
+    try {
+      await provider.disconnect();
+    } catch {
+      // Ignore disconnect errors
+    }
   });
 
   it('should recover nametag from encrypted event', async () => {

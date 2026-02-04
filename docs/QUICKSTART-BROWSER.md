@@ -15,7 +15,7 @@ npm install @unicitylabs/sphere-sdk
 
 **That's it!** No additional dependencies for basic usage. Browser uses native WebSocket.
 
-> **API Key Required:** Nametag minting and L3 token operations require an aggregator API key. Configure via `oracle: { apiKey: 'your-key' }` in provider options. Contact Unicity to obtain a key.
+> **Note:** API key for aggregator is included by default. For custom deployments, configure via `oracle: { apiKey: 'your-key' }`.
 
 **Optional** (for IPFS token sync):
 ```bash
@@ -286,11 +286,21 @@ async function sendTokens(recipient: string, amount: string) {
 
 ### Register Nametag
 
+> **Note:** `registerNametag()` mints a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createBrowserProviders()`.
+
 ```typescript
 async function registerNametag(username: string) {
+  // This registers on Nostr AND mints token on-chain
   await sphere.registerNametag(username);
   console.log('Registered:', sphere.identity?.nametag);
 }
+
+// Alternative: register during init (also mints token)
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  nametag: 'alice',  // Mints token on-chain!
+});
 ```
 
 ### Listen for Events

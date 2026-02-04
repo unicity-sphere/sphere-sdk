@@ -18,11 +18,34 @@ import {
   hasMissingNewStateHash,
 } from '../../../serialization/txf-serializer';
 import type { Token } from '../../../types';
-import type { TxfToken } from '../../../types/txf';
+import type { TxfToken, TxfTransaction, TxfInclusionProof } from '../../../types/txf';
 
 // =============================================================================
 // Test Fixtures
 // =============================================================================
+
+const createMockInclusionProof = (): TxfInclusionProof => ({
+  authenticator: {
+    algorithm: 'secp256k1',
+    publicKey: 'pubkey_hex',
+    signature: 'sig_hex',
+    stateHash: 'state_hash_hex',
+  },
+  merkleTreePath: {
+    root: 'root_hash_hex',
+    steps: [],
+  },
+  transactionHash: 'tx_hash_hex',
+  unicityCertificate: 'cert_hex',
+});
+
+const createMockTransaction = (overrides: Partial<TxfTransaction> = {}): TxfTransaction => ({
+  previousStateHash: 'prev_hash',
+  newStateHash: 'new_hash',
+  predicate: 'predicate_hex',
+  inclusionProof: createMockInclusionProof(),
+  ...overrides,
+});
 
 const createMockTxf = (): TxfToken => ({
   version: '2.0',
@@ -32,22 +55,18 @@ const createMockTxf = (): TxfToken => ({
       tokenType: 'fungible_type_hash',
       salt: 'random_salt_hex',
       coinData: [['ALPHA_HEX', '1000000000000000000']],
+      tokenData: '',
+      recipient: 'DIRECT://abc123def456789',
+      recipientDataHash: null,
+      reason: null,
     },
-    inclusionProof: {
-      roundNumber: 100,
-      rootHash: 'root_hash_hex',
-      path: [],
-      authenticator: {
-        publicKey: 'pubkey_hex',
-        signature: 'sig_hex',
-      },
-    },
+    inclusionProof: createMockInclusionProof(),
   },
   transactions: [],
   nametags: [],
   state: {
-    pubKey: 'owner_pubkey_hex',
-    nonce: 1,
+    data: 'state_data_hex',
+    predicate: 'predicate_hex',
   },
   _integrity: {
     genesisDataJSONHash: '0'.repeat(64),
@@ -61,6 +80,7 @@ const createMockToken = (overrides: Partial<Token> = {}): Token => {
     coinId: 'ALPHA_HEX',
     symbol: 'UCT',
     name: 'Token',
+    decimals: 8,
     amount: '1000000000000000000',
     status: 'confirmed',
     createdAt: Date.now(),
@@ -155,8 +175,8 @@ describe('normalizeSdkTokenToStorage()', () => {
 
     const result = normalizeSdkTokenToStorage(input);
 
-    expect(result.transactions[0].inclusionProof.authenticator.publicKey).toBe('02cd');
-    expect(result.transactions[0].inclusionProof.authenticator.signature).toBe('3046');
+    expect(result.transactions[0].inclusionProof!.authenticator.publicKey).toBe('02cd');
+    expect(result.transactions[0].inclusionProof!.authenticator.signature).toBe('3046');
   });
 
   it('should not modify original object', () => {
@@ -171,7 +191,7 @@ describe('normalizeSdkTokenToStorage()', () => {
     normalizeSdkTokenToStorage(input);
 
     // Original should still have bytes object
-    expect((input.genesis.data.tokenId as any).bytes).toEqual([0xab]);
+    expect((input.genesis.data.tokenId as { bytes: number[] }).bytes).toEqual([0xab]);
   });
 });
 
@@ -212,7 +232,7 @@ describe('tokenToTxf()', () => {
 
   it('should add default version if missing', () => {
     const txf = createMockTxf();
-    delete (txf as any).version;
+    delete (txf as unknown as Record<string, unknown>).version;
     const token = createMockToken({ sdkData: JSON.stringify(txf) });
 
     const result = tokenToTxf(token);
@@ -222,7 +242,7 @@ describe('tokenToTxf()', () => {
 
   it('should add empty transactions array if missing', () => {
     const txf = createMockTxf();
-    delete (txf as any).transactions;
+    delete (txf as unknown as Record<string, unknown>).transactions;
     const token = createMockToken({ sdkData: JSON.stringify(txf) });
 
     const result = tokenToTxf(token);
@@ -250,12 +270,7 @@ describe('txfToToken()', () => {
   it('should detect pending status from uncommitted transaction', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      {
-        newStateHash: 'new_hash',
-        inclusionProof: null, // Uncommitted
-        coins: null,
-        nametag: null,
-      },
+      createMockTransaction({ inclusionProof: null }),
     ];
 
     const token = txfToToken('test', txf);
@@ -266,17 +281,7 @@ describe('txfToToken()', () => {
   it('should detect confirmed status with committed transaction', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      {
-        newStateHash: 'new_hash',
-        inclusionProof: {
-          roundNumber: 101,
-          rootHash: 'root',
-          path: [],
-          authenticator: { publicKey: 'pk', signature: 'sig' },
-        },
-        coins: null,
-        nametag: null,
-      },
+      createMockTransaction(),
     ];
 
     const token = txfToToken('test', txf);
@@ -326,7 +331,7 @@ describe('buildTxfStorageData()', () => {
 
   it('should add tokens with underscore prefix', async () => {
     const token = createMockToken();
-    const meta = { version: 1, address: 'alpha1test' };
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
 
     const result = await buildTxfStorageData([token], meta);
 
@@ -339,17 +344,25 @@ describe('buildTxfStorageData()', () => {
     expect(tokenKeys[0]).toMatch(/^_[a-z0-9]+$/i);
   });
 
-  it('should include nametag if provided', async () => {
-    const meta = { version: 1, address: 'alpha1test' };
-    const nametag = { name: '@alice', address: 'alpha1test', timestamp: Date.now() };
+  it('should NOT include nametag in TXF (saved separately as nametag-{name}.json)', async () => {
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const nametag = {
+      name: 'alice',
+      token: { genesis: {}, state: {} },
+      timestamp: Date.now(),
+      format: 'txf',
+      version: '2.0',
+    };
 
     const result = await buildTxfStorageData([], meta, { nametag });
 
-    expect(result._nametag).toEqual(nametag);
+    // Nametag is no longer saved in TXF to avoid duplication
+    // It's saved separately via saveNametagToFileStorage() as nametag-{name}.json
+    expect(result._nametag).toBeUndefined();
   });
 
   it('should include tombstones if provided', async () => {
-    const meta = { version: 1, address: 'alpha1test' };
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
     const tombstones = [
       { tokenId: 'abc', stateHash: 'hash', timestamp: Date.now(), reason: 'transferred' as const },
     ];
@@ -360,7 +373,7 @@ describe('buildTxfStorageData()', () => {
   });
 
   it('should not include empty arrays', async () => {
-    const meta = { version: 1, address: 'alpha1test' };
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
 
     const result = await buildTxfStorageData([], meta, { tombstones: [] });
 
@@ -375,7 +388,7 @@ describe('buildTxfStorageData()', () => {
 describe('parseTxfStorageData()', () => {
   it('should parse valid storage data', async () => {
     const tokens = [createMockToken()];
-    const meta = { version: 1, address: 'alpha1test' };
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
     const storageData = await buildTxfStorageData(tokens, meta);
 
     const parsed = parseTxfStorageData(storageData);
@@ -385,19 +398,29 @@ describe('parseTxfStorageData()', () => {
     expect(parsed.validationErrors.length).toBe(0);
   });
 
-  it('should extract meta and nametag', async () => {
-    const meta = { version: 2, address: 'alpha1abc' };
-    const nametag = { name: '@bob', address: 'alpha1abc', timestamp: Date.now() };
-    const storageData = await buildTxfStorageData([], meta, { nametag });
+  it('should extract meta and nametag (backwards compatibility)', async () => {
+    const meta = { version: 2, address: 'alpha1abc', ipnsName: '' };
+    const nametag = {
+      name: 'bob',
+      token: { genesis: {}, state: {} },
+      timestamp: Date.now(),
+      format: 'txf',
+      version: '2.0',
+    };
+    // Simulate old storage format where _nametag was included
+    const storageData = await buildTxfStorageData([], meta);
+    // Manually add _nametag for backwards compatibility test
+    (storageData as Record<string, unknown>)._nametag = nametag;
 
     const parsed = parseTxfStorageData(storageData);
 
     expect(parsed.meta?.version).toBe(2);
-    expect(parsed.nametag?.name).toBe('@bob');
+    // Backwards compatibility: old storage with _nametag should still be parsed
+    expect(parsed.nametag?.name).toBe('bob');
   });
 
   it('should extract tombstones', async () => {
-    const meta = { version: 1, address: 'alpha1test' };
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
     const tombstones = [
       { tokenId: 'dead', stateHash: 'hash1', timestamp: 12345, reason: 'transferred' as const },
     ];
@@ -453,7 +476,10 @@ describe('getTokenId()', () => {
 describe('getCurrentStateHash()', () => {
   it('should return newStateHash from last transaction', () => {
     const txf = createMockTxf();
-    txf.transactions = [{ newStateHash: 'hash1' } as any, { newStateHash: 'hash2' } as any];
+    txf.transactions = [
+      createMockTransaction({ newStateHash: 'hash1' }),
+      createMockTransaction({ newStateHash: 'hash2' }),
+    ];
 
     const hash = getCurrentStateHash(txf);
 
@@ -506,7 +532,7 @@ describe('hasUncommittedTransactions()', () => {
   it('should return true if any transaction has null inclusionProof', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      { newStateHash: 'h', inclusionProof: null, coins: null, nametag: null },
+      createMockTransaction({ inclusionProof: null }),
     ];
     const token = createMockToken({ sdkData: JSON.stringify(txf) });
 
@@ -516,12 +542,7 @@ describe('hasUncommittedTransactions()', () => {
   it('should return false if all transactions are committed', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      {
-        newStateHash: 'h',
-        inclusionProof: { roundNumber: 1, rootHash: 'r', path: [], authenticator: {} as any },
-        coins: null,
-        nametag: null,
-      },
+      createMockTransaction(),
     ];
     const token = createMockToken({ sdkData: JSON.stringify(txf) });
 
@@ -538,19 +559,9 @@ describe('countCommittedTransactions()', () => {
   it('should count only committed transactions', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      {
-        newStateHash: 'h1',
-        inclusionProof: { roundNumber: 1, rootHash: 'r', path: [], authenticator: {} as any },
-        coins: null,
-        nametag: null,
-      },
-      { newStateHash: 'h2', inclusionProof: null, coins: null, nametag: null },
-      {
-        newStateHash: 'h3',
-        inclusionProof: { roundNumber: 2, rootHash: 'r', path: [], authenticator: {} as any },
-        coins: null,
-        nametag: null,
-      },
+      createMockTransaction(),
+      createMockTransaction({ inclusionProof: null }),
+      createMockTransaction(),
     ];
     const token = createMockToken({ sdkData: JSON.stringify(txf) });
 
@@ -568,7 +579,7 @@ describe('hasMissingNewStateHash()', () => {
   it('should return true if any transaction lacks newStateHash', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      { newStateHash: undefined as any, inclusionProof: null, coins: null, nametag: null },
+      createMockTransaction({ newStateHash: undefined }),
     ];
     expect(hasMissingNewStateHash(txf)).toBe(true);
   });
@@ -576,7 +587,7 @@ describe('hasMissingNewStateHash()', () => {
   it('should return false if all transactions have newStateHash', () => {
     const txf = createMockTxf();
     txf.transactions = [
-      { newStateHash: 'hash1', inclusionProof: null, coins: null, nametag: null },
+      createMockTransaction({ newStateHash: 'hash1' }),
     ];
     expect(hasMissingNewStateHash(txf)).toBe(false);
   });

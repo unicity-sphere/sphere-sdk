@@ -30,6 +30,62 @@ Choose your platform:
 |----------|-------|----------|----------|
 | **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | `helia` (IPFS sync) |
 | **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | - |
+| **CLI** | See below | SDK + `tsx` | - |
+
+## CLI (Command Line Interface)
+
+The SDK includes a CLI for quick testing and development:
+
+```bash
+# Show help
+npm run cli -- --help
+
+# Initialize new wallet on testnet
+npm run cli -- init --network testnet
+
+# Import existing wallet
+npm run cli -- init --mnemonic "your 24 words here"
+
+# Check wallet status
+npm run cli -- status
+
+# Check balance
+npm run cli -- balance
+
+# Show receive address
+npm run cli -- receive
+
+# Send tokens
+npm run cli -- send @alice 1000000
+
+# Register nametag
+npm run cli -- nametag myname
+
+# Show transaction history
+npm run cli -- history 10
+```
+
+### Available CLI Commands
+
+| Category | Command | Description |
+|----------|---------|-------------|
+| **Wallet** | `init [--network <net>] [--mnemonic "<words>"]` | Create or import wallet |
+| | `status` | Show wallet identity |
+| | `config` | Show/set configuration |
+| **Balance** | `balance` | Show L3 token balance |
+| | `tokens` | List all tokens |
+| | `l1-balance` | Show L1 (ALPHA) balance |
+| **Transfers** | `send <recipient> <amount>` | Send tokens |
+| | `receive` | Show address for receiving |
+| | `history [limit]` | Show transaction history |
+| **Nametags** | `nametag <name>` | Register a nametag |
+| | `nametag-info <name>` | Lookup nametag info |
+| | `my-nametag` | Show current nametag |
+| **Utils** | `generate-key` | Generate random key |
+| | `to-human <amount>` | Convert to human readable |
+| | `parse-wallet <file>` | Parse wallet file |
+
+CLI data is stored in `./.sphere-cli/` directory.
 
 ## Quick Start
 

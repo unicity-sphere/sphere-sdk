@@ -2,6 +2,83 @@
 
 This file provides context for Claude Code when working with the Sphere SDK project.
 
+## Quick Start (Using SDK as Dependency)
+
+### Installation
+
+**Browser:**
+```bash
+npm install @unicitylabs/sphere-sdk
+```
+
+**Node.js:**
+```bash
+npm install @unicitylabs/sphere-sdk ws
+```
+
+### Minimal Example
+
+```typescript
+// Browser
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+
+const providers = createBrowserProviders({ network: 'testnet' });
+const { sphere, created, generatedMnemonic } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+});
+
+// Node.js
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet',
+  tokensDir: './tokens',
+});
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+```
+
+### Common Operations
+
+```typescript
+// Check balance
+const balance = sphere.payments.getBalance();
+
+// Send tokens
+await sphere.payments.send({
+  recipient: '@alice',  // or DIRECT://... address
+  amount: '1000000',
+  coinId: 'UCT',
+});
+
+// Register nametag (mints token on-chain!)
+await sphere.registerNametag('myname');
+
+// Listen for incoming transfers
+sphere.on('transfer:incoming', (event) => {
+  console.log('Received:', event.data.amount);
+});
+
+// Cleanup
+await sphere.destroy();
+```
+
+### What's Included by Default
+
+| Component | Browser | Node.js |
+|-----------|---------|---------|
+| Storage | localStorage + IndexedDB | File-based JSON |
+| Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
+| Oracle (Aggregator) | Included with API key | Included with API key |
+| IPFS sync | Optional (`helia`) | Not available |
+
+See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
+
+---
+
 ## Project Overview
 
 **Sphere SDK** (`@unicitylabs/sphere-sdk`) is a modular TypeScript SDK for Unicity wallet operations supporting:
@@ -156,7 +233,20 @@ npm run type-check
 - Registered via Nostr relay events (NIP-04 encrypted)
 - Can be recovered from Nostr when importing wallet
 - Each derived HD address can have its own nametag
-- On-chain minting via `NametagMinter` for PROXY addresses
+
+**When nametag token is minted on-chain:**
+- `Sphere.init({ nametag: 'alice' })` → mints via `registerNametag()`
+- `sphere.registerNametag('alice')` → mints token
+- CLI: `npm run cli -- init --nametag alice` → mints token
+- CLI: `npm run cli -- nametag alice` → mints token
+
+**When NO minting happens:**
+- `Sphere.init({ autoGenerate: true })` without nametag → only creates wallet
+- CLI: `npm run cli -- init` → only creates wallet
+
+**Requirements for minting:**
+- Oracle (Aggregator) provider - included by default with `createBrowserProviders()` / `createNodeProviders()`
+- API key - embedded by default for testnet/mainnet
 
 ### L3 Transfers
 - Use `DirectAddress` (not PROXY) for transfers

@@ -328,3 +328,25 @@ export type {
 
 // L1 Low-level SDK
 export * as L1 from './l1';
+
+// =============================================================================
+// Token Registry
+// =============================================================================
+
+export {
+  TokenRegistry,
+  getTokenDefinition,
+  getTokenSymbol,
+  getTokenName,
+  getTokenDecimals,
+  getTokenIconUrl,
+  isKnownToken,
+  getCoinIdBySymbol,
+  getCoinIdByName,
+} from './registry';
+
+export type {
+  TokenDefinition,
+  TokenIcon,
+  RegistryNetwork,
+} from './registry';

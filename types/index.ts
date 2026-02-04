@@ -64,6 +64,8 @@ export interface Token {
   readonly coinId: string;
   readonly symbol: string;
   readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
   readonly amount: string;
   status: TokenStatus;
   readonly createdAt: number;

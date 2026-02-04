@@ -15,7 +15,41 @@ npm install @unicitylabs/sphere-sdk ws
 
 **Node.js version:** 18.0.0 or higher
 
-> **API Key Required:** Nametag minting and L3 token operations require an aggregator API key. Configure via `oracle: { apiKey: 'your-key' }` in provider options. Contact Unicity to obtain a key.
+> **Note:** API key for aggregator is included by default. For custom deployments, configure via `oracle: { apiKey: 'your-key' }`.
+
+## CLI (Quick Testing)
+
+The SDK includes a built-in CLI for quick testing without writing code:
+
+```bash
+# Initialize wallet (no token minted)
+npm run cli -- init --network testnet
+
+# Initialize wallet WITH nametag (mints token on-chain!)
+npm run cli -- init --network testnet --nametag alice
+
+# Check status
+npm run cli -- status
+
+# Check balance
+npm run cli -- balance
+
+# Send tokens
+npm run cli -- send @alice 1000000
+
+# Show receive address
+npm run cli -- receive
+
+# Register nametag (mints token on-chain!)
+npm run cli -- nametag myname
+
+# Full help
+npm run cli -- --help
+```
+
+> **Important:** Commands with `--nametag` or `nametag` mint a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createNodeProviders()`.
+
+CLI stores data in `./.sphere-cli/` directory.
 
 ## Storage
 
@@ -144,7 +178,10 @@ const result = await sphere.payments.send({
 
 ### Register Nametag
 
+> **Note:** `registerNametag()` mints a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createNodeProviders()`.
+
 ```typescript
+// This registers on Nostr AND mints token on-chain
 await sphere.registerNametag('myusername');
 console.log('Registered:', sphere.identity?.nametag);
 ```
@@ -265,7 +302,9 @@ import type {
 } from '@unicitylabs/sphere-sdk';
 ```
 
-## Complete CLI Example
+## Custom CLI Example
+
+Build your own CLI tool using the SDK:
 
 ```typescript
 #!/usr/bin/env node
