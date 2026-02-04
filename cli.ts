@@ -128,7 +128,7 @@ BALANCE & TOKENS:
   l1-balance                        Show L1 (ALPHA) balance
 
 TRANSFERS:
-  send <recipient> <amount>         Send tokens (recipient: @nametag or address)
+  send <to> <amount> [--coin SYM]   Send tokens (to: @nametag or address, SYM: UCT/BTC/ETH/SOL)
   receive                           Show address for receiving tokens
   history [limit]                   Show transaction history
 
@@ -166,7 +166,7 @@ Examples:
   npm run cli -- init --mnemonic "word1 word2 ... word24"
   npm run cli -- status
   npm run cli -- balance
-  npm run cli -- send @alice 1000000
+  npm run cli -- send @alice 1000000 --coin ETH
   npm run cli -- nametag myname
   npm run cli -- history 10
 `);
@@ -385,25 +385,34 @@ async function main() {
       case 'send': {
         const [, recipient, amountStr] = args;
         if (!recipient || !amountStr) {
-          console.error('Usage: send <recipient> <amount> [--coin <coinId>]');
+          console.error('Usage: send <recipient> <amount> [--coin <symbol>]');
           console.error('  recipient: @nametag or DIRECT:// address');
           console.error('  amount: in smallest units');
-          console.error('  --coin: token type (default: UCT)');
+          console.error('  --coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
           process.exit(1);
         }
 
-        // Parse --coin option
+        // Parse --coin option (symbol like UCT, BTC, ETH)
         const coinIndex = args.indexOf('--coin');
-        const coinId = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
+        const coinSymbol = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
+
+        // Resolve symbol to coinId hex
+        const registry = TokenRegistry.getInstance();
+        const coinIdHex = registry.getCoinIdBySymbol(coinSymbol);
+        if (!coinIdHex) {
+          console.error(`Unknown coin symbol: ${coinSymbol}`);
+          console.error('Available symbols: UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT');
+          process.exit(1);
+        }
 
         const sphere = await getSphere();
 
-        console.log(`\nSending ${toHumanReadable(amountStr)} ${coinId} to ${recipient}...`);
+        console.log(`\nSending ${toHumanReadable(amountStr)} ${coinSymbol} to ${recipient}...`);
 
         const result = await sphere.payments.send({
           recipient,
           amount: amountStr,
-          coinId,
+          coinId: coinIdHex,
         });
 
         if (result.status === 'completed' || result.status === 'submitted') {
