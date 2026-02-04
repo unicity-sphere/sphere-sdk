@@ -80,6 +80,7 @@ const createMockToken = (overrides: Partial<Token> = {}): Token => {
     coinId: 'ALPHA_HEX',
     symbol: 'UCT',
     name: 'Token',
+    decimals: 8,
     amount: '1000000000000000000',
     status: 'confirmed',
     createdAt: Date.now(),
