@@ -122,11 +122,15 @@
     "vitest": "^2.0.0"
   },
   "peerDependencies": {
+    "ws": ">=8.0.0",
     "@helia/ipns": ">=9.0.0",
     "@helia/json": ">=5.0.0",
     "helia": ">=6.0.0"
   },
   "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    },
     "@helia/ipns": {
       "optional": true
     },

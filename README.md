@@ -22,6 +22,71 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 npm install @unicitylabs/sphere-sdk
 ```
 
+## Quick Start Guides
+
+Choose your platform:
+
+| Platform | Guide | Required | Optional |
+|----------|-------|----------|----------|
+| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | `helia` (IPFS sync) |
+| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | - |
+| **CLI** | See below | SDK + `tsx` | - |
+
+## CLI (Command Line Interface)
+
+The SDK includes a CLI for quick testing and development:
+
+```bash
+# Show help
+npm run cli -- --help
+
+# Initialize new wallet on testnet
+npm run cli -- init --network testnet
+
+# Import existing wallet
+npm run cli -- init --mnemonic "your 24 words here"
+
+# Check wallet status
+npm run cli -- status
+
+# Check balance
+npm run cli -- balance
+
+# Show receive address
+npm run cli -- receive
+
+# Send tokens
+npm run cli -- send @alice 1000000
+
+# Register nametag
+npm run cli -- nametag myname
+
+# Show transaction history
+npm run cli -- history 10
+```
+
+### Available CLI Commands
+
+| Category | Command | Description |
+|----------|---------|-------------|
+| **Wallet** | `init [--network <net>] [--mnemonic "<words>"]` | Create or import wallet |
+| | `status` | Show wallet identity |
+| | `config` | Show/set configuration |
+| **Balance** | `balance` | Show L3 token balance |
+| | `tokens` | List all tokens |
+| | `l1-balance` | Show L1 (ALPHA) balance |
+| **Transfers** | `send <recipient> <amount>` | Send tokens |
+| | `receive` | Show address for receiving |
+| | `history [limit]` | Show transaction history |
+| **Nametags** | `nametag <name>` | Register a nametag |
+| | `nametag-info <name>` | Lookup nametag info |
+| | `my-nametag` | Show current nametag |
+| **Utils** | `generate-key` | Generate random key |
+| | `to-human <amount>` | Convert to human readable |
+| | `parse-wallet <file>` | Parse wallet file |
+
+CLI data is stored in `./.sphere-cli/` directory.
+
 ## Quick Start
 
 ```typescript
@@ -45,7 +110,7 @@ if (created && generatedMnemonic) {
 }
 
 // Get identity
-console.log('Address:', sphere.identity?.address);
+console.log('Address:', sphere.identity?.l1Address);
 
 // Check balance
 const balance = await sphere.payments.getBalance();
@@ -100,7 +165,7 @@ const currentIndex = sphere.getCurrentAddressIndex(); // 0
 
 // Switch to a different address
 await sphere.switchToAddress(1);
-console.log(sphere.identity?.address); // alpha1... (address at index 1)
+console.log(sphere.identity?.l1Address); // alpha1... (address at index 1)
 
 // Register nametag for this address (independent per address)
 await sphere.registerNametag('bob');
@@ -124,16 +189,17 @@ console.log(addr2.address, addr2.publicKey);
 
 ```typescript
 interface Identity {
-  publicKey: string;           // secp256k1 public key (hex)
-  address: string;             // L1 address (alpha1...)
-  predicateAddress?: string;   // L3 address (DIRECT://...)
+  chainPubkey: string;         // 33-byte compressed secp256k1 public key (for L3 chain)
+  l1Address: string;           // L1 address (alpha1...)
+  directAddress?: string;      // L3 DIRECT address (DIRECT://...)
   ipnsName?: string;           // IPNS name for token sync
   nametag?: string;            // Registered nametag (@username)
 }
 
 // Access identity
-console.log(sphere.identity?.address);          // alpha1qw3e...
-console.log(sphere.identity?.predicateAddress); // DIRECT://0000be36...
+console.log(sphere.identity?.l1Address);        // alpha1qw3e...
+console.log(sphere.identity?.directAddress);    // DIRECT://0000be36...
+console.log(sphere.identity?.chainPubkey);      // 02abc123... (33-byte compressed)
 console.log(sphere.identity?.nametag);          // alice
 ```
 
@@ -143,10 +209,15 @@ console.log(sphere.identity?.nametag);          // alice
 // Listen for address switches
 sphere.on('identity:changed', (event) => {
   console.log('Switched to address index:', event.data.addressIndex);
-  console.log('L1 address:', event.data.address);
-  console.log('L3 address:', event.data.predicateAddress);
-  console.log('Public key:', event.data.publicKey);
+  console.log('L1 address:', event.data.l1Address);
+  console.log('L3 address:', event.data.directAddress);
+  console.log('Chain pubkey:', event.data.chainPubkey);
   console.log('Nametag:', event.data.nametag);
+});
+
+// Listen for nametag recovery (when importing wallet)
+sphere.on('nametag:recovered', (event) => {
+  console.log('Recovered nametag from Nostr:', event.data.nametag);
 });
 ```
 
@@ -345,7 +416,7 @@ if (result.needsPassword) {
 
 if (result.success) {
   const sphere = result.sphere;
-  console.log('Imported wallet:', sphere.identity?.address);
+  console.log('Imported wallet:', sphere.identity?.l1Address);
 }
 
 // Import from text backup file
@@ -453,9 +524,10 @@ mnemonic → master key → BIP32 derivation → identity
                                               ↓
                         ┌─────────────────────┴─────────────────────┐
                         │              shared keys                  │
-                        │  privateKey: "abc..."  (hex secp256k1)    │
-                        │  publicKey:  "02def..." (compressed)      │
-                        │  address:    "alpha1..." (bech32)         │
+                        │  privateKey:   "abc..."  (hex secp256k1)  │
+                        │  chainPubkey:  "02def..." (33-byte comp.) │
+                        │  l1Address:    "alpha1..." (bech32)       │
+                        │  directAddress: "DIRECT://..." (L3)       │
                         └─────────────────────┬─────────────────────┘
                                               ↓
               ┌───────────────────────────────┼───────────────────────────────┐
@@ -814,7 +886,7 @@ class MyCustomStorageProvider implements TokenStorageProvider<TxfStorageDataBase
     // Load tokens from your storage
     return {
       success: true,
-      data: { _meta: { version: 1, address: this.identity?.address ?? '', formatVersion: '2.0', updatedAt: Date.now() } },
+      data: { _meta: { version: 1, address: this.identity?.l1Address ?? '', formatVersion: '2.0', updatedAt: Date.now() } },
       source: 'remote',
       timestamp: Date.now(),
     };
@@ -985,6 +1057,8 @@ function getRelayStatuses() {
 
 Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments.
 
+> **Note:** Nametag minting requires an aggregator API key for proof verification. Configure it via the `oracle.apiKey` option when creating providers. Contact Unicity to obtain an API key.
+
 ### Registering a Nametag
 
 ```typescript
@@ -1067,6 +1141,27 @@ const exists = await Sphere.exists(storage);
 console.log('Wallet exists:', exists);  // Should be true after first run
 
 // If false - storage is not persisting properly
+```
+
+### Nametag Recovery on Import
+
+When importing a wallet (from mnemonic or file), the SDK automatically attempts to recover the nametag from Nostr:
+
+```typescript
+// Import wallet - nametag will be recovered automatically if found on Nostr
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your twelve words...',
+  // No nametag specified - will try to recover from Nostr
+});
+
+// Listen for recovery event
+sphere.on('nametag:recovered', (event) => {
+  console.log('Recovered nametag:', event.data.nametag);  // e.g., 'alice'
+});
+
+// After init, check if nametag was recovered
+console.log(sphere.identity?.nametag);  // 'alice' (if found on Nostr)
 ```
 
 ### Multi-Address Nametags

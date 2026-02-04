@@ -8,6 +8,8 @@ import {
   type UnicityAggregatorProviderConfig,
 } from '../../../oracle/UnicityAggregatorProvider';
 import type { TrustBaseLoader } from '../../../oracle/oracle-provider';
+import { BaseTrustBaseLoader } from '../../shared/trustbase-loader';
+import type { NetworkType } from '../../../constants';
 
 // Re-export shared types and classes
 export {
@@ -24,23 +26,30 @@ export type { TrustBaseLoader } from '../../../oracle/oracle-provider';
 // =============================================================================
 
 /**
- * Browser TrustBase loader using fetch
+ * Browser TrustBase loader - fetches from URL or uses embedded data
  */
-export class BrowserTrustBaseLoader implements TrustBaseLoader {
-  private url: string;
+export class BrowserTrustBaseLoader extends BaseTrustBaseLoader {
+  private url?: string;
 
-  constructor(url: string = '/trustbase-testnet.json') {
-    this.url = url;
+  constructor(networkOrUrl: NetworkType | string = 'testnet') {
+    if (networkOrUrl.startsWith('/') || networkOrUrl.startsWith('http')) {
+      super('testnet');
+      this.url = networkOrUrl;
+    } else {
+      super(networkOrUrl as NetworkType);
+    }
   }
 
-  async load(): Promise<unknown | null> {
+  protected async loadFromExternal(): Promise<unknown | null> {
+    if (!this.url) return null;
+
     try {
       const response = await fetch(this.url);
       if (response.ok) {
         return await response.json();
       }
     } catch {
-      // Ignore fetch errors
+      // Fall through to embedded
     }
     return null;
   }
@@ -49,8 +58,8 @@ export class BrowserTrustBaseLoader implements TrustBaseLoader {
 /**
  * Create browser TrustBase loader
  */
-export function createBrowserTrustBaseLoader(url?: string): TrustBaseLoader {
-  return new BrowserTrustBaseLoader(url);
+export function createBrowserTrustBaseLoader(networkOrUrl?: NetworkType | string): TrustBaseLoader {
+  return new BrowserTrustBaseLoader(networkOrUrl);
 }
 
 // =============================================================================
@@ -59,17 +68,17 @@ export function createBrowserTrustBaseLoader(url?: string): TrustBaseLoader {
 
 /**
  * Create UnicityAggregatorProvider with browser TrustBase loader
- * Convenience factory that injects browser-specific loader
  */
 export function createUnicityAggregatorProvider(
   config: Omit<UnicityAggregatorProviderConfig, 'trustBaseLoader'> & {
     trustBaseUrl?: string;
+    network?: NetworkType;
   }
 ): UnicityAggregatorProvider {
-  const { trustBaseUrl, ...restConfig } = config;
+  const { trustBaseUrl, network, ...restConfig } = config;
   return new UnicityAggregatorProvider({
     ...restConfig,
-    trustBaseLoader: createBrowserTrustBaseLoader(trustBaseUrl),
+    trustBaseLoader: createBrowserTrustBaseLoader(trustBaseUrl ?? network ?? 'testnet'),
   });
 }
 

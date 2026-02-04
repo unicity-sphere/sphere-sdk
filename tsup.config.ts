@@ -11,8 +11,8 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
+    noExternal: [/^@noble\//],
     external: [
-      /^@noble\//,
       /^@unicitylabs\//,
       /^@libp2p\//,
       /^@helia\//,
@@ -35,8 +35,8 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
+    noExternal: [/^@noble\//],
     external: [
-      /^@noble\//,
       /^@unicitylabs\//,
       'bip39',
       'buffer',
@@ -55,8 +55,8 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
+    noExternal: [/^@noble\//],
     external: [
-      /^@noble\//,
       'bip39',
       'buffer',
       'crypto-js',
@@ -73,8 +73,8 @@ export default defineConfig([
     sourcemap: true,
     platform: 'browser',
     target: 'es2022',
+    noExternal: [/^@noble\//],
     external: [
-      /^@noble\//,
       /^@unicitylabs\//,
     ],
   },
@@ -89,8 +89,8 @@ export default defineConfig([
     sourcemap: true,
     platform: 'browser',
     target: 'es2022',
+    noExternal: [/^@noble\//],
     external: [
-      /^@noble\//,
       /^@unicitylabs\//,
       /^@libp2p\//,
       /^@helia\//,
@@ -108,8 +108,8 @@ export default defineConfig([
     sourcemap: true,
     platform: 'node',
     target: 'es2022',
+    noExternal: [/^@noble\//],
     external: [
-      /^@noble\//,
       /^@unicitylabs\//,
       /^@libp2p\//,
       /^@helia\//,

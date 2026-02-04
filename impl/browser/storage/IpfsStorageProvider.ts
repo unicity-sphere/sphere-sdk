@@ -450,7 +450,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     const emptyData = {
       _meta: {
         version: 0,
-        address: this.identity?.address ?? '',
+        address: this.identity?.l1Address ?? '',
         formatVersion: '2.0',
         updatedAt: Date.now(),
       },

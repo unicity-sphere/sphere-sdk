@@ -159,6 +159,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       trustBasePath: oracleConfig.trustBasePath,
       skipVerification: oracleConfig.skipVerification,
       debug: oracleConfig.debug,
+      network,
     }),
     l1: l1Config,
   };

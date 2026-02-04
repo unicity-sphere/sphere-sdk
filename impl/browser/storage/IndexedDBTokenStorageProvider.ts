@@ -1,10 +1,12 @@
 /**
  * IndexedDB Token Storage Provider for Browser
  * Stores tokens in IndexedDB for persistent browser storage
+ * Each address gets its own database for multi-address support
  */
 
 import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
+import { getAddressId } from '../../../constants';
 
 const DB_NAME = 'sphere-token-storage';
 const DB_VERSION = 1;
@@ -21,20 +23,24 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   readonly name = 'IndexedDB Token Storage';
   readonly type = 'local' as const;
 
+  private dbNamePrefix: string;
   private dbName: string;
   private db: IDBDatabase | null = null;
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
 
   constructor(config?: IndexedDBTokenStorageConfig) {
-    const prefix = config?.dbNamePrefix ?? DB_NAME;
-    this.dbName = prefix;
+    this.dbNamePrefix = config?.dbNamePrefix ?? DB_NAME;
+    this.dbName = this.dbNamePrefix;
   }
 
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
-    // Scope database to address
-    this.dbName = `${DB_NAME}-${identity.address.slice(0, 20)}`;
+    // Scope database to address using consistent addressId format
+    if (identity.directAddress) {
+      const addressId = getAddressId(identity.directAddress);
+      this.dbName = `${this.dbNamePrefix}-${addressId}`;
+    }
   }
 
   async initialize(): Promise<boolean> {
@@ -87,7 +93,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       const data: TxfStorageDataBase = {
         _meta: {
           version: 1,
-          address: this.identity?.address ?? '',
+          address: this.identity?.l1Address ?? '',
           formatVersion: '2.0',
           updatedAt: Date.now(),
         },

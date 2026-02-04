@@ -179,9 +179,10 @@ describe('resolveOracleConfig', () => {
       expect(result.trustBasePath).toBe('./trustbase.json');
     });
 
-    it('should return undefined for unset options', () => {
+    it('should use default API key when not specified', () => {
       const result = resolveOracleConfig('testnet');
-      expect(result.apiKey).toBeUndefined();
+      // Default API key is set in constants for trustbase authentication
+      expect(result.apiKey).toBe('sk_06365a9c44654841a366068bcfc68986');
       expect(result.timeout).toBeUndefined();
       expect(result.skipVerification).toBeUndefined();
     });

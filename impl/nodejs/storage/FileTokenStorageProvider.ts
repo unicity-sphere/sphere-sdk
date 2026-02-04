@@ -1,12 +1,13 @@
 /**
  * File Token Storage Provider for Node.js
- * Stores tokens as individual JSON files
+ * Stores tokens as individual JSON files in per-address subdirectories
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
+import { getAddressId } from '../../../constants';
 
 export interface FileTokenStorageConfig {
   /** Directory to store token files */
@@ -18,16 +19,29 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
   readonly name = 'File Token Storage';
   readonly type = 'local' as const;
 
-  private tokensDir: string;
+  private baseTokensDir: string;
   private status: ProviderStatus = 'disconnected';
   private identity: FullIdentity | null = null;
 
   constructor(config: FileTokenStorageConfig | string) {
-    this.tokensDir = typeof config === 'string' ? config : config.tokensDir;
+    this.baseTokensDir = typeof config === 'string' ? config : config.tokensDir;
   }
 
   setIdentity(identity: FullIdentity): void {
     this.identity = identity;
+  }
+
+  /**
+   * Get tokens directory for current address
+   * Format: {baseTokensDir}/{addressId}/
+   */
+  private get tokensDir(): string {
+    if (this.identity?.directAddress) {
+      // getAddressId returns sanitized format: DIRECT_abc123_xyz789
+      const addressId = getAddressId(this.identity.directAddress);
+      return path.join(this.baseTokensDir, addressId);
+    }
+    return this.baseTokensDir;
   }
 
   async initialize(): Promise<boolean> {
@@ -62,7 +76,7 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     const data: TxfStorageDataBase = {
       _meta: {
         version: 1,
-        address: this.identity?.address ?? '',
+        address: this.identity?.l1Address ?? '',
         formatVersion: '2.0',
         updatedAt: Date.now(),
       },

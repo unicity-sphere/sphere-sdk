@@ -17,49 +17,89 @@ export const STORAGE_PREFIX = 'sphere_' as const;
  */
 export const DEFAULT_ENCRYPTION_KEY = 'sphere-default-key' as const;
 
-/** Storage keys for wallet data */
-export const STORAGE_KEYS = {
+/**
+ * Global storage keys (one per wallet, no address index)
+ * Final key format: sphere_{key}
+ */
+export const STORAGE_KEYS_GLOBAL = {
   /** Encrypted BIP39 mnemonic */
-  MNEMONIC: `${STORAGE_PREFIX}mnemonic`,
+  MNEMONIC: 'mnemonic',
   /** Encrypted master private key */
-  MASTER_KEY: `${STORAGE_PREFIX}master_key`,
+  MASTER_KEY: 'master_key',
   /** BIP32 chain code */
-  CHAIN_CODE: `${STORAGE_PREFIX}chain_code`,
+  CHAIN_CODE: 'chain_code',
   /** HD derivation path (full path like m/44'/0'/0'/0/0) */
-  DERIVATION_PATH: `${STORAGE_PREFIX}derivation_path`,
+  DERIVATION_PATH: 'derivation_path',
   /** Base derivation path (like m/44'/0'/0' without chain/index) */
-  BASE_PATH: `${STORAGE_PREFIX}base_path`,
+  BASE_PATH: 'base_path',
   /** Derivation mode: bip32, wif_hmac, legacy_hmac */
-  DERIVATION_MODE: `${STORAGE_PREFIX}derivation_mode`,
+  DERIVATION_MODE: 'derivation_mode',
   /** Wallet source: mnemonic, file, unknown */
-  WALLET_SOURCE: `${STORAGE_PREFIX}wallet_source`,
+  WALLET_SOURCE: 'wallet_source',
   /** Wallet existence flag */
-  WALLET_EXISTS: `${STORAGE_PREFIX}wallet_exists`,
-  /** Registered nametag (legacy - single address) */
-  NAMETAG: `${STORAGE_PREFIX}nametag`,
+  WALLET_EXISTS: 'wallet_exists',
   /** Current active address index */
-  CURRENT_ADDRESS_INDEX: `${STORAGE_PREFIX}current_address_index`,
-  /** Address nametags map (JSON: { "0": "alice", "1": "bob" }) */
-  ADDRESS_NAMETAGS: `${STORAGE_PREFIX}address_nametags`,
-  /** Token data */
-  TOKENS: `${STORAGE_PREFIX}tokens`,
-  /** Pending transfers */
-  PENDING_TRANSFERS: `${STORAGE_PREFIX}pending_transfers`,
-  /** Transfer outbox */
-  OUTBOX: `${STORAGE_PREFIX}outbox`,
-  /** Conversations */
-  CONVERSATIONS: `${STORAGE_PREFIX}conversations`,
-  /** Messages */
-  MESSAGES: `${STORAGE_PREFIX}messages`,
-  /** Transaction history */
-  TRANSACTION_HISTORY: `${STORAGE_PREFIX}transaction_history`,
-  /** Archived tokens (spent token history) */
-  ARCHIVED_TOKENS: `${STORAGE_PREFIX}archived_tokens`,
-  /** Tombstones (records of deleted/spent tokens) */
-  TOMBSTONES: `${STORAGE_PREFIX}tombstones`,
-  /** Forked tokens (alternative histories) */
-  FORKED_TOKENS: `${STORAGE_PREFIX}forked_tokens`,
+  CURRENT_ADDRESS_INDEX: 'current_address_index',
+  /** Index of address nametags (JSON: { "0": "alice", "1": "bob" }) - for discovery */
+  ADDRESS_NAMETAGS: 'address_nametags',
 } as const;
+
+/**
+ * Per-address storage keys (one per derived address)
+ * Final key format: sphere_{DIRECT_xxx_yyy}_{key}
+ * Example: sphere_DIRECT_abc123_xyz789_pending_transfers
+ *
+ * Note: Token data (tokens, tombstones, archived, forked) is stored via
+ * TokenStorageProvider, not here. This avoids duplication.
+ */
+export const STORAGE_KEYS_ADDRESS = {
+  /** Pending transfers for this address */
+  PENDING_TRANSFERS: 'pending_transfers',
+  /** Transfer outbox for this address */
+  OUTBOX: 'outbox',
+  /** Conversations for this address */
+  CONVERSATIONS: 'conversations',
+  /** Messages for this address */
+  MESSAGES: 'messages',
+  /** Transaction history for this address */
+  TRANSACTION_HISTORY: 'transaction_history',
+} as const;
+
+/** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
+export const STORAGE_KEYS = {
+  ...STORAGE_KEYS_GLOBAL,
+  ...STORAGE_KEYS_ADDRESS,
+} as const;
+
+/**
+ * Build a per-address storage key using address identifier
+ * @param addressId - Short identifier for the address (e.g., first 8 chars of pubkey hash, or direct address hash)
+ * @param key - The key from STORAGE_KEYS_ADDRESS
+ * @returns Key in format: "{addressId}_{key}" e.g., "a1b2c3d4_tokens"
+ */
+export function getAddressStorageKey(addressId: string, key: string): string {
+  return `${addressId}_${key}`;
+}
+
+/**
+ * Create a readable address identifier from directAddress or chainPubkey
+ * Format: DIRECT_first6_last6 (sanitized for filesystem/storage)
+ * @param directAddress - The L3 direct address (DIRECT:xxx) or chainPubkey
+ * @returns Sanitized identifier like "DIRECT_abc123_xyz789"
+ */
+export function getAddressId(directAddress: string): string {
+  // Remove DIRECT:// or DIRECT: prefix if present
+  let hash = directAddress;
+  if (hash.startsWith('DIRECT://')) {
+    hash = hash.slice(9);
+  } else if (hash.startsWith('DIRECT:')) {
+    hash = hash.slice(7);
+  }
+  // Format: DIRECT_first6_last6 (sanitized)
+  const first = hash.slice(0, 6).toLowerCase();
+  const last = hash.slice(-6).toLowerCase();
+  return `DIRECT_${first}_${last}`;
+}
 
 // =============================================================================
 // Nostr Defaults
@@ -108,6 +148,9 @@ export const TEST_AGGREGATOR_URL = 'https://goggregator-test.unicity.network' as
 
 /** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
+
+/** Default API key for aggregator authentication */
+export const DEFAULT_AGGREGATOR_API_KEY = 'sk_06365a9c44654841a366068bcfc68986' as const;
 
 // =============================================================================
 // IPFS Defaults

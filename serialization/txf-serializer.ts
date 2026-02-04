@@ -256,9 +256,9 @@ export async function buildTxfStorageData(
     },
   };
 
-  if (options?.nametag) {
-    storageData._nametag = options.nametag;
-  }
+  // Note: nametag is no longer saved here to avoid duplication.
+  // Nametag is saved separately via saveNametagToFileStorage() as nametag-{name}.json
+  // The options.nametag parameter is kept for backwards compatibility but ignored.
 
   if (options?.tombstones && options.tombstones.length > 0) {
     storageData._tombstones = options.tombstones;

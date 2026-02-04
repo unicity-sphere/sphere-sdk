@@ -33,7 +33,8 @@
     "serialization/**/*.ts",
     "validation/**/*.ts",
     "impl/**/*.ts",
-    "l1/**/*.ts"
+    "l1/**/*.ts",
+    "registry/**/*.ts"
   ],
   "exclude": [
     "node_modules",

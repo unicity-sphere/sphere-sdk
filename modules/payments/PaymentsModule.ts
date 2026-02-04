@@ -52,22 +52,21 @@ import type {
   PaymentRequestResponse,
   PaymentRequestResponseHandler,
 } from '../../types';
-import { STORAGE_KEYS } from '../../constants';
+import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   tokenToTxf,
   getCurrentStateHash,
   buildTxfStorageData,
   parseTxfStorageData,
 } from '../../serialization/txf-serializer';
+import { TokenRegistry } from '../../registry';
 
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
-import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import { TransferTransaction } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransaction';
 import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
-import { ProxyAddress } from '@unicitylabs/state-transition-sdk/lib/address/ProxyAddress';
 import { AddressScheme } from '@unicitylabs/state-transition-sdk/lib/address/AddressScheme';
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -99,8 +98,28 @@ interface ParsedTokenInfo {
   coinId: string;
   symbol: string;
   name: string;
+  decimals: number;
+  iconUrl?: string;
   amount: string;
   tokenId?: string;
+}
+
+/**
+ * Enrich token info with data from TokenRegistry
+ */
+function enrichWithRegistry(info: ParsedTokenInfo): ParsedTokenInfo {
+  const registry = TokenRegistry.getInstance();
+  const def = registry.getDefinition(info.coinId);
+  if (def) {
+    return {
+      ...info,
+      symbol: def.symbol || info.symbol,
+      name: def.name.charAt(0).toUpperCase() + def.name.slice(1),
+      decimals: def.decimals ?? 0,
+      iconUrl: registry.getIconUrl(info.coinId) ?? undefined,
+    };
+  }
+  return info;
 }
 
 /**
@@ -111,6 +130,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
     coinId: 'ALPHA',
     symbol: 'ALPHA',
     name: 'Alpha Token',
+    decimals: 0,
     amount: '0',
   };
 
@@ -144,13 +164,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
           // Extract hex string from CoinId object
           if (coinIdObj instanceof CoinId) {
             const coinIdHex = coinIdObj.toJSON() as string;
-            return {
+            return enrichWithRegistry({
               coinId: coinIdHex,
               symbol: coinIdHex.slice(0, 8),
               name: `Token ${coinIdHex.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount ?? '0'),
               tokenId: defaultInfo.tokenId,
-            };
+            });
           } else if (coinIdObj && typeof coinIdObj === 'object' && 'bytes' in coinIdObj) {
             // CoinId stored as object with bytes
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -160,13 +181,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
               : Array.isArray(bytes)
                 ? Buffer.from(bytes).toString('hex')
                 : String(bytes);
-            return {
+            return enrichWithRegistry({
               coinId: coinIdHex,
               symbol: coinIdHex.slice(0, 8),
               name: `Token ${coinIdHex.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount ?? '0'),
               tokenId: defaultInfo.tokenId,
-            };
+            });
           }
         }
       }
@@ -185,13 +207,14 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
             if (Array.isArray(firstEntry) && firstEntry.length === 2) {
               const [coinIdHex, amount] = firstEntry;
               const coinIdStr = typeof coinIdHex === 'string' ? coinIdHex : String(coinIdHex);
-              return {
+              return enrichWithRegistry({
                 coinId: coinIdStr,
                 symbol: coinIdStr.slice(0, 8),
                 name: `Token ${coinIdStr.slice(0, 8)}`,
+                decimals: 0,
                 amount: String(amount),
                 tokenId: defaultInfo.tokenId,
-              };
+              });
             }
           }
         }
@@ -211,25 +234,27 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
           const firstEntry = coinData[0];
           if (Array.isArray(firstEntry) && firstEntry.length === 2) {
             const [coinIdHex, amount] = firstEntry;
-            return {
+            return enrichWithRegistry({
               coinId: String(coinIdHex),
               symbol: String(coinIdHex).slice(0, 8),
               name: `Token ${String(coinIdHex).slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount),
               tokenId: genesis.tokenId,
-            };
+            });
           }
         } else if (typeof coinData === 'object') {
           const coinEntries = Object.entries(coinData);
           if (coinEntries.length > 0) {
             const [coinId, amount] = coinEntries[0] as [string, unknown];
-            return {
+            return enrichWithRegistry({
               coinId,
               symbol: coinId.slice(0, 8),
               name: `Token ${coinId.slice(0, 8)}`,
+              decimals: 0,
               amount: String(amount),
               tokenId: genesis.tokenId,
-            };
+            });
           }
         }
       }
@@ -246,25 +271,27 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
         const firstEntry = coinData[0];
         if (Array.isArray(firstEntry) && firstEntry.length === 2) {
           const [coinIdHex, amount] = firstEntry;
-          return {
+          return enrichWithRegistry({
             coinId: String(coinIdHex),
             symbol: String(coinIdHex).slice(0, 8),
             name: `Token ${String(coinIdHex).slice(0, 8)}`,
+            decimals: 0,
             amount: String(amount),
             tokenId: defaultInfo.tokenId,
-          };
+          });
         }
       } else if (typeof coinData === 'object') {
         const coinEntries = Object.entries(coinData);
         if (coinEntries.length > 0) {
           const [coinId, amount] = coinEntries[0] as [string, unknown];
-          return {
+          return enrichWithRegistry({
             coinId,
             symbol: coinId.slice(0, 8),
             name: `Token ${coinId.slice(0, 8)}`,
+            decimals: 0,
             amount: String(amount),
             tokenId: defaultInfo.tokenId,
-          };
+          });
         }
       }
     }
@@ -548,12 +575,13 @@ export class PaymentsModule {
   initialize(deps: PaymentsModuleDependencies): void {
     this.deps = deps;
 
-    // Initialize L1 sub-module with chain code and addresses (if enabled)
+    // Initialize L1 sub-module with chain code, addresses, and transport (if enabled)
     if (this.l1) {
       this.l1.initialize({
         identity: deps.identity,
         chainCode: deps.chainCode,
         addresses: deps.l1Addresses,
+        transport: deps.transport,
       });
     }
 
@@ -583,58 +611,32 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
-    // Load from key-value storage
-    const data = await this.deps!.storage.get(STORAGE_KEYS.TOKENS);
-    if (data) {
+    // Load from TokenStorageProviders (IndexedDB/files)
+    const providers = this.getTokenStorageProviders();
+    for (const [id, provider] of providers) {
       try {
-        const parsed = JSON.parse(data);
-
-        // Load tokens
-        const tokens = parsed.tokens as Token[] || [];
-        this.tokens.clear();
-        for (const token of tokens) {
-          this.tokens.set(token.id, token);
+        const result = await provider.load();
+        if (result.success && result.data) {
+          this.loadFromStorageData(result.data);
+          this.log(`Loaded from provider ${id}: ${this.tokens.size} tokens`);
+          break; // Use first successful provider
         }
-
-        // Load tombstones
-        if (Array.isArray(parsed.tombstones)) {
-          this.tombstones = parsed.tombstones.filter(
-            (t: unknown) =>
-              typeof t === 'object' && t !== null &&
-              typeof (t as TombstoneEntry).tokenId === 'string' &&
-              typeof (t as TombstoneEntry).stateHash === 'string'
-          );
-        }
-
-        // Load archived tokens
-        if (parsed.archivedTokens && typeof parsed.archivedTokens === 'object') {
-          this.archivedTokens = new Map(Object.entries(parsed.archivedTokens));
-        }
-
-        // Load forked tokens
-        if (parsed.forkedTokens && typeof parsed.forkedTokens === 'object') {
-          this.forkedTokens = new Map(Object.entries(parsed.forkedTokens));
-        }
-
-        // Load nametag
-        if (parsed.nametag) {
-          this.nametag = parsed.nametag;
-        }
-
-        this.log(`Loaded ${this.tokens.size} tokens, ${this.tombstones.length} tombstones, ${this.archivedTokens.size} archived`);
       } catch (err) {
-        console.error('[Payments] Failed to parse stored data:', err);
+        console.error(`[Payments] Failed to load from provider ${id}:`, err);
       }
     }
 
-    // Load tokens from file storage providers (lottery compatibility)
-    await this.loadTokensFromFileStorage();
+    // Legacy: Load tokens from file storage (lottery compatibility)
+    if (this.tokens.size === 0) {
+      await this.loadTokensFromFileStorage();
+    }
 
-    // Load nametag from file storage (lottery compatibility)
+    // Load nametag from file storage (nametag-{name}.json)
+    // This is the primary source for nametag data now
     await this.loadNametagFromFileStorage();
 
     // Load transaction history
-    const historyData = await this.deps!.storage.get(STORAGE_KEYS.TRANSACTION_HISTORY);
+    const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
     if (historyData) {
       try {
         this.transactionHistory = JSON.parse(historyData);
@@ -644,7 +646,7 @@ export class PaymentsModule {
     }
 
     // Load pending transfers
-    const pending = await this.deps!.storage.get(STORAGE_KEYS.PENDING_TRANSFERS);
+    const pending = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
     if (pending) {
       const transfers = JSON.parse(pending) as TransferResult[];
       for (const transfer of transfers) {
@@ -777,6 +779,8 @@ export class PaymentsModule {
           coinId: request.coinId,
           symbol: this.getCoinSymbol(request.coinId),
           name: this.getCoinName(request.coinId),
+          decimals: this.getCoinDecimals(request.coinId),
+          iconUrl: this.getCoinIconUrl(request.coinId),
           amount: splitPlan.remainderAmount!.toString(),
           status: 'confirmed',
           createdAt: Date.now(),
@@ -881,22 +885,28 @@ export class PaymentsModule {
    * Get coin symbol from coinId
    */
   private getCoinSymbol(coinId: string): string {
-    // Common coin mappings
-    const symbols: Record<string, string> = {
-      'UCT': 'UCT',
-      // Add more as needed
-    };
-    return symbols[coinId] || coinId.slice(0, 6).toUpperCase();
+    return TokenRegistry.getInstance().getSymbol(coinId);
   }
 
   /**
    * Get coin name from coinId
    */
   private getCoinName(coinId: string): string {
-    const names: Record<string, string> = {
-      'UCT': 'Unicity Token',
-    };
-    return names[coinId] || coinId;
+    return TokenRegistry.getInstance().getName(coinId);
+  }
+
+  /**
+   * Get coin decimals from coinId
+   */
+  private getCoinDecimals(coinId: string): number {
+    return TokenRegistry.getInstance().getDecimals(coinId);
+  }
+
+  /**
+   * Get coin icon URL from coinId
+   */
+  private getCoinIconUrl(coinId: string): string | undefined {
+    return TokenRegistry.getInstance().getIconUrl(coinId) ?? undefined;
   }
 
   // ===========================================================================
@@ -1099,7 +1109,7 @@ export class PaymentsModule {
     // Convert transport request to IncomingPaymentRequest
     const request: IncomingPaymentRequest = {
       id: transportRequest.id,
-      senderPubkey: transportRequest.senderPubkey,
+      senderPubkey: transportRequest.senderTransportPubkey,
       amount: transportRequest.request.amount,
       coinId: transportRequest.request.coinId,
       symbol: transportRequest.request.coinId, // Use coinId as symbol for now
@@ -1237,7 +1247,7 @@ export class PaymentsModule {
     // Convert transport response to PaymentRequestResponse
     const response: PaymentRequestResponse = {
       id: transportResponse.id,
-      responderPubkey: transportResponse.responderPubkey,
+      responderPubkey: transportResponse.responderTransportPubkey,
       requestId: transportResponse.response.requestId,
       responseType: transportResponse.response.responseType,
       message: transportResponse.response.message,
@@ -1506,6 +1516,8 @@ export class PaymentsModule {
               coinId: tokenInfo.coinId,
               symbol: tokenInfo.symbol,
               name: tokenInfo.name,
+              decimals: tokenInfo.decimals,
+              iconUrl: tokenInfo.iconUrl,
               amount: tokenInfo.amount,
               status: 'confirmed',
               createdAt: (data.receivedAt as number) || Date.now(),
@@ -1830,7 +1842,7 @@ export class PaymentsModule {
     this.transactionHistory.push(historyEntry);
 
     await this.deps!.storage.set(
-      STORAGE_KEYS.TRANSACTION_HISTORY,
+      STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
       JSON.stringify(this.transactionHistory)
     );
   }
@@ -2203,7 +2215,28 @@ export class PaymentsModule {
   // Private: Transfer Operations
   // ===========================================================================
 
+  /**
+   * Detect if a string is an L3 address (not a nametag)
+   * Returns true for: hex pubkeys (64+ chars), PROXY:, DIRECT: prefixed addresses
+   */
+  private isL3Address(value: string): boolean {
+    // PROXY: or DIRECT: prefixed addresses
+    if (value.startsWith('PROXY:') || value.startsWith('DIRECT:')) {
+      return true;
+    }
+    // Hex pubkey (64+ hex chars)
+    if (value.length >= 64 && /^[0-9a-fA-F]+$/.test(value)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Resolve recipient to Nostr pubkey for messaging
+   * Supports: nametag (with or without @), hex pubkey
+   */
   private async resolveRecipient(recipient: string): Promise<string> {
+    // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
       const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
@@ -2212,7 +2245,26 @@ export class PaymentsModule {
       }
       return pubkey;
     }
-    return recipient;
+
+    // If it looks like an L3 address, return as-is (it's a pubkey)
+    if (this.isL3Address(recipient)) {
+      return recipient;
+    }
+
+    // Smart detection: try as nametag first
+    if (this.deps?.transport.resolveNametag) {
+      const pubkey = await this.deps.transport.resolveNametag(recipient);
+      if (pubkey) {
+        this.log(`Resolved "${recipient}" as nametag to pubkey`);
+        return pubkey;
+      }
+    }
+
+    // If not found as nametag and doesn't look like an address, throw error
+    throw new Error(
+      `Recipient "${recipient}" is not a valid nametag or address. ` +
+      `Use @nametag for explicit nametag or a valid hex pubkey/PROXY:/DIRECT: address.`
+    );
   }
 
   /**
@@ -2258,22 +2310,97 @@ export class PaymentsModule {
   }
 
   /**
-   * Resolve recipient to IAddress
+   * Create DirectAddress from a public key using UnmaskedPredicateReference
    */
-  private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
-    // If it's a nametag, resolve via TokenId
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const tokenId = await TokenId.fromNameTag(nametag);
-      return ProxyAddress.fromTokenId(tokenId);
+  private async createDirectAddressFromPubkey(pubkeyHex: string): Promise<IAddress> {
+    const { UnmaskedPredicateReference } = await import('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference');
+    const { TokenType } = await import('@unicitylabs/state-transition-sdk/lib/token/TokenType');
+
+    // Same token type used for address creation throughout the SDK
+    const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
+    const tokenType = new TokenType(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
+
+    // Convert hex pubkey to bytes
+    const pubkeyBytes = new Uint8Array(
+      pubkeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    );
+
+    // Create predicate reference with secp256k1 algorithm
+    const addressRef = await UnmaskedPredicateReference.create(
+      tokenType,
+      'secp256k1',
+      pubkeyBytes,
+      HashAlgorithm.SHA256
+    );
+
+    return addressRef.toAddress();
+  }
+
+  /**
+   * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
+   * Returns null if nametag not found or publicKey not available
+   */
+  private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
+    if (!this.deps?.transport.resolveNametagInfo) {
+      this.log('resolveNametagInfo not available on transport');
+      return null;
     }
 
-    // If it's a pubkey, create proxy address from it
-    const pubkeyBytes = new Uint8Array(
-      recipient.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+    const info = await this.deps.transport.resolveNametagInfo(nametag);
+    if (!info) {
+      this.log(`Nametag "${nametag}" not found`);
+      return null;
+    }
+
+    if (!info.chainPubkey) {
+      this.log(`Nametag "${nametag}" has no 33-byte chainPubkey (legacy event)`);
+      return null;
+    }
+
+    return info.chainPubkey;
+  }
+
+  /**
+   * Resolve recipient to IAddress for L3 transfers
+   * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
+   */
+  private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
+    const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
+
+    // Explicit nametag with @ - resolve to 33-byte pubkey and use DirectAddress
+    if (recipient.startsWith('@')) {
+      const nametag = recipient.slice(1);
+      const publicKey = await this.resolveNametagToPublicKey(nametag);
+      if (publicKey) {
+        this.log(`Resolved @${nametag} to 33-byte publicKey for DirectAddress`);
+        return this.createDirectAddressFromPubkey(publicKey);
+      }
+      throw new Error(`Nametag "${nametag}" not found or missing publicKey`);
+    }
+
+    // PROXY: or DIRECT: prefixed - parse using AddressFactory
+    if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
+      return AddressFactory.createAddress(recipient);
+    }
+
+    // If it looks like a hex pubkey (66 chars = 33 bytes compressed), create DirectAddress
+    if (recipient.length === 66 && /^[0-9a-fA-F]+$/.test(recipient)) {
+      this.log(`Creating DirectAddress from 33-byte compressed pubkey`);
+      return this.createDirectAddressFromPubkey(recipient);
+    }
+
+    // Smart detection: try as nametag - resolve to 33-byte pubkey and use DirectAddress
+    const publicKey = await this.resolveNametagToPublicKey(recipient);
+    if (publicKey) {
+      this.log(`Resolved "${recipient}" as nametag to 33-byte publicKey for DirectAddress`);
+      return this.createDirectAddressFromPubkey(publicKey);
+    }
+
+    // Not found as nametag and doesn't look like an address
+    throw new Error(
+      `Recipient "${recipient}" is not a valid nametag or L3 address. ` +
+      `Use @nametag for explicit nametag or a valid 33-byte hex pubkey/PROXY:/DIRECT: address.`
     );
-    const tokenId = new TokenId(pubkeyBytes.slice(0, 32));
-    return ProxyAddress.fromTokenId(tokenId);
   }
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
@@ -2355,8 +2482,44 @@ export class PaymentsModule {
             }
           }
         } else {
-          // Direct address - no finalization needed
-          tokenData = sourceTokenInput;
+          // Direct address - finalize to generate local state for tracking
+          this.log('Finalizing DIRECT address transfer for state tracking...');
+          try {
+            const signingService = await this.createSigningService();
+            const transferSalt = transferTx.data.salt;
+
+            const recipientPredicate = await UnmaskedPredicate.create(
+              sourceToken.id,
+              sourceToken.type,
+              signingService,
+              HashAlgorithm.SHA256,
+              transferSalt
+            );
+
+            const recipientState = new TokenState(recipientPredicate, null);
+
+            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+            if (!stClient || !trustBase) {
+              this.log('Cannot finalize DIRECT transfer - missing client, using source token');
+              tokenData = sourceTokenInput;
+            } else {
+              finalizedSdkToken = await stClient.finalizeTransaction(
+                trustBase,
+                sourceToken,
+                recipientState,
+                transferTx,
+                []  // No nametag tokens needed for DIRECT
+              );
+              tokenData = finalizedSdkToken.toJSON();
+              this.log('DIRECT transfer finalized successfully');
+            }
+          } catch (finalizeError) {
+            this.log('DIRECT finalization failed, using source token:', finalizeError);
+            tokenData = sourceTokenInput;
+          }
         }
       } else if (payload.token) {
         // SDK format
@@ -2382,6 +2545,8 @@ export class PaymentsModule {
         coinId: tokenInfo.coinId,
         symbol: tokenInfo.symbol,
         name: tokenInfo.name,
+        decimals: tokenInfo.decimals,
+        iconUrl: tokenInfo.iconUrl,
         amount: tokenInfo.amount,
         status: 'confirmed',
         createdAt: Date.now(),
@@ -2403,7 +2568,7 @@ export class PaymentsModule {
 
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
-        senderPubkey: transfer.senderPubkey,
+        senderPubkey: transfer.senderTransportPubkey,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
@@ -2450,52 +2615,53 @@ export class PaymentsModule {
   // ===========================================================================
 
   private async save(): Promise<void> {
-    const tokens = Array.from(this.tokens.values());
+    // Save to TokenStorageProviders (IndexedDB/files)
+    const providers = this.getTokenStorageProviders();
+    if (providers.size === 0) {
+      this.log('No token storage providers - tokens not persisted');
+      return;
+    }
 
-    const data = {
-      tokens,
-      tombstones: this.tombstones.length > 0 ? this.tombstones : undefined,
-      archivedTokens: this.archivedTokens.size > 0
-        ? Object.fromEntries(this.archivedTokens)
-        : undefined,
-      forkedTokens: this.forkedTokens.size > 0
-        ? Object.fromEntries(this.forkedTokens)
-        : undefined,
-      nametag: this.nametag || undefined,
-    };
-
-    await this.deps!.storage.set(STORAGE_KEYS.TOKENS, JSON.stringify(data));
+    const data = await this.createStorageData();
+    for (const [id, provider] of providers) {
+      try {
+        await provider.save(data);
+      } catch (err) {
+        console.error(`[Payments] Failed to save to provider ${id}:`, err);
+      }
+    }
   }
 
   private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
     const outbox = await this.loadOutbox();
     outbox.push({ transfer, recipient, createdAt: Date.now() });
-    await this.deps!.storage.set(STORAGE_KEYS.OUTBOX, JSON.stringify(outbox));
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(outbox));
   }
 
   private async removeFromOutbox(transferId: string): Promise<void> {
     const outbox = await this.loadOutbox();
     const filtered = outbox.filter((e) => e.transfer.id !== transferId);
-    await this.deps!.storage.set(STORAGE_KEYS.OUTBOX, JSON.stringify(filtered));
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(filtered));
   }
 
   private async loadOutbox(): Promise<Array<{ transfer: TransferResult; recipient: string; createdAt: number }>> {
-    const data = await this.deps!.storage.get(STORAGE_KEYS.OUTBOX);
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
     return data ? JSON.parse(data) : [];
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
     const tokens = Array.from(this.tokens.values());
 
+    // Note: nametag is NOT passed here - it's saved separately via saveNametagToFileStorage()
+    // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
       tokens,
       {
         version: 1,
-        address: this.deps!.identity.address,
+        address: this.deps!.identity.l1Address,
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {
-        nametag: this.nametag || undefined,
         tombstones: this.tombstones,
         archivedTokens: this.archivedTokens,
         forkedTokens: this.forkedTokens,

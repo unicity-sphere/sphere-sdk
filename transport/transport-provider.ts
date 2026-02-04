@@ -20,9 +20,10 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Send encrypted direct message
+   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
    * @returns Event ID
    */
-  sendMessage(recipientPubkey: string, content: string): Promise<string>;
+  sendMessage(recipientTransportPubkey: string, content: string): Promise<string>;
 
   /**
    * Subscribe to incoming direct messages
@@ -32,9 +33,10 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Send token transfer payload
+   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
    * @returns Event ID
    */
-  sendTokenTransfer(recipientPubkey: string, payload: TokenTransferPayload): Promise<string>;
+  sendTokenTransfer(recipientTransportPubkey: string, payload: TokenTransferPayload): Promise<string>;
 
   /**
    * Subscribe to incoming token transfers
@@ -48,10 +50,26 @@ export interface TransportProvider extends BaseProvider {
   resolveNametag?(nametag: string): Promise<string | null>;
 
   /**
+   * Resolve nametag to full address information
+   * Returns transportPubkey, chainPubkey, l1Address, directAddress, proxyAddress
+   */
+  resolveNametagInfo?(nametag: string): Promise<NametagInfo | null>;
+
+  /**
+   * Recover nametag for current identity by decrypting stored encrypted nametag
+   * Used after wallet import to recover associated nametag
+   * @returns Decrypted nametag or null if none found
+   */
+  recoverNametag?(): Promise<string | null>;
+
+  /**
    * Register a nametag for this identity
+   * @param nametag - Nametag to register
+   * @param chainPubkey - 33-byte compressed secp256k1 public key (for L1/L3)
+   * @param directAddress - L3 DIRECT address (DIRECT://...)
    * @returns true if successful, false if already taken
    */
-  registerNametag?(nametag: string, publicKey: string): Promise<boolean>;
+  registerNametag?(nametag: string, chainPubkey: string, directAddress: string): Promise<boolean>;
 
   /**
    * Publish nametag binding
@@ -74,9 +92,10 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Send payment request to a recipient
+   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
    * @returns Event ID
    */
-  sendPaymentRequest?(recipientPubkey: string, request: PaymentRequestPayload): Promise<string>;
+  sendPaymentRequest?(recipientTransportPubkey: string, request: PaymentRequestPayload): Promise<string>;
 
   /**
    * Subscribe to incoming payment requests
@@ -86,10 +105,11 @@ export interface TransportProvider extends BaseProvider {
 
   /**
    * Send response to a payment request
+   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
    * @returns Event ID
    */
   sendPaymentRequestResponse?(
-    recipientPubkey: string,
+    recipientTransportPubkey: string,
     response: PaymentRequestResponsePayload
   ): Promise<string>;
 
@@ -142,7 +162,8 @@ export interface TransportProvider extends BaseProvider {
 
 export interface IncomingMessage {
   id: string;
-  senderPubkey: string;
+  /** Transport-specific pubkey of sender */
+  senderTransportPubkey: string;
   content: string;
   timestamp: number;
   encrypted: boolean;
@@ -163,14 +184,16 @@ export interface TokenTransferPayload {
   memo?: string;
   /** Sender info */
   sender?: {
-    pubkey: string;
+    /** Transport-specific pubkey */
+    transportPubkey: string;
     nametag?: string;
   };
 }
 
 export interface IncomingTokenTransfer {
   id: string;
-  senderPubkey: string;
+  /** Transport-specific pubkey of sender */
+  senderTransportPubkey: string;
   payload: TokenTransferPayload;
   timestamp: number;
 }
@@ -197,8 +220,8 @@ export interface PaymentRequestPayload {
 export interface IncomingPaymentRequest {
   /** Event ID */
   id: string;
-  /** Sender's public key */
-  senderPubkey: string;
+  /** Transport-specific pubkey of sender */
+  senderTransportPubkey: string;
   /** Parsed request data */
   request: {
     requestId: string;
@@ -234,8 +257,8 @@ export interface PaymentRequestResponsePayload {
 export interface IncomingPaymentRequestResponse {
   /** Event ID */
   id: string;
-  /** Responder's public key */
-  responderPubkey: string;
+  /** Transport-specific pubkey of responder */
+  responderTransportPubkey: string;
   /** Parsed response data */
   response: {
     requestId: string;
@@ -255,7 +278,8 @@ export type PaymentRequestResponseHandler = (response: IncomingPaymentRequestRes
 
 export interface IncomingBroadcast {
   id: string;
-  authorPubkey: string;
+  /** Transport-specific pubkey of author */
+  authorTransportPubkey: string;
   content: string;
   tags: string[];
   timestamp: number;
@@ -295,3 +319,28 @@ export type TransportEventCallback = (event: TransportEvent) => void;
 export type TransportProviderFactory<TConfig, TProvider extends TransportProvider> = (
   config?: TConfig
 ) => TProvider;
+
+// =============================================================================
+// Nametag Info Types
+// =============================================================================
+
+/**
+ * Full nametag address information
+ * Used for resolving nametag to all address formats
+ */
+export interface NametagInfo {
+  /** Nametag name (without @) */
+  nametag: string;
+  /** Transport-specific pubkey (for messaging/encryption) */
+  transportPubkey: string;
+  /** 33-byte compressed secp256k1 public key (for L3 chain) */
+  chainPubkey: string;
+  /** L1 address (alpha1...) */
+  l1Address: string;
+  /** L3 DIRECT address (DIRECT://...) */
+  directAddress: string;
+  /** L3 PROXY address derived from nametag hash (PROXY:...) */
+  proxyAddress: string;
+  /** Event timestamp */
+  timestamp: number;
+}

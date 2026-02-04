@@ -28,11 +28,12 @@ export interface BaseProvider extends ProviderMetadata {
 // =============================================================================
 
 export interface Identity {
-  readonly publicKey: string;
+  /** 33-byte compressed secp256k1 public key (for L3 chain) */
+  readonly chainPubkey: string;
   /** L1 address (alpha1...) */
-  readonly address: string;
-  /** L3 predicate address (DIRECT://...) */
-  readonly predicateAddress?: string;
+  readonly l1Address: string;
+  /** L3 DIRECT address (DIRECT://...) */
+  readonly directAddress?: string;
   readonly ipnsName?: string;
   readonly nametag?: string;
 }
@@ -63,6 +64,8 @@ export interface Token {
   readonly coinId: string;
   readonly symbol: string;
   readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
   readonly amount: string;
   status: TokenStatus;
   readonly createdAt: number;
@@ -291,6 +294,7 @@ export type SphereEventType =
   | 'sync:error'
   | 'connection:changed'
   | 'nametag:registered'
+  | 'nametag:recovered'
   | 'identity:changed';
 
 export interface SphereEventMap {
@@ -310,7 +314,8 @@ export interface SphereEventMap {
   'sync:error': { source: string; error: string };
   'connection:changed': { provider: string; connected: boolean };
   'nametag:registered': { nametag: string; addressIndex: number };
-  'identity:changed': { address: string; predicateAddress?: string; publicKey: string; nametag?: string; addressIndex: number };
+  'nametag:recovered': { nametag: string };
+  'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
