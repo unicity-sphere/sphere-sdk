@@ -149,6 +149,9 @@ export const TEST_AGGREGATOR_URL = 'https://goggregator-test.unicity.network' as
 /** Default aggregator request timeout (ms) */
 export const DEFAULT_AGGREGATOR_TIMEOUT = 30000;
 
+/** Default API key for aggregator authentication */
+export const DEFAULT_AGGREGATOR_API_KEY = 'sk_06365a9c44654841a366068bcfc68986' as const;
+
 // =============================================================================
 // IPFS Defaults
 // =============================================================================
