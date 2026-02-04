@@ -1131,9 +1131,16 @@ export class PaymentsModule {
         signingService,
         senderPubkey,
         {
-          findNametagToken: async (proxyAddress: string) => {
-            // Look up nametag token from storage
-            // This would need to be implemented based on storage structure
+          findNametagToken: async (_proxyAddress: string) => {
+            // Return nametag token if available
+            if (this.nametag?.token) {
+              try {
+                return await SdkToken.fromJSON(this.nametag.token);
+              } catch (err) {
+                this.log('Failed to parse nametag token:', err);
+                return null;
+              }
+            }
             return null;
           },
         }
@@ -2697,7 +2704,32 @@ export class PaymentsModule {
     try {
       // Check payload format - Sphere wallet sends { sourceToken, transferTx }
       // SDK format is { token, proof }
+      // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
+
+      // Check for INSTANT_SPLIT bundle first (V4 or V5)
+      if (isInstantSplitBundle(payload)) {
+        this.log('Processing INSTANT_SPLIT bundle...');
+        try {
+          // Ensure nametag is loaded before processing (needed for PROXY address verification)
+          if (!this.nametag) {
+            await this.loadNametagFromFileStorage();
+          }
+
+          const result = await this.processInstantSplitBundle(
+            payload as InstantSplitBundle,
+            transfer.senderTransportPubkey
+          );
+          if (result.success) {
+            this.log('INSTANT_SPLIT processed successfully');
+          } else {
+            console.warn('[Payments] INSTANT_SPLIT processing failed:', result.error);
+          }
+        } catch (err) {
+          console.error('[Payments] INSTANT_SPLIT processing error:', err);
+        }
+        return;
+      }
 
       let tokenData: unknown;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
