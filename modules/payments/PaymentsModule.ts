@@ -2638,7 +2638,8 @@ export class PaymentsModule {
 
   /**
    * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
-   * Returns null if nametag not found or publicKey not available
+   * Returns null if nametag not found
+   * For legacy nametags without chainPubkey, derives from Nostr pubkey (x-only -> 02 prefix)
    */
   private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
     if (!this.deps?.transport.resolveNametagInfo) {
@@ -2652,12 +2653,21 @@ export class PaymentsModule {
       return null;
     }
 
-    if (!info.chainPubkey) {
-      this.log(`Nametag "${nametag}" has no 33-byte chainPubkey (legacy event)`);
-      return null;
+    // Use chainPubkey if available (new format)
+    if (info.chainPubkey) {
+      return info.chainPubkey;
     }
 
-    return info.chainPubkey;
+    // Fallback: derive 33-byte compressed pubkey from 32-byte Nostr pubkey
+    // Nostr uses x-only pubkeys (BIP-340), which always have even Y parity (02 prefix)
+    if (info.transportPubkey && info.transportPubkey.length === 64) {
+      const compressedPubkey = '02' + info.transportPubkey;
+      this.log(`Derived 33-byte pubkey from Nostr pubkey for legacy nametag "${nametag}"`);
+      return compressedPubkey;
+    }
+
+    this.log(`Nametag "${nametag}" has no usable public key`);
+    return null;
   }
 
   /**
@@ -2675,7 +2685,8 @@ export class PaymentsModule {
         this.log(`Resolved @${nametag} to 33-byte publicKey for DirectAddress`);
         return this.createDirectAddressFromPubkey(publicKey);
       }
-      throw new Error(`Nametag "${nametag}" not found or missing publicKey`);
+
+      throw new Error(`Nametag "@${nametag}" not found`);
     }
 
     // PROXY: or DIRECT: prefixed - parse using AddressFactory

@@ -387,7 +387,7 @@ async function main() {
         if (!recipient || !amountStr) {
           console.error('Usage: send <recipient> <amount> [--coin <symbol>]');
           console.error('  recipient: @nametag or DIRECT:// address');
-          console.error('  amount: in smallest units');
+          console.error('  amount: decimal amount (e.g., 0.5, 100)');
           console.error('  --coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
           process.exit(1);
         }
@@ -396,22 +396,27 @@ async function main() {
         const coinIndex = args.indexOf('--coin');
         const coinSymbol = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
 
-        // Resolve symbol to coinId hex
+        // Resolve symbol to coinId hex and get decimals
         const registry = TokenRegistry.getInstance();
-        const coinIdHex = registry.getCoinIdBySymbol(coinSymbol);
-        if (!coinIdHex) {
+        const coinDef = registry.getDefinitionBySymbol(coinSymbol);
+        if (!coinDef) {
           console.error(`Unknown coin symbol: ${coinSymbol}`);
           console.error('Available symbols: UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT');
           process.exit(1);
         }
+        const coinIdHex = coinDef.id;
+        const decimals = coinDef.decimals ?? 8;
+
+        // Convert amount to smallest units (supports decimal input like "0.2")
+        const amountSmallest = toSmallestUnit(amountStr, decimals).toString();
 
         const sphere = await getSphere();
 
-        console.log(`\nSending ${toHumanReadable(amountStr)} ${coinSymbol} to ${recipient}...`);
+        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}...`);
 
         const result = await sphere.payments.send({
           recipient,
-          amount: amountStr,
+          amount: amountSmallest,
           coinId: coinIdHex,
         });
 
