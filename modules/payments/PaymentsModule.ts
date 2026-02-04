@@ -611,14 +611,15 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
-    // Load from TokenStorageProviders (IndexedDB/files)
+    // Load metadata from TokenStorageProviders (archived, tombstones, forked)
+    // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
     const providers = this.getTokenStorageProviders();
     for (const [id, provider] of providers) {
       try {
         const result = await provider.load();
         if (result.success && result.data) {
           this.loadFromStorageData(result.data);
-          this.log(`Loaded from provider ${id}: ${this.tokens.size} tokens`);
+          this.log(`Loaded metadata from provider ${id}`);
           break; // Use first successful provider
         }
       } catch (err) {
@@ -626,10 +627,8 @@ export class PaymentsModule {
       }
     }
 
-    // Legacy: Load tokens from file storage (lottery compatibility)
-    if (this.tokens.size === 0) {
-      await this.loadTokensFromFileStorage();
-    }
+    // Load active tokens from token-xxx files (primary storage for tokens)
+    await this.loadTokensFromFileStorage();
 
     // Load nametag from file storage (nametag-{name}.json)
     // This is the primary source for nametag data now
@@ -1472,7 +1471,9 @@ export class PaymentsModule {
       if (!provider.listTokenIds || !provider.getToken) continue;
 
       try {
-        const tokenIds = await provider.listTokenIds();
+        const allIds = await provider.listTokenIds();
+        // Only load token-xxx entries (not archived-, nametag-, or raw hex IDs)
+        const tokenIds = allIds.filter(id => id.startsWith('token-'));
         this.log(`Found ${tokenIds.length} token files in ${providerId}`);
 
         for (const tokenId of tokenIds) {
@@ -1539,10 +1540,7 @@ export class PaymentsModule {
       }
     }
 
-    // Save to key-value storage to sync
-    if (this.tokens.size > 0) {
-      await this.save();
-    }
+    this.log(`Loaded ${this.tokens.size} tokens from file storage`);
   }
 
   /**
@@ -2650,12 +2648,13 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    const tokens = Array.from(this.tokens.values());
-
-    // Note: nametag is NOT passed here - it's saved separately via saveNametagToFileStorage()
+    // Active tokens are NOT stored in TXF format - they are saved as individual
+    // token-xxx files via saveTokenToFileStorage() to avoid duplication.
+    // TXF storage is only used for metadata: archived, tombstones, forked, outbox.
+    // Note: nametag is also saved separately via saveNametagToFileStorage()
     // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
-      tokens,
+      [], // Empty - active tokens stored as token-xxx files
       {
         version: 1,
         address: this.deps!.identity.l1Address,

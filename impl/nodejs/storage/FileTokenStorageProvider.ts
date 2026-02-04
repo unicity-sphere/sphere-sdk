@@ -87,10 +87,23 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
 
       for (const file of files) {
         try {
+          const basename = path.basename(file, '.json');
+          // Skip file-format entries (token-, nametag-) - they are loaded via loadTokensFromFileStorage
+          if (basename.startsWith('token-') || basename.startsWith('nametag-')) {
+            continue;
+          }
+
           const content = fs.readFileSync(path.join(this.tokensDir, file), 'utf-8');
           const token = JSON.parse(content);
-          const key = `_${path.basename(file, '.json')}` as `_${string}`;
-          data[key] = token;
+
+          if (basename.startsWith('archived-')) {
+            // Archived tokens: keep as-is (archived-tokenId key)
+            data[basename as keyof TxfStorageDataBase] = token;
+          } else {
+            // Other entries: add _ prefix for TXF format
+            const key = `_${basename}` as `_${string}`;
+            data[key] = token;
+          }
         } catch {
           // Skip invalid files
         }
@@ -120,12 +133,22 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
         JSON.stringify(data._meta, null, 2)
       );
 
-      // Save each token
+      // Save each token (active tokens start with _, archived with archived-)
+      const reservedKeys = ['_meta', '_tombstones', '_outbox', '_sent', '_invalid'];
       for (const [key, value] of Object.entries(data)) {
-        if (key.startsWith('_') && key !== '_meta' && key !== '_tombstones' && key !== '_outbox' && key !== '_sent' && key !== '_invalid') {
+        if (reservedKeys.includes(key)) continue;
+
+        if (key.startsWith('_')) {
+          // Active token: _tokenId -> tokenId.json
           const tokenId = key.slice(1);
           fs.writeFileSync(
             path.join(this.tokensDir, `${tokenId}.json`),
+            JSON.stringify(value, null, 2)
+          );
+        } else if (key.startsWith('archived-')) {
+          // Archived token: archived-tokenId -> archived-tokenId.json (keep prefix)
+          fs.writeFileSync(
+            path.join(this.tokensDir, `${key}.json`),
             JSON.stringify(value, null, 2)
           );
         }

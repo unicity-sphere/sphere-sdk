@@ -240,7 +240,7 @@ export interface TokenValidationResult {
 // Key Utilities
 // =============================================================================
 
-const ARCHIVED_PREFIX = '_archived_';
+const ARCHIVED_PREFIX = 'archived-';
 const FORKED_PREFIX = '_forked_';
 const RESERVED_KEYS = ['_meta', '_nametag', '_tombstones', '_invalidatedNametags', '_outbox', '_mintOutbox', '_sent', '_invalid', '_integrity'];
 
