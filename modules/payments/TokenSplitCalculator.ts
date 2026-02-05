@@ -53,28 +53,13 @@ export class TokenSplitCalculator {
     targetAmount: bigint,
     targetCoinIdHex: string
   ): Promise<SplitPlan | null> {
-    console.log(
-      `[SplitCalculator] Calculating split for ${targetAmount} of ${targetCoinIdHex}`
-    );
-    console.log(`[SplitCalculator] Available tokens: ${availableTokens.length}`);
-
     const candidates: TokenWithAmount[] = [];
 
     // Build candidate list from available tokens
     for (const t of availableTokens) {
-      console.log(`[SplitCalculator] Token ${t.id}: coinId=${t.coinId}, status=${t.status}, hasSdkData=${!!t.sdkData}`);
-      if (t.coinId !== targetCoinIdHex) {
-        console.log(`[SplitCalculator] Skipping token ${t.id}: coinId mismatch (${t.coinId} !== ${targetCoinIdHex})`);
-        continue;
-      }
-      if (t.status !== 'confirmed') {
-        console.log(`[SplitCalculator] Skipping token ${t.id}: status is ${t.status}`);
-        continue;
-      }
-      if (!t.sdkData) {
-        console.log(`[SplitCalculator] Skipping token ${t.id}: no sdkData`);
-        continue;
-      }
+      if (t.coinId !== targetCoinIdHex) continue;
+      if (t.status !== 'confirmed') continue;
+      if (!t.sdkData) continue;
 
       try {
         const parsed = JSON.parse(t.sdkData);
@@ -111,7 +96,6 @@ export class TokenSplitCalculator {
     // Strategy 1: Find exact match
     const exactMatch = candidates.find((t) => t.amount === targetAmount);
     if (exactMatch) {
-      console.log('[SplitCalculator] Found exact match token');
       return this.createDirectPlan([exactMatch], targetAmount, targetCoinIdHex);
     }
 
@@ -120,7 +104,6 @@ export class TokenSplitCalculator {
     for (let size = 2; size <= maxCombinationSize; size++) {
       const combo = this.findCombinationOfSize(candidates, targetAmount, size);
       if (combo) {
-        console.log(`[SplitCalculator] Found exact combination of ${size} tokens`);
         return this.createDirectPlan(combo, targetAmount, targetCoinIdHex);
       }
     }
@@ -145,10 +128,6 @@ export class TokenSplitCalculator {
         const neededFromThisToken = targetAmount - currentSum;
         const remainderForSender = candidate.amount - neededFromThisToken;
 
-        console.log(
-          `[SplitCalculator] Split required. Sending: ${neededFromThisToken}, Remainder: ${remainderForSender}`
-        );
-
         return {
           tokensToTransferDirectly: toTransfer,
           tokenToSplit: candidate,
@@ -170,16 +149,10 @@ export class TokenSplitCalculator {
    */
   private getTokenBalance(sdkToken: SdkToken<any>, coinIdHex: string): bigint {
     try {
-      if (!sdkToken.coins) {
-        console.log('[SplitCalculator] Token has no coins');
-        return 0n;
-      }
+      if (!sdkToken.coins) return 0n;
       const coinId = CoinId.fromJSON(coinIdHex);
-      const balance = sdkToken.coins.get(coinId);
-      console.log(`[SplitCalculator] Token balance for ${coinIdHex.slice(0, 8)}...: ${balance ?? 0n}`);
-      return balance ?? 0n;
-    } catch (e) {
-      console.error('[SplitCalculator] Error getting token balance:', e);
+      return sdkToken.coins.get(coinId) ?? 0n;
+    } catch {
       return 0n;
     }
   }

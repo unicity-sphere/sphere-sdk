@@ -743,8 +743,6 @@ export class PaymentsModule {
         throw new Error('Insufficient balance');
       }
 
-      this.log(`Split plan: requiresSplit=${splitPlan.requiresSplit}, directTokens=${splitPlan.tokensToTransferDirectly.length}`);
-
       // Collect all tokens involved
       const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map(t => t.uiToken);
       if (splitPlan.tokenToSplit) {
@@ -802,11 +800,13 @@ export class PaymentsModule {
         this.log(`Change token saved: ${changeToken.id}, amount: ${changeToken.amount}`);
 
         // Send recipient token via Nostr (Sphere format)
+        console.log(`[Payments] Sending split token to ${recipientPubkey.slice(0, 8)}... via Nostr`);
         await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
           sourceToken: JSON.stringify(splitResult.tokenForRecipient.toJSON()),
           transferTx: JSON.stringify(splitResult.recipientTransferTx.toJSON()),
           memo: request.memo,
         } as unknown as import('../../transport').TokenTransferPayload);
+        console.log(`[Payments] Split token sent successfully`);
 
         // Remove the original token that was split
         await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
@@ -845,11 +845,13 @@ export class PaymentsModule {
           : String(requestIdBytes);
 
         // Send via transport (Nostr) - use Sphere-compatible format
+        console.log(`[Payments] Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}... via Nostr`);
         await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
           sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
           transferTx: JSON.stringify(transferTx.toJSON()),
           memo: request.memo,
         } as unknown as import('../../transport').TokenTransferPayload);
+        console.log(`[Payments] Direct token sent successfully`);
 
         this.log(`Token ${token.id} transferred, txHash: ${result.txHash}`);
 
@@ -2639,7 +2641,11 @@ export class PaymentsModule {
   /**
    * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
    * Returns null if nametag not found
-   * For legacy nametags without chainPubkey, derives from Nostr pubkey (x-only -> 02 prefix)
+   *
+   * NOTE: Legacy nametags without chainPubkey CANNOT be used for transfers.
+   * The transportPubkey (Nostr pubkey) is a different key from the L3 chainPubkey,
+   * so deriving one from the other is impossible. Legacy nametags must be re-registered
+   * with the new SDK format that includes chainPubkey.
    */
   private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
     if (!this.deps?.transport.resolveNametagInfo) {
@@ -2653,20 +2659,13 @@ export class PaymentsModule {
       return null;
     }
 
-    // Use chainPubkey if available (new format)
+    // Use chainPubkey if available (required for correct address derivation)
     if (info.chainPubkey) {
       return info.chainPubkey;
     }
 
-    // Fallback: derive 33-byte compressed pubkey from 32-byte Nostr pubkey
-    // Nostr uses x-only pubkeys (BIP-340), which always have even Y parity (02 prefix)
-    if (info.transportPubkey && info.transportPubkey.length === 64) {
-      const compressedPubkey = '02' + info.transportPubkey;
-      this.log(`Derived 33-byte pubkey from Nostr pubkey for legacy nametag "${nametag}"`);
-      return compressedPubkey;
-    }
-
-    this.log(`Nametag "${nametag}" has no usable public key`);
+    // Legacy nametag without chainPubkey - PROXY fallback will be used in resolveRecipientAddress
+    this.log(`Nametag "${nametag}" has no chainPubkey - will use PROXY address fallback`);
     return null;
   }
 
@@ -2684,6 +2683,14 @@ export class PaymentsModule {
       if (publicKey) {
         this.log(`Resolved @${nametag} to 33-byte publicKey for DirectAddress`);
         return this.createDirectAddressFromPubkey(publicKey);
+      }
+
+      // FALLBACK: Use PROXY address for legacy nametags without chainPubkey
+      const info = await this.deps?.transport.resolveNametagInfo?.(nametag);
+      if (info) {
+        const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+        this.log(`Using PROXY address for legacy nametag @${nametag}`);
+        return ProxyAddress.fromNameTag(nametag);
       }
 
       throw new Error(`Nametag "@${nametag}" not found`);
@@ -2705,6 +2712,14 @@ export class PaymentsModule {
     if (publicKey) {
       this.log(`Resolved "${recipient}" as nametag to 33-byte publicKey for DirectAddress`);
       return this.createDirectAddressFromPubkey(publicKey);
+    }
+
+    // FALLBACK: Use PROXY address for legacy nametags without chainPubkey
+    const info = await this.deps?.transport.resolveNametagInfo?.(recipient);
+    if (info) {
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      this.log(`Using PROXY address for legacy nametag "${recipient}"`);
+      return ProxyAddress.fromNameTag(recipient);
     }
 
     // Not found as nametag and doesn't look like an address
@@ -2751,6 +2766,7 @@ export class PaymentsModule {
 
       if (payload.sourceToken && payload.transferTx) {
         // Sphere wallet format - needs finalization for PROXY addresses
+        console.log('[Payments] Received Sphere wallet format transfer');
         this.log('Processing Sphere wallet format transfer...');
 
         const sourceTokenInput = typeof payload.sourceToken === 'string'
