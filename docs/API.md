@@ -106,9 +106,26 @@ Load and decrypt existing wallet.
 
 Import wallet from mnemonic phrase.
 
-#### `clear(): Promise<void>`
+#### `clear(storageOrOptions): Promise<void>`
 
-Delete all wallet data from storage.
+Delete all SDK-owned wallet data from storage. Accepts either a `StorageProvider` directly (legacy) or an options object with optional `tokenStorage`.
+
+```typescript
+// Recommended: clear wallet keys + token data
+await Sphere.clear({
+  storage: providers.storage,
+  tokenStorage: providers.tokenStorage,
+});
+
+// Legacy (backward compatible): clear wallet keys only
+await Sphere.clear(storage);
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `storageOrOptions` | `StorageProvider \| { storage, tokenStorage? }` | Storage provider or options object |
+| `options.storage` | `StorageProvider` | Key-value storage provider |
+| `options.tokenStorage` | `TokenStorageProvider` | Optional token storage to clear |
 
 ---
 

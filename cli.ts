@@ -118,6 +118,7 @@ WALLET MANAGEMENT:
   init [--network <net>]            Create new wallet (mainnet|testnet|dev)
   init --mnemonic "<words>"         Import wallet from mnemonic
   status                            Show wallet status and identity
+  clear                             Delete all wallet data (keys + tokens)
   config                            Show current configuration
   config set <key> <value>          Set configuration (network, dataDir, tokensDir)
 
@@ -293,6 +294,26 @@ async function main() {
           console.log('\nCurrent Configuration:');
           console.log(JSON.stringify(config, null, 2));
         }
+        break;
+      }
+
+      case 'clear': {
+        const config = loadConfig();
+        const providers = createNodeProviders({
+          network: config.network,
+          dataDir: config.dataDir,
+          tokensDir: config.tokensDir,
+        });
+
+        await providers.storage.connect();
+        await providers.tokenStorage.initialize();
+
+        console.log('Clearing all wallet data...');
+        await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+        console.log('All wallet data cleared.');
+
+        await providers.storage.disconnect();
+        await providers.tokenStorage.shutdown();
         break;
       }
 
