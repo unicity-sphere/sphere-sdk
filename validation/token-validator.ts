@@ -7,7 +7,7 @@
 
 import type { Token } from '../types';
 import type { TxfTransaction, ValidationIssue, TokenValidationResult } from '../types/txf';
-import { getCurrentStateHash, tokenToTxf } from '../serialization/txf-serializer';
+import { tokenToTxf } from '../serialization/txf-serializer';
 
 // =============================================================================
 // Types
@@ -297,14 +297,14 @@ export class TokenValidator {
   /**
    * Check which tokens are spent using SDK Token object to calculate state hash.
    *
-   * IMPORTANT: This follows the same approach as the Sphere webgui:
+   * Follows the same approach as the Sphere webgui TokenValidationService:
    * 1. Parse TXF using SDK's Token.fromJSON()
-   * 2. Calculate state hash via sdkToken.state.calculateHash()
+   * 2. Calculate CURRENT state hash via sdkToken.state.calculateHash()
    * 3. Create RequestId via RequestId.create(walletPubKey, calculatedHash)
    *
-   * The stored stateHash from getCurrentStateHash() can be STALE for received tokens.
-   * For received tokens, the state is updated with a new predicate (new owner),
-   * so the CURRENT state hash must be CALCULATED, not read from storage.
+   * Uses wallet's own pubkey (not source state predicate key) because "spent" means
+   * the CURRENT OWNER committed this state. Using the source state key would falsely
+   * detect received tokens as "spent" (sender's commitment matches source state).
    */
   async checkSpentTokens(
     tokens: Token[],
@@ -349,93 +349,38 @@ export class TokenValidator {
             // Parse TXF into SDK Token object (like webgui does)
             const sdkToken = await SdkToken.fromJSON(txf);
 
-            // NOTE: We skip ownership check here because:
-            // 1. Per TOKEN_INVENTORY_SPEC.md, ownership is verified in Step 5.2 (during token receipt)
-            // 2. Tokens in our storage have already been validated for ownership when received
-            // 3. Step 7 (Spent Detection) checks if our ALREADY-OWNED tokens have been spent
+            // Use SDK-calculated state hash + wallet's own public key for spent detection
+            // (matching webgui TokenValidationService approach)
             //
-            // For PROXY tokens that were finalized, the predicate is updated to use the wallet's
-            // predicate, but the isOwner() check may fail due to SDK implementation details.
-            // Since the token is already in our storage and was validated during receipt,
-            // we trust that it belongs to us.
-
-            // IMPORTANT: Use STORED state hash for spent detection
+            // Key insight: "spent" means the CURRENT OWNER has committed this state as input
+            // for another transition. So we check:
+            //   RequestId = hash(wallet_pubkey + current_state_hash)
+            // If the aggregator has an inclusion proof → we spent this token
+            // If exclusion proof → token is still ours (unspent)
             //
-            // For spent detection, we need to check the state hash that WAS COMMITTED to aggregator.
-            // The SDK-calculated hash reflects the CURRENT state (after local finalization),
-            // but if a token was SPENT, the commitment used the state hash BEFORE the spend.
-            //
-            // Priority:
-            // 1. Use stored stateHash from the token's last transaction (what was committed)
-            // 2. Fall back to SDK-calculated hash for tokens without transaction history
-            const storedStateHash = getCurrentStateHash(txf);
+            // Using the SOURCE STATE's predicate key would incorrectly detect received tokens
+            // as "spent" (because the sender's commitment matches the source state).
             const calculatedStateHash = await sdkToken.state.calculateHash();
             const calculatedStateHashStr = calculatedStateHash.toJSON();
 
-            // Prefer stored state hash if available (it's what was committed)
-            const stateHashStr = storedStateHash || calculatedStateHashStr;
-
-            // CRITICAL: Extract public key from the SOURCE STATE's predicate
-            //
-            // For spent detection, we need the public key that was used to SIGN the spending commitment.
-            // This is the public key in the SOURCE STATE's predicate (the state being spent),
-            // NOT the current state's predicate (which belongs to the recipient).
-            //
-            // For tokens with transaction history:
-            // - The last transaction's data.sourceState.predicate contains the spender's key
-            // For tokens without transactions (genesis only):
-            // - The current state's predicate is the owner's key
-            //
-            let predicatePublicKey: Buffer = pubKeyBytes; // Default to wallet's key
-
-            // Try to extract public key from source state of last transaction
-            const lastTx = txf.transactions?.[txf.transactions.length - 1];
-            const sourceStatePredicate = lastTx?.data?.sourceState?.predicate;
-
-            if (sourceStatePredicate) {
-              // Extract public key from predicate hex
-              // Pattern: 5821 (CBOR byte string of 33 bytes) followed by 02 or 03 (compressed pubkey)
-              const predicateHex = typeof sourceStatePredicate === 'string'
-                ? sourceStatePredicate
-                : JSON.stringify(sourceStatePredicate);
-              const match = predicateHex.match(/5821(0[23][a-f0-9]{64})/i);
-              if (match) {
-                predicatePublicKey = Buffer.from(match[1], 'hex');
-              }
-            } else {
-              // No transaction history - use current state's predicate
-              const currentPredicate = txf.state?.predicate;
-              if (currentPredicate) {
-                const predicateHex = typeof currentPredicate === 'string'
-                  ? currentPredicate
-                  : JSON.stringify(currentPredicate);
-                const match = predicateHex.match(/5821(0[23][a-f0-9]{64})/i);
-                if (match) {
-                  predicatePublicKey = Buffer.from(match[1], 'hex');
-                }
-              }
-            }
-
-            // Check cache first (use predicate pubkey for cache key)
-            const predicatePubkeyHex = predicatePublicKey.toString('hex');
-            const cacheKey = `${tokenId}:${stateHashStr}:${predicatePubkeyHex}`;
+            // Check cache
+            const cacheKey = `${tokenId}:${calculatedStateHashStr}:${publicKey}`;
             const cached = this.spentStateCache.get(cacheKey);
             if (cached !== undefined) {
               if (cached.isSpent) {
-                return { tokenId, localId: token.id, stateHash: stateHashStr, spent: true };
+                return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: true };
               }
               if (Date.now() - cached.timestamp < this.UNSPENT_CACHE_TTL_MS) {
-                return { tokenId, localId: token.id, stateHash: stateHashStr, spent: false };
+                return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: false };
               }
             }
 
-            // Create RequestId using predicate's public key + stored state hash
-            // The predicate's public key is what would have been used to sign the spending commitment
+            // Create RequestId using wallet's public key + SDK-calculated state hash
             const { DataHash } = await import(
               '@unicitylabs/state-transition-sdk/lib/hash/DataHash'
             );
-            const stateHashObj = DataHash.fromJSON(stateHashStr);
-            const requestId = await RequestId.create(predicatePublicKey, stateHashObj);
+            const stateHashObj = DataHash.fromJSON(calculatedStateHashStr);
+            const requestId = await RequestId.create(pubKeyBytes, stateHashObj);
 
             // Query aggregator
             const response = await this.aggregatorClient!.getInclusionProof(requestId);
@@ -459,7 +404,7 @@ export class TokenValidator {
               timestamp: Date.now(),
             });
 
-            return { tokenId, localId: token.id, stateHash: stateHashStr, spent: isSpent };
+            return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: isSpent };
           } catch (err) {
             return {
               tokenId: token.id,
