@@ -209,7 +209,10 @@ BALANCE & TOKENS:
   l1-balance                        Show L1 (ALPHA) balance
 
 TRANSFERS:
-  send <to> <amount> [--coin SYM]   Send tokens (to: @nametag or address, SYM: UCT/BTC/ETH/SOL)
+  send <to> <amount> [options]      Send tokens (to: @nametag or address)
+                                    --coin SYM    Token symbol (UCT/BTC/ETH/SOL)
+                                    --direct      Force DirectAddress transfer
+                                    --proxy       Force PROXY address transfer
   receive                           Show address for receiving tokens
   history [limit]                   Show transaction history
 
@@ -659,16 +662,27 @@ async function main() {
       case 'send': {
         const [, recipient, amountStr] = args;
         if (!recipient || !amountStr) {
-          console.error('Usage: send <recipient> <amount> [--coin <symbol>]');
+          console.error('Usage: send <recipient> <amount> [--coin <symbol>] [--direct|--proxy]');
           console.error('  recipient: @nametag or DIRECT:// address');
           console.error('  amount: decimal amount (e.g., 0.5, 100)');
           console.error('  --coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
+          console.error('  --direct: force DirectAddress transfer (requires new nametag with directAddress)');
+          console.error('  --proxy: force PROXY address transfer (works with any nametag)');
           process.exit(1);
         }
 
         // Parse --coin option (symbol like UCT, BTC, ETH)
         const coinIndex = args.indexOf('--coin');
         const coinSymbol = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
+
+        // Parse --direct and --proxy options
+        const forceDirect = args.includes('--direct');
+        const forceProxy = args.includes('--proxy');
+        if (forceDirect && forceProxy) {
+          console.error('Cannot use both --direct and --proxy');
+          process.exit(1);
+        }
+        const addressMode = forceDirect ? 'direct' : forceProxy ? 'proxy' : 'auto';
 
         // Resolve symbol to coinId hex and get decimals
         const registry = TokenRegistry.getInstance();
@@ -686,12 +700,14 @@ async function main() {
 
         const sphere = await getSphere();
 
-        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}...`);
+        const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode} mode)`;
+        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}${modeLabel}...`);
 
         const result = await sphere.payments.send({
           recipient,
           amount: amountSmallest,
           coinId: coinIdHex,
+          addressMode,
         });
 
         if (result.status === 'completed' || result.status === 'submitted') {

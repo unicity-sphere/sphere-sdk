@@ -94,11 +94,15 @@ export type TransferStatus =
   | 'completed'
   | 'failed';
 
+export type AddressMode = 'auto' | 'direct' | 'proxy';
+
 export interface TransferRequest {
   readonly coinId: string;
   readonly amount: string;
   readonly recipient: string;
   readonly memo?: string;
+  /** Address mode: 'auto' (default) uses directAddress if available, 'direct' forces DIRECT, 'proxy' forces PROXY */
+  readonly addressMode?: AddressMode;
 }
 
 export interface TransferResult {

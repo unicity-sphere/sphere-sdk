@@ -714,7 +714,7 @@ export class PaymentsModule {
       const recipientPubkey = await this.resolveRecipient(request.recipient);
 
       // Resolve recipient address for on-chain transfer
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -952,7 +952,7 @@ export class PaymentsModule {
       const recipientPubkey = await this.resolveRecipient(request.recipient);
 
       // Resolve recipient address for on-chain transfer
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -2673,8 +2673,9 @@ export class PaymentsModule {
    * Resolve recipient to IAddress for L3 transfers
    * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
    */
-  private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
+  private async resolveRecipientAddress(recipient: string, addressMode: 'auto' | 'direct' | 'proxy' = 'auto'): Promise<IAddress> {
     const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
+    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
 
     // Explicit nametag with @
     if (recipient.startsWith('@')) {
@@ -2684,20 +2685,33 @@ export class PaymentsModule {
         throw new Error(`Nametag "@${nametag}" not found`);
       }
 
-      // NEW nametags have directAddress stored (created using SigningService.createFromSecret)
-      // Use it directly for proper ownership verification
+      // Force PROXY mode
+      if (addressMode === 'proxy') {
+        console.log(`[Payments] Using PROXY address for @${nametag} (forced)`);
+        return ProxyAddress.fromNameTag(nametag);
+      }
+
+      // Force DIRECT mode - requires directAddress to be available
+      if (addressMode === 'direct') {
+        if (!info.directAddress) {
+          throw new Error(`Nametag "@${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
+        }
+        console.log(`[Payments] Using DirectAddress for @${nametag} (forced): ${info.directAddress.slice(0, 30)}...`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // AUTO mode: NEW nametags have directAddress stored, LEGACY use PROXY
       if (info.directAddress) {
         console.log(`[Payments] Using stored DirectAddress for @${nametag}: ${info.directAddress.slice(0, 30)}...`);
         return AddressFactory.createAddress(info.directAddress);
       }
 
       // LEGACY nametags don't have directAddress - use PROXY address
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
       this.log(`Using PROXY address for legacy nametag @${nametag}`);
       return ProxyAddress.fromNameTag(nametag);
     }
 
-    // PROXY: or DIRECT: prefixed - parse using AddressFactory
+    // PROXY: or DIRECT: prefixed - parse using AddressFactory (explicit address overrides mode)
     if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
       return AddressFactory.createAddress(recipient);
     }
@@ -2711,14 +2725,28 @@ export class PaymentsModule {
     // Smart detection: try as nametag
     const info = await this.deps?.transport.resolveNametagInfo?.(recipient);
     if (info) {
-      // NEW nametags have directAddress - use it
+      // Force PROXY mode
+      if (addressMode === 'proxy') {
+        console.log(`[Payments] Using PROXY address for "${recipient}" (forced)`);
+        return ProxyAddress.fromNameTag(recipient);
+      }
+
+      // Force DIRECT mode
+      if (addressMode === 'direct') {
+        if (!info.directAddress) {
+          throw new Error(`Nametag "${recipient}" has no DirectAddress stored. It may be a legacy registration.`);
+        }
+        console.log(`[Payments] Using DirectAddress for "${recipient}" (forced): ${info.directAddress.slice(0, 30)}...`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // AUTO mode: NEW nametags have directAddress - use it
       if (info.directAddress) {
         this.log(`Using stored DirectAddress for nametag "${recipient}"`);
         return AddressFactory.createAddress(info.directAddress);
       }
 
       // LEGACY nametags - use PROXY
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
       this.log(`Using PROXY address for legacy nametag "${recipient}"`);
       return ProxyAddress.fromNameTag(recipient);
     }
