@@ -2676,23 +2676,25 @@ export class PaymentsModule {
   private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
     const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
 
-    // Explicit nametag with @ - always use PROXY address
-    // NOTE: DirectAddress requires signingPubkey (derived from SHA256(privateKey)),
-    // but nametag events only contain chainPubkey (derived from raw privateKey).
-    // These are different keys, so DirectAddress verification fails.
-    // PROXY addresses work because finalization uses the recipient's SigningService.
+    // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
-
-      // Verify nametag exists
       const info = await this.deps?.transport.resolveNametagInfo?.(nametag);
-      if (info) {
-        const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-        this.log(`Using PROXY address for nametag @${nametag}`);
-        return ProxyAddress.fromNameTag(nametag);
+      if (!info) {
+        throw new Error(`Nametag "@${nametag}" not found`);
       }
 
-      throw new Error(`Nametag "@${nametag}" not found`);
+      // NEW nametags have directAddress stored (created using SigningService.createFromSecret)
+      // Use it directly for proper ownership verification
+      if (info.directAddress) {
+        console.log(`[Payments] Using stored DirectAddress for @${nametag}: ${info.directAddress.slice(0, 30)}...`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // LEGACY nametags don't have directAddress - use PROXY address
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      this.log(`Using PROXY address for legacy nametag @${nametag}`);
+      return ProxyAddress.fromNameTag(nametag);
     }
 
     // PROXY: or DIRECT: prefixed - parse using AddressFactory
@@ -2706,11 +2708,18 @@ export class PaymentsModule {
       return this.createDirectAddressFromPubkey(recipient);
     }
 
-    // Smart detection: try as nametag - always use PROXY address (see note above)
+    // Smart detection: try as nametag
     const info = await this.deps?.transport.resolveNametagInfo?.(recipient);
     if (info) {
+      // NEW nametags have directAddress - use it
+      if (info.directAddress) {
+        this.log(`Using stored DirectAddress for nametag "${recipient}"`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // LEGACY nametags - use PROXY
       const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      this.log(`Using PROXY address for nametag "${recipient}"`);
+      this.log(`Using PROXY address for legacy nametag "${recipient}"`);
       return ProxyAddress.fromNameTag(recipient);
     }
 
@@ -2890,11 +2899,46 @@ export class PaymentsModule {
             }
           }
         } else {
-          // Direct address - store source token as-is
-          // NOTE: DirectAddress finalization is not supported because chainPubkey (stored in nametag)
-          // and SigningService.publicKey use different key derivation. PROXY addresses should be used.
-          this.log('DIRECT address transfer received - storing source token');
-          tokenData = sourceTokenInput;
+          // Direct address - finalize to generate local state for tracking
+          // The directAddress stored in nametag events is derived using SigningService.createFromSecret,
+          // so finalization will work when recipient uses the same derivation method
+          console.log('[Payments] Finalizing DIRECT address transfer...');
+          try {
+            const signingService = await this.createSigningService();
+            const transferSalt = transferTx.data.salt;
+
+            const recipientPredicate = await UnmaskedPredicate.create(
+              sourceToken.id,
+              sourceToken.type,
+              signingService,
+              HashAlgorithm.SHA256,
+              transferSalt
+            );
+
+            const recipientState = new TokenState(recipientPredicate, null);
+
+            const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+            if (!stClient || !trustBase) {
+              this.log('Cannot finalize DIRECT transfer - missing client, using source token');
+              tokenData = sourceTokenInput;
+            } else {
+              finalizedSdkToken = await stClient.finalizeTransaction(
+                trustBase,
+                sourceToken,
+                recipientState,
+                transferTx,
+                []  // No nametag tokens needed for DIRECT
+              );
+              tokenData = finalizedSdkToken.toJSON();
+              this.log('DIRECT transfer finalized successfully');
+            }
+          } catch (finalizeError) {
+            this.log('DIRECT finalization failed, using source token:', finalizeError);
+            tokenData = sourceTokenInput;
+          }
         }
       } else if (payload.token) {
         // SDK format
