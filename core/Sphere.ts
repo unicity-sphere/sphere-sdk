@@ -511,8 +511,8 @@ export class Sphere {
       throw new Error('Either mnemonic or masterKey is required');
     }
 
-    // Clear existing wallet if any
-    await Sphere.clear(options.storage);
+    // Clear existing wallet if any (including token data)
+    await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
 
     const sphere = new Sphere(
       options.storage,
@@ -569,10 +569,30 @@ export class Sphere {
   }
 
   /**
-   * Clear wallet data from storage
-   * Note: Token data is cleared via TokenStorageProvider, not here
+   * Clear all SDK-owned wallet data from storage.
+   *
+   * Removes wallet keys, per-address data, and optionally token storage.
+   * Does NOT affect application-level data stored outside the SDK.
+   *
+   * @param storageOrOptions - StorageProvider (backward compatible) or options object
+   *
+   * @example
+   * // New usage (recommended) - clears wallet keys AND token data
+   * await Sphere.clear({
+   *   storage: providers.storage,
+   *   tokenStorage: providers.tokenStorage,
+   * });
+   *
+   * @example
+   * // Legacy usage - clears only wallet keys
+   * await Sphere.clear(storage);
    */
-  static async clear(storage: StorageProvider): Promise<void> {
+  static async clear(
+    storageOrOptions: StorageProvider | { storage: StorageProvider; tokenStorage?: TokenStorageProvider<TxfStorageDataBase> },
+  ): Promise<void> {
+    const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
+    const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
+
     // Clear global wallet data
     await storage.remove(STORAGE_KEYS_GLOBAL.MNEMONIC);
     await storage.remove(STORAGE_KEYS_GLOBAL.MASTER_KEY);
@@ -586,6 +606,11 @@ export class Sphere {
     // Per-address data
     await storage.remove(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
     await storage.remove(STORAGE_KEYS_ADDRESS.OUTBOX);
+
+    // Clear token storage if provided
+    if (tokenStorage?.clear) {
+      await tokenStorage.clear();
+    }
 
     if (Sphere.instance) {
       await Sphere.instance.destroy();

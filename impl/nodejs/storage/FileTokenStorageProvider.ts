@@ -190,6 +190,21 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     };
   }
 
+  async clear(): Promise<boolean> {
+    try {
+      if (!fs.existsSync(this.tokensDir)) {
+        return true;
+      }
+      const files = fs.readdirSync(this.tokensDir).filter(f => f.endsWith('.json'));
+      for (const file of files) {
+        fs.unlinkSync(path.join(this.tokensDir, file));
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async deleteToken(tokenId: string): Promise<void> {
     const filePath = path.join(this.tokensDir, `${tokenId}.json`);
     if (fs.existsSync(filePath)) {
