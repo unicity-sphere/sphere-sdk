@@ -486,9 +486,20 @@ describe('getCurrentStateHash()', () => {
     expect(hash).toBe('hash2');
   });
 
-  it('should return undefined if no transactions', () => {
+  it('should fallback to genesis stateHash if no transactions', () => {
     const txf = createMockTxf();
     txf.transactions = [];
+
+    const hash = getCurrentStateHash(txf);
+
+    // Falls back to genesis inclusionProof.authenticator.stateHash
+    expect(hash).toBe('state_hash_hex');
+  });
+
+  it('should return undefined if no transactions and no genesis proof', () => {
+    const txf = createMockTxf();
+    txf.transactions = [];
+    txf.genesis.inclusionProof = undefined as unknown as typeof txf.genesis.inclusionProof;
 
     const hash = getCurrentStateHash(txf);
 

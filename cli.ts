@@ -18,6 +18,8 @@ import { generateAddressFromMasterKey } from './l1/address';
 import { Sphere } from './core/Sphere';
 import { createNodeProviders } from './impl/nodejs';
 import { TokenRegistry } from './registry/TokenRegistry';
+import { TokenValidator } from './validation/token-validator';
+import { tokenToTxf, getCurrentStateHash } from './serialization/txf-serializer';
 import type { NetworkType } from './constants';
 
 const args = process.argv.slice(2);
@@ -210,6 +212,10 @@ BALANCE & TOKENS:
   topup [coin] [amount]             Request test tokens from faucet
                                     Without args: requests all supported coins
                                     With coin: requests specific coin (bitcoin, ethereum, etc.)
+  verify-balance [--remove] [-v]    Verify tokens against aggregator
+                                    Detects spent tokens not removed from storage
+                                    --remove: Remove spent tokens from storage
+                                    -v/--verbose: Show all tokens, not just spent
 
 TRANSFERS:
   send <to> <amount> [options]      Send tokens (to: @nametag or address)
@@ -671,6 +677,145 @@ async function main() {
         console.log(`Confirmed: ${toHumanReadable(balance.confirmed.toString())} ALPHA`);
         console.log(`Unconfirmed: ${toHumanReadable(balance.unconfirmed.toString())} ALPHA`);
         console.log('─'.repeat(50));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'verify-balance': {
+        // Verify tokens against the aggregator to detect spent tokens
+        // Uses SDK Token.fromJSON() to calculate current state hash (per TOKEN_INVENTORY_SPEC.md)
+        const removeSpent = args.includes('--remove');
+        const verbose = args.includes('--verbose') || args.includes('-v');
+
+        const sphere = await getSphere();
+        const tokens = sphere.payments.getTokens();
+        const identity = sphere.identity;
+
+        if (!identity) {
+          console.error('No wallet identity found.');
+          process.exit(1);
+        }
+
+        console.log(`\nVerifying ${tokens.length} token(s) against aggregator...`);
+        console.log('─'.repeat(60));
+
+        // Get aggregator client from the initialized oracle provider in Sphere
+        const oracle = sphere.getAggregator();
+        const aggregatorClient = (oracle as { getAggregatorClient?: () => unknown }).getAggregatorClient?.();
+
+        if (!aggregatorClient) {
+          console.error('Aggregator client not available. Cannot verify tokens.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Create validator with aggregator client
+        const validator = new TokenValidator({
+          aggregatorClient: aggregatorClient as Parameters<typeof TokenValidator.prototype.setAggregatorClient>[0],
+        });
+
+        // Use checkSpentTokens which properly calculates state hash using SDK
+        // (following TOKEN_INVENTORY_SPEC.md Step 7: Spent Token Detection)
+        const result = await validator.checkSpentTokens(
+          tokens,
+          identity.chainPubkey,
+          {
+            batchSize: 5,
+            onProgress: (completed, total) => {
+              if (verbose && (completed % 10 === 0 || completed === total)) {
+                console.log(`  Checked ${completed}/${total} tokens...`);
+              }
+            }
+          }
+        );
+
+        // Build result maps for display
+        const registry = TokenRegistry.getInstance();
+        const spentTokenIds = new Set(result.spentTokens.map(s => s.localId));
+
+        const spentDisplay: { id: string; tokenId: string; symbol: string; amount: string }[] = [];
+        const validDisplay: { id: string; tokenId: string; symbol: string; amount: string }[] = [];
+
+        for (const token of tokens) {
+          const def = registry.getDefinition(token.coinId);
+          const symbol = def?.symbol || token.symbol || 'UNK';
+          const decimals = def?.decimals ?? token.decimals ?? 8;
+          const amountBigInt = BigInt(token.amount || '0');
+          const divisor = BigInt(10 ** decimals);
+          const wholePart = amountBigInt / divisor;
+          const fracPart = amountBigInt % divisor;
+          const formatted = fracPart > 0
+            ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+            : wholePart.toString();
+
+          const txf = tokenToTxf(token);
+          const tokenId = txf?.genesis?.data?.tokenId || token.id;
+
+          if (spentTokenIds.has(token.id)) {
+            spentDisplay.push({
+              id: token.id,
+              tokenId: tokenId.slice(0, 16),
+              symbol,
+              amount: formatted,
+            });
+            console.log(`✗ SPENT: ${formatted} ${symbol} (${tokenId.slice(0, 12)}...)`);
+          } else {
+            validDisplay.push({
+              id: token.id,
+              tokenId: tokenId.slice(0, 16),
+              symbol,
+              amount: formatted,
+            });
+            if (verbose) {
+              console.log(`✓ Valid: ${formatted} ${symbol} (${tokenId.slice(0, 12)}...)`);
+            }
+          }
+        }
+
+        console.log('─'.repeat(60));
+        console.log(`\nSummary:`);
+        console.log(`  Valid tokens: ${validDisplay.length}`);
+        console.log(`  Spent tokens: ${spentDisplay.length}`);
+        if (result.errors.length > 0) {
+          console.log(`  Errors: ${result.errors.length}`);
+          if (verbose) {
+            for (const err of result.errors) {
+              console.log(`    - ${err}`);
+            }
+          }
+        }
+
+        // Move spent tokens to Sent folder if requested (per TOKEN_INVENTORY_SPEC.md)
+        if (removeSpent && spentDisplay.length > 0) {
+          console.log(`\nMoving ${spentDisplay.length} spent token(s) to Sent folder...`);
+
+          // Access PaymentsModule's removeToken which:
+          // 1. Archives token to Sent folder (archivedTokens)
+          // 2. Creates tombstone to prevent re-sync
+          // 3. Removes from active tokens
+          const paymentsModule = sphere.payments as unknown as {
+            removeToken?: (tokenId: string, recipientNametag?: string, skipHistory?: boolean) => Promise<void>;
+          };
+
+          if (!paymentsModule.removeToken) {
+            console.error('  Error: removeToken method not available');
+          } else {
+            for (const spent of spentDisplay) {
+              try {
+                // Use removeToken which archives to Sent folder and creates tombstone
+                // skipHistory=true since this is spent detection, not a new send
+                await paymentsModule.removeToken(spent.id, undefined, true);
+                console.log(`  Archived: ${spent.amount} ${spent.symbol} (${spent.tokenId}...)`);
+              } catch (err) {
+                console.error(`  Failed to archive ${spent.id}: ${err}`);
+              }
+            }
+            console.log('  Tokens moved to Sent folder.');
+          }
+        } else if (spentDisplay.length > 0) {
+          console.log(`\nTo move spent tokens to Sent folder, run: npm run cli -- verify-balance --remove`);
+        }
 
         await closeSphere();
         break;

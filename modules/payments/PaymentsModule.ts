@@ -1804,6 +1804,14 @@ export class PaymentsModule {
       ? createTokenStateKey(incomingTokenId, incomingStateHash)
       : null;
 
+    // Check tombstones - reject tokens with exact (tokenId, stateHash) match
+    // This prevents spent tokens from being re-added via Nostr re-delivery
+    // Tokens with the same tokenId but DIFFERENT stateHash are allowed (new state)
+    if (incomingTokenId && incomingStateHash && this.isStateTombstoned(incomingTokenId, incomingStateHash)) {
+      this.log(`Rejecting tombstoned token: ${incomingTokenId.slice(0, 8)}..._${incomingStateHash.slice(0, 8)}...`);
+      return false;
+    }
+
     // Check for exact duplicate (same tokenId AND same stateHash)
     if (incomingStateKey) {
       for (const [existingId, existing] of this.tokens) {
@@ -2963,9 +2971,15 @@ export class PaymentsModule {
           : JSON.stringify(sourceTokenInput),
       };
 
-      // NOTE: We intentionally do NOT check tombstones for incoming transfers
-      // A tombstoned token can legitimately come back via transfer (with new state)
-      // Duplicate detection in addToken() handles stale copies
+      // Check tombstones - reject tokens with exact (tokenId, stateHash) match
+      // This prevents spent tokens from being re-added via Nostr re-delivery
+      // Tokens with the same tokenId but DIFFERENT stateHash are allowed (new state)
+      const nostrTokenId = extractTokenIdFromSdkData(token.sdkData);
+      const nostrStateHash = extractStateHashFromSdkData(token.sdkData);
+      if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
+        this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
+        return;
+      }
 
       // Add token as unconfirmed
       this.tokens.set(token.id, token);
@@ -3424,10 +3438,8 @@ export class PaymentsModule {
           : JSON.stringify(tokenData),
       };
 
-      // NOTE: We intentionally do NOT check tombstones for incoming transfers
-      // A tombstoned token can legitimately come back via transfer (with new state)
-      // Duplicate detection in addToken() handles stale copies
-
+      // addToken() checks tombstones with exact (tokenId, stateHash) match
+      // Tokens with same tokenId but different stateHash pass through (new state)
       await this.addToken(token);
 
       const incomingTransfer: IncomingTransfer = {
