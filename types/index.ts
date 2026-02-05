@@ -82,6 +82,16 @@ export interface TokenBalance {
   readonly decimals: number;
 }
 
+export interface Asset {
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
+  readonly totalAmount: string;
+  readonly tokenCount: number;
+}
+
 // =============================================================================
 // Transfer Types
 // =============================================================================

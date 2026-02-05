@@ -12,6 +12,7 @@
  */
 
 import type {
+  Asset,
   Token,
   TokenBalance,
   TokenStatus,
@@ -1350,6 +1351,41 @@ export class PaymentsModule {
     }
 
     return Array.from(balances.values());
+  }
+
+  /**
+   * Get aggregated assets (tokens grouped by coinId)
+   * Only includes confirmed tokens
+   */
+  getAssets(coinId?: string): Asset[] {
+    const assets = new Map<string, Asset>();
+
+    for (const token of this.tokens.values()) {
+      if (token.status !== 'confirmed') continue;
+      if (coinId && token.coinId !== coinId) continue;
+
+      const key = token.coinId;
+      const existing = assets.get(key);
+
+      if (existing) {
+        (existing as { totalAmount: string }).totalAmount = (
+          BigInt(existing.totalAmount) + BigInt(token.amount)
+        ).toString();
+        (existing as { tokenCount: number }).tokenCount++;
+      } else {
+        assets.set(key, {
+          coinId: token.coinId,
+          symbol: token.symbol,
+          name: token.name,
+          decimals: token.decimals,
+          iconUrl: token.iconUrl,
+          totalAmount: token.amount,
+          tokenCount: 1,
+        });
+      }
+    }
+
+    return Array.from(assets.values());
   }
 
   /**
