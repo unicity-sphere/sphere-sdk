@@ -60,13 +60,11 @@ interface TransferTestResult {
   success: boolean;
   balanceVerified: boolean;
   tombstoneVerified: boolean;
-  knownFailing: boolean;
   senderDelta: bigint;
   receiverDelta: bigint;
   tombstonesBefore: number;
   tombstonesAfter: number;
   error?: string;
-  skipped?: boolean;
 }
 
 // =============================================================================
@@ -286,13 +284,12 @@ interface TransferTestConfig {
   amount: string;
   coinSymbol: string;
   mode: 'direct' | 'proxy';
-  knownFailing?: boolean;
 }
 
 async function runTransferTest(config: TransferTestConfig): Promise<TransferTestResult> {
   const {
     scenario, sender, receiver, receiverNametag,
-    amount, coinSymbol, mode, knownFailing = false,
+    amount, coinSymbol, mode,
   } = config;
 
   const registry = TokenRegistry.getInstance();
@@ -302,7 +299,7 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
   const amountSmallest = parseAmount(amount, decimals);
 
   console.log(`\n${'='.repeat(70)}`);
-  console.log(`SCENARIO: ${scenario}${knownFailing ? ' [KNOWN FAILING]' : ''}`);
+  console.log(`SCENARIO: ${scenario}`);
   console.log(`  Mode: ${mode.toUpperCase()}, Amount: ${amount} ${coinSymbol} (${amountSmallest} smallest)`);
   console.log('='.repeat(70));
 
@@ -317,7 +314,6 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
     success: false,
     balanceVerified: false,
     tombstoneVerified: false,
-    knownFailing,
     senderDelta: 0n,
     receiverDelta: 0n,
     tombstonesBefore: 0,
@@ -423,11 +419,6 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error(`    ERROR: ${errorMsg}`);
     result.error = errorMsg;
-
-    if (knownFailing) {
-      console.log(`    [KNOWN_FAILING] Marking as skipped`);
-      result.skipped = true;
-    }
   }
 
   return result;
@@ -455,16 +446,11 @@ function printResultsTable(results: TransferTestResult[]): void {
     const scenario = r.scenario.slice(0, 33).padEnd(33);
     const mode = r.mode.toUpperCase().padEnd(6);
     const amount = `${r.amount} ${r.coin}`.padEnd(12).slice(0, 12);
-    const sendTime = r.skipped ? '    -   ' : r.sendTimeMs.toFixed(0).padStart(8);
-    const recvTime = r.skipped ? '    -   ' : r.receiveTimeMs.toFixed(0).padStart(8);
-    const balanceOk = r.skipped ? '   -   ' : (r.balanceVerified ? '  PASS ' : '  FAIL ');
-    const tombOk = r.skipped ? '    -    ' : (r.tombstoneVerified ? '   PASS  ' : '   FAIL  ');
-
-    let status: string;
-    if (r.skipped) status = '  SKIPPED ';
-    else if (r.success) status = '  PASS    ';
-    else if (r.knownFailing) status = ' KNOWN_FAIL';
-    else status = '  FAIL    ';
+    const sendTime = r.sendTimeMs.toFixed(0).padStart(8);
+    const recvTime = r.receiveTimeMs.toFixed(0).padStart(8);
+    const balanceOk = r.balanceVerified ? '  PASS ' : '  FAIL ';
+    const tombOk = r.tombstoneVerified ? '   PASS  ' : '   FAIL  ';
+    const status = r.success ? '  PASS    ' : '  FAIL    ';
 
     console.log(
       ` ${num} | ${scenario} | ${mode} | ${amount} | ${sendTime} | ${recvTime} |${balanceOk}|${tombOk}|${status}`,
@@ -476,34 +462,35 @@ function printResultsTable(results: TransferTestResult[]): void {
   );
 
   // Statistics
-  const directResults = results.filter(r => !r.knownFailing);
+  const passed = results.filter(r => r.success);
+  const directResults = results.filter(r => r.mode === 'direct');
+  const proxyResults = results.filter(r => r.mode === 'proxy');
   const directPassed = directResults.filter(r => r.success);
-  const balanceVerified = directResults.filter(r => r.balanceVerified);
-  const tombVerified = directResults.filter(r => r.tombstoneVerified);
+  const proxyPassed = proxyResults.filter(r => r.success);
+  const balanceVerified = results.filter(r => r.balanceVerified);
+  const tombVerified = results.filter(r => r.tombstoneVerified);
 
   console.log(`\nSTATISTICS:`);
+  console.log(`   Total passed:              ${passed.length}/${results.length}`);
   console.log(`   DIRECT tests passed:       ${directPassed.length}/${directResults.length}`);
-  console.log(`   Balance verified:          ${balanceVerified.length}/${directResults.length}`);
-  console.log(`   Tombstone verified:        ${tombVerified.length}/${directResults.length}`);
+  console.log(`   PROXY tests passed:        ${proxyPassed.length}/${proxyResults.length}`);
+  console.log(`   Balance verified:          ${balanceVerified.length}/${results.length}`);
+  console.log(`   Tombstone verified:        ${tombVerified.length}/${results.length}`);
 
-  const proxyResults = results.filter(r => r.knownFailing);
-  const proxySkipped = proxyResults.filter(r => r.skipped);
-  console.log(`   PROXY tests (known-fail):  ${proxySkipped.length} skipped / ${proxyResults.length} total`);
-
-  if (directPassed.length > 0) {
-    const avgSend = directPassed.reduce((s, r) => s + r.sendTimeMs, 0) / directPassed.length;
-    const avgRecv = directPassed.reduce((s, r) => s + r.receiveTimeMs, 0) / directPassed.length;
+  if (passed.length > 0) {
+    const avgSend = passed.reduce((s, r) => s + r.sendTimeMs, 0) / passed.length;
+    const avgRecv = passed.reduce((s, r) => s + r.receiveTimeMs, 0) / passed.length;
     console.log(`   Avg send time (passing):   ${avgSend.toFixed(0)}ms`);
     console.log(`   Avg receive time (passing):${avgRecv.toFixed(0)}ms`);
   }
 
   // Final verdict
   console.log('');
-  if (directPassed.length === directResults.length) {
-    console.log('ALL DIRECT TESTS PASSED - Balance conservation verified, tombstones working');
+  if (passed.length === results.length) {
+    console.log('ALL TESTS PASSED - Balance conservation verified, tombstones working');
   } else {
-    console.log('SOME DIRECT TESTS FAILED:');
-    for (const r of directResults.filter(r => !r.success)) {
+    console.log('SOME TESTS FAILED:');
+    for (const r of results.filter(r => !r.success)) {
       console.log(`   - ${r.scenario}: ${r.error ?? 'balance/tombstone mismatch'}`);
     }
   }
@@ -636,7 +623,7 @@ async function main(): Promise<void> {
     // =========================================================================
     // Phase 3: PROXY Mode Tests (known-failing)
     // =========================================================================
-    console.log('\n\n--- PHASE 3: PROXY MODE TESTS (KNOWN FAILING) ---');
+    console.log('\n\n--- PHASE 3: PROXY MODE TESTS ---');
 
     // Test 5: PROXY UCT
     results.push(await runTransferTest({
@@ -647,7 +634,6 @@ async function main(): Promise<void> {
       amount: '0.1',
       coinSymbol: 'UCT',
       mode: 'proxy',
-      knownFailing: true,
     }));
     await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
 
@@ -663,7 +649,6 @@ async function main(): Promise<void> {
       amount: '0.01',
       coinSymbol: 'BTC',
       mode: 'proxy',
-      knownFailing: true,
     }));
 
     // =========================================================================
@@ -690,10 +675,9 @@ async function main(): Promise<void> {
     }
   }
 
-  // Exit code based on DIRECT test results
-  const directResults = results.filter(r => !r.knownFailing);
-  const allDirectPassed = directResults.length > 0 && directResults.every(r => r.success);
-  process.exit(allDirectPassed ? 0 : 1);
+  // Exit code based on ALL test results
+  const allPassed = results.length > 0 && results.every(r => r.success);
+  process.exit(allPassed ? 0 : 1);
 }
 
 main().catch((error) => {
