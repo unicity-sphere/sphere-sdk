@@ -714,19 +714,20 @@ export class NostrTransportProvider implements TransportProvider {
     try {
       const content = JSON.parse(bindingEvent.content);
 
+      // Compute proper PROXY address using state-transition-sdk
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
+      const proxyAddress = proxyAddr.toString();
+
       // Check if event has extended fields
       if (content.public_key && content.l1_address) {
-        // Full info available
-        // Compute L3 address from nametag token ID (PROXY:nametagTokenIdHex)
-        const l3Address = `PROXY:${hashedNametag}`;
-
         return {
           nametag,
           transportPubkey: bindingEvent.pubkey,
           chainPubkey: content.public_key,
           l1Address: content.l1_address,
           directAddress: content.direct_address || '',
-          proxyAddress: l3Address,
+          proxyAddress,
           timestamp: bindingEvent.created_at * 1000,
         };
       }
@@ -740,14 +741,13 @@ export class NostrTransportProvider implements TransportProvider {
       const l1Tag = bindingEvent.tags.find((t: string[]) => t[0] === 'l1');
 
       if (pubkeyTag?.[1] && l1Tag?.[1]) {
-        const l3Address = `PROXY:${hashedNametag}`;
         return {
           nametag,
           transportPubkey: bindingEvent.pubkey,
           chainPubkey: pubkeyTag[1],
           l1Address: l1Tag[1],
           directAddress: '',
-          proxyAddress: l3Address,
+          proxyAddress,
           timestamp: bindingEvent.created_at * 1000,
         };
       }
@@ -759,18 +759,20 @@ export class NostrTransportProvider implements TransportProvider {
         chainPubkey: '', // Cannot derive from 32-byte Nostr pubkey
         l1Address: '', // Cannot derive without 33-byte pubkey
         directAddress: '',
-        proxyAddress: `PROXY:${hashedNametag}`,
+        proxyAddress,
         timestamp: bindingEvent.created_at * 1000,
       };
     } catch {
       // If content is not JSON, try legacy format
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
       return {
         nametag,
         transportPubkey: bindingEvent.pubkey,
         chainPubkey: '',
         l1Address: '',
         directAddress: '',
-        proxyAddress: `PROXY:${hashedNametag}`,
+        proxyAddress: proxyAddr.toString(),
         timestamp: bindingEvent.created_at * 1000,
       };
     }

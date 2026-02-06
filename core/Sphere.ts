@@ -95,7 +95,7 @@ import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/Signi
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
 import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
-import { hashNametag } from '@unicitylabs/nostr-js-sdk';
+
 import type {
   LegacyFileType,
   DecryptionProgressCallback,
@@ -283,6 +283,8 @@ export class Sphere {
   private _currentAddressIndex: number = 0;
   /** Map of addressId -> (nametagIndex -> nametag). Supports multiple nametags per address (e.g., from Nostr recovery) */
   private _addressNametags: Map<string, Map<number, string>> = new Map();
+  /** Cached PROXY address (computed once when nametag is set) */
+  private _cachedProxyAddress: string | undefined = undefined;
 
   // Providers
   private _storage: StorageProvider;
@@ -1507,6 +1509,7 @@ export class Sphere {
 
     // Update current index
     this._currentAddressIndex = index;
+    await this._updateCachedProxyAddress();
 
     // Persist current index
     await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
@@ -1752,9 +1755,19 @@ export class Sphere {
    * @returns PROXY address string or undefined if no nametag
    */
   getProxyAddress(): string | undefined {
+    return this._cachedProxyAddress;
+  }
+
+  /** Compute and cache the PROXY address from the current nametag */
+  private async _updateCachedProxyAddress(): Promise<void> {
     const nametag = this._identity?.nametag;
-    if (!nametag) return undefined;
-    return `PROXY:${hashNametag(nametag)}`;
+    if (!nametag) {
+      this._cachedProxyAddress = undefined;
+      return;
+    }
+    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
+    this._cachedProxyAddress = proxyAddr.toString();
   }
 
   /**
@@ -1803,6 +1816,7 @@ export class Sphere {
 
     // Update identity
     this._identity!.nametag = cleanNametag;
+    await this._updateCachedProxyAddress();
 
     // Store in address nametags map (addressId -> nametagIndex -> nametag)
     const addressId = this.getCurrentAddressId();
@@ -1976,6 +1990,7 @@ export class Sphere {
         // Update identity with recovered nametag
         if (this._identity) {
           (this._identity as MutableFullIdentity).nametag = recoveredNametag;
+          await this._updateCachedProxyAddress();
         }
 
         // Store nametag locally (addressId -> nametagIndex -> nametag)
@@ -2197,6 +2212,7 @@ export class Sphere {
         this._identity.nametag = nametag;
       }
     }
+    await this._updateCachedProxyAddress();
   }
 
   private async initializeIdentityFromMnemonic(
