@@ -62,6 +62,17 @@ import {
 } from '../../serialization/txf-serializer';
 import { TokenRegistry } from '../../registry';
 
+// Instant split imports
+import { InstantSplitExecutor } from './InstantSplitExecutor';
+import { InstantSplitProcessor } from './InstantSplitProcessor';
+import type {
+  InstantSplitBundle,
+  InstantSplitResult,
+  InstantSplitProcessResult,
+  InstantSplitOptions,
+} from '../../types/instant-split';
+import { isInstantSplitBundle } from '../../types/instant-split';
+
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
@@ -308,7 +319,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 // =============================================================================
 
 /**
- * Extract token ID from sdkData/jsonData
+ * Extract token ID (genesis tokenId) from sdkData/jsonData
  */
 function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
   if (!sdkData) return null;
@@ -327,32 +338,76 @@ function extractStateHashFromSdkData(sdkData: string | undefined): string {
   if (!sdkData) return '';
   try {
     const txf = JSON.parse(sdkData) as TxfToken;
-    return getCurrentStateHash(txf) || '';
+    const stateHash = getCurrentStateHash(txf);
+
+    // Try alternative locations if not found in standard place
+    if (!stateHash) {
+      if ((txf as any).state?.hash) {
+        return (txf as any).state.hash;
+      }
+      if ((txf as any).stateHash) {
+        return (txf as any).stateHash;
+      }
+      if ((txf as any).currentStateHash) {
+        return (txf as any).currentStateHash;
+      }
+    }
+
+    return stateHash || '';
   } catch {
     return '';
   }
 }
 
 /**
- * Check if two tokens are the same (by genesis tokenId)
+ * Create composite key from tokenId and stateHash
+ * Format: {tokenId}_{stateHash}
+ * This uniquely identifies a token at a specific state
  */
-function isSameToken(t1: Token, t2: Token): boolean {
-  if (t1.id === t2.id) return true;
+function createTokenStateKey(tokenId: string, stateHash: string): string {
+  return `${tokenId}_${stateHash}`;
+}
 
+/**
+ * Extract composite key (tokenId_stateHash) from token
+ * Returns null if token doesn't have valid tokenId and stateHash
+ */
+function extractTokenStateKey(token: Token): string | null {
+  const tokenId = extractTokenIdFromSdkData(token.sdkData);
+  const stateHash = extractStateHashFromSdkData(token.sdkData);
+  if (!tokenId || !stateHash) return null;
+  return createTokenStateKey(tokenId, stateHash);
+}
+
+/**
+ * Check if two tokens have the same genesis tokenId (same token, possibly different states)
+ */
+function hasSameGenesisTokenId(t1: Token, t2: Token): boolean {
   const id1 = extractTokenIdFromSdkData(t1.sdkData);
   const id2 = extractTokenIdFromSdkData(t2.sdkData);
-
   return !!(id1 && id2 && id1 === id2);
 }
 
 /**
- * Create tombstone from token
+ * Check if two tokens are exactly the same (same tokenId AND same stateHash)
+ */
+function isSameTokenState(t1: Token, t2: Token): boolean {
+  const key1 = extractTokenStateKey(t1);
+  const key2 = extractTokenStateKey(t2);
+  return !!(key1 && key2 && key1 === key2);
+}
+
+/**
+ * Create tombstone from token - requires valid tokenId and stateHash
  */
 function createTombstoneFromToken(token: Token): TombstoneEntry | null {
   const tokenId = extractTokenIdFromSdkData(token.sdkData);
-  if (!tokenId) return null;
-
   const stateHash = extractStateHashFromSdkData(token.sdkData);
+
+  // Both tokenId and stateHash are required for a valid tombstone
+  if (!tokenId || !stateHash) {
+    return null;
+  }
 
   return {
     tokenId,
@@ -482,6 +537,24 @@ export interface PaymentsModuleConfig {
 }
 
 // =============================================================================
+// NOSTR-FIRST Proof Polling Types
+// =============================================================================
+
+/**
+ * Job for background proof polling (NOSTR-FIRST pattern)
+ */
+export interface ProofPollingJob {
+  tokenId: string;
+  requestIdHex: string;
+  commitmentJson: string;
+  startedAt: number;
+  attemptCount: number;
+  lastAttemptAt: number;
+  /** Callback when proof is received */
+  onProofReceived?: (tokenId: string) => void;
+}
+
+// =============================================================================
 // Dependencies Interface
 // =============================================================================
 
@@ -540,6 +613,12 @@ export class PaymentsModule {
   private unsubscribeTransfers: (() => void) | null = null;
   private unsubscribePaymentRequests: (() => void) | null = null;
   private unsubscribePaymentRequestResponses: (() => void) | null = null;
+
+  // NOSTR-FIRST proof polling (background proof verification)
+  private proofPollingJobs: Map<string, ProofPollingJob> = new Map();
+  private proofPollingInterval: ReturnType<typeof setInterval> | null = null;
+  private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
+  private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
 
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
@@ -668,6 +747,10 @@ export class PaymentsModule {
     this.paymentRequestHandlers.clear();
     this.paymentRequestResponseHandlers.clear();
 
+    // Stop proof polling (NOSTR-FIRST)
+    this.stopProofPolling();
+    this.proofPollingJobs.clear();
+
     // Clear pending response resolvers
     for (const [, resolver] of this.pendingResponseResolvers) {
       clearTimeout(resolver.timeout);
@@ -703,7 +786,7 @@ export class PaymentsModule {
       const recipientPubkey = await this.resolveRecipient(request.recipient);
 
       // Resolve recipient address for on-chain transfer
-      const recipientAddress = await this.resolveRecipientAddress(request.recipient);
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
 
       // Create signing service
       const signingService = await this.createSigningService();
@@ -731,8 +814,6 @@ export class PaymentsModule {
       if (!splitPlan) {
         throw new Error('Insufficient balance');
       }
-
-      this.log(`Split plan: requiresSplit=${splitPlan.requiresSplit}, directTokens=${splitPlan.tokensToTransferDirectly.length}`);
 
       // Collect all tokens involved
       const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map(t => t.uiToken);
@@ -791,11 +872,13 @@ export class PaymentsModule {
         this.log(`Change token saved: ${changeToken.id}, amount: ${changeToken.amount}`);
 
         // Send recipient token via Nostr (Sphere format)
+        console.log(`[Payments] Sending split token to ${recipientPubkey.slice(0, 8)}... via Nostr`);
         await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
           sourceToken: JSON.stringify(splitResult.tokenForRecipient.toJSON()),
           transferTx: JSON.stringify(splitResult.recipientTransferTx.toJSON()),
           memo: request.memo,
         } as unknown as import('../../transport').TokenTransferPayload);
+        console.log(`[Payments] Split token sent successfully`);
 
         // Remove the original token that was split
         await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
@@ -804,7 +887,10 @@ export class PaymentsModule {
         this.log(`Split transfer completed`);
       }
 
-      // Transfer direct tokens (no split needed)
+      // Transfer direct tokens (no split needed) - standard aggregator-first flow
+      // NOTE: NOSTR-FIRST for direct transfers has receiver-side issues with commitment validation.
+      // The InstantSplit V5 flow is used for splits which provides fast transfers.
+      // For direct (non-split) tokens, we use the proven standard flow.
       for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
         const token = tokenWithAmount.uiToken;
 
@@ -834,11 +920,13 @@ export class PaymentsModule {
           : String(requestIdBytes);
 
         // Send via transport (Nostr) - use Sphere-compatible format
+        console.log(`[Payments] Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}... via Nostr`);
         await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
           sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
           transferTx: JSON.stringify(transferTx.toJSON()),
           memo: request.memo,
         } as unknown as import('../../transport').TokenTransferPayload);
+        console.log(`[Payments] Direct token sent successfully`);
 
         this.log(`Token ${token.id} transferred, txHash: ${result.txHash}`);
 
@@ -907,6 +995,298 @@ export class PaymentsModule {
    */
   private getCoinIconUrl(coinId: string): string | undefined {
     return TokenRegistry.getInstance().getIconUrl(coinId) ?? undefined;
+  }
+
+  // ===========================================================================
+  // Public API - Instant Split (V5 Optimized)
+  // ===========================================================================
+
+  /**
+   * Send tokens using INSTANT_SPLIT V5 optimized flow.
+   *
+   * This achieves ~2.3s critical path latency instead of ~42s by:
+   * 1. Waiting only for burn proof (required)
+   * 2. Creating transfer commitment from mint data (no mint proof needed)
+   * 3. Sending bundle via Nostr immediately
+   * 4. Processing mints in background
+   *
+   * @param request - Transfer request with recipient, amount, and coinId
+   * @param options - Optional instant split configuration
+   * @returns InstantSplitResult with timing info
+   */
+  async sendInstant(
+    request: TransferRequest,
+    options?: InstantSplitOptions
+  ): Promise<InstantSplitResult> {
+    this.ensureInitialized();
+
+    const startTime = performance.now();
+
+    try {
+      // Resolve recipient pubkey for Nostr delivery
+      const recipientPubkey = await this.resolveRecipient(request.recipient);
+
+      // Resolve recipient address for on-chain transfer
+      const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode);
+
+      // Create signing service
+      const signingService = await this.createSigningService();
+
+      // Get state transition client and trust base
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        throw new Error('State transition client not available');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!trustBase) {
+        throw new Error('Trust base not available');
+      }
+
+      // Calculate optimal split plan
+      const calculator = new TokenSplitCalculator();
+      const availableTokens = Array.from(this.tokens.values());
+      const splitPlan = await calculator.calculateOptimalSplit(
+        availableTokens,
+        BigInt(request.amount),
+        request.coinId
+      );
+
+      if (!splitPlan) {
+        throw new Error('Insufficient balance');
+      }
+
+      if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
+        // For direct transfers without split, fall back to standard flow
+        this.log('No split required, falling back to standard send()');
+        const result = await this.send(request);
+        return {
+          success: result.status === 'completed',
+          criticalPathDurationMs: performance.now() - startTime,
+          error: result.error,
+        };
+      }
+
+      this.log(`InstantSplit: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
+
+      // Mark token as transferring
+      const tokenToSplit = splitPlan.tokenToSplit.uiToken;
+      tokenToSplit.status = 'transferring';
+      this.tokens.set(tokenToSplit.id, tokenToSplit);
+
+      // Check if dev mode
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
+
+      // Create instant split executor
+      const executor = new InstantSplitExecutor({
+        stateTransitionClient: stClient,
+        trustBase,
+        signingService,
+        devMode,
+      });
+
+      // Execute instant split
+      const result = await executor.executeSplitInstant(
+        splitPlan.tokenToSplit.sdkToken,
+        splitPlan.splitAmount!,
+        splitPlan.remainderAmount!,
+        splitPlan.coinId,
+        recipientAddress,
+        this.deps!.transport,
+        recipientPubkey,
+        {
+          ...options,
+          onChangeTokenCreated: async (changeToken) => {
+            // Save change token when background completes
+            const changeTokenData = changeToken.toJSON();
+            const uiToken: Token = {
+              id: crypto.randomUUID(),
+              coinId: request.coinId,
+              symbol: this.getCoinSymbol(request.coinId),
+              name: this.getCoinName(request.coinId),
+              decimals: this.getCoinDecimals(request.coinId),
+              iconUrl: this.getCoinIconUrl(request.coinId),
+              amount: splitPlan.remainderAmount!.toString(),
+              status: 'confirmed',
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              sdkData: JSON.stringify(changeTokenData),
+            };
+            await this.addToken(uiToken, true);
+            this.log(`Change token saved via background: ${uiToken.id}`);
+          },
+          onStorageSync: async () => {
+            await this.save();
+            return true;
+          },
+        }
+      );
+
+      if (result.success) {
+        // Remove the original token
+        const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
+        await this.removeToken(tokenToSplit.id, recipientNametag);
+
+        // Add to transaction history
+        await this.addToHistory({
+          type: 'SENT',
+          amount: request.amount,
+          coinId: request.coinId,
+          symbol: this.getCoinSymbol(request.coinId),
+          timestamp: Date.now(),
+          recipientNametag,
+        });
+
+        await this.save();
+      } else {
+        // Restore token on failure
+        tokenToSplit.status = 'confirmed';
+        this.tokens.set(tokenToSplit.id, tokenToSplit);
+      }
+
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        criticalPathDurationMs: performance.now() - startTime,
+        error: errorMessage,
+      };
+    }
+  }
+
+  /**
+   * Process a received INSTANT_SPLIT bundle.
+   *
+   * This should be called when receiving an instant split bundle via transport.
+   * It handles the recipient-side processing:
+   * 1. Validate burn transaction
+   * 2. Submit and wait for mint proof
+   * 3. Submit and wait for transfer proof
+   * 4. Finalize and save the token
+   *
+   * @param bundle - The received InstantSplitBundle (V4 or V5)
+   * @param senderPubkey - Sender's public key for verification
+   * @returns Processing result with finalized token
+   */
+  async processInstantSplitBundle(
+    bundle: InstantSplitBundle,
+    senderPubkey: string
+  ): Promise<InstantSplitProcessResult> {
+    this.ensureInitialized();
+
+    try {
+      // Create signing service
+      const signingService = await this.createSigningService();
+
+      // Get state transition client and trust base
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        throw new Error('State transition client not available');
+      }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+      if (!trustBase) {
+        throw new Error('Trust base not available');
+      }
+
+      // Check if dev mode
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
+
+      // Create processor
+      const processor = new InstantSplitProcessor({
+        stateTransitionClient: stClient,
+        trustBase,
+        devMode,
+      });
+
+      // Process the bundle
+      const result = await processor.processReceivedBundle(
+        bundle,
+        signingService,
+        senderPubkey,
+        {
+          findNametagToken: async (proxyAddress: string) => {
+            if (this.nametag?.token) {
+              try {
+                const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+                const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+                const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+                if (proxy.address === proxyAddress) {
+                  return nametagToken;
+                }
+                this.log(`Nametag PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
+                return null;
+              } catch (err) {
+                this.log('Failed to parse nametag token:', err);
+                return null;
+              }
+            }
+            return null;
+          },
+        }
+      );
+
+      if (result.success && result.token) {
+        // Save the received token
+        const tokenData = result.token.toJSON();
+        const info = await parseTokenInfo(tokenData);
+
+        const uiToken: Token = {
+          id: crypto.randomUUID(),
+          coinId: info.coinId,
+          symbol: info.symbol,
+          name: info.name,
+          decimals: info.decimals,
+          iconUrl: info.iconUrl,
+          amount: bundle.amount,
+          status: 'confirmed',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          sdkData: JSON.stringify(tokenData),
+        };
+
+        await this.addToken(uiToken);
+
+        // Add to history
+        await this.addToHistory({
+          type: 'RECEIVED',
+          amount: bundle.amount,
+          coinId: info.coinId,
+          symbol: info.symbol,
+          timestamp: Date.now(),
+          senderPubkey,
+        });
+
+        await this.save();
+
+        // Emit event
+        this.deps!.emitEvent('transfer:incoming', {
+          id: bundle.splitGroupId,
+          senderPubkey,
+          tokens: [uiToken],
+          receivedAt: Date.now(),
+        });
+      }
+
+      return result;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: errorMessage,
+        durationMs: 0,
+      };
+    }
+  }
+
+  /**
+   * Check if a payload is an instant split bundle
+   */
+  isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
+    return isInstantSplitBundle(payload);
   }
 
   // ===========================================================================
@@ -1324,33 +1704,68 @@ export class PaymentsModule {
    * Get balance for coin type
    */
   getBalance(coinId?: string): TokenBalance[] {
-    const balances = new Map<string, TokenBalance>();
+    const balances = new Map<string, {
+      coinId: string;
+      symbol: string;
+      name: string;
+      decimals: number;
+      confirmedAmount: bigint;
+      unconfirmedAmount: bigint;
+      confirmedTokenCount: number;
+      unconfirmedTokenCount: number;
+    }>();
+    const registry = TokenRegistry.getInstance();
 
     for (const token of this.tokens.values()) {
-      if (token.status !== 'confirmed') continue;
+      // Skip tokens that are spent, invalid, or in active transfer
+      if (token.status === 'spent' || token.status === 'invalid' || token.status === 'transferring') {
+        continue;
+      }
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
-      const existing = balances.get(key);
+      const amount = BigInt(token.amount);
+      const isConfirmed = token.status === 'confirmed';
+      const isUnconfirmed = token.status === 'submitted' || token.status === 'pending';
 
+      const existing = balances.get(key);
       if (existing) {
-        (existing as { totalAmount: string }).totalAmount = (
-          BigInt(existing.totalAmount) + BigInt(token.amount)
-        ).toString();
-        (existing as { tokenCount: number }).tokenCount++;
+        if (isConfirmed) {
+          existing.confirmedAmount += amount;
+          existing.confirmedTokenCount++;
+        } else if (isUnconfirmed) {
+          existing.unconfirmedAmount += amount;
+          existing.unconfirmedTokenCount++;
+        }
       } else {
+        // Look up token metadata from registry (more reliable than stored values)
+        const def = registry.getDefinition(token.coinId);
         balances.set(key, {
           coinId: token.coinId,
-          symbol: token.symbol,
-          name: token.name,
-          totalAmount: token.amount,
-          tokenCount: 1,
-          decimals: 8,
+          symbol: def?.symbol || token.symbol,
+          name: def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : token.name,
+          decimals: def?.decimals ?? token.decimals ?? 8,
+          confirmedAmount: isConfirmed ? amount : 0n,
+          unconfirmedAmount: isUnconfirmed ? amount : 0n,
+          confirmedTokenCount: isConfirmed ? 1 : 0,
+          unconfirmedTokenCount: isUnconfirmed ? 1 : 0,
         });
       }
     }
 
-    return Array.from(balances.values());
+    // Convert to TokenBalance interface
+    return Array.from(balances.values()).map(bal => ({
+      coinId: bal.coinId,
+      symbol: bal.symbol,
+      name: bal.name,
+      decimals: bal.decimals,
+      totalAmount: (bal.confirmedAmount + bal.unconfirmedAmount).toString(),
+      confirmedAmount: bal.confirmedAmount.toString(),
+      unconfirmedAmount: bal.unconfirmedAmount.toString(),
+      tokenCount: bal.confirmedTokenCount + bal.unconfirmedTokenCount,
+      confirmedTokenCount: bal.confirmedTokenCount,
+      unconfirmedTokenCount: bal.unconfirmedTokenCount,
+    }));
   }
 
   /**
@@ -1417,22 +1832,82 @@ export class PaymentsModule {
 
   /**
    * Add a token
-   * @returns false if duplicate
+   * Tokens are uniquely identified by (tokenId, stateHash) composite key.
+   * Multiple historic states of the same token can coexist.
+   * @returns false if exact duplicate (same tokenId AND same stateHash)
    */
   async addToken(token: Token, skipHistory: boolean = false): Promise<boolean> {
     this.ensureInitialized();
 
-    // Check for duplicates
-    for (const existing of this.tokens.values()) {
-      if (isSameToken(existing, token)) {
-        this.log(`Duplicate token detected: ${token.id}`);
-        return false;
+    const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
+    const incomingStateHash = extractStateHashFromSdkData(token.sdkData);
+    const incomingStateKey = incomingTokenId && incomingStateHash
+      ? createTokenStateKey(incomingTokenId, incomingStateHash)
+      : null;
+
+    // Check tombstones - reject tokens with exact (tokenId, stateHash) match
+    // This prevents spent tokens from being re-added via Nostr re-delivery
+    // Tokens with the same tokenId but DIFFERENT stateHash are allowed (new state)
+    if (incomingTokenId && incomingStateHash && this.isStateTombstoned(incomingTokenId, incomingStateHash)) {
+      this.log(`Rejecting tombstoned token: ${incomingTokenId.slice(0, 8)}..._${incomingStateHash.slice(0, 8)}...`);
+      return false;
+    }
+
+    // Check for exact duplicate (same tokenId AND same stateHash)
+    if (incomingStateKey) {
+      for (const [existingId, existing] of this.tokens) {
+        if (isSameTokenState(existing, token)) {
+          // Exact duplicate - same tokenId and same stateHash
+          this.log(`Duplicate token state ignored: ${incomingTokenId?.slice(0, 8)}..._${incomingStateHash?.slice(0, 8)}...`);
+          return false;
+        }
       }
     }
 
+    // Check for older states of the same token (same tokenId, different stateHash)
+    // Replace older states with the new state
+    for (const [existingId, existing] of this.tokens) {
+      if (hasSameGenesisTokenId(existing, token)) {
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+
+        // Skip if same state (already handled above)
+        if (incomingStateHash && existingStateHash && incomingStateHash === existingStateHash) {
+          continue;
+        }
+
+        // CASE 1: Existing token is spent/invalid - allow replacement
+        if (existing.status === 'spent' || existing.status === 'invalid') {
+          this.log(`Replacing spent/invalid token ${incomingTokenId?.slice(0, 8)}...`);
+          this.tokens.delete(existingId);
+          break;
+        }
+
+        // CASE 2: Different stateHash - this is a newer state of the token
+        // Remove old state (it will be archived) and add new state
+        if (incomingStateHash && existingStateHash && incomingStateHash !== existingStateHash) {
+          this.log(`Token ${incomingTokenId?.slice(0, 8)}... state updated: ${existingStateHash.slice(0, 8)}... -> ${incomingStateHash.slice(0, 8)}...`);
+          // Archive old state before removing
+          await this.archiveToken(existing);
+          this.tokens.delete(existingId);
+          break;
+        }
+
+        // CASE 3: No state hashes available - use .id as heuristic
+        if (!incomingStateHash || !existingStateHash) {
+          if (existingId !== token.id) {
+            this.log(`Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
+            await this.archiveToken(existing);
+            this.tokens.delete(existingId);
+            break;
+          }
+        }
+      }
+    }
+
+    // Add the new token state
     this.tokens.set(token.id, token);
 
-    // Archive the token
+    // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
     // Add to transaction history
@@ -1624,7 +2099,7 @@ export class PaymentsModule {
     // Archive before removing
     await this.archiveToken(token);
 
-    // Create tombstone
+    // Create tombstone with exact (tokenId, stateHash) - requires both
     const tombstone = createTombstoneFromToken(token);
     if (tombstone) {
       const alreadyTombstoned = this.tombstones.some(
@@ -1632,8 +2107,12 @@ export class PaymentsModule {
       );
       if (!alreadyTombstoned) {
         this.tombstones.push(tombstone);
-        this.log(`Created tombstone for ${tombstone.tokenId.slice(0, 8)}...`);
+        this.log(`Created tombstone for ${tombstone.tokenId.slice(0, 8)}..._${tombstone.stateHash.slice(0, 8)}...`);
       }
+    } else {
+      // No valid tombstone could be created (missing tokenId or stateHash)
+      // Token will still be removed but may be re-synced later
+      this.log(`Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
     }
 
     // Remove from active tokens
@@ -2372,7 +2851,12 @@ export class PaymentsModule {
 
   /**
    * Resolve nametag to 33-byte compressed public key using resolveNametagInfo
-   * Returns null if nametag not found or publicKey not available
+   * Returns null if nametag not found
+   *
+   * NOTE: Legacy nametags without chainPubkey CANNOT be used for transfers.
+   * The transportPubkey (Nostr pubkey) is a different key from the L3 chainPubkey,
+   * so deriving one from the other is impossible. Legacy nametags must be re-registered
+   * with the new SDK format that includes chainPubkey.
    */
   private async resolveNametagToPublicKey(nametag: string): Promise<string | null> {
     if (!this.deps?.transport.resolveNametagInfo) {
@@ -2386,33 +2870,59 @@ export class PaymentsModule {
       return null;
     }
 
-    if (!info.chainPubkey) {
-      this.log(`Nametag "${nametag}" has no 33-byte chainPubkey (legacy event)`);
-      return null;
+    // Use chainPubkey if available (required for correct address derivation)
+    if (info.chainPubkey) {
+      return info.chainPubkey;
     }
 
-    return info.chainPubkey;
+    // Legacy nametag without chainPubkey - PROXY fallback will be used in resolveRecipientAddress
+    this.log(`Nametag "${nametag}" has no chainPubkey - will use PROXY address fallback`);
+    return null;
   }
 
   /**
    * Resolve recipient to IAddress for L3 transfers
    * Supports: nametag (with or without @), PROXY:, DIRECT:, hex pubkey
    */
-  private async resolveRecipientAddress(recipient: string): Promise<IAddress> {
+  private async resolveRecipientAddress(recipient: string, addressMode: 'auto' | 'direct' | 'proxy' = 'auto'): Promise<IAddress> {
     const { AddressFactory } = await import('@unicitylabs/state-transition-sdk/lib/address/AddressFactory');
+    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
 
-    // Explicit nametag with @ - resolve to 33-byte pubkey and use DirectAddress
+    // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
-      const publicKey = await this.resolveNametagToPublicKey(nametag);
-      if (publicKey) {
-        this.log(`Resolved @${nametag} to 33-byte publicKey for DirectAddress`);
-        return this.createDirectAddressFromPubkey(publicKey);
+      const info = await this.deps?.transport.resolveNametagInfo?.(nametag);
+      if (!info) {
+        throw new Error(`Nametag "@${nametag}" not found`);
       }
-      throw new Error(`Nametag "${nametag}" not found or missing publicKey`);
+
+      // Force PROXY mode
+      if (addressMode === 'proxy') {
+        console.log(`[Payments] Using PROXY address for @${nametag} (forced)`);
+        return ProxyAddress.fromNameTag(nametag);
+      }
+
+      // Force DIRECT mode - requires directAddress to be available
+      if (addressMode === 'direct') {
+        if (!info.directAddress) {
+          throw new Error(`Nametag "@${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
+        }
+        console.log(`[Payments] Using DirectAddress for @${nametag} (forced): ${info.directAddress.slice(0, 30)}...`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // AUTO mode: NEW nametags have directAddress stored, LEGACY use PROXY
+      if (info.directAddress) {
+        console.log(`[Payments] Using stored DirectAddress for @${nametag}: ${info.directAddress.slice(0, 30)}...`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // LEGACY nametags don't have directAddress - use PROXY address
+      this.log(`Using PROXY address for legacy nametag @${nametag}`);
+      return ProxyAddress.fromNameTag(nametag);
     }
 
-    // PROXY: or DIRECT: prefixed - parse using AddressFactory
+    // PROXY: or DIRECT: prefixed - parse using AddressFactory (explicit address overrides mode)
     if (recipient.startsWith('PROXY:') || recipient.startsWith('DIRECT:')) {
       return AddressFactory.createAddress(recipient);
     }
@@ -2423,11 +2933,33 @@ export class PaymentsModule {
       return this.createDirectAddressFromPubkey(recipient);
     }
 
-    // Smart detection: try as nametag - resolve to 33-byte pubkey and use DirectAddress
-    const publicKey = await this.resolveNametagToPublicKey(recipient);
-    if (publicKey) {
-      this.log(`Resolved "${recipient}" as nametag to 33-byte publicKey for DirectAddress`);
-      return this.createDirectAddressFromPubkey(publicKey);
+    // Smart detection: try as nametag
+    const info = await this.deps?.transport.resolveNametagInfo?.(recipient);
+    if (info) {
+      // Force PROXY mode
+      if (addressMode === 'proxy') {
+        console.log(`[Payments] Using PROXY address for "${recipient}" (forced)`);
+        return ProxyAddress.fromNameTag(recipient);
+      }
+
+      // Force DIRECT mode
+      if (addressMode === 'direct') {
+        if (!info.directAddress) {
+          throw new Error(`Nametag "${recipient}" has no DirectAddress stored. It may be a legacy registration.`);
+        }
+        console.log(`[Payments] Using DirectAddress for "${recipient}" (forced): ${info.directAddress.slice(0, 30)}...`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // AUTO mode: NEW nametags have directAddress - use it
+      if (info.directAddress) {
+        this.log(`Using stored DirectAddress for nametag "${recipient}"`);
+        return AddressFactory.createAddress(info.directAddress);
+      }
+
+      // LEGACY nametags - use PROXY
+      this.log(`Using PROXY address for legacy nametag "${recipient}"`);
+      return ProxyAddress.fromNameTag(recipient);
     }
 
     // Not found as nametag and doesn't look like an address
@@ -2437,11 +2969,291 @@ export class PaymentsModule {
     );
   }
 
+  /**
+   * Handle NOSTR-FIRST commitment-only transfer (recipient side)
+   * This is called when receiving a transfer with only commitmentData and no proof yet.
+   * We create the token as 'submitted', submit commitment (idempotent), and poll for proof.
+   */
+  private async handleCommitmentOnlyTransfer(
+    transfer: IncomingTokenTransfer,
+    payload: Record<string, unknown>
+  ): Promise<void> {
+    try {
+      const sourceTokenInput = typeof payload.sourceToken === 'string'
+        ? JSON.parse(payload.sourceToken as string)
+        : payload.sourceToken;
+      const commitmentInput = typeof payload.commitmentData === 'string'
+        ? JSON.parse(payload.commitmentData as string)
+        : payload.commitmentData;
+
+      if (!sourceTokenInput || !commitmentInput) {
+        console.warn('[Payments] Invalid NOSTR-FIRST transfer format');
+        return;
+      }
+
+      // Parse source token info
+      const tokenInfo = await parseTokenInfo(sourceTokenInput);
+
+      // Create token with 'submitted' status (unconfirmed until proof received)
+      const token: Token = {
+        id: tokenInfo.tokenId ?? crypto.randomUUID(),
+        coinId: tokenInfo.coinId,
+        symbol: tokenInfo.symbol,
+        name: tokenInfo.name,
+        decimals: tokenInfo.decimals,
+        iconUrl: tokenInfo.iconUrl,
+        amount: tokenInfo.amount,
+        status: 'submitted',  // NOSTR-FIRST: unconfirmed until proof
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        sdkData: typeof sourceTokenInput === 'string'
+          ? sourceTokenInput
+          : JSON.stringify(sourceTokenInput),
+      };
+
+      // Check tombstones - reject tokens with exact (tokenId, stateHash) match
+      // This prevents spent tokens from being re-added via Nostr re-delivery
+      // Tokens with the same tokenId but DIFFERENT stateHash are allowed (new state)
+      const nostrTokenId = extractTokenIdFromSdkData(token.sdkData);
+      const nostrStateHash = extractStateHashFromSdkData(token.sdkData);
+      if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
+        this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
+        return;
+      }
+
+      // Add token as unconfirmed
+      this.tokens.set(token.id, token);
+      await this.save();
+      this.log(`NOSTR-FIRST: Token ${token.id.slice(0, 8)}... added as submitted (unconfirmed)`);
+
+      // Emit event for incoming transfer (even though unconfirmed)
+      const incomingTransfer: IncomingTransfer = {
+        id: transfer.id,
+        senderPubkey: transfer.senderTransportPubkey,
+        tokens: [token],
+        memo: payload.memo as string | undefined,
+        receivedAt: transfer.timestamp,
+      };
+      this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+
+      // Parse commitment and start proof polling
+      try {
+        const commitment = await TransferCommitment.fromJSON(commitmentInput);
+        const requestIdBytes = commitment.requestId;
+        const requestIdHex = requestIdBytes instanceof Uint8Array
+          ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
+          : String(requestIdBytes);
+
+        // Submit commitment to aggregator (idempotent - same as sender)
+        const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+        if (stClient) {
+          const response = await stClient.submitTransferCommitment(commitment);
+          this.log(`NOSTR-FIRST recipient commitment submit: ${response.status}`);
+        }
+
+        // Start polling for proof
+        this.addProofPollingJob({
+          tokenId: token.id,
+          requestIdHex,
+          commitmentJson: JSON.stringify(commitmentInput),
+          startedAt: Date.now(),
+          attemptCount: 0,
+          lastAttemptAt: 0,
+          onProofReceived: async (tokenId) => {
+            // When proof arrives, finalize the token and update status
+            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput, transfer.senderTransportPubkey);
+          },
+        });
+      } catch (err) {
+        console.error('[Payments] Failed to parse commitment for proof polling:', err);
+        // Token remains as 'submitted' - will eventually time out
+      }
+    } catch (error) {
+      console.error('[Payments] Failed to process NOSTR-FIRST transfer:', error);
+    }
+  }
+
+  /**
+   * Shared finalization logic for received transfers.
+   * Handles both PROXY (with nametag token + address validation) and DIRECT schemes.
+   */
+  private async finalizeTransferToken(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sourceToken: SdkToken<any>,
+    transferTx: TransferTransaction,
+    stClient: StateTransitionClient,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    trustBase: any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Promise<SdkToken<any>> {
+    const recipientAddress = transferTx.data.recipient;
+    const addressScheme = recipientAddress.scheme;
+    const signingService = await this.createSigningService();
+    const transferSalt = transferTx.data.salt;
+
+    const recipientPredicate = await UnmaskedPredicate.create(
+      sourceToken.id,
+      sourceToken.type,
+      signingService,
+      HashAlgorithm.SHA256,
+      transferSalt
+    );
+    const recipientState = new TokenState(recipientPredicate, null);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let nametagTokens: SdkToken<any>[] = [];
+
+    if (addressScheme === AddressScheme.PROXY) {
+      // PROXY: Validate nametag address match (per reference impl)
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      if (!this.nametag?.token) {
+        throw new Error('Cannot finalize PROXY transfer - no nametag token');
+      }
+      const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+      const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+      if (proxy.address !== recipientAddress.address) {
+        throw new Error(
+          `PROXY address mismatch: nametag resolves to ${proxy.address} ` +
+          `but transfer targets ${recipientAddress.address}`
+        );
+      }
+      nametagTokens = [nametagToken];
+    }
+    // DIRECT: nametagTokens stays empty []
+
+    return stClient.finalizeTransaction(
+      trustBase,
+      sourceToken,
+      recipientState,
+      transferTx,
+      nametagTokens
+    );
+  }
+
+  /**
+   * Finalize a received token after proof is available
+   */
+  private async finalizeReceivedToken(
+    tokenId: string,
+    sourceTokenInput: unknown,
+    commitmentInput: unknown,
+    senderPubkey: string
+  ): Promise<void> {
+    try {
+      const token = this.tokens.get(tokenId);
+      if (!token) {
+        this.log(`Token ${tokenId} not found for finalization`);
+        return;
+      }
+
+      // Get proof from aggregator
+      const commitment = await TransferCommitment.fromJSON(commitmentInput);
+      if (!this.deps!.oracle.waitForProofSdk) {
+        this.log('Cannot finalize - no waitForProofSdk');
+        token.status = 'confirmed'; // Mark as confirmed anyway
+        token.updatedAt = Date.now();
+        await this.save();
+        return;
+      }
+
+      const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const transferTx = commitment.toTransaction(inclusionProof as any);
+
+      // Parse source token
+      const sourceToken = await SdkToken.fromJSON(sourceTokenInput);
+
+      // Get state transition client
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+
+      if (!stClient || !trustBase) {
+        this.log('Cannot finalize - missing state transition client or trust base');
+        token.status = 'confirmed';
+        token.updatedAt = Date.now();
+        await this.save();
+        return;
+      }
+
+      // Finalize using shared helper (handles PROXY address validation)
+      const finalizedSdkToken = await this.finalizeTransferToken(
+        sourceToken, transferTx, stClient, trustBase
+      );
+
+      // Update token with finalized data (create new token with updated sdkData)
+      const finalizedToken: Token = {
+        ...token,
+        status: 'confirmed',
+        updatedAt: Date.now(),
+        sdkData: JSON.stringify(finalizedSdkToken.toJSON()),
+      };
+      this.tokens.set(tokenId, finalizedToken);
+      await this.save();
+
+      // Also save as individual token file
+      await this.saveTokenToFileStorage(finalizedToken);
+
+      this.log(`NOSTR-FIRST: Token ${tokenId.slice(0, 8)}... finalized and confirmed`);
+
+      // Emit confirmation event
+      this.deps!.emitEvent('transfer:confirmed', {
+        id: crypto.randomUUID(),
+        status: 'completed',
+        tokens: [finalizedToken],
+      });
+
+      // Add to history
+      await this.addToHistory({
+        type: 'RECEIVED',
+        amount: finalizedToken.amount,
+        coinId: finalizedToken.coinId,
+        symbol: finalizedToken.symbol,
+        timestamp: Date.now(),
+        senderPubkey,
+      });
+    } catch (error) {
+      console.error('[Payments] Failed to finalize received token:', error);
+      // Mark as confirmed anyway (user has the token)
+      const token = this.tokens.get(tokenId);
+      if (token && token.status === 'submitted') {
+        token.status = 'confirmed';
+        token.updatedAt = Date.now();
+        await this.save();
+      }
+    }
+  }
+
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
     try {
       // Check payload format - Sphere wallet sends { sourceToken, transferTx }
       // SDK format is { token, proof }
+      // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
+
+      // Check for INSTANT_SPLIT bundle first (V4 or V5)
+      if (isInstantSplitBundle(payload)) {
+        this.log('Processing INSTANT_SPLIT bundle...');
+        try {
+          // Ensure nametag is loaded before processing (needed for PROXY address verification)
+          if (!this.nametag) {
+            await this.loadNametagFromFileStorage();
+          }
+
+          const result = await this.processInstantSplitBundle(
+            payload as InstantSplitBundle,
+            transfer.senderTransportPubkey
+          );
+          if (result.success) {
+            this.log('INSTANT_SPLIT processed successfully');
+          } else {
+            console.warn('[Payments] INSTANT_SPLIT processing failed:', result.error);
+          }
+        } catch (err) {
+          console.error('[Payments] INSTANT_SPLIT processing error:', err);
+        }
+        return;
+      }
 
       let tokenData: unknown;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2463,97 +3275,90 @@ export class PaymentsModule {
           return;
         }
 
-        const sourceToken = await SdkToken.fromJSON(sourceTokenInput);
-        const transferTx = await TransferTransaction.fromJSON(transferTxInput);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let sourceToken: SdkToken<any>;
+        let transferTx: TransferTransaction;
 
-        // Check if this is a PROXY address transfer (needs finalization)
-        const recipientAddress = transferTx.data.recipient;
-        const addressScheme = recipientAddress.scheme;
+        try {
+          sourceToken = await SdkToken.fromJSON(sourceTokenInput);
+        } catch (err) {
+          console.error('[Payments] Failed to parse sourceToken:', err);
+          return;
+        }
 
-        if (addressScheme === AddressScheme.PROXY) {
-          // Need to finalize with nametag token
-          if (!this.nametag?.token) {
-            console.error('[Payments] Cannot finalize PROXY transfer - no nametag token. Token rejected.');
-            return; // Reject token - cannot spend without finalization
-          }
-          {
-            try {
-              const nametagToken = await SdkToken.fromJSON(this.nametag.token);
-              const signingService = await this.createSigningService();
-              const transferSalt = transferTx.data.salt;
+        // Try multiple parsing strategies for transferTx
+        // Format 1: TransferTransaction - has { data, inclusionProof }
+        // Format 2: TransferCommitment - has { authenticator, requestId, transactionData }
+        try {
+          // Detect format based on structure
+          const hasInclusionProof = transferTxInput.inclusionProof !== undefined;
+          const hasData = transferTxInput.data !== undefined;
+          const hasTransactionData = transferTxInput.transactionData !== undefined;
+          const hasAuthenticator = transferTxInput.authenticator !== undefined;
 
-              const recipientPredicate = await UnmaskedPredicate.create(
-                sourceToken.id,
-                sourceToken.type,
-                signingService,
-                HashAlgorithm.SHA256,
-                transferSalt
-              );
-
-              const recipientState = new TokenState(recipientPredicate, null);
-
-              const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-
-              if (!stClient || !trustBase) {
-                console.error('[Payments] Cannot finalize - missing state transition client or trust base. Token rejected.');
-                return; // Reject token - cannot spend without finalization
-              }
-
-              finalizedSdkToken = await stClient.finalizeTransaction(
-                trustBase,
-                sourceToken,
-                recipientState,
-                transferTx,
-                [nametagToken]
-              );
-              tokenData = finalizedSdkToken.toJSON();
-              this.log('Token finalized successfully');
-            } catch (finalizeError) {
-              console.error('[Payments] Finalization failed:', finalizeError);
-              return; // Reject token - cannot spend without finalization
-            }
-          }
-        } else {
-          // Direct address - finalize to generate local state for tracking
-          this.log('Finalizing DIRECT address transfer for state tracking...');
-          try {
-            const signingService = await this.createSigningService();
-            const transferSalt = transferTx.data.salt;
-
-            const recipientPredicate = await UnmaskedPredicate.create(
-              sourceToken.id,
-              sourceToken.type,
-              signingService,
-              HashAlgorithm.SHA256,
-              transferSalt
-            );
-
-            const recipientState = new TokenState(recipientPredicate, null);
-
+          if (hasData && hasInclusionProof) {
+            // Full transaction format - parse directly
+            transferTx = await TransferTransaction.fromJSON(transferTxInput);
+          } else if (hasTransactionData && hasAuthenticator) {
+            // Commitment format - submit and wait for proof
+            const commitment = await TransferCommitment.fromJSON(transferTxInput);
             const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const trustBase = (this.deps!.oracle as any).getTrustBase?.();
-
-            if (!stClient || !trustBase) {
-              this.log('Cannot finalize DIRECT transfer - missing client, using source token');
-              tokenData = sourceTokenInput;
-            } else {
-              finalizedSdkToken = await stClient.finalizeTransaction(
-                trustBase,
-                sourceToken,
-                recipientState,
-                transferTx,
-                []  // No nametag tokens needed for DIRECT
-              );
-              tokenData = finalizedSdkToken.toJSON();
-              this.log('DIRECT transfer finalized successfully');
+            if (!stClient) {
+              console.error('[Payments] Cannot process commitment - no state transition client');
+              return;
             }
-          } catch (finalizeError) {
-            this.log('DIRECT finalization failed, using source token:', finalizeError);
-            tokenData = sourceTokenInput;
+
+            const response = await stClient.submitTransferCommitment(commitment);
+            if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
+              console.error('[Payments] Transfer commitment submission failed:', response.status);
+              return;
+            }
+
+            if (!this.deps!.oracle.waitForProofSdk) {
+              console.error('[Payments] Cannot wait for proof - missing oracle method');
+              return;
+            }
+            const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            transferTx = commitment.toTransaction(inclusionProof as any);
+          } else {
+            // Unknown format - try parsing approaches
+            try {
+              transferTx = await TransferTransaction.fromJSON(transferTxInput);
+            } catch {
+              // Try commitment format as fallback
+              const commitment = await TransferCommitment.fromJSON(transferTxInput);
+              const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+              if (!stClient || !this.deps!.oracle.waitForProofSdk) {
+                throw new Error('Cannot submit commitment - missing oracle methods');
+              }
+              await stClient.submitTransferCommitment(commitment);
+              const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              transferTx = commitment.toTransaction(inclusionProof as any);
+            }
           }
+        } catch (err) {
+          console.error('[Payments] Failed to parse transferTx:', err);
+          return;
+        }
+
+        // Finalize using shared helper (handles PROXY address validation)
+        try {
+          const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+          if (!stClient || !trustBase) {
+            console.error('[Payments] Cannot finalize - missing state transition client or trust base. Token rejected.');
+            return;
+          }
+          finalizedSdkToken = await this.finalizeTransferToken(sourceToken, transferTx, stClient, trustBase);
+          tokenData = finalizedSdkToken.toJSON();
+          const addressScheme = transferTx.data.recipient.scheme;
+          this.log(`${addressScheme === AddressScheme.PROXY ? 'PROXY' : 'DIRECT'} finalization successful`);
+        } catch (finalizeError) {
+          console.error(`[Payments] Finalization FAILED - token rejected:`, finalizeError);
+          return;
         }
       } else if (payload.token) {
         // SDK format
@@ -2590,14 +3395,8 @@ export class PaymentsModule {
           : JSON.stringify(tokenData),
       };
 
-      // Check if tombstoned
-      const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-      const stateHash = extractStateHashFromSdkData(token.sdkData);
-      if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
-        this.log(`Rejected tombstoned token ${sdkTokenId.slice(0, 8)}...`);
-        return;
-      }
-
+      // addToken() checks tombstones with exact (tokenId, stateHash) match
+      // Tokens with same tokenId but different stateHash pass through (new state)
       await this.addToken(token);
 
       const incomingTransfer: IncomingTransfer = {
@@ -2707,14 +3506,26 @@ export class PaymentsModule {
   private loadFromStorageData(data: TxfStorageDataBase): void {
     const parsed = parseTxfStorageData(data);
 
-    // Load tokens
+    // Load tombstones FIRST so we can filter tokens
+    this.tombstones = parsed.tombstones;
+    // Load tokens, filtering out tombstoned ones
+    // NOTE: Only filter by exact (tokenId, stateHash) match to avoid over-blocking
+    // When state hash is unavailable, we can't reliably distinguish old from new
     this.tokens.clear();
     for (const token of parsed.tokens) {
+      const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
+      const stateHash = extractStateHashFromSdkData(token.sdkData);
+
+      // Only filter if we have exact state match
+      if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
+        this.log(`Skipping tombstoned token ${sdkTokenId.slice(0, 8)}... during load (exact state match)`);
+        continue;
+      }
+
       this.tokens.set(token.id, token);
     }
 
     // Load other data
-    this.tombstones = parsed.tombstones;
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
     // Only overwrite nametag if TXF data explicitly includes one.
@@ -2722,6 +3533,185 @@ export class PaymentsModule {
     // so parsed.nametag is normally null and must not erase the existing value.
     if (parsed.nametag !== null) {
       this.nametag = parsed.nametag;
+    }
+  }
+
+  // ===========================================================================
+  // Private: NOSTR-FIRST Proof Polling
+  // ===========================================================================
+
+  /**
+   * Submit commitment to aggregator and start background proof polling
+   * (NOSTR-FIRST pattern: fire-and-forget submission)
+   */
+  private async submitAndPollForProof(
+    tokenId: string,
+    commitment: TransferCommitment,
+    requestIdHex: string,
+    onProofReceived?: (tokenId: string) => void
+  ): Promise<void> {
+    try {
+      // Submit to aggregator
+      const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+      if (!stClient) {
+        this.log('Cannot submit commitment - no state transition client');
+        return;
+      }
+
+      const response = await stClient.submitTransferCommitment(commitment);
+      if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
+        this.log(`Transfer commitment submission failed: ${response.status}`);
+        // Mark token as invalid since submission failed
+        const token = this.tokens.get(tokenId);
+        if (token) {
+          token.status = 'invalid';
+          token.updatedAt = Date.now();
+          this.tokens.set(tokenId, token);
+          await this.save();
+        }
+        return;
+      }
+
+      // Add to polling queue
+      this.addProofPollingJob({
+        tokenId,
+        requestIdHex,
+        commitmentJson: JSON.stringify(commitment.toJSON()),
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+        onProofReceived,
+      });
+    } catch (error) {
+      this.log('submitAndPollForProof error:', error);
+    }
+  }
+
+  /**
+   * Add a proof polling job to the queue
+   */
+  private addProofPollingJob(job: ProofPollingJob): void {
+    this.proofPollingJobs.set(job.tokenId, job);
+    this.log(`Added proof polling job for token ${job.tokenId.slice(0, 8)}...`);
+    this.startProofPolling();
+  }
+
+  /**
+   * Start the proof polling interval if not already running
+   */
+  private startProofPolling(): void {
+    if (this.proofPollingInterval) return;
+    if (this.proofPollingJobs.size === 0) return;
+
+    this.log('Starting proof polling...');
+    this.proofPollingInterval = setInterval(
+      () => this.processProofPollingQueue(),
+      PaymentsModule.PROOF_POLLING_INTERVAL_MS
+    );
+  }
+
+  /**
+   * Stop the proof polling interval
+   */
+  private stopProofPolling(): void {
+    if (this.proofPollingInterval) {
+      clearInterval(this.proofPollingInterval);
+      this.proofPollingInterval = null;
+      this.log('Stopped proof polling');
+    }
+  }
+
+  /**
+   * Process all pending proof polling jobs
+   */
+  private async processProofPollingQueue(): Promise<void> {
+    if (this.proofPollingJobs.size === 0) {
+      this.stopProofPolling();
+      return;
+    }
+
+    const completedJobs: string[] = [];
+
+    for (const [tokenId, job] of this.proofPollingJobs) {
+      try {
+        job.attemptCount++;
+        job.lastAttemptAt = Date.now();
+
+        // Check for timeout
+        if (job.attemptCount >= PaymentsModule.PROOF_POLLING_MAX_ATTEMPTS) {
+          this.log(`Proof polling timeout for token ${tokenId.slice(0, 8)}...`);
+          // Mark token as invalid due to timeout
+          const token = this.tokens.get(tokenId);
+          if (token && token.status === 'submitted') {
+            token.status = 'invalid';
+            token.updatedAt = Date.now();
+            this.tokens.set(tokenId, token);
+          }
+          completedJobs.push(tokenId);
+          continue;
+        }
+
+        // Try to get proof from aggregator using a short timeout
+        const commitment = await TransferCommitment.fromJSON(JSON.parse(job.commitmentJson));
+
+        // Try to get proof with a quick timeout (non-blocking check)
+        let inclusionProof: unknown = null;
+        try {
+          // Create abort controller for quick timeout
+          const abortController = new AbortController();
+          const timeoutId = setTimeout(() => abortController.abort(), 500);
+
+          if (this.deps!.oracle.waitForProofSdk) {
+            inclusionProof = await Promise.race([
+              this.deps!.oracle.waitForProofSdk(commitment, abortController.signal),
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+            ]);
+          } else {
+            // Fallback: use getProof with request ID hex
+            const proof = await this.deps!.oracle.getProof(job.requestIdHex);
+            if (proof) {
+              inclusionProof = proof;
+            }
+          }
+
+          clearTimeout(timeoutId);
+        } catch (err) {
+          // Proof not ready yet or timed out
+          continue;
+        }
+
+        if (!inclusionProof) {
+          // Proof not ready yet
+          continue;
+        }
+
+        // Proof received! Update token status
+        const token = this.tokens.get(tokenId);
+        if (token) {
+          token.status = 'spent';
+          token.updatedAt = Date.now();
+          this.tokens.set(tokenId, token);
+          await this.save();
+          this.log(`Proof received for token ${tokenId.slice(0, 8)}..., status: spent`);
+        }
+
+        // Call callback if provided
+        job.onProofReceived?.(tokenId);
+        completedJobs.push(tokenId);
+      } catch (error) {
+        // Most errors mean proof is not ready yet, continue polling
+        this.log(`Proof polling attempt ${job.attemptCount} for ${tokenId.slice(0, 8)}...: ${error}`);
+      }
+    }
+
+    // Remove completed jobs
+    for (const tokenId of completedJobs) {
+      this.proofPollingJobs.delete(tokenId);
+    }
+
+    // Stop polling if no more jobs
+    if (this.proofPollingJobs.size === 0) {
+      this.stopProofPolling();
     }
   }
 

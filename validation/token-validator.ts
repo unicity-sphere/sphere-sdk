@@ -7,7 +7,7 @@
 
 import type { Token } from '../types';
 import type { TxfTransaction, ValidationIssue, TokenValidationResult } from '../types/txf';
-import { getCurrentStateHash, tokenToTxf } from '../serialization/txf-serializer';
+import { tokenToTxf } from '../serialization/txf-serializer';
 
 // =============================================================================
 // Types
@@ -295,7 +295,16 @@ export class TokenValidator {
   }
 
   /**
-   * Check which tokens are spent
+   * Check which tokens are spent using SDK Token object to calculate state hash.
+   *
+   * Follows the same approach as the Sphere webgui TokenValidationService:
+   * 1. Parse TXF using SDK's Token.fromJSON()
+   * 2. Calculate CURRENT state hash via sdkToken.state.calculateHash()
+   * 3. Create RequestId via RequestId.create(walletPubKey, calculatedHash)
+   *
+   * Uses wallet's own pubkey (not source state predicate key) because "spent" means
+   * the CURRENT OWNER committed this state. Using the source state key would falsely
+   * detect received tokens as "spent" (sender's commitment matches source state).
    */
   async checkSpentTokens(
     tokens: Token[],
@@ -305,9 +314,24 @@ export class TokenValidator {
     const spentTokens: SpentTokenInfo[] = [];
     const errors: string[] = [];
 
+    if (!this.aggregatorClient) {
+      errors.push('Aggregator client not available');
+      return { spentTokens, errors };
+    }
+
     const batchSize = options?.batchSize ?? 3;
     const total = tokens.length;
     let completed = 0;
+
+    // Import SDK modules once
+    const { Token: SdkToken } = await import(
+      '@unicitylabs/state-transition-sdk/lib/token/Token'
+    );
+    const { RequestId } = await import(
+      '@unicitylabs/state-transition-sdk/lib/api/RequestId'
+    );
+
+    const pubKeyBytes = Buffer.from(publicKey, 'hex');
 
     for (let i = 0; i < tokens.length; i += batchSize) {
       const batch = tokens.slice(i, i + batchSize);
@@ -320,15 +344,67 @@ export class TokenValidator {
               return { tokenId: token.id, localId: token.id, stateHash: '', spent: false, error: 'Invalid TXF' };
             }
 
-            const tokenId = txf.genesis.data.tokenId;
-            const stateHash = getCurrentStateHash(txf);
+            const tokenId = txf.genesis?.data?.tokenId || token.id;
 
-            if (!stateHash) {
-              return { tokenId, localId: token.id, stateHash: '', spent: false, error: 'No state hash' };
+            // Parse TXF into SDK Token object (like webgui does)
+            const sdkToken = await SdkToken.fromJSON(txf);
+
+            // Use SDK-calculated state hash + wallet's own public key for spent detection
+            // (matching webgui TokenValidationService approach)
+            //
+            // Key insight: "spent" means the CURRENT OWNER has committed this state as input
+            // for another transition. So we check:
+            //   RequestId = hash(wallet_pubkey + current_state_hash)
+            // If the aggregator has an inclusion proof → we spent this token
+            // If exclusion proof → token is still ours (unspent)
+            //
+            // Using the SOURCE STATE's predicate key would incorrectly detect received tokens
+            // as "spent" (because the sender's commitment matches the source state).
+            const calculatedStateHash = await sdkToken.state.calculateHash();
+            const calculatedStateHashStr = calculatedStateHash.toJSON();
+
+            // Check cache
+            const cacheKey = `${tokenId}:${calculatedStateHashStr}:${publicKey}`;
+            const cached = this.spentStateCache.get(cacheKey);
+            if (cached !== undefined) {
+              if (cached.isSpent) {
+                return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: true };
+              }
+              if (Date.now() - cached.timestamp < this.UNSPENT_CACHE_TTL_MS) {
+                return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: false };
+              }
             }
 
-            const spent = await this.isTokenStateSpent(tokenId, stateHash, publicKey);
-            return { tokenId, localId: token.id, stateHash, spent };
+            // Create RequestId using wallet's public key + SDK-calculated state hash
+            const { DataHash } = await import(
+              '@unicitylabs/state-transition-sdk/lib/hash/DataHash'
+            );
+            const stateHashObj = DataHash.fromJSON(calculatedStateHashStr);
+            const requestId = await RequestId.create(pubKeyBytes, stateHashObj);
+
+            // Query aggregator
+            const response = await this.aggregatorClient!.getInclusionProof(requestId);
+
+            let isSpent = false;
+
+            if (response.inclusionProof) {
+              const proof = response.inclusionProof;
+              const pathResult = await proof.merkleTreePath.verify(
+                requestId.toBitString().toBigInt()
+              );
+
+              if (pathResult.isPathValid && pathResult.isPathIncluded && proof.authenticator !== null) {
+                isSpent = true;
+              }
+            }
+
+            // Cache result
+            this.spentStateCache.set(cacheKey, {
+              isSpent,
+              timestamp: Date.now(),
+            });
+
+            return { tokenId, localId: token.id, stateHash: calculatedStateHashStr, spent: isSpent };
           } catch (err) {
             return {
               tokenId: token.id,
