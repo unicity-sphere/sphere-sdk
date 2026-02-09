@@ -532,13 +532,21 @@ interface TransportProvider {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
 
-  setIdentity(identity: FullIdentity): Promise<void>;
+  setIdentity(identity: FullIdentity): void;
   sendMessage(recipientPubkey: string, content: string): Promise<string>;
   onMessage(callback: (msg: IncomingMessage) => void): () => void;
+  sendTokenTransfer(recipientPubkey: string, payload: TokenTransferPayload): Promise<string>;
+  onTokenTransfer(handler: TokenTransferHandler): () => void;
 
-  // Optional
-  resolveNametag?(nametag: string): Promise<string | null>;
-  registerNametag?(nametag: string): Promise<boolean>;
+  // Peer resolution (optional)
+  resolve?(identifier: string): Promise<PeerInfo | null>;
+  resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
+  resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
+
+  // Identity binding (optional)
+  publishIdentityBinding?(chainPubkey: string, l1Address: string, directAddress: string, nametag?: string): Promise<boolean>;
+
+  // Broadcast (optional)
   publishBroadcast?(content: string, tags?: string[]): Promise<string>;
   subscribeToBroadcast?(tags: string[], callback: (b: IncomingBroadcast) => void): () => void;
 }
