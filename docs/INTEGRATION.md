@@ -211,6 +211,45 @@ interface AddressInfo {
 }
 ```
 
+### Tracked Addresses
+
+The SDK tracks which addresses have been activated (via create, switchToAddress, registerNametag). This lets UI display the list of used addresses with metadata.
+
+```typescript
+// Get all active (non-hidden) addresses
+const addresses = sphere.getActiveAddresses();
+for (const addr of addresses) {
+  console.log(`#${addr.index}: ${addr.l1Address}`);
+  console.log(`  DIRECT: ${addr.directAddress}`);
+  console.log(`  Nametag: ${addr.nametag ?? 'none'}`);
+  console.log(`  Created: ${new Date(addr.createdAt)}`);
+}
+
+// Switch to a new address (auto-tracked)
+await sphere.switchToAddress(2);
+
+// Register nametag for current address
+await sphere.registerNametag('bob');
+
+// Hide an address from UI
+await sphere.setAddressHidden(1, true);
+
+// Get all including hidden
+const all = sphere.getAllTrackedAddresses();
+
+// Get single address
+const addr = sphere.getTrackedAddress(0);
+
+// Listen for new address activations
+sphere.on('address:activated', ({ address }) => {
+  console.log(`New address tracked: #${address.index}`);
+});
+
+sphere.on('address:hidden', ({ index, addressId }) => {
+  console.log(`Address #${index} hidden`);
+});
+```
+
 ---
 
 ## L3 Payments
@@ -562,6 +601,10 @@ interface StorageProvider {
   has(key: string): Promise<boolean>;
   keys(prefix?: string): Promise<string[]>;
   clear(prefix?: string): Promise<void>;
+
+  // Tracked addresses registry
+  saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void>;
+  loadTrackedAddresses(): Promise<TrackedAddressEntry[]>;
 }
 ```
 
@@ -647,6 +690,11 @@ sphere.on('nametag:recovered', ({ nametag }) => { });
 
 // Identity events
 sphere.on('identity:changed', ({ l1Address, directAddress, chainPubkey, nametag, addressIndex }) => { });
+
+// Address tracking events
+sphere.on('address:activated', ({ address }) => { });  // New address tracked
+sphere.on('address:hidden', ({ index, addressId }) => { });
+sphere.on('address:unhidden', ({ index, addressId }) => { });
 ```
 
 ### Unsubscribe

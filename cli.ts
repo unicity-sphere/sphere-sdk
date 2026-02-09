@@ -226,6 +226,12 @@ TRANSFERS:
   receive                           Show address for receiving tokens
   history [limit]                   Show transaction history
 
+ADDRESSES:
+  addresses                         List all tracked addresses
+  switch <index>                    Switch to address at HD index
+  hide <index>                      Hide address from active list
+  unhide <index>                    Unhide address
+
 NAMETAGS:
   nametag <name>                    Register a nametag (@name)
   nametag-info <name>               Lookup nametag info
@@ -953,6 +959,87 @@ async function main() {
         }
         console.log('─'.repeat(60));
 
+        await closeSphere();
+        break;
+      }
+
+      // === ADDRESSES ===
+      case 'addresses': {
+        const sphere = await getSphere();
+        const all = sphere.getAllTrackedAddresses();
+        const currentIndex = sphere.getCurrentAddressIndex();
+
+        console.log('\nTracked Addresses:');
+        console.log('─'.repeat(70));
+
+        if (all.length === 0) {
+          console.log('No tracked addresses.');
+        } else {
+          for (const addr of all) {
+            const marker = addr.index === currentIndex ? '→ ' : '  ';
+            const hidden = addr.hidden ? ' [hidden]' : '';
+            const tag = addr.nametag ? ` @${addr.nametag}` : '';
+            console.log(`${marker}#${addr.index}: ${addr.l1Address}${tag}${hidden}`);
+            console.log(`    DIRECT: ${addr.directAddress}`);
+          }
+        }
+
+        console.log('─'.repeat(70));
+        await closeSphere();
+        break;
+      }
+
+      case 'switch': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: switch <index>');
+          console.error('  index: HD address index (0, 1, 2, ...)');
+          process.exit(1);
+        }
+
+        const index = parseInt(indexStr);
+        if (isNaN(index) || index < 0) {
+          console.error('Invalid index. Must be a non-negative integer.');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.switchToAddress(index);
+
+        const identity = sphere.identity;
+        console.log(`\nSwitched to address #${index}`);
+        console.log(`  L1:      ${identity?.l1Address}`);
+        console.log(`  DIRECT:  ${identity?.directAddress}`);
+        console.log(`  Nametag: ${identity?.nametag || '(not set)'}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'hide': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: hide <index>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.setAddressHidden(parseInt(indexStr), true);
+        console.log(`Address #${indexStr} hidden.`);
+        await closeSphere();
+        break;
+      }
+
+      case 'unhide': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: unhide <index>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.setAddressHidden(parseInt(indexStr), false);
+        console.log(`Address #${indexStr} unhidden.`);
         await closeSphere();
         break;
       }

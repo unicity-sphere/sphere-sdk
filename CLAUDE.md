@@ -61,6 +61,11 @@ await sphere.payments.send({
 // Register nametag (mints token on-chain!)
 await sphere.registerNametag('myname');
 
+// Multi-address management
+await sphere.switchToAddress(1);
+const addresses = sphere.getActiveAddresses(); // non-hidden tracked addresses
+await sphere.setAddressHidden(1, true);        // hide from UI
+
 // Listen for incoming transfers
 sphere.on('transfer:incoming', (event) => {
   console.log('Received:', event.data.amount);
@@ -197,6 +202,19 @@ interface Identity {
 interface FullIdentity extends Identity {
   privateKey: string;       // secp256k1 private key (hex)
 }
+
+// Tracked address (returned by getActiveAddresses(), etc.)
+interface TrackedAddress {
+  index: number;            // HD derivation index
+  addressId: string;        // "DIRECT_abc123_xyz789"
+  l1Address: string;        // alpha1...
+  directAddress: string;    // DIRECT://...
+  chainPubkey: string;      // 33-byte compressed pubkey
+  nametag?: string;         // primary nametag (without @)
+  hidden: boolean;          // manual hide flag for UI
+  createdAt: number;        // ms timestamp
+  updatedAt: number;        // ms timestamp
+}
 ```
 
 ### Provider Pattern
@@ -300,6 +318,8 @@ TxfStorageDataBase {
 4. **New events**:
    - `nametag:recovered` - Emitted when nametag found on Nostr during import
    - `identity:changed` - Updated with new field names
+   - `address:activated` - Emitted when new address first tracked
+   - `address:hidden` / `address:unhidden` - Address visibility changes
 
 5. **TypeScript 5.6 compatibility**: Web Crypto API ArrayBuffer types fixed
 
@@ -313,7 +333,7 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 825+
+**Total tests:** 840+
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
@@ -322,6 +342,7 @@ Key test files:
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
+- `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
 
 ## Dependencies
 

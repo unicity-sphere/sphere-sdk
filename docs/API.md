@@ -84,6 +84,48 @@ Get the default address path (`m/44'/0'/0'/0/0`).
 
 Check if wallet has BIP32 master key for HD derivation.
 
+#### `getCurrentAddressIndex(): number`
+
+Get the current active address index.
+
+#### `switchToAddress(index: number): Promise<void>`
+
+Switch the active identity to a different HD-derived address. Automatically tracks the address in the registry.
+
+```typescript
+await sphere.switchToAddress(1);
+console.log(sphere.getCurrentAddressIndex()); // 1
+console.log(sphere.identity!.l1Address);      // alpha1... (address at index 1)
+```
+
+#### `getActiveAddresses(): TrackedAddress[]`
+
+Get all non-hidden tracked addresses, sorted by index.
+
+```typescript
+const addresses = sphere.getActiveAddresses();
+for (const addr of addresses) {
+  console.log(`#${addr.index}: ${addr.l1Address} (${addr.nametag ?? 'no nametag'})`);
+}
+```
+
+#### `getAllTrackedAddresses(): TrackedAddress[]`
+
+Get all tracked addresses including hidden ones, sorted by index.
+
+#### `getTrackedAddress(index: number): TrackedAddress | undefined`
+
+Get a single tracked address by HD index.
+
+#### `setAddressHidden(index: number, hidden: boolean): Promise<void>`
+
+Hide or unhide a tracked address. Hidden addresses are excluded from `getActiveAddresses()`.
+
+```typescript
+await sphere.setAddressHidden(1, true);   // hide
+await sphere.setAddressHidden(1, false);  // unhide
+```
+
 #### `resolve(identifier: string): Promise<PeerInfo | null>`
 
 Resolve any identifier to full peer information. Delegates to the transport provider.
@@ -595,6 +637,33 @@ interface AddressInfo {
 
 Note: `AddressInfo.publicKey` is the same format as `Identity.chainPubkey` (33-byte compressed secp256k1).
 
+### TrackedAddressEntry
+
+Minimal data stored in persistent storage for a tracked address.
+
+```typescript
+interface TrackedAddressEntry {
+  readonly index: number;      // HD derivation index
+  hidden: boolean;             // Whether hidden from UI
+  readonly createdAt: number;  // Timestamp (ms) when first activated
+  updatedAt: number;           // Timestamp (ms) of last modification
+}
+```
+
+### TrackedAddress
+
+Full tracked address with derived fields (available in memory via `getActiveAddresses()`, etc.).
+
+```typescript
+interface TrackedAddress extends TrackedAddressEntry {
+  readonly addressId: string;      // Short ID (e.g., "DIRECT_abc123_xyz789")
+  readonly l1Address: string;      // L1 bech32 address (alpha1...)
+  readonly directAddress: string;  // L3 DIRECT address (DIRECT://...)
+  readonly chainPubkey: string;    // 33-byte compressed secp256k1
+  readonly nametag?: string;       // Primary nametag (without @ prefix)
+}
+```
+
 ### ProviderStatus
 
 ```typescript
@@ -624,8 +693,11 @@ type SphereEventType =
   | 'sync:error'
   | 'connection:changed'
   | 'nametag:registered'
-  | 'nametag:recovered'   // New: emitted when nametag is recovered from Nostr
-  | 'identity:changed';   // Emitted when switching addresses
+  | 'nametag:recovered'
+  | 'identity:changed'
+  | 'address:activated'   // Emitted when address first tracked
+  | 'address:hidden'      // Emitted when address hidden
+  | 'address:unhidden';   // Emitted when address unhidden
 ```
 
 ### SphereEventMap
@@ -642,6 +714,9 @@ interface SphereEventMap {
     nametag?: string;
     addressIndex: number;
   };
+  'address:activated': { address: TrackedAddress };
+  'address:hidden': { index: number; addressId: string };
+  'address:unhidden': { index: number; addressId: string };
 }
 ```
 
