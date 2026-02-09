@@ -168,15 +168,44 @@ await Sphere.clear(storage);
 
 ### Methods
 
-#### `getBalance(): Promise<Balance>`
+#### `getBalance(): Promise<number | null>`
+
+Returns total portfolio value in USD. Requires `PriceProvider` to be configured.
 
 ```typescript
-interface Balance {
-  total: string;      // Total balance in smallest units
-  available: string;  // Spendable balance
-  pending: string;    // Unconfirmed balance
-}
+const totalUsd = await sphere.payments.getBalance();
+// 1523.45 — total value of all confirmed tokens in USD
+// null    — if PriceProvider is not configured or no prices available
 ```
+
+#### `getAssets(coinId?: string): Promise<Asset[]>`
+
+Returns aggregated assets (tokens grouped by coinId) with price data. Only includes confirmed tokens.
+
+```typescript
+interface Asset {
+  readonly coinId: string;       // Token coin ID
+  readonly symbol: string;       // e.g., 'UCT'
+  readonly name: string;         // e.g., 'Unicity'
+  readonly decimals: number;     // e.g., 18
+  readonly iconUrl?: string;     // Token icon URL
+  readonly totalAmount: string;  // Sum of all token amounts (smallest units)
+  readonly tokenCount: number;   // Number of tokens aggregated
+  readonly priceUsd: number | null;     // Price per unit in USD
+  readonly priceEur: number | null;     // Price per unit in EUR
+  readonly change24h: number | null;    // 24h price change %
+  readonly fiatValueUsd: number | null; // totalAmount * priceUsd (in human units)
+  readonly fiatValueEur: number | null; // totalAmount * priceEur (in human units)
+}
+
+// All assets
+const assets = await sphere.payments.getAssets();
+
+// Filter by coinId
+const uctAssets = await sphere.payments.getAssets('0xabc...');
+```
+
+> **Note:** Price fields are `null` when `PriceProvider` is not configured. The SDK works fully without it — prices are optional.
 
 #### `getTokens(): Promise<Token[]>`
 
@@ -1025,3 +1054,108 @@ interface AggregatorClient {
   isTokenStateSpent?(trustBase: unknown, token: unknown, pubKey: Buffer): Promise<boolean>;
 }
 ```
+
+---
+
+## PriceProvider
+
+Optional provider for fetching token market prices. Enables `getBalance()` (total USD value) and price enrichment in `getAssets()`.
+
+### Configuration
+
+```typescript
+// Via createBrowserProviders / createNodeProviders
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: {
+    platform: 'coingecko',       // Currently supported: 'coingecko'
+    apiKey: 'CG-xxx',            // Optional (free tier works without key)
+    baseUrl: '/api/coingecko',   // Optional: custom base URL (e.g., CORS proxy)
+    cacheTtlMs: 60000,           // Cache TTL (default: 60s)
+    timeout: 10000,              // Request timeout (default: 10s)
+    debug: false,                // Enable debug logging
+  },
+});
+
+// Or set after initialization
+import { createPriceProvider } from '@unicitylabs/sphere-sdk';
+
+sphere.setPriceProvider(createPriceProvider({
+  platform: 'coingecko',
+  apiKey: 'CG-xxx',
+}));
+```
+
+### PriceProvider Interface
+
+```typescript
+type PricePlatform = 'coingecko';
+
+interface TokenPrice {
+  readonly tokenName: string;    // CoinGecko ID (e.g., "bitcoin")
+  readonly priceUsd: number;
+  readonly priceEur?: number;
+  readonly change24h?: number;
+  readonly timestamp: number;
+}
+
+interface PriceProvider {
+  readonly platform: PricePlatform;
+  getPrices(tokenNames: string[]): Promise<Map<string, TokenPrice>>;
+  getPrice(tokenName: string): Promise<TokenPrice | null>;
+  clearCache(): void;
+}
+```
+
+### PriceProviderConfig
+
+```typescript
+interface PriceProviderConfig {
+  platform: PricePlatform;     // 'coingecko'
+  apiKey?: string;             // API key (optional for free tier)
+  baseUrl?: string;            // Custom base URL (e.g., for CORS proxy)
+  cacheTtlMs?: number;        // Cache TTL in ms (default: 60000)
+  timeout?: number;            // Request timeout in ms (default: 10000)
+  debug?: boolean;             // Enable debug logging
+}
+```
+
+### CoinGeckoPriceProvider
+
+- **Free tier**: `api.coingecko.com` (no API key needed, rate-limited)
+- **Pro tier**: `pro-api.coingecko.com` (requires API key via `x-cg-pro-api-key` header)
+- **Custom URL**: `baseUrl` overrides the default API endpoint (useful for CORS proxy in browser)
+- Internal cache with configurable TTL (default 60s)
+- **Negative cache**: tokens not found on CoinGecko are cached as "not found" for the TTL duration, preventing repeated API requests for project-specific tokens
+- Partial fetch: only requests uncached tokens from API
+- Stale-on-error: returns cached data on API failure instead of throwing
+
+### CORS Proxy (Browser)
+
+CoinGecko's free API does not include CORS headers, so browser requests will be blocked. Solutions:
+
+1. **Development**: Use a dev server proxy (e.g., Vite):
+   ```typescript
+   // vite.config.ts
+   export default defineConfig({
+     server: {
+       proxy: {
+         '/api/coingecko': {
+           target: 'https://api.coingecko.com/api/v3',
+           changeOrigin: true,
+           rewrite: (path) => path.replace(/^\/api\/coingecko/, ''),
+         },
+       },
+     },
+   });
+
+   // SDK config
+   const providers = createBrowserProviders({
+     network: 'testnet',
+     price: { platform: 'coingecko', baseUrl: '/api/coingecko' },
+   });
+   ```
+
+2. **Production**: Use a reverse proxy (Nginx, Cloudflare Worker, etc.) or the CoinGecko Pro API which supports CORS natively.
+
+3. **Node.js**: No proxy needed — server-side requests are not subject to CORS.

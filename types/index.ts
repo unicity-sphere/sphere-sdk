@@ -74,19 +74,6 @@ export interface Token {
   readonly sdkData?: string;
 }
 
-export interface TokenBalance {
-  readonly coinId: string;
-  readonly symbol: string;
-  readonly name: string;
-  readonly totalAmount: string;
-  readonly confirmedAmount: string;     // Amount with inclusion proofs
-  readonly unconfirmedAmount: string;   // Amount pending proof (NOSTR-FIRST)
-  readonly tokenCount: number;
-  readonly confirmedTokenCount: number;   // Tokens with proofs
-  readonly unconfirmedTokenCount: number; // Tokens pending proof
-  readonly decimals: number;
-}
-
 export interface Asset {
   readonly coinId: string;
   readonly symbol: string;
@@ -95,6 +82,16 @@ export interface Asset {
   readonly iconUrl?: string;
   readonly totalAmount: string;
   readonly tokenCount: number;
+  /** Price per whole unit in USD (null if PriceProvider not configured) */
+  readonly priceUsd: number | null;
+  /** Price per whole unit in EUR (null if PriceProvider not configured) */
+  readonly priceEur: number | null;
+  /** 24h price change percentage (null if unavailable) */
+  readonly change24h: number | null;
+  /** Total fiat value in USD: (totalAmount / 10^decimals) * priceUsd */
+  readonly fiatValueUsd: number | null;
+  /** Total fiat value in EUR */
+  readonly fiatValueEur: number | null;
 }
 
 // =============================================================================

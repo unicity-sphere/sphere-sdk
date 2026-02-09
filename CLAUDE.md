@@ -44,8 +44,12 @@ const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
 ### Common Operations
 
 ```typescript
-// Check balance
-const balance = sphere.payments.getBalance();
+// Check total portfolio value in USD (requires PriceProvider)
+const balance = await sphere.payments.getBalance(); // number | null
+
+// Get assets with price data
+const assets = await sphere.payments.getAssets();
+// [{ coinId, symbol, totalAmount, priceUsd, fiatValueUsd, ... }]
 
 // Send tokens
 await sphere.payments.send({
@@ -73,6 +77,7 @@ await sphere.destroy();
 | Storage | localStorage + IndexedDB | File-based JSON |
 | Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
 | Oracle (Aggregator) | Included with API key | Included with API key |
+| Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | IPFS sync | Optional (`helia`) | Not available |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
@@ -124,6 +129,11 @@ sphere-sdk/
 │
 ├── oracle/                  # Token validation (Aggregator)
 │   └── oracle-provider.ts         # OracleProvider interface
+│
+├── price/                   # Token market prices
+│   ├── price-provider.ts          # PriceProvider interface
+│   ├── CoinGeckoPriceProvider.ts  # CoinGecko implementation
+│   └── index.ts                   # Barrel exports + factory
 │
 ├── impl/                    # Platform-specific implementations
 │   ├── browser/            # LocalStorage, IndexedDB, IPFS
@@ -198,6 +208,7 @@ Abstract interfaces for platform independence:
 | TokenStorage | `TokenStorageProvider` | IndexedDBTokenStorageProvider, FileTokenStorageProvider, IpfsStorageProvider |
 | Transport | `TransportProvider` | NostrTransportProvider |
 | Oracle | `OracleProvider` | UnicityAggregatorProvider |
+| Price | `PriceProvider` | CoinGeckoPriceProvider |
 
 ### Network Configuration
 
@@ -292,16 +303,24 @@ TxfStorageDataBase {
 
 5. **TypeScript 5.6 compatibility**: Web Crypto API ArrayBuffer types fixed
 
+6. **PriceProvider** (optional): CoinGecko integration for token fiat prices
+   - `getBalance()` returns total USD value (`number | null`)
+   - `getAssets()` returns assets enriched with `priceUsd`, `fiatValueUsd`, `change24h`
+   - `baseUrl` config for CORS proxy in browser environments
+   - Negative cache: tokens not found on CoinGecko are cached to prevent repeated requests
+   - `setPriceProvider()` for runtime provider configuration
+
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 611+
+**Total tests:** 825+
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
+- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 
 ## Dependencies
@@ -337,7 +356,8 @@ const { sphere } = await Sphere.init({
 });
 
 // 4. Operations
-const balance = await sphere.payments.getBalance();
+const balance = await sphere.payments.getBalance(); // total USD value or null
+const assets = await sphere.payments.getAssets();    // assets with price data
 await sphere.payments.send({ recipient: '@bob', amount: '1000000', coinId: 'UCT' });
 
 // 5. Cleanup

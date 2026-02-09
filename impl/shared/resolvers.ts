@@ -7,10 +7,12 @@ import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, type NetworkType, type NetworkCon
 import type {
   BaseTransportConfig,
   BaseOracleConfig,
+  BasePriceConfig,
   L1Config,
   ResolvedTransportConfig,
   ResolvedOracleConfig,
 } from './config';
+import type { PriceProviderConfig } from '../../price';
 
 // =============================================================================
 // Network Resolution
@@ -148,6 +150,44 @@ export function resolveL1Config(
     electrumUrl: config.electrumUrl ?? networkConfig.electrumUrl,
     defaultFeeRate: config.defaultFeeRate,
     enableVesting: config.enableVesting,
+  };
+}
+
+// =============================================================================
+// Price Resolution
+// =============================================================================
+
+/**
+ * Resolve price provider configuration
+ *
+ * Returns undefined if no price config is provided (price is optional).
+ *
+ * @example
+ * ```ts
+ * // No price config
+ * resolvePriceConfig(undefined); // undefined
+ *
+ * // Minimal config (defaults to coingecko)
+ * resolvePriceConfig({}); // { platform: 'coingecko' }
+ *
+ * // With API key
+ * resolvePriceConfig({ apiKey: 'CG-xxx' }); // { platform: 'coingecko', apiKey: 'CG-xxx' }
+ * ```
+ */
+export function resolvePriceConfig(
+  config?: BasePriceConfig
+): PriceProviderConfig | undefined {
+  if (config === undefined) {
+    return undefined;
+  }
+
+  return {
+    platform: config.platform ?? 'coingecko',
+    apiKey: config.apiKey,
+    baseUrl: config.baseUrl,
+    cacheTtlMs: config.cacheTtlMs,
+    timeout: config.timeout,
+    debug: config.debug,
   };
 }
 

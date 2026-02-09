@@ -28,16 +28,23 @@
 The easiest way to set up providers is using the factory functions:
 
 ```typescript
-// Browser
+// Browser (requires CORS proxy for free CoinGecko API — see "CORS Proxy" section below)
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
-const providers = createBrowserProviders({ network: 'testnet' });
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: {
+    platform: 'coingecko',
+    baseUrl: '/api/coingecko',  // CORS proxy path (see below)
+  },
+});
 
-// Node.js
+// Node.js (no proxy needed)
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 const providers = createNodeProviders({
   network: 'testnet',
   dataDir: './wallet',
   tokensDir: './tokens',
+  price: { platform: 'coingecko', apiKey: 'CG-xxx' },  // Optional
 });
 ```
 
@@ -208,12 +215,58 @@ interface AddressInfo {
 
 ## L3 Payments
 
-### Get Balance
+### Get Balance & Assets
 
 ```typescript
-const balance = await sphere.payments.getBalance();
-// Returns: { total: '1000000', available: '1000000', pending: '0' }
+// Total portfolio value in USD (null if PriceProvider not configured)
+const totalUsd = await sphere.payments.getBalance();
+console.log('Total USD:', totalUsd); // number | null
+
+// Get assets with price data
+const assets = await sphere.payments.getAssets();
+for (const asset of assets) {
+  console.log(`${asset.symbol}: ${asset.totalAmount}`);
+  console.log(`  Price: $${asset.priceUsd ?? 'N/A'}`);
+  console.log(`  Value: $${asset.fiatValueUsd?.toFixed(2) ?? 'N/A'}`);
+}
 ```
+
+### Set Price Provider After Init
+
+```typescript
+import { createPriceProvider } from '@unicitylabs/sphere-sdk';
+
+// Set or replace PriceProvider at runtime
+sphere.setPriceProvider(createPriceProvider({
+  platform: 'coingecko',
+  apiKey: userProvidedKey,
+}));
+```
+
+### CORS Proxy (Browser)
+
+CoinGecko's free API does not include CORS headers. In browser environments, you need a proxy:
+
+**Vite (development):**
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    proxy: {
+      '/api/coingecko': {
+        target: 'https://api.coingecko.com/api/v3',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/coingecko/, ''),
+      },
+    },
+  },
+});
+```
+
+Then pass `baseUrl: '/api/coingecko'` in the `price` config. In production, use Nginx or a Cloudflare Worker as a reverse proxy. CoinGecko Pro API supports CORS natively and doesn't require a proxy.
+
+Node.js environments are not subject to CORS — no proxy needed.
 
 ### Get Tokens
 
@@ -863,11 +916,12 @@ npm test -- --coverage
 | `modules/TokenSplitExecutor` | 16 | Token split execution |
 | `modules/PaymentsModule` | 36 | Payments, nametag, PROXY |
 | `modules/NametagMinter` | 22 | On-chain nametag minting |
+| `price/CoinGeckoPriceProvider` | 29 | Price provider, cache, negative cache |
 | `transport/NostrTransportProvider` | 24 | Nostr P2P messaging |
 | `integration/wallet-import-export` | 20 | Wallet import/export |
 | `integration/nametag-roundtrip` | 9 | Nametag serialization |
 | `impl/shared/resolvers` | 41 | Config resolution utilities |
-| **Total** | **611** | All passing |
+| **Total** | **825+** | All passing |
 
 ### Writing Tests
 
@@ -896,6 +950,8 @@ tests/
 │   │   ├── TokenSplitExecutor.test.ts
 │   │   ├── PaymentsModule.test.ts
 │   │   └── NametagMinter.test.ts
+│   ├── price/
+│   │   └── CoinGeckoPriceProvider.test.ts
 │   ├── transport/
 │   │   └── NostrTransportProvider.test.ts
 │   ├── serialization/

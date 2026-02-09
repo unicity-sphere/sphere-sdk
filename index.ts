@@ -351,3 +351,19 @@ export type {
   TokenIcon,
   RegistryNetwork,
 } from './registry';
+
+// =============================================================================
+// Price Provider
+// =============================================================================
+
+export type {
+  PriceProvider,
+  PriceProviderConfig,
+  PricePlatform,
+  TokenPrice,
+} from './price';
+
+export {
+  CoinGeckoPriceProvider,
+  createPriceProvider,
+} from './price';

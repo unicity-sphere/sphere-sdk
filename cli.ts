@@ -607,42 +607,36 @@ async function main() {
       // === BALANCE & TOKENS ===
       case 'balance': {
         const sphere = await getSphere();
-        const balances = sphere.payments.getBalance();
+        const assets = await sphere.payments.getAssets();
+        const totalUsd = await sphere.payments.getBalance();
 
         console.log('\nL3 Balance:');
         console.log('─'.repeat(50));
 
-        if (balances.length === 0) {
+        if (assets.length === 0) {
           console.log('No tokens found.');
         } else {
-          for (const bal of balances) {
-            const decimals = bal.decimals ?? 8;
+          for (const asset of assets) {
+            const decimals = asset.decimals ?? 8;
             const divisor = BigInt(10 ** decimals);
+            const amountBigInt = BigInt(asset.totalAmount);
+            const wholePart = amountBigInt / divisor;
+            const fracPart = amountBigInt % divisor;
+            const formatted = fracPart > 0n
+              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+              : wholePart.toString();
 
-            // Format confirmed amount
-            const confirmedBigInt = BigInt(bal.confirmedAmount);
-            const confirmedWhole = confirmedBigInt / divisor;
-            const confirmedFrac = confirmedBigInt % divisor;
-            const confirmedFormatted = confirmedFrac > 0
-              ? `${confirmedWhole}.${confirmedFrac.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-              : confirmedWhole.toString();
-
-            // Format unconfirmed amount
-            const unconfirmedBigInt = BigInt(bal.unconfirmedAmount);
-
-            if (unconfirmedBigInt > 0n) {
-              const unconfirmedWhole = unconfirmedBigInt / divisor;
-              const unconfirmedFrac = unconfirmedBigInt % divisor;
-              const unconfirmedFormatted = unconfirmedFrac > 0
-                ? `${unconfirmedWhole}.${unconfirmedFrac.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-                : unconfirmedWhole.toString();
-              console.log(`${bal.symbol}: ${confirmedFormatted} (+ ${unconfirmedFormatted} unconfirmed) [${bal.confirmedTokenCount}+${bal.unconfirmedTokenCount} tokens]`);
-            } else {
-              console.log(`${bal.symbol}: ${confirmedFormatted} (${bal.tokenCount} tokens)`);
+            let line = `${asset.symbol}: ${formatted} (${asset.tokenCount} token${asset.tokenCount !== 1 ? 's' : ''})`;
+            if (asset.fiatValueUsd != null) {
+              line += ` ≈ $${asset.fiatValueUsd.toFixed(2)}`;
             }
+            console.log(line);
           }
         }
         console.log('─'.repeat(50));
+        if (totalUsd != null) {
+          console.log(`Total: $${totalUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+        }
 
         await closeSphere();
         break;

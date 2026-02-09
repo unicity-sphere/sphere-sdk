@@ -34,14 +34,18 @@ import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { NetworkType } from '../../constants';
+import type { PriceProvider } from '../../price';
+import { createPriceProvider } from '../../price';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
+  type BasePriceConfig,
   type L1Config,
   type BrowserTransportExtensions,
   resolveTransportConfig,
   resolveOracleConfig,
   resolveL1Config,
+  resolvePriceConfig,
   resolveArrayConfig,
   getNetworkConfig,
 } from '../shared';
@@ -167,6 +171,8 @@ export interface BrowserProvidersConfig {
    * Each backend can be enabled/disabled independently
    */
   tokenSync?: TokenSyncConfig;
+  /** Price provider configuration (optional — enables fiat value display) */
+  price?: BasePriceConfig;
 }
 
 export interface BrowserProviders {
@@ -177,6 +183,8 @@ export interface BrowserProviders {
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   /** L1 configuration (for passing to Sphere.init) */
   l1?: L1Config;
+  /** Price provider (optional — enables fiat value display) */
+  price?: PriceProvider;
   /**
    * Token sync configuration (resolved from tokenSync options)
    * For advanced use cases when additional sync backends are needed
@@ -341,6 +349,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
+  const priceConfig = resolvePriceConfig(config?.price);
 
   return {
     storage: createLocalStorageProvider(config?.storage),
@@ -362,6 +371,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     }),
     tokenStorage: createIndexedDBTokenStorageProvider(),
     l1: l1Config,
+    price: priceConfig ? createPriceProvider(priceConfig) : undefined,
     tokenSyncConfig,
   };
 }
