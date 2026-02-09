@@ -114,27 +114,26 @@ export class NametagMinter {
     this.log(`Starting mint for nametag: ${cleanNametag}`);
 
     try {
-      // 1. Check availability
-      const isAvailable = await this.isNametagAvailable(cleanNametag);
-      if (!isAvailable) {
-        return {
-          success: false,
-          error: `Nametag "${cleanNametag}" is already taken`,
-        };
-      }
-
-      // 2. Create token ID and type
+      // 1. Create token ID and type
       const nametagTokenId = await TokenId.fromNameTag(cleanNametag);
       const nametagTokenType = new TokenType(
         Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex')
       );
 
-      // 3. Generate salt
-      const salt = new Uint8Array(32);
-      crypto.getRandomValues(salt);
-      this.log('Generated salt');
+      // 2. Generate deterministic salt from signing key + nametag.
+      // This ensures the same wallet can recover its nametag token if lost
+      // from local storage, because re-minting produces the same commitment
+      // and the aggregator returns REQUEST_ID_EXISTS with the same inclusion proof.
+      const nametagBytes = new TextEncoder().encode(cleanNametag);
+      const pubKey = this.signingService.publicKey;
+      const saltInput = new Uint8Array(pubKey.length + nametagBytes.length);
+      saltInput.set(pubKey, 0);
+      saltInput.set(nametagBytes, pubKey.length);
+      const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
+      const salt = new Uint8Array(saltBuffer);
+      this.log('Generated deterministic salt');
 
-      // 4. Create mint transaction data
+      // 3. Create mint transaction data
       const mintData = await MintTransactionData.createFromNametag(
         cleanNametag,
         nametagTokenType,
@@ -144,11 +143,13 @@ export class NametagMinter {
       );
       this.log('Created MintTransactionData');
 
-      // 5. Create commitment
+      // 4. Create commitment
       const commitment = await MintCommitment.create(mintData);
       this.log('Created MintCommitment');
 
-      // 6. Submit to aggregator with retries
+      // 5. Submit to aggregator with retries
+      // If the nametag was previously minted by this wallet (same deterministic salt),
+      // the aggregator returns REQUEST_ID_EXISTS which is handled as success.
       const MAX_RETRIES = 3;
       let submitSuccess = false;
 
@@ -190,15 +191,15 @@ export class NametagMinter {
         };
       }
 
-      // 7. Wait for inclusion proof
+      // 6. Wait for inclusion proof
       this.log('Waiting for inclusion proof...');
       const inclusionProof = await waitInclusionProof(this.trustBase, this.client, commitment);
       this.log('Received inclusion proof');
 
-      // 8. Create genesis transaction
+      // 7. Create genesis transaction
       const genesisTransaction = commitment.toTransaction(inclusionProof);
 
-      // 9. Create token predicate and state
+      // 8. Create token predicate and state
       const nametagPredicate = await UnmaskedPredicate.create(
         nametagTokenId,
         nametagTokenType,
@@ -209,7 +210,7 @@ export class NametagMinter {
 
       const tokenState = new TokenState(nametagPredicate, null);
 
-      // 10. Create final token
+      // 9. Create final token
       let token: Token<any>;
 
       if (this.skipVerification) {
@@ -232,7 +233,7 @@ export class NametagMinter {
 
       this.log(`Nametag minted successfully: ${cleanNametag}`);
 
-      // 11. Create NametagData for storage
+      // 10. Create NametagData for storage
       const nametagData: NametagData = {
         name: cleanNametag,
         token: token.toJSON(),

@@ -131,6 +131,7 @@ export type {
 export type {
   // Transport
   TransportProvider,
+  PeerInfo,
   MessageHandler,
   TokenTransferHandler,
   BroadcastHandler,

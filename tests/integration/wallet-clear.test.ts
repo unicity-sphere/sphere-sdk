@@ -73,10 +73,19 @@ function createMockTransport(): TransportProvider {
     resolveNametag: vi.fn((nametag: string) => {
       return Promise.resolve(nostrRelayNametags.get(nametag) ?? null);
     }),
+    publishIdentityBinding: vi.fn((chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
+      if (nametag) {
+        const existing = nostrRelayNametags.get(nametag);
+        if (existing && existing !== chainPubkey) {
+          return Promise.resolve(false);
+        }
+        nostrRelayNametags.set(nametag, chainPubkey);
+      }
+      return Promise.resolve(true);
+    }),
     registerNametag: vi.fn((nametag: string, chainPubkey: string) => {
       const existing = nostrRelayNametags.get(nametag);
       if (existing && existing !== chainPubkey) {
-        // Nametag taken by another pubkey
         return Promise.resolve(false);
       }
       nostrRelayNametags.set(nametag, chainPubkey);

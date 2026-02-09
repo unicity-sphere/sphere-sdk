@@ -53,11 +53,12 @@ export interface IdentityConfig {
 // =============================================================================
 
 export type TokenStatus =
-  | 'pending'
-  | 'confirmed'
-  | 'transferring'
-  | 'spent'
-  | 'invalid';
+  | 'pending'      // Initial creation
+  | 'submitted'    // Commitment sent, waiting for proof (NOSTR-FIRST)
+  | 'confirmed'    // Has inclusion proof
+  | 'transferring' // Being transferred
+  | 'spent'        // Transferred away
+  | 'invalid';     // Validation failed
 
 export interface Token {
   readonly id: string;
@@ -105,11 +106,15 @@ export type TransferStatus =
   | 'completed'
   | 'failed';
 
+export type AddressMode = 'auto' | 'direct' | 'proxy';
+
 export interface TransferRequest {
   readonly coinId: string;
   readonly amount: string;
   readonly recipient: string;
   readonly memo?: string;
+  /** Address mode: 'auto' (default) uses directAddress if available, 'direct' forces DIRECT, 'proxy' forces PROXY */
+  readonly addressMode?: AddressMode;
 }
 
 export interface TransferResult {
@@ -484,3 +489,9 @@ export type { AddressInfo } from '../core/crypto';
 
 // Re-export TXF types
 export * from './txf';
+
+// Re-export instant split types
+export * from './instant-split';
+
+// Re-export payment session types
+export * from './payment-session';

@@ -224,11 +224,11 @@ export class L1PaymentsModule {
    * Resolve nametag to L1 address using transport provider
    */
   private async resolveNametagToL1Address(nametag: string): Promise<string> {
-    if (!this._transport?.resolveNametagInfo) {
-      throw new Error('Transport provider does not support nametag resolution');
+    if (!this._transport?.resolve) {
+      throw new Error('Transport provider does not support resolution');
     }
 
-    const info = await this._transport.resolveNametagInfo(nametag);
+    const info = await this._transport.resolve(nametag);
     if (!info) {
       throw new Error(`Nametag not found: ${nametag}`);
     }

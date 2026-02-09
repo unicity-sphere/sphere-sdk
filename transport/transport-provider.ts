@@ -45,15 +45,39 @@ export interface TransportProvider extends BaseProvider {
   onTokenTransfer(handler: TokenTransferHandler): () => void;
 
   /**
+   * Resolve any identifier to full peer information.
+   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, L1 address, chain pubkey, or transport pubkey.
+   * @param identifier - Any supported identifier format
+   * @returns PeerInfo or null if not found
+   */
+  resolve?(identifier: string): Promise<PeerInfo | null>;
+
+  /**
    * Resolve nametag to public key
    */
   resolveNametag?(nametag: string): Promise<string | null>;
 
   /**
-   * Resolve nametag to full address information
+   * Resolve nametag to full peer information
    * Returns transportPubkey, chainPubkey, l1Address, directAddress, proxyAddress
    */
-  resolveNametagInfo?(nametag: string): Promise<NametagInfo | null>;
+  resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
+
+  /**
+   * Resolve a DIRECT://, PROXY://, or L1 address to full peer info.
+   * Performs reverse lookup: address → binding event → PeerInfo.
+   * @param address - L3 address (DIRECT://... or PROXY://...) or L1 address (alpha1...)
+   * @returns PeerInfo or null if no binding found for this address
+   */
+  resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
+
+  /**
+   * Resolve transport pubkey to full peer info.
+   * Queries binding events authored by the given transport pubkey.
+   * @param transportPubkey - Transport-specific pubkey (e.g. 64-char hex string)
+   * @returns PeerInfo or null if no binding found
+   */
+  resolveTransportPubkeyInfo?(transportPubkey: string): Promise<PeerInfo | null>;
 
   /**
    * Recover nametag for current identity by decrypting stored encrypted nametag
@@ -63,15 +87,27 @@ export interface TransportProvider extends BaseProvider {
   recoverNametag?(): Promise<string | null>;
 
   /**
+   * Publish identity binding event.
+   * Without nametag: publishes base binding (chainPubkey, l1Address, directAddress).
+   * With nametag: adds nametag hash, proxy address, encrypted nametag for recovery.
+   * Uses parameterized replaceable event (kind 30078, d=hash(nostrPubkey)).
+   * @returns true if successful, false if nametag is taken by another pubkey
+   */
+  publishIdentityBinding?(
+    chainPubkey: string,
+    l1Address: string,
+    directAddress: string,
+    nametag?: string,
+  ): Promise<boolean>;
+
+  /**
+   * @deprecated Use publishIdentityBinding instead
    * Register a nametag for this identity
-   * @param nametag - Nametag to register
-   * @param chainPubkey - 33-byte compressed secp256k1 public key (for L1/L3)
-   * @param directAddress - L3 DIRECT address (DIRECT://...)
-   * @returns true if successful, false if already taken
    */
   registerNametag?(nametag: string, chainPubkey: string, directAddress: string): Promise<boolean>;
 
   /**
+   * @deprecated Use publishIdentityBinding instead
    * Publish nametag binding
    */
   publishNametag?(nametag: string, address: string): Promise<void>;
@@ -154,7 +190,70 @@ export interface TransportProvider extends BaseProvider {
    * Check if a relay is currently connected
    */
   isRelayConnected?(relayUrl: string): boolean;
+
+  // ===========================================================================
+  // Instant Split Support (optional)
+  // ===========================================================================
+
+  /**
+   * Send an instant split bundle to a recipient.
+   * This is a specialized method for INSTANT_SPLIT V5 bundles.
+   *
+   * @param recipientTransportPubkey - Transport-specific pubkey for messaging
+   * @param bundle - The InstantSplitBundleV5 to send
+   * @returns Event ID
+   */
+  sendInstantSplitBundle?(
+    recipientTransportPubkey: string,
+    bundle: InstantSplitBundlePayload
+  ): Promise<string>;
+
+  /**
+   * Subscribe to incoming instant split bundles.
+   *
+   * @param handler - Handler for received bundles
+   * @returns Unsubscribe function
+   */
+  onInstantSplitReceived?(handler: InstantSplitBundleHandler): () => void;
 }
+
+// =============================================================================
+// Instant Split Types
+// =============================================================================
+
+/**
+ * Payload for sending instant split bundles
+ */
+export interface InstantSplitBundlePayload {
+  /** The bundle JSON string (InstantSplitBundleV5 serialized) */
+  bundle: string;
+  /** Optional memo */
+  memo?: string;
+  /** Sender info */
+  sender?: {
+    transportPubkey: string;
+    nametag?: string;
+  };
+}
+
+/**
+ * Incoming instant split bundle
+ */
+export interface IncomingInstantSplitBundle {
+  /** Event ID */
+  id: string;
+  /** Transport-specific pubkey of sender */
+  senderTransportPubkey: string;
+  /** The bundle JSON string */
+  bundle: string;
+  /** Timestamp */
+  timestamp: number;
+}
+
+/**
+ * Handler for instant split bundles
+ */
+export type InstantSplitBundleHandler = (bundle: IncomingInstantSplitBundle) => void;
 
 // =============================================================================
 // Message Types
@@ -323,16 +422,17 @@ export type TransportProviderFactory<TConfig, TProvider extends TransportProvide
 ) => TProvider;
 
 // =============================================================================
-// Nametag Info Types
+// Peer Info Types
 // =============================================================================
 
 /**
- * Full nametag address information
- * Used for resolving nametag to all address formats
+ * Resolved peer identity information.
+ * Returned by resolve methods — contains all public address formats for a peer.
+ * Fields nametag and proxyAddress are optional (only present if nametag is registered).
  */
-export interface NametagInfo {
-  /** Nametag name (without @) */
-  nametag: string;
+export interface PeerInfo {
+  /** Nametag name (without @), if registered */
+  nametag?: string;
   /** Transport-specific pubkey (for messaging/encryption) */
   transportPubkey: string;
   /** 33-byte compressed secp256k1 public key (for L3 chain) */
@@ -341,8 +441,11 @@ export interface NametagInfo {
   l1Address: string;
   /** L3 DIRECT address (DIRECT://...) */
   directAddress: string;
-  /** L3 PROXY address derived from nametag hash (PROXY:...) */
-  proxyAddress: string;
+  /** L3 PROXY address derived from nametag hash (PROXY:...), only if nametag registered */
+  proxyAddress?: string;
   /** Event timestamp */
   timestamp: number;
 }
+
+/** @deprecated Use PeerInfo instead */
+export type NametagInfo = PeerInfo;
