@@ -290,6 +290,42 @@ export interface BroadcastMessage {
 }
 
 // =============================================================================
+// Tracked Addresses
+// =============================================================================
+
+/**
+ * Minimal data stored in persistent storage for a tracked address.
+ * Only contains user state — derived fields are computed on load.
+ */
+export interface TrackedAddressEntry {
+  /** HD derivation index (0, 1, 2, ...) */
+  readonly index: number;
+  /** Whether this address is hidden from UI display */
+  hidden: boolean;
+  /** Timestamp (ms) when this address was first activated */
+  readonly createdAt: number;
+  /** Timestamp (ms) of last modification */
+  updatedAt: number;
+}
+
+/**
+ * Full tracked address with derived fields and nametag (available in memory).
+ * Returned by Sphere.getActiveAddresses() / getAllTrackedAddresses().
+ */
+export interface TrackedAddress extends TrackedAddressEntry {
+  /** Short address identifier (e.g., "DIRECT_abc123_xyz789") */
+  readonly addressId: string;
+  /** L1 bech32 address (alpha1...) */
+  readonly l1Address: string;
+  /** L3 DIRECT address (DIRECT://...) */
+  readonly directAddress: string;
+  /** 33-byte compressed secp256k1 public key */
+  readonly chainPubkey: string;
+  /** Primary nametag (from nametag cache, without @ prefix) */
+  readonly nametag?: string;
+}
+
+// =============================================================================
 // Event Types
 // =============================================================================
 
@@ -311,7 +347,10 @@ export type SphereEventType =
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
-  | 'identity:changed';
+  | 'identity:changed'
+  | 'address:activated'
+  | 'address:hidden'
+  | 'address:unhidden';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -332,6 +371,9 @@ export interface SphereEventMap {
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
+  'address:activated': { address: TrackedAddress };
+  'address:hidden': { index: number; addressId: string };
+  'address:unhidden': { index: number; addressId: string };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (

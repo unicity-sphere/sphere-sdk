@@ -3,7 +3,7 @@
  * Platform-independent storage abstraction
  */
 
-import type { BaseProvider, FullIdentity } from '../types';
+import type { BaseProvider, FullIdentity, TrackedAddressEntry } from '../types';
 
 // =============================================================================
 // Storage Provider Interface
@@ -48,6 +48,16 @@ export interface StorageProvider extends BaseProvider {
    * Clear all keys with optional prefix filter
    */
   clear(prefix?: string): Promise<void>;
+
+  /**
+   * Save tracked addresses (only user state: index, hidden, timestamps)
+   */
+  saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void>;
+
+  /**
+   * Load tracked addresses
+   */
+  loadTrackedAddresses(): Promise<TrackedAddressEntry[]>;
 }
 
 // =============================================================================

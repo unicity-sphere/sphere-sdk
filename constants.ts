@@ -40,8 +40,10 @@ export const STORAGE_KEYS_GLOBAL = {
   WALLET_EXISTS: 'wallet_exists',
   /** Current active address index */
   CURRENT_ADDRESS_INDEX: 'current_address_index',
-  /** Index of address nametags (JSON: { "0": "alice", "1": "bob" }) - for discovery */
+  /** Nametag cache per address (separate from tracked addresses registry) */
   ADDRESS_NAMETAGS: 'address_nametags',
+  /** Active addresses registry (JSON: TrackedAddressesStorage) */
+  TRACKED_ADDRESSES: 'tracked_addresses',
 } as const;
 
 /**
