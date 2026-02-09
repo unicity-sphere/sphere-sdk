@@ -485,13 +485,15 @@ export class Sphere {
     // Track address 0 in the registry
     await sphere.ensureAddressTracked(0);
 
-    // Publish identity binding via transport (makes wallet discoverable)
-    await sphere.syncIdentityWithTransport();
-
-    // Register nametag if provided, otherwise try to recover from transport
+    // Register nametag if provided, otherwise publish identity and try recovery
     if (options.nametag) {
+      // registerNametag publishes identity binding WITH nametag atomically
+      // (calling syncIdentityWithTransport before this would race — both replaceable
+      // events get the same created_at second and relay keeps the one without nametag)
       await sphere.registerNametag(options.nametag);
     } else {
+      // Publish identity binding via transport (makes wallet discoverable)
+      await sphere.syncIdentityWithTransport();
       // Try to recover nametag from transport (for wallet import scenarios)
       await sphere.recoverNametagFromTransport();
     }
@@ -1592,7 +1594,7 @@ export class Sphere {
    * await sphere.switchToAddress(0);
    * ```
    */
-  async switchToAddress(index: number): Promise<void> {
+  async switchToAddress(index: number, options?: { nametag?: string }): Promise<void> {
     this.ensureReady();
 
     if (!this._masterKey) {
@@ -1601,6 +1603,14 @@ export class Sphere {
 
     if (index < 0) {
       throw new Error('Address index must be non-negative');
+    }
+
+    // If nametag requested, validate format early
+    const newNametag = options?.nametag?.startsWith('@')
+      ? options.nametag.slice(1)
+      : options?.nametag;
+    if (newNametag && !this.validateNametag(newNametag)) {
+      throw new Error('Invalid nametag format. Use alphanumeric characters, 3-20 chars.');
     }
 
     // Derive the address at the given index
@@ -1615,6 +1625,23 @@ export class Sphere {
     // Ensure address is tracked in the registry
     await this.ensureAddressTracked(index);
     const addressId = getAddressId(predicateAddress);
+
+    // If nametag requested, check availability and store it BEFORE building identity
+    if (newNametag) {
+      const existing = await this._transport.resolveNametag?.(newNametag);
+      if (existing) {
+        throw new Error(`Nametag @${newNametag} is already taken`);
+      }
+
+      // Pre-populate nametag cache so identity is built WITH nametag
+      let nametags = this._addressNametags.get(addressId);
+      if (!nametags) {
+        nametags = new Map();
+        this._addressNametags.set(addressId, nametags);
+      }
+      nametags.set(0, newNametag);
+    }
+
     const nametag = this._addressNametags.get(addressId)?.get(0);
 
     // Update identity
@@ -1636,18 +1663,58 @@ export class Sphere {
 
     // Re-initialize providers with new identity
     this._storage.setIdentity(this._identity);
-    this._transport.setIdentity(this._identity);
+    await this._transport.setIdentity(this._identity);
 
-    // Update token storage providers
+    // Update token storage providers and re-open databases for new address
     for (const provider of this._tokenStorageProviders.values()) {
       provider.setIdentity(this._identity);
+      await provider.initialize();
     }
 
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
 
-    // Publish identity binding for the new address
-    await this.syncIdentityWithTransport();
+    // Publish identity binding (with nametag if present — single atomic publish)
+    if (this._identity.nametag) {
+      await this.syncIdentityWithTransport();
+    }
+
+    // If new nametag was registered, persist cache and mint token
+    if (newNametag) {
+      await this.persistAddressNametags();
+
+      if (!this._payments.hasNametag()) {
+        console.log(`[Sphere] Minting nametag token for @${newNametag}...`);
+        try {
+          const result = await this.mintNametag(newNametag);
+          if (result.success) {
+            console.log(`[Sphere] Nametag token minted successfully`);
+          } else {
+            console.warn(`[Sphere] Could not mint nametag token: ${result.error}`);
+          }
+        } catch (err) {
+          console.warn(`[Sphere] Nametag token mint failed:`, err);
+        }
+      }
+
+      this.emitEvent('nametag:registered', {
+        nametag: newNametag,
+        addressIndex: index,
+      });
+    } else if (this._identity.nametag && !this._payments.hasNametag()) {
+      // Existing address with nametag but missing token — mint it
+      console.log(`[Sphere] Nametag @${this._identity.nametag} has no token after switch, minting...`);
+      try {
+        const result = await this.mintNametag(this._identity.nametag);
+        if (result.success) {
+          console.log(`[Sphere] Nametag token minted successfully after switch`);
+        } else {
+          console.warn(`[Sphere] Could not mint nametag token after switch: ${result.error}`);
+        }
+      } catch (err) {
+        console.warn(`[Sphere] Nametag token mint failed after switch:`, err);
+      }
+    }
 
     this.emitEvent('identity:changed', {
       l1Address: this._identity.l1Address,
@@ -2594,7 +2661,7 @@ export class Sphere {
   private async initializeProviders(): Promise<void> {
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
-    this._transport.setIdentity(this._identity!);
+    await this._transport.setIdentity(this._identity!);
 
     // Set identity on all token storage providers
     for (const provider of this._tokenStorageProviders.values()) {

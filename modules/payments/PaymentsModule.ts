@@ -659,6 +659,23 @@ export class PaymentsModule {
    * Initialize module with dependencies
    */
   initialize(deps: PaymentsModuleDependencies): void {
+    // Clean up previous subscriptions before re-initializing
+    this.unsubscribeTransfers?.();
+    this.unsubscribeTransfers = null;
+    this.unsubscribePaymentRequests?.();
+    this.unsubscribePaymentRequests = null;
+    this.unsubscribePaymentRequestResponses?.();
+    this.unsubscribePaymentRequestResponses = null;
+
+    // Reset per-address state (will be re-populated by load())
+    this.tokens.clear();
+    this.pendingTransfers.clear();
+    this.tombstones = [];
+    this.archivedTokens.clear();
+    this.forkedTokens.clear();
+    this.transactionHistory = [];
+    this.nametag = null;
+
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
 

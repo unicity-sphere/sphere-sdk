@@ -434,7 +434,7 @@ export class NostrTransportProvider implements TransportProvider {
   // TransportProvider Implementation
   // ===========================================================================
 
-  setIdentity(identity: FullIdentity): void {
+  async setIdentity(identity: FullIdentity): Promise<void> {
     this.identity = identity;
 
     // Create NostrKeyManager from private key
@@ -475,13 +475,10 @@ export class NostrTransportProvider implements TransportProvider {
         },
       });
 
-      // Connect with new identity and set up subscriptions
-      this.nostrClient.connect(...this.config.relays).then(() => {
-        this.subscribeToEvents();
-        oldClient.disconnect();
-      }).catch((err) => {
-        this.log('Failed to reconnect with new identity:', err);
-      });
+      // Connect with new identity, set up subscriptions, then disconnect old client
+      await this.nostrClient.connect(...this.config.relays);
+      this.subscribeToEvents();
+      oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
       this.subscribeToEvents();

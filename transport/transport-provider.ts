@@ -14,9 +14,10 @@ import type { BaseProvider, FullIdentity } from '../types';
  */
 export interface TransportProvider extends BaseProvider {
   /**
-   * Set identity for signing/encryption
+   * Set identity for signing/encryption.
+   * If the transport is already connected, reconnects with the new identity.
    */
-  setIdentity(identity: FullIdentity): void;
+  setIdentity(identity: FullIdentity): void | Promise<void>;
 
   /**
    * Send encrypted direct message
