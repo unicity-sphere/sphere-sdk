@@ -251,12 +251,18 @@ npm run type-check
 ### L3 Transfers
 - Use `DirectAddress` (not PROXY) for transfers
 - Finalization required to generate local state for tracking
-- Recipient resolved via `resolveNametagInfo` for 33-byte pubkey
+- Recipient resolved via unified `transport.resolve(identifier)` → returns `PeerInfo`
+
+### Peer Resolution
+- `sphere.resolve(identifier)` / `transport.resolve(identifier)` — unified lookup
+- Accepts: `@nametag`, `DIRECT://...`, `PROXY://...`, `alpha1...`, chain pubkey (`02`/`03` prefix), transport pubkey (64-hex)
+- Returns `PeerInfo` with all address formats, or `null` if not found
+- Identity binding event published on `init()`/`load()` — wallet discoverable without nametag
 
 ### Transport vs Chain Pubkeys
 - `chainPubkey`: 33-byte compressed secp256k1 for L3 chain operations
-- `transportPubkey`: Derived key for Nostr messaging (HKDF from private key)
-- Nametag events include both for cross-compatibility
+- `transportPubkey`: Derived key for transport messaging (HKDF from private key)
+- Identity binding events include both for cross-resolution
 
 ### Token Storage (TXF Format)
 ```typescript

@@ -84,6 +84,41 @@ Get the default address path (`m/44'/0'/0'/0/0`).
 
 Check if wallet has BIP32 master key for HD derivation.
 
+#### `resolve(identifier: string): Promise<PeerInfo | null>`
+
+Resolve any identifier to full peer information. Delegates to the transport provider.
+
+```typescript
+// By nametag
+const peer = await sphere.resolve('@alice');
+
+// By DIRECT address
+const peer = await sphere.resolve('DIRECT://000059756bc9c2e4c...');
+
+// By L1 address
+const peer = await sphere.resolve('alpha1qptag...');
+
+// By chain pubkey (33-byte compressed, 02/03 prefix)
+const peer = await sphere.resolve('025412bda2c5b5a15a891c6...');
+
+// By transport pubkey (32-byte hex)
+const peer = await sphere.resolve('a1b2c3d4e5f6...');
+```
+
+Returns `PeerInfo`:
+
+```typescript
+interface PeerInfo {
+  nametag?: string;        // @name if registered
+  transportPubkey: string; // 32-byte transport key
+  chainPubkey: string;     // 33-byte compressed secp256k1
+  l1Address: string;       // alpha1... L1 address
+  directAddress: string;   // DIRECT://... L3 address
+  proxyAddress?: string;   // PROXY://... (only if nametag registered)
+  timestamp: number;       // Binding event timestamp
+}
+```
+
 ---
 
 ## WalletManager
@@ -160,7 +195,7 @@ interface Token {
 
 ```typescript
 interface TransferRequest {
-  recipient: string;  // Nametag (@name) or public key
+  recipient: string;  // @nametag, DIRECT://..., PROXY://..., alpha1... address
   amount: string;
   coinId: string;
   memo?: string;
