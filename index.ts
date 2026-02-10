@@ -176,6 +176,7 @@ export {
 export type {
   PaymentsModuleConfig,
   PaymentsModuleDependencies,
+  TransactionHistoryEntry,
 } from './modules/payments';
 
 export {

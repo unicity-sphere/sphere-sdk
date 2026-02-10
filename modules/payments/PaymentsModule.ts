@@ -903,8 +903,8 @@ export class PaymentsModule {
         } as unknown as import('../../transport').TokenTransferPayload);
         console.log(`[Payments] Split token sent successfully`);
 
-        // Remove the original token that was split
-        await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+        // Remove the original token that was split — skipHistory because we record below
+        await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag, true);
 
         result.txHash = 'split-' + Date.now().toString(16);
         this.log(`Split transfer completed`);
@@ -953,8 +953,8 @@ export class PaymentsModule {
 
         this.log(`Token ${token.id} transferred, txHash: ${result.txHash}`);
 
-        // Remove sent token (creates tombstone)
-        await this.removeToken(token.id, recipientNametag);
+        // Remove sent token (creates tombstone) — skipHistory because we record below
+        await this.removeToken(token.id, recipientNametag, true);
       }
 
       result.status = 'delivered';
@@ -1146,11 +1146,11 @@ export class PaymentsModule {
       );
 
       if (result.success) {
-        // Remove the original token
+        // Remove the original token — skipHistory because we record below
         const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
-        await this.removeToken(tokenToSplit.id, recipientNametag);
+        await this.removeToken(tokenToSplit.id, recipientNametag, true);
 
-        // Add to transaction history
+        // Add to transaction history (single entry for the actual sent amount)
         await this.addToHistory({
           type: 'SENT',
           amount: request.amount,
@@ -1801,38 +1801,42 @@ export class PaymentsModule {
     let priceMap: Map<string, { priceUsd: number; priceEur?: number; change24h?: number }> | null = null;
 
     if (this.priceProvider && rawAssets.length > 0) {
-      const registry = TokenRegistry.getInstance();
-      const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
+      try {
+        const registry = TokenRegistry.getInstance();
+        const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
 
-      for (const asset of rawAssets) {
-        const def = registry.getDefinition(asset.coinId);
-        if (def?.name) {
-          const existing = nameToCoins.get(def.name);
-          if (existing) {
-            existing.push(asset.coinId);
-          } else {
-            nameToCoins.set(def.name, [asset.coinId]);
-          }
-        }
-      }
-
-      if (nameToCoins.size > 0) {
-        const tokenNames = Array.from(nameToCoins.keys());
-        const prices = await this.priceProvider.getPrices(tokenNames);
-
-        priceMap = new Map();
-        for (const [name, coinIds] of nameToCoins) {
-          const price = prices.get(name);
-          if (price) {
-            for (const cid of coinIds) {
-              priceMap.set(cid, {
-                priceUsd: price.priceUsd,
-                priceEur: price.priceEur,
-                change24h: price.change24h,
-              });
+        for (const asset of rawAssets) {
+          const def = registry.getDefinition(asset.coinId);
+          if (def?.name) {
+            const existing = nameToCoins.get(def.name);
+            if (existing) {
+              existing.push(asset.coinId);
+            } else {
+              nameToCoins.set(def.name, [asset.coinId]);
             }
           }
         }
+
+        if (nameToCoins.size > 0) {
+          const tokenNames = Array.from(nameToCoins.keys());
+          const prices = await this.priceProvider.getPrices(tokenNames);
+
+          priceMap = new Map();
+          for (const [name, coinIds] of nameToCoins) {
+            const price = prices.get(name);
+            if (price) {
+              for (const cid of coinIds) {
+                priceMap.set(cid, {
+                  priceUsd: price.priceUsd,
+                  priceEur: price.priceEur,
+                  change24h: price.change24h,
+                });
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('[Payments] Failed to fetch prices, returning assets without price data:', error);
       }
     }
 
@@ -2103,6 +2107,14 @@ export class PaymentsModule {
                 : JSON.stringify(tokenJson),
             };
 
+            // Check if this token is tombstoned (was previously removed/sent)
+            const loadedTokenId = extractTokenIdFromSdkData(token.sdkData);
+            const loadedStateHash = extractStateHashFromSdkData(token.sdkData);
+            if (loadedTokenId && loadedStateHash && this.isStateTombstoned(loadedTokenId, loadedStateHash)) {
+              this.log(`Skipping tombstoned token file ${tokenId} (${loadedTokenId.slice(0, 8)}...)`);
+              continue;
+            }
+
             // Add to in-memory storage (skip file save since it's already in file)
             this.tokens.set(token.id, token);
             this.log(`Loaded token from file: ${tokenId}`);
@@ -2182,6 +2194,9 @@ export class PaymentsModule {
     // Remove from active tokens
     this.tokens.delete(tokenId);
 
+    // Delete physical token file(s) from storage providers
+    await this.deleteTokenFiles(token);
+
     // Add to transaction history
     if (!skipHistory && token.coinId && token.amount) {
       await this.addToHistory({
@@ -2195,6 +2210,34 @@ export class PaymentsModule {
     }
 
     await this.save();
+  }
+
+  /**
+   * Delete physical token file(s) from all storage providers.
+   * Finds files by matching the SDK token ID prefix in the filename.
+   */
+  private async deleteTokenFiles(token: Token): Promise<void> {
+    const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
+    if (!sdkTokenId) return;
+
+    const tokenIdPrefix = sdkTokenId.slice(0, 16);
+    const providers = this.getTokenStorageProviders();
+
+    for (const [providerId, provider] of providers) {
+      if (!provider.listTokenIds || !provider.deleteToken) continue;
+      try {
+        const allIds = await provider.listTokenIds();
+        const matchingFiles = allIds.filter(id =>
+          id.startsWith(`token-${tokenIdPrefix}`)
+        );
+        for (const fileId of matchingFiles) {
+          await provider.deleteToken(fileId);
+          this.log(`Deleted token file ${fileId} from ${providerId}`);
+        }
+      } catch (error) {
+        console.warn(`[Payments] Failed to delete token files from ${providerId}:`, error);
+      }
+    }
   }
 
   // ===========================================================================
