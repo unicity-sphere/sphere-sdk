@@ -645,25 +645,11 @@ async function main() {
         } else {
           for (const bal of balances) {
             const decimals = bal.decimals ?? 8;
-            const divisor = BigInt(10 ** decimals);
-
-            // Format confirmed amount
-            const confirmedBigInt = BigInt(bal.confirmedAmount);
-            const confirmedWhole = confirmedBigInt / divisor;
-            const confirmedFrac = confirmedBigInt % divisor;
-            const confirmedFormatted = confirmedFrac > 0
-              ? `${confirmedWhole}.${confirmedFrac.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-              : confirmedWhole.toString();
-
-            // Format unconfirmed amount
+            const confirmedFormatted = toHumanReadable(bal.confirmedAmount, decimals);
             const unconfirmedBigInt = BigInt(bal.unconfirmedAmount);
 
             if (unconfirmedBigInt > 0n) {
-              const unconfirmedWhole = unconfirmedBigInt / divisor;
-              const unconfirmedFrac = unconfirmedBigInt % divisor;
-              const unconfirmedFormatted = unconfirmedFrac > 0
-                ? `${unconfirmedWhole}.${unconfirmedFrac.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-                : unconfirmedWhole.toString();
+              const unconfirmedFormatted = toHumanReadable(bal.unconfirmedAmount, decimals);
               console.log(`${bal.symbol}: ${confirmedFormatted} (+ ${unconfirmedFormatted} unconfirmed) [${bal.confirmedTokenCount}+${bal.unconfirmedTokenCount} tokens]`);
             } else {
               console.log(`${bal.symbol}: ${confirmedFormatted} (${bal.tokenCount} tokens)`);
@@ -691,13 +677,7 @@ async function main() {
             const def = registry.getDefinition(token.coinId);
             const symbol = def?.symbol || token.symbol || 'UNK';
             const decimals = def?.decimals ?? token.decimals ?? 8;
-            const amountBigInt = BigInt(token.amount || '0');
-            const divisor = BigInt(10 ** decimals);
-            const wholePart = amountBigInt / divisor;
-            const fracPart = amountBigInt % divisor;
-            const formatted = fracPart > 0
-              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-              : wholePart.toString();
+            const formatted = toHumanReadable(token.amount || '0', decimals);
             console.log(`ID: ${token.id.slice(0, 16)}...`);
             console.log(`  Coin: ${symbol} (${token.coinId.slice(0, 8)}...)`);
             console.log(`  Amount: ${formatted} ${symbol}`);
@@ -790,13 +770,7 @@ async function main() {
           const def = registry.getDefinition(token.coinId);
           const symbol = def?.symbol || token.symbol || 'UNK';
           const decimals = def?.decimals ?? token.decimals ?? 8;
-          const amountBigInt = BigInt(token.amount || '0');
-          const divisor = BigInt(10 ** decimals);
-          const wholePart = amountBigInt / divisor;
-          const fracPart = amountBigInt % divisor;
-          const formatted = fracPart > 0
-            ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-            : wholePart.toString();
+          const formatted = toHumanReadable(token.amount || '0', decimals);
 
           const txf = tokenToTxf(token);
           const tokenId = txf?.genesis?.data?.tokenId || token.id;
