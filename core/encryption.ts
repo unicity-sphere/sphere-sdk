@@ -194,6 +194,25 @@ export function decryptSimple(ciphertext: string, password: string): string {
   return result;
 }
 
+/**
+ * Decrypt data encrypted with PBKDF2-derived key (legacy JSON wallet format).
+ * Compatible with webwallet's encryptWithPassword/decryptWithPassword.
+ */
+export function decryptWithSalt(ciphertext: string, password: string, salt: string): string | null {
+  try {
+    const key = CryptoJS.PBKDF2(password, salt, {
+      keySize: 256 / 32,
+      iterations: 100000,
+      hasher: CryptoJS.algo.SHA256,
+    }).toString();
+    const decrypted = CryptoJS.AES.decrypt(ciphertext, key);
+    const result = decrypted.toString(CryptoJS.enc.Utf8);
+    return result || null;
+  } catch {
+    return null;
+  }
+}
+
 // =============================================================================
 // Mnemonic Encryption (Compatible with existing wallet format)
 // =============================================================================

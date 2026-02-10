@@ -689,7 +689,7 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async resolveNametag(nametag: string): Promise<string | null> {
-    this.ensureReady();
+    this.ensureConnected();
 
     // Query for nametag binding events using hashed nametag (privacy-preserving)
     // Try both '#d' and '#t' filters for compatibility with nostr-js-sdk
@@ -732,7 +732,7 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async resolveNametagInfo(nametag: string): Promise<PeerInfo | null> {
-    this.ensureReady();
+    this.ensureConnected();
 
     // Query for nametag binding events using hashed nametag (privacy-preserving)
     const hashedNametag = hashNametag(nametag);
@@ -830,7 +830,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Works with both new identity binding events and legacy nametag binding events.
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
-    this.ensureReady();
+    this.ensureConnected();
 
     const addressHash = hashAddressForTag(address);
 
@@ -872,7 +872,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Queries binding events authored by the given pubkey.
    */
   async resolveTransportPubkeyInfo(transportPubkey: string): Promise<PeerInfo | null> {
-    this.ensureReady();
+    this.ensureConnected();
 
     const events = await this.queryEvents({
       kinds: [EVENT_KINDS.NAMETAG_BINDING],
@@ -1685,10 +1685,14 @@ export class NostrTransportProvider implements TransportProvider {
   // Private: Helpers
   // ===========================================================================
 
-  private ensureReady(): void {
+  private ensureConnected(): void {
     if (!this.isConnected()) {
       throw new Error('NostrTransportProvider not connected');
     }
+  }
+
+  private ensureReady(): void {
+    this.ensureConnected();
     if (!this.identity) {
       throw new Error('Identity not set');
     }
