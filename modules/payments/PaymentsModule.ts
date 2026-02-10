@@ -110,6 +110,36 @@ export interface TransactionHistoryEntry {
 }
 
 // =============================================================================
+// Receive Options & Result
+// =============================================================================
+
+export interface ReceiveOptions {
+  /** Wait for all unconfirmed tokens to be finalized (default: false).
+   *  When false, calls resolveUnconfirmed() once to submit pending commitments.
+   *  When true, polls resolveUnconfirmed() + load() until all confirmed or timeout. */
+  finalize?: boolean;
+  /** Finalization timeout in ms (default: 60000). Only used when finalize=true. */
+  timeout?: number;
+  /** Poll interval in ms (default: 2000). Only used when finalize=true. */
+  pollInterval?: number;
+  /** Callback for each newly received transfer. */
+  callback?: (transfer: IncomingTransfer) => void;
+  /** Progress callback after each resolveUnconfirmed() poll. Only when finalize=true. */
+  onProgress?: (result: UnconfirmedResolutionResult) => void;
+}
+
+export interface ReceiveResult {
+  /** Newly received incoming transfers. */
+  transfers: IncomingTransfer[];
+  /** Finalization result (from resolveUnconfirmed). */
+  finalization?: UnconfirmedResolutionResult;
+  /** Whether finalization timed out (only when finalize=true). */
+  timedOut?: boolean;
+  /** Duration of finalization in ms (only when finalize=true). */
+  finalizationDurationMs?: number;
+}
+
+// =============================================================================
 // Token Parsing Utilities
 // =============================================================================
 
@@ -1768,18 +1798,42 @@ export class PaymentsModule {
    * through the existing pipeline, and resolves after all stored events
    * are handled. Useful for batch/CLI apps that need explicit receive.
    *
-   * @param callback - Optional callback for each received transfer (same as transfer:incoming)
    * @returns Array of IncomingTransfer objects received during this call
    */
+  async receive(): Promise<IncomingTransfer[]>;
+  /**
+   * Fetch and process pending incoming transfers with a callback.
+   *
+   * @param callback - Invoked for each received transfer (same as transfer:incoming)
+   * @returns Array of IncomingTransfer objects received during this call
+   */
+  async receive(callback: (transfer: IncomingTransfer) => void): Promise<IncomingTransfer[]>;
+  /**
+   * Fetch and process pending incoming transfers with options.
+   *
+   * When `finalize` is true, polls resolveUnconfirmed() + load() until all
+   * tokens are confirmed or the timeout expires.
+   *
+   * @param options - Receive options including finalization control
+   * @returns ReceiveResult with transfers and finalization metadata
+   */
+  async receive(options: ReceiveOptions): Promise<ReceiveResult>;
   async receive(
-    callback?: (transfer: IncomingTransfer) => void
-  ): Promise<IncomingTransfer[]> {
+    callbackOrOptions?: ((transfer: IncomingTransfer) => void) | ReceiveOptions
+  ): Promise<IncomingTransfer[] | ReceiveResult> {
     this.ensureInitialized();
+
+    // Normalize arguments
+    const isLegacy = typeof callbackOrOptions === 'function' || callbackOrOptions === undefined;
+    const options: ReceiveOptions = isLegacy
+      ? { callback: callbackOrOptions as ((transfer: IncomingTransfer) => void) | undefined }
+      : callbackOrOptions;
 
     if (!this.deps!.transport.fetchPendingEvents) {
       throw new Error('Transport provider does not support fetchPendingEvents');
     }
 
+    // Phase 1: Fetch pending events
     // Snapshot token keys before fetch
     const tokensBefore = new Set(this.tokens.keys());
 
@@ -1806,11 +1860,48 @@ export class PaymentsModule {
           receivedAt: Date.now(),
         };
         received.push(transfer);
-        if (callback) callback(transfer);
+        if (options.callback) options.callback(transfer);
       }
     }
 
-    return received;
+    // Legacy mode: return plain array
+    if (isLegacy) {
+      return received;
+    }
+
+    // Phase 2: Finalization
+    const result: ReceiveResult = { transfers: received };
+
+    if (options.finalize) {
+      const timeout = options.timeout ?? 60_000;
+      const pollInterval = options.pollInterval ?? 2_000;
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < timeout) {
+        const resolution = await this.resolveUnconfirmed();
+        result.finalization = resolution;
+        if (options.onProgress) options.onProgress(resolution);
+
+        // Check if any unconfirmed tokens remain
+        const stillUnconfirmed = Array.from(this.tokens.values()).some(
+          t => t.status === 'submitted' || t.status === 'pending'
+        );
+        if (!stillUnconfirmed) break;
+
+        await new Promise(r => setTimeout(r, pollInterval));
+        await this.load();
+      }
+
+      result.finalizationDurationMs = Date.now() - startTime;
+      result.timedOut = Array.from(this.tokens.values()).some(
+        t => t.status === 'submitted' || t.status === 'pending'
+      );
+    } else {
+      // Non-finalize: submit commitments once (fire-and-forget style)
+      result.finalization = await this.resolveUnconfirmed();
+    }
+
+    return result;
   }
 
   // ===========================================================================

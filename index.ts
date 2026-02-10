@@ -175,6 +175,8 @@ export {
 export type {
   PaymentsModuleConfig,
   PaymentsModuleDependencies,
+  ReceiveOptions,
+  ReceiveResult,
 } from './modules/payments';
 
 export {

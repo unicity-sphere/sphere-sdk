@@ -217,7 +217,9 @@ const result = await sphere.payments.send({
 });
 ```
 
-#### `receive(callback?: (transfer: IncomingTransfer) => void): Promise<IncomingTransfer[]>`
+#### `receive(): Promise<IncomingTransfer[]>`
+#### `receive(callback): Promise<IncomingTransfer[]>`
+#### `receive(options: ReceiveOptions): Promise<ReceiveResult>`
 
 Fetch and process pending incoming transfers from the transport layer (one-shot query).
 
@@ -225,16 +227,47 @@ Unlike the persistent subscription that delivers events asynchronously, `receive
 queries the Nostr relay and resolves after all stored events are processed. Useful for
 batch/CLI applications.
 
-- **callback** (optional): Invoked for each transfer received, same signature as `transfer:incoming` event
-- **Returns**: Array of `IncomingTransfer` objects received during this call
+**Overloads:**
+
+- `receive()` / `receive(callback)` — Legacy mode. Fetches events and returns array of new transfers.
+- `receive(options)` — Options mode. Returns `ReceiveResult` with finalization support.
+
+**ReceiveOptions:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `finalize` | `boolean` | `false` | Wait for all tokens to be finalized |
+| `timeout` | `number` | `60000` | Finalization timeout in ms |
+| `pollInterval` | `number` | `2000` | Poll interval between finalization attempts |
+| `callback` | `function` | — | Callback for each new transfer |
+| `onProgress` | `function` | — | Progress callback during finalization |
+
+**ReceiveResult:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `transfers` | `IncomingTransfer[]` | Newly received transfers |
+| `finalization` | `UnconfirmedResolutionResult` | Result from resolveUnconfirmed() |
+| `timedOut` | `boolean` | Whether finalization timed out |
+| `finalizationDurationMs` | `number` | Duration of finalization in ms |
 
 ```typescript
-// Simple usage
+// Simple usage (legacy)
 const transfers = await sphere.payments.receive();
 
-// With callback
+// With callback (legacy)
 await sphere.payments.receive((transfer) => {
   console.log(`Received ${transfer.tokens.length} tokens`);
+});
+
+// With options — submit commitments, don't wait
+const result = await sphere.payments.receive({});
+
+// Wait for finalization
+const result = await sphere.payments.receive({
+  finalize: true,
+  timeout: 30000,
+  onProgress: (res) => console.log(`${res.stillPending} pending`),
 });
 ```
 

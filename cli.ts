@@ -225,7 +225,8 @@ TRANSFERS:
                                     --proxy          Force PROXY address transfer
                                     --instant        Send immediately via Nostr (default)
                                     --conservative   Collect all proofs first, then send
-  receive                           Show address for receiving tokens
+  receive [--finalize]              Check for incoming transfers
+                                    --finalize: wait for unconfirmed tokens to be finalized
   history [limit]                   Show transaction history
 
 NAMETAGS:
@@ -592,49 +593,27 @@ async function main() {
         const sphere = await getSphere();
 
         if (finalize) {
-          // Fetch pending transfers from Nostr relay (one-shot query, waits for EOSE)
-          await sphere.payments.receive();
-
-          // Finalize unconfirmed tokens: submit tx commitments and fetch inclusion proofs
-          const balancesBefore = sphere.payments.getBalance();
-          const hasUnconfirmed = balancesBefore.some(b => BigInt(b.unconfirmedAmount) > 0n);
-
-          if (!hasUnconfirmed) {
-            console.log('\nAll tokens are already confirmed.');
-          } else {
-            console.log('\nFinalizing unconfirmed tokens...');
-            const FINALIZE_TIMEOUT_MS = 60_000;
-            const FINALIZE_POLL_MS = 2_000;
-            const startTime = performance.now();
-
-            while (performance.now() - startTime < FINALIZE_TIMEOUT_MS) {
-              await sphere.payments.resolveUnconfirmed();
-              await sphere.payments.load();
-
-              const current = sphere.payments.getBalance();
-              const stillUnconfirmed = current.some(b => BigInt(b.unconfirmedAmount) > 0n);
-              if (!stillUnconfirmed) {
-                const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
-                console.log(`All tokens finalized in ${elapsed}s.`);
-                break;
-              }
-
-              // Show progress
-              for (const bal of current) {
-                const unconf = BigInt(bal.unconfirmedAmount);
-                if (unconf > 0n) {
-                  console.log(`  ${bal.symbol}: ${bal.unconfirmedTokenCount} token(s) still unconfirmed...`);
+          console.log('\nFetching and finalizing tokens...');
+          const result = await sphere.payments.receive({
+            finalize: true,
+            onProgress: (resolution) => {
+              if (resolution.stillPending > 0) {
+                const balances = sphere.payments.getBalance();
+                for (const bal of balances) {
+                  if (BigInt(bal.unconfirmedAmount) > 0n) {
+                    console.log(`  ${bal.symbol}: ${bal.unconfirmedTokenCount} token(s) still unconfirmed...`);
+                  }
                 }
               }
+            },
+          });
 
-              await new Promise(r => setTimeout(r, FINALIZE_POLL_MS));
-            }
-
-            // Check if we timed out
-            const finalCheck = sphere.payments.getBalance();
-            if (finalCheck.some(b => BigInt(b.unconfirmedAmount) > 0n)) {
-              console.log('  Warning: finalization timed out, some tokens still unconfirmed.');
-            }
+          if (result.timedOut) {
+            console.log('  Warning: finalization timed out, some tokens still unconfirmed.');
+          } else if (result.finalization && result.finalization.resolved > 0) {
+            console.log(`All tokens finalized in ${((result.finalizationDurationMs ?? 0) / 1000).toFixed(1)}s.`);
+          } else {
+            console.log('All tokens are already confirmed.');
           }
         }
 
@@ -925,6 +904,7 @@ async function main() {
       }
 
       case 'receive': {
+        const finalize = args.includes('--finalize');
         const sphere = await getSphere();
         const identity = sphere.identity;
 
@@ -933,6 +913,7 @@ async function main() {
           process.exit(1);
         }
 
+        // Show addresses
         console.log('\nReceive Address:');
         console.log('─'.repeat(50));
         console.log(`L3 (Direct): ${identity.directAddress || '(not available)'}`);
@@ -941,7 +922,40 @@ async function main() {
           console.log(`Nametag:     @${identity.nametag}`);
         }
         console.log('─'.repeat(50));
-        console.log('\nShare your nametag or Direct address to receive tokens.');
+
+        // Fetch pending transfers
+        console.log('\nChecking for incoming transfers...');
+        const registry = TokenRegistry.getInstance();
+        const result = await sphere.payments.receive({
+          finalize,
+          onProgress: (resolution) => {
+            if (resolution.stillPending > 0) {
+              console.log(`  ${resolution.stillPending} token(s) still finalizing...`);
+            }
+          },
+        });
+
+        if (result.transfers.length === 0) {
+          console.log('No new transfers found.');
+        } else {
+          console.log(`\nReceived ${result.transfers.length} new transfer(s):`);
+          for (const transfer of result.transfers) {
+            for (const token of transfer.tokens) {
+              const def = registry.getDefinition(token.coinId);
+              const decimals = def?.decimals ?? token.decimals ?? 8;
+              const symbol = def?.symbol || token.symbol;
+              const formatted = toHumanReadable(token.amount, decimals);
+              const statusTag = token.status === 'confirmed' ? '' : ` [${token.status}]`;
+              console.log(`  ${formatted} ${symbol}${statusTag}`);
+            }
+          }
+        }
+
+        if (finalize && result.timedOut) {
+          console.log('\nWarning: finalization timed out, some tokens still unconfirmed.');
+        } else if (finalize && result.finalizationDurationMs) {
+          console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
+        }
 
         await closeSphere();
         break;
