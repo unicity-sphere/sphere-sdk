@@ -272,6 +272,31 @@ async function waitForReceiverBalance(
   };
 }
 
+async function waitForTokenResolution(
+  sphere: Sphere,
+  coinSymbol: string,
+  timeoutMs: number = 30_000,
+): Promise<{ resolved: boolean; durationMs: number }> {
+  const startTime = performance.now();
+
+  while (performance.now() - startTime < timeoutMs) {
+    // Call resolveUnconfirmed directly (not fire-and-forget)
+    const resolution = await sphere.payments.resolveUnconfirmed();
+
+    // Check if all tokens for this coin are confirmed
+    const bal = getBalance(sphere, coinSymbol);
+    if (bal.unconfirmed === 0n && bal.confirmed > 0n) {
+      return { resolved: true, durationMs: performance.now() - startTime };
+    }
+
+    // Wait before next attempt (proofs need ~2s aggregator rounds)
+    await new Promise(r => setTimeout(r, 2_000));
+    await sphere.payments.load();
+  }
+
+  return { resolved: false, durationMs: performance.now() - startTime };
+}
+
 // =============================================================================
 // Test Runner
 // =============================================================================
@@ -376,9 +401,17 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
     console.log(`    Receive detected in ${receiveResult.receiveTimeMs.toFixed(0)}ms`);
     console.log(`    Receiver balance AFTER: ${formatBalance(receiveResult.finalBalance, decimals)}`);
 
-    // Calculate deltas (reload sender in case state changed during receiver wait)
-    await sender.payments.load();
-    const senderAfter = getBalance(sender, coinSymbol);
+    // Wait for sender's change token to appear from background processing
+    // (InstantSplit sends split amount immediately, change token arrives ~4s later)
+    console.log(`    Waiting for sender change token (up to 15s)...`);
+    const expectedSenderTotal = senderBefore.total - amountSmallest;
+    const changeDeadline = performance.now() + 15_000;
+    let senderAfter = getBalance(sender, coinSymbol);
+    while (performance.now() < changeDeadline && senderAfter.total < expectedSenderTotal) {
+      await new Promise(r => setTimeout(r, 1000));
+      await sender.payments.load();
+      senderAfter = getBalance(sender, coinSymbol);
+    }
     const senderDelta = senderBefore.total - senderAfter.total;
     const receiverDelta = receiveResult.finalBalance.total - receiverBefore.total;
     result.senderDelta = senderDelta;
@@ -605,6 +638,12 @@ async function main(): Promise<void> {
     await alice.payments.load();
     await bob.payments.load();
 
+    // Resolve Bob's unconfirmed tokens before send-back
+    // (V5 tokens are saved as 'submitted' and need proof resolution to become 'confirmed')
+    console.log('\n[RESOLVE] Resolving Bob unconfirmed UCT tokens...');
+    const uctResolution = await waitForTokenResolution(bob, 'UCT');
+    console.log(`  UCT resolved=${uctResolution.resolved} in ${uctResolution.durationMs.toFixed(0)}ms`);
+
     // Test 4: Send-back UCT (bob -> alice)
     results.push(await runTransferTest({
       scenario: '4. Send-back UCT (bob -> alice)',
@@ -639,6 +678,11 @@ async function main(): Promise<void> {
 
     await alice.payments.load();
     await bob.payments.load();
+
+    // Resolve Bob's unconfirmed BTC tokens before send-back
+    console.log('\n[RESOLVE] Resolving Bob unconfirmed BTC tokens...');
+    const btcResolution = await waitForTokenResolution(bob, 'BTC');
+    console.log(`  BTC resolved=${btcResolution.resolved} in ${btcResolution.durationMs.toFixed(0)}ms`);
 
     // Test 6: PROXY BTC send-back
     results.push(await runTransferTest({

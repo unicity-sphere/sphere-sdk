@@ -89,6 +89,7 @@ import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType
 import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
 import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
@@ -723,6 +724,11 @@ export class PaymentsModule {
         console.error(`[Payments] Failed to load from provider ${id}:`, err);
       }
     }
+
+    // Restore pending V5 tokens BEFORE legacy file loading
+    // (must come first because loadTokensFromFileStorage calls save() which
+    // would overwrite pending V5 data if the tokens aren't in memory yet)
+    await this.loadPendingV5Tokens();
 
     // Legacy: Load tokens from file storage (lottery compatibility)
     if (this.tokens.size === 0) {
@@ -1950,8 +1956,8 @@ export class PaymentsModule {
     const mintDataJson = JSON.parse(bundle.recipientMintData);
     const mintData = await MintTransactionData.fromJSON(mintDataJson);
     const mintCommitment = await MintCommitment.create(mintData);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const mintProof = JSON.parse(pending.mintProofJson!) as any;
+    const mintProofJson = JSON.parse(pending.mintProofJson!);
+    const mintProof = InclusionProof.fromJSON(mintProofJson);
     const mintTransaction = mintCommitment.toTransaction(mintProof);
 
     const tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
@@ -2062,6 +2068,53 @@ export class PaymentsModule {
     this.tokens.set(token.id, updated);
   }
 
+  /**
+   * Save pending V5 tokens to key-value storage.
+   * These tokens can't be serialized to TXF format (no genesis/state),
+   * so we persist them separately and restore on load().
+   */
+  private async savePendingV5Tokens(): Promise<void> {
+    const pendingTokens: Token[] = [];
+    for (const token of this.tokens.values()) {
+      if (this.parsePendingFinalization(token.sdkData)) {
+        pendingTokens.push(token);
+      }
+    }
+    if (pendingTokens.length > 0) {
+      await this.deps!.storage.set(
+        STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
+        JSON.stringify(pendingTokens)
+      );
+    } else {
+      // Clean up when no pending tokens remain
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
+    }
+  }
+
+  /**
+   * Load pending V5 tokens from key-value storage and merge into tokens map.
+   * Called during load() to restore tokens that TXF format can't represent.
+   */
+  private async loadPendingV5Tokens(): Promise<void> {
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+    if (!data) return;
+
+    try {
+      const pendingTokens = JSON.parse(data) as Token[];
+      for (const token of pendingTokens) {
+        // Only restore if not already in the map (e.g., already resolved)
+        if (!this.tokens.has(token.id)) {
+          this.tokens.set(token.id, token);
+        }
+      }
+      if (pendingTokens.length > 0) {
+        this.log(`Restored ${pendingTokens.length} pending V5 token(s)`);
+      }
+    } catch {
+      // Ignore corrupt data
+    }
+  }
+
   // ===========================================================================
   // Public API - Token Operations
   // ===========================================================================
@@ -2160,7 +2213,11 @@ export class PaymentsModule {
     await this.save();
 
     // Save as individual token file (like lottery pattern)
-    await this.saveTokenToFileStorage(token);
+    // Skip for pending V5 tokens - they don't have valid SDK data for the legacy format
+    // and would be corrupted by parseTokenInfo() on reload
+    if (!this.parsePendingFinalization(token.sdkData)) {
+      await this.saveTokenToFileStorage(token);
+    }
 
     this.log(`Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
@@ -2230,6 +2287,11 @@ export class PaymentsModule {
             const data = fileData as Record<string, unknown>;
             const tokenJson = data.token;
             if (!tokenJson) continue;
+
+            // Skip pending V5 finalization tokens (not valid SDK token data)
+            if (typeof tokenJson === 'object' && tokenJson !== null && '_pendingFinalization' in (tokenJson as Record<string, unknown>)) {
+              continue;
+            }
 
             // Check if already loaded from key-value storage
             let sdkTokenId: string | undefined;
@@ -3468,8 +3530,23 @@ export class PaymentsModule {
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
 
-      // Check for INSTANT_SPLIT bundle first (V4 or V5)
+      // Check for INSTANT_SPLIT bundle - may be the payload itself or nested in payload.token
+      let instantBundle: InstantSplitBundle | null = null;
       if (isInstantSplitBundle(payload)) {
+        instantBundle = payload as InstantSplitBundle;
+      } else if (payload.token) {
+        // InstantSplitExecutor wraps V5 bundle as { token: JSON.stringify(bundle), proof: null }
+        try {
+          const inner = typeof payload.token === 'string' ? JSON.parse(payload.token as string) : payload.token;
+          if (isInstantSplitBundle(inner)) {
+            instantBundle = inner as InstantSplitBundle;
+          }
+        } catch {
+          // Not a JSON string or not a bundle - fall through
+        }
+      }
+
+      if (instantBundle) {
         this.log('Processing INSTANT_SPLIT bundle...');
         try {
           // Ensure nametag is loaded before processing (needed for PROXY address verification)
@@ -3478,7 +3555,7 @@ export class PaymentsModule {
           }
 
           const result = await this.processInstantSplitBundle(
-            payload as InstantSplitBundle,
+            instantBundle,
             transfer.senderTransportPubkey
           );
           if (result.success) {
@@ -3489,6 +3566,13 @@ export class PaymentsModule {
         } catch (err) {
           console.error('[Payments] INSTANT_SPLIT processing error:', err);
         }
+        return;
+      }
+
+      // Check for NOSTR-FIRST commitment-only transfer (whole-token instant send)
+      if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
+        this.log('Processing NOSTR-FIRST commitment-only transfer...');
+        await this.handleCommitmentOnlyTransfer(transfer, payload);
         return;
       }
 
@@ -3700,6 +3784,9 @@ export class PaymentsModule {
         console.error(`[Payments] Failed to save to provider ${id}:`, err);
       }
     }
+
+    // Save pending V5 tokens separately (TXF can't represent them)
+    await this.savePendingV5Tokens();
   }
 
   private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
