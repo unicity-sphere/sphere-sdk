@@ -67,9 +67,7 @@ import { InstantSplitProcessor } from './InstantSplitProcessor';
 import type {
   InstantSplitBundle,
   InstantSplitBundleV5,
-  InstantSplitResult,
   InstantSplitProcessResult,
-  InstantSplitOptions,
   PendingV5Finalization,
   UnconfirmedResolutionResult,
 } from '../../types/instant-split';
@@ -1031,35 +1029,6 @@ export class PaymentsModule {
   // ===========================================================================
   // Public API - Instant Split (V5 Optimized)
   // ===========================================================================
-
-  /**
-   * Send tokens using instant flow.
-   *
-   * Now delegates to send() which uses instant paths for both splits and whole-token transfers.
-   *
-   * @param request - Transfer request with recipient, amount, and coinId
-   * @param options - Optional instant split configuration (unused, kept for API compat)
-   * @returns InstantSplitResult with timing info
-   */
-  async sendInstant(
-    request: TransferRequest,
-    options?: InstantSplitOptions
-  ): Promise<InstantSplitResult> {
-    const startTime = performance.now();
-    try {
-      const result = await this.send(request);
-      return {
-        success: result.status === 'completed',
-        criticalPathDurationMs: performance.now() - startTime,
-      };
-    } catch (error) {
-      return {
-        success: false,
-        criticalPathDurationMs: performance.now() - startTime,
-        error: error instanceof Error ? error.message : String(error),
-      };
-    }
-  }
 
   /**
    * Process a received INSTANT_SPLIT bundle.

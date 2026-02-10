@@ -192,34 +192,6 @@ const result = await sphere.payments.send({
 console.log(result.status); // 'completed'
 ```
 
-#### `sendInstant(request: TransferRequest, options?: InstantSplitOptions): Promise<InstantSplitResult>`
-
-Send tokens using the instant flow. Delegates to `send()` internally — kept for backward compatibility.
-
-```typescript
-interface InstantSplitResult {
-  success: boolean;
-  nostrEventId?: string;
-  splitGroupId?: string;
-  criticalPathDurationMs: number;
-  error?: string;
-  backgroundStarted?: boolean;
-}
-
-interface InstantSplitOptions {
-  nostrTimeoutMs?: number;        // Default: 30000
-  burnProofTimeoutMs?: number;    // Default: 60000
-  mintProofTimeoutMs?: number;    // Default: 60000
-  skipBackground?: boolean;
-  devMode?: boolean;
-  onBurnCompleted?: (burnTxJson: string) => void;
-  onNostrDelivered?: (eventId: string) => void;
-  onBackgroundProgress?: (status: BackgroundProgressStatus) => void;
-  onChangeTokenCreated?: (token: any) => Promise<void>;
-  onStorageSync?: () => Promise<boolean>;
-}
-```
-
 #### `processInstantSplitBundle(bundle: InstantSplitBundle, senderPubkey: string): Promise<InstantSplitProcessResult>`
 
 Process a received instant split bundle (recipient side).
