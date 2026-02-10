@@ -129,7 +129,7 @@ export class L1PaymentsModule {
 
   constructor(config?: L1PaymentsModuleConfig) {
     this._config = {
-      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.alpha.unicity.network:50004',
+      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.unicity.network:50004',
       network: config?.network ?? 'mainnet',
       defaultFeeRate: config?.defaultFeeRate ?? 10,
       enableVesting: config?.enableVesting ?? true,
@@ -167,12 +167,22 @@ export class L1PaymentsModule {
       }
     }
 
-    // Connect to Fulcrum WebSocket
-    if (this._config.electrumUrl) {
-      await l1Connect(this._config.electrumUrl);
-    }
+    // NOTE: We do NOT connect to Fulcrum here. Connection is deferred to
+    // first use (ensureConnected) so that import + scan flows are not
+    // disrupted by an early L1 WebSocket connection on the global singleton.
 
     this._initialized = true;
+  }
+
+  /**
+   * Ensure the Fulcrum WebSocket is connected. Called lazily before any
+   * operation that needs the network. If the singleton is already connected
+   * (e.g. by the address scanner), this is a no-op.
+   */
+  private async ensureConnected(): Promise<void> {
+    if (!isWebSocketConnected() && this._config.electrumUrl) {
+      await l1Connect(this._config.electrumUrl);
+    }
   }
 
   destroy(): void {
@@ -245,6 +255,7 @@ export class L1PaymentsModule {
 
   async send(request: L1SendRequest): Promise<L1SendResult> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     if (!this._wallet || !this._identity) {
       return { success: false, error: 'No wallet available' };
@@ -288,6 +299,7 @@ export class L1PaymentsModule {
 
   async getBalance(): Promise<L1Balance> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const addresses = this._getWatchedAddresses();
     let totalAlpha = 0;
@@ -327,6 +339,7 @@ export class L1PaymentsModule {
 
   async getUtxos(): Promise<L1Utxo[]> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const result: L1Utxo[] = [];
     const currentHeight = await getCurrentBlockHeight();
@@ -371,6 +384,7 @@ export class L1PaymentsModule {
   }
 
   async getHistory(limit?: number): Promise<L1Transaction[]> {
+    await this.ensureConnected();
     this.ensureInitialized();
 
     const addresses = this._getWatchedAddresses();
@@ -431,6 +445,7 @@ export class L1PaymentsModule {
 
   async getTransaction(txid: string): Promise<L1Transaction | null> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const tx = (await l1GetTransaction(txid)) as TransactionDetail | null;
     if (!tx) return null;
@@ -476,6 +491,7 @@ export class L1PaymentsModule {
     amount: string
   ): Promise<{ fee: string; feeRate: number }> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     if (!this._wallet) {
       return { fee: '0', feeRate: this._config.defaultFeeRate ?? 10 };

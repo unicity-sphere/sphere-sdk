@@ -632,9 +632,9 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
-    // Initialize L1 sub-module only if electrumUrl is provided
-    const l1Enabled = config?.l1?.electrumUrl && config.l1.electrumUrl.length > 0;
-    this.l1 = l1Enabled ? new L1PaymentsModule(config?.l1) : null;
+    // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
+    // Only skip if l1 is explicitly set to null.
+    this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
   }
 
   /** Get module configuration */
