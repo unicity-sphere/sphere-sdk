@@ -371,3 +371,39 @@ export interface SplitRecoveryResult {
   /** Total duration of recovery in ms */
   durationMs: number;
 }
+
+// =============================================================================
+// Pending Finalization Types (Lazy Proof Resolution)
+// =============================================================================
+
+/** Finalization stage for V5 bundles saved as unconfirmed */
+export type V5FinalizationStage =
+  | 'RECEIVED'
+  | 'MINT_SUBMITTED'
+  | 'MINT_PROVEN'
+  | 'TRANSFER_SUBMITTED'
+  | 'FINALIZED';
+
+/** Pending finalization metadata stored in token.sdkData */
+export interface PendingV5Finalization {
+  type: 'v5_bundle';
+  stage: V5FinalizationStage;
+  bundleJson: string;
+  senderPubkey: string;
+  savedAt: number;
+  lastAttemptAt?: number;
+  attemptCount: number;
+  mintProofJson?: string;
+}
+
+/** Result of resolveUnconfirmed() */
+export interface UnconfirmedResolutionResult {
+  resolved: number;
+  stillPending: number;
+  failed: number;
+  details: Array<{
+    tokenId: string;
+    stage: string;
+    status: 'resolved' | 'pending' | 'failed';
+  }>;
+}
