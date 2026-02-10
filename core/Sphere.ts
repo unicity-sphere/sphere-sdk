@@ -1110,6 +1110,7 @@ export class Sphere {
     transport: TransportProvider;
     oracle: OracleProvider;
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+    l1?: L1Config;
   }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
     try {
       const data = JSON.parse(options.jsonContent) as WalletJSON;
@@ -1155,6 +1156,7 @@ export class Sphere {
           transport: options.transport,
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
+          l1: options.l1,
         });
         return { success: true, mnemonic };
       }
@@ -1170,6 +1172,7 @@ export class Sphere {
           transport: options.transport,
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
+          l1: options.l1,
         });
         return { success: true };
       }
@@ -1232,6 +1235,8 @@ export class Sphere {
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
     /** Optional nametag to register */
     nametag?: string;
+    /** L1 (ALPHA blockchain) configuration */
+    l1?: L1Config;
   }): Promise<{
     success: boolean;
     sphere?: Sphere;
@@ -1262,6 +1267,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
 
       return { success: true, sphere, mnemonic };
@@ -1304,6 +1310,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
 
       return { success: true, sphere };
@@ -1347,6 +1354,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
 
       return { success: true, sphere };
@@ -1374,6 +1382,7 @@ export class Sphere {
           transport: options.transport,
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
+          l1: options.l1,
         });
 
         if (result.success) {
@@ -1436,6 +1445,7 @@ export class Sphere {
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
           nametag: options.nametag,
+          l1: options.l1,
         });
         return { success: true, sphere, mnemonic };
       }
@@ -1450,6 +1460,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
       return { success: true, sphere };
     }
