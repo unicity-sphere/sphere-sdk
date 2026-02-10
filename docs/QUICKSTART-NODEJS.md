@@ -265,7 +265,7 @@ console.log(addr.address, addr.publicKey);
 sphere.on('transfer:incoming', handler);
 sphere.on('transfer:sent', handler);
 sphere.on('transfer:pending', handler);
-sphere.on('payment_request:received', handler);
+sphere.on('payment_request:incoming', handler);
 sphere.on('payment_request:paid', handler);
 sphere.on('message:dm', handler);
 sphere.on('message:broadcast', handler);

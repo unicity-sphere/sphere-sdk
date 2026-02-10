@@ -157,7 +157,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 
       // Try to get token ID
       if (sdkToken.id) {
-        defaultInfo.tokenId = sdkToken.id.toString();
+        defaultInfo.tokenId = sdkToken.id.toJSON();
       }
 
       // Extract coinId from SDK token's coins structure (lottery-compatible)
@@ -1510,12 +1510,17 @@ export class PaymentsModule {
     }
 
     // Convert transport request to IncomingPaymentRequest
+    const coinId = transportRequest.request.coinId;
+    const registry = TokenRegistry.getInstance();
+    const coinDef = registry.getDefinition(coinId);
+
     const request: IncomingPaymentRequest = {
       id: transportRequest.id,
       senderPubkey: transportRequest.senderTransportPubkey,
+      senderNametag: transportRequest.senderNametag,
       amount: transportRequest.request.amount,
-      coinId: transportRequest.request.coinId,
-      symbol: transportRequest.request.coinId, // Use coinId as symbol for now
+      coinId,
+      symbol: coinDef?.symbol || coinId.slice(0, 8),
       message: transportRequest.request.message,
       recipientNametag: transportRequest.request.recipientNametag,
       requestId: transportRequest.request.requestId,

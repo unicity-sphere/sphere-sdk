@@ -324,6 +324,8 @@ export interface IncomingPaymentRequest {
   id: string;
   /** Transport-specific pubkey of sender */
   senderTransportPubkey: string;
+  /** Sender's nametag (if included in encrypted content) */
+  senderNametag?: string;
   /** Parsed request data */
   request: {
     requestId: string;
