@@ -305,7 +305,7 @@ interface PaymentRequest {
   amount: string;           // Amount in smallest units
   coinId: string;           // Token type (e.g., 'ALPHA')
   message?: string;         // Optional message
-  recipientNametag?: string; // Who should pay
+  recipientNametag?: string; // Where tokens should be sent
   metadata?: Record<string, unknown>;
 }
 
@@ -339,10 +339,11 @@ interface IncomingPaymentRequest {
   coinId: string;              // Token type
   symbol: string;              // Token symbol for display
   message?: string;            // Request message
-  recipientNametag?: string;   // Our nametag (if specified)
+  recipientNametag?: string;   // Requester's nametag (where to send tokens)
   requestId: string;           // Original request ID
   timestamp: number;           // Request timestamp
   status: PaymentRequestStatus;
+  metadata?: Record<string, unknown>; // Custom metadata
 }
 
 // Example

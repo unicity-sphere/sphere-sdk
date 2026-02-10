@@ -1323,6 +1323,7 @@ export class NostrTransportProvider implements TransportProvider {
       const request: IncomingPaymentRequest = {
         id: event.id,
         senderTransportPubkey: event.pubkey,
+        senderNametag: requestData.recipientNametag,
         request: {
           requestId: requestData.requestId,
           amount: requestData.amount,

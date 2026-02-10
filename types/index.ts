@@ -152,7 +152,7 @@ export interface PaymentRequest {
   readonly coinId: string;
   /** Optional message/memo */
   readonly message?: string;
-  /** Recipient nametag (who should pay) */
+  /** Where tokens should be sent */
   readonly recipientNametag?: string;
   /** Custom metadata */
   readonly metadata?: Record<string, unknown>;
@@ -180,7 +180,7 @@ export interface IncomingPaymentRequest {
   readonly symbol: string;
   /** Message from sender */
   readonly message?: string;
-  /** Who this request is for (our nametag) */
+  /** Requester's nametag (where tokens should be sent) */
   readonly recipientNametag?: string;
   /** Original request ID from sender */
   readonly requestId: string;
