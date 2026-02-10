@@ -2344,6 +2344,16 @@ export class PaymentsModule {
   }
 
   /**
+   * Get the wallet's signing public key (used for token ownership predicates).
+   * This is the key that token state predicates are checked against.
+   */
+  async getSigningPublicKey(): Promise<Uint8Array> {
+    this.ensureInitialized();
+    const signer = await this.createSigningService();
+    return signer.publicKey;
+  }
+
+  /**
    * Create DirectAddress from a public key using UnmaskedPredicateReference
    */
   private async createDirectAddressFromPubkey(pubkeyHex: string): Promise<IAddress> {
