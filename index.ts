@@ -54,6 +54,10 @@ export type {
   SphereLoadOptions,
   SphereInitOptions,
   SphereInitResult,
+  ScanAddressProgress,
+  ScannedAddressResult,
+  ScanAddressesOptions,
+  ScanAddressesResult,
 } from './core';
 
 // =============================================================================

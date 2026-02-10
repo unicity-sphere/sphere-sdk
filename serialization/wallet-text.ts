@@ -283,10 +283,14 @@ export function parseWalletText(content: string): LegacyFileParseResult {
       content.includes('WALLET TYPE: Alpha descriptor wallet') ||
       !!chainCode;
 
+    // BIP32 wallets without explicit descriptor path default to 84'/1'/0' (Alpha network standard).
+    // The webwallet exports omit DESCRIPTOR PATH for encrypted files, so we must infer it.
+    const effectiveDescriptorPath = descriptorPath ?? (isBIP32 ? "84'/1'/0'" : undefined);
+
     const data: LegacyFileParsedData = {
       masterKey,
       chainCode: chainCode ?? undefined,
-      descriptorPath: descriptorPath ?? undefined,
+      descriptorPath: effectiveDescriptorPath,
       derivationMode: isBIP32 ? 'bip32' : 'wif_hmac',
     };
 
@@ -355,10 +359,14 @@ export function parseAndDecryptWalletText(
       content.includes('WALLET TYPE: Alpha descriptor wallet') ||
       !!chainCode;
 
+    // BIP32 wallets without explicit descriptor path default to 84'/1'/0' (Alpha network standard).
+    // The webwallet exports omit DESCRIPTOR PATH for encrypted files, so we must infer it.
+    const effectiveDescriptorPath = descriptorPath ?? (isBIP32 ? "84'/1'/0'" : undefined);
+
     const data: LegacyFileParsedData = {
       masterKey,
       chainCode: chainCode ?? undefined,
-      descriptorPath: descriptorPath ?? undefined,
+      descriptorPath: effectiveDescriptorPath,
       derivationMode: isBIP32 ? 'bip32' : 'wif_hmac',
     };
 
