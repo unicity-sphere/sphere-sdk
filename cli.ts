@@ -592,22 +592,22 @@ async function main() {
         const finalize = args.includes('--finalize');
         const sphere = await getSphere();
 
-        if (finalize) {
-          console.log('\nFetching and finalizing tokens...');
-          const result = await sphere.payments.receive({
-            finalize: true,
-            onProgress: (resolution) => {
-              if (resolution.stillPending > 0) {
-                const balances = sphere.payments.getBalance();
-                for (const bal of balances) {
-                  if (BigInt(bal.unconfirmedAmount) > 0n) {
-                    console.log(`  ${bal.symbol}: ${bal.unconfirmedTokenCount} token(s) still unconfirmed...`);
-                  }
+        console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
+        const result = await sphere.payments.receive({
+          finalize,
+          onProgress: (resolution) => {
+            if (resolution.stillPending > 0) {
+              const balances = sphere.payments.getBalance();
+              for (const bal of balances) {
+                if (BigInt(bal.unconfirmedAmount) > 0n) {
+                  console.log(`  ${bal.symbol}: ${bal.unconfirmedTokenCount} token(s) still unconfirmed...`);
                 }
               }
-            },
-          });
+            }
+          },
+        });
 
+        if (finalize) {
           if (result.timedOut) {
             console.log('  Warning: finalization timed out, some tokens still unconfirmed.');
           } else if (result.finalization && result.finalization.resolved > 0) {

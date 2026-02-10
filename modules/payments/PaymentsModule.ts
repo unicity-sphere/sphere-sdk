@@ -1893,15 +1893,10 @@ export class PaymentsModule {
    * Each entry includes confirmed and unconfirmed breakdowns. Tokens with
    * status `'spent'`, `'invalid'`, or `'transferring'` are excluded.
    *
-   * **Side effect:** fires a non-blocking {@link resolveUnconfirmed} call to
-   * advance any pending V5 finalization stages.
-   *
    * @param coinId - Optional coin ID to filter by (e.g. hex string). When omitted, all coin types are returned.
    * @returns Array of balance summaries (synchronous — no await needed).
    */
   getBalance(coinId?: string): TokenBalance[] {
-    // Fire-and-forget: try to resolve unconfirmed tokens
-    this.resolveUnconfirmed().catch(() => {});
 
     const balances = new Map<string, {
       coinId: string;
@@ -2013,7 +2008,7 @@ export class PaymentsModule {
    * when proofs are not yet available. Tokens that exceed 50 failed attempts are
    * marked `'invalid'`.
    *
-   * Automatically called (fire-and-forget) by {@link getBalance} and {@link load}.
+   * Automatically called (fire-and-forget) by {@link load}.
    *
    * @returns Summary with counts of resolved, still-pending, and failed tokens plus per-token details.
    */
