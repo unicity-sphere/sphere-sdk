@@ -73,10 +73,19 @@ function createMockTransport(): TransportProvider {
     resolveNametag: vi.fn((nametag: string) => {
       return Promise.resolve(nostrRelayNametags.get(nametag) ?? null);
     }),
+    publishIdentityBinding: vi.fn((chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
+      if (nametag) {
+        const existing = nostrRelayNametags.get(nametag);
+        if (existing && existing !== chainPubkey) {
+          return Promise.resolve(false);
+        }
+        nostrRelayNametags.set(nametag, chainPubkey);
+      }
+      return Promise.resolve(true);
+    }),
     registerNametag: vi.fn((nametag: string, chainPubkey: string) => {
       const existing = nostrRelayNametags.get(nametag);
       if (existing && existing !== chainPubkey) {
-        // Nametag taken by another pubkey
         return Promise.resolve(false);
       }
       nostrRelayNametags.set(nametag, chainPubkey);
@@ -186,12 +195,15 @@ describe('Sphere.clear() integration', () => {
       const walletExists = await storage.get(STORAGE_KEYS_GLOBAL.WALLET_EXISTS);
       expect(walletExists).toBeTruthy();
 
+      const trackedJson = await storage.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
+      expect(trackedJson).not.toBeNull();
+
+      // Nametags are stored separately in ADDRESS_NAMETAGS cache
       const nametagsJson = await storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
       expect(nametagsJson).not.toBeNull();
       const nametagsData = JSON.parse(nametagsJson!);
-      // At least one address has a nametag
       const hasNametag = Object.values(nametagsData).some(
-        (addrNametags) => Object.values(addrNametags as Record<string, string>).includes('alice')
+        (nametags: unknown) => typeof nametags === 'object' && nametags !== null && Object.values(nametags as Record<string, string>).includes('alice')
       );
       expect(hasNametag).toBe(true);
 
@@ -389,9 +401,9 @@ describe('Sphere.clear() integration', () => {
       expect(addr0.address).not.toBe(addr1.address);
       expect(addr1.address).not.toBe(addr2.address);
 
-      // Verify nametag is stored
-      const nametagsJson = await storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
-      expect(nametagsJson).not.toBeNull();
+      // Verify tracked addresses are stored
+      const trackedJson = await storage.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
+      expect(trackedJson).not.toBeNull();
 
       await sphere.destroy();
 
@@ -400,7 +412,7 @@ describe('Sphere.clear() integration', () => {
 
       // All data should be gone
       expect(await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC)).toBeNull();
-      expect(await storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS)).toBeNull();
+      expect(await storage.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES)).toBeNull();
       expect(await Sphere.exists(storage)).toBe(false);
     });
   });

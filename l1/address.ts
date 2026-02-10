@@ -12,6 +12,7 @@ import {
   generateMasterKey,
   generateAddressInfo,
   ec,
+  type AddressInfo,
 } from '../core/crypto';
 
 // Re-export core functions with L1 naming conventions
@@ -55,7 +56,7 @@ export function generateHDAddressBIP32(
   index: number,
   basePath: string = "m/44'/0'/0'",
   isChange: boolean = false
-) {
+): AddressInfo {
   // Chain: 0 = external (receiving), 1 = internal (change)
   const chain = isChange ? 1 : 0;
   const fullPath = `${basePath}/${chain}/${index}`;
@@ -80,7 +81,7 @@ export function generateHDAddressBIP32(
 export function generateAddressFromMasterKey(
   masterPrivateKey: string,
   index: number
-) {
+): AddressInfo {
   const derivationPath = `m/44'/0'/${index}'`;
 
   // HMAC-SHA512 with path as key (matching index.html exactly)
@@ -129,7 +130,7 @@ export function generateHDAddress(
   masterPriv: string,
   chainCode: string,
   index: number
-) {
+): AddressInfo {
   const child = deriveChildKey(masterPriv, chainCode, index);
   const path = `m/44'/0'/0'/${index}`;
 

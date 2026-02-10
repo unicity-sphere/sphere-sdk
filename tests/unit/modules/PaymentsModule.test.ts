@@ -769,19 +769,19 @@ describe('getAssets()', () => {
     return module;
   }
 
-  it('should return empty array when no tokens exist', () => {
+  it('should return empty array when no tokens exist', async () => {
     const module = createPaymentsModule();
-    expect(module.getAssets()).toEqual([]);
+    expect(await module.getAssets()).toEqual([]);
   });
 
-  it('should aggregate tokens by coinId', () => {
+  it('should aggregate tokens by coinId', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '2000', status: 'confirmed' },
       { id: 't3', coinId: '0xbbb', symbol: 'BTC', name: 'Bitcoin', decimals: 8, amount: '500', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets();
+    const assets = await module.getAssets();
 
     expect(assets.length).toBe(2);
 
@@ -797,17 +797,17 @@ describe('getAssets()', () => {
     expect(btc?.tokenCount).toBe(1);
   });
 
-  it('should sum amounts correctly using BigInt', () => {
+  it('should sum amounts correctly using BigInt', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '999999999999999999', status: 'confirmed' },
       { id: 't2', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets();
+    const assets = await module.getAssets();
     expect(assets[0]?.totalAmount).toBe('1000000000000000000');
   });
 
-  it('should only include confirmed tokens', () => {
+  it('should only include confirmed tokens', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '2000', status: 'pending' },
@@ -816,39 +816,39 @@ describe('getAssets()', () => {
       { id: 't5', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '5000', status: 'invalid' },
     ]);
 
-    const assets = module.getAssets();
+    const assets = await module.getAssets();
     expect(assets.length).toBe(1);
     expect(assets[0]?.totalAmount).toBe('1000');
     expect(assets[0]?.tokenCount).toBe(1);
   });
 
-  it('should filter by coinId when provided', () => {
+  it('should filter by coinId when provided', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xbbb', symbol: 'BTC', name: 'Bitcoin', decimals: 8, amount: '500', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets('0xaaa');
+    const assets = await module.getAssets('0xaaa');
     expect(assets.length).toBe(1);
     expect(assets[0]?.symbol).toBe('UCT');
   });
 
-  it('should return empty array when coinId filter matches nothing', () => {
+  it('should return empty array when coinId filter matches nothing', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets('0xnonexistent');
+    const assets = await module.getAssets('0xnonexistent');
     expect(assets.length).toBe(0);
   });
 
-  it('should include decimals from token', () => {
+  it('should include decimals from token', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xbbb', symbol: 'USDU', name: 'Unicity-usd', decimals: 6, amount: '500', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets();
+    const assets = await module.getAssets();
     const uct = assets.find((a) => a.symbol === 'UCT');
     const usdu = assets.find((a) => a.symbol === 'USDU');
 
@@ -856,13 +856,13 @@ describe('getAssets()', () => {
     expect(usdu?.decimals).toBe(6);
   });
 
-  it('should include iconUrl from token', () => {
+  it('should include iconUrl from token', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, iconUrl: 'https://example.com/uct.png', amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xbbb', symbol: 'BTC', name: 'Bitcoin', decimals: 8, amount: '500', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets();
+    const assets = await module.getAssets();
     const uct = assets.find((a) => a.symbol === 'UCT');
     const btc = assets.find((a) => a.symbol === 'BTC');
 
@@ -870,15 +870,70 @@ describe('getAssets()', () => {
     expect(btc?.iconUrl).toBeUndefined();
   });
 
-  it('should preserve symbol and name from first token of each group', () => {
+  it('should preserve symbol and name from first token of each group', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '2000', status: 'confirmed' },
     ]);
 
-    const assets = module.getAssets();
+    const assets = await module.getAssets();
     expect(assets[0]?.symbol).toBe('UCT');
     expect(assets[0]?.name).toBe('Unicity');
     expect(assets[0]?.coinId).toBe('0xaaa');
+  });
+
+  it('should have null price fields when no PriceProvider', async () => {
+    const module = createModuleWithTokens([
+      { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
+    ]);
+
+    const assets = await module.getAssets();
+    expect(assets[0]?.priceUsd).toBeNull();
+    expect(assets[0]?.priceEur).toBeNull();
+    expect(assets[0]?.change24h).toBeNull();
+    expect(assets[0]?.fiatValueUsd).toBeNull();
+    expect(assets[0]?.fiatValueEur).toBeNull();
+  });
+});
+
+// =============================================================================
+// getBalance() Tests
+// =============================================================================
+
+describe('getBalance()', () => {
+  function createModuleWithTokens(tokens: Array<{
+    id: string;
+    coinId: string;
+    symbol: string;
+    name: string;
+    decimals: number;
+    amount: string;
+    status: string;
+  }>) {
+    const module = createPaymentsModule();
+    const tokensMap = (module as unknown as { tokens: Map<string, unknown> }).tokens;
+    for (const token of tokens) {
+      tokensMap.set(token.id, {
+        ...token,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+    }
+    return module;
+  }
+
+  it('should return null when no PriceProvider is configured', async () => {
+    const module = createModuleWithTokens([
+      { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
+    ]);
+
+    const balance = await module.getBalance();
+    expect(balance).toBeNull();
+  });
+
+  it('should return null when no tokens exist', async () => {
+    const module = createPaymentsModule();
+    const balance = await module.getBalance();
+    expect(balance).toBeNull();
   });
 });

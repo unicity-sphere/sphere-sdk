@@ -233,6 +233,13 @@ const providers = createBrowserProviders({
     enableVesting: true,
   },
 
+  // Price provider (optional — enables fiat value display)
+  price: {
+    platform: 'coingecko',    // Currently supported: 'coingecko'
+    apiKey: 'CG-xxx',         // Optional (free tier works without key)
+    cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
+  },
+
   // Token sync (optional IPFS)
   tokenSync: {
     ipfs: {
@@ -256,12 +263,22 @@ console.log('Public Key:', identity?.chainPubkey);    // 02abc...
 console.log('Nametag:', identity?.nametag);           // @username
 ```
 
-### Check Balance
+### Check Balance & Assets
 
 ```typescript
-// L3 token balance
-const balance = await sphere.payments.getBalance();
-document.getElementById('balance').textContent = balance;
+// Get assets with price data (price fields are null without PriceProvider)
+const assets = await sphere.payments.getAssets();
+for (const asset of assets) {
+  console.log(`${asset.symbol}: ${asset.totalAmount} (${asset.tokenCount} tokens)`);
+  if (asset.fiatValueUsd != null) {
+    console.log(`  Value: $${asset.fiatValueUsd.toFixed(2)}`);
+  }
+}
+
+// Total portfolio value in USD (null if PriceProvider not configured)
+const totalUsd = await sphere.payments.getBalance();
+document.getElementById('balance').textContent =
+  totalUsd != null ? `$${totalUsd.toFixed(2)}` : 'N/A';
 
 // L1 (ALPHA) balance
 const l1Balance = await sphere.payments.l1.getBalance();
@@ -374,14 +391,14 @@ function WalletApp() {
       setSphere(sphere);
       setStatus('Connected');
 
-      // Load balance
+      // Load balance (total USD value, null if no PriceProvider)
       const bal = await sphere.payments.getBalance();
-      setBalance(bal);
+      setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
 
       // Listen for incoming
       sphere.on('transfer:incoming', async () => {
         const newBal = await sphere.payments.getBalance();
-        setBalance(newBal);
+        setBalance(newBal != null ? `$${newBal.toFixed(2)}` : 'N/A');
       });
     };
 
@@ -407,7 +424,7 @@ function WalletApp() {
 
       // Refresh balance
       const bal = await sphere.payments.getBalance();
-      setBalance(bal);
+      setBalance(bal != null ? `$${bal.toFixed(2)}` : 'N/A');
     } catch (err: any) {
       setStatus('Error: ' + err.message);
     }

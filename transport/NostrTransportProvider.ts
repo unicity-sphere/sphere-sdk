@@ -43,7 +43,7 @@ import type {
   PaymentRequestResponsePayload,
   TransportEvent,
   TransportEventCallback,
-  NametagInfo,
+  PeerInfo,
 } from './transport-provider';
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
@@ -78,6 +78,21 @@ export interface NostrTransportProviderConfig {
 
 // Alias for backward compatibility
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
+
+// =============================================================================
+// Address Hashing Utility
+// =============================================================================
+
+/**
+ * Hash an address (DIRECT:// or PROXY://) for use as indexed 't' tag value.
+ * Enables reverse lookup: address → binding event → transport pubkey.
+ * @param address - Address string (e.g., DIRECT://... or PROXY://...)
+ * @returns Hex-encoded SHA-256 hash
+ */
+function hashAddressForTag(address: string): string {
+  const bytes = new TextEncoder().encode('unicity:address:' + address);
+  return Buffer.from(sha256Noble(bytes)).toString('hex');
+}
 
 // =============================================================================
 // Nametag Encryption Utilities
@@ -420,7 +435,7 @@ export class NostrTransportProvider implements TransportProvider {
   // TransportProvider Implementation
   // ===========================================================================
 
-  setIdentity(identity: FullIdentity): void {
+  async setIdentity(identity: FullIdentity): Promise<void> {
     this.identity = identity;
 
     // Create NostrKeyManager from private key
@@ -461,13 +476,10 @@ export class NostrTransportProvider implements TransportProvider {
         },
       });
 
-      // Connect with new identity and set up subscriptions
-      this.nostrClient.connect(...this.config.relays).then(() => {
-        this.subscribeToEvents();
-        oldClient.disconnect();
-      }).catch((err) => {
-        this.log('Failed to reconnect with new identity:', err);
-      });
+      // Connect with new identity, set up subscriptions, then disconnect old client
+      await this.nostrClient.connect(...this.config.relays);
+      this.subscribeToEvents();
+      oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
       this.subscribeToEvents();
@@ -658,8 +670,42 @@ export class NostrTransportProvider implements TransportProvider {
     return () => this.paymentRequestResponseHandlers.delete(handler);
   }
 
+  /**
+   * Resolve any identifier to full peer information.
+   * Routes to the appropriate specific resolve method based on identifier format.
+   */
+  async resolve(identifier: string): Promise<PeerInfo | null> {
+    // @nametag
+    if (identifier.startsWith('@')) {
+      return this.resolveNametagInfo(identifier.slice(1));
+    }
+
+    // DIRECT:// or PROXY:// address
+    if (identifier.startsWith('DIRECT:') || identifier.startsWith('PROXY:')) {
+      return this.resolveAddressInfo(identifier);
+    }
+
+    // L1 address (alpha1... or alphat1...)
+    if (identifier.startsWith('alpha1') || identifier.startsWith('alphat1')) {
+      return this.resolveAddressInfo(identifier);
+    }
+
+    // 66-char hex starting with 02/03 → compressed chain pubkey (33 bytes)
+    if (/^0[23][0-9a-f]{64}$/i.test(identifier)) {
+      return this.resolveAddressInfo(identifier);
+    }
+
+    // 64-char hex string → transport pubkey
+    if (/^[0-9a-f]{64}$/i.test(identifier)) {
+      return this.resolveTransportPubkeyInfo(identifier);
+    }
+
+    // Fallback: treat as bare nametag
+    return this.resolveNametagInfo(identifier);
+  }
+
   async resolveNametag(nametag: string): Promise<string | null> {
-    this.ensureReady();
+    this.ensureConnected();
 
     // Query for nametag binding events using hashed nametag (privacy-preserving)
     // Try both '#d' and '#t' filters for compatibility with nostr-js-sdk
@@ -701,8 +747,8 @@ export class NostrTransportProvider implements TransportProvider {
     return null;
   }
 
-  async resolveNametagInfo(nametag: string): Promise<NametagInfo | null> {
-    this.ensureReady();
+  async resolveNametagInfo(nametag: string): Promise<PeerInfo | null> {
+    this.ensureConnected();
 
     // Query for nametag binding events using hashed nametag (privacy-preserving)
     const hashedNametag = hashNametag(nametag);
@@ -795,6 +841,91 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
+   * Resolve a DIRECT://, PROXY://, or L1 address to full peer info.
+   * Performs reverse lookup: hash(address) → query '#t' tag → parse binding event.
+   * Works with both new identity binding events and legacy nametag binding events.
+   */
+  async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
+    this.ensureConnected();
+
+    const addressHash = hashAddressForTag(address);
+
+    const events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      '#t': [addressHash],
+      limit: 1,
+    });
+
+    if (events.length === 0) return null;
+
+    const bindingEvent = events[0];
+
+    try {
+      const content = JSON.parse(bindingEvent.content);
+
+      return {
+        nametag: content.nametag || undefined,
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: content.public_key || '',
+        l1Address: content.l1_address || '',
+        directAddress: content.direct_address || '',
+        proxyAddress: content.proxy_address || undefined,
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    } catch {
+      return {
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '',
+        l1Address: '',
+        directAddress: '',
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    }
+  }
+
+  /**
+   * Resolve transport pubkey (Nostr pubkey) to full peer info.
+   * Queries binding events authored by the given pubkey.
+   */
+  async resolveTransportPubkeyInfo(transportPubkey: string): Promise<PeerInfo | null> {
+    this.ensureConnected();
+
+    const events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      authors: [transportPubkey],
+      limit: 5,
+    });
+
+    if (events.length === 0) return null;
+
+    // Sort by timestamp descending and take the most recent
+    events.sort((a, b) => b.created_at - a.created_at);
+    const bindingEvent = events[0];
+
+    try {
+      const content = JSON.parse(bindingEvent.content);
+
+      return {
+        nametag: content.nametag || undefined,
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: content.public_key || '',
+        l1Address: content.l1_address || '',
+        directAddress: content.direct_address || '',
+        proxyAddress: content.proxy_address || undefined,
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    } catch {
+      return {
+        transportPubkey: bindingEvent.pubkey,
+        chainPubkey: '',
+        l1Address: '',
+        directAddress: '',
+        timestamp: bindingEvent.created_at * 1000,
+      };
+    }
+  }
+
+  /**
    * Recover nametag for the current identity by searching for encrypted nametag events
    * Used after wallet import to recover associated nametag
    * @returns Decrypted nametag or null if none found
@@ -848,6 +979,90 @@ export class NostrTransportProvider implements TransportProvider {
     return null;
   }
 
+  /**
+   * Publish identity binding event on Nostr.
+   * Without nametag: publishes base binding (chainPubkey, l1Address, directAddress).
+   * With nametag: also publishes nametag hash, proxy address, encrypted nametag for recovery.
+   *
+   * Uses kind 30078 parameterized replaceable event with d=SHA256('unicity:identity:' + nostrPubkey).
+   * Each HD address index has its own Nostr key → its own binding event.
+   *
+   * @returns true if successful, false if nametag is taken by another pubkey
+   */
+  async publishIdentityBinding(
+    chainPubkey: string,
+    l1Address: string,
+    directAddress: string,
+    nametag?: string,
+  ): Promise<boolean> {
+    this.ensureReady();
+
+    if (!this.identity) {
+      throw new Error('Identity not set');
+    }
+
+    const nostrPubkey = this.getNostrPubkey();
+
+    // Deterministic d-tag: SHA256('unicity:identity:' + nostrPubkey) — privacy-preserving
+    const dTagBytes = new TextEncoder().encode('unicity:identity:' + nostrPubkey);
+    const dTag = Buffer.from(sha256Noble(dTagBytes)).toString('hex');
+
+    // Content — event.pubkey already identifies the author, event.created_at provides timestamp
+    const contentObj: Record<string, unknown> = {
+      public_key: chainPubkey,
+      l1_address: l1Address,
+      direct_address: directAddress,
+    };
+
+    // Tags — 'd' for replacement, 't' for indexed lookups
+    const tags: string[][] = [
+      ['d', dTag],
+      ['t', hashAddressForTag(chainPubkey)],
+      ['t', hashAddressForTag(directAddress)],
+      ['t', hashAddressForTag(l1Address)],
+    ];
+
+    // If nametag provided, check availability and add nametag-specific fields
+    if (nametag) {
+      const existing = await this.resolveNametag(nametag);
+      if (existing && existing !== nostrPubkey) {
+        this.log('Nametag already taken:', nametag, '- owner:', existing);
+        return false;
+      }
+
+      // Compute proxy address
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
+      const proxyAddress = proxyAddr.toString();
+
+      // Encrypt nametag for recovery
+      const encryptedNametag = await encryptNametag(nametag, this.identity.privateKey);
+      const hashedNametag = hashNametag(nametag);
+
+      // Add nametag fields to content
+      contentObj.nametag = nametag;
+      contentObj.encrypted_nametag = encryptedNametag;
+      contentObj.proxy_address = proxyAddress;
+
+      // Add nametag-specific 't' tags for indexed lookup
+      tags.push(['t', hashedNametag]);
+      tags.push(['t', hashAddressForTag(proxyAddress)]);
+    }
+
+    const content = JSON.stringify(contentObj);
+    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
+    await this.publishEvent(event);
+
+    if (nametag) {
+      this.log('Published identity binding with nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+    } else {
+      this.log('Published identity binding (no nametag) for pubkey:', nostrPubkey.slice(0, 16) + '...');
+    }
+
+    return true;
+  }
+
+  /** @deprecated Use publishIdentityBinding instead */
   async publishNametag(nametag: string, address: string): Promise<void> {
     this.ensureReady();
 
@@ -895,6 +1110,11 @@ export class NostrTransportProvider implements TransportProvider {
     const l1Address = publicKeyToAddress(compressedPubkey, 'alpha'); // alpha1...
     const encryptedNametag = await encryptNametag(nametag, privateKeyHex);
 
+    // Compute PROXY address for reverse lookup
+    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
+    const proxyAddress = proxyAddr.toString();
+
     // Publish nametag binding with extended info
     const hashedNametag = hashNametag(nametag);
     const content = JSON.stringify({
@@ -906,17 +1126,22 @@ export class NostrTransportProvider implements TransportProvider {
       public_key: compressedPubkey,
       l1_address: l1Address,
       direct_address: directAddress,
+      proxy_address: proxyAddress,
     });
 
-    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, [
+    // Build tags with indexed 't' tags for reverse lookup by nametag and address
+    const tags: string[][] = [
       ['d', hashedNametag],
       ['nametag', hashedNametag],
       ['t', hashedNametag],
+      ['t', hashAddressForTag(directAddress)],
+      ['t', hashAddressForTag(proxyAddress)],
       ['address', nostrPubkey],
-      // Extended tags for indexing
       ['pubkey', compressedPubkey],
       ['l1', l1Address],
-    ]);
+    ];
+
+    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
 
     await this.publishEvent(event);
     this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
@@ -1481,10 +1706,14 @@ export class NostrTransportProvider implements TransportProvider {
   // Private: Helpers
   // ===========================================================================
 
-  private ensureReady(): void {
+  private ensureConnected(): void {
     if (!this.isConnected()) {
       throw new Error('NostrTransportProvider not connected');
     }
+  }
+
+  private ensureReady(): void {
+    this.ensureConnected();
     if (!this.identity) {
       throw new Error('Identity not set');
     }

@@ -44,8 +44,12 @@ const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
 ### Common Operations
 
 ```typescript
-// Check balance
-const balance = sphere.payments.getBalance();
+// Check total portfolio value in USD (requires PriceProvider)
+const balance = await sphere.payments.getBalance(); // number | null
+
+// Get assets with price data
+const assets = await sphere.payments.getAssets();
+// [{ coinId, symbol, totalAmount, priceUsd, fiatValueUsd, ... }]
 
 // Send tokens
 await sphere.payments.send({
@@ -56,6 +60,11 @@ await sphere.payments.send({
 
 // Register nametag (mints token on-chain!)
 await sphere.registerNametag('myname');
+
+// Multi-address management
+await sphere.switchToAddress(1);
+const addresses = sphere.getActiveAddresses(); // non-hidden tracked addresses
+await sphere.setAddressHidden(1, true);        // hide from UI
 
 // Listen for incoming transfers
 sphere.on('transfer:incoming', (event) => {
@@ -73,6 +82,7 @@ await sphere.destroy();
 | Storage | localStorage + IndexedDB | File-based JSON |
 | Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
 | Oracle (Aggregator) | Included with API key | Included with API key |
+| Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | IPFS sync | Optional (`helia`) | Not available |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
@@ -124,6 +134,11 @@ sphere-sdk/
 │
 ├── oracle/                  # Token validation (Aggregator)
 │   └── oracle-provider.ts         # OracleProvider interface
+│
+├── price/                   # Token market prices
+│   ├── price-provider.ts          # PriceProvider interface
+│   ├── CoinGeckoPriceProvider.ts  # CoinGecko implementation
+│   └── index.ts                   # Barrel exports + factory
 │
 ├── impl/                    # Platform-specific implementations
 │   ├── browser/            # LocalStorage, IndexedDB, IPFS
@@ -187,6 +202,19 @@ interface Identity {
 interface FullIdentity extends Identity {
   privateKey: string;       // secp256k1 private key (hex)
 }
+
+// Tracked address (returned by getActiveAddresses(), etc.)
+interface TrackedAddress {
+  index: number;            // HD derivation index
+  addressId: string;        // "DIRECT_abc123_xyz789"
+  l1Address: string;        // alpha1...
+  directAddress: string;    // DIRECT://...
+  chainPubkey: string;      // 33-byte compressed pubkey
+  nametag?: string;         // primary nametag (without @)
+  hidden: boolean;          // manual hide flag for UI
+  createdAt: number;        // ms timestamp
+  updatedAt: number;        // ms timestamp
+}
 ```
 
 ### Provider Pattern
@@ -198,6 +226,7 @@ Abstract interfaces for platform independence:
 | TokenStorage | `TokenStorageProvider` | IndexedDBTokenStorageProvider, FileTokenStorageProvider, IpfsStorageProvider |
 | Transport | `TransportProvider` | NostrTransportProvider |
 | Oracle | `OracleProvider` | UnicityAggregatorProvider |
+| Price | `PriceProvider` | CoinGeckoPriceProvider |
 
 ### Network Configuration
 
@@ -251,12 +280,18 @@ npm run type-check
 ### L3 Transfers
 - Use `DirectAddress` (not PROXY) for transfers
 - Finalization required to generate local state for tracking
-- Recipient resolved via `resolveNametagInfo` for 33-byte pubkey
+- Recipient resolved via unified `transport.resolve(identifier)` → returns `PeerInfo`
+
+### Peer Resolution
+- `sphere.resolve(identifier)` / `transport.resolve(identifier)` — unified lookup
+- Accepts: `@nametag`, `DIRECT://...`, `PROXY://...`, `alpha1...`, chain pubkey (`02`/`03` prefix), transport pubkey (64-hex)
+- Returns `PeerInfo` with all address formats, or `null` if not found
+- Identity binding event published on `init()`/`load()` — wallet discoverable without nametag
 
 ### Transport vs Chain Pubkeys
 - `chainPubkey`: 33-byte compressed secp256k1 for L3 chain operations
-- `transportPubkey`: Derived key for Nostr messaging (HKDF from private key)
-- Nametag events include both for cross-compatibility
+- `transportPubkey`: Derived key for transport messaging (HKDF from private key)
+- Identity binding events include both for cross-resolution
 
 ### Token Storage (TXF Format)
 ```typescript
@@ -283,20 +318,31 @@ TxfStorageDataBase {
 4. **New events**:
    - `nametag:recovered` - Emitted when nametag found on Nostr during import
    - `identity:changed` - Updated with new field names
+   - `address:activated` - Emitted when new address first tracked
+   - `address:hidden` / `address:unhidden` - Address visibility changes
 
 5. **TypeScript 5.6 compatibility**: Web Crypto API ArrayBuffer types fixed
+
+6. **PriceProvider** (optional): CoinGecko integration for token fiat prices
+   - `getBalance()` returns total USD value (`number | null`)
+   - `getAssets()` returns assets enriched with `priceUsd`, `fiatValueUsd`, `change24h`
+   - `baseUrl` config for CORS proxy in browser environments
+   - Negative cache: tokens not found on CoinGecko are cached to prevent repeated requests
+   - `setPriceProvider()` for runtime provider configuration
 
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 611+
+**Total tests:** 840+
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
+- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
+- `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
 
 ## Dependencies
 
@@ -331,7 +377,8 @@ const { sphere } = await Sphere.init({
 });
 
 // 4. Operations
-const balance = await sphere.payments.getBalance();
+const balance = await sphere.payments.getBalance(); // total USD value or null
+const assets = await sphere.payments.getAssets();    // assets with price data
 await sphere.payments.send({ recipient: '@bob', amount: '1000000', coinId: 'UCT' });
 
 // 5. Cleanup

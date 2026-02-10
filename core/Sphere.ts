@@ -48,10 +48,13 @@ import type {
   WalletInfo,
   WalletJSON,
   WalletJSONExportOptions,
+  TrackedAddress,
+  TrackedAddressEntry,
 } from '../types';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
-import type { TransportProvider } from '../transport';
+import type { TransportProvider, PeerInfo } from '../transport';
 import type { OracleProvider } from '../oracle';
+import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
 import {
@@ -75,7 +78,11 @@ import {
   type MasterKey,
   type AddressInfo,
 } from './crypto';
-import { encryptSimple, decryptSimple } from './encryption';
+import { encryptSimple, decryptSimple, decryptWithSalt } from './encryption';
+import { scanAddressesImpl } from './scan';
+import type { ScanAddressesOptions, ScanAddressesResult } from './scan';
+import { vestingClassifier } from '../l1/vesting';
+import { generateAddressFromMasterKey } from '../l1/address';
 import {
   parseWalletText,
   parseAndDecryptWalletText,
@@ -123,6 +130,8 @@ export interface SphereCreateOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
   /**
    * Network type (mainnet, testnet, dev) - informational only.
    * Actual network configuration comes from provider URLs.
@@ -143,6 +152,8 @@ export interface SphereLoadOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
   /**
    * Network type (mainnet, testnet, dev) - informational only.
    * Actual network configuration comes from provider URLs.
@@ -177,6 +188,8 @@ export interface SphereImportOptions {
   oracle: OracleProvider;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -209,6 +222,8 @@ export interface SphereInitOptions {
   nametag?: string;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Optional price provider for fiat conversion */
+  price?: PriceProvider;
   /**
    * Network type (mainnet, testnet, dev) - informational only.
    * Actual network configuration comes from provider URLs.
@@ -281,7 +296,11 @@ export class Sphere {
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
   private _currentAddressIndex: number = 0;
-  /** Map of addressId -> (nametagIndex -> nametag). Supports multiple nametags per address (e.g., from Nostr recovery) */
+  /** Registry of all tracked (activated) addresses, keyed by HD index */
+  private _trackedAddresses: Map<number, TrackedAddress> = new Map();
+  /** Reverse lookup: addressId -> HD index */
+  private _addressIdToIndex: Map<string, number> = new Map();
+  /** Nametag cache: addressId -> (nametagIndex -> nametag). Separate from tracked addresses. */
   private _addressNametags: Map<string, Map<number, string>> = new Map();
   /** Cached PROXY address (computed once when nametag is set) */
   private _cachedProxyAddress: string | undefined = undefined;
@@ -291,6 +310,7 @@ export class Sphere {
   private _tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>> = new Map();
   private _transport: TransportProvider;
   private _oracle: OracleProvider;
+  private _priceProvider: PriceProvider | null;
 
   // Modules
   private _payments: PaymentsModule;
@@ -308,11 +328,13 @@ export class Sphere {
     transport: TransportProvider,
     oracle: OracleProvider,
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
-    l1Config?: L1Config
+    l1Config?: L1Config,
+    priceProvider?: PriceProvider,
   ) {
     this._storage = storage;
     this._transport = transport;
     this._oracle = oracle;
+    this._priceProvider = priceProvider ?? null;
 
     // Initialize token storage providers map
     if (tokenStorage) {
@@ -387,6 +409,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         l1: options.l1,
+        price: options.price,
       });
       return { sphere, created: false };
     }
@@ -417,6 +440,7 @@ export class Sphere {
       derivationPath: options.derivationPath,
       nametag: options.nametag,
       l1: options.l1,
+      price: options.price,
     });
 
     return { sphere, created: true, generatedMnemonic };
@@ -441,7 +465,8 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1
+      options.l1,
+      options.price,
     );
 
     // Store encrypted mnemonic
@@ -461,12 +486,20 @@ export class Sphere {
     sphere._initialized = true;
     Sphere.instance = sphere;
 
-    // Register nametag if provided, otherwise try to recover from Nostr
+    // Track address 0 in the registry
+    await sphere.ensureAddressTracked(0);
+
+    // Register nametag if provided, otherwise publish identity and try recovery
     if (options.nametag) {
+      // registerNametag publishes identity binding WITH nametag atomically
+      // (calling syncIdentityWithTransport before this would race — both replaceable
+      // events get the same created_at second and relay keeps the one without nametag)
       await sphere.registerNametag(options.nametag);
     } else {
-      // Try to recover nametag from Nostr (for wallet import scenarios)
-      await sphere.recoverNametagFromNostr();
+      // Publish identity binding via transport (makes wallet discoverable)
+      await sphere.syncIdentityWithTransport();
+      // Try to recover nametag from transport (for wallet import scenarios)
+      await sphere.recoverNametagFromTransport();
     }
 
     return sphere;
@@ -486,7 +519,8 @@ export class Sphere {
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1
+      options.l1,
+      options.price,
     );
 
     // Load identity from storage
@@ -496,11 +530,27 @@ export class Sphere {
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
-    // Sync nametag with Nostr (re-register if missing)
-    await sphere.syncNametagWithNostr();
+    // Publish identity binding via transport
+    await sphere.syncIdentityWithTransport();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
+
+    // If nametag name exists but token is missing, try to mint it.
+    // This handles the case where the token was lost from IndexedDB.
+    if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
+      console.log(`[Sphere] Nametag @${sphere._identity.nametag} has no token, attempting to mint...`);
+      try {
+        const result = await sphere.mintNametag(sphere._identity.nametag);
+        if (result.success) {
+          console.log(`[Sphere] Nametag token minted successfully on load`);
+        } else {
+          console.warn(`[Sphere] Could not mint nametag token: ${result.error}`);
+        }
+      } catch (err) {
+        console.warn(`[Sphere] Nametag token mint failed:`, err);
+      }
+    }
 
     return sphere;
   }
@@ -516,12 +566,19 @@ export class Sphere {
     // Clear existing wallet if any (including token data)
     await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
 
+    // Reconnect storage after clear (clear may have called destroy() on the
+    // previous instance which disconnects the shared storage provider)
+    if (!options.storage.isConnected()) {
+      await options.storage.connect();
+    }
+
     const sphere = new Sphere(
       options.storage,
       options.transport,
       options.oracle,
       options.tokenStorage,
-      options.l1
+      options.l1,
+      options.price,
     );
 
     if (options.mnemonic) {
@@ -553,7 +610,7 @@ export class Sphere {
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
-      await sphere.recoverNametagFromNostr();
+      await sphere.recoverNametagFromTransport();
     }
 
     // Mark wallet as created only after successful initialization
@@ -561,6 +618,9 @@ export class Sphere {
 
     sphere._initialized = true;
     Sphere.instance = sphere;
+
+    // Track address 0 in the registry
+    await sphere.ensureAddressTracked(0);
 
     // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
@@ -604,6 +664,7 @@ export class Sphere {
     await storage.remove(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
     await storage.remove(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
     await storage.remove(STORAGE_KEYS_GLOBAL.WALLET_EXISTS);
+    await storage.remove(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
     await storage.remove(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
     // Per-address data
     await storage.remove(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
@@ -613,6 +674,9 @@ export class Sphere {
     if (tokenStorage?.clear) {
       await tokenStorage.clear();
     }
+
+    // Clear L1 vesting cache
+    await vestingClassifier.destroy();
 
     if (Sphere.instance) {
       await Sphere.instance.destroy();
@@ -761,6 +825,14 @@ export class Sphere {
     return this._tokenStorageProviders.has(providerId);
   }
 
+  /**
+   * Set or update the price provider after initialization
+   */
+  setPriceProvider(provider: PriceProvider): void {
+    this._priceProvider = provider;
+    this._payments.setPriceProvider(provider);
+  }
+
   getTransport(): TransportProvider {
     return this._transport;
   }
@@ -828,7 +900,7 @@ export class Sphere {
     return {
       source: this._source,
       hasMnemonic: this._mnemonic !== null,
-      hasChainCode: this._masterKey?.chainCode !== undefined,
+      hasChainCode: !!this._masterKey?.chainCode,
       derivationMode: this._derivationMode,
       basePath: this._basePath,
       address0,
@@ -895,7 +967,7 @@ export class Sphere {
 
     if (this._masterKey) {
       masterPrivateKey = this._masterKey.privateKey;
-      chainCode = this._masterKey.chainCode;
+      chainCode = this._masterKey.chainCode || undefined;
     }
 
     // Prepare mnemonic (optionally encrypt)
@@ -990,7 +1062,7 @@ export class Sphere {
     }
 
     const masterPrivateKey = this._masterKey?.privateKey || '';
-    const chainCode = this._masterKey?.chainCode;
+    const chainCode = this._masterKey?.chainCode || undefined;
     const isBIP32 = this._derivationMode === 'bip32';
     const descriptorPath = this._basePath.replace(/^m\//, '');
 
@@ -1280,27 +1352,106 @@ export class Sphere {
       return { success: true, sphere };
     }
 
-    // Handle JSON (redirect to importFromJSON)
+    // Handle JSON
     if (fileType === 'json') {
       const content = typeof fileContent === 'string'
         ? fileContent
         : new TextDecoder().decode(fileContent);
 
-      const result = await Sphere.importFromJSON({
-        jsonContent: content,
-        password,
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        return { success: false, error: 'Invalid JSON file' };
+      }
+
+      // sphere-wallet format — delegate to importFromJSON
+      if (parsed.type === 'sphere-wallet') {
+        const result = await Sphere.importFromJSON({
+          jsonContent: content,
+          password,
+          storage: options.storage,
+          transport: options.transport,
+          oracle: options.oracle,
+          tokenStorage: options.tokenStorage,
+        });
+
+        if (result.success) {
+          const sphere = Sphere.getInstance();
+          return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
+        }
+
+        if (!password && result.error?.includes('Password required')) {
+          return { success: false, needsPassword: true, error: result.error };
+        }
+
+        return { success: false, error: result.error };
+      }
+
+      // Legacy flat JSON format (webwallet export)
+      let masterKey: string | undefined;
+      let mnemonic: string | undefined;
+
+      if (parsed.encrypted && typeof parsed.encrypted === 'object') {
+        // Encrypted legacy JSON — needs password + salt-based PBKDF2 decryption
+        if (!password) {
+          return { success: false, needsPassword: true, error: 'Password required for encrypted wallet' };
+        }
+        const enc = parsed.encrypted as { masterPrivateKey?: string; mnemonic?: string; salt?: string };
+        if (!enc.salt || !enc.masterPrivateKey) {
+          return { success: false, error: 'Invalid encrypted wallet format' };
+        }
+        const decryptedKey = decryptWithSalt(enc.masterPrivateKey, password, enc.salt);
+        if (!decryptedKey) {
+          return { success: false, error: 'Failed to decrypt - incorrect password?' };
+        }
+        masterKey = decryptedKey;
+        if (enc.mnemonic) {
+          mnemonic = decryptWithSalt(enc.mnemonic, password, enc.salt) ?? undefined;
+        }
+      } else {
+        // Unencrypted legacy JSON
+        masterKey = parsed.masterPrivateKey as string | undefined;
+        mnemonic = parsed.mnemonic as string | undefined;
+      }
+
+      if (!masterKey) {
+        return { success: false, error: 'No master key found in wallet JSON' };
+      }
+
+      const chainCode = parsed.chainCode as string | undefined;
+      const descriptorPath = parsed.descriptorPath as string | undefined;
+      const derivationMode = (parsed.derivationMode as string | undefined);
+      const isBIP32 = derivationMode === 'bip32' || !!chainCode;
+      const basePath = descriptorPath
+        ? `m/${descriptorPath}`
+        : (isBIP32 ? "m/84'/1'/0'" : DEFAULT_BASE_PATH);
+
+      if (mnemonic) {
+        const sphere = await Sphere.import({
+          mnemonic,
+          basePath,
+          storage: options.storage,
+          transport: options.transport,
+          oracle: options.oracle,
+          tokenStorage: options.tokenStorage,
+          nametag: options.nametag,
+        });
+        return { success: true, sphere, mnemonic };
+      }
+
+      const sphere = await Sphere.import({
+        masterKey,
+        chainCode,
+        basePath,
+        derivationMode: (derivationMode as DerivationMode) || (chainCode ? 'bip32' : 'wif_hmac'),
         storage: options.storage,
         transport: options.transport,
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
+        nametag: options.nametag,
       });
-
-      if (result.success) {
-        const sphere = Sphere.getInstance();
-        return { success: true, sphere: sphere!, mnemonic: result.mnemonic };
-      }
-
-      return result;
+      return { success: true, sphere };
     }
 
     return { success: false, error: 'Unsupported file type' };
@@ -1412,10 +1563,9 @@ export class Sphere {
    * @returns Primary nametag (index 0) or undefined if not registered
    */
   getNametagForAddress(addressId?: string): string | undefined {
-    const id = addressId ?? this.getCurrentAddressId();
+    const id = addressId ?? this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
     if (!id) return undefined;
-    const nametagsMap = this._addressNametags.get(id);
-    return nametagsMap?.get(0); // Return primary nametag (index 0)
+    return this._addressNametags.get(id)?.get(0);
   }
 
   /**
@@ -1425,32 +1575,96 @@ export class Sphere {
    * @returns Map of nametagIndex to nametag, or undefined if no nametags
    */
   getNametagsForAddress(addressId?: string): Map<number, string> | undefined {
-    const id = addressId ?? this.getCurrentAddressId();
+    const id = addressId ?? this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
     if (!id) return undefined;
-    const nametagsMap = this._addressNametags.get(id);
-    return nametagsMap ? new Map(nametagsMap) : undefined;
+    const nametags = this._addressNametags.get(id);
+    return nametags && nametags.size > 0 ? new Map(nametags) : undefined;
   }
 
   /**
    * Get all registered address nametags
-   *
+   * @deprecated Use getActiveAddresses() or getAllTrackedAddresses() instead
    * @returns Map of addressId to (nametagIndex -> nametag)
    */
   getAllAddressNametags(): Map<string, Map<number, string>> {
-    // Deep copy
     const result = new Map<string, Map<number, string>>();
-    this._addressNametags.forEach((nametagsMap, addressId) => {
-      result.set(addressId, new Map(nametagsMap));
-    });
+    for (const [addressId, nametags] of this._addressNametags.entries()) {
+      if (nametags.size > 0) {
+        result.set(addressId, new Map(nametags));
+      }
+    }
     return result;
   }
 
   /**
-   * Get current address identifier (DIRECT://xxx format)
+   * Get all active (non-hidden) tracked addresses.
+   * Returns addresses that have been activated through create, switchToAddress,
+   * registerNametag, or nametag recovery.
+   *
+   * @returns Array of TrackedAddress entries sorted by index, excluding hidden ones
    */
-  private getCurrentAddressId(): string | undefined {
-    if (!this._identity?.directAddress) return undefined;
-    return getAddressId(this._identity.directAddress);
+  getActiveAddresses(): TrackedAddress[] {
+    this.ensureReady();
+    const result: TrackedAddress[] = [];
+    for (const entry of this._trackedAddresses.values()) {
+      if (!entry.hidden) {
+        const nametag = this._addressNametags.get(entry.addressId)?.get(0);
+        result.push({ ...entry, nametag });
+      }
+    }
+    return result.sort((a, b) => a.index - b.index);
+  }
+
+  /**
+   * Get all tracked addresses, including hidden ones.
+   *
+   * @returns Array of all TrackedAddress entries sorted by index
+   */
+  getAllTrackedAddresses(): TrackedAddress[] {
+    this.ensureReady();
+    const result: TrackedAddress[] = [];
+    for (const entry of this._trackedAddresses.values()) {
+      const nametag = this._addressNametags.get(entry.addressId)?.get(0);
+      result.push({ ...entry, nametag });
+    }
+    return result.sort((a, b) => a.index - b.index);
+  }
+
+  /**
+   * Get tracked address info by index.
+   *
+   * @param index - Address index
+   * @returns TrackedAddress or undefined if not tracked
+   */
+  getTrackedAddress(index: number): TrackedAddress | undefined {
+    this.ensureReady();
+    const entry = this._trackedAddresses.get(index);
+    if (!entry) return undefined;
+    const nametag = this._addressNametags.get(entry.addressId)?.get(0);
+    return { ...entry, nametag };
+  }
+
+  /**
+   * Set visibility of a tracked address.
+   * Hidden addresses are not returned by getActiveAddresses() but remain tracked.
+   *
+   * @param index - Address index to hide/unhide
+   * @param hidden - true to hide, false to show
+   * @throws Error if address index is not tracked
+   */
+  async setAddressHidden(index: number, hidden: boolean): Promise<void> {
+    this.ensureReady();
+    const entry = this._trackedAddresses.get(index);
+    if (!entry) {
+      throw new Error(`Address at index ${index} is not tracked. Switch to it first.`);
+    }
+    if (entry.hidden === hidden) return;
+
+    (entry as { hidden: boolean }).hidden = hidden;
+    await this.persistTrackedAddresses();
+
+    const eventType = hidden ? 'address:hidden' : 'address:unhidden';
+    this.emitEvent(eventType, { index, addressId: entry.addressId });
   }
 
   /**
@@ -1472,7 +1686,7 @@ export class Sphere {
    * await sphere.switchToAddress(0);
    * ```
    */
-  async switchToAddress(index: number): Promise<void> {
+  async switchToAddress(index: number, options?: { nametag?: string }): Promise<void> {
     this.ensureReady();
 
     if (!this._masterKey) {
@@ -1481,6 +1695,14 @@ export class Sphere {
 
     if (index < 0) {
       throw new Error('Address index must be non-negative');
+    }
+
+    // If nametag requested, validate format early
+    const newNametag = options?.nametag?.startsWith('@')
+      ? options.nametag.slice(1)
+      : options?.nametag;
+    if (newNametag && !this.validateNametag(newNametag)) {
+      throw new Error('Invalid nametag format. Use alphanumeric characters, 3-20 chars.');
     }
 
     // Derive the address at the given index
@@ -1492,10 +1714,27 @@ export class Sphere {
     // Derive L3 predicate address (DIRECT://...)
     const predicateAddress = await deriveL3PredicateAddress(addressInfo.privateKey);
 
-    // Get nametag for this address (if registered)
+    // Ensure address is tracked in the registry
+    await this.ensureAddressTracked(index);
     const addressId = getAddressId(predicateAddress);
-    const nametagsMap = this._addressNametags.get(addressId);
-    const nametag = nametagsMap?.get(0); // Primary nametag
+
+    // If nametag requested, check availability and store it BEFORE building identity
+    if (newNametag) {
+      const existing = await this._transport.resolveNametag?.(newNametag);
+      if (existing) {
+        throw new Error(`Nametag @${newNametag} is already taken`);
+      }
+
+      // Pre-populate nametag cache so identity is built WITH nametag
+      let nametags = this._addressNametags.get(addressId);
+      if (!nametags) {
+        nametags = new Map();
+        this._addressNametags.set(addressId, nametags);
+      }
+      nametags.set(0, newNametag);
+    }
+
+    const nametag = this._addressNametags.get(addressId)?.get(0);
 
     // Update identity
     this._identity = {
@@ -1516,15 +1755,58 @@ export class Sphere {
 
     // Re-initialize providers with new identity
     this._storage.setIdentity(this._identity);
-    this._transport.setIdentity(this._identity);
+    await this._transport.setIdentity(this._identity);
 
-    // Update token storage providers
+    // Update token storage providers and re-open databases for new address
     for (const provider of this._tokenStorageProviders.values()) {
       provider.setIdentity(this._identity);
+      await provider.initialize();
     }
 
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
+
+    // Publish identity binding (with nametag if present — single atomic publish)
+    if (this._identity.nametag) {
+      await this.syncIdentityWithTransport();
+    }
+
+    // If new nametag was registered, persist cache and mint token
+    if (newNametag) {
+      await this.persistAddressNametags();
+
+      if (!this._payments.hasNametag()) {
+        console.log(`[Sphere] Minting nametag token for @${newNametag}...`);
+        try {
+          const result = await this.mintNametag(newNametag);
+          if (result.success) {
+            console.log(`[Sphere] Nametag token minted successfully`);
+          } else {
+            console.warn(`[Sphere] Could not mint nametag token: ${result.error}`);
+          }
+        } catch (err) {
+          console.warn(`[Sphere] Nametag token mint failed:`, err);
+        }
+      }
+
+      this.emitEvent('nametag:registered', {
+        nametag: newNametag,
+        addressIndex: index,
+      });
+    } else if (this._identity.nametag && !this._payments.hasNametag()) {
+      // Existing address with nametag but missing token — mint it
+      console.log(`[Sphere] Nametag @${this._identity.nametag} has no token after switch, minting...`);
+      try {
+        const result = await this.mintNametag(this._identity.nametag);
+        if (result.success) {
+          console.log(`[Sphere] Nametag token minted successfully after switch`);
+        } else {
+          console.warn(`[Sphere] Could not mint nametag token after switch: ${result.error}`);
+        }
+      } catch (err) {
+        console.warn(`[Sphere] Nametag token mint failed after switch:`, err);
+      }
+    }
 
     this.emitEvent('identity:changed', {
       l1Address: this._identity.l1Address,
@@ -1550,7 +1832,8 @@ export class Sphere {
       transport: this._transport,
       oracle: this._oracle,
       emitEvent,
-      chainCode: this._masterKey?.chainCode,
+      chainCode: this._masterKey?.chainCode || undefined,
+      price: this._priceProvider ?? undefined,
     });
 
     this._communications.initialize({
@@ -1586,9 +1869,22 @@ export class Sphere {
    */
   deriveAddress(index: number, isChange: boolean = false): AddressInfo {
     this.ensureReady();
+    return this._deriveAddressInternal(index, isChange);
+  }
 
+  /**
+   * Internal address derivation without ensureReady() check.
+   * Used during initialization (loadTrackedAddresses, ensureAddressTracked)
+   * when _initialized is still false.
+   */
+  private _deriveAddressInternal(index: number, isChange: boolean = false): AddressInfo {
     if (!this._masterKey) {
       throw new Error('HD derivation requires master key with chain code');
+    }
+
+    // WIF/HMAC mode: legacy HMAC-SHA512 derivation (no chain code, no change addresses)
+    if (this._derivationMode === 'wif_hmac') {
+      return generateAddressFromMasterKey(this._masterKey.privateKey, index);
     }
 
     const info = deriveAddressInfo(
@@ -1676,6 +1972,80 @@ export class Sphere {
     return addresses;
   }
 
+  /**
+   * Scan blockchain addresses to discover used addresses with balances.
+   * Derives addresses sequentially and checks L1 balance via Fulcrum.
+   * Uses gap limit to stop after N consecutive empty addresses.
+   *
+   * @param options - Scanning options
+   * @returns Scan results with found addresses and total balance
+   *
+   * @example
+   * ```ts
+   * const result = await sphere.scanAddresses({
+   *   maxAddresses: 100,
+   *   gapLimit: 20,
+   *   onProgress: (p) => console.log(`Scanned ${p.scanned}/${p.total}, found ${p.foundCount}`),
+   * });
+   * console.log(`Found ${result.addresses.length} addresses, total: ${result.totalBalance} ALPHA`);
+   * ```
+   */
+  async scanAddresses(options: ScanAddressesOptions = {}): Promise<ScanAddressesResult> {
+    this.ensureReady();
+
+    if (!this._masterKey) {
+      throw new Error('Address scanning requires HD master key');
+    }
+
+    // Auto-provide nametag resolver from transport if caller didn't supply one
+    const resolveNametag = options.resolveNametag ?? (
+      this._transport.resolveAddressInfo
+        ? async (l1Address: string): Promise<string | null> => {
+            try {
+              const info = await this._transport.resolveAddressInfo!(l1Address);
+              return info?.nametag ?? null;
+            } catch { return null; }
+          }
+        : undefined
+    );
+
+    return scanAddressesImpl(
+      (index, isChange) => this._deriveAddressInternal(index, isChange),
+      { ...options, resolveNametag },
+    );
+  }
+
+  /**
+   * Bulk-track scanned addresses with visibility and nametag data.
+   * Selected addresses get `hidden: false`, unselected get `hidden: true`.
+   * Performs only 2 storage writes total (tracked addresses + nametags).
+   */
+  async trackScannedAddresses(
+    entries: Array<{ index: number; hidden: boolean; nametag?: string }>,
+  ): Promise<void> {
+    this.ensureReady();
+
+    for (const { index, hidden, nametag } of entries) {
+      const tracked = await this.ensureAddressTracked(index);
+
+      if (nametag) {
+        let nametags = this._addressNametags.get(tracked.addressId);
+        if (!nametags) {
+          nametags = new Map();
+          this._addressNametags.set(tracked.addressId, nametags);
+        }
+        if (!nametags.has(0)) nametags.set(0, nametag);
+      }
+
+      if (tracked.hidden !== hidden) {
+        (tracked as { hidden: boolean }).hidden = hidden;
+      }
+    }
+
+    await this.persistTrackedAddresses();
+    await this.persistAddressNametags();
+  }
+
   // ===========================================================================
   // Public Methods - Status
   // ===========================================================================
@@ -1758,6 +2128,23 @@ export class Sphere {
     return this._cachedProxyAddress;
   }
 
+  /**
+   * Resolve any identifier to full peer information.
+   * Accepts @nametag, bare nametag, DIRECT://, PROXY://, L1 address, or transport pubkey.
+   *
+   * @example
+   * ```ts
+   * const peer = await sphere.resolve('@alice');
+   * const peer = await sphere.resolve('DIRECT://...');
+   * const peer = await sphere.resolve('alpha1...');
+   * const peer = await sphere.resolve('ab12cd...'); // 64-char hex transport pubkey
+   * ```
+   */
+  async resolve(identifier: string): Promise<PeerInfo | null> {
+    this.ensureReady();
+    return this._transport.resolve?.(identifier) ?? null;
+  }
+
   /** Compute and cache the PROXY address from the current nametag */
   private async _updateCachedProxyAddress(): Promise<void> {
     const nametag = this._identity?.nametag;
@@ -1802,12 +2189,13 @@ export class Sphere {
       throw new Error(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`);
     }
 
-    // Register with transport provider (Nostr)
-    if (this._transport.registerNametag) {
-      const success = await this._transport.registerNametag(
-        cleanNametag,
+    // Publish identity binding with nametag (updates existing binding event)
+    if (this._transport.publishIdentityBinding) {
+      const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
-        this._identity!.directAddress || ''
+        this._identity!.l1Address,
+        this._identity!.directAddress || '',
+        cleanNametag,
       );
       if (!success) {
         throw new Error('Failed to register nametag. It may already be taken.');
@@ -1818,18 +2206,18 @@ export class Sphere {
     this._identity!.nametag = cleanNametag;
     await this._updateCachedProxyAddress();
 
-    // Store in address nametags map (addressId -> nametagIndex -> nametag)
-    const addressId = this.getCurrentAddressId();
-    if (addressId) {
-      let nametagsMap = this._addressNametags.get(addressId);
-      if (!nametagsMap) {
-        nametagsMap = new Map();
-        this._addressNametags.set(addressId, nametagsMap);
+    // Update nametag cache
+    const currentAddressId = this._trackedAddresses.get(this._currentAddressIndex)?.addressId;
+    if (currentAddressId) {
+      let nametags = this._addressNametags.get(currentAddressId);
+      if (!nametags) {
+        nametags = new Map();
+        this._addressNametags.set(currentAddressId, nametags);
       }
-      nametagsMap.set(0, cleanNametag); // Primary nametag at index 0
+      nametags.set(0, cleanNametag);
     }
 
-    // Persist to storage
+    // Persist nametag cache
     await this.persistAddressNametags();
 
     // Mint nametag token on-chain if not already minted
@@ -1839,7 +2227,7 @@ export class Sphere {
       const result = await this.mintNametag(cleanNametag);
       if (!result.success) {
         console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
-        // Don't throw - nametag is registered on Nostr, token can be minted later
+        // Don't throw - nametag is published via transport, token can be minted later
       } else {
         console.log(`[Sphere] Nametag token minted successfully`);
       }
@@ -1853,19 +2241,19 @@ export class Sphere {
   }
 
   /**
-   * Persist address nametags to storage
-   * Format: { "DIRECT://abc...xyz": { "0": "alice", "1": "alice2" }, ... }
+   * Persist tracked addresses to storage (only minimal fields via StorageProvider)
    */
-  private async persistAddressNametags(): Promise<void> {
-    const result: Record<string, Record<string, string>> = {};
-    this._addressNametags.forEach((nametagsMap, addressId) => {
-      const innerObj: Record<string, string> = {};
-      nametagsMap.forEach((nametag, index) => {
-        innerObj[index.toString()] = nametag;
+  private async persistTrackedAddresses(): Promise<void> {
+    const entries: TrackedAddressEntry[] = [];
+    for (const entry of this._trackedAddresses.values()) {
+      entries.push({
+        index: entry.index,
+        hidden: entry.hidden,
+        createdAt: entry.createdAt,
+        updatedAt: entry.updatedAt,
       });
-      result[addressId] = innerObj;
-    });
-    await this._storage.set(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS, JSON.stringify(result));
+    }
+    await this._storage.saveTrackedAddresses(entries);
   }
 
   /**
@@ -1902,32 +2290,42 @@ export class Sphere {
   }
 
   /**
-   * Load address nametags from storage
-   * Supports new format: { "DIRECT://abc...xyz": { "0": "alice" } }
-   * And legacy format: { "0": "alice" } (migrates to new format on save)
+   * Load tracked addresses from storage.
+   * Falls back to migrating from old ADDRESS_NAMETAGS format.
    */
-  private async loadAddressNametags(): Promise<void> {
-    try {
-      const saved = await this._storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
-      if (saved) {
-        const parsed = JSON.parse(saved) as Record<string, unknown>;
-        this._addressNametags.clear();
+  private async loadTrackedAddresses(): Promise<void> {
+    this._trackedAddresses.clear();
+    this._addressIdToIndex.clear();
 
-        for (const [key, value] of Object.entries(parsed)) {
-          if (typeof value === 'object' && value !== null) {
-            // New format: key is addressId, value is { nametagIndex: nametag }
-            const nametagsMap = new Map<number, string>();
-            for (const [indexStr, nametag] of Object.entries(value as Record<string, string>)) {
-              nametagsMap.set(parseInt(indexStr, 10), nametag);
-            }
-            this._addressNametags.set(key, nametagsMap);
-          } else if (typeof value === 'string') {
-            // Legacy format: key is index, value is nametag
-            // Will be migrated to new format when persistAddressNametags is called
-            // For now, we can't fully migrate without knowing the addressId
-            // This will be handled after identity is restored
-          }
+    try {
+      // Load minimal entries from storage
+      const entries = await this._storage.loadTrackedAddresses();
+      if (entries.length > 0) {
+        for (const stored of entries) {
+          // Derive address fields from index (internal: no ensureReady check)
+          const addrInfo = this._deriveAddressInternal(stored.index, false);
+          const directAddress = await deriveL3PredicateAddress(addrInfo.privateKey);
+          const addressId = getAddressId(directAddress);
+
+          const entry: TrackedAddress = {
+            ...stored,
+            addressId,
+            l1Address: addrInfo.address,
+            directAddress,
+            chainPubkey: addrInfo.publicKey,
+          };
+          this._trackedAddresses.set(entry.index, entry);
+          this._addressIdToIndex.set(addressId, entry.index);
         }
+        return;
+      }
+
+      // Fall back to old ADDRESS_NAMETAGS format and migrate
+      const oldData = await this._storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
+      if (oldData) {
+        const parsed = JSON.parse(oldData) as Record<string, unknown>;
+        await this.migrateFromOldNametagFormat(parsed);
+        await this.persistTrackedAddresses();
       }
     } catch {
       // Ignore parse errors - start fresh
@@ -1935,43 +2333,174 @@ export class Sphere {
   }
 
   /**
-   * Sync nametag with Nostr on wallet load
-   * If local nametag exists but not registered on Nostr, re-register it
+   * Migrate from old ADDRESS_NAMETAGS format to tracked addresses.
+   * Scans HD indices 0..19 to match addressIds from the old format.
+   * Populates both _trackedAddresses and _addressNametags.
    */
-  private async syncNametagWithNostr(): Promise<void> {
-    const nametag = this._identity?.nametag;
-    if (!nametag) {
-      return; // No nametag to sync
-    }
-
-    if (!this._transport.resolveNametag || !this._transport.registerNametag) {
-      return; // Transport doesn't support nametag operations
-    }
-
-    try {
-      // Register nametag (will check if already registered and re-publish if needed)
-      const success = await this._transport.registerNametag(
-        nametag,
-        this._identity!.chainPubkey,
-        this._identity!.directAddress || ''
-      );
-      if (success) {
-        console.log(`[Sphere] Nametag @${nametag} synced with Nostr`);
-      } else {
-        console.warn(`[Sphere] Nametag @${nametag} is taken by another pubkey`);
+  private async migrateFromOldNametagFormat(
+    parsed: Record<string, unknown>
+  ): Promise<void> {
+    const addressIdToNametags = new Map<string, Record<string, string>>();
+    for (const [key, value] of Object.entries(parsed)) {
+      if (typeof value === 'object' && value !== null) {
+        addressIdToNametags.set(key, value as Record<string, string>);
       }
-    } catch (error) {
-      // Don't fail wallet load on nametag sync errors
-      console.warn(`[Sphere] Nametag sync failed:`, error);
+    }
+
+    if (addressIdToNametags.size === 0 || !this._masterKey) return;
+
+    const SCAN_LIMIT = 20;
+    for (let i = 0; i < SCAN_LIMIT && addressIdToNametags.size > 0; i++) {
+      try {
+        const addrInfo = this._deriveAddressInternal(i, false);
+        const directAddress = await deriveL3PredicateAddress(addrInfo.privateKey);
+        const addressId = getAddressId(directAddress);
+
+        if (addressIdToNametags.has(addressId)) {
+          const nametagsObj = addressIdToNametags.get(addressId)!;
+
+          // Populate nametag cache
+          const nametagMap = new Map<number, string>();
+          for (const [idx, tag] of Object.entries(nametagsObj)) {
+            nametagMap.set(parseInt(idx, 10), tag);
+          }
+          if (nametagMap.size > 0) {
+            this._addressNametags.set(addressId, nametagMap);
+          }
+
+          // Create tracked address entry
+          const now = Date.now();
+          const entry: TrackedAddress = {
+            index: i,
+            addressId,
+            l1Address: addrInfo.address,
+            directAddress,
+            chainPubkey: addrInfo.publicKey,
+            nametag: nametagMap.get(0),
+            hidden: false,
+            createdAt: now,
+            updatedAt: now,
+          };
+
+          this._trackedAddresses.set(i, entry);
+          this._addressIdToIndex.set(addressId, i);
+          addressIdToNametags.delete(addressId);
+        }
+      } catch {
+        // Skip indices that fail to derive
+      }
+    }
+
+    // Persist nametag cache separately
+    await this.persistAddressNametags();
+  }
+
+  /**
+   * Ensure an address is tracked in the registry.
+   * If not yet tracked, derives full info and creates the entry.
+   */
+  private async ensureAddressTracked(index: number): Promise<TrackedAddress> {
+    const existing = this._trackedAddresses.get(index);
+    if (existing) return existing;
+
+    const addrInfo = this._deriveAddressInternal(index, false);
+    const directAddress = await deriveL3PredicateAddress(addrInfo.privateKey);
+    const addressId = getAddressId(directAddress);
+
+    const now = Date.now();
+    const nametag = this._addressNametags.get(addressId)?.get(0);
+    const entry: TrackedAddress = {
+      index,
+      addressId,
+      l1Address: addrInfo.address,
+      directAddress,
+      chainPubkey: addrInfo.publicKey,
+      nametag,
+      hidden: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    this._trackedAddresses.set(index, entry);
+    this._addressIdToIndex.set(addressId, index);
+    await this.persistTrackedAddresses();
+
+    this.emitEvent('address:activated', { address: { ...entry } });
+    return entry;
+  }
+
+  /**
+   * Persist nametag cache to storage.
+   * Format: { addressId: { "0": "alice", "1": "alice2" } }
+   */
+  private async persistAddressNametags(): Promise<void> {
+    const result: Record<string, Record<string, string>> = {};
+    for (const [addressId, nametags] of this._addressNametags.entries()) {
+      const obj: Record<string, string> = {};
+      for (const [idx, tag] of nametags.entries()) {
+        obj[idx.toString()] = tag;
+      }
+      result[addressId] = obj;
+    }
+    await this._storage.set(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS, JSON.stringify(result));
+  }
+
+  /**
+   * Load nametag cache from storage.
+   */
+  private async loadAddressNametags(): Promise<void> {
+    this._addressNametags.clear();
+    try {
+      const data = await this._storage.get(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
+      if (!data) return;
+      const parsed = JSON.parse(data) as Record<string, Record<string, string>>;
+      for (const [addressId, nametags] of Object.entries(parsed)) {
+        const map = new Map<number, string>();
+        for (const [idx, tag] of Object.entries(nametags)) {
+          map.set(parseInt(idx, 10), tag);
+        }
+        this._addressNametags.set(addressId, map);
+      }
+    } catch {
+      // Ignore parse errors
     }
   }
 
   /**
-   * Recover nametag from Nostr after wallet import
-   * Searches for encrypted nametag events authored by this wallet's pubkey
-   * and decrypts them to restore the nametag association
+   * Publish identity binding via transport.
+   * Always publishes base identity (chainPubkey, l1Address, directAddress).
+   * If nametag is set, also publishes nametag hash, proxy address, encrypted nametag.
    */
-  private async recoverNametagFromNostr(): Promise<void> {
+  private async syncIdentityWithTransport(): Promise<void> {
+    if (!this._transport.publishIdentityBinding) {
+      return; // Transport doesn't support identity binding
+    }
+
+    try {
+      const nametag = this._identity?.nametag;
+      const success = await this._transport.publishIdentityBinding(
+        this._identity!.chainPubkey,
+        this._identity!.l1Address,
+        this._identity!.directAddress || '',
+        nametag || undefined,
+      );
+      if (success) {
+        console.log(`[Sphere] Identity binding published${nametag ? ` with nametag @${nametag}` : ''}`);
+      } else if (nametag) {
+        console.warn(`[Sphere] Nametag @${nametag} is taken by another pubkey`);
+      }
+    } catch (error) {
+      // Don't fail wallet load on identity sync errors
+      console.warn(`[Sphere] Identity binding sync failed:`, error);
+    }
+  }
+
+  /**
+   * Recover nametag from transport after wallet import.
+   * Searches for encrypted nametag events authored by this wallet's pubkey
+   * and decrypts them to restore the nametag association.
+   */
+  private async recoverNametagFromTransport(): Promise<void> {
     // Skip if already has a nametag
     if (this._identity?.nametag) {
       return;
@@ -1993,26 +2522,24 @@ export class Sphere {
           await this._updateCachedProxyAddress();
         }
 
-        // Store nametag locally (addressId -> nametagIndex -> nametag)
-        const addressId = this.getCurrentAddressId();
-        if (addressId) {
-          let nametagsMap = this._addressNametags.get(addressId);
-          if (!nametagsMap) {
-            nametagsMap = new Map();
-            this._addressNametags.set(addressId, nametagsMap);
-          }
-          // Add as next available index
-          const nextIndex = nametagsMap.size;
-          nametagsMap.set(nextIndex, recoveredNametag);
+        // Update nametag cache
+        const entry = await this.ensureAddressTracked(this._currentAddressIndex);
+        let nametags = this._addressNametags.get(entry.addressId);
+        if (!nametags) {
+          nametags = new Map();
+          this._addressNametags.set(entry.addressId, nametags);
         }
+        const nextIndex = nametags.size;
+        nametags.set(nextIndex, recoveredNametag);
         await this.persistAddressNametags();
 
-        // Re-register to ensure event has latest format with all fields
-        if (this._transport.registerNametag) {
-          await this._transport.registerNametag(
-            recoveredNametag,
+        // Re-publish identity binding with recovered nametag
+        if (this._transport.publishIdentityBinding) {
+          await this._transport.publishIdentityBinding(
             this._identity!.chainPubkey,
-            this._identity!.directAddress || ''
+            this._identity!.l1Address,
+            this._identity!.directAddress || '',
+            recoveredNametag,
           );
         }
 
@@ -2048,6 +2575,9 @@ export class Sphere {
 
     this._initialized = false;
     this._identity = null;
+    this._trackedAddresses.clear();
+    this._addressIdToIndex.clear();
+    this._addressNametags.clear();
     this.eventHandlers.clear();
 
     if (Sphere.instance === this) {
@@ -2179,18 +2709,20 @@ export class Sphere {
       this._storage.setIdentity(this._identity);
     }
 
-    // Load address nametags from single source of truth
+    // Load tracked addresses registry (with migration from old format)
+    await this.loadTrackedAddresses();
+    // Load nametag cache
     await this.loadAddressNametags();
 
-    // If we have a saved address index > 0 and master key, switch to that address
+    // Ensure current address is tracked
+    const trackedEntry = await this.ensureAddressTracked(this._currentAddressIndex);
+    const nametag = this._addressNametags.get(trackedEntry.addressId)?.get(0);
+
+    // If we have a saved address index > 0 and master key, re-derive identity
     if (this._currentAddressIndex > 0 && this._masterKey) {
-      // Re-derive identity for the saved address index
-      const addressInfo = this.deriveAddress(this._currentAddressIndex, false);
+      const addressInfo = this._deriveAddressInternal(this._currentAddressIndex, false);
       const ipnsHash = sha256(addressInfo.publicKey, 'hex').slice(0, 40);
       const predicateAddress = await deriveL3PredicateAddress(addressInfo.privateKey);
-      const addressId = getAddressId(predicateAddress);
-      const nametagsMap = this._addressNametags.get(addressId);
-      const nametag = nametagsMap?.get(0); // Primary nametag
 
       this._identity = {
         privateKey: addressInfo.privateKey,
@@ -2200,17 +2732,11 @@ export class Sphere {
         ipnsName: '12D3KooW' + ipnsHash,
         nametag,
       };
-      // Update storage identity for correct address
       this._storage.setIdentity(this._identity);
       console.log(`[Sphere] Restored to address ${this._currentAddressIndex}:`, this._identity.l1Address);
-    } else if (this._identity) {
-      // Restore nametag for current address from the nametags map
-      const addressId = this.getCurrentAddressId();
-      const nametagsMap = addressId ? this._addressNametags.get(addressId) : undefined;
-      const nametag = nametagsMap?.get(0); // Primary nametag
-      if (nametag) {
-        this._identity.nametag = nametag;
-      }
+    } else if (this._identity && nametag) {
+      // Restore nametag from cache
+      this._identity.nametag = nametag;
     }
     await this._updateCachedProxyAddress();
   }
@@ -2260,10 +2786,12 @@ export class Sphere {
   private async initializeIdentityFromMasterKey(
     masterKey: string,
     chainCode?: string,
-    derivationPath?: string
+    _derivationPath?: string
   ): Promise<void> {
-    // Use base path (e.g., m/44'/0'/0') and append chain/index
-    const basePath = derivationPath ?? DEFAULT_BASE_PATH;
+    // Use _basePath (already set by storeMasterKey) for consistency with deriveAddress/scan.
+    // Previously used derivationPath param which was undefined for file imports,
+    // causing identity to derive at DEFAULT_BASE_PATH instead of the wallet's actual path.
+    const basePath = this._basePath;
     const fullPath = `${basePath}/0/0`;
 
     let privateKey: string;
@@ -2278,9 +2806,16 @@ export class Sphere {
         chainCode,
       };
     } else {
-      // Direct master key usage (legacy wallets)
-      privateKey = masterKey;
-      this._masterKey = null;
+      // WIF/HMAC derivation without chain code
+      // Uses HMAC-SHA512(masterKey, path) to derive child keys (legacy webwallet format)
+      const addr0 = generateAddressFromMasterKey(masterKey, 0);
+      privateKey = addr0.privateKey;
+
+      // Store masterKey for future deriveAddress() calls (chainCode unused in wif_hmac mode)
+      this._masterKey = {
+        privateKey: masterKey,
+        chainCode: '',
+      };
     }
 
     const publicKey = getPublicKey(privateKey);
@@ -2306,7 +2841,7 @@ export class Sphere {
   private async initializeProviders(): Promise<void> {
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
-    this._transport.setIdentity(this._identity!);
+    await this._transport.setIdentity(this._identity!);
 
     // Set identity on all token storage providers
     for (const provider of this._tokenStorageProviders.values()) {
@@ -2335,7 +2870,8 @@ export class Sphere {
       oracle: this._oracle,
       emitEvent,
       // Pass chain code for L1 HD derivation
-      chainCode: this._masterKey?.chainCode,
+      chainCode: this._masterKey?.chainCode || undefined,
+      price: this._priceProvider ?? undefined,
     });
 
     this._communications.initialize({

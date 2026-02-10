@@ -3,9 +3,9 @@
  * Implements StorageProvider using browser localStorage
  */
 
-import type { ProviderStatus, FullIdentity } from '../../../types';
+import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
-import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants';
+import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
 
 // =============================================================================
 // Configuration
@@ -138,6 +138,21 @@ export class LocalStorageProvider implements StorageProvider {
     const keysToRemove = await this.keys(prefix);
     for (const key of keysToRemove) {
       await this.remove(key);
+    }
+  }
+
+  async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
+    await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify({ version: 1, addresses: entries }));
+  }
+
+  async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
+    const data = await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
+    if (!data) return [];
+    try {
+      const parsed = JSON.parse(data);
+      return parsed.addresses ?? [];
+    } catch {
+      return [];
     }
   }
 

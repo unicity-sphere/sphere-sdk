@@ -6,8 +6,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
-import type { FullIdentity, ProviderStatus } from '../../../types';
-import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants';
+import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
+import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */
@@ -122,6 +122,21 @@ export class FileStorageProvider implements StorageProvider {
       this.data = {};
     }
     await this.save();
+  }
+
+  async saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void> {
+    await this.set(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES, JSON.stringify({ version: 1, addresses: entries }));
+  }
+
+  async loadTrackedAddresses(): Promise<TrackedAddressEntry[]> {
+    const data = await this.get(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
+    if (!data) return [];
+    try {
+      const parsed = JSON.parse(data);
+      return parsed.addresses ?? [];
+    } catch {
+      return [];
+    }
   }
 
   /**

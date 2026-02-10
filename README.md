@@ -112,9 +112,13 @@ if (created && generatedMnemonic) {
 // Get identity (L3 DIRECT address is primary)
 console.log('Address:', sphere.identity?.directAddress);
 
-// Check balance
+// Get assets with price data
+const assets = await sphere.payments.getAssets();
+console.log('Assets:', assets);
+
+// Get total portfolio value in USD (requires PriceProvider)
 const balance = await sphere.payments.getBalance();
-console.log('L3 Balance:', balance);
+console.log('Total USD:', balance); // number | null
 
 // Send tokens
 const result = await sphere.payments.send({
@@ -153,6 +157,47 @@ const providers = createBrowserProviders({
   network: 'testnet',
   l1: { enableVesting: true },  // uses testnet electrum URL automatically
 });
+```
+
+## Price Provider (Optional)
+
+Enable fiat price display by adding a `price` config. Currently supports CoinGecko API (free and pro tiers).
+
+```typescript
+// With CoinGecko (free tier, no API key)
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: { platform: 'coingecko' },
+});
+
+// With CoinGecko Pro
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: { platform: 'coingecko', apiKey: 'CG-xxx' },
+});
+
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+
+// Total portfolio value in USD
+const totalUsd = await sphere.payments.getBalance();
+// 1523.45
+
+// Assets with price data
+const assets = await sphere.payments.getAssets();
+// [{ coinId, symbol, totalAmount, priceUsd: 97500, fiatValueUsd: 975.00, change24h: 2.3, ... }]
+```
+
+Without `price` config, `getBalance()` returns `null` and price fields in `getAssets()` are `null`. All other functionality works normally.
+
+You can also set the price provider after initialization:
+
+```typescript
+import { createPriceProvider } from '@unicitylabs/sphere-sdk';
+
+sphere.setPriceProvider(createPriceProvider({
+  platform: 'coingecko',
+  apiKey: 'CG-xxx',
+}));
 ```
 
 ## Testnet Faucet

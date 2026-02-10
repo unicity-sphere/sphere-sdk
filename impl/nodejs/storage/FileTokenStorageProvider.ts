@@ -83,7 +83,14 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     };
 
     try {
-      const files = fs.readdirSync(this.tokensDir).filter(f => f.endsWith('.json') && f !== '_meta.json');
+      const files = fs.readdirSync(this.tokensDir).filter(f =>
+        f.endsWith('.json') &&
+        f !== '_meta.json' &&
+        f !== '_tombstones.json' &&
+        !f.startsWith('archived_') &&  // Skip archived tokens
+        !f.startsWith('token-') &&     // Skip legacy token format
+        !f.startsWith('nametag-')      // Skip nametag files (not tokens)
+      );
 
       for (const file of files) {
         try {
@@ -106,6 +113,17 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
           }
         } catch {
           // Skip invalid files
+        }
+      }
+
+      // Load tombstones if they exist
+      const tombstonesPath = path.join(this.tokensDir, '_tombstones.json');
+      if (fs.existsSync(tombstonesPath)) {
+        try {
+          const content = fs.readFileSync(tombstonesPath, 'utf-8');
+          data._tombstones = JSON.parse(content);
+        } catch {
+          // Skip invalid tombstones file
         }
       }
 
@@ -154,14 +172,20 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
         }
       }
 
-      // Handle tombstones - delete files
+      // Handle tombstones - delete files AND persist tombstones list
       if (data._tombstones) {
+        // Delete tombstoned token files
         for (const tombstone of data._tombstones) {
           const filePath = path.join(this.tokensDir, `${tombstone.tokenId}.json`);
           if (fs.existsSync(filePath)) {
             fs.unlinkSync(filePath);
           }
         }
+        // Persist tombstones list so they can be checked on reload
+        fs.writeFileSync(
+          path.join(this.tokensDir, '_tombstones.json'),
+          JSON.stringify(data._tombstones, null, 2)
+        );
       }
 
       return {

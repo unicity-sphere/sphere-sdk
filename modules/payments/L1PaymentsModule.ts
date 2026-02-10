@@ -26,7 +26,6 @@ import {
   VESTING_THRESHOLD,
   type UTXO,
   type Wallet,
-  type TransactionHistoryItem,
   type TransactionDetail,
 } from '../../l1';
 
@@ -124,7 +123,6 @@ export class L1PaymentsModule {
   private _initialized = false;
   private _config: L1PaymentsModuleConfig;
   private _identity?: FullIdentity;
-  private _chainCode?: string;
   private _addresses: string[] = [];
   private _wallet?: Wallet;
   private _transport?: TransportProvider;
@@ -140,7 +138,6 @@ export class L1PaymentsModule {
 
   async initialize(deps: L1PaymentsModuleDependencies): Promise<void> {
     this._identity = deps.identity;
-    this._chainCode = deps.chainCode;
     this._addresses = deps.addresses ?? [];
     this._transport = deps.transport;
 
@@ -184,7 +181,6 @@ export class L1PaymentsModule {
     }
     this._initialized = false;
     this._identity = undefined;
-    this._chainCode = undefined;
     this._addresses = [];
     this._wallet = undefined;
   }
@@ -228,11 +224,11 @@ export class L1PaymentsModule {
    * Resolve nametag to L1 address using transport provider
    */
   private async resolveNametagToL1Address(nametag: string): Promise<string> {
-    if (!this._transport?.resolveNametagInfo) {
-      throw new Error('Transport provider does not support nametag resolution');
+    if (!this._transport?.resolve) {
+      throw new Error('Transport provider does not support resolution');
     }
 
-    const info = await this._transport.resolveNametagInfo(nametag);
+    const info = await this._transport.resolve(nametag);
     if (!info) {
       throw new Error(`Nametag not found: ${nametag}`);
     }

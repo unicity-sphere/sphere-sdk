@@ -304,6 +304,25 @@ class VestingClassifier {
       tx.objectStore(this.storeName).clear();
     }
   }
+
+  /**
+   * Destroy caches and delete the IndexedDB database entirely.
+   */
+  async destroy(): Promise<void> {
+    this.memoryCache.clear();
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+    if (typeof indexedDB !== 'undefined') {
+      await new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(this.dbName);
+        req.onsuccess = () => resolve();
+        req.onerror = () => resolve();
+        req.onblocked = () => resolve();
+      });
+    }
+  }
 }
 
 export const vestingClassifier = new VestingClassifier();

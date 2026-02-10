@@ -28,16 +28,23 @@
 The easiest way to set up providers is using the factory functions:
 
 ```typescript
-// Browser
+// Browser (requires CORS proxy for free CoinGecko API — see "CORS Proxy" section below)
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
-const providers = createBrowserProviders({ network: 'testnet' });
+const providers = createBrowserProviders({
+  network: 'testnet',
+  price: {
+    platform: 'coingecko',
+    baseUrl: '/api/coingecko',  // CORS proxy path (see below)
+  },
+});
 
-// Node.js
+// Node.js (no proxy needed)
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 const providers = createNodeProviders({
   network: 'testnet',
   dataDir: './wallet',
   tokensDir: './tokens',
+  price: { platform: 'coingecko', apiKey: 'CG-xxx' },  // Optional
 });
 ```
 
@@ -204,16 +211,101 @@ interface AddressInfo {
 }
 ```
 
+### Tracked Addresses
+
+The SDK tracks which addresses have been activated (via create, switchToAddress, registerNametag). This lets UI display the list of used addresses with metadata.
+
+```typescript
+// Get all active (non-hidden) addresses
+const addresses = sphere.getActiveAddresses();
+for (const addr of addresses) {
+  console.log(`#${addr.index}: ${addr.l1Address}`);
+  console.log(`  DIRECT: ${addr.directAddress}`);
+  console.log(`  Nametag: ${addr.nametag ?? 'none'}`);
+  console.log(`  Created: ${new Date(addr.createdAt)}`);
+}
+
+// Switch to a new address (auto-tracked)
+await sphere.switchToAddress(2);
+
+// Register nametag for current address
+await sphere.registerNametag('bob');
+
+// Hide an address from UI
+await sphere.setAddressHidden(1, true);
+
+// Get all including hidden
+const all = sphere.getAllTrackedAddresses();
+
+// Get single address
+const addr = sphere.getTrackedAddress(0);
+
+// Listen for new address activations
+sphere.on('address:activated', ({ address }) => {
+  console.log(`New address tracked: #${address.index}`);
+});
+
+sphere.on('address:hidden', ({ index, addressId }) => {
+  console.log(`Address #${index} hidden`);
+});
+```
+
 ---
 
 ## L3 Payments
 
-### Get Balance
+### Get Balance & Assets
 
 ```typescript
-const balance = await sphere.payments.getBalance();
-// Returns: { total: '1000000', available: '1000000', pending: '0' }
+// Total portfolio value in USD (null if PriceProvider not configured)
+const totalUsd = await sphere.payments.getBalance();
+console.log('Total USD:', totalUsd); // number | null
+
+// Get assets with price data
+const assets = await sphere.payments.getAssets();
+for (const asset of assets) {
+  console.log(`${asset.symbol}: ${asset.totalAmount}`);
+  console.log(`  Price: $${asset.priceUsd ?? 'N/A'}`);
+  console.log(`  Value: $${asset.fiatValueUsd?.toFixed(2) ?? 'N/A'}`);
+}
 ```
+
+### Set Price Provider After Init
+
+```typescript
+import { createPriceProvider } from '@unicitylabs/sphere-sdk';
+
+// Set or replace PriceProvider at runtime
+sphere.setPriceProvider(createPriceProvider({
+  platform: 'coingecko',
+  apiKey: userProvidedKey,
+}));
+```
+
+### CORS Proxy (Browser)
+
+CoinGecko's free API does not include CORS headers. In browser environments, you need a proxy:
+
+**Vite (development):**
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    proxy: {
+      '/api/coingecko': {
+        target: 'https://api.coingecko.com/api/v3',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/coingecko/, ''),
+      },
+    },
+  },
+});
+```
+
+Then pass `baseUrl: '/api/coingecko'` in the `price` config. In production, use Nginx or a Cloudflare Worker as a reverse proxy. CoinGecko Pro API supports CORS natively and doesn't require a proxy.
+
+Node.js environments are not subject to CORS — no proxy needed.
 
 ### Get Tokens
 
@@ -509,6 +601,10 @@ interface StorageProvider {
   has(key: string): Promise<boolean>;
   keys(prefix?: string): Promise<string[]>;
   clear(prefix?: string): Promise<void>;
+
+  // Tracked addresses registry
+  saveTrackedAddresses(entries: TrackedAddressEntry[]): Promise<void>;
+  loadTrackedAddresses(): Promise<TrackedAddressEntry[]>;
 }
 ```
 
@@ -519,13 +615,21 @@ interface TransportProvider {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
 
-  setIdentity(identity: FullIdentity): Promise<void>;
+  setIdentity(identity: FullIdentity): void;
   sendMessage(recipientPubkey: string, content: string): Promise<string>;
   onMessage(callback: (msg: IncomingMessage) => void): () => void;
+  sendTokenTransfer(recipientPubkey: string, payload: TokenTransferPayload): Promise<string>;
+  onTokenTransfer(handler: TokenTransferHandler): () => void;
 
-  // Optional
-  resolveNametag?(nametag: string): Promise<string | null>;
-  registerNametag?(nametag: string): Promise<boolean>;
+  // Peer resolution (optional)
+  resolve?(identifier: string): Promise<PeerInfo | null>;
+  resolveNametagInfo?(nametag: string): Promise<PeerInfo | null>;
+  resolveAddressInfo?(address: string): Promise<PeerInfo | null>;
+
+  // Identity binding (optional)
+  publishIdentityBinding?(chainPubkey: string, l1Address: string, directAddress: string, nametag?: string): Promise<boolean>;
+
+  // Broadcast (optional)
   publishBroadcast?(content: string, tags?: string[]): Promise<string>;
   subscribeToBroadcast?(tags: string[], callback: (b: IncomingBroadcast) => void): () => void;
 }
@@ -586,6 +690,11 @@ sphere.on('nametag:recovered', ({ nametag }) => { });
 
 // Identity events
 sphere.on('identity:changed', ({ l1Address, directAddress, chainPubkey, nametag, addressIndex }) => { });
+
+// Address tracking events
+sphere.on('address:activated', ({ address }) => { });  // New address tracked
+sphere.on('address:hidden', ({ index, addressId }) => { });
+sphere.on('address:unhidden', ({ index, addressId }) => { });
 ```
 
 ### Unsubscribe
@@ -855,11 +964,12 @@ npm test -- --coverage
 | `modules/TokenSplitExecutor` | 16 | Token split execution |
 | `modules/PaymentsModule` | 36 | Payments, nametag, PROXY |
 | `modules/NametagMinter` | 22 | On-chain nametag minting |
+| `price/CoinGeckoPriceProvider` | 29 | Price provider, cache, negative cache |
 | `transport/NostrTransportProvider` | 24 | Nostr P2P messaging |
 | `integration/wallet-import-export` | 20 | Wallet import/export |
 | `integration/nametag-roundtrip` | 9 | Nametag serialization |
 | `impl/shared/resolvers` | 41 | Config resolution utilities |
-| **Total** | **611** | All passing |
+| **Total** | **825+** | All passing |
 
 ### Writing Tests
 
@@ -888,6 +998,8 @@ tests/
 │   │   ├── TokenSplitExecutor.test.ts
 │   │   ├── PaymentsModule.test.ts
 │   │   └── NametagMinter.test.ts
+│   ├── price/
+│   │   └── CoinGeckoPriceProvider.test.ts
 │   ├── transport/
 │   │   └── NostrTransportProvider.test.ts
 │   ├── serialization/

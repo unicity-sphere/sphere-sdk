@@ -483,18 +483,33 @@ export function getTokenId(token: Token): string {
 
 /**
  * Get the current state hash from a TXF token
+ * Checks multiple sources in order of preference:
+ * 1. Last transaction's newStateHash
+ * 2. _integrity.currentStateHash
+ * 3. Last transaction's inclusionProof authenticator stateHash
+ * 4. Genesis inclusionProof authenticator stateHash (for never-transferred tokens)
  */
 export function getCurrentStateHash(txf: TxfToken): string | undefined {
+  // Check last transaction's explicit newStateHash
   if (txf.transactions && txf.transactions.length > 0) {
     const lastTx = txf.transactions[txf.transactions.length - 1];
     if (lastTx?.newStateHash) {
       return lastTx.newStateHash;
     }
-    return undefined;
+    // Check authenticator stateHash from last transaction's proof
+    if (lastTx?.inclusionProof?.authenticator?.stateHash) {
+      return lastTx.inclusionProof.authenticator.stateHash;
+    }
   }
 
+  // Check integrity metadata
   if (txf._integrity?.currentStateHash) {
     return txf._integrity.currentStateHash;
+  }
+
+  // For tokens with no transactions, use genesis proof's stateHash
+  if (txf.genesis?.inclusionProof?.authenticator?.stateHash) {
+    return txf.genesis.inclusionProof.authenticator.stateHash;
   }
 
   return undefined;

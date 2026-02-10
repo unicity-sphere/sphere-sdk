@@ -17,6 +17,9 @@ import { getPublicKey } from './core/crypto';
 import { generateAddressFromMasterKey } from './l1/address';
 import { Sphere } from './core/Sphere';
 import { createNodeProviders } from './impl/nodejs';
+import { TokenRegistry } from './registry/TokenRegistry';
+import { TokenValidator } from './validation/token-validator';
+import { tokenToTxf, getCurrentStateHash } from './serialization/txf-serializer';
 import type { NetworkType } from './constants';
 
 const args = process.argv.slice(2);
@@ -29,11 +32,25 @@ const command = args[0];
 const DEFAULT_DATA_DIR = './.sphere-cli';
 const DEFAULT_TOKENS_DIR = './.sphere-cli/tokens';
 const CONFIG_FILE = './.sphere-cli/config.json';
+const PROFILES_FILE = './.sphere-cli/profiles.json';
 
 interface CliConfig {
   network: NetworkType;
   dataDir: string;
   tokensDir: string;
+  currentProfile?: string;
+}
+
+interface WalletProfile {
+  name: string;
+  dataDir: string;
+  tokensDir: string;
+  network: NetworkType;
+  createdAt: string;
+}
+
+interface ProfilesStore {
+  profiles: WalletProfile[];
 }
 
 function loadConfig(): CliConfig {
@@ -54,6 +71,66 @@ function loadConfig(): CliConfig {
 function saveConfig(config: CliConfig): void {
   fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+// =============================================================================
+// Wallet Profile Management
+// =============================================================================
+
+function loadProfiles(): ProfilesStore {
+  try {
+    if (fs.existsSync(PROFILES_FILE)) {
+      return JSON.parse(fs.readFileSync(PROFILES_FILE, 'utf8'));
+    }
+  } catch {
+    // Use defaults
+  }
+  return { profiles: [] };
+}
+
+function saveProfiles(store: ProfilesStore): void {
+  fs.mkdirSync(path.dirname(PROFILES_FILE), { recursive: true });
+  fs.writeFileSync(PROFILES_FILE, JSON.stringify(store, null, 2));
+}
+
+function getProfile(name: string): WalletProfile | undefined {
+  const store = loadProfiles();
+  return store.profiles.find(p => p.name === name);
+}
+
+function addProfile(profile: WalletProfile): void {
+  const store = loadProfiles();
+  const existing = store.profiles.findIndex(p => p.name === profile.name);
+  if (existing >= 0) {
+    store.profiles[existing] = profile;
+  } else {
+    store.profiles.push(profile);
+  }
+  saveProfiles(store);
+}
+
+function deleteProfile(name: string): boolean {
+  const store = loadProfiles();
+  const index = store.profiles.findIndex(p => p.name === name);
+  if (index >= 0) {
+    store.profiles.splice(index, 1);
+    saveProfiles(store);
+    return true;
+  }
+  return false;
+}
+
+function switchToProfile(name: string): boolean {
+  const profile = getProfile(name);
+  if (!profile) return false;
+
+  const config = loadConfig();
+  config.dataDir = profile.dataDir;
+  config.tokensDir = profile.tokensDir;
+  config.network = profile.network;
+  config.currentProfile = name;
+  saveConfig(config);
+  return true;
 }
 
 // =============================================================================
@@ -122,20 +199,44 @@ WALLET MANAGEMENT:
   config                            Show current configuration
   config set <key> <value>          Set configuration (network, dataDir, tokensDir)
 
+WALLET PROFILES:
+  wallet list                       List all wallet profiles
+  wallet use <name>                 Switch to a wallet profile
+  wallet create <name> [--network]  Create a new wallet profile
+  wallet delete <name>              Delete a wallet profile
+  wallet current                    Show current wallet profile
+
 BALANCE & TOKENS:
   balance                           Show L3 token balance
   tokens                            List all tokens with details
   l1-balance                        Show L1 (ALPHA) balance
+  topup [coin] [amount]             Request test tokens from faucet
+                                    Without args: requests all supported coins
+                                    With coin: requests specific coin (bitcoin, ethereum, etc.)
+  verify-balance [--remove] [-v]    Verify tokens against aggregator
+                                    Detects spent tokens not removed from storage
+                                    --remove: Remove spent tokens from storage
+                                    -v/--verbose: Show all tokens, not just spent
 
 TRANSFERS:
-  send <recipient> <amount>         Send tokens (recipient: @nametag or address)
+  send <to> <amount> [options]      Send tokens (to: @nametag or address)
+                                    --coin SYM    Token symbol (UCT/BTC/ETH/SOL)
+                                    --direct      Force DirectAddress transfer
+                                    --proxy       Force PROXY address transfer
   receive                           Show address for receiving tokens
   history [limit]                   Show transaction history
+
+ADDRESSES:
+  addresses                         List all tracked addresses
+  switch <index>                    Switch to address at HD index
+  hide <index>                      Hide address from active list
+  unhide <index>                    Unhide address
 
 NAMETAGS:
   nametag <name>                    Register a nametag (@name)
   nametag-info <name>               Lookup nametag info
   my-nametag                        Show current nametag
+  nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
@@ -166,9 +267,20 @@ Examples:
   npm run cli -- init --mnemonic "word1 word2 ... word24"
   npm run cli -- status
   npm run cli -- balance
-  npm run cli -- send @alice 1000000
+  npm run cli -- send @alice 1000000 --coin ETH
   npm run cli -- nametag myname
   npm run cli -- history 10
+
+Wallet Profile Examples:
+  npm run cli -- wallet create alice              Create profile "alice"
+  npm run cli -- init --nametag alice             Initialize wallet in profile
+  npm run cli -- wallet create bob                Create another profile
+  npm run cli -- init --nametag bob               Initialize second wallet
+  npm run cli -- wallet list                      List all profiles
+  npm run cli -- wallet use alice                 Switch to alice
+  npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
+  npm run cli -- wallet use bob                   Switch to bob
+  npm run cli -- balance                          Check bob's balance
 `);
 }
 
@@ -258,6 +370,9 @@ async function main() {
 
           console.log('\nWallet Status:');
           console.log('─'.repeat(50));
+          if (config.currentProfile) {
+            console.log(`Profile:       ${config.currentProfile}`);
+          }
           console.log(`Network:       ${config.network}`);
           console.log(`L1 Address:    ${identity.l1Address}`);
           console.log(`Direct Addr:   ${identity.directAddress || '(not set)'}`);
@@ -317,22 +432,217 @@ async function main() {
         break;
       }
 
+      // === WALLET PROFILES ===
+      case 'wallet': {
+        const [, subCmd, profileName] = args;
+
+        switch (subCmd) {
+          case 'list': {
+            const store = loadProfiles();
+            const config = loadConfig();
+
+            console.log('\nWallet Profiles:');
+            console.log('─'.repeat(60));
+
+            if (store.profiles.length === 0) {
+              console.log('No profiles found. Create one with: npm run cli -- wallet create <name>');
+            } else {
+              for (const profile of store.profiles) {
+                const isCurrent = config.currentProfile === profile.name;
+                const marker = isCurrent ? '→ ' : '  ';
+                console.log(`${marker}${profile.name}`);
+                console.log(`    Network: ${profile.network}`);
+                console.log(`    DataDir: ${profile.dataDir}`);
+              }
+            }
+            console.log('─'.repeat(60));
+            break;
+          }
+
+          case 'use': {
+            if (!profileName) {
+              console.error('Usage: wallet use <name>');
+              console.error('Example: npm run cli -- wallet use babaika9');
+              process.exit(1);
+            }
+
+            if (switchToProfile(profileName)) {
+              console.log(`✓ Switched to wallet profile: ${profileName}`);
+
+              // Show wallet status
+              try {
+                const sphere = await getSphere();
+                const identity = sphere.identity;
+                if (identity) {
+                  console.log(`  Nametag:  ${identity.nametag || '(not set)'}`);
+                  console.log(`  L1 Addr:  ${identity.l1Address}`);
+                }
+                await closeSphere();
+              } catch {
+                console.log('  (wallet not initialized in this profile)');
+              }
+            } else {
+              console.error(`Profile "${profileName}" not found.`);
+              console.error('Run: npm run cli -- wallet list');
+              process.exit(1);
+            }
+            break;
+          }
+
+          case 'create': {
+            if (!profileName) {
+              console.error('Usage: wallet create <name> [--network testnet|mainnet|dev]');
+              console.error('Example: npm run cli -- wallet create mywalletname');
+              process.exit(1);
+            }
+
+            // Check if profile already exists
+            if (getProfile(profileName)) {
+              console.error(`Profile "${profileName}" already exists.`);
+              console.error('Run: npm run cli -- wallet use ' + profileName);
+              process.exit(1);
+            }
+
+            // Parse optional network
+            const networkIdx = args.indexOf('--network');
+            let network: NetworkType = 'testnet';
+            if (networkIdx !== -1 && args[networkIdx + 1]) {
+              network = args[networkIdx + 1] as NetworkType;
+            }
+
+            const dataDir = `./.sphere-cli-${profileName}`;
+            const tokensDir = `${dataDir}/tokens`;
+
+            // Create the profile
+            const profile: WalletProfile = {
+              name: profileName,
+              dataDir,
+              tokensDir,
+              network,
+              createdAt: new Date().toISOString(),
+            };
+            addProfile(profile);
+
+            // Switch to the new profile
+            switchToProfile(profileName);
+
+            console.log(`✓ Created wallet profile: ${profileName}`);
+            console.log(`  Network:  ${network}`);
+            console.log(`  DataDir:  ${dataDir}`);
+            console.log('');
+            console.log('Now initialize the wallet:');
+            console.log(`  npm run cli -- init --nametag ${profileName}`);
+            break;
+          }
+
+          case 'current': {
+            const config = loadConfig();
+            const currentName = config.currentProfile;
+
+            console.log('\nCurrent Wallet:');
+            console.log('─'.repeat(50));
+
+            if (currentName) {
+              const profile = getProfile(currentName);
+              if (profile) {
+                console.log(`Profile:   ${profile.name}`);
+                console.log(`Network:   ${profile.network}`);
+                console.log(`DataDir:   ${profile.dataDir}`);
+              } else {
+                console.log(`Profile:   ${currentName} (not found in profiles)`);
+              }
+            } else {
+              console.log('Profile:   (default)');
+            }
+
+            console.log(`DataDir:   ${config.dataDir}`);
+            console.log(`Network:   ${config.network}`);
+
+            // Try to get identity
+            try {
+              const sphere = await getSphere();
+              const identity = sphere.identity;
+              if (identity) {
+                console.log(`Nametag:   ${identity.nametag || '(not set)'}`);
+                console.log(`L1 Addr:   ${identity.l1Address}`);
+              }
+              await closeSphere();
+            } catch {
+              console.log('Wallet:    (not initialized)');
+            }
+
+            console.log('─'.repeat(50));
+            break;
+          }
+
+          case 'delete': {
+            if (!profileName) {
+              console.error('Usage: wallet delete <name>');
+              process.exit(1);
+            }
+
+            const config = loadConfig();
+            if (config.currentProfile === profileName) {
+              console.error(`Cannot delete the current profile. Switch to another profile first.`);
+              process.exit(1);
+            }
+
+            if (deleteProfile(profileName)) {
+              console.log(`✓ Deleted profile: ${profileName}`);
+              console.log('Note: Wallet data directory was NOT deleted. Remove manually if needed.');
+            } else {
+              console.error(`Profile "${profileName}" not found.`);
+              process.exit(1);
+            }
+            break;
+          }
+
+          default:
+            console.error('Unknown wallet subcommand:', subCmd);
+            console.log('\nUsage:');
+            console.log('  wallet list              List all profiles');
+            console.log('  wallet use <name>        Switch to profile');
+            console.log('  wallet create <name>     Create new profile');
+            console.log('  wallet current           Show current profile');
+            console.log('  wallet delete <name>     Delete profile');
+            process.exit(1);
+        }
+        break;
+      }
+
       // === BALANCE & TOKENS ===
       case 'balance': {
         const sphere = await getSphere();
-        const balances = sphere.payments.getBalance();
+        const assets = await sphere.payments.getAssets();
+        const totalUsd = await sphere.payments.getBalance();
 
         console.log('\nL3 Balance:');
         console.log('─'.repeat(50));
 
-        if (balances.length === 0) {
+        if (assets.length === 0) {
           console.log('No tokens found.');
         } else {
-          for (const bal of balances) {
-            console.log(`${bal.symbol}: ${toHumanReadable(bal.totalAmount)} (${bal.tokenCount} tokens)`);
+          for (const asset of assets) {
+            const decimals = asset.decimals ?? 8;
+            const divisor = BigInt(10 ** decimals);
+            const amountBigInt = BigInt(asset.totalAmount);
+            const wholePart = amountBigInt / divisor;
+            const fracPart = amountBigInt % divisor;
+            const formatted = fracPart > 0n
+              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+              : wholePart.toString();
+
+            let line = `${asset.symbol}: ${formatted} (${asset.tokenCount} token${asset.tokenCount !== 1 ? 's' : ''})`;
+            if (asset.fiatValueUsd != null) {
+              line += ` ≈ $${asset.fiatValueUsd.toFixed(2)}`;
+            }
+            console.log(line);
           }
         }
         console.log('─'.repeat(50));
+        if (totalUsd != null) {
+          console.log(`Total: $${totalUsd.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+        }
 
         await closeSphere();
         break;
@@ -341,6 +651,7 @@ async function main() {
       case 'tokens': {
         const sphere = await getSphere();
         const tokens = sphere.payments.getTokens();
+        const registry = TokenRegistry.getInstance();
 
         console.log('\nTokens:');
         console.log('─'.repeat(50));
@@ -349,9 +660,19 @@ async function main() {
           console.log('No tokens found.');
         } else {
           for (const token of tokens) {
-            console.log(`ID: ${token.id}`);
-            console.log(`  Coin: ${token.coinId || 'UCT'}`);
-            console.log(`  Amount: ${toHumanReadable(token.amount?.toString() || '0')}`);
+            const def = registry.getDefinition(token.coinId);
+            const symbol = def?.symbol || token.symbol || 'UNK';
+            const decimals = def?.decimals ?? token.decimals ?? 8;
+            const amountBigInt = BigInt(token.amount || '0');
+            const divisor = BigInt(10 ** decimals);
+            const wholePart = amountBigInt / divisor;
+            const fracPart = amountBigInt % divisor;
+            const formatted = fracPart > 0
+              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+              : wholePart.toString();
+            console.log(`ID: ${token.id.slice(0, 16)}...`);
+            console.log(`  Coin: ${symbol} (${token.coinId.slice(0, 8)}...)`);
+            console.log(`  Amount: ${formatted} ${symbol}`);
             console.log(`  Status: ${token.status || 'active'}`);
             console.log('');
           }
@@ -382,29 +703,195 @@ async function main() {
         break;
       }
 
+      case 'verify-balance': {
+        // Verify tokens against the aggregator to detect spent tokens
+        // Uses SDK Token.fromJSON() to calculate current state hash (per TOKEN_INVENTORY_SPEC.md)
+        const removeSpent = args.includes('--remove');
+        const verbose = args.includes('--verbose') || args.includes('-v');
+
+        const sphere = await getSphere();
+        const tokens = sphere.payments.getTokens();
+        const identity = sphere.identity;
+
+        if (!identity) {
+          console.error('No wallet identity found.');
+          process.exit(1);
+        }
+
+        console.log(`\nVerifying ${tokens.length} token(s) against aggregator...`);
+        console.log('─'.repeat(60));
+
+        // Get aggregator client from the initialized oracle provider in Sphere
+        const oracle = sphere.getAggregator();
+        const aggregatorClient = (oracle as { getAggregatorClient?: () => unknown }).getAggregatorClient?.();
+
+        if (!aggregatorClient) {
+          console.error('Aggregator client not available. Cannot verify tokens.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Create validator with aggregator client
+        const validator = new TokenValidator({
+          aggregatorClient: aggregatorClient as Parameters<typeof TokenValidator.prototype.setAggregatorClient>[0],
+        });
+
+        // Use checkSpentTokens which properly calculates state hash using SDK
+        // (following TOKEN_INVENTORY_SPEC.md Step 7: Spent Token Detection)
+        const result = await validator.checkSpentTokens(
+          tokens,
+          identity.chainPubkey,
+          {
+            batchSize: 5,
+            onProgress: (completed, total) => {
+              if (verbose && (completed % 10 === 0 || completed === total)) {
+                console.log(`  Checked ${completed}/${total} tokens...`);
+              }
+            }
+          }
+        );
+
+        // Build result maps for display
+        const registry = TokenRegistry.getInstance();
+        const spentTokenIds = new Set(result.spentTokens.map(s => s.localId));
+
+        const spentDisplay: { id: string; tokenId: string; symbol: string; amount: string }[] = [];
+        const validDisplay: { id: string; tokenId: string; symbol: string; amount: string }[] = [];
+
+        for (const token of tokens) {
+          const def = registry.getDefinition(token.coinId);
+          const symbol = def?.symbol || token.symbol || 'UNK';
+          const decimals = def?.decimals ?? token.decimals ?? 8;
+          const amountBigInt = BigInt(token.amount || '0');
+          const divisor = BigInt(10 ** decimals);
+          const wholePart = amountBigInt / divisor;
+          const fracPart = amountBigInt % divisor;
+          const formatted = fracPart > 0
+            ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
+            : wholePart.toString();
+
+          const txf = tokenToTxf(token);
+          const tokenId = txf?.genesis?.data?.tokenId || token.id;
+
+          if (spentTokenIds.has(token.id)) {
+            spentDisplay.push({
+              id: token.id,
+              tokenId: tokenId.slice(0, 16),
+              symbol,
+              amount: formatted,
+            });
+            console.log(`✗ SPENT: ${formatted} ${symbol} (${tokenId.slice(0, 12)}...)`);
+          } else {
+            validDisplay.push({
+              id: token.id,
+              tokenId: tokenId.slice(0, 16),
+              symbol,
+              amount: formatted,
+            });
+            if (verbose) {
+              console.log(`✓ Valid: ${formatted} ${symbol} (${tokenId.slice(0, 12)}...)`);
+            }
+          }
+        }
+
+        console.log('─'.repeat(60));
+        console.log(`\nSummary:`);
+        console.log(`  Valid tokens: ${validDisplay.length}`);
+        console.log(`  Spent tokens: ${spentDisplay.length}`);
+        if (result.errors.length > 0) {
+          console.log(`  Errors: ${result.errors.length}`);
+          if (verbose) {
+            for (const err of result.errors) {
+              console.log(`    - ${err}`);
+            }
+          }
+        }
+
+        // Move spent tokens to Sent folder if requested (per TOKEN_INVENTORY_SPEC.md)
+        if (removeSpent && spentDisplay.length > 0) {
+          console.log(`\nMoving ${spentDisplay.length} spent token(s) to Sent folder...`);
+
+          // Access PaymentsModule's removeToken which:
+          // 1. Archives token to Sent folder (archivedTokens)
+          // 2. Creates tombstone to prevent re-sync
+          // 3. Removes from active tokens
+          const paymentsModule = sphere.payments as unknown as {
+            removeToken?: (tokenId: string, recipientNametag?: string, skipHistory?: boolean) => Promise<void>;
+          };
+
+          if (!paymentsModule.removeToken) {
+            console.error('  Error: removeToken method not available');
+          } else {
+            for (const spent of spentDisplay) {
+              try {
+                // Use removeToken which archives to Sent folder and creates tombstone
+                // skipHistory=true since this is spent detection, not a new send
+                await paymentsModule.removeToken(spent.id, undefined, true);
+                console.log(`  Archived: ${spent.amount} ${spent.symbol} (${spent.tokenId}...)`);
+              } catch (err) {
+                console.error(`  Failed to archive ${spent.id}: ${err}`);
+              }
+            }
+            console.log('  Tokens moved to Sent folder.');
+          }
+        } else if (spentDisplay.length > 0) {
+          console.log(`\nTo move spent tokens to Sent folder, run: npm run cli -- verify-balance --remove`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
       // === TRANSFERS ===
       case 'send': {
         const [, recipient, amountStr] = args;
         if (!recipient || !amountStr) {
-          console.error('Usage: send <recipient> <amount> [--coin <coinId>]');
+          console.error('Usage: send <recipient> <amount> [--coin <symbol>] [--direct|--proxy]');
           console.error('  recipient: @nametag or DIRECT:// address');
-          console.error('  amount: in smallest units');
-          console.error('  --coin: token type (default: UCT)');
+          console.error('  amount: decimal amount (e.g., 0.5, 100)');
+          console.error('  --coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
+          console.error('  --direct: force DirectAddress transfer (requires new nametag with directAddress)');
+          console.error('  --proxy: force PROXY address transfer (works with any nametag)');
           process.exit(1);
         }
 
-        // Parse --coin option
+        // Parse --coin option (symbol like UCT, BTC, ETH)
         const coinIndex = args.indexOf('--coin');
-        const coinId = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
+        const coinSymbol = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
+
+        // Parse --direct and --proxy options
+        const forceDirect = args.includes('--direct');
+        const forceProxy = args.includes('--proxy');
+        if (forceDirect && forceProxy) {
+          console.error('Cannot use both --direct and --proxy');
+          process.exit(1);
+        }
+        const addressMode = forceDirect ? 'direct' : forceProxy ? 'proxy' : 'auto';
+
+        // Resolve symbol to coinId hex and get decimals
+        const registry = TokenRegistry.getInstance();
+        const coinDef = registry.getDefinitionBySymbol(coinSymbol);
+        if (!coinDef) {
+          console.error(`Unknown coin symbol: ${coinSymbol}`);
+          console.error('Available symbols: UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT');
+          process.exit(1);
+        }
+        const coinIdHex = coinDef.id;
+        const decimals = coinDef.decimals ?? 8;
+
+        // Convert amount to smallest units (supports decimal input like "0.2")
+        const amountSmallest = toSmallestUnit(amountStr, decimals).toString();
 
         const sphere = await getSphere();
 
-        console.log(`\nSending ${toHumanReadable(amountStr)} ${coinId} to ${recipient}...`);
+        const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode} mode)`;
+        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}${modeLabel}...`);
 
         const result = await sphere.payments.send({
           recipient,
-          amount: amountStr,
-          coinId,
+          amount: amountSmallest,
+          coinId: coinIdHex,
+          addressMode,
         });
 
         if (result.status === 'completed' || result.status === 'submitted') {
@@ -456,10 +943,14 @@ async function main() {
         if (limited.length === 0) {
           console.log('No transactions found.');
         } else {
+          const registry = TokenRegistry.getInstance();
           for (const tx of limited) {
             const date = new Date(tx.timestamp).toLocaleString();
             const direction = tx.type === 'SENT' ? '→' : '←';
-            const amount = toHumanReadable(tx.amount?.toString() || '0');
+            // Look up decimals from registry, default to 8
+            const coinDef = registry.getDefinition(tx.coinId);
+            const decimals = coinDef?.decimals ?? 8;
+            const amount = toHumanReadable(tx.amount?.toString() || '0', decimals);
             console.log(`${date} ${direction} ${amount} ${tx.symbol}`);
             const counterparty = tx.type === 'SENT' ? tx.recipientNametag : tx.senderPubkey;
             console.log(`  ${tx.type === 'SENT' ? 'To' : 'From'}: ${counterparty || 'unknown'}`);
@@ -468,6 +959,87 @@ async function main() {
         }
         console.log('─'.repeat(60));
 
+        await closeSphere();
+        break;
+      }
+
+      // === ADDRESSES ===
+      case 'addresses': {
+        const sphere = await getSphere();
+        const all = sphere.getAllTrackedAddresses();
+        const currentIndex = sphere.getCurrentAddressIndex();
+
+        console.log('\nTracked Addresses:');
+        console.log('─'.repeat(70));
+
+        if (all.length === 0) {
+          console.log('No tracked addresses.');
+        } else {
+          for (const addr of all) {
+            const marker = addr.index === currentIndex ? '→ ' : '  ';
+            const hidden = addr.hidden ? ' [hidden]' : '';
+            const tag = addr.nametag ? ` @${addr.nametag}` : '';
+            console.log(`${marker}#${addr.index}: ${addr.l1Address}${tag}${hidden}`);
+            console.log(`    DIRECT: ${addr.directAddress}`);
+          }
+        }
+
+        console.log('─'.repeat(70));
+        await closeSphere();
+        break;
+      }
+
+      case 'switch': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: switch <index>');
+          console.error('  index: HD address index (0, 1, 2, ...)');
+          process.exit(1);
+        }
+
+        const index = parseInt(indexStr);
+        if (isNaN(index) || index < 0) {
+          console.error('Invalid index. Must be a non-negative integer.');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.switchToAddress(index);
+
+        const identity = sphere.identity;
+        console.log(`\nSwitched to address #${index}`);
+        console.log(`  L1:      ${identity?.l1Address}`);
+        console.log(`  DIRECT:  ${identity?.directAddress}`);
+        console.log(`  Nametag: ${identity?.nametag || '(not set)'}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'hide': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: hide <index>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.setAddressHidden(parseInt(indexStr), true);
+        console.log(`Address #${indexStr} hidden.`);
+        await closeSphere();
+        break;
+      }
+
+      case 'unhide': {
+        const [, indexStr] = args;
+        if (!indexStr) {
+          console.error('Usage: unhide <index>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await sphere.setAddressHidden(parseInt(indexStr), false);
+        console.log(`Address #${indexStr} unhidden.`);
         await closeSphere();
         break;
       }
@@ -533,6 +1105,50 @@ async function main() {
         } else {
           console.log('\nNo nametag registered.');
           console.log('Register one with: npm run cli -- nametag <name>');
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nametag-sync': {
+        // Force re-publish nametag binding with chainPubkey
+        // Useful for legacy nametags that were registered without chainPubkey
+        const sphere = await getSphere();
+        const identity = sphere.identity;
+
+        if (!identity?.nametag) {
+          console.error('\nNo nametag to sync.');
+          console.error('Register one first with: npm run cli -- nametag <name>');
+          process.exit(1);
+        }
+
+        console.log(`\nRe-publishing nametag @${identity.nametag} with chainPubkey...`);
+
+        // Get transport provider and force re-register
+        const transport = (sphere as unknown as { _transport?: { registerNametag?: (n: string, pk: string, da: string) => Promise<boolean> } })._transport;
+        if (!transport?.registerNametag) {
+          console.error('Transport provider does not support nametag registration');
+          process.exit(1);
+        }
+
+        try {
+          const success = await transport.registerNametag(
+            identity.nametag,
+            identity.chainPubkey,
+            identity.directAddress || ''
+          );
+
+          if (success) {
+            console.log(`\n✓ Nametag @${identity.nametag} synced successfully!`);
+            console.log(`  chainPubkey: ${identity.chainPubkey.slice(0, 16)}...`);
+          } else {
+            console.error('\n✗ Nametag sync failed. The nametag may be taken by another pubkey.');
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error('\n✗ Sync failed:', err instanceof Error ? err.message : err);
+          process.exit(1);
         }
 
         await closeSphere();
@@ -746,6 +1362,99 @@ async function main() {
         }
         const bytes = base58Decode(str);
         console.log(Buffer.from(bytes).toString('hex'));
+        break;
+      }
+
+      // === FAUCET / TOPUP ===
+      case 'topup':
+      case 'top-up':
+      case 'faucet': {
+        // Get nametag from wallet
+        const sphere = await getSphere();
+        const nametag = sphere.getNametag();
+        if (!nametag) {
+          console.error('Error: No nametag registered. Use "nametag <name>" first.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Parse options
+        const coinArg = args[1];  // Optional: specific coin
+        const amountArg = args[2]; // Optional: specific amount
+
+        const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
+
+        // Default amounts for all coins
+        const DEFAULT_COINS: Record<string, number> = {
+          'unicity': 100,
+          'bitcoin': 1,
+          'ethereum': 42,
+          'solana': 1000,
+          'tether': 1000,
+          'usd-coin': 1000,
+          'unicity-usd': 1000,
+        };
+
+        async function requestFaucet(coin: string, amount: number): Promise<{ success: boolean; message?: string }> {
+          try {
+            const response = await fetch(FAUCET_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                unicityId: nametag,  // Without @ prefix - faucet API expects raw nametag
+                coin,
+                amount,
+              }),
+            });
+            const result = await response.json() as { success: boolean; message?: string; error?: string };
+            // API returns 'error' field on failure, normalize to 'message'
+            return {
+              success: result.success,
+              message: result.message || result.error,
+            };
+          } catch (error) {
+            return { success: false, message: error instanceof Error ? error.message : 'Request failed' };
+          }
+        }
+
+        if (coinArg) {
+          // Request specific coin
+          const coin = coinArg.toLowerCase();
+          const amount = amountArg ? parseFloat(amountArg) : (DEFAULT_COINS[coin] || 1);
+
+          console.log(`Requesting ${amount} ${coin} from faucet for @${nametag}...`);
+          const result = await requestFaucet(coin, amount);
+
+          if (result.success) {
+            console.log(`\n✓ Received ${amount} ${coin}`);
+          } else {
+            console.error(`\n✗ Failed: ${result.message || 'Unknown error'}`);
+          }
+        } else {
+          // Request all coins
+          console.log(`Requesting all test tokens for @${nametag}...`);
+          console.log('─'.repeat(50));
+
+          const results = await Promise.all(
+            Object.entries(DEFAULT_COINS).map(async ([coin, amount]) => {
+              const result = await requestFaucet(coin, amount);
+              return { coin, amount, ...result };
+            })
+          );
+
+          for (const result of results) {
+            if (result.success) {
+              console.log(`✓ ${result.coin}: ${result.amount}`);
+            } else {
+              console.log(`✗ ${result.coin}: Failed - ${result.message || 'Unknown error'}`);
+            }
+          }
+
+          console.log('─'.repeat(50));
+          console.log('TopUp complete! Run "balance" to see updated balances.');
+        }
+
+        await closeSphere();
         break;
       }
 

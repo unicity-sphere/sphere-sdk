@@ -6,6 +6,7 @@
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
+import type { PriceProvider, PricePlatform } from '../../price';
 import type { NetworkType } from '../../constants';
 
 // =============================================================================
@@ -85,6 +86,28 @@ export interface L1Config {
 }
 
 // =============================================================================
+// Price Configuration
+// =============================================================================
+
+/**
+ * Base price provider configuration
+ */
+export interface BasePriceConfig {
+  /** Which price platform to use (default: 'coingecko') */
+  platform?: PricePlatform;
+  /** API key for the price platform (optional for free tiers) */
+  apiKey?: string;
+  /** Custom base URL (e.g., for CORS proxy in browser environments) */
+  baseUrl?: string;
+  /** Cache TTL in milliseconds (default: 60000) */
+  cacheTtlMs?: number;
+  /** Request timeout in milliseconds (default: 10000) */
+  timeout?: number;
+  /** Enable debug logging */
+  debug?: boolean;
+}
+
+// =============================================================================
 // Provider Configuration
 // =============================================================================
 
@@ -101,6 +124,8 @@ export interface BaseProvidersConfig {
   oracle?: BaseOracleConfig;
   /** L1 (ALPHA blockchain) configuration */
   l1?: L1Config;
+  /** Price provider configuration (optional — enables fiat value display) */
+  price?: BasePriceConfig;
 }
 
 // =============================================================================
@@ -118,6 +143,8 @@ export interface BaseProviders {
   oracle: OracleProvider;
   /** L1 configuration (for passing to Sphere.init) */
   l1?: L1Config;
+  /** Price provider (optional — enables fiat value display) */
+  price?: PriceProvider;
 }
 
 // =============================================================================

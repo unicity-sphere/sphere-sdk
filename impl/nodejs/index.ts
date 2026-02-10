@@ -30,15 +30,19 @@ import { createUnicityAggregatorProvider } from './oracle';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
+import type { PriceProvider } from '../../price';
+import { createPriceProvider } from '../../price';
 import type { NetworkType } from '../../constants';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
+  type BasePriceConfig,
   type L1Config,
   type NodeOracleExtensions,
   resolveTransportConfig,
   resolveOracleConfig,
   resolveL1Config,
+  resolvePriceConfig,
 } from '../shared';
 
 // =============================================================================
@@ -80,6 +84,8 @@ export interface NodeProvidersConfig {
   oracle?: NodeOracleConfig;
   /** L1 (ALPHA blockchain) configuration */
   l1?: NodeL1Config;
+  /** Price provider configuration (optional — enables fiat value display) */
+  price?: BasePriceConfig;
 }
 
 export interface NodeProviders {
@@ -89,6 +95,8 @@ export interface NodeProviders {
   oracle: OracleProvider;
   /** L1 configuration (for passing to Sphere.init) */
   l1?: L1Config;
+  /** Price provider (optional — enables fiat value display) */
+  price?: PriceProvider;
 }
 
 // =============================================================================
@@ -138,6 +146,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const transportConfig = resolveTransportConfig(network, config?.transport);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
+  const priceConfig = resolvePriceConfig(config?.price);
 
   return {
     storage: createFileStorageProvider({
@@ -162,5 +171,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       network,
     }),
     l1: l1Config,
+    price: priceConfig ? createPriceProvider(priceConfig) : undefined,
   };
 }

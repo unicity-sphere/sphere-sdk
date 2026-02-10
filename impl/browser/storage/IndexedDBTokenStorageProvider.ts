@@ -245,10 +245,34 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   async clear(): Promise<boolean> {
-    if (!this.db) return false;
+    // Close the open connection so deleteDatabase isn't blocked
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+    this.status = 'disconnected';
+
+    const deleteDb = (name: string) =>
+      new Promise<void>((resolve) => {
+        const req = indexedDB.deleteDatabase(name);
+        req.onsuccess = () => resolve();
+        req.onerror = () => resolve();
+        req.onblocked = () => resolve();
+      });
+
     try {
-      await this.clearStore(STORE_TOKENS);
-      await this.clearStore(STORE_META);
+      // Delete all databases matching our prefix (covers all addresses)
+      if (typeof indexedDB.databases === 'function') {
+        const dbs = await indexedDB.databases();
+        await Promise.all(
+          dbs
+            .filter(db => db.name?.startsWith(this.dbNamePrefix))
+            .map(db => deleteDb(db.name!)),
+        );
+      } else {
+        // Fallback: delete only the current database
+        await deleteDb(this.dbName);
+      }
       return true;
     } catch {
       return false;

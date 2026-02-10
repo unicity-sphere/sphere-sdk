@@ -141,17 +141,33 @@ const providers = createNodeProviders({
     electrumUrl: 'wss://custom-electrum:50004',
     enableVesting: true,
   },
+
+  // Price provider (optional — enables fiat value display)
+  price: {
+    platform: 'coingecko',    // Currently supported: 'coingecko'
+    apiKey: 'CG-xxx',         // Optional (free tier works without key)
+    cacheTtlMs: 60000,        // Cache TTL in ms (default: 60s)
+  },
 });
 ```
 
 ## Common Operations
 
-### Check Balance
+### Check Balance & Assets
 
 ```typescript
-// L3 token balance
-const balance = await sphere.payments.getBalance();
-console.log('L3 Balance:', balance);
+// Get assets with price data (price fields are null without PriceProvider)
+const assets = await sphere.payments.getAssets();
+for (const asset of assets) {
+  console.log(`${asset.symbol}: ${asset.totalAmount} (${asset.tokenCount} tokens)`);
+  if (asset.fiatValueUsd != null) {
+    console.log(`  Value: $${asset.fiatValueUsd.toFixed(2)}`);
+  }
+}
+
+// Total portfolio value in USD (null if PriceProvider not configured)
+const totalUsd = await sphere.payments.getBalance();
+console.log('Total USD:', totalUsd); // number | null
 
 // L1 (ALPHA) balance
 const l1Balance = await sphere.payments.l1.getBalance();
