@@ -58,8 +58,11 @@ npm run cli -- balance
 # Fetch pending transfers and finalize unconfirmed tokens
 npm run cli -- balance --finalize
 
-# Show receive address
+# Check for incoming transfers
 npm run cli -- receive
+
+# Check for incoming transfers and finalize unconfirmed tokens
+npm run cli -- receive --finalize
 
 # Send tokens (instant mode, default)
 npm run cli -- send @alice 1 --coin UCT --instant
@@ -98,7 +101,7 @@ npm run cli -- verify-balance
 | | `topup [coin] [amount]` | Request test tokens from faucet |
 | | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
 | **Transfers** | `send <to> <amount> [--coin SYM] [--instant\|--conservative]` | Send tokens |
-| | `receive` | Show address for receiving |
+| | `receive [--finalize]` | Check for incoming transfers |
 | | `history [limit]` | Show transaction history |
 | **Nametags** | `nametag <name>` | Register a nametag |
 | | `nametag-info <name>` | Lookup nametag info |
