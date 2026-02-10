@@ -310,8 +310,8 @@ const { transfers } = await sphere.payments.receive();
 console.log(`Received ${transfers.length} transfers`);
 
 // With per-transfer callback
-await sphere.payments.receive({
-  callback: (transfer) => console.log(`Received ${transfer.tokens.length} tokens`),
+await sphere.payments.receive(undefined, (transfer) => {
+  console.log(`Received ${transfer.tokens.length} tokens`);
 });
 ```
 

@@ -122,9 +122,7 @@ export interface ReceiveOptions {
   timeout?: number;
   /** Poll interval in ms (default: 2000). Only used when finalize=true. */
   pollInterval?: number;
-  /** Callback for each newly received transfer. */
-  callback?: (transfer: IncomingTransfer) => void;
-  /** Progress callback after each resolveUnconfirmed() poll. Only when finalize=true. */
+  /** Progress callback after each resolveUnconfirmed() poll. Only used when finalize=true. */
   onProgress?: (result: UnconfirmedResolutionResult) => void;
 }
 
@@ -1803,9 +1801,13 @@ export class PaymentsModule {
    * resolveUnconfirmed() once to submit pending commitments.
    *
    * @param options - Optional receive options including finalization control
+   * @param callback - Optional callback invoked for each newly received transfer
    * @returns ReceiveResult with transfers and finalization metadata
    */
-  async receive(options?: ReceiveOptions): Promise<ReceiveResult> {
+  async receive(
+    options?: ReceiveOptions,
+    callback?: (transfer: IncomingTransfer) => void,
+  ): Promise<ReceiveResult> {
     this.ensureInitialized();
 
     if (!this.deps!.transport.fetchPendingEvents) {
@@ -1841,7 +1843,7 @@ export class PaymentsModule {
           receivedAt: Date.now(),
         };
         received.push(transfer);
-        if (opts.callback) opts.callback(transfer);
+        if (callback) callback(transfer);
       }
     }
 
