@@ -23,23 +23,32 @@ vi.mock('../../../l1/network', () => ({
 
 describe('PaymentsModule', () => {
   describe('L1 optional initialization', () => {
-    it('should have l1 as null when no config is provided', () => {
+    it('should have l1 enabled by default when no config is provided', () => {
       const module = createPaymentsModule();
-      expect(module.l1).toBeNull();
+      expect(module.l1).not.toBeNull();
+      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
     });
 
-    it('should have l1 as null when empty l1 config is provided', () => {
+    it('should have l1 enabled when empty l1 config is provided', () => {
       const module = createPaymentsModule({ l1: {} });
-      expect(module.l1).toBeNull();
+      expect(module.l1).not.toBeNull();
+      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
     });
 
-    it('should have l1 as null when l1 config has empty electrumUrl', () => {
+    it('should have l1 enabled when l1 config has empty electrumUrl', () => {
       const module = createPaymentsModule({ l1: { electrumUrl: '' } });
-      expect(module.l1).toBeNull();
+      expect(module.l1).not.toBeNull();
+      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
     });
 
-    it('should have l1 as null when l1 is undefined', () => {
+    it('should have l1 enabled when l1 is undefined', () => {
       const module = createPaymentsModule({ l1: undefined });
+      expect(module.l1).not.toBeNull();
+      expect(module.l1).toBeInstanceOf(L1PaymentsModule);
+    });
+
+    it('should have l1 as null when l1 is explicitly null', () => {
+      const module = createPaymentsModule({ l1: null });
       expect(module.l1).toBeNull();
     });
 
@@ -91,7 +100,7 @@ describe('PaymentsModule', () => {
 
   describe('destroy()', () => {
     it('should not throw when l1 is null', () => {
-      const module = createPaymentsModule();
+      const module = createPaymentsModule({ l1: null });
       expect(module.l1).toBeNull();
       expect(() => module.destroy()).not.toThrow();
     });
@@ -191,7 +200,7 @@ describe('L1PaymentsModule', () => {
       // Access private config for testing
       const config = (l1 as unknown as { _config: Record<string, unknown> })._config;
 
-      expect(config.electrumUrl).toBe('wss://fulcrum.alpha.unicity.network:50004');
+      expect(config.electrumUrl).toBe('wss://fulcrum.unicity.network:50004');
       expect(config.network).toBe('mainnet');
       expect(config.defaultFeeRate).toBe(10);
       expect(config.enableVesting).toBe(true);

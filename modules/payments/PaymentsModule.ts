@@ -533,8 +533,8 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1PaymentsModuleConfig;
+  /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
+  l1?: L1PaymentsModuleConfig | null;
 }
 
 // =============================================================================
