@@ -105,7 +105,8 @@ export interface TransactionHistoryEntry {
   timestamp: number;
   recipientNametag?: string;
   senderPubkey?: string;
-  txHash?: string;
+  /** TransferResult.id that created this entry (links history to transfer operation) */
+  transferId?: string;
 }
 
 // =============================================================================
@@ -991,6 +992,7 @@ export class PaymentsModule {
         symbol: this.getCoinSymbol(request.coinId),
         timestamp: Date.now(),
         recipientNametag,
+        transferId: result.id,
       });
 
       this.deps!.emitEvent('transfer:confirmed', result);

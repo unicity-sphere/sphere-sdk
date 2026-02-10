@@ -566,6 +566,42 @@ describe('TransferResult.tokenTransfers', () => {
       expect(result.tokens).toHaveLength(1);
     });
 
+    it('should pass transferId to addToHistory linking result.id', async () => {
+      const token = createMockToken('token-history-link', '1000');
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const mod = module as any;
+      mod.tokens.set(token.id, token);
+
+      mockCalculateOptimalSplit.mockResolvedValue({
+        tokensToTransferDirectly: [
+          { sdkToken: createMockSdkToken(), amount: 1000n, uiToken: token },
+        ],
+        tokenToSplit: null,
+        splitAmount: null,
+        remainderAmount: null,
+        totalTransferAmount: 1000n,
+        coinId: 'UCT',
+        requiresSplit: false,
+      });
+
+      mod.createSdkCommitment = vi.fn().mockResolvedValue(createMockCommitment('ab'.repeat(16)));
+
+      const result = await module.send({
+        recipient: '@alice',
+        amount: '1000',
+        coinId: 'UCT',
+      });
+
+      // addToHistory should have been called with transferId matching result.id
+      expect(mod.addToHistory).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'SENT',
+          transferId: result.id,
+        })
+      );
+    });
+
     it('should not have txHash property', async () => {
       const token = createMockToken('token-no-txhash', '1000');
 

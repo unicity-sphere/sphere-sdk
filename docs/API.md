@@ -449,7 +449,7 @@ interface TransactionHistoryEntry {
   timestamp: number;
   recipientNametag?: string;
   senderPubkey?: string;
-  txHash?: string;
+  transferId?: string;            // Links to TransferResult.id (for SENT entries)
 }
 ```
 
