@@ -816,6 +816,7 @@ export class PaymentsModule {
       id: crypto.randomUUID(),
       status: 'pending',
       tokens: [],
+      tokenTransfers: [],
     };
 
     try {
@@ -924,7 +925,12 @@ export class PaymentsModule {
         }
 
         await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
-        result.txHash = 'instant-split-' + Date.now().toString(16);
+        result.tokenTransfers.push({
+          sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
+          method: 'split',
+          splitGroupId: instantResult.splitGroupId,
+          nostrEventId: instantResult.nostrEventId,
+        });
         this.log(`Instant split transfer completed`);
       }
 
@@ -953,11 +959,17 @@ export class PaymentsModule {
 
         // Get request ID as hex string for tracking
         const requestIdBytes = commitment.requestId;
-        result.txHash = requestIdBytes instanceof Uint8Array
+        const requestIdHex = requestIdBytes instanceof Uint8Array
           ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
           : String(requestIdBytes);
 
-        this.log(`Token ${token.id} sent via NOSTR-FIRST, txHash: ${result.txHash}`);
+        result.tokenTransfers.push({
+          sourceTokenId: token.id,
+          method: 'direct',
+          requestIdHex,
+        });
+
+        this.log(`Token ${token.id} sent via NOSTR-FIRST, requestId: ${requestIdHex}`);
 
         // Remove sent token (creates tombstone)
         await this.removeToken(token.id, recipientNametag);
@@ -3638,6 +3650,7 @@ export class PaymentsModule {
         id: crypto.randomUUID(),
         status: 'completed',
         tokens: [finalizedToken],
+        tokenTransfers: [],
       });
 
       // Add to history

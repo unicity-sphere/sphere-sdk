@@ -268,7 +268,7 @@ const result2 = await sphere.payments.send({
 
 // Check result
 if (result.status === 'completed') {
-  console.log('Transfer completed, txHash:', result.txHash);
+  console.log('Transfer completed, details:', result.tokenTransfers);
 } else {
   console.error('Transfer failed:', result.error);
 }

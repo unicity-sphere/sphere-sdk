@@ -170,11 +170,19 @@ interface TransferRequest {
 type AddressMode = 'auto' | 'direct' | 'proxy';
 
 interface TransferResult {
-  readonly id: string;           // Local transfer UUID
-  status: TransferStatus;        // Current status
-  readonly tokens: Token[];      // Tokens involved
-  txHash?: string;               // Aggregator request ID or split marker
-  error?: string;                // Error message if failed
+  readonly id: string;                       // Local transfer UUID
+  status: TransferStatus;                    // Current status
+  readonly tokens: Token[];                  // Tokens involved
+  readonly tokenTransfers: TokenTransferDetail[];  // Per-token transfer details
+  error?: string;                            // Error message if failed
+}
+
+interface TokenTransferDetail {
+  readonly sourceTokenId: string;   // Source token ID consumed
+  readonly method: 'direct' | 'split';  // Transfer method
+  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
+  readonly splitGroupId?: string;   // Split group ID (split)
+  readonly nostrEventId?: string;   // Nostr event ID (split)
 }
 
 type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';

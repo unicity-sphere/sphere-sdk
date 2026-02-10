@@ -379,7 +379,7 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
 
     result.sendTimeMs = performance.now() - sendStart;
     console.log(`    Send completed in ${result.sendTimeMs.toFixed(0)}ms`);
-    console.log(`    Status: ${sendResult.status}, TxHash: ${sendResult.txHash?.slice(0, 16) ?? 'N/A'}...`);
+    console.log(`    Status: ${sendResult.status}, Transfers: ${sendResult.tokenTransfers.length} token(s)`);
 
     // Snapshot sender AFTER send
     await sender.payments.load();

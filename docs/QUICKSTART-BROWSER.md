@@ -277,7 +277,7 @@ async function sendTokens(recipient: string, amount: string) {
       amount,
       coinId: 'UCT',
     });
-    console.log('Sent! TX:', result.txHash);
+    console.log('Sent! Transfers:', result.tokenTransfers);
   } catch (error) {
     console.error('Failed:', error.message);
   }

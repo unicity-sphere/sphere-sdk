@@ -110,11 +110,29 @@ export interface TransferRequest {
   readonly addressMode?: AddressMode;
 }
 
+/**
+ * Per-token transfer detail tracking the on-chain commitment or split operation
+ * for each source token involved in a transfer.
+ */
+export interface TokenTransferDetail {
+  /** Source token ID that was consumed in this transfer */
+  readonly sourceTokenId: string;
+  /** Transfer method used for this token */
+  readonly method: 'direct' | 'split';
+  /** Aggregator commitment request ID hex (for direct transfers) */
+  readonly requestIdHex?: string;
+  /** Split group ID (for split transfers — correlates sender/recipient/change tokens) */
+  readonly splitGroupId?: string;
+  /** Nostr event ID (for split transfers delivered via Nostr) */
+  readonly nostrEventId?: string;
+}
+
 export interface TransferResult {
   readonly id: string;
   status: TransferStatus;
   readonly tokens: Token[];
-  txHash?: string;
+  /** Per-token transfer details — one entry per source token consumed */
+  readonly tokenTransfers: TokenTransferDetail[];
   error?: string;
 }
 
