@@ -587,16 +587,24 @@ export interface ServiceHealthResult {
 }
 
 /**
+ * User-provided health check function for custom services.
+ * Receives the configured timeout and should return a ServiceHealthResult.
+ */
+export type HealthCheckFn = (timeoutMs: number) => Promise<ServiceHealthResult>;
+
+/**
  * Result of checking all network services (pre-init)
  */
 export interface NetworkHealthResult {
   /** Overall health: true if all checked services are reachable */
   healthy: boolean;
-  /** Per-service results */
+  /** Per-service results (built-in + custom) */
   services: {
     relay?: ServiceHealthResult;
     oracle?: ServiceHealthResult;
     l1?: ServiceHealthResult;
+    /** Custom service results keyed by user-provided name */
+    [key: string]: ServiceHealthResult | undefined;
   };
   /** Total time to complete all checks (ms) */
   totalTimeMs: number;

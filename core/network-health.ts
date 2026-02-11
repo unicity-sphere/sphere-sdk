@@ -6,7 +6,7 @@
  */
 
 import { NETWORKS, type NetworkType } from '../constants';
-import type { NetworkHealthResult, ServiceHealthResult } from '../types';
+import type { NetworkHealthResult, ServiceHealthResult, HealthCheckFn } from '../types';
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -17,6 +17,38 @@ export interface CheckNetworkHealthOptions {
   timeoutMs?: number;
   /** Which services to check (default: all) */
   services?: ServiceName[];
+  /** Custom URLs — override defaults from NETWORKS[network] */
+  urls?: {
+    /** Custom Nostr relay WebSocket URL (e.g. 'wss://my-relay.example.com') */
+    relay?: string;
+    /** Custom aggregator HTTP URL (e.g. 'https://my-aggregator.example.com') */
+    oracle?: string;
+    /** Custom Electrum WebSocket URL (e.g. 'wss://my-fulcrum.example.com:50004') */
+    l1?: string;
+  };
+  /**
+   * Custom health checks — run in parallel alongside built-in checks.
+   * Key = service name (e.g. 'mongodb', 'ipfs', 'redis'), value = check function.
+   *
+   * @example
+   * ```typescript
+   * const health = await checkNetworkHealth('testnet', {
+   *   checks: {
+   *     mongodb: async (timeoutMs) => {
+   *       const start = Date.now();
+   *       try {
+   *         await mongoClient.db().command({ ping: 1 });
+   *         return { healthy: true, url: 'mongodb://localhost:27017', responseTimeMs: Date.now() - start };
+   *       } catch (err) {
+   *         return { healthy: false, url: 'mongodb://localhost:27017', responseTimeMs: null, error: err.message };
+   *       }
+   *     },
+   *   },
+   * });
+   * // health.services.mongodb?.healthy
+   * ```
+   */
+  checks?: Record<string, HealthCheckFn>;
 }
 
 /**
@@ -41,6 +73,31 @@ export interface CheckNetworkHealthOptions {
  *
  * // Check only specific services
  * const relayHealth = await checkNetworkHealth('testnet', { services: ['relay'] });
+ *
+ * // Use custom URLs instead of defaults
+ * const custom = await checkNetworkHealth('testnet', {
+ *   urls: {
+ *     relay: 'wss://my-relay.example.com',
+ *     oracle: 'https://my-aggregator.example.com',
+ *     l1: 'wss://my-fulcrum.example.com:50004',
+ *   },
+ * });
+ *
+ * // Add custom health checks for your own providers
+ * const health = await checkNetworkHealth('testnet', {
+ *   checks: {
+ *     mongodb: async (timeoutMs) => {
+ *       const start = Date.now();
+ *       try {
+ *         await mongoClient.db().command({ ping: 1 });
+ *         return { healthy: true, url: 'mongodb://localhost:27017', responseTimeMs: Date.now() - start };
+ *       } catch (err) {
+ *         return { healthy: false, url: 'mongodb://localhost:27017', responseTimeMs: null, error: String(err) };
+ *       }
+ *     },
+ *   },
+ * });
+ * // health.services.mongodb?.healthy === true
  * ```
  */
 export async function checkNetworkHealth(
@@ -50,25 +107,38 @@ export async function checkNetworkHealth(
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const servicesToCheck = options?.services ?? (['relay', 'oracle', 'l1'] as ServiceName[]);
   const networkConfig = NETWORKS[network];
+  const customUrls = options?.urls;
 
   const startTime = Date.now();
 
-  const checks: Promise<[ServiceName, ServiceHealthResult]>[] = [];
+  const allChecks: Promise<[string, ServiceHealthResult]>[] = [];
 
+  // Built-in service checks
   if (servicesToCheck.includes('relay')) {
-    const relayUrl = networkConfig.nostrRelays[0] as string;
-    checks.push(checkWebSocket(relayUrl, timeoutMs).then((r) => ['relay', r]));
+    const relayUrl = customUrls?.relay ?? networkConfig.nostrRelays[0] as string;
+    allChecks.push(checkWebSocket(relayUrl, timeoutMs).then((r) => ['relay', r]));
   }
 
   if (servicesToCheck.includes('oracle')) {
-    checks.push(checkOracle(networkConfig.aggregatorUrl, timeoutMs).then((r) => ['oracle', r]));
+    const oracleUrl = customUrls?.oracle ?? networkConfig.aggregatorUrl;
+    allChecks.push(checkOracle(oracleUrl, timeoutMs).then((r) => ['oracle', r]));
   }
 
   if (servicesToCheck.includes('l1')) {
-    checks.push(checkWebSocket(networkConfig.electrumUrl, timeoutMs).then((r) => ['l1', r]));
+    const l1Url = customUrls?.l1 ?? networkConfig.electrumUrl;
+    allChecks.push(checkWebSocket(l1Url, timeoutMs).then((r) => ['l1', r]));
   }
 
-  const results = await Promise.allSettled(checks);
+  // Custom checks — run in parallel with built-in ones
+  if (options?.checks) {
+    for (const [name, checkFn] of Object.entries(options.checks)) {
+      allChecks.push(
+        runCustomCheck(name, checkFn, timeoutMs).then((r) => [name, r]),
+      );
+    }
+  }
+
+  const results = await Promise.allSettled(allChecks);
 
   const services: NetworkHealthResult['services'] = {};
   let allHealthy = true;
@@ -217,6 +287,40 @@ async function checkOracle(url: string, timeoutMs: number): Promise<ServiceHealt
       error: err instanceof Error
         ? (err.name === 'AbortError' ? `Connection timeout after ${timeoutMs}ms` : err.message)
         : String(err),
+    };
+  }
+}
+
+/**
+ * Run a user-provided custom health check with timeout protection.
+ */
+async function runCustomCheck(
+  name: string,
+  checkFn: HealthCheckFn,
+  timeoutMs: number,
+): Promise<ServiceHealthResult> {
+  try {
+    const result = await Promise.race([
+      checkFn(timeoutMs),
+      new Promise<ServiceHealthResult>((resolve) =>
+        setTimeout(
+          () => resolve({
+            healthy: false,
+            url: name,
+            responseTimeMs: null,
+            error: `Custom check '${name}' timeout after ${timeoutMs}ms`,
+          }),
+          timeoutMs,
+        ),
+      ),
+    ]);
+    return result;
+  } catch (err) {
+    return {
+      healthy: false,
+      url: name,
+      responseTimeMs: null,
+      error: err instanceof Error ? err.message : String(err),
     };
   }
 }

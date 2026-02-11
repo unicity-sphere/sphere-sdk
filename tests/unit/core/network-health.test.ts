@@ -364,6 +364,94 @@ describe('checkNetworkHealth', () => {
       expect(result.services.oracle!.error).toBe('string error');
     });
 
+    it('should use custom oracle URL from urls option', async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), { status: 200 }),
+      );
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['oracle'],
+        urls: { oracle: 'https://my-custom-aggregator.example.com' },
+      });
+
+      expect(result.services.oracle!.healthy).toBe(true);
+      const calledUrl = fetchSpy.mock.calls[0][0] as string;
+      expect(calledUrl).toBe('https://my-custom-aggregator.example.com');
+    });
+
+    it('should use custom relay URL from urls option', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        url: string;
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor(url: string) {
+          this.url = url;
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['relay'],
+        urls: { relay: 'wss://my-custom-relay.example.com' },
+      });
+
+      expect(result.services.relay!.healthy).toBe(true);
+      expect(result.services.relay!.url).toBe('wss://my-custom-relay.example.com');
+    });
+
+    it('should use custom l1 URL from urls option', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        url: string;
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor(url: string) {
+          this.url = url;
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['l1'],
+        urls: { l1: 'wss://my-custom-fulcrum.example.com:50004' },
+      });
+
+      expect(result.services.l1!.healthy).toBe(true);
+      expect(result.services.l1!.url).toBe('wss://my-custom-fulcrum.example.com:50004');
+    });
+
+    it('should mix custom and default URLs', async () => {
+      // Custom oracle, default relay
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), { status: 200 }),
+      );
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['relay', 'oracle'],
+        urls: { oracle: 'https://custom-oracle.example.com' },
+      });
+
+      // Oracle uses custom URL
+      const calledUrl = fetchSpy.mock.calls[0][0] as string;
+      expect(calledUrl).toBe('https://custom-oracle.example.com');
+
+      // Relay uses default testnet URL
+      expect(result.services.relay!.url).toContain('nostr-relay.testnet.unicity.network');
+    });
+
     it('should show close code when reason is empty', async () => {
       (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
         onopen: (() => void) | null = null;
@@ -381,6 +469,128 @@ describe('checkNetworkHealth', () => {
 
       expect(result.services.relay!.healthy).toBe(false);
       expect(result.services.relay!.error).toContain('code 1006');
+    });
+  });
+
+  describe('custom checks', () => {
+    it('should run custom check function and include result', async () => {
+      const result = await checkNetworkHealth('testnet', {
+        services: [],  // skip built-in checks
+        checks: {
+          mongodb: async (_timeoutMs) => ({
+            healthy: true,
+            url: 'mongodb://localhost:27017',
+            responseTimeMs: 5,
+          }),
+        },
+      });
+
+      expect(result.services.mongodb).toBeDefined();
+      expect(result.services.mongodb!.healthy).toBe(true);
+      expect(result.services.mongodb!.url).toBe('mongodb://localhost:27017');
+      expect(result.services.mongodb!.responseTimeMs).toBe(5);
+      expect(result.healthy).toBe(true);
+    });
+
+    it('should report unhealthy when custom check fails', async () => {
+      const result = await checkNetworkHealth('testnet', {
+        services: [],
+        checks: {
+          redis: async () => ({
+            healthy: false,
+            url: 'redis://localhost:6379',
+            responseTimeMs: null,
+            error: 'ECONNREFUSED',
+          }),
+        },
+      });
+
+      expect(result.services.redis!.healthy).toBe(false);
+      expect(result.services.redis!.error).toBe('ECONNREFUSED');
+      expect(result.healthy).toBe(false);
+    });
+
+    it('should catch exceptions thrown by custom check', async () => {
+      const result = await checkNetworkHealth('testnet', {
+        services: [],
+        checks: {
+          broken: async () => {
+            throw new Error('connection pool exhausted');
+          },
+        },
+      });
+
+      expect(result.services.broken!.healthy).toBe(false);
+      expect(result.services.broken!.error).toBe('connection pool exhausted');
+    });
+
+    it('should timeout custom check that hangs', async () => {
+      const result = await checkNetworkHealth('testnet', {
+        services: [],
+        timeoutMs: 50,
+        checks: {
+          slow: async () => {
+            await new Promise((r) => setTimeout(r, 5000));
+            return { healthy: true, url: 'slow://service', responseTimeMs: 5000 };
+          },
+        },
+      });
+
+      expect(result.services.slow!.healthy).toBe(false);
+      expect(result.services.slow!.error).toContain('timeout');
+    });
+
+    it('should run custom checks in parallel with built-in', async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), { status: 200 }),
+      );
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['oracle'],
+        checks: {
+          ipfs: async () => ({
+            healthy: true,
+            url: 'https://ipfs.example.com',
+            responseTimeMs: 10,
+          }),
+        },
+      });
+
+      // Both built-in and custom present
+      expect(result.services.oracle).toBeDefined();
+      expect(result.services.oracle!.healthy).toBe(true);
+      expect(result.services.ipfs).toBeDefined();
+      expect(result.services.ipfs!.healthy).toBe(true);
+      expect(result.healthy).toBe(true);
+    });
+
+    it('should handle multiple custom checks', async () => {
+      const result = await checkNetworkHealth('testnet', {
+        services: [],
+        checks: {
+          mongodb: async () => ({
+            healthy: true,
+            url: 'mongodb://localhost:27017',
+            responseTimeMs: 3,
+          }),
+          redis: async () => ({
+            healthy: true,
+            url: 'redis://localhost:6379',
+            responseTimeMs: 1,
+          }),
+          ipfs: async () => ({
+            healthy: false,
+            url: 'https://ipfs.example.com',
+            responseTimeMs: null,
+            error: 'gateway down',
+          }),
+        },
+      });
+
+      expect(result.services.mongodb!.healthy).toBe(true);
+      expect(result.services.redis!.healthy).toBe(true);
+      expect(result.services.ipfs!.healthy).toBe(false);
+      expect(result.healthy).toBe(false); // one is down
     });
   });
 
