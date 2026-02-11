@@ -55,66 +55,38 @@ For fine-grained control, create providers manually:
 ### Browser Environment
 
 ```typescript
-import {
-  Sphere,
-  createLocalStorageProvider,
-  createNostrTransportProvider,
-  createUnicityAggregatorProvider,
-  createIpfsStorageProvider,
-} from '@unicitylabs/sphere-sdk';
+import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+import { Sphere } from '@unicitylabs/sphere-sdk';
 
-// Create providers
-const storage = createLocalStorageProvider({
-  prefix: 'sphere_',  // localStorage key prefix
-  debug: false,
+const providers = createBrowserProviders({
+  network: 'testnet',
+  // L1 is enabled by default with lazy Fulcrum connection
+  // Set l1: undefined (default) to use network defaults
+  // Set l1: null in Sphere.init() to explicitly disable L1
 });
 
-const transport = createNostrTransportProvider({
-  relays: ['wss://relay.unicity.network'],
-  debug: false,
-});
-
-const oracle = createUnicityAggregatorProvider({
-  aggregatorUrl: 'https://aggregator.unicity.network',
-  stateTransitionUrl: 'https://state.unicity.network',
-});
-
-const ipfsStorage = createIpfsStorageProvider({
-  gateways: ['https://ipfs.unicity.network'],
-  bootstrapPeers: [
-    '/dns4/unicity-ipfs2.dyndns.org/tcp/4001/p2p/12D3KooWLNi5NDPPHbrfJakAQqwBqymYTTwMQXQKEWuCrJNDdmfh',
-  ],
-});
-
-// Initialize Sphere
-const sphere = new Sphere();
-
-await sphere.initialize({
-  storage,
-  transport,
-  oracle,
-  ipfsStorage,  // optional
+// Initialize (auto-creates wallet if needed)
+const { sphere, created, generatedMnemonic } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
 });
 ```
 
 ### Node.js Environment
 
-For Node.js, implement custom providers or use provided interfaces:
-
 ```typescript
-import { Sphere, StorageProvider } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+import { Sphere } from '@unicitylabs/sphere-sdk';
 
-// Custom file-based storage
-class FileStorageProvider implements StorageProvider {
-  async get(key: string): Promise<string | null> { /* ... */ }
-  async set(key: string, value: string): Promise<void> { /* ... */ }
-  // ... other methods
-}
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens',
+});
 
-const sphere = new Sphere();
-await sphere.initialize({
-  storage: new FileStorageProvider(),
-  // ... other providers
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
 });
 ```
 
@@ -125,32 +97,31 @@ await sphere.initialize({
 ### Check if Wallet Exists
 
 ```typescript
-const exists = await sphere.wallet.exists();
+const exists = await Sphere.exists(providers.storage);
 ```
 
-### Create New Wallet
+### Create or Load Wallet (Recommended)
 
 ```typescript
-// Generate new mnemonic
-const mnemonic = await sphere.wallet.create('password123');
-console.log('Backup these words:', mnemonic);
+// Sphere.init() handles both creation and loading automatically
+const { sphere, created, generatedMnemonic } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,  // Generate mnemonic if wallet doesn't exist
+  nametag: 'alice',    // Optional: register nametag
+});
 
-// Or create with existing mnemonic
-await sphere.wallet.import(
-  'abandon abandon abandon ...',
-  'password123'
-);
-```
-
-### Load Existing Wallet
-
-```typescript
-try {
-  await sphere.wallet.load('password123');
-  console.log('Wallet loaded:', sphere.identity.l1Address);
-} catch (error) {
-  console.error('Wrong password or wallet not found');
+if (created && generatedMnemonic) {
+  console.log('Backup these words:', generatedMnemonic);
 }
+```
+
+### Import from Mnemonic
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'abandon abandon abandon ...',
+});
 ```
 
 ### Get Identity
@@ -167,7 +138,7 @@ console.log('Nametag:', identity.nametag);            // e.g., 'alice'
 ### Clear Wallet
 
 ```typescript
-await sphere.wallet.clear();
+await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
 ```
 
 ### Multi-Address Derivation
@@ -468,6 +439,8 @@ sphere.payments.clearCompletedOutgoingPaymentRequests();
 ## L1 Payments
 
 L1 module handles ALPHA blockchain transactions with vesting classification support.
+L1 is **enabled by default** — the Fulcrum WebSocket connection is lazy (deferred until first L1 operation).
+To explicitly disable L1, pass `l1: null` in the `PaymentsModuleConfig`.
 
 ### Get L1 Balance
 
@@ -546,14 +519,14 @@ const l1Module = createL1PaymentsModule({
 ### Send Direct Message
 
 ```typescript
-const message = await sphere.comms.sendDM('@bob', 'Hello!');
+const message = await sphere.communications.sendDM('@bob', 'Hello!');
 console.log('Message ID:', message.id);
 ```
 
 ### Get Conversations
 
 ```typescript
-const conversations = sphere.comms.getConversations();
+const conversations = sphere.communications.getConversations();
 
 for (const [peer, messages] of conversations) {
   console.log(`Conversation with ${peer}: ${messages.length} messages`);
@@ -564,13 +537,13 @@ for (const [peer, messages] of conversations) {
 
 ```typescript
 // Direct messages
-sphere.comms.onDirectMessage((message) => {
+sphere.communications.onDirectMessage((message) => {
   console.log(`${message.senderNametag}: ${message.content}`);
 });
 
 // Broadcasts
-sphere.comms.subscribeToBroadcasts(['news', 'updates']);
-sphere.comms.onBroadcast((broadcast) => {
+sphere.communications.subscribeToBroadcasts(['news', 'updates']);
+sphere.communications.onBroadcast((broadcast) => {
   console.log(`[${broadcast.tags}] ${broadcast.content}`);
 });
 ```
@@ -578,7 +551,7 @@ sphere.comms.onBroadcast((broadcast) => {
 ### Publish Broadcast
 
 ```typescript
-await sphere.comms.broadcast('Hello world!', ['general']);
+await sphere.communications.broadcast('Hello world!', ['general']);
 ```
 
 ---
@@ -872,20 +845,17 @@ if (!validation.valid) {
 
 ```typescript
 async function initApp() {
-  await sphere.initialize(providers);
+  const providers = createBrowserProviders({ network: 'testnet' });
 
-  if (!await sphere.wallet.exists()) {
-    // Show create/import wallet UI
-    return;
-  }
+  // Sphere.init() handles both creation and loading
+  const { sphere, created, generatedMnemonic } = await Sphere.init({
+    ...providers,
+    autoGenerate: true,
+  });
 
-  // Show password prompt
-  const password = await promptPassword();
-
-  try {
-    await sphere.wallet.load(password);
-  } catch {
-    // Show error, retry
+  if (created && generatedMnemonic) {
+    // Show mnemonic backup UI
+    console.log('Save your mnemonic:', generatedMnemonic);
   }
 }
 ```
@@ -893,12 +863,11 @@ async function initApp() {
 ### 2. Subscribe to Events Early
 
 ```typescript
-// Set up listeners before loading wallet
+// Sphere.init() returns an initialized sphere — subscribe to events right after
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+
 sphere.on('transfer:incoming', handleIncomingTransfer);
 sphere.on('message:dm', handleMessage);
-
-// Then load wallet
-await sphere.wallet.load(password);
 ```
 
 ### 3. Graceful Shutdown
@@ -957,6 +926,7 @@ npm test -- --coverage
 | `l1/crypto` | 22 | Wallet encryption, WIF conversion |
 | `l1/addressHelpers` | 36 | Address management utilities |
 | `l1/vesting` | 16 | Vesting classification |
+| `l1/L1PaymentsHistory` | 12 | L1 transaction history direction/amounts |
 | `serialization/txf` | 44 | TXF token format |
 | `serialization/wallet-text` | 32 | Text wallet backup format |
 | `serialization/wallet-dat` | 18 | SQLite wallet.dat parsing |
@@ -969,7 +939,7 @@ npm test -- --coverage
 | `integration/wallet-import-export` | 20 | Wallet import/export |
 | `integration/nametag-roundtrip` | 9 | Nametag serialization |
 | `impl/shared/resolvers` | 41 | Config resolution utilities |
-| **Total** | **825+** | All passing |
+| **Total** | **882** | All passing (34 test files) |
 
 ### Writing Tests
 
@@ -991,6 +961,7 @@ tests/
 │   │   ├── addressHelpers.test.ts
 │   │   ├── addressToScriptHash.test.ts
 │   │   ├── crypto.test.ts
+│   │   ├── L1PaymentsHistory.test.ts
 │   │   ├── tx.test.ts
 │   │   └── vesting.test.ts
 │   ├── modules/

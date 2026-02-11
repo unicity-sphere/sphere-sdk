@@ -95,7 +95,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 - **L1 (ALPHA blockchain)** - UTXO-based blockchain transactions via Electrum
 - **L3 (Unicity state transition network)** - Token transfers with state proofs via Aggregator
 
-**Version:** 0.1.2-beta.1
+**Version:** 0.2.2
 **License:** MIT
 **Target:** Node.js >= 18.0.0, Browser (ESM/CJS)
 
@@ -304,26 +304,42 @@ TxfStorageDataBase {
 }
 ```
 
-## Recent Changes (feature/nametag-enhancements)
+## Recent Changes
 
-1. **Identity field renaming** (consistent naming):
+### v0.2.2 (current)
+
+1. **L1 payments enabled by default**: `PaymentsModule` creates `L1PaymentsModule` automatically.
+   - Set `l1: null` in config to explicitly disable L1
+   - Fulcrum WebSocket connection is **lazy** — deferred until first L1 operation
+   - `importFromJSON()` and `importFromLegacyFile()` now accept `l1` config option
+
+2. **IndexedDB deadlock fix**: `tokenStorage.clear()` has timeout protection (2s) to prevent
+   deadlock on repeated calls. `indexedDB.databases()` also has a 1.5s timeout.
+
+3. **L1 transaction history fix**: Correctly resolves send/receive direction by looking up
+   previous transaction outputs instead of comparing txids to addresses.
+
+4. **Payment request fix**: `senderNametag` now correctly populated on incoming payment requests.
+   `recipientNametag` semantics clarified (where tokens should be sent, not who should pay).
+
+### Earlier changes
+
+5. **Identity field renaming** (consistent naming):
    - `publicKey` → `chainPubkey`
    - `address` → `l1Address`
    - `predicateAddress` → `directAddress`
 
-2. **Nametag recovery**: Automatic recovery from Nostr on wallet import
+6. **Nametag recovery**: Automatic recovery from Nostr on wallet import
 
-3. **DirectAddress for L3**: Using DirectAddress instead of ProxyAddress
+7. **DirectAddress for L3**: Using DirectAddress instead of ProxyAddress
 
-4. **New events**:
+8. **Events**:
    - `nametag:recovered` - Emitted when nametag found on Nostr during import
    - `identity:changed` - Updated with new field names
    - `address:activated` - Emitted when new address first tracked
    - `address:hidden` / `address:unhidden` - Address visibility changes
 
-5. **TypeScript 5.6 compatibility**: Web Crypto API ArrayBuffer types fixed
-
-6. **PriceProvider** (optional): CoinGecko integration for token fiat prices
+9. **PriceProvider** (optional): CoinGecko integration for token fiat prices
    - `getBalance()` returns total USD value (`number | null`)
    - `getAssets()` returns assets enriched with `priceUsd`, `fiatValueUsd`, `change24h`
    - `baseUrl` config for CORS proxy in browser environments
@@ -333,7 +349,7 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 840+
+**Total tests:** 882 (34 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
@@ -342,6 +358,7 @@ Key test files:
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
+- `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
 - `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
 
 ## Dependencies

@@ -152,7 +152,7 @@ const providers = createBrowserProviders({
   oracle: { url: 'https://custom-aggregator.example.com' }, // custom oracle
 });
 
-// Enable L1 with network defaults
+// L1 is enabled by default — customize if needed
 const providers = createBrowserProviders({
   network: 'testnet',
   l1: { enableVesting: true },  // uses testnet electrum URL automatically
@@ -332,16 +332,19 @@ sphere.payments.onPaymentRequest((request) => {
 Access L1 payments through `sphere.payments.l1`:
 
 ```typescript
-// L1 configuration is optional (has defaults)
+// L1 is enabled by default with lazy Fulcrum connection.
+// Connection to Fulcrum is deferred until first L1 operation.
 const { sphere } = await Sphere.init({
   ...providers,
   autoGenerate: true,
-  l1: {
-    electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
-    defaultFeeRate: 10,  // sat/byte, default
-    enableVesting: true, // default
-  },
+  // L1 config is optional — defaults are applied automatically:
+  // electrumUrl: network-specific (mainnet: fulcrum.alpha.unicity.network)
+  // defaultFeeRate: 10 sat/byte
+  // enableVesting: true
 });
+
+// To explicitly disable L1:
+// const { sphere } = await Sphere.init({ ...providers, l1: null });
 
 // Get L1 balance
 const balance = await sphere.payments.l1.getBalance();
