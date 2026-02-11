@@ -30,6 +30,7 @@ export type {
 import { createLocalStorageProvider, type LocalStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
+import { createBrowserIpfsStorageProvider } from './ipfs';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
@@ -185,6 +186,8 @@ export interface BrowserProviders {
   l1?: L1Config;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
+  /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
+  ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /**
    * Token sync configuration (resolved from tokenSync options)
    * For advanced use cases when additional sync backends are needed
@@ -353,6 +356,15 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
 
   const storage = createLocalStorageProvider(config?.storage);
 
+  // Create IPFS storage provider if enabled
+  const ipfsConfig = tokenSyncConfig?.ipfs;
+  const ipfsTokenStorage = ipfsConfig?.enabled
+    ? createBrowserIpfsStorageProvider({
+        gateways: ipfsConfig.gateways,
+        debug: config?.tokenSync?.ipfs?.useDht, // reuse debug-like flag
+      })
+    : undefined;
+
   return {
     storage,
     transport: createNostrTransportProvider({
@@ -375,6 +387,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
     tokenStorage: createIndexedDBTokenStorageProvider(),
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
+    ipfsTokenStorage,
     tokenSyncConfig,
   };
 }

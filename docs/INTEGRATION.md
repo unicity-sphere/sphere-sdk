@@ -362,6 +362,36 @@ const { valid, invalid } = await sphere.payments.validate();
 console.log(`Valid: ${valid.length}, Invalid: ${invalid.length}`);
 ```
 
+### IPFS Sync Configuration
+
+Enable decentralized IPFS/IPNS token backup (works on both browser and Node.js):
+
+```typescript
+// Enable at initialization
+const providers = createBrowserProviders({
+  network: 'testnet',
+  tokenSync: {
+    ipfs: { enabled: true },
+  },
+});
+```
+
+Add IPFS sync at runtime:
+
+```typescript
+import { createBrowserIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
+// For Node.js: import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs/ipfs';
+
+const ipfsProvider = createBrowserIpfsStorageProvider({ debug: true });
+await sphere.addTokenStorageProvider(ipfsProvider);
+
+// Sync merges local and remote token data
+const result = await sphere.payments.sync();
+console.log(`Added: ${result.added}, Removed: ${result.removed}`);
+```
+
+See [IPFS Storage Guide](./IPFS-STORAGE.md) for full configuration, caching, merge rules, and troubleshooting.
+
 ### Transaction History
 
 ```typescript

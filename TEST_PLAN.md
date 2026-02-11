@@ -22,7 +22,14 @@ Comprehensive test plan covering all SDK modules. Tests use **Vitest** with mock
 | `serialization/wallet-text` | 32 | ✅ Done |
 | `serialization/wallet-dat` | 18 | ✅ Done |
 | `modules/TokenSplitCalculator` | 23 | ✅ Done |
-| **Total** | **392** | **✅ Passing** |
+| `impl/shared/ipfs/ipfs-cache` | 59 | ✅ Done |
+| `impl/shared/ipfs/ipfs-error-types` | 18 | ✅ Done |
+| `impl/shared/ipfs/ipfs-http-client` | 18 | ✅ Done |
+| `impl/shared/ipfs/ipfs-storage-provider` | 28 | ✅ Done |
+| `impl/browser/ipfs/browser-ipfs-state-persistence` | 7 | ✅ Done |
+| `impl/nodejs/ipfs/nodejs-ipfs-state-persistence` | 7 | ✅ Done |
+| `e2e/ipfs-sync` | 6 | ✅ Done |
+| **Total** | **535** | **✅ Passing** |
 
 ### Not Yet Covered (Requires Mocking)
 
@@ -263,6 +270,61 @@ parse txt file → import → verify addresses match
 
 ---
 
+## 8. IPFS Storage Provider (`impl/shared/ipfs/`)
+
+### 8.1 `ipfs-cache.ts` - Multi-Tier Cache (59 tests)
+| Feature | Test Cases |
+|---------|------------|
+| IPNS record cache | TTL expiry, get/set, invalidation |
+| Content cache | Immutable CID cache, get/set |
+| Circuit breaker | Failure tracking, threshold, cooldown, reset on success |
+| Known-fresh | Fresh window timing, mark/check, expiry |
+| Cache management | Clear all, independent layer isolation |
+
+### 8.2 `ipfs-error-types.ts` - Error Classification (18 tests)
+| Feature | Test Cases |
+|---------|------------|
+| `IpfsError` | Category assignment, gateway tracking, circuit breaker flag |
+| `classifyFetchError()` | AbortError→TIMEOUT, TypeError→NETWORK, generic errors |
+| `classifyHttpStatus()` | 404→NOT_FOUND, 500 routing→NOT_FOUND, 5xx→GATEWAY |
+
+### 8.3 `ipfs-http-client.ts` - HTTP Operations (18 tests)
+| Feature | Test Cases |
+|---------|------------|
+| `upload()` | JSON upload, parallel gateways, all-fail handling |
+| `fetchContent()` | CID fetch, cache hit, content caching |
+| `resolveIpns()` | Progressive resolution, highest sequence, no results |
+| `publishIpns()` | Multi-gateway publish, partial success |
+| `testConnectivity()` | Gateway health, timeout, errors |
+
+### 8.4 `ipfs-storage-provider.ts` - Provider Lifecycle (28 tests)
+| Feature | Test Cases |
+|---------|------------|
+| Initialization | Identity derivation, state persistence load |
+| Save | Upload + IPNS publish, version increment, chain validation |
+| Load | Known-fresh, IPNS cache, network resolution, stale fallback |
+| Sync | Remote merge, initial upload, same-version skip |
+| Version conflicts | Concurrent device protection, lastCid chaining |
+| Events | Storage and sync event emission |
+
+### 8.5 `browser-ipfs-state-persistence.ts` - Browser Persistence (7 tests)
+| Feature | Test Cases |
+|---------|------------|
+| localStorage | Save/load/clear, missing key handling, JSON round-trip |
+
+### 8.6 `nodejs-ipfs-state-persistence.ts` - Node.js Persistence (7 tests)
+| Feature | Test Cases |
+|---------|------------|
+| File-based | Save/load/clear via StorageProvider, missing key handling |
+
+### 8.7 E2E `ipfs-sync.test.ts` - Live Network (6 tests)
+| Feature | Test Cases |
+|---------|------------|
+| End-to-end | Save→load round-trip, sync merge, recovery after wipe |
+| Identity | Deterministic IPNS name derivation, cross-session persistence |
+
+---
+
 ## Test Infrastructure
 
 ### Setup
@@ -305,8 +367,20 @@ tests/
 │   ├── serialization/
 │   │   ├── txf-serializer.test.ts
 │   │   └── wallet-text.test.ts
-│   └── validation/
-│       └── token-validator.test.ts
+│   ├── validation/
+│   │   └── token-validator.test.ts
+│   └── impl/
+│       ├── shared/ipfs/
+│       │   ├── ipfs-cache.test.ts
+│       │   ├── ipfs-error-types.test.ts
+│       │   ├── ipfs-http-client.test.ts
+│       │   └── ipfs-storage-provider.test.ts
+│       ├── browser/ipfs/
+│       │   └── browser-ipfs-state-persistence.test.ts
+│       └── nodejs/ipfs/
+│           └── nodejs-ipfs-state-persistence.test.ts
+├── e2e/
+│   └── ipfs-sync.test.ts
 ├── integration/
 │   ├── sphere.test.ts
 │   └── wallet-flow.test.ts

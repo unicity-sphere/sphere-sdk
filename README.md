@@ -9,7 +9,7 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 - **L3 Payments** - Token transfers with state transition proofs
 - **Payment Requests** - Request payments with async response tracking
 - **Nostr Transport** - P2P messaging with NIP-04 encryption
-- **IPFS Storage** - Decentralized token backup with Helia
+- **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
 - **Token Splitting** - Partial transfer amount calculations
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
 - **TXF Serialization** - Token eXchange Format for storage and transfer
@@ -28,8 +28,8 @@ Choose your platform:
 
 | Platform | Guide | Required | Optional |
 |----------|-------|----------|----------|
-| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | `helia` (IPFS sync) |
-| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | - |
+| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IPFS sync (built-in) |
+| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | IPFS sync (built-in) |
 | **CLI** | See below | SDK + `tsx` | - |
 
 ## CLI (Command Line Interface)
@@ -735,7 +735,7 @@ The SDK includes browser-ready provider implementations:
 | `LocalStorageProvider` | Browser localStorage with SSR fallback |
 | `NostrTransportProvider` | Nostr relay messaging with NIP-04 |
 | `UnicityAggregatorProvider` | Unicity aggregator for state proofs |
-| `IpfsStorageProvider` | Helia-based IPFS with HTTP fallback |
+| `IpfsStorageProvider` | HTTP-based IPFS/IPNS storage (cross-platform) |
 
 ## Node.js Providers
 
@@ -884,20 +884,31 @@ The SDK supports multiple token sync backends that can be enabled independently:
 
 | Backend | Status | Description |
 |---------|--------|-------------|
-| `ipfs` | ✅ Ready | Decentralized IPFS/IPNS with Helia browser DHT |
+| `ipfs` | ✅ Ready | HTTP-based IPFS/IPNS storage (browser + Node.js) |
 | `mongodb` | 🚧 Planned | MongoDB for centralized token storage |
 | `file` | 🚧 Planned | Local file system (Node.js) |
 | `cloud` | 🚧 Planned | Cloud storage (AWS S3, GCP, Azure) |
 
 ```typescript
-// Enable IPFS sync with custom gateways
+// Browser: enable IPFS sync
 const providers = createBrowserProviders({
   network: 'testnet',
   tokenSync: {
     ipfs: {
       enabled: true,
       additionalGateways: ['https://my-gateway.com'],
-      useDht: true,  // Enable browser DHT (Helia)
+    },
+  },
+});
+
+// Node.js: enable IPFS sync
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  tokenSync: {
+    ipfs: {
+      enabled: true,
     },
   },
 });
@@ -986,12 +997,12 @@ const { sphere } = await Sphere.init({
 After `Sphere.init()` is called, you can add/remove token storage providers dynamically:
 
 ```typescript
-import { createIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
+import { createBrowserIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
+// For Node.js: import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs/ipfs';
 
 // Add a new provider at runtime (e.g., user enables IPFS sync in settings)
-const ipfsProvider = createIpfsStorageProvider({
-  gateways: ['https://ipfs.io'],
-  useDht: true,
+const ipfsProvider = createBrowserIpfsStorageProvider({
+  gateways: ['https://my-ipfs-node.com'],
 });
 
 await sphere.addTokenStorageProvider(ipfsProvider);
@@ -1234,6 +1245,10 @@ await sphere.registerNametag('bob');
 const aliceTag = sphere.getNametagForAddress(0);  // 'alice'
 const bobTag = sphere.getNametagForAddress(1);    // 'bob'
 ```
+
+---
+
+See [IPFS Storage Guide](docs/IPFS-STORAGE.md) for complete IPFS/IPNS documentation including configuration, caching, merge rules, and troubleshooting.
 
 ---
 

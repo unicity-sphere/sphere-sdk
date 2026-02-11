@@ -124,7 +124,7 @@ await sphere.destroy();
 | Oracle (Aggregator) | Included with API key | Included with API key |
 | L1 (ALPHA blockchain) | Enabled, lazy Fulcrum connect | Enabled, lazy Fulcrum connect |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
-| IPFS sync | Optional (`helia`) | Not available |
+| IPFS sync | Built-in (HTTP) | Built-in (HTTP) |
 
 ### Key API Methods Reference
 
@@ -220,9 +220,10 @@ sphere-sdk/
 │   └── index.ts                   # Barrel exports + factory
 │
 ├── impl/                    # Platform-specific implementations
-│   ├── browser/            # LocalStorage, IndexedDB, IPFS
-│   ├── nodejs/             # FileStorage, FileTokenStorage
-│   └── shared/             # Common config and resolvers
+│   ├── browser/            # LocalStorage, IndexedDB, browser IPFS factory
+│   ├── nodejs/             # FileStorage, FileTokenStorage, Node.js IPFS factory
+│   └── shared/             # Common config, resolvers, and IPFS provider
+│       └── ipfs/           # Cross-platform IPFS/IPNS storage (HTTP-based)
 │
 ├── l1/                      # ALPHA blockchain utilities
 │   ├── address.ts          # Address generation
@@ -436,9 +437,10 @@ Key test files:
 - `bip39` - Mnemonic generation
 - `elliptic` - secp256k1 operations
 
-**Optional (IPFS):**
-- `helia` - IPFS node for browser
-- `@helia/json`, `@helia/ipns` - IPFS extensions
+**IPFS (built-in):**
+- `@libp2p/crypto` - Ed25519 key generation for IPNS
+- `@libp2p/peer-id` - PeerId derivation for IPNS names
+- `ipns` - IPNS record creation and marshalling
 
 ## File Size Reference
 

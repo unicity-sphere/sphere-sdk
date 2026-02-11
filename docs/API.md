@@ -1403,7 +1403,8 @@ if (plan) {
 ```typescript
 // Storage
 createLocalStorageProvider(config?: LocalStorageProviderConfig): LocalStorageProvider
-createIpfsStorageProvider(config?: IpfsStorageProviderConfig): IpfsStorageProvider
+createBrowserIpfsStorageProvider(config?: IpfsStorageConfig): IpfsStorageProvider  // Browser
+createNodeIpfsStorageProvider(config?: IpfsStorageConfig, storage?: StorageProvider): IpfsStorageProvider  // Node.js
 
 // Transport
 createNostrTransportProvider(config?: NostrTransportProviderConfig): NostrTransportProvider
@@ -1812,3 +1813,255 @@ CoinGecko's free API does not include CORS headers, so browser requests will be 
 2. **Production**: Use a reverse proxy (Nginx, Cloudflare Worker, etc.) or the CoinGecko Pro API which supports CORS natively.
 
 3. **Node.js**: No proxy needed — server-side requests are not subject to CORS.
+
+---
+
+## IpfsStorageProvider
+
+HTTP-based IPFS/IPNS storage provider that implements `TokenStorageProvider`. Works on both browser and Node.js using native `fetch`. Provides decentralized token backup with automatic conflict resolution.
+
+**Source:** `impl/shared/ipfs/ipfs-storage-provider.ts`
+
+### Configuration
+
+```typescript
+interface IpfsStorageConfig {
+  gateways?: string[];              // Gateway URLs (default: Unicity IPFS nodes)
+  fetchTimeoutMs?: number;          // Content fetch timeout (default: 15000)
+  resolveTimeoutMs?: number;        // IPNS resolution timeout (default: 10000)
+  publishTimeoutMs?: number;        // IPNS publish timeout (default: 30000)
+  connectivityTimeoutMs?: number;   // Gateway health check timeout (default: 5000)
+  ipnsLifetimeMs?: number;          // IPNS record lifetime (default: 99 years)
+  ipnsCacheTtlMs?: number;          // IPNS cache TTL (default: 60000)
+  circuitBreakerThreshold?: number; // Failures before cooldown (default: 3)
+  circuitBreakerCooldownMs?: number;// Cooldown duration (default: 60000)
+  knownFreshWindowMs?: number;      // Known-fresh window (default: 30000)
+  debug?: boolean;                  // Enable debug logging (default: false)
+}
+```
+
+### Factory Functions
+
+#### `createBrowserIpfsStorageProvider(config?)`
+
+Creates a browser IPFS storage provider with `localStorage`-based state persistence.
+
+```typescript
+import { createBrowserIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
+
+const provider = createBrowserIpfsStorageProvider({ debug: true });
+```
+
+**Parameters:**
+- `config?` — `IpfsStorageConfig` (all fields optional)
+
+**Returns:** `IpfsStorageProvider`
+
+#### `createNodeIpfsStorageProvider(config?, storageProvider?)`
+
+Creates a Node.js IPFS storage provider with file-based state persistence.
+
+```typescript
+import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs/ipfs';
+import { FileStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const storage = new FileStorageProvider('./wallet-data');
+const provider = createNodeIpfsStorageProvider({ debug: true }, storage);
+```
+
+**Parameters:**
+- `config?` — `IpfsStorageConfig` (all fields optional)
+- `storageProvider?` — `StorageProvider` for persisting IPNS state between sessions
+
+**Returns:** `IpfsStorageProvider`
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | `'ipfs'` | Provider identifier |
+| `name` | `'IPFS Storage'` | Display name |
+| `type` | `'p2p'` | Provider type |
+
+### Methods
+
+#### `setIdentity(identity: FullIdentity): void`
+
+Set the wallet identity. Must be called before `initialize()`.
+
+#### `initialize(): Promise<boolean>`
+
+Initialize the provider: derive IPNS key pair, load persisted state, test gateway connectivity. Returns `true` on success, `false` on failure.
+
+#### `shutdown(): Promise<void>`
+
+Clear caches and disconnect.
+
+#### `connect(): Promise<void>` / `disconnect(): Promise<void>`
+
+Aliases for `initialize()` / `shutdown()`.
+
+#### `isConnected(): boolean`
+
+Returns `true` if status is `'connected'`.
+
+#### `getStatus(): ProviderStatus`
+
+Returns `'disconnected'` | `'connecting'` | `'connected'` | `'error'`.
+
+#### `save(data: TData): Promise<SaveResult>`
+
+Upload token data to IPFS and publish an IPNS record.
+
+```typescript
+interface SaveResult {
+  success: boolean;
+  cid?: string;       // CID of uploaded content
+  error?: string;
+  timestamp: number;
+}
+```
+
+#### `load(identifier?: string): Promise<LoadResult<TData>>`
+
+Load token data from IPFS. Without `identifier`, resolves via IPNS. With a CID `identifier`, fetches directly.
+
+```typescript
+interface LoadResult<T> {
+  success: boolean;
+  data?: T;
+  error?: string;
+  source: 'local' | 'remote' | 'cache';
+  timestamp: number;
+}
+```
+
+#### `sync(localData: TData): Promise<SyncResult<TData>>`
+
+Sync local data with IPFS: load remote, merge, save merged result.
+
+```typescript
+interface SyncResult<T> {
+  success: boolean;
+  merged?: T;         // Merged data
+  added: number;      // Tokens added from remote
+  removed: number;    // Tokens removed (tombstoned)
+  conflicts: number;  // Conflicts resolved (local wins)
+  error?: string;
+}
+```
+
+#### `exists(): Promise<boolean>`
+
+Check if an IPNS record exists for this wallet.
+
+#### `clear(): Promise<boolean>`
+
+Publish an empty data set and clear local caches.
+
+#### `onEvent(callback: StorageEventCallback): () => void`
+
+Subscribe to storage events. Returns an unsubscribe function.
+
+#### `getIpnsName(): string | null`
+
+Get the derived IPNS name (available after `initialize()`).
+
+#### `getLastCid(): string | null`
+
+Get the last known CID.
+
+#### `getSequenceNumber(): bigint`
+
+Get the current IPNS sequence number.
+
+#### `getDataVersion(): number`
+
+Get the data version counter.
+
+#### `getRemoteCid(): string | null`
+
+Get the CID currently stored on the remote (used for chain validation).
+
+### Types
+
+#### `IpfsPersistedState`
+
+```typescript
+interface IpfsPersistedState {
+  sequenceNumber: string;   // bigint serialized as string
+  lastCid: string | null;
+  version: number;
+}
+```
+
+#### `IpfsStatePersistence`
+
+Platform-specific state storage interface:
+
+```typescript
+interface IpfsStatePersistence {
+  load(ipnsName: string): Promise<IpfsPersistedState | null>;
+  save(ipnsName: string, state: IpfsPersistedState): Promise<void>;
+  clear(ipnsName: string): Promise<void>;
+}
+```
+
+#### `IpfsError`
+
+```typescript
+class IpfsError extends Error {
+  readonly category: IpfsErrorCategory;
+  readonly gateway?: string;
+  readonly cause?: Error;
+  get shouldTriggerCircuitBreaker(): boolean;
+}
+```
+
+#### `IpfsErrorCategory`
+
+```typescript
+type IpfsErrorCategory =
+  | 'NOT_FOUND'          // IPNS record not published (new wallet)
+  | 'NETWORK_ERROR'      // Connectivity issues
+  | 'TIMEOUT'            // Request timed out
+  | 'GATEWAY_ERROR'      // Gateway returned error (5xx)
+  | 'INVALID_RESPONSE'   // Response parsing failed
+  | 'CID_MISMATCH'       // Content hash mismatch
+  | 'SEQUENCE_DOWNGRADE'; // Remote sequence < local
+```
+
+### Storage Events
+
+| Event | When |
+|-------|------|
+| `storage:saving` | Before uploading to IPFS |
+| `storage:saved` | After successful save (data: `{ cid, sequence }`) |
+| `storage:loading` | Before loading from IPFS |
+| `storage:loaded` | After successful load (data: `{ cid, sequence }`) |
+| `storage:error` | On any error (error: message string) |
+| `sync:started` | Before sync begins |
+| `sync:completed` | After sync completes (data: `{ added, removed, conflicts }`) |
+| `sync:conflict` | When merge conflicts are resolved (data: `{ conflicts }`) |
+| `sync:error` | On sync error (error: message string) |
+
+### Architecture
+
+```
+Save Flow:
+  data → JSON serialize → POST /api/v0/add (IPFS upload)
+       → create signed IPNS record (Ed25519)
+       → POST /api/v0/routing/put (IPNS publish to all gateways)
+       → update cache + persist state
+
+Load Flow:
+  known-fresh check → IPNS TTL cache → POST /api/v0/routing/get (resolve IPNS)
+       → GET /ipfs/{cid} (fetch content from fastest gateway)
+       → cache content → return data
+
+Sync Flow:
+  load remote → merge(local, remote) → save merged
+  (if no remote: save local as initial)
+```
+
+See [IPFS Storage Guide](./IPFS-STORAGE.md) for complete documentation.

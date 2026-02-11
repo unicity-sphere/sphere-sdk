@@ -95,7 +95,7 @@ Node.js implementation uses **file-based storage**:
 | Wallet (keys, nametag) | `dataDir/wallet.json` | Encrypted JSON |
 | Tokens | `tokensDir/_<tokenId>.json` | One JSON file per token |
 
-> **Note:** IPFS sync is currently only available for browser. Node.js uses local file storage only.
+> **Note:** IPFS sync is available for both browser and Node.js. See [IPFS Token Sync](#ipfs-token-sync-optional) below.
 
 ## Minimal Example
 
@@ -185,6 +185,31 @@ const providers = createNodeProviders({
   },
 });
 ```
+
+## IPFS Token Sync (Optional)
+
+Enable decentralized token backup to IPFS/IPNS. No extra packages needed — uses built-in HTTP API.
+
+```typescript
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  tokenSync: {
+    ipfs: { enabled: true },
+  },
+});
+
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+
+// Sync tokens with IPFS (merges local and remote data)
+const result = await sphere.payments.sync();
+console.log(`Sync: +${result.added} -${result.removed}`);
+```
+
+**Recovery after local data loss:** Re-initialize the wallet with the same mnemonic and call `sync()`. Tokens stored on IPFS will be restored automatically.
+
+See [IPFS Storage Guide](./IPFS-STORAGE.md) for full configuration, caching details, and troubleshooting.
 
 ## Common Operations
 
@@ -466,4 +491,5 @@ fs.mkdirSync('./tokens-data', { recursive: true });
 
 - [API Reference](./API.md) - Full API documentation
 - [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
+- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration
 - [Browser Quick Start](./QUICKSTART-BROWSER.md) - For web applications

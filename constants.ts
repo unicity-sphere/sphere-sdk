@@ -177,6 +177,28 @@ export const DEFAULT_IPFS_BOOTSTRAP_PEERS = [
   '/dns4/unicity-ipfs5.dyndns.org/tcp/4001/p2p/12D3KooWB1MdZZGHN5B8TvWXntbycfe7Cjcz7n6eZ9eykZadvmDv',
 ] as const;
 
+/** Unicity dedicated IPFS nodes (HTTP API access) */
+export const UNICITY_IPFS_NODES = [
+  {
+    host: 'unicity-ipfs1.dyndns.org',
+    peerId: '12D3KooWDKJqEMAhH4nsSSiKtK1VLcas5coUqSPZAfbWbZpxtL4u',
+    httpPort: 9080,
+    httpsPort: 443,
+  },
+] as const;
+
+/**
+ * Get IPFS gateway URLs for HTTP API access.
+ * @param isSecure - Use HTTPS (default: true). Set false for development.
+ */
+export function getIpfsGatewayUrls(isSecure?: boolean): string[] {
+  return UNICITY_IPFS_NODES.map((node) =>
+    isSecure !== false
+      ? `https://${node.host}`
+      : `http://${node.host}:${node.httpPort}`,
+  );
+}
+
 // =============================================================================
 // Wallet Defaults
 // =============================================================================

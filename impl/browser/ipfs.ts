@@ -2,7 +2,6 @@
  * Browser IPFS Storage Provider
  *
  * Separate entry point for IPFS functionality.
- * Requires helia and @helia/* packages to be installed.
  *
  * @example
  * ```ts
@@ -11,6 +10,8 @@
  */
 export {
   IpfsStorageProvider,
+  createBrowserIpfsStorageProvider,
   createIpfsStorageProvider,
+  BrowserIpfsStatePersistence,
   type IpfsStorageProviderConfig,
-} from './storage/IpfsStorageProvider';
+} from './ipfs/index';

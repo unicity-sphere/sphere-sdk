@@ -1,0 +1,562 @@
+/**
+ * IPFS Storage Provider
+ * Main TokenStorageProvider implementation using IPFS/IPNS.
+ * Shared cross-platform module (browser + Node.js via native fetch).
+ */
+
+import type { ProviderStatus, FullIdentity } from '../../../types';
+import type {
+  TokenStorageProvider,
+  TxfStorageDataBase,
+  SaveResult,
+  LoadResult,
+  SyncResult,
+  StorageEventCallback,
+  StorageEvent,
+} from '../../../storage';
+import type {
+  IpfsStorageConfig,
+  IpfsStatePersistence,
+} from './ipfs-types';
+import { getIpfsGatewayUrls } from '../../../constants';
+import { IpfsCache } from './ipfs-cache';
+import { IpfsHttpClient } from './ipfs-http-client';
+import { deriveIpnsIdentity } from './ipns-key-derivation';
+import { createSignedRecord } from './ipns-record-manager';
+import { mergeTxfData } from './txf-merge';
+import { InMemoryIpfsStatePersistence } from './ipfs-state-persistence';
+
+// =============================================================================
+// Implementation
+// =============================================================================
+
+export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDataBase>
+  implements TokenStorageProvider<TData>
+{
+  readonly id = 'ipfs';
+  readonly name = 'IPFS Storage';
+  readonly type = 'p2p' as const;
+
+  private status: ProviderStatus = 'disconnected';
+  private identity: FullIdentity | null = null;
+  private ipnsKeyPair: unknown = null;
+  private ipnsName: string | null = null;
+  private ipnsSequenceNumber: bigint = 0n;
+  private lastCid: string | null = null;
+  private lastKnownRemoteSequence: bigint = 0n;
+  private dataVersion = 0;
+
+  /**
+   * The CID currently stored on the sidecar for this IPNS name.
+   * Used as `_meta.lastCid` in the next save to satisfy chain validation.
+   * - null for bootstrap (first-ever save)
+   * - set after every successful save() or load()
+   */
+  private remoteCid: string | null = null;
+
+  private readonly cache: IpfsCache;
+  private readonly httpClient: IpfsHttpClient;
+  private readonly statePersistence: IpfsStatePersistence;
+  private readonly eventCallbacks: Set<StorageEventCallback> = new Set();
+  private readonly debug: boolean;
+  private readonly ipnsLifetimeMs: number;
+
+  constructor(
+    config?: IpfsStorageConfig,
+    statePersistence?: IpfsStatePersistence,
+  ) {
+    const gateways = config?.gateways ?? getIpfsGatewayUrls();
+    this.debug = config?.debug ?? false;
+    this.ipnsLifetimeMs = config?.ipnsLifetimeMs ?? (99 * 365 * 24 * 60 * 60 * 1000);
+
+    this.cache = new IpfsCache({
+      ipnsTtlMs: config?.ipnsCacheTtlMs,
+      failureCooldownMs: config?.circuitBreakerCooldownMs,
+      failureThreshold: config?.circuitBreakerThreshold,
+      knownFreshWindowMs: config?.knownFreshWindowMs,
+    });
+
+    this.httpClient = new IpfsHttpClient({
+      gateways,
+      fetchTimeoutMs: config?.fetchTimeoutMs,
+      resolveTimeoutMs: config?.resolveTimeoutMs,
+      publishTimeoutMs: config?.publishTimeoutMs,
+      connectivityTimeoutMs: config?.connectivityTimeoutMs,
+      debug: this.debug,
+    }, this.cache);
+
+    this.statePersistence = statePersistence ?? new InMemoryIpfsStatePersistence();
+  }
+
+  // ---------------------------------------------------------------------------
+  // BaseProvider interface
+  // ---------------------------------------------------------------------------
+
+  async connect(): Promise<void> {
+    await this.initialize();
+  }
+
+  async disconnect(): Promise<void> {
+    await this.shutdown();
+  }
+
+  isConnected(): boolean {
+    return this.status === 'connected';
+  }
+
+  getStatus(): ProviderStatus {
+    return this.status;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Identity & Initialization
+  // ---------------------------------------------------------------------------
+
+  setIdentity(identity: FullIdentity): void {
+    this.identity = identity;
+  }
+
+  async initialize(): Promise<boolean> {
+    if (!this.identity) {
+      this.log('Cannot initialize: no identity set');
+      return false;
+    }
+
+    this.status = 'connecting';
+    this.emitEvent({ type: 'storage:loading', timestamp: Date.now() });
+
+    try {
+      // Derive IPNS key pair and name from wallet private key
+      const { keyPair, ipnsName } = await deriveIpnsIdentity(this.identity.privateKey);
+      this.ipnsKeyPair = keyPair;
+      this.ipnsName = ipnsName;
+      this.log(`IPNS name derived: ${ipnsName}`);
+
+      // Load persisted state
+      const persisted = await this.statePersistence.load(ipnsName);
+      if (persisted) {
+        this.ipnsSequenceNumber = BigInt(persisted.sequenceNumber);
+        this.lastCid = persisted.lastCid;
+        this.remoteCid = persisted.lastCid; // chain link for next save
+        this.dataVersion = persisted.version;
+        this.log(`Loaded persisted state: seq=${this.ipnsSequenceNumber}, cid=${this.lastCid}`);
+      }
+
+      // Test gateway connectivity (non-blocking, don't fail on it)
+      this.httpClient.findHealthyGateways().then((healthy) => {
+        if (healthy.length > 0) {
+          this.log(`${healthy.length} healthy gateway(s) found`);
+        } else {
+          this.log('Warning: no healthy gateways found');
+        }
+      }).catch(() => {
+        // Non-fatal
+      });
+
+      this.status = 'connected';
+      this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
+      return true;
+    } catch (error) {
+      this.status = 'error';
+      this.emitEvent({
+        type: 'storage:error',
+        timestamp: Date.now(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    this.cache.clear();
+    this.status = 'disconnected';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Save
+  // ---------------------------------------------------------------------------
+
+  async save(data: TData): Promise<SaveResult> {
+    if (!this.ipnsKeyPair || !this.ipnsName) {
+      return { success: false, error: 'Not initialized', timestamp: Date.now() };
+    }
+
+    this.emitEvent({ type: 'storage:saving', timestamp: Date.now() });
+
+    try {
+      // Update meta with chain-validation fields required by sidecar:
+      // - lastCid: must equal the CID currently stored on sidecar (null for bootstrap)
+      // - version: must be exactly current_version + 1 (for normal updates)
+      this.dataVersion++;
+      const metaUpdate: Record<string, unknown> = {
+        ...data._meta,
+        version: this.dataVersion,
+        ipnsName: this.ipnsName,
+        updatedAt: Date.now(),
+      };
+      if (this.remoteCid) {
+        // Normal update: chain to previous CID
+        metaUpdate.lastCid = this.remoteCid;
+      }
+      // Bootstrap (remoteCid is null): do NOT include lastCid field at all
+      const updatedData = { ...data, _meta: metaUpdate };
+
+      // Upload to IPFS
+      const { cid } = await this.httpClient.upload(updatedData);
+      this.log(`Content uploaded: CID=${cid}`);
+
+      // Compute new sequence: max(local, remote) + 1
+      const baseSeq = this.ipnsSequenceNumber > this.lastKnownRemoteSequence
+        ? this.ipnsSequenceNumber
+        : this.lastKnownRemoteSequence;
+      const newSeq = baseSeq + 1n;
+
+      // Create signed IPNS record
+      const marshalledRecord = await createSignedRecord(
+        this.ipnsKeyPair,
+        cid,
+        newSeq,
+        this.ipnsLifetimeMs,
+      );
+
+      // Publish to all gateways
+      const publishResult = await this.httpClient.publishIpns(
+        this.ipnsName,
+        marshalledRecord,
+      );
+
+      if (!publishResult.success) {
+        // Rollback version (sequence was not yet updated)
+        this.dataVersion--;
+        this.log(`IPNS publish failed: ${publishResult.error}`);
+        return {
+          success: false,
+          error: publishResult.error ?? 'IPNS publish failed',
+          timestamp: Date.now(),
+        };
+      }
+
+      // Update local state
+      this.ipnsSequenceNumber = newSeq;
+      this.lastCid = cid;
+      this.remoteCid = cid; // next save chains to this CID
+
+      // Update cache
+      this.cache.setIpnsRecord(this.ipnsName, {
+        cid,
+        sequence: newSeq,
+        gateway: 'local',
+      });
+      this.cache.setContent(cid, updatedData);
+      this.cache.markIpnsFresh(this.ipnsName);
+
+      // Persist state
+      await this.statePersistence.save(this.ipnsName, {
+        sequenceNumber: newSeq.toString(),
+        lastCid: cid,
+        version: this.dataVersion,
+      });
+
+      this.emitEvent({
+        type: 'storage:saved',
+        timestamp: Date.now(),
+        data: { cid, sequence: newSeq.toString() },
+      });
+
+      this.log(`Saved: CID=${cid}, seq=${newSeq}`);
+      return { success: true, cid, timestamp: Date.now() };
+    } catch (error) {
+      // Rollback version on any error
+      this.dataVersion--;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.emitEvent({
+        type: 'storage:error',
+        timestamp: Date.now(),
+        error: errorMessage,
+      });
+      return { success: false, error: errorMessage, timestamp: Date.now() };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Load
+  // ---------------------------------------------------------------------------
+
+  async load(identifier?: string): Promise<LoadResult<TData>> {
+    if (!this.ipnsName && !identifier) {
+      return { success: false, error: 'Not initialized', source: 'local', timestamp: Date.now() };
+    }
+
+    this.emitEvent({ type: 'storage:loading', timestamp: Date.now() });
+
+    try {
+      // If a specific CID is given, fetch directly
+      if (identifier) {
+        const data = await this.httpClient.fetchContent<TData>(identifier);
+        return { success: true, data, source: 'remote', timestamp: Date.now() };
+      }
+
+      const ipnsName = this.ipnsName!;
+
+      // Check known-fresh cache
+      if (this.cache.isIpnsKnownFresh(ipnsName)) {
+        const cached = this.cache.getIpnsRecordIgnoreTtl(ipnsName);
+        if (cached) {
+          const content = this.cache.getContent(cached.cid);
+          if (content) {
+            this.log('Using known-fresh cached data');
+            return { success: true, data: content as TData, source: 'cache', timestamp: Date.now() };
+          }
+        }
+      }
+
+      // Check IPNS cache (60s TTL)
+      const cachedRecord = this.cache.getIpnsRecord(ipnsName);
+      if (cachedRecord) {
+        const content = this.cache.getContent(cachedRecord.cid);
+        if (content) {
+          this.log('IPNS cache hit');
+          return { success: true, data: content as TData, source: 'cache', timestamp: Date.now() };
+        }
+        // Have CID but not content — fetch content
+        try {
+          const data = await this.httpClient.fetchContent<TData>(cachedRecord.cid);
+          return { success: true, data, source: 'remote', timestamp: Date.now() };
+        } catch {
+          // Fall through to full resolution
+        }
+      }
+
+      // Resolve IPNS from network
+      const { best } = await this.httpClient.resolveIpns(ipnsName);
+
+      if (!best) {
+        // Not found — could be a new wallet
+        this.log('IPNS record not found (new wallet?)');
+        return { success: false, error: 'IPNS record not found', source: 'remote', timestamp: Date.now() };
+      }
+
+      // Track remote sequence and CID for chain validation
+      if (best.sequence > this.lastKnownRemoteSequence) {
+        this.lastKnownRemoteSequence = best.sequence;
+      }
+      this.remoteCid = best.cid;
+
+      // Fetch content
+      const data = await this.httpClient.fetchContent<TData>(best.cid);
+
+      // Track remote version for correct version chaining
+      const remoteVersion = (data as TxfStorageDataBase)?._meta?.version;
+      if (typeof remoteVersion === 'number' && remoteVersion > this.dataVersion) {
+        this.dataVersion = remoteVersion;
+      }
+
+      this.emitEvent({
+        type: 'storage:loaded',
+        timestamp: Date.now(),
+        data: { cid: best.cid, sequence: best.sequence.toString() },
+      });
+
+      return { success: true, data, source: 'remote', timestamp: Date.now() };
+    } catch (error) {
+      // On network error, try to return cached data
+      if (this.ipnsName) {
+        const cached = this.cache.getIpnsRecordIgnoreTtl(this.ipnsName);
+        if (cached) {
+          const content = this.cache.getContent(cached.cid);
+          if (content) {
+            this.log('Network error, returning stale cache');
+            return { success: true, data: content as TData, source: 'cache', timestamp: Date.now() };
+          }
+        }
+      }
+
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.emitEvent({
+        type: 'storage:error',
+        timestamp: Date.now(),
+        error: errorMessage,
+      });
+      return { success: false, error: errorMessage, source: 'remote', timestamp: Date.now() };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sync
+  // ---------------------------------------------------------------------------
+
+  async sync(localData: TData): Promise<SyncResult<TData>> {
+    this.emitEvent({ type: 'sync:started', timestamp: Date.now() });
+
+    try {
+      // Load remote data
+      const remoteResult = await this.load();
+
+      if (!remoteResult.success || !remoteResult.data) {
+        // No remote data — save local as initial
+        this.log('No remote data found, uploading local data');
+        const saveResult = await this.save(localData);
+        this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
+        return {
+          success: saveResult.success,
+          merged: localData,
+          added: 0,
+          removed: 0,
+          conflicts: 0,
+          error: saveResult.error,
+        };
+      }
+
+      const remoteData = remoteResult.data;
+
+      // Check if merge is needed
+      const localVersion = localData._meta?.version ?? 0;
+      const remoteVersion = remoteData._meta?.version ?? 0;
+
+      if (localVersion === remoteVersion && this.lastCid) {
+        // Same version — no merge needed
+        this.log('Data is in sync (same version)');
+        this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
+        return {
+          success: true,
+          merged: localData,
+          added: 0,
+          removed: 0,
+          conflicts: 0,
+        };
+      }
+
+      // Merge
+      this.log(`Merging: local v${localVersion} <-> remote v${remoteVersion}`);
+      const { merged, added, removed, conflicts } = mergeTxfData(localData, remoteData);
+
+      if (conflicts > 0) {
+        this.emitEvent({
+          type: 'sync:conflict',
+          timestamp: Date.now(),
+          data: { conflicts },
+        });
+      }
+
+      // Save merged result
+      const saveResult = await this.save(merged);
+
+      this.emitEvent({
+        type: 'sync:completed',
+        timestamp: Date.now(),
+        data: { added, removed, conflicts },
+      });
+
+      return {
+        success: saveResult.success,
+        merged,
+        added,
+        removed,
+        conflicts,
+        error: saveResult.error,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.emitEvent({
+        type: 'sync:error',
+        timestamp: Date.now(),
+        error: errorMessage,
+      });
+      return {
+        success: false,
+        added: 0,
+        removed: 0,
+        conflicts: 0,
+        error: errorMessage,
+      };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Optional Methods
+  // ---------------------------------------------------------------------------
+
+  async exists(): Promise<boolean> {
+    if (!this.ipnsName) return false;
+
+    // Check cache first
+    const cached = this.cache.getIpnsRecord(this.ipnsName);
+    if (cached) return true;
+
+    // Resolve from network
+    const { best } = await this.httpClient.resolveIpns(this.ipnsName);
+    return best !== null;
+  }
+
+  async clear(): Promise<boolean> {
+    if (!this.ipnsKeyPair || !this.ipnsName) return false;
+
+    const emptyData = {
+      _meta: {
+        version: 0,
+        address: this.identity?.directAddress ?? '',
+        ipnsName: this.ipnsName,
+        formatVersion: '2.0',
+        updatedAt: Date.now(),
+      },
+    } as TData;
+
+    const result = await this.save(emptyData);
+    if (result.success) {
+      this.cache.clear();
+      await this.statePersistence.clear(this.ipnsName);
+    }
+    return result.success;
+  }
+
+  onEvent(callback: StorageEventCallback): () => void {
+    this.eventCallbacks.add(callback);
+    return () => {
+      this.eventCallbacks.delete(callback);
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public Accessors
+  // ---------------------------------------------------------------------------
+
+  getIpnsName(): string | null {
+    return this.ipnsName;
+  }
+
+  getLastCid(): string | null {
+    return this.lastCid;
+  }
+
+  getSequenceNumber(): bigint {
+    return this.ipnsSequenceNumber;
+  }
+
+  getDataVersion(): number {
+    return this.dataVersion;
+  }
+
+  getRemoteCid(): string | null {
+    return this.remoteCid;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal
+  // ---------------------------------------------------------------------------
+
+  private emitEvent(event: StorageEvent): void {
+    for (const callback of this.eventCallbacks) {
+      try {
+        callback(event);
+      } catch {
+        // Don't let event handler errors break the provider
+      }
+    }
+  }
+
+  private log(message: string): void {
+    if (this.debug) {
+      console.log(`[IPFS-Storage] ${message}`);
+    }
+  }
+}

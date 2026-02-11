@@ -5,6 +5,6 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/e2e/**/*.test.ts'],
-    testTimeout: 30000,
+    testTimeout: 180000, // Recovery test needs up to 60s for IPNS propagation
   },
 });
