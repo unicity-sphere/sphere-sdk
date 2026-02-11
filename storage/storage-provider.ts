@@ -112,13 +112,6 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
   shutdown(): Promise<void>;
 
   /**
-   * When true, save() is skipped during normal operations; data is only
-   * written via sync(). Useful for remote providers like IPFS where save()
-   * triggers expensive network operations (IPNS publish).
-   */
-  readonly syncOnly?: boolean;
-
-  /**
    * Save token data
    */
   save(data: TData): Promise<SaveResult>;

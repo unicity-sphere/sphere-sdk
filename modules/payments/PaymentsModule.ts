@@ -4514,8 +4514,6 @@ export class PaymentsModule {
 
     const data = await this.createStorageData();
     for (const [id, provider] of providers) {
-      // Skip sync-only providers (e.g. IPFS) — they publish via sync(), not save()
-      if (provider.syncOnly) continue;
       try {
         await provider.save(data);
       } catch (err) {

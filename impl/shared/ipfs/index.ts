@@ -58,5 +58,8 @@ export { mergeTxfData } from './txf-merge';
 export { IpnsSubscriptionClient, type IpnsSubscriptionClientConfig } from './ipns-subscription-client';
 export type { IpnsUpdateEvent } from './ipfs-types';
 
+// Write-behind buffer
+export { AsyncSerialQueue, WriteBuffer } from './write-behind-buffer';
+
 // Main provider
 export { IpfsStorageProvider } from './ipfs-storage-provider';

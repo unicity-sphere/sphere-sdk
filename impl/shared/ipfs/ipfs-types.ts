@@ -129,6 +129,8 @@ export interface IpfsStorageConfig {
   fallbackPollIntervalMs?: number;
   /** Debounce for push-triggered sync in ms (default: 500) */
   syncDebounceMs?: number;
+  /** Debounce interval for background flush in ms (default: 2000) */
+  flushDebounceMs?: number;
 }
 
 /** IPNS update event received via WebSocket push or polling */

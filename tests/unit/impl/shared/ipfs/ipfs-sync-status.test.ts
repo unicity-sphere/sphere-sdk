@@ -88,7 +88,7 @@ async function initProvider(
   persistence?: InMemoryIpfsStatePersistence,
 ): Promise<IpfsStorageProvider> {
   const p = new IpfsStorageProvider(
-    { gateways: ['https://gw1.example.com'], ...config } as any,
+    { gateways: ['https://gw1.example.com'], flushDebounceMs: 100, ...config } as any,
     persistence ?? new InMemoryIpfsStatePersistence(),
   );
 
@@ -393,6 +393,10 @@ describe('IPFS Sync Status', () => {
         _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
       } as any);
 
+      // save() is non-blocking — flush to trigger actual upload
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
       expect(provider.getSequenceNumber()).toBe(1n);
       expect(provider.getLastCid()).toBe('bafySave1');
       expect(provider.getRemoteCid()).toBe('bafySave1');
@@ -433,6 +437,7 @@ describe('IPFS Sync Status', () => {
 
     it('should track cumulative saves with incrementing sequence and version', async () => {
       const provider = await initProvider();
+      vi.useRealTimers();
 
       for (let i = 0; i < 3; i++) {
         vi.mocked(fetch)
@@ -444,6 +449,9 @@ describe('IPFS Sync Status', () => {
         await provider.save({
           _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
         } as any);
+
+        // save() is non-blocking — flush each one before next
+        await provider.waitForFlush();
       }
 
       expect(provider.getSequenceNumber()).toBe(3n);
@@ -456,6 +464,7 @@ describe('IPFS Sync Status', () => {
 
     it('should not advance version on failed save', async () => {
       const provider = await initProvider();
+      vi.useRealTimers();
 
       // Successful save first
       vi.mocked(fetch)
@@ -466,6 +475,7 @@ describe('IPFS Sync Status', () => {
       await provider.save({
         _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
       } as any);
+      await provider.waitForFlush();
       expect(provider.getDataVersion()).toBe(1);
 
       // Failed save: upload ok, publish fails
@@ -477,6 +487,11 @@ describe('IPFS Sync Status', () => {
       await provider.save({
         _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
       } as any);
+      try {
+        await provider.waitForFlush();
+      } catch {
+        // Expected — flush failed
+      }
 
       // Version should be rolled back
       expect(provider.getDataVersion()).toBe(1);
@@ -646,6 +661,10 @@ describe('IPFS Sync Status', () => {
       await provider.save({
         _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
       } as any);
+
+      // save() is non-blocking — flush to trigger actual events
+      vi.useRealTimers();
+      await provider.waitForFlush();
 
       expect(events.some((e) => e.type === 'storage:saving')).toBe(true);
       expect(events.some((e) => e.type === 'storage:saved')).toBe(true);

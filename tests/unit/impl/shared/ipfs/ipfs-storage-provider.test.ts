@@ -31,15 +31,17 @@ describe('IpfsStorageProvider', () => {
   };
 
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.stubGlobal('fetch', vi.fn());
     statePersistence = new InMemoryIpfsStatePersistence();
     provider = new IpfsStorageProvider(
-      { gateways: ['https://gw1.example.com'] },
+      { gateways: ['https://gw1.example.com'], flushDebounceMs: 100 },
       statePersistence,
     );
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
@@ -54,6 +56,10 @@ describe('IpfsStorageProvider', () => {
       expect(provider.id).toBe('ipfs');
       expect(provider.name).toBe('IPFS Storage');
       expect(provider.type).toBe('p2p');
+    });
+
+    it('should not have syncOnly property', () => {
+      expect((provider as any).syncOnly).toBeUndefined();
     });
 
     it('should fail to initialize without identity', async () => {
@@ -99,6 +105,8 @@ describe('IpfsStorageProvider', () => {
 
       provider.setIdentity(testIdentity);
       await provider.initialize();
+
+      vi.useRealTimers();
       await provider.shutdown();
 
       expect(provider.isConnected()).toBe(false);
@@ -106,7 +114,7 @@ describe('IpfsStorageProvider', () => {
     });
   });
 
-  describe('save', () => {
+  describe('save (non-blocking with write-behind)', () => {
     const testData = {
       _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
       _abc123: { some: 'token' },
@@ -120,7 +128,13 @@ describe('IpfsStorageProvider', () => {
       await provider.initialize();
     });
 
-    it('should upload and publish successfully', async () => {
+    it('should return success immediately (non-blocking)', async () => {
+      const result = await provider.save(testData as any);
+      expect(result.success).toBe(true);
+      // No network calls yet — still buffered
+    });
+
+    it('should upload and publish on flush', async () => {
       // Upload response
       vi.mocked(fetch)
         .mockResolvedValueOnce(
@@ -129,14 +143,17 @@ describe('IpfsStorageProvider', () => {
         // Publish response
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
-      const result = await provider.save(testData as any);
-      expect(result.success).toBe(true);
-      expect(result.cid).toBe('bafynew123');
+      await provider.save(testData as any);
+
+      // Trigger the debounced flush
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
       expect(provider.getLastCid()).toBe('bafynew123');
       expect(provider.getSequenceNumber()).toBe(1n);
     });
 
-    it('should persist state after save', async () => {
+    it('should persist state after flush', async () => {
       vi.mocked(fetch)
         .mockResolvedValueOnce(
           new Response(JSON.stringify({ Hash: 'bafynew123' }), { status: 200 }),
@@ -144,6 +161,9 @@ describe('IpfsStorageProvider', () => {
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
       await provider.save(testData as any);
+
+      vi.useRealTimers();
+      await provider.waitForFlush();
 
       const persisted = await statePersistence.load('12D3KooWTestPeerId');
       expect(persisted).not.toBeNull();
@@ -160,18 +180,6 @@ describe('IpfsStorageProvider', () => {
       const result = await uninitProvider.save(testData as any);
       expect(result.success).toBe(false);
       expect(result.error).toContain('Not initialized');
-    });
-
-    it('should return failure when publish fails', async () => {
-      vi.mocked(fetch)
-        .mockResolvedValueOnce(
-          new Response(JSON.stringify({ Hash: 'bafynew123' }), { status: 200 }),
-        )
-        // All publish attempts fail
-        .mockRejectedValue(new TypeError('Failed'));
-
-      const result = await provider.save(testData as any);
-      expect(result.success).toBe(false);
     });
   });
 
@@ -220,6 +228,8 @@ describe('IpfsStorageProvider', () => {
     });
 
     it('should upload local data when no remote exists', async () => {
+      vi.useRealTimers();
+
       // IPNS resolution fails (no remote)
       vi.mocked(fetch)
         .mockResolvedValueOnce(new Response('routing: not found', { status: 500 }))
@@ -302,9 +312,13 @@ describe('IpfsStorageProvider', () => {
         )
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
-      const saveResult = await provider.save(savedInventory as any);
-      expect(saveResult.success).toBe(true);
-      expect(saveResult.cid).toBe('bafyInventoryCid');
+      await provider.save(savedInventory as any);
+
+      // Trigger the flush
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
+      expect(provider.getLastCid()).toBe('bafyInventoryCid');
 
       // Destroy Provider A (simulates full local wipe)
       await provider.shutdown();
@@ -312,7 +326,7 @@ describe('IpfsStorageProvider', () => {
       // --- Provider B: fresh instance, same key, NO persisted state ---
       const freshPersistence = new InMemoryIpfsStatePersistence();
       const providerB = new IpfsStorageProvider(
-        { gateways: ['https://gw1.example.com'] },
+        { gateways: ['https://gw1.example.com'], flushDebounceMs: 100 },
         freshPersistence,
       );
 
@@ -371,7 +385,7 @@ describe('IpfsStorageProvider', () => {
       // Fresh provider with same key but nothing ever published
       const freshPersistence = new InMemoryIpfsStatePersistence();
       const freshProvider = new IpfsStorageProvider(
-        { gateways: ['https://gw1.example.com'] },
+        { gateways: ['https://gw1.example.com'], flushDebounceMs: 100 },
         freshPersistence,
       );
 
@@ -392,6 +406,7 @@ describe('IpfsStorageProvider', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('not found');
 
+      vi.useRealTimers();
       await freshProvider.shutdown();
     });
   });
@@ -427,6 +442,10 @@ describe('IpfsStorageProvider', () => {
         _tok1: { id: 'tok1' },
       } as any);
 
+      // Wait for the flush to happen
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
       expect(uploadedBody).toBeTruthy();
       const uploaded = JSON.parse(uploadedBody!);
       expect(uploaded._meta.version).toBe(1); // >= 1
@@ -449,6 +468,8 @@ describe('IpfsStorageProvider', () => {
         _tok1: { id: 'tok1' },
       } as any);
 
+      vi.useRealTimers();
+      await provider.waitForFlush();
       expect(provider.getRemoteCid()).toBe('bafyFirst');
 
       // Second save — capture uploaded data
@@ -468,6 +489,8 @@ describe('IpfsStorageProvider', () => {
         _tok1: { id: 'tok1' },
         _tok2: { id: 'tok2' },
       } as any);
+
+      await provider.waitForFlush();
 
       expect(uploadedBody).toBeTruthy();
       const uploaded = JSON.parse(uploadedBody!);
@@ -524,6 +547,9 @@ describe('IpfsStorageProvider', () => {
         _tok2: { id: 'tok2' },
       } as any);
 
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
       const uploaded = JSON.parse(uploadedBody!);
       expect(uploaded._meta.lastCid).toBe('bafyRemoteV5');
       expect(uploaded._meta.version).toBe(6); // remote 5 + 1
@@ -535,6 +561,8 @@ describe('IpfsStorageProvider', () => {
       );
       provider.setIdentity(testIdentity);
       await provider.initialize();
+
+      vi.useRealTimers();
 
       const versions: number[] = [];
       const cids: (string | undefined)[] = [];
@@ -555,6 +583,8 @@ describe('IpfsStorageProvider', () => {
           _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
         } as any);
 
+        await provider.waitForFlush();
+
         const uploaded = JSON.parse(uploadedBody!);
         versions.push(uploaded._meta.version);
         cids.push(uploaded._meta.lastCid);
@@ -568,25 +598,37 @@ describe('IpfsStorageProvider', () => {
       expect(cids[2]).toBe('bafyCid1');       // chains to second
     });
 
-    it('failed save should not advance version', async () => {
+    it('failed flush should not advance version', async () => {
       vi.mocked(fetch).mockResolvedValue(
         new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
       );
       provider.setIdentity(testIdentity);
       await provider.initialize();
 
+      vi.useRealTimers();
+
       // Successful save: version becomes 1
       vi.mocked(fetch)
         .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyOk' }), { status: 200 }))
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
       await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+      await provider.waitForFlush();
       expect(provider.getDataVersion()).toBe(1);
 
       // Failed save: upload succeeds but publish fails
       vi.mocked(fetch)
         .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyFail' }), { status: 200 }))
         .mockRejectedValueOnce(new TypeError('Network error'));
+
       await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+
+      // waitForFlush will catch the error and the buffer will retry
+      // But the version should still be rolled back
+      try {
+        await provider.waitForFlush();
+      } catch {
+        // Expected — flush failed
+      }
 
       // Version should be rolled back to 1
       expect(provider.getDataVersion()).toBe(1);
@@ -623,6 +665,9 @@ describe('IpfsStorageProvider', () => {
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
       await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+
+      vi.useRealTimers();
+      await provider.waitForFlush();
 
       const uploaded = JSON.parse(uploadedBody!);
       expect(uploaded._meta.lastCid).toBe('bafyPrevSession');
@@ -681,7 +726,7 @@ describe('IpfsStorageProvider', () => {
       expect(ids).toContain('_tok1');
     });
 
-    it('save() includes buffered tokens in uploaded payload', async () => {
+    it('flush includes buffered tokens in uploaded payload', async () => {
       await provider.saveToken!('_bufTok1', { id: 'bufTok1', coinId: 'UCT', amount: '500' });
       await provider.saveToken!('_bufTok2', { id: 'bufTok2', coinId: 'GEMA', amount: '100' });
 
@@ -696,17 +741,21 @@ describe('IpfsStorageProvider', () => {
         })
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
-      const result = await provider.save({
+      // Also save full data to trigger flush with meaningful payload
+      await provider.save({
         _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
       } as any);
 
-      expect(result.success).toBe(true);
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
+      expect(uploadedBody).toBeTruthy();
       const uploaded = JSON.parse(uploadedBody!);
       expect(uploaded._bufTok1).toEqual({ id: 'bufTok1', coinId: 'UCT', amount: '500' });
       expect(uploaded._bufTok2).toEqual({ id: 'bufTok2', coinId: 'GEMA', amount: '100' });
     });
 
-    it('save() excludes deleted tokens from uploaded payload', async () => {
+    it('flush excludes deleted tokens from uploaded payload', async () => {
       await provider.saveToken!('_keep', { id: 'keep' });
       await provider.saveToken!('_remove', { id: 'remove' });
       await provider.deleteToken!('_remove');
@@ -726,6 +775,9 @@ describe('IpfsStorageProvider', () => {
         _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
         _remove: { id: 'remove', fromData: true },
       } as any);
+
+      vi.useRealTimers();
+      await provider.waitForFlush();
 
       const uploaded = JSON.parse(uploadedBody!);
       expect(uploaded._keep).toEqual({ id: 'keep' });
@@ -777,11 +829,12 @@ describe('IpfsStorageProvider', () => {
       await provider.saveToken!('_tok2', { id: 'tok2' });
       await provider.deleteToken!('_tok2');
 
-      // Mock save inside clear
+      // Mock save inside clear (uses _doSave directly)
       vi.mocked(fetch)
         .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyClear' }), { status: 200 }))
         .mockResolvedValueOnce(new Response('ok', { status: 200 }));
 
+      vi.useRealTimers();
       await provider.clear!();
 
       const ids = await provider.listTokenIds!();
@@ -794,7 +847,7 @@ describe('IpfsStorageProvider', () => {
     // Helper to set up an initialized provider with mocked fetch
     async function createInitializedProvider(): Promise<IpfsStorageProvider> {
       const p = new IpfsStorageProvider(
-        { gateways: ['https://gw1.example.com'] },
+        { gateways: ['https://gw1.example.com'], flushDebounceMs: 100 },
         new InMemoryIpfsStatePersistence(),
       );
       vi.stubGlobal('fetch', vi.fn());
@@ -807,6 +860,7 @@ describe('IpfsStorageProvider', () => {
     }
 
     it('sync with stale local should preserve remote-only tokens', async () => {
+      vi.useRealTimers();
       const p = await createInitializedProvider();
 
       // Remote has v5 with 3 tokens (including tokenNew added by another device)
@@ -865,6 +919,7 @@ describe('IpfsStorageProvider', () => {
     });
 
     it('sync with stale local should not lose tokens even when local has lower version', async () => {
+      vi.useRealTimers();
       const p = await createInitializedProvider();
 
       // Remote v10: has 4 tokens (tokenD was added on another device)
@@ -914,6 +969,7 @@ describe('IpfsStorageProvider', () => {
     });
 
     it('sync with stale local should preserve remote tokens even when local has extra tokens', async () => {
+      vi.useRealTimers();
       const p = await createInitializedProvider();
 
       // Remote v5: has tokenA + tokenRemoteOnly
@@ -962,6 +1018,7 @@ describe('IpfsStorageProvider', () => {
     });
 
     it('merged version should always exceed both local and remote versions', async () => {
+      vi.useRealTimers();
       const p = await createInitializedProvider();
 
       const remoteData = {
@@ -993,13 +1050,161 @@ describe('IpfsStorageProvider', () => {
 
       expect(result.success).toBe(true);
       // The merge sets version = max(local, remote) + 1
-      // Then save() increments dataVersion again, so the saved _meta.version
+      // Then _doSave() increments dataVersion again, so the saved _meta.version
       // must be > both 3 and 20
       const mergedVersion = (result.merged as any)._meta?.version;
       expect(mergedVersion).toBeGreaterThan(20);
       expect(mergedVersion).toBeGreaterThan(3);
 
       await p.shutdown();
+    });
+  });
+
+  describe('write-behind buffer behavior', () => {
+    beforeEach(async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+    });
+
+    it('multiple rapid save() calls coalesce into single flush', async () => {
+      let ipfsAddCount = 0;
+      vi.mocked(fetch).mockImplementation(async (_url, opts) => {
+        const url = String(_url);
+        if (url.includes('/api/v0/add')) {
+          ipfsAddCount++;
+          return new Response(JSON.stringify({ Hash: 'bafyCoalesced' }), { status: 200 });
+        }
+        // Routing/publish and other calls
+        return new Response('ok', { status: 200 });
+      });
+
+      // Fire multiple saves rapidly — debounce should coalesce
+      await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+      await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 }, _tok1: { id: 'tok1' } } as any);
+      await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 }, _tok1: { id: 'tok1' }, _tok2: { id: 'tok2' } } as any);
+
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
+      // Should only upload once (all coalesced by debounce)
+      expect(ipfsAddCount).toBe(1);
+    });
+
+    it('saveToken() schedules a flush', async () => {
+      let uploadedBody: string | undefined;
+      vi.mocked(fetch)
+        .mockImplementationOnce(async (_url, opts) => {
+          if (opts?.body instanceof FormData) {
+            const blob = opts.body.get('file') as Blob;
+            if (blob) uploadedBody = await blob.text();
+          }
+          return new Response(JSON.stringify({ Hash: 'bafyTokenFlush' }), { status: 200 });
+        })
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      await provider.saveToken!('_myTok', { id: 'myTok', coinId: 'UCT' });
+
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
+      expect(uploadedBody).toBeTruthy();
+      const uploaded = JSON.parse(uploadedBody!);
+      expect(uploaded._myTok).toEqual({ id: 'myTok', coinId: 'UCT' });
+    });
+
+    it('deleteToken() schedules a flush', async () => {
+      // Pre-populate a token in the buffer
+      await provider.saveToken!('_delTok', { id: 'delTok' });
+
+      // Now delete it
+      let uploadedBody: string | undefined;
+      vi.mocked(fetch)
+        .mockImplementationOnce(async (_url, opts) => {
+          if (opts?.body instanceof FormData) {
+            const blob = opts.body.get('file') as Blob;
+            if (blob) uploadedBody = await blob.text();
+          }
+          return new Response(JSON.stringify({ Hash: 'bafyAfterDel' }), { status: 200 });
+        })
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      await provider.deleteToken!('_delTok');
+
+      vi.useRealTimers();
+      await provider.waitForFlush();
+
+      expect(uploadedBody).toBeTruthy();
+      const uploaded = JSON.parse(uploadedBody!);
+      expect(uploaded._delTok).toBeUndefined();
+    });
+
+    it('shutdown() drains pending buffer', async () => {
+      let ipfsAddCount = 0;
+      vi.mocked(fetch).mockImplementation(async (_url, opts) => {
+        const url = String(_url);
+        if (url.includes('/api/v0/add')) {
+          ipfsAddCount++;
+          return new Response(JSON.stringify({ Hash: 'bafyShutdown' }), { status: 200 });
+        }
+        return new Response('ok', { status: 200 });
+      });
+
+      await provider.save({
+        _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        _tok1: { id: 'tok1' },
+      } as any);
+
+      // Don't wait for flush — shutdown should drain it
+      vi.useRealTimers();
+      await provider.shutdown();
+
+      expect(ipfsAddCount).toBe(1);
+    });
+
+    it('failed flush merges buffer back and retries', async () => {
+      vi.useRealTimers();
+
+      let attemptCount = 0;
+      vi.mocked(fetch).mockImplementation(async (_url, opts) => {
+        if (opts?.body instanceof FormData) {
+          attemptCount++;
+          if (attemptCount === 1) {
+            // First attempt: upload OK but publish fails
+            return new Response(JSON.stringify({ Hash: 'bafyAttempt1' }), { status: 200 });
+          }
+          if (attemptCount === 2) {
+            // This is the publish call that fails
+            throw new TypeError('Network error');
+          }
+          // Subsequent attempts: succeed
+          return new Response(JSON.stringify({ Hash: 'bafyRetry' }), { status: 200 });
+        }
+        // Publish succeeds on retry
+        return new Response('ok', { status: 200 });
+      });
+
+      await provider.save({
+        _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        _tok1: { id: 'tok1' },
+      } as any);
+
+      // First flush will fail (publish throws), but data should not be lost
+      // The retry mechanism will schedule another flush
+      try {
+        await provider.waitForFlush();
+      } catch {
+        // Expected
+      }
+
+      // Eventually the retry should succeed
+      // waitForFlush again to catch the retry
+      await provider.waitForFlush();
+
+      // Data should not be lost — version should eventually advance
+      expect(provider.getDataVersion()).toBeGreaterThanOrEqual(1);
     });
   });
 });
