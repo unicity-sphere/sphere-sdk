@@ -278,4 +278,121 @@ describe('IpfsStorageProvider', () => {
       expect(result).toBe(false);
     });
   });
+
+  describe('recovery after local storage wipe', () => {
+    const savedInventory = {
+      _meta: { version: 5, address: 'DIRECT://test', formatVersion: '2.0', updatedAt: 1000 },
+      _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '5000000' },
+      _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '2500000' },
+      _tokenC: { id: 'tokenC', coinId: 'GEMA', amount: '100' },
+    };
+
+    it('should recover full inventory via IPNS after destroying the original provider', async () => {
+      // --- Provider A: save inventory ---
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      // Upload + publish
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ Hash: 'bafyInventoryCid' }), { status: 200 }),
+        )
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const saveResult = await provider.save(savedInventory as any);
+      expect(saveResult.success).toBe(true);
+      expect(saveResult.cid).toBe('bafyInventoryCid');
+
+      // Destroy Provider A (simulates full local wipe)
+      await provider.shutdown();
+
+      // --- Provider B: fresh instance, same key, NO persisted state ---
+      const freshPersistence = new InMemoryIpfsStatePersistence();
+      const providerB = new IpfsStorageProvider(
+        { gateways: ['https://gw1.example.com'] },
+        freshPersistence,
+      );
+
+      vi.stubGlobal('fetch', vi.fn());
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      providerB.setIdentity(testIdentity);
+      const initOk = await providerB.initialize();
+      expect(initOk).toBe(true);
+
+      // Verify Provider B has zero local state
+      expect(providerB.getLastCid()).toBeNull();
+      expect(providerB.getSequenceNumber()).toBe(0n);
+
+      // Mock IPNS resolution: routing API returns record pointing to our CID
+      const { parseRoutingApiResponse } = await import(
+        '../../../../../impl/shared/ipfs/ipns-record-manager'
+      );
+      vi.mocked(parseRoutingApiResponse).mockResolvedValueOnce({
+        cid: 'bafyInventoryCid',
+        sequence: 1n,
+        recordData: new Uint8Array([1, 2, 3]),
+      });
+
+      // Mock the routing API HTTP call (returns 200 so parseRoutingApiResponse is called)
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(
+          new Response('routing-api-ndjson-body', { status: 200 }),
+        )
+        // Mock content fetch: GET /ipfs/bafyInventoryCid returns the saved inventory
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(savedInventory), { status: 200 }),
+        );
+
+      // Recovery: load via IPNS
+      const recovered = await providerB.load();
+
+      expect(recovered.success).toBe(true);
+      expect(recovered.source).toBe('remote');
+      expect(recovered.data).toBeTruthy();
+
+      const data = recovered.data as any;
+      expect(data._tokenA?.coinId).toBe('UCT');
+      expect(data._tokenA?.amount).toBe('5000000');
+      expect(data._tokenB?.coinId).toBe('UCT');
+      expect(data._tokenB?.amount).toBe('2500000');
+      expect(data._tokenC?.coinId).toBe('GEMA');
+      expect(data._tokenC?.amount).toBe('100');
+
+      await providerB.shutdown();
+    });
+
+    it('should return not-found when IPNS has no record for the key', async () => {
+      // Fresh provider with same key but nothing ever published
+      const freshPersistence = new InMemoryIpfsStatePersistence();
+      const freshProvider = new IpfsStorageProvider(
+        { gateways: ['https://gw1.example.com'] },
+        freshPersistence,
+      );
+
+      vi.stubGlobal('fetch', vi.fn());
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      freshProvider.setIdentity(testIdentity);
+      await freshProvider.initialize();
+
+      // IPNS resolution returns nothing
+      vi.mocked(fetch).mockResolvedValueOnce(
+        new Response('routing: not found', { status: 500 }),
+      );
+
+      const result = await freshProvider.load();
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('not found');
+
+      await freshProvider.shutdown();
+    });
+  });
 });

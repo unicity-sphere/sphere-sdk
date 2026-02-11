@@ -115,4 +115,67 @@ describe('IPFS Sync E2E', () => {
     const exists = await provider.exists!();
     expect(exists).toBe(true);
   }, 30000);
+
+  it('should recover full inventory from IPFS after local storage wipe', async () => {
+    // Step 1: Save a multi-token inventory with Provider A
+    const inventory: TxfStorageDataBase = {
+      _meta: {
+        version: 10,
+        address: testIdentity.directAddress!,
+        formatVersion: '2.0',
+        updatedAt: Date.now(),
+      },
+      _tokenAlpha: { id: 'tokenAlpha', coinId: 'UCT', amount: '5000000' },
+      _tokenBravo: { id: 'tokenBravo', coinId: 'UCT', amount: '2500000' },
+      _tokenCharlie: { id: 'tokenCharlie', coinId: 'GEMA', amount: '100' },
+    };
+
+    const saveResult = await provider.save(inventory);
+    expect(saveResult.success).toBe(true);
+    expect(saveResult.cid).toBeTruthy();
+
+    // Step 2: Destroy Provider A — simulates local storage wipe
+    await provider.shutdown();
+
+    // Step 3: Create Provider B from scratch with the SAME private key
+    // but a completely fresh state persistence (no cached CID, no sequence)
+    const freshPersistence = new InMemoryIpfsStatePersistence();
+    const providerB = new IpfsStorageProvider(
+      {
+        gateways,
+        debug: true,
+        fetchTimeoutMs: 30000,
+        resolveTimeoutMs: 15000,
+        publishTimeoutMs: 60000,
+      },
+      freshPersistence,
+    );
+
+    providerB.setIdentity(testIdentity);
+    const initOk = await providerB.initialize();
+    expect(initOk).toBe(true);
+
+    // Verify Provider B has no local state
+    expect(providerB.getLastCid()).toBeNull();
+    expect(providerB.getSequenceNumber()).toBe(0n);
+
+    // Step 4: Load from IPFS via IPNS resolution (the recovery path)
+    const recovered = await providerB.load();
+    expect(recovered.success).toBe(true);
+    expect(recovered.data).toBeTruthy();
+
+    // Step 5: Verify the recovered inventory matches what was saved
+    const data = recovered.data as any;
+    expect(data._tokenAlpha?.coinId).toBe('UCT');
+    expect(data._tokenAlpha?.amount).toBe('5000000');
+    expect(data._tokenBravo?.coinId).toBe('UCT');
+    expect(data._tokenBravo?.amount).toBe('2500000');
+    expect(data._tokenCharlie?.coinId).toBe('GEMA');
+    expect(data._tokenCharlie?.amount).toBe('100');
+
+    await providerB.shutdown();
+
+    // Re-init the original provider for afterAll cleanup
+    provider = providerB;
+  }, 120000);
 });
