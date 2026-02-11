@@ -386,6 +386,14 @@ npm run type-check
 - `transportPubkey`: Derived key for transport messaging (HKDF from private key)
 - Identity binding events include both for cross-resolution
 
+### Event Timestamp Persistence
+- Transport persists last processed wallet event timestamp via `TransportStorageAdapter`
+- Storage key: `last_wallet_event_ts_{pubkey_prefix}` (per-wallet, in `STORAGE_KEYS_GLOBAL`)
+- On reconnect: `since = stored timestamp` (existing wallet) or `since = now` (fresh wallet)
+- Only wallet events update the timestamp (TOKEN_TRANSFER, PAYMENT_REQUEST, PAYMENT_REQUEST_RESPONSE, DIRECT_MESSAGE)
+- Chat events (GIFT_WRAP/NIP-17) have no `since` filter — always real-time
+- Factory functions (`createBrowserProviders`, `createNodeProviders`) pass storage to transport automatically
+
 ### Token Storage (TXF Format)
 ```typescript
 TxfStorageDataBase {
@@ -400,11 +408,11 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 882 (34 test files)
+**Total tests:** 893 (34 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
-- `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer
+- `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer, event timestamp persistence
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider

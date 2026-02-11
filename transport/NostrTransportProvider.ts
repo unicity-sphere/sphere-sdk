@@ -50,12 +50,22 @@ import { defaultUUIDGenerator } from './websocket';
 import {
   DEFAULT_NOSTR_RELAYS,
   NOSTR_EVENT_KINDS,
+  STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
 
 // =============================================================================
 // Configuration
 // =============================================================================
+
+/**
+ * Minimal key-value storage interface for transport persistence.
+ * Used to persist the last processed event timestamp across sessions.
+ */
+export interface TransportStorageAdapter {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+}
 
 export interface NostrTransportProviderConfig {
   /** Nostr relay URLs */
@@ -74,6 +84,8 @@ export interface NostrTransportProviderConfig {
   createWebSocket: WebSocketFactory;
   /** UUID generator (optional, defaults to crypto.randomUUID) */
   generateUUID?: UUIDGenerator;
+  /** Optional storage adapter for persisting subscription timestamps */
+  storage?: TransportStorageAdapter;
 }
 
 // Alias for backward compatibility
@@ -191,10 +203,13 @@ export class NostrTransportProvider implements TransportProvider {
   readonly type = 'p2p' as const;
   readonly description = 'P2P messaging via Nostr protocol';
 
-  private config: Required<Omit<NostrTransportProviderConfig, 'createWebSocket' | 'generateUUID'>> & {
+  private config: Required<Omit<NostrTransportProviderConfig, 'createWebSocket' | 'generateUUID' | 'storage'>> & {
     createWebSocket: WebSocketFactory;
     generateUUID: UUIDGenerator;
   };
+  private storage: TransportStorageAdapter | null = null;
+  /** In-memory max event timestamp to avoid read-before-write races in updateLastEventTimestamp. */
+  private lastEventTs: number = 0;
   private identity: FullIdentity | null = null;
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
@@ -223,6 +238,7 @@ export class NostrTransportProvider implements TransportProvider {
       createWebSocket: config.createWebSocket,
       generateUUID: config.generateUUID ?? defaultUUIDGenerator,
     };
+    this.storage = config.storage ?? null;
   }
 
   // ===========================================================================
@@ -294,7 +310,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Set up subscriptions
       if (this.identity) {
-        this.subscribeToEvents();
+        await this.subscribeToEvents();
       }
     } catch (error) {
       this.status = 'error';
@@ -491,11 +507,11 @@ export class NostrTransportProvider implements TransportProvider {
           )), this.config.timeout)
         ),
       ]);
-      this.subscribeToEvents();
+      await this.subscribeToEvents();
       oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
-      this.subscribeToEvents();
+      await this.subscribeToEvents();
     }
   }
 
@@ -1224,9 +1240,41 @@ export class NostrTransportProvider implements TransportProvider {
           this.handleBroadcast(event);
           break;
       }
+
+      // Persist the latest event timestamp for resumption on reconnect.
+      // Only update for wallet event kinds (not chat/broadcast).
+      if (event.created_at && this.storage && this.keyManager) {
+        const kind = event.kind;
+        if (
+          kind === EVENT_KINDS.DIRECT_MESSAGE ||
+          kind === EVENT_KINDS.TOKEN_TRANSFER ||
+          kind === EVENT_KINDS.PAYMENT_REQUEST ||
+          kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
+        ) {
+          this.updateLastEventTimestamp(event.created_at);
+        }
+      }
     } catch (error) {
       this.log('Failed to handle event:', error);
     }
+  }
+
+  /**
+   * Save the max event timestamp to storage (fire-and-forget, no await needed by caller).
+   * Uses in-memory `lastEventTs` to avoid read-before-write race conditions
+   * when multiple events arrive in quick succession.
+   */
+  private updateLastEventTimestamp(createdAt: number): void {
+    if (!this.storage || !this.keyManager) return;
+    if (createdAt <= this.lastEventTs) return;
+
+    this.lastEventTs = createdAt;
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_WALLET_EVENT_TS}_${pubkey.slice(0, 16)}`;
+
+    this.storage.set(storageKey, createdAt.toString()).catch(err => {
+      this.log('Failed to save last event timestamp:', err);
+    });
   }
 
   private async handleDirectMessage(event: NostrEvent): Promise<void> {
@@ -1542,7 +1590,7 @@ export class NostrTransportProvider implements TransportProvider {
   private walletSubscriptionId: string | null = null;
   private chatSubscriptionId: string | null = null;
 
-  private subscribeToEvents(): void {
+  private async subscribeToEvents(): Promise<void> {
     this.log('subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
     if (!this.identity || !this.keyManager || !this.nostrClient) {
       this.log('subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
@@ -1567,8 +1615,34 @@ export class NostrTransportProvider implements TransportProvider {
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     this.log('Subscribing with Nostr pubkey:', nostrPubkey);
 
+    // Determine 'since' filter from persisted last event timestamp.
+    // - Existing wallet: resume from last processed event (inclusive >=, dedup handles replays)
+    // - Fresh wallet / no storage: use current time (no historical replay)
+    let since: number;
+    if (this.storage) {
+      const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_WALLET_EVENT_TS}_${nostrPubkey.slice(0, 16)}`;
+      try {
+        const stored = await this.storage.get(storageKey);
+        if (stored) {
+          since = parseInt(stored, 10);
+          this.lastEventTs = since; // Seed in-memory tracker from storage
+          this.log('Resuming from stored event timestamp:', since);
+        } else {
+          // No stored timestamp = fresh wallet, start from now
+          since = Math.floor(Date.now() / 1000);
+          this.log('No stored timestamp, starting from now:', since);
+        }
+      } catch (err) {
+        this.log('Failed to read last event timestamp, falling back to now:', err);
+        since = Math.floor(Date.now() / 1000);
+      }
+    } else {
+      // No storage adapter — fallback to last 24h (legacy behavior)
+      since = Math.floor(Date.now() / 1000) - 86400;
+      this.log('No storage adapter, using 24h fallback');
+    }
+
     // Subscribe to wallet events (token transfers, payment requests) with since filter
-    // Matches Sphere app's approach
     const walletFilter = new Filter();
     walletFilter.kinds = [
       EVENT_KINDS.DIRECT_MESSAGE,
@@ -1577,7 +1651,7 @@ export class NostrTransportProvider implements TransportProvider {
       EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
     ];
     walletFilter['#p'] = [nostrPubkey];
-    walletFilter.since = Math.floor(Date.now() / 1000) - 86400; // Last 24h
+    walletFilter.since = since;
 
     this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
       onEvent: (event) => {
