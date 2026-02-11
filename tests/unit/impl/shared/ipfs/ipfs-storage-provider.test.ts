@@ -396,6 +396,240 @@ describe('IpfsStorageProvider', () => {
     });
   });
 
+  describe('sidecar chain validation compliance', () => {
+    // The IPFS sidecar requires:
+    // - Bootstrap (first save): _meta.version >= 1, NO lastCid field
+    // - Normal update: _meta.lastCid == current CID on sidecar, version == current + 1
+    // These tests verify the uploaded JSON meets those requirements.
+
+    it('bootstrap save should NOT include lastCid in _meta', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      // Capture what gets uploaded
+      let uploadedBody: string | undefined;
+      vi.mocked(fetch)
+        .mockImplementationOnce(async (_url, opts) => {
+          // Upload call - extract the body
+          if (opts?.body instanceof FormData) {
+            const blob = opts.body.get('file') as Blob;
+            if (blob) uploadedBody = await blob.text();
+          }
+          return new Response(JSON.stringify({ Hash: 'bafyBootstrap' }), { status: 200 });
+        })
+        .mockResolvedValueOnce(new Response('ok', { status: 200 })); // publish
+
+      await provider.save({
+        _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        _tok1: { id: 'tok1' },
+      } as any);
+
+      expect(uploadedBody).toBeTruthy();
+      const uploaded = JSON.parse(uploadedBody!);
+      expect(uploaded._meta.version).toBe(1); // >= 1
+      expect(uploaded._meta).not.toHaveProperty('lastCid'); // NO lastCid for bootstrap
+    });
+
+    it('second save should include lastCid pointing to first CID', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      // First save (bootstrap)
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyFirst' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+      await provider.save({
+        _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        _tok1: { id: 'tok1' },
+      } as any);
+
+      expect(provider.getRemoteCid()).toBe('bafyFirst');
+
+      // Second save — capture uploaded data
+      let uploadedBody: string | undefined;
+      vi.mocked(fetch)
+        .mockImplementationOnce(async (_url, opts) => {
+          if (opts?.body instanceof FormData) {
+            const blob = opts.body.get('file') as Blob;
+            if (blob) uploadedBody = await blob.text();
+          }
+          return new Response(JSON.stringify({ Hash: 'bafySecond' }), { status: 200 });
+        })
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      await provider.save({
+        _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        _tok1: { id: 'tok1' },
+        _tok2: { id: 'tok2' },
+      } as any);
+
+      expect(uploadedBody).toBeTruthy();
+      const uploaded = JSON.parse(uploadedBody!);
+      expect(uploaded._meta.lastCid).toBe('bafyFirst'); // chain to previous CID
+      expect(uploaded._meta.version).toBe(2); // version 1 + 1
+    });
+
+    it('save after load should include lastCid from remote CID', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      // Simulate load() returning remote data at version 5
+      const remoteData = {
+        _meta: { version: 5, address: 'test', formatVersion: '2.0', updatedAt: 5000 },
+        _tok1: { id: 'tok1' },
+      };
+
+      const { parseRoutingApiResponse } = await import(
+        '../../../../../impl/shared/ipfs/ipns-record-manager'
+      );
+      vi.mocked(parseRoutingApiResponse).mockResolvedValueOnce({
+        cid: 'bafyRemoteV5',
+        sequence: 5n,
+        recordData: new Uint8Array([1, 2, 3]),
+      });
+
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('routing-response', { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify(remoteData), { status: 200 }));
+
+      await provider.load();
+
+      expect(provider.getRemoteCid()).toBe('bafyRemoteV5');
+      expect(provider.getDataVersion()).toBe(5);
+
+      // Now save — should chain to remote CID and use version 6
+      let uploadedBody: string | undefined;
+      vi.mocked(fetch)
+        .mockImplementationOnce(async (_url, opts) => {
+          if (opts?.body instanceof FormData) {
+            const blob = opts.body.get('file') as Blob;
+            if (blob) uploadedBody = await blob.text();
+          }
+          return new Response(JSON.stringify({ Hash: 'bafyNew' }), { status: 200 });
+        })
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      await provider.save({
+        _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        _tok1: { id: 'tok1' },
+        _tok2: { id: 'tok2' },
+      } as any);
+
+      const uploaded = JSON.parse(uploadedBody!);
+      expect(uploaded._meta.lastCid).toBe('bafyRemoteV5');
+      expect(uploaded._meta.version).toBe(6); // remote 5 + 1
+    });
+
+    it('version should increment by exactly 1 on consecutive saves', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      const versions: number[] = [];
+      const cids: (string | undefined)[] = [];
+
+      for (let i = 0; i < 3; i++) {
+        let uploadedBody: string | undefined;
+        vi.mocked(fetch)
+          .mockImplementationOnce(async (_url, opts) => {
+            if (opts?.body instanceof FormData) {
+              const blob = opts.body.get('file') as Blob;
+              if (blob) uploadedBody = await blob.text();
+            }
+            return new Response(JSON.stringify({ Hash: `bafyCid${i}` }), { status: 200 });
+          })
+          .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+        await provider.save({
+          _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 },
+        } as any);
+
+        const uploaded = JSON.parse(uploadedBody!);
+        versions.push(uploaded._meta.version);
+        cids.push(uploaded._meta.lastCid);
+      }
+
+      // Versions: 1, 2, 3 (incrementing by 1)
+      expect(versions).toEqual([1, 2, 3]);
+      // Chain: no lastCid, bafyCid0, bafyCid1
+      expect(cids[0]).toBeUndefined();       // bootstrap
+      expect(cids[1]).toBe('bafyCid0');       // chains to first
+      expect(cids[2]).toBe('bafyCid1');       // chains to second
+    });
+
+    it('failed save should not advance version', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      // Successful save: version becomes 1
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyOk' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+      await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+      expect(provider.getDataVersion()).toBe(1);
+
+      // Failed save: upload succeeds but publish fails
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyFail' }), { status: 200 }))
+        .mockRejectedValueOnce(new TypeError('Network error'));
+      await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+
+      // Version should be rolled back to 1
+      expect(provider.getDataVersion()).toBe(1);
+    });
+
+    it('persisted state should restore remoteCid for chain continuity', async () => {
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+
+      // Simulate persisted state from previous session
+      await statePersistence.save('12D3KooWTestPeerId', {
+        sequenceNumber: '5',
+        lastCid: 'bafyPrevSession',
+        version: 5,
+      });
+
+      provider.setIdentity(testIdentity);
+      await provider.initialize();
+
+      // remoteCid should be restored from persisted state
+      expect(provider.getRemoteCid()).toBe('bafyPrevSession');
+
+      // Next save should chain to persisted CID
+      let uploadedBody: string | undefined;
+      vi.mocked(fetch)
+        .mockImplementationOnce(async (_url, opts) => {
+          if (opts?.body instanceof FormData) {
+            const blob = opts.body.get('file') as Blob;
+            if (blob) uploadedBody = await blob.text();
+          }
+          return new Response(JSON.stringify({ Hash: 'bafyNewSession' }), { status: 200 });
+        })
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      await provider.save({ _meta: { version: 0, address: 'test', formatVersion: '2.0', updatedAt: 0 } } as any);
+
+      const uploaded = JSON.parse(uploadedBody!);
+      expect(uploaded._meta.lastCid).toBe('bafyPrevSession');
+      expect(uploaded._meta.version).toBe(6); // persisted 5 + 1
+    });
+  });
+
   describe('version conflict protection', () => {
     // Helper to set up an initialized provider with mocked fetch
     async function createInitializedProvider(): Promise<IpfsStorageProvider> {

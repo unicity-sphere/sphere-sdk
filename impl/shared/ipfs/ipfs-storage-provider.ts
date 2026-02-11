@@ -46,6 +46,14 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   private lastKnownRemoteSequence: bigint = 0n;
   private dataVersion = 0;
 
+  /**
+   * The CID currently stored on the sidecar for this IPNS name.
+   * Used as `_meta.lastCid` in the next save to satisfy chain validation.
+   * - null for bootstrap (first-ever save)
+   * - set after every successful save() or load()
+   */
+  private remoteCid: string | null = null;
+
   private readonly cache: IpfsCache;
   private readonly httpClient: IpfsHttpClient;
   private readonly statePersistence: IpfsStatePersistence;
@@ -129,6 +137,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       if (persisted) {
         this.ipnsSequenceNumber = BigInt(persisted.sequenceNumber);
         this.lastCid = persisted.lastCid;
+        this.remoteCid = persisted.lastCid; // chain link for next save
         this.dataVersion = persisted.version;
         this.log(`Loaded persisted state: seq=${this.ipnsSequenceNumber}, cid=${this.lastCid}`);
       }
@@ -175,17 +184,22 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     this.emitEvent({ type: 'storage:saving', timestamp: Date.now() });
 
     try {
-      // Update meta
+      // Update meta with chain-validation fields required by sidecar:
+      // - lastCid: must equal the CID currently stored on sidecar (null for bootstrap)
+      // - version: must be exactly current_version + 1 (for normal updates)
       this.dataVersion++;
-      const updatedData = {
-        ...data,
-        _meta: {
-          ...data._meta,
-          version: this.dataVersion,
-          ipnsName: this.ipnsName,
-          updatedAt: Date.now(),
-        },
+      const metaUpdate: Record<string, unknown> = {
+        ...data._meta,
+        version: this.dataVersion,
+        ipnsName: this.ipnsName,
+        updatedAt: Date.now(),
       };
+      if (this.remoteCid) {
+        // Normal update: chain to previous CID
+        metaUpdate.lastCid = this.remoteCid;
+      }
+      // Bootstrap (remoteCid is null): do NOT include lastCid field at all
+      const updatedData = { ...data, _meta: metaUpdate };
 
       // Upload to IPFS
       const { cid } = await this.httpClient.upload(updatedData);
@@ -212,7 +226,8 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       );
 
       if (!publishResult.success) {
-        // Rollback sequence
+        // Rollback version (sequence was not yet updated)
+        this.dataVersion--;
         this.log(`IPNS publish failed: ${publishResult.error}`);
         return {
           success: false,
@@ -224,6 +239,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       // Update local state
       this.ipnsSequenceNumber = newSeq;
       this.lastCid = cid;
+      this.remoteCid = cid; // next save chains to this CID
 
       // Update cache
       this.cache.setIpnsRecord(this.ipnsName, {
@@ -250,6 +266,8 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       this.log(`Saved: CID=${cid}, seq=${newSeq}`);
       return { success: true, cid, timestamp: Date.now() };
     } catch (error) {
+      // Rollback version on any error
+      this.dataVersion--;
       const errorMessage = error instanceof Error ? error.message : String(error);
       this.emitEvent({
         type: 'storage:error',
@@ -318,13 +336,20 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         return { success: false, error: 'IPNS record not found', source: 'remote', timestamp: Date.now() };
       }
 
-      // Track remote sequence
+      // Track remote sequence and CID for chain validation
       if (best.sequence > this.lastKnownRemoteSequence) {
         this.lastKnownRemoteSequence = best.sequence;
       }
+      this.remoteCid = best.cid;
 
       // Fetch content
       const data = await this.httpClient.fetchContent<TData>(best.cid);
+
+      // Track remote version for correct version chaining
+      const remoteVersion = (data as TxfStorageDataBase)?._meta?.version;
+      if (typeof remoteVersion === 'number' && remoteVersion > this.dataVersion) {
+        this.dataVersion = remoteVersion;
+      }
 
       this.emitEvent({
         type: 'storage:loaded',
@@ -505,6 +530,14 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
   getSequenceNumber(): bigint {
     return this.ipnsSequenceNumber;
+  }
+
+  getDataVersion(): number {
+    return this.dataVersion;
+  }
+
+  getRemoteCid(): string | null {
+    return this.remoteCid;
   }
 
   // ---------------------------------------------------------------------------
