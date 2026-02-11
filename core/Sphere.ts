@@ -102,6 +102,7 @@ import { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/Signi
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
 import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
+import { normalizeNametag, isValidNametag } from '@unicitylabs/nostr-js-sdk';
 
 import type {
   LegacyFileType,
@@ -1755,12 +1756,10 @@ export class Sphere {
       throw new Error('Address index must be non-negative');
     }
 
-    // If nametag requested, validate format early
-    const newNametag = options?.nametag?.startsWith('@')
-      ? options.nametag.slice(1)
-      : options?.nametag;
-    if (newNametag && !this.validateNametag(newNametag)) {
-      throw new Error('Invalid nametag format. Use alphanumeric characters, 3-20 chars.');
+    // If nametag requested, normalize and validate format early
+    const newNametag = options?.nametag ? this.cleanNametag(options.nametag) : undefined;
+    if (newNametag && !isValidNametag(newNametag)) {
+      throw new Error('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.');
     }
 
     // Derive the address at the given index
@@ -2236,10 +2235,10 @@ export class Sphere {
   async registerNametag(nametag: string): Promise<void> {
     this.ensureReady();
 
-    // Validate nametag format
-    const cleanNametag = nametag.startsWith('@') ? nametag.slice(1) : nametag;
-    if (!this.validateNametag(cleanNametag)) {
-      throw new Error('Invalid nametag format. Use alphanumeric characters, 3-20 chars.');
+    // Normalize and validate nametag format
+    const cleanNametag = this.cleanNametag(nametag);
+    if (!isValidNametag(cleanNametag)) {
+      throw new Error('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.');
     }
 
     // Check if current address already has a nametag
@@ -2620,14 +2619,11 @@ export class Sphere {
   }
 
   /**
-   * Validate nametag format
+   * Strip @ prefix and normalize a nametag (lowercase, phone E.164, strip @unicity suffix).
    */
-  private validateNametag(nametag: string): boolean {
-    // Alphanumeric characters, underscores and hyphens allowed
-    const pattern = new RegExp(
-      `^[a-zA-Z0-9_-]{${LIMITS.NAMETAG_MIN_LENGTH},${LIMITS.NAMETAG_MAX_LENGTH}}$`
-    );
-    return pattern.test(nametag);
+  private cleanNametag(raw: string): string {
+    const stripped = raw.startsWith('@') ? raw.slice(1) : raw;
+    return normalizeNametag(stripped);
   }
 
   // ===========================================================================

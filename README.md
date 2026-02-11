@@ -1103,7 +1103,7 @@ function getRelayStatuses() {
 
 ## Nametags
 
-Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments.
+Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments. Valid formats: lowercase alphanumeric with `_` or `-` (3–20 chars), or E.164 phone numbers (e.g., `+14155552671`). Input is normalized to lowercase automatically.
 
 > **Important:** Nametags are required to use the testnet faucet. Register a nametag before requesting test tokens.
 

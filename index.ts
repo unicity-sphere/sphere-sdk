@@ -360,6 +360,20 @@ export type {
 } from './registry';
 
 // =============================================================================
+// Nametag Utilities (re-exported from @unicitylabs/nostr-js-sdk)
+// =============================================================================
+
+export {
+  normalizeNametag,
+  isValidNametag,
+  isPhoneNumber,
+  hashNametag,
+  areSameNametag,
+  NAMETAG_MIN_LENGTH,
+  NAMETAG_MAX_LENGTH,
+} from '@unicitylabs/nostr-js-sdk';
+
+// =============================================================================
 // Price Provider
 // =============================================================================
 

@@ -90,7 +90,7 @@
   "dependencies": {
     "@noble/curves": "^1.9.7",
     "@noble/hashes": "^2.0.1",
-    "@unicitylabs/nostr-js-sdk": "^0.3.2",
+    "@unicitylabs/nostr-js-sdk": "^0.3.3",
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
