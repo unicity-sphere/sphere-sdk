@@ -935,6 +935,8 @@ async function main() {
           console.error('\n✗ Transfer failed:', result.error || result.status);
         }
 
+        // Wait for background tasks (e.g., change token creation from instant split)
+        await sphere.payments.waitForPendingOperations();
         await closeSphere();
         break;
       }
@@ -1537,4 +1539,4 @@ async function main() {
   }
 }
 
-main();
+main().then(() => process.exit(0));

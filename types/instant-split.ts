@@ -261,6 +261,9 @@ export interface InstantSplitResult {
 
   /** Whether background processing was started */
   backgroundStarted?: boolean;
+
+  /** Promise that resolves when background processing completes (change token saved) */
+  backgroundPromise?: Promise<void>;
 }
 
 /**

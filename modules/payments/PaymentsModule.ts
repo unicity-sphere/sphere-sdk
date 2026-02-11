@@ -640,6 +640,7 @@ export class PaymentsModule {
   // Token State
   private tokens: Map<string, Token> = new Map();
   private pendingTransfers: Map<string, TransferResult> = new Map();
+  private pendingBackgroundTasks: Promise<void>[] = [];
 
   // Repository State (tombstones, archives, forked, history)
   private tombstones: TombstoneEntry[] = [];
@@ -1039,6 +1040,11 @@ export class PaymentsModule {
             throw new Error(instantResult.error || 'Instant split failed');
           }
 
+          // Track background task for change token creation
+          if (instantResult.backgroundPromise) {
+            this.pendingBackgroundTasks.push(instantResult.backgroundPromise);
+          }
+
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
@@ -1302,6 +1308,11 @@ export class PaymentsModule {
       );
 
       if (result.success) {
+        // Track background task for change token creation
+        if (result.backgroundPromise) {
+          this.pendingBackgroundTasks.push(result.backgroundPromise);
+        }
+
         // Remove the original token — skipHistory because we record below
         const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
         await this.removeToken(tokenToSplit.id, recipientNametag, true);
@@ -2077,6 +2088,17 @@ export class PaymentsModule {
    */
   setPriceProvider(provider: PriceProvider): void {
     this.priceProvider = provider;
+  }
+
+  /**
+   * Wait for all pending background operations (e.g., instant split change token creation).
+   * Call this before process exit to ensure all tokens are saved.
+   */
+  async waitForPendingOperations(): Promise<void> {
+    if (this.pendingBackgroundTasks.length > 0) {
+      await Promise.allSettled(this.pendingBackgroundTasks);
+      this.pendingBackgroundTasks = [];
+    }
   }
 
   /**
