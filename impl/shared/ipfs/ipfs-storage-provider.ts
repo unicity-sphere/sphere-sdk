@@ -36,6 +36,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   implements TokenStorageProvider<TData>
 {
   readonly id = 'ipfs';
+  readonly syncOnly = true;
   readonly name = 'IPFS Storage';
   readonly type = 'p2p' as const;
 
@@ -710,7 +711,10 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     }
   }
 
-  private readonly META_KEYS = new Set(['_meta', '_tombstones', '_outbox', '_sent', '_invalid']);
+  private readonly META_KEYS = new Set([
+    '_meta', '_tombstones', '_outbox', '_sent', '_invalid',
+    '_nametag', '_mintOutbox', '_invalidatedNametags', '_integrity',
+  ]);
 
   private populateTokenBuffer(data: TxfStorageDataBase): void {
     this.tokenBuffer.clear();

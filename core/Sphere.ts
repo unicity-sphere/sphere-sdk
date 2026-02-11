@@ -856,11 +856,6 @@ export class Sphere {
     // Update payments module with new providers
     if (this._initialized) {
       this._payments.updateTokenStorageProviders(this._tokenStorageProviders);
-
-      // Auto-sync with newly added provider (non-blocking)
-      this._payments.sync().catch((err) => {
-        console.warn(`[Sphere] Auto-sync with ${provider.id} failed:`, err);
-      });
     }
   }
 

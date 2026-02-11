@@ -678,6 +678,9 @@ export class PaymentsModule {
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly SYNC_DEBOUNCE_MS = 500;
 
+  /** Sync coalescing: concurrent sync() calls share the same operation */
+  private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -3611,6 +3614,22 @@ export class PaymentsModule {
   async sync(): Promise<{ added: number; removed: number }> {
     this.ensureInitialized();
 
+    // Sync coalescing: if a sync is already in progress, return its promise.
+    // This prevents race conditions when addTokenStorageProvider() fires a
+    // fire-and-forget sync and the caller also syncs immediately after.
+    if (this._syncInProgress) {
+      return this._syncInProgress;
+    }
+
+    this._syncInProgress = this._doSync();
+    try {
+      return await this._syncInProgress;
+    } finally {
+      this._syncInProgress = null;
+    }
+  }
+
+  private async _doSync(): Promise<{ added: number; removed: number }> {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
 
     try {
@@ -4495,6 +4514,8 @@ export class PaymentsModule {
 
     const data = await this.createStorageData();
     for (const [id, provider] of providers) {
+      // Skip sync-only providers (e.g. IPFS) — they publish via sync(), not save()
+      if (provider.syncOnly) continue;
       try {
         await provider.save(data);
       } catch (err) {
