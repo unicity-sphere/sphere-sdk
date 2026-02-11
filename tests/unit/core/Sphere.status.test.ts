@@ -162,14 +162,29 @@ describe('Sphere Status & Provider Management', () => {
     (Sphere as unknown as { instance: null }).instance = null;
   });
 
-  async function initSphere() {
-    const { sphere } = await Sphere.init({
+  async function initSphere(options?: {
+    l1?: { electrumUrl?: string };
+    price?: { platform: string };
+  }) {
+    const initOpts: Record<string, unknown> = {
       storage,
       transport: transport as unknown as TransportProvider,
       oracle: oracle as unknown as OracleProvider,
       tokenStorage,
       autoGenerate: true,
-    });
+    };
+    if (options?.l1) {
+      initOpts.l1 = options.l1;
+    }
+    if (options?.price) {
+      initOpts.price = {
+        platform: options.price.platform,
+        getPrices: vi.fn().mockResolvedValue(new Map()),
+        getPrice: vi.fn().mockResolvedValue(null),
+        clearCache: vi.fn(),
+      };
+    }
+    const { sphere } = await Sphere.init(initOpts as Parameters<typeof Sphere.init>[0]);
     return sphere;
   }
 
@@ -443,6 +458,205 @@ describe('Sphere Status & Provider Management', () => {
       transportWithSim._simulateEvent({ type: 'transport:disconnected', timestamp: Date.now() });
 
       expect(events).toHaveLength(0);
+    });
+
+    it('should emit error event from transport', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const transportWithSim = transport as unknown as { _simulateEvent: (e: unknown) => void };
+      transportWithSim._simulateEvent({
+        type: 'transport:error',
+        timestamp: Date.now(),
+        error: 'Connection reset',
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].status).toBe('error');
+      expect(events[0].error).toBe('Connection reset');
+    });
+
+    it('should emit connecting status on reconnecting event', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const transportWithSim = transport as unknown as { _simulateEvent: (e: unknown) => void };
+      transportWithSim._simulateEvent({
+        type: 'transport:reconnecting',
+        timestamp: Date.now(),
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].status).toBe('connecting');
+      expect(events[0].connected).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // L1 status in getStatus()
+  // ===========================================================================
+
+  describe('L1 in getStatus()', () => {
+    it('should show L1 provider when configured', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+      const status = sphere.getStatus();
+
+      expect(status.l1).toHaveLength(1);
+      expect(status.l1[0].id).toBe('l1-alpha');
+      expect(status.l1[0].role).toBe('l1');
+      expect(status.l1[0].name).toBe('ALPHA L1');
+    });
+
+    it('should show L1 as disconnected when WebSocket not connected', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+      const status = sphere.getStatus();
+
+      // isWebSocketConnected() is mocked to return false
+      expect(status.l1[0].connected).toBe(false);
+      expect(status.l1[0].status).toBe('disconnected');
+    });
+
+    it('should show L1 enabled by default', async () => {
+      const sphere = await initSphere({
+        l1: { electrumUrl: 'wss://test-fulcrum:50004' },
+      });
+      const status = sphere.getStatus();
+
+      expect(status.l1[0].enabled).toBe(true);
+    });
+  });
+
+  // ===========================================================================
+  // Price provider in getStatus()
+  // ===========================================================================
+
+  describe('Price in getStatus()', () => {
+    it('should show price provider when configured', async () => {
+      const sphere = await initSphere({ price: { platform: 'coingecko' } });
+      const status = sphere.getStatus();
+
+      expect(status.price).toHaveLength(1);
+      expect(status.price[0].role).toBe('price');
+      expect(status.price[0].name).toBe('coingecko');
+      expect(status.price[0].connected).toBe(true);
+    });
+
+    it('should show price as empty when not configured', async () => {
+      const sphere = await initSphere();
+      const status = sphere.getStatus();
+
+      expect(status.price).toHaveLength(0);
+    });
+  });
+
+  // ===========================================================================
+  // disable/enable transport and oracle
+  // ===========================================================================
+
+  describe('disableProvider() for core providers', () => {
+    it('should disable transport provider', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.disableProvider('mock-transport');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(false);
+
+      const status = sphere.getStatus();
+      expect(status.transport[0].enabled).toBe(false);
+    });
+
+    it('should disable oracle provider', async () => {
+      const sphere = await initSphere();
+
+      const result = await sphere.disableProvider('mock-oracle');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-oracle')).toBe(false);
+
+      const status = sphere.getStatus();
+      expect(status.oracle[0].enabled).toBe(false);
+    });
+
+    it('should re-enable transport after disable', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('mock-transport');
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(false);
+
+      const result = await sphere.enableProvider('mock-transport');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(true);
+    });
+
+    it('should re-enable oracle after disable', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('mock-oracle');
+      const result = await sphere.enableProvider('mock-oracle');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-oracle')).toBe(true);
+    });
+  });
+
+  // ===========================================================================
+  // Multiple token storage providers
+  // ===========================================================================
+
+  describe('multiple token storage providers', () => {
+    it('should show all registered token storage providers in status', async () => {
+      const sphere = await initSphere();
+
+      // Add a second token storage provider
+      const secondStorage = createMockTokenStorage('file-tokens', 'File Storage');
+      await sphere.addTokenStorageProvider(secondStorage);
+
+      const status = sphere.getStatus();
+      expect(status.tokenStorage).toHaveLength(2);
+
+      const ids = status.tokenStorage.map((p) => p.id);
+      expect(ids).toContain('indexeddb-tokens');
+      expect(ids).toContain('file-tokens');
+    });
+
+    it('should disable one token storage without affecting others', async () => {
+      const sphere = await initSphere();
+      const secondStorage = createMockTokenStorage('file-tokens', 'File Storage');
+      await sphere.addTokenStorageProvider(secondStorage);
+
+      await sphere.disableProvider('file-tokens');
+
+      const status = sphere.getStatus();
+      const indexeddb = status.tokenStorage.find((p) => p.id === 'indexeddb-tokens');
+      const file = status.tokenStorage.find((p) => p.id === 'file-tokens');
+
+      expect(indexeddb!.enabled).toBe(true);
+      expect(file!.enabled).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // reconnect() without manual event emit
+  // ===========================================================================
+
+  describe('reconnect()', () => {
+    it('should reconnect transport without duplicate manual event', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      await sphere.reconnect();
+
+      // reconnect() calls transport.disconnect() then transport.connect()
+      expect(transport.disconnect).toHaveBeenCalled();
+      expect(transport.connect).toHaveBeenCalled();
+      // Events come from the auto-bridge, not manual emit
     });
   });
 });

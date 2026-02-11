@@ -125,39 +125,220 @@ describe('checkNetworkHealth', () => {
   });
 
   describe('WebSocket checks (relay, l1)', () => {
-    it('should report relay unhealthy when WebSocket not available', async () => {
-      // In Node.js test env without WebSocket polyfill, globalThis.WebSocket is undefined
-      const originalWS = (globalThis as Record<string, unknown>).WebSocket;
-      (globalThis as Record<string, unknown>).WebSocket = undefined;
+    let originalWS: unknown;
 
-      try {
-        const result = await checkNetworkHealth('testnet', { services: ['relay'] });
+    beforeEach(() => {
+      originalWS = (globalThis as Record<string, unknown>).WebSocket;
+    });
 
-        expect(result.services.relay).toBeDefined();
-        expect(result.services.relay!.healthy).toBe(false);
-        expect(result.services.relay!.error).toContain('WebSocket not available');
-      } finally {
-        if (originalWS !== undefined) {
-          (globalThis as Record<string, unknown>).WebSocket = originalWS;
-        }
+    afterEach(() => {
+      if (originalWS !== undefined) {
+        (globalThis as Record<string, unknown>).WebSocket = originalWS;
+      } else {
+        delete (globalThis as Record<string, unknown>).WebSocket;
       }
     });
 
-    it('should report l1 unhealthy when WebSocket not available', async () => {
-      const originalWS = (globalThis as Record<string, unknown>).WebSocket;
+    it('should report relay unhealthy when WebSocket not available', async () => {
       (globalThis as Record<string, unknown>).WebSocket = undefined;
 
-      try {
-        const result = await checkNetworkHealth('testnet', { services: ['l1'] });
+      const result = await checkNetworkHealth('testnet', { services: ['relay'] });
 
-        expect(result.services.l1).toBeDefined();
-        expect(result.services.l1!.healthy).toBe(false);
-        expect(result.services.l1!.error).toContain('WebSocket not available');
-      } finally {
-        if (originalWS !== undefined) {
-          (globalThis as Record<string, unknown>).WebSocket = originalWS;
+      expect(result.services.relay).toBeDefined();
+      expect(result.services.relay!.healthy).toBe(false);
+      expect(result.services.relay!.error).toContain('WebSocket not available');
+    });
+
+    it('should report l1 unhealthy when WebSocket not available', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = undefined;
+
+      const result = await checkNetworkHealth('testnet', { services: ['l1'] });
+
+      expect(result.services.l1).toBeDefined();
+      expect(result.services.l1!.healthy).toBe(false);
+      expect(result.services.l1!.error).toContain('WebSocket not available');
+    });
+
+    it('should report relay healthy when WebSocket connects successfully', async () => {
+      // Mock WebSocket that fires onopen immediately
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onopen?.(), 1);
         }
-      }
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', { services: ['relay'] });
+
+      expect(result.services.relay!.healthy).toBe(true);
+      expect(result.services.relay!.responseTimeMs).toBeGreaterThanOrEqual(0);
+      expect(result.services.relay!.url).toContain('wss://');
+    });
+
+    it('should report l1 healthy when WebSocket connects successfully', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', { services: ['l1'] });
+
+      expect(result.services.l1!.healthy).toBe(true);
+      expect(result.services.l1!.responseTimeMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should report relay unhealthy when WebSocket errors', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onerror?.({}), 1);
+        }
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', { services: ['relay'] });
+
+      expect(result.services.relay!.healthy).toBe(false);
+      expect(result.services.relay!.error).toContain('connection error');
+    });
+
+    it('should report relay unhealthy when WebSocket closes before open', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: ((event: { code: number; reason: string }) => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onclose?.({ code: 1006, reason: 'Connection refused' }), 1);
+        }
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', { services: ['relay'] });
+
+      expect(result.services.relay!.healthy).toBe(false);
+      expect(result.services.relay!.error).toContain('closed');
+    });
+
+    it('should report relay unhealthy on connection timeout', async () => {
+      // WebSocket that never fires any event — will timeout
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        close() {}
+      };
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['relay'],
+        timeoutMs: 50,
+      });
+
+      expect(result.services.relay!.healthy).toBe(false);
+      expect(result.services.relay!.error).toContain('timeout');
+    });
+
+    it('should report unhealthy when WebSocket constructor throws', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        constructor() {
+          throw new Error('Invalid URL');
+        }
+      };
+
+      const result = await checkNetworkHealth('testnet', { services: ['relay'] });
+
+      expect(result.services.relay!.healthy).toBe(false);
+      expect(result.services.relay!.error).toContain('Invalid URL');
+    });
+  });
+
+  describe('parallel checks', () => {
+    it('should check all services in parallel', async () => {
+      // Mock WebSocket for relay + l1
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      // Mock fetch for oracle
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({ jsonrpc: '2.0', result: 1 }), { status: 200 }),
+      );
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['relay', 'oracle', 'l1'],
+      });
+
+      expect(result.services.relay).toBeDefined();
+      expect(result.services.oracle).toBeDefined();
+      expect(result.services.l1).toBeDefined();
+      expect(result.services.relay!.healthy).toBe(true);
+      expect(result.services.oracle!.healthy).toBe(true);
+      expect(result.services.l1!.healthy).toBe(true);
+      expect(result.healthy).toBe(true);
+    });
+
+    it('should report unhealthy if any service is down', async () => {
+      // Relay succeeds, oracle fails
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      fetchSpy.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+      const result = await checkNetworkHealth('testnet', {
+        services: ['relay', 'oracle'],
+      });
+
+      expect(result.services.relay!.healthy).toBe(true);
+      expect(result.services.oracle!.healthy).toBe(false);
+      expect(result.healthy).toBe(false); // overall unhealthy
+    });
+  });
+
+  describe('default behavior', () => {
+    it('should check all three services when no filter specified', async () => {
+      // WebSocket for relay + l1
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: (() => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onopen?.(), 1);
+        }
+        close() {}
+      };
+
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), { status: 200 }),
+      );
+
+      const result = await checkNetworkHealth('testnet');
+
+      // All three services should be checked
+      expect(result.services.relay).toBeDefined();
+      expect(result.services.oracle).toBeDefined();
+      expect(result.services.l1).toBeDefined();
     });
   });
 });
