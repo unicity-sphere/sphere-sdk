@@ -82,6 +82,14 @@ export interface Asset {
   readonly iconUrl?: string;
   readonly totalAmount: string;
   readonly tokenCount: number;
+  /** Sum of confirmed token amounts (smallest units) */
+  readonly confirmedAmount: string;
+  /** Sum of unconfirmed (submitted/pending) token amounts (smallest units) */
+  readonly unconfirmedAmount: string;
+  /** Number of confirmed tokens aggregated */
+  readonly confirmedTokenCount: number;
+  /** Number of unconfirmed tokens aggregated */
+  readonly unconfirmedTokenCount: number;
   /** Price per whole unit in USD (null if PriceProvider not configured) */
   readonly priceUsd: number | null;
   /** Price per whole unit in EUR (null if PriceProvider not configured) */
@@ -108,6 +116,8 @@ export type TransferStatus =
 
 export type AddressMode = 'auto' | 'direct' | 'proxy';
 
+export type TransferMode = 'instant' | 'conservative';
+
 export interface TransferRequest {
   readonly coinId: string;
   readonly amount: string;
@@ -115,13 +125,33 @@ export interface TransferRequest {
   readonly memo?: string;
   /** Address mode: 'auto' (default) uses directAddress if available, 'direct' forces DIRECT, 'proxy' forces PROXY */
   readonly addressMode?: AddressMode;
+  /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
+  readonly transferMode?: TransferMode;
+}
+
+/**
+ * Per-token transfer detail tracking the on-chain commitment or split operation
+ * for each source token involved in a transfer.
+ */
+export interface TokenTransferDetail {
+  /** Source token ID that was consumed in this transfer */
+  readonly sourceTokenId: string;
+  /** Transfer method used for this token */
+  readonly method: 'direct' | 'split';
+  /** Aggregator commitment request ID hex (for direct transfers) */
+  readonly requestIdHex?: string;
+  /** Split group ID (for split transfers — correlates sender/recipient/change tokens) */
+  readonly splitGroupId?: string;
+  /** Nostr event ID (for split transfers delivered via Nostr) */
+  readonly nostrEventId?: string;
 }
 
 export interface TransferResult {
   readonly id: string;
   status: TransferStatus;
   readonly tokens: Token[];
-  txHash?: string;
+  /** Per-token transfer details — one entry per source token consumed */
+  readonly tokenTransfers: TokenTransferDetail[];
   error?: string;
 }
 

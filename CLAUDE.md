@@ -49,7 +49,8 @@ console.log('Nametag:', identity.nametag);            // alice
 const assets = await sphere.payments.getAssets();
 // [{ coinId, symbol, totalAmount, tokenCount, priceUsd, fiatValueUsd, change24h }]
 
-const totalUsd = await sphere.payments.getBalance();  // number | null (null if no PriceProvider)
+const balances = sphere.payments.getBalance();        // Asset[] with confirmed/unconfirmed breakdown
+const totalUsd = await sphere.payments.getFiatBalance(); // number | null (null if no PriceProvider)
 
 const tokens = sphere.payments.getTokens();           // individual Token[]
 const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' }); // filter by coin
@@ -60,11 +61,17 @@ const result = await sphere.payments.send({
   amount: '1000000',           // in smallest unit (string)
   coinId: 'UCT',              // token coin ID
   memo: 'Payment for coffee', // optional
+  // transferMode: 'instant',      // default — fast, receiver resolves proofs
+  // transferMode: 'conservative', // slower — sender collects all proofs first
 });
-// result: { id, status, tokens, error? }
+// result: { id, status, tokens, tokenTransfers, error? }
 // status: 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
 
-// 6. Receive tokens (automatic via Nostr)
+// 6. Receive tokens (explicit one-shot query + optional finalization)
+const { transfers } = await sphere.payments.receive();
+await sphere.payments.receive({ finalize: true }); // also resolve unconfirmed V5 tokens
+
+// Listen for incoming transfers
 sphere.on('transfer:incoming', (transfer) => {
   console.log(`From: ${transfer.senderNametag}, Tokens: ${transfer.tokens.length}`);
 });

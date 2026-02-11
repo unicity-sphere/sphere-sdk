@@ -43,6 +43,9 @@ npm run cli -- --help
 # Initialize new wallet on testnet
 npm run cli -- init --network testnet
 
+# Initialize with nametag (mints token on-chain)
+npm run cli -- init --network testnet --nametag alice
+
 # Import existing wallet
 npm run cli -- init --mnemonic "your 24 words here"
 
@@ -52,35 +55,58 @@ npm run cli -- status
 # Check balance
 npm run cli -- balance
 
-# Show receive address
+# Fetch pending transfers and finalize unconfirmed tokens
+npm run cli -- balance --finalize
+
+# Check for incoming transfers
 npm run cli -- receive
 
-# Send tokens
-npm run cli -- send @alice 1000000
+# Check for incoming transfers and finalize unconfirmed tokens
+npm run cli -- receive --finalize
+
+# Send tokens (instant mode, default)
+npm run cli -- send @alice 1 --coin UCT --instant
+
+# Send tokens (conservative mode — collect all proofs first)
+npm run cli -- send @alice 1 --coin UCT --conservative
+
+# Request test tokens from faucet
+npm run cli -- topup
 
 # Register nametag
 npm run cli -- nametag myname
 
 # Show transaction history
 npm run cli -- history 10
+
+# Verify tokens against aggregator (detect spent tokens)
+npm run cli -- verify-balance
 ```
 
 ### Available CLI Commands
 
 | Category | Command | Description |
 |----------|---------|-------------|
-| **Wallet** | `init [--network <net>] [--mnemonic "<words>"]` | Create or import wallet |
+| **Wallet** | `init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]` | Create or import wallet |
 | | `status` | Show wallet identity |
 | | `config` | Show/set configuration |
-| **Balance** | `balance` | Show L3 token balance |
-| | `tokens` | List all tokens |
+| **Profiles** | `wallet list` | List all wallet profiles |
+| | `wallet use <name>` | Switch to a wallet profile |
+| | `wallet create <name> [--network <net>]` | Create a new wallet profile |
+| | `wallet delete <name>` | Delete a wallet profile |
+| | `wallet current` | Show current wallet profile |
+| **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
+| | `tokens` | List all tokens with details |
 | | `l1-balance` | Show L1 (ALPHA) balance |
-| **Transfers** | `send <recipient> <amount>` | Send tokens |
-| | `receive` | Show address for receiving |
+| | `topup [coin] [amount]` | Request test tokens from faucet |
+| | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
+| **Transfers** | `send <to> <amount> [--coin SYM] [--instant\|--conservative]` | Send tokens |
+| | `receive [--finalize]` | Check for incoming transfers |
 | | `history [limit]` | Show transaction history |
 | **Nametags** | `nametag <name>` | Register a nametag |
 | | `nametag-info <name>` | Lookup nametag info |
 | | `my-nametag` | Show current nametag |
+| | `nametag-sync` | Re-publish nametag with chainPubkey |
 | **Utils** | `generate-key` | Generate random key |
 | | `to-human <amount>` | Convert to human readable |
 | | `parse-wallet <file>` | Parse wallet file |

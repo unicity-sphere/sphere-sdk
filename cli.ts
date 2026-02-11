@@ -207,7 +207,8 @@ WALLET PROFILES:
   wallet current                    Show current wallet profile
 
 BALANCE & TOKENS:
-  balance                           Show L3 token balance
+  balance [--finalize]              Show L3 token balance
+                                    --finalize: wait for unconfirmed tokens to be finalized
   tokens                            List all tokens with details
   l1-balance                        Show L1 (ALPHA) balance
   topup [coin] [amount]             Request test tokens from faucet
@@ -220,10 +221,13 @@ BALANCE & TOKENS:
 
 TRANSFERS:
   send <to> <amount> [options]      Send tokens (to: @nametag or address)
-                                    --coin SYM    Token symbol (UCT/BTC/ETH/SOL)
-                                    --direct      Force DirectAddress transfer
-                                    --proxy       Force PROXY address transfer
-  receive                           Show address for receiving tokens
+                                    --coin SYM       Token symbol (UCT/BTC/ETH/SOL)
+                                    --direct         Force DirectAddress transfer
+                                    --proxy          Force PROXY address transfer
+                                    --instant        Send immediately via Nostr (default)
+                                    --conservative   Collect all proofs first, then send
+  receive [--finalize]              Check for incoming transfers
+                                    --finalize: wait for unconfirmed tokens to be finalized
   history [limit]                   Show transaction history
 
 ADDRESSES:
@@ -612,9 +616,36 @@ async function main() {
 
       // === BALANCE & TOKENS ===
       case 'balance': {
+        const finalize = args.includes('--finalize');
         const sphere = await getSphere();
-        const assets = await sphere.payments.getAssets();
-        const totalUsd = await sphere.payments.getBalance();
+
+        console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
+        const result = await sphere.payments.receive({
+          finalize,
+          onProgress: (resolution) => {
+            if (resolution.stillPending > 0) {
+              const currentBalances = sphere.payments.getBalance();
+              for (const bal of currentBalances) {
+                if (BigInt(bal.unconfirmedAmount) > 0n) {
+                  console.log(`  ${bal.symbol}: ${bal.unconfirmedTokenCount} token(s) still unconfirmed...`);
+                }
+              }
+            }
+          },
+        });
+
+        if (finalize) {
+          if (result.timedOut) {
+            console.log('  Warning: finalization timed out, some tokens still unconfirmed.');
+          } else if (result.finalization && result.finalization.resolved > 0) {
+            console.log(`All tokens finalized in ${((result.finalizationDurationMs ?? 0) / 1000).toFixed(1)}s.`);
+          } else {
+            console.log('All tokens are already confirmed.');
+          }
+        }
+
+        const assets = sphere.payments.getBalance();
+        const totalUsd = await sphere.payments.getFiatBalance();
 
         console.log('\nL3 Balance:');
         console.log('─'.repeat(50));
@@ -624,15 +655,16 @@ async function main() {
         } else {
           for (const asset of assets) {
             const decimals = asset.decimals ?? 8;
-            const divisor = BigInt(10 ** decimals);
-            const amountBigInt = BigInt(asset.totalAmount);
-            const wholePart = amountBigInt / divisor;
-            const fracPart = amountBigInt % divisor;
-            const formatted = fracPart > 0n
-              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-              : wholePart.toString();
+            const confirmedFormatted = toHumanReadable(asset.confirmedAmount, decimals);
+            const unconfirmedBigInt = BigInt(asset.unconfirmedAmount);
 
-            let line = `${asset.symbol}: ${formatted} (${asset.tokenCount} token${asset.tokenCount !== 1 ? 's' : ''})`;
+            let line = `${asset.symbol}: ${confirmedFormatted}`;
+            if (unconfirmedBigInt > 0n) {
+              const unconfirmedFormatted = toHumanReadable(asset.unconfirmedAmount, decimals);
+              line += ` (+ ${unconfirmedFormatted} unconfirmed) [${asset.confirmedTokenCount}+${asset.unconfirmedTokenCount} tokens]`;
+            } else {
+              line += ` (${asset.tokenCount} token${asset.tokenCount !== 1 ? 's' : ''})`;
+            }
             if (asset.fiatValueUsd != null) {
               line += ` ≈ $${asset.fiatValueUsd.toFixed(2)}`;
             }
@@ -663,13 +695,7 @@ async function main() {
             const def = registry.getDefinition(token.coinId);
             const symbol = def?.symbol || token.symbol || 'UNK';
             const decimals = def?.decimals ?? token.decimals ?? 8;
-            const amountBigInt = BigInt(token.amount || '0');
-            const divisor = BigInt(10 ** decimals);
-            const wholePart = amountBigInt / divisor;
-            const fracPart = amountBigInt % divisor;
-            const formatted = fracPart > 0
-              ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-              : wholePart.toString();
+            const formatted = toHumanReadable(token.amount || '0', decimals);
             console.log(`ID: ${token.id.slice(0, 16)}...`);
             console.log(`  Coin: ${symbol} (${token.coinId.slice(0, 8)}...)`);
             console.log(`  Amount: ${formatted} ${symbol}`);
@@ -762,13 +788,7 @@ async function main() {
           const def = registry.getDefinition(token.coinId);
           const symbol = def?.symbol || token.symbol || 'UNK';
           const decimals = def?.decimals ?? token.decimals ?? 8;
-          const amountBigInt = BigInt(token.amount || '0');
-          const divisor = BigInt(10 ** decimals);
-          const wholePart = amountBigInt / divisor;
-          const fracPart = amountBigInt % divisor;
-          const formatted = fracPart > 0
-            ? `${wholePart}.${fracPart.toString().padStart(decimals, '0').replace(/0+$/, '')}`
-            : wholePart.toString();
+          const formatted = toHumanReadable(token.amount || '0', decimals);
 
           const txf = tokenToTxf(token);
           const tokenId = txf?.genesis?.data?.tokenId || token.id;
@@ -846,12 +866,14 @@ async function main() {
       case 'send': {
         const [, recipient, amountStr] = args;
         if (!recipient || !amountStr) {
-          console.error('Usage: send <recipient> <amount> [--coin <symbol>] [--direct|--proxy]');
+          console.error('Usage: send <recipient> <amount> [--coin <symbol>] [--direct|--proxy] [--instant|--conservative]');
           console.error('  recipient: @nametag or DIRECT:// address');
           console.error('  amount: decimal amount (e.g., 0.5, 100)');
           console.error('  --coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
           console.error('  --direct: force DirectAddress transfer (requires new nametag with directAddress)');
           console.error('  --proxy: force PROXY address transfer (works with any nametag)');
+          console.error('  --instant: send via Nostr immediately (default, receiver gets unconfirmed token)');
+          console.error('  --conservative: collect all proofs first, receiver gets confirmed token');
           process.exit(1);
         }
 
@@ -867,6 +889,15 @@ async function main() {
           process.exit(1);
         }
         const addressMode = forceDirect ? 'direct' : forceProxy ? 'proxy' : 'auto';
+
+        // Parse --instant and --conservative options
+        const forceInstant = args.includes('--instant');
+        const forceConservative = args.includes('--conservative');
+        if (forceInstant && forceConservative) {
+          console.error('Cannot use both --instant and --conservative');
+          process.exit(1);
+        }
+        const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
 
         // Resolve symbol to coinId hex and get decimals
         const registry = TokenRegistry.getInstance();
@@ -884,14 +915,16 @@ async function main() {
 
         const sphere = await getSphere();
 
-        const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode} mode)`;
-        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}${modeLabel}...`);
+        const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode})`;
+        const txModeLabel = forceConservative ? ' [conservative]' : '';
+        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}${modeLabel}${txModeLabel}...`);
 
         const result = await sphere.payments.send({
           recipient,
           amount: amountSmallest,
           coinId: coinIdHex,
           addressMode,
+          transferMode,
         });
 
         if (result.status === 'completed' || result.status === 'submitted') {
@@ -907,6 +940,7 @@ async function main() {
       }
 
       case 'receive': {
+        const finalize = args.includes('--finalize');
         const sphere = await getSphere();
         const identity = sphere.identity;
 
@@ -915,6 +949,7 @@ async function main() {
           process.exit(1);
         }
 
+        // Show addresses
         console.log('\nReceive Address:');
         console.log('─'.repeat(50));
         console.log(`L3 (Direct): ${identity.directAddress || '(not available)'}`);
@@ -923,7 +958,40 @@ async function main() {
           console.log(`Nametag:     @${identity.nametag}`);
         }
         console.log('─'.repeat(50));
-        console.log('\nShare your nametag or Direct address to receive tokens.');
+
+        // Fetch pending transfers
+        console.log('\nChecking for incoming transfers...');
+        const registry = TokenRegistry.getInstance();
+        const result = await sphere.payments.receive({
+          finalize,
+          onProgress: (resolution) => {
+            if (resolution.stillPending > 0) {
+              console.log(`  ${resolution.stillPending} token(s) still finalizing...`);
+            }
+          },
+        });
+
+        if (result.transfers.length === 0) {
+          console.log('No new transfers found.');
+        } else {
+          console.log(`\nReceived ${result.transfers.length} new transfer(s):`);
+          for (const transfer of result.transfers) {
+            for (const token of transfer.tokens) {
+              const def = registry.getDefinition(token.coinId);
+              const decimals = def?.decimals ?? token.decimals ?? 8;
+              const symbol = def?.symbol || token.symbol;
+              const formatted = toHumanReadable(token.amount, decimals);
+              const statusTag = token.status === 'confirmed' ? '' : ` [${token.status}]`;
+              console.log(`  ${formatted} ${symbol}${statusTag}`);
+            }
+          }
+        }
+
+        if (finalize && result.timedOut) {
+          console.log('\nWarning: finalization timed out, some tokens still unconfirmed.');
+        } else if (finalize && result.finalizationDurationMs) {
+          console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
+        }
 
         await closeSphere();
         break;

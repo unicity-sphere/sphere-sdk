@@ -293,12 +293,23 @@ async function sendTokens(recipient: string, amount: string) {
       recipient,  // '@alice' or 'DIRECT://...'
       amount,
       coinId: 'UCT',
+      // transferMode: 'instant',      // default — fast send, receiver resolves proofs
+      // transferMode: 'conservative', // collect all proofs first, then deliver
     });
-    console.log('Sent! TX:', result.txHash);
+    console.log('Sent! Transfers:', result.tokenTransfers);
   } catch (error) {
     console.error('Failed:', error.message);
   }
 }
+```
+
+### Fetch Pending Transfers
+
+For explicit receive (useful in batch operations or when you need to poll):
+
+```typescript
+const { transfers } = await sphere.payments.receive();
+console.log(`Received ${transfers.length} new transfers`);
 ```
 
 ### Register Nametag

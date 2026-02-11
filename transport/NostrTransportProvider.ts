@@ -220,6 +220,7 @@ export class NostrTransportProvider implements TransportProvider {
   private mainSubscriptionId: string | null = null;
 
   // Event handlers
+  private processedEventIds = new Set<string>();
   private messageHandlers: Set<MessageHandler> = new Set();
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
@@ -1217,6 +1218,14 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private async handleEvent(event: NostrEvent): Promise<void> {
+    // Dedup: skip events already processed by another subscription
+    if (event.id && this.processedEventIds.has(event.id)) {
+      return;
+    }
+    if (event.id) {
+      this.processedEventIds.add(event.id);
+    }
+
     this.log('Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
       switch (event.kind) {
@@ -1360,7 +1369,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     for (const handler of this.transferHandlers) {
       try {
-        handler(transfer);
+        await handler(transfer);
       } catch (error) {
         this.log('Transfer handler error:', error);
       }
@@ -1543,6 +1552,58 @@ export class NostrTransportProvider implements TransportProvider {
     // Convert to nostr-js-sdk Event and publish
     const sdkEvent = NostrEventClass.fromJSON(event);
     await this.nostrClient.publishEvent(sdkEvent);
+  }
+
+  async fetchPendingEvents(): Promise<void> {
+    if (!this.nostrClient?.isConnected() || !this.keyManager) {
+      throw new Error('Transport not connected');
+    }
+
+    const nostrPubkey = this.keyManager.getPublicKeyHex();
+
+    const walletFilter = new Filter();
+    walletFilter.kinds = [
+      EVENT_KINDS.DIRECT_MESSAGE,
+      EVENT_KINDS.TOKEN_TRANSFER,
+      EVENT_KINDS.PAYMENT_REQUEST,
+      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+    ];
+    walletFilter['#p'] = [nostrPubkey];
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400;
+
+    // Collect events first, then process after EOSE
+    const events: NostrEvent[] = [];
+
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (subId) this.nostrClient?.unsubscribe(subId);
+        resolve();
+      }, 5000);
+
+      const subId = this.nostrClient!.subscribe(walletFilter, {
+        onEvent: (event) => {
+          events.push({
+            id: event.id,
+            kind: event.kind,
+            content: event.content,
+            tags: event.tags,
+            pubkey: event.pubkey,
+            created_at: event.created_at,
+            sig: event.sig,
+          });
+        },
+        onEndOfStoredEvents: () => {
+          clearTimeout(timeout);
+          this.nostrClient?.unsubscribe(subId);
+          resolve();
+        },
+      });
+    });
+
+    // Process collected events sequentially (dedup skips already-processed ones)
+    for (const event of events) {
+      await this.handleEvent(event);
+    }
   }
 
   private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
