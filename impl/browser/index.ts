@@ -351,8 +351,10 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
   const priceConfig = resolvePriceConfig(config?.price);
 
+  const storage = createLocalStorageProvider(config?.storage);
+
   return {
-    storage: createLocalStorageProvider(config?.storage),
+    storage,
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,
       timeout: transportConfig.timeout,
@@ -360,6 +362,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       reconnectDelay: transportConfig.reconnectDelay,
       maxReconnectAttempts: transportConfig.maxReconnectAttempts,
       debug: transportConfig.debug,
+      storage,
     }),
     oracle: createUnicityAggregatorProvider({
       url: oracleConfig.url,

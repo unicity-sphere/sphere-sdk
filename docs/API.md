@@ -902,6 +902,7 @@ createIpfsStorageProvider(config?: IpfsStorageProviderConfig): IpfsStorageProvid
 
 // Transport
 createNostrTransportProvider(config?: NostrTransportProviderConfig): NostrTransportProvider
+// NostrTransportProviderConfig accepts optional `storage` for event timestamp persistence
 
 // Oracle
 createUnicityAggregatorProvider(config?: UnicityAggregatorProviderConfig): UnicityAggregatorProvider
@@ -921,6 +922,37 @@ createTokenSplitExecutor(client, trustBase): TokenSplitExecutor
 // Validation
 createTokenValidator(options?: TokenValidatorOptions): TokenValidator
 ```
+
+---
+
+## NostrTransportProviderConfig
+
+```typescript
+interface NostrTransportProviderConfig {
+  relays?: string[];                // Nostr relay URLs
+  timeout?: number;                 // Connection timeout (ms)
+  autoReconnect?: boolean;          // Auto-reconnect on disconnect
+  reconnectDelay?: number;          // Reconnect delay (ms)
+  maxReconnectAttempts?: number;    // Max reconnect attempts
+  debug?: boolean;                  // Enable debug logging
+  createWebSocket: WebSocketFactory; // Platform-specific WebSocket factory
+  generateUUID?: UUIDGenerator;      // Optional UUID generator
+  storage?: TransportStorageAdapter; // Optional: persist event timestamps
+}
+```
+
+### TransportStorageAdapter
+
+Minimal key-value storage interface for transport persistence. When provided, the transport persists the last processed wallet event timestamp per pubkey. On reconnect, only events newer than the stored timestamp are fetched.
+
+```typescript
+interface TransportStorageAdapter {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+}
+```
+
+**Note:** `createBrowserProviders()` and `createNodeProviders()` automatically pass the storage provider to the transport. Custom setups should pass any `StorageProvider` — it satisfies `TransportStorageAdapter` since it has the required `get`/`set` methods.
 
 ---
 

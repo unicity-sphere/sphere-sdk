@@ -44,6 +44,8 @@ export const STORAGE_KEYS_GLOBAL = {
   ADDRESS_NAMETAGS: 'address_nametags',
   /** Active addresses registry (JSON: TrackedAddressesStorage) */
   TRACKED_ADDRESSES: 'tracked_addresses',
+  /** Last processed Nostr wallet event timestamp (unix seconds), keyed per pubkey */
+  LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
 } as const;
 
 /**

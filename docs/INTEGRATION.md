@@ -972,6 +972,22 @@ sphere.on('connection:changed', async ({ provider, connected }) => {
 });
 ```
 
+### 5. Event Timestamp Persistence
+
+The transport layer persists the timestamp of the last processed wallet event. On reconnect or app restart, only events newer than the stored timestamp are fetched — preventing duplicate token processing.
+
+This is handled automatically when using `createBrowserProviders()` or `createNodeProviders()`. The storage provider is passed to the transport, and timestamps are persisted per wallet pubkey.
+
+**Behavior by scenario:**
+
+| Scenario | `since` filter |
+|----------|---------------|
+| Existing wallet with stored timestamp | Resume from last event timestamp |
+| Fresh wallet (no stored timestamp) | `now` — no historical events |
+| No storage adapter (legacy) | `now - 24h` fallback |
+
+**Note:** The `since` filter only applies to wallet events (token transfers, payment requests). Chat messages (NIP-17 GIFT_WRAP) are always real-time with no `since` filter.
+
 ---
 
 ## Testing
@@ -1018,11 +1034,11 @@ npm test -- --coverage
 | `modules/PaymentsModule` | 36 | Payments, nametag, PROXY |
 | `modules/NametagMinter` | 22 | On-chain nametag minting |
 | `price/CoinGeckoPriceProvider` | 29 | Price provider, cache, negative cache |
-| `transport/NostrTransportProvider` | 24 | Nostr P2P messaging |
+| `transport/NostrTransportProvider` | 43 | Nostr P2P messaging, event timestamp persistence |
 | `integration/wallet-import-export` | 20 | Wallet import/export |
 | `integration/nametag-roundtrip` | 9 | Nametag serialization |
 | `impl/shared/resolvers` | 41 | Config resolution utilities |
-| **Total** | **882** | All passing (34 test files) |
+| **Total** | **893** | All passing (34 test files) |
 
 ### Writing Tests
 
