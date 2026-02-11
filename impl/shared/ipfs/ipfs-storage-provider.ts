@@ -611,7 +611,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
           this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
           return {
             success: saveResult.success,
-            merged: localData,
+            merged: this.enrichWithTokenBuffer(localData),
             added: 0,
             removed: 0,
             conflicts: 0,
@@ -631,7 +631,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
           this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
           return {
             success: true,
-            merged: localData,
+            merged: this.enrichWithTokenBuffer(localData),
             added: 0,
             removed: 0,
             conflicts: 0,
@@ -661,7 +661,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
         return {
           success: saveResult.success,
-          merged,
+          merged: this.enrichWithTokenBuffer(merged),
           added,
           removed,
           conflicts,
@@ -683,6 +683,27 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         };
       }
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private Helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Enrich TXF data with individually-buffered tokens before returning to caller.
+   * PaymentsModule.createStorageData() passes empty tokens (they're stored via
+   * saveToken()), but loadFromStorageData() needs them in the merged result.
+   */
+  private enrichWithTokenBuffer(data: TData): TData {
+    if (this.tokenBuffer.size === 0) return data;
+
+    const enriched = { ...data } as Record<string, unknown>;
+    for (const [tokenId, tokenData] of this.tokenBuffer) {
+      if (!this.deletedTokenIds.has(tokenId)) {
+        enriched[tokenId] = tokenData;
+      }
+    }
+    return enriched as TData;
   }
 
   // ---------------------------------------------------------------------------
