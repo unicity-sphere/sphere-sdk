@@ -655,6 +655,16 @@ export class Sphere {
       await sphere.registerNametag(options.nametag);
     }
 
+    // Auto-sync with token storage providers (e.g., IPFS) to recover tokens
+    if (sphere._tokenStorageProviders.size > 0) {
+      try {
+        const syncResult = await sphere._payments.sync();
+        console.log(`[Sphere.import] Auto-sync: +${syncResult.added} -${syncResult.removed}`);
+      } catch (err) {
+        console.warn('[Sphere.import] Auto-sync failed (non-fatal):', err);
+      }
+    }
+
     console.log('[Sphere.import] Import complete');
     return sphere;
   }
@@ -846,6 +856,11 @@ export class Sphere {
     // Update payments module with new providers
     if (this._initialized) {
       this._payments.updateTokenStorageProviders(this._tokenStorageProviders);
+
+      // Auto-sync with newly added provider (non-blocking)
+      this._payments.sync().catch((err) => {
+        console.warn(`[Sphere] Auto-sync with ${provider.id} failed:`, err);
+      });
     }
   }
 

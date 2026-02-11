@@ -54,5 +54,9 @@ export { IpfsHttpClient, type IpfsHttpClientConfig } from './ipfs-http-client';
 // Merge
 export { mergeTxfData } from './txf-merge';
 
+// IPNS subscription client (push-based sync)
+export { IpnsSubscriptionClient, type IpnsSubscriptionClientConfig } from './ipns-subscription-client';
+export type { IpnsUpdateEvent } from './ipfs-types';
+
 // Main provider
 export { IpfsStorageProvider } from './ipfs-storage-provider';

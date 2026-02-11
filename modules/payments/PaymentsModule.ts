@@ -673,6 +673,11 @@ export class PaymentsModule {
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
 
+  // Storage event subscriptions (push-based sync)
+  private storageEventUnsubscribers: (() => void)[] = [];
+  private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SYNC_DEBOUNCE_MS = 500;
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -761,6 +766,9 @@ export class PaymentsModule {
         this.handlePaymentRequestResponse(response);
       });
     }
+
+    // Subscribe to storage provider events (push-based sync)
+    this.subscribeToStorageEvents();
   }
 
   /**
@@ -850,6 +858,9 @@ export class PaymentsModule {
       resolver.reject(new Error('Module destroyed'));
     }
     this.pendingResponseResolvers.clear();
+
+    // Clean up storage event subscriptions
+    this.unsubscribeStorageEvents();
 
     if (this.l1) {
       this.l1.destroy();
@@ -3666,6 +3677,76 @@ export class PaymentsModule {
     }
   }
 
+  // ===========================================================================
+  // Storage Event Subscription (Push-Based Sync)
+  // ===========================================================================
+
+  /**
+   * Subscribe to 'storage:remote-updated' events from all token storage providers.
+   * When a provider emits this event, a debounced sync is triggered.
+   */
+  private subscribeToStorageEvents(): void {
+    // Clean up existing subscriptions
+    this.unsubscribeStorageEvents();
+
+    const providers = this.getTokenStorageProviders();
+    for (const [providerId, provider] of providers) {
+      if (provider.onEvent) {
+        const unsub = provider.onEvent((event) => {
+          if (event.type === 'storage:remote-updated') {
+            this.log('Remote update detected from provider', providerId, event.data);
+            this.debouncedSyncFromRemoteUpdate(providerId, event.data);
+          }
+        });
+        this.storageEventUnsubscribers.push(unsub);
+      }
+    }
+  }
+
+  /**
+   * Unsubscribe from all storage provider events and clear debounce timer.
+   */
+  private unsubscribeStorageEvents(): void {
+    for (const unsub of this.storageEventUnsubscribers) {
+      unsub();
+    }
+    this.storageEventUnsubscribers = [];
+
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+      this.syncDebounceTimer = null;
+    }
+  }
+
+  /**
+   * Debounced sync triggered by a storage:remote-updated event.
+   * Waits 500ms to batch rapid updates, then performs sync.
+   */
+  private debouncedSyncFromRemoteUpdate(providerId: string, eventData: unknown): void {
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+    }
+
+    this.syncDebounceTimer = setTimeout(() => {
+      this.syncDebounceTimer = null;
+      this.sync()
+        .then((result) => {
+          const data = eventData as { name?: string; sequence?: number; cid?: string } | undefined;
+          this.deps?.emitEvent('sync:remote-update', {
+            providerId,
+            name: data?.name ?? '',
+            sequence: data?.sequence ?? 0,
+            cid: data?.cid ?? '',
+            added: result.added,
+            removed: result.removed,
+          });
+        })
+        .catch((err) => {
+          this.log('Auto-sync from remote update failed:', err);
+        });
+    }, PaymentsModule.SYNC_DEBOUNCE_MS);
+  }
+
   /**
    * Get all active token storage providers
    */
@@ -3695,6 +3776,8 @@ export class PaymentsModule {
   updateTokenStorageProviders(providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>): void {
     if (this.deps) {
       this.deps.tokenStorageProviders = providers;
+      // Re-subscribe to storage events for new providers
+      this.subscribeToStorageEvents();
     }
   }
 

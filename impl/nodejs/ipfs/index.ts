@@ -5,6 +5,7 @@
 
 import { IpfsStorageProvider, type IpfsStorageConfig } from '../../shared/ipfs';
 import { NodejsIpfsStatePersistence } from './nodejs-ipfs-state-persistence';
+import { createNodeWebSocketFactory } from '../transport';
 import type { StorageProvider } from '../../../storage';
 
 // Re-export for convenience
@@ -14,6 +15,7 @@ export type { IpfsStorageConfig as IpfsStorageProviderConfig } from '../../share
 
 /**
  * Create a Node.js IPFS storage provider with file-based state persistence.
+ * Automatically injects the Node.js WebSocket factory for IPNS push subscriptions.
  *
  * @param config - IPFS storage configuration
  * @param storageProvider - StorageProvider for persisting state (e.g., FileStorageProvider)
@@ -26,5 +28,8 @@ export function createNodeIpfsStorageProvider(
     ? new NodejsIpfsStatePersistence(storageProvider)
     : undefined;
 
-  return new IpfsStorageProvider(config, persistence);
+  return new IpfsStorageProvider(
+    { ...config, createWebSocket: config?.createWebSocket ?? createNodeWebSocketFactory() },
+    persistence,
+  );
 }

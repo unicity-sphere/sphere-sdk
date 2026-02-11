@@ -18,9 +18,11 @@ import type {
   IpfsStorageConfig,
   IpfsStatePersistence,
 } from './ipfs-types';
+import type { WebSocketFactory } from '../../../transport/websocket';
 import { getIpfsGatewayUrls } from '../../../constants';
 import { IpfsCache } from './ipfs-cache';
 import { IpfsHttpClient } from './ipfs-http-client';
+import { IpnsSubscriptionClient } from './ipns-subscription-client';
 import { deriveIpnsIdentity } from './ipns-key-derivation';
 import { createSignedRecord } from './ipns-record-manager';
 import { mergeTxfData } from './txf-merge';
@@ -61,6 +63,17 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   private readonly debug: boolean;
   private readonly ipnsLifetimeMs: number;
 
+  /** WebSocket factory for push subscriptions */
+  private readonly createWebSocket: WebSocketFactory | undefined;
+  /** Override WS URL */
+  private readonly wsUrl: string | undefined;
+  /** Fallback poll interval (default: 90000) */
+  private readonly fallbackPollIntervalMs: number;
+  /** IPNS subscription client for push notifications */
+  private subscriptionClient: IpnsSubscriptionClient | null = null;
+  /** Unsubscribe function from subscription client */
+  private subscriptionUnsubscribe: (() => void) | null = null;
+
   /** In-memory buffer for individual token save/delete calls, flushed on save() */
   private tokenBuffer: Map<string, unknown> = new Map();
   private deletedTokenIds: Set<string> = new Set();
@@ -90,6 +103,9 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     }, this.cache);
 
     this.statePersistence = statePersistence ?? new InMemoryIpfsStatePersistence();
+    this.createWebSocket = config?.createWebSocket;
+    this.wsUrl = config?.wsUrl;
+    this.fallbackPollIntervalMs = config?.fallbackPollIntervalMs ?? 90000;
   }
 
   // ---------------------------------------------------------------------------
@@ -146,6 +162,45 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         this.log(`Loaded persisted state: seq=${this.ipnsSequenceNumber}, cid=${this.lastCid}`);
       }
 
+      // Set up IPNS push subscription if WebSocket factory is available
+      if (this.createWebSocket) {
+        try {
+          const wsUrlFinal = this.wsUrl ?? this.deriveWsUrl();
+          if (wsUrlFinal) {
+            this.subscriptionClient = new IpnsSubscriptionClient({
+              wsUrl: wsUrlFinal,
+              createWebSocket: this.createWebSocket,
+              debug: this.debug,
+            });
+
+            // Subscribe to own IPNS name
+            this.subscriptionUnsubscribe = this.subscriptionClient.subscribe(
+              ipnsName,
+              (update) => {
+                this.log(`Push update: seq=${update.sequence}, cid=${update.cid}`);
+                this.emitEvent({
+                  type: 'storage:remote-updated',
+                  timestamp: Date.now(),
+                  data: { name: update.name, sequence: update.sequence, cid: update.cid },
+                });
+              },
+            );
+
+            // Set fallback poll for when WS is disconnected
+            this.subscriptionClient.setFallbackPoll(
+              () => this.pollForRemoteChanges(),
+              this.fallbackPollIntervalMs,
+            );
+
+            // Connect (non-blocking)
+            this.subscriptionClient.connect();
+          }
+        } catch (wsError) {
+          this.log(`Failed to set up IPNS subscription: ${wsError}`);
+          // Non-fatal — provider works without push notifications
+        }
+      }
+
       // Test gateway connectivity (non-blocking, don't fail on it)
       this.httpClient.findHealthyGateways().then((healthy) => {
         if (healthy.length > 0) {
@@ -172,6 +227,16 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   }
 
   async shutdown(): Promise<void> {
+    // Disconnect subscription client
+    if (this.subscriptionUnsubscribe) {
+      this.subscriptionUnsubscribe();
+      this.subscriptionUnsubscribe = null;
+    }
+    if (this.subscriptionClient) {
+      this.subscriptionClient.disconnect();
+      this.subscriptionClient = null;
+    }
+
     this.cache.clear();
     this.status = 'disconnected';
   }
@@ -582,6 +647,47 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
   getRemoteCid(): string | null {
     return this.remoteCid;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal: Push Subscription Helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Derive WebSocket URL from the first configured gateway.
+   * Converts https://host → wss://host/ws/ipns
+   */
+  private deriveWsUrl(): string | null {
+    const gateways = this.httpClient.getGateways();
+    if (gateways.length === 0) return null;
+
+    const gateway = gateways[0];
+    const wsProtocol = gateway.startsWith('https://') ? 'wss://' : 'ws://';
+    const host = gateway.replace(/^https?:\/\//, '');
+    return `${wsProtocol}${host}/ws/ipns`;
+  }
+
+  /**
+   * Poll for remote IPNS changes (fallback when WS is unavailable).
+   * Compares remote sequence number with last known and emits event if changed.
+   */
+  private async pollForRemoteChanges(): Promise<void> {
+    if (!this.ipnsName) return;
+
+    try {
+      const { best } = await this.httpClient.resolveIpns(this.ipnsName);
+      if (best && best.sequence > this.lastKnownRemoteSequence) {
+        this.log(`Poll detected remote change: seq=${best.sequence} (was ${this.lastKnownRemoteSequence})`);
+        this.lastKnownRemoteSequence = best.sequence;
+        this.emitEvent({
+          type: 'storage:remote-updated',
+          timestamp: Date.now(),
+          data: { name: this.ipnsName, sequence: Number(best.sequence), cid: best.cid },
+        });
+      }
+    } catch {
+      // Non-fatal — poll will retry on next interval
+    }
   }
 
   // ---------------------------------------------------------------------------
