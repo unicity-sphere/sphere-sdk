@@ -319,6 +319,71 @@ describe('checkNetworkHealth', () => {
     });
   });
 
+  describe('edge cases', () => {
+    it('should return healthy with no checks when services array is empty', async () => {
+      const result = await checkNetworkHealth('testnet', { services: [] });
+
+      expect(result.healthy).toBe(true);
+      expect(result.services.relay).toBeUndefined();
+      expect(result.services.oracle).toBeUndefined();
+      expect(result.services.l1).toBeUndefined();
+      expect(result.totalTimeMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it('should use dev network URLs', async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response(JSON.stringify({}), { status: 200 }),
+      );
+
+      const result = await checkNetworkHealth('dev', { services: ['oracle'] });
+
+      expect(result.services.oracle).toBeDefined();
+      const calledUrl = fetchSpy.mock.calls[0][0] as string;
+      // Dev uses dev-aggregator URL
+      expect(calledUrl).toContain('dev-aggregator');
+    });
+
+    it('should include responseTimeMs for non-ok HTTP responses', async () => {
+      fetchSpy.mockResolvedValueOnce(
+        new Response('Bad Request', { status: 400, statusText: 'Bad Request' }),
+      );
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      expect(result.services.oracle!.healthy).toBe(false);
+      expect(result.services.oracle!.responseTimeMs).toBeGreaterThanOrEqual(0);
+      expect(result.services.oracle!.error).toContain('400');
+    });
+
+    it('should handle non-Error thrown in fetch', async () => {
+      fetchSpy.mockRejectedValueOnce('string error');
+
+      const result = await checkNetworkHealth('testnet', { services: ['oracle'] });
+
+      expect(result.services.oracle!.healthy).toBe(false);
+      expect(result.services.oracle!.error).toBe('string error');
+    });
+
+    it('should show close code when reason is empty', async () => {
+      (globalThis as Record<string, unknown>).WebSocket = class MockWebSocket {
+        onopen: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        onclose: ((event: { code: number; reason: string }) => void) | null = null;
+        constructor() {
+          setTimeout(() => this.onclose?.({ code: 1006, reason: '' }), 1);
+        }
+        close() {}
+      };
+
+      const originalWS = (globalThis as Record<string, unknown>).WebSocket;
+      const result = await checkNetworkHealth('testnet', { services: ['relay'] });
+      (globalThis as Record<string, unknown>).WebSocket = originalWS;
+
+      expect(result.services.relay!.healthy).toBe(false);
+      expect(result.services.relay!.error).toContain('code 1006');
+    });
+  });
+
   describe('default behavior', () => {
     it('should check all three services when no filter specified', async () => {
       // WebSocket for relay + l1

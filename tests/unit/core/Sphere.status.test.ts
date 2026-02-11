@@ -776,4 +776,269 @@ describe('Sphere Status & Provider Management', () => {
       // Events come from the auto-bridge, not manual emit
     });
   });
+
+  // ===========================================================================
+  // Edge cases: disableProvider resilience
+  // ===========================================================================
+
+  describe('disableProvider edge cases', () => {
+    it('should still return true when provider disconnect throws', async () => {
+      const sphere = await initSphere();
+
+      // Make transport.disconnect throw
+      (transport.disconnect as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('disconnect failed'),
+      );
+
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.disableProvider('mock-transport');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(false);
+
+      // Event should still fire
+      expect(events).toHaveLength(1);
+      expect(events[0].enabled).toBe(false);
+    });
+
+    it('should be idempotent — disabling already-disabled provider', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('mock-transport');
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(false);
+
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      // Disable again — should still succeed
+      const result = await sphere.disableProvider('mock-transport');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(false);
+
+      // Event fires each call (no dedup in disableProvider itself)
+      expect(events).toHaveLength(1);
+    });
+
+    it('should call disconnect on transport when disabling', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('mock-transport');
+
+      expect(transport.disconnect).toHaveBeenCalled();
+    });
+
+    it('should call shutdown on token storage when disabling', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('indexeddb-tokens');
+
+      expect(tokenStorage.shutdown).toHaveBeenCalled();
+    });
+
+    it('should call clearCache on price when disabling', async () => {
+      const sphere = await initSphere({ price: { platform: 'coingecko' } });
+
+      await sphere.disableProvider('price');
+
+      // Price provider is stateless — disableProvider should call clearCache
+      const status = sphere.getStatus();
+      expect(status.price[0].enabled).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // Edge cases: enableProvider resilience
+  // ===========================================================================
+
+  describe('enableProvider edge cases', () => {
+    it('should emit error event and return false when connect() throws', async () => {
+      const sphere = await initSphere();
+
+      // Disable first, then make connect throw on re-enable
+      await sphere.disableProvider('mock-transport');
+      (transport.connect as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        new Error('connection refused'),
+      );
+
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.enableProvider('mock-transport');
+      expect(result).toBe(false);
+
+      // Should emit error event
+      expect(events).toHaveLength(1);
+      expect(events[0].status).toBe('error');
+      expect(events[0].error).toBe('connection refused');
+      expect(events[0].enabled).toBe(true);
+    });
+
+    it('should be safe to enable an already-enabled provider', async () => {
+      const sphere = await initSphere();
+
+      // Enable without prior disable — should succeed
+      const result = await sphere.enableProvider('mock-transport');
+      expect(result).toBe(true);
+      expect(sphere.isProviderEnabled('mock-transport')).toBe(true);
+    });
+
+    it('should emit connected for stateless provider (no lifecycle)', async () => {
+      const sphere = await initSphere({ price: { platform: 'coingecko' } });
+
+      await sphere.disableProvider('price');
+
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const result = await sphere.enableProvider('price');
+      expect(result).toBe(true);
+
+      // Price has no connect()/initialize() — stateless
+      expect(events).toHaveLength(1);
+      expect(events[0].connected).toBe(true);
+      expect(events[0].status).toBe('connected');
+      expect(events[0].enabled).toBe(true);
+    });
+  });
+
+  // ===========================================================================
+  // getDisabledProviderIds()
+  // ===========================================================================
+
+  describe('getDisabledProviderIds()', () => {
+    it('should return empty set initially', async () => {
+      const sphere = await initSphere();
+
+      const disabled = sphere.getDisabledProviderIds();
+      expect(disabled.size).toBe(0);
+    });
+
+    it('should reflect disabled providers', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('mock-transport');
+      await sphere.disableProvider('mock-oracle');
+
+      const disabled = sphere.getDisabledProviderIds();
+      expect(disabled.size).toBe(2);
+      expect(disabled.has('mock-transport')).toBe(true);
+      expect(disabled.has('mock-oracle')).toBe(true);
+    });
+
+    it('should remove provider on re-enable', async () => {
+      const sphere = await initSphere();
+
+      await sphere.disableProvider('mock-transport');
+      await sphere.enableProvider('mock-transport');
+
+      const disabled = sphere.getDisabledProviderIds();
+      expect(disabled.has('mock-transport')).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // Oracle event bridging edge cases
+  // ===========================================================================
+
+  describe('oracle event bridging edge cases', () => {
+    it('should bridge oracle:connected event', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const oracleWithSim = oracle as unknown as { _simulateEvent: (e: unknown) => void };
+      oracleWithSim._simulateEvent({ type: 'oracle:connected', timestamp: Date.now() });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].provider).toBe('mock-oracle');
+      expect(events[0].connected).toBe(true);
+      expect(events[0].status).toBe('connected');
+    });
+
+    it('should bridge oracle:error event', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const oracleWithSim = oracle as unknown as { _simulateEvent: (e: unknown) => void };
+      oracleWithSim._simulateEvent({
+        type: 'oracle:error',
+        timestamp: Date.now(),
+        error: 'RPC timeout',
+      });
+
+      expect(events).toHaveLength(1);
+      expect(events[0].provider).toBe('mock-oracle');
+      expect(events[0].status).toBe('error');
+      expect(events[0].error).toBe('RPC timeout');
+    });
+  });
+
+  // ===========================================================================
+  // Deduplication edge cases
+  // ===========================================================================
+
+  describe('event deduplication edge cases', () => {
+    it('should pass through connected → disconnected → connected cycle', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const transportWithSim = transport as unknown as { _simulateEvent: (e: unknown) => void };
+
+      transportWithSim._simulateEvent({ type: 'transport:connected', timestamp: Date.now() });
+      transportWithSim._simulateEvent({ type: 'transport:disconnected', timestamp: Date.now() });
+      transportWithSim._simulateEvent({ type: 'transport:connected', timestamp: Date.now() });
+
+      expect(events).toHaveLength(3);
+      expect(events[0].connected).toBe(true);
+      expect(events[1].connected).toBe(false);
+      expect(events[2].connected).toBe(true);
+    });
+
+    it('should deduplicate consecutive error events (same connected=false)', async () => {
+      const sphere = await initSphere();
+      const events: SphereEventMap['connection:changed'][] = [];
+      sphere.on('connection:changed', (e) => events.push(e));
+
+      const transportWithSim = transport as unknown as { _simulateEvent: (e: unknown) => void };
+
+      // Two consecutive errors — both connected=false, dedup fires only first
+      transportWithSim._simulateEvent({
+        type: 'transport:error',
+        timestamp: Date.now(),
+        error: 'First error',
+      });
+      transportWithSim._simulateEvent({
+        type: 'transport:error',
+        timestamp: Date.now(),
+        error: 'Second error',
+      });
+
+      // Only first passes through (dedup by connected boolean)
+      expect(events).toHaveLength(1);
+      expect(events[0].error).toBe('First error');
+    });
+  });
+
+  // ===========================================================================
+  // Transport without getRelays metadata
+  // ===========================================================================
+
+  describe('getStatus() transport metadata edge cases', () => {
+    it('should work without getRelays/getConnectedRelays methods', async () => {
+      // Remove relay methods from transport mock
+      delete (transport as unknown as Record<string, unknown>).getRelays;
+      delete (transport as unknown as Record<string, unknown>).getConnectedRelays;
+
+      const sphere = await initSphere();
+      const status = sphere.getStatus();
+
+      expect(status.transport).toHaveLength(1);
+      expect(status.transport[0].id).toBe('mock-transport');
+      // No metadata when relay methods are absent
+      expect(status.transport[0].metadata).toBeUndefined();
+    });
+  });
 });
