@@ -104,7 +104,7 @@ import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAl
 import { UnmaskedPredicateReference } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference';
 import { normalizeNametag, isPhoneNumber } from '@unicitylabs/nostr-js-sdk';
 
-function isValidNametag(nametag: string): boolean {
+export function isValidNametag(nametag: string): boolean {
   if (isPhoneNumber(nametag)) return true;
   return /^[a-z0-9_-]{3,20}$/.test(nametag);
 }

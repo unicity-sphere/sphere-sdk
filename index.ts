@@ -365,13 +365,12 @@ export type {
 
 export {
   normalizeNametag,
-  isValidNametag,
   isPhoneNumber,
   hashNametag,
   areSameNametag,
-  NAMETAG_MIN_LENGTH,
-  NAMETAG_MAX_LENGTH,
 } from '@unicitylabs/nostr-js-sdk';
+
+export { isValidNametag } from './core/Sphere';
 
 // =============================================================================
 // Price Provider
