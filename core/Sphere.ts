@@ -489,17 +489,19 @@ export class Sphere {
     // Track address 0 in the registry
     await sphere.ensureAddressTracked(0);
 
-    // Register nametag if provided, otherwise publish identity and try recovery
+    // Register nametag if provided, otherwise try recovery then publish
     if (options.nametag) {
       // registerNametag publishes identity binding WITH nametag atomically
       // (calling syncIdentityWithTransport before this would race — both replaceable
       // events get the same created_at second and relay keeps the one without nametag)
       await sphere.registerNametag(options.nametag);
     } else {
-      // Publish identity binding via transport (makes wallet discoverable)
-      await sphere.syncIdentityWithTransport();
-      // Try to recover nametag from transport (for wallet import scenarios)
+      // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
+      // kind 30078 (replaceable event), so a bare binding would overwrite the
+      // existing one that contains encrypted_nametag, making recovery impossible.
       await sphere.recoverNametagFromTransport();
+      // Now publish identity binding (with recovered nametag if found)
+      await sphere.syncIdentityWithTransport();
     }
 
     return sphere;
@@ -626,6 +628,8 @@ export class Sphere {
       console.log('[Sphere.import] Recovering nametag from transport...');
       await sphere.recoverNametagFromTransport();
       console.log('[Sphere.import] Nametag recovery done');
+      // Publish identity binding (with recovered nametag if found)
+      await sphere.syncIdentityWithTransport();
     }
 
     // Mark wallet as created only after successful initialization
@@ -2555,45 +2559,56 @@ export class Sphere {
       return;
     }
 
-    // Check if transport supports nametag recovery
-    if (!this._transport.recoverNametag) {
+    let recoveredNametag: string | null = null;
+
+    // Strategy 1: Decrypt nametag from own Nostr binding events (private-key based)
+    if (this._transport.recoverNametag) {
+      try {
+        recoveredNametag = await this._transport.recoverNametag();
+      } catch {
+        // Non-fatal — try fallback
+      }
+    }
+
+    // Strategy 2: Forward lookup by L1 address hash (public, same as scanAddresses).
+    // Covers edge cases where the encrypted binding event was lost from relay.
+    if (!recoveredNametag && this._transport.resolveAddressInfo && this._identity?.l1Address) {
+      try {
+        const info = await this._transport.resolveAddressInfo(this._identity.l1Address);
+        if (info?.nametag) {
+          recoveredNametag = info.nametag;
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    if (!recoveredNametag) {
       return;
     }
 
     try {
-      const recoveredNametag = await this._transport.recoverNametag();
-
-      if (recoveredNametag) {
-
-        // Update identity with recovered nametag
-        if (this._identity) {
-          (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-          await this._updateCachedProxyAddress();
-        }
-
-        // Update nametag cache
-        const entry = await this.ensureAddressTracked(this._currentAddressIndex);
-        let nametags = this._addressNametags.get(entry.addressId);
-        if (!nametags) {
-          nametags = new Map();
-          this._addressNametags.set(entry.addressId, nametags);
-        }
-        const nextIndex = nametags.size;
-        nametags.set(nextIndex, recoveredNametag);
-        await this.persistAddressNametags();
-
-        // Re-publish identity binding with recovered nametag
-        if (this._transport.publishIdentityBinding) {
-          await this._transport.publishIdentityBinding(
-            this._identity!.chainPubkey,
-            this._identity!.l1Address,
-            this._identity!.directAddress || '',
-            recoveredNametag,
-          );
-        }
-
-        this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
+      // Update identity with recovered nametag
+      if (this._identity) {
+        (this._identity as MutableFullIdentity).nametag = recoveredNametag;
+        await this._updateCachedProxyAddress();
       }
+
+      // Update nametag cache
+      const entry = await this.ensureAddressTracked(this._currentAddressIndex);
+      let nametags = this._addressNametags.get(entry.addressId);
+      if (!nametags) {
+        nametags = new Map();
+        this._addressNametags.set(entry.addressId, nametags);
+      }
+      const nextIndex = nametags.size;
+      nametags.set(nextIndex, recoveredNametag);
+      await this.persistAddressNametags();
+
+      // Note: no need to re-publish here — callers follow up with
+      // syncIdentityWithTransport() which will publish WITH the recovered nametag.
+
+      this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
     } catch {
       // Don't fail wallet import on nametag recovery errors
     }
