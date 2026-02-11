@@ -1,43 +1,73 @@
-# SDK2 API Reference
+# Sphere SDK API Reference
 
 ## Sphere
 
-Main entry point for all SDK operations.
+Main entry point for all SDK operations. The constructor is **private** — use static methods to create/load wallets.
 
-### Constructor
+### Static Methods
+
+#### `Sphere.init(options: SphereInitOptions): Promise<SphereInitResult>`
+
+Primary entry point. Creates a new wallet or loads an existing one automatically.
 
 ```typescript
-new Sphere(config?: SphereConfig)
+const { sphere, created, generatedMnemonic } = await Sphere.init({
+  storage, transport, oracle,
+  tokenStorage,              // Optional (for IPFS sync)
+  autoGenerate: true,        // Generate mnemonic if no wallet exists
+  mnemonic: 'words...',      // Or provide mnemonic to create/import
+  nametag: 'alice',          // Optional: register @alice on create
+  l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
+  price: priceProvider,      // Optional PriceProvider
+  derivationPath: "m/44'/0'/0'", // Optional custom path
+});
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `storagePrefix` | `string` | `'sphere_'` | localStorage key prefix |
-| `aggregatorUrl` | `string` | `'https://aggregator.unicity.network'` | Aggregator endpoint |
-| `nostrRelays` | `string[]` | `['wss://relay.unicity.network']` | Nostr relay URLs |
+#### `Sphere.exists(storage: StorageProvider): Promise<boolean>`
+
+Check if encrypted wallet data exists in storage.
+
+#### `Sphere.create(options: SphereCreateOptions): Promise<Sphere>`
+
+Create wallet from a known mnemonic (low-level; prefer `Sphere.init()`).
+
+#### `Sphere.load(options: SphereLoadOptions): Promise<Sphere>`
+
+Load existing wallet from storage (low-level; prefer `Sphere.init()`).
+
+#### `Sphere.clear(storageOrOptions): Promise<void>`
+
+Delete all SDK-owned wallet data from storage. Accepts either a `StorageProvider` directly (legacy) or an options object with optional `tokenStorage`.
+
+```typescript
+// Recommended: clear wallet keys + token data
+await Sphere.clear({
+  storage: providers.storage,
+  tokenStorage: providers.tokenStorage,
+});
+
+// Legacy (backward compatible): clear wallet keys only
+await Sphere.clear(storage);
+```
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `identity` | `FullIdentity` | Current wallet identity (after load) |
+| `identity` | `FullIdentity \| null` | Current wallet identity (after init/load) |
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
 | `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
 
-### Methods
-
-#### `initialize(providers: Providers): Promise<void>`
-
-Initialize SDK with provider implementations.
+### Instance Methods
 
 #### `destroy(): Promise<void>`
 
 Cleanup and disconnect all providers.
 
-#### `on<T>(event: string, handler: (data: T) => void): () => void`
+#### `on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void`
 
-Subscribe to events. Returns unsubscribe function.
+Subscribe to events. Returns unsubscribe function. Type-safe — see `SphereEventMap` for event payloads.
 
 #### `deriveAddress(index: number, isChange?: boolean): AddressInfo`
 
@@ -163,49 +193,6 @@ interface PeerInfo {
 
 ---
 
-## WalletManager
-
-### Methods
-
-#### `exists(): Promise<boolean>`
-
-Check if encrypted wallet data exists in storage.
-
-#### `create(password: string): Promise<string>`
-
-Create new wallet. Returns mnemonic phrase (24 words).
-
-#### `load(password: string): Promise<void>`
-
-Load and decrypt existing wallet.
-
-#### `import(mnemonic: string, password: string): Promise<void>`
-
-Import wallet from mnemonic phrase.
-
-#### `clear(storageOrOptions): Promise<void>`
-
-Delete all SDK-owned wallet data from storage. Accepts either a `StorageProvider` directly (legacy) or an options object with optional `tokenStorage`.
-
-```typescript
-// Recommended: clear wallet keys + token data
-await Sphere.clear({
-  storage: providers.storage,
-  tokenStorage: providers.tokenStorage,
-});
-
-// Legacy (backward compatible): clear wallet keys only
-await Sphere.clear(storage);
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `storageOrOptions` | `StorageProvider \| { storage, tokenStorage? }` | Storage provider or options object |
-| `options.storage` | `StorageProvider` | Key-value storage provider |
-| `options.tokenStorage` | `TokenStorageProvider` | Optional token storage to clear |
-
----
-
 ## PaymentsModule
 
 ### Methods
@@ -249,48 +236,78 @@ const uctAssets = await sphere.payments.getAssets('0xabc...');
 
 > **Note:** Price fields are `null` when `PriceProvider` is not configured. The SDK works fully without it — prices are optional.
 
-#### `getTokens(): Promise<Token[]>`
+#### `getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[]`
+
+Synchronous. Returns current in-memory token list.
 
 ```typescript
 interface Token {
-  id: string;
-  symbol: string;
-  amount: string;
-  coinId: string;
-  status: 'confirmed' | 'pending' | 'spent';
-  sdkData: string;  // Serialized SDK token
+  readonly id: string;
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
+  readonly amount: string;
+  status: TokenStatus;  // 'pending' | 'submitted' | 'confirmed' | 'transferring' | 'spent' | 'invalid'
+  readonly createdAt: number;
+  updatedAt: number;
+  readonly sdkData?: string;  // Serialized SDK token
 }
+
+// Filter examples
+const allTokens = sphere.payments.getTokens();
+const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' });
+const confirmed = sphere.payments.getTokens({ status: 'confirmed' });
 ```
+
+#### `getToken(id: string): Token | undefined`
+
+Get a single token by ID.
 
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
 ```typescript
 interface TransferRequest {
-  recipient: string;  // @nametag, DIRECT://..., PROXY://..., alpha1... address
+  recipient: string;  // @nametag, DIRECT://..., PROXY://..., alpha1... address, chain pubkey
   amount: string;
   coinId: string;
   memo?: string;
 }
 
 interface TransferResult {
-  success: boolean;
-  transferId?: string;
+  readonly id: string;
+  status: TransferStatus;  // 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed'
+  readonly tokens: Token[];
+  txHash?: string;
   error?: string;
 }
 ```
 
-#### `refresh(): Promise<void>`
+#### `sync(): Promise<{ added: number; removed: number }>`
 
-Refresh token list from storage and network.
-
-#### `validateTransfer(request: TransferRequest): Promise<ValidationResult>`
+Sync with all remote storage providers (IPFS, etc.). Merges local and remote token data.
 
 ```typescript
-interface ValidationResult {
-  valid: boolean;
-  errors: string[];
-}
+const result = await sphere.payments.sync();
+console.log(`Sync: +${result.added} -${result.removed}`);
 ```
+
+#### `validate(): Promise<{ valid: Token[]; invalid: Token[] }>`
+
+Validate tokens against the aggregator (checks state proofs).
+
+```typescript
+const { valid, invalid } = await sphere.payments.validate();
+```
+
+#### `getHistory(): TransactionHistoryEntry[]`
+
+Get sorted transaction history (L3 transfers).
+
+#### `getPendingTransfers(): TransferResult[]`
+
+Get transfers that are still in progress.
 
 ---
 
@@ -472,13 +489,16 @@ Clear all completed, rejected, or expired outgoing requests.
 
 L1 (ALPHA blockchain) payments are accessed via `sphere.payments.l1`.
 
+L1 is **enabled by default** with lazy WebSocket connection (connects on first use). Set `l1: null` to disable.
+
 ### Configuration
 
-L1 is configured through `Sphere.init()`, `Sphere.create()`, or `Sphere.load()`:
+L1 is configured through `Sphere.init()`:
 
 ```typescript
-const sphere = await Sphere.init({
-  storage, transport, oracle,
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
   l1: {
     electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
     defaultFeeRate: 10,    // sat/byte, default
@@ -488,6 +508,9 @@ const sphere = await Sphere.init({
 
 // Access L1 via payments module
 const balance = await sphere.payments.l1.getBalance();
+
+// Disable L1 entirely
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true, l1: null });
 ```
 
 ### L1Config
@@ -535,8 +558,9 @@ interface L1Utxo {
 ```typescript
 interface L1SendRequest {
   to: string;
-  amount: string;  // in satoshis
+  amount: string;      // in satoshis
   feeRate?: number;
+  useVested?: boolean;  // Send only vested coins
   memo?: string;
 }
 
@@ -549,6 +573,10 @@ interface L1SendResult {
 ```
 
 #### `getHistory(limit?: number): Promise<L1Transaction[]>`
+
+#### `getTransaction(txid: string): Promise<L1Transaction | null>`
+
+Get a single transaction by txid.
 
 #### `estimateFee(to: string, amount: string): Promise<{ fee: string; feeRate: number }>`
 
@@ -564,12 +592,13 @@ Send a direct message using NIP-17 gift wrapping (kind 1059). The recipient can 
 
 ```typescript
 interface DirectMessage {
-  id: string;
-  senderPubkey: string;
-  senderNametag?: string;
-  recipientPubkey: string;
-  content: string;
-  timestamp: number;
+  readonly id: string;
+  readonly senderPubkey: string;
+  readonly senderNametag?: string;
+  readonly recipientPubkey: string;
+  readonly recipientNametag?: string;
+  readonly content: string;
+  readonly timestamp: number;
   isRead: boolean;
 }
 ```
@@ -675,11 +704,7 @@ type ProviderStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 ```typescript
 type SphereEventType =
-  | 'wallet:created'
-  | 'wallet:loaded'
-  | 'wallet:cleared'
   | 'transfer:incoming'
-  | 'transfer:outgoing'
   | 'transfer:confirmed'
   | 'transfer:failed'
   | 'payment_request:incoming'
@@ -691,21 +716,36 @@ type SphereEventType =
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
+  | 'sync:provider'
   | 'sync:error'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
   | 'identity:changed'
-  | 'address:activated'   // Emitted when address first tracked
-  | 'address:hidden'      // Emitted when address hidden
-  | 'address:unhidden';   // Emitted when address unhidden
+  | 'address:activated'
+  | 'address:hidden'
+  | 'address:unhidden';
 ```
 
 ### SphereEventMap
 
 ```typescript
 interface SphereEventMap {
-  // ... other events ...
+  'transfer:incoming': IncomingTransfer;
+  'transfer:confirmed': TransferResult;
+  'transfer:failed': TransferResult;
+  'payment_request:incoming': IncomingPaymentRequest;
+  'payment_request:accepted': IncomingPaymentRequest;
+  'payment_request:rejected': IncomingPaymentRequest;
+  'payment_request:paid': IncomingPaymentRequest;
+  'payment_request:response': PaymentRequestResponse;
+  'message:dm': DirectMessage;
+  'message:broadcast': BroadcastMessage;
+  'sync:started': { source: string };
+  'sync:completed': { source: string; count: number };
+  'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
+  'sync:error': { source: string; error: string };
+  'connection:changed': { provider: string; connected: boolean };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': {

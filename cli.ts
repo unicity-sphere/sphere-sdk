@@ -186,7 +186,7 @@ function prompt(question: string): Promise<string> {
 
 function printUsage() {
   console.log(`
-Sphere SDK CLI v0.2.0
+Sphere SDK CLI v0.2.2
 
 Usage: npm run cli -- <command> [args...]
    or: npx tsx cli.ts <command> [args...]

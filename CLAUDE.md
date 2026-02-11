@@ -16,62 +16,95 @@ npm install @unicitylabs/sphere-sdk
 npm install @unicitylabs/sphere-sdk ws
 ```
 
-### Minimal Example
+### Complete L3 Wallet Integration Example
 
 ```typescript
-// Browser
 import { Sphere } from '@unicitylabs/sphere-sdk';
 import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
+// For Node.js: import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 
+// 1. Create providers (all services configured automatically by network)
 const providers = createBrowserProviders({ network: 'testnet' });
+// Node.js: createNodeProviders({ network: 'testnet', dataDir: './wallet', tokensDir: './tokens' })
+
+// 2. Init wallet (creates new OR loads existing — single entry point)
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
-  autoGenerate: true,
+  autoGenerate: true,   // Generate mnemonic if no wallet exists
+  nametag: 'alice',     // Optional: register @alice for receiving payments
 });
 
-// Node.js
-import { Sphere } from '@unicitylabs/sphere-sdk';
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+if (created && generatedMnemonic) {
+  // First run — prompt user to back up mnemonic
+  console.log('SAVE THIS:', generatedMnemonic);
+}
 
-const providers = createNodeProviders({
-  network: 'testnet',
-  dataDir: './wallet',
-  tokensDir: './tokens',
-});
-const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
-```
+// 3. Identity is ready
+const identity = sphere.identity!;
+console.log('L3 address:', identity.directAddress);  // DIRECT://... (primary)
+console.log('L1 address:', identity.l1Address);      // alpha1...
+console.log('Nametag:', identity.nametag);            // alice
 
-### Common Operations
-
-```typescript
-// Check total portfolio value in USD (requires PriceProvider)
-const balance = await sphere.payments.getBalance(); // number | null
-
-// Get assets with price data
+// 4. Check tokens and balance
 const assets = await sphere.payments.getAssets();
-// [{ coinId, symbol, totalAmount, priceUsd, fiatValueUsd, ... }]
+// [{ coinId, symbol, totalAmount, tokenCount, priceUsd, fiatValueUsd, change24h }]
 
-// Send tokens
-await sphere.payments.send({
-  recipient: '@alice',  // or DIRECT://... address
-  amount: '1000000',
-  coinId: 'UCT',
+const totalUsd = await sphere.payments.getBalance();  // number | null (null if no PriceProvider)
+
+const tokens = sphere.payments.getTokens();           // individual Token[]
+const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' }); // filter by coin
+
+// 5. Send tokens (L3)
+const result = await sphere.payments.send({
+  recipient: '@bob',           // @nametag, DIRECT://..., chain pubkey (02...), or alpha1...
+  amount: '1000000',           // in smallest unit (string)
+  coinId: 'UCT',              // token coin ID
+  memo: 'Payment for coffee', // optional
+});
+// result: { id, status, tokens, error? }
+// status: 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
+
+// 6. Receive tokens (automatic via Nostr)
+sphere.on('transfer:incoming', (transfer) => {
+  console.log(`From: ${transfer.senderNametag}, Tokens: ${transfer.tokens.length}`);
 });
 
-// Register nametag (mints token on-chain!)
-await sphere.registerNametag('myname');
+// 7. L1 operations (enabled by default, lazy Fulcrum connection)
+const l1Balance = await sphere.payments.l1!.getBalance();
+// { confirmed, unconfirmed, vested, unvested, total } — all strings in satoshis
 
-// Multi-address management
+const l1Result = await sphere.payments.l1!.send({
+  to: 'alpha1...', amount: '100000', feeRate: 5,
+});
+
+// 8. Sync with remote storage (IPFS etc.)
+const syncResult = await sphere.payments.sync(); // { added, removed }
+
+// 9. Transaction history
+const history = sphere.payments.getHistory();
+// [{ type, amount, coinId, symbol, timestamp, recipientNametag, senderPubkey }]
+
+// 10. Peer resolution (nametag → addresses)
+const peer = await sphere.resolve('@bob');
+// { chainPubkey, directAddress, l1Address, nametag, transportPubkey }
+
+// 11. Multi-address
 await sphere.switchToAddress(1);
-const addresses = sphere.getActiveAddresses(); // non-hidden tracked addresses
-await sphere.setAddressHidden(1, true);        // hide from UI
+await sphere.registerNametag('alice2');
+const addresses = sphere.getActiveAddresses(); // TrackedAddress[]
 
-// Listen for incoming transfers
-sphere.on('transfer:incoming', (event) => {
-  console.log('Received:', event.data.amount);
+// 12. Payment requests
+const reqResult = await sphere.payments.sendPaymentRequest('@bob', {
+  amount: '1000000', coinId: 'UCT', message: 'Pay for order #1234',
+});
+const response = await sphere.payments.waitForPaymentResponse(reqResult.requestId!, 120000);
+
+sphere.payments.onPaymentRequest((req) => {
+  // Handle incoming: req.senderNametag, req.amount, req.symbol
+  sphere.payments.payPaymentRequest(req.id);  // or rejectPaymentRequest()
 });
 
-// Cleanup
+// 13. Cleanup
 await sphere.destroy();
 ```
 
@@ -82,8 +115,47 @@ await sphere.destroy();
 | Storage | localStorage + IndexedDB | File-based JSON |
 | Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
 | Oracle (Aggregator) | Included with API key | Included with API key |
+| L1 (ALPHA blockchain) | Enabled, lazy Fulcrum connect | Enabled, lazy Fulcrum connect |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | IPFS sync | Optional (`helia`) | Not available |
+
+### Key API Methods Reference
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `Sphere.init(options)` | `{ sphere, created, generatedMnemonic? }` | Create or load wallet |
+| `Sphere.exists(storage)` | `boolean` | Check if wallet exists |
+| `Sphere.clear({ storage, tokenStorage? })` | `void` | Delete all wallet data |
+| `Sphere.import(options)` | `Sphere` | Import from mnemonic/masterKey |
+| `sphere.payments.getAssets(coinId?)` | `Asset[]` | Get assets grouped by coin |
+| `sphere.payments.getBalance()` | `number \| null` | Total USD value |
+| `sphere.payments.getTokens(filter?)` | `Token[]` | Get individual tokens |
+| `sphere.payments.send(request)` | `TransferResult` | Send L3 tokens |
+| `sphere.payments.sync()` | `{ added, removed }` | Sync with remote storage |
+| `sphere.payments.validate()` | `{ valid, invalid }` | Validate against aggregator |
+| `sphere.payments.getHistory()` | `TransactionHistoryEntry[]` | Transaction history |
+| `sphere.payments.l1.getBalance()` | `L1Balance` | L1 balance (strings in sats) |
+| `sphere.payments.l1.send(request)` | `L1SendResult` | Send L1 transaction |
+| `sphere.payments.l1.getHistory(limit?)` | `L1Transaction[]` | L1 tx history |
+| `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
+| `sphere.registerNametag(name)` | `void` | Register nametag (mints on-chain) |
+| `sphere.switchToAddress(index)` | `void` | Switch HD address |
+| `sphere.getActiveAddresses()` | `TrackedAddress[]` | Non-hidden tracked addresses |
+| `sphere.on(event, handler)` | `() => void` (unsubscribe) | Subscribe to events |
+
+### Key Events
+
+| Event | Payload | When |
+|-------|---------|------|
+| `transfer:incoming` | `{ senderPubkey, senderNametag?, tokens, receivedAt }` | Received tokens via Nostr |
+| `transfer:confirmed` | `TransferResult` | Outgoing transfer confirmed |
+| `transfer:failed` | `TransferResult` | Outgoing transfer failed |
+| `identity:changed` | `{ l1Address, directAddress, chainPubkey, nametag, addressIndex }` | Address switch |
+| `nametag:registered` | `{ nametag, addressIndex }` | Nametag registered |
+| `nametag:recovered` | `{ nametag }` | Nametag recovered from Nostr on import |
+| `address:activated` | `{ address: TrackedAddress }` | New address tracked |
+| `sync:provider` | `{ providerId, success, added, removed }` | Per-provider sync result |
+| `payment_request:incoming` | `IncomingPaymentRequest` | Received payment request |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
 
@@ -203,6 +275,21 @@ interface FullIdentity extends Identity {
   privateKey: string;       // secp256k1 private key (hex)
 }
 
+interface TransferRequest {
+  recipient: string;        // @nametag, DIRECT://..., chain pubkey, alpha1...
+  amount: string;           // Amount in smallest unit
+  coinId: string;           // Token coin ID (e.g., 'UCT')
+  memo?: string;            // Optional message
+}
+
+interface TransferResult {
+  readonly id: string;
+  status: 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed';
+  readonly tokens: Token[];
+  txHash?: string;
+  error?: string;
+}
+
 // Tracked address (returned by getActiveAddresses(), etc.)
 interface TrackedAddress {
   index: number;            // HD derivation index
@@ -257,6 +344,12 @@ npm run type-check
 
 ## Key Concepts
 
+### L1 Payments (Enabled by Default)
+- L1 module (`sphere.payments.l1`) is created automatically
+- Fulcrum WebSocket connection is **lazy** — deferred until first L1 operation
+- Set `l1: null` in `PaymentsModuleConfig` to explicitly disable
+- `importFromJSON()` and `importFromLegacyFile()` accept `l1` config option
+
 ### Nametags
 - Human-readable aliases (e.g., `@alice`) for receiving payments
 - Registered via Nostr relay events (NIP-04 encrypted)
@@ -304,48 +397,6 @@ TxfStorageDataBase {
 }
 ```
 
-## Recent Changes
-
-### v0.2.2 (current)
-
-1. **L1 payments enabled by default**: `PaymentsModule` creates `L1PaymentsModule` automatically.
-   - Set `l1: null` in config to explicitly disable L1
-   - Fulcrum WebSocket connection is **lazy** — deferred until first L1 operation
-   - `importFromJSON()` and `importFromLegacyFile()` now accept `l1` config option
-
-2. **IndexedDB deadlock fix**: `tokenStorage.clear()` has timeout protection (2s) to prevent
-   deadlock on repeated calls. `indexedDB.databases()` also has a 1.5s timeout.
-
-3. **L1 transaction history fix**: Correctly resolves send/receive direction by looking up
-   previous transaction outputs instead of comparing txids to addresses.
-
-4. **Payment request fix**: `senderNametag` now correctly populated on incoming payment requests.
-   `recipientNametag` semantics clarified (where tokens should be sent, not who should pay).
-
-### Earlier changes
-
-5. **Identity field renaming** (consistent naming):
-   - `publicKey` → `chainPubkey`
-   - `address` → `l1Address`
-   - `predicateAddress` → `directAddress`
-
-6. **Nametag recovery**: Automatic recovery from Nostr on wallet import
-
-7. **DirectAddress for L3**: Using DirectAddress instead of ProxyAddress
-
-8. **Events**:
-   - `nametag:recovered` - Emitted when nametag found on Nostr during import
-   - `identity:changed` - Updated with new field names
-   - `address:activated` - Emitted when new address first tracked
-   - `address:hidden` / `address:unhidden` - Address visibility changes
-
-9. **PriceProvider** (optional): CoinGecko integration for token fiat prices
-   - `getBalance()` returns total USD value (`number | null`)
-   - `getAssets()` returns assets enriched with `priceUsd`, `fiatValueUsd`, `change24h`
-   - `baseUrl` config for CORS proxy in browser environments
-   - Negative cache: tokens not found on CoinGecko are cached to prevent repeated requests
-   - `setPriceProvider()` for runtime provider configuration
-
 ## Testing
 
 **Framework:** Vitest
@@ -373,34 +424,6 @@ Key test files:
 **Optional (IPFS):**
 - `helia` - IPFS node for browser
 - `@helia/json`, `@helia/ipns` - IPFS extensions
-
-## Wallet Lifecycle
-
-```typescript
-// 1. Create new wallet
-const { sphere, generatedMnemonic } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-  nametag: 'alice',
-});
-
-// 2. Load existing wallet
-const { sphere } = await Sphere.init({ ...providers });
-
-// 3. Import from mnemonic
-const { sphere } = await Sphere.init({
-  ...providers,
-  mnemonic: 'twelve words...',
-});
-
-// 4. Operations
-const balance = await sphere.payments.getBalance(); // total USD value or null
-const assets = await sphere.payments.getAssets();    // assets with price data
-await sphere.payments.send({ recipient: '@bob', amount: '1000000', coinId: 'UCT' });
-
-// 5. Cleanup
-await sphere.destroy();
-```
 
 ## File Size Reference
 

@@ -48,46 +48,26 @@ const providers = createNodeProviders({
 });
 ```
 
-### Manual Setup (Advanced)
-
-For fine-grained control, create providers manually:
-
-### Browser Environment
+### Initialize Wallet
 
 ```typescript
-import { createBrowserProviders } from '@unicitylabs/sphere-sdk/impl/browser';
 import { Sphere } from '@unicitylabs/sphere-sdk';
 
-const providers = createBrowserProviders({
-  network: 'testnet',
-  // L1 is enabled by default with lazy Fulcrum connection
-  // Set l1: undefined (default) to use network defaults
-  // Set l1: null in Sphere.init() to explicitly disable L1
-});
-
-// Initialize (auto-creates wallet if needed)
+// Sphere.init() is the main entry point — it creates OR loads a wallet automatically
 const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
-  autoGenerate: true,
-});
-```
-
-### Node.js Environment
-
-```typescript
-import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
-import { Sphere } from '@unicitylabs/sphere-sdk';
-
-const providers = createNodeProviders({
-  network: 'testnet',
-  dataDir: './wallet-data',
-  tokensDir: './tokens',
+  autoGenerate: true,  // Generate mnemonic if no wallet exists
+  nametag: 'alice',    // Optional: register @alice nametag
 });
 
-const { sphere } = await Sphere.init({
-  ...providers,
-  autoGenerate: true,
-});
+if (created && generatedMnemonic) {
+  // First launch — show mnemonic to user for backup
+  console.log('Save this mnemonic:', generatedMnemonic);
+}
+
+// Wallet is ready — L3 and L1 payments are available
+console.log('Address:', sphere.identity?.directAddress);  // DIRECT://... (L3)
+console.log('L1:', sphere.identity?.l1Address);           // alpha1... (L1)
 ```
 
 ---
@@ -225,6 +205,42 @@ sphere.on('address:hidden', ({ index, addressId }) => {
 
 ## L3 Payments
 
+L3 is the primary payment layer. Tokens are transferred peer-to-peer via Nostr with state proofs committed to the Unicity aggregator.
+
+### Typical Wallet Flow
+
+```typescript
+// 1. Init wallet
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true, nametag: 'alice' });
+
+// 2. Check what tokens we have
+const assets = await sphere.payments.getAssets();
+for (const asset of assets) {
+  console.log(`${asset.symbol}: ${asset.totalAmount} (${asset.tokenCount} tokens)`);
+}
+
+// 3. Send tokens
+const result = await sphere.payments.send({
+  recipient: '@bob',
+  amount: '1000000',
+  coinId: 'UCT',
+});
+
+// 4. Listen for incoming transfers
+sphere.on('transfer:incoming', (transfer) => {
+  console.log(`Received from ${transfer.senderNametag}: ${transfer.tokens.length} tokens`);
+});
+
+// 5. Sync with remote storage (IPFS, etc.)
+await sphere.payments.sync();
+
+// 6. View history
+const history = sphere.payments.getHistory();
+
+// 7. Cleanup
+await sphere.destroy();
+```
+
 ### Get Balance & Assets
 
 ```typescript
@@ -232,16 +248,143 @@ sphere.on('address:hidden', ({ index, addressId }) => {
 const totalUsd = await sphere.payments.getBalance();
 console.log('Total USD:', totalUsd); // number | null
 
-// Get assets with price data
+// Get assets grouped by coin, with price data
 const assets = await sphere.payments.getAssets();
 for (const asset of assets) {
-  console.log(`${asset.symbol}: ${asset.totalAmount}`);
+  console.log(`${asset.symbol}: ${asset.totalAmount} (${asset.tokenCount} tokens)`);
   console.log(`  Price: $${asset.priceUsd ?? 'N/A'}`);
   console.log(`  Value: $${asset.fiatValueUsd?.toFixed(2) ?? 'N/A'}`);
+  console.log(`  24h change: ${asset.change24h ?? 'N/A'}%`);
+}
+
+// Get assets for a specific coin
+const uctAssets = await sphere.payments.getAssets('UCT');
+```
+
+### Get Individual Tokens
+
+```typescript
+// All tokens
+const tokens = sphere.payments.getTokens();
+
+for (const token of tokens) {
+  console.log(`Token ${token.id}: ${token.amount} ${token.symbol}`);
+  console.log(`  Coin ID: ${token.coinId}`);
+}
+
+// Filter by coin
+const uctTokens = sphere.payments.getTokens({ coinId: 'UCT' });
+
+// Get specific token by ID
+const token = sphere.payments.getToken('token-id-123');
+```
+
+### Send Tokens
+
+```typescript
+// Send to nametag (resolved via Nostr)
+const result = await sphere.payments.send({
+  recipient: '@alice',
+  amount: '1000000',
+  coinId: 'UCT',
+  memo: 'Payment for coffee',
+});
+
+// Send to DIRECT address
+const result = await sphere.payments.send({
+  recipient: 'DIRECT://0000be36...',
+  amount: '500000',
+  coinId: 'UCT',
+});
+
+// Send to chain pubkey (33-byte compressed secp256k1)
+const result = await sphere.payments.send({
+  recipient: '02abc123...',
+  amount: '500000',
+  coinId: 'UCT',
+});
+
+// Check result
+console.log('Transfer ID:', result.id);
+console.log('Status:', result.status);  // 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
+if (result.error) {
+  console.error('Error:', result.error);
 }
 ```
 
-### Set Price Provider After Init
+**TransferRequest fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `recipient` | Yes | `@nametag`, `DIRECT://...`, chain pubkey, or `alpha1...` address |
+| `amount` | Yes | Amount in smallest unit (string) |
+| `coinId` | Yes | Token coin ID (e.g., `'UCT'`) |
+| `memo` | No | Optional message to recipient |
+
+### Receive Tokens
+
+Incoming tokens arrive automatically via Nostr. Subscribe to the event:
+
+```typescript
+sphere.on('transfer:incoming', (transfer) => {
+  console.log('Sender:', transfer.senderPubkey);
+  console.log('Sender nametag:', transfer.senderNametag);
+  console.log('Tokens:', transfer.tokens.length);
+  console.log('Received at:', new Date(transfer.receivedAt));
+});
+```
+
+### Sync & Refresh
+
+```typescript
+// Sync with all remote storage providers (IPFS, etc.)
+// Merges local and remote token data
+const syncResult = await sphere.payments.sync();
+console.log(`Sync: +${syncResult.added} -${syncResult.removed}`);
+
+// Validate tokens against the aggregator
+const { valid, invalid } = await sphere.payments.validate();
+console.log(`Valid: ${valid.length}, Invalid: ${invalid.length}`);
+```
+
+### Transaction History
+
+```typescript
+const history = sphere.payments.getHistory();
+
+for (const entry of history) {
+  console.log(`${entry.type}: ${entry.amount} ${entry.coinId}`);
+  console.log(`  Date: ${new Date(entry.timestamp)}`);
+  if (entry.recipientNametag) {
+    console.log(`  To: @${entry.recipientNametag}`);
+  }
+}
+```
+
+### Pending Transfers
+
+```typescript
+// Get transfers that are still in progress
+const pending = sphere.payments.getPendingTransfers();
+for (const transfer of pending) {
+  console.log(`${transfer.id}: ${transfer.status}`);
+}
+```
+
+### Peer Resolution
+
+```typescript
+// Resolve any identifier to PeerInfo (nametag, address, pubkey)
+const peer = await sphere.resolve('@alice');
+if (peer) {
+  console.log('Chain pubkey:', peer.chainPubkey);
+  console.log('Direct address:', peer.directAddress);
+  console.log('L1 address:', peer.l1Address);
+  console.log('Nametag:', peer.nametag);
+}
+```
+
+### Price Provider (Optional)
 
 ```typescript
 import { createPriceProvider } from '@unicitylabs/sphere-sdk';
@@ -249,15 +392,14 @@ import { createPriceProvider } from '@unicitylabs/sphere-sdk';
 // Set or replace PriceProvider at runtime
 sphere.setPriceProvider(createPriceProvider({
   platform: 'coingecko',
-  apiKey: userProvidedKey,
+  apiKey: userProvidedKey,  // Optional for free tier
+  baseUrl: '/api/coingecko',  // CORS proxy for browser (see below)
 }));
 ```
 
-### CORS Proxy (Browser)
+Without a PriceProvider, `getBalance()` returns `null` and price fields in `getAssets()` are `null`. All other functionality works normally.
 
-CoinGecko's free API does not include CORS headers. In browser environments, you need a proxy:
-
-**Vite (development):**
+**CORS Proxy (Browser only):** CoinGecko's free API lacks CORS headers. Add a proxy in development:
 
 ```typescript
 // vite.config.ts
@@ -274,63 +416,7 @@ export default defineConfig({
 });
 ```
 
-Then pass `baseUrl: '/api/coingecko'` in the `price` config. In production, use Nginx or a Cloudflare Worker as a reverse proxy. CoinGecko Pro API supports CORS natively and doesn't require a proxy.
-
-Node.js environments are not subject to CORS — no proxy needed.
-
-### Get Tokens
-
-```typescript
-const tokens = await sphere.payments.getTokens();
-
-for (const token of tokens) {
-  console.log(`Token ${token.id}: ${token.amount} ${token.symbol}`);
-  console.log(`  Status: ${token.status}`);  // 'confirmed' | 'pending' | 'spent'
-  console.log(`  Coin ID: ${token.coinId}`);
-}
-```
-
-### Send Tokens
-
-```typescript
-// Send to nametag
-const result = await sphere.payments.send({
-  recipient: '@alice',
-  amount: '1000000',
-  coinId: 'UCT',
-  memo: 'Payment for coffee',
-});
-
-// Send to public key
-const result = await sphere.payments.send({
-  recipient: '02abc123...',
-  amount: '500000',
-  coinId: 'UCT',
-});
-
-if (result.success) {
-  console.log('Transfer ID:', result.transferId);
-} else {
-  console.error('Transfer failed:', result.error);
-}
-```
-
-### Receive Tokens
-
-Incoming tokens are received automatically via Nostr. Subscribe to events:
-
-```typescript
-sphere.on('transfer:incoming', (transfer) => {
-  console.log('Received tokens from:', transfer.senderNametag);
-  console.log('Amount:', transfer.amount);
-});
-```
-
-### Refresh Tokens
-
-```typescript
-await sphere.payments.refresh();
-```
+CoinGecko Pro API supports CORS natively. Node.js is not subject to CORS.
 
 ---
 
@@ -503,12 +589,12 @@ ALPHA coins are classified as "vested" or "unvested" based on their coinbase ori
 - **Unvested**: Coins from blocks >280,000
 
 ```typescript
-// Vesting is enabled by default, configure via L1PaymentsModule:
-import { createL1PaymentsModule } from '@unicitylabs/sphere-sdk';
-
-const l1Module = createL1PaymentsModule({
-  electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',
-  enableVesting: true,  // default: true
+// Vesting is enabled by default. Configure via providers:
+const providers = createBrowserProviders({
+  network: 'mainnet',
+  l1: {
+    enableVesting: true,  // default: true
+  },
 });
 ```
 
@@ -805,36 +891,33 @@ The recovery process:
 
 ## Error Handling
 
-### Error Types
+### Send Error Handling
+
+`send()` returns a `TransferResult` — check its `status` and `error` fields:
 
 ```typescript
-try {
-  await sphere.payments.send({ ... });
-} catch (error) {
-  if (error.code === 'INSUFFICIENT_BALANCE') {
-    console.error('Not enough tokens');
-  } else if (error.code === 'RECIPIENT_NOT_FOUND') {
-    console.error('Nametag not registered');
-  } else if (error.code === 'NETWORK_ERROR') {
-    console.error('Connection failed');
-  }
-}
-```
-
-### Validation Errors
-
-```typescript
-// Check before sending
-const validation = await sphere.payments.validateTransfer({
+const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
   coinId: 'UCT',
 });
 
-if (!validation.valid) {
-  console.error(validation.errors);
-  // ['Insufficient balance', 'Invalid recipient']
+if (result.status === 'failed') {
+  console.error('Transfer failed:', result.error);
+  // Common errors:
+  // - Insufficient balance
+  // - Recipient not found (nametag not registered)
+  // - Network/aggregator errors
 }
+
+// Subscribe to transfer lifecycle events
+sphere.on('transfer:confirmed', (transfer) => {
+  console.log('Transfer confirmed:', transfer.id);
+});
+
+sphere.on('transfer:failed', (transfer) => {
+  console.error('Transfer failed:', transfer.id, transfer.error);
+});
 ```
 
 ---
