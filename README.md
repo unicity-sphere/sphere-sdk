@@ -43,6 +43,9 @@ npm run cli -- --help
 # Initialize new wallet on testnet
 npm run cli -- init --network testnet
 
+# Initialize with nametag (mints token on-chain)
+npm run cli -- init --network testnet --nametag alice
+
 # Import existing wallet
 npm run cli -- init --mnemonic "your 24 words here"
 
@@ -52,35 +55,58 @@ npm run cli -- status
 # Check balance
 npm run cli -- balance
 
-# Show receive address
+# Fetch pending transfers and finalize unconfirmed tokens
+npm run cli -- balance --finalize
+
+# Check for incoming transfers
 npm run cli -- receive
 
-# Send tokens
-npm run cli -- send @alice 1000000
+# Check for incoming transfers and finalize unconfirmed tokens
+npm run cli -- receive --finalize
+
+# Send tokens (instant mode, default)
+npm run cli -- send @alice 1 --coin UCT --instant
+
+# Send tokens (conservative mode — collect all proofs first)
+npm run cli -- send @alice 1 --coin UCT --conservative
+
+# Request test tokens from faucet
+npm run cli -- topup
 
 # Register nametag
 npm run cli -- nametag myname
 
 # Show transaction history
 npm run cli -- history 10
+
+# Verify tokens against aggregator (detect spent tokens)
+npm run cli -- verify-balance
 ```
 
 ### Available CLI Commands
 
 | Category | Command | Description |
 |----------|---------|-------------|
-| **Wallet** | `init [--network <net>] [--mnemonic "<words>"]` | Create or import wallet |
+| **Wallet** | `init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]` | Create or import wallet |
 | | `status` | Show wallet identity |
 | | `config` | Show/set configuration |
-| **Balance** | `balance` | Show L3 token balance |
-| | `tokens` | List all tokens |
+| **Profiles** | `wallet list` | List all wallet profiles |
+| | `wallet use <name>` | Switch to a wallet profile |
+| | `wallet create <name> [--network <net>]` | Create a new wallet profile |
+| | `wallet delete <name>` | Delete a wallet profile |
+| | `wallet current` | Show current wallet profile |
+| **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
+| | `tokens` | List all tokens with details |
 | | `l1-balance` | Show L1 (ALPHA) balance |
-| **Transfers** | `send <recipient> <amount>` | Send tokens |
-| | `receive` | Show address for receiving |
+| | `topup [coin] [amount]` | Request test tokens from faucet |
+| | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
+| **Transfers** | `send <to> <amount> [--coin SYM] [--instant\|--conservative]` | Send tokens |
+| | `receive [--finalize]` | Check for incoming transfers |
 | | `history [limit]` | Show transaction history |
 | **Nametags** | `nametag <name>` | Register a nametag |
 | | `nametag-info <name>` | Lookup nametag info |
 | | `my-nametag` | Show current nametag |
+| | `nametag-sync` | Re-publish nametag with chainPubkey |
 | **Utils** | `generate-key` | Generate random key |
 | | `to-human <amount>` | Convert to human readable |
 | | `parse-wallet <file>` | Parse wallet file |
@@ -152,7 +178,7 @@ const providers = createBrowserProviders({
   oracle: { url: 'https://custom-aggregator.example.com' }, // custom oracle
 });
 
-// Enable L1 with network defaults
+// L1 is enabled by default — customize if needed
 const providers = createBrowserProviders({
   network: 'testnet',
   l1: { enableVesting: true },  // uses testnet electrum URL automatically
@@ -332,16 +358,19 @@ sphere.payments.onPaymentRequest((request) => {
 Access L1 payments through `sphere.payments.l1`:
 
 ```typescript
-// L1 configuration is optional (has defaults)
+// L1 is enabled by default with lazy Fulcrum connection.
+// Connection to Fulcrum is deferred until first L1 operation.
 const { sphere } = await Sphere.init({
   ...providers,
   autoGenerate: true,
-  l1: {
-    electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
-    defaultFeeRate: 10,  // sat/byte, default
-    enableVesting: true, // default
-  },
+  // L1 config is optional — defaults are applied automatically:
+  // electrumUrl: network-specific (mainnet: fulcrum.alpha.unicity.network)
+  // defaultFeeRate: 10 sat/byte
+  // enableVesting: true
 });
+
+// To explicitly disable L1:
+// const { sphere } = await Sphere.init({ ...providers, l1: null });
 
 // Get L1 balance
 const balance = await sphere.payments.l1.getBalance();
@@ -847,14 +876,6 @@ const providers = createBrowserProviders({
   },
 });
 
-// Enable multiple sync backends
-const providers = createBrowserProviders({
-  network: 'mainnet',
-  tokenSync: {
-    ipfs: { enabled: true, useDht: true },
-    cloud: { enabled: true, provider: 'aws', bucket: 'my-backup' },  // future
-  },
-});
 ```
 
 ## Token Sync Backends
@@ -864,7 +885,7 @@ The SDK supports multiple token sync backends that can be enabled independently:
 | Backend | Status | Description |
 |---------|--------|-------------|
 | `ipfs` | ✅ Ready | Decentralized IPFS/IPNS with Helia browser DHT |
-| `mongodb` | ✅ Ready | MongoDB for centralized token storage |
+| `mongodb` | 🚧 Planned | MongoDB for centralized token storage |
 | `file` | 🚧 Planned | Local file system (Node.js) |
 | `cloud` | 🚧 Planned | Cloud storage (AWS S3, GCP, Azure) |
 
@@ -878,29 +899,6 @@ const providers = createBrowserProviders({
       additionalGateways: ['https://my-gateway.com'],
       useDht: true,  // Enable browser DHT (Helia)
     },
-  },
-});
-
-// Enable MongoDB sync
-const providers = createBrowserProviders({
-  network: 'mainnet',
-  tokenSync: {
-    mongodb: {
-      enabled: true,
-      uri: 'mongodb://localhost:27017',
-      database: 'sphere_wallet',
-      collection: 'tokens',
-    },
-  },
-});
-
-// Multiple backends for redundancy
-const providers = createBrowserProviders({
-  tokenSync: {
-    ipfs: { enabled: true },
-    mongodb: { enabled: true, uri: 'mongodb://localhost:27017', database: 'wallet' },
-    file: { enabled: true, directory: './tokens', format: 'txf' },
-    cloud: { enabled: true, provider: 'aws', bucket: 'wallet-backup' },
   },
 });
 ```
@@ -985,32 +983,32 @@ const { sphere } = await Sphere.init({
 
 ## Dynamic Provider Management (Runtime)
 
-After `Sphere.init()` is called, you can add/remove token storage providers dynamically through UI:
+After `Sphere.init()` is called, you can add/remove token storage providers dynamically:
 
 ```typescript
-import { createMongoDbStorageProvider } from './my-mongodb-provider';
+import { createIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
 
-// Add a new provider at runtime (e.g., user enables MongoDB sync in settings)
-const mongoProvider = createMongoDbStorageProvider({
-  uri: 'mongodb://localhost:27017',
-  database: 'sphere_wallet',
+// Add a new provider at runtime (e.g., user enables IPFS sync in settings)
+const ipfsProvider = createIpfsStorageProvider({
+  gateways: ['https://ipfs.io'],
+  useDht: true,
 });
 
-await sphere.addTokenStorageProvider(mongoProvider);
+await sphere.addTokenStorageProvider(ipfsProvider);
 
 // Provider is now active and will be used in sync operations
 
 // Check if provider exists
-if (sphere.hasTokenStorageProvider('mongodb-token-storage')) {
-  console.log('MongoDB sync is enabled');
+if (sphere.hasTokenStorageProvider('ipfs-token-storage')) {
+  console.log('IPFS sync is enabled');
 }
 
 // Get all active providers
 const providers = sphere.getTokenStorageProviders();
 console.log('Active providers:', Array.from(providers.keys()));
 
-// Remove a provider (e.g., user disables MongoDB sync)
-await sphere.removeTokenStorageProvider('mongodb-token-storage');
+// Remove a provider (e.g., user disables IPFS sync)
+await sphere.removeTokenStorageProvider('ipfs-token-storage');
 
 // Listen for per-provider sync events
 sphere.on('sync:provider', (event) => {
@@ -1024,25 +1022,6 @@ sphere.on('sync:provider', (event) => {
 
 // Trigger sync (syncs with all active providers)
 await sphere.payments.sync();
-```
-
-### Multiple Providers Example
-
-```typescript
-// User configures multiple sync backends via UI
-const ipfsProvider = createIpfsStorageProvider({ gateways: ['https://ipfs.io'] });
-const mongoProvider = createMongoDbStorageProvider({ uri: 'mongodb://...' });
-const s3Provider = createS3StorageProvider({ bucket: 'wallet-backup' });
-
-// Add all providers
-await sphere.addTokenStorageProvider(ipfsProvider);
-await sphere.addTokenStorageProvider(mongoProvider);
-await sphere.addTokenStorageProvider(s3Provider);
-
-// Sync syncs with ALL active providers
-// If one fails, others continue (fault-tolerant)
-const result = await sphere.payments.sync();
-console.log(`Synced: +${result.added} -${result.removed}`);
 ```
 
 ## Dynamic Relay Management

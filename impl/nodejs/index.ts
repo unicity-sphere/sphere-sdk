@@ -148,10 +148,12 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const l1Config = resolveL1Config(network, config?.l1);
   const priceConfig = resolvePriceConfig(config?.price);
 
+  const storage = createFileStorageProvider({
+    dataDir: config?.dataDir ?? './sphere-data',
+  });
+
   return {
-    storage: createFileStorageProvider({
-      dataDir: config?.dataDir ?? './sphere-data',
-    }),
+    storage,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
     }),
@@ -160,6 +162,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       timeout: transportConfig.timeout,
       autoReconnect: transportConfig.autoReconnect,
       debug: transportConfig.debug,
+      storage,
     }),
     oracle: createUnicityAggregatorProvider({
       url: oracleConfig.url,

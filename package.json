@@ -1,6 +1,6 @@
 {
   "name": "@unicitylabs/sphere-sdk",
-  "version": "0.2.2",
+  "version": "0.2.4",
   "description": "Modular TypeScript SDK for Unicity wallet operations",
   "type": "module",
   "main": "./dist/index.cjs",

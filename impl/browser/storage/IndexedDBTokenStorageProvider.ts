@@ -252,6 +252,16 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     }
     this.status = 'disconnected';
 
+    const CLEAR_TIMEOUT = 1500;
+
+    const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
+      Promise.race([
+        promise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
+        ),
+      ]);
+
     const deleteDb = (name: string) =>
       new Promise<void>((resolve) => {
         const req = indexedDB.deleteDatabase(name);
@@ -263,7 +273,11 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     try {
       // Delete all databases matching our prefix (covers all addresses)
       if (typeof indexedDB.databases === 'function') {
-        const dbs = await indexedDB.databases();
+        const dbs = await withTimeout(
+          indexedDB.databases(),
+          CLEAR_TIMEOUT,
+          'indexedDB.databases()',
+        );
         await Promise.all(
           dbs
             .filter(db => db.name?.startsWith(this.dbNamePrefix))
@@ -274,7 +288,8 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         await deleteDb(this.dbName);
       }
       return true;
-    } catch {
+    } catch (err) {
+      console.warn('[IndexedDBTokenStorage] clear() failed:', err);
       return false;
     }
   }

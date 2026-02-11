@@ -490,17 +490,19 @@ export class Sphere {
     // Track address 0 in the registry
     await sphere.ensureAddressTracked(0);
 
-    // Register nametag if provided, otherwise publish identity and try recovery
+    // Register nametag if provided, otherwise try recovery then publish
     if (options.nametag) {
       // registerNametag publishes identity binding WITH nametag atomically
       // (calling syncIdentityWithTransport before this would race — both replaceable
       // events get the same created_at second and relay keeps the one without nametag)
       await sphere.registerNametag(options.nametag);
     } else {
-      // Publish identity binding via transport (makes wallet discoverable)
-      await sphere.syncIdentityWithTransport();
-      // Try to recover nametag from transport (for wallet import scenarios)
+      // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
+      // kind 30078 (replaceable event), so a bare binding would overwrite the
+      // existing one that contains encrypted_nametag, making recovery impossible.
       await sphere.recoverNametagFromTransport();
+      // Now publish identity binding (with recovered nametag if found)
+      await sphere.syncIdentityWithTransport();
     }
 
     return sphere;
@@ -564,13 +566,19 @@ export class Sphere {
       throw new Error('Either mnemonic or masterKey is required');
     }
 
+    console.log('[Sphere.import] Starting import...');
+
     // Clear existing wallet if any (including token data)
+    console.log('[Sphere.import] Clearing existing wallet data...');
     await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
+    console.log('[Sphere.import] Clear done');
 
     // Reconnect storage after clear (clear may have called destroy() on the
     // previous instance which disconnects the shared storage provider)
     if (!options.storage.isConnected()) {
+      console.log('[Sphere.import] Reconnecting storage...');
       await options.storage.connect();
+      console.log('[Sphere.import] Storage reconnected');
     }
 
     const sphere = new Sphere(
@@ -587,10 +595,13 @@ export class Sphere {
       if (!Sphere.validateMnemonic(options.mnemonic)) {
         throw new Error('Invalid mnemonic');
       }
+      console.log('[Sphere.import] Storing mnemonic...');
       await sphere.storeMnemonic(options.mnemonic, options.derivationPath, options.basePath);
+      console.log('[Sphere.import] Initializing identity from mnemonic...');
       await sphere.initializeIdentityFromMnemonic(options.mnemonic, options.derivationPath);
     } else if (options.masterKey) {
       // Store master key directly
+      console.log('[Sphere.import] Storing master key...');
       await sphere.storeMasterKey(
         options.masterKey,
         options.chainCode,
@@ -598,6 +609,7 @@ export class Sphere {
         options.basePath,
         options.derivationMode
       );
+      console.log('[Sphere.import] Initializing identity from master key...');
       await sphere.initializeIdentityFromMasterKey(
         options.masterKey,
         options.chainCode,
@@ -606,28 +618,39 @@ export class Sphere {
     }
 
     // Initialize everything
+    console.log('[Sphere.import] Initializing providers...');
     await sphere.initializeProviders();
+    console.log('[Sphere.import] Providers initialized. Initializing modules...');
     await sphere.initializeModules();
+    console.log('[Sphere.import] Modules initialized');
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
+      console.log('[Sphere.import] Recovering nametag from transport...');
       await sphere.recoverNametagFromTransport();
+      console.log('[Sphere.import] Nametag recovery done');
+      // Publish identity binding (with recovered nametag if found)
+      await sphere.syncIdentityWithTransport();
     }
 
     // Mark wallet as created only after successful initialization
+    console.log('[Sphere.import] Finalizing wallet creation...');
     await sphere.finalizeWalletCreation();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
 
     // Track address 0 in the registry
+    console.log('[Sphere.import] Tracking address 0...');
     await sphere.ensureAddressTracked(0);
 
     // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
+      console.log('[Sphere.import] Registering nametag...');
       await sphere.registerNametag(options.nametag);
     }
 
+    console.log('[Sphere.import] Import complete');
     return sphere;
   }
 
@@ -656,7 +679,13 @@ export class Sphere {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
 
+    // Ensure storage is connected (may have been disconnected by a previous destroy() cycle)
+    if (!storage.isConnected()) {
+      await storage.connect();
+    }
+
     // Clear global wallet data
+    console.log('[Sphere.clear] Removing storage keys...');
     await storage.remove(STORAGE_KEYS_GLOBAL.MNEMONIC);
     await storage.remove(STORAGE_KEYS_GLOBAL.MASTER_KEY);
     await storage.remove(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
@@ -670,17 +699,35 @@ export class Sphere {
     // Per-address data
     await storage.remove(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
     await storage.remove(STORAGE_KEYS_ADDRESS.OUTBOX);
+    console.log('[Sphere.clear] Storage keys removed');
 
-    // Clear token storage if provided
+    // Clear token storage if provided (with timeout to prevent IndexedDB deadlock)
     if (tokenStorage?.clear) {
-      await tokenStorage.clear();
+      console.log('[Sphere.clear] Clearing token storage...');
+      try {
+        await Promise.race([
+          tokenStorage.clear(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('tokenStorage.clear() timed out after 2s')), 2000),
+          ),
+        ]);
+        console.log('[Sphere.clear] Token storage cleared');
+      } catch (err) {
+        console.warn('[Sphere.clear] Token storage clear failed/timed out:', err);
+      }
     }
 
     // Clear L1 vesting cache
+    console.log('[Sphere.clear] Destroying vesting classifier...');
     await vestingClassifier.destroy();
+    console.log('[Sphere.clear] Vesting classifier destroyed');
 
     if (Sphere.instance) {
+      console.log('[Sphere.clear] Destroying Sphere instance...');
       await Sphere.instance.destroy();
+      console.log('[Sphere.clear] Sphere instance destroyed');
+    } else {
+      console.log('[Sphere.clear] No Sphere instance to destroy');
     }
   }
 
@@ -1111,6 +1158,7 @@ export class Sphere {
     transport: TransportProvider;
     oracle: OracleProvider;
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+    l1?: L1Config;
   }): Promise<{ success: boolean; mnemonic?: string; error?: string }> {
     try {
       const data = JSON.parse(options.jsonContent) as WalletJSON;
@@ -1156,6 +1204,7 @@ export class Sphere {
           transport: options.transport,
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
+          l1: options.l1,
         });
         return { success: true, mnemonic };
       }
@@ -1171,6 +1220,7 @@ export class Sphere {
           transport: options.transport,
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
+          l1: options.l1,
         });
         return { success: true };
       }
@@ -1233,6 +1283,8 @@ export class Sphere {
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
     /** Optional nametag to register */
     nametag?: string;
+    /** L1 (ALPHA blockchain) configuration */
+    l1?: L1Config;
   }): Promise<{
     success: boolean;
     sphere?: Sphere;
@@ -1263,6 +1315,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
 
       return { success: true, sphere, mnemonic };
@@ -1305,6 +1358,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
 
       return { success: true, sphere };
@@ -1348,6 +1402,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
 
       return { success: true, sphere };
@@ -1375,6 +1430,7 @@ export class Sphere {
           transport: options.transport,
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
+          l1: options.l1,
         });
 
         if (result.success) {
@@ -1437,6 +1493,7 @@ export class Sphere {
           oracle: options.oracle,
           tokenStorage: options.tokenStorage,
           nametag: options.nametag,
+          l1: options.l1,
         });
         return { success: true, sphere, mnemonic };
       }
@@ -1451,6 +1508,7 @@ export class Sphere {
         oracle: options.oracle,
         tokenStorage: options.tokenStorage,
         nametag: options.nametag,
+        l1: options.l1,
       });
       return { success: true, sphere };
     }
@@ -2505,45 +2563,56 @@ export class Sphere {
       return;
     }
 
-    // Check if transport supports nametag recovery
-    if (!this._transport.recoverNametag) {
+    let recoveredNametag: string | null = null;
+
+    // Strategy 1: Decrypt nametag from own Nostr binding events (private-key based)
+    if (this._transport.recoverNametag) {
+      try {
+        recoveredNametag = await this._transport.recoverNametag();
+      } catch {
+        // Non-fatal — try fallback
+      }
+    }
+
+    // Strategy 2: Forward lookup by L1 address hash (public, same as scanAddresses).
+    // Covers edge cases where the encrypted binding event was lost from relay.
+    if (!recoveredNametag && this._transport.resolveAddressInfo && this._identity?.l1Address) {
+      try {
+        const info = await this._transport.resolveAddressInfo(this._identity.l1Address);
+        if (info?.nametag) {
+          recoveredNametag = info.nametag;
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    if (!recoveredNametag) {
       return;
     }
 
     try {
-      const recoveredNametag = await this._transport.recoverNametag();
-
-      if (recoveredNametag) {
-
-        // Update identity with recovered nametag
-        if (this._identity) {
-          (this._identity as MutableFullIdentity).nametag = recoveredNametag;
-          await this._updateCachedProxyAddress();
-        }
-
-        // Update nametag cache
-        const entry = await this.ensureAddressTracked(this._currentAddressIndex);
-        let nametags = this._addressNametags.get(entry.addressId);
-        if (!nametags) {
-          nametags = new Map();
-          this._addressNametags.set(entry.addressId, nametags);
-        }
-        const nextIndex = nametags.size;
-        nametags.set(nextIndex, recoveredNametag);
-        await this.persistAddressNametags();
-
-        // Re-publish identity binding with recovered nametag
-        if (this._transport.publishIdentityBinding) {
-          await this._transport.publishIdentityBinding(
-            this._identity!.chainPubkey,
-            this._identity!.l1Address,
-            this._identity!.directAddress || '',
-            recoveredNametag,
-          );
-        }
-
-        this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
+      // Update identity with recovered nametag
+      if (this._identity) {
+        (this._identity as MutableFullIdentity).nametag = recoveredNametag;
+        await this._updateCachedProxyAddress();
       }
+
+      // Update nametag cache
+      const entry = await this.ensureAddressTracked(this._currentAddressIndex);
+      let nametags = this._addressNametags.get(entry.addressId);
+      if (!nametags) {
+        nametags = new Map();
+        this._addressNametags.set(entry.addressId, nametags);
+      }
+      const nextIndex = nametags.size;
+      nametags.set(nextIndex, recoveredNametag);
+      await this.persistAddressNametags();
+
+      // Note: no need to re-publish here — callers follow up with
+      // syncIdentityWithTransport() which will publish WITH the recovered nametag.
+
+      this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
     } catch {
       // Don't fail wallet import on nametag recovery errors
     }
@@ -2844,9 +2913,13 @@ export class Sphere {
       provider.setIdentity(this._identity!);
     }
 
-    // Connect providers
-    await this._storage.connect();
-    await this._transport.connect();
+    // Connect providers (skip if already connected, e.g. after setIdentity reconnect)
+    if (!this._storage.isConnected()) {
+      await this._storage.connect();
+    }
+    if (!this._transport.isConnected()) {
+      await this._transport.connect();
+    }
     await this._oracle.initialize();
 
     // Initialize all token storage providers

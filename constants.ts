@@ -44,6 +44,8 @@ export const STORAGE_KEYS_GLOBAL = {
   ADDRESS_NAMETAGS: 'address_nametags',
   /** Active addresses registry (JSON: TrackedAddressesStorage) */
   TRACKED_ADDRESSES: 'tracked_addresses',
+  /** Last processed Nostr wallet event timestamp (unix seconds), keyed per pubkey */
+  LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
 } as const;
 
 /**
@@ -65,6 +67,8 @@ export const STORAGE_KEYS_ADDRESS = {
   MESSAGES: 'messages',
   /** Transaction history for this address */
   TRANSACTION_HISTORY: 'transaction_history',
+  /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
+  PENDING_V5_TOKENS: 'pending_v5_tokens',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */

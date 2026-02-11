@@ -319,8 +319,9 @@ export class InstantSplitExecutor {
       options?.onNostrDelivered?.(nostrEventId);
 
       // === STEP 7: BACKGROUND PROCESSING ===
+      let backgroundPromise: Promise<void> | undefined;
       if (!options?.skipBackground) {
-        this.submitBackgroundV5(senderMintCommitment, recipientMintCommitment, transferCommitment, {
+        backgroundPromise = this.submitBackgroundV5(senderMintCommitment, recipientMintCommitment, transferCommitment, {
           signingService: this.signingService,
           tokenType: tokenToSplit.type,
           coinId,
@@ -338,6 +339,7 @@ export class InstantSplitExecutor {
         splitGroupId,
         criticalPathDurationMs: criticalPathDuration,
         backgroundStarted: !options?.skipBackground,
+        backgroundPromise,
       };
     } catch (error) {
       const duration = performance.now() - startTime;
@@ -412,7 +414,7 @@ export class InstantSplitExecutor {
     recipientMintCommitment: MintCommitment<any>,
     transferCommitment: TransferCommitment,
     context: BackgroundContext
-  ): void {
+  ): Promise<void> {
     console.log('[InstantSplit] Background: Starting parallel mint submission...');
     const startTime = performance.now();
 
@@ -434,7 +436,7 @@ export class InstantSplitExecutor {
         .catch((err) => ({ type: 'transfer', status: 'ERROR', error: err })),
     ]);
 
-    submissions
+    return submissions
       .then(async (results) => {
         const submitDuration = performance.now() - startTime;
         console.log(`[InstantSplit] Background: Submissions complete in ${submitDuration.toFixed(0)}ms`);

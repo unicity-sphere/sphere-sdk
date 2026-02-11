@@ -481,3 +481,354 @@ describe('Content prefix stripping', () => {
     });
   });
 });
+
+// =============================================================================
+// Last Event Timestamp Persistence Tests
+// =============================================================================
+
+describe('Last event timestamp persistence', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsConnected.mockReturnValue(true);
+    mockGetConnectedRelays.mockReturnValue(new Set(['wss://test.relay']));
+  });
+
+  function createProviderWithStorage(storage: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn> }) {
+    return new NostrTransportProvider({
+      relays: ['wss://test.relay'],
+      createWebSocket: (() => {}) as unknown as WebSocketFactory,
+      timeout: 100,
+      autoReconnect: false,
+      storage,
+    });
+  }
+
+  function setIdentity(provider: InstanceType<typeof NostrTransportProvider>) {
+    provider.setIdentity({
+      privateKey: 'b'.repeat(64),
+      chainPubkey: '02' + 'a'.repeat(64),
+      l1Address: 'alpha1test',
+    });
+  }
+
+  describe('subscribeToEvents since filter', () => {
+    it('should use stored timestamp when storage has a value', async () => {
+      const storedTimestamp = '1700000000';
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(storedTimestamp),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockSubscribe).toHaveBeenCalled();
+      const [walletFilterArg] = mockSubscribe.mock.calls[0];
+      const walletFilter = walletFilterArg.toJSON();
+      expect(walletFilter.since).toBe(1700000000);
+    });
+
+    it('should use current time when storage has no value (fresh wallet)', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const now = Math.floor(Date.now() / 1000);
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockSubscribe).toHaveBeenCalled();
+      const [walletFilterArg] = mockSubscribe.mock.calls[0];
+      const walletFilter = walletFilterArg.toJSON();
+      // Should be approximately current time (within 5 seconds)
+      expect(walletFilter.since).toBeGreaterThanOrEqual(now - 5);
+      expect(walletFilter.since).toBeLessThanOrEqual(now + 5);
+    });
+
+    it('should use current time when storage read fails', async () => {
+      const mockStorage = {
+        get: vi.fn().mockRejectedValue(new Error('Storage error')),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const now = Math.floor(Date.now() / 1000);
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockSubscribe).toHaveBeenCalled();
+      const [walletFilterArg] = mockSubscribe.mock.calls[0];
+      const walletFilter = walletFilterArg.toJSON();
+      expect(walletFilter.since).toBeGreaterThanOrEqual(now - 5);
+      expect(walletFilter.since).toBeLessThanOrEqual(now + 5);
+    });
+
+    it('should use 24h fallback when no storage adapter provided', async () => {
+      const provider = createProvider(['wss://test.relay']);
+      setIdentity(provider);
+
+      const now = Math.floor(Date.now() / 1000);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockSubscribe).toHaveBeenCalled();
+      const [walletFilterArg] = mockSubscribe.mock.calls[0];
+      const walletFilter = walletFilterArg.toJSON();
+      // Should be approximately now - 86400 (24h)
+      const expected24hAgo = now - 86400;
+      expect(walletFilter.since).toBeGreaterThanOrEqual(expected24hAgo - 5);
+      expect(walletFilter.since).toBeLessThanOrEqual(expected24hAgo + 5);
+    });
+
+    it('should NOT apply since filter to chat subscription regardless of storage', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue('1700000000'),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Two subscriptions: wallet and chat
+      expect(mockSubscribe).toHaveBeenCalledTimes(2);
+      const [chatFilterArg] = mockSubscribe.mock.calls[1];
+      const chatFilter = chatFilterArg.toJSON();
+      expect(chatFilter.kinds).toContain(1059); // GIFT_WRAP
+      expect(chatFilter.since).toBeUndefined();
+    });
+
+    it('should read storage key based on nostr pubkey prefix', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockStorage.get).toHaveBeenCalledTimes(1);
+      const storageKeyArg = mockStorage.get.mock.calls[0][0];
+      // Key format: last_wallet_event_ts_{first 16 chars of nostr pubkey}
+      expect(storageKeyArg).toMatch(/^last_wallet_event_ts_[0-9a-f]{16}$/);
+    });
+  });
+
+  describe('updateLastEventTimestamp', () => {
+    it('should persist timestamp for DIRECT_MESSAGE (wallet) events', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Reset mock to only track calls from handleEvent
+      mockStorage.set.mockClear();
+
+      // Simulate a wallet event via the subscription callback
+      // Use kind 4 (DIRECT_MESSAGE) because handleDirectMessage is a no-op
+      // (it logs and returns), so the code continues to updateLastEventTimestamp.
+      const subscribeCall = mockSubscribe.mock.calls[0];
+      const callbacks = subscribeCall[1];
+      callbacks.onEvent({
+        id: 'event1',
+        kind: 4, // DIRECT_MESSAGE
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000100,
+        sig: 'sig',
+      });
+
+      // Wait for fire-and-forget async operations
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // updateLastEventTimestamp uses in-memory comparison, then writes directly
+      expect(mockStorage.set).toHaveBeenCalledWith(
+        expect.stringMatching(/^last_wallet_event_ts_/),
+        '1700000100'
+      );
+    });
+
+    it('should only update if new timestamp is greater than in-memory tracker', async () => {
+      // Seed the in-memory tracker by providing a stored timestamp on connect
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue('1700000300'),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.set.mockClear();
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      callbacks.onEvent({
+        id: 'event3',
+        kind: 4, // DIRECT_MESSAGE (no-op handler, won't throw)
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000200, // Older than in-memory tracker (1700000300)
+        sig: 'sig',
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // set should NOT be called because 200 < 300 (in-memory check)
+      expect(mockStorage.set).not.toHaveBeenCalled();
+    });
+
+    it('should update timestamp when newer event arrives', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue('1700000100'),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.set.mockClear();
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      callbacks.onEvent({
+        id: 'event-newer',
+        kind: 4, // DIRECT_MESSAGE
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000200, // Newer than in-memory tracker (1700000100)
+        sig: 'sig',
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      expect(mockStorage.set).toHaveBeenCalledWith(
+        expect.stringMatching(/^last_wallet_event_ts_/),
+        '1700000200'
+      );
+    });
+
+    it('should handle rapid sequential events without race condition', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null), // fresh wallet
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.set.mockClear();
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+
+      // Fire 3 events in rapid succession (no await between them)
+      callbacks.onEvent({
+        id: 'rapid-1', kind: 4, content: '{}', tags: [],
+        pubkey: 'a'.repeat(64), created_at: 1700000100, sig: 'sig',
+      });
+      callbacks.onEvent({
+        id: 'rapid-2', kind: 4, content: '{}', tags: [],
+        pubkey: 'a'.repeat(64), created_at: 1700000300, sig: 'sig',
+      });
+      callbacks.onEvent({
+        id: 'rapid-3', kind: 4, content: '{}', tags: [],
+        pubkey: 'a'.repeat(64), created_at: 1700000200, sig: 'sig',
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // In-memory tracker ensures monotonic writes:
+      // event1 (100): 100 > 0 → write 100
+      // event2 (300): 300 > 100 → write 300
+      // event3 (200): 200 < 300 → skip (no regression!)
+      expect(mockStorage.set).toHaveBeenCalledTimes(2);
+      // Last write should be 300, not 200
+      const lastSetCall = mockStorage.set.mock.calls[mockStorage.set.mock.calls.length - 1];
+      expect(lastSetCall[1]).toBe('1700000300');
+    });
+
+    it('should NOT persist timestamp for GIFT_WRAP (chat) events', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.get.mockClear();
+      mockStorage.set.mockClear();
+
+      // Chat subscription is the second one
+      const chatCallbacks = mockSubscribe.mock.calls[1][1];
+      chatCallbacks.onEvent({
+        id: 'chat-event',
+        kind: 1059, // GIFT_WRAP
+        content: '{}',
+        tags: [],
+        pubkey: 'a'.repeat(64),
+        created_at: 1700000500,
+        sig: 'sig',
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Should NOT update timestamp for chat events
+      expect(mockStorage.set).not.toHaveBeenCalled();
+    });
+
+    it('should handle storage write errors gracefully', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null), // fresh wallet
+        set: vi.fn().mockRejectedValue(new Error('Write failed')),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      mockStorage.set.mockClear();
+
+      const callbacks = mockSubscribe.mock.calls[0][1];
+      // Should not throw even when storage.set fails
+      expect(() => {
+        callbacks.onEvent({
+          id: 'event4',
+          kind: 4, // DIRECT_MESSAGE (no-op handler, won't throw)
+          content: '{}',
+          tags: [],
+          pubkey: 'a'.repeat(64),
+          created_at: 1700000400,
+          sig: 'sig',
+        });
+      }).not.toThrow();
+
+      await new Promise(resolve => setTimeout(resolve, 100));
+      // Verify set was attempted (and failed gracefully)
+      expect(mockStorage.set).toHaveBeenCalled();
+    });
+  });
+});

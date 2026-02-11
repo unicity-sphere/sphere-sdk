@@ -216,6 +216,13 @@ export interface TransportProvider extends BaseProvider {
    * @returns Unsubscribe function
    */
   onInstantSplitReceived?(handler: InstantSplitBundleHandler): () => void;
+
+  /**
+   * Fetch pending events from transport (one-shot query).
+   * Creates a temporary subscription, processes events through normal handlers,
+   * and resolves after EOSE (End Of Stored Events).
+   */
+  fetchPendingEvents?(): Promise<void>;
 }
 
 // =============================================================================
@@ -300,7 +307,7 @@ export interface IncomingTokenTransfer {
   timestamp: number;
 }
 
-export type TokenTransferHandler = (transfer: IncomingTokenTransfer) => void;
+export type TokenTransferHandler = (transfer: IncomingTokenTransfer) => void | Promise<void>;
 
 // =============================================================================
 // Payment Request Types
@@ -324,6 +331,8 @@ export interface IncomingPaymentRequest {
   id: string;
   /** Transport-specific pubkey of sender */
   senderTransportPubkey: string;
+  /** Sender's nametag (if included in encrypted content) */
+  senderNametag?: string;
   /** Parsed request data */
   request: {
     requestId: string;

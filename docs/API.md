@@ -1,43 +1,73 @@
-# SDK2 API Reference
+# Sphere SDK API Reference
 
 ## Sphere
 
-Main entry point for all SDK operations.
+Main entry point for all SDK operations. The constructor is **private** — use static methods to create/load wallets.
 
-### Constructor
+### Static Methods
+
+#### `Sphere.init(options: SphereInitOptions): Promise<SphereInitResult>`
+
+Primary entry point. Creates a new wallet or loads an existing one automatically.
 
 ```typescript
-new Sphere(config?: SphereConfig)
+const { sphere, created, generatedMnemonic } = await Sphere.init({
+  storage, transport, oracle,
+  tokenStorage,              // Optional (for IPFS sync)
+  autoGenerate: true,        // Generate mnemonic if no wallet exists
+  mnemonic: 'words...',      // Or provide mnemonic to create/import
+  nametag: 'alice',          // Optional: register @alice on create
+  l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
+  price: priceProvider,      // Optional PriceProvider
+  derivationPath: "m/44'/0'/0'", // Optional custom path
+});
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `storagePrefix` | `string` | `'sphere_'` | localStorage key prefix |
-| `aggregatorUrl` | `string` | `'https://aggregator.unicity.network'` | Aggregator endpoint |
-| `nostrRelays` | `string[]` | `['wss://relay.unicity.network']` | Nostr relay URLs |
+#### `Sphere.exists(storage: StorageProvider): Promise<boolean>`
+
+Check if encrypted wallet data exists in storage.
+
+#### `Sphere.create(options: SphereCreateOptions): Promise<Sphere>`
+
+Create wallet from a known mnemonic (low-level; prefer `Sphere.init()`).
+
+#### `Sphere.load(options: SphereLoadOptions): Promise<Sphere>`
+
+Load existing wallet from storage (low-level; prefer `Sphere.init()`).
+
+#### `Sphere.clear(storageOrOptions): Promise<void>`
+
+Delete all SDK-owned wallet data from storage. Accepts either a `StorageProvider` directly (legacy) or an options object with optional `tokenStorage`.
+
+```typescript
+// Recommended: clear wallet keys + token data
+await Sphere.clear({
+  storage: providers.storage,
+  tokenStorage: providers.tokenStorage,
+});
+
+// Legacy (backward compatible): clear wallet keys only
+await Sphere.clear(storage);
+```
 
 ### Properties
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `identity` | `FullIdentity` | Current wallet identity (after load) |
+| `identity` | `FullIdentity \| null` | Current wallet identity (after init/load) |
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
 | `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
 
-### Methods
-
-#### `initialize(providers: Providers): Promise<void>`
-
-Initialize SDK with provider implementations.
+### Instance Methods
 
 #### `destroy(): Promise<void>`
 
 Cleanup and disconnect all providers.
 
-#### `on<T>(event: string, handler: (data: T) => void): () => void`
+#### `on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void`
 
-Subscribe to events. Returns unsubscribe function.
+Subscribe to events. Returns unsubscribe function. Type-safe — see `SphereEventMap` for event payloads.
 
 #### `deriveAddress(index: number, isChange?: boolean): AddressInfo`
 
@@ -163,66 +193,72 @@ interface PeerInfo {
 
 ---
 
-## WalletManager
-
-### Methods
-
-#### `exists(): Promise<boolean>`
-
-Check if encrypted wallet data exists in storage.
-
-#### `create(password: string): Promise<string>`
-
-Create new wallet. Returns mnemonic phrase (24 words).
-
-#### `load(password: string): Promise<void>`
-
-Load and decrypt existing wallet.
-
-#### `import(mnemonic: string, password: string): Promise<void>`
-
-Import wallet from mnemonic phrase.
-
-#### `clear(storageOrOptions): Promise<void>`
-
-Delete all SDK-owned wallet data from storage. Accepts either a `StorageProvider` directly (legacy) or an options object with optional `tokenStorage`.
-
-```typescript
-// Recommended: clear wallet keys + token data
-await Sphere.clear({
-  storage: providers.storage,
-  tokenStorage: providers.tokenStorage,
-});
-
-// Legacy (backward compatible): clear wallet keys only
-await Sphere.clear(storage);
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `storageOrOptions` | `StorageProvider \| { storage, tokenStorage? }` | Storage provider or options object |
-| `options.storage` | `StorageProvider` | Key-value storage provider |
-| `options.tokenStorage` | `TokenStorageProvider` | Optional token storage to clear |
-
----
-
 ## PaymentsModule
 
-### Methods
+Access via `sphere.payments`.
 
-#### `getBalance(): Promise<number | null>`
+Handles all L3 (Unicity state transition network) token operations including transfers, balance queries, token lifecycle management, nametag minting, and multi-provider sync.
+
+### Transfer Modes
+
+`send()` automatically selects the optimal transfer path:
+
+```
+Path 1 — Whole-Token NOSTR-FIRST (no split needed):
+  ┌─────────┐    commitment + token    ┌───────────┐
+  │  Sender  │ ────── Nostr ──────────>│ Recipient  │
+  └────┬─────┘                         └─────┬──────┘
+       │  submit commitment (background)      │  submit commitment (idempotent)
+       └──────> Aggregator <──────────────────┘  poll for proof → finalize
+
+Path 2 — Instant Split V5 (~2.3s sender latency):
+  ┌─────────┐  burn  ┌────────────┐  bundle via Nostr  ┌───────────┐
+  │  Sender  │──────> │ Aggregator │                    │ Recipient  │
+  └────┬─────┘ proof  └────────────┘                    └─────┬──────┘
+       │ create mints + transfer commitment                   │
+       │ ──────────── Nostr ─────────────────────────────────>│
+       │  background: submit mints, save change               │ submit mint
+       │                                                      │ wait for proof
+       │                                                      │ submit transfer
+       │                                                      │ finalize
+```
+
+### Methods: Balance & Assets
+
+#### `getFiatBalance(): Promise<number | null>`
 
 Returns total portfolio value in USD. Requires `PriceProvider` to be configured.
 
 ```typescript
-const totalUsd = await sphere.payments.getBalance();
+const totalUsd = await sphere.payments.getFiatBalance();
 // 1523.45 — total value of all confirmed tokens in USD
 // null    — if PriceProvider is not configured or no prices available
 ```
 
+#### `getBalance(coinId?: string): Asset[]`
+
+Returns aggregated assets (tokens grouped by coinId) with confirmed/unconfirmed breakdown. Synchronous.
+
+```typescript
+const balances = sphere.payments.getBalance();
+
+for (const bal of balances) {
+  console.log(`${bal.symbol}:`);
+  console.log(`  Confirmed:   ${bal.confirmedAmount} (${bal.confirmedTokenCount} tokens)`);
+  console.log(`  Unconfirmed: ${bal.unconfirmedAmount} (${bal.unconfirmedTokenCount} tokens)`);
+  console.log(`  Total:       ${bal.totalAmount}`);
+  if (bal.fiatValueUsd !== null) {
+    console.log(`  USD Value:   $${bal.fiatValueUsd.toFixed(2)}`);
+  }
+}
+
+// Filter to a single coin
+const uctBalances = sphere.payments.getBalance('UCT_COIN_ID_HEX');
+```
+
 #### `getAssets(coinId?: string): Promise<Asset[]>`
 
-Returns aggregated assets (tokens grouped by coinId) with price data. Only includes confirmed tokens.
+Returns aggregated assets with price data. Alias for `getBalance()` with async price resolution.
 
 ```typescript
 interface Asset {
@@ -233,6 +269,10 @@ interface Asset {
   readonly iconUrl?: string;     // Token icon URL
   readonly totalAmount: string;  // Sum of all token amounts (smallest units)
   readonly tokenCount: number;   // Number of tokens aggregated
+  readonly confirmedAmount: string;     // Confirmed token amounts
+  readonly unconfirmedAmount: string;   // Unconfirmed token amounts
+  readonly confirmedTokenCount: number; // Number of confirmed tokens
+  readonly unconfirmedTokenCount: number; // Number of unconfirmed tokens
   readonly priceUsd: number | null;     // Price per unit in USD
   readonly priceEur: number | null;     // Price per unit in EUR
   readonly change24h: number | null;    // 24h price change %
@@ -249,48 +289,473 @@ const uctAssets = await sphere.payments.getAssets('0xabc...');
 
 > **Note:** Price fields are `null` when `PriceProvider` is not configured. The SDK works fully without it — prices are optional.
 
-#### `getTokens(): Promise<Token[]>`
+#### `getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[]`
+
+Synchronous. Returns current in-memory token list.
 
 ```typescript
 interface Token {
-  id: string;
-  symbol: string;
-  amount: string;
-  coinId: string;
-  status: 'confirmed' | 'pending' | 'spent';
-  sdkData: string;  // Serialized SDK token
+  readonly id: string;
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
+  readonly amount: string;
+  status: TokenStatus;  // 'pending' | 'submitted' | 'confirmed' | 'transferring' | 'spent' | 'invalid'
+  readonly createdAt: number;
+  updatedAt: number;
+  readonly sdkData?: string;  // Serialized SDK token
 }
+
+// Filter examples
+const allTokens = sphere.payments.getTokens();
+const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' });
+const confirmed = sphere.payments.getTokens({ status: 'confirmed' });
 ```
+
+#### `getToken(id: string): Token | undefined`
+
+Get a single token by ID.
 
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
+Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token.
+
 ```typescript
 interface TransferRequest {
-  recipient: string;  // @nametag, DIRECT://..., PROXY://..., alpha1... address
-  amount: string;
-  coinId: string;
-  memo?: string;
+  readonly coinId: string;       // Coin type (hex string)
+  readonly amount: string;       // Amount in smallest units
+  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
+  readonly memo?: string;        // Optional message
+  readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
+  readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
 }
+
+type AddressMode = 'auto' | 'direct' | 'proxy';
+type TransferMode = 'instant' | 'conservative';
 
 interface TransferResult {
-  success: boolean;
-  transferId?: string;
-  error?: string;
+  readonly id: string;                       // Local transfer UUID
+  status: TransferStatus;                    // Current status
+  readonly tokens: Token[];                  // Tokens involved
+  readonly tokenTransfers: TokenTransferDetail[];  // Per-token transfer details
+  error?: string;                            // Error message if failed
 }
+
+interface TokenTransferDetail {
+  readonly sourceTokenId: string;   // Source token ID consumed
+  readonly method: 'direct' | 'split';  // Transfer method
+  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
+  readonly splitGroupId?: string;   // Split group ID (split)
+  readonly nostrEventId?: string;   // Nostr event ID (split)
+}
+
+type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
 ```
 
-#### `refresh(): Promise<void>`
-
-Refresh token list from storage and network.
-
-#### `validateTransfer(request: TransferRequest): Promise<ValidationResult>`
+**Events emitted:** `transfer:confirmed` on success, `transfer:failed` on error.
 
 ```typescript
-interface ValidationResult {
-  valid: boolean;
-  errors: string[];
+const result = await sphere.payments.send({
+  recipient: '@alice',
+  amount: '1000000',
+  coinId: 'UCT',
+  addressMode: 'auto',
+});
+console.log(result.status); // 'completed'
+```
+
+**Transfer Modes:**
+
+- **`'instant'`** (default) — Sends tokens via Nostr immediately with commitment data. The receiver resolves aggregator proofs in the background. Fastest sender experience (~2-3s for splits).
+- **`'conservative'`** — Collects all aggregator proofs at the sender side before delivering fully finalized tokens (with `{ sourceToken, transferTx }`) via Nostr. Slower for the sender but the receiver gets immediately usable tokens with no background proof resolution needed.
+
+```typescript
+// Conservative transfer — receiver gets fully finalized tokens
+const result = await sphere.payments.send({
+  recipient: '@alice',
+  amount: '1000000',
+  coinId: 'UCT',
+  transferMode: 'conservative',
+});
+```
+
+#### `receive(options?, callback?): Promise<ReceiveResult>`
+
+Fetch and process pending incoming transfers from the transport layer (one-shot query).
+
+Unlike the persistent subscription that delivers events asynchronously, `receive()` explicitly
+queries the Nostr relay and resolves after all stored events are processed. Useful for
+batch/CLI applications.
+
+- **options** (`ReceiveOptions`, optional): Finalization control and progress reporting.
+- **callback** (`(transfer: IncomingTransfer) => void`, optional): Invoked for each newly received transfer.
+
+**ReceiveOptions:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `finalize` | `boolean` | `false` | Wait for all tokens to be finalized |
+| `timeout` | `number` | `60000` | Finalization timeout in ms |
+| `pollInterval` | `number` | `2000` | Poll interval between finalization attempts |
+| `onProgress` | `function` | — | Progress callback during finalization |
+
+**ReceiveResult:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `transfers` | `IncomingTransfer[]` | Newly received transfers |
+| `finalization` | `UnconfirmedResolutionResult` | Result from resolveUnconfirmed() |
+| `timedOut` | `boolean` | Whether finalization timed out |
+| `finalizationDurationMs` | `number` | Duration of finalization in ms |
+
+```typescript
+// Simple usage — fetch and submit commitments once
+const { transfers } = await sphere.payments.receive();
+
+// With callback only
+await sphere.payments.receive(undefined, (transfer) => {
+  console.log(`Received ${transfer.tokens.length} tokens`);
+});
+
+// Wait for finalization
+const result = await sphere.payments.receive({
+  finalize: true,
+  timeout: 30000,
+  onProgress: (res) => console.log(`${res.stillPending} pending`),
+});
+
+// Both options and callback
+const result = await sphere.payments.receive({ finalize: true }, (transfer) => {
+  console.log(`Received ${transfer.tokens.length} tokens`);
+});
+```
+
+---
+
+### Methods: Unconfirmed Token Resolution
+
+#### `resolveUnconfirmed(): Promise<UnconfirmedResolutionResult>`
+
+Attempt to resolve unconfirmed (`status: 'submitted'`) tokens by acquiring missing aggregator proofs.
+
+V5 tokens progress through stages:
+
+```
+RECEIVED → MINT_SUBMITTED → MINT_PROVEN → TRANSFER_SUBMITTED → FINALIZED
+```
+
+- Uses 500ms quick-timeouts per proof check (non-blocking).
+- Tokens exceeding 50 failed attempts are marked `'invalid'`.
+- Automatically called (fire-and-forget) by `getBalance()` and `load()`.
+
+```typescript
+interface UnconfirmedResolutionResult {
+  resolved: number;       // Tokens fully confirmed
+  stillPending: number;   // Tokens still waiting for proofs
+  failed: number;         // Tokens that exceeded retry limit
+  details: Array<{
+    tokenId: string;
+    stage: string;        // Current V5FinalizationStage
+    status: 'resolved' | 'pending' | 'failed';
+  }>;
+}
+
+type V5FinalizationStage = 'RECEIVED' | 'MINT_SUBMITTED' | 'MINT_PROVEN' | 'TRANSFER_SUBMITTED' | 'FINALIZED';
+```
+
+---
+
+### Methods: Balance & Token Queries
+
+#### `getBalance(coinId?: string): TokenBalance[]`
+
+Get token balances grouped by coin type. **Synchronous** (no await needed).
+
+Skips tokens with status `'spent'`, `'invalid'`, or `'transferring'`. Fires a non-blocking `resolveUnconfirmed()` call as a side effect.
+
+```typescript
+interface TokenBalance {
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly totalAmount: string;          // confirmedAmount + unconfirmedAmount
+  readonly confirmedAmount: string;      // Tokens with inclusion proofs
+  readonly unconfirmedAmount: string;    // Tokens pending proof (status: 'submitted')
+  readonly tokenCount: number;           // Total token count
+  readonly confirmedTokenCount: number;
+  readonly unconfirmedTokenCount: number;
+  readonly decimals: number;
 }
 ```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `coinId` | `string?` | Filter to a specific coin type. Omit for all. |
+
+```typescript
+const balances = sphere.payments.getBalance();
+for (const bal of balances) {
+  console.log(`${bal.symbol}: ${bal.confirmedAmount} confirmed, ${bal.unconfirmedAmount} unconfirmed`);
+}
+```
+
+#### `getTokens(filter?): Token[]`
+
+Get all tokens, optionally filtered. **Synchronous**.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filter.coinId` | `string?` | Filter by coin type |
+| `filter.status` | `TokenStatus?` | Filter by status (e.g. `'submitted'` for unconfirmed) |
+
+```typescript
+type TokenStatus = 'pending' | 'submitted' | 'confirmed' | 'transferring' | 'spent' | 'invalid';
+
+interface Token {
+  readonly id: string;
+  readonly coinId: string;
+  readonly symbol: string;
+  readonly name: string;
+  readonly decimals: number;
+  readonly iconUrl?: string;
+  readonly amount: string;
+  status: TokenStatus;
+  readonly createdAt: number;
+  updatedAt: number;
+  readonly sdkData?: string;    // Serialized SDK token JSON
+}
+```
+
+#### `getToken(id: string): Token | undefined`
+
+Get a single token by its local UUID.
+
+#### `getPendingTransfers(): TransferResult[]`
+
+Get all in-progress (pending) outgoing transfers.
+
+---
+
+### Methods: Token CRUD
+
+#### `addToken(token: Token, skipHistory?: boolean): Promise<boolean>`
+
+Add a token to the wallet.
+
+- **Tombstone check**: Rejected if exact `(tokenId, stateHash)` is tombstoned.
+- **Duplicate check**: Rejected if same composite key already exists.
+- **State replacement**: If same `tokenId` with different `stateHash`, archives old state and adds new.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `token` | `Token` | — | Token to add |
+| `skipHistory` | `boolean` | `false` | Skip creating a RECEIVED history entry |
+
+Returns `true` if added, `false` if rejected.
+
+#### `updateToken(token: Token): Promise<void>`
+
+Update an existing token. Matches by genesis tokenId or `token.id`. Falls back to `addToken()` if not found.
+
+#### `removeToken(tokenId: string, recipientNametag?: string, skipHistory?: boolean): Promise<void>`
+
+Remove a token. Archives it first, creates a tombstone `(tokenId, stateHash)`, and optionally adds a SENT history entry.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tokenId` | `string` | — | Local UUID of the token |
+| `recipientNametag` | `string?` | — | Recipient nametag for history |
+| `skipHistory` | `boolean` | `false` | Skip creating a SENT history entry |
+
+---
+
+### Methods: Tombstones
+
+Tombstones prevent spent tokens from being re-added (e.g. via Nostr re-delivery). Each tombstone is keyed by `(tokenId, stateHash)`.
+
+#### `getTombstones(): TombstoneEntry[]`
+
+Get all tombstone entries.
+
+```typescript
+interface TombstoneEntry {
+  tokenId: string;
+  stateHash: string;
+  timestamp: number;
+}
+```
+
+#### `isStateTombstoned(tokenId: string, stateHash: string): boolean`
+
+Check if a specific `(tokenId, stateHash)` is tombstoned.
+
+#### `mergeTombstones(remoteTombstones: TombstoneEntry[]): Promise<number>`
+
+Merge remote tombstones (union). Removes any local tokens matching remote tombstones. Returns number of local tokens removed.
+
+#### `pruneTombstones(maxAge?: number): Promise<void>`
+
+Remove tombstones older than `maxAge` (default: 30 days) and cap at 100 entries.
+
+---
+
+### Methods: Archives
+
+Archived tokens are spent or superseded token versions kept for recovery and sync.
+
+#### `getArchivedTokens(): Map<string, TxfToken>`
+
+Get all archived tokens. Key is genesis token ID.
+
+#### `getBestArchivedVersion(tokenId: string): TxfToken | null`
+
+Get the version with the most committed transactions from both archives and forks.
+
+#### `mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number>`
+
+Merge remote archived tokens. Handles incremental updates and forks. Returns count of tokens updated/added.
+
+#### `pruneArchivedTokens(maxCount?: number): Promise<void>`
+
+Keep at most `maxCount` archived tokens (default: 100).
+
+---
+
+### Methods: Forked Tokens
+
+Forked tokens are alternative histories detected during sync.
+
+#### `getForkedTokens(): Map<string, TxfToken>`
+
+Get all forked tokens. Key is `{tokenId}_{stateHash}`.
+
+#### `storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void>`
+
+Store a forked token version. No-op if key already exists.
+
+#### `mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number>`
+
+Merge remote forked tokens (adds missing keys). Returns count added.
+
+#### `pruneForkedTokens(maxCount?: number): Promise<void>`
+
+Keep at most `maxCount` forked tokens (default: 50).
+
+---
+
+### Methods: Transaction History
+
+#### `getHistory(): TransactionHistoryEntry[]`
+
+Get transaction history sorted newest-first.
+
+```typescript
+interface TransactionHistoryEntry {
+  id: string;
+  type: 'SENT' | 'RECEIVED' | 'SPLIT' | 'MINT';
+  amount: string;
+  coinId: string;
+  symbol: string;
+  timestamp: number;
+  recipientNametag?: string;
+  senderPubkey?: string;
+  transferId?: string;            // Links to TransferResult.id (for SENT entries)
+}
+```
+
+#### `addToHistory(entry: Omit<TransactionHistoryEntry, 'id'>): Promise<void>`
+
+Append a history entry (UUID auto-generated). Persisted immediately.
+
+---
+
+### Methods: Nametag Management
+
+#### `mintNametag(nametag: string): Promise<MintNametagResult>`
+
+Mint a nametag token on-chain. Required for receiving tokens via PROXY addresses.
+
+```typescript
+interface MintNametagResult {
+  success: boolean;
+  token?: Token;
+  nametagData?: NametagData;
+  readonly id: string;                       // Local transfer UUID
+  status: TransferStatus;                    // Current status
+  readonly tokens: Token[];                  // Tokens involved
+  readonly tokenTransfers: TokenTransferDetail[];  // Per-token transfer details
+  error?: string;                            // Error message if failed
+}
+
+interface TokenTransferDetail {
+  readonly sourceTokenId: string;   // Source token ID consumed
+  readonly method: 'direct' | 'split';  // Transfer method
+  readonly requestIdHex?: string;   // Aggregator commitment request ID (direct)
+  readonly splitGroupId?: string;   // Split group ID (split)
+  readonly nostrEventId?: string;   // Nostr event ID (split)
+}
+
+type TransferStatus = 'pending' | 'submitted' | 'confirmed' | 'delivered' | 'completed' | 'failed';
+```
+
+#### `isNametagAvailable(nametag: string): Promise<boolean>`
+
+Check if a nametag is available for minting.
+
+#### `setNametag(nametag: NametagData): Promise<void>`
+
+Set nametag data (persists to storage and file).
+
+#### `getNametag(): NametagData | null`
+
+Get current nametag data.
+
+#### `hasNametag(): boolean`
+
+Check if a nametag is set.
+
+#### `clearNametag(): Promise<void>`
+
+Remove nametag data from memory and storage.
+
+---
+
+### Methods: Sync & Validation
+
+#### `sync(): Promise<{ added: number; removed: number }>`
+
+Sync with all remote storage providers (IPFS, etc.). Merges local and remote token data.
+
+```typescript
+const result = await sphere.payments.sync();
+console.log(`Sync: +${result.added} -${result.removed}`);
+```
+
+#### `validate(): Promise<{ valid: Token[]; invalid: Token[] }>`
+
+Validate tokens against the aggregator (checks state proofs).
+
+```typescript
+const { valid, invalid } = await sphere.payments.validate();
+```
+
+#### `getHistory(): TransactionHistoryEntry[]`
+
+Get sorted transaction history (L3 transfers).
+
+#### `getPendingTransfers(): TransferResult[]`
+
+Get transfers that are still in progress.
+
+#### `load(): Promise<void>`
+
+Load all token data from storage providers. Restores pending V5 tokens and triggers `resolveUnconfirmed()`.
+
+#### `destroy(): void`
+
+Cleanup all subscriptions, polling jobs, and pending resolvers.
 
 ---
 
@@ -305,7 +770,7 @@ interface PaymentRequest {
   amount: string;           // Amount in smallest units
   coinId: string;           // Token type (e.g., 'ALPHA')
   message?: string;         // Optional message
-  recipientNametag?: string; // Who should pay
+  recipientNametag?: string; // Where tokens should be sent
   metadata?: Record<string, unknown>;
 }
 
@@ -339,10 +804,11 @@ interface IncomingPaymentRequest {
   coinId: string;              // Token type
   symbol: string;              // Token symbol for display
   message?: string;            // Request message
-  recipientNametag?: string;   // Our nametag (if specified)
+  recipientNametag?: string;   // Requester's nametag (where to send tokens)
   requestId: string;           // Original request ID
   timestamp: number;           // Request timestamp
   status: PaymentRequestStatus;
+  metadata?: Record<string, unknown>; // Custom metadata
 }
 
 // Example
@@ -471,13 +937,16 @@ Clear all completed, rejected, or expired outgoing requests.
 
 L1 (ALPHA blockchain) payments are accessed via `sphere.payments.l1`.
 
+L1 is **enabled by default** with lazy WebSocket connection (connects on first use). Set `l1: null` to disable.
+
 ### Configuration
 
-L1 is configured through `Sphere.init()`, `Sphere.create()`, or `Sphere.load()`:
+L1 is configured through `Sphere.init()`:
 
 ```typescript
-const sphere = await Sphere.init({
-  storage, transport, oracle,
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
   l1: {
     electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
     defaultFeeRate: 10,    // sat/byte, default
@@ -487,6 +956,9 @@ const sphere = await Sphere.init({
 
 // Access L1 via payments module
 const balance = await sphere.payments.l1.getBalance();
+
+// Disable L1 entirely
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true, l1: null });
 ```
 
 ### L1Config
@@ -534,8 +1006,9 @@ interface L1Utxo {
 ```typescript
 interface L1SendRequest {
   to: string;
-  amount: string;  // in satoshis
+  amount: string;      // in satoshis
   feeRate?: number;
+  useVested?: boolean;  // Send only vested coins
   memo?: string;
 }
 
@@ -548,6 +1021,10 @@ interface L1SendResult {
 ```
 
 #### `getHistory(limit?: number): Promise<L1Transaction[]>`
+
+#### `getTransaction(txid: string): Promise<L1Transaction | null>`
+
+Get a single transaction by txid.
 
 #### `estimateFee(to: string, amount: string): Promise<{ fee: string; feeRate: number }>`
 
@@ -563,12 +1040,13 @@ Send a direct message using NIP-17 gift wrapping (kind 1059). The recipient can 
 
 ```typescript
 interface DirectMessage {
-  id: string;
-  senderPubkey: string;
-  senderNametag?: string;
-  recipientPubkey: string;
-  content: string;
-  timestamp: number;
+  readonly id: string;
+  readonly senderPubkey: string;
+  readonly senderNametag?: string;
+  readonly recipientPubkey: string;
+  readonly recipientNametag?: string;
+  readonly content: string;
+  readonly timestamp: number;
   isRead: boolean;
 }
 ```
@@ -674,11 +1152,7 @@ type ProviderStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 ```typescript
 type SphereEventType =
-  | 'wallet:created'
-  | 'wallet:loaded'
-  | 'wallet:cleared'
   | 'transfer:incoming'
-  | 'transfer:outgoing'
   | 'transfer:confirmed'
   | 'transfer:failed'
   | 'payment_request:incoming'
@@ -690,21 +1164,36 @@ type SphereEventType =
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
+  | 'sync:provider'
   | 'sync:error'
   | 'connection:changed'
   | 'nametag:registered'
   | 'nametag:recovered'
   | 'identity:changed'
-  | 'address:activated'   // Emitted when address first tracked
-  | 'address:hidden'      // Emitted when address hidden
-  | 'address:unhidden';   // Emitted when address unhidden
+  | 'address:activated'
+  | 'address:hidden'
+  | 'address:unhidden';
 ```
 
 ### SphereEventMap
 
 ```typescript
 interface SphereEventMap {
-  // ... other events ...
+  'transfer:incoming': IncomingTransfer;
+  'transfer:confirmed': TransferResult;
+  'transfer:failed': TransferResult;
+  'payment_request:incoming': IncomingPaymentRequest;
+  'payment_request:accepted': IncomingPaymentRequest;
+  'payment_request:rejected': IncomingPaymentRequest;
+  'payment_request:paid': IncomingPaymentRequest;
+  'payment_request:response': PaymentRequestResponse;
+  'message:dm': DirectMessage;
+  'message:broadcast': BroadcastMessage;
+  'sync:started': { source: string };
+  'sync:completed': { source: string; count: number };
+  'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
+  'sync:error': { source: string; error: string };
+  'connection:changed': { provider: string; connected: boolean };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': {
@@ -717,6 +1206,63 @@ interface SphereEventMap {
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
+}
+```
+
+### InstantSplitBundleV5
+
+The production bundle format for instant split transfers (~2.3s sender latency).
+
+```typescript
+interface InstantSplitBundleV5 {
+  version: '5.0';
+  type: 'INSTANT_SPLIT';
+  burnTransaction: string;         // Proven burn transaction JSON
+  recipientMintData: string;       // MintTransactionData JSON
+  transferCommitment: string;      // Pre-created TransferCommitment JSON
+  amount: string;                  // Payment amount
+  coinId: string;                  // Coin ID hex
+  tokenTypeHex: string;
+  splitGroupId: string;            // Recovery correlation ID
+  senderPubkey: string;
+  recipientSaltHex: string;
+  transferSaltHex: string;
+  mintedTokenStateJson: string;    // Intermediate minted token state
+  finalRecipientStateJson: string; // Final recipient state after transfer
+  recipientAddressJson: string;    // PROXY or DIRECT address
+  nametagTokenJson?: string;       // Nametag token for PROXY transfers
+}
+```
+
+### PendingV5Finalization
+
+Metadata stored in unconfirmed token's `sdkData` to track finalization progress.
+
+```typescript
+interface PendingV5Finalization {
+  type: 'v5_bundle';
+  stage: V5FinalizationStage;
+  bundleJson: string;
+  senderPubkey: string;
+  savedAt: number;
+  lastAttemptAt?: number;
+  attemptCount: number;
+  mintProofJson?: string;
+}
+```
+
+### PaymentsModuleDependencies
+
+```typescript
+interface PaymentsModuleDependencies {
+  identity: FullIdentity;
+  storage: StorageProvider;
+  tokenStorageProviders?: Map<string, TokenStorageProvider>;
+  transport: TransportProvider;
+  oracle: OracleProvider;
+  emitEvent: (type: SphereEventType, data: SphereEventMap[type]) => void;
+  chainCode?: string;
+  l1Addresses?: string[];
 }
 ```
 
@@ -861,6 +1407,7 @@ createIpfsStorageProvider(config?: IpfsStorageProviderConfig): IpfsStorageProvid
 
 // Transport
 createNostrTransportProvider(config?: NostrTransportProviderConfig): NostrTransportProvider
+// NostrTransportProviderConfig accepts optional `storage` for event timestamp persistence
 
 // Oracle
 createUnicityAggregatorProvider(config?: UnicityAggregatorProviderConfig): UnicityAggregatorProvider
@@ -880,6 +1427,37 @@ createTokenSplitExecutor(client, trustBase): TokenSplitExecutor
 // Validation
 createTokenValidator(options?: TokenValidatorOptions): TokenValidator
 ```
+
+---
+
+## NostrTransportProviderConfig
+
+```typescript
+interface NostrTransportProviderConfig {
+  relays?: string[];                // Nostr relay URLs
+  timeout?: number;                 // Connection timeout (ms)
+  autoReconnect?: boolean;          // Auto-reconnect on disconnect
+  reconnectDelay?: number;          // Reconnect delay (ms)
+  maxReconnectAttempts?: number;    // Max reconnect attempts
+  debug?: boolean;                  // Enable debug logging
+  createWebSocket: WebSocketFactory; // Platform-specific WebSocket factory
+  generateUUID?: UUIDGenerator;      // Optional UUID generator
+  storage?: TransportStorageAdapter; // Optional: persist event timestamps
+}
+```
+
+### TransportStorageAdapter
+
+Minimal key-value storage interface for transport persistence. When provided, the transport persists the last processed wallet event timestamp per pubkey. On reconnect, only events newer than the stored timestamp are fetched.
+
+```typescript
+interface TransportStorageAdapter {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+}
+```
+
+**Note:** `createBrowserProviders()` and `createNodeProviders()` automatically pass the storage provider to the transport. Custom setups should pass any `StorageProvider` — it satisfies `TransportStorageAdapter` since it has the required `get`/`set` methods.
 
 ---
 

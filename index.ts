@@ -180,6 +180,8 @@ export {
 export type {
   PaymentsModuleConfig,
   PaymentsModuleDependencies,
+  ReceiveOptions,
+  ReceiveResult,
   TransactionHistoryEntry,
 } from './modules/payments';
 
