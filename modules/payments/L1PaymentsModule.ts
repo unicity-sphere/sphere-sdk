@@ -392,6 +392,17 @@ export class L1PaymentsModule {
     const seenTxids = new Set<string>();
     const currentHeight = await getCurrentBlockHeight();
 
+    // Cache for fetched transactions (avoids re-fetching the same tx)
+    const txCache = new Map<string, TransactionDetail | null>();
+    const fetchTx = async (txid: string): Promise<TransactionDetail | null> => {
+      if (txCache.has(txid)) return txCache.get(txid)!;
+      const detail = (await l1GetTransaction(txid)) as TransactionDetail | null;
+      txCache.set(txid, detail);
+      return detail;
+    };
+
+    const addressSet = new Set(addresses.map((a) => a.toLowerCase()));
+
     for (const address of addresses) {
       const history = await getTransactionHistory(address);
 
@@ -399,37 +410,62 @@ export class L1PaymentsModule {
         if (seenTxids.has(item.tx_hash)) continue;
         seenTxids.add(item.tx_hash);
 
-        const tx = (await l1GetTransaction(item.tx_hash)) as TransactionDetail | null;
+        const tx = await fetchTx(item.tx_hash);
         if (!tx) continue;
 
-        // Determine if this is a send or receive
-        const isSend = tx.vin?.some((vin) =>
-          addresses.includes(vin.txid ?? '')
-        );
-
-        // Calculate amount from outputs going to our addresses
-        let amount = '0';
-        let txAddress = address;
-        if (tx.vout) {
-          for (const vout of tx.vout) {
-            const voutAddresses = vout.scriptPubKey?.addresses ?? [];
-            if (vout.scriptPubKey?.address) {
-              voutAddresses.push(vout.scriptPubKey.address);
-            }
-            const matchedAddr = voutAddresses.find((a) => addresses.includes(a));
-            if (matchedAddr) {
-              amount = Math.floor((vout.value ?? 0) * 100_000_000).toString();
-              txAddress = matchedAddr;
+        // Resolve input addresses by looking up previous transactions
+        let isSend = false;
+        for (const vin of (tx.vin ?? [])) {
+          if (!vin.txid) continue;
+          const prevTx = await fetchTx(vin.txid);
+          if (prevTx?.vout?.[vin.vout]) {
+            const prevOut = prevTx.vout[vin.vout];
+            const prevAddrs = [
+              ...(prevOut.scriptPubKey?.addresses ?? []),
+              ...(prevOut.scriptPubKey?.address ? [prevOut.scriptPubKey.address] : []),
+            ];
+            if (prevAddrs.some((a) => addressSet.has(a.toLowerCase()))) {
+              isSend = true;
               break;
             }
           }
         }
 
+        // Calculate amounts: sum outputs to us vs outputs to others
+        let amountToUs = 0;
+        let amountToOthers = 0;
+        let txAddress = address;
+        let externalAddress = '';
+        if (tx.vout) {
+          for (const vout of tx.vout) {
+            const voutAddresses = [
+              ...(vout.scriptPubKey?.addresses ?? []),
+              ...(vout.scriptPubKey?.address ? [vout.scriptPubKey.address] : []),
+            ];
+            const isOurs = voutAddresses.some((a) => addressSet.has(a.toLowerCase()));
+            const valueSats = Math.floor((vout.value ?? 0) * 100_000_000);
+            if (isOurs) {
+              amountToUs += valueSats;
+              if (!txAddress) txAddress = voutAddresses[0];
+            } else {
+              amountToOthers += valueSats;
+              if (!externalAddress && voutAddresses.length > 0) {
+                externalAddress = voutAddresses[0];
+              }
+            }
+          }
+        }
+
+        // For sends: amount is what went to external addresses; address is the recipient
+        // For receives: amount is what came to us; address is our address
+        const amount = isSend ? amountToOthers.toString() : amountToUs.toString();
+        const displayAddress = isSend ? (externalAddress || txAddress) : txAddress;
+
         transactions.push({
           txid: item.tx_hash,
           type: isSend ? 'send' : 'receive',
           amount,
-          address: txAddress,
+          address: displayAddress,
           confirmations: item.height > 0 ? currentHeight - item.height : 0,
           timestamp: tx.time ? tx.time * 1000 : Date.now(),
           blockHeight: item.height > 0 ? item.height : undefined,

@@ -847,14 +847,6 @@ const providers = createBrowserProviders({
   },
 });
 
-// Enable multiple sync backends
-const providers = createBrowserProviders({
-  network: 'mainnet',
-  tokenSync: {
-    ipfs: { enabled: true, useDht: true },
-    cloud: { enabled: true, provider: 'aws', bucket: 'my-backup' },  // future
-  },
-});
 ```
 
 ## Token Sync Backends
@@ -864,7 +856,7 @@ The SDK supports multiple token sync backends that can be enabled independently:
 | Backend | Status | Description |
 |---------|--------|-------------|
 | `ipfs` | ✅ Ready | Decentralized IPFS/IPNS with Helia browser DHT |
-| `mongodb` | ✅ Ready | MongoDB for centralized token storage |
+| `mongodb` | 🚧 Planned | MongoDB for centralized token storage |
 | `file` | 🚧 Planned | Local file system (Node.js) |
 | `cloud` | 🚧 Planned | Cloud storage (AWS S3, GCP, Azure) |
 
@@ -878,29 +870,6 @@ const providers = createBrowserProviders({
       additionalGateways: ['https://my-gateway.com'],
       useDht: true,  // Enable browser DHT (Helia)
     },
-  },
-});
-
-// Enable MongoDB sync
-const providers = createBrowserProviders({
-  network: 'mainnet',
-  tokenSync: {
-    mongodb: {
-      enabled: true,
-      uri: 'mongodb://localhost:27017',
-      database: 'sphere_wallet',
-      collection: 'tokens',
-    },
-  },
-});
-
-// Multiple backends for redundancy
-const providers = createBrowserProviders({
-  tokenSync: {
-    ipfs: { enabled: true },
-    mongodb: { enabled: true, uri: 'mongodb://localhost:27017', database: 'wallet' },
-    file: { enabled: true, directory: './tokens', format: 'txf' },
-    cloud: { enabled: true, provider: 'aws', bucket: 'wallet-backup' },
   },
 });
 ```
@@ -985,32 +954,32 @@ const { sphere } = await Sphere.init({
 
 ## Dynamic Provider Management (Runtime)
 
-After `Sphere.init()` is called, you can add/remove token storage providers dynamically through UI:
+After `Sphere.init()` is called, you can add/remove token storage providers dynamically:
 
 ```typescript
-import { createMongoDbStorageProvider } from './my-mongodb-provider';
+import { createIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
 
-// Add a new provider at runtime (e.g., user enables MongoDB sync in settings)
-const mongoProvider = createMongoDbStorageProvider({
-  uri: 'mongodb://localhost:27017',
-  database: 'sphere_wallet',
+// Add a new provider at runtime (e.g., user enables IPFS sync in settings)
+const ipfsProvider = createIpfsStorageProvider({
+  gateways: ['https://ipfs.io'],
+  useDht: true,
 });
 
-await sphere.addTokenStorageProvider(mongoProvider);
+await sphere.addTokenStorageProvider(ipfsProvider);
 
 // Provider is now active and will be used in sync operations
 
 // Check if provider exists
-if (sphere.hasTokenStorageProvider('mongodb-token-storage')) {
-  console.log('MongoDB sync is enabled');
+if (sphere.hasTokenStorageProvider('ipfs-token-storage')) {
+  console.log('IPFS sync is enabled');
 }
 
 // Get all active providers
 const providers = sphere.getTokenStorageProviders();
 console.log('Active providers:', Array.from(providers.keys()));
 
-// Remove a provider (e.g., user disables MongoDB sync)
-await sphere.removeTokenStorageProvider('mongodb-token-storage');
+// Remove a provider (e.g., user disables IPFS sync)
+await sphere.removeTokenStorageProvider('ipfs-token-storage');
 
 // Listen for per-provider sync events
 sphere.on('sync:provider', (event) => {
@@ -1024,25 +993,6 @@ sphere.on('sync:provider', (event) => {
 
 // Trigger sync (syncs with all active providers)
 await sphere.payments.sync();
-```
-
-### Multiple Providers Example
-
-```typescript
-// User configures multiple sync backends via UI
-const ipfsProvider = createIpfsStorageProvider({ gateways: ['https://ipfs.io'] });
-const mongoProvider = createMongoDbStorageProvider({ uri: 'mongodb://...' });
-const s3Provider = createS3StorageProvider({ bucket: 'wallet-backup' });
-
-// Add all providers
-await sphere.addTokenStorageProvider(ipfsProvider);
-await sphere.addTokenStorageProvider(mongoProvider);
-await sphere.addTokenStorageProvider(s3Provider);
-
-// Sync syncs with ALL active providers
-// If one fails, others continue (fault-tolerant)
-const result = await sphere.payments.sync();
-console.log(`Synced: +${result.added} -${result.removed}`);
 ```
 
 ## Dynamic Relay Management
