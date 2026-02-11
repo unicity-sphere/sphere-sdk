@@ -624,6 +624,8 @@ export interface PaymentsModuleDependencies {
   l1Addresses?: string[];
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
+  /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
+  disabledProviderIds?: ReadonlySet<string>;
 }
 
 // =============================================================================
@@ -3667,22 +3669,35 @@ export class PaymentsModule {
   }
 
   /**
-   * Get all active token storage providers
+   * Get all active (non-disabled) token storage providers
    */
   private getTokenStorageProviders(): Map<string, TokenStorageProvider<TxfStorageDataBase>> {
+    let providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
+
     // Prefer new multi-provider map
     if (this.deps!.tokenStorageProviders && this.deps!.tokenStorageProviders.size > 0) {
-      return this.deps!.tokenStorageProviders;
+      providers = this.deps!.tokenStorageProviders;
+    } else if (this.deps!.tokenStorage) {
+      // Fallback to deprecated single provider
+      providers = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+      providers.set(this.deps!.tokenStorage.id, this.deps!.tokenStorage);
+    } else {
+      return new Map();
     }
 
-    // Fallback to deprecated single provider
-    if (this.deps!.tokenStorage) {
-      const map = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
-      map.set(this.deps!.tokenStorage.id, this.deps!.tokenStorage);
-      return map;
+    // Filter out disabled providers
+    const disabled = this.deps!.disabledProviderIds;
+    if (disabled && disabled.size > 0) {
+      const filtered = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+      for (const [id, provider] of providers) {
+        if (!disabled.has(id)) {
+          filtered.set(id, provider);
+        }
+      }
+      return filtered;
     }
 
-    return new Map();
+    return providers;
   }
 
   /**

@@ -48,7 +48,7 @@
 // Core
 // =============================================================================
 
-export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists } from './core';
+export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth } from './core';
 export type {
   SphereCreateOptions,
   SphereLoadOptions,
@@ -58,6 +58,7 @@ export type {
   ScannedAddressResult,
   ScanAddressesOptions,
   ScanAddressesResult,
+  CheckNetworkHealthOptions,
 } from './core';
 
 // =============================================================================

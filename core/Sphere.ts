@@ -40,6 +40,9 @@
 import type {
   Identity,
   FullIdentity,
+  ProviderStatus,
+  ProviderStatusInfo,
+  SphereStatus,
   SphereEventType,
   SphereEventMap,
   SphereEventHandler,
@@ -83,6 +86,7 @@ import { scanAddressesImpl } from './scan';
 import type { ScanAddressesOptions, ScanAddressesResult } from './scan';
 import { vestingClassifier } from '../l1/vesting';
 import { generateAddressFromMasterKey } from '../l1/address';
+import { isWebSocketConnected } from '../l1/network';
 import {
   parseWalletText,
   parseAndDecryptWalletText,
@@ -324,6 +328,11 @@ export class Sphere {
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
+
+  // Provider management
+  private _disabledProviders: Set<string> = new Set();
+  private _providerEventCleanups: (() => void)[] = [];
+  private _lastProviderConnected: Map<string, boolean> = new Map();
 
   // ===========================================================================
   // Constructor (private)
@@ -2112,26 +2121,200 @@ export class Sphere {
   // Public Methods - Status
   // ===========================================================================
 
-  getStatus(): {
-    storage: { connected: boolean };
-    transport: { connected: boolean };
-    oracle: { connected: boolean };
-  } {
+  /**
+   * Get aggregated status of all providers, grouped by role.
+   *
+   * @example
+   * ```ts
+   * const status = sphere.getStatus();
+   * // status.transport[0].connected  // true/false
+   * // status.transport[0].metadata?.relays  // { total: 3, connected: 2 }
+   * // status.tokenStorage  // all registered token storage providers
+   * ```
+   */
+  getStatus(): SphereStatus {
+    const mkInfo = (
+      provider: { id: string; name: string; type: string; isConnected(): boolean; getStatus(): ProviderStatus },
+      role: ProviderStatusInfo['role'],
+      metadata?: Record<string, unknown>,
+    ): ProviderStatusInfo => ({
+      id: provider.id,
+      name: provider.name,
+      role,
+      status: provider.getStatus(),
+      connected: provider.isConnected(),
+      enabled: !this._disabledProviders.has(provider.id),
+      ...(metadata ? { metadata } : {}),
+    });
+
+    // Transport metadata: relay details
+    let transportMeta: Record<string, unknown> | undefined;
+    if (typeof (this._transport as any).getRelays === 'function') {
+      const total = ((this._transport as any).getRelays() as string[]).length;
+      const connected = typeof (this._transport as any).getConnectedRelays === 'function'
+        ? ((this._transport as any).getConnectedRelays() as string[]).length
+        : 0;
+      transportMeta = { relays: { total, connected } };
+    }
+
+    // L1 status
+    const l1Module = this._payments.l1;
+    const l1Providers: ProviderStatusInfo[] = [];
+    if (l1Module) {
+      const wsConnected = isWebSocketConnected();
+      l1Providers.push({
+        id: 'l1-alpha',
+        name: 'ALPHA L1',
+        role: 'l1',
+        status: wsConnected ? 'connected' : 'disconnected',
+        connected: wsConnected,
+        enabled: !this._disabledProviders.has('l1-alpha'),
+      });
+    }
+
+    // Price
+    const priceProviders: ProviderStatusInfo[] = [];
+    if (this._priceProvider) {
+      priceProviders.push({
+        id: (this._priceProvider as any).id ?? 'price',
+        name: this._priceProvider.platform ?? 'Price',
+        role: 'price',
+        status: 'connected',
+        connected: true,
+        enabled: !this._disabledProviders.has((this._priceProvider as any).id ?? 'price'),
+      });
+    }
+
     return {
-      storage: { connected: this._storage.isConnected() },
-      transport: { connected: this._transport.isConnected() },
-      oracle: { connected: this._oracle.isConnected() },
+      storage: [mkInfo(this._storage, 'storage')],
+      tokenStorage: Array.from(this._tokenStorageProviders.values()).map(
+        (p) => mkInfo(p, 'token-storage'),
+      ),
+      transport: [mkInfo(this._transport, 'transport', transportMeta)],
+      oracle: [mkInfo(this._oracle, 'oracle')],
+      l1: l1Providers,
+      price: priceProviders,
     };
   }
 
   async reconnect(): Promise<void> {
     await this._transport.disconnect();
     await this._transport.connect();
+    // connection:changed is emitted automatically by provider event bridge
+  }
+
+  // ===========================================================================
+  // Public Methods - Provider Management
+  // ===========================================================================
+
+  /**
+   * Disable a provider at runtime. The provider stays registered but is disconnected
+   * and skipped during operations (e.g., sync).
+   *
+   * Main storage provider cannot be disabled.
+   *
+   * @returns true if successfully disabled, false if provider not found
+   */
+  async disableProvider(providerId: string): Promise<boolean> {
+    if (providerId === this._storage.id) {
+      throw new Error('Cannot disable the main storage provider');
+    }
+
+    const provider = this.findProviderById(providerId);
+    if (!provider) return false;
+
+    this._disabledProviders.add(providerId);
+
+    try {
+      if ('shutdown' in provider && typeof provider.shutdown === 'function') {
+        await provider.shutdown();
+      } else if ('disconnect' in provider && typeof provider.disconnect === 'function') {
+        await provider.disconnect();
+      }
+    } catch {
+      // Provider disconnect may fail — still mark as disabled
+    }
 
     this.emitEvent('connection:changed', {
-      provider: 'transport',
-      connected: true,
+      provider: providerId,
+      connected: false,
+      status: 'disconnected',
+      enabled: false,
     });
+
+    return true;
+  }
+
+  /**
+   * Re-enable a previously disabled provider. Reconnects and resumes operations.
+   *
+   * @returns true if successfully enabled, false if provider not found
+   */
+  async enableProvider(providerId: string): Promise<boolean> {
+    const provider = this.findProviderById(providerId);
+    if (!provider) return false;
+
+    this._disabledProviders.delete(providerId);
+
+    try {
+      if ('initialize' in provider && typeof provider.initialize === 'function') {
+        await provider.initialize();
+      } else if ('connect' in provider && typeof provider.connect === 'function') {
+        await provider.connect();
+      }
+    } catch (err) {
+      this.emitEvent('connection:changed', {
+        provider: providerId,
+        connected: false,
+        status: 'error',
+        enabled: true,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+
+    this.emitEvent('connection:changed', {
+      provider: providerId,
+      connected: true,
+      status: 'connected',
+      enabled: true,
+    });
+
+    return true;
+  }
+
+  /**
+   * Check if a provider is currently enabled
+   */
+  isProviderEnabled(providerId: string): boolean {
+    return !this._disabledProviders.has(providerId);
+  }
+
+  /**
+   * Get the set of disabled provider IDs (for passing to modules)
+   */
+  getDisabledProviderIds(): ReadonlySet<string> {
+    return this._disabledProviders;
+  }
+
+  /**
+   * Find a provider by ID across all provider collections
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private findProviderById(providerId: string): Record<string, any> | null {
+    if (this._storage.id === providerId) return this._storage;
+    if (this._transport.id === providerId) return this._transport;
+    if (this._oracle.id === providerId) return this._oracle;
+    if (this._tokenStorageProviders.has(providerId)) {
+      return this._tokenStorageProviders.get(providerId)!;
+    }
+    if (this._priceProvider && ((this._priceProvider as any).id ?? 'price') === providerId) {
+      return this._priceProvider;
+    }
+    if (providerId === 'l1-alpha' && this._payments.l1) {
+      return this._payments.l1;
+    }
+    return null;
   }
 
   // ===========================================================================
@@ -2636,6 +2819,8 @@ export class Sphere {
   // ===========================================================================
 
   async destroy(): Promise<void> {
+    this.cleanupProviderEventSubscriptions();
+
     this._payments.destroy();
     this._communications.destroy();
 
@@ -2648,6 +2833,7 @@ export class Sphere {
     this._trackedAddresses.clear();
     this._addressIdToIndex.clear();
     this._addressNametags.clear();
+    this._disabledProviders.clear();
     this.eventHandlers.clear();
 
     if (Sphere.instance === this) {
@@ -2931,6 +3117,98 @@ export class Sphere {
     for (const provider of this._tokenStorageProviders.values()) {
       await provider.initialize();
     }
+
+    // Subscribe to provider events and bridge to connection:changed
+    this.subscribeToProviderEvents();
+  }
+
+  /**
+   * Subscribe to provider-level events and bridge them to Sphere connection:changed events.
+   * Uses deduplication to avoid emitting duplicate events.
+   */
+  private subscribeToProviderEvents(): void {
+    this.cleanupProviderEventSubscriptions();
+
+    // Bridge transport events
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const transportAny = this._transport as any;
+    if (typeof transportAny.onEvent === 'function') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const unsub = transportAny.onEvent((event: any) => {
+        const type = event?.type as string;
+        if (type === 'transport:connected') {
+          this.emitConnectionChanged(this._transport.id, true, 'connected');
+        } else if (type === 'transport:disconnected') {
+          this.emitConnectionChanged(this._transport.id, false, 'disconnected');
+        } else if (type === 'transport:reconnecting') {
+          this.emitConnectionChanged(this._transport.id, false, 'connecting');
+        } else if (type === 'transport:error') {
+          this.emitConnectionChanged(this._transport.id, false, 'error', event?.error);
+        }
+      });
+      if (unsub) this._providerEventCleanups.push(unsub);
+    }
+
+    // Bridge oracle events
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const oracleAny = this._oracle as any;
+    if (typeof oracleAny.onEvent === 'function') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const unsub = oracleAny.onEvent((event: any) => {
+        const type = event?.type as string;
+        if (type === 'oracle:connected') {
+          this.emitConnectionChanged(this._oracle.id, true, 'connected');
+        } else if (type === 'oracle:disconnected') {
+          this.emitConnectionChanged(this._oracle.id, false, 'disconnected');
+        } else if (type === 'oracle:error') {
+          this.emitConnectionChanged(this._oracle.id, false, 'error', event?.error);
+        }
+      });
+      if (unsub) this._providerEventCleanups.push(unsub);
+    }
+
+    // Bridge token storage events
+    for (const [providerId, provider] of this._tokenStorageProviders) {
+      if (typeof provider.onEvent === 'function') {
+        const unsub = provider.onEvent((event) => {
+          if (event.type === 'storage:error') {
+            this.emitConnectionChanged(providerId, provider.isConnected(), provider.getStatus(), event.error);
+          }
+        });
+        if (unsub) this._providerEventCleanups.push(unsub);
+      }
+    }
+  }
+
+  /**
+   * Emit connection:changed with deduplication — only emits if status actually changed.
+   */
+  private emitConnectionChanged(
+    providerId: string,
+    connected: boolean,
+    status: ProviderStatus,
+    error?: string,
+  ): void {
+    const lastConnected = this._lastProviderConnected.get(providerId);
+    if (lastConnected === connected) return; // No change — skip
+
+    this._lastProviderConnected.set(providerId, connected);
+
+    this.emitEvent('connection:changed', {
+      provider: providerId,
+      connected,
+      status,
+      enabled: !this._disabledProviders.has(providerId),
+      ...(error ? { error } : {}),
+    });
+  }
+
+  private cleanupProviderEventSubscriptions(): void {
+    for (const cleanup of this._providerEventCleanups) {
+      try { cleanup(); } catch { /* ignore */ }
+    }
+    this._providerEventCleanups = [];
+    this._lastProviderConnected.clear();
   }
 
   private async initializeModules(): Promise<void> {
@@ -2946,6 +3224,7 @@ export class Sphere {
       // Pass chain code for L1 HD derivation
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
+      disabledProviderIds: this._disabledProviders,
     });
 
     this._communications.initialize({

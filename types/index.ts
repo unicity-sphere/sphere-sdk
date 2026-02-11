@@ -397,7 +397,7 @@ export interface SphereEventMap {
   'sync:completed': { source: string; count: number };
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
-  'connection:changed': { provider: string; connected: boolean };
+  'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': { l1Address: string; directAddress?: string; chainPubkey: string; nametag?: string; addressIndex: number };
@@ -567,3 +567,76 @@ export * from './instant-split';
 
 // Re-export payment session types
 export * from './payment-session';
+
+// =============================================================================
+// Network Health Types
+// =============================================================================
+
+/**
+ * Result of a single service health check
+ */
+export interface ServiceHealthResult {
+  /** Whether the service is reachable */
+  healthy: boolean;
+  /** URL that was checked */
+  url: string;
+  /** Response time in ms (null if unreachable) */
+  responseTimeMs: number | null;
+  /** Error message if unhealthy */
+  error?: string;
+}
+
+/**
+ * Result of checking all network services (pre-init)
+ */
+export interface NetworkHealthResult {
+  /** Overall health: true if all checked services are reachable */
+  healthy: boolean;
+  /** Per-service results */
+  services: {
+    relay?: ServiceHealthResult;
+    oracle?: ServiceHealthResult;
+    l1?: ServiceHealthResult;
+  };
+  /** Total time to complete all checks (ms) */
+  totalTimeMs: number;
+}
+
+// =============================================================================
+// Provider Status Types
+// =============================================================================
+
+/** Role of a provider in the system */
+export type ProviderRole = 'storage' | 'token-storage' | 'transport' | 'oracle' | 'l1' | 'price';
+
+/**
+ * Rich status information for a single provider (used in getStatus())
+ */
+export interface ProviderStatusInfo {
+  /** Provider unique ID */
+  id: string;
+  /** Display name */
+  name: string;
+  /** Role in the system */
+  role: ProviderRole;
+  /** Detailed status */
+  status: ProviderStatus;
+  /** Shorthand for status === 'connected' */
+  connected: boolean;
+  /** Whether the provider is enabled (can be toggled at runtime) */
+  enabled: boolean;
+  /** Provider-specific metadata (e.g., relay count for transport) */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Aggregated status of all providers, grouped by role
+ */
+export interface SphereStatus {
+  storage: ProviderStatusInfo[];
+  tokenStorage: ProviderStatusInfo[];
+  transport: ProviderStatusInfo[];
+  oracle: ProviderStatusInfo[];
+  l1: ProviderStatusInfo[];
+  price: ProviderStatusInfo[];
+}
