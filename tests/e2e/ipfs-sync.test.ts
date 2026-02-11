@@ -207,4 +207,112 @@ describe('IPFS Sync E2E', () => {
     console.log('Recovery test PASSED: all tokens recovered from IPFS');
     await providerB.shutdown();
   }, 180000);
+
+  it('should not lose remote tokens when syncing stale local data', async () => {
+    // Tests that sync() merges remote-only tokens into stale local data.
+    //
+    // Scenario: remote IPFS has the "latest" inventory with 3 tokens.
+    // A stale device only has 2 tokens locally. After sync, all 3 must be present.
+    //
+    // NOTE: We use a single-provider publish flow (same instance publishes the
+    // "latest" inventory) because IPNS record updates from different provider
+    // instances do not reliably propagate on single-gateway setups.  The merge
+    // logic itself is what we're testing — the IPNS transport is just the vehicle.
+
+    const freshKey = randomHex(32);
+    const freshIdentity: FullIdentity = {
+      privateKey: freshKey,
+      chainPubkey: '03' + randomHex(32),
+      l1Address: 'alpha1version' + randomHex(10),
+      directAddress: 'DIRECT://version' + randomHex(10),
+    };
+
+    const providerConfig = {
+      gateways,
+      debug: true,
+      fetchTimeoutMs: 30000,
+      resolveTimeoutMs: 15000,
+      publishTimeoutMs: 60000,
+    };
+
+    // --- Step 1: Publish the "latest" inventory (3 tokens) to IPFS ---
+    const publisher = new IpfsStorageProvider(
+      providerConfig,
+      new InMemoryIpfsStatePersistence(),
+    );
+    publisher.setIdentity(freshIdentity);
+    expect(await publisher.initialize()).toBe(true);
+    console.log(`Version test: IPNS name = ${publisher.getIpnsName()}`);
+
+    const latestInventory: TxfStorageDataBase = {
+      _meta: {
+        version: 5,
+        address: freshIdentity.directAddress!,
+        formatVersion: '2.0',
+        updatedAt: Date.now(),
+      },
+      _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+      _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '2000' },
+      _tokenC: { id: 'tokenC', coinId: 'GEMA', amount: '500' },
+    };
+
+    const saveResult = await publisher.save(latestInventory);
+    expect(saveResult.success).toBe(true);
+    console.log(`Latest inventory saved: CID=${saveResult.cid}, seq=${publisher.getSequenceNumber()}`);
+    await publisher.shutdown();
+
+    // Wait for IPNS propagation (first-ever record for this name)
+    console.log('Waiting for IPNS propagation...');
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // --- Step 2: Stale device syncs with only 2 tokens (missing tokenC) ---
+    const staleProvider = new IpfsStorageProvider(
+      providerConfig,
+      new InMemoryIpfsStatePersistence(),
+    );
+    staleProvider.setIdentity(freshIdentity);
+    expect(await staleProvider.initialize()).toBe(true);
+
+    const staleLocalData: TxfStorageDataBase = {
+      _meta: {
+        version: 1,
+        address: freshIdentity.directAddress!,
+        formatVersion: '2.0',
+        updatedAt: Date.now() - 60000, // older timestamp
+      },
+      _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+      _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '2000' },
+    };
+
+    // Retry sync until remote is resolvable (IPNS propagation)
+    let syncResult;
+    for (let attempt = 1; attempt <= 12; attempt++) {
+      syncResult = await staleProvider.sync(staleLocalData);
+      if (syncResult.success && syncResult.merged) {
+        const m = syncResult.merged as any;
+        if (m._tokenC) {
+          console.log(`Sync resolved remote on attempt ${attempt}`);
+          break;
+        }
+      }
+      console.log(`Sync attempt ${attempt}: remote not yet visible — retrying in 5s...`);
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    expect(syncResult!.success).toBe(true);
+    const merged = syncResult!.merged as any;
+
+    // ALL 3 tokens must be present — tokenC from remote must NOT be lost
+    expect(merged._tokenA).toBeTruthy();
+    expect(merged._tokenB).toBeTruthy();
+    expect(merged._tokenC).toBeTruthy();
+    expect(merged._tokenC?.coinId).toBe('GEMA');
+    expect(merged._tokenC?.amount).toBe('500');
+
+    // tokenC was added from remote
+    expect(syncResult!.added).toBeGreaterThanOrEqual(1);
+
+    console.log('Version conflict test PASSED: remote tokens preserved after stale sync');
+    await staleProvider.shutdown();
+  }, 180000);
 });

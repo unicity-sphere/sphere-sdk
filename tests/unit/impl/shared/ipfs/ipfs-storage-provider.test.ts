@@ -395,4 +395,217 @@ describe('IpfsStorageProvider', () => {
       await freshProvider.shutdown();
     });
   });
+
+  describe('version conflict protection', () => {
+    // Helper to set up an initialized provider with mocked fetch
+    async function createInitializedProvider(): Promise<IpfsStorageProvider> {
+      const p = new IpfsStorageProvider(
+        { gateways: ['https://gw1.example.com'] },
+        new InMemoryIpfsStatePersistence(),
+      );
+      vi.stubGlobal('fetch', vi.fn());
+      vi.mocked(fetch).mockResolvedValue(
+        new Response(JSON.stringify({ Version: '0.20.0' }), { status: 200 }),
+      );
+      p.setIdentity(testIdentity);
+      await p.initialize();
+      return p;
+    }
+
+    it('sync with stale local should preserve remote-only tokens', async () => {
+      const p = await createInitializedProvider();
+
+      // Remote has v5 with 3 tokens (including tokenNew added by another device)
+      const remoteData = {
+        _meta: { version: 5, address: 'test', formatVersion: '2.0', updatedAt: 5000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+        _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '2000' },
+        _tokenNew: { id: 'tokenNew', coinId: 'GEMA', amount: '500' },
+      };
+
+      // Stale local has v2 with only 2 tokens (missing tokenNew)
+      const staleLocal = {
+        _meta: { version: 2, address: 'test', formatVersion: '2.0', updatedAt: 2000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+        _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '2000' },
+      } as any;
+
+      // Mock sync flow: load() resolves IPNS → fetches remote data
+      const { parseRoutingApiResponse } = await import(
+        '../../../../../impl/shared/ipfs/ipns-record-manager'
+      );
+      vi.mocked(parseRoutingApiResponse).mockResolvedValueOnce({
+        cid: 'bafyRemoteV5',
+        sequence: 5n,
+        recordData: new Uint8Array([1, 2, 3]),
+      });
+
+      vi.mocked(fetch)
+        // IPNS routing API returns 200
+        .mockResolvedValueOnce(new Response('routing-response', { status: 200 }))
+        // Content fetch returns remote data
+        .mockResolvedValueOnce(new Response(JSON.stringify(remoteData), { status: 200 }))
+        // Upload merged result
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyMerged' }), { status: 200 }))
+        // Publish IPNS
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const result = await p.sync(staleLocal);
+
+      expect(result.success).toBe(true);
+      expect(result.merged).toBeTruthy();
+
+      const merged = result.merged as any;
+      // All 3 tokens must be present — tokenNew from remote must NOT be lost
+      expect(merged._tokenA?.coinId).toBe('UCT');
+      expect(merged._tokenB?.coinId).toBe('UCT');
+      expect(merged._tokenNew?.coinId).toBe('GEMA');
+      expect(merged._tokenNew?.amount).toBe('500');
+
+      // tokenNew was added from remote
+      expect(result.added).toBe(1);
+      // No tokens were removed
+      expect(result.removed).toBe(0);
+
+      await p.shutdown();
+    });
+
+    it('sync with stale local should not lose tokens even when local has lower version', async () => {
+      const p = await createInitializedProvider();
+
+      // Remote v10: has 4 tokens (tokenD was added on another device)
+      const remoteData = {
+        _meta: { version: 10, address: 'test', formatVersion: '2.0', updatedAt: 10000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '100' },
+        _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '200' },
+        _tokenC: { id: 'tokenC', coinId: 'UCT', amount: '300' },
+        _tokenD: { id: 'tokenD', coinId: 'UCT', amount: '400' },
+      };
+
+      // Stale local v3: only has 2 of the original tokens
+      const staleLocal = {
+        _meta: { version: 3, address: 'test', formatVersion: '2.0', updatedAt: 3000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '100' },
+        _tokenB: { id: 'tokenB', coinId: 'UCT', amount: '200' },
+      } as any;
+
+      const { parseRoutingApiResponse } = await import(
+        '../../../../../impl/shared/ipfs/ipns-record-manager'
+      );
+      vi.mocked(parseRoutingApiResponse).mockResolvedValueOnce({
+        cid: 'bafyRemoteV10',
+        sequence: 10n,
+        recordData: new Uint8Array([1, 2, 3]),
+      });
+
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('routing-response', { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify(remoteData), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyMerged' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const result = await p.sync(staleLocal);
+
+      expect(result.success).toBe(true);
+      const merged = result.merged as any;
+
+      // ALL 4 tokens must survive — tokenC and tokenD from remote must be preserved
+      expect(merged._tokenA).toBeTruthy();
+      expect(merged._tokenB).toBeTruthy();
+      expect(merged._tokenC?.amount).toBe('300');
+      expect(merged._tokenD?.amount).toBe('400');
+      expect(result.added).toBe(2); // tokenC + tokenD added from remote
+
+      await p.shutdown();
+    });
+
+    it('sync with stale local should preserve remote tokens even when local has extra tokens', async () => {
+      const p = await createInitializedProvider();
+
+      // Remote v5: has tokenA + tokenRemoteOnly
+      const remoteData = {
+        _meta: { version: 5, address: 'test', formatVersion: '2.0', updatedAt: 5000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+        _tokenRemoteOnly: { id: 'tokenRemoteOnly', coinId: 'GEMA', amount: '999' },
+      };
+
+      // Stale local v2: has tokenA + tokenLocalOnly (different additions on each side)
+      const staleLocal = {
+        _meta: { version: 2, address: 'test', formatVersion: '2.0', updatedAt: 2000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+        _tokenLocalOnly: { id: 'tokenLocalOnly', coinId: 'UCT', amount: '777' },
+      } as any;
+
+      const { parseRoutingApiResponse } = await import(
+        '../../../../../impl/shared/ipfs/ipns-record-manager'
+      );
+      vi.mocked(parseRoutingApiResponse).mockResolvedValueOnce({
+        cid: 'bafyRemote',
+        sequence: 5n,
+        recordData: new Uint8Array([1, 2, 3]),
+      });
+
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('routing-response', { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify(remoteData), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyMerged' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const result = await p.sync(staleLocal);
+
+      expect(result.success).toBe(true);
+      const merged = result.merged as any;
+
+      // All 3 tokens from both sides must be present
+      expect(merged._tokenA?.amount).toBe('1000');
+      expect(merged._tokenLocalOnly?.amount).toBe('777');
+      expect(merged._tokenRemoteOnly?.amount).toBe('999');
+
+      // remote-only token was added
+      expect(result.added).toBe(1);
+
+      await p.shutdown();
+    });
+
+    it('merged version should always exceed both local and remote versions', async () => {
+      const p = await createInitializedProvider();
+
+      const remoteData = {
+        _meta: { version: 20, address: 'test', formatVersion: '2.0', updatedAt: 5000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+      };
+
+      const staleLocal = {
+        _meta: { version: 3, address: 'test', formatVersion: '2.0', updatedAt: 2000 },
+        _tokenA: { id: 'tokenA', coinId: 'UCT', amount: '1000' },
+      } as any;
+
+      const { parseRoutingApiResponse } = await import(
+        '../../../../../impl/shared/ipfs/ipns-record-manager'
+      );
+      vi.mocked(parseRoutingApiResponse).mockResolvedValueOnce({
+        cid: 'bafyRemote',
+        sequence: 20n,
+        recordData: new Uint8Array([1, 2, 3]),
+      });
+
+      vi.mocked(fetch)
+        .mockResolvedValueOnce(new Response('routing-response', { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify(remoteData), { status: 200 }))
+        .mockResolvedValueOnce(new Response(JSON.stringify({ Hash: 'bafyMerged' }), { status: 200 }))
+        .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+      const result = await p.sync(staleLocal);
+
+      expect(result.success).toBe(true);
+      // The merge sets version = max(local, remote) + 1
+      // Then save() increments dataVersion again, so the saved _meta.version
+      // must be > both 3 and 20
+      const mergedVersion = (result.merged as any)._meta?.version;
+      expect(mergedVersion).toBeGreaterThan(20);
+      expect(mergedVersion).toBeGreaterThan(3);
+
+      await p.shutdown();
+    });
+  });
 });
