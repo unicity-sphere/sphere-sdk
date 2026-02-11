@@ -6,6 +6,6 @@ export default defineConfig({
     environment: 'node',
     include: ['tests/e2e/**/*.test.ts'],
     exclude: ['tests/e2e/dm-manual.test.ts'],
-    testTimeout: 180000, // Recovery test needs up to 60s for IPNS propagation
+    testTimeout: 300000, // Wallet lifecycle test needs up to 5min (faucet + transfer + IPNS)
   },
 });
