@@ -4,139 +4,38 @@
  * Proves that active (spendable) tokens survive IPFS round-trips:
  * persist, recover, merge, and spend.
  *
+ * Multi-coin: tests use SOL + ETH simultaneously to verify that wallets
+ * with multiple coin types (different decimals) survive IPFS round-trips,
+ * recovery, spend, and merge flows.
+ *
  * Run with: npm run test:e2e
  */
 
 import { describe, it, expect, afterAll } from 'vitest';
 import { Sphere } from '../../core/Sphere';
-import { createNodeProviders, type NodeProviders } from '../../impl/nodejs';
-import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { createNodeProviders } from '../../impl/nodejs';
+import { rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
-const NETWORK = 'testnet' as const;
-const TRUSTBASE_URL = 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
-const DEFAULT_API_KEY = 'sk_06365a9c44654841a366068bcfc68986';
-
-const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
-const IPNS_PROPAGATION_WAIT_MS = 5_000;
-const IPNS_RESOLVE_TIMEOUT_MS = 60_000;
-const POLL_INTERVAL_MS = 1_000;
-
-// =============================================================================
-// Types
-// =============================================================================
-
-interface BalanceSnapshot {
-  confirmed: bigint;
-  unconfirmed: bigint;
-  total: bigint;
-  tokens: number;
-}
-
-// =============================================================================
-// Helpers
-// =============================================================================
-
-const rand = () => Math.random().toString(36).slice(2, 8);
-
-function makeTempDirs(label: string) {
-  const base = join(tmpdir(), `sphere-e2e-ipfs-persist-${label}-${Date.now()}-${rand()}`);
-  const dataDir = join(base, 'data');
-  const tokensDir = join(base, 'tokens');
-  mkdirSync(dataDir, { recursive: true });
-  mkdirSync(tokensDir, { recursive: true });
-  return { base, dataDir, tokensDir };
-}
-
-async function ensureTrustbase(dataDir: string): Promise<void> {
-  const trustbasePath = join(dataDir, 'trustbase.json');
-  if (existsSync(trustbasePath)) return;
-
-  const res = await fetch(TRUSTBASE_URL);
-  if (!res.ok) {
-    throw new Error(`Failed to download trustbase: ${res.status}`);
-  }
-  const data = await res.text();
-  writeFileSync(trustbasePath, data);
-}
-
-function makeProviders(dirs: { dataDir: string; tokensDir: string }): NodeProviders {
-  return createNodeProviders({
-    network: NETWORK,
-    dataDir: dirs.dataDir,
-    tokensDir: dirs.tokensDir,
-    oracle: {
-      trustBasePath: join(dirs.dataDir, 'trustbase.json'),
-      apiKey: DEFAULT_API_KEY,
-    },
-    tokenSync: {
-      ipfs: { enabled: true },
-    },
-  });
-}
-
-async function requestFaucet(
-  nametag: string,
-  coin: string,
-  amount: number,
-): Promise<{ success: boolean; message?: string }> {
-  try {
-    const response = await fetch(FAUCET_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ unicityId: nametag, coin, amount }),
-    });
-    const result = (await response.json()) as { success: boolean; message?: string; error?: string };
-    return { success: result.success, message: result.message || result.error };
-  } catch (error) {
-    return { success: false, message: error instanceof Error ? error.message : 'Request failed' };
-  }
-}
-
-function getBalance(sphere: Sphere, symbol: string): BalanceSnapshot {
-  const balances = sphere.payments.getBalance();
-  const bal = balances.find((b) => b.symbol === symbol);
-  if (!bal) return { confirmed: 0n, unconfirmed: 0n, total: 0n, tokens: 0 };
-  return {
-    confirmed: BigInt(bal.confirmedAmount),
-    unconfirmed: BigInt(bal.unconfirmedAmount),
-    total: BigInt(bal.totalAmount),
-    tokens: bal.tokenCount,
-  };
-}
-
-async function waitForTokens(
-  sphere: Sphere,
-  symbol: string,
-  minTotal: bigint,
-  timeoutMs: number,
-): Promise<BalanceSnapshot> {
-  const start = performance.now();
-  while (performance.now() - start < timeoutMs) {
-    // Explicit fetch from Nostr (one-shot query for pending events)
-    try {
-      await sphere.payments.receive();
-    } catch {
-      // receive() may throw if transport doesn't support fetchPendingEvents
-    }
-    const bal = getBalance(sphere, symbol);
-    if (bal.total >= minTotal) return bal;
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-  }
-  const final = getBalance(sphere, symbol);
-  if (final.total < minTotal) {
-    throw new Error(
-      `Timed out waiting for ${symbol} tokens: got ${final.total}, needed >= ${minTotal}`,
-    );
-  }
-  return final;
-}
+import {
+  TEST_COINS,
+  FAUCET_TOPUP_TIMEOUT_MS,
+  IPNS_PROPAGATION_WAIT_MS,
+  IPNS_RESOLVE_TIMEOUT_MS,
+  DEFAULT_API_KEY,
+  NETWORK,
+  rand,
+  makeTempDirs,
+  ensureTrustbase,
+  makeProviders,
+  requestFaucet,
+  requestMultiCoinFaucet,
+  getBalance,
+  getTokenIds,
+  getTokenAmounts,
+  waitForAllCoins,
+  waitForTokens,
+  type BalanceSnapshot,
+} from './helpers';
 
 // =============================================================================
 // Test Suite
@@ -145,13 +44,12 @@ async function waitForTokens(
 describe('IPFS Active Token Persistence E2E', () => {
   // Shared state across ordered tests
   let dirsA: ReturnType<typeof makeTempDirs>;
-  let providersA: NodeProviders;
   let sphereA: Sphere;
   let savedMnemonicA: string;
   let savedNametagA: string;
-  let originalBalance: BalanceSnapshot;
-  let originalTokenIds: Set<string>;
-  let originalTokenAmounts: Map<string, string>;
+  let originalBalances: Map<string, BalanceSnapshot>;
+  let originalTokenIds: Map<string, Set<string>>;
+  let originalTokenAmounts: Map<string, Map<string, string>>;
 
   const cleanupDirs: string[] = [];
   const spheres: Sphere[] = [];
@@ -176,16 +74,16 @@ describe('IPFS Active Token Persistence E2E', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Test 1: Create wallet, top up, sync to IPFS
+  // Test 1: Create wallet, top up with SOL+ETH, sync to IPFS
   // ---------------------------------------------------------------------------
 
-  it('creates wallet, receives tokens, and syncs to IPFS', async () => {
+  it('creates wallet, receives multi-coin tokens, and syncs to IPFS', async () => {
     savedNametagA = `e2e-ipfs-${rand()}`;
-    dirsA = makeTempDirs('wallet-a');
+    dirsA = makeTempDirs('persist-a');
     cleanupDirs.push(dirsA.base);
     await ensureTrustbase(dirsA.dataDir);
 
-    providersA = makeProviders(dirsA);
+    const providersA = makeProviders(dirsA);
 
     console.log(`\n[Test 1] Creating wallet A with nametag @${savedNametagA}...`);
     const { sphere, created, generatedMnemonic } = await Sphere.init({
@@ -209,41 +107,47 @@ describe('IPFS Active Token Persistence E2E', () => {
       throw new Error('IPFS token storage provider not created — check tokenSync.ipfs.enabled');
     }
 
-    // Request faucet
-    console.log(`  Requesting faucet: 1000 SOL to @${savedNametagA}...`);
-    const faucetResult = await requestFaucet(savedNametagA, 'solana', 1000);
-    console.log(`  Faucet response: ${faucetResult.success ? 'OK' : faucetResult.message}`);
+    // Request faucet for all coins (SOL + ETH)
+    console.log(`  Requesting multi-coin faucet for @${savedNametagA}...`);
+    await requestMultiCoinFaucet(savedNametagA);
 
-    // Wait for tokens
-    console.log('  Waiting for SOL tokens...');
-    const bal = await waitForTokens(sphereA, 'SOL', 1n, FAUCET_TOPUP_TIMEOUT_MS);
-    console.log(`  Received: total=${bal.total}, tokens=${bal.tokens}`);
+    // Wait for ALL coins to arrive
+    console.log('  Waiting for all coins (SOL + ETH)...');
+    originalBalances = await waitForAllCoins(sphereA, FAUCET_TOPUP_TIMEOUT_MS);
 
-    // Record original state
-    originalBalance = bal;
-    const tokens = sphereA.payments.getTokens({ coinId: undefined });
-    const solTokens = tokens.filter((t) => t.symbol === 'SOL');
-    originalTokenIds = new Set(solTokens.map((t) => t.id));
-    originalTokenAmounts = new Map(solTokens.map((t) => [t.id, t.amount]));
+    // Record original state per coin
+    originalTokenIds = new Map<string, Set<string>>();
+    originalTokenAmounts = new Map<string, Map<string, string>>();
+    for (const coin of TEST_COINS) {
+      const bal = originalBalances.get(coin.symbol)!;
+      console.log(`  ${coin.symbol}: total=${bal.total}, tokens=${bal.tokens}`);
+      expect(bal.total).toBeGreaterThan(0n);
 
-    expect(originalTokenIds.size).toBeGreaterThan(0);
-    console.log(`  Recorded ${originalTokenIds.size} SOL token(s)`);
+      const ids = getTokenIds(sphereA, coin.symbol);
+      const amounts = getTokenAmounts(sphereA, coin.symbol);
+      originalTokenIds.set(coin.symbol, ids);
+      originalTokenAmounts.set(coin.symbol, amounts);
+      expect(ids.size).toBeGreaterThan(0);
+      console.log(`  Recorded ${ids.size} ${coin.symbol} token(s)`);
+    }
 
     // Sync to IPFS
     console.log('  Syncing to IPFS...');
     const syncResult = await sphereA.payments.sync();
     console.log(`  Sync result: added=${syncResult.added}, removed=${syncResult.removed}`);
 
-    console.log('[Test 1] PASSED: wallet created, tokens received, synced to IPFS');
+    console.log('[Test 1] PASSED: multi-coin wallet created, tokens received, synced to IPFS');
   }, 180_000);
 
   // ---------------------------------------------------------------------------
-  // Test 2: Recover tokens from IPFS after local wipe
+  // Test 2: Recover multi-coin tokens from IPFS after local wipe
   // ---------------------------------------------------------------------------
 
-  it('recovers tokens from IPFS after local storage wipe', async () => {
+  it('recovers multi-coin tokens from IPFS after local storage wipe', async () => {
     expect(savedMnemonicA).toBeTruthy();
-    expect(originalTokenIds.size).toBeGreaterThan(0);
+    for (const coin of TEST_COINS) {
+      expect(originalTokenIds.get(coin.symbol)!.size).toBeGreaterThan(0);
+    }
 
     // Destroy and wipe
     console.log('\n[Test 2] Destroying wallet A and wiping local storage...');
@@ -257,12 +161,12 @@ describe('IPFS Active Token Persistence E2E', () => {
     await new Promise((r) => setTimeout(r, IPNS_PROPAGATION_WAIT_MS));
 
     // Fresh dirs + providers
-    dirsA = makeTempDirs('wallet-a-recovered');
+    dirsA = makeTempDirs('persist-a-recovered');
     cleanupDirs.push(dirsA.base);
     await ensureTrustbase(dirsA.dataDir);
-    providersA = makeProviders(dirsA);
+    const providersA = makeProviders(dirsA);
 
-    // Import from mnemonic (with nametag to re-mint nametag token for PROXY finalization)
+    // Import from mnemonic
     console.log('  Importing wallet A from mnemonic...');
     sphereA = await Sphere.import({
       ...providersA,
@@ -301,35 +205,39 @@ describe('IPFS Active Token Persistence E2E', () => {
 
     expect(syncAdded).toBeGreaterThan(0);
 
-    // Verify balance
+    // Verify per-coin balance and tokens
     await sphereA.payments.load();
-    const recoveredBalance = getBalance(sphereA, 'SOL');
-    console.log(`  Recovered balance: total=${recoveredBalance.total}, tokens=${recoveredBalance.tokens}`);
+    for (const coin of TEST_COINS) {
+      const recoveredBal = getBalance(sphereA, coin.symbol);
+      const origBal = originalBalances.get(coin.symbol)!;
+      console.log(`  Recovered ${coin.symbol}: total=${recoveredBal.total}, tokens=${recoveredBal.tokens}`);
 
-    expect(recoveredBalance.total).toBe(originalBalance.total);
-    expect(recoveredBalance.tokens).toBe(originalBalance.tokens);
+      expect(recoveredBal.total).toBe(origBal.total);
+      expect(recoveredBal.tokens).toBe(origBal.tokens);
 
-    // Verify individual tokens
-    const recoveredTokens = sphereA.payments.getTokens().filter((t) => t.symbol === 'SOL');
-    const recoveredIds = new Set(recoveredTokens.map((t) => t.id));
-    const recoveredAmounts = new Map(recoveredTokens.map((t) => [t.id, t.amount]));
+      // Verify individual tokens
+      const recoveredIds = getTokenIds(sphereA, coin.symbol);
+      const recoveredAmounts = getTokenAmounts(sphereA, coin.symbol);
+      const origIds = originalTokenIds.get(coin.symbol)!;
+      const origAmounts = originalTokenAmounts.get(coin.symbol)!;
 
-    for (const id of originalTokenIds) {
-      expect(recoveredIds.has(id)).toBe(true);
-      expect(recoveredAmounts.get(id)).toBe(originalTokenAmounts.get(id));
+      for (const id of origIds) {
+        expect(recoveredIds.has(id)).toBe(true);
+        expect(recoveredAmounts.get(id)).toBe(origAmounts.get(id));
+      }
     }
 
-    console.log('[Test 2] PASSED: all tokens recovered from IPFS with correct amounts');
+    console.log('[Test 2] PASSED: all multi-coin tokens recovered from IPFS with correct amounts');
   }, 180_000);
 
   // ---------------------------------------------------------------------------
-  // Test 3: Spend recovered tokens (proves they are truly usable)
+  // Test 3: Spend recovered tokens (proves they are truly usable) — per coin
   // ---------------------------------------------------------------------------
 
-  it('spends recovered tokens to another wallet', async () => {
+  it('spends recovered multi-coin tokens to another wallet', async () => {
     // Create wallet B as a send target
     const nametagB = `e2e-ipfs-b-${rand()}`;
-    const dirsB = makeTempDirs('wallet-b');
+    const dirsB = makeTempDirs('persist-b');
     cleanupDirs.push(dirsB.base);
     await ensureTrustbase(dirsB.dataDir);
 
@@ -358,45 +266,46 @@ describe('IPFS Active Token Persistence E2E', () => {
     await new Promise((r) => setTimeout(r, 3000));
     await sphereA.payments.load();
 
-    const senderBefore = getBalance(sphereA, 'SOL');
-    console.log(`  Sender A balance before: total=${senderBefore.total}, tokens=${senderBefore.tokens}`);
-    expect(senderBefore.total).toBeGreaterThan(0n);
+    // Send one token per coin to wallet B
+    for (const coin of TEST_COINS) {
+      const senderBefore = getBalance(sphereA, coin.symbol);
+      console.log(`  Sender A ${coin.symbol} before: total=${senderBefore.total}, tokens=${senderBefore.tokens}`);
+      expect(senderBefore.total).toBeGreaterThan(0n);
 
-    // Pick the first token's amount to send (avoids split complexity)
-    const solTokens = sphereA.payments.getTokens().filter((t) => t.symbol === 'SOL');
-    expect(solTokens.length).toBeGreaterThan(0);
-    const firstToken = solTokens[0];
-    const sendAmount = firstToken.amount;
-    const coinId = firstToken.coinId;
-    console.log(`  Sending ${sendAmount} (coinId=${coinId}) to @${nametagB}...`);
+      const tokens = sphereA.payments.getTokens().filter((t) => t.symbol === coin.symbol);
+      expect(tokens.length).toBeGreaterThan(0);
+      const firstToken = tokens[0];
+      const sendAmount = firstToken.amount;
+      const coinId = firstToken.coinId;
+      console.log(`  Sending ${sendAmount} ${coin.symbol} (coinId=${coinId}) to @${nametagB}...`);
 
-    // Send — proves the IPFS-recovered token is genuinely spendable
-    const sendResult = await sphereA.payments.send({
-      recipient: `@${nametagB}`,
-      amount: sendAmount,
-      coinId,
-    });
-    console.log(`  Send status: ${sendResult.status}`);
-    expect(sendResult.status).toBe('completed');
+      const sendResult = await sphereA.payments.send({
+        recipient: `@${nametagB}`,
+        amount: sendAmount,
+        coinId,
+      });
+      console.log(`  Send ${coin.symbol} status: ${sendResult.status}`);
+      expect(sendResult.status).toBe('completed');
 
-    // Verify A's balance decreased (token was spent)
-    await sphereA.payments.load();
-    const senderAfter = getBalance(sphereA, 'SOL');
-    console.log(`  Sender A balance after: total=${senderAfter.total}, tokens=${senderAfter.tokens}`);
-    expect(senderAfter.total).toBeLessThan(senderBefore.total);
+      // Verify A's balance decreased
+      await sphereA.payments.load();
+      const senderAfter = getBalance(sphereA, coin.symbol);
+      console.log(`  Sender A ${coin.symbol} after: total=${senderAfter.total}, tokens=${senderAfter.tokens}`);
+      expect(senderAfter.total).toBeLessThan(senderBefore.total);
+    }
 
-    console.log('[Test 3] PASSED: IPFS-recovered tokens are spendable (send completed)');
+    console.log('[Test 3] PASSED: IPFS-recovered multi-coin tokens are spendable');
   }, 120_000);
 
   // ---------------------------------------------------------------------------
-  // Test 4: Merge local + IPFS tokens
+  // Test 4: Merge local + IPFS tokens — multi-coin
   // ---------------------------------------------------------------------------
 
-  it('merges locally-received tokens with IPFS-recovered tokens', async () => {
+  it('merges locally-received multi-coin tokens with IPFS-recovered tokens', async () => {
     const nametagC = `e2e-ipfs-c-${rand()}`;
 
-    // --- Step 1: Create wallet C, top up batch 1, sync to IPFS ---
-    const dirsC1 = makeTempDirs('wallet-c-batch1');
+    // --- Step 1: Create wallet C, top up batch 1 (all coins), sync to IPFS ---
+    const dirsC1 = makeTempDirs('persist-c-batch1');
     cleanupDirs.push(dirsC1.base);
     await ensureTrustbase(dirsC1.dataDir);
     const providersC1 = makeProviders(dirsC1);
@@ -418,12 +327,15 @@ describe('IPFS Active Token Persistence E2E', () => {
       throw new Error('IPFS token storage provider not created');
     }
 
-    // Request batch 1
-    console.log('  Requesting batch 1: 1000 SOL...');
-    await requestFaucet(nametagC, 'solana', 1000);
-    const batch1Bal = await waitForTokens(sphereC1, 'SOL', 1n, FAUCET_TOPUP_TIMEOUT_MS);
-    const batch1Total = batch1Bal.total;
-    console.log(`  Batch 1 received: total=${batch1Total}, tokens=${batch1Bal.tokens}`);
+    // Request batch 1 (all coins)
+    console.log('  Requesting batch 1 (all coins)...');
+    await requestMultiCoinFaucet(nametagC);
+
+    const batch1Balances = await waitForAllCoins(sphereC1, FAUCET_TOPUP_TIMEOUT_MS);
+    for (const coin of TEST_COINS) {
+      const bal = batch1Balances.get(coin.symbol)!;
+      console.log(`  Batch 1 ${coin.symbol}: total=${bal.total}, tokens=${bal.tokens}`);
+    }
 
     // Sync batch 1 to IPFS
     console.log('  Syncing batch 1 to IPFS...');
@@ -439,7 +351,7 @@ describe('IPFS Active Token Persistence E2E', () => {
     await new Promise((r) => setTimeout(r, IPNS_PROPAGATION_WAIT_MS));
 
     // --- Step 3: Import fresh (no IPFS yet), request batch 2 ---
-    const dirsC2 = makeTempDirs('wallet-c-batch2');
+    const dirsC2 = makeTempDirs('persist-c-batch2');
     cleanupDirs.push(dirsC2.base);
     await ensureTrustbase(dirsC2.dataDir);
     const providersC2 = makeProviders(dirsC2);
@@ -452,16 +364,15 @@ describe('IPFS Active Token Persistence E2E', () => {
     });
     spheres.push(sphereC2);
 
-    // Request batch 2 (Nostr replay may also re-deliver batch 1)
-    console.log('  Requesting batch 2: 1000 SOL...');
-    await requestFaucet(nametagC, 'solana', 1000);
+    // Request batch 2 (all coins)
+    console.log('  Requesting batch 2 (all coins)...');
+    await requestMultiCoinFaucet(nametagC);
 
-    // Wait for batch 2 to arrive (we need at least some tokens)
-    // NOTE: Nostr replay may also re-deliver batch 1 tokens, so pre-sync
-    // balance could be 1 token (batch 2 only) or 2 tokens (batch 1 via Nostr + batch 2)
+    // Wait for batch 2 to arrive (at least one coin non-zero)
     console.log('  Waiting for batch 2 tokens...');
-    const preSyncBal = await waitForTokens(sphereC2, 'SOL', 1n, FAUCET_TOPUP_TIMEOUT_MS);
-    console.log(`  Pre-sync balance: total=${preSyncBal.total}, tokens=${preSyncBal.tokens}`);
+    // Use waitForTokens on the first coin as a minimum — Nostr replay may also deliver batch 1
+    const preSyncBal = await waitForTokens(sphereC2, TEST_COINS[0].symbol, 1n, FAUCET_TOPUP_TIMEOUT_MS);
+    console.log(`  Pre-sync ${TEST_COINS[0].symbol}: total=${preSyncBal.total}, tokens=${preSyncBal.tokens}`);
 
     // --- Step 4: Add IPFS provider and sync to merge ---
     if (providersC2.ipfsTokenStorage) {
@@ -489,19 +400,17 @@ describe('IPFS Active Token Persistence E2E', () => {
     }
 
     await sphereC2.payments.load();
-    const mergedBalance = getBalance(sphereC2, 'SOL');
-    console.log(`  Merged balance: total=${mergedBalance.total}, tokens=${mergedBalance.tokens}`);
 
-    // After merge, BOTH batches must be present:
-    // - No tokens lost during merge (merged >= pre-sync)
-    // - At least 2 tokens (one from each batch)
-    // - Total at least 2x batch1 (each batch is ~1000 SOL)
-    // NOTE: We don't use batch2Total in the assertion because Nostr replay
-    // may have already delivered batch 1 locally, inflating pre-sync balance
-    expect(mergedBalance.total).toBeGreaterThanOrEqual(preSyncBal.total);
-    expect(mergedBalance.total).toBeGreaterThanOrEqual(batch1Total * 2n);
-    expect(mergedBalance.tokens).toBeGreaterThanOrEqual(2);
+    // Verify per-coin: merged balance >= 2x batch1 (batch1 from IPFS + batch2 from Nostr)
+    for (const coin of TEST_COINS) {
+      const mergedBal = getBalance(sphereC2, coin.symbol);
+      const batch1Bal = batch1Balances.get(coin.symbol)!;
+      console.log(`  Merged ${coin.symbol}: total=${mergedBal.total}, tokens=${mergedBal.tokens}`);
 
-    console.log('[Test 4] PASSED: local + IPFS tokens merged correctly');
+      expect(mergedBal.total).toBeGreaterThanOrEqual(batch1Bal.total * 2n);
+      expect(mergedBal.tokens).toBeGreaterThanOrEqual(2);
+    }
+
+    console.log('[Test 4] PASSED: local + IPFS multi-coin tokens merged correctly');
   }, 300_000);
 });
