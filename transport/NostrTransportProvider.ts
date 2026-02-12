@@ -222,6 +222,7 @@ export class NostrTransportProvider implements TransportProvider {
   // Event handlers
   private processedEventIds = new Set<string>();
   private messageHandlers: Set<MessageHandler> = new Set();
+  private composingHandlers: Set<(indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }) => void> = new Set();
   private pendingMessages: IncomingMessage[] = [];  // buffer for messages arriving before handlers register
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
@@ -574,6 +575,11 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     return () => this.messageHandlers.delete(handler);
+  }
+
+  onComposing(handler: (indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }) => void): () => void {
+    this.composingHandlers.add(handler);
+    return () => this.composingHandlers.delete(handler);
   }
 
   async sendTokenTransfer(
@@ -1327,14 +1333,29 @@ export class NostrTransportProvider implements TransportProvider {
         return;
       }
 
-      // Sphere app wraps DM content as JSON: {senderNametag, text}
+      // Sphere app wraps DM content as JSON: {senderNametag, text} or {type: "composing", ...}
       let content = pm.content;
       let senderNametag: string | undefined;
       try {
         const parsed = JSON.parse(content);
-        if (typeof parsed === 'object' && parsed.text !== undefined) {
-          content = parsed.text;
-          senderNametag = parsed.senderNametag || undefined;
+        if (typeof parsed === 'object') {
+          if (parsed.type === 'composing') {
+            // Composing indicator — route to composing handlers, not message handlers
+            const indicator = {
+              senderPubkey: pm.senderPubkey,
+              senderNametag: parsed.senderNametag || undefined,
+              expiresIn: parsed.expiresIn ?? 30000,
+            };
+            this.log('Composing indicator from:', indicator.senderNametag || pm.senderPubkey?.slice(0, 16));
+            for (const handler of this.composingHandlers) {
+              try { handler(indicator); } catch (error) { this.log('Composing handler error:', error); }
+            }
+            return;
+          }
+          if (parsed.text !== undefined) {
+            content = parsed.text;
+            senderNametag = parsed.senderNametag || undefined;
+          }
         }
       } catch {
         // Plain text — use as-is
