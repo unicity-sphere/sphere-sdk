@@ -3342,7 +3342,7 @@ export class Sphere {
     for (const [providerId, provider] of this._tokenStorageProviders) {
       if (typeof provider.onEvent === 'function') {
         const unsub = provider.onEvent((event) => {
-          if (event.type === 'storage:error') {
+          if (event.type === 'storage:error' || event.type === 'sync:error') {
             this.emitConnectionChanged(providerId, provider.isConnected(), provider.getStatus(), event.error);
           }
         });
