@@ -355,6 +355,13 @@ export const TIMEOUTS = {
   SYNC_INTERVAL: 60000,
 } as const;
 
+// =============================================================================
+// Market API Defaults
+// =============================================================================
+
+/** Default Market API URL (intent bulletin board) */
+export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network' as const;
+
 /** Validation limits */
 export const LIMITS = {
   /** Min nametag length */

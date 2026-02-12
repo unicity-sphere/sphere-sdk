@@ -3,17 +3,19 @@
  * Utility functions for resolving provider configurations with extend/override pattern
  */
 
-import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, type NetworkType, type NetworkConfig } from '../../constants';
+import { NETWORKS, DEFAULT_AGGREGATOR_API_KEY, DEFAULT_MARKET_API_URL, type NetworkType, type NetworkConfig } from '../../constants';
 import type {
   BaseTransportConfig,
   BaseOracleConfig,
   BasePriceConfig,
+  BaseMarketConfig,
   L1Config,
   ResolvedTransportConfig,
   ResolvedOracleConfig,
 } from './config';
 import type { PriceProviderConfig } from '../../price';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
+import type { MarketModuleConfig } from '../../modules/market';
 
 // =============================================================================
 // Network Resolution
@@ -261,5 +263,29 @@ export function resolveGroupChatConfig(
   const netConfig = getNetworkConfig(network);
   return {
     relays: config.relays ?? [...netConfig.groupRelays],
+  };
+}
+
+// =============================================================================
+// Market Resolution
+// =============================================================================
+
+/**
+ * Resolve market module configuration.
+ * @param config - User-provided market config (true, object, or undefined)
+ * @returns Resolved MarketModuleConfig or undefined if disabled
+ */
+export function resolveMarketConfig(
+  config?: BaseMarketConfig | boolean,
+): MarketModuleConfig | undefined {
+  if (!config) return undefined;
+
+  if (config === true) {
+    return { apiUrl: DEFAULT_MARKET_API_URL };
+  }
+
+  return {
+    apiUrl: config.apiUrl ?? DEFAULT_MARKET_API_URL,
+    timeout: config.timeout,
   };
 }

@@ -210,6 +210,26 @@ export type {
   CreateGroupOptions,
 } from './modules/groupchat';
 
+export {
+  MarketModule,
+  createMarketModule,
+} from './modules/market';
+export type {
+  MarketModuleConfig,
+  MarketModuleDependencies,
+  PostIntentRequest,
+  PostIntentResult,
+  MarketIntent,
+  SearchIntentResult,
+  SearchFilters,
+  SearchOptions,
+  SearchResult,
+  MarketAgentProfile,
+  RegisterOptions,
+  IntentType,
+  IntentStatus,
+} from './modules/market';
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -229,6 +249,8 @@ export {
   DEV_AGGREGATOR_URL,
   TEST_AGGREGATOR_URL,
   DEFAULT_AGGREGATOR_TIMEOUT,
+  // Market
+  DEFAULT_MARKET_API_URL,
   // IPFS
   DEFAULT_IPFS_GATEWAYS,
   DEFAULT_IPFS_BOOTSTRAP_PEERS,
