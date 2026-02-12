@@ -55,9 +55,9 @@ export function mergeTxfData<T extends TxfStorageDataBase>(
   const mergedTokens: Record<string, unknown> = {};
 
   for (const key of allTokenKeys) {
-    const tokenId = key.slice(1); // Remove leading underscore
-    const localToken = local[key as `_${string}`];
-    const remoteToken = remote[key as `_${string}`];
+    const tokenId = key.startsWith('_') ? key.slice(1) : key;
+    const localToken = (local as Record<string, unknown>)[key];
+    const remoteToken = (remote as Record<string, unknown>)[key];
 
     // Check tombstone filter
     if (isTokenTombstoned(tokenId, localToken, remoteToken, tombstoneKeys)) {
@@ -143,13 +143,17 @@ function mergeTombstones(
  * Token keys start with '_' but are not meta fields.
  */
 function getTokenKeys(data: TxfStorageDataBase): Set<string> {
-  const metaKeys = new Set(['_meta', '_tombstones', '_outbox', '_sent', '_invalid']);
+  const reservedKeys = new Set([
+    '_meta', '_tombstones', '_outbox', '_sent', '_invalid',
+    '_nametag', '_mintOutbox', '_invalidatedNametags', '_integrity',
+  ]);
   const keys = new Set<string>();
 
   for (const key of Object.keys(data)) {
-    if (key.startsWith('_') && !metaKeys.has(key)) {
-      keys.add(key);
-    }
+    if (reservedKeys.has(key)) continue;
+    // Exclude archived, forked, and nametag entries from token merge
+    if (key.startsWith('archived-') || key.startsWith('_forked_') || key.startsWith('nametag-')) continue;
+    keys.add(key);
   }
 
   return keys;

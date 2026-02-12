@@ -673,6 +673,14 @@ export class PaymentsModule {
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
 
+  // Storage event subscriptions (push-based sync)
+  private storageEventUnsubscribers: (() => void)[] = [];
+  private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SYNC_DEBOUNCE_MS = 500;
+
+  /** Sync coalescing: concurrent sync() calls share the same operation */
+  private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -761,6 +769,9 @@ export class PaymentsModule {
         this.handlePaymentRequestResponse(response);
       });
     }
+
+    // Subscribe to storage provider events (push-based sync)
+    this.subscribeToStorageEvents();
   }
 
   /**
@@ -850,6 +861,9 @@ export class PaymentsModule {
       resolver.reject(new Error('Module destroyed'));
     }
     this.pendingResponseResolvers.clear();
+
+    // Clean up storage event subscriptions
+    this.unsubscribeStorageEvents();
 
     if (this.l1) {
       this.l1.destroy();
@@ -3600,6 +3614,22 @@ export class PaymentsModule {
   async sync(): Promise<{ added: number; removed: number }> {
     this.ensureInitialized();
 
+    // Sync coalescing: if a sync is already in progress, return its promise.
+    // This prevents race conditions when addTokenStorageProvider() fires a
+    // fire-and-forget sync and the caller also syncs immediately after.
+    if (this._syncInProgress) {
+      return this._syncInProgress;
+    }
+
+    this._syncInProgress = this._doSync();
+    try {
+      return await this._syncInProgress;
+    } finally {
+      this._syncInProgress = null;
+    }
+  }
+
+  private async _doSync(): Promise<{ added: number; removed: number }> {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
 
     try {
@@ -3651,6 +3681,11 @@ export class PaymentsModule {
         }
       }
 
+      // Persist merged state to primary storage so it survives process restarts
+      if (totalAdded > 0 || totalRemoved > 0) {
+        await this.save();
+      }
+
       this.deps!.emitEvent('sync:completed', {
         source: 'payments',
         count: this.tokens.size,
@@ -3664,6 +3699,76 @@ export class PaymentsModule {
       });
       throw error;
     }
+  }
+
+  // ===========================================================================
+  // Storage Event Subscription (Push-Based Sync)
+  // ===========================================================================
+
+  /**
+   * Subscribe to 'storage:remote-updated' events from all token storage providers.
+   * When a provider emits this event, a debounced sync is triggered.
+   */
+  private subscribeToStorageEvents(): void {
+    // Clean up existing subscriptions
+    this.unsubscribeStorageEvents();
+
+    const providers = this.getTokenStorageProviders();
+    for (const [providerId, provider] of providers) {
+      if (provider.onEvent) {
+        const unsub = provider.onEvent((event) => {
+          if (event.type === 'storage:remote-updated') {
+            this.log('Remote update detected from provider', providerId, event.data);
+            this.debouncedSyncFromRemoteUpdate(providerId, event.data);
+          }
+        });
+        this.storageEventUnsubscribers.push(unsub);
+      }
+    }
+  }
+
+  /**
+   * Unsubscribe from all storage provider events and clear debounce timer.
+   */
+  private unsubscribeStorageEvents(): void {
+    for (const unsub of this.storageEventUnsubscribers) {
+      unsub();
+    }
+    this.storageEventUnsubscribers = [];
+
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+      this.syncDebounceTimer = null;
+    }
+  }
+
+  /**
+   * Debounced sync triggered by a storage:remote-updated event.
+   * Waits 500ms to batch rapid updates, then performs sync.
+   */
+  private debouncedSyncFromRemoteUpdate(providerId: string, eventData: unknown): void {
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+    }
+
+    this.syncDebounceTimer = setTimeout(() => {
+      this.syncDebounceTimer = null;
+      this.sync()
+        .then((result) => {
+          const data = eventData as { name?: string; sequence?: number; cid?: string } | undefined;
+          this.deps?.emitEvent('sync:remote-update', {
+            providerId,
+            name: data?.name ?? '',
+            sequence: data?.sequence ?? 0,
+            cid: data?.cid ?? '',
+            added: result.added,
+            removed: result.removed,
+          });
+        })
+        .catch((err) => {
+          this.log('Auto-sync from remote update failed:', err);
+        });
+    }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
 
   /**
@@ -3695,6 +3800,8 @@ export class PaymentsModule {
   updateTokenStorageProviders(providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>): void {
     if (this.deps) {
       this.deps.tokenStorageProviders = providers;
+      // Re-subscribe to storage events for new providers
+      this.subscribeToStorageEvents();
     }
   }
 
@@ -4441,13 +4548,14 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    // Active tokens are NOT stored in TXF format - they are saved as individual
-    // token-xxx files via saveTokenToFileStorage() to avoid duplication.
-    // TXF storage is only used for metadata: archived, tombstones, forked, outbox.
-    // Note: nametag is also saved separately via saveNametagToFileStorage()
+    // Include active tokens in TXF data so IPFS sync can propagate them
+    // to other devices. File-based storage also saves tokens individually
+    // via saveTokenToFileStorage(), but the TXF format is needed for
+    // cross-device sync (IPFS merge operates on TXF data).
+    // Note: nametag is saved separately via saveNametagToFileStorage()
     // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
-      [], // Empty - active tokens stored as token-xxx files
+      Array.from(this.tokens.values()),
       {
         version: 1,
         address: this.deps!.identity.l1Address,

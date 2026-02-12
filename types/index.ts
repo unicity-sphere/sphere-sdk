@@ -380,7 +380,8 @@ export type SphereEventType =
   | 'identity:changed'
   | 'address:activated'
   | 'address:hidden'
-  | 'address:unhidden';
+  | 'address:unhidden'
+  | 'sync:remote-update';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -404,6 +405,7 @@ export interface SphereEventMap {
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
+  'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (

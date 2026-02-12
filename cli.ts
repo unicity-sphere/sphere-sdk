@@ -21,6 +21,8 @@ import { TokenRegistry } from './registry/TokenRegistry';
 import { TokenValidator } from './validation/token-validator';
 import { tokenToTxf, getCurrentStateHash } from './serialization/txf-serializer';
 import type { NetworkType } from './constants';
+import type { TransportProvider } from './transport/transport-provider';
+import type { ProviderStatus } from './types';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -138,6 +140,30 @@ function switchToProfile(name: string): boolean {
 // =============================================================================
 
 let sphereInstance: Sphere | null = null;
+let noNostrGlobal = false;
+
+/**
+ * Create a no-op transport that does nothing.
+ * Used with --no-nostr to prove IPFS-only recovery.
+ */
+function createNoopTransport(): TransportProvider {
+  return {
+    id: 'noop-transport',
+    name: 'No-Op Transport',
+    type: 'p2p' as const,
+    description: 'No-op transport (Nostr disabled)',
+    setIdentity: () => {},
+    connect: async () => {},
+    disconnect: async () => {},
+    isConnected: () => false,
+    getStatus: () => 'disconnected' as ProviderStatus,
+    sendMessage: async () => '',
+    onMessage: () => () => {},
+    sendTokenTransfer: async () => '',
+    onTokenTransfer: () => () => {},
+    fetchPendingEvents: async () => {},
+  };
+}
 
 async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; nametag?: string }): Promise<Sphere> {
   if (sphereInstance) return sphereInstance;
@@ -147,16 +173,27 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     network: config.network,
     dataDir: config.dataDir,
     tokensDir: config.tokensDir,
+    tokenSync: { ipfs: { enabled: true } },
   });
 
+  const initProviders = noNostrGlobal
+    ? { ...providers, transport: createNoopTransport() }
+    : providers;
+
   const result = await Sphere.init({
-    ...providers,
+    ...initProviders,
     autoGenerate: options?.autoGenerate,
     mnemonic: options?.mnemonic,
     nametag: options?.nametag,
   });
 
   sphereInstance = result.sphere;
+
+  // Attach IPFS storage provider for sync if available
+  if (providers.ipfsTokenStorage) {
+    await sphereInstance.addTokenStorageProvider(providers.ipfsTokenStorage);
+  }
+
   return sphereInstance;
 }
 
@@ -164,6 +201,21 @@ async function closeSphere(): Promise<void> {
   if (sphereInstance) {
     await sphereInstance.destroy();
     sphereInstance = null;
+  }
+}
+
+async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
+  if (skip) return;
+  try {
+    console.log('Syncing with IPFS...');
+    const result = await sphere.payments.sync();
+    if (result.added > 0 || result.removed > 0) {
+      console.log(`  Synced: +${result.added} added, -${result.removed} removed`);
+    } else {
+      console.log('  Up to date.');
+    }
+  } catch (err) {
+    console.warn(`  Sync warning: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -207,9 +259,10 @@ WALLET PROFILES:
   wallet current                    Show current wallet profile
 
 BALANCE & TOKENS:
-  balance [--finalize]              Show L3 token balance
+  balance [--finalize] [--no-sync]  Show L3 token balance
                                     --finalize: wait for unconfirmed tokens to be finalized
-  tokens                            List all tokens with details
+                                    --no-sync: skip IPFS sync before showing balance
+  tokens [--no-sync]                List all tokens with details
   l1-balance                        Show L1 (ALPHA) balance
   topup [coin] [amount]             Request test tokens from faucet
                                     Without args: requests all supported coins
@@ -218,6 +271,7 @@ BALANCE & TOKENS:
                                     Detects spent tokens not removed from storage
                                     --remove: Remove spent tokens from storage
                                     -v/--verbose: Show all tokens, not just spent
+  sync                              Sync tokens with IPFS remote storage
 
 TRANSFERS:
   send <to> <amount> [options]      Send tokens (to: @nametag or address)
@@ -226,8 +280,10 @@ TRANSFERS:
                                     --proxy          Force PROXY address transfer
                                     --instant        Send immediately via Nostr (default)
                                     --conservative   Collect all proofs first, then send
-  receive [--finalize]              Check for incoming transfers
+                                    --no-sync        Skip IPFS sync after sending
+  receive [--finalize] [--no-sync]  Check for incoming transfers
                                     --finalize: wait for unconfirmed tokens to be finalized
+                                    --no-sync: skip IPFS sync after receiving
   history [limit]                   Show transaction history
 
 ADDRESSES:
@@ -289,6 +345,9 @@ Wallet Profile Examples:
 }
 
 async function main() {
+  // Global flag: --no-nostr disables Nostr transport (uses no-op)
+  noNostrGlobal = args.includes('--no-nostr');
+
   if (!command || command === 'help' || command === '--help' || command === '-h') {
     printUsage();
     process.exit(0);
@@ -323,6 +382,7 @@ async function main() {
         saveConfig(config);
 
         console.log(`Initializing wallet on ${network}...`);
+        if (noNostrGlobal) console.log('  (Nostr transport disabled)');
 
         const sphere = await getSphere({
           autoGenerate: !mnemonic,
@@ -617,7 +677,10 @@ async function main() {
       // === BALANCE & TOKENS ===
       case 'balance': {
         const finalize = args.includes('--finalize');
+        const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        await syncIfEnabled(sphere, noSync);
 
         console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
         const result = await sphere.payments.receive({
@@ -681,7 +744,11 @@ async function main() {
       }
 
       case 'tokens': {
+        const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        await syncIfEnabled(sphere, noSync);
+
         const tokens = sphere.payments.getTokens();
         const registry = TokenRegistry.getInstance();
 
@@ -862,6 +929,13 @@ async function main() {
         break;
       }
 
+      case 'sync': {
+        const sphere = await getSphere();
+        await syncIfEnabled(sphere, false);
+        await closeSphere();
+        break;
+      }
+
       // === TRANSFERS ===
       case 'send': {
         const [, recipient, amountStr] = args;
@@ -937,12 +1011,15 @@ async function main() {
 
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
+        const noSyncSend = args.includes('--no-sync');
+        await syncIfEnabled(sphere, noSyncSend);
         await closeSphere();
         break;
       }
 
       case 'receive': {
         const finalize = args.includes('--finalize');
+        const noSyncRecv = args.includes('--no-sync');
         const sphere = await getSphere();
         const identity = sphere.identity;
 
@@ -995,6 +1072,7 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
+        await syncIfEnabled(sphere, noSyncRecv);
         await closeSphere();
         break;
       }

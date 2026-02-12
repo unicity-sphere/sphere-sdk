@@ -82,13 +82,15 @@ describe('IPFS Sync E2E', () => {
       },
     };
 
-    // Save
+    // Save (non-blocking — write-behind buffer flushes asynchronously)
     const saveResult = await provider.save(testData);
     expect(saveResult.success).toBe(true);
-    expect(saveResult.cid).toBeTruthy();
 
-    // Load by CID
-    const loadResult = await provider.load(saveResult.cid!);
+    // Wait for background flush to complete
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // Load by IPNS name (CID not available from non-blocking save)
+    const loadResult = await provider.load();
     expect(loadResult.success).toBe(true);
     expect(loadResult.data).toBeTruthy();
     expect((loadResult.data as any)._testtoken1?.coinId).toBe('UCT');
@@ -158,11 +160,11 @@ describe('IPFS Sync E2E', () => {
 
     const saveResult = await providerA.save(inventory);
     expect(saveResult.success).toBe(true);
-    expect(saveResult.cid).toBeTruthy();
-    console.log(`Saved CID=${saveResult.cid}, seq=${providerA.getSequenceNumber()}`);
 
-    // Destroy Provider A — simulates full local storage wipe
+    // Destroy Provider A — shutdown() drains the write-behind buffer,
+    // ensuring data is flushed to IPFS before simulating local wipe
     await providerA.shutdown();
+    console.log(`Saved seq=${providerA.getSequenceNumber()}`);
 
     // Wait for IPNS propagation (first-ever record for this name)
     console.log('Waiting for IPNS propagation...');
@@ -258,8 +260,10 @@ describe('IPFS Sync E2E', () => {
 
     const saveResult = await publisher.save(latestInventory);
     expect(saveResult.success).toBe(true);
-    console.log(`Latest inventory saved: CID=${saveResult.cid}, seq=${publisher.getSequenceNumber()}`);
+
+    // shutdown() drains the write-behind buffer, ensuring data is flushed to IPFS
     await publisher.shutdown();
+    console.log(`Latest inventory saved: seq=${publisher.getSequenceNumber()}`);
 
     // Wait for IPNS propagation (first-ever record for this name)
     console.log('Waiting for IPNS propagation...');

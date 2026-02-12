@@ -172,6 +172,7 @@ export type StorageEventType =
   | 'storage:loading'
   | 'storage:loaded'
   | 'storage:error'
+  | 'storage:remote-updated'
   | 'sync:started'
   | 'sync:completed'
   | 'sync:conflict'

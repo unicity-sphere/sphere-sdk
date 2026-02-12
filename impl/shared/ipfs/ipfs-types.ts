@@ -121,6 +121,24 @@ export interface IpfsStorageConfig {
   knownFreshWindowMs?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
+  /** WebSocket factory for IPNS push subscriptions (cross-platform) */
+  createWebSocket?: import('../../../transport/websocket').WebSocketFactory;
+  /** Override WebSocket URL (auto-derived from gateways if omitted) */
+  wsUrl?: string;
+  /** Fallback polling interval in ms when WS unavailable (default: 90000) */
+  fallbackPollIntervalMs?: number;
+  /** Debounce for push-triggered sync in ms (default: 500) */
+  syncDebounceMs?: number;
+  /** Debounce interval for background flush in ms (default: 2000) */
+  flushDebounceMs?: number;
+}
+
+/** IPNS update event received via WebSocket push or polling */
+export interface IpnsUpdateEvent {
+  name: string;
+  sequence: number;
+  cid: string;
+  timestamp: string;
 }
 
 // =============================================================================

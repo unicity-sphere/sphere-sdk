@@ -455,6 +455,20 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
         }
       }
     }
+    // Individual file format tokens (from IPFS storage's saveToken)
+    else if (key.startsWith('token-')) {
+      try {
+        const entry = storageData[key] as { token?: TxfToken };
+        const txfToken = entry?.token;
+        if (txfToken?.genesis?.data?.tokenId) {
+          const tokenId = txfToken.genesis.data.tokenId;
+          const token = txfToToken(tokenId, txfToken);
+          result.tokens.push(token);
+        }
+      } catch (err) {
+        result.validationErrors.push(`Token ${key}: ${err}`);
+      }
+    }
   }
 
   return result;
