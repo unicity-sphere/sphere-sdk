@@ -6,6 +6,7 @@
 import type {
   DirectMessage,
   BroadcastMessage,
+  ComposingIndicator,
   FullIdentity,
   SphereEventType,
   SphereEventMap,
@@ -51,10 +52,12 @@ export class CommunicationsModule {
 
   // Subscriptions
   private unsubscribeMessages: (() => void) | null = null;
+  private unsubscribeComposing: (() => void) | null = null;
   private broadcastSubscriptions: Map<string, () => void> = new Map();
 
   // Handlers
   private dmHandlers: Set<(message: DirectMessage) => void> = new Set();
+  private composingHandlers: Set<(indicator: ComposingIndicator) => void> = new Set();
   private broadcastHandlers: Set<(message: BroadcastMessage) => void> = new Set();
 
   constructor(config?: CommunicationsModuleConfig) {
@@ -79,6 +82,13 @@ export class CommunicationsModule {
     this.unsubscribeMessages = deps.transport.onMessage((msg) => {
       this.handleIncomingMessage(msg);
     });
+
+    // Subscribe to composing indicators
+    if ('onComposing' in deps.transport) {
+      this.unsubscribeComposing = (deps.transport as any).onComposing((indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }) => {
+        this.handleComposingIndicator(indicator);
+      });
+    }
   }
 
   /**
@@ -103,6 +113,8 @@ export class CommunicationsModule {
   destroy(): void {
     this.unsubscribeMessages?.();
     this.unsubscribeMessages = null;
+    this.unsubscribeComposing?.();
+    this.unsubscribeComposing = null;
 
     for (const unsub of this.broadcastSubscriptions.values()) {
       unsub();
@@ -222,6 +234,32 @@ export class CommunicationsModule {
     return () => this.dmHandlers.delete(handler);
   }
 
+  /**
+   * Send a composing indicator to a peer.
+   * Fire-and-forget — does not save to message history.
+   */
+  async sendComposingIndicator(recipientPubkeyOrNametag: string): Promise<void> {
+    this.ensureInitialized();
+
+    const recipientPubkey = await this.resolveRecipient(recipientPubkeyOrNametag);
+
+    const content = JSON.stringify({
+      type: 'composing',
+      senderNametag: this.deps!.identity.nametag,
+      expiresIn: 30000,
+    });
+
+    await this.deps!.transport.sendMessage(recipientPubkey, content);
+  }
+
+  /**
+   * Subscribe to incoming composing indicators
+   */
+  onComposingIndicator(handler: (indicator: ComposingIndicator) => void): () => void {
+    this.composingHandlers.add(handler);
+    return () => this.composingHandlers.delete(handler);
+  }
+
   // ===========================================================================
   // Public API - Broadcasts
   // ===========================================================================
@@ -332,6 +370,26 @@ export class CommunicationsModule {
 
     // Prune if needed
     this.pruneIfNeeded();
+  }
+
+  private handleComposingIndicator(indicator: { senderPubkey: string; senderNametag?: string; expiresIn: number }): void {
+    const composing: ComposingIndicator = {
+      senderPubkey: indicator.senderPubkey,
+      senderNametag: indicator.senderNametag,
+      expiresIn: indicator.expiresIn,
+    };
+
+    // Emit event
+    this.deps!.emitEvent('composing:started', composing);
+
+    // Notify handlers
+    for (const handler of this.composingHandlers) {
+      try {
+        handler(composing);
+      } catch (error) {
+        console.error('[Communications] Composing handler error:', error);
+      }
+    }
   }
 
   private handleIncomingBroadcast(incoming: IncomingBroadcast): void {
