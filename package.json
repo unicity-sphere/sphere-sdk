@@ -69,6 +69,7 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:relay": "vitest run --config vitest.relay.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
     "cli": "npx tsx cli/index.ts"
@@ -121,20 +122,21 @@
     "eslint": "^9.39.2",
     "fake-indexeddb": "^6.2.5",
     "multiformats": "^13.4.2",
+    "testcontainers": "^11.11.0",
     "tsup": "^8.5.1",
     "typescript": "~5.6.0",
     "typescript-eslint": "^8.54.0",
     "vitest": "^2.0.0"
   },
   "peerDependencies": {
-    "ws": ">=8.0.0",
     "@helia/ipns": ">=9.0.0",
     "@helia/json": ">=5.0.0",
     "@libp2p/crypto": ">=5.0.0",
     "@libp2p/peer-id": ">=6.0.0",
     "helia": ">=6.0.0",
     "ipns": ">=10.0.0",
-    "multiformats": ">=13.0.0"
+    "multiformats": ">=13.0.0",
+    "ws": ">=8.0.0"
   },
   "peerDependenciesMeta": {
     "ws": {

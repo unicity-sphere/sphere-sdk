@@ -799,69 +799,11 @@ export class GroupChatModule {
       .slice(0, 20) || this.randomId();
 
     try {
-      const creationTime = Math.floor(Date.now() / 1000);
-      const groupPromise = this.oneshotSubscription(
-        new Filter({ kinds: [NIP29_KINDS.GROUP_METADATA], since: creationTime - 5 }),
-        {
-          onEvent: (event: Event) => {
-            const group = this.parseGroupMetadata(event);
-            if (!group) return;
-
-            const isOurGroup =
-              (group.name === options.name || group.id === proposedGroupId) &&
-              event.created_at >= creationTime - 5;
-
-            if (isOurGroup) {
-              if (!group.name || group.name === 'Unnamed Group') {
-                group.name = options.name;
-              }
-              if (options.description && !group.description) {
-                group.description = options.description;
-              }
-              group.visibility = options.visibility || GroupVisibilityEnum.PUBLIC;
-              group.memberCount = 1;
-
-              // Store immediately so onComplete returns it
-              this.groups.set(group.id, group);
-
-              this.saveMemberToMemory({
-                pubkey: creatorPubkey,
-                groupId: group.id,
-                role: GroupRoleEnum.ADMIN,
-                joinedAt: Date.now(),
-              });
-            }
-          },
-          onComplete: () => {
-            // Find the group we just stored (matched in onEvent)
-            const found = Array.from(this.groups.values()).find(
-              (g) => (g.name === options.name || g.id === proposedGroupId) &&
-                     g.createdAt >= (creationTime - 5) * 1000,
-            );
-            return found || null;
-          },
-          timeoutMs: 10000,
-        },
-      ).then(async (group) => {
-        if (group) {
-          this.subscribeToGroup(group.id);
-
-          this.client!.createAndPublishEvent({
-            kind: NIP29_KINDS.JOIN_REQUEST,
-            tags: [['h', group.id]],
-            content: '',
-          }).catch(() => {});
-
-          this.fetchAndSaveMembers(group.id).catch(() => {});
-
-          this.deps!.emitEvent('groupchat:joined', { groupId: group.id, groupName: group.name });
-          this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-          this.schedulePersist();
-        }
-        return group;
-      });
-
       const isPrivate = options.visibility === GroupVisibilityEnum.PRIVATE;
+
+      // Publish CREATE_GROUP first, then fetch the metadata.
+      // The relay creates the group synchronously, so by the time the OK
+      // response arrives the GROUP_METADATA event is queryable.
       const eventId = await this.client.createAndPublishEvent({
         kind: NIP29_KINDS.CREATE_GROUP,
         tags: [['h', proposedGroupId]],
@@ -875,10 +817,57 @@ export class GroupChatModule {
         }),
       });
 
-      if (eventId) {
-        return await groupPromise;
+      if (!eventId) return null;
+
+      // Fetch the group metadata the relay created for us
+      let group = await this.fetchGroupMetadataInternal(proposedGroupId);
+
+      if (!group) {
+        // Fallback: build group data from what we know
+        group = {
+          id: proposedGroupId,
+          relayUrl: this.config.relays[0] || '',
+          name: options.name,
+          description: options.description,
+          visibility: options.visibility || GroupVisibilityEnum.PUBLIC,
+          createdAt: Date.now(),
+          memberCount: 1,
+        };
       }
-      return null;
+
+      if (!group.name || group.name === 'Unnamed Group') {
+        group.name = options.name;
+      }
+      if (options.description && !group.description) {
+        group.description = options.description;
+      }
+      group.visibility = options.visibility || GroupVisibilityEnum.PUBLIC;
+      group.memberCount = 1;
+
+      this.groups.set(group.id, group);
+
+      this.saveMemberToMemory({
+        pubkey: creatorPubkey,
+        groupId: group.id,
+        role: GroupRoleEnum.ADMIN,
+        joinedAt: Date.now(),
+      });
+
+      this.subscribeToGroup(group.id);
+
+      this.client!.createAndPublishEvent({
+        kind: NIP29_KINDS.JOIN_REQUEST,
+        tags: [['h', group.id]],
+        content: '',
+      }).catch(() => {});
+
+      this.fetchAndSaveMembers(group.id).catch(() => {});
+
+      this.deps!.emitEvent('groupchat:joined', { groupId: group.id, groupName: group.name });
+      this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
+      this.schedulePersist();
+
+      return group;
     } catch (error) {
       console.error('[GroupChat] Failed to create group', error);
       return null;
@@ -1609,7 +1598,9 @@ export class GroupChatModule {
 
   private getGroupIdFromMetadataEvent(event: Event): string | null {
     const dTag = event.tags.find((t: string[]) => t[0] === 'd');
-    return dTag ? dTag[1] : null;
+    if (dTag?.[1]) return dTag[1];
+    const hTag = event.tags.find((t: string[]) => t[0] === 'h');
+    return hTag?.[1] ?? null;
   }
 
   private extractReplyTo(event: Event): string | undefined {
