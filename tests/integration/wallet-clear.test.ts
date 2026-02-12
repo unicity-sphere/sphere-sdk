@@ -602,4 +602,112 @@ describe('Sphere.clear() integration', () => {
       expect(await Sphere.exists(storage)).toBe(false);
     });
   });
+
+  describe('destroy() shuts down tokenStorageProviders', () => {
+    it('should call shutdown() on tokenStorageProviders during destroy', async () => {
+      const transport = createMockTransport();
+      const oracle = createMockOracle();
+
+      const { sphere } = await Sphere.init({
+        storage,
+        transport,
+        oracle,
+        tokenStorage,
+        autoGenerate: true,
+      });
+
+      // tokenStorage was initialized by Sphere.init
+      expect(sphere.getTokenStorage()).toBeDefined();
+
+      // Spy on shutdown
+      const shutdownSpy = vi.spyOn(tokenStorage, 'shutdown');
+
+      await sphere.destroy();
+
+      expect(shutdownSpy).toHaveBeenCalled();
+      // tokenStorageProviders map should be cleared
+      expect(sphere.getTokenStorageProviders().size).toBe(0);
+    });
+
+    it('should not throw if tokenStorage shutdown fails', async () => {
+      const transport = createMockTransport();
+      const oracle = createMockOracle();
+
+      const { sphere } = await Sphere.init({
+        storage,
+        transport,
+        oracle,
+        tokenStorage,
+        autoGenerate: true,
+      });
+
+      // Make shutdown throw
+      vi.spyOn(tokenStorage, 'shutdown').mockRejectedValueOnce(new Error('shutdown failed'));
+
+      // destroy should not throw
+      await expect(sphere.destroy()).resolves.not.toThrow();
+    });
+  });
+
+  describe('import() skips redundant clear', () => {
+    it('should not call tokenStorage.clear() when no wallet exists and no instance', async () => {
+      const transport = createMockTransport();
+      const oracle = createMockOracle();
+
+      // Ensure no wallet exists and no Sphere instance
+      expect(await Sphere.exists(storage)).toBe(false);
+      expect(Sphere.getInstance()).toBeNull();
+
+      const clearSpy = vi.spyOn(tokenStorage, 'clear');
+
+      const sphere = await Sphere.import({
+        storage,
+        transport,
+        oracle,
+        tokenStorage,
+        mnemonic: Sphere.generateMnemonic(),
+      });
+
+      // clear should NOT have been called (no existing wallet to clean up)
+      expect(clearSpy).not.toHaveBeenCalled();
+
+      // But wallet should be created successfully
+      expect(sphere.identity).toBeDefined();
+      expect(await Sphere.exists(storage)).toBe(true);
+
+      await sphere.destroy();
+    });
+
+    it('should call clear() when a wallet already exists', async () => {
+      const transport = createMockTransport();
+      const oracle = createMockOracle();
+
+      // Create a wallet first
+      const { sphere: sphere1 } = await Sphere.init({
+        storage,
+        transport,
+        oracle,
+        tokenStorage,
+        autoGenerate: true,
+      });
+      expect(await Sphere.exists(storage)).toBe(true);
+      await sphere1.destroy();
+
+      // Now import — wallet exists in storage, clear should be called
+      const clearSpy = vi.spyOn(tokenStorage, 'clear');
+
+      const sphere2 = await Sphere.import({
+        storage,
+        transport: createMockTransport(),
+        oracle: createMockOracle(),
+        tokenStorage,
+        mnemonic: Sphere.generateMnemonic(),
+      });
+
+      expect(clearSpy).toHaveBeenCalled();
+      expect(sphere2.identity).toBeDefined();
+
+      await sphere2.destroy();
+    });
+  });
 });
