@@ -210,24 +210,24 @@ describe('IPFS Active Token Persistence E2E', () => {
     }
 
     // Request faucet
-    console.log(`  Requesting faucet: 100 UCT to @${savedNametagA}...`);
-    const faucetResult = await requestFaucet(savedNametagA, 'unicity', 100);
+    console.log(`  Requesting faucet: 1000 SOL to @${savedNametagA}...`);
+    const faucetResult = await requestFaucet(savedNametagA, 'solana', 1000);
     console.log(`  Faucet response: ${faucetResult.success ? 'OK' : faucetResult.message}`);
 
     // Wait for tokens
-    console.log('  Waiting for UCT tokens...');
-    const bal = await waitForTokens(sphereA, 'UCT', 1n, FAUCET_TOPUP_TIMEOUT_MS);
+    console.log('  Waiting for SOL tokens...');
+    const bal = await waitForTokens(sphereA, 'SOL', 1n, FAUCET_TOPUP_TIMEOUT_MS);
     console.log(`  Received: total=${bal.total}, tokens=${bal.tokens}`);
 
     // Record original state
     originalBalance = bal;
     const tokens = sphereA.payments.getTokens({ coinId: undefined });
-    const uctTokens = tokens.filter((t) => t.symbol === 'UCT');
-    originalTokenIds = new Set(uctTokens.map((t) => t.id));
-    originalTokenAmounts = new Map(uctTokens.map((t) => [t.id, t.amount]));
+    const solTokens = tokens.filter((t) => t.symbol === 'SOL');
+    originalTokenIds = new Set(solTokens.map((t) => t.id));
+    originalTokenAmounts = new Map(solTokens.map((t) => [t.id, t.amount]));
 
     expect(originalTokenIds.size).toBeGreaterThan(0);
-    console.log(`  Recorded ${originalTokenIds.size} UCT token(s)`);
+    console.log(`  Recorded ${originalTokenIds.size} SOL token(s)`);
 
     // Sync to IPFS
     console.log('  Syncing to IPFS...');
@@ -303,14 +303,14 @@ describe('IPFS Active Token Persistence E2E', () => {
 
     // Verify balance
     await sphereA.payments.load();
-    const recoveredBalance = getBalance(sphereA, 'UCT');
+    const recoveredBalance = getBalance(sphereA, 'SOL');
     console.log(`  Recovered balance: total=${recoveredBalance.total}, tokens=${recoveredBalance.tokens}`);
 
     expect(recoveredBalance.total).toBe(originalBalance.total);
     expect(recoveredBalance.tokens).toBe(originalBalance.tokens);
 
     // Verify individual tokens
-    const recoveredTokens = sphereA.payments.getTokens().filter((t) => t.symbol === 'UCT');
+    const recoveredTokens = sphereA.payments.getTokens().filter((t) => t.symbol === 'SOL');
     const recoveredIds = new Set(recoveredTokens.map((t) => t.id));
     const recoveredAmounts = new Map(recoveredTokens.map((t) => [t.id, t.amount]));
 
@@ -358,14 +358,14 @@ describe('IPFS Active Token Persistence E2E', () => {
     await new Promise((r) => setTimeout(r, 3000));
     await sphereA.payments.load();
 
-    const senderBefore = getBalance(sphereA, 'UCT');
+    const senderBefore = getBalance(sphereA, 'SOL');
     console.log(`  Sender A balance before: total=${senderBefore.total}, tokens=${senderBefore.tokens}`);
     expect(senderBefore.total).toBeGreaterThan(0n);
 
     // Pick the first token's amount to send (avoids split complexity)
-    const uctTokens = sphereA.payments.getTokens().filter((t) => t.symbol === 'UCT');
-    expect(uctTokens.length).toBeGreaterThan(0);
-    const firstToken = uctTokens[0];
+    const solTokens = sphereA.payments.getTokens().filter((t) => t.symbol === 'SOL');
+    expect(solTokens.length).toBeGreaterThan(0);
+    const firstToken = solTokens[0];
     const sendAmount = firstToken.amount;
     const coinId = firstToken.coinId;
     console.log(`  Sending ${sendAmount} (coinId=${coinId}) to @${nametagB}...`);
@@ -381,7 +381,7 @@ describe('IPFS Active Token Persistence E2E', () => {
 
     // Verify A's balance decreased (token was spent)
     await sphereA.payments.load();
-    const senderAfter = getBalance(sphereA, 'UCT');
+    const senderAfter = getBalance(sphereA, 'SOL');
     console.log(`  Sender A balance after: total=${senderAfter.total}, tokens=${senderAfter.tokens}`);
     expect(senderAfter.total).toBeLessThan(senderBefore.total);
 
@@ -419,9 +419,9 @@ describe('IPFS Active Token Persistence E2E', () => {
     }
 
     // Request batch 1
-    console.log('  Requesting batch 1: 100 UCT...');
-    await requestFaucet(nametagC, 'unicity', 100);
-    const batch1Bal = await waitForTokens(sphereC1, 'UCT', 1n, FAUCET_TOPUP_TIMEOUT_MS);
+    console.log('  Requesting batch 1: 1000 SOL...');
+    await requestFaucet(nametagC, 'solana', 1000);
+    const batch1Bal = await waitForTokens(sphereC1, 'SOL', 1n, FAUCET_TOPUP_TIMEOUT_MS);
     const batch1Total = batch1Bal.total;
     console.log(`  Batch 1 received: total=${batch1Total}, tokens=${batch1Bal.tokens}`);
 
@@ -453,14 +453,14 @@ describe('IPFS Active Token Persistence E2E', () => {
     spheres.push(sphereC2);
 
     // Request batch 2 (Nostr replay may also re-deliver batch 1)
-    console.log('  Requesting batch 2: 100 UCT...');
-    await requestFaucet(nametagC, 'unicity', 100);
+    console.log('  Requesting batch 2: 1000 SOL...');
+    await requestFaucet(nametagC, 'solana', 1000);
 
     // Wait for batch 2 to arrive (we need at least some tokens)
     // NOTE: Nostr replay may also re-deliver batch 1 tokens, so pre-sync
     // balance could be 1 token (batch 2 only) or 2 tokens (batch 1 via Nostr + batch 2)
     console.log('  Waiting for batch 2 tokens...');
-    const preSyncBal = await waitForTokens(sphereC2, 'UCT', 1n, FAUCET_TOPUP_TIMEOUT_MS);
+    const preSyncBal = await waitForTokens(sphereC2, 'SOL', 1n, FAUCET_TOPUP_TIMEOUT_MS);
     console.log(`  Pre-sync balance: total=${preSyncBal.total}, tokens=${preSyncBal.tokens}`);
 
     // --- Step 4: Add IPFS provider and sync to merge ---
@@ -489,13 +489,13 @@ describe('IPFS Active Token Persistence E2E', () => {
     }
 
     await sphereC2.payments.load();
-    const mergedBalance = getBalance(sphereC2, 'UCT');
+    const mergedBalance = getBalance(sphereC2, 'SOL');
     console.log(`  Merged balance: total=${mergedBalance.total}, tokens=${mergedBalance.tokens}`);
 
     // After merge, BOTH batches must be present:
     // - No tokens lost during merge (merged >= pre-sync)
     // - At least 2 tokens (one from each batch)
-    // - Total at least 2x batch1 (each batch is ~100 UCT)
+    // - Total at least 2x batch1 (each batch is ~1000 SOL)
     // NOTE: We don't use batch2Total in the assertion because Nostr replay
     // may have already delivered batch 1 locally, inflating pre-sync balance
     expect(mergedBalance.total).toBeGreaterThanOrEqual(preSyncBal.total);

@@ -311,6 +311,28 @@ describe('txfToToken()', () => {
     expect(token.symbol).toBe('NFT');
     expect(token.name).toBe('NFT');
   });
+
+  it('should resolve symbol from TokenRegistry for known coinId (SOL)', () => {
+    const txf = createMockTxf();
+    txf.genesis.data.coinData = [['dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93', '1000000000']];
+
+    const token = txfToToken('test-sol', txf);
+
+    expect(token.symbol).toBe('SOL');
+    expect(token.name).toBe('Solana');
+    expect(token.decimals).toBe(9);
+  });
+
+  it('should fallback to coinId prefix for unknown coinId', () => {
+    const txf = createMockTxf();
+    txf.genesis.data.coinData = [['abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890', '500']];
+
+    const token = txfToToken('test-unknown', txf);
+
+    expect(token.symbol).toBe('abcdef12');
+    expect(token.name).toBe('Token');
+    expect(token.decimals).toBe(8);
+  });
 });
 
 // =============================================================================

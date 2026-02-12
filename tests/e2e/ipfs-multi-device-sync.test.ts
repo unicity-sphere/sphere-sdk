@@ -306,17 +306,17 @@ describe('IPFS Multi-Device Sync E2E', () => {
       console.log('  IPFS token storage provider added');
 
       // Request faucet
-      console.log(`  Requesting faucet: 100 UCT to @${savedNametag}...`);
-      const faucetResult = await requestFaucet(savedNametag, 'unicity', 100);
+      console.log(`  Requesting faucet: 1000 SOL to @${savedNametag}...`);
+      const faucetResult = await requestFaucet(savedNametag, 'solana', 1000);
       console.log(
         `  Faucet: ${faucetResult.success ? 'OK' : faucetResult.message}`,
       );
 
       // Wait for tokens via Nostr
-      console.log('  Waiting for UCT tokens...');
+      console.log('  Waiting for SOL tokens...');
       originalBalance = await waitForTokens(
         sphere,
-        'UCT',
+        'SOL',
         1n,
         FAUCET_TOPUP_TIMEOUT_MS,
       );
@@ -326,10 +326,10 @@ describe('IPFS Multi-Device Sync E2E', () => {
       expect(originalBalance.total).toBeGreaterThan(0n);
 
       // Record original inventory
-      originalTokenIds = getTokenIds(sphere, 'UCT');
-      originalTokenAmounts = getTokenAmounts(sphere, 'UCT');
+      originalTokenIds = getTokenIds(sphere, 'SOL');
+      originalTokenAmounts = getTokenAmounts(sphere, 'SOL');
       expect(originalTokenIds.size).toBeGreaterThan(0);
-      console.log(`  Recorded ${originalTokenIds.size} UCT token(s)`);
+      console.log(`  Recorded ${originalTokenIds.size} SOL token(s)`);
 
       // Sync to IPFS
       console.log('  Syncing to IPFS...');
@@ -339,7 +339,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
       );
 
       // Verify tokens survived the sync round-trip
-      const postSync = getBalance(sphere, 'UCT');
+      const postSync = getBalance(sphere, 'SOL');
       expect(postSync.total).toBe(originalBalance.total);
       expect(postSync.tokens).toBe(originalBalance.tokens);
 
@@ -403,7 +403,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
 
       // CRITICAL ASSERTION: before sync, wallet must have ZERO tokens
       // This proves Nostr didn't deliver anything (no-op transport)
-      const preSyncBal = getBalance(sphereRecovery, 'UCT');
+      const preSyncBal = getBalance(sphereRecovery, 'SOL');
       console.log(
         `  Pre-sync balance: total=${preSyncBal.total}, tokens=${preSyncBal.tokens}`,
       );
@@ -414,7 +414,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
       console.log('  Syncing from IPFS (this is the only token source)...');
       const { syncAdded, balance: postSyncBal } = await syncUntilTokens(
         sphereRecovery,
-        'UCT',
+        'SOL',
         1n,
         IPNS_RESOLVE_TIMEOUT_MS,
       );
@@ -431,8 +431,8 @@ describe('IPFS Multi-Device Sync E2E', () => {
       expect(postSyncBal.tokens).toBe(originalBalance.tokens);
 
       // Verify exact token IDs and amounts match
-      const recoveredIds = getTokenIds(sphereRecovery, 'UCT');
-      const recoveredAmounts = getTokenAmounts(sphereRecovery, 'UCT');
+      const recoveredIds = getTokenIds(sphereRecovery, 'SOL');
+      const recoveredAmounts = getTokenAmounts(sphereRecovery, 'SOL');
 
       expect(recoveredIds.size).toBe(originalTokenIds.size);
       for (const id of originalTokenIds) {
@@ -489,7 +489,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
       console.log('  Syncing from IPFS...');
       const { syncAdded, balance: syncedBal } = await syncUntilTokens(
         sphereFull,
-        'UCT',
+        'SOL',
         1n,
         IPNS_RESOLVE_TIMEOUT_MS,
       );
@@ -504,7 +504,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
         // May throw if no pending events
       }
 
-      const finalBal = getBalance(sphereFull, 'UCT');
+      const finalBal = getBalance(sphereFull, 'SOL');
       console.log(
         `  Final balance: total=${finalBal.total}, tokens=${finalBal.tokens}`,
       );
@@ -514,7 +514,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
       expect(finalBal.total).toBeGreaterThanOrEqual(originalBalance.total);
 
       // Verify all original token IDs are present
-      const recoveredIds = getTokenIds(sphereFull, 'UCT');
+      const recoveredIds = getTokenIds(sphereFull, 'SOL');
       for (const id of originalTokenIds) {
         expect(recoveredIds.has(id)).toBe(true);
       }

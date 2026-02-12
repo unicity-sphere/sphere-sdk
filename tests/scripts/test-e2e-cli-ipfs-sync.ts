@@ -56,6 +56,7 @@ const CLI_TIMEOUT_MS = 300_000;
 
 const COIN_DECIMALS: Record<string, number> = {
   UCT: 8,
+  SOL: 9,
   BTC: 8,
   ETH: 18,
 };
@@ -344,7 +345,7 @@ async function main(): Promise<void> {
   const deviceBProfile = `ipfs_sync_${testRunId}_devB`;
   const deviceCProfile = `ipfs_sync_${testRunId}_devC`;
   const nametag = `sync${testRunId}`;
-  const decimals = COIN_DECIMALS['UCT'];
+  const decimals = COIN_DECIMALS['SOL'];
 
   let savedMnemonic = '';
   let deviceATokenCount = 0;
@@ -382,30 +383,30 @@ async function main(): Promise<void> {
         console.log(`  Mnemonic saved (${savedMnemonic.split(' ').length} words)`);
 
         // Request faucet topup
-        console.log(`  Requesting faucet: 100 UCT to @${nametag}...`);
-        const faucetResult = await requestFaucet(nametag, 'unicity', 100);
+        console.log(`  Requesting faucet: 1000 SOL to @${nametag}...`);
+        const faucetResult = await requestFaucet(nametag, 'solana', 1000);
         assert(faucetResult.success, `Faucet request failed: ${faucetResult.message}`);
         console.log('  Faucet: OK');
 
         // Wait for tokens to arrive (uses balance with Nostr receive)
-        console.log(`  Waiting for UCT tokens (up to ${FAUCET_TOPUP_TIMEOUT_MS / 1000}s)...`);
+        console.log(`  Waiting for SOL tokens (up to ${FAUCET_TOPUP_TIMEOUT_MS / 1000}s)...`);
         const startPoll = performance.now();
         let bal: ParsedBalance | null = null;
 
         while (performance.now() - startPoll < FAUCET_TOPUP_TIMEOUT_MS) {
           // Use --finalize to resolve V5 tokens, --no-sync to not conflate with IPFS
           const { stdout } = cli('balance --finalize --no-sync', deviceAProfile);
-          bal = parseBalanceOutput(stdout, 'UCT');
+          bal = parseBalanceOutput(stdout, 'SOL');
           if (bal && totalBalance(bal, decimals) > 0n) break;
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        assert(bal !== null, 'Balance command never returned UCT balance');
+        assert(bal !== null, 'Balance command never returned SOL balance');
         const total = totalBalance(bal, decimals);
-        assert(total > 0n, `Expected UCT balance > 0, got ${total}`);
+        assert(total > 0n, `Expected SOL balance > 0, got ${total}`);
         deviceATotal = total;
         deviceATokenCount = bal!.tokens;
-        console.log(`  Received: ${bal!.confirmed} UCT (${deviceATokenCount} tokens)`);
+        console.log(`  Received: ${bal!.confirmed} SOL (${deviceATokenCount} tokens)`);
 
         // Sync to IPFS — this pushes inventory to IPNS
         console.log('  Syncing to IPFS (pushing inventory)...');
@@ -414,11 +415,11 @@ async function main(): Promise<void> {
 
         // Verify balance is still intact after sync
         const { stdout: postSyncOut } = cli('balance --finalize --no-sync', deviceAProfile);
-        const postBal = parseBalanceOutput(postSyncOut, 'UCT');
+        const postBal = parseBalanceOutput(postSyncOut, 'SOL');
         assert(postBal !== null, 'Post-sync balance returned null');
         const postTotal = totalBalance(postBal, decimals);
         assert(postTotal === deviceATotal, `Post-sync balance ${postTotal} !== pre-sync ${deviceATotal}`);
-        console.log(`  Post-sync balance verified: ${postBal!.confirmed} UCT`);
+        console.log(`  Post-sync balance verified: ${postBal!.confirmed} SOL`);
       },
     );
 
@@ -467,7 +468,7 @@ async function main(): Promise<void> {
           // Check balance with --finalize --no-sync to avoid re-syncing
           const balResult = cliSoft('balance --finalize --no-sync', deviceBProfile);
           if (balResult.exitCode === 0) {
-            finalBal = parseBalanceOutput(balResult.stdout, 'UCT');
+            finalBal = parseBalanceOutput(balResult.stdout, 'SOL');
             if (finalBal) {
               finalTotal = totalBalance(finalBal, decimals);
               if (finalTotal > 0n) break;
@@ -478,11 +479,11 @@ async function main(): Promise<void> {
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        console.log(`  Recovery result: ${finalBal?.confirmed ?? '0'} UCT (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
+        console.log(`  Recovery result: ${finalBal?.confirmed ?? '0'} SOL (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
 
         // CRITICAL ASSERTIONS:
         // 1. Device B must have tokens
-        assert(finalTotal > 0n, `Recovery failed: Device B has 0 UCT after sync timeout`);
+        assert(finalTotal > 0n, `Recovery failed: Device B has 0 SOL after sync timeout`);
 
         // 2. Balance must match original Device A
         assert(
@@ -496,7 +497,7 @@ async function main(): Promise<void> {
           `Token count mismatch: Device A had ${deviceATokenCount}, Device B recovered ${finalBal!.tokens}`,
         );
 
-        console.log(`  Device B recovered identical inventory: ${finalBal!.confirmed} UCT (${finalBal!.tokens} tokens)`);
+        console.log(`  Device B recovered identical inventory: ${finalBal!.confirmed} SOL (${finalBal!.tokens} tokens)`);
       },
     );
 
@@ -508,10 +509,10 @@ async function main(): Promise<void> {
       async () => {
         // Record Device B's current balance
         const { stdout: bBefore } = cli('balance --finalize --no-sync', deviceBProfile);
-        const balBBefore = parseBalanceOutput(bBefore, 'UCT');
-        assert(balBBefore !== null, 'Device B has no UCT balance');
+        const balBBefore = parseBalanceOutput(bBefore, 'SOL');
+        assert(balBBefore !== null, 'Device B has no SOL balance');
         const totalBBefore = totalBalance(balBBefore, decimals);
-        console.log(`  Device B: ${balBBefore!.confirmed} UCT (${balBBefore!.tokens} tokens)`);
+        console.log(`  Device B: ${balBBefore!.confirmed} SOL (${balBBefore!.tokens} tokens)`);
 
         // Device B syncs (pushes its state)
         console.log('  Device B: syncing to IPFS...');
@@ -527,7 +528,7 @@ async function main(): Promise<void> {
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
           cliSoft('sync', deviceAProfile);
           const { stdout } = cli('balance --finalize --no-sync', deviceAProfile);
-          balA = parseBalanceOutput(stdout, 'UCT');
+          balA = parseBalanceOutput(stdout, 'SOL');
           if (balA) {
             totalAAfterSync = totalBalance(balA, decimals);
             if (totalAAfterSync > 0n) break;
@@ -536,8 +537,8 @@ async function main(): Promise<void> {
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        console.log(`  Device A after sync: ${balA?.confirmed ?? '0'} UCT (${balA?.tokens ?? 0} tokens)`);
-        console.log(`  Device B:            ${balBBefore!.confirmed} UCT (${balBBefore!.tokens} tokens)`);
+        console.log(`  Device A after sync: ${balA?.confirmed ?? '0'} SOL (${balA?.tokens ?? 0} tokens)`);
+        console.log(`  Device B:            ${balBBefore!.confirmed} SOL (${balBBefore!.tokens} tokens)`);
 
         // Both should have the same balance
         assert(
@@ -572,10 +573,10 @@ async function main(): Promise<void> {
         // Check balance BEFORE sync — must be 0 (no Nostr to deliver tokens)
         // NOTE: no --finalize (requires Nostr transport for fetchPendingEvents)
         const { stdout: preSyncOut } = cli('balance --no-sync --no-nostr', deviceCProfile);
-        const preSyncBal = parseBalanceOutput(preSyncOut, 'UCT');
+        const preSyncBal = parseBalanceOutput(preSyncOut, 'SOL');
         const preSyncTotal = preSyncBal ? totalBalance(preSyncBal, decimals) : 0n;
-        console.log(`  Pre-sync balance (no Nostr): ${preSyncBal?.confirmed ?? '0'} UCT (${preSyncBal?.tokens ?? 0} tokens)`);
-        assert(preSyncTotal === 0n, `Expected 0 UCT before IPFS sync (no Nostr), got ${preSyncTotal}`);
+        console.log(`  Pre-sync balance (no Nostr): ${preSyncBal?.confirmed ?? '0'} SOL (${preSyncBal?.tokens ?? 0} tokens)`);
+        assert(preSyncTotal === 0n, `Expected 0 SOL before IPFS sync (no Nostr), got ${preSyncTotal}`);
 
         // Sync from IPFS — this is the ONLY way tokens can arrive
         console.log('  Syncing from IPFS (IPFS-only, no Nostr)...');
@@ -599,7 +600,7 @@ async function main(): Promise<void> {
           // Check balance (still with --no-nostr, no --finalize)
           const balResult = cliSoft('balance --no-sync --no-nostr', deviceCProfile);
           if (balResult.exitCode === 0) {
-            finalBal = parseBalanceOutput(balResult.stdout, 'UCT');
+            finalBal = parseBalanceOutput(balResult.stdout, 'SOL');
             if (finalBal) {
               finalTotal = totalBalance(finalBal, decimals);
               if (finalTotal > 0n) break;
@@ -610,10 +611,10 @@ async function main(): Promise<void> {
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        console.log(`  IPFS-only recovery: ${finalBal?.confirmed ?? '0'} UCT (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
+        console.log(`  IPFS-only recovery: ${finalBal?.confirmed ?? '0'} SOL (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
 
         // CRITICAL: tokens MUST come from IPFS (syncAdded > 0 proves it)
-        assert(finalTotal > 0n, 'IPFS-only recovery failed: 0 UCT after sync timeout');
+        assert(finalTotal > 0n, 'IPFS-only recovery failed: 0 SOL after sync timeout');
         assert(totalSyncAdded > 0, `syncAdded must be > 0 to prove IPFS delivered tokens, got ${totalSyncAdded}`);
         assert(
           finalTotal === deviceATotal,
@@ -624,7 +625,7 @@ async function main(): Promise<void> {
           `Token count mismatch: Device A had ${deviceATokenCount}, Device C recovered ${finalBal!.tokens}`,
         );
 
-        console.log(`  Device C recovered EXCLUSIVELY from IPFS: ${finalBal!.confirmed} UCT (${finalBal!.tokens} tokens)`);
+        console.log(`  Device C recovered EXCLUSIVELY from IPFS: ${finalBal!.confirmed} SOL (${finalBal!.tokens} tokens)`);
         console.log(`  syncAdded=${totalSyncAdded} proves tokens came from IPFS, not Nostr`);
       },
     );

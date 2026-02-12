@@ -28,6 +28,7 @@ import {
   forkedKeyFromTokenIdAndState,
 } from '../types/txf';
 import type { Token, TokenStatus } from '../types';
+import { TokenRegistry } from '../registry/TokenRegistry';
 
 // =============================================================================
 // SDK Token Normalization
@@ -216,12 +217,15 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
 
   const now = Date.now();
 
+  const registry = TokenRegistry.getInstance();
+  const def = registry.getDefinition(coinId);
+
   return {
     id: tokenId,
     coinId,
-    symbol: isNft ? 'NFT' : 'UCT',
-    name: isNft ? 'NFT' : 'Token',
-    decimals: isNft ? 0 : 8,
+    symbol: isNft ? 'NFT' : (def?.symbol || coinId.slice(0, 8)),
+    name: isNft ? 'NFT' : (def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : 'Token'),
+    decimals: isNft ? 0 : (def?.decimals ?? 8),
     amount: totalAmount.toString(),
     status: determineTokenStatus(txf),
     createdAt: now,
