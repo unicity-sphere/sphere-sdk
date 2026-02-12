@@ -95,10 +95,13 @@ function parseAmount(amountStr: string, decimals: number): bigint {
   return BigInt(parts[0]) * multiplier;
 }
 
-function getBalance(sphere: Sphere, coinSymbol: string): BalanceSnapshot {
+function getBalance(sphere: Sphere, coinSymbol: string, allowMissing = false): BalanceSnapshot {
   const balances = sphere.payments.getBalance();
   const bal = balances.find(b => b.symbol === coinSymbol);
-  if (!bal) return { confirmed: 0n, unconfirmed: 0n, total: 0n, tokens: 0 };
+  if (!bal) {
+    if (allowMissing) return { confirmed: 0n, unconfirmed: 0n, total: 0n, tokens: 0 };
+    throw new Error(`Coin ${coinSymbol} not found. Available: ${balances.map(b => b.symbol).join(', ') || 'none'}`);
+  }
   return {
     confirmed: BigInt(bal.confirmedAmount),
     unconfirmed: BigInt(bal.unconfirmedAmount),
@@ -213,7 +216,7 @@ async function topupAndWait(sphere: Sphere, nametag: string): Promise<void> {
 
     let allReceived = true;
     for (const coin of FAUCET_COINS) {
-      const bal = getBalance(sphere, coin.symbol);
+      const bal = getBalance(sphere, coin.symbol, true);
       if (bal.total === 0n) {
         allReceived = false;
         break;
@@ -225,7 +228,7 @@ async function topupAndWait(sphere: Sphere, nametag: string): Promise<void> {
       console.log(`  All tokens received in ${elapsed}s`);
 
       for (const coin of FAUCET_COINS) {
-        const bal = getBalance(sphere, coin.symbol);
+        const bal = getBalance(sphere, coin.symbol, true);
         const coinDef = registry.getDefinitionBySymbol(coin.symbol);
         const decimals = coinDef?.decimals ?? 0;
         console.log(`  ${coin.symbol}: ${formatBalance(bal, decimals)}`);
@@ -239,12 +242,13 @@ async function topupAndWait(sphere: Sphere, nametag: string): Promise<void> {
   // Timeout - print what we have
   console.log('  WARNING: Topup timed out. Current balances:');
   for (const coin of FAUCET_COINS) {
-    const bal = getBalance(sphere, coin.symbol);
+    const bal = getBalance(sphere, coin.symbol, true);
     const coinDef = registry.getDefinitionBySymbol(coin.symbol);
     const decimals = coinDef?.decimals ?? 0;
     console.log(`  ${coin.symbol}: ${formatBalance(bal, decimals)}`);
   }
-  throw new Error('Faucet topup timed out - not all tokens received');
+  const missing = FAUCET_COINS.filter(c => getBalance(sphere, c.symbol, true).total === 0n).map(c => c.symbol);
+  throw new Error(`Faucet topup timed out. Missing: ${missing.join(', ')}`);
 }
 
 // =============================================================================
@@ -256,27 +260,29 @@ async function waitForReceiverBalance(
   coinSymbol: string,
   expectedMinTotal: bigint,
   timeoutMs: number = TRANSFER_TIMEOUT_MS,
-): Promise<{ receiveTimeMs: number; finalBalance: BalanceSnapshot }> {
+): Promise<{ receiveTimeMs: number; finalBalance: BalanceSnapshot; timedOut: boolean }> {
   const startTime = performance.now();
 
   while (performance.now() - startTime < timeoutMs) {
     await receiver.payments.load();
-    const balance = getBalance(receiver, coinSymbol);
+    const balance = getBalance(receiver, coinSymbol, true);
 
     if (balance.total >= expectedMinTotal) {
       return {
         receiveTimeMs: performance.now() - startTime,
         finalBalance: balance,
+        timedOut: false,
       };
     }
 
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
 
-  const finalBalance = getBalance(receiver, coinSymbol);
+  const finalBalance = getBalance(receiver, coinSymbol, true);
   return {
     receiveTimeMs: performance.now() - startTime,
     finalBalance,
+    timedOut: true,
   };
 }
 
@@ -290,6 +296,9 @@ async function waitForTokenResolution(
   while (performance.now() - startTime < timeoutMs) {
     // Call resolveUnconfirmed directly (not fire-and-forget)
     const resolution = await sphere.payments.resolveUnconfirmed();
+    if (resolution.failed > 0) {
+      console.warn(`    Resolution: ${resolution.failed} token(s) failed to resolve`);
+    }
 
     // Check if all tokens for this coin are confirmed
     const bal = getBalance(sphere, coinSymbol);
@@ -399,7 +408,7 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
     await sender.payments.load();
     await receiver.payments.load();
     const senderBefore = getBalance(sender, coinSymbol);
-    const receiverBefore = getBalance(receiver, coinSymbol);
+    const receiverBefore = getBalance(receiver, coinSymbol, true);
     const tombsBefore = getTombstoneSnapshot(sender);
     result.tombstonesBefore = tombsBefore.count;
 
@@ -469,6 +478,9 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
       receiver, coinSymbol, expectedReceiverTotal, TRANSFER_TIMEOUT_MS,
     );
     result.receiveTimeMs = receiveResult.receiveTimeMs;
+    if (receiveResult.timedOut) {
+      throw new Error(`Receiver balance timeout after ${TRANSFER_TIMEOUT_MS / 1000}s. Got ${receiveResult.finalBalance.total}, expected ${expectedReceiverTotal}`);
+    }
     console.log(`    Receive detected in ${receiveResult.receiveTimeMs.toFixed(0)}ms`);
     console.log(`    Receiver balance AFTER: ${formatBalance(receiveResult.finalBalance, decimals)}`);
 
@@ -537,6 +549,9 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error(`    ERROR: ${errorMsg}`);
+    if (error instanceof Error && error.stack) {
+      console.error(error.stack);
+    }
     result.error = errorMsg;
   }
 

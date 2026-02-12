@@ -196,9 +196,10 @@ function cliSoft(cmd: string, profile?: string): CliResult {
 }
 
 function parseBalanceOutput(stdout: string, coinSymbol: string): ParsedBalance | null {
+  const esc = coinSymbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Pattern 1: with unconfirmed — "SYM: <confirmed> (+ <unconfirmed> unconfirmed) [<c>+<u> tokens]"
   const unconfirmedPattern = new RegExp(
-    `${coinSymbol}:\\s+([\\d.]+)\\s+\\(\\+\\s+([\\d.]+)\\s+unconfirmed\\)\\s+\\[(\\d+)\\+(\\d+)\\s+tokens\\]`,
+    `${esc}:\\s+([\\d.]+)\\s+\\(\\+\\s+([\\d.]+)\\s+unconfirmed\\)\\s+\\[(\\d+)\\+(\\d+)\\s+tokens\\]`,
   );
   const m1 = stdout.match(unconfirmedPattern);
   if (m1) {
@@ -211,7 +212,7 @@ function parseBalanceOutput(stdout: string, coinSymbol: string): ParsedBalance |
 
   // Pattern 2: confirmed only — "SYM: <amount> (<n> tokens)"
   const confirmedPattern = new RegExp(
-    `${coinSymbol}:\\s+([\\d.]+)\\s+\\((\\d+)\\s+tokens?\\)`,
+    `${esc}:\\s+([\\d.]+)\\s+\\((\\d+)\\s+tokens?\\)`,
   );
   const m2 = stdout.match(confirmedPattern);
   if (m2) {
@@ -260,7 +261,7 @@ function totalBalance(parsed: ParsedBalance | null, decimals: number): bigint {
 }
 
 function sleepSync(ms: number): void {
-  execSync(`sleep ${(ms / 1000).toFixed(1)}`, { stdio: 'pipe' });
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 // =============================================================================
@@ -320,6 +321,12 @@ function extractMnemonicFromInitOutput(initStdout: string): string | null {
 // =============================================================================
 // Test Infrastructure
 // =============================================================================
+
+function validateMnemonic(mnemonic: string): void {
+  if (!/^[a-z ]+$/.test(mnemonic)) {
+    throw new Error('Mnemonic contains invalid characters');
+  }
+}
 
 function assert(condition: boolean, message: string): void {
   if (!condition) {
@@ -413,6 +420,7 @@ async function main(): Promise<void> {
         // Wait for ALL coins to arrive
         console.log(`  Waiting for all coins (up to ${FAUCET_TOPUP_TIMEOUT_MS / 1000}s)...`);
         const startPoll = performance.now();
+        let faucetReady = false;
 
         while (performance.now() - startPoll < FAUCET_TOPUP_TIMEOUT_MS) {
           const { stdout } = cli('balance --finalize --no-sync', deviceAProfile);
@@ -427,6 +435,7 @@ async function main(): Promise<void> {
           }
 
           if (allReady) {
+            faucetReady = true;
             // Record per-coin totals and counts
             for (const coin of TEST_COINS) {
               const bal = parseBalanceOutput(stdout, coin.symbol)!;
@@ -440,9 +449,9 @@ async function main(): Promise<void> {
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        for (const coin of TEST_COINS) {
-          const total = deviceATotals.get(coin.symbol) ?? 0n;
-          assert(total > 0n, `Expected ${coin.symbol} balance > 0, got ${total}`);
+        if (!faucetReady) {
+          const missing = TEST_COINS.filter(c => (deviceATotals.get(c.symbol) ?? 0n) === 0n).map(c => c.symbol);
+          throw new Error(`Faucet topup timed out after ${FAUCET_TOPUP_TIMEOUT_MS / 1000}s. Missing: ${missing.join(', ')}`);
         }
 
         // Sync to IPFS
@@ -484,12 +493,14 @@ async function main(): Promise<void> {
 
         // Import from mnemonic
         console.log(`  Importing wallet from mnemonic into ${deviceBProfile}...`);
+        validateMnemonic(savedMnemonic);
         cli(`init --mnemonic "${savedMnemonic}" --nametag ${nametag}`, deviceBProfile);
 
         // Sync from IPFS — poll until ALL coins recovered
         console.log('  Syncing from IPFS (polling for IPNS resolution)...');
         let totalSyncAdded = 0;
         const startPoll = performance.now();
+        let syncReady = false;
 
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
           const result = cliSoft('sync', deviceBProfile);
@@ -509,11 +520,18 @@ async function main(): Promise<void> {
                 break;
               }
             }
-            if (allReady) break;
+            if (allReady) {
+              syncReady = true;
+              break;
+            }
           }
 
           console.log('  Not all coins yet, retrying in 5s...');
           sleepSync(POLL_INTERVAL_MS);
+        }
+
+        if (!syncReady) {
+          throw new Error(`IPFS sync timed out after ${SYNC_PROPAGATION_TIMEOUT_MS / 1000}s waiting for all coins on Device B`);
         }
 
         // Final balance check and assertions per coin
@@ -565,6 +583,7 @@ async function main(): Promise<void> {
         // Device A syncs (pulls Device B's state)
         console.log('  Device A: syncing from IPFS...');
         const startPoll = performance.now();
+        let devASynced = false;
 
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
           cliSoft('sync', deviceAProfile);
@@ -578,10 +597,17 @@ async function main(): Promise<void> {
               break;
             }
           }
-          if (allReady) break;
+          if (allReady) {
+            devASynced = true;
+            break;
+          }
 
           console.log('  Device A still syncing, retrying in 5s...');
           sleepSync(POLL_INTERVAL_MS);
+        }
+
+        if (!devASynced) {
+          throw new Error(`Device A sync timed out after ${SYNC_PROPAGATION_TIMEOUT_MS / 1000}s`);
         }
 
         // Verify convergence per coin
@@ -620,6 +646,7 @@ async function main(): Promise<void> {
 
         // Import from mnemonic WITH --no-nostr
         console.log(`  Importing wallet with --no-nostr (Nostr disabled)...`);
+        validateMnemonic(savedMnemonic);
         cli(`init --mnemonic "${savedMnemonic}" --no-nostr`, deviceCProfile);
 
         // Check balance BEFORE sync — must be 0 for ALL coins
@@ -635,6 +662,7 @@ async function main(): Promise<void> {
         console.log('  Syncing from IPFS (IPFS-only, no Nostr)...');
         let totalSyncAdded = 0;
         const startPoll = performance.now();
+        let ipfsReady = false;
 
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
           const result = cliSoft('sync --no-nostr', deviceCProfile);
@@ -658,11 +686,18 @@ async function main(): Promise<void> {
                 break;
               }
             }
-            if (allReady) break;
+            if (allReady) {
+              ipfsReady = true;
+              break;
+            }
           }
 
           console.log('  Not all coins yet (IPFS-only), retrying in 5s...');
           sleepSync(POLL_INTERVAL_MS);
+        }
+
+        if (!ipfsReady) {
+          throw new Error(`IPFS-only sync timed out after ${SYNC_PROPAGATION_TIMEOUT_MS / 1000}s waiting for all coins on Device C`);
         }
 
         // Final assertions per coin
