@@ -573,12 +573,20 @@ export class Sphere {
 
     console.log('[Sphere.import] Starting import...');
 
-    // Clear existing wallet if any (including token data)
-    console.log('[Sphere.import] Clearing existing wallet data...');
-    await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
-    console.log('[Sphere.import] Clear done');
+    // Clear existing wallet if any (including token data).
+    // Skip if no active instance and wallet doesn't exist — avoids redundant
+    // tokenStorage.clear() which deletes/reopens IndexedDB and can race with
+    // a subsequent initialize().
+    const needsClear = Sphere.instance !== null || await Sphere.exists(options.storage);
+    if (needsClear) {
+      console.log('[Sphere.import] Clearing existing wallet data...');
+      await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
+      console.log('[Sphere.import] Clear done');
+    } else {
+      console.log('[Sphere.import] No existing wallet — skipping clear');
+    }
 
-    // Reconnect storage after clear (clear may have called destroy() on the
+    // Ensure storage is connected (clear may have called destroy() on the
     // previous instance which disconnects the shared storage provider)
     if (!options.storage.isConnected()) {
       console.log('[Sphere.import] Reconnecting storage...');
@@ -2690,6 +2698,16 @@ export class Sphere {
     await this._transport.disconnect();
     await this._storage.disconnect();
     await this._oracle.disconnect();
+
+    // Shutdown token storage providers (close IndexedDB connections etc.)
+    for (const provider of this._tokenStorageProviders.values()) {
+      try {
+        await provider.shutdown();
+      } catch {
+        // Non-fatal — provider may already be closed
+      }
+    }
+    this._tokenStorageProviders.clear();
 
     this._initialized = false;
     this._identity = null;
