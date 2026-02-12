@@ -28,16 +28,26 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  mkdirSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // =============================================================================
 // Constants
 // =============================================================================
 
 const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
-const CLI_CMD = 'npx tsx cli.ts';
-const CONFIG_FILE = '.sphere-cli/config.json';
-const PROFILES_FILE = '.sphere-cli/profiles.json';
+// Absolute path to cli.ts so it works from any cwd
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const CLI_TS_PATH = resolve(SCRIPT_DIR, 'cli.ts');
+const CLI_CMD = `npx tsx ${CLI_TS_PATH}`;
+
+// Isolated working directory — all .sphere-cli* paths are relative to this
+let WORK_DIR = '';
+const CONFIG_FILE = () => join(WORK_DIR, '.sphere-cli/config.json');
+const PROFILES_FILE = () => join(WORK_DIR, '.sphere-cli/profiles.json');
 
 const POLL_INTERVAL_MS = 5_000;
 const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
@@ -79,19 +89,19 @@ interface TestResult {
 // =============================================================================
 
 function switchProfile(profileName: string): void {
-  const profilesData = readFileSync(PROFILES_FILE, 'utf8');
+  const profilesData = readFileSync(PROFILES_FILE(), 'utf8');
   const profiles = JSON.parse(profilesData) as {
     profiles: Array<{ name: string; dataDir: string; tokensDir: string; network: string }>;
   };
   const profile = profiles.profiles.find((p) => p.name === profileName);
   if (!profile) throw new Error(`Profile "${profileName}" not found`);
 
-  const config = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+  const config = JSON.parse(readFileSync(CONFIG_FILE(), 'utf8'));
   config.dataDir = profile.dataDir;
   config.tokensDir = profile.tokensDir;
   config.currentProfile = profileName;
   config.network = profile.network;
-  writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  writeFileSync(CONFIG_FILE(), JSON.stringify(config, null, 2));
 }
 
 // =============================================================================
@@ -112,6 +122,7 @@ function cli(cmd: string, profile?: string): CliResult {
     const stdout = execSync(`${CLI_CMD} ${cmd}`, {
       encoding: 'utf8',
       timeout: CLI_TIMEOUT_MS,
+      cwd: WORK_DIR,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const durationMs = performance.now() - start;
@@ -150,6 +161,7 @@ function cliSoft(cmd: string, profile?: string): CliResult {
     const stdout = execSync(`${CLI_CMD} ${cmd}`, {
       encoding: 'utf8',
       timeout: CLI_TIMEOUT_MS,
+      cwd: WORK_DIR,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     return { stdout, stderr: '', exitCode: 0, durationMs: performance.now() - start };
@@ -324,6 +336,10 @@ async function main(): Promise<void> {
   const doCleanup = process.argv.includes('--cleanup');
   const testRunId = randomBytes(3).toString('hex');
 
+  // Create isolated temp directory — all CLI state lives here
+  WORK_DIR = join(tmpdir(), `sphere-cli-e2e-${testRunId}`);
+  mkdirSync(WORK_DIR, { recursive: true });
+
   const deviceAProfile = `ipfs_sync_${testRunId}_devA`;
   const deviceBProfile = `ipfs_sync_${testRunId}_devB`;
   const nametag = `sync${testRunId}`;
@@ -337,6 +353,7 @@ async function main(): Promise<void> {
   console.log('  CLI E2E: IPFS Multi-Device Sync');
   console.log('='.repeat(70));
   console.log(`  Test run ID:   ${testRunId}`);
+  console.log(`  Work dir:      ${WORK_DIR}`);
   console.log(`  Device A:      profile=${deviceAProfile}, nametag=@${nametag}`);
   console.log(`  Device B:      profile=${deviceBProfile} (recovery from mnemonic)`);
   console.log(`  Cleanup:       ${doCleanup ? 'yes' : 'no (use --cleanup to remove dirs after)'}`);
@@ -581,19 +598,11 @@ function printResults(): void {
   }
 }
 
-function cleanup(testRunId: string): void {
-  const profiles = [
-    `ipfs_sync_${testRunId}_devA`,
-    `ipfs_sync_${testRunId}_devB`,
-  ];
-
-  console.log('\n[CLEANUP] Removing test profile directories...');
-  for (const profile of profiles) {
-    const dir = `.sphere-cli-${profile}`;
-    if (existsSync(dir)) {
-      rmSync(dir, { recursive: true, force: true });
-      console.log(`  Removed ${dir}`);
-    }
+function cleanup(_testRunId: string): void {
+  console.log('\n[CLEANUP] Removing isolated work directory...');
+  if (WORK_DIR && existsSync(WORK_DIR)) {
+    rmSync(WORK_DIR, { recursive: true, force: true });
+    console.log(`  Removed ${WORK_DIR}`);
   }
 }
 
