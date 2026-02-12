@@ -23,18 +23,27 @@ export const TRUSTBASE_URL =
   'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
 export const DEFAULT_API_KEY = 'sk_06365a9c44654841a366068bcfc68986';
 
-export const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
+export const FAUCET_TOPUP_TIMEOUT_MS = 120_000;
 export const IPNS_PROPAGATION_WAIT_MS = 10_000;
 export const IPNS_RESOLVE_TIMEOUT_MS = 90_000;
 export const POLL_INTERVAL_MS = 1_000;
 
 /**
- * Coins to faucet in multi-coin tests.
- * SOL (decimals: 9) + ETH (decimals: 18) — different decimals maximizes coverage.
+ * All faucet-supported coins for multi-coin tests.
+ * Covers every decimal variant in the testnet registry:
+ *   18 decimals: UCT, ETH
+ *    9 decimals: SOL
+ *    8 decimals: BTC
+ *    6 decimals: USDT, USDC, USDU
  */
 export const TEST_COINS = [
   { faucetName: 'solana', symbol: 'SOL', amount: 1000 },
   { faucetName: 'ethereum', symbol: 'ETH', amount: 42 },
+  { faucetName: 'bitcoin', symbol: 'BTC', amount: 1 },
+  { faucetName: 'unicity', symbol: 'UCT', amount: 100 },
+  { faucetName: 'tether', symbol: 'USDT', amount: 1000 },
+  { faucetName: 'usd-coin', symbol: 'USDC', amount: 1000 },
+  { faucetName: 'unicity-usd', symbol: 'USDU', amount: 1000 },
 ] as const;
 
 // =============================================================================

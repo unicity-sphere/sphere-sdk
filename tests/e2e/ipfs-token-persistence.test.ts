@@ -4,9 +4,10 @@
  * Proves that active (spendable) tokens survive IPFS round-trips:
  * persist, recover, merge, and spend.
  *
- * Multi-coin: tests use SOL + ETH simultaneously to verify that wallets
- * with multiple coin types (different decimals) survive IPFS round-trips,
- * recovery, spend, and merge flows.
+ * Multi-coin: tests use ALL faucet-supported coins (SOL, ETH, BTC, UCT,
+ * USDT, USDC, USDU) simultaneously to verify that wallets with multiple
+ * coin types (decimals: 6/8/9/18) survive IPFS round-trips, recovery,
+ * spend, and merge flows.
  *
  * Run with: npm run test:e2e
  */
@@ -76,7 +77,7 @@ describe('IPFS Active Token Persistence E2E', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Test 1: Create wallet, top up with SOL+ETH, sync to IPFS
+  // Test 1: Create wallet, top up with all coins, sync to IPFS
   // ---------------------------------------------------------------------------
 
   it('creates wallet, receives multi-coin tokens, and syncs to IPFS', async () => {
@@ -101,12 +102,12 @@ describe('IPFS Active Token Persistence E2E', () => {
     savedMnemonicA = generatedMnemonic!;
     console.log(`  Wallet A created: ${sphereA.identity!.l1Address}`);
 
-    // Request faucet for all coins (SOL + ETH)
+    // Request faucet for all coins
     console.log(`  Requesting multi-coin faucet for @${savedNametagA}...`);
     await requestMultiCoinFaucet(savedNametagA);
 
     // Wait for ALL coins to arrive
-    console.log('  Waiting for all coins (SOL + ETH)...');
+    console.log(`  Waiting for all ${TEST_COINS.length} coins...`);
     originalBalances = await waitForAllCoins(sphereA, FAUCET_TOPUP_TIMEOUT_MS);
 
     // Record original state per coin
@@ -141,7 +142,7 @@ describe('IPFS Active Token Persistence E2E', () => {
     console.log(`  Sync result: added=${syncResult.added}, removed=${syncResult.removed}`);
 
     console.log('[Test 1] PASSED: multi-coin wallet created, tokens received, synced to IPFS');
-  }, 180_000);
+  }, 240_000);
 
   // ---------------------------------------------------------------------------
   // Test 2: Recover multi-coin tokens from IPFS after local wipe
@@ -260,7 +261,7 @@ describe('IPFS Active Token Persistence E2E', () => {
     await sphereA.payments.load();
 
     console.log('[Test 2] PASSED: all multi-coin tokens recovered exclusively from IPFS (no Nostr)');
-  }, 180_000);
+  }, 240_000);
 
   // ---------------------------------------------------------------------------
   // Test 3: Spend recovered tokens (proves they are truly usable) — per coin
@@ -445,5 +446,5 @@ describe('IPFS Active Token Persistence E2E', () => {
     }
 
     console.log('[Test 4] PASSED: local + IPFS multi-coin tokens merged correctly');
-  }, 300_000);
+  }, 360_000);
 });

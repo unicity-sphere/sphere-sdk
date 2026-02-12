@@ -3,15 +3,16 @@
  * E2E CLI Test: IPFS Multi-Device Sync
  *
  * Tests the exact user scenario:
- *   1. Create wallet, register nametag, top up with faucet (SOL + ETH)
+ *   1. Create wallet, register nametag, top up with faucet (all coins)
  *   2. Sync to IPFS (push inventory)
  *   3. ERASE ALL local data for this wallet
  *   4. Re-create wallet from saved mnemonic
  *   5. Sync from IPFS and verify complete inventory recovery
  *
- * Multi-coin: tests use SOL + ETH simultaneously to verify that wallets
- * with multiple coin types (different decimals) survive CLI balance/sync
- * round-trips and recovery flows.
+ * Multi-coin: tests use ALL faucet-supported coins (SOL, ETH, BTC, UCT,
+ * USDT, USDC, USDU) simultaneously to verify that wallets with multiple
+ * coin types (decimals: 6/8/9/18) survive CLI balance/sync round-trips
+ * and recovery flows.
  *
  * IMPORTANT: Unlike the vitest E2E test, CLI tests cannot use a no-op
  * transport because each CLI invocation creates a full Sphere instance
@@ -54,20 +55,28 @@ const CONFIG_FILE = () => join(WORK_DIR, '.sphere-cli/config.json');
 const PROFILES_FILE = () => join(WORK_DIR, '.sphere-cli/profiles.json');
 
 const POLL_INTERVAL_MS = 5_000;
-const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
+const FAUCET_TOPUP_TIMEOUT_MS = 120_000;
 const SYNC_PROPAGATION_TIMEOUT_MS = 90_000;
 const CLI_TIMEOUT_MS = 300_000;
 
 const COIN_DECIMALS: Record<string, number> = {
-  UCT: 8,
+  UCT: 18,
   SOL: 9,
   BTC: 8,
   ETH: 18,
+  USDT: 6,
+  USDC: 6,
+  USDU: 6,
 };
 
 const TEST_COINS = [
   { faucetName: 'solana', symbol: 'SOL', decimals: 9, amount: 1000 },
   { faucetName: 'ethereum', symbol: 'ETH', decimals: 18, amount: 42 },
+  { faucetName: 'bitcoin', symbol: 'BTC', decimals: 8, amount: 1 },
+  { faucetName: 'unicity', symbol: 'UCT', decimals: 18, amount: 100 },
+  { faucetName: 'tether', symbol: 'USDT', decimals: 6, amount: 1000 },
+  { faucetName: 'usd-coin', symbol: 'USDC', decimals: 6, amount: 1000 },
+  { faucetName: 'unicity-usd', symbol: 'USDU', decimals: 6, amount: 1000 },
 ] as const;
 
 // =============================================================================
@@ -360,7 +369,7 @@ async function main(): Promise<void> {
   const deviceATokenCounts = new Map<string, number>();
 
   console.log('='.repeat(70));
-  console.log('  CLI E2E: IPFS Multi-Device Sync (Multi-Coin: SOL + ETH)');
+  console.log(`  CLI E2E: IPFS Multi-Device Sync (Multi-Coin: ${TEST_COINS.map(c => c.symbol).join(' + ')})`);
   console.log('='.repeat(70));
   console.log(`  Test run ID:   ${testRunId}`);
   console.log(`  Work dir:      ${WORK_DIR}`);
@@ -373,7 +382,7 @@ async function main(): Promise<void> {
 
   try {
     // =========================================================================
-    // Test 1: Create wallet on Device A, top up (SOL+ETH), sync to IPFS
+    // Test 1: Create wallet on Device A, top up (all coins), sync to IPFS
     // =========================================================================
     await runTest(
       '1. Device A: create wallet, receive multi-coin tokens, sync to IPFS',

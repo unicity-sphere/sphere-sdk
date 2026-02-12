@@ -9,11 +9,12 @@
  * tokens can ONLY arrive via IPFS sync, eliminating false positives where
  * Nostr re-delivers tokens to the same identity.
  *
- * Multi-coin: tests use SOL + ETH simultaneously to verify that wallets
- * with multiple coin types (different decimals) survive IPFS round-trips.
+ * Multi-coin: tests use ALL faucet-supported coins (SOL, ETH, BTC, UCT,
+ * USDT, USDC, USDU) simultaneously to verify that wallets with multiple
+ * coin types (decimals: 6/8/9/18) survive IPFS round-trips.
  *
  * Test flow (user's requested scenario):
- *   1. Create wallet, receive SOL+ETH tokens via Nostr, sync to IPFS
+ *   1. Create wallet, receive all coin tokens via Nostr, sync to IPFS
  *   2. ERASE ALL LOCAL DATA, recreate from mnemonic WITHOUT Nostr,
  *      verify tokens recovered exclusively from IPFS
  *   3. Full recovery: erase + recreate with Nostr, verify IPFS + Nostr merge
@@ -78,7 +79,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // Test 1: Create wallet, top up with SOL+ETH, sync to IPFS
+  // Test 1: Create wallet, top up with all coins, sync to IPFS
   // ---------------------------------------------------------------------------
 
   it(
@@ -105,12 +106,12 @@ describe('IPFS Multi-Device Sync E2E', () => {
       expect(generatedMnemonic).toBeTruthy();
       savedMnemonic = generatedMnemonic!;
 
-      // Request faucet for all coins (SOL + ETH)
+      // Request faucet for all coins
       console.log(`  Requesting multi-coin faucet for @${savedNametag}...`);
       await requestMultiCoinFaucet(savedNametag);
 
       // Wait for ALL coins to arrive via Nostr
-      console.log('  Waiting for all coins (SOL + ETH)...');
+      console.log(`  Waiting for all ${TEST_COINS.length} coins...`);
       originalBalances = await waitForAllCoins(
         sphere,
         FAUCET_TOPUP_TIMEOUT_MS,
@@ -164,7 +165,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
 
       console.log('[Test 1] PASSED: multi-coin tokens received and synced to IPFS');
     },
-    180_000,
+    240_000,
   );
 
   // ---------------------------------------------------------------------------
@@ -273,7 +274,7 @@ describe('IPFS Multi-Device Sync E2E', () => {
         `[Test 2] PASSED: recovered multi-coin tokens exclusively from IPFS (no Nostr)`,
       );
     },
-    180_000,
+    240_000,
   );
 
   // ---------------------------------------------------------------------------
@@ -355,6 +356,6 @@ describe('IPFS Multi-Device Sync E2E', () => {
         `[Test 3] PASSED: full multi-coin recovery with IPFS + Nostr`,
       );
     },
-    180_000,
+    240_000,
   );
 });
