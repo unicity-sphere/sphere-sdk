@@ -154,6 +154,22 @@ function parseBalanceOutput(stdout: string, coinSymbol: string): ParsedBalance |
 }
 
 /**
+ * Parse balance output, throwing if parsing fails.
+ * Use in critical paths where a null result indicates a CLI format change, not a zero balance.
+ */
+function requireParsedBalance(stdout: string, coinSymbol: string, context: string): ParsedBalance {
+  const parsed = parseBalanceOutput(stdout, coinSymbol);
+  if (!parsed) {
+    const relevantLines = stdout.split('\n').filter(l => l.includes(coinSymbol) || l.includes('balance')).join('\n  ');
+    throw new Error(
+      `Failed to parse ${coinSymbol} balance (${context}). ` +
+      `CLI output may have changed format.\n  Relevant output:\n  ${relevantLines || stdout.trim()}`
+    );
+  }
+  return parsed;
+}
+
+/**
  * Convert a human-readable amount string to bigint in smallest units.
  * e.g. "1.5" with 8 decimals → 150000000n
  */
@@ -204,14 +220,16 @@ function waitForBalance(
           };
         }
       }
-    } catch {
-      // CLI may fail transiently; keep polling
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(`    [poll] Transient CLI error: ${msg.split('\n')[0]}`);
     }
 
     sleepSync(POLL_INTERVAL_MS);
   }
 
   // Final check
+  console.warn(`    WARNING: waitForBalance timed out after ${(timeoutMs / 1000).toFixed(0)}s for ${coinSymbol}`);
   const { balance: parsed } = readBalance(profile, coinSymbol);
   return {
     balance: parsed || { confirmed: '0', unconfirmed: '0', tokens: 0 },
@@ -350,10 +368,10 @@ function runTransferTest(config: TransferTestConfig): TestResult {
 
   try {
     // 1. Snapshot sender balance BEFORE (use --finalize for Nostr sync)
-    const { balance: senderBefore } = readBalance(senderProfile, coinSymbol);
-    const senderBeforeTotal = senderBefore
-      ? parseAmountToSmallest(senderBefore.confirmed, decimals) + parseAmountToSmallest(senderBefore.unconfirmed, decimals)
-      : 0n;
+    const { stdout: senderBeforeOut } = cli('balance --finalize', senderProfile);
+    const senderBefore = requireParsedBalance(senderBeforeOut, coinSymbol, 'sender BEFORE');
+    const senderBeforeTotal = parseAmountToSmallest(senderBefore.confirmed, decimals)
+      + parseAmountToSmallest(senderBefore.unconfirmed, decimals);
 
     // 2. Snapshot receiver balance BEFORE
     const { balance: receiverBefore } = readBalance(receiverProfile, coinSymbol);
@@ -361,7 +379,7 @@ function runTransferTest(config: TransferTestConfig): TestResult {
       ? parseAmountToSmallest(receiverBefore.confirmed, decimals) + parseAmountToSmallest(receiverBefore.unconfirmed, decimals)
       : 0n;
 
-    console.log(`[1] Sender BEFORE:   ${senderBefore?.confirmed ?? '0'} ${coinSymbol} (${senderBefore?.tokens ?? 0} tokens)`);
+    console.log(`[1] Sender BEFORE:   ${senderBefore.confirmed} ${coinSymbol} (${senderBefore.tokens} tokens)`);
     console.log(`    Receiver BEFORE: ${receiverBefore?.confirmed ?? '0'} ${coinSymbol} (${receiverBefore?.tokens ?? 0} tokens)`);
 
     // Check sufficient balance
@@ -408,10 +426,10 @@ function runTransferTest(config: TransferTestConfig): TestResult {
       + parseAmountToSmallest(senderAfter.unconfirmed, decimals);
 
     // 7. Re-read receiver balance after finalization for accurate verification
-    const { balance: receiverFinal } = readBalance(receiverProfile, coinSymbol);
-    const receiverFinalTotal = receiverFinal
-      ? parseAmountToSmallest(receiverFinal.confirmed, decimals) + parseAmountToSmallest(receiverFinal.unconfirmed, decimals)
-      : 0n;
+    const { stdout: receiverFinalOut } = cli('balance --finalize', receiverProfile);
+    const receiverFinal = requireParsedBalance(receiverFinalOut, coinSymbol, 'receiver FINAL');
+    const receiverFinalTotal = parseAmountToSmallest(receiverFinal.confirmed, decimals)
+      + parseAmountToSmallest(receiverFinal.unconfirmed, decimals);
 
     // 8. Verify balance conservation
     const senderDelta = senderBeforeTotal - senderAfterTotal;

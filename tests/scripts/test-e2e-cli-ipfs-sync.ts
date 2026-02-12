@@ -237,6 +237,7 @@ function parseSyncOutput(stdout: string): { added: number; removed: number } {
   if (stdout.includes('Up to date')) {
     return { added: 0, removed: 0 };
   }
+  console.warn(`    [sync] Unrecognized sync output format: ${stdout.trim().split('\n')[0]}`);
   return { added: 0, removed: 0 };
 }
 
