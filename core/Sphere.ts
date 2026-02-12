@@ -57,6 +57,8 @@ import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
+import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
+import type { GroupChatModuleConfig } from '../modules/groupchat';
 import {
   STORAGE_KEYS_GLOBAL,
   STORAGE_KEYS_ADDRESS,
@@ -64,6 +66,7 @@ import {
   DEFAULT_BASE_PATH,
   LIMITS,
   DEFAULT_ENCRYPTION_KEY,
+  NETWORKS,
   type NetworkType,
 } from '../constants';
 import {
@@ -144,6 +147,8 @@ export interface SphereCreateOptions {
    * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
    */
   network?: NetworkType;
+  /** Group chat configuration (NIP-29). Omit to disable groupchat. */
+  groupChat?: GroupChatModuleConfig | boolean;
 }
 
 /** Options for loading existing wallet */
@@ -166,6 +171,8 @@ export interface SphereLoadOptions {
    * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
    */
   network?: NetworkType;
+  /** Group chat configuration (NIP-29). Omit to disable groupchat. */
+  groupChat?: GroupChatModuleConfig | boolean;
 }
 
 /** Options for importing a wallet */
@@ -196,6 +203,8 @@ export interface SphereImportOptions {
   l1?: L1Config;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
+  /** Group chat configuration (NIP-29). Omit to disable groupchat. */
+  groupChat?: GroupChatModuleConfig | boolean;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -236,6 +245,13 @@ export interface SphereInitOptions {
    * Use createBrowserProviders({ network: 'testnet' }) to set up testnet providers.
    */
   network?: NetworkType;
+  /**
+   * Group chat configuration (NIP-29).
+   * - `true`: Enable with network-default relays
+   * - `GroupChatModuleConfig`: Enable with custom config
+   * - Omit/undefined: No groupchat module
+   */
+  groupChat?: GroupChatModuleConfig | boolean;
 }
 
 /** Result of init operation */
@@ -321,6 +337,7 @@ export class Sphere {
   // Modules
   private _payments: PaymentsModule;
   private _communications: CommunicationsModule;
+  private _groupChat: GroupChatModule | null = null;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -336,6 +353,7 @@ export class Sphere {
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
     l1Config?: L1Config,
     priceProvider?: PriceProvider,
+    groupChatConfig?: GroupChatModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -349,6 +367,7 @@ export class Sphere {
 
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule();
+    this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
   }
 
   // ===========================================================================
@@ -405,6 +424,9 @@ export class Sphere {
    * ```
    */
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
+    // Resolve groupChat config: true → use network-default relays
+    const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
+
     const walletExists = await Sphere.exists(options.storage);
 
     if (walletExists) {
@@ -416,6 +438,7 @@ export class Sphere {
         tokenStorage: options.tokenStorage,
         l1: options.l1,
         price: options.price,
+        groupChat,
       });
       return { sphere, created: false };
     }
@@ -447,9 +470,38 @@ export class Sphere {
       nametag: options.nametag,
       l1: options.l1,
       price: options.price,
+      groupChat,
     });
 
     return { sphere, created: true, generatedMnemonic };
+  }
+
+  /**
+   * Resolve groupChat config from init/create/load options.
+   * - `true` → use network-default relays
+   * - `GroupChatModuleConfig` → pass through
+   * - `undefined` → no groupchat
+   */
+  /**
+   * Resolve GroupChat config from Sphere.init() options.
+   * Note: impl/shared/resolvers.ts has a similar resolver for provider-level config
+   * (different input shape: { enabled?, relays? }). Both fill relay URLs from network defaults.
+   */
+  private static resolveGroupChatConfig(
+    config: GroupChatModuleConfig | boolean | undefined,
+    network?: NetworkType,
+  ): GroupChatModuleConfig | undefined {
+    if (!config) return undefined;
+    if (config === true) {
+      const netConfig = network ? NETWORKS[network] : NETWORKS.mainnet;
+      return { relays: [...netConfig.groupRelays] };
+    }
+    // If relays not specified, fill from network defaults
+    if (!config.relays || config.relays.length === 0) {
+      const netConfig = network ? NETWORKS[network] : NETWORKS.mainnet;
+      return { ...config, relays: [...netConfig.groupRelays] };
+    }
+    return config;
   }
 
   /**
@@ -466,6 +518,8 @@ export class Sphere {
       throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
     }
 
+    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
+
     const sphere = new Sphere(
       options.storage,
       options.transport,
@@ -473,6 +527,7 @@ export class Sphere {
       options.tokenStorage,
       options.l1,
       options.price,
+      groupChatConfig,
     );
 
     // Store encrypted mnemonic
@@ -522,6 +577,8 @@ export class Sphere {
       throw new Error('No wallet found. Use Sphere.create() to create a new wallet.');
     }
 
+    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
+
     const sphere = new Sphere(
       options.storage,
       options.transport,
@@ -529,6 +586,7 @@ export class Sphere {
       options.tokenStorage,
       options.l1,
       options.price,
+      groupChatConfig,
     );
 
     // Load identity from storage
@@ -586,6 +644,8 @@ export class Sphere {
       console.log('[Sphere.import] Storage reconnected');
     }
 
+    const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
+
     const sphere = new Sphere(
       options.storage,
       options.transport,
@@ -593,6 +653,7 @@ export class Sphere {
       options.tokenStorage,
       options.l1,
       options.price,
+      groupChatConfig,
     );
 
     if (options.mnemonic) {
@@ -789,6 +850,11 @@ export class Sphere {
   get communications(): CommunicationsModule {
     this.ensureReady();
     return this._communications;
+  }
+
+  /** Group chat module (NIP-29). Null if not configured. */
+  get groupChat(): GroupChatModule | null {
+    return this._groupChat;
   }
 
   // ===========================================================================
@@ -1915,8 +1981,15 @@ export class Sphere {
       emitEvent,
     });
 
+    this._groupChat?.initialize({
+      identity: this._identity!,
+      storage: this._storage,
+      emitEvent,
+    });
+
     await this._payments.load();
     await this._communications.load();
+    await this._groupChat?.load();
   }
 
   /**
@@ -2648,6 +2721,7 @@ export class Sphere {
   async destroy(): Promise<void> {
     this._payments.destroy();
     this._communications.destroy();
+    this._groupChat?.destroy();
 
     await this._transport.disconnect();
     await this._storage.disconnect();
@@ -2965,8 +3039,15 @@ export class Sphere {
       emitEvent,
     });
 
+    this._groupChat?.initialize({
+      identity: this._identity!,
+      storage: this._storage,
+      emitEvent,
+    });
+
     await this._payments.load();
     await this._communications.load();
+    await this._groupChat?.load();
   }
 
   // ===========================================================================

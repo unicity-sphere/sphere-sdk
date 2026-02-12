@@ -35,6 +35,7 @@ import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { NetworkType } from '../../constants';
+import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import {
@@ -49,6 +50,7 @@ import {
   resolvePriceConfig,
   resolveArrayConfig,
   getNetworkConfig,
+  resolveGroupChatConfig,
 } from '../shared';
 
 // =============================================================================
@@ -174,6 +176,8 @@ export interface BrowserProvidersConfig {
   tokenSync?: TokenSyncConfig;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
+  /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
+  groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
 }
 
 export interface BrowserProviders {
@@ -188,6 +192,8 @@ export interface BrowserProviders {
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** Group chat config (resolved, for passing to Sphere.init) */
+  groupChat?: GroupChatModuleConfig | boolean;
   /**
    * Token sync configuration (resolved from tokenSync options)
    * For advanced use cases when additional sync backends are needed
@@ -365,8 +371,12 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
       })
     : undefined;
 
+  // Resolve group chat config
+  const groupChat = resolveGroupChatConfig(network, config?.groupChat);
+
   return {
     storage,
+    groupChat,
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,
       timeout: transportConfig.timeout,

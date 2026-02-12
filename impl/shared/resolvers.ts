@@ -13,6 +13,7 @@ import type {
   ResolvedOracleConfig,
 } from './config';
 import type { PriceProviderConfig } from '../../price';
+import type { GroupChatModuleConfig } from '../../modules/groupchat';
 
 // =============================================================================
 // Network Resolution
@@ -230,4 +231,35 @@ export function resolveArrayConfig<T>(
   }
 
   return result;
+}
+
+// =============================================================================
+// Group Chat Resolution
+// =============================================================================
+
+/**
+ * Resolve group chat configuration for provider factories.
+ * @param network - Network type for default relay URLs
+ * @param config - User-provided group chat config (true, object, or undefined)
+ * @returns Resolved GroupChatModuleConfig or undefined if disabled
+ */
+export function resolveGroupChatConfig(
+  network: NetworkType,
+  config?: { enabled?: boolean; relays?: string[] } | boolean,
+): GroupChatModuleConfig | undefined {
+  if (!config) return undefined;
+
+  if (config === true) {
+    const netConfig = getNetworkConfig(network);
+    return { relays: [...netConfig.groupRelays] };
+  }
+
+  if (typeof config === 'object' && config.enabled === false) {
+    return undefined;
+  }
+
+  const netConfig = getNetworkConfig(network);
+  return {
+    relays: config.relays ?? [...netConfig.groupRelays],
+  };
 }

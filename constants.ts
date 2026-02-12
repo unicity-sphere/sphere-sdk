@@ -46,6 +46,16 @@ export const STORAGE_KEYS_GLOBAL = {
   TRACKED_ADDRESSES: 'tracked_addresses',
   /** Last processed Nostr wallet event timestamp (unix seconds), keyed per pubkey */
   LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
+  /** Group chat: joined groups */
+  GROUP_CHAT_GROUPS: 'group_chat_groups',
+  /** Group chat: messages */
+  GROUP_CHAT_MESSAGES: 'group_chat_messages',
+  /** Group chat: members */
+  GROUP_CHAT_MEMBERS: 'group_chat_members',
+  /** Group chat: processed event IDs for deduplication */
+  GROUP_CHAT_PROCESSED_EVENTS: 'group_chat_processed_events',
+  /** Group chat: last used relay URL (stale data detection) */
+  GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
 } as const;
 
 /**
@@ -133,6 +143,45 @@ export const NOSTR_EVENT_KINDS = {
   NAMETAG_BINDING: 30078,
   /** Public broadcast */
   BROADCAST: 1,
+} as const;
+
+/**
+ * NIP-29 Event Kinds for relay-based group chat
+ * https://github.com/nostr-protocol/nips/blob/master/29.md
+ */
+export const NIP29_KINDS = {
+  /** Chat message sent to group */
+  CHAT_MESSAGE: 9,
+  /** Thread root message */
+  THREAD_ROOT: 11,
+  /** Thread reply message */
+  THREAD_REPLY: 12,
+  /** User join request */
+  JOIN_REQUEST: 9021,
+  /** User leave request */
+  LEAVE_REQUEST: 9022,
+  /** Admin: add/update user */
+  PUT_USER: 9000,
+  /** Admin: remove user */
+  REMOVE_USER: 9001,
+  /** Admin: edit group metadata */
+  EDIT_METADATA: 9002,
+  /** Admin: delete event */
+  DELETE_EVENT: 9005,
+  /** Admin: create group */
+  CREATE_GROUP: 9007,
+  /** Admin: delete group */
+  DELETE_GROUP: 9008,
+  /** Admin: create invite code */
+  CREATE_INVITE: 9009,
+  /** Relay-signed group metadata */
+  GROUP_METADATA: 39000,
+  /** Relay-signed group admins */
+  GROUP_ADMINS: 39001,
+  /** Relay-signed group members */
+  GROUP_MEMBERS: 39002,
+  /** Relay-signed group roles */
+  GROUP_ROLES: 39003,
 } as const;
 
 // =============================================================================
@@ -236,6 +285,11 @@ export const TEST_NOSTR_RELAYS = [
   'wss://nostr-relay.testnet.unicity.network',
 ] as const;
 
+/** Default group chat relays (NIP-29 Zooid relay) */
+export const DEFAULT_GROUP_RELAYS = [
+  'wss://sphere-relay.unicity.network',
+] as const;
+
 /** Network configurations */
 export const NETWORKS = {
   mainnet: {
@@ -244,6 +298,7 @@ export const NETWORKS = {
     nostrRelays: DEFAULT_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: DEFAULT_ELECTRUM_URL,
+    groupRelays: DEFAULT_GROUP_RELAYS,
   },
   testnet: {
     name: 'Testnet',
@@ -251,6 +306,7 @@ export const NETWORKS = {
     nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: TEST_ELECTRUM_URL,
+    groupRelays: DEFAULT_GROUP_RELAYS,
   },
   dev: {
     name: 'Development',
@@ -258,6 +314,7 @@ export const NETWORKS = {
     nostrRelays: TEST_NOSTR_RELAYS,
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: TEST_ELECTRUM_URL,
+    groupRelays: DEFAULT_GROUP_RELAYS,
   },
 } as const;
 

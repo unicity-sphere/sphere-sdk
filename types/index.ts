@@ -381,7 +381,14 @@ export type SphereEventType =
   | 'address:activated'
   | 'address:hidden'
   | 'address:unhidden'
-  | 'sync:remote-update';
+  | 'sync:remote-update'
+  | 'groupchat:message'
+  | 'groupchat:joined'
+  | 'groupchat:left'
+  | 'groupchat:kicked'
+  | 'groupchat:group_deleted'
+  | 'groupchat:updated'
+  | 'groupchat:connection';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -406,6 +413,13 @@ export interface SphereEventMap {
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
   'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
+  'groupchat:message': import('../modules/groupchat/types').GroupMessageData;
+  'groupchat:joined': { groupId: string; groupName: string };
+  'groupchat:left': { groupId: string };
+  'groupchat:kicked': { groupId: string; groupName: string };
+  'groupchat:group_deleted': { groupId: string; groupName: string };
+  'groupchat:updated': Record<string, never>;
+  'groupchat:connection': { connected: boolean };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (

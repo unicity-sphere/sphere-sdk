@@ -34,6 +34,7 @@ import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import type { NetworkType } from '../../constants';
+import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { IpfsStorageConfig } from '../shared/ipfs';
 import {
   type BaseTransportConfig,
@@ -45,6 +46,7 @@ import {
   resolveOracleConfig,
   resolveL1Config,
   resolvePriceConfig,
+  resolveGroupChatConfig,
 } from '../shared';
 
 // =============================================================================
@@ -104,6 +106,8 @@ export interface NodeProvidersConfig {
   price?: BasePriceConfig;
   /** Token sync backends configuration */
   tokenSync?: NodeTokenSyncConfig;
+  /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
+  groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
 }
 
 export interface NodeProviders {
@@ -117,6 +121,8 @@ export interface NodeProviders {
   price?: PriceProvider;
   /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
+  /** Group chat config (resolved, for passing to Sphere.init) */
+  groupChat?: GroupChatModuleConfig | boolean;
 }
 
 // =============================================================================
@@ -178,8 +184,12 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
     : undefined;
 
+  // Resolve group chat config
+  const groupChat = resolveGroupChatConfig(network, config?.groupChat);
+
   return {
     storage,
+    groupChat,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
     }),
