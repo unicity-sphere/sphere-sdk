@@ -140,26 +140,6 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
    * Subscribe to storage events
    */
   onEvent?(callback: StorageEventCallback): () => void;
-
-  /**
-   * Save individual token (for file-based storage like lottery pattern)
-   */
-  saveToken?(tokenId: string, tokenData: unknown): Promise<void>;
-
-  /**
-   * Get individual token
-   */
-  getToken?(tokenId: string): Promise<unknown | null>;
-
-  /**
-   * List all token IDs
-   */
-  listTokenIds?(): Promise<string[]>;
-
-  /**
-   * Delete individual token
-   */
-  deleteToken?(tokenId: string): Promise<void>;
 }
 
 // =============================================================================

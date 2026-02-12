@@ -100,15 +100,22 @@ export function mergeTxfData<T extends TxfStorageDataBase>(
     'tokenId',
   );
 
+  // 7. Merge nametags — union by name, local wins on conflict
+  type NametagEntry = { name: string; [key: string]: unknown };
+  const localNametags = (local._nametags ?? []) as NametagEntry[];
+  const remoteNametags = (remote._nametags ?? []) as NametagEntry[];
+  const mergedNametags = mergeNametagsByName(localNametags, remoteNametags);
+
   // Build merged result
   const merged = {
     _meta: mergedMeta,
     _tombstones: mergedTombstones.length > 0 ? mergedTombstones : undefined,
+    _nametags: mergedNametags.length > 0 ? mergedNametags : undefined,
     _outbox: mergedOutbox.length > 0 ? mergedOutbox : undefined,
     _sent: mergedSent.length > 0 ? mergedSent : undefined,
     _invalid: mergedInvalid.length > 0 ? mergedInvalid : undefined,
     ...mergedTokens,
-  } as T;
+  } as unknown as T;
 
   return { merged, added, removed, conflicts };
 }
@@ -145,14 +152,14 @@ function mergeTombstones(
 function getTokenKeys(data: TxfStorageDataBase): Set<string> {
   const reservedKeys = new Set([
     '_meta', '_tombstones', '_outbox', '_sent', '_invalid',
-    '_nametag', '_mintOutbox', '_invalidatedNametags', '_integrity',
+    '_nametag', '_nametags', '_mintOutbox', '_invalidatedNametags', '_integrity',
   ]);
   const keys = new Set<string>();
 
   for (const key of Object.keys(data)) {
     if (reservedKeys.has(key)) continue;
-    // Exclude archived, forked, and nametag entries from token merge
-    if (key.startsWith('archived-') || key.startsWith('_forked_') || key.startsWith('nametag-')) continue;
+    // Exclude archived and forked entries from token merge
+    if (key.startsWith('archived-') || key.startsWith('_forked_')) continue;
     keys.add(key);
   }
 
@@ -179,6 +186,28 @@ function isTokenTombstoned(
   void localToken;
   void remoteToken;
   return false;
+}
+
+/**
+ * Merge nametag arrays by name, deduplicating.
+ * On duplicates, keep the local entry.
+ */
+function mergeNametagsByName(
+  local: Array<{ name: string; [key: string]: unknown }>,
+  remote: Array<{ name: string; [key: string]: unknown }>,
+): Array<{ name: string; [key: string]: unknown }> {
+  const seen = new Map<string, { name: string; [key: string]: unknown }>();
+
+  for (const item of local) {
+    if (item.name) seen.set(item.name, item);
+  }
+  for (const item of remote) {
+    if (item.name && !seen.has(item.name)) {
+      seen.set(item.name, item);
+    }
+  }
+
+  return Array.from(seen.values());
 }
 
 /**

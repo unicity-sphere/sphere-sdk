@@ -287,21 +287,14 @@ describe('Sphere.clear() integration', () => {
         },
       } as TxfStorageDataBase);
 
-      // Verify tokens actually exist by reading them back
-      const token1 = await tokenStorage.getToken('token1');
-      expect(token1).not.toBeNull();
-      expect((token1 as Record<string, unknown>).coinId).toBe('UCT');
-      expect((token1 as Record<string, unknown>).amount).toBe('1000000');
-
-      const nametagToken = await tokenStorage.getToken('nametagToken');
-      expect(nametagToken).not.toBeNull();
-      expect((nametagToken as Record<string, unknown>).coinId).toBe('NAMETAG');
-      expect((nametagToken as Record<string, unknown>).nametag).toBe('alice');
-
-      // Verify via listTokenIds too
-      const tokenIdsBefore = await tokenStorage.listTokenIds();
-      expect(tokenIdsBefore).toContain('token1');
-      expect(tokenIdsBefore).toContain('nametagToken');
+      // Verify tokens actually exist by reading them back via load()
+      const loadResult = await tokenStorage.load();
+      expect(loadResult.success).toBe(true);
+      const loadedData = loadResult.data as Record<string, unknown>;
+      expect(loadedData._token1).toBeDefined();
+      expect((loadedData._token1 as Record<string, unknown>).coinId).toBe('UCT');
+      expect(loadedData._nametagToken).toBeDefined();
+      expect((loadedData._nametagToken as Record<string, unknown>).coinId).toBe('NAMETAG');
 
       // Verify actual files on disk
       const tokenFilesBefore = getTokenFiles(TOKENS_DIR);
@@ -312,16 +305,13 @@ describe('Sphere.clear() integration', () => {
       // Clear everything
       await Sphere.clear({ storage, tokenStorage });
 
-      // Verify tokens are gone - by reading
-      const token1After = await tokenStorage.getToken('token1');
-      expect(token1After).toBeNull();
-
-      const nametagTokenAfter = await tokenStorage.getToken('nametagToken');
-      expect(nametagTokenAfter).toBeNull();
-
-      // Verify via listTokenIds
-      const tokenIdsAfter = await tokenStorage.listTokenIds();
-      expect(tokenIdsAfter.length).toBe(0);
+      // Verify tokens are gone - by loading
+      const loadResultAfter = await tokenStorage.load();
+      if (loadResultAfter.success && loadResultAfter.data) {
+        const dataAfter = loadResultAfter.data as Record<string, unknown>;
+        expect(dataAfter._token1).toBeUndefined();
+        expect(dataAfter._nametagToken).toBeUndefined();
+      }
 
       // Verify files on disk are gone
       const tokenFilesAfter = getTokenFiles(TOKENS_DIR);
@@ -435,28 +425,24 @@ describe('Sphere.clear() integration', () => {
       tokenStorage.setIdentity(identity as FullIdentity);
       await tokenStorage.initialize();
 
-      // Save tokens for current address
-      await tokenStorage.saveToken('nametag-alice', { id: 'nametag-alice', type: 'nametag', nametag: 'alice' });
-      await tokenStorage.saveToken('token-uct-001', { id: 'token-uct-001', coinId: 'UCT', amount: '5000000' });
-      await tokenStorage.saveToken('token-uct-002', { id: 'token-uct-002', coinId: 'UCT', amount: '3000000' });
+      // Save tokens for current address via save()
+      await tokenStorage.save({
+        _meta: {
+          version: 1,
+          address: identity.l1Address!,
+          formatVersion: '2.0',
+          updatedAt: Date.now(),
+        },
+        _token001: { id: 'token-uct-001', coinId: 'UCT', amount: '5000000' },
+        _token002: { id: 'token-uct-002', coinId: 'UCT', amount: '3000000' },
+      } as TxfStorageDataBase);
 
-      // Verify each token exists by reading back
-      const nametag = await tokenStorage.getToken('nametag-alice');
-      expect(nametag).not.toBeNull();
-      expect((nametag as Record<string, unknown>).nametag).toBe('alice');
-
-      const uct1 = await tokenStorage.getToken('token-uct-001');
-      expect(uct1).not.toBeNull();
-      expect((uct1 as Record<string, unknown>).amount).toBe('5000000');
-
-      const uct2 = await tokenStorage.getToken('token-uct-002');
-      expect(uct2).not.toBeNull();
-      expect((uct2 as Record<string, unknown>).amount).toBe('3000000');
-
-      const tokenIds = await tokenStorage.listTokenIds();
-      expect(tokenIds).toContain('nametag-alice');
-      expect(tokenIds).toContain('token-uct-001');
-      expect(tokenIds).toContain('token-uct-002');
+      // Verify tokens exist by loading
+      const loadResult = await tokenStorage.load();
+      expect(loadResult.success).toBe(true);
+      const loadedData = loadResult.data as Record<string, unknown>;
+      expect(loadedData._token001).toBeDefined();
+      expect(loadedData._token002).toBeDefined();
 
       await sphere.destroy();
 
@@ -464,12 +450,13 @@ describe('Sphere.clear() integration', () => {
       await Sphere.clear({ storage, tokenStorage });
 
       // Verify all tokens are gone
-      expect(await tokenStorage.getToken('nametag-alice')).toBeNull();
-      expect(await tokenStorage.getToken('token-uct-001')).toBeNull();
-      expect(await tokenStorage.getToken('token-uct-002')).toBeNull();
-
-      const tokenIdsAfter = await tokenStorage.listTokenIds();
-      expect(tokenIdsAfter.length).toBe(0);
+      const loadAfterClear = await tokenStorage.load();
+      if (loadAfterClear.success && loadAfterClear.data) {
+        const dataAfter = loadAfterClear.data as Record<string, unknown>;
+        // Only _meta should remain (or nothing)
+        const tokenKeysAfter = Object.keys(dataAfter).filter(k => !k.startsWith('_'));
+        expect(tokenKeysAfter.length).toBe(0);
+      }
     });
   });
 

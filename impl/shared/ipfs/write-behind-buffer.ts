@@ -51,16 +51,12 @@ export class WriteBuffer {
   /** Full TXF data from save() calls — latest wins */
   txfData: TxfStorageDataBase | null = null;
 
-  /** Individual token mutations: key -> { op: 'save'|'delete', data? } */
-  tokenMutations: Map<string, { op: 'save' | 'delete'; data?: unknown }> = new Map();
-
   get isEmpty(): boolean {
-    return this.txfData === null && this.tokenMutations.size === 0;
+    return this.txfData === null;
   }
 
   clear(): void {
     this.txfData = null;
-    this.tokenMutations.clear();
   }
 
   /**
@@ -68,15 +64,8 @@ export class WriteBuffer {
    * Existing (newer) mutations in `this` take precedence over `other`.
    */
   mergeFrom(other: WriteBuffer): void {
-    // If other had a full TXF save and we don't, take it
     if (other.txfData && !this.txfData) {
       this.txfData = other.txfData;
-    }
-    // Merge token mutations — existing (newer) mutations take precedence
-    for (const [id, mutation] of other.tokenMutations) {
-      if (!this.tokenMutations.has(id)) {
-        this.tokenMutations.set(id, mutation);
-      }
     }
   }
 }

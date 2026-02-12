@@ -229,37 +229,6 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     }
   }
 
-  async deleteToken(tokenId: string): Promise<void> {
-    const filePath = path.join(this.tokensDir, `${tokenId}.json`);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  }
-
-  async saveToken(tokenId: string, tokenData: unknown): Promise<void> {
-    fs.writeFileSync(
-      path.join(this.tokensDir, `${tokenId}.json`),
-      JSON.stringify(tokenData, null, 2)
-    );
-  }
-
-  async getToken(tokenId: string): Promise<unknown | null> {
-    const filePath = path.join(this.tokensDir, `${tokenId}.json`);
-    if (!fs.existsSync(filePath)) {
-      return null;
-    }
-    try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      return JSON.parse(content);
-    } catch {
-      return null;
-    }
-  }
-
-  async listTokenIds(): Promise<string[]> {
-    const files = fs.readdirSync(this.tokensDir).filter(f => f.endsWith('.json') && f !== '_meta.json');
-    return files.map(f => path.basename(f, '.json'));
-  }
 }
 
 export function createFileTokenStorageProvider(config: FileTokenStorageConfig | string): FileTokenStorageProvider {

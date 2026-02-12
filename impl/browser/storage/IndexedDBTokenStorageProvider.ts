@@ -295,34 +295,6 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   // =========================================================================
-  // Helper methods for individual token operations
-  // =========================================================================
-
-  async deleteToken(tokenId: string): Promise<void> {
-    if (this.db) {
-      await this.deleteFromStore(STORE_TOKENS, tokenId);
-    }
-  }
-
-  async saveToken(tokenId: string, tokenData: unknown): Promise<void> {
-    if (this.db) {
-      await this.putToStore(STORE_TOKENS, tokenId, { id: tokenId, data: tokenData });
-    }
-  }
-
-  async getToken(tokenId: string): Promise<unknown | null> {
-    if (!this.db) return null;
-    const result = await this.getFromStore<{ id: string; data: unknown }>(STORE_TOKENS, tokenId);
-    return result?.data ?? null;
-  }
-
-  async listTokenIds(): Promise<string[]> {
-    if (!this.db) return [];
-    const tokens = await this.getAllFromStore<{ id: string }>(STORE_TOKENS);
-    return tokens.map(t => t.id);
-  }
-
-  // =========================================================================
   // Private IndexedDB helpers
   // =========================================================================
 

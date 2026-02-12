@@ -224,17 +224,15 @@ describe('L1PaymentsModule', () => {
 });
 
 describe('Token file storage (lottery pattern)', () => {
-  it('should have saveToken as optional method on TokenStorageProvider interface', async () => {
-    // Import the interface to verify it has the optional saveToken method
+  it('should have save/load as methods on TokenStorageProvider', async () => {
     const { FileTokenStorageProvider } = await import('../../../impl/nodejs/storage');
 
     const provider = new FileTokenStorageProvider('/tmp/test-tokens');
 
-    // Verify the provider has saveToken method
-    expect(typeof provider.saveToken).toBe('function');
-    expect(typeof provider.getToken).toBe('function');
-    expect(typeof provider.listTokenIds).toBe('function');
-    expect(typeof provider.deleteToken).toBe('function');
+    // Verify the provider has core save/load methods
+    expect(typeof provider.save).toBe('function');
+    expect(typeof provider.load).toBe('function');
+    expect(typeof provider.sync).toBe('function');
   });
 
   it('should generate correct token filename format', () => {

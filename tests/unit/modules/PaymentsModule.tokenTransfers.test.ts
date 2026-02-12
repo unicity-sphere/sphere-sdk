@@ -267,7 +267,6 @@ describe('TransferResult.tokenTransfers', () => {
     mod.removeFromOutbox = vi.fn().mockResolvedValue(undefined);
     mod.addToHistory = vi.fn().mockResolvedValue(undefined);
     mod.removeToken = vi.fn().mockResolvedValue(undefined);
-    mod.saveTokenToFileStorage = vi.fn().mockResolvedValue(undefined);
   });
 
   describe('direct token transfers (NOSTR-FIRST)', () => {
@@ -733,7 +732,6 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
     mod.removeFromOutbox = vi.fn().mockResolvedValue(undefined);
     mod.addToHistory = vi.fn().mockResolvedValue(undefined);
     mod.removeToken = vi.fn().mockResolvedValue(undefined);
-    mod.saveTokenToFileStorage = vi.fn().mockResolvedValue(undefined);
   });
 
   describe('conservative direct transfers', () => {

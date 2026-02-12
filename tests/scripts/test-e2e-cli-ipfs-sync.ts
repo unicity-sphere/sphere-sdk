@@ -3,11 +3,16 @@
  * E2E CLI Test: IPFS Multi-Device Sync
  *
  * Tests the exact user scenario:
- *   1. Create wallet, register nametag, top up with faucet
+ *   1. Create wallet, register nametag, top up with faucet (all coins)
  *   2. Sync to IPFS (push inventory)
  *   3. ERASE ALL local data for this wallet
  *   4. Re-create wallet from saved mnemonic
  *   5. Sync from IPFS and verify complete inventory recovery
+ *
+ * Multi-coin: tests use ALL faucet-supported coins (SOL, ETH, BTC, UCT,
+ * USDT, USDC, USDU) simultaneously to verify that wallets with multiple
+ * coin types (decimals: 6/8/9/18) survive CLI balance/sync round-trips
+ * and recovery flows.
  *
  * IMPORTANT: Unlike the vitest E2E test, CLI tests cannot use a no-op
  * transport because each CLI invocation creates a full Sphere instance
@@ -50,15 +55,29 @@ const CONFIG_FILE = () => join(WORK_DIR, '.sphere-cli/config.json');
 const PROFILES_FILE = () => join(WORK_DIR, '.sphere-cli/profiles.json');
 
 const POLL_INTERVAL_MS = 5_000;
-const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
+const FAUCET_TOPUP_TIMEOUT_MS = 120_000;
 const SYNC_PROPAGATION_TIMEOUT_MS = 90_000;
 const CLI_TIMEOUT_MS = 300_000;
 
 const COIN_DECIMALS: Record<string, number> = {
-  UCT: 8,
+  UCT: 18,
+  SOL: 9,
   BTC: 8,
   ETH: 18,
+  USDT: 6,
+  USDC: 6,
+  USDU: 6,
 };
+
+const TEST_COINS = [
+  { faucetName: 'solana', symbol: 'SOL', decimals: 9, amount: 1000 },
+  { faucetName: 'ethereum', symbol: 'ETH', decimals: 18, amount: 42 },
+  { faucetName: 'bitcoin', symbol: 'BTC', decimals: 8, amount: 1 },
+  { faucetName: 'unicity', symbol: 'UCT', decimals: 18, amount: 100 },
+  { faucetName: 'tether', symbol: 'USDT', decimals: 6, amount: 1000 },
+  { faucetName: 'usd-coin', symbol: 'USDC', decimals: 6, amount: 1000 },
+  { faucetName: 'unicity-usd', symbol: 'USDU', decimals: 6, amount: 1000 },
+] as const;
 
 // =============================================================================
 // Types
@@ -344,29 +363,29 @@ async function main(): Promise<void> {
   const deviceBProfile = `ipfs_sync_${testRunId}_devB`;
   const deviceCProfile = `ipfs_sync_${testRunId}_devC`;
   const nametag = `sync${testRunId}`;
-  const decimals = COIN_DECIMALS['UCT'];
 
   let savedMnemonic = '';
-  let deviceATokenCount = 0;
-  let deviceATotal = 0n;
+  const deviceATotals = new Map<string, bigint>();
+  const deviceATokenCounts = new Map<string, number>();
 
   console.log('='.repeat(70));
-  console.log('  CLI E2E: IPFS Multi-Device Sync');
+  console.log(`  CLI E2E: IPFS Multi-Device Sync (Multi-Coin: ${TEST_COINS.map(c => c.symbol).join(' + ')})`);
   console.log('='.repeat(70));
   console.log(`  Test run ID:   ${testRunId}`);
   console.log(`  Work dir:      ${WORK_DIR}`);
   console.log(`  Device A:      profile=${deviceAProfile}, nametag=@${nametag}`);
   console.log(`  Device B:      profile=${deviceBProfile} (recovery from mnemonic)`);
   console.log(`  Device C:      profile=${deviceCProfile} (IPFS-only recovery, no Nostr)`);
+  console.log(`  Coins:         ${TEST_COINS.map((c) => `${c.symbol} (${c.amount})`).join(', ')}`);
   console.log(`  Cleanup:       ${doCleanup ? 'yes' : 'no (use --cleanup to remove dirs after)'}`);
   console.log('');
 
   try {
     // =========================================================================
-    // Test 1: Create wallet on Device A, top up, sync to IPFS
+    // Test 1: Create wallet on Device A, top up (all coins), sync to IPFS
     // =========================================================================
     await runTest(
-      '1. Device A: create wallet, receive tokens, sync to IPFS',
+      '1. Device A: create wallet, receive multi-coin tokens, sync to IPFS',
       async () => {
         // Create Device A wallet
         console.log(`  Creating wallet profile: ${deviceAProfile}`);
@@ -374,51 +393,72 @@ async function main(): Promise<void> {
         const { stdout: initOut } = cli(`init --nametag ${nametag}`, deviceAProfile);
         console.log(`  Init: ${initOut.split('\n').find((l) => l.includes('initialized') || l.includes('Wallet')) || 'OK'}`);
 
-        // Extract mnemonic from init output (shown between ─ separator lines)
+        // Extract mnemonic from init output
         const extracted = extractMnemonicFromInitOutput(initOut);
         assert(extracted !== null, 'Could not extract mnemonic from init output');
         savedMnemonic = extracted!;
         assert(savedMnemonic.split(' ').length >= 12, `Expected 12+ word mnemonic, got: ${savedMnemonic.split(' ').length} words`);
         console.log(`  Mnemonic saved (${savedMnemonic.split(' ').length} words)`);
 
-        // Request faucet topup
-        console.log(`  Requesting faucet: 100 UCT to @${nametag}...`);
-        const faucetResult = await requestFaucet(nametag, 'unicity', 100);
-        assert(faucetResult.success, `Faucet request failed: ${faucetResult.message}`);
-        console.log('  Faucet: OK');
+        // Request faucet for each coin with 500ms stagger
+        for (const coin of TEST_COINS) {
+          console.log(`  Requesting faucet: ${coin.amount} ${coin.symbol} to @${nametag}...`);
+          const faucetResult = await requestFaucet(nametag, coin.faucetName, coin.amount);
+          assert(faucetResult.success, `Faucet ${coin.symbol} failed: ${faucetResult.message}`);
+          console.log(`  Faucet ${coin.symbol}: OK`);
+          await new Promise((r) => setTimeout(r, 500));
+        }
 
-        // Wait for tokens to arrive (uses balance with Nostr receive)
-        console.log(`  Waiting for UCT tokens (up to ${FAUCET_TOPUP_TIMEOUT_MS / 1000}s)...`);
+        // Wait for ALL coins to arrive
+        console.log(`  Waiting for all coins (up to ${FAUCET_TOPUP_TIMEOUT_MS / 1000}s)...`);
         const startPoll = performance.now();
-        let bal: ParsedBalance | null = null;
 
         while (performance.now() - startPoll < FAUCET_TOPUP_TIMEOUT_MS) {
-          // Use --finalize to resolve V5 tokens, --no-sync to not conflate with IPFS
           const { stdout } = cli('balance --finalize --no-sync', deviceAProfile);
-          bal = parseBalanceOutput(stdout, 'UCT');
-          if (bal && totalBalance(bal, decimals) > 0n) break;
+
+          let allReady = true;
+          for (const coin of TEST_COINS) {
+            const bal = parseBalanceOutput(stdout, coin.symbol);
+            if (!bal || totalBalance(bal, coin.decimals) <= 0n) {
+              allReady = false;
+              break;
+            }
+          }
+
+          if (allReady) {
+            // Record per-coin totals and counts
+            for (const coin of TEST_COINS) {
+              const bal = parseBalanceOutput(stdout, coin.symbol)!;
+              const total = totalBalance(bal, coin.decimals);
+              deviceATotals.set(coin.symbol, total);
+              deviceATokenCounts.set(coin.symbol, bal.tokens);
+              console.log(`  Received ${coin.symbol}: ${bal.confirmed} (${bal.tokens} tokens)`);
+            }
+            break;
+          }
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        assert(bal !== null, 'Balance command never returned UCT balance');
-        const total = totalBalance(bal, decimals);
-        assert(total > 0n, `Expected UCT balance > 0, got ${total}`);
-        deviceATotal = total;
-        deviceATokenCount = bal!.tokens;
-        console.log(`  Received: ${bal!.confirmed} UCT (${deviceATokenCount} tokens)`);
+        for (const coin of TEST_COINS) {
+          const total = deviceATotals.get(coin.symbol) ?? 0n;
+          assert(total > 0n, `Expected ${coin.symbol} balance > 0, got ${total}`);
+        }
 
-        // Sync to IPFS — this pushes inventory to IPNS
+        // Sync to IPFS
         console.log('  Syncing to IPFS (pushing inventory)...');
         const { stdout: syncOut } = cli('sync', deviceAProfile);
         console.log(`  Sync: ${syncOut.trim().split('\n').filter((l) => l.includes('Sync')).join(' | ')}`);
 
-        // Verify balance is still intact after sync
+        // Verify balance is still intact after sync (per coin)
         const { stdout: postSyncOut } = cli('balance --finalize --no-sync', deviceAProfile);
-        const postBal = parseBalanceOutput(postSyncOut, 'UCT');
-        assert(postBal !== null, 'Post-sync balance returned null');
-        const postTotal = totalBalance(postBal, decimals);
-        assert(postTotal === deviceATotal, `Post-sync balance ${postTotal} !== pre-sync ${deviceATotal}`);
-        console.log(`  Post-sync balance verified: ${postBal!.confirmed} UCT`);
+        for (const coin of TEST_COINS) {
+          const postBal = parseBalanceOutput(postSyncOut, coin.symbol);
+          assert(postBal !== null, `Post-sync ${coin.symbol} balance returned null`);
+          const postTotal = totalBalance(postBal, coin.decimals);
+          const origTotal = deviceATotals.get(coin.symbol)!;
+          assert(postTotal === origTotal, `Post-sync ${coin.symbol}: ${postTotal} !== pre-sync ${origTotal}`);
+          console.log(`  Post-sync ${coin.symbol} verified: ${postBal!.confirmed}`);
+        }
       },
     );
 
@@ -428,33 +468,26 @@ async function main(): Promise<void> {
 
     // =========================================================================
     // Test 2: ERASE Device A, create Device B from mnemonic, recover from IPFS
-    //
-    // This is the user's exact scenario:
-    //   - Remember mnemonic
-    //   - Erase ALL local wallet data
-    //   - Re-create wallet from mnemonic on "new device"
-    //   - Verify tokens recovered from IPFS
     // =========================================================================
     await runTest(
-      '2. Erase local data, recreate from mnemonic, recover tokens from IPFS',
+      '2. Erase local data, recreate from mnemonic, recover multi-coin tokens from IPFS',
       async () => {
         assert(savedMnemonic.length > 0, 'No saved mnemonic from Test 1');
-        assert(deviceATokenCount > 0, 'No token count from Test 1');
+        for (const coin of TEST_COINS) {
+          assert((deviceATokenCounts.get(coin.symbol) ?? 0) > 0, `No ${coin.symbol} token count from Test 1`);
+        }
 
-        // Create Device B profile (simulates a new device)
+        // Create Device B profile
         console.log(`  Creating recovery profile: ${deviceBProfile}`);
         cli(`wallet create ${deviceBProfile}`);
 
-        // Import from mnemonic WITH the same nametag
-        // (In real life, user remembers their nametag too)
+        // Import from mnemonic
         console.log(`  Importing wallet from mnemonic into ${deviceBProfile}...`);
         cli(`init --mnemonic "${savedMnemonic}" --nametag ${nametag}`, deviceBProfile);
 
-        // Sync from IPFS — this should pull tokens from IPNS
+        // Sync from IPFS — poll until ALL coins recovered
         console.log('  Syncing from IPFS (polling for IPNS resolution)...');
         let totalSyncAdded = 0;
-        let finalBal: ParsedBalance | null = null;
-        let finalTotal = 0n;
         const startPoll = performance.now();
 
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
@@ -464,39 +497,46 @@ async function main(): Promise<void> {
             totalSyncAdded += syncCounts.added;
           }
 
-          // Check balance with --finalize --no-sync to avoid re-syncing
+          // Check balance for all coins
           const balResult = cliSoft('balance --finalize --no-sync', deviceBProfile);
           if (balResult.exitCode === 0) {
-            finalBal = parseBalanceOutput(balResult.stdout, 'UCT');
-            if (finalBal) {
-              finalTotal = totalBalance(finalBal, decimals);
-              if (finalTotal > 0n) break;
+            let allReady = true;
+            for (const coin of TEST_COINS) {
+              const bal = parseBalanceOutput(balResult.stdout, coin.symbol);
+              if (!bal || totalBalance(bal, coin.decimals) <= 0n) {
+                allReady = false;
+                break;
+              }
             }
+            if (allReady) break;
           }
 
-          console.log('  No tokens yet, retrying in 5s...');
+          console.log('  Not all coins yet, retrying in 5s...');
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        console.log(`  Recovery result: ${finalBal?.confirmed ?? '0'} UCT (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
+        // Final balance check and assertions per coin
+        const { stdout: finalOut } = cli('balance --finalize --no-sync', deviceBProfile);
+        for (const coin of TEST_COINS) {
+          const finalBal = parseBalanceOutput(finalOut, coin.symbol);
+          const finalTotal = finalBal ? totalBalance(finalBal, coin.decimals) : 0n;
+          const origTotal = deviceATotals.get(coin.symbol)!;
+          const origCount = deviceATokenCounts.get(coin.symbol)!;
 
-        // CRITICAL ASSERTIONS:
-        // 1. Device B must have tokens
-        assert(finalTotal > 0n, `Recovery failed: Device B has 0 UCT after sync timeout`);
+          console.log(`  Recovery ${coin.symbol}: ${finalBal?.confirmed ?? '0'} (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
 
-        // 2. Balance must match original Device A
-        assert(
-          finalTotal === deviceATotal,
-          `Balance mismatch: Device A had ${deviceATotal}, Device B recovered ${finalTotal}`,
-        );
+          assert(finalTotal > 0n, `Recovery failed: Device B has 0 ${coin.symbol} after sync timeout`);
+          assert(
+            finalTotal === origTotal,
+            `${coin.symbol} balance mismatch: Device A had ${origTotal}, Device B recovered ${finalTotal}`,
+          );
+          assert(
+            finalBal!.tokens === origCount,
+            `${coin.symbol} token count mismatch: Device A had ${origCount}, Device B recovered ${finalBal!.tokens}`,
+          );
+        }
 
-        // 3. Token count must match
-        assert(
-          finalBal!.tokens === deviceATokenCount,
-          `Token count mismatch: Device A had ${deviceATokenCount}, Device B recovered ${finalBal!.tokens}`,
-        );
-
-        console.log(`  Device B recovered identical inventory: ${finalBal!.confirmed} UCT (${finalBal!.tokens} tokens)`);
+        console.log('  Device B recovered identical multi-coin inventory');
       },
     );
 
@@ -504,14 +544,17 @@ async function main(): Promise<void> {
     // Test 3: Verify bidirectional sync — Device B modifies, Device A pulls
     // =========================================================================
     await runTest(
-      '3. Bidirectional sync: both devices converge after modifications',
+      '3. Bidirectional sync: both devices converge after modifications (multi-coin)',
       async () => {
-        // Record Device B's current balance
+        // Record Device B's current per-coin balance
         const { stdout: bBefore } = cli('balance --finalize --no-sync', deviceBProfile);
-        const balBBefore = parseBalanceOutput(bBefore, 'UCT');
-        assert(balBBefore !== null, 'Device B has no UCT balance');
-        const totalBBefore = totalBalance(balBBefore, decimals);
-        console.log(`  Device B: ${balBBefore!.confirmed} UCT (${balBBefore!.tokens} tokens)`);
+        const totalsBBefore = new Map<string, bigint>();
+        for (const coin of TEST_COINS) {
+          const bal = parseBalanceOutput(bBefore, coin.symbol);
+          assert(bal !== null, `Device B has no ${coin.symbol} balance`);
+          totalsBBefore.set(coin.symbol, totalBalance(bal, coin.decimals));
+          console.log(`  Device B ${coin.symbol}: ${bal!.confirmed} (${bal!.tokens} tokens)`);
+        }
 
         // Device B syncs (pushes its state)
         console.log('  Device B: syncing to IPFS...');
@@ -520,68 +563,76 @@ async function main(): Promise<void> {
 
         // Device A syncs (pulls Device B's state)
         console.log('  Device A: syncing from IPFS...');
-        let totalAAfterSync = 0n;
-        let balA: ParsedBalance | null = null;
         const startPoll = performance.now();
 
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
           cliSoft('sync', deviceAProfile);
           const { stdout } = cli('balance --finalize --no-sync', deviceAProfile);
-          balA = parseBalanceOutput(stdout, 'UCT');
-          if (balA) {
-            totalAAfterSync = totalBalance(balA, decimals);
-            if (totalAAfterSync > 0n) break;
+
+          let allReady = true;
+          for (const coin of TEST_COINS) {
+            const bal = parseBalanceOutput(stdout, coin.symbol);
+            if (!bal || totalBalance(bal, coin.decimals) <= 0n) {
+              allReady = false;
+              break;
+            }
           }
+          if (allReady) break;
+
           console.log('  Device A still syncing, retrying in 5s...');
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        console.log(`  Device A after sync: ${balA?.confirmed ?? '0'} UCT (${balA?.tokens ?? 0} tokens)`);
-        console.log(`  Device B:            ${balBBefore!.confirmed} UCT (${balBBefore!.tokens} tokens)`);
+        // Verify convergence per coin
+        const { stdout: aFinal } = cli('balance --finalize --no-sync', deviceAProfile);
+        for (const coin of TEST_COINS) {
+          const balA = parseBalanceOutput(aFinal, coin.symbol);
+          const totalA = balA ? totalBalance(balA, coin.decimals) : 0n;
+          const totalB = totalsBBefore.get(coin.symbol)!;
 
-        // Both should have the same balance
-        assert(
-          totalAAfterSync === totalBBefore,
-          `Balance divergence: Device A=${totalAAfterSync}, Device B=${totalBBefore}`,
-        );
+          console.log(`  Device A ${coin.symbol} after sync: ${balA?.confirmed ?? '0'} (${balA?.tokens ?? 0} tokens)`);
 
-        console.log('  Both devices converged to identical balance');
+          assert(
+            totalA === totalB,
+            `${coin.symbol} balance divergence: Device A=${totalA}, Device B=${totalB}`,
+          );
+        }
+
+        console.log('  Both devices converged for all coins');
       },
     );
 
     // =========================================================================
     // Test 4: IPFS-ONLY recovery — prove tokens come from IPFS, not Nostr
-    //
-    // This is the strongest proof: --no-nostr disables Nostr transport entirely,
-    // so tokens can ONLY be recovered via IPFS sync.
     // =========================================================================
     await runTest(
-      '4. IPFS-only recovery (--no-nostr): tokens recovered exclusively from IPFS',
+      '4. IPFS-only recovery (--no-nostr): multi-coin tokens recovered exclusively from IPFS',
       async () => {
         assert(savedMnemonic.length > 0, 'No saved mnemonic from Test 1');
-        assert(deviceATokenCount > 0, 'No token count from Test 1');
+        for (const coin of TEST_COINS) {
+          assert((deviceATokenCounts.get(coin.symbol) ?? 0) > 0, `No ${coin.symbol} token count from Test 1`);
+        }
 
-        // Create Device C profile (simulates fresh device with NO Nostr)
+        // Create Device C profile (no Nostr)
         console.log(`  Creating IPFS-only profile: ${deviceCProfile}`);
         cli(`wallet create ${deviceCProfile}`);
 
-        // Import from mnemonic WITH --no-nostr (Nostr transport disabled)
+        // Import from mnemonic WITH --no-nostr
         console.log(`  Importing wallet with --no-nostr (Nostr disabled)...`);
         cli(`init --mnemonic "${savedMnemonic}" --no-nostr`, deviceCProfile);
 
-        // Check balance BEFORE sync — must be 0 (no Nostr to deliver tokens)
-        // NOTE: no --finalize (requires Nostr transport for fetchPendingEvents)
+        // Check balance BEFORE sync — must be 0 for ALL coins
         const { stdout: preSyncOut } = cli('balance --no-sync --no-nostr', deviceCProfile);
-        const preSyncBal = parseBalanceOutput(preSyncOut, 'UCT');
-        const preSyncTotal = preSyncBal ? totalBalance(preSyncBal, decimals) : 0n;
-        console.log(`  Pre-sync balance (no Nostr): ${preSyncBal?.confirmed ?? '0'} UCT (${preSyncBal?.tokens ?? 0} tokens)`);
-        assert(preSyncTotal === 0n, `Expected 0 UCT before IPFS sync (no Nostr), got ${preSyncTotal}`);
+        for (const coin of TEST_COINS) {
+          const preSyncBal = parseBalanceOutput(preSyncOut, coin.symbol);
+          const preSyncTotal = preSyncBal ? totalBalance(preSyncBal, coin.decimals) : 0n;
+          console.log(`  Pre-sync ${coin.symbol} (no Nostr): ${preSyncBal?.confirmed ?? '0'} (${preSyncBal?.tokens ?? 0} tokens)`);
+          assert(preSyncTotal === 0n, `Expected 0 ${coin.symbol} before IPFS sync (no Nostr), got ${preSyncTotal}`);
+        }
 
-        // Sync from IPFS — this is the ONLY way tokens can arrive
+        // Sync from IPFS — poll until ALL coins recovered
         console.log('  Syncing from IPFS (IPFS-only, no Nostr)...');
         let totalSyncAdded = 0;
-        let finalBal: ParsedBalance | null = null;
-        let finalTotal = 0n;
         const startPoll = performance.now();
 
         while (performance.now() - startPoll < SYNC_PROPAGATION_TIMEOUT_MS) {
@@ -589,42 +640,53 @@ async function main(): Promise<void> {
           if (result.exitCode === 0) {
             const syncCounts = parseSyncOutput(result.stdout);
             totalSyncAdded += syncCounts.added;
-            // Show full sync output for debugging
             const syncLines = result.stdout.trim().split('\n').filter((l) => l.trim());
             for (const line of syncLines) console.log(`    [sync] ${line.trim()}`);
           } else {
             console.log(`    [sync] exit=${result.exitCode}: ${result.stderr.trim().split('\n')[0]}`);
           }
 
-          // Check balance (still with --no-nostr, no --finalize)
+          // Check balance for all coins
           const balResult = cliSoft('balance --no-sync --no-nostr', deviceCProfile);
           if (balResult.exitCode === 0) {
-            finalBal = parseBalanceOutput(balResult.stdout, 'UCT');
-            if (finalBal) {
-              finalTotal = totalBalance(finalBal, decimals);
-              if (finalTotal > 0n) break;
+            let allReady = true;
+            for (const coin of TEST_COINS) {
+              const bal = parseBalanceOutput(balResult.stdout, coin.symbol);
+              if (!bal || totalBalance(bal, coin.decimals) <= 0n) {
+                allReady = false;
+                break;
+              }
             }
+            if (allReady) break;
           }
 
-          console.log('  No tokens yet (IPFS-only), retrying in 5s...');
+          console.log('  Not all coins yet (IPFS-only), retrying in 5s...');
           sleepSync(POLL_INTERVAL_MS);
         }
 
-        console.log(`  IPFS-only recovery: ${finalBal?.confirmed ?? '0'} UCT (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
+        // Final assertions per coin
+        const { stdout: finalOut } = cli('balance --no-sync --no-nostr', deviceCProfile);
+        for (const coin of TEST_COINS) {
+          const finalBal = parseBalanceOutput(finalOut, coin.symbol);
+          const finalTotal = finalBal ? totalBalance(finalBal, coin.decimals) : 0n;
+          const origTotal = deviceATotals.get(coin.symbol)!;
+          const origCount = deviceATokenCounts.get(coin.symbol)!;
 
-        // CRITICAL: tokens MUST come from IPFS (syncAdded > 0 proves it)
-        assert(finalTotal > 0n, 'IPFS-only recovery failed: 0 UCT after sync timeout');
-        assert(totalSyncAdded > 0, `syncAdded must be > 0 to prove IPFS delivered tokens, got ${totalSyncAdded}`);
-        assert(
-          finalTotal === deviceATotal,
-          `Balance mismatch: Device A had ${deviceATotal}, Device C (IPFS-only) recovered ${finalTotal}`,
-        );
-        assert(
-          finalBal!.tokens === deviceATokenCount,
-          `Token count mismatch: Device A had ${deviceATokenCount}, Device C recovered ${finalBal!.tokens}`,
-        );
+          console.log(`  IPFS-only ${coin.symbol}: ${finalBal?.confirmed ?? '0'} (${finalBal?.tokens ?? 0} tokens), syncAdded=${totalSyncAdded}`);
 
-        console.log(`  Device C recovered EXCLUSIVELY from IPFS: ${finalBal!.confirmed} UCT (${finalBal!.tokens} tokens)`);
+          assert(finalTotal > 0n, `IPFS-only recovery failed: 0 ${coin.symbol} after sync timeout`);
+          assert(totalSyncAdded > 0, `syncAdded must be > 0 to prove IPFS delivered tokens, got ${totalSyncAdded}`);
+          assert(
+            finalTotal === origTotal,
+            `${coin.symbol} balance mismatch: Device A had ${origTotal}, Device C (IPFS-only) recovered ${finalTotal}`,
+          );
+          assert(
+            finalBal!.tokens === origCount,
+            `${coin.symbol} token count mismatch: Device A had ${origCount}, Device C recovered ${finalBal!.tokens}`,
+          );
+        }
+
+        console.log(`  Device C recovered multi-coin inventory EXCLUSIVELY from IPFS`);
         console.log(`  syncAdded=${totalSyncAdded} proves tokens came from IPFS, not Nostr`);
       },
     );
@@ -653,7 +715,7 @@ async function main(): Promise<void> {
 
 function printResults(): void {
   console.log(`\n\n${'='.repeat(70)}`);
-  console.log('  IPFS MULTI-DEVICE SYNC — CLI TEST RESULTS');
+  console.log('  IPFS MULTI-DEVICE SYNC (MULTI-COIN) — CLI TEST RESULTS');
   console.log('='.repeat(70));
 
   for (const [i, r] of results.entries()) {

@@ -647,7 +647,7 @@ export class PaymentsModule {
   private archivedTokens: Map<string, TxfToken> = new Map();
   private forkedTokens: Map<string, TxfToken> = new Map();
   private transactionHistory: TransactionHistoryEntry[] = [];
-  private nametag: NametagData | null = null;
+  private nametags: NametagData[] = [];
 
   // Payment Requests State (Incoming)
   private paymentRequests: IncomingPaymentRequest[] = [];
@@ -736,7 +736,7 @@ export class PaymentsModule {
     this.archivedTokens.clear();
     this.forkedTokens.clear();
     this.transactionHistory = [];
-    this.nametag = null;
+    this.nametags = [];
 
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
@@ -800,17 +800,8 @@ export class PaymentsModule {
       }
     }
 
-    // Restore pending V5 tokens BEFORE file storage loading
-    // (must come first because loadTokensFromFileStorage calls save() which
-    // would overwrite pending V5 data if the tokens aren't in memory yet)
+    // Restore pending V5 tokens
     await this.loadPendingV5Tokens();
-
-    // Load active tokens from token-xxx files (primary storage for tokens)
-    await this.loadTokensFromFileStorage();
-
-    // Load nametag from file storage (nametag-{name}.json)
-    // This is the primary source for nametag data now
-    await this.loadNametagFromFileStorage();
 
     // Load transaction history
     const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
@@ -1479,9 +1470,10 @@ export class PaymentsModule {
         senderPubkey,
         {
           findNametagToken: async (proxyAddress: string) => {
-            if (this.nametag?.token) {
+            const currentNametag = this.getNametag();
+            if (currentNametag?.token) {
               try {
-                const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+                const nametagToken = await SdkToken.fromJSON(currentNametag.token);
                 const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
                 const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
                 if (proxy.address === proxyAddress) {
@@ -2473,9 +2465,6 @@ export class PaymentsModule {
         };
         this.tokens.set(tokenId, confirmedToken);
 
-        // Update individual file
-        await this.saveTokenToFileStorage(confirmedToken);
-
         // Add to history
         await this.addToHistory({
           type: 'RECEIVED',
@@ -2600,10 +2589,11 @@ export class PaymentsModule {
       }
 
       // If not in bundle, try local nametag
-      if (nametagTokens.length === 0 && this.nametag?.token) {
+      const localNametag = this.getNametag();
+      if (nametagTokens.length === 0 && localNametag?.token) {
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const nametagToken = await SdkToken.fromJSON(this.nametag.token) as SdkToken<any>;
+          const nametagToken = await SdkToken.fromJSON(localNametag.token) as SdkToken<any>;
           const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
           const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
           if (proxy.address === recipientAddressStr) {
@@ -2808,153 +2798,11 @@ export class PaymentsModule {
 
     await this.save();
 
-    // Save as individual token file (like lottery pattern)
-    // Skip for pending V5 tokens - they don't have valid SDK data for the legacy format
-    // and would be corrupted by parseTokenInfo() on reload
-    if (!this.parsePendingFinalization(token.sdkData)) {
-      await this.saveTokenToFileStorage(token);
-    }
-
     this.log(`Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
   }
 
-  /**
-   * Save token as individual file to token storage providers
-   * Similar to lottery's saveReceivedToken() pattern
-   */
-  private async saveTokenToFileStorage(token: Token): Promise<void> {
-    const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) return;
 
-    // Extract SDK token ID for filename
-    const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-    const tokenIdPrefix = sdkTokenId ? sdkTokenId.slice(0, 16) : token.id.slice(0, 16);
-    const filename = `token-${tokenIdPrefix}-${Date.now()}`;
-
-    // Token data to save (similar to lottery format)
-    const tokenData = {
-      token: token.sdkData ? JSON.parse(token.sdkData) : null,
-      receivedAt: Date.now(),
-      meta: {
-        id: token.id,
-        coinId: token.coinId,
-        symbol: token.symbol,
-        amount: token.amount,
-        status: token.status,
-      },
-    };
-
-    // Save to all token storage providers
-    for (const [providerId, provider] of providers) {
-      try {
-        if (provider.saveToken) {
-          await provider.saveToken(filename, tokenData);
-          this.log(`Saved token file ${filename} to ${providerId}`);
-        }
-      } catch (error) {
-        console.warn(`[Payments] Failed to save token to ${providerId}:`, error);
-      }
-    }
-  }
-
-  /**
-   * Load tokens from file storage providers (lottery compatibility)
-   * This loads tokens from file-based storage that may have been saved
-   * by other applications using the same storage directory.
-   */
-  private async loadTokensFromFileStorage(): Promise<void> {
-    const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) return;
-
-    for (const [providerId, provider] of providers) {
-      if (!provider.listTokenIds || !provider.getToken) continue;
-
-      try {
-        const allIds = await provider.listTokenIds();
-        // Only load token-xxx entries (not archived-, nametag-, or raw hex IDs)
-        const tokenIds = allIds.filter(id => id.startsWith('token-'));
-        this.log(`Found ${tokenIds.length} token files in ${providerId}`);
-
-        for (const tokenId of tokenIds) {
-          try {
-            const fileData = await provider.getToken(tokenId);
-            if (!fileData || typeof fileData !== 'object') continue;
-
-            // Handle lottery format: { token, receivedAt } or { token, receivedAt, meta }
-            const data = fileData as Record<string, unknown>;
-            const tokenJson = data.token;
-            if (!tokenJson) continue;
-
-            // Skip pending V5 finalization tokens (not valid SDK token data)
-            if (typeof tokenJson === 'object' && tokenJson !== null && '_pendingFinalization' in (tokenJson as Record<string, unknown>)) {
-              continue;
-            }
-
-            // Check if already loaded from key-value storage
-            let sdkTokenId: string | undefined;
-            if (typeof tokenJson === 'object' && tokenJson !== null) {
-              const tokenObj = tokenJson as Record<string, unknown>;
-              const genesis = tokenObj.genesis as Record<string, unknown> | undefined;
-              const genesisData = genesis?.data as Record<string, unknown> | undefined;
-              sdkTokenId = genesisData?.tokenId as string | undefined;
-            }
-
-            if (sdkTokenId) {
-              // Check if this token already exists
-              let exists = false;
-              for (const existing of this.tokens.values()) {
-                const existingId = extractTokenIdFromSdkData(existing.sdkData);
-                if (existingId === sdkTokenId) {
-                  exists = true;
-                  break;
-                }
-              }
-              if (exists) continue;
-            }
-
-            // Parse token info
-            const tokenInfo = await parseTokenInfo(tokenJson);
-
-            // Create token entry
-            const token: Token = {
-              id: tokenInfo.tokenId ?? tokenId,
-              coinId: tokenInfo.coinId,
-              symbol: tokenInfo.symbol,
-              name: tokenInfo.name,
-              decimals: tokenInfo.decimals,
-              iconUrl: tokenInfo.iconUrl,
-              amount: tokenInfo.amount,
-              status: 'confirmed',
-              createdAt: (data.receivedAt as number) || Date.now(),
-              updatedAt: Date.now(),
-              sdkData: typeof tokenJson === 'string'
-                ? tokenJson
-                : JSON.stringify(tokenJson),
-            };
-
-            // Check if this token is tombstoned (was previously removed/sent)
-            const loadedTokenId = extractTokenIdFromSdkData(token.sdkData);
-            const loadedStateHash = extractStateHashFromSdkData(token.sdkData);
-            if (loadedTokenId && loadedStateHash && this.isStateTombstoned(loadedTokenId, loadedStateHash)) {
-              this.log(`Skipping tombstoned token file ${tokenId} (${loadedTokenId.slice(0, 8)}...)`);
-              continue;
-            }
-
-            // Add to in-memory storage (skip file save since it's already in file)
-            this.tokens.set(token.id, token);
-            this.log(`Loaded token from file: ${tokenId}`);
-          } catch (tokenError) {
-            console.warn(`[Payments] Failed to load token ${tokenId}:`, tokenError);
-          }
-        }
-      } catch (error) {
-        console.warn(`[Payments] Failed to load tokens from ${providerId}:`, error);
-      }
-    }
-
-    this.log(`Loaded ${this.tokens.size} tokens from file storage`);
-  }
 
   /**
    * Update an existing token or add it if not found.
@@ -3033,9 +2881,6 @@ export class PaymentsModule {
     // Remove from active tokens
     this.tokens.delete(tokenId);
 
-    // Delete physical token file(s) from storage providers
-    await this.deleteTokenFiles(token);
-
     // Add to transaction history
     if (!skipHistory && token.coinId && token.amount) {
       await this.addToHistory({
@@ -3051,33 +2896,6 @@ export class PaymentsModule {
     await this.save();
   }
 
-  /**
-   * Delete physical token file(s) from all storage providers.
-   * Finds files by matching the SDK token ID prefix in the filename.
-   */
-  private async deleteTokenFiles(token: Token): Promise<void> {
-    const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-    if (!sdkTokenId) return;
-
-    const tokenIdPrefix = sdkTokenId.slice(0, 16);
-    const providers = this.getTokenStorageProviders();
-
-    for (const [providerId, provider] of providers) {
-      if (!provider.listTokenIds || !provider.deleteToken) continue;
-      try {
-        const allIds = await provider.listTokenIds();
-        const matchingFiles = allIds.filter(id =>
-          id.startsWith(`token-${tokenIdPrefix}`)
-        );
-        for (const fileId of matchingFiles) {
-          await provider.deleteToken(fileId);
-          this.log(`Deleted token file ${fileId} from ${providerId}`);
-        }
-      } catch (error) {
-        console.warn(`[Payments] Failed to delete token files from ${providerId}:`, error);
-      }
-    }
-  }
 
   // ===========================================================================
   // Public API - Tombstones
@@ -3378,20 +3196,32 @@ export class PaymentsModule {
    */
   async setNametag(nametag: NametagData): Promise<void> {
     this.ensureInitialized();
-    this.nametag = nametag;
+    const idx = this.nametags.findIndex(n => n.name === nametag.name);
+    if (idx >= 0) {
+      this.nametags[idx] = nametag;
+    } else {
+      this.nametags.push(nametag);
+    }
     await this.save();
-    // Save to file storage for lottery compatibility
-    await this.saveNametagToFileStorage(nametag);
     this.log(`Nametag set: ${nametag.name}`);
   }
 
   /**
-   * Get the current nametag data.
+   * Get the current (first) nametag data.
    *
    * @returns The nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
-    return this.nametag;
+    return this.nametags[0] ?? null;
+  }
+
+  /**
+   * Get all nametag data entries.
+   *
+   * @returns A copy of the nametags array.
+   */
+  getNametags(): NametagData[] {
+    return [...this.nametags];
   }
 
   /**
@@ -3400,91 +3230,16 @@ export class PaymentsModule {
    * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
-    return this.nametag !== null;
+    return this.nametags.length > 0;
   }
 
   /**
-   * Remove the current nametag data from memory and storage.
+   * Remove all nametag data from memory and storage.
    */
   async clearNametag(): Promise<void> {
     this.ensureInitialized();
-    this.nametag = null;
+    this.nametags = [];
     await this.save();
-  }
-
-  /**
-   * Save nametag to file storage for lottery compatibility
-   * Creates file: nametag-{name}.json
-   */
-  private async saveNametagToFileStorage(nametag: NametagData): Promise<void> {
-    const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) return;
-
-    const filename = `nametag-${nametag.name}`;
-
-    // Lottery-compatible format
-    const fileData = {
-      nametag: nametag.name,
-      token: nametag.token,
-      timestamp: nametag.timestamp || Date.now(),
-    };
-
-    for (const [providerId, provider] of providers) {
-      try {
-        if (provider.saveToken) {
-          await provider.saveToken(filename, fileData);
-          this.log(`Saved nametag file ${filename} to ${providerId}`);
-        }
-      } catch (error) {
-        console.warn(`[Payments] Failed to save nametag to ${providerId}:`, error);
-      }
-    }
-  }
-
-  /**
-   * Load nametag from file storage (lottery compatibility)
-   * Looks for file: nametag-{name}.json
-   */
-  private async loadNametagFromFileStorage(): Promise<void> {
-    if (this.nametag) return; // Already loaded from key-value storage
-
-    const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) return;
-
-    for (const [providerId, provider] of providers) {
-      if (!provider.listTokenIds || !provider.getToken) continue;
-
-      try {
-        const tokenIds = await provider.listTokenIds();
-        const nametagFiles = tokenIds.filter(id => id.startsWith('nametag-'));
-
-        for (const nametagFile of nametagFiles) {
-          try {
-            const fileData = await provider.getToken(nametagFile);
-            if (!fileData || typeof fileData !== 'object') continue;
-
-            const data = fileData as Record<string, unknown>;
-            if (!data.token || !data.nametag) continue;
-
-            // Convert to NametagData format
-            this.nametag = {
-              name: data.nametag as string,
-              token: data.token as object,
-              timestamp: (data.timestamp as number) || Date.now(),
-              format: 'lottery',
-              version: '1.0',
-            };
-
-            this.log(`Loaded nametag from file: ${nametagFile}`);
-            return; // Found one, stop searching
-          } catch (fileError) {
-            console.warn(`[Payments] Failed to load nametag file ${nametagFile}:`, fileError);
-          }
-        }
-      } catch (error) {
-        console.warn(`[Payments] Failed to search nametag files in ${providerId}:`, error);
-      }
-    }
   }
 
   /**
@@ -4145,10 +3900,11 @@ export class PaymentsModule {
     if (addressScheme === AddressScheme.PROXY) {
       // PROXY: Validate nametag address match (per reference impl)
       const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      if (!this.nametag?.token) {
+      const proxyNametag = this.getNametag();
+      if (!proxyNametag?.token) {
         throw new Error('Cannot finalize PROXY transfer - no nametag token');
       }
-      const nametagToken = await SdkToken.fromJSON(this.nametag.token);
+      const nametagToken = await SdkToken.fromJSON(proxyNametag.token);
       const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
       if (proxy.address !== recipientAddress.address) {
         throw new Error(
@@ -4230,9 +3986,6 @@ export class PaymentsModule {
       this.tokens.set(tokenId, finalizedToken);
       await this.save();
 
-      // Also save as individual token file
-      await this.saveTokenToFileStorage(finalizedToken);
-
       this.log(`NOSTR-FIRST: Token ${tokenId.slice(0, 8)}... finalized and confirmed`);
 
       // Emit confirmation event
@@ -4290,11 +4043,6 @@ export class PaymentsModule {
       if (instantBundle) {
         this.log('Processing INSTANT_SPLIT bundle...');
         try {
-          // Ensure nametag is loaded before processing (needed for PROXY address verification)
-          if (!this.nametag) {
-            await this.loadNametagFromFileStorage();
-          }
-
           const result = await this.processInstantSplitBundle(
             instantBundle,
             transfer.senderTransportPubkey
@@ -4548,12 +4296,6 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    // Include active tokens in TXF data so IPFS sync can propagate them
-    // to other devices. File-based storage also saves tokens individually
-    // via saveTokenToFileStorage(), but the TXF format is needed for
-    // cross-device sync (IPFS merge operates on TXF data).
-    // Note: nametag is saved separately via saveNametagToFileStorage()
-    // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
       Array.from(this.tokens.values()),
       {
@@ -4562,6 +4304,7 @@ export class PaymentsModule {
         ipnsName: this.deps!.identity.ipnsName ?? '',
       },
       {
+        nametags: this.nametags,
         tombstones: this.tombstones,
         archivedTokens: this.archivedTokens,
         forkedTokens: this.forkedTokens,
@@ -4594,12 +4337,7 @@ export class PaymentsModule {
     // Load other data
     this.archivedTokens = parsed.archivedTokens;
     this.forkedTokens = parsed.forkedTokens;
-    // Only overwrite nametag if TXF data explicitly includes one.
-    // Nametag is stored separately as nametag-{name} files (not in TXF),
-    // so parsed.nametag is normally null and must not erase the existing value.
-    if (parsed.nametag !== null) {
-      this.nametag = parsed.nametag;
-    }
+    this.nametags = parsed.nametags;
   }
 
   // ===========================================================================

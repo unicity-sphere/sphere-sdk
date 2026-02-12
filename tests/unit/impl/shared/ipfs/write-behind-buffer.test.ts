@@ -71,7 +71,6 @@ describe('WriteBuffer', () => {
     const buf = new WriteBuffer();
     expect(buf.isEmpty).toBe(true);
     expect(buf.txfData).toBeNull();
-    expect(buf.tokenMutations.size).toBe(0);
   });
 
   it('should not be empty when txfData is set', () => {
@@ -80,22 +79,14 @@ describe('WriteBuffer', () => {
     expect(buf.isEmpty).toBe(false);
   });
 
-  it('should not be empty when tokenMutations exist', () => {
-    const buf = new WriteBuffer();
-    buf.tokenMutations.set('_tok1', { op: 'save', data: { id: 'tok1' } });
-    expect(buf.isEmpty).toBe(false);
-  });
-
   it('should clear all data', () => {
     const buf = new WriteBuffer();
     buf.txfData = { _meta: { version: 1, address: 'test', formatVersion: '2.0', updatedAt: 0 } };
-    buf.tokenMutations.set('_tok1', { op: 'save', data: { id: 'tok1' } });
 
     buf.clear();
 
     expect(buf.isEmpty).toBe(true);
     expect(buf.txfData).toBeNull();
-    expect(buf.tokenMutations.size).toBe(0);
   });
 
   describe('mergeFrom', () => {
@@ -119,36 +110,6 @@ describe('WriteBuffer', () => {
       current.mergeFrom(other);
 
       expect(current.txfData!._meta.address).toBe('newer');
-    });
-
-    it('should merge token mutations — existing take precedence', () => {
-      const current = new WriteBuffer();
-      current.tokenMutations.set('_tok1', { op: 'delete' });
-
-      const other = new WriteBuffer();
-      other.tokenMutations.set('_tok1', { op: 'save', data: { id: 'tok1', old: true } });
-      other.tokenMutations.set('_tok2', { op: 'save', data: { id: 'tok2' } });
-
-      current.mergeFrom(other);
-
-      // _tok1: current's delete takes precedence
-      expect(current.tokenMutations.get('_tok1')!.op).toBe('delete');
-      // _tok2: merged from other
-      expect(current.tokenMutations.get('_tok2')!.op).toBe('save');
-      expect(current.tokenMutations.size).toBe(2);
-    });
-
-    it('should add all mutations from other when current is empty', () => {
-      const current = new WriteBuffer();
-      const other = new WriteBuffer();
-      other.tokenMutations.set('_a', { op: 'save', data: { id: 'a' } });
-      other.tokenMutations.set('_b', { op: 'delete' });
-
-      current.mergeFrom(other);
-
-      expect(current.tokenMutations.size).toBe(2);
-      expect(current.tokenMutations.get('_a')!.op).toBe('save');
-      expect(current.tokenMutations.get('_b')!.op).toBe('delete');
     });
   });
 });

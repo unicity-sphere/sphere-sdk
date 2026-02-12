@@ -29,7 +29,6 @@ const NETWORK = 'testnet' as const;
 const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
 const TRANSFER_TIMEOUT_MS = 60_000;
 const POLL_INTERVAL_MS = 500;
-const INTER_TEST_DELAY_MS = 3_000;
 
 // =============================================================================
 // Types
@@ -113,6 +112,8 @@ function parseAmount(amountStr: string, decimals: number): bigint {
 }
 
 interface BalanceSnapshot {
+  confirmed: bigint;
+  unconfirmed: bigint;
   total: bigint;
   tokens: number;
 }
@@ -120,8 +121,58 @@ interface BalanceSnapshot {
 function getBalance(sphere: Sphere, coinSymbol: string): BalanceSnapshot {
   const balances = sphere.payments.getBalance();
   const bal = balances.find(b => b.symbol === coinSymbol);
-  if (!bal) return { total: 0n, tokens: 0 };
-  return { total: BigInt(bal.totalAmount), tokens: bal.tokenCount };
+  if (!bal) return { confirmed: 0n, unconfirmed: 0n, total: 0n, tokens: 0 };
+  return {
+    confirmed: BigInt(bal.confirmedAmount),
+    unconfirmed: BigInt(bal.unconfirmedAmount),
+    total: BigInt(bal.totalAmount),
+    tokens: bal.tokenCount,
+  };
+}
+
+/**
+ * Poll until sender's balance reaches expectedTotal (change token settled).
+ * Split transfers have a background InstantSplit task that takes ~4s to mint
+ * the change token — a fixed delay is insufficient.
+ */
+async function waitForSettlement(
+  sender: Sphere,
+  coinSymbol: string,
+  expectedSenderTotal: bigint,
+  timeoutMs: number = 20_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    await sender.payments.load();
+    const bal = getBalance(sender, coinSymbol);
+    if (bal.total >= expectedSenderTotal) return;
+    await new Promise(r => setTimeout(r, 1_000));
+  }
+}
+
+/**
+ * Wait until the receiver's CONFIRMED balance for the given coin reaches the
+ * expected total. This handles both V5-bundle resolution (via resolveUnconfirmed)
+ * and commitment-only whole-token finalization (via background proof polling).
+ *
+ * Checking confirmedAmount is more robust than checking token statuses because
+ * during finalization the token briefly transitions through 'spent' before
+ * the new 'confirmed' token is created.
+ */
+async function resolveReceiverTokens(
+  receiver: Sphere,
+  coinSymbol: string,
+  expectedConfirmedTotal: bigint,
+  timeoutMs: number = 30_000,
+): Promise<void> {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
+    await receiver.payments.resolveUnconfirmed();
+    await receiver.payments.load();
+    const bal = getBalance(receiver, coinSymbol);
+    if (bal.confirmed >= expectedConfirmedTotal) return;
+    await new Promise(r => setTimeout(r, 2_000));
+  }
 }
 
 // =============================================================================
@@ -196,8 +247,10 @@ async function measureTransfer(opts: {
   };
 
   try {
-    // Snapshot receiver balance before
+    // Snapshot balances before (load both to ensure settled state)
+    await opts.sender.payments.load();
     await opts.receiver.payments.load();
+    const senderBefore = getBalance(opts.sender, opts.coinSymbol);
     const receiverBefore = getBalance(opts.receiver, opts.coinSymbol);
 
     // --- SEND with phase capture ---
@@ -242,7 +295,10 @@ async function measureTransfer(opts: {
 
     const deadline = receiveStart + TRANSFER_TIMEOUT_MS;
     while (performance.now() < deadline) {
-      await opts.receiver.payments.load();
+      // Use receive() instead of load() to explicitly fetch pending Nostr events.
+      // The persistent subscription can miss messages during heavy async work
+      // (validate, proof polling), so fetchPendingEvents() catches them.
+      await opts.receiver.payments.receive();
       const bal = getBalance(opts.receiver, opts.coinSymbol);
       if (bal.total >= expectedTotal) break;
       await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
@@ -257,6 +313,19 @@ async function measureTransfer(opts: {
     if (!result.success) {
       result.error = `Balance mismatch: gained ${gained}, expected ${amountSmallest}`;
     }
+
+    // --- POST-MEASUREMENT SETTLEMENT (not timed) ---
+    // Wait for sender's change token to settle (split transfers have background tasks)
+    if (opts.type === 'split') {
+      const expectedSender = senderBefore.total - amountSmallest;
+      await waitForSettlement(opts.sender, opts.coinSymbol, expectedSender);
+      // Wait for receiver's V5 tokens to be fully confirmed
+      const expectedReceiverConfirmed = receiverBefore.confirmed + amountSmallest;
+      await resolveReceiverTokens(opts.receiver, opts.coinSymbol, expectedReceiverConfirmed);
+    }
+    // Reload both wallets to ensure clean state for next test
+    await opts.sender.payments.load();
+    await opts.receiver.payments.load();
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);
   }
@@ -401,96 +470,62 @@ async function main(): Promise<void> {
     console.log('  UCT received.\n');
 
     // =========================================================================
-    // Test 1: Split + DIRECT (alice -> bob, 1 UCT from 100)
+    // Tests 1-4: Split transfers (run first, before whole-token tests)
     // =========================================================================
+    // NOTE: Whole-token tests are last because NOSTR-FIRST whole-token
+    // transfers produce locally-confirmed tokens whose on-chain state
+    // can't be used for subsequent operations (SDK finalization issue).
+
+    // Test 1: Split + DIRECT (alice -> bob, 1 UCT from 100)
     console.log('--- TEST 1: Split + DIRECT ---');
     measurements.push(await measureTransfer({
       label: '1. Split + DIRECT (alice->bob 1 UCT)',
       sender: alice, receiver: bob, receiverNametag: bobNametag,
       amount: '1', coinSymbol: 'UCT', mode: 'direct', type: 'split',
     }));
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-    await alice.payments.load();
-    await bob.payments.load();
 
-    // =========================================================================
     // Test 2: Split + PROXY (alice -> bob, 1 UCT from 99)
-    // =========================================================================
     console.log('--- TEST 2: Split + PROXY ---');
     measurements.push(await measureTransfer({
       label: '2. Split + PROXY (alice->bob 1 UCT)',
       sender: alice, receiver: bob, receiverNametag: bobNametag,
       amount: '1', coinSymbol: 'UCT', mode: 'proxy', type: 'split',
     }));
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-    await alice.payments.load();
-    await bob.payments.load();
 
-    // =========================================================================
-    // Test 3: Whole token + DIRECT (bob -> alice, send back 1 UCT - bob has 1 token)
-    // =========================================================================
-    console.log('--- TEST 3: Whole token + DIRECT ---');
+    // Test 3: Split + DIRECT 2nd sample (alice -> bob, 0.5 UCT from 98)
+    console.log('--- TEST 3: Split + DIRECT (2nd sample) ---');
     measurements.push(await measureTransfer({
-      label: '3. Whole + DIRECT (bob->alice 1 UCT)',
-      sender: bob, receiver: alice, receiverNametag: aliceNametag,
-      amount: '1', coinSymbol: 'UCT', mode: 'direct', type: 'whole',
-    }));
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-    await alice.payments.load();
-    await bob.payments.load();
-
-    // =========================================================================
-    // Test 4: Whole token + PROXY (bob -> alice, send back 1 UCT)
-    // =========================================================================
-    // Bob needs another token. Alice sends 1 UCT to Bob (split), then Bob sends it back whole via PROXY.
-    console.log('--- PREP: Send 1 UCT to Bob for whole-token PROXY test ---');
-    await alice.payments.send({
-      recipient: `@${bobNametag}`,
-      amount: parseAmount('1', 18).toString(),
-      coinId: TokenRegistry.getInstance().getDefinitionBySymbol('UCT')!.id,
-      addressMode: 'direct',
-    });
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-    await alice.payments.load();
-    await bob.payments.load();
-
-    // Wait for Bob to receive
-    const deadline = performance.now() + TRANSFER_TIMEOUT_MS;
-    while (performance.now() < deadline) {
-      await bob.payments.load();
-      if (getBalance(bob, 'UCT').total > 0n) break;
-      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-    }
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-
-    console.log('--- TEST 4: Whole token + PROXY ---');
-    measurements.push(await measureTransfer({
-      label: '4. Whole + PROXY (bob->alice 1 UCT)',
-      sender: bob, receiver: alice, receiverNametag: aliceNametag,
-      amount: '1', coinSymbol: 'UCT', mode: 'proxy', type: 'whole',
-    }));
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-    await alice.payments.load();
-    await bob.payments.load();
-
-    // =========================================================================
-    // Test 5 & 6: Repeat split DIRECT & PROXY for second sample
-    // =========================================================================
-    console.log('--- TEST 5: Split + DIRECT (2nd sample) ---');
-    measurements.push(await measureTransfer({
-      label: '5. Split + DIRECT (alice->bob 0.5 UCT)',
+      label: '3. Split + DIRECT (alice->bob 0.5 UCT)',
       sender: alice, receiver: bob, receiverNametag: bobNametag,
       amount: '0.5', coinSymbol: 'UCT', mode: 'direct', type: 'split',
     }));
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-    await alice.payments.load();
-    await bob.payments.load();
 
-    console.log('--- TEST 6: Split + PROXY (2nd sample) ---');
+    // Test 4: Split + PROXY 2nd sample (alice -> bob, 0.5 UCT from 97.5)
+    console.log('--- TEST 4: Split + PROXY (2nd sample) ---');
     measurements.push(await measureTransfer({
-      label: '6. Split + PROXY (alice->bob 0.5 UCT)',
+      label: '4. Split + PROXY (alice->bob 0.5 UCT)',
       sender: alice, receiver: bob, receiverNametag: bobNametag,
       amount: '0.5', coinSymbol: 'UCT', mode: 'proxy', type: 'split',
+    }));
+
+    // =========================================================================
+    // Tests 5-6: Whole-token transfers (bob has 4 tokens from splits above)
+    // =========================================================================
+
+    // Test 5: Whole + DIRECT (bob -> alice, 1 UCT)
+    console.log('--- TEST 5: Whole + DIRECT ---');
+    measurements.push(await measureTransfer({
+      label: '5. Whole + DIRECT (bob->alice 1 UCT)',
+      sender: bob, receiver: alice, receiverNametag: aliceNametag,
+      amount: '1', coinSymbol: 'UCT', mode: 'direct', type: 'whole',
+    }));
+
+    // Test 6: Whole + PROXY (bob -> alice, 1 UCT)
+    console.log('--- TEST 6: Whole + PROXY ---');
+    measurements.push(await measureTransfer({
+      label: '6. Whole + PROXY (bob->alice 1 UCT)',
+      sender: bob, receiver: alice, receiverNametag: aliceNametag,
+      amount: '1', coinSymbol: 'UCT', mode: 'proxy', type: 'whole',
     }));
 
     // =========================================================================

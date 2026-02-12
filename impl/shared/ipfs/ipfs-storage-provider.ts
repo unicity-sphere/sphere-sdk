@@ -78,10 +78,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   /** Unsubscribe function from subscription client */
   private subscriptionUnsubscribe: (() => void) | null = null;
 
-  /** In-memory buffer for individual token save/delete calls */
-  private tokenBuffer: Map<string, unknown> = new Map();
-  private deletedTokenIds: Set<string> = new Set();
-
   /** Write-behind buffer: serializes flush / sync / shutdown */
   private readonly flushQueue = new AsyncSerialQueue();
   /** Pending mutations not yet flushed to IPFS */
@@ -327,17 +323,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       // Bootstrap (remoteCid is null): do NOT include lastCid field at all
       const updatedData = { ...data, _meta: metaUpdate } as unknown as Record<string, unknown>;
 
-      // Inject buffered tokens into TXF data
-      for (const [tokenId, tokenData] of this.tokenBuffer) {
-        if (!this.deletedTokenIds.has(tokenId)) {
-          updatedData[tokenId] = tokenData;
-        }
-      }
-      // Remove deleted tokens from the payload
-      for (const tokenId of this.deletedTokenIds) {
-        delete updatedData[tokenId];
-      }
-
       // Upload to IPFS
       const { cid } = await this.httpClient.upload(updatedData);
       this.log(`Content uploaded: CID=${cid}`);
@@ -393,9 +378,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         lastCid: cid,
         version: this.dataVersion,
       });
-
-      // Clear deleted set — deletions have been persisted
-      this.deletedTokenIds.clear();
 
       this.emitEvent({
         type: 'storage:saved',
@@ -550,9 +532,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         this.dataVersion = remoteVersion;
       }
 
-      // Populate token buffer from loaded data
-      this.populateTokenBuffer(data as TxfStorageDataBase);
-
       this.emitEvent({
         type: 'storage:loaded',
         timestamp: Date.now(),
@@ -611,7 +590,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
           this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
           return {
             success: saveResult.success,
-            merged: this.enrichWithTokenBuffer(localData),
+            merged: localData,
             added: 0,
             removed: 0,
             conflicts: 0,
@@ -631,7 +610,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
           this.emitEvent({ type: 'sync:completed', timestamp: Date.now() });
           return {
             success: true,
-            merged: this.enrichWithTokenBuffer(localData),
+            merged: localData,
             added: 0,
             removed: 0,
             conflicts: 0,
@@ -661,7 +640,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
         return {
           success: saveResult.success,
-          merged: this.enrichWithTokenBuffer(merged),
+          merged: merged,
           added,
           removed,
           conflicts,
@@ -688,23 +667,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   // ---------------------------------------------------------------------------
   // Private Helpers
   // ---------------------------------------------------------------------------
-
-  /**
-   * Enrich TXF data with individually-buffered tokens before returning to caller.
-   * PaymentsModule.createStorageData() passes empty tokens (they're stored via
-   * saveToken()), but loadFromStorageData() needs them in the merged result.
-   */
-  private enrichWithTokenBuffer(data: TData): TData {
-    if (this.tokenBuffer.size === 0) return data;
-
-    const enriched = { ...data } as Record<string, unknown>;
-    for (const [tokenId, tokenData] of this.tokenBuffer) {
-      if (!this.deletedTokenIds.has(tokenId)) {
-        enriched[tokenId] = tokenData;
-      }
-    }
-    return enriched as TData;
-  }
 
   // ---------------------------------------------------------------------------
   // Optional Methods
@@ -745,8 +707,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     const result = await this._doSave(emptyData);
     if (result.success) {
       this.cache.clear();
-      this.tokenBuffer.clear();
-      this.deletedTokenIds.clear();
       await this.statePersistence.clear(this.ipnsName);
     }
     return result.success;
@@ -757,31 +717,6 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     return () => {
       this.eventCallbacks.delete(callback);
     };
-  }
-
-  async saveToken(tokenId: string, tokenData: unknown): Promise<void> {
-    this.pendingBuffer.tokenMutations.set(tokenId, { op: 'save', data: tokenData });
-    this.tokenBuffer.set(tokenId, tokenData);
-    this.deletedTokenIds.delete(tokenId);
-    this.scheduleFlush();
-  }
-
-  async getToken(tokenId: string): Promise<unknown | null> {
-    if (this.deletedTokenIds.has(tokenId)) return null;
-    return this.tokenBuffer.get(tokenId) ?? null;
-  }
-
-  async listTokenIds(): Promise<string[]> {
-    return Array.from(this.tokenBuffer.keys()).filter(
-      (id) => !this.deletedTokenIds.has(id),
-    );
-  }
-
-  async deleteToken(tokenId: string): Promise<void> {
-    this.pendingBuffer.tokenMutations.set(tokenId, { op: 'delete' });
-    this.tokenBuffer.delete(tokenId);
-    this.deletedTokenIds.add(tokenId);
-    this.scheduleFlush();
   }
 
   // ---------------------------------------------------------------------------
@@ -893,18 +828,4 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     }
   }
 
-  private readonly META_KEYS = new Set([
-    '_meta', '_tombstones', '_outbox', '_sent', '_invalid',
-    '_nametag', '_mintOutbox', '_invalidatedNametags', '_integrity',
-  ]);
-
-  private populateTokenBuffer(data: TxfStorageDataBase): void {
-    this.tokenBuffer.clear();
-    this.deletedTokenIds.clear();
-    for (const key of Object.keys(data)) {
-      if (!this.META_KEYS.has(key)) {
-        this.tokenBuffer.set(key, (data as unknown as Record<string, unknown>)[key]);
-      }
-    }
-  }
 }

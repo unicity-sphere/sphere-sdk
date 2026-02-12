@@ -28,6 +28,7 @@ import {
   forkedKeyFromTokenIdAndState,
 } from '../types/txf';
 import type { Token, TokenStatus } from '../types';
+import { TokenRegistry } from '../registry/TokenRegistry';
 
 // =============================================================================
 // SDK Token Normalization
@@ -216,12 +217,15 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
 
   const now = Date.now();
 
+  const registry = TokenRegistry.getInstance();
+  const def = registry.getDefinition(coinId);
+
   return {
     id: tokenId,
     coinId,
-    symbol: isNft ? 'NFT' : 'UCT',
-    name: isNft ? 'NFT' : 'Token',
-    decimals: isNft ? 0 : 8,
+    symbol: isNft ? 'NFT' : (def?.symbol || coinId.slice(0, 8)),
+    name: isNft ? 'NFT' : (def?.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : 'Token'),
+    decimals: isNft ? 0 : (def?.decimals ?? 8),
     amount: totalAmount.toString(),
     status: determineTokenStatus(txf),
     createdAt: now,
@@ -241,7 +245,7 @@ export async function buildTxfStorageData(
   tokens: Token[],
   meta: Omit<TxfMeta, 'formatVersion'>,
   options?: {
-    nametag?: NametagData;
+    nametags?: NametagData[];
     tombstones?: TombstoneEntry[];
     archivedTokens?: Map<string, TxfToken>;
     forkedTokens?: Map<string, TxfToken>;
@@ -257,9 +261,9 @@ export async function buildTxfStorageData(
     },
   };
 
-  // Note: nametag is no longer saved here to avoid duplication.
-  // Nametag is saved separately via saveNametagToFileStorage() as nametag-{name}.json
-  // The options.nametag parameter is kept for backwards compatibility but ignored.
+  if (options?.nametags && options.nametags.length > 0) {
+    storageData._nametags = options.nametags;
+  }
 
   if (options?.tombstones && options.tombstones.length > 0) {
     storageData._tombstones = options.tombstones;
@@ -313,7 +317,7 @@ export async function buildTxfStorageData(
 export interface ParsedStorageData {
   tokens: Token[];
   meta: TxfMeta | null;
-  nametag: NametagData | null;
+  nametags: NametagData[];
   tombstones: TombstoneEntry[];
   archivedTokens: Map<string, TxfToken>;
   forkedTokens: Map<string, TxfToken>;
@@ -330,7 +334,7 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
   const result: ParsedStorageData = {
     tokens: [],
     meta: null,
-    nametag: null,
+    nametags: [],
     tombstones: [],
     archivedTokens: new Map(),
     forkedTokens: new Map(),
@@ -352,9 +356,23 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     result.meta = storageData._meta as TxfMeta;
   }
 
-  // Extract nametag
+  // Extract nametags (plural, array — primary source)
+  const seenNames = new Set<string>();
+  if (Array.isArray(storageData._nametags)) {
+    for (const entry of storageData._nametags) {
+      if (entry && typeof entry === 'object' && typeof (entry as NametagData).name === 'string') {
+        result.nametags.push(entry as NametagData);
+        seenNames.add((entry as NametagData).name);
+      }
+    }
+  }
+
+  // Backward compat: read singular _nametag and add if not already present
   if (storageData._nametag && typeof storageData._nametag === 'object') {
-    result.nametag = storageData._nametag as NametagData;
+    const legacy = storageData._nametag as NametagData;
+    if (typeof legacy.name === 'string' && !seenNames.has(legacy.name)) {
+      result.nametags.push(legacy);
+    }
   }
 
   // Extract tombstones

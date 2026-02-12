@@ -311,6 +311,28 @@ describe('txfToToken()', () => {
     expect(token.symbol).toBe('NFT');
     expect(token.name).toBe('NFT');
   });
+
+  it('should resolve symbol from TokenRegistry for known coinId (SOL)', () => {
+    const txf = createMockTxf();
+    txf.genesis.data.coinData = [['dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93', '1000000000']];
+
+    const token = txfToToken('test-sol', txf);
+
+    expect(token.symbol).toBe('SOL');
+    expect(token.name).toBe('Solana');
+    expect(token.decimals).toBe(9);
+  });
+
+  it('should fallback to coinId prefix for unknown coinId', () => {
+    const txf = createMockTxf();
+    txf.genesis.data.coinData = [['abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890', '500']];
+
+    const token = txfToToken('test-unknown', txf);
+
+    expect(token.symbol).toBe('abcdef12');
+    expect(token.name).toBe('Token');
+    expect(token.decimals).toBe(8);
+  });
 });
 
 // =============================================================================
@@ -416,7 +438,7 @@ describe('parseTxfStorageData()', () => {
 
     expect(parsed.meta?.version).toBe(2);
     // Backwards compatibility: old storage with _nametag should still be parsed
-    expect(parsed.nametag?.name).toBe('bob');
+    expect(parsed.nametags[0]?.name).toBe('bob');
   });
 
   it('should extract tombstones', async () => {
@@ -601,5 +623,174 @@ describe('hasMissingNewStateHash()', () => {
       createMockTransaction({ newStateHash: 'hash1' }),
     ];
     expect(hasMissingNewStateHash(txf)).toBe(false);
+  });
+});
+
+// =============================================================================
+// Multi-Coin Tests
+// =============================================================================
+
+const SOL_COIN_ID = 'dee5f8ce778562eec90e9c38a91296a023210ccc76ff4c29d527ac3eb64ade93';
+const ETH_COIN_ID = '3c2450f2fd867e7bb60c6a69d7ad0e53ce967078c201a3ecaa6074ed4c0deafb';
+const BTC_COIN_ID = '86bc190fcf7b2d07c6078de93db803578760148b16d4431aa2f42a3241ff0daa';
+const UCT_COIN_ID = '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
+const USDU_COIN_ID = '8f0f3d7a5e7297be0ee98c63b81bcebb2740f43f616566fc290f9823a54f52d7';
+const EURU_COIN_ID = '5e160d5e9fdbb03b553fb9c3f6e6c30efa41fa807be39fb4f18e43776e492925';
+const ALPHT_COIN_ID = 'cde78ded16ef65818a51f43138031c4284e519300ab0cb60c30a8f9078080e5f';
+const USDT_COIN_ID = '40d25444648418fe7efd433e147187a3a6adf049ac62bc46038bda5b960bf690';
+const USDC_COIN_ID = '2265121770fa6f41131dd9a6cc571e28679263d09a53eb2642e145b5b9a5b0a2';
+
+function createMockTxfWithCoin(coinId: string, amount: string): TxfToken {
+  const base = createMockTxf();
+  base.genesis.data.coinData = [[coinId, amount]];
+  base.genesis.data.tokenId = `token_${coinId.slice(0, 8)}_${Date.now()}`;
+  return base;
+}
+
+describe('buildTxfStorageData() multi-coin', () => {
+  it('should build storage data with tokens from all registry coin types', async () => {
+    const allCoins = [
+      { coinId: SOL_COIN_ID, symbol: 'SOL', decimals: 9, amount: '1000000000' },
+      { coinId: ETH_COIN_ID, symbol: 'ETH', decimals: 18, amount: '42000000000000000000' },
+      { coinId: BTC_COIN_ID, symbol: 'BTC', decimals: 8, amount: '100000000' },
+      { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
+      { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
+      { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
+      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', decimals: 8, amount: '200000000' },
+      { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '1000000000' },
+      { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '1000000000' },
+    ];
+
+    const tokens = allCoins.map((c) => {
+      const txf = createMockTxfWithCoin(c.coinId, c.amount);
+      return createMockToken({
+        id: txf.genesis.data.tokenId,
+        coinId: c.coinId,
+        symbol: c.symbol,
+        decimals: c.decimals,
+        amount: c.amount,
+        sdkData: JSON.stringify(txf),
+      });
+    });
+
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const result = await buildTxfStorageData(tokens, meta);
+
+    const reservedKeys = ['_meta', '_nametag', '_tombstones', '_outbox', '_mintOutbox', '_invalidatedNametags'];
+    const tokenKeys = Object.keys(result).filter(
+      (k) => k.startsWith('_') && !reservedKeys.includes(k),
+    );
+    expect(tokenKeys.length).toBe(9);
+  });
+});
+
+describe('parseTxfStorageData() multi-coin', () => {
+  it('should parse storage data with all coin types preserving coinId', async () => {
+    const allCoins = [
+      { coinId: SOL_COIN_ID, symbol: 'SOL', decimals: 9, amount: '1000000000' },
+      { coinId: ETH_COIN_ID, symbol: 'ETH', decimals: 18, amount: '42000000000000000000' },
+      { coinId: BTC_COIN_ID, symbol: 'BTC', decimals: 8, amount: '100000000' },
+      { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
+      { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
+      { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
+      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', decimals: 8, amount: '200000000' },
+      { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '1000000000' },
+      { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '1000000000' },
+    ];
+
+    const tokens = allCoins.map((c) => {
+      const txf = createMockTxfWithCoin(c.coinId, c.amount);
+      return createMockToken({
+        id: txf.genesis.data.tokenId,
+        coinId: c.coinId,
+        symbol: c.symbol,
+        decimals: c.decimals,
+        amount: c.amount,
+        sdkData: JSON.stringify(txf),
+      });
+    });
+
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const storageData = await buildTxfStorageData(tokens, meta);
+    const parsed = parseTxfStorageData(storageData);
+
+    expect(parsed.tokens.length).toBe(9);
+    expect(parsed.validationErrors.length).toBe(0);
+
+    for (const coin of allCoins) {
+      const found = parsed.tokens.find((t) => t.symbol === coin.symbol);
+      expect(found).toBeDefined();
+      expect(found!.coinId).toBe(coin.coinId);
+      expect(found!.decimals).toBe(coin.decimals);
+      expect(found!.amount).toBe(coin.amount);
+    }
+  });
+});
+
+describe('multi-coin round-trip', () => {
+  it('should preserve all registry coins through build -> parse cycle', async () => {
+    const coins = [
+      { coinId: SOL_COIN_ID, symbol: 'SOL', decimals: 9, amount: '5000000000' },
+      { coinId: ETH_COIN_ID, symbol: 'ETH', decimals: 18, amount: '100000000000000000' },
+      { coinId: BTC_COIN_ID, symbol: 'BTC', decimals: 8, amount: '50000000' },
+      { coinId: UCT_COIN_ID, symbol: 'UCT', decimals: 18, amount: '100000000000000000000' },
+      { coinId: USDU_COIN_ID, symbol: 'USDU', decimals: 6, amount: '1000000000' },
+      { coinId: EURU_COIN_ID, symbol: 'EURU', decimals: 6, amount: '500000000' },
+      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', decimals: 8, amount: '200000000' },
+      { coinId: USDT_COIN_ID, symbol: 'USDT', decimals: 6, amount: '750000000' },
+      { coinId: USDC_COIN_ID, symbol: 'USDC', decimals: 6, amount: '250000000' },
+    ];
+
+    const tokens = coins.map((c) => {
+      const txf = createMockTxfWithCoin(c.coinId, c.amount);
+      return createMockToken({
+        id: txf.genesis.data.tokenId,
+        coinId: c.coinId,
+        symbol: c.symbol,
+        decimals: c.decimals,
+        amount: c.amount,
+        sdkData: JSON.stringify(txf),
+      });
+    });
+
+    const meta = { version: 1, address: 'alpha1test', ipnsName: 'k51test' };
+    const storageData = await buildTxfStorageData(tokens, meta);
+    const parsed = parseTxfStorageData(storageData);
+
+    expect(parsed.tokens.length).toBe(9);
+    expect(parsed.validationErrors.length).toBe(0);
+
+    for (const coin of coins) {
+      const found = parsed.tokens.find((t) => t.symbol === coin.symbol);
+      expect(found).toBeDefined();
+      expect(found!.coinId).toBe(coin.coinId);
+      expect(found!.amount).toBe(coin.amount);
+      expect(found!.decimals).toBe(coin.decimals);
+    }
+  });
+
+  it('should preserve coin metadata through txfToToken for all registry coins', () => {
+    const knownCoins = [
+      { coinId: SOL_COIN_ID, symbol: 'SOL', name: 'Solana', decimals: 9 },
+      { coinId: ETH_COIN_ID, symbol: 'ETH', name: 'Ethereum', decimals: 18 },
+      { coinId: BTC_COIN_ID, symbol: 'BTC', name: 'Bitcoin', decimals: 8 },
+      { coinId: UCT_COIN_ID, symbol: 'UCT', name: 'Unicity', decimals: 18 },
+      { coinId: USDU_COIN_ID, symbol: 'USDU', name: 'Unicity-usd', decimals: 6 },
+      { coinId: EURU_COIN_ID, symbol: 'EURU', name: 'Unicity-eur', decimals: 6 },
+      { coinId: ALPHT_COIN_ID, symbol: 'ALPHT', name: 'Alpha_test', decimals: 8 },
+      { coinId: USDT_COIN_ID, symbol: 'USDT', name: 'Tether', decimals: 6 },
+      { coinId: USDC_COIN_ID, symbol: 'USDC', name: 'Usd-coin', decimals: 6 },
+    ];
+
+    for (const coin of knownCoins) {
+      const txf = createMockTxfWithCoin(coin.coinId, '12345');
+      const token = txfToToken(`test-${coin.symbol}`, txf);
+
+      expect(token.symbol).toBe(coin.symbol);
+      expect(token.name).toBe(coin.name);
+      expect(token.decimals).toBe(coin.decimals);
+      expect(token.coinId).toBe(coin.coinId);
+      expect(token.amount).toBe('12345');
+    }
   });
 });
