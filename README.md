@@ -9,7 +9,7 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 - **L3 Payments** - Token transfers with state transition proofs
 - **Payment Requests** - Request payments with async response tracking
 - **Nostr Transport** - P2P messaging with NIP-04 encryption
-- **IPFS Storage** - Decentralized token backup with Helia
+- **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
 - **Token Splitting** - Partial transfer amount calculations
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
 - **TXF Serialization** - Token eXchange Format for storage and transfer
@@ -28,8 +28,8 @@ Choose your platform:
 
 | Platform | Guide | Required | Optional |
 |----------|-------|----------|----------|
-| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | `helia` (IPFS sync) |
-| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | - |
+| **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IPFS sync (built-in) |
+| **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | IPFS sync (built-in) |
 | **CLI** | See below | SDK + `tsx` | - |
 
 ## CLI (Command Line Interface)
@@ -43,6 +43,9 @@ npm run cli -- --help
 # Initialize new wallet on testnet
 npm run cli -- init --network testnet
 
+# Initialize with nametag (mints token on-chain)
+npm run cli -- init --network testnet --nametag alice
+
 # Import existing wallet
 npm run cli -- init --mnemonic "your 24 words here"
 
@@ -52,35 +55,58 @@ npm run cli -- status
 # Check balance
 npm run cli -- balance
 
-# Show receive address
+# Fetch pending transfers and finalize unconfirmed tokens
+npm run cli -- balance --finalize
+
+# Check for incoming transfers
 npm run cli -- receive
 
-# Send tokens
-npm run cli -- send @alice 1000000
+# Check for incoming transfers and finalize unconfirmed tokens
+npm run cli -- receive --finalize
+
+# Send tokens (instant mode, default)
+npm run cli -- send @alice 1 --coin UCT --instant
+
+# Send tokens (conservative mode — collect all proofs first)
+npm run cli -- send @alice 1 --coin UCT --conservative
+
+# Request test tokens from faucet
+npm run cli -- topup
 
 # Register nametag
 npm run cli -- nametag myname
 
 # Show transaction history
 npm run cli -- history 10
+
+# Verify tokens against aggregator (detect spent tokens)
+npm run cli -- verify-balance
 ```
 
 ### Available CLI Commands
 
 | Category | Command | Description |
 |----------|---------|-------------|
-| **Wallet** | `init [--network <net>] [--mnemonic "<words>"]` | Create or import wallet |
+| **Wallet** | `init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]` | Create or import wallet |
 | | `status` | Show wallet identity |
 | | `config` | Show/set configuration |
-| **Balance** | `balance` | Show L3 token balance |
-| | `tokens` | List all tokens |
+| **Profiles** | `wallet list` | List all wallet profiles |
+| | `wallet use <name>` | Switch to a wallet profile |
+| | `wallet create <name> [--network <net>]` | Create a new wallet profile |
+| | `wallet delete <name>` | Delete a wallet profile |
+| | `wallet current` | Show current wallet profile |
+| **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
+| | `tokens` | List all tokens with details |
 | | `l1-balance` | Show L1 (ALPHA) balance |
-| **Transfers** | `send <recipient> <amount>` | Send tokens |
-| | `receive` | Show address for receiving |
+| | `topup [coin] [amount]` | Request test tokens from faucet |
+| | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
+| **Transfers** | `send <to> <amount> [--coin SYM] [--instant\|--conservative]` | Send tokens |
+| | `receive [--finalize]` | Check for incoming transfers |
 | | `history [limit]` | Show transaction history |
 | **Nametags** | `nametag <name>` | Register a nametag |
 | | `nametag-info <name>` | Lookup nametag info |
 | | `my-nametag` | Show current nametag |
+| | `nametag-sync` | Re-publish nametag with chainPubkey |
 | **Utils** | `generate-key` | Generate random key |
 | | `to-human <amount>` | Convert to human readable |
 | | `parse-wallet <file>` | Parse wallet file |
@@ -152,7 +178,7 @@ const providers = createBrowserProviders({
   oracle: { url: 'https://custom-aggregator.example.com' }, // custom oracle
 });
 
-// Enable L1 with network defaults
+// L1 is enabled by default — customize if needed
 const providers = createBrowserProviders({
   network: 'testnet',
   l1: { enableVesting: true },  // uses testnet electrum URL automatically
@@ -332,16 +358,19 @@ sphere.payments.onPaymentRequest((request) => {
 Access L1 payments through `sphere.payments.l1`:
 
 ```typescript
-// L1 configuration is optional (has defaults)
+// L1 is enabled by default with lazy Fulcrum connection.
+// Connection to Fulcrum is deferred until first L1 operation.
 const { sphere } = await Sphere.init({
   ...providers,
   autoGenerate: true,
-  l1: {
-    electrumUrl: 'wss://fulcrum.alpha.unicity.network:50004',  // default
-    defaultFeeRate: 10,  // sat/byte, default
-    enableVesting: true, // default
-  },
+  // L1 config is optional — defaults are applied automatically:
+  // electrumUrl: network-specific (mainnet: fulcrum.alpha.unicity.network)
+  // defaultFeeRate: 10 sat/byte
+  // enableVesting: true
 });
+
+// To explicitly disable L1:
+// const { sphere } = await Sphere.init({ ...providers, l1: null });
 
 // Get L1 balance
 const balance = await sphere.payments.l1.getBalance();
@@ -706,7 +735,7 @@ The SDK includes browser-ready provider implementations:
 | `LocalStorageProvider` | Browser localStorage with SSR fallback |
 | `NostrTransportProvider` | Nostr relay messaging with NIP-04 |
 | `UnicityAggregatorProvider` | Unicity aggregator for state proofs |
-| `IpfsStorageProvider` | Helia-based IPFS with HTTP fallback |
+| `IpfsStorageProvider` | HTTP-based IPFS/IPNS storage (cross-platform) |
 
 ## Node.js Providers
 
@@ -847,14 +876,6 @@ const providers = createBrowserProviders({
   },
 });
 
-// Enable multiple sync backends
-const providers = createBrowserProviders({
-  network: 'mainnet',
-  tokenSync: {
-    ipfs: { enabled: true, useDht: true },
-    cloud: { enabled: true, provider: 'aws', bucket: 'my-backup' },  // future
-  },
-});
 ```
 
 ## Token Sync Backends
@@ -863,44 +884,32 @@ The SDK supports multiple token sync backends that can be enabled independently:
 
 | Backend | Status | Description |
 |---------|--------|-------------|
-| `ipfs` | ✅ Ready | Decentralized IPFS/IPNS with Helia browser DHT |
-| `mongodb` | ✅ Ready | MongoDB for centralized token storage |
+| `ipfs` | ✅ Ready | HTTP-based IPFS/IPNS storage (browser + Node.js) |
+| `mongodb` | 🚧 Planned | MongoDB for centralized token storage |
 | `file` | 🚧 Planned | Local file system (Node.js) |
 | `cloud` | 🚧 Planned | Cloud storage (AWS S3, GCP, Azure) |
 
 ```typescript
-// Enable IPFS sync with custom gateways
+// Browser: enable IPFS sync
 const providers = createBrowserProviders({
   network: 'testnet',
   tokenSync: {
     ipfs: {
       enabled: true,
       additionalGateways: ['https://my-gateway.com'],
-      useDht: true,  // Enable browser DHT (Helia)
     },
   },
 });
 
-// Enable MongoDB sync
-const providers = createBrowserProviders({
-  network: 'mainnet',
+// Node.js: enable IPFS sync
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
   tokenSync: {
-    mongodb: {
+    ipfs: {
       enabled: true,
-      uri: 'mongodb://localhost:27017',
-      database: 'sphere_wallet',
-      collection: 'tokens',
     },
-  },
-});
-
-// Multiple backends for redundancy
-const providers = createBrowserProviders({
-  tokenSync: {
-    ipfs: { enabled: true },
-    mongodb: { enabled: true, uri: 'mongodb://localhost:27017', database: 'wallet' },
-    file: { enabled: true, directory: './tokens', format: 'txf' },
-    cloud: { enabled: true, provider: 'aws', bucket: 'wallet-backup' },
   },
 });
 ```
@@ -985,32 +994,32 @@ const { sphere } = await Sphere.init({
 
 ## Dynamic Provider Management (Runtime)
 
-After `Sphere.init()` is called, you can add/remove token storage providers dynamically through UI:
+After `Sphere.init()` is called, you can add/remove token storage providers dynamically:
 
 ```typescript
-import { createMongoDbStorageProvider } from './my-mongodb-provider';
+import { createBrowserIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/browser/ipfs';
+// For Node.js: import { createNodeIpfsStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs/ipfs';
 
-// Add a new provider at runtime (e.g., user enables MongoDB sync in settings)
-const mongoProvider = createMongoDbStorageProvider({
-  uri: 'mongodb://localhost:27017',
-  database: 'sphere_wallet',
+// Add a new provider at runtime (e.g., user enables IPFS sync in settings)
+const ipfsProvider = createBrowserIpfsStorageProvider({
+  gateways: ['https://my-ipfs-node.com'],
 });
 
-await sphere.addTokenStorageProvider(mongoProvider);
+await sphere.addTokenStorageProvider(ipfsProvider);
 
 // Provider is now active and will be used in sync operations
 
 // Check if provider exists
-if (sphere.hasTokenStorageProvider('mongodb-token-storage')) {
-  console.log('MongoDB sync is enabled');
+if (sphere.hasTokenStorageProvider('ipfs-token-storage')) {
+  console.log('IPFS sync is enabled');
 }
 
 // Get all active providers
 const providers = sphere.getTokenStorageProviders();
 console.log('Active providers:', Array.from(providers.keys()));
 
-// Remove a provider (e.g., user disables MongoDB sync)
-await sphere.removeTokenStorageProvider('mongodb-token-storage');
+// Remove a provider (e.g., user disables IPFS sync)
+await sphere.removeTokenStorageProvider('ipfs-token-storage');
 
 // Listen for per-provider sync events
 sphere.on('sync:provider', (event) => {
@@ -1024,25 +1033,6 @@ sphere.on('sync:provider', (event) => {
 
 // Trigger sync (syncs with all active providers)
 await sphere.payments.sync();
-```
-
-### Multiple Providers Example
-
-```typescript
-// User configures multiple sync backends via UI
-const ipfsProvider = createIpfsStorageProvider({ gateways: ['https://ipfs.io'] });
-const mongoProvider = createMongoDbStorageProvider({ uri: 'mongodb://...' });
-const s3Provider = createS3StorageProvider({ bucket: 'wallet-backup' });
-
-// Add all providers
-await sphere.addTokenStorageProvider(ipfsProvider);
-await sphere.addTokenStorageProvider(mongoProvider);
-await sphere.addTokenStorageProvider(s3Provider);
-
-// Sync syncs with ALL active providers
-// If one fails, others continue (fault-tolerant)
-const result = await sphere.payments.sync();
-console.log(`Synced: +${result.added} -${result.removed}`);
 ```
 
 ## Dynamic Relay Management
@@ -1124,7 +1114,7 @@ function getRelayStatuses() {
 
 ## Nametags
 
-Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments.
+Nametags provide human-readable addresses (e.g., `@alice`) for receiving payments. Valid formats: lowercase alphanumeric with `_` or `-` (3–20 chars), or E.164 phone numbers (e.g., `+14155552671`). Input is normalized to lowercase automatically.
 
 > **Important:** Nametags are required to use the testnet faucet. Register a nametag before requesting test tokens.
 
@@ -1255,6 +1245,10 @@ await sphere.registerNametag('bob');
 const aliceTag = sphere.getNametagForAddress(0);  // 'alice'
 const bobTag = sphere.getNametagForAddress(1);    // 'bob'
 ```
+
+---
+
+See [IPFS Storage Guide](docs/IPFS-STORAGE.md) for complete IPFS/IPNS documentation including configuration, caching, merge rules, and troubleshooting.
 
 ---
 

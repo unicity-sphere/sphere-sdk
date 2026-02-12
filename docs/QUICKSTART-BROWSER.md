@@ -11,16 +11,10 @@ npm install @unicitylabs/sphere-sdk
 | Package | Required | Description |
 |---------|----------|-------------|
 | `@unicitylabs/sphere-sdk` | Yes | The SDK |
-| `helia`, `@helia/json`, `@helia/ipns` | No | IPFS token sync (optional) |
 
-**That's it!** No additional dependencies for basic usage. Browser uses native WebSocket.
+**That's it!** No additional dependencies for basic usage. Browser uses native WebSocket. IPFS sync is built-in — no extra packages needed.
 
 > **Note:** API key for aggregator is included by default. For custom deployments, configure via `oracle: { apiKey: 'your-key' }`.
-
-**Optional** (for IPFS token sync):
-```bash
-npm install helia @helia/json @helia/ipns @libp2p/bootstrap multiformats
-```
 
 ## Framework Setup
 
@@ -293,12 +287,23 @@ async function sendTokens(recipient: string, amount: string) {
       recipient,  // '@alice' or 'DIRECT://...'
       amount,
       coinId: 'UCT',
+      // transferMode: 'instant',      // default — fast send, receiver resolves proofs
+      // transferMode: 'conservative', // collect all proofs first, then deliver
     });
-    console.log('Sent! TX:', result.txHash);
+    console.log('Sent! Transfers:', result.tokenTransfers);
   } catch (error) {
     console.error('Failed:', error.message);
   }
 }
+```
+
+### Fetch Pending Transfers
+
+For explicit receive (useful in batch operations or when you need to poll):
+
+```typescript
+const { transfers } = await sphere.payments.receive();
+console.log(`Received ${transfers.length} new transfers`);
 ```
 
 ### Register Nametag
@@ -623,4 +628,5 @@ const providers = createBrowserProviders({
 
 - [API Reference](./API.md) - Full API documentation
 - [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
+- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration
 - [Node.js Quick Start](./QUICKSTART-NODEJS.md) - For server-side usage

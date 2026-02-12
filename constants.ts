@@ -44,6 +44,8 @@ export const STORAGE_KEYS_GLOBAL = {
   ADDRESS_NAMETAGS: 'address_nametags',
   /** Active addresses registry (JSON: TrackedAddressesStorage) */
   TRACKED_ADDRESSES: 'tracked_addresses',
+  /** Last processed Nostr wallet event timestamp (unix seconds), keyed per pubkey */
+  LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
 } as const;
 
 /**
@@ -65,6 +67,8 @@ export const STORAGE_KEYS_ADDRESS = {
   MESSAGES: 'messages',
   /** Transaction history for this address */
   TRANSACTION_HISTORY: 'transaction_history',
+  /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
+  PENDING_V5_TOKENS: 'pending_v5_tokens',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
@@ -172,6 +176,28 @@ export const DEFAULT_IPFS_BOOTSTRAP_PEERS = [
   '/dns4/unicity-ipfs4.dyndns.org/tcp/4001/p2p/12D3KooWJ1ByPfUzUrpYvgxKU8NZrR8i6PU1tUgMEbQX9Hh2DEn1',
   '/dns4/unicity-ipfs5.dyndns.org/tcp/4001/p2p/12D3KooWB1MdZZGHN5B8TvWXntbycfe7Cjcz7n6eZ9eykZadvmDv',
 ] as const;
+
+/** Unicity dedicated IPFS nodes (HTTP API access) */
+export const UNICITY_IPFS_NODES = [
+  {
+    host: 'unicity-ipfs1.dyndns.org',
+    peerId: '12D3KooWDKJqEMAhH4nsSSiKtK1VLcas5coUqSPZAfbWbZpxtL4u',
+    httpPort: 9080,
+    httpsPort: 443,
+  },
+] as const;
+
+/**
+ * Get IPFS gateway URLs for HTTP API access.
+ * @param isSecure - Use HTTPS (default: true). Set false for development.
+ */
+export function getIpfsGatewayUrls(isSecure?: boolean): string[] {
+  return UNICITY_IPFS_NODES.map((node) =>
+    isSecure !== false
+      ? `https://${node.host}`
+      : `http://${node.host}:${node.httpPort}`,
+  );
+}
 
 // =============================================================================
 // Wallet Defaults

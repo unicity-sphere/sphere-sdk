@@ -27,12 +27,14 @@ export type {
 import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
+import { createNodeIpfsStorageProvider } from './ipfs';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
 import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import type { NetworkType } from '../../constants';
+import type { IpfsStorageConfig } from '../shared/ipfs';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -71,6 +73,20 @@ export type NodeL1Config = L1Config;
 // Node.js Providers Configuration
 // =============================================================================
 
+/** Node.js IPFS sync configuration */
+export interface NodeIpfsSyncConfig {
+  /** Enable IPFS sync (default: false) */
+  enabled?: boolean;
+  /** IPFS storage provider configuration */
+  config?: IpfsStorageConfig;
+}
+
+/** Node.js token sync configuration */
+export interface NodeTokenSyncConfig {
+  /** IPFS sync backend */
+  ipfs?: NodeIpfsSyncConfig;
+}
+
 export interface NodeProvidersConfig {
   /** Network preset: mainnet, testnet, or dev */
   network?: NetworkType;
@@ -86,6 +102,8 @@ export interface NodeProvidersConfig {
   l1?: NodeL1Config;
   /** Price provider configuration (optional — enables fiat value display) */
   price?: BasePriceConfig;
+  /** Token sync backends configuration */
+  tokenSync?: NodeTokenSyncConfig;
 }
 
 export interface NodeProviders {
@@ -97,6 +115,8 @@ export interface NodeProviders {
   l1?: L1Config;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
+  /** IPFS token storage provider (when tokenSync.ipfs.enabled is true) */
+  ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
 }
 
 // =============================================================================
@@ -148,10 +168,18 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const l1Config = resolveL1Config(network, config?.l1);
   const priceConfig = resolvePriceConfig(config?.price);
 
+  const storage = createFileStorageProvider({
+    dataDir: config?.dataDir ?? './sphere-data',
+  });
+
+  // Create IPFS storage provider if enabled
+  const ipfsSync = config?.tokenSync?.ipfs;
+  const ipfsTokenStorage = ipfsSync?.enabled
+    ? createNodeIpfsStorageProvider(ipfsSync.config, storage)
+    : undefined;
+
   return {
-    storage: createFileStorageProvider({
-      dataDir: config?.dataDir ?? './sphere-data',
-    }),
+    storage,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
     }),
@@ -160,6 +188,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
       timeout: transportConfig.timeout,
       autoReconnect: transportConfig.autoReconnect,
       debug: transportConfig.debug,
+      storage,
     }),
     oracle: createUnicityAggregatorProvider({
       url: oracleConfig.url,
@@ -172,5 +201,6 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
     }),
     l1: l1Config,
     price: priceConfig ? createPriceProvider(priceConfig) : undefined,
+    ipfsTokenStorage,
   };
 }

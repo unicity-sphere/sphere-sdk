@@ -34,20 +34,55 @@ npm run cli -- status
 # Check balance
 npm run cli -- balance
 
-# Send tokens
-npm run cli -- send @alice 1000000
+# Fetch pending transfers and finalize unconfirmed tokens
+npm run cli -- balance --finalize
+
+# Send tokens (instant mode — default, ~2-3s sender latency)
+npm run cli -- send @alice 1 --coin UCT --instant
+
+# Send tokens (conservative mode — collect all proofs first)
+npm run cli -- send @alice 1 --coin UCT --conservative
 
 # Show receive address
 npm run cli -- receive
 
+# Request test tokens from faucet
+npm run cli -- topup
+
 # Register nametag (mints token on-chain!)
 npm run cli -- nametag myname
+
+# Verify tokens against aggregator (detect spent tokens)
+npm run cli -- verify-balance
 
 # Full help
 npm run cli -- --help
 ```
 
 > **Important:** Commands with `--nametag` or `nametag` mint a token on-chain. This uses the Oracle (Aggregator) provider which is included by default with `createNodeProviders()`.
+
+### Transfer Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **Instant** (default) | `--instant` | Sends tokens via Nostr immediately. Receiver resolves proofs in background. Fastest sender experience (~2-3s). |
+| **Conservative** | `--conservative` | Collects all aggregator proofs first, then sends fully finalized tokens. Slower but receiver gets immediately usable tokens. |
+
+### Wallet Profiles
+
+Manage multiple wallets for testing:
+
+```bash
+npm run cli -- wallet create alice              # Create profile "alice"
+npm run cli -- init --nametag alice             # Initialize wallet in profile
+npm run cli -- wallet create bob                # Create another profile
+npm run cli -- init --nametag bob               # Initialize second wallet
+npm run cli -- wallet list                      # List all profiles
+npm run cli -- wallet use alice                 # Switch to alice
+npm run cli -- send @bob 0.1 --coin BTC         # Send from alice to bob
+npm run cli -- wallet use bob                   # Switch to bob
+npm run cli -- balance --finalize               # Check bob's balance (fetch + finalize)
+```
 
 CLI stores data in `./.sphere-cli/` directory.
 
@@ -60,7 +95,7 @@ Node.js implementation uses **file-based storage**:
 | Wallet (keys, nametag) | `dataDir/wallet.json` | Encrypted JSON |
 | Tokens | `tokensDir/_<tokenId>.json` | One JSON file per token |
 
-> **Note:** IPFS sync is currently only available for browser. Node.js uses local file storage only.
+> **Note:** IPFS sync is available for both browser and Node.js. See [IPFS Token Sync](#ipfs-token-sync-optional) below.
 
 ## Minimal Example
 
@@ -151,6 +186,31 @@ const providers = createNodeProviders({
 });
 ```
 
+## IPFS Token Sync (Optional)
+
+Enable decentralized token backup to IPFS/IPNS. No extra packages needed — uses built-in HTTP API.
+
+```typescript
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  tokenSync: {
+    ipfs: { enabled: true },
+  },
+});
+
+const { sphere } = await Sphere.init({ ...providers, autoGenerate: true });
+
+// Sync tokens with IPFS (merges local and remote data)
+const result = await sphere.payments.sync();
+console.log(`Sync: +${result.added} -${result.removed}`);
+```
+
+**Recovery after local data loss:** Re-initialize the wallet with the same mnemonic and call `sync()`. Tokens stored on IPFS will be restored automatically.
+
+See [IPFS Storage Guide](./IPFS-STORAGE.md) for full configuration, caching details, and troubleshooting.
+
 ## Common Operations
 
 ### Check Balance & Assets
@@ -177,11 +237,19 @@ console.log('L1 Balance:', l1Balance);
 ### Send Tokens
 
 ```typescript
-// Send to nametag
+// Send to nametag (instant mode — default)
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',  // In base units
   coinId: 'UCT',
+});
+
+// Send with conservative mode (collect proofs first, then deliver)
+const result = await sphere.payments.send({
+  recipient: '@alice',
+  amount: '1000000',
+  coinId: 'UCT',
+  transferMode: 'conservative',
 });
 
 // Send to direct address
@@ -189,6 +257,21 @@ const result = await sphere.payments.send({
   recipient: 'DIRECT://0000be36...',
   amount: '500000',
   coinId: 'UCT',
+});
+```
+
+### Fetch Pending Transfers (Explicit Receive)
+
+For batch/CLI apps, use `receive()` to explicitly query the Nostr relay for pending events:
+
+```typescript
+// Fetch and process all pending incoming transfers
+const { transfers } = await sphere.payments.receive();
+console.log(`Received ${transfers.length} transfers`);
+
+// With callback for each transfer
+await sphere.payments.receive(undefined, (transfer) => {
+  console.log(`Received ${transfer.tokens.length} tokens`);
 });
 ```
 
@@ -265,7 +348,7 @@ console.log(addr.address, addr.publicKey);
 sphere.on('transfer:incoming', handler);
 sphere.on('transfer:sent', handler);
 sphere.on('transfer:pending', handler);
-sphere.on('payment_request:received', handler);
+sphere.on('payment_request:incoming', handler);
 sphere.on('payment_request:paid', handler);
 sphere.on('message:dm', handler);
 sphere.on('message:broadcast', handler);
@@ -408,4 +491,5 @@ fs.mkdirSync('./tokens-data', { recursive: true });
 
 - [API Reference](./API.md) - Full API documentation
 - [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
+- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration
 - [Browser Quick Start](./QUICKSTART-BROWSER.md) - For web applications

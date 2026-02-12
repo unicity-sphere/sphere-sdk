@@ -3,13 +3,14 @@
  * Covers nametag minting interface and configuration
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   NametagMinter,
   createNametagMinter,
   type NametagMinterConfig,
   type MintNametagResult,
 } from '../../../modules/payments/NametagMinter';
+import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 
 // =============================================================================
 // Tests - Interface and Configuration
@@ -231,40 +232,85 @@ describe('Nametag minting flow', () => {
   });
 });
 
-describe('Nametag validation', () => {
-  it('should strip @ prefix from nametag', () => {
-    // The implementation strips @ prefix
-    const inputs = ['@alice', 'alice', '@bob', 'bob'];
-    const expected = ['alice', 'alice', 'bob', 'bob'];
-
-    inputs.forEach((input, i) => {
-      const cleaned = input.replace('@', '').trim();
-      expect(cleaned).toBe(expected[i]);
+describe('Nametag normalization in minter', () => {
+  it('should normalize uppercase to lowercase before TokenId.fromNameTag', async () => {
+    const mockClient = {
+      isMinted: vi.fn().mockResolvedValue(false),
+    };
+    const minter = new NametagMinter({
+      stateTransitionClient: mockClient,
+      trustBase: {},
+      signingService: { algorithm: 1, publicKey: new Uint8Array(33) } as any,
     });
+
+    const expectedAlice = await TokenId.fromNameTag('alice');
+    const expectedBob = await TokenId.fromNameTag('bob');
+
+    await minter.isNametagAvailable('Alice');
+    await minter.isNametagAvailable('@BOB');
+
+    // Verify the TokenId passed to isMinted matches the lowercased nametag
+    const call1TokenId = mockClient.isMinted.mock.calls[0][1];
+    const call2TokenId = mockClient.isMinted.mock.calls[1][1];
+    expect(call1TokenId.toString()).toBe(expectedAlice.toString());
+    expect(call2TokenId.toString()).toBe(expectedBob.toString());
   });
 
-  it('should trim whitespace from nametag', () => {
-    const inputs = ['  alice  ', '@  bob  ', ' charlie'];
-    const expected = ['alice', 'bob', 'charlie'];
-
-    inputs.forEach((input, i) => {
-      const cleaned = input.replace('@', '').trim();
-      expect(cleaned).toBe(expected[i]);
+  it('should strip @ prefix from nametag', async () => {
+    const mockClient = {
+      isMinted: vi.fn().mockResolvedValue(false),
+    };
+    const minter = new NametagMinter({
+      stateTransitionClient: mockClient,
+      trustBase: {},
+      signingService: { algorithm: 1, publicKey: new Uint8Array(33) } as any,
     });
+
+    await minter.isNametagAvailable('@alice');
+    await minter.isNametagAvailable('alice');
+
+    // Both should produce the same TokenId (@ stripped before TokenId.fromNameTag)
+    const call1TokenId = mockClient.isMinted.mock.calls[0][1];
+    const call2TokenId = mockClient.isMinted.mock.calls[1][1];
+    expect(call1TokenId.toString()).toBe(call2TokenId.toString());
   });
 
-  it('should handle various nametag formats', () => {
-    const validNametags = [
-      'alice',
-      'bob123',
-      'user_name',
-      'test-user',
-      'CamelCase',
-    ];
-
-    validNametags.forEach(nametag => {
-      expect(nametag.length).toBeGreaterThan(0);
+  it('should strip @unicity suffix via normalizeNametag', async () => {
+    const mockClient = {
+      isMinted: vi.fn().mockResolvedValue(false),
+    };
+    const minter = new NametagMinter({
+      stateTransitionClient: mockClient,
+      trustBase: {},
+      signingService: { algorithm: 1, publicKey: new Uint8Array(33) } as any,
     });
+
+    const expectedAlice = await TokenId.fromNameTag('alice');
+
+    await minter.isNametagAvailable('alice@unicity');
+
+    // Should resolve to 'alice' after suffix stripping
+    const callTokenId = mockClient.isMinted.mock.calls[0][1];
+    expect(callTokenId.toString()).toBe(expectedAlice.toString());
+  });
+
+  it('should produce same token ID for Alice and alice', async () => {
+    const mockClient = {
+      isMinted: vi.fn().mockResolvedValue(false),
+    };
+    const minter = new NametagMinter({
+      stateTransitionClient: mockClient,
+      trustBase: {},
+      signingService: { algorithm: 1, publicKey: new Uint8Array(33) } as any,
+    });
+
+    await minter.isNametagAvailable('Alice');
+    await minter.isNametagAvailable('alice');
+
+    // Both should resolve to the same token ID (both normalized to 'alice')
+    const call1TokenId = mockClient.isMinted.mock.calls[0][1];
+    const call2TokenId = mockClient.isMinted.mock.calls[1][1];
+    expect(call1TokenId.toString()).toBe(call2TokenId.toString());
   });
 });
 

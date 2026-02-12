@@ -68,11 +68,14 @@ import { InstantSplitExecutor } from './InstantSplitExecutor';
 import { InstantSplitProcessor } from './InstantSplitProcessor';
 import type {
   InstantSplitBundle,
-  InstantSplitResult,
+  InstantSplitBundleV5,
   InstantSplitProcessResult,
   InstantSplitOptions,
+  InstantSplitResult,
+  PendingV5Finalization,
+  UnconfirmedResolutionResult,
 } from '../../types/instant-split';
-import { isInstantSplitBundle } from '../../types/instant-split';
+import { isInstantSplitBundle, isInstantSplitBundleV5 } from '../../types/instant-split';
 
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
@@ -84,8 +87,14 @@ import { AddressScheme } from '@unicitylabs/state-transition-sdk/lib/address/Add
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
+import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
+import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
+import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
+import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
+import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
+import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
 
 // =============================================================================
 // Transaction History Entry
@@ -100,7 +109,36 @@ export interface TransactionHistoryEntry {
   timestamp: number;
   recipientNametag?: string;
   senderPubkey?: string;
-  txHash?: string;
+  /** TransferResult.id that created this entry (links history to transfer operation) */
+  transferId?: string;
+}
+
+// =============================================================================
+// Receive Options & Result
+// =============================================================================
+
+export interface ReceiveOptions {
+  /** Wait for all unconfirmed tokens to be finalized (default: false).
+   *  When false, calls resolveUnconfirmed() once to submit pending commitments.
+   *  When true, polls resolveUnconfirmed() + load() until all confirmed or timeout. */
+  finalize?: boolean;
+  /** Finalization timeout in ms (default: 60000). Only used when finalize=true. */
+  timeout?: number;
+  /** Poll interval in ms (default: 2000). Only used when finalize=true. */
+  pollInterval?: number;
+  /** Progress callback after each resolveUnconfirmed() poll. Only used when finalize=true. */
+  onProgress?: (result: UnconfirmedResolutionResult) => void;
+}
+
+export interface ReceiveResult {
+  /** Newly received incoming transfers. */
+  transfers: IncomingTransfer[];
+  /** Finalization result (from resolveUnconfirmed). */
+  finalization?: UnconfirmedResolutionResult;
+  /** Whether finalization timed out (only when finalize=true). */
+  timedOut?: boolean;
+  /** Duration of finalization in ms (only when finalize=true). */
+  finalizationDurationMs?: number;
 }
 
 // =============================================================================
@@ -157,7 +195,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 
       // Try to get token ID
       if (sdkToken.id) {
-        defaultInfo.tokenId = sdkToken.id.toString();
+        defaultInfo.tokenId = sdkToken.id.toJSON();
       }
 
       // Extract coinId from SDK token's coins structure (lottery-compatible)
@@ -381,6 +419,17 @@ function extractTokenStateKey(token: Token): string | null {
 }
 
 /**
+ * Convert hex string to Uint8Array
+ */
+function fromHex(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+/**
  * Check if two tokens have the same genesis tokenId (same token, possibly different states)
  */
 function hasSameGenesisTokenId(t1: Token, t2: Token): boolean {
@@ -533,8 +582,8 @@ export interface PaymentsModuleConfig {
   maxRetries?: number;
   /** Enable debug logging */
   debug?: boolean;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1PaymentsModuleConfig;
+  /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
+  l1?: L1PaymentsModuleConfig | null;
 }
 
 // =============================================================================
@@ -591,6 +640,7 @@ export class PaymentsModule {
   // Token State
   private tokens: Map<string, Token> = new Map();
   private pendingTransfers: Map<string, TransferResult> = new Map();
+  private pendingBackgroundTasks: Promise<void>[] = [];
 
   // Repository State (tombstones, archives, forked, history)
   private tombstones: TombstoneEntry[] = [];
@@ -623,6 +673,14 @@ export class PaymentsModule {
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
 
+  // Storage event subscriptions (push-based sync)
+  private storageEventUnsubscribers: (() => void)[] = [];
+  private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SYNC_DEBOUNCE_MS = 500;
+
+  /** Sync coalescing: concurrent sync() calls share the same operation */
+  private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -632,12 +690,16 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
-    // Initialize L1 sub-module only if electrumUrl is provided
-    const l1Enabled = config?.l1?.electrumUrl && config.l1.electrumUrl.length > 0;
-    this.l1 = l1Enabled ? new L1PaymentsModule(config?.l1) : null;
+    // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
+    // Only skip if l1 is explicitly set to null.
+    this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
   }
 
-  /** Get module configuration */
+  /**
+   * Get the current module configuration (excluding L1 config).
+   *
+   * @returns Resolved configuration with all defaults applied.
+   */
   getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
     return this.moduleConfig;
   }
@@ -690,9 +752,9 @@ export class PaymentsModule {
     }
 
     // Subscribe to incoming transfers
-    this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) => {
-      this.handleIncomingTransfer(transfer);
-    });
+    this.unsubscribeTransfers = deps.transport.onTokenTransfer((transfer) =>
+      this.handleIncomingTransfer(transfer)
+    );
 
     // Subscribe to incoming payment requests (if supported)
     if (deps.transport.onPaymentRequest) {
@@ -707,10 +769,17 @@ export class PaymentsModule {
         this.handlePaymentRequestResponse(response);
       });
     }
+
+    // Subscribe to storage provider events (push-based sync)
+    this.subscribeToStorageEvents();
   }
 
   /**
-   * Load tokens from storage
+   * Load all token data from storage providers and restore wallet state.
+   *
+   * Loads tokens, nametag data, transaction history, and pending transfers
+   * from configured storage providers. Restores pending V5 tokens and
+   * triggers a fire-and-forget {@link resolveUnconfirmed} call.
    */
   async load(): Promise<void> {
     this.ensureInitialized();
@@ -730,6 +799,11 @@ export class PaymentsModule {
         console.error(`[Payments] Failed to load from provider ${id}:`, err);
       }
     }
+
+    // Restore pending V5 tokens BEFORE file storage loading
+    // (must come first because loadTokensFromFileStorage calls save() which
+    // would overwrite pending V5 data if the tokens aren't in memory yet)
+    await this.loadPendingV5Tokens();
 
     // Load active tokens from token-xxx files (primary storage for tokens)
     await this.loadTokensFromFileStorage();
@@ -756,10 +830,16 @@ export class PaymentsModule {
         this.pendingTransfers.set(transfer.id, transfer);
       }
     }
+
+    // After loading, try to resolve any unconfirmed tokens
+    this.resolveUnconfirmed().catch(() => {});
   }
 
   /**
-   * Cleanup resources
+   * Cleanup all subscriptions, polling jobs, and pending resolvers.
+   *
+   * Should be called when the wallet is being shut down or the module is
+   * no longer needed. Also destroys the L1 sub-module if present.
    */
   destroy(): void {
     this.unsubscribeTransfers?.();
@@ -782,6 +862,9 @@ export class PaymentsModule {
     }
     this.pendingResponseResolvers.clear();
 
+    // Clean up storage event subscriptions
+    this.unsubscribeStorageEvents();
+
     if (this.l1) {
       this.l1.destroy();
     }
@@ -803,6 +886,7 @@ export class PaymentsModule {
       id: crypto.randomUUID(),
       status: 'pending',
       tokens: [],
+      tokenTransfers: [],
     };
 
     try {
@@ -858,100 +942,191 @@ export class PaymentsModule {
 
       const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
 
+      const transferMode = request.transferMode ?? 'instant';
+
       // Handle split if required
       if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-        this.log('Executing token split...');
+        if (transferMode === 'conservative') {
+          // Conservative split: use TokenSplitExecutor — collects all proofs before sending
+          this.log('Executing conservative split...');
+          const splitExecutor = new TokenSplitExecutor({
+            stateTransitionClient: stClient,
+            trustBase,
+            signingService,
+          });
 
-        const executor = new TokenSplitExecutor({
-          stateTransitionClient: stClient,
-          trustBase,
-          signingService,
-        });
+          const splitResult = await splitExecutor.executeSplit(
+            splitPlan.tokenToSplit.sdkToken,
+            splitPlan.splitAmount!,
+            splitPlan.remainderAmount!,
+            splitPlan.coinId,
+            recipientAddress,
+          );
 
-        const splitResult = await executor.executeSplit(
-          splitPlan.tokenToSplit.sdkToken,
-          splitPlan.splitAmount!,
-          splitPlan.remainderAmount!,
-          splitPlan.coinId,
-          recipientAddress
-        );
+          // Save change token
+          const changeTokenData = splitResult.tokenForSender.toJSON();
+          const changeUiToken: Token = {
+            id: crypto.randomUUID(),
+            coinId: request.coinId,
+            symbol: this.getCoinSymbol(request.coinId),
+            name: this.getCoinName(request.coinId),
+            decimals: this.getCoinDecimals(request.coinId),
+            iconUrl: this.getCoinIconUrl(request.coinId),
+            amount: splitPlan.remainderAmount!.toString(),
+            status: 'confirmed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: JSON.stringify(changeTokenData),
+          };
+          await this.addToken(changeUiToken, true);
+          this.log(`Conservative split: change token saved: ${changeUiToken.id}`);
 
-        // Save change token for sender
-        const changeTokenData = splitResult.tokenForSender.toJSON();
-        const changeToken: Token = {
-          id: crypto.randomUUID(),
-          coinId: request.coinId,
-          symbol: this.getCoinSymbol(request.coinId),
-          name: this.getCoinName(request.coinId),
-          decimals: this.getCoinDecimals(request.coinId),
-          iconUrl: this.getCoinIconUrl(request.coinId),
-          amount: splitPlan.remainderAmount!.toString(),
-          status: 'confirmed',
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          sdkData: JSON.stringify(changeTokenData),
-        };
-        await this.addToken(changeToken, true); // Skip history for change
-        this.log(`Change token saved: ${changeToken.id}, amount: ${changeToken.amount}`);
+          // Send fully finalized { sourceToken, transferTx } via Nostr
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(splitResult.tokenForRecipient.toJSON()),
+            transferTx: JSON.stringify(splitResult.recipientTransferTx.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
 
-        // Send recipient token via Nostr (Sphere format)
-        console.log(`[Payments] Sending split token to ${recipientPubkey.slice(0, 8)}... via Nostr`);
-        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-          sourceToken: JSON.stringify(splitResult.tokenForRecipient.toJSON()),
-          transferTx: JSON.stringify(splitResult.recipientTransferTx.toJSON()),
-          memo: request.memo,
-        } as unknown as import('../../transport').TokenTransferPayload);
-        console.log(`[Payments] Split token sent successfully`);
+          // Get request ID from the transfer commitment for tracking
+          const splitCommitmentRequestId = splitResult.recipientTransferTx?.data?.requestId
+            ?? splitResult.recipientTransferTx?.requestId;
+          const splitRequestIdHex = splitCommitmentRequestId instanceof Uint8Array
+            ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
+            : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
-        // Remove the original token that was split — skipHistory because we record below
-        await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag, true);
+          // Remove the original token that was split — skipHistory because we record below
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag, true);
+          result.tokenTransfers.push({
+            sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
+            method: 'split',
+            requestIdHex: splitRequestIdHex,
+          });
+          this.log(`Conservative split transfer completed`);
+        } else {
+          // Instant split: use InstantSplitExecutor for fast (~2.3s) splits
+          this.log('Executing instant split...');
 
-        result.txHash = 'split-' + Date.now().toString(16);
-        this.log(`Split transfer completed`);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
+          const executor = new InstantSplitExecutor({
+            stateTransitionClient: stClient,
+            trustBase,
+            signingService,
+            devMode,
+          });
+
+          const instantResult = await executor.executeSplitInstant(
+            splitPlan.tokenToSplit.sdkToken,
+            splitPlan.splitAmount!,
+            splitPlan.remainderAmount!,
+            splitPlan.coinId,
+            recipientAddress,
+            this.deps!.transport,
+            recipientPubkey,
+            {
+              onChangeTokenCreated: async (changeToken) => {
+                const changeTokenData = changeToken.toJSON();
+                const uiToken: Token = {
+                  id: crypto.randomUUID(),
+                  coinId: request.coinId,
+                  symbol: this.getCoinSymbol(request.coinId),
+                  name: this.getCoinName(request.coinId),
+                  decimals: this.getCoinDecimals(request.coinId),
+                  iconUrl: this.getCoinIconUrl(request.coinId),
+                  amount: splitPlan.remainderAmount!.toString(),
+                  status: 'confirmed',
+                  createdAt: Date.now(),
+                  updatedAt: Date.now(),
+                  sdkData: JSON.stringify(changeTokenData),
+                };
+                await this.addToken(uiToken, true);
+                this.log(`Change token saved via background: ${uiToken.id}`);
+              },
+              onStorageSync: async () => {
+                await this.save();
+                return true;
+              },
+            }
+          );
+
+          if (!instantResult.success) {
+            throw new Error(instantResult.error || 'Instant split failed');
+          }
+
+          // Track background task for change token creation
+          if (instantResult.backgroundPromise) {
+            this.pendingBackgroundTasks.push(instantResult.backgroundPromise);
+          }
+
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+          result.tokenTransfers.push({
+            sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
+            method: 'split',
+            splitGroupId: instantResult.splitGroupId,
+            nostrEventId: instantResult.nostrEventId,
+          });
+          this.log(`Instant split transfer completed`);
+        }
       }
 
-      // Transfer direct tokens (no split needed) - standard aggregator-first flow
-      // NOTE: NOSTR-FIRST for direct transfers has receiver-side issues with commitment validation.
-      // The InstantSplit V5 flow is used for splits which provides fast transfers.
-      // For direct (non-split) tokens, we use the proven standard flow.
+      // Transfer direct tokens (no split needed)
       for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
         const token = tokenWithAmount.uiToken;
 
         // Create SDK transfer commitment
         const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
 
-        // Submit commitment via SDK
-        const response = await stClient.submitTransferCommitment(commitment);
-        if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
-          throw new Error(`Transfer commitment failed: ${response.status}`);
-        }
+        if (transferMode === 'conservative') {
+          // Conservative direct: wait for proof, then send fully finalized transfer
+          console.log(`[Payments] CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
 
-        // Wait for inclusion proof using SDK
-        if (!this.deps!.oracle.waitForProofSdk) {
-          throw new Error('Oracle provider must implement waitForProofSdk()');
-        }
-        const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
+          // Submit commitment to aggregator and wait for inclusion proof
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
+            throw new Error(`Transfer commitment failed: ${submitResponse.status}`);
+          }
 
-        // Create transfer transaction
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const transferTx = commitment.toTransaction(inclusionProof as any);
+          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+          const transferTx = commitment.toTransaction(inclusionProof);
+
+          // Send fully finalized { sourceToken, transferTx } via Nostr
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            transferTx: JSON.stringify(transferTx.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          console.log(`[Payments] CONSERVATIVE: Direct token sent successfully`);
+        } else {
+          // Instant direct: NOSTR-FIRST - send commitment + source token via Nostr immediately
+          // Submit to aggregator in background. Receiver handles via handleCommitmentOnlyTransfer().
+          console.log(`[Payments] NOSTR-FIRST: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            commitmentData: JSON.stringify(commitment.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          console.log(`[Payments] NOSTR-FIRST: Direct token sent successfully`);
+
+          // Submit commitment to aggregator in background (fire-and-forget)
+          stClient.submitTransferCommitment(commitment).catch(err =>
+            console.error('[Payments] Background commitment submit failed:', err)
+          );
+        }
 
         // Get request ID as hex string for tracking
         const requestIdBytes = commitment.requestId;
-        result.txHash = requestIdBytes instanceof Uint8Array
+        const requestIdHex = requestIdBytes instanceof Uint8Array
           ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
           : String(requestIdBytes);
 
-        // Send via transport (Nostr) - use Sphere-compatible format
-        console.log(`[Payments] Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}... via Nostr`);
-        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-          sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
-          transferTx: JSON.stringify(transferTx.toJSON()),
-          memo: request.memo,
-        } as unknown as import('../../transport').TokenTransferPayload);
-        console.log(`[Payments] Direct token sent successfully`);
+        result.tokenTransfers.push({
+          sourceTokenId: token.id,
+          method: 'direct',
+          requestIdHex,
+        });
 
-        this.log(`Token ${token.id} transferred, txHash: ${result.txHash}`);
+        this.log(`Token ${token.id} sent via ${transferMode.toUpperCase()}, requestId: ${requestIdHex}`);
 
         // Remove sent token (creates tombstone) — skipHistory because we record below
         await this.removeToken(token.id, recipientNametag, true);
@@ -973,6 +1148,7 @@ export class PaymentsModule {
         symbol: this.getCoinSymbol(request.coinId),
         timestamp: Date.now(),
         recipientNametag,
+        transferId: result.id,
       });
 
       this.deps!.emitEvent('transfer:confirmed', result);
@@ -1146,6 +1322,11 @@ export class PaymentsModule {
       );
 
       if (result.success) {
+        // Track background task for change token creation
+        if (result.backgroundPromise) {
+          this.pendingBackgroundTasks.push(result.backgroundPromise);
+        }
+
         // Remove the original token — skipHistory because we record below
         const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
         await this.removeToken(tokenToSplit.id, recipientNametag, true);
@@ -1192,17 +1373,87 @@ export class PaymentsModule {
    * @param senderPubkey - Sender's public key for verification
    * @returns Processing result with finalized token
    */
-  async processInstantSplitBundle(
+  private async processInstantSplitBundle(
     bundle: InstantSplitBundle,
     senderPubkey: string
   ): Promise<InstantSplitProcessResult> {
     this.ensureInitialized();
 
+    if (!isInstantSplitBundleV5(bundle)) {
+      // V4 (dev mode) still processes synchronously
+      return this.processInstantSplitBundleSync(bundle, senderPubkey);
+    }
+
+    // V5: save immediately as unconfirmed, resolve proofs lazily
     try {
-      // Create signing service
+      // Use deterministic ID from splitGroupId to deduplicate Nostr re-deliveries
+      const deterministicId = `v5split_${bundle.splitGroupId}`;
+      if (this.tokens.has(deterministicId)) {
+        this.log(`V5 bundle ${deterministicId.slice(0, 16)}... already exists, skipping duplicate`);
+        return { success: true, durationMs: 0 };
+      }
+
+      const registry = TokenRegistry.getInstance();
+      const pendingData: PendingV5Finalization = {
+        type: 'v5_bundle',
+        stage: 'RECEIVED',
+        bundleJson: JSON.stringify(bundle),
+        senderPubkey,
+        savedAt: Date.now(),
+        attemptCount: 0,
+      };
+
+      const uiToken: Token = {
+        id: deterministicId,
+        coinId: bundle.coinId,
+        symbol: registry.getSymbol(bundle.coinId) || bundle.coinId,
+        name: registry.getName(bundle.coinId) || bundle.coinId,
+        decimals: registry.getDecimals(bundle.coinId) ?? 8,
+        amount: bundle.amount,
+        status: 'submitted',  // UNCONFIRMED
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        sdkData: JSON.stringify({ _pendingFinalization: pendingData }),
+      };
+
+      await this.addToken(uiToken, false);
+      this.log(`V5 bundle saved as unconfirmed: ${uiToken.id.slice(0, 8)}...`);
+
+      // Emit incoming transfer event
+      this.deps!.emitEvent('transfer:incoming', {
+        id: bundle.splitGroupId,
+        senderPubkey,
+        tokens: [uiToken],
+        receivedAt: Date.now(),
+      });
+
+      await this.save();
+
+      // Fire-and-forget: try to resolve immediately
+      this.resolveUnconfirmed().catch(() => {});
+
+      return { success: true, durationMs: 0 };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        success: false,
+        error: errorMessage,
+        durationMs: 0,
+      };
+    }
+  }
+
+  /**
+   * Synchronous V4 bundle processing (dev mode only).
+   * Kept for backward compatibility with V4 bundles.
+   */
+  private async processInstantSplitBundleSync(
+    bundle: InstantSplitBundle,
+    senderPubkey: string
+  ): Promise<InstantSplitProcessResult> {
+    try {
       const signingService = await this.createSigningService();
 
-      // Get state transition client and trust base
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
         throw new Error('State transition client not available');
@@ -1213,18 +1464,15 @@ export class PaymentsModule {
         throw new Error('Trust base not available');
       }
 
-      // Check if dev mode
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
 
-      // Create processor
       const processor = new InstantSplitProcessor({
         stateTransitionClient: stClient,
         trustBase,
         devMode,
       });
 
-      // Process the bundle
       const result = await processor.processReceivedBundle(
         bundle,
         signingService,
@@ -1252,7 +1500,6 @@ export class PaymentsModule {
       );
 
       if (result.success && result.token) {
-        // Save the received token
         const tokenData = result.token.toJSON();
         const info = await parseTokenInfo(tokenData);
 
@@ -1272,7 +1519,6 @@ export class PaymentsModule {
 
         await this.addToken(uiToken);
 
-        // Add to history
         await this.addToHistory({
           type: 'RECEIVED',
           amount: bundle.amount,
@@ -1284,7 +1530,6 @@ export class PaymentsModule {
 
         await this.save();
 
-        // Emit event
         this.deps!.emitEvent('transfer:incoming', {
           id: bundle.splitGroupId,
           senderPubkey,
@@ -1305,9 +1550,12 @@ export class PaymentsModule {
   }
 
   /**
-   * Check if a payload is an instant split bundle
+   * Type-guard: check whether a payload is a valid {@link InstantSplitBundle} (V4 or V5).
+   *
+   * @param payload - The object to test.
+   * @returns `true` if the payload matches the InstantSplitBundle shape.
    */
-  isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
+  private isInstantSplitBundle(payload: unknown): payload is InstantSplitBundle {
     return isInstantSplitBundle(payload);
   }
 
@@ -1407,14 +1655,21 @@ export class PaymentsModule {
   }
 
   /**
-   * Get pending payment requests count
+   * Get the count of payment requests with status `'pending'`.
+   *
+   * @returns Number of pending incoming payment requests.
    */
   getPendingPaymentRequestsCount(): number {
     return this.paymentRequests.filter((r) => r.status === 'pending').length;
   }
 
   /**
-   * Accept a payment request (marks it as accepted, user should then call send())
+   * Accept a payment request and notify the requester.
+   *
+   * Marks the request as `'accepted'` and sends a response via transport.
+   * The caller should subsequently call {@link send} to fulfill the payment.
+   *
+   * @param requestId - ID of the incoming payment request to accept.
    */
   async acceptPaymentRequest(requestId: string): Promise<void> {
     this.updatePaymentRequestStatus(requestId, 'accepted');
@@ -1422,7 +1677,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Reject a payment request
+   * Reject a payment request and notify the requester.
+   *
+   * @param requestId - ID of the incoming payment request to reject.
    */
   async rejectPaymentRequest(requestId: string): Promise<void> {
     this.updatePaymentRequestStatus(requestId, 'rejected');
@@ -1430,21 +1687,30 @@ export class PaymentsModule {
   }
 
   /**
-   * Mark a payment request as paid (after successful transfer)
+   * Mark a payment request as paid (local status update only).
+   *
+   * Typically called after a successful {@link send} to record that the
+   * request has been fulfilled.
+   *
+   * @param requestId - ID of the incoming payment request to mark as paid.
    */
   markPaymentRequestPaid(requestId: string): void {
     this.updatePaymentRequestStatus(requestId, 'paid');
   }
 
   /**
-   * Clear processed (non-pending) payment requests
+   * Remove all non-pending incoming payment requests from memory.
+   *
+   * Keeps only requests with status `'pending'`.
    */
   clearProcessedPaymentRequests(): void {
     this.paymentRequests = this.paymentRequests.filter((r) => r.status === 'pending');
   }
 
   /**
-   * Remove a specific payment request
+   * Remove a specific incoming payment request by ID.
+   *
+   * @param requestId - ID of the payment request to remove.
    */
   removePaymentRequest(requestId: string): void {
     this.paymentRequests = this.paymentRequests.filter((r) => r.id !== requestId);
@@ -1510,12 +1776,17 @@ export class PaymentsModule {
     }
 
     // Convert transport request to IncomingPaymentRequest
+    const coinId = transportRequest.request.coinId;
+    const registry = TokenRegistry.getInstance();
+    const coinDef = registry.getDefinition(coinId);
+
     const request: IncomingPaymentRequest = {
       id: transportRequest.id,
       senderPubkey: transportRequest.senderTransportPubkey,
+      senderNametag: transportRequest.senderNametag,
       amount: transportRequest.request.amount,
-      coinId: transportRequest.request.coinId,
-      symbol: transportRequest.request.coinId, // Use coinId as symbol for now
+      coinId,
+      symbol: coinDef?.symbol || coinId.slice(0, 8),
       message: transportRequest.request.message,
       recipientNametag: transportRequest.request.recipientNametag,
       requestId: transportRequest.request.requestId,
@@ -1602,7 +1873,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Cancel waiting for a payment response
+   * Cancel an active {@link waitForPaymentResponse} call.
+   *
+   * The pending promise is rejected with a `'Cancelled'` error.
+   *
+   * @param requestId - The outgoing request ID whose wait should be cancelled.
    */
   cancelWaitForPaymentResponse(requestId: string): void {
     const resolver = this.pendingResponseResolvers.get(requestId);
@@ -1614,7 +1889,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Remove an outgoing payment request
+   * Remove an outgoing payment request and cancel any pending wait.
+   *
+   * @param requestId - ID of the outgoing request to remove.
    */
   removeOutgoingPaymentRequest(requestId: string): void {
     this.outgoingPaymentRequests.delete(requestId);
@@ -1622,7 +1899,7 @@ export class PaymentsModule {
   }
 
   /**
-   * Clear completed/expired outgoing payment requests
+   * Remove all outgoing payment requests that are `'paid'`, `'rejected'`, or `'expired'`.
    */
   clearCompletedOutgoingPaymentRequests(): void {
     for (const [id, request] of this.outgoingPaymentRequests) {
@@ -1720,6 +1997,103 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
+  // Public API - Receive
+  // ===========================================================================
+
+  /**
+   * Fetch and process pending incoming transfers from the transport layer.
+   *
+   * Performs a one-shot query to fetch all pending events, processes them
+   * through the existing pipeline, and resolves after all stored events
+   * are handled. Useful for batch/CLI apps that need explicit receive.
+   *
+   * When `finalize` is true, polls resolveUnconfirmed() + load() until all
+   * tokens are confirmed or the timeout expires. Otherwise calls
+   * resolveUnconfirmed() once to submit pending commitments.
+   *
+   * @param options - Optional receive options including finalization control
+   * @param callback - Optional callback invoked for each newly received transfer
+   * @returns ReceiveResult with transfers and finalization metadata
+   */
+  async receive(
+    options?: ReceiveOptions,
+    callback?: (transfer: IncomingTransfer) => void,
+  ): Promise<ReceiveResult> {
+    this.ensureInitialized();
+
+    if (!this.deps!.transport.fetchPendingEvents) {
+      throw new Error('Transport provider does not support fetchPendingEvents');
+    }
+
+    const opts = options ?? {};
+
+    // Phase 1: Fetch pending events
+    // Snapshot token keys before fetch
+    const tokensBefore = new Set(this.tokens.keys());
+
+    // Fetch and process — events flow through handleIncomingTransfer() pipeline.
+    // fetchPendingEvents() collects events until EOSE, then processes sequentially
+    // with await. Event dedup in the transport layer prevents double-processing
+    // with the persistent subscription.
+    await this.deps!.transport.fetchPendingEvents();
+
+    // Reload from storage to get a clean, consistent state.
+    // Handlers save tokens during processing (with potentially different IDs for
+    // V5 pending tokens vs finalized tokens). load() clears the in-memory map
+    // and reloads from TXF + pending V5 storage, ensuring no duplicates.
+    await this.load();
+
+    // Identify newly added tokens
+    const received: IncomingTransfer[] = [];
+    for (const [tokenId, token] of this.tokens) {
+      if (!tokensBefore.has(tokenId)) {
+        const transfer: IncomingTransfer = {
+          id: tokenId,
+          senderPubkey: '',
+          tokens: [token],
+          receivedAt: Date.now(),
+        };
+        received.push(transfer);
+        if (callback) callback(transfer);
+      }
+    }
+
+    // Phase 2: Finalization
+    const result: ReceiveResult = { transfers: received };
+
+    if (opts.finalize) {
+      const timeout = opts.timeout ?? 60_000;
+      const pollInterval = opts.pollInterval ?? 2_000;
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < timeout) {
+        const resolution = await this.resolveUnconfirmed();
+        result.finalization = resolution;
+        if (opts.onProgress) opts.onProgress(resolution);
+
+        // Check if any unconfirmed tokens remain
+        const stillUnconfirmed = Array.from(this.tokens.values()).some(
+          t => t.status === 'submitted' || t.status === 'pending'
+        );
+        if (!stillUnconfirmed) break;
+
+        await new Promise(r => setTimeout(r, pollInterval));
+        await this.load();
+      }
+
+      result.finalizationDurationMs = Date.now() - startTime;
+      result.timedOut = Array.from(this.tokens.values()).some(
+        t => t.status === 'submitted' || t.status === 'pending'
+      );
+    } else {
+      // Non-finalize: submit commitments once (fire-and-forget style)
+      result.finalization = await this.resolveUnconfirmed();
+    }
+
+    return result;
+  }
+
+  // ===========================================================================
   // Public API - Balance & Tokens
   // ===========================================================================
 
@@ -1731,10 +2105,21 @@ export class PaymentsModule {
   }
 
   /**
-   * Get total portfolio value in USD
-   * Returns null if PriceProvider is not configured
+   * Wait for all pending background operations (e.g., instant split change token creation).
+   * Call this before process exit to ensure all tokens are saved.
    */
-  async getBalance(): Promise<number | null> {
+  async waitForPendingOperations(): Promise<void> {
+    if (this.pendingBackgroundTasks.length > 0) {
+      await Promise.allSettled(this.pendingBackgroundTasks);
+      this.pendingBackgroundTasks = [];
+    }
+  }
+
+  /**
+   * Get total portfolio value in USD.
+   * Returns null if PriceProvider is not configured.
+   */
+  async getFiatBalance(): Promise<number | null> {
     const assets = await this.getAssets();
 
     if (!this.priceProvider) {
@@ -1755,33 +2140,120 @@ export class PaymentsModule {
   }
 
   /**
-   * Get aggregated assets (tokens grouped by coinId) with price data
-   * Only includes confirmed tokens
+   * Get token balances grouped by coin type.
+   *
+   * Returns an array of {@link Asset} objects, one per coin type held.
+   * Each entry includes confirmed and unconfirmed breakdowns. Tokens with
+   * status `'spent'`, `'invalid'`, or `'transferring'` are excluded.
+   *
+   * This is synchronous — no price data is included. Use {@link getAssets}
+   * for the async version with fiat pricing.
+   *
+   * @param coinId - Optional coin ID to filter by (e.g. hex string). When omitted, all coin types are returned.
+   * @returns Array of balance summaries (synchronous — no await needed).
+   */
+  getBalance(coinId?: string): Asset[] {
+    return this.aggregateTokens(coinId);
+  }
+
+  /**
+   * Get aggregated assets (tokens grouped by coinId) with price data.
+   * Includes both confirmed and unconfirmed tokens with breakdown.
    */
   async getAssets(coinId?: string): Promise<Asset[]> {
-    // Aggregate tokens by coinId
+    const rawAssets = this.aggregateTokens(coinId);
+
+    // Fetch prices if provider is available
+    if (!this.priceProvider || rawAssets.length === 0) {
+      return rawAssets;
+    }
+
+    try {
+      const registry = TokenRegistry.getInstance();
+      const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
+
+      for (const asset of rawAssets) {
+        const def = registry.getDefinition(asset.coinId);
+        if (def?.name) {
+          const existing = nameToCoins.get(def.name);
+          if (existing) {
+            existing.push(asset.coinId);
+          } else {
+            nameToCoins.set(def.name, [asset.coinId]);
+          }
+        }
+      }
+
+      if (nameToCoins.size > 0) {
+        const tokenNames = Array.from(nameToCoins.keys());
+        const prices = await this.priceProvider.getPrices(tokenNames);
+
+        return rawAssets.map((raw) => {
+          const def = registry.getDefinition(raw.coinId);
+          const price = def?.name ? prices.get(def.name) : undefined;
+          let fiatValueUsd: number | null = null;
+          let fiatValueEur: number | null = null;
+
+          if (price) {
+            const humanAmount = Number(raw.totalAmount) / Math.pow(10, raw.decimals);
+            fiatValueUsd = humanAmount * price.priceUsd;
+            if (price.priceEur != null) {
+              fiatValueEur = humanAmount * price.priceEur;
+            }
+          }
+
+          return {
+            ...raw,
+            priceUsd: price?.priceUsd ?? null,
+            priceEur: price?.priceEur ?? null,
+            change24h: price?.change24h ?? null,
+            fiatValueUsd,
+            fiatValueEur,
+          };
+        });
+      }
+    } catch (error) {
+      console.warn('[Payments] Failed to fetch prices, returning assets without price data:', error);
+    }
+
+    return rawAssets;
+  }
+
+  /**
+   * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
+   * Excludes tokens with status 'spent', 'invalid', or 'transferring'.
+   */
+  private aggregateTokens(coinId?: string): Asset[] {
     const assetsMap = new Map<string, {
       coinId: string;
       symbol: string;
       name: string;
       decimals: number;
       iconUrl?: string;
-      totalAmount: string;
-      tokenCount: number;
+      confirmedAmount: bigint;
+      unconfirmedAmount: bigint;
+      confirmedTokenCount: number;
+      unconfirmedTokenCount: number;
     }>();
 
     for (const token of this.tokens.values()) {
-      if (token.status !== 'confirmed') continue;
+      // Skip spent, invalid, and transferring tokens
+      if (token.status === 'spent' || token.status === 'invalid' || token.status === 'transferring') continue;
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
+      const amount = BigInt(token.amount);
+      const isConfirmed = token.status === 'confirmed';
       const existing = assetsMap.get(key);
 
       if (existing) {
-        existing.totalAmount = (
-          BigInt(existing.totalAmount) + BigInt(token.amount)
-        ).toString();
-        existing.tokenCount++;
+        if (isConfirmed) {
+          existing.confirmedAmount += amount;
+          existing.confirmedTokenCount++;
+        } else {
+          existing.unconfirmedAmount += amount;
+          existing.unconfirmedTokenCount++;
+        }
       } else {
         assetsMap.set(key, {
           coinId: token.coinId,
@@ -1789,90 +2261,44 @@ export class PaymentsModule {
           name: token.name,
           decimals: token.decimals,
           iconUrl: token.iconUrl,
-          totalAmount: token.amount,
-          tokenCount: 1,
+          confirmedAmount: isConfirmed ? amount : 0n,
+          unconfirmedAmount: isConfirmed ? 0n : amount,
+          confirmedTokenCount: isConfirmed ? 1 : 0,
+          unconfirmedTokenCount: isConfirmed ? 0 : 1,
         });
       }
     }
 
-    const rawAssets = Array.from(assetsMap.values());
-
-    // Fetch prices if provider is available
-    let priceMap: Map<string, { priceUsd: number; priceEur?: number; change24h?: number }> | null = null;
-
-    if (this.priceProvider && rawAssets.length > 0) {
-      try {
-        const registry = TokenRegistry.getInstance();
-        const nameToCoins = new Map<string, string[]>(); // tokenName -> coinIds[]
-
-        for (const asset of rawAssets) {
-          const def = registry.getDefinition(asset.coinId);
-          if (def?.name) {
-            const existing = nameToCoins.get(def.name);
-            if (existing) {
-              existing.push(asset.coinId);
-            } else {
-              nameToCoins.set(def.name, [asset.coinId]);
-            }
-          }
-        }
-
-        if (nameToCoins.size > 0) {
-          const tokenNames = Array.from(nameToCoins.keys());
-          const prices = await this.priceProvider.getPrices(tokenNames);
-
-          priceMap = new Map();
-          for (const [name, coinIds] of nameToCoins) {
-            const price = prices.get(name);
-            if (price) {
-              for (const cid of coinIds) {
-                priceMap.set(cid, {
-                  priceUsd: price.priceUsd,
-                  priceEur: price.priceEur,
-                  change24h: price.change24h,
-                });
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.warn('[Payments] Failed to fetch prices, returning assets without price data:', error);
-      }
-    }
-
-    // Build final Asset array with price data
-    return rawAssets.map((raw) => {
-      const price = priceMap?.get(raw.coinId);
-      let fiatValueUsd: number | null = null;
-      let fiatValueEur: number | null = null;
-
-      if (price) {
-        const humanAmount = Number(raw.totalAmount) / Math.pow(10, raw.decimals);
-        fiatValueUsd = humanAmount * price.priceUsd;
-        if (price.priceEur != null) {
-          fiatValueEur = humanAmount * price.priceEur;
-        }
-      }
-
+    return Array.from(assetsMap.values()).map((raw) => {
+      const totalAmount = (raw.confirmedAmount + raw.unconfirmedAmount).toString();
       return {
         coinId: raw.coinId,
         symbol: raw.symbol,
         name: raw.name,
         decimals: raw.decimals,
         iconUrl: raw.iconUrl,
-        totalAmount: raw.totalAmount,
-        tokenCount: raw.tokenCount,
-        priceUsd: price?.priceUsd ?? null,
-        priceEur: price?.priceEur ?? null,
-        change24h: price?.change24h ?? null,
-        fiatValueUsd,
-        fiatValueEur,
+        totalAmount,
+        tokenCount: raw.confirmedTokenCount + raw.unconfirmedTokenCount,
+        confirmedAmount: raw.confirmedAmount.toString(),
+        unconfirmedAmount: raw.unconfirmedAmount.toString(),
+        confirmedTokenCount: raw.confirmedTokenCount,
+        unconfirmedTokenCount: raw.unconfirmedTokenCount,
+        priceUsd: null,
+        priceEur: null,
+        change24h: null,
+        fiatValueUsd: null,
+        fiatValueEur: null,
       };
     });
   }
 
   /**
-   * Get all tokens
+   * Get all tokens, optionally filtered by coin type and/or status.
+   *
+   * @param filter - Optional filter criteria.
+   * @param filter.coinId - Return only tokens of this coin type.
+   * @param filter.status - Return only tokens with this status (e.g. `'submitted'` for unconfirmed).
+   * @returns Array of matching {@link Token} objects (synchronous).
    */
   getTokens(filter?: { coinId?: string; status?: TokenStatus }): Token[] {
     let tokens = Array.from(this.tokens.values());
@@ -1888,10 +2314,393 @@ export class PaymentsModule {
   }
 
   /**
-   * Get single token
+   * Get a single token by its local ID.
+   *
+   * @param id - The local UUID assigned when the token was added.
+   * @returns The token, or `undefined` if not found.
    */
   getToken(id: string): Token | undefined {
     return this.tokens.get(id);
+  }
+
+  // ===========================================================================
+  // Public API - Unconfirmed Token Resolution
+  // ===========================================================================
+
+  /**
+   * Attempt to resolve unconfirmed (status `'submitted'`) tokens by acquiring
+   * their missing aggregator proofs.
+   *
+   * Each unconfirmed V5 token progresses through stages:
+   * `RECEIVED` → `MINT_SUBMITTED` → `MINT_PROVEN` → `TRANSFER_SUBMITTED` → `FINALIZED`
+   *
+   * Uses 500 ms quick-timeouts per proof check so the call returns quickly even
+   * when proofs are not yet available. Tokens that exceed 50 failed attempts are
+   * marked `'invalid'`.
+   *
+   * Automatically called (fire-and-forget) by {@link load}.
+   *
+   * @returns Summary with counts of resolved, still-pending, and failed tokens plus per-token details.
+   */
+  async resolveUnconfirmed(): Promise<UnconfirmedResolutionResult> {
+    this.ensureInitialized();
+    const result: UnconfirmedResolutionResult = {
+      resolved: 0,
+      stillPending: 0,
+      failed: 0,
+      details: [],
+    };
+
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.() as RootTrustBase | undefined;
+    if (!stClient || !trustBase) return result;
+
+    const signingService = await this.createSigningService();
+
+    for (const [tokenId, token] of this.tokens) {
+      if (token.status !== 'submitted') continue;
+
+      // Check for pending finalization metadata
+      const pending = this.parsePendingFinalization(token.sdkData);
+      if (!pending) {
+        // Legacy commitment-only token (existing proof polling handles these)
+        result.stillPending++;
+        continue;
+      }
+
+      if (pending.type === 'v5_bundle') {
+        const progress = await this.resolveV5Token(tokenId, token, pending, stClient, trustBase, signingService);
+        result.details.push({ tokenId, stage: pending.stage, status: progress });
+        if (progress === 'resolved') result.resolved++;
+        else if (progress === 'failed') result.failed++;
+        else result.stillPending++;
+      }
+    }
+
+    if (result.resolved > 0 || result.failed > 0) {
+      await this.save();
+    }
+    return result;
+  }
+
+  // ===========================================================================
+  // Private - V5 Lazy Resolution Helpers
+  // ===========================================================================
+
+  /**
+   * Process a single V5 token through its finalization stages with quick-timeout proof checks.
+   */
+  private async resolveV5Token(
+    tokenId: string,
+    token: Token,
+    pending: PendingV5Finalization,
+    stClient: StateTransitionClient,
+    trustBase: RootTrustBase,
+    signingService: SigningService
+  ): Promise<'resolved' | 'pending' | 'failed'> {
+    const bundle: InstantSplitBundleV5 = JSON.parse(pending.bundleJson);
+    pending.attemptCount++;
+    pending.lastAttemptAt = Date.now();
+
+    try {
+      // Stage: RECEIVED → MINT_SUBMITTED
+      if (pending.stage === 'RECEIVED') {
+        const mintDataJson = JSON.parse(bundle.recipientMintData);
+        const mintData = await MintTransactionData.fromJSON(mintDataJson);
+        const mintCommitment = await MintCommitment.create(mintData);
+        const mintResponse = await stClient.submitMintCommitment(mintCommitment);
+        if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
+          throw new Error(`Mint submission failed: ${mintResponse.status}`);
+        }
+        pending.stage = 'MINT_SUBMITTED';
+        this.updatePendingFinalization(token, pending);
+      }
+
+      // Stage: MINT_SUBMITTED → MINT_PROVEN
+      if (pending.stage === 'MINT_SUBMITTED') {
+        const mintDataJson = JSON.parse(bundle.recipientMintData);
+        const mintData = await MintTransactionData.fromJSON(mintDataJson);
+        const mintCommitment = await MintCommitment.create(mintData);
+        const proof = await this.quickProofCheck(stClient, trustBase, mintCommitment);
+        if (!proof) {
+          this.updatePendingFinalization(token, pending);
+          return 'pending';
+        }
+        pending.mintProofJson = JSON.stringify(proof);
+        pending.stage = 'MINT_PROVEN';
+        this.updatePendingFinalization(token, pending);
+      }
+
+      // Stage: MINT_PROVEN → TRANSFER_SUBMITTED
+      if (pending.stage === 'MINT_PROVEN') {
+        const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
+        const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
+        const transferResponse = await stClient.submitTransferCommitment(transferCommitment);
+        if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
+          throw new Error(`Transfer submission failed: ${transferResponse.status}`);
+        }
+        pending.stage = 'TRANSFER_SUBMITTED';
+        this.updatePendingFinalization(token, pending);
+      }
+
+      // Stage: TRANSFER_SUBMITTED → FINALIZED
+      if (pending.stage === 'TRANSFER_SUBMITTED') {
+        const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
+        const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
+        const proof = await this.quickProofCheck(stClient, trustBase, transferCommitment);
+        if (!proof) {
+          this.updatePendingFinalization(token, pending);
+          return 'pending';
+        }
+
+        // Finalize: reconstruct minted token, create recipient state, finalize
+        const finalizedToken = await this.finalizeFromV5Bundle(bundle, pending, signingService, stClient, trustBase);
+
+        // Replace token with confirmed version containing real SDK data
+        const confirmedToken: Token = {
+          id: token.id,
+          coinId: token.coinId,
+          symbol: token.symbol,
+          name: token.name,
+          decimals: token.decimals,
+          iconUrl: token.iconUrl,
+          amount: token.amount,
+          status: 'confirmed',
+          createdAt: token.createdAt,
+          updatedAt: Date.now(),
+          sdkData: JSON.stringify(finalizedToken.toJSON()),
+        };
+        this.tokens.set(tokenId, confirmedToken);
+
+        // Update individual file
+        await this.saveTokenToFileStorage(confirmedToken);
+
+        // Add to history
+        await this.addToHistory({
+          type: 'RECEIVED',
+          amount: confirmedToken.amount,
+          coinId: confirmedToken.coinId,
+          symbol: confirmedToken.symbol || 'UNK',
+          timestamp: Date.now(),
+          senderPubkey: pending.senderPubkey,
+        });
+
+        this.log(`V5 token resolved: ${tokenId.slice(0, 8)}...`);
+        return 'resolved';
+      }
+
+      return 'pending';
+    } catch (error) {
+      console.error(`[Payments] resolveV5Token failed for ${tokenId.slice(0, 8)}:`, error);
+      if (pending.attemptCount > 50) {
+        token.status = 'invalid';
+        token.updatedAt = Date.now();
+        this.tokens.set(tokenId, token);
+        return 'failed';
+      }
+      this.updatePendingFinalization(token, pending);
+      return 'pending';
+    }
+  }
+
+  /**
+   * Non-blocking proof check with 500ms timeout.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async quickProofCheck(
+    stClient: StateTransitionClient,
+    trustBase: RootTrustBase,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    commitment: any,
+    timeoutMs: number = 500
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Promise<any | null> {
+    try {
+      const proof = await Promise.race([
+        waitInclusionProof(trustBase, stClient, commitment),
+        new Promise<null>(resolve => setTimeout(() => resolve(null), timeoutMs)),
+      ]);
+      return proof;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Perform V5 bundle finalization from stored bundle data and proofs.
+   * Extracted from InstantSplitProcessor.processV5Bundle() steps 4-10.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async finalizeFromV5Bundle(
+    bundle: InstantSplitBundleV5,
+    pending: PendingV5Finalization,
+    signingService: SigningService,
+    stClient: StateTransitionClient,
+    trustBase: RootTrustBase
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Promise<SdkToken<any>> {
+    // Reconstruct minted token from bundle data
+    const mintDataJson = JSON.parse(bundle.recipientMintData);
+    const mintData = await MintTransactionData.fromJSON(mintDataJson);
+    const mintCommitment = await MintCommitment.create(mintData);
+    const mintProofJson = JSON.parse(pending.mintProofJson!);
+    const mintProof = InclusionProof.fromJSON(mintProofJson);
+    const mintTransaction = mintCommitment.toTransaction(mintProof);
+
+    const tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
+    const senderMintedStateJson = JSON.parse(bundle.mintedTokenStateJson);
+
+    const tokenJson = {
+      version: '2.0',
+      state: senderMintedStateJson,
+      genesis: mintTransaction.toJSON(),
+      transactions: [],
+      nametags: [],
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mintedToken = await SdkToken.fromJSON(tokenJson) as SdkToken<any>;
+
+    // Create transfer transaction
+    const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
+    const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
+    const transferProof = await waitInclusionProof(trustBase, stClient, transferCommitment);
+    const transferTransaction = transferCommitment.toTransaction(transferProof);
+
+    // Create recipient state
+    const transferSalt = fromHex(bundle.transferSaltHex);
+    const recipientPredicate = await UnmaskedPredicate.create(
+      mintData.tokenId,
+      tokenType,
+      signingService,
+      HashAlgorithm.SHA256,
+      transferSalt
+    );
+    const recipientState = new TokenState(recipientPredicate, null);
+
+    // Handle nametag tokens for PROXY addresses
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let nametagTokens: SdkToken<any>[] = [];
+    const recipientAddressStr = bundle.recipientAddressJson;
+
+    if (recipientAddressStr.startsWith('PROXY://')) {
+      // Try to get nametag token from bundle first
+      if (bundle.nametagTokenJson) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const nametagToken = await SdkToken.fromJSON(JSON.parse(bundle.nametagTokenJson)) as SdkToken<any>;
+          const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+          const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+          if (proxy.address === recipientAddressStr) {
+            nametagTokens = [nametagToken];
+          }
+        } catch {
+          // Fall through to local nametag lookup
+        }
+      }
+
+      // If not in bundle, try local nametag
+      if (nametagTokens.length === 0 && this.nametag?.token) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const nametagToken = await SdkToken.fromJSON(this.nametag.token) as SdkToken<any>;
+          const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+          const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
+          if (proxy.address === recipientAddressStr) {
+            nametagTokens = [nametagToken];
+          }
+        } catch {
+          // No nametag available
+        }
+      }
+    }
+
+    // Finalize
+    return stClient.finalizeTransaction(trustBase, mintedToken, recipientState, transferTransaction, nametagTokens);
+  }
+
+  /**
+   * Parse pending finalization metadata from token's sdkData.
+   */
+  private parsePendingFinalization(sdkData: string | undefined): PendingV5Finalization | null {
+    if (!sdkData) return null;
+    try {
+      const data = JSON.parse(sdkData);
+      if (data._pendingFinalization && data._pendingFinalization.type === 'v5_bundle') {
+        return data._pendingFinalization as PendingV5Finalization;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Update pending finalization metadata in token's sdkData.
+   * Creates a new token object since sdkData is readonly.
+   */
+  private updatePendingFinalization(token: Token, pending: PendingV5Finalization): void {
+    const updated: Token = {
+      id: token.id,
+      coinId: token.coinId,
+      symbol: token.symbol,
+      name: token.name,
+      decimals: token.decimals,
+      iconUrl: token.iconUrl,
+      amount: token.amount,
+      status: token.status,
+      createdAt: token.createdAt,
+      updatedAt: Date.now(),
+      sdkData: JSON.stringify({ _pendingFinalization: pending }),
+    };
+    this.tokens.set(token.id, updated);
+  }
+
+  /**
+   * Save pending V5 tokens to key-value storage.
+   * These tokens can't be serialized to TXF format (no genesis/state),
+   * so we persist them separately and restore on load().
+   */
+  private async savePendingV5Tokens(): Promise<void> {
+    const pendingTokens: Token[] = [];
+    for (const token of this.tokens.values()) {
+      if (this.parsePendingFinalization(token.sdkData)) {
+        pendingTokens.push(token);
+      }
+    }
+    if (pendingTokens.length > 0) {
+      await this.deps!.storage.set(
+        STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
+        JSON.stringify(pendingTokens)
+      );
+    } else {
+      // Clean up when no pending tokens remain
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
+    }
+  }
+
+  /**
+   * Load pending V5 tokens from key-value storage and merge into tokens map.
+   * Called during load() to restore tokens that TXF format can't represent.
+   */
+  private async loadPendingV5Tokens(): Promise<void> {
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+    if (!data) return;
+
+    try {
+      const pendingTokens = JSON.parse(data) as Token[];
+      for (const token of pendingTokens) {
+        // Only restore if not already in the map (e.g., already resolved)
+        if (!this.tokens.has(token.id)) {
+          this.tokens.set(token.id, token);
+        }
+      }
+      if (pendingTokens.length > 0) {
+        this.log(`Restored ${pendingTokens.length} pending V5 token(s)`);
+      }
+    } catch {
+      // Ignore corrupt data
+    }
   }
 
   // ===========================================================================
@@ -1899,10 +2708,18 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Add a token
-   * Tokens are uniquely identified by (tokenId, stateHash) composite key.
-   * Multiple historic states of the same token can coexist.
-   * @returns false if exact duplicate (same tokenId AND same stateHash)
+   * Add a token to the wallet.
+   *
+   * Tokens are uniquely identified by a `(tokenId, stateHash)` composite key.
+   * Duplicate detection:
+   * - **Tombstoned** — rejected if the exact `(tokenId, stateHash)` pair has a tombstone.
+   * - **Exact duplicate** — rejected if a token with the same composite key already exists.
+   * - **State replacement** — if the same `tokenId` exists with a *different* `stateHash`,
+   *   the old state is archived and replaced with the incoming one.
+   *
+   * @param token - The token to add.
+   * @param skipHistory - When `true`, do not create a `RECEIVED` transaction history entry (default `false`).
+   * @returns `true` if the token was added, `false` if rejected as duplicate or tombstoned.
    */
   async addToken(token: Token, skipHistory: boolean = false): Promise<boolean> {
     this.ensureInitialized();
@@ -1992,7 +2809,11 @@ export class PaymentsModule {
     await this.save();
 
     // Save as individual token file (like lottery pattern)
-    await this.saveTokenToFileStorage(token);
+    // Skip for pending V5 tokens - they don't have valid SDK data for the legacy format
+    // and would be corrupted by parseTokenInfo() on reload
+    if (!this.parsePendingFinalization(token.sdkData)) {
+      await this.saveTokenToFileStorage(token);
+    }
 
     this.log(`Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
@@ -2065,6 +2886,11 @@ export class PaymentsModule {
             const tokenJson = data.token;
             if (!tokenJson) continue;
 
+            // Skip pending V5 finalization tokens (not valid SDK token data)
+            if (typeof tokenJson === 'object' && tokenJson !== null && '_pendingFinalization' in (tokenJson as Record<string, unknown>)) {
+              continue;
+            }
+
             // Check if already loaded from key-value storage
             let sdkTokenId: string | undefined;
             if (typeof tokenJson === 'object' && tokenJson !== null) {
@@ -2131,7 +2957,12 @@ export class PaymentsModule {
   }
 
   /**
-   * Update an existing token
+   * Update an existing token or add it if not found.
+   *
+   * Looks up the token by genesis `tokenId` (from `sdkData`) first, then by
+   * `token.id`. If no match is found, falls back to {@link addToken}.
+   *
+   * @param token - The token with updated data. Must include a valid `id`.
    */
   async updateToken(token: Token): Promise<void> {
     this.ensureInitialized();
@@ -2164,7 +2995,15 @@ export class PaymentsModule {
   }
 
   /**
-   * Remove a token by ID
+   * Remove a token from the wallet.
+   *
+   * The token is archived first, then a tombstone `(tokenId, stateHash)` is
+   * created to prevent re-addition via Nostr re-delivery. A `SENT` history
+   * entry is created unless `skipHistory` is `true`.
+   *
+   * @param tokenId - Local UUID of the token to remove.
+   * @param recipientNametag - Optional nametag of the transfer recipient (for history).
+   * @param skipHistory - When `true`, skip creating a transaction history entry (default `false`).
    */
   async removeToken(tokenId: string, recipientNametag?: string, skipHistory: boolean = false): Promise<void> {
     this.ensureInitialized();
@@ -2245,14 +3084,23 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get all tombstones
+   * Get all tombstone entries.
+   *
+   * Each tombstone is keyed by `(tokenId, stateHash)` and prevents a spent
+   * token state from being re-added (e.g. via Nostr re-delivery).
+   *
+   * @returns A shallow copy of the tombstone array.
    */
   getTombstones(): TombstoneEntry[] {
     return [...this.tombstones];
   }
 
   /**
-   * Check if token state is tombstoned
+   * Check whether a specific `(tokenId, stateHash)` combination is tombstoned.
+   *
+   * @param tokenId - The genesis token ID.
+   * @param stateHash - The state hash of the token version to check.
+   * @returns `true` if the exact combination has been tombstoned.
    */
   isStateTombstoned(tokenId: string, stateHash: string): boolean {
     return this.tombstones.some(
@@ -2261,8 +3109,13 @@ export class PaymentsModule {
   }
 
   /**
-   * Merge remote tombstones
-   * @returns number of local tokens removed
+   * Merge tombstones received from a remote sync source.
+   *
+   * Any local token whose `(tokenId, stateHash)` matches a remote tombstone is
+   * removed. The remote tombstones are then added to the local set (union merge).
+   *
+   * @param remoteTombstones - Tombstone entries from the remote source.
+   * @returns Number of local tokens that were removed.
    */
   async mergeTombstones(remoteTombstones: TombstoneEntry[]): Promise<number> {
     this.ensureInitialized();
@@ -2308,7 +3161,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Prune old tombstones
+   * Remove tombstones older than `maxAge` and cap the list at 100 entries.
+   *
+   * @param maxAge - Maximum age in milliseconds (default: 30 days).
    */
   async pruneTombstones(maxAge?: number): Promise<void> {
     const originalCount = this.tombstones.length;
@@ -2325,22 +3180,40 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get archived tokens
+   * Get all archived (spent/superseded) tokens in TXF format.
+   *
+   * Archived tokens are kept for recovery and sync purposes. The map key is
+   * the genesis token ID.
+   *
+   * @returns A shallow copy of the archived token map.
    */
   getArchivedTokens(): Map<string, TxfToken> {
     return new Map(this.archivedTokens);
   }
 
   /**
-   * Get best archived version of a token
+   * Get the best (most committed transactions) archived version of a token.
+   *
+   * Searches both archived and forked token maps and returns the version with
+   * the highest number of committed transactions.
+   *
+   * @param tokenId - The genesis token ID to look up.
+   * @returns The best TXF token version, or `null` if not found.
    */
   getBestArchivedVersion(tokenId: string): TxfToken | null {
     return findBestTokenVersion(tokenId, this.archivedTokens, this.forkedTokens);
   }
 
   /**
-   * Merge remote archived tokens
-   * @returns number of tokens updated/added
+   * Merge archived tokens from a remote sync source.
+   *
+   * For each remote token:
+   * - If missing locally, it is added.
+   * - If the remote version is an incremental update of the local, it replaces it.
+   * - If the histories diverge (fork), the remote version is stored via {@link storeForkedToken}.
+   *
+   * @param remoteArchived - Map of genesis token ID → TXF token from remote.
+   * @returns Number of tokens that were updated or added locally.
    */
   async mergeArchivedTokens(remoteArchived: Map<string, TxfToken>): Promise<number> {
     let mergedCount = 0;
@@ -2369,7 +3242,11 @@ export class PaymentsModule {
   }
 
   /**
-   * Prune archived tokens
+   * Prune archived tokens to keep at most `maxCount` entries.
+   *
+   * Oldest entries (by insertion order) are removed first.
+   *
+   * @param maxCount - Maximum number of archived tokens to retain (default: 100).
    */
   async pruneArchivedTokens(maxCount: number = 100): Promise<void> {
     if (this.archivedTokens.size <= maxCount) return;
@@ -2386,14 +3263,25 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get forked tokens
+   * Get all forked token versions.
+   *
+   * Forked tokens represent alternative histories detected during sync.
+   * The map key is `{tokenId}_{stateHash}`.
+   *
+   * @returns A shallow copy of the forked tokens map.
    */
   getForkedTokens(): Map<string, TxfToken> {
     return new Map(this.forkedTokens);
   }
 
   /**
-   * Store a forked token
+   * Store a forked token version (alternative history).
+   *
+   * No-op if the exact `(tokenId, stateHash)` key already exists.
+   *
+   * @param tokenId - Genesis token ID.
+   * @param stateHash - State hash of this forked version.
+   * @param txfToken - The TXF token data to store.
    */
   async storeForkedToken(tokenId: string, stateHash: string, txfToken: TxfToken): Promise<void> {
     const key = `${tokenId}_${stateHash}`;
@@ -2405,8 +3293,10 @@ export class PaymentsModule {
   }
 
   /**
-   * Merge remote forked tokens
-   * @returns number of tokens added
+   * Merge forked tokens from a remote sync source. Only new keys are added.
+   *
+   * @param remoteForked - Map of `{tokenId}_{stateHash}` → TXF token from remote.
+   * @returns Number of new forked tokens added.
    */
   async mergeForkedTokens(remoteForked: Map<string, TxfToken>): Promise<number> {
     let addedCount = 0;
@@ -2426,7 +3316,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Prune forked tokens
+   * Prune forked tokens to keep at most `maxCount` entries.
+   *
+   * @param maxCount - Maximum number of forked tokens to retain (default: 50).
    */
   async pruneForkedTokens(maxCount: number = 50): Promise<void> {
     if (this.forkedTokens.size <= maxCount) return;
@@ -2443,14 +3335,20 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Get transaction history
+   * Get the transaction history sorted newest-first.
+   *
+   * @returns Array of {@link TransactionHistoryEntry} objects in descending timestamp order.
    */
   getHistory(): TransactionHistoryEntry[] {
     return [...this.transactionHistory].sort((a, b) => b.timestamp - a.timestamp);
   }
 
   /**
-   * Add to transaction history
+   * Append an entry to the transaction history.
+   *
+   * A unique `id` is auto-generated. The entry is immediately persisted to storage.
+   *
+   * @param entry - History entry fields (without `id`).
    */
   async addToHistory(entry: Omit<TransactionHistoryEntry, 'id'>): Promise<void> {
     this.ensureInitialized();
@@ -2472,7 +3370,11 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Set nametag for current identity
+   * Set the nametag data for the current identity.
+   *
+   * Persists to both key-value storage and file storage (lottery compatibility).
+   *
+   * @param nametag - The nametag data including minted token JSON.
    */
   async setNametag(nametag: NametagData): Promise<void> {
     this.ensureInitialized();
@@ -2484,21 +3386,25 @@ export class PaymentsModule {
   }
 
   /**
-   * Get nametag
+   * Get the current nametag data.
+   *
+   * @returns The nametag data, or `null` if no nametag is set.
    */
   getNametag(): NametagData | null {
     return this.nametag;
   }
 
   /**
-   * Check if has nametag
+   * Check whether a nametag is currently set.
+   *
+   * @returns `true` if nametag data is present.
    */
   hasNametag(): boolean {
     return this.nametag !== null;
   }
 
   /**
-   * Clear nametag
+   * Remove the current nametag data from memory and storage.
    */
   async clearNametag(): Promise<void> {
     this.ensureInitialized();
@@ -2697,12 +3603,33 @@ export class PaymentsModule {
   // ===========================================================================
 
   /**
-   * Sync with all token storage providers (IPFS, MongoDB, etc.)
-   * Syncs with each provider and merges results
+   * Sync local token state with all configured token storage providers (IPFS, file, etc.).
+   *
+   * For each provider, the local data is packaged into TXF storage format, sent
+   * to the provider's `sync()` method, and the merged result is applied locally.
+   * Emits `sync:started`, `sync:completed`, and `sync:error` events.
+   *
+   * @returns Summary with counts of tokens added and removed during sync.
    */
   async sync(): Promise<{ added: number; removed: number }> {
     this.ensureInitialized();
 
+    // Sync coalescing: if a sync is already in progress, return its promise.
+    // This prevents race conditions when addTokenStorageProvider() fires a
+    // fire-and-forget sync and the caller also syncs immediately after.
+    if (this._syncInProgress) {
+      return this._syncInProgress;
+    }
+
+    this._syncInProgress = this._doSync();
+    try {
+      return await this._syncInProgress;
+    } finally {
+      this._syncInProgress = null;
+    }
+  }
+
+  private async _doSync(): Promise<{ added: number; removed: number }> {
     this.deps!.emitEvent('sync:started', { source: 'payments' });
 
     try {
@@ -2754,6 +3681,11 @@ export class PaymentsModule {
         }
       }
 
+      // Persist merged state to primary storage so it survives process restarts
+      if (totalAdded > 0 || totalRemoved > 0) {
+        await this.save();
+      }
+
       this.deps!.emitEvent('sync:completed', {
         source: 'payments',
         count: this.tokens.size,
@@ -2767,6 +3699,76 @@ export class PaymentsModule {
       });
       throw error;
     }
+  }
+
+  // ===========================================================================
+  // Storage Event Subscription (Push-Based Sync)
+  // ===========================================================================
+
+  /**
+   * Subscribe to 'storage:remote-updated' events from all token storage providers.
+   * When a provider emits this event, a debounced sync is triggered.
+   */
+  private subscribeToStorageEvents(): void {
+    // Clean up existing subscriptions
+    this.unsubscribeStorageEvents();
+
+    const providers = this.getTokenStorageProviders();
+    for (const [providerId, provider] of providers) {
+      if (provider.onEvent) {
+        const unsub = provider.onEvent((event) => {
+          if (event.type === 'storage:remote-updated') {
+            this.log('Remote update detected from provider', providerId, event.data);
+            this.debouncedSyncFromRemoteUpdate(providerId, event.data);
+          }
+        });
+        this.storageEventUnsubscribers.push(unsub);
+      }
+    }
+  }
+
+  /**
+   * Unsubscribe from all storage provider events and clear debounce timer.
+   */
+  private unsubscribeStorageEvents(): void {
+    for (const unsub of this.storageEventUnsubscribers) {
+      unsub();
+    }
+    this.storageEventUnsubscribers = [];
+
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+      this.syncDebounceTimer = null;
+    }
+  }
+
+  /**
+   * Debounced sync triggered by a storage:remote-updated event.
+   * Waits 500ms to batch rapid updates, then performs sync.
+   */
+  private debouncedSyncFromRemoteUpdate(providerId: string, eventData: unknown): void {
+    if (this.syncDebounceTimer) {
+      clearTimeout(this.syncDebounceTimer);
+    }
+
+    this.syncDebounceTimer = setTimeout(() => {
+      this.syncDebounceTimer = null;
+      this.sync()
+        .then((result) => {
+          const data = eventData as { name?: string; sequence?: number; cid?: string } | undefined;
+          this.deps?.emitEvent('sync:remote-update', {
+            providerId,
+            name: data?.name ?? '',
+            sequence: data?.sequence ?? 0,
+            cid: data?.cid ?? '',
+            added: result.added,
+            removed: result.removed,
+          });
+        })
+        .catch((err) => {
+          this.log('Auto-sync from remote update failed:', err);
+        });
+    }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
 
   /**
@@ -2789,16 +3791,26 @@ export class PaymentsModule {
   }
 
   /**
-   * Update token storage providers (called when providers are added/removed dynamically)
+   * Replace the set of token storage providers at runtime.
+   *
+   * Use when providers are added or removed dynamically (e.g. IPFS node started).
+   *
+   * @param providers - New map of provider ID → TokenStorageProvider.
    */
   updateTokenStorageProviders(providers: Map<string, TokenStorageProvider<TxfStorageDataBase>>): void {
     if (this.deps) {
       this.deps.tokenStorageProviders = providers;
+      // Re-subscribe to storage events for new providers
+      this.subscribeToStorageEvents();
     }
   }
 
   /**
-   * Validate tokens with aggregator
+   * Validate all tokens against the aggregator (oracle provider).
+   *
+   * Tokens that fail validation or are detected as spent are marked `'invalid'`.
+   *
+   * @returns Object with arrays of valid and invalid tokens.
    */
   async validate(): Promise<{ valid: Token[]; invalid: Token[] }> {
     this.ensureInitialized();
@@ -2825,7 +3837,9 @@ export class PaymentsModule {
   }
 
   /**
-   * Get pending transfers
+   * Get all in-progress (pending) outgoing transfers.
+   *
+   * @returns Array of {@link TransferResult} objects for transfers that have not yet completed.
    */
   getPendingTransfers(): TransferResult[] {
     return Array.from(this.pendingTransfers.values());
@@ -3236,6 +4250,7 @@ export class PaymentsModule {
         id: crypto.randomUUID(),
         status: 'completed',
         tokens: [finalizedToken],
+        tokenTransfers: [],
       });
 
       // Add to history
@@ -3266,8 +4281,23 @@ export class PaymentsModule {
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
 
-      // Check for INSTANT_SPLIT bundle first (V4 or V5)
+      // Check for INSTANT_SPLIT bundle - may be the payload itself or nested in payload.token
+      let instantBundle: InstantSplitBundle | null = null;
       if (isInstantSplitBundle(payload)) {
+        instantBundle = payload as InstantSplitBundle;
+      } else if (payload.token) {
+        // InstantSplitExecutor wraps V5 bundle as { token: JSON.stringify(bundle), proof: null }
+        try {
+          const inner = typeof payload.token === 'string' ? JSON.parse(payload.token as string) : payload.token;
+          if (isInstantSplitBundle(inner)) {
+            instantBundle = inner as InstantSplitBundle;
+          }
+        } catch {
+          // Not a JSON string or not a bundle - fall through
+        }
+      }
+
+      if (instantBundle) {
         this.log('Processing INSTANT_SPLIT bundle...');
         try {
           // Ensure nametag is loaded before processing (needed for PROXY address verification)
@@ -3276,7 +4306,7 @@ export class PaymentsModule {
           }
 
           const result = await this.processInstantSplitBundle(
-            payload as InstantSplitBundle,
+            instantBundle,
             transfer.senderTransportPubkey
           );
           if (result.success) {
@@ -3287,6 +4317,13 @@ export class PaymentsModule {
         } catch (err) {
           console.error('[Payments] INSTANT_SPLIT processing error:', err);
         }
+        return;
+      }
+
+      // Check for NOSTR-FIRST commitment-only transfer (whole-token instant send)
+      if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
+        this.log('Processing NOSTR-FIRST commitment-only transfer...');
+        await this.handleCommitmentOnlyTransfer(transfer, payload);
         return;
       }
 
@@ -3498,6 +4535,9 @@ export class PaymentsModule {
         console.error(`[Payments] Failed to save to provider ${id}:`, err);
       }
     }
+
+    // Save pending V5 tokens separately (TXF can't represent them)
+    await this.savePendingV5Tokens();
   }
 
   private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
@@ -3518,13 +4558,14 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
-    // Active tokens are NOT stored in TXF format - they are saved as individual
-    // token-xxx files via saveTokenToFileStorage() to avoid duplication.
-    // TXF storage is only used for metadata: archived, tombstones, forked, outbox.
-    // Note: nametag is also saved separately via saveNametagToFileStorage()
+    // Include active tokens in TXF data so IPFS sync can propagate them
+    // to other devices. File-based storage also saves tokens individually
+    // via saveTokenToFileStorage(), but the TXF format is needed for
+    // cross-device sync (IPFS merge operates on TXF data).
+    // Note: nametag is saved separately via saveNametagToFileStorage()
     // as nametag-{name}.json to avoid duplication in storage
     return await buildTxfStorageData(
-      [], // Empty - active tokens stored as token-xxx files
+      Array.from(this.tokens.values()),
       {
         version: 1,
         address: this.deps!.identity.l1Address,

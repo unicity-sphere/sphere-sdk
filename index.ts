@@ -180,6 +180,8 @@ export {
 export type {
   PaymentsModuleConfig,
   PaymentsModuleDependencies,
+  ReceiveOptions,
+  ReceiveResult,
   TransactionHistoryEntry,
 } from './modules/payments';
 
@@ -356,6 +358,19 @@ export type {
   TokenIcon,
   RegistryNetwork,
 } from './registry';
+
+// =============================================================================
+// Nametag Utilities (re-exported from @unicitylabs/nostr-js-sdk)
+// =============================================================================
+
+export {
+  normalizeNametag,
+  isPhoneNumber,
+  hashNametag,
+  areSameNametag,
+} from '@unicitylabs/nostr-js-sdk';
+
+export { isValidNametag } from './core/Sphere';
 
 // =============================================================================
 // Price Provider

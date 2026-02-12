@@ -129,7 +129,7 @@ export class L1PaymentsModule {
 
   constructor(config?: L1PaymentsModuleConfig) {
     this._config = {
-      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.alpha.unicity.network:50004',
+      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.unicity.network:50004',
       network: config?.network ?? 'mainnet',
       defaultFeeRate: config?.defaultFeeRate ?? 10,
       enableVesting: config?.enableVesting ?? true,
@@ -167,12 +167,22 @@ export class L1PaymentsModule {
       }
     }
 
-    // Connect to Fulcrum WebSocket
-    if (this._config.electrumUrl) {
-      await l1Connect(this._config.electrumUrl);
-    }
+    // NOTE: We do NOT connect to Fulcrum here. Connection is deferred to
+    // first use (ensureConnected) so that import + scan flows are not
+    // disrupted by an early L1 WebSocket connection on the global singleton.
 
     this._initialized = true;
+  }
+
+  /**
+   * Ensure the Fulcrum WebSocket is connected. Called lazily before any
+   * operation that needs the network. If the singleton is already connected
+   * (e.g. by the address scanner), this is a no-op.
+   */
+  private async ensureConnected(): Promise<void> {
+    if (!isWebSocketConnected() && this._config.electrumUrl) {
+      await l1Connect(this._config.electrumUrl);
+    }
   }
 
   destroy(): void {
@@ -196,7 +206,7 @@ export class L1PaymentsModule {
    * Resolve recipient to L1 address
    * Supports: L1 address (alpha1...), nametag (with or without @)
    */
-  private async resolveL1Address(recipient: string): Promise<string> {
+  async resolveL1Address(recipient: string): Promise<string> {
     // Explicit nametag with @
     if (recipient.startsWith('@')) {
       const nametag = recipient.slice(1);
@@ -245,6 +255,7 @@ export class L1PaymentsModule {
 
   async send(request: L1SendRequest): Promise<L1SendResult> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     if (!this._wallet || !this._identity) {
       return { success: false, error: 'No wallet available' };
@@ -288,6 +299,7 @@ export class L1PaymentsModule {
 
   async getBalance(): Promise<L1Balance> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const addresses = this._getWatchedAddresses();
     let totalAlpha = 0;
@@ -327,6 +339,7 @@ export class L1PaymentsModule {
 
   async getUtxos(): Promise<L1Utxo[]> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const result: L1Utxo[] = [];
     const currentHeight = await getCurrentBlockHeight();
@@ -371,12 +384,24 @@ export class L1PaymentsModule {
   }
 
   async getHistory(limit?: number): Promise<L1Transaction[]> {
+    await this.ensureConnected();
     this.ensureInitialized();
 
     const addresses = this._getWatchedAddresses();
     const transactions: L1Transaction[] = [];
     const seenTxids = new Set<string>();
     const currentHeight = await getCurrentBlockHeight();
+
+    // Cache for fetched transactions (avoids re-fetching the same tx)
+    const txCache = new Map<string, TransactionDetail | null>();
+    const fetchTx = async (txid: string): Promise<TransactionDetail | null> => {
+      if (txCache.has(txid)) return txCache.get(txid)!;
+      const detail = (await l1GetTransaction(txid)) as TransactionDetail | null;
+      txCache.set(txid, detail);
+      return detail;
+    };
+
+    const addressSet = new Set(addresses.map((a) => a.toLowerCase()));
 
     for (const address of addresses) {
       const history = await getTransactionHistory(address);
@@ -385,37 +410,62 @@ export class L1PaymentsModule {
         if (seenTxids.has(item.tx_hash)) continue;
         seenTxids.add(item.tx_hash);
 
-        const tx = (await l1GetTransaction(item.tx_hash)) as TransactionDetail | null;
+        const tx = await fetchTx(item.tx_hash);
         if (!tx) continue;
 
-        // Determine if this is a send or receive
-        const isSend = tx.vin?.some((vin) =>
-          addresses.includes(vin.txid ?? '')
-        );
-
-        // Calculate amount from outputs going to our addresses
-        let amount = '0';
-        let txAddress = address;
-        if (tx.vout) {
-          for (const vout of tx.vout) {
-            const voutAddresses = vout.scriptPubKey?.addresses ?? [];
-            if (vout.scriptPubKey?.address) {
-              voutAddresses.push(vout.scriptPubKey.address);
-            }
-            const matchedAddr = voutAddresses.find((a) => addresses.includes(a));
-            if (matchedAddr) {
-              amount = Math.floor((vout.value ?? 0) * 100_000_000).toString();
-              txAddress = matchedAddr;
+        // Resolve input addresses by looking up previous transactions
+        let isSend = false;
+        for (const vin of (tx.vin ?? [])) {
+          if (!vin.txid) continue;
+          const prevTx = await fetchTx(vin.txid);
+          if (prevTx?.vout?.[vin.vout]) {
+            const prevOut = prevTx.vout[vin.vout];
+            const prevAddrs = [
+              ...(prevOut.scriptPubKey?.addresses ?? []),
+              ...(prevOut.scriptPubKey?.address ? [prevOut.scriptPubKey.address] : []),
+            ];
+            if (prevAddrs.some((a) => addressSet.has(a.toLowerCase()))) {
+              isSend = true;
               break;
             }
           }
         }
 
+        // Calculate amounts: sum outputs to us vs outputs to others
+        let amountToUs = 0;
+        let amountToOthers = 0;
+        let txAddress = address;
+        let externalAddress = '';
+        if (tx.vout) {
+          for (const vout of tx.vout) {
+            const voutAddresses = [
+              ...(vout.scriptPubKey?.addresses ?? []),
+              ...(vout.scriptPubKey?.address ? [vout.scriptPubKey.address] : []),
+            ];
+            const isOurs = voutAddresses.some((a) => addressSet.has(a.toLowerCase()));
+            const valueSats = Math.floor((vout.value ?? 0) * 100_000_000);
+            if (isOurs) {
+              amountToUs += valueSats;
+              if (!txAddress) txAddress = voutAddresses[0];
+            } else {
+              amountToOthers += valueSats;
+              if (!externalAddress && voutAddresses.length > 0) {
+                externalAddress = voutAddresses[0];
+              }
+            }
+          }
+        }
+
+        // For sends: amount is what went to external addresses; address is the recipient
+        // For receives: amount is what came to us; address is our address
+        const amount = isSend ? amountToOthers.toString() : amountToUs.toString();
+        const displayAddress = isSend ? (externalAddress || txAddress) : txAddress;
+
         transactions.push({
           txid: item.tx_hash,
           type: isSend ? 'send' : 'receive',
           amount,
-          address: txAddress,
+          address: displayAddress,
           confirmations: item.height > 0 ? currentHeight - item.height : 0,
           timestamp: tx.time ? tx.time * 1000 : Date.now(),
           blockHeight: item.height > 0 ? item.height : undefined,
@@ -431,6 +481,7 @@ export class L1PaymentsModule {
 
   async getTransaction(txid: string): Promise<L1Transaction | null> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     const tx = (await l1GetTransaction(txid)) as TransactionDetail | null;
     if (!tx) return null;
@@ -476,6 +527,7 @@ export class L1PaymentsModule {
     amount: string
   ): Promise<{ fee: string; feeRate: number }> {
     this.ensureInitialized();
+    await this.ensureConnected();
 
     if (!this._wallet) {
       return { fee: '0', feeRate: this._config.defaultFeeRate ?? 10 };

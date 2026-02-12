@@ -5,6 +5,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/e2e/**/*.test.ts'],
-    testTimeout: 30000,
+    exclude: ['tests/e2e/dm-manual.test.ts'],
+    testTimeout: 300000, // Wallet lifecycle test needs up to 5min (faucet + transfer + IPNS)
   },
 });

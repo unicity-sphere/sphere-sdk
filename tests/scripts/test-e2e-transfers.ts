@@ -7,12 +7,13 @@
  * balance conservation, tombstones, and spent token handling.
  *
  * Usage:
- *   npx tsx test-e2e-transfers.ts [--cleanup]
+ *   npx tsx tests/scripts/test-e2e-transfers.ts [--cleanup]
  */
 
-import { Sphere } from './core/Sphere';
-import { createNodeProviders } from './impl/nodejs';
-import { TokenRegistry } from './registry/TokenRegistry';
+import { Sphere } from '../../core/Sphere';
+import { createNodeProviders } from '../../impl/nodejs';
+import { TokenRegistry } from '../../registry/TokenRegistry';
+import { TransferMode } from '../../types';
 import { randomBytes } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 
@@ -49,14 +50,21 @@ interface TombstoneSnapshot {
   entries: Array<{ tokenId: string; stateHash: string }>;
 }
 
+interface PhaseTimings {
+  [phase: string]: number; // ms
+}
+
 interface TransferTestResult {
   scenario: string;
   mode: 'direct' | 'proxy';
+  transferMode: TransferMode;
   amount: string;
   amountSmallest: bigint;
   coin: string;
   sendTimeMs: number;
   receiveTimeMs: number;
+  receiverResolutionMs: number;
+  phases: PhaseTimings;
   success: boolean;
   balanceVerified: boolean;
   tombstoneVerified: boolean;
@@ -272,6 +280,68 @@ async function waitForReceiverBalance(
   };
 }
 
+async function waitForTokenResolution(
+  sphere: Sphere,
+  coinSymbol: string,
+  timeoutMs: number = 30_000,
+): Promise<{ resolved: boolean; durationMs: number }> {
+  const startTime = performance.now();
+
+  while (performance.now() - startTime < timeoutMs) {
+    // Call resolveUnconfirmed directly (not fire-and-forget)
+    const resolution = await sphere.payments.resolveUnconfirmed();
+
+    // Check if all tokens for this coin are confirmed
+    const bal = getBalance(sphere, coinSymbol);
+    if (bal.unconfirmed === 0n && bal.confirmed > 0n) {
+      return { resolved: true, durationMs: performance.now() - startTime };
+    }
+
+    // Wait before next attempt (proofs need ~2s aggregator rounds)
+    await new Promise(r => setTimeout(r, 2_000));
+    await sphere.payments.load();
+  }
+
+  return { resolved: false, durationMs: performance.now() - startTime };
+}
+
+// =============================================================================
+// Console-log timing interceptor
+// =============================================================================
+
+/**
+ * Captures timestamped console.log output to extract per-phase durations.
+ * Returns a stop() function and a between() accessor.
+ */
+function createPhaseCapture() {
+  const entries: Array<{ ts: number; msg: string }> = [];
+  const origLog = console.log;
+  const origWarn = console.warn;
+
+  const capture = (...args: unknown[]) => {
+    const msg = args.map(a => (typeof a === 'string' ? a : String(a))).join(' ');
+    entries.push({ ts: performance.now(), msg });
+    origLog.apply(console, args as Parameters<typeof console.log>);
+  };
+
+  console.log = capture as typeof console.log;
+  console.warn = capture as typeof console.warn;
+
+  return {
+    stop() {
+      console.log = origLog;
+      console.warn = origWarn;
+    },
+    /** Extract duration between two log-message markers (substring match) */
+    between(startMarker: string, endMarker: string): number | null {
+      const s = entries.find(e => e.msg.includes(startMarker));
+      const e = [...entries].reverse().find(e => e.msg.includes(endMarker));
+      if (s && e && e.ts >= s.ts) return e.ts - s.ts;
+      return null;
+    },
+  };
+}
+
 // =============================================================================
 // Test Runner
 // =============================================================================
@@ -284,12 +354,13 @@ interface TransferTestConfig {
   amount: string;
   coinSymbol: string;
   mode: 'direct' | 'proxy';
+  transferMode: TransferMode;
 }
 
 async function runTransferTest(config: TransferTestConfig): Promise<TransferTestResult> {
   const {
     scenario, sender, receiver, receiverNametag,
-    amount, coinSymbol, mode,
+    amount, coinSymbol, mode, transferMode,
   } = config;
 
   const registry = TokenRegistry.getInstance();
@@ -300,17 +371,20 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
 
   console.log(`\n${'='.repeat(70)}`);
   console.log(`SCENARIO: ${scenario}`);
-  console.log(`  Mode: ${mode.toUpperCase()}, Amount: ${amount} ${coinSymbol} (${amountSmallest} smallest)`);
+  console.log(`  Mode: ${mode.toUpperCase()}, TxMode: ${transferMode.toUpperCase()}, Amount: ${amount} ${coinSymbol} (${amountSmallest} smallest)`);
   console.log('='.repeat(70));
 
   const result: TransferTestResult = {
     scenario,
     mode,
+    transferMode,
     amount,
     amountSmallest,
     coin: coinSymbol,
     sendTimeMs: 0,
     receiveTimeMs: 0,
+    receiverResolutionMs: 0,
+    phases: {},
     success: false,
     balanceVerified: false,
     tombstoneVerified: false,
@@ -341,8 +415,9 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
       );
     }
 
-    // Send
-    console.log(`[2] Sending (${mode.toUpperCase()} mode)...`);
+    // Send with phase capture
+    console.log(`[2] Sending (${mode.toUpperCase()} / ${transferMode.toUpperCase()})...`);
+    const cap = createPhaseCapture();
     const sendStart = performance.now();
 
     const sendResult = await sender.payments.send({
@@ -350,11 +425,32 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
       amount: amountSmallest.toString(),
       coinId: coinDef.id,
       addressMode: mode,
+      transferMode,
     });
 
-    result.sendTimeMs = performance.now() - sendStart;
+    const sendEnd = performance.now();
+    cap.stop();
+    result.sendTimeMs = sendEnd - sendStart;
+
+    // Extract per-phase timings from captured logs
+    if (transferMode === 'conservative') {
+      const burn = cap.between('Step 1: Burning', 'Original token burned');
+      const mint = cap.between('Step 2: Minting', 'Split tokens minted');
+      const transfer = cap.between('Step 3: Transferring', 'Split transfer complete');
+      if (burn !== null) result.phases['split.burn'] = burn;
+      if (mint !== null) result.phases['split.mint'] = mint;
+      if (transfer !== null) result.phases['split.transfer'] = transfer;
+      if (burn !== null && mint !== null && transfer !== null) {
+        result.phases['chain.total'] = burn + mint + transfer;
+      }
+    } else {
+      // Instant mode
+      const nostrSend = cap.between('NOSTR-FIRST: Sending direct token', 'Direct token sent successfully');
+      if (nostrSend !== null) result.phases['nostr.send'] = nostrSend;
+    }
+
     console.log(`    Send completed in ${result.sendTimeMs.toFixed(0)}ms`);
-    console.log(`    Status: ${sendResult.status}, TxHash: ${sendResult.txHash?.slice(0, 16) ?? 'N/A'}...`);
+    console.log(`    Status: ${sendResult.status}, Transfers: ${sendResult.tokenTransfers.length} token(s)`);
 
     // Snapshot sender AFTER send
     await sender.payments.load();
@@ -376,9 +472,29 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
     console.log(`    Receive detected in ${receiveResult.receiveTimeMs.toFixed(0)}ms`);
     console.log(`    Receiver balance AFTER: ${formatBalance(receiveResult.finalBalance, decimals)}`);
 
-    // Calculate deltas (reload sender in case state changed during receiver wait)
-    await sender.payments.load();
-    const senderAfter = getBalance(sender, coinSymbol);
+    // Measure receiver resolution (unconfirmed → confirmed)
+    console.log(`[4b] Measuring receiver token resolution...`);
+    const receiverBal = getBalance(receiver, coinSymbol);
+    if (receiverBal.unconfirmed > 0n) {
+      const resolution = await waitForTokenResolution(receiver, coinSymbol);
+      result.receiverResolutionMs = resolution.durationMs;
+      console.log(`    Resolution: resolved=${resolution.resolved} in ${resolution.durationMs.toFixed(0)}ms`);
+    } else {
+      result.receiverResolutionMs = 0;
+      console.log(`    Resolution: already confirmed (0ms)`);
+    }
+
+    // Wait for sender's change token to appear from background processing
+    // (InstantSplit sends split amount immediately, change token arrives ~4s later)
+    console.log(`    Waiting for sender change token (up to 15s)...`);
+    const expectedSenderTotal = senderBefore.total - amountSmallest;
+    const changeDeadline = performance.now() + 15_000;
+    let senderAfter = getBalance(sender, coinSymbol);
+    while (performance.now() < changeDeadline && senderAfter.total < expectedSenderTotal) {
+      await new Promise(r => setTimeout(r, 1000));
+      await sender.payments.load();
+      senderAfter = getBalance(sender, coinSymbol);
+    }
     const senderDelta = senderBefore.total - senderAfter.total;
     const receiverDelta = receiveResult.finalBalance.total - receiverBefore.total;
     result.senderDelta = senderDelta;
@@ -430,58 +546,88 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
 
 function printResultsTable(results: TransferTestResult[]): void {
   console.log('\n\n');
-  console.log('='.repeat(120));
+  console.log('='.repeat(140));
   console.log('  TEST RESULTS SUMMARY');
-  console.log('='.repeat(120));
+  console.log('='.repeat(140));
   console.log('');
   console.log(
-    '  #  | Scenario                          | Mode   | Amount       | Send(ms) | Recv(ms) | Balance | Tombstone | Status',
+    '  #  | Scenario                          | Mode   | TxMode | Amount       | Send(ms) | Recv(ms) | Res(ms) | Balance | Tombstone | Status',
   );
   console.log(
-    '-----+-----------------------------------+--------+--------------+----------+----------+---------+-----------+-----------',
+    '-----+-----------------------------------+--------+--------+--------------+----------+----------+---------+---------+-----------+-----------',
   );
 
   results.forEach((r, i) => {
     const num = String(i + 1).padStart(3);
     const scenario = r.scenario.slice(0, 33).padEnd(33);
     const mode = r.mode.toUpperCase().padEnd(6);
+    const txMode = r.transferMode.slice(0, 6).toUpperCase().padEnd(6);
     const amount = `${r.amount} ${r.coin}`.padEnd(12).slice(0, 12);
     const sendTime = r.sendTimeMs.toFixed(0).padStart(8);
     const recvTime = r.receiveTimeMs.toFixed(0).padStart(8);
+    const resTime = r.receiverResolutionMs.toFixed(0).padStart(7);
     const balanceOk = r.balanceVerified ? '  PASS ' : '  FAIL ';
     const tombOk = r.tombstoneVerified ? '   PASS  ' : '   FAIL  ';
     const status = r.success ? '  PASS    ' : '  FAIL    ';
 
     console.log(
-      ` ${num} | ${scenario} | ${mode} | ${amount} | ${sendTime} | ${recvTime} |${balanceOk}|${tombOk}|${status}`,
+      ` ${num} | ${scenario} | ${mode} | ${txMode} | ${amount} | ${sendTime} | ${recvTime} | ${resTime} |${balanceOk}|${tombOk}|${status}`,
     );
   });
 
   console.log(
-    '-----+-----------------------------------+--------+--------------+----------+----------+---------+-----------+-----------',
+    '-----+-----------------------------------+--------+--------+--------------+----------+----------+---------+---------+-----------+-----------',
   );
 
   // Statistics
   const passed = results.filter(r => r.success);
-  const directResults = results.filter(r => r.mode === 'direct');
-  const proxyResults = results.filter(r => r.mode === 'proxy');
-  const directPassed = directResults.filter(r => r.success);
-  const proxyPassed = proxyResults.filter(r => r.success);
+  const instantResults = results.filter(r => r.transferMode === 'instant');
+  const conservativeResults = results.filter(r => r.transferMode === 'conservative');
+  const instantPassed = instantResults.filter(r => r.success);
+  const conservativePassed = conservativeResults.filter(r => r.success);
   const balanceVerified = results.filter(r => r.balanceVerified);
   const tombVerified = results.filter(r => r.tombstoneVerified);
 
+  const avg = (arr: TransferTestResult[], fn: (r: TransferTestResult) => number): string =>
+    arr.length > 0
+      ? (arr.reduce((s, r) => s + fn(r), 0) / arr.length).toFixed(0)
+      : 'N/A';
+
   console.log(`\nSTATISTICS:`);
   console.log(`   Total passed:              ${passed.length}/${results.length}`);
-  console.log(`   DIRECT tests passed:       ${directPassed.length}/${directResults.length}`);
-  console.log(`   PROXY tests passed:        ${proxyPassed.length}/${proxyResults.length}`);
+  console.log(`   INSTANT tests passed:      ${instantPassed.length}/${instantResults.length}`);
+  console.log(`   CONSERVATIVE tests passed: ${conservativePassed.length}/${conservativeResults.length}`);
   console.log(`   Balance verified:          ${balanceVerified.length}/${results.length}`);
   console.log(`   Tombstone verified:        ${tombVerified.length}/${results.length}`);
 
-  if (passed.length > 0) {
-    const avgSend = passed.reduce((s, r) => s + r.sendTimeMs, 0) / passed.length;
-    const avgRecv = passed.reduce((s, r) => s + r.receiveTimeMs, 0) / passed.length;
-    console.log(`   Avg send time (passing):   ${avgSend.toFixed(0)}ms`);
-    console.log(`   Avg receive time (passing):${avgRecv.toFixed(0)}ms`);
+  if (instantPassed.length > 0) {
+    console.log(`   Avg send time (instant):   ${avg(instantPassed, r => r.sendTimeMs)}ms`);
+    console.log(`   Avg recv time (instant):   ${avg(instantPassed, r => r.receiveTimeMs)}ms`);
+    console.log(`   Avg resolution (instant):  ${avg(instantPassed, r => r.receiverResolutionMs)}ms`);
+  }
+  if (conservativePassed.length > 0) {
+    console.log(`   Avg send time (conserv.):  ${avg(conservativePassed, r => r.sendTimeMs)}ms`);
+    console.log(`   Avg recv time (conserv.):  ${avg(conservativePassed, r => r.receiveTimeMs)}ms`);
+    console.log(`   Avg resolution (conserv.): ${avg(conservativePassed, r => r.receiverResolutionMs)}ms`);
+  }
+
+  // Benchmark comparison: instant vs conservative side-by-side
+  printBenchmarkComparison(results);
+
+  // Phase breakdown
+  const withPhases = results.filter(r => Object.keys(r.phases).length > 0);
+  if (withPhases.length > 0) {
+    console.log('\n--- PHASE BREAKDOWN (sender side) ---\n');
+    for (const r of withPhases) {
+      console.log(`  ${r.scenario} [${r.transferMode.toUpperCase()}]`);
+      console.log(`    Total send:     ${r.sendTimeMs.toFixed(0)} ms`);
+      const phaseKeys = Object.keys(r.phases).sort();
+      for (const key of phaseKeys) {
+        const pct = ((r.phases[key] / r.sendTimeMs) * 100).toFixed(1);
+        console.log(`    ${key.padEnd(18)} ${r.phases[key].toFixed(0).padStart(6)} ms  (${pct}%)`);
+      }
+      console.log('');
+    }
   }
 
   // Final verdict
@@ -494,6 +640,78 @@ function printResultsTable(results: TransferTestResult[]): void {
       console.log(`   - ${r.scenario}: ${r.error ?? 'balance/tombstone mismatch'}`);
     }
   }
+}
+
+/**
+ * Print side-by-side INSTANT vs CONSERVATIVE benchmark comparison.
+ * Groups tests by coin to show paired results.
+ */
+function printBenchmarkComparison(results: TransferTestResult[]): void {
+  console.log('\n--- BENCHMARK: INSTANT vs CONSERVATIVE ---\n');
+  console.log(
+    '                            Instant                          Conservative',
+  );
+  console.log(
+    '  Scenario              Send(ms) Recv(ms)  Res(ms)      Send(ms) Recv(ms)  Res(ms)',
+  );
+  console.log(
+    '  ' + '-'.repeat(85),
+  );
+
+  // Find paired tests: same coin where one is instant and the other conservative
+  // Group by coin symbol
+  const coins = [...new Set(results.map(r => r.coin))];
+
+  for (const coin of coins) {
+    const coinResults = results.filter(r => r.coin === coin);
+    const instantR = coinResults.find(r => r.transferMode === 'instant');
+    const conservR = coinResults.find(r => r.transferMode === 'conservative');
+
+    const fmtMs = (v: number | undefined): string =>
+      v !== undefined ? v.toFixed(0).padStart(8) : '     N/A';
+
+    const label = `${coin} split`.padEnd(20);
+    const iSend = fmtMs(instantR?.sendTimeMs);
+    const iRecv = fmtMs(instantR?.receiveTimeMs);
+    const iRes = fmtMs(instantR?.receiverResolutionMs);
+    const cSend = fmtMs(conservR?.sendTimeMs);
+    const cRecv = fmtMs(conservR?.receiveTimeMs);
+    const cRes = fmtMs(conservR?.receiverResolutionMs);
+
+    console.log(
+      `  ${label}  ${iSend}  ${iRecv}  ${iRes}    ${cSend}  ${cRecv}  ${cRes}`,
+    );
+  }
+
+  // Also show send-back if present
+  const sendBacks = results.filter(r => r.scenario.toLowerCase().includes('send-back'));
+  if (sendBacks.length > 0) {
+    const instantSB = sendBacks.find(r => r.transferMode === 'instant');
+    const conservSB = sendBacks.find(r => r.transferMode === 'conservative');
+
+    const fmtMs = (v: number | undefined): string =>
+      v !== undefined ? v.toFixed(0).padStart(8) : '     N/A';
+
+    const label = 'Send-back UCT'.padEnd(20);
+    console.log(
+      `  ${label}  ${fmtMs(instantSB?.sendTimeMs)}  ${fmtMs(instantSB?.receiveTimeMs)}  ${fmtMs(instantSB?.receiverResolutionMs)}    ${fmtMs(conservSB?.sendTimeMs)}  ${fmtMs(conservSB?.receiveTimeMs)}  ${fmtMs(conservSB?.receiverResolutionMs)}`,
+    );
+  }
+
+  // Averages
+  const instant = results.filter(r => r.transferMode === 'instant' && r.success);
+  const conserv = results.filter(r => r.transferMode === 'conservative' && r.success);
+
+  const avg = (arr: TransferTestResult[], fn: (r: TransferTestResult) => number): string =>
+    arr.length > 0
+      ? (arr.reduce((s, r) => s + fn(r), 0) / arr.length).toFixed(0).padStart(8)
+      : '     N/A';
+
+  console.log('  ' + '-'.repeat(85));
+  console.log(
+    `  ${'Average'.padEnd(20)}  ${avg(instant, r => r.sendTimeMs)}  ${avg(instant, r => r.receiveTimeMs)}  ${avg(instant, r => r.receiverResolutionMs)}    ${avg(conserv, r => r.sendTimeMs)}  ${avg(conserv, r => r.receiveTimeMs)}  ${avg(conserv, r => r.receiverResolutionMs)}`,
+  );
+  console.log('');
 }
 
 // =============================================================================
@@ -555,100 +773,140 @@ async function main(): Promise<void> {
     await topupAndWait(alice, aliceNametag);
 
     // =========================================================================
-    // Phase 2: DIRECT Mode Tests
+    // Phase 2: DIRECT mode split tests (instant + conservative)
     // =========================================================================
-    console.log('\n\n--- PHASE 2: DIRECT MODE TESTS ---');
+    console.log('\n\n--- PHASE 2: DIRECT MODE TESTS (INSTANT vs CONSERVATIVE) ---');
 
-    // Test 1: UCT transfer (split)
+    // Test 1: UCT split (instant)
     results.push(await runTransferTest({
-      scenario: '1. UCT transfer (split from 100)',
+      scenario: '1. UCT split (instant)',
       sender: alice,
       receiver: bob,
       receiverNametag: bobNametag,
       amount: '1',
       coinSymbol: 'UCT',
       mode: 'direct',
+      transferMode: 'instant',
     }));
     await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-
-    // Reload wallets to get fresh state
     await alice.payments.load();
     await bob.payments.load();
 
-    // Test 2: BTC partial (split)
+    // Test 2: UCT split (conservative)
     results.push(await runTransferTest({
-      scenario: '2. BTC partial (split from 1)',
+      scenario: '2. UCT split (conservative)',
+      sender: alice,
+      receiver: bob,
+      receiverNametag: bobNametag,
+      amount: '1',
+      coinSymbol: 'UCT',
+      mode: 'direct',
+      transferMode: 'conservative',
+    }));
+    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
+    await alice.payments.load();
+    await bob.payments.load();
+
+    // Test 3: BTC split (instant)
+    results.push(await runTransferTest({
+      scenario: '3. BTC split (instant)',
       sender: alice,
       receiver: bob,
       receiverNametag: bobNametag,
       amount: '0.1',
       coinSymbol: 'BTC',
       mode: 'direct',
+      transferMode: 'instant',
     }));
     await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-
     await alice.payments.load();
     await bob.payments.load();
 
-    // Test 3: ETH transfer (split)
+    // Test 4: BTC split (conservative)
     results.push(await runTransferTest({
-      scenario: '3. ETH transfer (split from 42)',
+      scenario: '4. BTC split (conservative)',
+      sender: alice,
+      receiver: bob,
+      receiverNametag: bobNametag,
+      amount: '0.1',
+      coinSymbol: 'BTC',
+      mode: 'direct',
+      transferMode: 'conservative',
+    }));
+    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
+    await alice.payments.load();
+    await bob.payments.load();
+
+    // Test 5: ETH split (instant)
+    results.push(await runTransferTest({
+      scenario: '5. ETH split (instant)',
       sender: alice,
       receiver: bob,
       receiverNametag: bobNametag,
       amount: '1',
       coinSymbol: 'ETH',
       mode: 'direct',
+      transferMode: 'instant',
     }));
     await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-
     await alice.payments.load();
     await bob.payments.load();
 
-    // Test 4: Send-back UCT (bob -> alice)
+    // Test 6: ETH split (conservative)
     results.push(await runTransferTest({
-      scenario: '4. Send-back UCT (bob -> alice)',
+      scenario: '6. ETH split (conservative)',
+      sender: alice,
+      receiver: bob,
+      receiverNametag: bobNametag,
+      amount: '1',
+      coinSymbol: 'ETH',
+      mode: 'direct',
+      transferMode: 'conservative',
+    }));
+    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
+    await alice.payments.load();
+    await bob.payments.load();
+
+    // =========================================================================
+    // Phase 3: Send-back tests (instant + conservative)
+    // =========================================================================
+    console.log('\n\n--- PHASE 3: SEND-BACK TESTS (INSTANT vs CONSERVATIVE) ---');
+
+    // Resolve Bob's unconfirmed UCT tokens before send-back
+    console.log('\n[RESOLVE] Resolving Bob unconfirmed UCT tokens...');
+    const uctResolution = await waitForTokenResolution(bob, 'UCT');
+    console.log(`  UCT resolved=${uctResolution.resolved} in ${uctResolution.durationMs.toFixed(0)}ms`);
+
+    // Test 7: Send-back UCT (instant, bob -> alice)
+    results.push(await runTransferTest({
+      scenario: '7. Send-back UCT (instant)',
       sender: bob,
       receiver: alice,
       receiverNametag: aliceNametag,
       amount: '0.5',
       coinSymbol: 'UCT',
       mode: 'direct',
+      transferMode: 'instant',
     }));
     await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-
     await alice.payments.load();
     await bob.payments.load();
 
-    // =========================================================================
-    // Phase 3: PROXY Mode Tests (known-failing)
-    // =========================================================================
-    console.log('\n\n--- PHASE 3: PROXY MODE TESTS ---');
+    // Resolve Bob's remaining UCT tokens before conservative send-back
+    console.log('\n[RESOLVE] Resolving Bob remaining UCT tokens...');
+    const uctResolution2 = await waitForTokenResolution(bob, 'UCT');
+    console.log(`  UCT resolved=${uctResolution2.resolved} in ${uctResolution2.durationMs.toFixed(0)}ms`);
 
-    // Test 5: PROXY UCT
+    // Test 8: Send-back UCT (conservative, bob -> alice)
     results.push(await runTransferTest({
-      scenario: '5. PROXY UCT (alice -> bob)',
-      sender: alice,
-      receiver: bob,
-      receiverNametag: bobNametag,
-      amount: '0.1',
-      coinSymbol: 'UCT',
-      mode: 'proxy',
-    }));
-    await new Promise(r => setTimeout(r, INTER_TEST_DELAY_MS));
-
-    await alice.payments.load();
-    await bob.payments.load();
-
-    // Test 6: PROXY BTC send-back
-    results.push(await runTransferTest({
-      scenario: '6. PROXY BTC send-back (bob -> alice)',
+      scenario: '8. Send-back UCT (conservative)',
       sender: bob,
       receiver: alice,
       receiverNametag: aliceNametag,
-      amount: '0.01',
-      coinSymbol: 'BTC',
-      mode: 'proxy',
+      amount: '0.5',
+      coinSymbol: 'UCT',
+      mode: 'direct',
+      transferMode: 'conservative',
     }));
 
     // =========================================================================

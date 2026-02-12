@@ -50,12 +50,22 @@ import { defaultUUIDGenerator } from './websocket';
 import {
   DEFAULT_NOSTR_RELAYS,
   NOSTR_EVENT_KINDS,
+  STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
 
 // =============================================================================
 // Configuration
 // =============================================================================
+
+/**
+ * Minimal key-value storage interface for transport persistence.
+ * Used to persist the last processed event timestamp across sessions.
+ */
+export interface TransportStorageAdapter {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+}
 
 export interface NostrTransportProviderConfig {
   /** Nostr relay URLs */
@@ -74,6 +84,8 @@ export interface NostrTransportProviderConfig {
   createWebSocket: WebSocketFactory;
   /** UUID generator (optional, defaults to crypto.randomUUID) */
   generateUUID?: UUIDGenerator;
+  /** Optional storage adapter for persisting subscription timestamps */
+  storage?: TransportStorageAdapter;
 }
 
 // Alias for backward compatibility
@@ -191,10 +203,13 @@ export class NostrTransportProvider implements TransportProvider {
   readonly type = 'p2p' as const;
   readonly description = 'P2P messaging via Nostr protocol';
 
-  private config: Required<Omit<NostrTransportProviderConfig, 'createWebSocket' | 'generateUUID'>> & {
+  private config: Required<Omit<NostrTransportProviderConfig, 'createWebSocket' | 'generateUUID' | 'storage'>> & {
     createWebSocket: WebSocketFactory;
     generateUUID: UUIDGenerator;
   };
+  private storage: TransportStorageAdapter | null = null;
+  /** In-memory max event timestamp to avoid read-before-write races in updateLastEventTimestamp. */
+  private lastEventTs: number = 0;
   private identity: FullIdentity | null = null;
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
@@ -205,6 +220,7 @@ export class NostrTransportProvider implements TransportProvider {
   private mainSubscriptionId: string | null = null;
 
   // Event handlers
+  private processedEventIds = new Set<string>();
   private messageHandlers: Set<MessageHandler> = new Set();
   private pendingMessages: IncomingMessage[] = [];  // buffer for messages arriving before handlers register
   private transferHandlers: Set<TokenTransferHandler> = new Set();
@@ -224,6 +240,7 @@ export class NostrTransportProvider implements TransportProvider {
       createWebSocket: config.createWebSocket,
       generateUUID: config.generateUUID ?? defaultUUIDGenerator,
     };
+    this.storage = config.storage ?? null;
   }
 
   // ===========================================================================
@@ -274,8 +291,15 @@ export class NostrTransportProvider implements TransportProvider {
         },
       });
 
-      // Connect to all relays
-      await this.nostrClient.connect(...this.config.relays);
+      // Connect to all relays (with timeout to prevent indefinite hang)
+      await Promise.race([
+        this.nostrClient.connect(...this.config.relays),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(
+            `Transport connection timed out after ${this.config.timeout}ms`
+          )), this.config.timeout)
+        ),
+      ]);
 
       // Need at least one successful connection
       if (!this.nostrClient.isConnected()) {
@@ -288,7 +312,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Set up subscriptions
       if (this.identity) {
-        this.subscribeToEvents();
+        await this.subscribeToEvents();
       }
     } catch (error) {
       this.status = 'error';
@@ -477,12 +501,19 @@ export class NostrTransportProvider implements TransportProvider {
       });
 
       // Connect with new identity, set up subscriptions, then disconnect old client
-      await this.nostrClient.connect(...this.config.relays);
-      this.subscribeToEvents();
+      await Promise.race([
+        this.nostrClient.connect(...this.config.relays),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(
+            `Transport reconnection timed out after ${this.config.timeout}ms`
+          )), this.config.timeout)
+        ),
+      ]);
+      await this.subscribeToEvents();
       oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
-      this.subscribeToEvents();
+      await this.subscribeToEvents();
     }
   }
 
@@ -1203,6 +1234,14 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private async handleEvent(event: NostrEvent): Promise<void> {
+    // Dedup: skip events already processed by another subscription
+    if (event.id && this.processedEventIds.has(event.id)) {
+      return;
+    }
+    if (event.id) {
+      this.processedEventIds.add(event.id);
+    }
+
     this.log('Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
       switch (event.kind) {
@@ -1226,9 +1265,41 @@ export class NostrTransportProvider implements TransportProvider {
           this.handleBroadcast(event);
           break;
       }
+
+      // Persist the latest event timestamp for resumption on reconnect.
+      // Only update for wallet event kinds (not chat/broadcast).
+      if (event.created_at && this.storage && this.keyManager) {
+        const kind = event.kind;
+        if (
+          kind === EVENT_KINDS.DIRECT_MESSAGE ||
+          kind === EVENT_KINDS.TOKEN_TRANSFER ||
+          kind === EVENT_KINDS.PAYMENT_REQUEST ||
+          kind === EVENT_KINDS.PAYMENT_REQUEST_RESPONSE
+        ) {
+          this.updateLastEventTimestamp(event.created_at);
+        }
+      }
     } catch (error) {
       this.log('Failed to handle event:', error);
     }
+  }
+
+  /**
+   * Save the max event timestamp to storage (fire-and-forget, no await needed by caller).
+   * Uses in-memory `lastEventTs` to avoid read-before-write race conditions
+   * when multiple events arrive in quick succession.
+   */
+  private updateLastEventTimestamp(createdAt: number): void {
+    if (!this.storage || !this.keyManager) return;
+    if (createdAt <= this.lastEventTs) return;
+
+    this.lastEventTs = createdAt;
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_WALLET_EVENT_TS}_${pubkey.slice(0, 16)}`;
+
+    this.storage.set(storageKey, createdAt.toString()).catch(err => {
+      this.log('Failed to save last event timestamp:', err);
+    });
   }
 
   private async handleDirectMessage(event: NostrEvent): Promise<void> {
@@ -1319,7 +1390,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     for (const handler of this.transferHandlers) {
       try {
-        handler(transfer);
+        await handler(transfer);
       } catch (error) {
         this.log('Transfer handler error:', error);
       }
@@ -1344,6 +1415,7 @@ export class NostrTransportProvider implements TransportProvider {
       const request: IncomingPaymentRequest = {
         id: event.id,
         senderTransportPubkey: event.pubkey,
+        senderNametag: requestData.recipientNametag,
         request: {
           requestId: requestData.requestId,
           amount: requestData.amount,
@@ -1503,6 +1575,58 @@ export class NostrTransportProvider implements TransportProvider {
     await this.nostrClient.publishEvent(sdkEvent);
   }
 
+  async fetchPendingEvents(): Promise<void> {
+    if (!this.nostrClient?.isConnected() || !this.keyManager) {
+      throw new Error('Transport not connected');
+    }
+
+    const nostrPubkey = this.keyManager.getPublicKeyHex();
+
+    const walletFilter = new Filter();
+    walletFilter.kinds = [
+      EVENT_KINDS.DIRECT_MESSAGE,
+      EVENT_KINDS.TOKEN_TRANSFER,
+      EVENT_KINDS.PAYMENT_REQUEST,
+      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+    ];
+    walletFilter['#p'] = [nostrPubkey];
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400;
+
+    // Collect events first, then process after EOSE
+    const events: NostrEvent[] = [];
+
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (subId) this.nostrClient?.unsubscribe(subId);
+        resolve();
+      }, 5000);
+
+      const subId = this.nostrClient!.subscribe(walletFilter, {
+        onEvent: (event) => {
+          events.push({
+            id: event.id,
+            kind: event.kind,
+            content: event.content,
+            tags: event.tags,
+            pubkey: event.pubkey,
+            created_at: event.created_at,
+            sig: event.sig,
+          });
+        },
+        onEndOfStoredEvents: () => {
+          clearTimeout(timeout);
+          this.nostrClient?.unsubscribe(subId);
+          resolve();
+        },
+      });
+    });
+
+    // Process collected events sequentially (dedup skips already-processed ones)
+    for (const event of events) {
+      await this.handleEvent(event);
+    }
+  }
+
   private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
     if (!this.nostrClient || !this.nostrClient.isConnected()) {
       throw new Error('No connected relays');
@@ -1548,7 +1672,7 @@ export class NostrTransportProvider implements TransportProvider {
   private walletSubscriptionId: string | null = null;
   private chatSubscriptionId: string | null = null;
 
-  private subscribeToEvents(): void {
+  private async subscribeToEvents(): Promise<void> {
     this.log('subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
     if (!this.identity || !this.keyManager || !this.nostrClient) {
       this.log('subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
@@ -1573,8 +1697,34 @@ export class NostrTransportProvider implements TransportProvider {
     const nostrPubkey = this.keyManager.getPublicKeyHex();
     this.log('Subscribing with Nostr pubkey:', nostrPubkey);
 
+    // Determine 'since' filter from persisted last event timestamp.
+    // - Existing wallet: resume from last processed event (inclusive >=, dedup handles replays)
+    // - Fresh wallet / no storage: use current time (no historical replay)
+    let since: number;
+    if (this.storage) {
+      const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_WALLET_EVENT_TS}_${nostrPubkey.slice(0, 16)}`;
+      try {
+        const stored = await this.storage.get(storageKey);
+        if (stored) {
+          since = parseInt(stored, 10);
+          this.lastEventTs = since; // Seed in-memory tracker from storage
+          this.log('Resuming from stored event timestamp:', since);
+        } else {
+          // No stored timestamp = fresh wallet, start from now
+          since = Math.floor(Date.now() / 1000);
+          this.log('No stored timestamp, starting from now:', since);
+        }
+      } catch (err) {
+        this.log('Failed to read last event timestamp, falling back to now:', err);
+        since = Math.floor(Date.now() / 1000);
+      }
+    } else {
+      // No storage adapter — fallback to last 24h (legacy behavior)
+      since = Math.floor(Date.now() / 1000) - 86400;
+      this.log('No storage adapter, using 24h fallback');
+    }
+
     // Subscribe to wallet events (token transfers, payment requests) with since filter
-    // Matches Sphere app's approach
     const walletFilter = new Filter();
     walletFilter.kinds = [
       EVENT_KINDS.DIRECT_MESSAGE,
@@ -1583,7 +1733,7 @@ export class NostrTransportProvider implements TransportProvider {
       EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
     ];
     walletFilter['#p'] = [nostrPubkey];
-    walletFilter.since = Math.floor(Date.now() / 1000) - 86400; // Last 24h
+    walletFilter.since = since;
 
     this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
       onEvent: (event) => {

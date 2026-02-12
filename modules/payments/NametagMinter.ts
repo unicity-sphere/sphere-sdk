@@ -25,6 +25,7 @@ import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAl
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
 import { DirectAddress } from '@unicitylabs/state-transition-sdk/lib/address/DirectAddress';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
+import { normalizeNametag } from '@unicitylabs/nostr-js-sdk';
 import type { NametagData } from '../../types/txf';
 
 // =============================================================================
@@ -88,7 +89,8 @@ export class NametagMinter {
    */
   async isNametagAvailable(nametag: string): Promise<boolean> {
     try {
-      const cleanNametag = nametag.replace('@', '').trim();
+      const stripped = nametag.startsWith('@') ? nametag.slice(1) : nametag;
+      const cleanNametag = normalizeNametag(stripped);
       const nametagTokenId = await TokenId.fromNameTag(cleanNametag);
 
       const isMinted = await this.client.isMinted(this.trustBase, nametagTokenId);
@@ -110,7 +112,8 @@ export class NametagMinter {
     nametag: string,
     ownerAddress: DirectAddress
   ): Promise<MintNametagResult> {
-    const cleanNametag = nametag.replace('@', '').trim();
+    const stripped = nametag.startsWith('@') ? nametag.slice(1) : nametag;
+    const cleanNametag = normalizeNametag(stripped);
     this.log(`Starting mint for nametag: ${cleanNametag}`);
 
     try {
