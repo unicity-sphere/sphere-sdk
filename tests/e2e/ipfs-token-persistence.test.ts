@@ -457,10 +457,11 @@ describe('IPFS Active Token Persistence E2E', () => {
     await requestFaucet(nametagC, 'unicity', 100);
 
     // Wait for batch 2 to arrive (we need at least some tokens)
+    // NOTE: Nostr replay may also re-deliver batch 1 tokens, so pre-sync
+    // balance could be 1 token (batch 2 only) or 2 tokens (batch 1 via Nostr + batch 2)
     console.log('  Waiting for batch 2 tokens...');
     const preSyncBal = await waitForTokens(sphereC2, 'UCT', 1n, FAUCET_TOPUP_TIMEOUT_MS);
-    const batch2Total = preSyncBal.total;
-    console.log(`  Pre-sync balance: total=${batch2Total}, tokens=${preSyncBal.tokens}`);
+    console.log(`  Pre-sync balance: total=${preSyncBal.total}, tokens=${preSyncBal.tokens}`);
 
     // --- Step 4: Add IPFS provider and sync to merge ---
     if (providersC2.ipfsTokenStorage) {
@@ -491,8 +492,15 @@ describe('IPFS Active Token Persistence E2E', () => {
     const mergedBalance = getBalance(sphereC2, 'UCT');
     console.log(`  Merged balance: total=${mergedBalance.total}, tokens=${mergedBalance.tokens}`);
 
-    // Use >= because Nostr replay may have already delivered batch 1 before IPFS sync
-    expect(mergedBalance.total).toBeGreaterThanOrEqual(batch1Total + batch2Total);
+    // After merge, BOTH batches must be present:
+    // - No tokens lost during merge (merged >= pre-sync)
+    // - At least 2 tokens (one from each batch)
+    // - Total at least 2x batch1 (each batch is ~100 UCT)
+    // NOTE: We don't use batch2Total in the assertion because Nostr replay
+    // may have already delivered batch 1 locally, inflating pre-sync balance
+    expect(mergedBalance.total).toBeGreaterThanOrEqual(preSyncBal.total);
+    expect(mergedBalance.total).toBeGreaterThanOrEqual(batch1Total * 2n);
+    expect(mergedBalance.tokens).toBeGreaterThanOrEqual(2);
 
     console.log('[Test 4] PASSED: local + IPFS tokens merged correctly');
   }, 300_000);
