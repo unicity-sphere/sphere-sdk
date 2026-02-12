@@ -495,6 +495,9 @@ async function runTransferTest(config: TransferTestConfig): Promise<TransferTest
       await sender.payments.load();
       senderAfter = getBalance(sender, coinSymbol);
     }
+    if (senderAfter.total < expectedSenderTotal) {
+      console.warn(`    WARNING: Sender change token wait timed out (15s). Balance: ${senderAfter.total}, expected: ${expectedSenderTotal}`);
+    }
     const senderDelta = senderBefore.total - senderAfter.total;
     const receiverDelta = receiveResult.finalBalance.total - receiverBefore.total;
     result.senderDelta = senderDelta;
