@@ -8,6 +8,7 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 - **L1 Payments** - ALPHA blockchain transactions via Fulcrum WebSocket
 - **L3 Payments** - Token transfers with state transition proofs
 - **Payment Requests** - Request payments with async response tracking
+- **Group Chat** - NIP-29 relay-based group messaging with moderation
 - **Nostr Transport** - P2P messaging with NIP-04 encryption
 - **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
 - **Token Splitting** - Partial transfer amount calculations
@@ -353,6 +354,162 @@ sphere.payments.onPaymentRequest((request) => {
 });
 ```
 
+## Group Chat (NIP-29)
+
+Relay-based group messaging using the NIP-29 protocol. The module embeds its own Nostr connection separate from the wallet transport.
+
+### Enabling Group Chat
+
+```typescript
+// Enable with network defaults (wss://sphere-relay.unicity.network)
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  groupChat: true,
+});
+
+// Enable with custom relay
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  groupChat: { relays: ['wss://my-nip29-relay.com'] },
+});
+
+// Access the module
+const gc = sphere.groupChat!;
+```
+
+### Connection
+
+```typescript
+// Connect to the NIP-29 relay
+await gc.connect();
+console.log('Connected:', gc.getConnectionStatus());
+
+// Check if current user is a relay admin
+const isRelayAdmin = await gc.isCurrentUserRelayAdmin();
+```
+
+### Groups
+
+```typescript
+import { GroupVisibility } from '@unicitylabs/sphere-sdk';
+
+// Create a public group
+const group = await gc.createGroup({
+  name: 'General',
+  description: 'Public discussion',
+});
+
+// Create a private group
+const privateGroup = await gc.createGroup({
+  name: 'Team',
+  visibility: GroupVisibility.PRIVATE,
+});
+
+// Discover and join
+const available = await gc.fetchAvailableGroups(); // public groups on relay
+await gc.joinGroup(group.id);
+
+// Join private group with invite
+await gc.joinGroup(privateGroup.id, inviteCode);
+
+// List joined groups
+const groups = gc.getGroups();
+
+// Leave or delete
+await gc.leaveGroup(group.id);
+await gc.deleteGroup(group.id); // admin only
+```
+
+### Messaging
+
+```typescript
+// Send a message
+const msg = await gc.sendMessage(group.id, 'Hello!');
+
+// Reply to a message
+await gc.sendMessage(group.id, 'Agreed', { replyToId: msg.id });
+
+// Fetch messages from relay
+const messages = await gc.fetchMessages(group.id, { limit: 50 });
+
+// Get locally cached messages
+const cached = gc.getMessages(group.id);
+
+// Listen for new messages in real-time
+const unsubscribe = gc.onMessage((message) => {
+  console.log(`[${message.groupId}] ${message.senderPubkey}: ${message.content}`);
+});
+```
+
+### Members & Moderation
+
+```typescript
+// Get members
+const members = gc.getMembers(group.id);
+
+// Check roles
+gc.isCurrentUserAdmin(group.id);     // boolean
+gc.isCurrentUserModerator(group.id); // boolean
+await gc.canModerateGroup(group.id); // includes relay admin check
+
+// Moderate (requires admin/moderator role)
+await gc.kickUser(group.id, userPubkey, 'reason');
+await gc.deleteMessage(group.id, messageId);
+```
+
+### Invites (Private Groups)
+
+```typescript
+// Create invite code (admin only)
+const invite = await gc.createInvite(group.id);
+
+// Share invite code, recipient joins with:
+await gc.joinGroup(group.id, invite);
+```
+
+### Unread Counts
+
+```typescript
+const total = gc.getTotalUnreadCount();
+gc.markGroupAsRead(group.id);
+```
+
+### Key Types
+
+```typescript
+interface GroupData {
+  id: string;
+  relayUrl: string;
+  name: string;
+  description?: string;
+  visibility: GroupVisibility;  // 'PUBLIC' | 'PRIVATE'
+  memberCount?: number;
+  unreadCount?: number;
+  lastMessageTime?: number;
+  lastMessageText?: string;
+}
+
+interface GroupMessageData {
+  id?: string;
+  groupId: string;
+  content: string;
+  timestamp: number;
+  senderPubkey: string;
+  senderNametag?: string;
+  replyToId?: string;
+}
+
+interface GroupMemberData {
+  pubkey: string;
+  groupId: string;
+  role: GroupRole;  // 'ADMIN' | 'MODERATOR' | 'MEMBER'
+  nametag?: string;
+  joinedAt: number;
+}
+```
+
 ## L1 (ALPHA Blockchain) Operations
 
 Access L1 payments through `sphere.payments.l1`:
@@ -628,18 +785,19 @@ mnemonic → master key → BIP32 derivation → identity
                         │  directAddress: "DIRECT://..." (L3)       │
                         └─────────────────────┬─────────────────────┘
                                               ↓
-              ┌───────────────────────────────┼───────────────────────────────┐
-              ↓                               ↓                               ↓
-         L1 (ALPHA)                     L3 (Unicity)                      Nostr
-     sphere.payments.l1              sphere.payments               sphere.communications
-      UTXOs, blockchain              Tokens, aggregator              P2P messaging
+              ┌──────────────────┬──────────────────┬──────────────────┐
+              ↓                  ↓                  ↓                  ↓
+         L1 (ALPHA)        L3 (Unicity)        Group Chat           Nostr
+     sphere.payments.l1  sphere.payments    sphere.groupChat  sphere.communications
+      UTXOs, blockchain  Tokens, aggregator  NIP-29 messaging    P2P messaging
 ```
 
 ```
 Sphere (main entry point)
-├── identity    - Wallet identity (address, publicKey, nametag)
-├── payments    - L3 token operations
-│   └── l1      - L1 ALPHA transactions (via sphere.payments.l1)
+├── identity       - Wallet identity (address, publicKey, nametag)
+├── payments       - L3 token operations
+│   └── l1         - L1 ALPHA transactions (via sphere.payments.l1)
+├── groupChat      - NIP-29 group messaging (via sphere.groupChat)
 └── communications - Direct messages & broadcasts
 
 Providers (injectable dependencies)

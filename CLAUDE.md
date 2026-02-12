@@ -201,6 +201,10 @@ sphere-sdk/
 │   │   ├── TokenSplitCalculator.ts
 │   │   ├── TokenSplitExecutor.ts
 │   │   └── NametagMinter.ts       # On-chain nametag minting
+│   ├── groupchat/
+│   │   ├── GroupChatModule.ts     # NIP-29 group chat (relay-based)
+│   │   ├── types.ts               # GroupData, GroupMessageData, etc.
+│   │   └── index.ts               # Barrel exports + factory
 │   └── communications/
 │       └── CommunicationsModule.ts # DMs and broadcasts
 │
@@ -427,6 +431,17 @@ Key test files:
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
 - `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
+- `tests/relay/groupchat-relay.test.ts` - GroupChat NIP-29 relay integration (Docker + remote)
+
+### Relay Integration Tests
+
+```bash
+# Run with Docker (testcontainers)
+npm run test:relay
+
+# Run against deployed relay
+RELAY_URL=wss://sphere-relay.unicity.network npm run test:relay
+```
 
 ## Dependencies
 
