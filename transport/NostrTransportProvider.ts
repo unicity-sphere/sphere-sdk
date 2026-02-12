@@ -538,10 +538,23 @@ export class NostrTransportProvider implements TransportProvider {
       : recipientPubkey;
 
     // Wrap content with sender nametag for Sphere app compatibility
+    // Structured messages (those with a "type" field) are sent as-is — they
+    // already include senderNametag and should not be double-wrapped.
     const senderNametag = this.identity?.nametag;
-    const wrappedContent = senderNametag
-      ? JSON.stringify({ senderNametag, text: content })
-      : content;
+    let wrappedContent: string;
+    try {
+      const parsed = JSON.parse(content);
+      if (typeof parsed === 'object' && parsed.type) {
+        // Structured message (e.g. composing indicator) — send as-is
+        wrappedContent = content;
+      } else {
+        throw new Error('not structured');
+      }
+    } catch {
+      wrappedContent = senderNametag
+        ? JSON.stringify({ senderNametag, text: content })
+        : content;
+    }
 
     // Create NIP-17 gift-wrapped message (kind 1059)
     const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
