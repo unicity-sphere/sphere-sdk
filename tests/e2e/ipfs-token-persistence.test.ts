@@ -27,6 +27,7 @@ import {
   makeTempDirs,
   ensureTrustbase,
   makeProviders,
+  createNoopTransport,
   requestFaucet,
   requestMultiCoinFaucet,
   getBalance,
@@ -34,6 +35,7 @@ import {
   getTokenAmounts,
   waitForAllCoins,
   waitForTokens,
+  syncUntilAllCoins,
   type BalanceSnapshot,
 } from './helpers';
 
@@ -99,14 +101,6 @@ describe('IPFS Active Token Persistence E2E', () => {
     savedMnemonicA = generatedMnemonic!;
     console.log(`  Wallet A created: ${sphereA.identity!.l1Address}`);
 
-    // Register IPFS provider
-    if (providersA.ipfsTokenStorage) {
-      await sphereA.addTokenStorageProvider(providersA.ipfsTokenStorage);
-      console.log('  IPFS token storage provider added');
-    } else {
-      throw new Error('IPFS token storage provider not created — check tokenSync.ipfs.enabled');
-    }
-
     // Request faucet for all coins (SOL + ETH)
     console.log(`  Requesting multi-coin faucet for @${savedNametagA}...`);
     await requestMultiCoinFaucet(savedNametagA);
@@ -131,6 +125,16 @@ describe('IPFS Active Token Persistence E2E', () => {
       console.log(`  Recorded ${ids.size} ${coin.symbol} token(s)`);
     }
 
+    // Register IPFS provider AFTER all tokens arrived — prevents the
+    // background write-behind buffer from flushing a partial token set
+    // to IPNS before the explicit sync() below.
+    if (providersA.ipfsTokenStorage) {
+      await sphereA.addTokenStorageProvider(providersA.ipfsTokenStorage);
+      console.log('  IPFS token storage provider added (after all tokens received)');
+    } else {
+      throw new Error('IPFS token storage provider not created — check tokenSync.ipfs.enabled');
+    }
+
     // Sync to IPFS
     console.log('  Syncing to IPFS...');
     const syncResult = await sphereA.payments.sync();
@@ -143,13 +147,13 @@ describe('IPFS Active Token Persistence E2E', () => {
   // Test 2: Recover multi-coin tokens from IPFS after local wipe
   // ---------------------------------------------------------------------------
 
-  it('recovers multi-coin tokens from IPFS after local storage wipe', async () => {
+  it('recovers multi-coin tokens ONLY from IPFS after local storage wipe (no Nostr)', async () => {
     expect(savedMnemonicA).toBeTruthy();
     for (const coin of TEST_COINS) {
       expect(originalTokenIds.get(coin.symbol)!.size).toBeGreaterThan(0);
     }
 
-    // Destroy and wipe
+    // Destroy and wipe ALL local data
     console.log('\n[Test 2] Destroying wallet A and wiping local storage...');
     await sphereA.destroy();
     spheres.splice(spheres.indexOf(sphereA), 1);
@@ -166,12 +170,16 @@ describe('IPFS Active Token Persistence E2E', () => {
     await ensureTrustbase(dirsA.dataDir);
     const providersA = makeProviders(dirsA);
 
-    // Import from mnemonic
-    console.log('  Importing wallet A from mnemonic...');
+    // CRITICAL: Use NO-OP transport to prove tokens come ONLY from IPFS, not Nostr
+    const noopTransport = createNoopTransport();
+
+    console.log('  Importing wallet A from mnemonic with NO-OP transport (no Nostr)...');
     sphereA = await Sphere.import({
-      ...providersA,
+      storage: providersA.storage,
+      tokenStorage: providersA.tokenStorage,
+      transport: noopTransport,
+      oracle: providersA.oracle,
       mnemonic: savedMnemonicA,
-      nametag: savedNametagA,
     });
     spheres.push(sphereA);
     console.log(`  Wallet A imported: ${sphereA.identity!.l1Address}`);
@@ -184,38 +192,41 @@ describe('IPFS Active Token Persistence E2E', () => {
       throw new Error('IPFS token storage provider not created');
     }
 
-    // Retry sync until tokens arrive
-    console.log(`  Retrying sync up to ${IPNS_RESOLVE_TIMEOUT_MS / 1000}s...`);
-    let syncAdded = 0;
-    const start = performance.now();
-    while (performance.now() - start < IPNS_RESOLVE_TIMEOUT_MS) {
-      try {
-        const syncResult = await sphereA.payments.sync();
-        syncAdded = syncResult.added;
-        if (syncAdded > 0) {
-          console.log(`  Sync succeeded: added=${syncAdded}`);
-          break;
-        }
-      } catch (err) {
-        console.log(`  Sync attempt failed: ${err instanceof Error ? err.message : err}`);
-      }
-      console.log('  Retrying in 5s...');
-      await new Promise((r) => setTimeout(r, 5000));
+    // CRITICAL ASSERTION: before sync, wallet must have ZERO tokens for ALL coins
+    // This proves Nostr did NOT deliver anything (no-op transport)
+    for (const coin of TEST_COINS) {
+      const preSyncBal = getBalance(sphereA, coin.symbol);
+      console.log(`  Pre-sync ${coin.symbol}: total=${preSyncBal.total}, tokens=${preSyncBal.tokens}`);
+      expect(preSyncBal.total).toBe(0n);
+      expect(preSyncBal.tokens).toBe(0);
     }
 
+    // Sync from IPFS — this is the ONLY way to get tokens (Nostr is disabled)
+    console.log('  Syncing from IPFS (this is the only token source)...');
+    const { syncAdded, balances: postSyncBalances } = await syncUntilAllCoins(
+      sphereA,
+      1n,
+      IPNS_RESOLVE_TIMEOUT_MS,
+    );
+
+    for (const coin of TEST_COINS) {
+      const bal = postSyncBalances.get(coin.symbol)!;
+      console.log(`  Post-sync ${coin.symbol}: total=${bal.total}, tokens=${bal.tokens}`);
+    }
+    console.log(`  syncAdded=${syncAdded}`);
+
+    // CRITICAL: sync must have actually added tokens (proves IPFS delivered them)
     expect(syncAdded).toBeGreaterThan(0);
 
-    // Verify per-coin balance and tokens
-    await sphereA.payments.load();
+    // Verify per-coin balance and tokens match original exactly
     for (const coin of TEST_COINS) {
-      const recoveredBal = getBalance(sphereA, coin.symbol);
+      const recoveredBal = postSyncBalances.get(coin.symbol)!;
       const origBal = originalBalances.get(coin.symbol)!;
-      console.log(`  Recovered ${coin.symbol}: total=${recoveredBal.total}, tokens=${recoveredBal.tokens}`);
 
       expect(recoveredBal.total).toBe(origBal.total);
       expect(recoveredBal.tokens).toBe(origBal.tokens);
 
-      // Verify individual tokens
+      // Verify individual token IDs and amounts
       const recoveredIds = getTokenIds(sphereA, coin.symbol);
       const recoveredAmounts = getTokenAmounts(sphereA, coin.symbol);
       const origIds = originalTokenIds.get(coin.symbol)!;
@@ -227,7 +238,28 @@ describe('IPFS Active Token Persistence E2E', () => {
       }
     }
 
-    console.log('[Test 2] PASSED: all multi-coin tokens recovered from IPFS with correct amounts');
+    // Now re-import with real Nostr transport so Test 3 (spend) can send tokens
+    console.log('  Re-importing with real transport for subsequent tests...');
+    await sphereA.destroy();
+    spheres.splice(spheres.indexOf(sphereA), 1);
+
+    sphereA = await Sphere.import({
+      ...providersA,
+      mnemonic: savedMnemonicA,
+      nametag: savedNametagA,
+    });
+    spheres.push(sphereA);
+
+    // Add IPFS provider to the real-transport sphere
+    if (providersA.ipfsTokenStorage) {
+      await sphereA.addTokenStorageProvider(providersA.ipfsTokenStorage);
+    }
+
+    // Sync to reload IPFS tokens into the real-transport sphere
+    await sphereA.payments.sync();
+    await sphereA.payments.load();
+
+    console.log('[Test 2] PASSED: all multi-coin tokens recovered exclusively from IPFS (no Nostr)');
   }, 180_000);
 
   // ---------------------------------------------------------------------------
@@ -320,13 +352,6 @@ describe('IPFS Active Token Persistence E2E', () => {
     expect(mnemonicC).toBeTruthy();
     console.log(`  Wallet C created: ${sphereC1.identity!.l1Address}`);
 
-    // Add IPFS
-    if (providersC1.ipfsTokenStorage) {
-      await sphereC1.addTokenStorageProvider(providersC1.ipfsTokenStorage);
-    } else {
-      throw new Error('IPFS token storage provider not created');
-    }
-
     // Request batch 1 (all coins)
     console.log('  Requesting batch 1 (all coins)...');
     await requestMultiCoinFaucet(nametagC);
@@ -335,6 +360,14 @@ describe('IPFS Active Token Persistence E2E', () => {
     for (const coin of TEST_COINS) {
       const bal = batch1Balances.get(coin.symbol)!;
       console.log(`  Batch 1 ${coin.symbol}: total=${bal.total}, tokens=${bal.tokens}`);
+    }
+
+    // Add IPFS AFTER all batch 1 tokens arrived — prevents write-behind
+    // buffer from flushing partial data to IPNS before explicit sync.
+    if (providersC1.ipfsTokenStorage) {
+      await sphereC1.addTokenStorageProvider(providersC1.ipfsTokenStorage);
+    } else {
+      throw new Error('IPFS token storage provider not created');
     }
 
     // Sync batch 1 to IPFS

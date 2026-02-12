@@ -105,11 +105,6 @@ describe('IPFS Multi-Device Sync E2E', () => {
       expect(generatedMnemonic).toBeTruthy();
       savedMnemonic = generatedMnemonic!;
 
-      // Register IPFS provider
-      expect(providersA.ipfsTokenStorage).toBeTruthy();
-      await sphere.addTokenStorageProvider(providersA.ipfsTokenStorage!);
-      console.log('  IPFS token storage provider added');
-
       // Request faucet for all coins (SOL + ETH)
       console.log(`  Requesting multi-coin faucet for @${savedNametag}...`);
       await requestMultiCoinFaucet(savedNametag);
@@ -140,6 +135,13 @@ describe('IPFS Multi-Device Sync E2E', () => {
         expect(ids.size).toBeGreaterThan(0);
         console.log(`  Recorded ${ids.size} ${coin.symbol} token(s)`);
       }
+
+      // Register IPFS provider AFTER all tokens arrived — prevents the
+      // background write-behind buffer from flushing a partial token set
+      // to IPNS before the explicit sync() below.
+      expect(providersA.ipfsTokenStorage).toBeTruthy();
+      await sphere.addTokenStorageProvider(providersA.ipfsTokenStorage!);
+      console.log('  IPFS token storage provider added (after all tokens received)');
 
       // Sync to IPFS
       console.log('  Syncing to IPFS...');
