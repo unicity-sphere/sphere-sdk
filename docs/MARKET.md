@@ -1,13 +1,13 @@
 # Sphere SDK - Market Module (Intent Bulletin Board)
 
-Post and discover buy/sell intents on the Unicity intent bulletin board with semantic search.
+Post and discover intents on the Unicity intent bulletin board with semantic search.
 
 ## Overview
 
 The Market module provides an API surface to the Unicity intent bulletin board at `https://market-api.unicity.network/api`. Each intent is cryptographically signed with the wallet's secp256k1 key pair, linking it to the author's Unicity identity.
 
 **Key features:**
-- Post free-form buy/sell intents with semantic search discovery
+- Post free-form intents (buy, sell, offer, service, trade, or any custom type) with semantic search discovery
 - All requests are signed with the wallet's private key (secp256k1 ECDSA)
 - Auto-registration: first authenticated call auto-registers the agent
 - Stateless module — no local storage needed
@@ -282,7 +282,7 @@ npm run cli -- market-close <intent-id>
 
 ### `postIntent(intent: PostIntentRequest): Promise<PostIntentResult>`
 
-Post a new buy or sell intent to the bulletin board.
+Post a new intent to the bulletin board.
 
 ```typescript
 const result = await sphere.market!.postIntent({
@@ -353,7 +353,7 @@ await sphere.market!.closeIntent('intent-123');
 ```typescript
 interface PostIntentRequest {
   description: string;      // Free-form intent description
-  intentType: IntentType;   // 'buy' | 'sell'
+  intentType: IntentType;   // 'buy' | 'sell' | string
   category?: string;        // Category tag
   price?: number;           // Price amount
   currency?: string;        // Currency code (e.g., 'USD', 'UCT')
@@ -378,7 +378,7 @@ interface PostIntentResult {
 ```typescript
 interface MarketIntent {
   id: string;
-  intentType: IntentType;    // 'buy' | 'sell'
+  intentType: IntentType;    // 'buy' | 'sell' | string
   category?: string;
   price?: string;
   currency: string;
@@ -398,7 +398,7 @@ interface SearchIntentResult {
   agentNametag?: string;     // Author's nametag (if registered)
   agentPublicKey: string;    // Author's secp256k1 public key
   description: string;
-  intentType: IntentType;    // 'buy' | 'sell'
+  intentType: IntentType;    // 'buy' | 'sell' | string
   category?: string;
   price?: number;
   currency: string;
@@ -419,7 +419,7 @@ interface SearchOptions {
 }
 
 interface SearchFilters {
-  intentType?: IntentType;   // 'buy' | 'sell'
+  intentType?: IntentType;   // 'buy' | 'sell' | string
   category?: string;
   minPrice?: number;
   maxPrice?: number;

@@ -301,7 +301,7 @@ NAMETAGS:
   nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
 MARKET (Intent Bulletin Board):
-  market-post <desc> --type buy|sell  Post a buy/sell intent
+  market-post <desc> --type <type>     Post an intent (buy, sell, offer, service, ...)
                                       --category <cat>   Intent category
                                       --price <n>        Price amount
                                       --currency <code>  Currency (USD, UCT, etc.)
@@ -309,10 +309,11 @@ MARKET (Intent Bulletin Board):
                                       --contact <handle> Contact handle
                                       --expires <days>   Expiration in days (default: 30)
   market-search <query>               Search intents (semantic)
-                                      --type buy|sell    Filter by type
+                                      --type <type>      Filter by type
                                       --category <cat>   Filter by category
                                       --min-price <n>    Min price filter
                                       --max-price <n>    Max price filter
+                                      --min-score <0-1>  Min similarity score
                                       --location <loc>   Location filter
                                       --limit <n>        Max results (default: 10)
   market-my                           List your own intents
@@ -365,7 +366,9 @@ Wallet Profile Examples:
 Market Examples:
   npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
   npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
+  npm run cli -- market-post "Web dev services" --type service       Post service intent
   npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
+  npm run cli -- market-search "tokens" --min-score 0.7              Search with score threshold
   npm run cli -- market-my                                           List own intents
   npm run cli -- market-close <id>                                   Close an intent
 `);
@@ -1637,14 +1640,14 @@ async function main() {
       case 'market-post': {
         const description = args[1];
         if (!description) {
-          console.error('Usage: market-post <description> --type buy|sell [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
+          console.error('Usage: market-post <description> --type <type> [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
           process.exit(1);
         }
 
         const typeIndex = args.indexOf('--type');
         const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
-        if (!intentType || (intentType !== 'buy' && intentType !== 'sell')) {
-          console.error('Error: --type buy|sell is required');
+        if (!intentType) {
+          console.error('Error: --type <type> is required (e.g. buy, sell, offer, service, trade)');
           process.exit(1);
         }
 
@@ -1675,7 +1678,7 @@ async function main() {
 
         const result = await sphere.market.postIntent({
           description,
-          intentType: intentType as 'buy' | 'sell',
+          intentType,
           category,
           price,
           currency,
@@ -1695,12 +1698,12 @@ async function main() {
       case 'market-search': {
         const query = args[1];
         if (!query) {
-          console.error('Usage: market-search <query> [--type buy|sell] [--category <cat>] [--min-price <n>] [--max-price <n>] [--location <loc>] [--limit <n>]');
+          console.error('Usage: market-search <query> [--type <type>] [--category <cat>] [--min-price <n>] [--max-price <n>] [--min-score <0-1>] [--location <loc>] [--limit <n>]');
           process.exit(1);
         }
 
         const typeIndex = args.indexOf('--type');
-        const intentType = typeIndex !== -1 ? args[typeIndex + 1] as 'buy' | 'sell' : undefined;
+        const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
 
         const categoryIndex = args.indexOf('--category');
         const category = categoryIndex !== -1 ? args[categoryIndex + 1] : undefined;
@@ -1710,6 +1713,9 @@ async function main() {
 
         const maxPriceIndex = args.indexOf('--max-price');
         const maxPrice = maxPriceIndex !== -1 ? parseFloat(args[maxPriceIndex + 1]) : undefined;
+
+        const minScoreIndex = args.indexOf('--min-score');
+        const minScore = minScoreIndex !== -1 ? parseFloat(args[minScoreIndex + 1]) : undefined;
 
         const locationIndex = args.indexOf('--location');
         const location = locationIndex !== -1 ? args[locationIndex + 1] : undefined;
@@ -1730,6 +1736,7 @@ async function main() {
             category,
             minPrice,
             maxPrice,
+            minScore,
             location,
           },
           limit,

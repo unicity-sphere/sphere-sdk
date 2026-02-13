@@ -7,7 +7,7 @@
 // Enums
 // =============================================================================
 
-export type IntentType = 'buy' | 'sell';
+export type IntentType = 'buy' | 'sell' | (string & {});
 export type IntentStatus = 'active' | 'closed' | 'expired';
 
 // =============================================================================
@@ -82,6 +82,8 @@ export interface SearchFilters {
   minPrice?: number;
   maxPrice?: number;
   location?: string;
+  /** Minimum similarity score (0–1). Results below this threshold are excluded (client-side). */
+  minScore?: number;
 }
 
 export interface SearchOptions {

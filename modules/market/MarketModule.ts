@@ -173,7 +173,11 @@ export class MarketModule {
       ...toSnakeCaseFilters(opts),
     };
     const data = await this.apiPublicPost('/api/search', body);
-    const results: SearchIntentResult[] = (data.intents ?? []).map(mapSearchResult);
+    let results: SearchIntentResult[] = (data.intents ?? []).map(mapSearchResult);
+    const minScore = opts?.filters?.minScore;
+    if (minScore != null) {
+      results = results.filter((r) => Math.round(r.score * 100) >= Math.round(minScore * 100));
+    }
     return { intents: results, count: results.length };
   }
 
