@@ -32,6 +32,7 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   ...providers,
   autoGenerate: true,   // Generate mnemonic if no wallet exists
   nametag: 'alice',     // Optional: register @alice for receiving payments
+  password: 'secret',   // Optional: encrypt mnemonic (plaintext if omitted)
 });
 
 if (created && generatedMnemonic) {

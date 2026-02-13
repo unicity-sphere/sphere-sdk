@@ -16,6 +16,7 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   tokenStorage,              // Optional (for IPFS sync)
   autoGenerate: true,        // Generate mnemonic if no wallet exists
   mnemonic: 'words...',      // Or provide mnemonic to create/import
+  password: 'secret',        // Optional: encrypt mnemonic (plaintext if omitted)
   nametag: 'alice',          // Optional: register @alice on create
   l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
   price: priceProvider,      // Optional PriceProvider
@@ -23,9 +24,15 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
 });
 ```
 
+**Password encryption behavior:**
+- **No password (default):** Mnemonic stored as plaintext in storage.
+- **Password provided on create:** Mnemonic encrypted with AES before storing.
+- **Password provided on load:** Decrypts the stored mnemonic. Throws `'Failed to decrypt mnemonic'` if wrong password.
+- **Backwards compatibility:** Wallets encrypted with older SDK versions (internal default key) load correctly without a password.
+
 #### `Sphere.exists(storage: StorageProvider): Promise<boolean>`
 
-Check if encrypted wallet data exists in storage.
+Check if wallet data exists in storage.
 
 #### `Sphere.create(options: SphereCreateOptions): Promise<Sphere>`
 

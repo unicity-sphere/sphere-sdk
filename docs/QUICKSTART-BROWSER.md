@@ -193,7 +193,7 @@ Browser SDK uses two storage mechanisms automatically:
 
 | Data | Storage | Persistence |
 |------|---------|-------------|
-| Wallet (keys, nametag) | `localStorage` | Per-domain, survives refresh |
+| Wallet (mnemonic, nametag) | `localStorage` | Per-domain, survives refresh |
 | Tokens | `IndexedDB` | Per-domain, larger capacity |
 
 **SSR Note:** If `localStorage` is unavailable (SSR), an in-memory fallback is used.
@@ -353,10 +353,23 @@ await sphere.communications.sendDM('@alice', 'Hello from the browser!');
 ## Import Existing Wallet
 
 ```typescript
-// From mnemonic (recovery)
+// From mnemonic (recovery, plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
   mnemonic: 'word1 word2 word3 ... word12',
+});
+
+// From mnemonic with password encryption
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'word1 word2 word3 ... word12',
+  password: 'my-secret-password',
+});
+
+// Load existing wallet with password
+const { sphere } = await Sphere.init({
+  ...providers,
+  password: 'my-secret-password',
 });
 
 // Nametag will be auto-recovered from Nostr if it was registered

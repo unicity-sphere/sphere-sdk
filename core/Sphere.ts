@@ -152,6 +152,8 @@ export interface SphereCreateOptions {
   network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
+  password?: string;
 }
 
 /** Options for loading existing wallet */
@@ -176,6 +178,8 @@ export interface SphereLoadOptions {
   network?: NetworkType;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to decrypt the wallet. Must match the password used during creation. */
+  password?: string;
 }
 
 /** Options for importing a wallet */
@@ -208,6 +212,8 @@ export interface SphereImportOptions {
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
+  password?: string;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -255,6 +261,8 @@ export interface SphereInitOptions {
    * - Omit/undefined: No groupchat module
    */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
+  password?: string;
 }
 
 /** Result of init operation */
@@ -317,6 +325,7 @@ export class Sphere {
   private _identity: MutableFullIdentity | null = null;
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
+  private _password: string | null = null;
   private _source: WalletSource = 'unknown';
   private _derivationMode: DerivationMode = 'bip32';
   private _basePath: string = DEFAULT_BASE_PATH;
@@ -447,6 +456,7 @@ export class Sphere {
         l1: options.l1,
         price: options.price,
         groupChat,
+        password: options.password,
       });
       return { sphere, created: false };
     }
@@ -479,6 +489,7 @@ export class Sphere {
       l1: options.l1,
       price: options.price,
       groupChat,
+      password: options.password,
     });
 
     return { sphere, created: true, generatedMnemonic };
@@ -537,8 +548,9 @@ export class Sphere {
       options.price,
       groupChatConfig,
     );
+    sphere._password = options.password ?? null;
 
-    // Store encrypted mnemonic
+    // Store mnemonic (encrypted if password provided, plaintext otherwise)
     await sphere.storeMnemonic(options.mnemonic, options.derivationPath);
 
     // Initialize identity from mnemonic
@@ -596,6 +608,7 @@ export class Sphere {
       options.price,
       groupChatConfig,
     );
+    sphere._password = options.password ?? null;
 
     // Load identity from storage
     await sphere.loadIdentityFromStorage();
@@ -671,6 +684,7 @@ export class Sphere {
       options.price,
       groupChatConfig,
     );
+    sphere._password = options.password ?? null;
 
     if (options.mnemonic) {
       // Validate and store mnemonic
@@ -1920,8 +1934,10 @@ export class Sphere {
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
 
-    // Publish identity binding (with nametag if present — single atomic publish)
-    if (this._identity.nametag) {
+    // Sync identity with transport — also recovers nametag from existing Nostr bindings
+    // via transport.resolve(directAddress). Skipped when registering a new nametag
+    // (that flow handles publishing separately below).
+    if (!newNametag) {
       await this.syncIdentityWithTransport();
     }
 
@@ -3444,12 +3460,24 @@ export class Sphere {
   // ===========================================================================
 
   private encrypt(data: string): string {
-    // Use AES-256 encryption with default key
-    // TODO: Add password parameter to create/load for user-provided encryption
-    return encryptSimple(data, DEFAULT_ENCRYPTION_KEY);
+    if (!this._password) return data; // No password — store as plaintext
+    return encryptSimple(data, this._password);
   }
 
   private decrypt(encrypted: string): string | null {
+    // Password provided — decrypt with it
+    if (this._password) {
+      try {
+        return decryptSimple(encrypted, this._password);
+      } catch {
+        return null;
+      }
+    }
+    // No password — check if it's already plaintext (valid BIP39 mnemonic or hex key)
+    if (validateBip39Mnemonic(encrypted) || /^[0-9a-f]{64}$/i.test(encrypted)) {
+      return encrypted;
+    }
+    // Backwards compat: try old hardcoded default key
     try {
       return decryptSimple(encrypted, DEFAULT_ENCRYPTION_KEY);
     } catch {

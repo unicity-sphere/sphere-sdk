@@ -92,7 +92,7 @@ Node.js implementation uses **file-based storage**:
 
 | Data | Location | Format |
 |------|----------|--------|
-| Wallet (keys, nametag) | `dataDir/wallet.json` | Encrypted JSON |
+| Wallet (keys, nametag) | `dataDir/wallet.json` (or custom file name) | JSON (plaintext or password-encrypted mnemonic) |
 | Tokens | `tokensDir/_<tokenId>.json` | One JSON file per token |
 
 > **Note:** IPFS sync is available for both browser and Node.js. See [IPFS Token Sync](#ipfs-token-sync-optional) below.
@@ -137,7 +137,7 @@ main().catch(console.error);
 
 ```
 ./wallet-data/
-  └── wallet.json      # Encrypted wallet data (mnemonic, keys, nametag)
+  └── wallet.json      # Wallet data (mnemonic stored plaintext or password-encrypted)
 
 ./tokens-data/
   ├── _meta.json       # Token storage metadata
@@ -154,6 +154,10 @@ const providers = createNodeProviders({
   // Storage directories (required)
   dataDir: './wallet-data',
   tokensDir: './tokens-data',
+
+  // Custom wallet file name (default: 'wallet.json')
+  // Use .txt extension for plain mnemonic files (no JSON wrapper)
+  walletFileName: 'my-wallet.json',
 
   // Transport options
   transport: {
@@ -307,10 +311,17 @@ sphere.communications.onDirectMessage((msg) => {
 ## Import Existing Wallet
 
 ```typescript
-// From mnemonic
+// From mnemonic (plaintext storage — default)
 const { sphere } = await Sphere.init({
   ...providers,
   mnemonic: 'your twelve word mnemonic phrase here ...',
+});
+
+// From mnemonic with password encryption
+const { sphere } = await Sphere.init({
+  ...providers,
+  mnemonic: 'your twelve word mnemonic phrase here ...',
+  password: 'my-secret-password',
 });
 
 // From master key (legacy)
@@ -320,6 +331,71 @@ const sphere = await Sphere.import({
   basePath: "m/84'/1'/0'",
   derivationMode: 'bip32',
   ...providers,
+});
+```
+
+## Password Encryption
+
+By default, the mnemonic is stored as **plaintext** in `wallet.json`. You can optionally encrypt it with a password:
+
+```typescript
+// Create wallet with password encryption
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  password: 'my-secret-password',
+});
+
+// Load wallet with password
+const { sphere } = await Sphere.init({
+  ...providers,
+  password: 'my-secret-password',
+});
+
+// Load wallet without password (plaintext mnemonic — default)
+const { sphere } = await Sphere.init({ ...providers });
+```
+
+**Backwards compatibility:** Wallets created with older SDK versions (encrypted with the internal default key) will load correctly without a password.
+
+### Custom Wallet File Names
+
+```typescript
+// Use a custom file name
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  walletFileName: 'my-wallet.json',
+});
+
+// Use .txt extension — stores only the mnemonic (no JSON wrapper)
+const providers = createNodeProviders({
+  network: 'testnet',
+  dataDir: './wallet-data',
+  tokensDir: './tokens-data',
+  walletFileName: 'mnemonic.txt',
+});
+```
+
+### Loading External Wallet Files
+
+If you have a plaintext mnemonic file from another source, simply point `FileStorageProvider` at it:
+
+```typescript
+import { FileStorageProvider } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+// Load from any .txt file containing a mnemonic
+const storage = new FileStorageProvider({
+  dataDir: './wallet-data',
+  fileName: 'external-mnemonic.txt',
+});
+
+const { sphere } = await Sphere.init({
+  storage,
+  tokenStorage: providers.tokenStorage,
+  transport: providers.transport,
+  oracle: providers.oracle,
 });
 ```
 

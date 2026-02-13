@@ -41,7 +41,11 @@ export function decryptTextFormatKey(encryptedKey: string, password: string): st
     const key = deriveLegacyKey(password);
     const decrypted = CryptoJS.AES.decrypt(encryptedKey, key);
     const result = decrypted.toString(CryptoJS.enc.Utf8);
-    return result || null;
+    if (!result) return null;
+    // Validate that decrypted value is a hex string (master keys are always hex).
+    // Wrong passwords produce garbage bytes that may be valid UTF-8 but not valid hex.
+    if (!/^[0-9a-fA-F]+$/.test(result)) return null;
+    return result;
   } catch {
     return null;
   }
