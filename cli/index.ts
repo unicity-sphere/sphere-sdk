@@ -174,6 +174,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     dataDir: config.dataDir,
     tokensDir: config.tokensDir,
     tokenSync: { ipfs: { enabled: true } },
+    market: true,
   });
 
   const initProviders = noNostrGlobal
@@ -185,6 +186,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     autoGenerate: options?.autoGenerate,
     mnemonic: options?.mnemonic,
     nametag: options?.nametag,
+    market: true,
   });
 
   sphereInstance = result.sphere;
@@ -297,6 +299,26 @@ NAMETAGS:
   nametag-info <name>               Lookup nametag info
   my-nametag                        Show current nametag
   nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
+
+MARKET (Intent Bulletin Board):
+  market-post <desc> --type buy|sell  Post a buy/sell intent
+                                      --category <cat>   Intent category
+                                      --price <n>        Price amount
+                                      --currency <code>  Currency (USD, UCT, etc.)
+                                      --location <loc>   Location filter
+                                      --contact <handle> Contact handle
+                                      --expires <days>   Expiration in days (default: 30)
+  market-search <query>               Search intents (semantic)
+                                      --type buy|sell    Filter by type
+                                      --category <cat>   Filter by category
+                                      --min-price <n>    Min price filter
+                                      --max-price <n>    Max price filter
+                                      --location <loc>   Location filter
+                                      --limit <n>        Max results (default: 10)
+  market-my                           List your own intents
+  market-close <id>                   Close (delete) an intent
+  market-categories                   List available categories
+  market-profile                      Show your market agent profile
 
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
@@ -1601,6 +1623,209 @@ async function main() {
           console.log('─'.repeat(50));
           console.log('TopUp complete! Run "balance" to see updated balances.');
         }
+
+        await closeSphere();
+        break;
+      }
+
+      // === MARKET (Intent Bulletin Board) ===
+      case 'market-post': {
+        const description = args[1];
+        if (!description) {
+          console.error('Usage: market-post <description> --type buy|sell [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
+          process.exit(1);
+        }
+
+        const typeIndex = args.indexOf('--type');
+        const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
+        if (!intentType || (intentType !== 'buy' && intentType !== 'sell')) {
+          console.error('Error: --type buy|sell is required');
+          process.exit(1);
+        }
+
+        const categoryIndex = args.indexOf('--category');
+        const category = categoryIndex !== -1 ? args[categoryIndex + 1] : undefined;
+
+        const priceIndex = args.indexOf('--price');
+        const price = priceIndex !== -1 ? parseFloat(args[priceIndex + 1]) : undefined;
+
+        const currencyIndex = args.indexOf('--currency');
+        const currency = currencyIndex !== -1 ? args[currencyIndex + 1] : undefined;
+
+        const locationIndex = args.indexOf('--location');
+        const location = locationIndex !== -1 ? args[locationIndex + 1] : undefined;
+
+        const contactIndex = args.indexOf('--contact');
+        const contactHandle = contactIndex !== -1 ? args[contactIndex + 1] : undefined;
+
+        const expiresIndex = args.indexOf('--expires');
+        const expiresInDays = expiresIndex !== -1 ? parseInt(args[expiresIndex + 1]) : undefined;
+
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const result = await sphere.market.postIntent({
+          description,
+          intentType: intentType as 'buy' | 'sell',
+          category,
+          price,
+          currency,
+          location,
+          contactHandle,
+          expiresInDays,
+        });
+
+        console.log('✓ Intent posted!');
+        console.log(`  ID: ${result.intentId}`);
+        console.log(`  Expires: ${result.expiresAt}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-search': {
+        const query = args[1];
+        if (!query) {
+          console.error('Usage: market-search <query> [--type buy|sell] [--category <cat>] [--min-price <n>] [--max-price <n>] [--location <loc>] [--limit <n>]');
+          process.exit(1);
+        }
+
+        const typeIndex = args.indexOf('--type');
+        const intentType = typeIndex !== -1 ? args[typeIndex + 1] as 'buy' | 'sell' : undefined;
+
+        const categoryIndex = args.indexOf('--category');
+        const category = categoryIndex !== -1 ? args[categoryIndex + 1] : undefined;
+
+        const minPriceIndex = args.indexOf('--min-price');
+        const minPrice = minPriceIndex !== -1 ? parseFloat(args[minPriceIndex + 1]) : undefined;
+
+        const maxPriceIndex = args.indexOf('--max-price');
+        const maxPrice = maxPriceIndex !== -1 ? parseFloat(args[maxPriceIndex + 1]) : undefined;
+
+        const locationIndex = args.indexOf('--location');
+        const location = locationIndex !== -1 ? args[locationIndex + 1] : undefined;
+
+        const limitIndex = args.indexOf('--limit');
+        const limit = limitIndex !== -1 ? parseInt(args[limitIndex + 1]) : 10;
+
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const result = await sphere.market.search(query, {
+          filters: {
+            intentType,
+            category,
+            minPrice,
+            maxPrice,
+            location,
+          },
+          limit,
+        });
+
+        console.log(`Found ${result.count} intent(s):`);
+        console.log('─'.repeat(50));
+
+        for (const intent of result.intents) {
+          const scoreStr = intent.score != null ? `[${intent.score.toFixed(2)}] ` : '';
+          console.log(`${scoreStr}${intent.description}`);
+          const byStr = intent.agentNametag ? `@${intent.agentNametag}` : intent.agentPublicKey.slice(0, 12) + '...';
+          console.log(`  By: ${byStr}`);
+          let details = `  Type: ${intent.intentType}`;
+          if (intent.category) details += ` | Category: ${intent.category}`;
+          if (intent.price != null) details += ` | Price: ${intent.price} ${intent.currency || ''}`;
+          console.log(details);
+          let extra = '';
+          if (intent.contactHandle) extra += `  Contact: ${intent.contactHandle}`;
+          if (intent.expiresAt) extra += `${extra ? ' | ' : '  '}Expires: ${intent.expiresAt.split('T')[0]}`;
+          if (extra) console.log(extra);
+          console.log('─'.repeat(50));
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-my': {
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const intents = await sphere.market.getMyIntents();
+
+        console.log(`Your intents (${intents.length}):`);
+        for (const intent of intents) {
+          const desc = intent.id;
+          const cat = intent.category || '';
+          const expires = intent.expiresAt ? intent.expiresAt.split('T')[0] : '';
+          console.log(`  ${desc}  ${intent.intentType}  ${intent.status}  ${cat}  expires ${expires}`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-close': {
+        const intentId = args[1];
+        if (!intentId) {
+          console.error('Usage: market-close <intentId>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        await sphere.market.closeIntent(intentId);
+        console.log(`✓ Intent ${intentId} closed.`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-categories': {
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const categories = await sphere.market.getCategories();
+        console.log(`Available categories: ${categories.join(', ')}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-profile': {
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const profile = await sphere.market.getProfile();
+
+        console.log('Market Agent Profile:');
+        console.log(`  ID: ${profile.id}`);
+        console.log(`  Public Key: ${profile.publicKey}`);
+        console.log(`  Registered: ${profile.registeredAt}`);
+        if (profile.name) console.log(`  Name: ${profile.name}`);
 
         await closeSphere();
         break;

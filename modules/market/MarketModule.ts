@@ -258,6 +258,18 @@ export class MarketModule {
     }
   }
 
+  private async parseResponse(res: Response): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
+    const text = await res.text();
+    let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`Market API error: HTTP ${res.status} — unexpected response (not JSON)`);
+    }
+    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+    return data;
+  }
+
   private async apiPost(path: string, body: unknown): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
     const signed = signRequest(body, this.identity!.privateKey);
@@ -267,9 +279,7 @@ export class MarketModule {
       body: signed.body,
       signal: AbortSignal.timeout(this.timeout),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    return data;
+    return this.parseResponse(res);
   }
 
   private async apiGet(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -280,9 +290,7 @@ export class MarketModule {
       headers: signed.headers,
       signal: AbortSignal.timeout(this.timeout),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    return data;
+    return this.parseResponse(res);
   }
 
   private async apiDelete(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -293,9 +301,7 @@ export class MarketModule {
       headers: signed.headers,
       signal: AbortSignal.timeout(this.timeout),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    return data;
+    return this.parseResponse(res);
   }
 
   private async apiPublicPost(path: string, body: unknown): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -305,9 +311,7 @@ export class MarketModule {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.timeout),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    return data;
+    return this.parseResponse(res);
   }
 
   private async apiPublicGet(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -315,9 +319,7 @@ export class MarketModule {
       method: 'GET',
       signal: AbortSignal.timeout(this.timeout),
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-    return data;
+    return this.parseResponse(res);
   }
 }
 
