@@ -1934,8 +1934,10 @@ export class Sphere {
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
 
-    // Publish identity binding (with nametag if present — single atomic publish)
-    if (this._identity.nametag) {
+    // Sync identity with transport — also recovers nametag from existing Nostr bindings
+    // via transport.resolve(directAddress). Skipped when registering a new nametag
+    // (that flow handles publishing separately below).
+    if (!newNametag) {
       await this.syncIdentityWithTransport();
     }
 
