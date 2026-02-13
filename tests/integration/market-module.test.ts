@@ -732,4 +732,155 @@ describe('MarketModule integration with Sphere', () => {
       expect(providers.market?.apiUrl).toBe('https://test-node-market.api');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // All intent types through Sphere
+  // ---------------------------------------------------------------------------
+
+  describe('posting and searching all intent types', () => {
+    const ALL_TYPES = ['buy', 'sell', 'service', 'announcement', 'other'] as const;
+
+    for (const intentType of ALL_TYPES) {
+      it(`should post a "${intentType}" intent via sphere.market`, async () => {
+        // Use URL-based routing so Sphere.init internal calls don't consume market mocks
+        const capturedBodies: Record<string, unknown>[] = [];
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+          const url = typeof input === 'string' ? input : (input as Request).url;
+          if (url.includes('/api/agent/register')) {
+            return new Response(JSON.stringify({ agentId: 1 }), { status: 201 });
+          }
+          if (url.includes('/api/intents')) {
+            if (init?.body) capturedBodies.push(JSON.parse(init.body as string));
+            return new Response(JSON.stringify({
+              intent_id: `int_${intentType}`,
+              message: 'Created',
+              expires_at: '2025-12-31',
+            }), { status: 201 });
+          }
+          return new Response(JSON.stringify({}), { status: 200 });
+        });
+
+        const { sphere } = await Sphere.init({
+          storage: new FileStorageProvider({ dataDir: DATA_DIR }),
+          tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+          transport: createMockTransport(),
+          oracle: createMockOracle(),
+          market: true,
+          autoGenerate: true,
+        });
+
+        const result = await sphere.market!.postIntent({
+          description: `Test ${intentType} intent`,
+          intentType,
+          category: 'test',
+        });
+
+        expect(result.intentId).toBe(`int_${intentType}`);
+        expect(capturedBodies.length).toBeGreaterThan(0);
+        expect(capturedBodies[0].intent_type).toBe(intentType);
+
+        await sphere.destroy();
+      });
+    }
+
+    for (const intentType of ALL_TYPES) {
+      it(`should search with type filter "${intentType}" via sphere.market`, async () => {
+        const capturedBodies: Record<string, unknown>[] = [];
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+          const url = typeof input === 'string' ? input : (input as Request).url;
+          if (url.includes('/api/search')) {
+            if (init?.body) capturedBodies.push(JSON.parse(init.body as string));
+            return new Response(JSON.stringify({
+              intents: [{
+                id: 'res_1',
+                score: 0.88,
+                agent_public_key: '02ab',
+                description: `A ${intentType} listing`,
+                intent_type: intentType,
+                currency: 'UCT',
+                contact_method: 'nostr',
+                created_at: '2025-01-01',
+                expires_at: '2025-12-31',
+              }],
+            }), { status: 200 });
+          }
+          return new Response(JSON.stringify({}), { status: 200 });
+        });
+
+        const { sphere } = await Sphere.init({
+          storage: new FileStorageProvider({ dataDir: DATA_DIR }),
+          tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+          transport: createMockTransport(),
+          oracle: createMockOracle(),
+          market: true,
+          autoGenerate: true,
+        });
+
+        const result = await sphere.market!.search('test', {
+          filters: { intentType },
+        });
+
+        expect(result.intents).toHaveLength(1);
+        expect(result.intents[0].intentType).toBe(intentType);
+        expect(capturedBodies[0].intent_type).toBe(intentType);
+
+        await sphere.destroy();
+      });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Feed methods through Sphere
+  // ---------------------------------------------------------------------------
+
+  describe('feed methods through Sphere', () => {
+    it('should fetch recent listings via sphere.market.getRecentListings()', async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = typeof input === 'string' ? input : (input as Request).url;
+        if (url.includes('/api/feed/recent')) {
+          return new Response(JSON.stringify({
+            listings: [
+              {
+                id: 'lst_1',
+                title: 'Test listing',
+                description_preview: 'Full description here',
+                agent_name: '@seller',
+                agent_id: 1,
+                type: 'sell',
+                created_at: '2026-01-01T00:00:00.000Z',
+              },
+              {
+                id: 'lst_2',
+                title: 'Service listing',
+                description_preview: 'Service description',
+                agent_name: '@provider',
+                agent_id: 2,
+                type: 'service',
+                created_at: '2026-01-01T01:00:00.000Z',
+              },
+            ],
+          }), { status: 200 });
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      });
+
+      const { sphere } = await Sphere.init({
+        storage: new FileStorageProvider({ dataDir: DATA_DIR }),
+        tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
+        transport: createMockTransport(),
+        oracle: createMockOracle(),
+        market: true,
+        autoGenerate: true,
+      });
+
+      const listings = await sphere.market!.getRecentListings();
+
+      expect(listings).toHaveLength(2);
+      expect(listings[0].type).toBe('sell');
+      expect(listings[0].descriptionPreview).toBe('Full description here');
+      expect(listings[1].type).toBe('service');
+
+      await sphere.destroy();
+    });
+  });
 });

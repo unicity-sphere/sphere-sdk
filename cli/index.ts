@@ -301,7 +301,7 @@ NAMETAGS:
   nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
 MARKET (Intent Bulletin Board):
-  market-post <desc> --type <type>     Post an intent (buy, sell, offer, service, ...)
+  market-post <desc> --type <type>     Post an intent (buy, sell, service, announcement, other)
                                       --category <cat>   Intent category
                                       --price <n>        Price amount
                                       --currency <code>  Currency (USD, UCT, etc.)
@@ -318,6 +318,8 @@ MARKET (Intent Bulletin Board):
                                       --limit <n>        Max results (default: 10)
   market-my                           List your own intents
   market-close <id>                   Close (delete) an intent
+  market-feed                         Watch the live listing feed (WebSocket)
+                                      --rest              Use REST fallback instead of WebSocket
 
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
@@ -367,10 +369,13 @@ Market Examples:
   npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
   npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
   npm run cli -- market-post "Web dev services" --type service       Post service intent
+  npm run cli -- market-post "New feature release" --type announcement   Post announcement
   npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
   npm run cli -- market-search "tokens" --min-score 0.7              Search with score threshold
   npm run cli -- market-my                                           List own intents
   npm run cli -- market-close <id>                                   Close an intent
+  npm run cli -- market-feed                                         Watch live feed
+  npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
 `);
 }
 
@@ -1647,7 +1652,7 @@ async function main() {
         const typeIndex = args.indexOf('--type');
         const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
         if (!intentType) {
-          console.error('Error: --type <type> is required (e.g. buy, sell, offer, service, trade)');
+          console.error('Error: --type <type> is required (buy, sell, service, announcement, other)');
           process.exit(1);
         }
 
@@ -1805,6 +1810,63 @@ async function main() {
         console.log(`✓ Intent ${intentId} closed.`);
 
         await closeSphere();
+        break;
+      }
+
+      case 'market-feed': {
+        const useRest = args.includes('--rest');
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        if (useRest) {
+          // REST fallback: fetch recent listings once
+          const listings = await sphere.market.getRecentListings();
+          console.log(`Recent listings (${listings.length}):`);
+          console.log('─'.repeat(50));
+          for (const listing of listings) {
+            console.log(`[${listing.type.toUpperCase()}] ${listing.agentName}: ${listing.title}`);
+            if (listing.descriptionPreview !== listing.title) {
+              console.log(`  ${listing.descriptionPreview}`);
+            }
+            console.log(`  ID: ${listing.id}  Posted: ${listing.createdAt}`);
+            console.log('');
+          }
+          await closeSphere();
+        } else {
+          // WebSocket live feed
+          console.log('Connecting to live feed... (Ctrl+C to stop)');
+          const unsubscribe = sphere.market.subscribeFeed((message) => {
+            if (message.type === 'initial') {
+              console.log(`Connected — ${message.listings.length} recent listing(s):`);
+              console.log('─'.repeat(50));
+              for (const listing of message.listings) {
+                console.log(`[${listing.type.toUpperCase()}] ${listing.agentName}: ${listing.title}`);
+              }
+              console.log('─'.repeat(50));
+              console.log('Watching for new listings...\n');
+            } else {
+              const l = message.listing;
+              console.log(`[NEW] [${l.type.toUpperCase()}] ${l.agentName}: ${l.title}`);
+              if (l.descriptionPreview !== l.title) {
+                console.log(`  ${l.descriptionPreview}`);
+              }
+            }
+          });
+
+          // Keep alive until Ctrl+C
+          process.on('SIGINT', () => {
+            console.log('\nDisconnecting...');
+            unsubscribe();
+            closeSphere().then(() => process.exit(0));
+          });
+
+          // Prevent the process from exiting
+          await new Promise(() => {});
+        }
         break;
       }
 

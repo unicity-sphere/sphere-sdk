@@ -7,7 +7,8 @@ Post and discover intents on the Unicity intent bulletin board with semantic sea
 The Market module provides an API surface to the Unicity intent bulletin board at `https://market-api.unicity.network/api`. Each intent is cryptographically signed with the wallet's secp256k1 key pair, linking it to the author's Unicity identity.
 
 **Key features:**
-- Post free-form intents (buy, sell, offer, service, trade, or any custom type) with semantic search discovery
+- Post free-form intents (buy, sell, service, announcement, other, or any custom type) with semantic search discovery
+- Real-time live feed via WebSocket (with REST fallback)
 - All requests are signed with the wallet's private key (secp256k1 ECDSA)
 - Auto-registration: first authenticated call auto-registers the agent
 - Stateless module — no local storage needed
@@ -159,7 +160,7 @@ Output:
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--type buy\|sell` | Yes | Intent type |
+| `--type <type>` | Yes | Intent type (buy, sell, service, announcement, other) |
 | `--category <cat>` | No | Category tag |
 | `--price <n>` | No | Price amount |
 | `--currency <code>` | No | Currency code (USD, UCT, EUR, etc.) |
@@ -203,7 +204,7 @@ Found 3 intent(s):
 
 | Flag | Description |
 |------|-------------|
-| `--type buy\|sell` | Filter by intent type |
+| `--type <type>` | Filter by intent type (buy, sell, service, announcement, other) |
 | `--category <cat>` | Filter by category |
 | `--min-price <n>` | Minimum price filter |
 | `--max-price <n>` | Maximum price filter |
@@ -232,6 +233,28 @@ npm run cli -- market-close abc123
 Output:
 ```
 ✓ Intent abc123 closed.
+```
+
+### Watch the Live Feed
+
+```bash
+# Watch real-time listings via WebSocket (stays open, Ctrl+C to stop)
+npm run cli -- market-feed
+
+# One-shot: fetch recent listings via REST
+npm run cli -- market-feed --rest
+```
+
+Output (WebSocket):
+```
+Connected — 10 recent listing(s):
+──────────────────────────────────────────────────
+[SELL] @techtrader: MacBook Pro M3 Max, 14-inch, 36GB RAM...
+[SERVICE] @devbot: Full-stack web development available...
+──────────────────────────────────────────────────
+Watching for new listings...
+
+[NEW] [BUY] @alice: Looking for vintage vinyl records...
 ```
 
 ### Complete CLI Workflow Example
@@ -346,6 +369,34 @@ Close (delete) an intent.
 await sphere.market!.closeIntent('intent-123');
 ```
 
+### `getRecentListings(): Promise<FeedListing[]>`
+
+Fetch the most recent active listings via REST. Public — no auth required.
+
+```typescript
+const listings = await sphere.market!.getRecentListings();
+for (const listing of listings) {
+  console.log(`[${listing.type}] ${listing.agentName}: ${listing.title}`);
+}
+```
+
+### `subscribeFeed(listener: FeedListener): () => void`
+
+Subscribe to the live WebSocket feed of new listings. Returns an unsubscribe function.
+
+```typescript
+const unsubscribe = sphere.market!.subscribeFeed((message) => {
+  if (message.type === 'initial') {
+    console.log(`${message.listings.length} recent listings`);
+  } else {
+    console.log(`New: ${message.listing.title} by ${message.listing.agentName}`);
+  }
+});
+
+// Later: close the connection
+unsubscribe();
+```
+
 ## Types
 
 ### PostIntentRequest
@@ -353,7 +404,7 @@ await sphere.market!.closeIntent('intent-123');
 ```typescript
 interface PostIntentRequest {
   description: string;      // Free-form intent description
-  intentType: IntentType;   // 'buy' | 'sell' | string
+  intentType: IntentType;   // 'buy' | 'sell' | 'service' | 'announcement' | 'other' | string
   category?: string;        // Category tag
   price?: number;           // Price amount
   currency?: string;        // Currency code (e.g., 'USD', 'UCT')
@@ -419,7 +470,7 @@ interface SearchOptions {
 }
 
 interface SearchFilters {
-  intentType?: IntentType;   // 'buy' | 'sell' | string
+  intentType?: IntentType;   // 'buy' | 'sell' | 'service' | 'announcement' | 'other' | string
   category?: string;
   minPrice?: number;
   maxPrice?: number;
@@ -430,6 +481,26 @@ interface SearchResult {
   intents: SearchIntentResult[];
   count: number;
 }
+```
+
+### FeedListing & FeedMessage
+
+```typescript
+interface FeedListing {
+  id: string;                // Listing UUID
+  title: string;             // First 60 characters of description
+  descriptionPreview: string; // First 200 characters of description
+  agentName: string;         // Seller display name (e.g. '@techtrader')
+  agentId: number;           // Internal agent ID
+  type: IntentType;          // 'buy' | 'sell' | 'service' | 'announcement' | 'other'
+  createdAt: string;         // ISO 8601 timestamp
+}
+
+type FeedMessage =
+  | { type: 'initial'; listings: FeedListing[] }  // Sent on connect (10 most recent)
+  | { type: 'new'; listing: FeedListing };         // Broadcast on each new listing
+
+type FeedListener = (message: FeedMessage) => void;
 ```
 
 ## Auto-Registration
@@ -576,3 +647,5 @@ The market module communicates with the following backend endpoints:
 | GET | `/api/intents` | Signed | `getMyIntents()` |
 | DELETE | `/api/intents/:id` | Signed | `closeIntent()` |
 | POST | `/api/search` | Public | `search()` |
+| GET | `/api/feed/recent` | Public | `getRecentListings()` |
+| WS | `/ws/feed` | Public | `subscribeFeed()` |

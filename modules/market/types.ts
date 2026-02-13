@@ -1,13 +1,14 @@
 /**
  * Market Module Types
- * Intent bulletin board for posting and discovering buy/sell intents.
+ * Intent bulletin board for posting and discovering intents,
+ * plus real-time feed subscription.
  */
 
 // =============================================================================
 // Enums
 // =============================================================================
 
-export type IntentType = 'buy' | 'sell' | (string & {});
+export type IntentType = 'buy' | 'sell' | 'service' | 'announcement' | 'other' | (string & {});
 export type IntentStatus = 'active' | 'closed' | 'expired';
 
 // =============================================================================
@@ -95,4 +96,36 @@ export interface SearchResult {
   intents: SearchIntentResult[];
   count: number;
 }
+
+// =============================================================================
+// Live Feed Types (WebSocket + REST fallback)
+// =============================================================================
+
+/** A listing broadcast on the live feed */
+export interface FeedListing {
+  id: string;
+  title: string;
+  descriptionPreview: string;
+  agentName: string;
+  agentId: number;
+  type: IntentType;
+  createdAt: string;
+}
+
+/** WebSocket message: initial batch of recent listings */
+export interface FeedInitialMessage {
+  type: 'initial';
+  listings: FeedListing[];
+}
+
+/** WebSocket message: single new listing */
+export interface FeedNewMessage {
+  type: 'new';
+  listing: FeedListing;
+}
+
+export type FeedMessage = FeedInitialMessage | FeedNewMessage;
+
+/** Callback for live feed events */
+export type FeedListener = (message: FeedMessage) => void;
 

@@ -1,8 +1,9 @@
 /**
  * Market Module
  *
- * Intent bulletin board — post and discover buy/sell intents
- * with secp256k1-signed requests tied to the wallet identity.
+ * Intent bulletin board — post and discover intents (buy, sell,
+ * service, announcement, other) with secp256k1-signed requests
+ * tied to the wallet identity. Includes real-time feed via WebSocket.
  */
 
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -19,6 +20,9 @@ import type {
   SearchIntentResult,
   SearchOptions,
   SearchResult,
+  FeedListing,
+  FeedMessage,
+  FeedListener,
 } from './types';
 import type { FullIdentity } from '../../types';
 
@@ -123,6 +127,25 @@ function mapMyIntent(raw: any): MarketIntent {
   };
 }
 
+function mapFeedListing(raw: any): FeedListing {
+  return {
+    id: raw.id,
+    title: raw.title,
+    descriptionPreview: raw.description_preview,
+    agentName: raw.agent_name,
+    agentId: raw.agent_id,
+    type: raw.type,
+    createdAt: raw.created_at,
+  };
+}
+
+function mapFeedMessage(raw: any): FeedMessage {
+  if (raw.type === 'initial') {
+    return { type: 'initial', listings: (raw.listings ?? []).map(mapFeedListing) };
+  }
+  return { type: 'new', listing: mapFeedListing(raw.listing) };
+}
+
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 // =============================================================================
@@ -190,6 +213,40 @@ export class MarketModule {
   /** Close (delete) an intent */
   async closeIntent(intentId: string): Promise<void> {
     await this.apiDelete(`/api/intents/${encodeURIComponent(intentId)}`);
+  }
+
+  /** Fetch the most recent listings via REST (public — no auth required) */
+  async getRecentListings(): Promise<FeedListing[]> {
+    const res = await fetch(`${this.apiUrl}/api/feed/recent`, {
+      signal: AbortSignal.timeout(this.timeout),
+    });
+    const data = await this.parseResponse(res);
+    return (data.listings ?? []).map(mapFeedListing);
+  }
+
+  /**
+   * Subscribe to the live listing feed via WebSocket.
+   * Returns an unsubscribe function that closes the connection.
+   *
+   * Requires a WebSocket implementation — works natively in browsers
+   * and in Node.js 21+ (or with the `ws` package).
+   */
+  subscribeFeed(listener: FeedListener): () => void {
+    const wsUrl = this.apiUrl.replace(/^http/, 'ws') + '/ws/feed';
+    const ws = new WebSocket(wsUrl);
+
+    ws.onmessage = (event: MessageEvent) => {
+      try {
+        const raw = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
+        listener(mapFeedMessage(raw));
+      } catch {
+        // Ignore malformed messages
+      }
+    };
+
+    return () => {
+      ws.close();
+    };
   }
 
   // ---------------------------------------------------------------------------
