@@ -48,6 +48,15 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
+/** Create a module that's already "registered" so tests don't trigger registration fetches */
+function createRegisteredModule(config?: Parameters<typeof createMarketModule>[0]): MarketModule {
+  const mod = createMarketModule(config);
+  mod.initialize(mockDeps());
+  // Skip auto-registration in unit tests — registration is tested separately
+  (mod as any).registered = true;
+  return mod;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -116,8 +125,7 @@ describe('MarketModule', () => {
         message: 'Created',
         expires_at: '2025-12-31',
       }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
       await mod.postIntent({ description: 'test', intentType: 'buy' });
 
       const [, opts] = fetchSpy.mock.calls[0];
@@ -145,8 +153,7 @@ describe('MarketModule', () => {
         message: 'Created',
         expires_at: '2025-12-31',
       }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       const result = await mod.postIntent({
         description: 'Looking for widgets',
@@ -235,8 +242,7 @@ describe('MarketModule', () => {
           expires_at: '2025-12-31',
         }],
       }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       const result = await mod.getMyIntents();
       const [url, opts] = fetchSpy.mock.calls[0];
@@ -257,8 +263,7 @@ describe('MarketModule', () => {
   describe('closeIntent()', () => {
     it('should DELETE /api/intents/:id', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({ message: 'Closed' }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await mod.closeIntent('int_123');
       const [url, opts] = fetchSpy.mock.calls[0];
@@ -274,16 +279,14 @@ describe('MarketModule', () => {
   describe('error handling', () => {
     it('should throw on non-ok response', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({ error: 'Bad request' }, 400));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('Bad request');
     });
 
     it('should throw generic HTTP error when no error field', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({}, 503));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('HTTP 503');
     });
@@ -317,8 +320,7 @@ describe('MarketModule', () => {
         message: 'Created',
         expires_at: '2025-12-31',
       }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).resolves.toBeDefined();
     });
 
@@ -328,15 +330,14 @@ describe('MarketModule', () => {
         message: 'Created',
         expires_at: '2025-12-31',
       }));
-      const mod = createMarketModule();
-      const identity1 = mockIdentity();
-      mod.initialize({ identity: identity1, emitEvent: vi.fn() });
+      const mod = createRegisteredModule();
 
       const identity2: FullIdentity = {
         ...mockIdentity(),
         privateKey: 'b'.repeat(64),
       };
       mod.initialize({ identity: identity2, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       // Both should work without error
       await mod.postIntent({ description: 'test', intentType: 'buy' });
@@ -358,6 +359,7 @@ describe('MarketModule', () => {
       }));
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       await mod.postIntent({ description: 'test', intentType: 'buy' });
 
@@ -376,7 +378,7 @@ describe('MarketModule', () => {
       expect(pubkey).toBe(bytesToHex(expectedPubkey));
 
       // Verify the signature can be parsed as a valid compact signature (will throw if invalid)
-      expect(() => secp256k1.Signature.fromCompact(sig)).not.toThrow();
+      expect(() => secp256k1.Signature.fromHex(sig)).not.toThrow();
 
       // Verify signature is for the correct message (body + timestamp)
       const body = JSON.parse(bodyStr);
@@ -389,9 +391,9 @@ describe('MarketModule', () => {
       const differentSig = secp256k1.sign(differentHash, hexToBytes(identity.privateKey));
 
       // Signatures should be different (proving uniqueness), but both valid format
-      expect(sig).not.toBe(differentSig.toCompactHex());
+      expect(sig).not.toBe(bytesToHex(differentSig));
       expect(sig).toMatch(/^[0-9a-f]{128}$/);
-      expect(differentSig.toCompactHex()).toMatch(/^[0-9a-f]{128}$/);
+      expect(bytesToHex(differentSig)).toMatch(/^[0-9a-f]{128}$/);
     });
 
     it('should include derived public key from private key', async () => {
@@ -403,6 +405,7 @@ describe('MarketModule', () => {
       }));
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       await mod.postIntent({ description: 'test', intentType: 'buy' });
 
@@ -424,6 +427,7 @@ describe('MarketModule', () => {
       }));
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       const beforeCall = Date.now();
       await mod.postIntent({ description: 'test', intentType: 'buy' });
@@ -441,6 +445,7 @@ describe('MarketModule', () => {
       const identity = mockIdentity();
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       // Mock Date.now to ensure signatures differ due to body, not timestamp
       const fixedTimestamp = 1700000000000;
@@ -494,6 +499,7 @@ describe('MarketModule', () => {
       }));
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       await mod.postIntent({ description: 'TestIntent', intentType: 'buy' });
 
@@ -513,7 +519,7 @@ describe('MarketModule', () => {
 
       // Verify signature format is valid
       expect(sig).toMatch(/^[0-9a-f]{128}$/);
-      expect(() => secp256k1.Signature.fromCompact(sig)).not.toThrow();
+      expect(() => secp256k1.Signature.fromHex(sig)).not.toThrow();
 
       // Verify the payload structure includes both body and timestamp
       expect(body).toHaveProperty('description', 'TestIntent');
@@ -535,6 +541,74 @@ describe('MarketModule', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // Auto-registration
+  // ---------------------------------------------------------------------------
+
+  describe('auto-registration', () => {
+    it('should register agent before first authenticated call', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(jsonResponse({ agentId: 'agent_1' }, 201)) // registration
+        .mockResolvedValueOnce(jsonResponse({ intents: [] })); // getMyIntents
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await mod.getMyIntents();
+
+      // First call: registration, second call: actual API
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const [regUrl, regOpts] = fetchSpy.mock.calls[0];
+      expect(regUrl).toContain('/api/agent/register');
+      expect(regOpts?.method).toBe('POST');
+      const regBody = JSON.parse(regOpts?.body as string);
+      expect(regBody.public_key).toBeDefined();
+    });
+
+    it('should only register once across multiple calls', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(jsonResponse({ agentId: 'agent_1' }, 201)) // registration
+        .mockResolvedValueOnce(jsonResponse({ intents: [] })) // first getMyIntents
+        .mockResolvedValueOnce(jsonResponse({ intents: [] })); // second getMyIntents
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await mod.getMyIntents();
+      await mod.getMyIntents();
+
+      // 1 registration + 2 API calls
+      expect(fetchSpy).toHaveBeenCalledTimes(3);
+      // Only first call should be registration
+      expect(fetchSpy.mock.calls[0][0]).toContain('/api/agent/register');
+      expect(fetchSpy.mock.calls[1][0]).toContain('/api/intents');
+      expect(fetchSpy.mock.calls[2][0]).toContain('/api/intents');
+    });
+
+    it('should treat 409 (already registered) as success', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(jsonResponse({ error: 'Agent already registered', agentId: 'agent_1' }, 409))
+        .mockResolvedValueOnce(jsonResponse({ intents: [] }));
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await expect(mod.getMyIntents()).resolves.toBeDefined();
+    });
+
+    it('should not register for public endpoints (search)', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse({ intents: [] }));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await mod.search('test');
+
+      // Only 1 call (no registration for public endpoint)
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy.mock.calls[0][0]).toContain('/api/search');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Field Mapping: snake_case ↔ camelCase
   // ---------------------------------------------------------------------------
 
@@ -546,8 +620,7 @@ describe('MarketModule', () => {
           message: 'Created',
           expires_at: '2025-12-31',
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         await mod.postIntent({
           description: 'Looking for widgets',
@@ -565,8 +638,7 @@ describe('MarketModule', () => {
           message: 'Created',
           expires_at: '2025-12-31',
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         await mod.postIntent({
           description: 'Looking for widgets',
@@ -589,8 +661,7 @@ describe('MarketModule', () => {
           message: 'Created',
           expires_at: '2025-12-31',
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         await mod.postIntent({
           description: 'Looking for widgets',
@@ -613,8 +684,7 @@ describe('MarketModule', () => {
           message: 'Created',
           expires_at: '2025-12-31',
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         await mod.postIntent({
           description: 'Test widget',
@@ -647,8 +717,7 @@ describe('MarketModule', () => {
           message: 'Created',
           expires_at: '2025-12-31',
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         const result = await mod.postIntent({
           description: 'test',
@@ -664,8 +733,7 @@ describe('MarketModule', () => {
           message: 'Created',
           expires_at: '2025-12-31T23:59:59Z',
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         const result = await mod.postIntent({
           description: 'test',
@@ -834,8 +902,7 @@ describe('MarketModule', () => {
             expires_at: '2025-12-31',
           }],
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         const result = await mod.getMyIntents();
 
@@ -858,8 +925,7 @@ describe('MarketModule', () => {
             expires_at: '2025-12-31',
           }],
         }));
-        const mod = createMarketModule();
-        mod.initialize(mockDeps());
+        const mod = createRegisteredModule();
 
         const result = await mod.getMyIntents();
 
@@ -877,32 +943,28 @@ describe('MarketModule', () => {
   describe('error handling details', () => {
     it('should throw on network error', async () => {
       fetchSpy.mockRejectedValue(new Error('Network error'));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('Network error');
     });
 
     it('should include error message from response', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({ error: 'Specific error message' }, 400));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('Specific error message');
     });
 
     it('should fallback to HTTP status code when no error field', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({}, 503));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('HTTP 503');
     });
 
     it('should show HTTP 400 as fallback', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({}, 400));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('HTTP 400');
     });
@@ -910,8 +972,7 @@ describe('MarketModule', () => {
     it('should parse JSON error in response', async () => {
       const errorBody = { error: 'Custom API error', details: 'field_name' };
       fetchSpy.mockResolvedValue(jsonResponse(errorBody, 400));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('Custom API error');
     });
@@ -984,6 +1045,7 @@ describe('MarketModule', () => {
       }));
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       await mod.postIntent({ description: 'test', intentType: 'buy' });
 
@@ -1002,8 +1064,7 @@ describe('MarketModule', () => {
       const messageHash = sha256(new TextEncoder().encode(payload));
 
       // Verify signature FAILS with wrong public key
-      const signature = secp256k1.Signature.fromCompact(hexToBytes(sig));
-      const isValidWrongKey = secp256k1.verify(signature, messageHash, wrongPubkey);
+      const isValidWrongKey = secp256k1.verify(hexToBytes(sig), messageHash, wrongPubkey);
       expect(isValidWrongKey).toBe(false);
     });
 
@@ -1016,6 +1077,7 @@ describe('MarketModule', () => {
       }));
       const mod = createMarketModule();
       mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
 
       await mod.postIntent({ description: 'test1', intentType: 'buy' });
       const ts1 = parseInt((fetchSpy.mock.calls[0][1]?.headers as Record<string, string>)['x-timestamp'], 10);
@@ -1043,8 +1105,7 @@ describe('MarketModule', () => {
   describe('edge cases', () => {
     it('should URL-encode intent ID in closeIntent', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({ message: 'Closed' }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       const intentId = 'int_/special?chars&';
       await mod.closeIntent(intentId);
@@ -1081,8 +1142,7 @@ describe('MarketModule', () => {
         message: 'Created',
         expires_at: '2025-12-31',
       }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       const result = await mod.postIntent({
         description: 'Minimal intent',
@@ -1094,8 +1154,7 @@ describe('MarketModule', () => {
 
     it('getMyIntents returning empty array should work', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({ intents: [] }));
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       const result = await mod.getMyIntents();
 
@@ -1111,8 +1170,7 @@ describe('MarketModule', () => {
         }))
         .mockResolvedValueOnce(jsonResponse({ intents: [] }));
 
-      const mod = createMarketModule();
-      mod.initialize(mockDeps());
+      const mod = createRegisteredModule();
 
       await mod.postIntent({ description: 'test', intentType: 'buy' });
       await mod.getMyIntents();

@@ -51,7 +51,7 @@ function signRequest(body: unknown, privateKeyHex: string): SignedRequest {
   return {
     body: JSON.stringify(body),
     headers: {
-      'x-signature': signature.toCompactHex(),
+      'x-signature': bytesToHex(signature),
       'x-public-key': publicKey,
       'x-timestamp': String(timestamp),
       'content-type': 'application/json',
@@ -133,6 +133,7 @@ export class MarketModule {
   private readonly apiUrl: string;
   private readonly timeout: number;
   private identity: FullIdentity | null = null;
+  private registered = false;
 
   constructor(config?: MarketModuleConfig) {
     this.apiUrl = (config?.apiUrl ?? DEFAULT_MARKET_API_URL).replace(/\/+$/, '');
@@ -197,6 +198,34 @@ export class MarketModule {
     }
   }
 
+  /** Register the agent's public key with the server (idempotent) */
+  private async ensureRegistered(): Promise<void> {
+    if (this.registered) return;
+    this.ensureIdentity();
+
+    const publicKey = bytesToHex(secp256k1.getPublicKey(hexToBytes(this.identity!.privateKey), true));
+    const body: Record<string, string> = { public_key: publicKey };
+    if (this.identity!.nametag) body.nametag = this.identity!.nametag;
+
+    const res = await fetch(`${this.apiUrl}/api/agent/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeout),
+    });
+
+    // 201 = created, 409 = already registered — both are fine
+    if (res.ok || res.status === 409) {
+      this.registered = true;
+      return;
+    }
+
+    const text = await res.text();
+    let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
+    try { data = JSON.parse(text); } catch { /* ignore */ }
+    throw new Error(data?.error ?? `Agent registration failed: HTTP ${res.status}`);
+  }
+
   private async parseResponse(res: Response): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     const text = await res.text();
     let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -211,6 +240,7 @@ export class MarketModule {
 
   private async apiPost(path: string, body: unknown): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
+    await this.ensureRegistered();
     const signed = signRequest(body, this.identity!.privateKey);
     const res = await fetch(`${this.apiUrl}${path}`, {
       method: 'POST',
@@ -223,6 +253,7 @@ export class MarketModule {
 
   private async apiGet(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
+    await this.ensureRegistered();
     const signed = signRequest({}, this.identity!.privateKey);
     const res = await fetch(`${this.apiUrl}${path}`, {
       method: 'GET',
@@ -234,6 +265,7 @@ export class MarketModule {
 
   private async apiDelete(path: string): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
     this.ensureIdentity();
+    await this.ensureRegistered();
     const signed = signRequest({}, this.identity!.privateKey);
     const res = await fetch(`${this.apiUrl}${path}`, {
       method: 'DELETE',

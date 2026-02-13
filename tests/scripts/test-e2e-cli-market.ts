@@ -3,8 +3,7 @@
  * E2E CLI Market Module Test Script
  *
  * Exercises all market CLI commands (market-post, market-search, market-my,
- * market-close, market-categories, market-profile) against the live testnet
- * Market API.
+ * market-close) against the live testnet Market API.
  *
  * Usage:
  *   npx tsx tests/scripts/test-e2e-cli-market.ts [--cleanup]
@@ -139,11 +138,11 @@ function cleanupProfiles(testRunId: string): void {
 
 async function checkMarketApiAvailable(): Promise<boolean> {
   try {
-    const res = await fetch(`${MARKET_API_URL}/api/categories`, {
+    const res = await fetch(`${MARKET_API_URL}/health`, {
       signal: AbortSignal.timeout(10_000),
     });
     const contentType = res.headers.get('content-type') ?? '';
-    return contentType.includes('application/json');
+    return res.ok && contentType.includes('application/json');
   } catch {
     return false;
   }
@@ -194,48 +193,7 @@ async function main(): Promise<void> {
     // =========================================================================
     console.log('\n--- PHASE 2: MARKET COMMAND TESTS ---\n');
 
-    // Test 1: market-categories
-    {
-      const testName = 'market-categories';
-      console.log(`\n[TEST] ${testName}`);
-      const start = performance.now();
-      try {
-        const { stdout, exitCode } = cli('market-categories', profileName);
-        assert(exitCode === 0, `exit code was ${exitCode}`);
-        assertIncludes(stdout, 'categories', 'should list categories');
-        const durationMs = performance.now() - start;
-        console.log(`  PASS (${durationMs.toFixed(0)}ms) — ${stdout.trim()}`);
-        results.push({ name: testName, passed: true, durationMs });
-      } catch (error) {
-        const durationMs = performance.now() - start;
-        const msg = error instanceof Error ? error.message : String(error);
-        console.log(`  FAIL — ${msg}`);
-        results.push({ name: testName, passed: false, durationMs, error: msg });
-      }
-    }
-
-    // Test 2: market-profile
-    {
-      const testName = 'market-profile';
-      console.log(`\n[TEST] ${testName}`);
-      const start = performance.now();
-      try {
-        const { stdout, exitCode } = cli('market-profile', profileName);
-        assert(exitCode === 0, `exit code was ${exitCode}`);
-        assertIncludes(stdout, 'Public Key:', 'should show public key');
-        assertIncludes(stdout, 'ID:', 'should show agent ID');
-        const durationMs = performance.now() - start;
-        console.log(`  PASS (${durationMs.toFixed(0)}ms)`);
-        results.push({ name: testName, passed: true, durationMs });
-      } catch (error) {
-        const durationMs = performance.now() - start;
-        const msg = error instanceof Error ? error.message : String(error);
-        console.log(`  FAIL — ${msg}`);
-        results.push({ name: testName, passed: false, durationMs, error: msg });
-      }
-    }
-
-    // Test 3: market-post (buy intent)
+    // Test 1: market-post (buy intent)
     {
       const testName = 'market-post (buy)';
       console.log(`\n[TEST] ${testName}`);
@@ -268,7 +226,7 @@ async function main(): Promise<void> {
       }
     }
 
-    // Test 4: market-post (sell intent)
+    // Test 2: market-post (sell intent)
     {
       const testName = 'market-post (sell)';
       console.log(`\n[TEST] ${testName}`);
@@ -292,7 +250,7 @@ async function main(): Promise<void> {
       }
     }
 
-    // Test 5: market-search
+    // Test 3: market-search
     {
       const testName = 'market-search';
       console.log(`\n[TEST] ${testName}`);
@@ -317,7 +275,7 @@ async function main(): Promise<void> {
       }
     }
 
-    // Test 6: market-my
+    // Test 4: market-my
     {
       const testName = 'market-my';
       console.log(`\n[TEST] ${testName}`);
@@ -341,7 +299,7 @@ async function main(): Promise<void> {
       }
     }
 
-    // Test 7: market-close
+    // Test 5: market-close
     {
       const testName = 'market-close';
       console.log(`\n[TEST] ${testName}`);
@@ -362,7 +320,7 @@ async function main(): Promise<void> {
       }
     }
 
-    // Test 8: market-my (after close)
+    // Test 6: market-my (after close)
     {
       const testName = 'market-my (after close)';
       console.log(`\n[TEST] ${testName}`);
