@@ -301,7 +301,7 @@ NAMETAGS:
   nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
 MARKET (Intent Bulletin Board):
-  market-post <desc> --type buy|sell  Post a buy/sell intent
+  market-post <desc> --type <type>     Post an intent (buy, sell, service, announcement, other)
                                       --category <cat>   Intent category
                                       --price <n>        Price amount
                                       --currency <code>  Currency (USD, UCT, etc.)
@@ -309,14 +309,17 @@ MARKET (Intent Bulletin Board):
                                       --contact <handle> Contact handle
                                       --expires <days>   Expiration in days (default: 30)
   market-search <query>               Search intents (semantic)
-                                      --type buy|sell    Filter by type
+                                      --type <type>      Filter by type
                                       --category <cat>   Filter by category
                                       --min-price <n>    Min price filter
                                       --max-price <n>    Max price filter
+                                      --min-score <0-1>  Min similarity score
                                       --location <loc>   Location filter
                                       --limit <n>        Max results (default: 10)
   market-my                           List your own intents
   market-close <id>                   Close (delete) an intent
+  market-feed                         Watch the live listing feed (WebSocket)
+                                      --rest              Use REST fallback instead of WebSocket
 
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
@@ -365,9 +368,14 @@ Wallet Profile Examples:
 Market Examples:
   npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
   npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
+  npm run cli -- market-post "Web dev services" --type service       Post service intent
+  npm run cli -- market-post "New feature release" --type announcement   Post announcement
   npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
+  npm run cli -- market-search "tokens" --min-score 0.7              Search with score threshold
   npm run cli -- market-my                                           List own intents
   npm run cli -- market-close <id>                                   Close an intent
+  npm run cli -- market-feed                                         Watch live feed
+  npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
 `);
 }
 
@@ -1637,14 +1645,14 @@ async function main() {
       case 'market-post': {
         const description = args[1];
         if (!description) {
-          console.error('Usage: market-post <description> --type buy|sell [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
+          console.error('Usage: market-post <description> --type <type> [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
           process.exit(1);
         }
 
         const typeIndex = args.indexOf('--type');
         const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
-        if (!intentType || (intentType !== 'buy' && intentType !== 'sell')) {
-          console.error('Error: --type buy|sell is required');
+        if (!intentType) {
+          console.error('Error: --type <type> is required (buy, sell, service, announcement, other)');
           process.exit(1);
         }
 
@@ -1675,7 +1683,7 @@ async function main() {
 
         const result = await sphere.market.postIntent({
           description,
-          intentType: intentType as 'buy' | 'sell',
+          intentType,
           category,
           price,
           currency,
@@ -1695,12 +1703,12 @@ async function main() {
       case 'market-search': {
         const query = args[1];
         if (!query) {
-          console.error('Usage: market-search <query> [--type buy|sell] [--category <cat>] [--min-price <n>] [--max-price <n>] [--location <loc>] [--limit <n>]');
+          console.error('Usage: market-search <query> [--type <type>] [--category <cat>] [--min-price <n>] [--max-price <n>] [--min-score <0-1>] [--location <loc>] [--limit <n>]');
           process.exit(1);
         }
 
         const typeIndex = args.indexOf('--type');
-        const intentType = typeIndex !== -1 ? args[typeIndex + 1] as 'buy' | 'sell' : undefined;
+        const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
 
         const categoryIndex = args.indexOf('--category');
         const category = categoryIndex !== -1 ? args[categoryIndex + 1] : undefined;
@@ -1710,6 +1718,9 @@ async function main() {
 
         const maxPriceIndex = args.indexOf('--max-price');
         const maxPrice = maxPriceIndex !== -1 ? parseFloat(args[maxPriceIndex + 1]) : undefined;
+
+        const minScoreIndex = args.indexOf('--min-score');
+        const minScore = minScoreIndex !== -1 ? parseFloat(args[minScoreIndex + 1]) : undefined;
 
         const locationIndex = args.indexOf('--location');
         const location = locationIndex !== -1 ? args[locationIndex + 1] : undefined;
@@ -1730,6 +1741,7 @@ async function main() {
             category,
             minPrice,
             maxPrice,
+            minScore,
             location,
           },
           limit,
@@ -1798,6 +1810,63 @@ async function main() {
         console.log(`✓ Intent ${intentId} closed.`);
 
         await closeSphere();
+        break;
+      }
+
+      case 'market-feed': {
+        const useRest = args.includes('--rest');
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        if (useRest) {
+          // REST fallback: fetch recent listings once
+          const listings = await sphere.market.getRecentListings();
+          console.log(`Recent listings (${listings.length}):`);
+          console.log('─'.repeat(50));
+          for (const listing of listings) {
+            console.log(`[${listing.type.toUpperCase()}] ${listing.agentName}: ${listing.title}`);
+            if (listing.descriptionPreview !== listing.title) {
+              console.log(`  ${listing.descriptionPreview}`);
+            }
+            console.log(`  ID: ${listing.id}  Posted: ${listing.createdAt}`);
+            console.log('');
+          }
+          await closeSphere();
+        } else {
+          // WebSocket live feed
+          console.log('Connecting to live feed... (Ctrl+C to stop)');
+          const unsubscribe = sphere.market.subscribeFeed((message) => {
+            if (message.type === 'initial') {
+              console.log(`Connected — ${message.listings.length} recent listing(s):`);
+              console.log('─'.repeat(50));
+              for (const listing of message.listings) {
+                console.log(`[${listing.type.toUpperCase()}] ${listing.agentName}: ${listing.title}`);
+              }
+              console.log('─'.repeat(50));
+              console.log('Watching for new listings...\n');
+            } else {
+              const l = message.listing;
+              console.log(`[NEW] [${l.type.toUpperCase()}] ${l.agentName}: ${l.title}`);
+              if (l.descriptionPreview !== l.title) {
+                console.log(`  ${l.descriptionPreview}`);
+              }
+            }
+          });
+
+          // Keep alive until Ctrl+C
+          process.on('SIGINT', () => {
+            console.log('\nDisconnecting...');
+            unsubscribe();
+            closeSphere().then(() => process.exit(0));
+          });
+
+          // Prevent the process from exiting
+          await new Promise(() => {});
+        }
         break;
       }
 

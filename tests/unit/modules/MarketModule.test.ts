@@ -1195,4 +1195,321 @@ describe('MarketModule', () => {
       expect(headers['x-signature']).toBeUndefined();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // All Intent Types
+  // ---------------------------------------------------------------------------
+
+  describe('all intent types', () => {
+    const ALL_TYPES = ['buy', 'sell', 'service', 'announcement', 'other'] as const;
+
+    describe('postIntent with each type', () => {
+      for (const intentType of ALL_TYPES) {
+        it(`should post a "${intentType}" intent and send correct intent_type`, async () => {
+          fetchSpy.mockResolvedValue(jsonResponse({
+            intent_id: `int_${intentType}`,
+            message: 'Created',
+            expires_at: '2025-12-31',
+          }));
+          const mod = createRegisteredModule();
+
+          const result = await mod.postIntent({
+            description: `Test ${intentType} intent`,
+            intentType,
+            category: 'test',
+            price: 42,
+          });
+
+          const [url, opts] = fetchSpy.mock.calls[0];
+          expect(url).toContain('/api/intents');
+          const body = JSON.parse(opts?.body as string);
+          expect(body.intent_type).toBe(intentType);
+          expect(body.description).toBe(`Test ${intentType} intent`);
+          expect(result.intentId).toBe(`int_${intentType}`);
+        });
+      }
+    });
+
+    describe('search with each type filter', () => {
+      for (const intentType of ALL_TYPES) {
+        it(`should filter search by type="${intentType}"`, async () => {
+          fetchSpy.mockResolvedValue(jsonResponse({
+            intents: [{
+              id: `int_${intentType}`,
+              score: 0.9,
+              agent_public_key: '02ab',
+              description: `A ${intentType} listing`,
+              intent_type: intentType,
+              currency: 'UCT',
+              contact_method: 'nostr',
+              created_at: '2025-01-01',
+              expires_at: '2025-12-31',
+            }],
+          }));
+          const mod = createMarketModule();
+          mod.initialize(mockDeps());
+
+          const result = await mod.search('test', {
+            filters: { intentType },
+          });
+
+          const [, opts] = fetchSpy.mock.calls[0];
+          const body = JSON.parse(opts?.body as string);
+          expect(body.intent_type).toBe(intentType);
+          expect(result.intents).toHaveLength(1);
+          expect(result.intents[0].intentType).toBe(intentType);
+        });
+      }
+    });
+
+    describe('getMyIntents returns mixed types', () => {
+      it('should correctly map intents of all types', async () => {
+        fetchSpy.mockResolvedValue(jsonResponse({
+          intents: ALL_TYPES.map((t, i) => ({
+            id: `int_${i}`,
+            intent_type: t,
+            currency: 'UCT',
+            status: 'active',
+            created_at: '2025-01-01',
+            expires_at: '2025-12-31',
+          })),
+        }));
+        const mod = createRegisteredModule();
+
+        const result = await mod.getMyIntents();
+
+        expect(result).toHaveLength(ALL_TYPES.length);
+        for (let i = 0; i < ALL_TYPES.length; i++) {
+          expect(result[i].intentType).toBe(ALL_TYPES[i]);
+        }
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Feed Methods
+  // ---------------------------------------------------------------------------
+
+  describe('getRecentListings()', () => {
+    it('should GET /api/feed/recent (public, no auth)', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse({
+        listings: [
+          {
+            id: 'lst_1',
+            title: 'MacBook Pro...',
+            description_preview: 'MacBook Pro M3 Max, 14-inch, 36GB RAM',
+            agent_name: '@techtrader',
+            agent_id: 1,
+            type: 'sell',
+            created_at: '2026-02-12T22:30:00.000Z',
+          },
+          {
+            id: 'lst_2',
+            title: 'Web dev services...',
+            description_preview: 'Full-stack web development available',
+            agent_name: '@devbot',
+            agent_id: 2,
+            type: 'service',
+            created_at: '2026-02-12T22:31:00.000Z',
+          },
+        ],
+      }));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const listings = await mod.getRecentListings();
+
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toContain('/api/feed/recent');
+      expect(opts?.method).toBeUndefined(); // GET (default)
+      // No auth headers
+      expect((opts?.headers as Record<string, string>)?.['x-public-key']).toBeUndefined();
+
+      expect(listings).toHaveLength(2);
+      expect(listings[0].id).toBe('lst_1');
+      expect(listings[0].title).toBe('MacBook Pro...');
+      expect(listings[0].descriptionPreview).toBe('MacBook Pro M3 Max, 14-inch, 36GB RAM');
+      expect(listings[0].agentName).toBe('@techtrader');
+      expect(listings[0].agentId).toBe(1);
+      expect(listings[0].type).toBe('sell');
+      expect(listings[0].createdAt).toBe('2026-02-12T22:30:00.000Z');
+      expect(listings[1].type).toBe('service');
+    });
+
+    it('should return empty array when no listings', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse({ listings: [] }));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const listings = await mod.getRecentListings();
+      expect(listings).toEqual([]);
+    });
+
+    it('should map all intent types in feed listings', async () => {
+      const ALL_TYPES = ['buy', 'sell', 'service', 'announcement', 'other'] as const;
+      fetchSpy.mockResolvedValue(jsonResponse({
+        listings: ALL_TYPES.map((t, i) => ({
+          id: `lst_${i}`,
+          title: `${t} listing`,
+          description_preview: `A ${t} listing description`,
+          agent_name: `@agent${i}`,
+          agent_id: i,
+          type: t,
+          created_at: '2026-01-01T00:00:00.000Z',
+        })),
+      }));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const listings = await mod.getRecentListings();
+      expect(listings).toHaveLength(5);
+      for (let i = 0; i < ALL_TYPES.length; i++) {
+        expect(listings[i].type).toBe(ALL_TYPES[i]);
+      }
+    });
+  });
+
+  describe('subscribeFeed()', () => {
+    let originalWebSocket: any;
+
+    beforeEach(() => {
+      originalWebSocket = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+      if (originalWebSocket === undefined) {
+        delete (globalThis as any).WebSocket;
+      } else {
+        (globalThis as any).WebSocket = originalWebSocket;
+      }
+    });
+
+    it('should create WebSocket with correct URL', () => {
+      const mockWs = {
+        onmessage: null as ((event: any) => void) | null,
+        close: vi.fn(),
+      };
+      const WSMock = vi.fn(() => mockWs);
+      (globalThis as any).WebSocket = WSMock;
+
+      const mod = createMarketModule({ apiUrl: 'https://market-api.unicity.network' });
+      mod.initialize(mockDeps());
+
+      const listener = vi.fn();
+      const unsubscribe = mod.subscribeFeed(listener);
+
+      expect(WSMock).toHaveBeenCalledWith('wss://market-api.unicity.network/ws/feed');
+
+      unsubscribe();
+      expect(mockWs.close).toHaveBeenCalled();
+    });
+
+    it('should parse and deliver initial message to listener', () => {
+      const mockWs = {
+        onmessage: null as ((event: any) => void) | null,
+        close: vi.fn(),
+      };
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const listener = vi.fn();
+      mod.subscribeFeed(listener);
+
+      // Simulate initial message
+      const initialMsg = {
+        type: 'initial',
+        listings: [{
+          id: 'lst_1',
+          title: 'Test listing',
+          description_preview: 'Test description',
+          agent_name: '@test',
+          agent_id: 1,
+          type: 'sell',
+          created_at: '2026-01-01T00:00:00.000Z',
+        }],
+      };
+      mockWs.onmessage!({ data: JSON.stringify(initialMsg) });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const msg = listener.mock.calls[0][0];
+      expect(msg.type).toBe('initial');
+      expect(msg.listings).toHaveLength(1);
+      expect(msg.listings[0].descriptionPreview).toBe('Test description');
+      expect(msg.listings[0].agentName).toBe('@test');
+    });
+
+    it('should parse and deliver new listing message to listener', () => {
+      const mockWs = {
+        onmessage: null as ((event: any) => void) | null,
+        close: vi.fn(),
+      };
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const listener = vi.fn();
+      mod.subscribeFeed(listener);
+
+      // Simulate new listing message
+      const newMsg = {
+        type: 'new',
+        listing: {
+          id: 'lst_2',
+          title: 'New item',
+          description_preview: 'Brand new item for sale',
+          agent_name: '@seller',
+          agent_id: 5,
+          type: 'announcement',
+          created_at: '2026-02-12T12:00:00.000Z',
+        },
+      };
+      mockWs.onmessage!({ data: JSON.stringify(newMsg) });
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const msg = listener.mock.calls[0][0];
+      expect(msg.type).toBe('new');
+      expect(msg.listing.id).toBe('lst_2');
+      expect(msg.listing.type).toBe('announcement');
+      expect(msg.listing.agentName).toBe('@seller');
+    });
+
+    it('should silently ignore malformed messages', () => {
+      const mockWs = {
+        onmessage: null as ((event: any) => void) | null,
+        close: vi.fn(),
+      };
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const listener = vi.fn();
+      mod.subscribeFeed(listener);
+
+      // Send garbage data
+      mockWs.onmessage!({ data: 'not json at all' });
+
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it('unsubscribe should close the WebSocket', () => {
+      const mockWs = {
+        onmessage: null as ((event: any) => void) | null,
+        close: vi.fn(),
+      };
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const unsubscribe = mod.subscribeFeed(vi.fn());
+      expect(mockWs.close).not.toHaveBeenCalled();
+
+      unsubscribe();
+      expect(mockWs.close).toHaveBeenCalledTimes(1);
+    });
+  });
 });

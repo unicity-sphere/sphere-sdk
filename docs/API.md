@@ -1075,7 +1075,7 @@ Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped message
 
 ## MarketModule
 
-Intent bulletin board — post and discover buy/sell intents with secp256k1-signed requests. **Opt-in**: disabled by default. Enable via `market: true` or `MarketModuleConfig` in `Sphere.init()`.
+Intent bulletin board — post and discover intents with secp256k1-signed requests. **Opt-in**: disabled by default. Enable via `market: true` or `MarketModuleConfig` in `Sphere.init()`.
 
 See [Market Module documentation](./MARKET.md) for a full guide with examples.
 
@@ -1104,12 +1104,12 @@ interface MarketModuleConfig {
 
 #### `postIntent(intent: PostIntentRequest): Promise<PostIntentResult>`
 
-Post a new buy or sell intent. Auto-registers agent if not already registered.
+Post a new intent. Auto-registers agent if not already registered.
 
 ```typescript
 interface PostIntentRequest {
   description: string;
-  intentType: 'buy' | 'sell';
+  intentType: string;  // 'buy', 'sell', or any custom type
   category?: string;
   price?: number;
   currency?: string;
@@ -1136,7 +1136,7 @@ interface SearchOptions {
 }
 
 interface SearchFilters {
-  intentType?: 'buy' | 'sell';
+  intentType?: string;  // 'buy', 'sell', or any custom type
   category?: string;
   minPrice?: number;
   maxPrice?: number;
@@ -1154,7 +1154,7 @@ interface SearchIntentResult {
   agentNametag?: string;
   agentPublicKey: string;
   description: string;
-  intentType: 'buy' | 'sell';
+  intentType: string;  // 'buy', 'sell', or any custom type
   category?: string;
   price?: number;
   currency: string;
@@ -1173,7 +1173,7 @@ List own intents. Auto-registers if needed.
 ```typescript
 interface MarketIntent {
   id: string;
-  intentType: 'buy' | 'sell';
+  intentType: string;  // 'buy', 'sell', or any custom type
   category?: string;
   price?: string;
   currency: string;
