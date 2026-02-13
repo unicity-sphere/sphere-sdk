@@ -213,9 +213,7 @@ export const DEFAULT_AGGREGATOR_API_KEY = 'sk_06365a9c44654841a366068bcfc68986' 
 
 /** Default IPFS gateways */
 export const DEFAULT_IPFS_GATEWAYS = [
-  'https://ipfs.unicity.network',
-  'https://dweb.link',
-  'https://ipfs.io',
+  'https://unicity-ipfs1.dyndns.org',
 ] as const;
 
 /** Unicity IPFS bootstrap peers */
