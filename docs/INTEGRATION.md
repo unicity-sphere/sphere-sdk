@@ -1000,14 +1000,8 @@ interface OracleProvider {
 ### Available Events
 
 ```typescript
-// Wallet events
-sphere.on('wallet:created', () => { });
-sphere.on('wallet:loaded', () => { });
-sphere.on('wallet:cleared', () => { });
-
 // Transfer events
 sphere.on('transfer:incoming', (transfer) => { });
-sphere.on('transfer:outgoing', (transfer) => { });
 sphere.on('transfer:confirmed', (transfer) => { });
 sphere.on('transfer:failed', (transfer) => { });
 
