@@ -38,6 +38,7 @@ import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
+import { TokenRegistry } from '../../registry';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
@@ -373,6 +374,10 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
+
+  // Configure token registry remote refresh with persistent cache
+  const networkConfig = getNetworkConfig(network);
+  TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
 
   return {
     storage,

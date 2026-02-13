@@ -2,10 +2,11 @@
  * Token Registry
  *
  * Provides token definitions (metadata) for known tokens on the Unicity network.
- * Uses bundled static data for offline access and consistency.
+ * Fetches from a remote URL, caches in StorageProvider, and refreshes periodically.
  */
 
-import testnetRegistry from './token-registry.testnet.json';
+import { TOKEN_REGISTRY_REFRESH_INTERVAL, STORAGE_KEYS_GLOBAL } from '../constants';
+import type { StorageProvider } from '../storage';
 
 // =============================================================================
 // Types
@@ -45,6 +46,26 @@ export interface TokenDefinition {
  */
 export type RegistryNetwork = 'testnet' | 'mainnet' | 'dev';
 
+/**
+ * Configuration options for remote registry refresh
+ */
+export interface TokenRegistryConfig {
+  /** Remote URL to fetch token definitions from */
+  remoteUrl?: string;
+  /** StorageProvider for persistent caching */
+  storage?: StorageProvider;
+  /** Refresh interval in ms (default: 1 hour) */
+  refreshIntervalMs?: number;
+  /** Start auto-refresh immediately (default: true) */
+  autoRefresh?: boolean;
+}
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+const FETCH_TIMEOUT_MS = 10_000;
+
 // =============================================================================
 // Registry Implementation
 // =============================================================================
@@ -55,12 +76,26 @@ export type RegistryNetwork = 'testnet' | 'mainnet' | 'dev';
  * Provides lookup functionality for token definitions by coin ID.
  * Uses singleton pattern for efficient memory usage.
  *
+ * Data flow:
+ * 1. On `configure()`: load cached definitions from StorageProvider (if fresh)
+ * 2. Fetch from remote URL in background
+ * 3. On successful fetch: update in-memory maps + persist to StorageProvider
+ * 4. Repeat every `refreshIntervalMs` (default 1 hour)
+ *
+ * If no cache and no network — registry is empty (lookup methods return fallbacks).
+ *
  * @example
  * ```ts
  * import { TokenRegistry } from '@unicitylabs/sphere-sdk';
  *
+ * // Usually called automatically by createBrowserProviders / createNodeProviders
+ * TokenRegistry.configure({
+ *   remoteUrl: 'https://raw.githubusercontent.com/.../unicity-ids.testnet.json',
+ *   storage: myStorageProvider,
+ * });
+ *
  * const registry = TokenRegistry.getInstance();
- * const def = registry.getDefinition('455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89');
+ * const def = registry.getDefinition('455ad87...');
  * console.log(def?.symbol); // 'UCT'
  * ```
  */
@@ -71,11 +106,18 @@ export class TokenRegistry {
   private readonly definitionsBySymbol: Map<string, TokenDefinition>;
   private readonly definitionsByName: Map<string, TokenDefinition>;
 
+  // Remote refresh state
+  private remoteUrl: string | null = null;
+  private storage: StorageProvider | null = null;
+  private refreshIntervalMs: number = TOKEN_REGISTRY_REFRESH_INTERVAL;
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private lastRefreshAt: number = 0;
+  private refreshPromise: Promise<boolean> | null = null;
+
   private constructor() {
     this.definitionsById = new Map();
     this.definitionsBySymbol = new Map();
     this.definitionsByName = new Map();
-    this.loadRegistry();
   }
 
   /**
@@ -89,17 +131,128 @@ export class TokenRegistry {
   }
 
   /**
-   * Reset the singleton instance (useful for testing)
+   * Configure remote registry refresh with persistent caching.
+   *
+   * On first call:
+   * 1. Loads cached data from StorageProvider (if available and fresh)
+   * 2. Starts periodic remote fetch (if autoRefresh is true, which is default)
+   *
+   * @param options - Configuration options
+   * @param options.remoteUrl - Remote URL to fetch definitions from
+   * @param options.storage - StorageProvider for persistent caching
+   * @param options.refreshIntervalMs - Refresh interval in ms (default: 1 hour)
+   * @param options.autoRefresh - Start auto-refresh immediately (default: true)
+   */
+  static configure(options: TokenRegistryConfig): void {
+    const instance = TokenRegistry.getInstance();
+
+    if (options.remoteUrl !== undefined) {
+      instance.remoteUrl = options.remoteUrl;
+    }
+    if (options.storage !== undefined) {
+      instance.storage = options.storage;
+    }
+    if (options.refreshIntervalMs !== undefined) {
+      instance.refreshIntervalMs = options.refreshIntervalMs;
+    }
+
+    // Load from cache first (async, fire-and-forget — populates maps ASAP)
+    if (instance.storage) {
+      instance.loadFromCache();
+    }
+
+    const autoRefresh = options.autoRefresh ?? true;
+    if (autoRefresh && instance.remoteUrl) {
+      instance.startAutoRefresh();
+    }
+  }
+
+  /**
+   * Reset the singleton instance (useful for testing).
+   * Stops auto-refresh if running.
    */
   static resetInstance(): void {
+    if (TokenRegistry.instance) {
+      TokenRegistry.instance.stopAutoRefresh();
+    }
     TokenRegistry.instance = null;
   }
 
   /**
-   * Load registry data from bundled JSON
+   * Destroy the singleton: stop auto-refresh and reset.
    */
-  private loadRegistry(): void {
-    const definitions = testnetRegistry as TokenDefinition[];
+  static destroy(): void {
+    TokenRegistry.resetInstance();
+  }
+
+  // ===========================================================================
+  // Cache (StorageProvider)
+  // ===========================================================================
+
+  /**
+   * Load definitions from StorageProvider cache.
+   * Only applies if cache exists and is fresh (within refreshIntervalMs).
+   */
+  private async loadFromCache(): Promise<boolean> {
+    if (!this.storage) return false;
+
+    try {
+      const [cached, cachedTs] = await Promise.all([
+        this.storage.get(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE),
+        this.storage.get(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS),
+      ]);
+
+      if (!cached || !cachedTs) return false;
+
+      const ts = parseInt(cachedTs, 10);
+      if (isNaN(ts)) return false;
+
+      // Check freshness
+      const age = Date.now() - ts;
+      if (age > this.refreshIntervalMs) return false;
+
+      // Don't overwrite data from a more recent remote fetch
+      if (this.lastRefreshAt > ts) return false;
+
+      const data: unknown = JSON.parse(cached);
+      if (!this.isValidDefinitionsArray(data)) return false;
+
+      this.applyDefinitions(data as TokenDefinition[]);
+      this.lastRefreshAt = ts;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Save definitions to StorageProvider cache.
+   */
+  private async saveToCache(definitions: TokenDefinition[]): Promise<void> {
+    if (!this.storage) return;
+
+    try {
+      await Promise.all([
+        this.storage.set(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE, JSON.stringify(definitions)),
+        this.storage.set(STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE_TS, String(Date.now())),
+      ]);
+    } catch {
+      // Cache save failure is non-critical
+    }
+  }
+
+  // ===========================================================================
+  // Remote Refresh
+  // ===========================================================================
+
+  /**
+   * Apply an array of token definitions to the internal maps.
+   * Clears existing data before applying.
+   */
+  private applyDefinitions(definitions: TokenDefinition[]): void {
+    this.definitionsById.clear();
+    this.definitionsBySymbol.clear();
+    this.definitionsByName.clear();
 
     for (const def of definitions) {
       const idLower = def.id.toLowerCase();
@@ -111,6 +264,117 @@ export class TokenRegistry {
 
       this.definitionsByName.set(def.name.toLowerCase(), def);
     }
+  }
+
+  /**
+   * Validate that data is an array of objects with 'id' field
+   */
+  private isValidDefinitionsArray(data: unknown): boolean {
+    return Array.isArray(data) && data.every((item) => item && typeof item === 'object' && 'id' in item);
+  }
+
+  /**
+   * Fetch token definitions from the remote URL and update the registry.
+   * On success, also persists to StorageProvider cache.
+   * Returns true on success, false on failure. On failure, existing data is preserved.
+   * Concurrent calls are deduplicated — only one fetch runs at a time.
+   */
+  async refreshFromRemote(): Promise<boolean> {
+    if (!this.remoteUrl) {
+      return false;
+    }
+
+    // Deduplicate concurrent calls
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
+    this.refreshPromise = this.doRefresh();
+    try {
+      return await this.refreshPromise;
+    } finally {
+      this.refreshPromise = null;
+    }
+  }
+
+  private async doRefresh(): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+      let response: Response;
+      try {
+        response = await fetch(this.remoteUrl!, {
+          headers: { Accept: 'application/json' },
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (!response.ok) {
+        console.warn(
+          `[TokenRegistry] Remote fetch failed: HTTP ${response.status} ${response.statusText}`,
+        );
+        return false;
+      }
+
+      const data: unknown = await response.json();
+
+      if (!this.isValidDefinitionsArray(data)) {
+        console.warn('[TokenRegistry] Remote data is not a valid token definitions array');
+        return false;
+      }
+
+      const definitions = data as TokenDefinition[];
+      this.applyDefinitions(definitions);
+      this.lastRefreshAt = Date.now();
+
+      // Persist to cache (fire-and-forget)
+      this.saveToCache(definitions);
+
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[TokenRegistry] Remote refresh failed: ${message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Start periodic auto-refresh from the remote URL.
+   * Does an immediate fetch, then repeats at the configured interval.
+   */
+  startAutoRefresh(intervalMs?: number): void {
+    this.stopAutoRefresh();
+
+    if (intervalMs !== undefined) {
+      this.refreshIntervalMs = intervalMs;
+    }
+
+    // Immediate first fetch (fire-and-forget)
+    this.refreshFromRemote();
+
+    this.refreshTimer = setInterval(() => {
+      this.refreshFromRemote();
+    }, this.refreshIntervalMs);
+  }
+
+  /**
+   * Stop periodic auto-refresh
+   */
+  stopAutoRefresh(): void {
+    if (this.refreshTimer !== null) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+  }
+
+  /**
+   * Timestamp of the last successful remote refresh (0 if never refreshed)
+   */
+  getLastRefreshAt(): number {
+    return this.lastRefreshAt;
   }
 
   // ===========================================================================

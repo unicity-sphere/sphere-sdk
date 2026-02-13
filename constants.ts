@@ -56,6 +56,10 @@ export const STORAGE_KEYS_GLOBAL = {
   GROUP_CHAT_PROCESSED_EVENTS: 'group_chat_processed_events',
   /** Group chat: last used relay URL (stale data detection) */
   GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
+  /** Cached token registry JSON (fetched from remote) */
+  TOKEN_REGISTRY_CACHE: 'token_registry_cache',
+  /** Timestamp of last token registry cache update (ms since epoch) */
+  TOKEN_REGISTRY_CACHE_TS: 'token_registry_cache_ts',
 } as const;
 
 /**
@@ -275,6 +279,17 @@ export const DEFAULT_ELECTRUM_URL = 'wss://fulcrum.alpha.unicity.network:50004' 
 export const TEST_ELECTRUM_URL = 'wss://fulcrum.alpha.testnet.unicity.network:50004' as const;
 
 // =============================================================================
+// Token Registry Defaults
+// =============================================================================
+
+/** Remote token registry URL (GitHub raw) */
+export const TOKEN_REGISTRY_URL =
+  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/unicity-ids.testnet.json' as const;
+
+/** Default token registry refresh interval (ms) — 1 hour */
+export const TOKEN_REGISTRY_REFRESH_INTERVAL = 3_600_000;
+
+// =============================================================================
 // Network Defaults
 // =============================================================================
 
@@ -297,6 +312,7 @@ export const NETWORKS = {
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: DEFAULT_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
+    tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
   testnet: {
     name: 'Testnet',
@@ -305,6 +321,7 @@ export const NETWORKS = {
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
+    tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
   dev: {
     name: 'Development',
@@ -313,6 +330,7 @@ export const NETWORKS = {
     ipfsGateways: DEFAULT_IPFS_GATEWAYS,
     electrumUrl: TEST_ELECTRUM_URL,
     groupRelays: DEFAULT_GROUP_RELAYS,
+    tokenRegistryUrl: TOKEN_REGISTRY_URL,
   },
 } as const;
 

@@ -124,6 +124,7 @@ await sphere.destroy();
 | Oracle (Aggregator) | Included with API key | Included with API key |
 | L1 (ALPHA blockchain) | Enabled, lazy Fulcrum connect | Enabled, lazy Fulcrum connect |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
+| Token Registry | Remote fetch + localStorage cache | Remote fetch + file cache |
 | IPFS sync | Built-in (HTTP) | Built-in (HTTP) |
 
 ### Key API Methods Reference
@@ -174,7 +175,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 - **L1 (ALPHA blockchain)** - UTXO-based blockchain transactions via Electrum
 - **L3 (Unicity state transition network)** - Token transfers with state proofs via Aggregator
 
-**Version:** 0.2.2
+**Version:** 0.3.3
 **License:** MIT
 **Target:** Node.js >= 18.0.0, Browser (ESM/CJS)
 
@@ -234,6 +235,9 @@ sphere-sdk/
 │   ├── tx.ts               # Transaction construction
 │   ├── vesting.ts          # Vesting classification
 │   └── ...
+│
+├── registry/                # Token metadata registry
+│   └── TokenRegistry.ts    # Remote fetch + cache singleton
 │
 ├── validation/              # Token validation
 │   └── TokenValidator.ts
@@ -351,7 +355,7 @@ npm run test:run
 npm run lint
 
 # Type check
-npm run type-check
+npm run typecheck
 ```
 
 ## Key Concepts
@@ -398,6 +402,18 @@ npm run type-check
 - `transportPubkey`: Derived key for transport messaging (HKDF from private key)
 - Identity binding events include both for cross-resolution
 
+### Token Registry (Remote + Cached)
+- `TokenRegistry` is a singleton that provides token metadata (symbol, name, decimals, icons) by coin ID
+- **No bundled data** — starts empty, data comes from remote URL + persistent cache
+- Configured automatically by `createBrowserProviders()` / `createNodeProviders()` via `TokenRegistry.configure({ remoteUrl, storage })`
+- **Data flow:** on `configure()` → load from StorageProvider cache (if fresh) → fetch from remote URL in background → persist to cache on success → repeat every 1 hour
+- **Graceful degradation:** if no cache and no network, lookup methods return fallbacks (truncated coinId for symbol, 0 for decimals)
+- Remote URL per network: `constants.ts` → `NETWORKS[network].tokenRegistryUrl`
+- Cache keys: `STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE` (JSON) and `TOKEN_REGISTRY_CACHE_TS` (timestamp)
+- Race-safe: cache load skipped if remote data is already newer (`lastRefreshAt > cacheTs`)
+- Concurrent `refreshFromRemote()` calls are deduplicated (only one fetch at a time)
+- `TokenRegistry.destroy()` stops auto-refresh and resets singleton
+
 ### Event Timestamp Persistence
 - Transport persists last processed wallet event timestamp via `TransportStorageAdapter`
 - Storage key: `last_wallet_event_ts_{pubkey_prefix}` (per-wallet, in `STORAGE_KEYS_GLOBAL`)
@@ -420,13 +436,14 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 893 (34 test files)
+**Total tests:** 1315 (52 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer, event timestamp persistence
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
+- `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts

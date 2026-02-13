@@ -11,6 +11,7 @@ export {
   type TokenDefinition,
   type TokenIcon,
   type RegistryNetwork,
+  type TokenRegistryConfig,
   // Convenience functions
   getTokenDefinition,
   getTokenSymbol,

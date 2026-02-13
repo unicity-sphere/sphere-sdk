@@ -33,6 +33,7 @@ import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
+import { TokenRegistry } from '../../registry';
 import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 import type { IpfsStorageConfig } from '../shared/ipfs';
@@ -47,6 +48,7 @@ import {
   resolveL1Config,
   resolvePriceConfig,
   resolveGroupChatConfig,
+  getNetworkConfig,
 } from '../shared';
 
 // =============================================================================
@@ -186,6 +188,10 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
 
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
+
+  // Configure token registry remote refresh with persistent cache
+  const networkConfig = getNetworkConfig(network);
+  TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
 
   return {
     storage,
