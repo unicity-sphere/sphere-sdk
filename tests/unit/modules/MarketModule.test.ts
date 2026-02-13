@@ -1370,12 +1370,27 @@ describe('MarketModule', () => {
   });
 
   describe('subscribeFeed()', () => {
+    let originalWebSocket: any;
+
+    beforeEach(() => {
+      originalWebSocket = (globalThis as any).WebSocket;
+    });
+
+    afterEach(() => {
+      if (originalWebSocket === undefined) {
+        delete (globalThis as any).WebSocket;
+      } else {
+        (globalThis as any).WebSocket = originalWebSocket;
+      }
+    });
+
     it('should create WebSocket with correct URL', () => {
       const mockWs = {
         onmessage: null as ((event: any) => void) | null,
         close: vi.fn(),
       };
-      const WSSpy = vi.spyOn(globalThis, 'WebSocket' as any).mockImplementation(() => mockWs);
+      const WSMock = vi.fn(() => mockWs);
+      (globalThis as any).WebSocket = WSMock;
 
       const mod = createMarketModule({ apiUrl: 'https://market-api.unicity.network' });
       mod.initialize(mockDeps());
@@ -1383,12 +1398,10 @@ describe('MarketModule', () => {
       const listener = vi.fn();
       const unsubscribe = mod.subscribeFeed(listener);
 
-      expect(WSSpy).toHaveBeenCalledWith('wss://market-api.unicity.network/ws/feed');
+      expect(WSMock).toHaveBeenCalledWith('wss://market-api.unicity.network/ws/feed');
 
       unsubscribe();
       expect(mockWs.close).toHaveBeenCalled();
-
-      WSSpy.mockRestore();
     });
 
     it('should parse and deliver initial message to listener', () => {
@@ -1396,7 +1409,7 @@ describe('MarketModule', () => {
         onmessage: null as ((event: any) => void) | null,
         close: vi.fn(),
       };
-      vi.spyOn(globalThis, 'WebSocket' as any).mockImplementation(() => mockWs);
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
 
       const mod = createMarketModule();
       mod.initialize(mockDeps());
@@ -1425,8 +1438,6 @@ describe('MarketModule', () => {
       expect(msg.listings).toHaveLength(1);
       expect(msg.listings[0].descriptionPreview).toBe('Test description');
       expect(msg.listings[0].agentName).toBe('@test');
-
-      vi.restoreAllMocks();
     });
 
     it('should parse and deliver new listing message to listener', () => {
@@ -1434,7 +1445,7 @@ describe('MarketModule', () => {
         onmessage: null as ((event: any) => void) | null,
         close: vi.fn(),
       };
-      vi.spyOn(globalThis, 'WebSocket' as any).mockImplementation(() => mockWs);
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
 
       const mod = createMarketModule();
       mod.initialize(mockDeps());
@@ -1463,8 +1474,6 @@ describe('MarketModule', () => {
       expect(msg.listing.id).toBe('lst_2');
       expect(msg.listing.type).toBe('announcement');
       expect(msg.listing.agentName).toBe('@seller');
-
-      vi.restoreAllMocks();
     });
 
     it('should silently ignore malformed messages', () => {
@@ -1472,7 +1481,7 @@ describe('MarketModule', () => {
         onmessage: null as ((event: any) => void) | null,
         close: vi.fn(),
       };
-      vi.spyOn(globalThis, 'WebSocket' as any).mockImplementation(() => mockWs);
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
 
       const mod = createMarketModule();
       mod.initialize(mockDeps());
@@ -1484,8 +1493,6 @@ describe('MarketModule', () => {
       mockWs.onmessage!({ data: 'not json at all' });
 
       expect(listener).not.toHaveBeenCalled();
-
-      vi.restoreAllMocks();
     });
 
     it('unsubscribe should close the WebSocket', () => {
@@ -1493,7 +1500,7 @@ describe('MarketModule', () => {
         onmessage: null as ((event: any) => void) | null,
         close: vi.fn(),
       };
-      vi.spyOn(globalThis, 'WebSocket' as any).mockImplementation(() => mockWs);
+      (globalThis as any).WebSocket = vi.fn(() => mockWs);
 
       const mod = createMarketModule();
       mod.initialize(mockDeps());
@@ -1503,8 +1510,6 @@ describe('MarketModule', () => {
 
       unsubscribe();
       expect(mockWs.close).toHaveBeenCalledTimes(1);
-
-      vi.restoreAllMocks();
     });
   });
 });
