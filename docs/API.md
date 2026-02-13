@@ -1289,7 +1289,15 @@ type SphereEventType =
   | 'identity:changed'
   | 'address:activated'
   | 'address:hidden'
-  | 'address:unhidden';
+  | 'address:unhidden'
+  | 'sync:remote-update'
+  | 'groupchat:message'
+  | 'groupchat:joined'
+  | 'groupchat:left'
+  | 'groupchat:kicked'
+  | 'groupchat:group_deleted'
+  | 'groupchat:updated'
+  | 'groupchat:connection';
 ```
 
 ### SphereEventMap
@@ -1310,7 +1318,7 @@ interface SphereEventMap {
   'sync:completed': { source: string; count: number };
   'sync:provider': { providerId: string; success: boolean; added?: number; removed?: number; error?: string };
   'sync:error': { source: string; error: string };
-  'connection:changed': { provider: string; connected: boolean };
+  'connection:changed': { provider: string; connected: boolean; status?: ProviderStatus; enabled?: boolean; error?: string };
   'nametag:registered': { nametag: string; addressIndex: number };
   'nametag:recovered': { nametag: string };
   'identity:changed': {
@@ -1323,6 +1331,14 @@ interface SphereEventMap {
   'address:activated': { address: TrackedAddress };
   'address:hidden': { index: number; addressId: string };
   'address:unhidden': { index: number; addressId: string };
+  'sync:remote-update': { providerId: string; name: string; sequence: number; cid: string; added: number; removed: number };
+  'groupchat:message': GroupMessageData;
+  'groupchat:joined': { groupId: string; groupName: string };
+  'groupchat:left': { groupId: string };
+  'groupchat:kicked': { groupId: string; groupName: string };
+  'groupchat:group_deleted': { groupId: string; groupName: string };
+  'groupchat:updated': Record<string, never>;
+  'groupchat:connection': { connected: boolean };
 }
 ```
 

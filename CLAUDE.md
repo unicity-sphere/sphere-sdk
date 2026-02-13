@@ -205,6 +205,10 @@ sphere-sdk/
 │   │   ├── TokenSplitCalculator.ts
 │   │   ├── TokenSplitExecutor.ts
 │   │   └── NametagMinter.ts       # On-chain nametag minting
+│   ├── market/
+│   │   ├── MarketModule.ts        # Intent bulletin board (buy/sell intents)
+│   │   ├── types.ts               # Market types (PostIntentRequest, etc.)
+│   │   └── index.ts               # Barrel exports + factory
 │   ├── groupchat/
 │   │   ├── GroupChatModule.ts     # NIP-29 group chat (relay-based)
 │   │   ├── types.ts               # GroupData, GroupMessageData, etc.
@@ -256,7 +260,11 @@ sphere-sdk/
 │
 ├── docs/                    # Documentation
 │   ├── API.md              # API reference
-│   └── INTEGRATION.md      # Integration guide
+│   ├── INTEGRATION.md      # Integration guide
+│   ├── MARKET.md           # Market module (intent bulletin board)
+│   ├── IPFS-STORAGE.md     # IPFS/IPNS storage provider
+│   ├── QUICKSTART-BROWSER.md # Browser quickstart guide
+│   └── QUICKSTART-NODEJS.md  # Node.js quickstart guide
 │
 ├── index.ts                 # Main SDK entry point
 ├── constants.ts             # Global constants and defaults
@@ -439,7 +447,7 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1315 (52 test files)
+**Total tests:** 1377 (54 unit/integration test files + 9 E2E/relay test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
@@ -447,10 +455,14 @@ Key test files:
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh
+- `tests/unit/modules/MarketModule.test.ts` - Market intent bulletin board
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
+- `tests/unit/validation/TokenValidator.test.ts` - Token validation
+- `tests/unit/impl/shared/ipfs/*.test.ts` - IPFS/IPNS storage
 - `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
+- `tests/integration/market-module.test.ts` - Market module integration
 - `tests/relay/groupchat-relay.test.ts` - GroupChat NIP-29 relay integration (Docker + remote)
 
 ### Relay Integration Tests
