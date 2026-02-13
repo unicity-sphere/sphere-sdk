@@ -137,9 +137,11 @@ await sphere.destroy();
 | `Sphere.clear({ storage, tokenStorage? })` | `void` | Delete all wallet data |
 | `Sphere.import(options)` | `Sphere` | Import from mnemonic/masterKey |
 | `sphere.payments.getAssets(coinId?)` | `Asset[]` | Get assets grouped by coin |
-| `sphere.payments.getBalance()` | `number \| null` | Total USD value |
+| `sphere.payments.getBalance(coinId?)` | `Asset[]` | Assets with confirmed/unconfirmed breakdown |
+| `sphere.payments.getFiatBalance()` | `Promise<number \| null>` | Total USD value (null if no PriceProvider) |
 | `sphere.payments.getTokens(filter?)` | `Token[]` | Get individual tokens |
 | `sphere.payments.send(request)` | `TransferResult` | Send L3 tokens |
+| `sphere.payments.receive(opts?)` | `Promise<{ transfers }>` | Check for incoming transfers |
 | `sphere.payments.sync()` | `{ added, removed }` | Sync with remote storage |
 | `sphere.payments.validate()` | `{ valid, invalid }` | Validate against aggregator |
 | `sphere.payments.getHistory()` | `TransactionHistoryEntry[]` | Transaction history |
