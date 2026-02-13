@@ -23,6 +23,7 @@ export class FileStorageProvider implements StorageProvider {
 
   private dataDir: string;
   private filePath: string;
+  private isTxtMode: boolean;
   private data: Record<string, string> = {};
   private status: ProviderStatus = 'disconnected';
   private _identity: FullIdentity | null = null;
@@ -35,6 +36,7 @@ export class FileStorageProvider implements StorageProvider {
       this.dataDir = config.dataDir;
       this.filePath = path.join(config.dataDir, config.fileName ?? 'wallet.json');
     }
+    this.isTxtMode = this.filePath.endsWith('.txt');
   }
 
   setIdentity(identity: FullIdentity): void {
@@ -59,8 +61,15 @@ export class FileStorageProvider implements StorageProvider {
     // Load existing data
     if (fs.existsSync(this.filePath)) {
       try {
-        const content = fs.readFileSync(this.filePath, 'utf-8');
-        this.data = JSON.parse(content);
+        const content = fs.readFileSync(this.filePath, 'utf-8').trim();
+        if (this.isTxtMode) {
+          // .txt file: entire content is the mnemonic (plaintext or encrypted)
+          if (content) {
+            this.data = { [STORAGE_KEYS_GLOBAL.MNEMONIC]: content };
+          }
+        } else {
+          this.data = JSON.parse(content);
+        }
       } catch {
         this.data = {};
       }
@@ -163,7 +172,13 @@ export class FileStorageProvider implements StorageProvider {
     if (!fs.existsSync(this.dataDir)) {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
-    fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    if (this.isTxtMode) {
+      // .txt file: persist only the mnemonic
+      const mnemonic = this.data[STORAGE_KEYS_GLOBAL.MNEMONIC] ?? '';
+      fs.writeFileSync(this.filePath, mnemonic);
+    } else {
+      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+    }
   }
 }
 

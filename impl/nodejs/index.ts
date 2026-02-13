@@ -94,6 +94,8 @@ export interface NodeProvidersConfig {
   network?: NetworkType;
   /** Directory for wallet data storage */
   dataDir?: string;
+  /** Wallet file name (default: 'wallet.json') */
+  walletFileName?: string;
   /** Directory for token files */
   tokensDir?: string;
   /** Transport (Nostr) configuration */
@@ -176,6 +178,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
 
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
+    ...(config?.walletFileName ? { fileName: config.walletFileName } : {}),
   });
 
   // Create IPFS storage provider if enabled
