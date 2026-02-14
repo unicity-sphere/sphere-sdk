@@ -4,9 +4,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { MarketModule, createMarketModule } from '../../../modules/market/MarketModule';
+import { MarketModule, createMarketModule, DEFAULT_MARKET_API_URL } from '../../../modules/market/MarketModule';
 import type { FullIdentity } from '../../../types';
-import { DEFAULT_MARKET_API_URL } from '../../../constants';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';

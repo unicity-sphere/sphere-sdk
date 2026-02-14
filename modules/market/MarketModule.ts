@@ -10,7 +10,8 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
-import { DEFAULT_MARKET_API_URL } from '../../constants';
+/** Default Market API URL (intent bulletin board) */
+export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';
 import type {
   MarketModuleConfig,
   MarketModuleDependencies,
