@@ -31,3 +31,9 @@ coverage/
 
 # CLI wallet profiles and test wallets
 .sphere-cli*/
+
+# Reference materials (local only)
+ref_materials/
+
+# Test artifacts
+tests/integration/.test-market-module/
