@@ -447,7 +447,7 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1377 (54 unit/integration test files + 9 E2E/relay test files)
+**Total tests:** 1459 (56 unit/integration test files + 9 E2E/relay test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
