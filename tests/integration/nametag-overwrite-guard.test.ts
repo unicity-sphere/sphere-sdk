@@ -51,6 +51,7 @@ function clearRelay(): void {
 interface MockTransport extends TransportProvider {
   publishIdentityBinding: ReturnType<typeof vi.fn>;
   resolve: ReturnType<typeof vi.fn>;
+  recoverNametag: ReturnType<typeof vi.fn>;
 }
 
 function createMockTransport(options: {
@@ -90,9 +91,9 @@ function createMockTransport(options: {
           // Look up by directAddress
           const binding = relayBindings.get(identifier);
           if (binding) return Promise.resolve(binding);
-          // Look up by any field
+          // Look up by chainPubkey, l1Address, or x-only pubkey (chainPubkey without 02/03 prefix)
           for (const b of relayBindings.values()) {
-            if (b.chainPubkey === identifier || b.l1Address === identifier) {
+            if (b.chainPubkey === identifier || b.l1Address === identifier || b.chainPubkey.slice(2) === identifier) {
               return Promise.resolve(b);
             }
           }
@@ -440,6 +441,103 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
 
     expect(sphere3.identity!.nametag).toBe('dave');
     // Still should not re-publish (binding exists on relay)
+    expect(transport.publishIdentityBinding).not.toHaveBeenCalled();
+
+    await sphere3.destroy();
+  });
+
+  it('should recover nametag from legacy event format (no content.nametag, only encrypted_nametag)', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    // 1. Create wallet with nametag
+    const { sphere: sphere1 } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+      nametag: 'legacy_user',
+    });
+
+    expect(sphere1.identity!.nametag).toBe('legacy_user');
+    const chainPubkey = sphere1.identity!.chainPubkey;
+    const directAddr = sphere1.identity!.directAddress!;
+
+    await sphere1.destroy();
+    (Sphere as unknown as { instance: null }).instance = null;
+
+    // 2. Simulate legacy event format on relay:
+    //    - binding exists (found by chainPubkey.slice(2))
+    //    - but content.nametag is MISSING (old format only had nametag_hash + encrypted_nametag)
+    const legacyBinding = relayBindings.get(directAddr)!;
+    relayBindings.set(directAddr, {
+      ...legacyBinding,
+      nametag: undefined, // old format didn't have plaintext nametag
+    });
+
+    // recoverNametag() simulates decrypting encrypted_nametag from the old event
+    transport.recoverNametag.mockResolvedValue('legacy_user');
+
+    // 3. Simulate nametag loss in local storage
+    const identityKey = 'sphere_identity';
+    const identityJson = await storage.get(identityKey);
+    if (identityJson) {
+      const identityData = JSON.parse(identityJson);
+      delete identityData.nametag;
+      await storage.set(identityKey, JSON.stringify(identityData));
+    }
+    const keys = await storage.keys('');
+    for (const key of keys ?? []) {
+      if (key.includes('nametag')) {
+        await storage.remove(key);
+      }
+    }
+
+    transport.publishIdentityBinding.mockClear();
+
+    // 4. Reload — should find legacy event, recover nametag, and migrate to new format
+    const sphere2 = await Sphere.load({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+    });
+
+    // Nametag recovered
+    expect(sphere2.identity!.nametag).toBe('legacy_user');
+
+    // recoverNametag was called (fallback for legacy events without content.nametag)
+    expect(transport.recoverNametag).toHaveBeenCalled();
+
+    // Re-published in new format (migration)
+    expect(transport.publishIdentityBinding).toHaveBeenCalledWith(
+      chainPubkey,
+      expect.any(String),
+      directAddr,
+      'legacy_user',
+    );
+
+    // Relay binding now has nametag in new format
+    const migrated = relayBindings.get(directAddr);
+    expect(migrated!.nametag).toBe('legacy_user');
+
+    await sphere2.destroy();
+    (Sphere as unknown as { instance: null }).instance = null;
+
+    // 5. Second reload — should find new-format event, no migration needed
+    transport.publishIdentityBinding.mockClear();
+    transport.recoverNametag.mockClear();
+
+    const sphere3 = await Sphere.load({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+    });
+
+    expect(sphere3.identity!.nametag).toBe('legacy_user');
+    // No re-publish needed (binding already in new format with nametag)
     expect(transport.publishIdentityBinding).not.toHaveBeenCalled();
 
     await sphere3.destroy();

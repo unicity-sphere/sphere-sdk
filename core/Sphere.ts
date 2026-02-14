@@ -2913,16 +2913,32 @@ export class Sphere {
     }
 
     try {
-      // Check if a binding already exists via transport.resolve(directAddress).
-      // If yes — skip publish. Only registerNametag() should modify bindings.
-      // Uses _transport.resolve directly because this runs before _initialized = true.
-      if (this._identity?.directAddress && this._transport.resolve) {
+      // Check if a binding already exists by querying the relay by transport pubkey
+      // (= x-only pubkey = chainPubkey without the 02/03 prefix).
+      // This finds events in ANY format (old d=hashedNametag and new d=hash(identity:pubkey))
+      // because resolve(64-hex) searches by event author, not by tag.
+      const transportPubkey = this._identity?.chainPubkey?.slice(2);
+      if (transportPubkey && this._transport.resolve) {
         try {
-          const existing = await this._transport.resolve(this._identity.directAddress);
+          const existing = await this._transport.resolve(transportPubkey);
           if (existing) {
             // If existing binding has nametag but local state doesn't — recover it
-            if (existing.nametag && !this._identity.nametag) {
-              (this._identity as MutableFullIdentity).nametag = existing.nametag;
+            let recoveredNametag = existing.nametag;
+            let fromLegacy = false;
+
+            // Old-format events don't have content.nametag (only encrypted_nametag).
+            // Fall back to recoverNametag() which decrypts encrypted_nametag from any event.
+            if (!recoveredNametag && !this._identity?.nametag && this._transport.recoverNametag) {
+              try {
+                recoveredNametag = await this._transport.recoverNametag() ?? undefined;
+                if (recoveredNametag) fromLegacy = true;
+              } catch {
+                // Decryption failed — continue without nametag
+              }
+            }
+
+            if (recoveredNametag && !this._identity?.nametag) {
+              (this._identity as MutableFullIdentity).nametag = recoveredNametag;
               await this._updateCachedProxyAddress();
 
               const entry = await this.ensureAddressTracked(this._currentAddressIndex);
@@ -2932,12 +2948,25 @@ export class Sphere {
                 this._addressNametags.set(entry.addressId, nametags);
               }
               if (!nametags.has(0)) {
-                nametags.set(0, existing.nametag);
+                nametags.set(0, recoveredNametag);
                 await this.persistAddressNametags();
               }
 
-              this.emitEvent('nametag:recovered', { nametag: existing.nametag });
+              this.emitEvent('nametag:recovered', { nametag: recoveredNametag });
+
+              // Re-publish in new format only when migrating from legacy event
+              if (fromLegacy) {
+                await this._transport.publishIdentityBinding!(
+                  this._identity!.chainPubkey,
+                  this._identity!.l1Address,
+                  this._identity!.directAddress || '',
+                  recoveredNametag,
+                );
+                console.log(`[Sphere] Migrated legacy binding with nametag @${recoveredNametag}`);
+                return;
+              }
             }
+
             console.log('[Sphere] Existing binding found, skipping re-publish');
             return;
           }
