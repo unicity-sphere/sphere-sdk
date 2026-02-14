@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "Bash(npx tsc:*)",
-      "Bash(npx vitest:*)"
+      "Bash(npx vitest:*)",
+      "Bash(gh pr view:*)",
+      "Bash(git log:*)",
+      "Bash(for c in 9f7792b de580f7)",
+      "Bash(do echo \"=== $c ===\")",
+      "Bash(done)",
+      "Bash(git checkout:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run typecheck:*)",
+      "Bash(npm run test:run:*)"
     ]
   }
 }

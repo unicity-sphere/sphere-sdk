@@ -54,6 +54,36 @@
         "types": "./dist/l1/index.d.cts",
         "default": "./dist/l1/index.cjs"
       }
+    },
+    "./connect": {
+      "import": {
+        "types": "./dist/connect/index.d.ts",
+        "default": "./dist/connect/index.js"
+      },
+      "require": {
+        "types": "./dist/connect/index.d.cts",
+        "default": "./dist/connect/index.cjs"
+      }
+    },
+    "./connect/browser": {
+      "import": {
+        "types": "./dist/impl/browser/connect/index.d.ts",
+        "default": "./dist/impl/browser/connect/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/browser/connect/index.d.cts",
+        "default": "./dist/impl/browser/connect/index.cjs"
+      }
+    },
+    "./connect/nodejs": {
+      "import": {
+        "types": "./dist/impl/nodejs/connect/index.d.ts",
+        "default": "./dist/impl/nodejs/connect/index.js"
+      },
+      "require": {
+        "types": "./dist/impl/nodejs/connect/index.d.cts",
+        "default": "./dist/impl/nodejs/connect/index.cjs"
+      }
     }
   },
   "files": [
