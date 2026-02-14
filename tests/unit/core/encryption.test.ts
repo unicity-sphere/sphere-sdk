@@ -16,7 +16,6 @@ import {
   serializeEncrypted,
   deserializeEncrypted,
   generateRandomKey,
-  type EncryptedData,
 } from '../../../core/encryption';
 
 // =============================================================================

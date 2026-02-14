@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IpfsStorageProvider } from '../../../../../impl/shared/ipfs/ipfs-storage-provider';
 import { InMemoryIpfsStatePersistence } from '../../../../../impl/shared/ipfs/ipfs-state-persistence';

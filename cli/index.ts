@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { encrypt, decrypt, generateRandomKey } from '../core/encryption';
+import { encrypt, decrypt } from '../core/encryption';
 import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from '../serialization/wallet-text';
 import { parseWalletDat, isSQLiteDatabase, isWalletDatEncrypted } from '../serialization/wallet-dat';
 import { isValidPrivateKey, base58Encode, base58Decode } from '../core/utils';
@@ -19,7 +19,7 @@ import { Sphere } from '../core/Sphere';
 import { createNodeProviders } from '../impl/nodejs';
 import { TokenRegistry } from '../registry/TokenRegistry';
 import { TokenValidator } from '../validation/token-validator';
-import { tokenToTxf, getCurrentStateHash } from '../serialization/txf-serializer';
+import { tokenToTxf } from '../serialization/txf-serializer';
 import type { NetworkType } from '../constants';
 import type { TransportProvider } from '../transport/transport-provider';
 import type { ProviderStatus } from '../types';
@@ -225,7 +225,7 @@ async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
 // Interactive Input
 // =============================================================================
 
-function prompt(question: string): Promise<string> {
+function _prompt(question: string): Promise<string> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,

@@ -59,7 +59,7 @@ const FAUCET_TOPUP_TIMEOUT_MS = 120_000;
 const SYNC_PROPAGATION_TIMEOUT_MS = 90_000;
 const CLI_TIMEOUT_MS = 300_000;
 
-const COIN_DECIMALS: Record<string, number> = {
+const _COIN_DECIMALS: Record<string, number> = {
   UCT: 18,
   SOL: 9,
   BTC: 8,
@@ -147,7 +147,7 @@ function cli(cmd: string, profile?: string): CliResult {
     const durationMs = performance.now() - start;
     return { stdout, stderr: '', exitCode: 0, durationMs };
   } catch (error: unknown) {
-    const durationMs = performance.now() - start;
+    const _durationMs = performance.now() - start;
     const execError = error as {
       stdout?: string;
       stderr?: string;

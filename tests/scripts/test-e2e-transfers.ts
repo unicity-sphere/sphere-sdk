@@ -154,7 +154,7 @@ async function createTestWallet(
   return { sphere, mnemonic: generatedMnemonic };
 }
 
-async function loadWallet(profileName: string): Promise<Sphere> {
+async function _loadWallet(profileName: string): Promise<Sphere> {
   const dataDir = `./.sphere-cli-${profileName}`;
   const tokensDir = `${dataDir}/tokens`;
 

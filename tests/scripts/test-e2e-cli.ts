@@ -12,8 +12,7 @@
 
 import { execSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import * as path from 'node:path';
+import { rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 // =============================================================================
 // Constants

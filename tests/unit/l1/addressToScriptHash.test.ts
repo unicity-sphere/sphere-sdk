@@ -5,7 +5,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { addressToScriptHash } from '../../../l1/addressToScriptHash';
-import { encodeBech32, decodeBech32 } from '../../../core/bech32';
+import { encodeBech32 } from '../../../core/bech32';
 
 // =============================================================================
 // addressToScriptHash Tests

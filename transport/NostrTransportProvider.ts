@@ -1369,6 +1369,7 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const pm = NIP17.unwrap(event as any, this.keyManager);
       this.log('Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
 

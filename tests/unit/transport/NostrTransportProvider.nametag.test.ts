@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Tests for NostrTransportProvider nametag functionality
  * Covers resolveNametagInfo, recoverNametag, and nametag encryption

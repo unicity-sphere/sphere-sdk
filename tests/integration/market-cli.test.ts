@@ -9,7 +9,7 @@
  * - Error messages reference correct types
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as path from 'node:path';
@@ -30,6 +30,7 @@ async function runCli(
       env: { ...process.env, NODE_NO_WARNINGS: '1' },
     });
     return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } catch (err: any) {
     return {
       stdout: err.stdout ?? '',

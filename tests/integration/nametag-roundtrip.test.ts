@@ -11,7 +11,6 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { NOSTR_EVENT_KINDS } from '../../constants';
 
 // =============================================================================
 // Mock relay event store (simulates relay behavior at NostrClient level)
@@ -90,7 +89,9 @@ const mockSubscribe = vi.fn().mockImplementation((filter: unknown, callbacks: {
 }) => {
   const subId = 'sub-' + Math.random().toString(36).slice(2, 8);
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const filterObj = typeof (filter as any).toJSON === 'function'
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ? (filter as any).toJSON()
     : filter as Record<string, unknown>;
 

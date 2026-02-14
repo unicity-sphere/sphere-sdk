@@ -71,7 +71,9 @@ describe('createScriptPubKey()', () => {
   });
 
   it('should throw for null/undefined', () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(() => createScriptPubKey(null as any)).toThrow();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect(() => createScriptPubKey(undefined as any)).toThrow();
   });
 });

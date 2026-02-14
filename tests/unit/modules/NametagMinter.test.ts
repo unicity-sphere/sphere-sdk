@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Tests for modules/payments/NametagMinter.ts
  * Covers nametag minting interface and configuration

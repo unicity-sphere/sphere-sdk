@@ -10,7 +10,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
-import type { Token, FullIdentity, SphereEventType, SphereEventMap } from '../../../types';
+import type { Token, FullIdentity } from '../../../types';
 import type { TombstoneEntry } from '../../../types/txf';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
@@ -81,7 +81,7 @@ const TOKEN_ID_A = 'aaaa00000000000000000000000000000000000000000000000000000000
 const TOKEN_ID_B = 'bbbb000000000000000000000000000000000000000000000000000000000002';
 const STATE_HASH_1 = '1111000000000000000000000000000000000000000000000000000000000001';
 const STATE_HASH_2 = '2222000000000000000000000000000000000000000000000000000000000002';
-const STATE_HASH_3 = '3333000000000000000000000000000000000000000000000000000000000003';
+const _STATE_HASH_3 = '3333000000000000000000000000000000000000000000000000000000000003';
 
 // =============================================================================
 // Test Helpers

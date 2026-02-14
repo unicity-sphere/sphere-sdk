@@ -436,7 +436,7 @@ function printReport(measurements: TransferMeasurement[]): void {
 
 async function main(): Promise<void> {
   const doCleanup = process.argv.includes('--cleanup');
-  const runsArg = process.argv.indexOf('--runs');
+  const _runsArg = process.argv.indexOf('--runs');
   const testRunId = generateTestRunId();
 
   const aliceNametag = `pf${testRunId}a`;

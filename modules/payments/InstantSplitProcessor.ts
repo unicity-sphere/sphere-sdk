@@ -138,7 +138,7 @@ export class InstantSplitProcessor {
 
       // === Step 1: Validate burn transaction ===
       const burnTxJson = JSON.parse(bundle.burnTransaction);
-      const burnTransaction = await TransferTransaction.fromJSON(burnTxJson);
+      const _burnTransaction = await TransferTransaction.fromJSON(burnTxJson);
       console.log('[InstantSplitProcessor] Burn transaction validated');
 
       // === Step 2: Deserialize and submit MintCommitment ===

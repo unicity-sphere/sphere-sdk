@@ -18,7 +18,7 @@ import type { Token } from '../../../types';
 // =============================================================================
 
 const mockRequestIdCreate = vi.fn();
-const mockRequestIdToBitString = vi.fn();
+const _mockRequestIdToBitString = vi.fn();
 const mockDataHashFromJSON = vi.fn();
 const mockSdkTokenFromJSON = vi.fn();
 

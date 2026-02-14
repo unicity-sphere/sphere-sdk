@@ -3,7 +3,7 @@
  * Covers syncNametagWithNostr() functionality
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { StorageProvider, OracleProvider, TransportProvider } from '../../../index';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 
@@ -11,7 +11,7 @@ import type { FullIdentity, ProviderStatus } from '../../../types';
 // Mock Providers
 // =============================================================================
 
-function createMockStorage(): StorageProvider & { _data: Map<string, string> } {
+function _createMockStorage(): StorageProvider & { _data: Map<string, string> } {
   const data = new Map<string, string>();
 
   return {
@@ -56,7 +56,7 @@ function createMockStorage(): StorageProvider & { _data: Map<string, string> } {
   };
 }
 
-function createMockOracle(): OracleProvider {
+function _createMockOracle(): OracleProvider {
   return {
     id: 'mock-oracle',
     name: 'Mock Oracle',

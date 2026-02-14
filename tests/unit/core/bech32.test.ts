@@ -14,6 +14,7 @@ import {
   CHARSET,
 } from '../../../core/bech32';
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 import { BECH32_VECTORS } from '../../fixtures/test-vectors';
 
 // =============================================================================

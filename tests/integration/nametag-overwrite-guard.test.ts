@@ -396,7 +396,7 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     });
 
     expect(sphere1.identity!.nametag).toBe('dave');
-    const directAddr = sphere1.identity!.directAddress!;
+    const _directAddr = sphere1.identity!.directAddress!;
 
     await sphere1.destroy();
     (Sphere as unknown as { instance: null }).instance = null;

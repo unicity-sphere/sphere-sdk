@@ -20,9 +20,6 @@ import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
 import { HashAlgorithm } from '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm';
 import { UnmaskedPredicate } from '@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicate';
-import { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
-import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/MintTransactionData';
-import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import type { SigningService } from '@unicitylabs/state-transition-sdk/lib/sign/SigningService';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
@@ -33,7 +30,6 @@ import type {
   SplitRecoveryResult,
 } from '../../types/instant-split';
 import type { TransportProvider } from '../../transport';
-import type { StorageProvider } from '../../storage';
 
 // =============================================================================
 // Types
@@ -212,12 +208,12 @@ export class TokenRecoveryService {
     try {
       // Parse bundle for token type if available
       let tokenType: TokenType | undefined;
-      let coinId: CoinId | undefined;
+      let _coinId: CoinId | undefined;
 
       if (bundleJson) {
         const bundle = JSON.parse(bundleJson) as InstantSplitBundleV5;
         tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
-        coinId = new CoinId(fromHex(bundle.coinId));
+        _coinId = new CoinId(fromHex(bundle.coinId));
       }
 
       if (!tokenType) {
@@ -233,7 +229,7 @@ export class TokenRecoveryService {
         HashAlgorithm.SHA256,
         senderSalt
       );
-      const state = new TokenState(predicate, null);
+      const _state = new TokenState(predicate, null);
 
       // Try to get the proof from the aggregator
       // The mint was submitted in background, so it might exist
@@ -261,8 +257,8 @@ export class TokenRecoveryService {
    * @returns Recovery result
    */
   async recoverSentTokens(
-    transport: TransportProvider,
-    options?: RecoverSentOptions
+    _transport: TransportProvider,
+    _options?: RecoverSentOptions
   ): Promise<SplitRecoveryResult> {
     const startTime = performance.now();
     const result: SplitRecoveryResult = {
@@ -297,13 +293,13 @@ export class TokenRecoveryService {
    */
   async recoverSplitBurnFailure(
     splitGroupId: string,
-    burnRequestIdHex: string,
+    _burnRequestIdHex: string,
     seedString: string,
-    tokenType: TokenType,
-    coinId: CoinId,
-    splitAmount: bigint,
-    changeAmount: bigint,
-    onTokenRecovered?: (token: Token<any>, isChange: boolean) => Promise<void>
+    _tokenType: TokenType,
+    _coinId: CoinId,
+    _splitAmount: bigint,
+    _changeAmount: bigint,
+    _onTokenRecovered?: (token: Token<any>, isChange: boolean) => Promise<void>
   ): Promise<SplitRecoveryResult> {
     const startTime = performance.now();
     const result: SplitRecoveryResult = {
@@ -317,10 +313,10 @@ export class TokenRecoveryService {
       console.log(`[Recovery] Attempting burn failure recovery for ${splitGroupId}`);
 
       // Regenerate the token IDs and salts
-      const recipientTokenId = new TokenId(await sha256(seedString));
+      const _recipientTokenId = new TokenId(await sha256(seedString));
       const senderTokenId = new TokenId(await sha256(seedString + '_sender'));
-      const recipientSalt = await sha256(seedString + '_recipient_salt');
-      const senderSalt = await sha256(seedString + '_sender_salt');
+      const _recipientSalt = await sha256(seedString + '_recipient_salt');
+      const _senderSalt = await sha256(seedString + '_sender_salt');
 
       // Note: Full recovery would require:
       // 1. Querying the aggregator for the burn transaction

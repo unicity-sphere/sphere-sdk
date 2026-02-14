@@ -332,6 +332,7 @@ describe('Tracked addresses integration', () => {
       const oracle = createMockOracle();
 
       // --- Create wallet with multiple addresses ---
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       const { sphere, generatedMnemonic } = await Sphere.init({
         storage,
         transport,

@@ -180,6 +180,7 @@ describe('MarketModule integration with Sphere', () => {
       );
 
       await sphere.market!.search('test');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const fetchCalls = (globalThis.fetch as any).mock.calls;
       const lastCall = fetchCalls[fetchCalls.length - 1];
       expect(lastCall[0]).toContain('https://custom-market.api');
@@ -423,7 +424,7 @@ describe('MarketModule integration with Sphere', () => {
         autoGenerate: true,
       });
 
-      const market1 = sphere.market;
+      const _market1 = sphere.market;
 
       // Switch to address 1
       await sphere.switchToAddress(1);
@@ -692,6 +693,7 @@ describe('MarketModule integration with Sphere', () => {
       expect(result.intents).toEqual([]);
 
       // Verify it was called with correct URL
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const fetchCalls = (globalThis.fetch as any).mock.calls;
       expect(fetchCalls[0][0]).toContain('https://test.market/api/search');
 

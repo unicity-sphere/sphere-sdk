@@ -655,7 +655,7 @@ describe('TransferResult.tokenTransfers', () => {
 
 describe('TokenTransferDetail type export', () => {
   it('should export TokenTransferDetail from types', async () => {
-    const { TokenTransferDetail } = await import('../../../types') as Record<string, unknown>;
+    const { TokenTransferDetail: _TokenTransferDetail } = await import('../../../types') as Record<string, unknown>;
     // TypeScript interface — only exists at compile time, but the import should not throw
     // We verify the type is usable at compile time via the type annotation below
     const detail: TokenTransferDetail = {

@@ -144,6 +144,7 @@ describe('IpfsHttpClient', () => {
     });
 
     it('should return cached content without network call', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       cache.setContent(testCid, testData as any);
 
       const result = await client.fetchContent(testCid);

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IpfsStorageProvider } from '../../../../../impl/shared/ipfs/ipfs-storage-provider';
 import { InMemoryIpfsStatePersistence } from '../../../../../impl/shared/ipfs/ipfs-state-persistence';
@@ -904,7 +905,7 @@ describe('IpfsStorageProvider', () => {
 
     it('multiple rapid save() calls coalesce into single flush', async () => {
       let ipfsAddCount = 0;
-      vi.mocked(fetch).mockImplementation(async (_url, opts) => {
+      vi.mocked(fetch).mockImplementation(async (_url, _opts) => {
         const url = String(_url);
         if (url.includes('/api/v0/add')) {
           ipfsAddCount++;
@@ -928,7 +929,7 @@ describe('IpfsStorageProvider', () => {
 
     it('shutdown() drains pending buffer', async () => {
       let ipfsAddCount = 0;
-      vi.mocked(fetch).mockImplementation(async (_url, opts) => {
+      vi.mocked(fetch).mockImplementation(async (_url, _opts) => {
         const url = String(_url);
         if (url.includes('/api/v0/add')) {
           ipfsAddCount++;

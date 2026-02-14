@@ -17,7 +17,6 @@ import type { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/trans
 import type { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
-import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 
 // =============================================================================
 // Types

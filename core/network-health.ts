@@ -220,7 +220,7 @@ async function checkWebSocket(url: string, timeoutMs: number): Promise<ServiceHe
       }
     };
 
-    ws.onerror = (event) => {
+    ws.onerror = (_event) => {
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);

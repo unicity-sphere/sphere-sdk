@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * Tests for modules/market/MarketModule.ts
  */
@@ -382,7 +383,7 @@ describe('MarketModule', () => {
 
       // Verify signature is for the correct message (body + timestamp)
       const body = JSON.parse(bodyStr);
-      const payload = JSON.stringify({ body, timestamp });
+      const _payload = JSON.stringify({ body, timestamp });
 
       // Create a signature for DIFFERENT data and verify it's different
       const differentBody = { ...body, test: 'different' };

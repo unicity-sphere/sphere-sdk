@@ -53,8 +53,8 @@ export async function createSignedRecord(
 ): Promise<Uint8Array> {
   const { createIPNSRecord, marshalIPNSRecord } = await loadIpnsModule();
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const record = await createIPNSRecord(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     keyPair as any,
     `/ipfs/${cid}`,
     sequenceNumber,

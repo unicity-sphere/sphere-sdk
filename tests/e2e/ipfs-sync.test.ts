@@ -93,6 +93,7 @@ describe('IPFS Sync E2E', () => {
     const loadResult = await provider.load();
     expect(loadResult.success).toBe(true);
     expect(loadResult.data).toBeTruthy();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     expect((loadResult.data as any)._testtoken1?.coinId).toBe('UCT');
   }, 60000);
 
@@ -198,6 +199,7 @@ describe('IPFS Sync E2E', () => {
     expect(recovered!.data).toBeTruthy();
 
     // Verify the recovered inventory matches what was saved
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data = recovered!.data as any;
     expect(data._tokenAlpha?.coinId).toBe('UCT');
     expect(data._tokenAlpha?.amount).toBe('5000000');
@@ -293,6 +295,7 @@ describe('IPFS Sync E2E', () => {
     for (let attempt = 1; attempt <= 12; attempt++) {
       syncResult = await staleProvider.sync(staleLocalData);
       if (syncResult.success && syncResult.merged) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const m = syncResult.merged as any;
         if (m._tokenC) {
           console.log(`Sync resolved remote on attempt ${attempt}`);
@@ -304,6 +307,7 @@ describe('IPFS Sync E2E', () => {
     }
 
     expect(syncResult!.success).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const merged = syncResult!.merged as any;
 
     // ALL 3 tokens must be present — tokenC from remote must NOT be lost

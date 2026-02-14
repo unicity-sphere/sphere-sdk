@@ -1684,23 +1684,24 @@ export class GroupChatModule {
   ): Promise<T> {
     return new Promise((resolve) => {
       let done = false;
-      let subId: string | undefined;
+      const state: { subId?: string } = {};
 
       const finish = () => {
         if (done) return;
         done = true;
-        if (subId) {
-          try { this.client!.unsubscribe(subId); } catch { /* ignore */ }
-          const idx = this.subscriptionIds.indexOf(subId);
+        if (state.subId) {
+          try { this.client!.unsubscribe(state.subId); } catch { /* ignore */ }
+          const idx = this.subscriptionIds.indexOf(state.subId);
           if (idx >= 0) this.subscriptionIds.splice(idx, 1);
         }
         resolve(opts.onComplete());
       };
 
-      subId = this.client!.subscribe(filter, {
+      const subId = this.client!.subscribe(filter, {
         onEvent: (event: Event) => { if (!done) opts.onEvent(event); },
         onEndOfStoredEvents: finish,
       });
+      state.subId = subId;
       this.subscriptionIds.push(subId);
 
       setTimeout(finish, opts.timeoutMs ?? 5000);

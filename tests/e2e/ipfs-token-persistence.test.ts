@@ -29,7 +29,6 @@ import {
   ensureTrustbase,
   makeProviders,
   createNoopTransport,
-  requestFaucet,
   requestMultiCoinFaucet,
   getBalance,
   getTokenIds,

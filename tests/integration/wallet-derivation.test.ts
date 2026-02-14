@@ -635,7 +635,7 @@ describe('Derivation edge cases', () => {
 
   it('should produce different addresses for different indices', () => {
     // BIP32
-    const mk: MasterKey = {
+    const _mk: MasterKey = {
       privateKey: BIP32_WALLET.masterKey,
       chainCode: BIP32_WALLET.chainCode,
     };

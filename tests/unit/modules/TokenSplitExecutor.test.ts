@@ -50,8 +50,11 @@ describe('TokenSplitExecutor', () => {
 
       const executor = new TokenSplitExecutor(config);
       // Access private fields via any
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((executor as any).client).toBe(stClient);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((executor as any).trustBase).toBe(trustBase);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((executor as any).signingService).toBe(signingService);
     });
   });
