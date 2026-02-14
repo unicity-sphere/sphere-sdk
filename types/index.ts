@@ -369,6 +369,8 @@ export type SphereEventType =
   | 'payment_request:paid'
   | 'payment_request:response'
   | 'message:dm'
+  | 'message:read'
+  | 'message:typing'
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
@@ -400,6 +402,8 @@ export interface SphereEventMap {
   'payment_request:paid': IncomingPaymentRequest;
   'payment_request:response': PaymentRequestResponse;
   'message:dm': DirectMessage;
+  'message:read': { messageIds: string[]; peerPubkey: string };
+  'message:typing': { senderPubkey: string; senderNametag?: string; timestamp: number };
   'message:broadcast': BroadcastMessage;
   'sync:started': { source: string };
   'sync:completed': { source: string; count: number };

@@ -245,48 +245,70 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   async clear(): Promise<boolean> {
-    // Close the open connection so deleteDatabase isn't blocked
-    if (this.db) {
-      this.db.close();
-      this.db = null;
-    }
-    this.status = 'disconnected';
-
-    const CLEAR_TIMEOUT = 1500;
-
-    const withTimeout = <T>(promise: Promise<T>, ms: number, label: string): Promise<T> =>
-      Promise.race([
-        promise,
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
-        ),
-      ]);
-
-    const deleteDb = (name: string) =>
-      new Promise<void>((resolve) => {
-        const req = indexedDB.deleteDatabase(name);
-        req.onsuccess = () => resolve();
-        req.onerror = () => resolve();
-        req.onblocked = () => resolve();
-      });
+    // Strategy: first clear store contents (reliable, immediate), then
+    // attempt deleteDatabase (best-effort, may be blocked by open connections).
+    // This guarantees data is wiped even if deleteDatabase silently fails.
+    const dbNames: string[] = [this.dbName];
 
     try {
-      // Delete all databases matching our prefix (covers all addresses)
-      if (typeof indexedDB.databases === 'function') {
-        const dbs = await withTimeout(
-          indexedDB.databases(),
-          CLEAR_TIMEOUT,
-          'indexedDB.databases()',
-        );
-        await Promise.all(
-          dbs
-            .filter(db => db.name?.startsWith(this.dbNamePrefix))
-            .map(db => deleteDb(db.name!)),
-        );
-      } else {
-        // Fallback: delete only the current database
-        await deleteDb(this.dbName);
+      // 1. Clear current database contents
+      if (this.db) {
+        await this.clearStore(STORE_TOKENS);
+        await this.clearStore(STORE_META);
+        this.db.close();
+        this.db = null;
       }
+      this.status = 'disconnected';
+
+      // 2. Collect and clear other per-address databases
+      if (typeof indexedDB.databases === 'function') {
+        try {
+          const dbs = await Promise.race([
+            indexedDB.databases(),
+            new Promise<IDBDatabaseInfo[]>((_, reject) =>
+              setTimeout(() => reject(new Error('timeout')), 1500),
+            ),
+          ]);
+          for (const dbInfo of dbs) {
+            if (dbInfo.name && dbInfo.name.startsWith(this.dbNamePrefix) && dbInfo.name !== this.dbName) {
+              dbNames.push(dbInfo.name);
+              try {
+                const db = await new Promise<IDBDatabase>((resolve, reject) => {
+                  const req = indexedDB.open(dbInfo.name!, DB_VERSION);
+                  req.onsuccess = () => resolve(req.result);
+                  req.onerror = () => reject(req.error);
+                  req.onupgradeneeded = (e) => {
+                    const d = (e.target as IDBOpenDBRequest).result;
+                    if (!d.objectStoreNames.contains(STORE_TOKENS)) d.createObjectStore(STORE_TOKENS, { keyPath: 'id' });
+                    if (!d.objectStoreNames.contains(STORE_META)) d.createObjectStore(STORE_META);
+                  };
+                });
+                const clearTx = db.transaction([STORE_TOKENS, STORE_META], 'readwrite');
+                clearTx.objectStore(STORE_TOKENS).clear();
+                clearTx.objectStore(STORE_META).clear();
+                await new Promise<void>((resolve) => { clearTx.oncomplete = () => resolve(); clearTx.onerror = () => resolve(); });
+                db.close();
+              } catch {
+                // Best effort
+              }
+            }
+          }
+        } catch {
+          // Timeout or unsupported
+        }
+      }
+
+      // 3. Attempt to delete all databases (best-effort, fire-and-forget)
+      for (const name of dbNames) {
+        try {
+          const req = indexedDB.deleteDatabase(name);
+          req.onerror = () => {};
+          req.onblocked = () => {};
+        } catch {
+          // Ignore
+        }
+      }
+
       return true;
     } catch (err) {
       console.warn('[IndexedDBTokenStorage] clear() failed:', err);
