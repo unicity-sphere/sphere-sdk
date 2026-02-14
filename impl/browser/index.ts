@@ -359,9 +359,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
-  const priceConfig = resolvePriceConfig(config?.price);
 
   const storage = createLocalStorageProvider(config?.storage);
+  const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsConfig = tokenSyncConfig?.ipfs;

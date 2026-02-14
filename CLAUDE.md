@@ -420,6 +420,19 @@ npm run typecheck
 
 **tsup bundle duplication note:** tsup compiles multiple entry points (`index.ts`, `impl/browser/index.ts`, etc.) into separate bundles, each inlining its own copy of `TokenRegistry`. The static singleton in `dist/impl/browser/index.js` is a different instance from the one in `dist/index.js`. This is why `Sphere` must call `TokenRegistry.configure()` in its own bundle context, not rely on the factory functions alone.
 
+### Price Provider (CoinGecko)
+- `CoinGeckoPriceProvider` fetches token prices from CoinGecko API with multi-layer caching
+- **In-memory cache:** prices cached with configurable TTL (`cacheTtlMs`, default 60s)
+- **Persistent cache:** when `StorageProvider` is passed, prices are persisted to survive page reloads
+  - Cache keys: `STORAGE_KEYS_GLOBAL.PRICE_CACHE` (JSON) and `PRICE_CACHE_TS` (timestamp)
+  - On first `getPrices()` call: loads from storage if within TTL, populates in-memory cache
+  - After each successful API fetch: saves all cached prices to storage (fire-and-forget)
+  - Factory functions (`createBrowserProviders`, `createNodeProviders`) pass storage automatically
+- **Unlisted tokens:** tokens not found on CoinGecko (e.g., UCT, USDU) are cached with zero-price `TokenPrice` entries (`priceUsd: 0`), persisted to storage, and not re-requested until TTL expires
+- **Request deduplication:** concurrent `getPrices()` calls share an in-flight fetch promise if all requested tokens are covered by the current request
+- **Rate-limit backoff:** on 429 response, extends stale cache entries by 60s to prevent retry hammering
+- **Error resilience:** on fetch failure, returns stale cached data if available; corrupted storage data is silently ignored
+
 ### Event Timestamp Persistence
 - Transport persists last processed wallet event timestamp via `TransportStorageAdapter`
 - Storage key: `last_wallet_event_ts_{pubkey_prefix}` (per-wallet, in `STORAGE_KEYS_GLOBAL`)
@@ -442,7 +455,7 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1335 (53 test files)
+**Total tests:** 1348 (53 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
@@ -450,7 +463,7 @@ Key test files:
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
-- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider
+- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider: caching, deduplication, rate-limit backoff, persistent storage, unlisted tokens
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
 - `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry

@@ -5,6 +5,8 @@
  * Does not extend BaseProvider — stateless HTTP client with internal caching.
  */
 
+import type { StorageProvider } from '../storage';
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -46,6 +48,8 @@ export interface PriceProviderConfig {
   timeout?: number;
   /** Enable debug logging */
   debug?: boolean;
+  /** StorageProvider for persistent caching across page reloads (optional) */
+  storage?: StorageProvider;
 }
 
 // =============================================================================
@@ -79,7 +83,7 @@ export interface PriceProvider {
   /**
    * Get price for a single token
    * @param tokenName - Token name (e.g., 'bitcoin')
-   * @returns Token price or null if not available
+   * @returns Token price (zero-price entry for tokens not listed on the platform), or null on network error with no cache
    */
   getPrice(tokenName: string): Promise<TokenPrice | null>;
 

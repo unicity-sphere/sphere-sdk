@@ -3,8 +3,11 @@
  *
  * Fetches token prices from CoinGecko API with internal caching.
  * Supports both free and pro API tiers.
+ * Optionally persists cache to StorageProvider for survival across page reloads.
  */
 
+import { STORAGE_KEYS_GLOBAL } from '../constants';
+import type { StorageProvider } from '../storage';
 import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } from './price-provider';
 
 // =============================================================================
@@ -12,9 +15,13 @@ import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } fr
 // =============================================================================
 
 interface CacheEntry {
-  /** Token price, or null if the token was not found on the platform */
-  price: TokenPrice | null;
+  price: TokenPrice;
   expiresAt: number;
+}
+
+/** Serializable format for persistent storage */
+interface PersistedPriceCache {
+  [tokenName: string]: TokenPrice;
 }
 
 // =============================================================================
@@ -32,6 +39,9 @@ interface CacheEntry {
  * // Pro tier
  * const provider = new CoinGeckoPriceProvider({ apiKey: 'CG-xxx' });
  *
+ * // With persistent cache (survives page reloads)
+ * const provider = new CoinGeckoPriceProvider({ storage: myStorageProvider });
+ *
  * const prices = await provider.getPrices(['bitcoin', 'ethereum']);
  * console.log(prices.get('bitcoin')?.priceUsd);
  * ```
@@ -45,12 +55,23 @@ export class CoinGeckoPriceProvider implements PriceProvider {
   private readonly timeout: number;
   private readonly debug: boolean;
   private readonly baseUrl: string;
+  private readonly storage: StorageProvider | null;
+
+  /** In-flight fetch promise for deduplication of concurrent getPrices() calls */
+  private fetchPromise: Promise<Map<string, TokenPrice>> | null = null;
+  /** Token names being fetched in the current in-flight request */
+  private fetchNames: Set<string> | null = null;
+  /** Whether persistent cache has been loaded into memory */
+  private persistentCacheLoaded = false;
+  /** Promise for loading persistent cache (deduplication) */
+  private loadCachePromise: Promise<void> | null = null;
 
   constructor(config?: Omit<PriceProviderConfig, 'platform'>) {
     this.apiKey = config?.apiKey;
     this.cacheTtlMs = config?.cacheTtlMs ?? 60_000;
     this.timeout = config?.timeout ?? 10_000;
     this.debug = config?.debug ?? false;
+    this.storage = config?.storage ?? null;
 
     this.baseUrl = config?.baseUrl
       ?? (this.apiKey
@@ -63,6 +84,11 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       return new Map();
     }
 
+    // Load persistent cache on first call (once)
+    if (!this.persistentCacheLoaded && this.storage) {
+      await this.loadFromStorage();
+    }
+
     const now = Date.now();
     const result = new Map<string, TokenPrice>();
     const uncachedNames: string[] = [];
@@ -71,10 +97,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     for (const name of tokenNames) {
       const cached = this.cache.get(name);
       if (cached && cached.expiresAt > now) {
-        // null = negative cache (token not found on platform), skip adding to result
-        if (cached.price !== null) {
-          result.set(name, cached.price);
-        }
+        result.set(name, cached.price);
       } else {
         uncachedNames.push(name);
       }
@@ -85,7 +108,49 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       return result;
     }
 
+    // Deduplicate concurrent calls: if an in-flight fetch covers all needed tokens, reuse it
+    if (this.fetchPromise && this.fetchNames) {
+      const allCovered = uncachedNames.every((n) => this.fetchNames!.has(n));
+      if (allCovered) {
+        if (this.debug) {
+          console.log(`[CoinGecko] Deduplicating request, reusing in-flight fetch`);
+        }
+        const fetched = await this.fetchPromise;
+        for (const name of uncachedNames) {
+          const price = fetched.get(name);
+          if (price) {
+            result.set(name, price);
+          }
+        }
+        return result;
+      }
+    }
+
     // Fetch uncached prices
+    const fetchPromise = this.doFetch(uncachedNames);
+    this.fetchPromise = fetchPromise;
+    this.fetchNames = new Set(uncachedNames);
+
+    try {
+      const fetched = await fetchPromise;
+      for (const [name, price] of fetched) {
+        result.set(name, price);
+      }
+    } finally {
+      // Clear in-flight state only if this is still the current request
+      if (this.fetchPromise === fetchPromise) {
+        this.fetchPromise = null;
+        this.fetchNames = null;
+      }
+    }
+
+    return result;
+  }
+
+  private async doFetch(uncachedNames: string[]): Promise<Map<string, TokenPrice>> {
+    const result = new Map<string, TokenPrice>();
+    const now = Date.now();
+
     try {
       const ids = uncachedNames.join(',');
       const url = `${this.baseUrl}/simple/price?ids=${encodeURIComponent(ids)}&vs_currencies=usd,eur&include_24hr_change=true`;
@@ -105,6 +170,10 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       });
 
       if (!response.ok) {
+        // On rate-limit, extend existing cache entries to avoid hammering the API
+        if (response.status === 429) {
+          this.extendCacheOnRateLimit(uncachedNames);
+        }
         throw new Error(`CoinGecko API error: ${response.status} ${response.statusText}`);
       }
 
@@ -125,16 +194,28 @@ export class CoinGeckoPriceProvider implements PriceProvider {
         }
       }
 
-      // Negative cache: tokens not found on CoinGecko won't be re-requested until TTL expires
+      // Tokens not found on CoinGecko: cache with zero prices to avoid re-requesting
+      // and to persist in storage (so page reloads don't trigger unnecessary API calls)
       for (const name of uncachedNames) {
         if (!result.has(name)) {
-          this.cache.set(name, { price: null, expiresAt: now + this.cacheTtlMs });
+          const zeroPrice: TokenPrice = {
+            tokenName: name,
+            priceUsd: 0,
+            priceEur: 0,
+            change24h: 0,
+            timestamp: now,
+          };
+          this.cache.set(name, { price: zeroPrice, expiresAt: now + this.cacheTtlMs });
+          result.set(name, zeroPrice);
         }
       }
 
       if (this.debug) {
         console.log(`[CoinGecko] Fetched ${result.size} prices`);
       }
+
+      // Persist to storage (fire-and-forget)
+      this.saveToStorage();
     } catch (error) {
       if (this.debug) {
         console.warn('[CoinGecko] Fetch failed, using stale cache:', error);
@@ -143,13 +224,115 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       // On error, return stale cached data if available
       for (const name of uncachedNames) {
         const stale = this.cache.get(name);
-        if (stale?.price) {
+        if (stale) {
           result.set(name, stale.price);
         }
       }
     }
 
     return result;
+  }
+
+  // ===========================================================================
+  // Persistent Storage
+  // ===========================================================================
+
+  /**
+   * Load cached prices from StorageProvider into in-memory cache.
+   * Only loads entries that are still within cacheTtlMs.
+   */
+  private async loadFromStorage(): Promise<void> {
+    // Deduplicate concurrent loads
+    if (this.loadCachePromise) {
+      return this.loadCachePromise;
+    }
+    this.loadCachePromise = this.doLoadFromStorage();
+    try {
+      await this.loadCachePromise;
+    } finally {
+      this.loadCachePromise = null;
+    }
+  }
+
+  private async doLoadFromStorage(): Promise<void> {
+    this.persistentCacheLoaded = true;
+    if (!this.storage) return;
+
+    try {
+      const [cached, cachedTs] = await Promise.all([
+        this.storage.get(STORAGE_KEYS_GLOBAL.PRICE_CACHE),
+        this.storage.get(STORAGE_KEYS_GLOBAL.PRICE_CACHE_TS),
+      ]);
+
+      if (!cached || !cachedTs) return;
+
+      const ts = parseInt(cachedTs, 10);
+      if (isNaN(ts)) return;
+
+      // Only use if within TTL
+      const age = Date.now() - ts;
+      if (age > this.cacheTtlMs) return;
+
+      const data: PersistedPriceCache = JSON.parse(cached);
+      const expiresAt = ts + this.cacheTtlMs;
+
+      for (const [name, price] of Object.entries(data)) {
+        // Only populate if not already in memory (in-memory is always fresher)
+        if (!this.cache.has(name)) {
+          this.cache.set(name, { price, expiresAt });
+        }
+      }
+
+      if (this.debug) {
+        console.log(`[CoinGecko] Loaded ${Object.keys(data).length} prices from persistent cache`);
+      }
+    } catch {
+      // Cache load failure is non-critical
+    }
+  }
+
+  /**
+   * Save current prices to StorageProvider (fire-and-forget).
+   */
+  private saveToStorage(): void {
+    if (!this.storage) return;
+
+    const data: PersistedPriceCache = {};
+    for (const [name, entry] of this.cache) {
+      data[name] = entry.price;
+    }
+
+    // Fire-and-forget
+    Promise.all([
+      this.storage.set(STORAGE_KEYS_GLOBAL.PRICE_CACHE, JSON.stringify(data)),
+      this.storage.set(STORAGE_KEYS_GLOBAL.PRICE_CACHE_TS, String(Date.now())),
+    ]).catch(() => {
+      // Cache save failure is non-critical
+    });
+  }
+
+  // ===========================================================================
+  // Rate-limit handling
+  // ===========================================================================
+
+  /**
+   * On 429 rate-limit, extend stale cache entries so subsequent calls
+   * don't immediately retry and hammer the API.
+   */
+  private extendCacheOnRateLimit(names: string[]): void {
+    const backoffMs = 60_000; // 1 minute backoff on rate-limit
+    const extendedExpiry = Date.now() + backoffMs;
+
+    for (const name of names) {
+      const existing = this.cache.get(name);
+      if (existing) {
+        existing.expiresAt = Math.max(existing.expiresAt, extendedExpiry);
+      }
+    }
+
+    if (this.debug) {
+      console.warn(`[CoinGecko] Rate-limited (429), extended cache TTL by ${backoffMs / 1000}s`);
+    }
   }
 
   async getPrice(tokenName: string): Promise<TokenPrice | null> {

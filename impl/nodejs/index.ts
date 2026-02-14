@@ -176,12 +176,12 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   const transportConfig = resolveTransportConfig(network, config?.transport);
   const oracleConfig = resolveOracleConfig(network, config?.oracle);
   const l1Config = resolveL1Config(network, config?.l1);
-  const priceConfig = resolvePriceConfig(config?.price);
 
   const storage = createFileStorageProvider({
     dataDir: config?.dataDir ?? './sphere-data',
     ...(config?.walletFileName ? { fileName: config.walletFileName } : {}),
   });
+  const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled
   const ipfsSync = config?.tokenSync?.ipfs;

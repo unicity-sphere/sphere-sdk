@@ -13,6 +13,7 @@ import type {
   ResolvedOracleConfig,
 } from './config';
 import type { PriceProviderConfig } from '../../price';
+import type { StorageProvider } from '../../storage';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
 
 // =============================================================================
@@ -176,7 +177,8 @@ export function resolveL1Config(
  * ```
  */
 export function resolvePriceConfig(
-  config?: BasePriceConfig
+  config?: BasePriceConfig,
+  storage?: StorageProvider,
 ): PriceProviderConfig | undefined {
   if (config === undefined) {
     return undefined;
@@ -189,6 +191,7 @@ export function resolvePriceConfig(
     cacheTtlMs: config.cacheTtlMs,
     timeout: config.timeout,
     debug: config.debug,
+    storage,
   };
 }
 
