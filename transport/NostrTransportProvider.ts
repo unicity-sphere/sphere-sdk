@@ -23,6 +23,8 @@ import {
   hashNametag,
   NostrClient,
   Filter,
+  isChatMessage,
+  isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
 import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import type { ProviderStatus, FullIdentity } from '../types';
@@ -44,6 +46,10 @@ import type {
   TransportEvent,
   TransportEventCallback,
   PeerInfo,
+  ReadReceiptHandler,
+  IncomingReadReceipt,
+  TypingIndicatorHandler,
+  IncomingTypingIndicator,
 } from './transport-provider';
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
@@ -225,6 +231,8 @@ export class NostrTransportProvider implements TransportProvider {
   private transferHandlers: Set<TokenTransferHandler> = new Set();
   private paymentRequestHandlers: Set<PaymentRequestHandler> = new Set();
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
+  private readReceiptHandlers: Set<ReadReceiptHandler> = new Set();
+  private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
 
@@ -541,10 +549,25 @@ export class NostrTransportProvider implements TransportProvider {
       ? JSON.stringify({ senderNametag, text: content })
       : content;
 
-    // Create NIP-17 gift-wrapped message (kind 1059)
+    // Create NIP-17 gift-wrapped message (kind 1059) for recipient
     const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
 
     await this.publishEvent(giftWrap);
+
+    // NIP-17 self-wrap: send a copy to ourselves so relay can replay sent messages.
+    // Content includes recipientPubkey and originalId for dedup against the live-sent record.
+    const selfWrapContent = JSON.stringify({
+      selfWrap: true,
+      originalId: giftWrap.id,
+      recipientPubkey,
+      senderNametag,
+      text: content,
+    });
+    const selfPubkey = this.keyManager!.getPublicKeyHex();
+    const selfGiftWrap = NIP17.createGiftWrap(this.keyManager!, selfPubkey, selfWrapContent);
+    this.publishEvent(selfGiftWrap).catch(err => {
+      this.log('Self-wrap publish failed:', err);
+    });
 
     this.emitEvent({
       type: 'message:sent',
@@ -683,6 +706,52 @@ export class NostrTransportProvider implements TransportProvider {
   onPaymentRequestResponse(handler: PaymentRequestResponseHandler): () => void {
     this.paymentRequestResponseHandlers.add(handler);
     return () => this.paymentRequestResponseHandlers.delete(handler);
+  }
+
+  // ===========================================================================
+  // Read Receipts
+  // ===========================================================================
+
+  async sendReadReceipt(recipientTransportPubkey: string, messageEventId: string): Promise<void> {
+    if (!this.keyManager) throw new Error('Not initialized');
+
+    // NIP-17 uses x-only pubkeys (64 hex chars, no 02/03 prefix)
+    const nostrRecipient = recipientTransportPubkey.length === 66
+      ? recipientTransportPubkey.slice(2)
+      : recipientTransportPubkey;
+
+    const event = NIP17.createReadReceipt(this.keyManager, nostrRecipient, messageEventId);
+    await this.publishEvent(event);
+    this.log('Sent read receipt for:', messageEventId, 'to:', nostrRecipient.slice(0, 16));
+  }
+
+  onReadReceipt(handler: ReadReceiptHandler): () => void {
+    this.readReceiptHandlers.add(handler);
+    return () => this.readReceiptHandlers.delete(handler);
+  }
+
+  // ===========================================================================
+  // Typing Indicators
+  // ===========================================================================
+
+  async sendTypingIndicator(recipientTransportPubkey: string): Promise<void> {
+    if (!this.keyManager) throw new Error('Not initialized');
+
+    const nostrRecipient = recipientTransportPubkey.length === 66
+      ? recipientTransportPubkey.slice(2)
+      : recipientTransportPubkey;
+
+    const content = JSON.stringify({
+      type: 'typing',
+      senderNametag: this.identity?.nametag,
+    });
+    const event = NIP17.createGiftWrap(this.keyManager, nostrRecipient, content);
+    await this.publishEvent(event);
+  }
+
+  onTypingIndicator(handler: TypingIndicatorHandler): () => void {
+    this.typingIndicatorHandlers.add(handler);
+    return () => this.typingIndicatorHandlers.delete(handler);
   }
 
   /**
@@ -1302,12 +1371,72 @@ export class NostrTransportProvider implements TransportProvider {
     try {
       const pm = NIP17.unwrap(event as any, this.keyManager);
       this.log('Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
+
+      // Handle self-wrap (sent message copy for relay replay)
       if (pm.senderPubkey === this.keyManager.getPublicKeyHex()) {
-        this.log('Skipping own message');
+        try {
+          const parsed = JSON.parse(pm.content);
+          if (parsed?.selfWrap && parsed.recipientPubkey) {
+            this.log('Self-wrap replay for recipient:', parsed.recipientPubkey?.slice(0, 16));
+            const message: IncomingMessage = {
+              id: parsed.originalId || pm.eventId,
+              senderTransportPubkey: pm.senderPubkey,
+              senderNametag: parsed.senderNametag,
+              recipientTransportPubkey: parsed.recipientPubkey,
+              content: parsed.text ?? '',
+              timestamp: pm.timestamp * 1000,
+              encrypted: true,
+              isSelfWrap: true,
+            };
+            for (const handler of this.messageHandlers) {
+              try { handler(message); } catch (e) { this.log('Self-wrap handler error:', e); }
+            }
+            return;
+          }
+        } catch {
+          // Not JSON self-wrap
+        }
+        this.log('Skipping own non-self-wrap message');
         return;
       }
-      if (pm.kind !== EventKinds.CHAT_MESSAGE) {
-        this.log('Skipping non-chat message, kind:', pm.kind);
+
+      // Handle read receipts (kind 15)
+      if (isReadReceipt(pm)) {
+        this.log('Read receipt from:', pm.senderPubkey?.slice(0, 16), 'for:', pm.replyToEventId);
+        if (pm.replyToEventId) {
+          const receipt: IncomingReadReceipt = {
+            senderTransportPubkey: pm.senderPubkey,
+            messageEventId: pm.replyToEventId,
+            timestamp: pm.timestamp * 1000,
+          };
+          for (const handler of this.readReceiptHandlers) {
+            try { handler(receipt); } catch (e) { this.log('Read receipt handler error:', e); }
+          }
+        }
+        return;
+      }
+
+      // Handle typing indicators (JSON content with type: 'typing')
+      try {
+        const parsed = JSON.parse(pm.content);
+        if (parsed?.type === 'typing') {
+          this.log('Typing indicator from:', pm.senderPubkey?.slice(0, 16));
+          const indicator: IncomingTypingIndicator = {
+            senderTransportPubkey: pm.senderPubkey,
+            senderNametag: parsed.senderNametag,
+            timestamp: pm.timestamp * 1000,
+          };
+          for (const handler of this.typingIndicatorHandlers) {
+            try { handler(indicator); } catch (e) { this.log('Typing handler error:', e); }
+          }
+          return;
+        }
+      } catch {
+        // Not JSON — continue to chat message handling
+      }
+
+      if (!isChatMessage(pm)) {
+        this.log('Skipping unknown message kind:', pm.kind);
         return;
       }
 
@@ -1327,7 +1456,9 @@ export class NostrTransportProvider implements TransportProvider {
       this.log('DM received from:', senderNametag || pm.senderPubkey?.slice(0, 16), 'content:', content?.slice(0, 50));
 
       const message: IncomingMessage = {
-        id: pm.eventId,
+        // Use outer gift wrap event.id so it matches the sender's stored giftWrap.id.
+        // This ensures read receipts reference an ID the sender recognizes.
+        id: event.id,
         senderTransportPubkey: pm.senderPubkey,
         senderNametag,
         content,
