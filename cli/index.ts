@@ -174,6 +174,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     dataDir: config.dataDir,
     tokensDir: config.tokensDir,
     tokenSync: { ipfs: { enabled: true } },
+    market: true,
   });
 
   const initProviders = noNostrGlobal

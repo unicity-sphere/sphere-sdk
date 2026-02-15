@@ -126,6 +126,13 @@ export function getAddressId(directAddress: string): string {
 }
 
 // =============================================================================
+// Market Defaults
+// =============================================================================
+
+/** Default Market API URL (intent bulletin board) */
+export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network' as const;
+
+// =============================================================================
 // Nostr Defaults
 // =============================================================================
 

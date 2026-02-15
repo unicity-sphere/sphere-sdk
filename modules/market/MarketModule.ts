@@ -56,7 +56,7 @@ function signRequest(body: unknown, privateKeyHex: string): SignedRequest {
   return {
     body: JSON.stringify(body),
     headers: {
-      'x-signature': bytesToHex(signature),
+      'x-signature': bytesToHex(signature.toCompactRawBytes()),
       'x-public-key': publicKey,
       'x-timestamp': String(timestamp),
       'content-type': 'application/json',

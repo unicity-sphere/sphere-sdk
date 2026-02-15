@@ -108,6 +108,20 @@ export interface BasePriceConfig {
 }
 
 // =============================================================================
+// Market Configuration
+// =============================================================================
+
+/**
+ * Base market module configuration
+ */
+export interface BaseMarketConfig {
+  /** Market API base URL (default: https://market-api.unicity.network) */
+  apiUrl?: string;
+  /** Request timeout in ms (default: 30000) */
+  timeout?: number;
+}
+
+// =============================================================================
 // Provider Configuration
 // =============================================================================
 
