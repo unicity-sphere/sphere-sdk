@@ -187,22 +187,6 @@ export interface TransportProvider extends BaseProvider {
   onReadReceipt?(handler: ReadReceiptHandler): () => void;
 
   // ===========================================================================
-  // Typing Indicators
-  // ===========================================================================
-
-  /**
-   * Send typing indicator to a recipient
-   * @param recipientTransportPubkey - Transport pubkey of the conversation partner
-   */
-  sendTypingIndicator?(recipientTransportPubkey: string): Promise<void>;
-
-  /**
-   * Subscribe to incoming typing indicators
-   * @returns Unsubscribe function
-   */
-  onTypingIndicator?(handler: TypingIndicatorHandler): () => void;
-
-  // ===========================================================================
   // Dynamic Relay Management (optional)
   // ===========================================================================
 
@@ -530,18 +514,3 @@ export interface IncomingReadReceipt {
 }
 
 export type ReadReceiptHandler = (receipt: IncomingReadReceipt) => void;
-
-// =============================================================================
-// Typing Indicator Types
-// =============================================================================
-
-export interface IncomingTypingIndicator {
-  /** Transport-specific pubkey of the sender who is typing */
-  senderTransportPubkey: string;
-  /** Sender's nametag (if known) */
-  senderNametag?: string;
-  /** Timestamp */
-  timestamp: number;
-}
-
-export type TypingIndicatorHandler = (indicator: IncomingTypingIndicator) => void;
