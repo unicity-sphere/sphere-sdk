@@ -2,7 +2,28 @@
   "permissions": {
     "allow": [
       "Bash(npx tsc:*)",
-      "Bash(npx vitest:*)"
+      "Bash(npx vitest:*)",
+      "Bash(npm run lint:*)",
+      "Bash(npm run build:*)",
+      "Bash(npm run test:run:*)",
+      "Bash(gh:*)",
+      "Bash(git -C /home/vrogojin/sphere-sdk log --oneline a40ef48...bb299e2)",
+      "Bash(git -C /home/vrogojin/sphere-sdk diff bb299e2..a40ef48 --stat)",
+      "Bash(git -C /home/vrogojin/sphere-sdk diff bb299e2..a40ef48 -- cli/index.ts)",
+      "Bash(git -C /home/vrogojin/sphere-sdk diff bb299e2..a40ef48 -- core/Sphere.ts)",
+      "Bash(git -C /home/vrogojin/sphere-sdk diff bb299e2..a40ef48 -- constants.ts)",
+      "Bash(git -C /home/vrogojin/sphere-sdk status -u)",
+      "Bash(git -C /home/vrogojin/sphere-sdk add modules/market/MarketModule.ts modules/market/index.ts tests/integration/market-cli.test.ts tests/integration/market-module.test.ts tests/unit/modules/MarketModule.test.ts)",
+      "Bash(git -C:*)",
+      "Bash(git -C /home/vrogojin/sphere-sdk push)",
+      "Bash(xargs:*)",
+      "Bash(xargs node:*)",
+      "Bash(npm install:*)",
+      "Bash(node -e:*)",
+      "Bash(node:*)",
+      "Bash(npx tsx:*)",
+      "Bash(npm run test:e2e:*)",
+      "Bash(npm run test:relay:*)"
     ]
   }
 }
