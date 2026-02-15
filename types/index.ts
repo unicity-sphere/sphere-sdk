@@ -319,6 +319,12 @@ export interface BroadcastMessage {
   readonly tags?: string[];
 }
 
+export interface ComposingIndicator {
+  readonly senderPubkey: string;
+  readonly senderNametag?: string;
+  readonly expiresIn: number;
+}
+
 // =============================================================================
 // Tracked Addresses
 // =============================================================================
@@ -371,6 +377,7 @@ export type SphereEventType =
   | 'message:dm'
   | 'message:read'
   | 'message:typing'
+  | 'composing:started'
   | 'message:broadcast'
   | 'sync:started'
   | 'sync:completed'
@@ -404,6 +411,7 @@ export interface SphereEventMap {
   'message:dm': DirectMessage;
   'message:read': { messageIds: string[]; peerPubkey: string };
   'message:typing': { senderPubkey: string; senderNametag?: string; timestamp: number };
+  'composing:started': ComposingIndicator;
   'message:broadcast': BroadcastMessage;
   'sync:started': { source: string };
   'sync:completed': { source: string; count: number };

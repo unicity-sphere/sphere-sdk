@@ -175,6 +175,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     tokensDir: config.tokensDir,
     tokenSync: { ipfs: { enabled: true } },
     market: true,
+    groupChat: true,
   });
 
   const initProviders = noNostrGlobal
@@ -187,6 +188,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     mnemonic: options?.mnemonic,
     nametag: options?.nametag,
     market: true,
+    groupChat: true,
   });
 
   sphereInstance = result.sphere;
@@ -300,6 +302,28 @@ NAMETAGS:
   my-nametag                        Show current nametag
   nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
+MESSAGING (Direct Messages):
+  dm <@nametag> <message>            Send a direct message
+  dm-inbox                           List conversations and unread counts
+  dm-history <@nametag|pubkey>       Show conversation history
+                                     --limit <n>  Max messages (default: 50)
+
+GROUP CHAT (NIP-29):
+  group-create <name>                Create a new group
+                                     --description <text>  Group description
+                                     --private             Create private group
+  group-list                         List available groups on relay
+  group-my                           List your joined groups
+  group-join <groupId>               Join a group
+                                     --invite <code>       Invite code (for private groups)
+  group-leave <groupId>              Leave a group
+  group-send <groupId> <message>     Send a message to a group
+                                     --reply <eventId>     Reply to a message
+  group-messages <groupId>           Show group messages
+                                     --limit <n>           Max messages (default: 50)
+  group-members <groupId>            List group members
+  group-info <groupId>               Show group details
+
 MARKET (Intent Bulletin Board):
   market-post <desc> --type <type>     Post an intent (buy, sell, service, announcement, other)
                                       --category <cat>   Intent category
@@ -364,6 +388,20 @@ Wallet Profile Examples:
   npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
   npm run cli -- wallet use bob                   Switch to bob
   npm run cli -- balance                          Check bob's balance
+
+Messaging Examples:
+  npm run cli -- dm @alice "Hello, how are you?"
+  npm run cli -- dm-inbox
+  npm run cli -- dm-history @alice --limit 20
+
+Group Chat Examples:
+  npm run cli -- group-list
+  npm run cli -- group-create "Trading Chat" --description "Discuss trades"
+  npm run cli -- group-join <groupId>
+  npm run cli -- group-send <groupId> "Hello everyone!"
+  npm run cli -- group-messages <groupId> --limit 20
+  npm run cli -- group-members <groupId>
+  npm run cli -- group-leave <groupId>
 
 Market Examples:
   npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
@@ -1008,6 +1046,9 @@ async function main() {
         }
         const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
 
+        // Initialize Sphere first so TokenRegistry is loaded
+        const sphere = await getSphere();
+
         // Resolve symbol to coinId hex and get decimals
         const registry = TokenRegistry.getInstance();
         const coinDef = registry.getDefinitionBySymbol(coinSymbol);
@@ -1021,8 +1062,6 @@ async function main() {
 
         // Convert amount to smallest units (supports decimal input like "0.2")
         const amountSmallest = toSmallestUnit(amountStr, decimals).toString();
-
-        const sphere = await getSphere();
 
         const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode})`;
         const txModeLabel = forceConservative ? ' [conservative]' : '';
@@ -1637,6 +1676,445 @@ async function main() {
           console.log('TopUp complete! Run "balance" to see updated balances.');
         }
 
+        await closeSphere();
+        break;
+      }
+
+      // === MESSAGING (Direct Messages) ===
+      case 'dm': {
+        const [, recipient, ...messageParts] = args;
+        // Collect message: everything after recipient that isn't a flag
+        const message = messageParts.filter(p => !p.startsWith('--')).join(' ');
+        if (!recipient || !message) {
+          console.error('Usage: dm <@nametag|pubkey> <message>');
+          console.error('  Example: npm run cli -- dm @alice "Hello!"');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        const dm = await sphere.communications.sendDM(recipient, message);
+        console.log(`\n✓ Message sent to ${recipient}`);
+        console.log(`  ID: ${dm.id}`);
+        console.log(`  Time: ${new Date(dm.timestamp).toLocaleString()}`);
+        await closeSphere();
+        break;
+      }
+
+      case 'dm-inbox': {
+        const sphere = await getSphere();
+        const conversations = sphere.communications.getConversations();
+        const totalUnread = sphere.communications.getUnreadCount();
+
+        console.log(`\nInbox (${conversations.size} conversation${conversations.size !== 1 ? 's' : ''}, ${totalUnread} unread):`);
+        console.log('─'.repeat(60));
+
+        if (conversations.size === 0) {
+          console.log('No conversations found.');
+        } else {
+          for (const [peerPubkey, messages] of conversations) {
+            const unread = sphere.communications.getUnreadCount(peerPubkey);
+            const lastMsg = messages[messages.length - 1];
+            const time = new Date(lastMsg.timestamp).toLocaleString();
+            const peerLabel = lastMsg.senderPubkey === peerPubkey
+              ? (lastMsg.senderNametag ? `@${lastMsg.senderNametag}` : peerPubkey.slice(0, 16) + '...')
+              : peerPubkey.slice(0, 16) + '...';
+            const unreadBadge = unread > 0 ? ` [${unread} unread]` : '';
+            const preview = lastMsg.content.length > 60
+              ? lastMsg.content.slice(0, 60) + '...'
+              : lastMsg.content;
+
+            console.log(`${peerLabel}${unreadBadge}`);
+            console.log(`  Last: ${preview}`);
+            console.log(`  Time: ${time}`);
+            console.log('');
+          }
+        }
+        console.log('─'.repeat(60));
+        await closeSphere();
+        break;
+      }
+
+      case 'dm-history': {
+        const [, peer] = args;
+        if (!peer) {
+          console.error('Usage: dm-history <@nametag|pubkey> [--limit <n>]');
+          console.error('  Example: npm run cli -- dm-history @alice --limit 20');
+          process.exit(1);
+        }
+
+        const limitIndex = args.indexOf('--limit');
+        const limit = limitIndex !== -1 && args[limitIndex + 1] ? parseInt(args[limitIndex + 1]) : 50;
+
+        const sphere = await getSphere();
+
+        // Resolve @nametag to pubkey if needed
+        let peerPubkey = peer;
+        if (peer.startsWith('@')) {
+          const resolved = await sphere.resolve(peer);
+          if (!resolved) {
+            console.error(`Could not resolve ${peer}`);
+            process.exit(1);
+          }
+          peerPubkey = resolved.chainPubkey;
+        }
+
+        const messages = sphere.communications.getConversation(peerPubkey);
+        const limited = messages.slice(-limit);
+        const myPubkey = sphere.identity?.chainPubkey;
+
+        console.log(`\nConversation with ${peer} (${limited.length} message${limited.length !== 1 ? 's' : ''}):`);
+        console.log('─'.repeat(60));
+
+        if (limited.length === 0) {
+          console.log('No messages found.');
+        } else {
+          for (const msg of limited) {
+            const time = new Date(msg.timestamp).toLocaleString();
+            const isMe = msg.senderPubkey === myPubkey;
+            const sender = isMe ? 'You' : (msg.senderNametag ? `@${msg.senderNametag}` : msg.senderPubkey.slice(0, 12) + '...');
+            console.log(`[${time}] ${sender}: ${msg.content}`);
+          }
+        }
+        console.log('─'.repeat(60));
+        await closeSphere();
+        break;
+      }
+
+      // === GROUP CHAT (NIP-29) ===
+      case 'group-create': {
+        const groupName = args[1];
+        if (!groupName) {
+          console.error('Usage: group-create <name> [--description <text>] [--private]');
+          console.error('  Example: npm run cli -- group-create "Trading Chat" --description "Discuss trades"');
+          process.exit(1);
+        }
+
+        const descIndex = args.indexOf('--description');
+        const description = descIndex !== -1 && args[descIndex + 1] ? args[descIndex + 1] : undefined;
+        const isPrivate = args.includes('--private');
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const group = await sphere.groupChat.createGroup({
+          name: groupName,
+          description,
+          visibility: isPrivate ? 'PRIVATE' : 'PUBLIC',
+        });
+
+        if (group) {
+          console.log('\n✓ Group created!');
+          console.log(`  ID: ${group.id}`);
+          console.log(`  Name: ${group.name}`);
+          console.log(`  Visibility: ${group.visibility}`);
+          if (group.description) console.log(`  Description: ${group.description}`);
+        } else {
+          console.error('\n✗ Failed to create group.');
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'group-list': {
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const groups = await sphere.groupChat.fetchAvailableGroups();
+
+        console.log(`\nAvailable Groups (${groups.length}):`);
+        console.log('─'.repeat(60));
+
+        if (groups.length === 0) {
+          console.log('No groups found on relay.');
+        } else {
+          for (const group of groups) {
+            console.log(`${group.name} [${group.visibility}]`);
+            console.log(`  ID: ${group.id}`);
+            if (group.description) console.log(`  Description: ${group.description}`);
+            if (group.memberCount != null) console.log(`  Members: ${group.memberCount}`);
+            console.log('');
+          }
+        }
+        console.log('─'.repeat(60));
+        await closeSphere();
+        break;
+      }
+
+      case 'group-my': {
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const groups = sphere.groupChat.getGroups();
+
+        console.log(`\nYour Groups (${groups.length}):`);
+        console.log('─'.repeat(60));
+
+        if (groups.length === 0) {
+          console.log('You have not joined any groups.');
+        } else {
+          for (const group of groups) {
+            const unreadBadge = (group.unreadCount || 0) > 0 ? ` [${group.unreadCount} unread]` : '';
+            console.log(`${group.name}${unreadBadge}`);
+            console.log(`  ID: ${group.id}`);
+            if (group.lastMessageText) {
+              const preview = group.lastMessageText.length > 60
+                ? group.lastMessageText.slice(0, 60) + '...'
+                : group.lastMessageText;
+              console.log(`  Last: ${preview}`);
+            }
+            console.log('');
+          }
+        }
+        console.log('─'.repeat(60));
+        await closeSphere();
+        break;
+      }
+
+      case 'group-join': {
+        const groupId = args[1];
+        if (!groupId) {
+          console.error('Usage: group-join <groupId> [--invite <code>]');
+          console.error('  Example: npm run cli -- group-join tradingchat');
+          process.exit(1);
+        }
+
+        const inviteIndex = args.indexOf('--invite');
+        const inviteCode = inviteIndex !== -1 && args[inviteIndex + 1] ? args[inviteIndex + 1] : undefined;
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const success = await sphere.groupChat.joinGroup(groupId, inviteCode);
+
+        if (success) {
+          console.log(`\n✓ Joined group: ${groupId}`);
+        } else {
+          console.error(`\n✗ Failed to join group: ${groupId}`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'group-leave': {
+        const groupId = args[1];
+        if (!groupId) {
+          console.error('Usage: group-leave <groupId>');
+          console.error('  Example: npm run cli -- group-leave tradingchat');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const success = await sphere.groupChat.leaveGroup(groupId);
+
+        if (success) {
+          console.log(`\n✓ Left group: ${groupId}`);
+        } else {
+          console.error(`\n✗ Failed to leave group: ${groupId}`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'group-send': {
+        const groupId = args[1];
+        // Collect message: everything after groupId that isn't a flag or flag value
+        const msgParts: string[] = [];
+        let skipNext = false;
+        for (let i = 2; i < args.length; i++) {
+          if (skipNext) { skipNext = false; continue; }
+          if (args[i] === '--reply') { skipNext = true; continue; }
+          if (args[i].startsWith('--')) continue;
+          msgParts.push(args[i]);
+        }
+        const msgContent = msgParts.join(' ');
+
+        if (!groupId || !msgContent) {
+          console.error('Usage: group-send <groupId> <message> [--reply <eventId>]');
+          console.error('  Example: npm run cli -- group-send tradingchat "Hello everyone!"');
+          process.exit(1);
+        }
+
+        const replyIndex = args.indexOf('--reply');
+        const replyToId = replyIndex !== -1 && args[replyIndex + 1] ? args[replyIndex + 1] : undefined;
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const sent = await sphere.groupChat.sendMessage(groupId, msgContent, replyToId);
+
+        if (sent) {
+          console.log('\n✓ Message sent!');
+          console.log(`  ID: ${sent.id}`);
+          console.log(`  Group: ${groupId}`);
+        } else {
+          console.error('\n✗ Failed to send message.');
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'group-messages': {
+        const groupId = args[1];
+        if (!groupId) {
+          console.error('Usage: group-messages <groupId> [--limit <n>]');
+          console.error('  Example: npm run cli -- group-messages tradingchat --limit 20');
+          process.exit(1);
+        }
+
+        const limitIndex = args.indexOf('--limit');
+        const limit = limitIndex !== -1 && args[limitIndex + 1] ? parseInt(args[limitIndex + 1]) : 50;
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+
+        // Fetch latest from relay
+        await sphere.groupChat.fetchMessages(groupId, undefined, limit);
+
+        // Get from local state (sorted)
+        const messages = sphere.groupChat.getMessages(groupId).slice(-limit);
+
+        const group = sphere.groupChat.getGroup(groupId);
+        const groupLabel = group?.name || groupId;
+
+        console.log(`\nMessages in "${groupLabel}" (${messages.length}):`);
+        console.log('─'.repeat(60));
+
+        if (messages.length === 0) {
+          console.log('No messages found.');
+        } else {
+          for (const msg of messages) {
+            const time = new Date(msg.timestamp).toLocaleString();
+            const sender = msg.senderNametag ? `@${msg.senderNametag}` : msg.senderPubkey.slice(0, 12) + '...';
+            const replyTag = msg.replyToId ? ` (reply)` : '';
+            console.log(`[${time}] ${sender}${replyTag}: ${msg.content}`);
+          }
+        }
+        console.log('─'.repeat(60));
+
+        // Mark as read
+        sphere.groupChat.markGroupAsRead(groupId);
+        await closeSphere();
+        break;
+      }
+
+      case 'group-members': {
+        const groupId = args[1];
+        if (!groupId) {
+          console.error('Usage: group-members <groupId>');
+          console.error('  Example: npm run cli -- group-members tradingchat');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const members = sphere.groupChat.getMembers(groupId);
+        const group = sphere.groupChat.getGroup(groupId);
+        const groupLabel = group?.name || groupId;
+
+        console.log(`\nMembers of "${groupLabel}" (${members.length}):`);
+        console.log('─'.repeat(60));
+
+        if (members.length === 0) {
+          console.log('No members found. Try joining the group first.');
+        } else {
+          for (const member of members) {
+            const label = member.nametag ? `@${member.nametag}` : member.pubkey.slice(0, 16) + '...';
+            const roleBadge = member.role === 'ADMIN' ? ' [ADMIN]' : member.role === 'MODERATOR' ? ' [MOD]' : '';
+            const joined = new Date(member.joinedAt).toLocaleDateString();
+            console.log(`  ${label}${roleBadge}  (joined ${joined})`);
+          }
+        }
+        console.log('─'.repeat(60));
+        await closeSphere();
+        break;
+      }
+
+      case 'group-info': {
+        const groupId = args[1];
+        if (!groupId) {
+          console.error('Usage: group-info <groupId>');
+          console.error('  Example: npm run cli -- group-info tradingchat');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+
+        if (!sphere.groupChat) {
+          console.error('Group chat module not available.');
+          process.exit(1);
+        }
+
+        await sphere.groupChat.connect();
+        const group = sphere.groupChat.getGroup(groupId);
+
+        if (!group) {
+          console.error(`Group "${groupId}" not found. You may need to join it first.`);
+          process.exit(1);
+        }
+
+        const myRole = sphere.groupChat.getCurrentUserRole(groupId);
+        const members = sphere.groupChat.getMembers(groupId);
+
+        console.log('\nGroup Info:');
+        console.log('─'.repeat(50));
+        console.log(`ID:          ${group.id}`);
+        console.log(`Name:        ${group.name}`);
+        console.log(`Visibility:  ${group.visibility}`);
+        if (group.description) console.log(`Description: ${group.description}`);
+        console.log(`Members:     ${members.length}`);
+        console.log(`Created:     ${new Date(group.createdAt).toLocaleString()}`);
+        if (group.lastMessageTime) console.log(`Last Active: ${new Date(group.lastMessageTime).toLocaleString()}`);
+        if (myRole) console.log(`Your Role:   ${myRole}`);
+        console.log(`Relay:       ${group.relayUrl}`);
+        console.log('─'.repeat(50));
         await closeSphere();
         break;
       }

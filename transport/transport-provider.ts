@@ -3,7 +3,7 @@
  * Platform-independent P2P messaging abstraction
  */
 
-import type { BaseProvider, FullIdentity } from '../types';
+import type { BaseProvider, FullIdentity, ComposingIndicator } from '../types';
 
 // =============================================================================
 // Transport Provider Interface
@@ -188,6 +188,23 @@ export interface TransportProvider extends BaseProvider {
    * @returns Unsubscribe function
    */
   onTypingIndicator?(handler: TypingIndicatorHandler): () => void;
+
+  // ===========================================================================
+  // Composing Indicators (NIP-59 kind 25050)
+  // ===========================================================================
+
+  /**
+   * Send composing indicator to a recipient using NIP-44 encrypted gift wrap
+   * @param recipientTransportPubkey - Transport pubkey of the conversation partner
+   * @param content - JSON payload with senderNametag and expiresIn
+   */
+  sendComposingIndicator?(recipientTransportPubkey: string, content: string): Promise<void>;
+
+  /**
+   * Subscribe to incoming composing indicators
+   * @returns Unsubscribe function
+   */
+  onComposing?(handler: ComposingHandler): () => void;
 
   // ===========================================================================
   // Dynamic Relay Management (optional)
@@ -526,3 +543,5 @@ export interface IncomingTypingIndicator {
 }
 
 export type TypingIndicatorHandler = (indicator: IncomingTypingIndicator) => void;
+
+export type ComposingHandler = (indicator: ComposingIndicator) => void;
