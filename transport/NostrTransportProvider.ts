@@ -18,6 +18,7 @@ import {
   NostrKeyManager,
   NIP04,
   NIP17,
+  NIP44,
   Event as NostrEventClass,
   EventKinds,
   hashNametag,
@@ -26,11 +27,13 @@ import {
   isChatMessage,
   isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
   MessageHandler,
+  ComposingHandler,
   TokenTransferHandler,
   BroadcastHandler,
   PaymentRequestHandler,
@@ -93,6 +96,9 @@ export interface NostrTransportProviderConfig {
   /** Optional storage adapter for persisting subscription timestamps */
   storage?: TransportStorageAdapter;
 }
+
+const COMPOSING_INDICATOR_KIND = 25050;
+const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 
 // Alias for backward compatibility
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
@@ -233,6 +239,8 @@ export class NostrTransportProvider implements TransportProvider {
   private paymentRequestResponseHandlers: Set<PaymentRequestResponseHandler> = new Set();
   private readReceiptHandlers: Set<ReadReceiptHandler> = new Set();
   private typingIndicatorHandlers: Set<TypingIndicatorHandler> = new Set();
+  private composingHandlers: Set<ComposingHandler> = new Set();
+  private pendingMessages: IncomingMessage[] = [];
   private broadcastHandlers: Map<string, Set<BroadcastHandler>> = new Map();
   private eventCallbacks: Set<TransportEventCallback> = new Set();
 
@@ -580,6 +588,21 @@ export class NostrTransportProvider implements TransportProvider {
 
   onMessage(handler: MessageHandler): () => void {
     this.messageHandlers.add(handler);
+
+    // Flush any messages that arrived before this handler was registered
+    if (this.pendingMessages.length > 0) {
+      const pending = this.pendingMessages;
+      this.pendingMessages = [];
+      this.log('Flushing', pending.length, 'buffered messages to new handler');
+      for (const message of pending) {
+        try {
+          handler(message);
+        } catch (error) {
+          this.log('Message handler error (buffered):', error);
+        }
+      }
+    }
+
     return () => this.messageHandlers.delete(handler);
   }
 
@@ -752,6 +775,30 @@ export class NostrTransportProvider implements TransportProvider {
   onTypingIndicator(handler: TypingIndicatorHandler): () => void {
     this.typingIndicatorHandlers.add(handler);
     return () => this.typingIndicatorHandlers.delete(handler);
+  }
+
+  // ===========================================================================
+  // Composing Indicators (NIP-59 kind 25050)
+  // ===========================================================================
+
+  onComposing(handler: ComposingHandler): () => void {
+    this.composingHandlers.add(handler);
+    return () => this.composingHandlers.delete(handler);
+  }
+
+  async sendComposingIndicator(recipientPubkey: string, content: string): Promise<void> {
+    this.ensureReady();
+
+    // NIP-17 requires 32-byte x-only pubkey; strip 02/03 prefix if present
+    const nostrRecipient = recipientPubkey.length === 66 && (recipientPubkey.startsWith('02') || recipientPubkey.startsWith('03'))
+      ? recipientPubkey.slice(2)
+      : recipientPubkey;
+
+    // Build NIP-17 gift wrap with kind 25050 rumor (instead of kind 14 for DMs).
+    // We replicate the three-layer NIP-59 envelope because NIP17.createGiftWrap
+    // hardcodes kind 14 for the inner rumor.
+    const giftWrap = this.createCustomKindGiftWrap(nostrRecipient, content, COMPOSING_INDICATOR_KIND);
+    await this.publishEvent(giftWrap);
   }
 
   /**
@@ -1417,6 +1464,29 @@ export class NostrTransportProvider implements TransportProvider {
         return;
       }
 
+      // Handle composing indicators (kind 25050)
+      if (pm.kind === COMPOSING_INDICATOR_KIND) {
+        let senderNametag: string | undefined;
+        let expiresIn = 30000;
+        try {
+          const parsed = JSON.parse(pm.content);
+          senderNametag = parsed.senderNametag || undefined;
+          expiresIn = parsed.expiresIn ?? 30000;
+        } catch {
+          // Payload parse failed — use defaults
+        }
+        const indicator = {
+          senderPubkey: pm.senderPubkey,
+          senderNametag,
+          expiresIn,
+        };
+        this.log('Composing indicator from:', indicator.senderNametag || pm.senderPubkey?.slice(0, 16));
+        for (const handler of this.composingHandlers) {
+          try { handler(indicator); } catch (e) { this.log('Composing handler error:', e); }
+        }
+        return;
+      }
+
       // Handle typing indicators (JSON content with type: 'typing')
       try {
         const parsed = JSON.parse(pm.content);
@@ -1469,12 +1539,17 @@ export class NostrTransportProvider implements TransportProvider {
 
       this.emitEvent({ type: 'message:received', timestamp: Date.now() });
 
-      this.log('Dispatching to', this.messageHandlers.size, 'handlers');
-      for (const handler of this.messageHandlers) {
-        try {
-          handler(message);
-        } catch (error) {
-          this.log('Message handler error:', error);
+      if (this.messageHandlers.size === 0) {
+        this.log('No message handlers registered, buffering message for later delivery');
+        this.pendingMessages.push(message);
+      } else {
+        this.log('Dispatching to', this.messageHandlers.size, 'handlers');
+        for (const handler of this.messageHandlers) {
+          try {
+            handler(message);
+          } catch (error) {
+            this.log('Message handler error:', error);
+          }
         }
       }
     } catch (err) {
@@ -1988,6 +2063,47 @@ export class NostrTransportProvider implements TransportProvider {
         this.log('Event callback error:', error);
       }
     }
+  }
+
+  /**
+   * Create a NIP-17 gift wrap with a custom inner rumor kind.
+   * Replicates the three-layer NIP-59 envelope (rumor → seal → gift wrap)
+   * because NIP17.createGiftWrap hardcodes kind 14 for the inner rumor.
+   */
+  private createCustomKindGiftWrap(recipientPubkeyHex: string, content: string, rumorKind: number): NostrEventClass {
+    const senderPubkey = this.keyManager!.getPublicKeyHex();
+    const now = Math.floor(Date.now() / 1000);
+
+    // 1. Create Rumor (unsigned inner event with custom kind)
+    const rumorTags: string[][] = [['p', recipientPubkeyHex]];
+    const rumorSerialized = JSON.stringify([0, senderPubkey, now, rumorKind, rumorTags, content]);
+    const rumorId = bytesToHex(sha256Noble(new TextEncoder().encode(rumorSerialized)));
+    const rumor = { id: rumorId, pubkey: senderPubkey, created_at: now, kind: rumorKind, tags: rumorTags, content };
+
+    // 2. Create Seal (kind 13, signed by sender, encrypts rumor)
+    const recipientPubkeyBytes = hexToBytes(recipientPubkeyHex);
+    const encryptedRumor = NIP44.encrypt(JSON.stringify(rumor), this.keyManager!.getPrivateKey(), recipientPubkeyBytes);
+    const sealTimestamp = now + Math.floor(Math.random() * 2 * TIMESTAMP_RANDOMIZATION) - TIMESTAMP_RANDOMIZATION;
+    const seal = NostrEventClass.create(this.keyManager!, {
+      kind: EventKinds.SEAL,
+      tags: [],
+      content: encryptedRumor,
+      created_at: sealTimestamp,
+    });
+
+    // 3. Create Gift Wrap (kind 1059, signed by ephemeral key, encrypts seal)
+    const ephemeralKeys = NostrKeyManager.generate();
+    const encryptedSeal = NIP44.encrypt(JSON.stringify(seal.toJSON()), ephemeralKeys.getPrivateKey(), recipientPubkeyBytes);
+    const wrapTimestamp = now + Math.floor(Math.random() * 2 * TIMESTAMP_RANDOMIZATION) - TIMESTAMP_RANDOMIZATION;
+    const giftWrap = NostrEventClass.create(ephemeralKeys, {
+      kind: EventKinds.GIFT_WRAP,
+      tags: [['p', recipientPubkeyHex]],
+      content: encryptedSeal,
+      created_at: wrapTimestamp,
+    });
+    ephemeralKeys.clear();
+
+    return giftWrap;
   }
 
   private log(...args: unknown[]): void {
