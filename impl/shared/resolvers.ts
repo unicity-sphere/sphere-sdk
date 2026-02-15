@@ -8,6 +8,7 @@ import type {
   BaseTransportConfig,
   BaseOracleConfig,
   BasePriceConfig,
+  BaseMarketConfig,
   L1Config,
   ResolvedTransportConfig,
   ResolvedOracleConfig,
@@ -15,6 +16,7 @@ import type {
 import type { PriceProviderConfig } from '../../price';
 import type { StorageProvider } from '../../storage';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
+import type { MarketModuleConfig } from '../../modules/market';
 
 // =============================================================================
 // Network Resolution
@@ -265,4 +267,21 @@ export function resolveGroupChatConfig(
   return {
     relays: config.relays ?? [...netConfig.groupRelays],
   };
+}
+
+// =============================================================================
+// Market Resolution
+// =============================================================================
+
+/**
+ * Resolve market module configuration.
+ * @param config - User-provided market config (true, object, or undefined)
+ * @returns Resolved MarketModuleConfig or undefined if disabled
+ */
+export function resolveMarketConfig(
+  config?: BaseMarketConfig | boolean,
+): MarketModuleConfig | undefined {
+  if (!config) return undefined;
+  if (config === true) return {};
+  return { apiUrl: config.apiUrl, timeout: config.timeout };
 }

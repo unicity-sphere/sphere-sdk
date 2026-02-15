@@ -210,6 +210,25 @@ export type {
   CreateGroupOptions,
 } from './modules/groupchat';
 
+export {
+  MarketModule,
+  createMarketModule,
+  DEFAULT_MARKET_API_URL,
+} from './modules/market';
+export type {
+  MarketModuleConfig,
+  MarketModuleDependencies,
+  PostIntentRequest,
+  PostIntentResult,
+  MarketIntent,
+  SearchIntentResult,
+  SearchFilters,
+  SearchOptions,
+  SearchResult,
+  IntentType,
+  IntentStatus,
+} from './modules/market';
+
 // =============================================================================
 // Constants
 // =============================================================================

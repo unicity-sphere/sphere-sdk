@@ -36,11 +36,13 @@ import { createPriceProvider } from '../../price';
 import { TokenRegistry } from '../../registry';
 import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
+import type { MarketModuleConfig } from '../../modules/market';
 import type { IpfsStorageConfig } from '../shared/ipfs';
 import {
   type BaseTransportConfig,
   type BaseOracleConfig,
   type BasePriceConfig,
+  type BaseMarketConfig,
   type L1Config,
   type NodeOracleExtensions,
   resolveTransportConfig,
@@ -48,6 +50,7 @@ import {
   resolveL1Config,
   resolvePriceConfig,
   resolveGroupChatConfig,
+  resolveMarketConfig,
   getNetworkConfig,
 } from '../shared';
 
@@ -112,6 +115,8 @@ export interface NodeProvidersConfig {
   tokenSync?: NodeTokenSyncConfig;
   /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
   groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
+  /** Market module configuration. true = enable with defaults, object = custom config */
+  market?: BaseMarketConfig | boolean;
 }
 
 export interface NodeProviders {
@@ -127,6 +132,8 @@ export interface NodeProviders {
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Market module config (resolved, for passing to Sphere.init) */
+  market?: MarketModuleConfig | boolean;
 }
 
 // =============================================================================
@@ -192,6 +199,9 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
+  // Resolve market config
+  const market = resolveMarketConfig(config?.market);
+
   // Configure token registry remote refresh with persistent cache
   const networkConfig = getNetworkConfig(network);
   TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
@@ -199,6 +209,7 @@ export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders
   return {
     storage,
     groupChat,
+    market,
     tokenStorage: createFileTokenStorageProvider({
       tokensDir: config?.tokensDir ?? './sphere-tokens',
     }),

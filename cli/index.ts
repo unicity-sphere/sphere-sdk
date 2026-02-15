@@ -174,6 +174,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     dataDir: config.dataDir,
     tokensDir: config.tokensDir,
     tokenSync: { ipfs: { enabled: true } },
+    market: true,
   });
 
   const initProviders = noNostrGlobal
@@ -185,6 +186,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     autoGenerate: options?.autoGenerate,
     mnemonic: options?.mnemonic,
     nametag: options?.nametag,
+    market: true,
   });
 
   sphereInstance = result.sphere;
@@ -298,6 +300,27 @@ NAMETAGS:
   my-nametag                        Show current nametag
   nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
 
+MARKET (Intent Bulletin Board):
+  market-post <desc> --type <type>     Post an intent (buy, sell, service, announcement, other)
+                                      --category <cat>   Intent category
+                                      --price <n>        Price amount
+                                      --currency <code>  Currency (USD, UCT, etc.)
+                                      --location <loc>   Location filter
+                                      --contact <handle> Contact handle
+                                      --expires <days>   Expiration in days (default: 30)
+  market-search <query>               Search intents (semantic)
+                                      --type <type>      Filter by type
+                                      --category <cat>   Filter by category
+                                      --min-price <n>    Min price filter
+                                      --max-price <n>    Max price filter
+                                      --min-score <0-1>  Min similarity score
+                                      --location <loc>   Location filter
+                                      --limit <n>        Max results (default: 10)
+  market-my                           List your own intents
+  market-close <id>                   Close (delete) an intent
+  market-feed                         Watch the live listing feed (WebSocket)
+                                      --rest              Use REST fallback instead of WebSocket
+
 ENCRYPTION:
   encrypt <data> <password>         Encrypt data with password
   decrypt <json> <password>         Decrypt encrypted JSON data
@@ -341,6 +364,18 @@ Wallet Profile Examples:
   npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
   npm run cli -- wallet use bob                   Switch to bob
   npm run cli -- balance                          Check bob's balance
+
+Market Examples:
+  npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
+  npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
+  npm run cli -- market-post "Web dev services" --type service       Post service intent
+  npm run cli -- market-post "New feature release" --type announcement   Post announcement
+  npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
+  npm run cli -- market-search "tokens" --min-score 0.7              Search with score threshold
+  npm run cli -- market-my                                           List own intents
+  npm run cli -- market-close <id>                                   Close an intent
+  npm run cli -- market-feed                                         Watch live feed
+  npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
 `);
 }
 
@@ -1603,6 +1638,235 @@ async function main() {
         }
 
         await closeSphere();
+        break;
+      }
+
+      // === MARKET (Intent Bulletin Board) ===
+      case 'market-post': {
+        const description = args[1];
+        if (!description) {
+          console.error('Usage: market-post <description> --type <type> [--category <cat>] [--price <n>] [--currency <code>] [--location <loc>] [--contact <handle>] [--expires <days>]');
+          process.exit(1);
+        }
+
+        const typeIndex = args.indexOf('--type');
+        const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
+        if (!intentType) {
+          console.error('Error: --type <type> is required (buy, sell, service, announcement, other)');
+          process.exit(1);
+        }
+
+        const categoryIndex = args.indexOf('--category');
+        const category = categoryIndex !== -1 ? args[categoryIndex + 1] : undefined;
+
+        const priceIndex = args.indexOf('--price');
+        const price = priceIndex !== -1 ? parseFloat(args[priceIndex + 1]) : undefined;
+
+        const currencyIndex = args.indexOf('--currency');
+        const currency = currencyIndex !== -1 ? args[currencyIndex + 1] : undefined;
+
+        const locationIndex = args.indexOf('--location');
+        const location = locationIndex !== -1 ? args[locationIndex + 1] : undefined;
+
+        const contactIndex = args.indexOf('--contact');
+        const contactHandle = contactIndex !== -1 ? args[contactIndex + 1] : undefined;
+
+        const expiresIndex = args.indexOf('--expires');
+        const expiresInDays = expiresIndex !== -1 ? parseInt(args[expiresIndex + 1]) : undefined;
+
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const result = await sphere.market.postIntent({
+          description,
+          intentType,
+          category,
+          price,
+          currency,
+          location,
+          contactHandle,
+          expiresInDays,
+        });
+
+        console.log('✓ Intent posted!');
+        console.log(`  ID: ${result.intentId}`);
+        console.log(`  Expires: ${result.expiresAt}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-search': {
+        const query = args[1];
+        if (!query) {
+          console.error('Usage: market-search <query> [--type <type>] [--category <cat>] [--min-price <n>] [--max-price <n>] [--min-score <0-1>] [--location <loc>] [--limit <n>]');
+          process.exit(1);
+        }
+
+        const typeIndex = args.indexOf('--type');
+        const intentType = typeIndex !== -1 ? args[typeIndex + 1] : undefined;
+
+        const categoryIndex = args.indexOf('--category');
+        const category = categoryIndex !== -1 ? args[categoryIndex + 1] : undefined;
+
+        const minPriceIndex = args.indexOf('--min-price');
+        const minPrice = minPriceIndex !== -1 ? parseFloat(args[minPriceIndex + 1]) : undefined;
+
+        const maxPriceIndex = args.indexOf('--max-price');
+        const maxPrice = maxPriceIndex !== -1 ? parseFloat(args[maxPriceIndex + 1]) : undefined;
+
+        const minScoreIndex = args.indexOf('--min-score');
+        const minScore = minScoreIndex !== -1 ? parseFloat(args[minScoreIndex + 1]) : undefined;
+
+        const locationIndex = args.indexOf('--location');
+        const location = locationIndex !== -1 ? args[locationIndex + 1] : undefined;
+
+        const limitIndex = args.indexOf('--limit');
+        const limit = limitIndex !== -1 ? parseInt(args[limitIndex + 1]) : 10;
+
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const result = await sphere.market.search(query, {
+          filters: {
+            intentType,
+            category,
+            minPrice,
+            maxPrice,
+            minScore,
+            location,
+          },
+          limit,
+        });
+
+        console.log(`Found ${result.count} intent(s):`);
+        console.log('─'.repeat(50));
+
+        for (const intent of result.intents) {
+          const scoreStr = intent.score != null ? `[${intent.score.toFixed(2)}] ` : '';
+          console.log(`${scoreStr}${intent.description}`);
+          const byStr = intent.agentNametag ? `@${intent.agentNametag}` : intent.agentPublicKey.slice(0, 12) + '...';
+          console.log(`  By: ${byStr}`);
+          let details = `  Type: ${intent.intentType}`;
+          if (intent.category) details += ` | Category: ${intent.category}`;
+          if (intent.price != null) details += ` | Price: ${intent.price} ${intent.currency || ''}`;
+          console.log(details);
+          let extra = '';
+          if (intent.contactHandle) extra += `  Contact: ${intent.contactHandle}`;
+          if (intent.expiresAt) extra += `${extra ? ' | ' : '  '}Expires: ${intent.expiresAt.split('T')[0]}`;
+          if (extra) console.log(extra);
+          console.log('─'.repeat(50));
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-my': {
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        const intents = await sphere.market.getMyIntents();
+
+        console.log(`Your intents (${intents.length}):`);
+        for (const intent of intents) {
+          const desc = intent.id;
+          const cat = intent.category || '';
+          const expires = intent.expiresAt ? intent.expiresAt.split('T')[0] : '';
+          console.log(`  ${desc}  ${intent.intentType}  ${intent.status}  ${cat}  expires ${expires}`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-close': {
+        const intentId = args[1];
+        if (!intentId) {
+          console.error('Usage: market-close <intentId>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        await sphere.market.closeIntent(intentId);
+        console.log(`✓ Intent ${intentId} closed.`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'market-feed': {
+        const useRest = args.includes('--rest');
+        const sphere = await getSphere();
+
+        if (!sphere.market) {
+          console.error('Market module not available.');
+          process.exit(1);
+        }
+
+        if (useRest) {
+          // REST fallback: fetch recent listings once
+          const listings = await sphere.market.getRecentListings();
+          console.log(`Recent listings (${listings.length}):`);
+          console.log('─'.repeat(50));
+          for (const listing of listings) {
+            console.log(`[${listing.type.toUpperCase()}] ${listing.agentName}: ${listing.title}`);
+            if (listing.descriptionPreview !== listing.title) {
+              console.log(`  ${listing.descriptionPreview}`);
+            }
+            console.log(`  ID: ${listing.id}  Posted: ${listing.createdAt}`);
+            console.log('');
+          }
+          await closeSphere();
+        } else {
+          // WebSocket live feed
+          console.log('Connecting to live feed... (Ctrl+C to stop)');
+          const unsubscribe = sphere.market.subscribeFeed((message) => {
+            if (message.type === 'initial') {
+              console.log(`Connected — ${message.listings.length} recent listing(s):`);
+              console.log('─'.repeat(50));
+              for (const listing of message.listings) {
+                console.log(`[${listing.type.toUpperCase()}] ${listing.agentName}: ${listing.title}`);
+              }
+              console.log('─'.repeat(50));
+              console.log('Watching for new listings...\n');
+            } else {
+              const l = message.listing;
+              console.log(`[NEW] [${l.type.toUpperCase()}] ${l.agentName}: ${l.title}`);
+              if (l.descriptionPreview !== l.title) {
+                console.log(`  ${l.descriptionPreview}`);
+              }
+            }
+          });
+
+          // Keep alive until Ctrl+C
+          process.on('SIGINT', () => {
+            console.log('\nDisconnecting...');
+            unsubscribe();
+            closeSphere().then(() => process.exit(0));
+          });
+
+          // Prevent the process from exiting
+          await new Promise(() => {});
+        }
         break;
       }
 

@@ -36,6 +36,7 @@ import type { TransportProvider } from '../../transport';
 import type { OracleProvider } from '../../oracle';
 import type { NetworkType } from '../../constants';
 import type { GroupChatModuleConfig } from '../../modules/groupchat';
+import type { MarketModuleConfig } from '../../modules/market';
 import type { PriceProvider } from '../../price';
 import { createPriceProvider } from '../../price';
 import { TokenRegistry } from '../../registry';
@@ -43,6 +44,7 @@ import {
   type BaseTransportConfig,
   type BaseOracleConfig,
   type BasePriceConfig,
+  type BaseMarketConfig,
   type L1Config,
   type BrowserTransportExtensions,
   resolveTransportConfig,
@@ -52,6 +54,7 @@ import {
   resolveArrayConfig,
   getNetworkConfig,
   resolveGroupChatConfig,
+  resolveMarketConfig,
 } from '../shared';
 
 // =============================================================================
@@ -179,6 +182,8 @@ export interface BrowserProvidersConfig {
   price?: BasePriceConfig;
   /** Group chat (NIP-29) configuration. true = enable with defaults, object = custom config */
   groupChat?: { enabled?: boolean; relays?: string[] } | boolean;
+  /** Market module configuration. true = enable with defaults, object = custom config */
+  market?: BaseMarketConfig | boolean;
 }
 
 export interface BrowserProviders {
@@ -195,6 +200,8 @@ export interface BrowserProviders {
   ipfsTokenStorage?: TokenStorageProvider<TxfStorageDataBase>;
   /** Group chat config (resolved, for passing to Sphere.init) */
   groupChat?: GroupChatModuleConfig | boolean;
+  /** Market module config (resolved, for passing to Sphere.init) */
+  market?: MarketModuleConfig | boolean;
   /**
    * Token sync configuration (resolved from tokenSync options)
    * For advanced use cases when additional sync backends are needed
@@ -375,6 +382,9 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   // Resolve group chat config
   const groupChat = resolveGroupChatConfig(network, config?.groupChat);
 
+  // Resolve market config
+  const market = resolveMarketConfig(config?.market);
+
   // Configure token registry remote refresh with persistent cache
   const networkConfig = getNetworkConfig(network);
   TokenRegistry.configure({ remoteUrl: networkConfig.tokenRegistryUrl, storage });
@@ -382,6 +392,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   return {
     storage,
     groupChat,
+    market,
     transport: createNostrTransportProvider({
       relays: transportConfig.relays,
       timeout: transportConfig.timeout,
