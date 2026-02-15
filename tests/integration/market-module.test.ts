@@ -100,7 +100,7 @@ describe('MarketModule integration with Sphere', () => {
   beforeEach(() => {
     cleanupTestDir();
     ensureTestDirs();
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
       new Response(JSON.stringify({}), { status: 200, headers: { 'content-type': 'application/json' } })
     );
   });

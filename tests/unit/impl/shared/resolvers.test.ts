@@ -10,6 +10,7 @@ import {
   resolveOracleConfig,
   resolveL1Config,
   resolveArrayConfig,
+  resolveMarketConfig,
 } from '../../../../impl/shared/resolvers';
 import { NETWORKS } from '../../../../constants';
 
@@ -285,6 +286,47 @@ describe('resolveArrayConfig', () => {
     const result = resolveArrayConfig(objDefaults, undefined, [{ id: 3 }]);
     expect(result).toHaveLength(3);
     expect(result[2]).toEqual({ id: 3 });
+  });
+});
+
+// =============================================================================
+// resolveMarketConfig
+// =============================================================================
+
+describe('resolveMarketConfig', () => {
+  it('should return undefined when config is undefined', () => {
+    const result = resolveMarketConfig(undefined);
+    expect(result).toBeUndefined();
+  });
+
+  it('should return undefined when config is false', () => {
+    const result = resolveMarketConfig(false);
+    expect(result).toBeUndefined();
+  });
+
+  it('should return empty object when config is true', () => {
+    const result = resolveMarketConfig(true);
+    expect(result).toEqual({});
+  });
+
+  it('should pass through apiUrl from object config', () => {
+    const result = resolveMarketConfig({ apiUrl: 'https://custom.market' });
+    expect(result).toEqual({ apiUrl: 'https://custom.market', timeout: undefined });
+  });
+
+  it('should pass through timeout from object config', () => {
+    const result = resolveMarketConfig({ timeout: 5000 });
+    expect(result).toEqual({ apiUrl: undefined, timeout: 5000 });
+  });
+
+  it('should pass through both apiUrl and timeout', () => {
+    const result = resolveMarketConfig({ apiUrl: 'https://api.test', timeout: 10000 });
+    expect(result).toEqual({ apiUrl: 'https://api.test', timeout: 10000 });
+  });
+
+  it('should return object with undefined fields for empty object config', () => {
+    const result = resolveMarketConfig({});
+    expect(result).toEqual({ apiUrl: undefined, timeout: undefined });
   });
 });
 

@@ -595,6 +595,65 @@ describe('MarketModule', () => {
       await expect(mod.getMyIntents()).resolves.toBeDefined();
     });
 
+    it('should send correct public key in registration payload', async () => {
+      const identity = mockIdentity();
+      fetchSpy
+        .mockResolvedValueOnce(jsonResponse({ agentId: 'agent_1' }, 201))
+        .mockResolvedValueOnce(jsonResponse({ intents: [] }));
+
+      const mod = createMarketModule();
+      mod.initialize({ identity, emitEvent: vi.fn() });
+
+      await mod.getMyIntents();
+
+      const [, regOpts] = fetchSpy.mock.calls[0];
+      const regBody = JSON.parse(regOpts?.body as string);
+
+      // Verify the public key is derived from the private key
+      const expectedPubkey = bytesToHex(secp256k1.getPublicKey(hexToBytes(identity.privateKey), true));
+      expect(regBody.public_key).toBe(expectedPubkey);
+    });
+
+    it('should include nametag in registration payload when identity has one', async () => {
+      const identity = { ...mockIdentity(), nametag: 'alice' };
+      fetchSpy
+        .mockResolvedValueOnce(jsonResponse({ agentId: 'agent_1' }, 201))
+        .mockResolvedValueOnce(jsonResponse({ intents: [] }));
+
+      const mod = createMarketModule();
+      mod.initialize({ identity, emitEvent: vi.fn() });
+
+      await mod.getMyIntents();
+
+      const [, regOpts] = fetchSpy.mock.calls[0];
+      const regBody = JSON.parse(regOpts?.body as string);
+      expect(regBody.nametag).toBe('alice');
+    });
+
+    it('should not include nametag in registration when identity has none', async () => {
+      fetchSpy
+        .mockResolvedValueOnce(jsonResponse({ agentId: 'agent_1' }, 201))
+        .mockResolvedValueOnce(jsonResponse({ intents: [] }));
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await mod.getMyIntents();
+
+      const [, regOpts] = fetchSpy.mock.calls[0];
+      const regBody = JSON.parse(regOpts?.body as string);
+      expect(regBody.nametag).toBeUndefined();
+    });
+
+    it('should throw on registration failure (non-201/409)', async () => {
+      fetchSpy.mockResolvedValueOnce(jsonResponse({ error: 'Server error' }, 500));
+
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await expect(mod.getMyIntents()).rejects.toThrow('Server error');
+    });
+
     it('should not register for public endpoints (search)', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({ intents: [] }));
       const mod = createMarketModule();
@@ -962,6 +1021,23 @@ describe('MarketModule', () => {
       await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('HTTP 503');
     });
 
+    it('should throw descriptive error on non-JSON response', async () => {
+      fetchSpy.mockResolvedValue(new Response('Bad Gateway', { status: 502 }));
+      const mod = createRegisteredModule();
+
+      await expect(mod.postIntent({ description: 'test', intentType: 'buy' })).rejects.toThrow('unexpected response (not JSON)');
+    });
+
+    it('should throw descriptive error on HTML response', async () => {
+      fetchSpy.mockResolvedValue(new Response('<html>Error</html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html' },
+      }));
+      const mod = createRegisteredModule();
+
+      await expect(mod.search('test')).rejects.toThrow('unexpected response (not JSON)');
+    });
+
     it('should show HTTP 400 as fallback', async () => {
       fetchSpy.mockResolvedValue(jsonResponse({}, 400));
       const mod = createRegisteredModule();
@@ -1036,6 +1112,36 @@ describe('MarketModule', () => {
   // ---------------------------------------------------------------------------
 
   describe('security and validation', () => {
+    it('should produce a signature that verifies with the correct public key', async () => {
+      const identity = mockIdentity();
+      fetchSpy.mockResolvedValue(jsonResponse({
+        intent_id: 'int_1',
+        message: 'Created',
+        expires_at: '2025-12-31',
+      }));
+      const mod = createMarketModule();
+      mod.initialize({ identity, emitEvent: vi.fn() });
+      (mod as any).registered = true;
+
+      await mod.postIntent({ description: 'verify me', intentType: 'buy' });
+
+      const [, opts] = fetchSpy.mock.calls[0];
+      const headers = opts?.headers as Record<string, string>;
+      const sig = headers['x-signature'];
+      const pubkey = headers['x-public-key'];
+      const timestamp = headers['x-timestamp'];
+      const bodyStr = opts?.body as string;
+
+      // Reconstruct the signed payload (timestamp is signed as a number, sent as string in header)
+      const body = JSON.parse(bodyStr);
+      const payload = JSON.stringify({ body, timestamp: parseInt(timestamp, 10) });
+      const messageHash = sha256(new TextEncoder().encode(payload));
+
+      // Verify signature with the correct public key (both as raw bytes)
+      const isValid = secp256k1.verify(hexToBytes(sig), messageHash, hexToBytes(pubkey));
+      expect(isValid).toBe(true);
+    });
+
     it('should fail signature verification with wrong private key', async () => {
       const identity = mockIdentity();
       fetchSpy.mockResolvedValue(jsonResponse({
@@ -1283,6 +1389,103 @@ describe('MarketModule', () => {
           expect(result[i].intentType).toBe(ALL_TYPES[i]);
         }
       });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // minScore Client-Side Filtering
+  // ---------------------------------------------------------------------------
+
+  describe('minScore filtering', () => {
+    const searchResults = {
+      intents: [
+        { id: 'high', score: 0.95, agent_public_key: '02ab', description: 'High', intent_type: 'sell', currency: 'USD', contact_method: 'nostr', created_at: '2025-01-01', expires_at: '2025-12-31' },
+        { id: 'mid', score: 0.70, agent_public_key: '02cd', description: 'Mid', intent_type: 'buy', currency: 'USD', contact_method: 'nostr', created_at: '2025-01-01', expires_at: '2025-12-31' },
+        { id: 'low', score: 0.30, agent_public_key: '02ef', description: 'Low', intent_type: 'service', currency: 'USD', contact_method: 'nostr', created_at: '2025-01-01', expires_at: '2025-12-31' },
+      ],
+    };
+
+    it('should filter results below minScore', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse(searchResults));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const result = await mod.search('test', { filters: { minScore: 0.50 } });
+
+      expect(result.intents).toHaveLength(2);
+      expect(result.intents.map(i => i.id)).toEqual(['high', 'mid']);
+      expect(result.count).toBe(2);
+    });
+
+    it('should keep results at exactly minScore', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse(searchResults));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const result = await mod.search('test', { filters: { minScore: 0.70 } });
+
+      expect(result.intents).toHaveLength(2);
+      expect(result.intents.map(i => i.id)).toEqual(['high', 'mid']);
+    });
+
+    it('should return all results when minScore is 0', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse(searchResults));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const result = await mod.search('test', { filters: { minScore: 0 } });
+
+      expect(result.intents).toHaveLength(3);
+    });
+
+    it('should return no results when minScore is very high', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse(searchResults));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const result = await mod.search('test', { filters: { minScore: 0.99 } });
+
+      expect(result.intents).toHaveLength(0);
+      expect(result.count).toBe(0);
+    });
+
+    it('should not filter when minScore is not specified', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse(searchResults));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      const result = await mod.search('test');
+
+      expect(result.intents).toHaveLength(3);
+    });
+
+    it('should handle floating-point rounding correctly (e.g., 0.845 vs 0.85)', async () => {
+      // This tests the Math.round(score * 100) >= Math.round(minScore * 100) logic
+      fetchSpy.mockResolvedValue(jsonResponse({
+        intents: [
+          { id: 'edge', score: 0.845, agent_public_key: '02ab', description: 'Edge', intent_type: 'sell', currency: 'USD', contact_method: 'nostr', created_at: '2025-01-01', expires_at: '2025-12-31' },
+        ],
+      }));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      // 0.845 rounds to 85, 0.85 rounds to 85 → should be included (equal)
+      const result = await mod.search('test', { filters: { minScore: 0.85 } });
+      expect(result.intents).toHaveLength(1);
+    });
+
+    it('should not send minScore to server (client-side only)', async () => {
+      fetchSpy.mockResolvedValue(jsonResponse(searchResults));
+      const mod = createMarketModule();
+      mod.initialize(mockDeps());
+
+      await mod.search('test', { filters: { minScore: 0.50, intentType: 'sell' } });
+
+      const [, opts] = fetchSpy.mock.calls[0];
+      const body = JSON.parse(opts?.body as string);
+      expect(body.min_score).toBeUndefined();
+      expect(body.minScore).toBeUndefined();
+      expect(body.intent_type).toBe('sell');
     });
   });
 
