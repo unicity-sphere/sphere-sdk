@@ -118,4 +118,47 @@ export default defineConfig([
       'ws',
     ],
   },
+  // Sphere Connect - Core (transport-agnostic)
+  {
+    entry: { 'connect/index': 'connect/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'neutral',
+    target: 'es2022',
+    external: [
+      /^@unicitylabs\//,
+    ],
+  },
+  // Sphere Connect - Browser transport (PostMessage)
+  {
+    entry: { 'impl/browser/connect/index': 'impl/browser/connect/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'browser',
+    target: 'es2022',
+    external: [
+      /^@unicitylabs\//,
+    ],
+  },
+  // Sphere Connect - Node.js transport (WebSocket)
+  {
+    entry: { 'impl/nodejs/connect/index': 'impl/nodejs/connect/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'node',
+    target: 'es2022',
+    external: [
+      /^@unicitylabs\//,
+      'ws',
+    ],
+  },
 ]);
