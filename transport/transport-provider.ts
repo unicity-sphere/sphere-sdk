@@ -157,6 +157,39 @@ export interface TransportProvider extends BaseProvider {
   onPaymentRequestResponse?(handler: PaymentRequestResponseHandler): () => void;
 
   // ===========================================================================
+  // Read Receipts
+  // ===========================================================================
+
+  /**
+   * Send a read receipt for a message
+   * @param recipientTransportPubkey - Transport pubkey of the message sender
+   * @param messageEventId - Event ID of the message being acknowledged
+   */
+  sendReadReceipt?(recipientTransportPubkey: string, messageEventId: string): Promise<void>;
+
+  /**
+   * Subscribe to incoming read receipts
+   * @returns Unsubscribe function
+   */
+  onReadReceipt?(handler: ReadReceiptHandler): () => void;
+
+  // ===========================================================================
+  // Typing Indicators
+  // ===========================================================================
+
+  /**
+   * Send typing indicator to a recipient
+   * @param recipientTransportPubkey - Transport pubkey of the conversation partner
+   */
+  sendTypingIndicator?(recipientTransportPubkey: string): Promise<void>;
+
+  /**
+   * Subscribe to incoming typing indicators
+   * @returns Unsubscribe function
+   */
+  onTypingIndicator?(handler: TypingIndicatorHandler): () => void;
+
+  // ===========================================================================
   // Dynamic Relay Management (optional)
   // ===========================================================================
 
@@ -276,6 +309,10 @@ export interface IncomingMessage {
   content: string;
   timestamp: number;
   encrypted: boolean;
+  /** Set when this is a self-wrap replay (sent message recovered from relay) */
+  isSelfWrap?: boolean;
+  /** Recipient pubkey — only present on self-wrap replays */
+  recipientTransportPubkey?: string;
 }
 
 export type MessageHandler = (message: IncomingMessage) => void;
@@ -459,3 +496,33 @@ export interface PeerInfo {
 
 /** @deprecated Use PeerInfo instead */
 export type NametagInfo = PeerInfo;
+
+// =============================================================================
+// Read Receipt Types
+// =============================================================================
+
+export interface IncomingReadReceipt {
+  /** Transport-specific pubkey of the sender who read the message */
+  senderTransportPubkey: string;
+  /** Event ID of the message that was read */
+  messageEventId: string;
+  /** Timestamp */
+  timestamp: number;
+}
+
+export type ReadReceiptHandler = (receipt: IncomingReadReceipt) => void;
+
+// =============================================================================
+// Typing Indicator Types
+// =============================================================================
+
+export interface IncomingTypingIndicator {
+  /** Transport-specific pubkey of the sender who is typing */
+  senderTransportPubkey: string;
+  /** Sender's nametag (if known) */
+  senderNametag?: string;
+  /** Timestamp */
+  timestamp: number;
+}
+
+export type TypingIndicatorHandler = (indicator: IncomingTypingIndicator) => void;
