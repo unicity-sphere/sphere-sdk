@@ -15,6 +15,8 @@ export { ConnectClient } from './client/ConnectClient';
 export {
   SPHERE_CONNECT_NAMESPACE,
   SPHERE_CONNECT_VERSION,
+  HOST_READY_TYPE,
+  HOST_READY_TIMEOUT,
   RPC_METHODS,
   INTENT_ACTIONS,
   ERROR_CODES,

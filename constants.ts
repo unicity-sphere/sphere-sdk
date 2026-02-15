@@ -359,6 +359,16 @@ export const TIMEOUTS = {
   SYNC_INTERVAL: 60000,
 } as const;
 
+// =============================================================================
+// Sphere Connect
+// =============================================================================
+
+/** Signal sent by wallet popup to dApp when ConnectHost is ready */
+export const HOST_READY_TYPE = 'sphere-connect:host-ready' as const;
+
+/** Default timeout (ms) for waiting for the host-ready signal */
+export const HOST_READY_TIMEOUT = 30_000;
+
 /** Validation limits */
 export const LIMITS = {
   /** Min nametag length */

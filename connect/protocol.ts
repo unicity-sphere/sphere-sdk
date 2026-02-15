@@ -10,6 +10,8 @@
 export const SPHERE_CONNECT_NAMESPACE = 'sphere-connect';
 export const SPHERE_CONNECT_VERSION = '1.0';
 
+export { HOST_READY_TYPE, HOST_READY_TIMEOUT } from '../constants';
+
 // =============================================================================
 // RPC Method Names (query — return data, no UI)
 // =============================================================================
