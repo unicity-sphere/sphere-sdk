@@ -1046,6 +1046,9 @@ async function main() {
         }
         const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
 
+        // Initialize Sphere first so TokenRegistry is loaded
+        const sphere = await getSphere();
+
         // Resolve symbol to coinId hex and get decimals
         const registry = TokenRegistry.getInstance();
         const coinDef = registry.getDefinitionBySymbol(coinSymbol);
@@ -1059,8 +1062,6 @@ async function main() {
 
         // Convert amount to smallest units (supports decimal input like "0.2")
         const amountSmallest = toSmallestUnit(amountStr, decimals).toString();
-
-        const sphere = await getSphere();
 
         const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode})`;
         const txModeLabel = forceConservative ? ' [conservative]' : '';
