@@ -214,10 +214,10 @@ export class CommunicationsModule {
     this.ensureInitialized();
 
     // Resolve recipient
-    const recipientPubkey = await this.resolveRecipient(recipient);
+    const resolved = await this.resolveRecipient(recipient);
 
     // Send via transport
-    const eventId = await this.deps!.transport.sendMessage(recipientPubkey, content);
+    const eventId = await this.deps!.transport.sendMessage(resolved.pubkey, content);
 
     // Create message record
     // isRead=false for sent messages means "not yet read by recipient".
@@ -226,7 +226,8 @@ export class CommunicationsModule {
       id: eventId,
       senderPubkey: this.deps!.identity.chainPubkey,
       senderNametag: this.deps!.identity.nametag,
-      recipientPubkey,
+      recipientPubkey: resolved.pubkey,
+      ...(resolved.nametag ? { recipientNametag: resolved.nametag } : {}),
       content,
       timestamp: Date.now(),
       isRead: false,
@@ -376,14 +377,14 @@ export class CommunicationsModule {
   async sendComposingIndicator(recipientPubkeyOrNametag: string): Promise<void> {
     this.ensureInitialized();
 
-    const recipientPubkey = await this.resolveRecipient(recipientPubkeyOrNametag);
+    const resolved = await this.resolveRecipient(recipientPubkeyOrNametag);
 
     const content = JSON.stringify({
       senderNametag: this.deps!.identity.nametag,
       expiresIn: 30000,
     });
 
-    await this.deps!.transport.sendComposingIndicator?.(recipientPubkey, content);
+    await this.deps!.transport.sendComposingIndicator?.(resolved.pubkey, content);
   }
 
   /**
@@ -633,15 +634,16 @@ export class CommunicationsModule {
   // Private: Helpers
   // ===========================================================================
 
-  private async resolveRecipient(recipient: string): Promise<string> {
+  private async resolveRecipient(recipient: string): Promise<{ pubkey: string; nametag?: string }> {
     if (recipient.startsWith('@')) {
-      const pubkey = await this.deps!.transport.resolveNametag?.(recipient.slice(1));
+      const nametag = recipient.slice(1);
+      const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
       if (!pubkey) {
         throw new Error(`Nametag not found: ${recipient}`);
       }
-      return pubkey;
+      return { pubkey, nametag };
     }
-    return recipient;
+    return { pubkey: recipient };
   }
 
   private ensureInitialized(): void {

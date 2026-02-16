@@ -29,6 +29,10 @@ export const RPC_METHODS = {
   SUBSCRIBE: 'sphere_subscribe',
   UNSUBSCRIBE: 'sphere_unsubscribe',
   DISCONNECT: 'sphere_disconnect',
+  GET_CONVERSATIONS: 'sphere_getConversations',
+  GET_MESSAGES: 'sphere_getMessages',
+  GET_DM_UNREAD_COUNT: 'sphere_getDMUnreadCount',
+  MARK_AS_READ: 'sphere_markAsRead',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
