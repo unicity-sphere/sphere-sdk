@@ -28,6 +28,7 @@ coverage/
 
 # Misc
 *.tgz
+ref_materials/
 
 # CLI wallet profiles and test wallets
 .sphere-cli*/
