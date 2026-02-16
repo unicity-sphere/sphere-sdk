@@ -66,7 +66,6 @@ import { MarketModule, createMarketModule } from '../modules/market';
 import type { MarketModuleConfig } from '../modules/market';
 import {
   STORAGE_KEYS_GLOBAL,
-  STORAGE_KEYS_ADDRESS,
   getAddressId,
   DEFAULT_BASE_PATH,
   DEFAULT_ENCRYPTION_KEY,
@@ -410,8 +409,8 @@ export class Sphere {
    */
   static async exists(storage: StorageProvider): Promise<boolean> {
     try {
-      // Ensure storage is connected before checking
-      if (!storage.isConnected()) {
+      const wasConnected = storage.isConnected();
+      if (!wasConnected) {
         await storage.connect();
       }
 
@@ -422,6 +421,11 @@ export class Sphere {
 
       const masterKey = await storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
       if (masterKey) return true;
+
+      // No wallet found — disconnect so we don't leave an empty database open
+      if (!wasConnected) {
+        await storage.disconnect();
+      }
 
       return false;
     } catch {
@@ -848,55 +852,72 @@ export class Sphere {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
 
-    // Ensure storage is connected (may have been disconnected by a previous destroy() cycle)
-    if (!storage.isConnected()) {
-      await storage.connect();
-    }
-
-    // Clear global wallet data
-    console.log('[Sphere.clear] Removing storage keys...');
-    await storage.remove(STORAGE_KEYS_GLOBAL.MNEMONIC);
-    await storage.remove(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-    await storage.remove(STORAGE_KEYS_GLOBAL.CHAIN_CODE);
-    await storage.remove(STORAGE_KEYS_GLOBAL.DERIVATION_PATH);
-    await storage.remove(STORAGE_KEYS_GLOBAL.BASE_PATH);
-    await storage.remove(STORAGE_KEYS_GLOBAL.DERIVATION_MODE);
-    await storage.remove(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
-    await storage.remove(STORAGE_KEYS_GLOBAL.WALLET_EXISTS);
-    await storage.remove(STORAGE_KEYS_GLOBAL.TRACKED_ADDRESSES);
-    await storage.remove(STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS);
-    // Per-address data
-    await storage.remove(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
-    await storage.remove(STORAGE_KEYS_ADDRESS.OUTBOX);
-    console.log('[Sphere.clear] Storage keys removed');
-
-    // Clear token storage if provided (with timeout to prevent IndexedDB deadlock)
-    if (tokenStorage?.clear) {
-      console.log('[Sphere.clear] Clearing token storage...');
-      try {
-        await Promise.race([
-          tokenStorage.clear(),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('tokenStorage.clear() timed out after 2s')), 2000),
-          ),
-        ]);
-        console.log('[Sphere.clear] Token storage cleared');
-      } catch (err) {
-        console.warn('[Sphere.clear] Token storage clear failed/timed out:', err);
-      }
-    }
-
-    // Clear L1 vesting cache
-    console.log('[Sphere.clear] Destroying vesting classifier...');
-    await vestingClassifier.destroy();
-    console.log('[Sphere.clear] Vesting classifier destroyed');
-
+    // 1. Destroy Sphere instance — closes all connections
     if (Sphere.instance) {
       console.log('[Sphere.clear] Destroying Sphere instance...');
       await Sphere.instance.destroy();
       console.log('[Sphere.clear] Sphere instance destroyed');
-    } else {
-      console.log('[Sphere.clear] No Sphere instance to destroy');
+    }
+
+    // 2. Clear L1 vesting cache
+    await vestingClassifier.destroy();
+
+    // 3. Delete ALL sphere IndexedDB databases directly.
+    //    We don't go through providers because leaked connections from
+    //    concurrent connect() calls can block deleteDatabase via onblocked.
+    //    After destroy(), there are no active Sphere operations, so any
+    //    leaked IDBDatabase references will be GC'd once we yield.
+    if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
+      console.log('[Sphere.clear] Deleting all sphere IndexedDB databases...');
+      try {
+        const dbs = await Promise.race([
+          indexedDB.databases(),
+          new Promise<IDBDatabaseInfo[]>((_, reject) =>
+            setTimeout(() => reject(new Error('timeout')), 2000),
+          ),
+        ]);
+        const sphereDbs = dbs.filter((db) => db.name?.startsWith('sphere'));
+        if (sphereDbs.length > 0) {
+          await Promise.all(sphereDbs.map((db) =>
+            new Promise<void>((resolve) => {
+              const req = indexedDB.deleteDatabase(db.name!);
+              req.onsuccess = () => {
+                console.log(`[Sphere.clear] Deleted ${db.name}`);
+                resolve();
+              };
+              req.onerror = () => resolve();
+              req.onblocked = () => {
+                console.warn(`[Sphere.clear] deleteDatabase blocked: ${db.name}`);
+                resolve();
+              };
+            }),
+          ));
+        }
+        console.log('[Sphere.clear] IndexedDB cleanup done');
+      } catch {
+        console.warn('[Sphere.clear] IndexedDB enumeration failed');
+      }
+    }
+
+    // 4. Clear token storage (for non-IndexedDB backends like FileTokenStorageProvider)
+    if (tokenStorage?.clear) {
+      try {
+        await tokenStorage.clear();
+      } catch (err) {
+        console.warn('[Sphere.clear] Token storage clear failed:', err);
+      }
+    }
+
+    // 5. Clear provider state (handles localStorage fallback, non-IDB backends)
+    if (!storage.isConnected()) {
+      try {
+        await storage.connect();
+      } catch {
+        // Database was already deleted above — that's fine
+      }
+    }
+    if (storage.isConnected()) {
+      await storage.clear();
     }
   }
 

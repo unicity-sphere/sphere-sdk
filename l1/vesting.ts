@@ -36,9 +36,15 @@ class VestingClassifier {
   private db: IDBDatabase | null = null;
 
   /**
-   * Initialize IndexedDB for persistent caching
+   * Initialize IndexedDB for persistent caching.
+   * In Node.js (no IndexedDB), silently falls back to memory-only caching.
    */
   async initDB(): Promise<void> {
+    if (typeof indexedDB === 'undefined') {
+      // Node.js / SSR — memory-only cache, data re-fetched from network
+      return;
+    }
+
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, 1);
 

@@ -803,6 +803,8 @@ ALPHA coins are classified as "vested" or "unvested" based on their coinbase ori
 - **Vested**: Coins traced back to coinbase transactions in blocks ≤280,000
 - **Unvested**: Coins from blocks >280,000
 
+The vesting classifier traces each UTXO through the transaction chain to its coinbase origin. Results are cached in IndexedDB (`SphereVestingCacheV5`) for performance. In Node.js, where IndexedDB is not available, the cache is memory-only (re-fetched from network each session).
+
 ```typescript
 // Vesting is enabled by default. Configure via providers:
 const providers = createBrowserProviders({
@@ -860,6 +862,8 @@ await sphere.communications.broadcast('Hello world!', ['general']);
 ## Custom Providers
 
 ### Storage Provider Interface
+
+The default browser implementation is `IndexedDBStorageProvider` (database: `sphere-storage`, object store: `kv`). For Node.js, `FileStorageProvider` is used. Both support per-address key scoping via `setIdentity()`.
 
 ```typescript
 interface StorageProvider {
@@ -1248,12 +1252,13 @@ npm test -- --coverage
 | `core/currency` | 37 | Amount conversion and formatting |
 | `core/encryption` | 39 | AES-256-CBC encryption |
 | `core/utils` | 40 | Base58, validation, utilities |
+| `core/Sphere.clear` | 11 | Wallet data cleanup (storage + tokenStorage) |
 | `l1/address` | 18 | HD key derivation |
 | `l1/addressToScriptHash` | 7 | Electrum scripthash |
 | `l1/tx` | 23 | SegWit transactions, UTXO selection |
 | `l1/crypto` | 22 | Wallet encryption, WIF conversion |
 | `l1/addressHelpers` | 36 | Address management utilities |
-| `l1/vesting` | 16 | Vesting classification |
+| `l1/vesting` | 20 | Vesting classification, Node.js memory-only fallback |
 | `l1/L1PaymentsHistory` | 12 | L1 transaction history direction/amounts |
 | `serialization/txf` | 44 | TXF token format |
 | `serialization/wallet-text` | 32 | Text wallet backup format |
@@ -1262,12 +1267,14 @@ npm test -- --coverage
 | `modules/TokenSplitExecutor` | 16 | Token split execution |
 | `modules/PaymentsModule` | 36 | Payments, nametag, PROXY |
 | `modules/NametagMinter` | 22 | On-chain nametag minting |
+| `modules/CommunicationsModule.storage` | 16 | DM per-address storage, migration, pagination |
 | `price/CoinGeckoPriceProvider` | 29 | Price provider, cache, negative cache |
 | `transport/NostrTransportProvider` | 43 | Nostr P2P messaging, event timestamp persistence |
+| `impl/browser/IndexedDBStorageProvider` | 17 | IndexedDB kv storage, per-address key scoping |
 | `integration/wallet-import-export` | 20 | Wallet import/export |
 | `integration/nametag-roundtrip` | 9 | Nametag serialization |
 | `impl/shared/resolvers` | 41 | Config resolution utilities |
-| **Total** | **893** | All passing (34 test files) |
+| **Total** | **1613** | All passing (63 test files) |
 
 ### Writing Tests
 
@@ -1283,7 +1290,8 @@ tests/
 │   │   ├── encryption.test.ts
 │   │   ├── utils.test.ts
 │   │   ├── Sphere.providers.test.ts
-│   │   └── Sphere.nametag-sync.test.ts
+│   │   ├── Sphere.nametag-sync.test.ts
+│   │   └── Sphere.clear.test.ts
 │   ├── l1/
 │   │   ├── address.test.ts
 │   │   ├── addressHelpers.test.ts
@@ -1296,7 +1304,8 @@ tests/
 │   │   ├── TokenSplitCalculator.test.ts
 │   │   ├── TokenSplitExecutor.test.ts
 │   │   ├── PaymentsModule.test.ts
-│   │   └── NametagMinter.test.ts
+│   │   ├── NametagMinter.test.ts
+│   │   └── CommunicationsModule.storage.test.ts
 │   ├── price/
 │   │   └── CoinGeckoPriceProvider.test.ts
 │   ├── transport/
@@ -1306,6 +1315,8 @@ tests/
 │   │   ├── wallet-text.test.ts
 │   │   └── wallet-dat.test.ts
 │   └── impl/
+│       ├── browser/
+│       │   └── IndexedDBStorageProvider.test.ts
 │       └── shared/
 │           └── resolvers.test.ts
 ├── integration/

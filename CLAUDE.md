@@ -120,10 +120,12 @@ await sphere.destroy();
 
 | Component | Browser | Node.js |
 |-----------|---------|---------|
-| Storage | localStorage + IndexedDB | File-based JSON |
+| Storage | IndexedDB (`IndexedDBStorageProvider`) | File-based JSON (`FileStorageProvider`) |
+| Token Storage | IndexedDB per-address | File-based per-address |
 | Transport (Nostr) | Native WebSocket | `ws` package (install separately) |
 | Oracle (Aggregator) | Included with API key | Included with API key |
 | L1 (ALPHA blockchain) | Enabled, lazy Fulcrum connect | Enabled, lazy Fulcrum connect |
+| L1 Vesting Cache | IndexedDB (`SphereVestingCacheV5`) | Memory-only (no persistence) |
 | Price (CoinGecko) | Optional (`price` config) | Optional (`price` config) |
 | Token Registry | Remote fetch + localStorage cache | Remote fetch + file cache |
 | IPFS sync | Built-in (HTTP) | Built-in (HTTP) |
@@ -226,7 +228,7 @@ sphere-sdk/
 │   └── index.ts                   # Barrel exports + factory
 │
 ├── impl/                    # Platform-specific implementations
-│   ├── browser/            # LocalStorage, IndexedDB, browser IPFS factory
+│   ├── browser/            # IndexedDB storage (kv + tokens), browser IPFS factory
 │   ├── nodejs/             # FileStorage, FileTokenStorage, Node.js IPFS factory
 │   └── shared/             # Common config, resolvers, and IPFS provider
 │       └── ipfs/           # Cross-platform IPFS/IPNS storage (HTTP-based)
@@ -326,7 +328,7 @@ Abstract interfaces for platform independence:
 
 | Provider | Interface | Implementations |
 |----------|-----------|-----------------|
-| Storage | `StorageProvider` | LocalStorageProvider, FileStorageProvider |
+| Storage | `StorageProvider` | IndexedDBStorageProvider (browser default), LocalStorageProvider (browser legacy), FileStorageProvider (Node.js) |
 | TokenStorage | `TokenStorageProvider` | IndexedDBTokenStorageProvider, FileTokenStorageProvider, IpfsStorageProvider |
 | Transport | `TransportProvider` | NostrTransportProvider |
 | Oracle | `OracleProvider` | UnicityAggregatorProvider |
@@ -366,6 +368,7 @@ npm run typecheck
 - Fulcrum WebSocket connection is **lazy** — deferred until first L1 operation
 - Set `l1: null` in `PaymentsModuleConfig` to explicitly disable
 - `importFromJSON()` and `importFromLegacyFile()` accept `l1` config option
+- **Vesting cache**: `VestingClassifier` uses IndexedDB (`SphereVestingCacheV5`) in browser for persistent UTXO→coinbase tracing cache. In Node.js, falls back to memory-only cache (re-fetched from network each session)
 
 ### Nametags
 - Human-readable aliases (e.g., `@alice`) for receiving payments
@@ -441,6 +444,21 @@ npm run typecheck
 - Chat events (GIFT_WRAP/NIP-17) have no `since` filter — always real-time
 - Factory functions (`createBrowserProviders`, `createNodeProviders`) pass storage to transport automatically
 
+### IndexedDB Databases (Browser)
+The SDK manages multiple IndexedDB databases:
+
+| Database | Provider | Purpose |
+|----------|----------|---------|
+| `sphere-storage` | `IndexedDBStorageProvider` | Wallet keys, per-address data (messages, etc.) |
+| `sphere-token-storage-{addressId}` | `IndexedDBTokenStorageProvider` | Token data per address (TXF format) |
+| `SphereVestingCacheV5` | `VestingClassifier` | L1 UTXO→coinbase tracing cache |
+
+`Sphere.clear()` deletes all three via:
+1. `vestingClassifier.destroy()` → deletes `SphereVestingCacheV5`
+2. Bulk `indexedDB.databases()` → deletes all `sphere*` databases
+3. `tokenStorage.clear()` → deletes per-address token databases
+4. `storage.clear()` → deletes `sphere-storage`
+
 ### Token Storage (TXF Format)
 ```typescript
 TxfStorageDataBase {
@@ -455,17 +473,20 @@ TxfStorageDataBase {
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1475 (57 test files)
+**Total tests:** 1613 (63 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
+- `tests/unit/core/Sphere.clear.test.ts` - Wallet data cleanup (storage + tokenStorage + vesting)
 - `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer, event timestamp persistence
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
+- `tests/unit/modules/CommunicationsModule.storage.test.ts` - DM per-address storage, migration, pagination
 - `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider: caching, deduplication, rate-limit backoff, persistent storage, unlisted tokens
-- `tests/unit/l1/*.test.ts` - L1 blockchain utilities
+- `tests/unit/l1/*.test.ts` - L1 blockchain utilities (incl. vesting Node.js fallback)
 - `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
+- `tests/unit/impl/browser/IndexedDBStorageProvider.test.ts` - IndexedDB kv storage, per-address scoping
 - `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
 - `tests/relay/groupchat-relay.test.ts` - GroupChat NIP-29 relay integration (Docker + remote)
 

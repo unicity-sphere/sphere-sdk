@@ -1,4 +1,5 @@
 export * from './LocalStorageProvider';
+export * from './IndexedDBStorageProvider';
 export * from './IndexedDBTokenStorageProvider';
 
 // IpfsStorageProvider is available via separate import:

@@ -47,6 +47,12 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     try {
       this.db = await this.openDatabase();
       this.status = 'connected';
+
+      // Best-effort background cleanup: delete stale databases from other
+      // addresses that were emptied by a previous clear() but never removed.
+      // Safe because our current database is already open and won't be affected.
+      this.cleanupStaleDatabases();
+
       return true;
     } catch (error) {
       console.error('[IndexedDBTokenStorage] Failed to initialize:', error);
@@ -245,22 +251,18 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   async clear(): Promise<boolean> {
-    // Strategy: first clear store contents (reliable, immediate), then
-    // attempt deleteDatabase (best-effort, may be blocked by open connections).
-    // This guarantees data is wiped even if deleteDatabase silently fails.
-    const dbNames: string[] = [this.dbName];
-
+    // Close connection first (no transactions), then deleteDatabase.
+    // Do NOT clearStore() before close — lingering transactions keep the
+    // connection alive and cause deleteDatabase to fire onblocked.
     try {
-      // 1. Clear current database contents
       if (this.db) {
-        await this.clearStore(STORE_TOKENS);
-        await this.clearStore(STORE_META);
         this.db.close();
         this.db = null;
       }
       this.status = 'disconnected';
 
-      // 2. Collect and clear other per-address databases
+      // Collect all databases matching our prefix
+      const dbNames = [this.dbName];
       if (typeof indexedDB.databases === 'function') {
         try {
           const dbs = await Promise.race([
@@ -272,25 +274,6 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
           for (const dbInfo of dbs) {
             if (dbInfo.name && dbInfo.name.startsWith(this.dbNamePrefix) && dbInfo.name !== this.dbName) {
               dbNames.push(dbInfo.name);
-              try {
-                const db = await new Promise<IDBDatabase>((resolve, reject) => {
-                  const req = indexedDB.open(dbInfo.name!, DB_VERSION);
-                  req.onsuccess = () => resolve(req.result);
-                  req.onerror = () => reject(req.error);
-                  req.onupgradeneeded = (e) => {
-                    const d = (e.target as IDBOpenDBRequest).result;
-                    if (!d.objectStoreNames.contains(STORE_TOKENS)) d.createObjectStore(STORE_TOKENS, { keyPath: 'id' });
-                    if (!d.objectStoreNames.contains(STORE_META)) d.createObjectStore(STORE_META);
-                  };
-                });
-                const clearTx = db.transaction([STORE_TOKENS, STORE_META], 'readwrite');
-                clearTx.objectStore(STORE_TOKENS).clear();
-                clearTx.objectStore(STORE_META).clear();
-                await new Promise<void>((resolve) => { clearTx.oncomplete = () => resolve(); clearTx.onerror = () => resolve(); });
-                db.close();
-              } catch {
-                // Best effort
-              }
             }
           }
         } catch {
@@ -298,16 +281,23 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         }
       }
 
-      // 3. Attempt to delete all databases (best-effort, fire-and-forget)
-      for (const name of dbNames) {
-        try {
-          const req = indexedDB.deleteDatabase(name);
-          req.onerror = () => {};
-          req.onblocked = () => {};
-        } catch {
-          // Ignore
-        }
-      }
+      // Delete all databases and wait for completion
+      await Promise.all(dbNames.map((name) =>
+        new Promise<void>((resolve) => {
+          try {
+            const req = indexedDB.deleteDatabase(name);
+            req.onsuccess = () => resolve();
+            req.onerror = () => resolve();
+            req.onblocked = () => {
+              // Another connection is still open — resolve anyway,
+              // cleanupStaleDatabases() will retry on next initialize().
+              resolve();
+            };
+          } catch {
+            resolve();
+          }
+        }),
+      ));
 
       return true;
     } catch (err) {
@@ -319,6 +309,31 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   // =========================================================================
   // Private IndexedDB helpers
   // =========================================================================
+
+  /**
+   * Delete stale databases from other addresses (fire-and-forget, background).
+   * Called after the current database is already open, so deleteDatabase
+   * on other databases won't block anything.
+   */
+  private cleanupStaleDatabases(): void {
+    if (typeof indexedDB.databases !== 'function') return;
+
+    indexedDB.databases().then((dbs) => {
+      for (const dbInfo of dbs) {
+        if (
+          dbInfo.name &&
+          dbInfo.name.startsWith(this.dbNamePrefix) &&
+          dbInfo.name !== this.dbName
+        ) {
+          const req = indexedDB.deleteDatabase(dbInfo.name);
+          req.onerror = () => {};
+          req.onblocked = () => {};
+        }
+      }
+    }).catch(() => {
+      // Unsupported or failed — ignore
+    });
+  }
 
   private openDatabase(): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {

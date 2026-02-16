@@ -27,7 +27,7 @@ export type {
 // Convenience Factory
 // =============================================================================
 
-import { createLocalStorageProvider, type LocalStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
+import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
 import { createBrowserIpfsStorageProvider } from './ipfs';
@@ -164,8 +164,8 @@ export interface TokenSyncConfig {
 export interface BrowserProvidersConfig {
   /** Network preset: mainnet, testnet, or dev. Sets default URLs for all services */
   network?: NetworkType;
-  /** Storage configuration (localStorage) */
-  storage?: LocalStorageProviderConfig;
+  /** Storage configuration (IndexedDB) */
+  storage?: IndexedDBStorageProviderConfig;
   /** Transport (Nostr) configuration - supports extend/override pattern */
   transport?: TransportConfig;
   /** Oracle (Aggregator) configuration - supports extend/override pattern */
@@ -367,7 +367,7 @@ export function createBrowserProviders(config?: BrowserProvidersConfig): Browser
   const l1Config = resolveL1Config(network, config?.l1);
   const tokenSyncConfig = resolveTokenSyncConfig(network, config?.tokenSync);
 
-  const storage = createLocalStorageProvider(config?.storage);
+  const storage = createIndexedDBStorageProvider(config?.storage);
   const priceConfig = resolvePriceConfig(config?.price, storage);
 
   // Create IPFS storage provider if enabled

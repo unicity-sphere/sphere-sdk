@@ -68,6 +68,55 @@ npm run cli -- --help
 | **Instant** (default) | `--instant` | Sends tokens via Nostr immediately. Receiver resolves proofs in background. Fastest sender experience (~2-3s). |
 | **Conservative** | `--conservative` | Collects all aggregator proofs first, then sends fully finalized tokens. Slower but receiver gets immediately usable tokens. |
 
+### Address Management
+
+```bash
+npm run cli -- addresses                        # List all tracked addresses
+npm run cli -- switch 1                         # Switch to address at HD index 1
+npm run cli -- hide 2                           # Hide address from active list
+npm run cli -- unhide 2                         # Unhide address
+```
+
+### Direct Messages
+
+```bash
+npm run cli -- dm @alice "Hello, how are you?"  # Send a DM
+npm run cli -- dm-inbox                         # List conversations + unread counts
+npm run cli -- dm-history @alice                 # Show conversation history
+npm run cli -- dm-history @alice --limit 20      # Limit messages shown
+```
+
+### Group Chat (NIP-29)
+
+```bash
+npm run cli -- group-list                                        # List available groups
+npm run cli -- group-create "Trading Chat" --description "Discuss trades"  # Create group
+npm run cli -- group-create "Private" --private                  # Create private group
+npm run cli -- group-join <groupId>                              # Join a group
+npm run cli -- group-join <groupId> --invite <code>              # Join with invite code
+npm run cli -- group-send <groupId> "Hello everyone!"            # Send message
+npm run cli -- group-send <groupId> "Reply" --reply <eventId>    # Reply to message
+npm run cli -- group-messages <groupId> --limit 20               # Show messages
+npm run cli -- group-members <groupId>                           # List members
+npm run cli -- group-info <groupId>                              # Show group details
+npm run cli -- group-leave <groupId>                             # Leave group
+npm run cli -- group-my                                          # List your groups
+```
+
+### Market (Intent Bulletin Board)
+
+```bash
+npm run cli -- market-post "Buying 100 UCT" --type buy                    # Post buy intent
+npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD  # Post sell intent
+npm run cli -- market-post "Web dev services" --type service              # Post service intent
+npm run cli -- market-search "UCT tokens" --type sell --limit 5           # Search intents
+npm run cli -- market-search "tokens" --min-score 0.7                     # Search with score threshold
+npm run cli -- market-my                                                  # List own intents
+npm run cli -- market-close <id>                                          # Close an intent
+npm run cli -- market-feed                                                # Watch live feed (WebSocket)
+npm run cli -- market-feed --rest                                         # Fetch recent (REST fallback)
+```
+
 ### Wallet Profiles
 
 Manage multiple wallets for testing:

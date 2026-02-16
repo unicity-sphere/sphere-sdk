@@ -31,3 +31,6 @@ coverage/
 
 # CLI wallet profiles and test wallets
 .sphere-cli*/
+
+# Integration test data
+tests/integration/.test-*/

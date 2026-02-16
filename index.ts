@@ -62,6 +62,17 @@ export type {
 } from './core';
 
 // =============================================================================
+// Constants & Address Utilities
+// =============================================================================
+
+export {
+  getAddressId,
+  getAddressStorageKey,
+  STORAGE_KEYS_ADDRESS,
+  STORAGE_KEYS_GLOBAL,
+} from './constants';
+
+// =============================================================================
 // Core Utilities
 // =============================================================================
 
@@ -193,6 +204,8 @@ export {
 export type {
   CommunicationsModuleConfig,
   CommunicationsModuleDependencies,
+  ConversationPage,
+  GetConversationPageOptions,
 } from './modules/communications';
 
 export {

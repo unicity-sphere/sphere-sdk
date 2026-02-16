@@ -13,6 +13,7 @@ import type {
 } from '../../types';
 import type { StorageProvider } from '../../storage';
 import type { TransportProvider, IncomingMessage, IncomingBroadcast } from '../../transport';
+import { STORAGE_KEYS_ADDRESS } from '../../constants';
 
 // =============================================================================
 // Configuration
@@ -21,10 +22,29 @@ import type { TransportProvider, IncomingMessage, IncomingBroadcast } from '../.
 export interface CommunicationsModuleConfig {
   /** Auto-save messages */
   autoSave?: boolean;
-  /** Max messages in memory */
+  /** Max messages in memory (global cap) */
   maxMessages?: number;
+  /** Max messages per conversation (default: 200) */
+  maxPerConversation?: number;
   /** Enable read receipts */
   readReceipts?: boolean;
+}
+
+// =============================================================================
+// Pagination Types
+// =============================================================================
+
+export interface ConversationPage {
+  messages: DirectMessage[];
+  hasMore: boolean;
+  oldestTimestamp: number | null;
+}
+
+export interface GetConversationPageOptions {
+  /** Max messages to return (default: 20) */
+  limit?: number;
+  /** Return messages older than this timestamp */
+  before?: number;
 }
 
 // =============================================================================
@@ -64,6 +84,7 @@ export class CommunicationsModule {
     this.config = {
       autoSave: config?.autoSave ?? true,
       maxMessages: config?.maxMessages ?? 1000,
+      maxPerConversation: config?.maxPerConversation ?? 200,
       readReceipts: config?.readReceipts ?? true,
     };
   }
@@ -76,6 +97,10 @@ export class CommunicationsModule {
    * Initialize module with dependencies
    */
   initialize(deps: CommunicationsModuleDependencies): void {
+    // Clean up previous subscriptions before re-initializing
+    this.unsubscribeMessages?.();
+    this.unsubscribeComposing?.();
+
     this.deps = deps;
 
     // Subscribe to incoming messages
@@ -117,17 +142,47 @@ export class CommunicationsModule {
   }
 
   /**
-   * Load messages from storage
+   * Load messages from storage.
+   * Uses per-address key (STORAGE_KEYS_ADDRESS.MESSAGES) which is automatically
+   * scoped by LocalStorageProvider to sphere_DIRECT_xxx_yyy_messages.
+   * Falls back to legacy global 'direct_messages' key for migration.
    */
   async load(): Promise<void> {
     this.ensureInitialized();
 
-    const data = await this.deps!.storage.get('direct_messages');
+    // Always clear in-memory state before loading new address data.
+    // Without this, switching to an address with no stored messages
+    // would leave the previous address's messages visible.
+    this.messages.clear();
+
+    // Try per-address key first
+    let data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.MESSAGES);
+
     if (data) {
       const messages = JSON.parse(data) as DirectMessage[];
-      this.messages.clear();
       for (const msg of messages) {
         this.messages.set(msg.id, msg);
+      }
+      return;
+    }
+
+    // Migration: fall back to legacy global key, filter for current identity
+    data = await this.deps!.storage.get('direct_messages');
+    if (data) {
+      const allMessages = JSON.parse(data) as DirectMessage[];
+      const myPubkey = this.deps!.identity.chainPubkey;
+      const myMessages = allMessages.filter(
+        (m) => m.senderPubkey === myPubkey || m.recipientPubkey === myPubkey,
+      );
+
+      for (const msg of myMessages) {
+        this.messages.set(msg.id, msg);
+      }
+
+      // Persist to new per-address key
+      if (myMessages.length > 0) {
+        await this.save();
+        console.log(`[Communications] Migrated ${myMessages.length} messages to per-address storage`);
       }
     }
   }
@@ -264,6 +319,44 @@ export class CommunicationsModule {
     }
 
     return messages.length;
+  }
+
+  /**
+   * Get a page of messages from a conversation (for lazy loading).
+   * Returns messages in chronological order with a cursor for loading older messages.
+   */
+  getConversationPage(peerPubkey: string, options?: GetConversationPageOptions): ConversationPage {
+    const limit = options?.limit ?? 20;
+    const before = options?.before ?? Infinity;
+
+    const all = Array.from(this.messages.values())
+      .filter(
+        (m) =>
+          (m.senderPubkey === peerPubkey || m.recipientPubkey === peerPubkey) &&
+          m.timestamp < before,
+      )
+      .sort((a, b) => b.timestamp - a.timestamp); // newest first for slicing
+
+    const page = all.slice(0, limit);
+    return {
+      messages: page.reverse(), // chronological order for display
+      hasMore: all.length > limit,
+      oldestTimestamp: page.length > 0 ? page[0].timestamp : null,
+    };
+  }
+
+  /**
+   * Delete all messages in a conversation with a peer
+   */
+  async deleteConversation(peerPubkey: string): Promise<void> {
+    for (const [id, msg] of this.messages) {
+      if (msg.senderPubkey === peerPubkey || msg.recipientPubkey === peerPubkey) {
+        this.messages.delete(id);
+      }
+    }
+    if (this.config.autoSave) {
+      await this.save();
+    }
   }
 
   /**
@@ -500,10 +593,31 @@ export class CommunicationsModule {
 
   private async save(): Promise<void> {
     const messages = Array.from(this.messages.values());
-    await this.deps!.storage.set('direct_messages', JSON.stringify(messages));
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, JSON.stringify(messages));
   }
 
   private pruneIfNeeded(): void {
+    // Per-conversation pruning
+    const byPeer = new Map<string, DirectMessage[]>();
+    for (const msg of this.messages.values()) {
+      const peer =
+        msg.senderPubkey === this.deps?.identity.chainPubkey
+          ? msg.recipientPubkey
+          : msg.senderPubkey;
+      if (!byPeer.has(peer)) byPeer.set(peer, []);
+      byPeer.get(peer)!.push(msg);
+    }
+
+    for (const [, msgs] of byPeer) {
+      if (msgs.length <= this.config.maxPerConversation) continue;
+      msgs.sort((a, b) => a.timestamp - b.timestamp);
+      const toRemove = msgs.slice(0, msgs.length - this.config.maxPerConversation);
+      for (const msg of toRemove) {
+        this.messages.delete(msg.id);
+      }
+    }
+
+    // Global cap
     if (this.messages.size <= this.config.maxMessages) return;
 
     const sorted = Array.from(this.messages.entries())

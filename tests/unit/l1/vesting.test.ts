@@ -344,6 +344,71 @@ describe('vestingClassifier', () => {
 });
 
 // =============================================================================
+// Node.js / No IndexedDB
+// =============================================================================
+
+describe('VestingClassifier without IndexedDB (Node.js)', () => {
+  let savedIndexedDB: typeof globalThis.indexedDB;
+
+  beforeEach(() => {
+    savedIndexedDB = globalThis.indexedDB;
+    // Simulate Node.js — no IndexedDB
+    delete (globalThis as Record<string, unknown>).indexedDB;
+  });
+
+  afterEach(() => {
+    // Restore fake-indexeddb
+    globalThis.indexedDB = savedIndexedDB;
+  });
+
+  it('should not throw on initDB() when IndexedDB is unavailable', async () => {
+    const { vestingClassifier } = await import('../../../l1/vesting');
+
+    await expect(vestingClassifier.initDB()).resolves.not.toThrow();
+  });
+
+  it('should classify UTXOs using memory-only cache', async () => {
+    const { getTransaction, getCurrentBlockHeight } = await import('../../../l1/network');
+    const { vestingClassifier } = await import('../../../l1/vesting');
+
+    vi.mocked(getCurrentBlockHeight).mockResolvedValue(300000);
+    vi.mocked(getTransaction).mockResolvedValue({
+      txid: 'node_test',
+      confirmations: 200001, // block 100000
+      vin: [{ coinbase: '04ffff001d0104' }],
+    });
+
+    await vestingClassifier.initDB(); // should be a no-op
+
+    const utxos: UTXO[] = [{
+      tx_hash: 'node_test',
+      tx_pos: 0,
+      value: 5000000000,
+      height: 100000,
+    }];
+
+    const result = await vestingClassifier.classifyUtxos(utxos);
+
+    expect(result.vested).toHaveLength(1);
+    expect(result.vested[0].coinbaseHeight).toBe(100000);
+  });
+
+  it('should not throw on destroy() when IndexedDB is unavailable', async () => {
+    const { vestingClassifier } = await import('../../../l1/vesting');
+
+    await vestingClassifier.initDB();
+    await expect(vestingClassifier.destroy()).resolves.not.toThrow();
+  });
+
+  it('should not throw on clearCaches() when IndexedDB is unavailable', async () => {
+    const { vestingClassifier } = await import('../../../l1/vesting');
+
+    await vestingClassifier.initDB();
+    expect(() => vestingClassifier.clearCaches()).not.toThrow();
+  });
+});
+
+// =============================================================================
 // Edge Cases
 // =============================================================================
 
