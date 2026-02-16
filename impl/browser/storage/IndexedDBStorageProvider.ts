@@ -55,6 +55,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
     if (this.status === 'connected' && this.db) return;
 
     this.status = 'connecting';
+    console.log(`[IndexedDBStorage] connect: opening db=${this.dbName}`);
 
     try {
       this.db = await Promise.race([
@@ -64,7 +65,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
         ),
       ]);
       this.status = 'connected';
-      this.log('Connected to IndexedDB');
+      console.log(`[IndexedDBStorage] connect: connected to db=${this.dbName}`);
     } catch (error) {
       this.status = 'error';
       throw new Error(`IndexedDB not available: ${error}`);
@@ -72,12 +73,12 @@ export class IndexedDBStorageProvider implements StorageProvider {
   }
 
   async disconnect(): Promise<void> {
+    console.log(`[IndexedDBStorage] disconnect: closing db=${this.dbName}, wasConnected=${!!this.db}`);
     if (this.db) {
       this.db.close();
       this.db = null;
     }
     this.status = 'disconnected';
-    this.log('Disconnected from IndexedDB');
   }
 
   isConnected(): boolean {
@@ -145,6 +146,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
       // Close connection first (no transactions), then deleteDatabase.
       // Do NOT clearStore() before close — lingering transactions keep the
       // connection alive and cause deleteDatabase to fire onblocked.
+      console.log(`[IndexedDBStorage] clear: starting, db=${this.dbName}, wasConnected=${!!this.db}`);
       if (this.db) {
         this.db.close();
         this.db = null;
@@ -154,9 +156,18 @@ export class IndexedDBStorageProvider implements StorageProvider {
       await new Promise<void>((resolve) => {
         try {
           const req = indexedDB.deleteDatabase(this.dbName);
-          req.onsuccess = () => resolve();
-          req.onerror = () => resolve();
-          req.onblocked = () => resolve();
+          req.onsuccess = () => {
+            console.log(`[IndexedDBStorage] clear: deleted db=${this.dbName}`);
+            resolve();
+          };
+          req.onerror = () => {
+            console.warn(`[IndexedDBStorage] clear: error deleting db=${this.dbName}`, req.error);
+            resolve();
+          };
+          req.onblocked = () => {
+            console.warn(`[IndexedDBStorage] clear: deleteDatabase blocked for db=${this.dbName}`);
+            resolve();
+          };
         } catch {
           resolve();
         }

@@ -3249,6 +3249,31 @@ export class PaymentsModule {
   }
 
   /**
+   * Reload nametag data from storage providers into memory.
+   *
+   * Used as a recovery mechanism when `this.nametags` is unexpectedly empty
+   * (e.g., wiped by sync or race condition) but nametag data exists in storage.
+   */
+  private async reloadNametagsFromStorage(): Promise<void> {
+    const providers = this.getTokenStorageProviders();
+    for (const [, provider] of providers) {
+      try {
+        const result = await provider.load();
+        if (result.success && result.data) {
+          const parsed = parseTxfStorageData(result.data);
+          if (parsed.nametags.length > 0) {
+            this.nametags = parsed.nametags;
+            this.log(`Reloaded ${parsed.nametags.length} nametag(s) from storage`);
+            return;
+          }
+        }
+      } catch {
+        // Continue to next provider
+      }
+    }
+  }
+
+  /**
    * Mint a nametag token on-chain (like Sphere wallet and lottery)
    * This creates the nametag token required for receiving tokens via PROXY addresses
    *
@@ -3413,6 +3438,9 @@ export class PaymentsModule {
       let totalAdded = 0;
       let totalRemoved = 0;
 
+      // Preserve nametags — sync providers may not include _nametags in merged data
+      const savedNametags = [...this.nametags];
+
       // Sync with each provider
       for (const [providerId, provider] of providers) {
         try {
@@ -3421,6 +3449,10 @@ export class PaymentsModule {
           if (result.success && result.merged) {
             // Apply merged data from each provider
             this.loadFromStorageData(result.merged);
+            // Restore nametags if sync wiped them
+            if (this.nametags.length === 0 && savedNametags.length > 0) {
+              this.nametags = savedNametags;
+            }
             totalAdded += result.added;
             totalRemoved += result.removed;
           }
@@ -3939,7 +3971,16 @@ export class PaymentsModule {
     if (addressScheme === AddressScheme.PROXY) {
       // PROXY: Validate nametag address match (per reference impl)
       const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      const proxyNametag = this.getNametag();
+      let proxyNametag = this.getNametag();
+
+      // Recovery: if nametag is missing in memory (e.g., wiped by sync or race
+      // condition during address switch), try reloading from storage
+      if (!proxyNametag?.token) {
+        this.log('Nametag missing in memory, attempting reload from storage...');
+        await this.reloadNametagsFromStorage();
+        proxyNametag = this.getNametag();
+      }
+
       if (!proxyNametag?.token) {
         throw new Error('Cannot finalize PROXY transfer - no nametag token');
       }

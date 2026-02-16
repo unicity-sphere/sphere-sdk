@@ -41,18 +41,23 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       const addressId = getAddressId(identity.directAddress);
       this.dbName = `${this.dbNamePrefix}-${addressId}`;
     }
+    console.log(`[IndexedDBTokenStorage] setIdentity → db=${this.dbName}`);
   }
 
   async initialize(): Promise<boolean> {
     try {
+      // Close any existing connection before opening a new one
+      // (e.g. when switching addresses — prevents leaked IDB connections)
+      if (this.db) {
+        console.log(`[IndexedDBTokenStorage] initialize: closing existing connection before re-open (db=${this.dbName})`);
+        this.db.close();
+        this.db = null;
+      }
+
+      console.log(`[IndexedDBTokenStorage] initialize: opening db=${this.dbName}`);
       this.db = await this.openDatabase();
       this.status = 'connected';
-
-      // Best-effort background cleanup: delete stale databases from other
-      // addresses that were emptied by a previous clear() but never removed.
-      // Safe because our current database is already open and won't be affected.
-      this.cleanupStaleDatabases();
-
+      console.log(`[IndexedDBTokenStorage] initialize: connected to db=${this.dbName}`);
       return true;
     } catch (error) {
       console.error('[IndexedDBTokenStorage] Failed to initialize:', error);
@@ -62,6 +67,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   }
 
   async shutdown(): Promise<void> {
+    console.log(`[IndexedDBTokenStorage] shutdown: closing db=${this.dbName}, wasConnected=${!!this.db}`);
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -87,6 +93,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
 
   async load(): Promise<LoadResult<TxfStorageDataBase>> {
     if (!this.db) {
+      console.warn(`[IndexedDBTokenStorage] load: db not initialized (db=${this.dbName})`);
       return {
         success: false,
         error: 'Database not initialized',
@@ -153,6 +160,9 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         data._invalid = invalid;
       }
 
+      const tokenKeys = Object.keys(data).filter(k => k.startsWith('_') && !['_meta', '_tombstones', '_outbox', '_sent', '_invalid'].includes(k));
+      console.log(`[IndexedDBTokenStorage] load: db=${this.dbName}, tokens=${tokenKeys.length}`);
+
       return {
         success: true,
         data,
@@ -160,6 +170,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         timestamp: Date.now(),
       };
     } catch (error) {
+      console.error(`[IndexedDBTokenStorage] load failed: db=${this.dbName}`, error);
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -171,6 +182,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
 
   async save(data: TxfStorageDataBase): Promise<SaveResult> {
     if (!this.db) {
+      console.warn(`[IndexedDBTokenStorage] save: db not initialized (db=${this.dbName})`);
       return {
         success: false,
         error: 'Database not initialized',
@@ -179,6 +191,10 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     }
 
     try {
+      const tokenKeys = Object.keys(data).filter(k => k.startsWith('_') && !['_meta', '_tombstones', '_outbox', '_sent', '_invalid'].includes(k));
+      const archivedKeys = Object.keys(data).filter(k => k.startsWith('archived-'));
+      console.log(`[IndexedDBTokenStorage] save: db=${this.dbName}, tokens=${tokenKeys.length}, archived=${archivedKeys.length}, tombstones=${data._tombstones?.length ?? 0}`);
+
       // Save meta
       await this.putToStore(STORE_META, 'meta', data._meta);
 
@@ -255,6 +271,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     // Do NOT clearStore() before close — lingering transactions keep the
     // connection alive and cause deleteDatabase to fire onblocked.
     try {
+      console.log(`[IndexedDBTokenStorage] clear: starting, db=${this.dbName}, wasConnected=${!!this.db}`);
       if (this.db) {
         this.db.close();
         this.db = null;
@@ -281,16 +298,23 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         }
       }
 
+      console.log(`[IndexedDBTokenStorage] clear: deleting ${dbNames.length} database(s):`, dbNames);
+
       // Delete all databases and wait for completion
       await Promise.all(dbNames.map((name) =>
         new Promise<void>((resolve) => {
           try {
             const req = indexedDB.deleteDatabase(name);
-            req.onsuccess = () => resolve();
-            req.onerror = () => resolve();
+            req.onsuccess = () => {
+              console.log(`[IndexedDBTokenStorage] clear: deleted db=${name}`);
+              resolve();
+            };
+            req.onerror = () => {
+              console.warn(`[IndexedDBTokenStorage] clear: error deleting db=${name}`, req.error);
+              resolve();
+            };
             req.onblocked = () => {
-              // Another connection is still open — resolve anyway,
-              // cleanupStaleDatabases() will retry on next initialize().
+              console.warn(`[IndexedDBTokenStorage] clear: deleteDatabase blocked for db=${name}`);
               resolve();
             };
           } catch {
@@ -299,6 +323,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         }),
       ));
 
+      console.log(`[IndexedDBTokenStorage] clear: done`);
       return true;
     } catch (err) {
       console.warn('[IndexedDBTokenStorage] clear() failed:', err);
@@ -309,31 +334,6 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
   // =========================================================================
   // Private IndexedDB helpers
   // =========================================================================
-
-  /**
-   * Delete stale databases from other addresses (fire-and-forget, background).
-   * Called after the current database is already open, so deleteDatabase
-   * on other databases won't block anything.
-   */
-  private cleanupStaleDatabases(): void {
-    if (typeof indexedDB.databases !== 'function') return;
-
-    indexedDB.databases().then((dbs) => {
-      for (const dbInfo of dbs) {
-        if (
-          dbInfo.name &&
-          dbInfo.name.startsWith(this.dbNamePrefix) &&
-          dbInfo.name !== this.dbName
-        ) {
-          const req = indexedDB.deleteDatabase(dbInfo.name);
-          req.onerror = () => {};
-          req.onblocked = () => {};
-        }
-      }
-    }).catch(() => {
-      // Unsupported or failed — ignore
-    });
-  }
 
   private openDatabase(): Promise<IDBDatabase> {
     return new Promise((resolve, reject) => {

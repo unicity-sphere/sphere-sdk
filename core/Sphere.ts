@@ -852,7 +852,9 @@ export class Sphere {
     const storage = 'get' in storageOrOptions ? storageOrOptions as StorageProvider : storageOrOptions.storage;
     const tokenStorage = 'get' in storageOrOptions ? undefined : storageOrOptions.tokenStorage;
 
-    // 1. Destroy Sphere instance — closes all connections
+    // 1. Destroy Sphere instance — flushes pending IPFS writes (saves good
+    //    state), then closes all connections. Awaited so IPFS completes
+    //    before we delete databases.
     if (Sphere.instance) {
       console.log('[Sphere.clear] Destroying Sphere instance...');
       await Sphere.instance.destroy();
@@ -860,65 +862,45 @@ export class Sphere {
     }
 
     // 2. Clear L1 vesting cache
+    console.log('[Sphere.clear] Clearing L1 vesting cache...');
     await vestingClassifier.destroy();
 
-    // 3. Delete ALL sphere IndexedDB databases directly.
-    //    We don't go through providers because leaked connections from
-    //    concurrent connect() calls can block deleteDatabase via onblocked.
-    //    After destroy(), there are no active Sphere operations, so any
-    //    leaked IDBDatabase references will be GC'd once we yield.
-    if (typeof indexedDB !== 'undefined' && typeof indexedDB.databases === 'function') {
-      console.log('[Sphere.clear] Deleting all sphere IndexedDB databases...');
-      try {
-        const dbs = await Promise.race([
-          indexedDB.databases(),
-          new Promise<IDBDatabaseInfo[]>((_, reject) =>
-            setTimeout(() => reject(new Error('timeout')), 2000),
-          ),
-        ]);
-        const sphereDbs = dbs.filter((db) => db.name?.startsWith('sphere'));
-        if (sphereDbs.length > 0) {
-          await Promise.all(sphereDbs.map((db) =>
-            new Promise<void>((resolve) => {
-              const req = indexedDB.deleteDatabase(db.name!);
-              req.onsuccess = () => {
-                console.log(`[Sphere.clear] Deleted ${db.name}`);
-                resolve();
-              };
-              req.onerror = () => resolve();
-              req.onblocked = () => {
-                console.warn(`[Sphere.clear] deleteDatabase blocked: ${db.name}`);
-                resolve();
-              };
-            }),
-          ));
-        }
-        console.log('[Sphere.clear] IndexedDB cleanup done');
-      } catch {
-        console.warn('[Sphere.clear] IndexedDB enumeration failed');
-      }
-    }
+    // 3. Yield to let IndexedDB finalize pending transactions after close().
+    //    db.close() is synchronous but the connection isn't fully released
+    //    until all in-flight transactions complete. Without this yield,
+    //    deleteDatabase() fires onblocked.
+    console.log('[Sphere.clear] Yielding 50ms for IDB transaction settlement...');
+    await new Promise((r) => setTimeout(r, 50));
 
-    // 4. Clear token storage (for non-IndexedDB backends like FileTokenStorageProvider)
+    // 4. Delete token databases (sphere-token-storage-*)
     if (tokenStorage?.clear) {
+      console.log('[Sphere.clear] Clearing token storage...');
       try {
         await tokenStorage.clear();
+        console.log('[Sphere.clear] Token storage cleared');
       } catch (err) {
         console.warn('[Sphere.clear] Token storage clear failed:', err);
       }
+    } else {
+      console.log('[Sphere.clear] No token storage provider to clear');
     }
 
-    // 5. Clear provider state (handles localStorage fallback, non-IDB backends)
+    // 5. Delete KV database (sphere-storage)
+    console.log('[Sphere.clear] Clearing KV storage...');
     if (!storage.isConnected()) {
       try {
         await storage.connect();
       } catch {
-        // Database was already deleted above — that's fine
+        // May fail if database was already deleted — that's fine
       }
     }
     if (storage.isConnected()) {
       await storage.clear();
+      console.log('[Sphere.clear] KV storage cleared');
+    } else {
+      console.log('[Sphere.clear] KV storage not connected, skipping');
     }
+    console.log('[Sphere.clear] Done');
   }
 
   /**
@@ -2014,9 +1996,14 @@ export class Sphere {
     this._storage.setIdentity(this._identity);
     await this._transport.setIdentity(this._identity);
 
-    // Update token storage providers and re-open databases for new address
-    for (const provider of this._tokenStorageProviders.values()) {
+    // Close current token storage connections, then re-open for new address.
+    // Shutdown first prevents leaked IDB connections that block deleteDatabase.
+    console.log(`[Sphere] switchToAddress(${index}): re-initializing ${this._tokenStorageProviders.size} token storage provider(s)`);
+    for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
+      console.log(`[Sphere] switchToAddress(${index}): shutdown provider=${providerId}`);
+      await provider.shutdown();
       provider.setIdentity(this._identity);
+      console.log(`[Sphere] switchToAddress(${index}): initialize provider=${providerId}`);
       await provider.initialize();
     }
 
@@ -2117,6 +2104,13 @@ export class Sphere {
     await this._communications.load();
     await this._groupChat?.load();
     await this._market?.load();
+
+    // After loading from local storage, sync with remote (IPFS) to restore
+    // tokens that exist remotely but not locally (e.g. after address switch
+    // where the local IndexedDB is empty but IPFS has the data).
+    this._payments.sync().catch((err) => {
+      console.warn('[Sphere] Post-switch sync failed:', err);
+    });
   }
 
   /**

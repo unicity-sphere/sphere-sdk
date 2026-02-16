@@ -948,3 +948,216 @@ describe('getFiatBalance()', () => {
     expect(balance).toBeNull();
   });
 });
+
+// =============================================================================
+// Nametag preservation during sync
+// =============================================================================
+
+describe('Nametag preservation during sync', () => {
+  function createInitializedModule(tokenStorageProviders: Map<string, unknown>) {
+    const module = createPaymentsModule();
+    const mockIdentity = {
+      chainPubkey: '02' + '0'.repeat(64),
+      l1Address: 'alpha1test',
+      directAddress: 'DIRECT://test',
+      privateKey: '0'.repeat(64),
+    };
+    const mockStorage = {
+      get: vi.fn().mockResolvedValue(null),
+      set: vi.fn().mockResolvedValue(undefined),
+      remove: vi.fn().mockResolvedValue(undefined),
+      has: vi.fn().mockResolvedValue(false),
+      keys: vi.fn().mockResolvedValue([]),
+      clear: vi.fn().mockResolvedValue(undefined),
+      setIdentity: vi.fn(),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected'),
+      id: 'mock-storage',
+      name: 'Mock Storage',
+      type: 'local' as const,
+      saveTrackedAddresses: vi.fn().mockResolvedValue(undefined),
+      loadTrackedAddresses: vi.fn().mockResolvedValue([]),
+    };
+    const mockTransport = {
+      onTokenTransfer: vi.fn().mockReturnValue(() => {}),
+      onPaymentRequest: vi.fn().mockReturnValue(() => {}),
+      onPaymentRequestResponse: vi.fn().mockReturnValue(() => {}),
+      resolve: vi.fn().mockResolvedValue(null),
+      id: 'mock-transport',
+      name: 'Mock Transport',
+      type: 'transport' as const,
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected'),
+      setIdentity: vi.fn().mockResolvedValue(undefined),
+    };
+    const mockOracle = {
+      validateToken: vi.fn().mockResolvedValue({ valid: true }),
+      id: 'mock-oracle',
+      name: 'Mock Oracle',
+      type: 'oracle' as const,
+      initialize: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected'),
+    };
+
+    module.initialize({
+      identity: mockIdentity,
+      storage: mockStorage,
+      tokenStorageProviders: tokenStorageProviders as Map<string, never>,
+      transport: mockTransport as never,
+      oracle: mockOracle as never,
+      emitEvent: vi.fn(),
+    });
+
+    return module;
+  }
+
+  const TEST_NAMETAG = {
+    name: 'testuser',
+    token: { genesis: { data: 'test' }, state: {}, transactions: [], nametags: [] },
+    timestamp: Date.now(),
+    format: 'txf',
+    version: '2.0',
+  };
+
+  it('should preserve nametags when sync provider returns merged data without _nametags', async () => {
+    const mockProvider = {
+      id: 'test-provider',
+      name: 'Test Provider',
+      type: 'local' as const,
+      setIdentity: vi.fn(),
+      initialize: vi.fn().mockResolvedValue(true),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected' as const),
+      save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
+      load: vi.fn().mockResolvedValue({ success: true, data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } }, source: 'local', timestamp: Date.now() }),
+      sync: vi.fn().mockResolvedValue({
+        success: true,
+        // Merged data WITHOUT _nametags — simulates IPFS returning data that lacks nametags
+        merged: {
+          _meta: { version: 2, address: '', formatVersion: '2.0', updatedAt: Date.now() },
+        },
+        added: 0,
+        removed: 0,
+        conflicts: 0,
+      }),
+    };
+
+    const providers = new Map([['test', mockProvider]]);
+    const module = createInitializedModule(providers);
+
+    // Set nametag first
+    await module.setNametag(TEST_NAMETAG);
+    expect(module.hasNametag()).toBe(true);
+    expect(module.getNametag()?.name).toBe('testuser');
+
+    // Sync — provider returns merged data without _nametags
+    await module.sync();
+
+    // Nametag should be preserved despite sync
+    expect(module.hasNametag()).toBe(true);
+    expect(module.getNametag()?.name).toBe('testuser');
+    expect(module.getNametag()?.token).toBeTruthy();
+  });
+
+  it('should update nametags when sync provider returns valid _nametags', async () => {
+    const updatedNametag = {
+      name: 'updateduser',
+      token: { genesis: { data: 'updated' }, state: {}, transactions: [], nametags: [] },
+      timestamp: Date.now() + 1000,
+      format: 'txf',
+      version: '2.0',
+    };
+
+    const mockProvider = {
+      id: 'test-provider',
+      name: 'Test Provider',
+      type: 'local' as const,
+      setIdentity: vi.fn(),
+      initialize: vi.fn().mockResolvedValue(true),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected' as const),
+      save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
+      load: vi.fn().mockResolvedValue({ success: true, data: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } }, source: 'local', timestamp: Date.now() }),
+      sync: vi.fn().mockResolvedValue({
+        success: true,
+        merged: {
+          _meta: { version: 2, address: '', formatVersion: '2.0', updatedAt: Date.now() },
+          _nametags: [updatedNametag],
+        },
+        added: 0,
+        removed: 0,
+        conflicts: 0,
+      }),
+    };
+
+    const providers = new Map([['test', mockProvider]]);
+    const module = createInitializedModule(providers);
+
+    await module.setNametag(TEST_NAMETAG);
+    expect(module.getNametag()?.name).toBe('testuser');
+
+    // Sync — provider returns merged data WITH different nametag
+    await module.sync();
+
+    // Nametag should be updated to the one from merged data
+    expect(module.hasNametag()).toBe(true);
+    expect(module.getNametag()?.name).toBe('updateduser');
+  });
+
+  it('should recover nametags from storage via reloadNametagsFromStorage', async () => {
+    const mockProvider = {
+      id: 'test-provider',
+      name: 'Test Provider',
+      type: 'local' as const,
+      setIdentity: vi.fn(),
+      initialize: vi.fn().mockResolvedValue(true),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      connect: vi.fn().mockResolvedValue(undefined),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      isConnected: vi.fn().mockReturnValue(true),
+      getStatus: vi.fn().mockReturnValue('connected' as const),
+      save: vi.fn().mockResolvedValue({ success: true, timestamp: Date.now() }),
+      // load() returns data WITH nametag — simulating nametag exists in IndexedDB
+      load: vi.fn().mockResolvedValue({
+        success: true,
+        data: {
+          _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() },
+          _nametags: [TEST_NAMETAG],
+        },
+        source: 'local',
+        timestamp: Date.now(),
+      }),
+      sync: vi.fn().mockResolvedValue({
+        success: true,
+        merged: { _meta: { version: 1, address: '', formatVersion: '2.0', updatedAt: Date.now() } },
+        added: 0,
+        removed: 0,
+        conflicts: 0,
+      }),
+    };
+
+    const providers = new Map([['test', mockProvider]]);
+    const module = createInitializedModule(providers);
+
+    // Module starts with empty nametags (simulating the bug)
+    expect(module.hasNametag()).toBe(false);
+
+    // Load the module — should populate nametags from storage
+    await module.load();
+
+    expect(module.hasNametag()).toBe(true);
+    expect(module.getNametag()?.name).toBe('testuser');
+    expect(module.getNametag()?.token).toBeTruthy();
+  });
+});
