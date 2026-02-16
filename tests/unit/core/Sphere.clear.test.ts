@@ -6,7 +6,6 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Sphere } from '../../../core/Sphere';
-import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS } from '../../../constants';
 import type { StorageProvider } from '../../../storage';
 import type { TokenStorageProvider, TxfStorageDataBase } from '../../../storage';
 import type { ProviderStatus } from '../../../types';
@@ -15,19 +14,17 @@ import type { ProviderStatus } from '../../../types';
 // Mocks
 // =============================================================================
 
-function createMockStorage(): StorageProvider & { removedKeys: string[] } {
+function createMockStorage(): StorageProvider {
   const data = new Map<string, string>();
-  const removedKeys: string[] = [];
 
   return {
     id: 'mock-storage',
     name: 'Mock Storage',
     type: 'local' as const,
-    removedKeys,
     setIdentity: vi.fn(),
     get: vi.fn(async (key: string) => data.get(key) ?? null),
     set: vi.fn(async (key: string, value: string) => { data.set(key, value); }),
-    remove: vi.fn(async (key: string) => { data.delete(key); removedKeys.push(key); }),
+    remove: vi.fn(async (key: string) => { data.delete(key); }),
     has: vi.fn(async (key: string) => data.has(key)),
     keys: vi.fn(async () => Array.from(data.keys())),
     clear: vi.fn(async () => { data.clear(); }),
@@ -35,6 +32,8 @@ function createMockStorage(): StorageProvider & { removedKeys: string[] } {
     disconnect: vi.fn(async () => {}),
     isConnected: vi.fn(() => true),
     getStatus: vi.fn((): ProviderStatus => 'connected'),
+    saveTrackedAddresses: vi.fn(async () => {}),
+    loadTrackedAddresses: vi.fn(async () => []),
   };
 }
 
@@ -82,35 +81,12 @@ describe('Sphere.clear()', () => {
   });
 
   describe('with StorageProvider only (backward compatible)', () => {
-    it('should remove all global wallet keys', async () => {
+    it('should call storage.clear() to remove all data', async () => {
       const storage = createMockStorage();
 
       await Sphere.clear(storage);
 
-      const expectedKeys = [
-        STORAGE_KEYS_GLOBAL.MNEMONIC,
-        STORAGE_KEYS_GLOBAL.MASTER_KEY,
-        STORAGE_KEYS_GLOBAL.CHAIN_CODE,
-        STORAGE_KEYS_GLOBAL.DERIVATION_PATH,
-        STORAGE_KEYS_GLOBAL.BASE_PATH,
-        STORAGE_KEYS_GLOBAL.DERIVATION_MODE,
-        STORAGE_KEYS_GLOBAL.WALLET_SOURCE,
-        STORAGE_KEYS_GLOBAL.WALLET_EXISTS,
-        STORAGE_KEYS_GLOBAL.ADDRESS_NAMETAGS,
-      ];
-
-      for (const key of expectedKeys) {
-        expect(storage.remove).toHaveBeenCalledWith(key);
-      }
-    });
-
-    it('should remove per-address data', async () => {
-      const storage = createMockStorage();
-
-      await Sphere.clear(storage);
-
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_ADDRESS.OUTBOX);
+      expect(storage.clear).toHaveBeenCalled();
     });
 
     it('should not throw when no instance exists', async () => {
@@ -130,17 +106,13 @@ describe('Sphere.clear()', () => {
       expect(tokenStorage.clear).toHaveBeenCalled();
     });
 
-    it('should clear wallet keys AND token storage', async () => {
+    it('should clear storage AND token storage', async () => {
       const storage = createMockStorage();
       const tokenStorage = createMockTokenStorage();
 
       await Sphere.clear({ storage, tokenStorage });
 
-      // Wallet keys cleared
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.MNEMONIC);
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-
-      // Token storage cleared
+      expect(storage.clear).toHaveBeenCalled();
       expect(tokenStorage.clear).toHaveBeenCalled();
     });
 
@@ -149,7 +121,7 @@ describe('Sphere.clear()', () => {
 
       await Sphere.clear({ storage });
 
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.MNEMONIC);
+      expect(storage.clear).toHaveBeenCalled();
     });
 
     it('should handle tokenStorage without clear() method', async () => {
@@ -159,7 +131,7 @@ describe('Sphere.clear()', () => {
       delete (tokenStorage as Partial<typeof tokenStorage>).clear;
 
       await expect(Sphere.clear({ storage, tokenStorage })).resolves.not.toThrow();
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.MNEMONIC);
+      expect(storage.clear).toHaveBeenCalled();
     });
   });
 
@@ -170,8 +142,7 @@ describe('Sphere.clear()', () => {
       // Old-style call: Sphere.clear(storage)
       await Sphere.clear(storage);
 
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.MNEMONIC);
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.WALLET_EXISTS);
+      expect(storage.clear).toHaveBeenCalled();
     });
 
     it('should accept options object (new API)', async () => {
@@ -180,8 +151,35 @@ describe('Sphere.clear()', () => {
       // New-style call: Sphere.clear({ storage })
       await Sphere.clear({ storage });
 
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.MNEMONIC);
-      expect(storage.remove).toHaveBeenCalledWith(STORAGE_KEYS_GLOBAL.WALLET_EXISTS);
+      expect(storage.clear).toHaveBeenCalled();
+    });
+  });
+
+  describe('instance lifecycle', () => {
+    it('should destroy existing Sphere instance before clearing', async () => {
+      const storage = createMockStorage();
+
+      // Simulate an existing instance whose destroy() resets the singleton
+      const mockInstance = {
+        destroy: vi.fn(async () => {
+          (Sphere as unknown as { instance: null }).instance = null;
+        }),
+      };
+      (Sphere as unknown as { instance: typeof mockInstance }).instance = mockInstance;
+
+      await Sphere.clear(storage);
+
+      expect(mockInstance.destroy).toHaveBeenCalled();
+      expect(Sphere.getInstance()).toBeNull();
+    });
+
+    it('should connect storage if disconnected before clearing', async () => {
+      const storage = createMockStorage();
+      (storage.isConnected as ReturnType<typeof vi.fn>).mockReturnValue(false);
+
+      await Sphere.clear(storage);
+
+      expect(storage.connect).toHaveBeenCalled();
     });
   });
 });

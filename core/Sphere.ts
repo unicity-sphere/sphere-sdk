@@ -899,7 +899,16 @@ export class Sphere {
       }
     }
 
-    // 4. Clear provider state (handles localStorage fallback, non-IDB backends)
+    // 4. Clear token storage (for non-IndexedDB backends like FileTokenStorageProvider)
+    if (tokenStorage?.clear) {
+      try {
+        await tokenStorage.clear();
+      } catch (err) {
+        console.warn('[Sphere.clear] Token storage clear failed:', err);
+      }
+    }
+
+    // 5. Clear provider state (handles localStorage fallback, non-IDB backends)
     if (!storage.isConnected()) {
       try {
         await storage.connect();

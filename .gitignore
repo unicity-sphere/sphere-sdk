@@ -33,4 +33,4 @@ coverage/
 .sphere-cli*/
 
 # Integration test data
-tests/integration/.test-*/data/
+tests/integration/.test-*/
