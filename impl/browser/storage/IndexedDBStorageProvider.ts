@@ -54,21 +54,33 @@ export class IndexedDBStorageProvider implements StorageProvider {
   async connect(): Promise<void> {
     if (this.status === 'connected' && this.db) return;
 
-    this.status = 'connecting';
-    console.log(`[IndexedDBStorage] connect: opening db=${this.dbName}`);
+    // Retry once — a pending deleteDatabase() from a prior clear() can
+    // block open() until the deletion completes. A short delay is usually
+    // enough for the browser to finish the deletion.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      this.status = 'connecting';
+      console.log(`[IndexedDBStorage] connect: opening db=${this.dbName}${attempt > 0 ? ' (retry)' : ''}`);
 
-    try {
-      this.db = await Promise.race([
-        this.openDatabase(),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('IndexedDB open timed out after 5s')), 5000),
-        ),
-      ]);
-      this.status = 'connected';
-      console.log(`[IndexedDBStorage] connect: connected to db=${this.dbName}`);
-    } catch (error) {
-      this.status = 'error';
-      throw new Error(`IndexedDB not available: ${error}`);
+      try {
+        this.db = await Promise.race([
+          this.openDatabase(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('IndexedDB open timed out after 5s')), 5000),
+          ),
+        ]);
+        this.status = 'connected';
+        console.log(`[IndexedDBStorage] connect: connected to db=${this.dbName}`);
+        return;
+      } catch (error) {
+        if (attempt === 0) {
+          console.warn(`[IndexedDBStorage] connect: open failed, retrying in 1s...`);
+          this.status = 'disconnected';
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        this.status = 'error';
+        throw new Error(`IndexedDB not available: ${error}`);
+      }
     }
   }
 
@@ -156,17 +168,24 @@ export class IndexedDBStorageProvider implements StorageProvider {
       await new Promise<void>((resolve) => {
         try {
           const req = indexedDB.deleteDatabase(this.dbName);
+          // Do NOT resolve on onblocked — the pending deleteDatabase would
+          // block all subsequent open() calls. Wait for onsuccess or timeout.
+          const timer = setTimeout(() => {
+            console.warn(`[IndexedDBStorage] clear: deleteDatabase timed out for db=${this.dbName}`);
+            resolve();
+          }, 5000);
           req.onsuccess = () => {
+            clearTimeout(timer);
             console.log(`[IndexedDBStorage] clear: deleted db=${this.dbName}`);
             resolve();
           };
           req.onerror = () => {
+            clearTimeout(timer);
             console.warn(`[IndexedDBStorage] clear: error deleting db=${this.dbName}`, req.error);
             resolve();
           };
           req.onblocked = () => {
-            console.warn(`[IndexedDBStorage] clear: deleteDatabase blocked for db=${this.dbName}`);
-            resolve();
+            console.warn(`[IndexedDBStorage] clear: deleteDatabase blocked for db=${this.dbName}, waiting...`);
           };
         } catch {
           resolve();
