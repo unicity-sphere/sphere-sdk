@@ -46,6 +46,28 @@ interface SphereInstance {
   };
   resolve(identifier: string): Promise<unknown>;
   on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void;
+  readonly communications?: {
+    getConversations(): Map<string, ConnectDirectMessage[]>;
+    getConversationPage(
+      peerPubkey: string,
+      options?: { limit?: number; before?: number },
+    ): { messages: ConnectDirectMessage[]; hasMore: boolean; oldestTimestamp: number | null };
+    getUnreadCount(peerPubkey?: string): number;
+    markAsRead(messageIds: string[]): Promise<void>;
+    sendDM(recipient: string, content: string): Promise<ConnectDirectMessage>;
+  };
+}
+
+/** Minimal DM type to avoid circular imports with Sphere core types. */
+interface ConnectDirectMessage {
+  readonly id: string;
+  readonly senderPubkey: string;
+  readonly senderNametag?: string;
+  readonly recipientPubkey: string;
+  readonly recipientNametag?: string;
+  readonly content: string;
+  readonly timestamp: number;
+  isRead: boolean;
 }
 
 const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
@@ -61,6 +83,12 @@ export class ConnectHost {
 
   // Event subscription management
   private eventSubscriptions: Map<string, () => void> = new Map(); // eventName → unsub
+
+  // Intent auto-approve: action → handler that bypasses wallet UI
+  private autoApprovedIntents = new Map<
+    string,
+    (action: string, params: Record<string, unknown>, session: ConnectSession) => Promise<{ result?: unknown; error?: { code: number; message: string } }>
+  >();
 
   // Rate limiting
   private rateLimitCounter = 0;
@@ -81,11 +109,29 @@ export class ConnectHost {
     return this.session;
   }
 
+  /** Register an auto-approve handler for an intent action (session-scoped). */
+  setIntentAutoApprove(
+    action: string,
+    handler: (
+      action: string,
+      params: Record<string, unknown>,
+      session: ConnectSession,
+    ) => Promise<{ result?: unknown; error?: { code: number; message: string } }>,
+  ): void {
+    this.autoApprovedIntents.set(action, handler);
+  }
+
+  /** Remove auto-approve for an intent action. */
+  clearIntentAutoApprove(action: string): void {
+    this.autoApprovedIntents.delete(action);
+  }
+
   /** Revoke the current session */
   revokeSession(): void {
     if (this.session) {
       this.session.active = false;
       this.cleanupEventSubscriptions();
+      this.autoApprovedIntents.clear();
       this.session = null;
       this.grantedPermissions.clear();
     }
@@ -255,6 +301,18 @@ export class ConnectHost {
       return;
     }
 
+    // Check auto-approve before delegating to wallet UI
+    const autoHandler = this.autoApprovedIntents.get(msg.action);
+    if (autoHandler) {
+      const autoResponse = await autoHandler(msg.action, msg.params, this.session);
+      if (autoResponse.error) {
+        this.sendIntentError(msg.id, autoResponse.error.code, autoResponse.error.message);
+      } else {
+        this.sendIntentResult(msg.id, autoResponse.result);
+      }
+      return;
+    }
+
     // Delegate to wallet app
     const response = await this.config.onIntent(msg.action, msg.params, this.session);
 
@@ -316,6 +374,65 @@ export class ConnectHost {
 
       case RPC_METHODS.UNSUBSCRIBE:
         return this.handleUnsubscribe(params.event as string);
+
+      case RPC_METHODS.GET_CONVERSATIONS: {
+        if (!this.sphere.communications) throw new Error('Communications module not available');
+        const convos = this.sphere.communications.getConversations();
+        const result: Array<{
+          peerPubkey: string;
+          peerNametag?: string;
+          lastMessage: ConnectDirectMessage;
+          unreadCount: number;
+          messageCount: number;
+        }> = [];
+        for (const [peer, messages] of convos) {
+          if (messages.length === 0) continue;
+          const last = messages[messages.length - 1];
+          // Find peer nametag from any message in the conversation
+          const peerNametag =
+            messages.find(m => m.senderPubkey === peer && m.senderNametag)?.senderNametag
+            ?? messages.find(m => m.recipientPubkey === peer && m.recipientNametag)?.recipientNametag;
+          result.push({
+            peerPubkey: peer,
+            peerNametag,
+            lastMessage: last,
+            unreadCount: this.sphere.communications.getUnreadCount(peer),
+            messageCount: messages.length,
+          });
+        }
+        result.sort((a, b) => b.lastMessage.timestamp - a.lastMessage.timestamp);
+        return result;
+      }
+
+      case RPC_METHODS.GET_MESSAGES: {
+        if (!this.sphere.communications) throw new Error('Communications module not available');
+        if (!params.peerPubkey) throw new Error('Missing required parameter: peerPubkey');
+        return this.sphere.communications.getConversationPage(
+          params.peerPubkey as string,
+          {
+            limit: params.limit as number | undefined,
+            before: params.before as number | undefined,
+          },
+        );
+      }
+
+      case RPC_METHODS.GET_DM_UNREAD_COUNT: {
+        if (!this.sphere.communications) throw new Error('Communications module not available');
+        return {
+          unreadCount: this.sphere.communications.getUnreadCount(
+            params.peerPubkey as string | undefined,
+          ),
+        };
+      }
+
+      case RPC_METHODS.MARK_AS_READ: {
+        if (!this.sphere.communications) throw new Error('Communications module not available');
+        if (!params.messageIds || !Array.isArray(params.messageIds)) {
+          throw new Error('Missing required parameter: messageIds (string[])');
+        }
+        await this.sphere.communications.markAsRead(params.messageIds as string[]);
+        return { marked: true, count: (params.messageIds as string[]).length };
+      }
 
       default:
         throw new Error(`Unknown method: ${method}`);
