@@ -18,7 +18,7 @@ import type {
   SphereEventMap,
 } from '../../types';
 import type { StorageProvider } from '../../storage';
-import { STORAGE_KEYS_GLOBAL, NIP29_KINDS } from '../../constants';
+import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS, NIP29_KINDS } from '../../constants';
 
 import type {
   GroupData,
@@ -135,12 +135,18 @@ export class GroupChatModule {
     this.ensureInitialized();
     const storage = this.deps!.storage;
 
+    // Always clear in-memory state first so stale data from a previous
+    // address never leaks into the newly loaded address.
+    this.groups.clear();
+    this.messages.clear();
+    this.members.clear();
+    this.processedEventIds.clear();
+
     // Load groups
-    const groupsJson = await storage.get(STORAGE_KEYS_GLOBAL.GROUP_CHAT_GROUPS);
+    const groupsJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS);
     if (groupsJson) {
       try {
         const parsed: GroupData[] = JSON.parse(groupsJson);
-        this.groups.clear();
         for (const g of parsed) {
           this.groups.set(g.id, g);
         }
@@ -150,11 +156,10 @@ export class GroupChatModule {
     }
 
     // Load messages
-    const messagesJson = await storage.get(STORAGE_KEYS_GLOBAL.GROUP_CHAT_MESSAGES);
+    const messagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
     if (messagesJson) {
       try {
         const parsed: GroupMessageData[] = JSON.parse(messagesJson);
-        this.messages.clear();
         for (const m of parsed) {
           const groupId = m.groupId;
           if (!this.messages.has(groupId)) {
@@ -168,11 +173,10 @@ export class GroupChatModule {
     }
 
     // Load members
-    const membersJson = await storage.get(STORAGE_KEYS_GLOBAL.GROUP_CHAT_MEMBERS);
+    const membersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
     if (membersJson) {
       try {
         const parsed: GroupMemberData[] = JSON.parse(membersJson);
-        this.members.clear();
         for (const m of parsed) {
           const groupId = m.groupId;
           if (!this.members.has(groupId)) {
@@ -186,7 +190,7 @@ export class GroupChatModule {
     }
 
     // Load processed event IDs
-    const processedJson = await storage.get(STORAGE_KEYS_GLOBAL.GROUP_CHAT_PROCESSED_EVENTS);
+    const processedJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS);
     if (processedJson) {
       try {
         const parsed: string[] = JSON.parse(processedJson);
@@ -246,7 +250,12 @@ export class GroupChatModule {
   // ===========================================================================
 
   async connect(): Promise<void> {
-    if (this.connected) return;
+    if (this.connected) {
+      // Already connected — refresh subscriptions for the current address
+      // (e.g., after load() switched to a different address's data).
+      await this.refreshSubscriptions();
+      return;
+    }
 
     if (this.connectPromise) {
       return this.connectPromise;
@@ -263,6 +272,32 @@ export class GroupChatModule {
 
   getConnectionStatus(): boolean {
     return this.connected;
+  }
+
+  /**
+   * Refresh subscriptions after load() switched to a different address.
+   * Clears old subscriptions, restores groups if needed, and re-subscribes.
+   */
+  private async refreshSubscriptions(): Promise<void> {
+    if (!this.client) return;
+
+    // Clear old subscriptions (for previous address's groups)
+    for (const subId of this.subscriptionIds) {
+      try { this.client.unsubscribe(subId); } catch { /* ignore */ }
+    }
+    this.subscriptionIds = [];
+
+    // Update key manager for new identity
+    const secretKey = Buffer.from(this.deps!.identity.privateKey, 'hex');
+    this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
+
+    if (this.groups.size === 0) {
+      await this.restoreJoinedGroups();
+    } else {
+      await this.subscribeToJoinedGroups();
+    }
+
+    this.deps!.emitEvent('groupchat:connection', { connected: true });
   }
 
   private async doConnect(): Promise<void> {
@@ -286,8 +321,6 @@ export class GroupChatModule {
       this.connected = true;
       this.reconnectAttempts = 0;
 
-      this.deps!.emitEvent('groupchat:connection', { connected: true });
-
       // Check if we have local groups
       if (this.groups.size === 0) {
         // No local groups — try to restore from relay (e.g., after wallet import)
@@ -296,6 +329,10 @@ export class GroupChatModule {
         // Subscribe to events for existing joined groups
         await this.subscribeToJoinedGroups();
       }
+
+      // Emit connection event AFTER groups are loaded/subscribed,
+      // so consumers don't query getGroups() while restoreJoinedGroups() is still running.
+      this.deps!.emitEvent('groupchat:connection', { connected: true });
     } catch (error) {
       console.error('[GroupChat] Failed to connect to relays', error);
       this.deps!.emitEvent('groupchat:connection', { connected: false });
@@ -1504,7 +1541,7 @@ export class GroupChatModule {
   private async persistGroups(): Promise<void> {
     if (!this.deps) return;
     const data = Array.from(this.groups.values());
-    await this.deps.storage.set(STORAGE_KEYS_GLOBAL.GROUP_CHAT_GROUPS, JSON.stringify(data));
+    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(data));
   }
 
   private async persistMessages(): Promise<void> {
@@ -1513,7 +1550,7 @@ export class GroupChatModule {
     for (const msgs of this.messages.values()) {
       allMessages.push(...msgs);
     }
-    await this.deps.storage.set(STORAGE_KEYS_GLOBAL.GROUP_CHAT_MESSAGES, JSON.stringify(allMessages));
+    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES, JSON.stringify(allMessages));
   }
 
   private async persistMembers(): Promise<void> {
@@ -1522,13 +1559,13 @@ export class GroupChatModule {
     for (const mems of this.members.values()) {
       allMembers.push(...mems);
     }
-    await this.deps.storage.set(STORAGE_KEYS_GLOBAL.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
+    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
   }
 
   private async persistProcessedEvents(): Promise<void> {
     if (!this.deps) return;
     const arr = Array.from(this.processedEventIds);
-    await this.deps.storage.set(STORAGE_KEYS_GLOBAL.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(arr));
+    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_PROCESSED_EVENTS, JSON.stringify(arr));
   }
 
   // ===========================================================================

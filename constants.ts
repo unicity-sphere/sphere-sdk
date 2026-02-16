@@ -46,15 +46,7 @@ export const STORAGE_KEYS_GLOBAL = {
   TRACKED_ADDRESSES: 'tracked_addresses',
   /** Last processed Nostr wallet event timestamp (unix seconds), keyed per pubkey */
   LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
-  /** Group chat: joined groups */
-  GROUP_CHAT_GROUPS: 'group_chat_groups',
-  /** Group chat: messages */
-  GROUP_CHAT_MESSAGES: 'group_chat_messages',
-  /** Group chat: members */
-  GROUP_CHAT_MEMBERS: 'group_chat_members',
-  /** Group chat: processed event IDs for deduplication */
-  GROUP_CHAT_PROCESSED_EVENTS: 'group_chat_processed_events',
-  /** Group chat: last used relay URL (stale data detection) */
+  /** Group chat: last used relay URL (stale data detection) — global, same relay for all addresses */
   GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
   /** Cached token registry JSON (fetched from remote) */
   TOKEN_REGISTRY_CACHE: 'token_registry_cache',
@@ -87,6 +79,14 @@ export const STORAGE_KEYS_ADDRESS = {
   TRANSACTION_HISTORY: 'transaction_history',
   /** Pending V5 finalization tokens (unconfirmed instant split tokens) */
   PENDING_V5_TOKENS: 'pending_v5_tokens',
+  /** Group chat: joined groups for this address */
+  GROUP_CHAT_GROUPS: 'group_chat_groups',
+  /** Group chat: messages for this address */
+  GROUP_CHAT_MESSAGES: 'group_chat_messages',
+  /** Group chat: members for this address */
+  GROUP_CHAT_MEMBERS: 'group_chat_members',
+  /** Group chat: processed event IDs for deduplication */
+  GROUP_CHAT_PROCESSED_EVENTS: 'group_chat_processed_events',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
