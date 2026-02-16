@@ -80,6 +80,9 @@ export class CommunicationsModule {
   private composingHandlers: Set<(indicator: ComposingIndicator) => void> = new Set();
   private broadcastHandlers: Set<(message: BroadcastMessage) => void> = new Set();
 
+  // Timestamp of module initialization — messages older than this are historical
+  private initializedAt: number = 0;
+
   constructor(config?: CommunicationsModuleConfig) {
     this.config = {
       autoSave: config?.autoSave ?? true,
@@ -102,6 +105,7 @@ export class CommunicationsModule {
     this.unsubscribeComposing?.();
 
     this.deps = deps;
+    this.initializedAt = Date.now();
 
     // Subscribe to incoming messages
     this.unsubscribeMessages = deps.transport.onMessage((msg) => {
@@ -479,6 +483,10 @@ export class CommunicationsModule {
   // ===========================================================================
 
   private handleIncomingMessage(msg: IncomingMessage): void {
+    // Messages older than initialization are historical (e.g. recovered after
+    // storage clear). Mark them as read so they don't inflate unread counts.
+    const isHistorical = msg.timestamp < this.initializedAt;
+
     // Self-wrap replay: sent message recovered from relay
     if (msg.isSelfWrap && msg.recipientTransportPubkey) {
       // Dedup: skip if already known
@@ -491,7 +499,7 @@ export class CommunicationsModule {
         recipientPubkey: msg.recipientTransportPubkey,
         content: msg.content,
         timestamp: msg.timestamp,
-        isRead: false,
+        isRead: isHistorical,
       };
 
       this.messages.set(message.id, message);
@@ -518,7 +526,7 @@ export class CommunicationsModule {
       recipientPubkey: this.deps!.identity.chainPubkey,
       content: msg.content,
       timestamp: msg.timestamp,
-      isRead: false,
+      isRead: isHistorical,
     };
 
     this.messages.set(message.id, message);
