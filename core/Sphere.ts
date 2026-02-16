@@ -414,20 +414,23 @@ export class Sphere {
         await storage.connect();
       }
 
-      // Check for mnemonic or master_key directly
-      // These are saved with 'default' address before identity is set
-      const mnemonic = await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC);
-      if (mnemonic) return true;
+      try {
+        // Check for mnemonic or master_key directly
+        // These are saved with 'default' address before identity is set
+        const mnemonic = await storage.get(STORAGE_KEYS_GLOBAL.MNEMONIC);
+        if (mnemonic) return true;
 
-      const masterKey = await storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
-      if (masterKey) return true;
+        const masterKey = await storage.get(STORAGE_KEYS_GLOBAL.MASTER_KEY);
+        if (masterKey) return true;
 
-      // No wallet found — disconnect so we don't leave an empty database open
-      if (!wasConnected) {
-        await storage.disconnect();
+        return false;
+      } finally {
+        // Always restore original connection state — callers (create, load,
+        // import) are responsible for connecting storage when they need it.
+        if (!wasConnected) {
+          await storage.disconnect();
+        }
       }
-
-      return false;
     } catch {
       return false;
     }
@@ -592,6 +595,11 @@ export class Sphere {
       throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
     }
 
+    // exists() restores original (disconnected) state — reconnect for writes
+    if (!options.storage.isConnected()) {
+      await options.storage.connect();
+    }
+
     // Configure TokenRegistry in main bundle context (see init() for details)
     Sphere.configureTokenRegistry(options.storage, options.network);
 
@@ -674,6 +682,11 @@ export class Sphere {
       marketConfig,
     );
     sphere._password = options.password ?? null;
+
+    // exists() restores original (disconnected) state — reconnect for reads
+    if (!options.storage.isConnected()) {
+      await options.storage.connect();
+    }
 
     // Load identity from storage
     await sphere.loadIdentityFromStorage();
