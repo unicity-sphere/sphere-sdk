@@ -55,6 +55,7 @@ interface SphereInstance {
     getUnreadCount(peerPubkey?: string): number;
     markAsRead(messageIds: string[]): Promise<void>;
     sendDM(recipient: string, content: string): Promise<ConnectDirectMessage>;
+    resolvePeerNametag(peerPubkey: string): Promise<string | undefined>;
   };
 }
 
@@ -385,6 +386,8 @@ export class ConnectHost {
           unreadCount: number;
           messageCount: number;
         }> = [];
+        // Collect conversations and track which ones need nametag resolution
+        const needsResolve: Array<{ index: number; peerPubkey: string }> = [];
         for (const [peer, messages] of convos) {
           if (messages.length === 0) continue;
           const last = messages[messages.length - 1];
@@ -392,6 +395,7 @@ export class ConnectHost {
           const peerNametag =
             messages.find(m => m.senderPubkey === peer && m.senderNametag)?.senderNametag
             ?? messages.find(m => m.recipientPubkey === peer && m.recipientNametag)?.recipientNametag;
+          const idx = result.length;
           result.push({
             peerPubkey: peer,
             peerNametag,
@@ -399,6 +403,22 @@ export class ConnectHost {
             unreadCount: this.sphere.communications.getUnreadCount(peer),
             messageCount: messages.length,
           });
+          if (!peerNametag) {
+            needsResolve.push({ index: idx, peerPubkey: peer });
+          }
+        }
+        // Resolve missing nametags via transport (parallel, best-effort)
+        if (needsResolve.length > 0) {
+          const resolved = await Promise.all(
+            needsResolve.map(({ peerPubkey }) =>
+              this.sphere.communications!.resolvePeerNametag(peerPubkey).catch(() => undefined),
+            ),
+          );
+          for (let i = 0; i < needsResolve.length; i++) {
+            if (resolved[i]) {
+              result[needsResolve[i].index].peerNametag = resolved[i];
+            }
+          }
         }
         result.sort((a, b) => b.lastMessage.timestamp - a.lastMessage.timestamp);
         return result;

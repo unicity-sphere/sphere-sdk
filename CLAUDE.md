@@ -149,6 +149,7 @@ await sphere.destroy();
 | `sphere.payments.l1.send(request)` | `L1SendResult` | Send L1 transaction |
 | `sphere.payments.l1.getHistory(limit?)` | `L1Transaction[]` | L1 tx history |
 | `sphere.resolve(identifier)` | `PeerInfo \| null` | Resolve @nametag/address/pubkey |
+| `sphere.communications.resolvePeerNametag(pubkey)` | `string \| undefined` | Resolve peer nametag via transport |
 | `sphere.registerNametag(name)` | `void` | Register nametag (mints on-chain) |
 | `sphere.switchToAddress(index)` | `void` | Switch HD address |
 | `sphere.getActiveAddresses()` | `TrackedAddress[]` | Non-hidden tracked addresses |
@@ -401,6 +402,14 @@ npm run typecheck
 - Returns `PeerInfo` with all address formats, or `null` if not found
 - Identity binding event published on `init()`/`load()` — wallet discoverable without nametag
 
+### DM Nametag Resolution
+- In DMs, peer nametag can come from two sources:
+  1. **Message-embedded**: `senderNametag` field in `DirectMessage` (set by sender in NIP-17 JSON payload)
+  2. **Transport fallback**: `CommunicationsModule.resolvePeerNametag(pubkey)` — live lookup via `transport.resolveTransportPubkeyInfo()` against Nostr relay binding events
+- `ConnectHost.GET_CONVERSATIONS` automatically falls back to transport resolution when no nametag found in messages
+- Consumers using the SDK directly (e.g., agentsphere) should call `resolvePeerNametag()` for conversations missing nametags
+- Resolution is best-effort: errors are silently caught, returns `undefined` on failure
+
 ### Transport vs Chain Pubkeys
 - `chainPubkey`: 33-byte compressed secp256k1 for L3 chain operations
 - `transportPubkey`: Derived key for transport messaging (HKDF from private key)
@@ -482,6 +491,7 @@ Key test files:
 - `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/modules/CommunicationsModule.storage.test.ts` - DM per-address storage, migration, pagination
+- `tests/unit/modules/CommunicationsModule.resolve.test.ts` - Peer nametag resolution via transport fallback
 - `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider: caching, deduplication, rate-limit backoff, persistent storage, unlisted tokens
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities (incl. vesting Node.js fallback)

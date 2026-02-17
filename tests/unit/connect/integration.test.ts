@@ -86,6 +86,8 @@ function createMockSphere() {
     _emit(type: string, data: unknown) {
       for (const h of eventHandlers.get(type) ?? []) h(data);
     },
+    // Optional communications module (set by tests that need DM support)
+    communications: undefined as unknown,
   };
 }
 
@@ -437,6 +439,114 @@ describe('Sphere Connect Integration', () => {
 
       // Third should be rate limited
       await expect(client.query(RPC_METHODS.GET_IDENTITY)).rejects.toThrow('Too many requests');
+    });
+  });
+
+  // ===========================================================================
+  // GET_CONVERSATIONS nametag fallback
+  // ===========================================================================
+
+  describe('GET_CONVERSATIONS nametag resolution', () => {
+    const MY_PK = '02abc123';
+    const PEER_PK = '02peer456';
+
+    function addCommunications(
+      messages: Map<string, Array<{ id: string; senderPubkey: string; senderNametag?: string; recipientPubkey: string; recipientNametag?: string; content: string; timestamp: number; isRead: boolean }>>,
+      resolvePeerNametag?: (pubkey: string) => Promise<string | undefined>,
+    ) {
+      mockSphere.communications = {
+        getConversations: vi.fn().mockReturnValue(messages),
+        getConversationPage: vi.fn().mockReturnValue({ messages: [], hasMore: false, oldestTimestamp: null }),
+        getUnreadCount: vi.fn().mockReturnValue(0),
+        markAsRead: vi.fn().mockResolvedValue(undefined),
+        sendDM: vi.fn().mockResolvedValue({ id: 'new', senderPubkey: MY_PK, recipientPubkey: PEER_PK, content: 'hi', timestamp: Date.now(), isRead: false }),
+        resolvePeerNametag: resolvePeerNametag ?? vi.fn().mockResolvedValue(undefined),
+      };
+    }
+
+    it('returns peerNametag from messages when available', async () => {
+      const messages = new Map([
+        [PEER_PK, [
+          { id: 'm1', senderPubkey: PEER_PK, senderNametag: 'bob', recipientPubkey: MY_PK, content: 'hi', timestamp: 1000, isRead: false },
+        ]],
+      ]);
+      addCommunications(messages);
+
+      createHost();
+      createClient();
+      await client.connect();
+
+      const result = await client.query(RPC_METHODS.GET_CONVERSATIONS) as Array<{ peerPubkey: string; peerNametag?: string }>;
+      expect(result).toHaveLength(1);
+      expect(result[0].peerNametag).toBe('bob');
+    });
+
+    it('resolves peerNametag via transport fallback when missing from messages', async () => {
+      const messages = new Map([
+        [PEER_PK, [
+          { id: 'm1', senderPubkey: PEER_PK, recipientPubkey: MY_PK, content: 'hi', timestamp: 1000, isRead: false },
+        ]],
+      ]);
+      addCommunications(messages, vi.fn().mockResolvedValue('bob'));
+
+      createHost();
+      createClient();
+      await client.connect();
+
+      const result = await client.query(RPC_METHODS.GET_CONVERSATIONS) as Array<{ peerPubkey: string; peerNametag?: string }>;
+      expect(result).toHaveLength(1);
+      expect(result[0].peerNametag).toBe('bob');
+    });
+
+    it('leaves peerNametag undefined when both messages and transport have no nametag', async () => {
+      const messages = new Map([
+        [PEER_PK, [
+          { id: 'm1', senderPubkey: PEER_PK, recipientPubkey: MY_PK, content: 'hi', timestamp: 1000, isRead: false },
+        ]],
+      ]);
+      addCommunications(messages, vi.fn().mockResolvedValue(undefined));
+
+      createHost();
+      createClient();
+      await client.connect();
+
+      const result = await client.query(RPC_METHODS.GET_CONVERSATIONS) as Array<{ peerPubkey: string; peerNametag?: string }>;
+      expect(result).toHaveLength(1);
+      expect(result[0].peerNametag).toBeUndefined();
+    });
+
+    it('does not call resolvePeerNametag when nametag already in messages', async () => {
+      const resolveFn = vi.fn().mockResolvedValue('shouldnt-be-called');
+      const messages = new Map([
+        [PEER_PK, [
+          { id: 'm1', senderPubkey: PEER_PK, senderNametag: 'bob', recipientPubkey: MY_PK, content: 'hi', timestamp: 1000, isRead: false },
+        ]],
+      ]);
+      addCommunications(messages, resolveFn);
+
+      createHost();
+      createClient();
+      await client.connect();
+
+      await client.query(RPC_METHODS.GET_CONVERSATIONS);
+      expect(resolveFn).not.toHaveBeenCalled();
+    });
+
+    it('handles resolvePeerNametag errors gracefully', async () => {
+      const messages = new Map([
+        [PEER_PK, [
+          { id: 'm1', senderPubkey: PEER_PK, recipientPubkey: MY_PK, content: 'hi', timestamp: 1000, isRead: false },
+        ]],
+      ]);
+      addCommunications(messages, vi.fn().mockRejectedValue(new Error('Network error')));
+
+      createHost();
+      createClient();
+      await client.connect();
+
+      const result = await client.query(RPC_METHODS.GET_CONVERSATIONS) as Array<{ peerPubkey: string; peerNametag?: string }>;
+      expect(result).toHaveLength(1);
+      expect(result[0].peerNametag).toBeUndefined();
     });
   });
 });

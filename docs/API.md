@@ -1072,6 +1072,10 @@ interface DirectMessage {
 
 #### `getBroadcasts(limit?: number): BroadcastMessage[]`
 
+#### `resolvePeerNametag(peerPubkey: string): Promise<string | undefined>`
+
+Resolve a peer's nametag by their transport pubkey via live lookup from Nostr relay binding events. Returns `undefined` if the transport doesn't support resolution, the peer has no registered nametag, or the lookup fails. Useful as a fallback when no nametag is available in stored messages.
+
 #### `onDirectMessage(handler: (msg: DirectMessage) => void): () => void`
 
 Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
