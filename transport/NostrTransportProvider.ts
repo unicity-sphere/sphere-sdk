@@ -620,7 +620,7 @@ export class NostrTransportProvider implements TransportProvider {
       content,
       [
         ['p', recipientPubkey],
-        ['d', 'token-transfer'],
+        ['d', `token-transfer:${crypto.randomUUID()}`],
         ['type', 'token_transfer'],
       ]
     );
