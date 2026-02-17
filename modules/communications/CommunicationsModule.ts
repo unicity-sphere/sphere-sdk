@@ -475,6 +475,25 @@ export class CommunicationsModule {
   }
 
   // ===========================================================================
+  // Public API - Peer Resolution
+  // ===========================================================================
+
+  /**
+   * Resolve a peer's nametag by their transport pubkey.
+   * Uses transport.resolveTransportPubkeyInfo() for live lookup from relay binding events.
+   * Returns undefined if transport doesn't support resolution or peer has no nametag.
+   */
+  async resolvePeerNametag(peerPubkey: string): Promise<string | undefined> {
+    if (!this.deps?.transport.resolveTransportPubkeyInfo) return undefined;
+    try {
+      const info = await this.deps.transport.resolveTransportPubkeyInfo(peerPubkey);
+      return info?.nametag;
+    } catch {
+      return undefined;
+    }
+  }
+
+  // ===========================================================================
   // Private: Message Handling
   // ===========================================================================
 
