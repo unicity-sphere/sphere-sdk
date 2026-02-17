@@ -700,6 +700,8 @@ describe('Daemon CLI', () => {
       expect(log).toContain('connection:changed');
       expect(log).toContain('nametag:registered');
       expect(log).toContain('sync:completed');
+      // market:feed is in ALL_SPHERE_EVENTS so * should enable market feed
+      expect(log).toContain('Market feed: enabled');
     }, 90_000);
   });
 
@@ -962,5 +964,107 @@ describe('Daemon CLI', () => {
       await sleep(10_000);
       expect(fs.existsSync(markerFile)).toBe(false);
     }, 120_000);
+  });
+
+  // =============================================================================
+  // G. Market Feed
+  // =============================================================================
+
+  describe('G. Market feed', () => {
+    let testDir: string;
+
+    afterEach(async () => {
+      if (testDir) {
+        stopDaemonForce(testDir);
+        try {
+          await runCli(['daemon', 'stop'], { cwd: testDir, timeout: 10_000 });
+        } catch { /* best effort */ }
+        cleanupTestDir(testDir);
+      }
+    });
+
+    it('G1: --market-feed flag logs "Market feed: enabled"', async () => {
+      testDir = createTestDir();
+      testDirs.push(testDir);
+      await initWallet(testDir, { timeout: 60_000 });
+
+      const logFile = path.join(testDir, '.sphere-cli', 'daemon.log');
+
+      spawnDaemon(testDir, [
+        '--no-nostr', '--market-feed',
+        '--event', 'transfer:incoming', '--action', 'auto-receive',
+      ]);
+
+      const log = await pollForFile(logFile, { timeout: 60_000, contains: 'Daemon running' });
+      expect(log).toContain('Market feed: enabled');
+    }, 90_000);
+
+    it('G2: --event market:feed produces "Market feed: enabled" log', async () => {
+      testDir = createTestDir();
+      testDirs.push(testDir);
+      await initWallet(testDir, { timeout: 60_000 });
+
+      const logFile = path.join(testDir, '.sphere-cli', 'daemon.log');
+
+      spawnDaemon(testDir, [
+        '--no-nostr',
+        '--event', 'market:feed', '--action', 'bash:echo market event',
+      ]);
+
+      const log = await pollForFile(logFile, { timeout: 60_000, contains: 'Daemon running' });
+      expect(log).toContain('Market feed: enabled');
+    }, 90_000);
+
+    it('G3: wildcard "*" includes market:feed (Market feed: enabled)', async () => {
+      testDir = createTestDir();
+      testDirs.push(testDir);
+      await initWallet(testDir, { timeout: 60_000 });
+
+      const logFile = path.join(testDir, '.sphere-cli', 'daemon.log');
+
+      spawnDaemon(testDir, [
+        '--no-nostr', '--event', '*', '--action', 'auto-receive',
+      ]);
+
+      const log = await pollForFile(logFile, { timeout: 60_000, contains: 'Daemon running' });
+      expect(log).toContain('Market feed: enabled');
+    }, 90_000);
+
+    it('G4: wildcard "market:*" expands to include market:feed', async () => {
+      testDir = createTestDir();
+      testDirs.push(testDir);
+      await initWallet(testDir, { timeout: 60_000 });
+
+      const logFile = path.join(testDir, '.sphere-cli', 'daemon.log');
+
+      spawnDaemon(testDir, [
+        '--no-nostr', '--event', 'market:*', '--action', 'bash:echo market',
+      ]);
+
+      const log = await pollForFile(logFile, { timeout: 60_000, contains: 'Daemon running' });
+      expect(log).toContain('Market feed: enabled');
+    }, 90_000);
+
+    it('G5: config with marketFeed: true logs "Market feed: enabled"', async () => {
+      testDir = createTestDir();
+      testDirs.push(testDir);
+      await initWallet(testDir, { timeout: 60_000 });
+
+      const configPath = path.join(testDir, 'market-config.json');
+      fs.writeFileSync(configPath, JSON.stringify({
+        marketFeed: true,
+        rules: [{
+          events: ['transfer:incoming'],
+          actions: [{ type: 'builtin', action: 'auto-receive' }],
+        }],
+      }));
+
+      const logFile = path.join(testDir, '.sphere-cli', 'daemon.log');
+
+      spawnDaemon(testDir, ['--no-nostr', '--config', configPath]);
+
+      const log = await pollForFile(logFile, { timeout: 60_000, contains: 'Daemon running' });
+      expect(log).toContain('Market feed: enabled');
+    }, 90_000);
   });
 });

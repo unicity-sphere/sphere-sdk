@@ -65,6 +65,7 @@ const ALL_SPHERE_EVENTS: SphereEventType[] = [
   'groupchat:group_deleted',
   'groupchat:updated',
   'groupchat:connection',
+  'market:feed',
 ];
 
 // =============================================================================
@@ -163,6 +164,20 @@ function buildEnvVars(eventType: string, data: unknown): Record<string, string> 
         env.SPHERE_AMOUNT = total.toString();
       } catch {
         // Ignore amount calculation errors
+      }
+    }
+
+    // Market feed env vars
+    if (eventType === 'market:feed') {
+      if (d.type === 'new' && d.listing && typeof d.listing === 'object') {
+        const listing = d.listing as Record<string, unknown>;
+        if (listing.title) env.SPHERE_MARKET_TITLE = String(listing.title);
+        if (listing.descriptionPreview) env.SPHERE_MARKET_DESCRIPTION = String(listing.descriptionPreview);
+        if (listing.agentName) env.SPHERE_MARKET_AGENT = String(listing.agentName);
+        if (listing.type) env.SPHERE_MARKET_TYPE = String(listing.type);
+        if (listing.id) env.SPHERE_MARKET_LISTING_ID = String(listing.id);
+      } else if (d.type === 'initial' && Array.isArray(d.listings)) {
+        env.SPHERE_MARKET_COUNT = String(d.listings.length);
       }
     }
   }
@@ -365,7 +380,7 @@ function setupMarketFeed(
   }
 
   // Market feed events are dispatched as synthetic "market:feed" rules
-  const marketRules = dispatchMap.get('market:feed' as SphereEventType);
+  const marketRules = dispatchMap.get('market:feed');
   if (!marketRules || marketRules.length === 0) return null;
 
   const unsubscribe = sphere.market.subscribeFeed((message) => {
@@ -446,12 +461,12 @@ export async function runDaemon(
 
   // Build dispatch map
   const dispatchMap = buildDispatchMap(activeRules);
-  const subscribedEvents = [...dispatchMap.keys()].filter(e => e !== 'market:feed' as string);
+  const subscribedEvents = [...dispatchMap.keys()].filter(e => e !== 'market:feed');
 
   log('Starting Sphere daemon...');
   log(`Active rules: ${activeRules.length}`);
   log(`Subscribed events: ${subscribedEvents.join(', ') || '(none)'}`);
-  if (config.marketFeed || dispatchMap.has('market:feed' as SphereEventType)) {
+  if (config.marketFeed || dispatchMap.has('market:feed')) {
     log('Market feed: enabled');
   }
 
@@ -489,7 +504,7 @@ export async function runDaemon(
   }
 
   // Market feed
-  if (config.marketFeed || dispatchMap.has('market:feed' as SphereEventType)) {
+  if (config.marketFeed || dispatchMap.has('market:feed')) {
     const unsub = setupMarketFeed(sphere, dispatchMap, config.actionTimeout);
     if (unsub) unsubscribers.push(unsub);
   }
