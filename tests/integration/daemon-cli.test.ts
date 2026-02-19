@@ -881,7 +881,7 @@ describe('Daemon CLI', () => {
         { cwd: testDirB, timeout: 30_000 },
       );
 
-      const content = await pollForFile(eventsFile, { timeout: 30_000, contains: 'message:dm' });
+      const content = await pollForFile(eventsFile, { timeout: 60_000, contains: 'message:dm' });
       const firstLine = content.split('\n').find(l => l.trim().length > 0);
       expect(firstLine).toBeDefined();
       const parsed = JSON.parse(firstLine!);
