@@ -1,5 +1,6 @@
 export * from './Sphere';
 export * from './scan';
+export * from './discover';
 export * from './crypto';
 export * from './encryption';
 export * from './currency';

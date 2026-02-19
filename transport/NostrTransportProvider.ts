@@ -1057,6 +1057,53 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   /**
+   * Batch-resolve multiple transport pubkeys to peer info.
+   * Used for HD address discovery — single relay query with multi-author filter.
+   */
+  async discoverAddresses(transportPubkeys: string[]): Promise<PeerInfo[]> {
+    this.ensureConnected();
+
+    if (transportPubkeys.length === 0) return [];
+
+    const events = await this.queryEvents({
+      kinds: [EVENT_KINDS.NAMETAG_BINDING],
+      authors: transportPubkeys,
+      limit: transportPubkeys.length * 2,
+    });
+
+    if (events.length === 0) return [];
+
+    // Group by author, take most recent per author
+    const byAuthor = new Map<string, NostrEvent>();
+    for (const event of events) {
+      const existing = byAuthor.get(event.pubkey);
+      if (!existing || event.created_at > existing.created_at) {
+        byAuthor.set(event.pubkey, event);
+      }
+    }
+
+    const results: PeerInfo[] = [];
+    for (const [pubkey, event] of byAuthor) {
+      try {
+        const content = JSON.parse(event.content);
+        results.push({
+          nametag: content.nametag || undefined,
+          transportPubkey: pubkey,
+          chainPubkey: content.public_key || '',
+          l1Address: content.l1_address || '',
+          directAddress: content.direct_address || '',
+          proxyAddress: content.proxy_address || undefined,
+          timestamp: event.created_at * 1000,
+        });
+      } catch {
+        // Skip unparseable events
+      }
+    }
+
+    return results;
+  }
+
+  /**
    * Recover nametag for the current identity by searching for encrypted nametag events
    * Used after wallet import to recover associated nametag
    * @returns Decrypted nametag or null if none found

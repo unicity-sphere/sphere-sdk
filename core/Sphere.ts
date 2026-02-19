@@ -88,6 +88,8 @@ import {
 import { encryptSimple, decryptSimple, decryptWithSalt } from './encryption';
 import { scanAddressesImpl } from './scan';
 import type { ScanAddressesOptions, ScanAddressesResult } from './scan';
+import { discoverAddressesImpl } from './discover';
+import type { DiscoverAddressesOptions, DiscoverAddressesResult } from './discover';
 import { vestingClassifier } from '../l1/vesting';
 import { generateAddressFromMasterKey } from '../l1/address';
 import { isWebSocketConnected } from '../l1/network';
@@ -121,6 +123,34 @@ import type {
   LegacyFileType,
   DecryptionProgressCallback,
 } from '../serialization/types';
+
+// =============================================================================
+// Progress Callback
+// =============================================================================
+
+/** Steps reported by the onProgress callback during wallet init/create/load/import */
+export type InitProgressStep =
+  | 'clearing'
+  | 'storing_keys'
+  | 'initializing'
+  | 'recovering_nametag'
+  | 'registering_nametag'
+  | 'syncing_identity'
+  | 'syncing_tokens'
+  | 'discovering_addresses'
+  | 'finalizing'
+  | 'complete';
+
+/** Progress info passed to onProgress callback */
+export interface InitProgress {
+  /** Current step identifier */
+  readonly step: InitProgressStep;
+  /** Human-readable description of what's happening */
+  readonly message: string;
+}
+
+/** Callback for tracking wallet initialization progress */
+export type InitProgressCallback = (progress: InitProgress) => void;
 
 // =============================================================================
 // Options Types
@@ -158,6 +188,15 @@ export interface SphereCreateOptions {
   market?: MarketModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
+  /**
+   * Auto-discover previously used HD addresses after creation.
+   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - DiscoverAddressesOptions: custom config
+   * - false/undefined: no auto-discovery (default)
+   */
+  discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Optional callback to report initialization progress steps */
+  onProgress?: InitProgressCallback;
 }
 
 /** Options for loading existing wallet */
@@ -186,6 +225,15 @@ export interface SphereLoadOptions {
   market?: MarketModuleConfig | boolean;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
+  /**
+   * Auto-discover previously used HD addresses on load.
+   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - DiscoverAddressesOptions: custom config
+   * - false/undefined: no auto-discovery (default)
+   */
+  discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Optional callback to report initialization progress steps */
+  onProgress?: InitProgressCallback;
 }
 
 /** Options for importing a wallet */
@@ -222,6 +270,15 @@ export interface SphereImportOptions {
   market?: MarketModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
+  /**
+   * Auto-discover previously used HD addresses after import.
+   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - DiscoverAddressesOptions: custom config
+   * - false/undefined: no auto-discovery (default)
+   */
+  discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Optional callback to report initialization progress steps */
+  onProgress?: InitProgressCallback;
 }
 
 /** L1 (ALPHA blockchain) configuration */
@@ -273,6 +330,16 @@ export interface SphereInitOptions {
   market?: MarketModuleConfig | boolean;
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
+  /**
+   * Auto-discover previously used HD addresses when creating from mnemonic.
+   * Only applies when wallet is newly created (not on load of existing wallet).
+   * - true: discover with defaults (Nostr + L1 scan, autoTrack: true)
+   * - DiscoverAddressesOptions: custom config
+   * - false/undefined: no auto-discovery (default)
+   */
+  discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Optional callback to report initialization progress steps */
+  onProgress?: InitProgressCallback;
 }
 
 /** Result of init operation */
@@ -486,6 +553,8 @@ export class Sphere {
         groupChat,
         market,
         password: options.password,
+        discoverAddresses: options.discoverAddresses,
+        onProgress: options.onProgress,
       });
       return { sphere, created: false };
     }
@@ -520,6 +589,8 @@ export class Sphere {
       groupChat,
       market,
       password: options.password,
+      discoverAddresses: options.discoverAddresses,
+      onProgress: options.onProgress,
     });
 
     return { sphere, created: true, generatedMnemonic };
@@ -595,6 +666,8 @@ export class Sphere {
       throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
     }
 
+    const progress = options.onProgress;
+
     // exists() restores original (disconnected) state — reconnect for writes
     if (!options.storage.isConnected()) {
       await options.storage.connect();
@@ -619,17 +692,20 @@ export class Sphere {
     sphere._password = options.password ?? null;
 
     // Store mnemonic (encrypted if password provided, plaintext otherwise)
+    progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
     await sphere.storeMnemonic(options.mnemonic, options.derivationPath);
 
     // Initialize identity from mnemonic
     await sphere.initializeIdentityFromMnemonic(options.mnemonic, options.derivationPath);
 
     // Initialize everything
+    progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
     // Mark wallet as created only after successful initialization
     // This prevents "Wallet already exists" errors if init fails partway through
+    progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
     await sphere.finalizeWalletCreation();
 
     sphere._initialized = true;
@@ -640,6 +716,7 @@ export class Sphere {
 
     // Register nametag if provided, otherwise try recovery then publish
     if (options.nametag) {
+      progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
       // registerNametag publishes identity binding WITH nametag atomically
       // (calling syncIdentityWithTransport before this would race — both replaceable
       // events get the same created_at second and relay keeps the one without nametag)
@@ -648,11 +725,31 @@ export class Sphere {
       // Try to recover nametag BEFORE publishing — publishIdentityBinding uses
       // kind 30078 (replaceable event), so a bare binding would overwrite the
       // existing one that contains encrypted_nametag, making recovery impossible.
+      progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
       await sphere.recoverNametagFromTransport();
       // Now publish identity binding (with recovered nametag if found)
+      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
     }
 
+    // Auto-discover previously used HD addresses
+    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
+      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+      try {
+        const discoverOpts: DiscoverAddressesOptions =
+          typeof options.discoverAddresses === 'object'
+            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+            : { autoTrack: true };
+        const result = await sphere.discoverAddresses(discoverOpts);
+        if (result.addresses.length > 0) {
+          console.log(`[Sphere.create] Address discovery: found ${result.addresses.length} address(es)`);
+        }
+      } catch (err) {
+        console.warn('[Sphere.create] Address discovery failed (non-fatal):', err);
+      }
+    }
+
+    progress?.({ step: 'complete', message: 'Wallet created' });
     return sphere;
   }
 
@@ -664,6 +761,8 @@ export class Sphere {
     if (!(await Sphere.exists(options.storage))) {
       throw new Error('No wallet found. Use Sphere.create() to create a new wallet.');
     }
+
+    const progress = options.onProgress;
 
     // Configure TokenRegistry in main bundle context (see init() for details)
     Sphere.configureTokenRegistry(options.storage, options.network);
@@ -689,13 +788,16 @@ export class Sphere {
     }
 
     // Load identity from storage
+    progress?.({ step: 'storing_keys', message: 'Loading wallet keys...' });
     await sphere.loadIdentityFromStorage();
 
     // Initialize everything
+    progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     await sphere.initializeProviders();
     await sphere.initializeModules();
 
     // Publish identity binding via transport
+    progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
     await sphere.syncIdentityWithTransport();
 
     sphere._initialized = true;
@@ -704,6 +806,7 @@ export class Sphere {
     // If nametag name exists but token is missing, try to mint it.
     // This handles the case where the token was lost from IndexedDB.
     if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
+      progress?.({ step: 'registering_nametag', message: 'Restoring nametag token...' });
       console.log(`[Sphere] Nametag @${sphere._identity.nametag} has no token, attempting to mint...`);
       try {
         const result = await sphere.mintNametag(sphere._identity.nametag);
@@ -717,6 +820,24 @@ export class Sphere {
       }
     }
 
+    // Auto-discover previously used HD addresses
+    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses && sphere._masterKey) {
+      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+      try {
+        const discoverOpts: DiscoverAddressesOptions =
+          typeof options.discoverAddresses === 'object'
+            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+            : { autoTrack: true };
+        const result = await sphere.discoverAddresses(discoverOpts);
+        if (result.addresses.length > 0) {
+          console.log(`[Sphere.load] Address discovery: found ${result.addresses.length} address(es)`);
+        }
+      } catch (err) {
+        console.warn('[Sphere.load] Address discovery failed (non-fatal):', err);
+      }
+    }
+
+    progress?.({ step: 'complete', message: 'Wallet loaded' });
     return sphere;
   }
 
@@ -728,6 +849,8 @@ export class Sphere {
       throw new Error('Either mnemonic or masterKey is required');
     }
 
+    const progress = options.onProgress;
+
     console.log('[Sphere.import] Starting import...');
 
     // Clear existing wallet if any (including token data).
@@ -736,6 +859,7 @@ export class Sphere {
     // a subsequent initialize().
     const needsClear = Sphere.instance !== null || await Sphere.exists(options.storage);
     if (needsClear) {
+      progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
       console.log('[Sphere.import] Clearing existing wallet data...');
       await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
       console.log('[Sphere.import] Clear done');
@@ -766,6 +890,8 @@ export class Sphere {
     );
     sphere._password = options.password ?? null;
 
+    progress?.({ step: 'storing_keys', message: 'Storing wallet keys...' });
+
     if (options.mnemonic) {
       // Validate and store mnemonic
       if (!Sphere.validateMnemonic(options.mnemonic)) {
@@ -794,6 +920,7 @@ export class Sphere {
     }
 
     // Initialize everything
+    progress?.({ step: 'initializing', message: 'Initializing wallet...' });
     console.log('[Sphere.import] Initializing providers...');
     await sphere.initializeProviders();
     console.log('[Sphere.import] Providers initialized. Initializing modules...');
@@ -802,14 +929,17 @@ export class Sphere {
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
+      progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
       console.log('[Sphere.import] Recovering nametag from transport...');
       await sphere.recoverNametagFromTransport();
       console.log('[Sphere.import] Nametag recovery done');
       // Publish identity binding (with recovered nametag if found)
+      progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
     }
 
     // Mark wallet as created only after successful initialization
+    progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
     console.log('[Sphere.import] Finalizing wallet creation...');
     await sphere.finalizeWalletCreation();
 
@@ -822,12 +952,14 @@ export class Sphere {
 
     // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
+      progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
       console.log('[Sphere.import] Registering nametag...');
       await sphere.registerNametag(options.nametag);
     }
 
     // Auto-sync with token storage providers (e.g., IPFS) to recover tokens
     if (sphere._tokenStorageProviders.size > 0) {
+      progress?.({ step: 'syncing_tokens', message: 'Syncing tokens...' });
       try {
         const syncResult = await sphere._payments.sync();
         console.log(`[Sphere.import] Auto-sync: +${syncResult.added} -${syncResult.removed}`);
@@ -836,6 +968,24 @@ export class Sphere {
       }
     }
 
+    // Auto-discover previously used HD addresses
+    if (options.discoverAddresses !== false && sphere._transport.discoverAddresses) {
+      progress?.({ step: 'discovering_addresses', message: 'Discovering addresses...' });
+      try {
+        const discoverOpts: DiscoverAddressesOptions =
+          typeof options.discoverAddresses === 'object'
+            ? { ...options.discoverAddresses, autoTrack: options.discoverAddresses.autoTrack ?? true }
+            : { autoTrack: true };
+        const result = await sphere.discoverAddresses(discoverOpts);
+        if (result.addresses.length > 0) {
+          console.log(`[Sphere.import] Address discovery: found ${result.addresses.length} address(es)`);
+        }
+      } catch (err) {
+        console.warn('[Sphere.import] Address discovery failed (non-fatal):', err);
+      }
+    }
+
+    progress?.({ step: 'complete', message: 'Import complete' });
     console.log('[Sphere.import] Import complete');
     return sphere;
   }
@@ -2257,6 +2407,115 @@ export class Sphere {
     await this.persistAddressNametags();
   }
 
+  /**
+   * Discover previously used HD addresses.
+   *
+   * Primary: queries Nostr relay for identity binding events (fast, single batch query).
+   * Secondary: runs L1 balance scan to find legacy addresses with no binding event.
+   *
+   * @example
+   * ```ts
+   * const result = await sphere.discoverAddresses();
+   * console.log(`Found ${result.addresses.length} addresses`);
+   *
+   * // With auto-tracking
+   * await sphere.discoverAddresses({ autoTrack: true });
+   * ```
+   */
+  async discoverAddresses(
+    options: DiscoverAddressesOptions = {},
+  ): Promise<DiscoverAddressesResult> {
+    this.ensureReady();
+
+    if (!this._masterKey) {
+      throw new Error('Address discovery requires HD master key');
+    }
+
+    if (!this._transport.discoverAddresses) {
+      throw new Error('Transport provider does not support address discovery');
+    }
+
+    const includeL1Scan = options.includeL1Scan ?? true;
+
+    // Phase 1: Transport (Nostr) binding event scan
+    const transportResult = await discoverAddressesImpl(
+      (index: number) => {
+        const addrInfo = this._deriveAddressInternal(index, false);
+        return {
+          transportPubkey: addrInfo.publicKey.slice(2), // x-only 32 bytes
+          chainPubkey: addrInfo.publicKey,
+          l1Address: addrInfo.address,
+          directAddress: '', // not needed for discovery query
+        };
+      },
+      (pubkeys: string[]) => this._transport.discoverAddresses!(pubkeys),
+      options,
+    );
+
+    // Phase 2: L1 balance scan (finds legacy addresses with no binding event)
+    if (includeL1Scan) {
+      try {
+        const l1Result = await this.scanAddresses({
+          maxAddresses: options.maxAddresses,
+          gapLimit: options.gapLimit,
+          signal: options.signal,
+          onProgress: options.onProgress
+            ? (p) => options.onProgress!({
+                currentBatch: 0,
+                totalBatches: 0,
+                discoveredCount: p.foundCount,
+                currentGap: p.currentGap,
+                phase: 'l1',
+              })
+            : undefined,
+        });
+
+        // Merge L1 results into transport results
+        for (const l1Addr of l1Result.addresses) {
+          if (l1Addr.isChange) continue;
+
+          const existing = transportResult.addresses.find(a => a.index === l1Addr.index);
+          if (existing) {
+            existing.l1Balance = l1Addr.balance;
+            existing.source = 'both';
+            if (!existing.nametag && l1Addr.nametag) {
+              existing.nametag = l1Addr.nametag;
+            }
+          } else {
+            // Address found via L1 only (legacy, no binding event)
+            const addrInfo = this._deriveAddressInternal(l1Addr.index, false);
+            transportResult.addresses.push({
+              index: l1Addr.index,
+              l1Address: l1Addr.address,
+              directAddress: '',
+              chainPubkey: addrInfo.publicKey,
+              nametag: l1Addr.nametag,
+              l1Balance: l1Addr.balance,
+              source: 'l1',
+            });
+          }
+        }
+
+        transportResult.addresses.sort((a, b) => a.index - b.index);
+      } catch (err) {
+        console.warn('[Sphere] L1 scan failed during discovery (non-fatal):', err);
+      }
+    }
+
+    // Phase 3: Auto-track if requested
+    if (options.autoTrack && transportResult.addresses.length > 0) {
+      await this.trackScannedAddresses(
+        transportResult.addresses.map(a => ({
+          index: a.index,
+          hidden: false,
+          nametag: a.nametag,
+        })),
+      );
+    }
+
+    return transportResult;
+  }
+
   // ===========================================================================
   // Public Methods - Status
   // ===========================================================================
@@ -2946,6 +3205,24 @@ export class Sphere {
                 console.log(`[Sphere] Migrated legacy binding with nametag @${recoveredNametag}`);
                 return;
               }
+            }
+
+            // Check if existing binding is missing critical fields — re-publish if so
+            const needsUpdate =
+              !existing.directAddress ||
+              !existing.l1Address ||
+              !existing.chainPubkey ||
+              (this._identity?.nametag && !existing.nametag);
+
+            if (needsUpdate) {
+              console.log('[Sphere] Existing binding incomplete, re-publishing with full data');
+              await this._transport.publishIdentityBinding!(
+                this._identity!.chainPubkey,
+                this._identity!.l1Address,
+                this._identity!.directAddress || '',
+                this._identity?.nametag || existing.nametag || undefined,
+              );
+              return;
             }
 
             console.log('[Sphere] Existing binding found, skipping re-publish');
