@@ -446,4 +446,8 @@ export function disconnect() {
     if (cb.timeoutId) clearTimeout(cb.timeoutId);
   });
   connectionCallbacks.length = 0;
+
+  // Clear block subscribers and cached header to prevent stale state across wallet instances
+  blockSubscribers.length = 0;
+  lastBlockHeader = null;
 }
