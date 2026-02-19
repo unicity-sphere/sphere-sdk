@@ -2105,9 +2105,29 @@ export class Sphere {
     // Re-initialize modules with new identity
     await this.reinitializeModulesForNewAddress();
 
-    // Sync identity with transport — also recovers nametag from existing Nostr bindings
-    // via transport.resolve(directAddress). Skipped when registering a new nametag
-    // (that flow handles publishing separately below).
+    this.emitEvent('identity:changed', {
+      l1Address: this._identity.l1Address,
+      directAddress: this._identity.directAddress,
+      chainPubkey: this._identity.chainPubkey,
+      nametag: this._identity.nametag,
+      addressIndex: index,
+    });
+
+    console.log(`[Sphere] Switched to address ${index}:`, this._identity.l1Address);
+
+    // Run transport sync and nametag operations in background so address
+    // switch returns quickly and L1/L3 balance queries can start immediately.
+    this.postSwitchSync(index, newNametag).catch(err => {
+      console.warn(`[Sphere] Post-switch sync failed for address ${index}:`, err);
+    });
+  }
+
+  /**
+   * Background transport sync and nametag operations after address switch.
+   * Runs after switchToAddress returns so L1/L3 queries can start immediately.
+   */
+  private async postSwitchSync(index: number, newNametag?: string): Promise<void> {
+    // Sync identity with transport — recovers nametag from existing Nostr bindings
     if (!newNametag) {
       await this.syncIdentityWithTransport();
     }
@@ -2134,7 +2154,7 @@ export class Sphere {
         nametag: newNametag,
         addressIndex: index,
       });
-    } else if (this._identity.nametag && !this._payments.hasNametag()) {
+    } else if (this._identity?.nametag && !this._payments.hasNametag()) {
       // Existing address with nametag but missing token — mint it
       console.log(`[Sphere] Nametag @${this._identity.nametag} has no token after switch, minting...`);
       try {
@@ -2148,16 +2168,6 @@ export class Sphere {
         console.warn(`[Sphere] Nametag token mint failed after switch:`, err);
       }
     }
-
-    this.emitEvent('identity:changed', {
-      l1Address: this._identity.l1Address,
-      directAddress: this._identity.directAddress,
-      chainPubkey: this._identity.chainPubkey,
-      nametag: this._identity.nametag,
-      addressIndex: index,
-    });
-
-    console.log(`[Sphere] Switched to address ${index}:`, this._identity.l1Address);
   }
 
   /**
