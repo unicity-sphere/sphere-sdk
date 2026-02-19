@@ -277,10 +277,10 @@ export const COIN_TYPES = {
 // =============================================================================
 
 /** Default Fulcrum electrum server for mainnet */
-export const DEFAULT_ELECTRUM_URL = 'wss://fulcrum.alpha.unicity.network:50004' as const;
+export const DEFAULT_ELECTRUM_URL = 'wss://fulcrum.unicity.network:50004' as const;
 
 /** Testnet Fulcrum electrum server */
-export const TEST_ELECTRUM_URL = 'wss://fulcrum.alpha.testnet.unicity.network:50004' as const;
+export const TEST_ELECTRUM_URL = 'wss://fulcrum.unicity.network:50004' as const;
 
 // =============================================================================
 // Token Registry Defaults

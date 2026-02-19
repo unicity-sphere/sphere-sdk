@@ -81,6 +81,15 @@ export interface TransportProvider extends BaseProvider {
   resolveTransportPubkeyInfo?(transportPubkey: string): Promise<PeerInfo | null>;
 
   /**
+   * Batch-resolve multiple transport pubkeys to peer info.
+   * Used for HD address discovery: derives transport pubkeys for indices 0..N
+   * and queries binding events in a single batch.
+   * @param transportPubkeys - Array of transport-specific pubkeys to look up
+   * @returns Array of PeerInfo for pubkeys that have binding events (may be shorter than input)
+   */
+  discoverAddresses?(transportPubkeys: string[]): Promise<PeerInfo[]>;
+
+  /**
    * Recover nametag for current identity by decrypting stored encrypted nametag
    * Used after wallet import to recover associated nametag
    * @returns Decrypted nametag or null if none found

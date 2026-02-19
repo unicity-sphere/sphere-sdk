@@ -11,6 +11,7 @@
 
 import type { FullIdentity } from '../../types';
 import type { TransportProvider } from '../../transport';
+import { DEFAULT_ELECTRUM_URL } from '../../constants';
 import {
   connect as l1Connect,
   disconnect as l1Disconnect,
@@ -130,7 +131,7 @@ export class L1PaymentsModule {
 
   constructor(config?: L1PaymentsModuleConfig) {
     this._config = {
-      electrumUrl: config?.electrumUrl ?? 'wss://fulcrum.unicity.network:50004',
+      electrumUrl: config?.electrumUrl ?? DEFAULT_ELECTRUM_URL,
       network: config?.network ?? 'mainnet',
       defaultFeeRate: config?.defaultFeeRate ?? 10,
       enableVesting: config?.enableVesting ?? true,

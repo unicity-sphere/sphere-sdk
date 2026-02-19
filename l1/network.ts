@@ -2,8 +2,9 @@
 
 import { addressToScriptHash } from './addressToScriptHash';
 import type { UTXO } from './types';
+import { DEFAULT_ELECTRUM_URL } from '../constants';
 
-const DEFAULT_ENDPOINT = 'wss://fulcrum.unicity.network:50004';
+const DEFAULT_ENDPOINT = DEFAULT_ELECTRUM_URL;
 
 interface PendingRequest {
   resolve: (result: unknown) => void;

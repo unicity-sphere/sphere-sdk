@@ -54,10 +54,18 @@ export type {
   SphereLoadOptions,
   SphereInitOptions,
   SphereInitResult,
+  SphereImportOptions,
+  InitProgressStep,
+  InitProgress,
+  InitProgressCallback,
   ScanAddressProgress,
   ScannedAddressResult,
   ScanAddressesOptions,
   ScanAddressesResult,
+  DiscoverAddressProgress,
+  DiscoveredAddress,
+  DiscoverAddressesOptions,
+  DiscoverAddressesResult,
   CheckNetworkHealthOptions,
 } from './core';
 
