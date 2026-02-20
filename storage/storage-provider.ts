@@ -61,6 +61,33 @@ export interface StorageProvider extends BaseProvider {
 }
 
 // =============================================================================
+// History Record (shared by all token storage providers)
+// =============================================================================
+
+export interface HistoryRecord {
+  /** Composite dedup key (primary key) — e.g. "RECEIVED_v5split_abc123" */
+  dedupKey: string;
+  /** UUID for public API consumption */
+  id: string;
+  type: 'SENT' | 'RECEIVED' | 'SPLIT' | 'MINT';
+  amount: string;
+  coinId: string;
+  symbol: string;
+  timestamp: number;
+  transferId?: string;
+  /** Genesis tokenId this entry relates to (used for dedup) */
+  tokenId?: string;
+  // Sender info (for RECEIVED)
+  senderPubkey?: string;
+  senderAddress?: string;
+  senderNametag?: string;
+  // Recipient info (for SENT)
+  recipientPubkey?: string;
+  recipientAddress?: string;
+  recipientNametag?: string;
+}
+
+// =============================================================================
 // Token Storage Provider Interface
 // =============================================================================
 
@@ -140,6 +167,23 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
    * Subscribe to storage events
    */
   onEvent?(callback: StorageEventCallback): () => void;
+
+  // --- History operations (optional — not supported by all providers, e.g. IPFS) ---
+
+  /** Store a history entry (upsert by dedupKey) */
+  addHistoryEntry?(entry: HistoryRecord): Promise<void>;
+
+  /** Get all history entries sorted by timestamp descending */
+  getHistoryEntries?(): Promise<HistoryRecord[]>;
+
+  /** Check if a history entry exists by dedupKey */
+  hasHistoryEntry?(dedupKey: string): Promise<boolean>;
+
+  /** Clear all history entries */
+  clearHistory?(): Promise<void>;
+
+  /** Bulk import history entries (skip existing dedupKeys). Returns count of newly imported. */
+  importHistoryEntries?(entries: HistoryRecord[]): Promise<number>;
 }
 
 // =============================================================================

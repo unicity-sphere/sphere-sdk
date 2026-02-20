@@ -5,9 +5,13 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult } from '../../../storage';
+import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import { getAddressId } from '../../../constants';
+
+const META_FILE = '_meta.json';
+const TOMBSTONES_FILE = '_tombstones.json';
+const HISTORY_FILE = '_history.json';
 
 export interface FileTokenStorageConfig {
   /** Directory to store token files */
@@ -85,8 +89,9 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     try {
       const files = fs.readdirSync(this.tokensDir).filter(f =>
         f.endsWith('.json') &&
-        f !== '_meta.json' &&
-        f !== '_tombstones.json' &&
+        f !== META_FILE &&
+        f !== TOMBSTONES_FILE &&
+        f !== HISTORY_FILE &&
         !f.startsWith('archived_') &&  // Skip archived tokens
         !f.startsWith('token-') &&     // Skip legacy token format
         !f.startsWith('nametag-')      // Skip nametag files (not tokens)
@@ -117,7 +122,7 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
       }
 
       // Load tombstones if they exist
-      const tombstonesPath = path.join(this.tokensDir, '_tombstones.json');
+      const tombstonesPath = path.join(this.tokensDir, TOMBSTONES_FILE);
       if (fs.existsSync(tombstonesPath)) {
         try {
           const content = fs.readFileSync(tombstonesPath, 'utf-8');
@@ -147,7 +152,7 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     try {
       // Save meta
       fs.writeFileSync(
-        path.join(this.tokensDir, '_meta.json'),
+        path.join(this.tokensDir, META_FILE),
         JSON.stringify(data._meta, null, 2)
       );
 
@@ -183,7 +188,7 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
         }
         // Persist tombstones list so they can be checked on reload
         fs.writeFileSync(
-          path.join(this.tokensDir, '_tombstones.json'),
+          path.join(this.tokensDir, TOMBSTONES_FILE),
           JSON.stringify(data._tombstones, null, 2)
         );
       }
@@ -227,6 +232,71 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     } catch {
       return false;
     }
+  }
+
+  // =========================================================================
+  // History operations
+  // =========================================================================
+
+  private get historyPath(): string {
+    return path.join(this.tokensDir, HISTORY_FILE);
+  }
+
+  private readHistoryFile(): Record<string, HistoryRecord> {
+    try {
+      if (fs.existsSync(this.historyPath)) {
+        return JSON.parse(fs.readFileSync(this.historyPath, 'utf-8'));
+      }
+    } catch {
+      // Ignore corrupt file
+    }
+    return {};
+  }
+
+  private writeHistoryFile(data: Record<string, HistoryRecord>): void {
+    fs.writeFileSync(this.historyPath, JSON.stringify(data, null, 2));
+  }
+
+  async addHistoryEntry(entry: HistoryRecord): Promise<void> {
+    const data = this.readHistoryFile();
+    data[entry.dedupKey] = entry;
+    this.writeHistoryFile(data);
+  }
+
+  async getHistoryEntries(): Promise<HistoryRecord[]> {
+    const data = this.readHistoryFile();
+    return Object.values(data).sort((a, b) => b.timestamp - a.timestamp);
+  }
+
+  async hasHistoryEntry(dedupKey: string): Promise<boolean> {
+    const data = this.readHistoryFile();
+    return dedupKey in data;
+  }
+
+  async clearHistory(): Promise<void> {
+    try {
+      if (fs.existsSync(this.historyPath)) {
+        fs.unlinkSync(this.historyPath);
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  async importHistoryEntries(entries: HistoryRecord[]): Promise<number> {
+    if (entries.length === 0) return 0;
+    const data = this.readHistoryFile();
+    let imported = 0;
+    for (const entry of entries) {
+      if (!(entry.dedupKey in data)) {
+        data[entry.dedupKey] = entry;
+        imported++;
+      }
+    }
+    if (imported > 0) {
+      this.writeHistoryFile(data);
+    }
+    return imported;
   }
 
 }
