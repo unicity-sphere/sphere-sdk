@@ -291,6 +291,9 @@ export interface InstantSplitProcessResult {
  * Options for instant split send operation
  */
 export interface InstantSplitOptions {
+  /** Optional memo/message to include with the transfer */
+  memo?: string;
+
   /** Timeout for Nostr delivery in ms (default: 30000) */
   nostrTimeoutMs?: number;
 

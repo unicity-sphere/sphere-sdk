@@ -85,6 +85,8 @@ export interface HistoryRecord {
   recipientPubkey?: string;
   recipientAddress?: string;
   recipientNametag?: string;
+  /** Optional memo/message attached to the transfer */
+  memo?: string;
 }
 
 // =============================================================================

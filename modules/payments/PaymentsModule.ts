@@ -1024,6 +1024,7 @@ export class PaymentsModule {
             this.deps!.transport,
             recipientPubkey,
             {
+              memo: request.memo,
               onChangeTokenCreated: async (changeToken) => {
                 const changeTokenData = changeToken.toJSON();
                 const uiToken: Token = {
@@ -1150,6 +1151,7 @@ export class PaymentsModule {
         recipientPubkey,
         recipientNametag,
         recipientAddress: peerInfo?.directAddress || recipientAddress?.toString() || recipientPubkey,
+        memo: request.memo,
         transferId: result.id,
         tokenId: sentTokenId || undefined,
       });
@@ -1298,6 +1300,7 @@ export class PaymentsModule {
         recipientPubkey,
         {
           ...options,
+          memo: request.memo,
           onChangeTokenCreated: async (changeToken) => {
             // Save change token when background completes
             const changeTokenData = changeToken.toJSON();
@@ -1346,6 +1349,7 @@ export class PaymentsModule {
           recipientPubkey,
           recipientNametag,
           recipientAddress: peerInfo?.directAddress || recipientAddress?.toString() || recipientPubkey,
+          memo: request.memo,
           tokenId: splitTokenId || undefined,
         });
 
@@ -1383,13 +1387,14 @@ export class PaymentsModule {
    */
   private async processInstantSplitBundle(
     bundle: InstantSplitBundle,
-    senderPubkey: string
+    senderPubkey: string,
+    memo?: string,
   ): Promise<InstantSplitProcessResult> {
     this.ensureInitialized();
 
     if (!isInstantSplitBundleV5(bundle)) {
       // V4 (dev mode) still processes synchronously
-      return this.processInstantSplitBundleSync(bundle, senderPubkey);
+      return this.processInstantSplitBundleSync(bundle, senderPubkey, memo);
     }
 
     // V5: save immediately as unconfirmed, resolve proofs lazily
@@ -1437,6 +1442,7 @@ export class PaymentsModule {
         timestamp: Date.now(),
         senderPubkey,
         ...senderInfo,
+        memo,
         tokenId: deterministicId,
       });
 
@@ -1444,7 +1450,9 @@ export class PaymentsModule {
       this.deps!.emitEvent('transfer:incoming', {
         id: bundle.splitGroupId,
         senderPubkey,
+        senderNametag: senderInfo.senderNametag,
         tokens: [uiToken],
+        memo,
         receivedAt: Date.now(),
       });
 
@@ -1470,7 +1478,8 @@ export class PaymentsModule {
    */
   private async processInstantSplitBundleSync(
     bundle: InstantSplitBundle,
-    senderPubkey: string
+    senderPubkey: string,
+    memo?: string,
   ): Promise<InstantSplitProcessResult> {
     try {
       const signingService = await this.createSigningService();
@@ -1551,6 +1560,7 @@ export class PaymentsModule {
           timestamp: Date.now(),
           senderPubkey,
           ...senderInfo,
+          memo,
           tokenId: receivedTokenId || uiToken.id,
         });
 
@@ -1559,7 +1569,9 @@ export class PaymentsModule {
         this.deps!.emitEvent('transfer:incoming', {
           id: bundle.splitGroupId,
           senderPubkey,
+          senderNametag: senderInfo.senderNametag,
           tokens: [uiToken],
+          memo,
           receivedAt: Date.now(),
         });
       }
@@ -3980,15 +3992,32 @@ export class PaymentsModule {
       await this.save();
       this.log(`NOSTR-FIRST: Token ${token.id.slice(0, 8)}... added as submitted (unconfirmed)`);
 
+      // Resolve sender info for both event and history
+      const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
+
       // Emit event for incoming transfer (even though unconfirmed)
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
         senderPubkey: transfer.senderTransportPubkey,
+        senderNametag: senderInfo.senderNametag,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
       };
       this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+
+      // Record in history immediately (not during finalization — that's just proof confirmation)
+      await this.addToHistory({
+        type: 'RECEIVED',
+        amount: token.amount,
+        coinId: token.coinId,
+        symbol: token.symbol,
+        timestamp: Date.now(),
+        senderPubkey: transfer.senderTransportPubkey,
+        ...senderInfo,
+        memo: payload.memo as string | undefined,
+        tokenId: nostrTokenId || token.id,
+      });
 
       // Parse commitment and start proof polling
       try {
@@ -4015,7 +4044,7 @@ export class PaymentsModule {
           lastAttemptAt: 0,
           onProofReceived: async (tokenId) => {
             // When proof arrives, finalize the token and update status
-            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput, transfer.senderTransportPubkey);
+            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput);
           },
         });
       } catch (err) {
@@ -4101,7 +4130,6 @@ export class PaymentsModule {
     tokenId: string,
     sourceTokenInput: unknown,
     commitmentInput: unknown,
-    senderPubkey: string
   ): Promise<void> {
     try {
       const token = this.tokens.get(tokenId);
@@ -4165,19 +4193,7 @@ export class PaymentsModule {
         tokenTransfers: [],
       });
 
-      // Add to history
-      const nostrTokenId = extractTokenIdFromSdkData(finalizedToken.sdkData);
-      const senderInfo = await this.resolveSenderInfo(senderPubkey);
-      await this.addToHistory({
-        type: 'RECEIVED',
-        amount: finalizedToken.amount,
-        coinId: finalizedToken.coinId,
-        symbol: finalizedToken.symbol,
-        timestamp: Date.now(),
-        senderPubkey,
-        ...senderInfo,
-        tokenId: nostrTokenId || tokenId,
-      });
+      // History entry was already created in handleCommitmentOnlyTransfer() — no duplicate here
     } catch (error) {
       console.error('[Payments] Failed to finalize received token:', error);
       // Mark as confirmed anyway (user has the token)
@@ -4218,7 +4234,8 @@ export class PaymentsModule {
         try {
           const result = await this.processInstantSplitBundle(
             instantBundle,
-            transfer.senderTransportPubkey
+            transfer.senderTransportPubkey,
+            payload.memo as string | undefined,
           );
           if (result.success) {
             this.log('INSTANT_SPLIT processed successfully');
@@ -4381,10 +4398,10 @@ export class PaymentsModule {
       // addToken() checks tombstones with exact (tokenId, stateHash) match
       // Tokens with same tokenId but different stateHash pass through (new state)
       const added = await this.addToken(token);
+      const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
 
       if (added) {
         const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
-        const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
         await this.addToHistory({
           type: 'RECEIVED',
           amount: token.amount,
@@ -4393,6 +4410,7 @@ export class PaymentsModule {
           timestamp: Date.now(),
           senderPubkey: transfer.senderTransportPubkey,
           ...senderInfo,
+          memo: payload.memo as string | undefined,
           tokenId: incomingTokenId || token.id,
         });
       }
@@ -4400,6 +4418,7 @@ export class PaymentsModule {
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
         senderPubkey: transfer.senderTransportPubkey,
+        senderNametag: senderInfo.senderNametag,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
