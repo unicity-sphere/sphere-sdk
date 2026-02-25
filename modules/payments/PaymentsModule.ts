@@ -1191,9 +1191,9 @@ export class PaymentsModule {
           );
         }
 
-        // 7. Track tokens and remove from in-memory map (single save below)
+        // 7. Track and remove tokens (removeToken archives + tombstones + saves)
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          this.tokens.delete(splitPlan.tokenToSplit.uiToken.id);
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1215,7 +1215,7 @@ export class PaymentsModule {
             method: 'direct',
             requestIdHex,
           });
-          this.tokens.delete(token.id);
+          await this.removeToken(token.id);
         }
 
         this.log(`V6 combined transfer completed`);
@@ -1223,11 +1223,9 @@ export class PaymentsModule {
 
       result.status = 'delivered';
 
-      // Save state + remove outbox entry in parallel (one persist round-trip)
-      await Promise.all([
-        this.save(),
-        this.removeFromOutbox(result.id),
-      ]);
+      // Save state and remove outbox entry
+      await this.save();
+      await this.removeFromOutbox(result.id);
 
       result.status = 'completed';
 
@@ -1235,7 +1233,10 @@ export class PaymentsModule {
       const tokenMap = new Map(result.tokens.map(t => [t.id, t]));
       const sentTokenIds: Array<{ id: string; amount: string; source: 'split' | 'direct' }> = result.tokenTransfers.map(tt => ({
         id: tt.sourceTokenId,
-        amount: tokenMap.get(tt.sourceTokenId)?.amount || '0',
+        // For split tokens, use splitAmount (the portion sent), not the original token amount
+        amount: tt.method === 'split'
+          ? (splitPlan.splitAmount?.toString() || '0')
+          : (tokenMap.get(tt.sourceTokenId)?.amount || '0'),
         source: tt.method === 'split' ? 'split' : 'direct',
       }));
       const sentTokenId = result.tokens[0] ? extractTokenIdFromSdkData(result.tokens[0].sdkData) : undefined;
@@ -1545,8 +1546,36 @@ export class PaymentsModule {
   ): Promise<Token | null> {
     const tokenInfo = await parseTokenInfo(sourceTokenInput);
 
+    const sdkData = typeof sourceTokenInput === 'string'
+      ? sourceTokenInput
+      : JSON.stringify(sourceTokenInput);
+
+    // Check tombstones BEFORE creating the token
+    const nostrTokenId = extractTokenIdFromSdkData(sdkData);
+    const nostrStateHash = extractStateHashFromSdkData(sdkData);
+    if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
+      this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
+      return null;
+    }
+
+    // Dedup by (tokenId + stateHash) — NOT by genesis ID alone, since split children
+    // share the same genesis ID but have different states
+    if (nostrTokenId && nostrStateHash) {
+      for (const existing of this.tokens.values()) {
+        const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+        if (existingTokenId === nostrTokenId && existingStateHash === nostrStateHash) {
+          console.log(
+            `[Payments] NOSTR-FIRST: Skipping duplicate token state ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}... ` +
+            `(existing id=${existing.id.slice(0, 12)}, status=${existing.status})`
+          );
+          return null;
+        }
+      }
+    }
+
     const token: Token = {
-      id: tokenInfo.tokenId ?? crypto.randomUUID(),
+      id: crypto.randomUUID(),
       coinId: tokenInfo.coinId,
       symbol: tokenInfo.symbol,
       name: tokenInfo.name,
@@ -1556,28 +1585,8 @@ export class PaymentsModule {
       status: 'submitted',  // NOSTR-FIRST: unconfirmed until proof
       createdAt: Date.now(),
       updatedAt: Date.now(),
-      sdkData: typeof sourceTokenInput === 'string'
-        ? sourceTokenInput
-        : JSON.stringify(sourceTokenInput),
+      sdkData,
     };
-
-    // Check tombstones
-    const nostrTokenId = extractTokenIdFromSdkData(token.sdkData);
-    const nostrStateHash = extractStateHashFromSdkData(token.sdkData);
-    if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
-      this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
-      return null;
-    }
-
-    // Dedup: skip if already in wallet
-    const existingToken = this.tokens.get(token.id);
-    if (existingToken) {
-      console.log(
-        `[Payments] NOSTR-FIRST: Skipping duplicate token ${token.id.slice(0, 12)}... ` +
-        `(existing status=${existingToken.status})`
-      );
-      return null;
-    }
 
     // Add token to in-memory map
     this.tokens.set(token.id, token);
@@ -1671,6 +1680,8 @@ export class PaymentsModule {
       if (splitToken) {
         allTokens.push(splitToken);
         tokenBreakdown.push({ id: splitToken.id, amount: splitToken.amount, source: 'split' });
+      } else {
+        console.warn(`[Payments] V6: split token was deduped/failed — amount=${bundle.splitBundle.amount}`);
       }
     }
 
@@ -1680,10 +1691,17 @@ export class PaymentsModule {
         this.saveCommitmentOnlyToken(sourceToken, commitment, senderPubkey, true)
       )
     );
-    for (const token of directResults) {
+    for (let i = 0; i < directResults.length; i++) {
+      const token = directResults[i];
       if (token) {
         allTokens.push(token);
         tokenBreakdown.push({ id: token.id, amount: token.amount, source: 'direct' });
+      } else {
+        const entry = bundle.directTokens[i];
+        console.warn(
+          `[Payments] V6: direct token #${i} dropped (amount=${entry.amount}, ` +
+          `tokenId=${entry.tokenId?.slice(0, 12) ?? 'N/A'})`
+        );
       }
     }
 
@@ -1724,9 +1742,12 @@ export class PaymentsModule {
       receivedAt: Date.now(),
     });
 
+    // Compute actual received amount from saved tokens (not bundle.totalAmount which is sender's request)
+    const actualAmount = allTokens.reduce((sum, t) => sum + BigInt(t.amount || '0'), 0n).toString();
+
     await this.addToHistory({
       type: 'RECEIVED',
-      amount: bundle.totalAmount,
+      amount: actualAmount,
       coinId: bundle.coinId,
       symbol: allTokens[0]?.symbol || bundle.coinId,
       timestamp: Date.now(),
