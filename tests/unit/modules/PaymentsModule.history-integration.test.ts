@@ -38,10 +38,12 @@ vi.mock('../../../modules/payments/TokenSplitCalculator', () => ({
 }));
 
 const mockExecuteSplitInstant = vi.fn();
+const mockBuildSplitBundle = vi.fn();
 vi.mock('../../../modules/payments/InstantSplitExecutor', () => ({
   InstantSplitExecutor: class {
     constructor() {}
     executeSplitInstant = mockExecuteSplitInstant;
+    buildSplitBundle = mockBuildSplitBundle;
   },
 }));
 
@@ -459,10 +461,10 @@ describe('History deduplication — integration flows', () => {
         requiresSplit: true,
       });
 
-      mockExecuteSplitInstant.mockResolvedValue({
-        success: true,
+      mockBuildSplitBundle.mockResolvedValue({
+        bundle: { version: '5.0', type: 'INSTANT_SPLIT', splitGroupId: 'sg-1' },
         splitGroupId: 'sg-1',
-        nostrEventId: 'nostr-1',
+        startBackground: vi.fn().mockResolvedValue(undefined),
       });
 
       await ctx.module.send({

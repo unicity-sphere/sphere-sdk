@@ -27,10 +27,12 @@ vi.mock('../../../modules/payments/TokenSplitCalculator', () => ({
 
 // Mock InstantSplitExecutor — controls split execution result
 const mockExecuteSplitInstant = vi.fn();
+const mockBuildSplitBundle = vi.fn();
 vi.mock('../../../modules/payments/InstantSplitExecutor', () => ({
   InstantSplitExecutor: class {
     constructor() {}
     executeSplitInstant = mockExecuteSplitInstant;
+    buildSplitBundle = mockBuildSplitBundle;
   },
 }));
 
@@ -419,11 +421,10 @@ describe('TransferResult.tokenTransfers', () => {
         requiresSplit: true,
       });
 
-      mockExecuteSplitInstant.mockResolvedValue({
-        success: true,
+      mockBuildSplitBundle.mockResolvedValue({
+        bundle: { version: '5.0', type: 'INSTANT_SPLIT', splitGroupId: 'split-group-abc123' },
         splitGroupId: 'split-group-abc123',
-        nostrEventId: 'nostr-event-def456',
-        criticalPathDurationMs: 2300,
+        startBackground: vi.fn().mockResolvedValue(undefined),
       });
 
       const result = await module.send({
@@ -437,7 +438,6 @@ describe('TransferResult.tokenTransfers', () => {
         sourceTokenId: 'token-split-src',
         method: 'split',
         splitGroupId: 'split-group-abc123',
-        nostrEventId: 'nostr-event-def456',
       });
     });
 
@@ -462,11 +462,10 @@ describe('TransferResult.tokenTransfers', () => {
         requiresSplit: true,
       });
 
-      mockExecuteSplitInstant.mockResolvedValue({
-        success: true,
+      mockBuildSplitBundle.mockResolvedValue({
+        bundle: { version: '5.0', type: 'INSTANT_SPLIT', splitGroupId: 'split-group-xyz' },
         splitGroupId: 'split-group-xyz',
-        nostrEventId: undefined,
-        criticalPathDurationMs: 1500,
+        startBackground: vi.fn().mockResolvedValue(undefined),
       });
 
       const result = await module.send({
@@ -509,11 +508,10 @@ describe('TransferResult.tokenTransfers', () => {
         requiresSplit: true,
       });
 
-      mockExecuteSplitInstant.mockResolvedValue({
-        success: true,
+      mockBuildSplitBundle.mockResolvedValue({
+        bundle: { version: '5.0', type: 'INSTANT_SPLIT', splitGroupId: 'split-mixed-001' },
         splitGroupId: 'split-mixed-001',
-        nostrEventId: 'nostr-mixed-001',
-        criticalPathDurationMs: 2100,
+        startBackground: vi.fn().mockResolvedValue(undefined),
       });
 
       const directCommitment = createMockCommitment('dd'.repeat(16));
@@ -534,7 +532,6 @@ describe('TransferResult.tokenTransfers', () => {
       expect(splitEntry).toBeDefined();
       expect(splitEntry!.sourceTokenId).toBe('token-to-split');
       expect(splitEntry!.splitGroupId).toBe('split-mixed-001');
-      expect(splitEntry!.nostrEventId).toBe('nostr-mixed-001');
 
       expect(directEntry).toBeDefined();
       expect(directEntry!.sourceTokenId).toBe('token-direct');
@@ -961,10 +958,11 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
         // transferMode omitted — should default to instant
       });
 
-      // Should send commitmentData format (instant), not transferTx
+      // V6: Should send { token: JSON.stringify(combinedBundle), proof: null } format
       const sendCall = (mockTransport.sendTokenTransfer as ReturnType<typeof vi.fn>).mock.calls[0];
       const payload = sendCall[1] as Record<string, unknown>;
-      expect(payload).toHaveProperty('commitmentData');
+      expect(payload).toHaveProperty('token');
+      expect(payload).toHaveProperty('proof', null);
       expect(payload).not.toHaveProperty('transferTx');
 
       // Should NOT call waitInclusionProof (instant mode is fire-and-forget)
@@ -999,10 +997,11 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
         transferMode: 'instant',
       });
 
-      // Should send commitmentData format (instant)
+      // V6: Should send { token: JSON.stringify(combinedBundle), proof: null } format
       const sendCall = (mockTransport.sendTokenTransfer as ReturnType<typeof vi.fn>).mock.calls[0];
       const payload = sendCall[1] as Record<string, unknown>;
-      expect(payload).toHaveProperty('commitmentData');
+      expect(payload).toHaveProperty('token');
+      expect(payload).toHaveProperty('proof', null);
       expect(payload).not.toHaveProperty('transferTx');
     });
 
@@ -1027,11 +1026,10 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
         requiresSplit: true,
       });
 
-      mockExecuteSplitInstant.mockResolvedValue({
-        success: true,
+      mockBuildSplitBundle.mockResolvedValue({
+        bundle: { version: '5.0', type: 'INSTANT_SPLIT', splitGroupId: 'instant-group' },
         splitGroupId: 'instant-group',
-        nostrEventId: 'instant-event',
-        criticalPathDurationMs: 2000,
+        startBackground: vi.fn().mockResolvedValue(undefined),
       });
 
       await module.send({
@@ -1041,8 +1039,8 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
         transferMode: 'instant',
       });
 
-      // Should use InstantSplitExecutor, NOT TokenSplitExecutor
-      expect(mockExecuteSplitInstant).toHaveBeenCalled();
+      // Should use InstantSplitExecutor (buildSplitBundle), NOT TokenSplitExecutor
+      expect(mockBuildSplitBundle).toHaveBeenCalled();
       expect(mockExecuteSplit).not.toHaveBeenCalled();
     });
   });

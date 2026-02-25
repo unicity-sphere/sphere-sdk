@@ -814,7 +814,7 @@ describe('getAssets()', () => {
     expect(assets[0]?.totalAmount).toBe('1000000000000000000');
   });
 
-  it('should include confirmed and unconfirmed tokens but exclude spent/invalid/transferring', async () => {
+  it('should include confirmed, unconfirmed, and transferring tokens but exclude spent/invalid', async () => {
     const module = createModuleWithTokens([
       { id: 't1', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '1000', status: 'confirmed' },
       { id: 't2', coinId: '0xaaa', symbol: 'UCT', name: 'Unicity', decimals: 18, amount: '2000', status: 'pending' },
@@ -825,12 +825,13 @@ describe('getAssets()', () => {
 
     const assets = await module.getAssets();
     expect(assets.length).toBe(1);
-    expect(assets[0]?.totalAmount).toBe('3000'); // 1000 confirmed + 2000 pending
-    expect(assets[0]?.tokenCount).toBe(2); // t1 + t2
+    expect(assets[0]?.totalAmount).toBe('6000'); // 1000 confirmed + 2000 pending + 3000 transferring
+    expect(assets[0]?.tokenCount).toBe(3); // t1 + t2 + t3
     expect(assets[0]?.confirmedAmount).toBe('1000');
-    expect(assets[0]?.unconfirmedAmount).toBe('2000');
+    expect(assets[0]?.unconfirmedAmount).toBe('5000'); // 2000 pending + 3000 transferring
     expect(assets[0]?.confirmedTokenCount).toBe(1);
-    expect(assets[0]?.unconfirmedTokenCount).toBe(1);
+    expect(assets[0]?.unconfirmedTokenCount).toBe(2); // pending + transferring
+    expect(assets[0]?.transferringTokenCount).toBe(1);
   });
 
   it('should filter by coinId when provided', async () => {
