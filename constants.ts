@@ -89,6 +89,8 @@ export const STORAGE_KEYS_ADDRESS = {
   GROUP_CHAT_PROCESSED_EVENTS: 'group_chat_processed_events',
   /** Processed V5 split group IDs for Nostr re-delivery dedup */
   PROCESSED_SPLIT_GROUP_IDS: 'processed_split_group_ids',
+  /** Processed V6 combined transfer IDs for Nostr re-delivery dedup */
+  PROCESSED_COMBINED_TRANSFER_IDS: 'processed_combined_transfer_ids',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */

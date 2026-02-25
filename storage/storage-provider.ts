@@ -87,6 +87,8 @@ export interface HistoryRecord {
   recipientNametag?: string;
   /** Optional memo/message attached to the transfer */
   memo?: string;
+  /** All token IDs in a combined transfer (V6 bundle breakdown) */
+  tokenIds?: Array<{ id: string; amount: string; source: 'split' | 'direct' }>;
 }
 
 // =============================================================================

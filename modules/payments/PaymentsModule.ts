@@ -74,8 +74,10 @@ import type {
   InstantSplitResult,
   PendingV5Finalization,
   UnconfirmedResolutionResult,
+  CombinedTransferBundleV6,
+  DirectTokenEntry,
 } from '../../types/instant-split';
-import { isInstantSplitBundle, isInstantSplitBundleV5 } from '../../types/instant-split';
+import { isInstantSplitBundle, isInstantSplitBundleV5, isCombinedTransferBundleV6 } from '../../types/instant-split';
 
 // SDK imports for token parsing and transfers
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
@@ -695,6 +697,9 @@ export class PaymentsModule {
   // even when the confirmed token's in-memory ID differs from v5split_{id}.
   private processedSplitGroupIds: Set<string> = new Set();
 
+  // Persistent dedup: tracks V6 combined transfer IDs that have been processed.
+  private processedCombinedTransferIds: Set<string> = new Set();
+
   // Storage event subscriptions (push-based sync)
   private storageEventUnsubscribers: (() => void)[] = [];
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -829,6 +834,23 @@ export class PaymentsModule {
         }
       }
 
+      // Remove stale placeholder tokens from interrupted sends.
+      // Placeholders have sdkData = '{"_placeholder":true}' — they were temporary
+      // UI stand-ins for change tokens whose background minting never completed.
+      for (const [id, token] of this.tokens) {
+        try {
+          if (token.sdkData) {
+            const data = JSON.parse(token.sdkData);
+            if (data?._placeholder) {
+              this.tokens.delete(id);
+              console.log(`[Payments] Removed stale placeholder token: ${id}`);
+            }
+          }
+        } catch {
+          // Not valid JSON — not a placeholder
+        }
+      }
+
       // Log loaded tokens
       const loadedTokens = Array.from(this.tokens.values()).map(t => `${t.id.slice(0, 12)}(${t.status})`);
       console.log(`[Payments][DEBUG] load(): from TXF providers: ${this.tokens.size} tokens [${loadedTokens.join(', ')}]`);
@@ -838,6 +860,7 @@ export class PaymentsModule {
 
       // Restore processed split group IDs for dedup across reloads
       await this.loadProcessedSplitGroupIds();
+      await this.loadProcessedCombinedTransferIds();
 
       // Load transaction history from dedicated history store (with migration from legacy KV)
       await this.loadHistory();
@@ -960,11 +983,12 @@ export class PaymentsModule {
       }
       result.tokens = tokensToSend;
 
-      // Mark as transferring
+      // Mark as transferring and persist — UI shows "Pending" badge immediately
       for (const token of tokensToSend) {
         token.status = 'transferring';
         this.tokens.set(token.id, token);
       }
+      await this.save();
 
       // Save to outbox for recovery
       await this.saveToOutbox(result, recipientPubkey);
@@ -977,10 +1001,13 @@ export class PaymentsModule {
 
       const transferMode = request.transferMode ?? 'instant';
 
-      // Handle split if required
-      if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-        if (transferMode === 'conservative') {
-          // Conservative split: use TokenSplitExecutor — collects all proofs before sending
+      if (transferMode === 'conservative') {
+        // =================================================================
+        // CONSERVATIVE MODE: each token sent individually with full proofs
+        // =================================================================
+
+        // Handle split if required
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
           this.log('Executing conservative split...');
           const splitExecutor = new TokenSplitExecutor({
             stateTransitionClient: stClient,
@@ -1021,14 +1048,12 @@ export class PaymentsModule {
             memo: request.memo,
           } as unknown as import('../../transport').TokenTransferPayload);
 
-          // Get request ID from the transfer commitment for tracking
           const splitCommitmentRequestId = splitResult.recipientTransferTx?.data?.requestId
             ?? splitResult.recipientTransferTx?.requestId;
           const splitRequestIdHex = splitCommitmentRequestId instanceof Uint8Array
             ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
             : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
-          // Remove the original token that was split
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
@@ -1036,12 +1061,59 @@ export class PaymentsModule {
             requestIdHex: splitRequestIdHex,
           });
           this.log(`Conservative split transfer completed`);
-        } else {
-          // Instant split: use InstantSplitExecutor for fast (~2.3s) splits
-          this.log('Executing instant split...');
+        }
 
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
+        // Transfer direct tokens
+        for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
+          const token = tokenWithAmount.uiToken;
+          const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
+
+          console.log(`[Payments] CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
+
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
+            throw new Error(`Transfer commitment failed: ${submitResponse.status}`);
+          }
+
+          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+          const transferTx = commitment.toTransaction(inclusionProof);
+
+          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
+            transferTx: JSON.stringify(transferTx.toJSON()),
+            memo: request.memo,
+          } as unknown as import('../../transport').TokenTransferPayload);
+          console.log(`[Payments] CONSERVATIVE: Direct token sent successfully`);
+
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex = requestIdBytes instanceof Uint8Array
+            ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
+            : String(requestIdBytes);
+
+          result.tokenTransfers.push({
+            sourceTokenId: token.id,
+            method: 'direct',
+            requestIdHex,
+          });
+          this.log(`Token ${token.id} sent via CONSERVATIVE, requestId: ${requestIdHex}`);
+          await this.removeToken(token.id);
+        }
+      } else {
+        // =================================================================
+        // INSTANT MODE: collect all tokens into ONE CombinedTransferBundleV6
+        // =================================================================
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const devMode = (this.deps!.oracle as any).isDevMode?.() ?? false;
+        const senderPubkey = this.deps!.identity.chainPubkey;
+
+        // Placeholder ID for the change token — set after sending, read by background callback
+        let changeTokenPlaceholderId: string | null = null;
+
+        // 1. Build split bundle (if needed) — does NOT send
+        let builtSplit: import('../../types/instant-split').BuildSplitBundleResult | null = null;
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+          this.log('Building instant split bundle...');
           const executor = new InstantSplitExecutor({
             stateTransitionClient: stClient,
             trustBase,
@@ -1049,18 +1121,20 @@ export class PaymentsModule {
             devMode,
           });
 
-          const instantResult = await executor.executeSplitInstant(
+          builtSplit = await executor.buildSplitBundle(
             splitPlan.tokenToSplit.sdkToken,
             splitPlan.splitAmount!,
             splitPlan.remainderAmount!,
             splitPlan.coinId,
             recipientAddress,
-            this.deps!.transport,
-            recipientPubkey,
             {
               memo: request.memo,
               onChangeTokenCreated: async (changeToken) => {
                 const changeTokenData = changeToken.toJSON();
+                // Remove placeholder — it was a temporary UI stand-in
+                if (changeTokenPlaceholderId && this.tokens.has(changeTokenPlaceholderId)) {
+                  this.tokens.delete(changeTokenPlaceholderId);
+                }
                 const uiToken: Token = {
                   id: crypto.randomUUID(),
                   coinId: request.coinId,
@@ -1083,99 +1157,136 @@ export class PaymentsModule {
               },
             }
           );
-
-          if (!instantResult.success) {
-            throw new Error(instantResult.error || 'Instant split failed');
-          }
-
-          // Track background task for change token creation
-          if (instantResult.backgroundPromise) {
-            this.pendingBackgroundTasks.push(instantResult.backgroundPromise);
-          }
-
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
-          result.tokenTransfers.push({
-            sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
-            method: 'split',
-            splitGroupId: instantResult.splitGroupId,
-            nostrEventId: instantResult.nostrEventId,
-          });
-          this.log(`Instant split transfer completed`);
+          this.log(`Split bundle built: splitGroupId=${builtSplit.splitGroupId}`);
         }
-      }
 
-      // Transfer direct tokens (no split needed)
-      for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
-        const token = tokenWithAmount.uiToken;
+        // 2. Prepare direct token entries in parallel — does NOT send
+        const directCommitments = await Promise.all(
+          splitPlan.tokensToTransferDirectly.map(tw =>
+            this.createSdkCommitment(tw.uiToken, recipientAddress, signingService)
+          )
+        );
 
-        // Create SDK transfer commitment
-        const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
+        const directTokenEntries: DirectTokenEntry[] = splitPlan.tokensToTransferDirectly.map(
+          (tw, i) => ({
+            sourceToken: JSON.stringify(tw.sdkToken.toJSON()),
+            commitmentData: JSON.stringify(directCommitments[i].toJSON()),
+            amount: tw.uiToken.amount,
+            coinId: tw.uiToken.coinId,
+            tokenId: extractTokenIdFromSdkData(tw.uiToken.sdkData) || undefined,
+          })
+        );
 
-        if (transferMode === 'conservative') {
-          // Conservative direct: wait for proof, then send fully finalized transfer
-          console.log(`[Payments] CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
+        // 3. Assemble CombinedTransferBundleV6
+        const combinedBundle: CombinedTransferBundleV6 = {
+          version: '6.0',
+          type: 'COMBINED_TRANSFER',
+          transferId: result.id,
+          splitBundle: builtSplit?.bundle ?? null,
+          directTokens: directTokenEntries,
+          totalAmount: request.amount.toString(),
+          coinId: request.coinId,
+          senderPubkey,
+          memo: request.memo,
+        };
 
-          // Submit commitment to aggregator and wait for inclusion proof
-          const submitResponse = await stClient.submitTransferCommitment(commitment);
-          if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
-            throw new Error(`Transfer commitment failed: ${submitResponse.status}`);
-          }
+        // 4. Send ONE Nostr message
+        console.log(
+          `[Payments] Sending V6 combined bundle: transfer=${result.id.slice(0, 8)}... ` +
+          `split=${!!builtSplit} direct=${directTokenEntries.length}`
+        );
+        await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
+          token: JSON.stringify(combinedBundle),
+          proof: null,
+          memo: request.memo,
+          sender: { transportPubkey: senderPubkey },
+        });
+        console.log(`[Payments] V6 combined bundle sent successfully`);
 
-          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
-          const transferTx = commitment.toTransaction(inclusionProof);
+        // 5. Start background: split mint proofs + change token creation
+        if (builtSplit) {
+          const bgPromise = builtSplit.startBackground();
+          this.pendingBackgroundTasks.push(bgPromise);
+        }
 
-          // Send fully finalized { sourceToken, transferTx } via Nostr
-          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
-            transferTx: JSON.stringify(transferTx.toJSON()),
-            memo: request.memo,
-          } as unknown as import('../../transport').TokenTransferPayload);
-          console.log(`[Payments] CONSERVATIVE: Direct token sent successfully`);
-        } else {
-          // Instant direct: NOSTR-FIRST - send commitment + source token via Nostr immediately
-          // Submit to aggregator in background. Receiver handles via handleCommitmentOnlyTransfer().
-          console.log(`[Payments] NOSTR-FIRST: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
-          await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
-            sourceToken: JSON.stringify(tokenWithAmount.sdkToken.toJSON()),
-            commitmentData: JSON.stringify(commitment.toJSON()),
-            memo: request.memo,
-          } as unknown as import('../../transport').TokenTransferPayload);
-          console.log(`[Payments] NOSTR-FIRST: Direct token sent successfully`);
+        // 5a. Create placeholder change token so sender sees correct remainder immediately.
+        // The real change token replaces this when background mint proof arrives (~2s).
+        if (builtSplit && splitPlan.remainderAmount) {
+          changeTokenPlaceholderId = crypto.randomUUID();
+          const placeholder: Token = {
+            id: changeTokenPlaceholderId,
+            coinId: request.coinId,
+            symbol: this.getCoinSymbol(request.coinId),
+            name: this.getCoinName(request.coinId),
+            decimals: this.getCoinDecimals(request.coinId),
+            iconUrl: this.getCoinIconUrl(request.coinId),
+            amount: splitPlan.remainderAmount.toString(),
+            status: 'transferring',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: JSON.stringify({ _placeholder: true }),
+          };
+          this.tokens.set(placeholder.id, placeholder);
+          this.log(`Placeholder change token created: ${placeholder.id} (${placeholder.amount})`);
+        }
 
-          // Submit commitment to aggregator in background (fire-and-forget)
+        // 6. Submit direct token commitments to aggregator in background
+        for (const commitment of directCommitments) {
           stClient.submitTransferCommitment(commitment).catch(err =>
             console.error('[Payments] Background commitment submit failed:', err)
           );
         }
 
-        // Get request ID as hex string for tracking
-        const requestIdBytes = commitment.requestId;
-        const requestIdHex = requestIdBytes instanceof Uint8Array
-          ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-          : String(requestIdBytes);
+        // 7. Track and remove tokens (removeToken archives + tombstones + saves)
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
+          result.tokenTransfers.push({
+            sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
+            method: 'split',
+            splitGroupId: builtSplit!.splitGroupId,
+          });
+        }
 
-        result.tokenTransfers.push({
-          sourceTokenId: token.id,
-          method: 'direct',
-          requestIdHex,
-        });
+        for (let i = 0; i < splitPlan.tokensToTransferDirectly.length; i++) {
+          const token = splitPlan.tokensToTransferDirectly[i].uiToken;
+          const commitment = directCommitments[i];
 
-        this.log(`Token ${token.id} sent via ${transferMode.toUpperCase()}, requestId: ${requestIdHex}`);
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex = requestIdBytes instanceof Uint8Array
+            ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
+            : String(requestIdBytes);
 
-        // Remove sent token (creates tombstone)
-        await this.removeToken(token.id);
+          result.tokenTransfers.push({
+            sourceTokenId: token.id,
+            method: 'direct',
+            requestIdHex,
+          });
+          await this.removeToken(token.id);
+        }
+
+        this.log(`V6 combined transfer completed`);
       }
 
       result.status = 'delivered';
 
-      // Save state
+      // Save state and remove outbox entry
       await this.save();
       await this.removeFromOutbox(result.id);
 
       result.status = 'completed';
 
-      // Add to transaction history (one entry per send operation)
+      // Build token breakdown using a Map for O(1) lookup
+      const tokenMap = new Map(result.tokens.map(t => [t.id, t]));
+      const sentTokenIds: Array<{ id: string; amount: string; source: 'split' | 'direct' }> = result.tokenTransfers.map(tt => ({
+        id: tt.sourceTokenId,
+        // For split tokens, use splitAmount (the portion sent), not the original token amount
+        amount: tt.method === 'split'
+          ? (splitPlan.splitAmount?.toString() || '0')
+          : (tokenMap.get(tt.sourceTokenId)?.amount || '0'),
+        source: tt.method === 'split' ? 'split' : 'direct',
+      }));
       const sentTokenId = result.tokens[0] ? extractTokenIdFromSdkData(result.tokens[0].sdkData) : undefined;
+
       await this.addToHistory({
         type: 'SENT',
         amount: request.amount,
@@ -1188,6 +1299,7 @@ export class PaymentsModule {
         memo: request.memo,
         transferId: result.id,
         tokenId: sentTokenId || undefined,
+        tokenIds: sentTokenIds.length > 0 ? sentTokenIds : undefined,
       });
 
       this.deps!.emitEvent('transfer:confirmed', result);
@@ -1405,6 +1517,343 @@ export class PaymentsModule {
     }
   }
 
+  // ===========================================================================
+  // Shared Helpers for V5 and V6 Receiver Processing
+  // ===========================================================================
+
+  /**
+   * Save a V5 split bundle as an unconfirmed token (shared by V5 standalone and V6 combined).
+   * Returns the created UI token, or null if deduped.
+   *
+   * @param deferPersistence - If true, skip addToken/save calls (caller batches them).
+   *   The token is still added to the in-memory map for dedup; caller must call save().
+   */
+  private async saveUnconfirmedV5Token(
+    bundle: InstantSplitBundleV5,
+    senderPubkey: string,
+    deferPersistence = false,
+  ): Promise<Token | null> {
+    const deterministicId = `v5split_${bundle.splitGroupId}`;
+    if (this.tokens.has(deterministicId) || this.processedSplitGroupIds.has(bundle.splitGroupId)) {
+      console.log(`[Payments] V5 bundle ${bundle.splitGroupId.slice(0, 12)}... already processed, skipping`);
+      return null;
+    }
+
+    const registry = TokenRegistry.getInstance();
+    const pendingData: PendingV5Finalization = {
+      type: 'v5_bundle',
+      stage: 'RECEIVED',
+      bundleJson: JSON.stringify(bundle),
+      senderPubkey,
+      savedAt: Date.now(),
+      attemptCount: 0,
+    };
+
+    const uiToken: Token = {
+      id: deterministicId,
+      coinId: bundle.coinId,
+      symbol: registry.getSymbol(bundle.coinId) || bundle.coinId,
+      name: registry.getName(bundle.coinId) || bundle.coinId,
+      decimals: registry.getDecimals(bundle.coinId) ?? 8,
+      amount: bundle.amount,
+      status: 'submitted',  // UNCONFIRMED
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: JSON.stringify({ _pendingFinalization: pendingData }),
+    };
+
+    // Record splitGroupId for persistent dedup across page reloads
+    this.processedSplitGroupIds.add(bundle.splitGroupId);
+
+    if (deferPersistence) {
+      // Only update in-memory map — caller will save() + saveProcessedSplitGroupIds()
+      this.tokens.set(uiToken.id, uiToken);
+    } else {
+      await this.addToken(uiToken);
+      await this.saveProcessedSplitGroupIds();
+    }
+
+    return uiToken;
+  }
+
+  /**
+   * Save a commitment-only (NOSTR-FIRST) token and start proof polling.
+   * Shared by standalone NOSTR-FIRST handler and V6 combined handler.
+   * Returns the created UI token, or null if deduped/tombstoned.
+   *
+   * @param deferPersistence - If true, skip save() and commitment submission
+   *   (caller batches them). Token is added to in-memory map + proof polling is queued.
+   * @param skipGenesisDedup - If true, skip genesis-ID-only dedup. V6 handler sets this
+   *   because bundle-level dedup protects against replays, and split children share genesis IDs.
+   */
+  private async saveCommitmentOnlyToken(
+    sourceTokenInput: unknown,
+    commitmentInput: unknown,
+    senderPubkey: string,
+    deferPersistence = false,
+    skipGenesisDedup = false,
+  ): Promise<Token | null> {
+    const tokenInfo = await parseTokenInfo(sourceTokenInput);
+
+    const sdkData = typeof sourceTokenInput === 'string'
+      ? sourceTokenInput
+      : JSON.stringify(sourceTokenInput);
+
+    // Check tombstones BEFORE creating the token
+    const nostrTokenId = extractTokenIdFromSdkData(sdkData);
+    const nostrStateHash = extractStateHashFromSdkData(sdkData);
+    if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
+      this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
+      return null;
+    }
+
+    // Dedup: check existing tokens
+    if (nostrTokenId) {
+      for (const existing of this.tokens.values()) {
+        const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
+        if (existingTokenId !== nostrTokenId) continue;
+
+        // Exact state match — always reject (duplicate delivery)
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+        if (nostrStateHash && existingStateHash === nostrStateHash) {
+          console.log(
+            `[Payments] NOSTR-FIRST: Skipping duplicate token state ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`
+          );
+          return null;
+        }
+
+        // Same genesis, different state — reject for standalone NOSTR-FIRST (replay after
+        // finalization changes stateHash), allow for V6 batches (split children share genesis)
+        if (!skipGenesisDedup) {
+          console.log(
+            `[Payments] NOSTR-FIRST: Skipping replay of finalized token ${nostrTokenId.slice(0, 8)}...`
+          );
+          return null;
+        }
+      }
+    }
+
+    const token: Token = {
+      id: crypto.randomUUID(),
+      coinId: tokenInfo.coinId,
+      symbol: tokenInfo.symbol,
+      name: tokenInfo.name,
+      decimals: tokenInfo.decimals,
+      iconUrl: tokenInfo.iconUrl,
+      amount: tokenInfo.amount,
+      status: 'submitted',  // NOSTR-FIRST: unconfirmed until proof
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData,
+    };
+
+    // Add token to in-memory map
+    this.tokens.set(token.id, token);
+
+    if (!deferPersistence) {
+      await this.save();
+    }
+
+    // Start proof polling (commitment submission deferred when batching)
+    try {
+      const commitment = await TransferCommitment.fromJSON(commitmentInput);
+      const requestIdBytes = commitment.requestId;
+      const requestIdHex = requestIdBytes instanceof Uint8Array
+        ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
+        : String(requestIdBytes);
+
+      if (!deferPersistence) {
+        // Submit commitment to aggregator immediately (standalone path)
+        const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+        if (stClient) {
+          const response = await stClient.submitTransferCommitment(commitment);
+          this.log(`NOSTR-FIRST recipient commitment submit: ${response.status}`);
+        }
+      }
+
+      this.addProofPollingJob({
+        tokenId: token.id,
+        requestIdHex,
+        commitmentJson: JSON.stringify(commitmentInput),
+        startedAt: Date.now(),
+        attemptCount: 0,
+        lastAttemptAt: 0,
+        onProofReceived: async (tokenId) => {
+          await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput);
+        },
+      });
+    } catch (err) {
+      console.error('[Payments] Failed to parse commitment for proof polling:', err);
+    }
+
+    return token;
+  }
+
+  // ===========================================================================
+  // Combined Transfer V6 — Receiver
+  // ===========================================================================
+
+  /**
+   * Process a received COMBINED_TRANSFER V6 bundle.
+   *
+   * Unpacks a single Nostr message into its component tokens:
+   * - Optional V5 split bundle (saved as unconfirmed, resolved lazily)
+   * - Zero or more direct tokens (saved as unconfirmed, proof-polled)
+   *
+   * Emits ONE transfer:incoming event and records ONE history entry.
+   */
+  private async processCombinedTransferBundle(
+    bundle: CombinedTransferBundleV6,
+    senderPubkey: string,
+  ): Promise<void> {
+    this.ensureInitialized();
+
+    // Ensure load() has completed so dedup checks see all persisted tokens
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+
+    // Dedup by transferId
+    if (this.processedCombinedTransferIds.has(bundle.transferId)) {
+      console.log(`[Payments] V6 combined transfer ${bundle.transferId.slice(0, 12)}... already processed, skipping`);
+      return;
+    }
+
+    console.log(
+      `[Payments] Processing V6 combined transfer ${bundle.transferId.slice(0, 12)}... ` +
+      `(split=${!!bundle.splitBundle}, direct=${bundle.directTokens.length})`
+    );
+
+    const allTokens: Token[] = [];
+    const tokenBreakdown: Array<{ id: string; amount: string; source: 'split' | 'direct' }> = [];
+
+    // Pre-parse direct token commitment data once (reused for saving + aggregator submit)
+    const parsedDirectEntries = bundle.directTokens.map(entry => ({
+      sourceToken: typeof entry.sourceToken === 'string' ? JSON.parse(entry.sourceToken) : entry.sourceToken,
+      commitment: typeof entry.commitmentData === 'string' ? JSON.parse(entry.commitmentData) : entry.commitmentData,
+    }));
+
+    // 1. Process split bundle (if present) — deferred persistence
+    if (bundle.splitBundle) {
+      const splitToken = await this.saveUnconfirmedV5Token(bundle.splitBundle, senderPubkey, true);
+      if (splitToken) {
+        allTokens.push(splitToken);
+        tokenBreakdown.push({ id: splitToken.id, amount: splitToken.amount, source: 'split' });
+      } else {
+        console.warn(`[Payments] V6: split token was deduped/failed — amount=${bundle.splitBundle.amount}`);
+      }
+    }
+
+    // 2. Process direct tokens in parallel — deferred persistence
+    const directResults = await Promise.all(
+      parsedDirectEntries.map(({ sourceToken, commitment }) =>
+        this.saveCommitmentOnlyToken(sourceToken, commitment, senderPubkey, true, true)
+      )
+    );
+    for (let i = 0; i < directResults.length; i++) {
+      const token = directResults[i];
+      if (token) {
+        allTokens.push(token);
+        tokenBreakdown.push({ id: token.id, amount: token.amount, source: 'direct' });
+      } else {
+        const entry = bundle.directTokens[i];
+        console.warn(
+          `[Payments] V6: direct token #${i} dropped (amount=${entry.amount}, ` +
+          `tokenId=${entry.tokenId?.slice(0, 12) ?? 'N/A'})`
+        );
+      }
+    }
+
+    if (allTokens.length === 0) {
+      console.log(`[Payments] V6 combined transfer: all tokens deduped, nothing to save`);
+      return;
+    }
+
+    // 3. Batched persistence + sender info resolution in parallel
+    this.processedCombinedTransferIds.add(bundle.transferId);
+    const [senderInfo] = await Promise.all([
+      this.resolveSenderInfo(senderPubkey),
+      this.save(),
+      this.saveProcessedCombinedTransferIds(),
+      ...(bundle.splitBundle ? [this.saveProcessedSplitGroupIds()] : []),
+    ]);
+
+    // 4. Submit direct token commitments to aggregator (fire-and-forget, reuse parsed data)
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+    if (stClient) {
+      for (const { commitment } of parsedDirectEntries) {
+        TransferCommitment.fromJSON(commitment).then(c =>
+          stClient.submitTransferCommitment(c)
+        ).catch(err =>
+          console.error('[Payments] V6 background commitment submit failed:', err)
+        );
+      }
+    }
+
+    // 5. Emit event + history
+
+    this.deps!.emitEvent('transfer:incoming', {
+      id: bundle.transferId,
+      senderPubkey,
+      senderNametag: senderInfo.senderNametag,
+      tokens: allTokens,
+      memo: bundle.memo,
+      receivedAt: Date.now(),
+    });
+
+    // Compute actual received amount from saved tokens (not bundle.totalAmount which is sender's request)
+    const actualAmount = allTokens.reduce((sum, t) => sum + BigInt(t.amount || '0'), 0n).toString();
+
+    await this.addToHistory({
+      type: 'RECEIVED',
+      amount: actualAmount,
+      coinId: bundle.coinId,
+      symbol: allTokens[0]?.symbol || bundle.coinId,
+      timestamp: Date.now(),
+      senderPubkey,
+      ...senderInfo,
+      memo: bundle.memo,
+      transferId: bundle.transferId,
+      tokenId: allTokens[0]?.id,
+      tokenIds: tokenBreakdown,
+    });
+
+    // 6. Fire-and-forget: try to resolve V5 tokens immediately
+    if (bundle.splitBundle) {
+      this.resolveUnconfirmed().catch(() => {});
+      this.scheduleResolveUnconfirmed();
+    }
+  }
+
+  /**
+   * Persist processed combined transfer IDs to KV storage.
+   */
+  private async saveProcessedCombinedTransferIds(): Promise<void> {
+    const ids = Array.from(this.processedCombinedTransferIds);
+    if (ids.length > 0) {
+      await this.deps!.storage.set(
+        STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
+        JSON.stringify(ids)
+      );
+    }
+  }
+
+  /**
+   * Load processed combined transfer IDs from KV storage.
+   */
+  private async loadProcessedCombinedTransferIds(): Promise<void> {
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS);
+    if (!data) return;
+    try {
+      const ids = JSON.parse(data) as string[];
+      for (const id of ids) {
+        this.processedCombinedTransferIds.add(id);
+      }
+    } catch {
+      // Ignore corrupt data
+    }
+  }
+
   /**
    * Process a received INSTANT_SPLIT bundle.
    *
@@ -1439,44 +1888,10 @@ export class PaymentsModule {
 
     // V5: save immediately as unconfirmed, resolve proofs lazily
     try {
-      // Deduplicate Nostr re-deliveries using both in-memory token map AND
-      // the persisted processedSplitGroupIds set.  After confirmation, the
-      // token's ID changes from v5split_{id} to the real genesis tokenId
-      // (TXF round-trip), so the in-memory check alone isn't sufficient.
-      const deterministicId = `v5split_${bundle.splitGroupId}`;
-      if (this.tokens.has(deterministicId) || this.processedSplitGroupIds.has(bundle.splitGroupId)) {
-        console.log(`[Payments] V5 bundle ${bundle.splitGroupId.slice(0, 12)}... already processed, skipping`);
+      const uiToken = await this.saveUnconfirmedV5Token(bundle, senderPubkey);
+      if (!uiToken) {
         return { success: true, durationMs: 0 };
       }
-
-      const registry = TokenRegistry.getInstance();
-      const pendingData: PendingV5Finalization = {
-        type: 'v5_bundle',
-        stage: 'RECEIVED',
-        bundleJson: JSON.stringify(bundle),
-        senderPubkey,
-        savedAt: Date.now(),
-        attemptCount: 0,
-      };
-
-      const uiToken: Token = {
-        id: deterministicId,
-        coinId: bundle.coinId,
-        symbol: registry.getSymbol(bundle.coinId) || bundle.coinId,
-        name: registry.getName(bundle.coinId) || bundle.coinId,
-        decimals: registry.getDecimals(bundle.coinId) ?? 8,
-        amount: bundle.amount,
-        status: 'submitted',  // UNCONFIRMED
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        sdkData: JSON.stringify({ _pendingFinalization: pendingData }),
-      };
-
-      await this.addToken(uiToken);
-
-      // Record splitGroupId for persistent dedup across page reloads
-      this.processedSplitGroupIds.add(bundle.splitGroupId);
-      await this.saveProcessedSplitGroupIds();
 
       // Record in history (once per token — resolveV5Token will NOT add another)
       const senderInfo = await this.resolveSenderInfo(senderPubkey);
@@ -1489,7 +1904,7 @@ export class PaymentsModule {
         senderPubkey,
         ...senderInfo,
         memo,
-        tokenId: deterministicId,
+        tokenId: uiToken.id,
       });
 
       // Emit incoming transfer event
@@ -2306,7 +2721,8 @@ export class PaymentsModule {
 
   /**
    * Aggregate tokens by coinId with confirmed/unconfirmed breakdown.
-   * Excludes tokens with status 'spent', 'invalid', or 'transferring'.
+   * Excludes tokens with status 'spent' or 'invalid'.
+   * Tokens with status 'transferring' are counted as unconfirmed (visible in UI as "Sending").
    */
   private aggregateTokens(coinId?: string): Asset[] {
     const assetsMap = new Map<string, {
@@ -2319,16 +2735,18 @@ export class PaymentsModule {
       unconfirmedAmount: bigint;
       confirmedTokenCount: number;
       unconfirmedTokenCount: number;
+      transferringTokenCount: number;
     }>();
 
     for (const token of this.tokens.values()) {
-      // Skip spent, invalid, and transferring tokens
-      if (token.status === 'spent' || token.status === 'invalid' || token.status === 'transferring') continue;
+      // Skip spent and invalid tokens; transferring tokens remain visible
+      if (token.status === 'spent' || token.status === 'invalid') continue;
       if (coinId && token.coinId !== coinId) continue;
 
       const key = token.coinId;
       const amount = BigInt(token.amount);
       const isConfirmed = token.status === 'confirmed';
+      const isTransferring = token.status === 'transferring';
       const existing = assetsMap.get(key);
 
       if (existing) {
@@ -2339,6 +2757,7 @@ export class PaymentsModule {
           existing.unconfirmedAmount += amount;
           existing.unconfirmedTokenCount++;
         }
+        if (isTransferring) existing.transferringTokenCount++;
       } else {
         assetsMap.set(key, {
           coinId: token.coinId,
@@ -2350,6 +2769,7 @@ export class PaymentsModule {
           unconfirmedAmount: isConfirmed ? 0n : amount,
           confirmedTokenCount: isConfirmed ? 1 : 0,
           unconfirmedTokenCount: isConfirmed ? 0 : 1,
+          transferringTokenCount: isTransferring ? 1 : 0,
         });
       }
     }
@@ -2368,6 +2788,7 @@ export class PaymentsModule {
         unconfirmedAmount: raw.unconfirmedAmount.toString(),
         confirmedTokenCount: raw.confirmedTokenCount,
         unconfirmedTokenCount: raw.unconfirmedTokenCount,
+        transferringTokenCount: raw.transferringTokenCount,
         priceUsd: null,
         priceEur: null,
         change24h: null,
@@ -4139,7 +4560,7 @@ export class PaymentsModule {
   /**
    * Handle NOSTR-FIRST commitment-only transfer (recipient side)
    * This is called when receiving a transfer with only commitmentData and no proof yet.
-   * We create the token as 'submitted', submit commitment (idempotent), and poll for proof.
+   * Delegates to saveCommitmentOnlyToken() helper, then emits event + records history.
    */
   private async handleCommitmentOnlyTransfer(
     transfer: IncomingTokenTransfer,
@@ -4158,57 +4579,28 @@ export class PaymentsModule {
         return;
       }
 
-      // Parse source token info
-      const tokenInfo = await parseTokenInfo(sourceTokenInput);
-
-      // Create token with 'submitted' status (unconfirmed until proof received)
-      const token: Token = {
-        id: tokenInfo.tokenId ?? crypto.randomUUID(),
-        coinId: tokenInfo.coinId,
-        symbol: tokenInfo.symbol,
-        name: tokenInfo.name,
-        decimals: tokenInfo.decimals,
-        iconUrl: tokenInfo.iconUrl,
-        amount: tokenInfo.amount,
-        status: 'submitted',  // NOSTR-FIRST: unconfirmed until proof
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        sdkData: typeof sourceTokenInput === 'string'
-          ? sourceTokenInput
-          : JSON.stringify(sourceTokenInput),
-      };
-
-      // Check tombstones - reject tokens with exact (tokenId, stateHash) match
-      // This prevents spent tokens from being re-added via Nostr re-delivery
-      // Tokens with the same tokenId but DIFFERENT stateHash are allowed (new state)
-      const nostrTokenId = extractTokenIdFromSdkData(token.sdkData);
-      const nostrStateHash = extractStateHashFromSdkData(token.sdkData);
-      if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
-        this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
-        return;
-      }
-
-      // Add token as unconfirmed
-      this.tokens.set(token.id, token);
-      console.log(`[Payments][DEBUG] NOSTR-FIRST: saving token id=${token.id.slice(0, 16)} status=${token.status} sdkData.length=${token.sdkData?.length}`);
-      await this.save();
-      console.log(`[Payments][DEBUG] NOSTR-FIRST: save() completed, tokens.size=${this.tokens.size}`);
+      const token = await this.saveCommitmentOnlyToken(
+        sourceTokenInput,
+        commitmentInput,
+        transfer.senderTransportPubkey,
+      );
+      if (!token) return;
 
       // Resolve sender info for both event and history
       const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
 
       // Emit event for incoming transfer (even though unconfirmed)
-      const incomingTransfer: IncomingTransfer = {
+      this.deps!.emitEvent('transfer:incoming', {
         id: transfer.id,
         senderPubkey: transfer.senderTransportPubkey,
         senderNametag: senderInfo.senderNametag,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
-      };
-      this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+      });
 
-      // Record in history immediately (not during finalization — that's just proof confirmation)
+      // Record in history immediately
+      const nostrTokenId = extractTokenIdFromSdkData(token.sdkData);
       await this.addToHistory({
         type: 'RECEIVED',
         amount: token.amount,
@@ -4220,39 +4612,6 @@ export class PaymentsModule {
         memo: payload.memo as string | undefined,
         tokenId: nostrTokenId || token.id,
       });
-
-      // Parse commitment and start proof polling
-      try {
-        const commitment = await TransferCommitment.fromJSON(commitmentInput);
-        const requestIdBytes = commitment.requestId;
-        const requestIdHex = requestIdBytes instanceof Uint8Array
-          ? Array.from(requestIdBytes).map(b => b.toString(16).padStart(2, '0')).join('')
-          : String(requestIdBytes);
-
-        // Submit commitment to aggregator (idempotent - same as sender)
-        const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
-        if (stClient) {
-          const response = await stClient.submitTransferCommitment(commitment);
-          this.log(`NOSTR-FIRST recipient commitment submit: ${response.status}`);
-        }
-
-        // Start polling for proof
-        this.addProofPollingJob({
-          tokenId: token.id,
-          requestIdHex,
-          commitmentJson: JSON.stringify(commitmentInput),
-          startedAt: Date.now(),
-          attemptCount: 0,
-          lastAttemptAt: 0,
-          onProofReceived: async (tokenId) => {
-            // When proof arrives, finalize the token and update status
-            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput);
-          },
-        });
-      } catch (err) {
-        console.error('[Payments] Failed to parse commitment for proof polling:', err);
-        // Token remains as 'submitted' - will eventually time out
-      }
     } catch (error) {
       console.error('[Payments] Failed to process NOSTR-FIRST transfer:', error);
     }
@@ -4417,11 +4776,38 @@ export class PaymentsModule {
     try {
       // Check payload format - Sphere wallet sends { sourceToken, transferTx }
       // SDK format is { token, proof }
+      // COMBINED_TRANSFER V6 format is { type: 'COMBINED_TRANSFER', version: '6.0', ... }
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
       console.log('[Payments][DEBUG] handleIncomingTransfer: keys=', Object.keys(payload).join(','));
 
-      // Check for INSTANT_SPLIT bundle - may be the payload itself or nested in payload.token
+      // Check for COMBINED_TRANSFER V6 bundle (single message containing all tokens)
+      let combinedBundle: CombinedTransferBundleV6 | null = null;
+      if (isCombinedTransferBundleV6(payload)) {
+        combinedBundle = payload as CombinedTransferBundleV6;
+      } else if (payload.token) {
+        try {
+          const inner = typeof payload.token === 'string' ? JSON.parse(payload.token as string) : payload.token;
+          if (isCombinedTransferBundleV6(inner)) {
+            combinedBundle = inner as CombinedTransferBundleV6;
+          }
+        } catch {
+          // Not a JSON string or not a V6 bundle - fall through
+        }
+      }
+
+      if (combinedBundle) {
+        this.log('Processing COMBINED_TRANSFER V6 bundle...');
+        try {
+          await this.processCombinedTransferBundle(combinedBundle, transfer.senderTransportPubkey);
+          this.log('COMBINED_TRANSFER V6 processed successfully');
+        } catch (err) {
+          console.error('[Payments] COMBINED_TRANSFER V6 processing error:', err);
+        }
+        return;
+      }
+
+      // Check for INSTANT_SPLIT bundle (V4/V5 standalone — backward compat)
       let instantBundle: InstantSplitBundle | null = null;
       if (isInstantSplitBundle(payload)) {
         instantBundle = payload as InstantSplitBundle;
@@ -4621,19 +5007,21 @@ export class PaymentsModule {
           memo: payload.memo as string | undefined,
           tokenId: incomingTokenId || token.id,
         });
+
+        const incomingTransfer: IncomingTransfer = {
+          id: transfer.id,
+          senderPubkey: transfer.senderTransportPubkey,
+          senderNametag: senderInfo.senderNametag,
+          tokens: [token],
+          memo: payload.memo as string | undefined,
+          receivedAt: transfer.timestamp,
+        };
+
+        this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+        this.log(`Incoming transfer processed: ${token.id}, ${token.amount} ${token.symbol}`);
+      } else {
+        this.log(`Duplicate transfer ignored: ${token.id}, ${token.amount} ${token.symbol}`);
       }
-
-      const incomingTransfer: IncomingTransfer = {
-        id: transfer.id,
-        senderPubkey: transfer.senderTransportPubkey,
-        senderNametag: senderInfo.senderNametag,
-        tokens: [token],
-        memo: payload.memo as string | undefined,
-        receivedAt: transfer.timestamp,
-      };
-
-      this.deps!.emitEvent('transfer:incoming', incomingTransfer);
-      this.log(`Incoming transfer processed: ${token.id}, ${token.amount} ${token.symbol}`);
     } catch (error) {
       console.error('[Payments] Failed to process incoming transfer:', error);
     }

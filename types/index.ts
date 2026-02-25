@@ -90,6 +90,8 @@ export interface Asset {
   readonly confirmedTokenCount: number;
   /** Number of unconfirmed tokens aggregated */
   readonly unconfirmedTokenCount: number;
+  /** Number of tokens currently being sent */
+  readonly transferringTokenCount: number;
   /** Price per whole unit in USD (null if PriceProvider not configured) */
   readonly priceUsd: number | null;
   /** Price per whole unit in EUR (null if PriceProvider not configured) */
