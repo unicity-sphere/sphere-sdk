@@ -615,12 +615,20 @@ export class NostrTransportProvider implements TransportProvider {
     // Create encrypted token transfer event
     // Content must have "token_transfer:" prefix for nostr-js-sdk compatibility
     const content = 'token_transfer:' + JSON.stringify(payload);
+
+    // IMPORTANT: kind 31113 is a Parameterized Replaceable Event (NIP-01).
+    // The relay keeps only the LATEST event per (pubkey, kind, d-tag).
+    // A static d-tag like 'token-transfer' caused subsequent sends to OVERWRITE
+    // previous ones on the relay — the recipient only saw the last token sent.
+    // Fix: use a unique d-tag per event so each transfer is its own slot.
+    const uniqueD = `token-transfer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
     const event = await this.createEncryptedEvent(
       EVENT_KINDS.TOKEN_TRANSFER,
       content,
       [
         ['p', recipientPubkey],
-        ['d', 'token-transfer'],
+        ['d', uniqueD],
         ['type', 'token_transfer'],
       ]
     );

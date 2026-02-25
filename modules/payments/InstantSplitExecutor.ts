@@ -49,6 +49,7 @@ import type {
   InstantSplitResult,
   InstantSplitOptions,
   BackgroundProgressStatus,
+  BuildSplitBundleResult,
 } from '../../types/instant-split';
 import type { TransportProvider } from '../../transport';
 
@@ -126,14 +127,194 @@ export class InstantSplitExecutor {
   }
 
   /**
-   * Execute an instant split transfer with V5 optimized flow.
+   * Build a V5 split bundle WITHOUT sending it via transport.
    *
-   * Critical path (~2.3s):
+   * Steps 1-5 of the V5 flow:
    * 1. Create and submit burn commitment
    * 2. Wait for burn proof
    * 3. Create mint commitments with SplitMintReason
    * 4. Create transfer commitment (no mint proof needed)
-   * 5. Send bundle via transport
+   * 5. Package V5 bundle
+   *
+   * The caller is responsible for sending the bundle and then calling
+   * `startBackground()` on the result to begin mint proof + change token creation.
+   */
+  async buildSplitBundle(
+    tokenToSplit: Token<any>,
+    splitAmount: bigint,
+    remainderAmount: bigint,
+    coinIdHex: string,
+    recipientAddress: IAddress,
+    options?: InstantSplitOptions
+  ): Promise<BuildSplitBundleResult> {
+    const splitGroupId = crypto.randomUUID();
+    const tokenIdHex = toHex(tokenToSplit.id.bytes);
+    console.log(`[InstantSplit] Building V5 bundle for token ${tokenIdHex.slice(0, 8)}...`);
+
+    const coinId = new CoinId(fromHex(coinIdHex));
+    const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${Date.now()}`;
+
+    // Generate IDs and salts (deterministic from seed)
+    const recipientTokenId = new TokenId(await sha256(seedString));
+    const senderTokenId = new TokenId(await sha256(seedString + '_sender'));
+    const recipientSalt = await sha256(seedString + '_recipient_salt');
+    const senderSalt = await sha256(seedString + '_sender_salt');
+
+    // Create sender address (for minting to self first)
+    const senderAddressRef = await UnmaskedPredicateReference.create(
+      tokenToSplit.type,
+      this.signingService.algorithm,
+      this.signingService.publicKey,
+      HashAlgorithm.SHA256
+    );
+    const senderAddress = await senderAddressRef.toAddress();
+
+    // Build split configuration
+    const builder = new TokenSplitBuilder();
+
+    // Recipient token (will be transferred)
+    const coinDataA = TokenCoinData.create([[coinId, splitAmount]]);
+    builder.createToken(
+      recipientTokenId,
+      tokenToSplit.type,
+      new Uint8Array(0),
+      coinDataA,
+      senderAddress, // Mint to sender first, then transfer
+      recipientSalt,
+      null
+    );
+
+    // Sender token (change)
+    const coinDataB = TokenCoinData.create([[coinId, remainderAmount]]);
+    builder.createToken(
+      senderTokenId,
+      tokenToSplit.type,
+      new Uint8Array(0),
+      coinDataB,
+      senderAddress,
+      senderSalt,
+      null
+    );
+
+    const split = await builder.build(tokenToSplit);
+
+    // === STEP 1: CREATE AND SUBMIT BURN COMMITMENT ===
+    console.log('[InstantSplit] Step 1: Creating and submitting burn...');
+    const burnSalt = await sha256(seedString + '_burn_salt');
+    const burnCommitment = await split.createBurnCommitment(burnSalt, this.signingService);
+
+    const burnResponse = await this.client.submitTransferCommitment(burnCommitment);
+    if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
+      throw new Error(`Burn submission failed: ${burnResponse.status}`);
+    }
+
+    // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
+    console.log('[InstantSplit] Step 2: Waiting for burn proof...');
+    const burnProof = this.devMode
+      ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
+      : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
+    const burnTransaction = burnCommitment.toTransaction(burnProof);
+
+    console.log(`[InstantSplit] Burn proof received`);
+
+    options?.onBurnCompleted?.(JSON.stringify(burnTransaction.toJSON()));
+
+    // === STEP 3: CREATE MINT COMMITMENTS WITH SPLITMINT REASON ===
+    console.log('[InstantSplit] Step 3: Creating mint commitments...');
+    const mintCommitments = await split.createSplitMintCommitments(this.trustBase, burnTransaction);
+
+    // Find recipient and sender mint commitments
+    const recipientIdHex = toHex(recipientTokenId.bytes);
+    const senderIdHex = toHex(senderTokenId.bytes);
+
+    const recipientMintCommitment = mintCommitments.find(
+      (c) => toHex(c.transactionData.tokenId.bytes) === recipientIdHex
+    );
+    const senderMintCommitment = mintCommitments.find(
+      (c) => toHex(c.transactionData.tokenId.bytes) === senderIdHex
+    );
+
+    if (!recipientMintCommitment || !senderMintCommitment) {
+      throw new Error('Failed to find expected mint commitments');
+    }
+
+    // === STEP 4: CREATE TRANSFER COMMITMENT FROM MINT DATA ===
+    console.log('[InstantSplit] Step 4: Creating transfer commitment...');
+    const transferSalt = await sha256(seedString + '_transfer_salt');
+
+    const transferCommitment = await this.createTransferCommitmentFromMintData(
+      recipientMintCommitment.transactionData,
+      recipientAddress,
+      transferSalt,
+      this.signingService
+    );
+
+    // Create minted token state for recipient to reconstruct
+    const mintedPredicate = await UnmaskedPredicate.create(
+      recipientTokenId,
+      tokenToSplit.type,
+      this.signingService,
+      HashAlgorithm.SHA256,
+      recipientSalt
+    );
+    const mintedState = new TokenState(mintedPredicate, null);
+
+    // === STEP 5: PACKAGE V5 BUNDLE ===
+    console.log('[InstantSplit] Step 5: Packaging V5 bundle...');
+    const senderPubkey = toHex(this.signingService.publicKey);
+
+    // Get nametag token if this is a PROXY address transfer
+    let nametagTokenJson: string | undefined;
+    const recipientAddressStr = recipientAddress.toString();
+    if (recipientAddressStr.startsWith('PROXY://') && tokenToSplit.nametagTokens?.length > 0) {
+      // Include sender's nametag token for PROXY verification
+      nametagTokenJson = JSON.stringify(tokenToSplit.nametagTokens[0].toJSON());
+    }
+
+    const bundle: InstantSplitBundleV5 = {
+      version: '5.0',
+      type: 'INSTANT_SPLIT',
+      burnTransaction: JSON.stringify(burnTransaction.toJSON()),
+      recipientMintData: JSON.stringify(recipientMintCommitment.transactionData.toJSON()),
+      transferCommitment: JSON.stringify(transferCommitment.toJSON()),
+      amount: splitAmount.toString(),
+      coinId: coinIdHex,
+      tokenTypeHex: toHex(tokenToSplit.type.bytes),
+      splitGroupId,
+      senderPubkey,
+      recipientSaltHex: toHex(recipientSalt),
+      transferSaltHex: toHex(transferSalt),
+      mintedTokenStateJson: JSON.stringify(mintedState.toJSON()),
+      finalRecipientStateJson: '', // Recipient creates their own
+      recipientAddressJson: recipientAddressStr,
+      nametagTokenJson,
+    };
+
+    return {
+      bundle,
+      splitGroupId,
+      startBackground: async () => {
+        if (!options?.skipBackground) {
+          await this.submitBackgroundV5(senderMintCommitment, recipientMintCommitment, transferCommitment, {
+            signingService: this.signingService,
+            tokenType: tokenToSplit.type,
+            coinId,
+            senderTokenId,
+            senderSalt,
+            onProgress: options?.onBackgroundProgress,
+            onChangeTokenCreated: options?.onChangeTokenCreated,
+            onStorageSync: options?.onStorageSync,
+          });
+        }
+      },
+    };
+  }
+
+  /**
+   * Execute an instant split transfer with V5 optimized flow.
+   *
+   * Builds the bundle via buildSplitBundle(), sends via transport,
+   * and starts background processing.
    *
    * @param tokenToSplit - The SDK token to split
    * @param splitAmount - Amount to send to recipient
@@ -156,156 +337,22 @@ export class InstantSplitExecutor {
     options?: InstantSplitOptions
   ): Promise<InstantSplitResult> {
     const startTime = performance.now();
-    const splitGroupId = crypto.randomUUID();
-
-    const tokenIdHex = toHex(tokenToSplit.id.bytes);
-    console.log(`[InstantSplit] Starting V5 split for token ${tokenIdHex.slice(0, 8)}...`);
 
     try {
-      const coinId = new CoinId(fromHex(coinIdHex));
-      const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${Date.now()}`;
-
-      // Generate IDs and salts (deterministic from seed)
-      const recipientTokenId = new TokenId(await sha256(seedString));
-      const senderTokenId = new TokenId(await sha256(seedString + '_sender'));
-      const recipientSalt = await sha256(seedString + '_recipient_salt');
-      const senderSalt = await sha256(seedString + '_sender_salt');
-
-      // Create sender address (for minting to self first)
-      const senderAddressRef = await UnmaskedPredicateReference.create(
-        tokenToSplit.type,
-        this.signingService.algorithm,
-        this.signingService.publicKey,
-        HashAlgorithm.SHA256
-      );
-      const senderAddress = await senderAddressRef.toAddress();
-
-      // Build split configuration
-      const builder = new TokenSplitBuilder();
-
-      // Recipient token (will be transferred)
-      const coinDataA = TokenCoinData.create([[coinId, splitAmount]]);
-      builder.createToken(
-        recipientTokenId,
-        tokenToSplit.type,
-        new Uint8Array(0),
-        coinDataA,
-        senderAddress, // Mint to sender first, then transfer
-        recipientSalt,
-        null
-      );
-
-      // Sender token (change)
-      const coinDataB = TokenCoinData.create([[coinId, remainderAmount]]);
-      builder.createToken(
-        senderTokenId,
-        tokenToSplit.type,
-        new Uint8Array(0),
-        coinDataB,
-        senderAddress,
-        senderSalt,
-        null
-      );
-
-      const split = await builder.build(tokenToSplit);
-
-      // === STEP 1: CREATE AND SUBMIT BURN COMMITMENT ===
-      console.log('[InstantSplit] Step 1: Creating and submitting burn...');
-      const burnSalt = await sha256(seedString + '_burn_salt');
-      const burnCommitment = await split.createBurnCommitment(burnSalt, this.signingService);
-
-      const burnResponse = await this.client.submitTransferCommitment(burnCommitment);
-      if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Burn submission failed: ${burnResponse.status}`);
-      }
-
-      // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
-      console.log('[InstantSplit] Step 2: Waiting for burn proof...');
-      const burnProof = this.devMode
-        ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
-        : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
-      const burnTransaction = burnCommitment.toTransaction(burnProof);
-
-      const burnDuration = performance.now() - startTime;
-      console.log(`[InstantSplit] Burn proof received in ${burnDuration.toFixed(0)}ms`);
-
-      options?.onBurnCompleted?.(JSON.stringify(burnTransaction.toJSON()));
-
-      // === STEP 3: CREATE MINT COMMITMENTS WITH SPLITMINT REASON ===
-      console.log('[InstantSplit] Step 3: Creating mint commitments...');
-      const mintCommitments = await split.createSplitMintCommitments(this.trustBase, burnTransaction);
-
-      // Find recipient and sender mint commitments
-      const recipientIdHex = toHex(recipientTokenId.bytes);
-      const senderIdHex = toHex(senderTokenId.bytes);
-
-      const recipientMintCommitment = mintCommitments.find(
-        (c) => toHex(c.transactionData.tokenId.bytes) === recipientIdHex
-      );
-      const senderMintCommitment = mintCommitments.find(
-        (c) => toHex(c.transactionData.tokenId.bytes) === senderIdHex
-      );
-
-      if (!recipientMintCommitment || !senderMintCommitment) {
-        throw new Error('Failed to find expected mint commitments');
-      }
-
-      // === STEP 4: CREATE TRANSFER COMMITMENT FROM MINT DATA ===
-      console.log('[InstantSplit] Step 4: Creating transfer commitment...');
-      const transferSalt = await sha256(seedString + '_transfer_salt');
-
-      const transferCommitment = await this.createTransferCommitmentFromMintData(
-        recipientMintCommitment.transactionData,
+      const buildResult = await this.buildSplitBundle(
+        tokenToSplit,
+        splitAmount,
+        remainderAmount,
+        coinIdHex,
         recipientAddress,
-        transferSalt,
-        this.signingService
+        options
       );
 
-      // Create minted token state for recipient to reconstruct
-      const mintedPredicate = await UnmaskedPredicate.create(
-        recipientTokenId,
-        tokenToSplit.type,
-        this.signingService,
-        HashAlgorithm.SHA256,
-        recipientSalt
-      );
-      const mintedState = new TokenState(mintedPredicate, null);
-
-      // === STEP 5: PACKAGE V5 BUNDLE ===
-      console.log('[InstantSplit] Step 5: Packaging V5 bundle...');
+      // === SEND VIA TRANSPORT ===
+      console.log('[InstantSplit] Sending via transport...');
       const senderPubkey = toHex(this.signingService.publicKey);
-
-      // Get nametag token if this is a PROXY address transfer
-      let nametagTokenJson: string | undefined;
-      const recipientAddressStr = recipientAddress.toString();
-      if (recipientAddressStr.startsWith('PROXY://') && tokenToSplit.nametagTokens?.length > 0) {
-        // Include sender's nametag token for PROXY verification
-        nametagTokenJson = JSON.stringify(tokenToSplit.nametagTokens[0].toJSON());
-      }
-
-      const bundle: InstantSplitBundleV5 = {
-        version: '5.0',
-        type: 'INSTANT_SPLIT',
-        burnTransaction: JSON.stringify(burnTransaction.toJSON()),
-        recipientMintData: JSON.stringify(recipientMintCommitment.transactionData.toJSON()),
-        transferCommitment: JSON.stringify(transferCommitment.toJSON()),
-        amount: splitAmount.toString(),
-        coinId: coinIdHex,
-        tokenTypeHex: toHex(tokenToSplit.type.bytes),
-        splitGroupId,
-        senderPubkey,
-        recipientSaltHex: toHex(recipientSalt),
-        transferSaltHex: toHex(transferSalt),
-        mintedTokenStateJson: JSON.stringify(mintedState.toJSON()),
-        finalRecipientStateJson: '', // Recipient creates their own
-        recipientAddressJson: recipientAddressStr,
-        nametagTokenJson,
-      };
-
-      // === STEP 6: SEND VIA TRANSPORT ===
-      console.log('[InstantSplit] Step 6: Sending via transport...');
       const nostrEventId = await transport.sendTokenTransfer(recipientPubkey, {
-        token: JSON.stringify(bundle),
+        token: JSON.stringify(buildResult.bundle),
         proof: null, // Proof is included in the bundle
         memo: options?.memo,
         sender: {
@@ -318,27 +365,15 @@ export class InstantSplitExecutor {
 
       options?.onNostrDelivered?.(nostrEventId);
 
-      // === STEP 7: BACKGROUND PROCESSING ===
-      let backgroundPromise: Promise<void> | undefined;
-      if (!options?.skipBackground) {
-        backgroundPromise = this.submitBackgroundV5(senderMintCommitment, recipientMintCommitment, transferCommitment, {
-          signingService: this.signingService,
-          tokenType: tokenToSplit.type,
-          coinId,
-          senderTokenId,
-          senderSalt,
-          onProgress: options?.onBackgroundProgress,
-          onChangeTokenCreated: options?.onChangeTokenCreated,
-          onStorageSync: options?.onStorageSync,
-        });
-      }
+      // === BACKGROUND PROCESSING ===
+      const backgroundPromise = buildResult.startBackground();
 
       return {
         success: true,
         nostrEventId,
-        splitGroupId,
+        splitGroupId: buildResult.splitGroupId,
         criticalPathDurationMs: criticalPathDuration,
-        backgroundStarted: !options?.skipBackground,
+        backgroundStarted: true,
         backgroundPromise,
       };
     } catch (error) {
@@ -348,7 +383,6 @@ export class InstantSplitExecutor {
 
       return {
         success: false,
-        splitGroupId,
         criticalPathDurationMs: duration,
         error: errorMessage,
         backgroundStarted: false,

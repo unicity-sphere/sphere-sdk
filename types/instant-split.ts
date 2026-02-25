@@ -413,3 +413,87 @@ export interface UnconfirmedResolutionResult {
     status: 'resolved' | 'pending' | 'failed';
   }>;
 }
+
+// =============================================================================
+// COMBINED_TRANSFER V6 Bundle Types
+// =============================================================================
+
+/**
+ * A single direct (whole-token) transfer entry inside a combined bundle.
+ * The receiver processes each entry the same way as a standalone NOSTR-FIRST
+ * commitment-only transfer.
+ */
+export interface DirectTokenEntry {
+  /** JSON-serialized SDK token */
+  sourceToken: string;
+  /** JSON-serialized TransferCommitment */
+  commitmentData: string;
+  /** Token value (display metadata) */
+  amount: string;
+  /** Coin ID hex */
+  coinId: string;
+  /** Extracted tokenId for receiver-side dedup (optional) */
+  tokenId?: string;
+}
+
+/**
+ * Combined Transfer Bundle V6
+ *
+ * Packs ALL tokens for a single send() operation into ONE Nostr message:
+ * - An optional V5 split bundle (when the sender had to split a token)
+ * - Zero or more direct token entries (whole tokens transferred as-is)
+ *
+ * Benefits over V5 + NOSTR-FIRST multi-message approach:
+ * - Single Nostr event = no relay overwrite issues (kind 31113 replaceable events)
+ * - Atomic delivery: all tokens arrive together or not at all
+ * - One notification, one history entry on receiver side
+ */
+export interface CombinedTransferBundleV6 {
+  /** Bundle version */
+  version: '6.0';
+
+  /** Bundle type identifier */
+  type: 'COMBINED_TRANSFER';
+
+  /** Transfer ID (matches sender's TransferResult.id) */
+  transferId: string;
+
+  /** V5 split bundle (null if no split was needed) */
+  splitBundle: InstantSplitBundleV5 | null;
+
+  /** Direct tokens sent without splitting */
+  directTokens: DirectTokenEntry[];
+
+  /** Total transfer amount (display metadata) */
+  totalAmount: string;
+
+  /** Coin ID hex */
+  coinId: string;
+
+  /** Sender's transport pubkey */
+  senderPubkey: string;
+
+  /** Optional memo (one per transfer) */
+  memo?: string;
+}
+
+/**
+ * Type guard for CombinedTransferBundleV6
+ */
+export function isCombinedTransferBundleV6(obj: unknown): obj is CombinedTransferBundleV6 {
+  if (typeof obj !== 'object' || obj === null) return false;
+  const b = obj as Record<string, unknown>;
+  return b.version === '6.0' && b.type === 'COMBINED_TRANSFER';
+}
+
+/**
+ * Result of building a split bundle (without sending it)
+ */
+export interface BuildSplitBundleResult {
+  /** The constructed V5 bundle */
+  bundle: InstantSplitBundleV5;
+  /** Split group ID for correlation */
+  splitGroupId: string;
+  /** Call this after transport delivery to start background mint proof + change token creation */
+  startBackground: () => Promise<void>;
+}
