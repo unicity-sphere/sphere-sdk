@@ -682,6 +682,19 @@ export class PaymentsModule {
   private static readonly PROOF_POLLING_INTERVAL_MS = 2000;  // Poll every 2s
   private static readonly PROOF_POLLING_MAX_ATTEMPTS = 30;   // Max 30 attempts (~60s)
 
+  // Periodic retry for resolveUnconfirmed (V5 lazy finalization)
+  private resolveUnconfirmedTimer: ReturnType<typeof setInterval> | null = null;
+  private static readonly RESOLVE_UNCONFIRMED_INTERVAL_MS = 10_000; // Retry every 10s
+
+  // Guard: ensure load() completes before processing incoming bundles
+  private loadedPromise: Promise<void> | null = null;
+  private loaded = false;
+
+  // Persistent dedup: tracks splitGroupIds that have been fully processed.
+  // Survives page reloads via KV storage so Nostr re-deliveries are ignored
+  // even when the confirmed token's in-memory ID differs from v5split_{id}.
+  private processedSplitGroupIds: Set<string> = new Set();
+
   // Storage event subscriptions (push-based sync)
   private storageEventUnsubscribers: (() => void)[] = [];
   private syncDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -793,43 +806,61 @@ export class PaymentsModule {
   async load(): Promise<void> {
     this.ensureInitialized();
 
-    // Ensure token registry has loaded metadata (symbol, name, decimals)
-    // before parsing tokens — otherwise tokens get fallback truncated coinId values
-    await TokenRegistry.waitForReady();
+    // Expose a promise that incoming transfer handlers can await to ensure
+    // the token map is populated before running dedup checks.
+    const doLoad = async () => {
+      // Ensure token registry has loaded metadata (symbol, name, decimals)
+      // before parsing tokens — otherwise tokens get fallback truncated coinId values
+      await TokenRegistry.waitForReady();
 
-    // Load metadata from TokenStorageProviders (archived, tombstones, forked)
-    // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
-    const providers = this.getTokenStorageProviders();
-    for (const [id, provider] of providers) {
-      try {
-        const result = await provider.load();
-        if (result.success && result.data) {
-          this.loadFromStorageData(result.data);
-          this.log(`Loaded metadata from provider ${id}`);
-          break; // Use first successful provider
+      // Load metadata from TokenStorageProviders (archived, tombstones, forked)
+      // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
+      const providers = this.getTokenStorageProviders();
+      for (const [id, provider] of providers) {
+        try {
+          const result = await provider.load();
+          if (result.success && result.data) {
+            this.loadFromStorageData(result.data);
+            this.log(`Loaded metadata from provider ${id}`);
+            break; // Use first successful provider
+          }
+        } catch (err) {
+          console.error(`[Payments] Failed to load from provider ${id}:`, err);
         }
-      } catch (err) {
-        console.error(`[Payments] Failed to load from provider ${id}:`, err);
       }
-    }
 
-    // Restore pending V5 tokens
-    await this.loadPendingV5Tokens();
+      // Log loaded tokens
+      const loadedTokens = Array.from(this.tokens.values()).map(t => `${t.id.slice(0, 12)}(${t.status})`);
+      console.log(`[Payments][DEBUG] load(): from TXF providers: ${this.tokens.size} tokens [${loadedTokens.join(', ')}]`);
 
-    // Load transaction history from dedicated history store (with migration from legacy KV)
-    await this.loadHistory();
+      // Restore pending V5 tokens
+      await this.loadPendingV5Tokens();
 
-    // Load pending transfers
-    const pending = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
-    if (pending) {
-      const transfers = JSON.parse(pending) as TransferResult[];
-      for (const transfer of transfers) {
-        this.pendingTransfers.set(transfer.id, transfer);
+      // Restore processed split group IDs for dedup across reloads
+      await this.loadProcessedSplitGroupIds();
+
+      // Load transaction history from dedicated history store (with migration from legacy KV)
+      await this.loadHistory();
+
+      // Load pending transfers
+      const pending = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
+      if (pending) {
+        const transfers = JSON.parse(pending) as TransferResult[];
+        for (const transfer of transfers) {
+          this.pendingTransfers.set(transfer.id, transfer);
+        }
       }
-    }
 
-    // After loading, try to resolve any unconfirmed tokens
+      this.loaded = true;
+    };
+
+    this.loadedPromise = doLoad();
+    await this.loadedPromise;
+
+    // After loading, try to resolve any unconfirmed tokens and start
+    // periodic retries so tokens don't stay stuck as 'submitted'.
     this.resolveUnconfirmed().catch(() => {});
+    this.scheduleResolveUnconfirmed();
   }
 
   /**
@@ -851,6 +882,9 @@ export class PaymentsModule {
     // Stop proof polling (NOSTR-FIRST)
     this.stopProofPolling();
     this.proofPollingJobs.clear();
+
+    // Stop V5 resolve-unconfirmed retry polling
+    this.stopResolveUnconfirmedPolling();
 
     // Clear pending response resolvers
     for (const [, resolver] of this.pendingResponseResolvers) {
@@ -1392,6 +1426,12 @@ export class PaymentsModule {
   ): Promise<InstantSplitProcessResult> {
     this.ensureInitialized();
 
+    // Ensure load() has completed so the dedup check below sees all
+    // persisted tokens.  Transport may deliver events before load finishes.
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+
     if (!isInstantSplitBundleV5(bundle)) {
       // V4 (dev mode) still processes synchronously
       return this.processInstantSplitBundleSync(bundle, senderPubkey, memo);
@@ -1399,10 +1439,13 @@ export class PaymentsModule {
 
     // V5: save immediately as unconfirmed, resolve proofs lazily
     try {
-      // Use deterministic ID from splitGroupId to deduplicate Nostr re-deliveries
+      // Deduplicate Nostr re-deliveries using both in-memory token map AND
+      // the persisted processedSplitGroupIds set.  After confirmation, the
+      // token's ID changes from v5split_{id} to the real genesis tokenId
+      // (TXF round-trip), so the in-memory check alone isn't sufficient.
       const deterministicId = `v5split_${bundle.splitGroupId}`;
-      if (this.tokens.has(deterministicId)) {
-        this.log(`V5 bundle ${deterministicId.slice(0, 16)}... already exists, skipping duplicate`);
+      if (this.tokens.has(deterministicId) || this.processedSplitGroupIds.has(bundle.splitGroupId)) {
+        console.log(`[Payments] V5 bundle ${bundle.splitGroupId.slice(0, 12)}... already processed, skipping`);
         return { success: true, durationMs: 0 };
       }
 
@@ -1430,7 +1473,10 @@ export class PaymentsModule {
       };
 
       await this.addToken(uiToken);
-      this.log(`V5 bundle saved as unconfirmed: ${uiToken.id.slice(0, 8)}...`);
+
+      // Record splitGroupId for persistent dedup across page reloads
+      this.processedSplitGroupIds.add(bundle.splitGroupId);
+      await this.saveProcessedSplitGroupIds();
 
       // Record in history (once per token — resolveV5Token will NOT add another)
       const senderInfo = await this.resolveSenderInfo(senderPubkey);
@@ -1458,8 +1504,9 @@ export class PaymentsModule {
 
       await this.save();
 
-      // Fire-and-forget: try to resolve immediately
+      // Fire-and-forget: try to resolve immediately, then start periodic retry
       this.resolveUnconfirmed().catch(() => {});
+      this.scheduleResolveUnconfirmed();
 
       return { success: true, durationMs: 0 };
     } catch (error) {
@@ -2392,9 +2439,15 @@ export class PaymentsModule {
     const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const trustBase = (this.deps!.oracle as any).getTrustBase?.() as RootTrustBase | undefined;
-    if (!stClient || !trustBase) return result;
+    if (!stClient || !trustBase) {
+      console.log(`[V5-RESOLVE] resolveUnconfirmed: EARLY EXIT — stClient=${!!stClient} trustBase=${!!trustBase}`);
+      return result;
+    }
 
     const signingService = await this.createSigningService();
+
+    const submittedCount = Array.from(this.tokens.values()).filter(t => t.status === 'submitted').length;
+    console.log(`[V5-RESOLVE] resolveUnconfirmed: ${submittedCount} submitted token(s) to process`);
 
     for (const [tokenId, token] of this.tokens) {
       if (token.status !== 'submitted') continue;
@@ -2403,12 +2456,15 @@ export class PaymentsModule {
       const pending = this.parsePendingFinalization(token.sdkData);
       if (!pending) {
         // Legacy commitment-only token (existing proof polling handles these)
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, skipping`);
         result.stillPending++;
         continue;
       }
 
       if (pending.type === 'v5_bundle') {
+        console.log(`[V5-RESOLVE] Processing ${tokenId.slice(0, 16)}... stage=${pending.stage} attempt=${pending.attemptCount}`);
         const progress = await this.resolveV5Token(tokenId, token, pending, stClient, trustBase, signingService);
+        console.log(`[V5-RESOLVE] Result for ${tokenId.slice(0, 16)}...: ${progress} (stage now: ${pending.stage})`);
         result.details.push({ tokenId, stage: pending.stage, status: progress });
         if (progress === 'resolved') result.resolved++;
         else if (progress === 'failed') result.failed++;
@@ -2416,10 +2472,53 @@ export class PaymentsModule {
       }
     }
 
-    if (result.resolved > 0 || result.failed > 0) {
+    // Always save when any token was processed — this persists intermediate
+    // stage progress (e.g. RECEIVED → MINT_SUBMITTED) and attemptCount so
+    // that reloads don't restart finalization from scratch.
+    if (result.resolved > 0 || result.failed > 0 || result.stillPending > 0) {
+      console.log(`[V5-RESOLVE] Saving: resolved=${result.resolved} failed=${result.failed} stillPending=${result.stillPending}`);
       await this.save();
     }
     return result;
+  }
+
+  /**
+   * Start a periodic interval that retries resolveUnconfirmed() until all
+   * tokens are confirmed or failed.  Stops automatically when nothing is
+   * pending and is cleaned up by destroy().
+   */
+  private scheduleResolveUnconfirmed(): void {
+    // Don't stack intervals
+    if (this.resolveUnconfirmedTimer) return;
+
+    // Only start if there are actually submitted tokens to resolve
+    const hasUnconfirmed = Array.from(this.tokens.values()).some(
+      (t) => t.status === 'submitted',
+    );
+    if (!hasUnconfirmed) {
+      console.log(`[V5-RESOLVE] scheduleResolveUnconfirmed: no submitted tokens, not starting timer`);
+      return;
+    }
+
+    console.log(`[V5-RESOLVE] scheduleResolveUnconfirmed: starting periodic retry (every ${PaymentsModule.RESOLVE_UNCONFIRMED_INTERVAL_MS}ms)`);
+    this.resolveUnconfirmedTimer = setInterval(async () => {
+      try {
+        const result = await this.resolveUnconfirmed();
+        if (result.stillPending === 0) {
+          console.log(`[V5-RESOLVE] All tokens resolved, stopping periodic retry`);
+          this.stopResolveUnconfirmedPolling();
+        }
+      } catch (err) {
+        console.log(`[V5-RESOLVE] Periodic retry error:`, err);
+      }
+    }, PaymentsModule.RESOLVE_UNCONFIRMED_INTERVAL_MS);
+  }
+
+  private stopResolveUnconfirmedPolling(): void {
+    if (this.resolveUnconfirmedTimer) {
+      clearInterval(this.resolveUnconfirmedTimer);
+      this.resolveUnconfirmedTimer = null;
+    }
   }
 
   // ===========================================================================
@@ -2444,10 +2543,12 @@ export class PaymentsModule {
     try {
       // Stage: RECEIVED → MINT_SUBMITTED
       if (pending.stage === 'RECEIVED') {
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: RECEIVED → submitting mint commitment...`);
         const mintDataJson = JSON.parse(bundle.recipientMintData);
         const mintData = await MintTransactionData.fromJSON(mintDataJson);
         const mintCommitment = await MintCommitment.create(mintData);
         const mintResponse = await stClient.submitMintCommitment(mintCommitment);
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint response status=${mintResponse.status}`);
         if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
           throw new Error(`Mint submission failed: ${mintResponse.status}`);
         }
@@ -2457,14 +2558,17 @@ export class PaymentsModule {
 
       // Stage: MINT_SUBMITTED → MINT_PROVEN
       if (pending.stage === 'MINT_SUBMITTED') {
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_SUBMITTED → checking mint proof...`);
         const mintDataJson = JSON.parse(bundle.recipientMintData);
         const mintData = await MintTransactionData.fromJSON(mintDataJson);
         const mintCommitment = await MintCommitment.create(mintData);
         const proof = await this.quickProofCheck(stClient, trustBase, mintCommitment);
         if (!proof) {
+          console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint proof not yet available, staying MINT_SUBMITTED`);
           this.updatePendingFinalization(token, pending);
           return 'pending';
         }
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint proof obtained!`);
         pending.mintProofJson = JSON.stringify(proof);
         pending.stage = 'MINT_PROVEN';
         this.updatePendingFinalization(token, pending);
@@ -2472,9 +2576,11 @@ export class PaymentsModule {
 
       // Stage: MINT_PROVEN → TRANSFER_SUBMITTED
       if (pending.stage === 'MINT_PROVEN') {
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_PROVEN → submitting transfer commitment...`);
         const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
         const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
         const transferResponse = await stClient.submitTransferCommitment(transferCommitment);
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer response status=${transferResponse.status}`);
         if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
           throw new Error(`Transfer submission failed: ${transferResponse.status}`);
         }
@@ -2484,13 +2590,16 @@ export class PaymentsModule {
 
       // Stage: TRANSFER_SUBMITTED → FINALIZED
       if (pending.stage === 'TRANSFER_SUBMITTED') {
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: TRANSFER_SUBMITTED → checking transfer proof...`);
         const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
         const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
         const proof = await this.quickProofCheck(stClient, trustBase, transferCommitment);
         if (!proof) {
+          console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof not yet available, staying TRANSFER_SUBMITTED`);
           this.updatePendingFinalization(token, pending);
           return 'pending';
         }
+        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof obtained! Finalizing...`);
 
         // Finalize: reconstruct minted token, create recipient state, finalize
         const finalizedToken = await this.finalizeFromV5Bundle(bundle, pending, signingService, stClient, trustBase);
@@ -2512,6 +2621,14 @@ export class PaymentsModule {
         this.tokens.set(tokenId, confirmedToken);
 
         // History entry was already created in processInstantSplitBundle() — no duplicate here
+
+        // Emit transfer:confirmed so the UI learns about the state change
+        this.deps!.emitEvent('transfer:confirmed', {
+          id: crypto.randomUUID(),
+          status: 'completed',
+          tokens: [confirmedToken],
+          tokenTransfers: [],
+        });
 
         this.log(`V5 token resolved: ${tokenId.slice(0, 8)}...`);
         return 'resolved';
@@ -2695,11 +2812,21 @@ export class PaymentsModule {
       }
     }
     if (pendingTokens.length > 0) {
+      const json = JSON.stringify(pendingTokens);
+      this.log(`[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')} (${json.length} bytes)`);
       await this.deps!.storage.set(
         STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
-        JSON.stringify(pendingTokens)
+        json
       );
+      // Verify write
+      const verify = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+      if (!verify) {
+        console.error('[Payments][V5-PERSIST] CRITICAL: KV write succeeded but read-back is empty!');
+      } else {
+        this.log(`[V5-PERSIST] Verified: read-back ${verify.length} bytes`);
+      }
     } else {
+      this.log(`[V5-PERSIST] No pending V5 tokens to save (total tokens: ${this.tokens.size}), clearing KV`);
       // Clean up when no pending tokens remain
       await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
     }
@@ -2711,18 +2838,51 @@ export class PaymentsModule {
    */
   private async loadPendingV5Tokens(): Promise<void> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+    this.log(`[V5-PERSIST] loadPendingV5Tokens: KV data = ${data ? `${data.length} bytes` : 'null/empty'}`);
     if (!data) return;
 
     try {
       const pendingTokens = JSON.parse(data) as Token[];
+      this.log(`[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')}`);
       for (const token of pendingTokens) {
         // Only restore if not already in the map (e.g., already resolved)
         if (!this.tokens.has(token.id)) {
           this.tokens.set(token.id, token);
+          this.log(`[V5-PERSIST] Restored token ${token.id.slice(0, 16)} (status=${token.status})`);
+        } else {
+          this.log(`[V5-PERSIST] Token ${token.id.slice(0, 16)} already in map, skipping`);
         }
       }
-      if (pendingTokens.length > 0) {
-        this.log(`Restored ${pendingTokens.length} pending V5 token(s)`);
+    } catch (err) {
+      console.error('[Payments][V5-PERSIST] Failed to parse pending V5 tokens:', err);
+    }
+  }
+
+  /**
+   * Persist the set of processed splitGroupIds to KV storage.
+   * This ensures Nostr re-deliveries are ignored across page reloads,
+   * even when the confirmed token's in-memory ID differs from v5split_{id}.
+   */
+  private async saveProcessedSplitGroupIds(): Promise<void> {
+    const ids = Array.from(this.processedSplitGroupIds);
+    if (ids.length > 0) {
+      await this.deps!.storage.set(
+        STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS,
+        JSON.stringify(ids)
+      );
+    }
+  }
+
+  /**
+   * Load processed splitGroupIds from KV storage.
+   */
+  private async loadProcessedSplitGroupIds(): Promise<void> {
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS);
+    if (!data) return;
+    try {
+      const ids = JSON.parse(data) as string[];
+      for (const id of ids) {
+        this.processedSplitGroupIds.add(id);
       }
     } catch {
       // Ignore corrupt data
@@ -3548,8 +3708,49 @@ export class PaymentsModule {
           const result = await provider.sync(localData);
 
           if (result.success && result.merged) {
+            // Snapshot tokens that can't survive TXF round-trip (V5 pending)
+            // AND tokens that were added after the localData snapshot.
+            // Sync can race with resolveUnconfirmed() or incoming transfers.
+            const savedTokens = new Map(this.tokens);
+
             // Apply merged data from each provider
             this.loadFromStorageData(result.merged);
+
+            // Restore tokens lost by loadFromStorageData()'s tokens.clear().
+            // Only restore if no token with the same genesis tokenId already
+            // exists (avoids duplicating tokens whose ID changed from v5split
+            // to real genesis ID during TXF round-trip).
+            let restoredCount = 0;
+            for (const [tokenId, token] of savedTokens) {
+              if (this.tokens.has(tokenId)) continue;
+
+              // Check tombstones
+              const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
+              const stateHash = extractStateHashFromSdkData(token.sdkData);
+              if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
+                continue;
+              }
+
+              // Skip if an equivalent token (same genesis tokenId) already
+              // exists under a different ID — avoids balance doubling.
+              if (sdkTokenId) {
+                let hasEquivalent = false;
+                for (const existing of this.tokens.values()) {
+                  if (extractTokenIdFromSdkData(existing.sdkData) === sdkTokenId) {
+                    hasEquivalent = true;
+                    break;
+                  }
+                }
+                if (hasEquivalent) continue;
+              }
+
+              this.tokens.set(tokenId, token);
+              restoredCount++;
+            }
+            if (restoredCount > 0) {
+              console.log(`[Payments] Sync: restored ${restoredCount} token(s) lost by loadFromStorageData`);
+            }
+
             // Restore nametags if sync wiped them
             if (this.nametags.length === 0 && savedNametags.length > 0) {
               this.nametags = savedNametags;
@@ -3989,8 +4190,9 @@ export class PaymentsModule {
 
       // Add token as unconfirmed
       this.tokens.set(token.id, token);
+      console.log(`[Payments][DEBUG] NOSTR-FIRST: saving token id=${token.id.slice(0, 16)} status=${token.status} sdkData.length=${token.sdkData?.length}`);
       await this.save();
-      this.log(`NOSTR-FIRST: Token ${token.id.slice(0, 8)}... added as submitted (unconfirmed)`);
+      console.log(`[Payments][DEBUG] NOSTR-FIRST: save() completed, tokens.size=${this.tokens.size}`);
 
       // Resolve sender info for both event and history
       const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
@@ -4207,11 +4409,17 @@ export class PaymentsModule {
   }
 
   private async handleIncomingTransfer(transfer: IncomingTokenTransfer): Promise<void> {
+    // Ensure load() has completed so dedup checks see all persisted tokens.
+    if (!this.loaded && this.loadedPromise) {
+      await this.loadedPromise;
+    }
+
     try {
       // Check payload format - Sphere wallet sends { sourceToken, transferTx }
       // SDK format is { token, proof }
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
+      console.log('[Payments][DEBUG] handleIncomingTransfer: keys=', Object.keys(payload).join(','));
 
       // Check for INSTANT_SPLIT bundle - may be the payload itself or nested in payload.token
       let instantBundle: InstantSplitBundle | null = null;
@@ -4250,7 +4458,7 @@ export class PaymentsModule {
 
       // Check for NOSTR-FIRST commitment-only transfer (whole-token instant send)
       if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
-        this.log('Processing NOSTR-FIRST commitment-only transfer...');
+        console.log('[Payments][DEBUG] >>> NOSTR-FIRST commitment-only transfer detected');
         await this.handleCommitmentOnlyTransfer(transfer, payload);
         return;
       }
@@ -4467,21 +4675,31 @@ export class PaymentsModule {
   private async save(): Promise<void> {
     // Save to TokenStorageProviders (IndexedDB/files)
     const providers = this.getTokenStorageProviders();
-    if (providers.size === 0) {
-      this.log('No token storage providers - tokens not persisted');
-      return;
-    }
+    // Debug: log token serialization status
+    const tokenStats = Array.from(this.tokens.values()).map(t => {
+      const txf = tokenToTxf(t);
+      return `${t.id.slice(0, 12)}(${t.status},txf=${!!txf})`;
+    });
+    console.log(`[Payments][DEBUG] save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
 
-    const data = await this.createStorageData();
-    for (const [id, provider] of providers) {
-      try {
-        await provider.save(data);
-      } catch (err) {
-        console.error(`[Payments] Failed to save to provider ${id}:`, err);
+    if (providers.size > 0) {
+      const data = await this.createStorageData();
+      const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
+      console.log(`[Payments][DEBUG] save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
+      for (const [id, provider] of providers) {
+        try {
+          await provider.save(data);
+        } catch (err) {
+          console.error(`[Payments] Failed to save to provider ${id}:`, err);
+        }
       }
+    } else {
+      console.log('[Payments][DEBUG] save(): No token storage providers - TXF not persisted');
     }
 
-    // Save pending V5 tokens separately (TXF can't represent them)
+    // Always save pending V5 tokens to KV storage (separate from TXF providers).
+    // V5 pending tokens can't be serialized to TXF, so they use KV regardless
+    // of whether TXF providers exist.
     await this.savePendingV5Tokens();
   }
 
@@ -4521,6 +4739,7 @@ export class PaymentsModule {
 
   private loadFromStorageData(data: TxfStorageDataBase): void {
     const parsed = parseTxfStorageData(data);
+    console.log(`[Payments][DEBUG] loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
 
     // Load tombstones FIRST so we can filter tokens
     this.tombstones = parsed.tombstones;
