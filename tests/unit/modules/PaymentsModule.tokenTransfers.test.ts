@@ -922,13 +922,12 @@ describe('TransferResult.tokenTransfers (conservative mode)', () => {
         transferMode: 'conservative',
       });
 
-      // addToken should have been called with the change token
+      // addToken should have been called with the change token (no skipHistory arg)
       expect(mod.addToken).toHaveBeenCalledWith(
         expect.objectContaining({
           amount: '5000000',
           status: 'confirmed',
-        }),
-        true
+        })
       );
     });
   });

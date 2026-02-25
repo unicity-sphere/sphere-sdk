@@ -4,18 +4,22 @@
  * Each address gets its own database for multi-address support
  */
 
-import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult } from '../../../storage';
+import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import { getAddressId } from '../../../constants';
+
+// Re-export HistoryRecord for backwards compat
+export type { HistoryRecord } from '../../../storage';
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
 const DB_NAME = 'sphere-token-storage';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_TOKENS = 'tokens';
 const STORE_META = 'meta';
+const STORE_HISTORY = 'history';
 
 export interface IndexedDBTokenStorageConfig {
   /** Database name prefix (default: 'sphere-token-storage') */
@@ -374,6 +378,11 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         if (!db.objectStoreNames.contains(STORE_META)) {
           db.createObjectStore(STORE_META);
         }
+
+        // Create history store (v2)
+        if (!db.objectStoreNames.contains(STORE_HISTORY)) {
+          db.createObjectStore(STORE_HISTORY, { keyPath: 'dedupKey' });
+        }
       };
     });
   }
@@ -420,8 +429,9 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       const transaction = this.db.transaction(storeName, 'readwrite');
       const store = transaction.objectStore(storeName);
 
-      // For meta store, use put with explicit key
-      // For tokens store, value contains the key (keyPath: 'id')
+      // Meta store: no keyPath, use explicit key
+      // Tokens store: keyPath 'id'
+      // History store: keyPath 'dedupKey'
       const request = storeName === STORE_META
         ? store.put(value, key)
         : store.put(value);
@@ -468,6 +478,68 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     }
   }
 
+  // =========================================================================
+  // Public: History operations
+  // =========================================================================
+
+  /**
+   * Add a history entry. Uses `put` (upsert by dedupKey) so duplicate
+   * calls with the same dedupKey simply overwrite — no duplicates.
+   */
+  async addHistoryEntry(entry: HistoryRecord): Promise<void> {
+    await this.putToStore(STORE_HISTORY, entry.dedupKey, entry);
+  }
+
+  /**
+   * Get all history entries sorted by timestamp descending.
+   */
+  async getHistoryEntries(): Promise<HistoryRecord[]> {
+    const entries = await this.getAllFromStore<HistoryRecord>(STORE_HISTORY);
+    return entries.sort((a, b) => b.timestamp - a.timestamp);
+  }
+
+  /**
+   * Check if a history entry with the given dedupKey exists.
+   */
+  async hasHistoryEntry(dedupKey: string): Promise<boolean> {
+    const entry = await this.getFromStore<HistoryRecord>(STORE_HISTORY, dedupKey);
+    return entry !== null;
+  }
+
+  /**
+   * Clear all history entries.
+   */
+  async clearHistory(): Promise<void> {
+    if (!this.db) return;
+    await new Promise<void>((resolve, reject) => {
+      const tx = this.db!.transaction(STORE_HISTORY, 'readwrite');
+      const req = tx.objectStore(STORE_HISTORY).clear();
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => resolve();
+    });
+  }
+
+  /**
+   * Bulk import history entries. Entries with existing dedupKeys are
+   * skipped (first-write-wins). Returns the number of newly imported entries.
+   */
+  async importHistoryEntries(entries: HistoryRecord[]): Promise<number> {
+    if (!this.db || entries.length === 0) return 0;
+    let imported = 0;
+    for (const entry of entries) {
+      const exists = await this.hasHistoryEntry(entry.dedupKey);
+      if (!exists) {
+        await this.addHistoryEntry(entry);
+        imported++;
+      }
+    }
+    return imported;
+  }
+
+  // =========================================================================
+  // Private IndexedDB helpers (clear)
+  // =========================================================================
+
   /**
    * Clear all object stores in a single database.
    * Opens a temporary connection, clears STORE_TOKENS and STORE_META, then closes.
@@ -492,6 +564,9 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
           if (!db.objectStoreNames.contains(STORE_META)) {
             db.createObjectStore(STORE_META);
           }
+          if (!db.objectStoreNames.contains(STORE_HISTORY)) {
+            db.createObjectStore(STORE_HISTORY, { keyPath: 'dedupKey' });
+          }
         };
       }),
       new Promise<never>((_, reject) =>
@@ -500,7 +575,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     ]);
 
     try {
-      for (const storeName of [STORE_TOKENS, STORE_META]) {
+      for (const storeName of [STORE_TOKENS, STORE_META, STORE_HISTORY]) {
         if (db.objectStoreNames.contains(storeName)) {
           await new Promise<void>((resolve, reject) => {
             const tx = db.transaction(storeName, 'readwrite');

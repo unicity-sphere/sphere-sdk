@@ -307,7 +307,7 @@ export class InstantSplitExecutor {
       const nostrEventId = await transport.sendTokenTransfer(recipientPubkey, {
         token: JSON.stringify(bundle),
         proof: null, // Proof is included in the bundle
-        memo: 'INSTANT_SPLIT_V5',
+        memo: options?.memo,
         sender: {
           transportPubkey: senderPubkey,
         },

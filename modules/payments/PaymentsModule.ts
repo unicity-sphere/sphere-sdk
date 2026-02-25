@@ -100,17 +100,22 @@ import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/Ro
 // Transaction History Entry
 // =============================================================================
 
-export interface TransactionHistoryEntry {
-  id: string;
-  type: 'SENT' | 'RECEIVED' | 'SPLIT' | 'MINT';
-  amount: string;
-  coinId: string;
-  symbol: string;
-  timestamp: number;
-  recipientNametag?: string;
-  senderPubkey?: string;
-  /** TransferResult.id that created this entry (links history to transfer operation) */
-  transferId?: string;
+/**
+ * Public history entry type — re-exported from the shared storage layer.
+ * Single source of truth: {@link HistoryRecord} in `storage/storage-provider.ts`.
+ */
+export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
+
+/**
+ * Compute a dedup key for a history entry.
+ * - SENT + transferId → groups multi-token sends into a single entry
+ * - type + tokenId → one entry per token per direction
+ * - fallback → UUID (no dedup possible)
+ */
+function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: string): string {
+  if (type === 'SENT' && transferId) return `${type}_transfer_${transferId}`;
+  if (tokenId) return `${type}_${tokenId}`;
+  return `${type}_${crypto.randomUUID()}`;
 }
 
 // =============================================================================
@@ -650,7 +655,7 @@ export class PaymentsModule {
   private tombstones: TombstoneEntry[] = [];
   private archivedTokens: Map<string, TxfToken> = new Map();
   private forkedTokens: Map<string, TxfToken> = new Map();
-  private transactionHistory: TransactionHistoryEntry[] = [];
+  private _historyCache: TransactionHistoryEntry[] = [];
   private nametags: NametagData[] = [];
 
   // Payment Requests State (Incoming)
@@ -739,7 +744,7 @@ export class PaymentsModule {
     this.tombstones = [];
     this.archivedTokens.clear();
     this.forkedTokens.clear();
-    this.transactionHistory = [];
+    this._historyCache = [];
     this.nametags = [];
 
     this.deps = deps;
@@ -811,15 +816,8 @@ export class PaymentsModule {
     // Restore pending V5 tokens
     await this.loadPendingV5Tokens();
 
-    // Load transaction history
-    const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
-    if (historyData) {
-      try {
-        this.transactionHistory = JSON.parse(historyData);
-      } catch {
-        this.transactionHistory = [];
-      }
-    }
+    // Load transaction history from dedicated history store (with migration from legacy KV)
+    await this.loadHistory();
 
     // Load pending transfers
     const pending = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_TRANSFERS);
@@ -939,7 +937,9 @@ export class PaymentsModule {
 
       result.status = 'submitted';
 
-      const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
+      // Use resolved peerInfo for history metadata (nametag, directAddress)
+      const recipientNametag = peerInfo?.nametag
+        || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
 
       const transferMode = request.transferMode ?? 'instant';
 
@@ -977,7 +977,7 @@ export class PaymentsModule {
             updatedAt: Date.now(),
             sdkData: JSON.stringify(changeTokenData),
           };
-          await this.addToken(changeUiToken, true);
+          await this.addToken(changeUiToken);
           this.log(`Conservative split: change token saved: ${changeUiToken.id}`);
 
           // Send fully finalized { sourceToken, transferTx } via Nostr
@@ -994,8 +994,8 @@ export class PaymentsModule {
             ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
             : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
-          // Remove the original token that was split — skipHistory because we record below
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag, true);
+          // Remove the original token that was split
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1024,6 +1024,7 @@ export class PaymentsModule {
             this.deps!.transport,
             recipientPubkey,
             {
+              memo: request.memo,
               onChangeTokenCreated: async (changeToken) => {
                 const changeTokenData = changeToken.toJSON();
                 const uiToken: Token = {
@@ -1039,7 +1040,7 @@ export class PaymentsModule {
                   updatedAt: Date.now(),
                   sdkData: JSON.stringify(changeTokenData),
                 };
-                await this.addToken(uiToken, true);
+                await this.addToken(uiToken);
                 this.log(`Change token saved via background: ${uiToken.id}`);
               },
               onStorageSync: async () => {
@@ -1058,7 +1059,7 @@ export class PaymentsModule {
             this.pendingBackgroundTasks.push(instantResult.backgroundPromise);
           }
 
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, recipientNametag);
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1127,8 +1128,8 @@ export class PaymentsModule {
 
         this.log(`Token ${token.id} sent via ${transferMode.toUpperCase()}, requestId: ${requestIdHex}`);
 
-        // Remove sent token (creates tombstone) — skipHistory because we record below
-        await this.removeToken(token.id, recipientNametag, true);
+        // Remove sent token (creates tombstone)
+        await this.removeToken(token.id);
       }
 
       result.status = 'delivered';
@@ -1139,15 +1140,20 @@ export class PaymentsModule {
 
       result.status = 'completed';
 
-      // Add to transaction history
+      // Add to transaction history (one entry per send operation)
+      const sentTokenId = result.tokens[0] ? extractTokenIdFromSdkData(result.tokens[0].sdkData) : undefined;
       await this.addToHistory({
         type: 'SENT',
         amount: request.amount,
         coinId: request.coinId,
         symbol: this.getCoinSymbol(request.coinId),
         timestamp: Date.now(),
+        recipientPubkey,
         recipientNametag,
+        recipientAddress: peerInfo?.directAddress || recipientAddress?.toString() || recipientPubkey,
+        memo: request.memo,
         transferId: result.id,
+        tokenId: sentTokenId || undefined,
       });
 
       this.deps!.emitEvent('transfer:confirmed', result);
@@ -1294,6 +1300,7 @@ export class PaymentsModule {
         recipientPubkey,
         {
           ...options,
+          memo: request.memo,
           onChangeTokenCreated: async (changeToken) => {
             // Save change token when background completes
             const changeTokenData = changeToken.toJSON();
@@ -1310,7 +1317,7 @@ export class PaymentsModule {
               updatedAt: Date.now(),
               sdkData: JSON.stringify(changeTokenData),
             };
-            await this.addToken(uiToken, true);
+            await this.addToken(uiToken);
             this.log(`Change token saved via background: ${uiToken.id}`);
           },
           onStorageSync: async () => {
@@ -1326,18 +1333,24 @@ export class PaymentsModule {
           this.pendingBackgroundTasks.push(result.backgroundPromise);
         }
 
-        // Remove the original token — skipHistory because we record below
-        const recipientNametag = request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined;
-        await this.removeToken(tokenToSplit.id, recipientNametag, true);
+        // Remove the original token
+        await this.removeToken(tokenToSplit.id);
 
         // Add to transaction history (single entry for the actual sent amount)
+        const recipientNametag = peerInfo?.nametag
+          || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
+        const splitTokenId = extractTokenIdFromSdkData(tokenToSplit.sdkData);
         await this.addToHistory({
           type: 'SENT',
           amount: request.amount,
           coinId: request.coinId,
           symbol: this.getCoinSymbol(request.coinId),
           timestamp: Date.now(),
+          recipientPubkey,
           recipientNametag,
+          recipientAddress: peerInfo?.directAddress || recipientAddress?.toString() || recipientPubkey,
+          memo: request.memo,
+          tokenId: splitTokenId || undefined,
         });
 
         await this.save();
@@ -1374,13 +1387,14 @@ export class PaymentsModule {
    */
   private async processInstantSplitBundle(
     bundle: InstantSplitBundle,
-    senderPubkey: string
+    senderPubkey: string,
+    memo?: string,
   ): Promise<InstantSplitProcessResult> {
     this.ensureInitialized();
 
     if (!isInstantSplitBundleV5(bundle)) {
       // V4 (dev mode) still processes synchronously
-      return this.processInstantSplitBundleSync(bundle, senderPubkey);
+      return this.processInstantSplitBundleSync(bundle, senderPubkey, memo);
     }
 
     // V5: save immediately as unconfirmed, resolve proofs lazily
@@ -1415,14 +1429,30 @@ export class PaymentsModule {
         sdkData: JSON.stringify({ _pendingFinalization: pendingData }),
       };
 
-      await this.addToken(uiToken, false);
+      await this.addToken(uiToken);
       this.log(`V5 bundle saved as unconfirmed: ${uiToken.id.slice(0, 8)}...`);
+
+      // Record in history (once per token — resolveV5Token will NOT add another)
+      const senderInfo = await this.resolveSenderInfo(senderPubkey);
+      await this.addToHistory({
+        type: 'RECEIVED',
+        amount: bundle.amount,
+        coinId: bundle.coinId,
+        symbol: uiToken.symbol,
+        timestamp: Date.now(),
+        senderPubkey,
+        ...senderInfo,
+        memo,
+        tokenId: deterministicId,
+      });
 
       // Emit incoming transfer event
       this.deps!.emitEvent('transfer:incoming', {
         id: bundle.splitGroupId,
         senderPubkey,
+        senderNametag: senderInfo.senderNametag,
         tokens: [uiToken],
+        memo,
         receivedAt: Date.now(),
       });
 
@@ -1448,7 +1478,8 @@ export class PaymentsModule {
    */
   private async processInstantSplitBundleSync(
     bundle: InstantSplitBundle,
-    senderPubkey: string
+    senderPubkey: string,
+    memo?: string,
   ): Promise<InstantSplitProcessResult> {
     try {
       const signingService = await this.createSigningService();
@@ -1519,6 +1550,8 @@ export class PaymentsModule {
 
         await this.addToken(uiToken);
 
+        const receivedTokenId = extractTokenIdFromSdkData(uiToken.sdkData);
+        const senderInfo = await this.resolveSenderInfo(senderPubkey);
         await this.addToHistory({
           type: 'RECEIVED',
           amount: bundle.amount,
@@ -1526,6 +1559,9 @@ export class PaymentsModule {
           symbol: info.symbol,
           timestamp: Date.now(),
           senderPubkey,
+          ...senderInfo,
+          memo,
+          tokenId: receivedTokenId || uiToken.id,
         });
 
         await this.save();
@@ -1533,7 +1569,9 @@ export class PaymentsModule {
         this.deps!.emitEvent('transfer:incoming', {
           id: bundle.splitGroupId,
           senderPubkey,
+          senderNametag: senderInfo.senderNametag,
           tokens: [uiToken],
+          memo,
           receivedAt: Date.now(),
         });
       }
@@ -2473,15 +2511,7 @@ export class PaymentsModule {
         };
         this.tokens.set(tokenId, confirmedToken);
 
-        // Add to history
-        await this.addToHistory({
-          type: 'RECEIVED',
-          amount: confirmedToken.amount,
-          coinId: confirmedToken.coinId,
-          symbol: confirmedToken.symbol || 'UNK',
-          timestamp: Date.now(),
-          senderPubkey: pending.senderPubkey,
-        });
+        // History entry was already created in processInstantSplitBundle() — no duplicate here
 
         this.log(`V5 token resolved: ${tokenId.slice(0, 8)}...`);
         return 'resolved';
@@ -2714,10 +2744,9 @@ export class PaymentsModule {
    *   the old state is archived and replaced with the incoming one.
    *
    * @param token - The token to add.
-   * @param skipHistory - When `true`, do not create a `RECEIVED` transaction history entry (default `false`).
    * @returns `true` if the token was added, `false` if rejected as duplicate or tombstoned.
    */
-  async addToken(token: Token, skipHistory: boolean = false): Promise<boolean> {
+  async addToken(token: Token): Promise<boolean> {
     this.ensureInitialized();
 
     const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
@@ -2791,17 +2820,6 @@ export class PaymentsModule {
     // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
-    // Add to transaction history
-    if (!skipHistory && token.coinId && token.amount) {
-      await this.addToHistory({
-        type: 'RECEIVED',
-        amount: token.amount,
-        coinId: token.coinId,
-        symbol: token.symbol || 'UNK',
-        timestamp: token.createdAt || Date.now(),
-      });
-    }
-
     await this.save();
 
     this.log(`Added token ${token.id}, total: ${this.tokens.size}`);
@@ -2837,7 +2855,7 @@ export class PaymentsModule {
     }
 
     if (!found) {
-      await this.addToken(token, true);
+      await this.addToken(token);
       return;
     }
 
@@ -2856,10 +2874,8 @@ export class PaymentsModule {
    * entry is created unless `skipHistory` is `true`.
    *
    * @param tokenId - Local UUID of the token to remove.
-   * @param recipientNametag - Optional nametag of the transfer recipient (for history).
-   * @param skipHistory - When `true`, skip creating a transaction history entry (default `false`).
    */
-  async removeToken(tokenId: string, recipientNametag?: string, skipHistory: boolean = false): Promise<void> {
+  async removeToken(tokenId: string): Promise<void> {
     this.ensureInitialized();
 
     const token = this.tokens.get(tokenId);
@@ -2886,18 +2902,6 @@ export class PaymentsModule {
 
     // Remove from active tokens
     this.tokens.delete(tokenId);
-
-    // Add to transaction history
-    if (!skipHistory && token.coinId && token.amount) {
-      await this.addToHistory({
-        type: 'SENT',
-        amount: token.amount,
-        coinId: token.coinId,
-        symbol: token.symbol || 'UNK',
-        timestamp: Date.now(),
-        recipientNametag,
-      });
-    }
 
     await this.save();
   }
@@ -3164,29 +3168,126 @@ export class PaymentsModule {
    * @returns Array of {@link TransactionHistoryEntry} objects in descending timestamp order.
    */
   getHistory(): TransactionHistoryEntry[] {
-    return [...this.transactionHistory].sort((a, b) => b.timestamp - a.timestamp);
+    return [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
+  }
+
+  /**
+   * Best-effort resolve sender's DIRECT address and nametag from their transport pubkey.
+   * Returns empty object if transport doesn't support resolution or lookup fails.
+   */
+  private async resolveSenderInfo(senderTransportPubkey: string): Promise<{
+    senderAddress?: string;
+    senderNametag?: string;
+  }> {
+    try {
+      if (this.deps?.transport?.resolveTransportPubkeyInfo) {
+        const peerInfo = await this.deps.transport.resolveTransportPubkeyInfo(senderTransportPubkey);
+        if (peerInfo) {
+          return {
+            senderAddress: peerInfo.directAddress || undefined,
+            senderNametag: peerInfo.nametag || undefined,
+          };
+        }
+      }
+    } catch {
+      // Best-effort: ignore resolution failures
+    }
+    return {};
   }
 
   /**
    * Append an entry to the transaction history.
    *
-   * A unique `id` is auto-generated. The entry is immediately persisted to storage.
+   * A unique `id` and `dedupKey` are auto-generated. The entry is persisted to
+   * the local token storage provider's `history` store (IndexedDB / file).
+   * Duplicate entries with the same `dedupKey` are silently ignored (upsert).
    *
-   * @param entry - History entry fields (without `id`).
+   * @param entry - History entry fields (without `id` and `dedupKey`).
    */
-  async addToHistory(entry: Omit<TransactionHistoryEntry, 'id'>): Promise<void> {
+  async addToHistory(entry: Omit<TransactionHistoryEntry, 'id' | 'dedupKey'>): Promise<void> {
     this.ensureInitialized();
 
+    const dedupKey = computeHistoryDedupKey(entry.type, entry.tokenId, entry.transferId);
     const historyEntry: TransactionHistoryEntry = {
       id: crypto.randomUUID(),
+      dedupKey,
       ...entry,
     };
-    this.transactionHistory.push(historyEntry);
 
-    await this.deps!.storage.set(
-      STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY,
-      JSON.stringify(this.transactionHistory)
-    );
+    // Persist to the local token storage provider's history store
+    const provider = this.getLocalTokenStorageProvider();
+    if (provider?.addHistoryEntry) {
+      await provider.addHistoryEntry(historyEntry);
+    }
+
+    // Update in-memory cache (replace if same dedupKey, else append)
+    const existingIdx = this._historyCache.findIndex(e => e.dedupKey === dedupKey);
+    if (existingIdx >= 0) {
+      this._historyCache[existingIdx] = historyEntry;
+    } else {
+      this._historyCache.push(historyEntry);
+    }
+
+    // Notify listeners that a history entry was saved
+    this.deps!.emitEvent('history:updated', historyEntry);
+  }
+
+  /**
+   * Load history from the local token storage provider into the in-memory cache.
+   * Also performs one-time migration from legacy KV storage.
+   */
+  async loadHistory(): Promise<void> {
+    const provider = this.getLocalTokenStorageProvider();
+    if (provider?.getHistoryEntries) {
+      this._historyCache = await provider.getHistoryEntries();
+
+      // One-time migration from legacy KV storage
+      const legacyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
+      if (legacyData) {
+        try {
+          const legacyEntries = JSON.parse(legacyData) as TransactionHistoryEntry[];
+          // Ensure legacy entries have dedupKeys for import
+          const records = legacyEntries.map(e => ({
+            ...e,
+            dedupKey: e.dedupKey || computeHistoryDedupKey(e.type, e.tokenId, e.transferId),
+          }));
+          const imported = await provider.importHistoryEntries?.(records) ?? 0;
+          if (imported > 0) {
+            this._historyCache = await provider.getHistoryEntries();
+            this.log(`Migrated ${imported} history entries from KV to history store`);
+          }
+          // Delete legacy key after successful migration
+          await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
+        } catch {
+          // Ignore corrupt legacy data
+        }
+      }
+    } else {
+      // Fallback: load from KV storage (no dedicated provider)
+      const historyData = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
+      if (historyData) {
+        try {
+          this._historyCache = JSON.parse(historyData);
+        } catch {
+          this._historyCache = [];
+        }
+      }
+    }
+  }
+
+  /**
+   * Get the first local token storage provider (for history operations).
+   */
+  private getLocalTokenStorageProvider(): TokenStorageProvider<TxfStorageDataBase> | null {
+    const providers = this.getTokenStorageProviders();
+    for (const [, provider] of providers) {
+      if (provider.type === 'local') return provider;
+    }
+    // Fallback: first provider
+    for (const [, provider] of providers) {
+      return provider;
+    }
+    return null;
   }
 
   // ===========================================================================
@@ -3891,15 +3992,32 @@ export class PaymentsModule {
       await this.save();
       this.log(`NOSTR-FIRST: Token ${token.id.slice(0, 8)}... added as submitted (unconfirmed)`);
 
+      // Resolve sender info for both event and history
+      const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
+
       // Emit event for incoming transfer (even though unconfirmed)
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
         senderPubkey: transfer.senderTransportPubkey,
+        senderNametag: senderInfo.senderNametag,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
       };
       this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+
+      // Record in history immediately (not during finalization — that's just proof confirmation)
+      await this.addToHistory({
+        type: 'RECEIVED',
+        amount: token.amount,
+        coinId: token.coinId,
+        symbol: token.symbol,
+        timestamp: Date.now(),
+        senderPubkey: transfer.senderTransportPubkey,
+        ...senderInfo,
+        memo: payload.memo as string | undefined,
+        tokenId: nostrTokenId || token.id,
+      });
 
       // Parse commitment and start proof polling
       try {
@@ -3926,7 +4044,7 @@ export class PaymentsModule {
           lastAttemptAt: 0,
           onProofReceived: async (tokenId) => {
             // When proof arrives, finalize the token and update status
-            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput, transfer.senderTransportPubkey);
+            await this.finalizeReceivedToken(tokenId, sourceTokenInput, commitmentInput);
           },
         });
       } catch (err) {
@@ -4012,7 +4130,6 @@ export class PaymentsModule {
     tokenId: string,
     sourceTokenInput: unknown,
     commitmentInput: unknown,
-    senderPubkey: string
   ): Promise<void> {
     try {
       const token = this.tokens.get(tokenId);
@@ -4076,15 +4193,7 @@ export class PaymentsModule {
         tokenTransfers: [],
       });
 
-      // Add to history
-      await this.addToHistory({
-        type: 'RECEIVED',
-        amount: finalizedToken.amount,
-        coinId: finalizedToken.coinId,
-        symbol: finalizedToken.symbol,
-        timestamp: Date.now(),
-        senderPubkey,
-      });
+      // History entry was already created in handleCommitmentOnlyTransfer() — no duplicate here
     } catch (error) {
       console.error('[Payments] Failed to finalize received token:', error);
       // Mark as confirmed anyway (user has the token)
@@ -4125,7 +4234,8 @@ export class PaymentsModule {
         try {
           const result = await this.processInstantSplitBundle(
             instantBundle,
-            transfer.senderTransportPubkey
+            transfer.senderTransportPubkey,
+            payload.memo as string | undefined,
           );
           if (result.success) {
             this.log('INSTANT_SPLIT processed successfully');
@@ -4287,11 +4397,28 @@ export class PaymentsModule {
 
       // addToken() checks tombstones with exact (tokenId, stateHash) match
       // Tokens with same tokenId but different stateHash pass through (new state)
-      await this.addToken(token);
+      const added = await this.addToken(token);
+      const senderInfo = await this.resolveSenderInfo(transfer.senderTransportPubkey);
+
+      if (added) {
+        const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
+        await this.addToHistory({
+          type: 'RECEIVED',
+          amount: token.amount,
+          coinId: token.coinId,
+          symbol: token.symbol,
+          timestamp: Date.now(),
+          senderPubkey: transfer.senderTransportPubkey,
+          ...senderInfo,
+          memo: payload.memo as string | undefined,
+          tokenId: incomingTokenId || token.id,
+        });
+      }
 
       const incomingTransfer: IncomingTransfer = {
         id: transfer.id,
         senderPubkey: transfer.senderTransportPubkey,
+        senderNametag: senderInfo.senderNametag,
         tokens: [token],
         memo: payload.memo as string | undefined,
         receivedAt: transfer.timestamp,
