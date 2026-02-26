@@ -10,7 +10,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createPaymentsModule, type PaymentsModuleDependencies } from '../../../modules/payments/PaymentsModule';
-import type { Token, FullIdentity } from '../../../types';
+import type { FullIdentity } from '../../../types';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
@@ -196,7 +196,6 @@ function createMockDeps() {
     l1Address: 'alpha1testaddress',
     directAddress: 'DIRECT://testaddress',
     privateKey: '0x' + 'b'.repeat(64),
-    transportPubkey: 'c'.repeat(64),
   };
 
   return {
