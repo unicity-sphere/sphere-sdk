@@ -432,6 +432,33 @@ describe('buildTxfStorageData()', () => {
 
     expect(result._tombstones).toBeUndefined();
   });
+
+  it('should include historyEntries as _history if provided', async () => {
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const historyEntries = [
+      {
+        dedupKey: 'RECEIVED_token1',
+        id: 'uuid-1',
+        type: 'RECEIVED' as const,
+        amount: '1000',
+        coinId: 'UCT',
+        symbol: 'UCT',
+        timestamp: 1000,
+      },
+    ];
+
+    const result = await buildTxfStorageData([], meta, { historyEntries });
+
+    expect((result as Record<string, unknown>)._history).toEqual(historyEntries);
+  });
+
+  it('should not include _history if historyEntries is empty', async () => {
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+
+    const result = await buildTxfStorageData([], meta, { historyEntries: [] });
+
+    expect((result as Record<string, unknown>)._history).toBeUndefined();
+  });
 });
 
 // =============================================================================
@@ -496,6 +523,66 @@ describe('parseTxfStorageData()', () => {
     const parsed = parseTxfStorageData('not an object');
 
     expect(parsed.validationErrors.length).toBeGreaterThan(0);
+  });
+
+  it('should extract history entries from _history', async () => {
+    const meta = { version: 1, address: 'alpha1test', ipnsName: '' };
+    const historyEntries = [
+      {
+        dedupKey: 'RECEIVED_token1',
+        id: 'uuid-1',
+        type: 'RECEIVED' as const,
+        amount: '1000',
+        coinId: 'UCT',
+        symbol: 'UCT',
+        timestamp: 1000,
+      },
+      {
+        dedupKey: 'SENT_transfer_tx1',
+        id: 'uuid-2',
+        type: 'SENT' as const,
+        amount: '500',
+        coinId: 'UCT',
+        symbol: 'UCT',
+        timestamp: 2000,
+        transferId: 'tx1',
+        recipientNametag: 'bob',
+      },
+    ];
+    const storageData = await buildTxfStorageData([], meta, { historyEntries });
+
+    const parsed = parseTxfStorageData(storageData);
+
+    expect(parsed.historyEntries).toHaveLength(2);
+    expect(parsed.historyEntries[0].dedupKey).toBe('RECEIVED_token1');
+    expect(parsed.historyEntries[1].dedupKey).toBe('SENT_transfer_tx1');
+    expect(parsed.historyEntries[1].recipientNametag).toBe('bob');
+  });
+
+  it('should skip malformed history entries', () => {
+    const storageData = {
+      _meta: { version: 1, address: 'alpha1test', ipnsName: '', formatVersion: '2.0' },
+      _history: [
+        { dedupKey: 'valid', type: 'RECEIVED', amount: '100', coinId: 'UCT', symbol: 'UCT', timestamp: 1000, id: 'x' },
+        { notADedupKey: 'bad' },        // missing dedupKey
+        { dedupKey: 123, type: 'SENT' }, // dedupKey is not string
+        null,                            // null entry
+        'not-an-object',                 // string entry
+      ],
+    };
+
+    const parsed = parseTxfStorageData(storageData);
+
+    expect(parsed.historyEntries).toHaveLength(1);
+    expect(parsed.historyEntries[0].dedupKey).toBe('valid');
+  });
+
+  it('should handle missing _history gracefully', () => {
+    const parsed = parseTxfStorageData({
+      _meta: { version: 1, address: 'test', ipnsName: '', formatVersion: '2.0' },
+    });
+
+    expect(parsed.historyEntries).toEqual([]);
   });
 });
 

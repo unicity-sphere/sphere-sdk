@@ -225,6 +225,7 @@ export interface TxfStorageDataBase {
   _outbox?: TxfOutboxEntry[];
   _sent?: TxfSentEntry[];
   _invalid?: TxfInvalidEntry[];
+  _history?: HistoryRecord[];
   // Dynamic token entries: _<tokenId>
   [key: `_${string}`]: unknown;
 }

@@ -106,6 +106,11 @@ export function mergeTxfData<T extends TxfStorageDataBase>(
   const remoteNametags = (remote._nametags ?? []) as NametagEntry[];
   const mergedNametags = mergeNametagsByName(localNametags, remoteNametags);
 
+  // 8. Merge history — union with dedup by dedupKey (same pattern as _outbox/_sent/_invalid)
+  const localHistory = (local._history ?? []) as Array<{ dedupKey: string }>;
+  const remoteHistory = (remote._history ?? []) as Array<{ dedupKey: string }>;
+  const mergedHistory = mergeArrayById(localHistory, remoteHistory, 'dedupKey');
+
   // Build merged result
   const merged = {
     _meta: mergedMeta,
@@ -114,6 +119,7 @@ export function mergeTxfData<T extends TxfStorageDataBase>(
     _outbox: mergedOutbox.length > 0 ? mergedOutbox : undefined,
     _sent: mergedSent.length > 0 ? mergedSent : undefined,
     _invalid: mergedInvalid.length > 0 ? mergedInvalid : undefined,
+    _history: mergedHistory.length > 0 ? mergedHistory : undefined,
     ...mergedTokens,
   } as unknown as T;
 
@@ -153,6 +159,7 @@ function getTokenKeys(data: TxfStorageDataBase): Set<string> {
   const reservedKeys = new Set([
     '_meta', '_tombstones', '_outbox', '_sent', '_invalid',
     '_nametag', '_nametags', '_mintOutbox', '_invalidatedNametags', '_integrity',
+    '_history',
   ]);
   const keys = new Set<string>();
 

@@ -16,6 +16,7 @@ import type {
   MintOutboxEntry,
   InvalidatedNametagEntry,
 } from '../types/txf';
+import type { HistoryRecord } from '../storage';
 import {
   isTokenKey,
   isArchivedKey,
@@ -252,6 +253,7 @@ export async function buildTxfStorageData(
     outboxEntries?: OutboxEntry[];
     mintOutboxEntries?: MintOutboxEntry[];
     invalidatedNametags?: InvalidatedNametagEntry[];
+    historyEntries?: HistoryRecord[];
   }
 ): Promise<TxfStorageData> {
   const storageData: TxfStorageData = {
@@ -279,6 +281,10 @@ export async function buildTxfStorageData(
 
   if (options?.invalidatedNametags && options.invalidatedNametags.length > 0) {
     storageData._invalidatedNametags = options.invalidatedNametags;
+  }
+
+  if (options?.historyEntries && options.historyEntries.length > 0) {
+    (storageData as TxfStorageData & { _history: HistoryRecord[] })._history = options.historyEntries;
   }
 
   // Add active tokens
@@ -324,6 +330,7 @@ export interface ParsedStorageData {
   outboxEntries: OutboxEntry[];
   mintOutboxEntries: MintOutboxEntry[];
   invalidatedNametags: InvalidatedNametagEntry[];
+  historyEntries: HistoryRecord[];
   validationErrors: string[];
 }
 
@@ -341,6 +348,7 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
     outboxEntries: [],
     mintOutboxEntries: [],
     invalidatedNametags: [],
+    historyEntries: [],
     validationErrors: [],
   };
 
@@ -427,6 +435,20 @@ export function parseTxfStorageData(data: unknown): ParsedStorageData {
         typeof (entry as InvalidatedNametagEntry).name === 'string'
       ) {
         result.invalidatedNametags.push(entry as InvalidatedNametagEntry);
+      }
+    }
+  }
+
+  // Extract history entries
+  if (Array.isArray(storageData._history)) {
+    for (const entry of storageData._history) {
+      if (
+        typeof entry === 'object' &&
+        entry !== null &&
+        typeof (entry as HistoryRecord).dedupKey === 'string' &&
+        typeof (entry as HistoryRecord).type === 'string'
+      ) {
+        result.historyEntries.push(entry as HistoryRecord);
       }
     }
   }

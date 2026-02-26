@@ -219,6 +219,7 @@ export interface TxfStorageDataBase {
   _invalidatedNametags?: InvalidatedNametagEntry[];
   _outbox?: OutboxEntry[];
   _mintOutbox?: MintOutboxEntry[];
+  _history?: unknown[];
   [key: string]: unknown;
 }
 
@@ -244,7 +245,7 @@ export interface TokenValidationResult {
 
 const ARCHIVED_PREFIX = 'archived-';
 const FORKED_PREFIX = '_forked_';
-const RESERVED_KEYS = ['_meta', '_nametag', '_nametags', '_tombstones', '_invalidatedNametags', '_outbox', '_mintOutbox', '_sent', '_invalid', '_integrity'];
+const RESERVED_KEYS = ['_meta', '_nametag', '_nametags', '_tombstones', '_invalidatedNametags', '_outbox', '_mintOutbox', '_sent', '_invalid', '_integrity', '_history'];
 
 /**
  * Check if a key is an active token key

@@ -32,7 +32,7 @@ import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModul
 import { TokenSplitCalculator } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
-import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../../storage';
+import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
   TransportProvider,
   PeerInfo,
@@ -119,6 +119,9 @@ function computeHistoryDedupKey(type: string, tokenId?: string, transferId?: str
   if (tokenId) return `${type}_${tokenId}`;
   return `${type}_${crypto.randomUUID()}`;
 }
+
+/** Maximum number of history entries to include in IPFS-synced TXF data */
+const MAX_SYNCED_HISTORY_ENTRIES = 5000;
 
 // =============================================================================
 // Receive Options & Result
@@ -826,6 +829,11 @@ export class PaymentsModule {
           const result = await provider.load();
           if (result.success && result.data) {
             this.loadFromStorageData(result.data);
+            // Import history from IPFS TXF data into local store
+            const txfData = result.data as TxfStorageDataBase;
+            if (txfData._history && txfData._history.length > 0) {
+              await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
+            }
             this.log(`Loaded metadata from provider ${id}`);
             break; // Use first successful provider
           }
@@ -3857,6 +3865,38 @@ export class PaymentsModule {
   }
 
   /**
+   * Import history entries from remote TXF data into local store.
+   * Delegates to the local TokenStorageProvider's importHistoryEntries() for
+   * persistent storage, with in-memory fallback.
+   * Reused by both load() (initial IPFS fetch) and _doSync() (merge result).
+   */
+  private async importRemoteHistoryEntries(entries: HistoryRecord[]): Promise<number> {
+    if (entries.length === 0) return 0;
+
+    const provider = this.getLocalTokenStorageProvider();
+    if (provider?.importHistoryEntries) {
+      const imported = await provider.importHistoryEntries(entries);
+      if (imported > 0) {
+        // Reload cache from provider to stay in sync
+        this._historyCache = await provider.getHistoryEntries!();
+      }
+      return imported;
+    }
+
+    // Fallback: merge into in-memory cache by dedupKey
+    const existingKeys = new Set(this._historyCache.map(e => e.dedupKey));
+    let imported = 0;
+    for (const entry of entries) {
+      if (!existingKeys.has(entry.dedupKey)) {
+        this._historyCache.push(entry);
+        existingKeys.add(entry.dedupKey);
+        imported++;
+      }
+    }
+    return imported;
+  }
+
+  /**
    * Get the first local token storage provider (for history operations).
    */
   private getLocalTokenStorageProvider(): TokenStorageProvider<TxfStorageDataBase> | null {
@@ -4176,6 +4216,16 @@ export class PaymentsModule {
             if (this.nametags.length === 0 && savedNametags.length > 0) {
               this.nametags = savedNametags;
             }
+
+            // Import merged history from IPFS sync into local store
+            const txfData = result.merged as TxfStorageDataBase;
+            if (txfData._history && txfData._history.length > 0) {
+              const imported = await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
+              if (imported > 0) {
+                this.log(`Imported ${imported} history entries from IPFS sync`);
+              }
+            }
+
             totalAdded += result.added;
             totalRemoved += result.removed;
           }
@@ -5109,6 +5159,7 @@ export class PaymentsModule {
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
+    const sorted = [...this._historyCache].sort((a, b) => b.timestamp - a.timestamp);
     return await buildTxfStorageData(
       Array.from(this.tokens.values()),
       {
@@ -5121,6 +5172,7 @@ export class PaymentsModule {
         tombstones: this.tombstones,
         archivedTokens: this.archivedTokens,
         forkedTokens: this.forkedTokens,
+        historyEntries: sorted.slice(0, MAX_SYNCED_HISTORY_ENTRIES),
       }
     ) as unknown as TxfStorageDataBase;
   }
