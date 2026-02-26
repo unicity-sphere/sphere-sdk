@@ -6,6 +6,7 @@ import type {
   TxfOutboxEntry,
   TxfSentEntry,
   TxfInvalidEntry,
+  HistoryRecord,
 } from '../../../../../storage';
 
 // =============================================================================
@@ -72,6 +73,19 @@ function invalidEntry(overrides: Partial<TxfInvalidEntry> & { tokenId: string })
   return {
     reason: 'spent',
     detectedAt: 3000,
+    ...overrides,
+  };
+}
+
+/** Convenience history entry factory. */
+function historyEntry(overrides: Partial<HistoryRecord> & { dedupKey: string }): HistoryRecord {
+  return {
+    id: crypto.randomUUID(),
+    type: 'RECEIVED',
+    amount: '1000000',
+    coinId: 'UCT',
+    symbol: 'UCT',
+    timestamp: Date.now(),
     ...overrides,
   };
 }
@@ -791,6 +805,126 @@ describe('mergeTxfData', () => {
       expect(added).toBe(2);
       expect(removed).toBe(1);
       expect(conflicts).toBe(1);
+    });
+  });
+
+  // ===========================================================================
+  // History merge
+  // ===========================================================================
+
+  describe('_history merge', () => {
+    it('should union history entries from both sides', () => {
+      const local: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token1', timestamp: 1000 }),
+          historyEntry({ dedupKey: 'RECEIVED_token2', timestamp: 2000 }),
+          historyEntry({ dedupKey: 'SENT_transfer_tx1', timestamp: 3000 }),
+        ],
+      };
+      const remote: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token3', timestamp: 1500 }),
+          historyEntry({ dedupKey: 'SENT_transfer_tx2', timestamp: 2500 }),
+        ],
+      };
+
+      const { merged } = mergeTxfData(local, remote);
+
+      expect(merged._history).toHaveLength(5);
+      const keys = (merged._history as HistoryRecord[]).map(e => e.dedupKey);
+      expect(keys).toContain('RECEIVED_token1');
+      expect(keys).toContain('RECEIVED_token2');
+      expect(keys).toContain('RECEIVED_token3');
+      expect(keys).toContain('SENT_transfer_tx1');
+      expect(keys).toContain('SENT_transfer_tx2');
+    });
+
+    it('should deduplicate by dedupKey — local wins', () => {
+      const local: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token1', amount: '100', timestamp: 1000 }),
+        ],
+      };
+      const remote: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token1', amount: '200', timestamp: 2000 }),
+        ],
+      };
+
+      const { merged } = mergeTxfData(local, remote);
+
+      expect(merged._history).toHaveLength(1);
+      expect((merged._history as HistoryRecord[])[0].amount).toBe('100');
+    });
+
+    it('should handle empty _history on both sides', () => {
+      const local = emptyData();
+      const remote = emptyData();
+
+      const { merged } = mergeTxfData(local, remote);
+
+      expect(merged._history).toBeUndefined();
+    });
+
+    it('should handle _history only on local side', () => {
+      const local: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'SENT_transfer_tx1' }),
+        ],
+      };
+      const remote = emptyData();
+
+      const { merged } = mergeTxfData(local, remote);
+
+      expect(merged._history).toHaveLength(1);
+      expect((merged._history as HistoryRecord[])[0].dedupKey).toBe('SENT_transfer_tx1');
+    });
+
+    it('should handle _history only on remote side', () => {
+      const local = emptyData();
+      const remote: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token1' }),
+          historyEntry({ dedupKey: 'RECEIVED_token2' }),
+        ],
+      };
+
+      const { merged } = mergeTxfData(local, remote);
+
+      expect(merged._history).toHaveLength(2);
+    });
+
+    it('should not treat _history entries as token keys', () => {
+      const local: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token1' }),
+        ],
+        [tokenKey(1)]: { v: 'L' },
+      };
+      const remote: TxfStorageDataBase = {
+        ...emptyData(),
+        _history: [
+          historyEntry({ dedupKey: 'RECEIVED_token2' }),
+        ],
+        [tokenKey(2)]: { v: 'R' },
+      };
+
+      const { merged, added } = mergeTxfData(local, remote);
+
+      // History should be merged
+      expect(merged._history).toHaveLength(2);
+      // Tokens should be counted correctly (remote-only = added)
+      expect(added).toBe(1);
+      // Both tokens should exist
+      expect(merged[tokenKey(1)]).toEqual({ v: 'L' });
+      expect(merged[tokenKey(2)]).toEqual({ v: 'R' });
     });
   });
 });
