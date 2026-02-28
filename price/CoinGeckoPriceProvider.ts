@@ -308,9 +308,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     Promise.all([
       this.storage.set(STORAGE_KEYS_GLOBAL.PRICE_CACHE, JSON.stringify(data)),
       this.storage.set(STORAGE_KEYS_GLOBAL.PRICE_CACHE_TS, String(Date.now())),
-    ]).catch(() => {
-      // Cache save failure is non-critical
-    });
+    ]).catch((err) => logger.debug('Price', 'Cache save failed (non-critical)', err));
   }
 
   // ===========================================================================

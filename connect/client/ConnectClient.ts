@@ -8,6 +8,7 @@
  * Zero dependencies on the Sphere SDK core.
  */
 
+import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import type { ConnectTransport, ConnectClientConfig, ConnectResult, ConnectEventHandler } from '../types';
 import type {
@@ -208,7 +209,7 @@ export class ConnectClient {
       this.eventHandlers.set(event, new Set());
       // Tell host to forward this event
       if (this.connected) {
-        this.query(RPC_METHODS.SUBSCRIBE, { event }).catch(() => {});
+        this.query(RPC_METHODS.SUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event subscription failed', err));
       }
     }
     this.eventHandlers.get(event)!.add(handler);
@@ -220,7 +221,7 @@ export class ConnectClient {
         if (handlers.size === 0) {
           this.eventHandlers.delete(event);
           if (this.connected) {
-            this.query(RPC_METHODS.UNSUBSCRIBE, { event }).catch(() => {});
+            this.query(RPC_METHODS.UNSUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event unsubscription failed', err));
           }
         }
       }
@@ -257,8 +258,8 @@ export class ConnectClient {
         for (const handler of handlers) {
           try {
             handler(msg.data);
-          } catch {
-            // Ignore handler errors
+          } catch (err) {
+            logger.debug('Connect', 'Event handler error', err);
           }
         }
       }

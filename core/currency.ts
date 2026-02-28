@@ -3,6 +3,8 @@
  * Conversion between human-readable amounts and smallest units (bigint)
  */
 
+import { logger } from './logger';
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -34,7 +36,8 @@ export function toSmallestUnit(amount: number | string, decimals: number = DEFAU
     const paddedFraction = fraction.padEnd(decimals, '0').slice(0, decimals);
 
     return BigInt(integer + paddedFraction);
-  } catch {
+  } catch (err) {
+    logger.debug('Currency', 'toSmallestUnit conversion failed', err);
     return 0n;
   }
 }

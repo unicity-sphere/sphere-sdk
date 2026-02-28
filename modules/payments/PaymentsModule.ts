@@ -886,7 +886,7 @@ export class PaymentsModule {
 
     // After loading, try to resolve any unconfirmed tokens and start
     // periodic retries so tokens don't stay stuck as 'submitted'.
-    this.resolveUnconfirmed().catch(() => {});
+    this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
     this.scheduleResolveUnconfirmed();
   }
 
@@ -1829,7 +1829,7 @@ export class PaymentsModule {
 
     // 6. Fire-and-forget: try to resolve V5 tokens immediately
     if (bundle.splitBundle) {
-      this.resolveUnconfirmed().catch(() => {});
+      this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
       this.scheduleResolveUnconfirmed();
     }
   }
@@ -1929,7 +1929,7 @@ export class PaymentsModule {
       await this.save();
 
       // Fire-and-forget: try to resolve immediately, then start periodic retry
-      this.resolveUnconfirmed().catch(() => {});
+      this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
       this.scheduleResolveUnconfirmed();
 
       return { success: true, durationMs: 0 };

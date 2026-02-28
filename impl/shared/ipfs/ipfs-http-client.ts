@@ -223,7 +223,7 @@ export class IpfsHttpClient {
         );
 
         if (!response.ok) {
-          const body = await response.text().catch(() => '');
+          const body = await response.text().catch((err) => { logger.debug('IPFS-HTTP', 'Failed to read error response body', err); return ''; });
           throw new IpfsError(
             `Fetch failed: HTTP ${response.status}`,
             classifyHttpStatus(response.status, body),
@@ -278,7 +278,7 @@ export class IpfsHttpClient {
       );
 
       if (!response.ok) {
-        const body = await response.text().catch(() => '');
+        const body = await response.text().catch((err) => { logger.debug('IPFS-HTTP', 'Failed to read error response body', err); return ''; });
         const category = classifyHttpStatus(response.status, body);
         if (category === 'NOT_FOUND') return null;
         throw new IpfsError(`Routing API: HTTP ${response.status}`, category, gateway);
@@ -335,7 +335,8 @@ export class IpfsHttpClient {
       }
 
       return { cid: '', content };
-    } catch {
+    } catch (err) {
+      logger.debug('IPFS-HTTP', 'IPNS gateway resolution failed', err);
       return null;
     }
   }
@@ -422,7 +423,7 @@ export class IpfsHttpClient {
       );
 
       if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
+        const errorText = await response.text().catch((err) => { logger.debug('IPFS-HTTP', 'Failed to read error response body', err); return ''; });
         throw new IpfsError(
           `IPNS publish: HTTP ${response.status}: ${errorText.slice(0, 100)}`,
           classifyHttpStatus(response.status, errorText),

@@ -2394,7 +2394,7 @@ export class Sphere {
             try {
               const info = await this._transport.resolveAddressInfo!(l1Address);
               return info?.nametag ?? null;
-            } catch { return null; }
+            } catch (err) { logger.debug('Sphere', 'Nametag resolution failed during scan', err); return null; }
           }
         : undefined
     );

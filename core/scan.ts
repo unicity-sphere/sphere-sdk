@@ -134,8 +134,8 @@ export async function scanAddressesImpl(
                 nametag = tag;
                 nametagsFoundCount++;
               }
-            } catch {
-              // Nametag resolution failure is non-fatal
+            } catch (err) {
+              logger.debug('Sphere', 'Nametag resolution failed during scan', err);
             }
           }
 

@@ -319,7 +319,8 @@ export class UnicityAggregatorProvider implements OracleProvider {
         proof: response.proof,
         timestamp: Date.now(),
       };
-    } catch {
+    } catch (error) {
+      logger.warn('Aggregator', 'getProof failed', error);
       return null;
     }
   }
@@ -454,7 +455,8 @@ export class UnicityAggregatorProvider implements OracleProvider {
       }
 
       return spent;
-    } catch {
+    } catch (error) {
+      logger.warn('Aggregator', 'isSpent check failed, assuming unspent', error);
       return false;
     }
   }
@@ -476,7 +478,8 @@ export class UnicityAggregatorProvider implements OracleProvider {
         roundNumber: response.state.roundNumber,
         lastUpdated: Date.now(),
       };
-    } catch {
+    } catch (error) {
+      logger.warn('Aggregator', 'getTokenState failed', error);
       return null;
     }
   }

@@ -7,6 +7,7 @@
 
 import CryptoJS from 'crypto-js';
 import { SphereError } from './errors';
+import { logger } from './logger';
 
 // =============================================================================
 // Types
@@ -209,7 +210,8 @@ export function decryptWithSalt(ciphertext: string, password: string, salt: stri
     const decrypted = CryptoJS.AES.decrypt(ciphertext, key);
     const result = decrypted.toString(CryptoJS.enc.Utf8);
     return result || null;
-  } catch {
+  } catch (err) {
+    logger.debug('Encryption', 'decryptWithSalt failed', err);
     return null;
   }
 }

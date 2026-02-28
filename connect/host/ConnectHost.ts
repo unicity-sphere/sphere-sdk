@@ -275,7 +275,7 @@ export class ConnectHost {
       this.sendResult(msg.id, { disconnected: true });
       if (disconnectedSession && this.config.onDisconnect) {
         // Fire-and-forget: don't block the response
-        Promise.resolve(this.config.onDisconnect(disconnectedSession)).catch(console.warn);
+        Promise.resolve(this.config.onDisconnect(disconnectedSession)).catch((err) => logger.warn('Connect', 'onDisconnect handler error', err));
       }
       return;
     }
@@ -427,7 +427,7 @@ export class ConnectHost {
         if (needsResolve.length > 0) {
           const resolved = await Promise.all(
             needsResolve.map(({ peerPubkey }) =>
-              this.sphere.communications!.resolvePeerNametag(peerPubkey).catch(() => undefined),
+              this.sphere.communications!.resolvePeerNametag(peerPubkey).catch((err) => { logger.debug('Connect', 'Peer nametag resolution failed', err); return undefined; }),
             ),
           );
           for (let i = 0; i < needsResolve.length; i++) {
