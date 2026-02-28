@@ -281,18 +281,27 @@ const l1Balance = await sphere.payments.l1.getBalance();
 ### Send Tokens
 
 ```typescript
+import { isSphereError } from '@unicitylabs/sphere-sdk';
+
 async function sendTokens(recipient: string, amount: string) {
   try {
-    const result = await sphere.payments.send({
-      recipient,  // '@alice' or 'DIRECT://...'
-      amount,
+    await sphere.payments.send({
       coinId: 'UCT',
-      // transferMode: 'instant',      // default — fast send, receiver resolves proofs
-      // transferMode: 'conservative', // collect all proofs first, then deliver
+      amount: '1000000',
+      recipient: '@alice',
     });
-    console.log('Sent! Transfers:', result.tokenTransfers);
+    showToast('Sent!');
   } catch (error) {
-    console.error('Failed:', error.message);
+    if (isSphereError(error)) {
+      switch (error.code) {
+        case 'INSUFFICIENT_BALANCE': showToast('Not enough funds'); break;
+        case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
+        case 'TRANSPORT_ERROR': showToast('Network issue, try again'); break;
+        default: showToast(error.message);
+      }
+    } else {
+      showToast('Something went wrong');
+    }
   }
 }
 ```
@@ -622,6 +631,20 @@ const providers = createBrowserProviders({
     autoReconnect: true,   // Auto-retry
   },
 });
+```
+
+### Debug Logging
+
+Enable SDK debug logging in the browser console:
+
+```typescript
+import { logger } from '@unicitylabs/sphere-sdk';
+
+// Enable all debug logging
+logger.configure({ debug: true });
+
+// Enable only transport logs
+logger.setTagDebug('Nostr', true);
 ```
 
 ## Browser Support
