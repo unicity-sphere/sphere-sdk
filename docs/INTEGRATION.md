@@ -3,6 +3,7 @@
 > **Quick Start**: For a fast setup, see the platform-specific guides:
 > - [Browser Quick Start](./QUICKSTART-BROWSER.md) - Web applications
 > - [Node.js Quick Start](./QUICKSTART-NODEJS.md) - Server-side / CLI
+> - [Connect Protocol](./CONNECT.md) - Wallet ↔ dApp communication
 >
 > This document covers advanced integration patterns and custom provider implementations.
 
