@@ -19,6 +19,7 @@ export { CoinGeckoPriceProvider } from './CoinGeckoPriceProvider';
 
 import type { PriceProviderConfig, PriceProvider } from './price-provider';
 import { CoinGeckoPriceProvider } from './CoinGeckoPriceProvider';
+import { SphereError } from '../core/errors';
 
 /**
  * Create a price provider based on platform configuration
@@ -33,6 +34,6 @@ export function createPriceProvider(config: PriceProviderConfig): PriceProvider 
     case 'coingecko':
       return new CoinGeckoPriceProvider(config);
     default:
-      throw new Error(`Unsupported price platform: ${String(config.platform)}`);
+      throw new SphereError(`Unsupported price platform: ${String(config.platform)}`, 'INVALID_CONFIG');
   }
 }

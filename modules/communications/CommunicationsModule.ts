@@ -4,6 +4,7 @@
  */
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import type {
   DirectMessage,
   BroadcastMessage,
@@ -667,7 +668,7 @@ export class CommunicationsModule {
       const nametag = recipient.slice(1);
       const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
       if (!pubkey) {
-        throw new Error(`Nametag not found: ${recipient}`);
+        throw new SphereError(`Nametag not found: ${recipient}`, 'INVALID_RECIPIENT');
       }
       return { pubkey, nametag };
     }
@@ -676,7 +677,7 @@ export class CommunicationsModule {
 
   private ensureInitialized(): void {
     if (!this.deps) {
-      throw new Error('CommunicationsModule not initialized');
+      throw new SphereError('CommunicationsModule not initialized', 'NOT_INITIALIZED');
     }
   }
 }

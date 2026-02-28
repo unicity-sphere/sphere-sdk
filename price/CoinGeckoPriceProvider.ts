@@ -7,6 +7,7 @@
  */
 
 import { logger } from '../core/logger';
+import { SphereError } from '../core/errors';
 import { STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } from './price-provider';
@@ -175,7 +176,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
         if (response.status === 429) {
           this.extendCacheOnRateLimit(uncachedNames);
         }
-        throw new Error(`CoinGecko API error: ${response.status} ${response.statusText}`);
+        throw new SphereError(`CoinGecko API error: ${response.status} ${response.statusText}`, 'NETWORK_ERROR');
       }
 
       const data = await response.json() as Record<string, Record<string, number>>;

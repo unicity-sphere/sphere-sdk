@@ -63,6 +63,7 @@ import {
 } from '../../serialization/txf-serializer';
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -958,12 +959,12 @@ export class PaymentsModule {
       // Get state transition client and trust base
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        throw new Error('State transition client not available. Oracle provider must implement getStateTransitionClient()');
+        throw new SphereError('State transition client not available. Oracle provider must implement getStateTransitionClient()', 'AGGREGATOR_ERROR');
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
       if (!trustBase) {
-        throw new Error('Trust base not available. Oracle provider must implement getTrustBase()');
+        throw new SphereError('Trust base not available. Oracle provider must implement getTrustBase()', 'AGGREGATOR_ERROR');
       }
 
       // Calculate optimal split plan
@@ -976,7 +977,7 @@ export class PaymentsModule {
       );
 
       if (!splitPlan) {
-        throw new Error('Insufficient balance');
+        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
       }
 
       // Collect all tokens involved
@@ -1075,7 +1076,7 @@ export class PaymentsModule {
 
           const submitResponse = await stClient.submitTransferCommitment(commitment);
           if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
-            throw new Error(`Transfer commitment failed: ${submitResponse.status}`);
+            throw new SphereError(`Transfer commitment failed: ${submitResponse.status}`, 'TRANSFER_FAILED');
           }
 
           const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
@@ -1388,12 +1389,12 @@ export class PaymentsModule {
       // Get state transition client and trust base
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        throw new Error('State transition client not available');
+        throw new SphereError('State transition client not available', 'AGGREGATOR_ERROR');
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
       if (!trustBase) {
-        throw new Error('Trust base not available');
+        throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
       }
 
       // Calculate optimal split plan
@@ -1406,7 +1407,7 @@ export class PaymentsModule {
       );
 
       if (!splitPlan) {
-        throw new Error('Insufficient balance');
+        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
       }
 
       if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
@@ -1956,12 +1957,12 @@ export class PaymentsModule {
 
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        throw new Error('State transition client not available');
+        throw new SphereError('State transition client not available', 'AGGREGATOR_ERROR');
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
       if (!trustBase) {
-        throw new Error('Trust base not available');
+        throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2231,11 +2232,11 @@ export class PaymentsModule {
   async payPaymentRequest(requestId: string, memo?: string): Promise<TransferResult> {
     const request = this.paymentRequests.find((r) => r.id === requestId);
     if (!request) {
-      throw new Error(`Payment request not found: ${requestId}`);
+      throw new SphereError(`Payment request not found: ${requestId}`, 'VALIDATION_ERROR');
     }
 
     if (request.status !== 'pending' && request.status !== 'accepted') {
-      throw new Error(`Payment request is not pending or accepted: ${request.status}`);
+      throw new SphereError(`Payment request is not pending or accepted: ${request.status}`, 'VALIDATION_ERROR');
     }
 
     // Mark as accepted (don't send response yet, wait for payment)
@@ -2530,7 +2531,7 @@ export class PaymentsModule {
     this.ensureInitialized();
 
     if (!this.deps!.transport.fetchPendingEvents) {
-      throw new Error('Transport provider does not support fetchPendingEvents');
+      throw new SphereError('Transport provider does not support fetchPendingEvents', 'TRANSPORT_ERROR');
     }
 
     const opts = options ?? {};
@@ -2979,7 +2980,7 @@ export class PaymentsModule {
         const mintResponse = await stClient.submitMintCommitment(mintCommitment);
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint response status=${mintResponse.status}`);
         if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
-          throw new Error(`Mint submission failed: ${mintResponse.status}`);
+          throw new SphereError(`Mint submission failed: ${mintResponse.status}`, 'TRANSFER_FAILED');
         }
         pending.stage = 'MINT_SUBMITTED';
         this.updatePendingFinalization(token, pending);
@@ -3011,7 +3012,7 @@ export class PaymentsModule {
         const transferResponse = await stClient.submitTransferCommitment(transferCommitment);
         logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer response status=${transferResponse.status}`);
         if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
-          throw new Error(`Transfer submission failed: ${transferResponse.status}`);
+          throw new SphereError(`Transfer submission failed: ${transferResponse.status}`, 'TRANSFER_FAILED');
         }
         pending.stage = 'TRANSFER_SUBMITTED';
         this.updatePendingFinalization(token, pending);
@@ -4461,9 +4462,10 @@ export class PaymentsModule {
       return recipient;
     }
 
-    throw new Error(
+    throw new SphereError(
       `Cannot resolve transport pubkey for "${recipient}". ` +
-      `No binding event found. The recipient must publish their identity first.`
+      `No binding event found. The recipient must publish their identity first.`,
+      'INVALID_RECIPIENT',
     );
   }
 
@@ -4572,9 +4574,10 @@ export class PaymentsModule {
     // For nametag-based recipients, use PeerInfo (pre-resolved or resolve now)
     const info = peerInfo ?? await this.deps?.transport.resolve?.(recipient) ?? null;
     if (!info) {
-      throw new Error(
+      throw new SphereError(
         `Recipient "${recipient}" not found. ` +
-        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`
+        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`,
+        'INVALID_RECIPIENT',
       );
     }
 
@@ -4591,7 +4594,7 @@ export class PaymentsModule {
     // Force DIRECT mode
     if (addressMode === 'direct') {
       if (!info.directAddress) {
-        throw new Error(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
+        throw new SphereError(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`, 'INVALID_RECIPIENT');
       }
       logger.debug('Payments', `Using DirectAddress for "${nametag}" (forced): ${info.directAddress.slice(0, 30)}...`);
       return AddressFactory.createAddress(info.directAddress);
@@ -4711,14 +4714,15 @@ export class PaymentsModule {
       }
 
       if (!proxyNametag?.token) {
-        throw new Error('Cannot finalize PROXY transfer - no nametag token');
+        throw new SphereError('Cannot finalize PROXY transfer - no nametag token', 'VALIDATION_ERROR');
       }
       const nametagToken = await SdkToken.fromJSON(proxyNametag.token);
       const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
       if (proxy.address !== recipientAddress.address) {
-        throw new Error(
+        throw new SphereError(
           `PROXY address mismatch: nametag resolves to ${proxy.address} ` +
-          `but transfer targets ${recipientAddress.address}`
+          `but transfer targets ${recipientAddress.address}`,
+          'VALIDATION_ERROR',
         );
       }
       nametagTokens = [nametagToken];
@@ -4974,7 +4978,7 @@ export class PaymentsModule {
               const commitment = await TransferCommitment.fromJSON(transferTxInput);
               const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
               if (!stClient || !this.deps!.oracle.waitForProofSdk) {
-                throw new Error('Cannot submit commitment - missing oracle methods');
+                throw new SphereError('Cannot submit commitment - missing oracle methods', 'AGGREGATOR_ERROR');
               }
               await stClient.submitTransferCommitment(commitment);
               const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
@@ -5391,7 +5395,7 @@ export class PaymentsModule {
 
   private ensureInitialized(): void {
     if (!this.deps) {
-      throw new Error('PaymentsModule not initialized');
+      throw new SphereError('PaymentsModule not initialized', 'NOT_INITIALIZED');
     }
   }
 }

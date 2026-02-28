@@ -6,6 +6,7 @@
  */
 
 import CryptoJS from 'crypto-js';
+import { SphereError } from '../core/errors';
 import type { LegacyFileParseResult, LegacyFileParsedData, DecryptionProgressCallback } from './types';
 import { findPattern, base58Decode, isValidPrivateKey } from '../core/utils';
 import { bytesToHex } from '../core/crypto';
@@ -325,7 +326,7 @@ export async function decryptCMasterKey(
   const result = CryptoJS.enc.Hex.stringify(decrypted);
 
   if (!result || result.length !== 64) {
-    throw new Error('Master key decryption failed - incorrect password');
+    throw new SphereError('Master key decryption failed - incorrect password', 'DECRYPTION_ERROR');
   }
 
   return result;

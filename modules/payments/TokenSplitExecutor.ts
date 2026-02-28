@@ -11,6 +11,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -126,7 +127,7 @@ export class TokenSplitExecutor {
 
     const burnResponse = await this.client.submitTransferCommitment(burnCommitment);
     if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
-      throw new Error(`Burn failed: ${burnResponse.status}`);
+      throw new SphereError(`Burn failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
     }
 
     const burnInclusionProof = await waitInclusionProof(this.trustBase, this.client, burnCommitment);
@@ -142,7 +143,7 @@ export class TokenSplitExecutor {
     for (const commitment of mintCommitments) {
       const res = await this.client.submitMintCommitment(commitment);
       if (res.status !== 'SUCCESS' && res.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Mint split token failed: ${res.status}`);
+        throw new SphereError(`Mint split token failed: ${res.status}`, 'TRANSFER_FAILED');
       }
 
       const proof = await waitInclusionProof(this.trustBase, this.client, commitment);
@@ -168,7 +169,7 @@ export class TokenSplitExecutor {
       const state = new TokenState(predicate, null);
       const token = await Token.mint(this.trustBase, state, info.commitment.toTransaction(info.inclusionProof));
       const verification = await token.verify(this.trustBase);
-      if (!verification.isSuccessful) throw new Error(`Token verification failed: ${label}`);
+      if (!verification.isSuccessful) throw new SphereError(`Token verification failed: ${label}`, 'TRANSFER_FAILED');
       return token;
     };
 
@@ -190,7 +191,7 @@ export class TokenSplitExecutor {
 
     const transferRes = await this.client.submitTransferCommitment(transferCommitment);
     if (transferRes.status !== 'SUCCESS' && transferRes.status !== 'REQUEST_ID_EXISTS') {
-      throw new Error(`Transfer failed: ${transferRes.status}`);
+      throw new SphereError(`Transfer failed: ${transferRes.status}`, 'TRANSFER_FAILED');
     }
 
     const transferProof = await waitInclusionProof(this.trustBase, this.client, transferCommitment);

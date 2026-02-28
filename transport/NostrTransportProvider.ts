@@ -320,7 +320,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Need at least one successful connection
       if (!this.nostrClient.isConnected()) {
-        throw new Error('Failed to connect to any relay');
+        throw new SphereError('Failed to connect to any relay', 'TRANSPORT_ERROR');
       }
 
       this.status = 'connected';
@@ -540,7 +540,7 @@ export class NostrTransportProvider implements TransportProvider {
    */
   getNostrPubkey(): string {
     if (!this.keyManager) {
-      throw new Error('KeyManager not initialized - call setIdentity first');
+      throw new SphereError('KeyManager not initialized - call setIdentity first', 'NOT_INITIALIZED');
     }
     return this.keyManager.getPublicKeyHex();
   }
@@ -746,7 +746,7 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   async sendReadReceipt(recipientTransportPubkey: string, messageEventId: string): Promise<void> {
-    if (!this.keyManager) throw new Error('Not initialized');
+    if (!this.keyManager) throw new SphereError('Not initialized', 'NOT_INITIALIZED');
 
     // NIP-17 uses x-only pubkeys (64 hex chars, no 02/03 prefix)
     const nostrRecipient = recipientTransportPubkey.length === 66
@@ -768,7 +768,7 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   async sendTypingIndicator(recipientTransportPubkey: string): Promise<void> {
-    if (!this.keyManager) throw new Error('Not initialized');
+    if (!this.keyManager) throw new SphereError('Not initialized', 'NOT_INITIALIZED');
 
     const nostrRecipient = recipientTransportPubkey.length === 66
       ? recipientTransportPubkey.slice(2)
@@ -1125,7 +1125,7 @@ export class NostrTransportProvider implements TransportProvider {
     this.ensureReady();
 
     if (!this.identity || !this.keyManager) {
-      throw new Error('Identity not set');
+      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
     }
 
     const nostrPubkey = this.getNostrPubkey();
@@ -1189,7 +1189,7 @@ export class NostrTransportProvider implements TransportProvider {
     this.ensureReady();
 
     if (!this.identity) {
-      throw new Error('Identity not set');
+      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
     }
 
     const nostrPubkey = this.getNostrPubkey();
@@ -1272,7 +1272,7 @@ export class NostrTransportProvider implements TransportProvider {
     this.ensureReady();
 
     if (!this.identity) {
-      throw new Error('Identity not set');
+      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
     }
 
     // Always use 32-byte Nostr-format pubkey from keyManager (not the 33-byte compressed key)
@@ -1763,8 +1763,8 @@ export class NostrTransportProvider implements TransportProvider {
     content: string,
     tags: string[][]
   ): Promise<NostrEvent> {
-    if (!this.identity) throw new Error('Identity not set');
-    if (!this.keyManager) throw new Error('KeyManager not initialized');
+    if (!this.identity) throw new SphereError('Identity not set', 'NOT_INITIALIZED');
+    if (!this.keyManager) throw new SphereError('KeyManager not initialized', 'NOT_INITIALIZED');
 
     // Create and sign event using SDK
     const signedEvent = NostrEventClass.create(this.keyManager, {
@@ -1792,12 +1792,12 @@ export class NostrTransportProvider implements TransportProvider {
     content: string,
     tags: string[][]
   ): Promise<NostrEvent> {
-    if (!this.keyManager) throw new Error('KeyManager not initialized');
+    if (!this.keyManager) throw new SphereError('KeyManager not initialized', 'NOT_INITIALIZED');
 
     // Extract recipient pubkey from tags (first 'p' tag)
     const recipientTag = tags.find((t) => t[0] === 'p');
     if (!recipientTag || !recipientTag[1]) {
-      throw new Error('No recipient pubkey in tags for encryption');
+      throw new SphereError('No recipient pubkey in tags for encryption', 'VALIDATION_ERROR');
     }
     const recipientPubkey = recipientTag[1];
 
@@ -1813,7 +1813,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   private async publishEvent(event: NostrEvent): Promise<void> {
     if (!this.nostrClient) {
-      throw new Error('NostrClient not initialized');
+      throw new SphereError('NostrClient not initialized', 'NOT_INITIALIZED');
     }
 
     // Convert to nostr-js-sdk Event and publish
@@ -1823,7 +1823,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   async fetchPendingEvents(): Promise<void> {
     if (!this.nostrClient?.isConnected() || !this.keyManager) {
-      throw new Error('Transport not connected');
+      throw new SphereError('Transport not connected', 'TRANSPORT_ERROR');
     }
 
     const nostrPubkey = this.keyManager.getPublicKeyHex();
@@ -2066,7 +2066,7 @@ export class NostrTransportProvider implements TransportProvider {
   // ===========================================================================
 
   private async decryptContent(content: string, senderPubkey: string): Promise<string> {
-    if (!this.keyManager) throw new Error('KeyManager not initialized');
+    if (!this.keyManager) throw new SphereError('KeyManager not initialized', 'NOT_INITIALIZED');
 
     // Decrypt content using NIP-04 (using hex variant for string keys)
     const decrypted = await NIP04.decryptHex(
@@ -2112,7 +2112,7 @@ export class NostrTransportProvider implements TransportProvider {
   private ensureReady(): void {
     this.ensureConnected();
     if (!this.identity) {
-      throw new Error('Identity not set');
+      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
     }
   }
 

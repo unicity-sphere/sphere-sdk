@@ -4,6 +4,7 @@
  */
 
 import { logger } from '../../../core/logger';
+import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
@@ -67,7 +68,7 @@ export class LocalStorageProvider implements StorageProvider {
       this.log('Connected to localStorage');
     } catch (error) {
       this.status = 'error';
-      throw new Error(`LocalStorage not available: ${error}`);
+      throw new SphereError(`LocalStorage not available: ${error}`, 'STORAGE_ERROR');
     }
   }
 
@@ -201,7 +202,7 @@ export class LocalStorageProvider implements StorageProvider {
 
   private ensureConnected(): void {
     if (this.status !== 'connected') {
-      throw new Error('LocalStorageProvider not connected');
+      throw new SphereError('LocalStorageProvider not connected', 'STORAGE_ERROR');
     }
   }
 

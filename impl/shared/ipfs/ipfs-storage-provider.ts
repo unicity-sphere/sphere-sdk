@@ -8,6 +8,7 @@
  */
 
 import { logger } from '../../../core/logger';
+import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity } from '../../../types';
 import type {
   TokenStorageProvider,
@@ -442,7 +443,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       const result = await this._doSave(baseData);
 
       if (!result.success) {
-        throw new Error(result.error ?? 'Save failed');
+        throw new SphereError(result.error ?? 'Save failed', 'STORAGE_ERROR');
       }
 
       this.log(`Flushed successfully: CID=${result.cid}`);

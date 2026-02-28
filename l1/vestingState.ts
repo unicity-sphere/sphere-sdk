@@ -1,4 +1,5 @@
 import { logger } from '../core/logger';
+import { SphereError } from '../core/errors';
 import { vestingClassifier } from "./vesting";
 import type {
   UTXO,
@@ -26,7 +27,7 @@ class VestingStateManager {
    */
   setMode(mode: VestingMode): void {
     if (!["all", "vested", "unvested"].includes(mode)) {
-      throw new Error(`Invalid vesting mode: ${mode}`);
+      throw new SphereError(`Invalid vesting mode: ${mode}`, 'VALIDATION_ERROR');
     }
     this.currentMode = mode;
   }

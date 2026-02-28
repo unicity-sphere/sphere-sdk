@@ -3,6 +3,8 @@
  * BIP-173 implementation for address encoding
  */
 
+import { SphereError } from './errors';
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -116,12 +118,12 @@ export function encodeBech32(
   program: Uint8Array
 ): string {
   if (version < 0 || version > 16) {
-    throw new Error('Invalid witness version');
+    throw new SphereError('Invalid witness version', 'VALIDATION_ERROR');
   }
 
   const converted = convertBits(Array.from(program), 8, 5, true);
   if (!converted) {
-    throw new Error('Failed to convert bits');
+    throw new SphereError('Failed to convert bits', 'VALIDATION_ERROR');
   }
 
   const data = [version].concat(converted);

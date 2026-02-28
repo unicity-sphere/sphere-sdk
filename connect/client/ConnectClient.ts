@@ -8,6 +8,7 @@
  * Zero dependencies on the Sphere SDK core.
  */
 
+import { SphereError } from '../../core/errors';
 import type { ConnectTransport, ConnectClientConfig, ConnectResult, ConnectEventHandler } from '../types';
 import type {
   SphereConnectMessage,
@@ -137,7 +138,7 @@ export class ConnectClient {
 
   /** Send a query request and return the result */
   async query<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
-    if (!this.connected) throw new Error('Not connected');
+    if (!this.connected) throw new SphereError('Not connected', 'NOT_INITIALIZED');
 
     const id = createRequestId();
 
@@ -170,7 +171,7 @@ export class ConnectClient {
 
   /** Send an intent request. The wallet will open its UI for user confirmation. */
   async intent<T = unknown>(action: string, params: Record<string, unknown>): Promise<T> {
-    if (!this.connected) throw new Error('Not connected');
+    if (!this.connected) throw new SphereError('Not connected', 'NOT_INITIALIZED');
 
     const id = createRequestId();
 

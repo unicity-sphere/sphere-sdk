@@ -7,6 +7,7 @@
  */
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import type { SphereEventType, SphereEventHandler } from '../../types';
 import type { ConnectTransport, ConnectSession, ConnectHostConfig } from '../types';
 import type {
@@ -369,19 +370,19 @@ export class ConnectHost {
 
       case RPC_METHODS.L1_GET_BALANCE:
         if (!this.sphere.payments.l1) {
-          throw new Error('L1 module not available');
+          throw new SphereError('L1 module not available', 'MODULE_NOT_AVAILABLE');
         }
         return this.sphere.payments.l1.getBalance();
 
       case RPC_METHODS.L1_GET_HISTORY:
         if (!this.sphere.payments.l1) {
-          throw new Error('L1 module not available');
+          throw new SphereError('L1 module not available', 'MODULE_NOT_AVAILABLE');
         }
         return this.sphere.payments.l1.getHistory(params.limit as number | undefined);
 
       case RPC_METHODS.RESOLVE:
         if (!params.identifier) {
-          throw new Error('Missing required parameter: identifier');
+          throw new SphereError('Missing required parameter: identifier', 'VALIDATION_ERROR');
         }
         return this.sphere.resolve(params.identifier as string);
 
@@ -392,7 +393,7 @@ export class ConnectHost {
         return this.handleUnsubscribe(params.event as string);
 
       case RPC_METHODS.GET_CONVERSATIONS: {
-        if (!this.sphere.communications) throw new Error('Communications module not available');
+        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
         const convos = this.sphere.communications.getConversations();
         const result: Array<{
           peerPubkey: string;
@@ -440,8 +441,8 @@ export class ConnectHost {
       }
 
       case RPC_METHODS.GET_MESSAGES: {
-        if (!this.sphere.communications) throw new Error('Communications module not available');
-        if (!params.peerPubkey) throw new Error('Missing required parameter: peerPubkey');
+        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
+        if (!params.peerPubkey) throw new SphereError('Missing required parameter: peerPubkey', 'VALIDATION_ERROR');
         return this.sphere.communications.getConversationPage(
           params.peerPubkey as string,
           {
@@ -452,7 +453,7 @@ export class ConnectHost {
       }
 
       case RPC_METHODS.GET_DM_UNREAD_COUNT: {
-        if (!this.sphere.communications) throw new Error('Communications module not available');
+        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
         return {
           unreadCount: this.sphere.communications.getUnreadCount(
             params.peerPubkey as string | undefined,
@@ -461,16 +462,16 @@ export class ConnectHost {
       }
 
       case RPC_METHODS.MARK_AS_READ: {
-        if (!this.sphere.communications) throw new Error('Communications module not available');
+        if (!this.sphere.communications) throw new SphereError('Communications module not available', 'MODULE_NOT_AVAILABLE');
         if (!params.messageIds || !Array.isArray(params.messageIds)) {
-          throw new Error('Missing required parameter: messageIds (string[])');
+          throw new SphereError('Missing required parameter: messageIds (string[])', 'VALIDATION_ERROR');
         }
         await this.sphere.communications.markAsRead(params.messageIds as string[]);
         return { marked: true, count: (params.messageIds as string[]).length };
       }
 
       default:
-        throw new Error(`Unknown method: ${method}`);
+        throw new SphereError(`Unknown method: ${method}`, 'VALIDATION_ERROR');
     }
   }
 
@@ -479,7 +480,7 @@ export class ConnectHost {
   // ===========================================================================
 
   private handleSubscribe(eventName: string): { subscribed: boolean; event: string } {
-    if (!eventName) throw new Error('Missing required parameter: event');
+    if (!eventName) throw new SphereError('Missing required parameter: event', 'VALIDATION_ERROR');
 
     if (this.eventSubscriptions.has(eventName)) {
       return { subscribed: true, event: eventName };
@@ -500,7 +501,7 @@ export class ConnectHost {
   }
 
   private handleUnsubscribe(eventName: string): { unsubscribed: boolean; event: string } {
-    if (!eventName) throw new Error('Missing required parameter: event');
+    if (!eventName) throw new SphereError('Missing required parameter: event', 'VALIDATION_ERROR');
 
     const unsub = this.eventSubscriptions.get(eventName);
     if (unsub) {

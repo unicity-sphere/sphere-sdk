@@ -8,6 +8,7 @@
  * Performance: O(n) lookup is negligible for typical wallet sizes (5-100 addresses)
  */
 
+import { SphereError } from '../core/errors';
 import type { Wallet, WalletAddress } from "./types";
 
 export class WalletAddressHelper {
@@ -58,7 +59,7 @@ export class WalletAddressHelper {
    */
   static add(wallet: Wallet, newAddress: WalletAddress): Wallet {
     if (!newAddress.path) {
-      throw new Error("Cannot add address without a path");
+      throw new SphereError('Cannot add address without a path', 'INVALID_CONFIG');
     }
 
     const existing = this.findByPath(wallet, newAddress.path);
@@ -66,11 +67,12 @@ export class WalletAddressHelper {
     if (existing) {
       // Path exists - verify it's the SAME address
       if (existing.address !== newAddress.address) {
-        throw new Error(
+        throw new SphereError(
           `CRITICAL: Attempted to overwrite address for path ${newAddress.path}\n` +
             `Existing: ${existing.address}\n` +
             `New: ${newAddress.address}\n` +
-            `This indicates master key corruption or derivation logic error.`
+            `This indicates master key corruption or derivation logic error.`,
+          'INVALID_CONFIG'
         );
       }
 
@@ -140,9 +142,10 @@ export class WalletAddressHelper {
     if (paths.length !== uniquePaths.size) {
       // Find duplicates for error message
       const duplicates = paths.filter((p, i) => paths.indexOf(p) !== i);
-      throw new Error(
+      throw new SphereError(
         `CRITICAL: Wallet has duplicate paths: ${duplicates.join(", ")}\n` +
-          `This indicates data corruption. Please restore from backup.`
+          `This indicates data corruption. Please restore from backup.`,
+        'INVALID_CONFIG'
       );
     }
   }

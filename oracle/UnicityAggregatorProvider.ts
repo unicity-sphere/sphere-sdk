@@ -27,6 +27,7 @@ import type {
   TrustBaseLoader,
 } from './oracle-provider';
 import { DEFAULT_AGGREGATOR_TIMEOUT, TIMEOUTS } from '../constants';
+import { SphereError } from '../core/errors';
 
 // SDK imports - using direct imports from the SDK
 import { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
@@ -345,7 +346,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
       await new Promise((resolve) => setTimeout(resolve, pollInterval));
     }
 
-    throw new Error(`Timeout waiting for proof: ${requestId}`);
+    throw new SphereError(`Timeout waiting for proof: ${requestId}`, 'TIMEOUT');
   }
 
   async validateToken(tokenData: unknown): Promise<ValidationResult> {
@@ -423,7 +424,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
     this.ensureConnected();
 
     if (!this.trustBase) {
-      throw new Error('Trust base not initialized');
+      throw new SphereError('Trust base not initialized', 'NOT_INITIALIZED');
     }
 
     return await waitInclusionProof(
@@ -545,13 +546,13 @@ export class UnicityAggregatorProvider implements OracleProvider {
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        throw new SphereError(`HTTP ${response.status}: ${response.statusText}`, 'AGGREGATOR_ERROR');
       }
 
       const result = await response.json();
 
       if (result.error) {
-        throw new Error(result.error.message ?? 'RPC error');
+        throw new SphereError(result.error.message ?? 'RPC error', 'AGGREGATOR_ERROR');
       }
 
       return (result.result ?? {}) as T;
@@ -566,7 +567,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
 
   private ensureConnected(): void {
     if (this.status !== 'connected') {
-      throw new Error('UnicityAggregatorProvider not connected');
+      throw new SphereError('UnicityAggregatorProvider not connected', 'NOT_INITIALIZED');
     }
   }
 

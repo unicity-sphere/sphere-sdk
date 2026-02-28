@@ -1,4 +1,5 @@
 import { decodeBech32 } from "../core/bech32";
+import { SphereError } from '../core/errors';
 import CryptoJS from "crypto-js";
 
 /** Convert bytes to hex */
@@ -16,7 +17,7 @@ function bytesToHex(buf: Uint8Array) {
  */
 export function addressToScriptHash(address: string): string {
   const decoded = decodeBech32(address);
-  if (!decoded) throw new Error("Invalid bech32 address: " + address);
+  if (!decoded) throw new SphereError('Invalid bech32 address: ' + address, 'VALIDATION_ERROR');
 
   // witness program always starts with OP_0 + PUSH20 (for P2WPKH)
   const scriptHex = "0014" + bytesToHex(decoded.data);

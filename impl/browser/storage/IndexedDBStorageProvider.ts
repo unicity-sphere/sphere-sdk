@@ -4,6 +4,7 @@
  */
 
 import { logger } from '../../../core/logger';
+import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
@@ -86,7 +87,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
           continue;
         }
         this.status = 'error';
-        throw new Error(`IndexedDB not available: ${error}`);
+        throw new SphereError(`IndexedDB not available: ${error}`, 'STORAGE_ERROR');
       }
     }
   }
@@ -273,7 +274,7 @@ export class IndexedDBStorageProvider implements StorageProvider {
 
   private ensureConnected(): void {
     if (this.status !== 'connected' || !this.db) {
-      throw new Error('IndexedDBStorageProvider not connected');
+      throw new SphereError('IndexedDBStorageProvider not connected', 'STORAGE_ERROR');
     }
   }
 

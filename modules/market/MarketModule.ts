@@ -10,6 +10,8 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
+import { SphereError } from '../../core/errors';
+
 /** Default Market API URL (intent bulletin board) */
 export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';
 import type {
@@ -256,7 +258,7 @@ export class MarketModule {
 
   private ensureIdentity(): void {
     if (!this.identity) {
-      throw new Error('MarketModule not initialized — call initialize() first');
+      throw new SphereError('MarketModule not initialized — call initialize() first', 'NOT_INITIALIZED');
     }
   }
 
@@ -285,7 +287,7 @@ export class MarketModule {
     const text = await res.text();
     let data: any; // eslint-disable-line @typescript-eslint/no-explicit-any
     try { data = JSON.parse(text); } catch { /* ignore */ }
-    throw new Error(data?.error ?? `Agent registration failed: HTTP ${res.status}`);
+    throw new SphereError(data?.error ?? `Agent registration failed: HTTP ${res.status}`, 'NETWORK_ERROR');
   }
 
   private async parseResponse(res: Response): Promise<any> { // eslint-disable-line @typescript-eslint/no-explicit-any
@@ -294,9 +296,9 @@ export class MarketModule {
     try {
       data = JSON.parse(text);
     } catch {
-      throw new Error(`Market API error: HTTP ${res.status} — unexpected response (not JSON)`);
+      throw new SphereError(`Market API error: HTTP ${res.status} — unexpected response (not JSON)`, 'NETWORK_ERROR');
     }
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+    if (!res.ok) throw new SphereError(data.error ?? `HTTP ${res.status}`, 'NETWORK_ERROR');
     return data;
   }
 

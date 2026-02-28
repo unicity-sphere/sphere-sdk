@@ -9,6 +9,7 @@ import * as bip39 from 'bip39';
 import CryptoJS from 'crypto-js';
 import elliptic from 'elliptic';
 import { encodeBech32 } from './bech32';
+import { SphereError } from './errors';
 
 // =============================================================================
 // Constants
@@ -126,7 +127,7 @@ export function generateMasterKey(seedHex: string): MasterKey {
   // Validate master key
   const masterKeyBigInt = BigInt('0x' + IL);
   if (masterKeyBigInt === 0n || masterKeyBigInt >= CURVE_ORDER) {
-    throw new Error('Invalid master key generated');
+    throw new SphereError('Invalid master key generated', 'VALIDATION_ERROR');
   }
 
   return {
@@ -176,14 +177,14 @@ export function deriveChildKey(
 
   // Check IL is valid (less than curve order)
   if (ilBigInt >= CURVE_ORDER) {
-    throw new Error('Invalid key: IL >= curve order');
+    throw new SphereError('Invalid key: IL >= curve order', 'VALIDATION_ERROR');
   }
 
   const childKeyBigInt = (ilBigInt + parentKeyBigInt) % CURVE_ORDER;
 
   // Check child key is valid (not zero)
   if (childKeyBigInt === 0n) {
-    throw new Error('Invalid key: child key is zero');
+    throw new SphereError('Invalid key: child key is zero', 'VALIDATION_ERROR');
   }
 
   const childPrivKey = childKeyBigInt.toString(16).padStart(64, '0');
@@ -384,7 +385,7 @@ export async function identityFromMnemonic(
   passphrase: string = ''
 ): Promise<MasterKey> {
   if (!validateMnemonic(mnemonic)) {
-    throw new Error('Invalid mnemonic phrase');
+    throw new SphereError('Invalid mnemonic phrase', 'INVALID_IDENTITY');
   }
   const seedHex = await mnemonicToSeed(mnemonic, passphrase);
   return generateMasterKey(seedHex);
@@ -398,7 +399,7 @@ export function identityFromMnemonicSync(
   passphrase: string = ''
 ): MasterKey {
   if (!validateMnemonic(mnemonic)) {
-    throw new Error('Invalid mnemonic phrase');
+    throw new SphereError('Invalid mnemonic phrase', 'INVALID_IDENTITY');
   }
   const seedHex = mnemonicToSeedSync(mnemonic, passphrase);
   return generateMasterKey(seedHex);

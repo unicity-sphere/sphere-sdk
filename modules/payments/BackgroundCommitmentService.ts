@@ -14,6 +14,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import type { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
 import type { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
@@ -231,7 +232,7 @@ export class BackgroundCommitmentService {
 
     const group = this.groups.get(splitGroupId);
     if (!group) {
-      throw new Error(`Unknown split group: ${splitGroupId}`);
+      throw new SphereError(`Unknown split group: ${splitGroupId}`, 'VALIDATION_ERROR');
     }
 
     if (group.status === 'COMPLETED' || group.status === 'FAILED') {
@@ -352,14 +353,14 @@ export class BackgroundCommitmentService {
   private async submitMintCommitment(commitment: MintCommitment<any>): Promise<void> {
     const response = await this.client.submitMintCommitment(commitment);
     if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
-      throw new Error(`Mint submission failed: ${response.status}`);
+      throw new SphereError(`Mint submission failed: ${response.status}`, 'TRANSFER_FAILED');
     }
   }
 
   private async submitTransferCommitment(commitment: TransferCommitment): Promise<void> {
     const response = await this.client.submitTransferCommitment(commitment);
     if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
-      throw new Error(`Transfer submission failed: ${response.status}`);
+      throw new SphereError(`Transfer submission failed: ${response.status}`, 'TRANSFER_FAILED');
     }
   }
 

@@ -13,6 +13,7 @@ import {
 } from '@unicitylabs/nostr-js-sdk';
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 
 import type {
   FullIdentity,
@@ -1775,7 +1776,7 @@ export class GroupChatModule {
 
   private ensureInitialized(): void {
     if (!this.deps) {
-      throw new Error('GroupChatModule not initialized');
+      throw new SphereError('GroupChatModule not initialized', 'NOT_INITIALIZED');
     }
   }
 

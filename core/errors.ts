@@ -37,7 +37,9 @@ export type SphereErrorCode =
   | 'AGGREGATOR_ERROR'
   | 'VALIDATION_ERROR'
   | 'NETWORK_ERROR'
-  | 'TIMEOUT';
+  | 'TIMEOUT'
+  | 'DECRYPTION_ERROR'
+  | 'MODULE_NOT_AVAILABLE';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

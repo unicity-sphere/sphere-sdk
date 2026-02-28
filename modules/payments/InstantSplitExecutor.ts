@@ -26,6 +26,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -206,7 +207,7 @@ export class InstantSplitExecutor {
 
     const burnResponse = await this.client.submitTransferCommitment(burnCommitment);
     if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
-      throw new Error(`Burn submission failed: ${burnResponse.status}`);
+      throw new SphereError(`Burn submission failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
     }
 
     // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
@@ -236,7 +237,7 @@ export class InstantSplitExecutor {
     );
 
     if (!recipientMintCommitment || !senderMintCommitment) {
-      throw new Error('Failed to find expected mint commitments');
+      throw new SphereError('Failed to find expected mint commitments', 'TRANSFER_FAILED');
     }
 
     // === STEP 4: CREATE TRANSFER COMMITMENT FROM MINT DATA ===
@@ -529,7 +530,7 @@ export class InstantSplitExecutor {
           if (!this.devMode) {
             const verification = await changeToken.verify(this.trustBase);
             if (!verification.isSuccessful) {
-              throw new Error(`Change token verification failed`);
+              throw new SphereError('Change token verification failed', 'TRANSFER_FAILED');
             }
           }
 

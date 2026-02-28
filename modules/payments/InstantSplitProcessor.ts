@@ -16,6 +16,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
@@ -151,7 +152,7 @@ export class InstantSplitProcessor {
 
       const mintResponse = await this.client.submitMintCommitment(mintCommitment);
       if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Mint submission failed: ${mintResponse.status}`);
+        throw new SphereError(`Mint submission failed: ${mintResponse.status}`, 'TRANSFER_FAILED');
       }
       logger.debug('InstantSplit', `Mint submitted: ${mintResponse.status}`);
 
@@ -182,7 +183,7 @@ export class InstantSplitProcessor {
 
       const transferResponse = await this.client.submitTransferCommitment(transferCommitment);
       if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Transfer submission failed: ${transferResponse.status}`);
+        throw new SphereError(`Transfer submission failed: ${transferResponse.status}`, 'TRANSFER_FAILED');
       }
       logger.debug('InstantSplit', `Transfer submitted: ${transferResponse.status}`);
 
@@ -242,9 +243,10 @@ export class InstantSplitProcessor {
 
         // CRITICAL: For PROXY addresses, we MUST have a nametag token
         if (nametagTokens.length === 0 && !this.devMode) {
-          throw new Error(
+          throw new SphereError(
             `PROXY address transfer requires nametag token for verification. ` +
-              `Address: ${recipientAddressStr}`
+              `Address: ${recipientAddressStr}`,
+            'TRANSFER_FAILED'
           );
         }
       }
@@ -275,7 +277,7 @@ export class InstantSplitProcessor {
       if (!this.devMode) {
         const verification = await finalToken.verify(this.trustBase);
         if (!verification.isSuccessful) {
-          throw new Error(`Token verification failed`);
+          throw new SphereError(`Token verification failed`, 'TRANSFER_FAILED');
         }
         logger.debug('InstantSplit', 'Token verified');
       }
@@ -335,7 +337,7 @@ export class InstantSplitProcessor {
 
       const burnResponse = await this.client.submitTransferCommitment(burnCommitment);
       if (burnResponse.status !== 'SUCCESS' && burnResponse.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Burn submission failed: ${burnResponse.status}`);
+        throw new SphereError(`Burn submission failed: ${burnResponse.status}`, 'TRANSFER_FAILED');
       }
 
       await this.waitInclusionProofWithDevBypass(burnCommitment, options?.proofTimeoutMs);
@@ -349,7 +351,7 @@ export class InstantSplitProcessor {
 
       const mintResponse = await this.client.submitMintCommitment(mintCommitment);
       if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Mint submission failed: ${mintResponse.status}`);
+        throw new SphereError(`Mint submission failed: ${mintResponse.status}`, 'TRANSFER_FAILED');
       }
 
       const mintProof = await this.waitInclusionProofWithDevBypass(
@@ -388,7 +390,7 @@ export class InstantSplitProcessor {
 
       const transferResponse = await this.client.submitTransferCommitment(transferCommitment);
       if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
-        throw new Error(`Transfer submission failed: ${transferResponse.status}`);
+        throw new SphereError(`Transfer submission failed: ${transferResponse.status}`, 'TRANSFER_FAILED');
       }
 
       const transferProof = await this.waitInclusionProofWithDevBypass(
