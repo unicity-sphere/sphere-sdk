@@ -12,6 +12,7 @@ import type { ConnectTransport, SphereConnectMessage } from '../../../connect';
 import { isSphereConnectMessage } from '../../../connect';
 import type { IWebSocket, WebSocketFactory } from '../../../transport/websocket';
 import { WebSocketReadyState } from '../../../transport/websocket';
+import { logger } from '../../../core/logger';
 
 // =============================================================================
 // Configuration
@@ -80,13 +81,13 @@ export class WebSocketServerTransport implements ConnectTransport {
             for (const handler of this.handlers) {
               try {
                 handler(msg);
-              } catch {
-                // Ignore handler errors
+              } catch (err) {
+                logger.debug('WebSocket', 'Message handler error', err);
               }
             }
           }
-        } catch {
-          // Ignore malformed messages
+        } catch (err) {
+          logger.debug('WebSocket', 'Malformed message received', err);
         }
       };
 
@@ -208,13 +209,13 @@ export class WebSocketClientTransport implements ConnectTransport {
             for (const handler of this.handlers) {
               try {
                 handler(msg);
-              } catch {
-                // Ignore handler errors
+              } catch (err) {
+                logger.debug('WebSocket', 'Message handler error', err);
               }
             }
           }
-        } catch {
-          // Ignore malformed messages
+        } catch (err) {
+          logger.debug('WebSocket', 'Malformed message received', err);
         }
       };
 
@@ -244,9 +245,7 @@ export class WebSocketClientTransport implements ConnectTransport {
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      this.doConnect().catch(() => {
-        // Reconnect failed, will retry via onclose
-      });
+      this.doConnect().catch((err) => logger.debug('WebSocket', 'Reconnect attempt failed', err));
     }, delay);
   }
 }

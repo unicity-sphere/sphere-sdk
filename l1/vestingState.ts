@@ -1,3 +1,5 @@
+import { logger } from '../core/logger';
+import { SphereError } from '../core/errors';
 import { vestingClassifier } from "./vesting";
 import type {
   UTXO,
@@ -25,7 +27,7 @@ class VestingStateManager {
    */
   setMode(mode: VestingMode): void {
     if (!["all", "vested", "unvested"].includes(mode)) {
-      throw new Error(`Invalid vesting mode: ${mode}`);
+      throw new SphereError(`Invalid vesting mode: ${mode}`, 'VALIDATION_ERROR');
     }
     this.currentMode = mode;
   }
@@ -77,10 +79,10 @@ class VestingStateManager {
 
       // Log any errors
       if (result.errors.length > 0) {
-        console.warn(`Vesting classification errors: ${result.errors.length}`);
+        logger.warn('L1', `Vesting classification errors: ${result.errors.length}`);
         result.errors.slice(0, 5).forEach((err) => {
           const txHash = err.utxo.tx_hash || err.utxo.txid;
-          console.warn(`  ${txHash}: ${err.error}`);
+          logger.warn('L1', `  ${txHash}: ${err.error}`);
         });
       }
     } finally {

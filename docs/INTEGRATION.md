@@ -1066,6 +1066,11 @@ const { sphere } = await Sphere.init({
 ```typescript
 const exists = await Sphere.exists(storage);
 console.log('Wallet exists:', exists);  // Should be true after first run
+
+// Enable storage debug logs
+logger.setTagDebug('LocalStorage', true);
+logger.setTagDebug('IndexedDB', true);
+logger.setTagDebug('IPFS-Storage', true);
 ```
 
 ### Nametag Sync on Load
@@ -1152,6 +1157,52 @@ sphere.on('transfer:confirmed', (transfer) => {
 sphere.on('transfer:failed', (transfer) => {
   console.error('Transfer failed:', transfer.id, transfer.error);
 });
+```
+
+### Typed Error Handling
+
+All SDK methods throw `SphereError` with a typed `.code` field. Use `isSphereError()` type guard to handle errors programmatically:
+
+```typescript
+import { isSphereError } from '@unicitylabs/sphere-sdk';
+
+try {
+  await sphere.payments.send({ coinId, amount, recipient });
+} catch (err) {
+  if (isSphereError(err)) {
+    // err.code is typed as SphereErrorCode
+    switch (err.code) {
+      case 'INSUFFICIENT_BALANCE':
+        showError('Not enough funds');
+        break;
+      case 'INVALID_RECIPIENT':
+        showError('Recipient not found');
+        break;
+      case 'TRANSPORT_ERROR':
+        showError('Network issue');
+        break;
+      case 'AGGREGATOR_ERROR':
+        showError('Oracle unavailable');
+        break;
+      default:
+        showError(err.message);
+    }
+  }
+}
+```
+
+### Debug Logging
+
+Enable the centralized logger to diagnose issues:
+
+```typescript
+import { logger } from '@unicitylabs/sphere-sdk';
+
+logger.configure({ debug: true });
+
+// Or enable specific modules:
+logger.setTagDebug('Payments', true);
+logger.setTagDebug('Nostr', true);
 ```
 
 ---

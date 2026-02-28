@@ -13,6 +13,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { logger } from '../../core/logger';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -149,7 +150,7 @@ export class TokenRecoveryService {
       }
 
       try {
-        console.log(`[Recovery] Processing orphaned split ${entry.splitGroupId}`);
+        logger.debug('Recovery', `Processing orphaned split ${entry.splitGroupId}`);
 
         // Reconstruct the sender's mint commitment from metadata
         const senderTokenId = new TokenId(fromHex(metadata.senderTokenIdHex));
@@ -169,7 +170,7 @@ export class TokenRecoveryService {
           await onTokenRecovered?.(changeToken, entry.splitGroupId);
           result.changeTokensRecovered++;
           result.splitsRecovered++;
-          console.log(`[Recovery] Recovered change token for split ${entry.splitGroupId}`);
+          logger.debug('Recovery', `Recovered change token for split ${entry.splitGroupId}`);
         }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -178,12 +179,12 @@ export class TokenRecoveryService {
           error: errorMessage,
           timestamp: Date.now(),
         });
-        console.error(`[Recovery] Failed to recover split ${entry.splitGroupId}:`, error);
+        logger.error('Recovery', `Failed to recover split ${entry.splitGroupId}:`, error);
       }
     }
 
     result.durationMs = performance.now() - startTime;
-    console.log(`[Recovery] Completed in ${result.durationMs.toFixed(0)}ms: ${result.changeTokensRecovered} tokens recovered`);
+    logger.debug('Recovery', `Completed in ${result.durationMs.toFixed(0)}ms: ${result.changeTokensRecovered} tokens recovered`);
 
     return result;
   }
@@ -217,7 +218,7 @@ export class TokenRecoveryService {
       }
 
       if (!tokenType) {
-        console.log('[Recovery] Cannot recover: no token type available');
+        logger.debug('Recovery', 'Cannot recover: no token type available');
         return null;
       }
 
@@ -238,10 +239,10 @@ export class TokenRecoveryService {
 
       // This is a simplified recovery - in production, you'd need to store
       // the full MintCommitment JSON in the outbox for complete recovery
-      console.log('[Recovery] Would attempt to recover change token - mint proof lookup not implemented');
+      logger.debug('Recovery', 'Would attempt to recover change token - mint proof lookup not implemented');
       return null;
     } catch (error) {
-      console.warn('[Recovery] Failed to recover change token:', error);
+      logger.warn('Recovery', 'Failed to recover change token:', error);
       return null;
     }
   }
@@ -270,7 +271,7 @@ export class TokenRecoveryService {
 
     // Note: Full implementation would query Nostr for sent events
     // and cross-reference with local storage to find missing tokens
-    console.log('[Recovery] Sent token recovery not fully implemented');
+    logger.debug('Recovery', 'Sent token recovery not fully implemented');
 
     result.durationMs = performance.now() - startTime;
     return result;
@@ -310,7 +311,7 @@ export class TokenRecoveryService {
     };
 
     try {
-      console.log(`[Recovery] Attempting burn failure recovery for ${splitGroupId}`);
+      logger.debug('Recovery', `Attempting burn failure recovery for ${splitGroupId}`);
 
       // Regenerate the token IDs and salts
       const _recipientTokenId = new TokenId(await sha256(seedString));
@@ -325,8 +326,8 @@ export class TokenRecoveryService {
       // 4. Waiting for proofs and creating the tokens
 
       // This is a complex operation that depends on the specific failure mode
-      console.log('[Recovery] Burn failure recovery not fully implemented');
-      console.log(`[Recovery] Would recover: ${toHex(senderTokenId.bytes).slice(0, 16)}... (change)`);
+      logger.debug('Recovery', 'Burn failure recovery not fully implemented');
+      logger.debug('Recovery', `Would recover: ${toHex(senderTokenId.bytes).slice(0, 16)}... (change)`);
 
       result.errors.push({
         splitGroupId,

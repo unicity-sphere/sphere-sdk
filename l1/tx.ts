@@ -1,6 +1,8 @@
 /**
  * Transaction handling - Strict copy of index.html logic
  */
+import { logger } from '../core/logger';
+import { SphereError } from '../core/errors';
 import { getUtxo, broadcast } from "./network";
 import { decodeBech32 } from "../core/bech32";
 import CryptoJS from "crypto-js";
@@ -22,12 +24,12 @@ const SAT = 100_000_000; // sats in 1 ALPHA
  */
 export function createScriptPubKey(address: string): string {
   if (!address || typeof address !== "string") {
-    throw new Error("Invalid address: must be a string");
+    throw new SphereError('Invalid address: must be a string', 'VALIDATION_ERROR');
   }
 
   const decoded = decodeBech32(address);
   if (!decoded) {
-    throw new Error("Invalid bech32 address: " + address);
+    throw new SphereError('Invalid bech32 address: ' + address, 'VALIDATION_ERROR');
   }
 
   // Convert data array to hex string
@@ -281,7 +283,7 @@ export function createAndSignTransaction(
   }
 
   if (!privateKeyHex) {
-    throw new Error("No private key available for address: " + fromAddress);
+    throw new SphereError('No private key available for address: ' + fromAddress, 'INVALID_CONFIG');
   }
 
   const keyPair = ec.keyFromPrivate(privateKeyHex, "hex");
@@ -434,7 +436,7 @@ export async function createTransactionPlan(
   fromAddress?: string
 ): Promise<TransactionPlan> {
   if (!decodeBech32(toAddress)) {
-    throw new Error("Invalid recipient address");
+    throw new SphereError('Invalid recipient address', 'INVALID_RECIPIENT');
   }
 
   // Use specified fromAddress or default to first external address
@@ -449,16 +451,16 @@ export async function createTransactionPlan(
   if (vestingState.hasClassifiedData(senderAddress)) {
     // Use vesting-filtered UTXOs based on selected mode
     utxos = vestingState.getFilteredUtxos(senderAddress);
-    console.log(`Using ${utxos.length} ${currentMode} UTXOs`);
+    logger.debug('L1', `Using ${utxos.length} ${currentMode} UTXOs`);
   } else {
     // Fall back to all UTXOs if not yet classified
     utxos = await getUtxo(senderAddress);
-    console.log(`Using ${utxos.length} UTXOs (vesting not classified yet)`);
+    logger.debug('L1', `Using ${utxos.length} UTXOs (vesting not classified yet)`);
   }
 
   if (!Array.isArray(utxos) || utxos.length === 0) {
     const modeText = currentMode !== 'all' ? ` (${currentMode} coins)` : '';
-    throw new Error(`No UTXOs available${modeText} for address: ` + senderAddress);
+    throw new SphereError(`No UTXOs available${modeText} for address: ` + senderAddress, 'INSUFFICIENT_BALANCE');
   }
 
   return collectUtxosForAmount(utxos, amountSats, toAddress, senderAddress);
@@ -480,7 +482,7 @@ export async function sendAlpha(
   const plan = await createTransactionPlan(wallet, toAddress, amountAlpha, fromAddress);
 
   if (!plan.success) {
-    throw new Error(plan.error || "Transaction planning failed");
+    throw new SphereError(plan.error || 'Transaction planning failed', 'TRANSFER_FAILED');
   }
 
   const results = [];

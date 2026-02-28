@@ -1,5 +1,6 @@
 // L1 Network - Fulcrum WebSocket client
 
+import { logger } from '../core/logger';
 import { addressToScriptHash } from './addressToScriptHash';
 import type { UTXO } from './types';
 import { DEFAULT_ELECTRUM_URL } from '../constants';
@@ -111,7 +112,7 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
     try {
       ws = new WebSocket(endpoint);
     } catch (err) {
-      console.error('[L1] WebSocket constructor threw exception:', err);
+      logger.error('L1', 'WebSocket constructor threw exception:', err);
       isConnecting = false;
       reject(err);
       return;
@@ -159,7 +160,7 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
 
       // Check if we've exceeded max reconnect attempts
       if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-        console.error('[L1] Max reconnect attempts reached. Giving up.');
+        logger.error('L1', 'Max reconnect attempts reached. Giving up.');
         isConnecting = false;
 
         // Reject all waiting callbacks
@@ -182,8 +183,8 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
       const delay = Math.min(BASE_DELAY * Math.pow(2, reconnectAttempts), MAX_DELAY);
 
       reconnectAttempts++;
-      console.warn(
-        `[L1] WebSocket closed unexpectedly. Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
+      logger.warn('L1',
+        `WebSocket closed unexpectedly. Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`
       );
 
       // Keep isConnecting true so callers know reconnection is in progress
@@ -206,7 +207,7 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
     };
 
     ws.onerror = (err: Event) => {
-      console.error('[L1] WebSocket error:', err);
+      logger.error('L1', 'WebSocket error:', err);
       // Note: Browser WebSocket errors don't provide detailed error info for security reasons
       // The actual connection error details are only visible in browser DevTools Network tab
       // Error alone doesn't mean connection failed - onclose will be called
@@ -291,7 +292,7 @@ export async function getUtxo(address: string) {
   const result = await rpc('blockchain.scripthash.listunspent', [scripthash]);
 
   if (!Array.isArray(result)) {
-    console.warn('listunspent returned non-array:', result);
+    logger.warn('L1', 'listunspent returned non-array:', result);
     return [];
   }
 
@@ -399,7 +400,7 @@ export async function getTransactionHistory(address: string): Promise<Transactio
   const result = await rpc('blockchain.scripthash.get_history', [scriptHash]);
 
   if (!Array.isArray(result)) {
-    console.warn('get_history returned non-array:', result);
+    logger.warn('L1', 'get_history returned non-array:', result);
     return [];
   }
 
@@ -419,7 +420,7 @@ export async function getCurrentBlockHeight(): Promise<number> {
     const header = (await rpc('blockchain.headers.subscribe', [])) as BlockHeader;
     return header?.height || 0;
   } catch (err) {
-    console.error('Error getting current block height:', err);
+    logger.error('L1', 'Error getting current block height:', err);
     return 0;
   }
 }

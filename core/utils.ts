@@ -3,6 +3,8 @@
  * Pure utility functions for the wallet SDK
  */
 
+import { SphereError } from './errors';
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -90,7 +92,7 @@ export function base58Decode(str: string): Uint8Array {
   for (let i = 0; i < str.length; i++) {
     const char = str[i];
     if (!(char in ALPHABET_MAP)) {
-      throw new Error('Invalid base58 character: ' + char);
+      throw new SphereError('Invalid base58 character: ' + char, 'VALIDATION_ERROR');
     }
     num = num * BigInt(58) + BigInt(ALPHABET_MAP[char]);
   }

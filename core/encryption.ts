@@ -6,6 +6,8 @@
  */
 
 import CryptoJS from 'crypto-js';
+import { SphereError } from './errors';
+import { logger } from './logger';
 
 // =============================================================================
 // Types
@@ -144,7 +146,7 @@ export function decrypt(encryptedData: EncryptedData, password: string): string 
   const result = decrypted.toString(CryptoJS.enc.Utf8);
 
   if (!result) {
-    throw new Error('Decryption failed: invalid password or corrupted data');
+    throw new SphereError('Decryption failed: invalid password or corrupted data', 'DECRYPTION_ERROR');
   }
 
   return result;
@@ -160,7 +162,7 @@ export function decryptJson<T = unknown>(encryptedData: EncryptedData, password:
   try {
     return JSON.parse(decrypted) as T;
   } catch {
-    throw new Error('Decryption failed: invalid JSON data');
+    throw new SphereError('Decryption failed: invalid JSON data', 'DECRYPTION_ERROR');
   }
 }
 
@@ -188,7 +190,7 @@ export function decryptSimple(ciphertext: string, password: string): string {
   const result = decrypted.toString(CryptoJS.enc.Utf8);
 
   if (!result) {
-    throw new Error('Decryption failed: invalid password or corrupted data');
+    throw new SphereError('Decryption failed: invalid password or corrupted data', 'DECRYPTION_ERROR');
   }
 
   return result;
@@ -208,7 +210,8 @@ export function decryptWithSalt(ciphertext: string, password: string, salt: stri
     const decrypted = CryptoJS.AES.decrypt(ciphertext, key);
     const result = decrypted.toString(CryptoJS.enc.Utf8);
     return result || null;
-  } catch {
+  } catch (err) {
+    logger.debug('Encryption', 'decryptWithSalt failed', err);
     return null;
   }
 }
@@ -271,7 +274,7 @@ export function serializeEncrypted(data: EncryptedData): string {
 export function deserializeEncrypted(serialized: string): EncryptedData {
   const parsed = JSON.parse(serialized);
   if (!isEncryptedData(parsed)) {
-    throw new Error('Invalid encrypted data format');
+    throw new SphereError('Invalid encrypted data format', 'VALIDATION_ERROR');
   }
   return parsed;
 }

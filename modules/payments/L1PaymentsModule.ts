@@ -10,6 +10,7 @@
  */
 
 import type { FullIdentity } from '../../types';
+import { SphereError } from '../../core/errors';
 import type { TransportProvider } from '../../transport';
 import { DEFAULT_ELECTRUM_URL } from '../../constants';
 import {
@@ -183,7 +184,7 @@ export class L1PaymentsModule {
    */
   private async ensureConnected(): Promise<void> {
     if (this._disabled) {
-      throw new Error('L1 provider is disabled');
+      throw new SphereError('L1 provider is disabled', 'NOT_INITIALIZED');
     }
     if (!isWebSocketConnected() && this._config.electrumUrl) {
       await l1Connect(this._config.electrumUrl);
@@ -249,9 +250,10 @@ export class L1PaymentsModule {
       const l1Address = await this.resolveNametagToL1Address(recipient);
       return l1Address;
     } catch {
-      throw new Error(
+      throw new SphereError(
         `Recipient "${recipient}" is not a valid nametag or L1 address. ` +
-        `Use @nametag for explicit nametag or a valid alpha1... address.`
+        `Use @nametag for explicit nametag or a valid alpha1... address.`,
+        'INVALID_RECIPIENT'
       );
     }
   }
@@ -261,18 +263,19 @@ export class L1PaymentsModule {
    */
   private async resolveNametagToL1Address(nametag: string): Promise<string> {
     if (!this._transport?.resolve) {
-      throw new Error('Transport provider does not support resolution');
+      throw new SphereError('Transport provider does not support resolution', 'TRANSPORT_ERROR');
     }
 
     const info = await this._transport.resolve(nametag);
     if (!info) {
-      throw new Error(`Nametag not found: ${nametag}`);
+      throw new SphereError(`Nametag not found: ${nametag}`, 'INVALID_RECIPIENT');
     }
 
     if (!info.l1Address) {
-      throw new Error(
+      throw new SphereError(
         `Nametag @${nametag} does not have L1 address information. ` +
-        `The owner needs to update their nametag registration.`
+        `The owner needs to update their nametag registration.`,
+        'INVALID_RECIPIENT'
       );
     }
 
@@ -614,7 +617,7 @@ export class L1PaymentsModule {
 
   private ensureInitialized(): void {
     if (!this._initialized) {
-      throw new Error('L1PaymentsModule not initialized');
+      throw new SphereError('L1PaymentsModule not initialized', 'NOT_INITIALIZED');
     }
   }
 

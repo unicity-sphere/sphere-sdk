@@ -2076,3 +2076,83 @@ Sync Flow:
 ```
 
 See [IPFS Storage Guide](./IPFS-STORAGE.md) for complete documentation.
+
+---
+
+## Error Handling
+
+### SphereError
+
+All SDK methods throw `SphereError` with a typed `code` field for programmatic error handling:
+
+```typescript
+import { SphereError, isSphereError } from '@unicitylabs/sphere-sdk';
+import type { SphereErrorCode } from '@unicitylabs/sphere-sdk';
+
+try {
+  await sphere.payments.send({ ... });
+} catch (err) {
+  if (isSphereError(err)) {
+    switch (err.code) {
+      case 'INSUFFICIENT_BALANCE': showToast('Not enough funds'); break;
+      case 'INVALID_RECIPIENT': showToast('Recipient not found'); break;
+      case 'TRANSPORT_ERROR': showToast('Network connection issue'); break;
+      case 'TIMEOUT': showToast('Request timed out, try again'); break;
+      default: showToast(err.message);
+    }
+  }
+}
+```
+
+#### Error Codes
+
+| Code | Description |
+|------|-------------|
+| `NOT_INITIALIZED` | SDK or module not initialized |
+| `ALREADY_INITIALIZED` | Wallet already exists |
+| `INVALID_CONFIG` | Invalid configuration parameters |
+| `INVALID_IDENTITY` | Invalid mnemonic or key |
+| `INSUFFICIENT_BALANCE` | Not enough funds for transfer |
+| `INVALID_RECIPIENT` | Recipient nametag not found or invalid |
+| `TRANSFER_FAILED` | Token transfer/mint/burn failed |
+| `STORAGE_ERROR` | Storage read/write failed |
+| `TRANSPORT_ERROR` | Relay/network transport error |
+| `AGGREGATOR_ERROR` | Oracle/aggregator request failed |
+| `VALIDATION_ERROR` | Input validation failed |
+| `NETWORK_ERROR` | HTTP/API request failed |
+| `TIMEOUT` | Operation timed out |
+| `DECRYPTION_ERROR` | Wallet decryption failed |
+| `MODULE_NOT_AVAILABLE` | Requested module not registered |
+
+### Logger
+
+Centralized debug logging with per-module control:
+
+```typescript
+import { logger } from '@unicitylabs/sphere-sdk';
+
+// Enable all debug logging
+logger.configure({ debug: true });
+
+// Per-module control
+logger.setTagDebug('Nostr', true);     // Only transport logs
+logger.setTagDebug('Payments', true);  // Only payment logs
+logger.setTagDebug('GroupChat', true); // Only group chat logs
+
+// Check if debug enabled
+logger.isDebugEnabled();        // global
+logger.isDebugEnabled('Nostr'); // per-tag
+
+// Custom log handler
+logger.configure({
+  debug: true,
+  handler: (level, tag, message, ...args) => {
+    // Send to your logging service
+  },
+});
+```
+
+**Log levels:**
+- `debug` — detailed operational info (hidden when `debug=false`)
+- `warn` — important warnings like timeouts (always shown)
+- `error` — critical failures (always shown)

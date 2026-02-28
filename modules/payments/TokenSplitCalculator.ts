@@ -4,6 +4,7 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { logger } from '../../core/logger';
 import type { Token } from '../../types';
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { CoinId } from '@unicitylabs/state-transition-sdk/lib/token/fungible/CoinId';
@@ -67,7 +68,7 @@ export class TokenSplitCalculator {
         const realAmount = this.getTokenBalance(sdkToken, targetCoinIdHex);
 
         if (realAmount <= 0n) {
-          console.warn(`[SplitCalculator] Token ${t.id} has 0 balance for coinId ${targetCoinIdHex}`);
+          logger.warn('TokenSplit', `Token ${t.id} has 0 balance for coinId ${targetCoinIdHex}`);
           continue;
         }
 
@@ -77,7 +78,7 @@ export class TokenSplitCalculator {
           uiToken: t,
         });
       } catch (e) {
-        console.warn('[SplitCalculator] Failed to parse token', t.id, e);
+        logger.warn('TokenSplit', 'Failed to parse token', t.id, e);
       }
     }
 
@@ -87,8 +88,9 @@ export class TokenSplitCalculator {
     // Check total available
     const totalAvailable = candidates.reduce((sum, t) => sum + t.amount, 0n);
     if (totalAvailable < targetAmount) {
-      console.error(
-        `[SplitCalculator] Insufficient funds. Available: ${totalAvailable}, Required: ${targetAmount}`
+      logger.error(
+        'TokenSplit',
+        `Insufficient funds. Available: ${totalAvailable}, Required: ${targetAmount}`
       );
       return null;
     }

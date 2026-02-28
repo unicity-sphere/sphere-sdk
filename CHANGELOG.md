@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Centralized logger** — `logger` singleton with `debug`/`warn`/`error` levels, `globalThis`-based state sharing across tsup bundles, per-tag control (`logger.setTagDebug('Nostr', true)`), and custom handler support
+- **`SphereError` with typed error codes** — All SDK methods throw `SphereError` with a typed `.code` field (`SphereErrorCode`). 15 error codes: `NOT_INITIALIZED`, `ALREADY_INITIALIZED`, `INVALID_CONFIG`, `INVALID_IDENTITY`, `INSUFFICIENT_BALANCE`, `INVALID_RECIPIENT`, `TRANSFER_FAILED`, `STORAGE_ERROR`, `TRANSPORT_ERROR`, `AGGREGATOR_ERROR`, `VALIDATION_ERROR`, `NETWORK_ERROR`, `TIMEOUT`, `DECRYPTION_ERROR`, `MODULE_NOT_AVAILABLE`
+- **`isSphereError()` type guard** — Helper function for typed error handling in catch blocks
+- **Silent failure logging** — All previously silent `.catch(() => {})`, empty catch blocks, and timeout-based silent failures now log via `logger.warn` (operational issues) or `logger.debug` (expected/non-critical)
+- **20 unit tests** for logger module
 - **IPNS push-based sync via WebSocket** — `IpnsSubscriptionClient` connects to `/ws/ipns` on IPFS gateways for real-time IPNS update notifications, with exponential backoff reconnection (5s→60s capped) and 30s keepalive pings
 - **Fallback HTTP polling** — When WebSocket is unavailable, the IPFS provider automatically polls for IPNS changes at a configurable interval (default: 90s)
 - **Auto-sync on import** — `Sphere.import()` automatically syncs with all registered token storage providers after initialization to recover tokens from IPFS
@@ -26,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sync coalescing** — `PaymentsModule.sync()` now coalesces concurrent calls, preventing race conditions when multiple syncs overlap
 
 ### Changed
+- All `throw new Error()` in production code replaced with `throw new SphereError()` — zero plain errors remaining
+- All `console.log/warn/error` in production code replaced with `logger.debug/warn/error` — console output controlled by debug flag
+- `logger.warn()` and `logger.error()` are always shown regardless of debug flag; `logger.debug()` is hidden when `debug=false`
 - `PaymentsModule.updateTokenStorageProviders()` now re-subscribes to storage events when providers change
 - `PaymentsModule.destroy()` now cleans up storage event subscriptions and debounce timers
 - `IpfsStorageProvider.shutdown()` now disconnects the subscription client

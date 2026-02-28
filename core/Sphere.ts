@@ -37,6 +37,7 @@
  * ```
  */
 
+import { logger } from './logger';
 import type {
   Identity,
   FullIdentity,
@@ -54,6 +55,7 @@ import type {
   TrackedAddress,
   TrackedAddressEntry,
 } from '../types';
+import { SphereError } from './errors';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
 import type { TransportProvider, PeerInfo } from '../transport';
 import type { OracleProvider } from '../oracle';
@@ -195,6 +197,8 @@ export interface SphereCreateOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Enable debug logging (default: false) */
+  debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
 }
@@ -232,6 +236,8 @@ export interface SphereLoadOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Enable debug logging (default: false) */
+  debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
 }
@@ -277,6 +283,8 @@ export interface SphereImportOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Enable debug logging (default: false) */
+  debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
 }
@@ -338,6 +346,8 @@ export interface SphereInitOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /** Enable debug logging (default: false) */
+  debug?: boolean;
   /** Optional callback to report initialization progress steps */
   onProgress?: InitProgressCallback;
 }
@@ -529,6 +539,9 @@ export class Sphere {
    * ```
    */
   static async init(options: SphereInitOptions): Promise<SphereInitResult> {
+    // Configure debug logging (also needed in main bundle context, same as TokenRegistry)
+    if (options.debug) logger.configure({ debug: true });
+
     // Configure TokenRegistry in the main bundle context.
     // Factory functions (createBrowserProviders/createNodeProviders) are built as
     // separate bundles by tsup, so their TokenRegistry.configure() call configures
@@ -569,9 +582,9 @@ export class Sphere {
         mnemonic = Sphere.generateMnemonic();
         generatedMnemonic = mnemonic;
       } else {
-        throw new Error(
-          'No wallet exists and no mnemonic provided. ' +
-          'Provide a mnemonic or set autoGenerate: true.'
+        throw new SphereError(
+          'No wallet exists and no mnemonic provided. Provide a mnemonic or set autoGenerate: true.',
+          'INVALID_CONFIG'
         );
       }
     }
@@ -656,14 +669,16 @@ export class Sphere {
    * Create new wallet with mnemonic
    */
   static async create(options: SphereCreateOptions): Promise<Sphere> {
+    if (options.debug) logger.configure({ debug: true });
+
     // Validate mnemonic
     if (!options.mnemonic || !Sphere.validateMnemonic(options.mnemonic)) {
-      throw new Error('Invalid mnemonic');
+      throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
     }
 
     // Check if wallet already exists
     if (await Sphere.exists(options.storage)) {
-      throw new Error('Wallet already exists. Use Sphere.load() or Sphere.clear() first.');
+      throw new SphereError('Wallet already exists. Use Sphere.load() or Sphere.clear() first.', 'ALREADY_INITIALIZED');
     }
 
     const progress = options.onProgress;
@@ -742,10 +757,10 @@ export class Sphere {
             : { autoTrack: true };
         const result = await sphere.discoverAddresses(discoverOpts);
         if (result.addresses.length > 0) {
-          console.log(`[Sphere.create] Address discovery: found ${result.addresses.length} address(es)`);
+          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
         }
       } catch (err) {
-        console.warn('[Sphere.create] Address discovery failed (non-fatal):', err);
+        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
       }
     }
 
@@ -757,9 +772,11 @@ export class Sphere {
    * Load existing wallet from storage
    */
   static async load(options: SphereLoadOptions): Promise<Sphere> {
+    if (options.debug) logger.configure({ debug: true });
+
     // Check if wallet exists
     if (!(await Sphere.exists(options.storage))) {
-      throw new Error('No wallet found. Use Sphere.create() to create a new wallet.');
+      throw new SphereError('No wallet found. Use Sphere.create() to create a new wallet.', 'NOT_INITIALIZED');
     }
 
     const progress = options.onProgress;
@@ -807,16 +824,16 @@ export class Sphere {
     // This handles the case where the token was lost from IndexedDB.
     if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
       progress?.({ step: 'registering_nametag', message: 'Restoring nametag token...' });
-      console.log(`[Sphere] Nametag @${sphere._identity.nametag} has no token, attempting to mint...`);
+      logger.debug('Sphere', `Nametag @${sphere._identity.nametag} has no token, attempting to mint...`);
       try {
         const result = await sphere.mintNametag(sphere._identity.nametag);
         if (result.success) {
-          console.log(`[Sphere] Nametag token minted successfully on load`);
+          logger.debug('Sphere', `Nametag token minted successfully on load`);
         } else {
-          console.warn(`[Sphere] Could not mint nametag token: ${result.error}`);
+          logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
         }
       } catch (err) {
-        console.warn(`[Sphere] Nametag token mint failed:`, err);
+        logger.warn('Sphere', `Nametag token mint failed:`, err);
       }
     }
 
@@ -830,10 +847,10 @@ export class Sphere {
             : { autoTrack: true };
         const result = await sphere.discoverAddresses(discoverOpts);
         if (result.addresses.length > 0) {
-          console.log(`[Sphere.load] Address discovery: found ${result.addresses.length} address(es)`);
+          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
         }
       } catch (err) {
-        console.warn('[Sphere.load] Address discovery failed (non-fatal):', err);
+        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
       }
     }
 
@@ -845,13 +862,15 @@ export class Sphere {
    * Import wallet from mnemonic or master key
    */
   static async import(options: SphereImportOptions): Promise<Sphere> {
+    if (options.debug) logger.configure({ debug: true });
+
     if (!options.mnemonic && !options.masterKey) {
-      throw new Error('Either mnemonic or masterKey is required');
+      throw new SphereError('Either mnemonic or masterKey is required', 'INVALID_CONFIG');
     }
 
     const progress = options.onProgress;
 
-    console.log('[Sphere.import] Starting import...');
+    logger.debug('Sphere', 'Starting import...');
 
     // Clear existing wallet if any (including token data).
     // Skip if no active instance and wallet doesn't exist — avoids redundant
@@ -860,19 +879,19 @@ export class Sphere {
     const needsClear = Sphere.instance !== null || await Sphere.exists(options.storage);
     if (needsClear) {
       progress?.({ step: 'clearing', message: 'Clearing previous wallet data...' });
-      console.log('[Sphere.import] Clearing existing wallet data...');
+      logger.debug('Sphere', 'Clearing existing wallet data...');
       await Sphere.clear({ storage: options.storage, tokenStorage: options.tokenStorage });
-      console.log('[Sphere.import] Clear done');
+      logger.debug('Sphere', 'Clear done');
     } else {
-      console.log('[Sphere.import] No existing wallet — skipping clear');
+      logger.debug('Sphere', 'No existing wallet — skipping clear');
     }
 
     // Ensure storage is connected (clear may have called destroy() on the
     // previous instance which disconnects the shared storage provider)
     if (!options.storage.isConnected()) {
-      console.log('[Sphere.import] Reconnecting storage...');
+      logger.debug('Sphere', 'Reconnecting storage...');
       await options.storage.connect();
-      console.log('[Sphere.import] Storage reconnected');
+      logger.debug('Sphere', 'Storage reconnected');
     }
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
@@ -895,15 +914,15 @@ export class Sphere {
     if (options.mnemonic) {
       // Validate and store mnemonic
       if (!Sphere.validateMnemonic(options.mnemonic)) {
-        throw new Error('Invalid mnemonic');
+        throw new SphereError('Invalid mnemonic', 'INVALID_IDENTITY');
       }
-      console.log('[Sphere.import] Storing mnemonic...');
+      logger.debug('Sphere', 'Storing mnemonic...');
       await sphere.storeMnemonic(options.mnemonic, options.derivationPath, options.basePath);
-      console.log('[Sphere.import] Initializing identity from mnemonic...');
+      logger.debug('Sphere', 'Initializing identity from mnemonic...');
       await sphere.initializeIdentityFromMnemonic(options.mnemonic, options.derivationPath);
     } else if (options.masterKey) {
       // Store master key directly
-      console.log('[Sphere.import] Storing master key...');
+      logger.debug('Sphere', 'Storing master key...');
       await sphere.storeMasterKey(
         options.masterKey,
         options.chainCode,
@@ -911,7 +930,7 @@ export class Sphere {
         options.basePath,
         options.derivationMode
       );
-      console.log('[Sphere.import] Initializing identity from master key...');
+      logger.debug('Sphere', 'Initializing identity from master key...');
       await sphere.initializeIdentityFromMasterKey(
         options.masterKey,
         options.chainCode,
@@ -921,18 +940,18 @@ export class Sphere {
 
     // Initialize everything
     progress?.({ step: 'initializing', message: 'Initializing wallet...' });
-    console.log('[Sphere.import] Initializing providers...');
+    logger.debug('Sphere', 'Initializing providers...');
     await sphere.initializeProviders();
-    console.log('[Sphere.import] Providers initialized. Initializing modules...');
+    logger.debug('Sphere', 'Providers initialized. Initializing modules...');
     await sphere.initializeModules();
-    console.log('[Sphere.import] Modules initialized');
+    logger.debug('Sphere', 'Modules initialized');
 
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
       progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
-      console.log('[Sphere.import] Recovering nametag from transport...');
+      logger.debug('Sphere', 'Recovering nametag from transport...');
       await sphere.recoverNametagFromTransport();
-      console.log('[Sphere.import] Nametag recovery done');
+      logger.debug('Sphere', 'Nametag recovery done');
       // Publish identity binding (with recovered nametag if found)
       progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
@@ -940,20 +959,20 @@ export class Sphere {
 
     // Mark wallet as created only after successful initialization
     progress?.({ step: 'finalizing', message: 'Finalizing wallet...' });
-    console.log('[Sphere.import] Finalizing wallet creation...');
+    logger.debug('Sphere', 'Finalizing wallet creation...');
     await sphere.finalizeWalletCreation();
 
     sphere._initialized = true;
     Sphere.instance = sphere;
 
     // Track address 0 in the registry
-    console.log('[Sphere.import] Tracking address 0...');
+    logger.debug('Sphere', 'Tracking address 0...');
     await sphere.ensureAddressTracked(0);
 
     // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
       progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
-      console.log('[Sphere.import] Registering nametag...');
+      logger.debug('Sphere', 'Registering nametag...');
       await sphere.registerNametag(options.nametag);
     }
 
@@ -962,9 +981,9 @@ export class Sphere {
       progress?.({ step: 'syncing_tokens', message: 'Syncing tokens...' });
       try {
         const syncResult = await sphere._payments.sync();
-        console.log(`[Sphere.import] Auto-sync: +${syncResult.added} -${syncResult.removed}`);
+        logger.debug('Sphere', `Auto-sync: +${syncResult.added} -${syncResult.removed}`);
       } catch (err) {
-        console.warn('[Sphere.import] Auto-sync failed (non-fatal):', err);
+        logger.warn('Sphere', 'Auto-sync failed (non-fatal):', err);
       }
     }
 
@@ -978,15 +997,15 @@ export class Sphere {
             : { autoTrack: true };
         const result = await sphere.discoverAddresses(discoverOpts);
         if (result.addresses.length > 0) {
-          console.log(`[Sphere.import] Address discovery: found ${result.addresses.length} address(es)`);
+          logger.debug('Sphere', `Address discovery: found ${result.addresses.length} address(es)`);
         }
       } catch (err) {
-        console.warn('[Sphere.import] Address discovery failed (non-fatal):', err);
+        logger.warn('Sphere', 'Address discovery failed (non-fatal):', err);
       }
     }
 
     progress?.({ step: 'complete', message: 'Import complete' });
-    console.log('[Sphere.import] Import complete');
+    logger.debug('Sphere', 'Import complete');
     return sphere;
   }
 
@@ -1019,36 +1038,36 @@ export class Sphere {
     //    state), then closes all connections. Awaited so IPFS completes
     //    before we delete databases.
     if (Sphere.instance) {
-      console.log('[Sphere.clear] Destroying Sphere instance...');
+      logger.debug('Sphere', 'Destroying Sphere instance...');
       await Sphere.instance.destroy();
-      console.log('[Sphere.clear] Sphere instance destroyed');
+      logger.debug('Sphere', 'Sphere instance destroyed');
     }
 
     // 2. Clear L1 vesting cache
-    console.log('[Sphere.clear] Clearing L1 vesting cache...');
+    logger.debug('Sphere', 'Clearing L1 vesting cache...');
     await vestingClassifier.destroy();
 
     // 3. Yield to let IndexedDB finalize pending transactions after close().
     //    db.close() is synchronous but the connection isn't fully released
     //    until all in-flight transactions complete.
-    console.log('[Sphere.clear] Yielding 50ms for IDB transaction settlement...');
+    logger.debug('Sphere', 'Yielding 50ms for IDB transaction settlement...');
     await new Promise((r) => setTimeout(r, 50));
 
     // 4. Delete token databases (sphere-token-storage-*)
     if (tokenStorage?.clear) {
-      console.log('[Sphere.clear] Clearing token storage...');
+      logger.debug('Sphere', 'Clearing token storage...');
       try {
         await tokenStorage.clear();
-        console.log('[Sphere.clear] Token storage cleared');
+        logger.debug('Sphere', 'Token storage cleared');
       } catch (err) {
-        console.warn('[Sphere.clear] Token storage clear failed:', err);
+        logger.warn('Sphere', 'Token storage clear failed:', err);
       }
     } else {
-      console.log('[Sphere.clear] No token storage provider to clear');
+      logger.debug('Sphere', 'No token storage provider to clear');
     }
 
     // 5. Delete KV database (sphere-storage)
-    console.log('[Sphere.clear] Clearing KV storage...');
+    logger.debug('Sphere', 'Clearing KV storage...');
     if (!storage.isConnected()) {
       try {
         await storage.connect();
@@ -1058,11 +1077,11 @@ export class Sphere {
     }
     if (storage.isConnected()) {
       await storage.clear();
-      console.log('[Sphere.clear] KV storage cleared');
+      logger.debug('Sphere', 'KV storage cleared');
     } else {
-      console.log('[Sphere.clear] KV storage not connected, skipping');
+      logger.debug('Sphere', 'KV storage not connected, skipping');
     }
-    console.log('[Sphere.clear] Done');
+    logger.debug('Sphere', 'Done');
   }
 
   /**
@@ -1171,7 +1190,7 @@ export class Sphere {
    */
   async addTokenStorageProvider(provider: TokenStorageProvider<TxfStorageDataBase>): Promise<void> {
     if (this._tokenStorageProviders.has(provider.id)) {
-      throw new Error(`Token storage provider '${provider.id}' already exists`);
+      throw new SphereError(`Token storage provider '${provider.id}' already exists`, 'INVALID_CONFIG');
     }
 
     // Set identity if wallet is initialized
@@ -1318,7 +1337,7 @@ export class Sphere {
     this.ensureReady();
 
     if (!this._masterKey && !this._identity) {
-      throw new Error('Wallet not initialized');
+      throw new SphereError('Wallet not initialized', 'NOT_INITIALIZED');
     }
 
     // Build addresses array
@@ -1418,7 +1437,7 @@ export class Sphere {
     this.ensureReady();
 
     if (!this._masterKey && !this._identity) {
-      throw new Error('Wallet not initialized');
+      throw new SphereError('Wallet not initialized', 'NOT_INITIALIZED');
     }
 
     // Build addresses array
@@ -1992,7 +2011,7 @@ export class Sphere {
     this.ensureReady();
     const entry = this._trackedAddresses.get(index);
     if (!entry) {
-      throw new Error(`Address at index ${index} is not tracked. Switch to it first.`);
+      throw new SphereError(`Address at index ${index} is not tracked. Switch to it first.`, 'INVALID_CONFIG');
     }
     if (entry.hidden === hidden) return;
 
@@ -2026,17 +2045,17 @@ export class Sphere {
     this.ensureReady();
 
     if (!this._masterKey) {
-      throw new Error('HD derivation requires master key with chain code. Cannot switch addresses.');
+      throw new SphereError('HD derivation requires master key with chain code. Cannot switch addresses.', 'INVALID_CONFIG');
     }
 
     if (index < 0) {
-      throw new Error('Address index must be non-negative');
+      throw new SphereError('Address index must be non-negative', 'INVALID_CONFIG');
     }
 
     // If nametag requested, normalize and validate format early
     const newNametag = options?.nametag ? this.cleanNametag(options.nametag) : undefined;
     if (newNametag && !isValidNametag(newNametag)) {
-      throw new Error('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.');
+      throw new SphereError('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
     // Derive the address at the given index
@@ -2056,7 +2075,7 @@ export class Sphere {
     if (newNametag) {
       const existing = await this._transport.resolveNametag?.(newNametag);
       if (existing) {
-        throw new Error(`Nametag @${newNametag} is already taken`);
+        throw new SphereError(`Nametag @${newNametag} is already taken`, 'VALIDATION_ERROR');
       }
 
       // Pre-populate nametag cache so identity is built WITH nametag
@@ -2093,12 +2112,12 @@ export class Sphere {
 
     // Close current token storage connections, then re-open for new address.
     // Shutdown first prevents leaked IDB connections that block deleteDatabase.
-    console.log(`[Sphere] switchToAddress(${index}): re-initializing ${this._tokenStorageProviders.size} token storage provider(s)`);
+    logger.debug('Sphere', `switchToAddress(${index}): re-initializing ${this._tokenStorageProviders.size} token storage provider(s)`);
     for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
-      console.log(`[Sphere] switchToAddress(${index}): shutdown provider=${providerId}`);
+      logger.debug('Sphere', `switchToAddress(${index}): shutdown provider=${providerId}`);
       await provider.shutdown();
       provider.setIdentity(this._identity);
-      console.log(`[Sphere] switchToAddress(${index}): initialize provider=${providerId}`);
+      logger.debug('Sphere', `switchToAddress(${index}): initialize provider=${providerId}`);
       await provider.initialize();
     }
 
@@ -2113,12 +2132,12 @@ export class Sphere {
       addressIndex: index,
     });
 
-    console.log(`[Sphere] Switched to address ${index}:`, this._identity.l1Address);
+    logger.debug('Sphere', `Switched to address ${index}:`, this._identity.l1Address);
 
     // Run transport sync and nametag operations in background so address
     // switch returns quickly and L1/L3 balance queries can start immediately.
     this.postSwitchSync(index, newNametag).catch(err => {
-      console.warn(`[Sphere] Post-switch sync failed for address ${index}:`, err);
+      logger.warn('Sphere', `Post-switch sync failed for address ${index}:`, err);
     });
   }
 
@@ -2137,16 +2156,16 @@ export class Sphere {
       await this.persistAddressNametags();
 
       if (!this._payments.hasNametag()) {
-        console.log(`[Sphere] Minting nametag token for @${newNametag}...`);
+        logger.debug('Sphere', `Minting nametag token for @${newNametag}...`);
         try {
           const result = await this.mintNametag(newNametag);
           if (result.success) {
-            console.log(`[Sphere] Nametag token minted successfully`);
+            logger.debug('Sphere', `Nametag token minted successfully`);
           } else {
-            console.warn(`[Sphere] Could not mint nametag token: ${result.error}`);
+            logger.warn('Sphere', `Could not mint nametag token: ${result.error}`);
           }
         } catch (err) {
-          console.warn(`[Sphere] Nametag token mint failed:`, err);
+          logger.warn('Sphere', `Nametag token mint failed:`, err);
         }
       }
 
@@ -2156,16 +2175,16 @@ export class Sphere {
       });
     } else if (this._identity?.nametag && !this._payments.hasNametag()) {
       // Existing address with nametag but missing token — mint it
-      console.log(`[Sphere] Nametag @${this._identity.nametag} has no token after switch, minting...`);
+      logger.debug('Sphere', `Nametag @${this._identity.nametag} has no token after switch, minting...`);
       try {
         const result = await this.mintNametag(this._identity.nametag);
         if (result.success) {
-          console.log(`[Sphere] Nametag token minted successfully after switch`);
+          logger.debug('Sphere', `Nametag token minted successfully after switch`);
         } else {
-          console.warn(`[Sphere] Could not mint nametag token after switch: ${result.error}`);
+          logger.warn('Sphere', `Could not mint nametag token after switch: ${result.error}`);
         }
       } catch (err) {
-        console.warn(`[Sphere] Nametag token mint failed after switch:`, err);
+        logger.warn('Sphere', `Nametag token mint failed after switch:`, err);
       }
     }
   }
@@ -2214,7 +2233,7 @@ export class Sphere {
     // tokens that exist remotely but not locally (e.g. after address switch
     // where the local IndexedDB is empty but IPFS has the data).
     this._payments.sync().catch((err) => {
-      console.warn('[Sphere] Post-switch sync failed:', err);
+      logger.warn('Sphere', 'Post-switch sync failed:', err);
     });
   }
 
@@ -2250,7 +2269,7 @@ export class Sphere {
    */
   private _deriveAddressInternal(index: number, isChange: boolean = false): AddressInfo {
     if (!this._masterKey) {
-      throw new Error('HD derivation requires master key with chain code');
+      throw new SphereError('HD derivation requires master key with chain code', 'INVALID_CONFIG');
     }
 
     // WIF/HMAC mode: legacy HMAC-SHA512 derivation (no chain code, no change addresses)
@@ -2287,7 +2306,7 @@ export class Sphere {
     this.ensureReady();
 
     if (!this._masterKey) {
-      throw new Error('HD derivation requires master key with chain code');
+      throw new SphereError('HD derivation requires master key with chain code', 'INVALID_CONFIG');
     }
 
     // Parse path to extract index
@@ -2365,7 +2384,7 @@ export class Sphere {
     this.ensureReady();
 
     if (!this._masterKey) {
-      throw new Error('Address scanning requires HD master key');
+      throw new SphereError('Address scanning requires HD master key', 'INVALID_CONFIG');
     }
 
     // Auto-provide nametag resolver from transport if caller didn't supply one
@@ -2375,7 +2394,7 @@ export class Sphere {
             try {
               const info = await this._transport.resolveAddressInfo!(l1Address);
               return info?.nametag ?? null;
-            } catch { return null; }
+            } catch (err) { logger.debug('Sphere', 'Nametag resolution failed during scan', err); return null; }
           }
         : undefined
     );
@@ -2438,11 +2457,11 @@ export class Sphere {
     this.ensureReady();
 
     if (!this._masterKey) {
-      throw new Error('Address discovery requires HD master key');
+      throw new SphereError('Address discovery requires HD master key', 'INVALID_CONFIG');
     }
 
     if (!this._transport.discoverAddresses) {
-      throw new Error('Transport provider does not support address discovery');
+      throw new SphereError('Transport provider does not support address discovery', 'INVALID_CONFIG');
     }
 
     const includeL1Scan = options.includeL1Scan ?? true;
@@ -2508,7 +2527,7 @@ export class Sphere {
 
         transportResult.addresses.sort((a, b) => a.index - b.index);
       } catch (err) {
-        console.warn('[Sphere] L1 scan failed during discovery (non-fatal):', err);
+        logger.warn('Sphere', 'L1 scan failed during discovery (non-fatal):', err);
       }
     }
 
@@ -2628,7 +2647,7 @@ export class Sphere {
    */
   async disableProvider(providerId: string): Promise<boolean> {
     if (providerId === this._storage.id) {
-      throw new Error('Cannot disable the main storage provider');
+      throw new SphereError('Cannot disable the main storage provider', 'INVALID_CONFIG');
     }
 
     const provider = this.findProviderById(providerId);
@@ -2868,12 +2887,12 @@ export class Sphere {
     // Normalize and validate nametag format
     const cleanNametag = this.cleanNametag(nametag);
     if (!isValidNametag(cleanNametag)) {
-      throw new Error('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.');
+      throw new SphereError('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
     // Check if current address already has a nametag
     if (this._identity?.nametag) {
-      throw new Error(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`);
+      throw new SphereError(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
     // Publish identity binding with nametag (updates existing binding event)
@@ -2885,7 +2904,7 @@ export class Sphere {
         cleanNametag,
       );
       if (!success) {
-        throw new Error('Failed to register nametag. It may already be taken.');
+        throw new SphereError('Failed to register nametag. It may already be taken.', 'VALIDATION_ERROR');
       }
     }
 
@@ -2910,13 +2929,13 @@ export class Sphere {
     // Mint nametag token on-chain if not already minted
     // Required for receiving tokens via @nametag (PROXY address finalization)
     if (!this._payments.hasNametag()) {
-      console.log(`[Sphere] Minting nametag token for @${cleanNametag}...`);
+      logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
       const result = await this.mintNametag(cleanNametag);
       if (!result.success) {
-        console.warn(`[Sphere] Failed to mint nametag token: ${result.error}`);
+        logger.warn('Sphere', `Failed to mint nametag token: ${result.error}`);
         // Don't throw - nametag is published via transport, token can be minted later
       } else {
-        console.log(`[Sphere] Nametag token minted successfully`);
+        logger.debug('Sphere', `Nametag token minted successfully`);
       }
     }
 
@@ -2924,7 +2943,7 @@ export class Sphere {
       nametag: cleanNametag,
       addressIndex: this._currentAddressIndex,
     });
-    console.log(`[Sphere] Nametag registered for address ${this._currentAddressIndex}:`, cleanNametag);
+    logger.debug('Sphere', `Nametag registered for address ${this._currentAddressIndex}:`, cleanNametag);
   }
 
   /**
@@ -3213,7 +3232,7 @@ export class Sphere {
                   this._identity!.directAddress || '',
                   recoveredNametag,
                 );
-                console.log(`[Sphere] Migrated legacy binding with nametag @${recoveredNametag}`);
+                logger.debug('Sphere', `Migrated legacy binding with nametag @${recoveredNametag}`);
                 return;
               }
             }
@@ -3226,7 +3245,7 @@ export class Sphere {
               (this._identity?.nametag && !existing.nametag);
 
             if (needsUpdate) {
-              console.log('[Sphere] Existing binding incomplete, re-publishing with full data');
+              logger.debug('Sphere', 'Existing binding incomplete, re-publishing with full data');
               await this._transport.publishIdentityBinding!(
                 this._identity!.chainPubkey,
                 this._identity!.l1Address,
@@ -3236,14 +3255,14 @@ export class Sphere {
               return;
             }
 
-            console.log('[Sphere] Existing binding found, skipping re-publish');
+            logger.debug('Sphere', 'Existing binding found, skipping re-publish');
             return;
           }
         } catch (e) {
           // resolve failed — do NOT fall through to publish, as it could
           // overwrite an existing binding (with nametag) with one without.
           // Next reload will retry.
-          console.warn('[Sphere] resolve() failed, skipping publish to avoid overwrite', e);
+          logger.warn('Sphere', 'resolve() failed, skipping publish to avoid overwrite', e);
           return;
         }
       }
@@ -3257,13 +3276,13 @@ export class Sphere {
         nametag || undefined,
       );
       if (success) {
-        console.log(`[Sphere] Identity binding published${nametag ? ` with nametag @${nametag}` : ''}`);
+        logger.debug('Sphere', `Identity binding published${nametag ? ` with nametag @${nametag}` : ''}`);
       } else if (nametag) {
-        console.warn(`[Sphere] Nametag @${nametag} is taken by another pubkey`);
+        logger.warn('Sphere', `Nametag @${nametag} is taken by another pubkey`);
       }
     } catch (error) {
       // Don't fail wallet load on identity sync errors
-      console.warn(`[Sphere] Identity binding sync failed:`, error);
+      logger.warn('Sphere', `Identity binding sync failed:`, error);
     }
   }
 
@@ -3476,7 +3495,7 @@ export class Sphere {
     if (encryptedMnemonic) {
       const mnemonic = this.decrypt(encryptedMnemonic);
       if (!mnemonic) {
-        throw new Error('Failed to decrypt mnemonic');
+        throw new SphereError('Failed to decrypt mnemonic', 'STORAGE_ERROR');
       }
       this._mnemonic = mnemonic;
       this._source = 'mnemonic';
@@ -3484,7 +3503,7 @@ export class Sphere {
     } else if (encryptedMasterKey) {
       const masterKey = this.decrypt(encryptedMasterKey);
       if (!masterKey) {
-        throw new Error('Failed to decrypt master key');
+        throw new SphereError('Failed to decrypt master key', 'STORAGE_ERROR');
       }
       this._mnemonic = null;
       if (this._source === 'unknown') {
@@ -3496,7 +3515,7 @@ export class Sphere {
         derivationPath ?? undefined
       );
     } else {
-      throw new Error('No wallet data found in storage');
+      throw new SphereError('No wallet data found in storage', 'NOT_INITIALIZED');
     }
 
     // Now that identity is restored, set it on storage so subsequent reads use correct address
@@ -3528,7 +3547,7 @@ export class Sphere {
         nametag,
       };
       this._storage.setIdentity(this._identity);
-      console.log(`[Sphere] Restored to address ${this._currentAddressIndex}:`, this._identity.l1Address);
+      logger.debug('Sphere', `Restored to address ${this._currentAddressIndex}:`, this._identity.l1Address);
     } else if (this._identity && nametag) {
       // Restore nametag from cache
       this._identity.nametag = nametag;
@@ -3796,7 +3815,7 @@ export class Sphere {
 
   private ensureReady(): void {
     if (!this._initialized) {
-      throw new Error('Sphere not initialized');
+      throw new SphereError('Sphere not initialized', 'NOT_INITIALIZED');
     }
   }
 
@@ -3808,7 +3827,7 @@ export class Sphere {
       try {
         (handler as SphereEventHandler<T>)(data);
       } catch (error) {
-        console.error('[Sphere] Event handler error:', error);
+        logger.error('Sphere', 'Event handler error:', error);
       }
     }
   }

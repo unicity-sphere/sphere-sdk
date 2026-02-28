@@ -62,6 +62,8 @@ import {
   parseTxfStorageData,
 } from '../../serialization/txf-serializer';
 import { TokenRegistry } from '../../registry';
+import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -357,7 +359,7 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
       }
     }
   } catch (error) {
-    console.warn('[Payments] Failed to parse token info:', error);
+    logger.warn('Payments', 'Failed to parse token info:', error);
   }
 
   return defaultInfo;
@@ -737,12 +739,6 @@ export class PaymentsModule {
   /** Price provider (optional) */
   private priceProvider: PriceProvider | null = null;
 
-  private log(...args: unknown[]): void {
-    if (this.moduleConfig.debug) {
-      console.log('[PaymentsModule]', ...args);
-    }
-  }
-
   // ===========================================================================
   // Lifecycle
   // ===========================================================================
@@ -834,11 +830,11 @@ export class PaymentsModule {
             if (txfData._history && txfData._history.length > 0) {
               await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
             }
-            this.log(`Loaded metadata from provider ${id}`);
+            logger.debug('Payments', `Loaded metadata from provider ${id}`);
             break; // Use first successful provider
           }
         } catch (err) {
-          console.error(`[Payments] Failed to load from provider ${id}:`, err);
+          logger.error('Payments', `Failed to load from provider ${id}:`, err);
         }
       }
 
@@ -851,7 +847,7 @@ export class PaymentsModule {
             const data = JSON.parse(token.sdkData);
             if (data?._placeholder) {
               this.tokens.delete(id);
-              console.log(`[Payments] Removed stale placeholder token: ${id}`);
+              logger.debug('Payments', `Removed stale placeholder token: ${id}`);
             }
           }
         } catch {
@@ -861,7 +857,7 @@ export class PaymentsModule {
 
       // Log loaded tokens
       const loadedTokens = Array.from(this.tokens.values()).map(t => `${t.id.slice(0, 12)}(${t.status})`);
-      console.log(`[Payments][DEBUG] load(): from TXF providers: ${this.tokens.size} tokens [${loadedTokens.join(', ')}]`);
+      logger.debug('Payments', `load(): from TXF providers: ${this.tokens.size} tokens [${loadedTokens.join(', ')}]`);
 
       // Restore pending V5 tokens
       await this.loadPendingV5Tokens();
@@ -890,7 +886,7 @@ export class PaymentsModule {
 
     // After loading, try to resolve any unconfirmed tokens and start
     // periodic retries so tokens don't stay stuck as 'submitted'.
-    this.resolveUnconfirmed().catch(() => {});
+    this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
     this.scheduleResolveUnconfirmed();
   }
 
@@ -963,12 +959,12 @@ export class PaymentsModule {
       // Get state transition client and trust base
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        throw new Error('State transition client not available. Oracle provider must implement getStateTransitionClient()');
+        throw new SphereError('State transition client not available. Oracle provider must implement getStateTransitionClient()', 'AGGREGATOR_ERROR');
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
       if (!trustBase) {
-        throw new Error('Trust base not available. Oracle provider must implement getTrustBase()');
+        throw new SphereError('Trust base not available. Oracle provider must implement getTrustBase()', 'AGGREGATOR_ERROR');
       }
 
       // Calculate optimal split plan
@@ -981,7 +977,7 @@ export class PaymentsModule {
       );
 
       if (!splitPlan) {
-        throw new Error('Insufficient balance');
+        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
       }
 
       // Collect all tokens involved
@@ -1016,7 +1012,7 @@ export class PaymentsModule {
 
         // Handle split if required
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          this.log('Executing conservative split...');
+          logger.debug('Payments', 'Executing conservative split...');
           const splitExecutor = new TokenSplitExecutor({
             stateTransitionClient: stClient,
             trustBase,
@@ -1047,7 +1043,7 @@ export class PaymentsModule {
             sdkData: JSON.stringify(changeTokenData),
           };
           await this.addToken(changeUiToken);
-          this.log(`Conservative split: change token saved: ${changeUiToken.id}`);
+          logger.debug('Payments', `Conservative split: change token saved: ${changeUiToken.id}`);
 
           // Send fully finalized { sourceToken, transferTx } via Nostr
           await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
@@ -1068,7 +1064,7 @@ export class PaymentsModule {
             method: 'split',
             requestIdHex: splitRequestIdHex,
           });
-          this.log(`Conservative split transfer completed`);
+          logger.debug('Payments', 'Conservative split transfer completed');
         }
 
         // Transfer direct tokens
@@ -1076,11 +1072,11 @@ export class PaymentsModule {
           const token = tokenWithAmount.uiToken;
           const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
 
-          console.log(`[Payments] CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
+          logger.debug('Payments', `CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
 
           const submitResponse = await stClient.submitTransferCommitment(commitment);
           if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
-            throw new Error(`Transfer commitment failed: ${submitResponse.status}`);
+            throw new SphereError(`Transfer commitment failed: ${submitResponse.status}`, 'TRANSFER_FAILED');
           }
 
           const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
@@ -1091,7 +1087,7 @@ export class PaymentsModule {
             transferTx: JSON.stringify(transferTx.toJSON()),
             memo: request.memo,
           } as unknown as import('../../transport').TokenTransferPayload);
-          console.log(`[Payments] CONSERVATIVE: Direct token sent successfully`);
+          logger.debug('Payments', 'CONSERVATIVE: Direct token sent successfully');
 
           const requestIdBytes = commitment.requestId;
           const requestIdHex = requestIdBytes instanceof Uint8Array
@@ -1103,7 +1099,7 @@ export class PaymentsModule {
             method: 'direct',
             requestIdHex,
           });
-          this.log(`Token ${token.id} sent via CONSERVATIVE, requestId: ${requestIdHex}`);
+          logger.debug('Payments', `Token ${token.id} sent via CONSERVATIVE, requestId: ${requestIdHex}`);
           await this.removeToken(token.id);
         }
       } else {
@@ -1121,7 +1117,7 @@ export class PaymentsModule {
         // 1. Build split bundle (if needed) — does NOT send
         let builtSplit: import('../../types/instant-split').BuildSplitBundleResult | null = null;
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          this.log('Building instant split bundle...');
+          logger.debug('Payments', 'Building instant split bundle...');
           const executor = new InstantSplitExecutor({
             stateTransitionClient: stClient,
             trustBase,
@@ -1157,7 +1153,7 @@ export class PaymentsModule {
                   sdkData: JSON.stringify(changeTokenData),
                 };
                 await this.addToken(uiToken);
-                this.log(`Change token saved via background: ${uiToken.id}`);
+                logger.debug('Payments', `Change token saved via background: ${uiToken.id}`);
               },
               onStorageSync: async () => {
                 await this.save();
@@ -1165,7 +1161,7 @@ export class PaymentsModule {
               },
             }
           );
-          this.log(`Split bundle built: splitGroupId=${builtSplit.splitGroupId}`);
+          logger.debug('Payments', `Split bundle built: splitGroupId=${builtSplit.splitGroupId}`);
         }
 
         // 2. Prepare direct token entries in parallel — does NOT send
@@ -1199,8 +1195,9 @@ export class PaymentsModule {
         };
 
         // 4. Send ONE Nostr message
-        console.log(
-          `[Payments] Sending V6 combined bundle: transfer=${result.id.slice(0, 8)}... ` +
+        logger.debug(
+          'Payments',
+          `Sending V6 combined bundle: transfer=${result.id.slice(0, 8)}... ` +
           `split=${!!builtSplit} direct=${directTokenEntries.length}`
         );
         await this.deps!.transport.sendTokenTransfer(recipientPubkey, {
@@ -1209,7 +1206,7 @@ export class PaymentsModule {
           memo: request.memo,
           sender: { transportPubkey: senderPubkey },
         });
-        console.log(`[Payments] V6 combined bundle sent successfully`);
+        logger.debug('Payments', 'V6 combined bundle sent successfully');
 
         // 5. Start background: split mint proofs + change token creation
         if (builtSplit) {
@@ -1235,13 +1232,13 @@ export class PaymentsModule {
             sdkData: JSON.stringify({ _placeholder: true }),
           };
           this.tokens.set(placeholder.id, placeholder);
-          this.log(`Placeholder change token created: ${placeholder.id} (${placeholder.amount})`);
+          logger.debug('Payments', `Placeholder change token created: ${placeholder.id} (${placeholder.amount})`);
         }
 
         // 6. Submit direct token commitments to aggregator in background
         for (const commitment of directCommitments) {
           stClient.submitTransferCommitment(commitment).catch(err =>
-            console.error('[Payments] Background commitment submit failed:', err)
+            logger.error('Payments', 'Background commitment submit failed:', err)
           );
         }
 
@@ -1272,7 +1269,7 @@ export class PaymentsModule {
           await this.removeToken(token.id);
         }
 
-        this.log(`V6 combined transfer completed`);
+        logger.debug('Payments', 'V6 combined transfer completed');
       }
 
       result.status = 'delivered';
@@ -1392,12 +1389,12 @@ export class PaymentsModule {
       // Get state transition client and trust base
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        throw new Error('State transition client not available');
+        throw new SphereError('State transition client not available', 'AGGREGATOR_ERROR');
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
       if (!trustBase) {
-        throw new Error('Trust base not available');
+        throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
       }
 
       // Calculate optimal split plan
@@ -1410,12 +1407,12 @@ export class PaymentsModule {
       );
 
       if (!splitPlan) {
-        throw new Error('Insufficient balance');
+        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
       }
 
       if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
         // For direct transfers without split, fall back to standard flow
-        this.log('No split required, falling back to standard send()');
+        logger.debug('Payments', 'No split required, falling back to standard send()');
         const result = await this.send(request);
         return {
           success: result.status === 'completed',
@@ -1424,7 +1421,7 @@ export class PaymentsModule {
         };
       }
 
-      this.log(`InstantSplit: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
+      logger.debug('Payments', `InstantSplit: amount=${splitPlan.splitAmount}, remainder=${splitPlan.remainderAmount}`);
 
       // Mark token as transferring
       const tokenToSplit = splitPlan.tokenToSplit.uiToken;
@@ -1472,7 +1469,7 @@ export class PaymentsModule {
               sdkData: JSON.stringify(changeTokenData),
             };
             await this.addToken(uiToken);
-            this.log(`Change token saved via background: ${uiToken.id}`);
+            logger.debug('Payments', `Change token saved via background: ${uiToken.id}`);
           },
           onStorageSync: async () => {
             await this.save();
@@ -1543,7 +1540,7 @@ export class PaymentsModule {
   ): Promise<Token | null> {
     const deterministicId = `v5split_${bundle.splitGroupId}`;
     if (this.tokens.has(deterministicId) || this.processedSplitGroupIds.has(bundle.splitGroupId)) {
-      console.log(`[Payments] V5 bundle ${bundle.splitGroupId.slice(0, 12)}... already processed, skipping`);
+      logger.debug('Payments', `V5 bundle ${bundle.splitGroupId.slice(0, 12)}... already processed, skipping`);
       return null;
     }
 
@@ -1611,7 +1608,7 @@ export class PaymentsModule {
     const nostrTokenId = extractTokenIdFromSdkData(sdkData);
     const nostrStateHash = extractStateHashFromSdkData(sdkData);
     if (nostrTokenId && nostrStateHash && this.isStateTombstoned(nostrTokenId, nostrStateHash)) {
-      this.log(`NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
+      logger.debug('Payments', `NOSTR-FIRST: Rejecting tombstoned token ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`);
       return null;
     }
 
@@ -1624,8 +1621,9 @@ export class PaymentsModule {
         // Exact state match — always reject (duplicate delivery)
         const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
         if (nostrStateHash && existingStateHash === nostrStateHash) {
-          console.log(
-            `[Payments] NOSTR-FIRST: Skipping duplicate token state ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`
+          logger.debug(
+            'Payments',
+            `NOSTR-FIRST: Skipping duplicate token state ${nostrTokenId.slice(0, 8)}..._${nostrStateHash.slice(0, 8)}...`
           );
           return null;
         }
@@ -1633,8 +1631,9 @@ export class PaymentsModule {
         // Same genesis, different state — reject for standalone NOSTR-FIRST (replay after
         // finalization changes stateHash), allow for V6 batches (split children share genesis)
         if (!skipGenesisDedup) {
-          console.log(
-            `[Payments] NOSTR-FIRST: Skipping replay of finalized token ${nostrTokenId.slice(0, 8)}...`
+          logger.debug(
+            'Payments',
+            `NOSTR-FIRST: Skipping replay of finalized token ${nostrTokenId.slice(0, 8)}...`
           );
           return null;
         }
@@ -1675,7 +1674,7 @@ export class PaymentsModule {
         const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
         if (stClient) {
           const response = await stClient.submitTransferCommitment(commitment);
-          this.log(`NOSTR-FIRST recipient commitment submit: ${response.status}`);
+          logger.debug('Payments', `NOSTR-FIRST recipient commitment submit: ${response.status}`);
         }
       }
 
@@ -1691,7 +1690,7 @@ export class PaymentsModule {
         },
       });
     } catch (err) {
-      console.error('[Payments] Failed to parse commitment for proof polling:', err);
+      logger.error('Payments', 'Failed to parse commitment for proof polling:', err);
     }
 
     return token;
@@ -1723,12 +1722,13 @@ export class PaymentsModule {
 
     // Dedup by transferId
     if (this.processedCombinedTransferIds.has(bundle.transferId)) {
-      console.log(`[Payments] V6 combined transfer ${bundle.transferId.slice(0, 12)}... already processed, skipping`);
+      logger.debug('Payments', `V6 combined transfer ${bundle.transferId.slice(0, 12)}... already processed, skipping`);
       return;
     }
 
-    console.log(
-      `[Payments] Processing V6 combined transfer ${bundle.transferId.slice(0, 12)}... ` +
+    logger.debug(
+      'Payments',
+      `Processing V6 combined transfer ${bundle.transferId.slice(0, 12)}... ` +
       `(split=${!!bundle.splitBundle}, direct=${bundle.directTokens.length})`
     );
 
@@ -1748,7 +1748,7 @@ export class PaymentsModule {
         allTokens.push(splitToken);
         tokenBreakdown.push({ id: splitToken.id, amount: splitToken.amount, source: 'split' });
       } else {
-        console.warn(`[Payments] V6: split token was deduped/failed — amount=${bundle.splitBundle.amount}`);
+        logger.warn('Payments', `V6: split token was deduped/failed — amount=${bundle.splitBundle.amount}`);
       }
     }
 
@@ -1765,15 +1765,16 @@ export class PaymentsModule {
         tokenBreakdown.push({ id: token.id, amount: token.amount, source: 'direct' });
       } else {
         const entry = bundle.directTokens[i];
-        console.warn(
-          `[Payments] V6: direct token #${i} dropped (amount=${entry.amount}, ` +
+        logger.warn(
+          'Payments',
+          `V6: direct token #${i} dropped (amount=${entry.amount}, ` +
           `tokenId=${entry.tokenId?.slice(0, 12) ?? 'N/A'})`
         );
       }
     }
 
     if (allTokens.length === 0) {
-      console.log(`[Payments] V6 combined transfer: all tokens deduped, nothing to save`);
+      logger.debug('Payments', 'V6 combined transfer: all tokens deduped, nothing to save');
       return;
     }
 
@@ -1793,7 +1794,7 @@ export class PaymentsModule {
         TransferCommitment.fromJSON(commitment).then(c =>
           stClient.submitTransferCommitment(c)
         ).catch(err =>
-          console.error('[Payments] V6 background commitment submit failed:', err)
+          logger.error('Payments', 'V6 background commitment submit failed:', err)
         );
       }
     }
@@ -1828,7 +1829,7 @@ export class PaymentsModule {
 
     // 6. Fire-and-forget: try to resolve V5 tokens immediately
     if (bundle.splitBundle) {
-      this.resolveUnconfirmed().catch(() => {});
+      this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
       this.scheduleResolveUnconfirmed();
     }
   }
@@ -1928,7 +1929,7 @@ export class PaymentsModule {
       await this.save();
 
       // Fire-and-forget: try to resolve immediately, then start periodic retry
-      this.resolveUnconfirmed().catch(() => {});
+      this.resolveUnconfirmed().catch((err) => logger.debug('Payments', 'resolveUnconfirmed failed', err));
       this.scheduleResolveUnconfirmed();
 
       return { success: true, durationMs: 0 };
@@ -1956,12 +1957,12 @@ export class PaymentsModule {
 
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        throw new Error('State transition client not available');
+        throw new SphereError('State transition client not available', 'AGGREGATOR_ERROR');
       }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
       if (!trustBase) {
-        throw new Error('Trust base not available');
+        throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1988,10 +1989,10 @@ export class PaymentsModule {
                 if (proxy.address === proxyAddress) {
                   return nametagToken;
                 }
-                this.log(`Nametag PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
+                logger.debug('Payments', `Nametag PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
                 return null;
               } catch (err) {
-                this.log('Failed to parse nametag token:', err);
+                logger.debug('Payments', 'Failed to parse nametag token:', err);
                 return null;
               }
             }
@@ -2124,7 +2125,7 @@ export class PaymentsModule {
       };
       this.outgoingPaymentRequests.set(requestId, outgoingRequest);
 
-      this.log(`Payment request sent: ${eventId}`);
+      logger.debug('Payments', `Payment request sent: ${eventId}`);
 
       return {
         success: true,
@@ -2133,7 +2134,7 @@ export class PaymentsModule {
       };
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.log(`Failed to send payment request: ${errorMsg}`);
+      logger.debug('Payments', `Failed to send payment request: ${errorMsg}`);
       return {
         success: false,
         error: errorMsg,
@@ -2231,11 +2232,11 @@ export class PaymentsModule {
   async payPaymentRequest(requestId: string, memo?: string): Promise<TransferResult> {
     const request = this.paymentRequests.find((r) => r.id === requestId);
     if (!request) {
-      throw new Error(`Payment request not found: ${requestId}`);
+      throw new SphereError(`Payment request not found: ${requestId}`, 'VALIDATION_ERROR');
     }
 
     if (request.status !== 'pending' && request.status !== 'accepted') {
-      throw new Error(`Payment request is not pending or accepted: ${request.status}`);
+      throw new SphereError(`Payment request is not pending or accepted: ${request.status}`, 'VALIDATION_ERROR');
     }
 
     // Mark as accepted (don't send response yet, wait for payment)
@@ -2314,11 +2315,11 @@ export class PaymentsModule {
       try {
         handler(request);
       } catch (error) {
-        this.log('Payment request handler error:', error);
+        logger.debug('Payments', 'Payment request handler error:', error);
       }
     }
 
-    this.log(`Incoming payment request: ${request.id} for ${request.amount} ${request.symbol}`);
+    logger.debug('Payments', `Incoming payment request: ${request.id} for ${request.amount} ${request.symbol}`);
   }
 
   // ===========================================================================
@@ -2467,11 +2468,11 @@ export class PaymentsModule {
       try {
         handler(response);
       } catch (error) {
-        this.log('Payment request response handler error:', error);
+        logger.debug('Payments', 'Payment request response handler error:', error);
       }
     }
 
-    this.log(`Received payment request response: ${response.id} type: ${response.responseType}`);
+    logger.debug('Payments', `Received payment request response: ${response.id} type: ${response.responseType}`);
   }
 
   /**
@@ -2486,7 +2487,7 @@ export class PaymentsModule {
     if (!request) return;
 
     if (!this.deps?.transport.sendPaymentRequestResponse) {
-      this.log('Transport does not support sendPaymentRequestResponse');
+      logger.debug('Payments', 'Transport does not support sendPaymentRequestResponse');
       return;
     }
 
@@ -2498,9 +2499,9 @@ export class PaymentsModule {
       };
 
       await this.deps.transport.sendPaymentRequestResponse(request.senderPubkey, payload);
-      this.log(`Sent payment request response: ${responseType} for ${requestId}`);
+      logger.debug('Payments', `Sent payment request response: ${responseType} for ${requestId}`);
     } catch (error) {
-      this.log('Failed to send payment request response:', error);
+      logger.debug('Payments', 'Failed to send payment request response:', error);
     }
   }
 
@@ -2530,7 +2531,7 @@ export class PaymentsModule {
     this.ensureInitialized();
 
     if (!this.deps!.transport.fetchPendingEvents) {
-      throw new Error('Transport provider does not support fetchPendingEvents');
+      throw new SphereError('Transport provider does not support fetchPendingEvents', 'TRANSPORT_ERROR');
     }
 
     const opts = options ?? {};
@@ -2721,7 +2722,7 @@ export class PaymentsModule {
         });
       }
     } catch (error) {
-      console.warn('[Payments] Failed to fetch prices, returning assets without price data:', error);
+      logger.warn('Payments', 'Failed to fetch prices, returning assets without price data:', error);
     }
 
     return rawAssets;
@@ -2869,14 +2870,14 @@ export class PaymentsModule {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const trustBase = (this.deps!.oracle as any).getTrustBase?.() as RootTrustBase | undefined;
     if (!stClient || !trustBase) {
-      console.log(`[V5-RESOLVE] resolveUnconfirmed: EARLY EXIT — stClient=${!!stClient} trustBase=${!!trustBase}`);
+      logger.debug('Payments', `[V5-RESOLVE] resolveUnconfirmed: EARLY EXIT — stClient=${!!stClient} trustBase=${!!trustBase}`);
       return result;
     }
 
     const signingService = await this.createSigningService();
 
     const submittedCount = Array.from(this.tokens.values()).filter(t => t.status === 'submitted').length;
-    console.log(`[V5-RESOLVE] resolveUnconfirmed: ${submittedCount} submitted token(s) to process`);
+    logger.debug('Payments', `[V5-RESOLVE] resolveUnconfirmed: ${submittedCount} submitted token(s) to process`);
 
     for (const [tokenId, token] of this.tokens) {
       if (token.status !== 'submitted') continue;
@@ -2885,15 +2886,15 @@ export class PaymentsModule {
       const pending = this.parsePendingFinalization(token.sdkData);
       if (!pending) {
         // Legacy commitment-only token (existing proof polling handles these)
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, skipping`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 16)}: no pending finalization metadata, skipping`);
         result.stillPending++;
         continue;
       }
 
       if (pending.type === 'v5_bundle') {
-        console.log(`[V5-RESOLVE] Processing ${tokenId.slice(0, 16)}... stage=${pending.stage} attempt=${pending.attemptCount}`);
+        logger.debug('Payments', `[V5-RESOLVE] Processing ${tokenId.slice(0, 16)}... stage=${pending.stage} attempt=${pending.attemptCount}`);
         const progress = await this.resolveV5Token(tokenId, token, pending, stClient, trustBase, signingService);
-        console.log(`[V5-RESOLVE] Result for ${tokenId.slice(0, 16)}...: ${progress} (stage now: ${pending.stage})`);
+        logger.debug('Payments', `[V5-RESOLVE] Result for ${tokenId.slice(0, 16)}...: ${progress} (stage now: ${pending.stage})`);
         result.details.push({ tokenId, stage: pending.stage, status: progress });
         if (progress === 'resolved') result.resolved++;
         else if (progress === 'failed') result.failed++;
@@ -2905,7 +2906,7 @@ export class PaymentsModule {
     // stage progress (e.g. RECEIVED → MINT_SUBMITTED) and attemptCount so
     // that reloads don't restart finalization from scratch.
     if (result.resolved > 0 || result.failed > 0 || result.stillPending > 0) {
-      console.log(`[V5-RESOLVE] Saving: resolved=${result.resolved} failed=${result.failed} stillPending=${result.stillPending}`);
+      logger.debug('Payments', `[V5-RESOLVE] Saving: resolved=${result.resolved} failed=${result.failed} stillPending=${result.stillPending}`);
       await this.save();
     }
     return result;
@@ -2925,20 +2926,20 @@ export class PaymentsModule {
       (t) => t.status === 'submitted',
     );
     if (!hasUnconfirmed) {
-      console.log(`[V5-RESOLVE] scheduleResolveUnconfirmed: no submitted tokens, not starting timer`);
+      logger.debug('Payments', '[V5-RESOLVE] scheduleResolveUnconfirmed: no submitted tokens, not starting timer');
       return;
     }
 
-    console.log(`[V5-RESOLVE] scheduleResolveUnconfirmed: starting periodic retry (every ${PaymentsModule.RESOLVE_UNCONFIRMED_INTERVAL_MS}ms)`);
+    logger.debug('Payments', `[V5-RESOLVE] scheduleResolveUnconfirmed: starting periodic retry (every ${PaymentsModule.RESOLVE_UNCONFIRMED_INTERVAL_MS}ms)`);
     this.resolveUnconfirmedTimer = setInterval(async () => {
       try {
         const result = await this.resolveUnconfirmed();
         if (result.stillPending === 0) {
-          console.log(`[V5-RESOLVE] All tokens resolved, stopping periodic retry`);
+          logger.debug('Payments', '[V5-RESOLVE] All tokens resolved, stopping periodic retry');
           this.stopResolveUnconfirmedPolling();
         }
       } catch (err) {
-        console.log(`[V5-RESOLVE] Periodic retry error:`, err);
+        logger.debug('Payments', '[V5-RESOLVE] Periodic retry error:', err);
       }
     }, PaymentsModule.RESOLVE_UNCONFIRMED_INTERVAL_MS);
   }
@@ -2972,14 +2973,14 @@ export class PaymentsModule {
     try {
       // Stage: RECEIVED → MINT_SUBMITTED
       if (pending.stage === 'RECEIVED') {
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: RECEIVED → submitting mint commitment...`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: RECEIVED → submitting mint commitment...`);
         const mintDataJson = JSON.parse(bundle.recipientMintData);
         const mintData = await MintTransactionData.fromJSON(mintDataJson);
         const mintCommitment = await MintCommitment.create(mintData);
         const mintResponse = await stClient.submitMintCommitment(mintCommitment);
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint response status=${mintResponse.status}`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint response status=${mintResponse.status}`);
         if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
-          throw new Error(`Mint submission failed: ${mintResponse.status}`);
+          throw new SphereError(`Mint submission failed: ${mintResponse.status}`, 'TRANSFER_FAILED');
         }
         pending.stage = 'MINT_SUBMITTED';
         this.updatePendingFinalization(token, pending);
@@ -2987,17 +2988,17 @@ export class PaymentsModule {
 
       // Stage: MINT_SUBMITTED → MINT_PROVEN
       if (pending.stage === 'MINT_SUBMITTED') {
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_SUBMITTED → checking mint proof...`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_SUBMITTED → checking mint proof...`);
         const mintDataJson = JSON.parse(bundle.recipientMintData);
         const mintData = await MintTransactionData.fromJSON(mintDataJson);
         const mintCommitment = await MintCommitment.create(mintData);
         const proof = await this.quickProofCheck(stClient, trustBase, mintCommitment);
         if (!proof) {
-          console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint proof not yet available, staying MINT_SUBMITTED`);
+          logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint proof not yet available, staying MINT_SUBMITTED`);
           this.updatePendingFinalization(token, pending);
           return 'pending';
         }
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint proof obtained!`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: mint proof obtained!`);
         pending.mintProofJson = JSON.stringify(proof);
         pending.stage = 'MINT_PROVEN';
         this.updatePendingFinalization(token, pending);
@@ -3005,13 +3006,13 @@ export class PaymentsModule {
 
       // Stage: MINT_PROVEN → TRANSFER_SUBMITTED
       if (pending.stage === 'MINT_PROVEN') {
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_PROVEN → submitting transfer commitment...`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: MINT_PROVEN → submitting transfer commitment...`);
         const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
         const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
         const transferResponse = await stClient.submitTransferCommitment(transferCommitment);
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer response status=${transferResponse.status}`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer response status=${transferResponse.status}`);
         if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
-          throw new Error(`Transfer submission failed: ${transferResponse.status}`);
+          throw new SphereError(`Transfer submission failed: ${transferResponse.status}`, 'TRANSFER_FAILED');
         }
         pending.stage = 'TRANSFER_SUBMITTED';
         this.updatePendingFinalization(token, pending);
@@ -3019,16 +3020,16 @@ export class PaymentsModule {
 
       // Stage: TRANSFER_SUBMITTED → FINALIZED
       if (pending.stage === 'TRANSFER_SUBMITTED') {
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: TRANSFER_SUBMITTED → checking transfer proof...`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: TRANSFER_SUBMITTED → checking transfer proof...`);
         const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
         const transferCommitment = await TransferCommitment.fromJSON(transferCommitmentJson);
         const proof = await this.quickProofCheck(stClient, trustBase, transferCommitment);
         if (!proof) {
-          console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof not yet available, staying TRANSFER_SUBMITTED`);
+          logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof not yet available, staying TRANSFER_SUBMITTED`);
           this.updatePendingFinalization(token, pending);
           return 'pending';
         }
-        console.log(`[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof obtained! Finalizing...`);
+        logger.debug('Payments', `[V5-RESOLVE] ${tokenId.slice(0, 12)}: transfer proof obtained! Finalizing...`);
 
         // Finalize: reconstruct minted token, create recipient state, finalize
         const finalizedToken = await this.finalizeFromV5Bundle(bundle, pending, signingService, stClient, trustBase);
@@ -3059,13 +3060,13 @@ export class PaymentsModule {
           tokenTransfers: [],
         });
 
-        this.log(`V5 token resolved: ${tokenId.slice(0, 8)}...`);
+        logger.debug('Payments', `V5 token resolved: ${tokenId.slice(0, 8)}...`);
         return 'resolved';
       }
 
       return 'pending';
     } catch (error) {
-      console.error(`[Payments] resolveV5Token failed for ${tokenId.slice(0, 8)}:`, error);
+      logger.error('Payments', `resolveV5Token failed for ${tokenId.slice(0, 8)}:`, error);
       if (pending.attemptCount > 50) {
         token.status = 'invalid';
         token.updatedAt = Date.now();
@@ -3242,7 +3243,7 @@ export class PaymentsModule {
     }
     if (pendingTokens.length > 0) {
       const json = JSON.stringify(pendingTokens);
-      this.log(`[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')} (${json.length} bytes)`);
+      logger.debug('Payments', `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')} (${json.length} bytes)`);
       await this.deps!.storage.set(
         STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
         json
@@ -3250,12 +3251,12 @@ export class PaymentsModule {
       // Verify write
       const verify = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
       if (!verify) {
-        console.error('[Payments][V5-PERSIST] CRITICAL: KV write succeeded but read-back is empty!');
+        logger.error('Payments', '[V5-PERSIST] CRITICAL: KV write succeeded but read-back is empty!');
       } else {
-        this.log(`[V5-PERSIST] Verified: read-back ${verify.length} bytes`);
+        logger.debug('Payments', `[V5-PERSIST] Verified: read-back ${verify.length} bytes`);
       }
     } else {
-      this.log(`[V5-PERSIST] No pending V5 tokens to save (total tokens: ${this.tokens.size}), clearing KV`);
+      logger.debug('Payments', `[V5-PERSIST] No pending V5 tokens to save (total tokens: ${this.tokens.size}), clearing KV`);
       // Clean up when no pending tokens remain
       await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
     }
@@ -3267,23 +3268,23 @@ export class PaymentsModule {
    */
   private async loadPendingV5Tokens(): Promise<void> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
-    this.log(`[V5-PERSIST] loadPendingV5Tokens: KV data = ${data ? `${data.length} bytes` : 'null/empty'}`);
+    logger.debug('Payments', `[V5-PERSIST] loadPendingV5Tokens: KV data = ${data ? `${data.length} bytes` : 'null/empty'}`);
     if (!data) return;
 
     try {
       const pendingTokens = JSON.parse(data) as Token[];
-      this.log(`[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')}`);
+      logger.debug('Payments', `[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')}`);
       for (const token of pendingTokens) {
         // Only restore if not already in the map (e.g., already resolved)
         if (!this.tokens.has(token.id)) {
           this.tokens.set(token.id, token);
-          this.log(`[V5-PERSIST] Restored token ${token.id.slice(0, 16)} (status=${token.status})`);
+          logger.debug('Payments', `[V5-PERSIST] Restored token ${token.id.slice(0, 16)} (status=${token.status})`);
         } else {
-          this.log(`[V5-PERSIST] Token ${token.id.slice(0, 16)} already in map, skipping`);
+          logger.debug('Payments', `[V5-PERSIST] Token ${token.id.slice(0, 16)} already in map, skipping`);
         }
       }
     } catch (err) {
-      console.error('[Payments][V5-PERSIST] Failed to parse pending V5 tokens:', err);
+      logger.error('Payments', '[V5-PERSIST] Failed to parse pending V5 tokens:', err);
     }
   }
 
@@ -3348,7 +3349,7 @@ export class PaymentsModule {
     // This prevents spent tokens from being re-added via Nostr re-delivery
     // Tokens with the same tokenId but DIFFERENT stateHash are allowed (new state)
     if (incomingTokenId && incomingStateHash && this.isStateTombstoned(incomingTokenId, incomingStateHash)) {
-      this.log(`Rejecting tombstoned token: ${incomingTokenId.slice(0, 8)}..._${incomingStateHash.slice(0, 8)}...`);
+      logger.debug('Payments', `Rejecting tombstoned token: ${incomingTokenId.slice(0, 8)}..._${incomingStateHash.slice(0, 8)}...`);
       return false;
     }
 
@@ -3357,7 +3358,7 @@ export class PaymentsModule {
       for (const [_existingId, existing] of this.tokens) {
         if (isSameTokenState(existing, token)) {
           // Exact duplicate - same tokenId and same stateHash
-          this.log(`Duplicate token state ignored: ${incomingTokenId?.slice(0, 8)}..._${incomingStateHash?.slice(0, 8)}...`);
+          logger.debug('Payments', `Duplicate token state ignored: ${incomingTokenId?.slice(0, 8)}..._${incomingStateHash?.slice(0, 8)}...`);
           return false;
         }
       }
@@ -3376,7 +3377,7 @@ export class PaymentsModule {
 
         // CASE 1: Existing token is spent/invalid - allow replacement
         if (existing.status === 'spent' || existing.status === 'invalid') {
-          this.log(`Replacing spent/invalid token ${incomingTokenId?.slice(0, 8)}...`);
+          logger.debug('Payments', `Replacing spent/invalid token ${incomingTokenId?.slice(0, 8)}...`);
           this.tokens.delete(existingId);
           break;
         }
@@ -3384,7 +3385,7 @@ export class PaymentsModule {
         // CASE 2: Different stateHash - this is a newer state of the token
         // Remove old state (it will be archived) and add new state
         if (incomingStateHash && existingStateHash && incomingStateHash !== existingStateHash) {
-          this.log(`Token ${incomingTokenId?.slice(0, 8)}... state updated: ${existingStateHash.slice(0, 8)}... -> ${incomingStateHash.slice(0, 8)}...`);
+          logger.debug('Payments', `Token ${incomingTokenId?.slice(0, 8)}... state updated: ${existingStateHash.slice(0, 8)}... -> ${incomingStateHash.slice(0, 8)}...`);
           // Archive old state before removing
           await this.archiveToken(existing);
           this.tokens.delete(existingId);
@@ -3394,7 +3395,7 @@ export class PaymentsModule {
         // CASE 3: No state hashes available - use .id as heuristic
         if (!incomingStateHash || !existingStateHash) {
           if (existingId !== token.id) {
-            this.log(`Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
+            logger.debug('Payments', `Token ${incomingTokenId?.slice(0, 8)}... .id changed, replacing`);
             await this.archiveToken(existing);
             this.tokens.delete(existingId);
             break;
@@ -3411,7 +3412,7 @@ export class PaymentsModule {
 
     await this.save();
 
-    this.log(`Added token ${token.id}, total: ${this.tokens.size}`);
+    logger.debug('Payments', `Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
   }
 
@@ -3452,7 +3453,7 @@ export class PaymentsModule {
     await this.archiveToken(token);
 
     await this.save();
-    this.log(`Updated token ${token.id}`);
+    logger.debug('Payments', `Updated token ${token.id}`);
   }
 
   /**
@@ -3481,12 +3482,12 @@ export class PaymentsModule {
       );
       if (!alreadyTombstoned) {
         this.tombstones.push(tombstone);
-        this.log(`Created tombstone for ${tombstone.tokenId.slice(0, 8)}..._${tombstone.stateHash.slice(0, 8)}...`);
+        logger.debug('Payments', `Created tombstone for ${tombstone.tokenId.slice(0, 8)}..._${tombstone.stateHash.slice(0, 8)}...`);
       }
     } else {
       // No valid tombstone could be created (missing tokenId or stateHash)
       // Token will still be removed but may be re-synced later
-      this.log(`Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
+      logger.debug('Payments', `Warning: Could not create tombstone for token ${tokenId.slice(0, 8)}... (missing tokenId or stateHash)`);
     }
 
     // Remove from active tokens
@@ -3556,7 +3557,7 @@ export class PaymentsModule {
 
     for (const token of tokensToRemove) {
       this.tokens.delete(token.id);
-      this.log(`Removed tombstoned token ${token.id.slice(0, 8)}...`);
+      logger.debug('Payments', `Removed tombstoned token ${token.id.slice(0, 8)}...`);
       removedCount++;
     }
 
@@ -3588,7 +3589,7 @@ export class PaymentsModule {
 
     if (this.tombstones.length < originalCount) {
       await this.save();
-      this.log(`Pruned tombstones from ${originalCount} to ${this.tombstones.length}`);
+      logger.debug('Payments', `Pruned tombstones from ${originalCount} to ${this.tombstones.length}`);
     }
   }
 
@@ -3672,7 +3673,7 @@ export class PaymentsModule {
     this.archivedTokens = pruneMapByCount(this.archivedTokens, maxCount);
 
     await this.save();
-    this.log(`Pruned archived tokens from ${originalCount} to ${this.archivedTokens.size}`);
+    logger.debug('Payments', `Pruned archived tokens from ${originalCount} to ${this.archivedTokens.size}`);
   }
 
   // ===========================================================================
@@ -3705,7 +3706,7 @@ export class PaymentsModule {
     if (this.forkedTokens.has(key)) return;
 
     this.forkedTokens.set(key, txfToken);
-    this.log(`Stored forked token ${tokenId.slice(0, 8)}... state ${stateHash.slice(0, 12)}...`);
+    logger.debug('Payments', `Stored forked token ${tokenId.slice(0, 8)}... state ${stateHash.slice(0, 12)}...`);
     await this.save();
   }
 
@@ -3744,7 +3745,7 @@ export class PaymentsModule {
     this.forkedTokens = pruneMapByCount(this.forkedTokens, maxCount);
 
     await this.save();
-    this.log(`Pruned forked tokens from ${originalCount} to ${this.forkedTokens.size}`);
+    logger.debug('Payments', `Pruned forked tokens from ${originalCount} to ${this.forkedTokens.size}`);
   }
 
   // ===========================================================================
@@ -3843,7 +3844,7 @@ export class PaymentsModule {
           const imported = await provider.importHistoryEntries?.(records) ?? 0;
           if (imported > 0) {
             this._historyCache = await provider.getHistoryEntries();
-            this.log(`Migrated ${imported} history entries from KV to history store`);
+            logger.debug('Payments', `Migrated ${imported} history entries from KV to history store`);
           }
           // Delete legacy key after successful migration
           await this.deps!.storage.remove(STORAGE_KEYS_ADDRESS.TRANSACTION_HISTORY);
@@ -3931,7 +3932,7 @@ export class PaymentsModule {
       this.nametags.push(nametag);
     }
     await this.save();
-    this.log(`Nametag set: ${nametag.name}`);
+    logger.debug('Payments', `Nametag set: ${nametag.name}`);
   }
 
   /**
@@ -3985,7 +3986,7 @@ export class PaymentsModule {
           const parsed = parseTxfStorageData(result.data);
           if (parsed.nametags.length > 0) {
             this.nametags = parsed.nametags;
-            this.log(`Reloaded ${parsed.nametags.length} nametag(s) from storage`);
+            logger.debug('Payments', `Reloaded ${parsed.nametags.length} nametag(s) from storage`);
             return;
           }
         }
@@ -4057,7 +4058,7 @@ export class PaymentsModule {
       if (result.success && result.nametagData) {
         // Save the nametag data
         await this.setNametag(result.nametagData);
-        this.log(`Nametag minted and saved: ${result.nametagData.name}`);
+        logger.debug('Payments', `Nametag minted and saved: ${result.nametagData.name}`);
 
         // Emit event (use existing nametag:registered event type)
         this.deps!.emitEvent('nametag:registered', {
@@ -4069,7 +4070,7 @@ export class PaymentsModule {
       return result;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
-      this.log('mintNametag failed:', errorMsg);
+      logger.debug('Payments', 'mintNametag failed:', errorMsg);
       return {
         success: false,
         error: errorMsg,
@@ -4209,7 +4210,7 @@ export class PaymentsModule {
               restoredCount++;
             }
             if (restoredCount > 0) {
-              console.log(`[Payments] Sync: restored ${restoredCount} token(s) lost by loadFromStorageData`);
+              logger.debug('Payments', `Sync: restored ${restoredCount} token(s) lost by loadFromStorageData`);
             }
 
             // Restore nametags if sync wiped them
@@ -4222,7 +4223,7 @@ export class PaymentsModule {
             if (txfData._history && txfData._history.length > 0) {
               const imported = await this.importRemoteHistoryEntries(txfData._history as HistoryRecord[]);
               if (imported > 0) {
-                this.log(`Imported ${imported} history entries from IPFS sync`);
+                logger.debug('Payments', `Imported ${imported} history entries from IPFS sync`);
               }
             }
 
@@ -4238,7 +4239,7 @@ export class PaymentsModule {
           });
         } catch (providerError) {
           // Log error but continue with other providers
-          console.warn(`[PaymentsModule] Sync failed for provider ${providerId}:`, providerError);
+          logger.warn('Payments', `Sync failed for provider ${providerId}:`, providerError);
           this.deps!.emitEvent('sync:provider', {
             providerId,
             success: false,
@@ -4284,7 +4285,7 @@ export class PaymentsModule {
       if (provider.onEvent) {
         const unsub = provider.onEvent((event) => {
           if (event.type === 'storage:remote-updated') {
-            this.log('Remote update detected from provider', providerId, event.data);
+            logger.debug('Payments', 'Remote update detected from provider', providerId, event.data);
             this.debouncedSyncFromRemoteUpdate(providerId, event.data);
           }
         });
@@ -4332,7 +4333,7 @@ export class PaymentsModule {
           });
         })
         .catch((err) => {
-          this.log('Auto-sync from remote update failed:', err);
+          logger.debug('Payments', 'Auto-sync from remote update failed:', err);
         });
     }, PaymentsModule.SYNC_DEBOUNCE_MS);
   }
@@ -4461,9 +4462,10 @@ export class PaymentsModule {
       return recipient;
     }
 
-    throw new Error(
+    throw new SphereError(
       `Cannot resolve transport pubkey for "${recipient}". ` +
-      `No binding event found. The recipient must publish their identity first.`
+      `No binding event found. The recipient must publish their identity first.`,
+      'INVALID_RECIPIENT',
     );
   }
 
@@ -4565,16 +4567,17 @@ export class PaymentsModule {
 
     // 66-char hex (33-byte compressed pubkey) — create DirectAddress
     if (recipient.length === 66 && /^[0-9a-fA-F]+$/.test(recipient)) {
-      this.log(`Creating DirectAddress from 33-byte compressed pubkey`);
+      logger.debug('Payments', 'Creating DirectAddress from 33-byte compressed pubkey');
       return this.createDirectAddressFromPubkey(recipient);
     }
 
     // For nametag-based recipients, use PeerInfo (pre-resolved or resolve now)
     const info = peerInfo ?? await this.deps?.transport.resolve?.(recipient) ?? null;
     if (!info) {
-      throw new Error(
+      throw new SphereError(
         `Recipient "${recipient}" not found. ` +
-        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`
+        `Use @nametag, a valid PROXY:/DIRECT: address, or a 33-byte hex pubkey.`,
+        'INVALID_RECIPIENT',
       );
     }
 
@@ -4584,26 +4587,26 @@ export class PaymentsModule {
 
     // Force PROXY mode
     if (addressMode === 'proxy') {
-      console.log(`[Payments] Using PROXY address for "${nametag}" (forced)`);
+      logger.debug('Payments', `Using PROXY address for "${nametag}" (forced)`);
       return ProxyAddress.fromNameTag(nametag);
     }
 
     // Force DIRECT mode
     if (addressMode === 'direct') {
       if (!info.directAddress) {
-        throw new Error(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`);
+        throw new SphereError(`"${nametag}" has no DirectAddress stored. It may be a legacy registration.`, 'INVALID_RECIPIENT');
       }
-      console.log(`[Payments] Using DirectAddress for "${nametag}" (forced): ${info.directAddress.slice(0, 30)}...`);
+      logger.debug('Payments', `Using DirectAddress for "${nametag}" (forced): ${info.directAddress.slice(0, 30)}...`);
       return AddressFactory.createAddress(info.directAddress);
     }
 
     // AUTO mode: prefer directAddress, fallback to PROXY for legacy
     if (info.directAddress) {
-      this.log(`Using DirectAddress for "${nametag}": ${info.directAddress.slice(0, 30)}...`);
+      logger.debug('Payments', `Using DirectAddress for "${nametag}": ${info.directAddress.slice(0, 30)}...`);
       return AddressFactory.createAddress(info.directAddress);
     }
 
-    this.log(`Using PROXY address for legacy nametag "${nametag}"`);
+    logger.debug('Payments', `Using PROXY address for legacy nametag "${nametag}"`);
     return ProxyAddress.fromNameTag(nametag);
   }
 
@@ -4625,7 +4628,7 @@ export class PaymentsModule {
         : payload.commitmentData;
 
       if (!sourceTokenInput || !commitmentInput) {
-        console.warn('[Payments] Invalid NOSTR-FIRST transfer format');
+        logger.warn('Payments', 'Invalid NOSTR-FIRST transfer format');
         return;
       }
 
@@ -4663,7 +4666,7 @@ export class PaymentsModule {
         tokenId: nostrTokenId || token.id,
       });
     } catch (error) {
-      console.error('[Payments] Failed to process NOSTR-FIRST transfer:', error);
+      logger.error('Payments', 'Failed to process NOSTR-FIRST transfer:', error);
     }
   }
 
@@ -4705,20 +4708,21 @@ export class PaymentsModule {
       // Recovery: if nametag is missing in memory (e.g., wiped by sync or race
       // condition during address switch), try reloading from storage
       if (!proxyNametag?.token) {
-        this.log('Nametag missing in memory, attempting reload from storage...');
+        logger.debug('Payments', 'Nametag missing in memory, attempting reload from storage...');
         await this.reloadNametagsFromStorage();
         proxyNametag = this.getNametag();
       }
 
       if (!proxyNametag?.token) {
-        throw new Error('Cannot finalize PROXY transfer - no nametag token');
+        throw new SphereError('Cannot finalize PROXY transfer - no nametag token', 'VALIDATION_ERROR');
       }
       const nametagToken = await SdkToken.fromJSON(proxyNametag.token);
       const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
       if (proxy.address !== recipientAddress.address) {
-        throw new Error(
+        throw new SphereError(
           `PROXY address mismatch: nametag resolves to ${proxy.address} ` +
-          `but transfer targets ${recipientAddress.address}`
+          `but transfer targets ${recipientAddress.address}`,
+          'VALIDATION_ERROR',
         );
       }
       nametagTokens = [nametagToken];
@@ -4745,14 +4749,14 @@ export class PaymentsModule {
     try {
       const token = this.tokens.get(tokenId);
       if (!token) {
-        this.log(`Token ${tokenId} not found for finalization`);
+        logger.debug('Payments', `Token ${tokenId} not found for finalization`);
         return;
       }
 
       // Get proof from aggregator
       const commitment = await TransferCommitment.fromJSON(commitmentInput);
       if (!this.deps!.oracle.waitForProofSdk) {
-        this.log('Cannot finalize - no waitForProofSdk');
+        logger.debug('Payments', 'Cannot finalize - no waitForProofSdk');
         token.status = 'confirmed'; // Mark as confirmed anyway
         token.updatedAt = Date.now();
         await this.save();
@@ -4772,7 +4776,7 @@ export class PaymentsModule {
       const trustBase = (this.deps!.oracle as any).getTrustBase?.();
 
       if (!stClient || !trustBase) {
-        this.log('Cannot finalize - missing state transition client or trust base');
+        logger.debug('Payments', 'Cannot finalize - missing state transition client or trust base');
         token.status = 'confirmed';
         token.updatedAt = Date.now();
         await this.save();
@@ -4794,7 +4798,7 @@ export class PaymentsModule {
       this.tokens.set(tokenId, finalizedToken);
       await this.save();
 
-      this.log(`NOSTR-FIRST: Token ${tokenId.slice(0, 8)}... finalized and confirmed`);
+      logger.debug('Payments', `NOSTR-FIRST: Token ${tokenId.slice(0, 8)}... finalized and confirmed`);
 
       // Emit confirmation event
       this.deps!.emitEvent('transfer:confirmed', {
@@ -4806,7 +4810,7 @@ export class PaymentsModule {
 
       // History entry was already created in handleCommitmentOnlyTransfer() — no duplicate here
     } catch (error) {
-      console.error('[Payments] Failed to finalize received token:', error);
+      logger.error('Payments', 'Failed to finalize received token:', error);
       // Mark as confirmed anyway (user has the token)
       const token = this.tokens.get(tokenId);
       if (token && token.status === 'submitted') {
@@ -4829,7 +4833,7 @@ export class PaymentsModule {
       // COMBINED_TRANSFER V6 format is { type: 'COMBINED_TRANSFER', version: '6.0', ... }
       // INSTANT_SPLIT format is { type: 'INSTANT_SPLIT', version, ... }
       const payload = transfer.payload as unknown as Record<string, unknown>;
-      console.log('[Payments][DEBUG] handleIncomingTransfer: keys=', Object.keys(payload).join(','));
+      logger.debug('Payments', 'handleIncomingTransfer: keys=', Object.keys(payload).join(','));
 
       // Check for COMBINED_TRANSFER V6 bundle (single message containing all tokens)
       let combinedBundle: CombinedTransferBundleV6 | null = null;
@@ -4847,12 +4851,12 @@ export class PaymentsModule {
       }
 
       if (combinedBundle) {
-        this.log('Processing COMBINED_TRANSFER V6 bundle...');
+        logger.debug('Payments', 'Processing COMBINED_TRANSFER V6 bundle...');
         try {
           await this.processCombinedTransferBundle(combinedBundle, transfer.senderTransportPubkey);
-          this.log('COMBINED_TRANSFER V6 processed successfully');
+          logger.debug('Payments', 'COMBINED_TRANSFER V6 processed successfully');
         } catch (err) {
-          console.error('[Payments] COMBINED_TRANSFER V6 processing error:', err);
+          logger.error('Payments', 'COMBINED_TRANSFER V6 processing error:', err);
         }
         return;
       }
@@ -4874,7 +4878,7 @@ export class PaymentsModule {
       }
 
       if (instantBundle) {
-        this.log('Processing INSTANT_SPLIT bundle...');
+        logger.debug('Payments', 'Processing INSTANT_SPLIT bundle...');
         try {
           const result = await this.processInstantSplitBundle(
             instantBundle,
@@ -4882,19 +4886,19 @@ export class PaymentsModule {
             payload.memo as string | undefined,
           );
           if (result.success) {
-            this.log('INSTANT_SPLIT processed successfully');
+            logger.debug('Payments', 'INSTANT_SPLIT processed successfully');
           } else {
-            console.warn('[Payments] INSTANT_SPLIT processing failed:', result.error);
+            logger.warn('Payments', 'INSTANT_SPLIT processing failed:', result.error);
           }
         } catch (err) {
-          console.error('[Payments] INSTANT_SPLIT processing error:', err);
+          logger.error('Payments', 'INSTANT_SPLIT processing error:', err);
         }
         return;
       }
 
       // Check for NOSTR-FIRST commitment-only transfer (whole-token instant send)
       if (payload.sourceToken && payload.commitmentData && !payload.transferTx) {
-        console.log('[Payments][DEBUG] >>> NOSTR-FIRST commitment-only transfer detected');
+        logger.debug('Payments', 'NOSTR-FIRST commitment-only transfer detected');
         await this.handleCommitmentOnlyTransfer(transfer, payload);
         return;
       }
@@ -4905,7 +4909,7 @@ export class PaymentsModule {
 
       if (payload.sourceToken && payload.transferTx) {
         // Sphere wallet format - needs finalization for PROXY addresses
-        this.log('Processing Sphere wallet format transfer...');
+        logger.debug('Payments', 'Processing Sphere wallet format transfer...');
 
         const sourceTokenInput = typeof payload.sourceToken === 'string'
           ? JSON.parse(payload.sourceToken as string)
@@ -4915,7 +4919,7 @@ export class PaymentsModule {
           : payload.transferTx;
 
         if (!sourceTokenInput || !transferTxInput) {
-          console.warn('[Payments] Invalid Sphere wallet transfer format');
+          logger.warn('Payments', 'Invalid Sphere wallet transfer format');
           return;
         }
 
@@ -4926,7 +4930,7 @@ export class PaymentsModule {
         try {
           sourceToken = await SdkToken.fromJSON(sourceTokenInput);
         } catch (err) {
-          console.error('[Payments] Failed to parse sourceToken:', err);
+          logger.error('Payments', 'Failed to parse sourceToken:', err);
           return;
         }
 
@@ -4948,18 +4952,18 @@ export class PaymentsModule {
             const commitment = await TransferCommitment.fromJSON(transferTxInput);
             const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
             if (!stClient) {
-              console.error('[Payments] Cannot process commitment - no state transition client');
+              logger.error('Payments', 'Cannot process commitment - no state transition client');
               return;
             }
 
             const response = await stClient.submitTransferCommitment(commitment);
             if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
-              console.error('[Payments] Transfer commitment submission failed:', response.status);
+              logger.error('Payments', 'Transfer commitment submission failed:', response.status);
               return;
             }
 
             if (!this.deps!.oracle.waitForProofSdk) {
-              console.error('[Payments] Cannot wait for proof - missing oracle method');
+              logger.error('Payments', 'Cannot wait for proof - missing oracle method');
               return;
             }
             const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
@@ -4974,7 +4978,7 @@ export class PaymentsModule {
               const commitment = await TransferCommitment.fromJSON(transferTxInput);
               const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
               if (!stClient || !this.deps!.oracle.waitForProofSdk) {
-                throw new Error('Cannot submit commitment - missing oracle methods');
+                throw new SphereError('Cannot submit commitment - missing oracle methods', 'AGGREGATOR_ERROR');
               }
               await stClient.submitTransferCommitment(commitment);
               const inclusionProof = await this.deps!.oracle.waitForProofSdk(commitment);
@@ -4983,7 +4987,7 @@ export class PaymentsModule {
             }
           }
         } catch (err) {
-          console.error('[Payments] Failed to parse transferTx:', err);
+          logger.error('Payments', 'Failed to parse transferTx:', err);
           return;
         }
 
@@ -4993,29 +4997,29 @@ export class PaymentsModule {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const trustBase = (this.deps!.oracle as any).getTrustBase?.();
           if (!stClient || !trustBase) {
-            console.error('[Payments] Cannot finalize - missing state transition client or trust base. Token rejected.');
+            logger.error('Payments', 'Cannot finalize - missing state transition client or trust base. Token rejected.');
             return;
           }
           finalizedSdkToken = await this.finalizeTransferToken(sourceToken, transferTx, stClient, trustBase);
           tokenData = finalizedSdkToken.toJSON();
           const addressScheme = transferTx.data.recipient.scheme;
-          this.log(`${addressScheme === AddressScheme.PROXY ? 'PROXY' : 'DIRECT'} finalization successful`);
+          logger.debug('Payments', `${addressScheme === AddressScheme.PROXY ? 'PROXY' : 'DIRECT'} finalization successful`);
         } catch (finalizeError) {
-          console.error(`[Payments] Finalization FAILED - token rejected:`, finalizeError);
+          logger.error('Payments', 'Finalization FAILED - token rejected:', finalizeError);
           return;
         }
       } else if (payload.token) {
         // SDK format
         tokenData = payload.token;
       } else {
-        console.warn('[Payments] Unknown transfer payload format');
+        logger.warn('Payments', 'Unknown transfer payload format');
         return;
       }
 
       // Validate token
       const validation = await this.deps!.oracle.validateToken(tokenData);
       if (!validation.valid) {
-        console.warn('[Payments] Received invalid token');
+        logger.warn('Payments', 'Received invalid token');
         return;
       }
 
@@ -5068,12 +5072,12 @@ export class PaymentsModule {
         };
 
         this.deps!.emitEvent('transfer:incoming', incomingTransfer);
-        this.log(`Incoming transfer processed: ${token.id}, ${token.amount} ${token.symbol}`);
+        logger.debug('Payments', `Incoming transfer processed: ${token.id}, ${token.amount} ${token.symbol}`);
       } else {
-        this.log(`Duplicate transfer ignored: ${token.id}, ${token.amount} ${token.symbol}`);
+        logger.debug('Payments', `Duplicate transfer ignored: ${token.id}, ${token.amount} ${token.symbol}`);
       }
     } catch (error) {
-      console.error('[Payments] Failed to process incoming transfer:', error);
+      logger.error('Payments', 'Failed to process incoming transfer:', error);
     }
   }
 
@@ -5093,16 +5097,16 @@ export class PaymentsModule {
     if (existingArchive) {
       if (isIncrementalUpdate(existingArchive, txf)) {
         this.archivedTokens.set(tokenId, txf);
-        this.log(`Updated archived token ${tokenId.slice(0, 8)}...`);
+        logger.debug('Payments', `Updated archived token ${tokenId.slice(0, 8)}...`);
       } else {
         // Fork
         const stateHash = getCurrentStateHash(txf) || '';
         await this.storeForkedToken(tokenId, stateHash, txf);
-        this.log(`Archived token ${tokenId.slice(0, 8)}... is a fork`);
+        logger.debug('Payments', `Archived token ${tokenId.slice(0, 8)}... is a fork`);
       }
     } else {
       this.archivedTokens.set(tokenId, txf);
-      this.log(`Archived token ${tokenId.slice(0, 8)}...`);
+      logger.debug('Payments', `Archived token ${tokenId.slice(0, 8)}...`);
     }
   }
 
@@ -5118,21 +5122,21 @@ export class PaymentsModule {
       const txf = tokenToTxf(t);
       return `${t.id.slice(0, 12)}(${t.status},txf=${!!txf})`;
     });
-    console.log(`[Payments][DEBUG] save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
+    logger.debug('Payments', `save(): providers=${providers.size}, tokens=[${tokenStats.join(', ')}]`);
 
     if (providers.size > 0) {
       const data = await this.createStorageData();
       const dataKeys = Object.keys(data).filter(k => k.startsWith('token-'));
-      console.log(`[Payments][DEBUG] save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
+      logger.debug('Payments', `save(): TXF keys=${dataKeys.length} (${dataKeys.join(', ')})`);
       for (const [id, provider] of providers) {
         try {
           await provider.save(data);
         } catch (err) {
-          console.error(`[Payments] Failed to save to provider ${id}:`, err);
+          logger.error('Payments', `Failed to save to provider ${id}:`, err);
         }
       }
     } else {
-      console.log('[Payments][DEBUG] save(): No token storage providers - TXF not persisted');
+      logger.debug('Payments', 'save(): No token storage providers - TXF not persisted');
     }
 
     // Always save pending V5 tokens to KV storage (separate from TXF providers).
@@ -5179,7 +5183,7 @@ export class PaymentsModule {
 
   private loadFromStorageData(data: TxfStorageDataBase): void {
     const parsed = parseTxfStorageData(data);
-    console.log(`[Payments][DEBUG] loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
+    logger.debug('Payments', `loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
 
     // Load tombstones FIRST so we can filter tokens
     this.tombstones = parsed.tombstones;
@@ -5193,7 +5197,7 @@ export class PaymentsModule {
 
       // Only filter if we have exact state match
       if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) {
-        this.log(`Skipping tombstoned token ${sdkTokenId.slice(0, 8)}... during load (exact state match)`);
+        logger.debug('Payments', `Skipping tombstoned token ${sdkTokenId.slice(0, 8)}... during load (exact state match)`);
         continue;
       }
 
@@ -5224,13 +5228,13 @@ export class PaymentsModule {
       // Submit to aggregator
       const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
       if (!stClient) {
-        this.log('Cannot submit commitment - no state transition client');
+        logger.debug('Payments', 'Cannot submit commitment - no state transition client');
         return;
       }
 
       const response = await stClient.submitTransferCommitment(commitment);
       if (response.status !== 'SUCCESS' && response.status !== 'REQUEST_ID_EXISTS') {
-        this.log(`Transfer commitment submission failed: ${response.status}`);
+        logger.debug('Payments', `Transfer commitment submission failed: ${response.status}`);
         // Mark token as invalid since submission failed
         const token = this.tokens.get(tokenId);
         if (token) {
@@ -5253,7 +5257,7 @@ export class PaymentsModule {
         onProofReceived,
       });
     } catch (error) {
-      this.log('submitAndPollForProof error:', error);
+      logger.debug('Payments', 'submitAndPollForProof error:', error);
     }
   }
 
@@ -5262,7 +5266,7 @@ export class PaymentsModule {
    */
   private addProofPollingJob(job: ProofPollingJob): void {
     this.proofPollingJobs.set(job.tokenId, job);
-    this.log(`Added proof polling job for token ${job.tokenId.slice(0, 8)}...`);
+    logger.debug('Payments', `Added proof polling job for token ${job.tokenId.slice(0, 8)}...`);
     this.startProofPolling();
   }
 
@@ -5273,7 +5277,7 @@ export class PaymentsModule {
     if (this.proofPollingInterval) return;
     if (this.proofPollingJobs.size === 0) return;
 
-    this.log('Starting proof polling...');
+    logger.debug('Payments', 'Starting proof polling...');
     this.proofPollingInterval = setInterval(
       () => this.processProofPollingQueue(),
       PaymentsModule.PROOF_POLLING_INTERVAL_MS
@@ -5287,7 +5291,7 @@ export class PaymentsModule {
     if (this.proofPollingInterval) {
       clearInterval(this.proofPollingInterval);
       this.proofPollingInterval = null;
-      this.log('Stopped proof polling');
+      logger.debug('Payments', 'Stopped proof polling');
     }
   }
 
@@ -5309,7 +5313,7 @@ export class PaymentsModule {
 
         // Check for timeout
         if (job.attemptCount >= PaymentsModule.PROOF_POLLING_MAX_ATTEMPTS) {
-          this.log(`Proof polling timeout for token ${tokenId.slice(0, 8)}...`);
+          logger.debug('Payments', `Proof polling timeout for token ${tokenId.slice(0, 8)}...`);
           // Mark token as invalid due to timeout
           const token = this.tokens.get(tokenId);
           if (token && token.status === 'submitted') {
@@ -5362,7 +5366,7 @@ export class PaymentsModule {
           token.updatedAt = Date.now();
           this.tokens.set(tokenId, token);
           await this.save();
-          this.log(`Proof received for token ${tokenId.slice(0, 8)}..., status: spent`);
+          logger.debug('Payments', `Proof received for token ${tokenId.slice(0, 8)}..., status: spent`);
         }
 
         // Call callback if provided
@@ -5370,7 +5374,7 @@ export class PaymentsModule {
         completedJobs.push(tokenId);
       } catch (error) {
         // Most errors mean proof is not ready yet, continue polling
-        this.log(`Proof polling attempt ${job.attemptCount} for ${tokenId.slice(0, 8)}...: ${error}`);
+        logger.debug('Payments', `Proof polling attempt ${job.attemptCount} for ${tokenId.slice(0, 8)}...: ${error}`);
       }
     }
 
@@ -5391,7 +5395,7 @@ export class PaymentsModule {
 
   private ensureInitialized(): void {
     if (!this.deps) {
-      throw new Error('PaymentsModule not initialized');
+      throw new SphereError('PaymentsModule not initialized', 'NOT_INITIALIZED');
     }
   }
 }

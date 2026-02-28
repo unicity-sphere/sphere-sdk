@@ -493,19 +493,32 @@ unsubscribe(); // Stop listening
 ## Error Handling
 
 ```typescript
+import { isSphereError } from '@unicitylabs/sphere-sdk';
+
 try {
-  await sphere.payments.send({
-    recipient: '@alice',
-    amount: '1000000',
+  const result = await sphere.payments.send({
     coinId: 'UCT',
+    amount: '1000000',
+    recipient: '@alice',
   });
+  console.log('Sent:', result.txId);
 } catch (error) {
-  if (error.message.includes('Insufficient balance')) {
-    console.error('Not enough tokens');
-  } else if (error.message.includes('Nametag not found')) {
-    console.error('Recipient nametag does not exist');
+  if (isSphereError(error)) {
+    switch (error.code) {
+      case 'INSUFFICIENT_BALANCE':
+        console.error('Not enough funds');
+        break;
+      case 'INVALID_RECIPIENT':
+        console.error('Recipient not found');
+        break;
+      case 'TRANSPORT_ERROR':
+        console.error('Network issue, try again');
+        break;
+      default:
+        console.error('Transfer failed:', error.message);
+    }
   } else {
-    console.error('Transfer failed:', error.message);
+    console.error('Unexpected error:', error);
   }
 }
 ```
@@ -610,6 +623,29 @@ Ensure directories exist and are writable:
 import fs from 'fs';
 fs.mkdirSync('./wallet-data', { recursive: true });
 fs.mkdirSync('./tokens-data', { recursive: true });
+```
+
+### Debug Logging
+
+Enable SDK debug logging to diagnose issues:
+
+```typescript
+import { logger } from '@unicitylabs/sphere-sdk';
+
+// Enable all debug logging
+logger.configure({ debug: true });
+
+// Enable only specific modules
+logger.setTagDebug('Nostr', true);    // Transport logs
+logger.setTagDebug('Payments', true); // Payment logs
+
+// Custom log handler (e.g., write to file)
+logger.configure({
+  debug: true,
+  handler: (level, tag, message, ...args) => {
+    fs.appendFileSync('sdk.log', `[${level}] [${tag}] ${message}\n`);
+  },
+});
 ```
 
 ## Next Steps

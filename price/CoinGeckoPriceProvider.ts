@@ -6,6 +6,8 @@
  * Optionally persists cache to StorageProvider for survival across page reloads.
  */
 
+import { logger } from '../core/logger';
+import { SphereError } from '../core/errors';
 import { STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } from './price-provider';
@@ -113,7 +115,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       const allCovered = uncachedNames.every((n) => this.fetchNames!.has(n));
       if (allCovered) {
         if (this.debug) {
-          console.log(`[CoinGecko] Deduplicating request, reusing in-flight fetch`);
+          logger.debug('CoinGecko', 'Deduplicating request, reusing in-flight fetch');
         }
         const fetched = await this.fetchPromise;
         for (const name of uncachedNames) {
@@ -161,7 +163,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       }
 
       if (this.debug) {
-        console.log(`[CoinGecko] Fetching prices for: ${uncachedNames.join(', ')}`);
+        logger.debug('CoinGecko', `Fetching prices for: ${uncachedNames.join(', ')}`);
       }
 
       const response = await fetch(url, {
@@ -174,7 +176,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
         if (response.status === 429) {
           this.extendCacheOnRateLimit(uncachedNames);
         }
-        throw new Error(`CoinGecko API error: ${response.status} ${response.statusText}`);
+        throw new SphereError(`CoinGecko API error: ${response.status} ${response.statusText}`, 'NETWORK_ERROR');
       }
 
       const data = await response.json() as Record<string, Record<string, number>>;
@@ -211,14 +213,14 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       }
 
       if (this.debug) {
-        console.log(`[CoinGecko] Fetched ${result.size} prices`);
+        logger.debug('CoinGecko', `Fetched ${result.size} prices`);
       }
 
       // Persist to storage (fire-and-forget)
       this.saveToStorage();
     } catch (error) {
       if (this.debug) {
-        console.warn('[CoinGecko] Fetch failed, using stale cache:', error);
+        logger.warn('CoinGecko', 'Fetch failed, using stale cache:', error);
       }
 
       // On error, return stale cached data if available
@@ -284,7 +286,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       }
 
       if (this.debug) {
-        console.log(`[CoinGecko] Loaded ${Object.keys(data).length} prices from persistent cache`);
+        logger.debug('CoinGecko', `Loaded ${Object.keys(data).length} prices from persistent cache`);
       }
     } catch {
       // Cache load failure is non-critical
@@ -306,9 +308,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     Promise.all([
       this.storage.set(STORAGE_KEYS_GLOBAL.PRICE_CACHE, JSON.stringify(data)),
       this.storage.set(STORAGE_KEYS_GLOBAL.PRICE_CACHE_TS, String(Date.now())),
-    ]).catch(() => {
-      // Cache save failure is non-critical
-    });
+    ]).catch((err) => logger.debug('Price', 'Cache save failed (non-critical)', err));
   }
 
   // ===========================================================================
@@ -331,7 +331,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     }
 
     if (this.debug) {
-      console.warn(`[CoinGecko] Rate-limited (429), extended cache TTL by ${backoffMs / 1000}s`);
+      logger.warn('CoinGecko', `Rate-limited (429), extended cache TTL by ${backoffMs / 1000}s`);
     }
   }
 

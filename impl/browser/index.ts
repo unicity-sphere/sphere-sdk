@@ -27,6 +27,7 @@ export type {
 // Convenience Factory
 // =============================================================================
 
+import { logger as sdkLogger } from '../../core/logger';
 import { createIndexedDBStorageProvider, type IndexedDBStorageProviderConfig, createIndexedDBTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -164,6 +165,8 @@ export interface TokenSyncConfig {
 export interface BrowserProvidersConfig {
   /** Network preset: mainnet, testnet, or dev. Sets default URLs for all services */
   network?: NetworkType;
+  /** Enable debug logging globally for all providers (default: false). Per-provider debug flags override this. */
+  debug?: boolean;
   /** Storage configuration (IndexedDB) */
   storage?: IndexedDBStorageProviderConfig;
   /** Transport (Nostr) configuration - supports extend/override pattern */
@@ -360,6 +363,15 @@ function resolveTokenSyncConfig(
  */
 export function createBrowserProviders(config?: BrowserProvidersConfig): BrowserProviders {
   const network = config?.network ?? 'mainnet';
+
+  // Configure global logger: top-level debug enables all, per-provider overrides are additive.
+  // Only override global debug flag when explicitly provided — don't reset a previously-configured value.
+  if (config?.debug !== undefined) {
+    sdkLogger.configure({ debug: config.debug });
+  }
+  if (config?.transport?.debug) sdkLogger.setTagDebug('Nostr', true);
+  if (config?.oracle?.debug) sdkLogger.setTagDebug('Aggregator', true);
+  if (config?.price?.debug) sdkLogger.setTagDebug('Price', true);
 
   // Resolve configurations using shared utilities
   const transportConfig = resolveTransportConfig(network, config?.transport);

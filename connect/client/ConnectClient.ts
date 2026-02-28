@@ -8,6 +8,8 @@
  * Zero dependencies on the Sphere SDK core.
  */
 
+import { logger } from '../../core/logger';
+import { SphereError } from '../../core/errors';
 import type { ConnectTransport, ConnectClientConfig, ConnectResult, ConnectEventHandler } from '../types';
 import type {
   SphereConnectMessage,
@@ -137,7 +139,7 @@ export class ConnectClient {
 
   /** Send a query request and return the result */
   async query<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
-    if (!this.connected) throw new Error('Not connected');
+    if (!this.connected) throw new SphereError('Not connected', 'NOT_INITIALIZED');
 
     const id = createRequestId();
 
@@ -170,7 +172,7 @@ export class ConnectClient {
 
   /** Send an intent request. The wallet will open its UI for user confirmation. */
   async intent<T = unknown>(action: string, params: Record<string, unknown>): Promise<T> {
-    if (!this.connected) throw new Error('Not connected');
+    if (!this.connected) throw new SphereError('Not connected', 'NOT_INITIALIZED');
 
     const id = createRequestId();
 
@@ -207,7 +209,7 @@ export class ConnectClient {
       this.eventHandlers.set(event, new Set());
       // Tell host to forward this event
       if (this.connected) {
-        this.query(RPC_METHODS.SUBSCRIBE, { event }).catch(() => {});
+        this.query(RPC_METHODS.SUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event subscription failed', err));
       }
     }
     this.eventHandlers.get(event)!.add(handler);
@@ -219,7 +221,7 @@ export class ConnectClient {
         if (handlers.size === 0) {
           this.eventHandlers.delete(event);
           if (this.connected) {
-            this.query(RPC_METHODS.UNSUBSCRIBE, { event }).catch(() => {});
+            this.query(RPC_METHODS.UNSUBSCRIBE, { event }).catch((err) => logger.debug('Connect', 'Event unsubscription failed', err));
           }
         }
       }
@@ -256,8 +258,8 @@ export class ConnectClient {
         for (const handler of handlers) {
           try {
             handler(msg.data);
-          } catch {
-            // Ignore handler errors
+          } catch (err) {
+            logger.debug('Connect', 'Event handler error', err);
           }
         }
       }
