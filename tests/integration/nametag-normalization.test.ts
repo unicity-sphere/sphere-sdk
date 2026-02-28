@@ -200,7 +200,7 @@ describe('Nametag normalization integration', () => {
       autoGenerate: true,
     });
 
-    await expect(sphere.registerNametag('ab')).rejects.toThrow('Invalid nametag format');
+    await expect(sphere.registerNametag('ab')).rejects.toThrow('Invalid Unicity ID format');
 
     await sphere.destroy();
   });
@@ -217,7 +217,7 @@ describe('Nametag normalization integration', () => {
       autoGenerate: true,
     });
 
-    await expect(sphere.registerNametag('hello world')).rejects.toThrow('Invalid nametag format');
+    await expect(sphere.registerNametag('hello world')).rejects.toThrow('Invalid Unicity ID format');
 
     await sphere.destroy();
   });
@@ -255,7 +255,7 @@ describe('Nametag normalization integration', () => {
 
     await expect(
       sphere.switchToAddress(1, { nametag: 'x' })
-    ).rejects.toThrow('Invalid nametag format');
+    ).rejects.toThrow('Invalid Unicity ID format');
 
     await sphere.destroy();
   });
