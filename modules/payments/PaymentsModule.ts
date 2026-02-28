@@ -1989,7 +1989,7 @@ export class PaymentsModule {
                 if (proxy.address === proxyAddress) {
                   return nametagToken;
                 }
-                logger.debug('Payments', `Nametag PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
+                logger.debug('Payments', `Unicity ID PROXY address mismatch: ${proxy.address} !== ${proxyAddress}`);
                 return null;
               } catch (err) {
                 logger.debug('Payments', 'Failed to parse nametag token:', err);
@@ -3932,7 +3932,7 @@ export class PaymentsModule {
       this.nametags.push(nametag);
     }
     await this.save();
-    logger.debug('Payments', `Nametag set: ${nametag.name}`);
+    logger.debug('Payments', `Unicity ID set: ${nametag.name}`);
   }
 
   /**
@@ -3986,7 +3986,7 @@ export class PaymentsModule {
           const parsed = parseTxfStorageData(result.data);
           if (parsed.nametags.length > 0) {
             this.nametags = parsed.nametags;
-            logger.debug('Payments', `Reloaded ${parsed.nametags.length} nametag(s) from storage`);
+            logger.debug('Payments', `Reloaded ${parsed.nametags.length} Unicity ID(s) from storage`);
             return;
           }
         }
@@ -4058,7 +4058,7 @@ export class PaymentsModule {
       if (result.success && result.nametagData) {
         // Save the nametag data
         await this.setNametag(result.nametagData);
-        logger.debug('Payments', `Nametag minted and saved: ${result.nametagData.name}`);
+        logger.debug('Payments', `Unicity ID minted and saved: ${result.nametagData.name}`);
 
         // Emit event (use existing nametag:registered event type)
         this.deps!.emitEvent('nametag:registered', {
@@ -4708,13 +4708,13 @@ export class PaymentsModule {
       // Recovery: if nametag is missing in memory (e.g., wiped by sync or race
       // condition during address switch), try reloading from storage
       if (!proxyNametag?.token) {
-        logger.debug('Payments', 'Nametag missing in memory, attempting reload from storage...');
+        logger.debug('Payments', 'Unicity ID missing in memory, attempting reload from storage...');
         await this.reloadNametagsFromStorage();
         proxyNametag = this.getNametag();
       }
 
       if (!proxyNametag?.token) {
-        throw new SphereError('Cannot finalize PROXY transfer - no nametag token', 'VALIDATION_ERROR');
+        throw new SphereError('Cannot finalize PROXY transfer - no Unicity ID token', 'VALIDATION_ERROR');
       }
       const nametagToken = await SdkToken.fromJSON(proxyNametag.token);
       const proxy = await ProxyAddress.fromTokenId(nametagToken.id);

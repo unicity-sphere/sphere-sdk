@@ -231,7 +231,7 @@ describe('Wallet clear end-to-end', () => {
         autoGenerate: true,
         nametag,
       })
-    ).rejects.toThrow('Failed to register nametag');
+    ).rejects.toThrow('Failed to register Unicity ID');
 
     console.log('Wallet 2 correctly rejected — nametag is taken on Nostr.');
   }, 90000);
