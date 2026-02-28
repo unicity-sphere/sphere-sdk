@@ -135,6 +135,8 @@ export interface SphereHandshake extends SphereMessageBase {
   readonly dapp?: DAppMetadata;
   readonly sessionId?: string;
   readonly identity?: PublicIdentity;
+  /** If true, wallet must NOT open any approval UI. Immediately reject if origin is not already approved. */
+  readonly silent?: boolean;
 }
 
 export interface SphereRpcError {

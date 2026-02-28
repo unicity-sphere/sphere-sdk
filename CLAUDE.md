@@ -116,6 +116,148 @@ sphere.payments.onPaymentRequest((req) => {
 await sphere.destroy();
 ```
 
+---
+
+## Connect Protocol (dApp ↔ Wallet Integration)
+
+The SDK ships a full **Connect Protocol** — a typed RPC layer that allows web dApps to communicate with the Sphere wallet without exposing private keys.
+
+> Full guide: [`docs/CONNECT.md`](docs/CONNECT.md)
+
+### Key Concepts
+
+| Role | Class | Where it runs |
+|------|-------|--------------|
+| dApp (client) | `ConnectClient` | any web page / app |
+| Wallet (host) | `ConnectHost` | Sphere app / extension background |
+
+### Transport Types
+
+| Transport | Import path | When to use |
+|-----------|-------------|-------------|
+| `PostMessageTransport` | `@unicitylabs/sphere-sdk/connect/browser` | dApp inside iframe OR wallet popup |
+| `ExtensionTransport` | `@unicitylabs/sphere-sdk/connect/browser` | Sphere browser extension installed |
+| `WebSocketTransport` | `@unicitylabs/sphere-sdk/connect/nodejs` | Node.js server-side wallet host |
+
+### ConnectClient (dApp side)
+
+```typescript
+import { ConnectClient } from '@unicitylabs/sphere-sdk/connect';
+import { ExtensionTransport, PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
+
+// Priority-based transport selection
+let transport: ConnectTransport;
+if (isInIframe())       transport = PostMessageTransport.forClient();          // P1
+else if (hasExt())      transport = ExtensionTransport.forClient();            // P2
+else                    transport = PostMessageTransport.forClient({ target: popup, targetOrigin: WALLET_URL }); // P3
+
+const client = new ConnectClient({
+  transport,
+  dapp: { name: 'My App', description: '...', url: location.origin },
+  silent: true,      // fast-fail if not approved yet (no popup, no UI)
+  resumeSessionId,   // optional: resume popup session across reloads
+});
+
+const { identity, permissions, sessionId } = await client.connect();
+
+// Queries (read-only, no user interaction)
+const balance = await client.query('sphere_getBalance');
+const assets  = await client.query('sphere_getAssets');
+
+// Intents (require user confirmation in wallet)
+await client.intent('send', { recipient: '@alice', amount: 100, coinId: 'USDC' });
+await client.intent('sign_message', { message: 'I agree to ToS' });
+
+// Events (real-time push from wallet)
+const unsub = client.on('transfer:incoming', (data) => { ... });
+
+await client.disconnect();
+```
+
+### ConnectHost (wallet side)
+
+```typescript
+import { ConnectHost } from '@unicitylabs/sphere-sdk/connect';
+import { ExtensionTransport } from '@unicitylabs/sphere-sdk/connect/browser';
+
+const host = new ConnectHost({
+  sphere,          // Sphere instance (unlocked wallet)
+  transport: ExtensionTransport.forHost(chromeApi),
+  onConnectionRequest: async (dapp, requestedPermissions, silent) => {
+    // silent=true → fast-check approved list, no popup
+    // silent=false → show approval UI
+    return { approved: true, grantedPermissions: requestedPermissions };
+  },
+  onIntent: async (action, params, session) => {
+    // Route to correct UI (send modal, sign modal, etc.)
+    return { result: { ... } };
+  },
+  onDisconnect: async (session) => {
+    // dApp called disconnect() — revoke approval if needed
+  },
+});
+
+host.destroy(); // call on wallet lock
+```
+
+### Silent Mode (auto-connect on page load)
+
+```typescript
+// On mount: check silently if origin already approved
+const client = new ConnectClient({ transport, dapp, silent: true });
+try {
+  const result = await client.connect(); // instant success if approved
+} catch {
+  // Not approved — show Connect button, no error displayed
+}
+```
+
+**Extension behavior with `silent=true`:**
+- Origin in approved storage → approve immediately (no popup)
+- Origin NOT in storage → reject immediately (no popup)
+
+### Available RPC Methods
+
+| Method | Description |
+|--------|-------------|
+| `sphere_getIdentity` | Public identity (nametag, addresses) |
+| `sphere_getBalance` | L3 token balances |
+| `sphere_getFiatBalance` | USD value |
+| `sphere_l1GetBalance` | L1 (ALPHA) balance |
+| `sphere_getAssets` | Assets grouped by coin |
+| `sphere_getTokens` | Individual tokens |
+| `sphere_getHistory` | Transaction history |
+| `sphere_l1GetHistory` | L1 transaction history |
+| `sphere_resolve` | Resolve nametag/address |
+
+### Available Intent Actions
+
+| Action | User sees | Description |
+|--------|-----------|-------------|
+| `send` | Send modal | Send L3 tokens |
+| `l1_send` | L1 send modal | Send L1 transaction |
+| `dm` | DM modal | Send direct message |
+| `payment_request` | Request modal | Create payment request |
+| `receive` | Receive modal | Show receive address |
+| `sign_message` | Sign modal | Sign arbitrary message |
+
+### Permission Scopes
+
+| Scope | Grants access to |
+|-------|-----------------|
+| `identity:read` | Public identity info |
+| `balance:read` | Balance queries |
+| `history:read` | Transaction history |
+| `assets:read` | Asset/token list |
+| `intent:send` | Send intent |
+| `intent:l1_send` | L1 send intent |
+| `intent:dm` | DM intent |
+| `intent:payment_request` | Payment request intent |
+| `intent:receive` | Receive intent |
+| `intent:sign_message` | Sign message intent |
+
+---
+
 ### What's Included by Default
 
 | Component | Browser | Node.js |

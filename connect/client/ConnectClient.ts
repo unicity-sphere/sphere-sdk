@@ -39,6 +39,9 @@ export class ConnectClient {
   private readonly timeout: number;
   private readonly intentTimeout: number;
 
+  private readonly resumeSessionId: string | null;
+  private readonly silent: boolean;
+
   private sessionId: string | null = null;
   private grantedPermissions: PermissionScope[] = [];
   private identity: PublicIdentity | null = null;
@@ -61,6 +64,8 @@ export class ConnectClient {
     this.requestedPermissions = config.permissions ?? [...ALL_PERMISSIONS];
     this.timeout = config.timeout ?? DEFAULT_TIMEOUT;
     this.intentTimeout = config.intentTimeout ?? DEFAULT_INTENT_TIMEOUT;
+    this.resumeSessionId = config.resumeSessionId ?? null;
+    this.silent = config.silent ?? false;
   }
 
   // ===========================================================================
@@ -88,6 +93,8 @@ export class ConnectClient {
         direction: 'request',
         permissions: this.requestedPermissions,
         dapp: this.dapp,
+        ...(this.resumeSessionId ? { sessionId: this.resumeSessionId } : {}),
+        ...(this.silent ? { silent: true } : {}),
       });
     });
   }

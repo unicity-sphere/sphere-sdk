@@ -16,6 +16,7 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 - **TXF Serialization** - Token eXchange Format for storage and transfer
 - **Token Validation** - Aggregator-based token verification
 - **Core Utilities** - Crypto, currency, bech32, base58 functions
+- **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
 
 ## Installation
 
@@ -32,6 +33,7 @@ Choose your platform:
 | **Browser** | [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) | SDK only | IPFS sync (built-in) |
 | **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | IPFS sync (built-in) |
 | **CLI** | See below | SDK + `tsx` | - |
+| **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | Sphere extension |
 
 ## CLI (Command Line Interface)
 
