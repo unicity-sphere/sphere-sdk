@@ -184,11 +184,20 @@ export class ConnectHost {
       return;
     }
 
+    // Session resumption: if the client presents a valid existing sessionId,
+    // skip the approval popup and restore the session without user interaction.
+    if (msg.sessionId && this.session?.active && this.session.id === msg.sessionId) {
+      const identity = this.getPublicIdentity();
+      this.sendHandshakeResponse([...this.grantedPermissions], this.session.id, identity);
+      return;
+    }
+
     const requestedPermissions = msg.permissions as PermissionScope[];
 
     const { approved, grantedPermissions } = await this.config.onConnectionRequest(
       dapp,
       requestedPermissions,
+      msg.silent,
     );
 
     if (!approved) {
@@ -259,8 +268,13 @@ export class ConnectHost {
 
     // Handle disconnect
     if (msg.method === RPC_METHODS.DISCONNECT) {
+      const disconnectedSession = this.session;
       this.revokeSession();
       this.sendResult(msg.id, { disconnected: true });
+      if (disconnectedSession && this.config.onDisconnect) {
+        // Fire-and-forget: don't block the response
+        Promise.resolve(this.config.onDisconnect(disconnectedSession)).catch(console.warn);
+      }
       return;
     }
 
