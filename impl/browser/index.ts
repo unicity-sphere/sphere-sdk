@@ -364,9 +364,11 @@ function resolveTokenSyncConfig(
 export function createBrowserProviders(config?: BrowserProvidersConfig): BrowserProviders {
   const network = config?.network ?? 'mainnet';
 
-  // Configure global logger: top-level debug enables all, per-provider overrides are additive
-  const globalDebug = config?.debug ?? false;
-  sdkLogger.configure({ debug: globalDebug });
+  // Configure global logger: top-level debug enables all, per-provider overrides are additive.
+  // Only override global debug flag when explicitly provided — don't reset a previously-configured value.
+  if (config?.debug !== undefined) {
+    sdkLogger.configure({ debug: config.debug });
+  }
   if (config?.transport?.debug) sdkLogger.setTagDebug('Nostr', true);
   if (config?.oracle?.debug) sdkLogger.setTagDebug('Aggregator', true);
   if (config?.price?.debug) sdkLogger.setTagDebug('Price', true);
