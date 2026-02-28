@@ -427,7 +427,7 @@ export class ConnectHost {
         if (needsResolve.length > 0) {
           const resolved = await Promise.all(
             needsResolve.map(({ peerPubkey }) =>
-              this.sphere.communications!.resolvePeerNametag(peerPubkey).catch((err) => { logger.debug('Connect', 'Peer nametag resolution failed', err); return undefined; }),
+              this.sphere.communications!.resolvePeerNametag(peerPubkey).catch((err) => { logger.debug('Connect', 'Peer Unicity ID resolution failed', err); return undefined; }),
             ),
           );
           for (let i = 0; i < needsResolve.length; i++) {

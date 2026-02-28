@@ -824,7 +824,7 @@ export class Sphere {
     // This handles the case where the token was lost from IndexedDB.
     if (sphere._identity?.nametag && !sphere._payments.hasNametag()) {
       progress?.({ step: 'registering_nametag', message: 'Restoring nametag token...' });
-      logger.debug('Sphere', `Nametag @${sphere._identity.nametag} has no token, attempting to mint...`);
+      logger.debug('Sphere', `Unicity ID @${sphere._identity.nametag} has no token, attempting to mint...`);
       try {
         const result = await sphere.mintNametag(sphere._identity.nametag);
         if (result.success) {
@@ -949,9 +949,9 @@ export class Sphere {
     // Try to recover nametag from transport (if no nametag provided and wallet previously had one)
     if (!options.nametag) {
       progress?.({ step: 'recovering_nametag', message: 'Recovering nametag...' });
-      logger.debug('Sphere', 'Recovering nametag from transport...');
+      logger.debug('Sphere', 'Recovering Unicity ID from transport...');
       await sphere.recoverNametagFromTransport();
-      logger.debug('Sphere', 'Nametag recovery done');
+      logger.debug('Sphere', 'Unicity ID recovery done');
       // Publish identity binding (with recovered nametag if found)
       progress?.({ step: 'syncing_identity', message: 'Publishing identity...' });
       await sphere.syncIdentityWithTransport();
@@ -972,7 +972,7 @@ export class Sphere {
     // Register nametag if provided (this overrides any recovered nametag)
     if (options.nametag) {
       progress?.({ step: 'registering_nametag', message: 'Registering nametag...' });
-      logger.debug('Sphere', 'Registering nametag...');
+      logger.debug('Sphere', 'Registering Unicity ID...');
       await sphere.registerNametag(options.nametag);
     }
 
@@ -2055,7 +2055,7 @@ export class Sphere {
     // If nametag requested, normalize and validate format early
     const newNametag = options?.nametag ? this.cleanNametag(options.nametag) : undefined;
     if (newNametag && !isValidNametag(newNametag)) {
-      throw new SphereError('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
+      throw new SphereError('Invalid Unicity ID format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
     // Derive the address at the given index
@@ -2075,7 +2075,7 @@ export class Sphere {
     if (newNametag) {
       const existing = await this._transport.resolveNametag?.(newNametag);
       if (existing) {
-        throw new SphereError(`Nametag @${newNametag} is already taken`, 'VALIDATION_ERROR');
+        throw new SphereError(`Unicity ID @${newNametag} is already taken`, 'VALIDATION_ERROR');
       }
 
       // Pre-populate nametag cache so identity is built WITH nametag
@@ -2175,7 +2175,7 @@ export class Sphere {
       });
     } else if (this._identity?.nametag && !this._payments.hasNametag()) {
       // Existing address with nametag but missing token — mint it
-      logger.debug('Sphere', `Nametag @${this._identity.nametag} has no token after switch, minting...`);
+      logger.debug('Sphere', `Unicity ID @${this._identity.nametag} has no token after switch, minting...`);
       try {
         const result = await this.mintNametag(this._identity.nametag);
         if (result.success) {
@@ -2394,7 +2394,7 @@ export class Sphere {
             try {
               const info = await this._transport.resolveAddressInfo!(l1Address);
               return info?.nametag ?? null;
-            } catch (err) { logger.debug('Sphere', 'Nametag resolution failed during scan', err); return null; }
+            } catch (err) { logger.debug('Sphere', 'Unicity ID resolution failed during scan', err); return null; }
           }
         : undefined
     );
@@ -2887,12 +2887,12 @@ export class Sphere {
     // Normalize and validate nametag format
     const cleanNametag = this.cleanNametag(nametag);
     if (!isValidNametag(cleanNametag)) {
-      throw new SphereError('Invalid nametag format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
+      throw new SphereError('Invalid Unicity ID format. Use lowercase alphanumeric, underscore, or hyphen (3-20 chars), or a valid phone number.', 'VALIDATION_ERROR');
     }
 
     // Check if current address already has a nametag
     if (this._identity?.nametag) {
-      throw new SphereError(`Nametag already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
+      throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
     // Publish identity binding with nametag (updates existing binding event)
@@ -2904,7 +2904,7 @@ export class Sphere {
         cleanNametag,
       );
       if (!success) {
-        throw new SphereError('Failed to register nametag. It may already be taken.', 'VALIDATION_ERROR');
+        throw new SphereError('Failed to register Unicity ID. It may already be taken.', 'VALIDATION_ERROR');
       }
     }
 
@@ -2943,7 +2943,7 @@ export class Sphere {
       nametag: cleanNametag,
       addressIndex: this._currentAddressIndex,
     });
-    logger.debug('Sphere', `Nametag registered for address ${this._currentAddressIndex}:`, cleanNametag);
+    logger.debug('Sphere', `Unicity ID registered for address ${this._currentAddressIndex}:`, cleanNametag);
   }
 
   /**
@@ -3232,7 +3232,7 @@ export class Sphere {
                   this._identity!.directAddress || '',
                   recoveredNametag,
                 );
-                logger.debug('Sphere', `Migrated legacy binding with nametag @${recoveredNametag}`);
+                logger.debug('Sphere', `Migrated legacy binding with Unicity ID @${recoveredNametag}`);
                 return;
               }
             }
@@ -3276,9 +3276,9 @@ export class Sphere {
         nametag || undefined,
       );
       if (success) {
-        logger.debug('Sphere', `Identity binding published${nametag ? ` with nametag @${nametag}` : ''}`);
+        logger.debug('Sphere', `Identity binding published${nametag ? ` with Unicity ID @${nametag}` : ''}`);
       } else if (nametag) {
-        logger.warn('Sphere', `Nametag @${nametag} is taken by another pubkey`);
+        logger.warn('Sphere', `Unicity ID @${nametag} is taken by another pubkey`);
       }
     } catch (error) {
       // Don't fail wallet load on identity sync errors

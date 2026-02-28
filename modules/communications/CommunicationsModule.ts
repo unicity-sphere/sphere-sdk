@@ -668,7 +668,7 @@ export class CommunicationsModule {
       const nametag = recipient.slice(1);
       const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
       if (!pubkey) {
-        throw new SphereError(`Nametag not found: ${recipient}`, 'INVALID_RECIPIENT');
+        throw new SphereError(`Unicity ID not found: ${recipient}`, 'INVALID_RECIPIENT');
       }
       return { pubkey, nametag };
     }

@@ -135,7 +135,7 @@ export async function scanAddressesImpl(
                 nametagsFoundCount++;
               }
             } catch (err) {
-              logger.debug('Sphere', 'Nametag resolution failed during scan', err);
+              logger.debug('Sphere', 'Unicity ID resolution failed during scan', err);
             }
           }
 

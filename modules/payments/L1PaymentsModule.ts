@@ -268,7 +268,7 @@ export class L1PaymentsModule {
 
     const info = await this._transport.resolve(nametag);
     if (!info) {
-      throw new SphereError(`Nametag not found: ${nametag}`, 'INVALID_RECIPIENT');
+      throw new SphereError(`Unicity ID not found: ${nametag}`, 'INVALID_RECIPIENT');
     }
 
     if (!info.l1Address) {

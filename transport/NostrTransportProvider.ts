@@ -911,7 +911,7 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     if (events.length === 0) {
-      logger.debug('Nostr', `resolveNametagInfo: no binding events found for nametag "${nametag}"`);
+      logger.debug('Nostr', `resolveNametagInfo: no binding events found for Unicity ID "${nametag}"`);
       return null;
     }
 
@@ -1156,7 +1156,7 @@ export class NostrTransportProvider implements TransportProvider {
             this.identity.privateKey
           );
           if (decrypted) {
-            logger.debug('Nostr', 'Recovered nametag:', decrypted);
+            logger.debug('Nostr', 'Recovered Unicity ID:', decrypted);
             return decrypted;
           }
         }
@@ -1166,7 +1166,7 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
-    logger.debug('Nostr', 'Could not decrypt nametag from any event');
+    logger.debug('Nostr', 'Could not decrypt Unicity ID from any event');
     return null;
   }
 
@@ -1217,7 +1217,7 @@ export class NostrTransportProvider implements TransportProvider {
     if (nametag) {
       const existing = await this.resolveNametag(nametag);
       if (existing && existing !== nostrPubkey) {
-        logger.debug('Nostr', 'Nametag already taken:', nametag, '- owner:', existing);
+        logger.debug('Nostr', 'Unicity ID already taken:', nametag, '- owner:', existing);
         return false;
       }
 
@@ -1245,9 +1245,9 @@ export class NostrTransportProvider implements TransportProvider {
     await this.publishEvent(event);
 
     if (nametag) {
-      logger.debug('Nostr', 'Published identity binding with nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+      logger.debug('Nostr', 'Published identity binding with Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
     } else {
-      logger.debug('Nostr', 'Published identity binding (no nametag) for pubkey:', nostrPubkey.slice(0, 16) + '...');
+      logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
     }
 
     return true;
@@ -1265,7 +1265,7 @@ export class NostrTransportProvider implements TransportProvider {
     ]);
 
     await this.publishEvent(event);
-    logger.debug('Nostr', 'Published nametag binding:', nametag);
+    logger.debug('Nostr', 'Published Unicity ID binding:', nametag);
   }
 
   async registerNametag(nametag: string, _publicKey: string, directAddress: string = ''): Promise<boolean> {
@@ -1284,7 +1284,7 @@ export class NostrTransportProvider implements TransportProvider {
     logger.debug('Nostr', 'registerNametag:', nametag, 'existing:', existing, 'myPubkey:', nostrPubkey);
 
     if (existing && existing !== nostrPubkey) {
-      logger.debug('Nostr', 'Nametag already taken:', nametag, '- owner:', existing);
+      logger.debug('Nostr', 'Unicity ID already taken:', nametag, '- owner:', existing);
       return false;
     }
 
@@ -1335,7 +1335,7 @@ export class NostrTransportProvider implements TransportProvider {
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
 
     await this.publishEvent(event);
-    logger.debug('Nostr', 'Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
+    logger.debug('Nostr', 'Registered Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
     return true;
   }
 

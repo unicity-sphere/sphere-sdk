@@ -221,7 +221,7 @@ export class InstantSplitProcessor {
             const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
             const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
             if (proxy.address !== recipientAddressStr) {
-              logger.warn('InstantSplit', 'Nametag PROXY address mismatch, ignoring bundle token');
+              logger.warn('InstantSplit', 'Unicity ID PROXY address mismatch, ignoring bundle token');
               // Fall through to callback path
             } else {
               nametagTokens = [nametagToken];
