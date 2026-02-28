@@ -10,6 +10,7 @@
  * - Node.js: read from file
  */
 
+import { logger } from '../core/logger';
 import type { ProviderStatus } from '../types';
 import type {
   OracleProvider,
@@ -579,10 +580,8 @@ export class UnicityAggregatorProvider implements OracleProvider {
     }
   }
 
-  private log(...args: unknown[]): void {
-    if (this.config.debug) {
-      console.log('[UnicityAggregatorProvider]', ...args);
-    }
+  private log(message: string, ...args: unknown[]): void {
+    logger.debug('Aggregator', message, ...args);
   }
 }
 

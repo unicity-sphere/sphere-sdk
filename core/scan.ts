@@ -4,6 +4,7 @@
  * Used after importing BIP32/.dat wallets to discover which addresses have funds.
  */
 
+import { logger } from './logger';
 import type { AddressInfo } from './crypto';
 
 // =============================================================================
@@ -153,7 +154,7 @@ export async function scanAddressesImpl(
         }
       } catch (err) {
         // Network error — count as empty to avoid hanging
-        console.warn(`[scanAddresses] Error checking ${addrInfo.address}:`, err);
+        logger.warn('Sphere', `scanAddresses: Error checking ${addrInfo.address}:`, err);
         consecutiveEmpty++;
       }
 

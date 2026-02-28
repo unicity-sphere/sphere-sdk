@@ -3,6 +3,7 @@
  * Implements StorageProvider using browser localStorage
  */
 
+import { logger } from '../../../core/logger';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
@@ -213,10 +214,8 @@ export class LocalStorageProvider implements StorageProvider {
     return createInMemoryStorage();
   }
 
-  private log(...args: unknown[]): void {
-    if (this.config.debug) {
-      console.log('[LocalStorageProvider]', ...args);
-    }
+  private log(message: string, ...args: unknown[]): void {
+    logger.debug('LocalStorage', message, ...args);
   }
 }
 

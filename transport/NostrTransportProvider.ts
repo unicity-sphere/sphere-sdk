@@ -29,7 +29,9 @@ import {
 } from '@unicitylabs/nostr-js-sdk';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { getPublicKey, publicKeyToAddress } from '../core/crypto';
+import { logger } from '../core/logger';
 import type { ProviderStatus, FullIdentity } from '../types';
+import { SphereError } from '../core/errors';
 import type {
   TransportProvider,
   MessageHandler,
@@ -290,18 +292,18 @@ export class NostrTransportProvider implements TransportProvider {
       // Add connection event listener for logging
       this.nostrClient.addConnectionListener({
         onConnect: (url) => {
-          this.log('NostrClient connected to relay:', url);
+          logger.debug('Nostr', 'NostrClient connected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
         },
         onDisconnect: (url, reason) => {
-          this.log('NostrClient disconnected from relay:', url, 'reason:', reason);
+          logger.debug('Nostr', 'NostrClient disconnected from relay:', url, 'reason:', reason);
         },
         onReconnecting: (url, attempt) => {
-          this.log('NostrClient reconnecting to relay:', url, 'attempt:', attempt);
+          logger.debug('Nostr', 'NostrClient reconnecting to relay:', url, 'attempt:', attempt);
           this.emitEvent({ type: 'transport:reconnecting', timestamp: Date.now() });
         },
         onReconnected: (url) => {
-          this.log('NostrClient reconnected to relay:', url);
+          logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
         },
       });
@@ -323,7 +325,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       this.status = 'connected';
       this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
-      this.log('Connected to', this.nostrClient.getConnectedRelays().size, 'relays');
+      logger.debug('Nostr', 'Connected to', this.nostrClient.getConnectedRelays().size, 'relays');
 
       // Set up subscriptions
       if (this.identity) {
@@ -345,7 +347,7 @@ export class NostrTransportProvider implements TransportProvider {
     this.chatSubscriptionId = null;
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
-    this.log('Disconnected from all relays');
+    logger.debug('Nostr', 'Disconnected from all relays');
   }
 
   isConnected(): boolean {
@@ -382,7 +384,7 @@ export class NostrTransportProvider implements TransportProvider {
   async addRelay(relayUrl: string): Promise<boolean> {
     // Check if already configured
     if (this.config.relays.includes(relayUrl)) {
-      this.log('Relay already configured:', relayUrl);
+      logger.debug('Nostr', 'Relay already configured:', relayUrl);
       return false;
     }
 
@@ -393,7 +395,7 @@ export class NostrTransportProvider implements TransportProvider {
     if (this.status === 'connected' && this.nostrClient) {
       try {
         await this.nostrClient.connect(relayUrl);
-        this.log('Added and connected to relay:', relayUrl);
+        logger.debug('Nostr', 'Added and connected to relay:', relayUrl);
         this.emitEvent({
           type: 'transport:relay_added',
           timestamp: Date.now(),
@@ -401,7 +403,7 @@ export class NostrTransportProvider implements TransportProvider {
         });
         return true;
       } catch (error) {
-        this.log('Failed to connect to new relay:', relayUrl, error);
+        logger.debug('Nostr', 'Failed to connect to new relay:', relayUrl, error);
         this.emitEvent({
           type: 'transport:relay_added',
           timestamp: Date.now(),
@@ -428,13 +430,13 @@ export class NostrTransportProvider implements TransportProvider {
   async removeRelay(relayUrl: string): Promise<boolean> {
     const index = this.config.relays.indexOf(relayUrl);
     if (index === -1) {
-      this.log('Relay not found:', relayUrl);
+      logger.debug('Nostr', 'Relay not found:', relayUrl);
       return false;
     }
 
     // Remove from config
     this.config.relays.splice(index, 1);
-    this.log('Removed relay from config:', relayUrl);
+    logger.debug('Nostr', 'Removed relay from config:', relayUrl);
 
     this.emitEvent({
       type: 'transport:relay_removed',
@@ -483,12 +485,12 @@ export class NostrTransportProvider implements TransportProvider {
 
     // Use Nostr-format pubkey (32 bytes / 64 hex chars) from keyManager
     const nostrPubkey = this.keyManager.getPublicKeyHex();
-    this.log('Identity set, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
+    logger.debug('Nostr', 'Identity set, Nostr pubkey:', nostrPubkey.slice(0, 16) + '...');
 
     // If we already have a NostrClient with a temp key, we need to reconnect with the real key
     // NostrClient doesn't support changing key at runtime
     if (this.nostrClient && this.status === 'connected') {
-      this.log('Identity changed while connected - recreating NostrClient');
+      logger.debug('Nostr', 'Identity changed while connected - recreating NostrClient');
       const oldClient = this.nostrClient;
 
       // Create new client with real identity
@@ -502,16 +504,16 @@ export class NostrTransportProvider implements TransportProvider {
       // Add connection event listener
       this.nostrClient.addConnectionListener({
         onConnect: (url) => {
-          this.log('NostrClient connected to relay:', url);
+          logger.debug('Nostr', 'NostrClient connected to relay:', url);
         },
         onDisconnect: (url, reason) => {
-          this.log('NostrClient disconnected from relay:', url, 'reason:', reason);
+          logger.debug('Nostr', 'NostrClient disconnected from relay:', url, 'reason:', reason);
         },
         onReconnecting: (url, attempt) => {
-          this.log('NostrClient reconnecting to relay:', url, 'attempt:', attempt);
+          logger.debug('Nostr', 'NostrClient reconnecting to relay:', url, 'attempt:', attempt);
         },
         onReconnected: (url) => {
-          this.log('NostrClient reconnected to relay:', url);
+          logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
         },
       });
 
@@ -574,7 +576,7 @@ export class NostrTransportProvider implements TransportProvider {
     const selfPubkey = this.keyManager!.getPublicKeyHex();
     const selfGiftWrap = NIP17.createGiftWrap(this.keyManager!, selfPubkey, selfWrapContent);
     this.publishEvent(selfGiftWrap).catch(err => {
-      this.log('Self-wrap publish failed:', err);
+      logger.debug('Nostr', 'Self-wrap publish failed:', err);
     });
 
     this.emitEvent({
@@ -593,12 +595,12 @@ export class NostrTransportProvider implements TransportProvider {
     if (this.pendingMessages.length > 0) {
       const pending = this.pendingMessages;
       this.pendingMessages = [];
-      this.log('Flushing', pending.length, 'buffered messages to new handler');
+      logger.debug('Nostr', 'Flushing', pending.length, 'buffered messages to new handler');
       for (const message of pending) {
         try {
           handler(message);
         } catch (error) {
-          this.log('Message handler error (buffered):', error);
+          logger.debug('Nostr', 'Message handler error (buffered):', error);
         }
       }
     }
@@ -689,7 +691,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     await this.publishEvent(event);
 
-    this.log('Sent payment request:', event.id);
+    logger.debug('Nostr', 'Sent payment request:', event.id);
 
     return event.id;
   }
@@ -729,7 +731,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     await this.publishEvent(event);
 
-    this.log('Sent payment request response:', event.id, 'type:', payload.responseType);
+    logger.debug('Nostr', 'Sent payment request response:', event.id, 'type:', payload.responseType);
 
     return event.id;
   }
@@ -753,7 +755,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     const event = NIP17.createReadReceipt(this.keyManager, nostrRecipient, messageEventId);
     await this.publishEvent(event);
-    this.log('Sent read receipt for:', messageEventId, 'to:', nostrRecipient.slice(0, 16));
+    logger.debug('Nostr', 'Sent read receipt for:', messageEventId, 'to:', nostrRecipient.slice(0, 16));
   }
 
   onReadReceipt(handler: ReadReceiptHandler): () => void {
@@ -908,7 +910,10 @@ export class NostrTransportProvider implements TransportProvider {
       });
     }
 
-    if (events.length === 0) return null;
+    if (events.length === 0) {
+      logger.debug('Nostr', `resolveNametagInfo: no binding events found for nametag "${nametag}"`);
+      return null;
+    }
 
     const bindingEvent = events[0];
 
@@ -935,7 +940,7 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Legacy event - only has Nostr pubkey
       // Cannot derive l1_address or l3_address without 33-byte pubkey
-      this.log('Legacy nametag event without extended fields:', nametag);
+      logger.debug('Nostr', 'Legacy nametag event without extended fields:', nametag);
 
       // Try to get info from tags as fallback
       const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'pubkey');
@@ -1124,7 +1129,7 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     const nostrPubkey = this.getNostrPubkey();
-    this.log('Searching for nametag events for pubkey:', nostrPubkey.slice(0, 16) + '...');
+    logger.debug('Nostr', 'Searching for nametag events for pubkey:', nostrPubkey.slice(0, 16) + '...');
 
     // Query for nametag binding events authored by this pubkey
     const events = await this.queryEvents({
@@ -1134,7 +1139,7 @@ export class NostrTransportProvider implements TransportProvider {
     });
 
     if (events.length === 0) {
-      this.log('No nametag events found for this pubkey');
+      logger.debug('Nostr', 'No nametag events found for this pubkey');
       return null;
     }
 
@@ -1151,7 +1156,7 @@ export class NostrTransportProvider implements TransportProvider {
             this.identity.privateKey
           );
           if (decrypted) {
-            this.log('Recovered nametag:', decrypted);
+            logger.debug('Nostr', 'Recovered nametag:', decrypted);
             return decrypted;
           }
         }
@@ -1161,7 +1166,7 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
-    this.log('Could not decrypt nametag from any event');
+    logger.debug('Nostr', 'Could not decrypt nametag from any event');
     return null;
   }
 
@@ -1212,7 +1217,7 @@ export class NostrTransportProvider implements TransportProvider {
     if (nametag) {
       const existing = await this.resolveNametag(nametag);
       if (existing && existing !== nostrPubkey) {
-        this.log('Nametag already taken:', nametag, '- owner:', existing);
+        logger.debug('Nostr', 'Nametag already taken:', nametag, '- owner:', existing);
         return false;
       }
 
@@ -1240,9 +1245,9 @@ export class NostrTransportProvider implements TransportProvider {
     await this.publishEvent(event);
 
     if (nametag) {
-      this.log('Published identity binding with nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+      logger.debug('Nostr', 'Published identity binding with nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
     } else {
-      this.log('Published identity binding (no nametag) for pubkey:', nostrPubkey.slice(0, 16) + '...');
+      logger.debug('Nostr', 'Published identity binding (no nametag) for pubkey:', nostrPubkey.slice(0, 16) + '...');
     }
 
     return true;
@@ -1260,7 +1265,7 @@ export class NostrTransportProvider implements TransportProvider {
     ]);
 
     await this.publishEvent(event);
-    this.log('Published nametag binding:', nametag);
+    logger.debug('Nostr', 'Published nametag binding:', nametag);
   }
 
   async registerNametag(nametag: string, _publicKey: string, directAddress: string = ''): Promise<boolean> {
@@ -1276,10 +1281,10 @@ export class NostrTransportProvider implements TransportProvider {
     // Check if nametag is already taken by someone else
     const existing = await this.resolveNametag(nametag);
 
-    this.log('registerNametag:', nametag, 'existing:', existing, 'myPubkey:', nostrPubkey);
+    logger.debug('Nostr', 'registerNametag:', nametag, 'existing:', existing, 'myPubkey:', nostrPubkey);
 
     if (existing && existing !== nostrPubkey) {
-      this.log('Nametag already taken:', nametag, '- owner:', existing);
+      logger.debug('Nostr', 'Nametag already taken:', nametag, '- owner:', existing);
       return false;
     }
 
@@ -1330,7 +1335,7 @@ export class NostrTransportProvider implements TransportProvider {
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
 
     await this.publishEvent(event);
-    this.log('Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
+    logger.debug('Nostr', 'Registered nametag:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
     return true;
   }
 
@@ -1397,14 +1402,14 @@ export class NostrTransportProvider implements TransportProvider {
       this.processedEventIds.add(event.id);
     }
 
-    this.log('Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+    logger.debug('Nostr', 'Processing event kind:', event.kind, 'id:', event.id?.slice(0, 12));
     try {
       switch (event.kind) {
         case EVENT_KINDS.DIRECT_MESSAGE:
           await this.handleDirectMessage(event);
           break;
         case EventKinds.GIFT_WRAP:
-          this.log('Handling gift wrap (NIP-17 DM)');
+          logger.debug('Nostr', 'Handling gift wrap (NIP-17 DM)');
           await this.handleGiftWrap(event);
           break;
         case EVENT_KINDS.TOKEN_TRANSFER:
@@ -1435,7 +1440,7 @@ export class NostrTransportProvider implements TransportProvider {
         }
       }
     } catch (error) {
-      this.log('Failed to handle event:', error);
+      logger.debug('Nostr', 'Failed to handle event:', error);
     }
   }
 
@@ -1453,7 +1458,7 @@ export class NostrTransportProvider implements TransportProvider {
     const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_WALLET_EVENT_TS}_${pubkey.slice(0, 16)}`;
 
     this.storage.set(storageKey, createdAt.toString()).catch(err => {
-      this.log('Failed to save last event timestamp:', err);
+      logger.debug('Nostr', 'Failed to save last event timestamp:', err);
     });
   }
 
@@ -1461,26 +1466,26 @@ export class NostrTransportProvider implements TransportProvider {
     // NIP-04 (kind 4) is deprecated for DMs - only used for legacy token transfers
     // DMs should come through NIP-17 (kind 1059 gift wrap) via handleGiftWrap
     // This handler is kept for backwards compatibility but does NOT dispatch to messageHandlers
-    this.log('Ignoring NIP-04 kind 4 event (DMs use NIP-17):', event.id?.slice(0, 12));
+    logger.debug('Nostr', 'Ignoring NIP-04 kind 4 event (DMs use NIP-17):', event.id?.slice(0, 12));
   }
 
   private async handleGiftWrap(event: NostrEvent): Promise<void> {
     if (!this.identity || !this.keyManager) {
-      this.log('handleGiftWrap: no identity/keyManager');
+      logger.debug('Nostr', 'handleGiftWrap: no identity/keyManager');
       return;
     }
 
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const pm = NIP17.unwrap(event as any, this.keyManager);
-      this.log('Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
+      logger.debug('Nostr', 'Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
 
       // Handle self-wrap (sent message copy for relay replay)
       if (pm.senderPubkey === this.keyManager.getPublicKeyHex()) {
         try {
           const parsed = JSON.parse(pm.content);
           if (parsed?.selfWrap && parsed.recipientPubkey) {
-            this.log('Self-wrap replay for recipient:', parsed.recipientPubkey?.slice(0, 16));
+            logger.debug('Nostr', 'Self-wrap replay for recipient:', parsed.recipientPubkey?.slice(0, 16));
             const message: IncomingMessage = {
               id: parsed.originalId || pm.eventId,
               senderTransportPubkey: pm.senderPubkey,
@@ -1492,20 +1497,20 @@ export class NostrTransportProvider implements TransportProvider {
               isSelfWrap: true,
             };
             for (const handler of this.messageHandlers) {
-              try { handler(message); } catch (e) { this.log('Self-wrap handler error:', e); }
+              try { handler(message); } catch (e) { logger.debug('Nostr', 'Self-wrap handler error:', e); }
             }
             return;
           }
         } catch {
           // Not JSON self-wrap
         }
-        this.log('Skipping own non-self-wrap message');
+        logger.debug('Nostr', 'Skipping own non-self-wrap message');
         return;
       }
 
       // Handle read receipts (kind 15)
       if (isReadReceipt(pm)) {
-        this.log('Read receipt from:', pm.senderPubkey?.slice(0, 16), 'for:', pm.replyToEventId);
+        logger.debug('Nostr', 'Read receipt from:', pm.senderPubkey?.slice(0, 16), 'for:', pm.replyToEventId);
         if (pm.replyToEventId) {
           const receipt: IncomingReadReceipt = {
             senderTransportPubkey: pm.senderPubkey,
@@ -1513,7 +1518,7 @@ export class NostrTransportProvider implements TransportProvider {
             timestamp: pm.timestamp * 1000,
           };
           for (const handler of this.readReceiptHandlers) {
-            try { handler(receipt); } catch (e) { this.log('Read receipt handler error:', e); }
+            try { handler(receipt); } catch (e) { logger.debug('Nostr', 'Read receipt handler error:', e); }
           }
         }
         return;
@@ -1535,9 +1540,9 @@ export class NostrTransportProvider implements TransportProvider {
           senderNametag,
           expiresIn,
         };
-        this.log('Composing indicator from:', indicator.senderNametag || pm.senderPubkey?.slice(0, 16));
+        logger.debug('Nostr', 'Composing indicator from:', indicator.senderNametag || pm.senderPubkey?.slice(0, 16));
         for (const handler of this.composingHandlers) {
-          try { handler(indicator); } catch (e) { this.log('Composing handler error:', e); }
+          try { handler(indicator); } catch (e) { logger.debug('Nostr', 'Composing handler error:', e); }
         }
         return;
       }
@@ -1546,14 +1551,14 @@ export class NostrTransportProvider implements TransportProvider {
       try {
         const parsed = JSON.parse(pm.content);
         if (parsed?.type === 'typing') {
-          this.log('Typing indicator from:', pm.senderPubkey?.slice(0, 16));
+          logger.debug('Nostr', 'Typing indicator from:', pm.senderPubkey?.slice(0, 16));
           const indicator: IncomingTypingIndicator = {
             senderTransportPubkey: pm.senderPubkey,
             senderNametag: parsed.senderNametag,
             timestamp: pm.timestamp * 1000,
           };
           for (const handler of this.typingIndicatorHandlers) {
-            try { handler(indicator); } catch (e) { this.log('Typing handler error:', e); }
+            try { handler(indicator); } catch (e) { logger.debug('Nostr', 'Typing handler error:', e); }
           }
           return;
         }
@@ -1562,7 +1567,7 @@ export class NostrTransportProvider implements TransportProvider {
       }
 
       if (!isChatMessage(pm)) {
-        this.log('Skipping unknown message kind:', pm.kind);
+        logger.debug('Nostr', 'Skipping unknown message kind:', pm.kind);
         return;
       }
 
@@ -1579,7 +1584,7 @@ export class NostrTransportProvider implements TransportProvider {
         // Plain text — use as-is
       }
 
-      this.log('DM received from:', senderNametag || pm.senderPubkey?.slice(0, 16), 'content:', content?.slice(0, 50));
+      logger.debug('Nostr', 'DM received from:', senderNametag || pm.senderPubkey?.slice(0, 16), 'content:', content?.slice(0, 50));
 
       const message: IncomingMessage = {
         // Use outer gift wrap event.id so it matches the sender's stored giftWrap.id.
@@ -1595,21 +1600,21 @@ export class NostrTransportProvider implements TransportProvider {
       this.emitEvent({ type: 'message:received', timestamp: Date.now() });
 
       if (this.messageHandlers.size === 0) {
-        this.log('No message handlers registered, buffering message for later delivery');
+        logger.debug('Nostr', 'No message handlers registered, buffering message for later delivery');
         this.pendingMessages.push(message);
       } else {
-        this.log('Dispatching to', this.messageHandlers.size, 'handlers');
+        logger.debug('Nostr', 'Dispatching to', this.messageHandlers.size, 'handlers');
         for (const handler of this.messageHandlers) {
           try {
             handler(message);
           } catch (error) {
-            this.log('Message handler error:', error);
+            logger.debug('Nostr', 'Message handler error:', error);
           }
         }
       }
     } catch (err) {
       // Expected for gift wraps meant for other recipients
-      this.log('Gift wrap decrypt failed (expected if not for us):', (err as Error)?.message?.slice(0, 50));
+      logger.debug('Nostr', 'Gift wrap decrypt failed (expected if not for us):', (err as Error)?.message?.slice(0, 50));
     }
   }
 
@@ -1633,7 +1638,7 @@ export class NostrTransportProvider implements TransportProvider {
       try {
         await handler(transfer);
       } catch (error) {
-        this.log('Transfer handler error:', error);
+        logger.debug('Nostr', 'Transfer handler error:', error);
       }
     }
   }
@@ -1668,17 +1673,17 @@ export class NostrTransportProvider implements TransportProvider {
         timestamp: event.created_at * 1000,
       };
 
-      this.log('Received payment request:', request.id);
+      logger.debug('Nostr', 'Received payment request:', request.id);
 
       for (const handler of this.paymentRequestHandlers) {
         try {
           handler(request);
         } catch (error) {
-          this.log('Payment request handler error:', error);
+          logger.debug('Nostr', 'Payment request handler error:', error);
         }
       }
     } catch (error) {
-      this.log('Failed to handle payment request:', error);
+      logger.debug('Nostr', 'Failed to handle payment request:', error);
     }
   }
 
@@ -1707,17 +1712,17 @@ export class NostrTransportProvider implements TransportProvider {
         timestamp: event.created_at * 1000,
       };
 
-      this.log('Received payment request response:', response.id, 'type:', responseData.responseType);
+      logger.debug('Nostr', 'Received payment request response:', response.id, 'type:', responseData.responseType);
 
       for (const handler of this.paymentRequestResponseHandlers) {
         try {
           handler(response);
         } catch (error) {
-          this.log('Payment request response handler error:', error);
+          logger.debug('Nostr', 'Payment request response handler error:', error);
         }
       }
     } catch (error) {
-      this.log('Failed to handle payment request response:', error);
+      logger.debug('Nostr', 'Failed to handle payment request response:', error);
     }
   }
 
@@ -1742,7 +1747,7 @@ export class NostrTransportProvider implements TransportProvider {
           try {
             handler(broadcast);
           } catch (error) {
-            this.log('Broadcast handler error:', error);
+            logger.debug('Nostr', 'Broadcast handler error:', error);
           }
         }
       }
@@ -1870,7 +1875,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
     if (!this.nostrClient || !this.nostrClient.isConnected()) {
-      throw new Error('No connected relays');
+      throw new SphereError('No connected relays', 'TRANSPORT_ERROR');
     }
 
     const events: NostrEvent[] = [];
@@ -1881,6 +1886,7 @@ export class NostrTransportProvider implements TransportProvider {
         if (subId) {
           this.nostrClient?.unsubscribe(subId);
         }
+        logger.warn('Nostr', `queryEvents timed out after 5s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
       }, 5000);
 
@@ -1914,9 +1920,9 @@ export class NostrTransportProvider implements TransportProvider {
   private chatSubscriptionId: string | null = null;
 
   private async subscribeToEvents(): Promise<void> {
-    this.log('subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
+    logger.debug('Nostr', 'subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
     if (!this.identity || !this.keyManager || !this.nostrClient) {
-      this.log('subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
+      logger.debug('Nostr', 'subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
       return;
     }
 
@@ -1936,7 +1942,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     // Use 32-byte Nostr pubkey (x-coordinate only), not 33-byte compressed key
     const nostrPubkey = this.keyManager.getPublicKeyHex();
-    this.log('Subscribing with Nostr pubkey:', nostrPubkey);
+    logger.debug('Nostr', 'Subscribing with Nostr pubkey:', nostrPubkey);
 
     // Determine 'since' filter from persisted last event timestamp.
     // - Existing wallet: resume from last processed event (inclusive >=, dedup handles replays)
@@ -1949,20 +1955,20 @@ export class NostrTransportProvider implements TransportProvider {
         if (stored) {
           since = parseInt(stored, 10);
           this.lastEventTs = since; // Seed in-memory tracker from storage
-          this.log('Resuming from stored event timestamp:', since);
+          logger.debug('Nostr', 'Resuming from stored event timestamp:', since);
         } else {
           // No stored timestamp = fresh wallet, start from now
           since = Math.floor(Date.now() / 1000);
-          this.log('No stored timestamp, starting from now:', since);
+          logger.debug('Nostr', 'No stored timestamp, starting from now:', since);
         }
       } catch (err) {
-        this.log('Failed to read last event timestamp, falling back to now:', err);
+        logger.debug('Nostr', 'Failed to read last event timestamp, falling back to now:', err);
         since = Math.floor(Date.now() / 1000);
       }
     } else {
       // No storage adapter — fallback to last 24h (legacy behavior)
       since = Math.floor(Date.now() / 1000) - 86400;
-      this.log('No storage adapter, using 24h fallback');
+      logger.debug('Nostr', 'No storage adapter, using 24h fallback');
     }
 
     // Subscribe to wallet events (token transfers, payment requests) with since filter
@@ -1978,7 +1984,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
       onEvent: (event) => {
-        this.log('Received wallet event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        logger.debug('Nostr', 'Received wallet event kind:', event.kind, 'id:', event.id?.slice(0, 12));
         this.handleEvent({
           id: event.id,
           kind: event.kind,
@@ -1990,13 +1996,13 @@ export class NostrTransportProvider implements TransportProvider {
         });
       },
       onEndOfStoredEvents: () => {
-        this.log('Wallet subscription ready (EOSE)');
+        logger.debug('Nostr', 'Wallet subscription ready (EOSE)');
       },
       onError: (_subId, error) => {
-        this.log('Wallet subscription error:', error);
+        logger.debug('Nostr', 'Wallet subscription error:', error);
       },
     });
-    this.log('Wallet subscription created, subId:', this.walletSubscriptionId);
+    logger.debug('Nostr', 'Wallet subscription created, subId:', this.walletSubscriptionId);
 
     // Subscribe to chat events (NIP-17 gift wrap) WITHOUT since filter
     // This matches Sphere app's approach - chat messages rely on deduplication
@@ -2007,7 +2013,7 @@ export class NostrTransportProvider implements TransportProvider {
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
-        this.log('Received chat event kind:', event.kind, 'id:', event.id?.slice(0, 12));
+        logger.debug('Nostr', 'Received chat event kind:', event.kind, 'id:', event.id?.slice(0, 12));
         this.handleEvent({
           id: event.id,
           kind: event.kind,
@@ -2019,13 +2025,13 @@ export class NostrTransportProvider implements TransportProvider {
         });
       },
       onEndOfStoredEvents: () => {
-        this.log('Chat subscription ready (EOSE)');
+        logger.debug('Nostr', 'Chat subscription ready (EOSE)');
       },
       onError: (_subId, error) => {
-        this.log('Chat subscription error:', error);
+        logger.debug('Nostr', 'Chat subscription error:', error);
       },
     });
-    this.log('Chat subscription created, subId:', this.chatSubscriptionId);
+    logger.debug('Nostr', 'Chat subscription created, subId:', this.chatSubscriptionId);
   }
 
   private subscribeToTags(tags: string[]): void {
@@ -2099,7 +2105,7 @@ export class NostrTransportProvider implements TransportProvider {
 
   private ensureConnected(): void {
     if (!this.isConnected()) {
-      throw new Error('NostrTransportProvider not connected');
+      throw new SphereError('NostrTransportProvider not connected', 'TRANSPORT_ERROR');
     }
   }
 
@@ -2115,7 +2121,7 @@ export class NostrTransportProvider implements TransportProvider {
       try {
         callback(event);
       } catch (error) {
-        this.log('Event callback error:', error);
+        logger.debug('Nostr', 'Event callback error:', error);
       }
     }
   }
@@ -2161,11 +2167,6 @@ export class NostrTransportProvider implements TransportProvider {
     return giftWrap;
   }
 
-  private log(...args: unknown[]): void {
-    if (this.config.debug) {
-      console.log('[NostrTransportProvider]', ...args);
-    }
-  }
 }
 
 // =============================================================================

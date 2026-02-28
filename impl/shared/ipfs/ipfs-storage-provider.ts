@@ -7,6 +7,7 @@
  * Writes are accepted immediately and flushed to IPFS asynchronously.
  */
 
+import { logger } from '../../../core/logger';
 import type { ProviderStatus, FullIdentity } from '../../../types';
 import type {
   TokenStorageProvider,
@@ -220,8 +221,8 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         } else {
           this.log('Warning: no healthy gateways found');
         }
-      }).catch(() => {
-        // Non-fatal
+      }).catch((err) => {
+        logger.warn('IPFS-Storage', 'Gateway health check failed (non-fatal):', err);
       });
 
       this.isShuttingDown = false;
@@ -757,10 +758,14 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       // Force the timer to fire now
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
-      await this.flushQueue.enqueue(() => this.executeFlush()).catch(() => {});
+      await this.flushQueue.enqueue(() => this.executeFlush()).catch((err) => {
+        logger.warn('IPFS-Storage', 'Flush on shutdown failed:', err);
+      });
     } else if (!this.pendingBuffer.isEmpty) {
       // No timer but pending data — flush now
-      await this.flushQueue.enqueue(() => this.executeFlush()).catch(() => {});
+      await this.flushQueue.enqueue(() => this.executeFlush()).catch((err) => {
+        logger.warn('IPFS-Storage', 'Flush on shutdown failed:', err);
+      });
     } else {
       // Ensure any in-flight flush completes
       await this.flushQueue.enqueue(async () => {});
@@ -823,9 +828,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   }
 
   private log(message: string): void {
-    if (this.debug) {
-      console.log(`[IPFS-Storage] ${message}`);
-    }
+    logger.debug('IPFS-Storage', message);
   }
 
 }

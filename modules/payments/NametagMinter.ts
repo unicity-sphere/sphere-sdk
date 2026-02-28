@@ -13,6 +13,7 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { logger } from '../../core/logger';
 
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
@@ -78,10 +79,8 @@ export class NametagMinter {
     this.debug = config.debug ?? false;
   }
 
-  private log(...args: unknown[]): void {
-    if (this.debug) {
-      console.log('[NametagMinter]', ...args);
-    }
+  private log(message: string, ...args: unknown[]): void {
+    logger.debug('NametagMinter', message, ...args);
   }
 
   /**

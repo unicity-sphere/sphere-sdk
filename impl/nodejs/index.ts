@@ -24,6 +24,7 @@ export type {
 // Convenience Factory
 // =============================================================================
 
+import { logger as sdkLogger } from '../../core/logger';
 import { createFileStorageProvider, createFileTokenStorageProvider } from './storage';
 import { createNostrTransportProvider } from './transport';
 import { createUnicityAggregatorProvider } from './oracle';
@@ -97,6 +98,8 @@ export interface NodeTokenSyncConfig {
 export interface NodeProvidersConfig {
   /** Network preset: mainnet, testnet, or dev */
   network?: NetworkType;
+  /** Enable debug logging globally for all providers (default: false). Per-provider debug flags override this. */
+  debug?: boolean;
   /** Directory for wallet data storage */
   dataDir?: string;
   /** Wallet file name (default: 'wallet.json') */
@@ -178,6 +181,13 @@ export interface NodeProviders {
  */
 export function createNodeProviders(config?: NodeProvidersConfig): NodeProviders {
   const network = config?.network ?? 'mainnet';
+
+  // Configure global logger: top-level debug enables all, per-provider overrides are additive
+  const globalDebug = config?.debug ?? false;
+  sdkLogger.configure({ debug: globalDebug });
+  if (config?.transport?.debug) sdkLogger.setTagDebug('Nostr', true);
+  if (config?.oracle?.debug) sdkLogger.setTagDebug('Aggregator', true);
+  if (config?.price?.debug) sdkLogger.setTagDebug('Price', true);
 
   // Resolve configurations using shared utilities
   const transportConfig = resolveTransportConfig(network, config?.transport);

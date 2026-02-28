@@ -15,6 +15,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { logger } from '../../core/logger';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
 import { TokenType } from '@unicitylabs/state-transition-sdk/lib/token/TokenType';
@@ -127,39 +128,39 @@ export class InstantSplitProcessor {
     senderPubkey: string,
     options?: ProcessBundleOptions
   ): Promise<InstantSplitProcessResult> {
-    console.log('[InstantSplitProcessor] Processing V5 bundle...');
+    logger.debug('InstantSplit', 'Processing V5 bundle...');
     const startTime = performance.now();
 
     try {
       // Validate sender pubkey matches bundle
       if (bundle.senderPubkey !== senderPubkey) {
-        console.warn('[InstantSplitProcessor] Sender pubkey mismatch (non-fatal)');
+        logger.warn('InstantSplit', 'Sender pubkey mismatch (non-fatal)');
       }
 
       // === Step 1: Validate burn transaction ===
       const burnTxJson = JSON.parse(bundle.burnTransaction);
       const _burnTransaction = await TransferTransaction.fromJSON(burnTxJson);
-      console.log('[InstantSplitProcessor] Burn transaction validated');
+      logger.debug('InstantSplit', 'Burn transaction validated');
 
       // === Step 2: Deserialize and submit MintCommitment ===
       const mintDataJson = JSON.parse(bundle.recipientMintData);
       const mintData = await MintTransactionData.fromJSON(mintDataJson);
 
       const mintCommitment = await MintCommitment.create(mintData);
-      console.log('[InstantSplitProcessor] Mint commitment recreated');
+      logger.debug('InstantSplit', 'Mint commitment recreated');
 
       const mintResponse = await this.client.submitMintCommitment(mintCommitment);
       if (mintResponse.status !== 'SUCCESS' && mintResponse.status !== 'REQUEST_ID_EXISTS') {
         throw new Error(`Mint submission failed: ${mintResponse.status}`);
       }
-      console.log(`[InstantSplitProcessor] Mint submitted: ${mintResponse.status}`);
+      logger.debug('InstantSplit', `Mint submitted: ${mintResponse.status}`);
 
       // === Step 3: Wait for mint inclusion proof ===
       const mintProof = this.devMode
         ? await this.waitInclusionProofWithDevBypass(mintCommitment, options?.proofTimeoutMs)
         : await waitInclusionProof(this.trustBase, this.client, mintCommitment);
       const mintTransaction = mintCommitment.toTransaction(mintProof);
-      console.log('[InstantSplitProcessor] Mint proof received');
+      logger.debug('InstantSplit', 'Mint proof received');
 
       // === Step 4: Reconstruct minted token using sender's state ===
       const tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
@@ -173,7 +174,7 @@ export class InstantSplitProcessor {
         nametags: [],
       };
       const mintedToken = await Token.fromJSON(tokenJson);
-      console.log('[InstantSplitProcessor] Minted token reconstructed from sender state');
+      logger.debug('InstantSplit', 'Minted token reconstructed from sender state');
 
       // === Step 5: Submit transfer commitment ===
       const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
@@ -183,14 +184,14 @@ export class InstantSplitProcessor {
       if (transferResponse.status !== 'SUCCESS' && transferResponse.status !== 'REQUEST_ID_EXISTS') {
         throw new Error(`Transfer submission failed: ${transferResponse.status}`);
       }
-      console.log(`[InstantSplitProcessor] Transfer submitted: ${transferResponse.status}`);
+      logger.debug('InstantSplit', `Transfer submitted: ${transferResponse.status}`);
 
       // === Step 6: Wait for transfer inclusion proof ===
       const transferProof = this.devMode
         ? await this.waitInclusionProofWithDevBypass(transferCommitment, options?.proofTimeoutMs)
         : await waitInclusionProof(this.trustBase, this.client, transferCommitment);
       const transferTransaction = transferCommitment.toTransaction(transferProof);
-      console.log('[InstantSplitProcessor] Transfer proof received');
+      logger.debug('InstantSplit', 'Transfer proof received');
 
       // === Step 7: Create recipient's final state ===
       const transferSalt = fromHex(bundle.transferSaltHex);
@@ -202,14 +203,14 @@ export class InstantSplitProcessor {
         transferSalt
       );
       const finalRecipientState = new TokenState(finalRecipientPredicate, null);
-      console.log('[InstantSplitProcessor] Final recipient state created');
+      logger.debug('InstantSplit', 'Final recipient state created');
 
       // === Step 8: Find nametag token for PROXY addresses ===
       let nametagTokens: Token<any>[] = [];
       const recipientAddressStr = bundle.recipientAddressJson;
 
       if (recipientAddressStr.startsWith('PROXY://')) {
-        console.log('[InstantSplitProcessor] PROXY address detected, finding nametag token...');
+        logger.debug('InstantSplit', 'PROXY address detected, finding nametag token...');
 
         // Try to get nametag token from bundle first
         if (bundle.nametagTokenJson) {
@@ -219,14 +220,14 @@ export class InstantSplitProcessor {
             const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
             const proxy = await ProxyAddress.fromTokenId(nametagToken.id);
             if (proxy.address !== recipientAddressStr) {
-              console.warn('[InstantSplitProcessor] Nametag PROXY address mismatch, ignoring bundle token');
+              logger.warn('InstantSplit', 'Nametag PROXY address mismatch, ignoring bundle token');
               // Fall through to callback path
             } else {
               nametagTokens = [nametagToken];
-              console.log('[InstantSplitProcessor] Using nametag token from bundle (address validated)');
+              logger.debug('InstantSplit', 'Using nametag token from bundle (address validated)');
             }
           } catch (err) {
-            console.warn('[InstantSplitProcessor] Failed to parse nametag token from bundle:', err);
+            logger.warn('InstantSplit', 'Failed to parse nametag token from bundle:', err);
           }
         }
 
@@ -235,7 +236,7 @@ export class InstantSplitProcessor {
           const token = await options.findNametagToken(recipientAddressStr);
           if (token) {
             nametagTokens = [token];
-            console.log('[InstantSplitProcessor] Found nametag token via callback');
+            logger.debug('InstantSplit', 'Found nametag token via callback');
           }
         }
 
@@ -253,7 +254,7 @@ export class InstantSplitProcessor {
 
       if (this.devMode) {
         // Dev mode: create token without verification
-        console.log('[InstantSplitProcessor] Dev mode: finalizing without verification');
+        logger.debug('InstantSplit', 'Dev mode: finalizing without verification');
         const tokenJson = mintedToken.toJSON() as any;
         tokenJson.state = finalRecipientState.toJSON();
         tokenJson.transactions = [transferTransaction.toJSON()];
@@ -268,7 +269,7 @@ export class InstantSplitProcessor {
           nametagTokens
         );
       }
-      console.log('[InstantSplitProcessor] Token finalized');
+      logger.debug('InstantSplit', 'Token finalized');
 
       // === Step 10: Verify the final token ===
       if (!this.devMode) {
@@ -276,11 +277,11 @@ export class InstantSplitProcessor {
         if (!verification.isSuccessful) {
           throw new Error(`Token verification failed`);
         }
-        console.log('[InstantSplitProcessor] Token verified');
+        logger.debug('InstantSplit', 'Token verified');
       }
 
       const duration = performance.now() - startTime;
-      console.log(`[InstantSplitProcessor] V5 bundle processed in ${duration.toFixed(0)}ms`);
+      logger.debug('InstantSplit', `V5 bundle processed in ${duration.toFixed(0)}ms`);
 
       return {
         success: true,
@@ -290,7 +291,7 @@ export class InstantSplitProcessor {
     } catch (error) {
       const duration = performance.now() - startTime;
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`[InstantSplitProcessor] V5 processing failed:`, error);
+      logger.error('InstantSplit', 'V5 processing failed:', error);
 
       return {
         success: false,
@@ -324,7 +325,7 @@ export class InstantSplitProcessor {
       };
     }
 
-    console.log('[InstantSplitProcessor] Processing V4 bundle (dev mode)...');
+    logger.debug('InstantSplit', 'Processing V4 bundle (dev mode)...');
     const startTime = performance.now();
 
     try {
@@ -338,7 +339,7 @@ export class InstantSplitProcessor {
       }
 
       await this.waitInclusionProofWithDevBypass(burnCommitment, options?.proofTimeoutMs);
-      console.log('[InstantSplitProcessor] V4: Burn proof received');
+      logger.debug('InstantSplit', 'V4: Burn proof received');
 
       // === Step 2: Submit mint commitment and wait for proof ===
       const mintDataJson = JSON.parse(bundle.recipientMintData);
@@ -356,7 +357,7 @@ export class InstantSplitProcessor {
         options?.proofTimeoutMs
       );
       const mintTransaction = mintCommitment.toTransaction(mintProof);
-      console.log('[InstantSplitProcessor] V4: Mint proof received');
+      logger.debug('InstantSplit', 'V4: Mint proof received');
 
       // === Step 3: Reconstruct minted token ===
       const tokenType = new TokenType(fromHex(bundle.tokenTypeHex));
@@ -379,7 +380,7 @@ export class InstantSplitProcessor {
         nametags: [],
       };
       const mintedToken = await Token.fromJSON(tokenJson);
-      console.log('[InstantSplitProcessor] V4: Minted token reconstructed');
+      logger.debug('InstantSplit', 'V4: Minted token reconstructed');
 
       // === Step 4: Submit transfer commitment and wait for proof ===
       const transferCommitmentJson = JSON.parse(bundle.transferCommitment);
@@ -395,7 +396,7 @@ export class InstantSplitProcessor {
         options?.proofTimeoutMs
       );
       const transferTransaction = transferCommitment.toTransaction(transferProof);
-      console.log('[InstantSplitProcessor] V4: Transfer proof received');
+      logger.debug('InstantSplit', 'V4: Transfer proof received');
 
       // === Step 5: Finalize token (dev mode - no verification) ===
       const transferSalt = fromHex(bundle.transferSaltHex);
@@ -412,10 +413,10 @@ export class InstantSplitProcessor {
       finalTokenJson.state = finalState.toJSON();
       finalTokenJson.transactions = [transferTransaction.toJSON()];
       const finalToken = await Token.fromJSON(finalTokenJson);
-      console.log('[InstantSplitProcessor] V4: Token finalized');
+      logger.debug('InstantSplit', 'V4: Token finalized');
 
       const duration = performance.now() - startTime;
-      console.log(`[InstantSplitProcessor] V4 bundle processed in ${duration.toFixed(0)}ms`);
+      logger.debug('InstantSplit', `V4 bundle processed in ${duration.toFixed(0)}ms`);
 
       return {
         success: true,
@@ -425,7 +426,7 @@ export class InstantSplitProcessor {
     } catch (error) {
       const duration = performance.now() - startTime;
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`[InstantSplitProcessor] V4 processing failed:`, error);
+      logger.error('InstantSplit', 'V4 processing failed:', error);
 
       return {
         success: false,
@@ -451,7 +452,7 @@ export class InstantSplitProcessor {
           ),
         ]);
       } catch {
-        console.log('[InstantSplitProcessor] Dev mode: Using mock proof');
+        logger.debug('InstantSplit', 'Dev mode: Using mock proof');
         return {
           toJSON: () => ({ mock: true }),
         };

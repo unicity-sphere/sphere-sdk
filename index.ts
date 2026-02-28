@@ -48,7 +48,7 @@
 // Core
 // =============================================================================
 
-export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth } from './core';
+export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth, logger, SphereError, isSphereError } from './core';
 export type {
   SphereCreateOptions,
   SphereLoadOptions,
@@ -67,6 +67,10 @@ export type {
   DiscoverAddressesOptions,
   DiscoverAddressesResult,
   CheckNetworkHealthOptions,
+  LogLevel,
+  LogHandler,
+  LoggerConfig,
+  SphereErrorCode,
 } from './core';
 
 // =============================================================================

@@ -132,6 +132,8 @@ export interface BaseMarketConfig {
 export interface BaseProvidersConfig {
   /** Network preset: mainnet, testnet, or dev. Sets default URLs for all services */
   network?: NetworkType;
+  /** Enable debug logging globally for all providers (default: false). Per-provider debug flags override this. */
+  debug?: boolean;
   /** Transport (Nostr) configuration - supports extend/override pattern */
   transport?: BaseTransportConfig;
   /** Oracle (Aggregator) configuration - supports extend/override pattern */

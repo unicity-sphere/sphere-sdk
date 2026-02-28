@@ -489,35 +489,11 @@ export interface LoggingConfig {
 }
 
 // =============================================================================
-// Error Types
+// Error Types (canonical source: core/errors.ts)
 // =============================================================================
 
-export type SphereErrorCode =
-  | 'NOT_INITIALIZED'
-  | 'ALREADY_INITIALIZED'
-  | 'INVALID_CONFIG'
-  | 'INVALID_IDENTITY'
-  | 'INSUFFICIENT_BALANCE'
-  | 'INVALID_RECIPIENT'
-  | 'TRANSFER_FAILED'
-  | 'STORAGE_ERROR'
-  | 'TRANSPORT_ERROR'
-  | 'AGGREGATOR_ERROR'
-  | 'VALIDATION_ERROR'
-  | 'NETWORK_ERROR'
-  | 'TIMEOUT';
-
-export class SphereError extends Error {
-  readonly code: SphereErrorCode;
-  readonly cause?: unknown;
-
-  constructor(message: string, code: SphereErrorCode, cause?: unknown) {
-    super(message);
-    this.name = 'SphereError';
-    this.code = code;
-    this.cause = cause;
-  }
-}
+export { SphereError, isSphereError } from '../core/errors';
+export type { SphereErrorCode } from '../core/errors';
 
 // =============================================================================
 // Wallet Management Types

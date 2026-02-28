@@ -4,6 +4,7 @@
  * Each address gets its own database for multi-address support
  */
 
+import { logger } from '../../../core/logger';
 import type { TokenStorageProvider, TxfStorageDataBase, SyncResult, SaveResult, LoadResult, HistoryRecord } from '../../../storage';
 import type { FullIdentity, ProviderStatus } from '../../../types';
 import { getAddressId } from '../../../constants';
@@ -62,7 +63,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       const addressId = getAddressId(identity.directAddress);
       this.dbName = `${this.dbNamePrefix}-${addressId}`;
     }
-    console.log(`[IndexedDBTokenStorage] setIdentity: db=${this.dbName}`);
+    logger.debug('IndexedDBToken', `setIdentity: db=${this.dbName}`);
   }
 
   async initialize(): Promise<boolean> {
@@ -72,18 +73,18 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       // Close any existing connection before opening a new one
       // (e.g. when switching addresses — prevents leaked IDB connections)
       if (this.db) {
-        console.log(`[IndexedDBTokenStorage] initialize: closing existing connId=${prevConnId} before re-open (db=${this.dbName})`);
+        logger.debug('IndexedDBToken', `initialize: closing existing connId=${prevConnId} before re-open (db=${this.dbName})`);
         this.db.close();
         this.db = null;
       }
 
-      console.log(`[IndexedDBTokenStorage] initialize: opening db=${this.dbName}`);
+      logger.debug('IndexedDBToken', `initialize: opening db=${this.dbName}`);
       this.db = await this.openDatabase();
       this.status = 'connected';
-      console.log(`[IndexedDBTokenStorage] initialize: connected db=${this.dbName} connId=${this.connId} (${Date.now() - t0}ms)`);
+      logger.debug('IndexedDBToken', `initialize: connected db=${this.dbName} connId=${this.connId} (${Date.now() - t0}ms)`);
       return true;
     } catch (error) {
-      console.error(`[IndexedDBTokenStorage] initialize: failed db=${this.dbName} (${Date.now() - t0}ms):`, error);
+      logger.error('IndexedDBToken', `initialize: failed db=${this.dbName} (${Date.now() - t0}ms):`, error);
       this.status = 'error';
       return false;
     }
@@ -91,7 +92,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
 
   async shutdown(): Promise<void> {
     const cid = this.connId;
-    console.log(`[IndexedDBTokenStorage] shutdown: db=${this.dbName} connId=${cid} wasConnected=${!!this.db}`);
+    logger.debug('IndexedDBToken', `shutdown: db=${this.dbName} connId=${cid} wasConnected=${!!this.db}`);
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -117,7 +118,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
 
   async load(): Promise<LoadResult<TxfStorageDataBase>> {
     if (!this.db) {
-      console.warn(`[IndexedDBTokenStorage] load: db not initialized (db=${this.dbName})`);
+      logger.warn('IndexedDBToken', `load: db not initialized (db=${this.dbName})`);
       return {
         success: false,
         error: 'Database not initialized',
@@ -185,7 +186,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       }
 
       const tokenKeys = Object.keys(data).filter(k => k.startsWith('_') && !['_meta', '_tombstones', '_outbox', '_sent', '_invalid'].includes(k));
-      console.log(`[IndexedDBTokenStorage] load: db=${this.dbName}, tokens=${tokenKeys.length}`);
+      logger.debug('IndexedDBToken', `load: db=${this.dbName}, tokens=${tokenKeys.length}`);
 
       return {
         success: true,
@@ -194,7 +195,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         timestamp: Date.now(),
       };
     } catch (error) {
-      console.error(`[IndexedDBTokenStorage] load failed: db=${this.dbName}`, error);
+      logger.error('IndexedDBToken', `load failed: db=${this.dbName}`, error);
       return {
         success: false,
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -206,7 +207,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
 
   async save(data: TxfStorageDataBase): Promise<SaveResult> {
     if (!this.db) {
-      console.warn(`[IndexedDBTokenStorage] save: db not initialized (db=${this.dbName})`);
+      logger.warn('IndexedDBToken', `save: db not initialized (db=${this.dbName})`);
       return {
         success: false,
         error: 'Database not initialized',
@@ -217,7 +218,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
     try {
       const tokenKeys = Object.keys(data).filter(k => k.startsWith('_') && !['_meta', '_tombstones', '_outbox', '_sent', '_invalid'].includes(k));
       const archivedKeys = Object.keys(data).filter(k => k.startsWith('archived-'));
-      console.log(`[IndexedDBTokenStorage] save: db=${this.dbName}, tokens=${tokenKeys.length}, archived=${archivedKeys.length}, tombstones=${data._tombstones?.length ?? 0}`);
+      logger.debug('IndexedDBToken', `save: db=${this.dbName}, tokens=${tokenKeys.length}, archived=${archivedKeys.length}, tombstones=${data._tombstones?.length ?? 0}`);
 
       // Save meta
       await this.putToStore(STORE_META, 'meta', data._meta);
@@ -312,21 +313,21 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       }
 
       // 3. Clear stores in each database in parallel
-      console.log(`[IndexedDBTokenStorage] clear: clearing ${dbNames.size} database(s) (${[...dbNames].join(', ')})`);
+      logger.debug('IndexedDBToken', `clear: clearing ${dbNames.size} database(s) (${[...dbNames].join(', ')})`);
       const results = await Promise.allSettled(
         [...dbNames].map((name) => this.clearDatabaseStores(name)),
       );
 
       const failed = results.filter((r) => r.status === 'rejected');
       if (failed.length > 0) {
-        console.warn(`[IndexedDBTokenStorage] clear: ${failed.length}/${dbNames.size} failed (${Date.now() - t0}ms)`,
+        logger.warn('IndexedDBToken', `clear: ${failed.length}/${dbNames.size} failed (${Date.now() - t0}ms)`,
           failed.map((r) => (r as PromiseRejectedResult).reason));
       }
 
-      console.log(`[IndexedDBTokenStorage] clear: done ${dbNames.size} database(s) (${Date.now() - t0}ms)`);
+      logger.debug('IndexedDBToken', `clear: done ${dbNames.size} database(s) (${Date.now() - t0}ms)`);
       return failed.length === 0;
     } catch (err) {
-      console.warn(`[IndexedDBTokenStorage] clear: failed (${Date.now() - t0}ms)`, err);
+      logger.warn('IndexedDBToken', `clear: failed (${Date.now() - t0}ms)`, err);
       return false;
     }
   }
@@ -350,7 +351,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
         // Prevents leaked connections (e.g. React StrictMode double-mount)
         // from blocking deleteDatabase() or version upgrades.
         db.onversionchange = () => {
-          console.log(`[IndexedDBTokenStorage] onversionchange: auto-closing db=${this.dbName} connId=${cid}`);
+          logger.debug('IndexedDBToken', `onversionchange: auto-closing db=${this.dbName} connId=${cid}`);
           db.close();
           if (this.db === db) {
             this.db = null;
@@ -363,7 +364,7 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       // onblocked fires when another connection holds the database.
       // Log it — onsuccess will follow once the other connection closes.
       request.onblocked = () => {
-        console.warn(`[IndexedDBTokenStorage] open blocked by another connection, db=${this.dbName}`);
+        logger.warn('IndexedDBToken', `open blocked by another connection, db=${this.dbName}`);
       };
 
       request.onupgradeneeded = (event) => {

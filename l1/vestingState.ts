@@ -1,3 +1,4 @@
+import { logger } from '../core/logger';
 import { vestingClassifier } from "./vesting";
 import type {
   UTXO,
@@ -77,10 +78,10 @@ class VestingStateManager {
 
       // Log any errors
       if (result.errors.length > 0) {
-        console.warn(`Vesting classification errors: ${result.errors.length}`);
+        logger.warn('L1', `Vesting classification errors: ${result.errors.length}`);
         result.errors.slice(0, 5).forEach((err) => {
           const txHash = err.utxo.tx_hash || err.utxo.txid;
-          console.warn(`  ${txHash}: ${err.error}`);
+          logger.warn('L1', `  ${txHash}: ${err.error}`);
         });
       }
     } finally {

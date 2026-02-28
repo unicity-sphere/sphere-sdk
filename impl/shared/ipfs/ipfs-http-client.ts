@@ -4,6 +4,7 @@
  * Works in both browser and Node.js (native fetch available since Node 18+).
  */
 
+import { logger } from '../../../core/logger';
 import type {
   IpnsGatewayResult,
   IpnsProgressiveResult,
@@ -525,8 +526,6 @@ export class IpfsHttpClient {
   }
 
   private log(message: string): void {
-    if (this.debug) {
-      console.log(`[IPFS-HTTP] ${message}`);
-    }
+    logger.debug('IPFS-HTTP', message);
   }
 }

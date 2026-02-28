@@ -12,6 +12,7 @@
  * Ported from Sphere webapp's IpnsSubscriptionClient.
  */
 
+import { logger } from '../../../core/logger';
 import type { IWebSocket, WebSocketFactory } from '../../../transport/websocket';
 import { WebSocketReadyState } from '../../../transport/websocket';
 import type { IpnsUpdateEvent } from './ipfs-types';
@@ -424,10 +425,10 @@ export class IpnsSubscriptionClient {
     this.log(`Starting fallback polling (${this.fallbackPollIntervalMs / 1000}s interval)`);
 
     // Run poll immediately once
-    this.fallbackPollFn().catch(() => { /* ignore */ });
+    this.fallbackPollFn().catch((err) => { logger.warn('IPNS-WS', 'Fallback poll error:', err); });
 
     this.fallbackPollInterval = setInterval(() => {
-      this.fallbackPollFn?.().catch(() => { /* ignore */ });
+      this.fallbackPollFn?.().catch((err) => { logger.warn('IPNS-WS', 'Fallback poll error:', err); });
     }, this.fallbackPollIntervalMs);
   }
 
@@ -443,8 +444,6 @@ export class IpnsSubscriptionClient {
   // ---------------------------------------------------------------------------
 
   private log(message: string): void {
-    if (this.debugEnabled) {
-      console.log(`[IPNS-WS] ${message}`);
-    }
+    logger.debug('IPNS-WS', message);
   }
 }

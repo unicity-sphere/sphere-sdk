@@ -25,6 +25,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { logger } from '../../core/logger';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -149,7 +150,7 @@ export class InstantSplitExecutor {
   ): Promise<BuildSplitBundleResult> {
     const splitGroupId = crypto.randomUUID();
     const tokenIdHex = toHex(tokenToSplit.id.bytes);
-    console.log(`[InstantSplit] Building V5 bundle for token ${tokenIdHex.slice(0, 8)}...`);
+    logger.debug('InstantSplit', `Building V5 bundle for token ${tokenIdHex.slice(0, 8)}...`);
 
     const coinId = new CoinId(fromHex(coinIdHex));
     const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}_${Date.now()}`;
@@ -199,7 +200,7 @@ export class InstantSplitExecutor {
     const split = await builder.build(tokenToSplit);
 
     // === STEP 1: CREATE AND SUBMIT BURN COMMITMENT ===
-    console.log('[InstantSplit] Step 1: Creating and submitting burn...');
+    logger.debug('InstantSplit', 'Step 1: Creating and submitting burn...');
     const burnSalt = await sha256(seedString + '_burn_salt');
     const burnCommitment = await split.createBurnCommitment(burnSalt, this.signingService);
 
@@ -209,18 +210,18 @@ export class InstantSplitExecutor {
     }
 
     // === STEP 2: WAIT FOR BURN PROOF (~2s) ===
-    console.log('[InstantSplit] Step 2: Waiting for burn proof...');
+    logger.debug('InstantSplit', 'Step 2: Waiting for burn proof...');
     const burnProof = this.devMode
       ? await this.waitInclusionProofWithDevBypass(burnCommitment, options?.burnProofTimeoutMs)
       : await waitInclusionProof(this.trustBase, this.client, burnCommitment);
     const burnTransaction = burnCommitment.toTransaction(burnProof);
 
-    console.log(`[InstantSplit] Burn proof received`);
+    logger.debug('InstantSplit', 'Burn proof received');
 
     options?.onBurnCompleted?.(JSON.stringify(burnTransaction.toJSON()));
 
     // === STEP 3: CREATE MINT COMMITMENTS WITH SPLITMINT REASON ===
-    console.log('[InstantSplit] Step 3: Creating mint commitments...');
+    logger.debug('InstantSplit', 'Step 3: Creating mint commitments...');
     const mintCommitments = await split.createSplitMintCommitments(this.trustBase, burnTransaction);
 
     // Find recipient and sender mint commitments
@@ -239,7 +240,7 @@ export class InstantSplitExecutor {
     }
 
     // === STEP 4: CREATE TRANSFER COMMITMENT FROM MINT DATA ===
-    console.log('[InstantSplit] Step 4: Creating transfer commitment...');
+    logger.debug('InstantSplit', 'Step 4: Creating transfer commitment...');
     const transferSalt = await sha256(seedString + '_transfer_salt');
 
     const transferCommitment = await this.createTransferCommitmentFromMintData(
@@ -260,7 +261,7 @@ export class InstantSplitExecutor {
     const mintedState = new TokenState(mintedPredicate, null);
 
     // === STEP 5: PACKAGE V5 BUNDLE ===
-    console.log('[InstantSplit] Step 5: Packaging V5 bundle...');
+    logger.debug('InstantSplit', 'Step 5: Packaging V5 bundle...');
     const senderPubkey = toHex(this.signingService.publicKey);
 
     // Get nametag token if this is a PROXY address transfer
@@ -349,7 +350,7 @@ export class InstantSplitExecutor {
       );
 
       // === SEND VIA TRANSPORT ===
-      console.log('[InstantSplit] Sending via transport...');
+      logger.debug('InstantSplit', 'Sending via transport...');
       const senderPubkey = toHex(this.signingService.publicKey);
       const nostrEventId = await transport.sendTokenTransfer(recipientPubkey, {
         token: JSON.stringify(buildResult.bundle),
@@ -361,7 +362,7 @@ export class InstantSplitExecutor {
       });
 
       const criticalPathDuration = performance.now() - startTime;
-      console.log(`[InstantSplit] V5 complete in ${criticalPathDuration.toFixed(0)}ms`);
+      logger.debug('InstantSplit', `V5 complete in ${criticalPathDuration.toFixed(0)}ms`);
 
       options?.onNostrDelivered?.(nostrEventId);
 
@@ -379,7 +380,7 @@ export class InstantSplitExecutor {
     } catch (error) {
       const duration = performance.now() - startTime;
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.error(`[InstantSplit] Failed after ${duration.toFixed(0)}ms:`, error);
+      logger.error('InstantSplit', `Failed after ${duration.toFixed(0)}ms:`, error);
 
       return {
         success: false,
@@ -449,7 +450,7 @@ export class InstantSplitExecutor {
     transferCommitment: TransferCommitment,
     context: BackgroundContext
   ): Promise<void> {
-    console.log('[InstantSplit] Background: Starting parallel mint submission...');
+    logger.debug('InstantSplit', 'Background: Starting parallel mint submission...');
     const startTime = performance.now();
 
     // Submit all commitments in parallel
@@ -473,7 +474,7 @@ export class InstantSplitExecutor {
     return submissions
       .then(async (results) => {
         const submitDuration = performance.now() - startTime;
-        console.log(`[InstantSplit] Background: Submissions complete in ${submitDuration.toFixed(0)}ms`);
+        logger.debug('InstantSplit', `Background: Submissions complete in ${submitDuration.toFixed(0)}ms`);
 
         context.onProgress?.({
           stage: 'MINTS_SUBMITTED',
@@ -486,7 +487,7 @@ export class InstantSplitExecutor {
           senderMintResult?.status !== 'SUCCESS' &&
           senderMintResult?.status !== 'REQUEST_ID_EXISTS'
         ) {
-          console.error('[InstantSplit] Background: Sender mint failed - cannot save change token');
+          logger.error('InstantSplit', 'Background: Sender mint failed - cannot save change token');
           context.onProgress?.({
             stage: 'FAILED',
             message: 'Sender mint submission failed',
@@ -496,7 +497,7 @@ export class InstantSplitExecutor {
         }
 
         // Wait for sender's mint proof to save change token
-        console.log('[InstantSplit] Background: Waiting for sender mint proof...');
+        logger.debug('InstantSplit', 'Background: Waiting for sender mint proof...');
         const proofStartTime = performance.now();
 
         try {
@@ -505,7 +506,7 @@ export class InstantSplitExecutor {
             : await waitInclusionProof(this.trustBase, this.client, senderMintCommitment);
 
           const proofDuration = performance.now() - proofStartTime;
-          console.log(`[InstantSplit] Background: Sender mint proof received in ${proofDuration.toFixed(0)}ms`);
+          logger.debug('InstantSplit', `Background: Sender mint proof received in ${proofDuration.toFixed(0)}ms`);
 
           context.onProgress?.({
             stage: 'MINTS_PROVEN',
@@ -532,7 +533,7 @@ export class InstantSplitExecutor {
             }
           }
 
-          console.log('[InstantSplit] Background: Change token created');
+          logger.debug('InstantSplit', 'Background: Change token created');
 
           context.onProgress?.({
             stage: 'CHANGE_TOKEN_SAVED',
@@ -542,32 +543,32 @@ export class InstantSplitExecutor {
           // Save change token via callback
           if (context.onChangeTokenCreated) {
             await context.onChangeTokenCreated(changeToken);
-            console.log('[InstantSplit] Background: Change token saved');
+            logger.debug('InstantSplit', 'Background: Change token saved');
           }
 
           // Trigger storage sync if provided
           if (context.onStorageSync) {
             try {
               const syncSuccess = await context.onStorageSync();
-              console.log(`[InstantSplit] Background: Storage sync ${syncSuccess ? 'completed' : 'deferred'}`);
+              logger.debug('InstantSplit', `Background: Storage sync ${syncSuccess ? 'completed' : 'deferred'}`);
               context.onProgress?.({
                 stage: 'STORAGE_SYNCED',
                 message: syncSuccess ? 'Storage synchronized' : 'Sync deferred',
               });
             } catch (syncError) {
-              console.warn('[InstantSplit] Background: Storage sync error:', syncError);
+              logger.warn('InstantSplit', 'Background: Storage sync error:', syncError);
             }
           }
 
           const totalDuration = performance.now() - startTime;
-          console.log(`[InstantSplit] Background: Complete in ${totalDuration.toFixed(0)}ms`);
+          logger.debug('InstantSplit', `Background: Complete in ${totalDuration.toFixed(0)}ms`);
 
           context.onProgress?.({
             stage: 'COMPLETED',
             message: `Background processing complete in ${totalDuration.toFixed(0)}ms`,
           });
         } catch (proofError) {
-          console.error('[InstantSplit] Background: Failed to get sender mint proof:', proofError);
+          logger.error('InstantSplit', 'Background: Failed to get sender mint proof:', proofError);
           context.onProgress?.({
             stage: 'FAILED',
             message: 'Failed to get mint proof',
@@ -576,7 +577,7 @@ export class InstantSplitExecutor {
         }
       })
       .catch((err) => {
-        console.error('[InstantSplit] Background: Submission batch failed:', err);
+        logger.error('InstantSplit', 'Background: Submission batch failed:', err);
         context.onProgress?.({
           stage: 'FAILED',
           message: 'Background submission failed',
@@ -604,7 +605,7 @@ export class InstantSplitExecutor {
         ]);
       } catch {
         // Return a mock proof in dev mode
-        console.log('[InstantSplit] Dev mode: Using mock proof');
+        logger.debug('InstantSplit', 'Dev mode: Using mock proof');
         return {
           toJSON: () => ({ mock: true }),
         };

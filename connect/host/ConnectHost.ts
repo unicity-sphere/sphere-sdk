@@ -6,6 +6,7 @@
  * and delegates intents to the wallet app via callbacks.
  */
 
+import { logger } from '../../core/logger';
 import type { SphereEventType, SphereEventHandler } from '../../types';
 import type { ConnectTransport, ConnectSession, ConnectHostConfig } from '../types';
 import type {
@@ -169,7 +170,7 @@ export class ConnectHost {
       }
     } catch (error) {
       // Swallow errors from malformed messages
-      console.warn('[ConnectHost] Error handling message:', error);
+      logger.warn('ConnectHost', 'Error handling message:', error);
     }
   }
 

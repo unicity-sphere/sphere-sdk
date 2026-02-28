@@ -1,6 +1,7 @@
 /**
  * Transaction handling - Strict copy of index.html logic
  */
+import { logger } from '../core/logger';
 import { getUtxo, broadcast } from "./network";
 import { decodeBech32 } from "../core/bech32";
 import CryptoJS from "crypto-js";
@@ -449,11 +450,11 @@ export async function createTransactionPlan(
   if (vestingState.hasClassifiedData(senderAddress)) {
     // Use vesting-filtered UTXOs based on selected mode
     utxos = vestingState.getFilteredUtxos(senderAddress);
-    console.log(`Using ${utxos.length} ${currentMode} UTXOs`);
+    logger.debug('L1', `Using ${utxos.length} ${currentMode} UTXOs`);
   } else {
     // Fall back to all UTXOs if not yet classified
     utxos = await getUtxo(senderAddress);
-    console.log(`Using ${utxos.length} UTXOs (vesting not classified yet)`);
+    logger.debug('L1', `Using ${utxos.length} UTXOs (vesting not classified yet)`);
   }
 
   if (!Array.isArray(utxos) || utxos.length === 0) {

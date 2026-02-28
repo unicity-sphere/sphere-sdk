@@ -6,6 +6,7 @@
  * Optionally persists cache to StorageProvider for survival across page reloads.
  */
 
+import { logger } from '../core/logger';
 import { STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
 import type { PriceProvider, PricePlatform, TokenPrice, PriceProviderConfig } from './price-provider';
@@ -113,7 +114,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       const allCovered = uncachedNames.every((n) => this.fetchNames!.has(n));
       if (allCovered) {
         if (this.debug) {
-          console.log(`[CoinGecko] Deduplicating request, reusing in-flight fetch`);
+          logger.debug('CoinGecko', 'Deduplicating request, reusing in-flight fetch');
         }
         const fetched = await this.fetchPromise;
         for (const name of uncachedNames) {
@@ -161,7 +162,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       }
 
       if (this.debug) {
-        console.log(`[CoinGecko] Fetching prices for: ${uncachedNames.join(', ')}`);
+        logger.debug('CoinGecko', `Fetching prices for: ${uncachedNames.join(', ')}`);
       }
 
       const response = await fetch(url, {
@@ -211,14 +212,14 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       }
 
       if (this.debug) {
-        console.log(`[CoinGecko] Fetched ${result.size} prices`);
+        logger.debug('CoinGecko', `Fetched ${result.size} prices`);
       }
 
       // Persist to storage (fire-and-forget)
       this.saveToStorage();
     } catch (error) {
       if (this.debug) {
-        console.warn('[CoinGecko] Fetch failed, using stale cache:', error);
+        logger.warn('CoinGecko', 'Fetch failed, using stale cache:', error);
       }
 
       // On error, return stale cached data if available
@@ -284,7 +285,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
       }
 
       if (this.debug) {
-        console.log(`[CoinGecko] Loaded ${Object.keys(data).length} prices from persistent cache`);
+        logger.debug('CoinGecko', `Loaded ${Object.keys(data).length} prices from persistent cache`);
       }
     } catch {
       // Cache load failure is non-critical
@@ -331,7 +332,7 @@ export class CoinGeckoPriceProvider implements PriceProvider {
     }
 
     if (this.debug) {
-      console.warn(`[CoinGecko] Rate-limited (429), extended cache TTL by ${backoffMs / 1000}s`);
+      logger.warn('CoinGecko', `Rate-limited (429), extended cache TTL by ${backoffMs / 1000}s`);
     }
   }
 

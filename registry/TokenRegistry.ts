@@ -5,6 +5,7 @@
  * Fetches from a remote URL, caches in StorageProvider, and refreshes periodically.
  */
 
+import { logger } from '../core/logger';
 import { TOKEN_REGISTRY_REFRESH_INTERVAL, STORAGE_KEYS_GLOBAL } from '../constants';
 import type { StorageProvider } from '../storage';
 
@@ -367,16 +368,14 @@ export class TokenRegistry {
       }
 
       if (!response.ok) {
-        console.warn(
-          `[TokenRegistry] Remote fetch failed: HTTP ${response.status} ${response.statusText}`,
-        );
+        logger.warn('TokenRegistry', `Remote fetch failed: HTTP ${response.status} ${response.statusText}`);
         return false;
       }
 
       const data: unknown = await response.json();
 
       if (!this.isValidDefinitionsArray(data)) {
-        console.warn('[TokenRegistry] Remote data is not a valid token definitions array');
+        logger.warn('TokenRegistry', 'Remote data is not a valid token definitions array');
         return false;
       }
 
@@ -390,7 +389,7 @@ export class TokenRegistry {
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[TokenRegistry] Remote refresh failed: ${message}`);
+      logger.warn('TokenRegistry', `Remote refresh failed: ${message}`);
       return false;
     }
   }

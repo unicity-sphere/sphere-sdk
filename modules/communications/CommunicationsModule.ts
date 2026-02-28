@@ -3,6 +3,7 @@
  * Platform-independent messaging operations
  */
 
+import { logger } from '../../core/logger';
 import type {
   DirectMessage,
   BroadcastMessage,
@@ -186,7 +187,7 @@ export class CommunicationsModule {
       // Persist to new per-address key
       if (myMessages.length > 0) {
         await this.save();
-        console.log(`[Communications] Migrated ${myMessages.length} messages to per-address storage`);
+        logger.debug('Communications', `Migrated ${myMessages.length} messages to per-address storage`);
       }
     }
   }
@@ -304,7 +305,7 @@ export class CommunicationsModule {
         const msg = this.messages.get(id);
         if (msg && msg.senderPubkey !== this.deps.identity.chainPubkey) {
           this.deps.transport.sendReadReceipt(msg.senderPubkey, id).catch((err) => {
-            console.warn('[Communications] Failed to send read receipt:', err);
+            logger.warn('Communications', 'Failed to send read receipt:', err);
           });
         }
       }
@@ -558,7 +559,7 @@ export class CommunicationsModule {
       try {
         handler(message);
       } catch (error) {
-        console.error('[Communications] Handler error:', error);
+        logger.error('Communications', 'Handler error:', error);
       }
     }
 
@@ -586,7 +587,7 @@ export class CommunicationsModule {
       try {
         handler(composing);
       } catch (error) {
-        console.error('[Communications] Composing handler error:', error);
+        logger.error('Communications', 'Composing handler error:', error);
       }
     }
   }
@@ -610,7 +611,7 @@ export class CommunicationsModule {
       try {
         handler(message);
       } catch (error) {
-        console.error('[Communications] Handler error:', error);
+        logger.error('Communications', 'Handler error:', error);
       }
     }
   }

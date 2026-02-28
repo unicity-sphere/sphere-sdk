@@ -12,6 +12,8 @@ import {
   type Event,
 } from '@unicitylabs/nostr-js-sdk';
 
+import { logger } from '../../core/logger';
+
 import type {
   FullIdentity,
   SphereEventType,
@@ -334,7 +336,7 @@ export class GroupChatModule {
       // so consumers don't query getGroups() while restoreJoinedGroups() is still running.
       this.deps!.emitEvent('groupchat:connection', { connected: true });
     } catch (error) {
-      console.error('[GroupChat] Failed to connect to relays', error);
+      logger.error('GroupChat', 'Failed to connect to relays', error);
       this.deps!.emitEvent('groupchat:connection', { connected: false });
       this.scheduleReconnect();
     }
@@ -342,7 +344,7 @@ export class GroupChatModule {
 
   private scheduleReconnect(): void {
     if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
-      console.error('[GroupChat] Max reconnection attempts reached');
+      logger.error('GroupChat', 'Max reconnection attempts reached');
       return;
     }
 
@@ -351,7 +353,7 @@ export class GroupChatModule {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.deps) { // Guard against post-destroy fire
-        this.connect().catch(console.error);
+        this.connect().catch((err) => logger.error('GroupChat', 'Reconnect failed:', err));
       }
     }, this.config.reconnectDelayMs);
   }
@@ -791,7 +793,7 @@ export class GroupChatModule {
           return true;
         }
       }
-      console.error('[GroupChat] Failed to join group', error);
+      logger.error('GroupChat', 'Failed to join group', error);
       return false;
     }
   }
@@ -826,7 +828,7 @@ export class GroupChatModule {
         this.persistAll();
         return true;
       }
-      console.error('[GroupChat] Failed to leave group', error);
+      logger.error('GroupChat', 'Failed to leave group', error);
       return false;
     }
   }
@@ -916,7 +918,7 @@ export class GroupChatModule {
 
       return group;
     } catch (error) {
-      console.error('[GroupChat] Failed to create group', error);
+      logger.error('GroupChat', 'Failed to create group', error);
       return null;
     }
   }
@@ -949,7 +951,7 @@ export class GroupChatModule {
       }
       return false;
     } catch (error) {
-      console.error('[GroupChat] Failed to delete group', error);
+      logger.error('GroupChat', 'Failed to delete group', error);
       return false;
     }
   }
@@ -974,7 +976,7 @@ export class GroupChatModule {
 
       return eventId ? inviteCode : null;
     } catch (error) {
-      console.error('[GroupChat] Failed to create invite', error);
+      logger.error('GroupChat', 'Failed to create invite', error);
       return null;
     }
   }
@@ -1043,7 +1045,7 @@ export class GroupChatModule {
       }
       return null;
     } catch (error) {
-      console.error('[GroupChat] Failed to send message', error);
+      logger.error('GroupChat', 'Failed to send message', error);
       return null;
     }
   }
@@ -1171,7 +1173,7 @@ export class GroupChatModule {
       }
       return false;
     } catch (error) {
-      console.error('[GroupChat] Failed to kick user', error);
+      logger.error('GroupChat', 'Failed to kick user', error);
       return false;
     }
   }
@@ -1198,7 +1200,7 @@ export class GroupChatModule {
       }
       return false;
     } catch (error) {
-      console.error('[GroupChat] Failed to delete message', error);
+      logger.error('GroupChat', 'Failed to delete message', error);
       return false;
     }
   }
@@ -1535,7 +1537,7 @@ export class GroupChatModule {
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
       this.persistPromise = this.doPersistAll().catch((err) => {
-        console.error('[GroupChat] Persistence error:', err);
+        logger.error('GroupChat', 'Persistence error:', err);
       }).finally(() => {
         this.persistPromise = null;
       });

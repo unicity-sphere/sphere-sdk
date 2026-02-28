@@ -5,6 +5,7 @@
  * Platform-independent implementation that accepts dependencies via constructor.
  */
 
+import { logger } from '../core/logger';
 import type { Token } from '../types';
 import type { TxfTransaction, ValidationIssue, TokenValidationResult } from '../types/txf';
 import { tokenToTxf } from '../serialization/txf-serializer';
@@ -221,7 +222,7 @@ export class TokenValidator {
         }
       } catch (err) {
         // SDK verification is optional
-        console.warn('SDK verification skipped:', err instanceof Error ? err.message : err);
+        logger.warn('Validation', 'SDK verification skipped:', err instanceof Error ? err.message : err);
       }
     }
 
@@ -289,7 +290,7 @@ export class TokenValidator {
 
       return isSpent;
     } catch (err) {
-      console.warn('Error checking token state:', err);
+      logger.warn('Validation', 'Error checking token state:', err);
       return false;
     }
   }

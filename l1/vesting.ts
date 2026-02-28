@@ -1,3 +1,5 @@
+import { logger } from '../core/logger';
+
 /**
  * VestingClassifier - Traces UTXOs to their coinbase origin to determine vesting status
  * VESTED: Coins from coinbase transactions in blocks <= VESTING_THRESHOLD (280000)
@@ -332,13 +334,13 @@ class VestingClassifier {
       await new Promise<void>((resolve) => {
         const req = indexedDB.deleteDatabase(this.dbName);
         const timer = setTimeout(() => {
-          console.warn(`[VestingClassifier] destroy: deleteDatabase timed out for ${this.dbName}`);
+          logger.warn('L1',` destroy: deleteDatabase timed out for ${this.dbName}`);
           resolve();
         }, 3000);
         req.onsuccess = () => { clearTimeout(timer); resolve(); };
         req.onerror = () => { clearTimeout(timer); resolve(); };
         req.onblocked = () => {
-          console.warn(`[VestingClassifier] destroy: deleteDatabase blocked for ${this.dbName}, waiting...`);
+          logger.warn('L1',` destroy: deleteDatabase blocked for ${this.dbName}, waiting...`);
           // Do NOT resolve — onversionchange handler on leaked connections should close them.
         };
       });

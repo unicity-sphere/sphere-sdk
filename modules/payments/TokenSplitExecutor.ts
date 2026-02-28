@@ -10,6 +10,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { logger } from '../../core/logger';
 import { Token } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { TokenId } from '@unicitylabs/state-transition-sdk/lib/token/TokenId';
 import { TokenState } from '@unicitylabs/state-transition-sdk/lib/token/TokenState';
@@ -87,7 +88,7 @@ export class TokenSplitExecutor {
     recipientAddress: any
   ): Promise<SplitResult> {
     const tokenIdHex = toHex(tokenToSplit.id.bytes);
-    console.log(`[TokenSplitExecutor] Splitting token ${tokenIdHex.slice(0, 8)}...`);
+    logger.debug('TokenSplit', `Splitting token ${tokenIdHex.slice(0, 8)}...`);
 
     const coinId = new CoinId(fromHex(coinIdHex));
     const seedString = `${tokenIdHex}_${splitAmount.toString()}_${remainderAmount.toString()}`;
@@ -119,7 +120,7 @@ export class TokenSplitExecutor {
     const split = await builder.build(tokenToSplit);
 
     // Step 1: Burn
-    console.log('[TokenSplitExecutor] Step 1: Burning original token...');
+    logger.debug('TokenSplit', 'Step 1: Burning original token...');
     const burnSalt = await sha256(seedString + '_burn_salt');
     const burnCommitment = await split.createBurnCommitment(burnSalt, this.signingService);
 
@@ -130,10 +131,10 @@ export class TokenSplitExecutor {
 
     const burnInclusionProof = await waitInclusionProof(this.trustBase, this.client, burnCommitment);
     const burnTransaction = burnCommitment.toTransaction(burnInclusionProof);
-    console.log('[TokenSplitExecutor] Original token burned.');
+    logger.debug('TokenSplit', 'Original token burned.');
 
     // Step 2: Mint
-    console.log('[TokenSplitExecutor] Step 2: Minting split tokens...');
+    logger.debug('TokenSplit', 'Step 2: Minting split tokens...');
     const mintCommitments = await split.createSplitMintCommitments(this.trustBase, burnTransaction);
 
     const mintedTokensInfo: Array<{ commitment: any; inclusionProof: any; isForRecipient: boolean; tokenId: any; salt: Uint8Array }> = [];
@@ -156,7 +157,7 @@ export class TokenSplitExecutor {
         salt: commitment.transactionData.salt,
       });
     }
-    console.log('[TokenSplitExecutor] Split tokens minted.');
+    logger.debug('TokenSplit', 'Split tokens minted.');
 
     // Step 3: Reconstruct tokens
     const recipientInfo = mintedTokensInfo.find((t) => t.isForRecipient)!;
@@ -175,7 +176,7 @@ export class TokenSplitExecutor {
     const senderToken = await createToken(senderInfo, 'Sender');
 
     // Step 4: Transfer
-    console.log('[TokenSplitExecutor] Step 3: Transferring to recipient...');
+    logger.debug('TokenSplit', 'Step 3: Transferring to recipient...');
     const transferSalt = await sha256(seedString + '_transfer_salt');
 
     const transferCommitment = await TransferCommitment.create(
@@ -195,7 +196,7 @@ export class TokenSplitExecutor {
     const transferProof = await waitInclusionProof(this.trustBase, this.client, transferCommitment);
     const transferTx = transferCommitment.toTransaction(transferProof);
 
-    console.log('[TokenSplitExecutor] Split transfer complete!');
+    logger.debug('TokenSplit', 'Split transfer complete!');
 
     return {
       tokenForRecipient: recipientTokenBeforeTransfer,

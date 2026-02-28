@@ -13,6 +13,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { logger } from '../../core/logger';
 import type { MintCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/MintCommitment';
 import type { TransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
@@ -334,7 +335,7 @@ export class BackgroundCommitmentService {
       if (task.retryCount < task.maxRetries) {
         // Retry with exponential backoff
         const delay = Math.min(1000 * Math.pow(2, task.retryCount - 1), 10000);
-        console.log(`[Background] Task ${task.id.slice(0, 8)} failed, retrying in ${delay}ms`);
+        logger.debug('BackgroundCommit', `Task ${task.id.slice(0, 8)} failed, retrying in ${delay}ms`);
         task.status = 'PENDING';
         setTimeout(() => this.executeTask(task, callbacks), delay);
         return;
