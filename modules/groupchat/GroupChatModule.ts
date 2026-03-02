@@ -349,14 +349,19 @@ export class GroupChatModule {
       return;
     }
 
+    // Exponential backoff: base * 2^attempt, capped at base * 16
+    const maxDelay = this.config.reconnectDelayMs * 16;
+    const delay = Math.min(this.config.reconnectDelayMs * Math.pow(2, this.reconnectAttempts), maxDelay);
     this.reconnectAttempts++;
+
+    logger.debug('GroupChat', `Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.deps) { // Guard against post-destroy fire
         this.connect().catch((err) => logger.error('GroupChat', 'Reconnect failed:', err));
       }
-    }, this.config.reconnectDelayMs);
+    }, delay);
   }
 
   // ===========================================================================

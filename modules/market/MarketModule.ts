@@ -11,6 +11,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 
 import { SphereError } from '../../core/errors';
+import { logger } from '../../core/logger';
 
 /** Default Market API URL (intent bulletin board) */
 export const DEFAULT_MARKET_API_URL = 'https://market-api.unicity.network';
@@ -236,19 +237,68 @@ export class MarketModule {
    */
   subscribeFeed(listener: FeedListener): () => void {
     const wsUrl = this.apiUrl.replace(/^http/, 'ws') + '/ws/feed';
-    const ws = new WebSocket(wsUrl);
 
-    ws.onmessage = (event: MessageEvent) => {
-      try {
-        const raw = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
-        listener(mapFeedMessage(raw));
-      } catch {
-        // Ignore malformed messages
+    const BASE_DELAY = 2000;
+    const MAX_DELAY = 30_000;
+    const MAX_ATTEMPTS = 10;
+
+    let ws: WebSocket | null = null;
+    let reconnectAttempts = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let destroyed = false;
+
+    function connect() {
+      if (destroyed) return;
+
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        reconnectAttempts = 0;
+        logger.debug('Market', 'Feed WebSocket connected');
+      };
+
+      ws.onmessage = (event: MessageEvent) => {
+        try {
+          const raw = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
+          listener(mapFeedMessage(raw));
+        } catch {
+          // Ignore malformed messages
+        }
+      };
+
+      ws.onclose = () => {
+        if (destroyed) return;
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        // onerror is always followed by onclose — reconnect is handled there
+      };
+    }
+
+    function scheduleReconnect() {
+      if (destroyed) return;
+      if (reconnectAttempts >= MAX_ATTEMPTS) {
+        logger.warn('Market', `Feed WebSocket: gave up after ${MAX_ATTEMPTS} reconnect attempts`);
+        return;
       }
-    };
+
+      const delay = Math.min(BASE_DELAY * Math.pow(2, reconnectAttempts), MAX_DELAY);
+      reconnectAttempts++;
+      logger.debug('Market', `Feed WebSocket reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_ATTEMPTS})`);
+      reconnectTimer = setTimeout(connect, delay);
+    }
+
+    connect();
 
     return () => {
-      ws.close();
+      destroyed = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      ws?.close();
+      ws = null;
     };
   }
 
