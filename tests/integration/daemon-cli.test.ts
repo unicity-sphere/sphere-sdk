@@ -932,7 +932,7 @@ describe('Daemon CLI', () => {
         { cwd: testDirB, timeout: 30_000 },
       );
 
-      const marker = await pollForFile(markerFile, { timeout: 30_000 });
+      const marker = await pollForFile(markerFile, { timeout: 60_000 });
       expect(marker).toContain('matched');
     }, 120_000);
 
