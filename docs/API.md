@@ -68,6 +68,19 @@ await Sphere.clear(storage);
 
 ### Instance Methods
 
+#### `signMessage(message: string): string`
+
+Sign an arbitrary message using the wallet's private key (secp256k1 ECDSA with recoverable signature).
+
+Returns a 130-character hex string: `v` (2 chars) + `r` (64 chars) + `s` (64 chars). The recovery byte `v = 31 + recoveryParam`.
+
+```typescript
+const signature = sphere.signMessage('Sign in to My App\n\nNonce: abc123');
+// → '1f3a5b7c...' (130 hex chars)
+```
+
+The private key never leaves the SDK. Use `verifySignedMessage()` to verify on the server side.
+
 #### `destroy(): Promise<void>`
 
 Cleanup and disconnect all providers.
@@ -1502,6 +1515,12 @@ doubleSha256(data: string, inputEncoding?: 'hex' | 'utf8'): string
 hexToBytes(hex: string): Uint8Array
 bytesToHex(bytes: Uint8Array): string
 randomBytes(length: number): string
+
+// Message signing (secp256k1 ECDSA with recoverable signatures)
+SIGN_MESSAGE_PREFIX: 'Sphere Signed Message:\n'
+hashSignMessage(message: string): string  // double-SHA256 with prefix, returns 64-char hex
+signMessage(privateKeyHex: string, message: string): string  // returns 130-char hex (v+r+s)
+verifySignedMessage(message: string, signature: string, expectedPubkey: string): boolean
 ```
 
 ### Currency Functions

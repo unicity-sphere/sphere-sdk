@@ -147,6 +147,11 @@ const txResult = await client.intent('send', {
   coinId: 'USDC',
 });
 
+// Sign a message (e.g. challenge-response auth)
+const { signature, publicKey } = await client.intent('sign_message', {
+  message: 'Sign in to My App\n\nNonce: abc123',
+});
+
 // Events — wallet pushes real-time updates
 const unsub = client.on('transfer:incoming', (data) => {
   console.log('Incoming transfer:', data);
@@ -204,6 +209,35 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `payment_request` | `amount, coinId, description?` |
 | `receive` | `coinId?` |
 | `sign_message` | `message` |
+
+### sign_message Intent
+
+The `sign_message` intent lets a dApp request a cryptographic signature from the wallet. The wallet signs using secp256k1 ECDSA with a Bitcoin-like double-SHA256 hash and the `Sphere Signed Message:\n` prefix.
+
+```typescript
+// dApp requests signature
+const result = await client.intent('sign_message', {
+  message: 'Sign in to My App\n\nDomain: example.com\nNonce: R_6j46iCPW\nIssued At: 2026-03-03T20:50:26Z',
+});
+
+// result = { signature: '1f3a5b7c...', publicKey: '02ed95e9...' }
+// signature: 130-char hex (v + r + s), publicKey: 66-char compressed secp256k1
+```
+
+**Server-side verification** (using SDK crypto functions):
+
+```typescript
+import { verifySignedMessage } from '@unicitylabs/sphere-sdk';
+
+const isValid = verifySignedMessage(originalMessage, signature, expectedPubkey);
+// Recovers pubkey from signature via ECDSA recovery and compares with expected
+```
+
+**Security properties:**
+- Private key never leaves the wallet — signing happens inside `Sphere.signMessage()`
+- Recoverable signature — server can verify without storing the public key
+- Canonical signatures — prevents signature malleability attacks
+- The wallet displays the full message text for user review before signing
 
 ## Events (wallet → dApp push)
 
