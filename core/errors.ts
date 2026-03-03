@@ -39,7 +39,8 @@ export type SphereErrorCode =
   | 'NETWORK_ERROR'
   | 'TIMEOUT'
   | 'DECRYPTION_ERROR'
-  | 'MODULE_NOT_AVAILABLE';
+  | 'MODULE_NOT_AVAILABLE'
+  | 'SIGNING_ERROR';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

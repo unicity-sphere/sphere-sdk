@@ -84,6 +84,7 @@ import {
   getPublicKey,
   sha256,
   publicKeyToAddress,
+  signMessage as signMessageCrypto,
   type MasterKey,
   type AddressInfo,
 } from './crypto';
@@ -1158,6 +1159,25 @@ export class Sphere {
   /** Is ready */
   get isReady(): boolean {
     return this._initialized;
+  }
+
+  // ===========================================================================
+  // Public Methods - Signing
+  // ===========================================================================
+
+  /**
+   * Sign a plaintext message with the wallet's secp256k1 private key.
+   *
+   * Returns a 130-character hex string: v (2) + r (64) + s (64).
+   * The private key never leaves the SDK boundary.
+   *
+   * @throws SphereError if the wallet is not initialized or identity is missing
+   */
+  signMessage(message: string): string {
+    if (!this._identity?.privateKey) {
+      throw new SphereError('Wallet not initialized — cannot sign', 'NOT_INITIALIZED');
+    }
+    return signMessageCrypto(this._identity.privateKey, message);
   }
 
   // ===========================================================================

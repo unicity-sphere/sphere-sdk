@@ -49,6 +49,7 @@
 // =============================================================================
 
 export { Sphere, createSphere, loadSphere, initSphere, getSphere, sphereExists, checkNetworkHealth, logger, SphereError, isSphereError } from './core';
+export { signMessage, verifySignedMessage, hashSignMessage, SIGN_MESSAGE_PREFIX } from './core/crypto';
 export type {
   SphereCreateOptions,
   SphereLoadOptions,

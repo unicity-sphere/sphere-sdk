@@ -46,6 +46,7 @@ interface SphereInstance {
       getHistory(limit?: number): Promise<unknown[]>;
     };
   };
+  signMessage(message: string): string;
   resolve(identifier: string): Promise<unknown>;
   on<T extends SphereEventType>(type: T, handler: SphereEventHandler<T>): () => void;
   readonly communications?: {

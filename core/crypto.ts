@@ -456,5 +456,113 @@ export function generateAddressInfo(
   };
 }
 
+// =============================================================================
+// Message Signing (secp256k1 ECDSA with recoverable signature)
+// =============================================================================
+
+/** Prefix prepended to all signed messages (Bitcoin-like signed message format) */
+export const SIGN_MESSAGE_PREFIX = 'Sphere Signed Message:\n';
+
+/** Encode an integer as a Bitcoin-style compact varint */
+function varint(n: number): Uint8Array {
+  if (n < 253) return new Uint8Array([n]);
+  const buf = new Uint8Array(3);
+  buf[0] = 253;
+  buf[1] = n & 0xff;
+  buf[2] = (n >> 8) & 0xff;
+  return buf;
+}
+
+/**
+ * Hash a message for signing using the Bitcoin-like double-SHA256 scheme:
+ *   SHA256(SHA256(varint(prefix.length) + prefix + varint(msg.length) + msg))
+ *
+ * @returns 64-char lowercase hex hash
+ */
+export function hashSignMessage(message: string): string {
+  const prefix = new TextEncoder().encode(SIGN_MESSAGE_PREFIX);
+  const msg = new TextEncoder().encode(message);
+  const prefixLen = varint(prefix.length);
+  const msgLen = varint(msg.length);
+  const full = new Uint8Array(prefixLen.length + prefix.length + msgLen.length + msg.length);
+  let off = 0;
+  full.set(prefixLen, off); off += prefixLen.length;
+  full.set(prefix, off); off += prefix.length;
+  full.set(msgLen, off); off += msgLen.length;
+  full.set(msg, off);
+  const hex = Array.from(full).map(b => b.toString(16).padStart(2, '0')).join('');
+  const h1 = CryptoJS.SHA256(CryptoJS.enc.Hex.parse(hex)).toString();
+  return CryptoJS.SHA256(CryptoJS.enc.Hex.parse(h1)).toString();
+}
+
+/**
+ * Sign a message with a secp256k1 private key.
+ *
+ * Returns a 130-character hex string: v (2 chars) + r (64 chars) + s (64 chars).
+ * The recovery byte `v` is `31 + recoveryParam` (0-3).
+ *
+ * @param privateKeyHex - 64-char hex private key
+ * @param message       - plaintext message to sign
+ */
+export function signMessage(privateKeyHex: string, message: string): string {
+  const keyPair = ec.keyFromPrivate(privateKeyHex, 'hex');
+  const hashHex = hashSignMessage(message);
+  const hashBytes = Buffer.from(hashHex, 'hex');
+  const sig = keyPair.sign(hashBytes, { canonical: true });
+
+  // Find recovery parameter
+  const pub = keyPair.getPublic();
+  let recoveryParam = -1;
+  for (let i = 0; i < 4; i++) {
+    try {
+      if (ec.recoverPubKey(hashBytes, sig, i).eq(pub)) {
+        recoveryParam = i;
+        break;
+      }
+    } catch { /* try next */ }
+  }
+  if (recoveryParam === -1) {
+    throw new SphereError('Could not find recovery parameter', 'SIGNING_ERROR');
+  }
+
+  const v = (31 + recoveryParam).toString(16).padStart(2, '0');
+  const r = sig.r.toString('hex').padStart(64, '0');
+  const s = sig.s.toString('hex').padStart(64, '0');
+  return v + r + s;
+}
+
+/**
+ * Verify a signed message against a compressed secp256k1 public key.
+ *
+ * @param message       - The original plaintext message
+ * @param signature     - 130-char hex signature (v + r + s)
+ * @param expectedPubkey - 66-char compressed public key hex
+ * @returns `true` if the signature is valid and matches the expected public key
+ */
+export function verifySignedMessage(
+  message: string,
+  signature: string,
+  expectedPubkey: string,
+): boolean {
+  if (signature.length !== 130) return false;
+
+  const v = parseInt(signature.slice(0, 2), 16) - 31;
+  const r = signature.slice(2, 66);
+  const s = signature.slice(66, 130);
+
+  if (v < 0 || v > 3) return false;
+
+  const hashHex = hashSignMessage(message);
+  const hashBytes = Buffer.from(hashHex, 'hex');
+
+  try {
+    const recovered = ec.recoverPubKey(hashBytes, { r, s }, v);
+    const recoveredHex = recovered.encode('hex', true); // compressed
+    return recoveredHex === expectedPubkey;
+  } catch {
+    return false;
+  }
+}
+
 // Re-export elliptic instance for advanced use cases
 export { ec };

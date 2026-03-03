@@ -28,6 +28,10 @@ import {
   deriveAddressInfo,
   identityFromMnemonicSync,
   DEFAULT_DERIVATION_PATH,
+  SIGN_MESSAGE_PREFIX,
+  hashSignMessage,
+  signMessage,
+  verifySignedMessage,
 } from '../../../core/crypto';
 
 import {
@@ -430,6 +434,199 @@ describe('High-Level Functions', () => {
   describe('DEFAULT_DERIVATION_PATH', () => {
     it('should be valid BIP44 path', () => {
       expect(DEFAULT_DERIVATION_PATH).toBe("m/44'/0'/0'");
+    });
+  });
+});
+
+// =============================================================================
+// Message Signing Tests
+// =============================================================================
+
+describe('Message Signing', () => {
+  // Use known test key pair from ADDRESS_VECTORS
+  const TEST_PRIVATE_KEY = ADDRESS_VECTORS[0].privateKey;
+  const TEST_PUBLIC_KEY = ADDRESS_VECTORS[0].publicKey;
+  const TEST_MESSAGE = 'Hello, Sphere!';
+
+  describe('SIGN_MESSAGE_PREFIX', () => {
+    it('should be the expected prefix string', () => {
+      expect(SIGN_MESSAGE_PREFIX).toBe('Sphere Signed Message:\n');
+    });
+  });
+
+  describe('hashSignMessage()', () => {
+    it('should return a 64-char hex string (32 bytes)', () => {
+      const hash = hashSignMessage(TEST_MESSAGE);
+      expect(hash).toHaveLength(64);
+      expect(/^[0-9a-f]+$/.test(hash)).toBe(true);
+    });
+
+    it('should be deterministic', () => {
+      const hash1 = hashSignMessage(TEST_MESSAGE);
+      const hash2 = hashSignMessage(TEST_MESSAGE);
+      expect(hash1).toBe(hash2);
+    });
+
+    it('should produce different hashes for different messages', () => {
+      const hash1 = hashSignMessage('message A');
+      const hash2 = hashSignMessage('message B');
+      expect(hash1).not.toBe(hash2);
+    });
+
+    it('should handle empty message', () => {
+      const hash = hashSignMessage('');
+      expect(hash).toHaveLength(64);
+      expect(/^[0-9a-f]+$/.test(hash)).toBe(true);
+    });
+
+    it('should handle unicode messages', () => {
+      const hash = hashSignMessage('Привет мир! 🌍');
+      expect(hash).toHaveLength(64);
+      expect(/^[0-9a-f]+$/.test(hash)).toBe(true);
+    });
+
+    it('should handle long messages', () => {
+      const longMessage = 'A'.repeat(10000);
+      const hash = hashSignMessage(longMessage);
+      expect(hash).toHaveLength(64);
+    });
+  });
+
+  describe('signMessage()', () => {
+    it('should return a 130-char hex string (v + r + s)', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      expect(signature).toHaveLength(130);
+      expect(/^[0-9a-f]+$/.test(signature)).toBe(true);
+    });
+
+    it('should have valid recovery byte v (31-34)', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      const v = parseInt(signature.slice(0, 2), 16);
+      expect(v).toBeGreaterThanOrEqual(31);
+      expect(v).toBeLessThanOrEqual(34);
+    });
+
+    it('should be deterministic for same key and message', () => {
+      const sig1 = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      const sig2 = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      expect(sig1).toBe(sig2);
+    });
+
+    it('should produce different signatures for different messages', () => {
+      const sig1 = signMessage(TEST_PRIVATE_KEY, 'message A');
+      const sig2 = signMessage(TEST_PRIVATE_KEY, 'message B');
+      expect(sig1).not.toBe(sig2);
+    });
+
+    it('should produce different signatures for different keys', () => {
+      const otherKey = 'e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35';
+      const sig1 = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      const sig2 = signMessage(otherKey, TEST_MESSAGE);
+      expect(sig1).not.toBe(sig2);
+    });
+
+    it('should handle empty message', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, '');
+      expect(signature).toHaveLength(130);
+    });
+
+    it('should handle challenge-format message', () => {
+      const challenge = [
+        'Sign in to Sphere Quests',
+        '',
+        'Domain: localhost:5175',
+        'Address: DIRECT://abc123',
+        'Nonce: test-nonce-123',
+        'Issued At: 2026-03-03T20:50:26.812Z',
+        'Expiration Time: 2026-03-03T20:55:26.812Z',
+      ].join('\n');
+      const signature = signMessage(TEST_PRIVATE_KEY, challenge);
+      expect(signature).toHaveLength(130);
+    });
+  });
+
+  describe('verifySignedMessage()', () => {
+    it('should verify a valid signature', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      const result = verifySignedMessage(TEST_MESSAGE, signature, TEST_PUBLIC_KEY);
+      expect(result).toBe(true);
+    });
+
+    it('should reject signature with wrong message', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      const result = verifySignedMessage('wrong message', signature, TEST_PUBLIC_KEY);
+      expect(result).toBe(false);
+    });
+
+    it('should reject signature with wrong public key', () => {
+      const otherKey = 'e8f32e723decf4051aefac8e2c93c9c5b214313817cdb01a1494b917c8436b35';
+      const otherPubKey = getPublicKey(otherKey);
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      const result = verifySignedMessage(TEST_MESSAGE, signature, otherPubKey);
+      expect(result).toBe(false);
+    });
+
+    it('should reject invalid signature length', () => {
+      expect(verifySignedMessage(TEST_MESSAGE, 'abcdef', TEST_PUBLIC_KEY)).toBe(false);
+      expect(verifySignedMessage(TEST_MESSAGE, '', TEST_PUBLIC_KEY)).toBe(false);
+    });
+
+    it('should reject tampered signature', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      // Flip a byte in the r component
+      const tampered = signature.slice(0, 10) + 'ff' + signature.slice(12);
+      const result = verifySignedMessage(TEST_MESSAGE, tampered, TEST_PUBLIC_KEY);
+      expect(result).toBe(false);
+    });
+
+    it('should reject invalid recovery byte', () => {
+      const signature = signMessage(TEST_PRIVATE_KEY, TEST_MESSAGE);
+      // Set v to 0x00 (invalid: v - 31 = -31)
+      const invalidV = '00' + signature.slice(2);
+      expect(verifySignedMessage(TEST_MESSAGE, invalidV, TEST_PUBLIC_KEY)).toBe(false);
+    });
+
+    it('should work with unicode messages', () => {
+      const msg = 'Подпись кошелька 🔑';
+      const sig = signMessage(TEST_PRIVATE_KEY, msg);
+      expect(verifySignedMessage(msg, sig, TEST_PUBLIC_KEY)).toBe(true);
+    });
+
+    it('should work with empty message', () => {
+      const sig = signMessage(TEST_PRIVATE_KEY, '');
+      expect(verifySignedMessage('', sig, TEST_PUBLIC_KEY)).toBe(true);
+    });
+  });
+
+  describe('sign + verify round-trip', () => {
+    it('should work with multiple different keys', () => {
+      const keys = [
+        ADDRESS_VECTORS[0].privateKey,
+        BIP32_VECTORS[0].masterPrivateKey,
+        BIP32_VECTORS[0].children[0].privateKey,
+      ];
+
+      for (const privateKey of keys) {
+        const pubKey = getPublicKey(privateKey);
+        const sig = signMessage(privateKey, 'round-trip test');
+        expect(verifySignedMessage('round-trip test', sig, pubKey)).toBe(true);
+      }
+    });
+
+    it('should not cross-verify between different keys', () => {
+      const key1 = ADDRESS_VECTORS[0].privateKey;
+      const key2 = BIP32_VECTORS[0].masterPrivateKey;
+      const pub1 = getPublicKey(key1);
+      const pub2 = getPublicKey(key2);
+
+      const sig1 = signMessage(key1, TEST_MESSAGE);
+      const sig2 = signMessage(key2, TEST_MESSAGE);
+
+      // Each signature should only verify with its own pubkey
+      expect(verifySignedMessage(TEST_MESSAGE, sig1, pub1)).toBe(true);
+      expect(verifySignedMessage(TEST_MESSAGE, sig1, pub2)).toBe(false);
+      expect(verifySignedMessage(TEST_MESSAGE, sig2, pub2)).toBe(true);
+      expect(verifySignedMessage(TEST_MESSAGE, sig2, pub1)).toBe(false);
     });
   });
 });
