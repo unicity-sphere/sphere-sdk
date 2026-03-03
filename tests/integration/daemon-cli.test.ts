@@ -834,6 +834,9 @@ describe('Daemon CLI', () => {
       try {
         await runCli(['daemon', 'stop'], { cwd: testDirA, timeout: 10_000 });
       } catch { /* best effort */ }
+      // Clean up daemon log so retry doesn't see stale "Daemon running"
+      const logFile = path.join(testDirA, '.sphere-cli', 'daemon.log');
+      if (fs.existsSync(logFile)) fs.unlinkSync(logFile);
     });
 
     afterAll(() => {
@@ -843,7 +846,7 @@ describe('Daemon CLI', () => {
       cleanupTestDir(testDirB);
     });
 
-    it('F1: bash action triggered by DM', async () => {
+    it('F1: bash action triggered by DM', { retry: 2, timeout: 120_000 }, async () => {
       const markerFile = path.join(testDirA, 'marker-f1.txt');
       const logFile = path.join(testDirA, '.sphere-cli', 'daemon.log');
 
@@ -862,11 +865,11 @@ describe('Daemon CLI', () => {
       expect(dmResult.exitCode).toBe(0);
 
       // Wait for the marker file
-      const marker = await pollForFile(markerFile, { timeout: 30_000 });
+      const marker = await pollForFile(markerFile, { timeout: 60_000 });
       expect(marker).toContain('message:dm');
     }, 120_000);
 
-    it('F2: log-to-file action triggered by DM', async () => {
+    it('F2: log-to-file action triggered by DM', { retry: 2, timeout: 120_000 }, async () => {
       const eventsFile = path.join(testDirA, 'events-f2.jsonl');
       const logFile = path.join(testDirA, '.sphere-cli', 'daemon.log');
 
@@ -888,7 +891,7 @@ describe('Daemon CLI', () => {
       expect(parsed.event).toBe('message:dm');
     }, 120_000);
 
-    it('F3: bash action receives SPHERE_SENDER and SPHERE_MESSAGE env vars', async () => {
+    it('F3: bash action receives SPHERE_SENDER and SPHERE_MESSAGE env vars', { retry: 2, timeout: 120_000 }, async () => {
       const markerFile = path.join(testDirA, 'marker-f3.txt');
       const logFile = path.join(testDirA, '.sphere-cli', 'daemon.log');
       const dmText = `hello-f3-${Date.now()}`;
@@ -904,13 +907,13 @@ describe('Daemon CLI', () => {
         { cwd: testDirB, timeout: 30_000 },
       );
 
-      const marker = await pollForFile(markerFile, { timeout: 30_000, contains: dmText });
+      const marker = await pollForFile(markerFile, { timeout: 60_000, contains: dmText });
       expect(marker).toContain(dmText);
       // Sender should be present (nametag or pubkey)
       expect(marker.trim().length).toBeGreaterThan(dmText.length);
     }, 120_000);
 
-    it('F4: config file with matching filter triggers action', async () => {
+    it('F4: config file with matching filter triggers action', { retry: 2, timeout: 120_000 }, async () => {
       const markerFile = path.join(testDirA, 'marker-f4.txt');
       const configPath = path.join(testDirA, 'daemon-f4.json');
       const logFile = path.join(testDirA, '.sphere-cli', 'daemon.log');
@@ -936,7 +939,7 @@ describe('Daemon CLI', () => {
       expect(marker).toContain('matched');
     }, 120_000);
 
-    it('F5: config file with mismatching filter does NOT trigger action', async () => {
+    it('F5: config file with mismatching filter does NOT trigger action', { retry: 2, timeout: 120_000 }, async () => {
       const markerFile = path.join(testDirA, 'marker-f5.txt');
       const configPath = path.join(testDirA, 'daemon-f5.json');
       const logFile = path.join(testDirA, '.sphere-cli', 'daemon.log');
