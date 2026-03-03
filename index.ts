@@ -429,10 +429,28 @@ export {
   normalizeNametag,
   isPhoneNumber,
   hashNametag,
+  hashAddressForTag,
   areSameNametag,
+  encryptNametag,
+  decryptNametag,
+} from '@unicitylabs/nostr-js-sdk';
+
+export type {
+  IdentityBindingParams,
+  BindingInfo,
 } from '@unicitylabs/nostr-js-sdk';
 
 export { isValidNametag } from './core/Sphere';
+
+// =============================================================================
+// Nostr Client (re-exported from @unicitylabs/nostr-js-sdk)
+// =============================================================================
+
+export { NostrClient, NostrKeyManager } from '@unicitylabs/nostr-js-sdk';
+export type {
+  NostrClientOptions,
+  ConnectionEventListener,
+} from '@unicitylabs/nostr-js-sdk';
 
 // =============================================================================
 // Price Provider
