@@ -12,7 +12,6 @@
  */
 
 import { Buffer } from 'buffer';
-import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 as sha256Noble } from '@noble/hashes/sha2.js';
 import {
   NostrKeyManager,
@@ -22,13 +21,15 @@ import {
   Event as NostrEventClass,
   EventKinds,
   hashNametag,
+  hashAddressForTag,
+  decryptNametag,
   NostrClient,
   Filter,
   isChatMessage,
   isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
+import type { BindingInfo } from '@unicitylabs/nostr-js-sdk';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
-import { getPublicKey, publicKeyToAddress } from '../core/crypto';
 import { logger } from '../core/logger';
 import type { ProviderStatus, FullIdentity } from '../types';
 import { SphereError } from '../core/errors';
@@ -104,108 +105,6 @@ const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 
 // Alias for backward compatibility
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
-
-// =============================================================================
-// Address Hashing Utility
-// =============================================================================
-
-/**
- * Hash an address (DIRECT:// or PROXY://) for use as indexed 't' tag value.
- * Enables reverse lookup: address → binding event → transport pubkey.
- * @param address - Address string (e.g., DIRECT://... or PROXY://...)
- * @returns Hex-encoded SHA-256 hash
- */
-function hashAddressForTag(address: string): string {
-  const bytes = new TextEncoder().encode('unicity:address:' + address);
-  return Buffer.from(sha256Noble(bytes)).toString('hex');
-}
-
-// =============================================================================
-// Nametag Encryption Utilities
-// =============================================================================
-
-/**
- * Derive encryption key from private key using HKDF
- * @param privateKeyHex - 32-byte private key as hex
- * @returns 32-byte derived key as Uint8Array
- */
-function deriveNametagEncryptionKey(privateKeyHex: string): Uint8Array {
-  const privateKeyBytes = Buffer.from(privateKeyHex, 'hex');
-  // Use HKDF with SHA-256, salt derived from constant, info = "nametag-encryption"
-  const saltInput = new TextEncoder().encode('sphere-nametag-salt');
-  const salt = sha256Noble(saltInput);
-  const info = new TextEncoder().encode('nametag-encryption');
-  return hkdf(sha256Noble, privateKeyBytes, salt, info, 32);
-}
-
-/**
- * Encrypt nametag with AES-GCM using derived key
- * @param nametag - Plain text nametag
- * @param privateKeyHex - Private key for key derivation
- * @returns Base64 encoded encrypted data (iv + ciphertext + tag)
- */
-async function encryptNametag(nametag: string, privateKeyHex: string): Promise<string> {
-  const key = deriveNametagEncryptionKey(privateKeyHex);
-  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV for AES-GCM
-  const encoder = new TextEncoder();
-  const data = encoder.encode(nametag);
-
-  const cryptoKey = await crypto.subtle.importKey(
-    'raw',
-    new Uint8Array(key).buffer as ArrayBuffer,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt']
-  );
-
-  const encrypted = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
-    cryptoKey,
-    new Uint8Array(data).buffer as ArrayBuffer
-  );
-
-  // Combine IV + ciphertext (includes auth tag)
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(encrypted), iv.length);
-
-  return Buffer.from(combined).toString('base64');
-}
-
-/**
- * Decrypt nametag with AES-GCM using derived key
- * @param encryptedBase64 - Base64 encoded encrypted data (iv + ciphertext + tag)
- * @param privateKeyHex - Private key for key derivation
- * @returns Decrypted nametag or null if decryption fails
- */
-async function decryptNametag(encryptedBase64: string, privateKeyHex: string): Promise<string | null> {
-  try {
-    const key = deriveNametagEncryptionKey(privateKeyHex);
-    const combined = Buffer.from(encryptedBase64, 'base64');
-
-    const iv = combined.slice(0, 12);
-    const ciphertext = combined.slice(12);
-
-    const cryptoKey = await crypto.subtle.importKey(
-      'raw',
-      new Uint8Array(key).buffer as ArrayBuffer,
-      { name: 'AES-GCM' },
-      false,
-      ['decrypt']
-    );
-
-    const decrypted = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: new Uint8Array(iv).buffer as ArrayBuffer },
-      cryptoKey,
-      new Uint8Array(ciphertext).buffer as ArrayBuffer
-    );
-
-    const decoder = new TextDecoder();
-    return decoder.decode(decrypted);
-  } catch {
-    return null;
-  }
-}
 
 // =============================================================================
 // Implementation
@@ -847,184 +746,64 @@ export class NostrTransportProvider implements TransportProvider {
 
   async resolveNametag(nametag: string): Promise<string | null> {
     this.ensureConnected();
-
-    // Query for nametag binding events using hashed nametag (privacy-preserving)
-    // Try both '#d' and '#t' filters for compatibility with nostr-js-sdk
-    const hashedNametag = hashNametag(nametag);
-
-    // First try '#t' tag (nostr-js-sdk format)
-    let events = await this.queryEvents({
-      kinds: [EVENT_KINDS.NAMETAG_BINDING],
-      '#t': [hashedNametag],
-      limit: 1,
-    });
-
-    // Fallback to '#d' tag (legacy format)
-    if (events.length === 0) {
-      events = await this.queryEvents({
-        kinds: [EVENT_KINDS.NAMETAG_BINDING],
-        '#d': [hashedNametag],
-        limit: 1,
-      });
-    }
-
-    if (events.length === 0) return null;
-
-    // Parse binding event
-    const bindingEvent = events[0];
-
-    // For Nostr messaging (NIP-04 encryption), we MUST use the event author's pubkey.
-    // The 'address' tag contains the Unicity blockchain address (not a hex pubkey),
-    // which cannot be used for Nostr encryption.
-    // The event.pubkey is always the hex pubkey of the nametag owner.
-    if (bindingEvent.pubkey) {
-      return bindingEvent.pubkey;
-    }
-
-    // Fallback: try 'p' tag (our SDK format uses hex pubkey here)
-    const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'p');
-    if (pubkeyTag?.[1]) return pubkeyTag[1];
-
-    return null;
+    // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
+    return this.nostrClient!.queryPubkeyByNametag(nametag);
   }
 
   async resolveNametagInfo(nametag: string): Promise<PeerInfo | null> {
     this.ensureConnected();
 
-    // Query for nametag binding events using hashed nametag (privacy-preserving)
-    const hashedNametag = hashNametag(nametag);
-
-    // First try '#t' tag (nostr-js-sdk format)
-    let events = await this.queryEvents({
-      kinds: [EVENT_KINDS.NAMETAG_BINDING],
-      '#t': [hashedNametag],
-      limit: 1,
-    });
-
-    // Fallback to '#d' tag (legacy format)
-    if (events.length === 0) {
-      events = await this.queryEvents({
-        kinds: [EVENT_KINDS.NAMETAG_BINDING],
-        '#d': [hashedNametag],
-        limit: 1,
-      });
-    }
-
-    if (events.length === 0) {
+    // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
+    const binding = await this.nostrClient!.queryBindingByNametag(nametag);
+    if (!binding) {
       logger.debug('Nostr', `resolveNametagInfo: no binding events found for Unicity ID "${nametag}"`);
       return null;
     }
 
-    const bindingEvent = events[0];
-
-    try {
-      const content = JSON.parse(bindingEvent.content);
-
-      // Compute proper PROXY address using state-transition-sdk
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-      const proxyAddress = proxyAddr.toString();
-
-      // Check if event has extended fields
-      if (content.public_key && content.l1_address) {
-        return {
-          nametag,
-          transportPubkey: bindingEvent.pubkey,
-          chainPubkey: content.public_key,
-          l1Address: content.l1_address,
-          directAddress: content.direct_address || '',
-          proxyAddress,
-          timestamp: bindingEvent.created_at * 1000,
-        };
-      }
-
-      // Legacy event - only has Nostr pubkey
-      // Cannot derive l1_address or l3_address without 33-byte pubkey
-      logger.debug('Nostr', 'Legacy nametag event without extended fields:', nametag);
-
-      // Try to get info from tags as fallback
-      const pubkeyTag = bindingEvent.tags.find((t: string[]) => t[0] === 'pubkey');
-      const l1Tag = bindingEvent.tags.find((t: string[]) => t[0] === 'l1');
-
-      if (pubkeyTag?.[1] && l1Tag?.[1]) {
-        return {
-          nametag,
-          transportPubkey: bindingEvent.pubkey,
-          chainPubkey: pubkeyTag[1],
-          l1Address: l1Tag[1],
-          directAddress: '',
-          proxyAddress,
-          timestamp: bindingEvent.created_at * 1000,
-        };
-      }
-
-      // Return partial info with empty addresses for legacy events
-      return {
-        nametag,
-        transportPubkey: bindingEvent.pubkey,
-        chainPubkey: '', // Cannot derive from 32-byte Nostr pubkey
-        l1Address: '', // Cannot derive without 33-byte pubkey
-        directAddress: '',
-        proxyAddress,
-        timestamp: bindingEvent.created_at * 1000,
-      };
-    } catch {
-      // If content is not JSON, try legacy format
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-      return {
-        nametag,
-        transportPubkey: bindingEvent.pubkey,
-        chainPubkey: '',
-        l1Address: '',
-        directAddress: '',
-        proxyAddress: proxyAddr.toString(),
-        timestamp: bindingEvent.created_at * 1000,
-      };
-    }
+    return this.bindingInfoToPeerInfo(binding, nametag);
   }
 
   /**
    * Resolve a DIRECT://, PROXY://, or L1 address to full peer info.
-   * Performs reverse lookup: hash(address) → query '#t' tag → parse binding event.
-   * Works with both new identity binding events and legacy nametag binding events.
+   * Performs reverse lookup via nostr-js-sdk with first-seen-wins anti-hijacking.
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
     this.ensureConnected();
 
-    const addressHash = hashAddressForTag(address);
+    const binding = await this.nostrClient!.queryBindingByAddress(address);
+    if (!binding) return null;
 
-    const events = await this.queryEvents({
-      kinds: [EVENT_KINDS.NAMETAG_BINDING],
-      '#t': [addressHash],
-      limit: 1,
-    });
+    return this.bindingInfoToPeerInfo(binding);
+  }
 
-    if (events.length === 0) return null;
+  /**
+   * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
+   * Computes PROXY address from nametag if available.
+   */
+  private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
+    const nametagValue = nametag || binding.nametag;
+    let proxyAddress: string | undefined = binding.proxyAddress;
 
-    const bindingEvent = events[0];
-
-    try {
-      const content = JSON.parse(bindingEvent.content);
-
-      return {
-        nametag: content.nametag || undefined,
-        transportPubkey: bindingEvent.pubkey,
-        chainPubkey: content.public_key || '',
-        l1Address: content.l1_address || '',
-        directAddress: content.direct_address || '',
-        proxyAddress: content.proxy_address || undefined,
-        timestamp: bindingEvent.created_at * 1000,
-      };
-    } catch {
-      return {
-        transportPubkey: bindingEvent.pubkey,
-        chainPubkey: '',
-        l1Address: '',
-        directAddress: '',
-        timestamp: bindingEvent.created_at * 1000,
-      };
+    // Compute PROXY address from nametag if not already in binding
+    if (nametagValue && !proxyAddress) {
+      try {
+        const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+        const proxyAddr = await ProxyAddress.fromNameTag(nametagValue);
+        proxyAddress = proxyAddr.toString();
+      } catch {
+        // Ignore — proxy address computation is best-effort
+      }
     }
+
+    return {
+      nametag: nametagValue,
+      transportPubkey: binding.transportPubkey,
+      chainPubkey: binding.publicKey || '',
+      l1Address: binding.l1Address || '',
+      directAddress: binding.directAddress || '',
+      proxyAddress,
+      timestamp: binding.timestamp,
+    };
   }
 
   /**
@@ -1172,11 +951,10 @@ export class NostrTransportProvider implements TransportProvider {
 
   /**
    * Publish identity binding event on Nostr.
-   * Without nametag: publishes base binding (chainPubkey, l1Address, directAddress).
-   * With nametag: also publishes nametag hash, proxy address, encrypted nametag for recovery.
-   *
-   * Uses kind 30078 parameterized replaceable event with d=SHA256('unicity:identity:' + nostrPubkey).
-   * Each HD address index has its own Nostr key → its own binding event.
+   * Without nametag: publishes base binding (chainPubkey, l1Address, directAddress)
+   * using a per-identity d-tag for address discovery.
+   * With nametag: delegates to nostr-js-sdk's publishNametagBinding which handles
+   * conflict detection (first-seen-wins), encryption, and indexed tags.
    *
    * @returns true if successful, false if nametag is taken by another pubkey
    */
@@ -1194,18 +972,47 @@ export class NostrTransportProvider implements TransportProvider {
 
     const nostrPubkey = this.getNostrPubkey();
 
-    // Deterministic d-tag: SHA256('unicity:identity:' + nostrPubkey) — privacy-preserving
+    if (nametag) {
+      // Delegate to nostr-js-sdk — handles conflict detection, encryption, and event creation
+      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
+      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
+
+      try {
+        const success = await this.nostrClient!.publishNametagBinding(
+          nametag,
+          nostrPubkey,
+          {
+            publicKey: chainPubkey,
+            l1Address,
+            directAddress,
+            proxyAddress: proxyAddr.toString(),
+          },
+        );
+
+        if (success) {
+          logger.debug('Nostr', 'Published identity binding with Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+        }
+        return success;
+      } catch (error) {
+        // publishNametagBinding throws if nametag is already claimed
+        if (error instanceof Error && error.message.includes('already claimed')) {
+          logger.debug('Nostr', 'Unicity ID already taken:', nametag);
+          return false;
+        }
+        throw error;
+      }
+    }
+
+    // No nametag — publish base identity binding with per-identity d-tag
     const dTagBytes = new TextEncoder().encode('unicity:identity:' + nostrPubkey);
     const dTag = Buffer.from(sha256Noble(dTagBytes)).toString('hex');
 
-    // Content — event.pubkey already identifies the author, event.created_at provides timestamp
     const contentObj: Record<string, unknown> = {
       public_key: chainPubkey,
       l1_address: l1Address,
       direct_address: directAddress,
     };
 
-    // Tags — 'd' for replacement, 't' for indexed lookups
     const tags: string[][] = [
       ['d', dTag],
       ['t', hashAddressForTag(chainPubkey)],
@@ -1213,129 +1020,11 @@ export class NostrTransportProvider implements TransportProvider {
       ['t', hashAddressForTag(l1Address)],
     ];
 
-    // If nametag provided, check availability and add nametag-specific fields
-    if (nametag) {
-      const existing = await this.resolveNametag(nametag);
-      if (existing && existing !== nostrPubkey) {
-        logger.debug('Nostr', 'Unicity ID already taken:', nametag, '- owner:', existing);
-        return false;
-      }
-
-      // Compute proxy address
-      const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-      const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-      const proxyAddress = proxyAddr.toString();
-
-      // Encrypt nametag for recovery
-      const encryptedNametag = await encryptNametag(nametag, this.identity.privateKey);
-      const hashedNametag = hashNametag(nametag);
-
-      // Add nametag fields to content
-      contentObj.nametag = nametag;
-      contentObj.encrypted_nametag = encryptedNametag;
-      contentObj.proxy_address = proxyAddress;
-
-      // Add nametag-specific 't' tags for indexed lookup
-      tags.push(['t', hashedNametag]);
-      tags.push(['t', hashAddressForTag(proxyAddress)]);
-    }
-
     const content = JSON.stringify(contentObj);
     const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
     await this.publishEvent(event);
 
-    if (nametag) {
-      logger.debug('Nostr', 'Published identity binding with Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
-    } else {
-      logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
-    }
-
-    return true;
-  }
-
-  /** @deprecated Use publishIdentityBinding instead */
-  async publishNametag(nametag: string, address: string): Promise<void> {
-    this.ensureReady();
-
-    // Use hashed nametag (privacy-preserving)
-    const hashedNametag = hashNametag(nametag);
-    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, address, [
-      ['d', hashedNametag],
-      ['a', address],
-    ]);
-
-    await this.publishEvent(event);
-    logger.debug('Nostr', 'Published Unicity ID binding:', nametag);
-  }
-
-  async registerNametag(nametag: string, _publicKey: string, directAddress: string = ''): Promise<boolean> {
-    this.ensureReady();
-
-    if (!this.identity) {
-      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
-    }
-
-    // Always use 32-byte Nostr-format pubkey from keyManager (not the 33-byte compressed key)
-    const nostrPubkey = this.getNostrPubkey();
-
-    // Check if nametag is already taken by someone else
-    const existing = await this.resolveNametag(nametag);
-
-    logger.debug('Nostr', 'registerNametag:', nametag, 'existing:', existing, 'myPubkey:', nostrPubkey);
-
-    if (existing && existing !== nostrPubkey) {
-      logger.debug('Nostr', 'Unicity ID already taken:', nametag, '- owner:', existing);
-      return false;
-    }
-
-    // Always (re)publish to ensure event has correct format with all required tags
-    // This is a parameterized replaceable event (kind 30078), so publishing with same 'd' tag
-    // will replace any old event. This ensures the event has ['t', hash] tag for nostr-js-sdk.
-
-    // Derive extended address info for full nametag support:
-    // - encrypted_nametag: AES-GCM encrypted nametag for recovery
-    // - public_key: 33-byte compressed public key for L3 operations
-    // - l1_address: L1 address (alpha1...) for L1 transfers
-    const privateKeyHex = this.identity.privateKey;
-    const compressedPubkey = getPublicKey(privateKeyHex, true); // 33-byte compressed
-    const l1Address = publicKeyToAddress(compressedPubkey, 'alpha'); // alpha1...
-    const encryptedNametag = await encryptNametag(nametag, privateKeyHex);
-
-    // Compute PROXY address for reverse lookup
-    const { ProxyAddress } = await import('@unicitylabs/state-transition-sdk/lib/address/ProxyAddress');
-    const proxyAddr = await ProxyAddress.fromNameTag(nametag);
-    const proxyAddress = proxyAddr.toString();
-
-    // Publish nametag binding with extended info
-    const hashedNametag = hashNametag(nametag);
-    const content = JSON.stringify({
-      nametag_hash: hashedNametag,
-      address: nostrPubkey,
-      verified: Date.now(),
-      // Extended fields for nametag recovery and address lookup
-      encrypted_nametag: encryptedNametag,
-      public_key: compressedPubkey,
-      l1_address: l1Address,
-      direct_address: directAddress,
-      proxy_address: proxyAddress,
-    });
-
-    // Build tags with indexed 't' tags for reverse lookup by nametag and address
-    const tags: string[][] = [
-      ['d', hashedNametag],
-      ['nametag', hashedNametag],
-      ['t', hashedNametag],
-      ['t', hashAddressForTag(directAddress)],
-      ['t', hashAddressForTag(proxyAddress)],
-      ['address', nostrPubkey],
-      ['pubkey', compressedPubkey],
-      ['l1', l1Address],
-    ];
-
-    const event = await this.createEvent(EVENT_KINDS.NAMETAG_BINDING, content, tags);
-
-    await this.publishEvent(event);
-    logger.debug('Nostr', 'Registered Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...', 'l1:', l1Address.slice(0, 12) + '...');
+    logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
     return true;
   }
 

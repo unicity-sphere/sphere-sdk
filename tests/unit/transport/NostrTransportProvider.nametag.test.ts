@@ -137,6 +137,30 @@ const mockSubscribe = vi.fn().mockImplementation((filter: unknown, callbacks: {
   return subId;
 });
 
+// Mock queryBindingByNametag: parses stored events to return BindingInfo
+const mockQueryBindingByNametag = vi.fn().mockImplementation(async (nametagId: string) => {
+  const { hashNametag: ht } = await import('@unicitylabs/nostr-js-sdk');
+  const hashedNametag = ht(nametagId);
+  const key = `nametag:${hashedNametag}`;
+  const events = storedQueryEvents.get(key) || [];
+  if (events.length === 0) return null;
+  // First-seen-wins: pick event with earliest created_at
+  const sorted = [...events].sort((a: any, b: any) => a.created_at - b.created_at);
+  const event = sorted[0] as any;
+  const content = JSON.parse(event.content);
+  return {
+    transportPubkey: event.pubkey,
+    publicKey: content.public_key || undefined,
+    l1Address: content.l1_address || undefined,
+    directAddress: content.direct_address || undefined,
+    proxyAddress: content.proxy_address || undefined,
+    nametag: content.nametag || undefined,
+    timestamp: event.created_at * 1000,
+  };
+});
+
+const mockQueryBindingByAddress = vi.fn().mockResolvedValue(null);
+
 vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@unicitylabs/nostr-js-sdk')>();
   return {
@@ -150,6 +174,10 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
       unsubscribe: mockUnsubscribe,
       publishEvent: mockPublishEvent,
       addConnectionListener: mockAddConnectionListener,
+      queryBindingByNametag: mockQueryBindingByNametag,
+      queryBindingByAddress: mockQueryBindingByAddress,
+      queryPubkeyByNametag: vi.fn().mockResolvedValue(null),
+      publishNametagBinding: vi.fn().mockResolvedValue(true),
     })),
   };
 });
@@ -388,7 +416,7 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
     expect(info!.proxyAddress).toBe(expectedProxy);
   });
 
-  it('should handle event with tags fallback (pubkey and l1 tags)', async () => {
+  it('should handle event with content fields (pubkey and l1 in content)', async () => {
     const hashedNametag = hashNametag('tagged');
     const nostrPubkey = 'f'.repeat(64);
 
@@ -399,10 +427,11 @@ describe('NostrTransportProvider.resolveNametagInfo()', () => {
       kind: NOSTR_EVENT_KINDS.NAMETAG_BINDING,
       tags: [
         ['t', hashedNametag],
-        ['pubkey', TEST_COMPRESSED_PUBKEY],
-        ['l1', TEST_L1_ADDRESS],
       ],
-      content: JSON.stringify({}),
+      content: JSON.stringify({
+        public_key: TEST_COMPRESSED_PUBKEY,
+        l1_address: TEST_L1_ADDRESS,
+      }),
       sig: 'mocksig',
     };
 
@@ -551,10 +580,10 @@ describe('NostrTransportProvider.recoverNametag()', () => {
 });
 
 // =============================================================================
-// Tests: registerNametag with extended fields
+// Tests: publishIdentityBinding with nametag (delegates to nostr-js-sdk)
 // =============================================================================
 
-describe('NostrTransportProvider.registerNametag() extended fields', () => {
+describe('NostrTransportProvider.publishIdentityBinding() with nametag', () => {
   let provider: InstanceType<typeof NostrTransportProvider>;
 
   beforeEach(() => {
@@ -573,56 +602,37 @@ describe('NostrTransportProvider.registerNametag() extended fields', () => {
     });
   });
 
-  it('should include encrypted_nametag in published event', async () => {
+  it('should delegate to nostrClient.publishNametagBinding when nametag is provided', async () => {
     await provider.connect();
 
-    // resolveNametag returns null (nametag not taken)
-    await provider.registerNametag(TEST_NAMETAG, TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS);
+    const success = await provider.publishIdentityBinding(
+      TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS, TEST_NAMETAG,
+    );
 
+    expect(success).toBe(true);
+    // publishNametagBinding is called on the mock NostrClient
+    const mockInstance = (await import('@unicitylabs/nostr-js-sdk')).NostrClient as any;
+    const clientInstance = mockInstance.mock.results[0]?.value;
+    expect(clientInstance.publishNametagBinding).toHaveBeenCalledWith(
+      TEST_NAMETAG,
+      expect.any(String),
+      expect.objectContaining({
+        publicKey: TEST_COMPRESSED_PUBKEY,
+        l1Address: TEST_L1_ADDRESS,
+        directAddress: TEST_DIRECT_ADDRESS,
+      }),
+    );
+  });
+
+  it('should publish identity binding event without nametag (no-nametag path)', async () => {
+    await provider.connect();
+
+    const success = await provider.publishIdentityBinding(
+      TEST_COMPRESSED_PUBKEY, TEST_L1_ADDRESS, TEST_DIRECT_ADDRESS,
+    );
+
+    expect(success).toBe(true);
+    // Without nametag, it publishes directly via publishEvent (identity-based d-tag)
     expect(publishedEvents.length).toBeGreaterThan(0);
-
-    // Find the nametag binding event
-    const event = publishedEvents.find((e: any) => e.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING) as any;
-    expect(event).toBeDefined();
-
-    const content = JSON.parse(event.content);
-    expect(content.encrypted_nametag).toBeDefined();
-    expect(content.encrypted_nametag).not.toBe(TEST_NAMETAG);
-
-    // Verify we can decrypt it
-    const decrypted = await decryptNametag(content.encrypted_nametag, TEST_PRIVATE_KEY);
-    expect(decrypted).toBe(TEST_NAMETAG);
-  });
-
-  it('should include public_key, l1_address, and direct_address in published event', async () => {
-    await provider.connect();
-
-    await provider.registerNametag(TEST_NAMETAG, TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS);
-
-    const event = publishedEvents.find((e: any) => e.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING) as any;
-    const content = JSON.parse(event.content);
-
-    expect(content.public_key).toBeDefined();
-    expect(content.public_key).toMatch(/^0[23][0-9a-f]{64}$/);
-    expect(content.l1_address).toBeDefined();
-    expect(content.l1_address).toMatch(/^alpha1[a-z0-9]+$/);
-    expect(content.direct_address).toBe(TEST_DIRECT_ADDRESS);
-  });
-
-  it('should include hashed nametag in both "t" and "d" tags', async () => {
-    await provider.connect();
-
-    await provider.registerNametag(TEST_NAMETAG, TEST_COMPRESSED_PUBKEY, TEST_DIRECT_ADDRESS);
-
-    const event = publishedEvents.find((e: any) => e.kind === NOSTR_EVENT_KINDS.NAMETAG_BINDING) as any;
-    const hashedNametag = hashNametag(TEST_NAMETAG);
-
-    const tTag = event.tags.find((t: string[]) => t[0] === 't');
-    const dTag = event.tags.find((t: string[]) => t[0] === 'd');
-
-    expect(tTag).toBeDefined();
-    expect(tTag[1]).toBe(hashedNametag);
-    expect(dTag).toBeDefined();
-    expect(dTag[1]).toBe(hashedNametag);
   });
 });

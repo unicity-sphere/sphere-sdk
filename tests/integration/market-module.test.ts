@@ -56,7 +56,6 @@ function createMockTransport(): TransportProvider {
     onEvent: vi.fn().mockReturnValue(() => {}),
     resolveNametag: vi.fn().mockResolvedValue(null),
     publishIdentityBinding: vi.fn().mockResolvedValue(true),
-    registerNametag: vi.fn().mockResolvedValue(true),
     recoverNametag: vi.fn().mockResolvedValue(null),
   } as TransportProvider;
 }

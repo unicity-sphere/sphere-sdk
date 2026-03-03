@@ -1369,18 +1369,19 @@ async function main() {
 
         console.log(`\nRe-publishing nametag @${identity.nametag} with chainPubkey...`);
 
-        // Get transport provider and force re-register
-        const transport = (sphere as unknown as { _transport?: { registerNametag?: (n: string, pk: string, da: string) => Promise<boolean> } })._transport;
-        if (!transport?.registerNametag) {
-          console.error('Transport provider does not support nametag registration');
+        // Get transport provider and force re-publish
+        const transport = (sphere as unknown as { _transport?: { publishIdentityBinding?: (ck: string, l1: string, da: string, nt: string) => Promise<boolean> } })._transport;
+        if (!transport?.publishIdentityBinding) {
+          console.error('Transport provider does not support identity binding');
           process.exit(1);
         }
 
         try {
-          const success = await transport.registerNametag(
-            identity.nametag,
+          const success = await transport.publishIdentityBinding(
             identity.chainPubkey,
-            identity.directAddress || ''
+            identity.l1Address,
+            identity.directAddress || '',
+            identity.nametag,
           );
 
           if (success) {
