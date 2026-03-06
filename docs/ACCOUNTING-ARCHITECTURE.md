@@ -79,7 +79,7 @@ The `tokenData` field contains a canonical JSON serialization of `InvoiceTerms`:
 ```
 InvoiceTerms (serialized into genesis.data.tokenData)
 +-- creator?: string                    // chain pubkey of the invoice creator (OPTIONAL -- anonymous allowed)
-+-- createdAt: number                   // ms timestamp
++-- createdAt: number                   // ms timestamp (local clock at mint time, NOT aggregator time)
 +-- dueDate?: number                    // optional deadline (ms timestamp)
 +-- memo?: string                       // free-text or URL
 +-- deliveryMethods?: string[]          // ordered list of delivery URLs (highest priority first) -- PLACEHOLDER
@@ -91,6 +91,8 @@ InvoiceTerms (serialized into genesis.data.tokenData)
 ```
 
 **Anonymous invoices:** The `creator` field is optional. Anyone can create an invoice without identifying themselves. When `creator` is omitted, the invoice is anonymous — any party holding the invoice locally may close or cancel it (since there is no creator to verify against). For non-anonymous invoices, only the creator may close or cancel.
+
+**Anonymous invoice auto-return restriction:** Auto-return is **disabled** for anonymous invoices. The `autoReturn` option in `closeInvoice()` / `cancelInvoice()` is rejected with `INVOICE_ANON_AUTO_RETURN` for anonymous invoices, and `setAutoReturn()` skips anonymous invoices. This prevents a malicious holder from cancelling an anonymous invoice to trigger auto-return of all accumulated payments. Targets of anonymous invoices may still manually return tokens via `returnInvoicePayment()` (`:B` direction).
 
 **Delivery methods:** The `deliveryMethods` field is an optional ordered list of URLs specifying how payments should be delivered, in priority order (first URL = highest priority). This is a **placeholder** for future use — the current SDK uses the Nostr-based delivery network exclusively. When delivery method support is implemented, a payer should attempt delivery to the first URL, falling back to subsequent URLs on failure.
 
@@ -246,6 +248,7 @@ Both inbound and outbound transfers are considered. The scan examines the memo f
 Key transitions:
 - **EXPIRED is not terminal.** An expired invoice can still transition to CLOSED if all targets become fully covered and all related tokens are confirmed after the due date. EXPIRED is only reachable from OPEN or PARTIAL — if the invoice is COVERED (all targets met but unconfirmed), it stays COVERED even after the due date passes, and transitions to CLOSED once confirmed.
 - **EXPIRED detection is passive.** The `invoice:expired` event fires when `getInvoiceStatus()` is called or when an inbound event triggers recomputation — there is no background timer. If no events arrive and no status queries are made after the due date, the `invoice:expired` event will not fire until the next interaction. Applications requiring prompt expiration notification should poll `getInvoiceStatus()` or set a `setTimeout` based on `dueDate - Date.now()`.
+- **Clock skew.** EXPIRED is a local-only state derived from `Date.now() > dueDate`. Different parties may have different system clocks, so they may disagree on whether an invoice is expired. Implementations SHOULD tolerate up to 60 seconds of clock skew in UI presentation (e.g., showing "expiring soon" rather than hard cutoff). The `dueDate` is a signal, not an enforcement mechanism — there is no on-chain expiration.
 - **CANCELLED is terminal (locally).** Once cancelled, the invoice remains cancelled on the local party's side regardless of subsequent payments. Balances are frozen and persisted. See Section 4.4 for cancellation semantics.
 - **CLOSED is terminal (locally).** Two paths to CLOSED: (1) implicit — all targets covered + all tokens confirmed; (2) explicit — **creator** calls `closeInvoice()` at any time (satisfied with current payments). Balances are frozen and persisted. Target owners cannot close — only the creator (or any party for anonymous invoices).
 - **Frozen terminal states.** Once CLOSED or CANCELLED, the frozen balance snapshot is persisted. Dynamic recomputation stops. New transfers referencing the invoice may trigger auto-return but do not change the status.
@@ -304,7 +307,15 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
    - The return memo uses `INV:<id>:RC` (if invoice is CLOSED) or `INV:<id>:RX` (if CANCELLED).
 3. The auto-return transfer is recorded in history like any other transfer.
 
-**Auto-return deduplication:** Each auto-return is tracked in a persistent ledger (`auto_return_ledger`) keyed by `(invoiceId, originalTransferId)`. Before executing an auto-return, the module checks the ledger — if the entry exists, the return is skipped. This prevents double-returns when the same inbound event is re-delivered (Nostr re-delivery, reconnection, or retroactive scan). On partial failure (send succeeds but ledger write fails), the next attempt finds no ledger entry and retries the send — `PaymentsModule.send()` is not idempotent, so the ledger write MUST succeed before the auto-return is considered complete. The auto-return operation is: (1) check ledger, (2) send, (3) write ledger entry — all within the per-invoice serialization gate.
+**Auto-return deduplication (intent log pattern):** Each auto-return is tracked in a persistent ledger (`auto_return_ledger`) keyed by `(invoiceId, originalTransferId)`. The auto-return operation follows a write-first intent log pattern to prevent duplicate sends on crash recovery:
+
+1. Check ledger for `(invoiceId, originalTransferId)` — if entry exists with `status: 'completed'`, skip (already returned).
+2. **Write intent:** Write ledger entry with `status: 'pending'` and persist.
+3. **Send:** Call `PaymentsModule.send()` to return tokens.
+4. **Complete:** Update ledger entry to `status: 'completed'` with `returnTransferId`.
+5. Fire `invoice:auto_returned` event.
+
+On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found, retry the send. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
 
 **Auto-return exclusions — return payments are NEVER auto-returned:**
 - Transfers with direction `:B`, `:RC`, or `:RX` are **never** auto-returned.
@@ -351,13 +362,13 @@ The accounting module wraps all its inbound event processing in try/catch guards
 - `setAutoReturn()` immediate trigger
 - Inbound event processing that may trigger auto-return
 
-**Non-serialized (read-only) operations:**
-- `getInvoiceStatus()` — always safe to call concurrently; reads frozen balances or recomputes from history
+**Non-serialized (read-only) operations (with one exception):**
+- `getInvoiceStatus()` — read-only in the common case. However, when it detects an implicit close condition (all targets covered + all confirmed), it acquires the per-invoice gate to freeze balances and persist. Inside the gate, the condition is re-verified before freezing (another operation may have already terminated the invoice). This prevents a race between concurrent implicit close detection and explicit `closeInvoice()`/`cancelInvoice()` calls.
 - `getInvoice()`, `getInvoices()`, `getRelatedTransfers()`
 - `payInvoice()` — only reads terminal state to decide whether to block; the actual `send()` call is delegated to PaymentsModule
 - `parseInvoiceMemo()`
 
-**Implementation:** A `Map<string, Promise<void>>` keyed by invoice ID. Each mutating operation chains onto the existing promise (or creates a new one). This is a lightweight cooperative lock — no OS-level primitives needed in single-threaded JavaScript. The gate ensures that if two events arrive in rapid succession for the same invoice, the second waits for the first to complete before executing.
+**Implementation:** A `Map<string, Promise<void>>` keyed by invoice ID. Each mutating operation chains onto the existing promise (or creates a new one). This is a lightweight cooperative lock — no OS-level primitives needed in single-threaded JavaScript. The gate ensures that if two events arrive in rapid succession for the same invoice, the second waits for the first to complete before executing. **Cleanup:** After each operation completes, if no further operations are queued, the gate entry is deleted from the map to prevent unbounded memory growth over thousands of invoices.
 
 **Global operations** (`setAutoReturn('*', true)`) acquire the gate for each affected invoice sequentially, not all at once. This prevents deadlocks and allows interleaving with per-invoice operations on other invoices.
 
@@ -470,7 +481,7 @@ The AccountingModule registers a memo parser that extracts:
 
 No changes to `TransferRequest`, `PaymentsModule`, or the transport layer are needed.
 
-**Memo injection defense:** The `INV:` memo field is user-controlled — any sender can write any memo. The canonical parser (`parseInvoiceMemo()`) is the sole authority for extracting invoice references. The parser validates the invoice ID format (64-char hex), rejects malformed prefixes, and normalizes direction codes. Invalid or unrecognized formats are ignored (treated as non-invoice transfers). Direction codes from untrusted senders are validated against sender identity (see §6.2 sender restriction) before being accepted. Applications MUST NOT parse invoice memos manually — always use `parseInvoiceMemo()`.
+**Memo injection defense:** The `INV:` memo field is user-controlled — any sender can write any memo. The canonical parser (`parseInvoiceMemo()`) is the sole authority for extracting invoice references. The parser validates the invoice ID format (64-char hex `[0-9a-fA-F]{64}` — guaranteed colon-free and space-free by the SHA-256 derivation), rejects malformed prefixes, and normalizes direction codes. Invalid or unrecognized formats are ignored (treated as non-invoice transfers). Direction codes from untrusted senders are validated against sender identity (see §6.2 sender restriction) before being accepted. Applications MUST NOT parse invoice memos manually — always use `parseInvoiceMemo()`.
 
 ## 7. Integration with Existing SDK
 
@@ -571,6 +582,7 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:overpayment` | `{ invoiceId, address, coinId, surplus, confirmed }` | Payment exceeds requested amount |
 | `invoice:irrelevant` | `{ invoiceId, transfer, reason, confirmed }` | Transfer references this invoice but doesn't match any target address or requested asset |
 | `invoice:auto_returned` | `{ invoiceId, originalTransfer, returnTransfer }` | Tokens were auto-returned for a terminated invoice |
+| `invoice:auto_return_failed` | `{ invoiceId, transferId, reason }` | Auto-return failed (sender unresolvable or send failed) |
 | `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return (`:RC` or `:RX`) — may trigger auto-termination |
 
 ### 7.6 Idempotent Event Re-Firing
@@ -659,6 +671,8 @@ For multi-target invoices, each party has an **inherently partial view**:
 
 Close and cancel operations are **per-wallet, per-perspective**. A target closing their view of the invoice does not close it for other targets. This is a fundamental consequence of local-first accounting. Applications requiring synchronized multi-party termination should use explicit out-of-band coordination (e.g., transport messages).
 
+**Target resolution:** Invoice targets are identified by `DIRECT://` address, which is derived from the chain pubkey. Target matching compares the transfer's destination address (for forward payments) or sender address (for returns) against the `target.address` field stored in the invoice terms at creation time. The addresses are deterministic — there is no ambiguity from nametag resolution or address format differences.
+
 ### 9.5 Same Invoice on Multiple HD Addresses
 
 A single wallet may hold the same invoice token on multiple HD addresses (e.g., address 0 and address 1 both import the invoice). Terminal state (CLOSED, CANCELLED) is **per-address** — closing the invoice on address 0 does not close it on address 1. Each address maintains its own frozen balances, auto-return settings, and terminal state. This matches the existing SDK pattern where each address is an independent accounting unit with its own token storage and history.
@@ -745,6 +759,7 @@ Sender receives the auto-return (INV:abc:RX):
 | Cancel by non-creator | Reject — only the creator (or any holder for anonymous invoices) can cancel |
 | Forward payment to terminated invoice | **Throw `INVOICE_TERMINATED`** — the transfer is blocked before it happens |
 | Return payment from non-target party | **Throw `INVOICE_NOT_TARGET`** — only invoice target parties may send back/return payments |
+| Auto-return on anonymous invoice | **Throw `INVOICE_ANON_AUTO_RETURN`** — auto-return is disabled for anonymous invoices to prevent abuse |
 | Auto-return failure | Log error — the inbound transfer is already recorded, auto-return can be retried |
 | Event processing failure | Log error, continue — transfer is already complete, accounting catches up on next recomputation |
 | Status computation failure | Return error to caller — does not affect any transfer in progress |
