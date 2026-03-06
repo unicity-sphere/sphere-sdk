@@ -20,35 +20,54 @@
 
 ## 1. Types
 
-### 1.1 Invoice Types
+### 1.1 Shared Asset Types
+
+These types are shared between token genesis data and invoice targets — the same representation is used everywhere in the SDK.
 
 ```typescript
 // =============================================================================
-// Invoice Core Types
+// Shared Asset Types (reused from TXF genesis coinData format)
 // =============================================================================
 
 /**
- * An asset requested in an invoice line item.
- * Represents a specific amount of a fungible token.
+ * A fungible coin entry — same [coinId, amount] tuple used in TxfGenesisData.coinData.
+ *
+ * Examples: ["UCT", "1000000"], ["USDU", "500000000"], ["ALPHA", "200000"]
+ *
+ * This is the EXISTING format from TxfGenesisData.coinData: [string, string][].
+ * Invoice targets reuse this exact type for consistency.
  */
-interface InvoiceAsset {
-  /** Token coin ID (e.g., 'UCT', 'USDU', 'ALPHA') */
-  readonly coinId: string;
-  /** Amount in smallest units (string to avoid precision loss) */
-  readonly amount: string;
-}
+type CoinEntry = [string, string]; // [coinId, amount in smallest units]
 
 /**
- * Placeholder for future NFT support in invoice line items.
- * Not yet implemented in Sphere SDK — included for forward compatibility.
+ * An NFT entry — placeholder for future NFT support (not yet implemented in Sphere SDK).
+ * Same type will be used in both token genesis and invoice targets when NFTs are added.
  */
-interface InvoiceNFT {
+interface NFTEntry {
   /** Unique NFT token ID (64-char hex) */
   readonly tokenId: string;
   /** NFT type identifier (64-char hex, optional) */
   readonly tokenType?: string;
-  /** Arbitrary metadata (schema TBD when NFTs are implemented) */
-  readonly metadata?: Record<string, unknown>;
+}
+```
+
+### 1.2 Invoice Types
+
+```typescript
+// =============================================================================
+// Invoice Types
+// =============================================================================
+
+/**
+ * A single requested asset in an invoice target.
+ * Wraps either a CoinEntry (fungible) or NFTEntry (non-fungible).
+ * Exactly one of `coin` or `nft` must be set.
+ */
+interface InvoiceRequestedAsset {
+  /** Fungible token request — same [coinId, amount] tuple as genesis coinData */
+  readonly coin?: CoinEntry;
+  /** NFT request (placeholder — not yet implemented) */
+  readonly nft?: NFTEntry;
 }
 
 /**
@@ -58,10 +77,25 @@ interface InvoiceNFT {
 interface InvoiceTarget {
   /** Destination address (DIRECT://... format) */
   readonly address: string;
-  /** Fungible assets requested for this address */
-  readonly assets: InvoiceAsset[];
-  /** NFTs requested for this address (placeholder, not yet supported) */
-  readonly nfts?: InvoiceNFT[];
+  /** Requested assets for this address */
+  readonly assets: InvoiceRequestedAsset[];
+}
+
+/**
+ * Invoice terms — the payload serialized into the token's genesis.data.tokenData field.
+ * This is the complete invoice definition. The token IS the invoice.
+ */
+interface InvoiceTerms {
+  /** Chain pubkey of the creator */
+  readonly creator: string;
+  /** Creation timestamp (ms) */
+  readonly createdAt: number;
+  /** Optional due date (ms timestamp). Expiration does NOT invalidate the invoice. */
+  readonly dueDate?: number;
+  /** Optional memo — free text or URL describing the reason */
+  readonly memo?: string;
+  /** Payment targets — at least one required */
+  readonly targets: InvoiceTarget[];
 }
 
 /**
@@ -71,61 +105,35 @@ interface InvoiceTarget {
 interface CreateInvoiceRequest {
   /** Payment targets — at least one required */
   readonly targets: InvoiceTarget[];
-  /** Optional due date (ms timestamp). Invoice expires after this time. */
+  /** Optional due date (ms timestamp). */
   readonly dueDate?: number;
   /** Optional memo — free text or URL describing the reason for the invoice */
   readonly memo?: string;
 }
-
-/**
- * Full invoice data stored locally.
- * The `id` is the on-chain token ID (globally unique via aggregator).
- */
-interface Invoice {
-  /** Invoice ID = minted token ID (64-char hex) */
-  readonly id: string;
-  /** Chain pubkey of the creator */
-  readonly creator: string;
-  /** Payment targets */
-  readonly targets: InvoiceTarget[];
-  /** Optional due date (ms timestamp) */
-  readonly dueDate?: number;
-  /** Optional memo */
-  readonly memo?: string;
-  /** Creation timestamp (ms) */
-  readonly createdAt: number;
-  /** Whether this wallet is the creator */
-  readonly isCreator: boolean;
-  /** Explicitly cancelled by creator */
-  cancelled: boolean;
-  /** Timestamp of cancellation (ms), if cancelled */
-  cancelledAt?: number;
-}
 ```
 
-### 1.2 Invoice Status Types
+### 1.3 Invoice Status Types
 
 ```typescript
 /**
- * Computed invoice state (not stored — derived from local data).
+ * Computed invoice state.
+ * NEVER stored — always derived on-demand from local token inventory and history.
  */
 type InvoiceState = 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED';
 
 /**
- * Detailed status of a single asset within a target.
+ * Detailed status of a single coin asset within a target.
  */
-interface InvoiceAssetStatus {
-  /** The requested asset */
-  readonly coinId: string;
-  /** Requested amount (smallest units) */
-  readonly requestedAmount: string;
+interface InvoiceCoinAssetStatus {
+  /** The coin entry from the invoice target: [coinId, amount] */
+  readonly coin: CoinEntry;
   /** Total forward payments received/sent for this asset (smallest units) */
   readonly coveredAmount: string;
   /** Total back/return payments for this asset (smallest units) */
   readonly returnedAmount: string;
   /** Net covered = coveredAmount - returnedAmount */
   readonly netCoveredAmount: string;
-  /** Whether requestedAmount is fully met (netCovered >= requested) */
+  /** Whether requested amount is fully met (netCovered >= requested) */
   readonly isCovered: boolean;
   /** Surplus amount if overpaid (netCovered - requested), '0' if not overpaid */
   readonly surplusAmount: string;
@@ -138,9 +146,9 @@ interface InvoiceAssetStatus {
 /**
  * Status of a single NFT line item (placeholder).
  */
-interface InvoiceNFTStatus {
-  /** The requested NFT token ID */
-  readonly tokenId: string;
+interface InvoiceNFTAssetStatus {
+  /** The NFT entry from the invoice target */
+  readonly nft: NFTEntry;
   /** Whether the NFT has been received */
   readonly received: boolean;
   /** Whether the received token is confirmed */
@@ -153,30 +161,32 @@ interface InvoiceNFTStatus {
 interface InvoiceTargetStatus {
   /** Target destination address */
   readonly address: string;
-  /** Per-asset status */
-  readonly assets: InvoiceAssetStatus[];
-  /** Per-NFT status (placeholder) */
-  readonly nfts?: InvoiceNFTStatus[];
-  /** Whether all assets (and NFTs) for this target are covered */
+  /** Per-coin-asset status */
+  readonly coinAssets: InvoiceCoinAssetStatus[];
+  /** Per-NFT-asset status (placeholder) */
+  readonly nftAssets: InvoiceNFTAssetStatus[];
+  /** Whether all assets (coins and NFTs) for this target are covered */
   readonly isCovered: boolean;
   /** Whether all related tokens are confirmed */
   readonly confirmed: boolean;
 }
 
 /**
- * Reference to a transfer that contributes to an invoice.
+ * Reference to a transfer that contributes to (or is related to) an invoice.
  */
 interface InvoiceTransferRef {
   /** Transfer/history entry ID */
   readonly transferId: string;
   /** Transfer direction from this wallet's perspective */
   readonly direction: 'inbound' | 'outbound';
-  /** Invoice payment direction */
+  /** Invoice payment direction (from memo) */
   readonly paymentDirection: 'forward' | 'back';
   /** Coin ID of the transferred token */
   readonly coinId: string;
   /** Amount transferred (smallest units) */
   readonly amount: string;
+  /** Destination address of the transfer */
+  readonly destinationAddress: string;
   /** Timestamp of the transfer */
   readonly timestamp: number;
   /** Whether the transfer's tokens are fully confirmed */
@@ -192,38 +202,39 @@ interface InvoiceTransferRef {
 }
 
 /**
- * Transfers related to an invoice that don't match any target.
+ * A transfer that references this invoice but doesn't match any target.
  */
-interface UnrelatedTransfer extends InvoiceTransferRef {
-  /** Why this transfer is unrelated */
+interface IrrelevantTransfer extends InvoiceTransferRef {
+  /** Why this transfer is irrelevant */
   readonly reason: 'unknown_address' | 'unknown_asset' | 'unknown_address_and_asset';
 }
 
 /**
  * Complete computed status of an invoice.
  * Returned by `accounting.getInvoiceStatus()`.
+ * NEVER persisted — always computed fresh.
  */
 interface InvoiceStatus {
-  /** Invoice ID */
+  /** Invoice token ID */
   readonly invoiceId: string;
   /** Current computed state */
   readonly state: InvoiceState;
   /** Per-target breakdown */
   readonly targets: InvoiceTargetStatus[];
   /** Transfers referencing this invoice but not matching any target/asset */
-  readonly unrelatedTransfers: UnrelatedTransfer[];
-  /** Total forward payments across all targets (sum of coveredAmounts by coinId) */
+  readonly irrelevantTransfers: IrrelevantTransfer[];
+  /** Total forward payments across all targets, keyed by coinId */
   readonly totalForward: Record<string, string>;
-  /** Total back/return payments across all targets */
+  /** Total back/return payments across all targets, keyed by coinId */
   readonly totalBack: Record<string, string>;
   /** Whether ALL related tokens are confirmed */
   readonly allConfirmed: boolean;
-  /** Timestamp of last status change */
-  readonly lastUpdatedAt: number;
+  /** Timestamp of most recent related transfer */
+  readonly lastActivityAt: number;
 }
 ```
 
-### 1.3 Result Types
+### 1.4 Result Types
 
 ```typescript
 /**
@@ -232,10 +243,12 @@ interface InvoiceStatus {
 interface CreateInvoiceResult {
   /** Whether the invoice was successfully minted */
   readonly success: boolean;
-  /** Invoice data (if successful) */
-  readonly invoice?: Invoice;
+  /** Invoice token ID (if successful) */
+  readonly invoiceId?: string;
   /** Invoice token in TXF format (if successful) */
   readonly token?: TxfToken;
+  /** Parsed invoice terms (if successful) */
+  readonly terms?: InvoiceTerms;
   /** Error message (if failed) */
   readonly error?: string;
 }
@@ -244,7 +257,7 @@ interface CreateInvoiceResult {
  * Options for listing invoices.
  */
 interface GetInvoicesOptions {
-  /** Filter by state */
+  /** Filter by computed state */
   readonly state?: InvoiceState | InvoiceState[];
   /** Filter: only invoices created by this wallet */
   readonly createdByMe?: boolean;
@@ -255,12 +268,28 @@ interface GetInvoicesOptions {
   /** Offset for pagination */
   readonly offset?: number;
   /** Sort order */
-  readonly sortBy?: 'createdAt' | 'dueDate' | 'lastUpdated';
+  readonly sortBy?: 'createdAt' | 'dueDate';
   readonly sortOrder?: 'asc' | 'desc';
+}
+
+/**
+ * Lightweight invoice reference returned by getInvoices().
+ * Contains the token ID and parsed terms. Status is NOT included —
+ * call getInvoiceStatus() per invoice when needed.
+ */
+interface InvoiceRef {
+  /** Invoice token ID */
+  readonly invoiceId: string;
+  /** Parsed invoice terms from token genesis */
+  readonly terms: InvoiceTerms;
+  /** Whether this wallet created the invoice */
+  readonly isCreator: boolean;
+  /** Whether this invoice has been locally cancelled */
+  readonly cancelled: boolean;
 }
 ```
 
-### 1.4 Configuration Types
+### 1.5 Configuration Types
 
 ```typescript
 /**
@@ -278,9 +307,7 @@ interface AccountingModuleConfig {
 interface AccountingModuleDependencies {
   /** PaymentsModule instance (read-only access) */
   payments: PaymentsModule;
-  /** Storage provider for invoice metadata */
-  storage: StorageProvider;
-  /** Token storage for invoice tokens */
+  /** Token storage for invoice tokens (same provider as currency/nametag tokens) */
   tokenStorage: TokenStorageProvider;
   /** Oracle for minting invoice tokens */
   oracle: OracleProvider;
@@ -302,9 +329,10 @@ class AccountingModule {
   constructor(config: AccountingModuleConfig, deps: AccountingModuleDependencies);
 
   /**
-   * Load persisted invoices from storage.
+   * Load invoice tokens from TokenStorageProvider.
    * Called by Sphere after module construction.
    * Subscribes to PaymentsModule events for automatic tracking.
+   * Filters tokens by INVOICE_TOKEN_TYPE_HEX to identify invoice tokens.
    */
   async load(): Promise<void>;
 
@@ -313,69 +341,79 @@ class AccountingModule {
    *
    * Flow:
    * 1. Validate request (at least one target, valid amounts)
-   * 2. Serialize invoice metadata deterministically
-   * 3. Mint invoice token via aggregator (same flow as NametagMinter)
-   * 4. Store invoice metadata + token locally
-   * 5. Fire 'invoice:created' event
+   * 2. Build InvoiceTerms (adding creator pubkey, createdAt timestamp)
+   * 3. Serialize InvoiceTerms canonically into tokenData
+   * 4. Mint token via aggregator (same flow as NametagMinter)
+   * 5. Store token via TokenStorageProvider
+   * 6. Fire 'invoice:created' event
    *
-   * @returns CreateInvoiceResult with invoice data and token
+   * @returns CreateInvoiceResult with token and parsed terms
    */
   async createInvoice(request: CreateInvoiceRequest): Promise<CreateInvoiceResult>;
 
   /**
-   * Import an invoice received from another party.
-   * The invoice token is validated against the aggregator.
+   * Import an invoice token received from another party.
+   * The token is validated (proof chain, token type, parseable tokenData).
+   * Stored via TokenStorageProvider alongside other tokens.
    *
    * @param token - Invoice token in TXF format (received via transfer or out-of-band)
-   * @returns The parsed Invoice, or throws if token is invalid
+   * @returns Parsed InvoiceTerms
+   * @throws SphereError if token is invalid or not an invoice token
    */
-  async importInvoice(token: TxfToken): Promise<Invoice>;
+  async importInvoice(token: TxfToken): Promise<InvoiceTerms>;
 
   /**
    * Compute the current status of an invoice from local data.
    *
-   * Scans PaymentsModule.getHistory() for transfers with matching
-   * INV:<id> memo prefix and aggregates amounts per target per asset.
+   * Reads invoice terms from the token's genesis tokenData, then scans
+   * PaymentsModule.getHistory() for transfers with matching INV:<id> memo
+   * prefix. Aggregates amounts per target per asset.
+   *
+   * Status is NEVER cached or stored — always computed fresh.
    *
    * @param invoiceId - The invoice token ID
    * @returns Computed InvoiceStatus
-   * @throws SphereError if invoice not found locally
+   * @throws SphereError if invoice token not found locally
    */
   async getInvoiceStatus(invoiceId: string): Promise<InvoiceStatus>;
 
   /**
-   * List invoices with optional filtering and pagination.
+   * List invoice tokens with optional filtering and pagination.
    *
-   * Status is computed on-demand for each invoice in the result.
+   * Returns lightweight InvoiceRef objects (token ID + parsed terms).
+   * Status is NOT computed here — call getInvoiceStatus() per invoice when needed.
+   *
+   * When filtering by state, status IS computed per invoice to apply the filter
+   * (but not returned — caller must call getInvoiceStatus() separately).
    *
    * @param options - Filter/sort/pagination options
-   * @returns Array of Invoice objects (without computed status — call getInvoiceStatus per invoice)
+   * @returns Array of InvoiceRef objects
    */
-  getInvoices(options?: GetInvoicesOptions): Invoice[];
+  getInvoices(options?: GetInvoicesOptions): InvoiceRef[];
 
   /**
-   * Get a single invoice by ID.
+   * Get a single invoice by token ID.
    *
    * @param invoiceId - The invoice token ID
-   * @returns Invoice or null if not found
+   * @returns InvoiceRef or null if not found
    */
-  getInvoice(invoiceId: string): Invoice | null;
+  getInvoice(invoiceId: string): InvoiceRef | null;
 
   /**
    * Cancel an invoice. Only the creator can cancel.
-   * Sets `cancelled = true` and fires 'invoice:cancelled' event.
+   * Cancellation is local-only (not on-chain). Fires 'invoice:cancelled' event.
    *
-   * Cancellation is local-only — there is no on-chain cancel.
-   * The payer may still send tokens referencing this invoice.
+   * The payer may still send tokens referencing this invoice — those
+   * transfers will still be tracked but the status will remain CANCELLED.
    *
    * @param invoiceId - The invoice token ID
-   * @throws SphereError if not creator or invoice not found
+   * @throws SphereError if not creator, not found, or already closed/cancelled
    */
   async cancelInvoice(invoiceId: string): Promise<void>;
 
   /**
    * Get all transfers related to a specific invoice.
-   * Includes forward payments, back payments, and unrelated transfers.
+   * Includes forward payments, back payments, and irrelevant transfers.
    *
    * @param invoiceId - The invoice token ID
    * @returns InvoiceTransferRef[] sorted by timestamp
@@ -444,13 +482,15 @@ export * from './types';
 The invoice token ID is derived deterministically from the invoice content, ensuring that the same invoice parameters always produce the same token ID (enabling idempotent re-minting).
 
 ```typescript
-// Deterministic token ID from invoice content
-const invoiceBytes = canonicalSerialize({
-  targets: request.targets,
+// Deterministic token ID from canonical invoice terms
+const terms: InvoiceTerms = {
   creator: identity.chainPubkey,
-  memo: request.memo,
+  createdAt: Date.now(),
   dueDate: request.dueDate,
-});
+  memo: request.memo,
+  targets: request.targets,
+};
+const invoiceBytes = canonicalSerialize(terms);
 const tokenId = TokenId.fromData(invoiceBytes);
 ```
 
@@ -458,27 +498,28 @@ const tokenId = TokenId.fromData(invoiceBytes);
 
 ```
 Step  Action                                SDK Class
-────  ──────────────────────────────────    ─────────────────────
+----  ------                                ---------
 1     Validate CreateInvoiceRequest         AccountingModule
-2     Canonical serialize invoice data      AccountingModule
-3     Generate deterministic salt           SHA-256(signingKey ‖ invoiceBytes)
-4     Create MintTransactionData            MintTransactionData.create()
+2     Build InvoiceTerms (add creator,      AccountingModule
+      createdAt)
+3     Canonical serialize InvoiceTerms      AccountingModule
+4     Generate deterministic salt           SHA-256(signingKey || invoiceBytes)
+5     Create MintTransactionData            MintTransactionData.create()
       - tokenType: INVOICE_TOKEN_TYPE
-      - tokenData: serialized invoice
+      - tokenData: serialized InvoiceTerms
       - coinData: [] (non-fungible)
       - recipient: creator's DirectAddress
-5     Create MintCommitment                 MintCommitment.create()
-6     Submit to aggregator (3 retries)      client.submitMintCommitment()
-      - SUCCESS → continue
-      - REQUEST_ID_EXISTS → continue (idempotent)
-7     Wait for inclusion proof              waitInclusionProof()
-8     Create genesis transaction            commitment.toTransaction()
-9     Create UnmaskedPredicate + TokenState UnmaskedPredicate.create()
-10    Create Token (with or without         Token.mint() or Token.fromJSON()
+6     Create MintCommitment                 MintCommitment.create()
+7     Submit to aggregator (3 retries)      client.submitMintCommitment()
+      - SUCCESS -> continue
+      - REQUEST_ID_EXISTS -> continue (idempotent)
+8     Wait for inclusion proof              waitInclusionProof()
+9     Create genesis transaction            commitment.toTransaction()
+10    Create UnmaskedPredicate + TokenState  UnmaskedPredicate.create()
+11    Create Token (with or without          Token.mint() or Token.fromJSON()
       verification based on config)
-11    Store token via TokenStorageProvider   tokenStorage.saveToken()
-12    Store invoice metadata via Storage     storage.set(key, metadata)
-13    Fire 'invoice:created' event           emitEvent()
+12    Store token via TokenStorageProvider   tokenStorage.saveToken()
+13    Fire 'invoice:created' event          emitEvent()
 ```
 
 ### 3.3 Invoice Token Type Constant
@@ -495,29 +536,27 @@ const INVOICE_TOKEN_TYPE_HEX =
 
 ### 3.4 Canonical Serialization
 
-Invoice metadata must be serialized deterministically (same input → same bytes) for consistent token ID derivation:
+InvoiceTerms must be serialized deterministically (same input -> same bytes) for consistent token ID derivation:
 
 ```typescript
-function canonicalSerialize(invoice: {
-  targets: InvoiceTarget[];
-  creator: string;
-  memo?: string;
-  dueDate?: number;
-}): Uint8Array {
+function canonicalSerialize(terms: InvoiceTerms): Uint8Array {
   // Sort targets by address (lexicographic)
-  // Within each target, sort assets by coinId
-  // Use JSON.stringify with sorted keys
-  // Encode as UTF-8
+  // Within each target, sort assets: coins first (sorted by coinId), then NFTs (sorted by tokenId)
   const sorted = {
-    creator: invoice.creator,
-    dueDate: invoice.dueDate ?? null,
-    memo: invoice.memo ?? null,
-    targets: [...invoice.targets]
+    creator: terms.creator,
+    createdAt: terms.createdAt,
+    dueDate: terms.dueDate ?? null,
+    memo: terms.memo ?? null,
+    targets: [...terms.targets]
       .sort((a, b) => a.address.localeCompare(b.address))
       .map(t => ({
         address: t.address,
-        assets: [...t.assets].sort((a, b) => a.coinId.localeCompare(b.coinId)),
-        nfts: t.nfts ? [...t.nfts].sort((a, b) => a.tokenId.localeCompare(b.tokenId)) : undefined,
+        assets: [...t.assets].sort((a, b) => {
+          // Coins before NFTs, then sort within category
+          if (a.coin && b.coin) return a.coin[0].localeCompare(b.coin[0]);
+          if (a.nft && b.nft) return a.nft.tokenId.localeCompare(b.nft.tokenId);
+          return a.coin ? -1 : 1; // coins first
+        }),
       })),
   };
   return new TextEncoder().encode(JSON.stringify(sorted));
@@ -578,9 +617,9 @@ No changes to `PaymentsModule.send()` are required. The caller constructs the me
 ```typescript
 await sphere.payments.send({
   recipient: invoiceTarget.address,
-  amount: invoiceAsset.amount,
-  coinId: invoiceAsset.coinId,
-  memo: buildInvoiceMemo(invoice.id, 'forward', 'Order #1234'),
+  amount: invoiceAsset.coin![1], // amount from CoinEntry tuple
+  coinId: invoiceAsset.coin![0], // coinId from CoinEntry tuple
+  memo: buildInvoiceMemo(invoiceId, 'forward', 'Order #1234'),
 });
 ```
 
@@ -591,30 +630,34 @@ await sphere.payments.send({
 ### 5.1 Algorithm
 
 ```
-function computeInvoiceStatus(invoice, history):
-  1. Filter history for entries where parseInvoiceMemo(entry.memo)?.invoiceId === invoice.id
-  2. For each matching transfer:
+function computeInvoiceStatus(invoiceId, terms, cancelledSet, history):
+  1. Parse terms from token's genesis.data.tokenData
+  2. Check if invoiceId is in cancelledSet -> CANCELLED
+  3. Filter history for entries where parseInvoiceMemo(entry.memo)?.invoiceId === invoiceId
+  4. For each matching transfer:
      a. Determine target match: find target where target.address matches
-        the transfer's destination (inbound) or source (outbound)
-     b. Determine asset match: find asset where asset.coinId matches transfer's coinId
-     c. If both match → accumulate into target/asset status
-     d. If address matches but coinId doesn't → unrelated (unknown_asset)
-     e. If coinId matches but address doesn't → unrelated (unknown_address)
-     f. If neither matches → unrelated (unknown_address_and_asset)
-  3. Compute per-asset coverage:
+        the transfer's destination address
+     b. Determine asset match: find coin asset where coinId matches
+     c. If both match -> accumulate into target/asset status
+     d. If address matches but coinId doesn't -> irrelevant (unknown_asset)
+     e. If coinId matches but address doesn't -> irrelevant (unknown_address)
+     f. If neither matches -> irrelevant (unknown_address_and_asset)
+  5. Compute per-coin-asset coverage:
      netCovered = sum(forward amounts) - sum(back amounts)
      isCovered = netCovered >= requestedAmount
      surplus = max(0, netCovered - requestedAmount)
-  4. Compute per-target coverage:
-     isCovered = all assets isCovered (AND all NFTs received, when supported)
-  5. Determine state:
-     - if invoice.cancelled → CANCELLED
-     - if invoice.dueDate && now > invoice.dueDate && state != CLOSED → EXPIRED
-     - if all targets isCovered AND allConfirmed → CLOSED
-     - if all targets isCovered → COVERED
-     - if any asset has netCovered > 0 → PARTIAL
-     - else → OPEN
-  6. Determine allConfirmed:
+  6. Compute per-target coverage:
+     isCovered = all coin assets isCovered AND all NFTs received
+  7. Determine state:
+     - if cancelled -> CANCELLED
+     - if all targets isCovered AND allConfirmed -> CLOSED
+     - if all targets isCovered -> COVERED
+     - if any asset has netCovered > 0 -> PARTIAL
+     - if terms.dueDate && now > terms.dueDate -> EXPIRED
+     - else -> OPEN
+  8. Note: EXPIRED is checked AFTER CLOSED/COVERED. If all targets are
+     covered+confirmed after dueDate, the state is CLOSED, not EXPIRED.
+  9. Determine allConfirmed:
      Every InvoiceTransferRef.confirmed === true
 ```
 
@@ -639,6 +682,16 @@ The same invoice viewed by different parties:
 
 The status computation uses the wallet's own transaction history, so each party naturally gets their perspective.
 
+### 5.4 EXPIRED State Semantics
+
+EXPIRED is **informational, not terminal**. When `dueDate` has passed:
+- If the invoice is already CLOSED -> stays CLOSED (terminal)
+- If the invoice is COVERED (all covered but not all confirmed) -> stays COVERED (will transition to CLOSED on confirmation)
+- If the invoice is OPEN or PARTIAL -> becomes EXPIRED
+- An EXPIRED invoice can still transition to CLOSED if all targets become covered and confirmed after expiration
+
+This means: due date is a signal to participants, not an enforcement mechanism. The on-chain tokens don't enforce deadlines.
+
 ---
 
 ## 6. Events
@@ -659,10 +712,11 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 | 'invoice:expired'
 | 'invoice:unknown_reference'
 | 'invoice:overpayment'
+| 'invoice:irrelevant'
 
 // New SphereEventMap entries:
 'invoice:created': {
-  invoice: Invoice;
+  invoiceId: string;
   confirmed: boolean;  // true once mint proof is confirmed
 };
 
@@ -693,7 +747,7 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 
 'invoice:closed': {
   invoiceId: string;
-  // No 'confirmed' field — CLOSED implies all confirmed
+  // No 'confirmed' field -- CLOSED implies all confirmed
 };
 
 'invoice:cancelled': {
@@ -702,10 +756,11 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 
 'invoice:expired': {
   invoiceId: string;
+  // Informational only -- invoice can still transition to CLOSED
 };
 
 'invoice:unknown_reference': {
-  invoiceId: string;          // referenced in memo but not in local storage
+  invoiceId: string;          // referenced in memo but not in local token storage
   transfer: InvoiceTransferRef;
 };
 
@@ -716,136 +771,114 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
   surplus: string;     // amount exceeding request (smallest units)
   confirmed: boolean;
 };
+
+'invoice:irrelevant': {
+  invoiceId: string;
+  transfer: InvoiceTransferRef;
+  reason: 'unknown_address' | 'unknown_asset' | 'unknown_address_and_asset';
+  confirmed: boolean;
+};
 ```
 
 ### 6.2 Event Firing Logic
 
 ```
 On PaymentsModule 'transfer:incoming' or 'history:updated':
-  1. Parse memo → get invoiceId, direction
-  2. If invoiceId not in local storage:
-     → fire 'invoice:unknown_reference' { invoiceId, transfer, confirmed: false }
-     → return
+  1. Parse memo -> get invoiceId, direction
+  2. If invoiceId not in local token storage:
+     -> fire 'invoice:unknown_reference' { invoiceId, transfer }
+     -> return
   3. Build InvoiceTransferRef from transfer data
-  4. fire 'invoice:payment' { invoiceId, transfer, direction, confirmed: false }
+  4. Match transfer against invoice targets:
+     a. If matches target + asset:
+        -> fire 'invoice:payment' { invoiceId, transfer, direction, confirmed }
+     b. If doesn't match any target/asset:
+        -> fire 'invoice:irrelevant' { invoiceId, transfer, reason, confirmed }
   5. Recompute status:
-     a. If asset just became covered → fire 'invoice:asset_covered' { ..., confirmed: false }
-     b. If target just became covered → fire 'invoice:target_covered' { ..., confirmed: false }
+     a. If asset just became covered -> fire 'invoice:asset_covered'
+     b. If target just became covered -> fire 'invoice:target_covered'
      c. If all targets covered:
-        - If all confirmed → fire 'invoice:closed'
-        - Else → fire 'invoice:covered' { ..., confirmed: false }
-     d. If surplus detected → fire 'invoice:overpayment' { ..., confirmed: false }
+        - If all confirmed -> fire 'invoice:closed'
+        - Else -> fire 'invoice:covered' { confirmed: false }
+     d. If surplus detected -> fire 'invoice:overpayment'
 
 On PaymentsModule 'transfer:confirmed':
   1. Check if transfer has invoice memo reference
-  2. If yes, recompute status with confirmed tokens:
-     a. Re-fire 'invoice:payment' with confirmed: true
-     b. Re-fire 'invoice:asset_covered' with confirmed: true (if still covered)
-     c. Re-fire 'invoice:target_covered' with confirmed: true (if still covered)
-     d. If all targets covered AND all confirmed:
-        → fire 'invoice:closed'
-     e. If overpayment → re-fire 'invoice:overpayment' with confirmed: true
+  2. If yes, recompute and re-fire all applicable events with confirmed: true
+  3. If all targets covered AND now all confirmed -> fire 'invoice:closed'
 ```
 
-### 6.3 Due Date Expiration
+### 6.3 Idempotency Contract
 
-Expiration is checked lazily:
-- On `getInvoiceStatus()` call — if dueDate passed and state is not CLOSED/CANCELLED
-- On any event recomputation — if dueDate passed during processing
+**Events may fire multiple times.** The AccountingModule does NOT track which events have been fired. On every relevant trigger (incoming transfer, confirmation, history update), it recomputes from scratch and fires all applicable events.
 
-When detected, fire `'invoice:expired'` once (guard against duplicate fires via stored flag).
+This means consumers WILL receive duplicate events and MUST handle them idempotently:
+- A UI should update its display, not append to a list
+- A notification system should deduplicate by (invoiceId, event type, transferId)
+- A logging system can safely log duplicates
+
+This design is intentional — it avoids complex "already-fired" bookkeeping and aligns with the Nostr re-delivery model used elsewhere in the SDK.
+
+### 6.4 Due Date Expiration
+
+The `invoice:expired` event fires when `getInvoiceStatus()` or event recomputation detects that `dueDate` has passed and the invoice is in OPEN or PARTIAL state. Since events are idempotent, this may fire multiple times. Consumers should treat it as informational.
 
 ---
 
 ## 7. Storage
 
-### 7.1 Storage Keys
+### 7.1 Token Storage (Primary)
+
+Invoice tokens are stored via `TokenStorageProvider` — the **same** provider used for currency tokens, nametag tokens, etc. The token's `genesis.data.tokenType` of `INVOICE_TOKEN_TYPE_HEX` identifies it as an invoice.
+
+On `load()`, the AccountingModule filters all tokens in storage by token type to discover invoice tokens. All invoice data (terms, creator, targets, etc.) is read from the token's `genesis.data.tokenData` field.
+
+### 7.2 Cancellation Storage
+
+Since cancellation is local-only (not encoded in the token), a minimal per-address key tracks cancelled invoice IDs:
 
 Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 
 ```typescript
-/** Invoice metadata map (JSON: Record<string, InvoiceStorageEntry>) */
-INVOICES: 'invoices',
-/** Invoice status index for quick lookups (JSON: Record<string, InvoiceIndexEntry>) */
-INVOICE_INDEX: 'invoice_index',
+/** Cancelled invoice IDs (JSON string array) */
+CANCELLED_INVOICES: 'cancelled_invoices',
 ```
 
-Full key format: `sphere_{addressId}_invoices`, `sphere_{addressId}_invoice_index`
+Full key format: `sphere_{addressId}_cancelled_invoices`
 
-### 7.2 Storage Schemas
+Storage schema:
 
 ```typescript
-/**
- * Persisted invoice metadata (stored in INVOICES key).
- * Keyed by invoice ID.
- */
-interface InvoiceStorageEntry {
-  /** Invoice ID (= token ID) */
-  id: string;
-  /** Creator's chain pubkey */
-  creator: string;
-  /** Serialized targets (InvoiceTarget[]) */
-  targets: InvoiceTarget[];
-  /** Due date (ms timestamp) */
-  dueDate?: number;
-  /** Memo */
-  memo?: string;
-  /** Creation timestamp */
-  createdAt: number;
-  /** Whether this wallet created it */
-  isCreator: boolean;
-  /** Cancellation flag */
-  cancelled: boolean;
-  /** Cancellation timestamp */
-  cancelledAt?: number;
-  /** Whether expiration event was already fired */
-  expiredEventFired?: boolean;
-}
-
-/**
- * Lightweight index entry for quick status lookups.
- * Cached to avoid full recomputation on every getInvoices() call.
- * Invalidated when related transfers change.
- */
-interface InvoiceIndexEntry {
-  /** Last computed state */
-  lastState: InvoiceState;
-  /** Timestamp of last computation */
-  computedAt: number;
-  /** Whether all tokens were confirmed at last check */
-  allConfirmed: boolean;
-}
+// Simple array of cancelled invoice token IDs
+type CancelledInvoicesStorage = string[];
 ```
 
-### 7.3 Invoice Tokens
-
-Invoice tokens (TXF format) are stored via `TokenStorageProvider`, identical to how nametag tokens are stored:
-
-- Active: `{tokenId}.json` in the per-address token directory
-- The token's `tokenData` field contains the serialized invoice metadata
-- Token type: `INVOICE_TOKEN_TYPE_HEX` (distinguishes from currency/nametag tokens)
-
-### 7.4 Storage Operations
+### 7.3 Storage Operations
 
 ```
 createInvoice():
-  1. tokenStorage.saveToken(invoiceToken)    // TXF token
-  2. storage.set(INVOICES_KEY, { ...existing, [id]: entry })  // metadata
-  3. storage.set(INDEX_KEY, { ...existing, [id]: indexEntry }) // index
+  1. tokenStorage.saveToken(invoiceToken)       // TXF token with InvoiceTerms in tokenData
 
 importInvoice():
-  1. tokenStorage.saveToken(invoiceToken)    // TXF token
-  2. storage.set(INVOICES_KEY, { ...existing, [id]: entry })  // metadata
+  1. tokenStorage.saveToken(invoiceToken)       // same as any received token
 
 cancelInvoice():
-  1. entry.cancelled = true; entry.cancelledAt = Date.now()
-  2. storage.set(INVOICES_KEY, updated)
-  3. storage.set(INDEX_KEY, { ...existing, [id]: { lastState: 'CANCELLED', ... } })
+  1. Load cancelled set from storage
+  2. Add invoiceId to set
+  3. storage.set(CANCELLED_INVOICES_KEY, updatedSet)
 
 getInvoiceStatus():
-  1. Read invoice from storage
-  2. Read history from PaymentsModule
-  3. Compute status (no writes unless index update is needed)
+  1. Read token from tokenStorage (parse terms from genesis.data.tokenData)
+  2. Read cancelled set from storage
+  3. Read history from PaymentsModule
+  4. Compute status (pure function, no writes)
+
+load():
+  1. Enumerate tokens from tokenStorage
+  2. Filter by tokenType === INVOICE_TOKEN_TYPE_HEX
+  3. Parse InvoiceTerms from each token's genesis.data.tokenData
+  4. Load cancelled set from storage
+  5. Subscribe to PaymentsModule events
 ```
 
 ---
@@ -858,12 +891,15 @@ getInvoiceStatus():
 |------|-------|
 | `targets` must be non-empty | `INVOICE_NO_TARGETS` |
 | Each target must have a valid DIRECT:// address | `INVOICE_INVALID_ADDRESS` |
-| Each target must have at least one asset or NFT | `INVOICE_NO_ASSETS` |
-| Each asset `amount` must be a positive integer string | `INVOICE_INVALID_AMOUNT` |
-| Each asset `coinId` must be non-empty | `INVOICE_INVALID_COIN` |
+| Each target must have at least one asset | `INVOICE_NO_ASSETS` |
+| Each asset must have exactly one of `coin` or `nft` set | `INVOICE_INVALID_ASSET` |
+| Each coin asset's amount (tuple index 1) must be a positive integer string | `INVOICE_INVALID_AMOUNT` |
+| Each coin asset's coinId (tuple index 0) must be non-empty | `INVOICE_INVALID_COIN` |
+| Each NFT asset's tokenId must be non-empty (64-char hex) | `INVOICE_INVALID_NFT` |
 | `dueDate` (if provided) must be in the future | `INVOICE_PAST_DUE_DATE` |
 | No duplicate addresses across targets | `INVOICE_DUPLICATE_ADDRESS` |
-| No duplicate coinIds within a single target | `INVOICE_DUPLICATE_ASSET` |
+| No duplicate coinIds within a single target's coin assets | `INVOICE_DUPLICATE_COIN` |
+| No duplicate NFT tokenIds within a single target | `INVOICE_DUPLICATE_NFT` |
 
 ### 8.2 Import Validation
 
@@ -871,17 +907,17 @@ getInvoiceStatus():
 |------|-------|
 | Token must have valid inclusion proof | `INVOICE_INVALID_PROOF` |
 | Token type must be `INVOICE_TOKEN_TYPE_HEX` | `INVOICE_WRONG_TOKEN_TYPE` |
-| Token data must parse as valid invoice metadata | `INVOICE_INVALID_DATA` |
-| Invoice must not already exist locally | `INVOICE_ALREADY_EXISTS` |
+| Token's `genesis.data.tokenData` must parse as valid InvoiceTerms | `INVOICE_INVALID_DATA` |
+| Invoice token must not already exist in local TokenStorage | `INVOICE_ALREADY_EXISTS` |
 
 ### 8.3 Cancel Validation
 
 | Rule | Error |
 |------|-------|
-| Invoice must exist locally | `INVOICE_NOT_FOUND` |
-| Caller must be the creator (`isCreator === true`) | `INVOICE_NOT_CREATOR` |
-| Invoice must not already be CLOSED | `INVOICE_ALREADY_CLOSED` |
-| Invoice must not already be CANCELLED | `INVOICE_ALREADY_CANCELLED` |
+| Invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| Caller must be the creator (terms.creator === identity.chainPubkey) | `INVOICE_NOT_CREATOR` |
+| Invoice must not already be CLOSED (computed) | `INVOICE_ALREADY_CLOSED` |
+| Invoice must not already be cancelled | `INVOICE_ALREADY_CANCELLED` |
 
 ---
 
@@ -891,7 +927,7 @@ getInvoiceStatus():
 
 ```typescript
 // sphere_getInvoices
-// Returns: Invoice[] (without computed status)
+// Returns: InvoiceRef[] (without computed status)
 // Params: GetInvoicesOptions (optional)
 {
   method: 'sphere_getInvoices',
@@ -899,7 +935,7 @@ getInvoiceStatus():
 }
 
 // sphere_getInvoiceStatus
-// Returns: InvoiceStatus
+// Returns: InvoiceStatus (computed fresh)
 // Params: { invoiceId: string }
 {
   method: 'sphere_getInvoiceStatus',
@@ -910,12 +946,18 @@ getInvoiceStatus():
 ### 9.2 New Intent Actions
 
 ```typescript
-// create_invoice — prompts user to confirm invoice creation
+// create_invoice -- prompts user to confirm invoice creation
 {
   action: 'create_invoice',
   params: {
     targets: [
-      { address: 'DIRECT://...', assets: [{ coinId: 'UCT', amount: '1000000' }] }
+      {
+        address: 'DIRECT://...',
+        assets: [
+          { coin: ['UCT', '1000000'] },
+          { coin: ['USDU', '500000000'] }
+        ]
+      }
     ],
     memo: 'Payment for services',
     dueDate: 1709251200000,
@@ -923,7 +965,7 @@ getInvoiceStatus():
 }
 // Returns: { invoiceId: string } on success
 
-// pay_invoice — prompts user to confirm payment against an invoice
+// pay_invoice -- prompts user to confirm payment against an invoice
 {
   action: 'pay_invoice',
   params: {
@@ -954,6 +996,7 @@ getInvoiceStatus():
 'invoice:payment'        // When a payment matches an invoice
 'invoice:covered'        // When an invoice is fully covered
 'invoice:closed'         // When an invoice transitions to CLOSED
+'invoice:irrelevant'     // When a non-matching payment references an invoice
 ```
 
 ---
@@ -966,18 +1009,21 @@ All errors use `SphereError` with the following codes:
 |------|---------|------|
 | `INVOICE_NO_TARGETS` | Invoice must have at least one target | Empty targets array |
 | `INVOICE_INVALID_ADDRESS` | Invalid target address: must be DIRECT:// format | Bad address format |
-| `INVOICE_NO_ASSETS` | Target must have at least one asset or NFT | Empty assets in target |
-| `INVOICE_INVALID_AMOUNT` | Asset amount must be a positive integer string | Non-positive or non-integer amount |
-| `INVOICE_INVALID_COIN` | Asset coinId must be non-empty | Empty coinId |
+| `INVOICE_NO_ASSETS` | Target must have at least one asset | Empty assets in target |
+| `INVOICE_INVALID_ASSET` | Asset must have exactly one of coin or nft | Both or neither set |
+| `INVOICE_INVALID_AMOUNT` | Coin amount must be a positive integer string | Non-positive or non-integer |
+| `INVOICE_INVALID_COIN` | Coin ID must be non-empty | Empty coinId in CoinEntry |
+| `INVOICE_INVALID_NFT` | NFT tokenId must be a 64-char hex string | Bad NFT tokenId |
 | `INVOICE_PAST_DUE_DATE` | Due date must be in the future | dueDate <= now |
-| `INVOICE_DUPLICATE_ADDRESS` | Duplicate target address in invoice | Same address appears twice |
-| `INVOICE_DUPLICATE_ASSET` | Duplicate asset coinId in target | Same coinId in one target |
-| `INVOICE_MINT_FAILED` | Failed to mint invoice token: {details} | Aggregator submission failure |
-| `INVOICE_INVALID_PROOF` | Invoice token has invalid inclusion proof | Import validation failure |
-| `INVOICE_WRONG_TOKEN_TYPE` | Token is not an invoice token | Wrong token type on import |
-| `INVOICE_INVALID_DATA` | Cannot parse invoice metadata from token | Corrupt tokenData |
-| `INVOICE_ALREADY_EXISTS` | Invoice already exists locally | Duplicate import |
-| `INVOICE_NOT_FOUND` | Invoice not found | Unknown invoiceId |
+| `INVOICE_DUPLICATE_ADDRESS` | Duplicate target address in invoice | Same address twice |
+| `INVOICE_DUPLICATE_COIN` | Duplicate coin ID in target | Same coinId in one target |
+| `INVOICE_DUPLICATE_NFT` | Duplicate NFT tokenId in target | Same NFT in one target |
+| `INVOICE_MINT_FAILED` | Failed to mint invoice token: {details} | Aggregator failure |
+| `INVOICE_INVALID_PROOF` | Invoice token has invalid inclusion proof | Import validation |
+| `INVOICE_WRONG_TOKEN_TYPE` | Token is not an invoice token | Wrong tokenType on import |
+| `INVOICE_INVALID_DATA` | Cannot parse invoice terms from token data | Corrupt tokenData |
+| `INVOICE_ALREADY_EXISTS` | Invoice token already exists locally | Duplicate import |
+| `INVOICE_NOT_FOUND` | Invoice token not found | Unknown invoiceId |
 | `INVOICE_NOT_CREATOR` | Only the creator can cancel an invoice | Cancel by non-creator |
 | `INVOICE_ALREADY_CLOSED` | Cannot cancel a closed invoice | Cancel after CLOSED |
 | `INVOICE_ALREADY_CANCELLED` | Invoice is already cancelled | Double cancel |
@@ -989,56 +1035,57 @@ All errors use `SphereError` with the following codes:
 
 ```
 modules/accounting/
-├── AccountingModule.ts    # Main module class
-├── InvoiceMinter.ts       # Invoice token minting (mirrors NametagMinter)
-├── StatusComputer.ts      # Invoice status computation logic
-├── memo.ts                # Memo parsing/building utilities
-├── types.ts               # All type definitions
-└── index.ts               # Barrel exports
++-- AccountingModule.ts    # Main module class
++-- InvoiceMinter.ts       # Invoice token minting (mirrors NametagMinter)
++-- StatusComputer.ts      # Invoice status computation logic
++-- memo.ts                # Memo parsing/building utilities
++-- types.ts               # All type definitions (InvoiceTerms, CoinEntry, NFTEntry, etc.)
++-- index.ts               # Barrel exports
 ```
 
-## Appendix B: Interaction Sequence — Full Invoice Lifecycle
+## Appendix B: Interaction Sequence -- Full Invoice Lifecycle
 
 ```
 Creator                    Aggregator              Payer
-   │                          │                      │
-   │ createInvoice(req)       │                      │
-   │─── mint commitment ─────►│                      │
-   │◄── inclusion proof ──────│                      │
-   │                          │                      │
-   │ send invoice token ──────────────────────────► │
-   │                          │                      │ importInvoice(token)
-   │                          │                      │
-   │                          │                      │ send(amount, memo=INV:id:F)
-   │◄─── token transfer ──────────────────────────── │
-   │                          │                      │
-   │ invoice:payment (unconfirmed)                   │ invoice:payment (unconfirmed)
-   │                          │                      │
-   │ ... more payments ...    │                      │
-   │                          │                      │
-   │ invoice:covered (unconfirmed)                   │
-   │                          │                      │
-   │ ... proofs confirmed ... │                      │
-   │                          │                      │
-   │ invoice:closed           │                      │
+   |                          |                      |
+   | createInvoice(req)       |                      |
+   |--- mint commitment ----->|                      |
+   |<-- inclusion proof ------|                      |
+   |                          |                      |
+   | send invoice token ---------------------------> |
+   |                          |                      | importInvoice(token)
+   |                          |                      |
+   |                          |                      | send(amount, memo=INV:id:F)
+   |<---- token transfer ----------------------------|
+   |                          |                      |
+   | invoice:payment (conf=false)                    | invoice:payment (conf=false)
+   |                          |                      |
+   | ... more payments ...    |                      |
+   |                          |                      |
+   | invoice:covered (conf=false)                    |
+   |                          |                      |
+   | ... proofs confirmed ... |                      |
+   |                          |                      |
+   | invoice:payment (conf=true, re-fire)            |
+   | invoice:closed           |                      |
 ```
 
 ## Appendix C: Exchange/Swap Scenario
 
 ```
 Exchange creates invoice:
-  Target 1: exchange_address ← Buyer sends 100 USDU
-  Target 2: buyer_address    ← Exchange sends 50 TOKEN_X
+  Target 1: exchange_address <- Buyer sends 100 USDU  [coin: ["USDU", "100000000"]]
+  Target 2: buyer_address    <- Exchange sends 50 TKN  [coin: ["TKN", "50000000"]]
 
 Both parties hold the invoice token.
 
-Buyer sends 100 USDU → memo: INV:xxx:F
-  → Exchange sees: target[0] COVERED (from their inbound history)
-  → Buyer sees: target[0] payment sent (from their outbound history)
+Buyer sends 100 USDU -> memo: INV:xxx:F
+  -> Exchange sees: target[0] COVERED (from their inbound history)
+  -> Buyer sees: target[0] payment sent (from their outbound history)
 
-Exchange sends 50 TOKEN_X → memo: INV:xxx:F
-  → Buyer sees: target[1] COVERED (from their inbound history)
-  → Exchange sees: target[1] payment sent (from their outbound history)
+Exchange sends 50 TKN -> memo: INV:xxx:F
+  -> Buyer sees: target[1] COVERED (from their inbound history)
+  -> Exchange sees: target[1] payment sent (from their outbound history)
 
-Both parties independently compute COVERED → CLOSED.
+Both parties independently compute COVERED -> CLOSED.
 ```
