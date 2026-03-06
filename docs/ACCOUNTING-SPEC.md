@@ -1045,7 +1045,7 @@ The `INV:` memo field is user-controlled — any sender can write any memo strin
 ### 5.1 Algorithm
 
 ```
-function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenBalances, history):
+function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenBalances, invoiceLedger, balanceCache):
   1. Parse terms from token's genesis.data.tokenData
 
   2. Check terminal states first:
@@ -1054,15 +1054,17 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
      - if previously reached implicit CLOSED (all covered + all confirmed)
        -> return CLOSED with persisted frozen balances
 
-  3. Scan FULL transaction history (active + sent tokens):
-     Filter for entries where parseInvoiceMemo(entry.memo)?.invoiceId === invoiceId
+  3. Read from persistent invoice-transfer index (§5.4):
+     entries = invoiceLedger.get(invoiceId)
+     // The index contains expanded per-coin InvoiceTransferRef entries,
+     // pre-built from HistoryRecord + token coinData at processing time.
+     // No history scan occurs at query time.
 
-  4. For each matching transfer:
-     a. Extract ALL coin entries from the transferred token's coinData.
-        A single token may carry multiple coins (multi-asset token).
-        If the token is no longer available (archived/spent), fall back to
-        the in-memory invoice-transfer index which preserves full coinData
-        from the time of initial processing (see §5.4, §7.6 index cache).
+  4. For each entry in the index:
+     a. Each entry represents ONE coin from a transfer's coinData.
+        Multi-asset tokens produce multiple entries (same transferId,
+        different coinId). The full coinData was captured at processing
+        time (§5.4.3) — no token lookup needed here.
      b. For EACH coin entry [coinId, amount] in the token:
         (Skip coin entries where amount is "0" — they carry no economic value
          and should not produce InvoiceTransferRef entries, fire events, or
@@ -1185,19 +1187,173 @@ Example: A token with `coinData = [["UCT", "500"], ["USDU", "1000"]]` transferre
 **Missing coinId in status queries:** For any coinId not present in the computed `coinData` map (i.e., no payments received for that asset), `amountCovered` is `'0'` and `tokenCount` is `0`. The `InvoiceCoinAssetStatus` is still returned with zero values — the target's requested assets always appear in the status regardless of payment activity.
 - If the invoice target for alice only requests UCT: the UCT entry matches, the USDU entry is irrelevant (`unknown_asset`).
 
-### 5.4 History Scanning Scope
+### 5.4 Invoice-Transfer Index (Primary Data Source)
 
-The status computation scans the **full transaction history** from `PaymentsModule.getHistory()`. This includes:
+Invoice balance computation reads from a **persistent invoice-transfer index**, NOT from `PaymentsModule.getHistory()` on every query. The index is the primary data source for all non-terminal invoice status computation.
 
-- **Inbound transfers** — tokens received by this wallet (active tokens)
-- **Outbound transfers** — tokens sent from this wallet (sent/archived tokens)
-- Both active and archived (spent) token histories are included
+#### 5.4.1 Why Not getHistory()?
 
-This ensures that all memo-referenced transfers are captured regardless of whether the underlying tokens are still in the inventory.
+`PaymentsModule.getHistory()` returns `HistoryRecord` entries with a **single** `coinId` and `amount` per entry. For multi-asset tokens (`coinData = [["UCT", "500"], ["USDU", "1000"]]`), the history record captures only the primary coin — the other coin entries are invisible. The full multi-asset `coinData` is only available from the token itself (`Token.sdkData` → `TxfToken.genesis.data.coinData`) or from the `transfer:incoming` event payload (`IncomingTransfer.tokens[]`).
 
-**Multi-asset data source:** `PaymentsModule.getHistory()` returns one entry per token transfer. Each entry includes the transfer's `coinId` and `amount` from the history record. For multi-asset tokens (tokens with multiple `coinData` entries), the accounting module reads the full `coinData` from the token itself via `PaymentsModule.getTokens()` or the transfer event payload — the history entry's single `coinId`/`amount` fields represent only the primary coin. The accounting module MUST read the token's `coinData` array to discover all coin entries carried by the transfer. If the token is no longer available (archived/spent), the module uses the in-memory invoice-transfer index (§7.6) which was built from the full token data at the time of processing.
+Additionally, rescanning the full history on every `getInvoiceStatus()` call is O(H) where H is total history size — unacceptable at scale.
 
-**Index reconstruction after restart:** The in-memory invoice-transfer index is rebuilt on `load()` by scanning history. Since archived tokens may not be available for `getTokens()` lookup, multi-asset coin entries from those transfers would be lost — only the primary `coinId`/`amount` from the history record would be available. To handle this, the index stores `InvoiceTransferRef[]` entries per invoice, and these entries are **persisted** alongside the in-memory index as a lightweight cache (storage key: `invoice_transfer_refs`). On `load()`, the cache is loaded first; then a history scan adds any new entries not yet in the cache. This ensures multi-asset coinData is not lost across restarts. The cache is rebuilt from scratch when an invoice is created/imported (full rescan with token access).
+#### 5.4.2 Index Architecture
+
+The index captures **expanded per-coin entries** at the time each transfer is processed. A single multi-asset transfer produces one `InvoiceTransferRef` per coin entry, each persisted in the index. Once captured, the index entry is self-contained — no token lookup is needed at query time.
+
+**Two-level structure:**
+
+```typescript
+// Level 1: Per-invoice transfer ledger (primary index)
+// In-memory: Map<invoiceId, Map<entryKey, InvoiceTransferRef>>
+// entryKey = `${transferId}::${coinId}` (composite dedup key)
+// Persisted: one storage key per invoice (see §7.2)
+private invoiceLedger: Map<string, Map<string, InvoiceTransferRef>>;
+
+// Level 2: History scan watermark (tracks processing progress)
+// In-memory: Map<dedupKey, true>
+// Persisted: single storage key (see §7.2)
+// Tracks which HistoryRecord.dedupKey values have been processed.
+private processedHistoryKeys: Map<string, true>;
+```
+
+**Secondary in-memory index (not persisted, rebuilt on load):**
+
+```typescript
+// Token-to-invoice mapping — answers "which invoices does this token affect?"
+// Needed for efficient transfer:confirmed updates.
+// Rebuilt from invoiceLedger entries on load().
+private tokenInvoiceMap: Map<string, Set<string>>; // tokenId → Set<invoiceId>
+```
+
+**Balance cache (not persisted, computed lazily):**
+
+```typescript
+// Per-invoice, per-coinId balance summary — invalidated on index mutation.
+private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigint }>>;
+```
+
+#### 5.4.3 Transfer Processing: `processTransfer()`
+
+This is the core function called by both cold-start and incremental updates. It takes a `HistoryRecord` + optional token data, extracts invoice-relevant information, and updates the index.
+
+```
+processTransfer(historyEntry: HistoryRecord, tokenCoinData?: [string, string][]):
+  1. If processedHistoryKeys.has(historyEntry.dedupKey): return  // already processed
+  2. Parse memo: ref = parseInvoiceMemo(historyEntry.memo)
+     If no match: mark as processed, return
+  3. If ref.invoiceId not in local invoice token storage: return
+     (unknown invoice — fire invoice:unknown_reference from caller, not here)
+
+  4. Resolve full coinData:
+     a. If tokenCoinData provided (from event payload): use it
+     b. Else if historyEntry.tokenId: look up token via getTokens(),
+        extract token.sdkData.genesis.data.coinData
+     c. Else: fall back to single-coin from historyEntry:
+        coinData = [[historyEntry.coinId, historyEntry.amount]]
+     // NOTE: Fallback (c) loses multi-asset data. This path is only hit
+     // for archived tokens on cold-start when the token is no longer
+     // available AND the index was not previously populated. For active
+     // tokens and event-driven updates, (a) or (b) always succeeds.
+
+  5. For each [coinId, amount] in coinData:
+     a. Skip if amount === "0"
+     b. entryKey = `${historyEntry.transferId ?? historyEntry.id}::${coinId}`
+     c. invoiceMap = invoiceLedger.get(ref.invoiceId)
+     d. If invoiceMap.has(entryKey): continue  // dedup
+     e. Create InvoiceTransferRef:
+        - transferId: historyEntry.transferId ?? historyEntry.id
+        - tokenId: historyEntry.tokenId
+        - direction: ref.direction
+        - coinId, amount
+        - senderAddress: historyEntry.senderAddress
+        - senderNametag: historyEntry.senderNametag
+        - recipientAddress: historyEntry.recipientAddress
+        - recipientNametag: historyEntry.recipientNametag
+        - timestamp: historyEntry.timestamp
+        - confirmed: determined from token status
+     f. invoiceMap.set(entryKey, entry)
+     g. Update tokenInvoiceMap
+     h. Invalidate balanceCache for ref.invoiceId
+     i. Mark invoice as dirty (needs storage flush)
+
+  6. processedHistoryKeys.set(historyEntry.dedupKey, true)
+```
+
+**Idempotency guarantee:** The composite key `${transferId}::${coinId}` ensures that reprocessing the same transfer (due to event re-delivery, Nostr reconnection, or retroactive scan) is a no-op. The `processedHistoryKeys` watermark provides a fast-path skip before memo parsing.
+
+#### 5.4.4 Population: Cold Start (`load()`)
+
+Cold start loads persisted state, then fills gaps from current history.
+
+```
+Phase 1 — Load persisted index:
+  1. Load inv_ledger_index → populate invoiceLedger outer map (keys only)
+  2. Load inv_ledger:{invoiceId} for each invoice → populate transfer Maps
+  3. Load processed_history_keys → populate processedHistoryKeys
+  4. Rebuild tokenInvoiceMap from loaded entries
+
+Phase 2 — Process new history entries:
+  5. history = PaymentsModule.getHistory()
+  6. For each entry in history (oldest first):
+     a. If processedHistoryKeys.has(entry.dedupKey): skip
+     b. If entry has no invoice memo: mark as processed, skip
+     c. Look up token for full coinData:
+        - Try getTokens() by tokenId
+        - If not found (archived): coinData falls back to single-coin
+     d. Call processTransfer(entry, coinData)
+  7. Flush dirty invoice entries to storage
+  8. Persist updated processedHistoryKeys
+```
+
+**Cost analysis:** Phase 1 is O(persisted entries). Phase 2 is O(new history entries since last session) — the watermark ensures only unprocessed entries are examined. On a warm start with no new history, Phase 2 does zero work.
+
+#### 5.4.5 Population: Incremental Updates
+
+**On `transfer:incoming` event** (IncomingTransfer payload):
+```
+1. Parse memo from IncomingTransfer.memo
+2. If invoice reference found:
+   a. Extract coinData from IncomingTransfer.tokens[0].sdkData.genesis.data.coinData
+   b. Wait for history:updated event (which provides the HistoryRecord)
+      OR construct a synthetic HistoryRecord from the IncomingTransfer payload
+   c. Call processTransfer(historyEntry, coinData)
+   d. Flush dirty entries to storage (async)
+```
+
+**On `history:updated` event** (HistoryRecord payload):
+```
+1. Call processTransfer(historyEntry)
+   - processTransfer will look up token for full coinData
+2. Flush dirty entries to storage (async)
+```
+
+**On `transfer:confirmed` event** (TransferResult payload):
+```
+1. For each token in TransferResult.tokens:
+   a. Look up invoices via tokenInvoiceMap.get(token.id)
+   b. For each invoice: update confirmed=true on matching entries
+   c. Invalidate balanceCache for affected invoices
+   d. Mark affected invoices as dirty
+2. Flush dirty entries to storage (async)
+```
+
+#### 5.4.6 Query: Balance from Index
+
+`getInvoiceStatus()` reads directly from the in-memory `invoiceLedger`:
+
+```
+1. If terminal → return frozen balances (no index read)
+2. entries = invoiceLedger.get(invoiceId)
+3. If balanceCache has valid entry → return cached balances
+4. Else: iterate entries, accumulate per-coin BigInt sums
+   - forward → coveredAmount
+   - back/return_closed/return_cancelled → returnedAmount
+5. Cache result in balanceCache
+6. Return computed status
+```
+
+This is O(E) where E = entries for this invoice, not O(H) where H = full history. The balance cache makes repeated queries O(1).
 
 **Dynamic scanning applies only to non-terminal invoices.** For terminal invoices, the persisted frozen balances are returned directly.
 
@@ -1306,14 +1462,22 @@ All state-mutating operations on a given invoice are serialized through a **per-
 private readonly invoiceGates = new Map<string, Promise<void>>();
 
 private async withInvoiceGate(invoiceId: string, fn: () => Promise<void>): Promise<void> {
+  if (this.destroyed) throw new SphereError('MODULE_DESTROYED', 'AccountingModule is destroyed');
   const prev = this.invoiceGates.get(invoiceId) ?? Promise.resolve();
-  const next = prev.then(fn, fn); // run fn after previous completes (even on error)
+  // Chain fn after previous operation completes. Use .then(run, run) to ensure
+  // fn executes even if the prior operation rejected — each gate entry runs
+  // independently. fn's own rejection propagates to the caller via `await next`.
+  const run = () => fn();
+  const next = prev.then(run, run);
   this.invoiceGates.set(invoiceId, next);
-  await next;
-  // Cleanup: if this was the last queued operation, remove the gate entry
-  // to prevent unbounded memory growth over thousands of invoices.
-  if (this.invoiceGates.get(invoiceId) === next) {
-    this.invoiceGates.delete(invoiceId);
+  try {
+    await next;
+  } finally {
+    // Cleanup: if this was the last queued operation, remove the gate entry
+    // to prevent unbounded memory growth over thousands of invoices.
+    if (this.invoiceGates.get(invoiceId) === next) {
+      this.invoiceGates.delete(invoiceId);
+    }
   }
 }
 ```
@@ -1488,8 +1652,9 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
            - fire 'invoice:auto_returned'
      -> do not fire balance-related events (frozen)
      -> return
-  5. Build InvoiceTransferRef from transfer data
-  6. Match transfer against invoice targets:
+  5. Process transfer into index via processTransfer() (§5.4.3)
+     This builds InvoiceTransferRef entries and updates invoiceLedger.
+  6. Match transfer against invoice targets (using index entries):
      a. If matches target + asset:
         -> fire 'invoice:payment' { invoiceId, transfer, direction, confirmed }
      b. If doesn't match any target/asset:
@@ -1526,7 +1691,7 @@ On createInvoice() or importInvoice():
 
 ### 6.3 Idempotency Contract
 
-**Events may fire multiple times.** The AccountingModule does NOT track which events have been fired. On every relevant trigger (incoming transfer, confirmation, history update, invoice creation/import with retroactive scan), it recomputes from scratch and fires all applicable events.
+**Events may fire multiple times.** The AccountingModule does NOT track which events have been fired. On every relevant trigger (incoming transfer, confirmation, history update, invoice creation/import with retroactive scan), it recomputes the current invoice status from the index and fires all events that apply to the current state. The §6.2 step-by-step logic describes what events to fire based on the computed state — not a stateful transition tracker. For example, "if asset just became covered" means "the recomputed status shows this asset is covered AND this is the event that triggered the recomputation" — it does not mean the module remembers whether `invoice:asset_covered` was previously fired.
 
 This means consumers WILL receive duplicate events and MUST handle them idempotently:
 - A UI should update its display, not append to a list
@@ -1568,8 +1733,26 @@ FROZEN_BALANCES: 'frozen_balances',
 AUTO_RETURN: 'auto_return',
 /** Auto-return deduplication ledger (JSON: AutoReturnLedger) */
 AUTO_RETURN_LEDGER: 'auto_return_ledger',
-/** Invoice-transfer index cache for multi-asset coinData preservation (JSON: Record<invoiceId, InvoiceTransferRef[]>) */
-INVOICE_TRANSFER_REFS: 'invoice_transfer_refs',
+/**
+ * Invoice-transfer index — partitioned per invoice for efficient targeted reads/writes.
+ * Each key stores the expanded InvoiceTransferRef[] for one invoice.
+ * Format: 'inv_ledger:{invoiceId}' → JSON InvoiceTransferRef[]
+ */
+// INV_LEDGER prefix: 'inv_ledger:',
+/**
+ * Invoice ledger directory — lightweight map of all known invoice IDs
+ * and their termination status. Loaded on startup to populate the outer
+ * invoiceLedger map without loading all transfer data.
+ * Format: Record<invoiceId, { terminated: boolean; frozenAt?: number }>
+ */
+INV_LEDGER_INDEX: 'inv_ledger_index',
+/**
+ * History scan watermark — tracks which HistoryRecord.dedupKey values
+ * have been processed into the invoice-transfer index. Enables incremental
+ * updates on restart: only unprocessed history entries are scanned.
+ * Format: string[] (array of processed dedupKey values)
+ */
+PROCESSED_HISTORY_KEYS: 'processed_history_keys',
 ```
 
 Full key format: `sphere_{addressId}_cancelled_invoices`, etc. The `addressId` value (e.g., `DIRECT_abc123_xyz789`) is guaranteed colon-free and underscore-delimited, so no separator collision is possible.
@@ -1800,8 +1983,9 @@ getInvoiceStatus():
   1. Read token from tokenStorage (parse terms from genesis.data.tokenData)
   2. Check cancelled set and closed set
   3. If terminal -> load frozen balances from FROZEN_BALANCES, return frozen status
-  4. Read full history from PaymentsModule (active + sent tokens)
-  5. Compute status (pure function)
+  4. Read from invoice-transfer index: entries = invoiceLedger.get(invoiceId)
+     (No history scan — the index is the primary data source, see §5.4)
+  5. Compute status from index entries using balanceCache (§5.4.6)
   6. If just reached implicit CLOSED -> freeze and persist
 
 setAutoReturn():
@@ -1863,9 +2047,29 @@ load():
        auto-return via setAutoReturn(invoiceId, true) which re-triggers
        failed entries (resets retryCount to 0, status back to 'pending').
      'failed' entries are never pruned (unlike 'completed' entries).
-  6. Build in-memory invoice-transfer index (see below)
+  6. **Populate invoice-transfer index** (§5.4.4):
+     a. Load persisted index state:
+        - Load INV_LEDGER_INDEX → populate invoiceLedger outer map (keys only)
+        - Load inv_ledger:{invoiceId} for each invoice → populate transfer Maps
+        - Load PROCESSED_HISTORY_KEYS → populate processedHistoryKeys set
+        - Rebuild tokenInvoiceMap from loaded transfer entries
+     b. Process new history entries (gap fill):
+        - history = PaymentsModule.getHistory()
+        - For each entry (oldest first):
+          · If processedHistoryKeys.has(entry.dedupKey): skip
+          · If entry has no invoice memo: mark as processed, skip
+          · Look up token for full coinData via getTokens() by tokenId.
+            If not found (archived): fall back to single-coin from HistoryRecord.
+          · Call processTransfer(entry, coinData) — see §5.4.3
+        - Flush dirty invoice entries to storage
+        - Persist updated processedHistoryKeys
+     c. **Corruption resilience for index:** If INV_LEDGER_INDEX or
+        PROCESSED_HISTORY_KEYS fails to parse, reset to empty and rescan
+        full history. If inv_ledger:{invoiceId} fails to parse, delete the
+        corrupted key and rescan history for that invoice only. Dedup in
+        processTransfer() prevents duplicate entries on rescan.
   7. Subscribe to PaymentsModule events
-  8. Scan full history for pre-existing payments -> fire retroactive events
+  8. Fire retroactive events for any transfers discovered during index gap fill
 
 **Required ordering:** Steps 4-6 (reconciliation, crash recovery, index build) MUST
 complete before step 7 (event subscription). This prevents races between recovery
@@ -1873,20 +2077,57 @@ retries and incoming event processing for the same transfer — both would enter
 per-invoice gate, but recovery must finish first to populate the dedup ledger.
 ```
 
-#### Performance: In-Memory Invoice-Transfer Index
+#### Invoice-Transfer Index (Primary Data Source)
 
-To avoid scanning the full transaction history on every `getInvoiceStatus()` call, the module maintains an **in-memory index** mapping invoice IDs to their related transfer references:
+The module maintains a **persistent invoice-transfer index** as the primary data source for all non-terminal invoice balance computation. See §5.4 for the complete index architecture, data structures, population strategy, and query patterns.
 
 ```typescript
-// Built on load(), updated incrementally on each inbound/confirmed event
-private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
+// Primary index: per-invoice transfer ledger
+// entryKey = `${transferId}::${coinId}` (composite dedup key)
+private invoiceLedger: Map<string, Map<string, InvoiceTransferRef>>;
+
+// History scan watermark — tracks processed HistoryRecord dedupKeys
+private processedHistoryKeys: Map<string, true>;
+
+// Secondary: token → invoice mapping (rebuilt on load, not persisted)
+private tokenInvoiceMap: Map<string, Set<string>>;
+
+// Computed balance cache (invalidated on mutation, not persisted)
+private balanceCache: Map<string, Map<string, { covered: bigint; returned: bigint }>>;
 ```
 
-- **Built on `load()`:** Full history scan populates the index for all known invoices.
-- **Updated incrementally (idempotent):** Each `transfer:incoming` / `transfer:confirmed` event with an invoice memo adds/updates the entry. Updates are **idempotent by (transferId, coinId)**: if the index already contains an entry with the same transferId and coinId, the event-driven update is a no-op (not an append). This is critical because `returnInvoicePayment()` synchronously updates the index after `send()` (§5.9), and the subsequent async event for the same transfer must not produce a duplicate entry. **This includes transfers for terminal invoices** — the index is a complete record of all invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot that does not reflect post-termination activity. The index and frozen balances serve different purposes: the index powers `getRelatedTransfers()` (complete picture), while frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
-- **Used by `getInvoiceStatus()`:** Instead of re-scanning full history, reads from the index.
-- **Invalidated on `createInvoice()` / `importInvoice()`:** A full rescan rebuilds the entry for the new invoice (to catch retroactive payments).
-- **Persisted as cache:** The index is backed by a lightweight storage cache (key: `invoice_transfer_refs` in `STORAGE_KEYS_ADDRESS`) to preserve multi-asset coinData across restarts. On `load()`, the cache is loaded first, then supplemented by a history scan for any new entries. The cache is rebuilt from scratch on `createInvoice()` / `importInvoice()` when full token data is available. The cache is also updated when post-termination transfers are indexed.
+**Key properties:**
+
+- **Persistent and partitioned:** Each invoice's transfer entries are stored under a separate key (`inv_ledger:{invoiceId}`). This allows targeted reads/writes without loading the entire dataset.
+- **Idempotent updates by (transferId, coinId):** The composite dedup key ensures that reprocessing the same transfer is a no-op. This is critical because `returnInvoicePayment()` synchronously updates the index after `send()` (§5.9), and the subsequent async event must not produce a duplicate.
+- **Terminal invoices included:** The index records ALL invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot. The index powers `getRelatedTransfers()` (complete picture); frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
+- **Multi-asset correctness:** Each transfer is expanded into per-coin entries at processing time using the token's full `coinData` from `TxfToken.genesis.data.coinData`. Once captured, no token lookup is needed at query time.
+- **Incremental via watermark:** The `processedHistoryKeys` set tracks which `HistoryRecord.dedupKey` values have been processed. On restart, only unprocessed history entries are scanned. On a warm start with no new history, gap processing does zero work.
+- **Retroactive on create/import:** On `createInvoice()` / `importInvoice()`, the full history is scanned for pre-existing payments referencing the new invoice. Each match goes through `processTransfer()` (§5.4.3), which respects the dedup key.
+
+#### Storage Efficiency Estimates
+
+| Component | Per-entry size | Typical scale | Total |
+|-----------|---------------|---------------|-------|
+| InvoiceTransferRef (JSON) | ~400–500 bytes | 1000 invoices × 20 entries | ~10 MB |
+| Processed history keys | ~60 bytes/key | 10,000 history entries | ~600 KB |
+| Invoice ledger index | ~80 bytes/invoice | 1000 invoices | ~80 KB |
+
+Per-invoice partitioned storage means any single read/write operation touches at most one invoice's data. IndexedDB (browser) and file-based storage (Node.js) handle this scale without issue.
+
+#### Crash Recovery
+
+**Storage write order** (on flush):
+1. Write `inv_ledger:{invoiceId}` for each dirty invoice
+2. Write `processed_history_keys`
+3. Write `inv_ledger_index`
+
+If the process crashes after step 1 but before step 2, the next cold start will reprocess some history entries. The dedup check on `${transferId}::${coinId}` inside `processTransfer()` catches duplicates — the ledger is the source of truth.
+
+**Corruption recovery:**
+- If `inv_ledger:{invoiceId}` is corrupted: log warning, delete key, remove that invoice from `processedHistoryKeys` for entries referencing it, rescan history for that invoice only.
+- If `processed_history_keys` is corrupted: reset to empty, rescan full history. Dedup in `processTransfer()` prevents duplicate ledger entries. This is O(full history) but recovers correctly.
+- If `inv_ledger_index` is corrupted: rebuild from `inv_ledger:*` keys discovered via storage enumeration.
 
 ---
 

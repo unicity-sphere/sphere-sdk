@@ -14,7 +14,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |-----------|-----------|
 | **Invoice IS a token** | An invoice is a minted on-chain token — the invoice terms live in the token's genesis `tokenData` field. There are no external metadata fields outside the token itself. The token ID (guaranteed unique by the aggregator) is the invoice ID. |
 | **Local-first accounting** | Each party computes invoice status from its own token inventory — no shared on-chain state, no consensus needed. Status is **never** stored for non-terminal invoices; it is always derived on-demand. Terminal invoices have frozen balances persisted locally. |
-| **Memo-referenced balances** | Invoice balances are derived **exclusively** from transaction history entries whose memo references the invoice. Physical token inventory (whether tokens still exist or have been spent further) is irrelevant to invoice accounting. |
+| **Memo-referenced balances** | Invoice balances are derived **exclusively** from transfers whose memo references the invoice, captured in a persistent invoice-transfer index. The index is built from `HistoryRecord` + token `coinData` at processing time and queried in-memory — no history rescan at query time. Physical token inventory is irrelevant to invoice accounting. |
 | **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getHistory, getTokens, events) but never calls `send()` or modifies payment state directly. The one exception is auto-return, where the module invokes `send()` to return tokens for terminated invoices. |
 | **Outbound payment blocking for terminated invoices** | Outgoing forward payments (`INV:<id>:F`) referencing a locally terminated (CLOSED or CANCELLED) invoice are **blocked** — the transfer is prevented and an exception is thrown. This is enforced at the `payInvoice()` / memo-construction layer, not in `PaymentsModule.send()`. |
 | **Non-blocking inbound observer** | Accounting errors during inbound transfer processing MUST NEVER break the token transfer flow. Inbound transfers are atomic — they either happen fully or not at all. The accounting module is a side-effect observer that processes inbound transfers after the fact. |
@@ -43,12 +43,15 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |  |                 |  mint      |  - getRelatedTransfers()        |  |
 |  |                 |            |  - parseInvoiceMemo()            |  |
 |  +-----------------+            |  - load() / destroy()           |  |
-|                                 +-------------+-------------------+  |
-|                                 |  TokenStorage (per-address)     |  |
-|                                 |  - Invoice tokens (TXF)         |  |
-|                                 |  (genesis.data.tokenData         |  |
-|                                 |   contains invoice terms)        |  |
-|                                 +---------------------------------+  |
+|                                 +-------+-------+-------+---------+  |
+|                                 |  TokenStorage  | StorageProvider |  |
+|                                 |  (per-address) | (per-address)   |  |
+|                                 |  Invoice tokens| Invoice-Transfer|  |
+|                                 |  (TXF format)  | Index:          |  |
+|                                 |                | inv_ledger:*    |  |
+|                                 |                | inv_ledger_index|  |
+|                                 |                | processed_*     |  |
+|                                 +----------------+-----------------+  |
 +----------------------------------------------------------------------+
 ```
 
@@ -147,7 +150,7 @@ The invoice is **fully covered** only when every target address has received eve
 
 ### 3.4 Status: Computed for Active, Frozen for Terminated
 
-For **non-terminal invoices** (OPEN, PARTIAL, COVERED, EXPIRED), status is a **dynamic property** derived on-demand from the transaction history of active and sent tokens. Every call to `getInvoiceStatus()` recomputes the status from scratch.
+For **non-terminal invoices** (OPEN, PARTIAL, COVERED, EXPIRED), status is a **dynamic property** derived on-demand from the persistent invoice-transfer index (§3.7). The index captures expanded per-coin transfer entries at processing time. `getInvoiceStatus()` reads from the in-memory index and balance cache — no history scan at query time.
 
 For **terminal invoices** (CLOSED, CANCELLED), the balances are **frozen and persisted**. Once an invoice reaches a terminal state, the frozen balance snapshot is stored locally and returned on subsequent queries without recomputation. New transfers referencing a terminated invoice do not change the frozen balances or status — but they may trigger auto-return behavior (see Section 4.5). The `allConfirmed` field in frozen balances is an exception: it is **dynamically derived** from PaymentsModule on each query (checking whether all related tokens now have confirmed proofs), not frozen at the time of termination. This ensures that tokens confirmed after termination are accurately reflected.
 
@@ -188,16 +191,30 @@ Key rules:
 
 7. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen and persisted. Dynamic recomputation no longer occurs. The frozen snapshot is returned for all subsequent queries.
 
-### 3.7 History Scanning
+### 3.7 Invoice-Transfer Index
 
-To compute invoice balances, the module scans the **full transaction history** of all active and sent tokens. This includes:
+Invoice balance computation does NOT scan `PaymentsModule.getHistory()` on every query. Instead, the module maintains a **persistent invoice-transfer index** that captures expanded per-coin transfer entries at processing time.
 
-- **Active tokens** — tokens currently in the wallet's inventory
-- **Sent (archived) tokens** — tokens that have been transferred away
+**Why not getHistory()?** `HistoryRecord` exposes a single `coinId` and `amount` per entry. For multi-asset tokens (`coinData = [["UCT", "500"], ["USDU", "1000"]]`), only the primary coin is visible in the history record — the full `coinData` is only available from the token itself (`Token.sdkData` → `TxfToken.genesis.data.coinData`). Rescanning O(H) history entries on every status query is also unacceptable at scale.
 
-Both inbound and outbound transfers are considered. The scan examines the memo field of each history entry to find invoice references.
+**Index architecture:**
 
-**Dynamic scanning applies only to non-terminal invoices.** For terminal invoices, the persisted frozen balances are returned directly.
+1. **Per-invoice transfer ledger** — partitioned storage, one key per invoice. Each entry is an `InvoiceTransferRef` with a composite dedup key `${transferId}::${coinId}`. A multi-asset transfer produces one entry per coin.
+
+2. **History scan watermark** — tracks which `HistoryRecord.dedupKey` values have been processed. On restart, only unprocessed entries are scanned.
+
+3. **Core processing function** `processTransfer()` — takes a `HistoryRecord` + optional token `coinData`, parses the invoice memo, expands multi-asset coins into individual index entries, and applies idempotent dedup.
+
+4. **Population paths:**
+   - **Cold start:** Load persisted index, then process any new history entries since last session.
+   - **Incremental:** `transfer:incoming`, `history:updated`, and `transfer:confirmed` events call `processTransfer()`.
+   - **Retroactive:** On `createInvoice()` / `importInvoice()`, scan full history for pre-existing payments.
+
+5. **Query:** `getInvoiceStatus()` reads directly from the in-memory index and a lazy `balanceCache` — no storage reads or history scans at query time.
+
+**Dynamic computation applies only to non-terminal invoices.** For terminal invoices, the persisted frozen balances are returned directly. The index still records post-termination transfers for `getRelatedTransfers()`.
+
+See ACCOUNTING-SPEC.md §5.4 for the complete index specification.
 
 ## 4. Invoice Lifecycle & State Machine
 
