@@ -576,6 +576,8 @@ class AccountingModule {
    *
    * IMPORTANT: Outgoing forward payments to terminated invoices are BLOCKED.
    * An INVOICE_TERMINATED exception is thrown BEFORE the transfer happens.
+   * The terminal-state check acquires the per-invoice gate to prevent TOCTOU
+   * races with concurrent implicit close. The gate is released before send().
    *
    * @param invoiceId - The invoice token ID
    * @param params - { targetIndex, assetIndex?, amount?, freeText? }
@@ -675,6 +677,12 @@ class AccountingModule {
   /**
    * Cleanup: unsubscribe from events, release resources.
    * Called by Sphere.destroy().
+   *
+   * Sets an internal `destroyed` flag. All gate operations check this flag
+   * at entry and bail out early if set. destroy() awaits any currently
+   * executing gate operation (at most one per invoice) before returning,
+   * ensuring no storage writes occur after destroy completes.
+   * Queued (not yet started) gate operations are skipped.
    */
   async destroy(): Promise<void>;
 }
@@ -780,7 +788,7 @@ Step  Action                                SDK Class
 3     Canonical serialize InvoiceTerms      AccountingModule
 4     Generate deterministic salt           SHA-256(signingKey || invoiceBytes)
 5     Create MintTransactionData            MintTransactionData.create()
-      - tokenType: INVOICE_TOKEN_TYPE
+      - tokenType: INVOICE_TOKEN_TYPE_HEX
       - tokenData: serialized InvoiceTerms
       - coinData: [] (non-fungible)
       - recipient: creator's DirectAddress
@@ -824,27 +832,31 @@ InvoiceTerms must be serialized deterministically (same input -> same bytes) for
 function canonicalSerialize(terms: InvoiceTerms): Uint8Array {
   // Sort targets by address (lexicographic)
   // Within each target, sort assets: coins first (sorted by coinId), then NFTs (sorted by tokenId)
-  const sorted: Record<string, unknown> = {
-    createdAt: terms.createdAt,
-    deliveryMethods: terms.deliveryMethods ?? null,
-    dueDate: terms.dueDate ?? null,
-    memo: terms.memo ?? null,
-    targets: [...terms.targets]
-      .sort((a, b) => a.address.localeCompare(b.address))
-      .map(t => ({
-        address: t.address,
-        assets: [...t.assets].sort((a, b) => {
-          // Coins before NFTs, then sort within category
-          if (a.coin && b.coin) return a.coin[0].localeCompare(b.coin[0]);
-          if (a.nft && b.nft) return a.nft.tokenId.localeCompare(b.nft.tokenId);
-          return a.coin ? -1 : 1; // coins first
-        }),
-      })),
-  };
-  // Only include creator if present (anonymous invoices omit it)
+  // Build sorted targets (address lexicographic, coins before NFTs within each target)
+  const sortedTargets = [...terms.targets]
+    .sort((a, b) => a.address.localeCompare(b.address))
+    .map(t => ({
+      address: t.address,
+      assets: [...t.assets].sort((a, b) => {
+        if (a.coin && b.coin) return a.coin[0].localeCompare(b.coin[0]);
+        if (a.nft && b.nft) return a.nft.tokenId.localeCompare(b.nft.tokenId);
+        return a.coin ? -1 : 1; // coins first
+      }),
+    }));
+
+  // Keys MUST be inserted in strict alphabetical order.
+  // The normative key order is: createdAt, [creator], deliveryMethods, dueDate, memo, targets.
+  // `creator` is conditionally included (omitted for anonymous invoices).
+  // Other optional fields use `null` normalization (always present).
+  // Any reimplementation MUST produce this exact key order.
+  const sorted: Record<string, unknown> = { createdAt: terms.createdAt };
   if (terms.creator !== undefined) {
-    sorted.creator = terms.creator;
+    sorted.creator = terms.creator; // inserted between createdAt and deliveryMethods
   }
+  sorted.deliveryMethods = terms.deliveryMethods ?? null;
+  sorted.dueDate = terms.dueDate ?? null;
+  sorted.memo = terms.memo ?? null;
+  sorted.targets = sortedTargets;
   // NOTE: JSON.stringify preserves insertion order of object keys in all
   // modern JS engines (V8, SpiderMonkey, JSC) per ES2015+ spec. The `sorted`
   // object above uses alphabetical key insertion order to ensure determinism.
@@ -911,18 +923,26 @@ function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
 ### 4.5 Constructing Invoice Memos
 
 ```typescript
+const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64}$/;
+
 function buildInvoiceMemo(
   invoiceId: string,
   direction: 'forward' | 'back' | 'return_closed' | 'return_cancelled' = 'forward',
   freeText?: string
 ): string {
+  // MUST validate invoiceId format to prevent memo injection
+  if (!INVOICE_ID_REGEX.test(invoiceId)) {
+    throw new SphereError('INVOICE_INVALID_ID', 'Invoice ID must be a 64-char hex string');
+  }
   const dirMap = {
     forward: ':F',
     back: ':B',
     return_closed: ':RC',
     return_cancelled: ':RX',
   };
-  const text = freeText ? ` ${freeText}` : '';
+  // Strip newlines from freeText to prevent memo injection via line splitting
+  const sanitized = freeText?.replace(/[\r\n]/g, ' ');
+  const text = sanitized ? ` ${sanitized}` : '';
   return `INV:${invoiceId}${dirMap[direction]}${text}`;
 }
 ```
@@ -956,10 +976,10 @@ await this.deps.payments.send({
 The `INV:` memo field is user-controlled — any sender can write any memo string. The canonical parser (`parseInvoiceMemo()`) is the **sole authority** for extracting invoice references. Security measures:
 
 - **Invoice ID validation:** Only 64-char hex strings (`[0-9a-fA-F]{64}`) are accepted as invoice IDs. This is guaranteed by the token ID derivation (SHA-256 hash) — invoice IDs cannot contain colons, spaces, or other characters that would conflict with memo parsing. Other formats are rejected (treated as non-invoice transfers).
-- **Direction code normalization:** Only `:F`, `:B`, `:RC`, `:RX` are recognized. Unknown suffixes are ignored (treated as forward).
+- **Direction code enforcement:** Only `:F`, `:B`, `:RC`, `:RX` are recognized by the regex. Memos with unrecognized suffixes (e.g., `INV:abc...:Z`) do not match the regex and are treated as non-invoice transfers (ignored entirely).
 - **Sender validation for returns:** Inbound `:B`/`:RC`/`:RX` transfers are validated against invoice target addresses before being accepted as return payments (see §6.2 step 3).
 - **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2).
-- **Free text sanitization:** The `freeText` portion of an invoice memo is arbitrary user input from an untrusted sender. Applications MUST sanitize `freeText` before rendering in HTML/DOM contexts to prevent XSS. The SDK does not sanitize `freeText` — it passes the raw string through. Applications using React (like Sphere) get automatic escaping via JSX; other rendering contexts must apply their own sanitization.
+- **Untrusted string sanitization:** Multiple fields in the accounting system contain arbitrary user input from untrusted parties. Applications MUST sanitize these before rendering in HTML/DOM contexts to prevent XSS: (1) `freeText` in invoice memos, (2) `InvoiceTerms.memo` (set by the invoice creator), (3) `deliveryMethods` URLs (could contain `javascript:` if validation is bypassed), (4) `senderNametag`/`recipientNametag` in `InvoiceTransferRef`. The SDK does not sanitize these — it passes raw strings through. Applications using React (like Sphere) get automatic escaping via JSX; other rendering contexts must apply their own sanitization.
 - Applications **MUST NOT** parse invoice memos manually — always use `parseInvoiceMemo()`.
 
 ---
@@ -1147,7 +1167,7 @@ This means: due date is a signal to participants, not an enforcement mechanism. 
 - **Implicit close.** Happens automatically when all targets are fully covered AND all tokens confirmed. Balances are frozen. This is functionally identical to explicit close but with `explicitClose: false` in the status.
 - **Outbound blocking.** `payInvoice()` throws `INVOICE_TERMINATED` if the invoice is locally terminated (closed or cancelled). The transfer does NOT happen. This is the only case where the accounting module prevents a transfer.
 - **Perspective divergence.** Your CLOSED does not imply others' CLOSED. Different parties have different transaction histories.
-- **Frozen balance staleness.** The `coveredAmount`, `returnedAmount`, and `netCoveredAmount` in frozen balances reflect the state at the moment of termination. Transfers that arrive after termination (and are auto-returned) are NOT reflected in the frozen snapshot — they are visible only via `getRelatedTransfers()`. The `allConfirmed` field is the exception: it is dynamically derived (see §7.3). Applications needing a complete post-termination picture should combine frozen balances with `getRelatedTransfers()`.
+- **Frozen balance staleness.** The `coveredAmount`, `returnedAmount`, `netCoveredAmount`, and `transfers` arrays in frozen balances reflect the state at the moment of termination. Post-termination transfers (including auto-returns sent after freezing) are NOT reflected in the frozen snapshot — they are visible only via `getRelatedTransfers()`. Specifically, `InvoiceStatus.targets[].coinAssets[].transfers` for terminal invoices is the frozen list, NOT a live query. The `allConfirmed` field is the exception: it is dynamically derived (see §7.3). Applications needing a complete post-termination picture should combine frozen balances with `getRelatedTransfers()`.
 
 ### 5.9 Concurrency Model
 
@@ -1170,7 +1190,11 @@ All state-mutating operations on a given invoice are serialized through a **per-
   scratch (which may differ if new transfers arrived during the wait). Only if the
   recomputed state still meets the implicit close condition is the freeze performed.
 - `getInvoice()`, `getInvoices()`, `getRelatedTransfers()`
-- `payInvoice()` (reads terminal state, delegates send to PaymentsModule)
+- `payInvoice()` — acquires the per-invoice gate for the terminal-state check
+  only (released before calling `PaymentsModule.send()`). This prevents a TOCTOU
+  race where a concurrent implicit close could terminate the invoice between the
+  check and the send. The gate is NOT held during the send itself to avoid blocking
+  other operations for the duration of the network call.
 - `parseInvoiceMemo()`
 
 ```typescript
@@ -1348,13 +1372,15 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
      -> fire 'invoice:payment' (transfer is still recorded)
      -> if direction is 'forward' AND auto-return enabled (perInvoice[id] ?? global)
         AND wallet is a target:
-        - check dedup ledger for (invoiceId, transferId) — skip if status='completed'
-        - write dedup ledger entry with status='pending' (intent log)
-        - invoke auto-return: send entire incoming amount back
-          (any new forward payment to a terminated invoice is surplus by definition)
-        - use :RC for CLOSED, :RX for CANCELLED
-        - update dedup ledger entry to status='completed'
-        - fire 'invoice:auto_returned'
+        -> **acquire per-invoice gate** (entire auto-return block is serialized)
+        -> inside gate:
+           - check dedup ledger for (invoiceId, transferId) — skip if status='completed'
+           - write dedup ledger entry with status='pending' (intent log)
+           - invoke auto-return: send entire incoming amount back
+             (any new forward payment to a terminated invoice is surplus by definition)
+           - use :RC for CLOSED, :RX for CANCELLED
+           - update dedup ledger entry to status='completed'
+           - fire 'invoice:auto_returned'
      -> do not fire balance-related events (frozen)
      -> return
   5. Build InvoiceTransferRef from transfer data
@@ -1651,6 +1677,13 @@ load():
   2. Filter by tokenType === INVOICE_TOKEN_TYPE_HEX
   3. Parse InvoiceTerms from each token's genesis.data.tokenData
   4. Load cancelled set, closed set, frozen balances, auto-return settings, and dedup ledger from storage
+  4b. **Storage reconciliation:** Scan FROZEN_BALANCES for any invoiceId that
+      exists in frozen balances but NOT in the corresponding terminal set
+      (CLOSED_INVOICES or CANCELLED_INVOICES). This handles crash between
+      writing frozen balances and updating the terminal set. For each orphan:
+      - Read `FrozenInvoiceBalances.state` ('CLOSED' or 'CANCELLED')
+      - Add the invoiceId to the matching terminal set and persist
+      This ensures storage is consistent before proceeding.
   5. **Crash recovery:** Scan dedup ledger for 'pending' entries. For each:
      - Check if the return transfer landed (via getHistory())
      - If found -> update to 'completed'
@@ -1689,9 +1722,11 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 | Each target must have at least one asset | `INVOICE_NO_ASSETS` |
 | Each asset must have exactly one of `coin` or `nft` set | `INVOICE_INVALID_ASSET` |
 | Each coin asset's amount (tuple index 1) must be a positive integer string | `INVOICE_INVALID_AMOUNT` |
-| Each coin asset's coinId (tuple index 0) must be non-empty | `INVOICE_INVALID_COIN` |
+| Each coin asset's coinId (tuple index 0) must be non-empty, alphanumeric only (`/^[A-Za-z0-9]+$/`), max 20 characters | `INVOICE_INVALID_COIN` |
 | Each NFT asset's tokenId must be non-empty (64-char hex) | `INVOICE_INVALID_NFT` |
 | `dueDate` (if provided) must be in the future | `INVOICE_PAST_DUE_DATE` |
+| `deliveryMethods` entries (if provided) must use `https://` or `wss://` scheme only, max 2048 chars each, max 10 entries | `INVOICE_INVALID_DELIVERY_METHOD` |
+| Oracle provider must be available | `INVOICE_ORACLE_REQUIRED` |
 | No duplicate addresses across targets | `INVOICE_DUPLICATE_ADDRESS` |
 | No duplicate coinIds within a single target's coin assets | `INVOICE_DUPLICATE_COIN` |
 | No duplicate NFT tokenIds within a single target | `INVOICE_DUPLICATE_NFT` |
@@ -1761,6 +1796,13 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // sphere_getInvoiceStatus
 // Returns: InvoiceStatus (computed fresh for non-terminal, frozen for terminal)
 // Params: { invoiceId: string }
+//
+// NOTE: This is a query method but it has a SIDE EFFECT. When the computed
+// status reaches implicit close (all covered + all confirmed), this call
+// triggers the freeze-and-persist operation and may trigger surplus auto-return
+// (token sends). This is a known exception to the Connect Protocol's
+// query/intent separation. The side effect only occurs once per invoice
+// (subsequent calls return the frozen snapshot).
 {
   method: 'sphere_getInvoiceStatus',
   params: { invoiceId: 'abc123...' }
@@ -1870,7 +1912,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_NO_ASSETS` | Target must have at least one asset | Empty assets in target |
 | `INVOICE_INVALID_ASSET` | Asset must have exactly one of coin or nft | Both or neither set |
 | `INVOICE_INVALID_AMOUNT` | Coin amount must be a positive integer string | Non-positive or non-integer |
-| `INVOICE_INVALID_COIN` | Coin ID must be non-empty | Empty coinId in CoinEntry |
+| `INVOICE_INVALID_COIN` | Coin ID must be non-empty, alphanumeric, max 20 chars | Invalid coinId format |
 | `INVOICE_INVALID_NFT` | NFT tokenId must be a 64-char hex string | Bad NFT tokenId |
 | `INVOICE_PAST_DUE_DATE` | Due date must be in the future | dueDate <= now |
 | `INVOICE_DUPLICATE_ADDRESS` | Duplicate target address in invoice | Same address twice |
@@ -1892,6 +1934,8 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_NOT_TARGET` | Only invoice target parties can send return payments | Return from non-target wallet address |
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds net covered balance for this target:coinId | Excessive return |
 | `INVOICE_ANON_AUTO_RETURN` | Auto-return is not allowed for anonymous invoices | `autoReturn: true` on anonymous invoice close/cancel |
+| `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
+| `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 
 **IMPORTANT:** All error codes above apply to the accounting module's own operations. Accounting errors during inbound transfer event processing are caught internally and logged — they NEVER propagate to or interrupt the inbound token transfer flow. The one exception is `INVOICE_TERMINATED` for outbound forward payments, which is thrown intentionally to prevent paying a terminated invoice.
 

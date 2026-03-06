@@ -384,7 +384,7 @@ Status is **computed on-demand** for non-terminal invoices. For terminal invoice
 2. Checks if the invoice is in a terminal state (CLOSED or CANCELLED) — if so, returns the persisted frozen status
 3. Scans transaction history of **all active and sent tokens** (`PaymentsModule.getHistory()`) for memo-matched transfers
 4. Aggregates forward and back payments per target per asset
-5. Computes `coveredBalance = forward - back` for each target:asset
+5. Computes `netCoveredAmount = max(0, coveredAmount - returnedAmount)` for each target:asset
 6. Determines which targets are covered, partially covered, or untouched
 7. Checks confirmation status of all related tokens
 8. Returns the computed `InvoiceStatus` object
@@ -401,7 +401,7 @@ Each party independently derives invoice status from their own perspective — s
 3. Generate salt (SHA-256 of signingKey + invoiceBytes)
 4. Create MintTransactionData with:
    - tokenId: derived from invoice content hash
-   - tokenType: INVOICE_TOKEN_TYPE (new constant)
+   - tokenType: INVOICE_TOKEN_TYPE_HEX (new constant)
    - coinData: [] (non-fungible, no denomination)
    - tokenData: serialized InvoiceTerms
    - recipient: creator's DirectAddress
@@ -510,6 +510,8 @@ this.accounting = createAccountingModule(
 );
 
 // Load persisted invoice tokens + frozen balances + scan history for pre-existing payments
+// Also performs storage reconciliation (orphaned frozen balances from crash)
+// and crash recovery (pending auto-return ledger entries)
 await this.accounting.load();
 
 // Cleanup
