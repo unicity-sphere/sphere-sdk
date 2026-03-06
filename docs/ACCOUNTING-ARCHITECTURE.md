@@ -249,6 +249,8 @@ Both inbound and outbound transfers are considered. The scan examines the memo f
          (from OPEN or PARTIAL only)
 ```
 
+**Note:** The diagram above is simplified. In practice, `closeInvoice()` and `cancelInvoice()` can be called from ANY non-terminal state (OPEN, PARTIAL, COVERED, EXPIRED), not just the states shown with arrows. Additionally, return payments can reduce coverage, causing reverse transitions (e.g., EXPIRED → OPEN if all coverage is returned, PARTIAL → OPEN if all payments are returned).
+
 Key transitions:
 - **EXPIRED is not terminal.** An expired invoice can still transition to COVERED/CLOSED if all targets become fully covered (and confirmed) after the due date. EXPIRED is only reachable when not all targets are covered — if the invoice is COVERED (all targets met but unconfirmed), it stays COVERED even after the due date passes, and transitions to CLOSED once confirmed. Note: EXPIRED takes priority over PARTIAL in the status algorithm — a partially covered invoice past its due date shows EXPIRED, not PARTIAL.
 - **EXPIRED detection is passive.** The `invoice:expired` event fires when `getInvoiceStatus()` is called or when an inbound event triggers recomputation — there is no background timer. If no events arrive and no status queries are made after the due date, the `invoice:expired` event will not fire until the next interaction. Applications requiring prompt expiration notification should poll `getInvoiceStatus()` or set a `setTimeout` based on `dueDate - Date.now()`.
@@ -321,6 +323,8 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 
 On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found, retry using the persisted `recipient`, `amount`, `coinId`, and `memo` fields from the ledger entry. These fields are written at intent time (step 2) specifically to enable retry without re-deriving from the original transfer. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
 
+**Secondary dedup (defense-in-depth):** Before executing any auto-return send, check `getHistory()` for an existing outbound `:RC`/`:RX` transfer matching `(invoiceId, originalSenderAddress, coinId)`. This catches duplicates when ledger entries have been pruned (completed entries are pruned after 30 days on `load()`).
+
 **Auto-return exclusions — return payments are NEVER auto-returned:**
 - Transfers with direction `:B`, `:RC`, or `:RX` are **never** auto-returned.
 - This prevents infinite loops (return → auto-return → auto-return → ...).
@@ -361,6 +365,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 **Serialized operations (per invoice):**
 - `closeInvoice()`
 - `cancelInvoice()`
+- `returnInvoicePayment()` — holds gate through validation+send to prevent concurrent double-return on terminal invoices (over-return is fund loss, unlike over-payment which is benign)
 - Implicit close (all targets covered + confirmed)
 - Auto-return execution (both immediate and ongoing)
 - `setAutoReturn()` immediate trigger

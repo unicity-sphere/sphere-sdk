@@ -681,11 +681,24 @@ class AccountingModule {
    * Cleanup: unsubscribe from events, release resources.
    * Called by Sphere.destroy().
    *
-   * Sets an internal `destroyed` flag. All gate operations check this flag
-   * at entry and bail out early if set. destroy() awaits any currently
-   * executing gate operation (at most one per invoice) before returning,
-   * ensuring no storage writes occur after destroy completes.
-   * Queued (not yet started) gate operations are skipped.
+   * Sequence:
+   * 1. Unsubscribe from all PaymentsModule events (prevents new gate entries)
+   * 2. Set internal `destroyed` flag
+   * 3. Await the current promise-chain tail for ALL active gate entries
+   *    (captures the map snapshot at flag-set time)
+   *
+   * The `destroyed` flag is checked at the TOP of every gate `fn` body.
+   * If set, the fn returns immediately without storage writes. This
+   * guarantees that:
+   * - Operations that were in-flight when destroy was called complete normally
+   * - Operations that were queued (chained but not started) execute their fn
+   *   but bail out immediately on the destroyed check — no storage writes
+   * - Operations chained AFTER step 1 are impossible (events unsubscribed)
+   *   except for direct API calls, which are the caller's responsibility
+   *
+   * Net guarantee: after destroy() resolves, no further storage writes will
+   * occur from event-driven gate operations. Direct API calls after destroy
+   * are a caller error and will bail via the destroyed flag.
    */
   async destroy(): Promise<void>;
 }
@@ -774,6 +787,7 @@ const terms: InvoiceTerms = {
   createdAt: Date.now(),
   dueDate: request.dueDate,
   memo: request.memo,
+  deliveryMethods: request.deliveryMethods,
   targets: request.targets,
 };
 const invoiceBytes = canonicalSerialize(terms);
@@ -948,7 +962,11 @@ function buildInvoiceMemo(
   };
   // Strip newlines from freeText to prevent memo injection via line splitting
   // Enforce max length to prevent storage amplification via memo-referenced history
-  const sanitized = freeText?.replace(/[\r\n]/g, ' ').slice(0, 256);
+  // Use Array.from() to split on code points (not UTF-16 code units) to avoid
+  // splitting surrogate pairs for astral plane characters (emoji, CJK, etc.)
+  const sanitized = freeText
+    ? Array.from(freeText.replace(/[\r\n]/g, ' ')).slice(0, 256).join('')
+    : undefined;
   const text = sanitized ? ` ${sanitized}` : '';
   return `INV:${invoiceId}${dirMap[direction]}${text}`;
 }
@@ -1173,6 +1191,7 @@ EXPIRED is **informational, not terminal**. When `dueDate` has passed:
 - If the invoice is OPEN or PARTIAL (not all targets covered) -> becomes EXPIRED
 - An EXPIRED invoice can still transition to COVERED/CLOSED if all targets become covered after expiration
 - Note: EXPIRED takes priority over PARTIAL in the algorithm (§5.1 step 7e). A partially covered invoice past its due date shows EXPIRED, not PARTIAL.
+- **Reverse transitions:** Return payments can reduce coverage. If all coverage is returned on an expired invoice, the state reverts to EXPIRED (step 7e still matches due date check). If coverage is returned on a non-expired invoice, it can go from PARTIAL back to OPEN. These reverse transitions are inherent to the on-demand recomputation model.
 
 This means: due date is a signal to participants, not an enforcement mechanism. The on-chain tokens don't enforce deadlines.
 
@@ -1199,6 +1218,12 @@ All state-mutating operations on a given invoice are serialized through a **per-
 - Auto-return execution (immediate and ongoing)
 - `setAutoReturn()` immediate trigger
 - Inbound event processing that may trigger auto-return or implicit close
+- `returnInvoicePayment()` — holds the gate through validation AND send.
+  Unlike `payInvoice()` (where over-payment is benign and auto-returnable),
+  over-return is direct fund loss with no automatic recovery. Serialization
+  prevents two concurrent returns from both passing the balance check before
+  either's send completes. Returns are infrequent, so the blocking cost is
+  acceptable.
 
 **Non-serialized** (read-only, with one exception):
 - `getInvoiceStatus()` — read-only in the common case. However, when it detects
@@ -1210,7 +1235,7 @@ All state-mutating operations on a given invoice are serialized through a **per-
   scratch (which may differ if new transfers arrived during the wait). Only if the
   recomputed state still meets the implicit close condition is the freeze performed.
 - `getInvoice()`, `getInvoices()`, `getRelatedTransfers()`
-- `payInvoice()` — acquires the per-invoice gate for the terminal-state check
+- `payInvoice()` (gate for check only, released before send) — acquires the per-invoice gate for the terminal-state check
   only (released before calling `PaymentsModule.send()`). This prevents a TOCTOU
   race where a concurrent implicit close could terminate the invoice between the
   check and the send. The gate is NOT held during the send itself to avoid blocking
@@ -1627,6 +1652,13 @@ interface AutoReturnLedger {
    * entries older than 30 days (`completedAt < Date.now() - 30*86400000`).
    * This bounds ledger growth while retaining enough history for dedup
    * of delayed Nostr re-deliveries. Pending entries are never pruned.
+   *
+   * **Secondary dedup (defense-in-depth):** Before executing any auto-return
+   * send, check `getHistory()` for an existing outbound `:RC`/`:RX` transfer
+   * matching the same `(invoiceId, originalSenderAddress, coinId)`. If found,
+   * skip the send and write the ledger entry as `completed` with the existing
+   * return transfer ID. This prevents duplicate returns when ledger entries
+   * have been pruned (e.g., Nostr re-delivery after 30+ days offline).
    */
   entries: Record<string, AutoReturnLedgerEntry>;
 }
@@ -1741,8 +1773,12 @@ load():
       has NO entry in FROZEN_BALANCES. This handles the crash between writing
       the terminal set and writing frozen balances (possible if write order
       is not guaranteed by the storage provider). For each orphan:
-      - Recompute balances from history (same as non-terminal status computation)
-      - Persist as FrozenInvoiceBalances with the appropriate state
+      - Recompute balances from history (same formula as non-terminal status
+        computation — the balance formula is state-agnostic)
+      - Persist as FrozenInvoiceBalances with `state` set based on which
+        terminal set the invoice belongs to (CLOSED or CANCELLED)
+      - The `state` field (not the balance values) drives auto-return
+        semantics: CLOSED → surplus only, CANCELLED → everything
       This ensures storage is consistent before proceeding.
   5. **Crash recovery:** Scan dedup ledger for 'pending' entries. For each:
      - Check if the return transfer landed (via getHistory())
@@ -1787,6 +1823,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 | `dueDate` (if provided) must be in the future | `INVOICE_PAST_DUE_DATE` |
 | `deliveryMethods` entries (if provided) must use `https://` or `wss://` scheme only, max 2048 chars each, max 10 entries | `INVOICE_INVALID_DELIVERY_METHOD` |
 | Oracle provider must be available | `INVOICE_ORACLE_REQUIRED` |
+| Aggregator submission failure (after retries) | `INVOICE_MINT_FAILED` |
 | No duplicate addresses across targets | `INVOICE_DUPLICATE_ADDRESS` |
 | No duplicate coinIds within a single target's coin assets | `INVOICE_DUPLICATE_COIN` |
 | No duplicate NFT tokenIds within a single target | `INVOICE_DUPLICATE_NFT` |
@@ -1802,6 +1839,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 | Token type must be `INVOICE_TOKEN_TYPE_HEX` | `INVOICE_WRONG_TOKEN_TYPE` |
 | Token's `genesis.data.tokenData` must parse as valid InvoiceTerms | `INVOICE_INVALID_DATA` |
 | Parsed InvoiceTerms must pass full business validation (non-empty targets, valid addresses, positive amounts, no duplicate addresses/coins — same rules as §8.1 CreateInvoiceRequest, except `dueDate` may be in the past for imported invoices) | `INVOICE_INVALID_DATA` |
+| `createdAt` must be a positive integer not exceeding `Date.now() + 86400000` (1-day clock skew tolerance). `dueDate` (if present) must be a positive integer. | `INVOICE_INVALID_DATA` |
 | Invoice token must not already exist in local TokenStorage | `INVOICE_ALREADY_EXISTS` |
 
 ### 8.3 Close Validation
@@ -1872,6 +1910,12 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
 // (token sends). This is a known exception to the Connect Protocol's
 // query/intent separation. The side effect only occurs once per invoice
 // (subsequent calls return the frozen snapshot).
+//
+// WALLET HOST GUIDANCE: Auto-return sends triggered by implicit close inside
+// a Connect query are deferred to a background microtask — they do NOT block
+// the query response. Wallet hosts SHOULD rate-limit sphere_getInvoiceStatus
+// calls from dApps (e.g., max 1 call/second per invoiceId) to prevent a
+// malicious dApp from rapidly triggering implicit close across many invoices.
 {
   method: 'sphere_getInvoiceStatus',
   params: { invoiceId: 'abc123...' }
@@ -1896,6 +1940,7 @@ private invoiceTransferIndex: Map<string, InvoiceTransferRef[]>;
     ],
     memo: 'Payment for services',
     dueDate: 1709251200000,
+    deliveryMethods: ['https://pay.example.com/inv/abc'], // optional placeholder
     anonymous: false, // default: false
   }
 }
@@ -2034,6 +2079,8 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
 | `INVOICE_MEMO_TOO_LONG` | Invoice memo exceeds maximum of 4096 characters | InvoiceTerms.memo too long |
+
+Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
 
 **IMPORTANT:** All error codes above apply to the accounting module's own operations. Accounting errors during inbound transfer event processing are caught internally and logged — they NEVER propagate to or interrupt the inbound token transfer flow. The one exception is `INVOICE_TERMINATED` for outbound forward payments, which is thrown intentionally to prevent paying a terminated invoice.
 
