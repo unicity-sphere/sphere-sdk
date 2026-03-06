@@ -14,7 +14,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |-----------|-----------|
 | **Invoice IS a token** | An invoice is a minted on-chain token — the invoice terms live in the token's genesis `tokenData` field. There are no external metadata fields outside the token itself. The token ID (guaranteed unique by the aggregator) is the invoice ID. |
 | **Local-first accounting** | Each party computes invoice status from its own token inventory — no shared on-chain state, no consensus needed. Status is **never** stored; it is always derived on-demand. |
-| **Memo-referenced payments** | Transfers reference invoices via structured prefix in the existing `memo` field — no transport protocol changes |
+| **Memo-referenced balances** | Invoice balances are derived **exclusively** from transaction history entries whose memo references the invoice. Physical token inventory (whether tokens still exist or have been spent further) is irrelevant to invoice accounting. |
 | **Read-only dependency on PaymentsModule** | AccountingModule reads from `PaymentsModule` (getHistory, getTokens, events) but never calls `send()` or modifies payment state directly |
 | **Idempotent event re-firing** | The same event (with the same or updated `confirmed` flag) may fire multiple times for the same underlying transfer. Event consumers MUST be idempotent — handling a re-fired event must produce the same result as handling it once. This is the fundamental contract. |
 
@@ -55,10 +55,10 @@ Token (TXF format)
 |   +-- data
 |   |   +-- tokenId: string             // = invoice ID (64-char hex, unique via aggregator)
 |   |   +-- tokenType: string           // INVOICE_TOKEN_TYPE_HEX
-|   |   +-- coinData: []                // empty — invoice tokens are non-fungible
+|   |   +-- coinData: []                // empty -- invoice tokens are non-fungible
 |   |   +-- tokenData: string           // <-- serialized InvoiceTerms (see below)
 |   |   +-- salt: string                // deterministic from signingKey + invoiceBytes
-|   |   +-- recipient: string           // creator's DIRECT:// address
+|   |   +-- recipient: string           // creator's DIRECT:// address (or any address)
 |   |   +-- ...
 |   +-- inclusionProof: ...
 +-- state: ...
@@ -69,7 +69,7 @@ The `tokenData` field contains a canonical JSON serialization of `InvoiceTerms`:
 
 ```
 InvoiceTerms (serialized into genesis.data.tokenData)
-+-- creator: string                     // chain pubkey of the invoice creator
++-- creator?: string                    // chain pubkey of the invoice creator (OPTIONAL -- anonymous allowed)
 +-- createdAt: number                   // ms timestamp
 +-- dueDate?: number                    // optional deadline (ms timestamp)
 +-- memo?: string                       // free-text or URL
@@ -80,6 +80,8 @@ InvoiceTerms (serialized into genesis.data.tokenData)
         +-- nft?: NFTEntry              // NFT request (placeholder)
 ```
 
+**Anonymous invoices:** The `creator` field is optional. Anyone can create an invoice without identifying themselves. When `creator` is omitted, the invoice is anonymous — it cannot be cancelled (cancellation requires creator identity verification), but it can still be paid and closed normally.
+
 ### 3.2 Shared Asset Types: CoinEntry and NFTEntry
 
 Invoice targets reuse the **same types** used elsewhere in the SDK for token genesis and asset representation. This ensures consistency and avoids parallel type hierarchies.
@@ -87,7 +89,7 @@ Invoice targets reuse the **same types** used elsewhere in the SDK for token gen
 **CoinEntry** — the same `[coinId, amount]` tuple used in `TxfGenesisData.coinData`:
 
 ```
-CoinEntry = [string, string]            // [coinId, amount] — e.g., ["UCT", "1000000"]
+CoinEntry = [string, string]            // [coinId, amount] -- e.g., ["UCT", "1000000"]
 ```
 
 This is the existing format from `TxfGenesisData.coinData: [string, string][]`. Invoice targets reference coins using the exact same tuple, so the same parsing/validation code works for both genesis coin definitions and invoice asset requests.
@@ -104,7 +106,7 @@ NFTEntry
 
 ```
 InvoiceRequestedAsset
-+-- coin?: CoinEntry                    // [coinId, amount] — fungible token request
++-- coin?: CoinEntry                    // [coinId, amount] -- fungible token request
 +-- nft?: NFTEntry                      // NFT request (placeholder)
 ```
 
@@ -127,9 +129,41 @@ The invoice is **fully covered** only when every target address has received eve
 
 ### 3.4 Status Is Always Computed, Never Stored
 
-Invoice status (OPEN, PARTIAL, COVERED, CLOSED, etc.) is a **dynamic property** derived from the current local token inventory and transaction history. It is NEVER stored in the token, in storage, or anywhere else. Every call to `getInvoiceStatus()` recomputes the status from scratch.
+Invoice status (OPEN, PARTIAL, COVERED, CLOSED, etc.) is a **dynamic property** derived from the transaction history of active and sent tokens. It is NEVER stored in the token, in storage, or anywhere else. Every call to `getInvoiceStatus()` recomputes the status from scratch.
 
 This is a fundamental design principle — there is no state to get out of sync.
+
+### 3.5 Balance Computation Model
+
+**Invoice balances are derived from transaction history, not token inventory.**
+
+For a given invoice target and asset (e.g., target `DIRECT://alice`, asset `UCT`):
+
+```
+coveredBalance = sum(forward payments referencing this invoice for this target:asset)
+               - sum(back payments referencing this invoice for this target:asset)
+```
+
+Key rules:
+
+1. **Only memo-referenced transfers count.** A transfer affects an invoice balance if and only if its memo contains `INV:<invoiceId>` referencing that invoice. The mere presence or absence of tokens in the wallet is irrelevant.
+
+2. **Spending received tokens is independent.** A recipient can freely spend tokens received for a partially covered (or even uncovered) invoice without affecting that invoice's balances. The invoice accounting tracks memo-referenced transfers, not token ownership chains.
+
+3. **Self-payments are valid.** A recipient may pay themselves with tokens referencing the given invoice, which increases the respective asset balance. This is a legitimate operation (e.g., consolidating tokens).
+
+4. **Return payments decrease balance.** A return payment (`INV:<id>:B`) decreases the covered balance for the matching target:asset. This handles overpayments, refunds, and corrections.
+
+5. **Frozen at terminal states.** Once an invoice reaches CLOSED or CANCELLED, its balances are frozen — no further computation is performed. New transfers referencing a terminated invoice are still recorded but do not affect the terminal status.
+
+### 3.6 History Scanning
+
+To compute invoice balances, the module scans the **full transaction history** of all active and sent tokens. This includes:
+
+- **Active tokens** — tokens currently in the wallet's inventory
+- **Sent (archived) tokens** — tokens that have been transferred away
+
+Both inbound and outbound transfers are considered. The scan examines the memo field of each history entry to find invoice references.
 
 ## 4. Invoice Lifecycle & State Machine
 
@@ -140,9 +174,9 @@ This is a fundamental design principle — there is no state to get out of sync.
 | `OPEN` | Invoice created, no payments matched yet |
 | `PARTIAL` | At least one matching payment received, but not all targets fully covered |
 | `COVERED` | All targets fully covered (unconfirmed — at least one related token lacks full proof chain) |
-| `CLOSED` | All targets fully covered AND all related tokens fully confirmed |
-| `CANCELLED` | Creator explicitly cancelled the invoice |
-| `EXPIRED` | `dueDate` passed without reaching CLOSED (if dueDate was set). **Note:** expiration does NOT invalidate the invoice — it can still transition to CLOSED if all targets are subsequently covered and confirmed. |
+| `CLOSED` | All targets fully covered AND all related tokens fully confirmed. **Terminal.** |
+| `CANCELLED` | Creator explicitly cancelled the invoice. **Terminal.** |
+| `EXPIRED` | `dueDate` passed without reaching CLOSED (if dueDate was set). **Not terminal** — can still transition to CLOSED. |
 
 ### 4.2 State Transitions
 
@@ -178,19 +212,22 @@ This is a fundamental design principle — there is no state to get out of sync.
 
 Key transitions:
 - **EXPIRED is not terminal.** An expired invoice can still transition to CLOSED if all targets become fully covered and all related tokens are confirmed after the due date.
-- **CANCELLED is terminal.** Once cancelled, the invoice remains cancelled regardless of subsequent payments.
-- **CLOSED is terminal.** All targets covered + all tokens confirmed.
+- **CANCELLED is terminal.** Once cancelled, the invoice remains cancelled regardless of subsequent payments. Balances are frozen.
+- **CLOSED is terminal.** All targets covered + all tokens confirmed. Balances are frozen.
+- **Frozen terminal states.** Once CLOSED or CANCELLED, no further balance computation occurs. Subsequent transfers referencing the invoice are recorded but do not change the status.
 
 ### 4.3 Status Computation
 
 Status is **computed on-demand** from local data, never stored. The `getInvoiceStatus()` method:
 
 1. Reads the invoice terms from the token's genesis `tokenData`
-2. Scans transaction history (`PaymentsModule.getHistory()`) for memo-matched transfers
-3. Aggregates received/sent amounts per target per asset
-4. Determines which targets are covered, partially covered, or untouched
-5. Checks confirmation status of all related tokens
-6. Returns the computed `InvoiceStatus` object
+2. Checks if the invoice is in a terminal state (CLOSED or CANCELLED) — if so, returns the frozen status
+3. Scans transaction history of **all active and sent tokens** (`PaymentsModule.getHistory()`) for memo-matched transfers
+4. Aggregates forward and back payments per target per asset
+5. Computes `coveredBalance = forward - back` for each target:asset
+6. Determines which targets are covered, partially covered, or untouched
+7. Checks confirmation status of all related tokens
+8. Returns the computed `InvoiceStatus` object
 
 Each party independently derives invoice status from their own perspective — sender sees what they've sent, receiver sees what they've received.
 
@@ -212,6 +249,8 @@ Each party independently derives invoice status from their own perspective — s
 6. Submit to aggregator -> wait for inclusion proof
 7. Create Token with proof
 8. Store invoice token via TokenStorageProvider (same as nametag/currency tokens)
+9. Scan existing transaction history for payments referencing this invoice
+10. Fire 'invoice:created' event + any retroactive payment/coverage events
 ```
 
 ### 5.2 Why Mint?
@@ -285,7 +324,7 @@ this.accounting = createAccountingModule({
   emitEvent: (type, data) => this.emit(type, data),
 });
 
-// Load persisted invoice tokens from TokenStorageProvider
+// Load persisted invoice tokens + scan history for pre-existing payments
 await this.accounting.load();
 
 // Cleanup
@@ -309,7 +348,17 @@ PaymentsModule                    AccountingModule
      +--------------------------------->| recompute affected invoices
 ```
 
-### 7.3 Storage Layout
+### 7.3 Payments Arriving Before Invoice (P2P Async)
+
+In a P2P asynchronous environment, a payment referencing an invoice may arrive **before** the invoice token itself is created or imported. The module handles this:
+
+1. **On `transfer:incoming` with unknown invoice ID:** Fire `invoice:unknown_reference` event. The transfer is recorded in history regardless.
+
+2. **On `createInvoice()` or `importInvoice()`:** After storing the invoice token, perform a **full history rescan** — scan all active and sent token transaction history for any transfers whose memo references the newly created/imported invoice. Fire all applicable events (payment, asset_covered, target_covered, covered, closed) as if the payments just arrived. This ensures no payments are missed regardless of arrival order.
+
+This retroactive evaluation is safe because all events are idempotent — re-firing events for already-known transfers produces correct results.
+
+### 7.4 Storage Layout
 
 Invoice tokens are stored via `TokenStorageProvider` — the **same** storage used for nametag tokens and currency tokens. Since all invoice terms live in the token's genesis `tokenData`, no separate metadata storage is needed.
 
@@ -325,7 +374,7 @@ Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 CANCELLED_INVOICES: 'cancelled_invoices',
 ```
 
-### 7.4 New Events
+### 7.5 New Events
 
 Added to `SphereEventType` and `SphereEventMap`:
 
@@ -343,11 +392,11 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:overpayment` | `{ invoiceId, address, coinId, surplus, confirmed }` | Payment exceeds requested amount |
 | `invoice:irrelevant` | `{ invoiceId, transfer, reason, confirmed }` | Transfer references this invoice but doesn't match any target address or requested asset |
 
-### 7.5 Idempotent Event Re-Firing
+### 7.6 Idempotent Event Re-Firing
 
 All events with a `confirmed` field follow this contract:
 
-- Events **may fire multiple times** for the same underlying transfer — with `confirmed: false`, then again with `confirmed: true`, and potentially again if the same transfer event is re-delivered.
+- Events **may fire multiple times** for the same underlying transfer — with `confirmed: false`, then again with `confirmed: true`, and potentially again if the same transfer event is re-delivered, or on retroactive history rescan after invoice creation/import.
 - **Event consumers MUST be idempotent.** Processing the same event twice must produce the same result as processing it once. This is the fundamental design principle.
 - This aligns naturally with the SDK's existing pattern where Nostr may re-deliver events and where `transfer:incoming` precedes `transfer:confirmed`.
 - The AccountingModule itself does not track "already fired" state — it simply recomputes and re-fires on every relevant trigger.
@@ -384,13 +433,25 @@ The recipient holds the invoice token and monitors incoming transfers:
 
 ```
 Invoice OPEN
-  <- receive 500 USDU to target[0] -> PARTIAL
-  <- receive 1000 UCT to target[0] -> target[0] COVERED
-  <- receive 200 ALPHA to target[1] -> COVERED (all targets met)
+  <- receive 500 USDU to target[0] (memo: INV:xxx:F) -> PARTIAL
+  <- receive 1000 UCT to target[0] (memo: INV:xxx:F) -> target[0] COVERED
+  -- recipient spends the 500 USDU token on something else (no invoice ref) --
+  -- ^^^ this does NOT affect the invoice balance (no INV: memo) --
+  <- receive 200 ALPHA to target[1] (memo: INV:xxx:F) -> COVERED (all targets met)
   ... all tokens confirmed -> CLOSED
 ```
 
-### 9.2 Payer/Sender View
+### 9.2 Token Independence
+
+**Spending tokens does not affect invoice balances.** After receiving tokens for an invoice:
+
+- The recipient can spend those tokens freely (for other invoices, purchases, etc.) without affecting the current invoice's covered balance.
+- The invoice balance is based on the **memo-referenced transfer history**, not on whether the tokens are still in the wallet.
+- The recipient CAN affect the invoice balance by making new transfers that reference the same invoice:
+  - Forward payment to self (`INV:xxx:F`) — increases balance
+  - Return payment (`INV:xxx:B`) — decreases balance
+
+### 9.3 Payer/Sender View
 
 The payer receives or imports the invoice token and tracks outgoing transfers:
 
@@ -403,7 +464,7 @@ Invoice OPEN (imported/received)
 
 The sender's status reflects what they have sent, which may differ from the recipient's view (network delays, multiple payers).
 
-### 9.3 Third-Party / Exchange View
+### 9.4 Third-Party / Exchange View
 
 An exchange creating invoices for two-way swaps can track both sides:
 
@@ -413,6 +474,19 @@ Invoice for swap:
   Target 2: Buyer address   <- exchange sends tokens
 
 Both parties independently verify their side is covered.
+```
+
+### 9.5 Async P2P: Payment Before Invoice
+
+```
+Time 1: Payer sends 500 USDU with memo INV:abc:F
+        -> Recipient receives transfer
+        -> AccountingModule fires invoice:unknown_reference (invoice abc not yet known)
+
+Time 2: Recipient imports invoice token abc
+        -> AccountingModule scans full history
+        -> Finds the earlier 500 USDU transfer with INV:abc:F
+        -> Fires invoice:payment, and possibly invoice:asset_covered etc.
 ```
 
 ## 10. Error Handling
@@ -425,6 +499,7 @@ Both parties independently verify their side is covered.
 | Malformed memo | Ignore — treat as a regular transfer with no invoice association |
 | Duplicate invoice | Aggregator rejects with `REQUEST_ID_EXISTS` — use deterministic salt for idempotent re-mint |
 | Token data parsing failure | Log warning, skip — corrupted tokenData does not crash the module |
+| Cancel of anonymous invoice | Reject — anonymous invoices (no `creator` field) cannot be cancelled |
 
 ## 11. Future Extensions
 
