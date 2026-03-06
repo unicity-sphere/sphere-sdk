@@ -92,7 +92,11 @@ InvoiceTerms (serialized into genesis.data.tokenData)
 
 **Anonymous invoices:** The `creator` field is optional. Anyone can create an invoice without identifying themselves. When `creator` is omitted, the invoice is anonymous — any party holding the invoice locally may close or cancel it (since there is no creator to verify against). For non-anonymous invoices, only the creator may close or cancel.
 
-**Anonymous invoice auto-return restriction:** Auto-return is **disabled** for anonymous invoices. The `autoReturn` option in `closeInvoice()` / `cancelInvoice()` is rejected with `INVOICE_ANON_AUTO_RETURN` for anonymous invoices, and `setAutoReturn()` skips anonymous invoices. This prevents a malicious holder from cancelling an anonymous invoice to trigger auto-return of all accumulated payments. Targets of anonymous invoices may still manually return tokens via `returnInvoicePayment()` (`:B` direction).
+**Creator identity trust model:** The `creator` field is **self-asserted** — the minter can set it to any pubkey. The aggregator does not verify that `creator` matches the minting key. Applications requiring verified creator identity should use out-of-band verification (e.g., receiving the invoice token directly from the claimed creator via authenticated transport). The `creator` field's purpose is local authorization gating for close/cancel, not identity attestation.
+
+**Privacy limitation of anonymous invoices:** Even when `creator` is omitted, the minting process embeds the minter's signing key in the salt derivation and sets the minter's DirectAddress as the `recipient` in genesis data. The minter's on-chain identity is therefore still discoverable. "Anonymous" means the `creator` field is absent from InvoiceTerms (affecting close/cancel authorization), not that the minter's identity is hidden on-chain.
+
+**Anonymous invoice auto-return restriction:** Auto-return is **disabled** for anonymous invoices. The `autoReturn` option in `closeInvoice()` / `cancelInvoice()` is rejected with `INVOICE_ANON_AUTO_RETURN` for anonymous invoices. `setAutoReturn(invoiceId)` for a specific anonymous invoice throws `INVOICE_ANON_AUTO_RETURN`. `setAutoReturn('*', true)` sets the global flag but **silently skips** anonymous invoices during immediate trigger and ongoing processing (no error thrown). This prevents a malicious holder from cancelling an anonymous invoice to trigger auto-return of all accumulated payments. Targets of anonymous invoices may still manually return tokens via `returnInvoicePayment()` (`:B` direction).
 
 **Delivery methods:** The `deliveryMethods` field is an optional ordered list of URLs specifying how payments should be delivered, in priority order (first URL = highest priority). This is a **placeholder** for future use — the current SDK uses the Nostr-based delivery network exclusively. When delivery method support is implemented, a payer should attempt delivery to the first URL, falling back to subsequent URLs on failure.
 
@@ -250,7 +254,7 @@ Key transitions:
 - **EXPIRED detection is passive.** The `invoice:expired` event fires when `getInvoiceStatus()` is called or when an inbound event triggers recomputation — there is no background timer. If no events arrive and no status queries are made after the due date, the `invoice:expired` event will not fire until the next interaction. Applications requiring prompt expiration notification should poll `getInvoiceStatus()` or set a `setTimeout` based on `dueDate - Date.now()`.
 - **Clock skew.** EXPIRED is a local-only state derived from `Date.now() > dueDate`. Different parties may have different system clocks, so they may disagree on whether an invoice is expired. Implementations SHOULD tolerate up to 60 seconds of clock skew in UI presentation (e.g., showing "expiring soon" rather than hard cutoff). The `dueDate` is a signal, not an enforcement mechanism — there is no on-chain expiration.
 - **CANCELLED is terminal (locally).** Once cancelled, the invoice remains cancelled on the local party's side regardless of subsequent payments. Balances are frozen and persisted. See Section 4.4 for cancellation semantics.
-- **CLOSED is terminal (locally).** Two paths to CLOSED: (1) implicit — all targets covered + all tokens confirmed; (2) explicit — **creator** calls `closeInvoice()` at any time (satisfied with current payments). Balances are frozen and persisted. Target owners cannot close — only the creator (or any party for anonymous invoices).
+- **CLOSED is terminal (locally).** Two paths to CLOSED: (1) implicit — all targets covered + all tokens confirmed; (2) explicit — **creator** calls `closeInvoice()` at any time (satisfied with current payments). Balances are frozen and persisted. Target owners cannot close — only the creator (or any party for anonymous invoices). After implicit close, if auto-return is enabled and the wallet is a target and the invoice is not anonymous, surplus auto-return is triggered immediately.
 - **Frozen terminal states.** Once CLOSED or CANCELLED, the frozen balance snapshot is persisted. Dynamic recomputation stops. New transfers referencing the invoice may trigger auto-return but do not change the status.
 
 ### 4.3 Close vs Cancel Semantics
@@ -315,7 +319,7 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 4. **Complete:** Update ledger entry to `status: 'completed'` with `returnTransferId`.
 5. Fire `invoice:auto_returned` event.
 
-On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found, retry the send. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
+On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found, retry using the persisted `recipient`, `amount`, `coinId`, and `memo` fields from the ledger entry. These fields are written at intent time (step 2) specifically to enable retry without re-deriving from the original transfer. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
 
 **Auto-return exclusions — return payments are NEVER auto-returned:**
 - Transfers with direction `:B`, `:RC`, or `:RX` are **never** auto-returned.
@@ -332,7 +336,7 @@ On crash recovery (during `load()`), scan the ledger for `pending` entries. For 
 **Recipient-side auto-termination (opt-in):**
 - When a party receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally.
 - When a party receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
-- This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
+- This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism. **Trust note:** A target can send `:RC`/`:RX` even if the invoice is not actually terminated on their side. The payer's `autoTerminateOnReturn` trusts the direction code at face value. This is acceptable because the target already holds the tokens and could simply not return them — spoofing a direction code gains nothing.
 
 ### 4.6 Non-Blocking Inbound Guarantee
 
@@ -363,7 +367,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 - Inbound event processing that may trigger auto-return
 
 **Non-serialized (read-only) operations (with one exception):**
-- `getInvoiceStatus()` — read-only in the common case. However, when it detects an implicit close condition (all targets covered + all confirmed), it acquires the per-invoice gate to freeze balances and persist. Inside the gate, the condition is re-verified before freezing (another operation may have already terminated the invoice). This prevents a race between concurrent implicit close detection and explicit `closeInvoice()`/`cancelInvoice()` calls.
+- `getInvoiceStatus()` — read-only in the common case. However, when it detects an implicit close condition (all targets covered + all confirmed), it acquires the per-invoice gate to freeze balances and persist. Inside the gate, **re-verification is a full recomputation from history** — checking both terminal sets (closedSet/cancelledSet, which may have been modified by a concurrent operation) AND recomputing balances from scratch (which may differ if new transfers arrived). Only if the recomputed state still meets the implicit close condition is the freeze performed. This prevents a race between concurrent implicit close detection and explicit `closeInvoice()`/`cancelInvoice()` calls.
 - `getInvoice()`, `getInvoices()`, `getRelatedTransfers()`
 - `payInvoice()` — only reads terminal state to decide whether to block; the actual `send()` call is delegated to PaymentsModule
 - `parseInvoiceMemo()`
@@ -553,6 +557,7 @@ Additional per-address storage keys:
 | `sphere_{addressId}_frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
 | `sphere_{addressId}_auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
 | `sphere_{addressId}_auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
+| `sphere_{addressId}_invoice_transfer_refs` | Per-address | Invoice-transfer index cache: preserves multi-asset coinData across restarts (JSON) |
 
 Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 
@@ -562,6 +567,7 @@ CLOSED_INVOICES: 'closed_invoices',
 FROZEN_BALANCES: 'frozen_balances',
 AUTO_RETURN: 'auto_return',
 AUTO_RETURN_LEDGER: 'auto_return_ledger',
+INVOICE_TRANSFER_REFS: 'invoice_transfer_refs',
 ```
 
 ### 7.5 New Events
