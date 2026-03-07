@@ -65,9 +65,10 @@ An invoice is a standard on-chain token. All invoice terms are encoded in the to
 Token (TXF format)
 +-- genesis
 |   +-- data
-|   |   +-- tokenId: string             // = invoice ID (64-char hex, unique via aggregator)
+|   |   +-- tokenId: string             // = invoice ID (64-char hex, unique via SHA-256 collision resistance;
+|   |   //                                   aggregator prevents duplicate minting of same ID)
 |   |   +-- tokenType: string           // INVOICE_TOKEN_TYPE_HEX
-|   |   +-- coinData: []                // empty -- invoice tokens are non-fungible
+|   |   +-- coinData: null              // null -- invoice tokens are non-fungible
 |   |   +-- tokenData: string           // <-- serialized InvoiceTerms (see below)
 |   |   +-- salt: string                // deterministic from signingKey + invoiceBytes
 |   |   +-- recipient: string           // creator's DIRECT:// address (or any address)
@@ -483,7 +484,7 @@ Each party independently derives invoice status from their own perspective — s
 6.  Create MintTransactionData with:
     - tokenId from step 5
     - tokenType: INVOICE_TOKEN_TYPE_HEX
-    - coinData: [] (non-fungible)
+    - coinData: null (non-fungible — null, not empty array)
     - tokenData: invoiceBytes
     - recipient: creator's DirectAddress
 7.  Create MintCommitment, submit to aggregator
@@ -584,6 +585,7 @@ this.accounting = createAccountingModule(
     payments: this.payments,
     tokenStorage: this.tokenStorage,
     oracle: this.oracle,
+    trustBase: this.trustBase,  // required by InvoiceMinter for waitInclusionProof + Token.mint
     identity: this.fullIdentity,
     storage: this.storage,
     getActiveAddresses: () => this.getActiveAddresses(),

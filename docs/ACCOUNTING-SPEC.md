@@ -387,7 +387,7 @@ interface InvoiceRef {
   readonly isCreator: boolean;
   /** Whether this invoice has been locally cancelled */
   readonly cancelled: boolean;
-  /** Whether this invoice has been locally closed (explicitly) */
+  /** Whether this invoice has been locally closed (explicitly or implicitly via all-covered+confirmed) */
   readonly closed: boolean;
 }
 
@@ -422,6 +422,12 @@ interface AccountingModuleConfig {
    * requires restarting the module with a new config.
    */
   autoTerminateOnReturn?: boolean;
+  /**
+   * Maximum number of coinData entries processed per token transaction.
+   * Defense against adversarial tokens with thousands of coin types.
+   * Default: 50. In practice, tokens carry 1-3 coin types.
+   */
+  maxCoinDataEntries?: number;
 }
 
 /**
@@ -433,8 +439,15 @@ interface AccountingModuleDependencies {
   payments: PaymentsModule;
   /** Token storage for invoice tokens (same provider as currency/nametag tokens) */
   tokenStorage: TokenStorageProvider;
-  /** Oracle for minting invoice tokens */
+  /** Oracle for minting invoice tokens (also provides stateTransitionClient via getStateTransitionClient()) */
   oracle: OracleProvider;
+  /**
+   * Trust base for aggregator proof verification.
+   * Required by waitInclusionProof() and Token.mint() during invoice minting.
+   * Follows the same pattern as NametagMinterConfig.trustBase.
+   * Obtained via the oracle/aggregator configuration at init time.
+   */
+  trustBase: unknown;
   /** Current wallet identity */
   identity: FullIdentity;
   /** All tracked wallet addresses — used for target check in close/cancel/return.
@@ -843,6 +856,12 @@ const tokenId = new TokenId(hash.imprint);
 
 ### 3.2 Minting Flow (Mirrors NametagMinter)
 
+> **Factory method:** `MintTransactionData.create()` is the general-purpose factory
+> (accepts arbitrary `tokenData: Uint8Array | null` and `coinData: TokenCoinData | null`).
+> This is distinct from `MintTransactionData.createFromNametag()` which is a convenience
+> wrapper for nametag tokens only. Invoice minting uses `create()` because it carries
+> arbitrary `InvoiceTerms` in `tokenData`, not a nametag string.
+
 ```
 Step  Action                                SDK Class
 ----  ------                                ---------
@@ -854,7 +873,7 @@ Step  Action                                SDK Class
 5     Create MintTransactionData            MintTransactionData.create()
       - tokenType: INVOICE_TOKEN_TYPE_HEX
       - tokenData: serialized InvoiceTerms
-      - coinData: [] (non-fungible)
+      - coinData: null (non-fungible — null, not empty array)
       - recipient: creator's DirectAddress
 6     Create MintCommitment                 MintCommitment.create()
 7     Submit to aggregator (3 retries)      client.submitMintCommitment()
@@ -930,6 +949,13 @@ function canonicalSerialize(terms: InvoiceTerms): Uint8Array {
   // modern JS engines (V8, SpiderMonkey, JSC) per ES2015+ spec. The `sorted`
   // object above uses alphabetical key insertion order to ensure determinism.
   // This is safe for all SDK target environments (Node.js >= 18, modern browsers).
+  // PORTABILITY: All InvoiceTerms field names are semantic strings (not integer-
+  // like), so ES2015+ [[OwnPropertyKeys]] numeric-first ordering cannot reorder
+  // them. If a future field with an integer-like name is ever added, it would
+  // break canonical ordering on all engines. Future maintainers: do not add
+  // fields with numeric names. For maximum cross-environment safety, an
+  // implementation MAY use a deterministic JSON serializer library (e.g.,
+  // json-stable-stringify) instead of relying on insertion order.
   return new TextEncoder().encode(JSON.stringify(sorted));
 }
 ```
@@ -1131,22 +1157,21 @@ function buildInvoiceMemo(
 
 **PaymentsModule.send() MUST be modified** to encode the `TransferRequest.memo` into BOTH the Nostr transport payload AND the on-chain `TransferTransactionData.message` field. Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter — this must change.
 
-> **PREREQUISITE:** The upstream `@unicitylabs/state-transition-sdk` must be modified
-> to add a `message: Uint8Array | null` parameter to `TransferCommitment.create()`.
-> The current SDK signature is `(token, address, salt, recipientData, recipientDataHash,
-> signingService)` with no `message` parameter. The BEFORE/AFTER code below assumes
-> this upstream change has been made. The `message` parameter position shown below
-> (after `recipientDataHash`) is illustrative — the actual position will be determined
-> by the upstream API change.
+> **NOTE:** The upstream `@unicitylabs/state-transition-sdk` **already supports** the
+> `message: Uint8Array | null` parameter on `TransferCommitment.create()`. The actual
+> signature is `(token, recipient, salt, recipientDataHash, message, signingService)`.
+> No upstream SDK change is required — the work is entirely within sphere-sdk's
+> `PaymentsModule.createSdkCommitment()` and related transfer paths, which currently
+> pass `null` for the `message` parameter.
 
 **Required change to PaymentsModule.send():**
 
 ```typescript
-// BEFORE (current code — no message parameter; recipientData and recipientDataHash are null):
+// BEFORE (current code — message parameter always null):
 const commitment = await TransferCommitment.create(
   sdkToken, recipientAddress, salt,
-  null,  // recipientData
   null,  // recipientDataHash
+  null,  // message (unused — always null currently)
   signingService
 );
 
@@ -1219,6 +1244,8 @@ await this.deps.payments.send({
 ```
 
 **Backward compatibility:** Transfers made before this change have `message: null` in their on-chain data. The accounting module MUST fall back to `HistoryRecord.memo` (Nostr transport) when `TxfTransaction.data.message` is null or unparseable. See §5.4.3 for the fallback logic.
+
+**Legacy fallback join:** To match a `TxfTransaction` to its corresponding `HistoryRecord` for the legacy fallback, `processTokenTransactions()` must build a lookup map from `PaymentsModule.getHistory()` keyed by `(tokenId, transactionIndex)`. `HistoryRecord` entries contain a `tokenId` field and can be correlated by position in the token's transaction chain. This join is built once during `load()` and updated incrementally from `history:updated` events.
 
 ### 4.8 Reference Resolution Priority
 
@@ -1508,7 +1535,7 @@ interface InvoiceBalanceSnapshot {
 This is the core function called by both cold-start and incremental updates. It scans a token's transaction history for invoice references in the on-chain `TransferTransactionData.message` field.
 
 ```
-processTokenTransactions(token: Token, startIndex: number): InvoiceTransferRef[]
+async processTokenTransactions(token: Token, startIndex: number): Promise<InvoiceTransferRef[]>
   const newEntries: InvoiceTransferRef[] = []
   txf = JSON.parse(token.sdkData) as TxfToken
   coinData = txf.genesis.data.coinData   // multi-asset: [string, string][]
@@ -1635,7 +1662,7 @@ processTokenTransactions(token: Token, startIndex: number): InvoiceTransferRef[]
        // The previous-predicate lookup uses absIdx - 1 (no double-offset).
        //
        // Extract the public key from the predicate, then derive the
-       // DIRECT:// address from it.
+       // DIRECT:// address from it using the SDK's address derivation.
        // IMPORTANT: Predicate may be MASKED (owner hidden) or UNMASKED.
        // UnmaskedPredicate.fromCBOR() will throw on a masked predicate.
        // If the predicate is masked, the sender address is unresolvable —
@@ -1643,20 +1670,24 @@ processTokenTransactions(token: Token, startIndex: number): InvoiceTransferRef[]
        // NOTE below). Downstream logic skips null-sender entries for
        // self-payment detection and return matching, but includes them in
        // aggregate coverage computation.
-       // FORMAT CONSISTENCY: genesis.data.recipient and deriveDIRECTAddress()
-       // both produce identically-formatted DIRECT:// strings. The SDK's
-       // deriveDIRECTAddress(pubkey) produces the same output as the address
-       // stored in genesis.data.recipient for the same public key. No
-       // normalization is needed for address comparisons.
+       // ADDRESS DERIVATION: Uses PaymentsModule.createDirectAddressFromPubkey()
+       // which calls UnmaskedPredicateReference.create(tokenType, 'secp256k1',
+       // pubkeyBytes).toString(). This produces the same DIRECT:// format as
+       // genesis.data.recipient for the same public key. No normalization needed.
+       // NOTE: This derivation is ASYNC (requires await). The caller
+       // (processTokenTransactions) is async due to TransferTransactionData.fromJSON().
        senderAddress = (absIdx === 0)
          ? txf.genesis.data.recipient
-         : (() => {
+         : await (async () => {
              try {
-               return deriveDIRECTAddress(UnmaskedPredicate.fromCBOR(
+               const predicate = UnmaskedPredicate.fromCBOR(
                  hexToBytes(txf.transactions[absIdx - 1].predicate)
-               ).publicKey);
+               );
+               // Derive DIRECT:// address from public key using the SDK's
+               // address derivation (same as PaymentsModule.createDirectAddressFromPubkey)
+               return await createDirectAddressFromPubkey(predicate.publicKey);
              } catch {
-               return null;  // masked predicate — sender unknown
+               return null;  // masked predicate or empty — sender unknown
              }
            })()
 
@@ -1738,15 +1769,11 @@ Phase 2 — Scan token transaction tails:
      // have unprocessed transaction tails if the process crashed between
      // archiving the token and updating tokenScanState. The tokenScanState
      // watermark provides the fast-path skip for fully-processed tokens.
-     // Note: getArchivedTokens() may not exist in current PaymentsModule API.
-     // If unavailable, scan archived token files directly from TokenStorage:
-     //   archivedTokens = tokenStorage.getArchivedTokens()
-     // Alternatively, if neither API is available, rely on the tokenScanState
-     // entries: any tokenId in tokenScanState that is NOT in allTokens was
-     // likely archived. Its index entries are already captured. The only risk
-     // is a crash between the token's last transaction and archival — this is
-     // a narrow window. For v1, document this as a known limitation and
-     // recommend the getArchivedTokens() API be added to PaymentsModule.
+     // NOTE: getArchivedTokens() exists in current PaymentsModule API and
+     // returns Map<string, TxfToken> (not Token[]). For archived tokens,
+     // the TxfToken is available directly — no JSON.parse(sdkData) needed.
+     // Construct a lightweight Token-shaped object for processTokenTransactions:
+     //   { id: tokenId, sdkData: JSON.stringify(txfToken) } for each entry.
   6. For each token T in allTokens:
      a. txf = JSON.parse(T.sdkData) as TxfToken
      b. startIndex = tokenScanState.get(T.id) ?? 0
@@ -1983,6 +2010,14 @@ No exception from the accounting layer may propagate to or interrupt the payment
 
 All new events are added to `SphereEventType` union and `SphereEventMap` interface in `types/index.ts`.
 
+**IMPORTANT: `SphereEventType` is a `type` alias (union), not an `interface`.** Module augmentation
+cannot extend it. The additions below MUST be made directly in `types/index.ts`. Similarly,
+`SphereEventMap` entries must be added directly. The `connect/permissions.ts` file must also be
+updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` and
+`sphere_getInvoiceStatus` to `METHOD_PERMISSIONS`, and add all six intent actions
+(`create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`,
+`set_auto_return`) to `INTENT_PERMISSIONS`.
+
 ```typescript
 // New SphereEventType additions:
 | 'invoice:created'
@@ -2101,7 +2136,7 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
   2. If invoiceId not in local token storage:
      -> fire 'invoice:unknown_reference' { invoiceId, transfer }
      -> return
-  3. If paymentDirection is 'return_closed' or 'return_cancelled':
+  3. If paymentDirection is 'back', 'return_closed', or 'return_cancelled':
      -> Process transfer into index via processTokenTransactions() (§5.4.3)
         FIRST, before gate acquisition. This ensures the return transfer is
         indexed in invoiceLedger (updating returnedAmount) regardless of
@@ -2121,7 +2156,7 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
           inflate returnedAmount.
         - Treat the transfer as `invoice:irrelevant` with reason
           `'unauthorized_return'` and return (releasing gate).
-        This prevents spoofed :RC/:RX transfers from non-target parties or
+        This prevents spoofed :B/:RC/:RX transfers from non-target parties or
         masked-predicate senders from inflating returnedAmount or triggering
         auto-termination.
      b. fire 'invoice:return_received' { invoiceId, transfer, returnReason }
@@ -2254,13 +2289,22 @@ The `invoice:expired` event fires when `getInvoiceStatus()` or event recomputati
 
 Invoice tokens are stored via `TokenStorageProvider` -- the **same** provider used for currency tokens, nametag tokens, etc. The token's `genesis.data.tokenType` of `INVOICE_TOKEN_TYPE_HEX` identifies it as an invoice.
 
-On `load()`, the AccountingModule filters all tokens in storage by token type to discover invoice tokens. All invoice data (terms, creator, targets, etc.) is read from the token's `genesis.data.tokenData` field.
+On `load()`, the AccountingModule discovers invoice tokens via `PaymentsModule.getTokens()` (which returns `Token[]` with `sdkData` containing TXF JSON) filtered by `genesis.data.tokenType === INVOICE_TOKEN_TYPE_HEX`. `TokenStorageProvider` does not expose an enumeration API — all token discovery goes through `PaymentsModule`. All invoice data (terms, creator, targets, etc.) is read from the token's `genesis.data.tokenData` field.
 
 ### 7.2 Termination Storage
 
 Since termination (close/cancel) is local-only (not encoded in the token), per-address keys track terminated invoice IDs and their frozen balances:
 
-Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
+Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`. Full storage keys are built via
+`getAddressStorageKey(addressId, key)` which produces `{addressId}_{key}` format
+(e.g., `DIRECT_abc123_xyz789_cancelled_invoices`). Note: no `sphere_` prefix — the
+existing SDK pattern uses the addressId directly as the prefix. Storage access uses
+`storage.get(key)` / `storage.set(key, value)` (not `getItem`/`setItem`).
+
+The per-invoice ledger keys use a colon separator (`inv_ledger:{invoiceId}`) which
+is distinct from the underscore separator in address-scoped keys. This is safe because
+invoiceIds are 64-char hex (no colons or underscores) and the colon cannot collide
+with any existing key pattern.
 
 ```typescript
 /** Cancelled invoice IDs (JSON string array) */
@@ -2923,11 +2967,15 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 // pairs, each requires a PaymentsModule.send() network call. To bound query
 // latency, the implicit close path MUST process at most MAX_SYNC_RETURNS (10)
 // surplus pairs synchronously within the gate. Any remaining surplus pairs are
-// queued for async processing via setTimeout(0) (still serialized through the
-// per-invoice gate). This caps worst-case query latency to ~600s (10 * 60s send
-// timeout). Connect hosts SHOULD set response timeouts accordingly (recommended:
-// 120s — if more than 2 surplus pairs exist, the query returns after processing
-// the first batch and remaining auto-returns complete asynchronously).
+// queued as separate gate entries via setTimeout(0), each re-acquiring the
+// per-invoice gate independently. The query returns after the synchronous batch
+// completes. The remaining auto-returns execute asynchronously and may interleave
+// with other gated operations on the same invoice (the gate is NOT held
+// continuously across the setTimeout boundary). This caps worst-case synchronous
+// query latency to ~600s (10 * 60s send timeout). Connect hosts SHOULD set
+// response timeouts accordingly (recommended: 120s — if more than 2 surplus
+// pairs exist, the query returns after the first batch and remaining auto-returns
+// complete asynchronously).
 {
   method: 'sphere_getInvoiceStatus',
   params: { invoiceId: 'abc123...' }
@@ -3077,14 +3125,13 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_DATA` | Cannot parse invoice terms from token data | Corrupt tokenData |
 | `INVOICE_ALREADY_EXISTS` | Invoice token already exists locally | Duplicate import |
 | `INVOICE_NOT_FOUND` | Invoice token not found | Unknown invoiceId |
-| `INVOICE_NOT_TARGET` | Only a target party can close or cancel this invoice | Close or cancel by non-target party. |
+| `INVOICE_NOT_TARGET` | Only a target party can perform this operation | Close, cancel, or return by non-target party |
 | `INVOICE_ALREADY_CLOSED` | Invoice is already closed | Close/cancel after CLOSED |
 | `INVOICE_ALREADY_CANCELLED` | Invoice is already cancelled | Close/cancel after CANCELLED |
 | `INVOICE_ORACLE_REQUIRED` | Oracle provider required for invoice minting | No oracle configured |
 | `INVOICE_TERMINATED` | Cannot pay a terminated invoice (closed or cancelled) | Forward payment to terminated invoice |
 | `INVOICE_INVALID_TARGET` | Invalid target index | Out-of-bounds targetIndex in payInvoice |
 | `INVOICE_INVALID_ASSET_INDEX` | Invalid asset index | Out-of-bounds assetIndex in payInvoice |
-| `INVOICE_NOT_TARGET` | Only invoice target parties can send return payments | Return from non-target wallet address |
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the per-sender net balance for (target, sender, coinId). Returns MUST NOT cause returnedAmount to exceed coveredAmount. | Excessive return to a specific sender |
 | `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
