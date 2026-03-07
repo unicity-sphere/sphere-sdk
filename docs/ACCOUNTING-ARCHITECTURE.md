@@ -50,7 +50,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |                                 |  (TXF format)  | Index:          |  |
 |                                 |                | inv_ledger:*    |  |
 |                                 |                | inv_ledger_index|  |
-|                                 |                | processed_*     |  |
+|                                 |                | token_scan_state|  |
 |                                 +----------------+-----------------+  |
 +----------------------------------------------------------------------+
 ```
@@ -171,13 +171,14 @@ The accounting module must handle this:
 For a given invoice target and asset (e.g., target `DIRECT://alice`, asset `UCT`):
 
 ```
-netCoveredAmount = sum(forward payments referencing this invoice for this target:asset)
-                 - sum(back/return payments referencing this invoice for this target:asset)
+coveredAmount    = sum(forward payments referencing this invoice for this target:asset)
+returnedAmount   = sum(back/return payments referencing this invoice for this target:asset)
+netCoveredAmount = max(0, coveredAmount - returnedAmount)   // floored at zero
 ```
 
 Key rules:
 
-1. **Only memo-referenced transfers count.** A transfer affects an invoice balance if and only if its memo contains `INV:<invoiceId>` referencing that invoice. The mere presence or absence of tokens in the wallet is irrelevant.
+1. **Only invoice-referenced transfers count.** A transfer affects an invoice balance if and only if its on-chain `TransferMessagePayload.inv.id` (or, for legacy transfers, its transport memo `INV:<invoiceId>`) references that invoice. The mere presence or absence of tokens in the wallet is irrelevant.
 
 2. **Spending received tokens is independent.** A recipient can freely spend tokens received for a partially covered (or even uncovered) invoice without affecting that invoice's balances. The invoice accounting tracks memo-referenced transfers, not token ownership chains.
 
@@ -351,7 +352,7 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 4. **Complete:** Update ledger entry to `status: 'completed'` with `returnTransferId`.
 5. Fire `invoice:auto_returned` event.
 
-On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found and `retryCount < 5`, increment retryCount and retry using the persisted `recipient`, `amount`, `coinId`, and `memo` fields from the ledger entry; if `retryCount >= 5`, transition to `failed` status and fire `invoice:auto_return_failed` with reason `'max_retries_exceeded'`. Failed entries are terminal until re-enabled via `setAutoReturn(invoiceId, true)` which resets retryCount and status to `pending`. These fields are written at intent time (step 2) specifically to enable retry without re-deriving from the original transfer. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
+On crash recovery (during `load()`), scan the ledger for `pending` entries. For each, check if the return transfer actually landed (via `getHistory()`): if found, update to `completed`; if not found and `retryCount < 5`, increment retryCount and retry using the persisted `recipient`, `amount`, `coinId`, and `memo` fields from the ledger entry; if `retryCount >= 5`, transition to `failed` status and fire `invoice:auto_return_failed` with reason `'max_retries_exceeded'`. If sender address resolution fails, fire `invoice:auto_return_failed` with reason `'sender_unresolvable'` — the dedup ledger is NOT written, so the return will be retried on the next trigger. If `PaymentsModule.send()` throws, fire `invoice:auto_return_failed` with reason `'send_failed'` and increment retryCount. Failed entries are terminal until re-enabled via `setAutoReturn(invoiceId, true)` which resets retryCount and status to `pending`. These fields are written at intent time (step 2) specifically to enable retry without re-deriving from the original transfer. This makes duplicate returns impossible — the intent is recorded before the send, so re-delivery of the original event hits step 1 and skips. All steps execute within the per-invoice serialization gate.
 
 **Secondary dedup (defense-in-depth):** Before executing any auto-return send, check `getHistory()` for an existing outbound `:RC`/`:RX` transfer matching `(invoiceId, originalTransferId)` — the `originalTransferId` is stored in the auto-return memo's freeText field and extracted via `parseInvoiceMemo()`. This per-transfer match prevents false-positive dedup when the same sender makes multiple forward payments for the same coinId. Catches duplicates when ledger entries have been pruned (completed entries are pruned after 30 days on `load()`).
 
@@ -418,13 +419,14 @@ The accounting module wraps all its inbound event processing in try/catch guards
 Status is **computed on-demand** for non-terminal invoices. For terminal invoices, persisted frozen balances are returned. The `getInvoiceStatus()` method:
 
 1. Reads the invoice terms from the token's genesis `tokenData`
-2. Checks if the invoice is in a terminal state (CLOSED or CANCELLED) — if so, returns the persisted frozen status
-3. Scans transaction history of **all active and sent tokens** (`PaymentsModule.getHistory()`) for memo-matched transfers
-4. Aggregates forward and back payments per target per asset
+2. Checks if the invoice is in a terminal state (CLOSED or CANCELLED) — if so, returns the persisted frozen status (but `allConfirmed` is still dynamically derived)
+3. Reads from the **in-memory invoice-transfer index** (`invoiceLedger`) — NOT from `PaymentsModule.getHistory()`. The index is populated at load time and kept current by `transfer:incoming` / `transfer:confirmed` event handlers (see §3.7.2)
+4. Aggregates forward and back/return payments per target per asset from the index entries
 5. Computes `netCoveredAmount = max(0, coveredAmount - returnedAmount)` for each target:asset
 6. Determines which targets are covered, partially covered, or untouched
-7. Checks confirmation status of all related tokens
-8. Returns the computed `InvoiceStatus` object
+7. If all targets are COVERED and all related transfers are confirmed, enters the per-invoice gate to re-verify and perform implicit close (freeze balances, persist terminal state, fire `invoice:closed` then any `invoice:auto_returned` events)
+8. Checks `dueDate` — if past and state would be OPEN/PARTIAL, returns EXPIRED
+9. Returns the computed `InvoiceStatus` object
 
 Each party independently derives invoice status from their own perspective — sender sees what they've sent, receiver sees what they've received.
 
@@ -433,21 +435,24 @@ Each party independently derives invoice status from their own perspective — s
 ### 5.1 Minting Flow
 
 ```
-1. Validate CreateInvoiceRequest
-2. Serialize InvoiceTerms canonically -> deterministic bytes
-3. Generate salt (SHA-256 of signingKey + invoiceBytes)
-4. Create MintTransactionData with:
-   - tokenId: derived from invoice content hash
-   - tokenType: INVOICE_TOKEN_TYPE_HEX (new constant)
-   - coinData: [] (non-fungible, no denomination)
-   - tokenData: serialized InvoiceTerms
-   - recipient: creator's DirectAddress
-5. Create MintCommitment
-6. Submit to aggregator -> wait for inclusion proof
-7. Create Token with proof
-8. Store invoice token via TokenStorageProvider (same as nametag/currency tokens)
-9. Scan existing transaction history for payments referencing this invoice
-10. Fire 'invoice:created' event + any retroactive payment/coverage events
+1.  Validate CreateInvoiceRequest
+2.  Build InvoiceTerms (add createdAt, optionally add creator pubkey)
+3.  Serialize InvoiceTerms canonically -> deterministic bytes (invoiceBytes)
+4.  Generate salt: SHA-256(signingKey || invoiceBytes)
+5.  Derive tokenId: SHA-256(invoiceBytes) -> new TokenId(hash.imprint)
+    (mirrors NametagMinter's TokenId.fromNameTag() pattern)
+6.  Create MintTransactionData with:
+    - tokenId from step 5
+    - tokenType: INVOICE_TOKEN_TYPE_HEX
+    - coinData: [] (non-fungible)
+    - tokenData: invoiceBytes
+    - recipient: creator's DirectAddress
+7.  Create MintCommitment, submit to aggregator
+8.  waitInclusionProof() -> commitment.toTransaction()
+9.  UnmaskedPredicate.create() -> Token.mint() or Token.fromJSON()
+10. Store invoice token via TokenStorageProvider
+11. Scan existing token transaction histories for payments referencing this invoice
+12. Fire 'invoice:created' event + any retroactive payment/coverage events
 ```
 
 ### 5.2 Why Mint?
@@ -492,12 +497,12 @@ INV:<invoiceId>[:<direction>] [optional free text]
 
 ### 6.2 Direction Semantics
 
-| Direction | Code | Meaning | Affects balance | Auto-returnable | Who can send |
-|-----------|------|---------|-----------------|-----------------|--------------|
-| Forward | `:F` (or omitted) | Payment towards covering the invoice | +coveredAmount (increases net) | Yes (if invoice terminated) | Anyone |
-| Back | `:B` | Manual return/refund | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
-| Return-for-closed | `:RC` | Auto-return because invoice is closed | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
-| Return-for-cancelled | `:RX` | Auto-return because invoice is cancelled | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
+| Direction | On-chain `dir` | Transport memo | Meaning | Affects balance | Auto-returnable | Who can send |
+|-----------|---------------|----------------|---------|-----------------|-----------------|--------------|
+| Forward | `F` (or omitted) | `:F` | Payment towards covering the invoice | +coveredAmount (increases net) | Yes (if invoice terminated) | Anyone |
+| Back | `B` | `:B` | Manual return/refund | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
+| Return-for-closed | `RC` | `:RC` | Auto-return because invoice is closed | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
+| Return-for-cancelled | `RX` | `:RX` | Auto-return because invoice is cancelled | +returnedAmount (decreases net) | **No** (never auto-returned) | **Target only** |
 
 All return directions (`:B`, `:RC`, `:RX`) have the same effect on balance computation — they increase `returnedAmount`, which decreases the net covered balance. The distinction between `:B`, `:RC`, and `:RX` is semantic: it communicates _why_ the tokens were returned.
 
@@ -520,7 +525,7 @@ The AccountingModule registers a memo parser that extracts:
 - `direction` — `'forward'` (F or default), `'back'` (B), `'return_closed'` (RC), or `'return_cancelled'` (RX)
 - `freeText` — remaining memo content
 
-No changes to `TransferRequest`, `PaymentsModule`, or the transport layer are needed.
+No changes to `TransferRequest` or the transport layer are needed. However, `PaymentsModule.send()` **must be modified** to encode `TransferRequest.memo` into the on-chain `TransferTransactionData.message` field (see §3.7.1).
 
 **Memo injection defense:** The `INV:` memo field is user-controlled — any sender can write any memo. The canonical parser (`parseInvoiceMemo()`) is the sole authority for extracting invoice references. The parser validates the invoice ID format (64-char hex `[0-9a-fA-F]{64}` — guaranteed colon-free and space-free by the SHA-256 derivation), rejects malformed prefixes, and normalizes direction codes. Invalid or unrecognized formats are ignored (treated as non-invoice transfers). Direction codes from untrusted senders are validated against sender identity (see §6.2 sender restriction) before being accepted. Applications MUST NOT parse invoice memos manually — always use `parseInvoiceMemo()`.
 
@@ -590,18 +595,18 @@ This retroactive evaluation is safe because all events are idempotent — re-fir
 
 Invoice tokens are stored via `TokenStorageProvider` — the **same** storage used for nametag tokens and currency tokens. Since all invoice terms live in the token's genesis `tokenData`, no separate metadata storage is needed.
 
-Additional per-address storage keys:
+Additional per-address storage keys (the `StorageProvider` handles key scoping — the module passes only the constant suffix, e.g., `storage.set(STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES, ...)`. The `sphere_{addressId}_` prefix shown below is the **IndexedDB** provider's convention; `FileStorageProvider` uses `{addressId}_` without the `sphere_` prefix):
 
-| Storage Key | Scope | Content |
+| Storage Key (logical) | Scope | Content |
 |------------|-------|---------|
-| `sphere_{addressId}_cancelled_invoices` | Per-address | Set of cancelled invoice IDs (JSON array) |
-| `sphere_{addressId}_closed_invoices` | Per-address | Set of explicitly closed invoice IDs (JSON array) |
-| `sphere_{addressId}_frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
-| `sphere_{addressId}_auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
-| `sphere_{addressId}_auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
-| `sphere_{addressId}_inv_ledger_index` | Per-address | Invoice ledger directory: `Record<invoiceId, { terminated, frozenAt? }>` |
-| `sphere_{addressId}_inv_ledger:{invoiceId}` | Per-address, per-invoice | Partitioned invoice-transfer index: `InvoiceTransferRef[]` for one invoice |
-| `sphere_{addressId}_token_scan_state` | Per-address | Token transaction scan watermark: `Record<tokenId, lastScannedIndex>` (JSON object) |
+| `cancelled_invoices` | Per-address | Set of cancelled invoice IDs (JSON array) |
+| `closed_invoices` | Per-address | Set of explicitly closed invoice IDs (JSON array) |
+| `frozen_balances` | Per-address | Frozen balance snapshots for terminated invoices (JSON map) |
+| `auto_return` | Per-address | Auto-return settings: per-invoice flags and global flag (JSON) |
+| `auto_return_ledger` | Per-address | Auto-return deduplication ledger: tracks which transfers have been returned (JSON) |
+| `inv_ledger_index` | Per-address | Invoice ledger directory: `Record<invoiceId, { terminated: boolean, frozenAt?: number }>` |
+| `inv_ledger:{invoiceId}` | Per-address, per-invoice | Partitioned invoice-transfer index: `InvoiceTransferRef[]` for one invoice |
+| `token_scan_state` | Per-address | Token transaction scan watermark: `Record<tokenId, txCount>` — number of transactions already processed per token (JSON object) |
 
 Added to `STORAGE_KEYS_ADDRESS` in `constants.ts`:
 
@@ -634,8 +639,10 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:overpayment` | `{ invoiceId, address, coinId, surplus, confirmed }` | Payment exceeds requested amount |
 | `invoice:irrelevant` | `{ invoiceId, transfer, reason, confirmed }` | Transfer references this invoice but doesn't match any target address or requested asset |
 | `invoice:auto_returned` | `{ invoiceId, originalTransfer, returnTransfer }` | Tokens were auto-returned for a terminated invoice |
-| `invoice:auto_return_failed` | `{ invoiceId, transferId, reason }` | Auto-return failed (sender unresolvable or send failed) |
-| `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return (`:RC` or `:RX`) — may trigger auto-termination |
+| `invoice:auto_return_failed` | `{ invoiceId, transferId, reason }` | Auto-return failed — `reason`: `'sender_unresolvable'` \| `'send_failed'` \| `'max_retries_exceeded'` |
+| `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return — `returnReason`: `'closed'` (from `:RC`) \| `'cancelled'` (from `:RX`). May trigger auto-termination |
+
+**Event ordering guarantee:** `invoice:closed` fires BEFORE any `invoice:auto_returned` events, for both explicit close (via `closeInvoice()`) and implicit close (all targets covered + all confirmed). This ensures listeners can react to the close before seeing the auto-return consequences.
 
 ### 7.6 Idempotent Event Re-Firing
 

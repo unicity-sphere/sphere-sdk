@@ -809,7 +809,8 @@ const terms: InvoiceTerms = {
   targets: request.targets,
 };
 const invoiceBytes = canonicalSerialize(terms);
-const tokenId = TokenId.fromData(invoiceBytes);
+const hash = await new DataHasher(HashAlgorithm.SHA256).update(invoiceBytes).digest();
+const tokenId = new TokenId(hash.imprint);
 ```
 
 ### 3.2 Minting Flow (Mirrors NametagMinter)
@@ -1014,7 +1015,7 @@ function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
   }
 
   // Invoice IDs are always stored and compared in lowercase hex.
-  // TokenId.fromData() produces lowercase hex; this normalization ensures
+  // TokenId constructor produces lowercase hex via DataHasher; this normalization ensures
   // that case-insensitive memo input matches storage lookups.
   // Truncate inbound freeText to 1024 code points. buildInvoiceMemo() caps
   // outbound at 256, but inbound memos from untrusted senders may be
@@ -1241,14 +1242,18 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
 **The core formula for each target:asset:**
 
 ```
-coveredAmount  = SUM(amount) for all transfers WHERE:
-                 - memo matches INV:<invoiceId>:F (or INV:<invoiceId> without suffix)
-                 - destination matches target.address
-                 - coinId matches asset.coin[0]
+coveredAmount  = SUM(amount) for all InvoiceTransferRef entries WHERE:
+                 - ref.invoiceId == invoiceId AND ref.direction == 'forward'
+                   (on-chain: TransferMessagePayload.inv.dir == 'F' or omitted;
+                    legacy fallback: transport memo matches INV:<invoiceId>:F)
+                 - ref.destination matches target.address
+                 - ref.coinId matches asset.coin[0]
 
-returnedAmount = SUM(amount) for all transfers WHERE:
-                 - memo matches INV:<invoiceId>:B or :RC or :RX
-                 - sender matches target.address (returns flow FROM target TO payer)
+returnedAmount = SUM(amount) for all InvoiceTransferRef entries WHERE:
+                 - ref.invoiceId == invoiceId AND ref.direction in ('back', 'return_closed', 'return_cancelled')
+                   (on-chain: TransferMessagePayload.inv.dir in ('B', 'RC', 'RX');
+                    legacy fallback: transport memo matches INV:<invoiceId>:B or :RC or :RX)
+                 - ref.senderAddress matches target.address (returns flow FROM target TO payer)
                    NOTE: For inbound return transfers, the sender is identified via
                    the transfer's senderPubkey/senderAddress fields. For outbound
                    return transfers (sent by this wallet), the sender is this wallet's
@@ -1372,7 +1377,12 @@ processTokenTransactions(token: Token, startIndex: number):
 
     5. Resolve sender/recipient from tx.data:
        recipientAddress = (tx.data as any)?.recipient   // TransferTransactionData.recipient
-       senderAddress = derived from tx.predicate or previous state owner
+       senderAddress = derived from tx.predicate via UnmaskedPredicate.fromCBOR()
+       // The predicate encodes the owner's public key. Deserialize with
+       // UnmaskedPredicate.fromCBOR(hexToBytes(tx.predicate)) to extract
+       // the public key, then derive the DIRECT:// address from it.
+       // For the first transaction, the genesis recipient serves as a
+       // fallback if predicate decoding fails.
 
     6. For each [coinId, amount] in coinData:
        a. Skip if amount === "0"
