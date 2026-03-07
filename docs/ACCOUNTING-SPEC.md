@@ -166,9 +166,21 @@ type InvoiceState = 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'E
  * Tracks how much this sender has forwarded and how much has been returned to them.
  */
 interface InvoiceSenderBalance {
-  /** Sender's DIRECT:// address */
+  /**
+   * Effective sender address (DIRECT:// format).
+   * This is the per-sender balance key: `senderAddress ?? refundAddress` from the
+   * transfer's InvoiceTransferRef. When the original sender used a masked predicate,
+   * this field contains the refund address (if provided), NOT the actual sender address.
+   * Use `isRefundAddress` to distinguish.
+   */
   readonly senderAddress: string;
-  /** Sender's chain pubkey (if known) */
+  /**
+   * True when `senderAddress` actually contains a refund address (the original sender
+   * used a masked predicate and provided `inv.ra`). False or undefined when the
+   * senderAddress was derived from an unmasked predicate.
+   */
+  readonly isRefundAddress?: boolean;
+  /** Sender's chain pubkey (if known — null when isRefundAddress is true) */
   readonly senderPubkey?: string;
   /** Sender's nametag (if known) */
   readonly senderNametag?: string;
@@ -673,6 +685,14 @@ class AccountingModule {
    * A target cannot return more to a sender than that sender originally sent.
    * Throws INVOICE_RETURN_EXCEEDS_BALANCE if the amount exceeds this cap.
    *
+   * IMPORTANT: `params.recipient` must match the effective sender address used for
+   * per-sender balance keying (see §5.2 effectiveSender). For masked-predicate
+   * senders who provided a refund address, this means passing the REFUND ADDRESS
+   * (not the null sender address). Use `InvoiceSenderBalance.senderAddress` from
+   * the invoice status as the source of truth for this value. When
+   * `InvoiceSenderBalance.isRefundAddress` is true, the senderAddress field
+   * contains the refund address.
+   *
    * @param invoiceId - The invoice token ID
    * @param params - { recipient, amount, coinId, freeText? }
    * @returns TransferResult from PaymentsModule.send()
@@ -816,6 +836,11 @@ interface PayInvoiceParams {
    * This address is NOT included in the transport memo (privacy: transport
    * memos are human-readable). It is only recorded on-chain in the
    * structured `inv.ra` field of the TransferMessagePayload.
+   *
+   * Privacy note: while the refund address is not in the memo, it IS the
+   * recipient of auto-return transfers and therefore visible in the transport
+   * layer's addressing metadata (Nostr NIP-04/NIP-17 envelope), as with any
+   * transfer recipient.
    *
    * Auto-return destination priority: refundAddress → senderAddress → fail.
    */
@@ -1080,7 +1105,9 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
       // Lenient inbound parsing for refund address: strip silently if unparseable.
       // Outbound validation is strict (INVOICE_INVALID_REFUND_ADDRESS in payInvoice).
       if (parsed.inv.ra !== undefined) {
-        if (typeof parsed.inv.ra !== 'string' || !parsed.inv.ra.startsWith('DIRECT://')) {
+        if (typeof parsed.inv.ra !== 'string'
+            || !parsed.inv.ra.startsWith('DIRECT://')
+            || parsed.inv.ra.length <= 'DIRECT://'.length) {
           delete parsed.inv.ra; // silently strip malformed refund address
         }
       }
@@ -1480,6 +1507,8 @@ surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 The aggregate formula above is used for coverage computation (`isCovered`, `surplusAmount`). In addition, balances are tracked per `(target, effectiveSender, coinId)` tuple for return cap enforcement and auto-return distribution:
 
 **Effective sender:** `effectiveSender = ref.senderAddress ?? ref.refundAddress`. When the sender uses a masked predicate (one-time address), `senderAddress` is null. If the sender included a refund address in the on-chain payload (`inv.ra`), it substitutes as the sender identity for per-sender balance keying. If both are null, the entry is excluded from per-sender tracking (but still counted in aggregate coverage). This ensures masked-predicate payers who provide a refund address are trackable for return cap enforcement and auto-return distribution.
+
+**Known limitation (effective sender collisions):** Because `effectiveSender` falls back to `refundAddress`, two distinct economic actors can share a per-sender balance bucket if they resolve to the same effective address. This occurs when: (a) two masked-predicate payers provide the same refund address — their forward payments merge into one bucket; (b) a masked-predicate payer provides a refund address that matches another payer's actual `senderAddress` — their balances conflate. In both cases, the return cap is computed against the combined balance and auto-returns flow to the shared address. This is **not exploitable for theft** — an attacker who spoofs another sender's address as their refund address loses their own funds irrecoverably (returns go to that address, not to the attacker). The aggregate coverage computation (`coveredAmount`, `isCovered`, `surplusAmount`) is unaffected — only per-sender return cap and auto-return distribution are impacted. Applications requiring strict per-payer accounting with masked predicates should use out-of-band identity verification.
 
 ```
 effectiveSender = ref.senderAddress ?? ref.refundAddress
@@ -2489,13 +2518,28 @@ interface FrozenCoinAssetBalances {
 }
 
 interface FrozenSenderBalance {
+  /**
+   * Effective sender address (DIRECT:// format) — the per-sender balance key.
+   * When `isRefundAddress` is true, this contains the refund address (the original
+   * sender used a masked predicate). See InvoiceSenderBalance.senderAddress for details.
+   */
   readonly senderAddress: string;
+  /**
+   * True when `senderAddress` actually contains a refund address.
+   * See InvoiceSenderBalance.isRefundAddress for semantics.
+   */
+  readonly isRefundAddress?: boolean;
   readonly senderPubkey?: string;
   /**
    * Refund address from the sender's on-chain TransferMessagePayload `inv.ra` field.
    * Persisted at freeze time to enable crash recovery of auto-return destination
    * resolution (refundAddress → senderAddress → fail) without re-parsing the
    * on-chain payload. Only present if the sender included a refund address.
+   *
+   * NOTE: When `isRefundAddress` is true, `refundAddress` equals `senderAddress`
+   * (both contain the refund address). When `isRefundAddress` is false/undefined,
+   * `refundAddress` is informational only — auto-return routing uses `senderAddress`
+   * (the real sender address from the unmasked predicate) as the destination.
    */
   readonly refundAddress?: string;
   /** Returnable balance baseline at freeze time */
@@ -2966,7 +3010,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Invoice must NOT be in a terminal state (CLOSED or CANCELLED) | `INVOICE_TERMINATED` |
 | `targetIndex` must be valid | `INVOICE_INVALID_TARGET` |
 | `assetIndex` must be valid (if provided) | `INVOICE_INVALID_ASSET_INDEX` |
-| If `refundAddress` is provided, it must be a valid `DIRECT://` address (strict outbound validation) | `INVOICE_INVALID_REFUND_ADDRESS` |
+| If `refundAddress` is provided, it must be a valid `DIRECT://` address: starts with `DIRECT://` AND has content after the prefix (`length > 'DIRECT://'.length`). Reuse the same address validation that `PaymentsModule.send()` applies to recipient addresses. | `INVOICE_INVALID_REFUND_ADDRESS` |
 
 **Downstream errors:** `payInvoice()` and `returnInvoicePayment()` delegate to `PaymentsModule.send()`, which may throw its own errors (insufficient balance, network failure, etc.). These errors pass through to the caller unchanged — the accounting module does not wrap them.
 
