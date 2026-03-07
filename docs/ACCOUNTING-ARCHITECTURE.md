@@ -221,8 +221,10 @@ Invoice references are recorded **on-chain** in the `TransferTransactionData.mes
 
 The on-chain `message` carries a structured `TransferMessagePayload`:
 ```
-{ inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX" }, txt?: "..." }
+{ inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX", ra?: "<DIRECT://...>" }, txt?: "..." }
 ```
+
+The optional `ra` (refund address) field provides a stable return destination for masked-predicate payers whose sender address becomes unresolvable after the transfer. It is set by the payer via `payInvoice({ refundAddress })` and is NOT included in the transport memo (privacy: transport memos are human-readable). Auto-return destination priority: `ra` → sender address → fail.
 
 **PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode the memo into the on-chain message field **for invoice-related transfers only**. For invoice-related memos (`INV:` prefix), the on-chain message carries the structured `TransferMessagePayload` JSON (not the raw memo text). Non-invoice memos are NOT encoded on-chain — they remain transport-only (Nostr) to avoid permanently recording private user text on-chain. See ACCOUNTING-SPEC.md §4.7 for the `parseInvoiceMemoForOnChain()` helper. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
 
@@ -362,7 +364,8 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 1. An incoming forward payment with memo `INV:<id>:F` arrives for a terminated invoice.
 2. If auto-return is enabled for this invoice (or globally), and the local wallet is an invoice target:
    - The incoming transfer is processed normally (recorded in history).
-   - The module invokes `PaymentsModule.send()` to return the tokens to **the sender of that specific transfer** (not aggregated across senders).
+   - **Return destination resolution:** `ref.refundAddress ?? ref.senderAddress`. If both are null (masked predicate with no refund address), the auto-return fires `invoice:auto_return_failed` with reason `'sender_unresolvable'` and is skipped.
+   - The module invokes `PaymentsModule.send()` to return the tokens to the resolved destination address (not aggregated across senders).
    - **CLOSED invoice:** The entire incoming amount is returned to that sender (the invoice is already satisfied — any new payment is surplus by definition).
    - **CANCELLED invoice:** The entire incoming amount is returned to that sender (the deal is abandoned).
    - The return memo uses `INV:<id>:RC` (if invoice is CLOSED) or `INV:<id>:RX` (if CANCELLED).

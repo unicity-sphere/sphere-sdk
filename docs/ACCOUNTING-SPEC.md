@@ -282,6 +282,13 @@ interface InvoiceTransferRef {
    *  detection or return matching — they are indexed but treated as
    *  having an unknown sender for balance purposes. */
   readonly senderAddress: string | null;
+  /**
+   * Refund address extracted from the on-chain TransferMessagePayload `inv.ra` field.
+   * Provides a stable return destination when the sender uses a masked predicate
+   * (one-time address) that becomes unresolvable after the transfer.
+   * Undefined if not present in the on-chain payload.
+   */
+  readonly refundAddress?: string;
   /** Sender chain pubkey (null if predicate is masked) */
   readonly senderPubkey?: string | null;
   /** Sender nametag */
@@ -634,11 +641,17 @@ class AccountingModule {
    * The terminal-state check acquires the per-invoice gate to prevent TOCTOU
    * races with concurrent implicit close. The gate is released before send().
    *
+   * If `params.refundAddress` is provided, it is validated as a DIRECT:// address
+   * and embedded in the on-chain TransferMessagePayload (`inv.ra` field). This
+   * provides a stable return destination for masked-predicate payers whose
+   * sender address becomes unresolvable after the transfer.
+   *
    * @param invoiceId - The invoice token ID
-   * @param params - { targetIndex, assetIndex?, amount?, freeText? }
+   * @param params - { targetIndex, assetIndex?, amount?, freeText?, refundAddress? }
    * @returns TransferResult from PaymentsModule.send()
    * @throws SphereError with INVOICE_TERMINATED if invoice is CLOSED or CANCELLED
    * @throws SphereError with INVOICE_NOT_FOUND if invoice not found
+   * @throws SphereError with INVOICE_INVALID_REFUND_ADDRESS if refundAddress is malformed
    */
   async payInvoice(invoiceId: string, params: PayInvoiceParams): Promise<TransferResult>;
 
@@ -794,6 +807,19 @@ interface PayInvoiceParams {
   readonly amount?: string;
   /** Optional free text appended to memo */
   readonly freeText?: string;
+  /**
+   * Optional refund address (DIRECT:// format) embedded in the on-chain
+   * TransferMessagePayload. Provides a stable return destination when the
+   * payer uses a masked predicate (one-time address) that becomes
+   * unresolvable after the transfer.
+   *
+   * This address is NOT included in the transport memo (privacy: transport
+   * memos are human-readable). It is only recorded on-chain in the
+   * structured `inv.ra` field of the TransferMessagePayload.
+   *
+   * Auto-return destination priority: refundAddress → senderAddress → fail.
+   */
+  readonly refundAddress?: string;
 }
 
 /**
@@ -992,6 +1018,18 @@ interface TransferMessagePayload {
     readonly id: string;
     /** Direction code: F=forward, B=back, RC=return-closed, RX=return-cancelled */
     readonly dir: 'F' | 'B' | 'RC' | 'RX';
+    /**
+     * Refund address (DIRECT:// format, optional).
+     * Provides a stable return destination when the payer uses a masked
+     * predicate (one-time address) that becomes unresolvable after the transfer.
+     * Set by the payer via `payInvoice({ refundAddress })`.
+     *
+     * Auto-return destination priority: ra → sender address → fail.
+     *
+     * NOT included in the transport memo (privacy: transport memos are
+     * human-readable, on-chain payload is structured).
+     */
+    readonly ra?: string;
   };
   /** Human-readable text (optional, max 256 code points) */
   readonly txt?: string;
@@ -1039,6 +1077,13 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
       if (parsed.inv.dir !== undefined && !['F', 'B', 'RC', 'RX'].includes(parsed.inv.dir)) {
         return null; // unknown direction code
       }
+      // Lenient inbound parsing for refund address: strip silently if unparseable.
+      // Outbound validation is strict (INVOICE_INVALID_REFUND_ADDRESS in payInvoice).
+      if (parsed.inv.ra !== undefined) {
+        if (typeof parsed.inv.ra !== 'string' || !parsed.inv.ra.startsWith('DIRECT://')) {
+          delete parsed.inv.ra; // silently strip malformed refund address
+        }
+      }
     }
     // Truncate inbound txt to 1024 code points to bound index cache and
     // event payload size. Outbound is capped at 256 by buildInvoiceMemo(),
@@ -1072,7 +1117,9 @@ All return directions (`B`, `RC`, `RX`) have the same effect on balance computat
 
 ### 4.3 Transport Memo Format (Secondary)
 
-The Nostr transport memo uses a text format for human-readable display and backward compatibility with pre-accounting-module transfers:
+The Nostr transport memo uses a text format for human-readable display and backward compatibility with pre-accounting-module transfers.
+
+**NOTE:** The refund address (`inv.ra`) is NOT included in the transport memo. It is only recorded on-chain in the structured `TransferMessagePayload`. This preserves privacy — transport memos are human-readable and may be visible to relay operators, while the on-chain payload is structured data embedded in the cryptographic proof chain.
 
 ```
 invoice-memo  = "INV:" invoice-id [ ":" direction ] [ " " free-text ]
@@ -1179,7 +1226,7 @@ const commitment = await TransferCommitment.create(
 // For invoice-related transfers, the memo contains the INV: text format.
 // The on-chain message carries a structured JSON TransferMessagePayload.
 // PaymentsModule.send() must detect invoice memos and encode accordingly:
-const payload = parseInvoiceMemoForOnChain(request.memo);
+const payload = parseInvoiceMemoForOnChain(request.memo, request.refundAddress);
 // parseInvoiceMemoForOnChain returns:
 //   - TransferMessagePayload JSON bytes if memo is INV: format
 //   - null if no memo or if memo is non-invoice (non-invoice memos stay
@@ -1196,14 +1243,22 @@ const commitment = await TransferCommitment.create(
 **`parseInvoiceMemoForOnChain()` helper (in PaymentsModule):**
 
 ```typescript
-function parseInvoiceMemoForOnChain(memo: string | undefined): Uint8Array | null {
+function parseInvoiceMemoForOnChain(
+  memo: string | undefined,
+  refundAddress?: string
+): Uint8Array | null {
   if (!memo) return null;
   const ref = parseInvoiceMemo(memo);
   if (ref) {
     // Invoice-related: encode as structured TransferMessagePayload
     const dirMap = { forward: 'F', back: 'B', return_closed: 'RC', return_cancelled: 'RX' } as const;
+    const inv: TransferMessagePayload['inv'] = {
+      id: ref.invoiceId,
+      dir: dirMap[ref.paymentDirection],
+      ...(refundAddress ? { ra: refundAddress } : {}),
+    };
     const payload: TransferMessagePayload = {
-      inv: { id: ref.invoiceId, dir: dirMap[ref.paymentDirection] },
+      inv,
       ...(ref.freeText ? { txt: ref.freeText } : {}),
     };
     return new TextEncoder().encode(JSON.stringify(payload));
@@ -1422,19 +1477,23 @@ surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 
 **Per-sender balance (for return cap enforcement and auto-return distribution):**
 
-The aggregate formula above is used for coverage computation (`isCovered`, `surplusAmount`). In addition, balances are tracked per `(target, sender, coinId)` tuple for return cap enforcement and auto-return distribution:
+The aggregate formula above is used for coverage computation (`isCovered`, `surplusAmount`). In addition, balances are tracked per `(target, effectiveSender, coinId)` tuple for return cap enforcement and auto-return distribution:
+
+**Effective sender:** `effectiveSender = ref.senderAddress ?? ref.refundAddress`. When the sender uses a masked predicate (one-time address), `senderAddress` is null. If the sender included a refund address in the on-chain payload (`inv.ra`), it substitutes as the sender identity for per-sender balance keying. If both are null, the entry is excluded from per-sender tracking (but still counted in aggregate coverage). This ensures masked-predicate payers who provide a refund address are trackable for return cap enforcement and auto-return distribution.
 
 ```
+effectiveSender = ref.senderAddress ?? ref.refundAddress
+
 senderForwarded = SUM(amount) for all InvoiceTransferRef entries WHERE:
                   - ref.paymentDirection == 'forward'
                   - ref.destinationAddress == target.address
-                  - ref.senderAddress == sender
+                  - (ref.senderAddress ?? ref.refundAddress) == effectiveSender
                   - ref.coinId == coinId
 
 senderReturned  = SUM(amount) for all InvoiceTransferRef entries WHERE:
                   - ref.paymentDirection in ('back', 'return_closed', 'return_cancelled')
                   - ref.senderAddress == target.address   (return flows FROM target)
-                  - ref.destinationAddress == sender       (return goes TO original sender)
+                  - ref.destinationAddress == effectiveSender  (return goes TO original sender or refund address)
                   - ref.coinId == coinId
 
 senderNetBalance = max(0, senderForwarded - senderReturned)
@@ -1525,8 +1584,11 @@ private balanceCache: Map<string, InvoiceBalanceSnapshot>;
 interface InvoiceBalanceSnapshot {
   // Aggregate per (target, coinId) — for coverage computation
   aggregate: Map<string, { covered: bigint; returned: bigint }>;  // key = `${targetAddress}::${coinId}`
-  // Per-sender per (target, sender, coinId) — for return cap and auto-return
-  perSender: Map<string, { forwarded: bigint; returned: bigint }>; // key = `${targetAddress}::${senderAddress}::${coinId}`
+  // Per-sender per (target, effectiveSender, coinId) — for return cap and auto-return
+  // effectiveSender = senderAddress ?? refundAddress (refund address substitutes when
+  // sender is unresolvable due to masked predicate). If both are null/undefined,
+  // the entry is excluded from per-sender tracking (but still counted in aggregate).
+  perSender: Map<string, { forwarded: bigint; returned: bigint }>; // key = `${targetAddress}::${effectiveSender}::${coinId}`
 }
 ```
 
@@ -1562,6 +1624,7 @@ async processTokenTransactions(token: Token, startIndex: number): Promise<Invoic
        If payload?.inv is present:
          ref = { invoiceId: payload.inv.id, paymentDirection: mapDir(payload.inv.dir) }
          // mapDir maps: 'F'->'forward', 'B'->'back', 'RC'->'return_closed', 'RX'->'return_cancelled'
+         refundAddress = payload.inv.ra  // string | undefined (already validated by decodeTransferMessage)
        Else:
          // Fallback for legacy transfers (pre-accounting-module):
          // Check HistoryRecord.memo via parseInvoiceMemo() if available.
@@ -1721,6 +1784,7 @@ async processTokenTransactions(token: Token, startIndex: number): Promise<Invoic
           - coinId, amount
           - senderAddress (may be null if predicate was masked),
             destinationAddress
+          - refundAddress (from step 1, may be undefined)
           - timestamp: Date.now()
             // NOTE: TxfAuthenticator does not have a timestamp field.
             // Use the local clock when the transaction is first processed.
@@ -2125,6 +2189,7 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
   invoiceId: string;
   transferId: string;                     // the inbound transfer that could not be returned
   reason: 'sender_unresolvable' | 'send_failed' | 'max_retries_exceeded';
+  refundAddress?: string;                 // if present, shows the refund address that was attempted
 };
 ```
 
@@ -2214,8 +2279,11 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
              ('failed' entries are also skipped here — they are only retried via
              setAutoReturn(), which explicitly resets them to 'pending' first)
            - write dedup ledger entry with status='pending' (intent log)
-           - invoke auto-return: send the entire incoming amount back to the SENDER
-             of this specific transfer. The amount and sender come from the
+           - resolve auto-return destination: `ref.refundAddress ?? ref.senderAddress`.
+             If both are null (masked predicate with no refund address), fire
+             'invoice:auto_return_failed' with reason 'sender_unresolvable' and skip.
+           - invoke auto-return: send the entire incoming amount back to the resolved
+             destination address. The amount and destination come from the
              triggering transfer's own data (passed as context to this handler),
              NOT from a fresh index read. This makes auto-return independent of
              concurrent index mutations by other event handlers.
@@ -2423,6 +2491,13 @@ interface FrozenCoinAssetBalances {
 interface FrozenSenderBalance {
   readonly senderAddress: string;
   readonly senderPubkey?: string;
+  /**
+   * Refund address from the sender's on-chain TransferMessagePayload `inv.ra` field.
+   * Persisted at freeze time to enable crash recovery of auto-return destination
+   * resolution (refundAddress → senderAddress → fail) without re-parsing the
+   * on-chain payload. Only present if the sender included a refund address.
+   */
+  readonly refundAddress?: string;
   /** Returnable balance baseline at freeze time */
   readonly netBalance: string;
 }
@@ -2468,7 +2543,7 @@ interface AutoReturnLedgerEntry {
    * Without these, a 'pending' entry found on load() cannot be retried
    * because the original transfer data may no longer be available.
    */
-  /** Recipient address for the return transfer */
+  /** Recipient address for the return transfer (resolved: refundAddress ?? senderAddress) */
   readonly recipient: string;
   /** Amount to return (smallest units) */
   readonly amount: string;
@@ -2590,6 +2665,10 @@ closeInvoice():
   5. If options.autoReturn:
      -> enable auto-return for this invoice
      -> immediately return SURPLUS ONLY to the latest sender (from step 2b).
+        **Return destination:** For each return, resolve destination as
+        `ref.refundAddress ?? ref.senderAddress`. If both are null (masked
+        predicate with no refund address), fire 'invoice:auto_return_failed'
+        with reason 'sender_unresolvable' and skip that return.
         This is a single return per target:coinId with surplus.
         Dedup key: `(invoiceId, "CLOSE_IMMEDIATE:<targetAddress>:<senderAddress>:<coinId>")`
         follows the same intent-log pattern as ongoing auto-return (§7.5).
@@ -2613,6 +2692,11 @@ cancelInvoice():
      -> immediately return EVERYTHING: decompose into individual returns
         per sender. For each target:coinId, iterate all senders with
         senderNetBalance > 0 and return each sender's full senderNetBalance.
+        **Return destination:** For each sender, resolve destination as
+        `frozenSenderBalance.refundAddress ?? frozenSenderBalance.senderAddress`.
+        If both are null (masked predicate with no refund address), fire
+        'invoice:auto_return_failed' with reason 'sender_unresolvable' and
+        skip that sender's return.
         Each individual return uses a synthetic dedup key:
         `(invoiceId, "CANCEL_IMMEDIATE:<targetAddress>:<senderAddress>:<coinId>")`
         and follows the same intent-log pattern as ongoing auto-return (§7.5).
@@ -2649,7 +2733,10 @@ setAutoReturn():
         to retry failed auto-returns — the ongoing event handler (§6.2 step 5)
         skips both 'completed' and 'failed' entries.
      b. Trigger immediate auto-return for applicable invoices
-     (within per-invoice serialization gate, checking dedup ledger for each):
+     (within per-invoice serialization gate, checking dedup ledger for each).
+     **Return destination resolution** for all auto-return paths:
+     `ref.refundAddress ?? ref.senderAddress`. If both are null, fire
+     'invoice:auto_return_failed' with reason 'sender_unresolvable'.
      - For specific invoiceId: if terminated AND wallet is a target:
        - CLOSED -> return surplus only (per target:asset)
        - CANCELLED -> return everything
@@ -2879,6 +2966,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | Invoice must NOT be in a terminal state (CLOSED or CANCELLED) | `INVOICE_TERMINATED` |
 | `targetIndex` must be valid | `INVOICE_INVALID_TARGET` |
 | `assetIndex` must be valid (if provided) | `INVOICE_INVALID_ASSET_INDEX` |
+| If `refundAddress` is provided, it must be a valid `DIRECT://` address (strict outbound validation) | `INVOICE_INVALID_REFUND_ADDRESS` |
 
 **Downstream errors:** `payInvoice()` and `returnInvoicePayment()` delegate to `PaymentsModule.send()`, which may throw its own errors (insufficient balance, network failure, etc.). These errors pass through to the caller unchanged — the accounting module does not wrap them.
 
@@ -3134,6 +3222,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_ASSET_INDEX` | Invalid asset index | Out-of-bounds assetIndex in payInvoice |
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the per-sender net balance for (target, sender, coinId). Returns MUST NOT cause returnedAmount to exceed coveredAmount. | Excessive return to a specific sender |
 | `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
+| `INVOICE_INVALID_REFUND_ADDRESS` | Refund address must be a valid DIRECT:// address | Malformed `refundAddress` in `payInvoice()` params |
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
