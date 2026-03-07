@@ -221,10 +221,12 @@ Invoice references are recorded **on-chain** in the `TransferTransactionData.mes
 
 The on-chain `message` carries a structured `TransferMessagePayload`:
 ```
-{ inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX", ra?: "<DIRECT://...>" }, txt?: "..." }
+{ inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX", ra?: "<DIRECT://...>", ct?: { a: "<DIRECT://...>", u?: "<URL>" } }, txt?: "..." }
 ```
 
 The optional `ra` (refund address) field provides a stable return destination for masked-predicate payers whose sender address becomes unresolvable after the transfer. It is set by the payer via `payInvoice({ refundAddress })` and is NOT included in the transport memo (privacy: transport memos are human-readable). Auto-return destination priority: `ra` → sender address → fail.
+
+The optional `ct` (contact) field provides payer contact info for future communication between the invoice target and the payer (receipts after close, cancellation notices, payment reminders). `ct.a` is a required DIRECT:// address; `ct.u` is an optional non-Nostr transport URL (https:// or wss://, max 2048 chars). Set by the payer via `payInvoice({ contact })`. When `contact` is not explicitly provided, `payInvoice()` auto-populates it from `identity.directAddress`. Like `ra`, contact is NOT included in the transport memo. Contact is purely informational — it does not affect auto-return routing or balance computation. Per-sender `contacts` (on `InvoiceSenderBalance`) accumulates all unique contact entries from that sender's transfers. Applications SHOULD use the contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null` when needing to reach a payer. **Security:** `contact.address` is self-asserted by the payer — applications MUST NOT trust it as identity verification (see ACCOUNTING-SPEC.md §4.9).
 
 **PaymentsModule.send() change required:** Currently, `TransferCommitment.create()` always receives `null` for the `message` parameter. This must be changed to encode the memo into the on-chain message field **for invoice-related transfers only**. For invoice-related memos (`INV:` prefix), the on-chain message carries the structured `TransferMessagePayload` JSON (not the raw memo text). Non-invoice memos are NOT encoded on-chain — they remain transport-only (Nostr) to avoid permanently recording private user text on-chain. See ACCOUNTING-SPEC.md §4.7 for the `parseInvoiceMemoForOnChain()` helper. This change affects all transfer paths (direct send, split-and-send, V5 instant split).
 
@@ -364,7 +366,7 @@ Similarly, when enabling auto-return globally (`'*'`), the operation is triggere
 1. An incoming forward payment with memo `INV:<id>:F` arrives for a terminated invoice.
 2. If auto-return is enabled for this invoice (or globally), and the local wallet is an invoice target:
    - The incoming transfer is processed normally (recorded in history).
-   - **Return destination resolution:** `ref.refundAddress ?? ref.senderAddress`. If both are null (masked predicate with no refund address), the auto-return fires `invoice:auto_return_failed` with reason `'sender_unresolvable'` and is skipped.
+   - **Return destination resolution:** `ref.refundAddress ?? ref.senderAddress`. If both are null (masked predicate with no refund address), the auto-return fires `invoice:auto_return_failed` with reason `'sender_unresolvable'` and is skipped. **Note:** The `contact` field is NOT used for auto-return routing — it is purely for application-level communication (receipts, notices). Auto-return always uses `refundAddress → senderAddress → fail`.
    - The module invokes `PaymentsModule.send()` to return the tokens to the resolved destination address (not aggregated across senders).
    - **CLOSED invoice:** The entire incoming amount is returned to that sender (the invoice is already satisfied — any new payment is surplus by definition).
    - **CANCELLED invoice:** The entire incoming amount is returned to that sender (the deal is abandoned).
@@ -886,3 +888,4 @@ These are **not** in scope for v1 but inform the architecture:
 - **L1 payment matching**: Match L1 (ALPHA) transfers to invoice targets via L1 history
 - **Cross-chain invoices**: Targets on different chains/networks
 - **Invoice negotiation**: Counter-offers modifying invoice terms via transport messages
+- **Receipts, cancellation notices, and payment reminders**: Use the `contacts` array (from `InvoiceSenderBalance`, accumulated from `inv.ct` on-chain payloads) to send structured messages to payers after close (receipt), on cancellation (notice), or when payment is overdue (reminder). Contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null`. The `contact.url` field enables delivery via non-Nostr transports (HTTPS webhooks, WebSocket endpoints).

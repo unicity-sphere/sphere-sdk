@@ -168,22 +168,41 @@ type InvoiceState = 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'E
 interface InvoiceSenderBalance {
   /**
    * Effective sender address (DIRECT:// format).
-   * This is the per-sender balance key: `senderAddress ?? refundAddress` from the
-   * transfer's InvoiceTransferRef. When the original sender used a masked predicate,
-   * this field contains the refund address (if provided), NOT the actual sender address.
+   * This is the per-sender balance key: `refundAddress ?? senderAddress` from the
+   * transfer's InvoiceTransferRef. Refund address takes priority — if the payer
+   * provided a refund address, that IS their identity for per-sender keying.
+   * When the original sender used a masked predicate, this field contains the
+   * refund address (if provided), NOT the actual sender address.
    * Use `isRefundAddress` to distinguish.
    */
   readonly senderAddress: string;
   /**
    * True when `senderAddress` actually contains a refund address (the original sender
-   * used a masked predicate and provided `inv.ra`). False or undefined when the
-   * senderAddress was derived from an unmasked predicate.
+   * provided `inv.ra`). False or undefined when the senderAddress was derived from
+   * an unmasked predicate without a refund address override.
    */
   readonly isRefundAddress?: boolean;
   /** Sender's chain pubkey (if known — null when isRefundAddress is true) */
   readonly senderPubkey?: string;
   /** Sender's nametag (if known) */
   readonly senderNametag?: string;
+  /**
+   * All unique contact info entries provided by the sender across transfers
+   * (from on-chain TransferMessagePayload `inv.ct`).
+   *
+   * ALWAYS present (never undefined). Empty array if no contacts were provided.
+   * Contacts are accumulated from all transfers by this effective sender —
+   * different transfers may carry different contact info, and all unique entries
+   * are preserved. Deduplication is by (address, url) tuple: two entries with the
+   * same address but different url values are both kept.
+   *
+   * Contact is informational only — does not affect balance computation or per-sender keying.
+   *
+   * SECURITY: contact.address is self-asserted by the payer. Applications MUST NOT
+   * trust it as identity verification. A malicious payer can set any DIRECT:// address
+   * as their contact. Use out-of-band verification for identity-sensitive operations.
+   */
+  readonly contacts: ReadonlyArray<{ address: string; url?: string }>;
   /** Total forwarded by this sender for this target:coinId */
   readonly forwardedAmount: string;
   /** Total returned to this sender for this target:coinId (includes :B, :RC, :RX) */
@@ -301,6 +320,17 @@ interface InvoiceTransferRef {
    * Undefined if not present in the on-chain payload.
    */
   readonly refundAddress?: string;
+  /**
+   * Contact info provided by the sender (from on-chain TransferMessagePayload `inv.ct`).
+   * Allows the invoice target to reach the payer for receipts, cancellation notices,
+   * or payment reminders. Undefined if not present in the on-chain payload.
+   *
+   * `address`: a reachable DIRECT:// address for the payer.
+   * `url`: optional non-Nostr transport URL (https:// or wss://).
+   *
+   * NOT included in the transport memo (same privacy model as refund address).
+   */
+  readonly contact?: { address: string; url?: string };
   /** Sender chain pubkey (null if predicate is masked) */
   readonly senderPubkey?: string | null;
   /** Sender nametag */
@@ -658,12 +688,22 @@ class AccountingModule {
    * provides a stable return destination for masked-predicate payers whose
    * sender address becomes unresolvable after the transfer.
    *
+   * Contact info is embedded in the on-chain TransferMessagePayload (`inv.ct` field).
+   * If `params.contact` is provided, it is used directly. If `params.contact` is
+   * NOT provided, it is auto-populated from `this.identity.directAddress` as
+   * `{ address: this.identity.directAddress }`. This ensures every outbound invoice
+   * payment carries contact info for the recipient to reach the payer.
+   * The `contact.address` must be a valid DIRECT:// address. If `contact.url` is
+   * provided, it must use https:// or wss:// scheme and not exceed 2048 characters.
+   * Throws `INVOICE_INVALID_CONTACT` on validation failure.
+   *
    * @param invoiceId - The invoice token ID
-   * @param params - { targetIndex, assetIndex?, amount?, freeText?, refundAddress? }
+   * @param params - { targetIndex, assetIndex?, amount?, freeText?, refundAddress?, contact? }
    * @returns TransferResult from PaymentsModule.send()
    * @throws SphereError with INVOICE_TERMINATED if invoice is CLOSED or CANCELLED
    * @throws SphereError with INVOICE_NOT_FOUND if invoice not found
    * @throws SphereError with INVOICE_INVALID_REFUND_ADDRESS if refundAddress is malformed
+   * @throws SphereError with INVOICE_INVALID_CONTACT if contact is malformed
    */
   async payInvoice(invoiceId: string, params: PayInvoiceParams): Promise<TransferResult>;
 
@@ -845,6 +885,26 @@ interface PayInvoiceParams {
    * Auto-return destination priority: refundAddress → senderAddress → fail.
    */
   readonly refundAddress?: string;
+  /**
+   * Optional contact info embedded in the on-chain TransferMessagePayload
+   * (`inv.ct` field). Allows the invoice target to reach the payer for
+   * future communication: receipts (after close), cancellation notices,
+   * and payment reminders.
+   *
+   * `address`: a reachable DIRECT:// address for the payer (required within the object).
+   * `url`: optional non-Nostr transport URL (https:// or wss://, max 2048 chars).
+   *
+   * NOT included in the transport memo (same privacy model as refund address).
+   * Contact is purely informational — it does not affect auto-return routing,
+   * balance computation, or per-sender keying.
+   *
+   * When not provided, auto-populated from `identity.directAddress` at runtime
+   * (see §4.7). This ensures every outbound invoice payment carries contact info.
+   *
+   * Contact resolution priority (application-level recommendation):
+   * `contacts[0].address → refundAddress → senderAddress → null`
+   */
+  readonly contact?: { address: string; url?: string };
 }
 
 /**
@@ -1055,6 +1115,19 @@ interface TransferMessagePayload {
      * human-readable, on-chain payload is structured).
      */
     readonly ra?: string;
+    /**
+     * Contact info (optional). Allows the invoice target to reach the payer
+     * for future communication (receipts, cancellation notices, reminders).
+     * Set by the payer via `payInvoice({ contact })`.
+     *
+     * `a`: contact address (DIRECT:// format, required within the object).
+     * `u`: optional transport URL (https:// or wss://, max 2048 chars).
+     *
+     * NOT included in the transport memo (same privacy model as `ra`).
+     * Contact is purely informational — does not affect auto-return routing
+     * or balance computation.
+     */
+    readonly ct?: { a: string; u?: string };
   };
   /** Human-readable text (optional, max 256 code points) */
   readonly txt?: string;
@@ -1111,6 +1184,24 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
           delete parsed.inv.ra; // silently strip malformed refund address
         }
       }
+      // Lenient inbound parsing for contact info: strip silently if unparseable.
+      // Outbound validation is strict (INVOICE_INVALID_CONTACT in payInvoice).
+      if (parsed.inv.ct !== undefined) {
+        if (typeof parsed.inv.ct !== 'object' || parsed.inv.ct === null || Array.isArray(parsed.inv.ct)
+            || typeof parsed.inv.ct.a !== 'string' || !parsed.inv.ct.a.startsWith('DIRECT://')
+            || parsed.inv.ct.a.length <= 'DIRECT://'.length) {
+          delete parsed.inv.ct; // silently strip malformed contact
+        } else if (parsed.inv.ct.u !== undefined) {
+          // Validate ct.u: must be string, must use https:// or wss:// scheme,
+          // and must not exceed 2048 characters (storage amplification defense).
+          // Strip silently if violated (lenient inbound parsing).
+          if (typeof parsed.inv.ct.u !== 'string'
+              || !(parsed.inv.ct.u.startsWith('https://') || parsed.inv.ct.u.startsWith('wss://'))
+              || parsed.inv.ct.u.length > 2048) {
+            delete parsed.inv.ct.u; // strip malformed/dangerous URL, keep address
+          }
+        }
+      }
     }
     // Truncate inbound txt to 1024 code points to bound index cache and
     // event payload size. Outbound is capped at 256 by buildInvoiceMemo(),
@@ -1125,7 +1216,7 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
 }
 ```
 
-**Validation:** The `inv.id` field MUST be a 64-char lowercase hex string. The `inv.dir` field MUST be one of `'F'`, `'B'`, `'RC'`, `'RX'`. Payloads failing validation are treated as non-invoice transfers (no error thrown, silently ignored).
+**Validation:** The `inv.id` field MUST be a 64-char lowercase hex string. The `inv.dir` field MUST be one of `'F'`, `'B'`, `'RC'`, `'RX'`. The `inv.ra` and `inv.ct` fields are validated leniently on inbound (malformed values silently stripped) and strictly on outbound (`INVOICE_INVALID_REFUND_ADDRESS` / `INVOICE_INVALID_CONTACT`). Payloads failing `inv.id` or `inv.dir` validation are treated as non-invoice transfers (no error thrown, silently ignored).
 
 **On-chain / transport disagreement:** When both the on-chain message and the transport memo contain invoice references, the on-chain reference is authoritative (§4.8). The transport memo is ignored for balance computation. If the two disagree (different invoiceId or direction), no error is raised — the on-chain reference wins silently. This can happen if a sender modifies the transport memo after constructing the on-chain commitment, or if a relay replays a stale transport message.
 
@@ -1146,7 +1237,7 @@ All return directions (`B`, `RC`, `RX`) have the same effect on balance computat
 
 The Nostr transport memo uses a text format for human-readable display and backward compatibility with pre-accounting-module transfers.
 
-**NOTE:** The refund address (`inv.ra`) is NOT included in the transport memo. It is only recorded on-chain in the structured `TransferMessagePayload`. This preserves privacy — transport memos are human-readable and may be visible to relay operators, while the on-chain payload is structured data embedded in the cryptographic proof chain.
+**NOTE:** The refund address (`inv.ra`) and contact info (`inv.ct`) are NOT included in the transport memo. They are only recorded on-chain in the structured `TransferMessagePayload`. This preserves privacy — transport memos are human-readable and may be visible to relay operators, while the on-chain payload is structured data embedded in the cryptographic proof chain.
 
 ```
 invoice-memo  = "INV:" invoice-id [ ":" direction ] [ " " free-text ]
@@ -1253,7 +1344,11 @@ const commitment = await TransferCommitment.create(
 // For invoice-related transfers, the memo contains the INV: text format.
 // The on-chain message carries a structured JSON TransferMessagePayload.
 // PaymentsModule.send() must detect invoice memos and encode accordingly:
-const payload = parseInvoiceMemoForOnChain(request.memo, request.refundAddress);
+// Auto-populate contact from identity when not explicitly provided.
+// This ensures every outbound invoice payment carries contact info.
+const contact = request.contact ?? { address: this.identity.directAddress };
+// Validate contact (same rules as explicit contact — INVOICE_INVALID_CONTACT on failure)
+const payload = parseInvoiceMemoForOnChain(request.memo, request.refundAddress, contact);
 // parseInvoiceMemoForOnChain returns:
 //   - TransferMessagePayload JSON bytes if memo is INV: format
 //   - null if no memo or if memo is non-invoice (non-invoice memos stay
@@ -1272,7 +1367,8 @@ const commitment = await TransferCommitment.create(
 ```typescript
 function parseInvoiceMemoForOnChain(
   memo: string | undefined,
-  refundAddress?: string
+  refundAddress?: string,
+  contact?: { address: string; url?: string }
 ): Uint8Array | null {
   if (!memo) return null;
   const ref = parseInvoiceMemo(memo);
@@ -1283,6 +1379,7 @@ function parseInvoiceMemoForOnChain(
       id: ref.invoiceId,
       dir: dirMap[ref.paymentDirection],
       ...(refundAddress ? { ra: refundAddress } : {}),
+      ...(contact ? { ct: { a: contact.address, ...(contact.url ? { u: contact.url } : {}) } } : {}),
     };
     const payload: TransferMessagePayload = {
       inv,
@@ -1345,6 +1442,7 @@ When resolving invoice references for a transfer, the accounting module uses thi
 - **Sender validation for returns:** Inbound `B`/`RC`/`RX` transfers are validated against invoice target addresses (see §6.2 step 3).
 - **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2). **Limitation (Sybil):** Self-payment detection is per-address only — it does not prevent a target from creating a second wallet (different HD address or different mnemonic) and fabricating forward payments from that wallet. Cross-wallet self-payment detection is impossible in a privacy-preserving system. Applications requiring verified external payments should use out-of-band identity verification or trusted intermediaries.
 - **Untrusted string sanitization:** `txt` field in `TransferMessagePayload`, `InvoiceTerms.memo`, `deliveryMethods` URLs, and `senderNametag`/`recipientNametag` in `InvoiceTransferRef` contain untrusted user input. Applications MUST sanitize before HTML/DOM rendering. React (JSX) provides automatic escaping; other contexts must apply their own.
+- **Contact address is self-asserted (phishing risk).** The `contact.address` field in `InvoiceTransferRef` and `InvoiceSenderBalance.contacts` is set by the payer — the SDK does NOT verify that the contact address belongs to the actual sender. A malicious payer can set any DIRECT:// address as their contact, potentially impersonating another party. Applications MUST NOT treat `contact.address` as verified identity. For identity-sensitive operations (e.g., displaying "Payment from X"), applications SHOULD cross-reference `contact.address` against independently verified identity sources (e.g., nametag registry, trusted contact list). The `refundAddress` field has the same trust model — it is self-asserted and unverified.
 - Applications MUST use the SDK's decoding functions — never parse on-chain messages or transport memos manually.
 
 ---
@@ -1506,17 +1604,19 @@ surplusAmount    = max(0, netCoveredAmount - asset.coin[1])
 
 The aggregate formula above is used for coverage computation (`isCovered`, `surplusAmount`). In addition, balances are tracked per `(target, effectiveSender, coinId)` tuple for return cap enforcement and auto-return distribution:
 
-**Effective sender:** `effectiveSender = ref.senderAddress ?? ref.refundAddress`. When the sender uses a masked predicate (one-time address), `senderAddress` is null. If the sender included a refund address in the on-chain payload (`inv.ra`), it substitutes as the sender identity for per-sender balance keying. If both are null, the entry is excluded from per-sender tracking (but still counted in aggregate coverage). This ensures masked-predicate payers who provide a refund address are trackable for return cap enforcement and auto-return distribution.
+**Effective sender:** `effectiveSender = ref.refundAddress ?? ref.senderAddress`. Refund address takes priority — if the payer provided a refund address, that IS their identity for per-sender keying, regardless of whether the sender's predicate is masked or unmasked. This means the same real sender with different refund addresses produces different effective senders (separate balance buckets), and two different real senders with the same refund address share one effective sender (joined balances). If no refund address was provided, `senderAddress` is used as fallback. If both are null/undefined, the entry is excluded from per-sender tracking (but still counted in aggregate coverage). This ensures payers who provide a refund address are trackable for return cap enforcement and auto-return distribution under their chosen return identity.
 
-**Known limitation (effective sender collisions):** Because `effectiveSender` falls back to `refundAddress`, two distinct economic actors can share a per-sender balance bucket if they resolve to the same effective address. This occurs when: (a) two masked-predicate payers provide the same refund address — their forward payments merge into one bucket; (b) a masked-predicate payer provides a refund address that matches another payer's actual `senderAddress` — their balances conflate. In both cases, the return cap is computed against the combined balance and auto-returns flow to the shared address. This is **not exploitable for theft** — an attacker who spoofs another sender's address as their refund address loses their own funds irrecoverably (returns go to that address, not to the attacker). The aggregate coverage computation (`coveredAmount`, `isCovered`, `surplusAmount`) is unaffected — only per-sender return cap and auto-return distribution are impacted. Applications requiring strict per-payer accounting with masked predicates should use out-of-band identity verification.
+**Contact info is informational only.** The `contact` field on `InvoiceTransferRef` (per-transfer, optional) and the `contacts` array on `InvoiceSenderBalance` (per-sender, always present) do not affect balance computation, per-sender keying, or auto-return routing. They are stored for application-level use (receipts, cancellation notices, reminders). Per-sender `contacts` accumulates all unique contact entries from that sender's transfers — different transfers may carry different contact info, and all unique (address, url) tuples are preserved. Applications needing to reach a payer SHOULD use the contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null` (first contact in the array is the earliest by processing order).
+
+**Known limitation (effective sender collisions):** Because `effectiveSender` prioritizes `refundAddress`, two distinct economic actors can share a per-sender balance bucket if they resolve to the same effective address. This occurs when: (a) two payers (masked or unmasked) provide the same refund address — their forward payments merge into one bucket; (b) a payer provides a refund address that matches another payer's actual `senderAddress` (where that other payer has no refund address) — their balances conflate. In both cases, the return cap is computed against the combined balance and auto-returns flow to the shared address. This is **not exploitable for theft** — an attacker who spoofs another sender's address as their refund address loses their own funds irrecoverably (returns go to that address, not to the attacker). The aggregate coverage computation (`coveredAmount`, `isCovered`, `surplusAmount`) is unaffected — only per-sender return cap and auto-return distribution are impacted. Applications requiring strict per-payer accounting should use out-of-band identity verification.
 
 ```
-effectiveSender = ref.senderAddress ?? ref.refundAddress
+effectiveSender = ref.refundAddress ?? ref.senderAddress
 
 senderForwarded = SUM(amount) for all InvoiceTransferRef entries WHERE:
                   - ref.paymentDirection == 'forward'
                   - ref.destinationAddress == target.address
-                  - (ref.senderAddress ?? ref.refundAddress) == effectiveSender
+                  - (ref.refundAddress ?? ref.senderAddress) == effectiveSender
                   - ref.coinId == coinId
 
 senderReturned  = SUM(amount) for all InvoiceTransferRef entries WHERE:
@@ -1614,9 +1714,9 @@ interface InvoiceBalanceSnapshot {
   // Aggregate per (target, coinId) — for coverage computation
   aggregate: Map<string, { covered: bigint; returned: bigint }>;  // key = `${targetAddress}::${coinId}`
   // Per-sender per (target, effectiveSender, coinId) — for return cap and auto-return
-  // effectiveSender = senderAddress ?? refundAddress (refund address substitutes when
-  // sender is unresolvable due to masked predicate). If both are null/undefined,
-  // the entry is excluded from per-sender tracking (but still counted in aggregate).
+  // effectiveSender = refundAddress ?? senderAddress (refund address takes priority
+  // as sender identity). If both are null/undefined, the entry is excluded from
+  // per-sender tracking (but still counted in aggregate).
   perSender: Map<string, { forwarded: bigint; returned: bigint }>; // key = `${targetAddress}::${effectiveSender}::${coinId}`
 }
 ```
@@ -1654,6 +1754,7 @@ async processTokenTransactions(token: Token, startIndex: number): Promise<Invoic
          ref = { invoiceId: payload.inv.id, paymentDirection: mapDir(payload.inv.dir) }
          // mapDir maps: 'F'->'forward', 'B'->'back', 'RC'->'return_closed', 'RX'->'return_cancelled'
          refundAddress = payload.inv.ra  // string | undefined (already validated by decodeTransferMessage)
+         contact = payload.inv.ct       // { a: string; u?: string } | undefined (already validated by decodeTransferMessage)
        Else:
          // Fallback for legacy transfers (pre-accounting-module):
          // Check HistoryRecord.memo via parseInvoiceMemo() if available.
@@ -1814,6 +1915,8 @@ async processTokenTransactions(token: Token, startIndex: number): Promise<Invoic
           - senderAddress (may be null if predicate was masked),
             destinationAddress
           - refundAddress (from step 1, may be undefined)
+          - contact: contact ? { address: contact.a, url: contact.u } : undefined
+            (from step 1, mapped from on-chain `ct` to TypeScript shape, may be undefined)
           - timestamp: Date.now()
             // NOTE: TxfAuthenticator does not have a timestamp field.
             // Use the local clock when the transaction is first processed.
@@ -1931,8 +2034,20 @@ Phase 2 — Scan token transaction tails:
 4. Else: iterate entries, accumulate per-coin BigInt sums
    - forward → coveredAmount
    - back/return_closed/return_cancelled → returnedAmount
-5. Cache result in balanceCache
-6. Return computed status
+   - Per-sender: group by effectiveSender (= refundAddress ?? senderAddress)
+5. Build InvoiceSenderBalance for each (target, effectiveSender, coinId):
+   - Accumulate contacts from all InvoiceTransferRef entries for this sender:
+     const contactSet = new Set<string>()  // dedup key = JSON.stringify(contact)
+     const contacts: Array<{ address: string; url?: string }> = []
+     for each ref in senderEntries:
+       if ref.contact:
+         const key = JSON.stringify(ref.contact)
+         if !contactSet.has(key):
+           contactSet.add(key)
+           contacts.push(ref.contact)
+     // contacts is always an array (possibly empty), never undefined
+6. Cache result in balanceCache
+7. Return computed status
 ```
 
 This is O(E) where E = entries for this invoice, not O(H) where H = full history. The balance cache makes repeated queries O(1).
@@ -2219,6 +2334,7 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
   transferId: string;                     // the inbound transfer that could not be returned
   reason: 'sender_unresolvable' | 'send_failed' | 'max_retries_exceeded';
   refundAddress?: string;                 // if present, shows the refund address that was attempted
+  contactAddresses?: string[];            // if present, all contact addresses from the sender (for manual follow-up)
 };
 ```
 
@@ -2520,8 +2636,8 @@ interface FrozenCoinAssetBalances {
 interface FrozenSenderBalance {
   /**
    * Effective sender address (DIRECT:// format) — the per-sender balance key.
-   * When `isRefundAddress` is true, this contains the refund address (the original
-   * sender used a masked predicate). See InvoiceSenderBalance.senderAddress for details.
+   * Derived as `refundAddress ?? senderAddress`. When `isRefundAddress` is true,
+   * this contains the refund address. See InvoiceSenderBalance.senderAddress for details.
    */
   readonly senderAddress: string;
   /**
@@ -2542,6 +2658,16 @@ interface FrozenSenderBalance {
    * (the real sender address from the unmasked predicate) as the destination.
    */
   readonly refundAddress?: string;
+  /**
+   * All unique contact info entries from the sender's on-chain TransferMessagePayload
+   * `inv.ct` fields, accumulated across all transfers from this sender.
+   * Persisted at freeze time to enable post-termination communication (receipts,
+   * cancellation notices, reminders) without re-parsing the on-chain payload.
+   * ALWAYS present (never undefined). Empty array if no contacts were provided.
+   * Deduplication is by (address, url) tuple — same semantics as
+   * InvoiceSenderBalance.contacts.
+   */
+  readonly contacts: ReadonlyArray<{ address: string; url?: string }>;
   /** Returnable balance baseline at freeze time */
   readonly netBalance: string;
 }
@@ -3011,6 +3137,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 | `targetIndex` must be valid | `INVOICE_INVALID_TARGET` |
 | `assetIndex` must be valid (if provided) | `INVOICE_INVALID_ASSET_INDEX` |
 | If `refundAddress` is provided, it must be a valid `DIRECT://` address: starts with `DIRECT://` AND has content after the prefix (`length > 'DIRECT://'.length`). Reuse the same address validation that `PaymentsModule.send()` applies to recipient addresses. | `INVOICE_INVALID_REFUND_ADDRESS` |
+| If `contact` is provided, `contact.address` must be a valid `DIRECT://` address (starts with `DIRECT://` AND has content after the prefix). If `contact.url` is provided, it must start with `https://` or `wss://` and not exceed 2048 characters. | `INVOICE_INVALID_CONTACT` |
 
 **Downstream errors:** `payInvoice()` and `returnInvoicePayment()` delegate to `PaymentsModule.send()`, which may throw its own errors (insufficient balance, network failure, etc.). These errors pass through to the caller unchanged — the accounting module does not wrap them.
 
@@ -3267,6 +3394,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the per-sender net balance for (target, sender, coinId). Returns MUST NOT cause returnedAmount to exceed coveredAmount. | Excessive return to a specific sender |
 | `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method must use https:// or wss:// scheme, max 2048 chars, max 10 entries | Invalid deliveryMethods entry |
 | `INVOICE_INVALID_REFUND_ADDRESS` | Refund address must be a valid DIRECT:// address | Malformed `refundAddress` in `payInvoice()` params |
+| `INVOICE_INVALID_CONTACT` | Contact address must be a valid DIRECT:// address; URL must use https:// or wss:// scheme, max 2048 chars | Malformed `contact` in `payInvoice()` params |
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
