@@ -1,10 +1,10 @@
 /**
  * Integration test for nametag registration and resolution
- * Tests the full cycle: register -> resolve
+ * Tests the full cycle: publishIdentityBinding -> resolveNametag
  *
  * Key behavior (matching nostr-js-sdk):
- * - registerNametag uses 32-byte Nostr pubkey from keyManager (not passed publicKey)
- * - resolveNametag returns event.pubkey (the signer), not address tag
+ * - publishIdentityBinding delegates to nostrClient.publishNametagBinding
+ * - resolveNametag delegates to nostrClient.queryPubkeyByNametag (first-seen-wins)
  *
  * Uses NostrClient module-level mock since NostrTransportProvider
  * delegates WebSocket management to NostrClient.
@@ -110,6 +110,67 @@ const mockSubscribe = vi.fn().mockImplementation((filter: unknown, callbacks: {
   return subId;
 });
 
+// publishNametagBinding: simulates nostr-js-sdk conflict detection
+const mockPublishNametagBinding = vi.fn().mockImplementation(
+  async (nametagId: string, _address: string, _identity?: unknown) => {
+    const { hashNametag: ht } = await import('@unicitylabs/nostr-js-sdk');
+    const hashedNametag = ht(nametagId);
+
+    // Check for existing binding by different pubkey (first-seen-wins)
+    const existing = relayEventStore.find((e) => {
+      const tTag = e.tags.find((t) => t[0] === 't');
+      return tTag && tTag[1] === hashedNametag;
+    });
+
+    if (existing) {
+      // Check if it's a different author — reject
+      const nostrPubkey = mockNostrPubkey;
+      if (existing.pubkey !== nostrPubkey) {
+        return false;
+      }
+    }
+
+    // Store event (simulating what nostr-js-sdk does)
+    const event: StoredEvent = {
+      id: 'event_' + Math.random().toString(36).slice(2),
+      kind: 30078,
+      content: JSON.stringify({
+        nametag_hash: hashedNametag,
+        address: mockNostrPubkey,
+        verified: Date.now(),
+      }),
+      tags: [
+        ['d', hashedNametag],
+        ['t', hashedNametag],
+      ],
+      pubkey: mockNostrPubkey,
+      created_at: Math.floor(Date.now() / 1000),
+      sig: 'mock-sig',
+    };
+    relayEventStore.push(event);
+    return true;
+  }
+);
+
+// queryPubkeyByNametag: first-seen-wins lookup
+const mockQueryPubkeyByNametag = vi.fn().mockImplementation(async (nametagId: string) => {
+  const { hashNametag: ht } = await import('@unicitylabs/nostr-js-sdk');
+  const hashedNametag = ht(nametagId);
+
+  const matching = relayEventStore.filter((e) => {
+    const tTag = e.tags.find((t) => t[0] === 't');
+    return tTag && tTag[1] === hashedNametag;
+  });
+
+  if (matching.length === 0) return null;
+
+  // First-seen-wins: earliest created_at
+  matching.sort((a, b) => a.created_at - b.created_at);
+  return matching[0].pubkey;
+});
+
+let mockNostrPubkey = '';
+
 vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@unicitylabs/nostr-js-sdk')>();
   return {
@@ -123,6 +184,10 @@ vi.mock('@unicitylabs/nostr-js-sdk', async (importOriginal) => {
       unsubscribe: mockUnsubscribe,
       publishEvent: mockPublishEvent,
       addConnectionListener: mockAddConnectionListener,
+      publishNametagBinding: mockPublishNametagBinding,
+      queryPubkeyByNametag: mockQueryPubkeyByNametag,
+      queryBindingByNametag: vi.fn().mockResolvedValue(null),
+      queryBindingByAddress: vi.fn().mockResolvedValue(null),
     })),
   };
 });
@@ -138,8 +203,11 @@ type WebSocketFactory = import('../../transport/websocket').WebSocketFactory;
 
 const TEST_IDENTITY = {
   privateKey: 'a'.repeat(64),
-  publicKey: 'b'.repeat(64), // This is NOT used by registerNametag
+  publicKey: 'b'.repeat(64), // This is NOT used by publishIdentityBinding
   address: 'alpha1testaddress',
+  chainPubkey: '02' + 'b'.repeat(64),
+  l1Address: 'alpha1testaddress',
+  directAddress: 'DIRECT://testdirectaddress',
   ipnsName: '12D3KooWtest',
   nametag: undefined,
 };
@@ -167,78 +235,50 @@ describe('Nametag roundtrip integration', () => {
     await provider.disconnect();
   });
 
-  it('should register nametag with correct event structure', async () => {
+  it('should publish identity binding with nametag via nostr-js-sdk', async () => {
     provider.setIdentity(TEST_IDENTITY);
     await provider.connect();
+    mockNostrPubkey = provider.getNostrPubkey();
 
     const nametag = 'test-lottery';
 
-    // Register nametag
-    const registerResult = await provider.registerNametag(
+    const result = await provider.publishIdentityBinding(
+      TEST_IDENTITY.chainPubkey,
+      TEST_IDENTITY.l1Address,
+      TEST_IDENTITY.directAddress!,
       nametag,
-      TEST_IDENTITY.publicKey
     );
-    expect(registerResult).toBe(true);
+    expect(result).toBe(true);
 
-    // Verify event was published
-    expect(relayEventStore.length).toBe(1);
-
-    const event = relayEventStore[0];
-    expect(event.kind).toBe(30078); // NAMETAG_BINDING (APP_DATA)
-
-    // Check tags include all required fields (matching nostr-js-sdk format)
-    const tagNames = event.tags.map((t) => t[0]);
-    expect(tagNames).toContain('d'); // Required for parameterized replaceable
-    expect(tagNames).toContain('t'); // Indexed tag for relay search
-
-    // Check content is valid JSON with correct structure
-    const content = JSON.parse(event.content);
-    expect(content).toHaveProperty('nametag_hash');
-    expect(content).toHaveProperty('address');
-  });
-
-  it('should use 32-byte nostr pubkey from keyManager, not passed publicKey', async () => {
-    provider.setIdentity(TEST_IDENTITY);
-    await provider.connect();
-
-    const nametag = 'pubkey-test';
-
-    await provider.registerNametag(nametag, TEST_IDENTITY.publicKey);
-
-    const event = relayEventStore[0];
-
-    // Get the actual nostr pubkey used
-    const nostrPubkey = provider.getNostrPubkey();
-
-    // Address tag should contain nostrPubkey (from keyManager), NOT TEST_IDENTITY.publicKey
-    const addressTag = event.tags.find((t) => t[0] === 'address');
-    expect(addressTag?.[1]).toBe(nostrPubkey);
-    expect(addressTag?.[1]).not.toBe(TEST_IDENTITY.publicKey);
-
-    // Content should also use nostrPubkey
-    const content = JSON.parse(event.content);
-    expect(content.address).toBe(nostrPubkey);
-
-    // event.pubkey is the signer - should match nostrPubkey
-    expect(event.pubkey).toBe(nostrPubkey);
+    // publishNametagBinding was called on the NostrClient
+    expect(mockPublishNametagBinding).toHaveBeenCalledWith(
+      nametag,
+      expect.any(String),
+      expect.objectContaining({
+        publicKey: TEST_IDENTITY.chainPubkey,
+        l1Address: TEST_IDENTITY.l1Address,
+        directAddress: TEST_IDENTITY.directAddress,
+      }),
+    );
   });
 
   it('should resolve nametag returning event.pubkey (the signer)', async () => {
     provider.setIdentity(TEST_IDENTITY);
     await provider.connect();
+    mockNostrPubkey = provider.getNostrPubkey();
 
     const nametag = 'resolve-test';
 
-    // Register first (stores event in relay store)
-    await provider.registerNametag(nametag, TEST_IDENTITY.publicKey);
-
-    const event = relayEventStore[0];
+    // Publish first
+    await provider.publishIdentityBinding(
+      TEST_IDENTITY.chainPubkey,
+      TEST_IDENTITY.l1Address,
+      TEST_IDENTITY.directAddress!,
+      nametag,
+    );
 
     // resolveNametag should return event.pubkey (the signer)
     const resolved = await provider.resolveNametag(nametag);
-    expect(resolved).toBe(event.pubkey);
-
-    // This should be the nostr pubkey from keyManager
     expect(resolved).toBe(provider.getNostrPubkey());
   });
 
@@ -250,38 +290,36 @@ describe('Nametag roundtrip integration', () => {
     expect(resolvedPubkey).toBeNull();
   });
 
-  it('should allow re-registration by same pubkey (republish with correct format)', async () => {
+  it('should allow re-publication by same pubkey', async () => {
     provider.setIdentity(TEST_IDENTITY);
     await provider.connect();
+    mockNostrPubkey = provider.getNostrPubkey();
 
     const nametag = 'republish-test';
-    const nostrPubkey = provider.getNostrPubkey();
 
-    // Register first time
-    const result1 = await provider.registerNametag(
+    // Publish first time
+    const result1 = await provider.publishIdentityBinding(
+      TEST_IDENTITY.chainPubkey,
+      TEST_IDENTITY.l1Address,
+      TEST_IDENTITY.directAddress!,
       nametag,
-      TEST_IDENTITY.publicKey
     );
     expect(result1).toBe(true);
 
-    // Register second time - should succeed and republish
-    const result2 = await provider.registerNametag(
+    // Publish second time — should succeed (same pubkey)
+    const result2 = await provider.publishIdentityBinding(
+      TEST_IDENTITY.chainPubkey,
+      TEST_IDENTITY.l1Address,
+      TEST_IDENTITY.directAddress!,
       nametag,
-      TEST_IDENTITY.publicKey
     );
     expect(result2).toBe(true);
-
-    // Two events stored (always republishes to ensure correct format)
-    expect(relayEventStore.length).toBe(2);
-
-    // Both events have same pubkey
-    expect(relayEventStore[0].pubkey).toBe(nostrPubkey);
-    expect(relayEventStore[1].pubkey).toBe(nostrPubkey);
   });
 
-  it('should reject registration if nametag taken by another pubkey', async () => {
+  it('should reject publication if nametag taken by another pubkey', async () => {
     provider.setIdentity(TEST_IDENTITY);
     await provider.connect();
+    mockNostrPubkey = provider.getNostrPubkey();
 
     const nametag = 'taken-tag';
 
@@ -289,7 +327,6 @@ describe('Nametag roundtrip integration', () => {
     const otherPubkey = 'c'.repeat(64);
     const hashedNametag = hashNametag(nametag);
 
-    // Simulate event from another user already in relay store
     relayEventStore.push({
       id: 'fake-id',
       kind: 30078,
@@ -301,60 +338,42 @@ describe('Nametag roundtrip integration', () => {
       tags: [
         ['d', hashedNametag],
         ['t', hashedNametag],
-        ['nametag', hashedNametag],
-        ['address', otherPubkey],
       ],
-      pubkey: otherPubkey, // Different pubkey (the signer)
+      pubkey: otherPubkey,
       created_at: Math.floor(Date.now() / 1000),
       sig: 'fake-sig',
     });
 
-    // Try to register with our identity - should fail
-    const result = await provider.registerNametag(
+    // Try to publish with our identity — should fail
+    const result = await provider.publishIdentityBinding(
+      TEST_IDENTITY.chainPubkey,
+      TEST_IDENTITY.l1Address,
+      TEST_IDENTITY.directAddress!,
       nametag,
-      TEST_IDENTITY.publicKey
     );
     expect(result).toBe(false);
-
-    // No new events added (still just the fake one)
-    expect(relayEventStore.length).toBe(1);
-  });
-
-  it('should query by #t tag first (nostr-js-sdk format)', async () => {
-    provider.setIdentity(TEST_IDENTITY);
-    await provider.connect();
-
-    const nametag = 't-tag-test';
-
-    await provider.registerNametag(nametag, TEST_IDENTITY.publicKey);
-
-    // Event should have 't' tag for indexed search
-    const event = relayEventStore[0];
-    const tTag = event.tags.find((t) => t[0] === 't');
-    expect(tTag).toBeDefined();
-
-    // Resolution should work via #t tag query
-    const resolved = await provider.resolveNametag(nametag);
-    expect(resolved).toBe(event.pubkey);
   });
 
   it('should use hashed nametag for privacy', async () => {
     provider.setIdentity(TEST_IDENTITY);
     await provider.connect();
+    mockNostrPubkey = provider.getNostrPubkey();
 
     const nametag = 'my-secret-tag';
 
-    await provider.registerNametag(nametag, TEST_IDENTITY.publicKey);
+    await provider.publishIdentityBinding(
+      TEST_IDENTITY.chainPubkey,
+      TEST_IDENTITY.l1Address,
+      TEST_IDENTITY.directAddress!,
+      nametag,
+    );
 
-    const event = relayEventStore[0];
-
-    // Raw nametag should NOT appear anywhere in the event
-    const eventStr = JSON.stringify(event);
-    expect(eventStr).not.toContain(nametag);
-
-    // But hashed version should be in tags
-    const hashedNametag = hashNametag(nametag);
-    expect(eventStr).toContain(hashedNametag);
+    // publishNametagBinding was called with the raw nametag (nostr-js-sdk handles hashing)
+    expect(mockPublishNametagBinding).toHaveBeenCalledWith(
+      nametag,
+      expect.any(String),
+      expect.any(Object),
+    );
   });
 
   it('getNostrPubkey should return 32-byte hex (64 chars)', async () => {

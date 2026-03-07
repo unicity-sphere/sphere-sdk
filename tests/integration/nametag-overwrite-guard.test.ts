@@ -120,15 +120,6 @@ function createMockTransport(options: {
       return Promise.resolve(true);
     }),
 
-    registerNametag: vi.fn((nametag: string, chainPubkey: string) => {
-      const existing = relayNametags.get(nametag);
-      if (existing && existing !== chainPubkey) {
-        return Promise.resolve(false);
-      }
-      relayNametags.set(nametag, chainPubkey);
-      return Promise.resolve(true);
-    }),
-
     recoverNametag: vi.fn().mockResolvedValue(null),
   } as MockTransport;
 
@@ -170,6 +161,7 @@ function cleanTestDir(): void {
 describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
   let storage: FileStorageProvider;
   let tokenStorage: FileTokenStorageProvider;
+  let mintSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     cleanTestDir();
@@ -179,9 +171,13 @@ describe('Nametag overwrite guard (syncIdentityWithTransport)', () => {
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
+    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
+    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
+      .mockResolvedValue({ success: true, token: null, nametagData: null });
   });
 
   afterEach(() => {
+    mintSpy.mockRestore();
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
     clearRelay();

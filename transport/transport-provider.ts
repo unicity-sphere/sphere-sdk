@@ -111,18 +111,6 @@ export interface TransportProvider extends BaseProvider {
   ): Promise<boolean>;
 
   /**
-   * @deprecated Use publishIdentityBinding instead
-   * Register a nametag for this identity
-   */
-  registerNametag?(nametag: string, chainPubkey: string, directAddress: string): Promise<boolean>;
-
-  /**
-   * @deprecated Use publishIdentityBinding instead
-   * Publish nametag binding
-   */
-  publishNametag?(nametag: string, address: string): Promise<void>;
-
-  /**
    * Subscribe to broadcast messages (global/channel)
    */
   subscribeToBroadcast?(tags: string[], handler: BroadcastHandler): () => void;

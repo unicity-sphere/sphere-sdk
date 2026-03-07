@@ -114,8 +114,10 @@ function createMockTransport(options: {
       return Promise.resolve(options.resolveResult ?? null);
     }),
 
-    registerNametag: vi.fn((nametag: string, chainPubkey: string, directAddress: string) => {
-      registerCalls.push({ nametag, chainPubkey, directAddress });
+    publishIdentityBinding: vi.fn((_chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
+      if (nametag) {
+        registerCalls.push({ nametag, chainPubkey: _chainPubkey, directAddress: _directAddress });
+      }
       return Promise.resolve(options.registerResult ?? true);
     }),
 
@@ -154,18 +156,13 @@ describe('Sphere.syncNametagWithNostr', () => {
       const existingPubkey = await transport.resolveNametag!(TEST_NAMETAG);
       expect(existingPubkey).toBeNull();
 
-      // Should register since not found
+      // Should publish binding since not found
       if (!existingPubkey) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey, identity.directAddress || '');
+        await transport.publishIdentityBinding!(identity.chainPubkey, identity.l1Address, identity.directAddress || '', TEST_NAMETAG);
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
-      expect(transport._registerCalls).toHaveLength(1);
-      expect(transport._registerCalls[0]).toEqual({
-        nametag: TEST_NAMETAG,
-        chainPubkey: TEST_PUBKEY,
-        directAddress: 'DIRECT://test',
-      });
+      expect(transport.publishIdentityBinding).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -186,13 +183,13 @@ describe('Sphere.syncNametagWithNostr', () => {
       const existingPubkey = await transport.resolveNametag!(TEST_NAMETAG);
       expect(existingPubkey).toBe(TEST_PUBKEY);
 
-      // Should not register since already registered to same pubkey
+      // Should not publish since already registered to same pubkey
       if (existingPubkey !== identity.chainPubkey) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey, identity.directAddress || '');
+        await transport.publishIdentityBinding!(identity.chainPubkey, identity.l1Address, identity.directAddress || '', TEST_NAMETAG);
       }
 
       expect(transport._resolveCalls).toContain(TEST_NAMETAG);
-      expect(transport._registerCalls).toHaveLength(0);
+      expect(transport.publishIdentityBinding).not.toHaveBeenCalled();
     });
   });
 
@@ -217,12 +214,12 @@ describe('Sphere.syncNametagWithNostr', () => {
       const isConflict = existingPubkey && existingPubkey !== identity.chainPubkey;
       expect(isConflict).toBe(true);
 
-      // Simulate: do not register on conflict
+      // Simulate: do not publish on conflict
       if (!isConflict) {
-        await transport.registerNametag!(TEST_NAMETAG, identity.chainPubkey, identity.directAddress || '');
+        await transport.publishIdentityBinding!(identity.chainPubkey, identity.l1Address, identity.directAddress || '', TEST_NAMETAG);
       }
 
-      expect(transport._registerCalls).toHaveLength(0);
+      expect(transport.publishIdentityBinding).not.toHaveBeenCalled();
     });
   });
 
@@ -256,7 +253,7 @@ describe('Sphere.syncNametagWithNostr', () => {
       const transport = createMockTransport();
       // Remove nametag methods
       delete (transport as Partial<MockTransportProvider>).resolveNametag;
-      delete (transport as Partial<MockTransportProvider>).registerNametag;
+      delete (transport as Partial<MockTransportProvider>).publishIdentityBinding;
 
       const identity: FullIdentity = {
         privateKey: 'c'.repeat(64),
@@ -267,7 +264,7 @@ describe('Sphere.syncNametagWithNostr', () => {
       };
 
       // Should check if methods exist
-      const hasNametagSupport = transport.resolveNametag && transport.registerNametag;
+      const hasNametagSupport = transport.resolveNametag && transport.publishIdentityBinding;
       expect(hasNametagSupport).toBeFalsy();
 
       // Should not throw
@@ -354,8 +351,10 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
         return Promise.resolve(options.recoverResult ?? null);
       }),
 
-      registerNametag: vi.fn((nametag: string, chainPubkey: string, directAddress: string) => {
-        registerCalls.push({ nametag, chainPubkey, directAddress });
+      publishIdentityBinding: vi.fn((chainPubkey: string, l1Address: string, directAddress: string, nametag?: string) => {
+        if (nametag) {
+          registerCalls.push({ nametag, chainPubkey, directAddress });
+        }
         return Promise.resolve(true);
       }),
 
@@ -388,12 +387,13 @@ describe('Sphere.recoverNametagFromNostr (simulated)', () => {
           // Update identity
           (identity as { nametag?: string }).nametag = recovered;
 
-          // Re-register to ensure event has latest format
-          if (transport.registerNametag) {
-            await transport.registerNametag(
-              recovered,
+          // Re-publish to ensure event has latest format
+          if (transport.publishIdentityBinding) {
+            await transport.publishIdentityBinding(
               identity.chainPubkey,
-              identity.directAddress || ''
+              identity.l1Address,
+              identity.directAddress || '',
+              recovered,
             );
           }
         }

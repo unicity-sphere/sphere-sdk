@@ -2915,7 +2915,22 @@ export class Sphere {
       throw new SphereError(`Unicity ID already registered for address ${this._currentAddressIndex}: @${this._identity.nametag}`, 'ALREADY_INITIALIZED');
     }
 
-    // Publish identity binding with nametag (updates existing binding event)
+    // 1. Mint nametag token on-chain FIRST
+    // Required for receiving tokens via @nametag (PROXY address finalization).
+    // Minting before publishing ensures the nametag is backed by an on-chain token.
+    if (!this._payments.hasNametag()) {
+      logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
+      const result = await this.mintNametag(cleanNametag);
+      if (!result.success) {
+        throw new SphereError(
+          `Failed to mint nametag token: ${result.error}`,
+          'AGGREGATOR_ERROR',
+        );
+      }
+      logger.debug('Sphere', `Nametag token minted successfully`);
+    }
+
+    // 2. Publish identity binding with nametag to Nostr AFTER minting succeeds
     if (this._transport.publishIdentityBinding) {
       const success = await this._transport.publishIdentityBinding(
         this._identity!.chainPubkey,
@@ -2928,7 +2943,7 @@ export class Sphere {
       }
     }
 
-    // Update identity
+    // 3. Update local state
     this._identity!.nametag = cleanNametag;
     await this._updateCachedProxyAddress();
 
@@ -2945,19 +2960,6 @@ export class Sphere {
 
     // Persist nametag cache
     await this.persistAddressNametags();
-
-    // Mint nametag token on-chain if not already minted
-    // Required for receiving tokens via @nametag (PROXY address finalization)
-    if (!this._payments.hasNametag()) {
-      logger.debug('Sphere', `Minting nametag token for @${cleanNametag}...`);
-      const result = await this.mintNametag(cleanNametag);
-      if (!result.success) {
-        logger.warn('Sphere', `Failed to mint nametag token: ${result.error}`);
-        // Don't throw - nametag is published via transport, token can be minted later
-      } else {
-        logger.debug('Sphere', `Nametag token minted successfully`);
-      }
-    }
 
     this.emitEvent('nametag:registered', {
       nametag: cleanNametag,

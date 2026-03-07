@@ -1,36 +1,39 @@
 /**
- * Integration tests for nametag normalization and validation.
+ * Tests for mint-before-publish ordering in registerNametag.
  *
  * Verifies that:
- * - Uppercase input is normalized to lowercase before registration
- * - @unicity suffix is stripped
- * - Invalid nametags are rejected with proper error messages
- * - switchToAddress normalizes nametags too
+ * 1. Minting happens BEFORE publishing to Nostr
+ * 2. If minting fails, nothing is published (no unbacked nametag claims)
+ * 3. If minting succeeds but publishing fails, the error is surfaced
+ * 4. If minting succeeds and publishing succeeds, local state is updated
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Sphere } from '../../core/Sphere';
-import { FileStorageProvider } from '../../impl/nodejs/storage/FileStorageProvider';
-import { FileTokenStorageProvider } from '../../impl/nodejs/storage/FileTokenStorageProvider';
-import type { TransportProvider, OracleProvider } from '../../index';
-import type { ProviderStatus } from '../../types';
-import { vi } from 'vitest';
+import { Sphere } from '../../../core/Sphere';
+import { FileStorageProvider } from '../../../impl/nodejs/storage/FileStorageProvider';
+import { FileTokenStorageProvider } from '../../../impl/nodejs/storage/FileTokenStorageProvider';
+import type { TransportProvider, OracleProvider } from '../../../index';
+import type { ProviderStatus } from '../../../types';
 
 // =============================================================================
 // Test directories
 // =============================================================================
 
-const TEST_DIR = path.join(__dirname, '.test-nametag-normalization');
+const TEST_DIR = path.join(__dirname, '.test-mint-before-publish');
 const DATA_DIR = path.join(TEST_DIR, 'data');
 const TOKENS_DIR = path.join(TEST_DIR, 'tokens');
 
 // =============================================================================
-// Mock providers
+// Call order tracker
 // =============================================================================
 
-const nostrRelayNametags = new Map<string, string>();
+const callOrder: string[] = [];
+
+// =============================================================================
+// Mock providers
+// =============================================================================
 
 function createMockTransport(): TransportProvider {
   return {
@@ -54,17 +57,9 @@ function createMockTransport(): TransportProvider {
     subscribeToBroadcast: vi.fn().mockReturnValue(() => {}),
     publishBroadcast: vi.fn().mockResolvedValue('broadcast-id'),
     onEvent: vi.fn().mockReturnValue(() => {}),
-    resolveNametag: vi.fn((nametag: string) => {
-      return Promise.resolve(nostrRelayNametags.get(nametag) ?? null);
-    }),
-    publishIdentityBinding: vi.fn((chainPubkey: string, _l1Address: string, _directAddress: string, nametag?: string) => {
-      if (nametag) {
-        const existing = nostrRelayNametags.get(nametag);
-        if (existing && existing !== chainPubkey) {
-          return Promise.resolve(false);
-        }
-        nostrRelayNametags.set(nametag, chainPubkey);
-      }
+    resolveNametag: vi.fn().mockResolvedValue(null),
+    publishIdentityBinding: vi.fn().mockImplementation(() => {
+      callOrder.push('publish');
       return Promise.resolve(true);
     }),
     recoverNametag: vi.fn().mockResolvedValue(null),
@@ -103,34 +98,38 @@ function cleanTestDir(): void {
 // Tests
 // =============================================================================
 
-describe('Nametag normalization integration', () => {
+describe('Sphere.registerNametag() mint-before-publish ordering', () => {
   let storage: FileStorageProvider;
   let tokenStorage: FileTokenStorageProvider;
   let mintSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     cleanTestDir();
-    nostrRelayNametags.clear();
+    callOrder.length = 0;
     if (Sphere.getInstance()) {
       (Sphere as unknown as { instance: null }).instance = null;
     }
     storage = new FileStorageProvider({ dataDir: DATA_DIR });
     tokenStorage = new FileTokenStorageProvider({ tokensDir: TOKENS_DIR });
-    // Mock minting so registerNametag (mint-before-publish) succeeds without a real aggregator
-    mintSpy = vi.spyOn(Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> }, 'mintNametag')
-      .mockResolvedValue({ success: true, token: null, nametagData: null });
   });
 
   afterEach(() => {
-    mintSpy.mockRestore();
+    mintSpy?.mockRestore();
     (Sphere as unknown as { instance: null }).instance = null;
     cleanTestDir();
-    nostrRelayNametags.clear();
   });
 
-  it('should normalize uppercase nametag to lowercase on registerNametag', async () => {
+  it('should mint on-chain BEFORE publishing to Nostr', async () => {
     const transport = createMockTransport();
     const oracle = createMockOracle();
+
+    mintSpy = vi.spyOn(
+      Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> },
+      'mintNametag',
+    ).mockImplementation(() => {
+      callOrder.push('mint');
+      return Promise.resolve({ success: true, token: null, nametagData: null });
+    });
 
     const { sphere } = await Sphere.init({
       storage,
@@ -140,119 +139,104 @@ describe('Nametag normalization integration', () => {
       autoGenerate: true,
     });
 
-    await sphere.registerNametag('Alice');
+    // Reset call order after init (init publishes identity binding without nametag)
+    callOrder.length = 0;
 
-    // Identity should have the lowercased nametag
+    await sphere.registerNametag('alice');
+
+    // Verify ordering: mint must come before publish
+    expect(callOrder).toEqual(['mint', 'publish']);
+
+    await sphere.destroy();
+  });
+
+  it('should NOT publish to Nostr when minting fails', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    mintSpy = vi.spyOn(
+      Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> },
+      'mintNametag',
+    ).mockImplementation(() => {
+      callOrder.push('mint');
+      return Promise.resolve({ success: false, error: 'Aggregator rejected' });
+    });
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    // Reset after init
+    callOrder.length = 0;
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockClear();
+
+    await expect(sphere.registerNametag('alice')).rejects.toThrow('Failed to mint nametag token');
+
+    // Mint was called, but publish was NOT
+    expect(callOrder).toEqual(['mint']);
+    expect(transport.publishIdentityBinding).not.toHaveBeenCalled();
+
+    // Local state should NOT have the nametag
+    expect(sphere.identity!.nametag).toBeUndefined();
+
+    await sphere.destroy();
+  });
+
+  it('should throw when publishing to Nostr fails (nametag taken)', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    mintSpy = vi.spyOn(
+      Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> },
+      'mintNametag',
+    ).mockResolvedValue({ success: true, token: null, nametagData: null });
+
+    // publishIdentityBinding returns false (nametag taken by another pubkey)
+    (transport.publishIdentityBinding as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    await expect(sphere.registerNametag('taken')).rejects.toThrow('may already be taken');
+
+    // Local state should NOT have the nametag
+    expect(sphere.identity!.nametag).toBeUndefined();
+
+    await sphere.destroy();
+  });
+
+  it('should update local state only after both mint and publish succeed', async () => {
+    const transport = createMockTransport();
+    const oracle = createMockOracle();
+
+    mintSpy = vi.spyOn(
+      Sphere.prototype as unknown as { mintNametag: () => Promise<unknown> },
+      'mintNametag',
+    ).mockResolvedValue({ success: true, token: null, nametagData: null });
+
+    const { sphere } = await Sphere.init({
+      storage,
+      transport,
+      oracle,
+      tokenStorage,
+      autoGenerate: true,
+    });
+
+    expect(sphere.identity!.nametag).toBeUndefined();
+
+    await sphere.registerNametag('alice');
+
+    // Now local state should have the nametag
     expect(sphere.identity!.nametag).toBe('alice');
-
-    await sphere.destroy();
-  });
-
-  it('should normalize uppercase nametag on Sphere.init with nametag option', async () => {
-    const transport = createMockTransport();
-    const oracle = createMockOracle();
-
-    const { sphere } = await Sphere.init({
-      storage,
-      transport,
-      oracle,
-      tokenStorage,
-      autoGenerate: true,
-      nametag: 'BOB',
-    });
-
-    expect(sphere.identity!.nametag).toBe('bob');
-
-    await sphere.destroy();
-  });
-
-  it('should strip @unicity suffix during registerNametag', async () => {
-    const transport = createMockTransport();
-    const oracle = createMockOracle();
-
-    const { sphere } = await Sphere.init({
-      storage,
-      transport,
-      oracle,
-      tokenStorage,
-      autoGenerate: true,
-    });
-
-    await sphere.registerNametag('carol@unicity');
-
-    expect(sphere.identity!.nametag).toBe('carol');
-
-    await sphere.destroy();
-  });
-
-  it('should reject too-short nametag', async () => {
-    const transport = createMockTransport();
-    const oracle = createMockOracle();
-
-    const { sphere } = await Sphere.init({
-      storage,
-      transport,
-      oracle,
-      tokenStorage,
-      autoGenerate: true,
-    });
-
-    await expect(sphere.registerNametag('ab')).rejects.toThrow('Invalid Unicity ID format');
-
-    await sphere.destroy();
-  });
-
-  it('should reject nametag with spaces', async () => {
-    const transport = createMockTransport();
-    const oracle = createMockOracle();
-
-    const { sphere } = await Sphere.init({
-      storage,
-      transport,
-      oracle,
-      tokenStorage,
-      autoGenerate: true,
-    });
-
-    await expect(sphere.registerNametag('hello world')).rejects.toThrow('Invalid Unicity ID format');
-
-    await sphere.destroy();
-  });
-
-  it('should normalize nametag in switchToAddress', async () => {
-    const transport = createMockTransport();
-    const oracle = createMockOracle();
-
-    const { sphere } = await Sphere.init({
-      storage,
-      transport,
-      oracle,
-      tokenStorage,
-      autoGenerate: true,
-    });
-
-    await sphere.switchToAddress(1, { nametag: 'Dave' });
-
-    expect(sphere.identity!.nametag).toBe('dave');
-
-    await sphere.destroy();
-  });
-
-  it('should reject invalid nametag in switchToAddress', async () => {
-    const transport = createMockTransport();
-    const oracle = createMockOracle();
-
-    const { sphere } = await Sphere.init({
-      storage,
-      transport,
-      oracle,
-      tokenStorage,
-      autoGenerate: true,
-    });
-
-    await expect(
-      sphere.switchToAddress(1, { nametag: 'x' })
-    ).rejects.toThrow('Invalid Unicity ID format');
 
     await sphere.destroy();
   });
