@@ -395,11 +395,20 @@ On crash recovery (during `load()`), scan the ledger for `pending` entries. For 
 - When a sender receives an auto-return transfer with `:RC`, their accounting module MAY auto-close the invoice locally — even if the invoice was not fully covered from the sender's perspective (the target decided to close).
 - When a sender receives an auto-return transfer with `:RX`, their accounting module MAY auto-cancel the invoice locally.
 - This is **opt-in** — controlled by `autoTerminateOnReturn` config (default: `false`). It provides implicit cross-party termination signaling without requiring an explicit broadcast mechanism.
-- **Implementation note:** Auto-termination uses an internal `_terminateInvoice()` method that performs the freeze-and-persist directly, bypassing the public `closeInvoice()`/`cancelInvoice()` gate acquisition. This prevents deadlock when the event handler is already inside the per-invoice gate. See SPEC §6.2 step 3d.
+- **Implementation note:** Auto-termination uses an internal `_terminateInvoice()` method that performs the freeze-and-persist directly, bypassing the public `closeInvoice()`/`cancelInvoice()` gate acquisition. This prevents deadlock when the event handler is already inside the per-invoice gate. **PREREQUISITE:** `_terminateInvoice()` MUST only be called from code paths that already hold the per-invoice gate. The §6.2 step 3 event handler acquires the gate at entry before any processing, satisfying this requirement. See SPEC §6.2 step 3.
 - **Over-refund warning:** If the total amount returned to a sender exceeds the total amount that sender has forwarded (for a given coinId), the module fires `invoice:over_refund_warning`. This can happen if a target manually returns more than the sender paid. The warning is informational — the transfer is not blocked.
 - **Trust note:** A target can send `:RC`/`:RX` even if the invoice is not actually terminated on their side. The payer's `autoTerminateOnReturn` trusts the direction code at face value. This is acceptable because the target already holds the tokens and could simply not return them — spoofing a direction code gains nothing.
 
-### 4.6 Non-Blocking Inbound Guarantee
+### 4.6 Termination Write Order
+
+When an invoice transitions to a terminal state (CLOSED or CANCELLED), multiple storage writes occur. The write order is critical for crash recovery:
+
+1. **Terminal set FIRST:** Add invoiceId to `closed_invoices` or `cancelled_invoices` set and persist.
+2. **Frozen balances SECOND:** Compute balance snapshot and persist to `frozen_balances`.
+
+**Rationale:** If the process crashes between steps 1 and 2, recovery (during `load()`) detects the orphaned terminal set entry (no corresponding frozen balance) and recomputes the frozen balance from the live index. The inverse crash (frozen balance written but not in terminal set) is handled by forward reconciliation: orphaned frozen balances are matched to their terminal set. See SPEC §5.9 for full crash recovery semantics.
+
+### 4.7 Non-Blocking Inbound Guarantee
 
 **Accounting errors MUST NEVER break the inbound token transfer flow.**
 
@@ -415,7 +424,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 
 **Outbound forward payments to terminated invoices ARE blocked.** This is the one case where the accounting module prevents a transfer from happening — throwing an exception before `PaymentsModule.send()` is called. This is a deliberate design choice: the caller explicitly attempted to pay a terminated invoice and should be informed via an error.
 
-### 4.7 Concurrency Model
+### 4.8 Concurrency Model
 
 **Per-invoice serialization gate.** All state-mutating operations on a given invoice are serialized through a per-invoice async mutex. This prevents race conditions where concurrent events (e.g., an incoming transfer and an explicit `closeInvoice()` call) could both attempt to freeze balances or trigger auto-returns simultaneously.
 
@@ -442,7 +451,7 @@ The accounting module wraps all its inbound event processing in try/catch guards
 
 **Target validation** uses `getActiveAddresses()` (from `Sphere` dependency) to check whether the wallet is a target for close/cancel/return operations. All HD addresses (not just the current one) are checked, ensuring multi-address wallets can operate on invoices targeting any of their addresses.
 
-### 4.8 Status Computation
+### 4.9 Status Computation
 
 Status is **computed on-demand** for non-terminal invoices. For terminal invoices, persisted frozen balances are returned. The `getInvoiceStatus()` method:
 
@@ -577,6 +586,7 @@ this.accounting = createAccountingModule(
     oracle: this.oracle,
     identity: this.fullIdentity,
     storage: this.storage,
+    getActiveAddresses: () => this.getActiveAddresses(),
     emitEvent: (type, data) => this.emit(type, data),
   }
 );
@@ -692,6 +702,8 @@ All events with a `confirmed` field follow this contract:
 |--------|-------------|
 | `sphere_getInvoices` | List invoices (with optional filters) |
 | `sphere_getInvoiceStatus` | Get computed status of a specific invoice |
+
+**Rate-limiting requirement for `sphere_getInvoiceStatus`:** This query has an implicit close side effect — when it detects all targets covered + all confirmed, it acquires the per-invoice gate and triggers freeze + auto-return. Wallet hosts MUST rate-limit calls from dApps: max 1 call/second per invoiceId and max 10 calls/second aggregate per session. Without rate limiting, a malicious dApp with `invoice:read` permission can trigger fund-moving operations (auto-return sends) purely through rapid query polling. See SPEC §8.2 for full rationale.
 
 ### 8.2 New Intent Actions
 

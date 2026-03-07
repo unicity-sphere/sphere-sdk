@@ -870,7 +870,7 @@ Step  Action                                SDK Class
       verification based on config)
 12    Store token via TokenStorageProvider   tokenStorage.saveToken()
 13    Scan history for pre-existing payments  AccountingModule
-      via processTransfer() (§5.4.3)
+      via processTokenTransactions() (§5.4.3)
 14    Fire 'invoice:created' event +        emitEvent()
       retroactive payment/coverage events
 ```
@@ -1349,14 +1349,16 @@ function computeInvoiceStatus(invoiceId, terms, cancelledSet, closedSet, frozenB
 
 ```
 coveredAmount  = SUM(amount) for all InvoiceTransferRef entries WHERE:
-                 - ref.invoiceId == invoiceId AND ref.direction == 'forward'
+                 // NOTE: entries are already scoped to a single invoice via the
+                 // invoiceLedger map key — no ref.invoiceId field needed.
+                 - ref.paymentDirection == 'forward'
                    (on-chain: TransferMessagePayload.inv.dir == 'F' or omitted;
                     legacy fallback: transport memo matches INV:<invoiceId>:F)
-                 - ref.destination matches target.address
+                 - ref.destinationAddress matches target.address
                  - ref.coinId matches asset.coin[0]
 
 returnedAmount = SUM(amount) for all InvoiceTransferRef entries WHERE:
-                 - ref.invoiceId == invoiceId AND ref.direction in ('back', 'return_closed', 'return_cancelled')
+                 - ref.paymentDirection in ('back', 'return_closed', 'return_cancelled')
                    (on-chain: TransferMessagePayload.inv.dir in ('B', 'RC', 'RX');
                     legacy fallback: transport memo matches INV:<invoiceId>:B or :RC or :RX)
                  - ref.senderAddress matches target.address (returns flow FROM target TO payer)
@@ -1579,19 +1581,28 @@ processTokenTransactions(token: Token, startIndex: number):
        // The first await resolves the TransferTransactionData instance,
        // the second resolves the DataHash. Do NOT chain .calculateHash()
        // directly on fromJSON() — that calls a method on a Promise.
-       const txData = await TransferTransactionData.fromJSON(tx.data)
-       transferId = bytesToHex((await txData.calculateHash()).data)
-       // Edge case: TxfTransaction.data is typed as optional (Record<string, unknown> | undefined).
-       // If tx.data is missing, skip this transaction — it cannot be linked to an invoice
-       // without its transaction data. This should not occur for well-formed tokens.
+       //
+       // ORDERING: destinationAddress validation (step 4a) runs BEFORE
+       // the hash computation (step 4b) because fromJSON()+calculateHash()
+       // are async and comparatively expensive. If the recipient is
+       // malformed, skip early without computing the hash.
 
-    5. Resolve sender/recipient from tx and token state:
+    4a. Validate destinationAddress (cheap check — before hash computation):
        destinationAddress = (tx.data as any)?.recipient   // TransferTransactionData.recipient
        // Validate destinationAddress format: must be a DIRECT:// address string.
        // Reject malformed values (prevents garbage data from flowing into events/UI).
        if (typeof destinationAddress !== 'string' || !destinationAddress.startsWith('DIRECT://')) {
          continue  // skip transaction with invalid recipient
        }
+
+    4b. Derive transferId (expensive — async hash computation):
+       const txData = await TransferTransactionData.fromJSON(tx.data)
+       transferId = bytesToHex((await txData.calculateHash()).data)
+       // Edge case: TxfTransaction.data is typed as optional (Record<string, unknown> | undefined).
+       // If tx.data is missing, skip this transaction — it cannot be linked to an invoice
+       // without its transaction data. This should not occur for well-formed tokens.
+
+    5. Resolve sender from tx and token state:
        // IMPORTANT: tx.predicate at index N is the NEW owner's predicate
        // (the recipient of transaction N), NOT the sender's. The SENDER is
        // the PREVIOUS state's owner — identified by the predicate at the
@@ -1614,9 +1625,10 @@ processTokenTransactions(token: Token, startIndex: number):
        // IMPORTANT: Predicate may be MASKED (owner hidden) or UNMASKED.
        // UnmaskedPredicate.fromCBOR() will throw on a masked predicate.
        // If the predicate is masked, the sender address is unresolvable —
-       // set senderAddress to null and classify the transfer as irrelevant
-       // (reason: 'sender_unresolvable') downstream if sender is required
-       // (e.g., for return matching or self-payment detection).
+       // set senderAddress to null. The entry is still indexed (see step 6e
+       // NOTE below). Downstream logic skips null-sender entries for
+       // self-payment detection and return matching, but includes them in
+       // aggregate coverage computation.
        // FORMAT CONSISTENCY: genesis.data.recipient and deriveDIRECTAddress()
        // both produce identically-formatted DIRECT:// strings. The SDK's
        // deriveDIRECTAddress(pubkey) produces the same output as the address
@@ -1634,8 +1646,17 @@ processTokenTransactions(token: Token, startIndex: number):
              }
            })()
 
-    6. For each [coinId, amount] in coinData (capped at first 50 entries):
-       a. Skip if amount === "0" or amount.length > 78 (prevent BigInt CPU exhaustion)
+    6. For each [coinId, amount] in coinData (capped at first MAX_COIN_DATA_ENTRIES entries,
+       default 50; configurable via AccountingModuleConfig.maxCoinDataEntries):
+       // KNOWN LIMITATION: Tokens with more than MAX_COIN_DATA_ENTRIES distinct
+       // coin types will have trailing entries silently ignored. In practice,
+       // tokens carry 1-3 coin types. The cap is a defense against adversarial
+       // tokens with thousands of entries causing O(N) processing per transaction.
+       a. Skip if !/^[1-9][0-9]*$/.test(amount) or amount.length > 78
+          // Rejects: "0", negative ("-500"), non-numeric ("abc"), decimals ("12.5"),
+          // leading zeros ("007"), whitespace, empty strings, and strings > 78 digits.
+          // This is the INBOUND validation — token coinData is adversarial input.
+          // Only positive integer strings survive to BigInt balance computation.
        b. entryKey = `${transferId}::${coinId}`
        c. invoiceMap = invoiceLedger.get(ref.invoiceId)
        d. If invoiceMap.has(entryKey): continue  // dedup
@@ -1705,6 +1726,11 @@ Phase 2 — Scan token transaction tails:
      b. startIndex = tokenScanState.get(T.id) ?? 0
      c. If txf.transactions.length > startIndex:
         → processTokenTransactions(T, startIndex)
+     d. **Yield check:** After every BATCH_SIZE tokens (default 100),
+        yield to the event loop (await new Promise(r => setTimeout(r, 0)))
+        to prevent blocking the main thread during cold start with large
+        token inventories. This is a SHOULD, not a MUST — implementations
+        may omit yielding if the runtime supports worker threads.
   7. Flush dirty invoice entries to storage
   8. Persist updated tokenScanState
 ```
@@ -2050,11 +2076,14 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
      -> fire 'invoice:unknown_reference' { invoiceId, transfer }
      -> return
   3. If direction is 'return_closed' or 'return_cancelled':
+     -> **acquire per-invoice gate** (serializes all return processing for
+        this invoice; released at end of step 3 or on early return)
      a. **Validate sender:** check that the transfer's sender address matches
         one of the invoice's target addresses. If the sender is NOT an invoice
         target, treat the transfer as `invoice:irrelevant` with reason
-        `'unauthorized_return'` and return. This prevents spoofed :RC/:RX
-        transfers from non-target parties triggering auto-termination.
+        `'unauthorized_return'` and return (releasing gate). This prevents
+        spoofed :RC/:RX transfers from non-target parties triggering
+        auto-termination.
      b. fire 'invoice:return_received' { invoiceId, transfer, returnReason }
      c. **Over-refund check:** Compare total returned to this sender vs total
         forwarded by this sender (for this coinId). If returned > forwarded,
@@ -2067,19 +2096,18 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
           perspective — the target decided to close, and the sender accepts
           this via the implicit termination signal.
         - :RX -> auto-cancel invoice locally (if not already terminated)
-        **Implementation note:** Auto-termination MUST NOT call the public
-        `closeInvoice()`/`cancelInvoice()` methods, which would attempt to
-        acquire the per-invoice gate and deadlock (the event handler may
-        already be inside the gate). Instead, use an internal
+        **Implementation note:** Auto-termination uses an internal
         `_terminateInvoice(invoiceId, state)` method that performs the
-        freeze-and-persist directly without gate acquisition.
+        freeze-and-persist directly without gate acquisition (since the
+        gate is already held from step 3 entry). MUST NOT call the public
+        `closeInvoice()`/`cancelInvoice()` methods, which would re-acquire
+        the gate and deadlock.
         **PREREQUISITE:** `_terminateInvoice()` MUST only be called from
-        code paths that already hold the per-invoice gate. The event handler
-        at step 3 MUST acquire the per-invoice gate BEFORE calling
-        `_terminateInvoice()`. The gate acquisition happens at step 3
-        entry (not just at step 5). This ensures: (a) no concurrent
-        `closeInvoice()`/`cancelInvoice()` can race with the freeze, and
-        (b) the frozen balance computation uses a consistent index state.
+        code paths that already hold the per-invoice gate. The gate was
+        acquired at step 3 entry, satisfying this requirement. This
+        ensures: (a) no concurrent `closeInvoice()`/`cancelInvoice()` can
+        race with the freeze, and (b) the frozen balance computation uses
+        a consistent index state.
         The `_terminateInvoice()` method checks terminal sets atomically
         (if already terminated, returns immediately — no double-freeze).
         It performs the same steps as closeInvoice()/cancelInvoice()
@@ -2092,7 +2120,7 @@ On PaymentsModule 'transfer:incoming' or 'history:updated':
         (default false); (2) the target already holds the tokens and could
         simply not return them; (3) spoofing a direction code gains the
         target nothing — the tokens are being returned regardless.
-     -> return
+     -> return (releasing gate)
   4. Process transfer into index via processTokenTransactions() (§5.4.3)
      This builds InvoiceTransferRef entries and updates invoiceLedger.
      NOTE: This step runs for ALL invoices (terminal and non-terminal) so that
@@ -2420,7 +2448,7 @@ AUTO_RETURN_LEDGER: 'auto_return_ledger',
 ```
 createInvoice():
   1. tokenStorage.saveToken(invoiceToken)       // TXF token with InvoiceTerms in tokenData
-  2. Scan history for pre-existing payments     // retroactive via processTransfer() (§5.4.3)
+  2. Scan history for pre-existing payments     // retroactive via processTokenTransactions() (§5.4.3)
   3. If immediately reaches CLOSED (all covered + all confirmed):
      -> acquire per-invoice gate, re-verify by full recomputation,
         freeze balances and persist to FROZEN_BALANCES,
@@ -2429,7 +2457,7 @@ createInvoice():
 
 importInvoice():
   1. tokenStorage.saveToken(invoiceToken)       // same as any received token
-  2. Scan history for pre-existing payments     // retroactive via processTransfer() (§5.4.3)
+  2. Scan history for pre-existing payments     // retroactive via processTokenTransactions() (§5.4.3)
   3. If immediately reaches CLOSED:
      -> acquire per-invoice gate, re-verify, freeze balances and persist,
         trigger surplus auto-return if enabled
@@ -2662,7 +2690,7 @@ private balanceCache: Map<string, InvoiceBalanceSnapshot>;
 - **Terminal invoices included:** The index records ALL invoice-related transfers regardless of terminal state. Frozen balances are a separate point-in-time snapshot. The index powers `getRelatedTransfers()` (complete picture); frozen balances power `getInvoiceStatus()` for terminal invoices (snapshot at termination).
 - **Multi-asset correctness:** Each transfer is expanded into per-coin entries at processing time using the token's full `coinData` from `TxfToken.genesis.data.coinData`. Once captured, no token lookup is needed at query time.
 - **Incremental via watermark:** The `tokenScanState` map tracks how many `TxfToken.transactions[]` entries have been processed per token. On restart, only the tail of each token's transaction array is scanned. On a warm start with no new transactions, gap processing does a single Map lookup per token.
-- **Retroactive on create/import:** On `createInvoice()` / `importInvoice()`, the full history is scanned for pre-existing payments referencing the new invoice. Each match goes through `processTransfer()` (§5.4.3), which respects the dedup key.
+- **Retroactive on create/import:** On `createInvoice()` / `importInvoice()`, the full history is scanned for pre-existing payments referencing the new invoice. Each match goes through `processTokenTransactions()` (§5.4.3), which respects the dedup key.
 
 #### Storage Efficiency Estimates
 
