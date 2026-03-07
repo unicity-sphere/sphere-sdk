@@ -594,11 +594,15 @@ interface InvoiceReceiptAsset {
 /**
  * Parsed receipt on the payer side — constructed from an incoming DM
  * whose content starts with 'invoice_receipt:'.
+ *
+ * NOTE: `sender*` fields refer to the DM sender, who is the invoice TARGET
+ * (not the invoice payer). The naming follows the DM layer convention where
+ * "sender" = the party who sent the DM.
  */
 interface IncomingInvoiceReceipt {
   /** DirectMessage.id from the DM that carried this receipt */
   readonly dmId: string;
-  /** Target's transport pubkey (from DM sender) */
+  /** Target's transport pubkey (DM sender = invoice target) */
   readonly senderPubkey: string;
   /** Target's nametag (from DM metadata or receipt payload) */
   readonly senderNametag?: string;
@@ -906,9 +910,14 @@ class AccountingModule {
    *      unique sender per target, aggregating all coinId breakdowns into a single
    *      `InvoiceReceiptContribution.assets[]` array.
    *   2. For each unique sender:
-   *      a. If net balance across all coinIds is zero AND !options.includeZeroBalance: skip
+   *      a. If ALL per-coinId net amounts are '0' for this sender AND !options.includeZeroBalance: skip
+   *         (i.e., `assets.every(a => a.netAmount === '0')`. Different coins are never
+   *         summed — the check is per-coinId. A sender with +100 UCT and 0 USDU is non-zero.)
    *      b. Resolve DM recipient (see DELIVERY below)
-   *      c. Build InvoiceReceiptPayload with all coinId breakdowns for this (target, sender)
+   *      c. Build InvoiceReceiptPayload with all coinId breakdowns for this (target, sender).
+   *         Resolve targetNametag from `getActiveAddresses().find(a => a.directAddress === targetAddress)?.nametag`.
+   *         Do NOT use `identity.nametag` directly — it reflects the currently active HD address
+   *         which may differ from the target being processed.
    *      d. Send DM
    *
    * DELIVERY:
@@ -1110,6 +1119,8 @@ interface SendReceiptsResult {
  * Info about a successfully sent receipt DM.
  */
 interface SentReceiptInfo {
+  /** Target address this receipt was sent for (DIRECT:// format) */
+  readonly targetAddress: string;
   /** Effective sender address the receipt was sent for */
   readonly senderAddress: string;
   /** Resolved DM recipient address */
@@ -1122,6 +1133,8 @@ interface SentReceiptInfo {
  * Info about a failed receipt DM.
  */
 interface FailedReceiptInfo {
+  /** Target address this receipt was attempted for (DIRECT:// format) */
+  readonly targetAddress: string;
   /** Effective sender address the receipt was attempted for */
   readonly senderAddress: string;
   /** Reason the receipt failed */
@@ -1685,7 +1698,10 @@ invoice_receipt:{"type":"invoice_receipt","version":1,"invoiceId":"a1b2c3...64he
 3. Parse as JSON. On parse failure, treat as regular DM (do not throw).
 4. Validate required fields:
    - `type` must equal `'invoice_receipt'`
-   - `version` must equal `1` (future versions with higher numbers are silently ignored — forward compat)
+   - `version` must be a number:
+     - If `version === 1`: proceed with current parsing
+     - If `version > 1`: silently ignore — return without firing events (forward compat)
+     - If `version < 1`, not a number, or not an integer: treat as validation failure (step 5 fallthrough)
    - `invoiceId` must be a 64-char lowercase hex string (`/^[0-9a-f]{64}$/`)
    - `terminalState` must be `'CLOSED'` or `'CANCELLED'`
    - `senderContribution` must be an object with `senderAddress` (string) and `assets` (array)
@@ -1697,7 +1713,7 @@ invoice_receipt:{"type":"invoice_receipt","version":1,"invoiceId":"a1b2c3...64he
 - Receipt content is **self-asserted** by the target. A malicious target can send fabricated receipt data (inflated amounts, wrong terminal state). Applications SHOULD cross-reference receipt data against the local invoice status when available.
 - Receipt DMs are encrypted via NIP-17 (same as all DMs through `CommunicationsModule`).
 - The `memo` field in the receipt payload is untrusted user input — applications MUST sanitize before rendering in HTML/DOM contexts.
-- Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice_receipt:` prefix allows UI layers to render them with structured formatting.
+- Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice_receipt:` prefix allows UI layers to render them with structured formatting. **UI dedup guidance:** Applications rendering both DM conversations and structured receipt cards SHOULD use the `invoice_receipt:` prefix to suppress raw text rendering of receipt DMs in conversation views, replacing them with a structured receipt component. The `IncomingInvoiceReceipt.dmId` field allows correlation between the structured `invoice:receipt_received` event and the stored DM.
 
 ---
 
@@ -2501,7 +2517,10 @@ On CommunicationsModule 'message:dm' (subscribed during load()):
 
   5. Validate parsed payload:
      a. type === 'invoice_receipt'
-     b. version === 1  (higher versions are silently ignored for forward compat)
+     b. version must be a number:
+        - version === 1: proceed
+        - version > 1: return (silently ignore, forward compat)
+        - version < 1 or non-number/non-integer: validation failure (step 5 fallthrough)
      c. invoiceId is a 64-char lowercase hex string (/^[0-9a-f]{64}$/)
      d. terminalState is 'CLOSED' or 'CANCELLED'
      e. senderContribution is an object with:
@@ -2527,7 +2546,7 @@ On CommunicationsModule 'message:dm' (subscribed during load()):
 
 **Implementation note:** The DM subscription is set up in `load()` and torn down in `destroy()`. The subscription uses the same lifecycle pattern as PaymentsModule event subscriptions. If `CommunicationsModule` is not in dependencies, receipt detection is simply not available — no error is thrown.
 
-**CommunicationsModule event contract assumption:** This section assumes `CommunicationsModule` emits a `'message:dm'` event (or equivalent `onDirectMessage()` callback) with a payload containing at minimum: `{ id: string, content: string, senderPubkey: string, senderNametag?: string, timestamp?: number }`. If the actual event signature differs, adapt the subscription accordingly.
+**CommunicationsModule subscription mechanism:** AccountingModule subscribes via `dependencies.communications.onDirectMessage(handler)` (the direct CommunicationsModule callback API), NOT via the Sphere event bus (`sphere.on('message:dm', ...)`). This avoids requiring the AccountingModule to access the Sphere-level event emitter. The callback receives a `DirectMessage` object with at minimum: `{ id: string, content: string, senderPubkey: string, senderNametag?: string, timestamp?: number }`. If the CommunicationsModule API differs, adapt the subscription accordingly.
 
 **No separate receipt storage.** Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice:receipt_received` event allows UI layers to detect and render receipts with structured formatting. The AccountingModule does not persist receipt state separately.
 
@@ -3767,7 +3786,7 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_INVALID_ID` | Invoice ID must be a 64-char hex string | Invalid invoiceId passed to buildInvoiceMemo |
 | `INVOICE_TOO_MANY_TARGETS` | Invoice exceeds maximum of 100 targets | Too many targets in CreateInvoiceRequest |
 | `INVOICE_TOO_MANY_ASSETS` | Target exceeds maximum of 50 assets | Too many assets in a single target |
-| `INVOICE_MEMO_TOO_LONG` | Invoice memo exceeds maximum of 4096 characters | InvoiceTerms.memo too long |
+| `INVOICE_MEMO_TOO_LONG` | Memo exceeds maximum of 4096 characters | InvoiceTerms.memo or receipt options.memo too long |
 | `INVOICE_TERMS_TOO_LARGE` | Serialized invoice terms exceed 64 KB limit | Aggregate size of all targets, assets, memo, deliveryMethods too large |
 | `RATE_LIMITED` | Operation rate-limited, try again later | `setAutoReturn('*')` called within 5-second cooldown |
 | `INVOICE_NOT_TERMINATED` | Invoice must be closed or cancelled before sending receipts | `sendInvoiceReceipts()` on non-terminal invoice |
@@ -3827,8 +3846,8 @@ Creator                    Aggregator              Payer
    |                          |                      |
    | sendInvoiceReceipts(id, { memo })               |
    | --- receipt DM (NIP-17) ----------------------> |
+   | invoice:receipt_sent                            |
    |                          |                      | invoice:receipt_received
-   | invoice:receipt_sent                           |
 ```
 
 ## Appendix C: Exchange/Swap Scenario
