@@ -438,7 +438,9 @@ The accounting module wraps all its inbound event processing in try/catch guards
 
 **Implementation:** A `Map<string, Promise<void>>` keyed by invoice ID. Each mutating operation chains onto the existing promise (or creates a new one). This is a lightweight cooperative lock — no OS-level primitives needed in single-threaded JavaScript. The gate ensures that if two events arrive in rapid succession for the same invoice, the second waits for the first to complete before executing. **Cleanup:** After each operation completes, if no further operations are queued, the gate entry is deleted from the map to prevent unbounded memory growth over thousands of invoices.
 
-**Global operations** (`setAutoReturn('*', true)`) acquire the gate for each affected invoice sequentially, not all at once. This prevents deadlocks and allows interleaving with per-invoice operations on other invoices. To prevent unbounded execution time, at most 100 invoices are processed per call (see SPEC §7.6).
+**Global operations** (`setAutoReturn('*', true)`) acquire the gate for each affected invoice sequentially, not all at once. This prevents deadlocks and allows interleaving with per-invoice operations on other invoices. To prevent unbounded execution time, at most 100 invoices are processed per call, with a MUST 5-second cooldown between `setAutoReturn('*')` calls (rejected with `RATE_LIMITED`). When enabling auto-return, `setAutoReturn()` first resets any 'failed' dedup ledger entries to 'pending' (retryCount=0), then triggers the auto-return sweep (see SPEC §7.6).
+
+**Target validation** uses `getActiveAddresses()` (from `Sphere` dependency) to check whether the wallet is a target for close/cancel/return operations. All HD addresses (not just the current one) are checked, ensuring multi-address wallets can operate on invoices targeting any of their addresses.
 
 ### 4.8 Status Computation
 
