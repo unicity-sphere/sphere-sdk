@@ -517,6 +517,95 @@ interface AccountingModuleDependencies {
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
   /** General storage for cancelled/closed sets, frozen balances, auto-return settings */
   storage: StorageProvider;
+  /**
+   * Optional CommunicationsModule instance for sending/receiving receipt DMs.
+   * When provided:
+   * - `sendInvoiceReceipts()` sends receipt DMs via `sendDM()`
+   * - Incoming DMs are monitored for `invoice_receipt:` prefix (payer-side detection)
+   * When omitted:
+   * - `sendInvoiceReceipts()` throws `COMMUNICATIONS_UNAVAILABLE`
+   * - Payer-side receipt detection is disabled (no subscription)
+   */
+  communications?: CommunicationsModule;
+}
+```
+
+### 1.6 Receipt Types
+
+```typescript
+// =============================================================================
+// Receipt Types (Invoice Receipt DMs)
+// =============================================================================
+
+/**
+ * Structured payload inside a receipt DM content field.
+ * Sent by a target to each payer after invoice close or cancel.
+ * Wire format: `invoice_receipt:` prefix + JSON.stringify(InvoiceReceiptPayload).
+ */
+interface InvoiceReceiptPayload {
+  /** Discriminator — always 'invoice_receipt' */
+  readonly type: 'invoice_receipt';
+  /** Format version — always 1 for forward compatibility */
+  readonly version: 1;
+  /** Invoice token ID (64-char hex) */
+  readonly invoiceId: string;
+  /** DIRECT:// address of the target sending this receipt */
+  readonly targetAddress: string;
+  /** Target's nametag (if known at send time) */
+  readonly targetNametag?: string;
+  /** Terminal state of the invoice when receipt was issued */
+  readonly terminalState: 'CLOSED' | 'CANCELLED';
+  /** This sender's contribution breakdown */
+  readonly senderContribution: InvoiceReceiptContribution;
+  /** Optional free-text memo from target (deal/service description) */
+  readonly memo?: string;
+  /** Timestamp when receipt was issued (ms) */
+  readonly issuedAt: number;
+}
+
+/**
+ * Per-sender contribution details within a receipt.
+ */
+interface InvoiceReceiptContribution {
+  /** Effective sender address (DIRECT:// format) — same as InvoiceSenderBalance.senderAddress */
+  readonly senderAddress: string;
+  /** True when senderAddress is actually a refund address */
+  readonly isRefundAddress?: boolean;
+  /** Per-asset breakdown of this sender's contribution to this target */
+  readonly assets: InvoiceReceiptAsset[];
+}
+
+/**
+ * Per-asset breakdown within a receipt contribution.
+ */
+interface InvoiceReceiptAsset {
+  /** Coin ID (e.g., 'UCT', 'USDU') */
+  readonly coinId: string;
+  /** Total forwarded by this sender for this target:coinId */
+  readonly forwardedAmount: string;
+  /** Total returned to this sender for this target:coinId */
+  readonly returnedAmount: string;
+  /** Net amount: forwardedAmount - returnedAmount */
+  readonly netAmount: string;
+  /** Requested amount from the invoice terms for this target:coinId */
+  readonly requestedAmount: string;
+}
+
+/**
+ * Parsed receipt on the payer side — constructed from an incoming DM
+ * whose content starts with 'invoice_receipt:'.
+ */
+interface IncomingInvoiceReceipt {
+  /** DirectMessage.id from the DM that carried this receipt */
+  readonly dmId: string;
+  /** Target's transport pubkey (from DM sender) */
+  readonly senderPubkey: string;
+  /** Target's nametag (from DM metadata or receipt payload) */
+  readonly senderNametag?: string;
+  /** Parsed receipt payload */
+  readonly receipt: InvoiceReceiptPayload;
+  /** Timestamp when the DM was received */
+  readonly receivedAt: number;
 }
 ```
 
@@ -795,6 +884,43 @@ class AccountingModule {
   getAutoReturnSettings(): AutoReturnSettings;
 
   /**
+   * Send receipt DMs to each payer of a terminated invoice.
+   *
+   * For each target address controlled by this wallet, iterates over the
+   * frozen per-sender balances and sends a structured receipt DM to each
+   * payer via `CommunicationsModule.sendDM()`.
+   *
+   * PREREQUISITES:
+   * - Invoice must be in a terminal state (CLOSED or CANCELLED)
+   * - Caller must be a target party
+   * - CommunicationsModule must be available (passed via dependencies)
+   *
+   * DELIVERY:
+   * - Recipient resolution per sender (first match wins):
+   *   1. `contacts[0].address` — payer's explicitly-provided contact address
+   *   2. `senderAddress` (if not a refund address, i.e., `isRefundAddress` is falsy)
+   *   3. Skip — unresolvable sender goes to `failedReceipts`
+   * - DM failures for one sender don't block others (best-effort)
+   * - Receipt DMs do not affect invoice state or balances
+   *
+   * IDEMPOTENCY: Multiple calls send duplicate receipts. Receipts are
+   * informational with no fund-moving side effects. Applications needing
+   * at-most-once semantics should track this themselves.
+   *
+   * @param invoiceId - Invoice token ID (must be terminated)
+   * @param options - Optional memo and filtering options
+   * @returns Result with sent/failed counts and per-sender details
+   * @throws INVOICE_NOT_FOUND if invoice doesn't exist
+   * @throws INVOICE_NOT_TERMINATED if invoice is not CLOSED or CANCELLED
+   * @throws INVOICE_NOT_TARGET if caller is not a target party
+   * @throws COMMUNICATIONS_UNAVAILABLE if CommunicationsModule is not available
+   */
+  async sendInvoiceReceipts(
+    invoiceId: string,
+    options?: SendInvoiceReceiptsOptions
+  ): Promise<SendReceiptsResult>;
+
+  /**
    * Get all transfers related to a specific invoice.
    * Includes forward payments, back payments, return payments, and irrelevant transfers.
    * Scans full transaction history of active and sent tokens.
@@ -931,6 +1057,54 @@ interface ReturnPaymentParams {
   readonly coinId: string;
   /** Optional free text appended to memo */
   readonly freeText?: string;
+}
+
+/**
+ * Options for sendInvoiceReceipts().
+ */
+interface SendInvoiceReceiptsOptions {
+  /** Optional memo — deal/service description included in each receipt. Max 4096 chars. */
+  readonly memo?: string;
+  /** Whether to include senders with net balance of 0 (default: false) */
+  readonly includeZeroBalance?: boolean;
+}
+
+/**
+ * Result of sendInvoiceReceipts().
+ */
+interface SendReceiptsResult {
+  /** Number of receipts successfully sent */
+  readonly sent: number;
+  /** Number of receipts that failed to send */
+  readonly failed: number;
+  /** Details of each successfully sent receipt */
+  readonly sentReceipts: SentReceiptInfo[];
+  /** Details of each failed receipt */
+  readonly failedReceipts: FailedReceiptInfo[];
+}
+
+/**
+ * Info about a successfully sent receipt DM.
+ */
+interface SentReceiptInfo {
+  /** Effective sender address the receipt was sent for */
+  readonly senderAddress: string;
+  /** Resolved DM recipient address */
+  readonly recipientAddress: string;
+  /** DM ID returned by CommunicationsModule.sendDM() */
+  readonly dmId: string;
+}
+
+/**
+ * Info about a failed receipt DM.
+ */
+interface FailedReceiptInfo {
+  /** Effective sender address the receipt was attempted for */
+  readonly senderAddress: string;
+  /** Reason the receipt failed */
+  readonly reason: 'unresolvable' | 'dm_failed';
+  /** Error message (for 'dm_failed' reason) */
+  readonly error?: string;
 }
 ```
 
@@ -1462,6 +1636,45 @@ When resolving invoice references for a transfer, the accounting module uses thi
 - **Contact address is self-asserted (phishing risk).** The `contact.address` field in `InvoiceTransferRef` and `InvoiceSenderBalance.contacts` is set by the payer — the SDK does NOT verify that the contact address belongs to the actual sender. A malicious payer can set any DIRECT:// address as their contact, potentially impersonating another party. Applications MUST NOT treat `contact.address` as verified identity. For identity-sensitive operations (e.g., displaying "Payment from X"), applications SHOULD cross-reference `contact.address` against independently verified identity sources (e.g., nametag registry, trusted contact list). The `refundAddress` field has the same trust model — it is self-asserted and unverified.
 - **Contact URL sanitization.** Inbound `ct.u` values are validated for scheme (`https://` or `wss://` only), length (≤ 2048 chars), and control characters (codepoints < 0x20 rejected to prevent newline/header injection). Applications MUST still sanitize `ct.u` before use in HTML attributes, HTTP headers, or WebSocket handshakes — the SDK strips known-bad patterns but does not guarantee full URL safety.
 - Applications MUST use the SDK's decoding functions — never parse on-chain messages or transport memos manually.
+
+### 4.10 Receipt DM Format
+
+Receipt DMs use a prefix-based content format, following the same pattern as `payment_request:` in `NostrTransportProvider` (line ~570).
+
+**Wire format:**
+
+```
+invoice_receipt:<JSON payload>
+```
+
+Where `<JSON payload>` is `JSON.stringify(InvoiceReceiptPayload)` (no whitespace, no trailing newline).
+
+**Example:**
+
+```
+invoice_receipt:{"type":"invoice_receipt","version":1,"invoiceId":"a1b2c3...64hex...","targetAddress":"DIRECT://...","terminalState":"CLOSED","senderContribution":{"senderAddress":"DIRECT://...","assets":[{"coinId":"UCT","forwardedAmount":"1000000","returnedAmount":"0","netAmount":"1000000","requestedAmount":"1000000"}]},"memo":"Thank you for your payment","issuedAt":1709856000000}
+```
+
+**Parsing rules (payer side):**
+
+1. Check if DM content starts with `invoice_receipt:` — if not, treat as regular DM.
+2. Extract the substring after the prefix: `content.slice('invoice_receipt:'.length)`.
+3. Parse as JSON. On parse failure, treat as regular DM (do not throw).
+4. Validate required fields:
+   - `type` must equal `'invoice_receipt'`
+   - `version` must equal `1` (future versions with higher numbers are silently ignored — forward compat)
+   - `invoiceId` must be a 64-char lowercase hex string (`/^[0-9a-f]{64}$/`)
+   - `terminalState` must be `'CLOSED'` or `'CANCELLED'`
+   - `senderContribution` must be an object with `senderAddress` (string) and `assets` (array)
+5. On validation failure, treat as regular DM (silent — do not throw or fire error events).
+6. On success, construct `IncomingInvoiceReceipt` and fire `invoice:receipt_received` event.
+
+**Security considerations:**
+
+- Receipt content is **self-asserted** by the target. A malicious target can send fabricated receipt data (inflated amounts, wrong terminal state). Applications SHOULD cross-reference receipt data against the local invoice status when available.
+- Receipt DMs are encrypted via NIP-17 (same as all DMs through `CommunicationsModule`).
+- The `memo` field in the receipt payload is untrusted user input — applications MUST sanitize before rendering in HTML/DOM contexts.
+- Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice_receipt:` prefix allows UI layers to render them with structured formatting.
 
 ---
 
@@ -2236,6 +2449,54 @@ No exception from the accounting layer may propagate to or interrupt the payment
 
 **Outbound forward payments to terminated invoices ARE blocked** — `payInvoice()` throws before calling `send()`. This is deliberate: the caller explicitly attempted to pay a terminated invoice.
 
+### 5.11 Receipt DM Processing (Payer Side)
+
+The AccountingModule subscribes to incoming DMs from `CommunicationsModule` during `load()` to detect and parse receipt DMs. This is a passive listener — it does not affect DM delivery or storage.
+
+```
+On CommunicationsModule 'message:dm' (subscribed during load()):
+
+  1. If CommunicationsModule is not available (not passed in dependencies):
+     -> No subscription — receipt detection is disabled. This is fine:
+        receipts are informational and not required for invoice operation.
+
+  2. Check if content starts with 'invoice_receipt:' prefix.
+     If not -> return (regular DM, no action needed)
+
+  3. Extract JSON substring: content.slice('invoice_receipt:'.length)
+
+  4. Try JSON.parse(). On failure -> return (treat as regular DM, silent)
+
+  5. Validate parsed payload:
+     a. type === 'invoice_receipt'
+     b. version === 1  (higher versions are silently ignored for forward compat)
+     c. invoiceId is a 64-char lowercase hex string (/^[0-9a-f]{64}$/)
+     d. terminalState is 'CLOSED' or 'CANCELLED'
+     e. senderContribution is an object with:
+        - senderAddress: non-empty string
+        - assets: array (may be empty)
+     On any validation failure -> return (treat as regular DM, silent)
+
+  6. Construct IncomingInvoiceReceipt:
+     {
+       dmId: dm.id,
+       senderPubkey: dm.senderPubkey,
+       senderNametag: dm.senderNametag ?? payload.targetNametag,
+       receipt: payload,
+       receivedAt: dm.timestamp ?? Date.now()
+     }
+
+  7. Fire 'invoice:receipt_received' event with:
+     {
+       invoiceId: payload.invoiceId,
+       receipt: <constructed IncomingInvoiceReceipt>
+     }
+```
+
+**Implementation note:** The DM subscription is set up in `load()` and torn down in `destroy()`. The subscription uses the same lifecycle pattern as PaymentsModule event subscriptions. If `CommunicationsModule` is not in dependencies, receipt detection is simply not available — no error is thrown.
+
+**No separate receipt storage.** Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice:receipt_received` event allows UI layers to detect and render receipts with structured formatting. The AccountingModule does not persist receipt state separately.
+
 ---
 
 ## 6. Events
@@ -2250,7 +2511,7 @@ cannot extend it. The additions below MUST be made directly in `types/index.ts`.
 updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` and
 `sphere_getInvoiceStatus` to `METHOD_PERMISSIONS`, and add all six intent actions
 (`create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`,
-`set_auto_return`) to `INTENT_PERMISSIONS`.
+`set_auto_return`, `send_invoice_receipts`) to `INTENT_PERMISSIONS`.
 
 ```typescript
 // New SphereEventType additions:
@@ -2269,6 +2530,8 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
 | 'invoice:auto_return_failed'
 | 'invoice:return_received'
 | 'invoice:over_refund_warning'
+| 'invoice:receipts_sent'
+| 'invoice:receipt_received'
 
 // New SphereEventMap entries:
 'invoice:created': {
@@ -2361,6 +2624,17 @@ updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` a
   reason: 'sender_unresolvable' | 'send_failed' | 'max_retries_exceeded';
   refundAddress?: string;                 // if present, shows the refund address that was attempted
   contactAddresses?: string[];            // if present, all contact addresses from the sender (for manual follow-up)
+};
+
+'invoice:receipts_sent': {
+  invoiceId: string;
+  sent: number;                           // number of receipt DMs successfully sent
+  failed: number;                         // number of receipt DMs that failed
+};
+
+'invoice:receipt_received': {
+  invoiceId: string;
+  receipt: IncomingInvoiceReceipt;        // parsed receipt from incoming DM
 };
 ```
 
@@ -2501,6 +2775,15 @@ On createInvoice() or importInvoice():
   3. For each matching transfer found: fire events as if the transfer just arrived
      (invoice:payment, invoice:asset_covered, invoice:target_covered, etc.)
   4. This handles the P2P async case where payments arrive before the invoice
+
+On sendInvoiceReceipts():
+  1. After all receipt DMs are sent (or failed):
+     -> fire 'invoice:receipts_sent' { invoiceId, sent: <count>, failed: <count> }
+
+On CommunicationsModule 'message:dm' (payer-side receipt detection):
+  1. If content starts with 'invoice_receipt:' AND parses successfully (see §5.11):
+     -> fire 'invoice:receipt_received' { invoiceId, receipt: <IncomingInvoiceReceipt> }
+  2. Parse/validation failures are silent — the DM is treated as a regular DM.
 ```
 
 ### 6.3 Idempotency Contract
@@ -3189,6 +3472,18 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 
 **Note:** `getRelatedTransfers()` throws `INVOICE_NOT_FOUND` for unknown invoices rather than returning an empty array, consistent with `getInvoiceStatus()`. This prevents silent failures when callers pass an incorrect invoice ID. `getInvoice()` returns `null` for unknown invoices (non-throwing, lightweight lookup).
 
+### 8.9 sendInvoiceReceipts Validation
+
+| Rule | Error |
+|------|-------|
+| Invoice token must exist locally | `INVOICE_NOT_FOUND` |
+| Invoice must be in a terminal state (CLOSED or CANCELLED) | `INVOICE_NOT_TERMINATED` |
+| Caller must be a target: the `directAddress` of ANY tracked address from `getActiveAddresses()` must match one of the `targets[].address` entries in the invoice terms | `INVOICE_NOT_TARGET` |
+| CommunicationsModule must be available (passed via dependencies) | `COMMUNICATIONS_UNAVAILABLE` |
+| `options.memo` (if provided) must be max 4096 characters | `INVOICE_MEMO_TOO_LONG` |
+
+**Note:** Per-sender DM delivery failures (unresolvable recipient, `sendDM()` error) are collected in `failedReceipts` and do NOT throw. Only the precondition checks above throw errors.
+
 ---
 
 ## 9. Connect Protocol Extensions
@@ -3348,6 +3643,17 @@ If the process crashes after step 1 but before step 2, the next cold start will 
   }
 }
 // Returns: { success: true }
+
+// send_invoice_receipts -- prompts user to confirm sending receipt DMs
+{
+  action: 'send_invoice_receipts',
+  params: {
+    invoiceId: 'abc123...',
+    memo: 'Thank you for your payment', // optional
+    includeZeroBalance: false,           // optional (default: false)
+  }
+}
+// Returns: SendReceiptsResult
 ```
 
 ### 9.3 New Permission Scopes
@@ -3361,6 +3667,7 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 'intent:cancel_invoice'           // Cancel invoice intent
 'intent:return_invoice_payment'   // Return invoice payment intent
 'intent:set_auto_return'          // Set auto-return intent
+'intent:send_invoice_receipts'    // Send invoice receipts intent
 ```
 
 ### 9.4 New Events (Connect push)
@@ -3383,6 +3690,8 @@ If the process crashes after step 1 but before step 2, the next cold start will 
 'invoice:auto_return_failed' // Auto-return failed
 'invoice:return_received'  // When auto-return tokens are received
 'invoice:over_refund_warning' // Total returned exceeds total forwarded (informational)
+'invoice:receipts_sent'    // Receipt DMs sent after close/cancel
+'invoice:receipt_received' // Receipt DM received from a target
 ```
 
 ---
@@ -3427,6 +3736,8 @@ All errors use `SphereError` with the following codes:
 | `INVOICE_MEMO_TOO_LONG` | Invoice memo exceeds maximum of 4096 characters | InvoiceTerms.memo too long |
 | `INVOICE_TERMS_TOO_LARGE` | Serialized invoice terms exceed 64 KB limit | Aggregate size of all targets, assets, memo, deliveryMethods too large |
 | `RATE_LIMITED` | Operation rate-limited, try again later | `setAutoReturn('*')` called within 5-second cooldown |
+| `INVOICE_NOT_TERMINATED` | Invoice must be closed or cancelled before sending receipts | `sendInvoiceReceipts()` on non-terminal invoice |
+| `COMMUNICATIONS_UNAVAILABLE` | CommunicationsModule is required for sending receipt DMs | `sendInvoiceReceipts()` without CommunicationsModule |
 | `MODULE_DESTROYED` | AccountingModule is destroyed | Any public method called after `destroy()` completes |
 
 Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
@@ -3443,6 +3754,7 @@ modules/accounting/
 +-- InvoiceMinter.ts       # Invoice token minting (mirrors NametagMinter)
 +-- StatusComputer.ts      # Invoice status computation logic
 +-- AutoReturnManager.ts   # Auto-return logic for terminated invoices
++-- ReceiptSender.ts       # Receipt DM composition and delivery
 +-- memo.ts                # Memo parsing/building utilities
 +-- types.ts               # All type definitions (InvoiceTerms, CoinEntry, NFTEntry, etc.)
 +-- index.ts               # Barrel exports
@@ -3478,6 +3790,11 @@ Creator                    Aggregator              Payer
    | invoice:payment (conf=true, re-fire)            |
    | invoice:closed { explicit: false }              |
    | (balances frozen and persisted)                 |
+   |                          |                      |
+   | sendInvoiceReceipts(id, { memo })               |
+   | --- receipt DM (NIP-17) ----------------------> |
+   |                          |                      | invoice:receipt_received
+   | invoice:receipts_sent                           |
 ```
 
 ## Appendix C: Exchange/Swap Scenario

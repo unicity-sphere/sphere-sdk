@@ -19,6 +19,7 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 | **Outbound payment blocking for terminated invoices** | Outgoing forward payments (`INV:<id>:F`) referencing a locally terminated (CLOSED or CANCELLED) invoice are **blocked** — the transfer is prevented and an exception is thrown. This is enforced at the `payInvoice()` / memo-construction layer, not in `PaymentsModule.send()`. |
 | **Non-blocking inbound observer** | Accounting errors during inbound transfer processing MUST NEVER break the token transfer flow. Inbound transfers are atomic — they either happen fully or not at all. The accounting module is a side-effect observer that processes inbound transfers after the fact. |
 | **Idempotent event re-firing** | The same event (with the same or updated `confirmed` flag) may fire multiple times for the same underlying transfer. Event consumers MUST be idempotent — handling a re-fired event must produce the same result as handling it once. This is the fundamental contract. |
+| **Receipt DMs are opt-in and best-effort** | Receipt DMs are sent explicitly by the target via `sendInvoiceReceipts()`, never automatically on close/cancel. Delivery is best-effort — failures for individual senders are collected but do not block others or affect invoice state. Receipts use `CommunicationsModule.sendDM()` (NIP-17 encrypted DMs) with an `invoice_receipt:` prefix for content sniffing. |
 
 ## 2. Architecture Diagram
 
@@ -40,10 +41,15 @@ The Accounting Module extends Sphere SDK with invoice creation, tracking, and se
 |  +-------v--------+            |  - returnInvoicePayment()       |  |
 |  |  Oracle         |            |  - setAutoReturn()              |  |
 |  |  (Aggregator)   |<-----------|  - getAutoReturnSettings()      |  |
-|  |                 |  mint      |  - getRelatedTransfers()        |  |
-|  |                 |            |  - parseInvoiceMemo()            |  |
-|  +-----------------+            |  - load() / destroy()           |  |
-|                                 +-------+-------+-------+---------+  |
+|  |                 |  mint      |  - sendInvoiceReceipts()        |  |
+|  |                 |            |  - getRelatedTransfers()        |  |
+|  +-----------------+            |  - parseInvoiceMemo()            |  |
+|                                 |  - load() / destroy()           |  |
+|  +------------------+  sendDM  |                                 |  |
+|  | Communications   |<---------|  (receipt DMs, optional)         |  |
+|  | Module           |  onDM    |                                 |  |
+|  | (optional)       |--------->|  (payer-side receipt detection)  |  |
+|  +------------------+          +-------+-------+-------+---------+  |
 |                                 |  TokenStorage  | StorageProvider |  |
 |                                 |  (per-address) | (per-address)   |  |
 |                                 |  Invoice tokens| Invoice-Transfer|  |
@@ -689,6 +695,8 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:auto_return_failed` | `{ invoiceId, transferId, reason, refundAddress?, contactAddresses? }` | Auto-return failed — `reason`: `'sender_unresolvable'` \| `'send_failed'` \| `'max_retries_exceeded'` |
 | `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return — `returnReason`: `'closed'` (from `:RC`) \| `'cancelled'` (from `:RX`). May trigger sender-side implicit termination |
 | `invoice:over_refund_warning` | `{ invoiceId, senderAddress, coinId, forwardedAmount, returnedAmount }` | Total returned to sender exceeds total forwarded — informational warning, transfer not blocked |
+| `invoice:receipts_sent` | `{ invoiceId, sent, failed }` | Receipt DMs sent after `sendInvoiceReceipts()` completes |
+| `invoice:receipt_received` | `{ invoiceId, receipt: IncomingInvoiceReceipt }` | Receipt DM received from a target (payer-side, detected via `invoice_receipt:` prefix) |
 
 **Event ordering guarantee:** `invoice:closed` fires BEFORE any `invoice:auto_returned` events, for both explicit close (via `closeInvoice()`) and implicit close (all targets covered + all confirmed). This ensures listeners can react to the close before seeing the auto-return consequences.
 
@@ -722,6 +730,7 @@ All events with a `confirmed` field follow this contract:
 | `cancel_invoice` | Confirmation modal | Cancel an invoice |
 | `return_invoice_payment` | Return modal | Return tokens for an invoice |
 | `set_auto_return` | Confirmation modal | Enable/disable auto-return |
+| `send_invoice_receipts` | Confirmation modal | Send receipt DMs to payers of a terminated invoice |
 
 ### 8.3 New Permission Scopes
 
@@ -734,6 +743,7 @@ All events with a `confirmed` field follow this contract:
 | `intent:cancel_invoice` | Cancel invoice intent |
 | `intent:return_invoice_payment` | Return invoice payment intent |
 | `intent:set_auto_return` | Set auto-return intent |
+| `intent:send_invoice_receipts` | Send invoice receipts intent |
 
 ## 9. Multi-Party Perspective
 
@@ -853,6 +863,22 @@ Recipient (alice) cancels invoice:
 Sender receives the auto-return (INV:abc:RX):
   -> Fires invoice:return_received { returnReason: 'cancelled' }
   -> Sender's module MAY auto-cancel invoice abc locally
+
+--- Optional: Send receipts after close ---
+
+Recipient (alice) sends receipts after closing:
+  -> sendInvoiceReceipts('abc', { memo: 'Thank you for your payment' })
+  -> For each sender with non-zero frozen balance:
+     - Resolve DM recipient: contacts[0].address ?? senderAddress ?? skip
+     - Build InvoiceReceiptPayload with per-asset breakdown
+     - Send via CommunicationsModule.sendDM() (NIP-17 encrypted)
+  -> Fires invoice:receipts_sent { invoiceId: 'abc', sent: 2, failed: 0 }
+
+Sender receives the receipt DM:
+  -> CommunicationsModule delivers DM with 'invoice_receipt:' prefix
+  -> AccountingModule detects prefix, parses payload, validates
+  -> Fires invoice:receipt_received { invoiceId: 'abc', receipt: ... }
+  -> UI renders structured receipt (amount breakdown, memo, terminal state)
 ```
 
 ## 10. Error Handling
@@ -876,6 +902,10 @@ Sender receives the auto-return (INV:abc:RX):
 | Auto-return failure | Log error — the inbound transfer is already recorded, auto-return can be retried later |
 | Event processing failure | Log error, continue — transfer is already complete, accounting catches up on next recomputation |
 | Status computation failure | Return error to caller — does not affect any transfer in progress |
+| Receipt send to non-terminal invoice | **Throw `INVOICE_NOT_TERMINATED`** — receipts require CLOSED or CANCELLED state |
+| Receipt send without CommunicationsModule | **Throw `COMMUNICATIONS_UNAVAILABLE`** — CommunicationsModule is required |
+| Receipt DM delivery failure (per-sender) | Collect in `failedReceipts` — does not throw, does not block other receipts |
+| Incoming receipt DM parse failure | Ignore silently — treat as regular DM, no error event |
 
 ## 11. Future Extensions
 
@@ -888,4 +918,4 @@ These are **not** in scope for v1 but inform the architecture:
 - **L1 payment matching**: Match L1 (ALPHA) transfers to invoice targets via L1 history
 - **Cross-chain invoices**: Targets on different chains/networks
 - **Invoice negotiation**: Counter-offers modifying invoice terms via transport messages
-- **Receipts, cancellation notices, and payment reminders**: Use the `contacts` array (from `InvoiceSenderBalance`, accumulated from `inv.ct` on-chain payloads) to send structured messages to payers after close (receipt), on cancellation (notice), or when payment is overdue (reminder). Contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null`. The `contact.url` field enables delivery via non-Nostr transports (HTTPS webhooks, WebSocket endpoints).
+- **Cancellation notices and payment reminders**: Use the `contacts` array (from `InvoiceSenderBalance`, accumulated from `inv.ct` on-chain payloads) to send structured messages to payers on cancellation (notice) or when payment is overdue (reminder). Contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null`. The `contact.url` field enables delivery via non-Nostr transports (HTTPS webhooks, WebSocket endpoints). (Note: **Receipts** are now fully specified — see `sendInvoiceReceipts()` in ACCOUNTING-SPEC.md §2.1 and §4.10.)
