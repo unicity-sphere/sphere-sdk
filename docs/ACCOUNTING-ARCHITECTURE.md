@@ -224,7 +224,7 @@ The on-chain `message` carries a structured `TransferMessagePayload`:
 { inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX", ra?: "<DIRECT://...>", ct?: { a: "<DIRECT://...>", u?: "<URL>" } }, txt?: "..." }
 ```
 
-The optional `ra` (refund address) field provides a stable return destination for masked-predicate payers whose sender address becomes unresolvable after the transfer. It is set by the payer via `payInvoice({ refundAddress })` and is NOT included in the transport memo (privacy: transport memos are human-readable). Auto-return destination priority: `ra` → sender address → fail.
+The optional `ra` (refund address) field provides an explicit return destination for the payer. When the sender uses a masked predicate, the sender address becomes unresolvable, making `ra` essential. For unmasked predicates, `ra` overrides the sender address as the return destination and per-sender balance key. It is set by the payer via `payInvoice({ refundAddress })` and is NOT included in the transport memo (privacy: transport memos are human-readable). Auto-return destination priority: `ra` → sender address → fail.
 
 The optional `ct` (contact) field provides payer contact info for future communication between the invoice target and the payer (receipts after close, cancellation notices, payment reminders). `ct.a` is a required DIRECT:// address; `ct.u` is an optional non-Nostr transport URL (https:// or wss://, max 2048 chars). Set by the payer via `payInvoice({ contact })`. When `contact` is not explicitly provided, `payInvoice()` auto-populates it from `identity.directAddress`. Like `ra`, contact is NOT included in the transport memo. Contact is purely informational — it does not affect auto-return routing or balance computation. Per-sender `contacts` (on `InvoiceSenderBalance`) accumulates all unique contact entries from that sender's transfers. Applications SHOULD use the contact resolution priority: `contacts[0].address → refundAddress → senderAddress → null` when needing to reach a payer. **Security:** `contact.address` is self-asserted by the payer — applications MUST NOT trust it as identity verification (see ACCOUNTING-SPEC.md §4.9).
 
@@ -686,7 +686,7 @@ Added to `SphereEventType` and `SphereEventMap`:
 | `invoice:overpayment` | `{ invoiceId, address, coinId, surplus, confirmed }` | Payment exceeds requested amount |
 | `invoice:irrelevant` | `{ invoiceId, transfer, reason, confirmed }` | Transfer references this invoice but doesn't match any target address or requested asset |
 | `invoice:auto_returned` | `{ invoiceId, originalTransfer, returnTransfer }` | Tokens were auto-returned for a terminated invoice |
-| `invoice:auto_return_failed` | `{ invoiceId, transferId, reason }` | Auto-return failed — `reason`: `'sender_unresolvable'` \| `'send_failed'` \| `'max_retries_exceeded'` |
+| `invoice:auto_return_failed` | `{ invoiceId, transferId, reason, refundAddress?, contactAddresses? }` | Auto-return failed — `reason`: `'sender_unresolvable'` \| `'send_failed'` \| `'max_retries_exceeded'` |
 | `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Received auto-return — `returnReason`: `'closed'` (from `:RC`) \| `'cancelled'` (from `:RX`). May trigger sender-side implicit termination |
 | `invoice:over_refund_warning` | `{ invoiceId, senderAddress, coinId, forwardedAmount, returnedAmount }` | Total returned to sender exceeds total forwarded — informational warning, transfer not blocked |
 
