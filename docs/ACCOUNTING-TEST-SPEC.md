@@ -35,7 +35,7 @@ Validate AccountingModule (§ ACCOUNTING-SPEC.md) through three test categories:
 - **Methods tested:** All 17 public methods (load, destroy, createInvoice, importInvoice, getInvoiceStatus, getInvoices, getInvoice, closeInvoice, cancelInvoice, payInvoice, returnInvoicePayment, setAutoReturn, getAutoReturnSettings, sendInvoiceReceipts, sendCancellationNotices, getRelatedTransfers, parseInvoiceMemo)
 - **Error codes:** All 38 error codes (§10)
 - **State machine:** All transitions (OPEN → PARTIAL → COVERED → CLOSED/CANCELLED/EXPIRED)
-- **Events:** All 19 core + 4 DM event types (23 total) with idempotency
+- **Events:** All 19 event types (including 4 DM-related) with idempotency
 - **Storage:** Persisted data (cancelled set, closed set, frozen balances, auto-return settings, invoice-transfer index)
 - **Memo encoding:** All direction codes (F, B, RC, RX) and memo parsing
 - **CLI:** All 14 commands, flag validation, prefix matching, output formats
@@ -468,7 +468,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Preconditions:** Module loaded, history contains transfer referencing non-existent invoice before createInvoice() is called
 - **Action:** Create that invoice
 - **Expected:** Retroactive payment event fired immediately; invoice terms stored
-- **Spec ref:** §2.1 createInvoice() flow step 6; see also ARCHITECTURE.md §7.2 P2P Async
+- **Spec ref:** §2.1 createInvoice() flow step 6; see also ARCHITECTURE.md §7.3 P2P Async
 
 #### UT-CREATE-037: Invalid NFT tokenId (non-64-hex)
 - **Preconditions:** Module loaded
@@ -528,7 +528,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Preconditions:** Module loaded, history contains transfer referencing the token being imported
 - **Action:** `importInvoice(token)`
 - **Expected:** Retroactive events fired for pre-existing transfers; terms returned
-- **Spec ref:** §2.1 importInvoice() "scans full transaction history"; see also ARCHITECTURE.md §7.2 P2P Async
+- **Spec ref:** §2.1 importInvoice() "scans full transaction history"; see also ARCHITECTURE.md §7.3 P2P Async
 
 #### UT-IMPORT-009: createdAt timestamp validation (future allowed)
 - **Preconditions:** Module loaded, token with createdAt = now + 3600000 (within 1-day clock skew)
@@ -618,19 +618,19 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Preconditions:** Module with PARTIAL invoice; sender forwarded 5 UCT, then sent return :B for 5 UCT
 - **Action:** `getInvoiceStatus(invoiceId)`
 - **Expected:** Status reverts to OPEN; all balances zero again
-- **Spec ref:** §5.7 reverse transitions
+- **Spec ref:** §5.7 EXPIRED State Semantics (reverse transitions)
 
 #### UT-STATUS-013: COVERED → PARTIAL (return reduces below full coverage)
 - **Preconditions:** Module with COVERED invoice; 10 UCT required, 12 received; then :B return of 3 UCT
 - **Action:** `getInvoiceStatus(invoiceId)`
 - **Expected:** Status changes from COVERED to PARTIAL (9 UCT net, below 10 required)
-- **Spec ref:** §5.7 reverse transitions
+- **Spec ref:** §5.7 EXPIRED State Semantics (reverse transitions)
 
 #### UT-STATUS-014: COVERED → CANCELLED (explicit cancel from COVERED)
 - **Preconditions:** Module with COVERED invoice
 - **Action:** `cancelInvoice(invoiceId)` then `getInvoiceStatus(invoiceId)`
 - **Expected:** Status is CANCELLED; frozen balances persisted
-- **Spec ref:** §4.2 state transitions
+- **Spec ref:** §5.1 status computation; ARCHITECTURE.md §4.2 state transitions
 
 #### UT-STATUS-015: EXPIRED → COVERED (all payments arrive after dueDate)
 - **Preconditions:** Module with invoice, dueDate passed, invoice is EXPIRED (partial), then final payment arrives covering all targets
@@ -648,7 +648,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Preconditions:** Module with EXPIRED invoice
 - **Action:** `cancelInvoice(invoiceId)` then `getInvoiceStatus(invoiceId)`
 - **Expected:** Status is CANCELLED
-- **Spec ref:** §4.2 state transitions
+- **Spec ref:** §5.1 status computation; ARCHITECTURE.md §4.2 state transitions
 
 #### UT-STATUS-018: EXPIRED stays EXPIRED after return (not OPEN)
 - **Preconditions:** Module with EXPIRED invoice (partially covered, past due), then :B return reducing coverage to zero
@@ -1039,25 +1039,25 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-MEMO-001: parseInvoiceMemo() with F direction
 - **Preconditions:** N/A (offline utility)
 - **Action:** `parseInvoiceMemo('INV:a1b2c3d4e5f6a7b8...:F Payment for consulting')`
-- **Expected:** Returns { invoiceId: 'a1b2c3d4e5f6a7b8...', direction: 'forward', freeText: 'Payment for consulting' }
+- **Expected:** Returns { invoiceId: 'a1b2c3d4e5f6a7b8...', paymentDirection: 'forward', freeText: 'Payment for consulting' }
 - **Spec ref:** §4 memo format
 
 #### UT-MEMO-002: parseInvoiceMemo() with B direction
 - **Preconditions:** N/A
 - **Action:** `parseInvoiceMemo('INV:abc...:B')`
-- **Expected:** Returns { invoiceId: 'abc...', direction: 'back', freeText: '' }
+- **Expected:** Returns { invoiceId: 'abc...', paymentDirection: 'back', freeText: '' }
 - **Spec ref:** §4
 
 #### UT-MEMO-003: parseInvoiceMemo() with RC direction
 - **Preconditions:** N/A
 - **Action:** `parseInvoiceMemo('INV:abc...:RC')`
-- **Expected:** Returns { invoiceId: 'abc...', direction: 'return_closed', freeText: '' }
+- **Expected:** Returns { invoiceId: 'abc...', paymentDirection: 'return_closed', freeText: '' }
 - **Spec ref:** §4
 
 #### UT-MEMO-004: parseInvoiceMemo() with RX direction
 - **Preconditions:** N/A
 - **Action:** `parseInvoiceMemo('INV:abc...:RX')`
-- **Expected:** Returns { invoiceId: 'abc...', direction: 'return_cancelled', freeText: '' }
+- **Expected:** Returns { invoiceId: 'abc...', paymentDirection: 'return_cancelled', freeText: '' }
 - **Spec ref:** §4
 
 #### UT-MEMO-005: parseInvoiceMemo() with no match
@@ -1095,6 +1095,12 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Action:** `buildInvoiceMemo('a'.repeat(64), 'forward', 'custom text')`
 - **Expected:** Returns memo with appended free text
 - **Spec ref:** §4
+
+#### UT-MEMO-011: Legacy fallback — on-chain message null, transport memo INV: reference
+- **Preconditions:** Module loaded with invoice; transfer token has TxfTransaction.data.message = null (no on-chain message)
+- **Action:** Process transfer where HistoryRecord.memo contains 'INV:invoiceId:F Payment text'
+- **Expected:** Fallback path activates; transfer indexed correctly against the invoice; invoice:payment event fires
+- **Spec ref:** §4.8 legacy fallback path
 
 ---
 
@@ -1171,13 +1177,13 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-EVENTS-012: invoice:return_received fires on :RC/:RX transfer
 - **Preconditions:** Module with invoice
 - **Action:** Trigger transfer with RC direction code from target
-- **Expected:** Event fired with { invoiceId, direction: 'return_closed' }
+- **Expected:** Event fired with { invoiceId, transfer, returnReason: 'closed' }
 - **Spec ref:** §6.2 step 5
 
-#### UT-EVENTS-013: invoice:irrelevant fires for non-matching transfers
-- **Preconditions:** Module with invoice
-- **Action:** Trigger transfer not referencing any invoice
-- **Expected:** Event fired with { transfer, reason: 'unknown_reference' }
+#### UT-EVENTS-013: invoice:irrelevant fires for transfer to unknown address
+- **Preconditions:** Module with invoice targeting @alice
+- **Action:** Trigger transfer referencing the invoice but sent to @bob (not a target)
+- **Expected:** Event fired with { invoiceId, transfer, reason: 'unknown_address', confirmed }
 - **Spec ref:** §6.2 step 6c
 
 #### UT-EVENTS-014: invoice:irrelevant with reason 'unauthorized_return'
@@ -1201,7 +1207,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-EVENTS-017: invoice:auto_returned fires on successful auto-return
 - **Preconditions:** Module with invoice, terminal state, auto-return enabled, balance available
 - **Action:** Trigger implicit auto-return via terminal state trigger
-- **Expected:** Event fired with { invoiceId, coinId, amount, recipient }
+- **Expected:** Event fired with { invoiceId, originalTransfer, returnTransfer }
 - **Spec ref:** §6.2 step 5
 
 #### UT-EVENTS-018: invoice:auto_return_failed fires on send failure
@@ -1219,13 +1225,13 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-EVENTS-020: invoice:receipt_sent fires after sendInvoiceReceipts()
 - **Preconditions:** Module with CLOSED invoice
 - **Action:** `sendInvoiceReceipts(invoiceId)` completes successfully
-- **Expected:** Event fired with { invoiceId, sentCount, failedCount }
+- **Expected:** Event fired with { invoiceId, sent, failed }
 - **Spec ref:** §6.2
 
 #### UT-EVENTS-021: invoice:cancellation_sent fires after sendCancellationNotices()
 - **Preconditions:** Module with CANCELLED invoice
 - **Action:** `sendCancellationNotices(invoiceId)` completes successfully
-- **Expected:** Event fired with { invoiceId, sentCount, failedCount }
+- **Expected:** Event fired with { invoiceId, sent, failed }
 - **Spec ref:** §6.2
 
 #### UT-EVENTS-022: invoice:receipt_received fires on receipt DM
@@ -1240,6 +1246,18 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Expected:** Event fired with { invoiceId, senderNametag, reason }
 - **Spec ref:** §5.12
 
+#### UT-EVENTS-024: invoice:unknown_reference fires for unrecognized invoice ID
+- **Preconditions:** Module loaded; NO invoice with ID 'abc123...' in local storage
+- **Action:** Trigger inbound transfer with INV:abc123...:F memo referencing a non-existent invoice
+- **Expected:** Event fired with { invoiceId: 'abc123...', transfer }; transfer proceeds normally (not blocked)
+- **Spec ref:** §6.2 step 2 "invoice not in local storage"
+
+#### UT-EVENTS-025: invoice:over_refund_warning fires when returns exceed forwards
+- **Preconditions:** Module loaded; invoice with sender A who forwarded 5 UCT; target sends :B return of 3 UCT; then target sends another :B return of 3 UCT (total returns 6 > forwarded 5)
+- **Action:** Process the second return transfer
+- **Expected:** Event fired with { invoiceId, senderAddress, coinId: 'UCT', forwardedAmount: '5000000', returnedAmount: '6000000' }
+- **Spec ref:** §6.2 step 3c "over-refund warning"
+
 ---
 
 ### 3.14 On-Chain Message Decoding
@@ -1249,7 +1267,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-DECODE-001: Valid TransferMessagePayload parsed correctly
 - **Preconditions:** N/A
 - **Action:** Call `decodeTransferMessage` with valid JSON: `{ "inv": { "id": "a1b2c3d4...", "dir": "F" } }`
-- **Expected:** Returns { invoiceId, direction: 'forward' }
+- **Expected:** Returns { invoiceId, paymentDirection: 'forward' }
 - **Spec ref:** §4.1
 
 #### UT-DECODE-002: inv as array → null
@@ -1525,7 +1543,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-AUTOTERM-001: Receiving :RC with autoTerminateOnReturn: true → invoice auto-closed
 - **Preconditions:** Module configured with autoTerminateOnReturn: true; invoice is OPEN/PARTIAL
 - **Action:** Receive transfer with RC direction from a target
-- **Expected:** Invoice is automatically closed locally via internal _terminateInvoice() (not public closeInvoice); no deadlock
+- **Expected:** Invoice state changes to CLOSED; 'invoice:closed' event fires with explicit: false; no deadlock; public closeInvoice() is NOT re-entered
 - **Spec ref:** §4.5 autoTerminateOnReturn
 
 #### UT-AUTOTERM-002: Receiving :RX with autoTerminateOnReturn: true → invoice auto-cancelled
@@ -1841,7 +1859,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### CLI-030: invoice help listing
 - **Command:** `invoice`
 - **Verify:** Lists all 14 commands with brief descriptions
-- **Spec ref:** §11.2 help
+- **Spec ref:** §11.3 help listing
 
 #### CLI-031: --targets with path traversal (/etc/passwd) → error message
 - **Command:** `invoice-create --targets /etc/passwd`
@@ -1867,13 +1885,13 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-RECEIPTS-001: Happy path — send receipts for CLOSED invoice
 - **Preconditions:** Module loaded; invoice CLOSED with frozen balances; 2 senders with non-zero balances; CommunicationsModule available
 - **Action:** `sendInvoiceReceipts(invoiceId)`
-- **Expected:** 2 DMs sent via CommunicationsModule.sendDM(); each DM has `invoice_receipt:` prefix; returns { sentCount: 2, failedCount: 0 }; fires invoice:receipt_sent event
+- **Expected:** 2 DMs sent via CommunicationsModule.sendDM(); each DM has `invoice_receipt:` prefix; returns { sent: 2, failed: 0 }; fires invoice:receipt_sent event
 - **Spec ref:** §2.1 sendInvoiceReceipts(), §4.10
 
 #### UT-RECEIPTS-002: Happy path — send receipts for CANCELLED invoice
 - **Preconditions:** Module loaded; invoice CANCELLED with frozen balances; 1 sender
 - **Action:** `sendInvoiceReceipts(invoiceId)`
-- **Expected:** 1 DM sent; returns { sentCount: 1, failedCount: 0 }; fires invoice:receipt_sent
+- **Expected:** 1 DM sent; returns { sent: 1, failed: 0 }; fires invoice:receipt_sent
 - **Spec ref:** §2.1 sendInvoiceReceipts()
 
 #### UT-RECEIPTS-003: Receipt DM content includes per-asset breakdown
@@ -1888,15 +1906,15 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Expected:** Receipt DM includes custom memo field
 - **Spec ref:** §2.1 sendInvoiceReceipts() options.memo
 
-#### UT-RECEIPTS-005: --include-zero sends to senders with zero balance
+#### UT-RECEIPTS-005: includeZeroBalance sends to senders with zero balance
 - **Preconditions:** Module loaded; invoice CLOSED; sender A has balance 5, sender B has balance 0
-- **Action:** `sendInvoiceReceipts(invoiceId, { includeZero: true })`
+- **Action:** `sendInvoiceReceipts(invoiceId, { includeZeroBalance: true })`
 - **Expected:** 2 DMs sent (including sender B with zero balance)
-- **Spec ref:** §2.1 sendInvoiceReceipts() options.includeZero
+- **Spec ref:** §2.1 sendInvoiceReceipts() options.includeZeroBalance
 
-#### UT-RECEIPTS-006: Without --include-zero, zero-balance senders skipped
+#### UT-RECEIPTS-006: Without includeZeroBalance, zero-balance senders skipped
 - **Preconditions:** Same as UT-RECEIPTS-005
-- **Action:** `sendInvoiceReceipts(invoiceId)` (no includeZero)
+- **Action:** `sendInvoiceReceipts(invoiceId)` (no includeZeroBalance)
 - **Expected:** 1 DM sent (only sender A); sender B skipped
 - **Spec ref:** §2.1 sendInvoiceReceipts()
 
@@ -1909,7 +1927,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-RECEIPTS-008: Partial DM failure — some succeed, some fail
 - **Preconditions:** Module loaded; invoice CLOSED; 3 senders; CommunicationsModule.sendDM() fails for sender B
 - **Action:** `sendInvoiceReceipts(invoiceId)`
-- **Expected:** Returns { sentCount: 2, failedCount: 1, failedReceipts: [{ address: senderB, error: ... }] }; does NOT throw
+- **Expected:** Returns { sent: 2, failed: 1, failedReceipts: [{ address: senderB, error: ... }] }; does NOT throw
 - **Spec ref:** §8.9 per-sender DM delivery failures
 
 #### UT-RECEIPTS-009: INVOICE_NOT_FOUND — nonexistent invoice
@@ -1930,11 +1948,11 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Expected:** Throws SphereError with code INVOICE_MEMO_TOO_LONG
 - **Spec ref:** §10 INVOICE_MEMO_TOO_LONG
 
-#### UT-RECEIPTS-012: INVOICE_NOT_TARGET — non-target caller
-- **Preconditions:** Module loaded; invoice CLOSED; wallet address not in targets
+#### UT-RECEIPTS-012: INVOICE_NOT_TERMINATED — invoice is COVERED (non-terminal)
+- **Preconditions:** Module loaded; invoice in COVERED state (all assets covered but not yet closed)
 - **Action:** `sendInvoiceReceipts(invoiceId)`
-- **Expected:** Throws SphereError with code INVOICE_NOT_TARGET
-- **Spec ref:** §10 INVOICE_NOT_TARGET
+- **Expected:** Throws SphereError with code INVOICE_NOT_TERMINATED
+- **Spec ref:** §10 INVOICE_NOT_TERMINATED
 
 #### UT-RECEIPTS-013: INVOICE_NOT_TERMINATED — invoice is OPEN
 - **Preconditions:** Module loaded; invoice in OPEN state
@@ -1969,7 +1987,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-NOTICES-001: Happy path — send cancellation notices for CANCELLED invoice
 - **Preconditions:** Module loaded; invoice CANCELLED with frozen balances; 2 senders with non-zero balances; CommunicationsModule available
 - **Action:** `sendCancellationNotices(invoiceId)`
-- **Expected:** 2 DMs sent with `invoice_cancellation:` prefix; returns { sentCount: 2, failedCount: 0 }; fires invoice:cancellation_sent event
+- **Expected:** 2 DMs sent with `invoice_cancellation:` prefix; returns { sent: 2, failed: 0 }; fires invoice:cancellation_sent event
 - **Spec ref:** §2.1 sendCancellationNotices(), §4.11
 
 #### UT-NOTICES-002: INVOICE_NOT_CANCELLED — invoice is CLOSED (not CANCELLED)
@@ -1980,7 +1998,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 #### UT-NOTICES-003: Custom reason and dealDescription included
 - **Preconditions:** Module loaded; invoice CANCELLED; 1 sender
-- **Action:** `sendCancellationNotices(invoiceId, { reason: 'Out of stock', deal: 'Order #1234' })`
+- **Action:** `sendCancellationNotices(invoiceId, { reason: 'Out of stock', dealDescription: 'Order #1234' })`
 - **Expected:** Cancellation DM payload includes reason and dealDescription fields
 - **Spec ref:** §4.11 cancellation notice payload
 
@@ -1992,7 +2010,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 #### UT-NOTICES-005: INVOICE_MEMO_TOO_LONG — dealDescription exceeds 4096 chars
 - **Preconditions:** Module loaded; invoice CANCELLED
-- **Action:** `sendCancellationNotices(invoiceId, { deal: 'x'.repeat(4097) })`
+- **Action:** `sendCancellationNotices(invoiceId, { dealDescription: 'x'.repeat(4097) })`
 - **Expected:** Throws SphereError with code INVOICE_MEMO_TOO_LONG
 - **Spec ref:** §10 INVOICE_MEMO_TOO_LONG
 
@@ -2011,7 +2029,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-NOTICES-008: Partial DM failure — some succeed, some fail
 - **Preconditions:** Module loaded; invoice CANCELLED; 3 senders; sendDM fails for sender B
 - **Action:** `sendCancellationNotices(invoiceId)`
-- **Expected:** Returns { sentCount: 2, failedCount: 1, failedNotices: [{ address: senderB, error: ... }] }; does NOT throw
+- **Expected:** Returns { sent: 2, failed: 1, failedNotices: [{ address: senderB, error: ... }] }; does NOT throw
 - **Spec ref:** §8.9 per-sender DM delivery failures
 
 #### UT-NOTICES-009: INVOICE_NOT_FOUND — nonexistent invoice
@@ -2020,11 +2038,11 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 - **Expected:** Throws SphereError with code INVOICE_NOT_FOUND
 - **Spec ref:** §10 INVOICE_NOT_FOUND
 
-#### UT-NOTICES-010: --include-zero sends notices to zero-balance senders
+#### UT-NOTICES-010: includeZeroBalance sends notices to zero-balance senders
 - **Preconditions:** Module loaded; invoice CANCELLED; sender A has balance, sender B has zero
-- **Action:** `sendCancellationNotices(invoiceId, { includeZero: true })`
+- **Action:** `sendCancellationNotices(invoiceId, { includeZeroBalance: true })`
 - **Expected:** 2 DMs sent (including sender B)
-- **Spec ref:** §2.1 sendCancellationNotices() options.includeZero
+- **Spec ref:** §2.1 sendCancellationNotices() options.includeZeroBalance
 
 ---
 
@@ -2041,7 +2059,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### UT-TRANSFERS-002: Includes irrelevant transfers
 - **Preconditions:** Module loaded; invoice with 1 relevant forward + 1 irrelevant (wrong target)
 - **Action:** `getRelatedTransfers(invoiceId)`
-- **Expected:** Both transfers returned; irrelevant transfer marked with relevant: false
+- **Expected:** Both transfers returned; irrelevant transfer has `reason` field set (e.g., reason: 'unknown_address') per IrrelevantTransfer type
 - **Spec ref:** §2.1 getRelatedTransfers()
 
 #### UT-TRANSFERS-003: Empty result — no transfers for invoice
@@ -2086,7 +2104,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
   5. Creator calls closeInvoice
   6. Payer receives sendInvoiceReceipts DM
   7. Creator calls sendCancellationNotices (error expected: INVOICE_NOT_CANCELLED)
-- **Verify:** All events fire in sequence; balances correct; storage persisted
+- **Verify:** Events fire in order: [invoice:created, invoice:payment, invoice:covered, invoice:closed, invoice:receipt_sent]; final balance = 10 UCT covered; frozen balances persisted to storage
 - **Spec ref:** §2.1 full lifecycle
 
 ### 4.2–4.10 E2E Workflow Tests (Planned)
@@ -2112,13 +2130,13 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 #### CONC-001: Per-invoice gate serialization
 - **Setup:** Module with invoice; 2 async handlers (payment + closure)
 - **Action:** Trigger payment and close simultaneously using `Promise.all([payInvoice(), closeInvoice()])`
-- **Verify:** Per-invoice gate ensures close sees consistent index state; no data corruption
+- **Verify:** Per-invoice gate ensures close sees consistent index state; invoice ends in terminal state (CLOSED); frozen balances are non-null; no duplicate storage writes
 - **Spec ref:** §5.9 per-invoice gate
 
 #### CONC-002: Return + close race
 - **Setup:** Module with invoice, auto-return enabled
 - **Action:** `Promise.all([returnInvoicePayment(), closeInvoice()])`
-- **Verify:** Both operations complete without deadlock; balance correct
+- **Verify:** Both operations complete without deadlock; net balance = 0 after full return; invoice in terminal state
 - **Spec ref:** §6.2 gate acquisition
 
 #### CONC-003: Auto-return dedup concurrent sends
@@ -2193,7 +2211,7 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 
 #### EDGE-003: Masked sender (senderAddress = null) with auto-return
 - **Setup:** Transfer with masked predicate and no refundAddress; auto-return enabled
-- **Action:** If auto-return attempted
+- **Action:** Receive forward transfer with masked sender (senderAddress=null, no refundAddress); auto-return is triggered
 - **Verify:** Fires invoice:auto_return_failed with reason 'sender_unresolvable'
 - **Spec ref:** §6.2 step 5 auto-return resolution
 
@@ -2226,20 +2244,20 @@ Returns 'CLOSED' or 'CANCELLED' if status.state is terminal, else throws.
 | payInvoice() | 12 | Validation + direction codes + contact |
 | returnInvoicePayment() | 7 | Balance validation + terminal state semantics |
 | setAutoReturn() / getAutoReturnSettings() | 8 | Global + per-invoice + cooldown + synchronous |
-| Memo Encoding/Decoding | 10 | All direction codes + parse/build + normalization |
-| Events (Idempotency & Firing) | 23 | All 19 core + 4 DM event types |
+| Memo Encoding/Decoding | 11 | All direction codes + parse/build + normalization + legacy fallback |
+| Events (Idempotency & Firing) | 25 | All 19 event types (including unknown_reference + over_refund_warning) |
 | On-Chain Message Decoding | 11 | Type guards + control character stripping + truncation |
 | Token Minting Internals | 10 | Determinism + serialization + REQUEST_ID_EXISTS |
 | Invoice-Transfer Index | 11 | Cold-start + watermark + dedup + caps + error isolation |
 | Payer-Side DM Processing | 10 | Receipt/cancellation DM parsing + size guards |
 | autoTerminateOnReturn | 5 | RC/RX handling + deadlock prevention |
 | Storage & Crash Recovery | 9 | Write order + reconciliation + pruning + corruption |
-| Validation Gauntlet | 11 | Creator self-assertion + injection vectors + concurrency (UT-VAL-004 removed as duplicate) |
+| Validation Gauntlet | 10 | Creator self-assertion + injection vectors + concurrency (UT-VAL-004 removed as duplicate; IDs skip from 003 to 005) |
 | sendInvoiceReceipts() | 16 | Happy path + error paths + contact resolution + partial failures |
 | sendCancellationNotices() | 10 | Happy path + error paths + reason/deal validation |
 | getRelatedTransfers() | 6 | Query + irrelevant + empty + multi-coin + post-termination |
 | CLI Integration | 33 | All 14 CLI commands (30 tests) + 3 security tests |
-| **Unit Tests Total** | **~274** | All 17 methods + all error paths |
+| **Unit Tests Total** | **~275** | All 17 methods + all error paths |
 | **E2E Integration Tests** | **1 specified + planned** | Full workflow IT-LIFECYCLE-001; §4.2–4.10 planned |
 | **E2E CLI Tests** | **Planned** | Pending expansion |
 | **Concurrency Tests** | **8** | Gate serialization + race conditions + timeout |
@@ -2271,7 +2289,7 @@ Every error code from §10 MUST have at least one test case:
 | `INVOICE_INVALID_DATA` | UT-IMPORT-004, UT-IMPORT-005 | Unparseable/invalid terms | importInvoice | INVOICE_INVALID_DATA |
 | `INVOICE_ALREADY_EXISTS` | UT-IMPORT-006 | Duplicate import | importInvoice | INVOICE_ALREADY_EXISTS |
 | `INVOICE_NOT_FOUND` | UT-STATUS-006, UT-CLOSE-007, UT-CANCEL-006, UT-PAY-008, UT-RETURN-005, UT-AUTORET-008, UT-RECEIPTS-009, UT-NOTICES-009, UT-TRANSFERS-004 | Unknown invoiceId | getStatus/close/cancel/pay/return/autoReturn/receipts/notices/transfers | INVOICE_NOT_FOUND |
-| `INVOICE_NOT_TARGET` | UT-CLOSE-002, UT-CANCEL-002, UT-RETURN-004, UT-RECEIPTS-010, UT-RECEIPTS-012, UT-NOTICES-006 | Caller not target | close/cancel/return/receipts/notices | INVOICE_NOT_TARGET |
+| `INVOICE_NOT_TARGET` | UT-CLOSE-002, UT-CANCEL-002, UT-RETURN-004, UT-RECEIPTS-010, UT-NOTICES-006 | Caller not target | close/cancel/return/receipts/notices | INVOICE_NOT_TARGET |
 | `INVOICE_ALREADY_CLOSED` | UT-CLOSE-003, UT-CANCEL-003 | Close/cancel CLOSED | close/cancel | INVOICE_ALREADY_CLOSED |
 | `INVOICE_ALREADY_CANCELLED` | UT-CLOSE-004, UT-CANCEL-004 | Close/cancel CANCELLED | close/cancel | INVOICE_ALREADY_CANCELLED |
 | `INVOICE_ORACLE_REQUIRED` | UT-CREATE-031 | No oracle | createInvoice | INVOICE_ORACLE_REQUIRED |
@@ -2288,7 +2306,7 @@ Every error code from §10 MUST have at least one test case:
 | `INVOICE_MEMO_TOO_LONG` | UT-CREATE-028, UT-RECEIPTS-011, UT-NOTICES-004, UT-NOTICES-005 | Memo > 4096 | createInvoice/sendReceipts/sendNotices | INVOICE_MEMO_TOO_LONG |
 | `INVOICE_TERMS_TOO_LARGE` | UT-CREATE-030 | Terms > 64 KB | createInvoice | INVOICE_TERMS_TOO_LARGE |
 | `RATE_LIMITED` | UT-AUTORET-004 | setAutoReturn('*') within 5s | setAutoReturn | RATE_LIMITED |
-| `INVOICE_NOT_TERMINATED` | UT-RECEIPTS-013, UT-RECEIPTS-015, UT-RECEIPTS-016 | sendReceipts on non-terminal | sendInvoiceReceipts | INVOICE_NOT_TERMINATED |
+| `INVOICE_NOT_TERMINATED` | UT-RECEIPTS-012, UT-RECEIPTS-013, UT-RECEIPTS-015, UT-RECEIPTS-016 | sendReceipts on non-terminal (COVERED/OPEN/PARTIAL/EXPIRED) | sendInvoiceReceipts | INVOICE_NOT_TERMINATED |
 | `INVOICE_NOT_CANCELLED` | UT-NOTICES-002 | sendCancellationNotices on CLOSED | sendCancellationNotices | INVOICE_NOT_CANCELLED |
 | `COMMUNICATIONS_UNAVAILABLE` | UT-RECEIPTS-014, UT-NOTICES-007 | No CommunicationsModule | sendReceipts/notices | COMMUNICATIONS_UNAVAILABLE |
 | `MODULE_DESTROYED` | UT-LIFECYCLE-007 | After destroy() | All I/O methods | MODULE_DESTROYED |

@@ -2860,7 +2860,7 @@ All new events are added to `SphereEventType` union and `SphereEventMap` interfa
 cannot extend it. The additions below MUST be made directly in `types/index.ts`. Similarly,
 `SphereEventMap` entries must be added directly. The `connect/permissions.ts` file must also be
 updated: add `'invoice:read'` to `PERMISSION_SCOPES`, add `sphere_getInvoices` and
-`sphere_getInvoiceStatus` to `METHOD_PERMISSIONS`, and add all six intent actions
+`sphere_getInvoiceStatus` to `METHOD_PERMISSIONS`, and add all eight intent actions
 (`create_invoice`, `close_invoice`, `cancel_invoice`, `pay_invoice`, `return_invoice_payment`,
 `set_auto_return`, `send_invoice_receipts`, `send_cancellation_notices`) to `INTENT_PERMISSIONS`.
 
