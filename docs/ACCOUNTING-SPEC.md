@@ -4167,13 +4167,20 @@ if (!sphere.accounting) {
 }
 ```
 
-**Invoice ID prefix matching:** Invoice IDs are 64-char hex strings. For CLI ergonomics, commands accept a prefix of at least 8 characters. If the prefix matches multiple invoices, the command prints all matches and exits with an error:
+**Invoice ID prefix matching:** Invoice IDs are 64-char hex strings. For CLI ergonomics, commands accept a prefix of at least 8 hex characters. The prefix must match `/^[0-9a-fA-F]{8,64}$/`. CLI-level validation errors (exit code 1):
+
+- Prefix shorter than 8 characters: `✗ Prefix too short: minimum 8 hex characters.`
+- Non-hex characters: `✗ Invalid invoice ID: must be hexadecimal.`
+- Zero matches: `✗ No invoice found matching prefix "{prefix}".`
+- Ambiguous (multiple matches):
 
 ```
 ✗ Ambiguous invoice ID prefix "a1b2c3d4". Matches:
   a1b2c3d4e5f6a7b8...full-id-1
   a1b2c3d4deadbeef...full-id-2
 ```
+
+If exactly 64 characters, it is treated as a full ID (no prefix search — direct lookup).
 
 **Output style:**
 - Dividers: `'─'.repeat(60)`
@@ -4186,7 +4193,7 @@ if (!sphere.accounting) {
 **Novel patterns:** The following patterns are new to the CLI and will require implementation when coding these commands:
 - **`--json` flag:** No existing CLI command implements `--json`. Invoice commands introduce this as a new convention.
 - **Invoice ID prefix matching:** No existing command does partial ID matching. Requires a `resolveInvoicePrefix(prefix)` helper that loads the invoice list and filters by prefix. The 8-char minimum is enforced at the CLI level.
-- **Duration parsing for `--due`:** The `--due` flag accepts single-unit durations (`7d`, `24h`, `30m`). Compound durations (e.g., `7d12h`) are not supported — use ISO 8601 for complex dates. No existing CLI command parses durations.
+- **Duration parsing for `--due`:** The `--due` flag accepts single-unit durations matching `/^([1-9][0-9]*)(d|h|m)$/` — a positive integer followed by `d` (days), `h` (hours), or `m` (minutes). `0d`, negative values, bare numbers without a unit, and unknown units are rejected at CLI level: `✗ Invalid duration: must be a positive integer with unit (d, h, m).` Compound durations (e.g., `7d12h`) are not supported — use ISO 8601 for complex dates. No existing CLI command parses durations.
 - **`--targets` JSON file loading:** No existing command reads user-provided JSON files from arbitrary paths. Error handling: file not found, invalid JSON, missing `targets` key, and empty `targets` array should produce CLI-level errors (not SDK errors).
 - **`getSphere()` update required:** The current `getSphere()` function does not enable the accounting module. It must be updated to pass the accounting module configuration to `Sphere.init()` for the module guard to succeed.
 
@@ -4573,7 +4580,7 @@ Usage: invoice-pay <invoiceId> [amount] [--target <index>] [--asset <index>] [--
 
 **Contact auto-population:** The `PayInvoiceParams.contact` field is not exposed as a CLI flag. Contact info is always auto-populated from `identity.directAddress` at runtime (see §4.7). CLI users who need custom contact info should use the SDK programmatically.
 
-**Default amount:** When `amount` is omitted, the command calls `getInvoiceStatus()` to compute the remaining balance (`requestedAmount - netCoveredAmount`) for the asset at `[targetIndex][assetIndex]`. This requires an additional API call and may fail if the aggregator is unreachable for non-terminal invoices. If the asset is already covered, prints a warning and exits with code 0 (no action taken, not an error).
+**Default amount:** When `amount` is omitted, the command calls `getInvoiceStatus()` to compute the remaining balance (`requestedAmount - netCoveredAmount`) for the asset at `[targetIndex][assetIndex]`. This requires an additional API call and may fail if the aggregator is unreachable for non-terminal invoices. If the asset is already covered, prints a warning and exits with code 0 (no action taken, not an error). Note: `getInvoiceStatus()` may trigger implicit close (§5.1 step 7c) if the invoice is COVERED and all tokens are confirmed. In this case, the asset will show as covered and the command exits with the warning — the implicit close is an expected side effect (the invoice was already fully satisfied).
 
 **Human output:**
 
@@ -4911,10 +4918,17 @@ INVOICING (Accounting Module):
                                       --state <states>    Filter by state (comma-separated)
                                       --created-by-me     Only invoices I created
                                       --targeting-me      Only invoices targeting me
+                                      --limit <n>         Max results (default: 20)
+                                      --offset <n>        Pagination offset (default: 0)
+                                      --sort <field>      Sort: createdAt (default), dueDate
+                                      --order <asc|desc>  Sort order (default: desc)
   invoice-pay <id> [amount]           Pay an invoice
                                       --target <idx>      Target index (default: 0)
                                       --asset <idx>       Asset index (default: 0)
+                                      --text <text>       Free text in memo
+                                      --refund-address    Explicit refund DIRECT:// address
   invoice-return <id> <to> <amt> <coin>  Return tokens to a payer
+                                      --text <text>       Free text in memo
   invoice-close <id>                  Close an invoice
                                       --auto-return       Enable auto-return (surplus only)
   invoice-cancel <id>                 Cancel an invoice
@@ -4928,6 +4942,7 @@ INVOICING (Accounting Module):
   invoice-cancel-notices <id>         Send cancellation notice DMs
                                       --reason <text>     Cancellation reason
                                       --deal <text>       Deal description
+                                      --include-zero      Include zero-balance payers
   invoice-transfers <id>              Show related transfers
   invoice-parse-memo <memo> [--json]  Parse invoice reference from memo (offline)
 ```

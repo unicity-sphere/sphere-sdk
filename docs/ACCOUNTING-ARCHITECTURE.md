@@ -947,7 +947,7 @@ Sender receives the cancellation notice DM:
 | Any public method called after destroy() | **Throw `MODULE_DESTROYED`** — module is destroyed |
 | Global auto-return within 5s cooldown | **Throw `RATE_LIMITED`** — `setAutoReturn('*')` rate-limited |
 
-> **Note:** This table covers the most operationally significant error scenarios. For the complete list of 31 error codes with their exact conditions, see [ACCOUNTING-SPEC.md §10](./ACCOUNTING-SPEC.md#10-error-codes).
+> **Note:** This table covers the most operationally significant error scenarios. For the complete list of 38 error codes with their exact conditions, see [ACCOUNTING-SPEC.md §10](./ACCOUNTING-SPEC.md#10-error-codes).
 
 ## 11. Future Extensions
 
