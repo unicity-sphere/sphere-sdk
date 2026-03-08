@@ -15,6 +15,7 @@
 8. [Validation Rules](#8-validation-rules)
 9. [Connect Protocol Extensions](#9-connect-protocol-extensions)
 10. [Error Codes](#10-error-codes)
+11. [CLI Commands](#11-cli-commands)
 
 ---
 
@@ -4130,6 +4131,812 @@ All errors use `SphereError` with the following codes:
 Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal utilities (`buildInvoiceMemo` and the minting flow respectively), not from §8 validation tables. They are included here for completeness.
 
 **IMPORTANT:** All error codes above apply to the accounting module's own operations. Accounting errors during inbound transfer event processing are caught internally and logged — they NEVER propagate to or interrupt the inbound token transfer flow. The one exception is `INVOICE_TERMINATED` for outbound forward payments, which is thrown intentionally to prevent paying a terminated invoice.
+
+---
+
+## 11. CLI Commands
+
+This section specifies 14 CLI commands that fully cover the AccountingModule API (§2.1). These are documentation-only specifications — no implementation code yet. When implemented, they will be added to `cli/index.ts` following the existing patterns (manual arg parsing, switch-case dispatch, `getSphere()` / `closeSphere()` lifecycle).
+
+### 11.1 Shared Conventions
+
+**Prefix:** All commands use the `invoice-` prefix, following the existing grouping pattern (`dm-`, `market-`, `group-`).
+
+**Module guard:** Every command (except `invoice-parse-memo`) checks for the accounting module:
+
+```typescript
+const sphere = await getSphere();
+if (!sphere.accounting) {
+  console.error('Accounting module not available.');
+  process.exit(1);
+}
+```
+
+**Invoice ID prefix matching:** Invoice IDs are 64-char hex strings. For CLI ergonomics, commands accept a prefix of at least 8 characters. If the prefix matches multiple invoices, the command prints all matches and exits with an error:
+
+```
+✗ Ambiguous invoice ID prefix "a1b2c3d4". Matches:
+  a1b2c3d4e5f6a7b8...full-id-1
+  a1b2c3d4deadbeef...full-id-2
+```
+
+**Output style:**
+- Dividers: `'─'.repeat(60)`
+- Success indicator: `✓`
+- Failure indicator: `✗`
+- `--json` flag on commands that return structured results (queries, operations with result objects). Omitted from void-returning commands (`invoice-close`, `invoice-cancel`).
+
+**Amount display:** Human-readable amounts (e.g., `10.00 UCT`) using `currency.toHuman()` with the coin's decimals from `TokenRegistry`. Smallest-unit values shown in parentheses when `--json` is not used.
+
+**Novel patterns:** The following patterns are new to the CLI and will require implementation when coding these commands:
+- **`--json` flag:** No existing CLI command implements `--json`. Invoice commands introduce this as a new convention.
+- **Invoice ID prefix matching:** No existing command does partial ID matching. Requires a `resolveInvoicePrefix(prefix)` helper that loads the invoice list and filters by prefix. The 8-char minimum is enforced at the CLI level.
+- **Duration parsing for `--due`:** The `--due` flag accepts single-unit durations (`7d`, `24h`, `30m`). Compound durations (e.g., `7d12h`) are not supported — use ISO 8601 for complex dates. No existing CLI command parses durations.
+- **`--targets` JSON file loading:** No existing command reads user-provided JSON files from arbitrary paths. Error handling: file not found, invalid JSON, missing `targets` key, and empty `targets` array should produce CLI-level errors (not SDK errors).
+- **`getSphere()` update required:** The current `getSphere()` function does not enable the accounting module. It must be updated to pass the accounting module configuration to `Sphere.init()` for the module guard to succeed.
+
+### 11.2 Command Specifications
+
+#### 11.2.1 `invoice-create`
+
+Creates and mints a new invoice on-chain. Maps to `accounting.createInvoice()`.
+
+```
+Usage: invoice-create <address> <coin> <amount> [--memo <text>] [--due <timestamp|duration>] [--anonymous] [--json]
+       invoice-create --targets <json-file> [--memo <text>] [--due <timestamp|duration>] [--anonymous] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `address` | positional | Yes (simple mode) | Target address (`@nametag` or `DIRECT://...`) |
+| `coin` | positional | Yes (simple mode) | Coin symbol (e.g., `UCT`, `USDU`) |
+| `amount` | positional | Yes (simple mode) | Amount in human-readable units (converted to smallest unit internally) |
+| `--targets` | named | Yes (multi mode) | Path to JSON file with targets array |
+| `--memo` | named | No | Free-text memo (max 4096 chars) |
+| `--due` | named | No | Due date: ISO 8601 timestamp (`2026-04-01T00:00:00Z`) or duration (`7d`, `24h`, `30m`) |
+| `--anonymous` | flag | No | Omit creator pubkey from invoice terms |
+| `--json` | flag | No | Output as JSON |
+
+**Simple mode** creates a single-target, single-asset invoice from positional args. The address is resolved to a `DIRECT://` address via `sphere.resolve()` if a nametag is given. The `deliveryMethods` field from `CreateInvoiceRequest` is not exposed in the CLI (placeholder, not used by current SDK — see §1.2).
+
+**Multi-target mode** reads a JSON file structured as:
+
+```json
+{
+  "targets": [
+    {
+      "address": "@alice",
+      "assets": [
+        { "coinId": "UCT", "amount": "10000000" },
+        { "coinId": "USDU", "amount": "500000000" }
+      ]
+    },
+    {
+      "address": "DIRECT://...",
+      "assets": [
+        { "coinId": "UCT", "amount": "5000000" }
+      ]
+    }
+  ]
+}
+```
+
+**Note on `--targets` JSON format:** The JSON file uses `{ "coinId": "UCT", "amount": "10000000" }` object syntax for readability. The CLI converts each entry to the SDK's `CoinEntry` tuple format (`[coinId, amount]`) before passing to `createInvoice()`. Amounts in the JSON file are in **smallest units** (matching the SDK convention). In simple mode, the positional `amount` is in **human-readable units** (converted to smallest units internally). This mirrors the difference between programmatic and interactive use.
+
+**Human output:**
+
+```
+✓ Invoice created!
+  Invoice ID: a1b2c3d4e5f6a7b8...
+  Targets:    1
+  Amount:     10.00 UCT → @alice
+  Memo:       Payment for consulting
+  Due:        2026-04-01 00:00:00
+```
+
+**JSON output:** The `CreateInvoiceResult` object.
+
+**Error conditions:**
+- No targets → `INVOICE_NO_TARGETS`
+- Invalid address → `INVOICE_INVALID_ADDRESS`
+- Duplicate target address → `INVOICE_DUPLICATE_ADDRESS`
+- No assets in target → `INVOICE_NO_ASSETS`
+- Invalid asset (both or neither coin/nft set) → `INVOICE_INVALID_ASSET`
+- Invalid coin ID → `INVOICE_INVALID_COIN`
+- Duplicate coin in target → `INVOICE_DUPLICATE_COIN`
+- Invalid amount → `INVOICE_INVALID_AMOUNT`
+- Due date in the past → `INVOICE_PAST_DUE_DATE`
+- Memo too long → `INVOICE_MEMO_TOO_LONG`
+- Too many targets (>100) → `INVOICE_TOO_MANY_TARGETS`
+- Too many assets per target (>50) → `INVOICE_TOO_MANY_ASSETS`
+- Serialized terms exceed 64 KB → `INVOICE_TERMS_TOO_LARGE`
+- Oracle not configured → `INVOICE_ORACLE_REQUIRED`
+- Aggregator failure → `INVOICE_MINT_FAILED`
+- Targets file not found or invalid JSON → CLI error (not an SDK error)
+
+**Examples:**
+
+```bash
+# Simple: single target
+npm run cli -- invoice-create @alice UCT 10.00 --memo "Consulting fee"
+
+# With due date (duration)
+npm run cli -- invoice-create @alice UCT 10.00 --due 7d
+
+# Multi-target from file
+npm run cli -- invoice-create --targets invoice-targets.json --memo "Project payment" --due 2026-04-01T00:00:00Z
+
+# Anonymous invoice
+npm run cli -- invoice-create @alice UCT 10.00 --anonymous
+```
+
+---
+
+#### 11.2.2 `invoice-import`
+
+Imports an invoice token from a TXF JSON file. Maps to `accounting.importInvoice()`.
+
+```
+Usage: invoice-import <file> [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `file` | positional | Yes | Path to TXF JSON file containing the invoice token |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+✓ Invoice imported!
+  Invoice ID: a1b2c3d4e5f6a7b8...
+  Creator:    @bob
+  Targets:    2
+  Due:        2026-04-01 00:00:00
+  Memo:       Project milestone payment
+```
+
+**JSON output:** The parsed `InvoiceTerms` object.
+
+**Error conditions:**
+- File not found → CLI error
+- Invalid JSON → CLI error
+- Not an invoice token → `INVOICE_WRONG_TOKEN_TYPE`
+- Corrupt/unparseable tokenData → `INVOICE_INVALID_DATA`
+- Invalid proof chain → `INVOICE_INVALID_PROOF`
+- Already imported → `INVOICE_ALREADY_EXISTS`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-import ./invoice-a1b2c3d4.txf.json
+npm run cli -- invoice-import ./invoice-a1b2c3d4.txf.json --json
+```
+
+---
+
+#### 11.2.3 `invoice-status`
+
+Shows the full computed status of an invoice. Maps to `accounting.getInvoiceStatus()`.
+
+```
+Usage: invoice-status <invoiceId> [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+Invoice a1b2c3d4e5f6a7b8...
+──────────────────────────────────────────────────────────────
+State:          PARTIAL
+All Confirmed:  No
+Last Activity:  2026-03-08 14:30:00
+
+Target 0: @alice (DIRECT://abc123...)
+  UCT:  5.00 / 10.00 covered (50%)  [net: 5.00, returned: 0.00]
+    ✓ Confirmed: Yes
+    Senders:
+      DIRECT://sender1... — 5.00 forwarded, 0.00 returned (net: 5.00)
+
+Irrelevant Transfers: 0
+
+Totals:
+  Forward:  5.00 UCT
+  Back:     0.00 UCT
+```
+
+**JSON output:** The full `InvoiceStatus` object.
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-status a1b2c3d4
+npm run cli -- invoice-status a1b2c3d4e5f6a7b8... --json
+```
+
+---
+
+#### 11.2.4 `invoice-list`
+
+Lists invoices with optional filtering and pagination. Maps to `accounting.getInvoices()`.
+
+```
+Usage: invoice-list [--state <states>] [--created-by-me] [--targeting-me] [--limit <n>] [--offset <n>] [--sort <field>] [--order <asc|desc>] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `--state` | named | No | Comma-separated states: `OPEN,PARTIAL,COVERED,CLOSED,CANCELLED,EXPIRED` |
+| `--created-by-me` | flag | No | Only invoices created by this wallet |
+| `--targeting-me` | flag | No | Only invoices targeting this wallet |
+| `--limit` | named | No | Max results (default: 20) |
+| `--offset` | named | No | Pagination offset (default: 0) |
+| `--sort` | named | No | Sort field: `createdAt` (default) or `dueDate` |
+| `--order` | named | No | `asc` or `desc` (default: `desc`) |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+Invoices (3 total)
+──────────────────────────────────────────────────────────────
+a1b2c3d4  PARTIAL   10.00 UCT → @alice       Due: 2026-04-01   Created: 2026-03-08
+b2c3d4e5  OPEN      5.00 USDU → @bob         Due: —            Created: 2026-03-07
+c3d4e5f6  CLOSED    20.00 UCT → @charlie     Due: 2026-03-15   Created: 2026-03-01
+```
+
+**JSON output:** Array of `InvoiceRef` objects.
+
+**Error conditions:**
+- Invalid state value in `--state` → CLI error: `Invalid state: {value}. Must be one of: OPEN, PARTIAL, COVERED, CLOSED, CANCELLED, EXPIRED.`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-list
+npm run cli -- invoice-list --state OPEN,PARTIAL --targeting-me
+npm run cli -- invoice-list --created-by-me --limit 5 --sort dueDate --order asc
+npm run cli -- invoice-list --json
+```
+
+---
+
+#### 11.2.5 `invoice-info`
+
+Shows lightweight invoice details without computing live status. Maps to `accounting.getInvoice()`.
+
+```
+Usage: invoice-info <invoiceId> [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+Invoice a1b2c3d4e5f6a7b8...
+──────────────────────────────────────────────────────────────
+Creator:     @bob (02abc123...)
+Created:     2026-03-08 10:00:00
+Due:         2026-04-01 00:00:00
+Memo:        Consulting services Q1
+Cancelled:   No
+Closed:      No
+
+Targets:
+  0: @alice (DIRECT://abc123...)
+     UCT: 10.00
+     USDU: 5.00
+  1: DIRECT://def456...
+     UCT: 5.00
+```
+
+**JSON output:** The `InvoiceRef` object.
+
+**Error conditions:**
+- Invoice not found → prints `✗ Invoice not found.` and exits with code 1
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-info a1b2c3d4
+npm run cli -- invoice-info a1b2c3d4 --json
+```
+
+---
+
+#### 11.2.6 `invoice-close`
+
+Explicitly closes an invoice. Maps to `accounting.closeInvoice()`.
+
+```
+Usage: invoice-close <invoiceId> [--auto-return]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--auto-return` | flag | No | Enable auto-return on close (returns surplus only) |
+
+**Output:**
+
+```
+✓ Invoice a1b2c3d4 closed.
+```
+
+With `--auto-return`:
+
+```
+✓ Invoice a1b2c3d4 closed with auto-return enabled.
+```
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+- Not a target → `INVOICE_NOT_TARGET`
+- Already closed → `INVOICE_ALREADY_CLOSED`
+- Already cancelled → `INVOICE_ALREADY_CANCELLED`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-close a1b2c3d4
+npm run cli -- invoice-close a1b2c3d4 --auto-return
+```
+
+---
+
+#### 11.2.7 `invoice-cancel`
+
+Cancels an invoice. Maps to `accounting.cancelInvoice()`.
+
+```
+Usage: invoice-cancel <invoiceId> [--auto-return]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--auto-return` | flag | No | Enable auto-return on cancel (returns everything) |
+
+**Output:**
+
+```
+✓ Invoice a1b2c3d4 cancelled.
+```
+
+With `--auto-return`:
+
+```
+✓ Invoice a1b2c3d4 cancelled with auto-return enabled.
+```
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+- Not a target → `INVOICE_NOT_TARGET`
+- Already closed → `INVOICE_ALREADY_CLOSED`
+- Already cancelled → `INVOICE_ALREADY_CANCELLED`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-cancel a1b2c3d4
+npm run cli -- invoice-cancel a1b2c3d4 --auto-return
+```
+
+---
+
+#### 11.2.8 `invoice-pay`
+
+Pays an invoice (sends tokens referencing it). Maps to `accounting.payInvoice()`.
+
+```
+Usage: invoice-pay <invoiceId> [amount] [--target <index>] [--asset <index>] [--text <text>] [--refund-address <DIRECT://...>] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `amount` | positional | No | Amount in human-readable units (converted to smallest units via `currency.toSmallest()` before passing to `PayInvoiceParams.amount`). Default: remaining amount to cover the asset. |
+| `--target` | named | No | Target index (default: `0`) |
+| `--asset` | named | No | Asset index within target (default: `0`) |
+| `--text` | named | No | Free text appended to the on-chain memo |
+| `--refund-address` | named | No | Explicit refund address (`DIRECT://...`) |
+| `--json` | flag | No | Output as JSON |
+
+**Coin is inferred** from the invoice terms at the specified target/asset indices — no `--coin` flag needed.
+
+**Contact auto-population:** The `PayInvoiceParams.contact` field is not exposed as a CLI flag. Contact info is always auto-populated from `identity.directAddress` at runtime (see §4.7). CLI users who need custom contact info should use the SDK programmatically.
+
+**Default amount:** When `amount` is omitted, the command calls `getInvoiceStatus()` to compute the remaining balance (`requestedAmount - netCoveredAmount`) for the asset at `[targetIndex][assetIndex]`. This requires an additional API call and may fail if the aggregator is unreachable for non-terminal invoices. If the asset is already covered, prints a warning and exits with code 0 (no action taken, not an error).
+
+**Human output:**
+
+```
+✓ Payment sent!
+  Invoice:  a1b2c3d4
+  Target:   0 (@alice)
+  Asset:    UCT
+  Amount:   10.00 UCT
+  Transfer: pending (id: tx_abc123...)
+```
+
+**JSON output:** The `TransferResult` object.
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+- Invoice terminated → `INVOICE_TERMINATED`
+- Invalid target index → `INVOICE_INVALID_TARGET`
+- Invalid asset index → `INVOICE_INVALID_ASSET_INDEX`
+- Invalid refund address → `INVOICE_INVALID_REFUND_ADDRESS`
+
+**Examples:**
+
+```bash
+# Pay remaining balance on target 0, asset 0
+npm run cli -- invoice-pay a1b2c3d4
+
+# Pay specific amount
+npm run cli -- invoice-pay a1b2c3d4 5.00
+
+# Pay second target, first asset
+npm run cli -- invoice-pay a1b2c3d4 5.00 --target 1
+
+# With refund address
+npm run cli -- invoice-pay a1b2c3d4 10.00 --refund-address "DIRECT://myrefund..."
+```
+
+---
+
+#### 11.2.9 `invoice-return`
+
+Returns tokens to an invoice payer. Maps to `accounting.returnInvoicePayment()`.
+
+```
+Usage: invoice-return <invoiceId> <recipient> <amount> <coin> [--text <text>] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `recipient` | positional | Yes | Recipient address (`DIRECT://...`) — must match a `senderAddress` from `invoice-status`. Maps to `ReturnPaymentParams.recipient`. |
+| `amount` | positional | Yes | Amount to return in human-readable units (converted to smallest units via `currency.toSmallest()` before passing to `ReturnPaymentParams.amount`) |
+| `coin` | positional | Yes | Coin symbol (e.g., `UCT`). Maps to `ReturnPaymentParams.coinId`. |
+| `--text` | named | No | Free text appended to the on-chain memo |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+✓ Return payment sent!
+  Invoice:    a1b2c3d4
+  Recipient:  DIRECT://sender1...
+  Amount:     5.00 UCT
+  Transfer:   pending (id: tx_def456...)
+```
+
+**JSON output:** The `TransferResult` object.
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+- Not a target → `INVOICE_NOT_TARGET`
+- Amount exceeds per-sender net balance → `INVOICE_RETURN_EXCEEDS_BALANCE`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-return a1b2c3d4 "DIRECT://sender1..." 5.00 UCT
+npm run cli -- invoice-return a1b2c3d4 "DIRECT://sender1..." 5.00 UCT --text "Partial refund"
+```
+
+---
+
+#### 11.2.10 `invoice-auto-return`
+
+Shows or sets auto-return settings. Maps to `accounting.setAutoReturn()` and `accounting.getAutoReturnSettings()`.
+
+```
+Usage: invoice-auto-return [--enable|--disable] [--invoice <id>|--global] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `--enable` | flag | No | Enable auto-return |
+| `--disable` | flag | No | Disable auto-return |
+| `--invoice` | named | No | Invoice ID to set (full or 8+ char prefix) |
+| `--global` | flag | No | Set global auto-return (equivalent to `'*'` in the API) |
+| `--json` | flag | No | Output as JSON |
+
+**Dual-mode behavior:**
+- **No `--enable`/`--disable` flags:** Shows current settings (read mode)
+- **With `--enable` or `--disable`:** Sets the value for the specified scope (write mode)
+- **Scope:** Exactly one of `--invoice <id>` or `--global` required when setting
+
+**Show output:**
+
+```
+Auto-Return Settings
+──────────────────────────────────────────────────────────────
+Global:     Disabled
+
+Per-Invoice Overrides:
+  a1b2c3d4...  Enabled
+  b2c3d4e5...  Disabled
+```
+
+**Set output:**
+
+```
+✓ Auto-return enabled globally.
+```
+
+```
+✓ Auto-return disabled for invoice a1b2c3d4.
+```
+
+**JSON output (show mode):** The `AutoReturnSettings` object. In write mode (with `--enable`/`--disable`), `--json` is silently ignored — `setAutoReturn()` returns `void`.
+
+**Error conditions:**
+- Both `--enable` and `--disable` → CLI error: `Specify either --enable or --disable, not both.`
+- Neither `--invoice` nor `--global` when setting → CLI error: `Specify --invoice <id> or --global.`
+- Both `--invoice` and `--global` → CLI error: `Specify either --invoice or --global, not both.`
+
+**Examples:**
+
+```bash
+# Show current settings
+npm run cli -- invoice-auto-return
+npm run cli -- invoice-auto-return --json
+
+# Enable globally
+npm run cli -- invoice-auto-return --enable --global
+
+# Disable for specific invoice
+npm run cli -- invoice-auto-return --disable --invoice a1b2c3d4
+```
+
+---
+
+#### 11.2.11 `invoice-receipts`
+
+Sends receipt DMs to payers of a terminated invoice. Maps to `accounting.sendInvoiceReceipts()`.
+
+```
+Usage: invoice-receipts <invoiceId> [--memo <text>] [--include-zero] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--memo` | named | No | Deal/service description included in each receipt (max 4096 chars) |
+| `--include-zero` | flag | No | Include senders with net balance of 0 |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+✓ Receipts sent for invoice a1b2c3d4
+  Sent:   3
+  Failed: 1
+
+  Sent:
+    → DIRECT://sender1... (via DIRECT://sender1...)
+    → DIRECT://sender2... (via DIRECT://contact2...)
+    → DIRECT://sender3... (via DIRECT://sender3...)
+
+  Failed:
+    ✗ DIRECT://sender4... — unresolvable (masked sender, no contact)
+```
+
+**JSON output:** The `SendReceiptsResult` object.
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+- Invoice not terminated → `INVOICE_NOT_TERMINATED`
+- Not a target → `INVOICE_NOT_TARGET`
+- No CommunicationsModule → `COMMUNICATIONS_UNAVAILABLE`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-receipts a1b2c3d4
+npm run cli -- invoice-receipts a1b2c3d4 --memo "Thank you for your payment!"
+npm run cli -- invoice-receipts a1b2c3d4 --include-zero --json
+```
+
+---
+
+#### 11.2.12 `invoice-cancel-notices`
+
+Sends cancellation notice DMs to payers of a cancelled invoice. Maps to `accounting.sendCancellationNotices()`.
+
+```
+Usage: invoice-cancel-notices <invoiceId> [--reason <text>] [--deal <text>] [--include-zero] [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--reason` | named | No | Cancellation reason (max 4096 chars) |
+| `--deal` | named | No | Deal/service/asset description (max 4096 chars) |
+| `--include-zero` | flag | No | Include senders with net balance of 0 |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+✓ Cancellation notices sent for invoice a1b2c3d4
+  Sent:   2
+  Failed: 0
+
+  Sent:
+    → DIRECT://sender1... (via DIRECT://sender1...)
+    → DIRECT://sender2... (via DIRECT://contact2...)
+```
+
+**JSON output:** The `SendNoticesResult` object.
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+- Invoice not cancelled → `INVOICE_NOT_CANCELLED`
+- Not a target → `INVOICE_NOT_TARGET`
+- No CommunicationsModule → `COMMUNICATIONS_UNAVAILABLE`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-cancel-notices a1b2c3d4
+npm run cli -- invoice-cancel-notices a1b2c3d4 --reason "Service no longer available"
+npm run cli -- invoice-cancel-notices a1b2c3d4 --reason "Out of stock" --deal "Widget order #1234"
+```
+
+---
+
+#### 11.2.13 `invoice-transfers`
+
+Shows all transfers related to an invoice. Maps to `accounting.getRelatedTransfers()`.
+
+```
+Usage: invoice-transfers <invoiceId> [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `invoiceId` | positional | Yes | Invoice ID (full or 8+ char prefix) |
+| `--json` | flag | No | Output as JSON |
+
+**Human output:**
+
+```
+Transfers for invoice a1b2c3d4
+──────────────────────────────────────────────────────────────
+2026-03-08 14:30  inbound   forward           5.00 UCT   from DIRECT://sender1...  ✓
+2026-03-08 15:00  inbound   forward           3.00 UCT   from DIRECT://sender2...  ✓
+2026-03-08 16:00  outbound  return_closed      1.00 UCT   to   DIRECT://sender2...  ✓
+2026-03-08 17:00  inbound   forward [IRRELEVANT: unknown_address]  2.00 UCT   from DIRECT://unknown...
+```
+
+**JSON output:** Array of `(InvoiceTransferRef | IrrelevantTransfer)` objects.
+
+**Error conditions:**
+- Invoice not found → `INVOICE_NOT_FOUND`
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-transfers a1b2c3d4
+npm run cli -- invoice-transfers a1b2c3d4 --json
+```
+
+---
+
+#### 11.2.14 `invoice-parse-memo`
+
+Parses an invoice reference from a transfer memo string. Maps to `accounting.parseInvoiceMemo()`. This is an offline utility — **no wallet initialization needed** (does not call `getSphere()`).
+
+```
+Usage: invoice-parse-memo <memo> [--json]
+```
+
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `memo` | positional | Yes | Transfer memo string to parse |
+| `--json` | flag | No | Output as JSON |
+
+**Output (match):**
+
+```
+✓ Invoice reference found
+  Invoice ID: a1b2c3d4e5f6a7b8...
+  Direction:  forward
+  Free Text:  Payment for consulting
+```
+
+**Output (no match):**
+
+```
+✗ No invoice reference found in memo.
+```
+
+**JSON output:** The `InvoiceMemoRef` object, or `null` if no reference found.
+
+**Examples:**
+
+```bash
+npm run cli -- invoice-parse-memo "INV:a1b2c3d4e5f6a7b8...:F Payment for consulting"
+npm run cli -- invoice-parse-memo "regular transfer memo"
+npm run cli -- invoice-parse-memo "INV:a1b2c3d4e5f6a7b8...:B" --json
+```
+
+### 11.3 Help: `invoice`
+
+When the user types `invoice` as the command (with no subcommand), the CLI prints a summary of all invoice commands:
+
+```
+INVOICING (Accounting Module):
+  invoice-create <addr> <coin> <amt>  Create an invoice
+                                      --targets <file>    Multi-target from JSON file
+                                      --memo <text>       Free-text memo
+                                      --due <date|dur>    Due date or duration (7d, 24h)
+                                      --anonymous         Omit creator pubkey
+  invoice-import <file>               Import an invoice from TXF file
+  invoice-status <id>                 Show live invoice status & balances
+  invoice-info <id>                   Show invoice details (no status computation)
+  invoice-list                        List invoices
+                                      --state <states>    Filter by state (comma-separated)
+                                      --created-by-me     Only invoices I created
+                                      --targeting-me      Only invoices targeting me
+  invoice-pay <id> [amount]           Pay an invoice
+                                      --target <idx>      Target index (default: 0)
+                                      --asset <idx>       Asset index (default: 0)
+  invoice-return <id> <to> <amt> <coin>  Return tokens to a payer
+  invoice-close <id>                  Close an invoice
+                                      --auto-return       Enable auto-return (surplus only)
+  invoice-cancel <id>                 Cancel an invoice
+                                      --auto-return       Enable auto-return (everything)
+  invoice-auto-return                 Show/set auto-return settings
+                                      --enable/--disable  Set value
+                                      --global/--invoice  Scope
+  invoice-receipts <id>               Send receipt DMs to payers
+                                      --memo <text>       Receipt memo
+                                      --include-zero      Include zero-balance senders
+  invoice-cancel-notices <id>         Send cancellation notice DMs
+                                      --reason <text>     Cancellation reason
+                                      --deal <text>       Deal description
+  invoice-transfers <id>              Show related transfers
+  invoice-parse-memo <memo> [--json]  Parse invoice reference from memo (offline)
+```
+
+This block is also included in `printUsage()` output alongside the existing command groups.
+
+### 11.4 Method-to-Command Reference
+
+| # | AccountingModule Method | CLI Command | Notes |
+|---|------------------------|-------------|-------|
+| 1 | `createInvoice()` | `invoice-create` | Simple positional + `--targets` for multi |
+| 2 | `importInvoice()` | `invoice-import` | Takes TXF file path |
+| 3 | `getInvoiceStatus()` | `invoice-status` | Full live balance computation |
+| 4 | `getInvoices()` | `invoice-list` | Filters mapped to flags |
+| 5 | `getInvoice()` | `invoice-info` | Lightweight, no status computation |
+| 6 | `closeInvoice()` | `invoice-close` | `--auto-return` flag |
+| 7 | `cancelInvoice()` | `invoice-cancel` | `--auto-return` flag |
+| 8 | `payInvoice()` | `invoice-pay` | Amount optional (defaults to remaining) |
+| 9 | `returnInvoicePayment()` | `invoice-return` | All 4 essential params positional |
+| 10 | `setAutoReturn()` + `getAutoReturnSettings()` | `invoice-auto-return` | Dual-mode: show or set |
+| 11 | `sendInvoiceReceipts()` | `invoice-receipts` | `--memo`, `--include-zero` |
+| 12 | `sendCancellationNotices()` | `invoice-cancel-notices` | `--reason`, `--deal`, `--include-zero` |
+| 13 | `getRelatedTransfers()` | `invoice-transfers` | Read-only, chronological |
+| 14 | `parseInvoiceMemo()` | `invoice-parse-memo` | Offline utility, no wallet needed |
 
 ---
 
