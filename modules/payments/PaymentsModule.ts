@@ -714,6 +714,9 @@ export class PaymentsModule {
   /** Sync coalescing: concurrent sync() calls share the same operation */
   private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
 
+  /** Token change observers — notified when a token is added, updated, or removed */
+  private tokenChangeCallbacks: Array<(tokenId: string, sdkData: string) => void> = [];
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -735,6 +738,41 @@ export class PaymentsModule {
    */
   getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
     return this.moduleConfig;
+  }
+
+  /**
+   * Register a callback to be notified when a token is added or updated.
+   *
+   * The callback receives the token's genesis `tokenId` (64-hex) and the raw
+   * `sdkData` JSON string. This enables consumers (e.g., AccountingModule) to
+   * index token transactions at mutation time rather than doing periodic scans.
+   *
+   * @param cb - Callback: `(tokenId: string, sdkData: string) => void`
+   * @returns Unsubscribe function.
+   */
+  onTokenChange(cb: (tokenId: string, sdkData: string) => void): () => void {
+    this.tokenChangeCallbacks.push(cb);
+    return () => {
+      this.tokenChangeCallbacks = this.tokenChangeCallbacks.filter((c) => c !== cb);
+    };
+  }
+
+  /**
+   * Notify all registered token change observers.
+   * Called from addToken(), updateToken() after successful mutation.
+   * Errors in callbacks are silently caught to prevent disrupting the caller.
+   */
+  private notifyTokenChange(token: Token): void {
+    if (this.tokenChangeCallbacks.length === 0) return;
+    const tokenId = extractTokenIdFromSdkData(token.sdkData);
+    if (!tokenId || !token.sdkData) return;
+    for (const cb of this.tokenChangeCallbacks) {
+      try {
+        cb(tokenId, token.sdkData);
+      } catch {
+        // Silently ignore callback errors
+      }
+    }
   }
 
   /** Price provider (optional) */
@@ -3422,6 +3460,9 @@ export class PaymentsModule {
 
     await this.save();
 
+    // Notify observers (e.g., AccountingModule) that a token was added
+    this.notifyTokenChange(token);
+
     logger.debug('Payments', `Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
   }
@@ -3463,6 +3504,10 @@ export class PaymentsModule {
     await this.archiveToken(token);
 
     await this.save();
+
+    // Notify observers (e.g., AccountingModule) that a token was updated
+    this.notifyTokenChange(token);
+
     logger.debug('Payments', `Updated token ${token.id}`);
   }
 

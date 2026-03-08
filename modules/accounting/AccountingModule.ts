@@ -1301,8 +1301,15 @@ export class AccountingModule {
     }
 
     // ------------------------------------------------------------------
-    // Step 8: Scan existing tokens for pre-existing payments referencing
-    //         this invoice (retroactive indexing).
+    // Step 8: Proactive indexing check.
+    //
+    // With proactive indexing, _processTokenTransactions() indexes ALL
+    // invoice-referencing transactions regardless of whether the invoice
+    // is known — so entries for this invoice may already be in the ledger
+    // from prior token scans.
+    //
+    // We still scan for any remaining gaps (tokens added since last scan)
+    // to handle the edge case where a token arrived between scans.
     // ------------------------------------------------------------------
     const allTokens = deps.payments.getTokens();
     let anyDirty = false;
@@ -3569,7 +3576,13 @@ export class AccountingModule {
       if (!payload?.inv?.id) continue;
 
       const invoiceId = payload.inv.id.toLowerCase();
-      if (!this.invoiceTermsCache.has(invoiceId)) continue;
+      // NOTE: We intentionally do NOT skip unknown invoices here.
+      // Proactive indexing: index ALL invoice-referencing transactions so that
+      // when an invoice is later imported via importInvoice(), its transfer
+      // entries are already in the ledger — no need to rescan all tokens.
+      // The tokenScanState watermark is advanced regardless, so skipping would
+      // cause a permanent gap: the watermark passes these transactions and
+      // importInvoice()'s retroactive scan finds nothing new.
 
       // Map direction code to paymentDirection
       const dirMap: Record<string, InvoiceTransferRef['paymentDirection']> = {
@@ -3675,7 +3688,68 @@ export class AccountingModule {
       },
     );
 
-    this.unsubscribePayments = [unsubIncoming, unsubConfirmed, unsubHistory];
+    // Register token change observer for inline indexing.
+    // When PaymentsModule adds/updates a token (addToken, updateToken, sync),
+    // this callback indexes the token's transactions immediately — no separate
+    // gap-fill scan needed for runtime changes.
+    const unsubTokenChange = deps.payments.onTokenChange((tokenId: string, sdkData: string) => {
+      try {
+        this._handleTokenChange(tokenId, sdkData);
+      } catch (err) {
+        logger.warn(LOG_TAG, 'Error in token change observer:', err);
+      }
+    });
+
+    this.unsubscribePayments = [unsubIncoming, unsubConfirmed, unsubHistory, unsubTokenChange];
+  }
+
+  // ===========================================================================
+  // Internal: Token change observer (inline indexing)
+  // ===========================================================================
+
+  /**
+   * Handle a token change notification from PaymentsModule.
+   *
+   * Called synchronously by the `onTokenChange` observer when a token is
+   * added or updated in PaymentsModule (addToken, updateToken). Parses the
+   * token's TXF data and indexes any invoice-referencing transactions.
+   *
+   * This is the "index at validation time" path — transactions are indexed
+   * the moment they enter the wallet, eliminating the need for separate
+   * gap-fill scans for runtime changes.
+   *
+   * Synchronous: only updates in-memory ledger and marks dirty entries.
+   * Persistence is deferred to the next `_flushDirtyLedgerEntries()` call
+   * (triggered by event handlers or explicit flush).
+   *
+   * @param tokenId - The genesis tokenId (64-hex) of the changed token.
+   * @param sdkData - The raw TXF JSON string from the token's sdkData field.
+   */
+  private _handleTokenChange(tokenId: string, sdkData: string): void {
+    if (this.destroyed || !this.deps) return;
+
+    let txf: TxfToken;
+    try {
+      txf = JSON.parse(sdkData) as TxfToken;
+    } catch {
+      return;
+    }
+
+    const transactions = txf.transactions ?? [];
+    const startIndex = this.tokenScanState.get(tokenId) ?? 0;
+    if (transactions.length <= startIndex) return; // no new transactions
+
+    this._processTokenTransactions(tokenId, txf, startIndex);
+
+    // Flush is deferred — the event handlers (_handleIncomingTransfer,
+    // _handleTransferConfirmed) will call _flushDirtyLedgerEntries() as
+    // part of their normal flow. For token changes that DON'T trigger
+    // an event (e.g., sync), we schedule an async flush.
+    if (this.dirtyLedgerEntries.size > 0) {
+      this._flushDirtyLedgerEntries().catch((err) => {
+        logger.warn(LOG_TAG, 'Error flushing ledger after token change:', err);
+      });
+    }
   }
 
   // ===========================================================================

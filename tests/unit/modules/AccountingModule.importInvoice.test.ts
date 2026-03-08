@@ -332,3 +332,101 @@ describe('UT-IMPORT-010: Import with expired dueDate still succeeds', () => {
     expect(result.dueDate).toBe(terms.dueDate);
   });
 });
+
+// =============================================================================
+// UT-IMPORT-011: Proactive indexing — pre-indexed entries available on import
+// =============================================================================
+
+describe('UT-IMPORT-011: Proactive indexing picks up pre-indexed entries', () => {
+  beforeEach(() => setup());
+
+  it('entries indexed before import are available in the ledger after import', async () => {
+    await module.load();
+    const mod = module as any;
+
+    const terms = validTerms();
+    const invoiceToken = createTestToken(terms);
+    const invoiceId = invoiceToken.genesis.data.tokenId;
+
+    // Simulate a pre-existing payment token referencing this invoice BEFORE import.
+    // The transfer was already scanned during load() or a prior event.
+    const paymentTransfer = createTestTransfer(invoiceId, 'F', '5000000', 'UCT', 'DIRECT://some_sender', 'DIRECT://target_addr_1');
+
+    // Build a UI token with sdkData containing the transfer
+    const paymentTokenId = 'payment_' + 'f'.repeat(56);
+    const paymentUiToken = {
+      id: paymentTokenId,
+      coinId: 'UCT',
+      symbol: 'UCT',
+      name: 'UCT',
+      decimals: 0,
+      amount: '5000000',
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: JSON.stringify(paymentTransfer),
+    };
+
+    // Make getTokens return this payment token (simulates pre-existing inventory)
+    mocks.payments.getTokens.mockReturnValue([paymentUiToken]);
+
+    // Force scan of payment token (simulates what happens during load or event handling)
+    mod._processTokenTransactions(paymentTokenId, paymentTransfer, 0);
+    await mod._flushDirtyLedgerEntries();
+
+    // At this point, invoiceTermsCache does NOT have invoiceId, but the ledger does
+    // (proactive indexing)
+    expect(mod.invoiceTermsCache.has(invoiceId)).toBe(false);
+    const preLedger = mod.invoiceLedger.get(invoiceId);
+    expect(preLedger).toBeDefined();
+    expect(preLedger.size).toBeGreaterThan(0);
+
+    // Now import the invoice
+    (mocks.payments as any).addToken = vi.fn().mockResolvedValue(undefined);
+    const result = await module.importInvoice(invoiceToken);
+    expect(result).toBeDefined();
+
+    // Ledger entries from proactive indexing should still be present
+    const postLedger = mod.invoiceLedger.get(invoiceId);
+    expect(postLedger).toBeDefined();
+    expect(postLedger.size).toBeGreaterThan(0);
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-012: Token observer indexes transactions at add time
+// =============================================================================
+
+describe('UT-IMPORT-012: Token observer indexes transactions inline', () => {
+  beforeEach(() => setup());
+
+  it('token change callback indexes invoice transactions immediately', async () => {
+    await module.load();
+    const mod = module as any;
+
+    // Verify onTokenChange was registered during load
+    expect(mocks.payments.onTokenChange).toHaveBeenCalledOnce();
+
+    const terms = validTerms();
+    const invoiceToken = createTestToken(terms);
+    const invoiceId = invoiceToken.genesis.data.tokenId;
+
+    // Create a payment token referencing this invoice
+    const paymentTransfer = createTestTransfer(invoiceId, 'F', '5000000', 'UCT', 'DIRECT://some_sender', 'DIRECT://target_addr_1');
+
+    // The observer receives the genesis tokenId (from TXF) and the sdkData JSON
+    const txfTokenId = paymentTransfer.genesis.data.tokenId;
+
+    // Simulate PaymentsModule notifying about a new token via the observer
+    const sdkData = JSON.stringify(paymentTransfer);
+    mocks.payments._notifyTokenChange(txfTokenId, sdkData);
+
+    // The ledger should now have entries for this invoice (indexed inline)
+    const ledger = mod.invoiceLedger.get(invoiceId);
+    expect(ledger).toBeDefined();
+    expect(ledger.size).toBeGreaterThan(0);
+
+    // Watermark should be advanced
+    expect(mod.tokenScanState.get(txfTokenId)).toBe(1);
+  });
+});

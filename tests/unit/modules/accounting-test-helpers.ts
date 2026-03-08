@@ -57,12 +57,15 @@ export interface MockPaymentsModule {
   getHistory: ReturnType<typeof vi.fn>;
   send: ReturnType<typeof vi.fn>;
   on: ReturnType<typeof vi.fn>;
+  onTokenChange: ReturnType<typeof vi.fn>;
   l1: null;
   // Test helpers
   _tokens: Token[];
   _sendResult: TransferResult;
   _handlers: Map<string, Array<(data: unknown) => void>>;
   _emit: (event: string, data: unknown) => void;
+  _tokenChangeCallbacks: Array<(tokenId: string, sdkData: string) => void>;
+  _notifyTokenChange: (tokenId: string, sdkData: string) => void;
 }
 
 export function createMockPaymentsModule(): MockPaymentsModule {
@@ -116,12 +119,27 @@ export function createMockPaymentsModule(): MockPaymentsModule {
     }
   };
 
+  const tokenChangeCallbacks: Array<(tokenId: string, sdkData: string) => void> = [];
+
+  const onTokenChange = vi.fn().mockImplementation((cb: (tokenId: string, sdkData: string) => void): (() => void) => {
+    tokenChangeCallbacks.push(cb);
+    return () => {
+      const idx = tokenChangeCallbacks.indexOf(cb);
+      if (idx !== -1) tokenChangeCallbacks.splice(idx, 1);
+    };
+  });
+
+  const _notifyTokenChange = (tokenId: string, sdkData: string): void => {
+    for (const cb of tokenChangeCallbacks) cb(tokenId, sdkData);
+  };
+
   const mock: MockPaymentsModule = {
     getTokens,
     getAssets,
     getHistory,
     send,
     on,
+    onTokenChange,
     l1: null,
     _tokens: tokens,
     get _sendResult(): TransferResult {
@@ -132,6 +150,8 @@ export function createMockPaymentsModule(): MockPaymentsModule {
     },
     _handlers: handlers,
     _emit,
+    _tokenChangeCallbacks: tokenChangeCallbacks,
+    _notifyTokenChange,
   };
 
   return mock;
