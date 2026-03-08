@@ -2462,7 +2462,14 @@ async function main() {
             }
             process.exit(1);
           }
-          const result = await sphere.accounting.createInvoice(termsJson as import('../modules/accounting/types').CreateInvoiceRequest);
+          let result;
+          try {
+            result = await sphere.accounting.createInvoice(termsJson as import('../modules/accounting/types').CreateInvoiceRequest);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`Failed to create invoice from terms file: ${msg}`);
+            process.exit(1);
+          }
           console.log('Invoice created:');
           console.log(JSON.stringify(result, null, 2));
         } else {
@@ -2476,11 +2483,19 @@ async function main() {
           const amount = amountIdx !== -1 ? args[amountIdx + 1] : undefined;
           const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
           const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
+          if (dueDate !== undefined && isNaN(dueDate)) {
+            console.error('Invalid due date format. Use ISO-8601, e.g. 2026-12-31');
+            process.exit(1);
+          }
           const memo = memoIdx !== -1 ? args[memoIdx + 1] : undefined;
           const delivery = deliveryIdx !== -1 ? args[deliveryIdx + 1] : undefined;
 
           const assets: import('../modules/accounting/types').InvoiceRequestedAsset[] = [];
           if (coinId && amount) {
+            if (!/^\d+$/.test(amount)) {
+              console.error(`Invalid amount "${amount}" — must be a non-negative integer in smallest units (no decimals)`);
+              process.exit(1);
+            }
             assets.push({ coin: [coinId, amount] });
           } else if (nftId) {
             assets.push({ nft: { tokenId: nftId } });
@@ -2522,7 +2537,14 @@ async function main() {
           process.exit(1);
         }
 
-        const terms = await sphere.accounting.importInvoice(tokenJson as import('../types/txf').TxfToken);
+        let terms;
+        try {
+          terms = await sphere.accounting.importInvoice(tokenJson as import('../types/txf').TxfToken);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Failed to import invoice: ${msg}`);
+          process.exit(1);
+        }
         console.log('Invoice imported:');
         console.log(JSON.stringify(terms, null, 2));
 
@@ -2545,7 +2567,10 @@ async function main() {
         const options: import('../modules/accounting/types').GetInvoicesOptions = {};
         if (createdByMe) options.createdByMe = true;
         if (targetingMe) options.targetingMe = true;
-        if (stateFilter) options.state = stateFilter as import('../modules/accounting/types').InvoiceState;
+        if (stateFilter) {
+          const stateValues = stateFilter.split(',').map(s => s.trim());
+          options.state = stateValues.length === 1 ? stateValues[0] as any : stateValues as any;
+        }
 
         const invoices = await sphere.accounting.getInvoices(options);
 
@@ -2695,10 +2720,24 @@ async function main() {
         const amountIdx2 = args.indexOf('--amount');
         const targetIndexIdx = args.indexOf('--target-index');
 
+        const rawTargetIdx = targetIndexIdx !== -1 ? args[targetIndexIdx + 1] : undefined;
+        const targetIndex = rawTargetIdx !== undefined ? parseInt(rawTargetIdx, 10) : 0;
+        if (isNaN(targetIndex) || targetIndex < 0) {
+          console.error('--target-index must be a non-negative integer');
+          process.exit(1);
+        }
+
         const payParams: import('../modules/accounting/types').PayInvoiceParams = {
-          targetIndex: targetIndexIdx !== -1 ? parseInt(args[targetIndexIdx + 1]) : 0,
+          targetIndex,
         };
-        if (amountIdx2 !== -1 && args[amountIdx2 + 1]) payParams.amount = args[amountIdx2 + 1];
+        if (amountIdx2 !== -1 && args[amountIdx2 + 1]) {
+          const rawAmount = args[amountIdx2 + 1];
+          if (!/^\d+$/.test(rawAmount)) {
+            console.error(`Invalid amount "${rawAmount}" — must be a non-negative integer in smallest units (no decimals)`);
+            process.exit(1);
+          }
+          payParams.amount = rawAmount;
+        }
 
         const result = await sphere.accounting.payInvoice(invoiceId, payParams);
         console.log('Payment result:');

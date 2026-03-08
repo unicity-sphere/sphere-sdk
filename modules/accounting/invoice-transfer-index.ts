@@ -285,6 +285,7 @@ export class InvoiceTransferIndex {
     this.dirtyInvoices.clear();
 
     // Step 1: Write per-invoice ledger entries
+    let anyLedgerWriteFailed = false;
     for (const invoiceId of dirtySnapshot) {
       const entryMap = this.invoiceLedger.get(invoiceId);
       if (!entryMap) continue;
@@ -295,8 +296,12 @@ export class InvoiceTransferIndex {
         logger.warn('InvoiceTransferIndex', `Failed to flush inv_ledger:${invoiceId}`, err);
         // Re-mark as dirty so next flush retries
         this.dirtyInvoices.add(invoiceId);
+        anyLedgerWriteFailed = true;
       }
     }
+
+    // If any ledger write failed, do NOT advance scanState/index — preserves crash-recovery invariant
+    if (anyLedgerWriteFailed) return;
 
     // Step 2: Write token scan state
     try {
@@ -408,6 +413,7 @@ export class InvoiceTransferIndex {
      */
     const deriveDirectAddress = async (pubkeyHex: string): Promise<string> => {
       await ensureSdkImports();
+      // Use the standard fungible token type for address derivation (same constant as PaymentsModule/NametagMinter)
       const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
       const tokenType = new TokenType!(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
       const pubkeyBytes = hexToBytes(pubkeyHex);

@@ -69,6 +69,7 @@ function makeIncomingTransfer(
   coinId = 'UCT',
   senderAddress?: string,
   destinationAddress?: string,
+  senderPubkey = '02' + 'b'.repeat(64),
 ): IncomingTransfer {
   const txfToken = createTestTransfer(
     invoiceId,
@@ -80,7 +81,7 @@ function makeIncomingTransfer(
   );
   return {
     id: 'transfer-' + Math.random().toString(36).slice(2),
-    senderPubkey: '02' + 'b'.repeat(64),
+    senderPubkey,
     memo: `INV:${invoiceId}:${direction}`,
     tokens: [
       {
@@ -307,12 +308,10 @@ describe('AccountingModule — Events', () => {
 
     await module.getInvoiceStatus(invoiceId);
 
-    // Check if implicit close fired
+    // Implicit close must fire with explicit: false
     const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
-    if (closedCalls.length > 0) {
-      expect(closedCalls[0][1]).toMatchObject({ invoiceId, explicit: false });
-    }
-    // If not fired: need all tokens confirmed — acceptable if module didn't trigger implicit close
+    expect(closedCalls.length).toBeGreaterThan(0);
+    expect(closedCalls[0][1]).toMatchObject({ invoiceId, explicit: false });
   });
 
   // -------------------------------------------------------------------------
@@ -559,12 +558,21 @@ describe('AccountingModule — Events', () => {
   // UT-EVENTS-018: invoice:auto_return_failed fires on send failure
   // -------------------------------------------------------------------------
   it('UT-EVENTS-018: invoice:auto_return_failed fires when auto-return send() fails', async () => {
-    const invoiceId = injectInvoice(module, makeTerms());
+    // Invoice requires 5M but sender paid 10M → 5M surplus → termination auto-return triggered
+    const invoiceId = injectInvoice(module, makeTerms({
+      targets: [
+        {
+          address: 'DIRECT://test_target_address_abc123',
+          assets: [{ coin: ['UCT', '5000000'] }],
+        },
+      ],
+    }));
 
-    // Inject a forward payment so there is a balance
+    // Inject a forward payment of 10M (surplus = 5M)
     const transferRef = createTestTransferRef(invoiceId, 'forward', '10000000', 'UCT', {
       destinationAddress: 'DIRECT://test_target_address_abc123',
       senderAddress: 'DIRECT://sender_address_def456',
+      confirmed: true,
     });
     const key = `${transferRef.transferId}::${transferRef.coinId}`;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -582,11 +590,10 @@ describe('AccountingModule — Events', () => {
       expect.objectContaining({ invoiceId }),
     );
 
-    // auto_return_failed may fire if auto-return was attempted
+    // auto_return_failed must fire since send() was rejected
     const failedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:auto_return_failed');
-    if (failedCalls.length > 0) {
-      expect(failedCalls[0][1]).toMatchObject({ invoiceId });
-    }
+    expect(failedCalls.length).toBeGreaterThan(0);
+    expect(failedCalls[0][1]).toMatchObject({ invoiceId });
   });
 
   // -------------------------------------------------------------------------
@@ -613,22 +620,19 @@ describe('AccountingModule — Events', () => {
     expect(paymentCalls.length).toBeGreaterThanOrEqual(1);
 
     // Ledger should not double-count: dedup key prevents it.
-    // NOTE: the _processTokenTransactions stub does not populate the ledger from
-    // incoming transfers, so the ledger will only have entries if pre-injected.
-    // This assertion is only meaningful if the ledger has been populated.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const ledgerMap = (module as any).invoiceLedger.get(invoiceId) as Map<string, any> | undefined;
-    if (ledgerMap && ledgerMap.size > 0) {
-      const entries = Array.from(ledgerMap.values()).filter(
-        (e: InvoiceTransferRef) => e.paymentDirection === 'forward',
-      );
-      const totalForwarded = entries.reduce(
-        (sum: bigint, e: InvoiceTransferRef) => sum + BigInt(e.amount),
-        0n,
-      );
-      // Should be 5000000 (not doubled to 10000000)
-      expect(totalForwarded).toBe(5000000n);
-    }
+    expect(ledgerMap).toBeDefined();
+    expect(ledgerMap!.size).toBeGreaterThan(0);
+    const entries = Array.from(ledgerMap!.values()).filter(
+      (e: InvoiceTransferRef) => e.paymentDirection === 'forward',
+    );
+    const totalForwarded = entries.reduce(
+      (sum: bigint, e: InvoiceTransferRef) => sum + BigInt(e.amount),
+      0n,
+    );
+    // Should be 5000000 (not doubled to 10000000)
+    expect(totalForwarded).toBe(5000000n);
   });
 
   // -------------------------------------------------------------------------
@@ -787,6 +791,7 @@ describe('AccountingModule — Events', () => {
     ]));
 
     // Now send another 3 UCT back (total returned = 6 > forwarded 5)
+    // sender = target (the wallet itself returning), so senderPubkey must match wallet identity
     const overReturnTransfer = makeIncomingTransfer(
       invoiceId,
       'B',
@@ -794,15 +799,14 @@ describe('AccountingModule — Events', () => {
       'UCT',
       'DIRECT://test_target_address_abc123', // sender = target (returning)
       'DIRECT://sender_address_def456',
+      DEFAULT_TEST_IDENTITY.chainPubkey, // wallet's own pubkey → isSelfSender=true → senderAddress resolved
     );
     mocks.payments._emit('transfer:incoming', overReturnTransfer);
     await new Promise((r) => setTimeout(r, 30));
 
-    // over_refund_warning may fire — verify it has the correct invoiceId if it does
+    // over_refund_warning must fire since returned (6 UCT) > forwarded (5 UCT)
     const warnCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:over_refund_warning');
-    if (warnCalls.length > 0) {
-      expect(warnCalls[0][1]).toMatchObject({ invoiceId });
-    }
-    // No crash occurred (test completing proves it)
+    expect(warnCalls.length).toBeGreaterThan(0);
+    expect(warnCalls[0][1]).toMatchObject({ invoiceId });
   });
 });

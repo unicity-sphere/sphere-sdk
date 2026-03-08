@@ -156,11 +156,12 @@ export function buildInvoiceMemo(
     throw new SphereError('Invoice ID must be a 64-char hex string', 'INVOICE_INVALID_ID');
   }
 
-  // Strip control characters U+0000–U+001F except \n (U+000A) and \r (U+000D),
-  // then truncate to 256 Unicode code points (split on code points to handle
+  // Strip ALL control characters U+0000–U+001F (including \n and \r) to ensure
+  // the memo is single-line compatible with INVOICE_MEMO_REGEX (.+ does not match \n).
+  // Then truncate to 256 Unicode code points (split on code points to handle
   // surrogate pairs for astral-plane characters correctly).
   const sanitized = freeText
-    ? [...freeText.replace(/[\x00-\x09\x0b\x0c\x0e-\x1f]/g, '')].slice(0, 256).join('').trim()
+    ? [...freeText.replace(/[\x00-\x1f]/g, '')].slice(0, 256).join('').trim()
     : undefined;
 
   const text = sanitized ? ` ${sanitized}` : '';
@@ -377,13 +378,44 @@ export function parseInvoiceMemoForOnChain(
     return null;
   }
 
+  // Validate refundAddress before embedding on-chain (same rules as decodeTransferMessage)
+  const validRefundAddress =
+    refundAddress &&
+    typeof refundAddress === 'string' &&
+    refundAddress.startsWith('DIRECT://') &&
+    refundAddress.length > 9 &&
+    refundAddress.length <= 256
+      ? refundAddress
+      : undefined;
+
+  // Validate contact fields before embedding on-chain (same rules as decodeTransferMessage)
+  let validContact: { a: string; u?: string } | undefined;
+  if (contact) {
+    const validAddr =
+      typeof contact.address === 'string' &&
+      contact.address.startsWith('DIRECT://') &&
+      contact.address.length > 9 &&
+      contact.address.length <= 256;
+
+    if (validAddr) {
+      validContact = { a: contact.address };
+      if (
+        contact.url &&
+        typeof contact.url === 'string' &&
+        (contact.url.startsWith('https://') || contact.url.startsWith('wss://')) &&
+        contact.url.length <= 2048 &&
+        !/[\x00-\x1f]/.test(contact.url)
+      ) {
+        validContact.u = contact.url;
+      }
+    }
+  }
+
   const inv: NonNullable<TransferMessagePayload['inv']> = {
     id: ref.invoiceId,
     dir: DIRECTION_TO_CODE[ref.paymentDirection],
-    ...(refundAddress ? { ra: refundAddress } : {}),
-    ...(contact
-      ? { ct: { a: contact.address, ...(contact.url ? { u: contact.url } : {}) } }
-      : {}),
+    ...(validRefundAddress ? { ra: validRefundAddress } : {}),
+    ...(validContact ? { ct: validContact } : {}),
   };
 
   const payload: TransferMessagePayload = {

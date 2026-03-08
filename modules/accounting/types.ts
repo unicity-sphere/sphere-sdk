@@ -328,8 +328,8 @@ export interface InvoiceTransferRef {
    * NOT included in the transport memo (same privacy model as refund address).
    */
   readonly contact?: { address: string; url?: string };
-  /** Sender chain pubkey (null if predicate is masked) */
-  readonly senderPubkey?: string | null;
+  /** Sender chain pubkey (null if predicate is masked, undefined if not extracted) */
+  readonly senderPubkey?: string;
   /** Sender nametag */
   readonly senderNametag?: string;
   /** Recipient chain pubkey */

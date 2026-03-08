@@ -46,7 +46,7 @@ function makeInvoiceToken(terms: InvoiceTerms, tokenId: string = INVOICE_ID): To
   const txf = createTestToken(terms, tokenId);
   return {
     id: tokenId,
-    coinId: 'INVOICE',
+    coinId: INVOICE_TOKEN_TYPE_HEX,
     symbol: 'INV',
     name: 'Invoice',
     decimals: 0,

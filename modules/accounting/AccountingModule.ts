@@ -290,6 +290,7 @@ export class AccountingModule {
 
   private async _doLoad(): Promise<void> {
     const deps = this.deps!;
+    const deferredEvents: Array<{ event: string; payload: unknown }> = [];
 
     // ------------------------------------------------------------------
     // Step 1: Clear all in-memory state
@@ -372,12 +373,12 @@ export class AccountingModule {
         logger.warn(LOG_TAG, `Reconcile (forward): adding ${invoiceId} to CANCELLED set`);
         this.cancelledInvoices.add(invoiceId);
         terminalSetDirty = true;
-        deps.emitEvent('invoice:cancelled', { invoiceId });
+        deferredEvents.push({ event: 'invoice:cancelled', payload: { invoiceId } });
       } else if (frozen.state === 'CLOSED' && !this.closedInvoices.has(invoiceId)) {
         logger.warn(LOG_TAG, `Reconcile (forward): adding ${invoiceId} to CLOSED set`);
         this.closedInvoices.add(invoiceId);
         terminalSetDirty = true;
-        deps.emitEvent('invoice:closed', { invoiceId, explicit: frozen.explicitClose ?? false });
+        deferredEvents.push({ event: 'invoice:closed', payload: { invoiceId, explicit: frozen.explicitClose ?? false } });
       }
     }
     if (terminalSetDirty) {
@@ -453,6 +454,11 @@ export class AccountingModule {
     // Catches tokens that arrived between the initial scan and subscription.
     // ------------------------------------------------------------------
     await this._gapFillTokenScan();
+
+    // Emit deferred reconciliation events now that the module is fully initialized
+    for (const { event, payload } of deferredEvents) {
+      deps.emitEvent(event as keyof SphereEventMap, payload as never);
+    }
 
     if (this.config.debug) {
       logger.debug(LOG_TAG, 'load() complete');
@@ -993,7 +999,7 @@ export class AccountingModule {
       // ------------------------------------------------------------------
       const sdkTokenJson = sdkToken.toJSON();
       const uiToken: import('../../types/index.js').Token = {
-        id: crypto.randomUUID(),
+        id: invoiceId,
         coinId: INVOICE_TOKEN_TYPE_HEX,
         symbol: 'INVOICE',
         name: 'Invoice',
@@ -3191,9 +3197,22 @@ export class AccountingModule {
           const coinId = fca.coin[0];
           const amount = fsb.netBalance;
           const memo = buildInvoiceMemo(invoiceId, direction);
+          // Use a dedup key that identifies this frozen-balance return uniquely
+          const dedupTransferId = `FROZEN:${ft.address}:${recipient}:${coinId}`;
+
+          // Skip if already done
+          if (this.autoReturnManager.isDone(invoiceId, dedupTransferId)) continue;
+          const existing = this.autoReturnManager.getEntry(invoiceId, dedupTransferId);
+          if (existing?.status === 'failed') continue;
+
+          // Write-first intent
+          await this.autoReturnManager.recordIntent(invoiceId, dedupTransferId, {
+            recipient, amount, coinId, memo,
+          });
 
           try {
-            await deps.payments.send({ recipient, amount, coinId, memo });
+            const result = await deps.payments.send({ recipient, amount, coinId, memo });
+            await this.autoReturnManager.markCompleted(invoiceId, dedupTransferId, result.id);
             if (this.config.debug) {
               logger.debug(
                 LOG_TAG,
@@ -3206,6 +3225,12 @@ export class AccountingModule {
               `Termination auto-return (${direction}) failed for ${invoiceId} → ${recipient} ${amount} ${coinId}:`,
               err,
             );
+            await this.autoReturnManager.markFailed(invoiceId, dedupTransferId);
+            deps.emitEvent('invoice:auto_return_failed', {
+              invoiceId,
+              transferId: dedupTransferId,
+              reason: 'send_failed',
+            });
           }
         }
       }
@@ -3221,6 +3246,14 @@ export class AccountingModule {
    * in `destroy()`.
    */
   private _clearInMemoryState(): void {
+    // Unsubscribe any existing event handlers to prevent accumulation on retry
+    for (const unsub of this.unsubscribePayments) {
+      try { unsub(); } catch { /* ignore */ }
+    }
+    this.unsubscribePayments = [];
+    try { this.unsubscribeDMs?.(); } catch { /* ignore */ }
+    this.unsubscribeDMs = null;
+
     this.invoiceTermsCache.clear();
     this.cancelledInvoices.clear();
     this.closedInvoices.clear();
@@ -3548,6 +3581,27 @@ export class AccountingModule {
     }
   }
 
+  /**
+   * Update confirmed=true on all ledger entries whose transferId starts with
+   * the given tokenId prefix. Called when transfer:confirmed fires to ensure
+   * allConfirmed can become true for implicit close.
+   */
+  private _markTokenEntriesConfirmed(tokenId: string): void {
+    for (const [invoiceId, ledger] of this.invoiceLedger) {
+      let changed = false;
+      for (const [key, entry] of ledger) {
+        if (entry.transferId.startsWith(`${tokenId}:`) && !entry.confirmed) {
+          ledger.set(key, { ...entry, confirmed: true });
+          changed = true;
+        }
+      }
+      if (changed) {
+        this.dirtyLedgerEntries.add(invoiceId);
+        this.balanceCache.delete(invoiceId);
+      }
+    }
+  }
+
   // ===========================================================================
   // Internal: Process token transactions (§5.4.3)
   // ===========================================================================
@@ -3865,6 +3919,13 @@ export class AccountingModule {
       }
     }
 
+    await this._flushDirtyLedgerEntries();
+
+    // Mark ledger entries as confirmed for all tokens in this result
+    for (const token of result.tokens) {
+      this._markTokenEntriesConfirmed(token.id);
+    }
+    // Flush the confirmed-status updates
     await this._flushDirtyLedgerEntries();
 
     // §6.2 transfer:confirmed step 1–4: re-fire events with confirmed=true
@@ -4542,15 +4603,16 @@ export class AccountingModule {
     originalRef: InvoiceTransferRef,
     deps: AccountingModuleDependencies,
   ): Promise<void> {
-    await this.withInvoiceGate(invoiceId, async () => {
-      if (this.destroyed) return;
+    // Phase 1: Inside gate — check dedup, resolve destination, record intent
+    const sendParams = await this.withInvoiceGate(invoiceId, async () => {
+      if (this.destroyed) return null;
 
       const transferId = originalRef.transferId;
 
       // Skip if already completed (failed entries are retried only via setAutoReturn())
-      if (this.autoReturnManager.isDone(invoiceId, transferId)) return;
+      if (this.autoReturnManager.isDone(invoiceId, transferId)) return null;
       const existing = this.autoReturnManager.getEntry(invoiceId, transferId);
-      if (existing?.status === 'failed') return;
+      if (existing?.status === 'failed') return null;
 
       // §6.2: Resolve auto-return destination: refundAddress ?? senderAddress
       const returnTo = originalRef.refundAddress ?? originalRef.senderAddress;
@@ -4560,16 +4622,14 @@ export class AccountingModule {
           transferId,
           reason: 'sender_unresolvable',
         });
-        // Leave as 'pending' so setAutoReturn() can retry when destination is known
-        return;
+        return null;
       }
 
       // Direction code: :RC for CLOSED, :RX for CANCELLED (§6.2 step 5)
       const dirCode = this.closedInvoices.has(invoiceId) ? 'RC' : 'RX';
-      // freeText = originalTransferId for secondary dedup matching (§7.5)
       const returnMemo = buildInvoiceMemo(invoiceId, dirCode, transferId);
 
-      // Write-first intent log (crash recovery: if process dies here, next load() will retry)
+      // Write-first intent log (crash recovery)
       await this.autoReturnManager.recordIntent(invoiceId, transferId, {
         recipient: returnTo,
         amount: originalRef.amount,
@@ -4577,32 +4637,44 @@ export class AccountingModule {
         memo: returnMemo,
       });
 
-      try {
-        const result = await deps.payments.send({
-          recipient: returnTo,
-          amount: originalRef.amount,
-          coinId: originalRef.coinId,
-          memo: returnMemo,
-        });
-
-        await this.autoReturnManager.markCompleted(invoiceId, transferId, result.id);
-
-        deps.emitEvent('invoice:auto_returned', {
-          invoiceId,
-          originalTransfer: originalRef,
-          returnTransfer: originalRef, // best available; confirmed ref unavailable until transfer:confirmed
-        });
-      } catch (err) {
-        logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${returnTo}:`, err);
-        await this.autoReturnManager.markFailed(invoiceId, transferId);
-
-        deps.emitEvent('invoice:auto_return_failed', {
-          invoiceId,
-          transferId,
-          reason: 'send_failed',
-        });
-      }
+      return { transferId, returnTo, amount: originalRef.amount, coinId: originalRef.coinId, memo: returnMemo };
     });
+
+    if (!sendParams) return;
+
+    // Phase 2: Outside gate — send tokens (no gate held during network call)
+    try {
+      const result = await deps.payments.send({
+        recipient: sendParams.returnTo,
+        amount: sendParams.amount,
+        coinId: sendParams.coinId,
+        memo: sendParams.memo,
+      });
+
+      // Phase 3: Inside gate — mark completed
+      await this.withInvoiceGate(invoiceId, async () => {
+        await this.autoReturnManager.markCompleted(invoiceId, sendParams.transferId, result.id);
+      });
+
+      deps.emitEvent('invoice:auto_returned', {
+        invoiceId,
+        originalTransfer: originalRef,
+        returnTransfer: originalRef,
+      });
+    } catch (err) {
+      logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${sendParams.returnTo}:`, err);
+
+      // Phase 3 (failure): Inside gate — mark failed
+      await this.withInvoiceGate(invoiceId, async () => {
+        await this.autoReturnManager.markFailed(invoiceId, sendParams.transferId);
+      });
+
+      deps.emitEvent('invoice:auto_return_failed', {
+        invoiceId,
+        transferId: sendParams.transferId,
+        reason: 'send_failed',
+      });
+    }
   }
 
   /**

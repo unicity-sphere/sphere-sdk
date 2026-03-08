@@ -978,6 +978,16 @@ function freezeCoinAsset(
       }
     }
 
+    // Assign any undistributed remainder to latest sender (or first sender as fallback)
+    // This ensures sum(frozenNetBalances) == totalSurplus for CLOSED invoices.
+    if (remainingSurplus > 0n && coinAsset.senderBalances.length > 0) {
+      const fallbackSender = latestSender ?? coinAsset.senderBalances[0]!.senderAddress;
+      senderSurplusMap.set(
+        fallbackSender,
+        (senderSurplusMap.get(fallbackSender) ?? 0n) + remainingSurplus,
+      );
+    }
+
     frozenSenderBalances = coinAsset.senderBalances.map((sb) => {
       const allocatedSurplus = senderSurplusMap.get(sb.senderAddress) ?? 0n;
       const isLatest =

@@ -274,8 +274,10 @@ describe('UT-LIFECYCLE-005: destroy() unsubscribes from events', () => {
     await module.load();
     module.destroy();
 
-    // The emitEvent stub should not be called after destroy
-    const emitSpy = vi.fn();
+    // Capture the call count of the actual emitEvent mock BEFORE emitting
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const countBefore = (module as any).deps?.emitEvent?.mock?.calls?.length ?? 0;
+
     // Re-emit a transfer event — the destroyed module should ignore it
     mocks.payments._emit('transfer:incoming', {
       senderPubkey: '02' + 'a'.repeat(64),
@@ -283,8 +285,10 @@ describe('UT-LIFECYCLE-005: destroy() unsubscribes from events', () => {
       receivedAt: Date.now(),
     });
 
-    // emitEvent is on the deps, not payments; just verify no errors thrown
-    expect(emitSpy).not.toHaveBeenCalled();
+    // emitEvent should not have been called again after destroy
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const countAfter = (module as any).deps?.emitEvent?.mock?.calls?.length ?? 0;
+    expect(countAfter).toBe(countBefore);
   });
 });
 
