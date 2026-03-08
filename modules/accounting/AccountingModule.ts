@@ -11,7 +11,7 @@
 
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
-import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey } from '../../constants.js';
+import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
   TransferRequest,
@@ -831,8 +831,9 @@ export class AccountingModule {
     const saltBuffer = await crypto.subtle.digest('SHA-256', saltInput);
     const salt = new Uint8Array(saltBuffer);
 
-    // Zero key material immediately — no longer needed after digest
-    signingKeyBytes.fill(0);
+    // NOTE: signingKeyBytes is still needed for SigningService.createFromSecret() below.
+    // Zero saltInput now (no longer needed after digest), but defer signingKeyBytes
+    // zeroing to the finally block after all signing operations are complete.
     saltInput.fill(0);
 
     // ------------------------------------------------------------------
@@ -1101,6 +1102,9 @@ export class AccountingModule {
         'INVOICE_MINT_FAILED',
         err,
       );
+    } finally {
+      // Zero private key material on all paths (success, error, or re-throw)
+      signingKeyBytes.fill(0);
     }
   }
 
@@ -2044,17 +2048,17 @@ export class AccountingModule {
       );
     }
 
-    // Delegate to PaymentsModule.send(). refundAddress and contact are forwarded
-    // so PaymentsModule can encode them in the on-chain TransferMessagePayload
+    // Delegate to PaymentsModule.send(). invoiceRefundAddress and invoiceContact are
+    // forwarded so PaymentsModule can encode them in the on-chain TransferMessagePayload
     // via parseInvoiceMemoForOnChain (§4.7).
     return deps.payments.send({
       recipient: target.address,
       amount: sendAmount,
       coinId,
       memo,
-      refundAddress: params.refundAddress,
-      contact: effectiveContact,
-    } as TransferRequest);
+      invoiceRefundAddress: params.refundAddress,
+      invoiceContact: effectiveContact,
+    });
   }
 
   /**
@@ -2239,14 +2243,19 @@ export class AccountingModule {
         memo,
       });
 
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(
           () => reject(new SphereError('returnInvoicePayment send() timed out after 60s', 'TIMEOUT')),
           60_000,
-        ),
-      );
+        );
+      });
 
-      return Promise.race([sendPromise, timeoutPromise]);
+      try {
+        return await Promise.race([sendPromise, timeoutPromise]);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
     });
   }
 
@@ -3698,12 +3707,10 @@ export class AccountingModule {
       };
       const paymentDirection = dirMap[payload.inv.dir] ?? 'forward';
 
-      // Extract coin data from genesis
+      // Extract coin data from genesis — skip tokens without valid coinData
       const coinData = txf.genesis?.data?.coinData as [string, string][] | undefined;
-      const entries =
-        coinData && coinData.length > 0
-          ? coinData.slice(0, this.config.maxCoinDataEntries)
-          : ([['UNKNOWN', '0']] as [string, string][]);
+      if (!coinData || coinData.length === 0) continue; // no phantom UNKNOWN entries
+      const entries = coinData.slice(0, this.config.maxCoinDataEntries);
 
       // Use positional transferId (avoids expensive async hash computation)
       const transferId = `${tokenId}:${i}`;
@@ -4960,7 +4967,8 @@ export class AccountingModule {
   private async _flushDirtyLedgerEntries(): Promise<void> {
     if (this.dirtyLedgerEntries.size === 0 && this.tokenScanState.size === 0) return;
 
-    // Step 1: Write dirty invoice ledger entries
+    // Step 1: Write dirty invoice ledger entries (delete per-write for crash safety)
+    const written = new Set<string>();
     for (const invoiceId of this.dirtyLedgerEntries) {
       const innerMap = this.invoiceLedger.get(invoiceId);
       if (!innerMap) continue;
@@ -4969,8 +4977,11 @@ export class AccountingModule {
         entries[k] = v;
       }
       await this.saveJsonToStorage(`${INV_LEDGER_PREFIX}${invoiceId}`, entries);
+      written.add(invoiceId);
     }
-    this.dirtyLedgerEntries.clear();
+    for (const id of written) {
+      this.dirtyLedgerEntries.delete(id);
+    }
 
     // Step 2: Write token_scan_state
     const scanStateObj: Record<string, number> = {};
@@ -5041,9 +5052,9 @@ export class AccountingModule {
    */
   private getStorageKey(key: string): string {
     const identity = this.deps!.identity;
-    // Derive addressId from directAddress or chainPubkey
-    const directAddress = identity.directAddress ?? identity.chainPubkey;
-    return getAddressStorageKey(directAddress, key);
+    // Use condensed addressId format (DIRECT_abc123_xyz789) for consistency with other modules
+    const addressId = getAddressId(identity.directAddress ?? identity.chainPubkey);
+    return getAddressStorageKey(addressId, key);
   }
 
   /**

@@ -590,9 +590,8 @@ describe('AccountingModule.getInvoiceStatus()', () => {
     // USDU zero-entry should not contribute → PARTIAL (USDU still 0)
     expect(status.state).toBe('PARTIAL');
     const usduAsset = status.targets[0].coinAssets?.find((a: any) => a.coin[0] === 'USDU');
-    if (usduAsset) {
-      expect(usduAsset.netCoveredAmount).toBe('0');
-    }
+    expect(usduAsset).toBeDefined();
+    expect(usduAsset!.netCoveredAmount).toBe('0');
   });
 
   // -------------------------------------------------------------------------

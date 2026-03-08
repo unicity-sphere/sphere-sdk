@@ -85,11 +85,10 @@ describe('AccountingModule Memo Utilities', () => {
     // acceptable as long as when it does match, paymentDirection === 'forward'.
     const result = parseInvoiceMemo(`INV:${VALID_ID}`);
 
-    if (result !== null) {
-      // When the absent-direction path matches, it must default to 'forward'
-      expect(result.paymentDirection).toBe('forward');
-    }
-    // No error should be thrown either way
+    // Direction group is optional in the regex — omitted direction defaults to 'forward'
+    expect(result).not.toBeNull();
+    expect(result!.invoiceId).toBe(VALID_ID.toLowerCase());
+    expect(result!.paymentDirection).toBe('forward');
   });
 
   // UT-MEMO-007

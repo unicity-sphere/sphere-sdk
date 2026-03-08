@@ -16,6 +16,7 @@ import {
   SphereError,
   INVOICE_TOKEN_TYPE_HEX,
 } from './accounting-test-helpers.js';
+import { getAddressId } from '../../../constants.js';
 import type { InvoiceTerms, InvoiceTransferRef } from '../../../modules/accounting/types.js';
 import type { Token } from '../../../types/index.js';
 
@@ -37,9 +38,9 @@ const TARGET_ADDRESS = 'DIRECT://test_target_address_abc123';
  *   getAddressStorageKey(identity.directAddress, subKey) = `${identity.directAddress}_${subKey}`
  *
  * DEFAULT_TEST_IDENTITY.directAddress = 'DIRECT://test_target_address_abc123'
- * So keys look like: 'DIRECT://test_target_address_abc123_closed_invoices'
+ * Uses condensed addressId format (DIRECT_first6_last6) for storage keys.
  */
-const STORAGE_PREFIX = DEFAULT_TEST_IDENTITY.directAddress!;
+const STORAGE_PREFIX = getAddressId(DEFAULT_TEST_IDENTITY.directAddress!);
 
 /** Build a Token shape that load() will parse as an invoice token. */
 function makeInvoiceToken(terms: InvoiceTerms, tokenId: string = INVOICE_ID): Token {
@@ -258,7 +259,7 @@ describe('AccountingModule.payInvoice()', () => {
     await module.payInvoice(INVOICE_ID, { targetIndex: 0, amount: '5000000' });
 
     const sendCall = mocks.payments.send.mock.calls[0]![0] as Record<string, unknown>;
-    const contact = sendCall.contact as { address: string } | undefined;
+    const contact = sendCall.invoiceContact as { address: string } | undefined;
     expect(contact).toBeDefined();
     // Auto-populated from DEFAULT_TEST_IDENTITY.directAddress
     expect(contact!.address).toBe(DEFAULT_TEST_IDENTITY.directAddress);

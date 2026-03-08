@@ -129,6 +129,10 @@ export interface TransferRequest {
   readonly addressMode?: AddressMode;
   /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
   readonly transferMode?: TransferMode;
+  /** Invoice refund address (DIRECT://) — embedded in on-chain message for return routing */
+  readonly invoiceRefundAddress?: string;
+  /** Invoice contact info — embedded in on-chain message for receipt/notice delivery */
+  readonly invoiceContact?: { address: string; url?: string };
 }
 
 /**

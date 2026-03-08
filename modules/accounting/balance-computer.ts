@@ -985,7 +985,8 @@ function freezeCoinAsset(
       let bestSender = latestSender ?? coinAsset.senderBalances[0]!.senderAddress;
       let bestNet = 0n;
       for (const sb of coinAsset.senderBalances) {
-        const senderNet = BigInt(sb.forwardedAmount) - BigInt(sb.returnedAmount);
+        const rawNet = BigInt(sb.forwardedAmount) - BigInt(sb.returnedAmount);
+        const senderNet = rawNet > 0n ? rawNet : 0n; // clamp: negative net → 0
         if (senderNet > bestNet) {
           bestNet = senderNet;
           bestSender = sb.senderAddress;

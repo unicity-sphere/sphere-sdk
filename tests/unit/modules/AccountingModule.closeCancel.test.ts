@@ -208,10 +208,13 @@ function getEmitEvent(module: AccountingModule): ReturnType<typeof vi.fn> {
   return (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
 }
 
-/** Compute storage key as the module does internally. */
+/** Compute storage key as the module does internally (uses condensed addressId). */
 function storageKey(storageKeyName: string): string {
   const directAddress = DEFAULT_TEST_IDENTITY.directAddress!;
-  return `${directAddress}_${storageKeyName}`;
+  // Mirrors getAddressId() from constants.ts: DIRECT_first6_last6
+  const hash = directAddress.startsWith('DIRECT://') ? directAddress.slice(9) : directAddress;
+  const addressId = `DIRECT_${hash.slice(0, 6).toLowerCase()}_${hash.slice(-6).toLowerCase()}`;
+  return `${addressId}_${storageKeyName}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -409,10 +412,8 @@ describe('AccountingModule.closeInvoice()', () => {
     const s1Frozen = uctAsset!.frozenSenderBalances.find(
       (fsb: any) => fsb.senderAddress === sender1,
     );
-    if (s1Frozen) {
-      // Either s1 is absent (not in frozen at all) or has netBalance 0
-      expect(s1Frozen.netBalance).toBe('0');
-    }
+    expect(s1Frozen).toBeDefined();
+    expect(s1Frozen!.netBalance).toBe('0');
     // Latest sender (sender2) should have the surplus (0 in this case: 10 - 10 = 0)
     // but should still appear as the latest sender
     expect(uctAsset!.latestSenderAddress).toBe(sender2);

@@ -116,32 +116,23 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    // Simulate an :RC transfer arriving (from a target address indicating close-return)
-    const rcTransfer = makeIncomingTransferWithDirection(
-      invoiceId,
-      'RC',
-      '5000000',
-      'UCT',
-      'DIRECT://test_target_address_abc123',
-      'DIRECT://sender_address_def456',
-    );
+    // Simulate an :RC transfer arriving — must appear as self-sent so senderAddress
+    // resolves to identity.directAddress (a target). Use identity.chainPubkey as senderPubkey.
+    const rcTransfer = makeIncomingTransferWithDirection(invoiceId, 'RC');
+    rcTransfer.senderPubkey = '02' + 'a'.repeat(64); // matches DEFAULT_TEST_IDENTITY.chainPubkey
 
     mocks.payments._emit('transfer:incoming', rcTransfer);
 
     // Give the async pipeline time to settle
     await new Promise((r) => setTimeout(r, 50));
 
-    // The invoice should be marked as closed
+    // The invoice should be marked as closed — assert unconditionally
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const closedInvoices = (module as any).closedInvoices as Set<string>;
-    // Check if auto-terminate fired a closed event
     const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
-    if (closedCalls.length > 0) {
-      expect(closedCalls[0][1]).toMatchObject({ invoiceId, explicit: false });
-      expect(closedInvoices.has(invoiceId)).toBe(true);
-    }
-    // Either the module auto-closed it (closedCalls > 0), or the :RC was treated as return_received.
-    // At minimum no deadlock occurred — the test completing proves that.
+    expect(closedCalls.length).toBeGreaterThan(0);
+    expect(closedCalls[0][1]).toMatchObject({ invoiceId, explicit: false });
+    expect(closedInvoices.has(invoiceId)).toBe(true);
 
     module.destroy();
   });
@@ -160,26 +151,21 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    const rxTransfer = makeIncomingTransferWithDirection(
-      invoiceId,
-      'RX',
-      '5000000',
-      'UCT',
-      'DIRECT://test_target_address_abc123',
-      'DIRECT://sender_address_def456',
-    );
+    // Simulate an :RX transfer — must appear as self-sent so senderAddress
+    // resolves to identity.directAddress (a target). Use identity.chainPubkey as senderPubkey.
+    const rxTransfer = makeIncomingTransferWithDirection(invoiceId, 'RX');
+    rxTransfer.senderPubkey = '02' + 'a'.repeat(64); // matches DEFAULT_TEST_IDENTITY.chainPubkey
 
     mocks.payments._emit('transfer:incoming', rxTransfer);
     await new Promise((r) => setTimeout(r, 50));
 
+    // The invoice should be marked as cancelled — assert unconditionally
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const cancelledInvoices = (module as any).cancelledInvoices as Set<string>;
     const cancelledCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:cancelled');
-    if (cancelledCalls.length > 0) {
-      expect(cancelledCalls[0][1]).toMatchObject({ invoiceId });
-      expect(cancelledInvoices.has(invoiceId)).toBe(true);
-    }
-    // No deadlock occurred
+    expect(cancelledCalls.length).toBeGreaterThan(0);
+    expect(cancelledCalls[0][1]).toMatchObject({ invoiceId });
+    expect(cancelledInvoices.has(invoiceId)).toBe(true);
 
     module.destroy();
   });
@@ -292,20 +278,14 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const closedInvoices = (module as any).closedInvoices as Set<string>;
 
-    // If the implementation correctly rejects unauthorized :RC, closed set stays empty
-    // (Some implementations may emit invoice:irrelevant with reason 'unauthorized_return')
+    // The unauthorized :RC from a non-target must NOT close the invoice.
+    // Assert unconditionally: invoice stays open, unauthorized event fired.
+    expect(closedInvoices.has(invoiceId)).toBe(false);
     const unauthorizedCalls = emitEvent.mock.calls.filter(
       ([evt, p]: [string, any]) =>
         evt === 'invoice:irrelevant' && p.reason === 'unauthorized_return',
     );
-    if (unauthorizedCalls.length > 0) {
-      // Correctly rejected
-      expect(closedInvoices.has(invoiceId)).toBe(false);
-    } else {
-      // If no unauthorized_return event, at minimum no deadlock
-      // The transfer is processed as return_received from a non-target
-    }
-    // At minimum: no deadlock and the test completes
+    expect(unauthorizedCalls.length).toBeGreaterThan(0);
 
     module.destroy();
   });

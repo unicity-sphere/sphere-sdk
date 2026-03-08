@@ -253,7 +253,8 @@ export function decodeTransferMessage(messageBytes: Uint8Array | null | undefine
     const validatedRa: string | undefined =
       typeof rawRa === 'string' &&
       rawRa.startsWith('DIRECT://') &&
-      rawRa.length > 'DIRECT://'.length
+      rawRa.length > 'DIRECT://'.length &&
+      rawRa.length <= 256
         ? rawRa
         : undefined;
 

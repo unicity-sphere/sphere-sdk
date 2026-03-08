@@ -18,7 +18,7 @@ import {
 } from './accounting-test-helpers.js';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
-import { STORAGE_KEYS_ADDRESS } from '../../../constants.js';
+import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants.js';
 
 // =============================================================================
 // Shared setup
@@ -154,10 +154,10 @@ describe('UT-LIFECYCLE-003: load() loads terminal state from storage', () => {
     const storage = createMockStorageProvider();
     setup({ storage });
 
-    const directAddress = mocks.identity.directAddress!;
-    const cancelledKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
-    const closedKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
-    const frozenKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
+    const addressId = getAddressId(mocks.identity.directAddress!);
+    const cancelledKey = `${addressId}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
+    const closedKey = `${addressId}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
+    const frozenKey = `${addressId}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
 
     const cancelledId = 'a'.repeat(64);
     const closedId = 'b'.repeat(64);
@@ -208,8 +208,8 @@ describe('UT-LIFECYCLE-004: load() recovers auto-return settings', () => {
     const storage = createMockStorageProvider();
     setup({ storage });
 
-    const directAddress = mocks.identity.directAddress!;
-    const autoReturnKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
+    const addressId = getAddressId(mocks.identity.directAddress!);
+    const autoReturnKey = `${addressId}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
     const invoiceId = 'c'.repeat(64);
 
     storage._data.set(

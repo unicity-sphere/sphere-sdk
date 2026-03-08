@@ -19,7 +19,7 @@ import {
 } from './accounting-test-helpers.js';
 import type { AccountingModule } from '../../../modules/accounting/AccountingModule.js';
 import type { TestAccountingModuleMocks } from './accounting-test-helpers.js';
-import { STORAGE_KEYS_ADDRESS } from '../../../constants.js';
+import { STORAGE_KEYS_ADDRESS, getAddressId } from '../../../constants.js';
 
 // Mock SDK Token to prevent cross-file mock contamination when run alongside
 // other test files (e.g., importInvoice, validation, errors) that mock this module.
@@ -61,8 +61,8 @@ describe('UT-STORAGE: cancelled/closed set persistence', () => {
 
   it('load() restores cancelled set from storage', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const cancelledKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
-    const frozenKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
+    const cancelledKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
+    const frozenKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
 
     const cancelledId = 'a'.repeat(64);
     mocks.storage._data.set(cancelledKey, JSON.stringify([cancelledId]));
@@ -86,8 +86,8 @@ describe('UT-STORAGE: cancelled/closed set persistence', () => {
 
   it('load() restores closed set from storage', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const closedKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
-    const frozenKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
+    const closedKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
+    const frozenKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
 
     const closedId = 'b'.repeat(64);
     mocks.storage._data.set(closedKey, JSON.stringify([closedId]));
@@ -120,8 +120,8 @@ describe('UT-STORAGE: frozen balances persistence', () => {
 
   it('load() restores frozen balances from storage', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const frozenKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
-    const closedKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
+    const frozenKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
+    const closedKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.CLOSED_INVOICES}`;
 
     const closedId = 'c'.repeat(64);
     const frozenData = {
@@ -155,7 +155,7 @@ describe('UT-STORAGE: auto-return settings persistence', () => {
 
   it('load() restores auto-return settings from storage', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const autoReturnKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
+    const autoReturnKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
     const invoiceId = 'd'.repeat(64);
 
     mocks.storage._data.set(autoReturnKey, JSON.stringify({
@@ -180,7 +180,7 @@ describe('UT-STORAGE: crash recovery — terminal sets loaded before frozen bala
 
   it('forward reconciliation: frozen balance without terminal entry gets auto-added', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const frozenKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
+    const frozenKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
     // Do NOT set cancelled/closed keys — simulate crash after frozen save but before terminal set save
 
     const invoiceId = 'e'.repeat(64);
@@ -256,7 +256,7 @@ describe('UT-STORAGE: corrupted storage data handled gracefully', () => {
 
   it('load() handles corrupted cancelled set JSON gracefully', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const cancelledKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
+    const cancelledKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES}`;
 
     mocks.storage._data.set(cancelledKey, 'NOT VALID JSON {{{');
 
@@ -269,7 +269,7 @@ describe('UT-STORAGE: corrupted storage data handled gracefully', () => {
 
   it('load() handles corrupted frozen balances JSON gracefully', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const frozenKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
+    const frozenKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.FROZEN_BALANCES}`;
 
     mocks.storage._data.set(frozenKey, '<<CORRUPT>>');
 
@@ -281,7 +281,7 @@ describe('UT-STORAGE: corrupted storage data handled gracefully', () => {
 
   it('load() handles corrupted auto-return settings gracefully', async () => {
     const directAddress = mocks.identity.directAddress!;
-    const autoReturnKey = `${directAddress}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
+    const autoReturnKey = `${getAddressId(directAddress)}_${STORAGE_KEYS_ADDRESS.AUTO_RETURN}`;
 
     mocks.storage._data.set(autoReturnKey, '!!!');
 

@@ -1045,7 +1045,11 @@ export class PaymentsModule {
       const transferMode = request.transferMode ?? 'instant';
 
       // Encode invoice memo into on-chain message bytes (null for non-invoice memos)
-      const onChainMessage = parseInvoiceMemoForOnChain(request.memo);
+      const onChainMessage = parseInvoiceMemoForOnChain(
+        request.memo,
+        request.invoiceRefundAddress,
+        request.invoiceContact,
+      );
 
       if (transferMode === 'conservative') {
         // =================================================================
@@ -1477,7 +1481,11 @@ export class PaymentsModule {
       const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
 
       // Encode invoice memo into on-chain message bytes (null for non-invoice memos)
-      const onChainMessage = parseInvoiceMemoForOnChain(request.memo);
+      const onChainMessage = parseInvoiceMemoForOnChain(
+        request.memo,
+        request.invoiceRefundAddress,
+        request.invoiceContact,
+      );
 
       // Create instant split executor
       const executor = new InstantSplitExecutor({
