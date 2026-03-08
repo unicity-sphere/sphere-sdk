@@ -745,9 +745,9 @@ class AccountingModule {
   /**
    * Compute the current status of an invoice from local data.
    *
-   * For non-terminal invoices: reads invoice terms from the token's genesis
-   * tokenData, then scans full transaction history for transfers with matching
-   * INV:<id> memo prefix. Computes balances fresh.
+   * For non-terminal invoices: reads from the persistent invoice-transfer index
+   * (built during load() and updated incrementally on each transfer event).
+   * Computes balances from the indexed transfer entries.
    *
    * For terminal invoices (CLOSED, CANCELLED): returns persisted frozen balances
    * without recomputation.
@@ -954,6 +954,7 @@ class AccountingModule {
    * @param invoiceId - Invoice token ID, or '*' for global setting
    * @param enabled - Whether auto-return is enabled
    * @throws SphereError with RATE_LIMITED if invoiceId is '*' and called within 5-second cooldown
+   * @throws SphereError with INVOICE_NOT_FOUND if invoiceId is not '*' and invoice does not exist
    */
   async setAutoReturn(invoiceId: string | '*', enabled: boolean): Promise<void>;
 
@@ -1073,7 +1074,7 @@ class AccountingModule {
   /**
    * Get all transfers related to a specific invoice.
    * Includes forward payments, back payments, return payments, and irrelevant transfers.
-   * Scans full transaction history of active and sent tokens.
+   * Reads from the persistent invoice-transfer index.
    *
    * Irrelevant transfers are returned as IrrelevantTransfer (extends InvoiceTransferRef
    * with a `reason` field). Callers can discriminate using `'reason' in transfer`.
@@ -2363,9 +2364,11 @@ async processTokenTransactions(token: Token, startIndex: number): Promise<Invoic
        // NOTE below). Downstream logic skips null-sender entries for
        // self-payment detection and return matching, but includes them in
        // aggregate coverage computation.
-       // ADDRESS DERIVATION: Uses PaymentsModule.createDirectAddressFromPubkey()
-       // which calls UnmaskedPredicateReference.create(tokenType, 'secp256k1',
-       // pubkeyBytes).toString(). This produces the same DIRECT:// format as
+       // ADDRESS DERIVATION: Same logic as PaymentsModule's private
+       // createDirectAddressFromPubkey() — calls
+       // UnmaskedPredicateReference.create(tokenType, 'secp256k1', pubkeyBytes).toString().
+       // AccountingModule inlines this derivation (3 lines) rather than depending on
+       // PaymentsModule internals. Produces the same DIRECT:// format as
        // genesis.data.recipient for the same public key. No normalization needed.
        // NOTE: This derivation is ASYNC (requires await). The caller
        // (processTokenTransactions) is async due to TransferTransactionData.fromJSON().
@@ -3234,7 +3237,7 @@ INV_LEDGER_INDEX: 'inv_ledger_index',
 TOKEN_SCAN_STATE: 'token_scan_state',
 ```
 
-Full key format: `sphere_{addressId}_cancelled_invoices`, etc. The `addressId` value (e.g., `DIRECT_abc123_xyz789`) is guaranteed colon-free and underscore-delimited, so no separator collision is possible.
+Full key format: `{addressId}_cancelled_invoices`, etc. (no `sphere_` prefix — address-scoped keys use `{addressId}_{keyName}` format per existing SDK convention, e.g., `DIRECT_abc123_xyz789_cancelled_invoices`). The `addressId` value is guaranteed colon-free and underscore-delimited, so no separator collision is possible.
 
 ### 7.3 Frozen Balance Schema
 
