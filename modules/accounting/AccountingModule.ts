@@ -330,6 +330,25 @@ export class AccountingModule {
         }
       }
 
+      // Also scan archived tokens (spec §5.4 Phase 2 step 5)
+      const archivedTokens = deps.payments.getArchivedTokens();
+      for (const [archivedId, txf] of archivedTokens) {
+        try {
+          const tokenType = txf.genesis?.data?.tokenType;
+          if (tokenType !== INVOICE_TOKEN_TYPE_HEX) continue;
+
+          const tokenData = txf.genesis?.data?.tokenData;
+          if (!tokenData) continue;
+
+          const terms = this._parseInvoiceTerms(tokenData);
+          if (terms) {
+            this.invoiceTermsCache.set(archivedId, terms);
+          }
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
+        }
+      }
+
       if (this.config.debug) {
         logger.debug(LOG_TAG, `Loaded ${this.invoiceTermsCache.size} invoice token(s)`);
       }
@@ -500,7 +519,7 @@ export class AccountingModule {
    * Cleanup subscriptions and clear all in-memory state.
    * After calling destroy(), all public methods will throw `MODULE_DESTROYED`.
    */
-  destroy(): void {
+  async destroy(): Promise<void> {
     // Set destroyed flag FIRST to prevent concurrent operations from seeing
     // partially cleared state during cleanup
     this.destroyed = true;
@@ -514,6 +533,13 @@ export class AccountingModule {
     // Unsubscribe from CommunicationsModule DM events
     try { this.unsubscribeDMs?.(); } catch { /* ignore */ }
     this.unsubscribeDMs = null;
+
+    // Await all in-flight gated operations before clearing state.
+    // Each gate value is the tail of a per-invoice promise chain;
+    // awaiting all tails ensures no operation is mid-flight when we clear.
+    if (this.invoiceGates.size > 0) {
+      await Promise.allSettled(Array.from(this.invoiceGates.values()));
+    }
 
     // Clear all in-memory state
     this._clearInMemoryState();
@@ -1068,6 +1094,15 @@ export class AccountingModule {
         anyScanDirty = true;
       }
 
+      // Also scan archived tokens (spec §5.4 Phase 2 step 5)
+      const archivedTokensForScan = deps.payments.getArchivedTokens();
+      for (const [archivedId, txf] of archivedTokensForScan) {
+        const txCount = txf.transactions?.length ?? 0;
+        if (txCount === 0) continue;
+        this._processTokenTransactions(archivedId, txf, 0);
+        anyScanDirty = true;
+      }
+
       if (anyScanDirty) {
         await this._flushDirtyLedgerEntries();
       }
@@ -1380,6 +1415,18 @@ export class AccountingModule {
         anyDirty = true;
       }
     }
+
+    // Also scan archived tokens (spec §5.4 Phase 2 step 5)
+    const archivedTokensForGap = deps.payments.getArchivedTokens();
+    for (const [archivedId, txf] of archivedTokensForGap) {
+      const transactions = txf.transactions ?? [];
+      const startIndex = this.tokenScanState.get(archivedId) ?? 0;
+      if (transactions.length > startIndex) {
+        this._processTokenTransactions(archivedId, txf, startIndex);
+        anyDirty = true;
+      }
+    }
+
     if (anyDirty) {
       await this._flushDirtyLedgerEntries();
     }
@@ -2252,7 +2299,33 @@ export class AccountingModule {
       });
 
       try {
-        return await Promise.race([sendPromise, timeoutPromise]);
+        const result = await Promise.race([sendPromise, timeoutPromise]);
+
+        // §5.9: Synchronously update the in-memory index inside the gate
+        // before releasing, so concurrent operations see the new balance.
+        if (result.id) {
+          const returnRef: InvoiceTransferRef = {
+            transferId: result.id,
+            direction: 'outbound',
+            paymentDirection: 'back',
+            coinId,
+            amount: params.amount,
+            destinationAddress: senderAddress,
+            timestamp: Date.now(),
+            confirmed: false,
+            senderAddress: myTargetAddress,
+          };
+          const entryKey = `${result.id}::${coinId}`;
+          const ledger = this.invoiceLedger.get(invoiceId);
+          if (ledger) {
+            ledger.set(entryKey, returnRef);
+            this.dirtyLedgerEntries.add(invoiceId);
+          }
+          // Invalidate balance cache for this invoice
+          this.balanceCache.delete(invoiceId);
+        }
+
+        return result;
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
@@ -3615,6 +3688,17 @@ export class AccountingModule {
       const startIndex = this.tokenScanState.get(token.id) ?? 0;
       if (transactions.length > startIndex) {
         this._processTokenTransactions(token.id, txf, startIndex);
+        anyDirty = true;
+      }
+    }
+
+    // Also scan archived tokens (spec §5.4 Phase 2 step 5)
+    const archivedTokens = deps.payments.getArchivedTokens();
+    for (const [archivedId, txf] of archivedTokens) {
+      const transactions = txf.transactions ?? [];
+      const startIndex = this.tokenScanState.get(archivedId) ?? 0;
+      if (transactions.length > startIndex) {
+        this._processTokenTransactions(archivedId, txf, startIndex);
         anyDirty = true;
       }
     }

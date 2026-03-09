@@ -3462,7 +3462,7 @@ export class Sphere {
     this._communications.destroy();
     this._groupChat?.destroy();
     this._market?.destroy();
-    this._accounting?.destroy();
+    await this._accounting?.destroy();
 
     await this._transport.disconnect();
     await this._storage.disconnect();

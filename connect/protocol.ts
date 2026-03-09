@@ -58,6 +58,7 @@ export const INTENT_ACTIONS = {
   IMPORT_INVOICE: 'import_invoice',
   SEND_INVOICE_RECEIPTS: 'send_invoice_receipts',
   SEND_CANCELLATION_NOTICES: 'send_cancellation_notices',
+  SET_AUTO_RETURN: 'set_auto_return',
 } as const;
 
 export type IntentAction = (typeof INTENT_ACTIONS)[keyof typeof INTENT_ACTIONS];
