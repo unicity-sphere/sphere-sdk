@@ -2303,7 +2303,7 @@ export class Sphere {
           oracle: this._oracle,
           trustBase,
           identity: this._identity!,
-          getActiveAddresses: () => this.getActiveAddresses(),
+          getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,
           on: this.on.bind(this),
           storage: this._storage,
@@ -2349,6 +2349,21 @@ export class Sphere {
   deriveAddress(index: number, isChange: boolean = false): AddressInfo {
     this.ensureReady();
     return this._deriveAddressInternal(index, isChange);
+  }
+
+  /**
+   * Internal getActiveAddresses without ensureReady() check.
+   * Used during initialization (AccountingModule.load()) when _initialized is still false.
+   */
+  private _getActiveAddressesInternal(): TrackedAddress[] {
+    const result: TrackedAddress[] = [];
+    for (const entry of this._trackedAddresses.values()) {
+      if (!entry.hidden) {
+        const nametag = this._addressNametags.get(entry.addressId)?.get(0);
+        result.push({ ...entry, nametag });
+      }
+    }
+    return result.sort((a, b) => a.index - b.index);
   }
 
   /**
@@ -3913,7 +3928,7 @@ export class Sphere {
           oracle: this._oracle,
           trustBase,
           identity: this._identity!,
-          getActiveAddresses: () => this.getActiveAddresses(),
+          getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,
           on: this.on.bind(this),
           storage: this._storage,
