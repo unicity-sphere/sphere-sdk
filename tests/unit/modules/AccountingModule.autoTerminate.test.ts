@@ -224,9 +224,9 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
   });
 
   // -------------------------------------------------------------------------
-  // UT-AUTOTERM-004: No deadlock on concurrent operation
+  // UT-AUTOTERM-004: No deadlock on concurrent gate operations
   // -------------------------------------------------------------------------
-  it('UT-AUTOTERM-004: no deadlock when :RC arrives while another gate operation runs', async () => {
+  it('UT-AUTOTERM-004: no deadlock when :RC and closeInvoice contend for the same gate', async () => {
     const { module, mocks } = createTestAccountingModule({
       config: { autoTerminateOnReturn: true },
     });
@@ -235,29 +235,30 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    // Use self-sender pubkey so the transfer actually acquires the invoice gate
-    // (non-self sender resolves to null → invoice:irrelevant before gate)
+    // Self-sender :RC acquires the invoice gate via withInvoiceGate (return path).
+    // closeInvoice() also acquires the same gate. Fire both concurrently to create
+    // real gate contention — if the gate implementation deadlocks, the timeout
+    // sentinel below will reject.
     const rcTransfer = makeIncomingTransferWithDirection(invoiceId, 'RC');
 
-    // Fire RC + status check concurrently — neither should deadlock
-    const results = await Promise.allSettled([
-      new Promise<void>((resolve) => {
-        mocks.payments._emit('transfer:incoming', rcTransfer);
-        resolve();
-      }),
-      module.getInvoiceStatus(invoiceId),
+    // Fire the :RC transfer (async handler acquires gate in the next microtask)
+    mocks.payments._emit('transfer:incoming', rcTransfer);
+
+    // Immediately race closeInvoice (also gate-acquiring) against a timeout
+    const DEADLOCK_TIMEOUT_MS = 5000;
+    const deadlockSentinel = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('DEADLOCK: gate not released within 5s')), DEADLOCK_TIMEOUT_MS);
+    });
+
+    // closeInvoice() will queue behind the RC handler's gate hold, then run.
+    // If the gate deadlocks, the sentinel fires first.
+    const result = await Promise.race([
+      module.closeInvoice(invoiceId).then(() => 'resolved' as const).catch(() => 'rejected' as const),
+      deadlockSentinel,
     ]);
 
-    // Give async pipeline time to complete
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Both should resolve or at most one rejects (never hang)
-    for (const result of results) {
-      if (result.status === 'rejected') {
-        // An error is acceptable; a hang/timeout is not
-        expect(result.reason).toBeInstanceOf(Error);
-      }
-    }
+    // If we reach here, no deadlock occurred
+    expect(['resolved', 'rejected']).toContain(result);
 
     module.destroy();
   });

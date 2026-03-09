@@ -14,6 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { InvoiceTransferIndex } from '../../../modules/accounting/invoice-transfer-index.js';
 import { createMockStorageProvider, createTestTransfer } from './accounting-test-helpers.js';
 import type { InvoiceTransferRef, InvoiceBalanceSnapshot } from '../../../modules/accounting/types.js';
+import { getAddressId } from '../../../constants.js';
 
 // =============================================================================
 // Mocks for @unicitylabs/state-transition-sdk dynamic imports
@@ -72,7 +73,7 @@ const INVOICE_ID = 'a'.repeat(64);
 const COIN_ID = 'UCT';
 const TARGET_ADDRESS = 'DIRECT://test_target_address_abc123';
 const SENDER_ADDRESS = 'DIRECT://sender_address_def456';
-const ADDRESS_ID = 'DIRECT_test_target_address_abc123';
+const ADDRESS_ID = getAddressId(TARGET_ADDRESS);
 
 /** Builds an InvoiceTransferRef with sensible defaults. */
 function makeRef(overrides?: Partial<InvoiceTransferRef>): InvoiceTransferRef {
