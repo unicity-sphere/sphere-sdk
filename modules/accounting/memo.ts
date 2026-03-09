@@ -127,8 +127,7 @@ export function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
  * The direction code is always explicit in generated memos. Free text is:
  * - Truncated to 256 Unicode code points (split on code points, not UTF-16
  *   code units, to preserve astral-plane characters such as emoji).
- * - Stripped of control characters U+0000–U+001F **except** `\n` (U+000A) and
- *   `\r` (U+000D).
+ * - Stripped of all U+0000–U+001F control characters (including `\n` and `\r`).
  *
  * Note: the spec's reference implementation replaces `\r\n` with spaces during
  * memo construction, but this function only strips control characters per the

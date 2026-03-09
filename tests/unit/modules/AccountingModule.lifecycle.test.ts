@@ -440,14 +440,17 @@ describe('UT-LIFECYCLE-008: non-exempt methods throw after destroy, parseInvoice
     module.destroy();
   });
 
-  it('getInvoice() throws MODULE_DESTROYED after destroy', () => {
-    // The implementation calls ensureNotDestroyed, so getInvoice throws after destroy.
-    expect(() => module.getInvoice('nonexistent')).toThrow();
+  it('getInvoice() remains callable after destroy (spec §10 exemption)', () => {
+    // getInvoice() is synchronous, read-only, in-memory — exempt from MODULE_DESTROYED per spec §10.
+    const result = module.getInvoice('nonexistent');
+    expect(result).toBeNull();
   });
 
-  it('getAutoReturnSettings() throws MODULE_DESTROYED after destroy', () => {
-    // The implementation calls ensureNotDestroyed, so getAutoReturnSettings throws after destroy.
-    expect(() => module.getAutoReturnSettings()).toThrow();
+  it('getAutoReturnSettings() remains callable after destroy (spec §10 exemption)', () => {
+    // getAutoReturnSettings() is synchronous, read-only, in-memory — exempt from MODULE_DESTROYED per spec §10.
+    const settings = module.getAutoReturnSettings();
+    expect(settings).toBeDefined();
+    expect(settings.global).toBe(false);
   });
 
   it('parseInvoiceMemo() is a pure utility method and never checks destroyed state', () => {

@@ -405,8 +405,32 @@ export class AccountingModule {
     }
 
     // ------------------------------------------------------------------
-    // Step 4c: Storage reconciliation (inverse)
-    // Terminal set entry exists but no frozen balances → log warning.
+    // Step 6: Load auto-return settings
+    // ------------------------------------------------------------------
+    const autoReturn = await this.loadJsonFromStorage<AutoReturnStorage>(
+      STORAGE_KEYS_ADDRESS.AUTO_RETURN,
+      { global: false, perInvoice: {} },
+    );
+    this.autoReturnGlobal = autoReturn.global;
+    this.autoReturnPerInvoice.clear();
+    for (const [id, enabled] of Object.entries(autoReturn.perInvoice)) {
+      this.autoReturnPerInvoice.set(id, enabled);
+    }
+
+    // ------------------------------------------------------------------
+    // Step 7: Load auto-return dedup ledger — prune and crash recovery
+    // (Full implementation deferred; we load the ledger here for completeness.)
+    // ------------------------------------------------------------------
+    await this._loadAndRecoverAutoReturnLedger();
+
+    // ------------------------------------------------------------------
+    // Step 8: Populate invoice-transfer index (§5.4.4)
+    // ------------------------------------------------------------------
+    await this._loadInvoiceTransferIndex();
+
+    // ------------------------------------------------------------------
+    // Step 4c: Storage reconciliation (inverse) — deferred until after ledger loaded
+    // Terminal set entry exists but no frozen balances → reconstruct from ledger.
     // (Full recomputation from history is deferred to later tasks.)
     // ------------------------------------------------------------------
     // Build wallet address set for computeInvoiceStatus
@@ -452,30 +476,6 @@ export class AccountingModule {
         logger.warn(LOG_TAG, `Failed to persist reconstructed frozen balances:`, err);
       });
     }
-
-    // ------------------------------------------------------------------
-    // Step 6: Load auto-return settings
-    // ------------------------------------------------------------------
-    const autoReturn = await this.loadJsonFromStorage<AutoReturnStorage>(
-      STORAGE_KEYS_ADDRESS.AUTO_RETURN,
-      { global: false, perInvoice: {} },
-    );
-    this.autoReturnGlobal = autoReturn.global;
-    this.autoReturnPerInvoice.clear();
-    for (const [id, enabled] of Object.entries(autoReturn.perInvoice)) {
-      this.autoReturnPerInvoice.set(id, enabled);
-    }
-
-    // ------------------------------------------------------------------
-    // Step 7: Load auto-return dedup ledger — prune and crash recovery
-    // (Full implementation deferred; we load the ledger here for completeness.)
-    // ------------------------------------------------------------------
-    await this._loadAndRecoverAutoReturnLedger();
-
-    // ------------------------------------------------------------------
-    // Step 8: Populate invoice-transfer index (§5.4.4)
-    // ------------------------------------------------------------------
-    await this._loadInvoiceTransferIndex();
 
     // ------------------------------------------------------------------
     // Step 9: Subscribe to PaymentsModule events (MUST come after index build)
@@ -603,16 +603,23 @@ export class AccountingModule {
       resolve = r;
     });
     this.invoiceGates.set(invoiceId, next);
-    try {
-      await current;
-      // Bail out if module was destroyed while waiting for the gate
+    let result!: T;
+    const run = async () => {
       if (this.destroyed) {
         throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
       }
-      return await fn();
+      result = await fn();
+    };
+    try {
+      // Use .then(run, run) so fn executes even if prior gate op rejected
+      await current.then(run, run);
+      return result;
     } finally {
       resolve();
-      // Clean up gate if it's still the last one (prevent memory leak)
+      // Clean up gate if it's still the last one (prevent memory leak).
+      // Multi-waiter invariant: if A, B, C are queued, C's promise is the tail.
+      // When A completes, A sees get(id) === C_next (set by C), so A skips deletion.
+      // B also skips. Only C (the tail) deletes. This is correct.
       if (this.invoiceGates.get(invoiceId) === next) {
         this.invoiceGates.delete(invoiceId);
       }
@@ -987,7 +994,12 @@ export class AccountingModule {
             await new Promise((r) => setTimeout(r, 1000 * attempt));
           }
         } catch (retryErr) {
-          if (retryErr instanceof SphereError) throw retryErr;
+          if (retryErr instanceof SphereError && (
+            retryErr.code === 'INVOICE_ORACLE_REQUIRED' ||
+            retryErr.code === 'INVOICE_INVALID_PROOF' ||
+            retryErr.code === 'NOT_INITIALIZED' ||
+            retryErr.code === 'MODULE_DESTROYED'
+          )) throw retryErr;
           logger.warn(LOG_TAG, `Invoice commitment attempt ${attempt} error:`, retryErr);
           if (attempt === MAX_RETRIES) {
             throw new SphereError(
@@ -1538,8 +1550,30 @@ export class AccountingModule {
         );
 
         if (reStatus.state === 'COVERED' && reStatus.allConfirmed) {
+          // Determine latest sender per target:coinId (same logic as closeInvoice)
+          const latestSenderMap = new Map<string, Map<string, string>>();
+          const targetAddressSet = new Set(terms.targets.map((t) => t.address));
+
+          for (const entry of reEntries) {
+            if (
+              entry.paymentDirection === 'forward' &&
+              targetAddressSet.has(entry.destinationAddress)
+            ) {
+              const effectiveSender = entry.refundAddress ?? entry.senderAddress;
+              if (effectiveSender === null || effectiveSender === undefined) continue;
+
+              let coinMap = latestSenderMap.get(entry.destinationAddress);
+              if (!coinMap) {
+                coinMap = new Map();
+                latestSenderMap.set(entry.destinationAddress, coinMap);
+              }
+              // Overwrite — last entry in iteration order wins (processing order)
+              coinMap.set(entry.coinId, effectiveSender);
+            }
+          }
+
           // Perform implicit close
-          const frozen = freezeBalances(terms, reStatus, 'CLOSED', false);
+          const frozen = freezeBalances(terms, reStatus, 'CLOSED', false, latestSenderMap);
           this.frozenBalances.set(invoiceId, frozen);
           this.closedInvoices.add(invoiceId);
 
@@ -1693,11 +1727,9 @@ export class AccountingModule {
    * @returns InvoiceRef or null if not found.
    *
    * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
-   * @throws {SphereError} `MODULE_DESTROYED` — module has been destroyed.
    */
   getInvoice(invoiceId: string): InvoiceRef | null {
     this.ensureInitialized();
-    this.ensureNotDestroyed();
 
     const terms = this.invoiceTermsCache.get(invoiceId);
     if (!terms) return null;
@@ -2454,11 +2486,9 @@ export class AccountingModule {
    * @returns AutoReturnSettings with global flag and per-invoice overrides.
    *
    * @throws {SphereError} `NOT_INITIALIZED` — module not initialized.
-   * @throws {SphereError} `MODULE_DESTROYED` — module has been destroyed.
    */
   getAutoReturnSettings(): AutoReturnSettings {
     this.ensureInitialized();
-    this.ensureNotDestroyed();
 
     const perInvoice: Record<string, boolean> = {};
     for (const [id, enabled] of this.autoReturnPerInvoice.entries()) {
@@ -3467,11 +3497,7 @@ export class AccountingModule {
 
       // Secondary dedup: check if return already landed in history (§7.5)
       // Use exact memo match to prevent crafted-memo false positives
-      const expectedMemo = buildInvoiceMemo(
-        invoiceId,
-        transferId.startsWith('FROZEN:') ? 'RC' : 'B',
-        transferId,
-      );
+      const expectedMemo = entry.memo;
       const alreadyReturned = history.find(
         (h) =>
           h.type === 'SENT' &&
@@ -3620,7 +3646,9 @@ export class AccountingModule {
         for (const [entryKey, ref] of Object.entries(entries)) {
           innerMap.set(entryKey, ref);
           // Rebuild tokenInvoiceMap
-          this._addToTokenInvoiceMap(ref.transferId, invoiceId);
+          // transferId format: "{tokenId}:{txIndex}" — extract tokenId for reverse index
+          const tokenIdFromRef = ref.transferId.includes(':') ? ref.transferId.slice(0, ref.transferId.indexOf(':')) : ref.transferId;
+          this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
         }
       } catch (err) {
         logger.warn(LOG_TAG, `inv_ledger:${invoiceId} corrupt — resetting entry:`, err);
@@ -4404,7 +4432,7 @@ export class AccountingModule {
 
         if (!senderIsTarget) {
           // Reclassify: fire as irrelevant with reason 'unauthorized_return'
-          // (The index mutation is best-effort since _processTokenTransactions is a stub.)
+          // (The index mutation is best-effort — errors are logged but do not fail the transfer.)
           deps.emitEvent('invoice:irrelevant', {
             invoiceId,
             transfer: { ...syntheticRef, paymentDirection: 'forward' as const },
