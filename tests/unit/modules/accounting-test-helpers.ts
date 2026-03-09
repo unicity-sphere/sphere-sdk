@@ -759,7 +759,7 @@ export const DEFAULT_TEST_IDENTITY: FullIdentity = {
 /** Default TrackedAddress derived from DEFAULT_TEST_IDENTITY. */
 export const DEFAULT_TEST_TRACKED_ADDRESS: TrackedAddress = {
   index: 0,
-  addressId: 'DIRECT_test_target_address_abc123',
+  addressId: 'DIRECT_test_t_abc123', // getAddressId('DIRECT://test_target_address_abc123')
   l1Address: 'alpha1testaddr',
   directAddress: 'DIRECT://test_target_address_abc123',
   chainPubkey: '02' + 'a'.repeat(64),

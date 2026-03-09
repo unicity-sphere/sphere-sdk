@@ -2493,7 +2493,7 @@ async function main() {
           const assets: import('../modules/accounting/types').InvoiceRequestedAsset[] = [];
           if (coinId && amount) {
             if (!/^[1-9][0-9]*$/.test(amount)) {
-              console.error(`Invalid amount "${amount}" — must be a non-negative integer in smallest units (no decimals)`);
+              console.error(`Invalid amount "${amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
               process.exit(1);
             }
             assets.push({ coin: [coinId, amount] });
@@ -2747,7 +2747,7 @@ async function main() {
         if (amountIdx2 !== -1 && args[amountIdx2 + 1]) {
           const rawAmount = args[amountIdx2 + 1];
           if (!/^[1-9][0-9]*$/.test(rawAmount)) {
-            console.error(`Invalid amount "${rawAmount}" — must be a non-negative integer in smallest units (no decimals)`);
+            console.error(`Invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
             process.exit(1);
           }
           payParams.amount = rawAmount;
@@ -2805,7 +2805,7 @@ async function main() {
 
         const returnAmount = args[amountIdx3 + 1];
         if (!/^[1-9][0-9]*$/.test(returnAmount)) {
-          console.error('--amount must be a non-negative integer string (smallest unit, e.g. 1000000)');
+          console.error('--amount must be a positive integer string (smallest unit, no leading zeros, e.g. 1000000)');
           process.exit(1);
         }
 

@@ -23,6 +23,7 @@ import type {
   InvoiceTransferRef,
   FrozenInvoiceBalances,
 } from '../../../modules/accounting/types.js';
+import { getAddressId } from '../../../constants.js';
 
 // ---------------------------------------------------------------------------
 // Private-field helpers
@@ -210,11 +211,7 @@ function getEmitEvent(module: AccountingModule): ReturnType<typeof vi.fn> {
 
 /** Compute storage key as the module does internally (uses condensed addressId). */
 function storageKey(storageKeyName: string): string {
-  const directAddress = DEFAULT_TEST_IDENTITY.directAddress!;
-  // Mirrors getAddressId() from constants.ts: DIRECT_first6_last6
-  const hash = directAddress.startsWith('DIRECT://') ? directAddress.slice(9) : directAddress;
-  const addressId = `DIRECT_${hash.slice(0, 6).toLowerCase()}_${hash.slice(-6).toLowerCase()}`;
-  return `${addressId}_${storageKeyName}`;
+  return `${getAddressId(DEFAULT_TEST_IDENTITY.directAddress!)}_${storageKeyName}`;
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,13 @@
  * Tests for the autoTerminateOnReturn config option.
  * Corresponds to §3.18 of ACCOUNTING-TEST-SPEC.md.
  *
+ * Production scenario: autoTerminate fires when the wallet (acting as a target)
+ * observes its OWN outgoing :RC/:RX return transfer. The Nostr transport echoes
+ * self-sent transfers as `transfer:incoming` events, so `senderPubkey` equals
+ * `identity.chainPubkey` (isSelfSender = true), resolving `senderAddress` to
+ * `identity.directAddress` — which IS a target address on the target's local
+ * invoice copy. This is the designed autoTerminate trigger path.
+ *
  * Test IDs: UT-AUTOTERM-001 through UT-AUTOTERM-005
  */
 
@@ -11,6 +18,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   createTestAccountingModule,
   createTestTransfer,
+  DEFAULT_TEST_IDENTITY,
 } from './accounting-test-helpers.js';
 import type { InvoiceTerms } from '../../../modules/accounting/types.js';
 import type { IncomingTransfer } from '../../../types/index.js';
@@ -58,7 +66,9 @@ function injectInvoice(
 
 /**
  * Builds a minimal IncomingTransfer carrying an invoice memo with the given direction.
- * The sender address comes from a target address (for :RC/:RX, the target sends back).
+ *
+ * By default uses identity.chainPubkey as senderPubkey (self-sender), which is
+ * the production scenario for autoTerminate — the wallet observes its own return.
  */
 function makeIncomingTransferWithDirection(
   invoiceId: string,
@@ -78,7 +88,7 @@ function makeIncomingTransferWithDirection(
   );
   return {
     id: 'transfer-' + Math.random().toString(36).slice(2),
-    senderPubkey: '02' + 'b'.repeat(64),
+    senderPubkey: DEFAULT_TEST_IDENTITY.chainPubkey, // self-sender: identity observes own return
     memo: `INV:${invoiceId}:${direction}`,
     tokens: [
       {
@@ -116,17 +126,17 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    // Simulate an :RC transfer arriving — must appear as self-sent so senderAddress
-    // resolves to identity.directAddress (a target). Use identity.chainPubkey as senderPubkey.
+    // Simulate target wallet observing its own :RC return (self-sender echo).
+    // senderPubkey = identity.chainPubkey → isSelfSender = true →
+    // senderAddress = identity.directAddress (a target) → autoTerminate fires.
     const rcTransfer = makeIncomingTransferWithDirection(invoiceId, 'RC');
-    rcTransfer.senderPubkey = '02' + 'a'.repeat(64); // matches DEFAULT_TEST_IDENTITY.chainPubkey
 
     mocks.payments._emit('transfer:incoming', rcTransfer);
 
     // Give the async pipeline time to settle
     await new Promise((r) => setTimeout(r, 50));
 
-    // The invoice should be marked as closed — assert unconditionally
+    // The invoice should be marked as closed
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const closedInvoices = (module as any).closedInvoices as Set<string>;
     const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
@@ -151,15 +161,13 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    // Simulate an :RX transfer — must appear as self-sent so senderAddress
-    // resolves to identity.directAddress (a target). Use identity.chainPubkey as senderPubkey.
+    // Simulate target wallet observing its own :RX return (self-sender echo).
     const rxTransfer = makeIncomingTransferWithDirection(invoiceId, 'RX');
-    rxTransfer.senderPubkey = '02' + 'a'.repeat(64); // matches DEFAULT_TEST_IDENTITY.chainPubkey
 
     mocks.payments._emit('transfer:incoming', rxTransfer);
     await new Promise((r) => setTimeout(r, 50));
 
-    // The invoice should be marked as cancelled — assert unconditionally
+    // The invoice should be marked as cancelled
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const cancelledInvoices = (module as any).cancelledInvoices as Set<string>;
     const cancelledCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:cancelled');
@@ -185,12 +193,17 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    // Receive :RC and :RX
-    mocks.payments._emit('transfer:incoming', makeIncomingTransferWithDirection(invoiceId, 'RC'));
-    mocks.payments._emit('transfer:incoming', makeIncomingTransferWithDirection(invoiceId, 'RX'));
+    // Use self-sender pubkey so senderAddress resolves to a target address.
+    // This ensures the config flag (not sender resolution failure) is what
+    // prevents termination.
+    const rcTransfer = makeIncomingTransferWithDirection(invoiceId, 'RC');
+    const rxTransfer = makeIncomingTransferWithDirection(invoiceId, 'RX');
+
+    mocks.payments._emit('transfer:incoming', rcTransfer);
+    mocks.payments._emit('transfer:incoming', rxTransfer);
     await new Promise((r) => setTimeout(r, 50));
 
-    // Invoice should remain non-terminated
+    // Invoice should remain non-terminated despite valid sender — config is false
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const closedInvoices = (module as any).closedInvoices as Set<string>;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -199,6 +212,9 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     expect(closedInvoices.has(invoiceId)).toBe(false);
     expect(cancelledInvoices.has(invoiceId)).toBe(false);
 
+    // invoice:return_received SHOULD fire (sender is valid), but no close/cancel
+    const returnCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:return_received');
+    expect(returnCalls.length).toBeGreaterThan(0);
     const closedCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:closed');
     const cancelledCalls = emitEvent.mock.calls.filter(([evt]: [string]) => evt === 'invoice:cancelled');
     expect(closedCalls.length).toBe(0);
@@ -219,7 +235,8 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const terms = makeTerms();
     const invoiceId = await injectInvoice(module, terms);
 
-    // Start a concurrent getInvoiceStatus (which acquires no gate) alongside the RC transfer
+    // Use self-sender pubkey so the transfer actually acquires the invoice gate
+    // (non-self sender resolves to null → invoice:irrelevant before gate)
     const rcTransfer = makeIncomingTransferWithDirection(invoiceId, 'RC');
 
     // Fire RC + status check concurrently — neither should deadlock
@@ -256,30 +273,23 @@ describe('AccountingModule — autoTerminateOnReturn', () => {
     const emitEvent = (module as any).deps?.emitEvent as ReturnType<typeof vi.fn>;
     await module.load();
 
-    const terms = makeTerms();
+    // Create invoice with a DIFFERENT target that does NOT match identity.directAddress.
+    // This way, when the self-sender resolves senderAddress = identity.directAddress,
+    // it won't be in the target set → senderIsTarget = false → unauthorized_return.
+    const terms = makeTerms('DIRECT://completely_different_target_addr');
     const invoiceId = await injectInvoice(module, terms);
 
-    // :RC arriving from a non-target address C (not in invoice targets)
-    // The direction is RC but the sender is NOT a target
-    const spoofedRcTransfer = makeIncomingTransferWithDirection(
-      invoiceId,
-      'RC',
-      '5000000',
-      'UCT',
-      'DIRECT://non_target_sender_address',  // NOT a target
-      'DIRECT://test_target_address_abc123',
-    );
+    // Self-sender :RC — senderAddress resolves to identity.directAddress which is
+    // NOT 'DIRECT://completely_different_target_addr', so senderIsTarget = false.
+    const spoofedRcTransfer = makeIncomingTransferWithDirection(invoiceId, 'RC');
 
     mocks.payments._emit('transfer:incoming', spoofedRcTransfer);
     await new Promise((r) => setTimeout(r, 50));
 
-    // The module should process the transfer but the :RC from a non-target is
-    // treated as irrelevant/unauthorized; invoice should NOT be closed.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const closedInvoices = (module as any).closedInvoices as Set<string>;
 
-    // The unauthorized :RC from a non-target must NOT close the invoice.
-    // Assert unconditionally: invoice stays open, unauthorized event fired.
+    // The sender (identity.directAddress) is NOT a target, so unauthorized_return fires
     expect(closedInvoices.has(invoiceId)).toBe(false);
     const unauthorizedCalls = emitEvent.mock.calls.filter(
       ([evt, p]: [string, any]) =>

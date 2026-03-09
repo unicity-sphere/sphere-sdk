@@ -3709,7 +3709,13 @@ export class AccountingModule {
 
       // Extract coin data from genesis — skip tokens without valid coinData
       const coinData = txf.genesis?.data?.coinData as [string, string][] | undefined;
-      if (!coinData || coinData.length === 0) continue; // no phantom UNKNOWN entries
+      if (!coinData || coinData.length === 0) {
+        // Invoice tokens intentionally have null coinData; non-invoice tokens should not.
+        if (txf.genesis?.data?.tokenType !== INVOICE_TOKEN_TYPE_HEX) {
+          logger.warn(LOG_TAG, `Token ${tokenId} tx[${i}] has no coinData — skipping`);
+        }
+        continue;
+      }
       const entries = coinData.slice(0, this.config.maxCoinDataEntries);
 
       // Use positional transferId (avoids expensive async hash computation)

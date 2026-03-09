@@ -248,7 +248,9 @@ export function decodeTransferMessage(messageBytes: Uint8Array | null | undefine
       return null; // unknown direction code
     }
 
-    // Lenient parsing for `ra` (refund address): include only if valid
+    // Lenient parsing for `ra` (refund address): include only if valid.
+    // Max known DIRECT address is ~75 chars; 256 is a generous upper bound to
+    // reject arbitrarily long strings from untrusted on-chain data.
     const rawRa = invObj['ra'];
     const validatedRa: string | undefined =
       typeof rawRa === 'string' &&

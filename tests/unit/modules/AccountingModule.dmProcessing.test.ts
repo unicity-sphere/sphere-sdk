@@ -295,7 +295,9 @@ describe('AccountingModule — Payer-Side DM Processing', () => {
     expect(receiptCalls.length).toBeGreaterThan(0);
     const receipt = receiptCalls[0][1];
     // senderNametag should fall back to targetNametag from payload
-    expect(receipt.receipt.senderNametag ?? receipt.receipt.receipt?.senderNametag).toBe('alice');
+    // Event shape: { invoiceId, receipt: IncomingInvoiceReceipt }
+    // IncomingInvoiceReceipt.senderNametag = dm.senderNametag ?? receipt.targetNametag
+    expect(receipt.receipt.senderNametag).toBe('alice');
   });
 
   // -------------------------------------------------------------------------

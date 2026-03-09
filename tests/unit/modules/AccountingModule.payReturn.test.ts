@@ -34,11 +34,11 @@ const SENDER_ADDRESS = 'DIRECT://sender_address_def456';
 const TARGET_ADDRESS = 'DIRECT://test_target_address_abc123';
 
 /**
- * The AccountingModule derives its storage key prefix from identity.directAddress:
- *   getAddressStorageKey(identity.directAddress, subKey) = `${identity.directAddress}_${subKey}`
+ * The AccountingModule derives its storage key prefix via getAddressId():
+ *   getAddressStorageKey(getAddressId(identity.directAddress), subKey)
+ *     = `DIRECT_test_t_abc123_${subKey}`
  *
  * DEFAULT_TEST_IDENTITY.directAddress = 'DIRECT://test_target_address_abc123'
- * Uses condensed addressId format (DIRECT_first6_last6) for storage keys.
  */
 const STORAGE_PREFIX = getAddressId(DEFAULT_TEST_IDENTITY.directAddress!);
 
@@ -372,7 +372,7 @@ describe('AccountingModule.returnInvoicePayment()', () => {
     // forward payment entry from SENDER_ADDRESS → TARGET_ADDRESS when load() runs.
     //
     // AccountingModule._loadInvoiceTransferIndex() reads:
-    //   key: getAddressStorageKey(identity.directAddress, 'inv_ledger:{invoiceId}')
+    //   key: getAddressStorageKey(getAddressId(identity.directAddress), 'inv_ledger:{invoiceId}')
     //      = `${STORAGE_PREFIX}_inv_ledger:${INVOICE_ID}`
     //   format: Record<string, InvoiceTransferRef>  (keyed by composite entryKey)
     const entryKey = `mock-transfer-001::UCT`;
