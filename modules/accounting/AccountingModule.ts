@@ -437,6 +437,7 @@ export class AccountingModule {
     const activeAddresses = deps.getActiveAddresses();
     const walletAddresses = new Set(activeAddresses.map((a) => a.directAddress));
 
+    let anyReconstructed = false;
     const reconstructFrozen = (invoiceId: string, terminalState: 'CLOSED' | 'CANCELLED', resetReturns: boolean) => {
       const terms = this.invoiceTermsCache.get(invoiceId);
       if (terms) {
@@ -449,6 +450,7 @@ export class AccountingModule {
         const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
         const frozen = freezeBalances(terms, status, terminalState, resetReturns);
         this.frozenBalances.set(invoiceId, frozen);
+        anyReconstructed = true;
       } else {
         logger.warn(
           LOG_TAG,
@@ -467,8 +469,8 @@ export class AccountingModule {
         reconstructFrozen(invoiceId, 'CLOSED', true);
       }
     }
-    // Persist any reconstructed frozen balances
-    if (this.frozenBalances.size > 0) {
+    // Persist only if we actually reconstructed any frozen balances (W4 fix)
+    if (anyReconstructed) {
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
@@ -597,6 +599,11 @@ export class AccountingModule {
    * @returns The result of `fn`.
    */
   private async withInvoiceGate<T>(invoiceId: string, fn: () => Promise<T>): Promise<T> {
+    // Early check before registering the gate — prevents registering new gates
+    // after destroy() has already snapshot the gate map for draining.
+    if (this.destroyed) {
+      throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
+    }
     const current = this.invoiceGates.get(invoiceId) ?? Promise.resolve();
     let resolve!: () => void;
     const next = new Promise<void>((r) => {
@@ -997,6 +1004,7 @@ export class AccountingModule {
           if (retryErr instanceof SphereError && (
             retryErr.code === 'INVOICE_ORACLE_REQUIRED' ||
             retryErr.code === 'INVOICE_INVALID_PROOF' ||
+            retryErr.code === 'INVOICE_MINT_FAILED' ||
             retryErr.code === 'NOT_INITIALIZED' ||
             retryErr.code === 'MODULE_DESTROYED'
           )) throw retryErr;
@@ -2335,9 +2343,11 @@ export class AccountingModule {
 
         // §5.9: Synchronously update the in-memory index inside the gate
         // before releasing, so concurrent operations see the new balance.
+        // Use a provisional prefix so _processTokenTransactions can supersede
+        // this entry when the on-chain tokenId:txIndex entry arrives (C1 fix).
         if (result.id) {
           const returnRef: InvoiceTransferRef = {
-            transferId: result.id,
+            transferId: `provisional:${result.id}`,
             direction: 'outbound',
             paymentDirection: 'back',
             coinId,
@@ -2347,7 +2357,7 @@ export class AccountingModule {
             confirmed: false,
             senderAddress: myTargetAddress,
           };
-          const entryKey = `${result.id}::${coinId}`;
+          const entryKey = `provisional:${result.id}::${coinId}`;
           const ledger = this.invoiceLedger.get(invoiceId);
           if (ledger) {
             ledger.set(entryKey, returnRef);
@@ -3496,14 +3506,17 @@ export class AccountingModule {
       const transferId = key.slice(colonIdx + 1);
 
       // Secondary dedup: check if return already landed in history (§7.5)
-      // Use exact memo match to prevent crafted-memo false positives
+      // Use exact memo match to prevent crafted-memo false positives.
+      // Guard: entry.memo may be undefined in old storage data (W5 fix).
       const expectedMemo = entry.memo;
-      const alreadyReturned = history.find(
-        (h) =>
-          h.type === 'SENT' &&
-          h.memo !== undefined &&
-          h.memo === expectedMemo,
-      );
+      const alreadyReturned = expectedMemo
+        ? history.find(
+            (h) =>
+              h.type === 'SENT' &&
+              h.memo !== undefined &&
+              h.memo === expectedMemo,
+          )
+        : undefined;
 
       if (alreadyReturned) {
         // Return already landed — mark completed with the found transfer ID
@@ -3541,7 +3554,14 @@ export class AccountingModule {
         );
       }
 
-      // Retry the send using persisted recipient/amount/coinId/memo
+      // Retry the send using persisted recipient/amount/coinId/memo.
+      // Guard: if required fields are missing (old storage format), skip this entry.
+      if (!entry.recipient || !entry.amount || !entry.coinId || !entry.memo) {
+        await this.autoReturnManager.markFailed(invoiceId, transferId);
+        logger.warn(LOG_TAG, `Crash recovery: ${key} missing required fields — marked failed`);
+        continue;
+      }
+
       try {
         const result = await deps.payments.send({
           recipient: entry.recipient,
@@ -3645,10 +3665,12 @@ export class AccountingModule {
         const innerMap = this.invoiceLedger.get(invoiceId)!;
         for (const [entryKey, ref] of Object.entries(entries)) {
           innerMap.set(entryKey, ref);
-          // Rebuild tokenInvoiceMap
-          // transferId format: "{tokenId}:{txIndex}" — extract tokenId for reverse index
-          const tokenIdFromRef = ref.transferId.includes(':') ? ref.transferId.slice(0, ref.transferId.indexOf(':')) : ref.transferId;
-          this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
+          // Rebuild tokenInvoiceMap — only for positional entries (tokenId:txIndex format).
+          // Provisional entries (provisional:uuid) don't map to real tokens.
+          if (!ref.transferId.startsWith('provisional:') && ref.transferId.includes(':')) {
+            const tokenIdFromRef = ref.transferId.slice(0, ref.transferId.indexOf(':'));
+            this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
+          }
         }
       } catch (err) {
         logger.warn(LOG_TAG, `inv_ledger:${invoiceId} corrupt — resetting entry:`, err);
@@ -3861,6 +3883,22 @@ export class AccountingModule {
           senderAddress,
           ...(payload.inv.ra !== undefined ? { refundAddress: payload.inv.ra } : {}),
         };
+
+        // C1 fix: Remove any provisional entry that this on-chain entry supersedes.
+        // Provisional entries (from returnInvoicePayment sync update) have keys
+        // like "provisional:{uuid}::{coinId}". When the real tokenId:txIndex entry
+        // arrives, we remove the provisional to prevent double-counting.
+        for (const [existingKey, existingRef] of ledger) {
+          if (
+            existingKey.startsWith('provisional:') &&
+            existingRef.coinId === coinId &&
+            existingRef.paymentDirection === paymentDirection &&
+            existingRef.amount === amount
+          ) {
+            ledger.delete(existingKey);
+            break; // at most one provisional per coin+direction+amount
+          }
+        }
 
         ledger.set(dedupKey, ref);
         this.dirtyLedgerEntries.add(invoiceId);
