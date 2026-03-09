@@ -24,6 +24,7 @@ import type { TxfToken, TxfInclusionProof } from '../../../types/txf.js';
 import type { StorageProvider } from '../../../storage/storage-provider.js';
 import type { TokenStorageProvider, LoadResult, SaveResult, SyncResult } from '../../../storage/storage-provider.js';
 import { SphereError } from '../../../core/errors.js';
+import { getAddressId } from '../../../constants.js';
 
 // Re-export for convenience in test files
 export { SphereError, INVOICE_TOKEN_TYPE_HEX };
@@ -759,7 +760,7 @@ export const DEFAULT_TEST_IDENTITY: FullIdentity = {
 /** Default TrackedAddress derived from DEFAULT_TEST_IDENTITY. */
 export const DEFAULT_TEST_TRACKED_ADDRESS: TrackedAddress = {
   index: 0,
-  addressId: 'DIRECT_test_t_abc123', // getAddressId('DIRECT://test_target_address_abc123')
+  addressId: getAddressId('DIRECT://test_target_address_abc123'),
   l1Address: 'alpha1testaddr',
   directAddress: 'DIRECT://test_target_address_abc123',
   chainPubkey: '02' + 'a'.repeat(64),
