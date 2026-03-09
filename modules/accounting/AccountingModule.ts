@@ -582,17 +582,19 @@ export class AccountingModule {
     try { this.unsubscribeDMs?.(); } catch { /* ignore */ }
     this.unsubscribeDMs = null;
 
-    // W1-R18 fix: Await any pending flush before draining gates, so the flush
-    // doesn't race with storage teardown after destroy() returns.
-    if (this._flushPromise) {
+    // C3-R20 fix: Loop until _flushPromise is fully drained. A concurrent
+    // _handleTokenChange can replace the reference between our await and the null
+    // assignment, causing the replacement chain to escape the drain.
+    while (this._flushPromise) {
       await this._flushPromise.catch(() => { /* swallow — flush errors are non-fatal on destroy */ });
-      this._flushPromise = null;
     }
 
-    // Await all in-flight gated operations before declaring destruction complete.
-    // Each gate value is the tail of a per-invoice promise chain;
-    // awaiting all tails ensures no operation is mid-flight.
-    if (this.invoiceGates.size > 0) {
+    // C2-R20 fix: Loop gate drain until empty. A one-shot snapshot misses gates
+    // registered during the await (e.g., Phase 3 of in-flight auto-returns).
+    // The loop terminates because: (1) destroyed=true prevents new public API calls,
+    // (2) event handlers are unsubscribed above, (3) in-flight callbacks eventually
+    // complete and withInvoiceGate cleans up idle entries.
+    while (this.invoiceGates.size > 0) {
       await Promise.allSettled(Array.from(this.invoiceGates.values()));
     }
 
@@ -4320,6 +4322,9 @@ export class AccountingModule {
       }
     }
 
+    // W5-R20 fix: Check destroyed before flush — event handler may still be mid-execution
+    // after destroy() unsubscribes (fire-and-forget promise from before unsubscribe).
+    if (this.destroyed) return;
     await this._flushDirtyLedgerEntries();
 
     // §6.2 step 1: Parse transport memo for invoice reference
@@ -4405,6 +4410,8 @@ export class AccountingModule {
       }
     }
 
+    // W5-R20 fix: Check destroyed before flush
+    if (this.destroyed) return;
     await this._flushDirtyLedgerEntries();
 
     // Mark ledger entries as confirmed for all tokens in this result
@@ -4412,6 +4419,7 @@ export class AccountingModule {
       this._markTokenEntriesConfirmed(token.id);
     }
     // Flush the confirmed-status updates
+    if (this.destroyed) return;
     await this._flushDirtyLedgerEntries();
 
     // §6.2 transfer:confirmed step 1–4: re-fire events with confirmed=true
@@ -4466,7 +4474,9 @@ export class AccountingModule {
           const reEntries = this.invoiceLedger.get(invoiceId)
             ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
             : [];
-          const reStatus = computeInvoiceStatus(invoiceId, terms, reEntries, null, walletAddresses);
+          // W7-R20 fix: Re-read walletAddresses inside gate (matches W15 fix in getInvoiceStatus)
+          const freshWalletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+          const reStatus = computeInvoiceStatus(invoiceId, terms, reEntries, null, freshWalletAddresses);
           if (reStatus.state === 'COVERED' && reStatus.allConfirmed) {
             await this._terminateInvoice(invoiceId, 'CLOSED');
           }
@@ -4507,6 +4517,7 @@ export class AccountingModule {
     const startIndex = this.tokenScanState.get(tokenId) ?? 0;
     if ((txf.transactions?.length ?? 0) > startIndex) {
       this._processTokenTransactions(tokenId, txf, startIndex);
+      if (this.destroyed) return;
       await this._flushDirtyLedgerEntries();
     }
 
@@ -4635,6 +4646,14 @@ export class AccountingModule {
     // W2 fix: terminalState is already validated above (line 5d). The redundant
     // status/terminalState check here was dead code — remove to avoid confusion.
 
+    // W6-R20 fix: Truncate unbounded string fields before cast to prevent memory
+    // pressure from malicious DMs with oversized payloads in event consumers.
+    if (typeof raw['targetNametag'] === 'string' && raw['targetNametag'].length > 64) {
+      raw['targetNametag'] = raw['targetNametag'].slice(0, 64);
+    }
+    if (typeof raw['memo'] === 'string' && raw['memo'].length > 4096) {
+      raw['memo'] = raw['memo'].slice(0, 4096);
+    }
     const receipt: InvoiceReceiptPayload = raw as unknown as InvoiceReceiptPayload;
 
     // §5.11 step 6: nametag fallback — DM sender nametag takes priority over payload field
@@ -4721,6 +4740,16 @@ export class AccountingModule {
     // §5.12 step 5b (invoice existence check): drop if invoice not known locally
     if (!this.invoiceTermsCache.has(invoiceId)) return;
 
+    // W6-R20 fix: Truncate unbounded string fields before cast
+    if (typeof raw['targetNametag'] === 'string' && raw['targetNametag'].length > 64) {
+      raw['targetNametag'] = raw['targetNametag'].slice(0, 64);
+    }
+    if (typeof raw['reason'] === 'string' && raw['reason'].length > 4096) {
+      raw['reason'] = raw['reason'].slice(0, 4096);
+    }
+    if (typeof raw['dealDescription'] === 'string' && raw['dealDescription'].length > 4096) {
+      raw['dealDescription'] = raw['dealDescription'].slice(0, 4096);
+    }
     const notice: InvoiceCancellationPayload = raw as unknown as InvoiceCancellationPayload;
 
     // §5.12 step 6: nametag fallback — DM sender nametag takes priority over payload field
@@ -5051,8 +5080,20 @@ export class AccountingModule {
                 totalReturned += AccountingModule._safeBigInt(ref.amount);
               }
             }
-            // Add synthetic amount if not already indexed
-            totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
+            // W4-R20 fix: Check if this return was already indexed by _processTokenTransactions
+            // (same alreadyIndexed pattern as _processInvoiceTransferEvent §6.2 step 3c)
+            let alreadyIndexed = false;
+            if (entry.tokenId) {
+              for (const ledgerKey of innerMap.keys()) {
+                if (ledgerKey.startsWith(`${entry.tokenId}:`) && ledgerKey.endsWith(`::${coinId}`)) {
+                  alreadyIndexed = true;
+                  break;
+                }
+              }
+            }
+            if (!alreadyIndexed) {
+              totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
+            }
             if (totalReturned > totalForwarded) {
               deps.emitEvent('invoice:over_refund_warning', {
                 invoiceId,
@@ -5210,7 +5251,11 @@ export class AccountingModule {
 
     if (!sendParams) return;
 
-    // Phase 2: Outside gate — send tokens (no gate held during network call)
+    // Phase 2+3: Outside gate — send tokens then mark completed/failed directly.
+    // C1-R20 fix: markCompleted/markFailed only touch the dedup ledger (not invoice
+    // state), so gate exclusion is not needed. Removing the Phase 3 gate entry
+    // eliminates the destroy() gap where send succeeds but markCompleted never runs
+    // (causing duplicate payment on crash recovery).
     try {
       const result = await deps.payments.send({
         recipient: sendParams.returnTo,
@@ -5219,10 +5264,8 @@ export class AccountingModule {
         memo: sendParams.memo,
       });
 
-      // Phase 3: Inside gate — mark completed
-      await this.withInvoiceGate(invoiceId, async () => {
-        await this.autoReturnManager.markCompleted(invoiceId, sendParams.transferId, result.id);
-      });
+      // Mark completed immediately after send (no gate — dedup ledger only)
+      await this.autoReturnManager.markCompleted(invoiceId, sendParams.transferId, result.id);
 
       const returnRef: import('./types.js').InvoiceTransferRef = {
         transferId: result.id,
@@ -5244,10 +5287,8 @@ export class AccountingModule {
     } catch (err) {
       logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${sendParams.returnTo}:`, err);
 
-      // Phase 3 (failure): Inside gate — mark failed
-      await this.withInvoiceGate(invoiceId, async () => {
-        await this.autoReturnManager.markFailed(invoiceId, sendParams.transferId);
-      });
+      // Mark failed immediately (no gate — dedup ledger only)
+      await this.autoReturnManager.markFailed(invoiceId, sendParams.transferId).catch(() => {});
 
       deps.emitEvent('invoice:auto_return_failed', {
         invoiceId,
