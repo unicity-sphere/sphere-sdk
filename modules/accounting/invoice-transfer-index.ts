@@ -98,6 +98,14 @@ export class InvoiceTransferIndex {
   /** Set of invoice IDs that have un-flushed mutations */
   private dirtyInvoices: Set<string> = new Set();
 
+  /**
+   * W7 fix: per-token error retry counter for stuck watermarks.
+   * Key: `${tokenId}:${absIdx}` → number of consecutive failures.
+   * After MAX_WATERMARK_RETRIES failures at the same index, skip the transaction.
+   */
+  private watermarkRetries: Map<string, number> = new Map();
+  private static readonly MAX_WATERMARK_RETRIES = 3;
+
   /** Storage provider (set via configure()) */
   private storage: StorageProvider | null = null;
 
@@ -671,13 +679,27 @@ export class InvoiceTransferIndex {
         // Mark this transaction as successfully processed
         lastSuccessIdx = absIdx + 1;
       } catch (err) {
-        // Per spec §5.4.3 ERROR HANDLING: log and stop processing at the
-        // first error. The watermark only advances to the last successfully
-        // processed index, so the failing transaction will be retried on
-        // the next gap-fill pass.
+        // W7 fix: track retry count per stuck watermark position. After
+        // MAX_WATERMARK_RETRIES consecutive failures at the same index,
+        // skip the transaction to prevent permanent watermark stall.
+        const retryKey = `${tokenId}:${absIdx}`;
+        const retries = (this.watermarkRetries.get(retryKey) ?? 0) + 1;
+        this.watermarkRetries.set(retryKey, retries);
+
+        if (retries >= InvoiceTransferIndex.MAX_WATERMARK_RETRIES) {
+          logger.warn(
+            'InvoiceTransferIndex',
+            `Skipping permanently failing tx at absIdx=${absIdx} for tokenId=${tokenId} after ${retries} retries`,
+            err,
+          );
+          this.watermarkRetries.delete(retryKey);
+          lastSuccessIdx = absIdx + 1; // skip past the bad transaction
+          continue; // try next transaction
+        }
+
         logger.warn(
           'InvoiceTransferIndex',
-          `Error processing tx at absIdx=${absIdx} for tokenId=${tokenId}`,
+          `Error processing tx at absIdx=${absIdx} for tokenId=${tokenId} (retry ${retries}/${InvoiceTransferIndex.MAX_WATERMARK_RETRIES})`,
           err,
         );
         break; // stop at first error to retry on next gap-fill

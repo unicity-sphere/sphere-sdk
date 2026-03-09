@@ -288,7 +288,19 @@ export class AccountingModule {
     if (this.loadPromise) {
       return this.loadPromise;
     }
-    if (this._loading) return;
+    // W1 fix: If _loading is true but loadPromise is null (brief window in finally block),
+    // spin-wait until the flag clears, then re-check — avoids silent undefined return.
+    if (this._loading) {
+      await new Promise<void>((resolve) => {
+        const check = () => {
+          if (!this._loading) resolve();
+          else setTimeout(check, 1);
+        };
+        check();
+      });
+      // After the previous load completed, do not re-run — just return.
+      return;
+    }
 
     this._loading = true;
     this.loadPromise = this._doLoad();
@@ -1414,6 +1426,16 @@ export class AccountingModule {
     // the trust base. Token.fromJSON() reconstructs without verification;
     // verify() performs the cryptographic proof check.
     // ------------------------------------------------------------------
+
+    // C2/C6 fix: Reject imports when trustBase is empty — without a valid trust
+    // base, verify() may silently accept forged proofs depending on SDK behavior.
+    if (!deps.trustBase || (deps.trustBase instanceof Uint8Array && deps.trustBase.length === 0)) {
+      throw new SphereError(
+        'Trust base unavailable — cannot verify invoice proof. Ensure oracle supports getTrustBase().',
+        'INVOICE_INVALID_PROOF',
+      );
+    }
+
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const sdkToken = await SdkToken.fromJSON(token as any);
@@ -1429,10 +1451,12 @@ export class AccountingModule {
       // C7 fix: Verify that the JSON-supplied tokenId matches the cryptographically
       // computed token identity. Without this check, an attacker can submit a valid
       // proof for token X while claiming it is token Y, poisoning the ledger cache.
+      // CRITICAL: Require a match, not just check for mismatch — if canonicalTokenId
+      // is undefined/null, reject rather than silently accepting.
       const canonicalTokenId = sdkToken.id?.toJSON?.() ?? null;
-      if (canonicalTokenId && canonicalTokenId !== tokenId) {
+      if (!canonicalTokenId || canonicalTokenId !== tokenId) {
         throw new SphereError(
-          `Invoice import failed: tokenId mismatch — JSON claims ${tokenId} but cryptographic identity is ${canonicalTokenId}`,
+          `Invoice import failed: tokenId mismatch or unverifiable — JSON claims ${tokenId}, cryptographic identity is ${canonicalTokenId ?? 'unknown'}`,
           'INVOICE_INVALID_DATA',
         );
       }
@@ -1652,9 +1676,10 @@ export class AccountingModule {
           this.frozenBalances.set(invoiceId, frozen);
           this.closedInvoices.add(invoiceId);
 
-          // Persist frozen balances and terminal sets (terminal set FIRST per §7 crash recovery)
-          await this._persistTerminalSets();
+          // C5 fix: Persist in crash-safe order: frozen balances FIRST, then terminal set.
+          // The terminal set write is the commit point — crash between writes = not terminal.
           await this._persistFrozenBalances();
+          await this._persistTerminalSets();
 
           // Invalidate balance cache
           this.balanceCache.delete(invoiceId);
@@ -3209,30 +3234,32 @@ export class AccountingModule {
 
       // Implicit close (called by auto-terminate path — explicit=false)
       frozen = freezeBalances(terms, status, 'CLOSED', false, latestSenderMap);
-
-      // Persist: terminal set FIRST, then frozen balances
       this.closedInvoices.add(invoiceId);
-      await this.saveJsonToStorage(
-        STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
-        Array.from(this.closedInvoices),
-      );
     } else {
       // CANCELLED — preserve all per-sender balances
       frozen = freezeBalances(terms, status, 'CANCELLED', false);
-
-      // Persist: terminal set FIRST, then frozen balances
       this.cancelledInvoices.add(invoiceId);
-      await this.saveJsonToStorage(
-        STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
-        Array.from(this.cancelledInvoices),
-      );
     }
 
+    // C5 fix: Persist in crash-safe order matching closeInvoice/cancelInvoice:
+    // frozen balances FIRST, then terminal set. The terminal set write is the
+    // commit point — crash between writes = not terminal on recovery.
     this.frozenBalances.set(invoiceId, frozen);
     await this.saveJsonToStorage(
       STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
       Object.fromEntries(this.frozenBalances),
     );
+    if (state === 'CLOSED') {
+      await this.saveJsonToStorage(
+        STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
+        Array.from(this.closedInvoices),
+      );
+    } else {
+      await this.saveJsonToStorage(
+        STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
+        Array.from(this.cancelledInvoices),
+      );
+    }
 
     // Fire event
     if (state === 'CLOSED') {
@@ -3933,6 +3960,7 @@ export class AccountingModule {
     startIndex: number,
   ): void {
     const transactions = txf.transactions ?? [];
+    let lastSuccessIdx = startIndex;
 
     for (let i = startIndex; i < transactions.length; i++) {
       const tx = transactions[i];
@@ -3943,6 +3971,8 @@ export class AccountingModule {
       try {
         const hexStr = tx.data['message'] as string;
         if (!hexStr || hexStr.length > 8192) continue;
+        // W10 fix: validate hex chars before parseInt to avoid NaN bytes
+        if (!/^[0-9a-fA-F]*$/.test(hexStr)) continue;
         const matches = hexStr.match(/.{1,2}/g);
         if (!matches) continue;
         const bytes = new Uint8Array(matches.map((b) => parseInt(b, 16)));
@@ -4006,8 +4036,9 @@ export class AccountingModule {
 
       // Create one ref per coin
       for (const [coinId, amount] of entries) {
-        // Validate amount: must be a non-empty string of digits (no negatives, no decimals)
-        if (!amount || !/^\d+$/.test(amount)) {
+        // W12 fix: validate amount — must be a positive integer without leading zeros.
+        // On-chain amounts of "0" are nonsensical for accounting; leading zeros indicate corruption.
+        if (!amount || !/^[1-9][0-9]*$/.test(amount)) {
           logger.warn(LOG_TAG, `Token ${tokenId} tx[${i}] coin ${coinId} has invalid amount '${amount}' — skipping`);
           continue;
         }
@@ -4030,18 +4061,23 @@ export class AccountingModule {
           paymentDirection,
           coinId,
           amount,
-          // W2: For non-genesis tx, only use tx-level recipient — genesis recipient is the first owner, not the destination.
-          destinationAddress: ((tx.data as Record<string, unknown>)['recipient'] as string) ?? (i === 0 ? (txf.genesis?.data?.recipient ?? '') : ''),
+          // W5 fix: validate tx.data.recipient is a string before use (untrusted on-chain data)
+          destinationAddress: (() => {
+            const txRecipient = (tx.data as Record<string, unknown>)?.['recipient'];
+            if (typeof txRecipient === 'string' && txRecipient) return txRecipient;
+            if (i === 0) return (txf.genesis?.data?.recipient ?? '');
+            return '';
+          })(),
           timestamp: Date.now(),
           confirmed: tx.inclusionProof !== null,
           senderAddress,
           ...(payload.inv.ra !== undefined ? { refundAddress: payload.inv.ra } : {}),
         };
 
-        // Remove ALL provisional entries that this on-chain entry supersedes.
+        // W8 fix: Remove ONE provisional entry per on-chain entry (one-for-one match).
         // Provisional entries (from returnInvoicePayment sync update) have keys
         // like "provisional:{uuid}::{coinId}". When the real tokenId:txIndex entry
-        // arrives, we remove all matching provisionals to prevent double-counting.
+        // arrives, we remove one matching provisional to prevent double-counting.
         // Match on coinId + paymentDirection only (not amount) because token splits
         // may produce different on-chain amounts than the requested return amount.
         const provisionalKeysToDelete: string[] = [];
@@ -4052,6 +4088,7 @@ export class AccountingModule {
             existingRef.paymentDirection === paymentDirection
           ) {
             provisionalKeysToDelete.push(existingKey);
+            break; // W8: one-for-one — remove only one provisional per on-chain entry
           }
         }
         for (const pKey of provisionalKeysToDelete) {
@@ -4068,10 +4105,14 @@ export class AccountingModule {
         }
         this.tokenInvoiceMap.get(tokenId)!.add(invoiceId);
       }
+
+      // C4/W19 fix: advance watermark per-transaction, not unconditionally at end.
+      // This ensures errors don't permanently skip valid transactions.
+      lastSuccessIdx = i + 1;
     }
 
-    // Update watermark regardless of per-transaction errors
-    this.tokenScanState.set(tokenId, transactions.length);
+    // Update watermark to last successfully processed index
+    this.tokenScanState.set(tokenId, lastSuccessIdx);
     this.tokenScanDirty = true;
   }
 
@@ -4509,6 +4550,14 @@ export class AccountingModule {
     const assets = (senderContribution as Record<string, unknown>)['assets'] as unknown[];
     if (assets.length > 100) return; // storage amplification defense
 
+    // W3 fix: validate each asset element is a non-null object with coinId string
+    for (const asset of assets) {
+      if (typeof asset !== 'object' || asset === null ||
+          typeof (asset as Record<string, unknown>)['coinId'] !== 'string') {
+        return; // malformed asset element
+      }
+    }
+
     // §5.11 step 5f: targetAddress must be present as string
     if (typeof raw['targetAddress'] !== 'string') return;
 
@@ -4518,10 +4567,8 @@ export class AccountingModule {
     // §5.11 step 5b (invoice existence check): drop if invoice not known locally
     if (!this.invoiceTermsCache.has(invoiceId)) return;
 
-    // W5: Field-level validation before cast — ensure required fields have correct types
-    if (typeof raw['invoiceId'] !== 'string' || typeof raw['status'] !== 'string' && typeof raw['terminalState'] !== 'string') {
-      return; // malformed receipt
-    }
+    // W2 fix: terminalState is already validated above (line 5d). The redundant
+    // status/terminalState check here was dead code — remove to avoid confusion.
 
     const receipt: InvoiceReceiptPayload = raw as unknown as InvoiceReceiptPayload;
 
@@ -4588,6 +4635,14 @@ export class AccountingModule {
     }
     const assetsArr = (senderContribution as Record<string, unknown>)['assets'] as unknown[];
     if (assetsArr.length > 100) return; // storage amplification defense
+
+    // W4 fix: validate each asset element is a non-null object with coinId string
+    for (const asset of assetsArr) {
+      if (typeof asset !== 'object' || asset === null ||
+          typeof (asset as Record<string, unknown>)['coinId'] !== 'string') {
+        return; // malformed asset element
+      }
+    }
 
     // §5.12 step 5e: targetAddress must be present as string
     if (typeof raw['targetAddress'] !== 'string') return;
@@ -4703,13 +4758,13 @@ export class AccountingModule {
               if (effectiveSender !== senderAddr) continue;
 
               if (ref.paymentDirection === 'forward') {
-                totalForwarded += BigInt(ref.amount);
+                totalForwarded += AccountingModule._safeBigInt(ref.amount);
               } else {
-                totalReturned += BigInt(ref.amount);
+                totalReturned += AccountingModule._safeBigInt(ref.amount);
               }
             }
             // Include the current return amount
-            totalReturned += BigInt(syntheticRef.amount);
+            totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
 
             if (totalReturned > totalForwarded) {
               deps.emitEvent('invoice:over_refund_warning', {
@@ -5122,7 +5177,7 @@ export class AccountingModule {
         }
 
         // §6.2 step 7d: fire overpayment when surplus > 0
-        if (BigInt(coinAsset.surplusAmount) > 0n) {
+        if (AccountingModule._safeBigInt(coinAsset.surplusAmount) > 0n) {
           deps.emitEvent('invoice:overpayment', {
             invoiceId,
             address: targetStatus.address,
@@ -5346,7 +5401,6 @@ export class AccountingModule {
       scanStateObj[tokenId] = count;
     }
     await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE, scanStateObj);
-    this.tokenScanDirty = false;
 
     // Step 3: Write INV_LEDGER_INDEX
     const indexMeta: InvLedgerIndex = {};
@@ -5357,6 +5411,10 @@ export class AccountingModule {
       };
     }
     await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX, indexMeta);
+
+    // W9 fix: clear tokenScanDirty AFTER all 3 steps complete, not between steps 2 and 3.
+    // If step 3 fails, the dirty flag remains set so the next flush retries.
+    this.tokenScanDirty = false;
   }
 
   // ===========================================================================

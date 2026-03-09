@@ -30,18 +30,20 @@ import type { InvoiceTerms } from '../../../modules/accounting/types.js';
 // Mock SDK Token — bypass proof verification for importInvoice()
 // =============================================================================
 
+// C1 fix: Mock must return an object with .id.toJSON() matching the tokenId
+// so the canonical ID verification passes. Extract tokenId from the JSON arg.
+const createMockSdkToken = (json: any) => ({
+  verify: vi.fn().mockResolvedValue(true),
+  id: { toJSON: () => json?.tokenId ?? json?.genesis?.data?.tokenId ?? null },
+});
 vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
   Token: {
-    fromJSON: vi.fn().mockResolvedValue({
-      verify: vi.fn().mockResolvedValue(true),
-    }),
+    fromJSON: vi.fn().mockImplementation(async (json: any) => createMockSdkToken(json)),
   },
 }));
 vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token.js', () => ({
   Token: {
-    fromJSON: vi.fn().mockResolvedValue({
-      verify: vi.fn().mockResolvedValue(true),
-    }),
+    fromJSON: vi.fn().mockImplementation(async (json: any) => createMockSdkToken(json)),
   },
 }));
 
