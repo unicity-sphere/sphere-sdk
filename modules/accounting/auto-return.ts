@@ -144,10 +144,14 @@ export class AutoReturnManager {
 
   /**
    * Persist the current in-memory ledger to storage.
-   * Fire-and-forget errors are silently swallowed — the in-memory state remains
-   * authoritative for the current session.
+   *
+   * When `critical` is true (default false), storage write failures are
+   * propagated to the caller. This is used by `recordIntent()` to ensure
+   * the write-first pattern actually persists before the send proceeds.
+   * For non-critical saves (markCompleted, markFailed), failures are
+   * silently swallowed — the in-memory state remains authoritative.
    */
-  async save(): Promise<void> {
+  async save(critical = false): Promise<void> {
     if (!this.storage) return;
     const entries: Record<string, AutoReturnLedgerEntry> = {};
     for (const [key, entry] of this.ledger.entries()) {
@@ -155,8 +159,9 @@ export class AutoReturnManager {
     }
     try {
       await this.storage.set(this.storageKey, JSON.stringify({ entries }));
-    } catch {
-      // Storage write failure — in-memory ledger is still authoritative
+    } catch (err) {
+      if (critical) throw err;
+      // Non-critical: storage write failure — in-memory ledger is still authoritative
     }
   }
 
@@ -218,7 +223,9 @@ export class AutoReturnManager {
       status: 'pending',
     };
     this.ledger.set(key, entry);
-    await this.save();
+    // W4 fix: Use critical=true so storage write failures propagate.
+    // The write-first pattern only provides crash safety if the write succeeds.
+    await this.save(true);
   }
 
   /**

@@ -3663,7 +3663,24 @@ export class AccountingModule {
         if (!raw) continue;
         const entries = JSON.parse(raw) as Record<string, InvoiceTransferRef>;
         const innerMap = this.invoiceLedger.get(invoiceId)!;
+        const now = Date.now();
+        const PROVISIONAL_TTL_MS = 10 * 60 * 1000; // 10 minutes
         for (const [entryKey, ref] of Object.entries(entries)) {
+          // W1 fix: Drop stale provisional entries on load. If a provisional is
+          // older than 10 minutes, the on-chain scan should have replaced it by now.
+          // Keeping stale provisionals corrupts balance computation indefinitely.
+          if (
+            entryKey.startsWith('provisional:') &&
+            ref.timestamp &&
+            (now - ref.timestamp) > PROVISIONAL_TTL_MS
+          ) {
+            logger.warn(
+              LOG_TAG,
+              `Dropping stale provisional entry ${entryKey} for invoice ${invoiceId} (age: ${Math.round((now - ref.timestamp) / 1000)}s)`,
+            );
+            this.dirtyLedgerEntries.add(invoiceId);
+            continue; // skip loading this entry
+          }
           innerMap.set(entryKey, ref);
           // Rebuild tokenInvoiceMap — only for positional entries (tokenId:txIndex format).
           // Provisional entries (provisional:uuid) don't map to real tokens.
@@ -3824,13 +3841,30 @@ export class AccountingModule {
       if (!payload?.inv?.id) continue;
 
       const invoiceId = payload.inv.id.toLowerCase();
-      // NOTE: We intentionally do NOT skip unknown invoices here.
-      // Proactive indexing: index ALL invoice-referencing transactions so that
+      // Proactive indexing: index invoice-referencing transactions so that
       // when an invoice is later imported via importInvoice(), its transfer
       // entries are already in the ledger — no need to rescan all tokens.
       // The tokenScanState watermark is advanced regardless, so skipping would
       // cause a permanent gap: the watermark passes these transactions and
       // importInvoice()'s retroactive scan finds nothing new.
+      //
+      // W5 fix: Cap the number of unknown invoice IDs to prevent unbounded
+      // storage growth from attacker-crafted transfers with fake invoice IDs.
+      // Known invoices (in invoiceTermsCache) are always indexed. Unknown ones
+      // are indexed only up to the cap.
+      const MAX_UNKNOWN_INVOICE_IDS = 500;
+      if (!this.invoiceTermsCache.has(invoiceId) && !this.invoiceLedger.has(invoiceId)) {
+        // Count how many unknown invoice IDs are in the ledger
+        let unknownCount = 0;
+        for (const id of this.invoiceLedger.keys()) {
+          if (!this.invoiceTermsCache.has(id)) unknownCount++;
+        }
+        if (unknownCount >= MAX_UNKNOWN_INVOICE_IDS) {
+          // Skip indexing this unknown invoice — cap reached.
+          // importInvoice() will do a full rescan for this invoice if needed.
+          continue;
+        }
+      }
 
       // Map direction code to paymentDirection
       const dirMap: Record<string, InvoiceTransferRef['paymentDirection']> = {
@@ -3884,19 +3918,20 @@ export class AccountingModule {
           ...(payload.inv.ra !== undefined ? { refundAddress: payload.inv.ra } : {}),
         };
 
-        // C1 fix: Remove any provisional entry that this on-chain entry supersedes.
+        // C1+C2 fix: Remove any provisional entry that this on-chain entry supersedes.
         // Provisional entries (from returnInvoicePayment sync update) have keys
         // like "provisional:{uuid}::{coinId}". When the real tokenId:txIndex entry
-        // arrives, we remove the provisional to prevent double-counting.
+        // arrives, we remove ONE matching provisional to prevent double-counting.
+        // Match on coinId + paymentDirection only (not amount) because token splits
+        // may produce different on-chain amounts than the requested return amount.
         for (const [existingKey, existingRef] of ledger) {
           if (
             existingKey.startsWith('provisional:') &&
             existingRef.coinId === coinId &&
-            existingRef.paymentDirection === paymentDirection &&
-            existingRef.amount === amount
+            existingRef.paymentDirection === paymentDirection
           ) {
             ledger.delete(existingKey);
-            break; // at most one provisional per coin+direction+amount
+            break; // one on-chain entry supersedes one provisional
           }
         }
 
@@ -4064,9 +4099,33 @@ export class AccountingModule {
     const memoRef = parseInvoiceMemo(memo);
     if (!memoRef) return;
 
-    const { invoiceId, paymentDirection } = memoRef;
+    let { invoiceId, paymentDirection } = memoRef;
     const confirmed = false; // transfer:incoming = unconfirmed
     const deps = this.deps!;
+
+    // W3 fix: Prefer on-chain direction over transport memo direction.
+    // The ledger entries from _processTokenTransactions (run above) have the
+    // authoritative direction from the on-chain message bytes. If the transport
+    // memo direction disagrees (e.g., compromised relay), use the on-chain one.
+    const ledger = this.invoiceLedger.get(invoiceId);
+    if (ledger) {
+      for (const token of transfer.tokens) {
+        if (!token.id) continue;
+        for (const [, ref] of ledger) {
+          if (ref.transferId.startsWith(`${token.id}:`)) {
+            if (ref.paymentDirection !== paymentDirection) {
+              logger.warn(
+                LOG_TAG,
+                `Direction mismatch: transport memo says ${paymentDirection}, ` +
+                  `on-chain says ${ref.paymentDirection} for invoice ${invoiceId} — using on-chain`,
+              );
+              paymentDirection = ref.paymentDirection;
+            }
+            break;
+          }
+        }
+      }
+    }
 
     // §6.2 step 2: Invoice not in local store → fire unknown_reference and return
     if (!this.invoiceTermsCache.has(invoiceId)) {
@@ -4157,6 +4216,13 @@ export class AccountingModule {
       const entries = Array.from(innerMap.values());
       const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
       const status = computeInvoiceStatus(invoiceId, terms, entries, null, walletAddresses);
+
+      // W2 fix: Re-check terminal state before firing coverage events — a concurrent
+      // closeInvoice/cancelInvoice may have completed between our terminal check above
+      // and here. Firing coverage events on a terminal invoice confuses consumers.
+      if (this.cancelledInvoices.has(invoiceId) || this.closedInvoices.has(invoiceId)) {
+        continue;
+      }
 
       // §6.2 transfer:confirmed step 3: re-fire coverage events with confirmed=true
       this._fireCoverageEvents(invoiceId, terms, status, entries, true, deps);
