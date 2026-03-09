@@ -824,6 +824,8 @@ export function createTestAccountingModule(overrides?: {
   communications?: MockCommunicationsModule;
   identity?: FullIdentity;
   trackedAddresses?: TrackedAddress[];
+  // C6-R17: Allow overriding trustBase for security tests (null/empty = rejection)
+  trustBase?: unknown;
 }): {
   module: AccountingModule;
   mocks: TestAccountingModuleMocks;
@@ -843,7 +845,7 @@ export function createTestAccountingModule(overrides?: {
     payments: payments as unknown as AccountingModuleDependencies['payments'],
     tokenStorage: tokenStorage as unknown as AccountingModuleDependencies['tokenStorage'],
     oracle: oracle as unknown as AccountingModuleDependencies['oracle'],
-    trustBase: new Uint8Array([1, 2, 3]),
+    trustBase: overrides?.trustBase !== undefined ? overrides.trustBase : new Uint8Array([1, 2, 3]),
     identity,
     getActiveAddresses: vi.fn().mockReturnValue(trackedAddresses),
     emitEvent: vi.fn(),

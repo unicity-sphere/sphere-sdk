@@ -2899,6 +2899,11 @@ async function main() {
         const enableFlag = args.includes('--enable');
         const disableFlag = args.includes('--disable');
         const invoiceIdx = args.indexOf('--invoice');
+        // W7-R17 fix: Validate --invoice has a following argument
+        if (invoiceIdx !== -1 && !args[invoiceIdx + 1]) {
+          console.error('--invoice requires an invoice ID');
+          process.exit(1);
+        }
         const specificInvoice = invoiceIdx !== -1 ? args[invoiceIdx + 1] : undefined;
 
         if (!enableFlag && !disableFlag) {

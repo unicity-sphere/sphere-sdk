@@ -30,11 +30,13 @@ import type { InvoiceTerms } from '../../../modules/accounting/types.js';
 // Mock SDK Token — bypass proof verification for importInvoice()
 // =============================================================================
 
-// C1 fix: Mock must return an object with .id.toJSON() matching the tokenId
-// so the canonical ID verification passes. Extract tokenId from the JSON arg.
+// C5-R17 fix: Mock returns VerificationResult-like object (not boolean).
+// Real Token.verify() returns { isSuccessful: boolean, ... }.
+// C1 fix: Mock returns .id.toJSON() matching the tokenId for canonical ID verification.
+let mockVerifyResult: unknown = { isSuccessful: true };
 const createMockSdkToken = (json: any) => ({
-  verify: vi.fn().mockResolvedValue(true),
-  id: { toJSON: () => json?.tokenId ?? json?.genesis?.data?.tokenId ?? null },
+  verify: vi.fn().mockImplementation(async () => mockVerifyResult),
+  id: { toJSON: () => json?.genesis?.data?.tokenId ?? null },
 });
 vi.mock('@unicitylabs/state-transition-sdk/lib/token/Token', () => ({
   Token: {
@@ -78,6 +80,7 @@ function setup(overrides?: Parameters<typeof createTestAccountingModule>[0]) {
 
 afterEach(() => {
   try { module.destroy(); } catch { /* ignore */ }
+  mockVerifyResult = { isSuccessful: true }; // Reset verify mock for next test
   vi.clearAllMocks();
 });
 
@@ -430,5 +433,79 @@ describe('UT-IMPORT-012: Token observer indexes transactions inline', () => {
 
     // Watermark should be advanced
     expect(mod.tokenScanState.get(txfTokenId)).toBe(1);
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-013: Verification failure rejects import (C4-R17)
+// =============================================================================
+
+describe('UT-IMPORT-013: Verification failure rejects import', () => {
+  beforeEach(() => setup());
+  afterEach(() => { mockVerifyResult = { isSuccessful: true }; });
+
+  it('rejects token when verify returns isSuccessful: false', async () => {
+    await module.load();
+    const terms = validTerms();
+    const token = createTestToken(terms);
+
+    mockVerifyResult = { isSuccessful: false, status: 'FAIL', message: 'bad proof' };
+
+    await expect(module.importInvoice(token)).rejects.toSatisfy(
+      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_PROOF',
+    );
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-014: Empty trustBase rejects import (C6-R17)
+// =============================================================================
+
+describe('UT-IMPORT-014: Empty/null trustBase rejects import', () => {
+  it('rejects when trustBase is null', async () => {
+    setup({ trustBase: null });
+    await module.load();
+    const terms = validTerms();
+    const token = createTestToken(terms);
+
+    await expect(module.importInvoice(token)).rejects.toSatisfy(
+      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_PROOF',
+    );
+  });
+
+  it('rejects when trustBase is empty Uint8Array', async () => {
+    setup({ trustBase: new Uint8Array([]) });
+    await module.load();
+    const terms = validTerms();
+    const token = createTestToken(terms);
+
+    await expect(module.importInvoice(token)).rejects.toSatisfy(
+      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_PROOF',
+    );
+  });
+});
+
+// =============================================================================
+// UT-IMPORT-015: TokenId mismatch rejects import (C7-R17)
+// =============================================================================
+
+describe('UT-IMPORT-015: TokenId mismatch rejects import', () => {
+  beforeEach(() => setup());
+
+  it('rejects when SDK token ID differs from claimed tokenId', async () => {
+    await module.load();
+    const terms = validTerms();
+    const token = createTestToken(terms);
+
+    // Override the Token.fromJSON mock for this test to return a mismatched ID
+    const { Token } = await import('@unicitylabs/state-transition-sdk/lib/token/Token.js');
+    (Token.fromJSON as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => ({
+      verify: vi.fn().mockResolvedValue({ isSuccessful: true }),
+      id: { toJSON: () => 'mismatched_' + 'a'.repeat(54) },
+    }));
+
+    await expect(module.importInvoice(token)).rejects.toSatisfy(
+      (e: unknown) => e instanceof SphereError && (e as SphereError).code === 'INVOICE_INVALID_DATA',
+    );
   });
 });

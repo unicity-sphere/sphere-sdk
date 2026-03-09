@@ -2290,14 +2290,16 @@ export class Sphere {
       const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
         // Resolve trustBase from oracle for invoice proof verification
-        let trustBase: Uint8Array = new Uint8Array();
+        // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
+        // AccountingModule.deps.trustBase is typed as unknown.
+        let trustBase: unknown = null;
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          trustBase = (this._oracle as any).getTrustBase?.() ?? new Uint8Array();
+          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
         } catch {
           logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
         }
-        // NOTE: If trustBase is empty, AccountingModule.importInvoice() will reject imports
+        // NOTE: If trustBase is null/empty, AccountingModule.importInvoice() will reject imports
         // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
@@ -2312,6 +2314,11 @@ export class Sphere {
           storage: this._storage,
           communications: this._communications,
         });
+      } else {
+        // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
+        // load() throwing NOT_INITIALIZED downstream.
+        logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
+        this._accounting = null;
       }
     }
 
@@ -3929,14 +3936,16 @@ export class Sphere {
       const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
         // Resolve trustBase from oracle for invoice proof verification
-        let trustBase: Uint8Array = new Uint8Array();
+        // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
+        // AccountingModule.deps.trustBase is typed as unknown.
+        let trustBase: unknown = null;
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          trustBase = (this._oracle as any).getTrustBase?.() ?? new Uint8Array();
+          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
         } catch {
           logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
         }
-        // NOTE: If trustBase is empty, AccountingModule.importInvoice() will reject imports
+        // NOTE: If trustBase is null/empty, AccountingModule.importInvoice() will reject imports
         // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
@@ -3951,6 +3960,11 @@ export class Sphere {
           storage: this._storage,
           communications: this._communications,
         });
+      } else {
+        // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
+        // load() throwing NOT_INITIALIZED downstream.
+        logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
+        this._accounting = null;
       }
     }
 

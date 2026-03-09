@@ -1453,7 +1453,13 @@ export class AccountingModule {
       const sdkToken = await SdkToken.fromJSON(token as any);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const verifyResult = await sdkToken.verify(deps.trustBase as any);
-      if (!verifyResult) {
+      // C4-R17 fix: Token.verify() returns a VerificationResult object (always truthy),
+      // not a boolean. Check .isSuccessful for the actual result. Fall back to falsy check
+      // for SDK versions that might return boolean.
+      const verifyOk = typeof verifyResult === 'object' && verifyResult !== null
+        ? (verifyResult as { isSuccessful?: boolean }).isSuccessful !== false
+        : !!verifyResult;
+      if (!verifyOk) {
         throw new SphereError(
           'Invoice import failed: inclusion proof is invalid.',
           'INVOICE_INVALID_PROOF',
@@ -2217,7 +2223,7 @@ export class AccountingModule {
       const liveStatus = computeInvoiceStatus(invoiceId, terms, ledgerEntries, null, walletAddresses);
       const targetStatus = liveStatus.targets.find((t) => t.address === target.address);
       const coinAssetStatus = targetStatus?.coinAssets.find((ca) => ca.coin[0] === coinId);
-      const netCovered = coinAssetStatus ? BigInt(coinAssetStatus.netCoveredAmount) : 0n;
+      const netCovered = coinAssetStatus ? AccountingModule._safeBigInt(coinAssetStatus.netCoveredAmount) : 0n;
       const remaining = requested > netCovered ? requested - netCovered : 0n;
       sendAmount = remaining.toString();
     }
@@ -2421,7 +2427,9 @@ export class AccountingModule {
       }
 
       // §8.6 balance cap validation
-      const returnAmount = BigInt(params.amount);
+      // C3-R17 fix: Use _safeBigInt — params.amount is user input, raw BigInt() throws
+      // uncaught SyntaxError for non-numeric strings instead of controlled SphereError.
+      const returnAmount = AccountingModule._safeBigInt(params.amount);
       if (returnAmount > senderNetBalance) {
         throw new SphereError(
           `Return amount ${params.amount} exceeds sender net balance ${senderNetBalance.toString()} ` +
@@ -2798,7 +2806,8 @@ export class AccountingModule {
           // and '0' as returnedAmount for simplicity when only netBalance is available.
           // This is correct for the minimal case; a full implementation would track
           // forwarded/returned separately in FrozenSenderBalance (future enhancement).
-          assetEntry.forwardedAmount += BigInt(frozenSender.netBalance);
+          // C3-R17 fix: Use _safeBigInt — frozenSender.netBalance is from persisted storage
+          assetEntry.forwardedAmount += AccountingModule._safeBigInt(frozenSender.netBalance);
         }
       }
 
@@ -3053,7 +3062,8 @@ export class AccountingModule {
             });
           }
           const assetEntry = senderEntry.assets.get(coinId)!;
-          assetEntry.forwardedAmount += BigInt(frozenSender.netBalance);
+          // C3-R17 fix: Use _safeBigInt — frozenSender.netBalance is from persisted storage
+          assetEntry.forwardedAmount += AccountingModule._safeBigInt(frozenSender.netBalance);
         }
       }
 
@@ -3179,6 +3189,7 @@ export class AccountingModule {
    * @param memo - The raw memo string from TransferRequest.memo / HistoryRecord.memo.
    * @returns Parsed InvoiceMemoRef or null if the string does not match the INV: format.
    */
+  // §10 exemption: Pure function with no side effects — exempt from ensureNotDestroyed().
   parseInvoiceMemo(memo: string) {
     return parseInvoiceMemo(memo);
   }
@@ -4230,15 +4241,16 @@ export class AccountingModule {
     // _handleTransferConfirmed) will call _flushDirtyLedgerEntries() as
     // part of their normal flow. For token changes that DON'T trigger
     // an event (e.g., sync), we schedule an async flush.
-    // W2 fix: Serialize flushes to prevent concurrent interleaved writes
+    // W2 fix: Serialize flushes via promise chaining to prevent concurrent interleaved writes.
+    // C1-R17 fix: Use chain pattern instead of .finally() nulling — the old pattern clobbered
+    // a newer flush's promise reference when an older flush's .finally() ran, allowing a third
+    // flush to skip the await and run concurrently with the second.
     if (this.dirtyLedgerEntries.size > 0 || this.tokenScanDirty) {
-      const doFlush = async () => {
-        if (this._flushPromise) await this._flushPromise;
-        await this._flushDirtyLedgerEntries();
-      };
-      this._flushPromise = doFlush().catch((err) => {
-        logger.warn(LOG_TAG, 'Error flushing ledger after token change:', err);
-      }).finally(() => { this._flushPromise = null; });
+      this._flushPromise = (this._flushPromise ?? Promise.resolve())
+        .then(() => this._flushDirtyLedgerEntries())
+        .catch((err) => {
+          logger.warn(LOG_TAG, 'Error flushing ledger after token change:', err);
+        });
     }
   }
 
@@ -4787,9 +4799,25 @@ export class AccountingModule {
             }
             // W3 fix: Only add synthetic ref amount if it wasn't already indexed in the ledger.
             // _processTokenTransactions runs before this handler and may have already
-            // created a ledger entry with the same transferId — adding again double-counts.
-            const syntheticKey = `${syntheticRef.transferId}::${coinId}`;
-            if (!innerMap.has(syntheticKey)) {
+            // created a ledger entry for the same transfer.
+            // C2-R17 fix: Ledger keys use "{tokenId}:{txIdx}::{coinId}" format but
+            // syntheticRef.transferId is a transport UUID — formats never match for key lookup.
+            // Instead, check if any token from this transfer already has a matching ledger entry
+            // by scanning for tokenId-prefixed keys with matching coinId.
+            let alreadyIndexed = false;
+            if (transfer.tokens) {
+              for (const tok of transfer.tokens) {
+                if (!tok.id) continue;
+                for (const ledgerKey of innerMap.keys()) {
+                  if (ledgerKey.startsWith(`${tok.id}:`) && ledgerKey.endsWith(`::${coinId}`)) {
+                    alreadyIndexed = true;
+                    break;
+                  }
+                }
+                if (alreadyIndexed) break;
+              }
+            }
+            if (!alreadyIndexed) {
               totalReturned += AccountingModule._safeBigInt(syntheticRef.amount);
             }
 
