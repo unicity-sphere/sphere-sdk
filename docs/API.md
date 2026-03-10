@@ -1119,7 +1119,7 @@ interface CreateGroupOptions {
   description?: string;
   picture?: string;
   visibility?: GroupVisibility;    // 'PUBLIC' | 'PRIVATE' (default: PUBLIC)
-  writeRestricted?: boolean;       // Only admins/writers can post (default: false)
+  writeRestricted?: boolean;       // Only admins and moderators can post (default: false)
 }
 
 // Create a read-only announcement channel
@@ -1157,7 +1157,7 @@ Returns `null` if the relay rejects the message (e.g., write-restricted group an
 
 #### `canWriteToGroup(groupId: string): boolean`
 
-Check if the current user can post messages to a group. For write-restricted groups, only admins and moderators can write. For normal groups, any member can write.
+Check if the current user can post messages to a group. For write-restricted groups, only admins and moderators can post. For normal groups, any member can write.
 
 ```typescript
 if (!groupChat.canWriteToGroup(groupId)) {
@@ -1197,7 +1197,7 @@ interface GroupData {
   description?: string;
   picture?: string;
   visibility: 'PUBLIC' | 'PRIVATE';
-  writeRestricted?: boolean;       // Only admins/writers can post
+  writeRestricted?: boolean;       // Only admins and moderators can post
   createdAt: number;
   updatedAt?: number;
   memberCount?: number;

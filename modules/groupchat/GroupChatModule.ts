@@ -489,23 +489,25 @@ export class GroupChatModule {
     if (!group) return;
 
     if (event.kind === NIP29_KINDS.GROUP_METADATA) {
-      if (!event.content || event.content.trim() === '') return;
-      try {
-        const metadata = JSON.parse(event.content);
-        group.name = metadata.name || group.name;
-        group.description = metadata.about || group.description;
-        group.picture = metadata.picture || group.picture;
-        group.writeRestricted = metadata['write-restricted'] === true || undefined;
-        // Tags override JSON content (relay-authoritative)
-        for (const tag of event.tags) {
-          if (tag[0] === 'write-restricted') group.writeRestricted = true;
+      if (event.content && event.content.trim()) {
+        try {
+          const metadata = JSON.parse(event.content);
+          group.name = metadata.name || group.name;
+          group.description = metadata.about || group.description;
+          group.picture = metadata.picture || group.picture;
+          if (metadata['write-restricted'] === true) group.writeRestricted = true;
+          else group.writeRestricted = undefined;
+        } catch {
+          // Skip malformed JSON content
         }
-        group.updatedAt = event.created_at * 1000;
-        this.groups.set(groupId, group);
-        this.persistGroups();
-      } catch {
-        // Skip malformed metadata
       }
+      // Tags are relay-authoritative and override JSON content
+      for (const tag of event.tags) {
+        if (tag[0] === 'write-restricted') group.writeRestricted = true;
+      }
+      group.updatedAt = event.created_at * 1000;
+      this.groups.set(groupId, group);
+      this.persistGroups();
     } else if (event.kind === NIP29_KINDS.GROUP_MEMBERS) {
       this.updateMembersFromEvent(groupId, event);
     } else if (event.kind === NIP29_KINDS.GROUP_ADMINS) {
@@ -1270,7 +1272,7 @@ export class GroupChatModule {
     const group = this.groups.get(groupId);
     if (!group) return false;
     if (!group.writeRestricted) return true;
-    return this.isCurrentUserAdmin(groupId) || this.isCurrentUserModerator(groupId);
+    return this.isCurrentUserModerator(groupId);
   }
 
   getCurrentUserRole(groupId: string): GroupRole | null {

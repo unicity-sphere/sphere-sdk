@@ -409,6 +409,12 @@ const privateGroup = await gc.createGroup({
   visibility: GroupVisibility.PRIVATE,
 });
 
+// Create a write-restricted group (only admins/writers can post)
+const announcements = await gc.createGroup({
+  name: 'Announcements',
+  writeRestricted: true,
+});
+
 // Discover and join
 const available = await gc.fetchAvailableGroups(); // public groups on relay
 await gc.joinGroup(group.id);
@@ -455,6 +461,7 @@ const members = gc.getMembers(group.id);
 gc.isCurrentUserAdmin(group.id);     // boolean
 gc.isCurrentUserModerator(group.id); // boolean
 await gc.canModerateGroup(group.id); // includes relay admin check
+gc.canWriteToGroup(group.id);       // false if write-restricted and not admin/moderator
 
 // Moderate (requires admin/moderator role)
 await gc.kickUser(group.id, userPubkey, 'reason');
@@ -487,6 +494,7 @@ interface GroupData {
   name: string;
   description?: string;
   visibility: GroupVisibility;  // 'PUBLIC' | 'PRIVATE'
+  writeRestricted?: boolean;   // Only admins and moderators can post
   memberCount?: number;
   unreadCount?: number;
   lastMessageTime?: number;
