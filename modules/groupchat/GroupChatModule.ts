@@ -495,6 +495,11 @@ export class GroupChatModule {
         group.name = metadata.name || group.name;
         group.description = metadata.about || group.description;
         group.picture = metadata.picture || group.picture;
+        group.writeRestricted = metadata['write-restricted'] === true || undefined;
+        // Tags override JSON content (relay-authoritative)
+        for (const tag of event.tags) {
+          if (tag[0] === 'write-restricted') group.writeRestricted = true;
+        }
         group.updatedAt = event.created_at * 1000;
         this.groups.set(groupId, group);
         this.persistGroups();
@@ -870,6 +875,7 @@ export class GroupChatModule {
           closed: true,
           private: isPrivate,
           hidden: isPrivate,
+          ...(options.writeRestricted ? { 'write-restricted': true } : {}),
         }),
       });
 
@@ -1253,6 +1259,18 @@ export class GroupChatModule {
 
     const admins = await this.fetchRelayAdmins();
     return admins.has(myPubkey);
+  }
+
+  /**
+   * Check if current user can write messages to a group.
+   * For write-restricted groups, only admins/moderators can post.
+   * For normal groups, any member can post.
+   */
+  canWriteToGroup(groupId: string): boolean {
+    const group = this.groups.get(groupId);
+    if (!group) return false;
+    if (!group.writeRestricted) return true;
+    return this.isCurrentUserAdmin(groupId) || this.isCurrentUserModerator(groupId);
   }
 
   getCurrentUserRole(groupId: string): GroupRole | null {
@@ -1699,6 +1717,7 @@ export class GroupChatModule {
       let description: string | undefined;
       let picture: string | undefined;
       let isPrivate = false;
+      let writeRestricted = false;
 
       if (event.content && event.content.trim()) {
         try {
@@ -1707,6 +1726,7 @@ export class GroupChatModule {
           description = metadata.about || metadata.description;
           picture = metadata.picture;
           isPrivate = metadata.private === true;
+          if (metadata['write-restricted'] === true) writeRestricted = true;
         } catch {
           // Not JSON, check tags
         }
@@ -1718,6 +1738,7 @@ export class GroupChatModule {
         if (tag[0] === 'picture' && tag[1]) picture = tag[1];
         if (tag[0] === 'private') isPrivate = true;
         if (tag[0] === 'public' && tag[1] === 'false') isPrivate = true;
+        if (tag[0] === 'write-restricted') writeRestricted = true;
       }
 
       return {
@@ -1727,6 +1748,7 @@ export class GroupChatModule {
         description,
         picture,
         visibility: isPrivate ? GroupVisibilityEnum.PRIVATE : GroupVisibilityEnum.PUBLIC,
+        writeRestricted: writeRestricted || undefined,
         createdAt: event.created_at * 1000,
       };
     } catch {

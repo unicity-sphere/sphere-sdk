@@ -39,6 +39,8 @@ export interface GroupData {
   unreadCount?: number;
   lastMessageTime?: number;
   lastMessageText?: string;
+  /** Only admins/writers can post; other members are read-only (NIP-29 "write-restricted" tag) */
+  writeRestricted?: boolean;
   /** When the current user joined this group locally (used to filter old events) */
   localJoinedAt?: number;
 }
@@ -84,4 +86,6 @@ export interface CreateGroupOptions {
   description?: string;
   picture?: string;
   visibility?: GroupVisibility;
+  /** Only admins/writers can post; other members are read-only */
+  writeRestricted?: boolean;
 }

@@ -27,10 +27,12 @@ import type { FullIdentity, SphereEventType, SphereEventMap, TrackedAddressEntry
 // Constants
 // =============================================================================
 
-const RELAY_IMAGE = 'ghcr.io/unicitynetwork/unicity-relay:sha-999b6ec';
+const RELAY_IMAGE = 'ghcr.io/unicitynetwork/unicity-relay:sha-d04b26e';
 const RELAY_PORT = 3334;
 const PROXY_PORT = 80;
 const RELAY_ALIAS = 'relay'; // Docker network alias for the relay container
+const PG_ALIAS = 'postgres';
+const PG_PORT = 5432;
 
 const REMOTE_RELAY_URL = process.env.RELAY_URL; // e.g. wss://sphere-relay.unicity.network
 const USE_DOCKER = !REMOTE_RELAY_URL;
@@ -174,6 +176,7 @@ function createTestModule(privateKeyHex: string, relayUrl: string): TestModule {
 describe('GroupChatModule Relay Integration', () => {
   // Docker resources (only used when USE_DOCKER is true)
   let network: StartedNetwork | undefined;
+  let pgContainer: StartedTestContainer | undefined;
   let relayContainer: StartedTestContainer | undefined;
   let proxyContainer: StartedTestContainer | undefined;
 
@@ -205,7 +208,20 @@ describe('GroupChatModule Relay Integration', () => {
       // Docker network lets the proxy reach the relay by hostname.
       network = await new Network().start();
 
-      // 1. Start the proxy first to learn the random host port.
+      // 1. Start PostgreSQL for relay persistence.
+      pgContainer = await new GenericContainer('postgres:16-alpine')
+        .withNetwork(network)
+        .withNetworkAliases(PG_ALIAS)
+        .withEnvironment({
+          POSTGRES_USER: 'relay',
+          POSTGRES_PASSWORD: 'relay',
+          POSTGRES_DB: 'relay',
+        })
+        .withWaitStrategy(Wait.forLogMessage(/ready to accept connections/))
+        .withStartupTimeout(30000)
+        .start();
+
+      // 2. Start the proxy first to learn the random host port.
       //    Uses nginx resolver + variable proxy_pass so the upstream hostname
       //    ("relay") is resolved lazily at request time via Docker DNS (127.0.0.11),
       //    not at startup — avoiding the "host not found" crash.
@@ -235,7 +251,7 @@ describe('GroupChatModule Relay Integration', () => {
 
       const mappedPort = proxyContainer.getMappedPort(PROXY_PORT);
 
-      // 2. Start the relay with RELAY_HOST matching the public URL that clients
+      // 3. Start the relay with RELAY_HOST matching the public URL that clients
       //    connect to (localhost:<mappedPort>). This ensures the Host header and
       //    the NIP-42 AUTH relay URL tag both match what the relay expects.
       relayContainer = await new GenericContainer(RELAY_IMAGE)
@@ -250,9 +266,10 @@ describe('GroupChatModule Relay Integration', () => {
           GROUPS_ADMIN_CREATE_ONLY: 'false',
           GROUPS_PRIVATE_ADMIN_ONLY: 'false',
           GROUPS_PRIVATE_RELAY_ADMIN_ACCESS: 'false',
+          DATABASE_URL: `postgres://relay:relay@${PG_ALIAS}:${PG_PORT}/relay?sslmode=disable`,
           PORT: String(RELAY_PORT),
         })
-        .withWaitStrategy(Wait.forLogMessage(/running on/))
+        .withWaitStrategy(Wait.forListeningPorts())
         .withStartupTimeout(60000)
         .start();
 
@@ -322,6 +339,7 @@ describe('GroupChatModule Relay Integration', () => {
     if (USE_DOCKER) {
       await proxyContainer?.stop();
       await relayContainer?.stop();
+      await pgContainer?.stop();
       await network?.stop();
     }
   });
@@ -535,6 +553,59 @@ describe('GroupChatModule Relay Integration', () => {
       // isn't in User A's local state, it returns false
       const canModerate = await userA.module.canModerateGroup('nonexistent_private_group');
       expect(canModerate).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // Write-Restricted Groups
+  // ===========================================================================
+
+  describe('write-restricted groups', () => {
+    let writeRestrictedGroupId: string;
+
+    beforeAll(async () => {
+      const group = await userA.module.createGroup({
+        name: `WriteRestricted ${runId}`,
+        visibility: GroupVisibility.PUBLIC,
+        writeRestricted: true,
+      });
+      expect(group).not.toBeNull();
+      writeRestrictedGroupId = group!.id;
+      await sleep(300);
+      await userB.module.joinGroup(writeRestrictedGroupId);
+      await sleep(300);
+    });
+
+    it('metadata reflects write-restricted flag', () => {
+      const group = userA.module.getGroup(writeRestrictedGroupId);
+      expect(group).not.toBeNull();
+      expect(group!.writeRestricted).toBe(true);
+    });
+
+    it('fetchAvailableGroups includes write-restricted flag', async () => {
+      const groups = await userB.module.fetchAvailableGroups();
+      const found = groups.find((g: GroupData) => g.id === writeRestrictedGroupId);
+      expect(found).toBeTruthy();
+      expect(found!.writeRestricted).toBe(true);
+    });
+
+    it('canWriteToGroup returns true for admin (creator)', () => {
+      expect(userA.module.canWriteToGroup(writeRestrictedGroupId)).toBe(true);
+    });
+
+    it('canWriteToGroup returns false for regular member', () => {
+      expect(userB.module.canWriteToGroup(writeRestrictedGroupId)).toBe(false);
+    });
+
+    it('admin can send message to write-restricted group', async () => {
+      const msg = await userA.module.sendMessage(writeRestrictedGroupId, 'Admin announcement');
+      expect(msg).not.toBeNull();
+      expect(msg!.content).toBe('Admin announcement');
+    });
+
+    it('regular member message is rejected by relay', async () => {
+      const msg = await userB.module.sendMessage(writeRestrictedGroupId, 'Should be rejected');
+      expect(msg).toBeNull();
     });
   });
 

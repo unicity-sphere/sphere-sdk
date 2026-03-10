@@ -1097,6 +1097,118 @@ Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped message
 
 ---
 
+## GroupChatModule
+
+NIP-29 relay-based group chat. Access via `createGroupChatModule()` factory.
+
+```typescript
+import { createGroupChatModule } from '@unicitylabs/sphere-sdk/modules/groupchat';
+
+const groupChat = createGroupChatModule({ relays: ['wss://relay.example.com'] });
+groupChat.initialize({ identity, storage, emitEvent });
+await groupChat.connect();
+```
+
+### Group Management
+
+#### `createGroup(options: CreateGroupOptions): Promise<GroupData | null>`
+
+```typescript
+interface CreateGroupOptions {
+  name: string;
+  description?: string;
+  picture?: string;
+  visibility?: GroupVisibility;    // 'PUBLIC' | 'PRIVATE' (default: PUBLIC)
+  writeRestricted?: boolean;       // Only admins/writers can post (default: false)
+}
+
+// Create a read-only announcement channel
+const group = await groupChat.createGroup({
+  name: 'Announcements',
+  writeRestricted: true,
+});
+```
+
+#### `fetchAvailableGroups(): Promise<GroupData[]>`
+
+Fetches public groups from the relay. Returns `GroupData` objects including the `writeRestricted` flag.
+
+#### `joinGroup(groupId: string, inviteCode?: string): Promise<boolean>`
+#### `leaveGroup(groupId: string): Promise<boolean>`
+#### `deleteGroup(groupId: string): Promise<boolean>`
+#### `createInvite(groupId: string): Promise<string | null>`
+
+### Messaging
+
+#### `sendMessage(groupId: string, content: string, replyToId?: string): Promise<GroupMessageData | null>`
+
+Returns `null` if the relay rejects the message (e.g., write-restricted group and user lacks permission).
+
+#### `fetchMessages(groupId: string, limit?: number): Promise<GroupMessageData[]>`
+#### `getMessages(groupId: string): GroupMessageData[]`
+
+### Members & Permissions
+
+#### `getMembers(groupId: string): GroupMemberData[]`
+#### `getMember(groupId: string, pubkey: string): GroupMemberData | undefined`
+#### `isCurrentUserAdmin(groupId: string): boolean`
+#### `isCurrentUserModerator(groupId: string): boolean`
+#### `canModerateGroup(groupId: string): Promise<boolean>`
+
+#### `canWriteToGroup(groupId: string): boolean`
+
+Check if the current user can post messages to a group. For write-restricted groups, only admins and moderators can write. For normal groups, any member can write.
+
+```typescript
+if (!groupChat.canWriteToGroup(groupId)) {
+  // Disable message input — group is read-only for this user
+}
+```
+
+### Write-Restricted Groups
+
+Groups with `writeRestricted: true` are read-only for regular members. Only users with admin or moderator roles can post messages. The relay enforces this server-side — rejected messages return `null` from `sendMessage()`.
+
+```typescript
+// Check via group metadata
+const group = groupChat.getGroup(groupId);
+if (group?.writeRestricted) {
+  // Show read-only indicator in UI
+}
+
+// Check via convenience method (combines group flag + user role)
+const canWrite = groupChat.canWriteToGroup(groupId);
+```
+
+### Queries
+
+#### `getGroups(): GroupData[]`
+#### `getGroup(groupId: string): GroupData | undefined`
+#### `getCurrentUserRole(groupId: string): GroupRole | null`
+#### `getConnectionStatus(): boolean`
+
+### GroupData
+
+```typescript
+interface GroupData {
+  id: string;
+  relayUrl: string;
+  name: string;
+  description?: string;
+  picture?: string;
+  visibility: 'PUBLIC' | 'PRIVATE';
+  writeRestricted?: boolean;       // Only admins/writers can post
+  createdAt: number;
+  updatedAt?: number;
+  memberCount?: number;
+  unreadCount?: number;
+  lastMessageTime?: number;
+  lastMessageText?: string;
+}
+```
+
+---
+
 ## Types
 
 ### FullIdentity
