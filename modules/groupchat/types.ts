@@ -81,6 +81,27 @@ export interface GroupChatModuleConfig {
   maxReconnectAttempts?: number;
 }
 
+// =============================================================================
+// Pagination
+// =============================================================================
+
+export interface GroupMessagesPage {
+  messages: GroupMessageData[];
+  hasMore: boolean;
+  oldestTimestamp: number | null;
+}
+
+export interface GetGroupMessagesPageOptions {
+  /** Max messages to return (default: 20) */
+  limit?: number;
+  /** Return messages older than this timestamp */
+  before?: number;
+}
+
+// =============================================================================
+// Group Creation
+// =============================================================================
+
 export interface CreateGroupOptions {
   name: string;
   description?: string;

@@ -270,6 +270,15 @@ export interface TransportProvider extends BaseProvider {
    * and resolves after EOSE (End Of Stored Events).
    */
   fetchPendingEvents?(): Promise<void>;
+
+  /**
+   * Register a handler to be called when the chat subscription receives EOSE
+   * (End Of Stored Events), indicating that historical DMs have been delivered.
+   * The handler fires at most once per subscription lifecycle.
+   *
+   * @returns Unsubscribe function
+   */
+  onChatReady?(handler: () => void): () => void;
 }
 
 // =============================================================================

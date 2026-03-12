@@ -30,6 +30,8 @@ import type {
   GroupChatModuleConfig,
   CreateGroupOptions,
   GroupRole,
+  GroupMessagesPage,
+  GetGroupMessagesPageOptions,
 } from './types';
 import { GroupRole as GroupRoleEnum, GroupVisibility as GroupVisibilityEnum } from './types';
 
@@ -336,6 +338,7 @@ export class GroupChatModule {
       // Emit connection event AFTER groups are loaded/subscribed,
       // so consumers don't query getGroups() while restoreJoinedGroups() is still running.
       this.deps!.emitEvent('groupchat:connection', { connected: true });
+      this.deps!.emitEvent('groupchat:ready', { groupCount: this.groups.size });
     } catch (error) {
       logger.error('GroupChat', 'Failed to connect to relays', error);
       this.deps!.emitEvent('groupchat:connection', { connected: false });
@@ -1133,6 +1136,23 @@ export class GroupChatModule {
   getMessages(groupId: string): GroupMessageData[] {
     return (this.messages.get(groupId) || [])
       .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  getMessagesPage(groupId: string, options?: GetGroupMessagesPageOptions): GroupMessagesPage {
+    const limit = options?.limit ?? 20;
+    const before = options?.before ?? Infinity;
+    const groupMessages = this.messages.get(groupId) ?? [];
+
+    const filtered = groupMessages
+      .filter(m => m.timestamp < before)
+      .sort((a, b) => b.timestamp - a.timestamp); // newest first
+
+    const page = filtered.slice(0, limit);
+    return {
+      messages: page.reverse(), // chronological order
+      hasMore: filtered.length > limit,
+      oldestTimestamp: page.length > 0 ? page[0].timestamp : null,
+    };
   }
 
   getMembers(groupId: string): GroupMemberData[] {

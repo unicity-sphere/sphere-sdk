@@ -400,6 +400,8 @@ export type SphereEventType =
   | 'groupchat:group_deleted'
   | 'groupchat:updated'
   | 'groupchat:connection'
+  | 'groupchat:ready'
+  | 'communications:ready'
   | 'history:updated';
 
 export interface SphereEventMap {
@@ -435,6 +437,8 @@ export interface SphereEventMap {
   'groupchat:group_deleted': { groupId: string; groupName: string };
   'groupchat:updated': Record<string, never>;
   'groupchat:connection': { connected: boolean };
+  'groupchat:ready': { groupCount: number };
+  'communications:ready': { conversationCount: number };
   'history:updated': import('../modules/payments/PaymentsModule').TransactionHistoryEntry;
 }
 

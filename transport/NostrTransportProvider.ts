@@ -242,6 +242,7 @@ export class NostrTransportProvider implements TransportProvider {
     this.mainSubscriptionId = null;
     this.walletSubscriptionId = null;
     this.chatSubscriptionId = null;
+    this.chatEoseFired = false;
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
     logger.debug('Nostr', 'Disconnected from all relays');
@@ -682,6 +683,18 @@ export class NostrTransportProvider implements TransportProvider {
   onTypingIndicator(handler: TypingIndicatorHandler): () => void {
     this.typingIndicatorHandlers.add(handler);
     return () => this.typingIndicatorHandlers.delete(handler);
+  }
+
+  onChatReady(handler: () => void): () => void {
+    // If EOSE already fired, invoke immediately
+    if (this.chatEoseFired) {
+      try { handler(); } catch { /* ignore */ }
+      return () => {};
+    }
+    this.chatEoseHandlers.push(handler);
+    return () => {
+      this.chatEoseHandlers = this.chatEoseHandlers.filter(h => h !== handler);
+    };
   }
 
   // ===========================================================================
@@ -1594,6 +1607,10 @@ export class NostrTransportProvider implements TransportProvider {
   private walletSubscriptionId: string | null = null;
   private chatSubscriptionId: string | null = null;
 
+  // Chat EOSE handlers — fired once when relay finishes delivering stored DMs
+  private chatEoseHandlers: Array<() => void> = [];
+  private chatEoseFired = false;
+
   private async subscribeToEvents(): Promise<void> {
     logger.debug('Nostr', 'subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
     if (!this.identity || !this.keyManager || !this.nostrClient) {
@@ -1701,6 +1718,13 @@ export class NostrTransportProvider implements TransportProvider {
       },
       onEndOfStoredEvents: () => {
         logger.debug('Nostr', 'Chat subscription ready (EOSE)');
+        if (!this.chatEoseFired) {
+          this.chatEoseFired = true;
+          for (const handler of this.chatEoseHandlers) {
+            try { handler(); } catch { /* ignore */ }
+          }
+          this.chatEoseHandlers = [];
+        }
       },
       onError: (_subId, error) => {
         logger.debug('Nostr', 'Chat subscription error:', error);

@@ -145,6 +145,14 @@ export class CommunicationsModule {
     this.unsubscribeComposing = deps.transport.onComposing?.((indicator) => {
       this.handleComposingIndicator(indicator);
     }) ?? null;
+
+    // Emit ready event when relay EOSE fires (historical DMs delivered)
+    if (deps.transport.onChatReady) {
+      deps.transport.onChatReady(() => {
+        const conversations = this.getConversations();
+        deps.emitEvent('communications:ready', { conversationCount: conversations.size });
+      });
+    }
   }
 
   /**
