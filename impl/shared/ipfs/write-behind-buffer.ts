@@ -51,12 +51,19 @@ export class WriteBuffer {
   /** Full TXF data from save() calls — latest wins */
   txfData: TxfStorageDataBase | null = null;
 
+  /** IPNS context captured at save() time — ensures flush writes to the correct
+   *  IPNS record even if identity changes between save() and flush(). */
+  capturedIpnsKeyPair: unknown | null = null;
+  capturedIpnsName: string | null = null;
+
   get isEmpty(): boolean {
     return this.txfData === null;
   }
 
   clear(): void {
     this.txfData = null;
+    this.capturedIpnsKeyPair = null;
+    this.capturedIpnsName = null;
   }
 
   /**
@@ -66,6 +73,8 @@ export class WriteBuffer {
   mergeFrom(other: WriteBuffer): void {
     if (other.txfData && !this.txfData) {
       this.txfData = other.txfData;
+      this.capturedIpnsKeyPair = other.capturedIpnsKeyPair;
+      this.capturedIpnsName = other.capturedIpnsName;
     }
   }
 }

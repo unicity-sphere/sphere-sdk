@@ -436,6 +436,15 @@ describe('MarketModule integration with Sphere', () => {
         new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
 
+      // Helper: find the x-public-key from fetch calls (skip registration call which has no signed headers)
+      const extractPubkey = () => {
+        for (const call of fetchSpy.mock.calls) {
+          const headers = call[1]?.headers as Record<string, string> | undefined;
+          if (headers?.['x-public-key']) return headers['x-public-key'];
+        }
+        return undefined;
+      };
+
       const { sphere } = await Sphere.init({
         storage: new FileStorageProvider({ dataDir: DATA_DIR }),
         tokenStorage: new FileTokenStorageProvider({ tokensDir: TOKENS_DIR }),
@@ -453,7 +462,7 @@ describe('MarketModule integration with Sphere', () => {
         new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
       await sphere.market!.getMyIntents();
-      const pubkey1 = (fetchSpy.mock.calls[0][1]?.headers as Record<string, string>)['x-public-key'];
+      const pubkey1 = extractPubkey();
 
       // Switch to address 1
       await sphere.switchToAddress(1);
@@ -472,9 +481,11 @@ describe('MarketModule integration with Sphere', () => {
         new Response(JSON.stringify({ intents: [] }), { status: 200 })
       );
       await sphere.market!.getMyIntents();
-      const pubkey2 = (fetchSpy.mock.calls[0][1]?.headers as Record<string, string>)['x-public-key'];
+      const pubkey2 = extractPubkey();
 
       // Verify different public keys were used (proving module was reinitialized)
+      expect(pubkey1).toBeDefined();
+      expect(pubkey2).toBeDefined();
       expect(pubkey1).not.toBe(pubkey2);
       expect(pubkey2).toBe(identity2?.chainPubkey);
 

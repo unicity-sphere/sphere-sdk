@@ -265,6 +265,17 @@ export interface TransportProvider extends BaseProvider {
   onInstantSplitReceived?(handler: InstantSplitBundleHandler): () => void;
 
   /**
+   * Set fallback 'since' timestamp for event subscriptions.
+   * Used when switching to an address that has never subscribed before.
+   * The transport uses this instead of 'now' as the initial since filter,
+   * ensuring events sent while the address was inactive are not missed.
+   * Consumed once by the next subscription setup, then cleared.
+   *
+   * @param sinceSeconds - Unix timestamp in seconds
+   */
+  setFallbackSince?(sinceSeconds: number): void;
+
+  /**
    * Fetch pending events from transport (one-shot query).
    * Creates a temporary subscription, processes events through normal handlers,
    * and resolves after EOSE (End Of Stored Events).

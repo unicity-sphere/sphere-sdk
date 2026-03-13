@@ -121,6 +121,8 @@ export class NostrTransportProvider implements TransportProvider {
   private storage: TransportStorageAdapter | null = null;
   /** In-memory max event timestamp to avoid read-before-write races in updateLastEventTimestamp. */
   private lastEventTs: number = 0;
+  /** Fallback 'since' timestamp for first-time address subscriptions (consumed once). */
+  private fallbackSince: number | null = null;
   private identity: FullIdentity | null = null;
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
@@ -156,6 +158,56 @@ export class NostrTransportProvider implements TransportProvider {
     };
     this.storage = config.storage ?? null;
   }
+
+  /**
+   * Get the WebSocket factory (used by MultiAddressTransportMux to share the same factory).
+   */
+  getWebSocketFactory(): WebSocketFactory {
+    return this.config.createWebSocket;
+  }
+
+  /**
+   * Get the configured relay URLs.
+   */
+  getConfiguredRelays(): string[] {
+    return [...this.config.relays];
+  }
+
+  /**
+   * Get the storage adapter.
+   */
+  getStorageAdapter(): TransportStorageAdapter | null {
+    return this.storage;
+  }
+
+  /**
+   * Suppress event subscriptions — unsubscribe wallet/chat filters
+   * but keep the connection alive for resolve/identity-binding operations.
+   * Used when MultiAddressTransportMux takes over event handling.
+   */
+  suppressSubscriptions(): void {
+    if (!this.nostrClient) return;
+
+    if (this.walletSubscriptionId) {
+      this.nostrClient.unsubscribe(this.walletSubscriptionId);
+      this.walletSubscriptionId = null;
+    }
+    if (this.chatSubscriptionId) {
+      this.nostrClient.unsubscribe(this.chatSubscriptionId);
+      this.chatSubscriptionId = null;
+    }
+    if (this.mainSubscriptionId) {
+      this.nostrClient.unsubscribe(this.mainSubscriptionId);
+      this.mainSubscriptionId = null;
+    }
+
+    // Prevent re-subscription on reconnect by marking subscriptions as suppressed
+    this._subscriptionsSuppressed = true;
+    logger.debug('Nostr', 'Subscriptions suppressed — mux handles event routing');
+  }
+
+  // Flag to prevent re-subscription after suppressSubscriptions()
+  private _subscriptionsSuppressed = false;
 
   // ===========================================================================
   // BaseProvider Implementation
@@ -377,6 +429,11 @@ export class NostrTransportProvider implements TransportProvider {
   async setIdentity(identity: FullIdentity): Promise<void> {
     this.identity = identity;
 
+    // Clear per-address state so stale dedup entries from previous address
+    // don't block legitimate events for the new address.
+    this.processedEventIds.clear();
+    this.lastEventTs = 0;
+
     // Create NostrKeyManager from private key
     const secretKey = Buffer.from(identity.privateKey, 'hex');
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
@@ -430,6 +487,10 @@ export class NostrTransportProvider implements TransportProvider {
       // Already connected with right key, just subscribe
       await this.subscribeToEvents();
     }
+  }
+
+  setFallbackSince(sinceSeconds: number): void {
+    this.fallbackSince = sinceSeconds;
   }
 
   /**
@@ -1613,6 +1674,10 @@ export class NostrTransportProvider implements TransportProvider {
 
   private async subscribeToEvents(): Promise<void> {
     logger.debug('Nostr', 'subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
+    if (this._subscriptionsSuppressed) {
+      logger.debug('Nostr', 'subscribeToEvents: suppressed — mux handles event routing');
+      return;
+    }
     if (!this.identity || !this.keyManager || !this.nostrClient) {
       logger.debug('Nostr', 'subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
       return;
@@ -1647,15 +1712,24 @@ export class NostrTransportProvider implements TransportProvider {
         if (stored) {
           since = parseInt(stored, 10);
           this.lastEventTs = since; // Seed in-memory tracker from storage
+          this.fallbackSince = null; // Stored value takes priority
           logger.debug('Nostr', 'Resuming from stored event timestamp:', since);
+        } else if (this.fallbackSince !== null) {
+          // No stored timestamp but caller provided a fallback (e.g. address creation time).
+          // This ensures events sent while the address was inactive are not missed.
+          since = this.fallbackSince;
+          this.lastEventTs = since;
+          this.fallbackSince = null; // Consume once
+          logger.debug('Nostr', 'Using fallback since timestamp:', since);
         } else {
-          // No stored timestamp = fresh wallet, start from now
+          // No stored timestamp, no fallback = fresh wallet, start from now
           since = Math.floor(Date.now() / 1000);
           logger.debug('Nostr', 'No stored timestamp, starting from now:', since);
         }
       } catch (err) {
         logger.debug('Nostr', 'Failed to read last event timestamp, falling back to now:', err);
         since = Math.floor(Date.now() / 1000);
+        this.fallbackSince = null;
       }
     } else {
       // No storage adapter — fallback to last 24h (legacy behavior)
