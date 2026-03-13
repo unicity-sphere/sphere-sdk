@@ -817,13 +817,13 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async resolveNametag(nametag: string): Promise<string | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
     // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
     return this.nostrClient!.queryPubkeyByNametag(nametag);
   }
 
   async resolveNametagInfo(nametag: string): Promise<PeerInfo | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
     const binding = await this.nostrClient!.queryBindingByNametag(nametag);
@@ -840,7 +840,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Performs reverse lookup via nostr-js-sdk with first-seen-wins anti-hijacking.
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     const binding = await this.nostrClient!.queryBindingByAddress(address);
     if (!binding) return null;
@@ -883,7 +883,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Queries binding events authored by the given pubkey.
    */
   async resolveTransportPubkeyInfo(transportPubkey: string): Promise<PeerInfo | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     const events = await this.queryEvents({
       kinds: [EVENT_KINDS.NAMETAG_BINDING],
@@ -925,7 +925,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Used for HD address discovery — single relay query with multi-author filter.
    */
   async discoverAddresses(transportPubkeys: string[]): Promise<PeerInfo[]> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     if (transportPubkeys.length === 0) return [];
 
@@ -973,7 +973,10 @@ export class NostrTransportProvider implements TransportProvider {
    * @returns Decrypted nametag or null if none found
    */
   async recoverNametag(): Promise<string | null> {
-    this.ensureReady();
+    await this.ensureConnectedForResolve();
+    if (!this.identity) {
+      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
+    }
 
     if (!this.identity || !this.keyManager) {
       throw new SphereError('Identity not set', 'NOT_INITIALIZED');
@@ -1882,6 +1885,37 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
+  /**
+   * Async version of ensureConnected — reconnects if the original transport
+   * lost its WebSocket while subscriptions are suppressed (mux handles events).
+   * Used by resolve methods which are always async.
+   */
+  private async ensureConnectedForResolve(): Promise<void> {
+    if (this.isConnected()) return;
+
+    // When mux is active, the original transport can lose its idle WebSocket.
+    // Reconnect transparently so resolve operations still work.
+    if (this._subscriptionsSuppressed && this.nostrClient) {
+      logger.debug('Nostr', 'Suppressed transport disconnected — reconnecting for resolve');
+      try {
+        await Promise.race([
+          this.nostrClient.connect(...this.config.relays),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('reconnect timeout')), 5000)
+          ),
+        ]);
+        if (this.nostrClient.isConnected()) {
+          this.status = 'connected';
+          return;
+        }
+      } catch {
+        // Fall through to throw
+      }
+    }
+
+    throw new SphereError('NostrTransportProvider not connected', 'TRANSPORT_ERROR');
+  }
+
   private ensureReady(): void {
     this.ensureConnected();
     if (!this.identity) {
@@ -1905,7 +1939,15 @@ export class NostrTransportProvider implements TransportProvider {
    * because NIP17.createGiftWrap hardcodes kind 14 for the inner rumor.
    */
   private createCustomKindGiftWrap(recipientPubkeyHex: string, content: string, rumorKind: number): NostrEventClass {
-    const senderPubkey = this.keyManager!.getPublicKeyHex();
+    return NostrTransportProvider.createCustomKindGiftWrap(this.keyManager!, recipientPubkeyHex, content, rumorKind);
+  }
+
+  /**
+   * Create a NIP-17 gift wrap with a custom rumor kind.
+   * Shared between NostrTransportProvider and MultiAddressTransportMux.
+   */
+  static createCustomKindGiftWrap(keyManager: NostrKeyManager, recipientPubkeyHex: string, content: string, rumorKind: number): NostrEventClass {
+    const senderPubkey = keyManager.getPublicKeyHex();
     const now = Math.floor(Date.now() / 1000);
 
     // 1. Create Rumor (unsigned inner event with custom kind)
@@ -1916,9 +1958,9 @@ export class NostrTransportProvider implements TransportProvider {
 
     // 2. Create Seal (kind 13, signed by sender, encrypts rumor)
     const recipientPubkeyBytes = hexToBytes(recipientPubkeyHex);
-    const encryptedRumor = NIP44.encrypt(JSON.stringify(rumor), this.keyManager!.getPrivateKey(), recipientPubkeyBytes);
+    const encryptedRumor = NIP44.encrypt(JSON.stringify(rumor), keyManager.getPrivateKey(), recipientPubkeyBytes);
     const sealTimestamp = now + Math.floor(Math.random() * 2 * TIMESTAMP_RANDOMIZATION) - TIMESTAMP_RANDOMIZATION;
-    const seal = NostrEventClass.create(this.keyManager!, {
+    const seal = NostrEventClass.create(keyManager, {
       kind: EventKinds.SEAL,
       tags: [],
       content: encryptedRumor,

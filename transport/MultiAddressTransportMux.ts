@@ -17,7 +17,6 @@ import {
   NostrKeyManager,
   NIP04,
   NIP17,
-  NIP44,
   Event as NostrEventClass,
   EventKinds,
   NostrClient,
@@ -56,6 +55,7 @@ import type {
 } from './transport-provider';
 import type { WebSocketFactory, UUIDGenerator } from './websocket';
 import { defaultUUIDGenerator } from './websocket';
+import { NostrTransportProvider } from './NostrTransportProvider';
 import type { TransportStorageAdapter, NostrTransportProviderConfig } from './NostrTransportProvider';
 import {
   DEFAULT_NOSTR_RELAYS,
@@ -586,12 +586,31 @@ export class MultiAddressTransportMux {
           try {
             const parsed = JSON.parse(pm.content);
             if (parsed?.selfWrap && parsed.recipientPubkey) {
+              // Skip self-wrapped read receipts and typing indicators (legacy bug)
+              try {
+                const innerParsed = typeof parsed.text === 'string' ? JSON.parse(parsed.text) : null;
+                if (innerParsed?.type === 'read_receipt' || innerParsed?.type === 'typing') {
+                  return;
+                }
+              } catch { /* not JSON inner, continue as message */ }
+
+              // Parse inner JSON envelope (same as normal message handler)
+              let selfWrapContent = parsed.text ?? '';
+              let selfWrapNametag: string | undefined = parsed.senderNametag;
+              try {
+                const innerParsed = JSON.parse(selfWrapContent);
+                if (typeof innerParsed === 'object' && innerParsed.text !== undefined) {
+                  selfWrapContent = innerParsed.text;
+                  selfWrapNametag = innerParsed.senderNametag || selfWrapNametag;
+                }
+              } catch { /* plain text */ }
+
               const message: IncomingMessage = {
                 id: parsed.originalId || pm.eventId,
                 senderTransportPubkey: pm.senderPubkey,
-                senderNametag: parsed.senderNametag,
+                senderNametag: selfWrapNametag,
                 recipientTransportPubkey: parsed.recipientPubkey,
-                content: parsed.text ?? '',
+                content: selfWrapContent,
                 timestamp: pm.timestamp * 1000,
                 encrypted: true,
                 isSelfWrap: true,
@@ -636,9 +655,18 @@ export class MultiAddressTransportMux {
           return;
         }
 
-        // Handle typing indicators
+        // Filter control messages sent as kind-14 (legacy bug — should use dedicated kinds)
         try {
           const parsed = JSON.parse(pm.content);
+          if (parsed?.type === 'read_receipt' && parsed.messageEventId) {
+            const receipt: IncomingReadReceipt = {
+              senderTransportPubkey: pm.senderPubkey,
+              messageEventId: parsed.messageEventId,
+              timestamp: pm.timestamp * 1000,
+            };
+            entry.adapter.dispatchReadReceipt(receipt);
+            return;
+          }
           if (parsed?.type === 'typing') {
             const indicator: IncomingTypingIndicator = {
               senderTransportPubkey: pm.senderPubkey,
@@ -646,6 +674,14 @@ export class MultiAddressTransportMux {
               timestamp: pm.timestamp * 1000,
             };
             entry.adapter.dispatchTypingIndicator(indicator);
+            return;
+          }
+          if (parsed?.senderNametag !== undefined && parsed?.expiresIn !== undefined && !parsed?.text) {
+            entry.adapter.dispatchComposingIndicator({
+              senderPubkey: pm.senderPubkey,
+              senderNametag: parsed.senderNametag || undefined,
+              expiresIn: parsed.expiresIn ?? 30000,
+            });
             return;
           }
         } catch { /* not JSON, continue */ }
@@ -877,6 +913,43 @@ export class MultiAddressTransportMux {
     });
 
     return giftWrap.id;
+  }
+
+  /**
+   * Send a NIP-17 read receipt (kind 15) for a specific address.
+   */
+  async sendReadReceipt(addressIndex: number, recipientPubkey: string, messageEventId: string): Promise<void> {
+    const entry = this.addresses.get(addressIndex);
+    if (!entry) throw new SphereError('Address not registered in mux', 'NOT_INITIALIZED');
+    if (!this.nostrClient) throw new SphereError('Not connected', 'NOT_INITIALIZED');
+
+    const nostrRecipient = recipientPubkey.length === 66 &&
+      (recipientPubkey.startsWith('02') || recipientPubkey.startsWith('03'))
+      ? recipientPubkey.slice(2)
+      : recipientPubkey;
+
+    const event = NIP17.createReadReceipt(entry.keyManager, nostrRecipient, messageEventId);
+    const giftWrapEvent = NostrEventClass.fromJSON(event);
+    await this.nostrClient.publishEvent(giftWrapEvent);
+    logger.debug('Mux', `Sent read receipt for ${messageEventId} to ${nostrRecipient.slice(0, 16)}`);
+  }
+
+  /**
+   * Send a composing indicator (kind 25050) gift wrap for a specific address.
+   */
+  async sendComposingIndicator(addressIndex: number, recipientPubkey: string, content: string): Promise<void> {
+    const entry = this.addresses.get(addressIndex);
+    if (!entry) throw new SphereError('Address not registered in mux', 'NOT_INITIALIZED');
+    if (!this.nostrClient) throw new SphereError('Not connected', 'NOT_INITIALIZED');
+
+    const nostrRecipient = recipientPubkey.length === 66 &&
+      (recipientPubkey.startsWith('02') || recipientPubkey.startsWith('03'))
+      ? recipientPubkey.slice(2)
+      : recipientPubkey;
+
+    const giftWrap = NostrTransportProvider.createCustomKindGiftWrap(entry.keyManager, nostrRecipient, content, COMPOSING_INDICATOR_KIND);
+    const giftWrapEvent = NostrEventClass.fromJSON(giftWrap);
+    await this.nostrClient.publishEvent(giftWrapEvent);
   }
 
   /**
@@ -1142,21 +1215,22 @@ export class AddressTransportAdapter implements TransportProvider {
   }
 
   async sendReadReceipt(recipientPubkey: string, messageEventId: string): Promise<void> {
-    // Read receipts use NIP-17 gift wrap
-    const content = JSON.stringify({ type: 'read_receipt', messageEventId });
-    await this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, content);
+    // Read receipts must use NIP-17 kind 15 (not regular gift wrap kind 14)
+    await this.mux.sendReadReceipt(this.addressIndex, recipientPubkey, messageEventId);
   }
 
   async sendTypingIndicator(recipientPubkey: string): Promise<void> {
+    // Typing indicators use composing kind 25050
     const content = JSON.stringify({
       type: 'typing',
       senderNametag: this.identity.nametag,
     });
-    await this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, content);
+    await this.mux.sendComposingIndicator(this.addressIndex, recipientPubkey, content);
   }
 
   async sendComposingIndicator(recipientPubkey: string, content: string): Promise<void> {
-    await this.mux.sendGiftWrap(this.addressIndex, recipientPubkey, content);
+    // Composing indicators must use kind 25050 (not regular gift wrap kind 14)
+    await this.mux.sendComposingIndicator(this.addressIndex, recipientPubkey, content);
   }
 
   async sendInstantSplitBundle(
