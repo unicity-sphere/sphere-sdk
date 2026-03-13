@@ -38,7 +38,7 @@ const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 const NETWORK = 'testnet' as const;
 const FAUCET_TOPUP_TIMEOUT_MS = 90_000;
 const TRANSFER_TIMEOUT_MS = 90_000;
-const CHANGE_TOKEN_TIMEOUT_MS = 20_000;
+const CHANGE_TOKEN_TIMEOUT_MS = 60_000; // V5 change tokens need aggregator proof collection
 const INTER_TRANSFER_DELAY_MS = 2_000;
 const POLL_INTERVAL_MS = 1_000;
 
@@ -238,17 +238,23 @@ async function waitForReceiverBalance(
 async function waitForSenderChange(
   sender: Sphere,
   coinSymbol: string,
-  expectedTotal: bigint,
+  expectedConfirmed: bigint,
   timeoutMs: number = CHANGE_TOKEN_TIMEOUT_MS,
 ): Promise<{ balance: BalanceSnapshot; timedOut: boolean }> {
   const deadline = performance.now() + timeoutMs;
-  let bal = getBalance(sender, coinSymbol);
-  while (performance.now() < deadline && bal.total < expectedTotal) {
+  // allowMissing: after a split the coin may temporarily vanish while
+  // the change token is in 'submitted' status (not yet confirmed).
+  let bal = getBalance(sender, coinSymbol, true);
+  // Wait for CONFIRMED balance — send() only uses confirmed tokens.
+  // V5 change tokens arrive as 'submitted' first, then finalize to 'confirmed'.
+  while (performance.now() < deadline && bal.confirmed < expectedConfirmed) {
     await new Promise(r => setTimeout(r, 1_000));
+    // Trigger finalization check for pending V5 tokens
+    await sender.payments.receive({ finalize: true });
     await sender.payments.load();
-    bal = getBalance(sender, coinSymbol);
+    bal = getBalance(sender, coinSymbol, true);
   }
-  return { balance: bal, timedOut: bal.total < expectedTotal };
+  return { balance: bal, timedOut: bal.confirmed < expectedConfirmed };
 }
 
 // =============================================================================
@@ -302,7 +308,8 @@ async function runScenarioA(
   const startTime = performance.now();
 
   try {
-    // Snapshot BEFORE
+    // Snapshot BEFORE — finalize any pending V5 tokens from prior scenario
+    await sender.payments.receive({ finalize: true });
     await sender.payments.load();
     await receiver.payments.load();
     const senderBefore = getBalance(sender, coinSymbol);
@@ -380,9 +387,10 @@ async function runScenarioA(
       console.log(`  Received all in ${receiveResult.receiveTimeMs.toFixed(0)}ms`);
     }
 
-    // Snapshot AFTER
+    // Snapshot AFTER — finalize pending V5 change tokens first
+    await sender.payments.receive({ finalize: true });
     await sender.payments.load();
-    const senderAfter = getBalance(sender, coinSymbol);
+    const senderAfter = getBalance(sender, coinSymbol, true);
     const receiverAfter = receiveResult.finalBalance;
     result.senderBalanceAfter = senderAfter.total;
     result.receiverBalanceAfter = receiverAfter.total;
@@ -494,7 +502,8 @@ async function runScenarioB(
   const startTime = performance.now();
 
   try {
-    // Snapshot BEFORE
+    // Snapshot BEFORE — finalize any pending V5 tokens from prior scenario
+    await sender.payments.receive({ finalize: true });
     await sender.payments.load();
     await receiver.payments.load();
     const senderBefore = getBalance(sender, coinSymbol);
@@ -578,9 +587,10 @@ async function runScenarioB(
       console.log(`  Received all in ${receiveResult.receiveTimeMs.toFixed(0)}ms`);
     }
 
-    // Snapshot AFTER
+    // Snapshot AFTER — finalize pending V5 change tokens first
+    await sender.payments.receive({ finalize: true });
     await sender.payments.load();
-    const senderAfter = getBalance(sender, coinSymbol);
+    const senderAfter = getBalance(sender, coinSymbol, true);
     const receiverAfter = receiveResult.finalBalance;
     result.senderBalanceAfter = senderAfter.total;
     result.receiverBalanceAfter = receiverAfter.total;
