@@ -2163,6 +2163,11 @@ export class Sphere {
       // First time switching to this address — create independent modules
       logger.debug('Sphere', `switchToAddress(${index}): creating per-address modules (lazy init)`);
 
+      // CRITICAL: Update shared storage identity BEFORE loading per-address modules.
+      // IndexedDBStorageProvider.getFullKey() uses this.identity to build per-address
+      // storage keys.  Without this, modules would load the previous address's data.
+      this._storage.setIdentity(newIdentity);
+
       // Create per-address token storage providers (each address needs its own instances)
       const addressTokenProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
       for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
