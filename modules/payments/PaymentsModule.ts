@@ -31,6 +31,8 @@ import type {
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
 import { TokenSplitCalculator } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
+import { TokenReservationLedger } from './TokenReservationLedger';
+import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
 import { NametagMinter, type MintNametagResult } from './NametagMinter';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase, HistoryRecord } from '../../storage';
 import type {
@@ -713,6 +715,13 @@ export class PaymentsModule {
   /** Sync coalescing: concurrent sync() calls share the same operation */
   private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
 
+  // Token Spend Queue — concurrent send race condition prevention
+  private readonly reservationLedger = new TokenReservationLedger();
+  private readonly spendPlanner = new SpendPlanner();
+  private spendQueue: SpendQueue;
+  /** Cache of parsed SdkToken data for synchronous queue re-evaluation */
+  private readonly parsedTokenCache: Map<string, ParsedTokenEntry> = new Map();
+
   constructor(config?: PaymentsModuleConfig) {
     this.moduleConfig = {
       autoSync: config?.autoSync ?? true,
@@ -725,6 +734,14 @@ export class PaymentsModule {
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
     // Only skip if l1 is explicitly set to null.
     this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
+
+    // Initialize spend queue (requires ledger, planner, and access to this.tokens)
+    this.spendQueue = new SpendQueue(
+      this.reservationLedger,
+      this.spendPlanner,
+      () => this.tokens,
+      this.parsedTokenCache
+    );
   }
 
   /**
@@ -763,6 +780,17 @@ export class PaymentsModule {
     this.forkedTokens.clear();
     this._historyCache = [];
     this.nametags = [];
+
+    // Reset spend queue state
+    this.reservationLedger.clear();
+    this.parsedTokenCache.clear();
+    this.spendQueue.destroy();
+    this.spendQueue = new SpendQueue(
+      this.reservationLedger,
+      this.spendPlanner,
+      () => this.tokens,
+      this.parsedTokenCache
+    );
 
     this.deps = deps;
     this.priceProvider = deps.price ?? null;
@@ -825,6 +853,8 @@ export class PaymentsModule {
           const result = await provider.load();
           if (result.success && result.data) {
             this.loadFromStorageData(result.data);
+            // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
+            await this.rebuildParsedTokenCache();
             // Import history from IPFS TXF data into local store
             const txfData = result.data as TxfStorageDataBase;
             if (txfData._history && txfData._history.length > 0) {
@@ -920,6 +950,11 @@ export class PaymentsModule {
     }
     this.pendingResponseResolvers.clear();
 
+    // Clean up spend queue and reservation ledger
+    this.spendQueue.destroy();
+    this.reservationLedger.clear();
+    this.parsedTokenCache.clear();
+
     // Clean up storage event subscriptions
     this.unsubscribeStorageEvents();
 
@@ -967,17 +1002,30 @@ export class PaymentsModule {
         throw new SphereError('Trust base not available. Oracle provider must implement getTrustBase()', 'AGGREGATOR_ERROR');
       }
 
-      // Calculate optimal split plan
-      const calculator = new TokenSplitCalculator();
-      const availableTokens = Array.from(this.tokens.values());
-      const splitPlan = await calculator.calculateOptimalSplit(
-        availableTokens,
-        BigInt(request.amount),
+      // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
+      const parsedPool = await this.spendPlanner.buildParsedPool(
+        Array.from(this.tokens.values()),
         request.coinId
       );
 
+      // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
+      // planSend reads free amounts, runs split calculation, and creates a
+      // reservation atomically. No concurrent send() can interleave here.
+      const planResult = this.spendPlanner.planSend(
+        request, parsedPool, this.reservationLedger, this.spendQueue, result.id
+      );
+
+      let splitPlan;
+      if (planResult === 'queued') {
+        // Wait for change tokens to arrive and wake this entry
+        const queueResult = await this.spendQueue.waitForEntry(result.id);
+        splitPlan = queueResult.splitPlan;
+      } else {
+        splitPlan = planResult.splitPlan;
+      }
+
       if (!splitPlan) {
-        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
+        throw new SphereError('Insufficient balance', 'SEND_INSUFFICIENT_BALANCE');
       }
 
       // Collect all tokens involved
@@ -991,6 +1039,7 @@ export class PaymentsModule {
       for (const token of tokensToSend) {
         token.status = 'transferring';
         this.tokens.set(token.id, token);
+        this.parsedTokenCache.delete(token.id);
       }
       await this.save();
 
@@ -1058,6 +1107,10 @@ export class PaymentsModule {
             ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
             : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
+          // Commit reservation BEFORE removing tokens — prevents cancelForToken()
+          // from cancelling our own active reservation
+          this.reservationLedger.commit(result.id);
+
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
@@ -1065,6 +1118,11 @@ export class PaymentsModule {
             requestIdHex: splitRequestIdHex,
           });
           logger.debug('Payments', 'Conservative split transfer completed');
+        }
+
+        // Commit reservation if not already committed by split path above
+        if (!splitPlan.requiresSplit) {
+          this.reservationLedger.commit(result.id);
         }
 
         // Transfer direct tokens
@@ -1242,6 +1300,11 @@ export class PaymentsModule {
           );
         }
 
+        // Commit reservation BEFORE removing tokens — prevents cancelForToken()
+        // from cancelling our own active reservation and waking queued sends
+        // that could re-plan against already-spent tokens.
+        this.reservationLedger.commit(result.id);
+
         // 7. Track and remove tokens (removeToken archives + tombstones + saves)
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
@@ -1307,17 +1370,36 @@ export class PaymentsModule {
         tokenIds: sentTokenIds.length > 0 ? sentTokenIds : undefined,
       });
 
+      // Commit reservation (idempotent — may already be committed by mode-specific code above)
+      this.reservationLedger.commit(result.id);
+
       this.deps!.emitEvent('transfer:confirmed', result);
       return result;
     } catch (error) {
+      // Cancel reservation — free reserved amounts for other sends
+      this.reservationLedger.cancel(result.id);
+
       result.status = 'failed';
       result.error = error instanceof Error ? error.message : String(error);
 
-      // Restore tokens
+      // Restore tokens and re-add to spend queue cache
       for (const token of result.tokens) {
         token.status = 'confirmed';
         this.tokens.set(token.id, token);
+        if (token.sdkData) {
+          try {
+            const parsed = JSON.parse(token.sdkData);
+            const sdkToken = await SdkToken.fromJSON(parsed);
+            const amount = this.extractCoinAmountForCache(sdkToken, token.coinId);
+            if (amount > 0n) {
+              this.parsedTokenCache.set(token.id, { token, sdkToken, amount });
+            }
+          } catch { /* parse failure — skip */ }
+        }
       }
+
+      // Notify queue AFTER cache is rebuilt so queued entries see restored tokens
+      this.spendQueue.notifyChange(request.coinId);
 
       this.deps!.emitEvent('transfer:failed', result);
       throw error;
@@ -1352,6 +1434,42 @@ export class PaymentsModule {
     return TokenRegistry.getInstance().getIconUrl(coinId) ?? undefined;
   }
 
+  /**
+   * Extract coin amount from SDK token for the parsed token cache.
+   * Used by addToken() to populate the cache for synchronous queue re-evaluation.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private extractCoinAmountForCache(sdkToken: SdkToken<any>, coinIdHex: string): bigint {
+    try {
+      if (!sdkToken.coins) return 0n;
+      const coinId = CoinId.fromJSON(coinIdHex);
+      return sdkToken.coins.get(coinId) ?? 0n;
+    } catch {
+      return 0n;
+    }
+  }
+
+  /**
+   * Rebuild parsedTokenCache from current confirmed tokens.
+   * Called after loadFromStorageData() which bypasses addToken().
+   */
+  private async rebuildParsedTokenCache(): Promise<void> {
+    this.parsedTokenCache.clear();
+    for (const [, token] of this.tokens) {
+      if (token.status !== 'confirmed' || !token.sdkData) continue;
+      try {
+        const parsed = JSON.parse(token.sdkData);
+        const sdkToken = await SdkToken.fromJSON(parsed);
+        const amount = this.extractCoinAmountForCache(sdkToken, token.coinId);
+        if (amount > 0n) {
+          this.parsedTokenCache.set(token.id, { token, sdkToken, amount });
+        }
+      } catch {
+        // Parse failure — skip
+      }
+    }
+  }
+
   // ===========================================================================
   // Public API - Instant Split (V5 Optimized)
   // ===========================================================================
@@ -1377,6 +1495,8 @@ export class PaymentsModule {
 
     const startTime = performance.now();
 
+    let reservationId: string | undefined;
+
     try {
       // Resolve recipient once — single network query
       const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
@@ -1397,21 +1517,34 @@ export class PaymentsModule {
         throw new SphereError('Trust base not available', 'AGGREGATOR_ERROR');
       }
 
-      // Calculate optimal split plan
-      const calculator = new TokenSplitCalculator();
-      const availableTokens = Array.from(this.tokens.values());
-      const splitPlan = await calculator.calculateOptimalSplit(
-        availableTokens,
-        BigInt(request.amount),
+      // ── Spend Queue: reserve tokens (same path as send()) ──
+      reservationId = crypto.randomUUID();
+      const parsedPool = await this.spendPlanner.buildParsedPool(
+        Array.from(this.tokens.values()),
         request.coinId
       );
 
+      const planResult = this.spendPlanner.planSend(
+        request, parsedPool, this.reservationLedger, this.spendQueue, reservationId
+      );
+
+      let splitPlan;
+      if (planResult === 'queued') {
+        const queueResult = await this.spendQueue.waitForEntry(reservationId);
+        splitPlan = queueResult.splitPlan;
+      } else {
+        splitPlan = planResult.splitPlan;
+      }
+
       if (!splitPlan) {
-        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
+        throw new SphereError('Insufficient balance', 'SEND_INSUFFICIENT_BALANCE');
       }
 
       if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
-        // For direct transfers without split, fall back to standard flow
+        // For direct transfers without split, release reservation and fall back to standard flow.
+        // send() will create its own reservation.
+        this.reservationLedger.cancel(reservationId);
+        this.spendQueue.notifyChange(request.coinId);
         logger.debug('Payments', 'No split required, falling back to standard send()');
         const result = await this.send(request);
         return {
@@ -1427,6 +1560,7 @@ export class PaymentsModule {
       const tokenToSplit = splitPlan.tokenToSplit.uiToken;
       tokenToSplit.status = 'transferring';
       this.tokens.set(tokenToSplit.id, tokenToSplit);
+      this.parsedTokenCache.delete(tokenToSplit.id);
 
       // Check if dev mode
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1484,6 +1618,9 @@ export class PaymentsModule {
           this.pendingBackgroundTasks.push(result.backgroundPromise);
         }
 
+        // Commit reservation BEFORE removing token
+        this.reservationLedger.commit(reservationId);
+
         // Remove the original token
         await this.removeToken(tokenToSplit.id);
 
@@ -1506,13 +1643,34 @@ export class PaymentsModule {
 
         await this.save();
       } else {
-        // Restore token on failure
+        // Cancel reservation — free reserved amounts for other sends
+        this.reservationLedger.cancel(reservationId);
+        // Restore token on failure and re-add to cache
         tokenToSplit.status = 'confirmed';
         this.tokens.set(tokenToSplit.id, tokenToSplit);
+        if (tokenToSplit.sdkData) {
+          try {
+            const parsed = JSON.parse(tokenToSplit.sdkData);
+            const sdkToken = await SdkToken.fromJSON(parsed);
+            const amount = this.extractCoinAmountForCache(sdkToken, tokenToSplit.coinId);
+            if (amount > 0n) {
+              this.parsedTokenCache.set(tokenToSplit.id, { token: tokenToSplit, sdkToken, amount });
+            }
+          } catch { /* parse failure — skip */ }
+        }
+        this.spendQueue.notifyChange(request.coinId);
       }
 
       return result;
     } catch (error) {
+      // Cancel reservation on exception (only if one was created)
+      if (reservationId) {
+        try {
+          this.reservationLedger.cancel(reservationId);
+        } finally {
+          this.spendQueue.notifyChange(request.coinId);
+        }
+      }
       const errorMessage = error instanceof Error ? error.message : String(error);
       return {
         success: false,
@@ -3050,6 +3208,13 @@ export class PaymentsModule {
         };
         this.tokens.set(tokenId, confirmedToken);
 
+        // Spend Queue: cache newly confirmed token and wake queued entries
+        const resolvedAmount = this.extractCoinAmountForCache(finalizedToken, confirmedToken.coinId);
+        if (resolvedAmount > 0n) {
+          this.parsedTokenCache.set(tokenId, { token: confirmedToken, sdkToken: finalizedToken, amount: resolvedAmount });
+          this.spendQueue.notifyChange(confirmedToken.coinId);
+        }
+
         // History entry was already created in processInstantSplitBundle() — no duplicate here
 
         // Emit transfer:confirmed so the UI learns about the state change
@@ -3412,6 +3577,21 @@ export class PaymentsModule {
 
     await this.save();
 
+    // Spend Queue: cache parsed token and wake queued sends
+    if (token.sdkData && token.status === 'confirmed') {
+      try {
+        const parsed = JSON.parse(token.sdkData);
+        const sdkToken = await SdkToken.fromJSON(parsed);
+        const amount = this.extractCoinAmountForCache(sdkToken, token.coinId);
+        if (amount > 0n) {
+          this.parsedTokenCache.set(token.id, { token, sdkToken, amount });
+        }
+      } catch {
+        // Parse failure — token not cached; SpendQueue will skip it during re-evaluation
+      }
+      this.spendQueue.notifyChange(token.coinId);
+    }
+
     logger.debug('Payments', `Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
   }
@@ -3433,10 +3613,12 @@ export class PaymentsModule {
     let found = false;
 
     // Find by genesis tokenId first
+    let oldId: string | undefined;
     for (const [id, existing] of this.tokens) {
       const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
       if ((existingTokenId && incomingTokenId && existingTokenId === incomingTokenId) ||
           existing.id === token.id) {
+        oldId = id;
         this.tokens.delete(id);
         this.tokens.set(token.id, token);
         found = true;
@@ -3447,6 +3629,22 @@ export class PaymentsModule {
     if (!found) {
       await this.addToken(token);
       return;
+    }
+
+    // Spend Queue: remove stale cache entry for old id, update for new token
+    if (oldId) {
+      this.parsedTokenCache.delete(oldId);
+    }
+    if (token.status === 'confirmed' && token.sdkData) {
+      try {
+        const parsed = JSON.parse(token.sdkData);
+        const sdkToken = await SdkToken.fromJSON(parsed);
+        const amount = this.extractCoinAmountForCache(sdkToken, token.coinId);
+        if (amount > 0n) {
+          this.parsedTokenCache.set(token.id, { token, sdkToken, amount });
+          this.spendQueue.notifyChange(token.coinId);
+        }
+      } catch { /* parse failure — skip */ }
     }
 
     // Archive the updated token
@@ -3471,6 +3669,10 @@ export class PaymentsModule {
     const token = this.tokens.get(tokenId);
     if (!token) return;
 
+    // Spend Queue: cancel any active reservations referencing this token
+    this.reservationLedger.cancelForToken(tokenId);
+    this.parsedTokenCache.delete(tokenId);
+
     // Archive before removing
     await this.archiveToken(token);
 
@@ -3494,6 +3696,10 @@ export class PaymentsModule {
     this.tokens.delete(tokenId);
 
     await this.save();
+
+    // Spend Queue: wake queued entries (removal may reject waiting entries
+    // or free co-reserved tokens)
+    this.spendQueue.notifyChange(token.coinId);
   }
 
 
@@ -4218,6 +4424,9 @@ export class PaymentsModule {
               this.nametags = savedNametags;
             }
 
+            // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
+            await this.rebuildParsedTokenCache();
+
             // Import merged history from IPFS sync into local store
             const txfData = result.merged as TxfStorageDataBase;
             if (txfData._history && txfData._history.length > 0) {
@@ -4415,6 +4624,7 @@ export class PaymentsModule {
         valid.push(token);
       } else {
         token.status = 'invalid';
+        this.parsedTokenCache.delete(token.id);
         invalid.push(token);
       }
     }
@@ -4797,6 +5007,13 @@ export class PaymentsModule {
       };
       this.tokens.set(tokenId, finalizedToken);
       await this.save();
+
+      // Spend Queue: cache newly confirmed token and wake queued entries
+      const nostrAmount = this.extractCoinAmountForCache(finalizedSdkToken, finalizedToken.coinId);
+      if (nostrAmount > 0n) {
+        this.parsedTokenCache.set(tokenId, { token: finalizedToken, sdkToken: finalizedSdkToken, amount: nostrAmount });
+        this.spendQueue.notifyChange(finalizedToken.coinId);
+      }
 
       logger.debug('Payments', `NOSTR-FIRST: Token ${tokenId.slice(0, 8)}... finalized and confirmed`);
 

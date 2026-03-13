@@ -40,7 +40,13 @@ export type SphereErrorCode =
   | 'TIMEOUT'
   | 'DECRYPTION_ERROR'
   | 'MODULE_NOT_AVAILABLE'
-  | 'SIGNING_ERROR';
+  | 'SIGNING_ERROR'
+  // Token Spend Queue error codes
+  | 'SEND_QUEUE_TIMEOUT'
+  | 'SEND_INSUFFICIENT_BALANCE'
+  | 'SEND_RESERVATION_CANCELLED'
+  | 'SEND_QUEUE_FULL'
+  | 'MODULE_DESTROYED';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
