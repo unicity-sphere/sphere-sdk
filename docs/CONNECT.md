@@ -110,6 +110,80 @@ host.destroy();
 
 ---
 
+## autoConnect (recommended for browser dApps)
+
+The simplest way to connect from a browser dApp. Auto-detects the best transport and handles the full lifecycle:
+
+```typescript
+import { autoConnect } from '@unicitylabs/sphere-sdk/connect/browser';
+
+const result = await autoConnect({
+  dapp: { name: 'My App', url: location.origin },
+  walletUrl: 'https://sphere.unicity.network',
+  silent: true, // auto-reconnect without UI if already approved
+});
+
+// Use the client
+const balance = await result.client.query('sphere_getBalance');
+await result.client.intent('send', { recipient: '@alice', amount: '1000000', coinId: 'UCT' });
+result.client.on('transfer:incoming', (data) => console.log(data));
+
+// Disconnect
+await result.disconnect();
+```
+
+### Transport priority
+
+`autoConnect` selects the best transport automatically:
+
+| Priority | Mode | Detection | Transport |
+|----------|------|-----------|-----------|
+| P1 | Iframe | `isInIframe()` | `PostMessageTransport` to parent |
+| P2 | Extension | `hasExtension()` | `ExtensionTransport` via content script |
+| P3 | Popup | fallback | `PostMessageTransport` to popup window |
+
+You can force a specific transport:
+```typescript
+await autoConnect({ dapp, walletUrl, forceTransport: 'extension' });
+```
+
+### Auto-reconnect on page reload
+
+For extension mode, the wallet's background service worker is always running. A silent connect on page load reconnects instantly if the origin is already approved:
+
+```typescript
+// On mount: try silent auto-connect
+try {
+  const result = await autoConnect({ dapp, walletUrl, silent: true });
+  // Connected — origin was already approved
+} catch {
+  // Not approved — show Connect button
+}
+```
+
+### Detection utilities
+
+These are also exported from the SDK:
+```typescript
+import { isInIframe, hasExtension, detectTransport } from '@unicitylabs/sphere-sdk/connect/browser';
+import type { DetectedTransport } from '@unicitylabs/sphere-sdk/connect/browser';
+
+detectTransport(); // → 'iframe' | 'extension' | 'popup'
+```
+
+### AutoConnectResult
+
+```typescript
+interface AutoConnectResult {
+  client: ConnectClient;              // Use for queries, intents, events
+  connection: ConnectResult;          // Session info, identity, permissions
+  transport: 'iframe' | 'extension' | 'popup';
+  disconnect: () => Promise<void>;    // Clean up everything
+}
+```
+
+---
+
 ## Setting up ConnectClient (dApp side)
 
 ```typescript
