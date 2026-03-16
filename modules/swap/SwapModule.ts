@@ -960,7 +960,7 @@ export class SwapModule {
       deps.emitEvent('swap:rejected', { swapId, reason });
 
       // Step 7: Emit swap:cancelled with reason='rejected'
-      deps.emitEvent('swap:cancelled', { swapId, reason: 'explicit', depositsReturned: false });
+      deps.emitEvent('swap:cancelled', { swapId, reason: 'rejected', depositsReturned: false });
 
       // Step 8: Clear proposal timer
       this.clearLocalTimer(swapId);
@@ -1527,9 +1527,6 @@ export class SwapModule {
               senderNametag: dm.senderNametag,
             });
 
-            // Start proposal timer
-            this.startProposalTimer(manifest.swap_id);
-
             if (this.config.debug) {
               logger.debug(LOG_TAG, `Received proposal ${manifest.swap_id} from ${dm.senderPubkey}`);
             }
@@ -1566,16 +1563,17 @@ export class SwapModule {
                 role: swap.role,
               });
 
-              // Announce to escrow — failure transitions to 'failed' (matches acceptor-side pattern)
-              resolveEscrowAddress(swap.deal, this.config, deps.resolve)
-                .then(({ escrowPubkey }) => {
-                  return sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
-                })
-                .catch(async (err) => {
-                  logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
-                  await this.transitionProgress(swap, 'failed', { error: 'Failed to announce to escrow' });
-                  deps.emitEvent('swap:failed', { swapId, error: 'Failed to announce to escrow' });
-                });
+              // Resolve escrow and announce (await inside gate — escrowPubkey must be set)
+              try {
+                const { escrowPubkey } = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
+                swap.escrowPubkey = escrowPubkey;
+                await this.persistSwap(swap);
+                await sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
+              } catch (err) {
+                logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
+                await this.transitionProgress(swap, 'failed', { error: 'Failed to announce to escrow' });
+                deps.emitEvent('swap:failed', { swapId, error: 'Failed to announce to escrow' });
+              }
             });
             break;
           }
@@ -1587,10 +1585,10 @@ export class SwapModule {
             const rejectMsg = parsed.payload;
             const swapId = rejectMsg.swap_id;
 
-            // Look up swap — must exist, not terminal
+            // Look up swap — must exist, in 'proposed' state, proposer only
             const swap = this.swaps.get(swapId);
             if (!swap) return;
-            if (isTerminalProgress(swap.progress)) return;
+            if (swap.progress !== 'proposed' || swap.role !== 'proposer') return;
 
             // Verify sender is counterparty
             if (dm.senderPubkey !== swap.counterpartyPubkey) return;
@@ -1998,6 +1996,7 @@ export class SwapModule {
                 if (!errorSwapId) return;
                 const swap = this.swaps.get(errorSwapId);
                 if (!swap) return;
+                if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
 
                 const deps = this.deps!;
 
