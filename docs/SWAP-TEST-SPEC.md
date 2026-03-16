@@ -50,8 +50,8 @@ The escrow service (server-side) uses its own `SwapOrchestrator` with states: `A
 
 - **Methods tested:** All 8 public methods (`proposeSwap`, `acceptSwap`, `rejectSwap`, `deposit`, `getSwapStatus`, `getSwaps`, `verifyPayout`, `cancelSwap`)
 - **Error codes:** All 15 error codes (SWAP_NOT_FOUND through SWAP_ESCROW_REJECTED)
-- **State machine:** All local progress transitions (proposed -> accepted -> announced -> depositing -> deposited -> concluding -> completed / cancelled / failed)
-- **DM protocol:** All 9 message types (swap_proposal, swap_acceptance, swap_rejection, announce_result, invoice_delivery, payment_confirmation, swap_cancelled, bounce_notification, swap_status_query)
+- **State machine:** All local progress transitions (proposed -> accepted -> announced -> depositing -> awaiting_counter -> concluding -> completed / cancelled / failed)
+- **DM protocol:** All 9 message types (swap_proposal, swap_acceptance, swap_rejection, announce_result, invoice_delivery, payment_confirmation, swap_cancelled, bounce_notification, status)
 - **Events:** All 12 event types (swap:proposed through swap:failed)
 - **Storage:** Persisted swap records, dirty-write on destroy, terminal purge
 - **Manifest:** JCS canonicalization, deterministic swap_id, field validation
@@ -167,15 +167,15 @@ Each mock implements the full interface of its target to avoid partial stub issu
 
 #### Sample DM Payloads
 
-- **swap_proposal:** `{ type: 'swap_proposal', version: 1, swap_id, deal: SwapDeal }`
+- **swap_proposal:** `{ type: 'swap_proposal', version: 1, manifest: SwapManifest, escrow: string, message? }`
 - **swap_acceptance:** `{ type: 'swap_acceptance', version: 1, swap_id }`
 - **swap_rejection:** `{ type: 'swap_rejection', version: 1, swap_id, reason? }`
-- **announce_result:** `{ type: 'announce_result', swap_id, deposit_invoice_id, state, created_at }`
-- **invoice_delivery:** `{ type: 'invoice_delivery', swap_id, invoice_type: 'deposit'|'payout', token: TxfToken }`
+- **announce_result:** `{ type: 'announce_result', swap_id, deposit_invoice_id, state, created_at, is_new }`
+- **invoice_delivery:** `{ type: 'invoice_delivery', swap_id, invoice_type: 'deposit'|'payout', invoice_id, invoice_token: TxfToken, payment_instructions? }`
 - **payment_confirmation:** `{ type: 'payment_confirmation', swap_id, currency, amount, payout_invoice_id }`
-- **swap_cancelled:** `{ type: 'swap_cancelled', swap_id, reason: 'timeout'|'manual' }`
-- **bounce_notification:** `{ type: 'bounce_notification', swap_id, reason: 'WRONG_CURRENCY'|'ALREADY_COVERED', transfer_id }`
-- **swap_status_query:** `{ type: 'swap_status_query', swap_id }`
+- **swap_cancelled:** `{ type: 'swap_cancelled', swap_id, reason: 'timeout', deposits_returned }`
+- **bounce_notification:** `{ type: 'bounce_notification', swap_id, reason: 'WRONG_CURRENCY'|'ALREADY_COVERED', returned_amount, returned_currency }`
+- **status:** `{ type: 'status', swap_id }`
 
 ### 2.3 Helper Utilities
 
@@ -206,8 +206,12 @@ Returns a minimal valid `SwapDeal` with sensible defaults.
 ```typescript
 function createTestSwapDeal(overrides?: Partial<SwapDeal>): SwapDeal {
   return {
-    partyA: { address: 'DIRECT://aaa...', coinId: 'UCT', amount: '1000000' },
-    partyB: { address: 'DIRECT://bbb...', coinId: 'USDU', amount: '500000' },
+    partyA: 'DIRECT://aaa...',
+    partyB: 'DIRECT://bbb...',
+    partyACurrency: 'UCT',
+    partyAAmount: '1000000',
+    partyBCurrency: 'USDU',
+    partyBAmount: '500000',
     escrowAddress: 'DIRECT://eee...',
     timeout: 300,
     ...overrides,
@@ -223,12 +227,12 @@ Builds a `SwapManifest` from a deal (or default deal), computing `swap_id` deter
 function createTestManifest(deal?: SwapDeal): SwapManifest {
   const d = deal ?? createTestSwapDeal();
   const fields = {
-    party_a_address: d.partyA.address,
-    party_b_address: d.partyB.address,
-    party_a_currency_to_change: d.partyA.coinId,
-    party_a_value_to_change: d.partyA.amount,
-    party_b_currency_to_change: d.partyB.coinId,
-    party_b_value_to_change: d.partyB.amount,
+    party_a_address: d.partyA,
+    party_b_address: d.partyB,
+    party_a_currency_to_change: d.partyACurrency,
+    party_a_value_to_change: d.partyAAmount,
+    party_b_currency_to_change: d.partyBCurrency,
+    party_b_value_to_change: d.partyBAmount,
     timeout: d.timeout,
   };
   const swap_id = computeSwapId(fields);
@@ -289,6 +293,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 - **Preconditions:** None
 - **Action:** `createSwapModule({ maxPendingSwaps: 5 })`
 - **Expected:** Module created; `maxPendingSwaps` is 5; default `announceTimeoutMs` is 30000; default `terminalPurgeTtlMs` is 7 days
+- **Note:** `announceTimeoutMs` and `terminalPurgeTtlMs` are not yet in SWAP-SPEC's SwapModuleConfig (section 18). They should be added to the spec as optional config fields.
 - **Assertions:** Config values accessible via internal state inspection
 
 #### UT-SWAP-LIFE-002: initialize() stores deps reference
@@ -354,12 +359,12 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 - **Expected:** Each throws SphereError with code SWAP_NOT_INITIALIZED
 - **Assertions:** All public methods reject with SWAP_NOT_INITIALIZED
 
-#### UT-SWAP-LIFE-011: operations after destroy throw MODULE_DESTROYED
+#### UT-SWAP-LIFE-011: operations after destroy throw SWAP_MODULE_DESTROYED
 
 - **Preconditions:** Module loaded then destroyed
 - **Action:** Call `proposeSwap()`, `acceptSwap()`, `deposit()`, `getSwapStatus()`, `getSwaps()`, `verifyPayout()`, `cancelSwap()`, `rejectSwap()`
-- **Expected:** Each throws SphereError with code MODULE_DESTROYED
-- **Assertions:** All public methods reject with MODULE_DESTROYED
+- **Expected:** Each throws SphereError with code SWAP_MODULE_DESTROYED
+- **Assertions:** All public methods reject with SWAP_MODULE_DESTROYED
 
 ---
 
@@ -384,7 +389,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 #### UT-SWAP-PROP-003: resolves @nametag addresses via transport.resolve()
 
 - **Preconditions:** Module loaded; transport mock resolves '@alice' -> DIRECT://aaa, '@bob' -> DIRECT://bbb
-- **Action:** `proposeSwap({ partyA: { address: '@alice', ... }, partyB: { address: '@bob', ... }, ... })`
+- **Action:** `proposeSwap({ partyA: '@alice', partyB: '@bob', ... })`
 - **Expected:** Transport `resolve()` called twice; manifest contains DIRECT:// addresses
 - **Assertions:** `mocks.transport.resolve` called with '@alice' and '@bob'
 
@@ -412,42 +417,42 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 #### UT-SWAP-PROP-007: rejects empty partyA address (SWAP_INVALID_DEAL)
 
 - **Preconditions:** Module loaded
-- **Action:** `proposeSwap({ partyA: { address: '', ... }, ... })`
+- **Action:** `proposeSwap({ partyA: '', ... })`
 - **Expected:** Throws SphereError with code SWAP_INVALID_DEAL
 - **Assertions:** Error code is SWAP_INVALID_DEAL; message mentions address
 
 #### UT-SWAP-PROP-008: rejects empty partyB address
 
 - **Preconditions:** Module loaded
-- **Action:** `proposeSwap({ ..., partyB: { address: '', ... } })`
+- **Action:** `proposeSwap({ ..., partyB: '' })`
 - **Expected:** Throws SphereError with code SWAP_INVALID_DEAL
 - **Assertions:** Error code is SWAP_INVALID_DEAL
 
 #### UT-SWAP-PROP-009: rejects same partyA and partyB address
 
 - **Preconditions:** Module loaded
-- **Action:** `proposeSwap({ partyA: { address: 'DIRECT://same', ... }, partyB: { address: 'DIRECT://same', ... }, ... })`
+- **Action:** `proposeSwap({ partyA: 'DIRECT://same', partyB: 'DIRECT://same', ... })`
 - **Expected:** Throws SphereError with code SWAP_INVALID_DEAL
 - **Assertions:** Error code is SWAP_INVALID_DEAL; message mentions self-swap
 
 #### UT-SWAP-PROP-010: rejects non-positive amount (partyA)
 
 - **Preconditions:** Module loaded
-- **Action:** `proposeSwap({ partyA: { ..., amount: '-100' }, ... })`
+- **Action:** `proposeSwap({ ..., partyAAmount: '-100' })`
 - **Expected:** Throws SphereError with code SWAP_INVALID_DEAL
 - **Assertions:** Error code is SWAP_INVALID_DEAL; message mentions amount
 
 #### UT-SWAP-PROP-011: rejects zero amount (partyB)
 
 - **Preconditions:** Module loaded
-- **Action:** `proposeSwap({ ..., partyB: { ..., amount: '0' } })`
+- **Action:** `proposeSwap({ ..., partyBAmount: '0' })`
 - **Expected:** Throws SphereError with code SWAP_INVALID_DEAL
 - **Assertions:** Error code is SWAP_INVALID_DEAL
 
 #### UT-SWAP-PROP-012: rejects same currency for both parties
 
 - **Preconditions:** Module loaded
-- **Action:** `proposeSwap({ partyA: { ..., coinId: 'UCT' }, partyB: { ..., coinId: 'UCT' } })`
+- **Action:** `proposeSwap({ ..., partyACurrency: 'UCT', partyBCurrency: 'UCT' })`
 - **Expected:** Throws SphereError with code SWAP_INVALID_DEAL
 - **Assertions:** Error code is SWAP_INVALID_DEAL; message mentions same currency
 
@@ -476,13 +481,13 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 - **Preconditions:** Module loaded with config `{ maxPendingSwaps: 2 }`; 2 active swaps already in state
 - **Action:** `proposeSwap(newDeal)`
-- **Expected:** Throws SphereError with code SWAP_MAX_PENDING
-- **Assertions:** Error code is SWAP_MAX_PENDING
+- **Expected:** Throws SphereError with code SWAP_LIMIT_EXCEEDED
+- **Assertions:** Error code is SWAP_LIMIT_EXCEEDED
 
 #### UT-SWAP-PROP-017: address resolution failure throws SWAP_RESOLVE_FAILED
 
 - **Preconditions:** Module loaded; transport.resolve('@bob') returns null
-- **Action:** `proposeSwap({ ..., partyB: { address: '@bob', ... } })`
+- **Action:** `proposeSwap({ ..., partyB: '@bob' })`
 - **Expected:** Throws SphereError with code SWAP_RESOLVE_FAILED
 - **Assertions:** Error code is SWAP_RESOLVE_FAILED; message mentions unresolvable address
 
@@ -555,12 +560,12 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 - **Expected:** Throws SphereError with code SWAP_WRONG_STATE
 - **Assertions:** Error code is SWAP_WRONG_STATE; message mentions current state
 
-#### UT-SWAP-ACCEPT-008: acceptSwap on proposer's own swap throws SWAP_WRONG_ROLE
+#### UT-SWAP-ACCEPT-008: acceptSwap on proposer's own swap throws SWAP_WRONG_STATE
 
 - **Preconditions:** Module loaded; swap with role='proposer'
 - **Action:** `acceptSwap(swapId)`
-- **Expected:** Throws SphereError with code SWAP_WRONG_ROLE
-- **Assertions:** Error code is SWAP_WRONG_ROLE; message indicates only acceptor can accept
+- **Expected:** Throws SphereError with code SWAP_WRONG_STATE
+- **Assertions:** Error code is SWAP_WRONG_STATE; message contains "you are the proposer, not the acceptor"
 
 #### UT-SWAP-ACCEPT-009: escrow rejection in announce_result throws SWAP_ESCROW_REJECTED
 
@@ -635,8 +640,8 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 - **Preconditions:** Module loaded; swap announced
 - **Action:** `deposit(swapId)`
-- **Expected:** SwapRef progress becomes 'depositing' immediately upon call; becomes 'deposited' after payInvoice resolves
-- **Assertions:** Progress is 'depositing' during execution; 'deposited' after completion
+- **Expected:** SwapRef progress becomes 'depositing' immediately upon call; becomes 'awaiting_counter' after payInvoice resolves
+- **Assertions:** Progress is 'depositing' during execution; 'awaiting_counter' after completion
 
 #### UT-SWAP-DEP-004: deposit emits swap:deposit_sent with TransferResult
 
@@ -688,9 +693,9 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 #### UT-SWAP-STATUS-002: getSwapStatus optionally queries escrow via DM
 
-- **Preconditions:** Module loaded with swap in 'deposited' state
+- **Preconditions:** Module loaded with swap in 'awaiting_counter' state
 - **Action:** `getSwapStatus(swapId, { queryEscrow: true })`
-- **Expected:** Sends `swap_status_query` DM to escrow; waits for response; merges escrow state into local
+- **Expected:** Sends `status` DM to escrow; waits for response; merges escrow state into local
 - **Assertions:** `communications.sendDM()` called with escrow address
 
 #### UT-SWAP-STATUS-003: getSwapStatus merges escrow response into local state
@@ -709,7 +714,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 #### UT-SWAP-STATUS-005: getSwaps returns all tracked swaps
 
-- **Preconditions:** Module loaded with 3 swaps (1 proposed, 1 deposited, 1 completed)
+- **Preconditions:** Module loaded with 3 swaps (1 proposed, 1 awaiting_counter, 1 completed)
 - **Action:** `getSwaps()`
 - **Expected:** Returns array of 3 SwapRef objects
 - **Assertions:** Array length is 3
@@ -745,8 +750,8 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 - **Preconditions:** Module loaded; swap in 'concluding' state with payoutInvoiceId; accounting.getInvoiceStatus returns COVERED
 - **Action:** `verifyPayout(swapId)`
-- **Expected:** Returns `{ verified: true }`; accounting.getInvoiceStatus called with payoutInvoiceId
-- **Assertions:** `mocks.accounting.getInvoiceStatus` called; result.verified is true
+- **Expected:** Returns `true`; accounting.getInvoiceStatus called with payoutInvoiceId
+- **Assertions:** `mocks.accounting.getInvoiceStatus` called; result is `true`
 
 #### UT-SWAP-VERIFY-002: verifyPayout checks correct counter-currency
 
@@ -760,7 +765,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 - **Preconditions:** Party A expects 500000 USDU in payout
 - **Action:** `verifyPayout(swapId)` -- inspects payout invoice amounts
 - **Expected:** Verification confirms payout amount matches expected counter-party value
-- **Assertions:** Payout amount matches `deal.partyB.amount` (what party A receives)
+- **Assertions:** Payout amount matches `deal.partyBAmount` (what party A receives)
 
 #### UT-SWAP-VERIFY-004: verifyPayout transitions to 'completed' on success
 
@@ -780,26 +785,26 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 - **Preconditions:** Module loaded; accounting.getInvoiceStatus returns OPEN
 - **Action:** `verifyPayout(swapId)`
-- **Expected:** Returns `{ verified: false, reason: 'not_covered' }`; progress unchanged
-- **Assertions:** result.verified is false; progress still 'concluding'
+- **Expected:** Returns `false`; progress unchanged
+- **Assertions:** result is `false`; progress still 'concluding'
 
 #### UT-SWAP-VERIFY-007: verifyPayout returns false if wrong currency in payout
 
 - **Preconditions:** Module loaded; payout invoice covered but with wrong coinId
 - **Action:** `verifyPayout(swapId)`
-- **Expected:** Returns `{ verified: false, reason: 'wrong_currency' }`
-- **Assertions:** result.verified is false
+- **Expected:** Returns `false`; swap transitions to 'failed' with SWAP_PAYOUT_VERIFICATION_FAILED
+- **Assertions:** result is `false`; progress is 'failed'
 
 #### UT-SWAP-VERIFY-008: verifyPayout returns false if wrong amount in payout
 
 - **Preconditions:** Module loaded; payout invoice covered but with insufficient amount
 - **Action:** `verifyPayout(swapId)`
-- **Expected:** Returns `{ verified: false, reason: 'wrong_amount' }`
-- **Assertions:** result.verified is false
+- **Expected:** Returns `false`; swap transitions to 'failed' with SWAP_PAYOUT_VERIFICATION_FAILED
+- **Assertions:** result is `false`; progress is 'failed'
 
 #### UT-SWAP-VERIFY-009: verifyPayout with no payoutInvoiceId throws SWAP_WRONG_STATE
 
-- **Preconditions:** Module loaded; swap in 'deposited' state (no payout invoice yet)
+- **Preconditions:** Module loaded; swap in 'awaiting_counter' state (no payout invoice yet)
 - **Action:** `verifyPayout(swapId)`
 - **Expected:** Throws SphereError with code SWAP_WRONG_STATE
 - **Assertions:** Error code is SWAP_WRONG_STATE
@@ -821,7 +826,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 - **Preconditions:** Module loaded; swap in cancellable state
 - **Action:** `cancelSwap(swapId)`
-- **Expected:** `emitEvent` called with `'swap:cancelled'` and `{ swapId, reason: 'manual' }`
+- **Expected:** `emitEvent` called with `'swap:cancelled'` and `{ swapId, reason: 'explicit' }`
 - **Assertions:** Event emitted with correct payload
 
 #### UT-SWAP-CANCEL-003: cancelSwap on already-completed throws SWAP_ALREADY_COMPLETED
@@ -840,14 +845,14 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 #### UT-SWAP-CANCEL-005: escrow swap_cancelled DM updates local state
 
-- **Preconditions:** Module loaded; swap in 'deposited' state
+- **Preconditions:** Module loaded; swap in 'awaiting_counter' state
 - **Action:** Inject `swap_cancelled` DM from escrow via mock communications
 - **Expected:** SwapRef progress becomes 'cancelled'; reason stored
 - **Assertions:** `getSwapStatus(swapId).progress` equals 'cancelled'
 
 #### UT-SWAP-CANCEL-006: escrow cancellation triggers swap:cancelled event
 
-- **Preconditions:** Module loaded; swap in 'deposited' state
+- **Preconditions:** Module loaded; swap in 'awaiting_counter' state
 - **Action:** Inject `swap_cancelled` DM from escrow
 - **Expected:** `emitEvent` called with `'swap:cancelled'` and `{ swapId, reason: 'timeout' }`
 - **Assertions:** Event emitted with escrow-provided reason
@@ -886,12 +891,12 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 - **Expected:** Module sends announcement DM to escrow address; progress transitions to 'announced' after escrow reply
 - **Assertions:** `communications.sendDM()` called with escrow address
 
-#### UT-SWAP-DM-004: swap_rejection DM marks swap as failed
+#### UT-SWAP-DM-004: swap_rejection DM marks swap as cancelled
 
 - **Preconditions:** Module loaded; swap in 'proposed' state with role='proposer'
 - **Action:** Inject `swap_rejection` DM from counterparty
-- **Expected:** SwapRef progress becomes 'failed'; reason stored; `swap:rejected` event emitted
-- **Assertions:** Progress is 'failed'; event emitted
+- **Expected:** SwapRef progress becomes 'cancelled'; reason stored; `swap:rejected` and `swap:cancelled` events emitted
+- **Assertions:** Progress is 'cancelled'; both events emitted
 
 #### UT-SWAP-DM-005: announce_result DM stores deposit_invoice_id
 
@@ -904,12 +909,13 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 - **Preconditions:** Module loaded; announce_result already received
 - **Action:** Inject `invoice_delivery` DM containing deposit invoice token
-- **Expected:** `accounting.importInvoice()` called with the TxfToken from DM
+- **Expected:** `accounting.importInvoice()` called with the parsed TxfToken from DM
 - **Assertions:** `mocks.accounting.importInvoice` called once
+- **Note:** `msg.invoice_token` is a JSON string that must be parsed (`JSON.parse(msg.invoice_token)`) before passing to `importInvoice()`
 
 #### UT-SWAP-DM-007: payment_confirmation DM updates progress to 'concluding'
 
-- **Preconditions:** Module loaded; swap in 'deposited' state
+- **Preconditions:** Module loaded; swap in 'awaiting_counter' state
 - **Action:** Inject `payment_confirmation` DM from escrow
 - **Expected:** SwapRef progress becomes 'concluding'; payout invoice info stored
 - **Assertions:** Progress is 'concluding'; `payoutInvoiceId` set
@@ -923,7 +929,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 #### UT-SWAP-DM-009: bounce_notification DM logs warning
 
-- **Preconditions:** Module loaded; swap in 'deposited' state
+- **Preconditions:** Module loaded; swap in 'awaiting_counter' state
 - **Action:** Inject `bounce_notification` DM from escrow with `reason: 'WRONG_CURRENCY'`
 - **Expected:** Warning event emitted; swap state not changed (bounce is informational for the sender)
 - **Assertions:** `emitEvent` called with `'swap:bounce_received'`
@@ -964,7 +970,7 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 
 #### UT-SWAP-INV-002: invoice:covered on deposit invoice emits swap:deposits_covered
 
-- **Preconditions:** Module loaded; swap in 'deposited' state; deposit invoice becomes COVERED
+- **Preconditions:** Module loaded; swap in 'awaiting_counter' state; deposit invoice becomes COVERED
 - **Action:** Trigger `invoice:covered` event via mock accounting
 - **Expected:** `emitEvent` called with `'swap:deposits_covered'` and `{ swapId }`
 - **Assertions:** Event emitted
@@ -1139,16 +1145,17 @@ Mocks `Date.now()` to return a value advanced by `ms` milliseconds.
 |---------|------|----|---------|
 | UT-SWAP-SM-001 | proposed | accepted | acceptSwap() |
 | UT-SWAP-SM-002 | proposed | cancelled | cancelSwap() |
-| UT-SWAP-SM-003 | proposed | failed | swap_rejection DM |
+| UT-SWAP-SM-003 | proposed | cancelled | swap_rejection DM |
 | UT-SWAP-SM-004 | accepted | announced | announce_result DM |
 | UT-SWAP-SM-005 | accepted | failed | escrow rejection |
 | UT-SWAP-SM-006 | accepted | cancelled | cancelSwap() |
 | UT-SWAP-SM-007 | announced | depositing | deposit() called |
 | UT-SWAP-SM-008 | announced | cancelled | cancelSwap() |
-| UT-SWAP-SM-009 | depositing | deposited | payInvoice resolves |
+| UT-SWAP-SM-009 | depositing | awaiting_counter | payInvoice resolves |
 | UT-SWAP-SM-010 | depositing | failed | payInvoice rejects |
-| UT-SWAP-SM-011 | deposited | concluding | payment_confirmation DM |
-| UT-SWAP-SM-012 | deposited | cancelled | swap_cancelled DM |
+| UT-SWAP-SM-010a | depositing | cancelled | swap_cancelled DM received while deposit in flight |
+| UT-SWAP-SM-011 | awaiting_counter | concluding | payment_confirmation DM |
+| UT-SWAP-SM-012 | awaiting_counter | cancelled | swap_cancelled DM |
 | UT-SWAP-SM-013 | concluding | completed | verifyPayout() success |
 | UT-SWAP-SM-014 | concluding | cancelled | swap_cancelled DM |
 | UT-SWAP-SM-015 | concluding | failed | verification failure |
@@ -1167,7 +1174,7 @@ Each test:
 | UT-SWAP-SM-017 | proposed | concluding | SWAP_WRONG_STATE |
 | UT-SWAP-SM-018 | announced | completed | SWAP_WRONG_STATE |
 | UT-SWAP-SM-019 | depositing | announced | SWAP_WRONG_STATE |
-| UT-SWAP-SM-020 | deposited | proposed | SWAP_WRONG_STATE |
+| UT-SWAP-SM-020 | awaiting_counter | proposed | SWAP_WRONG_STATE |
 | UT-SWAP-SM-021 | completed | cancelled | SWAP_ALREADY_COMPLETED |
 | UT-SWAP-SM-022 | completed | depositing | SWAP_ALREADY_COMPLETED |
 | UT-SWAP-SM-023 | cancelled | proposed | SWAP_ALREADY_CANCELLED |
@@ -1198,8 +1205,8 @@ Each test:
 |-------------|---------------|
 | ANNOUNCED | announced |
 | DEPOSIT_INVOICE_CREATED | announced |
-| PARTIAL_DEPOSIT | deposited |
-| DEPOSIT_COVERED | deposited |
+| PARTIAL_DEPOSIT | awaiting_counter |
+| DEPOSIT_COVERED | awaiting_counter |
 | CONCLUDING | concluding |
 | COMPLETED | completed |
 | TIMED_OUT | cancelled |
@@ -1220,33 +1227,33 @@ Each test:
 
 | Test ID | Input | Expected |
 |---------|-------|----------|
-| UT-SWAP-VAL-001 | `partyA.address = 'DIRECT://valid'` | Accepted |
-| UT-SWAP-VAL-002 | `partyA.address = '@alice'` | Accepted (resolved) |
-| UT-SWAP-VAL-003 | `partyA.address = '02' + 'a'.repeat(64)` | Accepted (chain pubkey) |
-| UT-SWAP-VAL-004 | `partyA.address = 'alpha1testaddr'` | Accepted (L1 address) |
-| UT-SWAP-VAL-005 | `partyA.address = ''` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-006 | `partyA.address = null` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-001 | `partyA = 'DIRECT://valid'` | Accepted |
+| UT-SWAP-VAL-002 | `partyA = '@alice'` | Accepted (resolved) |
+| UT-SWAP-VAL-003 | `partyA = '02' + 'a'.repeat(64)` | Accepted (chain pubkey) |
+| UT-SWAP-VAL-004 | `partyA = 'alpha1testaddr'` | Accepted (L1 address) |
+| UT-SWAP-VAL-005 | `partyA = ''` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-006 | `partyA = null` | Rejected: SWAP_INVALID_DEAL |
 
 #### Amount Format Validation
 
 | Test ID | Input | Expected |
 |---------|-------|----------|
-| UT-SWAP-VAL-007 | `partyA.amount = '1000000'` | Accepted |
-| UT-SWAP-VAL-008 | `partyA.amount = '1'` | Accepted (minimum) |
-| UT-SWAP-VAL-009 | `partyA.amount = '0'` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-010 | `partyA.amount = '-100'` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-011 | `partyA.amount = '10.5'` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-012 | `partyA.amount = ''` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-013 | `partyA.amount = 'abc'` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-007 | `partyAAmount = '1000000'` | Accepted |
+| UT-SWAP-VAL-008 | `partyAAmount = '1'` | Accepted (minimum) |
+| UT-SWAP-VAL-009 | `partyAAmount = '0'` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-010 | `partyAAmount = '-100'` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-011 | `partyAAmount = '10.5'` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-012 | `partyAAmount = ''` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-013 | `partyAAmount = 'abc'` | Rejected: SWAP_INVALID_DEAL |
 
 #### Currency Format Validation
 
 | Test ID | Input | Expected |
 |---------|-------|----------|
-| UT-SWAP-VAL-014 | `partyA.coinId = 'UCT'` | Accepted |
-| UT-SWAP-VAL-015 | `partyA.coinId = 'USDU'` | Accepted |
-| UT-SWAP-VAL-016 | `partyA.coinId = ''` | Rejected: SWAP_INVALID_DEAL |
-| UT-SWAP-VAL-017 | `partyA.coinId = 'UC-T'` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-014 | `partyACurrency = 'UCT'` | Accepted |
+| UT-SWAP-VAL-015 | `partyACurrency = 'USDU'` | Accepted |
+| UT-SWAP-VAL-016 | `partyACurrency = ''` | Rejected: SWAP_INVALID_DEAL |
+| UT-SWAP-VAL-017 | `partyACurrency = 'UC-T'` | Rejected: SWAP_INVALID_DEAL |
 
 #### Timeout Range Validation
 
@@ -1271,9 +1278,9 @@ Each test:
 | Test ID | Error Code | Trigger | Expected Message Contains |
 |---------|-----------|---------|--------------------------|
 | UT-SWAP-ERR-001 | SWAP_NOT_FOUND | `getSwapStatus('nonexistent')` | "swap not found" |
-| UT-SWAP-ERR-002 | SWAP_INVALID_DEAL | `proposeSwap({ partyA: { address: '' } })` | "invalid deal" |
+| UT-SWAP-ERR-002 | SWAP_INVALID_DEAL | `proposeSwap({ partyA: '' })` | "invalid deal" |
 | UT-SWAP-ERR-003 | SWAP_WRONG_STATE | `deposit()` on 'proposed' swap | "wrong state" |
-| UT-SWAP-ERR-004 | SWAP_WRONG_ROLE | `acceptSwap()` on proposer's swap | "wrong role" |
+| UT-SWAP-ERR-004 | SWAP_WRONG_STATE | `acceptSwap()` on proposer's swap | "you are the proposer" |
 | UT-SWAP-ERR-005 | SWAP_RESOLVE_FAILED | nametag resolution returns null | "resolve failed" |
 | UT-SWAP-ERR-006 | SWAP_DM_SEND_FAILED | `sendDM()` rejects | "DM send failed" |
 | UT-SWAP-ERR-007 | SWAP_DEPOSIT_FAILED | `payInvoice()` rejects | "deposit failed" |
@@ -1281,9 +1288,9 @@ Each test:
 | UT-SWAP-ERR-009 | SWAP_ESCROW_TIMEOUT | no announce_result within timeout | "escrow timeout" |
 | UT-SWAP-ERR-010 | SWAP_ALREADY_COMPLETED | `cancelSwap()` on completed swap | "already completed" |
 | UT-SWAP-ERR-011 | SWAP_ALREADY_CANCELLED | `cancelSwap()` on cancelled swap | "already cancelled" |
-| UT-SWAP-ERR-012 | SWAP_MAX_PENDING | exceed maxPendingSwaps | "max pending" |
+| UT-SWAP-ERR-012 | SWAP_LIMIT_EXCEEDED | exceed maxPendingSwaps | "max pending" |
 | UT-SWAP-ERR-013 | SWAP_NOT_INITIALIZED | operation before initialize | "not initialized" |
-| UT-SWAP-ERR-014 | MODULE_DESTROYED | operation after destroy | "destroyed" |
+| UT-SWAP-ERR-014 | SWAP_MODULE_DESTROYED | operation after destroy | "destroyed" |
 | UT-SWAP-ERR-015 | SWAP_ALREADY_INITIALIZED | double initialize | "already initialized" |
 
 Each test:
@@ -1335,8 +1342,8 @@ The `MockDMRelay` routes DMs between party A, party B, and the escrow simulator 
   2. Party B receives proposal
   3. Party B calls `rejectSwap(swapId, { reason: 'Bad rate' })`
   4. Party A receives rejection DM
-- **Expected:** Party A's swap transitions to 'failed'; Party B's swap removed; both emit appropriate events
-- **Assertions:** Party A swap is 'failed'; party B has no swap
+- **Expected:** Party A's swap transitions to 'cancelled'; Party B's swap removed; both emit appropriate events
+- **Assertions:** Party A swap is 'cancelled'; party B has no swap
 
 ### INT-SWAP-003: Timeout cancellation flow
 
@@ -1441,6 +1448,8 @@ Alternative terminal paths:
   swap:bounce_received (informational, any state)
 ```
 
+> **Note:** `swap:deposit_returned` and `swap:bounce_received` are not yet in SWAP-SPEC's SwapEventMap (section 2.7). They should be added to the spec as additional event types.
+
 ### 6.2 DM Protocol Versioning
 
 All DM payloads include a `version` field. Tests should verify:
@@ -1450,7 +1459,7 @@ All DM payloads include a `version` field. Tests should verify:
 
 ### 6.3 Storage Key Convention
 
-Swap records use the key pattern: `{addressId}_swap_{swapId}` where `addressId` is derived from the wallet's current DIRECT:// address.
+Swap records use a single storage key: `swap_records_{addressId}` where `addressId` is derived from the wallet's current DIRECT:// address (e.g., `DIRECT_abc123_xyz789`). All swap records are stored as a JSON blob (`SwapStorageData`) under this key, matching the spec's single-key approach (SWAP-SPEC section 14).
 
 ### 6.4 Escrow Address Validation
 
@@ -1482,13 +1491,13 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 | SwapModule.concurrency.test.ts | UT-SWAP-CONC-001 to 004 | 4 |
 | SwapModule.storage.test.ts | UT-SWAP-STORE-001 to 005 | 5 |
 | SwapModule.manifest.test.ts | UT-SWAP-MAN-001 to 007 | 7 |
-| SwapModule.stateMachine.test.ts | UT-SWAP-SM-001 to 027 | 27 |
+| SwapModule.stateMachine.test.ts | UT-SWAP-SM-001 to 027 + SM-010a | 28 |
 | SwapModule.validation.test.ts | UT-SWAP-VAL-001 to 020 | 20 |
 | SwapModule.errors.test.ts | UT-SWAP-ERR-001 to 015 | 15 |
-| **Unit Total** | | **173** |
+| **Unit Total** | | **174** |
 | swap-lifecycle.test.ts (integration) | INT-SWAP-001 to 006 | 6 |
 | test-e2e-swap.ts (E2E) | E2E-SWAP-001 to 002 | 2 |
-| **Grand Total** | | **181** |
+| **Grand Total** | | **182** |
 
 ### Method Coverage Matrix
 
@@ -1511,8 +1520,7 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 |-----------|----------|
 | SWAP_NOT_FOUND | ERR-001, STATUS-004, ACCEPT-006 |
 | SWAP_INVALID_DEAL | ERR-002, PROP-007..015, VAL-005..017, VAL-020 |
-| SWAP_WRONG_STATE | ERR-003, DEP-005, DEP-007, ACCEPT-007, REJECT-004, VERIFY-009, SM-016..025 |
-| SWAP_WRONG_ROLE | ERR-004, ACCEPT-008 |
+| SWAP_WRONG_STATE | ERR-003, ERR-004, DEP-005, DEP-007, ACCEPT-007, ACCEPT-008, REJECT-004, VERIFY-009, SM-016..025 |
 | SWAP_RESOLVE_FAILED | ERR-005, PROP-017 |
 | SWAP_DM_SEND_FAILED | ERR-006, PROP-018 |
 | SWAP_DEPOSIT_FAILED | ERR-007, DEP-006 |
@@ -1520,9 +1528,9 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 | SWAP_ESCROW_TIMEOUT | ERR-009, ACCEPT-010 |
 | SWAP_ALREADY_COMPLETED | ERR-010, CANCEL-003, SM-021..022 |
 | SWAP_ALREADY_CANCELLED | ERR-011, CANCEL-004, SM-023..024 |
-| SWAP_MAX_PENDING | ERR-012, PROP-016 |
+| SWAP_LIMIT_EXCEEDED | ERR-012, PROP-016 |
 | SWAP_NOT_INITIALIZED | ERR-013, LIFE-010 |
-| MODULE_DESTROYED | ERR-014, LIFE-011 |
+| SWAP_MODULE_DESTROYED | ERR-014, LIFE-011 |
 | SWAP_ALREADY_INITIALIZED | ERR-015, LIFE-009 |
 
 ---
@@ -1533,7 +1541,7 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 
 | Type | Direction | Payload Fields |
 |------|-----------|---------------|
-| `swap_proposal` | Proposer -> Acceptor | `version`, `swap_id`, `deal: SwapDeal` |
+| `swap_proposal` | Proposer -> Acceptor | `version`, `manifest: SwapManifest`, `escrow: string`, `message?` |
 | `swap_acceptance` | Acceptor -> Proposer | `version`, `swap_id` |
 | `swap_rejection` | Acceptor -> Proposer | `version`, `swap_id`, `reason?` |
 
@@ -1541,25 +1549,25 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 
 | Type | Direction | Payload Fields |
 |------|-----------|---------------|
-| `swap_announce` | Client -> Escrow | `version`, `manifest: SwapManifest` |
-| `swap_status_query` | Client -> Escrow | `version`, `swap_id` |
+| `announce` | Client -> Escrow | `manifest: SwapManifest` |
+| `status` | Client -> Escrow | `swap_id` |
 
 ### C.3 Escrow-to-Client Messages
 
 | Type | Direction | Payload Fields |
 |------|-----------|---------------|
-| `announce_result` | Escrow -> Client | `swap_id`, `deposit_invoice_id`, `state`, `created_at`, `error?` |
-| `invoice_delivery` | Escrow -> Client | `swap_id`, `invoice_type: 'deposit'\|'payout'`, `token: TxfToken` |
-| `payment_confirmation` | Escrow -> Both | `swap_id`, `currency`, `amount`, `payout_invoice_id` |
-| `swap_cancelled` | Escrow -> Both | `swap_id`, `reason: 'timeout'\|'manual'` |
-| `bounce_notification` | Escrow -> Sender | `swap_id`, `reason: 'WRONG_CURRENCY'\|'ALREADY_COVERED'`, `transfer_id` |
+| `announce_result` | Escrow -> Client | `swap_id`, `deposit_invoice_id`, `state`, `created_at`, `is_new`, `error?` |
+| `invoice_delivery` | Escrow -> Client | `swap_id`, `invoice_type: 'deposit'\|'payout'`, `invoice_id`, `invoice_token: TxfToken`, `payment_instructions?` |
+| `payment_confirmation` | Escrow -> Both | `swap_id`, `payout_invoice_id`, `currency`, `amount`, `status` |
+| `swap_cancelled` | Escrow -> Both | `swap_id`, `reason: 'timeout'`, `deposits_returned` |
+| `bounce_notification` | Escrow -> Sender | `swap_id`, `reason: 'WRONG_CURRENCY'\|'ALREADY_COVERED'`, `returned_amount`, `returned_currency` |
 
 ### C.4 DM Content Format
 
 All swap DMs use a structured JSON payload prefixed with the message type:
 
 ```
-swap_proposal:{"version":1,"swap_id":"abc...","deal":{...}}
+swap_proposal:{"version":1,"manifest":{...},"escrow":"DIRECT://eee..."}
 ```
 
 The DM handler splits on the first `:` to extract the type prefix, then JSON-parses the remainder. This matches the pattern used by AccountingModule for `invoice_receipt:` and `invoice_cancellation:` DMs.

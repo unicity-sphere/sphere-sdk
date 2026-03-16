@@ -394,7 +394,9 @@ type SwapEventType =
   | 'swap:payout_received'
   | 'swap:completed'
   | 'swap:cancelled'
-  | 'swap:failed';
+  | 'swap:failed'
+  | 'swap:deposit_returned'
+  | 'swap:bounce_received';
 
 // Event payloads — these extend SphereEventMap:
 
@@ -534,6 +536,32 @@ interface SwapEventMap {
     /** Human-readable error description */
     readonly error: string;
   };
+
+  /**
+   * A deposit was returned after swap cancellation (via invoice auto-return).
+   * The wallet received tokens back from the escrow.
+   */
+  'swap:deposit_returned': {
+    readonly swapId: string;
+    /** The invoice transfer reference for the return */
+    readonly transfer: InvoiceTransferRef;
+    /** Return reason from the invoice system */
+    readonly returnReason: 'closed' | 'cancelled';
+  };
+
+  /**
+   * A bounce notification was received from the escrow (wrong currency deposit).
+   * Informational — the tokens were already returned.
+   */
+  'swap:bounce_received': {
+    readonly swapId: string;
+    /** Reason for the bounce */
+    readonly reason: string;
+    /** Amount returned */
+    readonly returnedAmount: string;
+    /** Currency returned */
+    readonly returnedCurrency: string;
+  };
 }
 ```
 
@@ -577,6 +605,19 @@ interface SwapModuleConfig {
    * are rejected with SWAP_LIMIT_EXCEEDED.
    */
   maxPendingSwaps?: number;
+  /**
+   * Time to wait for the escrow's announce_result DM after announcing (ms).
+   * After this timeout, the announce is considered failed.
+   * Default: 30000 (30 seconds).
+   */
+  announceTimeoutMs?: number;
+  /**
+   * TTL for terminal swap records before they are purged from storage (ms).
+   * Completed, cancelled, and failed swaps older than this TTL are removed
+   * during load() to prevent unbounded storage growth.
+   * Default: 604800000 (7 days).
+   */
+  terminalPurgeTtlMs?: number;
 }
 
 /**
@@ -745,8 +786,8 @@ async proposeSwap(deal: SwapDeal): Promise<SwapProposalResult>
    const manifest: SwapManifest = { swap_id: swapId, ...manifestFields };
    ```
 
-8. **Check for duplicate.**
-   - If `this.swaps.has(swapId)`, throw `SWAP_ALREADY_EXISTS` with message `'Swap with this ID already exists'`.
+8. **Check for duplicate (idempotent).**
+   - If `this.swaps.has(swapId)`, return the existing `SwapProposalResult` without sending a duplicate DM or creating a new record. This makes `proposeSwap()` safe to retry.
 
 9. **Create SwapRef.**
    ```typescript
@@ -1734,11 +1775,12 @@ All errors use `SphereError` with the following codes. All codes must be added t
 | `SWAP_ESCROW_REJECTED` | Escrow rejected manifest: {error} | Escrow responded with `error` message to announce |
 | `SWAP_DEPOSIT_FAILED` | Deposit payment failed: {details} | `accounting.payInvoice()` threw during deposit |
 | `SWAP_PAYOUT_VERIFICATION_FAILED` | Payout verification failed: {details} | Payout invoice terms do not match manifest expectations |
-| `SWAP_ALREADY_EXISTS` | Swap with this ID already exists | Duplicate `proposeSwap()` or duplicate incoming proposal |
+| `SWAP_ALREADY_EXISTS` | Swap with this ID already exists | Duplicate incoming proposal (proposeSwap is idempotent — returns existing) |
 | `SWAP_ALREADY_COMPLETED` | Swap is already completed | `cancelSwap()` on a completed swap |
 | `SWAP_ALREADY_CANCELLED` | Swap is already cancelled | `cancelSwap()` on a cancelled/failed swap |
 | `SWAP_TIMEOUT` | Swap timed out | Local or escrow timeout fired |
 | `SWAP_LIMIT_EXCEEDED` | Maximum pending swaps ({limit}) exceeded | `proposeSwap()` or incoming proposal when at capacity |
+| `SWAP_ALREADY_INITIALIZED` | SwapModule is already initialized | `initialize()` called twice without `destroy()` |
 | `SWAP_MODULE_DESTROYED` | SwapModule is destroyed | Any public method called after `destroy()` |
 | `SWAP_NOT_INITIALIZED` | SwapModule is not initialized | Any public method called before `load()` completes |
 
