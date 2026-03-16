@@ -24,7 +24,8 @@
 17. [Validation Rules](#17-validation-rules)
 18. [Configuration](#18-configuration)
 19. [Error Codes](#19-error-codes)
-20. [Future: Predicate-Based Direct Swaps](#20-future-predicate-based-direct-swaps)
+20. [CLI Commands](#20-cli-commands)
+21. [Future: Predicate-Based Direct Swaps](#21-future-predicate-based-direct-swaps)
 
 ---
 
@@ -1788,17 +1789,427 @@ All errors use `SphereError` with the following codes. All codes must be added t
 
 ---
 
-## 20. Future: Predicate-Based Direct Swaps
+## 20. CLI Commands
 
-### 20.1 Vision
+This section specifies the CLI commands for the swap module. Each command follows the same patterns established by the accounting CLI commands (`invoice-create`, `invoice-list`, `invoice-pay`, etc.): arguments parsed via `args.indexOf('--flag')`, error messages with usage strings, `getSphere()` to obtain the wallet instance, module availability checks, JSON output for structured data, and `closeSphere()` at exit.
+
+### 20.1 `swap-propose`
+
+**Usage:**
+
+```
+swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
+             --want-coin <coinId> --want-amount <amount>
+             [--escrow <address>] [--timeout <seconds>] [--message <text>]
+```
+
+**Step-by-step specification:**
+
+1. Parse all `--flag` arguments using `args.indexOf()`:
+   ```typescript
+   const toIdx = args.indexOf('--to');
+   const offerCoinIdx = args.indexOf('--offer-coin');
+   const offerAmountIdx = args.indexOf('--offer-amount');
+   const wantCoinIdx = args.indexOf('--want-coin');
+   const wantAmountIdx = args.indexOf('--want-amount');
+   const escrowIdx = args.indexOf('--escrow');
+   const timeoutIdx = args.indexOf('--timeout');
+   const messageIdx = args.indexOf('--message');
+   ```
+
+2. Validate required flags. If any of `--to`, `--offer-coin`, `--offer-amount`, `--want-coin`, or `--want-amount` is missing or lacks a following argument, print usage and `process.exit(1)`:
+   ```typescript
+   if (toIdx === -1 || !args[toIdx + 1] ||
+       offerCoinIdx === -1 || !args[offerCoinIdx + 1] ||
+       offerAmountIdx === -1 || !args[offerAmountIdx + 1] ||
+       wantCoinIdx === -1 || !args[wantCoinIdx + 1] ||
+       wantAmountIdx === -1 || !args[wantAmountIdx + 1]) {
+     console.error('Usage: swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount> [--escrow <address>] [--timeout <seconds>] [--message <text>]');
+     process.exit(1);
+   }
+   ```
+
+3. Validate `--offer-amount` and `--want-amount` are positive integers (regex: `/^[1-9][0-9]*$/`). If either fails:
+   ```typescript
+   console.error(`Invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+   process.exit(1);
+   ```
+
+4. Validate `--timeout` if provided. Must be an integer in [60, 86400]. Default: `3600`.
+   ```typescript
+   let timeout = 3600;
+   if (timeoutIdx !== -1 && args[timeoutIdx + 1]) {
+     timeout = parseInt(args[timeoutIdx + 1], 10);
+     if (isNaN(timeout) || timeout < 60 || timeout > 86400) {
+       console.error('--timeout must be an integer between 60 and 86400 seconds');
+       process.exit(1);
+     }
+   }
+   ```
+
+5. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled. Initialize with swap support.');
+     process.exit(1);
+   }
+   ```
+
+6. Determine local wallet role. The local wallet is the proposer (partyA); the `--to` recipient is the acceptor (partyB).
+
+7. Build `SwapDeal`:
+   ```typescript
+   const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
+   const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
+
+   const deal: SwapDeal = {
+     partyA: sphere.identity!.directAddress!,
+     partyB: args[toIdx + 1],
+     partyACurrency: args[offerCoinIdx + 1],
+     partyAAmount: args[offerAmountIdx + 1],
+     partyBCurrency: args[wantCoinIdx + 1],
+     partyBAmount: args[wantAmountIdx + 1],
+     timeout: timeout,
+     escrowAddress: escrow,
+   };
+   ```
+
+8. Call `sphere.swap.proposeSwap(deal, { message })`.
+
+9. Print result as structured JSON:
+   ```typescript
+   console.log('Swap proposed:');
+   console.log(JSON.stringify({
+     swap_id: result.swapId,
+     counterparty: args[toIdx + 1],
+     offer: `${args[offerAmountIdx + 1]} ${args[offerCoinIdx + 1]}`,
+     want: `${args[wantAmountIdx + 1]} ${args[wantCoinIdx + 1]}`,
+     escrow: deal.escrowAddress ?? '(config default)',
+     timeout: timeout,
+     status: result.progress,
+   }, null, 2));
+   ```
+
+10. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| Missing required flag | Print usage string | 1 |
+| Invalid amount | `Invalid amount "{value}" — must be a positive integer in smallest units (no decimals, no leading zeros)` | 1 |
+| Invalid timeout | `--timeout must be an integer between 60 and 86400 seconds` | 1 |
+| `sphere.swap` is null | `Swap module not enabled. Initialize with swap support.` | 1 |
+| `SWAP_RESOLVE_FAILED` | `Cannot resolve address: {address}` | 1 |
+| `SWAP_DM_SEND_FAILED` | `Failed to send proposal to counterparty` | 1 |
+
+### 20.2 `swap-list`
+
+**Usage:**
+
+```
+swap-list [--all] [--role <proposer|acceptor>] [--progress <state>]
+```
+
+**Step-by-step specification:**
+
+1. Parse optional flags:
+   ```typescript
+   const allFlag = args.includes('--all');
+   const roleIdx = args.indexOf('--role');
+   const progressIdx = args.indexOf('--progress');
+   ```
+
+2. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled.');
+     process.exit(1);
+   }
+   ```
+
+3. Build filter from flags:
+   ```typescript
+   const filter: GetSwapsFilter = {};
+   if (roleIdx !== -1 && args[roleIdx + 1]) {
+     const role = args[roleIdx + 1];
+     if (role !== 'proposer' && role !== 'acceptor') {
+       console.error('--role must be "proposer" or "acceptor"');
+       process.exit(1);
+     }
+     filter.role = role;
+   }
+   if (progressIdx !== -1 && args[progressIdx + 1]) {
+     filter.progress = args[progressIdx + 1] as SwapProgress;
+   }
+   ```
+
+4. Default filter: exclude terminal states (`completed`, `cancelled`, `failed`) unless `--all` is set:
+   ```typescript
+   if (!allFlag && !filter.progress) {
+     filter.excludeTerminal = true;
+   }
+   ```
+
+5. Call `sphere.swap.getSwaps(filter)`.
+
+6. If no swaps match, print `"No swaps found."` and exit.
+
+7. Print table with columns: SWAP ID (first 8 characters), ROLE, PROGRESS, OFFER, WANT, COUNTERPARTY, CREATED.
+   ```
+   SWAP ID   ROLE       PROGRESS          OFFER          WANT           COUNTERPARTY   CREATED
+   a1b2c3d4  proposer   awaiting_counter  1000000 UCT    500000 USDU    @bob           2 min ago
+   e5f6g7h8  acceptor   proposed          500000 USDU    1000000 UCT    @alice         5 min ago
+   ```
+
+   Implementation notes:
+   - Truncate `swap_id` to the first 8 characters (the full ID is shown in `swap-status`).
+   - Show relative timestamps for the CREATED column (e.g., `"2 min ago"`, `"1 hour ago"`, `"3 days ago"`). Compute from `swap.createdAt` relative to `Date.now()`.
+   - Use `console.log()` with fixed-width column formatting via `String.padEnd()`.
+   - Color progress states if the terminal supports it: green for `completed`, red for `failed` / `cancelled`, yellow for in-progress states. Check `process.stdout.isTTY` before applying ANSI codes.
+
+8. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| `sphere.swap` is null | `Swap module not enabled.` | 1 |
+| Invalid `--role` value | `--role must be "proposer" or "acceptor"` | 1 |
+
+### 20.3 `swap-accept`
+
+**Usage:**
+
+```
+swap-accept <swap_id> [--deposit] [--no-wait]
+```
+
+**Step-by-step specification:**
+
+1. Parse `<swap_id>` as the first positional argument after the command name:
+   ```typescript
+   const swapId = args[1];
+   if (!swapId) {
+     console.error('Usage: swap-accept <swap_id> [--deposit] [--no-wait]');
+     process.exit(1);
+   }
+   ```
+
+2. Validate `swap_id` is 64 hexadecimal characters:
+   ```typescript
+   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+     console.error('Invalid swap ID — must be 64 hex characters');
+     process.exit(1);
+   }
+   ```
+
+3. Parse optional flags:
+   ```typescript
+   const depositFlag = args.includes('--deposit');
+   const noWaitFlag = args.includes('--no-wait');
+   ```
+
+4. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled.');
+     process.exit(1);
+   }
+   ```
+
+5. Call `sphere.swap.acceptSwap(swapId)`. This sends the acceptance DM, announces to the escrow, and imports the deposit invoice.
+
+6. Print: `"Swap accepted. Announced to escrow. Deposit invoice imported."`
+
+7. If `--deposit` is set:
+   a. Call `sphere.swap.deposit(swapId)` to pay into the deposit invoice.
+   b. Print: `"Deposit sent: {transferId}"`
+   c. Unless `--no-wait` is set, subscribe to swap events and print live progress:
+      ```
+      [swap] Deposit sent: transfer_abc123
+      [swap] Awaiting counterparty deposit...
+      [swap] Both deposits received. Escrow concluding...
+      [swap] Payout received. Verifying...
+      [swap] Swap completed! Received 500000 USDU
+      ```
+      Wait for `swap:completed`, `swap:cancelled`, or `swap:failed` event, with a timeout of `2 * swap.deal.timeout` seconds. Print the final status on resolution.
+   d. If `--no-wait` is set, print status and exit immediately after deposit.
+
+8. If `--deposit` is not set, print: `"Run 'swap-deposit {swap_id}' to deposit when ready."`
+
+9. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| Missing `swap_id` | Print usage string | 1 |
+| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
+| `sphere.swap` is null | `Swap module not enabled.` | 1 |
+| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
+| `SWAP_WRONG_STATE` | `Cannot accept: swap is in {progress} state` | 1 |
+| `SWAP_DEPOSIT_FAILED` | `Deposit failed: {details}` | 1 |
+| Wait timeout exceeded | `Swap did not complete within timeout. Current progress: {progress}` | 1 |
+
+### 20.4 `swap-status`
+
+**Usage:**
+
+```
+swap-status <swap_id> [--query-escrow]
+```
+
+**Step-by-step specification:**
+
+1. Parse `<swap_id>` as the first positional argument:
+   ```typescript
+   const swapId = args[1];
+   if (!swapId) {
+     console.error('Usage: swap-status <swap_id> [--query-escrow]');
+     process.exit(1);
+   }
+   ```
+
+2. Validate `swap_id` is 64 hexadecimal characters:
+   ```typescript
+   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+     console.error('Invalid swap ID — must be 64 hex characters');
+     process.exit(1);
+   }
+   ```
+
+3. Parse optional flags:
+   ```typescript
+   const queryEscrow = args.includes('--query-escrow');
+   ```
+
+4. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled.');
+     process.exit(1);
+   }
+   ```
+
+5. Call `sphere.swap.getSwapStatus(swapId)`. If `--query-escrow` is set, the method queries the escrow service for the latest deposit and payout status before returning.
+
+6. Print the full `SwapRef` as structured JSON, including all fields:
+   ```typescript
+   console.log('Swap Status:');
+   console.log(JSON.stringify(status, null, 2));
+   ```
+
+   The output includes: `swapId`, `deal` (full `SwapDeal`), `role`, `progress`, `manifestId`, `depositInvoiceId`, `depositTransferId`, `payoutVerified`, `counterpartyDeposited`, `createdAt`, `updatedAt`, and any error details.
+
+7. If a deposit invoice ID is present, also fetch and print the invoice status:
+   ```typescript
+   if (status.depositInvoiceId && sphere.accounting) {
+     const invoiceStatus = await sphere.accounting.getInvoiceStatus(status.depositInvoiceId);
+     console.log('\nDeposit Invoice Status:');
+     console.log(JSON.stringify(invoiceStatus, null, 2));
+   }
+   ```
+
+8. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| Missing `swap_id` | Print usage string | 1 |
+| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
+| `sphere.swap` is null | `Swap module not enabled.` | 1 |
+| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
+| Escrow query failure | `Failed to query escrow: {details}` (non-fatal, print warning and continue with local data) | 0 |
+
+### 20.5 `swap-deposit`
+
+**Usage:**
+
+```
+swap-deposit <swap_id>
+```
+
+Manual deposit command for when `swap-accept` was called without `--deposit`.
+
+**Step-by-step specification:**
+
+1. Parse `<swap_id>` as the first positional argument:
+   ```typescript
+   const swapId = args[1];
+   if (!swapId) {
+     console.error('Usage: swap-deposit <swap_id>');
+     process.exit(1);
+   }
+   ```
+
+2. Validate `swap_id` is 64 hexadecimal characters:
+   ```typescript
+   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+     console.error('Invalid swap ID — must be 64 hex characters');
+     process.exit(1);
+   }
+   ```
+
+3. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled.');
+     process.exit(1);
+   }
+   ```
+
+4. Call `sphere.swap.deposit(swapId)`. This pays the local party's share into the deposit invoice managed by the escrow.
+
+5. Print the result:
+   ```typescript
+   console.log('Deposit result:');
+   console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+   ```
+
+6. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| Missing `swap_id` | Print usage string | 1 |
+| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
+| `sphere.swap` is null | `Swap module not enabled.` | 1 |
+| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
+| `SWAP_WRONG_STATE` | `Cannot deposit: swap is in {progress} state (expected "accepted" or "announced")` | 1 |
+| `SWAP_DEPOSIT_FAILED` | `Deposit failed: {details}` | 1 |
+| Insufficient balance | `Insufficient balance for deposit: need {amount} {coinId}, have {available}` | 1 |
+
+### 20.6 CLI Command Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `swap-propose` | Propose a swap deal to a counterparty |
+| `swap-list` | List swap deals (default: open + in-progress only) |
+| `swap-accept <id>` | Accept a proposed swap deal |
+| `swap-status <id>` | Show detailed swap status |
+| `swap-deposit <id>` | Deposit into an announced swap |
+
+---
+
+## 21. Future: Predicate-Based Direct Swaps
+
+### 21.1 Vision
 
 The current escrow-based design requires a trusted intermediary to hold deposits. A future version will use HTLC-like predicates to enable trustless atomic swaps directly between parties, without an escrow.
 
-### 20.2 API Stability
+### 21.2 API Stability
 
 The public API (`proposeSwap`, `acceptSwap`, `deposit`, `verifyPayout`, `cancelSwap`) is designed to remain stable across both execution mechanisms. The key abstraction is that `deposit()` sends tokens to "the swap" and `verifyPayout()` confirms receipt of counter-currency. Whether "the swap" is an escrow's invoice or a conditional predicate is an internal implementation detail.
 
-### 20.3 Predicate Approach (Sketch)
+### 21.3 Predicate Approach (Sketch)
 
 Instead of depositing to an escrow invoice, each party would:
 
@@ -1811,7 +2222,7 @@ Instead of depositing to an escrow invoice, each party would:
 
 This requires upstream support in `@unicitylabs/state-transition-sdk` for conditional predicates. The `SwapManifest` and `SwapDeal` types would remain unchanged; only the internal deposit and payout logic would change.
 
-### 20.4 Migration Path
+### 21.4 Migration Path
 
 When predicate-based swaps are available:
 - A new config option (`executionMode: 'escrow' | 'direct'`) would select the mechanism.

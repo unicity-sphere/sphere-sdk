@@ -1301,6 +1301,240 @@ Each test:
 
 ---
 
+### 3.16 CLI Commands
+
+**File:** `tests/unit/modules/SwapModule.cli.test.ts`
+
+Test the CLI commands `swap-propose`, `swap-list`, `swap-accept`, `swap-status`, and `swap-deposit` by verifying they correctly parse arguments, call the appropriate SwapModule methods, and produce the expected output.
+
+**Test helpers:**
+- Mock `getSphere()` to return a Sphere instance with a mocked SwapModule
+- Capture stdout via `vi.spyOn(console, 'log')`
+- Capture stderr via `vi.spyOn(console, 'error')`
+- Mock `process.exit` to prevent test runner from exiting
+
+#### swap-propose
+
+#### UT-SWAP-CLI-001: Valid proposal with all required flags calls proposeSwap with correct SwapDeal
+
+- **Preconditions:** Mocked SwapModule; `getSphere()` returns sphere with swap module
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Expected:** `swapModule.proposeSwap()` called once with deal containing `partyB: '@bob'`, `partyACurrency: 'UCT'`, `partyAAmount: '1000000'`, `partyBCurrency: 'USDU'`, `partyBAmount: '500000'`
+- **Assertions:** `proposeSwap` called with matching SwapDeal fields
+
+#### UT-SWAP-CLI-002: Missing --to flag prints usage and exits 1
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Expected:** `console.error` called with usage message; `process.exit(1)` called
+- **Assertions:** stderr contains usage info; exit code is 1
+
+#### UT-SWAP-CLI-003: Missing --offer-coin prints usage and exits 1
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --to @bob --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Expected:** `console.error` called with usage message; `process.exit(1)` called
+- **Assertions:** stderr contains usage info; exit code is 1
+
+#### UT-SWAP-CLI-004: Invalid --offer-amount (not positive integer) prints error and exits 1
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount -50 --want-coin USDU --want-amount 500000`
+- **Expected:** `console.error` called with message mentioning invalid amount; `process.exit(1)` called
+- **Assertions:** stderr contains "amount"; exit code is 1
+
+#### UT-SWAP-CLI-005: --timeout out of range [60, 86400] prints error and exits 1
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --timeout 30`
+- **Expected:** `console.error` called with message mentioning timeout range; `process.exit(1)` called
+- **Assertions:** stderr contains "timeout"; exit code is 1
+
+#### UT-SWAP-CLI-006: Default timeout is 3600 when not specified
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Expected:** `swapModule.proposeSwap()` called with deal where `timeout === 3600`
+- **Assertions:** Deal passed to proposeSwap has timeout 3600
+
+#### UT-SWAP-CLI-007: --escrow flag overrides default escrow
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --escrow DIRECT://custom_escrow`
+- **Expected:** `swapModule.proposeSwap()` called with deal where `escrowAddress === 'DIRECT://custom_escrow'`
+- **Assertions:** Deal passed to proposeSwap has custom escrow address
+
+#### UT-SWAP-CLI-008: --message flag passed as deal message
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --message "Trade offer"`
+- **Expected:** `swapModule.proposeSwap()` called with deal where `message === 'Trade offer'`
+- **Assertions:** Deal passed to proposeSwap includes message field
+
+#### UT-SWAP-CLI-009: SWAP_RESOLVE_FAILED error prints user-friendly message
+
+- **Preconditions:** Mocked SwapModule; `proposeSwap()` rejects with SphereError code SWAP_RESOLVE_FAILED
+- **Action:** Run `swap-propose --to @unknown --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Expected:** `console.error` called with user-friendly message (not raw stack trace); `process.exit(1)` called
+- **Assertions:** stderr contains "could not resolve" or similar human-readable text; exit code is 1
+
+#### UT-SWAP-CLI-010: Output includes swap_id, counterparty, offer, want summary
+
+- **Preconditions:** Mocked SwapModule; `proposeSwap()` resolves with `{ swapId: 'abc...', ... }`
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Expected:** `console.log` output includes swap_id, counterparty identifier, offer summary (coin + amount), want summary (coin + amount)
+- **Assertions:** stdout contains the swap_id, "@bob", "UCT", "1000000", "USDU", "500000"
+
+#### swap-list
+
+#### UT-SWAP-CLI-011: Default (no flags) excludes terminal states
+
+- **Preconditions:** Mocked SwapModule; `getSwaps()` returns 3 swaps (1 proposed, 1 completed, 1 cancelled)
+- **Action:** Run `swap-list`
+- **Expected:** Output contains only the proposed swap; terminal (completed, cancelled) swaps excluded by default
+- **Assertions:** stdout shows 1 row; completed and cancelled swaps not displayed
+
+#### UT-SWAP-CLI-012: --all flag includes terminal states
+
+- **Preconditions:** Mocked SwapModule; `getSwaps()` returns 3 swaps (1 proposed, 1 completed, 1 cancelled)
+- **Action:** Run `swap-list --all`
+- **Expected:** Output contains all 3 swaps including terminal states
+- **Assertions:** stdout shows 3 rows
+
+#### UT-SWAP-CLI-013: --role proposer filters by role
+
+- **Preconditions:** Mocked SwapModule; `getSwaps()` returns 2 swaps (1 proposer, 1 acceptor)
+- **Action:** Run `swap-list --role proposer`
+- **Expected:** `getSwaps()` called with `{ role: 'proposer' }` filter; output contains only proposer swap
+- **Assertions:** stdout shows 1 row with role='proposer'
+
+#### UT-SWAP-CLI-014: --progress depositing filters by progress
+
+- **Preconditions:** Mocked SwapModule; `getSwaps()` returns 3 swaps with mixed progress values
+- **Action:** Run `swap-list --progress depositing`
+- **Expected:** `getSwaps()` called with `{ progress: 'depositing' }` filter; output contains only matching swaps
+- **Assertions:** All displayed rows have progress='depositing'
+
+#### UT-SWAP-CLI-015: No matching swaps prints "No swaps found."
+
+- **Preconditions:** Mocked SwapModule; `getSwaps()` returns `[]`
+- **Action:** Run `swap-list`
+- **Expected:** `console.log` called with "No swaps found."
+- **Assertions:** stdout contains "No swaps found."
+
+#### UT-SWAP-CLI-016: Output table has correct columns (swap_id, role, progress, offer, want, counterparty, created)
+
+- **Preconditions:** Mocked SwapModule; `getSwaps()` returns 1 swap with known fields
+- **Action:** Run `swap-list --all`
+- **Expected:** Output formatted as table with columns: swap_id (truncated), role, progress, offer (coin + amount), want (coin + amount), counterparty (truncated), created (formatted timestamp)
+- **Assertions:** stdout contains all column headers; row data matches swap fields
+
+#### swap-accept
+
+#### UT-SWAP-CLI-017: Valid swap_id calls acceptSwap
+
+- **Preconditions:** Mocked SwapModule; `acceptSwap()` resolves successfully
+- **Action:** Run `swap-accept aabbccdd...` (64-hex swap_id)
+- **Expected:** `swapModule.acceptSwap()` called with the provided swap_id
+- **Assertions:** `acceptSwap` called once with correct swap_id
+
+#### UT-SWAP-CLI-018: Missing swap_id prints usage and exits 1
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-accept` (no arguments)
+- **Expected:** `console.error` called with usage message; `process.exit(1)` called
+- **Assertions:** stderr contains usage info; exit code is 1
+
+#### UT-SWAP-CLI-019: Invalid swap_id (not 64 hex) prints error and exits 1
+
+- **Preconditions:** Mocked SwapModule
+- **Action:** Run `swap-accept not-a-valid-hex-id`
+- **Expected:** `console.error` called with message mentioning invalid swap_id format; `process.exit(1)` called
+- **Assertions:** stderr contains "swap_id"; exit code is 1
+
+#### UT-SWAP-CLI-020: --deposit flag also calls deposit() after accept
+
+- **Preconditions:** Mocked SwapModule; `acceptSwap()` and `deposit()` both resolve successfully
+- **Action:** Run `swap-accept aabbccdd... --deposit` (64-hex swap_id)
+- **Expected:** `swapModule.acceptSwap()` called first, then `swapModule.deposit()` called with same swap_id
+- **Assertions:** Both `acceptSwap` and `deposit` called in order with correct swap_id
+
+#### UT-SWAP-CLI-021: Without --deposit prints instruction to run swap-deposit
+
+- **Preconditions:** Mocked SwapModule; `acceptSwap()` resolves successfully
+- **Action:** Run `swap-accept aabbccdd...` (64-hex swap_id, no --deposit flag)
+- **Expected:** `console.log` output includes instruction text mentioning `swap-deposit` command
+- **Assertions:** stdout contains "swap-deposit"
+
+#### UT-SWAP-CLI-022: SWAP_NOT_FOUND error prints user-friendly message
+
+- **Preconditions:** Mocked SwapModule; `acceptSwap()` rejects with SphereError code SWAP_NOT_FOUND
+- **Action:** Run `swap-accept aabbccdd...` (64-hex swap_id)
+- **Expected:** `console.error` called with user-friendly message; `process.exit(1)` called
+- **Assertions:** stderr contains "not found" or similar; exit code is 1
+
+#### UT-SWAP-CLI-023: SWAP_WRONG_STATE error prints current state
+
+- **Preconditions:** Mocked SwapModule; `acceptSwap()` rejects with SphereError code SWAP_WRONG_STATE and message containing "depositing"
+- **Action:** Run `swap-accept aabbccdd...` (64-hex swap_id)
+- **Expected:** `console.error` called with message including current swap state; `process.exit(1)` called
+- **Assertions:** stderr contains state information; exit code is 1
+
+#### UT-SWAP-CLI-024: --deposit with --no-wait returns immediately after deposit sent
+
+- **Preconditions:** Mocked SwapModule; `acceptSwap()` and `deposit()` both resolve successfully
+- **Action:** Run `swap-accept aabbccdd... --deposit --no-wait` (64-hex swap_id)
+- **Expected:** `deposit()` called; command exits without waiting for swap completion
+- **Assertions:** `deposit` called; process completes without polling for status
+
+#### swap-status
+
+#### UT-SWAP-CLI-025: Shows full SwapRef fields including deposit/payout invoice IDs
+
+- **Preconditions:** Mocked SwapModule; `getSwapStatus()` returns SwapStatus with all fields populated (swapId, progress, role, deal, depositInvoiceId, payoutInvoiceId, createdAt)
+- **Action:** Run `swap-status aabbccdd...` (64-hex swap_id)
+- **Expected:** `console.log` output includes all SwapRef fields: swap_id, progress, role, offer/want details, deposit invoice ID, payout invoice ID, timestamps
+- **Assertions:** stdout contains each field value from the returned SwapStatus
+
+#### UT-SWAP-CLI-026: --query-escrow flag triggers getSwapStatus with escrow query
+
+- **Preconditions:** Mocked SwapModule; `getSwapStatus()` resolves
+- **Action:** Run `swap-status aabbccdd... --query-escrow` (64-hex swap_id)
+- **Expected:** `swapModule.getSwapStatus()` called with `(swapId, { queryEscrow: true })`
+- **Assertions:** `getSwapStatus` called with queryEscrow option set to true
+
+#### UT-SWAP-CLI-027: SWAP_NOT_FOUND prints error
+
+- **Preconditions:** Mocked SwapModule; `getSwapStatus()` rejects with SphereError code SWAP_NOT_FOUND
+- **Action:** Run `swap-status aabbccdd...` (64-hex swap_id)
+- **Expected:** `console.error` called with user-friendly message; `process.exit(1)` called
+- **Assertions:** stderr contains "not found"; exit code is 1
+
+#### swap-deposit
+
+#### UT-SWAP-CLI-028: Valid swap_id calls deposit()
+
+- **Preconditions:** Mocked SwapModule; `deposit()` resolves successfully
+- **Action:** Run `swap-deposit aabbccdd...` (64-hex swap_id)
+- **Expected:** `swapModule.deposit()` called with the provided swap_id
+- **Assertions:** `deposit` called once with correct swap_id
+
+#### UT-SWAP-CLI-029: SWAP_WRONG_STATE prints current state info
+
+- **Preconditions:** Mocked SwapModule; `deposit()` rejects with SphereError code SWAP_WRONG_STATE and message containing "proposed"
+- **Action:** Run `swap-deposit aabbccdd...` (64-hex swap_id)
+- **Expected:** `console.error` called with message including current swap state; `process.exit(1)` called
+- **Assertions:** stderr contains state information; exit code is 1
+
+#### UT-SWAP-CLI-030: SWAP_DEPOSIT_FAILED prints failure details
+
+- **Preconditions:** Mocked SwapModule; `deposit()` rejects with SphereError code SWAP_DEPOSIT_FAILED and message containing failure reason
+- **Action:** Run `swap-deposit aabbccdd...` (64-hex swap_id)
+- **Expected:** `console.error` called with failure details from error; `process.exit(1)` called
+- **Assertions:** stderr contains failure details; exit code is 1
+
+---
+
 ## 4. Integration Tests
 
 **File:** `tests/integration/swap-lifecycle.test.ts`
@@ -1494,10 +1728,11 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 | SwapModule.stateMachine.test.ts | UT-SWAP-SM-001 to 027 + SM-010a | 28 |
 | SwapModule.validation.test.ts | UT-SWAP-VAL-001 to 020 | 20 |
 | SwapModule.errors.test.ts | UT-SWAP-ERR-001 to 015 | 15 |
-| **Unit Total** | | **174** |
+| SwapModule.cli.test.ts | UT-SWAP-CLI-001 to 030 | 30 |
+| **Unit Total** | | **204** |
 | swap-lifecycle.test.ts (integration) | INT-SWAP-001 to 006 | 6 |
 | test-e2e-swap.ts (E2E) | E2E-SWAP-001 to 002 | 2 |
-| **Grand Total** | | **182** |
+| **Grand Total** | | **212** |
 
 ### Method Coverage Matrix
 
@@ -1518,12 +1753,12 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 
 | Error Code | Test IDs |
 |-----------|----------|
-| SWAP_NOT_FOUND | ERR-001, STATUS-004, ACCEPT-006 |
-| SWAP_INVALID_DEAL | ERR-002, PROP-007..015, VAL-005..017, VAL-020 |
-| SWAP_WRONG_STATE | ERR-003, ERR-004, DEP-005, DEP-007, ACCEPT-007, ACCEPT-008, REJECT-004, VERIFY-009, SM-016..025 |
-| SWAP_RESOLVE_FAILED | ERR-005, PROP-017 |
+| SWAP_NOT_FOUND | ERR-001, STATUS-004, ACCEPT-006, CLI-022, CLI-027 |
+| SWAP_INVALID_DEAL | ERR-002, PROP-007..015, VAL-005..017, VAL-020, CLI-002..005 |
+| SWAP_WRONG_STATE | ERR-003, ERR-004, DEP-005, DEP-007, ACCEPT-007, ACCEPT-008, REJECT-004, VERIFY-009, SM-016..025, CLI-023, CLI-029 |
+| SWAP_RESOLVE_FAILED | ERR-005, PROP-017, CLI-009 |
 | SWAP_DM_SEND_FAILED | ERR-006, PROP-018 |
-| SWAP_DEPOSIT_FAILED | ERR-007, DEP-006 |
+| SWAP_DEPOSIT_FAILED | ERR-007, DEP-006, CLI-030 |
 | SWAP_ESCROW_REJECTED | ERR-008, ACCEPT-009 |
 | SWAP_ESCROW_TIMEOUT | ERR-009, ACCEPT-010 |
 | SWAP_ALREADY_COMPLETED | ERR-010, CANCEL-003, SM-021..022 |

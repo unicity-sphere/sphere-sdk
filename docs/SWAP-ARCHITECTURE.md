@@ -1345,6 +1345,120 @@ index.ts ─────▶ SwapModule.ts ─────▶ state-machine.ts
 
 ---
 
+## 13. CLI Commands
+
+The SDK CLI exposes swap operations through three primary commands and two convenience commands, following the same `{module}-{action}` naming convention as invoice commands (`invoice-create`, `invoice-list`, `invoice-pay`, etc.).
+
+### Primary Commands
+
+**`swap-propose`** — Propose a swap deal to a counterparty
+
+```
+npm run cli -- swap-propose --to <recipient> \
+  --offer-coin <coinId> --offer-amount <amount> \
+  --want-coin <coinId> --want-amount <amount> \
+  [--escrow <address>] [--timeout <seconds>] [--message <text>]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--to` | Counterparty's @nametag, DIRECT:// address, or chain pubkey |
+| `--offer-coin` / `--offer-amount` | What the proposer sends (coinId + amount in smallest units) |
+| `--want-coin` / `--want-amount` | What the proposer expects to receive |
+| `--escrow` | Escrow @nametag or DIRECT:// address (uses configured default if omitted) |
+| `--timeout` | Swap timeout in seconds (default: 3600, range: 60–86400) |
+| `--message` | Optional human-readable description sent to counterparty |
+
+Maps to: `sphere.swap.proposeSwap(deal)` → sends `swap_proposal` DM to counterparty
+
+Output: swap_id, manifest summary, status
+
+---
+
+**`swap-list`** — List swap deals
+
+```
+npm run cli -- swap-list [--all] [--role <proposer|acceptor>] [--progress <state>]
+```
+
+| Flag | Description |
+|------|-------------|
+| (default) | Shows only open deals (`proposed`, `accepted`, `announced`, `depositing`, `awaiting_counter`, `concluding`) — hides completed/cancelled/failed |
+| `--all` | Show all deals including terminal states |
+| `--role` | Filter by role (`proposer` or `acceptor`) |
+| `--progress` | Filter by specific progress state |
+
+Maps to: `sphere.swap.getSwaps(filter)` (local, synchronous)
+
+Output: table with columns — swap_id (truncated), role, progress, counterparty, offer, want, created_at
+
+---
+
+**`swap-accept`** — Accept a proposed swap deal and execute it
+
+```
+npm run cli -- swap-accept <swap_id> [--deposit]
+```
+
+| Argument / Flag | Description |
+|-----------------|-------------|
+| `<swap_id>` | The 64-hex swap ID (from `swap-list` or from a received proposal notification) |
+| `--deposit` | Also execute the deposit immediately after acceptance (otherwise deposit is a separate step) |
+
+Without `--deposit`: only sends acceptance and announces to escrow. The user must then manually deposit via `swap-deposit`.
+
+Maps to: `sphere.swap.acceptSwap(swapId)` + optionally `sphere.swap.deposit(swapId)`
+
+Steps when `--deposit` is used:
+1. Accept the swap (sends DM, announces to escrow, imports deposit invoice)
+2. Automatically deposit by calling `sphere.swap.deposit(swapId)`
+3. Print progress updates as events fire
+4. Once `swap:completed` fires, print the final status and payout verification
+
+Output: step-by-step progress log, final swap status
+
+### Convenience Commands
+
+**`swap-status`** — Show detailed status for a specific swap
+
+```
+npm run cli -- swap-status <swap_id> [--query-escrow]
+```
+
+Maps to: `sphere.swap.getSwapStatus(swapId)`
+
+**`swap-deposit`** — Manually deposit into an announced swap (if `--deposit` was not used with `swap-accept`)
+
+```
+npm run cli -- swap-deposit <swap_id>
+```
+
+Maps to: `sphere.swap.deposit(swapId)`
+
+### CLI-to-Protocol Data Flow
+
+```
+Proposer CLI                    Counterparty CLI                Escrow
+─────────────                   ────────────────                ──────
+swap-propose ──swap_proposal──►
+                                swap-list (sees proposal)
+                                swap-accept ──swap_acceptance──► (proposer)
+                                             ──announce────────► ◄── announce_result
+                                             ◄─invoice_delivery─
+                                swap-accept --deposit
+                                  └─payInvoice()──────────────►
+
+(proposer also announces and deposits)
+                                                                settlement...
+                                             ◄─payment_confirm──
+```
+
+### Incoming Proposal Notification
+
+When a counterparty sends a `swap_proposal` DM, the SwapModule emits a `swap:proposal_received` event. In the CLI, this triggers a console notification prompting the user to run `swap-list` to review incoming proposals. In a wallet UI, this event can drive a push notification or an in-app alert. The proposal remains in `PROPOSAL_RECEIVED` progress state until the user explicitly calls `swap-accept` or rejects it.
+
+---
+
 ## Appendix A: Complete Data Flow Diagram
 
 ```
