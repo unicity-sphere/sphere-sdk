@@ -1364,12 +1364,12 @@ Test the CLI commands `swap-propose`, `swap-list`, `swap-accept`, `swap-status`,
 - **Expected:** `swapModule.proposeSwap()` called with deal where `escrowAddress === 'DIRECT://custom_escrow'`
 - **Assertions:** Deal passed to proposeSwap has custom escrow address
 
-#### UT-SWAP-CLI-008: --message flag passed as deal message
+#### UT-SWAP-CLI-008: --message flag passed as options.message to proposeSwap
 
 - **Preconditions:** Mocked SwapModule
 - **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --message "Trade offer"`
-- **Expected:** `swapModule.proposeSwap()` called with deal where `message === 'Trade offer'`
-- **Assertions:** Deal passed to proposeSwap includes message field
+- **Expected:** `swapModule.proposeSwap()` called with deal (no `message` field on SwapDeal) and options `{ message: 'Trade offer' }` as the second argument
+- **Assertions:** `expect(mockSwap.proposeSwap).toHaveBeenCalledWith(expect.any(Object), { message: 'Trade offer' })`
 
 #### UT-SWAP-CLI-009: SWAP_RESOLVE_FAILED error prints user-friendly message
 
@@ -1532,6 +1532,27 @@ Test the CLI commands `swap-propose`, `swap-list`, `swap-accept`, `swap-status`,
 - **Action:** Run `swap-deposit aabbccdd...` (64-hex swap_id)
 - **Expected:** `console.error` called with failure details from error; `process.exit(1)` called
 - **Assertions:** stderr contains failure details; exit code is 1
+
+#### UT-SWAP-CLI-031: swap-propose without --escrow and no defaultEscrowAddress prints error
+
+- **Preconditions:** Mocked SwapModule with no `defaultEscrowAddress` configured; `proposeSwap()` rejects with SphereError code SWAP_INVALID_DEAL and message containing "No escrow address"
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000` (no --escrow flag)
+- **Expected:** `console.error` called with message mentioning escrow address; `process.exit(1)` called
+- **Assertions:** stderr contains "No escrow address"; exit code is 1
+
+#### UT-SWAP-CLI-032: swap-propose with SWAP_LIMIT_EXCEEDED prints error
+
+- **Preconditions:** Mocked SwapModule; `proposeSwap()` rejects with SphereError code SWAP_LIMIT_EXCEEDED
+- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --escrow DIRECT://eee`
+- **Expected:** `console.error` called with message about too many pending swaps; `process.exit(1)` called
+- **Assertions:** stderr contains "Too many pending swaps"; exit code is 1
+
+#### UT-SWAP-CLI-033: swap-propose with self-address as --to prints error
+
+- **Preconditions:** Mocked SwapModule; `proposeSwap()` rejects with SphereError code SWAP_INVALID_DEAL and message containing "Cannot swap with yourself"
+- **Action:** Run `swap-propose --to DIRECT://own_address --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --escrow DIRECT://eee` where `DIRECT://own_address` matches the local wallet's address
+- **Expected:** `console.error` called with message about self-swap; `process.exit(1)` called
+- **Assertions:** stderr contains "Cannot swap with yourself"; exit code is 1
 
 ---
 
@@ -1728,11 +1749,11 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 | SwapModule.stateMachine.test.ts | UT-SWAP-SM-001 to 027 + SM-010a | 28 |
 | SwapModule.validation.test.ts | UT-SWAP-VAL-001 to 020 | 20 |
 | SwapModule.errors.test.ts | UT-SWAP-ERR-001 to 015 | 15 |
-| SwapModule.cli.test.ts | UT-SWAP-CLI-001 to 030 | 30 |
-| **Unit Total** | | **204** |
+| SwapModule.cli.test.ts | UT-SWAP-CLI-001 to 033 | 33 |
+| **Unit Total** | | **207** |
 | swap-lifecycle.test.ts (integration) | INT-SWAP-001 to 006 | 6 |
 | test-e2e-swap.ts (E2E) | E2E-SWAP-001 to 002 | 2 |
-| **Grand Total** | | **212** |
+| **Grand Total** | | **215** |
 
 ### Method Coverage Matrix
 
@@ -1754,7 +1775,7 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 | Error Code | Test IDs |
 |-----------|----------|
 | SWAP_NOT_FOUND | ERR-001, STATUS-004, ACCEPT-006, CLI-022, CLI-027 |
-| SWAP_INVALID_DEAL | ERR-002, PROP-007..015, VAL-005..017, VAL-020, CLI-002..005 |
+| SWAP_INVALID_DEAL | ERR-002, PROP-007..015, VAL-005..017, VAL-020, CLI-002..005, CLI-031, CLI-033 |
 | SWAP_WRONG_STATE | ERR-003, ERR-004, DEP-005, DEP-007, ACCEPT-007, ACCEPT-008, REJECT-004, VERIFY-009, SM-016..025, CLI-023, CLI-029 |
 | SWAP_RESOLVE_FAILED | ERR-005, PROP-017, CLI-009 |
 | SWAP_DM_SEND_FAILED | ERR-006, PROP-018 |
@@ -1763,7 +1784,7 @@ The module should verify that protocol DMs (announce_result, invoice_delivery, p
 | SWAP_ESCROW_TIMEOUT | ERR-009, ACCEPT-010 |
 | SWAP_ALREADY_COMPLETED | ERR-010, CANCEL-003, SM-021..022 |
 | SWAP_ALREADY_CANCELLED | ERR-011, CANCEL-004, SM-023..024 |
-| SWAP_LIMIT_EXCEEDED | ERR-012, PROP-016 |
+| SWAP_LIMIT_EXCEEDED | ERR-012, PROP-016, CLI-032 |
 | SWAP_NOT_INITIALIZED | ERR-013, LIFE-010 |
 | SWAP_MODULE_DESTROYED | ERR-014, LIFE-011 |
 | SWAP_ALREADY_INITIALIZED | ERR-015, LIFE-009 |

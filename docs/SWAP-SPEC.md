@@ -364,6 +364,22 @@ interface SwapProposalResult {
 }
 
 /**
+ * Options for getSwapStatus().
+ */
+interface GetSwapStatusOptions {
+  /** If true, send a 'status' DM to the escrow and merge the response. Default: false for terminal swaps, true for active swaps. */
+  readonly queryEscrow?: boolean;
+}
+
+/**
+ * Options for proposeSwap().
+ */
+interface ProposeSwapOptions {
+  /** Human-readable message sent to the counterparty in the proposal DM. */
+  readonly message?: string;
+}
+
+/**
  * Filter options for getSwaps().
  */
 interface GetSwapsFilter {
@@ -371,6 +387,8 @@ interface GetSwapsFilter {
   readonly progress?: SwapProgress | SwapProgress[];
   /** Filter by role */
   readonly role?: SwapRole;
+  /** When true, exclude swaps where progress is 'completed', 'cancelled', or 'failed' */
+  readonly excludeTerminal?: boolean;
 }
 ```
 
@@ -738,7 +756,7 @@ Cleanup sequence:
 ## 4. proposeSwap
 
 ```typescript
-async proposeSwap(deal: SwapDeal): Promise<SwapProposalResult>
+async proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapProposalResult>
 ```
 
 ### 4.1 Step-by-Step
@@ -814,7 +832,7 @@ async proposeSwap(deal: SwapDeal): Promise<SwapProposalResult>
       version: 1,
       manifest,
       escrow: escrowAddress,
-      message: undefined, // deal has no message field in this version
+      message: options?.message,
     };
     const dmContent = `swap_proposal:${JSON.stringify(proposalMsg)}`;
     await deps.communications.sendDM(counterpartyPubkey, dmContent);
@@ -1012,7 +1030,7 @@ async deposit(swapId: string): Promise<TransferResult>
 ## 8. getSwapStatus
 
 ```typescript
-async getSwapStatus(swapId: string): Promise<SwapRef>
+async getSwapStatus(swapId: string, options?: GetSwapStatusOptions): Promise<SwapRef>
 ```
 
 ### 8.1 Step-by-Step
@@ -1023,7 +1041,8 @@ async getSwapStatus(swapId: string): Promise<SwapRef>
    - If not found, throw `SWAP_NOT_FOUND`.
 
 3. **Optionally refresh from escrow.**
-   - If the swap is in a non-terminal state AND has an escrow address, send a `status` DM to the escrow:
+   - Determine whether to query: `const shouldQuery = options?.queryEscrow ?? !TERMINAL_PROGRESS.has(swap.progress)`. If `options.queryEscrow` is explicitly set, use that value; otherwise default to `true` for active swaps and `false` for terminal swaps.
+   - If `shouldQuery` is true AND the swap has an escrow address, send a `status` DM to the escrow:
      ```typescript
      await deps.communications.sendDM(escrowPubkey, JSON.stringify({
        type: 'status',
@@ -1065,6 +1084,10 @@ getSwaps(filter?: GetSwapsFilter): SwapRef[] {
       ? new Set(filter.progress)
       : new Set([filter.progress]);
     results = results.filter(s => allowed.has(s.progress));
+  }
+
+  if (filter?.excludeTerminal) {
+    results = results.filter(s => !TERMINAL_PROGRESS.has(s.progress));
   }
 
   if (filter?.role) {
@@ -1875,7 +1898,7 @@ swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
    };
    ```
 
-8. Call `sphere.swap.proposeSwap(deal, { message })`.
+8. Call `sphere.swap.proposeSwap(deal, message ? { message } : undefined)`.
 
 9. Print result as structured JSON:
    ```typescript
@@ -1901,6 +1924,8 @@ swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
 | Invalid amount | `Invalid amount "{value}" — must be a positive integer in smallest units (no decimals, no leading zeros)` | 1 |
 | Invalid timeout | `--timeout must be an integer between 60 and 86400 seconds` | 1 |
 | `sphere.swap` is null | `Swap module not enabled. Initialize with swap support.` | 1 |
+| `SWAP_INVALID_DEAL` | `Invalid swap deal: {details}` | 1 |
+| `SWAP_LIMIT_EXCEEDED` | `Too many pending swaps. Complete or cancel existing swaps first.` | 1 |
 | `SWAP_RESOLVE_FAILED` | `Cannot resolve address: {address}` | 1 |
 | `SWAP_DM_SEND_FAILED` | `Failed to send proposal to counterparty` | 1 |
 
@@ -2021,9 +2046,9 @@ swap-accept <swap_id> [--deposit] [--no-wait]
    }
    ```
 
-5. Call `sphere.swap.acceptSwap(swapId)`. This sends the acceptance DM, announces to the escrow, and imports the deposit invoice.
+5. Call `sphere.swap.acceptSwap(swapId)`. This sends the acceptance DM and announces to the escrow. The deposit invoice is imported asynchronously when the escrow responds with an `invoice_delivery` DM.
 
-6. Print: `"Swap accepted. Announced to escrow. Deposit invoice imported."`
+6. Print: `"Swap accepted. Announced to escrow. Waiting for deposit invoice..."`
 
 7. If `--deposit` is set:
    a. Call `sphere.swap.deposit(swapId)` to pay into the deposit invoice.
@@ -2096,7 +2121,7 @@ swap-status <swap_id> [--query-escrow]
    }
    ```
 
-5. Call `sphere.swap.getSwapStatus(swapId)`. If `--query-escrow` is set, the method queries the escrow service for the latest deposit and payout status before returning.
+5. Call `sphere.swap.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined)`. If `--query-escrow` is set, the method queries the escrow service for the latest deposit and payout status before returning.
 
 6. Print the full `SwapRef` as structured JSON, including all fields:
    ```typescript
@@ -2183,7 +2208,7 @@ Manual deposit command for when `swap-accept` was called without `--deposit`.
 | Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
 | `sphere.swap` is null | `Swap module not enabled.` | 1 |
 | `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
-| `SWAP_WRONG_STATE` | `Cannot deposit: swap is in {progress} state (expected "accepted" or "announced")` | 1 |
+| `SWAP_WRONG_STATE` | `Cannot deposit: swap is in {progress} state (expected "announced")` | 1 |
 | `SWAP_DEPOSIT_FAILED` | `Deposit failed: {details}` | 1 |
 | Insufficient balance | `Insufficient balance for deposit: need {amount} {coinId}, have {available}` | 1 |
 

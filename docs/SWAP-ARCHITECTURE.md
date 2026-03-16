@@ -1397,13 +1397,14 @@ Output: table with columns — swap_id (truncated), role, progress, counterparty
 **`swap-accept`** — Accept a proposed swap deal and execute it
 
 ```
-npm run cli -- swap-accept <swap_id> [--deposit]
+npm run cli -- swap-accept <swap_id> [--deposit] [--no-wait]
 ```
 
 | Argument / Flag | Description |
 |-----------------|-------------|
 | `<swap_id>` | The 64-hex swap ID (from `swap-list` or from a received proposal notification) |
 | `--deposit` | Also execute the deposit immediately after acceptance (otherwise deposit is a separate step) |
+| `--no-wait` | Returns immediately after deposit is sent without waiting for completion (only meaningful with `--deposit`) |
 
 Without `--deposit`: only sends acceptance and announces to escrow. The user must then manually deposit via `swap-deposit`.
 
