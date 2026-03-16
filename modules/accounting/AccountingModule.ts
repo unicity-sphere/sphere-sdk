@@ -11,6 +11,7 @@
 
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
+import { AsyncGateMap } from '../../core/async-gate.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
@@ -215,7 +216,7 @@ export class AccountingModule {
    * New operations append to the chain; cleanup removes the key when the chain
    * is idle (no pending operations for this invoice).
    */
-  private invoiceGates: Map<string, Promise<void>> = new Map();
+  private _gateMap = new AsyncGateMap();
 
   // ---------------------------------------------------------------------------
   // Event subscription cleanup handles
@@ -602,14 +603,11 @@ export class AccountingModule {
     // assignment, causing the replacement chain to escape the drain.
     await this._drainFlushPromise();
 
-    // C2-R20 fix: Loop gate drain until empty. A one-shot snapshot misses gates
-    // registered during the await (e.g., Phase 3 of in-flight auto-returns).
-    // The loop terminates because: (1) destroyed=true prevents new public API calls,
+    // C2-R20 fix: Drain all in-flight gated operations. The loop inside drainAll()
+    // terminates because: (1) destroyed=true prevents new public API calls,
     // (2) event handlers are unsubscribed above, (3) in-flight callbacks eventually
-    // complete and withInvoiceGate cleans up idle entries.
-    while (this.invoiceGates.size > 0) {
-      await Promise.allSettled(Array.from(this.invoiceGates.values()));
-    }
+    // complete and the gate map cleans up idle entries.
+    await this._gateMap.drainAll();
 
     // C1-R21 fix: Gated operations completing during the gate drain above may have
     // scheduled new _flushPromise chains (e.g., _flushDirtyLedgerEntries from event
@@ -703,38 +701,7 @@ export class AccountingModule {
    * @returns The result of `fn`.
    */
   private async withInvoiceGate<T>(invoiceId: string, fn: () => Promise<T>): Promise<T> {
-    // Early check before registering the gate — prevents registering new gates
-    // after destroy() has already snapshot the gate map for draining.
-    if (this.destroyed) {
-      throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
-    }
-    const current = this.invoiceGates.get(invoiceId) ?? Promise.resolve();
-    let resolve!: () => void;
-    const next = new Promise<void>((r) => {
-      resolve = r;
-    });
-    this.invoiceGates.set(invoiceId, next);
-    let result!: T;
-    const run = async () => {
-      if (this.destroyed) {
-        throw new SphereError('AccountingModule has been destroyed.', 'MODULE_DESTROYED');
-      }
-      result = await fn();
-    };
-    try {
-      // Use .then(run, run) so fn executes even if prior gate op rejected
-      await current.then(run, run);
-      return result;
-    } finally {
-      resolve();
-      // Clean up gate if it's still the last one (prevent memory leak).
-      // Multi-waiter invariant: if A, B, C are queued, C's promise is the tail.
-      // When A completes, A sees get(id) === C_next (set by C), so A skips deletion.
-      // B also skips. Only C (the tail) deletes. This is correct.
-      if (this.invoiceGates.get(invoiceId) === next) {
-        this.invoiceGates.delete(invoiceId);
-      }
-    }
+    return this._gateMap.withGate(invoiceId, fn, () => this.destroyed, 'MODULE_DESTROYED');
   }
 
   // ===========================================================================
@@ -3768,9 +3735,7 @@ export class AccountingModule {
     this.tokenInvoiceMap.clear();
     this.balanceCache.clear();
     this.dirtyLedgerEntries.clear();
-    // Note: invoiceGates is NOT cleared — in-flight gated operations should
-    // complete naturally. They are racing towards a destroyed module, but the
-    // individual operations will see ensureNotDestroyed() and bail immediately.
+    this._gateMap = new AsyncGateMap();
   }
 
   // ===========================================================================

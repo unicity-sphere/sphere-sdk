@@ -255,6 +255,19 @@ export type {
   IntentStatus,
 } from './modules/market';
 
+// Swap module
+export { SwapModule, createSwapModule } from './modules/swap/index';
+export type {
+  SwapDeal,
+  SwapManifest,
+  SwapProgress,
+  SwapRole,
+  SwapRef,
+  SwapProposalResult,
+  GetSwapsFilter,
+  SwapModuleConfig,
+} from './modules/swap/types';
+
 // =============================================================================
 // Constants
 // =============================================================================

@@ -126,6 +126,7 @@
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
+    "canonicalize": "^2.1.0",
     "crypto-js": "^4.2.0",
     "elliptic": "^6.6.1"
   },

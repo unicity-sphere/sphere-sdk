@@ -426,7 +426,23 @@ export type SphereEventType =
   | 'invoice:receipt_sent'
   | 'invoice:receipt_received'
   | 'invoice:cancellation_sent'
-  | 'invoice:cancellation_received';
+  | 'invoice:cancellation_received'
+  // Swap events
+  | 'swap:proposal_received'
+  | 'swap:proposed'
+  | 'swap:accepted'
+  | 'swap:rejected'
+  | 'swap:announced'
+  | 'swap:deposit_sent'
+  | 'swap:deposit_confirmed'
+  | 'swap:deposits_covered'
+  | 'swap:concluding'
+  | 'swap:payout_received'
+  | 'swap:completed'
+  | 'swap:cancelled'
+  | 'swap:failed'
+  | 'swap:deposit_returned'
+  | 'swap:bounce_received';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -559,6 +575,22 @@ export interface SphereEventMap {
     invoiceId: string;
     notice: import('../modules/accounting/types').IncomingCancellationNotice;
   };
+  // Swap events
+  'swap:proposal_received': { swapId: string; deal: Record<string, unknown>; senderPubkey: string; senderNametag?: string };
+  'swap:proposed': { swapId: string; deal: Record<string, unknown>; recipientPubkey: string };
+  'swap:accepted': { swapId: string; role: string };
+  'swap:rejected': { swapId: string; reason?: string };
+  'swap:announced': { swapId: string; depositInvoiceId: string };
+  'swap:deposit_sent': { swapId: string; transferResult: TransferResult };
+  'swap:deposit_confirmed': { swapId: string; party: 'A' | 'B'; amount: string; coinId: string };
+  'swap:deposits_covered': { swapId: string };
+  'swap:concluding': { swapId: string };
+  'swap:payout_received': { swapId: string; payoutInvoiceId: string };
+  'swap:completed': { swapId: string; payoutVerified: boolean };
+  'swap:cancelled': { swapId: string; reason: 'timeout' | 'explicit' | 'escrow_failed'; depositsReturned: boolean };
+  'swap:failed': { swapId: string; error: string };
+  'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
+  'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (

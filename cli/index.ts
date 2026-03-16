@@ -381,6 +381,27 @@ INVOICES (Accounting):
   invoice-export <id-or-prefix>       Export invoice to JSON file
   invoice-parse-memo <memo-string>    Parse an invoice memo string
 
+SWAPS:
+  swap-propose [options]              Propose a swap deal to a counterparty
+                                      --to <recipient>       Counterparty address or @nametag
+                                      --offer-coin <coinId>  Coin you are offering
+                                      --offer-amount <amt>   Amount you are offering
+                                      --want-coin <coinId>   Coin you want in return
+                                      --want-amount <amt>    Amount you want in return
+                                      --escrow <address>     Escrow address (optional)
+                                      --timeout <seconds>    Swap timeout 60-86400 (default: 3600)
+                                      --message <text>       Optional message to counterparty
+  swap-list [options]                 List swap deals (default: open + in-progress)
+                                      --all                  Include terminal states
+                                      --role <role>          Filter: proposer or acceptor
+                                      --progress <state>     Filter by progress state
+  swap-accept <swap_id> [options]     Accept a proposed swap deal
+                                      --deposit              Also deposit immediately
+                                      --no-wait              Don't wait for completion
+  swap-status <swap_id> [options]     Show detailed swap status
+                                      --query-escrow         Query escrow for latest status
+  swap-deposit <swap_id>              Deposit into an announced swap
+
 EVENT DAEMON:
   daemon start [options]              Start persistent event listener
                                       --config <path>    Config file (default: .sphere-cli/daemon.json)
@@ -472,6 +493,16 @@ Invoice Examples:
   npm run cli -- invoice-pay a1b2c3d4 --amount 500000
   npm run cli -- invoice-close a1b2c3d4 --auto-return
   npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"
+
+Swap Examples:
+  npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000
+  npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --timeout 7200
+  npm run cli -- swap-list
+  npm run cli -- swap-list --all --role proposer
+  npm run cli -- swap-accept a1b2c3d4...full64hex... --deposit
+  npm run cli -- swap-status a1b2c3d4...full64hex...
+  npm run cli -- swap-status a1b2c3d4...full64hex... --query-escrow
+  npm run cli -- swap-deposit a1b2c3d4...full64hex...
 
 Daemon Examples:
   npm run cli -- daemon start --event transfer:incoming --action auto-receive
@@ -3030,6 +3061,329 @@ async function main() {
           console.log('Parsed invoice memo:');
           console.log(JSON.stringify(parsed, null, 2));
         }
+
+        await closeSphere();
+        break;
+      }
+
+      // =====================================================================
+      // Swap Commands
+      // =====================================================================
+
+      case 'swap-propose': {
+        const toIdx = args.indexOf('--to');
+        const offerCoinIdx = args.indexOf('--offer-coin');
+        const offerAmountIdx = args.indexOf('--offer-amount');
+        const wantCoinIdx = args.indexOf('--want-coin');
+        const wantAmountIdx = args.indexOf('--want-amount');
+        const escrowIdx = args.indexOf('--escrow');
+        const timeoutIdx = args.indexOf('--timeout');
+        const messageIdx = args.indexOf('--message');
+
+        if (toIdx === -1 || !args[toIdx + 1] ||
+            offerCoinIdx === -1 || !args[offerCoinIdx + 1] ||
+            offerAmountIdx === -1 || !args[offerAmountIdx + 1] ||
+            wantCoinIdx === -1 || !args[wantCoinIdx + 1] ||
+            wantAmountIdx === -1 || !args[wantAmountIdx + 1]) {
+          console.error('Usage: swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount> [--escrow <address>] [--timeout <seconds>] [--message <text>]');
+          process.exit(1);
+        }
+
+        const offerAmount = args[offerAmountIdx + 1];
+        const wantAmount = args[wantAmountIdx + 1];
+        if (!/^[1-9][0-9]*$/.test(offerAmount)) {
+          console.error(`Invalid amount "${offerAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+          process.exit(1);
+        }
+        if (!/^[1-9][0-9]*$/.test(wantAmount)) {
+          console.error(`Invalid amount "${wantAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+          process.exit(1);
+        }
+
+        let timeout = 3600;
+        if (timeoutIdx !== -1 && args[timeoutIdx + 1]) {
+          timeout = parseInt(args[timeoutIdx + 1], 10);
+          if (isNaN(timeout) || timeout < 60 || timeout > 86400) {
+            console.error('--timeout must be an integer between 60 and 86400 seconds');
+            process.exit(1);
+          }
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled. Initialize with swap support.');
+          process.exit(1);
+        }
+
+        const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
+        const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
+
+        const deal = {
+          partyA: sphere.identity!.directAddress!,
+          partyB: args[toIdx + 1],
+          partyACurrency: args[offerCoinIdx + 1],
+          partyAAmount: offerAmount,
+          partyBCurrency: args[wantCoinIdx + 1],
+          partyBAmount: wantAmount,
+          timeout: timeout,
+          escrowAddress: escrow,
+        };
+
+        const result = await swapModule.proposeSwap(deal, message ? { message } : undefined);
+        console.log('Swap proposed:');
+        console.log(JSON.stringify({
+          swap_id: result.swapId,
+          counterparty: args[toIdx + 1],
+          offer: `${offerAmount} ${args[offerCoinIdx + 1]}`,
+          want: `${wantAmount} ${args[wantCoinIdx + 1]}`,
+          escrow: deal.escrowAddress ?? '(config default)',
+          timeout: timeout,
+          status: result.progress,
+        }, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-list': {
+        const allFlag = args.includes('--all');
+        const roleIdx = args.indexOf('--role');
+        const progressIdx = args.indexOf('--progress');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const filter: any = {};
+        if (roleIdx !== -1 && args[roleIdx + 1]) {
+          const role = args[roleIdx + 1];
+          if (role !== 'proposer' && role !== 'acceptor') {
+            console.error('--role must be "proposer" or "acceptor"');
+            process.exit(1);
+          }
+          filter.role = role;
+        }
+        if (progressIdx !== -1 && args[progressIdx + 1]) {
+          filter.progress = args[progressIdx + 1];
+        }
+        if (!allFlag && !filter.progress) {
+          filter.excludeTerminal = true;
+        }
+
+        const swaps = await swapModule.getSwaps(filter);
+        if (!swaps || swaps.length === 0) {
+          console.log('No swaps found.');
+        } else {
+          const isTTY = process.stdout.isTTY;
+          const green = isTTY ? '\x1b[32m' : '';
+          const red = isTTY ? '\x1b[31m' : '';
+          const yellow = isTTY ? '\x1b[33m' : '';
+          const reset = isTTY ? '\x1b[0m' : '';
+
+          const header = [
+            'SWAP ID'.padEnd(10),
+            'ROLE'.padEnd(12),
+            'PROGRESS'.padEnd(20),
+            'OFFER'.padEnd(18),
+            'WANT'.padEnd(18),
+            'COUNTERPARTY'.padEnd(16),
+            'CREATED',
+          ].join('');
+          console.log(header);
+
+          for (const swap of swaps) {
+            const id = (swap.swapId || '').slice(0, 8);
+            const role = swap.role || '';
+            const progress = swap.progress || '';
+
+            // Determine counterparty display
+            const isProposer = role === 'proposer';
+            const offerStr = isProposer
+              ? `${swap.deal?.partyAAmount ?? ''} ${swap.deal?.partyACurrency ?? ''}`
+              : `${swap.deal?.partyBAmount ?? ''} ${swap.deal?.partyBCurrency ?? ''}`;
+            const wantStr = isProposer
+              ? `${swap.deal?.partyBAmount ?? ''} ${swap.deal?.partyBCurrency ?? ''}`
+              : `${swap.deal?.partyAAmount ?? ''} ${swap.deal?.partyACurrency ?? ''}`;
+            const counterparty = isProposer
+              ? (swap.deal?.partyB ?? '').slice(0, 14)
+              : (swap.deal?.partyA ?? '').slice(0, 14);
+
+            // Relative time
+            const elapsed = Date.now() - (swap.createdAt || 0);
+            let timeStr: string;
+            if (elapsed < 60_000) timeStr = 'just now';
+            else if (elapsed < 3_600_000) timeStr = `${Math.floor(elapsed / 60_000)} min ago`;
+            else if (elapsed < 86_400_000) timeStr = `${Math.floor(elapsed / 3_600_000)} hour ago`;
+            else timeStr = `${Math.floor(elapsed / 86_400_000)} days ago`;
+
+            // Color progress
+            let coloredProgress = progress;
+            if (progress === 'completed') coloredProgress = `${green}${progress}${reset}`;
+            else if (progress === 'failed' || progress === 'cancelled') coloredProgress = `${red}${progress}${reset}`;
+            else coloredProgress = `${yellow}${progress}${reset}`;
+
+            const row = [
+              id.padEnd(10),
+              role.padEnd(12),
+              // Pad the raw progress (color codes are zero-width for terminal)
+              coloredProgress + ' '.repeat(Math.max(0, 20 - progress.length)),
+              offerStr.padEnd(18),
+              wantStr.padEnd(18),
+              counterparty.padEnd(16),
+              timeStr,
+            ].join('');
+            console.log(row);
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-accept': {
+        const swapId = args[1];
+        if (!swapId) {
+          console.error('Usage: swap-accept <swap_id> [--deposit] [--no-wait]');
+          process.exit(1);
+        }
+        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+          console.error('Invalid swap ID — must be 64 hex characters');
+          process.exit(1);
+        }
+
+        const depositFlag = args.includes('--deposit');
+        const noWaitFlag = args.includes('--no-wait');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+
+        await swapModule.acceptSwap(swapId);
+        console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
+
+        if (depositFlag) {
+          const depositResult = await swapModule.deposit(swapId);
+          console.log(`Deposit sent: ${depositResult.id}`);
+
+          if (!noWaitFlag) {
+            // Wait for terminal event
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const swapRef = await swapModule.getSwapStatus(swapId);
+            const waitTimeout = 2 * (swapRef?.deal?.timeout ?? 3600) * 1000;
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => {
+                reject(new Error(`Swap did not complete within timeout. Current progress: ${swapRef?.progress ?? 'unknown'}`));
+              }, waitTimeout);
+
+              const handler = (event: { swapId: string; progress: string; amount?: string; coinId?: string }) => {
+                if (event.swapId !== swapId) return;
+                if (event.progress === 'completed') {
+                  clearTimeout(timer);
+                  console.log(`[swap] Swap completed!${event.amount ? ` Received ${event.amount} ${event.coinId ?? ''}` : ''}`);
+                  resolve();
+                } else if (event.progress === 'cancelled' || event.progress === 'failed') {
+                  clearTimeout(timer);
+                  console.log(`[swap] Swap ${event.progress}.`);
+                  resolve();
+                } else {
+                  console.log(`[swap] Progress: ${event.progress}`);
+                }
+              };
+
+              sphere.on('swap:completed', handler);
+              sphere.on('swap:cancelled', handler);
+              sphere.on('swap:failed', handler);
+              sphere.on('swap:deposit_confirmed', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] Deposit confirmed by escrow.');
+              });
+              sphere.on('swap:counterparty_deposited', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] Counterparty deposited. Escrow concluding...');
+              });
+              sphere.on('swap:payout_received', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] Payout received. Verifying...');
+              });
+            });
+          }
+        } else {
+          console.log(`Run 'swap-deposit ${swapId}' to deposit when ready.`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-status': {
+        const swapId = args[1];
+        if (!swapId) {
+          console.error('Usage: swap-status <swap_id> [--query-escrow]');
+          process.exit(1);
+        }
+        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+          console.error('Invalid swap ID — must be 64 hex characters');
+          process.exit(1);
+        }
+
+        const queryEscrow = args.includes('--query-escrow');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+
+        const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
+        console.log('Swap Status:');
+        console.log(JSON.stringify(status, null, 2));
+
+        if (status.depositInvoiceId && sphere.accounting) {
+          try {
+            const invoiceStatus = await sphere.accounting.getInvoiceStatus(status.depositInvoiceId);
+            console.log('\nDeposit Invoice Status:');
+            console.log(JSON.stringify(invoiceStatus, null, 2));
+          } catch {
+            // Non-fatal: invoice may not be imported yet
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-deposit': {
+        const swapId = args[1];
+        if (!swapId) {
+          console.error('Usage: swap-deposit <swap_id>');
+          process.exit(1);
+        }
+        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+          console.error('Invalid swap ID — must be 64 hex characters');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+
+        const result = await swapModule.deposit(swapId);
+        console.log('Deposit result:');
+        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
 
         await closeSphere();
         break;

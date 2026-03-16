@@ -106,6 +106,11 @@ export const STORAGE_KEYS_ADDRESS = {
   INV_LEDGER_INDEX: 'inv_ledger_index',
   /** Token scan state watermarks (JSON: Record<tokenId, txCount>) */
   TOKEN_SCAN_STATE: 'token_scan_state',
+  // Swap storage keys
+  /** Per-swap key: swap:{swapId} */
+  SWAP_RECORD_PREFIX: 'swap:',
+  /** Lightweight index array for listing */
+  SWAP_INDEX: 'swap_index',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
