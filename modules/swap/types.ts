@@ -144,28 +144,9 @@ export type SwapProgress =
  */
 export type SwapRole = 'proposer' | 'acceptor';
 
-/**
- * Valid SwapProgress transitions.
- * Used by the internal state guard to prevent illegal transitions.
- */
-export const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, ReadonlySet<SwapProgress>> = {
-  proposed:         new Set(['accepted', 'cancelled', 'failed']),
-  accepted:         new Set(['announced', 'cancelled', 'failed']),
-  announced:        new Set(['depositing', 'cancelled', 'failed']),
-  depositing:       new Set(['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed']),
-  awaiting_counter: new Set(['concluding', 'completed', 'cancelled', 'failed']),
-  concluding:       new Set(['completed', 'cancelled', 'failed']),
-  completed:        new Set([]),  // terminal
-  cancelled:        new Set([]),  // terminal
-  failed:           new Set([]),  // terminal
-};
-
-/**
- * Set of terminal progress states. Swaps in these states cannot transition further.
- */
-export const TERMINAL_PROGRESS: ReadonlySet<SwapProgress> = new Set([
-  'completed', 'cancelled', 'failed',
-]);
+// NOTE: VALID_PROGRESS_TRANSITIONS and TERMINAL_PROGRESS are defined
+// exclusively in state-machine.ts to avoid duplication conflicts.
+// Import from './state-machine.js' if needed.
 
 // =============================================================================
 // §2.3 Swap Reference Types
@@ -217,6 +198,17 @@ export interface SwapRef {
    * Used to correlate invoice:payment events with the local deposit.
    */
   localDepositTransferId?: string;
+  /**
+   * Chain pubkey of the resolved escrow service.
+   * Stored after escrow resolution so that incoming escrow DMs can be
+   * authenticated by comparing the sender's pubkey against this field.
+   */
+  escrowPubkey?: string;
+  /**
+   * DIRECT:// address of the resolved escrow service.
+   * Used for deposit invoice term verification (target address check).
+   */
+  escrowDirectAddress?: string;
   /**
    * Whether the payout invoice has been verified (correct terms, covered).
    * Set to true by verifyPayout() after successful verification.

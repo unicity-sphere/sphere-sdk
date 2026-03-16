@@ -14,13 +14,33 @@
  * @see docs/SWAP-SPEC.md
  */
 
-// Imports (FROZEN — Wave 3 agents must NOT modify imports)
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
 import { STORAGE_KEYS_ADDRESS, getAddressStorageKey } from '../../constants.js';
-import { assertTransition, isTerminalProgress } from './state-machine.js';
-import { parseSwapDM, isSwapDM } from './dm-protocol.js';
+import { assertTransition, isTerminalProgress, mapEscrowStateToProgress } from './state-machine.js';
+import {
+  parseSwapDM,
+  isSwapDM,
+  buildProposalDM,
+  buildAcceptanceDM,
+  buildRejectionDM,
+  buildAnnounceDM,
+  buildStatusQueryDM,
+} from './dm-protocol.js';
+import {
+  computeSwapId,
+  buildManifest,
+  validateManifest,
+  verifyManifestIntegrity,
+} from './manifest.js';
+import {
+  resolveEscrowAddress,
+  sendAnnounce,
+  sendStatusQuery,
+  sendRequestInvoice,
+  withRetry,
+} from './escrow-client.js';
 import type { TransferResult } from '../../types/index.js';
 import type {
   SwapModuleConfig,
@@ -528,6 +548,13 @@ export class SwapModule {
     const deps = this.deps;
     if (!deps) return;
 
+    // Clean up reverse index entries before removing from map
+    const swap = this.swaps.get(swapId);
+    if (swap) {
+      if (swap.depositInvoiceId) this.invoiceToSwapIndex.delete(swap.depositInvoiceId);
+      if (swap.payoutInvoiceId) this.invoiceToSwapIndex.delete(swap.payoutInvoiceId);
+    }
+
     const addressId = deps.identity.directAddress
       ? deps.identity.directAddress
       : deps.identity.chainPubkey;
@@ -544,7 +571,6 @@ export class SwapModule {
     }
 
     this.swaps.delete(swapId);
-    this.invoiceToSwapIndex.delete(swapId);
     await this.persistIndex();
   }
 
@@ -614,6 +640,21 @@ export class SwapModule {
   }
 
   /**
+   * Ensure the module has been initialized AND loaded.
+   * Used by public API methods that require full readiness.
+   * @throws {SphereError} `SWAP_NOT_INITIALIZED`
+   */
+  private ensureReady(): void {
+    this.ensureInitialized();
+    if (!this.loaded) {
+      throw new SphereError(
+        'SwapModule has not loaded. Call load() first.',
+        'SWAP_NOT_INITIALIZED',
+      );
+    }
+  }
+
+  /**
    * Ensure the module has not been destroyed.
    * @throws {SphereError} `SWAP_MODULE_DESTROYED`
    */
@@ -643,7 +684,7 @@ export class SwapModule {
    */
   async proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapProposalResult> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
     const deps = this.deps!;
 
     // Step 2: Validate deal fields (§17.1)
@@ -727,8 +768,7 @@ export class SwapModule {
       throw new SphereError(`Maximum pending swaps (${this.config.maxPendingSwaps}) exceeded`, 'SWAP_LIMIT_EXCEEDED');
     }
 
-    // Step 7: Build SwapManifest (dynamic import to respect frozen imports block)
-    const { buildManifest } = await import('./manifest.js');
+    // Step 7: Build SwapManifest
     const manifest = buildManifest(resolvedPartyA, resolvedPartyB, deal, deal.timeout);
     const swapId = manifest.swap_id;
 
@@ -751,6 +791,8 @@ export class SwapModule {
       role,
       progress: 'proposed',
       counterpartyPubkey,
+      escrowPubkey: escrowPeer.chainPubkey,
+      escrowDirectAddress: escrowPeer.directAddress,
       payoutVerified: false,
       createdAt: now,
       updatedAt: now,
@@ -762,7 +804,6 @@ export class SwapModule {
 
     // Step 11: Send proposal DM to the counterparty
     try {
-      const { buildProposalDM } = await import('./dm-protocol.js');
       const dmContent = buildProposalDM(manifest, escrowAddress, options?.message);
       await deps.communications.sendDM(counterpartyPubkey, dmContent);
     } catch (err) {
@@ -782,7 +823,7 @@ export class SwapModule {
     // Step 13: Emit event
     deps.emitEvent('swap:proposed', {
       swapId,
-      deal: deal as unknown as Record<string, unknown>,
+      deal: { ...deal },
       recipientPubkey: counterpartyPubkey,
     });
 
@@ -811,7 +852,7 @@ export class SwapModule {
    */
   async acceptSwap(swapId: string): Promise<void> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
     const deps = this.deps!;
 
     // Step 2: Look up swap
@@ -835,15 +876,8 @@ export class SwapModule {
     // Step 3: Enter per-swap gate
     await this.withSwapGate(swapId, async () => {
       // Step 4: Send acceptance DM to the proposer
-      const acceptancePayload = JSON.stringify({
-        type: 'swap_acceptance',
-        version: 1,
-        swap_id: swapId,
-      });
-      await deps.communications.sendDM(
-        swap.counterpartyPubkey!,
-        'swap_acceptance:' + acceptancePayload,
-      );
+      const dmContent = buildAcceptanceDM(swapId);
+      await deps.communications.sendDM(swap.counterpartyPubkey!, dmContent);
 
       // Step 5: Transition to 'accepted'
       await this.transitionProgress(swap, 'accepted');
@@ -854,27 +888,18 @@ export class SwapModule {
       // Step 7: Announce manifest to escrow (fire-and-forget, no await)
       void (async () => {
         try {
-          // Resolve escrow address
-          const escrowAddr = swap.deal.escrowAddress ?? this.config.defaultEscrowAddress;
-          if (!escrowAddr) {
-            logger.warn(LOG_TAG, `No escrow address configured for swap ${swapId}`);
-            return;
-          }
-          const peer = await deps.resolve(escrowAddr);
-          if (!peer) {
-            logger.warn(LOG_TAG, `Failed to resolve escrow address for swap ${swapId}: ${escrowAddr}`);
-            return;
-          }
+          const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(
+            swap.deal, this.config, deps.resolve,
+          );
 
           // Store resolved escrow pubkey on swap for later DM sender verification
-          (swap as unknown as Record<string, unknown>).escrowPubkey = peer.chainPubkey;
+          swap.escrowPubkey = escrowPubkey;
+          swap.escrowDirectAddress = escrowDirectAddress;
+          await this.persistSwap(swap);
 
           // Send announce DM to escrow
-          const announceDM = JSON.stringify({
-            type: 'announce',
-            manifest: swap.manifest,
-          });
-          await deps.communications.sendDM(peer.chainPubkey, announceDM);
+          const announceDM = buildAnnounceDM(swap.manifest);
+          await deps.communications.sendDM(escrowPubkey, announceDM);
         } catch (err) {
           logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
         }
@@ -893,7 +918,7 @@ export class SwapModule {
    */
   async rejectSwap(swapId: string, reason?: string): Promise<void> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
     const deps = this.deps!;
 
     // Step 2: Look up swap
@@ -918,16 +943,8 @@ export class SwapModule {
     await this.withSwapGate(swapId, async () => {
       // Step 4: Send rejection DM (best-effort, catch errors)
       try {
-        const rejectionPayload = JSON.stringify({
-          type: 'swap_rejection',
-          version: 1,
-          swap_id: swapId,
-          ...(reason !== undefined && reason !== '' ? { reason } : {}),
-        });
-        await deps.communications.sendDM(
-          swap.counterpartyPubkey!,
-          'swap_rejection:' + rejectionPayload,
-        );
+        const dmContent = buildRejectionDM(swapId, reason);
+        await deps.communications.sendDM(swap.counterpartyPubkey!, dmContent);
       } catch (err) {
         logger.warn(LOG_TAG, `Failed to send rejection DM for swap ${swapId}:`, err);
       }
@@ -964,7 +981,7 @@ export class SwapModule {
    */
   async deposit(swapId: string): Promise<TransferResult> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
     const deps = this.deps!;
 
     // Look up swap
@@ -1046,7 +1063,7 @@ export class SwapModule {
    */
   async verifyPayout(swapId: string): Promise<boolean> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
     const deps = this.deps!;
 
     // Look up swap
@@ -1143,6 +1160,17 @@ export class SwapModule {
       return false;
     }
 
+    // Verify payout invoice targets OUR address (not someone else's)
+    if (!myDirectAddresses.has(targetTerms.address)) {
+      swap.payoutVerified = false;
+      await this.persistSwap(swap);
+      deps.emitEvent('swap:failed', {
+        swapId,
+        error: 'Payout invoice targets wrong address',
+      });
+      return false;
+    }
+
     // Verify creator is defined (escrow invoices are non-anonymous)
     if (!invoiceRef.terms.creator) {
       swap.payoutVerified = false;
@@ -1227,7 +1255,7 @@ export class SwapModule {
    */
   async getSwapStatus(swapId: string, options?: GetSwapStatusOptions): Promise<SwapRef> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
 
     const swap = this.swaps.get(swapId);
     if (!swap) {
@@ -1248,7 +1276,7 @@ export class SwapModule {
         deps.resolve(escrowAddr)
           .then((peer) => {
             if (peer) {
-              const statusDM = JSON.stringify({ type: 'status', swap_id: swapId });
+              const statusDM = buildStatusQueryDM(swapId);
               return deps.communications.sendDM(peer.chainPubkey, statusDM).then(() => undefined);
             }
           })
@@ -1270,7 +1298,7 @@ export class SwapModule {
    */
   getSwaps(filter?: GetSwapsFilter): SwapRef[] {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
 
     let results = Array.from(this.swaps.values());
 
@@ -1306,7 +1334,7 @@ export class SwapModule {
    */
   async cancelSwap(swapId: string): Promise<void> {
     this.ensureNotDestroyed();
-    this.ensureInitialized();
+    this.ensureReady();
 
     const swap = this.swaps.get(swapId);
     if (!swap) {
@@ -1385,7 +1413,6 @@ export class SwapModule {
             if (proposalMsg.version > 1 || proposalMsg.version < 1) return;
 
             // Validate manifest integrity: swap_id matches SHA-256(JCS(fields))
-            const { verifyManifestIntegrity, validateManifest } = await import('./manifest.js');
             if (!verifyManifestIntegrity(manifest)) {
               if (this.config.debug) {
                 logger.debug(LOG_TAG, `Proposal ignored: manifest integrity check failed for ${manifest.swap_id}`);
@@ -1453,6 +1480,22 @@ export class SwapModule {
               escrowAddress: proposalMsg.escrow,
             };
 
+            // Resolve escrow address to store escrowPubkey for later DM verification
+            let escrowPubkey: string | undefined;
+            let escrowDirectAddr: string | undefined;
+            try {
+              const escrowResult = await resolveEscrowAddress(
+                deal, this.config, deps.resolve,
+              );
+              escrowPubkey = escrowResult.escrowPubkey;
+              escrowDirectAddr = escrowResult.escrowDirectAddress;
+            } catch {
+              // Best-effort: escrow may not be resolvable yet
+              if (this.config.debug) {
+                logger.debug(LOG_TAG, `Could not resolve escrow for proposal ${manifest.swap_id}`);
+              }
+            }
+
             // Create SwapRef
             const swap: SwapRef = {
               swapId: manifest.swap_id,
@@ -1461,6 +1504,8 @@ export class SwapModule {
               role: 'acceptor',
               progress: 'proposed',
               counterpartyPubkey: dm.senderPubkey,
+              escrowPubkey,
+              escrowDirectAddress: escrowDirectAddr,
               payoutVerified: false,
               createdAt: Date.now(),
               updatedAt: Date.now(),
@@ -1473,7 +1518,7 @@ export class SwapModule {
             // Emit swap:proposal_received
             deps.emitEvent('swap:proposal_received', {
               swapId: manifest.swap_id,
-              deal: deal as unknown as Record<string, unknown>,
+              deal: { ...deal },
               senderPubkey: dm.senderPubkey,
               senderNametag: dm.senderNametag,
             });
@@ -1506,7 +1551,7 @@ export class SwapModule {
 
             await this.withSwapGate(swapId, async () => {
               // Clear proposal timer
-              this.clearLocalTimer(`proposal:${swapId}`);
+              this.clearLocalTimer(swapId);
 
               // Transition to 'accepted'
               await this.transitionProgress(swap, 'accepted');
@@ -1518,7 +1563,6 @@ export class SwapModule {
               });
 
               // Announce to escrow (fire-and-forget)
-              const { resolveEscrowAddress, sendAnnounce } = await import('./escrow-client.js');
               resolveEscrowAddress(swap.deal, this.config, deps.resolve)
                 .then(({ escrowPubkey }) => {
                   return sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
@@ -1549,7 +1593,7 @@ export class SwapModule {
 
             await this.withSwapGate(swapId, async () => {
               // Clear proposal timer
-              this.clearLocalTimer(`proposal:${swapId}`);
+              this.clearLocalTimer(swapId);
 
               // Transition to 'cancelled'
               await this.transitionProgress(swap, 'cancelled', {
@@ -1645,6 +1689,72 @@ export class SwapModule {
                       return;
                     }
 
+                    // Verify deposit invoice terms match expectations
+                    const depositInvoiceId = msg.invoice_id ?? swap.depositInvoiceId;
+                    if (depositInvoiceId) {
+                      const invoice = deps.accounting.getInvoice(depositInvoiceId) as {
+                        invoiceId: string;
+                        terms: {
+                          targets: Array<{
+                            address: string;
+                            assets: Array<{ coin?: [string, string] }>;
+                          }>;
+                        };
+                      } | null;
+
+                      if (invoice) {
+                        const terms = invoice.terms;
+                        // Verify single target
+                        if (terms.targets.length !== 1) {
+                          logger.warn(LOG_TAG, `Deposit invoice for swap ${swapId} has ${terms.targets.length} targets, expected 1`);
+                          await this.transitionProgress(swap, 'failed', {
+                            error: 'Deposit invoice has unexpected number of targets',
+                          });
+                          deps.emitEvent('swap:failed', { swapId, error: 'Deposit invoice has unexpected number of targets' });
+                          return;
+                        }
+                        // Verify target address matches escrow
+                        if (swap.escrowDirectAddress && terms.targets[0].address !== swap.escrowDirectAddress) {
+                          logger.warn(LOG_TAG, `Deposit invoice for swap ${swapId} targets wrong address`);
+                          await this.transitionProgress(swap, 'failed', {
+                            error: 'Deposit invoice targets wrong address',
+                          });
+                          deps.emitEvent('swap:failed', { swapId, error: 'Deposit invoice targets wrong address' });
+                          return;
+                        }
+                        // Verify 2 assets with correct currencies/amounts
+                        const assets = terms.targets[0].assets;
+                        if (assets.length !== 2) {
+                          logger.warn(LOG_TAG, `Deposit invoice for swap ${swapId} has ${assets.length} assets, expected 2`);
+                          await this.transitionProgress(swap, 'failed', {
+                            error: 'Deposit invoice has unexpected number of assets',
+                          });
+                          deps.emitEvent('swap:failed', { swapId, error: 'Deposit invoice has unexpected number of assets' });
+                          return;
+                        }
+                        // Match currencies and amounts against manifest
+                        const expectedAssets = [
+                          { coinId: swap.manifest.party_a_currency_to_change, amount: swap.manifest.party_a_value_to_change },
+                          { coinId: swap.manifest.party_b_currency_to_change, amount: swap.manifest.party_b_value_to_change },
+                        ];
+                        const invoiceAssets = assets.map(a => ({
+                          coinId: a.coin?.[0],
+                          amount: a.coin?.[1],
+                        }));
+                        const assetsMatch = expectedAssets.every(ea =>
+                          invoiceAssets.some(ia => ia.coinId === ea.coinId && ia.amount === ea.amount),
+                        );
+                        if (!assetsMatch) {
+                          logger.warn(LOG_TAG, `Deposit invoice for swap ${swapId} has mismatched assets`);
+                          await this.transitionProgress(swap, 'failed', {
+                            error: 'Deposit invoice assets do not match manifest',
+                          });
+                          deps.emitEvent('swap:failed', { swapId, error: 'Deposit invoice assets do not match manifest' });
+                          return;
+                        }
+                      }
+                    }
+
                     // Set depositInvoiceId if not already set (announce_result may not have arrived)
                     if (msg.invoice_id && !swap.depositInvoiceId) {
                       swap.depositInvoiceId = msg.invoice_id;
@@ -1724,7 +1834,6 @@ export class SwapModule {
                   await this.persistSwap(swap);
 
                   // Map escrow state to client progress and advance if necessary
-                  const { mapEscrowStateToProgress } = await import('./state-machine.js');
                   const mappedProgress = mapEscrowStateToProgress(msg.state);
                   if (mappedProgress && isTerminalProgress(mappedProgress) && !isTerminalProgress(swap.progress)) {
                     if (mappedProgress === 'completed') {
@@ -1906,15 +2015,15 @@ export class SwapModule {
 
   /**
    * Check if a DM sender matches the expected escrow for a swap.
-   * Since the resolved escrow pubkey is not cached on SwapRef, this
-   * relies on the transport layer NIP-17 encryption for authentication.
-   * A future enhancement should store escrowPubkey on SwapRef and
-   * perform a strict comparison here.
+   * Compares the sender's chain pubkey against the escrowPubkey
+   * stored on the SwapRef during escrow resolution.
+   *
+   * @returns `true` if the sender matches the stored escrow pubkey,
+   *          `false` if no escrowPubkey is stored (unknown escrow) or mismatch.
    */
-  private isFromExpectedEscrow(_senderPubkey: string, _swap: SwapRef): boolean {
-    // The escrow pubkey is authenticated at the transport layer via NIP-17.
-    // Without a cached escrowPubkey on SwapRef, accept the sender.
-    return true;
+  private isFromExpectedEscrow(senderPubkey: string, swap: SwapRef): boolean {
+    if (!swap.escrowPubkey) return false; // unknown escrow = reject
+    return senderPubkey === swap.escrowPubkey;
   }
 
   // T2.5: IMPLEMENTATION END

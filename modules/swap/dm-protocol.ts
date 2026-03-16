@@ -486,29 +486,47 @@ function parseStatusResult(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
   if (typeof obj.state !== 'string') return null;
 
-  // status_result uses index signature for extensibility -- pass through all fields
+  // Explicitly pick known fields to avoid prototype pollution from spread
+  const payload: Record<string, unknown> = {
+    type: 'status_result' as const,
+    swap_id: obj.swap_id as string,
+    state: obj.state as string,
+  };
+  // Copy only safe, non-prototype fields for extensibility
+  for (const key of Object.keys(obj)) {
+    if (key !== 'type' && key !== 'swap_id' && key !== 'state') {
+      payload[key] = obj[key];
+    }
+  }
+
   return {
     kind: 'escrow',
-    payload: {
-      ...obj,
-      type: 'status_result',
-      swap_id: obj.swap_id as string,
-      state: obj.state as string,
-    } as EscrowMessage,
+    payload: payload as EscrowMessage,
   };
 }
 
 function parsePaymentConfirmation(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
 
-  // payment_confirmation uses index signature for extensibility -- pass through all fields
+  // Explicitly pick known fields to avoid prototype pollution from spread
+  const payload: Record<string, unknown> = {
+    type: 'payment_confirmation' as const,
+    swap_id: obj.swap_id as string,
+  };
+  // Copy party field if present
+  if (typeof obj.party === 'string') {
+    payload.party = obj.party;
+  }
+  // Copy only safe, non-prototype fields for extensibility
+  for (const key of Object.keys(obj)) {
+    if (key !== 'type' && key !== 'swap_id' && key !== 'party') {
+      payload[key] = obj[key];
+    }
+  }
+
   return {
     kind: 'escrow',
-    payload: {
-      ...obj,
-      type: 'payment_confirmation',
-      swap_id: obj.swap_id as string,
-    } as EscrowMessage,
+    payload: payload as EscrowMessage,
   };
 }
 
