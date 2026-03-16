@@ -192,7 +192,17 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
   it('UT-SWAP-MAN-007: computeSwapId matches expected hash for known test vector', () => {
     // Known test vector: a specific set of fields with a pre-computed expected hash.
     // This ensures the client SDK produces the same swap_id as the escrow service
-    // for the same input.
+    // for the same input. If the hashing algorithm or canonicalization changes,
+    // this test will fail — that is intentional (regression guard).
+    //
+    // Canonical JSON (RFC 8785 / JCS — keys sorted lexicographically):
+    //   {"party_a_address":"DIRECT://aaa","party_a_currency_to_change":"UCT",
+    //    "party_a_value_to_change":"1000000","party_b_address":"DIRECT://bbb",
+    //    "party_b_currency_to_change":"USDU","party_b_value_to_change":"500000",
+    //    "timeout":3600}
+    //
+    // SHA-256 of the above UTF-8 bytes:
+    //   6b42494131542822ffaa014f1f399473976233e8c13608e5b5f8c215686eeca0
     const testVectorFields: ManifestFields = {
       party_a_address: 'DIRECT://aaa',
       party_b_address: 'DIRECT://bbb',
@@ -200,23 +210,21 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_a_value_to_change: '1000000',
       party_b_currency_to_change: 'USDU',
       party_b_value_to_change: '500000',
-      timeout: 300,
+      timeout: 3600,
     };
 
-    // Compute the hash once and record it as the expected value.
-    // The point of this test is regression: if the hashing changes, this fails.
-    const hash = computeSwapId(testVectorFields);
+    const EXPECTED_HASH = '6b42494131542822ffaa014f1f399473976233e8c13608e5b5f8c215686eeca0';
 
-    // Verify it is a valid 64-hex string
-    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    const hash = computeSwapId(testVectorFields);
+    expect(hash).toBe(EXPECTED_HASH);
 
     // Verify determinism by computing again
-    expect(computeSwapId(testVectorFields)).toBe(hash);
+    expect(computeSwapId(testVectorFields)).toBe(EXPECTED_HASH);
 
     // Verify that changing any single field produces a DIFFERENT hash
-    const alteredFields = { ...testVectorFields, timeout: 301 };
+    const alteredFields = { ...testVectorFields, timeout: 3601 };
     const alteredHash = computeSwapId(alteredFields);
-    expect(alteredHash).not.toBe(hash);
+    expect(alteredHash).not.toBe(EXPECTED_HASH);
     expect(alteredHash).toMatch(/^[0-9a-f]{64}$/);
   });
 });

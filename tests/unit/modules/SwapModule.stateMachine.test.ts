@@ -355,6 +355,31 @@ describe('SwapModule — state machine (state-machine.ts)', () => {
   });
 
   // =========================================================================
+  // UT-SWAP-SM-003a: proposed -> cancelled via rejection
+  // SM-002 validates the transition is valid at the assertion level.
+  // This test validates the full transition path: assertTransition does
+  // not throw, and isValidTransition returns true, confirming rejection
+  // (proposed -> cancelled) is a distinct valid path from failure
+  // (proposed -> failed, tested by SM-003).
+  // =========================================================================
+
+  it('UT-SWAP-SM-003a: proposed -> cancelled is the rejection path (distinct from failed)', () => {
+    // proposed -> cancelled is the rejection transition
+    expect(isValidTransition('proposed', 'cancelled')).toBe(true);
+    expect(() => assertTransition('proposed', 'cancelled')).not.toThrow();
+
+    // proposed -> failed is the failure transition (timeout, error)
+    expect(isValidTransition('proposed', 'failed')).toBe(true);
+    expect(() => assertTransition('proposed', 'failed')).not.toThrow();
+
+    // Both are valid but distinct paths from 'proposed'
+    const validTargets = VALID_PROGRESS_TRANSITIONS['proposed'];
+    expect(validTargets).toContain('cancelled');
+    expect(validTargets).toContain('failed');
+    expect(validTargets).toContain('accepted');
+  });
+
+  // =========================================================================
   // UT-SWAP-SM-028: TERMINAL_PROGRESS set is correct
   // =========================================================================
 

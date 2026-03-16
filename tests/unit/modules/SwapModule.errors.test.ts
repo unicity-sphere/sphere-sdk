@@ -8,7 +8,7 @@
  * @see docs/SWAP-TEST-SPEC.md section 3.15
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createSwapModule, type SwapModule } from '../../../modules/swap/index.js';
 import {
   createTestSwapModule,
@@ -161,6 +161,53 @@ describe('SwapModule.errors', () => {
   });
 
   // =========================================================================
+  // UT-SWAP-ERR-008a: Escrow error DM transitions accepted swap to failed
+  //
+  // SWAP_ESCROW_REJECTED is defined as an error code but the current
+  // implementation handles escrow rejection via the DM handler: when
+  // the escrow sends an 'error' type DM for an 'accepted' swap, the
+  // swap transitions to 'failed' with a swap:failed event.
+  // =========================================================================
+
+  it('UT-SWAP-ERR-008a: escrow error DM transitions accepted swap to failed', async () => {
+    // Create an acceptor swap in 'accepted' state (post-acceptSwap, pre-announce_result)
+    const ref = createTestSwapRef({
+      role: 'acceptor',
+      progress: 'accepted',
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
+    });
+    injectSwapRef(module, ref);
+
+    // Simulate an escrow error DM (escrow rejected the manifest)
+    const errorDM = JSON.stringify({
+      type: 'error',
+      swap_id: ref.swapId,
+      error: 'INVALID_MANIFEST: currencies must differ',
+    });
+
+    mocks.communications._simulateIncomingDM(errorDM, DEFAULT_TEST_ESCROW_PUBKEY);
+
+    // Allow async DM handler to process
+    await new Promise(r => setTimeout(r, 100));
+
+    // Swap should transition to 'failed'
+    const updatedSwap = (module as any).swaps.get(ref.swapId);
+    expect(updatedSwap.progress).toBe('failed');
+
+    // swap:failed event should be emitted
+    const failedEvent = mocks.emitEvent._calls.find(
+      ([type]) => type === 'swap:failed',
+    );
+    expect(failedEvent).toBeDefined();
+    expect(failedEvent![1]).toMatchObject({
+      swapId: ref.swapId,
+      error: 'INVALID_MANIFEST: currencies must differ',
+    });
+  });
+
+  // =========================================================================
   // UT-SWAP-ERR-009: SWAP_NOT_FOUND — rejectSwap with nonexistent ID
   // =========================================================================
 
@@ -168,6 +215,67 @@ describe('SwapModule.errors', () => {
     const err = await module.rejectSwap('f'.repeat(64)).catch(e => e);
     expect(err).toBeInstanceOf(SphereError);
     expect(err.code).toBe('SWAP_NOT_FOUND');
+  });
+
+  // =========================================================================
+  // UT-SWAP-ERR-009a: announce failure transitions swap to failed
+  //
+  // When sendAnnounce exhausts all retries during acceptSwap, the swap
+  // transitions to 'failed' and a swap:failed event is emitted.
+  // =========================================================================
+
+  it('UT-SWAP-ERR-009a: announce failure in acceptSwap transitions to failed', async () => {
+    vi.useFakeTimers();
+
+    // Create an acceptor swap in 'proposed' state
+    const ref = createTestSwapRef({
+      role: 'acceptor',
+      progress: 'proposed',
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
+    });
+    injectSwapRef(module, ref);
+
+    // Make sendDM fail only for announce messages (JSON with type=announce)
+    mocks.communications.sendDM.mockImplementation(
+      async (recipient: string, content: string) => {
+        let parsed: any;
+        try {
+          parsed = JSON.parse(content);
+        } catch {
+          const idx = content.indexOf('{');
+          if (idx >= 0) parsed = JSON.parse(content.slice(idx));
+        }
+        if (parsed && parsed.type === 'announce') {
+          throw new Error('Escrow unreachable');
+        }
+        mocks.communications._sentDMs.push({ recipient, content });
+        return { eventId: 'mock-event-id' };
+      },
+    );
+
+    const acceptPromise = module.acceptSwap(ref.swapId);
+
+    // Advance through all retry delays
+    for (let i = 0; i < 10; i++) {
+      await vi.advanceTimersByTimeAsync(20000);
+    }
+
+    await acceptPromise;
+
+    vi.useRealTimers();
+
+    // Swap should be in 'failed' state
+    const updatedSwap = (module as any).swaps.get(ref.swapId);
+    expect(updatedSwap.progress).toBe('failed');
+
+    // swap:failed event should be emitted
+    const failedEvent = mocks.emitEvent._calls.find(
+      ([type]) => type === 'swap:failed',
+    );
+    expect(failedEvent).toBeDefined();
+    expect(failedEvent![1]).toMatchObject({ swapId: ref.swapId });
   });
 
   // =========================================================================

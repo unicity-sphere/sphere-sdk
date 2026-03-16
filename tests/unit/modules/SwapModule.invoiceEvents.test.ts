@@ -229,6 +229,56 @@ describe('SwapModule.invoiceEvents', () => {
   });
 
   // =========================================================================
+  // UT-SWAP-INV-004a: payout invoice delivery via DM emits swap:payout_received
+  //
+  // Note: The SwapModule does NOT subscribe to invoice:created for payout
+  // detection. Instead, payout invoices arrive via escrow DM (invoice_delivery
+  // with invoice_type='payout'). The DM handler imports the invoice and emits
+  // swap:payout_received. This is intentional per the design — the escrow
+  // controls payout delivery timing.
+  // =========================================================================
+
+  it('UT-SWAP-INV-004a: payout invoice delivery via DM emits swap:payout_received', async () => {
+    const depositInvoiceId = 'inv-deposit-004a';
+    const payoutInvoiceId = 'inv-payout-004a';
+    const ref = createTestSwapRef({
+      role: 'proposer',
+      progress: 'concluding',
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
+      depositInvoiceId,
+    });
+    injectSwapRef(module, ref);
+
+    // Simulate a payout invoice_delivery DM from the escrow
+    const payoutDeliveryDM = JSON.stringify({
+      type: 'invoice_delivery',
+      swap_id: ref.swapId,
+      invoice_type: 'payout',
+      invoice_id: payoutInvoiceId,
+      invoice_token: { version: '2.0', genesis: { data: {} }, state: {}, transactions: [] },
+    });
+
+    mocks.communications._simulateIncomingDM(payoutDeliveryDM, DEFAULT_TEST_ESCROW_PUBKEY);
+
+    // Verify swap:payout_received was emitted
+    await vi.waitFor(() => {
+      const payoutEvent = mocks.emitEvent._calls.find(
+        ([type]) => type === 'swap:payout_received',
+      );
+      expect(payoutEvent).toBeDefined();
+      expect(payoutEvent![1]).toMatchObject({
+        swapId: ref.swapId,
+        payoutInvoiceId,
+      });
+    });
+
+    // Verify importInvoice was called for the payout token
+    expect(mocks.accounting.importInvoice).toHaveBeenCalled();
+  });
+
+  // =========================================================================
   // UT-SWAP-INV-006: Invoice event for non-swap invoice ignored
   // =========================================================================
 

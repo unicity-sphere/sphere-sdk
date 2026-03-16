@@ -127,10 +127,11 @@ describe('SwapModule Lifecycle', () => {
     await module.load();
 
     // accounting.on() should be called for invoice:payment, invoice:covered,
-    // and potentially other events
+    // and invoice:return_received
     const calledEvents = mocks.accounting.on.mock.calls.map((call: any[]) => call[0]);
     expect(calledEvents).toContain('invoice:payment');
     expect(calledEvents).toContain('invoice:covered');
+    expect(calledEvents).toContain('invoice:return_received');
   });
 
   // --------------------------------------------------------------------------
@@ -277,6 +278,15 @@ describe('SwapModule Lifecycle', () => {
 
     // cancelSwap
     await expect(module.cancelSwap('fake-id')).rejects.toThrow(SphereError);
+
+    // deposit
+    await expect(module.deposit('fake-id')).rejects.toThrow(SphereError);
+
+    // getSwapStatus
+    await expect(module.getSwapStatus('fake-id')).rejects.toThrow(SphereError);
+
+    // verifyPayout
+    await expect(module.verifyPayout('fake-id')).rejects.toThrow(SphereError);
   });
 
   // --------------------------------------------------------------------------
@@ -307,5 +317,8 @@ describe('SwapModule Lifecycle', () => {
     await expect(module.acceptSwap('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
     await expect(module.rejectSwap('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
     await expect(module.cancelSwap('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
+    await expect(module.deposit('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
+    await expect(module.getSwapStatus('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
+    await expect(module.verifyPayout('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
   });
 });

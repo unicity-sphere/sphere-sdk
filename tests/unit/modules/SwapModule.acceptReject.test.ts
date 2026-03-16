@@ -108,19 +108,41 @@ describe('SwapModule.acceptSwap()', () => {
     expect(announceDM!.parsed.manifest.swap_id).toBe(swapRef.swapId);
   });
 
-  it('UT-SWAP-ACCEPT-003: stores escrowPubkey on swap after resolution', async () => {
+  it('UT-SWAP-ACCEPT-003: resolves and stores escrowPubkey, then DM handler calls importInvoice on invoice_delivery', async () => {
     // Remove escrowPubkey to force resolution
     swapRef.escrowPubkey = undefined as any;
     swapRef.escrowDirectAddress = undefined as any;
 
     await module.acceptSwap(swapRef.swapId);
 
+    // Verify escrow resolution was stored
     const updatedSwap = (module as any).swaps.get(swapRef.swapId) as SwapRef;
     expect(updatedSwap.escrowPubkey).toBe(DEFAULT_TEST_ESCROW_PUBKEY);
     expect(updatedSwap.escrowDirectAddress).toBe(DEFAULT_TEST_ESCROW_ADDRESS);
+
+    // Simulate an invoice_delivery DM from the escrow — the DM handler should call importInvoice
+    const invoiceDeliveryDM = JSON.stringify({
+      type: 'invoice_delivery',
+      swap_id: swapRef.swapId,
+      invoice_type: 'deposit',
+      invoice_id: 'test-deposit-invoice-003',
+      invoice_token: { version: '2.0', genesis: { data: {} }, state: {}, transactions: [] },
+      payment_instructions: {
+        your_currency: 'UCT',
+        your_amount: '1000000',
+        memo: `swap:${swapRef.swapId}`,
+      },
+    });
+
+    mocks.communications._simulateIncomingDM(invoiceDeliveryDM, DEFAULT_TEST_ESCROW_PUBKEY);
+
+    // Allow async processing to complete
+    await new Promise(r => setTimeout(r, 100));
+
+    expect(mocks.accounting.importInvoice).toHaveBeenCalled();
   });
 
-  it('UT-SWAP-ACCEPT-004: transitions to accepted', async () => {
+  it('UT-SWAP-ACCEPT-004: transitions to accepted state', async () => {
     await module.acceptSwap(swapRef.swapId);
 
     // Verify the swap:accepted event was emitted, confirming transition through 'accepted'
@@ -131,18 +153,33 @@ describe('SwapModule.acceptSwap()', () => {
     expect(acceptedEvent![1]).toEqual(
       expect.objectContaining({ swapId: swapRef.swapId, role: 'acceptor' }),
     );
+
+    // Verify the swap reached 'accepted' (or beyond, since announce may advance it further).
+    // acceptSwap transitions proposed -> accepted. If announce succeeds but no announce_result
+    // DM arrives yet, the swap stays in 'accepted'. If announce fails, it goes to 'failed'.
+    const updatedSwap = (module as any).swaps.get(swapRef.swapId) as SwapRef;
+    // The swap should be in 'accepted' (announce succeeded but no DM response yet to advance)
+    // or 'failed' (if announce failed). It should NOT still be 'proposed'.
+    expect(updatedSwap.progress).not.toBe('proposed');
+    // Since mocks succeed by default, it should be 'accepted'
+    expect(updatedSwap.progress).toBe('accepted');
   });
 
-  it('UT-SWAP-ACCEPT-005: emits swap:accepted event', async () => {
+  it('UT-SWAP-ACCEPT-005: emits swap:accepted event with complete payload', async () => {
     await module.acceptSwap(swapRef.swapId);
 
     const acceptedEvents = mocks.emitEvent._calls.filter(
       ([type]) => type === 'swap:accepted',
     );
     expect(acceptedEvents.length).toBe(1);
-    expect(acceptedEvents[0][1]).toEqual(
-      expect.objectContaining({ swapId: swapRef.swapId }),
-    );
+
+    const payload = acceptedEvents[0][1] as { swapId: string; role: string };
+    // Verify all required fields per SwapEventMap['swap:accepted']
+    expect(payload.swapId).toBe(swapRef.swapId);
+    expect(payload.role).toBe('acceptor');
+    // Ensure no unexpected undefined fields
+    expect(typeof payload.swapId).toBe('string');
+    expect(typeof payload.role).toBe('string');
   });
 
   it('UT-SWAP-ACCEPT-006: non-existent swap throws SWAP_NOT_FOUND', async () => {
