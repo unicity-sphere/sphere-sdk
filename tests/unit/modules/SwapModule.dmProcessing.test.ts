@@ -50,18 +50,7 @@ describe('SwapModule.dmProcessing', () => {
     await module.destroy();
   });
 
-  // =========================================================================
-  // Helper: wait for async DM handler to settle
-  // =========================================================================
-
-  /**
-   * The DM handler is async (fire-and-forget promise chain). We need a small
-   * delay to let the microtask queue drain after simulating an incoming DM.
-   */
-  async function waitForDMProcessing(): Promise<void> {
-    // Two ticks should be enough for the async handler chain
-    await new Promise(r => setTimeout(r, 50));
-  }
+  // (vi.waitFor used directly in each test for reliable async DM processing)
 
   // =========================================================================
   // UT-SWAP-DM-001: swap_proposal DM creates SwapRef with role='acceptor'
@@ -82,14 +71,15 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_PARTY_B_PUBKEY,
       'bob',
     );
-    await waitForDMProcessing();
 
     // Verify SwapRef was created
-    const swaps = module.getSwaps();
-    expect(swaps.length).toBe(1);
-    expect(swaps[0].role).toBe('acceptor');
-    expect(swaps[0].progress).toBe('proposed');
-    expect(swaps[0].swapId).toBe(manifest.swap_id);
+    await vi.waitFor(() => {
+      const swaps = module.getSwaps();
+      expect(swaps.length).toBe(1);
+      expect(swaps[0].role).toBe('acceptor');
+      expect(swaps[0].progress).toBe('proposed');
+      expect(swaps[0].swapId).toBe(manifest.swap_id);
+    });
   });
 
   // =========================================================================
@@ -109,20 +99,21 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_PARTY_B_PUBKEY,
       'bob',
     );
-    await waitForDMProcessing();
 
     // Check emitEvent was called with swap:proposal_received
-    const proposalEvent = mocks.emitEvent._calls.find(
-      ([type]) => type === 'swap:proposal_received',
-    );
-    expect(proposalEvent).toBeDefined();
-    expect(proposalEvent![1]).toMatchObject({
-      swapId: manifest.swap_id,
-      senderPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+    await vi.waitFor(() => {
+      const proposalEvent = mocks.emitEvent._calls.find(
+        ([type]) => type === 'swap:proposal_received',
+      );
+      expect(proposalEvent).toBeDefined();
+      expect(proposalEvent![1]).toMatchObject({
+        swapId: manifest.swap_id,
+        senderPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      });
+      // Verify deal is included in the event payload
+      const payload = proposalEvent![1] as { deal: unknown };
+      expect(payload.deal).toBeDefined();
     });
-    // Verify deal is included in the event payload
-    const payload = proposalEvent![1] as { deal: unknown };
-    expect(payload.deal).toBeDefined();
   });
 
   // =========================================================================
@@ -147,13 +138,14 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_PARTY_B_PUBKEY,
       'bob',
     );
-    await waitForDMProcessing();
 
     // Verify that sendDM was called with the escrow pubkey (announce)
-    const sentToEscrow = mocks.communications._sentDMs.find(
-      (dm) => dm.recipient === DEFAULT_TEST_ESCROW_PUBKEY,
-    );
-    expect(sentToEscrow).toBeDefined();
+    await vi.waitFor(() => {
+      const sentToEscrow = mocks.communications._sentDMs.find(
+        (dm) => dm.recipient === DEFAULT_TEST_ESCROW_PUBKEY,
+      );
+      expect(sentToEscrow).toBeDefined();
+    });
 
     // Verify swap:accepted event was emitted
     const acceptedEvent = mocks.emitEvent._calls.find(
@@ -180,11 +172,12 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_PARTY_B_PUBKEY,
       'bob',
     );
-    await waitForDMProcessing();
 
     // Verify progress is cancelled
-    const status = await module.getSwapStatus(ref.swapId);
-    expect(status.progress).toBe('cancelled');
+    await vi.waitFor(async () => {
+      const status = await module.getSwapStatus(ref.swapId);
+      expect(status.progress).toBe('cancelled');
+    });
 
     // Verify both swap:rejected and swap:cancelled were emitted
     const rejectedEvent = mocks.emitEvent._calls.find(
@@ -219,11 +212,12 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_ESCROW_PUBKEY,
       'escrow',
     );
-    await waitForDMProcessing();
 
     // Verify depositInvoiceId is stored
-    const status = await module.getSwapStatus(ref.swapId);
-    expect(status.depositInvoiceId).toBe(depositInvoiceId);
+    await vi.waitFor(async () => {
+      const status = await module.getSwapStatus(ref.swapId);
+      expect(status.depositInvoiceId).toBe(depositInvoiceId);
+    });
   });
 
   // =========================================================================
@@ -262,10 +256,11 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_ESCROW_PUBKEY,
       'escrow',
     );
-    await waitForDMProcessing();
 
     // Verify importInvoice was called
-    expect(mocks.accounting.importInvoice).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(mocks.accounting.importInvoice).toHaveBeenCalledTimes(1);
+    });
   });
 
   // =========================================================================
@@ -289,10 +284,11 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_ESCROW_PUBKEY,
       'escrow',
     );
-    await waitForDMProcessing();
 
-    const status = await module.getSwapStatus(ref.swapId);
-    expect(status.progress).toBe('concluding');
+    await vi.waitFor(async () => {
+      const status = await module.getSwapStatus(ref.swapId);
+      expect(status.progress).toBe('concluding');
+    });
   });
 
   // =========================================================================
@@ -315,10 +311,11 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_ESCROW_PUBKEY,
       'escrow',
     );
-    await waitForDMProcessing();
 
-    const status = await module.getSwapStatus(ref.swapId);
-    expect(status.progress).toBe('cancelled');
+    await vi.waitFor(async () => {
+      const status = await module.getSwapStatus(ref.swapId);
+      expect(status.progress).toBe('cancelled');
+    });
 
     // Verify swap:cancelled event
     const cancelEvent = mocks.emitEvent._calls.find(
@@ -350,18 +347,19 @@ describe('SwapModule.dmProcessing', () => {
       DEFAULT_TEST_ESCROW_PUBKEY,
       'escrow',
     );
-    await waitForDMProcessing();
 
     // Verify swap:bounce_received was emitted
-    const bounceEvent = mocks.emitEvent._calls.find(
-      ([type]) => type === 'swap:bounce_received',
-    );
-    expect(bounceEvent).toBeDefined();
-    expect(bounceEvent![1]).toMatchObject({
-      swapId: ref.swapId,
-      reason: 'WRONG_CURRENCY',
-      returnedAmount: '1000000',
-      returnedCurrency: 'UCT',
+    await vi.waitFor(() => {
+      const bounceEvent = mocks.emitEvent._calls.find(
+        ([type]) => type === 'swap:bounce_received',
+      );
+      expect(bounceEvent).toBeDefined();
+      expect(bounceEvent![1]).toMatchObject({
+        swapId: ref.swapId,
+        reason: 'WRONG_CURRENCY',
+        returnedAmount: '1000000',
+        returnedCurrency: 'UCT',
+      });
     });
   });
 
@@ -378,7 +376,9 @@ describe('SwapModule.dmProcessing', () => {
       'this is not JSON or a swap message',
       DEFAULT_TEST_PARTY_B_PUBKEY,
     );
-    await waitForDMProcessing();
+
+    // Allow microtask queue to drain
+    await new Promise(r => setTimeout(r, 50));
 
     // No new swaps created
     expect(module.getSwaps().length).toBe(swapsBefore.length);
@@ -412,7 +412,9 @@ describe('SwapModule.dmProcessing', () => {
       unknownPubkey,
       'charlie',
     );
-    await waitForDMProcessing();
+
+    // Allow microtask queue to drain
+    await new Promise(r => setTimeout(r, 50));
 
     // Swap should still be in 'proposed' (not accepted)
     const status = await module.getSwapStatus(ref.swapId);
@@ -433,7 +435,9 @@ describe('SwapModule.dmProcessing', () => {
       acceptanceDM,
       DEFAULT_TEST_PARTY_B_PUBKEY,
     );
-    await waitForDMProcessing();
+
+    // Allow microtask queue to drain
+    await new Promise(r => setTimeout(r, 50));
 
     // No new swaps created (acceptance does not create swaps)
     const swaps = module.getSwaps();

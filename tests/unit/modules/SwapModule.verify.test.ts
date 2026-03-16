@@ -127,30 +127,34 @@ describe('SwapModule — verifyPayout', () => {
   });
 
   // --------------------------------------------------------------------------
-  // UT-SWAP-VERIFY-002: verifyPayout checks correct counter-currency
+  // UT-SWAP-VERIFY-002: verifyPayout returns false for wrong currency
   // --------------------------------------------------------------------------
-  it('UT-SWAP-VERIFY-002: verifyPayout checks correct counter-currency', async () => {
-    // Party A proposed UCT->USDU swap, so payout should be USDU
-    const ref = setupVerifiableSwap(module, mocks, { payoutCoinId: 'USDU' });
+  it('UT-SWAP-VERIFY-002: verifyPayout returns false when invoice has wrong currency', async () => {
+    // Party A proposed UCT->USDU swap, so payout should be USDU.
+    // Set up invoice with WRONG_COIN instead — verifyPayout should return false.
+    const ref = setupVerifiableSwap(module, mocks, { payoutCoinId: 'WRONG_COIN' });
 
     const result = await module.verifyPayout(ref.swapId);
 
-    expect(result).toBe(true);
-    // getInvoice was called to inspect terms
-    expect(mocks.accounting.getInvoice).toHaveBeenCalledWith(ref.payoutInvoiceId);
+    expect(result).toBe(false);
+    // swap:failed event should have been emitted with currency mismatch
+    const failedEvents = mocks.emitEvent._calls.filter(([type]) => type === 'swap:failed');
+    expect(failedEvents.length).toBeGreaterThanOrEqual(1);
   });
 
   // --------------------------------------------------------------------------
-  // UT-SWAP-VERIFY-003: verifyPayout checks correct amount
+  // UT-SWAP-VERIFY-003: verifyPayout returns false for wrong amount
   // --------------------------------------------------------------------------
-  it('UT-SWAP-VERIFY-003: verifyPayout checks correct amount', async () => {
-    // Party A expects 500000 USDU (deal.partyBAmount)
-    const ref = setupVerifiableSwap(module, mocks, { payoutAmount: '500000' });
+  it('UT-SWAP-VERIFY-003: verifyPayout returns false when invoice has wrong amount', async () => {
+    // Party A expects 500000 USDU (deal.partyBAmount).
+    // Set up invoice with 999 instead — verifyPayout should return false.
+    const ref = setupVerifiableSwap(module, mocks, { payoutAmount: '999' });
 
     const result = await module.verifyPayout(ref.swapId);
 
-    expect(result).toBe(true);
-    expect(mocks.accounting.getInvoice).toHaveBeenCalledWith(ref.payoutInvoiceId);
+    expect(result).toBe(false);
+    const failedEvents = mocks.emitEvent._calls.filter(([type]) => type === 'swap:failed');
+    expect(failedEvents.length).toBeGreaterThanOrEqual(1);
   });
 
   // --------------------------------------------------------------------------

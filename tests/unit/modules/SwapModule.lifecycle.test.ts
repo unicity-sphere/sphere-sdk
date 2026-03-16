@@ -149,12 +149,12 @@ describe('SwapModule Lifecycle', () => {
     const accountingUnsubs = mocks.accounting.on.mock.results.map((r: any) => r.value);
 
     // Before destroy, the DM handler should be active
-    expect(mocks.communications._dmHandler).not.toBeNull();
+    expect(mocks.communications._dmHandlers.length).toBeGreaterThan(0);
 
     await module.destroy();
 
-    // The DM handler should have been unsubscribed (set to null)
-    expect(mocks.communications._dmHandler).toBeNull();
+    // The DM handlers should have been unsubscribed (array empty)
+    expect(mocks.communications._dmHandlers.length).toBe(0);
 
     // Accounting handlers should also be unsubscribed
     // (their unsub functions were called during destroy)
@@ -302,10 +302,10 @@ describe('SwapModule Lifecycle', () => {
     };
 
     // All public methods should throw SWAP_MODULE_DESTROYED
-    await expect(module.proposeSwap(deal)).rejects.toThrow('destroyed');
-    expect(() => module.getSwaps()).toThrow('destroyed');
-    await expect(module.acceptSwap('fake-id')).rejects.toThrow('destroyed');
-    await expect(module.rejectSwap('fake-id')).rejects.toThrow('destroyed');
-    await expect(module.cancelSwap('fake-id')).rejects.toThrow('destroyed');
+    await expect(module.proposeSwap(deal)).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
+    expect(() => module.getSwaps()).toThrow(expect.objectContaining({ code: 'SWAP_MODULE_DESTROYED' }));
+    await expect(module.acceptSwap('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
+    await expect(module.rejectSwap('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
+    await expect(module.cancelSwap('fake-id')).rejects.toMatchObject({ code: 'SWAP_MODULE_DESTROYED' });
   });
 });

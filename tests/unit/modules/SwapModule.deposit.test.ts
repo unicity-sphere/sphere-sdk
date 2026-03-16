@@ -138,12 +138,7 @@ describe('SwapModule.deposit()', () => {
     });
     injectSwapRef(module, ref);
 
-    await expect(module.deposit(ref.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.deposit(ref.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_WRONG_STATE');
-    }
+    await expect(module.deposit(ref.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
   });
 
   it('UT-SWAP-DEP-006: payInvoice failure throws SWAP_DEPOSIT_FAILED', async () => {
@@ -152,12 +147,7 @@ describe('SwapModule.deposit()', () => {
     const payError = new Error('Insufficient balance');
     mocks.accounting.payInvoice.mockRejectedValueOnce(payError);
 
-    await expect(module.deposit(ref.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.deposit(ref.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_DEPOSIT_FAILED');
-    }
+    await expect(module.deposit(ref.swapId)).rejects.toMatchObject({ code: 'SWAP_DEPOSIT_FAILED' });
   });
 
   it('UT-SWAP-DEP-007: no depositInvoiceId throws SWAP_WRONG_STATE', async () => {
@@ -172,12 +162,7 @@ describe('SwapModule.deposit()', () => {
     delete (ref as any).depositInvoiceId;
     injectSwapRef(module, ref);
 
-    await expect(module.deposit(ref.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.deposit(ref.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_WRONG_STATE');
-    }
+    await expect(module.deposit(ref.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
   });
 
   it('UT-SWAP-DEP-008: stores localDepositTransferId on success', async () => {

@@ -95,12 +95,7 @@ describe('SwapModule.cancelSwap()', () => {
     });
     injectSwapRef(module, ref);
 
-    await expect(module.cancelSwap(ref.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.cancelSwap(ref.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_ALREADY_COMPLETED');
-    }
+    await expect(module.cancelSwap(ref.swapId)).rejects.toMatchObject({ code: 'SWAP_ALREADY_COMPLETED' });
   });
 
   it('UT-SWAP-CANCEL-004: already cancelled throws SWAP_ALREADY_CANCELLED', async () => {
@@ -111,12 +106,7 @@ describe('SwapModule.cancelSwap()', () => {
     });
     injectSwapRef(module, ref);
 
-    await expect(module.cancelSwap(ref.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.cancelSwap(ref.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_ALREADY_CANCELLED');
-    }
+    await expect(module.cancelSwap(ref.swapId)).rejects.toMatchObject({ code: 'SWAP_ALREADY_CANCELLED' });
   });
 
   it('UT-SWAP-CANCEL-005: escrow swap_cancelled DM updates local state', async () => {

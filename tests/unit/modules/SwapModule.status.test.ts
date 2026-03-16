@@ -5,7 +5,7 @@
  * Tests for getSwapStatus() and getSwaps() methods.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   createTestSwapModule,
   createTestSwapRef,
@@ -62,30 +62,23 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
 
     await module.getSwapStatus(ref.swapId, { queryEscrow: true });
 
-    // Wait for the fire-and-forget promise to settle
-    await new Promise((r) => setTimeout(r, 50));
+    // Wait for the fire-and-forget DM to be sent
+    await vi.waitFor(() => {
+      expect(mocks.communications.sendDM).toHaveBeenCalledWith(
+        DEFAULT_TEST_ESCROW_PUBKEY,
+        expect.stringContaining('status'),
+      );
+    });
 
     // resolve() should have been called with the escrow address
     expect(mocks.resolve).toHaveBeenCalledWith(DEFAULT_TEST_ESCROW_ADDRESS);
-
-    // sendDM should have been called with the escrow pubkey
-    expect(mocks.communications.sendDM).toHaveBeenCalledWith(
-      DEFAULT_TEST_ESCROW_PUBKEY,
-      expect.stringContaining('status'),
-    );
   });
 
   // --------------------------------------------------------------------------
   // UT-SWAP-STATUS-003: getSwapStatus on non-existent swap throws SWAP_NOT_FOUND
   // --------------------------------------------------------------------------
   it('UT-SWAP-STATUS-003: getSwapStatus on non-existent swap throws SWAP_NOT_FOUND', async () => {
-    await expect(module.getSwapStatus('nonexistent_id_' + '0'.repeat(48))).rejects.toThrow(SphereError);
-
-    try {
-      await module.getSwapStatus('nonexistent_id_' + '0'.repeat(48));
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_NOT_FOUND');
-    }
+    await expect(module.getSwapStatus('nonexistent_id_' + '0'.repeat(48))).rejects.toMatchObject({ code: 'SWAP_NOT_FOUND' });
   });
 
   // --------------------------------------------------------------------------

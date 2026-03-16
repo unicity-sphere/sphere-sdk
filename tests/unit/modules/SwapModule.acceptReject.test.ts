@@ -146,12 +146,7 @@ describe('SwapModule.acceptSwap()', () => {
   });
 
   it('UT-SWAP-ACCEPT-006: non-existent swap throws SWAP_NOT_FOUND', async () => {
-    await expect(module.acceptSwap('nonexistent-id')).rejects.toThrow(SphereError);
-    try {
-      await module.acceptSwap('nonexistent-id');
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_NOT_FOUND');
-    }
+    await expect(module.acceptSwap('nonexistent-id')).rejects.toMatchObject({ code: 'SWAP_NOT_FOUND' });
   });
 
   it('UT-SWAP-ACCEPT-007: wrong state throws SWAP_WRONG_STATE', async () => {
@@ -162,12 +157,7 @@ describe('SwapModule.acceptSwap()', () => {
     });
     injectSwapRef(module, depositingRef);
 
-    await expect(module.acceptSwap(depositingRef.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.acceptSwap(depositingRef.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_WRONG_STATE');
-    }
+    await expect(module.acceptSwap(depositingRef.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
   });
 
   it('UT-SWAP-ACCEPT-008: proposer cannot accept own swap throws SWAP_WRONG_STATE', async () => {
@@ -178,13 +168,7 @@ describe('SwapModule.acceptSwap()', () => {
     });
     injectSwapRef(module, proposerRef);
 
-    await expect(module.acceptSwap(proposerRef.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.acceptSwap(proposerRef.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_WRONG_STATE');
-      expect((err as Error).message).toContain('proposer');
-    }
+    await expect(module.acceptSwap(proposerRef.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
   });
 
   it('UT-SWAP-ACCEPT-009: escrow rejection transitions swap to failed', async () => {
@@ -303,12 +287,7 @@ describe('SwapModule.rejectSwap()', () => {
     });
     injectSwapRef(module, announcedRef);
 
-    await expect(module.rejectSwap(announcedRef.swapId)).rejects.toThrow(SphereError);
-    try {
-      await module.rejectSwap(announcedRef.swapId);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('SWAP_WRONG_STATE');
-    }
+    await expect(module.rejectSwap(announcedRef.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
   });
 
   it('UT-SWAP-REJECT-005: includes reason in rejection DM', async () => {

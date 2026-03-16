@@ -10,7 +10,7 @@
  * @see docs/SWAP-TEST-SPEC.md section 3.9
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { SwapModule } from '../../../modules/swap/index.js';
 import {
   createTestSwapModule,
@@ -38,12 +38,7 @@ describe('SwapModule.invoiceEvents', () => {
     await module.destroy();
   });
 
-  /**
-   * Wait for async gate operations triggered by invoice events.
-   */
-  async function waitForEventProcessing(): Promise<void> {
-    await new Promise(r => setTimeout(r, 50));
-  }
+  // (vi.waitFor used directly in each test for reliable async event processing)
 
   // =========================================================================
   // UT-SWAP-INV-001: invoice:payment on deposit invoice emits
@@ -73,17 +68,18 @@ describe('SwapModule.invoiceEvents', () => {
       paymentDirection: 'forward',
       confirmed: true,
     });
-    await waitForEventProcessing();
 
     // Verify swap:deposit_confirmed was emitted
-    const depositEvent = mocks.emitEvent._calls.find(
-      ([type]) => type === 'swap:deposit_confirmed',
-    );
-    expect(depositEvent).toBeDefined();
-    expect(depositEvent![1]).toMatchObject({
-      swapId: ref.swapId,
-      party: 'A',
-      coinId: ref.manifest.party_a_currency_to_change,
+    await vi.waitFor(() => {
+      const depositEvent = mocks.emitEvent._calls.find(
+        ([type]) => type === 'swap:deposit_confirmed',
+      );
+      expect(depositEvent).toBeDefined();
+      expect(depositEvent![1]).toMatchObject({
+        swapId: ref.swapId,
+        party: 'A',
+        coinId: ref.manifest.party_a_currency_to_change,
+      });
     });
   });
 
@@ -109,15 +105,16 @@ describe('SwapModule.invoiceEvents', () => {
       invoiceId: depositInvoiceId,
       confirmed: true,
     });
-    await waitForEventProcessing();
 
     // Verify swap:deposits_covered was emitted
-    const coveredEvent = mocks.emitEvent._calls.find(
-      ([type]) => type === 'swap:deposits_covered',
-    );
-    expect(coveredEvent).toBeDefined();
-    expect(coveredEvent![1]).toMatchObject({
-      swapId: ref.swapId,
+    await vi.waitFor(() => {
+      const coveredEvent = mocks.emitEvent._calls.find(
+        ([type]) => type === 'swap:deposits_covered',
+      );
+      expect(coveredEvent).toBeDefined();
+      expect(coveredEvent![1]).toMatchObject({
+        swapId: ref.swapId,
+      });
     });
   });
 
@@ -142,11 +139,12 @@ describe('SwapModule.invoiceEvents', () => {
       invoiceId: depositInvoiceId,
       confirmed: true,
     });
-    await waitForEventProcessing();
 
     // Verify progress is now 'concluding'
-    const status = await module.getSwapStatus(ref.swapId);
-    expect(status.progress).toBe('concluding');
+    await vi.waitFor(async () => {
+      const status = await module.getSwapStatus(ref.swapId);
+      expect(status.progress).toBe('concluding');
+    });
   });
 
   // =========================================================================
@@ -176,16 +174,17 @@ describe('SwapModule.invoiceEvents', () => {
       transfer: returnTransfer,
       returnReason: 'timeout',
     });
-    await waitForEventProcessing();
 
     // Verify swap:deposit_returned was emitted
-    const returnEvent = mocks.emitEvent._calls.find(
-      ([type]) => type === 'swap:deposit_returned',
-    );
-    expect(returnEvent).toBeDefined();
-    expect(returnEvent![1]).toMatchObject({
-      swapId: ref.swapId,
-      returnReason: 'timeout',
+    await vi.waitFor(() => {
+      const returnEvent = mocks.emitEvent._calls.find(
+        ([type]) => type === 'swap:deposit_returned',
+      );
+      expect(returnEvent).toBeDefined();
+      expect(returnEvent![1]).toMatchObject({
+        swapId: ref.swapId,
+        returnReason: 'timeout',
+      });
     });
   });
 
@@ -211,11 +210,12 @@ describe('SwapModule.invoiceEvents', () => {
       transfer: { id: 'return-002', coinId: 'UCT', amount: '1000000' },
       returnReason: 'timeout',
     });
-    await waitForEventProcessing();
 
     // Verify progress is 'cancelled'
-    const status = await module.getSwapStatus(ref.swapId);
-    expect(status.progress).toBe('cancelled');
+    await vi.waitFor(async () => {
+      const status = await module.getSwapStatus(ref.swapId);
+      expect(status.progress).toBe('cancelled');
+    });
 
     // Verify swap:cancelled event emitted with depositsReturned=true
     const cancelEvent = mocks.emitEvent._calls.find(
@@ -258,7 +258,9 @@ describe('SwapModule.invoiceEvents', () => {
       paymentDirection: 'forward',
       confirmed: true,
     });
-    await waitForEventProcessing();
+
+    // Allow microtask queue to drain
+    await new Promise(r => setTimeout(r, 50));
 
     // No swap events should have been emitted
     const swapEvents = mocks.emitEvent._calls

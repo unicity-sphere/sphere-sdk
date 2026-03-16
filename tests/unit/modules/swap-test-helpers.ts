@@ -197,13 +197,13 @@ export interface MockCommunicationsModule {
   onDirectMessage: ReturnType<typeof vi.fn>;
   // Test helpers
   _sentDMs: Array<{ recipient: string; content: string }>;
-  _dmHandler: ((message: { senderPubkey: string; senderNametag?: string; content: string; timestamp: number }) => void) | null;
+  _dmHandlers: Array<(message: { senderPubkey: string; senderNametag?: string; content: string; timestamp: number }) => void>;
   _simulateIncomingDM: (content: string, senderPubkey: string, senderNametag?: string) => void;
 }
 
 export function createMockCommunicationsModule(): MockCommunicationsModule {
   const sentDMs: Array<{ recipient: string; content: string }> = [];
-  let dmHandler: ((message: { senderPubkey: string; senderNametag?: string; content: string; timestamp: number }) => void) | null = null;
+  let dmHandlers: Array<(message: { senderPubkey: string; senderNametag?: string; content: string; timestamp: number }) => void> = [];
 
   const sendDM = vi.fn().mockImplementation((recipientPubkey: string, content: string): Promise<{ eventId: string }> => {
     sentDMs.push({ recipient: recipientPubkey, content });
@@ -212,18 +212,16 @@ export function createMockCommunicationsModule(): MockCommunicationsModule {
 
   const onDirectMessage = vi.fn().mockImplementation(
     (handler: (message: { senderPubkey: string; senderNametag?: string; content: string; timestamp: number }) => void): (() => void) => {
-      dmHandler = handler;
+      dmHandlers.push(handler);
       return () => {
-        if (dmHandler === handler) {
-          dmHandler = null;
-        }
+        dmHandlers = dmHandlers.filter(h => h !== handler);
       };
     },
   );
 
   const _simulateIncomingDM = (content: string, senderPubkey: string, senderNametag?: string): void => {
-    if (dmHandler) {
-      dmHandler({
+    for (const handler of dmHandlers) {
+      handler({
         senderPubkey,
         senderNametag,
         content,
@@ -236,8 +234,8 @@ export function createMockCommunicationsModule(): MockCommunicationsModule {
     sendDM,
     onDirectMessage,
     _sentDMs: sentDMs,
-    get _dmHandler() {
-      return dmHandler;
+    get _dmHandlers() {
+      return dmHandlers;
     },
     _simulateIncomingDM,
   };
