@@ -494,9 +494,8 @@ function parseStatusResult(obj: Record<string, unknown>): ParsedSwapDM | null {
   };
   // Copy only safe, non-prototype fields for extensibility
   for (const key of Object.keys(obj)) {
-    if (key !== 'type' && key !== 'swap_id' && key !== 'state') {
-      payload[key] = obj[key];
-    }
+    if (key === 'type' || key === 'swap_id' || key === 'state' || key === '__proto__' || key === 'constructor') continue;
+    payload[key] = obj[key];
   }
 
   return {
@@ -519,9 +518,8 @@ function parsePaymentConfirmation(obj: Record<string, unknown>): ParsedSwapDM | 
   }
   // Copy only safe, non-prototype fields for extensibility
   for (const key of Object.keys(obj)) {
-    if (key !== 'type' && key !== 'swap_id' && key !== 'party') {
-      payload[key] = obj[key];
-    }
+    if (key === 'type' || key === 'swap_id' || key === 'party' || key === '__proto__' || key === 'constructor') continue;
+    payload[key] = obj[key];
   }
 
   return {

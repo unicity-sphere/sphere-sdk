@@ -885,25 +885,29 @@ export class SwapModule {
       // Step 6: Emit swap:accepted
       deps.emitEvent('swap:accepted', { swapId, role: swap.role });
 
-      // Step 7: Announce manifest to escrow (fire-and-forget, no await)
-      void (async () => {
-        try {
-          const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(
-            swap.deal, this.config, deps.resolve,
-          );
+      // Step 7: Resolve escrow and announce (awaited — escrowPubkey must be set
+      // before the gate releases, otherwise incoming escrow DMs will be rejected
+      // by isFromExpectedEscrow). If resolution fails, the swap transitions to failed.
+      if (!swap.escrowPubkey) {
+        const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(
+          swap.deal, this.config, deps.resolve,
+        );
+        swap.escrowPubkey = escrowPubkey;
+        swap.escrowDirectAddress = escrowDirectAddress;
+        await this.persistSwap(swap);
+      }
 
-          // Store resolved escrow pubkey on swap for later DM sender verification
-          swap.escrowPubkey = escrowPubkey;
-          swap.escrowDirectAddress = escrowDirectAddress;
-          await this.persistSwap(swap);
-
-          // Send announce DM to escrow
-          const announceDM = buildAnnounceDM(swap.manifest);
-          await deps.communications.sendDM(escrowPubkey, announceDM);
-        } catch (err) {
-          logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
-        }
-      })();
+      // Send announce DM to escrow (with retry via escrow-client)
+      try {
+        await sendAnnounce(deps.communications, swap.escrowPubkey!, swap.manifest);
+      } catch (err) {
+        // Announce failure — transition to failed per spec §5.1 step 8
+        await this.transitionProgress(swap, 'failed', {
+          error: 'Failed to send announce to escrow',
+        });
+        deps.emitEvent('swap:failed', { swapId, error: 'Failed to send announce to escrow' });
+        logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
+      }
     });
   }
 
@@ -1702,7 +1706,15 @@ export class SwapModule {
                         };
                       } | null;
 
-                      if (invoice) {
+                      if (!invoice) {
+                        logger.warn(LOG_TAG, `Deposit invoice ${depositInvoiceId} imported but not found locally for swap ${swapId}`);
+                        await this.transitionProgress(swap, 'failed', {
+                          error: 'Deposit invoice imported but not retrievable',
+                        });
+                        deps.emitEvent('swap:failed', { swapId, error: 'Deposit invoice imported but not retrievable' });
+                        return;
+                      }
+                      {
                         const terms = invoice.terms;
                         // Verify single target
                         if (terms.targets.length !== 1) {
