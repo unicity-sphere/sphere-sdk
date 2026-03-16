@@ -1484,6 +1484,20 @@ export class SwapModule {
               escrowAddress: proposalMsg.escrow,
             };
 
+            // Verify sender is the other party in the manifest (defense against impersonation)
+            const counterpartyAddress = isPartyA ? manifest.party_b_address : manifest.party_a_address;
+            try {
+              const counterpartyPeer = await deps.resolve(counterpartyAddress);
+              if (counterpartyPeer && counterpartyPeer.chainPubkey !== dm.senderPubkey) {
+                if (this.config.debug) {
+                  logger.debug(LOG_TAG, `Proposal sender mismatch: expected ${counterpartyPeer.chainPubkey}, got ${dm.senderPubkey}`);
+                }
+                return; // Sender is not the counterparty — drop silently
+              }
+            } catch {
+              // Best-effort: if resolution fails, allow the proposal (may be a nametag we can't resolve yet)
+            }
+
             // Resolve escrow address to store escrowPubkey for later DM verification
             let escrowPubkey: string | undefined;
             let escrowDirectAddr: string | undefined;
@@ -1565,8 +1579,9 @@ export class SwapModule {
 
               // Resolve escrow and announce (await inside gate — escrowPubkey must be set)
               try {
-                const { escrowPubkey } = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
+                const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
                 swap.escrowPubkey = escrowPubkey;
+                swap.escrowDirectAddress = escrowDirectAddress;
                 await this.persistSwap(swap);
                 await sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
               } catch (err) {
@@ -2302,6 +2317,26 @@ export class SwapModule {
     // Clear any existing timer for this swapId
     this.clearLocalTimer(swapId);
 
+    // Compute remaining time, accounting for elapsed time since creation
+    // (important for proposals loaded from storage on restart)
+    const swap = this.swaps.get(swapId);
+    const elapsed = swap ? Date.now() - swap.createdAt : 0;
+    const remaining = this.config.proposalTimeoutMs - elapsed;
+
+    if (remaining <= 0) {
+      // Already expired — transition immediately
+      void this.withSwapGate(swapId, async () => {
+        const s = this.swaps.get(swapId);
+        if (!s || s.progress !== 'proposed') return;
+        await this.transitionProgress(s, 'failed', {
+          error: 'Proposal timed out',
+        });
+      }).catch((err) => {
+        logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
+      });
+      return;
+    }
+
     const timer = setTimeout(() => {
       void this.withSwapGate(swapId, async () => {
         const s = this.swaps.get(swapId);
@@ -2315,7 +2350,7 @@ export class SwapModule {
       }).catch((err) => {
         logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
       });
-    }, this.config.proposalTimeoutMs);
+    }, remaining);
 
     this.localTimers.set(swapId, timer);
   }
