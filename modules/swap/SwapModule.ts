@@ -875,12 +875,12 @@ export class SwapModule {
 
     // Step 3: Enter per-swap gate
     await this.withSwapGate(swapId, async () => {
-      // Step 4: Send acceptance DM to the proposer
+      // Step 4: Transition to 'accepted' (persist-before-act)
+      await this.transitionProgress(swap, 'accepted');
+
+      // Step 5: Send acceptance DM to the proposer
       const dmContent = buildAcceptanceDM(swapId);
       await deps.communications.sendDM(swap.counterpartyPubkey!, dmContent);
-
-      // Step 5: Transition to 'accepted'
-      await this.transitionProgress(swap, 'accepted');
 
       // Step 6: Emit swap:accepted
       deps.emitEvent('swap:accepted', { swapId, role: swap.role });
@@ -1566,13 +1566,15 @@ export class SwapModule {
                 role: swap.role,
               });
 
-              // Announce to escrow (fire-and-forget)
+              // Announce to escrow — failure transitions to 'failed' (matches acceptor-side pattern)
               resolveEscrowAddress(swap.deal, this.config, deps.resolve)
                 .then(({ escrowPubkey }) => {
                   return sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
                 })
-                .catch((err) => {
+                .catch(async (err) => {
                   logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
+                  await this.transitionProgress(swap, 'failed', { error: 'Failed to announce to escrow' });
+                  deps.emitEvent('swap:failed', { swapId, error: 'Failed to announce to escrow' });
                 });
             });
             break;
@@ -1726,7 +1728,13 @@ export class SwapModule {
                           return;
                         }
                         // Verify target address matches escrow
-                        if (swap.escrowDirectAddress && terms.targets[0].address !== swap.escrowDirectAddress) {
+                        if (!swap.escrowDirectAddress) {
+                          logger.warn(LOG_TAG, `Cannot verify deposit invoice target for swap ${swapId}: escrow address not resolved`);
+                          await this.transitionProgress(swap, 'failed', { error: 'Cannot verify deposit invoice: escrow address unknown' });
+                          deps.emitEvent('swap:failed', { swapId, error: 'Cannot verify deposit invoice: escrow address unknown' });
+                          return;
+                        }
+                        if (terms.targets[0].address !== swap.escrowDirectAddress) {
                           logger.warn(LOG_TAG, `Deposit invoice for swap ${swapId} targets wrong address`);
                           await this.transitionProgress(swap, 'failed', {
                             error: 'Deposit invoice targets wrong address',

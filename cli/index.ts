@@ -3140,7 +3140,7 @@ async function main() {
           want: `${wantAmount} ${args[wantCoinIdx + 1]}`,
           escrow: deal.escrowAddress ?? '(config default)',
           timeout: timeout,
-          status: result.progress,
+          status: result.swap?.progress ?? 'proposed',
         }, null, 2));
 
         await closeSphere();
@@ -3281,38 +3281,38 @@ async function main() {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const swapRef = await swapModule.getSwapStatus(swapId);
             const waitTimeout = 2 * (swapRef?.deal?.timeout ?? 3600) * 1000;
+            const unsubs: (() => void)[] = [];
             await new Promise<void>((resolve, reject) => {
               const timer = setTimeout(() => {
+                unsubs.forEach(u => u());
                 reject(new Error(`Swap did not complete within timeout. Current progress: ${swapRef?.progress ?? 'unknown'}`));
               }, waitTimeout);
 
-              const handler = (event: { swapId: string; progress: string; amount?: string; coinId?: string }) => {
-                if (event.swapId !== swapId) return;
-                if (event.progress === 'completed') {
-                  clearTimeout(timer);
-                  console.log(`[swap] Swap completed!${event.amount ? ` Received ${event.amount} ${event.coinId ?? ''}` : ''}`);
-                  resolve();
-                } else if (event.progress === 'cancelled' || event.progress === 'failed') {
-                  clearTimeout(timer);
-                  console.log(`[swap] Swap ${event.progress}.`);
-                  resolve();
-                } else {
-                  console.log(`[swap] Progress: ${event.progress}`);
-                }
+              const done = (msg: string) => {
+                clearTimeout(timer);
+                unsubs.forEach(u => u());
+                console.log(msg);
+                resolve();
               };
 
-              sphere.on('swap:completed', handler);
-              sphere.on('swap:cancelled', handler);
-              sphere.on('swap:failed', handler);
-              sphere.on('swap:deposit_confirmed', (e: { swapId: string }) => {
+              unsubs.push(sphere.on('swap:completed', (e: { swapId: string }) => {
+                if (e.swapId === swapId) done('[swap] Swap completed!');
+              }));
+              unsubs.push(sphere.on('swap:cancelled', (e: { swapId: string }) => {
+                if (e.swapId === swapId) done('[swap] Swap cancelled.');
+              }));
+              unsubs.push(sphere.on('swap:failed', (e: { swapId: string; error: string }) => {
+                if (e.swapId === swapId) done(`[swap] Swap failed: ${e.error}`);
+              }));
+              unsubs.push(sphere.on('swap:deposit_confirmed', (e: { swapId: string }) => {
                 if (e.swapId === swapId) console.log('[swap] Deposit confirmed by escrow.');
-              });
-              sphere.on('swap:counterparty_deposited', (e: { swapId: string }) => {
-                if (e.swapId === swapId) console.log('[swap] Counterparty deposited. Escrow concluding...');
-              });
-              sphere.on('swap:payout_received', (e: { swapId: string }) => {
+              }));
+              unsubs.push(sphere.on('swap:deposits_covered', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] All deposits covered. Escrow concluding...');
+              }));
+              unsubs.push(sphere.on('swap:payout_received', (e: { swapId: string }) => {
                 if (e.swapId === swapId) console.log('[swap] Payout received. Verifying...');
-              });
+              }));
             });
           }
         } else {

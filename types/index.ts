@@ -587,7 +587,7 @@ export interface SphereEventMap {
   'swap:concluding': { swapId: string };
   'swap:payout_received': { swapId: string; payoutInvoiceId: string };
   'swap:completed': { swapId: string; payoutVerified: boolean };
-  'swap:cancelled': { swapId: string; reason: 'timeout' | 'explicit' | 'escrow_failed'; depositsReturned: boolean };
+  'swap:cancelled': { swapId: string; reason: 'timeout' | 'explicit' | 'escrow_failed' | 'rejected'; depositsReturned?: boolean };
   'swap:failed': { swapId: string; error: string };
   'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
   'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
