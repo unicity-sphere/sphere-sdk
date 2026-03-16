@@ -72,6 +72,11 @@ npm run cli -- --help
 | `invoice-transfers <id>` | List related transfers |
 | `invoice-export <id>` | Export invoice to JSON file |
 | `invoice-parse-memo <memo>` | Parse an invoice memo string |
+| `swap-propose` | Propose a swap deal to a counterparty |
+| `swap-list` | List swap deals |
+| `swap-accept <id>` | Accept a swap deal |
+| `swap-status <id>` | Show detailed swap status |
+| `swap-deposit <id>` | Deposit into an announced swap |
 | `daemon start` | Start persistent event listener |
 | `daemon stop` | Stop running daemon |
 | `daemon status` | Check daemon status |
@@ -967,7 +972,205 @@ npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"
 
 ---
 
-## 11. Event Daemon
+## 11. Token Swaps
+
+The swap module enables trustless two-party token swaps via an escrow service. Both parties agree on terms, deposit their tokens into the escrow, and the escrow executes the exchange atomically -- either both parties receive their tokens, or both deposits are returned.
+
+**Prerequisites:**
+- Two wallet profiles set up (or two terminals with different data directories)
+- Both wallets initialized with nametags
+- Tokens available for the swap
+- An escrow service address (e.g., `@escrow-testnet` on testnet)
+
+> **Note:** The swap module requires the Accounting module (for invoice-based deposits) and the Communications module (for DM negotiation). Both are included by default.
+
+### Complete Walkthrough: Two-Party Token Swap
+
+This example shows Alice proposing a swap and Bob accepting it, using two terminals.
+
+**Terminal 1: Alice (@alice) -- the proposer**
+
+```bash
+# 1. Check Alice's balance
+npm run cli -- balance
+# Output: UCT: 10,000,000 (10 UCT)
+
+# 2. Propose a swap: Alice offers 1,000,000 UCT for 500,000 USDU
+npm run cli -- swap-propose \
+  --to @bob \
+  --offer-coin UCT --offer-amount 1000000 \
+  --want-coin USDU --want-amount 500000 \
+  --escrow @escrow-testnet \
+  --timeout 3600 \
+  --message "Trading 1 UCT for 0.5 USDU"
+
+# Output:
+# Swap proposed:
+# {
+#   "swap_id": "a1b2c3d4e5f6...",
+#   "counterparty": "@bob",
+#   "offer": "1000000 UCT",
+#   "want": "500000 USDU",
+#   "escrow": "@escrow-testnet",
+#   "timeout": 3600,
+#   "status": "proposed"
+# }
+
+# 3. Check swap list
+npm run cli -- swap-list
+# SWAP ID   ROLE        PROGRESS            OFFER             WANT              COUNTERPARTY    CREATED
+# a1b2c3d4  proposer    proposed            1000000 UCT       500000 USDU       @bob            just now
+
+# 4. Wait for Bob to accept...
+npm run cli -- swap-status a1b2c3d4e5f6...full64hex...
+```
+
+**Terminal 2: Bob (@bob) -- the acceptor**
+
+```bash
+# 1. Check Bob's balance
+npm run cli -- balance
+# Output: USDU: 5,000,000 (5 USDU)
+
+# 2. Check incoming swap proposals
+npm run cli -- swap-list
+# SWAP ID   ROLE        PROGRESS            OFFER             WANT              COUNTERPARTY    CREATED
+# a1b2c3d4  acceptor    proposed            500000 USDU       1000000 UCT       @alice          30 sec ago
+#
+# Note: from Bob's perspective, "OFFER" is what HE would send (USDU),
+# and "WANT" is what he receives (UCT).
+
+# 3. Accept the swap AND deposit in one command
+npm run cli -- swap-accept a1b2c3d4e5f6...full64hex... --deposit
+# Output:
+# Swap accepted. Announced to escrow. Waiting for deposit invoice...
+# Deposit sent: transfer_xyz789
+# [swap] Deposit confirmed by escrow.
+# [swap] Awaiting counterparty deposit...
+```
+
+**Terminal 1: Alice deposits**
+
+```bash
+# 5. Alice sees the swap is now 'announced' (escrow ready)
+npm run cli -- swap-list
+# SWAP ID   ROLE        PROGRESS            OFFER             WANT              COUNTERPARTY    CREATED
+# a1b2c3d4  proposer    announced           1000000 UCT       500000 USDU       @bob            2 min ago
+
+# 6. Alice deposits her side
+npm run cli -- swap-deposit a1b2c3d4e5f6...full64hex...
+# Output:
+# Deposit result:
+# {
+#   "id": "transfer_abc123",
+#   "status": "delivered"
+# }
+
+# 7. Check progress -- both deposits made
+npm run cli -- swap-status a1b2c3d4e5f6...full64hex...
+# progress: "concluding"
+# escrowState: "CONCLUDING"
+```
+
+**Both terminals: Swap completes**
+
+After the escrow processes payouts, both parties receive their tokens.
+
+```bash
+# Alice checks:
+npm run cli -- swap-list --all
+# a1b2c3d4  proposer    completed           1000000 UCT       500000 USDU       @bob            5 min ago
+
+npm run cli -- balance
+# UCT: 9,000,000 (was 10M, sent 1M)
+# USDU: 500,000 (received from swap!)
+
+# Bob checks:
+npm run cli -- swap-list --all
+# a1b2c3d4  acceptor    completed           500000 USDU       1000000 UCT       @alice          5 min ago
+
+npm run cli -- balance
+# USDU: 4,500,000 (was 5M, sent 0.5M)
+# UCT: 1,000,000 (received from swap!)
+```
+
+### Checking Progress and Troubleshooting
+
+```bash
+# Detailed status with escrow query (asks the escrow for its view)
+npm run cli -- swap-status a1b2c3d4...full64hex... --query-escrow
+
+# Filter swaps by progress state
+npm run cli -- swap-list --progress depositing
+npm run cli -- swap-list --progress announced
+
+# Filter by role
+npm run cli -- swap-list --role proposer
+npm run cli -- swap-list --role acceptor
+
+# Show all swaps including completed/cancelled/failed (default hides terminal)
+npm run cli -- swap-list --all
+```
+
+### Cancellation and Timeouts
+
+Swaps that are not fully deposited within the timeout period are automatically cancelled by the escrow. Any deposits already made are returned.
+
+```bash
+# If you proposed a swap and want to check if it timed out:
+npm run cli -- swap-status a1b2c3d4...full64hex...
+# progress: "cancelled"
+# escrowState: "CANCELLED"
+
+# Deposits are returned automatically by the escrow.
+# Check your balance to confirm tokens were returned:
+npm run cli -- balance
+```
+
+> **Note:** There is no explicit cancel command for the proposer after the escrow is announced. Cancellation happens automatically via the escrow timeout. Before acceptance, the proposal simply expires after 5 minutes (client-side timeout).
+
+### All Swap CLI Commands Reference
+
+| Command | Description | Key Flags |
+|---------|-------------|-----------|
+| `swap-propose` | Propose a swap deal | `--to`, `--offer-coin`, `--offer-amount`, `--want-coin`, `--want-amount`, `--escrow`, `--timeout`, `--message` |
+| `swap-list` | List swaps | `--all`, `--role <proposer\|acceptor>`, `--progress <state>` |
+| `swap-accept <id>` | Accept a swap | `--deposit` (also deposit immediately), `--no-wait` (do not wait for completion) |
+| `swap-status <id>` | Detailed status | `--query-escrow` (query the escrow for its state) |
+| `swap-deposit <id>` | Deposit into swap | (no additional flags) |
+
+**Swap IDs** are 64-character hex strings (content-addressed from the manifest). The `swap-list` output shows an 8-character prefix for readability. All commands that accept a swap ID require the full 64-character ID.
+
+### Swap Progress States
+
+| State | Meaning |
+|-------|---------|
+| `proposed` | Proposal sent or received, waiting for counterparty |
+| `accepted` | Counterparty accepted, announcing to escrow |
+| `announced` | Escrow acknowledged, deposit invoice available |
+| `depositing` | Local deposit sent, awaiting confirmation |
+| `awaiting_counter` | Local deposit confirmed, waiting for counterparty |
+| `concluding` | Both deposited, escrow processing payouts |
+| `completed` | Swap done -- tokens exchanged (terminal) |
+| `cancelled` | Swap cancelled -- timeout or escrow failure (terminal) |
+| `failed` | Unrecoverable error (terminal) |
+
+### Swap Propose Flags
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--to <recipient>` | Yes | Counterparty: `@nametag`, `DIRECT://...`, or chain pubkey |
+| `--offer-coin <coinId>` | Yes | Coin ID you are offering (e.g., `UCT`) |
+| `--offer-amount <amount>` | Yes | Amount you are offering (positive integer, smallest units) |
+| `--want-coin <coinId>` | Yes | Coin ID you want in return (e.g., `USDU`) |
+| `--want-amount <amount>` | Yes | Amount you want in return (positive integer, smallest units) |
+| `--escrow <address>` | No | Escrow service address (defaults to module config) |
+| `--timeout <seconds>` | No | Swap timeout in seconds, 60-86400 (default: 3600) |
+| `--message <text>` | No | Human-readable message included in proposal DM |
+
+---
+
+## 12. Event Daemon
 
 The daemon runs in the background and reacts to wallet events — incoming transfers, DMs, payment requests — by triggering actions such as auto-receive, webhook calls, bash scripts, or log writes.
 
@@ -1076,7 +1279,7 @@ For complex setups, write a JSON config file at `.sphere-cli/daemon.json`:
 
 ---
 
-## 12. Utility Commands
+## 13. Utility Commands
 
 ### Encryption
 
@@ -1155,7 +1358,7 @@ npm run cli -- base58-decode Xm4A9...
 
 ---
 
-## 13. Global Flags
+## 14. Global Flags
 
 These flags are accepted by all commands:
 
@@ -1170,7 +1373,7 @@ npm run cli -- init --network testnet --no-nostr
 
 ---
 
-## 14. Common Workflows
+## 15. Common Workflows
 
 ### Create Wallet, Register Nametag, Send Tokens
 

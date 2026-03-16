@@ -601,6 +601,80 @@ sphere.on('invoice:overpayment', ({ invoiceId, coinId, surplus }) => {
 });
 ```
 
+## Token Swaps
+
+The swap module enables trustless two-party token exchanges via an escrow service. Enable it when initializing:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,  // Required (swap uses invoices internally)
+  swap: true,        // Enable swap module
+});
+```
+
+**Propose a swap:**
+
+```typescript
+const result = await sphere.swap!.proposeSwap({
+  partyA: sphere.identity!.directAddress!,
+  partyB: '@bob',
+  partyACurrency: 'UCT',
+  partyAAmount: '1000000',
+  partyBCurrency: 'USDU',
+  partyBAmount: '500000',
+  timeout: 3600,
+  escrowAddress: '@escrow-testnet',
+});
+
+console.log('Swap ID:', result.swapId);
+```
+
+**Accept and deposit (counterparty side):**
+
+```typescript
+sphere.on('swap:proposal_received', async (data) => {
+  console.log('Swap proposal from:', data.senderNametag ?? data.senderPubkey);
+
+  await sphere.swap!.acceptSwap(data.swapId);
+  const transfer = await sphere.swap!.deposit(data.swapId);
+  console.log('Deposit sent:', transfer.id);
+});
+```
+
+**Deposit (proposer side, after counterparty accepts):**
+
+```typescript
+sphere.on('swap:announced', async (data) => {
+  const transfer = await sphere.swap!.deposit(data.swapId);
+  console.log('Deposit sent:', transfer.id);
+});
+```
+
+**Monitor swap lifecycle:**
+
+```typescript
+sphere.on('swap:completed', ({ swapId, payoutVerified }) => {
+  console.log('Swap completed:', swapId, 'Verified:', payoutVerified);
+});
+
+sphere.on('swap:cancelled', ({ swapId, reason, depositsReturned }) => {
+  console.log('Swap cancelled:', swapId, reason, 'Returned:', depositsReturned);
+});
+
+sphere.on('swap:failed', ({ swapId, error }) => {
+  console.log('Swap failed:', swapId, error);
+});
+```
+
+**List and query:**
+
+```typescript
+const swaps = sphere.swap!.getSwaps({ excludeTerminal: true });
+const status = await sphere.swap!.getSwapStatus(swapId, { queryEscrow: true });
+```
+
 ## Error Handling
 
 ```typescript

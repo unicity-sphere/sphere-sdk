@@ -436,6 +436,87 @@ sphere.on('invoice:covered', (event) => {
 
 > **Note:** `createInvoice()` requires the Oracle (Aggregator) provider, which is included automatically by `createBrowserProviders()`.
 
+### Token Swaps
+
+The swap module enables trustless two-party token exchanges via an escrow service. Enable it when initializing:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,  // Required (swap uses invoices internally)
+  swap: true,        // Enable swap module
+});
+```
+
+**Propose a swap:**
+
+```typescript
+const result = await sphere.swap!.proposeSwap({
+  partyA: sphere.identity!.directAddress!,
+  partyB: '@bob',
+  partyACurrency: 'UCT',
+  partyAAmount: '1000000',
+  partyBCurrency: 'USDU',
+  partyBAmount: '500000',
+  timeout: 3600,
+  escrowAddress: '@escrow-testnet',
+});
+
+console.log('Swap ID:', result.swapId);
+// result.swap.progress === 'proposed'
+```
+
+**Listen for incoming proposals and accept:**
+
+```typescript
+sphere.on('swap:proposal_received', async (data) => {
+  console.log('Swap proposal from:', data.senderNametag ?? data.senderPubkey);
+  console.log('Deal:', data.deal);
+
+  // Accept and deposit
+  await sphere.swap!.acceptSwap(data.swapId);
+  await sphere.swap!.deposit(data.swapId);
+});
+```
+
+**Deposit into a swap (proposer side, after counterparty accepts):**
+
+```typescript
+sphere.on('swap:announced', async (data) => {
+  // Escrow is ready, deposit now
+  const transferResult = await sphere.swap!.deposit(data.swapId);
+  console.log('Deposit sent:', transferResult.id);
+});
+```
+
+**Monitor progress:**
+
+```typescript
+sphere.on('swap:completed', (data) => {
+  console.log('Swap completed!', data.swapId, 'Payout verified:', data.payoutVerified);
+});
+
+sphere.on('swap:cancelled', (data) => {
+  console.log('Swap cancelled:', data.swapId, 'Reason:', data.reason);
+});
+
+sphere.on('swap:failed', (data) => {
+  console.log('Swap failed:', data.swapId, data.error);
+});
+```
+
+**List and query swaps:**
+
+```typescript
+// All active swaps
+const swaps = sphere.swap!.getSwaps({ excludeTerminal: true });
+
+// Detailed status (optionally query the escrow for its view)
+const status = await sphere.swap!.getSwapStatus(swapId, { queryEscrow: true });
+console.log('Progress:', status.progress, 'Escrow state:', status.escrowState);
+```
+
 ## Import Existing Wallet
 
 ```typescript

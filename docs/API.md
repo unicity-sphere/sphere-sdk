@@ -2789,6 +2789,248 @@ All invoice events are emitted via `sphere.on(eventType, handler)`.
 
 ---
 
+## SwapModule (Token Swaps)
+
+Orchestrates two-party atomic token swaps via an escrow service. The module manages the wallet-side state machine, DM-based negotiation with the counterparty, escrow interaction, deposit payment (via AccountingModule invoices), and payout verification.
+
+The module is a **client** of the escrow service -- it does not hold funds or execute payouts. Those responsibilities belong to the escrow.
+
+### Lifecycle
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,   // Required -- swap uses invoices internally
+  swap: true,         // Enable with defaults
+  // swap: { defaultEscrowAddress: '@escrow-testnet', proposalTimeoutMs: 300000 },
+});
+
+const swap = sphere.swap!;
+```
+
+### Configuration
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `defaultEscrowAddress` | `string` | `undefined` | Default escrow `@nametag` or `DIRECT://` address |
+| `proposalTimeoutMs` | `number` | `300000` (5 min) | Client-side timeout for proposal acceptance |
+| `maxPendingSwaps` | `number` | `100` | Max non-terminal swaps tracked simultaneously |
+| `announceTimeoutMs` | `number` | `30000` (30 sec) | Timeout for escrow announce response |
+| `terminalPurgeTtlMs` | `number` | `604800000` (7 days) | TTL before completed/cancelled swaps are purged from storage |
+
+### Core Types
+
+#### `SwapDeal`
+
+User-facing description of what is being exchanged. Passed to `proposeSwap()`.
+
+```typescript
+interface SwapDeal {
+  readonly partyA: string;          // Proposer address: @nametag, DIRECT://, or chain pubkey
+  readonly partyB: string;          // Counterparty address
+  readonly partyACurrency: string;  // Coin ID party A deposits (e.g., 'UCT')
+  readonly partyAAmount: string;    // Amount in smallest units (positive integer string)
+  readonly partyBCurrency: string;  // Coin ID party B deposits
+  readonly partyBAmount: string;    // Amount in smallest units
+  readonly timeout: number;         // Swap timeout in seconds [60, 86400]
+  readonly escrowAddress?: string;  // Escrow service address (falls back to config default)
+}
+```
+
+#### `SwapRef`
+
+The persistent swap record stored locally. Contains all state needed to resume across restarts.
+
+```typescript
+interface SwapRef {
+  readonly swapId: string;           // 64 hex chars, content-addressed from manifest
+  readonly deal: SwapDeal;
+  readonly manifest: SwapManifest;   // Wire-format manifest (DIRECT:// addresses)
+  readonly role: SwapRole;           // 'proposer' | 'acceptor'
+  progress: SwapProgress;            // Current state in the client-side state machine
+  depositInvoiceId?: string;         // Set after escrow announcement
+  payoutInvoiceId?: string;          // Set after escrow delivers payout
+  escrowState?: string;              // Last known escrow state (informational)
+  counterpartyPubkey?: string;       // Resolved counterparty chain pubkey
+  localDepositTransferId?: string;   // Transfer ID of local deposit
+  escrowPubkey?: string;             // Resolved escrow chain pubkey
+  payoutVerified: boolean;           // Whether payout was verified
+  readonly createdAt: number;        // ms timestamp
+  announcedAt?: number;              // ms timestamp when escrow acknowledged
+  updatedAt: number;                 // ms timestamp of last state change
+  error?: string;                    // Error message if progress is 'failed'
+}
+```
+
+#### `SwapProgress`
+
+Client-side state machine:
+
+```
+proposed -> accepted -> announced -> depositing -> awaiting_counter
+  -> concluding -> completed
+
+Terminal states: completed, cancelled, failed
+```
+
+| State | Description |
+|-------|-------------|
+| `proposed` | Proposal sent (proposer) or received (acceptor) |
+| `accepted` | Counterparty accepted, announcing to escrow |
+| `announced` | Escrow acknowledged, deposit invoice available |
+| `depositing` | Local deposit sent, awaiting confirmation |
+| `awaiting_counter` | Local deposit confirmed, waiting for counterparty |
+| `concluding` | Both deposited, escrow executing payouts |
+| `completed` | Swap done, tokens exchanged (terminal) |
+| `cancelled` | Swap cancelled (terminal) |
+| `failed` | Unrecoverable error (terminal) |
+
+### Methods
+
+#### `proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapProposalResult>`
+
+Propose a swap to a counterparty. Resolves addresses, computes the content-addressed swap ID, sends a proposal DM, and creates a local `SwapRef` with `progress='proposed'`.
+
+```typescript
+const result = await swap.proposeSwap({
+  partyA: sphere.identity!.directAddress!,
+  partyB: '@bob',
+  partyACurrency: 'UCT',
+  partyAAmount: '1000000',
+  partyBCurrency: 'USDU',
+  partyBAmount: '500000',
+  timeout: 3600,
+  escrowAddress: '@escrow-testnet',
+}, { message: 'Trading 1 UCT for 0.5 USDU' });
+
+console.log(result.swapId);     // 64-char hex
+console.log(result.manifest);   // Wire-format manifest
+console.log(result.swap);       // SwapRef
+```
+
+**Throws:** `SWAP_LIMIT_EXCEEDED`, `INVALID_RECIPIENT`, `TRANSPORT_ERROR`
+
+#### `acceptSwap(swapId: string): Promise<void>`
+
+Accept a swap proposal. Sends an acceptance DM to the proposer, announces the manifest to the escrow, and waits for the escrow's `announce_result`. After successful announcement, the swap transitions to `announced` and a deposit invoice is available.
+
+```typescript
+await swap.acceptSwap(swapId);
+// swap.progress is now 'announced'
+```
+
+**Throws:** `SWAP_NOT_FOUND`, `SWAP_INVALID_STATE` (if not in `proposed` state)
+
+#### `rejectSwap(swapId: string, reason?: string): Promise<void>`
+
+Reject a swap proposal. Sends a rejection DM to the proposer. The swap transitions to `cancelled` locally.
+
+```typescript
+await swap.rejectSwap(swapId, 'Price too high');
+```
+
+#### `deposit(swapId: string): Promise<TransferResult>`
+
+Deposit into an announced swap. Pays the escrow's deposit invoice with the correct currency and amount for this party's role.
+
+```typescript
+const result = await swap.deposit(swapId);
+console.log(result.id, result.status);
+```
+
+**Throws:** `SWAP_NOT_FOUND`, `SWAP_INVALID_STATE` (if not `announced` or `awaiting_counter`), `INSUFFICIENT_BALANCE`
+
+#### `getSwapStatus(swapId: string, options?: GetSwapStatusOptions): Promise<SwapRef>`
+
+Get the current swap status. By default, queries the escrow for active swaps (not for terminal swaps).
+
+```typescript
+const ref = await swap.getSwapStatus(swapId, { queryEscrow: true });
+console.log(ref.progress, ref.escrowState);
+```
+
+**Options:**
+- `queryEscrow?: boolean` -- If true, sends a status DM to the escrow and merges the response.
+
+#### `getSwaps(filter?: GetSwapsFilter): SwapRef[]`
+
+List swaps with optional filtering.
+
+```typescript
+// All active swaps
+const active = swap.getSwaps({ excludeTerminal: true });
+
+// Only swaps where I am the proposer
+const proposed = swap.getSwaps({ role: 'proposer' });
+
+// Specific progress state
+const depositing = swap.getSwaps({ progress: 'depositing' });
+
+// Multiple progress states
+const pending = swap.getSwaps({ progress: ['proposed', 'accepted', 'announced'] });
+```
+
+**Filter options:**
+- `progress?: SwapProgress | SwapProgress[]` -- Filter by state(s)
+- `role?: SwapRole` -- Filter by `'proposer'` or `'acceptor'`
+- `excludeTerminal?: boolean` -- Exclude completed/cancelled/failed swaps
+
+#### `verifyPayout(swapId: string): Promise<boolean>`
+
+Verify that the payout invoice has been correctly fulfilled. Checks that the payout invoice terms match the swap manifest and that the invoice is covered. Returns `true` if verification passes, `false` otherwise.
+
+```typescript
+const verified = await swap.verifyPayout(swapId);
+console.log('Payout verified:', verified);
+```
+
+#### `cancelSwap(swapId: string): Promise<void>`
+
+Cancel a swap locally. The swap transitions to `cancelled`. This does NOT communicate with the escrow -- use this for local cleanup of swaps that are stuck in non-terminal states.
+
+```typescript
+await swap.cancelSwap(swapId);
+```
+
+**Throws:** `SWAP_NOT_FOUND`, `SWAP_INVALID_STATE` (if already terminal)
+
+### Swap Events
+
+| Event | Payload | When |
+|-------|---------|------|
+| `swap:proposal_received` | `{ swapId, deal, senderPubkey, senderNametag? }` | Incoming swap proposal DM |
+| `swap:proposed` | `{ swapId, deal, recipientPubkey }` | Outgoing proposal sent |
+| `swap:accepted` | `{ swapId, role }` | Swap accepted (either side) |
+| `swap:rejected` | `{ swapId, reason? }` | Swap rejected (either side) |
+| `swap:announced` | `{ swapId, depositInvoiceId }` | Escrow acknowledged, deposit invoice ready |
+| `swap:deposit_sent` | `{ swapId, transferResult }` | Local deposit payment sent |
+| `swap:deposit_confirmed` | `{ swapId, party, amount, coinId }` | Deposit confirmed by escrow |
+| `swap:deposits_covered` | `{ swapId }` | Both deposits fully covered |
+| `swap:concluding` | `{ swapId }` | Escrow executing payouts |
+| `swap:payout_received` | `{ swapId, payoutInvoiceId }` | Payout invoice token received |
+| `swap:completed` | `{ swapId, payoutVerified }` | Swap completed (terminal) |
+| `swap:cancelled` | `{ swapId, reason, depositsReturned? }` | Swap cancelled (terminal) |
+| `swap:failed` | `{ swapId, error }` | Swap failed (terminal) |
+| `swap:deposit_returned` | `{ swapId, transfer, returnReason }` | Deposit returned after cancellation |
+| `swap:bounce_received` | `{ swapId, reason, returnedAmount, returnedCurrency }` | Wrong-currency deposit bounced back |
+
+### Escrow Communication
+
+The swap module communicates with the escrow service via encrypted DMs (NIP-17). The escrow sends the following message types:
+
+| Type | When | Key Fields |
+|------|------|------------|
+| `announce_result` | After manifest announcement | `swap_id`, `state`, `deposit_invoice_id` |
+| `invoice_delivery` | Deposit or payout invoice token | `swap_id`, `invoice_type`, `invoice_token` |
+| `status_result` | In response to status query | `swap_id`, `state` |
+| `payment_confirmation` | After escrow pays payout invoice | `swap_id`, `party` |
+| `swap_cancelled` | Swap cancelled (timeout/manual) | `swap_id`, `reason`, `deposits_returned?` |
+| `bounce_notification` | Wrong-currency deposit returned | `swap_id`, `reason`, `returned_amount` |
+| `error` | Escrow-side error | `error`, `swap_id?` |
+
+---
+
 ## Error Handling
 
 ### SphereError

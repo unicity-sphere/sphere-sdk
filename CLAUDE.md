@@ -310,6 +310,14 @@ try {
 | `sphere.accounting.sendInvoiceReceipts(options)` | `SendReceiptsResult` | Send payment receipts via DM |
 | `sphere.accounting.sendCancellationNotices(options)` | `SendNoticesResult` | Send cancellation notices via DM |
 | `sphere.accounting.getRelatedTransfers(invoiceId)` | `InvoiceTransferRef[]` | All transfers attributed to an invoice |
+| `sphere.swap.proposeSwap(deal, options?)` | `SwapProposalResult` | Propose a token swap |
+| `sphere.swap.acceptSwap(swapId)` | `void` | Accept a swap proposal |
+| `sphere.swap.rejectSwap(swapId, reason?)` | `void` | Reject a swap proposal |
+| `sphere.swap.deposit(swapId)` | `TransferResult` | Deposit into a swap |
+| `sphere.swap.getSwapStatus(swapId, options?)` | `SwapRef` | Get swap status |
+| `sphere.swap.getSwaps(filter?)` | `SwapRef[]` | List swaps with filter |
+| `sphere.swap.verifyPayout(swapId)` | `boolean` | Verify payout received |
+| `sphere.swap.cancelSwap(swapId)` | `void` | Cancel a swap |
 
 ### Key Events
 
@@ -336,6 +344,21 @@ try {
 | `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Payer received a return |
 | `invoice:receipt_received` | `{ invoiceId, receipt }` | Receipt DM arrived from payee |
 | `invoice:cancellation_received` | `{ invoiceId, notice }` | Cancellation notice DM arrived |
+| `swap:proposal_received` | `{ swapId, deal, senderPubkey, senderNametag? }` | Incoming swap proposal |
+| `swap:proposed` | `{ swapId, deal, recipientPubkey }` | Proposal sent |
+| `swap:accepted` | `{ swapId, role }` | Swap accepted |
+| `swap:rejected` | `{ swapId, reason? }` | Swap rejected |
+| `swap:announced` | `{ swapId, depositInvoiceId }` | Escrow acknowledged, deposit ready |
+| `swap:deposit_sent` | `{ swapId, transferResult }` | Deposit sent |
+| `swap:deposit_confirmed` | `{ swapId, party, amount, coinId }` | Deposit confirmed by escrow |
+| `swap:deposits_covered` | `{ swapId }` | Both deposits confirmed |
+| `swap:concluding` | `{ swapId }` | Escrow executing payouts |
+| `swap:payout_received` | `{ swapId, payoutInvoiceId }` | Payout invoice received |
+| `swap:completed` | `{ swapId, payoutVerified }` | Swap completed (terminal) |
+| `swap:cancelled` | `{ swapId, reason, depositsReturned? }` | Swap cancelled (terminal) |
+| `swap:failed` | `{ swapId, error }` | Swap failed (terminal) |
+| `swap:deposit_returned` | `{ swapId, transfer, returnReason }` | Deposit returned after cancellation |
+| `swap:bounce_received` | `{ swapId, reason, returnedAmount, returnedCurrency }` | Wrong-currency deposit bounced |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
 
