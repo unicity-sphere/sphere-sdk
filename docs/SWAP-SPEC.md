@@ -262,6 +262,8 @@ interface SwapRef {
   payoutVerified: boolean;
   /** Timestamp when the swap record was created (ms) */
   readonly createdAt: number;
+  /** Timestamp when the swap entered 'announced' state (deposit invoice available). Used as timeout base. */
+  announcedAt?: number;
   /** Timestamp of most recent state change (ms) */
   updatedAt: number;
   /** Error message if progress is 'failed' */
@@ -654,6 +656,10 @@ interface SwapModuleDependencies {
   storage: StorageProvider;
   /** Event emitter (from Sphere) */
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /** PaymentsModule for L3 token validation during payout verification */
+  readonly payments: {
+    validate(): Promise<{ valid: Token[]; invalid: Token[] }>;
+  };
   /**
    * Transport-level peer resolution.
    * Used to resolve @nametag and chain pubkey addresses to DIRECT:// and PeerInfo.
@@ -661,6 +667,23 @@ interface SwapModuleDependencies {
   resolve: (identifier: string) => Promise<PeerInfo | null>;
   /** All tracked wallet addresses (for determining party role) */
   getActiveAddresses: () => TrackedAddress[];
+}
+```
+
+### 2.9 Storage Types
+
+```typescript
+// =============================================================================
+// Storage Types
+// =============================================================================
+
+/**
+ * Persistent storage format for a single swap record.
+ * Stored at key `swap:{swapId}`.
+ */
+interface SwapStorageData {
+  readonly version: 1;
+  readonly swap: SwapRef;
 }
 ```
 
@@ -715,7 +738,7 @@ async load(): Promise<void>
 
 Called by `Sphere` after all modules are initialized. Steps:
 
-1. **Load persisted swap records** from storage (key: `swap_records_{addressId}`). Deserialize `Map<string, SwapRef>` from JSON. If the key does not exist, start with an empty map.
+1. **Load persisted swap records** from storage. Read the `swap_index` key, then load each non-terminal swap record from its per-swap key (`swap:{swapId}`). See [section 14.4](#144-load-pattern) for details.
 
 2. **Clean up stale proposals.** For each swap with `progress === 'proposed'`:
    - If `role === 'proposer'` and `Date.now() - createdAt > config.proposalTimeoutMs`: transition to `'failed'` with error `'Proposal timed out'`.
@@ -1146,7 +1169,14 @@ async verifyPayout(swapId: string): Promise<boolean>
    - `BigInt(status.targets[0].coinAssets[0].netCoveredAmount) >= BigInt(expectedAmount)`.
    - If not covered: return `false` without error (the payout may still be in progress).
 
-6. **Update state on success.**
+6. **Validate L3 inclusion proofs.**
+   - Call `deps.payments.validate()` on payout tokens to confirm L3 inclusion proofs against the aggregator's Sparse Merkle Tree.
+
+7. **Verify invoice creator matches escrow.**
+   - Verify `invoiceRef.terms.creator` matches the resolved escrow chain pubkey. This prevents a malicious party from crafting a fake payout invoice.
+   - If mismatched: set `swap.payoutVerified = false`, persist, emit `swap:failed` with error `'Payout invoice creator does not match escrow pubkey'`, return `false`.
+
+8. **Update state on success.**
    ```typescript
    swap.payoutVerified = true;
    swap.progress = 'completed';
@@ -1154,12 +1184,12 @@ async verifyPayout(swapId: string): Promise<boolean>
    ```
    Persist.
 
-7. **Emit `swap:completed`.**
+9. **Emit `swap:completed`.**
    ```typescript
    deps.emitEvent('swap:completed', { swapId, payoutVerified: true });
    ```
 
-8. **Return `true`.**
+10. **Return `true`.**
 
 ---
 
@@ -1356,6 +1386,8 @@ DMs from the escrow are JSON objects. The handler attempts `JSON.parse()` on the
 
 #### 12.4.2 invoice_delivery (deposit)
 
+**DM ordering note:** The `invoice_delivery` handler must handle the case where `announce_result` hasn't arrived yet. If a swap in `accepted` state receives an `invoice_delivery` for a deposit invoice, the handler should: (1) match by `swap_id` from the invoice memo, (2) set `depositInvoiceId` AND transition to `announced` in one step, (3) skip the `announce_result` handler for this swap (it becomes a no-op duplicate).
+
 1. Find swap by `swap_id`.
 2. `msg.invoice_type` must be `'deposit'`.
 3. Import the invoice token:
@@ -1363,7 +1395,7 @@ DMs from the escrow are JSON objects. The handler attempts `JSON.parse()` on the
    await deps.accounting.importInvoice(msg.invoice_token);
    ```
    - On failure: log error, transition to `'failed'`. Return.
-4. Transition to `'announced'`. Persist.
+4. Transition to `'announced'`. Set `swap.announcedAt = Date.now()`. Persist.
 5. Start local timeout timer (see [section 16](#16-local-timeout-management)).
 6. Emit `swap:announced` with `depositInvoiceId`.
 
@@ -1497,28 +1529,42 @@ When the deposit invoice has returns (after timeout/cancellation):
 
 All swap data is stored per-address, following the same scoping model as `AccountingModule`.
 
-**Storage key:** `swap_records_{addressId}`
+Storage uses per-swap keys and an index key:
 
-Where `addressId` is the `TrackedAddress.addressId` of the currently active wallet address (e.g., `DIRECT_abc123_xyz789`).
+- **Per-swap key:** `swap:{swapId}` -- serialized `SwapStorageData` JSON containing the full `SwapRef`.
+- **Index key:** `swap_index` -- JSON array of `{ swapId, progress, role, createdAt }` entries. Provides a lightweight lookup without deserializing every swap record.
+
+Where keys are scoped to the currently active `TrackedAddress.addressId` (e.g., `DIRECT_abc123_xyz789`) via the storage provider's per-address scoping.
 
 ### 14.2 Data Format
 
 ```typescript
 /**
- * Persistent storage format for swap records.
- * Stored as a JSON-serialized object keyed by swapId.
+ * Persistent storage format for a single swap record.
+ * Stored at key `swap:{swapId}`.
  */
 interface SwapStorageData {
   /** Version for forward-compatible schema evolution */
   readonly version: 1;
-  /** Map of swapId -> SwapRef */
-  readonly swaps: Record<string, SwapRef>;
+  /** The swap record */
+  readonly swap: SwapRef;
+}
+
+/**
+ * Index entry for the swap_index key.
+ * Lightweight summary for listing/filtering without loading full records.
+ */
+interface SwapIndexEntry {
+  readonly swapId: string;
+  readonly progress: SwapProgress;
+  readonly role: SwapRole;
+  readonly createdAt: number;
 }
 ```
 
-### 14.3 Persist-Before-Act Pattern
+### 14.3 Persist Pattern
 
-Every state transition is persisted to storage BEFORE any external action (DM send, invoice operation). This ensures that a crash between persist and action results in a recoverable state -- the worst case is a redundant DM or a redundant invoice operation, both of which are idempotent.
+On state transition, write the per-swap key and update the index atomically:
 
 ```typescript
 // Pattern used in every state transition:
@@ -1535,19 +1581,27 @@ async function transitionProgress(
   swap.progress = newProgress;
   swap.updatedAt = Date.now();
   if (updates) Object.assign(swap, updates);
-  // 3. Persist to storage
-  await this.persist();
-  // 4. External action happens AFTER persist returns
+  // 3. Persist per-swap key
+  const data: SwapStorageData = { version: 1, swap };
+  await this.storage.set(`swap:${swap.swapId}`, JSON.stringify(data));
+  // 4. Update index
+  await this.persistIndex();
+  // 5. External action happens AFTER persist returns
 }
 ```
 
-### 14.4 Load and Migration
+Every state transition is persisted to storage BEFORE any external action (DM send, invoice operation). This ensures that a crash between persist and action results in a recoverable state -- the worst case is a redundant DM or a redundant invoice operation, both of which are idempotent.
+
+### 14.4 Load Pattern
 
 On `load()`:
-1. Read `swap_records_{addressId}` from storage.
-2. Parse JSON. If missing or corrupt, start with empty map.
-3. Validate `version` field. If `version > 1`, log warning and attempt best-effort parsing (ignore unknown fields).
-4. Populate `this.swaps` from the parsed records.
+1. Read `swap_index` from storage. Parse JSON. If missing or corrupt, start with an empty array.
+2. For each entry in the index where `progress` is NOT terminal (`completed`, `cancelled`, `failed`):
+   a. Read `swap:{swapId}` from storage.
+   b. Parse JSON as `SwapStorageData`. Validate `version` field. If `version > 1`, log warning and attempt best-effort parsing (ignore unknown fields).
+   c. If missing or corrupt, skip (remove from index on next persist).
+   d. Populate `this.swaps` with the deserialized `SwapRef`.
+3. Terminal swap records are NOT loaded into memory -- they remain in storage for history queries and are purged after `terminalPurgeTtlMs`.
 
 ---
 
@@ -1640,9 +1694,10 @@ this.localTimers.set(swap.swapId, timer);
 - `deposit:covered` fires (the escrow is proceeding with payouts -- timeout no longer relevant).
 - `destroy()` clears all timers.
 
-**Resume on load:** During `load()`, for non-terminal swaps that were `'announced'` or later, compute the remaining time:
+**Resume on load:** During `load()`, for non-terminal swaps that were `'announced'` or later, compute the remaining time. If `announcedAt` is undefined (swap not yet announced), skip timer -- the swap will be cancelled by the proposal timeout instead.
 ```typescript
-const elapsed = Date.now() - swap.createdAt;
+if (!swap.announcedAt) return; // not yet announced — proposal timeout handles this
+const elapsed = Date.now() - swap.announcedAt;
 const totalTimeout = swap.manifest.timeout * 1000 + 30_000;
 const remaining = totalTimeout - elapsed;
 if (remaining <= 0) {
@@ -1670,8 +1725,8 @@ Called by `proposeSwap()` before any resolution or manifest construction.
 | `partyA` | Non-empty string | `SWAP_INVALID_DEAL: partyA is required` |
 | `partyB` | Non-empty string | `SWAP_INVALID_DEAL: partyB is required` |
 | `partyA` vs `partyB` | Must differ (case-insensitive for nametags) | `SWAP_INVALID_DEAL: partyA and partyB must be different` |
-| `partyACurrency` | Non-empty string, alphanumeric, 1-68 chars (`/^[A-Za-z0-9]{1,68}$/`) | `SWAP_INVALID_DEAL: partyACurrency must be 1-68 alphanumeric characters` |
-| `partyBCurrency` | Same rule as partyACurrency | `SWAP_INVALID_DEAL: partyBCurrency must be 1-68 alphanumeric characters` |
+| `partyACurrency` | Non-empty string, alphanumeric, 1-20 chars (`/^[A-Za-z0-9]{1,20}$/`). Aligned with AccountingModule's createInvoice validation (max 20 chars). | `SWAP_INVALID_DEAL: partyACurrency must be 1-20 alphanumeric characters` |
+| `partyBCurrency` | Same rule as partyACurrency | `SWAP_INVALID_DEAL: partyBCurrency must be 1-20 alphanumeric characters` |
 | `partyACurrency` vs `partyBCurrency` | Must differ (case-sensitive) | `SWAP_INVALID_DEAL: currencies must differ` |
 | `partyAAmount` | Positive integer string: `/^[1-9][0-9]*$/`, max 78 chars | `SWAP_INVALID_DEAL: partyAAmount must be a positive integer string` |
 | `partyBAmount` | Same rule | `SWAP_INVALID_DEAL: partyBAmount must be a positive integer string` |
@@ -1687,8 +1742,8 @@ Applied when receiving a `swap_proposal` DM. Mirrors the escrow's `manifest-vali
 | `swap_id` | Exactly 64 lowercase hex chars (`/^[0-9a-f]{64}$/`) | Silent reject |
 | `party_a_address` | Valid Sphere address (DIRECT://, PROXY://, or @nametag) | Silent reject |
 | `party_b_address` | Valid Sphere address, differs from `party_a_address` | Silent reject |
-| `party_a_currency_to_change` | 1-68 alphanumeric chars | Silent reject |
-| `party_b_currency_to_change` | 1-68 alphanumeric chars, differs from `party_a_currency_to_change` | Silent reject |
+| `party_a_currency_to_change` | 1-20 alphanumeric chars. Aligned with AccountingModule's createInvoice validation (max 20 chars). | Silent reject |
+| `party_b_currency_to_change` | 1-20 alphanumeric chars, differs from `party_a_currency_to_change` | Silent reject |
 | `party_a_value_to_change` | Positive integer string (`/^[1-9][0-9]*$/`) | Silent reject |
 | `party_b_value_to_change` | Same rule | Silent reject |
 | `timeout` | Integer in [60, 86400] | Silent reject |
@@ -1735,7 +1790,8 @@ When the escrow delivers a deposit invoice token via `invoice_delivery` DM, the 
    - `terms.targets[0].assets[0].coin![1] === manifest.party_a_value_to_change`
    - `terms.targets[0].assets[1].coin![0] === manifest.party_b_currency_to_change`
    - `terms.targets[0].assets[1].coin![1] === manifest.party_b_value_to_change`
-3. If any check fails: reject the invoice, transition to `'failed'` with error `'Deposit invoice terms do not match manifest'`. Emit `swap:failed`.
+3. Verify `terms.targets[0].address` matches the resolved escrow DIRECT:// address. If not, reject the invoice -- deposits would go to the wrong address.
+4. If any check fails: reject the invoice, transition to `'failed'` with error `'Deposit invoice terms do not match manifest'`. Emit `swap:failed`.
 
 ---
 
