@@ -670,6 +670,21 @@ export class AccountingModule {
     return BigInt(amount);
   }
 
+  /**
+   * Safely defer an event emission via queueMicrotask. Wraps the callback in
+   * try/catch so a throwing event handler doesn't become an uncaught exception
+   * that crashes the process.
+   */
+  private _deferEvent(fn: () => void): void {
+    queueMicrotask(() => {
+      try {
+        fn();
+      } catch (err) {
+        logger.warn(LOG_TAG, 'Deferred event handler threw:', err);
+      }
+    });
+  }
+
   // ===========================================================================
   // Per-invoice async mutex (§5.9)
   // ===========================================================================
@@ -1764,8 +1779,11 @@ export class AccountingModule {
           // Invalidate balance cache
           this.balanceCache.delete(invoiceId);
 
-          // Fire invoice:closed event
-          this.deps!.emitEvent('invoice:closed', { invoiceId, explicit: false });
+          // BUG-002 Fix 4: Defer event emission until after the gate is released.
+          // Handlers that call back into AccountingModule would queue behind the gate,
+          // seeing inconsistent state (e.g., closed but _executeTerminationReturns not yet run).
+          const depsRef = this.deps!;
+          this._deferEvent(() => depsRef.emitEvent('invoice:closed', { invoiceId, explicit: false }));
 
           // Return the now-frozen status with dynamic allConfirmed
           const closedTransfers: InvoiceTransferRef[] = [];
@@ -2028,9 +2046,6 @@ export class AccountingModule {
         Array.from(this.closedInvoices),
       );
 
-      // Fire event
-      deps.emitEvent('invoice:closed', { invoiceId, explicit: true });
-
       if (this.config.debug) {
         logger.debug(LOG_TAG, `closeInvoice(${invoiceId}) complete`);
       }
@@ -2044,6 +2059,10 @@ export class AccountingModule {
         // For CLOSED: only the surplus amounts are returnable (latest sender gets surplus)
         await this._executeTerminationReturns(invoiceId, frozen, 'RC', deps);
       }
+
+      // BUG-002 Fix 4: Defer event emission until after the gate is released.
+      // Placed AFTER _executeTerminationReturns so handlers see completed return state.
+      this._deferEvent(() => deps.emitEvent('invoice:closed', { invoiceId, explicit: true }));
     });
   }
 
@@ -2127,9 +2146,6 @@ export class AccountingModule {
         Array.from(this.cancelledInvoices),
       );
 
-      // Fire event
-      deps.emitEvent('invoice:cancelled', { invoiceId });
-
       if (this.config.debug) {
         logger.debug(LOG_TAG, `cancelInvoice(${invoiceId}) complete`);
       }
@@ -2143,6 +2159,10 @@ export class AccountingModule {
         // For CANCELLED: every sender with netBalance > 0 gets their entire balance returned
         await this._executeTerminationReturns(invoiceId, frozen, 'RX', deps);
       }
+
+      // BUG-002 Fix 4: Defer event emission until after the gate is released.
+      // Placed AFTER _executeTerminationReturns so handlers see completed return state.
+      this._deferEvent(() => deps.emitEvent('invoice:cancelled', { invoiceId }));
     });
   }
 
@@ -2180,31 +2200,7 @@ export class AccountingModule {
       throw new SphereError(`Invoice not found: ${invoiceId}`, 'INVOICE_NOT_FOUND');
     }
 
-    // §8.5 step 2: Invoice must not be in terminal state.
-    // Acquire gate briefly to prevent TOCTOU race with concurrent implicit close (§5.9).
-    // Gate is released before send() to avoid blocking other operations during the network call.
-    await this.withInvoiceGate(invoiceId, async () => {
-      this.ensureNotDestroyed();
-      if (this.closedInvoices.has(invoiceId) || this.cancelledInvoices.has(invoiceId)) {
-        throw new SphereError(
-          `Invoice is already terminated (closed or cancelled): ${invoiceId}`,
-          'INVOICE_TERMINATED',
-        );
-      }
-    });
-
-    // Re-check after gate release — best-effort guard. A concurrent close can still
-    // complete between this check and send() below (TOCTOU). This is an accepted race:
-    // payments that land on a just-terminated invoice will be auto-returned (§7.5).
-    // Gate is intentionally NOT held through send() to avoid blocking other invoice
-    // operations during the potentially long network call.
-    if (this.closedInvoices.has(invoiceId) || this.cancelledInvoices.has(invoiceId)) {
-      throw new SphereError(
-        `Invoice is already terminated (closed or cancelled): ${invoiceId}`,
-        'INVOICE_TERMINATED',
-      );
-    }
-
+    // Validate parameters that don't need the gate (pure input validation)
     const terms = this.invoiceTermsCache.get(invoiceId)!;
 
     // §8.5 step 3: targetIndex must be in range [0, targets.length)
@@ -2281,40 +2277,7 @@ export class AccountingModule {
     }
     const [coinId, requestedAmountStr] = asset.coin;
 
-    // §2.1: Compute send amount — default to remaining needed (requestedAmount - netCoveredAmount)
-    let sendAmount: string;
-    if (params.amount !== undefined) {
-      sendAmount = params.amount;
-    } else {
-      // C4 fix: use _safeBigInt to avoid SyntaxError on corrupted stored amounts
-      const requested = AccountingModule._safeBigInt(requestedAmountStr);
-      const ledgerEntries = this.invoiceLedger.get(invoiceId)
-        ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
-        : [];
-      const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
-      const ownDirect = deps.identity?.directAddress;
-      if (ownDirect) walletAddresses.add(ownDirect);
-      const liveStatus = computeInvoiceStatus(invoiceId, terms, ledgerEntries, null, walletAddresses);
-      const targetStatus = liveStatus.targets.find((t) => t.address === target.address);
-      const coinAssetStatus = targetStatus?.coinAssets.find((ca) => ca.coin[0] === coinId);
-      const netCovered = coinAssetStatus ? AccountingModule._safeBigInt(coinAssetStatus.netCoveredAmount) : 0n;
-      const remaining = requested > netCovered ? requested - netCovered : 0n;
-      sendAmount = remaining.toString();
-    }
-
-    // Guard: zero-amount sends are nonsensical and would be rejected by PaymentsModule anyway.
-    if (sendAmount === '0') {
-      throw new SphereError(
-        `Invoice ${invoiceId} target ${target.address} asset ${coinId} is already fully covered`,
-        'INVOICE_INVALID_AMOUNT',
-      );
-    }
-
-    // §4.4: Build transport memo: INV:<id>:F[ freeText]
-    const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
-
     // §4.7: Auto-populate contact from identity.directAddress when not explicitly provided.
-    // Every outbound invoice payment must carry contact info for the target to reach the payer.
     if (!deps.identity.directAddress) {
       throw new SphereError('directAddress required for invoice payments', 'NOT_INITIALIZED');
     }
@@ -2322,23 +2285,111 @@ export class AccountingModule {
       address: deps.identity.directAddress,
     };
 
-    if (this.config.debug) {
-      logger.debug(
-        LOG_TAG,
-        `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}`,
-      );
-    }
+    // §8.5 step 2 + BUG-002 Fix 2: Hold the gate across terminal check, balance
+    // computation, send(), AND provisional ledger write. This prevents concurrent
+    // payInvoice() calls from both computing remaining=R and both sending R (double-payment).
+    // Mirrors the returnInvoicePayment() provisional reservation pattern (§5.9).
+    return this.withInvoiceGate(invoiceId, async () => {
+      this.ensureNotDestroyed();
 
-    // Delegate to PaymentsModule.send(). invoiceRefundAddress and invoiceContact are
-    // forwarded so PaymentsModule can encode them in the on-chain TransferMessagePayload
-    // via parseInvoiceMemoForOnChain (§4.7).
-    return deps.payments.send({
-      recipient: target.address,
-      amount: sendAmount,
-      coinId,
-      memo,
-      invoiceRefundAddress: params.refundAddress,
-      invoiceContact: effectiveContact,
+      // Terminal state check inside gate
+      if (this.closedInvoices.has(invoiceId) || this.cancelledInvoices.has(invoiceId)) {
+        throw new SphereError(
+          `Invoice is already terminated (closed or cancelled): ${invoiceId}`,
+          'INVOICE_TERMINATED',
+        );
+      }
+
+      // §2.1: Compute send amount inside gate — sees provisional entries from concurrent calls
+      let sendAmount: string;
+      if (params.amount !== undefined) {
+        sendAmount = params.amount;
+      } else {
+        const requested = AccountingModule._safeBigInt(requestedAmountStr);
+        const ledgerEntries = this.invoiceLedger.get(invoiceId)
+          ? Array.from(this.invoiceLedger.get(invoiceId)!.values())
+          : [];
+        const walletAddresses = new Set(deps.getActiveAddresses().map((a) => a.directAddress));
+        const ownDirect = deps.identity?.directAddress;
+        if (ownDirect) walletAddresses.add(ownDirect);
+        const liveStatus = computeInvoiceStatus(invoiceId, terms, ledgerEntries, null, walletAddresses);
+        const targetStatus = liveStatus.targets.find((t) => t.address === target.address);
+        const coinAssetStatus = targetStatus?.coinAssets.find((ca) => ca.coin[0] === coinId);
+        const netCovered = coinAssetStatus ? AccountingModule._safeBigInt(coinAssetStatus.netCoveredAmount) : 0n;
+        const remaining = requested > netCovered ? requested - netCovered : 0n;
+        sendAmount = remaining.toString();
+      }
+
+      // Guard: zero-amount sends are nonsensical
+      if (sendAmount === '0') {
+        throw new SphereError(
+          `Invoice ${invoiceId} target ${target.address} asset ${coinId} is already fully covered`,
+          'INVOICE_INVALID_AMOUNT',
+        );
+      }
+
+      // §4.4: Build transport memo
+      const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
+
+      if (this.config.debug) {
+        logger.debug(
+          LOG_TAG,
+          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}`,
+        );
+      }
+
+      // §5.9: Apply 60-second timeout to send() within the gate (matches returnInvoicePayment)
+      const sendPromise = deps.payments.send({
+        recipient: target.address,
+        amount: sendAmount,
+        coinId,
+        memo,
+        invoiceRefundAddress: params.refundAddress,
+        invoiceContact: effectiveContact,
+      });
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new SphereError('payInvoice send() timed out after 60s', 'TIMEOUT')),
+          60_000,
+        );
+      });
+
+      try {
+        const result = await Promise.race([sendPromise, timeoutPromise]);
+
+        // BUG-002 Fix 2: Write provisional forward entry inside the gate so concurrent
+        // payInvoice() calls see an updated netCoveredAmount. The provisional entry is
+        // superseded by the real on-chain entry when _processTokenTransactions runs.
+        if (result.id) {
+          const forwardRef: InvoiceTransferRef = {
+            transferId: `provisional:${result.id}`,
+            direction: 'outbound',
+            paymentDirection: 'forward',
+            coinId,
+            amount: sendAmount,
+            destinationAddress: target.address,
+            timestamp: Date.now(),
+            confirmed: false,
+            senderAddress: deps.identity?.directAddress ?? null,
+          };
+          const entryKey = `provisional:${result.id}::${coinId}`;
+          let ledger = this.invoiceLedger.get(invoiceId);
+          if (!ledger) {
+            ledger = new Map();
+            this.invoiceLedger.set(invoiceId, ledger);
+          }
+          ledger.set(entryKey, forwardRef);
+          this.dirtyLedgerEntries.add(invoiceId);
+          // Invalidate balance cache for this invoice
+          this.balanceCache.delete(invoiceId);
+        }
+
+        return result;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
     });
   }
 
@@ -3370,11 +3421,11 @@ export class AccountingModule {
       );
     }
 
-    // Fire event
+    // BUG-002 Fix 4: Defer event emission until after the gate is released.
     if (state === 'CLOSED') {
-      deps.emitEvent('invoice:closed', { invoiceId, explicit: false });
+      this._deferEvent(() => deps.emitEvent('invoice:closed', { invoiceId, explicit: false }));
     } else {
-      deps.emitEvent('invoice:cancelled', { invoiceId });
+      this._deferEvent(() => deps.emitEvent('invoice:cancelled', { invoiceId }));
     }
 
     if (this.config.debug) {
@@ -3469,7 +3520,27 @@ export class AccountingModule {
           });
 
           try {
-            const result = await deps.payments.send({ recipient, amount, coinId, memo });
+            // Steelman fix: Wrap send() with 60s timeout, matching Fix 3 pattern in
+            // _executeTerminationReturns. Without this, a hung send holds the gate indefinitely.
+            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            let arSendTimer: ReturnType<typeof setTimeout> | undefined;
+            const arSendTimeout = new Promise<never>((_, reject) => {
+              arSendTimer = setTimeout(
+                () => reject(new SphereError(
+                  `Auto-return send() timed out after 60s: ${invoiceId} → ${recipient}`,
+                  'TIMEOUT',
+                )),
+                60_000,
+              );
+            });
+
+            let result: Awaited<typeof arSendPromise>;
+            try {
+              result = await Promise.race([arSendPromise, arSendTimeout]);
+            } finally {
+              if (arSendTimer !== undefined) clearTimeout(arSendTimer);
+            }
+
             const returnTransferId = result.id;
             await this.autoReturnManager.markCompleted(invoiceId, dedupTransferId, returnTransferId);
 
@@ -3612,7 +3683,28 @@ export class AccountingModule {
           });
 
           try {
-            const result = await deps.payments.send({ recipient, amount, coinId, memo });
+            // BUG-002 Fix 3: Wrap send() in Promise.race with 60s timeout, matching
+            // returnInvoicePayment() pattern. Without this, a hung send blocks all
+            // subsequent returns and holds the invoice gate indefinitely.
+            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            let sendTimer: ReturnType<typeof setTimeout> | undefined;
+            const sendTimeoutPromise = new Promise<never>((_, reject) => {
+              sendTimer = setTimeout(
+                () => reject(new SphereError(
+                  `Termination auto-return send() timed out after 60s: ${invoiceId} → ${recipient}`,
+                  'TIMEOUT',
+                )),
+                60_000,
+              );
+            });
+
+            let result: Awaited<typeof sendPromise>;
+            try {
+              result = await Promise.race([sendPromise, sendTimeoutPromise]);
+            } finally {
+              if (sendTimer !== undefined) clearTimeout(sendTimer);
+            }
+
             await this.autoReturnManager.markCompleted(invoiceId, dedupTransferId, result.id);
             if (this.config.debug) {
               logger.debug(
@@ -5470,12 +5562,30 @@ export class AccountingModule {
     // eliminates the destroy() gap where send succeeds but markCompleted never runs
     // (causing duplicate payment on crash recovery).
     try {
-      const result = await deps.payments.send({
+      // Steelman fix: Wrap send() with 60s timeout for consistency with all other send paths.
+      const evtSendPromise = deps.payments.send({
         recipient: sendParams.returnTo,
         amount: sendParams.amount,
         coinId: sendParams.coinId,
         memo: sendParams.memo,
       });
+      let evtSendTimer: ReturnType<typeof setTimeout> | undefined;
+      const evtSendTimeout = new Promise<never>((_, reject) => {
+        evtSendTimer = setTimeout(
+          () => reject(new SphereError(
+            `Event auto-return send() timed out after 60s: ${invoiceId} → ${sendParams.returnTo}`,
+            'TIMEOUT',
+          )),
+          60_000,
+        );
+      });
+
+      let result: Awaited<typeof evtSendPromise>;
+      try {
+        result = await Promise.race([evtSendPromise, evtSendTimeout]);
+      } finally {
+        if (evtSendTimer !== undefined) clearTimeout(evtSendTimer);
+      }
 
       // Mark completed immediately after send (no gate — dedup ledger only)
       await this.autoReturnManager.markCompleted(invoiceId, sendParams.transferId, result.id);

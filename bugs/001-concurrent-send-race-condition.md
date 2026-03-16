@@ -4,7 +4,7 @@
 **Component:** `PaymentsModule.send()`, `AccountingModule.payInvoice()`
 **Discovered:** 2026-03-12
 **Discovered by:** Adversarial review of escrow service → traced to SDK root cause
-**Status:** Open
+**Status:** Fixed (2026-03-13) — All 5 fixes implemented
 
 ---
 
