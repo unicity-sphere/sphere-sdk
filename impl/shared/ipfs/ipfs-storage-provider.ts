@@ -91,10 +91,16 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
   /** Set to true during shutdown to prevent new flushes */
   private isShuttingDown = false;
 
+  /** Stored config for createForAddress() cloning */
+  private readonly _config: IpfsStorageConfig | undefined;
+  private readonly _statePersistenceCtor: IpfsStatePersistence | undefined;
+
   constructor(
     config?: IpfsStorageConfig,
     statePersistence?: IpfsStatePersistence,
   ) {
+    this._config = config;
+    this._statePersistenceCtor = statePersistence;
     const gateways = config?.gateways ?? getIpfsGatewayUrls();
     this.debug = config?.debug ?? false;
     this.ipnsLifetimeMs = config?.ipnsLifetimeMs ?? (99 * 365 * 24 * 60 * 60 * 1000);
@@ -243,6 +249,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
   async shutdown(): Promise<void> {
     this.isShuttingDown = true;
+    logger.debug('IPFS-Storage', `shutdown: ipnsName=${this.ipnsName?.slice(0, 20)}..., pendingEmpty=${this.pendingBuffer.isEmpty}, capturedIpns=${this.pendingBuffer.capturedIpnsName?.slice(0, 20) ?? 'none'}`);
 
     // Cancel any pending debounced flush
     if (this.flushTimer) {
@@ -284,8 +291,12 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       return { success: false, error: 'Not initialized', timestamp: Date.now() };
     }
 
-    // Buffer the data for async flush
+    // Buffer the data for async flush.
+    // Capture IPNS context NOW so the flush writes to the correct IPNS record
+    // even if identity changes between save() and flush() (address switch).
     this.pendingBuffer.txfData = data;
+    this.pendingBuffer.capturedIpnsKeyPair = this.ipnsKeyPair;
+    this.pendingBuffer.capturedIpnsName = this.ipnsName;
     this.scheduleFlush();
 
     // Return immediately — flush happens in background
@@ -300,8 +311,14 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
    * Perform the actual upload + IPNS publish synchronously.
    * Called by executeFlush() and sync() — never by public save().
    */
-  private async _doSave(data: TData): Promise<SaveResult> {
-    if (!this.ipnsKeyPair || !this.ipnsName) {
+  private async _doSave(data: TData, overrideIpns?: { keyPair: unknown; name: string }): Promise<SaveResult> {
+    const ipnsKeyPair = overrideIpns?.keyPair ?? this.ipnsKeyPair;
+    const ipnsName = overrideIpns?.name ?? this.ipnsName;
+
+    const metaAddr = (data as unknown as TxfStorageDataBase)?._meta?.address;
+    logger.debug('IPFS-Storage', `_doSave: ipnsName=${ipnsName?.slice(0, 20)}..., override=${!!overrideIpns}, meta.address=${metaAddr?.slice(0, 20) ?? 'none'}`);
+
+    if (!ipnsKeyPair || !ipnsName) {
       return { success: false, error: 'Not initialized', timestamp: Date.now() };
     }
 
@@ -315,7 +332,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       const metaUpdate: Record<string, unknown> = {
         ...data._meta,
         version: this.dataVersion,
-        ipnsName: this.ipnsName,
+        ipnsName: ipnsName,
         updatedAt: Date.now(),
       };
       if (this.remoteCid) {
@@ -337,7 +354,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
       // Create signed IPNS record
       const marshalledRecord = await createSignedRecord(
-        this.ipnsKeyPair,
+        ipnsKeyPair,
         cid,
         newSeq,
         this.ipnsLifetimeMs,
@@ -345,7 +362,7 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
 
       // Publish to all gateways
       const publishResult = await this.httpClient.publishIpns(
-        this.ipnsName,
+        ipnsName,
         marshalledRecord,
       );
 
@@ -366,16 +383,16 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
       this.remoteCid = cid; // next save chains to this CID
 
       // Update cache
-      this.cache.setIpnsRecord(this.ipnsName, {
+      this.cache.setIpnsRecord(ipnsName, {
         cid,
         sequence: newSeq,
         gateway: 'local',
       });
       this.cache.setContent(cid, updatedData as unknown as TxfStorageDataBase);
-      this.cache.markIpnsFresh(this.ipnsName);
+      this.cache.markIpnsFresh(ipnsName);
 
       // Persist state
-      await this.statePersistence.save(this.ipnsName, {
+      await this.statePersistence.save(ipnsName, {
         sequenceNumber: newSeq.toString(),
         lastCid: cid,
         version: this.dataVersion,
@@ -439,8 +456,13 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
         _meta: { version: 0, address: this.identity?.directAddress ?? '', formatVersion: '2.0', updatedAt: 0 },
       }) as TData;
 
-      // 3. Perform the actual blocking save
-      const result = await this._doSave(baseData);
+      // 3. Perform the actual blocking save.
+      // Use captured IPNS context from save() time — prevents writing to wrong
+      // IPNS record if identity changed between save() and flush().
+      const overrideIpns = active.capturedIpnsKeyPair && active.capturedIpnsName
+        ? { keyPair: active.capturedIpnsKeyPair, name: active.capturedIpnsName }
+        : undefined;
+      const result = await this._doSave(baseData, overrideIpns);
 
       if (!result.success) {
         throw new SphereError(result.error ?? 'Save failed', 'STORAGE_ERROR');
@@ -832,4 +854,11 @@ export class IpfsStorageProvider<TData extends TxfStorageDataBase = TxfStorageDa
     logger.debug('IPFS-Storage', message);
   }
 
+  /**
+   * Create an independent instance for a different address.
+   * Shares the same gateway/timeout config but has fresh IPNS state.
+   */
+  createForAddress(): IpfsStorageProvider<TData> {
+    return new IpfsStorageProvider<TData>(this._config, this._statePersistenceCtor);
+  }
 }

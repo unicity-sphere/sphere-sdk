@@ -299,6 +299,12 @@ export class FileTokenStorageProvider implements TokenStorageProvider<TxfStorage
     return imported;
   }
 
+  /**
+   * Create an independent instance for a different address.
+   */
+  createForAddress(): FileTokenStorageProvider {
+    return new FileTokenStorageProvider({ tokensDir: this.baseTokensDir });
+  }
 }
 
 export function createFileTokenStorageProvider(config: FileTokenStorageConfig | string): FileTokenStorageProvider {

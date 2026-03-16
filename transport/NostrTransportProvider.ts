@@ -121,6 +121,8 @@ export class NostrTransportProvider implements TransportProvider {
   private storage: TransportStorageAdapter | null = null;
   /** In-memory max event timestamp to avoid read-before-write races in updateLastEventTimestamp. */
   private lastEventTs: number = 0;
+  /** Fallback 'since' timestamp for first-time address subscriptions (consumed once). */
+  private fallbackSince: number | null = null;
   private identity: FullIdentity | null = null;
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
@@ -156,6 +158,56 @@ export class NostrTransportProvider implements TransportProvider {
     };
     this.storage = config.storage ?? null;
   }
+
+  /**
+   * Get the WebSocket factory (used by MultiAddressTransportMux to share the same factory).
+   */
+  getWebSocketFactory(): WebSocketFactory {
+    return this.config.createWebSocket;
+  }
+
+  /**
+   * Get the configured relay URLs.
+   */
+  getConfiguredRelays(): string[] {
+    return [...this.config.relays];
+  }
+
+  /**
+   * Get the storage adapter.
+   */
+  getStorageAdapter(): TransportStorageAdapter | null {
+    return this.storage;
+  }
+
+  /**
+   * Suppress event subscriptions — unsubscribe wallet/chat filters
+   * but keep the connection alive for resolve/identity-binding operations.
+   * Used when MultiAddressTransportMux takes over event handling.
+   */
+  suppressSubscriptions(): void {
+    if (!this.nostrClient) return;
+
+    if (this.walletSubscriptionId) {
+      this.nostrClient.unsubscribe(this.walletSubscriptionId);
+      this.walletSubscriptionId = null;
+    }
+    if (this.chatSubscriptionId) {
+      this.nostrClient.unsubscribe(this.chatSubscriptionId);
+      this.chatSubscriptionId = null;
+    }
+    if (this.mainSubscriptionId) {
+      this.nostrClient.unsubscribe(this.mainSubscriptionId);
+      this.mainSubscriptionId = null;
+    }
+
+    // Prevent re-subscription on reconnect by marking subscriptions as suppressed
+    this._subscriptionsSuppressed = true;
+    logger.debug('Nostr', 'Subscriptions suppressed — mux handles event routing');
+  }
+
+  // Flag to prevent re-subscription after suppressSubscriptions()
+  private _subscriptionsSuppressed = false;
 
   // ===========================================================================
   // BaseProvider Implementation
@@ -377,6 +429,11 @@ export class NostrTransportProvider implements TransportProvider {
   async setIdentity(identity: FullIdentity): Promise<void> {
     this.identity = identity;
 
+    // Clear per-address state so stale dedup entries from previous address
+    // don't block legitimate events for the new address.
+    this.processedEventIds.clear();
+    this.lastEventTs = 0;
+
     // Create NostrKeyManager from private key
     const secretKey = Buffer.from(identity.privateKey, 'hex');
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
@@ -430,6 +487,10 @@ export class NostrTransportProvider implements TransportProvider {
       // Already connected with right key, just subscribe
       await this.subscribeToEvents();
     }
+  }
+
+  setFallbackSince(sinceSeconds: number): void {
+    this.fallbackSince = sinceSeconds;
   }
 
   /**
@@ -756,13 +817,13 @@ export class NostrTransportProvider implements TransportProvider {
   }
 
   async resolveNametag(nametag: string): Promise<string | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
     // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
     return this.nostrClient!.queryPubkeyByNametag(nametag);
   }
 
   async resolveNametagInfo(nametag: string): Promise<PeerInfo | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     // Delegate to nostr-js-sdk which implements first-seen-wins anti-hijacking
     const binding = await this.nostrClient!.queryBindingByNametag(nametag);
@@ -779,7 +840,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Performs reverse lookup via nostr-js-sdk with first-seen-wins anti-hijacking.
    */
   async resolveAddressInfo(address: string): Promise<PeerInfo | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     const binding = await this.nostrClient!.queryBindingByAddress(address);
     if (!binding) return null;
@@ -822,7 +883,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Queries binding events authored by the given pubkey.
    */
   async resolveTransportPubkeyInfo(transportPubkey: string): Promise<PeerInfo | null> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     const events = await this.queryEvents({
       kinds: [EVENT_KINDS.NAMETAG_BINDING],
@@ -864,7 +925,7 @@ export class NostrTransportProvider implements TransportProvider {
    * Used for HD address discovery — single relay query with multi-author filter.
    */
   async discoverAddresses(transportPubkeys: string[]): Promise<PeerInfo[]> {
-    this.ensureConnected();
+    await this.ensureConnectedForResolve();
 
     if (transportPubkeys.length === 0) return [];
 
@@ -912,7 +973,10 @@ export class NostrTransportProvider implements TransportProvider {
    * @returns Decrypted nametag or null if none found
    */
   async recoverNametag(): Promise<string | null> {
-    this.ensureReady();
+    await this.ensureConnectedForResolve();
+    if (!this.identity) {
+      throw new SphereError('Identity not set', 'NOT_INITIALIZED');
+    }
 
     if (!this.identity || !this.keyManager) {
       throw new SphereError('Identity not set', 'NOT_INITIALIZED');
@@ -1613,6 +1677,10 @@ export class NostrTransportProvider implements TransportProvider {
 
   private async subscribeToEvents(): Promise<void> {
     logger.debug('Nostr', 'subscribeToEvents called, identity:', !!this.identity, 'keyManager:', !!this.keyManager, 'nostrClient:', !!this.nostrClient);
+    if (this._subscriptionsSuppressed) {
+      logger.debug('Nostr', 'subscribeToEvents: suppressed — mux handles event routing');
+      return;
+    }
     if (!this.identity || !this.keyManager || !this.nostrClient) {
       logger.debug('Nostr', 'subscribeToEvents: skipped - no identity, keyManager, or nostrClient');
       return;
@@ -1647,15 +1715,24 @@ export class NostrTransportProvider implements TransportProvider {
         if (stored) {
           since = parseInt(stored, 10);
           this.lastEventTs = since; // Seed in-memory tracker from storage
+          this.fallbackSince = null; // Stored value takes priority
           logger.debug('Nostr', 'Resuming from stored event timestamp:', since);
+        } else if (this.fallbackSince !== null) {
+          // No stored timestamp but caller provided a fallback (e.g. address creation time).
+          // This ensures events sent while the address was inactive are not missed.
+          since = this.fallbackSince;
+          this.lastEventTs = since;
+          this.fallbackSince = null; // Consume once
+          logger.debug('Nostr', 'Using fallback since timestamp:', since);
         } else {
-          // No stored timestamp = fresh wallet, start from now
+          // No stored timestamp, no fallback = fresh wallet, start from now
           since = Math.floor(Date.now() / 1000);
           logger.debug('Nostr', 'No stored timestamp, starting from now:', since);
         }
       } catch (err) {
         logger.debug('Nostr', 'Failed to read last event timestamp, falling back to now:', err);
         since = Math.floor(Date.now() / 1000);
+        this.fallbackSince = null;
       }
     } else {
       // No storage adapter — fallback to last 24h (legacy behavior)
@@ -1808,6 +1885,37 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
+  /**
+   * Async version of ensureConnected — reconnects if the original transport
+   * lost its WebSocket while subscriptions are suppressed (mux handles events).
+   * Used by resolve methods which are always async.
+   */
+  private async ensureConnectedForResolve(): Promise<void> {
+    if (this.isConnected()) return;
+
+    // When mux is active, the original transport can lose its idle WebSocket.
+    // Reconnect transparently so resolve operations still work.
+    if (this._subscriptionsSuppressed && this.nostrClient) {
+      logger.debug('Nostr', 'Suppressed transport disconnected — reconnecting for resolve');
+      try {
+        await Promise.race([
+          this.nostrClient.connect(...this.config.relays),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('reconnect timeout')), 5000)
+          ),
+        ]);
+        if (this.nostrClient.isConnected()) {
+          this.status = 'connected';
+          return;
+        }
+      } catch {
+        // Fall through to throw
+      }
+    }
+
+    throw new SphereError('NostrTransportProvider not connected', 'TRANSPORT_ERROR');
+  }
+
   private ensureReady(): void {
     this.ensureConnected();
     if (!this.identity) {
@@ -1831,7 +1939,15 @@ export class NostrTransportProvider implements TransportProvider {
    * because NIP17.createGiftWrap hardcodes kind 14 for the inner rumor.
    */
   private createCustomKindGiftWrap(recipientPubkeyHex: string, content: string, rumorKind: number): NostrEventClass {
-    const senderPubkey = this.keyManager!.getPublicKeyHex();
+    return NostrTransportProvider.createCustomKindGiftWrap(this.keyManager!, recipientPubkeyHex, content, rumorKind);
+  }
+
+  /**
+   * Create a NIP-17 gift wrap with a custom rumor kind.
+   * Shared between NostrTransportProvider and MultiAddressTransportMux.
+   */
+  static createCustomKindGiftWrap(keyManager: NostrKeyManager, recipientPubkeyHex: string, content: string, rumorKind: number): NostrEventClass {
+    const senderPubkey = keyManager.getPublicKeyHex();
     const now = Math.floor(Date.now() / 1000);
 
     // 1. Create Rumor (unsigned inner event with custom kind)
@@ -1842,9 +1958,9 @@ export class NostrTransportProvider implements TransportProvider {
 
     // 2. Create Seal (kind 13, signed by sender, encrypts rumor)
     const recipientPubkeyBytes = hexToBytes(recipientPubkeyHex);
-    const encryptedRumor = NIP44.encrypt(JSON.stringify(rumor), this.keyManager!.getPrivateKey(), recipientPubkeyBytes);
+    const encryptedRumor = NIP44.encrypt(JSON.stringify(rumor), keyManager.getPrivateKey(), recipientPubkeyBytes);
     const sealTimestamp = now + Math.floor(Math.random() * 2 * TIMESTAMP_RANDOMIZATION) - TIMESTAMP_RANDOMIZATION;
-    const seal = NostrEventClass.create(this.keyManager!, {
+    const seal = NostrEventClass.create(keyManager, {
       kind: EventKinds.SEAL,
       tags: [],
       content: encryptedRumor,

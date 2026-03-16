@@ -168,6 +168,14 @@ export interface TokenStorageProvider<TData = unknown> extends BaseProvider {
   clear?(): Promise<boolean>;
 
   /**
+   * Create a new independent instance of this provider for a different address.
+   * Used by per-address module architecture — each address gets its own
+   * TokenStorageProvider instance to avoid cross-address data contamination.
+   * If not implemented, the provider cannot be used in multi-address mode.
+   */
+  createForAddress?(): TokenStorageProvider<TData>;
+
+  /**
    * Subscribe to storage events
    */
   onEvent?(callback: StorageEventCallback): () => void;

@@ -590,6 +590,16 @@ export class IndexedDBTokenStorageProvider implements TokenStorageProvider<TxfSt
       db.close();
     }
   }
+  /**
+   * Create an independent instance for a different address.
+   * The new instance shares the same config but has its own IDB connection.
+   */
+  createForAddress(): IndexedDBTokenStorageProvider {
+    return new IndexedDBTokenStorageProvider({
+      dbNamePrefix: this.dbNamePrefix,
+      debug: this.debug,
+    });
+  }
 }
 
 export function createIndexedDBTokenStorageProvider(

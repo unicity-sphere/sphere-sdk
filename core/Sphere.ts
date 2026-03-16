@@ -58,6 +58,7 @@ import type {
 import { SphereError } from './errors';
 import type { StorageProvider, TokenStorageProvider, TxfStorageDataBase } from '../storage';
 import type { TransportProvider, PeerInfo } from '../transport';
+import { MultiAddressTransportMux, AddressTransportAdapter } from '../transport/MultiAddressTransportMux';
 import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
@@ -411,6 +412,26 @@ type MutableFullIdentity = {
 };
 
 // =============================================================================
+// Per-Address Module Set
+// =============================================================================
+
+/**
+ * Holds all per-address module instances.
+ * Each HD address gets its own set so modules can run independently in background.
+ */
+export interface AddressModuleSet {
+  index: number;
+  identity: FullIdentity;
+  payments: PaymentsModule;
+  communications: CommunicationsModule;
+  groupChat: GroupChatModule | null;
+  market: MarketModule | null;
+  transportAdapter: AddressTransportAdapter | null;
+  tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>;
+  initialized: boolean;
+}
+
+// =============================================================================
 // Sphere Class
 // =============================================================================
 
@@ -445,12 +466,21 @@ export class Sphere {
   private _oracle: OracleProvider;
   private _priceProvider: PriceProvider | null;
 
-  // Modules
+  // Modules (single-instance — backward compat, delegates to active address)
   private _payments: PaymentsModule;
   private _communications: CommunicationsModule;
   private _groupChat: GroupChatModule | null = null;
   private _market: MarketModule | null = null;
   private _accounting: AccountingModule | null = null;
+
+  // Per-address module instances (Phase 2: independent parallel operation)
+  private _addressModules: Map<number, AddressModuleSet> = new Map();
+  private _transportMux: MultiAddressTransportMux | null = null;
+
+  // Stored configs for creating per-address modules
+  private _l1Config: L1Config | undefined;
+  private _groupChatConfig: GroupChatModuleConfig | undefined;
+  private _marketConfig: MarketModuleConfig | undefined;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -484,6 +514,11 @@ export class Sphere {
     if (tokenStorage) {
       this._tokenStorageProviders.set(tokenStorage.id, tokenStorage);
     }
+
+    // Store configs for creating per-address modules
+    this._l1Config = l1Config;
+    this._groupChatConfig = groupChatConfig;
+    this._marketConfig = marketConfig;
 
     this._payments = createPaymentsModule({ l1: l1Config });
     this._communications = createCommunicationsModule();
@@ -2151,8 +2186,8 @@ export class Sphere {
 
     const nametag = this._addressNametags.get(addressId)?.get(0);
 
-    // Update identity
-    this._identity = {
+    // Build identity for new address
+    const newIdentity: MutableFullIdentity = {
       privateKey: addressInfo.privateKey,
       chainPubkey: addressInfo.publicKey,
       l1Address: addressInfo.address,
@@ -2161,30 +2196,83 @@ export class Sphere {
       nametag,
     };
 
-    // Update current index
+    // =========================================================================
+    // Per-Address Module Architecture: Lazy Init + Pointer Switch
+    // No destroy, no waitForPendingOperations — old address keeps running.
+    // =========================================================================
+
+    if (!this._addressModules.has(index)) {
+      // First time switching to this address — create independent modules
+      logger.debug('Sphere', `switchToAddress(${index}): creating per-address modules (lazy init)`);
+
+      // CRITICAL: Update shared storage identity BEFORE loading per-address modules.
+      // IndexedDBStorageProvider.getFullKey() uses this.identity to build per-address
+      // storage keys.  Without this, modules would load the previous address's data.
+      this._storage.setIdentity(newIdentity);
+
+      // Create per-address token storage providers (each address needs its own instances)
+      const addressTokenProviders = new Map<string, TokenStorageProvider<TxfStorageDataBase>>();
+      for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
+        if (provider.createForAddress) {
+          const newProvider = provider.createForAddress();
+          newProvider.setIdentity(newIdentity);
+          await newProvider.initialize();
+          addressTokenProviders.set(providerId, newProvider);
+        } else {
+          // Fallback: reuse existing provider (legacy behavior for providers
+          // that don't support createForAddress)
+          logger.warn('Sphere', `Token storage provider ${providerId} does not support createForAddress, reusing shared instance`);
+          addressTokenProviders.set(providerId, provider);
+        }
+      }
+
+      await this.initializeAddressModules(index, newIdentity, addressTokenProviders);
+    } else {
+      // Modules already exist — update identity if nametag changed
+      const moduleSet = this._addressModules.get(index)!;
+      if (nametag !== moduleSet.identity.nametag) {
+        moduleSet.identity = newIdentity;
+        // Use per-address transport if available
+        const addressTransport: TransportProvider = moduleSet.transportAdapter ?? this._transport;
+        // Re-initialize with updated identity (nametag change)
+        moduleSet.payments.initialize({
+          identity: newIdentity,
+          storage: this._storage,
+          tokenStorageProviders: moduleSet.tokenStorageProviders,
+          transport: addressTransport,
+          oracle: this._oracle,
+          emitEvent: this.emitEvent.bind(this),
+          chainCode: this._masterKey?.chainCode || undefined,
+          price: this._priceProvider ?? undefined,
+        });
+      }
+    }
+
+    // Switch the active pointer — instant, no destroy
+    this._identity = newIdentity;
     this._currentAddressIndex = index;
     await this._updateCachedProxyAddress();
+
+    // Update active module references for backward compatibility
+    const activeModules = this._addressModules.get(index)!;
+    this._payments = activeModules.payments;
+    this._communications = activeModules.communications;
+    this._groupChat = activeModules.groupChat;
+    this._market = activeModules.market;
 
     // Persist current index
     await this._storage.set(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX, index.toString());
 
-    // Re-initialize providers with new identity
+    // Update storage identity for per-address key scoping
     this._storage.setIdentity(this._identity);
-    await this._transport.setIdentity(this._identity);
 
-    // Close current token storage connections, then re-open for new address.
-    // Shutdown first prevents leaked IDB connections that block deleteDatabase.
-    logger.debug('Sphere', `switchToAddress(${index}): re-initializing ${this._tokenStorageProviders.size} token storage provider(s)`);
-    for (const [providerId, provider] of this._tokenStorageProviders.entries()) {
-      logger.debug('Sphere', `switchToAddress(${index}): shutdown provider=${providerId}`);
-      await provider.shutdown();
-      provider.setIdentity(this._identity);
-      logger.debug('Sphere', `switchToAddress(${index}): initialize provider=${providerId}`);
-      await provider.initialize();
+    // Provide fallback 'since' for first-time Nostr subscriptions
+    if (this._transport.setFallbackSince) {
+      const fallbackTs = Math.floor(Date.now() / 1000) - 86400;
+      this._transport.setFallbackSince(fallbackTs);
     }
 
-    // Re-initialize modules with new identity
-    await this.reinitializeModulesForNewAddress();
+    await this._transport.setIdentity(this._identity);
 
     this.emitEvent('identity:changed', {
       l1Address: this._identity.l1Address,
@@ -2196,8 +2284,7 @@ export class Sphere {
 
     logger.debug('Sphere', `Switched to address ${index}:`, this._identity.l1Address);
 
-    // Run transport sync and nametag operations in background so address
-    // switch returns quickly and L1/L3 balance queries can start immediately.
+    // Run transport sync and nametag operations in background
     this.postSwitchSync(index, newNametag).catch(err => {
       logger.warn('Sphere', `Post-switch sync failed for address ${index}:`, err);
     });
@@ -2252,9 +2339,20 @@ export class Sphere {
   }
 
   /**
-   * Re-initialize modules after address switch
+   * Create a new set of per-address modules for the given index.
+   * Each address gets its own PaymentsModule, CommunicationsModule, etc.
+   * Modules are fully independent — they have their own token storage,
+   * and can sync/finalize/split in background regardless of active address.
+   *
+   * @param index - HD address index
+   * @param identity - Full identity for this address
+   * @param tokenStorageProviders - Token storage providers for this address
    */
-  private async reinitializeModulesForNewAddress(): Promise<void> {
+  private async initializeAddressModules(
+    index: number,
+    identity: FullIdentity,
+    tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>,
+  ): Promise<AddressModuleSet> {
     // W23 fix: Destroy the previous accounting module instance before re-init.
     // This drains in-flight gated operations (auto-return, implicit close) that
     // may hold stale ledger references from the previous address.
@@ -2264,37 +2362,51 @@ export class Sphere {
 
     const emitEvent = this.emitEvent.bind(this);
 
-    this._payments.initialize({
-      identity: this._identity!,
+    // Ensure transport mux exists for non-primary addresses
+    const adapter = await this.ensureTransportMux(index, identity);
+
+    // Use the adapter for transport-dependent modules (address-specific event routing)
+    // Resolve operations are delegated to the original transport
+    const addressTransport: TransportProvider = adapter ?? this._transport;
+
+    // Create fresh module instances for this address
+    const payments = createPaymentsModule({ l1: this._l1Config });
+    const communications = createCommunicationsModule();
+    const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
+    const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
+
+    // Initialize with address-specific identity and per-address transport
+    payments.initialize({
+      identity,
       storage: this._storage,
-      tokenStorageProviders: this._tokenStorageProviders,
-      transport: this._transport,
+      tokenStorageProviders,
+      transport: addressTransport,
       oracle: this._oracle,
       emitEvent,
       chainCode: this._masterKey?.chainCode || undefined,
       price: this._priceProvider ?? undefined,
     });
 
-    this._communications.initialize({
-      identity: this._identity!,
+    communications.initialize({
+      identity,
       storage: this._storage,
-      transport: this._transport,
+      transport: addressTransport,
       emitEvent,
     });
 
-    this._groupChat?.initialize({
-      identity: this._identity!,
+    groupChat?.initialize({
+      identity,
       storage: this._storage,
       emitEvent,
     });
 
-    this._market?.initialize({
-      identity: this._identity!,
+    market?.initialize({
+      identity,
       emitEvent,
     });
 
     if (this._accounting) {
-      const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
+      const accountingTokenStorage = tokenStorageProviders.values().next().value;
       if (accountingTokenStorage) {
         // Resolve trustBase from oracle for invoice proof verification
         // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
@@ -2310,16 +2422,16 @@ export class Sphere {
         // that require proof verification. createInvoice() is unaffected.
 
         this._accounting.initialize({
-          payments: this._payments,
+          payments,
           tokenStorage: accountingTokenStorage,
           oracle: this._oracle,
           trustBase,
-          identity: this._identity!,
+          identity,
           getActiveAddresses: () => this._getActiveAddressesInternal(),
           emitEvent,
           on: this.on.bind(this),
           storage: this._storage,
-          communications: this._communications,
+          communications,
         });
       } else {
         // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
@@ -2329,18 +2441,84 @@ export class Sphere {
       }
     }
 
-    await this._payments.load();
-    await this._communications.load();
-    await this._groupChat?.load();
-    await this._market?.load();
+    await payments.load();
+    await communications.load();
+    await groupChat?.load();
+    await market?.load();
     await this._accounting?.load();
 
-    // After loading from local storage, sync with remote (IPFS) to restore
-    // tokens that exist remotely but not locally (e.g. after address switch
-    // where the local IndexedDB is empty but IPFS has the data).
-    this._payments.sync().catch((err) => {
-      logger.warn('Sphere', 'Post-switch sync failed:', err);
+    const moduleSet: AddressModuleSet = {
+      index,
+      identity,
+      payments,
+      communications,
+      groupChat,
+      market,
+      transportAdapter: adapter,
+      tokenStorageProviders: new Map(tokenStorageProviders),
+      initialized: true,
+    };
+
+    this._addressModules.set(index, moduleSet);
+    logger.debug('Sphere', `Initialized per-address modules for address ${index} (transport: ${adapter ? 'mux adapter' : 'primary'})`);
+
+    // Background sync after initialization
+    payments.sync().catch((err) => {
+      logger.warn('Sphere', `Post-init sync failed for address ${index}:`, err);
     });
+
+    return moduleSet;
+  }
+
+  /**
+   * Ensure the transport multiplexer exists and register an address.
+   * Creates the mux on first call. Returns an AddressTransportAdapter
+   * that routes events for this address independently.
+   * @returns AddressTransportAdapter or null if transport is not Nostr-based
+   */
+  private async ensureTransportMux(index: number, identity: FullIdentity): Promise<AddressTransportAdapter | null> {
+    // Duck-type check for Nostr transport (instanceof won't work across tsup bundles)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const transport = this._transport as any;
+    if (typeof transport.getWebSocketFactory !== 'function' ||
+        typeof transport.getConfiguredRelays !== 'function') {
+      logger.debug('Sphere', 'Transport does not support mux interface, skipping');
+      return null;
+    }
+
+    const nostrTransport = transport;
+
+    // Create mux on first call
+    if (!this._transportMux) {
+      this._transportMux = new MultiAddressTransportMux({
+        relays: nostrTransport.getConfiguredRelays(),
+        createWebSocket: nostrTransport.getWebSocketFactory(),
+        storage: nostrTransport.getStorageAdapter() ?? undefined,
+      });
+
+      // Connect the mux
+      await this._transportMux.connect();
+
+      // Suppress original transport's subscriptions to avoid duplicate event handling.
+      // Original transport stays connected for resolve/identity-binding operations.
+      if (typeof nostrTransport.suppressSubscriptions === 'function') {
+        nostrTransport.suppressSubscriptions();
+      }
+
+      logger.debug('Sphere', 'Transport mux created and connected');
+    }
+
+    // Register address in the mux (resolve delegated to original transport)
+    const adapter = await this._transportMux.addAddress(index, identity, this._transport);
+    return adapter;
+  }
+
+  /**
+   * Get per-address modules for any address index (creates lazily if needed).
+   * This allows accessing any address's modules without switching.
+   */
+  getAddressPayments(index: number): PaymentsModule | undefined {
+    return this._addressModules.get(index)?.payments;
   }
 
   /**
@@ -3504,17 +3682,43 @@ export class Sphere {
       logger.warn('Sphere', 'Accounting module destroy failed:', err);
     }
 
-    // Now safe to destroy payments
+    // Destroy all per-address module sets
+    for (const [idx, moduleSet] of this._addressModules.entries()) {
+      try {
+        moduleSet.payments.destroy();
+        moduleSet.communications.destroy();
+        moduleSet.groupChat?.destroy();
+        moduleSet.market?.destroy();
+        // Shutdown per-address token storage providers
+        for (const provider of moduleSet.tokenStorageProviders.values()) {
+          try { await provider.shutdown(); } catch { /* non-fatal */ }
+        }
+        moduleSet.tokenStorageProviders.clear();
+        logger.debug('Sphere', `Destroyed modules for address ${idx}`);
+      } catch (err) {
+        logger.warn('Sphere', `Error destroying modules for address ${idx}:`, err);
+      }
+    }
+    this._addressModules.clear();
+
+    // Also destroy the active module references (they may be the same as
+    // address 0 modules, but destroy() is idempotent)
     this._payments.destroy();
     this._communications.destroy();
     this._groupChat?.destroy();
     this._market?.destroy();
 
+    // Disconnect transport mux if present
+    if (this._transportMux) {
+      await this._transportMux.disconnect();
+      this._transportMux = null;
+    }
+
     await this._transport.disconnect();
     await this._storage.disconnect();
     await this._oracle.disconnect();
 
-    // Shutdown token storage providers (close IndexedDB connections etc.)
+    // Shutdown original token storage providers (close IndexedDB connections etc.)
     for (const provider of this._tokenStorageProviders.values()) {
       try {
         await provider.shutdown();
@@ -3795,6 +3999,15 @@ export class Sphere {
   private async initializeProviders(): Promise<void> {
     // Set identity on providers
     this._storage.setIdentity(this._identity!);
+
+    // Provide fallback 'since' for existing wallets so Nostr subscriptions
+    // pick up events sent while this address was inactive.
+    // 24h lookback — safe because Nostr filter is pubkey-specific (#p=[pubkey]).
+    // Stored timestamp takes priority if available.
+    if (this._transport.setFallbackSince) {
+      this._transport.setFallbackSince(Math.floor(Date.now() / 1000) - 86400);
+    }
+
     await this._transport.setIdentity(this._identity!);
 
     // Set identity on all token storage providers
@@ -3912,11 +4125,16 @@ export class Sphere {
   private async initializeModules(): Promise<void> {
     const emitEvent = this.emitEvent.bind(this);
 
+    // Create transport mux for address 0 so all addresses use per-address routing
+    // from the start. The original transport stays connected for resolve operations.
+    const adapter = await this.ensureTransportMux(this._currentAddressIndex, this._identity!);
+    const moduleTransport: TransportProvider = adapter ?? this._transport;
+
     this._payments.initialize({
       identity: this._identity!,
       storage: this._storage,
       tokenStorageProviders: this._tokenStorageProviders,
-      transport: this._transport,
+      transport: moduleTransport,
       oracle: this._oracle,
       emitEvent,
       // Pass chain code for L1 HD derivation
@@ -3928,7 +4146,7 @@ export class Sphere {
     this._communications.initialize({
       identity: this._identity!,
       storage: this._storage,
-      transport: this._transport,
+      transport: moduleTransport,
       emitEvent,
     });
 
@@ -3984,6 +4202,19 @@ export class Sphere {
     await this._groupChat?.load();
     await this._market?.load();
     await this._accounting?.load();
+
+    // Register in per-address module map
+    this._addressModules.set(this._currentAddressIndex, {
+      index: this._currentAddressIndex,
+      identity: this._identity!,
+      payments: this._payments,
+      communications: this._communications,
+      groupChat: this._groupChat,
+      market: this._market,
+      transportAdapter: adapter,
+      tokenStorageProviders: new Map(this._tokenStorageProviders),
+      initialized: true,
+    });
   }
 
   // ===========================================================================

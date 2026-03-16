@@ -3,3 +3,6 @@ export type { PostMessageHostOptions, PostMessageClientOptions } from './PostMes
 
 export { ExtensionTransport, EXT_MSG_TO_HOST, EXT_MSG_TO_CLIENT, isExtensionConnectEnvelope } from './ExtensionTransport';
 export type { ExtensionConnectEnvelope, ChromeMessagingApi } from './ExtensionTransport';
+
+export { autoConnect, detectTransport, isInIframe, hasExtension } from './autoConnect';
+export type { AutoConnectConfig, AutoConnectResult, DetectedTransport } from './autoConnect';

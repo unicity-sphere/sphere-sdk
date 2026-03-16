@@ -811,6 +811,22 @@ export class PaymentsModule {
     this.unsubscribePaymentRequestResponses?.();
     this.unsubscribePaymentRequestResponses = null;
 
+    // Stop all background timers/jobs from previous address context.
+    // Without this, proof polling, resolveUnconfirmed intervals, and
+    // pending response resolvers continue running after address switch
+    // and may call save() in the new address's storage context.
+    this.stopProofPolling();
+    this.proofPollingJobs.clear();
+    this.stopResolveUnconfirmedPolling();
+    this.unsubscribeStorageEvents();
+
+    // Cancel pending payment response resolvers
+    for (const [, resolver] of this.pendingResponseResolvers) {
+      clearTimeout(resolver.timeout);
+      resolver.reject(new Error('Address switched'));
+    }
+    this.pendingResponseResolvers.clear();
+
     // Reset per-address state (will be re-populated by load())
     this.tokens.clear();
     this.pendingTransfers.clear();
@@ -891,6 +907,15 @@ export class PaymentsModule {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
+            // Address guard: reject data from a different address
+            const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
+            const currentL1 = this.deps!.identity.l1Address;
+            const currentChain = this.deps!.identity.chainPubkey;
+            if (loadedMeta?.address && currentL1 && loadedMeta.address !== currentL1 && loadedMeta.address !== currentChain) {
+              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+              continue;
+            }
+
             this.loadFromStorageData(result.data);
             // Rebuild parsedTokenCache for spend queue (loadFromStorageData bypasses addToken)
             await this.rebuildParsedTokenCache();
@@ -1020,6 +1045,13 @@ export class PaymentsModule {
     internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
   ): Promise<TransferResult> {
     this.ensureInitialized();
+
+    // Track this send() so switchToAddress() waits for it via waitForPendingOperations().
+    // Without this, the user can switch addresses while send() is still running,
+    // and save() calls inside send() would write to the wrong address's storage.
+    let resolveSendTracker!: () => void;
+    const sendTracker = new Promise<void>(r => { resolveSendTracker = r; });
+    this.pendingBackgroundTasks.push(sendTracker);
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
@@ -1491,6 +1523,8 @@ export class PaymentsModule {
 
       this.deps!.emitEvent('transfer:failed', result);
       throw error;
+    } finally {
+      resolveSendTracker();
     }
   }
 
@@ -2896,9 +2930,12 @@ export class PaymentsModule {
    * Call this before process exit to ensure all tokens are saved.
    */
   async waitForPendingOperations(): Promise<void> {
+    logger.debug('Payments', `waitForPendingOperations: ${this.pendingBackgroundTasks.length} pending tasks`);
     if (this.pendingBackgroundTasks.length > 0) {
+      logger.debug('Payments', 'waitForPendingOperations: waiting...');
       await Promise.allSettled(this.pendingBackgroundTasks);
       this.pendingBackgroundTasks = [];
+      logger.debug('Payments', 'waitForPendingOperations: all tasks completed');
     }
   }
 
@@ -4503,6 +4540,17 @@ export class PaymentsModule {
           const result = await provider.sync(localData);
 
           if (result.success && result.merged) {
+            // Address guard: reject data from a different address.
+            // Stale IPFS records may contain tokens from a previously active
+            // address if a write-behind flush raced with an address switch.
+            const mergedMeta = (result.merged as TxfStorageDataBase)?._meta;
+            const currentL1 = this.deps!.identity.l1Address;
+            const currentChain = this.deps!.identity.chainPubkey;
+            if (mergedMeta?.address && currentL1 && mergedMeta.address !== currentL1 && mergedMeta.address !== currentChain) {
+              logger.warn('Payments', `Sync: rejecting data from provider ${providerId} — address mismatch (got=${mergedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+              continue;
+            }
+
             // Snapshot tokens that can't survive TXF round-trip (V5 pending)
             // AND tokens that were added after the localData snapshot.
             // Sync can race with resolveUnconfirmed() or incoming transfers.

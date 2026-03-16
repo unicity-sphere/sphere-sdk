@@ -50,7 +50,7 @@ const { NostrTransportProvider } = await import('../../../transport/NostrTranspo
 function createProvider(relays: string[] = ['wss://relay1.test', 'wss://relay2.test']) {
   return new NostrTransportProvider({
     relays,
-    createWebSocket: (() => {}) as WebSocketFactory, // Not used anymore, NostrClient handles it
+    createWebSocket: (() => {}) as unknown as WebSocketFactory, // Not used anymore, NostrClient handles it
     timeout: 100,
     autoReconnect: false,
   });
@@ -620,6 +620,74 @@ describe('Last event timestamp persistence', () => {
       const storageKeyArg = mockStorage.get.mock.calls[0][0];
       // Key format: last_wallet_event_ts_{first 16 chars of nostr pubkey}
       expect(storageKeyArg).toMatch(/^last_wallet_event_ts_[0-9a-f]{16}$/);
+    });
+
+    it('should use fallback since when no stored timestamp and fallback is set', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null), // No stored timestamp
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const fallbackTs = 1690000000;
+      const provider = createProviderWithStorage(mockStorage);
+      provider.setFallbackSince(fallbackTs);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockSubscribe).toHaveBeenCalled();
+      const [walletFilterArg] = mockSubscribe.mock.calls[0];
+      const walletFilter = walletFilterArg.toJSON();
+      expect(walletFilter.since).toBe(fallbackTs);
+    });
+
+    it('should ignore fallback when stored timestamp exists', async () => {
+      const storedTimestamp = '1700000000';
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(storedTimestamp),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const provider = createProviderWithStorage(mockStorage);
+      provider.setFallbackSince(1690000000); // Earlier than stored
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      expect(mockSubscribe).toHaveBeenCalled();
+      const [walletFilterArg] = mockSubscribe.mock.calls[0];
+      const walletFilter = walletFilterArg.toJSON();
+      expect(walletFilter.since).toBe(1700000000); // Stored value wins
+    });
+
+    it('should consume fallback after first use (not reuse on next subscription)', async () => {
+      const mockStorage = {
+        get: vi.fn().mockResolvedValue(null),
+        set: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const fallbackTs = 1690000000;
+      const provider = createProviderWithStorage(mockStorage);
+      provider.setFallbackSince(fallbackTs);
+      setIdentity(provider);
+      await provider.connect();
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // First subscription should use fallback
+      const [firstWalletFilter] = mockSubscribe.mock.calls[0];
+      expect(firstWalletFilter.toJSON().since).toBe(fallbackTs);
+
+      // Reset mocks and trigger another subscription (e.g. identity change)
+      mockSubscribe.mockClear();
+      setIdentity(provider);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      // Second subscription should NOT use fallback (was consumed)
+      const now = Math.floor(Date.now() / 1000);
+      const [secondWalletFilter] = mockSubscribe.mock.calls[0];
+      const secondSince = secondWalletFilter.toJSON().since;
+      expect(secondSince).toBeGreaterThanOrEqual(now - 5);
+      expect(secondSince).toBeLessThanOrEqual(now + 5);
     });
   });
 
