@@ -376,6 +376,35 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- tokens --no-sync',
     ],
   },
+  'assets': {
+    usage: 'assets [--type <fungible|nft>]',
+    description: 'List all registered assets (coins and NFTs) from the token registry. Shows symbol, name, kind, decimals, and coin ID.',
+    flags: [
+      { flag: '--type <kind>', description: 'Filter by asset kind: fungible (or coin/coins), nft (or nfts/non-fungible)' },
+    ],
+    examples: [
+      'npm run cli -- assets',
+      'npm run cli -- assets --type fungible',
+      'npm run cli -- assets --type nft',
+    ],
+    notes: [
+      'Requires wallet initialization (to load the token registry from the network).',
+      'The registry is fetched from a remote URL and cached locally.',
+    ],
+  },
+  'asset-info': {
+    usage: 'asset-info <symbol|name|coinId>',
+    description: 'Show detailed information for a specific asset. Looks up by symbol (UCT), name (bitcoin), or coin ID hex.',
+    examples: [
+      'npm run cli -- asset-info UCT',
+      'npm run cli -- asset-info bitcoin',
+      'npm run cli -- asset-info 0a1b2c3d4e5f...',
+    ],
+    notes: [
+      'Use "assets" command first to see all available assets.',
+      'Lookup is case-insensitive for symbols and names.',
+    ],
+  },
   'l1-balance': {
     usage: 'l1-balance',
     description: 'Show L1 (ALPHA blockchain) balance including confirmed and unconfirmed amounts. Connects to Fulcrum electrum server on first use.',
@@ -1164,6 +1193,8 @@ WALLET PROFILES:
 BALANCE & TOKENS:
   balance                           Show L3 token balance
   tokens                            List individual tokens
+  assets                            List all registered assets (coins & NFTs)
+  asset-info <id>                   Show detailed info for an asset
   l1-balance                        L1 (ALPHA) balance
   topup [coin] [amount]             Request test tokens from faucet
   verify-balance                    Detect spent tokens via aggregator
@@ -1711,6 +1742,104 @@ async function main() {
             console.log(`  Amount: ${formatted} ${symbol}`);
             console.log(`  Status: ${token.status || 'active'}`);
             console.log('');
+          }
+        }
+        console.log('─'.repeat(50));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'assets': {
+        // Initialize Sphere so TokenRegistry is loaded with remote data
+        const sphere = await getSphere();
+        const registry = TokenRegistry.getInstance();
+        const allDefs = registry.getAllDefinitions();
+
+        const typeFilter = args.indexOf('--type');
+        const filterValue = typeFilter !== -1 ? args[typeFilter + 1] : undefined;
+
+        let defs = allDefs;
+        if (filterValue === 'fungible' || filterValue === 'coin' || filterValue === 'coins') {
+          defs = registry.getFungibleTokens();
+        } else if (filterValue === 'nft' || filterValue === 'nfts' || filterValue === 'non-fungible') {
+          defs = registry.getNonFungibleTokens();
+        }
+
+        if (defs.length === 0) {
+          console.log('No registered assets found.');
+          console.log('The token registry may not have loaded yet. Try again in a moment.');
+        } else {
+          // Table header
+          console.log('');
+          console.log(`${'SYMBOL'.padEnd(10)} ${'NAME'.padEnd(20)} ${'KIND'.padEnd(14)} ${'DECIMALS'.padEnd(10)} ${'COIN ID'}`);
+          console.log('─'.repeat(90));
+
+          // Sort: fungible first (by symbol), then NFTs (by name)
+          const sorted = [...defs].sort((a, b) => {
+            if (a.assetKind !== b.assetKind) return a.assetKind === 'fungible' ? -1 : 1;
+            const aLabel = a.symbol || a.name || a.id;
+            const bLabel = b.symbol || b.name || b.id;
+            return aLabel.localeCompare(bLabel);
+          });
+
+          for (const def of sorted) {
+            const symbol = (def.symbol || '—').padEnd(10);
+            const name = (def.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : '—').padEnd(20);
+            const kind = def.assetKind.padEnd(14);
+            const decimals = (def.decimals !== undefined ? String(def.decimals) : '—').padEnd(10);
+            const coinId = def.id.slice(0, 16) + '...';
+            console.log(`${symbol} ${name} ${kind} ${decimals} ${coinId}`);
+          }
+
+          console.log('─'.repeat(90));
+          console.log(`Total: ${defs.length} asset(s)`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'asset-info': {
+        const identifier = args[1];
+        if (!identifier) {
+          console.error('Usage: asset-info <symbol|name|coinId>');
+          console.error('Examples:');
+          console.error('  npm run cli -- asset-info UCT');
+          console.error('  npm run cli -- asset-info bitcoin');
+          console.error('  npm run cli -- asset-info 0a1b2c3d...');
+          process.exit(1);
+        }
+
+        // Initialize Sphere so TokenRegistry is loaded
+        const sphere = await getSphere();
+        const registry = TokenRegistry.getInstance();
+
+        // Try multiple lookup strategies
+        let def = registry.getDefinitionBySymbol(identifier);
+        if (!def) def = registry.getDefinitionByName(identifier);
+        if (!def) def = registry.getDefinition(identifier); // by coinId hex
+
+        if (!def) {
+          console.error(`Asset not found: "${identifier}"`);
+          console.error('Use "assets" command to list all registered assets.');
+          process.exit(1);
+        }
+
+        console.log('');
+        console.log('Asset Details');
+        console.log('─'.repeat(50));
+        console.log(`  Symbol:      ${def.symbol || '—'}`);
+        console.log(`  Name:        ${def.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : '—'}`);
+        console.log(`  Kind:        ${def.assetKind}`);
+        console.log(`  Decimals:    ${def.decimals !== undefined ? def.decimals : '—'}`);
+        console.log(`  Coin ID:     ${def.id}`);
+        console.log(`  Network:     ${def.network}`);
+        console.log(`  Description: ${def.description || '—'}`);
+        if (def.icons && def.icons.length > 0) {
+          console.log(`  Icons:`);
+          for (const icon of def.icons) {
+            console.log(`    - ${icon.url}`);
           }
         }
         console.log('─'.repeat(50));
