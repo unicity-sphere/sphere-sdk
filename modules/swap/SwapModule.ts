@@ -1415,6 +1415,7 @@ export class SwapModule {
     readonly content: string;
     readonly senderPubkey: string;
     readonly senderNametag?: string;
+    readonly timestamp?: number;
   }): void {
     // Quick check: skip non-swap DMs early
     if (!isSwapDM(dm.content)) return;
@@ -1588,6 +1589,9 @@ export class SwapModule {
             // Verify sender is the counterparty
             if (dm.senderPubkey !== swap.counterpartyPubkey) return;
 
+            // Skip stale acceptances from a previous proposal instance
+            if (dm.timestamp && dm.timestamp < swap.createdAt) return;
+
             const deps = this.deps!;
 
             await this.withSwapGate(swapId, async () => {
@@ -1633,6 +1637,10 @@ export class SwapModule {
 
             // Verify sender is counterparty
             if (dm.senderPubkey !== swap.counterpartyPubkey) return;
+
+            // Skip stale rejections from a previous proposal instance
+            // (same swap_id re-proposed after rejection — DM replay delivers the old rejection)
+            if (dm.timestamp && dm.timestamp < swap.createdAt) return;
 
             const deps = this.deps!;
 
