@@ -81,6 +81,10 @@ export class SwapModule {
   private config: Required<Pick<SwapModuleConfig, 'debug' | 'proposalTimeoutMs' | 'maxPendingSwaps' | 'announceTimeoutMs' | 'terminalPurgeTtlMs'>> & Pick<SwapModuleConfig, 'defaultEscrowAddress'>;
   private deps: SwapModuleDependencies | null = null;
   private swaps: Map<string, SwapRef> = new Map();
+  /** Set of swap IDs that have reached terminal state (completed/cancelled/failed).
+   * Used to reject replayed proposal DMs for swaps that were already processed.
+   * Populated during loadFromStorage and updated on terminal transitions. */
+  private terminalSwapIds: Set<string> = new Set();
   private _gateMap = new AsyncGateMap();
   private localTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private invoiceToSwapIndex: Map<string, string> = new Map(); // invoiceId -> swapId
@@ -213,6 +217,7 @@ export class SwapModule {
 
     // Step 1: Clear in-memory state
     this.swaps.clear();
+    this.terminalSwapIds.clear();
     this.invoiceToSwapIndex.clear();
     this.loaded = false;
 
@@ -475,6 +480,8 @@ export class SwapModule {
     for (const entry of indexEntries) {
       // Purge terminal entries older than TTL
       if (isTerminalProgress(entry.progress)) {
+        // Track terminal IDs to prevent replayed DMs from recreating the swap
+        this.terminalSwapIds.add(entry.swapId);
         const age = now - entry.createdAt;
         if (age > this.config.terminalPurgeTtlMs) {
           purgedIds.push(entry.swapId);
@@ -618,9 +625,10 @@ export class SwapModule {
     // Persist per-swap key
     await this.persistSwap(swap);
 
-    // Clear local timer on terminal states
+    // Clear local timer and track terminal ID on terminal states
     if (isTerminalProgress(to)) {
       this.clearLocalTimer(swap.swapId);
+      this.terminalSwapIds.add(swap.swapId);
     }
 
     if (this.config.debug) {
@@ -1452,10 +1460,10 @@ export class SwapModule {
               return;
             }
 
-            // Check for duplicate swap_id
-            if (this.swaps.has(manifest.swap_id)) {
+            // Check for duplicate swap_id (active or previously terminal)
+            if (this.swaps.has(manifest.swap_id) || this.terminalSwapIds.has(manifest.swap_id)) {
               if (this.config.debug) {
-                logger.debug(LOG_TAG, `Proposal ignored: duplicate swap_id ${manifest.swap_id}`);
+                logger.debug(LOG_TAG, `Proposal ignored: duplicate/terminal swap_id ${manifest.swap_id}`);
               }
               return;
             }
