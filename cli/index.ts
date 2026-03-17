@@ -210,6 +210,15 @@ async function closeSphere(): Promise<void> {
   }
 }
 
+/** Push local state changes to IPFS after write operations. Tolerates failures. */
+async function syncAfterWrite(sphere: Sphere): Promise<void> {
+  try {
+    await sphere.payments.sync();
+  } catch {
+    // Tolerated — IPFS may be unavailable
+  }
+}
+
 /**
  * Resolve a coin identifier (symbol, name, or hex ID) to its registry definition.
  * Tries symbol first, then name, then raw hex ID.
@@ -2229,6 +2238,7 @@ async function main() {
 
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -2292,6 +2302,7 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -3604,6 +3615,7 @@ async function main() {
           console.log(JSON.stringify(result, null, 2));
         }
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -3775,6 +3787,7 @@ async function main() {
         await sphere.accounting.closeInvoice(invoiceId, autoReturn ? { autoReturn: true } : undefined);
         console.log(`Invoice ${invoiceId} closed.${autoReturn ? ' Auto-return triggered.' : ''}`);
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -3808,6 +3821,7 @@ async function main() {
         await sphere.accounting.cancelInvoice(invoiceId);
         console.log(`Invoice ${invoiceId} cancelled.`);
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -3864,6 +3878,7 @@ async function main() {
         console.log('Payment result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -3928,6 +3943,7 @@ async function main() {
         console.log('Return payment result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -4463,6 +4479,7 @@ async function main() {
         console.log('Deposit result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
 
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }

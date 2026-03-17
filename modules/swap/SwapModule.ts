@@ -380,6 +380,12 @@ export class SwapModule {
   /**
    * Persist a single swap record to storage.
    * Writes the per-swap key and updates the index.
+   *
+   * TODO: Swap records are stored in StorageProvider (local file/IndexedDB) which
+   * is NOT synced to IPFS. The IpfsStorageProvider only covers TokenStorageProvider
+   * (TXF data). Nostr DMs provide the primary replication mechanism for swaps
+   * (proposals, acceptance, escrow messages). In a future iteration, consider
+   * extending IPFS sync to include swap records for full cross-device recovery.
    */
   private async persistSwap(swap: SwapRef): Promise<void> {
     const deps = this.deps;
