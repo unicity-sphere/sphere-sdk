@@ -116,6 +116,8 @@ npm run cli -- verify-balance
 
 CLI data is stored in `./.sphere-cli/` directory.
 
+> **Shell completion:** Run `npm link && sphere-cli completions bash >> ~/.bashrc` for tab-completion of all commands. See [CLI Quickstart](docs/QUICKSTART-CLI.md) for details.
+
 ## Quick Start
 
 ```typescript

@@ -22,6 +22,63 @@ npm run cli -- --help
 
 ---
 
+## Shell Auto-Completion (Optional)
+
+Enable tab-completion for all sphere-cli commands and flags.
+
+### Step 1: Install the CLI globally
+
+```bash
+cd /path/to/sphere-sdk
+npm link
+```
+
+This makes `sphere-cli` available as a global command (instead of `npm run cli --`).
+
+### Step 2: Generate and install completions
+
+**Bash:**
+```bash
+sphere-cli completions bash >> ~/.bashrc
+source ~/.bashrc
+```
+
+**Zsh:**
+```bash
+mkdir -p ~/.zsh/completions
+sphere-cli completions zsh > ~/.zsh/completions/_sphere-cli
+# Add to ~/.zshrc if not already there:
+# fpath=(~/.zsh/completions $fpath)
+# autoload -Uz compinit && compinit
+source ~/.zshrc
+```
+
+**Fish:**
+```bash
+sphere-cli completions fish > ~/.config/fish/completions/sphere-cli.fish
+```
+
+### Without `npm link` (using `npm run cli`)
+
+```bash
+eval "$(npm run --silent cli -- completions bash)"  # bash
+eval "$(npm run --silent cli -- completions zsh)"   # zsh
+npm run --silent cli -- completions fish > ~/.config/fish/completions/sphere-cli.fish  # fish
+```
+
+### What it provides
+
+After setup, press Tab to auto-complete:
+```
+sphere-cli <TAB>                    # all commands
+sphere-cli swap-<TAB>               # swap-propose swap-list swap-accept ...
+sphere-cli swap-propose --<TAB>     # --to --offer --want --escrow --timeout --message
+sphere-cli invoice-<TAB>            # invoice-create invoice-list ...
+sphere-cli wallet <TAB>             # list create use current delete
+```
+
+---
+
 ## Command Quick Reference
 
 | Command | Description |

@@ -590,6 +590,15 @@ npm run lint
 npm run typecheck
 ```
 
+## Shell Auto-Completion
+
+```bash
+npm link                                    # install sphere-cli globally
+sphere-cli completions bash >> ~/.bashrc    # bash
+sphere-cli completions zsh >> ~/.zshrc      # zsh
+sphere-cli completions fish > ~/.config/fish/completions/sphere-cli.fish  # fish
+```
+
 ## Key Concepts
 
 ### L1 Payments (Enabled by Default)

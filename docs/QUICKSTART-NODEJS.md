@@ -19,6 +19,8 @@ npm install @unicitylabs/sphere-sdk ws
 
 ## CLI (Quick Testing)
 
+> **Tip:** For shell auto-completion of all CLI commands, run `npm link` then `sphere-cli completions bash >> ~/.bashrc`. See [QUICKSTART-CLI.md](QUICKSTART-CLI.md) for full setup.
+
 The SDK includes a built-in CLI for quick testing without writing code:
 
 ```bash
