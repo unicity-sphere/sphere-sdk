@@ -482,12 +482,10 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- topup 100 UCT',
       'npm run cli -- topup 2 BTC',
       'npm run cli -- topup 42 ETH',
-      'npm run cli -- topup bitcoin 2   # old format also supported',
     ],
     notes: [
       'Requires a registered nametag. The faucet is only available on testnet.',
       'Also accessible as "top-up" or "faucet".',
-      'Old format "topup <coin> <amount>" is still supported for backward compatibility.',
     ],
   },
   'top-up': {
@@ -539,7 +537,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Send L3 tokens to a recipient. The recipient can be a @nametag, DIRECT:// address, chain public key (02/03 prefix), or alpha1... L1 address. Amount is in decimal (e.g., 0.5) and is converted to smallest units automatically.',
     flags: [
       { flag: '<coin>', description: 'Asset symbol (UCT, BTC) as positional argument after amount', default: 'UCT' },
-      { flag: '--coin <sym>', description: 'Deprecated: use positional <coin> instead. Still supported for backward compatibility.' },
       { flag: '--direct', description: 'Force DirectAddress transfer (requires nametag with directAddress)' },
       { flag: '--proxy', description: 'Force PROXY address transfer (works with any nametag)' },
       { flag: '--instant', description: 'Send immediately via Nostr; receiver gets unconfirmed token', default: 'yes' },
@@ -551,7 +548,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- send @alice 0.5 BTC',
       'npm run cli -- send DIRECT://0000be36... 500000 UCT --conservative',
       'npm run cli -- send @bob 100 USDU --no-sync',
-      'npm run cli -- send @alice 10 --coin UCT   # also supported (backward compat)',
     ],
     notes: [
       'Cannot use both --direct and --proxy simultaneously.',
@@ -828,8 +824,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: [
       { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
       { flag: '--asset "<amount> <coin>"', description: 'Requested asset in "<amount> <symbol>" format (e.g., "1000000 UCT")' },
-      { flag: '--coin <id>', description: 'Deprecated: use --asset instead. Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID' },
-      { flag: '--amount <value>', description: 'Deprecated: use --asset instead. Requested amount in smallest units' },
       { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
       { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
       { flag: '--memo <text>', description: 'Invoice memo text' },
@@ -840,7 +834,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'npm run cli -- invoice-create --target @alice --asset "1000000 UCT"',
       'npm run cli -- invoice-create --target @alice --asset "500000 BTC" --memo "Order #42" --due 2026-12-31',
       'npm run cli -- invoice-create --terms invoice-terms.json',
-      'npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000   # also supported',
     ],
     notes: [
       'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
@@ -912,12 +905,9 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: [
       { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
       { flag: '--asset "<amount> <coin>"', description: 'Asset to return in "<amount> <symbol>" format (e.g., "100000 UCT")' },
-      { flag: '--amount <value>', description: 'Deprecated: use --asset instead. Amount to return in smallest units' },
-      { flag: '--coin <id>', description: 'Deprecated: use --asset instead. Asset symbol (UCT, BTC), name, or hex coin ID' },
     ],
     examples: [
       'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --asset "100000 UCT"',
-      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --amount 100000 --coin UCT   # also supported',
     ],
   },
   'invoice-receipts': {
@@ -978,10 +968,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       { flag: '--to <recipient>', description: 'Counterparty @nametag or address (required)' },
       { flag: '--offer "<amount> <coin>"', description: 'Asset you are offering in "<amount> <symbol>" format (e.g., "1000000 UCT")' },
       { flag: '--want "<amount> <coin>"', description: 'Asset you want in return in "<amount> <symbol>" format (e.g., "500000 USDU")' },
-      { flag: '--offer-coin <coinId>', description: 'Deprecated: use --offer instead. Asset symbol you are offering' },
-      { flag: '--offer-amount <amount>', description: 'Deprecated: use --offer instead. Amount you are offering in smallest units' },
-      { flag: '--want-coin <coinId>', description: 'Deprecated: use --want instead. Asset symbol you want in return' },
-      { flag: '--want-amount <amount>', description: 'Deprecated: use --want instead. Amount you want in return in smallest units' },
       { flag: '--escrow <address>', description: 'Custom escrow address (optional, uses config default)' },
       { flag: '--timeout <seconds>', description: 'Swap timeout in seconds (60-86400)', default: '3600' },
       { flag: '--message <text>', description: 'Optional message to the counterparty' },
@@ -989,7 +975,6 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     examples: [
       'npm run cli -- swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"',
       'npm run cli -- swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU" --timeout 7200 --message "Quick trade?"',
-      'npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000   # also supported',
     ],
     notes: [
       'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
@@ -1181,13 +1166,11 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Convert a human-readable amount to the smallest unit. Use the coin symbol to apply the correct decimals for a specific asset. Default uses 8 decimals if no coin specified.',
     flags: [
       { flag: '<coin>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID. Determines decimal precision.' },
-      { flag: '--coin <symbol>', description: 'Deprecated: use positional <coin> instead. Still supported for backward compatibility.' },
     ],
     examples: [
       'npm run cli -- to-smallest 1.5 UCT',
       'npm run cli -- to-smallest 0.001 BTC',
       'npm run cli -- to-smallest 100.5 USDT',
-      'npm run cli -- to-smallest 1.5 --coin UCT   # also supported',
     ],
     notes: [
       'When a coin is provided, the wallet is loaded briefly to access the token registry.',
@@ -1198,13 +1181,11 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Convert an amount in smallest units back to human-readable format. Use the coin symbol to apply the correct decimals for a specific asset. Default uses 8 decimals if no coin specified.',
     flags: [
       { flag: '<coin>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID. Determines decimal precision.' },
-      { flag: '--coin <symbol>', description: 'Deprecated: use positional <coin> instead. Still supported for backward compatibility.' },
     ],
     examples: [
       'npm run cli -- to-human 150000000 UCT',
       'npm run cli -- to-human 1000000 BTC',
       'npm run cli -- to-human 1000000 USDT',
-      'npm run cli -- to-human 150000000 --coin UCT   # also supported',
     ],
     notes: [
       'When a coin is provided, the wallet is loaded briefly to access the token registry.',
@@ -2132,13 +2113,10 @@ async function main() {
           process.exit(1);
         }
 
-        // Parse coin: positional arg[3] (new format) or --coin flag (backward compat)
+        // Parse coin: positional arg[3]
         let coinSymbol: string;
-        const coinFlagIdx = args.indexOf('--coin');
-        if (coinFlagIdx !== -1 && args[coinFlagIdx + 1]) {
-          coinSymbol = args[coinFlagIdx + 1]; // backward compat
-        } else if (args[3] && !args[3].startsWith('--')) {
-          coinSymbol = args[3]; // new positional format
+        if (args[3] && !args[3].startsWith('--')) {
+          coinSymbol = args[3];
         } else {
           coinSymbol = 'UCT'; // default
         }
@@ -2649,14 +2627,7 @@ async function main() {
           console.error('Usage: to-smallest <amount> <coin>');
           process.exit(1);
         }
-        // Positional coin (new) or --coin flag (backward compat)
-        const coinFlagSmallest = args.indexOf('--coin');
-        let coinArgSmallest: string | undefined;
-        if (coinFlagSmallest !== -1 && args[coinFlagSmallest + 1]) {
-          coinArgSmallest = args[coinFlagSmallest + 1]; // backward compat
-        } else if (args[2] && !args[2].startsWith('--')) {
-          coinArgSmallest = args[2]; // new positional format
-        }
+        const coinArgSmallest: string | undefined = (args[2] && !args[2].startsWith('--')) ? args[2] : undefined;
         let decimalsSmallest = 8;
         if (coinArgSmallest) {
           await getSphere();
@@ -2673,14 +2644,7 @@ async function main() {
           console.error('Usage: to-human <amount> <coin>');
           process.exit(1);
         }
-        // Positional coin (new) or --coin flag (backward compat)
-        const coinFlagHuman = args.indexOf('--coin');
-        let coinArgHuman: string | undefined;
-        if (coinFlagHuman !== -1 && args[coinFlagHuman + 1]) {
-          coinArgHuman = args[coinFlagHuman + 1]; // backward compat
-        } else if (args[2] && !args[2].startsWith('--')) {
-          coinArgHuman = args[2]; // new positional format
-        }
+        const coinArgHuman: string | undefined = (args[2] && !args[2].startsWith('--')) ? args[2] : undefined;
         let decimalsHuman = 8;
         if (coinArgHuman) {
           await getSphere();
@@ -2736,18 +2700,9 @@ async function main() {
           process.exit(1);
         }
 
-        // Parse options: new format "topup <amount> <coin>" or old format "topup <coin> [amount]"
-        let coinArg: string | undefined;
-        let amountArg: string | undefined;
-        if (args[1] && /^\d/.test(args[1])) {
-          // New format: topup <amount> <coin>
-          amountArg = args[1];
-          coinArg = args[2];
-        } else {
-          // Old format: topup [coin] [amount] — backward compat
-          coinArg = args[1];
-          amountArg = args[2];
-        }
+        // Parse options: topup [<amount> <coin>]
+        const amountArg: string | undefined = args[1];
+        const coinArg: string | undefined = args[2];
 
         const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 
@@ -3507,8 +3462,6 @@ async function main() {
         // Parse options
         const targetIdx = args.indexOf('--target');
         const assetIdx = args.indexOf('--asset');
-        const coinIdx = args.indexOf('--coin');
-        const amountIdx = args.indexOf('--amount');
         const nftIdx = args.indexOf('--nft');
         const dueIdx = args.indexOf('--due');
         const memoIdx = args.indexOf('--memo');
@@ -3565,7 +3518,6 @@ async function main() {
 
           const assets: import('../modules/accounting/types').InvoiceRequestedAsset[] = [];
           if (assetIdx !== -1 && args[assetIdx + 1]) {
-            // New format: --asset "<amount> <coin>"
             const parsed = parseAssetArg(args[assetIdx + 1]);
             if (!/^[1-9][0-9]*$/.test(parsed.amount)) {
               console.error(`Invalid amount "${parsed.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
@@ -3573,16 +3525,6 @@ async function main() {
             }
             const { coinId: resolvedCoinId } = resolveCoin(parsed.coin);
             assets.push({ coin: [resolvedCoinId, parsed.amount] });
-          } else if (coinIdx !== -1 && args[coinIdx + 1] && amountIdx !== -1 && args[amountIdx + 1]) {
-            // Fallback to old format: --coin <id> --amount <value>
-            const rawCoinValue = args[coinIdx + 1];
-            const coinId = resolveCoin(rawCoinValue).coinId;
-            const amount = args[amountIdx + 1];
-            if (!/^[1-9][0-9]*$/.test(amount)) {
-              console.error(`Invalid amount "${amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
-              process.exit(1);
-            }
-            assets.push({ coin: [coinId, amount] });
           } else if (nftId) {
             assets.push({ nft: { tokenId: nftId } });
           }
@@ -3860,7 +3802,7 @@ async function main() {
       case 'invoice-return': {
         const idOrPrefix = args[1];
         if (!idOrPrefix) {
-          console.error('Usage: invoice-return <id-or-prefix> --recipient <address> --amount <value> --coin <id>');
+          console.error('Usage: invoice-return <id-or-prefix> --recipient <address> --asset "<amount> <coin>"');
           process.exit(1);
         }
 
@@ -3884,8 +3826,6 @@ async function main() {
 
         const recipientIdx = args.indexOf('--recipient');
         const assetIdx3 = args.indexOf('--asset');
-        const amountIdx3 = args.indexOf('--amount');
-        const coinIdx3 = args.indexOf('--coin');
 
         if (recipientIdx === -1 || !args[recipientIdx + 1]) {
           console.error('--recipient <address> is required for invoice-return');
@@ -3896,16 +3836,11 @@ async function main() {
         let returnCoinId: string;
 
         if (assetIdx3 !== -1 && args[assetIdx3 + 1]) {
-          // New format: --asset "<amount> <coin>"
           const parsed = parseAssetArg(args[assetIdx3 + 1]);
           returnAmount = parsed.amount;
           returnCoinId = resolveCoin(parsed.coin).coinId;
-        } else if (amountIdx3 !== -1 && args[amountIdx3 + 1] && coinIdx3 !== -1 && args[coinIdx3 + 1]) {
-          // Fallback to old format: --amount <value> --coin <id>
-          returnAmount = args[amountIdx3 + 1];
-          returnCoinId = resolveCoin(args[coinIdx3 + 1]).coinId;
         } else {
-          console.error('Either --asset "<amount> <coin>" or both --amount and --coin are required for invoice-return');
+          console.error('--asset "<amount> <coin>" is required for invoice-return');
           process.exit(1);
         }
 
@@ -4143,60 +4078,23 @@ async function main() {
         const timeoutIdx = args.indexOf('--timeout');
         const messageIdx = args.indexOf('--message');
 
-        // New combined format: --offer "<amount> <coin>" --want "<amount> <coin>"
+        // Combined format: --offer "<amount> <coin>" --want "<amount> <coin>"
         const offerIdx = args.indexOf('--offer');
         const wantIdx = args.indexOf('--want');
-        let offerCoinValue: string;
-        let offerAmount: string;
-        let wantCoinValue: string;
-        let wantAmount: string;
 
-        if (offerIdx !== -1 && args[offerIdx + 1] && !args[offerIdx + 1].startsWith('--') &&
-            wantIdx !== -1 && args[wantIdx + 1] && !args[wantIdx + 1].startsWith('--')) {
-          // Check if they look like combined format (contain a space or the next arg is not a known flag)
-          // --offer could conflict with --offer-coin, so check if value contains space
-          const offerVal = args[offerIdx + 1];
-          const wantVal = args[wantIdx + 1];
-          if (offerVal.includes(' ') && wantVal.includes(' ')) {
-            const offer = parseAssetArg(offerVal);
-            const want = parseAssetArg(wantVal);
-            offerAmount = offer.amount;
-            offerCoinValue = offer.coin;
-            wantAmount = want.amount;
-            wantCoinValue = want.coin;
-          } else {
-            // Fall through to old format check
-            offerAmount = '';
-            offerCoinValue = '';
-            wantAmount = '';
-            wantCoinValue = '';
-          }
-        } else {
-          offerAmount = '';
-          offerCoinValue = '';
-          wantAmount = '';
-          wantCoinValue = '';
-        }
-
-        // Fallback to old format: --offer-coin, --offer-amount, --want-coin, --want-amount
-        if (!offerAmount || !offerCoinValue) {
-          const offerCoinIdx = args.indexOf('--offer-coin');
-          const offerAmountIdx = args.indexOf('--offer-amount');
-          if (offerCoinIdx !== -1 && args[offerCoinIdx + 1]) offerCoinValue = args[offerCoinIdx + 1];
-          if (offerAmountIdx !== -1 && args[offerAmountIdx + 1]) offerAmount = args[offerAmountIdx + 1];
-        }
-        if (!wantAmount || !wantCoinValue) {
-          const wantCoinIdx = args.indexOf('--want-coin');
-          const wantAmountIdx = args.indexOf('--want-amount');
-          if (wantCoinIdx !== -1 && args[wantCoinIdx + 1]) wantCoinValue = args[wantCoinIdx + 1];
-          if (wantAmountIdx !== -1 && args[wantAmountIdx + 1]) wantAmount = args[wantAmountIdx + 1];
-        }
-
-        if (toIdx === -1 || !args[toIdx + 1] || !offerCoinValue || !offerAmount || !wantCoinValue || !wantAmount) {
+        if (toIdx === -1 || !args[toIdx + 1] ||
+            offerIdx === -1 || !args[offerIdx + 1] || args[offerIdx + 1].startsWith('--') ||
+            wantIdx === -1 || !args[wantIdx + 1] || args[wantIdx + 1].startsWith('--')) {
           console.error('Usage: swap-propose --to <recipient> --offer "<amount> <coin>" --want "<amount> <coin>" [--escrow <address>] [--timeout <seconds>] [--message <text>]');
-          console.error('  Also supported: --offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount>');
           process.exit(1);
         }
+
+        const offer = parseAssetArg(args[offerIdx + 1]);
+        const want = parseAssetArg(args[wantIdx + 1]);
+        const offerAmount = offer.amount;
+        const offerCoinValue = offer.coin;
+        const wantAmount = want.amount;
+        const wantCoinValue = want.coin;
         if (!/^[1-9][0-9]*$/.test(offerAmount)) {
           console.error(`Invalid amount "${offerAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
           process.exit(1);
