@@ -4306,9 +4306,15 @@ async function main() {
             const wantStr = isProposer
               ? `${swap.deal?.partyBAmount ?? ''} ${swap.deal?.partyBCurrency ?? ''}`
               : `${swap.deal?.partyAAmount ?? ''} ${swap.deal?.partyACurrency ?? ''}`;
-            const counterparty = isProposer
-              ? (swap.deal?.partyB ?? '').slice(0, 14)
-              : (swap.deal?.partyA ?? '').slice(0, 14);
+            // Show nametag if available, otherwise truncated address
+            let counterparty: string;
+            if (swap.counterpartyNametag) {
+              counterparty = '@' + swap.counterpartyNametag;
+            } else if (isProposer) {
+              counterparty = (swap.deal?.partyB ?? '').slice(0, 14);
+            } else {
+              counterparty = (swap.deal?.partyA ?? '').slice(0, 14);
+            }
 
             // Relative time
             const elapsed = Date.now() - (swap.createdAt || 0);

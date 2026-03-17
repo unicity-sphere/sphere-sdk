@@ -195,6 +195,8 @@ export interface SwapRef {
    * verification on acceptance/rejection messages.
    */
   counterpartyPubkey?: string;
+  /** Human-readable nametag of the counterparty (e.g., 'alice', 'bob'), if known. */
+  counterpartyNametag?: string;
   /**
    * Transfer ID of the local deposit payment (from TransferResult.id).
    * Used to correlate invoice:payment events with the local deposit.

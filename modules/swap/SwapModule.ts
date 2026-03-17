@@ -761,9 +761,9 @@ export class SwapModule {
       throw new SphereError('SWAP_INVALID_DEAL: Local wallet is neither party A nor party B', 'SWAP_INVALID_DEAL');
     }
     const role: 'proposer' = 'proposer';
-    const counterpartyPubkey = matchesPartyA
-      ? (peerB.transportPubkey ?? peerB.chainPubkey)
-      : (peerA.transportPubkey ?? peerA.chainPubkey);
+    const counterpartyPeer = matchesPartyA ? peerB : peerA;
+    const counterpartyPubkey = counterpartyPeer.transportPubkey ?? counterpartyPeer.chainPubkey;
+    const counterpartyNametag = counterpartyPeer.nametag;
 
     // Step 6: Check pending swap limit
     let pendingCount = 0;
@@ -799,6 +799,7 @@ export class SwapModule {
       role,
       progress: 'proposed',
       counterpartyPubkey,
+      counterpartyNametag,
       escrowPubkey: escrowPeer.transportPubkey ?? escrowPeer.chainPubkey,
       escrowDirectAddress: escrowPeer.directAddress,
       payoutVerified: false,
@@ -1534,6 +1535,7 @@ export class SwapModule {
               role: 'acceptor',
               progress: 'proposed',
               counterpartyPubkey: dm.senderPubkey,
+              counterpartyNametag: dm.senderNametag,
               escrowPubkey,
               escrowDirectAddress: escrowDirectAddr,
               payoutVerified: false,
