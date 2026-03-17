@@ -20,6 +20,7 @@ export {
   RPC_METHODS,
   INTENT_ACTIONS,
   ERROR_CODES,
+  WALLET_EVENTS,
   isSphereConnectMessage,
   createRequestId,
 } from './protocol';
@@ -28,6 +29,7 @@ export type {
   RpcMethod,
   IntentAction,
   ErrorCode,
+  WalletEvent,
   SphereRpcRequest,
   SphereRpcResponse,
   SphereIntentRequest,
