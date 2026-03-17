@@ -761,7 +761,9 @@ export class SwapModule {
       throw new SphereError('SWAP_INVALID_DEAL: Local wallet is neither party A nor party B', 'SWAP_INVALID_DEAL');
     }
     const role: 'proposer' = 'proposer';
-    const counterpartyPubkey = matchesPartyA ? peerB.chainPubkey : peerA.chainPubkey;
+    const counterpartyPubkey = matchesPartyA
+      ? (peerB.transportPubkey ?? peerB.chainPubkey)
+      : (peerA.transportPubkey ?? peerA.chainPubkey);
 
     // Step 6: Check pending swap limit
     let pendingCount = 0;
@@ -797,7 +799,7 @@ export class SwapModule {
       role,
       progress: 'proposed',
       counterpartyPubkey,
-      escrowPubkey: escrowPeer.chainPubkey,
+      escrowPubkey: escrowPeer.transportPubkey ?? escrowPeer.chainPubkey,
       escrowDirectAddress: escrowPeer.directAddress,
       payoutVerified: false,
       createdAt: now,
@@ -1287,7 +1289,7 @@ export class SwapModule {
           .then((peer) => {
             if (peer) {
               const statusDM = buildStatusQueryDM(swapId);
-              return deps.communications.sendDM(peer.chainPubkey, statusDM).then(() => undefined);
+              return deps.communications.sendDM(peer.transportPubkey ?? peer.chainPubkey, statusDM).then(() => undefined);
             }
           })
           .catch((err) => {
@@ -1419,6 +1421,7 @@ export class SwapModule {
             const proposalMsg = parsed.payload;
             const manifest = proposalMsg.manifest;
 
+
             // Validate version (forward compatibility)
             if (proposalMsg.version > 1 || proposalMsg.version < 1) return;
 
@@ -1471,6 +1474,7 @@ export class SwapModule {
             const isPartyA = ourAddresses.has(manifest.party_a_address);
             const isPartyB = ourAddresses.has(manifest.party_b_address);
 
+
             if (!isPartyA && !isPartyB) {
               if (this.config.debug) {
                 logger.debug(LOG_TAG, `Proposal ignored: neither party address matches our addresses`);
@@ -1490,13 +1494,15 @@ export class SwapModule {
               escrowAddress: proposalMsg.escrow,
             };
 
-            // Verify sender is the other party in the manifest (defense against impersonation)
+            // Verify sender is the other party in the manifest (defense against impersonation).
+            // Note: dm.senderPubkey is the transport pubkey (HKDF-derived), while resolve()
+            // returns chainPubkey (secp256k1) and transportPubkey. Compare against transportPubkey.
             const counterpartyAddress = isPartyA ? manifest.party_b_address : manifest.party_a_address;
             try {
               const counterpartyPeer = await deps.resolve(counterpartyAddress);
-              if (counterpartyPeer && counterpartyPeer.chainPubkey !== dm.senderPubkey) {
+              if (counterpartyPeer && counterpartyPeer.transportPubkey && counterpartyPeer.transportPubkey !== dm.senderPubkey) {
                 if (this.config.debug) {
-                  logger.debug(LOG_TAG, `Proposal sender mismatch: expected ${counterpartyPeer.chainPubkey}, got ${dm.senderPubkey}`);
+                  logger.debug(LOG_TAG, `Proposal sender mismatch: expected transport ${counterpartyPeer.transportPubkey?.slice(0, 16)}, got ${dm.senderPubkey?.slice(0, 16)}`);
                 }
                 return; // Sender is not the counterparty — drop silently
               }
@@ -2055,8 +2061,8 @@ export class SwapModule {
 
   /**
    * Check if a DM sender matches the expected escrow for a swap.
-   * Compares the sender's chain pubkey against the escrowPubkey
-   * stored on the SwapRef during escrow resolution.
+   * Compares the sender's transport pubkey (dm.senderPubkey) against the
+   * escrowPubkey (transport pubkey) stored on the SwapRef during escrow resolution.
    *
    * @returns `true` if the sender matches the stored escrow pubkey,
    *          `false` if no escrowPubkey is stored (unknown escrow) or mismatch.

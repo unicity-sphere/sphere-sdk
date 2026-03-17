@@ -414,6 +414,18 @@ export class CommunicationsModule {
    */
   onDirectMessage(handler: (message: DirectMessage) => void): () => void {
     this.dmHandlers.add(handler);
+
+    // Replay existing messages to new handler — ensures DMs that arrived
+    // before this handler was registered (e.g., swap proposals arriving
+    // during Sphere.init before SwapModule.load) are not lost.
+    for (const message of this.messages.values()) {
+      try {
+        handler(message);
+      } catch {
+        // Tolerated — handler may reject messages it doesn't care about
+      }
+    }
+
     return () => this.dmHandlers.delete(handler);
   }
 

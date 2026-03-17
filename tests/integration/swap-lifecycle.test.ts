@@ -36,10 +36,13 @@ import {
 // =============================================================================
 
 const PARTY_A_PUBKEY = '02' + 'a'.repeat(64);
+const PARTY_A_TRANSPORT_PUBKEY = 'a'.repeat(64);
 const PARTY_A_ADDRESS = 'DIRECT://party_a_aaa111';
 const PARTY_B_PUBKEY = '02' + 'b'.repeat(64);
+const PARTY_B_TRANSPORT_PUBKEY = 'b'.repeat(64);
 const PARTY_B_ADDRESS = 'DIRECT://party_b_bbb222';
 const ESCROW_PUBKEY = '02' + 'e'.repeat(64);
+const ESCROW_TRANSPORT_PUBKEY = 'e'.repeat(64);
 const ESCROW_ADDRESS = 'DIRECT://escrow_eee333';
 
 function randomHex(len: number): string {
@@ -190,7 +193,7 @@ class EscrowSimulator {
         this.relay.send(this.escrowPubkey, partyPk, confirmation);
 
         // Determine which payout invoice to send
-        const isPartyA = partyPk === PARTY_A_PUBKEY;
+        const isPartyA = partyPk === PARTY_A_TRANSPORT_PUBKEY;
         const payoutInvoiceId = isPartyA
           ? swapState.payoutInvoiceIdA
           : swapState.payoutInvoiceIdB;
@@ -387,6 +390,7 @@ function createParty(
   relay: MockDMRelay,
   identity: FullIdentity,
   peerMap: Map<string, PeerInfo>,
+  transportPubkey: string,
 ): IntegrationParty {
   const accounting = createMockAccountingModule();
   const storage = createMockStorageProvider();
@@ -418,14 +422,15 @@ function createParty(
 
   const communications = {
     sendDM: vi.fn().mockImplementation((recipientPubkey: string, content: string) => {
-      relay.send(identity.chainPubkey, recipientPubkey, content, identity.nametag);
+      // Sender uses transport pubkey (matches real DM behavior)
+      relay.send(transportPubkey, recipientPubkey, content, identity.nametag);
       return Promise.resolve({ eventId: 'evt-' + randomHex(8) });
     }),
     onDirectMessage: vi.fn().mockImplementation(
       (handler: (message: { senderPubkey: string; senderNametag?: string; content: string; timestamp: number }) => void) => {
         dmHandlers.push(handler);
-        // Register this party on the relay to receive DMs
-        const unsub = relay.register(identity.chainPubkey, handler);
+        // Register this party on the relay to receive DMs by transport pubkey
+        const unsub = relay.register(transportPubkey, handler);
         return () => {
           unsub();
           const idx = dmHandlers.indexOf(handler);
@@ -480,9 +485,9 @@ function createSwapTestPair(): SwapTestContext {
     privateKey: 'b'.repeat(64),
   };
 
-  const partyA = createParty(relay, identityA, peerMap);
-  const partyB = createParty(relay, identityB, peerMap);
-  const escrow = new EscrowSimulator(relay, ESCROW_PUBKEY);
+  const partyA = createParty(relay, identityA, peerMap, PARTY_A_TRANSPORT_PUBKEY);
+  const partyB = createParty(relay, identityB, peerMap, PARTY_B_TRANSPORT_PUBKEY);
+  const escrow = new EscrowSimulator(relay, ESCROW_TRANSPORT_PUBKEY);
 
   return { partyA, partyB, escrow, relay };
 }
@@ -695,8 +700,8 @@ describe('Swap Lifecycle Integration Tests', () => {
     await ctx.partyB.module.deposit(swapId);
 
     // Step 5: Escrow detects both deposits
-    ctx.escrow.simulateDeposit(swapId, PARTY_A_PUBKEY);
-    ctx.escrow.simulateDeposit(swapId, PARTY_B_PUBKEY);
+    ctx.escrow.simulateDeposit(swapId, PARTY_A_TRANSPORT_PUBKEY);
+    ctx.escrow.simulateDeposit(swapId, PARTY_B_TRANSPORT_PUBKEY);
     await settle(100);
 
     // Both should receive payment_confirmation -> concluding -> payout invoice_delivery

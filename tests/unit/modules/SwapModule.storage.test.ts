@@ -18,8 +18,8 @@ import {
   injectSwapRef,
   SphereError,
   DEFAULT_TEST_PARTY_A_ADDRESS,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
 } from './swap-test-helpers.js';
 import type { TestSwapModuleMocks } from './swap-test-helpers.js';
@@ -63,8 +63,8 @@ describe('SwapModule Storage', () => {
     const swapRef = createTestSwapRef({
       progress: 'proposed',
       role: 'acceptor',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, swapRef);

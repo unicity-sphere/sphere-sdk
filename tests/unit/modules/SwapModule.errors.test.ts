@@ -16,11 +16,11 @@ import {
   createTestSwapRef,
   injectSwapRef,
   SphereError,
-  DEFAULT_TEST_PARTY_A_PUBKEY,
+  DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
   DEFAULT_TEST_PARTY_A_ADDRESS,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_PARTY_B_ADDRESS,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   type TestSwapModuleMocks,
 } from './swap-test-helpers.js';
@@ -69,7 +69,7 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -86,7 +86,7 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -135,8 +135,8 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId: 'test-deposit-invoice-err007',
     });
@@ -174,8 +174,8 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'accepted',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, ref);
@@ -187,7 +187,7 @@ describe('SwapModule.errors', () => {
       error: 'INVALID_MANIFEST: currencies must differ',
     });
 
-    mocks.communications._simulateIncomingDM(errorDM, DEFAULT_TEST_ESCROW_PUBKEY);
+    mocks.communications._simulateIncomingDM(errorDM, DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY);
 
     // Allow async DM handler to process
     await new Promise(r => setTimeout(r, 100));
@@ -231,8 +231,8 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, ref);
@@ -286,7 +286,7 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'completed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -303,7 +303,7 @@ describe('SwapModule.errors', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'cancelled',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -328,7 +328,7 @@ describe('SwapModule.errors', () => {
     const existingRef = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, existingRef);
 

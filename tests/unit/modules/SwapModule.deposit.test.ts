@@ -14,11 +14,11 @@ import {
   createTestSwapRef,
   createTestSwapDeal,
   injectSwapRef,
-  DEFAULT_TEST_PARTY_A_PUBKEY,
+  DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
   DEFAULT_TEST_PARTY_A_ADDRESS,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_PARTY_B_ADDRESS,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   SphereError,
 } from './swap-test-helpers.js';
@@ -44,8 +44,8 @@ function setupAnnouncedSwap(overrides?: Partial<SwapRef>): SwapRef {
   const ref = createTestSwapRef({
     role: 'acceptor',
     progress: 'announced',
-    counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
-    escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+    counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+    escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
     escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     depositInvoiceId: DEPOSIT_INVOICE_ID,
     ...overrides,
@@ -133,7 +133,7 @@ describe('SwapModule.deposit()', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
       depositInvoiceId: DEPOSIT_INVOICE_ID,
     });
     injectSwapRef(module, ref);
@@ -154,8 +154,8 @@ describe('SwapModule.deposit()', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       // No depositInvoiceId
     });
     // Ensure depositInvoiceId is undefined

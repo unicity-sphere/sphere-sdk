@@ -14,9 +14,9 @@ import {
   createTestSwapModule,
   createTestSwapRef,
   injectSwapRef,
-  DEFAULT_TEST_PARTY_A_PUBKEY,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   SphereError,
 } from './swap-test-helpers.js';
@@ -69,7 +69,7 @@ function setupAcceptorProposed(): SwapRef {
   const ref = createTestSwapRef({
     role: 'acceptor',
     progress: 'proposed',
-    counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
+    counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
   });
   injectSwapRef(module, ref);
   return ref;
@@ -94,7 +94,7 @@ describe('SwapModule.acceptSwap()', () => {
     expect(mocks.communications.sendDM).toHaveBeenCalled();
     const acceptanceDM = findDMByType(mocks.communications._sentDMs, 'swap_acceptance');
     expect(acceptanceDM).toBeDefined();
-    expect(acceptanceDM!.recipient).toBe(DEFAULT_TEST_PARTY_A_PUBKEY);
+    expect(acceptanceDM!.recipient).toBe(DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY);
     expect(acceptanceDM!.parsed.swap_id).toBe(swapRef.swapId);
   });
 
@@ -103,7 +103,7 @@ describe('SwapModule.acceptSwap()', () => {
 
     const announceDM = findDMByType(mocks.communications._sentDMs, 'announce');
     expect(announceDM).toBeDefined();
-    expect(announceDM!.recipient).toBe(DEFAULT_TEST_ESCROW_PUBKEY);
+    expect(announceDM!.recipient).toBe(DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY);
     expect(announceDM!.parsed.manifest).toBeDefined();
     expect(announceDM!.parsed.manifest.swap_id).toBe(swapRef.swapId);
   });
@@ -117,7 +117,7 @@ describe('SwapModule.acceptSwap()', () => {
 
     // Verify escrow resolution was stored
     const updatedSwap = (module as any).swaps.get(swapRef.swapId) as SwapRef;
-    expect(updatedSwap.escrowPubkey).toBe(DEFAULT_TEST_ESCROW_PUBKEY);
+    expect(updatedSwap.escrowPubkey).toBe(DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY);
     expect(updatedSwap.escrowDirectAddress).toBe(DEFAULT_TEST_ESCROW_ADDRESS);
 
     // Simulate an invoice_delivery DM from the escrow — the DM handler should call importInvoice
@@ -134,7 +134,7 @@ describe('SwapModule.acceptSwap()', () => {
       },
     });
 
-    mocks.communications._simulateIncomingDM(invoiceDeliveryDM, DEFAULT_TEST_ESCROW_PUBKEY);
+    mocks.communications._simulateIncomingDM(invoiceDeliveryDM, DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY);
 
     // Allow async processing to complete
     await new Promise(r => setTimeout(r, 100));
@@ -190,7 +190,7 @@ describe('SwapModule.acceptSwap()', () => {
     const depositingRef = createTestSwapRef({
       role: 'acceptor',
       progress: 'depositing',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, depositingRef);
 
@@ -201,7 +201,7 @@ describe('SwapModule.acceptSwap()', () => {
     const proposerRef = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, proposerRef);
 
@@ -293,7 +293,7 @@ describe('SwapModule.rejectSwap()', () => {
 
     const rejectionDM = findDMByType(mocks.communications._sentDMs, 'swap_rejection');
     expect(rejectionDM).toBeDefined();
-    expect(rejectionDM!.recipient).toBe(DEFAULT_TEST_PARTY_A_PUBKEY);
+    expect(rejectionDM!.recipient).toBe(DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY);
     expect(rejectionDM!.parsed.swap_id).toBe(swapRef.swapId);
   });
 
@@ -320,7 +320,7 @@ describe('SwapModule.rejectSwap()', () => {
     const announcedRef = createTestSwapRef({
       role: 'acceptor',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, announcedRef);
 

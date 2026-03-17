@@ -49,10 +49,13 @@ export { SphereError };
 // =============================================================================
 
 export const DEFAULT_TEST_PARTY_A_PUBKEY = '02' + 'a'.repeat(64);
+export const DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY = 'a'.repeat(64);
 export const DEFAULT_TEST_PARTY_A_ADDRESS = 'DIRECT://party_a_aaa111';
 export const DEFAULT_TEST_PARTY_B_PUBKEY = '02' + 'b'.repeat(64);
+export const DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY = 'b'.repeat(64);
 export const DEFAULT_TEST_PARTY_B_ADDRESS = 'DIRECT://party_b_bbb222';
 export const DEFAULT_TEST_ESCROW_PUBKEY = '02' + 'e'.repeat(64);
+export const DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY = 'e'.repeat(64);
 export const DEFAULT_TEST_ESCROW_ADDRESS = 'DIRECT://escrow_eee333';
 
 export const DEFAULT_TEST_IDENTITY: FullIdentity = {
@@ -553,8 +556,8 @@ export function createTestSwapRef(overrides?: Partial<SwapRef>): SwapRef {
     manifest,
     role: 'proposer' as SwapRole,
     progress: 'proposed' as SwapProgress,
-    counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-    escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+    counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+    escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
     escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     payoutVerified: false,
     createdAt: now,

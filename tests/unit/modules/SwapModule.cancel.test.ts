@@ -14,9 +14,9 @@ import {
   createTestSwapRef,
   createMockSwapCancelledDM,
   injectSwapRef,
-  DEFAULT_TEST_PARTY_A_PUBKEY,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   SphereError,
 } from './swap-test-helpers.js';
@@ -49,7 +49,7 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -60,7 +60,7 @@ describe('SwapModule.cancelSwap()', () => {
 
     // No DM should be sent to escrow (pre-announcement — escrow not involved yet)
     const escrowDMs = mocks.communications._sentDMs.filter(
-      (dm) => dm.recipient === DEFAULT_TEST_ESCROW_PUBKEY,
+      (dm) => dm.recipient === DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
     );
     expect(escrowDMs.length).toBe(0);
   });
@@ -69,7 +69,7 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -91,7 +91,7 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'completed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -102,7 +102,7 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'cancelled',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
@@ -114,8 +114,8 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'awaiting_counter',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId: DEPOSIT_INVOICE_ID,
     });
@@ -125,7 +125,7 @@ describe('SwapModule.cancelSwap()', () => {
     const cancelledDMContent = createMockSwapCancelledDM(ref.swapId, 'timeout', true);
     mocks.communications._simulateIncomingDM(
       cancelledDMContent,
-      DEFAULT_TEST_ESCROW_PUBKEY,
+      DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       'escrow',
     );
 
@@ -140,8 +140,8 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, ref);
@@ -170,8 +170,8 @@ describe('SwapModule.cancelSwap()', () => {
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'awaiting_counter',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId: DEPOSIT_INVOICE_ID,
     });
@@ -187,7 +187,7 @@ describe('SwapModule.cancelSwap()', () => {
         coinId: 'UCT',
         amount: '1000000',
         direction: 'back',
-        senderPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+        senderPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
         confirmed: true,
         timestamp: Date.now(),
       },

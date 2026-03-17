@@ -26,11 +26,10 @@ import {
   createMockSwapCancelledDM,
   createMockBounceNotificationDM,
   injectSwapRef,
-  DEFAULT_TEST_PARTY_A_PUBKEY,
   DEFAULT_TEST_PARTY_A_ADDRESS,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_PARTY_B_ADDRESS,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   type TestSwapModuleMocks,
 } from './swap-test-helpers.js';
@@ -68,7 +67,7 @@ describe('SwapModule.dmProcessing', () => {
     // Simulate incoming DM from party B (the proposer)
     mocks.communications._simulateIncomingDM(
       proposalDM,
-      DEFAULT_TEST_PARTY_B_PUBKEY,
+      DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
       'bob',
     );
 
@@ -96,7 +95,7 @@ describe('SwapModule.dmProcessing', () => {
 
     mocks.communications._simulateIncomingDM(
       proposalDM,
-      DEFAULT_TEST_PARTY_B_PUBKEY,
+      DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
       'bob',
     );
 
@@ -108,7 +107,7 @@ describe('SwapModule.dmProcessing', () => {
       expect(proposalEvent).toBeDefined();
       expect(proposalEvent![1]).toMatchObject({
         swapId: manifest.swap_id,
-        senderPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+        senderPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
       });
       // Verify deal is included in the event payload
       const payload = proposalEvent![1] as { deal: unknown };
@@ -125,8 +124,8 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, ref);
@@ -135,14 +134,14 @@ describe('SwapModule.dmProcessing', () => {
     const acceptanceDM = createMockAcceptanceDM(ref.swapId);
     mocks.communications._simulateIncomingDM(
       acceptanceDM,
-      DEFAULT_TEST_PARTY_B_PUBKEY,
+      DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
       'bob',
     );
 
     // Verify that sendDM was called with the escrow pubkey (announce)
     await vi.waitFor(() => {
       const sentToEscrow = mocks.communications._sentDMs.find(
-        (dm) => dm.recipient === DEFAULT_TEST_ESCROW_PUBKEY,
+        (dm) => dm.recipient === DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       );
       expect(sentToEscrow).toBeDefined();
     });
@@ -162,14 +161,14 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
     const rejectionDM = createMockRejectionDM(ref.swapId, 'Not interested');
     mocks.communications._simulateIncomingDM(
       rejectionDM,
-      DEFAULT_TEST_PARTY_B_PUBKEY,
+      DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
       'bob',
     );
 
@@ -200,8 +199,8 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'accepted',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, ref);
@@ -209,7 +208,7 @@ describe('SwapModule.dmProcessing', () => {
     const announceResultDM = createMockAnnounceResultDM(ref.swapId, depositInvoiceId);
     mocks.communications._simulateIncomingDM(
       announceResultDM,
-      DEFAULT_TEST_ESCROW_PUBKEY,
+      DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       'escrow',
     );
 
@@ -229,8 +228,8 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'accepted',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -253,7 +252,7 @@ describe('SwapModule.dmProcessing', () => {
     const invoiceDeliveryDM = createMockInvoiceDeliveryDM(ref.swapId, 'deposit', depositInvoiceId);
     mocks.communications._simulateIncomingDM(
       invoiceDeliveryDM,
-      DEFAULT_TEST_ESCROW_PUBKEY,
+      DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       'escrow',
     );
 
@@ -271,8 +270,8 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'awaiting_counter',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId: 'test-deposit-invoice-003',
     });
@@ -281,7 +280,7 @@ describe('SwapModule.dmProcessing', () => {
     const paymentConfDM = createMockPaymentConfirmationDM(ref.swapId, 'B');
     mocks.communications._simulateIncomingDM(
       paymentConfDM,
-      DEFAULT_TEST_ESCROW_PUBKEY,
+      DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       'escrow',
     );
 
@@ -299,8 +298,8 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
     });
     injectSwapRef(module, ref);
@@ -308,7 +307,7 @@ describe('SwapModule.dmProcessing', () => {
     const cancelledDM = createMockSwapCancelledDM(ref.swapId, 'timeout', true);
     mocks.communications._simulateIncomingDM(
       cancelledDM,
-      DEFAULT_TEST_ESCROW_PUBKEY,
+      DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       'escrow',
     );
 
@@ -332,8 +331,8 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'awaiting_counter',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId: 'test-deposit-invoice-004',
     });
@@ -344,7 +343,7 @@ describe('SwapModule.dmProcessing', () => {
     );
     mocks.communications._simulateIncomingDM(
       bounceDM,
-      DEFAULT_TEST_ESCROW_PUBKEY,
+      DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       'escrow',
     );
 
@@ -374,7 +373,7 @@ describe('SwapModule.dmProcessing', () => {
     // Send non-JSON content
     mocks.communications._simulateIncomingDM(
       'this is not JSON or a swap message',
-      DEFAULT_TEST_PARTY_B_PUBKEY,
+      DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     );
 
     // Allow microtask queue to drain
@@ -399,13 +398,13 @@ describe('SwapModule.dmProcessing', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'proposed',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
     });
     injectSwapRef(module, ref);
 
     // Send acceptance DM from an unknown party C (not the counterparty)
-    const unknownPubkey = '02' + 'c'.repeat(64);
+    const unknownPubkey = 'c'.repeat(64);
     const acceptanceDM = createMockAcceptanceDM(ref.swapId);
     mocks.communications._simulateIncomingDM(
       acceptanceDM,
@@ -433,7 +432,7 @@ describe('SwapModule.dmProcessing', () => {
     const acceptanceDM = createMockAcceptanceDM(unknownSwapId);
     mocks.communications._simulateIncomingDM(
       acceptanceDM,
-      DEFAULT_TEST_PARTY_B_PUBKEY,
+      DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
     );
 
     // Allow microtask queue to drain

@@ -13,7 +13,7 @@ import {
   injectSwapRef,
   DEFAULT_TEST_PARTY_A_ADDRESS,
   DEFAULT_TEST_PARTY_B_ADDRESS,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   SphereError,
 } from './swap-test-helpers.js';
@@ -98,7 +98,7 @@ describe('SwapModule.proposeSwap()', () => {
     // sendDM called with counterparty pubkey
     expect(mocks.communications.sendDM).toHaveBeenCalled();
     const [recipient, content] = mocks.communications.sendDM.mock.calls[0];
-    expect(recipient).toBe(DEFAULT_TEST_PARTY_B_PUBKEY);
+    expect(recipient).toBe(DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY);
 
     // content is prefixed with 'swap_proposal:' followed by JSON
     expect(content).toMatch(/^swap_proposal:/);
@@ -119,7 +119,7 @@ describe('SwapModule.proposeSwap()', () => {
     const [, payload] = proposedEvents[0];
     expect((payload as { swapId: string }).swapId).toBe(result.swapId);
     expect((payload as { deal: unknown }).deal).toBeDefined();
-    expect((payload as { recipientPubkey: string }).recipientPubkey).toBe(DEFAULT_TEST_PARTY_B_PUBKEY);
+    expect((payload as { recipientPubkey: string }).recipientPubkey).toBe(DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY);
   });
 
   it('UT-SWAP-PROP-006: persists SwapRef with progress=proposed, role=proposer', async () => {

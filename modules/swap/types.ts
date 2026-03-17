@@ -189,8 +189,10 @@ export interface SwapRef {
    */
   escrowState?: string;
   /**
-   * Counterparty's chain pubkey (33-byte compressed secp256k1).
-   * Resolved during proposal or acceptance. Used for DM addressing.
+   * Counterparty's transport pubkey (HKDF-derived, 64-hex).
+   * Set from dm.senderPubkey on incoming proposals, or resolved from
+   * PeerInfo.transportPubkey on outgoing proposals. Used for DM sender
+   * verification on acceptance/rejection messages.
    */
   counterpartyPubkey?: string;
   /**
@@ -199,9 +201,9 @@ export interface SwapRef {
    */
   localDepositTransferId?: string;
   /**
-   * Chain pubkey of the resolved escrow service.
+   * Transport pubkey of the resolved escrow service (HKDF-derived, 64-hex).
    * Stored after escrow resolution so that incoming escrow DMs can be
-   * authenticated by comparing the sender's pubkey against this field.
+   * authenticated by comparing dm.senderPubkey against this field.
    */
   escrowPubkey?: string;
   /**

@@ -11,9 +11,7 @@ import {
   createTestSwapRef,
   injectSwapRef,
   SphereError,
-  DEFAULT_TEST_PARTY_A_PUBKEY,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   type TestSwapModuleMocks,
 } from './swap-test-helpers.js';
@@ -65,7 +63,7 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     // Wait for the fire-and-forget DM to be sent
     await vi.waitFor(() => {
       expect(mocks.communications.sendDM).toHaveBeenCalledWith(
-        DEFAULT_TEST_ESCROW_PUBKEY,
+        DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
         expect.stringContaining('status'),
       );
     });

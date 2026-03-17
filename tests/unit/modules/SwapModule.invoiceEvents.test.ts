@@ -17,8 +17,8 @@ import {
   createTestSwapRef,
   injectSwapRef,
   DEFAULT_TEST_PARTY_A_ADDRESS,
-  DEFAULT_TEST_PARTY_B_PUBKEY,
-  DEFAULT_TEST_ESCROW_PUBKEY,
+  DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   type TestSwapModuleMocks,
 } from './swap-test-helpers.js';
@@ -50,8 +50,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'depositing',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -93,8 +93,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'awaiting_counter',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -127,8 +127,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'awaiting_counter',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -156,8 +156,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -197,8 +197,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -244,8 +244,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'concluding',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });
@@ -260,7 +260,7 @@ describe('SwapModule.invoiceEvents', () => {
       invoice_token: { version: '2.0', genesis: { data: {} }, state: {}, transactions: [] },
     });
 
-    mocks.communications._simulateIncomingDM(payoutDeliveryDM, DEFAULT_TEST_ESCROW_PUBKEY);
+    mocks.communications._simulateIncomingDM(payoutDeliveryDM, DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY);
 
     // Verify swap:payout_received was emitted
     await vi.waitFor(() => {
@@ -288,8 +288,8 @@ describe('SwapModule.invoiceEvents', () => {
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'depositing',
-      counterpartyPubkey: DEFAULT_TEST_PARTY_B_PUBKEY,
-      escrowPubkey: DEFAULT_TEST_ESCROW_PUBKEY,
+      counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
+      escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
       depositInvoiceId,
     });

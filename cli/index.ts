@@ -297,6 +297,10 @@ async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void>
   // Tolerates relay being down — continues after timeout.
   try {
     await sphere.fetchPendingEvents();
+    // Allow async DM handlers (swap proposal processing, invoice import, etc.)
+    // to complete before reading in-memory state. These fire-and-forget handlers
+    // resolve addresses, validate manifests, and persist state asynchronously.
+    await new Promise(resolve => setTimeout(resolve, 500));
   } catch {
     // Tolerated — relay may be unreachable for reads
   }

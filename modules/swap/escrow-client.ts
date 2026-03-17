@@ -107,14 +107,14 @@ export async function withRetry<T>(
  * @param deal - The swap deal containing an optional escrow address
  * @param config - The swap module config containing an optional default escrow address
  * @param resolve - Transport-level peer resolution function
- * @returns Resolved escrow DIRECT:// address and chain pubkey
+ * @returns Resolved escrow DIRECT:// address and transport pubkey (for DM sender verification)
  * @throws {SphereError} `SWAP_INVALID_DEAL` if no escrow address is configured
  * @throws {SphereError} `SWAP_RESOLVE_FAILED` if the escrow address cannot be resolved
  */
 export async function resolveEscrowAddress(
   deal: SwapDeal,
   config: SwapModuleConfig,
-  resolve: (identifier: string) => Promise<{ directAddress: string; chainPubkey: string } | null>,
+  resolve: (identifier: string) => Promise<{ directAddress: string; chainPubkey: string; transportPubkey?: string } | null>,
 ): Promise<{ escrowDirectAddress: string; escrowPubkey: string }> {
   const escrowAddr = deal.escrowAddress ?? config.defaultEscrowAddress;
 
@@ -138,7 +138,7 @@ export async function resolveEscrowAddress(
 
   return {
     escrowDirectAddress: peer.directAddress,
-    escrowPubkey: peer.chainPubkey,
+    escrowPubkey: peer.transportPubkey ?? peer.chainPubkey,
   };
 }
 
@@ -154,7 +154,7 @@ export async function resolveEscrowAddress(
  * with 5 retries for resilience against transient transport failures.
  *
  * @param communications - CommunicationsModule subset for DM sending
- * @param escrowPubkey - Escrow's chain pubkey (DM recipient)
+ * @param escrowPubkey - Escrow's transport pubkey (DM recipient)
  * @param manifest - The swap manifest to announce
  */
 export async function sendAnnounce(
@@ -182,7 +182,7 @@ export async function sendAnnounce(
  * Wrapped in {@link withRetry} with 3 retries.
  *
  * @param communications - CommunicationsModule subset for DM sending
- * @param escrowPubkey - Escrow's chain pubkey (DM recipient)
+ * @param escrowPubkey - Escrow's transport pubkey (DM recipient)
  * @param swapId - The swap ID to query (64 lowercase hex chars)
  */
 export async function sendStatusQuery(
@@ -211,7 +211,7 @@ export async function sendStatusQuery(
  * with 3 retries.
  *
  * @param communications - CommunicationsModule subset for DM sending
- * @param escrowPubkey - Escrow's chain pubkey (DM recipient)
+ * @param escrowPubkey - Escrow's transport pubkey (DM recipient)
  * @param swapId - The swap ID (64 lowercase hex chars)
  * @param invoiceType - Whether to request the deposit or payout invoice
  */
