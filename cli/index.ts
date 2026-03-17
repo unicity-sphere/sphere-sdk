@@ -264,17 +264,20 @@ const FAUCET_COIN_MAP: Record<string, string> = {
  */
 /**
  * Sync wallet state before executing a command.
+ * All sync steps tolerate failures (Nostr timeout, IPFS unreachable).
+ * Nostr WRITES (sendDM in swap-propose, swap-accept) propagate errors
+ * naturally through the SwapModule — they are NOT part of this sync.
  *
  * Two sync modes:
  *
- * - **'nostr'**: Fetch pending Nostr events (DMs: swap proposals, invoice receipts,
- *   escrow messages). Tolerates relay being down (times out silently after 5s).
- *   Used by: swap-list, swap-accept, swap-status, swap-deposit, invoice-list,
- *   invoice-status, dm-inbox, dm-history.
+ * - **'nostr'**: Fetch pending Nostr events only (DMs: swap proposals,
+ *   invoice receipts, escrow messages, transfer notifications).
+ *   Used by: swap-list, swap-accept, swap-status, receive, dm-inbox, dm-history.
  *
- * - **'full'**: Nostr fetch + IPFS sync + receive incoming transfers.
- *   IPFS failures are tolerated (fire-and-forget storage).
- *   Used by: balance, tokens, verify-balance, sync, invoice-pay, swap-deposit.
+ * - **'full'**: Nostr fetch + receive incoming transfers + IPFS sync.
+ *   Gives the most up-to-date token inventory and invoice state.
+ *   Used by: send, balance, tokens, history, verify-balance, sync,
+ *   invoice-pay, invoice-close, invoice-cancel, invoice-transfers, swap-deposit.
  */
 async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void> {
   console.log('Syncing...');
@@ -2192,7 +2195,11 @@ async function main() {
         const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
 
         // Initialize Sphere first so TokenRegistry is loaded
+        const noSyncSend = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        // Sync token inventory (need latest state for spending)
+        if (!noSyncSend) await ensureSync(sphere, 'full');
 
         // Resolve symbol/name/hex to coinId and get decimals
         const { coinId: coinIdHex, symbol: resolvedSymbol, decimals } = resolveCoin(coinSymbol);
@@ -2222,8 +2229,6 @@ async function main() {
 
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
-        const noSyncSend = args.includes('--no-sync');
-        // No pre-sync needed — send/receive are write operations
         await closeSphere();
         break;
       }
@@ -2232,6 +2237,10 @@ async function main() {
         const finalize = args.includes('--finalize');
         const noSyncRecv = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        // Sync from Nostr to get incoming transfers
+        if (!noSyncRecv) await ensureSync(sphere, 'nostr');
+
         const identity = sphere.identity;
 
         if (!identity) {
@@ -2283,7 +2292,6 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
-        // No pre-sync needed — send/receive are write operations
         await closeSphere();
         break;
       }
@@ -2294,6 +2302,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
 
         const sphere = await getSphere();
+        if (!noSync) await ensureSync(sphere, 'full');
         const history = sphere.payments.getHistory();
         const limited = history.slice(0, limit);
 
@@ -3744,6 +3753,7 @@ async function main() {
         }
 
         const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
         if (!sphere.accounting) {
           console.error('Accounting module not enabled.');
           process.exit(1);
@@ -3777,6 +3787,7 @@ async function main() {
         }
 
         const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
         if (!sphere.accounting) {
           console.error('Accounting module not enabled.');
           process.exit(1);
@@ -4032,6 +4043,7 @@ async function main() {
         }
 
         const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
         if (!sphere.accounting) {
           console.error('Accounting module not enabled.');
           process.exit(1);
