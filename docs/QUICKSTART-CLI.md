@@ -145,8 +145,10 @@ sphere-cli wallet <TAB>             # list create use current delete
 | `swap-propose` | Propose a swap deal (`--offer`, `--want`) |
 | `swap-list` | List swap deals |
 | `swap-accept <id>` | Accept a swap deal |
+| `swap-reject <id> [reason]` | Reject a swap proposal |
 | `swap-status <id>` | Show detailed swap status |
 | `swap-deposit <id>` | Deposit into an announced swap |
+| `swap-cancel <id>` | Cancel a swap |
 | `daemon start` | Start persistent event listener |
 | `daemon stop` | Stop running daemon |
 | `daemon status` | Check daemon status |
@@ -1214,7 +1216,17 @@ npm run cli -- swap-status a1b2c3d4...full64hex...
 npm run cli -- balance
 ```
 
-> **Note:** There is no explicit cancel command for the proposer after the escrow is announced. Cancellation happens automatically via the escrow timeout. Before acceptance, the proposal simply expires after 5 minutes (client-side timeout).
+You can also explicitly reject or cancel swaps:
+
+```bash
+# Reject a proposal
+sphere-cli swap-reject 3611a464... "Price too high"
+
+# Cancel your own swap
+sphere-cli swap-cancel 3611a464...
+```
+
+> **Note:** After the escrow is announced but before deposits, you can explicitly cancel with `swap-cancel`. Once both deposits are confirmed, cancellation is no longer possible — the escrow will execute the payout. Before acceptance, the proposal can be rejected with `swap-reject` or simply expires after 5 minutes (client-side timeout).
 
 ### All Swap CLI Commands Reference
 
@@ -1223,8 +1235,10 @@ npm run cli -- balance
 | `swap-propose` | Propose a swap deal | `--to`, `--offer "<amount> <symbol>"`, `--want "<amount> <symbol>"`, `--escrow`, `--timeout`, `--message` |
 | `swap-list` | List swaps | `--all`, `--role <proposer\|acceptor>`, `--progress <state>` |
 | `swap-accept <id>` | Accept a swap | `--deposit` (also deposit immediately), `--no-wait` (do not wait for completion) |
+| `swap-reject <id> [reason]` | Reject a swap proposal | (optional reason as second positional argument) |
 | `swap-status <id>` | Detailed status | `--query-escrow` (query the escrow for its state) |
 | `swap-deposit <id>` | Deposit into swap | (no additional flags) |
+| `swap-cancel <id>` | Cancel a swap | (no additional flags) |
 
 **Swap IDs** are 64-character hex strings (content-addressed from the manifest). The `swap-list` output shows an 8-character prefix for readability. All commands that accept a swap ID require the full 64-character ID.
 

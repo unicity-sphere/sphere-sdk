@@ -1347,7 +1347,7 @@ index.ts ─────▶ SwapModule.ts ─────▶ state-machine.ts
 
 ## 13. CLI Commands
 
-The SDK CLI exposes swap operations through three primary commands and two convenience commands, following the same `{module}-{action}` naming convention as invoice commands (`invoice-create`, `invoice-list`, `invoice-pay`, etc.).
+The SDK CLI exposes swap operations through five primary commands and two convenience commands, following the same `{module}-{action}` naming convention as invoice commands (`invoice-create`, `invoice-list`, `invoice-pay`, etc.).
 
 ### Primary Commands
 
@@ -1420,6 +1420,26 @@ Output: step-by-step progress log, final swap status
 
 ### Convenience Commands
 
+**`swap-reject`** — Reject a swap proposal
+
+```
+npm run cli -- swap-reject <swap_id> [reason]
+```
+
+Maps to: `sphere.swap.rejectSwap(swapId, reason)`
+
+---
+
+**`swap-cancel`** — Cancel a swap
+
+```
+npm run cli -- swap-cancel <swap_id>
+```
+
+Maps to: `sphere.swap.cancelSwap(swapId)`
+
+---
+
 **`swap-status`** — Show detailed status for a specific swap
 
 ```
@@ -1456,7 +1476,7 @@ swap-propose ──swap_proposal──►
 
 ### Incoming Proposal Notification
 
-When a counterparty sends a `swap_proposal` DM, the SwapModule emits a `swap:proposal_received` event. In the CLI, this triggers a console notification prompting the user to run `swap-list` to review incoming proposals. In a wallet UI, this event can drive a push notification or an in-app alert. The proposal remains in `PROPOSAL_RECEIVED` progress state until the user explicitly calls `swap-accept` or rejects it.
+When a counterparty sends a `swap_proposal` DM, the SwapModule emits a `swap:proposal_received` event. In the CLI, this triggers a console notification prompting the user to run `swap-list` to review incoming proposals. In a wallet UI, this event can drive a push notification or an in-app alert. The proposal remains in `PROPOSAL_RECEIVED` progress state until the user explicitly calls `swap-accept` or `swap-reject`.
 
 ---
 

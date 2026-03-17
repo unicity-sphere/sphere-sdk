@@ -2263,15 +2263,138 @@ Manual deposit command for when `swap-accept` was called without `--deposit`.
 | `SWAP_DEPOSIT_FAILED` | `Deposit failed: {details}` | 1 |
 | Insufficient balance | `Insufficient balance for deposit: need {amount} {coinId}, have {available}` | 1 |
 
-### 20.6 CLI Command Quick Reference
+### 20.6 `swap-reject`
+
+**Usage:**
+
+```
+swap-reject <swap_id> [reason]
+```
+
+Reject a swap proposal received from a counterparty. Sends a `swap_rejection` DM to the proposer and moves the local swap record to `rejected` progress state.
+
+**Step-by-step specification:**
+
+1. Parse `<swap_id>` as the first positional argument:
+   ```typescript
+   const swapId = args[1];
+   if (!swapId) {
+     console.error('Usage: swap-reject <swap_id> [reason]');
+     process.exit(1);
+   }
+   ```
+
+2. Validate `swap_id` is 64 hexadecimal characters:
+   ```typescript
+   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+     console.error('Invalid swap ID — must be 64 hex characters');
+     process.exit(1);
+   }
+   ```
+
+3. Parse optional `[reason]` as the second positional argument (may be omitted):
+   ```typescript
+   const reason = args[2]; // undefined if not provided
+   ```
+
+4. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled.');
+     process.exit(1);
+   }
+   ```
+
+5. Call `sphere.swap.rejectSwap(swapId, reason)`.
+
+6. Print confirmation:
+   ```typescript
+   console.log(`Swap ${swapId.slice(0, 8)}... rejected.`);
+   if (reason) console.log(`Reason: ${reason}`);
+   ```
+
+7. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| Missing `swap_id` | Print usage string | 1 |
+| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
+| `sphere.swap` is null | `Swap module not enabled.` | 1 |
+| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
+| `SWAP_WRONG_STATE` | `Cannot reject: swap is in {progress} state (expected "proposed")` | 1 |
+
+### 20.7 `swap-cancel`
+
+**Usage:**
+
+```
+swap-cancel <swap_id>
+```
+
+Cancel a swap that you proposed or accepted. Sends a `swap_cancellation` DM to the counterparty and moves the local swap record to `cancelled` progress state. If the swap has been announced to an escrow but deposits are not yet complete, the escrow is notified and any existing deposits are returned.
+
+**Step-by-step specification:**
+
+1. Parse `<swap_id>` as the first positional argument:
+   ```typescript
+   const swapId = args[1];
+   if (!swapId) {
+     console.error('Usage: swap-cancel <swap_id>');
+     process.exit(1);
+   }
+   ```
+
+2. Validate `swap_id` is 64 hexadecimal characters:
+   ```typescript
+   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+     console.error('Invalid swap ID — must be 64 hex characters');
+     process.exit(1);
+   }
+   ```
+
+3. Call `getSphere()` and check swap module availability:
+   ```typescript
+   const sphere = await getSphere();
+   if (!sphere.swap) {
+     console.error('Swap module not enabled.');
+     process.exit(1);
+   }
+   ```
+
+4. Call `sphere.swap.cancelSwap(swapId)`.
+
+5. Print confirmation:
+   ```typescript
+   console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
+   ```
+
+6. Call `closeSphere()`.
+
+**Error handling:**
+
+| Condition | Message | Exit |
+|-----------|---------|------|
+| Missing `swap_id` | Print usage string | 1 |
+| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
+| `sphere.swap` is null | `Swap module not enabled.` | 1 |
+| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
+| `SWAP_WRONG_STATE` | `Cannot cancel: swap is in {progress} state` | 1 |
+| `SWAP_ALREADY_TERMINAL` | `Swap is already in terminal state: {progress}` | 1 |
+
+### 20.8 CLI Command Quick Reference
 
 | Command | Description |
 |---------|-------------|
 | `swap-propose` | Propose a swap deal to a counterparty |
 | `swap-list` | List swap deals (default: open + in-progress only) |
 | `swap-accept <id>` | Accept a proposed swap deal |
+| `swap-reject <id> [reason]` | Reject a swap proposal |
 | `swap-status <id>` | Show detailed swap status |
 | `swap-deposit <id>` | Deposit into an announced swap |
+| `swap-cancel <id>` | Cancel a swap |
 
 ---
 
