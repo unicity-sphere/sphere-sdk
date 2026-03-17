@@ -1853,6 +1853,93 @@ interface AggregatorClient {
 
 ---
 
+## TokenRegistry
+
+Singleton that provides token metadata (symbol, name, decimals, icons, asset kind) by coin ID. Data is fetched from a remote registry URL and cached locally.
+
+### Setup
+
+`TokenRegistry` is configured automatically by `createBrowserProviders()` / `createNodeProviders()` and by `Sphere.init()`. No manual setup is needed for typical usage.
+
+```typescript
+import { TokenRegistry } from '@unicitylabs/sphere-sdk';
+
+const registry = TokenRegistry.getInstance();
+```
+
+### Static Methods
+
+```typescript
+// Get the singleton instance (creates one if needed)
+TokenRegistry.getInstance(): TokenRegistry
+
+// Configure the registry (called automatically by Sphere.init)
+TokenRegistry.configure(options: TokenRegistryConfig): void
+
+// Wait until initial data is loaded (from cache or remote)
+TokenRegistry.waitForReady(timeoutMs?: number): Promise<boolean>
+
+// Stop auto-refresh and reset singleton
+TokenRegistry.destroy(): void
+```
+
+### Instance Methods
+
+```typescript
+// Look up by coin ID (hex string)
+getDefinition(coinId: string): TokenDefinition | undefined
+
+// Look up by symbol (e.g., 'UCT') — case-insensitive
+getDefinitionBySymbol(symbol: string): TokenDefinition | undefined
+
+// Look up by name (e.g., 'bitcoin') — case-insensitive
+getDefinitionByName(name: string): TokenDefinition | undefined
+
+// Shorthand accessors (return fallback values if not found)
+getSymbol(coinId: string): string      // fallback: truncated coinId
+getDecimals(coinId: string): number    // fallback: 0
+
+// List all definitions
+getAllDefinitions(): TokenDefinition[]
+
+// Filtered lists
+getFungibleDefinitions(): TokenDefinition[]
+getNonFungibleDefinitions(): TokenDefinition[]
+
+// Reverse lookups (symbol/name → coinId)
+getCoinIdBySymbol(symbol: string): string | undefined
+getCoinIdByName(name: string): string | undefined
+
+// Force refresh from remote
+refreshFromRemote(): Promise<boolean>
+```
+
+### TokenDefinition
+
+```typescript
+interface TokenDefinition {
+  coinId: string;           // Hex coin identifier
+  symbol: string;           // Short symbol (e.g., 'UCT')
+  name: string;             // Full name (e.g., 'Unicity Token')
+  decimals: number;         // Decimal places
+  assetKind: 'fungible' | 'non-fungible';
+  iconUrl?: string;         // Icon URL
+  coingeckoId?: string;     // CoinGecko identifier (for price lookups)
+}
+```
+
+### Standalone Helpers
+
+```typescript
+import { getTokenDefinition, getTokenSymbol, getTokenDecimals } from '@unicitylabs/sphere-sdk';
+
+const def = getTokenDefinition(coinId);   // TokenDefinition | undefined
+const sym = getTokenSymbol(coinId);       // string (with fallback)
+const dec = getTokenDecimals(coinId);     // number (with fallback)
+```
+
+---
+
 ## PriceProvider
 
 Optional provider for fetching token market prices. Enables `getBalance()` (total USD value) and price enrichment in `getAssets()`.

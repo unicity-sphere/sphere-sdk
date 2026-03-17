@@ -26,6 +26,8 @@ npm run cli -- --help
 | `wallet current` | Show active profile |
 | `balance` | Show L3 token balance |
 | `tokens` | List individual tokens |
+| `assets` | List registered assets (coins & NFTs) |
+| `asset-info <id>` | Show asset details |
 | `verify-balance` | Detect spent tokens via aggregator |
 | `sync` | Sync tokens with IPFS |
 | `send <to> <amount>` | Send L3 tokens |
@@ -322,6 +324,24 @@ ID: 9876543210abcdef...
   Amount: 0.04200000 ETH
   Status: active
 ──────────────────────────────────────────────────
+```
+
+### Registered Assets
+
+Browse the token registry to see all known coins and NFTs on the network.
+
+```bash
+# List all registered assets
+npm run cli -- assets
+
+# Filter by type
+npm run cli -- assets --type fungible
+npm run cli -- assets --type nft
+
+# Get detailed info for a specific asset (by symbol, name, or coin ID)
+npm run cli -- asset-info UCT
+npm run cli -- asset-info bitcoin
+npm run cli -- asset-info 0a1b2c3d4e5f...
 ```
 
 ### Verify Tokens Against Aggregator

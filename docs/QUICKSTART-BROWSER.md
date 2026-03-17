@@ -278,6 +278,30 @@ document.getElementById('balance').textContent =
 const l1Balance = await sphere.payments.l1.getBalance();
 ```
 
+### Look Up Asset Metadata
+
+The `TokenRegistry` provides metadata (symbol, name, decimals, icons) for all registered assets on the network:
+
+```typescript
+import { TokenRegistry } from '@unicitylabs/sphere-sdk';
+
+const registry = TokenRegistry.getInstance();
+
+// List all registered assets
+const allAssets = registry.getAllDefinitions();
+const coins = registry.getFungibleDefinitions();
+const nfts = registry.getNonFungibleDefinitions();
+
+// Look up a specific asset
+const uct = registry.getDefinitionBySymbol('UCT');
+console.log(uct?.name, uct?.decimals);  // 'Unicity Token', 8
+
+// Reverse lookup: symbol → coin ID
+const coinId = registry.getCoinIdBySymbol('UCT');
+```
+
+> **Note:** The registry is configured automatically by `createBrowserProviders()` and `Sphere.init()`. Data is fetched from the network and cached in `localStorage`.
+
 ### Send Tokens
 
 ```typescript
