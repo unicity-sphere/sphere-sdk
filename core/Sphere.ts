@@ -2356,10 +2356,19 @@ export class Sphere {
       emitEvent,
     });
 
-    await payments.load();
-    await communications.load();
-    await groupChat?.load();
-    await market?.load();
+    // Load modules in parallel — they are independent of each other.
+    // allSettled so one failing module doesn't block the rest.
+    const results = await Promise.allSettled([
+      payments.load(),
+      communications.load(),
+      groupChat?.load(),
+      market?.load(),
+    ]);
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        logger.warn('Sphere', 'Module load failed:', r.reason);
+      }
+    }
 
     const moduleSet: AddressModuleSet = {
       index,
@@ -3907,10 +3916,10 @@ export class Sphere {
     }
     await this._oracle.initialize();
 
-    // Initialize all token storage providers
-    for (const provider of this._tokenStorageProviders.values()) {
-      await provider.initialize();
-    }
+    // Initialize all token storage providers in parallel
+    await Promise.all(
+      [...this._tokenStorageProviders.values()].map(p => p.initialize())
+    );
 
     // Subscribe to provider events and bridge to connection:changed
     this.subscribeToProviderEvents();
@@ -4044,10 +4053,19 @@ export class Sphere {
       emitEvent,
     });
 
-    await this._payments.load();
-    await this._communications.load();
-    await this._groupChat?.load();
-    await this._market?.load();
+    // Load modules in parallel — they are independent of each other.
+    // allSettled so one failing module doesn't block the rest.
+    const results = await Promise.allSettled([
+      this._payments.load(),
+      this._communications.load(),
+      this._groupChat?.load(),
+      this._market?.load(),
+    ]);
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        logger.warn('Sphere', 'Module load failed:', r.reason);
+      }
+    }
 
     // Register in per-address module map
     this._addressModules.set(this._currentAddressIndex, {
