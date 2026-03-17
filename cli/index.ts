@@ -305,6 +305,21 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'This deletes everything in the current profile data and token directories.',
     ],
   },
+  'wallet': {
+    usage: 'wallet <subcommand>',
+    description: 'Manage wallet profiles. Each profile has its own data directory, token storage, and network configuration.',
+    examples: [
+      'npm run cli -- wallet list',
+      'npm run cli -- wallet create myprofile',
+      'npm run cli -- wallet use myprofile',
+      'npm run cli -- wallet current',
+      'npm run cli -- wallet delete myprofile',
+    ],
+    notes: [
+      'Subcommands: list, create, use, current, delete',
+      'Use "help wallet <subcommand>" for detailed help on each.',
+    ],
+  },
   'wallet list': {
     usage: 'wallet list',
     description: 'List all wallet profiles with their network and data directory. The current active profile is marked with an arrow.',
