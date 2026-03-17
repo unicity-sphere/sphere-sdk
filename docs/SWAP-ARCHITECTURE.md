@@ -1355,19 +1355,21 @@ The SDK CLI exposes swap operations through three primary commands and two conve
 
 ```
 npm run cli -- swap-propose --to <recipient> \
-  --offer-coin <coinId> --offer-amount <amount> \
-  --want-coin <coinId> --want-amount <amount> \
+  --offer "<amount> <symbol>" \
+  --want "<amount> <symbol>" \
   [--escrow <address>] [--timeout <seconds>] [--message <text>]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--to` | Counterparty's @nametag, DIRECT:// address, or chain pubkey |
-| `--offer-coin` / `--offer-amount` | What the proposer sends (coinId + amount in smallest units) |
-| `--want-coin` / `--want-amount` | What the proposer expects to receive |
+| `--offer "<amount> <symbol>"` | What the proposer sends (e.g., `"1000000 UCT"`) |
+| `--want "<amount> <symbol>"` | What the proposer expects to receive (e.g., `"500000 USDU"`) |
 | `--escrow` | Escrow @nametag or DIRECT:// address (uses configured default if omitted) |
-| `--timeout` | Swap timeout in seconds (default: 3600, range: 60–86400) |
+| `--timeout` | Swap timeout in seconds (default: 3600, range: 60-86400) |
 | `--message` | Optional human-readable description sent to counterparty |
+
+> **Deprecated:** `--offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount>` is still accepted for backwards compatibility.
 
 Maps to: `sphere.swap.proposeSwap(deal)` → sends `swap_proposal` DM to counterparty
 

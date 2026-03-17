@@ -1877,16 +1877,20 @@ This section specifies the CLI commands for the swap module. Each command follow
 **Usage:**
 
 ```
-swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
-             --want-coin <coinId> --want-amount <amount>
+swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symbol>"
              [--escrow <address>] [--timeout <seconds>] [--message <text>]
 ```
+
+> **Deprecated fallback:** `--offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount>` is still accepted for backwards compatibility but is not recommended. The new `--offer` / `--want` flags take a quoted `"<amount> <symbol>"` string.
 
 **Step-by-step specification:**
 
 1. Parse all `--flag` arguments using `args.indexOf()`:
    ```typescript
    const toIdx = args.indexOf('--to');
+   const offerIdx = args.indexOf('--offer');
+   const wantIdx = args.indexOf('--want');
+   // Deprecated fallback flags
    const offerCoinIdx = args.indexOf('--offer-coin');
    const offerAmountIdx = args.indexOf('--offer-amount');
    const wantCoinIdx = args.indexOf('--want-coin');
@@ -1896,19 +1900,17 @@ swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
    const messageIdx = args.indexOf('--message');
    ```
 
-2. Validate required flags. If any of `--to`, `--offer-coin`, `--offer-amount`, `--want-coin`, or `--want-amount` is missing or lacks a following argument, print usage and `process.exit(1)`:
+2. Parse `--offer` and `--want` values. Each is a quoted `"<amount> <symbol>"` string (e.g., `"1000000 UCT"`). Split on whitespace to extract amount and symbol. If the new-style flags are missing, fall back to the deprecated `--offer-coin`/`--offer-amount`/`--want-coin`/`--want-amount` flags.
+
+   Validate required flags. If neither the new `--offer`/`--want` nor the deprecated flags provide both amount and symbol, print usage and `process.exit(1)`:
    ```typescript
-   if (toIdx === -1 || !args[toIdx + 1] ||
-       offerCoinIdx === -1 || !args[offerCoinIdx + 1] ||
-       offerAmountIdx === -1 || !args[offerAmountIdx + 1] ||
-       wantCoinIdx === -1 || !args[wantCoinIdx + 1] ||
-       wantAmountIdx === -1 || !args[wantAmountIdx + 1]) {
-     console.error('Usage: swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount> [--escrow <address>] [--timeout <seconds>] [--message <text>]');
+   if (toIdx === -1 || !args[toIdx + 1] || !offerAmount || !offerCoin || !wantAmount || !wantCoin) {
+     console.error('Usage: swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symbol>" [--escrow <address>] [--timeout <seconds>] [--message <text>]');
      process.exit(1);
    }
    ```
 
-3. Validate `--offer-amount` and `--want-amount` are positive integers (regex: `/^[1-9][0-9]*$/`). If either fails:
+3. Validate offer and want amounts are positive integers (regex: `/^[1-9][0-9]*$/`). If either fails:
    ```typescript
    console.error(`Invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
    process.exit(1);
@@ -1945,10 +1947,10 @@ swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
    const deal: SwapDeal = {
      partyA: sphere.identity!.directAddress!,
      partyB: args[toIdx + 1],
-     partyACurrency: args[offerCoinIdx + 1],
-     partyAAmount: args[offerAmountIdx + 1],
-     partyBCurrency: args[wantCoinIdx + 1],
-     partyBAmount: args[wantAmountIdx + 1],
+     partyACurrency: offerCoin,
+     partyAAmount: offerAmount,
+     partyBCurrency: wantCoin,
+     partyBAmount: wantAmount,
      timeout: timeout,
      escrowAddress: escrow,
    };
@@ -1962,8 +1964,8 @@ swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount>
    console.log(JSON.stringify({
      swap_id: result.swapId,
      counterparty: args[toIdx + 1],
-     offer: `${args[offerAmountIdx + 1]} ${args[offerCoinIdx + 1]}`,
-     want: `${args[wantAmountIdx + 1]} ${args[wantCoinIdx + 1]}`,
+     offer: `${offerAmount} ${offerCoin}`,
+     want: `${wantAmount} ${wantCoin}`,
      escrow: deal.escrowAddress ?? '(config default)',
      timeout: timeout,
      status: result.progress,

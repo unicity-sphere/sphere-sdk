@@ -1318,70 +1318,70 @@ Test the CLI commands `swap-propose`, `swap-list`, `swap-accept`, `swap-status`,
 #### UT-SWAP-CLI-001: Valid proposal with all required flags calls proposeSwap with correct SwapDeal
 
 - **Preconditions:** Mocked SwapModule; `getSphere()` returns sphere with swap module
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"`
 - **Expected:** `swapModule.proposeSwap()` called once with deal containing `partyB: '@bob'`, `partyACurrency: 'UCT'`, `partyAAmount: '1000000'`, `partyBCurrency: 'USDU'`, `partyBAmount: '500000'`
 - **Assertions:** `proposeSwap` called with matching SwapDeal fields
 
 #### UT-SWAP-CLI-002: Missing --to flag prints usage and exits 1
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --offer "1000000 UCT" --want "500000 USDU"`
 - **Expected:** `console.error` called with usage message; `process.exit(1)` called
 - **Assertions:** stderr contains usage info; exit code is 1
 
-#### UT-SWAP-CLI-003: Missing --offer-coin prints usage and exits 1
+#### UT-SWAP-CLI-003: Missing --offer prints usage and exits 1
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --to @bob --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --to @bob --want "500000 USDU"`
 - **Expected:** `console.error` called with usage message; `process.exit(1)` called
 - **Assertions:** stderr contains usage info; exit code is 1
 
-#### UT-SWAP-CLI-004: Invalid --offer-amount (not positive integer) prints error and exits 1
+#### UT-SWAP-CLI-004: Invalid offer amount (not positive integer) prints error and exits 1
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount -50 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --to @bob --offer "-50 UCT" --want "500000 USDU"`
 - **Expected:** `console.error` called with message mentioning invalid amount; `process.exit(1)` called
 - **Assertions:** stderr contains "amount"; exit code is 1
 
 #### UT-SWAP-CLI-005: --timeout out of range [60, 86400] prints error and exits 1
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --timeout 30`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU" --timeout 30`
 - **Expected:** `console.error` called with message mentioning timeout range; `process.exit(1)` called
 - **Assertions:** stderr contains "timeout"; exit code is 1
 
 #### UT-SWAP-CLI-006: Default timeout is 3600 when not specified
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"`
 - **Expected:** `swapModule.proposeSwap()` called with deal where `timeout === 3600`
 - **Assertions:** Deal passed to proposeSwap has timeout 3600
 
 #### UT-SWAP-CLI-007: --escrow flag overrides default escrow
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --escrow DIRECT://custom_escrow`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU" --escrow DIRECT://custom_escrow`
 - **Expected:** `swapModule.proposeSwap()` called with deal where `escrowAddress === 'DIRECT://custom_escrow'`
 - **Assertions:** Deal passed to proposeSwap has custom escrow address
 
 #### UT-SWAP-CLI-008: --message flag passed as options.message to proposeSwap
 
 - **Preconditions:** Mocked SwapModule
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --message "Trade offer"`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU" --message "Trade offer"`
 - **Expected:** `swapModule.proposeSwap()` called with deal (no `message` field on SwapDeal) and options `{ message: 'Trade offer' }` as the second argument
 - **Assertions:** `expect(mockSwap.proposeSwap).toHaveBeenCalledWith(expect.any(Object), { message: 'Trade offer' })`
 
 #### UT-SWAP-CLI-009: SWAP_RESOLVE_FAILED error prints user-friendly message
 
 - **Preconditions:** Mocked SwapModule; `proposeSwap()` rejects with SphereError code SWAP_RESOLVE_FAILED
-- **Action:** Run `swap-propose --to @unknown --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --to @unknown --offer "1000000 UCT" --want "500000 USDU"`
 - **Expected:** `console.error` called with user-friendly message (not raw stack trace); `process.exit(1)` called
 - **Assertions:** stderr contains "could not resolve" or similar human-readable text; exit code is 1
 
 #### UT-SWAP-CLI-010: Output includes swap_id, counterparty, offer, want summary
 
 - **Preconditions:** Mocked SwapModule; `proposeSwap()` resolves with `{ swapId: 'abc...', ... }`
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"`
 - **Expected:** `console.log` output includes swap_id, counterparty identifier, offer summary (coin + amount), want summary (coin + amount)
 - **Assertions:** stdout contains the swap_id, "@bob", "UCT", "1000000", "USDU", "500000"
 
@@ -1536,21 +1536,21 @@ Test the CLI commands `swap-propose`, `swap-list`, `swap-accept`, `swap-status`,
 #### UT-SWAP-CLI-031: swap-propose without --escrow and no defaultEscrowAddress prints error
 
 - **Preconditions:** Mocked SwapModule with no `defaultEscrowAddress` configured; `proposeSwap()` rejects with SphereError code SWAP_INVALID_DEAL and message containing "No escrow address"
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000` (no --escrow flag)
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"` (no --escrow flag)
 - **Expected:** `console.error` called with message mentioning escrow address; `process.exit(1)` called
 - **Assertions:** stderr contains "No escrow address"; exit code is 1
 
 #### UT-SWAP-CLI-032: swap-propose with SWAP_LIMIT_EXCEEDED prints error
 
 - **Preconditions:** Mocked SwapModule; `proposeSwap()` rejects with SphereError code SWAP_LIMIT_EXCEEDED
-- **Action:** Run `swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --escrow DIRECT://eee`
+- **Action:** Run `swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU" --escrow DIRECT://eee`
 - **Expected:** `console.error` called with message about too many pending swaps; `process.exit(1)` called
 - **Assertions:** stderr contains "Too many pending swaps"; exit code is 1
 
 #### UT-SWAP-CLI-033: swap-propose with self-address as --to prints error
 
 - **Preconditions:** Mocked SwapModule; `proposeSwap()` rejects with SphereError code SWAP_INVALID_DEAL and message containing "Cannot swap with yourself"
-- **Action:** Run `swap-propose --to DIRECT://own_address --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --escrow DIRECT://eee` where `DIRECT://own_address` matches the local wallet's address
+- **Action:** Run `swap-propose --to DIRECT://own_address --offer "1000000 UCT" --want "500000 USDU" --escrow DIRECT://eee` where `DIRECT://own_address` matches the local wallet's address
 - **Expected:** `console.error` called with message about self-swap; `process.exit(1)` called
 - **Assertions:** stderr contains "Cannot swap with yourself"; exit code is 1
 

@@ -9,6 +9,17 @@ The Sphere SDK includes a built-in CLI for wallet management, payments, messagin
 npm run cli -- --help
 ```
 
+> **Asset amount convention:** All CLI commands that reference assets use the format `<amount> <symbol>`.
+> Examples: `10 UCT`, `0.5 BTC`, `1000000 USDU`. This format is used consistently:
+>
+> ```
+> send @alice 10 UCT
+> topup 10 UCT
+> swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"
+> invoice-create --target @alice --asset "1000000 UCT"
+> invoice-return <id> --recipient <addr> --asset "500 UCT"
+> ```
+
 ---
 
 ## Command Quick Reference
@@ -30,11 +41,11 @@ npm run cli -- --help
 | `asset-info <id>` | Show asset details |
 | `verify-balance` | Detect spent tokens via aggregator |
 | `sync` | Sync tokens with IPFS |
-| `send <to> <amount>` | Send L3 tokens |
+| `send <to> <amount> <symbol>` | Send L3 tokens |
 | `receive` | Check for incoming transfers |
 | `history [limit]` | Transaction history |
 | `l1-balance` | L1 (ALPHA) balance |
-| `topup` | Request test tokens from faucet |
+| `topup [<amount> <symbol>]` | Request test tokens from faucet |
 | `addresses` | List tracked addresses |
 | `switch <index>` | Switch to HD address |
 | `hide <index>` | Hide address |
@@ -74,7 +85,7 @@ npm run cli -- --help
 | `invoice-transfers <id>` | List related transfers |
 | `invoice-export <id>` | Export invoice to JSON file |
 | `invoice-parse-memo <memo>` | Parse an invoice memo string |
-| `swap-propose` | Propose a swap deal to a counterparty |
+| `swap-propose` | Propose a swap deal (`--offer`, `--want`) |
 | `swap-list` | List swap deals |
 | `swap-accept <id>` | Accept a swap deal |
 | `swap-status <id>` | Show detailed swap status |
@@ -258,7 +269,7 @@ npm run cli -- wallet use alice
 npm run cli -- topup
 
 # Send from alice to bob
-npm run cli -- send @bob 100 --coin UCT
+npm run cli -- send @bob 100 UCT
 
 # Check bob's balance
 npm run cli -- wallet use bob
@@ -487,16 +498,16 @@ npm run cli -- unhide 2
 
 ```bash
 # Basic send to a nametag
-npm run cli -- send @bob 100 --coin UCT
+npm run cli -- send @bob 100 UCT
 
 # Send to a DIRECT:// address
-npm run cli -- send DIRECT://0000be36... 50 --coin UCT
+npm run cli -- send DIRECT://0000be36... 50 UCT
 
 # Send to an L1 address (alpha1...)
-npm run cli -- send alpha1qxy... 0.001 --coin BTC
+npm run cli -- send alpha1qxy... 0.001 BTC
 
 # Send to a raw chain pubkey (02... or 03...)
-npm run cli -- send 02abc123def456... 1000000 --coin UCT
+npm run cli -- send 02abc123def456... 1000000 UCT
 ```
 
 **Available coin symbols:** UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT
@@ -512,10 +523,10 @@ npm run cli -- send 02abc123def456... 1000000 --coin UCT
 
 ```bash
 # Instant mode (explicit — same as default)
-npm run cli -- send @bob 100 --coin UCT --instant
+npm run cli -- send @bob 100 UCT --instant
 
 # Conservative mode
-npm run cli -- send @bob 100 --coin UCT --conservative
+npm run cli -- send @bob 100 UCT --conservative
 ```
 
 #### Address Mode Flags
@@ -524,13 +535,13 @@ By default, the CLI resolves the recipient's address automatically. You can forc
 
 ```bash
 # Force DirectAddress transfer
-npm run cli -- send @bob 100 --coin UCT --direct
+npm run cli -- send @bob 100 UCT --direct
 
 # Force PROXY address transfer (compatible with all nametags)
-npm run cli -- send @bob 100 --coin UCT --proxy
+npm run cli -- send @bob 100 UCT --proxy
 
 # Skip IPFS sync after sending
-npm run cli -- send @bob 100 --coin UCT --no-sync
+npm run cli -- send @bob 100 UCT --no-sync
 ```
 
 ### Receive Tokens
@@ -571,9 +582,10 @@ Received 2 new transfer(s):
 # Request all supported test coins (requires a registered nametag)
 npm run cli -- topup
 
-# Request a specific coin
-npm run cli -- topup bitcoin
-npm run cli -- topup unicity 200
+# Request a specific amount and coin
+npm run cli -- topup 10 UCT
+npm run cli -- topup 13 ETH
+npm run cli -- topup 200 BTC
 
 # Aliases: top-up, faucet
 npm run cli -- faucet
@@ -796,16 +808,15 @@ Invoices are on-chain tokens that encode payment terms: target address, coin, am
 
 ```bash
 # Create invoice requesting 1 UCT (amount in smallest units)
-npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000
+npm run cli -- invoice-create --target @alice --asset "1000000 UCT"
 
 # Create targeting a DIRECT address
-npm run cli -- invoice-create --target DIRECT://0000be36... --coin UCT --amount 1000000
+npm run cli -- invoice-create --target DIRECT://0000be36... --asset "1000000 UCT"
 
 # With optional metadata
 npm run cli -- invoice-create \
   --target @alice \
-  --coin UCT \
-  --amount 1000000 \
+  --asset "1000000 UCT" \
   --due 2026-12-31 \
   --memo "Order #1234"
 
@@ -816,7 +827,7 @@ npm run cli -- invoice-create --target @alice --nft <tokenId>
 npm run cli -- invoice-create --terms invoice-terms.json
 ```
 
-The `--amount` must be a positive integer in the smallest unit (no decimals, no leading zeros). For UCT with 8 decimals: `1000000` = 0.01 UCT.
+The `--asset` flag takes a quoted `"<amount> <symbol>"` string. The amount must be a positive integer in the smallest unit (no decimals, no leading zeros). For UCT with 8 decimals: `1000000` = 0.01 UCT.
 
 The `--due` flag accepts ISO-8601 date strings, e.g. `2026-12-31` or `2026-12-31T23:59:59Z`.
 
@@ -928,11 +939,10 @@ npm run cli -- invoice-cancel a1b2c3d4
 # Return a specific amount to the original sender
 npm run cli -- invoice-return a1b2c3d4 \
   --recipient @bob \
-  --amount 500000 \
-  --coin UCT
+  --asset "500000 UCT"
 ```
 
-All three flags (`--recipient`, `--amount`, `--coin`) are required.
+Both `--recipient` and `--asset` flags are required.
 
 ### Send Receipts and Notices
 
@@ -1018,8 +1028,8 @@ npm run cli -- balance
 # 2. Propose a swap: Alice offers 1,000,000 UCT for 500,000 USDU
 npm run cli -- swap-propose \
   --to @bob \
-  --offer-coin UCT --offer-amount 1000000 \
-  --want-coin USDU --want-amount 500000 \
+  --offer "1000000 UCT" \
+  --want "500000 USDU" \
   --escrow @escrow-testnet \
   --timeout 3600 \
   --message "Trading 1 UCT for 0.5 USDU"
@@ -1153,7 +1163,7 @@ npm run cli -- balance
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
-| `swap-propose` | Propose a swap deal | `--to`, `--offer-coin`, `--offer-amount`, `--want-coin`, `--want-amount`, `--escrow`, `--timeout`, `--message` |
+| `swap-propose` | Propose a swap deal | `--to`, `--offer "<amount> <symbol>"`, `--want "<amount> <symbol>"`, `--escrow`, `--timeout`, `--message` |
 | `swap-list` | List swaps | `--all`, `--role <proposer\|acceptor>`, `--progress <state>` |
 | `swap-accept <id>` | Accept a swap | `--deposit` (also deposit immediately), `--no-wait` (do not wait for completion) |
 | `swap-status <id>` | Detailed status | `--query-escrow` (query the escrow for its state) |
@@ -1180,10 +1190,8 @@ npm run cli -- balance
 | Flag | Required | Description |
 |------|----------|-------------|
 | `--to <recipient>` | Yes | Counterparty: `@nametag`, `DIRECT://...`, or chain pubkey |
-| `--offer-coin <coinId>` | Yes | Coin ID you are offering (e.g., `UCT`) |
-| `--offer-amount <amount>` | Yes | Amount you are offering (positive integer, smallest units) |
-| `--want-coin <coinId>` | Yes | Coin ID you want in return (e.g., `USDU`) |
-| `--want-amount <amount>` | Yes | Amount you want in return (positive integer, smallest units) |
+| `--offer "<amount> <symbol>"` | Yes | What you are offering (e.g., `"1000000 UCT"`) |
+| `--want "<amount> <symbol>"` | Yes | What you want in return (e.g., `"500000 USDU"`) |
 | `--escrow <address>` | No | Escrow service address (defaults to module config) |
 | `--timeout <seconds>` | No | Swap timeout in seconds, 60-86400 (default: 3600) |
 | `--message <text>` | No | Human-readable message included in proposal DM |
@@ -1408,7 +1416,7 @@ npm run cli -- topup
 npm run cli -- balance --finalize
 
 # 4. Send 50 UCT to bob
-npm run cli -- send @bob 50 --coin UCT
+npm run cli -- send @bob 50 UCT
 
 # 5. Confirm the transfer is reflected in history
 npm run cli -- history 5
@@ -1433,7 +1441,7 @@ npm run cli -- balance --finalize
 ```bash
 # Alice creates an invoice requesting 1 UCT from Bob
 npm run cli -- wallet use alice
-npm run cli -- invoice-create --target @alice --coin UCT --amount 100000000 --memo "Order #1234"
+npm run cli -- invoice-create --target @alice --asset "100000000 UCT" --memo "Order #1234"
 # Note the invoice ID prefix, e.g., a1b2c3d4
 
 # Alice exports the invoice token to share with Bob

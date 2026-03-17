@@ -38,10 +38,10 @@ npm run cli -- balance
 npm run cli -- balance --finalize
 
 # Send tokens (instant mode — default, ~2-3s sender latency)
-npm run cli -- send @alice 1 --coin UCT --instant
+npm run cli -- send @alice 1 UCT --instant
 
 # Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 --coin UCT --conservative
+npm run cli -- send @alice 1 UCT --conservative
 
 # Show receive address
 npm run cli -- receive
@@ -128,7 +128,7 @@ npm run cli -- wallet create bob                # Create another profile
 npm run cli -- init --nametag bob               # Initialize second wallet
 npm run cli -- wallet list                      # List all profiles
 npm run cli -- wallet use alice                 # Switch to alice
-npm run cli -- send @bob 0.1 --coin BTC         # Send from alice to bob
+npm run cli -- send @bob 0.1 BTC                 # Send from alice to bob
 npm run cli -- wallet use bob                   # Switch to bob
 npm run cli -- balance --finalize               # Check bob's balance (fetch + finalize)
 ```

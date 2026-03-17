@@ -105,25 +105,35 @@ async function runSwapCommand(
     switch (command) {
       case 'swap-propose': {
         const toIdx = args.indexOf('--to');
-        const offerCoinIdx = args.indexOf('--offer-coin');
-        const offerAmountIdx = args.indexOf('--offer-amount');
-        const wantCoinIdx = args.indexOf('--want-coin');
-        const wantAmountIdx = args.indexOf('--want-amount');
+        const offerIdx = args.indexOf('--offer');
+        const wantIdx = args.indexOf('--want');
         const escrowIdx = args.indexOf('--escrow');
         const timeoutIdx = args.indexOf('--timeout');
         const messageIdx = args.indexOf('--message');
 
         if (toIdx === -1 || !args[toIdx + 1] ||
-            offerCoinIdx === -1 || !args[offerCoinIdx + 1] ||
-            offerAmountIdx === -1 || !args[offerAmountIdx + 1] ||
-            wantCoinIdx === -1 || !args[wantCoinIdx + 1] ||
-            wantAmountIdx === -1 || !args[wantAmountIdx + 1]) {
-          error('Usage: swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount> [--escrow <address>] [--timeout <seconds>] [--message <text>]');
+            offerIdx === -1 || !args[offerIdx + 1] ||
+            wantIdx === -1 || !args[wantIdx + 1]) {
+          error('Usage: swap-propose --to <recipient> --offer <amount> <symbol> --want <amount> <symbol> [--escrow <address>] [--timeout <seconds>] [--message <text>]');
           exit(1);
         }
 
-        const offerAmount = args[offerAmountIdx + 1];
-        const wantAmount = args[wantAmountIdx + 1];
+        // Parse --offer "<amount> <symbol>"
+        const offerParts = args[offerIdx + 1].split(/\s+/);
+        if (offerParts.length !== 2) {
+          error('--offer must be "<amount> <symbol>" (e.g., "1000000 UCT")');
+          exit(1);
+        }
+        const [offerAmount, offerCoin] = offerParts;
+
+        // Parse --want "<amount> <symbol>"
+        const wantParts = args[wantIdx + 1].split(/\s+/);
+        if (wantParts.length !== 2) {
+          error('--want must be "<amount> <symbol>" (e.g., "500000 USDU")');
+          exit(1);
+        }
+        const [wantAmount, wantCoin] = wantParts;
+
         if (!/^[1-9][0-9]*$/.test(offerAmount)) {
           error(`Invalid amount "${offerAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
           exit(1);
@@ -153,9 +163,9 @@ async function runSwapCommand(
         const deal = {
           partyA: sphere.identity!.directAddress!,
           partyB: args[toIdx + 1],
-          partyACurrency: args[offerCoinIdx + 1],
+          partyACurrency: offerCoin,
           partyAAmount: offerAmount,
-          partyBCurrency: args[wantCoinIdx + 1],
+          partyBCurrency: wantCoin,
           partyBAmount: wantAmount,
           timeout: timeout,
           escrowAddress: escrow,
@@ -166,8 +176,8 @@ async function runSwapCommand(
         log(JSON.stringify({
           swap_id: result.swapId,
           counterparty: args[toIdx + 1],
-          offer: `${offerAmount} ${args[offerCoinIdx + 1]}`,
-          want: `${wantAmount} ${args[wantCoinIdx + 1]}`,
+          offer: `${offerAmount} ${offerCoin}`,
+          want: `${wantAmount} ${wantCoin}`,
           escrow: deal.escrowAddress ?? '(config default)',
           timeout: timeout,
           status: result.swap?.progress ?? 'proposed',
@@ -441,10 +451,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       expect(result.exitCode).toBeNull();
@@ -461,10 +469,8 @@ describe('SwapModule CLI Commands', () => {
     it('UT-SWAP-CLI-002: missing --to flag prints usage and exits 1', async () => {
       const result = await runSwapCommand([
         'swap-propose',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       expect(result.exitCode).toBe(1);
@@ -473,13 +479,11 @@ describe('SwapModule CLI Commands', () => {
     });
 
     // UT-SWAP-CLI-003
-    it('UT-SWAP-CLI-003: missing --offer-coin prints usage and exits 1', async () => {
+    it('UT-SWAP-CLI-003: missing --offer prints usage and exits 1', async () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--want', '500000 USDU',
       ], sphere);
 
       expect(result.exitCode).toBe(1);
@@ -492,10 +496,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '-50',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '-50 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       expect(result.exitCode).toBe(1);
@@ -508,10 +510,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
         '--timeout', '30',
       ], sphere);
 
@@ -527,10 +527,8 @@ describe('SwapModule CLI Commands', () => {
       await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       const [deal] = mockSwap.proposeSwap.mock.calls[0];
@@ -544,10 +542,8 @@ describe('SwapModule CLI Commands', () => {
       await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
         '--escrow', 'DIRECT://custom_escrow',
       ], sphere);
 
@@ -562,10 +558,8 @@ describe('SwapModule CLI Commands', () => {
       await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
         '--message', 'Trade offer',
       ], sphere);
 
@@ -584,10 +578,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@unknown',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       expect(result.exitCode).toBe(1);
@@ -602,10 +594,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       const stdoutText = result.stdout.join(' ');
@@ -953,10 +943,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
       ], sphere);
 
       expect(result.exitCode).toBe(1);
@@ -972,10 +960,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
         '--escrow', 'DIRECT://eee',
       ], sphere);
 
@@ -992,10 +978,8 @@ describe('SwapModule CLI Commands', () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', 'DIRECT://party_a_aaa111',
-        '--offer-coin', 'UCT',
-        '--offer-amount', '1000000',
-        '--want-coin', 'USDU',
-        '--want-amount', '500000',
+        '--offer', '1000000 UCT',
+        '--want', '500000 USDU',
         '--escrow', 'DIRECT://eee',
       ], sphere);
 
