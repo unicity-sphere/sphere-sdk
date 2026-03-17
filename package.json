@@ -86,6 +86,9 @@
       }
     }
   },
+  "bin": {
+    "sphere-cli": "./cli/bin.mjs"
+  },
   "files": [
     "dist",
     "README.md",
@@ -100,7 +103,6 @@
     "test:run": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:relay": "vitest run --config vitest.relay.config.ts",
-    "test:daemon": "vitest run --config vitest.daemon.config.ts",
     "lint": "eslint . --ext .ts",
     "typecheck": "tsc --noEmit",
     "cli": "npx tsx cli/index.ts"
@@ -126,7 +128,6 @@
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
-    "canonicalize": "^2.1.0",
     "crypto-js": "^4.2.0",
     "elliptic": "^6.6.1"
   },
