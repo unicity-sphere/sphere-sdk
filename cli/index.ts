@@ -1103,6 +1103,30 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
 
+  'swap-reject': {
+    usage: 'swap-reject <swap_id> [reason]',
+    description: 'Reject an incoming swap proposal. Sends a rejection DM to the proposer and marks the swap as cancelled.',
+    examples: [
+      'npm run cli -- swap-reject a1b2c3d4...full64hex...',
+      'npm run cli -- swap-reject a1b2c3d4...full64hex... "Price too high"',
+    ],
+    notes: [
+      'Only works on proposals you received (role: acceptor, progress: proposed).',
+      'The optional reason is included in the rejection DM sent to the proposer.',
+    ],
+  },
+  'swap-cancel': {
+    usage: 'swap-cancel <swap_id>',
+    description: 'Cancel a swap you proposed or accepted. Works before deposits are confirmed by the escrow.',
+    examples: [
+      'npm run cli -- swap-cancel a1b2c3d4...full64hex...',
+    ],
+    notes: [
+      'Pre-deposit cancellation is local only (no escrow notification).',
+      'Post-deposit cancellation: escrow handles timeout and returns deposits automatically.',
+    ],
+  },
+
   // --- DAEMON ---
   'daemon': {
     usage: 'daemon <start|stop|status> [options]',
@@ -1418,6 +1442,8 @@ SWAPS:
   swap-accept <id>                  Accept a swap deal
   swap-status <id>                  Show swap status
   swap-deposit <id>                 Deposit into a swap
+  swap-reject <id> [reason]        Reject a swap proposal
+  swap-cancel <id>                 Cancel a swap
 
 EVENT DAEMON:
   daemon start                      Start persistent event listener
@@ -4494,6 +4520,63 @@ async function main() {
         break;
       }
 
+      case 'swap-reject': {
+        const swapId = args[1];
+        if (!swapId) {
+          console.error('Usage: swap-reject <swap_id> [reason]');
+          process.exit(1);
+        }
+        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+          console.error('Invalid swap ID — must be 64 hex characters');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        // Optional reason from remaining args
+        const reason = args.slice(2).filter((a: string) => !a.startsWith('--')).join(' ') || undefined;
+
+        await swapModule.rejectSwap(swapId, reason);
+        console.log(`Swap ${swapId.slice(0, 8)}... rejected.${reason ? ` Reason: ${reason}` : ''}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-cancel': {
+        const swapId = args[1];
+        if (!swapId) {
+          console.error('Usage: swap-cancel <swap_id>');
+          process.exit(1);
+        }
+        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
+          console.error('Invalid swap ID — must be 64 hex characters');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        await swapModule.cancelSwap(swapId);
+        console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
+
+        await closeSphere();
+        break;
+      }
+
       case 'daemon': {
         const sub = args[1] || 'start';
         const { runDaemon, stopDaemon, statusDaemon } = await import('./daemon.js');
@@ -4621,6 +4704,8 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'swap-accept', description: 'Accept a swap deal', flags: ['--deposit', '--no-wait'] },
     { name: 'swap-status', description: 'Show swap status', flags: ['--query-escrow'] },
     { name: 'swap-deposit', description: 'Deposit into a swap' },
+    { name: 'swap-reject', description: 'Reject a swap proposal' },
+    { name: 'swap-cancel', description: 'Cancel a swap' },
     { name: 'market-post', description: 'Post a market intent', flags: ['--type', '--category', '--price', '--currency', '--location', '--contact', '--expires'] },
     { name: 'market-search', description: 'Search market intents', flags: ['--type', '--category', '--min-price', '--max-price', '--limit'] },
     { name: 'market-my', description: 'List your intents' },
