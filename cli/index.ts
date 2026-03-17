@@ -208,19 +208,63 @@ async function closeSphere(): Promise<void> {
   }
 }
 
-async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
-  if (skip) return;
-  try {
-    console.log('Syncing with IPFS...');
-    const result = await sphere.payments.sync();
-    if (result.added > 0 || result.removed > 0) {
-      console.log(`  Synced: +${result.added} added, -${result.removed} removed`);
-    } else {
-      console.log('  Up to date.');
+/**
+ * Ensure wallet state is synced before reading:
+ * 1. Wait for Nostr transport to deliver pending wallet events (DMs, transfers)
+ * 2. Process incoming transfers (receive)
+ * 3. Sync with IPFS
+ *
+ * Replaces the old syncIfEnabled(). All CLI commands that read wallet state
+ * should call this before accessing in-memory data.
+ */
+async function ensureSync(sphere: Sphere, options?: {
+  skipIpfs?: boolean;
+  skipReceive?: boolean;
+  skipNostr?: boolean;
+  silent?: boolean;
+}): Promise<void> {
+  const silent = options?.silent ?? false;
+
+  // Step 1: Fetch pending Nostr wallet events (one-shot EOSE-bounded query).
+  // This ensures DMs (swap proposals, invoice receipts, etc.) are processed
+  // before we read in-memory state.
+  if (!options?.skipNostr) {
+    try {
+      const transport = sphere.getTransport();
+      if (transport.isConnected() && transport.fetchPendingEvents) {
+        if (!silent) console.log('Syncing...');
+        await transport.fetchPendingEvents();
+      }
+    } catch {
+      // Non-critical — continue with whatever state we have
     }
-  } catch (err) {
-    console.warn(`  Sync warning: ${err instanceof Error ? err.message : err}`);
   }
+
+  // Step 2: Process incoming transfers (token receive)
+  if (!options?.skipReceive) {
+    try {
+      const result = await sphere.payments.receive();
+      if (result.transfers?.length > 0 && !silent) {
+        console.log(`  Received ${result.transfers.length} transfer(s)`);
+      }
+    } catch {
+      // Non-critical — continue
+    }
+  }
+
+  // Step 3: IPFS sync
+  if (!options?.skipIpfs) {
+    try {
+      const result = await sphere.payments.sync();
+      if ((result.added > 0 || result.removed > 0) && !silent) {
+        console.log(`  IPFS: +${result.added} added, -${result.removed} removed`);
+      }
+    } catch {
+      // Non-critical — continue
+    }
+  }
+
+  if (!silent) console.log('  Ready.');
 }
 
 // =============================================================================
@@ -775,7 +819,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await syncIfEnabled(sphere, noSync);
+        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: true, skipNostr: noSync });
 
         console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
         const result = await sphere.payments.receive({
@@ -842,7 +886,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await syncIfEnabled(sphere, noSync);
+        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: noSync, skipNostr: noSync });
 
         const tokens = sphere.payments.getTokens();
         const registry = TokenRegistry.getInstance();
@@ -1026,7 +1070,7 @@ async function main() {
 
       case 'sync': {
         const sphere = await getSphere();
-        await syncIfEnabled(sphere, false);
+        await ensureSync(sphere);
         await closeSphere();
         break;
       }
@@ -1108,7 +1152,7 @@ async function main() {
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
         const noSyncSend = args.includes('--no-sync');
-        await syncIfEnabled(sphere, noSyncSend);
+        await ensureSync(sphere, { skipIpfs: noSyncSend, skipReceive: true, skipNostr: true, silent: true });
         await closeSphere();
         break;
       }
@@ -1168,7 +1212,7 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
-        await syncIfEnabled(sphere, noSyncRecv);
+        await ensureSync(sphere, { skipIpfs: noSyncRecv, skipReceive: true, skipNostr: true, silent: true });
         await closeSphere();
         break;
       }
@@ -1176,8 +1220,10 @@ async function main() {
       case 'history': {
         const [, limitStr = '10'] = args;
         const limit = parseInt(limitStr);
+        const noSync = args.includes('--no-sync');
 
         const sphere = await getSphere();
+        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: noSync, skipNostr: noSync });
         const history = sphere.payments.getHistory();
         const limited = history.slice(0, limit);
 
