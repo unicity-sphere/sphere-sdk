@@ -253,19 +253,63 @@ const FAUCET_COIN_MAP: Record<string, string> = {
   'USDU': 'unicity-usd', 'EURU': 'unicity-eur', 'ALPHT': 'alpha-token',
 };
 
-async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
-  if (skip) return;
-  try {
-    console.log('Syncing with IPFS...');
-    const result = await sphere.payments.sync();
-    if (result.added > 0 || result.removed > 0) {
-      console.log(`  Synced: +${result.added} added, -${result.removed} removed`);
-    } else {
-      console.log('  Up to date.');
+/**
+ * Ensure wallet state is synced before reading:
+ * 1. Wait for Nostr transport to deliver pending wallet events (DMs, transfers)
+ * 2. Process incoming transfers (receive)
+ * 3. Sync with IPFS
+ *
+ * Replaces the old syncIfEnabled(). All CLI commands that read wallet state
+ * should call this before accessing in-memory data.
+ */
+async function ensureSync(sphere: Sphere, options?: {
+  skipIpfs?: boolean;
+  skipReceive?: boolean;
+  skipNostr?: boolean;
+  silent?: boolean;
+}): Promise<void> {
+  const silent = options?.silent ?? false;
+
+  // Step 1: Fetch pending Nostr wallet events (one-shot EOSE-bounded query).
+  // This ensures DMs (swap proposals, invoice receipts, etc.) are processed
+  // before we read in-memory state.
+  if (!options?.skipNostr) {
+    try {
+      const transport = sphere.getTransport();
+      if (transport.isConnected() && transport.fetchPendingEvents) {
+        if (!silent) console.log('Syncing...');
+        await transport.fetchPendingEvents();
+      }
+    } catch {
+      // Non-critical — continue with whatever state we have
     }
-  } catch (err) {
-    console.warn(`  Sync warning: ${err instanceof Error ? err.message : err}`);
   }
+
+  // Step 2: Process incoming transfers (token receive)
+  if (!options?.skipReceive) {
+    try {
+      const result = await sphere.payments.receive();
+      if (result.transfers?.length > 0 && !silent) {
+        console.log(`  Received ${result.transfers.length} transfer(s)`);
+      }
+    } catch {
+      // Non-critical — continue
+    }
+  }
+
+  // Step 3: IPFS sync
+  if (!options?.skipIpfs) {
+    try {
+      const result = await sphere.payments.sync();
+      if ((result.added > 0 || result.removed > 0) && !silent) {
+        console.log(`  IPFS: +${result.added} added, -${result.removed} removed`);
+      }
+    } catch {
+      // Non-critical — continue
+    }
+  }
+
+  if (!silent) console.log('  Ready.');
 }
 
 // =============================================================================
@@ -568,10 +612,11 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
   'history': {
-    usage: 'history [limit]',
+    usage: 'history [limit] [--no-sync]',
     description: 'Show transaction history ordered by most recent first. Each entry shows date, direction, amount, coin, and counterparty.',
     flags: [
       { flag: '<limit>', description: 'Maximum number of transactions to show', default: '10' },
+      { flag: '--no-sync', description: 'Skip sync before showing history' },
     ],
     examples: [
       'npm run cli -- history',
@@ -1745,7 +1790,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await syncIfEnabled(sphere, noSync);
+        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: true, skipNostr: noSync });
 
         console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
         const result = await sphere.payments.receive({
@@ -1812,7 +1857,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await syncIfEnabled(sphere, noSync);
+        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: noSync, skipNostr: noSync });
 
         const tokens = sphere.payments.getTokens();
         const registry = TokenRegistry.getInstance();
@@ -1966,6 +2011,7 @@ async function main() {
         const verbose = args.includes('--verbose') || args.includes('-v');
 
         const sphere = await getSphere();
+        await ensureSync(sphere);
         const tokens = sphere.payments.getTokens();
         const identity = sphere.identity;
 
@@ -2094,7 +2140,7 @@ async function main() {
 
       case 'sync': {
         const sphere = await getSphere();
-        await syncIfEnabled(sphere, false);
+        await ensureSync(sphere);
         await closeSphere();
         break;
       }
@@ -2172,7 +2218,7 @@ async function main() {
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
         const noSyncSend = args.includes('--no-sync');
-        await syncIfEnabled(sphere, noSyncSend);
+        await ensureSync(sphere, { skipIpfs: noSyncSend, skipReceive: true, skipNostr: true, silent: true });
         await closeSphere();
         break;
       }
@@ -2232,7 +2278,7 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
-        await syncIfEnabled(sphere, noSyncRecv);
+        await ensureSync(sphere, { skipIpfs: noSyncRecv, skipReceive: true, skipNostr: true, silent: true });
         await closeSphere();
         break;
       }
@@ -2240,8 +2286,10 @@ async function main() {
       case 'history': {
         const [, limitStr = '10'] = args;
         const limit = parseInt(limitStr);
+        const noSync = args.includes('--no-sync');
 
         const sphere = await getSphere();
+        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: noSync, skipNostr: noSync });
         const history = sphere.payments.getHistory();
         const limited = history.slice(0, limit);
 
@@ -2803,6 +2851,7 @@ async function main() {
 
       case 'dm-inbox': {
         const sphere = await getSphere();
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
         const conversations = sphere.communications.getConversations();
         const totalUnread = sphere.communications.getUnreadCount();
 
@@ -2847,6 +2896,7 @@ async function main() {
         const limit = limitIndex !== -1 && args[limitIndex + 1] ? parseInt(args[limitIndex + 1]) : 50;
 
         const sphere = await getSphere();
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
 
         // Resolve @nametag to pubkey if needed
         let peerPubkey = peer;
@@ -3597,6 +3647,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const stateIdx = args.indexOf('--state');
         const limitIdx2 = args.indexOf('--limit');
@@ -3658,6 +3709,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         // Resolve ID from prefix
         const allInvoices = await sphere.accounting.getInvoices();
@@ -3692,6 +3744,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -3725,6 +3778,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -3757,6 +3811,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -3979,6 +4034,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -4121,6 +4177,7 @@ async function main() {
           console.error('Swap module not enabled. Initialize with swap support.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
         const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
@@ -4164,6 +4221,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const filter: any = {};
@@ -4273,6 +4331,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         await swapModule.acceptSwap(swapId);
         console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
@@ -4348,6 +4407,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
         console.log('Swap Status:');
@@ -4385,6 +4445,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
+        await ensureSync(sphere, { skipIpfs: true });
 
         const result = await swapModule.deposit(swapId);
         console.log('Deposit result:');
