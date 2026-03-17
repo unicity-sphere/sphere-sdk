@@ -788,7 +788,7 @@ export class SwapModule {
     const manifest = buildManifest(resolvedPartyA, resolvedPartyB, deal, deal.timeout);
     const swapId = manifest.swap_id;
 
-    // Step 8: Check for duplicate (idempotent)
+    // Step 8: Check for duplicate (idempotent for active swaps)
     const existingSwap = this.swaps.get(swapId);
     if (existingSwap) {
       return {
@@ -797,6 +797,10 @@ export class SwapModule {
         swap: { ...existingSwap, deal: { ...existingSwap.deal }, manifest: { ...existingSwap.manifest } },
       };
     }
+
+    // Allow re-proposing a previously rejected/cancelled/failed swap
+    // (same deal → same swap_id, but user explicitly wants to try again)
+    this.terminalSwapIds.delete(swapId);
 
     // Step 9: Create SwapRef
     const now = Date.now();
@@ -1633,6 +1637,9 @@ export class SwapModule {
             const deps = this.deps!;
 
             await this.withSwapGate(swapId, async () => {
+              // Skip if already terminal (e.g., replayed rejection DM)
+              if (isTerminalProgress(swap.progress)) return;
+
               // Clear proposal timer
               this.clearLocalTimer(swapId);
 
