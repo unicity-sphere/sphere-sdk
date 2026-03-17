@@ -2,7 +2,7 @@
  * CLI integration tests for market commands.
  *
  * Spawns the CLI as a subprocess and verifies:
- * - Help text lists all 5 intent types and the market-feed command
+ * - Help text lists market commands in the MARKET section
  * - market-post sends correct intent_type for each type
  * - market-search sends correct type filter for each type
  * - market-feed --rest fetches recent listings
@@ -46,28 +46,30 @@ describe('Market CLI commands', () => {
   // ---------------------------------------------------------------------------
 
   describe('help text', () => {
-    it('should list all 5 intent types in market-post description', async () => {
+    it('should list market-post command with --type flag in help', async () => {
       const { stdout } = await runCli(['--help']);
-      expect(stdout).toContain('buy, sell, service, announcement, other');
+      expect(stdout).toContain('market-post');
+      expect(stdout).toContain('--type');
     });
 
     it('should include market-feed command in help', async () => {
       const { stdout } = await runCli(['--help']);
       expect(stdout).toContain('market-feed');
-      expect(stdout).toContain('--rest');
+      expect(stdout).toContain('Watch the live listing feed');
     });
 
-    it('should include market-feed in examples section', async () => {
+    it('should include market commands in MARKET section', async () => {
       const { stdout } = await runCli(['--help']);
+      expect(stdout).toContain('MARKET:');
+      expect(stdout).toContain('market-post');
+      expect(stdout).toContain('market-search');
       expect(stdout).toContain('market-feed');
-      // Both live and REST examples
-      expect(stdout).toMatch(/market-feed\b/);
-      expect(stdout).toMatch(/market-feed --rest/);
     });
 
-    it('should include announcement example in market examples', async () => {
+    it('should include market-close and market-my in help', async () => {
       const { stdout } = await runCli(['--help']);
-      expect(stdout).toContain('--type announcement');
+      expect(stdout).toContain('market-close');
+      expect(stdout).toContain('market-my');
     });
   });
 

@@ -241,203 +241,1019 @@ function _prompt(question: string): Promise<string> {
   });
 }
 
+// =============================================================================
+// Per-command help definitions
+// =============================================================================
+
+interface CommandHelp {
+  usage: string;
+  description: string;
+  flags?: Array<{ flag: string; description: string; default?: string }>;
+  examples: string[];
+  notes?: string[];
+}
+
+const COMMAND_HELP: Record<string, CommandHelp> = {
+  // --- WALLET ---
+  'init': {
+    usage: 'init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]',
+    description: 'Create a new wallet or import an existing one from a mnemonic phrase. If no mnemonic is provided, a new 24-word mnemonic is generated automatically.',
+    flags: [
+      { flag: '--network <net>', description: 'Network to use (mainnet, testnet, dev)', default: 'testnet' },
+      { flag: '--mnemonic "<words>"', description: 'Import wallet from BIP-39 mnemonic phrase (24 words in quotes)' },
+      { flag: '--nametag <name>', description: 'Register a nametag during initialization (mints on-chain)' },
+      { flag: '--no-nostr', description: 'Disable Nostr transport (use no-op transport)' },
+    ],
+    examples: [
+      'npm run cli -- init --network testnet',
+      'npm run cli -- init --mnemonic "word1 word2 ... word24"',
+      'npm run cli -- init --nametag alice --network mainnet',
+    ],
+    notes: [
+      'If a wallet already exists in the current profile, it will be loaded instead of creating a new one.',
+      'Back up the generated mnemonic immediately -- it cannot be retrieved later.',
+    ],
+  },
+  'status': {
+    usage: 'status',
+    description: 'Show wallet identity information including L1 address, Direct address, chain public key, nametag, and current network/profile.',
+    examples: [
+      'npm run cli -- status',
+    ],
+  },
+  'config': {
+    usage: 'config [set <key> <value>]',
+    description: 'Show current CLI configuration or update a specific setting. Without arguments, displays all config values as JSON.',
+    flags: [
+      { flag: 'set network <value>', description: 'Set network (mainnet, testnet, dev)' },
+      { flag: 'set dataDir <path>', description: 'Set wallet data directory path' },
+      { flag: 'set tokensDir <path>', description: 'Set token storage directory path' },
+    ],
+    examples: [
+      'npm run cli -- config',
+      'npm run cli -- config set network mainnet',
+      'npm run cli -- config set dataDir ./.my-wallet',
+    ],
+  },
+  'clear': {
+    usage: 'clear',
+    description: 'Delete all wallet data including keys, tokens, and storage. This is irreversible -- make sure you have your mnemonic backed up.',
+    examples: [
+      'npm run cli -- clear',
+    ],
+    notes: [
+      'This deletes everything in the current profile data and token directories.',
+    ],
+  },
+  'wallet list': {
+    usage: 'wallet list',
+    description: 'List all wallet profiles with their network and data directory. The current active profile is marked with an arrow.',
+    examples: [
+      'npm run cli -- wallet list',
+    ],
+  },
+  'wallet create': {
+    usage: 'wallet create <name> [--network <net>]',
+    description: 'Create a new wallet profile and switch to it. The profile stores its data in .sphere-cli-<name>/. After creating, run "init" to initialize the wallet.',
+    flags: [
+      { flag: '--network <net>', description: 'Network for the profile (mainnet, testnet, dev)', default: 'testnet' },
+    ],
+    examples: [
+      'npm run cli -- wallet create alice',
+      'npm run cli -- wallet create bob --network mainnet',
+    ],
+    notes: [
+      'Profile names must be unique. After creation, initialize with: npm run cli -- init --nametag <name>',
+    ],
+  },
+  'wallet use': {
+    usage: 'wallet use <name>',
+    description: 'Switch the active wallet profile. All subsequent commands will operate on this profile.',
+    examples: [
+      'npm run cli -- wallet use alice',
+    ],
+  },
+  'wallet current': {
+    usage: 'wallet current',
+    description: 'Show the currently active wallet profile, its network, data directory, and identity (if initialized).',
+    examples: [
+      'npm run cli -- wallet current',
+    ],
+  },
+  'wallet delete': {
+    usage: 'wallet delete <name>',
+    description: 'Remove a wallet profile from the profiles list. The on-disk data directory is NOT deleted -- remove it manually if needed.',
+    examples: [
+      'npm run cli -- wallet delete bob',
+    ],
+    notes: [
+      'Cannot delete the currently active profile. Switch to a different profile first.',
+    ],
+  },
+
+  // --- BALANCE & TOKENS ---
+  'balance': {
+    usage: 'balance [--finalize] [--no-sync]',
+    description: 'Show L3 token balance grouped by coin. Receives any pending incoming transfers before displaying. Shows confirmed and unconfirmed amounts, token counts, and USD value.',
+    flags: [
+      { flag: '--finalize', description: 'Wait for unconfirmed tokens to be finalized (may take several seconds)' },
+      { flag: '--no-sync', description: 'Skip IPFS sync before showing balance' },
+    ],
+    examples: [
+      'npm run cli -- balance',
+      'npm run cli -- balance --finalize',
+      'npm run cli -- balance --no-sync',
+    ],
+  },
+  'tokens': {
+    usage: 'tokens [--no-sync]',
+    description: 'List all individual tokens with their ID, coin type, amount, and status.',
+    flags: [
+      { flag: '--no-sync', description: 'Skip IPFS sync before listing tokens' },
+    ],
+    examples: [
+      'npm run cli -- tokens',
+      'npm run cli -- tokens --no-sync',
+    ],
+  },
+  'l1-balance': {
+    usage: 'l1-balance',
+    description: 'Show L1 (ALPHA blockchain) balance including confirmed and unconfirmed amounts. Connects to Fulcrum electrum server on first use.',
+    examples: [
+      'npm run cli -- l1-balance',
+    ],
+  },
+  'topup': {
+    usage: 'topup [coin] [amount]',
+    description: 'Request test tokens from the Unicity faucet. Without arguments, requests default amounts of all supported coins. With a coin name, requests a specific coin.',
+    flags: [
+      { flag: '<coin>', description: 'Coin name: unicity, bitcoin, ethereum, solana, tether, usd-coin, unicity-usd' },
+      { flag: '<amount>', description: 'Amount to request (overrides default)' },
+    ],
+    examples: [
+      'npm run cli -- topup',
+      'npm run cli -- topup bitcoin 2',
+      'npm run cli -- topup ethereum 100',
+    ],
+    notes: [
+      'Requires a registered nametag. The faucet is only available on testnet.',
+      'Also accessible as "top-up" or "faucet".',
+    ],
+  },
+  'verify-balance': {
+    usage: 'verify-balance [--remove] [-v|--verbose]',
+    description: 'Verify all tokens against the aggregator to detect spent tokens that were not properly removed from local storage. Useful for cleaning up stale token state.',
+    flags: [
+      { flag: '--remove', description: 'Move detected spent tokens to the Sent (archive) folder' },
+      { flag: '-v, --verbose', description: 'Show all tokens, not just spent ones; show progress and errors' },
+    ],
+    examples: [
+      'npm run cli -- verify-balance',
+      'npm run cli -- verify-balance --verbose',
+      'npm run cli -- verify-balance --remove',
+    ],
+  },
+  'sync': {
+    usage: 'sync',
+    description: 'Sync tokens with IPFS remote storage. Uploads local tokens and downloads any tokens stored remotely.',
+    examples: [
+      'npm run cli -- sync',
+    ],
+  },
+
+  // --- TRANSFERS ---
+  'send': {
+    usage: 'send <recipient> <amount> [--coin <sym>] [--direct|--proxy] [--instant|--conservative] [--no-sync]',
+    description: 'Send L3 tokens to a recipient. The recipient can be a @nametag, DIRECT:// address, chain public key (02/03 prefix), or alpha1... L1 address. Amount is in decimal (e.g., 0.5) and is converted to smallest units automatically.',
+    flags: [
+      { flag: '--coin <sym>', description: 'Token symbol (UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT)', default: 'UCT' },
+      { flag: '--direct', description: 'Force DirectAddress transfer (requires nametag with directAddress)' },
+      { flag: '--proxy', description: 'Force PROXY address transfer (works with any nametag)' },
+      { flag: '--instant', description: 'Send immediately via Nostr; receiver gets unconfirmed token', default: 'yes' },
+      { flag: '--conservative', description: 'Collect all proofs first; receiver gets confirmed token' },
+      { flag: '--no-sync', description: 'Skip IPFS sync after sending' },
+    ],
+    examples: [
+      'npm run cli -- send @alice 1000000',
+      'npm run cli -- send @alice 0.5 --coin BTC',
+      'npm run cli -- send DIRECT://0000be36... 500000 --mode conservative',
+      'npm run cli -- send @bob 100 --coin USDU --no-sync',
+    ],
+    notes: [
+      'Cannot use both --direct and --proxy simultaneously.',
+      'Cannot use both --instant and --conservative simultaneously.',
+    ],
+  },
+  'receive': {
+    usage: 'receive [--finalize] [--no-sync]',
+    description: 'Check for incoming token transfers via Nostr. Displays receive addresses and fetches any pending transfers.',
+    flags: [
+      { flag: '--finalize', description: 'Wait for unconfirmed tokens to be finalized before returning' },
+      { flag: '--no-sync', description: 'Skip IPFS sync after receiving' },
+    ],
+    examples: [
+      'npm run cli -- receive',
+      'npm run cli -- receive --finalize',
+    ],
+  },
+  'history': {
+    usage: 'history [limit]',
+    description: 'Show transaction history ordered by most recent first. Each entry shows date, direction, amount, coin, and counterparty.',
+    flags: [
+      { flag: '<limit>', description: 'Maximum number of transactions to show', default: '10' },
+    ],
+    examples: [
+      'npm run cli -- history',
+      'npm run cli -- history 20',
+    ],
+  },
+
+  // --- ADDRESSES ---
+  'addresses': {
+    usage: 'addresses',
+    description: 'List all tracked HD addresses with their index, L1 address, DIRECT address, nametag, and hidden status. The currently active address is marked with an arrow.',
+    examples: [
+      'npm run cli -- addresses',
+    ],
+  },
+  'switch': {
+    usage: 'switch <index>',
+    description: 'Switch to a different HD-derived address by index. Index 0 is the default. New addresses are created on first switch.',
+    examples: [
+      'npm run cli -- switch 1',
+      'npm run cli -- switch 0',
+    ],
+  },
+  'hide': {
+    usage: 'hide <index>',
+    description: 'Hide an address from the active address list. Hidden addresses are excluded from getActiveAddresses() but still tracked.',
+    examples: [
+      'npm run cli -- hide 2',
+    ],
+  },
+  'unhide': {
+    usage: 'unhide <index>',
+    description: 'Unhide a previously hidden address, making it visible in the active address list again.',
+    examples: [
+      'npm run cli -- unhide 2',
+    ],
+  },
+
+  // --- NAMETAGS ---
+  'nametag': {
+    usage: 'nametag <name>',
+    description: 'Register a nametag (@name) for the current address. Mints a nametag token on-chain and publishes to Nostr relay. The name should not include the @ prefix.',
+    examples: [
+      'npm run cli -- nametag alice',
+      'npm run cli -- nametag myname',
+    ],
+  },
+  'nametag-info': {
+    usage: 'nametag-info <name>',
+    description: 'Look up information about a nametag, including the associated public key and addresses. Resolves via the Nostr relay.',
+    examples: [
+      'npm run cli -- nametag-info alice',
+      'npm run cli -- nametag-info bob',
+    ],
+  },
+  'my-nametag': {
+    usage: 'my-nametag',
+    description: 'Show the nametag registered for the current address.',
+    examples: [
+      'npm run cli -- my-nametag',
+    ],
+  },
+  'nametag-sync': {
+    usage: 'nametag-sync',
+    description: 'Re-publish the current nametag identity binding with chainPubkey. Useful for fixing legacy nametags that were registered without the chainPubkey field.',
+    examples: [
+      'npm run cli -- nametag-sync',
+    ],
+  },
+
+  // --- MESSAGING ---
+  'dm': {
+    usage: 'dm <@nametag|pubkey> <message>',
+    description: 'Send an encrypted direct message to a peer via Nostr (NIP-17 gift-wrapped).',
+    examples: [
+      'npm run cli -- dm @alice "Hello, how are you?"',
+      'npm run cli -- dm @bob "Payment sent for order #42"',
+    ],
+  },
+  'dm-inbox': {
+    usage: 'dm-inbox',
+    description: 'List all DM conversations with unread counts and last message preview.',
+    examples: [
+      'npm run cli -- dm-inbox',
+    ],
+  },
+  'dm-history': {
+    usage: 'dm-history <@nametag|pubkey> [--limit <n>]',
+    description: 'Show message history for a specific conversation. Resolves @nametag to pubkey automatically.',
+    flags: [
+      { flag: '--limit <n>', description: 'Maximum number of messages to display', default: '50' },
+    ],
+    examples: [
+      'npm run cli -- dm-history @alice',
+      'npm run cli -- dm-history @alice --limit 20',
+    ],
+  },
+
+  // --- GROUP CHAT ---
+  'group-create': {
+    usage: 'group-create <name> [--description <text>] [--private]',
+    description: 'Create a new NIP-29 group chat on the relay.',
+    flags: [
+      { flag: '--description <text>', description: 'Group description text' },
+      { flag: '--private', description: 'Create a private (invite-only) group' },
+    ],
+    examples: [
+      'npm run cli -- group-create "Trading Chat"',
+      'npm run cli -- group-create "Team Alpha" --description "Internal team chat" --private',
+    ],
+  },
+  'group-list': {
+    usage: 'group-list',
+    description: 'List all available public groups on the relay with their names, IDs, descriptions, and member counts.',
+    examples: [
+      'npm run cli -- group-list',
+    ],
+  },
+  'group-my': {
+    usage: 'group-my',
+    description: 'List groups you have joined, with unread message counts and last message preview.',
+    examples: [
+      'npm run cli -- group-my',
+    ],
+  },
+  'group-join': {
+    usage: 'group-join <groupId> [--invite <code>]',
+    description: 'Join a group by its ID. Private groups require an invite code.',
+    flags: [
+      { flag: '--invite <code>', description: 'Invite code for private groups' },
+    ],
+    examples: [
+      'npm run cli -- group-join tradingchat',
+      'npm run cli -- group-join privatechat --invite abc123',
+    ],
+  },
+  'group-leave': {
+    usage: 'group-leave <groupId>',
+    description: 'Leave a group you have previously joined.',
+    examples: [
+      'npm run cli -- group-leave tradingchat',
+    ],
+  },
+  'group-send': {
+    usage: 'group-send <groupId> <message> [--reply <eventId>]',
+    description: 'Send a message to a group. Optionally reply to a specific message by event ID.',
+    flags: [
+      { flag: '--reply <eventId>', description: 'Event ID of the message to reply to' },
+    ],
+    examples: [
+      'npm run cli -- group-send tradingchat "Hello everyone!"',
+      'npm run cli -- group-send tradingchat "I agree" --reply abc123def',
+    ],
+  },
+  'group-messages': {
+    usage: 'group-messages <groupId> [--limit <n>]',
+    description: 'Show recent messages in a group. Fetches from relay and marks the group as read.',
+    flags: [
+      { flag: '--limit <n>', description: 'Maximum number of messages to display', default: '50' },
+    ],
+    examples: [
+      'npm run cli -- group-messages tradingchat',
+      'npm run cli -- group-messages tradingchat --limit 20',
+    ],
+  },
+  'group-members': {
+    usage: 'group-members <groupId>',
+    description: 'List members of a group with their nametags, roles (ADMIN/MOD), and join dates.',
+    examples: [
+      'npm run cli -- group-members tradingchat',
+    ],
+  },
+  'group-info': {
+    usage: 'group-info <groupId>',
+    description: 'Show detailed information about a group including name, visibility, description, member count, creation date, and relay URL.',
+    examples: [
+      'npm run cli -- group-info tradingchat',
+    ],
+  },
+
+  // --- MARKET ---
+  'market-post': {
+    usage: 'market-post <description> --type <type> [options]',
+    description: 'Post an intent to the market bulletin board. Type is required.',
+    flags: [
+      { flag: '--type <type>', description: 'Intent type: buy, sell, service, announcement, other (required)' },
+      { flag: '--category <cat>', description: 'Intent category for filtering' },
+      { flag: '--price <n>', description: 'Price amount (numeric)' },
+      { flag: '--currency <code>', description: 'Currency code (USD, UCT, etc.)' },
+      { flag: '--location <loc>', description: 'Location for geographic filtering' },
+      { flag: '--contact <handle>', description: 'Contact handle (e.g., @nametag, email)' },
+      { flag: '--expires <days>', description: 'Expiration in days', default: '30' },
+    ],
+    examples: [
+      'npm run cli -- market-post "Buying 100 UCT" --type buy',
+      'npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD',
+      'npm run cli -- market-post "Web dev services" --type service --contact @alice',
+    ],
+  },
+  'market-search': {
+    usage: 'market-search <query> [options]',
+    description: 'Search the market bulletin board using semantic search. Returns intents ranked by relevance score.',
+    flags: [
+      { flag: '--type <type>', description: 'Filter by intent type' },
+      { flag: '--category <cat>', description: 'Filter by category' },
+      { flag: '--min-price <n>', description: 'Minimum price filter' },
+      { flag: '--max-price <n>', description: 'Maximum price filter' },
+      { flag: '--min-score <0-1>', description: 'Minimum similarity score threshold' },
+      { flag: '--location <loc>', description: 'Location filter' },
+      { flag: '--limit <n>', description: 'Maximum results to return', default: '10' },
+    ],
+    examples: [
+      'npm run cli -- market-search "UCT tokens" --type sell --limit 5',
+      'npm run cli -- market-search "tokens" --min-score 0.7',
+      'npm run cli -- market-search "services" --min-price 10 --max-price 100',
+    ],
+  },
+  'market-my': {
+    usage: 'market-my',
+    description: 'List all intents you have posted to the market.',
+    examples: [
+      'npm run cli -- market-my',
+    ],
+  },
+  'market-close': {
+    usage: 'market-close <id>',
+    description: 'Close (delete) one of your market intents by its ID.',
+    examples: [
+      'npm run cli -- market-close abc123',
+    ],
+  },
+  'market-feed': {
+    usage: 'market-feed [--rest]',
+    description: 'Watch the live market listing feed via WebSocket. Shows new intents in real time. Use --rest for a one-shot fetch instead.',
+    flags: [
+      { flag: '--rest', description: 'Use REST fallback: fetch recent listings once and exit' },
+    ],
+    examples: [
+      'npm run cli -- market-feed',
+      'npm run cli -- market-feed --rest',
+    ],
+    notes: [
+      'WebSocket mode runs indefinitely. Press Ctrl+C to stop.',
+    ],
+  },
+
+  // --- INVOICES ---
+  'invoice-create': {
+    usage: 'invoice-create --target <address> --coin <id> --amount <value> [options]',
+    description: 'Create a new invoice by specifying a target address and requested payment. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
+    flags: [
+      { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
+      { flag: '--coin <id>', description: 'Coin ID hex (e.g., the hex ID from token registry)' },
+      { flag: '--amount <value>', description: 'Requested amount in smallest units (positive integer, no decimals)' },
+      { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
+      { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
+      { flag: '--memo <text>', description: 'Invoice memo text' },
+      { flag: '--delivery <method>', description: 'Delivery method description' },
+      { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags)' },
+    ],
+    examples: [
+      'npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000',
+      'npm run cli -- invoice-create --target @alice --coin UCT --amount 500000 --memo "Order #42" --due 2026-12-31',
+      'npm run cli -- invoice-create --terms invoice-terms.json',
+    ],
+    notes: [
+      'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+    ],
+  },
+  'invoice-import': {
+    usage: 'invoice-import <token-file>',
+    description: 'Import an invoice from a TXF token JSON file. Parses the invoice terms from the token data and adds it to local tracking.',
+    examples: [
+      'npm run cli -- invoice-import ./received-invoice.json',
+    ],
+  },
+  'invoice-list': {
+    usage: 'invoice-list [--state <states>] [--role <creator|payer>] [--limit <n>]',
+    description: 'List invoices with optional filtering by state and role. States can be comma-separated.',
+    flags: [
+      { flag: '--state <states>', description: 'Filter by state: OPEN, PARTIAL, COVERED, CLOSED, CANCELLED, EXPIRED (comma-separated)' },
+      { flag: '--role <role>', description: 'Filter by role: "creator" (invoices you created) or "payer" (invoices targeting you)' },
+      { flag: '--limit <n>', description: 'Maximum number of invoices to return' },
+    ],
+    examples: [
+      'npm run cli -- invoice-list',
+      'npm run cli -- invoice-list --state OPEN,PARTIAL --limit 5',
+      'npm run cli -- invoice-list --role creator',
+    ],
+  },
+  'invoice-status': {
+    usage: 'invoice-status <id-or-prefix>',
+    description: 'Show detailed invoice status including state, per-target balance breakdown, total forward/back payments, and confirmation status. Accepts full ID or unique prefix.',
+    examples: [
+      'npm run cli -- invoice-status a1b2c3d4',
+      'npm run cli -- invoice-status a1b2c3d4e5f6...',
+    ],
+  },
+  'invoice-close': {
+    usage: 'invoice-close <id-or-prefix> [--auto-return]',
+    description: 'Close an invoice (terminal state). Freezes balances and stops dynamic recomputation. Optionally triggers auto-return for overpayments.',
+    flags: [
+      { flag: '--auto-return', description: 'Trigger auto-return of excess payments on close' },
+    ],
+    examples: [
+      'npm run cli -- invoice-close a1b2c3d4',
+      'npm run cli -- invoice-close a1b2c3d4 --auto-return',
+    ],
+  },
+  'invoice-cancel': {
+    usage: 'invoice-cancel <id-or-prefix>',
+    description: 'Cancel an invoice (terminal state). If auto-return is enabled, payments will be automatically refunded.',
+    examples: [
+      'npm run cli -- invoice-cancel a1b2c3d4',
+    ],
+  },
+  'invoice-pay': {
+    usage: 'invoice-pay <id-or-prefix> [--amount <value>] [--target-index <n>]',
+    description: 'Pay an invoice. By default pays the remaining amount for the first target. For multi-target invoices, specify --target-index.',
+    flags: [
+      { flag: '--amount <value>', description: 'Amount to pay in smallest units (positive integer). Defaults to remaining amount.' },
+      { flag: '--target-index <n>', description: 'Target index for multi-target invoices (0-based)', default: '0' },
+    ],
+    examples: [
+      'npm run cli -- invoice-pay a1b2c3d4',
+      'npm run cli -- invoice-pay a1b2c3d4 --amount 500000',
+      'npm run cli -- invoice-pay a1b2c3d4 --target-index 1 --amount 250000',
+    ],
+  },
+  'invoice-return': {
+    usage: 'invoice-return <id-or-prefix> --recipient <address> --amount <value> --coin <id>',
+    description: 'Manually return a payment to a sender for a specific invoice. All three flags are required.',
+    flags: [
+      { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
+      { flag: '--amount <value>', description: 'Amount to return in smallest units (required)' },
+      { flag: '--coin <id>', description: 'Coin ID hex (required)' },
+    ],
+    examples: [
+      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --amount 100000 --coin UCT',
+    ],
+  },
+  'invoice-receipts': {
+    usage: 'invoice-receipts <id-or-prefix>',
+    description: 'Send payment receipts via DM to each sender who contributed to this invoice. Typically used after closing an invoice.',
+    examples: [
+      'npm run cli -- invoice-receipts a1b2c3d4',
+    ],
+  },
+  'invoice-notices': {
+    usage: 'invoice-notices <id-or-prefix>',
+    description: 'Send cancellation notice DMs to each sender who contributed to a cancelled invoice.',
+    examples: [
+      'npm run cli -- invoice-notices a1b2c3d4',
+    ],
+  },
+  'invoice-auto-return': {
+    usage: 'invoice-auto-return [--enable|--disable] [--invoice <id>]',
+    description: 'Show or configure auto-return settings. Without flags, displays current settings. Auto-return automatically refunds payments received against closed or cancelled invoices.',
+    flags: [
+      { flag: '--enable', description: 'Enable auto-return' },
+      { flag: '--disable', description: 'Disable auto-return' },
+      { flag: '--invoice <id>', description: 'Target a specific invoice (default: global "*" scope)' },
+    ],
+    examples: [
+      'npm run cli -- invoice-auto-return',
+      'npm run cli -- invoice-auto-return --enable',
+      'npm run cli -- invoice-auto-return --disable --invoice a1b2c3d4',
+    ],
+  },
+  'invoice-transfers': {
+    usage: 'invoice-transfers <id-or-prefix>',
+    description: 'List all transfers related to an invoice in chronological order, including forward payments and returns.',
+    examples: [
+      'npm run cli -- invoice-transfers a1b2c3d4',
+    ],
+  },
+  'invoice-export': {
+    usage: 'invoice-export <id-or-prefix>',
+    description: 'Export an invoice to a JSON file. The file is saved as invoice-<prefix>.json in the current directory.',
+    examples: [
+      'npm run cli -- invoice-export a1b2c3d4',
+    ],
+  },
+  'invoice-parse-memo': {
+    usage: 'invoice-parse-memo <memo-string>',
+    description: 'Parse an invoice memo string (INV:...) and display its decoded fields.',
+    examples: [
+      'npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"',
+    ],
+  },
+
+  // --- SWAPS ---
+  'swap-propose': {
+    usage: 'swap-propose --to <recipient> --offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount> [options]',
+    description: 'Propose a token swap deal to a counterparty. Both parties deposit tokens into an escrow, which executes the swap atomically.',
+    flags: [
+      { flag: '--to <recipient>', description: 'Counterparty @nametag or address (required)' },
+      { flag: '--offer-coin <coinId>', description: 'Coin ID you are offering (required)' },
+      { flag: '--offer-amount <amount>', description: 'Amount you are offering in smallest units (required)' },
+      { flag: '--want-coin <coinId>', description: 'Coin ID you want in return (required)' },
+      { flag: '--want-amount <amount>', description: 'Amount you want in return in smallest units (required)' },
+      { flag: '--escrow <address>', description: 'Custom escrow address (optional, uses config default)' },
+      { flag: '--timeout <seconds>', description: 'Swap timeout in seconds (60-86400)', default: '3600' },
+      { flag: '--message <text>', description: 'Optional message to the counterparty' },
+    ],
+    examples: [
+      'npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000',
+      'npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --timeout 7200 --message "Quick trade?"',
+    ],
+    notes: [
+      'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+      'The --to, --offer-coin, --offer-amount, --want-coin, and --want-amount flags are all required.',
+    ],
+  },
+  'swap-list': {
+    usage: 'swap-list [--all] [--role <proposer|acceptor>] [--progress <state>]',
+    description: 'List swap deals. By default shows only open and in-progress swaps. Use --all to include completed/cancelled/failed swaps.',
+    flags: [
+      { flag: '--all', description: 'Include terminal states (completed, cancelled, failed)' },
+      { flag: '--role <role>', description: 'Filter by your role: "proposer" or "acceptor"' },
+      { flag: '--progress <state>', description: 'Filter by progress state' },
+    ],
+    examples: [
+      'npm run cli -- swap-list',
+      'npm run cli -- swap-list --all',
+      'npm run cli -- swap-list --role proposer',
+      'npm run cli -- swap-list --all --role proposer',
+    ],
+  },
+  'swap-accept': {
+    usage: 'swap-accept <swap_id> [--deposit] [--no-wait]',
+    description: 'Accept a proposed swap deal by its full 64-character hex ID. Announces acceptance to the escrow.',
+    flags: [
+      { flag: '--deposit', description: 'Immediately deposit after accepting' },
+      { flag: '--no-wait', description: 'Do not wait for swap completion after depositing (only with --deposit)' },
+    ],
+    examples: [
+      'npm run cli -- swap-accept a1b2c3d4...full64hex...',
+      'npm run cli -- swap-accept a1b2c3d4...full64hex... --deposit',
+      'npm run cli -- swap-accept a1b2c3d4...full64hex... --deposit --no-wait',
+    ],
+    notes: [
+      'The swap ID must be the full 64-character hex string.',
+      'Without --deposit, run "swap-deposit <id>" separately when ready.',
+    ],
+  },
+  'swap-status': {
+    usage: 'swap-status <swap_id> [--query-escrow]',
+    description: 'Show detailed status of a swap deal including progress, deal terms, and deposit information.',
+    flags: [
+      { flag: '--query-escrow', description: 'Query the escrow service for the latest status' },
+    ],
+    examples: [
+      'npm run cli -- swap-status a1b2c3d4...full64hex...',
+      'npm run cli -- swap-status a1b2c3d4...full64hex... --query-escrow',
+    ],
+    notes: [
+      'If the swap has an associated deposit invoice, its status is also displayed.',
+    ],
+  },
+  'swap-deposit': {
+    usage: 'swap-deposit <swap_id>',
+    description: 'Deposit tokens into an accepted swap. The swap must be in the "announced" state (accepted and awaiting deposits).',
+    examples: [
+      'npm run cli -- swap-deposit a1b2c3d4...full64hex...',
+    ],
+    notes: [
+      'The swap ID must be the full 64-character hex string.',
+    ],
+  },
+
+  // --- DAEMON ---
+  'daemon': {
+    usage: 'daemon <start|stop|status> [options]',
+    description: 'Manage the persistent event listener daemon. The daemon listens for wallet events and triggers configured actions.',
+    examples: [
+      'npm run cli -- daemon start --event transfer:incoming --action auto-receive',
+      'npm run cli -- daemon start --detach --event "*" --action "log:./events.jsonl"',
+      'npm run cli -- daemon stop',
+      'npm run cli -- daemon status',
+    ],
+  },
+  'daemon start': {
+    usage: 'daemon start [options]',
+    description: 'Start the persistent event listener. Can subscribe to specific events and trigger actions (auto-receive, webhook, bash command, or log file).',
+    flags: [
+      { flag: '--config <path>', description: 'Config file path', default: '.sphere-cli/daemon.json' },
+      { flag: '--detach', description: 'Run in background (fork process, PID file, redirect logs)' },
+      { flag: '--log <path>', description: 'Override log file path' },
+      { flag: '--pid <path>', description: 'Override PID file path' },
+      { flag: '--event <type>', description: 'Event type to subscribe to (repeatable). Use "*" for all events.' },
+      { flag: '--action <spec>', description: 'Action to trigger: auto-receive, bash:<cmd>, webhook:<url>, log:<path>' },
+      { flag: '--market-feed', description: 'Also subscribe to the market WebSocket feed' },
+      { flag: '--verbose', description: 'Print full event JSON in logs' },
+    ],
+    examples: [
+      'npm run cli -- daemon start --event transfer:incoming --action auto-receive',
+      'npm run cli -- daemon start --event "transfer:*" --action "webhook:https://example.com/hook" --detach',
+      'npm run cli -- daemon start --event "*" --action "log:./events.jsonl" --verbose',
+      'npm run cli -- daemon start --event message:dm --action "bash:echo DM from \\$SPHERE_SENDER"',
+      'npm run cli -- daemon start --config ./my-daemon.json --detach',
+    ],
+  },
+  'daemon stop': {
+    usage: 'daemon stop',
+    description: 'Stop the running daemon process.',
+    examples: [
+      'npm run cli -- daemon stop',
+    ],
+  },
+  'daemon status': {
+    usage: 'daemon status',
+    description: 'Check if the daemon is currently running and show its PID.',
+    examples: [
+      'npm run cli -- daemon status',
+    ],
+  },
+
+  // --- ENCRYPTION ---
+  'encrypt': {
+    usage: 'encrypt <data> <password>',
+    description: 'Encrypt a string with AES using a password. Outputs the encrypted result as JSON.',
+    examples: [
+      'npm run cli -- encrypt "my secret data" mypassword',
+    ],
+  },
+  'decrypt': {
+    usage: 'decrypt <encrypted-json> <password>',
+    description: 'Decrypt an AES-encrypted JSON blob using a password. Outputs the original plaintext.',
+    examples: [
+      'npm run cli -- decrypt \'{"iv":"...","data":"..."}\' mypassword',
+    ],
+  },
+
+  // --- WALLET PARSING ---
+  'parse-wallet': {
+    usage: 'parse-wallet <file> [password]',
+    description: 'Parse a wallet backup file (.txt or .dat format). If the file is encrypted, a password is required.',
+    examples: [
+      'npm run cli -- parse-wallet wallet.txt',
+      'npm run cli -- parse-wallet wallet.txt mypassword',
+      'npm run cli -- parse-wallet wallet.dat',
+    ],
+  },
+  'wallet-info': {
+    usage: 'wallet-info <file>',
+    description: 'Show metadata about a wallet file: format (.txt, .dat, .json), whether it is encrypted, and other format-specific info.',
+    examples: [
+      'npm run cli -- wallet-info wallet.txt',
+      'npm run cli -- wallet-info backup.dat',
+    ],
+  },
+
+  // --- KEY OPERATIONS ---
+  'generate-key': {
+    usage: 'generate-key',
+    description: 'Generate a random secp256k1 private key and derive the public key, WIF, and L1 address from it.',
+    examples: [
+      'npm run cli -- generate-key',
+    ],
+  },
+  'validate-key': {
+    usage: 'validate-key <hex>',
+    description: 'Validate whether a hex string is a valid secp256k1 private key. Exits with code 0 if valid, 1 if invalid.',
+    examples: [
+      'npm run cli -- validate-key 0a1b2c3d...',
+    ],
+  },
+  'hex-to-wif': {
+    usage: 'hex-to-wif <hex>',
+    description: 'Convert a hex private key to Wallet Import Format (WIF).',
+    examples: [
+      'npm run cli -- hex-to-wif 0a1b2c3d...',
+    ],
+  },
+  'derive-pubkey': {
+    usage: 'derive-pubkey <private-key-hex>',
+    description: 'Derive the compressed secp256k1 public key from a private key.',
+    examples: [
+      'npm run cli -- derive-pubkey 0a1b2c3d...',
+    ],
+  },
+  'derive-address': {
+    usage: 'derive-address <private-key-hex> [index]',
+    description: 'Derive an L1 (alpha1...) address from a private key at the given HD derivation index.',
+    flags: [
+      { flag: '<index>', description: 'HD derivation index', default: '0' },
+    ],
+    examples: [
+      'npm run cli -- derive-address 0a1b2c3d...',
+      'npm run cli -- derive-address 0a1b2c3d... 3',
+    ],
+  },
+
+  // --- CURRENCY ---
+  'to-smallest': {
+    usage: 'to-smallest <amount>',
+    description: 'Convert a human-readable amount to the smallest unit (satoshi). For example, 1.5 becomes 150000000.',
+    examples: [
+      'npm run cli -- to-smallest 1.5',
+      'npm run cli -- to-smallest 0.001',
+    ],
+  },
+  'to-human': {
+    usage: 'to-human <amount>',
+    description: 'Convert an amount in smallest units back to human-readable format. For example, 150000000 becomes 1.5.',
+    examples: [
+      'npm run cli -- to-human 150000000',
+      'npm run cli -- to-human 1000000',
+    ],
+  },
+  'format': {
+    usage: 'format <amount> [decimals]',
+    description: 'Format an amount with the specified number of decimal places.',
+    flags: [
+      { flag: '<decimals>', description: 'Number of decimal places', default: '8' },
+    ],
+    examples: [
+      'npm run cli -- format 150000000',
+      'npm run cli -- format 150000000 6',
+    ],
+  },
+
+  // --- ENCODING ---
+  'base58-encode': {
+    usage: 'base58-encode <hex>',
+    description: 'Encode a hex string to Base58.',
+    examples: [
+      'npm run cli -- base58-encode 0a1b2c3d',
+    ],
+  },
+  'base58-decode': {
+    usage: 'base58-decode <string>',
+    description: 'Decode a Base58 string to hex.',
+    examples: [
+      'npm run cli -- base58-decode 2NEpo7TZRhna',
+    ],
+  },
+};
+
+function printCommandHelp(cmdName: string): void {
+  const help = COMMAND_HELP[cmdName];
+  if (!help) {
+    console.error(`No help available for command: ${cmdName}`);
+    console.error('Run "npm run cli -- help" for a list of all commands.');
+    process.exit(1);
+  }
+
+  console.log(`\n  ${cmdName}\n`);
+  console.log(`  Usage: npm run cli -- ${help.usage}\n`);
+  console.log(`  ${help.description}\n`);
+
+  if (help.flags && help.flags.length > 0) {
+    console.log('  Flags:');
+    const maxFlagLen = Math.max(...help.flags.map(f => f.flag.length));
+    for (const f of help.flags) {
+      const defaultStr = f.default ? ` (default: ${f.default})` : '';
+      console.log(`    ${f.flag.padEnd(maxFlagLen + 2)}${f.description}${defaultStr}`);
+    }
+    console.log('');
+  }
+
+  if (help.examples.length > 0) {
+    console.log('  Examples:');
+    for (const ex of help.examples) {
+      console.log(`    ${ex}`);
+    }
+    console.log('');
+  }
+
+  if (help.notes && help.notes.length > 0) {
+    console.log('  Notes:');
+    for (const note of help.notes) {
+      console.log(`    - ${note}`);
+    }
+    console.log('');
+  }
+}
+
 function printUsage() {
   console.log(`
-Sphere SDK CLI v0.2.2
+Sphere SDK CLI v0.3.0
 
 Usage: npm run cli -- <command> [args...]
    or: npx tsx cli/index.ts <command> [args...]
+   or: npm run cli -- help <command>     Show detailed help for a command
 
-WALLET MANAGEMENT:
-  init [--network <net>]            Create new wallet (mainnet|testnet|dev)
-  init --mnemonic "<words>"         Import wallet from mnemonic
-  status                            Show wallet status and identity
-  clear                             Delete all wallet data (keys + tokens)
-  config                            Show current configuration
-  config set <key> <value>          Set configuration (network, dataDir, tokensDir)
+WALLET:
+  init                              Create or import wallet
+  status                            Show wallet identity
+  config                            Show or set CLI configuration
+  clear                             Delete all wallet data
 
 WALLET PROFILES:
   wallet list                       List all wallet profiles
+  wallet create <name>              Create a new wallet profile
   wallet use <name>                 Switch to a wallet profile
-  wallet create <name> [--network]  Create a new wallet profile
+  wallet current                    Show active profile
   wallet delete <name>              Delete a wallet profile
-  wallet current                    Show current wallet profile
 
 BALANCE & TOKENS:
-  balance [--finalize] [--no-sync]  Show L3 token balance
-                                    --finalize: wait for unconfirmed tokens to be finalized
-                                    --no-sync: skip IPFS sync before showing balance
-  tokens [--no-sync]                List all tokens with details
-  l1-balance                        Show L1 (ALPHA) balance
+  balance                           Show L3 token balance
+  tokens                            List individual tokens
+  l1-balance                        L1 (ALPHA) balance
   topup [coin] [amount]             Request test tokens from faucet
-                                    Without args: requests all supported coins
-                                    With coin: requests specific coin (bitcoin, ethereum, etc.)
-  verify-balance [--remove] [-v]    Verify tokens against aggregator
-                                    Detects spent tokens not removed from storage
-                                    --remove: Remove spent tokens from storage
-                                    -v/--verbose: Show all tokens, not just spent
-  sync                              Sync tokens with IPFS remote storage
+  verify-balance                    Detect spent tokens via aggregator
+  sync                              Sync tokens with IPFS
 
 TRANSFERS:
-  send <to> <amount> [options]      Send tokens (to: @nametag or address)
-                                    --coin SYM       Token symbol (UCT/BTC/ETH/SOL)
-                                    --direct         Force DirectAddress transfer
-                                    --proxy          Force PROXY address transfer
-                                    --instant        Send immediately via Nostr (default)
-                                    --conservative   Collect all proofs first, then send
-                                    --no-sync        Skip IPFS sync after sending
-  receive [--finalize] [--no-sync]  Check for incoming transfers
-                                    --finalize: wait for unconfirmed tokens to be finalized
-                                    --no-sync: skip IPFS sync after receiving
-  history [limit]                   Show transaction history
+  send <to> <amount>                Send L3 tokens
+  receive                           Check for incoming transfers
+  history [limit]                   Transaction history
 
 ADDRESSES:
-  addresses                         List all tracked addresses
-  switch <index>                    Switch to address at HD index
-  hide <index>                      Hide address from active list
+  addresses                         List tracked addresses
+  switch <index>                    Switch to HD address
+  hide <index>                      Hide address
   unhide <index>                    Unhide address
 
 NAMETAGS:
-  nametag <name>                    Register a nametag (@name)
-  nametag-info <name>               Lookup nametag info
+  nametag <name>                    Register a nametag
+  nametag-info <name>               Look up nametag info
   my-nametag                        Show current nametag
-  nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
+  nametag-sync                      Sync nametags from Nostr
 
-MESSAGING (Direct Messages):
-  dm <@nametag> <message>            Send a direct message
-  dm-inbox                           List conversations and unread counts
-  dm-history <@nametag|pubkey>       Show conversation history
-                                     --limit <n>  Max messages (default: 50)
+MESSAGING:
+  dm <@nametag> <message>           Send a direct message
+  dm-inbox                          List conversations and unread counts
+  dm-history <@nametag|pubkey>      Show conversation history
 
-GROUP CHAT (NIP-29):
-  group-create <name>                Create a new group
-                                     --description <text>  Group description
-                                     --private             Create private group
-  group-list                         List available groups on relay
-  group-my                           List your joined groups
-  group-join <groupId>               Join a group
-                                     --invite <code>       Invite code (for private groups)
-  group-leave <groupId>              Leave a group
-  group-send <groupId> <message>     Send a message to a group
-                                     --reply <eventId>     Reply to a message
-  group-messages <groupId>           Show group messages
-                                     --limit <n>           Max messages (default: 50)
-  group-members <groupId>            List group members
-  group-info <groupId>               Show group details
+GROUP CHAT:
+  group-create <name>               Create a new group
+  group-list                        List available groups on relay
+  group-my                          List your joined groups
+  group-join <groupId>              Join a group
+  group-leave <groupId>             Leave a group
+  group-send <groupId> <message>    Send a message to a group
+  group-messages <groupId>          Show group messages
+  group-members <groupId>           List group members
+  group-info <groupId>              Show group details
 
-MARKET (Intent Bulletin Board):
-  market-post <desc> --type <type>     Post an intent (buy, sell, service, announcement, other)
-                                      --category <cat>   Intent category
-                                      --price <n>        Price amount
-                                      --currency <code>  Currency (USD, UCT, etc.)
-                                      --location <loc>   Location filter
-                                      --contact <handle> Contact handle
-                                      --expires <days>   Expiration in days (default: 30)
-  market-search <query>               Search intents (semantic)
-                                      --type <type>      Filter by type
-                                      --category <cat>   Filter by category
-                                      --min-price <n>    Min price filter
-                                      --max-price <n>    Max price filter
-                                      --min-score <0-1>  Min similarity score
-                                      --location <loc>   Location filter
-                                      --limit <n>        Max results (default: 10)
-  market-my                           List your own intents
-  market-close <id>                   Close (delete) an intent
-  market-feed                         Watch the live listing feed (WebSocket)
-                                      --rest              Use REST fallback instead of WebSocket
+MARKET:
+  market-post <desc> --type <type>  Post an intent
+  market-search <query>             Search intents (semantic)
+  market-my                         List your own intents
+  market-close <id>                 Close (delete) an intent
+  market-feed                       Watch the live listing feed
 
-INVOICES (Accounting):
-  invoice-create [options]            Create a new invoice
-                                      --target <address>  Target address
-                                      --coin <id>         Coin ID (e.g., UCT)
-                                      --amount <value>    Requested amount
-                                      --nft <id>          NFT token ID
-                                      --due <ISO-date>    Due date
-                                      --memo <text>       Invoice memo
-                                      --delivery <method> Delivery method
-                                      --terms <json-file> Load full terms from JSON file
-  invoice-import <token-file>         Import an invoice from a token file
-  invoice-list [options]              List invoices
-                                      --state <states>    Filter by state (OPEN,PARTIAL,etc.)
-                                      --limit <n>         Max results
-  invoice-status <id-or-prefix>       Show invoice status and balances
-  invoice-close <id-or-prefix>        Close an invoice
-                                      --auto-return       Trigger auto-return on close
-  invoice-cancel <id-or-prefix>       Cancel an invoice (as target)
-  invoice-pay <id-or-prefix> [amount] Pay an invoice
-                                      --amount <value>    Amount to pay (default: remaining)
-                                      --target-index <n>  Target index for multi-target
-  invoice-return <id-or-prefix>       Return payment to sender
-                                      --recipient <addr>  Recipient address (required)
-                                      --amount <value>    Amount to return (required)
-                                      --coin <id>         Coin ID (required)
-  invoice-receipts <id-or-prefix>     Send receipts for a terminated invoice
-  invoice-notices <id-or-prefix>      Send cancellation notices
-  invoice-auto-return [options]       Show/set auto-return settings
-                                      --enable            Enable auto-return
-                                      --disable           Disable auto-return
-                                      --invoice <id>      Target specific invoice
-  invoice-transfers <id-or-prefix>    List invoice transfers chronologically
-  invoice-export <id-or-prefix>       Export invoice to JSON file
-  invoice-parse-memo <memo-string>    Parse an invoice memo string
+INVOICES:
+  invoice-create                    Create invoice
+  invoice-import <file>             Import invoice from token file
+  invoice-list                      List invoices
+  invoice-status <id>               Show invoice status
+  invoice-pay <id>                  Pay an invoice
+  invoice-close <id>                Close an invoice
+  invoice-cancel <id>               Cancel an invoice
+  invoice-return <id>               Return payment to sender
+  invoice-receipts <id>             Send receipts
+  invoice-notices <id>              Send cancellation notices
+  invoice-auto-return               Show/set auto-return settings
+  invoice-transfers <id>            List related transfers
+  invoice-export <id>               Export invoice to JSON file
+  invoice-parse-memo <memo>         Parse invoice memo string
 
 SWAPS:
-  swap-propose [options]              Propose a swap deal to a counterparty
-                                      --to <recipient>       Counterparty address or @nametag
-                                      --offer-coin <coinId>  Coin you are offering
-                                      --offer-amount <amt>   Amount you are offering
-                                      --want-coin <coinId>   Coin you want in return
-                                      --want-amount <amt>    Amount you want in return
-                                      --escrow <address>     Escrow address (optional)
-                                      --timeout <seconds>    Swap timeout 60-86400 (default: 3600)
-                                      --message <text>       Optional message to counterparty
-  swap-list [options]                 List swap deals (default: open + in-progress)
-                                      --all                  Include terminal states
-                                      --role <role>          Filter: proposer or acceptor
-                                      --progress <state>     Filter by progress state
-  swap-accept <swap_id> [options]     Accept a proposed swap deal
-                                      --deposit              Also deposit immediately
-                                      --no-wait              Don't wait for completion
-  swap-status <swap_id> [options]     Show detailed swap status
-                                      --query-escrow         Query escrow for latest status
-  swap-deposit <swap_id>              Deposit into an announced swap
+  swap-propose                      Propose a token swap deal
+  swap-list                         List swap deals
+  swap-accept <id>                  Accept a swap deal
+  swap-status <id>                  Show swap status
+  swap-deposit <id>                 Deposit into a swap
 
 EVENT DAEMON:
-  daemon start [options]              Start persistent event listener
-                                      --config <path>    Config file (default: .sphere-cli/daemon.json)
-                                      --detach           Run in background (fork, PID file, log redirect)
-                                      --log <path>       Override log file path
-                                      --pid <path>       Override PID file path
-                                      --event <type>     Quick mode: subscribe to event (repeatable)
-                                      --action <spec>    Quick mode: auto-receive, bash:cmd, webhook:url, log:path
-                                      --market-feed      Subscribe to market WebSocket feed
-                                      --verbose          Print full event JSON in logs
-  daemon stop                         Stop running daemon
-  daemon status                       Check if daemon is running
+  daemon start                      Start persistent event listener
+  daemon stop                       Stop running daemon
+  daemon status                     Check if daemon is running
 
-ENCRYPTION:
+UTILITIES:
   encrypt <data> <password>         Encrypt data with password
   decrypt <json> <password>         Decrypt encrypted JSON data
-
-WALLET PARSING:
   parse-wallet <file> [password]    Parse wallet file (.txt, .dat)
-  wallet-info <file>                Show wallet file info (encrypted?, format)
+  wallet-info <file>                Show wallet file info
+  generate-key                      Generate new private key
+  validate-key <key>                Validate a private key
+  hex-to-wif <hex>                  Convert hex to WIF
+  derive-pubkey <key>               Derive public key
+  derive-address <key> [index]      Derive L1 address
+  to-smallest <amount>              Convert to smallest unit
+  to-human <amount>                 Convert to human-readable
+  format <amount> [decimals]        Format amount
+  base58-encode <hex>               Base58 encode
+  base58-decode <b58>               Base58 decode
 
-KEY OPERATIONS:
-  generate-key                      Generate random private key
-  validate-key <hex>                Validate secp256k1 private key
-  hex-to-wif <hex>                  Convert hex to WIF format
-  derive-pubkey <hex>               Derive public key from private
-  derive-address <hex> [index]      Derive address at index (default: 0)
-
-CURRENCY:
-  to-smallest <amount>              Convert to smallest unit (satoshi)
-  to-human <amount>                 Convert from smallest to human readable
-  format <amount> [decimals]        Format amount with decimals
-
-ENCODING:
-  base58-encode <hex>               Encode hex to base58
-  base58-decode <string>            Decode base58 to hex
+Run "npm run cli -- help <command>" for detailed help on any command.
 
 Examples:
   npm run cli -- init --network testnet
@@ -447,71 +1263,7 @@ Examples:
   npm run cli -- send @alice 1000000 --coin ETH
   npm run cli -- nametag myname
   npm run cli -- history 10
-
-Wallet Profile Examples:
-  npm run cli -- wallet create alice              Create profile "alice"
-  npm run cli -- init --nametag alice             Initialize wallet in profile
-  npm run cli -- wallet create bob                Create another profile
-  npm run cli -- init --nametag bob               Initialize second wallet
-  npm run cli -- wallet list                      List all profiles
-  npm run cli -- wallet use alice                 Switch to alice
-  npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
-  npm run cli -- wallet use bob                   Switch to bob
-  npm run cli -- balance                          Check bob's balance
-
-Messaging Examples:
-  npm run cli -- dm @alice "Hello, how are you?"
-  npm run cli -- dm-inbox
-  npm run cli -- dm-history @alice --limit 20
-
-Group Chat Examples:
-  npm run cli -- group-list
-  npm run cli -- group-create "Trading Chat" --description "Discuss trades"
-  npm run cli -- group-join <groupId>
-  npm run cli -- group-send <groupId> "Hello everyone!"
-  npm run cli -- group-messages <groupId> --limit 20
-  npm run cli -- group-members <groupId>
-  npm run cli -- group-leave <groupId>
-
-Market Examples:
-  npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
-  npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
-  npm run cli -- market-post "Web dev services" --type service       Post service intent
-  npm run cli -- market-post "New feature release" --type announcement   Post announcement
-  npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
-  npm run cli -- market-search "tokens" --min-score 0.7              Search with score threshold
-  npm run cli -- market-my                                           List own intents
-  npm run cli -- market-close <id>                                   Close an intent
-  npm run cli -- market-feed                                         Watch live feed
-  npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
-
-Invoice Examples:
-  npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000
-  npm run cli -- invoice-create --terms invoice-terms.json
-  npm run cli -- invoice-list --state OPEN,PARTIAL --limit 5
-  npm run cli -- invoice-status a1b2c3d4
-  npm run cli -- invoice-pay a1b2c3d4 --amount 500000
-  npm run cli -- invoice-close a1b2c3d4 --auto-return
-  npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"
-
-Swap Examples:
-  npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000
-  npm run cli -- swap-propose --to @bob --offer-coin UCT --offer-amount 1000000 --want-coin USDU --want-amount 500000 --timeout 7200
-  npm run cli -- swap-list
-  npm run cli -- swap-list --all --role proposer
-  npm run cli -- swap-accept a1b2c3d4...full64hex... --deposit
-  npm run cli -- swap-status a1b2c3d4...full64hex...
-  npm run cli -- swap-status a1b2c3d4...full64hex... --query-escrow
-  npm run cli -- swap-deposit a1b2c3d4...full64hex...
-
-Daemon Examples:
-  npm run cli -- daemon start --event transfer:incoming --action auto-receive
-  npm run cli -- daemon start --event "transfer:*" --action "webhook:https://example.com/hook" --detach
-  npm run cli -- daemon start --event "*" --action "log:./events.jsonl" --verbose
-  npm run cli -- daemon start --event message:dm --action "bash:echo DM from \\$SPHERE_SENDER"
-  npm run cli -- daemon start --config ./my-daemon.json --detach
-  npm run cli -- daemon status
-  npm run cli -- daemon stop
+  npm run cli -- help send
 `);
 }
 
@@ -519,8 +1271,28 @@ async function main() {
   // Global flag: --no-nostr disables Nostr transport (uses no-op)
   noNostrGlobal = args.includes('--no-nostr');
 
-  if (!command || command === 'help' || command === '--help' || command === '-h') {
+  if (!command || command === '--help' || command === '-h') {
     printUsage();
+    process.exit(0);
+  }
+
+  if (command === 'help') {
+    const helpTarget = args[1];
+    if (!helpTarget) {
+      printUsage();
+      process.exit(0);
+    }
+    // Try compound key first (e.g., "wallet create", "daemon start")
+    const compoundKey = args[2] ? `${helpTarget} ${args[2]}` : undefined;
+    if (compoundKey && COMMAND_HELP[compoundKey]) {
+      printCommandHelp(compoundKey);
+    } else if (COMMAND_HELP[helpTarget]) {
+      printCommandHelp(helpTarget);
+    } else {
+      console.error(`No help available for command: ${helpTarget}`);
+      console.error('Run "npm run cli -- help" for a list of all commands.');
+      process.exit(1);
+    }
     process.exit(0);
   }
 
