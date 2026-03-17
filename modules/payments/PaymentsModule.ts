@@ -369,17 +369,58 @@ async function parseTokenInfo(tokenData: unknown): Promise<ParsedTokenInfo> {
 // Repository Utility Functions
 // =============================================================================
 
+// Cache parsed sdkData fields to avoid repeated JSON.parse in hot loops.
+// Key = sdkData string reference, value = { tokenId, stateHash }.
+// Cleared on address switch via clearSdkDataCache().
+const sdkDataCache = new Map<string, { tokenId: string | null; stateHash: string }>();
+const SDK_DATA_CACHE_MAX = 2000;
+
+function parseSdkDataCached(sdkData: string): { tokenId: string | null; stateHash: string } {
+  const cached = sdkDataCache.get(sdkData);
+  if (cached) return cached;
+
+  let tokenId: string | null = null;
+  let stateHash = '';
+  try {
+    const txf = JSON.parse(sdkData);
+    tokenId = txf.genesis?.data?.tokenId || null;
+    stateHash = getCurrentStateHash(txf as TxfToken) || '';
+
+    // Try alternative locations if not found in standard place
+    if (!stateHash) {
+      /* eslint-disable @typescript-eslint/no-explicit-any */
+      if ((txf as any).state?.hash) {
+        stateHash = (txf as any).state.hash;
+      } else if ((txf as any).stateHash) {
+        stateHash = (txf as any).stateHash;
+      } else if ((txf as any).currentStateHash) {
+        stateHash = (txf as any).currentStateHash;
+      }
+      /* eslint-enable @typescript-eslint/no-explicit-any */
+    }
+  } catch {
+    // Invalid JSON — return defaults
+  }
+
+  const entry = { tokenId, stateHash };
+  // Evict cache if it grows too large (unlikely in normal usage)
+  if (sdkDataCache.size >= SDK_DATA_CACHE_MAX) {
+    sdkDataCache.clear();
+  }
+  sdkDataCache.set(sdkData, entry);
+  return entry;
+}
+
+function clearSdkDataCache(): void {
+  sdkDataCache.clear();
+}
+
 /**
  * Extract token ID (genesis tokenId) from sdkData/jsonData
  */
 function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
   if (!sdkData) return null;
-  try {
-    const txf = JSON.parse(sdkData);
-    return txf.genesis?.data?.tokenId || null;
-  } catch {
-    return null;
-  }
+  return parseSdkDataCached(sdkData).tokenId;
 }
 
 /**
@@ -387,29 +428,7 @@ function extractTokenIdFromSdkData(sdkData: string | undefined): string | null {
  */
 function extractStateHashFromSdkData(sdkData: string | undefined): string {
   if (!sdkData) return '';
-  try {
-    const txf = JSON.parse(sdkData) as TxfToken;
-    const stateHash = getCurrentStateHash(txf);
-
-    // Try alternative locations if not found in standard place
-    if (!stateHash) {
-      /* eslint-disable @typescript-eslint/no-explicit-any */
-      if ((txf as any).state?.hash) {
-        return (txf as any).state.hash;
-      }
-      if ((txf as any).stateHash) {
-        return (txf as any).stateHash;
-      }
-      if ((txf as any).currentStateHash) {
-        return (txf as any).currentStateHash;
-      }
-      /* eslint-enable @typescript-eslint/no-explicit-any */
-    }
-
-    return stateHash || '';
-  } catch {
-    return '';
-  }
+  return parseSdkDataCached(sdkData).stateHash;
 }
 
 /**
@@ -660,6 +679,8 @@ export class PaymentsModule {
 
   // Repository State (tombstones, archives, forked, history)
   private tombstones: TombstoneEntry[] = [];
+  // O(1) lookup set derived from tombstones array. Rebuilt via rebuildTombstoneKeySet().
+  private tombstoneKeySet: Set<string> = new Set();
   private archivedTokens: Map<string, TxfToken> = new Map();
   private forkedTokens: Map<string, TxfToken> = new Map();
   private _historyCache: TransactionHistoryEntry[] = [];
@@ -773,8 +794,10 @@ export class PaymentsModule {
 
     // Reset per-address state (will be re-populated by load())
     this.tokens.clear();
+    clearSdkDataCache();
     this.pendingTransfers.clear();
     this.tombstones = [];
+    this.tombstoneKeySet.clear();
     this.archivedTokens.clear();
     this.forkedTokens.clear();
     this._historyCache = [];
@@ -3514,11 +3537,10 @@ export class PaymentsModule {
     // Create tombstone with exact (tokenId, stateHash) - requires both
     const tombstone = createTombstoneFromToken(token);
     if (tombstone) {
-      const alreadyTombstoned = this.tombstones.some(
-        t => t.tokenId === tombstone.tokenId && t.stateHash === tombstone.stateHash
-      );
-      if (!alreadyTombstoned) {
+      const key = `${tombstone.tokenId}:${tombstone.stateHash}`;
+      if (!this.tombstoneKeySet.has(key)) {
         this.tombstones.push(tombstone);
+        this.tombstoneKeySet.add(key);
         logger.debug('Payments', `Created tombstone for ${tombstone.tokenId.slice(0, 8)}..._${tombstone.stateHash.slice(0, 8)}...`);
       }
     } else {
@@ -3552,15 +3574,21 @@ export class PaymentsModule {
 
   /**
    * Check whether a specific `(tokenId, stateHash)` combination is tombstoned.
+   * Uses O(1) Set lookup instead of O(n) linear scan.
    *
    * @param tokenId - The genesis token ID.
    * @param stateHash - The state hash of the token version to check.
    * @returns `true` if the exact combination has been tombstoned.
    */
   isStateTombstoned(tokenId: string, stateHash: string): boolean {
-    return this.tombstones.some(
-      t => t.tokenId === tokenId && t.stateHash === stateHash
-    );
+    return this.tombstoneKeySet.has(`${tokenId}:${stateHash}`);
+  }
+
+  private rebuildTombstoneKeySet(): void {
+    this.tombstoneKeySet.clear();
+    for (const t of this.tombstones) {
+      this.tombstoneKeySet.add(`${t.tokenId}:${t.stateHash}`);
+    }
   }
 
   /**
@@ -3600,11 +3628,10 @@ export class PaymentsModule {
 
     // Merge tombstones (union)
     for (const remoteTombstone of remoteTombstones) {
-      const alreadyExists = this.tombstones.some(
-        t => t.tokenId === remoteTombstone.tokenId && t.stateHash === remoteTombstone.stateHash
-      );
-      if (!alreadyExists) {
+      const key = `${remoteTombstone.tokenId}:${remoteTombstone.stateHash}`;
+      if (!this.tombstoneKeySet.has(key)) {
         this.tombstones.push(remoteTombstone);
+        this.tombstoneKeySet.add(key);
       }
     }
 
@@ -3623,6 +3650,7 @@ export class PaymentsModule {
   async pruneTombstones(maxAge?: number): Promise<void> {
     const originalCount = this.tombstones.length;
     this.tombstones = pruneTombstonesByAge(this.tombstones, maxAge);
+    this.rebuildTombstoneKeySet();
 
     if (this.tombstones.length < originalCount) {
       await this.save();
@@ -4230,6 +4258,13 @@ export class PaymentsModule {
             // Only restore if no token with the same genesis tokenId already
             // exists (avoids duplicating tokens whose ID changed from v5split
             // to real genesis ID during TXF round-trip).
+            // Build index of existing genesis tokenIds for O(1) lookup instead of O(n²).
+            const existingGenesisIds = new Set<string>();
+            for (const existing of this.tokens.values()) {
+              const gid = extractTokenIdFromSdkData(existing.sdkData);
+              if (gid) existingGenesisIds.add(gid);
+            }
+
             let restoredCount = 0;
             for (const [tokenId, token] of savedTokens) {
               if (this.tokens.has(tokenId)) continue;
@@ -4243,18 +4278,12 @@ export class PaymentsModule {
 
               // Skip if an equivalent token (same genesis tokenId) already
               // exists under a different ID — avoids balance doubling.
-              if (sdkTokenId) {
-                let hasEquivalent = false;
-                for (const existing of this.tokens.values()) {
-                  if (extractTokenIdFromSdkData(existing.sdkData) === sdkTokenId) {
-                    hasEquivalent = true;
-                    break;
-                  }
-                }
-                if (hasEquivalent) continue;
+              if (sdkTokenId && existingGenesisIds.has(sdkTokenId)) {
+                continue;
               }
 
               this.tokens.set(tokenId, token);
+              if (sdkTokenId) existingGenesisIds.add(sdkTokenId);
               restoredCount++;
             }
             if (restoredCount > 0) {
@@ -5235,6 +5264,7 @@ export class PaymentsModule {
 
     // Load tombstones FIRST so we can filter tokens
     this.tombstones = parsed.tombstones;
+    this.rebuildTombstoneKeySet();
     // Load tokens, filtering out tombstoned ones
     // NOTE: Only filter by exact (tokenId, stateHash) match to avoid over-blocking
     // When state hash is unavailable, we can't reliably distinguish old from new
