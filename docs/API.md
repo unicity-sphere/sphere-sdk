@@ -1918,7 +1918,7 @@ refreshFromRemote(): Promise<boolean>
 
 ```typescript
 interface TokenDefinition {
-  coinId: string;           // Hex coin identifier
+  id: string;               // Hex coin identifier (64 characters)
   symbol: string;           // Short symbol (e.g., 'UCT')
   name: string;             // Full name (e.g., 'Unicity Token')
   decimals: number;         // Decimal places

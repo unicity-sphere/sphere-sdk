@@ -502,7 +502,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     examples: [
       'npm run cli -- send @alice 1000000',
       'npm run cli -- send @alice 0.5 --coin BTC',
-      'npm run cli -- send DIRECT://0000be36... 500000 --mode conservative',
+      'npm run cli -- send DIRECT://0000be36... 500000 --conservative',
       'npm run cli -- send @bob 100 --coin USDU --no-sync',
     ],
     notes: [
@@ -779,7 +779,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Create a new invoice by specifying a target address and requested payment. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
     flags: [
       { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
-      { flag: '--coin <id>', description: 'Coin ID hex (e.g., the hex ID from token registry)' },
+      { flag: '--coin <id>', description: 'Hex coin ID (64 chars). Use "asset-info UCT" to find the hex ID for a symbol.' },
       { flag: '--amount <value>', description: 'Requested amount in smallest units (positive integer, no decimals)' },
       { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
       { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
@@ -788,9 +788,10 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags)' },
     ],
     examples: [
-      'npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000',
-      'npm run cli -- invoice-create --target @alice --coin UCT --amount 500000 --memo "Order #42" --due 2026-12-31',
+      'npm run cli -- invoice-create --target @alice --coin <hex-coin-id> --amount 1000000',
+      'npm run cli -- invoice-create --target @alice --coin <hex-coin-id> --amount 500000 --memo "Order #42" --due 2026-12-31',
       'npm run cli -- invoice-create --terms invoice-terms.json',
+      '# Use "asset-info UCT" to look up the hex coin ID for a given symbol.',
     ],
     notes: [
       'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
@@ -862,10 +863,11 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: [
       { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
       { flag: '--amount <value>', description: 'Amount to return in smallest units (required)' },
-      { flag: '--coin <id>', description: 'Coin ID hex (required)' },
+      { flag: '--coin <id>', description: 'Hex coin ID (64 chars, required). Use "asset-info UCT" to find the hex ID for a symbol.' },
     ],
     examples: [
-      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --amount 100000 --coin UCT',
+      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --amount 100000 --coin <hex-coin-id>',
+      '# Use "asset-info UCT" to look up the hex coin ID for a given symbol.',
     ],
   },
   'invoice-receipts': {
@@ -1252,7 +1254,7 @@ NAMETAGS:
   nametag <name>                    Register a nametag
   nametag-info <name>               Look up nametag info
   my-nametag                        Show current nametag
-  nametag-sync                      Sync nametags from Nostr
+  nametag-sync                      Re-publish nametag binding to Nostr
 
 MESSAGING:
   dm <@nametag> <message>           Send a direct message
@@ -1346,7 +1348,7 @@ async function main() {
 
   if (command === 'help') {
     const helpTarget = args[1];
-    if (!helpTarget) {
+    if (!helpTarget || helpTarget === '--help' || helpTarget === '-h' || helpTarget === 'help') {
       printUsage();
       process.exit(0);
     }
