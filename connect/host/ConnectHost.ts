@@ -22,6 +22,7 @@ import {
   SPHERE_CONNECT_VERSION,
   RPC_METHODS,
   ERROR_CODES,
+  WALLET_EVENTS,
   createRequestId,
 } from '../protocol';
 import {
@@ -78,7 +79,7 @@ const DEFAULT_SESSION_TTL_MS = 86400000; // 24 hours
 const DEFAULT_MAX_RPS = 20;
 
 export class ConnectHost {
-  private readonly sphere: SphereInstance;
+  private sphere: SphereInstance;
   private readonly transport: ConnectTransport;
   private readonly config: ConnectHostConfig;
 
@@ -130,6 +131,29 @@ export class ConnectHost {
     this.autoApprovedIntents.delete(action);
   }
 
+  /**
+   * Update the Sphere instance (e.g. user switched address — new Sphere created).
+   * Re-subscribes auto-push events and notifies connected dApp of the new identity.
+   */
+  updateSphere(newSphere: unknown): void {
+    this.sphere = newSphere as SphereInstance;
+
+    // Re-subscribe identity:changed on the new Sphere instance
+    const existing = this.eventSubscriptions.get(WALLET_EVENTS.IDENTITY_CHANGED);
+    if (existing) {
+      existing();
+      this.eventSubscriptions.delete(WALLET_EVENTS.IDENTITY_CHANGED);
+    }
+    if (this.session?.active) {
+      this.autoSubscribeIdentityChanged();
+      // Push the new identity immediately so dApp doesn't have to wait for the next event
+      const identity = this.getPublicIdentity();
+      if (identity) {
+        this.pushClientEvent(WALLET_EVENTS.IDENTITY_CHANGED, identity);
+      }
+    }
+  }
+
   /** Revoke the current session */
   revokeSession(): void {
     if (this.session) {
@@ -139,6 +163,18 @@ export class ConnectHost {
       this.session = null;
       this.grantedPermissions.clear();
     }
+  }
+
+  /**
+   * Notify connected dApp that wallet is locked/logged out, then revoke session.
+   * Call this BEFORE destroy() when the wallet locks so the dApp gets a clean signal
+   * instead of receiving NOT_CONNECTED errors on the next request.
+   */
+  notifyWalletLocked(): void {
+    if (this.session?.active) {
+      this.pushClientEvent(WALLET_EVENTS.LOCKED, {});
+    }
+    this.revokeSession();
   }
 
   /** Destroy the host, clean up all resources */
@@ -222,6 +258,10 @@ export class ConnectHost {
       active: true,
     };
     this.grantedPermissions = new Set(allPermissions);
+
+    // Auto-push identity:changed to dApp whenever the wallet switches address.
+    // MetaMask pattern: no sphere_subscribe needed — host pushes it unconditionally.
+    this.autoSubscribeIdentityChanged();
 
     // Build public identity
     const identity = this.getPublicIdentity();
@@ -480,6 +520,14 @@ export class ConnectHost {
   // Event Subscriptions
   // ===========================================================================
 
+  private autoSubscribeIdentityChanged(): void {
+    if (this.eventSubscriptions.has(WALLET_EVENTS.IDENTITY_CHANGED)) return;
+    const unsub = this.sphere.on('identity:changed' as SphereEventType, (data: unknown) => {
+      this.pushClientEvent(WALLET_EVENTS.IDENTITY_CHANGED, data);
+    });
+    this.eventSubscriptions.set(WALLET_EVENTS.IDENTITY_CHANGED, unsub);
+  }
+
   private handleSubscribe(eventName: string): { subscribed: boolean; event: string } {
     if (!eventName) throw new SphereError('Missing required parameter: event', 'VALIDATION_ERROR');
 
@@ -522,6 +570,17 @@ export class ConnectHost {
   // ===========================================================================
   // Helpers
   // ===========================================================================
+
+  /** Push an event to the dApp without requiring a sphere_subscribe call. */
+  private pushClientEvent(event: string, data: unknown): void {
+    this.transport.send({
+      ns: SPHERE_CONNECT_NAMESPACE,
+      v: SPHERE_CONNECT_VERSION,
+      type: 'event',
+      event,
+      data,
+    });
+  }
 
   private getPublicIdentity(): PublicIdentity | undefined {
     const id = this.sphere.identity;

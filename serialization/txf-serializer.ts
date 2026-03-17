@@ -69,7 +69,10 @@ function normalizeToHex(value: unknown): string {
  * Converts all bytes objects to hex strings before storage.
  */
 export function normalizeSdkTokenToStorage(sdkTokenJson: unknown): TxfToken {
-  const txf = JSON.parse(JSON.stringify(sdkTokenJson));
+  // structuredClone is faster than JSON.parse(JSON.stringify()) and avoids
+  // double serialization overhead that was blocking the main thread.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const txf = structuredClone(sdkTokenJson) as any;
 
   // Normalize genesis.data fields
   if (txf.genesis?.data) {

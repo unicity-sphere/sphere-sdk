@@ -172,6 +172,26 @@ export interface PublicIdentity {
 }
 
 // =============================================================================
+// Wallet-initiated Events (pushed automatically by host, no subscription needed)
+// =============================================================================
+
+/**
+ * Events that ConnectHost pushes proactively to connected dApps.
+ * dApps can listen with client.on(WALLET_EVENTS.LOCKED, handler) etc.
+ * No sphere_subscribe call needed — host sends these unconditionally.
+ */
+export const WALLET_EVENTS = {
+  /** Wallet locked or user logged out. dApp shows locked state and waits for unlock.
+   *  Pushed automatically by ConnectHost — no sphere_subscribe needed. */
+  LOCKED: 'wallet:locked',
+  /** Active wallet address changed. dApp should update displayed identity.
+   *  Pushed automatically by ConnectHost — no sphere_subscribe needed. */
+  IDENTITY_CHANGED: 'identity:changed',
+} as const;
+
+export type WalletEvent = (typeof WALLET_EVENTS)[keyof typeof WALLET_EVENTS];
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
