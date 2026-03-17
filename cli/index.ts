@@ -1790,7 +1790,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: true, skipNostr: noSync });
+        await ensureSync(sphere, { skipNostr: true, skipReceive: true, skipIpfs: noSync });
 
         console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
         const result = await sphere.payments.receive({
@@ -1857,7 +1857,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: noSync, skipNostr: noSync });
+        await ensureSync(sphere, { skipNostr: true, skipReceive: true, skipIpfs: noSync });
 
         const tokens = sphere.payments.getTokens();
         const registry = TokenRegistry.getInstance();
@@ -2011,7 +2011,7 @@ async function main() {
         const verbose = args.includes('--verbose') || args.includes('-v');
 
         const sphere = await getSphere();
-        await ensureSync(sphere);
+        await ensureSync(sphere, { skipNostr: true, skipReceive: true });
         const tokens = sphere.payments.getTokens();
         const identity = sphere.identity;
 
@@ -2140,7 +2140,7 @@ async function main() {
 
       case 'sync': {
         const sphere = await getSphere();
-        await ensureSync(sphere);
+        await ensureSync(sphere, { skipNostr: true, skipReceive: true });
         await closeSphere();
         break;
       }
@@ -2289,7 +2289,6 @@ async function main() {
         const noSync = args.includes('--no-sync');
 
         const sphere = await getSphere();
-        await ensureSync(sphere, { skipIpfs: noSync, skipReceive: noSync, skipNostr: noSync });
         const history = sphere.payments.getHistory();
         const limited = history.slice(0, limit);
 
@@ -3647,7 +3646,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
 
         const stateIdx = args.indexOf('--state');
         const limitIdx2 = args.indexOf('--limit');
@@ -3709,7 +3708,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
 
         // Resolve ID from prefix
         const allInvoices = await sphere.accounting.getInvoices();
@@ -3744,7 +3743,6 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -3778,7 +3776,6 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -3811,7 +3808,7 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
+        await ensureSync(sphere, { skipNostr: true, skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -4034,7 +4031,6 @@ async function main() {
           console.error('Accounting module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
 
         const allInvoices = await sphere.accounting.getInvoices();
         const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
@@ -4177,7 +4173,6 @@ async function main() {
           console.error('Swap module not enabled. Initialize with swap support.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
 
         const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
         const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
@@ -4221,7 +4216,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const filter: any = {};
@@ -4331,7 +4326,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
 
         await swapModule.acceptSwap(swapId);
         console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
@@ -4407,7 +4402,7 @@ async function main() {
           console.error('Swap module not enabled.');
           process.exit(1);
         }
-        await ensureSync(sphere, { skipIpfs: true });
+        await ensureSync(sphere, { skipIpfs: true, skipReceive: true });
 
         const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
         console.log('Swap Status:');
