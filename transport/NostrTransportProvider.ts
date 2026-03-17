@@ -1586,6 +1586,7 @@ export class NostrTransportProvider implements TransportProvider {
       EVENT_KINDS.TOKEN_TRANSFER,
       EVENT_KINDS.PAYMENT_REQUEST,
       EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+      EventKinds.GIFT_WRAP, // NIP-17 gift-wrapped DMs (swap proposals, invoice receipts, etc.)
     ];
     walletFilter['#p'] = [nostrPubkey];
     walletFilter.since = Math.floor(Date.now() / 1000) - 86400;
