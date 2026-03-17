@@ -246,6 +246,31 @@ function resolveCoin(identifier: string): { coinId: string; symbol: string; deci
  * Parse an asset argument in "<amount> <symbol>" format.
  * Examples: "1000000 UCT", "10.5 BTC", "500000 USDU"
  */
+/**
+ * Resolve a swap ID prefix to a full 64-char swap ID.
+ * Accepts full IDs or unique prefixes (like invoice commands do).
+ */
+function resolveSwapId(prefix: string, swapModule: { getSwaps: (f?: unknown) => Array<{ swapId: string }> }): string {
+  // Full ID — return as-is
+  if (/^[0-9a-f]{64}$/i.test(prefix)) return prefix;
+  // Must be at least 4 hex chars to avoid too many matches
+  if (!/^[0-9a-f]{4,}$/i.test(prefix)) {
+    console.error(`Invalid swap ID prefix: "${prefix}". Must be at least 4 hex characters.`);
+    process.exit(1);
+  }
+  const allSwaps = swapModule.getSwaps();
+  const matched = allSwaps.filter((s: { swapId: string }) => s.swapId.startsWith(prefix.toLowerCase()));
+  if (matched.length === 0) {
+    console.error(`No swap found matching prefix: ${prefix}`);
+    process.exit(1);
+  }
+  if (matched.length > 1) {
+    console.error(`Ambiguous prefix "${prefix}" matches ${matched.length} swaps. Use more characters.`);
+    process.exit(1);
+  }
+  return matched[0].swapId;
+}
+
 function parseAssetArg(value: string): { amount: string; coin: string } {
   const parts = value.trim().split(/\s+/);
   if (parts.length !== 2) {
@@ -1062,66 +1087,69 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
   'swap-accept': {
-    usage: 'swap-accept <swap_id> [--deposit] [--no-wait]',
-    description: 'Accept a proposed swap deal by its full 64-character hex ID. Announces acceptance to the escrow.',
+    usage: 'swap-accept <swap_id_or_prefix> [--deposit] [--no-wait]',
+    description: 'Accept a proposed swap deal. Announces acceptance to the escrow.',
     flags: [
       { flag: '--deposit', description: 'Immediately deposit after accepting' },
       { flag: '--no-wait', description: 'Do not wait for swap completion after depositing (only with --deposit)' },
     ],
     examples: [
-      'npm run cli -- swap-accept a1b2c3d4...full64hex...',
-      'npm run cli -- swap-accept a1b2c3d4...full64hex... --deposit',
-      'npm run cli -- swap-accept a1b2c3d4...full64hex... --deposit --no-wait',
+      'npm run cli -- swap-accept 3611a464',
+      'npm run cli -- swap-accept 3611a464 --deposit',
+      'npm run cli -- swap-accept 3611a464 --deposit --no-wait',
     ],
     notes: [
-      'The swap ID must be the full 64-character hex string.',
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
       'Without --deposit, run "swap-deposit <id>" separately when ready.',
     ],
   },
   'swap-status': {
-    usage: 'swap-status <swap_id> [--query-escrow]',
+    usage: 'swap-status <swap_id_or_prefix> [--query-escrow]',
     description: 'Show detailed status of a swap deal including progress, deal terms, and deposit information.',
     flags: [
       { flag: '--query-escrow', description: 'Query the escrow service for the latest status' },
     ],
     examples: [
-      'npm run cli -- swap-status a1b2c3d4...full64hex...',
-      'npm run cli -- swap-status a1b2c3d4...full64hex... --query-escrow',
+      'npm run cli -- swap-status 3611a464',
+      'npm run cli -- swap-status 3611a464 --query-escrow',
     ],
     notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
       'If the swap has an associated deposit invoice, its status is also displayed.',
     ],
   },
   'swap-deposit': {
-    usage: 'swap-deposit <swap_id>',
+    usage: 'swap-deposit <swap_id_or_prefix>',
     description: 'Deposit tokens into an accepted swap. The swap must be in the "announced" state (accepted and awaiting deposits).',
     examples: [
-      'npm run cli -- swap-deposit a1b2c3d4...full64hex...',
+      'npm run cli -- swap-deposit 3611a464',
     ],
     notes: [
-      'The swap ID must be the full 64-character hex string.',
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
     ],
   },
 
   'swap-reject': {
-    usage: 'swap-reject <swap_id> [reason]',
+    usage: 'swap-reject <swap_id_or_prefix> [reason]',
     description: 'Reject an incoming swap proposal. Sends a rejection DM to the proposer and marks the swap as cancelled.',
     examples: [
-      'npm run cli -- swap-reject a1b2c3d4...full64hex...',
-      'npm run cli -- swap-reject a1b2c3d4...full64hex... "Price too high"',
+      'npm run cli -- swap-reject 3611a464',
+      'npm run cli -- swap-reject 3611a464 "Price too high"',
     ],
     notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
       'Only works on proposals you received (role: acceptor, progress: proposed).',
       'The optional reason is included in the rejection DM sent to the proposer.',
     ],
   },
   'swap-cancel': {
-    usage: 'swap-cancel <swap_id>',
+    usage: 'swap-cancel <swap_id_or_prefix>',
     description: 'Cancel a swap you proposed or accepted. Works before deposits are confirmed by the escrow.',
     examples: [
-      'npm run cli -- swap-cancel a1b2c3d4...full64hex...',
+      'npm run cli -- swap-cancel 3611a464',
     ],
     notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
       'Pre-deposit cancellation is local only (no escrow notification).',
       'Post-deposit cancellation: escrow handles timeout and returns deposits automatically.',
     ],
@@ -1439,11 +1467,11 @@ INVOICES:
 SWAPS:
   swap-propose                      Propose a token swap deal
   swap-list                         List swap deals
-  swap-accept <id>                  Accept a swap deal
-  swap-status <id>                  Show swap status
-  swap-deposit <id>                 Deposit into a swap
-  swap-reject <id> [reason]        Reject a swap proposal
-  swap-cancel <id>                 Cancel a swap
+  swap-accept <id|prefix>            Accept a swap deal
+  swap-status <id|prefix>            Show swap status
+  swap-deposit <id|prefix>           Deposit into a swap
+  swap-reject <id|prefix> [reason]  Reject a swap proposal
+  swap-cancel <id|prefix>           Cancel a swap
 
 EVENT DAEMON:
   daemon start                      Start persistent event listener
@@ -4375,13 +4403,9 @@ async function main() {
       }
 
       case 'swap-accept': {
-        const swapId = args[1];
-        if (!swapId) {
-          console.error('Usage: swap-accept <swap_id> [--deposit] [--no-wait]');
-          process.exit(1);
-        }
-        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-          console.error('Invalid swap ID — must be 64 hex characters');
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-accept <swap_id_or_prefix> [--deposit] [--no-wait]');
           process.exit(1);
         }
 
@@ -4397,6 +4421,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
+        const swapId = resolveSwapId(swapIdArg, swapModule);
         await swapModule.acceptSwap(swapId);
         console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
 
@@ -4452,13 +4477,9 @@ async function main() {
       }
 
       case 'swap-status': {
-        const swapId = args[1];
-        if (!swapId) {
-          console.error('Usage: swap-status <swap_id> [--query-escrow]');
-          process.exit(1);
-        }
-        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-          console.error('Invalid swap ID — must be 64 hex characters');
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-status <swap_id_or_prefix> [--query-escrow]');
           process.exit(1);
         }
 
@@ -4473,6 +4494,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
+        const swapId = resolveSwapId(swapIdArg, swapModule);
         const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
         console.log('Swap Status:');
         console.log(JSON.stringify(status, null, 2));
@@ -4492,13 +4514,9 @@ async function main() {
       }
 
       case 'swap-deposit': {
-        const swapId = args[1];
-        if (!swapId) {
-          console.error('Usage: swap-deposit <swap_id>');
-          process.exit(1);
-        }
-        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-          console.error('Invalid swap ID — must be 64 hex characters');
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-deposit <swap_id_or_prefix>');
           process.exit(1);
         }
 
@@ -4511,6 +4529,7 @@ async function main() {
         }
         await ensureSync(sphere, 'full');
 
+        const swapId = resolveSwapId(swapIdArg, swapModule);
         const result = await swapModule.deposit(swapId);
         console.log('Deposit result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
@@ -4521,13 +4540,9 @@ async function main() {
       }
 
       case 'swap-reject': {
-        const swapId = args[1];
-        if (!swapId) {
-          console.error('Usage: swap-reject <swap_id> [reason]');
-          process.exit(1);
-        }
-        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-          console.error('Invalid swap ID — must be 64 hex characters');
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-reject <swap_id_or_prefix> [reason]');
           process.exit(1);
         }
 
@@ -4540,6 +4555,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
+        const swapId = resolveSwapId(swapIdArg, swapModule);
         // Optional reason from remaining args
         const reason = args.slice(2).filter((a: string) => !a.startsWith('--')).join(' ') || undefined;
 
@@ -4551,13 +4567,9 @@ async function main() {
       }
 
       case 'swap-cancel': {
-        const swapId = args[1];
-        if (!swapId) {
-          console.error('Usage: swap-cancel <swap_id>');
-          process.exit(1);
-        }
-        if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-          console.error('Invalid swap ID — must be 64 hex characters');
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-cancel <swap_id_or_prefix>');
           process.exit(1);
         }
 
@@ -4570,6 +4582,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
+        const swapId = resolveSwapId(swapIdArg, swapModule);
         await swapModule.cancelSwap(swapId);
         console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
 
