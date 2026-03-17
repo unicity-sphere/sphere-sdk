@@ -2308,7 +2308,7 @@ async function main() {
       }
 
       case 'history': {
-        const [, limitStr = '10'] = args;
+        const limitStr = (args[1] && !args[1].startsWith('--')) ? args[1] : '10';
         const limit = parseInt(limitStr);
         const noSync = args.includes('--no-sync');
 
@@ -3891,6 +3891,7 @@ async function main() {
         }
 
         const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
         if (!sphere.accounting) {
           console.error('Accounting module not enabled.');
           process.exit(1);
@@ -4598,11 +4599,11 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'invoice-status', description: 'Show invoice status' },
     { name: 'invoice-close', description: 'Close an invoice' },
     { name: 'invoice-cancel', description: 'Cancel an invoice' },
-    { name: 'invoice-pay', description: 'Pay an invoice', flags: ['--target-index', '--asset-index', '--amount'] },
+    { name: 'invoice-pay', description: 'Pay an invoice', flags: ['--target-index', '--amount'] },
     { name: 'invoice-return', description: 'Return payment to sender', flags: ['--recipient', '--asset'] },
     { name: 'invoice-receipts', description: 'Send payment receipts' },
     { name: 'invoice-notices', description: 'Send cancellation notices' },
-    { name: 'invoice-auto-return', description: 'Show/set auto-return settings', flags: ['--on', '--off', '--global', '--invoice'] },
+    { name: 'invoice-auto-return', description: 'Show/set auto-return settings', flags: ['--enable', '--disable', '--invoice'] },
     { name: 'invoice-transfers', description: 'List related transfers' },
     { name: 'invoice-export', description: 'Export invoice to JSON file' },
     { name: 'invoice-parse-memo', description: 'Parse invoice memo string' },
