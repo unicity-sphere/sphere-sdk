@@ -2356,10 +2356,15 @@ export class Sphere {
       emitEvent,
     });
 
+    // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
-    await communications.load();
-    await groupChat?.load();
-    await market?.load();
+
+    // Non-critical modules load in parallel — failures are non-fatal
+    await Promise.allSettled([
+      communications.load(),
+      groupChat?.load(),
+      market?.load(),
+    ]);
 
     const moduleSet: AddressModuleSet = {
       index,
