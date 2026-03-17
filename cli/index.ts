@@ -190,6 +190,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     market: true,
     groupChat: true,
     accounting: true,
+    swap: true,
   });
 
   sphereInstance = result.sphere;
