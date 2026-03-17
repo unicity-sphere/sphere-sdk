@@ -209,6 +209,36 @@ async function closeSphere(): Promise<void> {
   }
 }
 
+/**
+ * Resolve a coin identifier (symbol, name, or hex ID) to its registry definition.
+ * Tries symbol first, then name, then raw hex ID.
+ * Exits with error if not found.
+ */
+function resolveCoin(identifier: string): { coinId: string; symbol: string; decimals: number; name: string } {
+  const registry = TokenRegistry.getInstance();
+  let def = registry.getDefinitionBySymbol(identifier);
+  if (!def) def = registry.getDefinitionByName(identifier);
+  if (!def) def = registry.getDefinition(identifier);
+  if (!def) {
+    console.error(`Unknown asset: "${identifier}"`);
+    console.error('Use "npm run cli -- assets" to list all registered assets.');
+    process.exit(1);
+  }
+  return {
+    coinId: def.id,
+    symbol: def.symbol || identifier,
+    decimals: def.decimals ?? 8,
+    name: def.name || identifier,
+  };
+}
+
+/** Map common symbols to faucet coin names. */
+const FAUCET_COIN_MAP: Record<string, string> = {
+  'UCT': 'unicity', 'BTC': 'bitcoin', 'ETH': 'ethereum',
+  'SOL': 'solana', 'USDT': 'tether', 'USDC': 'usd-coin',
+  'USDU': 'unicity-usd', 'EURU': 'unicity-eur', 'ALPHT': 'alpha-token',
+};
+
 async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
   if (skip) return;
   try {
@@ -429,15 +459,16 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
   },
   'topup': {
     usage: 'topup [coin] [amount]',
-    description: 'Request test tokens from the Unicity faucet. Without arguments, requests default amounts of all supported coins. With a coin name, requests a specific coin.',
+    description: 'Request test tokens from the Unicity faucet. Without arguments, requests default amounts of all supported coins. With a coin name or symbol, requests a specific coin.',
     flags: [
-      { flag: '<coin>', description: 'Coin name: unicity, bitcoin, ethereum, solana, tether, usd-coin, unicity-usd' },
+      { flag: '<coin>', description: 'Coin symbol (UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT) or faucet name (unicity, bitcoin, ethereum, solana, tether, usd-coin, unicity-usd)' },
       { flag: '<amount>', description: 'Amount to request (overrides default)' },
     ],
     examples: [
       'npm run cli -- topup',
+      'npm run cli -- topup UCT 100',
       'npm run cli -- topup bitcoin 2',
-      'npm run cli -- topup ethereum 100',
+      'npm run cli -- topup ETH 42',
     ],
     notes: [
       'Requires a registered nametag. The faucet is only available on testnet.',
@@ -492,7 +523,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     usage: 'send <recipient> <amount> [--coin <sym>] [--direct|--proxy] [--instant|--conservative] [--no-sync]',
     description: 'Send L3 tokens to a recipient. The recipient can be a @nametag, DIRECT:// address, chain public key (02/03 prefix), or alpha1... L1 address. Amount is in decimal (e.g., 0.5) and is converted to smallest units automatically.',
     flags: [
-      { flag: '--coin <sym>', description: 'Token symbol (UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT)', default: 'UCT' },
+      { flag: '--coin <sym>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID', default: 'UCT' },
       { flag: '--direct', description: 'Force DirectAddress transfer (requires nametag with directAddress)' },
       { flag: '--proxy', description: 'Force PROXY address transfer (works with any nametag)' },
       { flag: '--instant', description: 'Send immediately via Nostr; receiver gets unconfirmed token', default: 'yes' },
@@ -779,7 +810,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Create a new invoice by specifying a target address and requested payment. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
     flags: [
       { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
-      { flag: '--coin <id>', description: 'Hex coin ID (64 chars). Use "asset-info UCT" to find the hex ID for a symbol.' },
+      { flag: '--coin <id>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID' },
       { flag: '--amount <value>', description: 'Requested amount in smallest units (positive integer, no decimals)' },
       { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
       { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
@@ -788,10 +819,9 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags)' },
     ],
     examples: [
-      'npm run cli -- invoice-create --target @alice --coin <hex-coin-id> --amount 1000000',
-      'npm run cli -- invoice-create --target @alice --coin <hex-coin-id> --amount 500000 --memo "Order #42" --due 2026-12-31',
+      'npm run cli -- invoice-create --target @alice --coin UCT --amount 1000000',
+      'npm run cli -- invoice-create --target @alice --coin BTC --amount 500000 --memo "Order #42" --due 2026-12-31',
       'npm run cli -- invoice-create --terms invoice-terms.json',
-      '# Use "asset-info UCT" to look up the hex coin ID for a given symbol.',
     ],
     notes: [
       'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
@@ -863,11 +893,10 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     flags: [
       { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
       { flag: '--amount <value>', description: 'Amount to return in smallest units (required)' },
-      { flag: '--coin <id>', description: 'Hex coin ID (64 chars, required). Use "asset-info UCT" to find the hex ID for a symbol.' },
+      { flag: '--coin <id>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID (required)' },
     ],
     examples: [
-      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --amount 100000 --coin <hex-coin-id>',
-      '# Use "asset-info UCT" to look up the hex coin ID for a given symbol.',
+      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --amount 100000 --coin UCT',
     ],
   },
   'invoice-receipts': {
@@ -926,9 +955,9 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Propose a token swap deal to a counterparty. Both parties deposit tokens into an escrow, which executes the swap atomically.',
     flags: [
       { flag: '--to <recipient>', description: 'Counterparty @nametag or address (required)' },
-      { flag: '--offer-coin <coinId>', description: 'Coin ID you are offering (required)' },
+      { flag: '--offer-coin <coinId>', description: 'Asset symbol (UCT, BTC) or short ID you are offering (required)' },
       { flag: '--offer-amount <amount>', description: 'Amount you are offering in smallest units (required)' },
-      { flag: '--want-coin <coinId>', description: 'Coin ID you want in return (required)' },
+      { flag: '--want-coin <coinId>', description: 'Asset symbol (UCT, BTC) or short ID you want in return (required)' },
       { flag: '--want-amount <amount>', description: 'Amount you want in return in smallest units (required)' },
       { flag: '--escrow <address>', description: 'Custom escrow address (optional, uses config default)' },
       { flag: '--timeout <seconds>', description: 'Swap timeout in seconds (60-86400)', default: '3600' },
@@ -1125,19 +1154,33 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
 
   // --- CURRENCY ---
   'to-smallest': {
-    usage: 'to-smallest <amount>',
-    description: 'Convert a human-readable amount to the smallest unit (satoshi). For example, 1.5 becomes 150000000.',
+    usage: 'to-smallest <amount> [--coin <symbol>]',
+    description: 'Convert a human-readable amount to the smallest unit. Default uses 8 decimals. Use --coin to apply the correct decimals for a specific asset.',
+    flags: [
+      { flag: '--coin <symbol>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID. Determines decimal precision.' },
+    ],
     examples: [
       'npm run cli -- to-smallest 1.5',
       'npm run cli -- to-smallest 0.001',
+      'npm run cli -- to-smallest 100.5 --coin USDT',
+    ],
+    notes: [
+      'When --coin is provided, the wallet is loaded briefly to access the token registry.',
     ],
   },
   'to-human': {
-    usage: 'to-human <amount>',
-    description: 'Convert an amount in smallest units back to human-readable format. For example, 150000000 becomes 1.5.',
+    usage: 'to-human <amount> [--coin <symbol>]',
+    description: 'Convert an amount in smallest units back to human-readable format. Default uses 8 decimals. Use --coin to apply the correct decimals for a specific asset.',
+    flags: [
+      { flag: '--coin <symbol>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID. Determines decimal precision.' },
+    ],
     examples: [
       'npm run cli -- to-human 150000000',
       'npm run cli -- to-human 1000000',
+      'npm run cli -- to-human 1000000 --coin USDT',
+    ],
+    notes: [
+      'When --coin is provided, the wallet is loaded briefly to access the token registry.',
     ],
   },
   'format': {
@@ -2087,23 +2130,15 @@ async function main() {
         // Initialize Sphere first so TokenRegistry is loaded
         const sphere = await getSphere();
 
-        // Resolve symbol to coinId hex and get decimals
-        const registry = TokenRegistry.getInstance();
-        const coinDef = registry.getDefinitionBySymbol(coinSymbol);
-        if (!coinDef) {
-          console.error(`Unknown coin symbol: ${coinSymbol}`);
-          console.error('Available symbols: UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT');
-          process.exit(1);
-        }
-        const coinIdHex = coinDef.id;
-        const decimals = coinDef.decimals ?? 8;
+        // Resolve symbol/name/hex to coinId and get decimals
+        const { coinId: coinIdHex, symbol: resolvedSymbol, decimals } = resolveCoin(coinSymbol);
 
         // Convert amount to smallest units (supports decimal input like "0.2")
         const amountSmallest = toSmallestUnit(amountStr, decimals).toString();
 
         const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode})`;
         const txModeLabel = forceConservative ? ' [conservative]' : '';
-        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}${modeLabel}${txModeLabel}...`);
+        console.log(`\nSending ${amountStr} ${resolvedSymbol} to ${recipient}${modeLabel}${txModeLabel}...`);
 
         const result = await sphere.payments.send({
           recipient,
@@ -2577,20 +2612,34 @@ async function main() {
       case 'to-smallest': {
         const [, amount] = args;
         if (!amount) {
-          console.error('Usage: to-smallest <amount>');
+          console.error('Usage: to-smallest <amount> [--coin <symbol>]');
           process.exit(1);
         }
-        console.log(toSmallestUnit(amount));
+        const coinIdxSmallest = args.indexOf('--coin');
+        let decimalsSmallest = 8;
+        if (coinIdxSmallest !== -1 && args[coinIdxSmallest + 1]) {
+          await getSphere();
+          decimalsSmallest = resolveCoin(args[coinIdxSmallest + 1]).decimals;
+          await closeSphere();
+        }
+        console.log(toSmallestUnit(amount, decimalsSmallest));
         break;
       }
 
       case 'to-human': {
         const [, amount] = args;
         if (!amount) {
-          console.error('Usage: to-human <amount>');
+          console.error('Usage: to-human <amount> [--coin <symbol>]');
           process.exit(1);
         }
-        console.log(toHumanReadable(amount));
+        const coinIdxHuman = args.indexOf('--coin');
+        let decimalsHuman = 8;
+        if (coinIdxHuman !== -1 && args[coinIdxHuman + 1]) {
+          await getSphere();
+          decimalsHuman = resolveCoin(args[coinIdxHuman + 1]).decimals;
+          await closeSphere();
+        }
+        console.log(toHumanReadable(amount, decimalsHuman));
         break;
       }
 
@@ -2679,8 +2728,8 @@ async function main() {
         }
 
         if (coinArg) {
-          // Request specific coin
-          const coin = coinArg.toLowerCase();
+          // Request specific coin — accept symbols (UCT, BTC) as well as faucet names (unicity, bitcoin)
+          const coin = FAUCET_COIN_MAP[coinArg.toUpperCase()] || coinArg.toLowerCase();
           const amount = amountArg ? parseFloat(amountArg) : (DEFAULT_COINS[coin] || 1);
 
           console.log(`Requesting ${amount} ${coin} from faucet for @${nametag}...`);
@@ -3447,7 +3496,8 @@ async function main() {
             process.exit(1);
           }
           const targetAddress = args[targetIdx + 1];
-          const coinId = coinIdx !== -1 ? args[coinIdx + 1] : undefined;
+          const rawCoinValue = coinIdx !== -1 ? args[coinIdx + 1] : undefined;
+          const coinId = rawCoinValue ? resolveCoin(rawCoinValue).coinId : undefined;
           const amount = amountIdx !== -1 ? args[amountIdx + 1] : undefined;
           const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
           const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
@@ -3787,10 +3837,11 @@ async function main() {
           process.exit(1);
         }
 
+        const resolvedReturnCoin = resolveCoin(args[coinIdx3 + 1]);
         const returnParams: import('../modules/accounting/types').ReturnPaymentParams = {
           recipient: args[recipientIdx + 1],
           amount: returnAmount,
-          coinId: args[coinIdx3 + 1],
+          coinId: resolvedReturnCoin.coinId,
         };
 
         const result = await sphere.accounting.returnInvoicePayment(invoiceId, returnParams);
