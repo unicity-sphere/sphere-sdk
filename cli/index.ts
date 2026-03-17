@@ -444,6 +444,28 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       'Also accessible as "top-up" or "faucet".',
     ],
   },
+  'top-up': {
+    usage: 'top-up [coin] [amount]',
+    description: 'Alias for "topup". Request test tokens from the Unicity faucet.',
+    examples: [
+      'npm run cli -- top-up',
+      'npm run cli -- top-up bitcoin 2',
+    ],
+    notes: [
+      'This is an alias for the "topup" command. See "help topup" for full details.',
+    ],
+  },
+  'faucet': {
+    usage: 'faucet [coin] [amount]',
+    description: 'Alias for "topup". Request test tokens from the Unicity faucet.',
+    examples: [
+      'npm run cli -- faucet',
+      'npm run cli -- faucet ethereum 100',
+    ],
+    notes: [
+      'This is an alias for the "topup" command. See "help topup" for full details.',
+    ],
+  },
   'verify-balance': {
     usage: 'verify-balance [--remove] [-v|--verbose]',
     description: 'Verify all tokens against the aggregator to detect spent tokens that were not properly removed from local storage. Useful for cleaning up stale token state.',
