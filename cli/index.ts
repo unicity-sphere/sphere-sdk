@@ -291,13 +291,12 @@ const FAUCET_COIN_MAP: Record<string, string> = {
 async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void> {
   console.log('Syncing...');
 
-  // Step 1: Always fetch pending Nostr events.
+  // Step 1: Always fetch pending Nostr events through the multi-address
+  // transport mux. This ensures DMs (swap proposals, invoice receipts,
+  // escrow messages) are delivered to all module handlers.
   // Tolerates relay being down — continues after timeout.
   try {
-    const transport = sphere.getTransport();
-    if (transport.isConnected() && transport.fetchPendingEvents) {
-      await transport.fetchPendingEvents();
-    }
+    await sphere.fetchPendingEvents();
   } catch {
     // Tolerated — relay may be unreachable for reads
   }

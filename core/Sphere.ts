@@ -1386,6 +1386,23 @@ export class Sphere {
     return this._transport;
   }
 
+  /**
+   * Fetch pending events from Nostr relay and process them through the
+   * multi-address transport mux. This ensures DMs (swap proposals, invoice
+   * receipts, escrow messages, transfer notifications) are delivered to
+   * module handlers before reading in-memory state.
+   *
+   * Tolerates failures — returns silently if transport is not connected.
+   */
+  async fetchPendingEvents(): Promise<void> {
+    if (this._transportMux) {
+      await this._transportMux.fetchPendingEvents();
+    } else if (this._transport.isConnected() && this._transport.fetchPendingEvents) {
+      // Fallback to raw transport if mux not available
+      await this._transport.fetchPendingEvents();
+    }
+  }
+
   getAggregator(): OracleProvider {
     return this._oracle;
   }

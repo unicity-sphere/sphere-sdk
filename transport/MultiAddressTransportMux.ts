@@ -332,6 +332,70 @@ export class MultiAddressTransportMux {
     return this.status === 'connected' && this.nostrClient?.isConnected() === true;
   }
 
+  /**
+   * One-shot fetch of pending events from the relay.
+   * Creates a temporary subscription, waits for EOSE (or timeout),
+   * then processes all collected events through the mux dispatch chain.
+   * This ensures DMs (swap proposals, invoice receipts, etc.) are processed
+   * before the CLI reads in-memory state.
+   */
+  async fetchPendingEvents(): Promise<void> {
+    if (!this.nostrClient?.isConnected() || this.addresses.size === 0) return;
+
+    const allPubkeys: string[] = [];
+    for (const entry of this.addresses.values()) {
+      allPubkeys.push(entry.nostrPubkey);
+    }
+
+    // Fetch gift-wrapped DMs (NIP-17, kind 1059) — these carry swap proposals,
+    // invoice receipts, escrow messages, etc.
+    const filter = new Filter();
+    filter.kinds = [
+      EVENT_KINDS.DIRECT_MESSAGE,
+      EVENT_KINDS.TOKEN_TRANSFER,
+      EVENT_KINDS.PAYMENT_REQUEST,
+      EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+      EventKinds.GIFT_WRAP,
+    ];
+    filter['#p'] = allPubkeys;
+    filter.since = Math.floor(Date.now() / 1000) - 86400; // last 24h
+
+    const events: NostrEvent[] = [];
+
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (subId) this.nostrClient?.unsubscribe(subId);
+        resolve();
+      }, 5000);
+
+      const subId = this.nostrClient!.subscribe(filter, {
+        onEvent: (event) => {
+          events.push({
+            id: event.id,
+            kind: event.kind,
+            content: event.content,
+            tags: event.tags,
+            pubkey: event.pubkey,
+            created_at: event.created_at,
+            sig: event.sig,
+          });
+        },
+        onEndOfStoredEvents: () => {
+          clearTimeout(timeout);
+          this.nostrClient?.unsubscribe(subId);
+          resolve();
+        },
+      });
+    });
+
+    // Process through mux dispatch chain (dedup handles already-seen events)
+    for (const event of events) {
+      await this.handleEvent(event);
+    }
+
+    logger.debug('Mux', `fetchPendingEvents: processed ${events.length} events`);
+  }
+
   getStatus(): ProviderStatus {
     return this.status;
   }
