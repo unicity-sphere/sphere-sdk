@@ -1369,8 +1369,6 @@ npm run cli -- swap-propose --to <recipient> \
 | `--timeout` | Swap timeout in seconds (default: 3600, range: 60-86400) |
 | `--message` | Optional human-readable description sent to counterparty |
 
-> **Deprecated:** `--offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount>` is still accepted for backwards compatibility.
-
 Maps to: `sphere.swap.proposeSwap(deal)` → sends `swap_proposal` DM to counterparty
 
 Output: swap_id, manifest summary, status

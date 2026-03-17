@@ -137,7 +137,7 @@ test('1a: Alice creates an invoice for Bob to pay', () => {
   const bobAddress = cli('identity').stdout.match(/directAddress:\s*(DIRECT:\/\/\S+)/)?.[1];
   assert(!!bobAddress, 'Could not get Alice directAddress');
 
-  const result = cli(`invoice-create --target ${bobAddress} --coin UCT --amount 1000000 --memo "E2E test invoice"`);
+  const result = cli(`invoice-create --target ${bobAddress} --asset "1000000 UCT" --memo "E2E test invoice"`);
   assert(result.exitCode === 0, `invoice-create failed: ${result.stderr}`);
   invoiceId = extractInvoiceId(result.stdout);
   assert(!!invoiceId, 'Could not extract invoice ID from output');
@@ -163,7 +163,7 @@ test('1d: Bob pays the invoice', () => {
   switchProfile('bob');
   assert(!!invoiceId, 'No invoice ID from previous step');
   // Bob needs to import the invoice first (or pay directly by ID)
-  const result = cli(`invoice-pay ${invoiceId!.slice(0, 16)} --amount 1000000 --coin UCT`, TRANSFER_TIMEOUT_MS);
+  const result = cli(`invoice-pay ${invoiceId!.slice(0, 16)} --amount 1000000`, TRANSFER_TIMEOUT_MS);
   assert(result.exitCode === 0, `invoice-pay failed: ${result.stderr}`);
 });
 
@@ -214,7 +214,7 @@ test('2a: Alice creates a second invoice', () => {
   switchProfile('alice');
   const aliceAddr = cli('identity').stdout.match(/directAddress:\s*(DIRECT:\/\/\S+)/)?.[1];
   assert(!!aliceAddr, 'Could not get Alice directAddress');
-  const result = cli(`invoice-create --target ${aliceAddr} --coin UCT --amount 500000 --memo "Cancel test"`);
+  const result = cli(`invoice-create --target ${aliceAddr} --asset "500000 UCT" --memo "Cancel test"`);
   assert(result.exitCode === 0, `invoice-create failed: ${result.stderr}`);
   cancelInvoiceId = extractInvoiceId(result.stdout);
   assert(!!cancelInvoiceId, 'Could not extract invoice ID');

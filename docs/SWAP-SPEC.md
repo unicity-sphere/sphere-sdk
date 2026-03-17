@@ -1881,8 +1881,6 @@ swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symb
              [--escrow <address>] [--timeout <seconds>] [--message <text>]
 ```
 
-> **Deprecated fallback:** `--offer-coin <coinId> --offer-amount <amount> --want-coin <coinId> --want-amount <amount>` is still accepted for backwards compatibility but is not recommended. The new `--offer` / `--want` flags take a quoted `"<amount> <symbol>"` string.
-
 **Step-by-step specification:**
 
 1. Parse all `--flag` arguments using `args.indexOf()`:
@@ -1890,19 +1888,14 @@ swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symb
    const toIdx = args.indexOf('--to');
    const offerIdx = args.indexOf('--offer');
    const wantIdx = args.indexOf('--want');
-   // Deprecated fallback flags
-   const offerCoinIdx = args.indexOf('--offer-coin');
-   const offerAmountIdx = args.indexOf('--offer-amount');
-   const wantCoinIdx = args.indexOf('--want-coin');
-   const wantAmountIdx = args.indexOf('--want-amount');
    const escrowIdx = args.indexOf('--escrow');
    const timeoutIdx = args.indexOf('--timeout');
    const messageIdx = args.indexOf('--message');
    ```
 
-2. Parse `--offer` and `--want` values. Each is a quoted `"<amount> <symbol>"` string (e.g., `"1000000 UCT"`). Split on whitespace to extract amount and symbol. If the new-style flags are missing, fall back to the deprecated `--offer-coin`/`--offer-amount`/`--want-coin`/`--want-amount` flags.
+2. Parse `--offer` and `--want` values. Each is a quoted `"<amount> <symbol>"` string (e.g., `"1000000 UCT"`). Split on whitespace to extract amount and symbol.
 
-   Validate required flags. If neither the new `--offer`/`--want` nor the deprecated flags provide both amount and symbol, print usage and `process.exit(1)`:
+   Validate required flags. If `--offer` or `--want` do not provide both amount and symbol, print usage and `process.exit(1)`:
    ```typescript
    if (toIdx === -1 || !args[toIdx + 1] || !offerAmount || !offerCoin || !wantAmount || !wantCoin) {
      console.error('Usage: swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symbol>" [--escrow <address>] [--timeout <seconds>] [--message <text>]');

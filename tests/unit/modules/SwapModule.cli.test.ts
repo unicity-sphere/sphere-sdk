@@ -492,7 +492,7 @@ describe('SwapModule CLI Commands', () => {
     });
 
     // UT-SWAP-CLI-004
-    it('UT-SWAP-CLI-004: invalid --offer-amount (not positive integer) prints error and exits 1', async () => {
+    it('UT-SWAP-CLI-004: invalid offer amount (not positive integer) prints error and exits 1', async () => {
       const result = await runSwapCommand([
         'swap-propose',
         '--to', '@bob',
