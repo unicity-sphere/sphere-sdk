@@ -2657,8 +2657,14 @@ export class SwapModule {
                   await this.withSwapGate(swapId, async () => {
                     // Skip terminal swaps — late delivery after cancel/fail creates orphan invoices.
                     if (isTerminalProgress(swap.progress)) return;
+                    // Reject malformed payout deliveries without an invoice_id — we need
+                    // the id to track the payout and for idempotency on relay replays.
+                    if (!msg.invoice_id) {
+                      logger.warn(LOG_TAG, `Payout invoice_delivery for swap ${swapId} has no invoice_id — ignoring`);
+                      return;
+                    }
                     // Idempotency: skip relay replays that deliver the same invoice twice.
-                    if (msg.invoice_id && swap.payoutInvoiceId === msg.invoice_id) return;
+                    if (swap.payoutInvoiceId === msg.invoice_id) return;
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
                     } catch (err) {
@@ -2781,6 +2787,21 @@ export class SwapModule {
                           // Transition not valid from current state — stop walking
                           break;
                         }
+                        // Emit the event corresponding to the reached state so UIs
+                        // don't miss state transitions during a catch-up walk.
+                        if (intermediate === 'accepted') {
+                          deps.emitEvent('swap:accepted', { swapId, role: swap.role });
+                        } else if (intermediate === 'announced') {
+                          deps.emitEvent('swap:announced', { swapId, depositInvoiceId: swap.depositInvoiceId ?? '' });
+                        } else if (intermediate === 'concluding') {
+                          deps.emitEvent('swap:concluding', { swapId });
+                        }
+                      }
+                      // Arm the local timer if the walk advanced through 'announced'
+                      // (sets announcedAt). Without this the swap has no timeout protection
+                      // for the remainder of the session — resumeTimers() only runs on load().
+                      if (swap.announcedAt && !isTerminalProgress(swap.progress)) {
+                        this.startLocalTimer(swap);
                       }
                     }
                   }
