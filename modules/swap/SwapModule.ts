@@ -341,9 +341,12 @@ export class SwapModule {
                 // v2 proposer: Bob already announced. Just send a status query.
                 logger.debug(LOG_TAG, `v2 crash recovery: proposer waiting for announce_result ${swapRef.swapId.slice(0, 12)}`);
                 await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
-                // Start bounded timer AFTER the status query is sent so the 30s window
-                // begins from now, not from before the DM was dispatched.
-                this.startAnnounceTimer(swapRef.swapId);
+                // Start bounded timer AFTER the status query is sent, and only if the swap
+                // is still in 'accepted' state — a concurrent invoice_delivery DM may have
+                // advanced it to 'announced' and started the local expiry timer.
+                if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                  this.startAnnounceTimer(swapRef.swapId);
+                }
               } else if (swapRef.protocolVersion === 2 && swapRef.role === 'acceptor') {
                 // v2 acceptor: re-announce with v2 format (both signatures)
                 logger.debug(LOG_TAG, `v2 crash recovery: re-announcing swap ${swapRef.swapId.slice(0, 12)}`);
@@ -361,14 +364,18 @@ export class SwapModule {
                     party_b: weArePartyA ? swapRef.proposerChainPubkey : deps.identity.chainPubkey,
                   };
                   await sendAnnounce_v2(deps.communications, escrowPubkey, swapRef.manifest, signatures, chainPubkeys, swapRef.auxiliary);
-                  // Start bounded timer AFTER announce is sent — the 30s window for
-                  // escrow to reply starts now, not before the DM was dispatched.
-                  this.startAnnounceTimer(swapRef.swapId);
+                  // Guard: only start timer if still in 'accepted' — concurrent invoice_delivery
+                  // may have already moved the swap to 'announced' and started the expiry timer.
+                  if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                    this.startAnnounceTimer(swapRef.swapId);
+                  }
                 } else {
                   // Missing signatures — fall back to status query
                   await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
-                  // Same: timer starts after the DM send completes.
-                  this.startAnnounceTimer(swapRef.swapId);
+                  // Same guard: do not clobber the expiry timer if swap already advanced.
+                  if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                    this.startAnnounceTimer(swapRef.swapId);
+                  }
                 }
               } else {
                 // v1: Re-send announce DM to escrow (idempotent — escrow returns existing state)
@@ -1149,6 +1156,8 @@ export class SwapModule {
       // Assign acceptor signature (v2 only) and auxiliary to swap BEFORE transitioning.
       // transitionProgress calls persistSwap, so these fields are included in the
       // single atomic write — no second persistSwap needed.
+      const prevProgress = swap.progress;
+      const prevUpdatedAt = swap.updatedAt;
       const prevAcceptorSignature = (swap as { acceptorSignature?: string }).acceptorSignature;
       const prevAuxiliary = (swap as { auxiliary?: ManifestAuxiliary }).auxiliary;
       if (isV2 && acceptorSignature) {
@@ -1160,7 +1169,12 @@ export class SwapModule {
       try {
         await this.transitionProgress(swap, 'accepted');
       } catch (err) {
-        // Roll back in-memory mutations so the swap is not left with partial state
+        // Roll back ALL in-memory mutations (progress, updatedAt, and v2 fields) so the
+        // swap is not left in a partially-advanced state if persistSwap throws.
+        // transitionProgress mutates swap.progress before calling persistSwap, so we must
+        // restore progress and updatedAt here — not just the fields we set before the call.
+        swap.progress = prevProgress;
+        swap.updatedAt = prevUpdatedAt;
         (swap as { acceptorSignature?: string }).acceptorSignature = prevAcceptorSignature;
         (swap as { auxiliary?: ManifestAuxiliary }).auxiliary = prevAuxiliary;
         throw err;
@@ -1262,10 +1276,14 @@ export class SwapModule {
           deps.communications, params.escrowPubkey,
           params.manifest, params.signatures, params.chainPubkeys, params.auxiliary,
         );
-        // Announce sent successfully. Start a bounded announce-response timer so the
-        // swap does not hang forever if the escrow's announce_result / invoice_delivery
-        // DM is lost in transit. Cleared when invoice_delivery advances to 'announced'.
-        this.startAnnounceTimer(swapId);
+        // Start the announce-response timer ONLY if the swap is still in 'accepted' state.
+        // sendAnnounce_v2 retries for up to ~82s; during that window the escrow may have
+        // already delivered invoice_delivery (transitioning to 'announced' and starting the
+        // local expiry timer). Calling startAnnounceTimer unconditionally would clobber that
+        // expiry timer via clearLocalTimer, leaving the swap without any local deadline.
+        if (this.swaps.get(swapId)?.progress === 'accepted') {
+          this.startAnnounceTimer(swapId);
+        }
       } catch (err) {
         // Announce failure — re-acquire gate to transition to failed and notify proposer
         await this.withSwapGate(swapId, async () => {

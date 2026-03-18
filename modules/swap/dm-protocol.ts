@@ -589,10 +589,18 @@ function parseEscrowMessage(json: string): ParsedSwapDM | null {
 // Per-type escrow message validators
 // ---------------------------------------------------------------------------
 
+/** Maximum length for invoice ID strings received from escrow. */
+const MAX_INVOICE_ID_LEN = 128;
+
+/** Validates that a value is a non-empty string within the invoice ID length budget. */
+function isValidInvoiceId(val: unknown): val is string {
+  return typeof val === 'string' && val.length > 0 && val.length <= MAX_INVOICE_ID_LEN;
+}
+
 function parseAnnounceResult(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
-  if (typeof obj.state !== 'string') return null;
-  if (typeof obj.deposit_invoice_id !== 'string') return null;
+  if (typeof obj.state !== 'string' || obj.state.length > 64) return null;
+  if (!isValidInvoiceId(obj.deposit_invoice_id)) return null;
   if (typeof obj.is_new !== 'boolean') return null;
 
   return {
@@ -642,6 +650,13 @@ const BLOCKED_PAYLOAD_KEYS = new Set([
 const MAX_PAYLOAD_STRING_LEN = 4096;
 
 /**
+ * Maximum number of extensibility keys copied from a single escrow payload.
+ * A compromised escrow could send thousands of keys to inflate persisted swap storage.
+ * Cap at 20 to bound the per-swap storage amplification to ≤20 * 4096 = ~80KB.
+ */
+const MAX_EXTENSIBILITY_KEYS = 20;
+
+/**
  * Safely forward extensibility keys from an escrow payload, blocking any key
  * that could shadow Object.prototype methods or cause memory amplification.
  */
@@ -650,7 +665,9 @@ function copyExtensibilityKeys(
   skipKeys: ReadonlySet<string>,
   target: Record<string, unknown>,
 ): void {
+  let copied = 0;
   for (const key of Object.keys(obj)) {
+    if (copied >= MAX_EXTENSIBILITY_KEYS) break;
     if (skipKeys.has(key) || BLOCKED_PAYLOAD_KEYS.has(key)) continue;
     const val = obj[key];
     // Only forward safe primitive values — objects and arrays are rejected to prevent
@@ -664,14 +681,19 @@ function copyExtensibilityKeys(
       // Reject NaN and ±Infinity: JSON.stringify converts them to `null`, silently
       // corrupting the persisted value on the next storage round-trip.
       if (Number.isFinite(val)) target[key] = val;
+    } else {
+      // Skip objects, arrays, undefined
+      continue;
     }
-    // Skip objects, arrays, undefined
+    copied++;
   }
 }
 
 function parseStatusResult(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
-  if (typeof obj.state !== 'string') return null;
+  // Cap state length: known escrow state names are short (<32 chars); a longer value
+  // indicates a malformed or malicious payload and should be rejected.
+  if (typeof obj.state !== 'string' || obj.state.length > 64) return null;
 
   const SKIP = new Set(['type', 'swap_id', 'state']);
   const payload: Record<string, unknown> = {
@@ -715,7 +737,9 @@ function parseSwapCancelled(obj: Record<string, unknown>): ParsedSwapDM | null {
     payload: {
       type: 'swap_cancelled',
       swap_id: obj.swap_id as string,
-      reason: obj.reason as string,
+      // Cap reason length: persisted via swap.error and surfaced in UI; a malicious
+      // escrow filling the entire 128KB DM budget would inflate stored swap records.
+      reason: obj.reason.slice(0, MAX_PAYLOAD_STRING_LEN),
       ...(typeof obj.deposits_returned === 'boolean' ? { deposits_returned: obj.deposits_returned } : {}),
     },
   };
@@ -732,9 +756,9 @@ function parseBounceNotification(obj: Record<string, unknown>): ParsedSwapDM | n
     payload: {
       type: 'bounce_notification',
       swap_id: obj.swap_id as string,
-      reason: obj.reason as string,
-      returned_amount: obj.returned_amount as string,
-      returned_currency: obj.returned_currency as string,
+      reason: obj.reason.slice(0, MAX_PAYLOAD_STRING_LEN),
+      returned_amount: obj.returned_amount.slice(0, MAX_PAYLOAD_STRING_LEN),
+      returned_currency: obj.returned_currency.slice(0, MAX_PAYLOAD_STRING_LEN),
     },
   };
 }

@@ -280,6 +280,24 @@ export function verifySwapSignature(
  * @param chainPubkey - The signer's 33-byte compressed chain pubkey (hex).
  * @returns A NametagBindingProof with the signature.
  */
+/**
+ * Maximum nametag length for binding proofs. Matches the nametag registration
+ * limit used elsewhere in the SDK to prevent oversized signed messages and
+ * storage amplification via the auxiliary field.
+ */
+const MAX_NAMETAG_LEN = 64;
+
+/** Nametag character whitelist: lowercase alphanumeric, hyphen, underscore. */
+const NAMETAG_RE = /^[a-z0-9_-]+$/;
+
+/**
+ * Returns true if the given nametag string is within acceptable bounds for
+ * inclusion in a binding proof.
+ */
+function isValidNametag(nametag: string): boolean {
+  return nametag.length > 0 && nametag.length <= MAX_NAMETAG_LEN && NAMETAG_RE.test(nametag);
+}
+
 export function createNametagBinding(
   privateKey: string,
   nametag: string,
@@ -287,6 +305,9 @@ export function createNametagBinding(
   swapId: string,
   chainPubkey: string,
 ): NametagBindingProof {
+  if (!isValidNametag(nametag)) {
+    throw new Error(`Invalid nametag for binding proof: "${nametag.slice(0, 80)}"`);
+  }
   const message = `nametag_bind:${nametag}:${directAddress}:${swapId}`;
   const signature = signMessage(privateKey, message);
   return { nametag, direct_address: directAddress, chain_pubkey: chainPubkey, signature };
@@ -303,6 +324,10 @@ export function verifyNametagBinding(
   proof: NametagBindingProof,
   swapId: string,
 ): boolean {
+  // Reject structurally invalid nametags before computing the signed message.
+  // This prevents a malicious peer from triggering a crypto operation on an
+  // arbitrarily large string.
+  if (!isValidNametag(proof.nametag)) return false;
   const message = `nametag_bind:${proof.nametag}:${proof.direct_address}:${swapId}`;
   return verifySignedMessage(message, proof.signature, proof.chain_pubkey);
 }
