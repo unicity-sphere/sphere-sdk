@@ -255,6 +255,10 @@ export type {
   IntentStatus,
 } from './modules/market';
 
+// Address parsing and validation
+export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
+export type { AddressType, ParsedAddress } from './core/address';
+
 // Swap module
 export { SwapModule, createSwapModule } from './modules/swap/index';
 export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity } from './modules/swap/manifest';

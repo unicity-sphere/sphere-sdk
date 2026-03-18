@@ -13,6 +13,7 @@ import canonicalize from 'canonicalize';
 import { sha256 } from '../../core/crypto.js';
 import { randomHex } from '../../core/utils.js';
 
+import { isValidAddress } from '../../core/address.js';
 import type { ManifestFields, SwapDeal, SwapManifest } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -115,14 +116,14 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
     errors.push('swap_id must be exactly 64 lowercase hex characters');
   }
 
-  // party_a_address: non-empty string starting with DIRECT://
-  if (typeof manifest.party_a_address !== 'string' || !manifest.party_a_address.startsWith('DIRECT://')) {
-    errors.push('party_a_address must be a non-empty string starting with DIRECT://');
+  // party_a_address: valid Unicity address (DIRECT://, PROXY://, or @nametag)
+  if (typeof manifest.party_a_address !== 'string' || !isValidAddress(manifest.party_a_address)) {
+    errors.push('party_a_address must be a valid address (DIRECT://, PROXY://, or @nametag)');
   }
 
-  // party_b_address: non-empty string starting with DIRECT://, differs from party_a
-  if (typeof manifest.party_b_address !== 'string' || !manifest.party_b_address.startsWith('DIRECT://')) {
-    errors.push('party_b_address must be a non-empty string starting with DIRECT://');
+  // party_b_address: valid address, differs from party_a
+  if (typeof manifest.party_b_address !== 'string' || !isValidAddress(manifest.party_b_address)) {
+    errors.push('party_b_address must be a valid address (DIRECT://, PROXY://, or @nametag)');
   } else if (manifest.party_b_address === manifest.party_a_address) {
     errors.push('party_b_address must differ from party_a_address');
   }
