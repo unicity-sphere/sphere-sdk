@@ -191,18 +191,22 @@ Signing the full JCS-canonical manifest string would work equivalently but adds 
 
 ```typescript
 interface ManifestFields {
-  party_a_address: string;        // DIRECT:// address
-  party_b_address: string;        // DIRECT:// address
-  party_a_currency_to_change: string;
-  party_a_value_to_change: string;
-  party_b_currency_to_change: string;
-  party_b_value_to_change: string;
-  timeout: number;
-  salt: string;
-  escrow_address: string;         // NEW: DIRECT:// address of the escrow
-  protocol_version: number;       // NEW: 2 for v2 manifests
+  readonly party_a_address: string;
+  readonly party_b_address: string;
+  readonly party_a_currency_to_change: string;
+  readonly party_a_value_to_change: string;
+  readonly party_b_currency_to_change: string;
+  readonly party_b_value_to_change: string;
+  readonly timeout: number;
+  readonly salt: string;
+  /** Escrow DIRECT:// address (v2 only, required when protocol_version === 2) */
+  readonly escrow_address?: string;
+  /** Protocol version: 2 for signed manifests (v2 only, required when present) */
+  readonly protocol_version?: number;
 }
 ```
+
+> **Validation note:** When `protocol_version === 2`, `escrow_address` is REQUIRED. When `protocol_version` is absent (v1), `escrow_address` is also absent. JCS canonicalization omits `undefined` properties, so v1 manifests hash identically with or without the new fields declared on the TypeScript interface.
 
 The `swap_id` computation remains `SHA-256(JCS(fields))` but now includes the escrow address and protocol version in the canonical JSON. `computeSwapId()` must be updated to include these fields in the JCS input.
 
@@ -350,6 +354,9 @@ interface SwapRef {
   proposerSignature?: string;
   /** Acceptor's signature over "swap_consent:{swap_id}:{escrow_address}" (set at acceptance time) */
   acceptorSignature?: string;
+  /** Proposer's chain pubkey (from v2 proposal DM's proposer_chain_pubkey field).
+   * Stored by the acceptor for use in the announce_v2 chain_pubkeys map. */
+  readonly proposerChainPubkey?: string;
   /** Nametag binding proofs (set at proposal time if nametags used) */
   auxiliary?: ManifestAuxiliary;
   /** Protocol version (1 = legacy, 2 = signed). Default: 2. */
@@ -569,6 +576,10 @@ If any verification fails, the escrow rejects the announce with an `error` DM.
 - Adding or modifying auxiliary data does not change the swap_id.
 - The escrow treats binding verification as an additional validation step, not a manifest identity change.
 
+### 6.8 Nametag Transfers After Proposal
+
+Nametag transfers after proposal do not affect the swap. The manifest binds to resolved addresses at proposal time. Deposits and payouts use the locked-in `DIRECT://` addresses, not re-resolved addresses.
+
 ---
 
 ## 7. SDK Implementation Changes
@@ -696,7 +707,14 @@ await this.withSwapGate(swapId, async () => {
   await this.transitionProgress(swap, 'accepted');
 
   // NEW: Step 4b — Sign the swap manifest (domain-prefixed: "swap_consent:{swapId}:{escrowAddress}")
-  const acceptorSignature = signSwapManifest(deps.identity.privateKey, swap.manifest.swap_id, swap.escrowDirectAddress!);
+  //
+  // IMPORTANT: Bob's signature MUST use `manifest.escrow_address` (the escrow address
+  // locked into the manifest at proposal time), NOT a re-resolved address from the
+  // @nametag. The manifest fields are immutable — the escrow_address is part of the
+  // swap_id hash. Re-resolving could yield a different address if the nametag was
+  // reassigned, causing a signature mismatch.
+  const escrowAddressForSignature = swap.manifest.escrow_address!;
+  const acceptorSignature = signSwapManifest(deps.identity.privateKey, swap.manifest.swap_id, escrowAddressForSignature);
   swap.acceptorSignature = acceptorSignature;
 
   // NEW: Step 4c — Create nametag binding if acceptor used @nametag
@@ -743,20 +761,19 @@ await this.withSwapGate(swapId, async () => {
   }
 
   // Build announce_v2 with both signatures and chain pubkeys
-  const proposerChainPubkey = /* resolved from counterparty PeerInfo */;
+  const proposerChainPubkey = swap.proposerChainPubkey!;
   const acceptorChainPubkey = deps.identity.chainPubkey;
 
+  // The proposer is always the one who created the manifest.
+  // If we (acceptor) are party A, the proposer is party B — and vice versa.
+  const weArePartyA = ourAddresses.has(swap.manifest.party_a_address);
   const signatures: ManifestSignatures = {
-    party_a: swap.role === 'acceptor' && !ourAddresses.has(swap.manifest.party_a_address)
-      ? swap.proposerSignature   // proposer is party A
-      : acceptorSignature,       // acceptor is party A
-    party_b: swap.role === 'acceptor' && !ourAddresses.has(swap.manifest.party_b_address)
-      ? swap.proposerSignature   // proposer is party B
-      : acceptorSignature,       // acceptor is party B
+    party_a: weArePartyA ? acceptorSignature : swap.proposerSignature!,
+    party_b: weArePartyA ? swap.proposerSignature! : acceptorSignature,
   };
 
   // Determine which chain pubkey belongs to which party
-  const acceptorIsPartyA = ourAddresses.has(swap.manifest.party_a_address);
+  const acceptorIsPartyA = weArePartyA;
   const chainPubkeys = {
     party_a: acceptorIsPartyA ? acceptorChainPubkey : proposerChainPubkey,
     party_b: acceptorIsPartyA ? proposerChainPubkey : acceptorChainPubkey,
@@ -833,11 +850,14 @@ case 'proposal': {
     }
   }
 
-  // Store proposer's signature in SwapRef
+  // Store proposer's signature and chain pubkey in SwapRef
   const swap: SwapRef = {
     // ... existing fields ...
     proposerSignature: proposalMsg.version === 2
       ? proposalMsg.proposer_signature
+      : undefined,
+    proposerChainPubkey: proposalMsg.version === 2
+      ? proposalMsg.proposer_chain_pubkey
       : undefined,
     auxiliary: proposalMsg.version === 2
       ? proposalMsg.auxiliary
