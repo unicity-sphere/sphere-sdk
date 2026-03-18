@@ -1652,6 +1652,8 @@ export class SwapModule {
         // If persistSwap throws, we ROLL BACK all in-memory changes so the swap
         // reloads as 'completed' next session and verifyPayout retries fraud detection.
         const prevProgress = swap.progress;
+        const prevPayoutVerified = (swap as { payoutVerified?: boolean }).payoutVerified;
+        const prevError = (swap as { error?: string }).error;
         const prevUpdatedAt = swap.updatedAt;
         swap.progress = 'failed';
         (swap as { payoutVerified?: boolean }).payoutVerified = false;
@@ -1671,13 +1673,11 @@ export class SwapModule {
         } catch (persistErr) {
           // Storage failed — roll back so next load retries fraud detection.
           swap.progress = prevProgress;
-          (swap as { payoutVerified?: boolean }).payoutVerified = undefined;
-          (swap as { error?: string }).error = undefined;
+          (swap as { payoutVerified?: boolean }).payoutVerified = prevPayoutVerified;
+          (swap as { error?: string }).error = prevError;
           swap.updatedAt = prevUpdatedAt;
           this.terminalSwapIds.delete(swap.swapId);
           this._storedTerminalEntries.splice(entryIdx, 1);
-          // Re-arm local timer so the swap doesn't get stranded.
-          this.startLocalTimer(swap);
           logger.warn(LOG_TAG, `failPayout: persistSwap failed for ${swapId}; fraud detection will retry on next load:`, persistErr);
           throw persistErr;
         }
@@ -2653,6 +2653,8 @@ export class SwapModule {
                   // §12.4.3: Payout invoice delivery
                   let shouldAutoVerify = false;
                   await this.withSwapGate(swapId, async () => {
+                    // Skip terminal swaps — late delivery after cancel/fail creates orphan invoices.
+                    if (isTerminalProgress(swap.progress)) return;
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
                     } catch (err) {

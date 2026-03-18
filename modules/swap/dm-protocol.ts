@@ -862,8 +862,10 @@ const NAMETAG_BINDING_RE = /^[a-z0-9][a-z0-9_-]*$/;
  * Validates a nametag binding proof has the expected structure and field formats.
  * Used to reject malformed auxiliary data before it reaches the swap handler.
  */
-// DIRECT:// address: "DIRECT://<64-hex-char-pubkey>" — total length is exactly 73 chars.
-const DIRECT_ADDRESS_RE = /^DIRECT:\/\/[0-9a-f]{64}$/;
+// DIRECT:// address: "DIRECT://<hex>" where the hex suffix is 64-80 chars.
+// Real Unicity addresses are 72 hex chars (32-byte SHA-256 predicate hash + 4-byte checksum).
+// Range 64-80 matches the documented core/address.ts spec and DIRECT_HEX_RE in manifest.ts.
+const DIRECT_ADDRESS_RE = /^DIRECT:\/\/[0-9a-f]{64,80}$/;
 
 function isValidNametagBinding(value: unknown): boolean {
   if (!isObject(value)) return false;

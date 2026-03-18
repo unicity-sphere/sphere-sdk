@@ -327,9 +327,10 @@ export function createNametagBinding(
   if (!isValidNametag(nametag)) {
     throw new Error(`Invalid nametag for binding proof: "${nametag.slice(0, 80)}"`);
   }
-  // Guard: directAddress must be a valid DIRECT:// address so the colon-delimiter
-  // invariant in the signed message holds (the pubkey suffix is hex-only, no colons).
-  if (!isValidDirectAddress(directAddress)) {
+  // Guard: directAddress must be a strict hex DIRECT:// address (DIRECT_HEX_RE).
+  // Using DIRECT_HEX_RE (not the permissive isValidDirectAddress) aligns with
+  // verifyNametagBinding, so every proof this function creates is verifiable.
+  if (!DIRECT_HEX_RE.test(directAddress)) {
     throw new Error(`Invalid directAddress for binding proof: "${directAddress.slice(0, 80)}"`);
   }
   // Message format: "nametag_bind:{nametag}:{directAddress}:{swapId}"
