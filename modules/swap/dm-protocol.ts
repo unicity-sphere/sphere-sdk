@@ -770,8 +770,10 @@ function parseEscrowError(obj: Record<string, unknown>): ParsedSwapDM | null {
     kind: 'escrow',
     payload: {
       type: 'error',
-      error: obj.error as string,
-      ...(typeof obj.swap_id === 'string' ? { swap_id: obj.swap_id } : {}),
+      // Cap error string length — consistent with reason/state caps on all other escrow parsers.
+      error: obj.error.slice(0, MAX_PAYLOAD_STRING_LEN),
+      // Validate swap_id with the same isValidSwapId check used by every other parser.
+      ...(isValidSwapId(obj.swap_id) ? { swap_id: obj.swap_id as string } : {}),
       // Validate details array: cap length and restrict to primitive elements only,
       // matching the same memory-safety guarantees as copyExtensibilityKeys.
       ...(Array.isArray(obj.details) ? {
