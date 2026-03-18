@@ -1531,6 +1531,17 @@ export class SwapModule {
         throw new SphereError('Payout invoice not yet received', 'SWAP_WRONG_STATE');
       }
 
+      // Idempotent for already-completed swaps: return the stored verification result
+      // rather than throwing a misleading SWAP_WRONG_STATE from assertTransition.
+      if (swap.progress === 'completed') return swap.payoutVerified ?? false;
+      // For other terminal states (cancelled/failed): clearly reject further verification.
+      if (isTerminalProgress(swap.progress)) {
+        throw new SphereError(
+          `Cannot verify payout: swap is already ${swap.progress}`,
+          'SWAP_WRONG_STATE',
+        );
+      }
+
     // Get invoice ref to access terms
     const invoiceRef = deps.accounting.getInvoice(swap.payoutInvoiceId) as {
       invoiceId: string;
@@ -1582,58 +1593,41 @@ export class SwapModule {
       expectedAmount = swap.manifest.party_a_value_to_change;
     }
 
+    // Helper: transition to failed and emit — used for fraud-indicative term mismatches.
+    // Using transitionProgress (not bare persistSwap) ensures the swap is marked terminal
+    // so that subsequent DM handlers cannot advance it to 'completed' after we emit 'failed'.
+    const failPayout = async (error: string): Promise<false> => {
+      await this.transitionProgress(swap, 'failed', { payoutVerified: false, error });
+      deps.emitEvent('swap:failed', { swapId, error });
+      return false;
+    };
+
     // Verify invoice terms match expectations
     const targetTerms = invoiceRef.terms.targets[0];
     if (!targetTerms || !targetTerms.assets[0]?.coin) {
-      swap.payoutVerified = false;
-      await this.persistSwap(swap);
-      deps.emitEvent('swap:failed', {
-        swapId,
-        error: 'Payout invoice has no valid target or asset',
-      });
-      return false;
+      return failPayout('Payout invoice has no valid target or asset');
     }
 
     if (targetTerms.assets[0].coin[0] !== expectedCoinId) {
-      swap.payoutVerified = false;
-      await this.persistSwap(swap);
-      deps.emitEvent('swap:failed', {
-        swapId,
-        error: `Payout invoice currency mismatch: expected ${expectedCoinId}, got ${targetTerms.assets[0].coin[0]}`,
-      });
-      return false;
+      return failPayout(
+        `Payout invoice currency mismatch: expected ${expectedCoinId}, got ${targetTerms.assets[0].coin[0]}`,
+      );
     }
 
     if (targetTerms.assets[0].coin[1] !== expectedAmount) {
-      swap.payoutVerified = false;
-      await this.persistSwap(swap);
-      deps.emitEvent('swap:failed', {
-        swapId,
-        error: `Payout invoice amount mismatch: expected ${expectedAmount}, got ${targetTerms.assets[0].coin[1]}`,
-      });
-      return false;
+      return failPayout(
+        `Payout invoice amount mismatch: expected ${expectedAmount}, got ${targetTerms.assets[0].coin[1]}`,
+      );
     }
 
     // Verify payout invoice targets OUR address (not someone else's)
     if (!myDirectAddresses.has(targetTerms.address)) {
-      swap.payoutVerified = false;
-      await this.persistSwap(swap);
-      deps.emitEvent('swap:failed', {
-        swapId,
-        error: 'Payout invoice targets wrong address',
-      });
-      return false;
+      return failPayout('Payout invoice targets wrong address');
     }
 
     // Verify creator is defined (escrow invoices are non-anonymous)
     if (!invoiceRef.terms.creator) {
-      swap.payoutVerified = false;
-      await this.persistSwap(swap);
-      deps.emitEvent('swap:failed', {
-        swapId,
-        error: 'Payout invoice has no creator (anonymous invoice)',
-      });
-      return false;
+      return failPayout('Payout invoice has no creator (anonymous invoice)');
     }
 
     // Verify coverage from invoice status
@@ -1660,25 +1654,18 @@ export class SwapModule {
     if (escrowAddr) {
       const escrowPeer = await deps.resolve(escrowAddr);
       if (escrowPeer && invoiceRef.terms.creator !== escrowPeer.chainPubkey) {
-        swap.payoutVerified = false;
-        await this.persistSwap(swap);
-        deps.emitEvent('swap:failed', {
-          swapId,
-          error: 'Payout invoice creator does not match escrow pubkey',
-        });
-        return false;
+        return failPayout('Payout invoice creator does not match escrow pubkey');
       }
     }
 
-    // Validate L3 inclusion proofs
+    // Validate L3 inclusion proofs.
+    // NOTE: validate() checks ALL wallet tokens, not only payout tokens. An unrelated
+    // invalid token should NOT cause the swap to fail — the swap's payout may be
+    // perfectly valid. We therefore do not call failPayout() here; instead we return
+    // false so the caller can retry once the unrelated token issue is resolved.
     const validationResult = await deps.payments.validate();
     if (validationResult.invalid.length > 0) {
-      swap.payoutVerified = false;
-      await this.persistSwap(swap);
-      deps.emitEvent('swap:failed', {
-        swapId,
-        error: 'L3 proof validation found invalid tokens',
-      });
+      logger.warn(LOG_TAG, `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${validationResult.invalid.length} invalid token(s) — retry after wallet sync`);
       return false;
     }
 
@@ -2869,12 +2856,23 @@ export class SwapModule {
 
         // Determine which party deposited by matching coinId against manifest
         let party: 'A' | 'B';
+        let requiredAmount: string;
         if (transfer.coinId === swap.manifest.party_a_currency_to_change) {
           party = 'A';
+          requiredAmount = swap.manifest.party_a_value_to_change;
         } else if (transfer.coinId === swap.manifest.party_b_currency_to_change) {
           party = 'B';
+          requiredAmount = swap.manifest.party_b_value_to_change;
         } else {
           // Unknown coinId — not attributable to either party
+          return;
+        }
+
+        // Only emit swap:deposit_confirmed when the payment meets the required amount.
+        // A dust payment in the correct coinId should not trigger a confirmation event —
+        // the escrow validates actual amounts via invoice:covered, but consumers relying
+        // on this event for UI confirmation should see accurate data.
+        if (BigInt(transfer.amount) < BigInt(requiredAmount)) {
           return;
         }
 
