@@ -4406,6 +4406,36 @@ async function main() {
         console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
 
         if (depositFlag) {
+          // acceptSwap() sends the announce to the escrow but the escrow's invoice_delivery
+          // DM arrives asynchronously. Wait for swap:announced before depositing.
+          const acceptAnnounced = await new Promise<boolean>((resolve) => {
+            const acceptUnsubs: (() => void)[] = [];
+            const timeout = setTimeout(() => {
+              acceptUnsubs.forEach(u => u());
+              resolve(false);
+            }, 60_000);
+            const done = (ok: boolean) => {
+              clearTimeout(timeout);
+              acceptUnsubs.forEach(u => u());
+              resolve(ok);
+            };
+            acceptUnsubs.push(sphere.on('swap:announced', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(true);
+            }));
+            acceptUnsubs.push(sphere.on('swap:failed', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+            acceptUnsubs.push(sphere.on('swap:cancelled', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+          });
+          if (!acceptAnnounced) {
+            const finalStatus = await swapModule.getSwapStatus(swapId);
+            console.error(`Swap did not reach 'announced' state (current: ${finalStatus?.progress ?? 'unknown'}). Check swap-status for details.`);
+            await closeSphere();
+            process.exit(1);
+          }
+
           const depositResult = await swapModule.deposit(swapId);
           console.log(`Deposit sent: ${depositResult.id}`);
 
@@ -4510,6 +4540,43 @@ async function main() {
         await ensureSync(sphere, 'full');
 
         const swapId = swapModule.resolveSwapId(swapIdArg);
+
+        // If the swap is still in 'accepted' (crash recovery re-announced to escrow but
+        // the escrow's invoice_delivery DM hasn't arrived yet), wait for swap:announced
+        // before calling deposit(). Crash recovery fires fire-and-forget after module load
+        // so the escrow response may arrive slightly after ensureSync completes.
+        const swapStatusBefore = await swapModule.getSwapStatus(swapId);
+        if (swapStatusBefore?.progress === 'accepted') {
+          console.log('Waiting for escrow to deliver deposit invoice (up to 60s)...');
+          const announced = await new Promise<boolean>((resolve) => {
+            const announceUnsubs: (() => void)[] = [];
+            const timeout = setTimeout(() => {
+              announceUnsubs.forEach(u => u());
+              resolve(false);
+            }, 60_000);
+            const done = (ok: boolean) => {
+              clearTimeout(timeout);
+              announceUnsubs.forEach(u => u());
+              resolve(ok);
+            };
+            announceUnsubs.push(sphere.on('swap:announced', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(true);
+            }));
+            announceUnsubs.push(sphere.on('swap:failed', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+            announceUnsubs.push(sphere.on('swap:cancelled', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+          });
+          if (!announced) {
+            const finalStatus = await swapModule.getSwapStatus(swapId);
+            console.error(`Swap did not reach 'announced' state (current: ${finalStatus?.progress ?? 'unknown'}). Try again shortly or check swap-status.`);
+            await closeSphere();
+            process.exit(1);
+          }
+        }
+
         const result = await swapModule.deposit(swapId);
         console.log('Deposit result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));

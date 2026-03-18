@@ -371,6 +371,14 @@ export class SwapModule {
                     party_b: weArePartyA ? swapRef.proposerChainPubkey : deps.identity.chainPubkey,
                   };
                   await sendAnnounce_v2(deps.communications, escrowPubkey, swapRef.manifest, signatures, chainPubkeys, swapRef.auxiliary);
+                  // If the escrow previously sent announce_result (depositInvoiceId is stored)
+                  // but invoice_delivery was never received (e.g. relay purged the event),
+                  // explicitly request the deposit invoice rather than relying on the escrow
+                  // to re-deliver it spontaneously in response to the re-announce.
+                  if (this.swaps.get(swapRef.swapId)?.depositInvoiceId &&
+                      this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                    await sendRequestInvoice(deps.communications, escrowPubkey, swapRef.swapId, 'deposit');
+                  }
                   // Guard: only start timer if still in 'accepted' — concurrent invoice_delivery
                   // may have already moved the swap to 'announced' and started the expiry timer.
                   if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
