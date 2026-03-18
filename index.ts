@@ -257,9 +257,11 @@ export type {
 
 // Swap module
 export { SwapModule, createSwapModule } from './modules/swap/index';
+export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity } from './modules/swap/manifest';
 export type {
   SwapDeal,
   SwapManifest,
+  ManifestFields,
   SwapProgress,
   SwapRole,
   SwapRef,
