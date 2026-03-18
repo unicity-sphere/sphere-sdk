@@ -249,7 +249,10 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
  */
 export function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string {
   // Message format: "swap_consent:{swapId}:{escrowAddress}"
-  // Colon is used as a delimiter. swapId is guaranteed hex-only (no colons).
+  // Colon is used as a delimiter. Both fields must be hex-only to uphold the invariant.
+  if (!SWAP_ID_RE.test(swapId)) {
+    throw new Error(`signSwapManifest: swapId must be 64 lowercase hex chars`);
+  }
   // Enforce DIRECT_HEX_RE here — isValidDirectAddress() in core/address.ts is
   // intentionally permissive (accepts test fixtures); the signer must be strict.
   if (!DIRECT_HEX_RE.test(escrowAddress)) {
@@ -274,6 +277,10 @@ export function verifySwapSignature(
   signature: string,
   chainPubkey: string,
 ): boolean {
+  // Guard against colon-delimiter injection: both fields must be hex-only.
+  // A swapId or escrowAddress containing colons would let a peer construct a
+  // message that re-partitions into a different valid {swapId, escrowAddress}.
+  if (!SWAP_ID_RE.test(swapId) || !DIRECT_HEX_RE.test(escrowAddress)) return false;
   const message = `swap_consent:${swapId}:${escrowAddress}`;
   return verifySignedMessage(message, signature, chainPubkey);
 }
@@ -333,10 +340,12 @@ export function createNametagBinding(
   if (!DIRECT_HEX_RE.test(directAddress)) {
     throw new Error(`Invalid directAddress for binding proof: "${directAddress.slice(0, 80)}"`);
   }
+  if (!SWAP_ID_RE.test(swapId)) {
+    throw new Error(`Invalid swapId for binding proof: must be 64 lowercase hex chars`);
+  }
   // Message format: "nametag_bind:{nametag}:{directAddress}:{swapId}"
   // Colon is used as a delimiter. nametag is [a-z0-9_-] (no colons, validated above).
-  // swapId is hex-only (no colons). directAddress must be a DIRECT:// address where
-  // the pubkey suffix is hex-only — enforced by caller validation before this point.
+  // directAddress is DIRECT_HEX_RE (hex-only, no colons). swapId is SWAP_ID_RE (hex-only).
   const message = `nametag_bind:${nametag}:${directAddress}:${swapId}`;
   const signature = signMessage(privateKey, message);
   return { nametag, direct_address: directAddress, chain_pubkey: chainPubkey, signature };
@@ -360,6 +369,8 @@ export function verifyNametagBinding(
   // Symmetric guard to createNametagBinding: enforce hex-only DIRECT:// address
   // to uphold the colon-delimiter invariant in the signed message.
   if (!DIRECT_HEX_RE.test(proof.direct_address)) return false;
+  // Guard swapId: hex-only ensures no colon can corrupt the message delimiter.
+  if (!SWAP_ID_RE.test(swapId)) return false;
   const message = `nametag_bind:${proof.nametag}:${proof.direct_address}:${swapId}`;
   return verifySignedMessage(message, proof.signature, proof.chain_pubkey);
 }

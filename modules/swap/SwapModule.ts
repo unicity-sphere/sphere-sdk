@@ -1768,6 +1768,8 @@ export class SwapModule {
     }
 
     deps.emitEvent('swap:completed', { swapId, payoutVerified: true });
+    // Clean up the dedup Set now that verified completion was emitted.
+    this._completedEventEmittedUnverified.delete(swapId);
 
     return true;
     }); // end withSwapGate
@@ -2655,10 +2657,18 @@ export class SwapModule {
                   await this.withSwapGate(swapId, async () => {
                     // Skip terminal swaps — late delivery after cancel/fail creates orphan invoices.
                     if (isTerminalProgress(swap.progress)) return;
+                    // Idempotency: skip relay replays that deliver the same invoice twice.
+                    if (msg.invoice_id && swap.payoutInvoiceId === msg.invoice_id) return;
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
                     } catch (err) {
                       logger.error(LOG_TAG, `Failed to import payout invoice for swap ${swapId}:`, err);
+                      // Mirror the deposit invoice handler: fail the swap so it doesn't strand
+                      // in 'concluding' forever. Crash recovery re-requests on next load.
+                      await this.transitionProgress(swap, 'failed', {
+                        error: `Payout invoice import failed: ${err instanceof Error ? err.message : String(err)}`,
+                      });
+                      deps.emitEvent('swap:failed', { swapId, error: 'Payout invoice import failed' });
                       return;
                     }
 
@@ -2686,8 +2696,11 @@ export class SwapModule {
                   // verifyPayout's internal gate runs.
                   if (shouldAutoVerify) {
                     this.verifyPayout(swapId).catch((err) => {
-                      if (this.config.debug) {
-                        logger.debug(LOG_TAG, `Auto-verification for swap ${swapId} deferred:`, err);
+                      // Always log payout verification failures — silent swallow in production
+                      // would leave the swap stuck with no observable diagnostic.
+                      const isExpectedShutdown = err instanceof Error && err.message.includes('SWAP_MODULE_DESTROYED');
+                      if (!isExpectedShutdown) {
+                        logger.warn(LOG_TAG, `Auto-verification for swap ${swapId} failed:`, err);
                       }
                     });
                   }
@@ -2736,8 +2749,9 @@ export class SwapModule {
                         // swap:completed is emitted (verifyPayout's returnFalse() ensures it fires
                         // even on transient failure). Runs OUTSIDE this gate via fire-and-forget.
                         this.verifyPayout(swapId).catch((err) => {
-                          if (this.config.debug) {
-                            logger.debug(LOG_TAG, `Deferred verify for swap ${swapId} after status_result:`, err);
+                          const isExpectedShutdown = err instanceof Error && err.message.includes('SWAP_MODULE_DESTROYED');
+                          if (!isExpectedShutdown) {
+                            logger.warn(LOG_TAG, `Deferred verify for swap ${swapId} after status_result failed:`, err);
                           }
                         });
                       }
@@ -2749,17 +2763,24 @@ export class SwapModule {
                       deps.emitEvent('swap:failed', { swapId, error: `Escrow reported: ${msg.state}` });
                     }
                   } else if (mappedProgress && !isTerminalProgress(mappedProgress) && !isTerminalProgress(swap.progress)) {
-                    // Advance local progress if escrow is further along
+                    // Advance local progress if escrow is further along.
+                    // Walk each intermediate state so the state machine invariants
+                    // are respected — e.g. proposed→depositing requires two hops
+                    // (proposed→announced→depositing), not a single direct skip.
                     const progressOrder: SwapProgress[] = [
                       'proposed', 'accepted', 'announced', 'depositing', 'awaiting_counter', 'concluding',
                     ];
                     const currentIdx = progressOrder.indexOf(swap.progress);
                     const targetIdx = progressOrder.indexOf(mappedProgress);
                     if (targetIdx > currentIdx) {
-                      try {
-                        await this.transitionProgress(swap, mappedProgress);
-                      } catch {
-                        // Transition not valid from current state — ignore
+                      for (let i = currentIdx + 1; i <= targetIdx; i++) {
+                        const intermediate = progressOrder[i];
+                        try {
+                          await this.transitionProgress(swap, intermediate);
+                        } catch {
+                          // Transition not valid from current state — stop walking
+                          break;
+                        }
                       }
                     }
                   }

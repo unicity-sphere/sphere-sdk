@@ -894,9 +894,13 @@ function isValidManifest(value: unknown): value is SwapManifest {
   if (!isObject(value)) return false;
   const m = value as Record<string, unknown>;
 
+  // v2: if protocol_version is present it must be 2 and escrow_address must be a hex DIRECT://
+  const hasV2 = m.protocol_version !== undefined;
+  if (hasV2 && (m.protocol_version !== 2 || !DIRECT_ADDRESS_RE.test(m.escrow_address as string))) return false;
+
   return (
     isValidSwapId(m.swap_id) &&
-    // addresses: DIRECT://<64-hex> = 73 chars; cap at 256 for safety
+    // addresses: DIRECT://<64-80-hex>; cap at 256 for safety
     typeof m.party_a_address === 'string' && m.party_a_address.length > 0 && m.party_a_address.length <= 256 &&
     typeof m.party_b_address === 'string' && m.party_b_address.length > 0 && m.party_b_address.length <= 256 &&
     // currency IDs: short identifiers (e.g. "UCT", "USDT") — cap at 20
@@ -905,7 +909,9 @@ function isValidManifest(value: unknown): value is SwapManifest {
     typeof m.party_a_value_to_change === 'string' && m.party_a_value_to_change.length > 0 && m.party_a_value_to_change.length <= 64 &&
     typeof m.party_b_currency_to_change === 'string' && m.party_b_currency_to_change.length > 0 && m.party_b_currency_to_change.length <= 20 &&
     typeof m.party_b_value_to_change === 'string' && m.party_b_value_to_change.length > 0 && m.party_b_value_to_change.length <= 64 &&
-    typeof m.timeout === 'number' && Number.isInteger(m.timeout)
+    typeof m.timeout === 'number' && Number.isInteger(m.timeout) &&
+    // salt: exactly 32 lowercase hex chars — same rule as manifest.ts validateManifest
+    typeof m.salt === 'string' && /^[0-9a-f]{32}$/.test(m.salt)
   );
 }
 
