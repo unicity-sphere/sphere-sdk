@@ -2091,12 +2091,18 @@ export class SwapModule {
                 // All checks passed — now safe to clear the proposal timer
                 this.clearLocalTimer(swapId);
 
-                // Transition to 'accepted' — if persistSwap fails, re-arm the timer
-                // so the proposal eventually times out rather than hanging indefinitely.
+                // Transition to 'accepted'.
+                // transitionProgress mutates swap.progress in memory BEFORE persisting.
+                // If persistSwap throws, roll back the in-memory mutation so the swap
+                // remains visibly 'proposed' and the proposal timer can still fire.
+                const prevProgress = swap.progress;
+                const prevUpdatedAt = swap.updatedAt;
                 try {
                   await this.transitionProgress(swap, 'accepted');
                 } catch (err) {
-                  this.startProposalTimer(swapId); // re-arm so proposal can still time out
+                  swap.progress = prevProgress;   // roll back in-memory
+                  swap.updatedAt = prevUpdatedAt;
+                  this.startProposalTimer(swapId); // re-arm so proposal can time out
                   throw err;
                 }
 

@@ -366,6 +366,15 @@ export class MultiAddressTransportMux {
 
     await new Promise<void>((resolve, reject) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false; // guard: EOSE may fire synchronously before subId is assigned
+
+      const settle = (sid: string | undefined) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (sid) { try { client.unsubscribe(sid); } catch { /* disconnected */ } }
+        resolve();
+      };
 
       let subId: string | undefined;
       try {
@@ -381,23 +390,23 @@ export class MultiAddressTransportMux {
               sig: event.sig,
             });
           },
-          onEndOfStoredEvents: () => {
-            clearTimeout(timeout);
-            try { client.unsubscribe(subId!); } catch { /* disconnected */ }
-            resolve();
-          },
+          // EOSE may fire synchronously (before subscribe() returns), so use `settle`
+          // which safely handles the subId-undefined case and is idempotent.
+          onEndOfStoredEvents: () => settle(subId),
         });
       } catch (err) {
-        // subscribe() threw synchronously — no timeout to clear (not yet set), reject immediately
+        // subscribe() threw synchronously — no timeout was set, reject immediately
         reject(err);
         return;
       }
 
-      // Set timeout AFTER subscribe() succeeds so we only need to clear it on success path
-      timeout = setTimeout(() => {
-        try { if (subId) client.unsubscribe(subId); } catch { /* disconnected */ }
-        resolve();
-      }, 5000);
+      if (settled) {
+        // EOSE already fired synchronously inside subscribe() — no timeout needed
+        return;
+      }
+
+      // Set timeout AFTER subscribe() succeeds (subId is now assigned)
+      timeout = setTimeout(() => settle(subId), 5000);
     });
 
     // Process through mux dispatch chain (dedup handles already-seen events)

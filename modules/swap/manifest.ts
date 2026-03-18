@@ -92,7 +92,7 @@ export function buildManifest(
     party_b_value_to_change: deal.partyBAmount,
     timeout,
     salt: randomHex(16), // 32 hex chars — ensures unique swap_id per proposal
-    ...(escrowAddress ? { escrow_address: escrowAddress, protocol_version: 2 } : {}),
+    ...(escrowAddress !== undefined ? { escrow_address: escrowAddress, protocol_version: 2 } : {}),
   };
 
   const swap_id = computeSwapId(fields);

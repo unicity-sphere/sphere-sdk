@@ -1595,12 +1595,19 @@ export class NostrTransportProvider implements TransportProvider {
     const events: NostrEvent[] = [];
 
     await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        if (subId) this.nostrClient?.unsubscribe(subId);
-        resolve();
-      }, 5000);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false; // EOSE may fire synchronously before subId is assigned
 
-      const subId = this.nostrClient!.subscribe(walletFilter, {
+      const settle = (sid: string | undefined) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (sid) this.nostrClient?.unsubscribe(sid);
+        resolve();
+      };
+
+      let subId: string | undefined;
+      subId = this.nostrClient!.subscribe(walletFilter, {
         onEvent: (event) => {
           events.push({
             id: event.id,
@@ -1612,12 +1619,12 @@ export class NostrTransportProvider implements TransportProvider {
             sig: event.sig,
           });
         },
-        onEndOfStoredEvents: () => {
-          clearTimeout(timeout);
-          this.nostrClient?.unsubscribe(subId);
-          resolve();
-        },
+        onEndOfStoredEvents: () => settle(subId),
       });
+
+      if (!settled) {
+        timeout = setTimeout(() => settle(subId), 5000);
+      }
     });
 
     // Process collected events sequentially (dedup skips already-processed ones)
