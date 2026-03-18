@@ -56,6 +56,7 @@ import type {
   SwapRef,
   SwapProgress,
   SwapDeal,
+  SwapManifest,
   SwapProposalResult,
   ProposeSwapOptions,
   GetSwapStatusOptions,
@@ -914,10 +915,6 @@ export class SwapModule {
       };
     }
 
-    // Allow re-proposing a previously rejected/cancelled/failed swap
-    // (same deal → same swap_id, but user explicitly wants to try again)
-    this.terminalSwapIds.delete(swapId);
-
     // Step 9: Create SwapRef
     const now = Date.now();
     const swap: SwapRef = {
@@ -939,8 +936,13 @@ export class SwapModule {
       protocolVersion: 2,
     };
 
-    // Step 10: Persist (persist-before-act)
+    // Step 10: Persist (persist-before-act).
+    // Remove from terminal set atomically with swaps.set — no window where the swap
+    // appears in neither map (DM handlers look up swaps.get first, then terminalSwapIds).
+    // Allow re-proposing a previously rejected/cancelled/failed swap
+    // (same deal → same swap_id, but user explicitly wants to try again).
     this.swaps.set(swapId, swap);
+    this.terminalSwapIds.delete(swapId);
     await this.persistSwap(swap);
 
     // Step 11: Send proposal DM to the counterparty (v2)
@@ -1018,6 +1020,19 @@ export class SwapModule {
       );
     }
 
+    // Capture v2 announce parameters from within the gate — executed outside to avoid
+    // holding the per-swap gate during sendAnnounce_v2 (up to 6 retries, ~82s total).
+    // Holding the gate would block all incoming escrow DMs (announce_result, invoice_delivery)
+    // for this swap, potentially causing them to time out before announce completes.
+    type V2AnnounceParams = {
+      escrowPubkey: string;
+      manifest: SwapManifest;
+      signatures: ManifestSignatures;
+      chainPubkeys: { party_a: string; party_b: string };
+      auxiliary: ManifestAuxiliary | undefined;
+    };
+    let v2AnnounceParams: V2AnnounceParams | undefined;
+
     // Step 3: Enter per-swap gate
     await this.withSwapGate(swapId, async () => {
       // Re-check state inside gate (TOCTOU guard — concurrent rejection/cancellation may have fired)
@@ -1039,11 +1054,13 @@ export class SwapModule {
         );
       }
 
-      // Step 4: Transition to 'accepted' (persist-before-act)
-      await this.transitionProgress(swap, 'accepted');
-
-      // Step 4b: Determine which protocol path to take
+      // Determine protocol version
       const isV2 = swap.protocolVersion === 2;
+
+      // Step 4b: Compute acceptor signature and nametag binding BEFORE transitioning,
+      // so the single transitionProgress persist captures all fields atomically.
+      // A crash between transitionProgress and a separate persistSwap would lose the
+      // signature / auxiliary, preventing v2 announce recovery.
 
       // v2: Sign the swap manifest.
       // IMPORTANT: Use manifest.escrow_address (locked at proposal time), NOT re-resolved address.
@@ -1085,12 +1102,16 @@ export class SwapModule {
         }
       }
 
-      // Store acceptor signature (v2 only) and auxiliary, then persist
+      // Assign acceptor signature (v2 only) and auxiliary to swap BEFORE transitioning.
+      // transitionProgress calls persistSwap, so these fields are included in the
+      // single atomic write — no second persistSwap needed.
       if (isV2 && acceptorSignature) {
         (swap as { acceptorSignature?: string }).acceptorSignature = acceptorSignature;
       }
       (swap as { auxiliary?: ManifestAuxiliary }).auxiliary = acceptorAuxiliary;
-      await this.persistSwap(swap);
+
+      // Step 4: Transition to 'accepted' (persist-before-act, includes signature + auxiliary)
+      await this.transitionProgress(swap, 'accepted');
 
       // Step 5: Send acceptance DM to proposer
       try {
@@ -1107,7 +1128,7 @@ export class SwapModule {
       // Step 6: Emit swap:accepted
       deps.emitEvent('swap:accepted', { swapId, role: swap.role });
 
-      // Step 7: v2 only — acceptor announces directly to escrow with both signatures.
+      // Step 7: v2 only — prepare announce params; actual send happens OUTSIDE the gate.
       // In v1, the proposer announces to escrow after receiving the acceptance DM.
       if (swap.protocolVersion === 2) {
         if (!swap.escrowPubkey) {
@@ -1131,7 +1152,7 @@ export class SwapModule {
         }
 
         // acceptorSignature is guaranteed defined here: we are in the v2 block and
-        // the guard at line 1035 ensures escrowAddressForSignature was defined.
+        // the guard above ensures escrowAddressForSignature was defined.
         if (!acceptorSignature) {
           await this.transitionProgress(swap, 'failed', {
             error: 'Cannot announce: acceptor signature missing (v2 internal error)',
@@ -1151,28 +1172,14 @@ export class SwapModule {
           party_b: weArePartyA ? proposerChainPubkey : acceptorChainPubkey,
         };
 
-        try {
-          await sendAnnounce_v2(
-            deps.communications, swap.escrowPubkey!,
-            swap.manifest, signatures, chainPubkeys, acceptorAuxiliary,
-          );
-        } catch (err) {
-          // Announce failure — transition to failed and notify proposer
-          await this.transitionProgress(swap, 'failed', {
-            error: 'Failed to send v2 announce to escrow',
-          });
-          deps.emitEvent('swap:failed', { swapId, error: 'Failed to send v2 announce to escrow' });
-          logger.warn(LOG_TAG, `Failed to announce v2 swap ${swapId} to escrow:`, err);
-          // Notify proposer so they don't wait indefinitely for escrow messages
-          if (swap.counterpartyPubkey) {
-            try {
-              const cancelDM = buildCancelDM(swapId, 'Acceptor failed to announce to escrow');
-              await deps.communications.sendDM(swap.counterpartyPubkey, cancelDM);
-            } catch {
-              // Best-effort
-            }
-          }
-        }
+        // Capture params — announce executes outside the gate (see Step 7b below)
+        v2AnnounceParams = {
+          escrowPubkey: swap.escrowPubkey!,
+          manifest: swap.manifest,
+          signatures,
+          chainPubkeys,
+          auxiliary: acceptorAuxiliary,
+        };
       } else {
         // v1: Resolve and store escrow address so it's available for crash recovery and DM verification.
         // The proposer is responsible for announcing to escrow when they receive our acceptance DM.
@@ -1190,6 +1197,40 @@ export class SwapModule {
         }
       }
     });
+
+    // Step 7b: Execute v2 announce OUTSIDE the gate.
+    // sendAnnounce_v2 has up to 6 retries (~82s). Running it inside the gate would block
+    // all incoming escrow DMs for this swap (announce_result, invoice_delivery), which
+    // arrive from escrow as a direct response to the announce we are sending.
+    if (v2AnnounceParams) {
+      const params = v2AnnounceParams;
+      try {
+        await sendAnnounce_v2(
+          deps.communications, params.escrowPubkey,
+          params.manifest, params.signatures, params.chainPubkeys, params.auxiliary,
+        );
+      } catch (err) {
+        // Announce failure — re-acquire gate to transition to failed and notify proposer
+        await this.withSwapGate(swapId, async () => {
+          const currentSwap = this.swaps.get(swapId);
+          if (!currentSwap || isTerminalProgress(currentSwap.progress)) return;
+          await this.transitionProgress(currentSwap, 'failed', {
+            error: 'Failed to send v2 announce to escrow',
+          });
+          deps.emitEvent('swap:failed', { swapId, error: 'Failed to send v2 announce to escrow' });
+          logger.warn(LOG_TAG, `Failed to announce v2 swap ${swapId} to escrow:`, err);
+          // Notify proposer so they don't wait indefinitely for escrow messages
+          if (currentSwap.counterpartyPubkey) {
+            try {
+              const cancelDM = buildCancelDM(swapId, 'Acceptor failed to announce to escrow');
+              await deps.communications.sendDM(currentSwap.counterpartyPubkey, cancelDM);
+            } catch {
+              // Best-effort
+            }
+          }
+        });
+      }
+    }
   }
 
   /**
@@ -1955,19 +1996,28 @@ export class SwapModule {
                 return;
               }
 
-              // Verify nametag bindings if present
+              // Verify nametag bindings if present.
+              // For the proposer's own binding: verifyNametagBinding checks internal
+              // signature consistency, but we must also cross-reference binding.chain_pubkey
+              // against the already-verified proposerChainPubkey. Without this, a malicious
+              // peer could craft a binding with a different chain_pubkey that still passes
+              // verifyNametagBinding (valid self-signature, wrong identity).
               if (proposalMsg.auxiliary) {
                 const aux = proposalMsg.auxiliary;
                 if (aux.party_a_binding) {
+                  const proposerBinding = proposerIsPartyA ? aux.party_a_binding : null;
                   if (!verifyNametagBinding(aux.party_a_binding, manifest.swap_id) ||
-                      aux.party_a_binding.direct_address !== manifest.party_a_address) {
+                      aux.party_a_binding.direct_address !== manifest.party_a_address ||
+                      (proposerBinding && proposerBinding.chain_pubkey !== proposerChainPubkey)) {
                     logger.debug(LOG_TAG, `Proposal ${manifest.swap_id}: invalid party_a nametag binding`);
                     return;
                   }
                 }
                 if (aux.party_b_binding) {
+                  const proposerBinding = !proposerIsPartyA ? aux.party_b_binding : null;
                   if (!verifyNametagBinding(aux.party_b_binding, manifest.swap_id) ||
-                      aux.party_b_binding.direct_address !== manifest.party_b_address) {
+                      aux.party_b_binding.direct_address !== manifest.party_b_address ||
+                      (proposerBinding && proposerBinding.chain_pubkey !== proposerChainPubkey)) {
                     logger.debug(LOG_TAG, `Proposal ${manifest.swap_id}: invalid party_b nametag binding`);
                     return;
                   }
@@ -2106,7 +2156,11 @@ export class SwapModule {
                   // Best-effort: if persistSwap wrote the record before the index write
                   // failed, the storage record now has the wrong (advanced) state.
                   // Re-persist the rolled-back state to heal the partial write.
-                  this.persistSwap(swap).catch((e) =>
+                  // Snapshot swap before the fire-and-forget: the gate will be released
+                  // (throw re-throws below), and the next gate acquisition can mutate
+                  // the live `swap` object before JSON.stringify runs inside persistSwap.
+                  const rollbackSnapshot = { ...swap };
+                  this.persistSwap(rollbackSnapshot).catch((e) =>
                     logger.warn(LOG_TAG, `Failed to persist rollback for ${swapId}:`, e),
                   );
                   throw err;
@@ -2227,6 +2281,10 @@ export class SwapModule {
                 }
 
                 await this.withSwapGate(swapId, async () => {
+                  // TOCTOU guard — re-check state after acquiring gate.
+                  // A concurrent cancellation or failure may have fired while we waited.
+                  if (isTerminalProgress(swap.progress)) return;
+
                   // Store depositInvoiceId and escrowState
                   swap.depositInvoiceId = msg.deposit_invoice_id;
                   swap.escrowState = msg.state;

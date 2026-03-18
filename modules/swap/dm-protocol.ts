@@ -606,8 +606,8 @@ function parseAnnounceResult(obj: Record<string, unknown>): ParsedSwapDM | null 
 function parseInvoiceDelivery(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
   if (obj.invoice_type !== 'deposit' && obj.invoice_type !== 'payout') return null;
-  // invoice_token is required but opaque (TxfToken JSON) -- just check presence
-  if (obj.invoice_token === undefined || obj.invoice_token === null) return null;
+  // invoice_token is required and must be a non-null object (TxfToken JSON)
+  if (obj.invoice_token === undefined || obj.invoice_token === null || typeof obj.invoice_token !== 'object') return null;
 
   return {
     kind: 'escrow',
@@ -632,9 +632,11 @@ function parseStatusResult(obj: Record<string, unknown>): ParsedSwapDM | null {
     swap_id: obj.swap_id as string,
     state: obj.state as string,
   };
-  // Copy only safe, non-prototype fields for extensibility
+  // Copy only safe, non-prototype fields for extensibility.
+  // Block prototype-pollution vectors beyond the obvious __proto__ / constructor.
   for (const key of Object.keys(obj)) {
-    if (key === 'type' || key === 'swap_id' || key === 'state' || key === '__proto__' || key === 'constructor') continue;
+    if (key === 'type' || key === 'swap_id' || key === 'state' ||
+        key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     payload[key] = obj[key];
   }
 
@@ -656,9 +658,10 @@ function parsePaymentConfirmation(obj: Record<string, unknown>): ParsedSwapDM | 
   if (typeof obj.party === 'string') {
     payload.party = obj.party;
   }
-  // Copy only safe, non-prototype fields for extensibility
+  // Copy only safe, non-prototype fields for extensibility.
   for (const key of Object.keys(obj)) {
-    if (key === 'type' || key === 'swap_id' || key === 'party' || key === '__proto__' || key === 'constructor') continue;
+    if (key === 'type' || key === 'swap_id' || key === 'party' ||
+        key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
     payload[key] = obj[key];
   }
 
