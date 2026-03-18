@@ -1998,6 +1998,8 @@ export class SwapModule {
                 // Verify escrow sender
                 if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
 
+                // Skip stale cancellation DMs
+                if (dm.timestamp && dm.timestamp < swap.createdAt) return;
                 if (isTerminalProgress(swap.progress)) return;
 
                 const deps = this.deps!;
@@ -2069,12 +2071,23 @@ export class SwapModule {
               case 'error': {
                 const errorSwapId = msg.swap_id;
 
-                logger.error(LOG_TAG, `Escrow error${errorSwapId ? ` for swap ${errorSwapId}` : ''}: ${msg.error}`);
+                if (!errorSwapId) {
+                  // Generic escrow error (no swap_id) — only log if the DM is recent (last 60s)
+                  // to suppress stale error DMs replayed from the relay on every startup
+                  if (dm.timestamp && (Date.now() - dm.timestamp) < 60_000) {
+                    logger.error(LOG_TAG, `Escrow error: ${msg.error}`);
+                  }
+                  return;
+                }
 
-                if (!errorSwapId) return;
                 const swap = this.swaps.get(errorSwapId);
                 if (!swap) return;
                 if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
+
+                // Skip stale error DMs from before the current swap instance
+                if (dm.timestamp && dm.timestamp < swap.createdAt) return;
+
+                logger.error(LOG_TAG, `Escrow error for swap ${errorSwapId.slice(0, 12)}: ${msg.error}`);
 
                 const deps = this.deps!;
 
