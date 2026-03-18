@@ -3103,22 +3103,26 @@ export class SwapModule {
         // Only handle deposit invoice
         if (data.invoiceId !== swap.depositInvoiceId) return;
 
-        // Clear local timeout — escrow will now execute payouts
-        this.clearLocalTimer(swapId);
-
-        // Emit deposits covered event
-        deps.emitEvent('swap:deposits_covered', { swapId });
-
-        // Transition to concluding if not already terminal or concluding
-        if (!isTerminalProgress(swap.progress) && swap.progress !== 'concluding' && swap.progress !== 'completed') {
-          this.withSwapGate(swapId, async () => {
-            if (!isTerminalProgress(swap.progress) && swap.progress !== 'concluding' && swap.progress !== 'completed') {
-              await this.transitionProgress(swap, 'concluding');
-            }
-          }).catch((err) => {
-            logger.warn(LOG_TAG, `Failed to transition swap ${swapId} to concluding:`, err);
-          });
-        }
+        // Move clearLocalTimer and swap:deposits_covered inside the gate so they
+        // can't race with a concurrent timeout callback that's already fired and
+        // is queued to enter the gate for a cancelled transition.
+        // If the timeout wins the gate: it transitions to cancelled (terminal).
+        //   Our gate callback fires next, sees terminal, skips — no spurious event.
+        // If we win the gate: we clear the timer, emit the event, transition to
+        //   concluding. The timeout callback fires next, sees concluding, skips.
+        this.withSwapGate(swapId, async () => {
+          if (isTerminalProgress(swap.progress)) return;
+          // Clear any pending local timeout — escrow will now execute payouts
+          this.clearLocalTimer(swapId);
+          // Emit deposits covered event (inside gate, so swap is confirmed non-terminal)
+          deps.emitEvent('swap:deposits_covered', { swapId });
+          // Advance to concluding if not already there
+          if (swap.progress !== 'concluding' && swap.progress !== 'completed') {
+            await this.transitionProgress(swap, 'concluding');
+          }
+        }).catch((err) => {
+          logger.warn(LOG_TAG, `Failed to transition swap ${swapId} to concluding:`, err);
+        });
       } catch (err) {
         logger.warn(LOG_TAG, 'Error handling invoice:covered for swap:', err);
       }
