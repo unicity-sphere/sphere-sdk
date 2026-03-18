@@ -732,10 +732,20 @@ export class SwapModule {
     // Persist per-swap key
     await this.persistSwap(swap);
 
-    // Clear local timer and track terminal ID on terminal states
+    // Clear local timer and track terminal ID on terminal states.
+    // Also push to _storedTerminalEntries so that subsequent persistIndex() calls
+    // (triggered by other swap persists) preserve this terminal entry — without it,
+    // if a future cleanup pass removes the swap from this.swaps mid-session, the
+    // entry would be silently dropped from the index.
     if (isTerminalProgress(to)) {
       this.clearLocalTimer(swap.swapId);
       this.terminalSwapIds.add(swap.swapId);
+      this._storedTerminalEntries.push({
+        swapId: swap.swapId,
+        progress: to,
+        role: swap.role,
+        createdAt: swap.createdAt,
+      });
     }
 
     if (this.config.debug) {
@@ -966,11 +976,17 @@ export class SwapModule {
       swap.error = `Proposal DM send failed: ${err instanceof Error ? err.message : String(err)}`;
       swap.updatedAt = Date.now();
       // Maintain invariant: all terminal swaps are in terminalSwapIds (not just this.swaps).
-      // transitionProgress() is bypassed here, so we must update both collections manually.
+      // transitionProgress() is bypassed here, so we must update all three collections manually.
       // IMPORTANT: persistSwap must run while swap is still in this.swaps — persistIndex()
       // iterates this.swaps to build the index; deleting before persist orphans the record.
       this.terminalSwapIds.add(swapId);
       await this.persistSwap(swap);
+      this._storedTerminalEntries.push({
+        swapId,
+        progress: 'failed',
+        role: swap.role,
+        createdAt: swap.createdAt,
+      });
       this.swaps.delete(swapId);
       throw new SphereError(
         `Failed to send proposal DM: ${err instanceof Error ? err.message : String(err)}`,
@@ -1224,6 +1240,10 @@ export class SwapModule {
           deps.communications, params.escrowPubkey,
           params.manifest, params.signatures, params.chainPubkeys, params.auxiliary,
         );
+        // Announce sent successfully. Start a bounded announce-response timer so the
+        // swap does not hang forever if the escrow's announce_result / invoice_delivery
+        // DM is lost in transit. Cleared when invoice_delivery advances to 'announced'.
+        this.startAnnounceTimer(swapId);
       } catch (err) {
         // Announce failure — re-acquire gate to transition to failed and notify proposer
         await this.withSwapGate(swapId, async () => {
@@ -2164,6 +2184,13 @@ export class SwapModule {
                 // All checks passed — now safe to clear the proposal timer
                 this.clearLocalTimer(swapId);
 
+                // Snapshot fields mutated before transitionProgress so we can fully revert
+                // in-memory state if persistSwap throws (incomplete rollback previously left
+                // acceptorSignature set on the swap object while storage had the old state).
+                const prevProgress = swap.progress;
+                const prevUpdatedAt = swap.updatedAt;
+                const prevAcceptorSignature = (swap as { acceptorSignature?: string }).acceptorSignature;
+
                 // Assign acceptor signature (v2 only) BEFORE transitionProgress so the
                 // single atomic persist captures it. A crash between transitionProgress and
                 // a separate persistSwap would leave the swap in 'accepted' without a
@@ -2174,15 +2201,14 @@ export class SwapModule {
 
                 // Transition to 'accepted'.
                 // transitionProgress mutates swap.progress in memory BEFORE persisting.
-                // If persistSwap throws, roll back the in-memory mutation so the swap
+                // If persistSwap throws, roll back ALL in-memory mutations so the swap
                 // remains visibly 'proposed' and the proposal timer can still fire.
-                const prevProgress = swap.progress;
-                const prevUpdatedAt = swap.updatedAt;
                 try {
                   await this.transitionProgress(swap, 'accepted');
                 } catch (err) {
                   swap.progress = prevProgress;   // roll back in-memory
                   swap.updatedAt = prevUpdatedAt;
+                  (swap as { acceptorSignature?: string }).acceptorSignature = prevAcceptorSignature;
                   this.startProposalTimer(swapId); // re-arm so proposal can time out
                   // Best-effort: if persistSwap wrote the record before the index write
                   // failed, the storage record now has the wrong (advanced) state.
@@ -2290,6 +2316,29 @@ export class SwapModule {
 
             // Extract swap_id from the escrow message (present on most types)
             const swapId = 'swap_id' in msg ? (msg as { swap_id?: string }).swap_id : undefined;
+
+            // Lazy escrow resolution: if this swap has no escrowPubkey (possible when
+            // transient resolution failure occurred during proposal receipt), attempt to
+            // resolve it now. Without this, isFromExpectedEscrow() would silently drop
+            // every escrow DM for the swap, leaving it stranded until the next restart.
+            if (swapId) {
+              const swapForResolution = this.swaps.get(swapId);
+              if (swapForResolution && !swapForResolution.escrowPubkey) {
+                const depsForResolution = this.deps;
+                if (depsForResolution) {
+                  try {
+                    const resolved = await resolveEscrowAddress(
+                      swapForResolution.deal, this.config, depsForResolution.resolve,
+                    );
+                    swapForResolution.escrowPubkey = resolved.escrowPubkey;
+                    swapForResolution.escrowDirectAddress = resolved.escrowDirectAddress;
+                    await this.persistSwap(swapForResolution);
+                  } catch {
+                    // Still best-effort — will retry on the next escrow DM
+                  }
+                }
+              }
+            }
 
             switch (msg.type) {
               // ---------------------------------------------------------------
@@ -2610,6 +2659,9 @@ export class SwapModule {
                 const deps = this.deps!;
 
                 await this.withSwapGate(swapId, async () => {
+                  // TOCTOU guard — swap may have completed or failed while waiting for gate.
+                  if (isTerminalProgress(swap.progress)) return;
+
                   this.clearLocalTimer(swapId);
 
                   await this.transitionProgress(swap, 'cancelled', {
@@ -2997,6 +3049,13 @@ export class SwapModule {
       if (swap.progress === 'proposed' && swap.role === 'proposer') {
         this.startProposalTimer(swap.swapId);
       }
+
+      // §16.2: For accepted v2 acceptor swaps — announce was already sent but escrow has
+      // not yet delivered invoice_delivery. Start announce timer to fail the swap if
+      // the escrow never responds (e.g., announce_result DM was lost before restart).
+      if (swap.progress === 'accepted' && swap.role === 'acceptor' && swap.protocolVersion === 2) {
+        this.startAnnounceTimer(swap.swapId);
+      }
     }
   }
 
@@ -3042,6 +3101,41 @@ export class SwapModule {
         logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
       });
     }, remaining);
+
+    this.localTimers.set(swapId, timer);
+  }
+
+  /**
+   * Start an announce-response timeout timer for v2 acceptor swaps.
+   * After sendAnnounce_v2 succeeds, if the escrow's announce_result + invoice_delivery
+   * DMs are not received within announceTimeoutMs, the swap is transitioned to 'failed'.
+   *
+   * Cleared automatically when:
+   * - invoice_delivery transitions the swap to 'announced' (via startLocalTimer →
+   *   clearLocalTimer)
+   * - transitionProgress transitions to any terminal state (calls clearLocalTimer)
+   */
+  private startAnnounceTimer(swapId: string): void {
+    this.clearLocalTimer(swapId);
+
+    const timer = setTimeout(() => {
+      void this.withSwapGate(swapId, async () => {
+        const s = this.swaps.get(swapId);
+        if (!s || s.progress !== 'accepted') return;
+        await this.transitionProgress(s, 'failed', {
+          error: 'Announce timed out: escrow did not deliver deposit invoice',
+        });
+        this.deps!.emitEvent('swap:failed', {
+          swapId,
+          error: 'Announce timed out: escrow did not deliver deposit invoice',
+        });
+        if (this.config.debug) {
+          logger.debug(LOG_TAG, `Announce timer expired for swap ${swapId}`);
+        }
+      }).catch((err) => {
+        logger.warn(LOG_TAG, `Failed to expire announce timer for ${swapId}:`, err);
+      });
+    }, this.config.announceTimeoutMs);
 
     this.localTimers.set(swapId, timer);
   }

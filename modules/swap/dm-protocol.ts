@@ -658,8 +658,12 @@ function copyExtensibilityKeys(
     if (typeof val === 'string') {
       if (val.length > MAX_PAYLOAD_STRING_LEN) continue;
       target[key] = val;
-    } else if (typeof val === 'number' || typeof val === 'boolean' || val === null) {
+    } else if (typeof val === 'boolean' || val === null) {
       target[key] = val;
+    } else if (typeof val === 'number') {
+      // Reject NaN and ±Infinity: JSON.stringify converts them to `null`, silently
+      // corrupting the persisted value on the next storage round-trip.
+      if (Number.isFinite(val)) target[key] = val;
     }
     // Skip objects, arrays, undefined
   }
@@ -744,7 +748,16 @@ function parseEscrowError(obj: Record<string, unknown>): ParsedSwapDM | null {
       type: 'error',
       error: obj.error as string,
       ...(typeof obj.swap_id === 'string' ? { swap_id: obj.swap_id } : {}),
-      ...(Array.isArray(obj.details) ? { details: obj.details } : {}),
+      // Validate details array: cap length and restrict to primitive elements only,
+      // matching the same memory-safety guarantees as copyExtensibilityKeys.
+      ...(Array.isArray(obj.details) ? {
+        details: (obj.details as unknown[]).slice(0, 20).filter((el) =>
+          el === null ||
+          typeof el === 'boolean' ||
+          (typeof el === 'string' && el.length <= MAX_PAYLOAD_STRING_LEN) ||
+          (typeof el === 'number' && Number.isFinite(el)),
+        ),
+      } : {}),
     },
   };
 }

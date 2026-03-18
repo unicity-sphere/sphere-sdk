@@ -22,7 +22,7 @@ import { SphereError } from '../../core/errors.js';
 export const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, readonly SwapProgress[]> = {
   proposed:         ['accepted', 'announced', 'cancelled', 'failed'],
   accepted:         ['announced', 'cancelled', 'failed'],
-  announced:        ['depositing', 'cancelled', 'failed'],
+  announced:        ['depositing', 'concluding', 'cancelled', 'failed'],
   depositing:       ['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed'],
   awaiting_counter: ['concluding', 'completed', 'cancelled', 'failed'],
   concluding:       ['completed', 'cancelled', 'failed'],
