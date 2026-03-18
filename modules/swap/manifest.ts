@@ -316,6 +316,11 @@ export function createNametagBinding(
   if (!isValidNametag(nametag)) {
     throw new Error(`Invalid nametag for binding proof: "${nametag.slice(0, 80)}"`);
   }
+  // Guard: directAddress must be a valid DIRECT:// address so the colon-delimiter
+  // invariant in the signed message holds (the pubkey suffix is hex-only, no colons).
+  if (!isValidDirectAddress(directAddress)) {
+    throw new Error(`Invalid directAddress for binding proof: "${directAddress.slice(0, 80)}"`);
+  }
   // Message format: "nametag_bind:{nametag}:{directAddress}:{swapId}"
   // Colon is used as a delimiter. nametag is [a-z0-9_-] (no colons, validated above).
   // swapId is hex-only (no colons). directAddress must be a DIRECT:// address where

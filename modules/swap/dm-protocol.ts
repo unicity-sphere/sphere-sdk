@@ -862,6 +862,9 @@ const NAMETAG_BINDING_RE = /^[a-z0-9][a-z0-9_-]*$/;
  * Validates a nametag binding proof has the expected structure and field formats.
  * Used to reject malformed auxiliary data before it reaches the swap handler.
  */
+// DIRECT:// address: "DIRECT://<64-hex-char-pubkey>" — total length is exactly 73 chars.
+const DIRECT_ADDRESS_RE = /^DIRECT:\/\/[0-9a-f]{64}$/;
+
 function isValidNametagBinding(value: unknown): boolean {
   if (!isObject(value)) return false;
   const b = value as Record<string, unknown>;
@@ -871,8 +874,7 @@ function isValidNametagBinding(value: unknown): boolean {
     b.nametag.length <= 30 &&
     NAMETAG_BINDING_RE.test(b.nametag) &&
     typeof b.direct_address === 'string' &&
-    b.direct_address.length > 0 &&
-    b.direct_address.length <= 256 &&
+    DIRECT_ADDRESS_RE.test(b.direct_address) &&
     typeof b.chain_pubkey === 'string' &&
     PUBKEY_RE.test(b.chain_pubkey) &&
     typeof b.signature === 'string' &&
@@ -892,12 +894,15 @@ function isValidManifest(value: unknown): value is SwapManifest {
 
   return (
     isValidSwapId(m.swap_id) &&
-    typeof m.party_a_address === 'string' && m.party_a_address.length > 0 &&
-    typeof m.party_b_address === 'string' && m.party_b_address.length > 0 &&
-    typeof m.party_a_currency_to_change === 'string' && m.party_a_currency_to_change.length > 0 &&
-    typeof m.party_a_value_to_change === 'string' && m.party_a_value_to_change.length > 0 &&
-    typeof m.party_b_currency_to_change === 'string' && m.party_b_currency_to_change.length > 0 &&
-    typeof m.party_b_value_to_change === 'string' && m.party_b_value_to_change.length > 0 &&
+    // addresses: DIRECT://<64-hex> = 73 chars; cap at 256 for safety
+    typeof m.party_a_address === 'string' && m.party_a_address.length > 0 && m.party_a_address.length <= 256 &&
+    typeof m.party_b_address === 'string' && m.party_b_address.length > 0 && m.party_b_address.length <= 256 &&
+    // currency IDs: short identifiers (e.g. "UCT", "USDT") — cap at 20
+    typeof m.party_a_currency_to_change === 'string' && m.party_a_currency_to_change.length > 0 && m.party_a_currency_to_change.length <= 20 &&
+    // amounts: decimal strings — cap at 64 chars (more than enough for any u256)
+    typeof m.party_a_value_to_change === 'string' && m.party_a_value_to_change.length > 0 && m.party_a_value_to_change.length <= 64 &&
+    typeof m.party_b_currency_to_change === 'string' && m.party_b_currency_to_change.length > 0 && m.party_b_currency_to_change.length <= 20 &&
+    typeof m.party_b_value_to_change === 'string' && m.party_b_value_to_change.length > 0 && m.party_b_value_to_change.length <= 64 &&
     typeof m.timeout === 'number' && Number.isInteger(m.timeout)
   );
 }

@@ -104,6 +104,9 @@ export class SwapModule {
   /** AbortControllers for in-progress sendAnnounce_v2 calls, keyed by swapId.
    * Cancelled/rejected swaps abort these to stop retry loops immediately. */
   private announceAbortControllers: Map<string, AbortController> = new Map();
+  /** Tracks swaps for which we already emitted swap:completed(payoutVerified:false).
+   * Prevents returnFalse() from emitting duplicate events on repeated verifyPayout calls. */
+  private _completedEventEmittedUnverified: Set<string> = new Set();
   private invoiceToSwapIndex: Map<string, string> = new Map(); // invoiceId -> swapId
   private destroyed = false;
   private loaded = false;
@@ -1573,8 +1576,11 @@ export class SwapModule {
 
       // Helper: return false while ensuring swap:completed is emitted if needed.
       // The fraud-indicative paths use failPayout() and transition to 'failed' instead.
+      // Dedup: only emit one swap:completed(payoutVerified:false) per swap; repeated
+      // transient-failure retries must not flood the caller with duplicate events.
       const returnFalse = (): false => {
-        if (alreadyCompleted) {
+        if (alreadyCompleted && !this._completedEventEmittedUnverified.has(swapId)) {
+          this._completedEventEmittedUnverified.add(swapId);
           deps.emitEvent('swap:completed', { swapId, payoutVerified: false });
         }
         return false;
@@ -1632,10 +1638,29 @@ export class SwapModule {
     }
 
     // Helper: transition to failed and emit — used for fraud-indicative term mismatches.
-    // Using transitionProgress (not bare persistSwap) ensures the swap is marked terminal
-    // so that subsequent DM handlers cannot advance it to 'completed' after we emit 'failed'.
+    // When alreadyCompleted=true the swap is already in 'completed' state, which is a terminal
+    // state with no outgoing transitions (completed → failed is INVALID in the state machine).
+    // We must replicate the side effects of transitionProgress() via direct mutation instead
+    // so that fraud is surfaced rather than silently swallowed by a SWAP_WRONG_STATE throw.
     const failPayout = async (error: string): Promise<false> => {
-      await this.transitionProgress(swap, 'failed', { payoutVerified: false, error });
+      if (swap.progress === 'completed') {
+        // Direct mutation: completed → failed bypass (invalid state machine edge).
+        swap.progress = 'failed';
+        (swap as { payoutVerified?: boolean }).payoutVerified = false;
+        (swap as { error?: string }).error = error;
+        swap.updatedAt = Date.now();
+        this.clearLocalTimer(swap.swapId);
+        this.terminalSwapIds.add(swap.swapId);
+        this._storedTerminalEntries.push({
+          swapId: swap.swapId,
+          progress: 'failed',
+          role: swap.role,
+          createdAt: swap.createdAt,
+        });
+        await this.persistSwap(swap);
+      } else {
+        await this.transitionProgress(swap, 'failed', { payoutVerified: false, error });
+      }
       deps.emitEvent('swap:failed', { swapId, error });
       return false;
     };
@@ -3191,6 +3216,7 @@ export class SwapModule {
     }
 
     const timer = setTimeout(() => {
+      if (this.destroyed) return;
       void this.withSwapGate(swapId, async () => {
         const s = this.swaps.get(swapId);
         if (!s || s.progress !== 'proposed') return;
