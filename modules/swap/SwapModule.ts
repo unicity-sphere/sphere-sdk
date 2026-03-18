@@ -2648,7 +2648,13 @@ export class SwapModule {
                   if (mappedProgress && isTerminalProgress(mappedProgress) && !isTerminalProgress(swap.progress)) {
                     if (mappedProgress === 'completed') {
                       await this.transitionProgress(swap, 'completed', { payoutVerified: false });
-                      deps.emitEvent('swap:completed', { swapId, payoutVerified: false });
+                      // Only emit swap:completed here if no payout invoice has been received.
+                      // When a payout invoice exists, verifyPayout (auto-triggered by invoice_delivery)
+                      // will emit swap:completed with payoutVerified=true — emitting now would cause
+                      // a duplicate event with conflicting payoutVerified values.
+                      if (!swap.payoutInvoiceId) {
+                        deps.emitEvent('swap:completed', { swapId, payoutVerified: false });
+                      }
                     } else if (mappedProgress === 'cancelled') {
                       await this.transitionProgress(swap, 'cancelled', { error: `Escrow state: ${msg.state}` });
                       deps.emitEvent('swap:cancelled', { swapId, reason: 'escrow_failed', depositsReturned: false });

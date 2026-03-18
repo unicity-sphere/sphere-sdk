@@ -83,8 +83,14 @@ export async function withRetry<T>(
           err instanceof Error ? err.message : err,
         );
 
-        // Interruptible delay: resolves early if signal fires
+        // Interruptible delay: resolves early if signal fires.
+        // Guard first: addEventListener on an already-aborted AbortSignal does not
+        // fire in Node.js v22, so check .aborted synchronously inside the executor.
         await new Promise<void>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new Error(`${label}: aborted during retry delay`));
+            return;
+          }
           const t = setTimeout(resolve, delay);
           signal?.addEventListener('abort', () => {
             clearTimeout(t);

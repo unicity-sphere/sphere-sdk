@@ -72,6 +72,13 @@ const KNOWN_ESCROW_TYPES: ReadonlySet<string> = new Set([
  */
 const MAX_DM_LENGTH = 131_072;
 
+/**
+ * Maximum string-value length for user-visible string fields (message, reason)
+ * and for open-ended escrow payload strings. Hoisted here so all parsers share
+ * the same constant rather than hardcoding 4096 in multiple places.
+ */
+const MAX_PAYLOAD_STRING_LEN = 4096;
+
 // =============================================================================
 // Discriminated union for parsed swap DMs
 // =============================================================================
@@ -451,8 +458,13 @@ function parseProposal(json: string): ParsedSwapDM | null {
   if (version === 2) {
     if (typeof obj.proposer_signature !== 'string' || !SIG_RE.test(obj.proposer_signature)) return null;
     if (typeof obj.proposer_chain_pubkey !== 'string' || !PUBKEY_RE.test(obj.proposer_chain_pubkey)) return null;
-    // auxiliary is optional even in v2
-    if (obj.auxiliary !== undefined && !isObject(obj.auxiliary)) return null;
+    // auxiliary is optional even in v2; if present, validate binding proof structure
+    if (obj.auxiliary !== undefined) {
+      if (!isObject(obj.auxiliary)) return null;
+      const aux = obj.auxiliary as Record<string, unknown>;
+      if (aux.party_a_binding !== undefined && !isValidNametagBinding(aux.party_a_binding)) return null;
+      if (aux.party_b_binding !== undefined && !isValidNametagBinding(aux.party_b_binding)) return null;
+    }
   }
 
   // v2-specific fields are only included when version === 2.
@@ -462,8 +474,8 @@ function parseProposal(json: string): ParsedSwapDM | null {
     type: 'swap_proposal',
     version,
     manifest: obj.manifest as SwapManifest,
-    escrow: (obj.escrow as string).slice(0, 512), // cap escrow address length
-    ...(typeof obj.message === 'string' ? { message: obj.message.slice(0, 4096) } : {}),
+    escrow: (obj.escrow as string).slice(0, 256), // cap escrow address length
+    ...(typeof obj.message === 'string' ? { message: obj.message.slice(0, MAX_PAYLOAD_STRING_LEN) } : {}),
     ...(version === 2 && typeof obj.proposer_signature === 'string' ? { proposer_signature: obj.proposer_signature } : {}),
     ...(version === 2 && typeof obj.proposer_chain_pubkey === 'string' ? { proposer_chain_pubkey: obj.proposer_chain_pubkey } : {}),
     ...(version === 2 && isObject(obj.auxiliary) ? { auxiliary: obj.auxiliary as ManifestAuxiliary } : {}),
@@ -528,7 +540,11 @@ function parseRejection(json: string): ParsedSwapDM | null {
   const obj = parsed as Record<string, unknown>;
 
   if (obj.type !== 'swap_rejection') return null;
-  if (typeof obj.version !== 'number') return null;
+  // Reject unknown versions (accept 1, 2, or undefined which defaults to 1).
+  // A v1 counterparty omitting the version field must NOT be silently dropped —
+  // its rejection DMs are valid and backward-compatible.
+  const rawVersion = obj.version;
+  if (rawVersion !== 1 && rawVersion !== 2 && rawVersion !== undefined) return null;
   if (!isValidSwapId(obj.swap_id)) return null;
 
   // Optional reason field
@@ -538,7 +554,7 @@ function parseRejection(json: string): ParsedSwapDM | null {
     type: 'swap_rejection',
     version: 1,
     swap_id: obj.swap_id as string,
-    ...(typeof obj.reason === 'string' ? { reason: obj.reason.slice(0, 4096) } : {}),
+    ...(typeof obj.reason === 'string' ? { reason: obj.reason.slice(0, MAX_PAYLOAD_STRING_LEN) } : {}),
   };
 
   return { kind: 'rejection', payload };
@@ -619,8 +635,11 @@ function parseAnnounceResult(obj: Record<string, unknown>): ParsedSwapDM | null 
 function parseInvoiceDelivery(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
   if (obj.invoice_type !== 'deposit' && obj.invoice_type !== 'payout') return null;
-  // invoice_token is required and must be a non-null object (TxfToken JSON)
+  // invoice_token is required and must be a non-null object (TxfToken JSON).
+  // Cap serialized size to 64 KiB to prevent memory amplification from a malicious escrow.
   if (obj.invoice_token === undefined || obj.invoice_token === null || typeof obj.invoice_token !== 'object') return null;
+  const MAX_INVOICE_TOKEN_BYTES = 65_536;
+  if (JSON.stringify(obj.invoice_token).length > MAX_INVOICE_TOKEN_BYTES) return null;
 
   // Validate payment_instructions sub-fields before forwarding — prevents oversized
   // or non-string values from being stored in the swap record via an unchecked cast.
@@ -664,9 +683,6 @@ const BLOCKED_PAYLOAD_KEYS = new Set([
   'toString', 'valueOf', 'hasOwnProperty',
   'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString',
 ]);
-
-/** Maximum string-value length forwarded from open-ended escrow payloads. */
-const MAX_PAYLOAD_STRING_LEN = 4096;
 
 /**
  * Maximum number of extensibility keys copied from a single escrow payload.
@@ -825,6 +841,31 @@ const PUBKEY_RE = /^(02|03)[0-9a-f]{64}$/;
  */
 function isValidSwapId(value: unknown): value is string {
   return typeof value === 'string' && SWAP_ID_RE.test(value);
+}
+
+/** Nametag character pattern — mirrors core/address.ts NAMETAG_RE. */
+const NAMETAG_BINDING_RE = /^[a-z0-9][a-z0-9_-]*$/;
+
+/**
+ * Validates a nametag binding proof has the expected structure and field formats.
+ * Used to reject malformed auxiliary data before it reaches the swap handler.
+ */
+function isValidNametagBinding(value: unknown): boolean {
+  if (!isObject(value)) return false;
+  const b = value as Record<string, unknown>;
+  return (
+    typeof b.nametag === 'string' &&
+    b.nametag.length > 0 &&
+    b.nametag.length <= 30 &&
+    NAMETAG_BINDING_RE.test(b.nametag) &&
+    typeof b.direct_address === 'string' &&
+    b.direct_address.length > 0 &&
+    b.direct_address.length <= 256 &&
+    typeof b.chain_pubkey === 'string' &&
+    PUBKEY_RE.test(b.chain_pubkey) &&
+    typeof b.signature === 'string' &&
+    SIG_RE.test(b.signature)
+  );
 }
 
 /**
