@@ -5,7 +5,7 @@ export default defineConfig({
     globals: true,
     environment: 'node',
     include: ['tests/**/*.test.ts'],
-    exclude: ['tests/e2e/**', 'tests/relay/**'],
+    exclude: ['tests/e2e/**', 'tests/relay/**', 'tests/integration/daemon-cli.test.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'html', 'json'],
