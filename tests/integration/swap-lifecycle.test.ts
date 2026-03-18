@@ -35,10 +35,16 @@ import {
 // Constants
 // =============================================================================
 
-const PARTY_A_PUBKEY = '02' + 'a'.repeat(64);
+// NOTE: Chain pubkeys must be the correct compressed secp256k1 points derived
+// from the private keys used in the identities below (privateKey = 'a'.repeat(64)
+// and 'b'.repeat(64)). The v2 signature verification recovers the pubkey from
+// the signature and compares it to chainPubkey, so these MUST match.
+const PARTY_A_PRIVATE_KEY = 'a'.repeat(64);
+const PARTY_A_PUBKEY = '026a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3';
 const PARTY_A_TRANSPORT_PUBKEY = 'a'.repeat(64);
 const PARTY_A_ADDRESS = 'DIRECT://party_a_aaa111';
-const PARTY_B_PUBKEY = '02' + 'b'.repeat(64);
+const PARTY_B_PRIVATE_KEY = 'b'.repeat(64);
+const PARTY_B_PUBKEY = '0268680737c76dabb801cb2204f57dbe4e4579e4f710cd67dc1b4227592c81e9b5';
 const PARTY_B_TRANSPORT_PUBKEY = 'b'.repeat(64);
 const PARTY_B_ADDRESS = 'DIRECT://party_b_bbb222';
 const ESCROW_PUBKEY = '02' + 'e'.repeat(64);
@@ -87,6 +93,8 @@ class MockDMRelay {
 class EscrowSimulator {
   private relay: MockDMRelay;
   private escrowPubkey: string;
+  /** Maps DIRECT:// addresses to transport pubkeys for v2 multi-party delivery. */
+  private addressToTransportPubkey: Map<string, string>;
   private swapStates = new Map<string, {
     manifest: SwapManifest;
     depositInvoiceId: string;
@@ -97,9 +105,10 @@ class EscrowSimulator {
     state: string;
   }>();
 
-  constructor(relay: MockDMRelay, escrowPubkey: string) {
+  constructor(relay: MockDMRelay, escrowPubkey: string, addressToTransportPubkey?: Map<string, string>) {
     this.relay = relay;
     this.escrowPubkey = escrowPubkey;
+    this.addressToTransportPubkey = addressToTransportPubkey ?? new Map();
 
     // Register escrow as DM recipient
     this.relay.register(escrowPubkey, (dm) => {
@@ -116,11 +125,11 @@ class EscrowSimulator {
     }
 
     if (parsed.type === 'announce') {
-      this.handleAnnounce(dm.senderPubkey, parsed.manifest as SwapManifest);
+      this.handleAnnounce(dm.senderPubkey, parsed.manifest as SwapManifest, parsed.version as number | undefined);
     }
   }
 
-  private handleAnnounce(senderPubkey: string, manifest: SwapManifest): void {
+  private handleAnnounce(senderPubkey: string, manifest: SwapManifest, version?: number): void {
     const swapId = manifest.swap_id;
 
     if (!this.swapStates.has(swapId)) {
@@ -143,31 +152,49 @@ class EscrowSimulator {
 
     const swapState = this.swapStates.get(swapId)!;
 
-    // Send announce_result
-    const announceResult = JSON.stringify({
-      type: 'announce_result',
-      swap_id: swapId,
-      state: 'ANNOUNCED',
-      deposit_invoice_id: swapState.depositInvoiceId,
-      is_new: swapState.announcedParties.size === 1,
-      created_at: Date.now(),
-    });
-    this.relay.send(this.escrowPubkey, senderPubkey, announceResult);
+    // In v2, the escrow sends announce_result + invoice_delivery to BOTH parties
+    // (not just the sender). Resolve transport pubkeys from the manifest addresses.
+    const recipients: string[] = [senderPubkey];
+    if (version === 2) {
+      const partyATransport = this.addressToTransportPubkey.get(manifest.party_a_address);
+      const partyBTransport = this.addressToTransportPubkey.get(manifest.party_b_address);
+      if (partyATransport && partyATransport !== senderPubkey) {
+        recipients.push(partyATransport);
+        swapState.announcedParties.add(partyATransport);
+      }
+      if (partyBTransport && partyBTransport !== senderPubkey) {
+        recipients.push(partyBTransport);
+        swapState.announcedParties.add(partyBTransport);
+      }
+    }
 
-    // Send deposit invoice_delivery
-    const invoiceDelivery = JSON.stringify({
-      type: 'invoice_delivery',
-      swap_id: swapId,
-      invoice_type: 'deposit',
-      invoice_id: swapState.depositInvoiceId,
-      invoice_token: this.createMockInvoiceToken(swapId, swapState),
-      payment_instructions: {
-        your_currency: manifest.party_a_currency_to_change,
-        your_amount: manifest.party_a_value_to_change,
-        memo: `swap:${swapId}`,
-      },
-    });
-    this.relay.send(this.escrowPubkey, senderPubkey, invoiceDelivery);
+    for (const recipientPubkey of recipients) {
+      // Send announce_result
+      const announceResult = JSON.stringify({
+        type: 'announce_result',
+        swap_id: swapId,
+        state: 'ANNOUNCED',
+        deposit_invoice_id: swapState.depositInvoiceId,
+        is_new: recipientPubkey === senderPubkey,
+        created_at: Date.now(),
+      });
+      this.relay.send(this.escrowPubkey, recipientPubkey, announceResult);
+
+      // Send deposit invoice_delivery
+      const invoiceDelivery = JSON.stringify({
+        type: 'invoice_delivery',
+        swap_id: swapId,
+        invoice_type: 'deposit',
+        invoice_id: swapState.depositInvoiceId,
+        invoice_token: this.createMockInvoiceToken(swapId, swapState),
+        payment_instructions: {
+          your_currency: manifest.party_a_currency_to_change,
+          your_amount: manifest.party_a_value_to_change,
+          memo: `swap:${swapId}`,
+        },
+      });
+      this.relay.send(this.escrowPubkey, recipientPubkey, invoiceDelivery);
+    }
   }
 
   /**
@@ -474,7 +501,7 @@ function createSwapTestPair(): SwapTestContext {
     directAddress: PARTY_A_ADDRESS,
     l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     nametag: 'alice',
-    privateKey: 'a'.repeat(64),
+    privateKey: PARTY_A_PRIVATE_KEY,
   };
 
   const identityB: FullIdentity = {
@@ -482,12 +509,18 @@ function createSwapTestPair(): SwapTestContext {
     directAddress: PARTY_B_ADDRESS,
     l1Address: 'alpha1partybbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     nametag: 'bob',
-    privateKey: 'b'.repeat(64),
+    privateKey: PARTY_B_PRIVATE_KEY,
   };
 
   const partyA = createParty(relay, identityA, peerMap, PARTY_A_TRANSPORT_PUBKEY);
   const partyB = createParty(relay, identityB, peerMap, PARTY_B_TRANSPORT_PUBKEY);
-  const escrow = new EscrowSimulator(relay, ESCROW_TRANSPORT_PUBKEY);
+
+  // Map DIRECT addresses to transport pubkeys so escrow can deliver to both parties in v2
+  const addressToTransportPubkey = new Map<string, string>([
+    [PARTY_A_ADDRESS, PARTY_A_TRANSPORT_PUBKEY],
+    [PARTY_B_ADDRESS, PARTY_B_TRANSPORT_PUBKEY],
+  ]);
+  const escrow = new EscrowSimulator(relay, ESCROW_TRANSPORT_PUBKEY, addressToTransportPubkey);
 
   return { partyA, partyB, escrow, relay };
 }

@@ -17,10 +17,11 @@ import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
 import {
   buildAnnounceDM,
+  buildAnnounceDM_v2,
   buildStatusQueryDM,
   buildRequestInvoiceDM,
 } from './dm-protocol.js';
-import type { SwapDeal, SwapManifest, SwapModuleConfig, SwapModuleDependencies } from './types.js';
+import type { SwapDeal, SwapManifest, ManifestSignatures, ManifestAuxiliary, SwapModuleConfig, SwapModuleDependencies } from './types.js';
 
 /** Logger tag for all escrow-client operations. */
 const TAG = 'SwapEscrow';
@@ -167,6 +168,42 @@ export async function sendAnnounce(
     () => communications.sendDM(escrowPubkey, dm).then(() => undefined),
     5,
     'announce',
+  );
+}
+
+// =============================================================================
+// sendAnnounce_v2 — Submit signed manifest to escrow (protocol v2)
+// =============================================================================
+
+/**
+ * Send a v2 `announce` DM to the escrow service with the swap manifest,
+ * both party signatures, chain pubkeys, and optional nametag binding proofs.
+ *
+ * In protocol v2 the escrow verifies both signatures before creating the
+ * swap record. The escrow deduplicates by swap_id, so this is safe to call
+ * multiple times (e.g., on recovery after crash). Wrapped in {@link withRetry}
+ * with 5 retries for resilience against transient transport failures.
+ *
+ * @param communications - CommunicationsModule subset for DM sending
+ * @param escrowPubkey - Escrow's transport pubkey (DM recipient)
+ * @param manifest - The swap manifest to announce
+ * @param signatures - Both party consent signatures
+ * @param chainPubkeys - Both party 33-byte compressed chain pubkeys
+ * @param auxiliary - Optional nametag binding proofs
+ */
+export async function sendAnnounce_v2(
+  communications: SwapModuleDependencies['communications'],
+  escrowPubkey: string,
+  manifest: SwapManifest,
+  signatures: ManifestSignatures,
+  chainPubkeys: { party_a: string; party_b: string },
+  auxiliary?: ManifestAuxiliary,
+): Promise<void> {
+  const dm = buildAnnounceDM_v2(manifest, signatures, chainPubkeys, auxiliary);
+  await withRetry(
+    () => communications.sendDM(escrowPubkey, dm).then(() => undefined),
+    5,
+    'announce_v2',
   );
 }
 

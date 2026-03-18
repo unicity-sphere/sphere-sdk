@@ -80,6 +80,50 @@ export interface ManifestFields {
   readonly timeout: number;
   /** Random salt ensuring unique swap_id even for identical deal terms (32 hex chars) */
   readonly salt: string;
+  /** Escrow DIRECT:// address (v2, required when protocol_version === 2) */
+  readonly escrow_address?: string;
+  /** Protocol version (v2: 2, absent for v1) */
+  readonly protocol_version?: number;
+}
+
+/**
+ * Signatures from both parties over the swap consent message.
+ * Each signature is a 130-char hex string (v + r + s) produced by
+ * signMessage() over "swap_consent:{swapId}:{escrowAddress}".
+ */
+export interface ManifestSignatures {
+  /** Party A's consent signature (130-char hex) */
+  readonly party_a?: string;
+  /** Party B's consent signature (130-char hex) */
+  readonly party_b?: string;
+}
+
+/**
+ * Nametag binding proof -- proves that the nametag owner authorized
+ * the DIRECT:// address for this swap. The signature covers
+ * "nametag_bind:{nametag}:{directAddress}:{swapId}".
+ */
+export interface NametagBindingProof {
+  /** The human-readable nametag (without @) */
+  readonly nametag: string;
+  /** The party's resolved DIRECT:// address */
+  readonly direct_address: string;
+  /** The party's 33-byte compressed chain pubkey (hex) */
+  readonly chain_pubkey: string;
+  /** 130-char hex signature over the binding message */
+  readonly signature: string;
+}
+
+/**
+ * Auxiliary manifest data (nametag bindings).
+ * Not part of swap_id hash -- carried alongside the manifest
+ * for UI enrichment and nametag verification.
+ */
+export interface ManifestAuxiliary {
+  /** Nametag binding proof for party A */
+  readonly party_a_binding?: NametagBindingProof;
+  /** Nametag binding proof for party B */
+  readonly party_b_binding?: NametagBindingProof;
 }
 
 /**
@@ -109,6 +153,10 @@ export interface SwapManifest {
   readonly timeout: number;
   /** Random salt ensuring unique swap_id even for identical deal terms (32 hex chars) */
   readonly salt: string;
+  /** Escrow DIRECT:// address (v2, required when protocol_version === 2) */
+  readonly escrow_address?: string;
+  /** Protocol version (v2: 2, absent for v1) */
+  readonly protocol_version?: number;
 }
 
 // =============================================================================
@@ -230,6 +278,16 @@ export interface SwapRef {
   updatedAt: number;
   /** Error message if progress is 'failed' */
   error?: string;
+  /** Proposer's chain pubkey (from v2 proposal DM) */
+  readonly proposerChainPubkey?: string;
+  /** Proposer's signature over swap consent message */
+  readonly proposerSignature?: string;
+  /** Acceptor's signature over swap consent message */
+  readonly acceptorSignature?: string;
+  /** Auxiliary data (nametag bindings) */
+  readonly auxiliary?: ManifestAuxiliary;
+  /** Protocol version (2 for v2, undefined for v1) */
+  readonly protocolVersion?: number;
 }
 
 // =============================================================================
@@ -246,14 +304,20 @@ export interface SwapRef {
 export interface SwapProposalMessage {
   /** Discriminator */
   readonly type: 'swap_proposal';
-  /** Protocol version (always 1 for forward compatibility) */
-  readonly version: 1;
+  /** Protocol version (1 = legacy, 2 = signed) */
+  readonly version: 1 | 2;
   /** The swap manifest (wire format, addresses already resolved) */
   readonly manifest: SwapManifest;
   /** Escrow service address (@nametag or DIRECT://) */
   readonly escrow: string;
   /** Optional human-readable description of the deal */
   readonly message?: string;
+  /** Proposer's consent signature over "swap_consent:{swap_id}:{escrow_address}" (v2 only, 130 hex chars) */
+  readonly proposer_signature?: string;
+  /** Proposer's 33-byte compressed chain pubkey (v2 only, 66 hex chars) */
+  readonly proposer_chain_pubkey?: string;
+  /** Nametag binding proofs (v2 only) */
+  readonly auxiliary?: ManifestAuxiliary;
 }
 
 /**
@@ -266,10 +330,14 @@ export interface SwapProposalMessage {
 export interface SwapAcceptanceMessage {
   /** Discriminator */
   readonly type: 'swap_acceptance';
-  /** Protocol version */
-  readonly version: 1;
+  /** Protocol version (1 = legacy, 2 = signed) */
+  readonly version: 1 | 2;
   /** Swap ID confirming which proposal is being accepted */
   readonly swap_id: string;
+  /** Acceptor's consent signature over "swap_consent:{swap_id}:{escrow_address}" (v2 only, 130 hex chars) */
+  readonly acceptor_signature?: string;
+  /** Acceptor's 33-byte compressed chain pubkey (v2 only, 66 hex chars) */
+  readonly acceptor_chain_pubkey?: string;
 }
 
 /**

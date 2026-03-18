@@ -261,11 +261,14 @@ export type { AddressType, ParsedAddress } from './core/address';
 
 // Swap module
 export { SwapModule, createSwapModule } from './modules/swap/index';
-export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity } from './modules/swap/manifest';
+export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity, signSwapManifest, verifySwapSignature, createNametagBinding, verifyNametagBinding } from './modules/swap/manifest';
 export type {
   SwapDeal,
   SwapManifest,
   ManifestFields,
+  ManifestSignatures,
+  NametagBindingProof,
+  ManifestAuxiliary,
   SwapProgress,
   SwapRole,
   SwapRef,

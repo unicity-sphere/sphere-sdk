@@ -13,8 +13,9 @@ import canonicalize from 'canonicalize';
 import { sha256 } from '../../core/crypto.js';
 import { randomHex } from '../../core/utils.js';
 
-import { isValidAddress } from '../../core/address.js';
-import type { ManifestFields, SwapDeal, SwapManifest } from './types.js';
+import { isValidAddress, isValidDirectAddress } from '../../core/address.js';
+import { signMessage, verifySignedMessage } from '../../core/crypto.js';
+import type { ManifestFields, NametagBindingProof, SwapDeal, SwapManifest } from './types.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -71,6 +72,8 @@ export function computeSwapId(fields: ManifestFields): string {
  * @param resolvedPartyB - Party B's resolved DIRECT:// address.
  * @param deal - The user-facing swap deal (currencies, amounts, timeout).
  * @param timeout - Timeout in seconds (from deal.timeout).
+ * @param escrowAddress - Optional escrow DIRECT:// address. When provided,
+ *   the manifest includes escrow_address and protocol_version=2.
  * @returns A complete SwapManifest with computed swap_id.
  */
 export function buildManifest(
@@ -78,6 +81,7 @@ export function buildManifest(
   resolvedPartyB: string,
   deal: SwapDeal,
   timeout: number,
+  escrowAddress?: string,
 ): SwapManifest {
   const fields: ManifestFields = {
     party_a_address: resolvedPartyA,
@@ -88,6 +92,7 @@ export function buildManifest(
     party_b_value_to_change: deal.partyBAmount,
     timeout,
     salt: randomHex(16), // 32 hex chars — ensures unique swap_id per proposal
+    ...(escrowAddress ? { escrow_address: escrowAddress, protocol_version: 2 } : {}),
   };
 
   const swap_id = computeSwapId(fields);
@@ -160,9 +165,19 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
     errors.push('salt must be exactly 32 lowercase hex characters');
   }
 
+  // v2 fields: if protocol_version is present, validate it and escrow_address
+  if (manifest.protocol_version !== undefined) {
+    if (manifest.protocol_version !== 2) {
+      errors.push('protocol_version must be 2 when present');
+    }
+    if (typeof manifest.escrow_address !== 'string' || !isValidDirectAddress(manifest.escrow_address)) {
+      errors.push('escrow_address must be a valid DIRECT:// address when protocol_version is 2');
+    }
+  }
+
   // Integrity check: recompute swap_id only if all other fields passed
   if (errors.length === 0) {
-    const recomputed = computeSwapId({
+    const hashFields: ManifestFields = {
       party_a_address: manifest.party_a_address,
       party_b_address: manifest.party_b_address,
       party_a_currency_to_change: manifest.party_a_currency_to_change,
@@ -171,7 +186,10 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
       party_b_value_to_change: manifest.party_b_value_to_change,
       timeout: manifest.timeout,
       salt: manifest.salt,
-    });
+      ...(manifest.escrow_address ? { escrow_address: manifest.escrow_address } : {}),
+      ...(manifest.protocol_version ? { protocol_version: manifest.protocol_version } : {}),
+    };
+    const recomputed = computeSwapId(hashFields);
     if (recomputed !== manifest.swap_id) {
       errors.push('swap_id does not match SHA-256 hash of manifest fields');
     }
@@ -186,7 +204,8 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
 
 /**
  * Verify that a manifest's swap_id matches the SHA-256 hash of its other
- * 8 fields. This is a lightweight check that does not validate field formats.
+ * fields. This is a lightweight check that does not validate field formats.
+ * Includes v2 fields (escrow_address, protocol_version) in the hash when present.
  *
  * @param manifest - The manifest to verify.
  * @returns true if swap_id matches the recomputed hash.
@@ -201,6 +220,89 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
     party_b_value_to_change: manifest.party_b_value_to_change,
     timeout: manifest.timeout,
     salt: manifest.salt,
+    ...(manifest.escrow_address ? { escrow_address: manifest.escrow_address } : {}),
+    ...(manifest.protocol_version ? { protocol_version: manifest.protocol_version } : {}),
   });
   return recomputed === manifest.swap_id;
+}
+
+// ---------------------------------------------------------------------------
+// Swap Consent Signing (v2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Sign a swap manifest consent message.
+ * Signs "swap_consent:{swapId}:{escrowAddress}" with the party's chain private key.
+ *
+ * @param privateKey - The signer's chain private key (hex).
+ * @param swapId - The swap_id (64 lowercase hex chars).
+ * @param escrowAddress - The escrow's DIRECT:// address.
+ * @returns 130-char hex signature (v + r + s).
+ */
+export function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string {
+  const message = `swap_consent:${swapId}:${escrowAddress}`;
+  return signMessage(privateKey, message);
+}
+
+/**
+ * Verify a swap manifest consent signature.
+ *
+ * @param swapId - The swap_id (64 lowercase hex chars).
+ * @param escrowAddress - The escrow's DIRECT:// address.
+ * @param signature - 130-char hex signature to verify.
+ * @param chainPubkey - Expected signer's 33-byte compressed pubkey (hex).
+ * @returns true if the signature is valid and matches the expected pubkey.
+ */
+export function verifySwapSignature(
+  swapId: string,
+  escrowAddress: string,
+  signature: string,
+  chainPubkey: string,
+): boolean {
+  const message = `swap_consent:${swapId}:${escrowAddress}`;
+  return verifySignedMessage(message, signature, chainPubkey);
+}
+
+// ---------------------------------------------------------------------------
+// Nametag Binding (v2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a nametag binding proof.
+ * Signs "nametag_bind:{nametag}:{directAddress}:{swapId}" with the party's
+ * chain private key, proving the nametag owner authorized the address for
+ * this swap.
+ *
+ * @param privateKey - The signer's chain private key (hex).
+ * @param nametag - The human-readable nametag (without @).
+ * @param directAddress - The party's resolved DIRECT:// address.
+ * @param swapId - The swap_id (64 lowercase hex chars).
+ * @param chainPubkey - The signer's 33-byte compressed chain pubkey (hex).
+ * @returns A NametagBindingProof with the signature.
+ */
+export function createNametagBinding(
+  privateKey: string,
+  nametag: string,
+  directAddress: string,
+  swapId: string,
+  chainPubkey: string,
+): NametagBindingProof {
+  const message = `nametag_bind:${nametag}:${directAddress}:${swapId}`;
+  const signature = signMessage(privateKey, message);
+  return { nametag, direct_address: directAddress, chain_pubkey: chainPubkey, signature };
+}
+
+/**
+ * Verify a nametag binding proof.
+ *
+ * @param proof - The NametagBindingProof to verify.
+ * @param swapId - The swap_id (64 lowercase hex chars).
+ * @returns true if the signature is valid and matches the proof's chain_pubkey.
+ */
+export function verifyNametagBinding(
+  proof: NametagBindingProof,
+  swapId: string,
+): boolean {
+  const message = `nametag_bind:${proof.nametag}:${proof.direct_address}:${swapId}`;
+  return verifySignedMessage(message, proof.signature, proof.chain_pubkey);
 }

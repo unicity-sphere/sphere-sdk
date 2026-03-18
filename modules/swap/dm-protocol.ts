@@ -26,6 +26,8 @@
 
 import type {
   SwapManifest,
+  ManifestSignatures,
+  ManifestAuxiliary,
   SwapProposalMessage,
   SwapAcceptanceMessage,
   SwapRejectionMessage,
@@ -233,6 +235,101 @@ export function buildCancelDM(swapId: string, reason?: string): string {
 }
 
 // =============================================================================
+// V2 Message Builders
+// =============================================================================
+
+/**
+ * Build a v2 swap proposal DM string.
+ *
+ * In protocol v2 the proposer signs the manifest and includes their chain
+ * pubkey so the acceptor can verify consent and announce directly to the
+ * escrow without requiring the proposer to be online.
+ *
+ * @param manifest - The swap manifest (addresses already resolved to DIRECT://)
+ * @param escrow - Escrow service address (@nametag or DIRECT://)
+ * @param proposerSignature - Proposer's signature of "swap_consent:{swap_id}:{escrow_address}" (130 hex chars)
+ * @param proposerChainPubkey - Proposer's 33-byte compressed chain pubkey (66 hex chars)
+ * @param auxiliary - Optional nametag binding proofs
+ * @param message - Optional human-readable description of the deal
+ * @returns DM content string with `swap_proposal:` prefix
+ */
+export function buildProposalDM_v2(
+  manifest: SwapManifest,
+  escrow: string,
+  proposerSignature: string,
+  proposerChainPubkey: string,
+  auxiliary?: ManifestAuxiliary,
+  message?: string,
+): string {
+  return SWAP_PROPOSAL_PREFIX + JSON.stringify({
+    type: 'swap_proposal',
+    version: 2,
+    manifest,
+    escrow,
+    proposer_signature: proposerSignature,
+    proposer_chain_pubkey: proposerChainPubkey,
+    ...(auxiliary !== undefined ? { auxiliary } : {}),
+    ...(message !== undefined && message !== '' ? { message } : {}),
+  });
+}
+
+/**
+ * Build a v2 swap acceptance DM string.
+ *
+ * In protocol v2 the acceptor includes their consent signature and chain
+ * pubkey. This is informational for the proposer -- the acceptor announces
+ * directly to the escrow with both signatures.
+ *
+ * @param swapId - The swap ID (64 lowercase hex chars) being accepted
+ * @param acceptorSignature - Acceptor's signature of "swap_consent:{swap_id}:{escrow_address}" (130 hex chars)
+ * @param acceptorChainPubkey - Acceptor's 33-byte compressed chain pubkey (66 hex chars)
+ * @returns DM content string with `swap_acceptance:` prefix
+ */
+export function buildAcceptanceDM_v2(
+  swapId: string,
+  acceptorSignature: string,
+  acceptorChainPubkey: string,
+): string {
+  return SWAP_ACCEPTANCE_PREFIX + JSON.stringify({
+    type: 'swap_acceptance',
+    version: 2,
+    swap_id: swapId,
+    acceptor_signature: acceptorSignature,
+    acceptor_chain_pubkey: acceptorChainPubkey,
+  });
+}
+
+/**
+ * Build a v2 announce DM for the escrow service.
+ *
+ * In protocol v2 the announce message includes both party signatures and
+ * their chain pubkeys so the escrow can cryptographically verify that both
+ * parties consented to the swap. Optional auxiliary data carries nametag
+ * binding proofs.
+ *
+ * @param manifest - The swap manifest (wire format with DIRECT:// addresses)
+ * @param signatures - Both party signatures over the swap consent message
+ * @param chainPubkeys - Both party chain pubkeys (33-byte compressed, 66 hex chars)
+ * @param auxiliary - Optional nametag binding proofs
+ * @returns JSON string suitable for DM to the escrow
+ */
+export function buildAnnounceDM_v2(
+  manifest: SwapManifest,
+  signatures: ManifestSignatures,
+  chainPubkeys: { party_a: string; party_b: string },
+  auxiliary?: ManifestAuxiliary,
+): string {
+  return JSON.stringify({
+    type: 'announce',
+    version: 2,
+    manifest,
+    signatures,
+    chain_pubkeys: chainPubkeys,
+    ...(auxiliary !== undefined ? { auxiliary } : {}),
+  });
+}
+
+// =============================================================================
 // Universal Parser
 // =============================================================================
 
@@ -346,12 +443,25 @@ function parseProposal(json: string): ParsedSwapDM | null {
   // Optional message field
   if (obj.message !== undefined && typeof obj.message !== 'string') return null;
 
+  const version = obj.version as number;
+
+  // V2-specific fields
+  if (version === 2) {
+    if (typeof obj.proposer_signature !== 'string' || obj.proposer_signature.length === 0) return null;
+    if (typeof obj.proposer_chain_pubkey !== 'string' || obj.proposer_chain_pubkey.length === 0) return null;
+    // auxiliary is optional even in v2
+    if (obj.auxiliary !== undefined && !isObject(obj.auxiliary)) return null;
+  }
+
   const payload: SwapProposalMessage = {
     type: 'swap_proposal',
-    version: 1,
+    version: (version === 2 ? 2 : 1) as 1 | 2,
     manifest: obj.manifest as SwapManifest,
     escrow: obj.escrow as string,
     ...(typeof obj.message === 'string' ? { message: obj.message } : {}),
+    ...(typeof obj.proposer_signature === 'string' ? { proposer_signature: obj.proposer_signature } : {}),
+    ...(typeof obj.proposer_chain_pubkey === 'string' ? { proposer_chain_pubkey: obj.proposer_chain_pubkey } : {}),
+    ...(isObject(obj.auxiliary) ? { auxiliary: obj.auxiliary as ManifestAuxiliary } : {}),
   };
 
   return { kind: 'proposal', payload };
@@ -375,10 +485,20 @@ function parseAcceptance(json: string): ParsedSwapDM | null {
   if (typeof obj.version !== 'number') return null;
   if (!isValidSwapId(obj.swap_id)) return null;
 
+  const version = obj.version as number;
+
+  // V2-specific fields
+  if (version === 2) {
+    if (typeof obj.acceptor_signature !== 'string' || obj.acceptor_signature.length === 0) return null;
+    if (typeof obj.acceptor_chain_pubkey !== 'string' || obj.acceptor_chain_pubkey.length === 0) return null;
+  }
+
   const payload: SwapAcceptanceMessage = {
     type: 'swap_acceptance',
-    version: 1,
+    version: (version === 2 ? 2 : 1) as 1 | 2,
     swap_id: obj.swap_id as string,
+    ...(typeof obj.acceptor_signature === 'string' ? { acceptor_signature: obj.acceptor_signature } : {}),
+    ...(typeof obj.acceptor_chain_pubkey === 'string' ? { acceptor_chain_pubkey: obj.acceptor_chain_pubkey } : {}),
   };
 
   return { kind: 'acceptance', payload };

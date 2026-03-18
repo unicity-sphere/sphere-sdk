@@ -20,7 +20,7 @@ import { SphereError } from '../../core/errors.js';
  * Terminal states (completed, cancelled, failed) have no outgoing transitions.
  */
 export const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, readonly SwapProgress[]> = {
-  proposed:         ['accepted', 'cancelled', 'failed'],
+  proposed:         ['accepted', 'announced', 'cancelled', 'failed'],
   accepted:         ['announced', 'cancelled', 'failed'],
   announced:        ['depositing', 'cancelled', 'failed'],
   depositing:       ['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed'],
