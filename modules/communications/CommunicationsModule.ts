@@ -542,8 +542,18 @@ export class CommunicationsModule {
       return;
     }
 
-    // Skip own messages (non-self-wrap)
-    if (msg.senderTransportPubkey === this.deps?.identity.chainPubkey) return;
+    // Skip own messages (non-self-wrap).
+    // Compare transport pubkey (32-byte x-only) against both chainPubkey (33-byte
+    // compressed, with 02/03 prefix) and its x-only form (prefix stripped).
+    const ownChainPubkey = this.deps?.identity.chainPubkey;
+    if (ownChainPubkey) {
+      const tp = msg.senderTransportPubkey;
+      if (tp === ownChainPubkey) return;
+      // x-only comparison: strip 02/03 prefix from chainPubkey
+      if (ownChainPubkey.length === 66 &&
+          (ownChainPubkey.startsWith('02') || ownChainPubkey.startsWith('03')) &&
+          tp === ownChainPubkey.slice(2)) return;
+    }
 
     // Dedup: skip if already known
     if (this.messages.has(msg.id)) return;
