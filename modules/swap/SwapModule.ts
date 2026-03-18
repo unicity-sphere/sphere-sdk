@@ -1565,6 +1565,21 @@ export class SwapModule {
         );
       }
 
+      // Track whether the swap was already 'completed' before this call (driven by
+      // status_result with payoutVerified=false). In that case, the status_result handler
+      // suppressed swap:completed to avoid a duplicate — this call must emit it on both
+      // success AND transient-failure paths, so the user is never left without any event.
+      const alreadyCompleted = swap.progress === 'completed';
+
+      // Helper: return false while ensuring swap:completed is emitted if needed.
+      // The fraud-indicative paths use failPayout() and transition to 'failed' instead.
+      const returnFalse = (): false => {
+        if (alreadyCompleted) {
+          deps.emitEvent('swap:completed', { swapId, payoutVerified: false });
+        }
+        return false;
+      };
+
     // Get invoice ref to access terms
     const invoiceRef = deps.accounting.getInvoice(swap.payoutInvoiceId) as {
       invoiceId: string;
@@ -1656,20 +1671,20 @@ export class SwapModule {
     // Verify coverage from invoice status
     const targetStatus = status.targets[0];
     if (!targetStatus || !targetStatus.coinAssets[0]) {
-      return false;
+      return returnFalse();
     }
 
     const coveredState = status.state;
     if (coveredState !== 'COVERED' && coveredState !== 'CLOSED') {
-      return false;
+      return returnFalse();
     }
 
     if (!targetStatus.coinAssets[0].isCovered) {
-      return false;
+      return returnFalse();
     }
 
     if (BigInt(targetStatus.coinAssets[0].netCoveredAmount) < BigInt(expectedAmount)) {
-      return false;
+      return returnFalse();
     }
 
     // Verify escrow creator identity
@@ -1689,7 +1704,7 @@ export class SwapModule {
     const validationResult = await deps.payments.validate();
     if (validationResult.invalid.length > 0) {
       logger.warn(LOG_TAG, `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${validationResult.invalid.length} invalid token(s) — retry after wallet sync`);
-      return false;
+      return returnFalse();
     }
 
     // All checks passed — mark payout as verified.
@@ -2654,6 +2669,16 @@ export class SwapModule {
                       // a duplicate event with conflicting payoutVerified values.
                       if (!swap.payoutInvoiceId) {
                         deps.emitEvent('swap:completed', { swapId, payoutVerified: false });
+                      } else {
+                        // Payout invoice exists but a prior auto-verify may have returned false
+                        // before this status_result arrived. Schedule a fresh attempt so
+                        // swap:completed is emitted (verifyPayout's returnFalse() ensures it fires
+                        // even on transient failure). Runs OUTSIDE this gate via fire-and-forget.
+                        this.verifyPayout(swapId).catch((err) => {
+                          if (this.config.debug) {
+                            logger.debug(LOG_TAG, `Deferred verify for swap ${swapId} after status_result:`, err);
+                          }
+                        });
                       }
                     } else if (mappedProgress === 'cancelled') {
                       await this.transitionProgress(swap, 'cancelled', { error: `Escrow state: ${msg.state}` });
@@ -3074,6 +3099,7 @@ export class SwapModule {
 
     // Start timer for remaining duration
     const timer = setTimeout(() => {
+      if (this.destroyed) return;
       void this.withSwapGate(swap.swapId, async () => {
         const s = this.swaps.get(swap.swapId);
         if (!s || isTerminalProgress(s.progress)) return;
@@ -3196,6 +3222,7 @@ export class SwapModule {
     this.clearLocalTimer(swapId);
 
     const timer = setTimeout(() => {
+      if (this.destroyed) return;
       void this.withSwapGate(swapId, async () => {
         const s = this.swaps.get(swapId);
         if (!s || s.progress !== 'accepted') return;

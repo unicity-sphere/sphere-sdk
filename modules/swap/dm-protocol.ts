@@ -444,7 +444,7 @@ function parseProposal(json: string): ParsedSwapDM | null {
   // Validate required fields
   if (obj.type !== 'swap_proposal') return null;
   if (!isValidManifest(obj.manifest)) return null;
-  if (typeof obj.escrow !== 'string' || obj.escrow.length === 0) return null;
+  if (typeof obj.escrow !== 'string' || obj.escrow.length === 0 || obj.escrow.length > 256) return null;
 
   // Optional message field
   if (obj.message !== undefined && typeof obj.message !== 'string') return null;
@@ -478,7 +478,16 @@ function parseProposal(json: string): ParsedSwapDM | null {
     ...(typeof obj.message === 'string' ? { message: obj.message.slice(0, MAX_PAYLOAD_STRING_LEN) } : {}),
     ...(version === 2 && typeof obj.proposer_signature === 'string' ? { proposer_signature: obj.proposer_signature } : {}),
     ...(version === 2 && typeof obj.proposer_chain_pubkey === 'string' ? { proposer_chain_pubkey: obj.proposer_chain_pubkey } : {}),
-    ...(version === 2 && isObject(obj.auxiliary) ? { auxiliary: obj.auxiliary as ManifestAuxiliary } : {}),
+    // Reconstruct auxiliary from only the two known binding keys — extra keys (e.g.
+    // constructor, toString) are silently dropped to prevent prototype-shadowing attacks.
+    ...(version === 2 && isObject(obj.auxiliary) ? (() => {
+      const aux = obj.auxiliary as Record<string, unknown>;
+      const clean: ManifestAuxiliary = {
+        ...(isObject(aux.party_a_binding) ? { party_a_binding: aux.party_a_binding as unknown as ManifestAuxiliary['party_a_binding'] } : {}),
+        ...(isObject(aux.party_b_binding) ? { party_b_binding: aux.party_b_binding as unknown as ManifestAuxiliary['party_b_binding'] } : {}),
+      };
+      return { auxiliary: clean };
+    })() : {}),
   };
 
   return { kind: 'proposal', payload };
@@ -550,9 +559,11 @@ function parseRejection(json: string): ParsedSwapDM | null {
   // Optional reason field
   if (obj.reason !== undefined && typeof obj.reason !== 'string') return null;
 
+  const version = (rawVersion === 2 ? 2 : 1) as 1 | 2;
+
   const payload: SwapRejectionMessage = {
     type: 'swap_rejection',
-    version: 1,
+    version,
     swap_id: obj.swap_id as string,
     ...(typeof obj.reason === 'string' ? { reason: obj.reason.slice(0, MAX_PAYLOAD_STRING_LEN) } : {}),
   };
@@ -753,7 +764,8 @@ function parsePaymentConfirmation(obj: Record<string, unknown>): ParsedSwapDM | 
     swap_id: obj.swap_id as string,
   };
   if (typeof obj.party === 'string') {
-    payload.party = obj.party;
+    // party is expected to be "party_a" or "party_b"; cap to prevent oversized values.
+    payload.party = obj.party.slice(0, 32);
   }
   copyExtensibilityKeys(obj, SKIP, payload);
 

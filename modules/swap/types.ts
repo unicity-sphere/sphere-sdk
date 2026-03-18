@@ -349,8 +349,8 @@ export interface SwapAcceptanceMessage {
 export interface SwapRejectionMessage {
   /** Discriminator */
   readonly type: 'swap_rejection';
-  /** Protocol version */
-  readonly version: 1;
+  /** Protocol version (1 = legacy, 2 = signed) */
+  readonly version: 1 | 2;
   /** Swap ID identifying which proposal is being rejected */
   readonly swap_id: string;
   /** Optional human-readable reason for rejection */

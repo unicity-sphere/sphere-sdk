@@ -240,6 +240,10 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
  * @returns 130-char hex signature (v + r + s).
  */
 export function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string {
+  // Message format: "swap_consent:{swapId}:{escrowAddress}"
+  // Colon is used as a delimiter. swapId is guaranteed hex-only (no colons).
+  // escrowAddress must be a DIRECT:// address where the pubkey suffix is hex-only —
+  // enforced by isValidDirectAddress() before this function is called.
   const message = `swap_consent:${swapId}:${escrowAddress}`;
   return signMessage(privateKey, message);
 }
@@ -312,6 +316,10 @@ export function createNametagBinding(
   if (!isValidNametag(nametag)) {
     throw new Error(`Invalid nametag for binding proof: "${nametag.slice(0, 80)}"`);
   }
+  // Message format: "nametag_bind:{nametag}:{directAddress}:{swapId}"
+  // Colon is used as a delimiter. nametag is [a-z0-9_-] (no colons, validated above).
+  // swapId is hex-only (no colons). directAddress must be a DIRECT:// address where
+  // the pubkey suffix is hex-only — enforced by caller validation before this point.
   const message = `nametag_bind:${nametag}:${directAddress}:${swapId}`;
   const signature = signMessage(privateKey, message);
   return { nametag, direct_address: directAddress, chain_pubkey: chainPubkey, signature };
