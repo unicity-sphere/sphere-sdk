@@ -1805,6 +1805,25 @@ export class SwapModule {
                 }
                 return;
               }
+
+              // Verify nametag bindings if present
+              if (proposalMsg.auxiliary) {
+                const aux = proposalMsg.auxiliary;
+                if (aux.party_a_binding) {
+                  if (!verifyNametagBinding(aux.party_a_binding, manifest.swap_id) ||
+                      aux.party_a_binding.direct_address !== manifest.party_a_address) {
+                    logger.debug(LOG_TAG, `Proposal ${manifest.swap_id}: invalid party_a nametag binding`);
+                    return;
+                  }
+                }
+                if (aux.party_b_binding) {
+                  if (!verifyNametagBinding(aux.party_b_binding, manifest.swap_id) ||
+                      aux.party_b_binding.direct_address !== manifest.party_b_address) {
+                    logger.debug(LOG_TAG, `Proposal ${manifest.swap_id}: invalid party_b nametag binding`);
+                    return;
+                  }
+                }
+              }
             }
 
             // Resolve escrow address to store escrowPubkey for later DM verification
@@ -1891,25 +1910,28 @@ export class SwapModule {
                 // Clear proposal timer
                 this.clearLocalTimer(swapId);
 
+                // v2: Verify acceptor signature BEFORE state transition
+                if (acceptMsg.version === 2 && acceptMsg.acceptor_signature && acceptMsg.acceptor_chain_pubkey) {
+                  const escrowAddr = swap.manifest.escrow_address ?? swap.escrowDirectAddress;
+                  if (!escrowAddr) {
+                    logger.debug(LOG_TAG, `Acceptance for ${swapId}: cannot verify v2 signature — escrow address unknown`);
+                    return; // Reject — cannot verify without escrow address
+                  }
+                  const valid = verifySwapSignature(
+                    swap.manifest.swap_id, escrowAddr,
+                    acceptMsg.acceptor_signature, acceptMsg.acceptor_chain_pubkey,
+                  );
+                  if (!valid) {
+                    logger.debug(LOG_TAG, `Acceptance for ${swapId}: invalid acceptor signature`);
+                    return;
+                  }
+                }
+
                 // Transition to 'accepted'
                 await this.transitionProgress(swap, 'accepted');
 
-                // v2: Verify and store acceptor signature
+                // v2: Store verified acceptor signature
                 if (acceptMsg.version === 2 && acceptMsg.acceptor_signature && acceptMsg.acceptor_chain_pubkey) {
-                  // Verify the acceptor's signature
-                  const escrowAddr = swap.manifest.escrow_address ?? swap.escrowDirectAddress;
-                  if (escrowAddr) {
-                    const valid = verifySwapSignature(
-                      swap.manifest.swap_id, escrowAddr,
-                      acceptMsg.acceptor_signature, acceptMsg.acceptor_chain_pubkey,
-                    );
-                    if (!valid) {
-                      if (this.config.debug) {
-                        logger.debug(LOG_TAG, `v2 acceptance for ${swapId}: invalid acceptor signature`);
-                      }
-                      return;
-                    }
-                  }
                   (swap as { acceptorSignature?: string }).acceptorSignature = acceptMsg.acceptor_signature;
                   await this.persistSwap(swap);
                 }

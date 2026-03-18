@@ -436,26 +436,28 @@ function parseProposal(json: string): ParsedSwapDM | null {
 
   // Validate required fields
   if (obj.type !== 'swap_proposal') return null;
-  if (typeof obj.version !== 'number') return null;
   if (!isValidManifest(obj.manifest)) return null;
   if (typeof obj.escrow !== 'string' || obj.escrow.length === 0) return null;
 
   // Optional message field
   if (obj.message !== undefined && typeof obj.message !== 'string') return null;
 
-  const version = obj.version as number;
+  // Reject unknown versions (accept 1, 2, or undefined which defaults to 1)
+  const rawVersion = obj.version;
+  if (rawVersion !== 1 && rawVersion !== 2 && rawVersion !== undefined) return null;
+  const version = (rawVersion === 2 ? 2 : 1) as 1 | 2;
 
   // V2-specific fields
   if (version === 2) {
-    if (typeof obj.proposer_signature !== 'string' || obj.proposer_signature.length === 0) return null;
-    if (typeof obj.proposer_chain_pubkey !== 'string' || obj.proposer_chain_pubkey.length === 0) return null;
+    if (typeof obj.proposer_signature !== 'string' || !SIG_RE.test(obj.proposer_signature)) return null;
+    if (typeof obj.proposer_chain_pubkey !== 'string' || !PUBKEY_RE.test(obj.proposer_chain_pubkey)) return null;
     // auxiliary is optional even in v2
     if (obj.auxiliary !== undefined && !isObject(obj.auxiliary)) return null;
   }
 
   const payload: SwapProposalMessage = {
     type: 'swap_proposal',
-    version: (version === 2 ? 2 : 1) as 1 | 2,
+    version,
     manifest: obj.manifest as SwapManifest,
     escrow: obj.escrow as string,
     ...(typeof obj.message === 'string' ? { message: obj.message } : {}),
@@ -482,20 +484,22 @@ function parseAcceptance(json: string): ParsedSwapDM | null {
   const obj = parsed as Record<string, unknown>;
 
   if (obj.type !== 'swap_acceptance') return null;
-  if (typeof obj.version !== 'number') return null;
   if (!isValidSwapId(obj.swap_id)) return null;
 
-  const version = obj.version as number;
+  // Reject unknown versions (accept 1, 2, or undefined which defaults to 1)
+  const rawVersion = obj.version;
+  if (rawVersion !== 1 && rawVersion !== 2 && rawVersion !== undefined) return null;
+  const version = (rawVersion === 2 ? 2 : 1) as 1 | 2;
 
   // V2-specific fields
   if (version === 2) {
-    if (typeof obj.acceptor_signature !== 'string' || obj.acceptor_signature.length === 0) return null;
-    if (typeof obj.acceptor_chain_pubkey !== 'string' || obj.acceptor_chain_pubkey.length === 0) return null;
+    if (typeof obj.acceptor_signature !== 'string' || !SIG_RE.test(obj.acceptor_signature)) return null;
+    if (typeof obj.acceptor_chain_pubkey !== 'string' || !PUBKEY_RE.test(obj.acceptor_chain_pubkey)) return null;
   }
 
   const payload: SwapAcceptanceMessage = {
     type: 'swap_acceptance',
-    version: (version === 2 ? 2 : 1) as 1 | 2,
+    version,
     swap_id: obj.swap_id as string,
     ...(typeof obj.acceptor_signature === 'string' ? { acceptor_signature: obj.acceptor_signature } : {}),
     ...(typeof obj.acceptor_chain_pubkey === 'string' ? { acceptor_chain_pubkey: obj.acceptor_chain_pubkey } : {}),
@@ -717,6 +721,12 @@ function parseEscrowError(obj: Record<string, unknown>): ParsedSwapDM | null {
 
 /** 64 lowercase hex characters (SHA-256 digest). */
 const SWAP_ID_RE = /^[0-9a-f]{64}$/;
+
+/** 130 lowercase hex characters (DER-encoded secp256k1 signature). */
+const SIG_RE = /^[0-9a-f]{130}$/;
+
+/** 33-byte compressed secp256k1 public key (02 or 03 prefix + 64 hex chars). */
+const PUBKEY_RE = /^(02|03)[0-9a-f]{64}$/;
 
 /**
  * Check whether a value is a valid swap ID (64 lowercase hex chars).
