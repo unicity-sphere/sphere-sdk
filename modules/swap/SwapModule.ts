@@ -240,6 +240,7 @@ export class SwapModule {
     this.terminalSwapIds.clear();
     this._storedTerminalEntries = [];
     this.invoiceToSwapIndex.clear();
+    this._completedEventEmittedUnverified.clear();
     this.loaded = false;
 
     if (this.config.debug) {
@@ -1645,19 +1646,41 @@ export class SwapModule {
     const failPayout = async (error: string): Promise<false> => {
       if (swap.progress === 'completed') {
         // Direct mutation: completed → failed bypass (invalid state machine edge).
+        // Side effects are replicated manually (clearLocalTimer, terminalSwapIds,
+        // _storedTerminalEntries, persistSwap).
+        //
+        // If persistSwap throws, we ROLL BACK all in-memory changes so the swap
+        // reloads as 'completed' next session and verifyPayout retries fraud detection.
+        const prevProgress = swap.progress;
+        const prevUpdatedAt = swap.updatedAt;
         swap.progress = 'failed';
         (swap as { payoutVerified?: boolean }).payoutVerified = false;
         (swap as { error?: string }).error = error;
         swap.updatedAt = Date.now();
         this.clearLocalTimer(swap.swapId);
         this.terminalSwapIds.add(swap.swapId);
+        const entryIdx = this._storedTerminalEntries.length;
         this._storedTerminalEntries.push({
           swapId: swap.swapId,
           progress: 'failed',
           role: swap.role,
           createdAt: swap.createdAt,
         });
-        await this.persistSwap(swap);
+        try {
+          await this.persistSwap(swap);
+        } catch (persistErr) {
+          // Storage failed — roll back so next load retries fraud detection.
+          swap.progress = prevProgress;
+          (swap as { payoutVerified?: boolean }).payoutVerified = undefined;
+          (swap as { error?: string }).error = undefined;
+          swap.updatedAt = prevUpdatedAt;
+          this.terminalSwapIds.delete(swap.swapId);
+          this._storedTerminalEntries.splice(entryIdx, 1);
+          // Re-arm local timer so the swap doesn't get stranded.
+          this.startLocalTimer(swap);
+          logger.warn(LOG_TAG, `failPayout: persistSwap failed for ${swapId}; fraud detection will retry on next load:`, persistErr);
+          throw persistErr;
+        }
       } else {
         await this.transitionProgress(swap, 'failed', { payoutVerified: false, error });
       }
@@ -2496,6 +2519,9 @@ export class SwapModule {
                 if (msg.invoice_type === 'deposit') {
                   // §12.4.2: Deposit invoice delivery
                   await this.withSwapGate(swapId, async () => {
+                    // Skip terminal swaps — late delivery after cancel/fail creates orphan invoices.
+                    if (isTerminalProgress(swap.progress)) return;
+
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
                     } catch (err) {
@@ -2637,6 +2663,9 @@ export class SwapModule {
                     // Store payoutInvoiceId
                     if (msg.invoice_id) {
                       swap.payoutInvoiceId = msg.invoice_id;
+                      // Register in index so in-session invoice events (invoice:covered,
+                      // invoice:return_received) route correctly to this swap.
+                      this.invoiceToSwapIndex.set(msg.invoice_id, swapId);
                     }
                     swap.updatedAt = Date.now();
                     await this.persistSwap(swap);
@@ -2678,6 +2707,11 @@ export class SwapModule {
                 const deps = this.deps!;
 
                 await this.withSwapGate(swapId, async () => {
+                  // Skip terminal swaps — no state advancement or persistence needed,
+                  // and failPayout direct-mutation may have left the swap as 'failed'
+                  // while still in this.swaps.
+                  if (isTerminalProgress(swap.progress)) return;
+
                   // Update escrowState
                   swap.escrowState = msg.state;
                   swap.updatedAt = Date.now();

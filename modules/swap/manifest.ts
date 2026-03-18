@@ -24,6 +24,14 @@ import type { ManifestFields, NametagBindingProof, SwapDeal, SwapManifest } from
 /** Regex for valid swap_id: exactly 64 lowercase hex characters. */
 const SWAP_ID_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * Strict DIRECT:// address regex used at signing boundaries.
+ * Enforces hex-only pubkey suffix (64 chars) to uphold the colon-delimiter
+ * invariant in signed messages. More permissive formats (e.g. test fixtures
+ * with non-hex suffixes) are accepted elsewhere but must never reach signers.
+ */
+const DIRECT_HEX_RE = /^DIRECT:\/\/[0-9a-f]{64,80}$/;
+
 /** Regex for valid currency/coinId: 1-20 alphanumeric characters. */
 const CURRENCY_RE = /^[A-Za-z0-9]{1,20}$/;
 
@@ -242,8 +250,11 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
 export function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string {
   // Message format: "swap_consent:{swapId}:{escrowAddress}"
   // Colon is used as a delimiter. swapId is guaranteed hex-only (no colons).
-  // escrowAddress must be a DIRECT:// address where the pubkey suffix is hex-only —
-  // enforced by isValidDirectAddress() before this function is called.
+  // Enforce DIRECT_HEX_RE here — isValidDirectAddress() in core/address.ts is
+  // intentionally permissive (accepts test fixtures); the signer must be strict.
+  if (!DIRECT_HEX_RE.test(escrowAddress)) {
+    throw new Error(`signSwapManifest: escrowAddress must be a DIRECT:// address with hex-only suffix, got "${escrowAddress.slice(0, 80)}"`);
+  }
   const message = `swap_consent:${swapId}:${escrowAddress}`;
   return signMessage(privateKey, message);
 }
@@ -345,6 +356,9 @@ export function verifyNametagBinding(
   // This prevents a malicious peer from triggering a crypto operation on an
   // arbitrarily large string.
   if (!isValidNametag(proof.nametag)) return false;
+  // Symmetric guard to createNametagBinding: enforce hex-only DIRECT:// address
+  // to uphold the colon-delimiter invariant in the signed message.
+  if (!DIRECT_HEX_RE.test(proof.direct_address)) return false;
   const message = `nametag_bind:${proof.nametag}:${proof.direct_address}:${swapId}`;
   return verifySignedMessage(message, proof.signature, proof.chain_pubkey);
 }
