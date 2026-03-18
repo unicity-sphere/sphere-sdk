@@ -154,7 +154,7 @@ describe('SwapModule Concurrency', () => {
   // --------------------------------------------------------------------------
   // UT-SWAP-CONC-004: concurrent proposeSwap with same deal returns idempotent result
   // --------------------------------------------------------------------------
-  it('UT-SWAP-CONC-004: concurrent proposeSwap with same deal returns idempotent result', async () => {
+  it('UT-SWAP-CONC-004: concurrent proposeSwap with same deal creates two swaps (unique salt)', async () => {
     const deal = createTestSwapDeal();
 
     // Call proposeSwap twice concurrently with the same deal
@@ -163,17 +163,17 @@ describe('SwapModule Concurrency', () => {
       module.proposeSwap(deal),
     ]);
 
-    // Both should succeed (the second should return the existing proposal)
+    // Both should succeed
     const fulfilled = results.filter(r => r.status === 'fulfilled');
     expect(fulfilled.length).toBe(2);
 
-    // Both should return the same swapId
+    // Each call generates a unique salt, so swap_ids differ
     const id1 = (fulfilled[0] as PromiseFulfilledResult<any>).value.swapId;
     const id2 = (fulfilled[1] as PromiseFulfilledResult<any>).value.swapId;
-    expect(id1).toBe(id2);
+    expect(id1).not.toBe(id2);
 
-    // Only 1 swap should exist in the module
+    // 2 swaps should exist in the module
     const swaps = module.getSwaps();
-    expect(swaps.length).toBe(1);
+    expect(swaps.length).toBe(2);
   });
 });

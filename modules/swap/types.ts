@@ -59,7 +59,7 @@ export interface SwapDeal {
 }
 
 /**
- * The 7 manifest fields used for swap_id computation (without swap_id).
+ * The 8 manifest fields used for swap_id computation (without swap_id).
  * Passed to computeSwapId() for SHA-256(JCS(fields)) hashing.
  * Field names use snake_case to match the escrow's wire format exactly.
  */
@@ -78,6 +78,8 @@ export interface ManifestFields {
   readonly party_b_value_to_change: string;
   /** Timeout in seconds (integer, [60, 86400]) */
   readonly timeout: number;
+  /** Random salt ensuring unique swap_id even for identical deal terms (32 hex chars) */
+  readonly salt: string;
 }
 
 /**
@@ -105,6 +107,8 @@ export interface SwapManifest {
   readonly party_b_value_to_change: string;
   /** Timeout in seconds (integer, [60, 86400]) */
   readonly timeout: number;
+  /** Random salt ensuring unique swap_id even for identical deal terms (32 hex chars) */
+  readonly salt: string;
 }
 
 // =============================================================================

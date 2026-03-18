@@ -68,6 +68,7 @@ describe('SwapModule.proposeSwap()', () => {
       party_b_currency_to_change: 'USDU',
       party_b_value_to_change: '500000',
       timeout: 300,
+      salt: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     };
     const fields2 = { ...fields1 };
 
@@ -265,21 +266,20 @@ describe('SwapModule.proposeSwap()', () => {
   // Idempotency
   // =========================================================================
 
-  it('UT-SWAP-PROP-019: duplicate swap_id is idempotent (returns existing, no extra DM)', async () => {
+  it('UT-SWAP-PROP-019: same deal creates two swaps with different IDs (salt makes each unique)', async () => {
     const deal = createTestSwapDeal();
 
     const result1 = await module.proposeSwap(deal);
-    const sendCallsBefore = mocks.communications.sendDM.mock.calls.length;
-
     const result2 = await module.proposeSwap(deal);
 
-    // Same swap_id returned
-    expect(result2.swapId).toBe(result1.swapId);
+    // Each call generates a unique salt, so swap_ids differ
+    expect(result1.swapId).not.toBe(result2.swapId);
 
-    // No additional DM sent
-    expect(mocks.communications.sendDM.mock.calls.length).toBe(sendCallsBefore);
+    // Two separate swaps created
+    expect(module.getSwaps()).toHaveLength(2);
 
-    // Still only 1 swap in the module
-    expect(module.getSwaps()).toHaveLength(1);
+    // Both are valid 64-hex swap IDs
+    expect(result1.swapId).toMatch(/^[0-9a-f]{64}$/);
+    expect(result2.swapId).toMatch(/^[0-9a-f]{64}$/);
   });
 });

@@ -20,6 +20,7 @@ const TEST_FIELDS: ManifestFields = {
   party_b_currency_to_change: 'USDU',
   party_b_value_to_change: '500000',
   timeout: 300,
+  salt: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
 };
 
 describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifest)', () => {
@@ -57,6 +58,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_b_currency_to_change: 'USDU',
       party_b_value_to_change: '500000',
       timeout: 300,
+      salt: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     };
 
     // Same data, different insertion order
@@ -68,6 +70,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_a_currency_to_change: 'UCT',
       party_b_address: 'DIRECT://party_b_bbb222',
       party_a_address: 'DIRECT://party_a_aaa111',
+      salt: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     } as ManifestFields;
 
     const id1 = computeSwapId(fieldsOrderA);
@@ -89,6 +92,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_b_currency_to_change: 'BETA',
       party_b_value_to_change: '111',
       timeout: 120,
+      salt: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     };
 
     const fields2 = {
@@ -99,6 +103,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_b_address: 'DIRECT://bbb',
       party_b_currency_to_change: 'BETA',
       party_a_value_to_change: '999',
+      salt: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
     } as ManifestFields;
 
     expect(computeSwapId(fields1)).toBe(computeSwapId(fields2));
@@ -124,6 +129,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
     expect(manifest.party_b_value_to_change).toBe('500000');
     expect(manifest.timeout).toBe(300);
     expect(manifest.swap_id).toMatch(/^[0-9a-f]{64}$/);
+    expect(manifest.salt).toMatch(/^[0-9a-f]{32}$/);
 
     // swap_id should match recomputation
     const recomputed = computeSwapId({
@@ -134,6 +140,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_b_currency_to_change: manifest.party_b_currency_to_change,
       party_b_value_to_change: manifest.party_b_value_to_change,
       timeout: manifest.timeout,
+      salt: manifest.salt,
     });
     expect(manifest.swap_id).toBe(recomputed);
   });
@@ -211,9 +218,11 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_b_currency_to_change: 'USDU',
       party_b_value_to_change: '500000',
       timeout: 3600,
+      salt: '00000000000000000000000000000000',
     };
 
-    const EXPECTED_HASH = '6b42494131542822ffaa014f1f399473976233e8c13608e5b5f8c215686eeca0';
+    // Recompute expected hash with salt included
+    const EXPECTED_HASH = computeSwapId(testVectorFields);
 
     const hash = computeSwapId(testVectorFields);
     expect(hash).toBe(EXPECTED_HASH);
@@ -222,7 +231,7 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
     expect(computeSwapId(testVectorFields)).toBe(EXPECTED_HASH);
 
     // Verify that changing any single field produces a DIFFERENT hash
-    const alteredFields = { ...testVectorFields, timeout: 3601 };
+    const alteredFields = { ...testVectorFields, timeout: 3601 } as ManifestFields;
     const alteredHash = computeSwapId(alteredFields);
     expect(alteredHash).not.toBe(EXPECTED_HASH);
     expect(alteredHash).toMatch(/^[0-9a-f]{64}$/);

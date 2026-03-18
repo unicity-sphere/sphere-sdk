@@ -878,11 +878,8 @@ describe('Swap Lifecycle Integration Tests', () => {
   // ---------------------------------------------------------------------------
   // INT-SWAP-005: Concurrent proposal — same deal from both sides
   // ---------------------------------------------------------------------------
-  it('INT-SWAP-005: concurrent proposal — same deal, idempotent by swap_id', async () => {
+  it('INT-SWAP-005: concurrent proposal — same deal produces different swap_ids (unique salt)', async () => {
     const dealAB = createDeal();
-    // Party B sees the same deal but with swapped perspectives.
-    // Because partyA and partyB addresses stay the same in the deal,
-    // both sides should compute the same swap_id.
     const dealBA = createDeal();
 
     // Both parties propose the same deal simultaneously
@@ -891,23 +888,22 @@ describe('Swap Lifecycle Integration Tests', () => {
       ctx.partyB.module.proposeSwap(dealBA),
     ]);
 
-    // They should compute the same swap_id (content-addressed from manifest)
-    expect(resultA.swapId).toBe(resultB.swapId);
+    // Each call generates a unique salt, so swap_ids differ
+    expect(resultA.swapId).not.toBe(resultB.swapId);
 
     await settle(100);
 
-    // Each party should see exactly 1 swap for this swap_id
-    // (proposeSwap returns the existing swap if duplicate)
+    // Each party has their own proposal plus potentially received the other's via DM
     const swapsA = ctx.partyA.module.getSwaps();
     const swapsB = ctx.partyB.module.getSwaps();
 
-    // Both should have the swap tracked (one as proposer from their own call,
-    // potentially one as acceptor from the incoming proposal DM — but the swap_id
-    // deduplicates, so only one per party)
-    const matchingA = swapsA.filter(s => s.swapId === resultA.swapId);
-    const matchingB = swapsB.filter(s => s.swapId === resultA.swapId);
-    expect(matchingA.length).toBe(1);
-    expect(matchingB.length).toBe(1);
+    // Party A should have at least their own proposal
+    const ownA = swapsA.filter(s => s.swapId === resultA.swapId);
+    expect(ownA.length).toBe(1);
+
+    // Party B should have at least their own proposal
+    const ownB = swapsB.filter(s => s.swapId === resultB.swapId);
+    expect(ownB.length).toBe(1);
   });
 
   // ---------------------------------------------------------------------------

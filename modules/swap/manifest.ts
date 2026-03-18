@@ -11,6 +11,7 @@
 
 import canonicalize from 'canonicalize';
 import { sha256 } from '../../core/crypto.js';
+import { randomHex } from '../../core/utils.js';
 
 import type { ManifestFields, SwapDeal, SwapManifest } from './types.js';
 
@@ -85,6 +86,7 @@ export function buildManifest(
     party_b_currency_to_change: deal.partyBCurrency,
     party_b_value_to_change: deal.partyBAmount,
     timeout,
+    salt: randomHex(16), // 32 hex chars — ensures unique swap_id per proposal
   };
 
   const swap_id = computeSwapId(fields);
@@ -152,6 +154,11 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
     errors.push(`timeout must be an integer between ${TIMEOUT_MIN} and ${TIMEOUT_MAX}`);
   }
 
+  // salt: 32 lowercase hex chars
+  if (typeof manifest.salt !== 'string' || !/^[0-9a-f]{32}$/.test(manifest.salt)) {
+    errors.push('salt must be exactly 32 lowercase hex characters');
+  }
+
   // Integrity check: recompute swap_id only if all other fields passed
   if (errors.length === 0) {
     const recomputed = computeSwapId({
@@ -162,6 +169,7 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
       party_b_currency_to_change: manifest.party_b_currency_to_change,
       party_b_value_to_change: manifest.party_b_value_to_change,
       timeout: manifest.timeout,
+      salt: manifest.salt,
     });
     if (recomputed !== manifest.swap_id) {
       errors.push('swap_id does not match SHA-256 hash of manifest fields');
@@ -177,7 +185,7 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
 
 /**
  * Verify that a manifest's swap_id matches the SHA-256 hash of its other
- * 7 fields. This is a lightweight check that does not validate field formats.
+ * 8 fields. This is a lightweight check that does not validate field formats.
  *
  * @param manifest - The manifest to verify.
  * @returns true if swap_id matches the recomputed hash.
@@ -191,6 +199,7 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
     party_b_currency_to_change: manifest.party_b_currency_to_change,
     party_b_value_to_change: manifest.party_b_value_to_change,
     timeout: manifest.timeout,
+    salt: manifest.salt,
   });
   return recomputed === manifest.swap_id;
 }
