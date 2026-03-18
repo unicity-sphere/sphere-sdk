@@ -455,15 +455,18 @@ function parseProposal(json: string): ParsedSwapDM | null {
     if (obj.auxiliary !== undefined && !isObject(obj.auxiliary)) return null;
   }
 
+  // v2-specific fields are only included when version === 2.
+  // A v1 message carrying these fields is silently stripped to prevent version-confusion
+  // attacks where a v1 DM carries v2-like signature fields that skip v2 validation.
   const payload: SwapProposalMessage = {
     type: 'swap_proposal',
     version,
     manifest: obj.manifest as SwapManifest,
     escrow: obj.escrow as string,
     ...(typeof obj.message === 'string' ? { message: obj.message } : {}),
-    ...(typeof obj.proposer_signature === 'string' ? { proposer_signature: obj.proposer_signature } : {}),
-    ...(typeof obj.proposer_chain_pubkey === 'string' ? { proposer_chain_pubkey: obj.proposer_chain_pubkey } : {}),
-    ...(isObject(obj.auxiliary) ? { auxiliary: obj.auxiliary as ManifestAuxiliary } : {}),
+    ...(version === 2 && typeof obj.proposer_signature === 'string' ? { proposer_signature: obj.proposer_signature } : {}),
+    ...(version === 2 && typeof obj.proposer_chain_pubkey === 'string' ? { proposer_chain_pubkey: obj.proposer_chain_pubkey } : {}),
+    ...(version === 2 && isObject(obj.auxiliary) ? { auxiliary: obj.auxiliary as ManifestAuxiliary } : {}),
   };
 
   return { kind: 'proposal', payload };
@@ -598,7 +601,7 @@ function parseAnnounceResult(obj: Record<string, unknown>): ParsedSwapDM | null 
       state: obj.state as string,
       deposit_invoice_id: obj.deposit_invoice_id as string,
       is_new: obj.is_new as boolean,
-      created_at: (obj.created_at ?? 0) as number | string,
+      created_at: (typeof obj.created_at === 'number' || typeof obj.created_at === 'string') ? obj.created_at : 0,
     },
   };
 }
@@ -622,23 +625,49 @@ function parseInvoiceDelivery(obj: Record<string, unknown>): ParsedSwapDM | null
   };
 }
 
+/**
+ * Object.prototype method names that must never be copied as own properties —
+ * shadowing them can alter object behaviour (toString, valueOf) or break
+ * property lookup (hasOwnProperty, isPrototypeOf).
+ */
+const BLOCKED_PAYLOAD_KEYS = new Set([
+  '__proto__', 'constructor', 'prototype',
+  'toString', 'valueOf', 'hasOwnProperty',
+  'isPrototypeOf', 'propertyIsEnumerable', 'toLocaleString',
+]);
+
+/** Maximum string-value length forwarded from open-ended escrow payloads. */
+const MAX_PAYLOAD_STRING_LEN = 4096;
+
+/**
+ * Safely forward extensibility keys from an escrow payload, blocking any key
+ * that could shadow Object.prototype methods or cause memory amplification.
+ */
+function copyExtensibilityKeys(
+  obj: Record<string, unknown>,
+  skipKeys: ReadonlySet<string>,
+  target: Record<string, unknown>,
+): void {
+  for (const key of Object.keys(obj)) {
+    if (skipKeys.has(key) || BLOCKED_PAYLOAD_KEYS.has(key)) continue;
+    const val = obj[key];
+    // Cap string values to prevent memory amplification
+    if (typeof val === 'string' && val.length > MAX_PAYLOAD_STRING_LEN) continue;
+    target[key] = val;
+  }
+}
+
 function parseStatusResult(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
   if (typeof obj.state !== 'string') return null;
 
-  // Explicitly pick known fields to avoid prototype pollution from spread
+  const SKIP = new Set(['type', 'swap_id', 'state']);
   const payload: Record<string, unknown> = {
     type: 'status_result' as const,
     swap_id: obj.swap_id as string,
     state: obj.state as string,
   };
-  // Copy only safe, non-prototype fields for extensibility.
-  // Block prototype-pollution vectors beyond the obvious __proto__ / constructor.
-  for (const key of Object.keys(obj)) {
-    if (key === 'type' || key === 'swap_id' || key === 'state' ||
-        key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-    payload[key] = obj[key];
-  }
+  copyExtensibilityKeys(obj, SKIP, payload);
 
   return {
     kind: 'escrow',
@@ -649,21 +678,15 @@ function parseStatusResult(obj: Record<string, unknown>): ParsedSwapDM | null {
 function parsePaymentConfirmation(obj: Record<string, unknown>): ParsedSwapDM | null {
   if (!isValidSwapId(obj.swap_id)) return null;
 
-  // Explicitly pick known fields to avoid prototype pollution from spread
+  const SKIP = new Set(['type', 'swap_id', 'party']);
   const payload: Record<string, unknown> = {
     type: 'payment_confirmation' as const,
     swap_id: obj.swap_id as string,
   };
-  // Copy party field if present
   if (typeof obj.party === 'string') {
     payload.party = obj.party;
   }
-  // Copy only safe, non-prototype fields for extensibility.
-  for (const key of Object.keys(obj)) {
-    if (key === 'type' || key === 'swap_id' || key === 'party' ||
-        key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
-    payload[key] = obj[key];
-  }
+  copyExtensibilityKeys(obj, SKIP, payload);
 
   return {
     kind: 'escrow',

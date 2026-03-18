@@ -956,6 +956,10 @@ export class SwapModule {
       swap.progress = 'failed';
       swap.error = `Proposal DM send failed: ${err instanceof Error ? err.message : String(err)}`;
       swap.updatedAt = Date.now();
+      // Maintain invariant: all terminal swaps are in terminalSwapIds (not just this.swaps).
+      // transitionProgress() is bypassed here, so we must update both collections manually.
+      this.terminalSwapIds.add(swapId);
+      this.swaps.delete(swapId);
       await this.persistSwap(swap);
       throw new SphereError(
         `Failed to send proposal DM: ${err instanceof Error ? err.message : String(err)}`,
@@ -1214,6 +1218,13 @@ export class SwapModule {
         await this.withSwapGate(swapId, async () => {
           const currentSwap = this.swaps.get(swapId);
           if (!currentSwap || isTerminalProgress(currentSwap.progress)) return;
+          // Guard: if escrow already acknowledged the announce (depositInvoiceId or escrowState
+          // set by an announce_result DM that arrived while sendAnnounce_v2 was retrying),
+          // the announce actually succeeded. A later retry timeout must not clobber that.
+          if (currentSwap.depositInvoiceId || currentSwap.escrowState) {
+            logger.warn(LOG_TAG, `v2 announce for ${swapId.slice(0, 12)} threw but escrow already ack'd — ignoring failure`);
+            return;
+          }
           await this.transitionProgress(currentSwap, 'failed', {
             error: 'Failed to send v2 announce to escrow',
           });
@@ -2141,6 +2152,14 @@ export class SwapModule {
                 // All checks passed — now safe to clear the proposal timer
                 this.clearLocalTimer(swapId);
 
+                // Assign acceptor signature (v2 only) BEFORE transitionProgress so the
+                // single atomic persist captures it. A crash between transitionProgress and
+                // a separate persistSwap would leave the swap in 'accepted' without a
+                // signature, breaking crash-recovery announce on restart.
+                if (acceptMsg.version === 2 && acceptMsg.acceptor_signature) {
+                  (swap as { acceptorSignature?: string }).acceptorSignature = acceptMsg.acceptor_signature;
+                }
+
                 // Transition to 'accepted'.
                 // transitionProgress mutates swap.progress in memory BEFORE persisting.
                 // If persistSwap throws, roll back the in-memory mutation so the swap
@@ -2156,20 +2175,21 @@ export class SwapModule {
                   // Best-effort: if persistSwap wrote the record before the index write
                   // failed, the storage record now has the wrong (advanced) state.
                   // Re-persist the rolled-back state to heal the partial write.
-                  // Snapshot swap before the fire-and-forget: the gate will be released
-                  // (throw re-throws below), and the next gate acquisition can mutate
-                  // the live `swap` object before JSON.stringify runs inside persistSwap.
-                  const rollbackSnapshot = { ...swap };
+                  // Deep-copy nested objects before the fire-and-forget: the gate will be
+                  // released (throw re-throws below) and the next gate acquisition can mutate
+                  // swap.deal / swap.manifest / swap.auxiliary before persistSwap serializes.
+                  // A shallow copy shares those references; deep-copy makes the snapshot safe
+                  // even if persistSwap ever adds an `await` before JSON.stringify.
+                  const rollbackSnapshot = {
+                    ...swap,
+                    deal: { ...swap.deal },
+                    manifest: { ...swap.manifest },
+                    ...(swap.auxiliary ? { auxiliary: { ...swap.auxiliary } } : {}),
+                  };
                   this.persistSwap(rollbackSnapshot).catch((e) =>
                     logger.warn(LOG_TAG, `Failed to persist rollback for ${swapId}:`, e),
                   );
                   throw err;
-                }
-
-                // v2: Store verified acceptor signature
-                if (acceptMsg.version === 2 && acceptMsg.acceptor_signature && acceptMsg.acceptor_chain_pubkey) {
-                  (swap as { acceptorSignature?: string }).acceptorSignature = acceptMsg.acceptor_signature;
-                  await this.persistSwap(swap);
                 }
 
                 // Emit swap:accepted
@@ -2612,28 +2632,27 @@ export class SwapModule {
                   logger.error(LOG_TAG, `Swap ${swapId}: deposit sent with wrong currency — this indicates a bug in the deposit logic`);
                 }
 
-                // Emit swap:bounce_received
-                deps.emitEvent('swap:bounce_received', {
-                  swapId,
-                  reason: msg.reason,
-                  returnedAmount: msg.returned_amount,
-                  returnedCurrency: msg.returned_currency,
-                });
-
-                // If swap not found or closed on escrow side, transition to failed
-                if (msg.reason === 'SWAP_NOT_FOUND' || msg.reason === 'SWAP_CLOSED') {
-                  await this.withSwapGate(swapId, async () => {
-                    if (!isTerminalProgress(swap.progress)) {
-                      await this.transitionProgress(swap, 'failed', {
-                        error: `Escrow bounce: ${msg.reason}`,
-                      });
-                      deps.emitEvent('swap:failed', {
-                        swapId,
-                        error: `Escrow does not recognize swap: ${msg.reason}`,
-                      });
-                    }
+                // All bounce handling inside the gate so that swap:bounce_received fires
+                // after any state transition — listeners see a consistent swap.progress.
+                await this.withSwapGate(swapId, async () => {
+                  if (!isTerminalProgress(swap.progress) &&
+                      (msg.reason === 'SWAP_NOT_FOUND' || msg.reason === 'SWAP_CLOSED')) {
+                    await this.transitionProgress(swap, 'failed', {
+                      error: `Escrow bounce: ${msg.reason}`,
+                    });
+                    deps.emitEvent('swap:failed', {
+                      swapId,
+                      error: `Escrow does not recognize swap: ${msg.reason}`,
+                    });
+                  }
+                  // Emit bounce_received inside gate — swap.progress is in its final state
+                  deps.emitEvent('swap:bounce_received', {
+                    swapId,
+                    reason: msg.reason,
+                    returnedAmount: msg.returned_amount,
+                    returnedCurrency: msg.returned_currency,
                   });
-                }
+                });
                 break;
               }
 
