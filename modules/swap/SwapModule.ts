@@ -1474,6 +1474,45 @@ export class SwapModule {
     });
   }
 
+  /**
+   * Resolve a swap ID from a full 64-char hex string or a unique prefix (min 4 chars).
+   * Matches against all known swaps (active + terminal in current session).
+   *
+   * @param idOrPrefix - Full swap ID or unique hex prefix (min 4 chars).
+   * @returns The full 64-char swap ID.
+   * @throws {SphereError} `SWAP_NOT_FOUND` if no match or ambiguous prefix.
+   * @throws {SphereError} `SWAP_INVALID_DEAL` if prefix is too short or not hex.
+   */
+  resolveSwapId(idOrPrefix: string): string {
+    const trimmed = idOrPrefix.trim();
+
+    // Full ID — return as-is
+    if (/^[0-9a-f]{64}$/i.test(trimmed)) return trimmed;
+
+    // Must be at least 4 hex chars
+    if (!/^[0-9a-f]{4,}$/i.test(trimmed)) {
+      throw new SphereError(
+        `Invalid swap ID: "${trimmed}". Must be a 64-char hex string or a prefix of at least 4 hex characters.`,
+        'SWAP_INVALID_DEAL',
+      );
+    }
+
+    const lower = trimmed.toLowerCase();
+    const matched = this.getSwaps().filter(s => s.swapId.startsWith(lower));
+
+    if (matched.length === 0) {
+      throw new SphereError(`No swap found matching prefix: ${trimmed}`, 'SWAP_NOT_FOUND');
+    }
+    if (matched.length > 1) {
+      throw new SphereError(
+        `Ambiguous prefix "${trimmed}" matches ${matched.length} swaps. Use more characters.`,
+        'SWAP_NOT_FOUND',
+      );
+    }
+
+    return matched[0].swapId;
+  }
+
   // T2.4: IMPLEMENTATION END
 
   // =========================================================================

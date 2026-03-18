@@ -250,27 +250,6 @@ function resolveCoin(identifier: string): { coinId: string; symbol: string; deci
  * Resolve a swap ID prefix to a full 64-char swap ID.
  * Accepts full IDs or unique prefixes (like invoice commands do).
  */
-function resolveSwapId(prefix: string, swapModule: { getSwaps: (f?: unknown) => Array<{ swapId: string }> }): string {
-  const trimmed = prefix.trim();
-  // Full ID — return as-is
-  if (/^[0-9a-f]{64}$/i.test(trimmed)) return trimmed;
-  // Must be at least 4 hex chars to avoid too many matches
-  if (!/^[0-9a-f]{4,}$/i.test(trimmed)) {
-    console.error(`Invalid swap ID prefix: "${trimmed}". Must be at least 4 hex characters.`);
-    process.exit(1);
-  }
-  const allSwaps = swapModule.getSwaps();
-  const matched = allSwaps.filter((s: { swapId: string }) => s.swapId.startsWith(trimmed.toLowerCase()));
-  if (matched.length === 0) {
-    console.error(`No swap found matching prefix: ${trimmed}`);
-    process.exit(1);
-  }
-  if (matched.length > 1) {
-    console.error(`Ambiguous prefix "${trimmed}" matches ${matched.length} swaps. Use more characters.`);
-    process.exit(1);
-  }
-  return matched[0].swapId;
-}
 
 function parseAssetArg(value: string): { amount: string; coin: string } {
   const parts = value.trim().split(/\s+/);
@@ -4422,7 +4401,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
-        const swapId = resolveSwapId(swapIdArg, swapModule);
+        const swapId = swapModule.resolveSwapId(swapIdArg);
         await swapModule.acceptSwap(swapId);
         console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
 
@@ -4495,7 +4474,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
-        const swapId = resolveSwapId(swapIdArg, swapModule);
+        const swapId = swapModule.resolveSwapId(swapIdArg);
         const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
         console.log('Swap Status:');
         console.log(JSON.stringify(status, null, 2));
@@ -4530,7 +4509,7 @@ async function main() {
         }
         await ensureSync(sphere, 'full');
 
-        const swapId = resolveSwapId(swapIdArg, swapModule);
+        const swapId = swapModule.resolveSwapId(swapIdArg);
         const result = await swapModule.deposit(swapId);
         console.log('Deposit result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
@@ -4556,7 +4535,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
-        const swapId = resolveSwapId(swapIdArg, swapModule);
+        const swapId = swapModule.resolveSwapId(swapIdArg);
         // Optional reason from remaining args
         const reason = args.slice(2).filter((a: string) => !a.startsWith('--')).join(' ') || undefined;
 
@@ -4583,7 +4562,7 @@ async function main() {
         }
         await ensureSync(sphere, 'nostr');
 
-        const swapId = resolveSwapId(swapIdArg, swapModule);
+        const swapId = swapModule.resolveSwapId(swapIdArg);
         await swapModule.cancelSwap(swapId);
         console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
 
