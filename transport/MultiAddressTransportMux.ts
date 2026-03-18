@@ -423,13 +423,23 @@ export class MultiAddressTransportMux {
 
     logger.debug('Mux', `Subscribing for ${allPubkeys.length} address(es):`, allPubkeys.map(p => p.slice(0, 12)).join(', '));
 
-    // Determine global 'since' — minimum across all addresses
+    // Determine global 'since' for wallet and DM subscriptions in one pass.
+    // Each address has independent stored timestamps; we take the minimum.
     let globalSince = Math.floor(Date.now() / 1000);
-    for (const entry of this.addresses.values()) {
-      const since = await this.getAddressSince(entry);
-      if (since < globalSince) {
-        globalSince = since;
-      }
+    let globalDmSince = Math.floor(Date.now() / 1000);
+    const entries = [...this.addresses.values()];
+    const sinceResults = await Promise.all(
+      entries.map(async (entry) => {
+        const [walletSince, dmSince] = await Promise.all([
+          this.getAddressSince(entry),
+          this.getAddressDmSince(entry),
+        ]);
+        return { walletSince, dmSince };
+      }),
+    );
+    for (const { walletSince, dmSince } of sinceResults) {
+      if (walletSince < globalSince) globalSince = walletSince;
+      if (dmSince < globalDmSince) globalDmSince = dmSince;
     }
 
     // Subscribe to wallet events for ALL pubkeys
@@ -462,15 +472,6 @@ export class MultiAddressTransportMux {
         logger.debug('Mux', 'Wallet subscription error:', error);
       },
     });
-
-    // Determine DM 'since' — minimum across all addresses (separate from wallet events)
-    let globalDmSince = Math.floor(Date.now() / 1000);
-    for (const entry of this.addresses.values()) {
-      const cs = await this.getAddressDmSince(entry);
-      if (cs < globalDmSince) {
-        globalDmSince = cs;
-      }
-    }
 
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
@@ -1079,8 +1080,8 @@ export class MultiAddressTransportMux {
       entry.fallbackDmSince = null;
       return ts;
     }
-    // No storage, no fallback — align with NostrTransportProvider's 24h lookback
-    return Math.floor(Date.now() / 1000) - 86400;
+    // No storage, no fallback — start from now (no historical replay)
+    return Math.floor(Date.now() / 1000);
   }
 
   // ===========================================================================

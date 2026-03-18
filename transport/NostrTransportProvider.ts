@@ -437,6 +437,8 @@ export class NostrTransportProvider implements TransportProvider {
     // don't block legitimate events for the new address.
     this.processedEventIds.clear();
     this.lastEventTs = 0;
+    this.lastDmEventTs = 0;
+    this.fallbackDmSince = null;
 
     // Create NostrKeyManager from private key
     const secretKey = Buffer.from(identity.privateKey, 'hex');
@@ -1840,8 +1842,8 @@ export class NostrTransportProvider implements TransportProvider {
       this.fallbackDmSince = null;
       logger.debug('Nostr', 'No storage adapter for DM, using fallback since:', dmSince);
     } else {
-      dmSince = Math.floor(Date.now() / 1000) - 86400;
-      logger.debug('Nostr', 'No storage adapter for DM, using 24h fallback');
+      dmSince = Math.floor(Date.now() / 1000);
+      logger.debug('Nostr', 'No storage adapter for DM, starting from now:', dmSince);
     }
 
     const chatFilter = new Filter();
