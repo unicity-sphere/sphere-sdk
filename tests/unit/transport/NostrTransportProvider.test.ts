@@ -378,11 +378,11 @@ describe('Event subscription pubkey format', () => {
     expect(walletFilter.kinds).toContain(31116); // PAYMENT_REQUEST_RESPONSE
     expect(walletFilter.since).toBeDefined();    // Wallet has since filter
 
-    // Second subscription: chat events (GIFT_WRAP, no since filter)
+    // Second subscription: DM events (GIFT_WRAP, with its own since filter)
     const [chatFilterArg] = mockSubscribe.mock.calls[1];
     const chatFilter = chatFilterArg.toJSON();
     expect(chatFilter.kinds).toContain(1059);  // GIFT_WRAP (NIP-17)
-    expect(chatFilter.since).toBeUndefined();  // Chat has NO since filter for real-time
+    expect(chatFilter.since).toBeDefined();    // DM has its own since filter
   });
 
   it('getNostrPubkey should return 32-byte hex, different from identity.chainPubkey', async () => {
@@ -586,9 +586,13 @@ describe('Last event timestamp persistence', () => {
       expect(walletFilter.since).toBeLessThanOrEqual(expected24hAgo + 5);
     });
 
-    it('should NOT apply since filter to chat subscription regardless of storage', async () => {
+    it('should apply independent since filter to DM subscription from storage', async () => {
       const mockStorage = {
-        get: vi.fn().mockResolvedValue('1700000000'),
+        get: vi.fn().mockImplementation((key: string) => {
+          if (key.startsWith('last_wallet_event_ts_')) return Promise.resolve('1700000000');
+          if (key.startsWith('last_dm_event_ts_')) return Promise.resolve('1699999000');
+          return Promise.resolve(null);
+        }),
         set: vi.fn().mockResolvedValue(undefined),
       };
 
@@ -597,12 +601,12 @@ describe('Last event timestamp persistence', () => {
       await provider.connect();
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Two subscriptions: wallet and chat
+      // Two subscriptions: wallet and DM (chat)
       expect(mockSubscribe).toHaveBeenCalledTimes(2);
       const [chatFilterArg] = mockSubscribe.mock.calls[1];
       const chatFilter = chatFilterArg.toJSON();
       expect(chatFilter.kinds).toContain(1059); // GIFT_WRAP
-      expect(chatFilter.since).toBeUndefined();
+      expect(chatFilter.since).toBe(1699999000);
     });
 
     it('should read storage key based on nostr pubkey prefix', async () => {
@@ -616,10 +620,12 @@ describe('Last event timestamp persistence', () => {
       await provider.connect();
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      expect(mockStorage.get).toHaveBeenCalledTimes(1);
-      const storageKeyArg = mockStorage.get.mock.calls[0][0];
-      // Key format: last_wallet_event_ts_{first 16 chars of nostr pubkey}
-      expect(storageKeyArg).toMatch(/^last_wallet_event_ts_[0-9a-f]{16}$/);
+      // Two reads: wallet event ts + DM event ts
+      expect(mockStorage.get).toHaveBeenCalledTimes(2);
+      const walletKeyArg = mockStorage.get.mock.calls[0][0];
+      const dmKeyArg = mockStorage.get.mock.calls[1][0];
+      expect(walletKeyArg).toMatch(/^last_wallet_event_ts_[0-9a-f]{16}$/);
+      expect(dmKeyArg).toMatch(/^last_dm_event_ts_[0-9a-f]{16}$/);
     });
 
     it('should use fallback since when no stored timestamp and fallback is set', async () => {
@@ -835,7 +841,7 @@ describe('Last event timestamp persistence', () => {
       expect(lastSetCall[1]).toBe('1700000300');
     });
 
-    it('should NOT persist timestamp for GIFT_WRAP (chat) events', async () => {
+    it('should NOT persist DM timestamp when GIFT_WRAP unwrap fails', async () => {
       const mockStorage = {
         get: vi.fn().mockResolvedValue(null),
         set: vi.fn().mockResolvedValue(undefined),
@@ -854,7 +860,7 @@ describe('Last event timestamp persistence', () => {
       chatCallbacks.onEvent({
         id: 'chat-event',
         kind: 1059, // GIFT_WRAP
-        content: '{}',
+        content: '{}', // Invalid gift wrap — unwrap will fail
         tags: [],
         pubkey: 'a'.repeat(64),
         created_at: 1700000500,
@@ -863,7 +869,8 @@ describe('Last event timestamp persistence', () => {
 
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Should NOT update timestamp for chat events
+      // Timestamp should NOT be persisted when unwrap fails,
+      // otherwise the event would be permanently skipped on reconnect
       expect(mockStorage.set).not.toHaveBeenCalled();
     });
 

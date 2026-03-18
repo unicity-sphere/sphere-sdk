@@ -21,6 +21,7 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
   price: priceProvider,      // Optional PriceProvider
   derivationPath: "m/44'/0'/0'", // Optional custom path
+  dmSince: Math.floor(Date.now() / 1000) - 86400, // Optional: DM history fallback (unix seconds)
 });
 ```
 
@@ -1092,6 +1093,8 @@ Resolve a peer's nametag by their transport pubkey via live lookup from Nostr re
 #### `onDirectMessage(handler: (msg: DirectMessage) => void): () => void`
 
 Subscribe to incoming direct messages. Supports both NIP-17 gift-wrapped messages (kind 1059, used by Sphere app) and NIP-04 encrypted DMs (kind 4, legacy). For NIP-17 messages, the sender's nametag is extracted from the Sphere messaging format if present.
+
+**DM history on connect:** The SDK persists the timestamp of the last processed DM event. On reconnect, only DMs newer than that timestamp are fetched from the relay. On first connect (no persisted timestamp), the SDK starts from "now" unless `dmSince` is set in `Sphere.init()` options — a unix timestamp (seconds) controlling how far back to fetch. This is a fallback: once the SDK processes a DM, the persisted timestamp takes priority on subsequent connects.
 
 #### `onBroadcast(handler: (msg: BroadcastMessage) => void): () => void`
 

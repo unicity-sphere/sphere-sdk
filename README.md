@@ -522,6 +522,36 @@ interface GroupMemberData {
 }
 ```
 
+## Direct Messages (NIP-17)
+
+End-to-end encrypted DMs via NIP-17 gift wrap, accessed through `sphere.communications`:
+
+```typescript
+// Send a DM (by nametag or pubkey)
+await sphere.communications.sendDM('@alice', 'Hello!');
+
+// Listen for incoming DMs
+sphere.communications.onDirectMessage((msg) => {
+  console.log(`From ${msg.senderNametag ?? msg.senderPubkey}: ${msg.content}`);
+});
+```
+
+### DM History on Connect
+
+By default, the SDK resumes from the last processed DM timestamp (persisted in storage). On first connect, it starts from "now" — no historical replay.
+
+Use `dmSince` to control how far back to fetch DMs on first connect:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  dmSince: Math.floor(Date.now() / 1000) - 86400,  // last 24 hours
+});
+```
+
+Once the SDK processes DMs, the timestamp is persisted and `dmSince` is ignored on subsequent connects.
+
 ## L1 (ALPHA Blockchain) Operations
 
 Access L1 payments through `sphere.payments.l1`:

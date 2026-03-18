@@ -46,6 +46,8 @@ export const STORAGE_KEYS_GLOBAL = {
   TRACKED_ADDRESSES: 'tracked_addresses',
   /** Last processed Nostr wallet event timestamp (unix seconds), keyed per pubkey */
   LAST_WALLET_EVENT_TS: 'last_wallet_event_ts',
+  /** Last processed Nostr DM (gift-wrap) event timestamp (unix seconds), keyed per pubkey */
+  LAST_DM_EVENT_TS: 'last_dm_event_ts',
   /** Group chat: last used relay URL (stale data detection) — global, same relay for all addresses */
   GROUP_CHAT_RELAY_URL: 'group_chat_relay_url',
   /** Cached token registry JSON (fetched from remote) */
