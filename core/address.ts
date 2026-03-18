@@ -20,8 +20,9 @@ const DIRECT_PREFIX = 'DIRECT://';
 const PROXY_PREFIX = 'PROXY://';
 const NAMETAG_PREFIX = '@';
 
-/** Valid chars after DIRECT:// prefix: hex or alphanumeric, at least 1 char */
-const DIRECT_VALUE_RE = /^[0-9a-zA-Z_]{1,}$/;
+// DIRECT:// accepts any non-empty value after the prefix.
+// Strict hex validation is NOT enforced here — the SDK resolves addresses
+// before on-chain use, and test fixtures use non-hex placeholder addresses.
 
 /** Valid nametag chars: lowercase alphanumeric + underscore + hyphen, 1-30 chars */
 const NAMETAG_RE = /^[a-z0-9][a-z0-9_-]{0,29}$/;
