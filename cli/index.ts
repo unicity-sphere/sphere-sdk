@@ -251,21 +251,22 @@ function resolveCoin(identifier: string): { coinId: string; symbol: string; deci
  * Accepts full IDs or unique prefixes (like invoice commands do).
  */
 function resolveSwapId(prefix: string, swapModule: { getSwaps: (f?: unknown) => Array<{ swapId: string }> }): string {
+  const trimmed = prefix.trim();
   // Full ID — return as-is
-  if (/^[0-9a-f]{64}$/i.test(prefix)) return prefix;
+  if (/^[0-9a-f]{64}$/i.test(trimmed)) return trimmed;
   // Must be at least 4 hex chars to avoid too many matches
-  if (!/^[0-9a-f]{4,}$/i.test(prefix)) {
-    console.error(`Invalid swap ID prefix: "${prefix}". Must be at least 4 hex characters.`);
+  if (!/^[0-9a-f]{4,}$/i.test(trimmed)) {
+    console.error(`Invalid swap ID prefix: "${trimmed}". Must be at least 4 hex characters.`);
     process.exit(1);
   }
   const allSwaps = swapModule.getSwaps();
-  const matched = allSwaps.filter((s: { swapId: string }) => s.swapId.startsWith(prefix.toLowerCase()));
+  const matched = allSwaps.filter((s: { swapId: string }) => s.swapId.startsWith(trimmed.toLowerCase()));
   if (matched.length === 0) {
-    console.error(`No swap found matching prefix: ${prefix}`);
+    console.error(`No swap found matching prefix: ${trimmed}`);
     process.exit(1);
   }
   if (matched.length > 1) {
-    console.error(`Ambiguous prefix "${prefix}" matches ${matched.length} swaps. Use more characters.`);
+    console.error(`Ambiguous prefix "${trimmed}" matches ${matched.length} swaps. Use more characters.`);
     process.exit(1);
   }
   return matched[0].swapId;
