@@ -69,7 +69,7 @@ Alice                           Bob                         Escrow
 ### 2.3 Detailed Sequence — Alice's Perspective (Proposer)
 
 1. Alice constructs `SwapDeal`, resolves addresses, builds `SwapManifest`.
-2. Alice signs the `swap_id` with her chain private key, producing `sig_a`.
+2. Alice signs `"swap_consent:" + swap_id + ":" + escrow_address` with her chain private key, producing `sig_a`.
 3. Alice sends `swap_proposal_v2` DM to Bob containing `{manifest, escrow, sig_a, message?}`.
 4. Alice persists `SwapRef` with `progress='proposed'`.
 5. Alice starts proposal timeout timer.
@@ -86,7 +86,7 @@ Alice                           Bob                         Escrow
 2. Bob verifies manifest integrity (`swap_id == SHA-256(JCS(fields))`).
 3. Bob verifies `sig_a` against the chain pubkey derived from `party_a_address`.
 4. Bob presents the deal to the user for approval.
-5. On acceptance, Bob signs the `swap_id` with his chain private key, producing `sig_b`.
+5. On acceptance, Bob signs `"swap_consent:" + swap_id + ":" + escrow_address` with his chain private key, producing `sig_b`.
 6. **Bob sends TWO messages in parallel (fire-and-forget for acceptance DM):**
    - `announce_v2` DM to escrow containing `{manifest, signatures: {party_a: sig_a, party_b: sig_b}, auxiliary?}`.
    - `swap_acceptance_v2` DM to Alice containing `{swap_id, sig_b}` -- informational only.
@@ -118,17 +118,20 @@ For the acceptor, no change: `proposed -> accepted -> announced` remains the onl
 
 ### 3.1 What Is Signed
 
-The signed message is the `swap_id` string itself: 64 lowercase hex characters.
+The signed message is a domain-prefixed string: `"swap_consent:" + swap_id + ":" + escrow_address`.
 
-**Rationale:** The `swap_id` is already a content-addressed hash (`SHA-256(JCS(manifest_fields))`). Signing the hash is equivalent to signing the full manifest -- any alteration to the manifest fields produces a different `swap_id`. Signing the `swap_id` string (rather than raw bytes) reuses the existing `signMessage`/`verifySignedMessage` functions from `core/crypto.ts` without modification.
+Example: `swap_consent:a1b2c3d4...64hex...:DIRECT://abc_def`
+
+**Rationale:** The domain prefix `"swap_consent:"` provides domain separation -- signatures produced for the swap protocol cannot be replayed in other contexts that use `signMessage`/`verifySignedMessage` (e.g., Connect protocol's `sign_message` intent). Including the `escrow_address` in the signed message binds the signature to a specific escrow, preventing redirect attacks where an attacker substitutes a different escrow address. Since the `swap_id` already commits to all deal terms including the escrow address (see section 4.1), the escrow binding in the signature is a defense-in-depth measure -- even if the `swap_id` computation were somehow bypassed, the signature would still fail verification against a different escrow.
 
 ### 3.2 Signing Function
 
 ```typescript
 import { signMessage } from '../../core/crypto.js';
 
-function signSwapId(privateKeyHex: string, swapId: string): string {
-  return signMessage(privateKeyHex, swapId);
+function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string {
+  const message = `swap_consent:${swapId}:${escrowAddress}`;
+  return signMessage(privateKey, message);
 }
 ```
 
@@ -139,16 +142,13 @@ The output is a 130-character hex string: `v (2 chars) + r (64 chars) + s (64 ch
 ```typescript
 import { verifySignedMessage } from '../../core/crypto.js';
 
-function verifySwapSignature(
-  swapId: string,
-  signature: string,
-  expectedChainPubkey: string,
-): boolean {
-  return verifySignedMessage(swapId, signature, expectedChainPubkey);
+function verifySwapSignature(swapId: string, escrowAddress: string, signature: string, chainPubkey: string): boolean {
+  const message = `swap_consent:${swapId}:${escrowAddress}`;
+  return verifySignedMessage(message, signature, chainPubkey);
 }
 ```
 
-The `expectedChainPubkey` is the 66-character compressed secp256k1 public key extracted from the party's `DIRECT://` address.
+The `chainPubkey` is the 66-character compressed secp256k1 public key extracted from the party's `DIRECT://` address.
 
 ### 3.4 Extracting Chain Pubkey from DIRECT Address
 
@@ -175,16 +175,38 @@ The second approach is preferred as it is deterministic and does not require a n
 
 Signing the full JCS-canonical manifest string would work equivalently but adds complexity:
 - The manifest JSON must be canonicalized identically on all parties (already done for `swap_id` computation).
-- The `signMessage` function uses Bitcoin-style double-SHA256 with a prefix, so the signed value is `SHA256(SHA256(prefix + len + message))` where message is the `swap_id` string. Signing a longer JSON string would change the hash but provide no additional security since the `swap_id` is already a binding commitment to all fields.
-- Signing the `swap_id` keeps signatures compact and avoids re-serialization ambiguity.
+- The `signMessage` function uses Bitcoin-style double-SHA256 with a prefix, so the signed value is `SHA256(SHA256(prefix + len + message))` where message is the domain-prefixed string. Signing a longer JSON string would change the hash but provide no additional security since the `swap_id` is already a binding commitment to all fields (including the escrow address and protocol version).
+- Signing the domain-prefixed `swap_id` keeps signatures compact, avoids re-serialization ambiguity, and provides explicit domain separation from other signing contexts in the SDK.
 
 ---
 
 ## 4. Updated Type Definitions
 
-### 4.1 Manifest Types (Unchanged)
+### 4.1 Manifest Types (Updated)
 
-`ManifestFields` and `SwapManifest` remain unchanged. The `swap_id` is computed the same way. Signatures are NOT part of the manifest -- they are transported alongside it.
+`ManifestFields` is extended with two new fields: `escrow_address` and `protocol_version`. Since both are included in the `ManifestFields` object, they are part of the `swap_id` hash (`SHA-256(JCS(fields))`). This means:
+
+- **`escrow_address`:** Binds the escrow into the deal terms. Changing the escrow changes the `swap_id`. Combined with domain-prefixed signatures (section 3), the signature is double-bound to the escrow.
+- **`protocol_version`:** Prevents downgrade attacks. A v2 manifest hashes to a different `swap_id` than a v1 manifest with otherwise identical fields, so a v2 manifest can never be announced as v1.
+
+```typescript
+interface ManifestFields {
+  party_a_address: string;        // DIRECT:// address
+  party_b_address: string;        // DIRECT:// address
+  party_a_currency_to_change: string;
+  party_a_value_to_change: string;
+  party_b_currency_to_change: string;
+  party_b_value_to_change: string;
+  timeout: number;
+  salt: string;
+  escrow_address: string;         // NEW: DIRECT:// address of the escrow
+  protocol_version: number;       // NEW: 2 for v2 manifests
+}
+```
+
+The `swap_id` computation remains `SHA-256(JCS(fields))` but now includes the escrow address and protocol version in the canonical JSON. `computeSwapId()` must be updated to include these fields in the JCS input.
+
+Signatures are NOT part of the manifest -- they are transported alongside it.
 
 ### 4.2 New: SignedManifest
 
@@ -205,18 +227,18 @@ export interface SignedManifest {
 }
 
 /**
- * Cryptographic signatures from both parties over the swap_id.
- * Each signature is a 130-char hex string (v + r + s) produced by
- * signMessage(privateKey, swap_id) from core/crypto.ts.
+ * Cryptographic signatures from both parties over the domain-prefixed message
+ * "swap_consent:{swap_id}:{escrow_address}". Each signature is a 130-char hex
+ * string (v + r + s) produced by signMessage(privateKey, message) from core/crypto.ts.
  *
  * party_a is always present in proposal DMs (Alice signs when proposing).
  * party_b is always present in announce DMs (Bob signs when accepting).
  * Both are present in the announce DM sent to the escrow.
  */
 export interface ManifestSignatures {
-  /** Alice's signature of swap_id, using her chain private key. 130 hex chars. */
+  /** Alice's signature of "swap_consent:{swap_id}:{escrow_address}", using her chain private key. 130 hex chars. */
   readonly party_a?: string;
-  /** Bob's signature of swap_id, using his chain private key. 130 hex chars. */
+  /** Bob's signature of "swap_consent:{swap_id}:{escrow_address}", using his chain private key. 130 hex chars. */
   readonly party_b?: string;
 }
 ```
@@ -282,7 +304,7 @@ export interface SwapProposalMessage {
   readonly version: 2;
   readonly manifest: SwapManifest;
   readonly escrow: string;
-  /** Proposer's signature of swap_id (130 hex chars) */
+  /** Proposer's signature of "swap_consent:{swap_id}:{escrow_address}" (130 hex chars) */
   readonly proposer_signature: string;
   /** Proposer's chain pubkey (66 hex chars, compressed secp256k1) */
   readonly proposer_chain_pubkey: string;
@@ -309,7 +331,7 @@ export interface SwapAcceptanceMessage {
   /** Protocol version: 2 for signed acceptances */
   readonly version: 2;
   readonly swap_id: string;
-  /** Acceptor's signature of swap_id (130 hex chars) */
+  /** Acceptor's signature of "swap_consent:{swap_id}:{escrow_address}" (130 hex chars) */
   readonly acceptor_signature: string;
   /** Acceptor's chain pubkey (66 hex chars, compressed secp256k1) */
   readonly acceptor_chain_pubkey: string;
@@ -324,9 +346,9 @@ export interface SwapAcceptanceMessage {
 interface SwapRef {
   // ... existing fields unchanged ...
 
-  /** Proposer's signature over swap_id (set at proposal time) */
+  /** Proposer's signature over "swap_consent:{swap_id}:{escrow_address}" (set at proposal time) */
   proposerSignature?: string;
-  /** Acceptor's signature over swap_id (set at acceptance time) */
+  /** Acceptor's signature over "swap_consent:{swap_id}:{escrow_address}" (set at acceptance time) */
   acceptorSignature?: string;
   /** Nametag binding proofs (set at proposal time if nametags used) */
   auxiliary?: ManifestAuxiliary;
@@ -434,7 +456,9 @@ function buildAnnounceDM_v2(
     "party_b_currency_to_change": "USDU",
     "party_b_value_to_change": "500000",
     "timeout": 3600,
-    "salt": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+    "salt": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    "escrow_address": "DIRECT://escrow_hash1_hash2",
+    "protocol_version": 2
   },
   "signatures": {
     "party_a": "1f<64-char-r><64-char-s>",
@@ -555,17 +579,20 @@ If any verification fails, the escrow rejects the announce with an `error` DM.
 
 ```typescript
 /**
- * Sign a swap_id with a chain private key.
+ * Sign a swap manifest with a chain private key.
+ * Signs the domain-prefixed message "swap_consent:{swapId}:{escrowAddress}".
  * @returns 130-char hex signature (v + r + s).
  */
-export function signSwapId(privateKeyHex: string, swapId: string): string;
+export function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string;
 
 /**
- * Verify a swap_id signature against a chain pubkey.
+ * Verify a swap manifest signature against a chain pubkey.
+ * Verifies against the domain-prefixed message "swap_consent:{swapId}:{escrowAddress}".
  * @returns true if signature is valid.
  */
 export function verifySwapSignature(
   swapId: string,
+  escrowAddress: string,
   signature: string,
   chainPubkey: string,
 ): boolean;
@@ -625,8 +652,8 @@ Changes to `proposeSwap()` (around line 830-870):
 const manifest = buildManifest(resolvedPartyA, resolvedPartyB, deal, deal.timeout);
 const swapId = manifest.swap_id;
 
-// NEW: Step 7b — Sign the swap_id
-const proposerSignature = signSwapId(deps.identity.privateKey, swapId);
+// NEW: Step 7b — Sign the swap manifest (domain-prefixed: "swap_consent:{swapId}:{escrowAddress}")
+const proposerSignature = signSwapManifest(deps.identity.privateKey, swapId, escrowAddress);
 
 // NEW: Step 7c — Create nametag binding if proposer used @nametag
 let auxiliary: ManifestAuxiliary | undefined;
@@ -668,8 +695,8 @@ await this.withSwapGate(swapId, async () => {
   // Step 4: Transition to 'accepted'
   await this.transitionProgress(swap, 'accepted');
 
-  // NEW: Step 4b — Sign the swap_id
-  const acceptorSignature = signSwapId(deps.identity.privateKey, swap.manifest.swap_id);
+  // NEW: Step 4b — Sign the swap manifest (domain-prefixed: "swap_consent:{swapId}:{escrowAddress}")
+  const acceptorSignature = signSwapManifest(deps.identity.privateKey, swap.manifest.swap_id, swap.escrowDirectAddress!);
   swap.acceptorSignature = acceptorSignature;
 
   // NEW: Step 4c — Create nametag binding if acceptor used @nametag
@@ -772,6 +799,7 @@ case 'proposal': {
     }
     if (!verifySwapSignature(
       manifest.swap_id,
+      proposalMsg.escrow,
       proposalMsg.proposer_signature,
       proposalMsg.proposer_chain_pubkey,
     )) {
@@ -781,16 +809,19 @@ case 'proposal': {
       return;
     }
 
-    // Verify proposer's chain pubkey is consistent with the manifest party address
-    // (resolves party address -> PeerInfo -> chainPubkey must match)
+    // Verify proposer's chain pubkey is consistent with the manifest party address.
+    // Peer resolution is MANDATORY in v2 — if resolve fails, the proposal is rejected.
+    // This prevents MITM attacks where an attacker substitutes their own pubkey
+    // in the proposal DM while relaying a legitimate manifest.
     const proposerIsPartyA = !ourAddresses.has(manifest.party_a_address);
     const expectedAddress = proposerIsPartyA
       ? manifest.party_a_address
       : manifest.party_b_address;
     const proposerPeer = await deps.resolve(expectedAddress);
-    if (proposerPeer && proposerPeer.chainPubkey !== proposalMsg.proposer_chain_pubkey) {
+    if (!proposerPeer || proposerPeer.chainPubkey !== proposalMsg.proposer_chain_pubkey) {
+      // Cannot verify proposer identity — reject proposal
       if (this.config.debug) {
-        logger.debug(LOG_TAG, `v2 proposal ignored: chain pubkey mismatch`);
+        logger.debug(LOG_TAG, `v2 proposal ignored: ${!proposerPeer ? 'peer resolution failed' : 'chain pubkey mismatch'}`);
       }
       return;
     }
@@ -845,8 +876,32 @@ case 'acceptance': {
       this.clearLocalTimer(swapId);
       await this.transitionProgress(swap, 'accepted');
 
-      // Store acceptor signature if v2
+      // Verify and store acceptor signature if v2
       if (acceptMsg.version === 2 && acceptMsg.acceptor_signature) {
+        // Verify the acceptor's signature before trusting it.
+        // The acceptor's chain pubkey must be resolved and matched.
+        const acceptorPeer = await deps.resolve(
+          ourAddresses.has(swap.manifest.party_a_address)
+            ? swap.manifest.party_b_address
+            : swap.manifest.party_a_address,
+        );
+        if (!acceptorPeer || acceptorPeer.chainPubkey !== acceptMsg.acceptor_chain_pubkey) {
+          if (this.config.debug) {
+            logger.debug(LOG_TAG, `v2 acceptance ignored: ${!acceptorPeer ? 'peer resolution failed' : 'chain pubkey mismatch'}`);
+          }
+          return;
+        }
+        if (!verifySwapSignature(
+          swap.manifest.swap_id,
+          swap.escrowDirectAddress!,
+          acceptMsg.acceptor_signature,
+          acceptMsg.acceptor_chain_pubkey,
+        )) {
+          if (this.config.debug) {
+            logger.debug(LOG_TAG, `v2 acceptance ignored: invalid acceptor signature`);
+          }
+          return;
+        }
         swap.acceptorSignature = acceptMsg.acceptor_signature;
         await this.persistSwap(swap);
       }
@@ -907,8 +962,8 @@ The `SwapOrchestrator.announce()` method (in `escrow-service/src/core/swap-orche
 
 1. **Accept the new announce format.** Parse `version`, `signatures`, `chain_pubkeys`, and `auxiliary` from the incoming DM.
 2. **Verify signatures (v2 only).** If `version === 2`:
-   a. Verify `signatures.party_a` against `chain_pubkeys.party_a` and `manifest.swap_id`.
-   b. Verify `signatures.party_b` against `chain_pubkeys.party_b` and `manifest.swap_id`.
+   a. Verify `signatures.party_a` against `chain_pubkeys.party_a`, `manifest.swap_id`, and the escrow's own `DIRECT://` address (domain-prefixed message: `"swap_consent:{swap_id}:{escrow_address}"`).
+   b. Verify `signatures.party_b` against `chain_pubkeys.party_b`, `manifest.swap_id`, and the escrow's own `DIRECT://` address.
    c. Verify `chain_pubkeys.party_a` derives to `manifest.party_a_address`.
    d. Verify `chain_pubkeys.party_b` derives to `manifest.party_b_address`.
    e. If any check fails, return `error` DM with details.
@@ -1049,18 +1104,39 @@ An attacker captures a nametag binding proof from a previous swap and replays it
 
 **DM confidentiality.** The proposal DM (containing Alice's signature) is encrypted via NIP-17. A compromised relay cannot read the signature. However, if the DM is decrypted by an attacker (key compromise), they obtain Alice's signature for that specific swap_id. This is not useful without Bob's signature.
 
-**Escrow collusion.** The escrow sees both signatures and could potentially forge future swaps. However, signatures are over specific swap_ids (unique per salt), so a captured signature cannot be reused for a different swap.
+**Escrow collusion.** The escrow sees both signatures and could potentially forge future swaps. However, signatures are over specific swap_ids (unique per salt) and bound to a specific escrow address, so a captured signature cannot be reused for a different swap or redirected to a different escrow.
 
 **Race condition: dual announce.** If both Alice and Bob somehow send announce_v2 to the escrow (e.g., Alice runs a modified client), the escrow deduplicates by swap_id and returns the existing swap. No harm done.
 
-### 10.5 Signature Scheme Security Properties
+### 10.5 Attacks Prevented by Domain-Prefixed Signatures
+
+**Attack: Cross-protocol signature replay.**
+An attacker obtains a signature produced by Alice for a swap and replays it in a different protocol context (e.g., Connect protocol's `sign_message` intent). The `"swap_consent:"` domain prefix ensures that swap signatures are syntactically distinct from any other signed message in the SDK. No other signing context produces messages with this prefix, so replay across protocols is impossible.
+
+**Attack: Escrow redirect.**
+An attacker intercepts a proposal DM and substitutes a different escrow address, hoping to route deposits to a malicious escrow. The signature includes the escrow address (`"swap_consent:{swap_id}:{escrow_address}"`), so the legitimate escrow's verification fails if the escrow address was changed. Additionally, the `escrow_address` is part of `ManifestFields` and thus included in the `swap_id` hash (section 4.1), so changing the escrow also changes the `swap_id`, invalidating the signature from a second angle.
+
+### 10.6 Attacks Prevented by Mandatory Peer Resolution
+
+**Attack: MITM pubkey substitution.**
+An attacker relays a legitimate proposal but substitutes their own `proposer_chain_pubkey` in the DM, signing the manifest with their own key. In v1, the acceptor might accept a proposal without verifying the proposer's identity. In v2, the acceptor MUST resolve the proposer's `DIRECT://` address via `deps.resolve()` and verify that the returned `chainPubkey` matches the one in the proposal. If resolution fails (returns `null`), the proposal is rejected -- there is no fallback to trusting the self-declared pubkey. This ensures that an attacker cannot impersonate a proposer unless they also compromise the identity binding on the Nostr relay.
+
+### 10.7 Protocol Downgrade Mitigation
+
+**Attack: Version downgrade.**
+An attacker strips the v2 fields from a proposal or announce and presents it as v1 to bypass signature verification. The `protocol_version` field is included in `ManifestFields` (section 4.1) and thus part of the `swap_id` hash. A v2 manifest produces a different `swap_id` than a v1 manifest with otherwise identical deal terms. If an attacker presents a v2 manifest as v1, the `swap_id` will not match the manifest fields (since the escrow recomputes it), causing validation failure. This makes downgrade attacks structurally impossible.
+
+### 10.8 Signature Scheme Security Properties
 
 | Property | Status |
 |---|---|
 | Existential unforgeability | Provided by secp256k1 ECDSA |
-| Non-repudiation | Party cannot deny signing swap_id |
-| Binding commitment | swap_id commits to all deal terms via SHA-256 |
+| Non-repudiation | Party cannot deny signing swap consent message |
+| Binding commitment | swap_id commits to all deal terms (incl. escrow address, protocol version) via SHA-256 |
+| Domain separation | `"swap_consent:"` prefix prevents cross-protocol replay |
+| Escrow binding | Signature includes escrow address; escrow address also in swap_id hash (double-bound) |
 | Replay prevention | Salt in manifest ensures unique swap_id; binding messages include swap_id |
+| Downgrade prevention | `protocol_version` in ManifestFields ensures v2 swap_id differs from v1 |
 | Forward secrecy | Not applicable (signatures are non-secret attestations) |
 
 ---
@@ -1070,8 +1146,8 @@ An attacker captures a nametag binding proof from a previous swap and replays it
 ### New functions in `modules/swap/manifest.ts`
 
 ```typescript
-export function signSwapId(privateKeyHex: string, swapId: string): string;
-export function verifySwapSignature(swapId: string, signature: string, chainPubkey: string): boolean;
+export function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string;
+export function verifySwapSignature(swapId: string, escrowAddress: string, signature: string, chainPubkey: string): boolean;
 export function createNametagBinding(privateKeyHex: string, nametag: string, directAddress: string, swapId: string): NametagBindingProof;
 export function verifyNametagBinding(proof: NametagBindingProof, swapId: string, expectedDirectAddress: string): boolean;
 ```
@@ -1118,8 +1194,8 @@ export interface NametagBindingProof { ... }
    b. Require chain_pubkeys.party_a AND chain_pubkeys.party_b
    c. Verify chain_pubkeys.party_a → derives to manifest.party_a_address
    d. Verify chain_pubkeys.party_b → derives to manifest.party_b_address
-   e. Verify signatures.party_a via verifySignedMessage(swap_id, sig, chain_pubkeys.party_a)
-   f. Verify signatures.party_b via verifySignedMessage(swap_id, sig, chain_pubkeys.party_b)
+   e. Verify signatures.party_a via verifySwapSignature(swap_id, escrow_own_address, sig, chain_pubkeys.party_a)
+   f. Verify signatures.party_b via verifySwapSignature(swap_id, escrow_own_address, sig, chain_pubkeys.party_b)
    g. If auxiliary.party_a_binding: verify nametag binding
    h. If auxiliary.party_b_binding: verify nametag binding
    i. Any failure → return { type: 'error', error: '...', swap_id }
