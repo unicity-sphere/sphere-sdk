@@ -364,30 +364,40 @@ export class MultiAddressTransportMux {
 
     const events: NostrEvent[] = [];
 
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
+    await new Promise<void>((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+
+      let subId: string | undefined;
+      try {
+        subId = client.subscribe(filter, {
+          onEvent: (event) => {
+            events.push({
+              id: event.id,
+              kind: event.kind,
+              content: event.content,
+              tags: event.tags,
+              pubkey: event.pubkey,
+              created_at: event.created_at,
+              sig: event.sig,
+            });
+          },
+          onEndOfStoredEvents: () => {
+            clearTimeout(timeout);
+            try { client.unsubscribe(subId!); } catch { /* disconnected */ }
+            resolve();
+          },
+        });
+      } catch (err) {
+        // subscribe() threw synchronously — no timeout to clear (not yet set), reject immediately
+        reject(err);
+        return;
+      }
+
+      // Set timeout AFTER subscribe() succeeds so we only need to clear it on success path
+      timeout = setTimeout(() => {
         try { if (subId) client.unsubscribe(subId); } catch { /* disconnected */ }
         resolve();
       }, 5000);
-
-      const subId = client.subscribe(filter, {
-        onEvent: (event) => {
-          events.push({
-            id: event.id,
-            kind: event.kind,
-            content: event.content,
-            tags: event.tags,
-            pubkey: event.pubkey,
-            created_at: event.created_at,
-            sig: event.sig,
-          });
-        },
-        onEndOfStoredEvents: () => {
-          clearTimeout(timeout);
-          client.unsubscribe(subId);
-          resolve();
-        },
-      });
     });
 
     // Process through mux dispatch chain (dedup handles already-seen events)

@@ -1230,8 +1230,11 @@ export class SwapModule {
       if (swap.progress === 'concluding') {
         throw new SphereError('Cannot reject: payouts are already in progress', 'SWAP_WRONG_STATE');
       }
-      if (isTerminalProgress(swap.progress)) {
-        throw new SphereError('Swap is already in a terminal state', 'SWAP_ALREADY_CANCELLED');
+      if (swap.progress === 'completed') {
+        throw new SphereError('Cannot reject: swap is already completed', 'SWAP_ALREADY_COMPLETED');
+      }
+      if (swap.progress === 'cancelled' || swap.progress === 'failed') {
+        throw new SphereError('Swap is already cancelled', 'SWAP_ALREADY_CANCELLED');
       }
 
       // Step 4: Send rejection DM to counterparty (best-effort)
@@ -2053,6 +2056,12 @@ export class SwapModule {
             // Only transition if still in 'proposed'
             if (swap.progress === 'proposed') {
               await this.withSwapGate(swapId, async () => {
+                // Re-check inside gate — a concurrent operation (e.g., cancelSwap, timeout)
+                // may have already advanced the swap out of 'proposed'.
+                if (swap.progress !== 'proposed') {
+                  return; // Silently ignore — not a duplicate acceptance, just a race
+                }
+
                 // v2: For v2 swaps, REQUIRE v2 acceptance with signature (downgrade attack prevention)
                 // Check BEFORE clearing the timer — a malformed/wrong-version acceptance must not
                 // disarm the proposal timeout (otherwise a bad actor can strand the swap indefinitely)
@@ -2082,8 +2091,14 @@ export class SwapModule {
                 // All checks passed — now safe to clear the proposal timer
                 this.clearLocalTimer(swapId);
 
-                // Transition to 'accepted'
-                await this.transitionProgress(swap, 'accepted');
+                // Transition to 'accepted' — if persistSwap fails, re-arm the timer
+                // so the proposal eventually times out rather than hanging indefinitely.
+                try {
+                  await this.transitionProgress(swap, 'accepted');
+                } catch (err) {
+                  this.startProposalTimer(swapId); // re-arm so proposal can still time out
+                  throw err;
+                }
 
                 // v2: Store verified acceptor signature
                 if (acceptMsg.version === 2 && acceptMsg.acceptor_signature && acceptMsg.acceptor_chain_pubkey) {

@@ -608,8 +608,8 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('composing:started', composing);
 
-    // Notify handlers
-    for (const handler of this.composingHandlers) {
+    // Notify handlers — snapshot Set to prevent mid-dispatch registration side-effects
+    for (const handler of Array.from(this.composingHandlers)) {
       try {
         handler(composing);
       } catch (error) {
@@ -632,8 +632,8 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:broadcast', message);
 
-    // Notify handlers
-    for (const handler of this.broadcastHandlers) {
+    // Notify handlers — snapshot Set to prevent mid-dispatch registration side-effects
+    for (const handler of Array.from(this.broadcastHandlers)) {
       try {
         handler(message);
       } catch (error) {

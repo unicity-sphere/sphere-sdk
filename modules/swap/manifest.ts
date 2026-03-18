@@ -186,7 +186,7 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
       party_b_value_to_change: manifest.party_b_value_to_change,
       timeout: manifest.timeout,
       salt: manifest.salt,
-      ...(manifest.escrow_address ? { escrow_address: manifest.escrow_address } : {}),
+      ...(manifest.escrow_address !== undefined ? { escrow_address: manifest.escrow_address } : {}),
       ...(manifest.protocol_version !== undefined ? { protocol_version: manifest.protocol_version } : {}),
     };
     const recomputed = computeSwapId(hashFields);
@@ -220,7 +220,7 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
     party_b_value_to_change: manifest.party_b_value_to_change,
     timeout: manifest.timeout,
     salt: manifest.salt,
-    ...(manifest.escrow_address ? { escrow_address: manifest.escrow_address } : {}),
+    ...(manifest.escrow_address !== undefined ? { escrow_address: manifest.escrow_address } : {}),
     ...(manifest.protocol_version !== undefined ? { protocol_version: manifest.protocol_version } : {}),
   });
   return recomputed === manifest.swap_id;
