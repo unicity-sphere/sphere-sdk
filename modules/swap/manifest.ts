@@ -221,7 +221,7 @@ export function verifyManifestIntegrity(manifest: SwapManifest): boolean {
     timeout: manifest.timeout,
     salt: manifest.salt,
     ...(manifest.escrow_address ? { escrow_address: manifest.escrow_address } : {}),
-    ...(manifest.protocol_version ? { protocol_version: manifest.protocol_version } : {}),
+    ...(manifest.protocol_version !== undefined ? { protocol_version: manifest.protocol_version } : {}),
   });
   return recomputed === manifest.swap_id;
 }

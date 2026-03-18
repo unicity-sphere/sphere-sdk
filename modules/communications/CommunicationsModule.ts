@@ -578,8 +578,10 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:dm', message);
 
-    // Notify handlers
-    for (const handler of this.dmHandlers) {
+    // Notify handlers — snapshot Set before iterating to prevent mid-dispatch
+    // registration (JS Set spec: new entries added during for-of are visited)
+    const handlers = Array.from(this.dmHandlers);
+    for (const handler of handlers) {
       try {
         handler(message);
       } catch (error) {

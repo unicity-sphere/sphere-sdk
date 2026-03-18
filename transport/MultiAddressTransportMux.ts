@@ -366,7 +366,7 @@ export class MultiAddressTransportMux {
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
-        if (subId) client.unsubscribe(subId);
+        try { if (subId) client.unsubscribe(subId); } catch { /* disconnected */ }
         resolve();
       }, 5000);
 

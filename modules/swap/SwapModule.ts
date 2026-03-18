@@ -1042,15 +1042,17 @@ export class SwapModule {
       // Step 4: Transition to 'accepted' (persist-before-act)
       await this.transitionProgress(swap, 'accepted');
 
-      // Step 4b: Sign the swap manifest (v2)
-      // IMPORTANT: Use manifest.escrow_address (locked at proposal time), NOT re-resolved address
-      // escrowAddressForSignature is guaranteed non-undefined for v2 by the guard above;
-      // for v1 this value may be undefined but acceptorSignature is only used in the v2 branch below.
-      const acceptorSignature = escrowAddressForSignature
-        ? signSwapManifest(deps.identity.privateKey, swap.manifest.swap_id, escrowAddressForSignature)
-        : '';
+      // Step 4b: Determine which protocol path to take
+      const isV2 = swap.protocolVersion === 2;
 
-      // Step 4c: Create nametag binding if acceptor used @nametag
+      // v2: Sign the swap manifest.
+      // IMPORTANT: Use manifest.escrow_address (locked at proposal time), NOT re-resolved address.
+      // escrowAddressForSignature is guaranteed non-undefined for v2 by the guard above.
+      const acceptorSignature = isV2 && escrowAddressForSignature
+        ? signSwapManifest(deps.identity.privateKey, swap.manifest.swap_id, escrowAddressForSignature)
+        : undefined;
+
+      // Step 4c: Resolve party positions for nametag binding (v2) and announce (v2)
       const activeAddresses = deps.getActiveAddresses();
       const ourAddresses = new Set<string>();
       for (const addr of activeAddresses) {
@@ -1061,37 +1063,45 @@ export class SwapModule {
       }
 
       const acceptorIsPartyA = ourAddresses.has(swap.manifest.party_a_address);
+
+      // v2: Create nametag binding proof if acceptor used @nametag
       let acceptorAuxiliary = swap.auxiliary;
-      const myNametag = deps.identity.nametag;
-      if (myNametag) {
-        const directAddress = acceptorIsPartyA
-          ? swap.manifest.party_a_address
-          : swap.manifest.party_b_address;
-        const binding = createNametagBinding(
-          deps.identity.privateKey, myNametag, directAddress, swap.manifest.swap_id,
-          deps.identity.chainPubkey,
-        );
-        acceptorAuxiliary = {
-          ...acceptorAuxiliary,
-          ...(acceptorIsPartyA
-            ? { party_a_binding: binding }
-            : { party_b_binding: binding }),
-        };
+      if (isV2) {
+        const myNametag = deps.identity.nametag;
+        if (myNametag) {
+          const directAddress = acceptorIsPartyA
+            ? swap.manifest.party_a_address
+            : swap.manifest.party_b_address;
+          const binding = createNametagBinding(
+            deps.identity.privateKey, myNametag, directAddress, swap.manifest.swap_id,
+            deps.identity.chainPubkey,
+          );
+          acceptorAuxiliary = {
+            ...acceptorAuxiliary,
+            ...(acceptorIsPartyA
+              ? { party_a_binding: binding }
+              : { party_b_binding: binding }),
+          };
+        }
       }
 
-      // Store acceptor signature and auxiliary
-      (swap as { acceptorSignature?: string }).acceptorSignature = acceptorSignature;
+      // Store acceptor signature (v2 only) and auxiliary, then persist
+      if (isV2 && acceptorSignature) {
+        (swap as { acceptorSignature?: string }).acceptorSignature = acceptorSignature;
+      }
       (swap as { auxiliary?: ManifestAuxiliary }).auxiliary = acceptorAuxiliary;
       await this.persistSwap(swap);
 
-      // Step 5: Send acceptance DM to proposer (v2 — informational, fire-and-forget)
+      // Step 5: Send acceptance DM to proposer
       try {
-        const acceptDM = buildAcceptanceDM_v2(swapId, acceptorSignature, deps.identity.chainPubkey);
+        const acceptDM = isV2 && acceptorSignature
+          ? buildAcceptanceDM_v2(swapId, acceptorSignature, deps.identity.chainPubkey)
+          : buildAcceptanceDM(swapId); // v1: informational only, proposer announces
         if (swap.counterpartyPubkey) {
           await deps.communications.sendDM(swap.counterpartyPubkey, acceptDM);
         }
       } catch {
-        // Best-effort — Bob announces directly, acceptance DM is informational
+        // Best-effort — in v2 Bob announces directly, so the acceptance DM is informational
       }
 
       // Step 6: Emit swap:accepted
@@ -1117,6 +1127,16 @@ export class SwapModule {
           });
           deps.emitEvent('swap:failed', { swapId, error: 'Cannot announce: proposer chain pubkey missing (v2 proposal)' });
           logger.warn(LOG_TAG, `v2 announce for ${swapId.slice(0, 12)} missing proposerChainPubkey`);
+          return;
+        }
+
+        // acceptorSignature is guaranteed defined here: we are in the v2 block and
+        // the guard at line 1035 ensures escrowAddressForSignature was defined.
+        if (!acceptorSignature) {
+          await this.transitionProgress(swap, 'failed', {
+            error: 'Cannot announce: acceptor signature missing (v2 internal error)',
+          });
+          deps.emitEvent('swap:failed', { swapId, error: 'Cannot announce: acceptor signature missing' });
           return;
         }
 
@@ -1205,6 +1225,15 @@ export class SwapModule {
 
     // Step 3: Enter per-swap gate
     await this.withSwapGate(swapId, async () => {
+      // Re-check state inside gate (TOCTOU guard — swap may have advanced to 'concluding'
+      // between the pre-gate check and gate acquisition due to a concurrent escrow DM)
+      if (swap.progress === 'concluding') {
+        throw new SphereError('Cannot reject: payouts are already in progress', 'SWAP_WRONG_STATE');
+      }
+      if (isTerminalProgress(swap.progress)) {
+        throw new SphereError('Swap is already in a terminal state', 'SWAP_ALREADY_CANCELLED');
+      }
+
       // Step 4: Send rejection DM to counterparty (best-effort)
       try {
         const dmContent = buildRejectionDM(swapId, reason);
@@ -2024,22 +2053,21 @@ export class SwapModule {
             // Only transition if still in 'proposed'
             if (swap.progress === 'proposed') {
               await this.withSwapGate(swapId, async () => {
-                // Clear proposal timer
-                this.clearLocalTimer(swapId);
-
                 // v2: For v2 swaps, REQUIRE v2 acceptance with signature (downgrade attack prevention)
+                // Check BEFORE clearing the timer — a malformed/wrong-version acceptance must not
+                // disarm the proposal timeout (otherwise a bad actor can strand the swap indefinitely)
                 if (swap.protocolVersion === 2) {
                   if (acceptMsg.version !== 2 || !acceptMsg.acceptor_signature || !acceptMsg.acceptor_chain_pubkey) {
                     logger.debug(LOG_TAG, `Acceptance for ${swapId}: v2 swap requires v2 acceptance with signature (got version=${acceptMsg.version})`);
-                    return; // Reject v1 acceptance on v2 swap
+                    return; // Reject — do NOT clear timer
                   }
                 }
-                // v2: Verify acceptor signature BEFORE state transition
+                // v2: Verify acceptor signature BEFORE state transition (and before clearing timer)
                 if (acceptMsg.version === 2 && acceptMsg.acceptor_signature && acceptMsg.acceptor_chain_pubkey) {
                   const escrowAddr = swap.manifest.escrow_address ?? swap.escrowDirectAddress;
                   if (!escrowAddr) {
                     logger.debug(LOG_TAG, `Acceptance for ${swapId}: cannot verify v2 signature — escrow address unknown`);
-                    return; // Reject — cannot verify without escrow address
+                    return; // Reject — do NOT clear timer
                   }
                   const valid = verifySwapSignature(
                     swap.manifest.swap_id, escrowAddr,
@@ -2047,9 +2075,12 @@ export class SwapModule {
                   );
                   if (!valid) {
                     logger.debug(LOG_TAG, `Acceptance for ${swapId}: invalid acceptor signature`);
-                    return;
+                    return; // Reject — do NOT clear timer
                   }
                 }
+
+                // All checks passed — now safe to clear the proposal timer
+                this.clearLocalTimer(swapId);
 
                 // Transition to 'accepted'
                 await this.transitionProgress(swap, 'accepted');
