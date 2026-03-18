@@ -363,20 +363,25 @@ export class MultiAddressTransportMux {
     filter.since = Math.floor(Date.now() / 1000) - 86400; // last 24h
 
     const events: NostrEvent[] = [];
+    // Declared outside the Promise so it's available for cleanup after resolve.
+    let subId: string | undefined;
 
     await new Promise<void>((resolve, reject) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let settled = false; // guard: EOSE may fire synchronously before subId is assigned
+      let settled = false;
 
-      const settle = (sid: string | undefined) => {
+      // settle() only resolves the Promise — unsubscribe happens AFTER the Promise
+      // resolves (below), where subId is guaranteed to be the real subscription ID.
+      // This fixes a synchronous-EOSE race: if EOSE fires inside subscribe() before
+      // the call returns, settle() is called with subId still undefined, so we must
+      // not unsubscribe here.
+      const settle = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        if (sid) { try { client.unsubscribe(sid); } catch { /* disconnected */ } }
         resolve();
       };
 
-      let subId: string | undefined;
       try {
         subId = client.subscribe(filter, {
           onEvent: (event) => {
@@ -390,24 +395,21 @@ export class MultiAddressTransportMux {
               sig: event.sig,
             });
           },
-          // EOSE may fire synchronously (before subscribe() returns), so use `settle`
-          // which safely handles the subId-undefined case and is idempotent.
-          onEndOfStoredEvents: () => settle(subId),
+          onEndOfStoredEvents: () => settle(),
         });
       } catch (err) {
-        // subscribe() threw synchronously — no timeout was set, reject immediately
         reject(err);
         return;
       }
 
-      if (settled) {
-        // EOSE already fired synchronously inside subscribe() — no timeout needed
-        return;
+      if (!settled) {
+        timeout = setTimeout(() => settle(), 5000);
       }
-
-      // Set timeout AFTER subscribe() succeeds (subId is now assigned)
-      timeout = setTimeout(() => settle(subId), 5000);
     });
+
+    // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
+    // This also ensures onEvent cannot fire while we iterate events below.
+    if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
 
     // Process through mux dispatch chain (dedup handles already-seen events)
     for (const event of events) {

@@ -1593,39 +1593,50 @@ export class NostrTransportProvider implements TransportProvider {
 
     // Collect events first, then process after EOSE
     const events: NostrEvent[] = [];
+    // Declared outside the Promise so it's available for cleanup after resolve.
+    let subId: string | undefined;
 
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let settled = false; // EOSE may fire synchronously before subId is assigned
+      let settled = false;
 
-      const settle = (sid: string | undefined) => {
+      // settle() only resolves the Promise — unsubscribe happens AFTER the Promise
+      // resolves (below), where subId is guaranteed to be the real subscription ID.
+      const settle = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        if (sid) this.nostrClient?.unsubscribe(sid);
         resolve();
       };
 
-      let subId: string | undefined;
-      subId = this.nostrClient!.subscribe(walletFilter, {
-        onEvent: (event) => {
-          events.push({
-            id: event.id,
-            kind: event.kind,
-            content: event.content,
-            tags: event.tags,
-            pubkey: event.pubkey,
-            created_at: event.created_at,
-            sig: event.sig,
-          });
-        },
-        onEndOfStoredEvents: () => settle(subId),
-      });
+      try {
+        subId = this.nostrClient!.subscribe(walletFilter, {
+          onEvent: (event) => {
+            events.push({
+              id: event.id,
+              kind: event.kind,
+              content: event.content,
+              tags: event.tags,
+              pubkey: event.pubkey,
+              created_at: event.created_at,
+              sig: event.sig,
+            });
+          },
+          onEndOfStoredEvents: () => settle(),
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
 
       if (!settled) {
-        timeout = setTimeout(() => settle(subId), 5000);
+        timeout = setTimeout(() => settle(), 5000);
       }
     });
+
+    // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
+    // This also ensures onEvent cannot fire while we iterate events below.
+    if (subId) this.nostrClient?.unsubscribe(subId);
 
     // Process collected events sequentially (dedup skips already-processed ones)
     for (const event of events) {

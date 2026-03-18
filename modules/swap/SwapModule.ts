@@ -2103,6 +2103,12 @@ export class SwapModule {
                   swap.progress = prevProgress;   // roll back in-memory
                   swap.updatedAt = prevUpdatedAt;
                   this.startProposalTimer(swapId); // re-arm so proposal can time out
+                  // Best-effort: if persistSwap wrote the record before the index write
+                  // failed, the storage record now has the wrong (advanced) state.
+                  // Re-persist the rolled-back state to heal the partial write.
+                  this.persistSwap(swap).catch((e) =>
+                    logger.warn(LOG_TAG, `Failed to persist rollback for ${swapId}:`, e),
+                  );
                   throw err;
                 }
 
