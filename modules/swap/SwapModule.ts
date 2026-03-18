@@ -101,6 +101,9 @@ export class SwapModule {
   private _storedTerminalEntries: SwapIndexEntry[] = [];
   private _gateMap = new AsyncGateMap();
   private localTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /** AbortControllers for in-progress sendAnnounce_v2 calls, keyed by swapId.
+   * Cancelled/rejected swaps abort these to stop retry loops immediately. */
+  private announceAbortControllers: Map<string, AbortController> = new Map();
   private invoiceToSwapIndex: Map<string, string> = new Map(); // invoiceId -> swapId
   private destroyed = false;
   private loaded = false;
@@ -457,6 +460,12 @@ export class SwapModule {
       clearTimeout(timer);
     }
     this.localTimers.clear();
+
+    // Abort any in-progress v2 announce retries
+    for (const ctrl of this.announceAbortControllers.values()) {
+      ctrl.abort();
+    }
+    this.announceAbortControllers.clear();
 
     // Drain all in-flight gated operations
     await this._gateMap.drainAll();
@@ -1271,10 +1280,14 @@ export class SwapModule {
     // arrive from escrow as a direct response to the announce we are sending.
     if (v2AnnounceParams) {
       const params = v2AnnounceParams;
+      // Create an AbortController so cancelSwap/rejectSwap can stop retries immediately.
+      const announceAbort = new AbortController();
+      this.announceAbortControllers.set(swapId, announceAbort);
       try {
         await sendAnnounce_v2(
           deps.communications, params.escrowPubkey,
           params.manifest, params.signatures, params.chainPubkeys, params.auxiliary,
+          announceAbort.signal,
         );
         // Start the announce-response timer ONLY if the swap is still in 'accepted' state.
         // sendAnnounce_v2 retries for up to ~82s; during that window the escrow may have
@@ -1312,6 +1325,9 @@ export class SwapModule {
             }
           }
         });
+      } finally {
+        // Always clean up the abort controller regardless of success/failure/abort
+        this.announceAbortControllers.delete(swapId);
       }
     }
   }
@@ -1361,9 +1377,13 @@ export class SwapModule {
         throw new SphereError('Swap is already cancelled', 'SWAP_ALREADY_CANCELLED');
       }
 
-      // Step 4: If post-announcement, notify escrow first to cancel and return deposits.
+      // Step 4: If post-acceptance, notify escrow first to cancel and return deposits.
       // Escrow must be notified before the counterparty so deposits are protected promptly.
-      if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
+      // Include 'accepted': sendAnnounce_v2 runs outside the gate for up to 82s, so the
+      // escrow may have already received the announce while progress is still 'accepted'.
+      if (swap.escrowPubkey && ['accepted', 'announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
+        // Abort any in-progress v2 announce so retries stop immediately
+        this.announceAbortControllers.get(swapId)?.abort();
         try {
           const cancelDM = buildCancelDM(swapId, reason ?? 'Rejected by user');
           await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
@@ -1672,10 +1692,17 @@ export class SwapModule {
       return false;
     }
 
-    // All checks passed -- transition to completed
-    await this.transitionProgress(swap, 'completed', {
-      payoutVerified: true,
-    });
+    // All checks passed — mark payout as verified.
+    // If the swap is already 'completed' (driven by escrow status DM before verifyPayout ran,
+    // payoutVerified=false), skip transitionProgress because completed→completed is not a valid
+    // state machine transition. Update the fields directly and persist instead.
+    if (swap.progress === 'completed') {
+      swap.payoutVerified = true;
+      swap.updatedAt = Date.now();
+      await this.persistSwap(swap);
+    } else {
+      await this.transitionProgress(swap, 'completed', { payoutVerified: true });
+    }
 
     deps.emitEvent('swap:completed', { swapId, payoutVerified: true });
 
@@ -1815,10 +1842,12 @@ export class SwapModule {
       // Clear local timer
       this.clearLocalTimer(swapId);
 
+      // Abort any in-progress v2 announce so retries stop immediately.
+      // Include 'accepted': sendAnnounce_v2 runs outside the gate for up to 82s.
+      this.announceAbortControllers.get(swapId)?.abort();
+
       // Notify escrow to cancel and return any deposited assets
-      const hadDeposits = swap.escrowPubkey &&
-        ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress);
-      if (hadDeposits && swap.escrowPubkey) {
+      if (swap.escrowPubkey && ['accepted', 'announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
         try {
           const cancelDM = buildCancelDM(swapId, 'Cancelled by user');
           await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
@@ -1841,26 +1870,12 @@ export class SwapModule {
       // Transition to cancelled
       await this.transitionProgress(swap, 'cancelled', { error: 'Cancelled by user' });
 
-      // Emit swap:cancelled event
-      // depositsReturned will be updated when escrow sends deposit returns
+      // depositsReturned will be updated when escrow sends deposit returns via invoice:return_received
       deps.emitEvent('swap:cancelled', {
         swapId,
         reason: 'explicit',
         depositsReturned: false,
       });
-
-      // Fallback: if deposits were in-flight, schedule a delayed status query so
-      // the SDK learns whether the escrow processed the cancellation and returned funds.
-      // This is a best-effort safety net — if the escrow is unresponsive, the
-      // invoice:return_received path (from accounting) is the primary signal.
-      if (hadDeposits && swap.escrowPubkey) {
-        const escrowPubkey = swap.escrowPubkey;
-        setTimeout(() => {
-          sendStatusQuery(deps.communications, escrowPubkey, swapId).catch((err) => {
-            logger.warn(LOG_TAG, `Fallback status query after cancel failed for swap ${swapId.slice(0, 12)}:`, err);
-          });
-        }, 30_000);
-      }
     });
   }
 
@@ -2987,12 +3002,16 @@ export class SwapModule {
               depositsReturned: true,
             });
           }
-          // Emit deposit_returned after state is consistent (inside gate, after transition).
-          deps.emitEvent('swap:deposit_returned', {
-            swapId,
-            transfer: data.transfer,
-            returnReason: data.returnReason,
-          });
+          // Only emit deposit_returned for cancelled swaps (inside gate, after transition).
+          // Stale or replayed invoice:return_received for a completed or failed swap is silently
+          // ignored — emitting deposit_returned on a non-cancelled swap would confuse consumers.
+          if (swap.progress === 'cancelled') {
+            deps.emitEvent('swap:deposit_returned', {
+              swapId,
+              transfer: data.transfer,
+              returnReason: data.returnReason,
+            });
+          }
         }).catch((err) => {
           logger.warn(LOG_TAG, `Failed to transition swap ${swapId} to cancelled:`, err);
         });

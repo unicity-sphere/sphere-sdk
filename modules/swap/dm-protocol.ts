@@ -462,8 +462,8 @@ function parseProposal(json: string): ParsedSwapDM | null {
     type: 'swap_proposal',
     version,
     manifest: obj.manifest as SwapManifest,
-    escrow: obj.escrow as string,
-    ...(typeof obj.message === 'string' ? { message: obj.message } : {}),
+    escrow: (obj.escrow as string).slice(0, 512), // cap escrow address length
+    ...(typeof obj.message === 'string' ? { message: obj.message.slice(0, 4096) } : {}),
     ...(version === 2 && typeof obj.proposer_signature === 'string' ? { proposer_signature: obj.proposer_signature } : {}),
     ...(version === 2 && typeof obj.proposer_chain_pubkey === 'string' ? { proposer_chain_pubkey: obj.proposer_chain_pubkey } : {}),
     ...(version === 2 && isObject(obj.auxiliary) ? { auxiliary: obj.auxiliary as ManifestAuxiliary } : {}),
@@ -538,7 +538,7 @@ function parseRejection(json: string): ParsedSwapDM | null {
     type: 'swap_rejection',
     version: 1,
     swap_id: obj.swap_id as string,
-    ...(typeof obj.reason === 'string' ? { reason: obj.reason } : {}),
+    ...(typeof obj.reason === 'string' ? { reason: obj.reason.slice(0, 4096) } : {}),
   };
 
   return { kind: 'rejection', payload };
@@ -622,15 +622,34 @@ function parseInvoiceDelivery(obj: Record<string, unknown>): ParsedSwapDM | null
   // invoice_token is required and must be a non-null object (TxfToken JSON)
   if (obj.invoice_token === undefined || obj.invoice_token === null || typeof obj.invoice_token !== 'object') return null;
 
+  // Validate payment_instructions sub-fields before forwarding — prevents oversized
+  // or non-string values from being stored in the swap record via an unchecked cast.
+  let paymentInstructions: EscrowPaymentInstructions | undefined;
+  if (isObject(obj.payment_instructions)) {
+    const pi = obj.payment_instructions as Record<string, unknown>;
+    if (
+      typeof pi.your_currency === 'string' &&
+      typeof pi.your_amount === 'string' &&
+      typeof pi.memo === 'string'
+    ) {
+      paymentInstructions = {
+        your_currency: pi.your_currency.slice(0, 128),
+        your_amount: pi.your_amount.slice(0, 128),
+        memo: pi.memo.slice(0, 4096),
+      };
+    }
+  }
+
   return {
     kind: 'escrow',
     payload: {
       type: 'invoice_delivery',
       swap_id: obj.swap_id as string,
       invoice_type: obj.invoice_type as 'deposit' | 'payout',
-      ...(typeof obj.invoice_id === 'string' ? { invoice_id: obj.invoice_id } : {}),
+      // Use isValidInvoiceId for invoice_id — consistent with parseAnnounceResult
+      ...(isValidInvoiceId(obj.invoice_id) ? { invoice_id: obj.invoice_id as string } : {}),
       invoice_token: obj.invoice_token,
-      ...(isObject(obj.payment_instructions) ? { payment_instructions: obj.payment_instructions as EscrowPaymentInstructions } : {}),
+      ...(paymentInstructions !== undefined ? { payment_instructions: paymentInstructions } : {}),
     },
   };
 }

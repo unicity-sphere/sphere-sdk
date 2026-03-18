@@ -281,14 +281,18 @@ export function verifySwapSignature(
  * @returns A NametagBindingProof with the signature.
  */
 /**
- * Maximum nametag length for binding proofs. Matches the nametag registration
- * limit used elsewhere in the SDK to prevent oversized signed messages and
- * storage amplification via the auxiliary field.
+ * Maximum nametag length for binding proofs.
+ * Matches core/address.ts NAMETAG_RE limit (1–30 chars) to prevent
+ * binding proofs being created for nametags the SDK would otherwise reject.
  */
-const MAX_NAMETAG_LEN = 64;
+const MAX_NAMETAG_LEN = 30;
 
-/** Nametag character whitelist: lowercase alphanumeric, hyphen, underscore. */
-const NAMETAG_RE = /^[a-z0-9_-]+$/;
+/**
+ * Nametag character whitelist: must start with lowercase alphanumeric,
+ * followed by lowercase alphanumeric, hyphen, or underscore.
+ * Mirrors core/address.ts NAMETAG_RE = /^[a-z0-9][a-z0-9_-]{0,29}$/.
+ */
+const NAMETAG_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 /**
  * Returns true if the given nametag string is within acceptable bounds for

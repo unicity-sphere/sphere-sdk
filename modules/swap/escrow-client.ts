@@ -56,13 +56,20 @@ export async function withRetry<T>(
   fn: () => Promise<T>,
   maxRetries: number,
   label: string,
+  signal?: AbortSignal,
 ): Promise<T> {
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Check for cancellation before each attempt
+    if (signal?.aborted) {
+      throw new Error(`${label}: aborted`);
+    }
     try {
       return await fn();
     } catch (err: unknown) {
+      // If aborted mid-attempt, stop retrying immediately
+      if (signal?.aborted) throw err;
       lastError = err;
 
       if (attempt < maxRetries) {
@@ -76,7 +83,14 @@ export async function withRetry<T>(
           err instanceof Error ? err.message : err,
         );
 
-        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+        // Interruptible delay: resolves early if signal fires
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, delay);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(t);
+            reject(new Error(`${label}: aborted during retry delay`));
+          }, { once: true });
+        });
       }
     }
   }
@@ -198,12 +212,14 @@ export async function sendAnnounce_v2(
   signatures: ManifestSignatures,
   chainPubkeys: { party_a: string; party_b: string },
   auxiliary?: ManifestAuxiliary,
+  signal?: AbortSignal,
 ): Promise<void> {
   const dm = buildAnnounceDM_v2(manifest, signatures, chainPubkeys, auxiliary);
   await withRetry(
     () => communications.sendDM(escrowPubkey, dm).then(() => undefined),
     5,
     'announce_v2',
+    signal,
   );
 }
 
