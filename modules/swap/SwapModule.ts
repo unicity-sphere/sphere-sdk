@@ -254,6 +254,8 @@ export class SwapModule {
         swap.error = 'Proposal timed out';
         swap.updatedAt = now;
         await this.persistSwap(swap);
+        // Track as terminal so replayed proposal DMs don't recreate it this session
+        this.terminalSwapIds.add(swap.swapId);
         if (this.config.debug) {
           logger.debug(LOG_TAG, `Proposal ${swap.swapId} timed out during load`);
         }
@@ -292,80 +294,94 @@ export class SwapModule {
     // Each recovery action is async and tolerates failures — the swap will
     // eventually be resolved by the escrow timeout or the next CLI sync.
     for (const swap of this.swaps.values()) {
+      const swapRef = swap; // capture for async closure
       void (async () => {
         try {
-          // Resolve escrow pubkey if not already stored
-          let escrowPubkey = swap.escrowPubkey;
+          if (this.destroyed) return; // Module was destroyed before recovery started
+
+          // Resolve escrow pubkey if not already stored (network call — outside gate)
+          let escrowPubkey = swapRef.escrowPubkey;
           if (!escrowPubkey) {
             try {
-              const resolved = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
+              const resolved = await resolveEscrowAddress(swapRef.deal, this.config, deps.resolve);
+              if (this.destroyed) return; // Destroyed while awaiting escrow resolution
+              // Persist escrow info inside per-swap gate to prevent concurrent DM handler races
+              await this.withSwapGate(swapRef.swapId, async () => {
+                if (this.destroyed) return;
+                swapRef.escrowPubkey = resolved.escrowPubkey;
+                swapRef.escrowDirectAddress = resolved.escrowDirectAddress;
+                await this.persistSwap(swapRef);
+              });
               escrowPubkey = resolved.escrowPubkey;
-              swap.escrowPubkey = escrowPubkey;
-              swap.escrowDirectAddress = resolved.escrowDirectAddress;
-              await this.persistSwap(swap);
             } catch {
-              logger.warn(LOG_TAG, `Crash recovery: cannot resolve escrow for swap ${swap.swapId.slice(0, 12)}`);
+              if (!this.destroyed) {
+                logger.warn(LOG_TAG, `Crash recovery: cannot resolve escrow for swap ${swapRef.swapId.slice(0, 12)}`);
+              }
               return;
             }
           }
 
-          switch (swap.progress) {
+          if (this.destroyed) return; // Check after all async operations
+
+          // Recovery DM sends are pure outgoing messages — no swap state mutation.
+          // No gate needed for sends; only the escrow resolution above was gated.
+          switch (swapRef.progress) {
             case 'accepted':
-              if (swap.protocolVersion === 2 && swap.role === 'proposer') {
+              if (swapRef.protocolVersion === 2 && swapRef.role === 'proposer') {
                 // v2 proposer: Bob already announced. Just send a status query.
-                logger.debug(LOG_TAG, `v2 crash recovery: proposer waiting for announce_result ${swap.swapId.slice(0, 12)}`);
-                await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
-              } else if (swap.protocolVersion === 2 && swap.role === 'acceptor') {
+                logger.debug(LOG_TAG, `v2 crash recovery: proposer waiting for announce_result ${swapRef.swapId.slice(0, 12)}`);
+                await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
+              } else if (swapRef.protocolVersion === 2 && swapRef.role === 'acceptor') {
                 // v2 acceptor: re-announce with v2 format (both signatures)
-                logger.debug(LOG_TAG, `v2 crash recovery: re-announcing swap ${swap.swapId.slice(0, 12)}`);
-                if (swap.proposerSignature && swap.acceptorSignature && swap.proposerChainPubkey) {
+                logger.debug(LOG_TAG, `v2 crash recovery: re-announcing swap ${swapRef.swapId.slice(0, 12)}`);
+                if (swapRef.proposerSignature && swapRef.acceptorSignature && swapRef.proposerChainPubkey) {
                   const activeAddresses = deps.getActiveAddresses();
                   const ourAddrs = new Set(activeAddresses.map(a => a.directAddress));
                   if (deps.identity.directAddress) ourAddrs.add(deps.identity.directAddress);
-                  const weArePartyA = ourAddrs.has(swap.manifest.party_a_address);
+                  const weArePartyA = ourAddrs.has(swapRef.manifest.party_a_address);
                   const signatures: ManifestSignatures = {
-                    party_a: weArePartyA ? swap.acceptorSignature : swap.proposerSignature,
-                    party_b: weArePartyA ? swap.proposerSignature : swap.acceptorSignature,
+                    party_a: weArePartyA ? swapRef.acceptorSignature : swapRef.proposerSignature,
+                    party_b: weArePartyA ? swapRef.proposerSignature : swapRef.acceptorSignature,
                   };
                   const chainPubkeys = {
-                    party_a: weArePartyA ? deps.identity.chainPubkey : swap.proposerChainPubkey,
-                    party_b: weArePartyA ? swap.proposerChainPubkey : deps.identity.chainPubkey,
+                    party_a: weArePartyA ? deps.identity.chainPubkey : swapRef.proposerChainPubkey,
+                    party_b: weArePartyA ? swapRef.proposerChainPubkey : deps.identity.chainPubkey,
                   };
-                  await sendAnnounce_v2(deps.communications, escrowPubkey, swap.manifest, signatures, chainPubkeys, swap.auxiliary);
+                  await sendAnnounce_v2(deps.communications, escrowPubkey, swapRef.manifest, signatures, chainPubkeys, swapRef.auxiliary);
                 } else {
                   // Missing signatures — fall back to status query
-                  await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
+                  await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
                 }
               } else {
                 // v1: Re-send announce DM to escrow (idempotent — escrow returns existing state)
-                logger.debug(LOG_TAG, `Crash recovery: re-announcing swap ${swap.swapId.slice(0, 12)}`);
-                await sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
+                logger.debug(LOG_TAG, `Crash recovery: re-announcing swap ${swapRef.swapId.slice(0, 12)}`);
+                await sendAnnounce(deps.communications, escrowPubkey, swapRef.manifest);
               }
               break;
 
             case 'announced':
             case 'depositing':
               // Send status query to get latest escrow state
-              logger.debug(LOG_TAG, `Crash recovery: status query for swap ${swap.swapId.slice(0, 12)}`);
-              await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
+              logger.debug(LOG_TAG, `Crash recovery: status query for swap ${swapRef.swapId.slice(0, 12)}`);
+              await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
               // Request deposit invoice if missing
-              if (!swap.depositInvoiceId) {
-                await sendRequestInvoice(deps.communications, escrowPubkey, swap.swapId, 'deposit');
+              if (!swapRef.depositInvoiceId) {
+                await sendRequestInvoice(deps.communications, escrowPubkey, swapRef.swapId, 'deposit');
               }
               break;
 
             case 'awaiting_counter':
               // Send status query to check if both deposits are in
-              logger.debug(LOG_TAG, `Crash recovery: status query for swap ${swap.swapId.slice(0, 12)}`);
-              await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
+              logger.debug(LOG_TAG, `Crash recovery: status query for swap ${swapRef.swapId.slice(0, 12)}`);
+              await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
               break;
 
             case 'concluding':
               // Send status query + request payout invoice if missing
-              logger.debug(LOG_TAG, `Crash recovery: concluding check for swap ${swap.swapId.slice(0, 12)}`);
-              await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
-              if (!swap.payoutInvoiceId) {
-                await sendRequestInvoice(deps.communications, escrowPubkey, swap.swapId, 'payout');
+              logger.debug(LOG_TAG, `Crash recovery: concluding check for swap ${swapRef.swapId.slice(0, 12)}`);
+              await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
+              if (!swapRef.payoutInvoiceId) {
+                await sendRequestInvoice(deps.communications, escrowPubkey, swapRef.swapId, 'payout');
               }
               break;
 
@@ -373,7 +389,9 @@ export class SwapModule {
               break;
           }
         } catch (err) {
-          logger.warn(LOG_TAG, `Crash recovery failed for swap ${swap.swapId.slice(0, 12)}:`, err);
+          if (!this.destroyed) {
+            logger.warn(LOG_TAG, `Crash recovery failed for swap ${swapRef.swapId.slice(0, 12)}:`, err);
+          }
         }
       })();
     }
@@ -986,6 +1004,7 @@ export class SwapModule {
     if (!swap) {
       throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
     }
+    // Fast-path checks before gate (re-checked inside gate for TOCTOU safety)
     if (swap.progress !== 'proposed') {
       throw new SphereError(
         `Cannot accept: swap is in ${swap.progress} state`,
@@ -1001,15 +1020,35 @@ export class SwapModule {
 
     // Step 3: Enter per-swap gate
     await this.withSwapGate(swapId, async () => {
+      // Re-check state inside gate (TOCTOU guard — concurrent rejection/cancellation may have fired)
+      if (swap.progress !== 'proposed') {
+        throw new SphereError(
+          `Cannot accept: swap changed to ${swap.progress} state before gate acquired`,
+          'SWAP_WRONG_STATE',
+        );
+      }
+
+      // Step 4b: Validate escrow address BEFORE transitioning (needed for v2 signature)
+      // For v2 swaps the escrow_address MUST be present in the manifest (set at proposal time).
+      // For v1 swaps the address is resolved in Step 7 after the transition.
+      const escrowAddressForSignature = swap.manifest.escrow_address ?? swap.escrowDirectAddress;
+      if (swap.protocolVersion === 2 && !escrowAddressForSignature) {
+        throw new SphereError(
+          'Cannot accept: escrow address not yet resolved (retry shortly)',
+          'SWAP_WRONG_STATE',
+        );
+      }
+
       // Step 4: Transition to 'accepted' (persist-before-act)
       await this.transitionProgress(swap, 'accepted');
 
       // Step 4b: Sign the swap manifest (v2)
       // IMPORTANT: Use manifest.escrow_address (locked at proposal time), NOT re-resolved address
-      const escrowAddressForSignature = swap.manifest.escrow_address ?? swap.escrowDirectAddress!;
-      const acceptorSignature = signSwapManifest(
-        deps.identity.privateKey, swap.manifest.swap_id, escrowAddressForSignature,
-      );
+      // escrowAddressForSignature is guaranteed non-undefined for v2 by the guard above;
+      // for v1 this value may be undefined but acceptorSignature is only used in the v2 branch below.
+      const acceptorSignature = escrowAddressForSignature
+        ? signSwapManifest(deps.identity.privateKey, swap.manifest.swap_id, escrowAddressForSignature)
+        : '';
 
       // Step 4c: Create nametag binding if acceptor used @nametag
       const activeAddresses = deps.getActiveAddresses();
@@ -1058,42 +1097,77 @@ export class SwapModule {
       // Step 6: Emit swap:accepted
       deps.emitEvent('swap:accepted', { swapId, role: swap.role });
 
-      // Step 7: Resolve escrow and announce with BOTH signatures (v2)
-      if (!swap.escrowPubkey) {
-        const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(
-          swap.deal, this.config, deps.resolve,
-        );
-        swap.escrowPubkey = escrowPubkey;
-        swap.escrowDirectAddress = escrowDirectAddress;
-        await this.persistSwap(swap);
-      }
+      // Step 7: v2 only — acceptor announces directly to escrow with both signatures.
+      // In v1, the proposer announces to escrow after receiving the acceptance DM.
+      if (swap.protocolVersion === 2) {
+        if (!swap.escrowPubkey) {
+          const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(
+            swap.deal, this.config, deps.resolve,
+          );
+          swap.escrowPubkey = escrowPubkey;
+          swap.escrowDirectAddress = escrowDirectAddress;
+          await this.persistSwap(swap);
+        }
 
-      // Build v2 announce with both signatures and chain pubkeys
-      const proposerChainPubkey = swap.proposerChainPubkey!;
-      const acceptorChainPubkey = deps.identity.chainPubkey;
+        // proposerChainPubkey is required for v2 (set during proposal receipt signature verification)
+        const proposerChainPubkey = swap.proposerChainPubkey;
+        if (!proposerChainPubkey) {
+          await this.transitionProgress(swap, 'failed', {
+            error: 'Cannot announce: proposer chain pubkey missing (v2 proposal)',
+          });
+          deps.emitEvent('swap:failed', { swapId, error: 'Cannot announce: proposer chain pubkey missing (v2 proposal)' });
+          logger.warn(LOG_TAG, `v2 announce for ${swapId.slice(0, 12)} missing proposerChainPubkey`);
+          return;
+        }
 
-      const weArePartyA = acceptorIsPartyA;
-      const signatures: ManifestSignatures = {
-        party_a: weArePartyA ? acceptorSignature : swap.proposerSignature,
-        party_b: weArePartyA ? swap.proposerSignature : acceptorSignature,
-      };
-      const chainPubkeys = {
-        party_a: weArePartyA ? acceptorChainPubkey : proposerChainPubkey,
-        party_b: weArePartyA ? proposerChainPubkey : acceptorChainPubkey,
-      };
+        const acceptorChainPubkey = deps.identity.chainPubkey;
+        const weArePartyA = acceptorIsPartyA;
+        const signatures: ManifestSignatures = {
+          party_a: weArePartyA ? acceptorSignature : swap.proposerSignature,
+          party_b: weArePartyA ? swap.proposerSignature : acceptorSignature,
+        };
+        const chainPubkeys = {
+          party_a: weArePartyA ? acceptorChainPubkey : proposerChainPubkey,
+          party_b: weArePartyA ? proposerChainPubkey : acceptorChainPubkey,
+        };
 
-      try {
-        await sendAnnounce_v2(
-          deps.communications, swap.escrowPubkey!,
-          swap.manifest, signatures, chainPubkeys, acceptorAuxiliary,
-        );
-      } catch (err) {
-        // Announce failure — transition to failed
-        await this.transitionProgress(swap, 'failed', {
-          error: 'Failed to send v2 announce to escrow',
-        });
-        deps.emitEvent('swap:failed', { swapId, error: 'Failed to send v2 announce to escrow' });
-        logger.warn(LOG_TAG, `Failed to announce v2 swap ${swapId} to escrow:`, err);
+        try {
+          await sendAnnounce_v2(
+            deps.communications, swap.escrowPubkey!,
+            swap.manifest, signatures, chainPubkeys, acceptorAuxiliary,
+          );
+        } catch (err) {
+          // Announce failure — transition to failed and notify proposer
+          await this.transitionProgress(swap, 'failed', {
+            error: 'Failed to send v2 announce to escrow',
+          });
+          deps.emitEvent('swap:failed', { swapId, error: 'Failed to send v2 announce to escrow' });
+          logger.warn(LOG_TAG, `Failed to announce v2 swap ${swapId} to escrow:`, err);
+          // Notify proposer so they don't wait indefinitely for escrow messages
+          if (swap.counterpartyPubkey) {
+            try {
+              const cancelDM = buildCancelDM(swapId, 'Acceptor failed to announce to escrow');
+              await deps.communications.sendDM(swap.counterpartyPubkey, cancelDM);
+            } catch {
+              // Best-effort
+            }
+          }
+        }
+      } else {
+        // v1: Resolve and store escrow address so it's available for crash recovery and DM verification.
+        // The proposer is responsible for announcing to escrow when they receive our acceptance DM.
+        if (!swap.escrowPubkey) {
+          try {
+            const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(
+              swap.deal, this.config, deps.resolve,
+            );
+            swap.escrowPubkey = escrowPubkey;
+            swap.escrowDirectAddress = escrowDirectAddress;
+            await this.persistSwap(swap);
+          } catch {
+            // Best-effort for v1 — escrow will be resolved at announce time
+          }
+        }
       }
     });
   }
@@ -1230,8 +1304,19 @@ export class SwapModule {
     }
 
     return this.withSwapGate(swapId, async () => {
+      // Re-check state inside gate (TOCTOU guard — a concurrent cancelSwap/DM handler may have
+      // transitioned the swap between the pre-gate checks and gate acquisition)
+      if (swap.progress !== 'announced') {
+        throw new SphereError(
+          `Swap ${swapId} state changed before deposit could execute (now: ${swap.progress})`,
+          'SWAP_WRONG_STATE',
+        );
+      }
+      if (!swap.depositInvoiceId) {
+        throw new SphereError('Deposit invoice not yet available', 'SWAP_WRONG_STATE');
+      }
       try {
-        const transferResult = await deps.accounting.payInvoice(swap.depositInvoiceId!, {
+        const transferResult = await deps.accounting.payInvoice(swap.depositInvoiceId, {
           targetIndex: 0,
           assetIndex,
         });
@@ -1271,16 +1356,24 @@ export class SwapModule {
     this.ensureReady();
     const deps = this.deps!;
 
-    // Look up swap
+    // Look up swap (pre-gate fast check)
     const swap = this.swaps.get(swapId);
     if (!swap) {
       throw new SphereError(`Swap ${swapId} not found`, 'SWAP_NOT_FOUND');
     }
 
-    // Verify payout invoice is available
     if (!swap.payoutInvoiceId) {
       throw new SphereError('Payout invoice not yet received', 'SWAP_WRONG_STATE');
     }
+
+    // Run all verification logic within the per-swap gate to prevent concurrent state mutations.
+    // This is safe to call from both: (a) inside fire-and-forget from payout DM handler (the outer
+    // gate has already released before this gate runs), and (b) from CLI (no outer gate).
+    return this.withSwapGate(swapId, async () => {
+      // Re-check after gate acquisition
+      if (!swap.payoutInvoiceId) {
+        throw new SphereError('Payout invoice not yet received', 'SWAP_WRONG_STATE');
+      }
 
     // Get invoice ref to access terms
     const invoiceRef = deps.accounting.getInvoice(swap.payoutInvoiceId) as {
@@ -1441,6 +1534,7 @@ export class SwapModule {
     deps.emitEvent('swap:completed', { swapId, payoutVerified: true });
 
     return true;
+    }); // end withSwapGate
   }
 
   // T2.3: IMPLEMENTATION END
@@ -1546,7 +1640,7 @@ export class SwapModule {
       throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
     }
 
-    // Block cancellation once payouts have started
+    // Fast-path checks before gate (TOCTOU-safe: re-checked inside gate)
     if (swap.progress === 'concluding') {
       throw new SphereError('Cannot cancel: payouts are already in progress', 'SWAP_WRONG_STATE');
     }
@@ -1560,6 +1654,18 @@ export class SwapModule {
     const deps = this.deps!;
 
     await this.withSwapGate(swapId, async () => {
+      // Re-check state inside gate (TOCTOU guard — a concurrent DM handler may have
+      // transitioned the swap between the pre-gate check and gate acquisition)
+      if (swap.progress === 'concluding') {
+        throw new SphereError('Cannot cancel: payouts are already in progress', 'SWAP_WRONG_STATE');
+      }
+      if (swap.progress === 'completed') {
+        throw new SphereError('Swap is already completed', 'SWAP_ALREADY_COMPLETED');
+      }
+      if (swap.progress === 'cancelled' || swap.progress === 'failed') {
+        throw new SphereError('Swap is already cancelled', 'SWAP_ALREADY_CANCELLED');
+      }
+
       // Clear local timer
       this.clearLocalTimer(swapId);
 
@@ -1752,14 +1858,25 @@ export class SwapModule {
             const counterpartyAddress = isPartyA ? manifest.party_b_address : manifest.party_a_address;
             try {
               const counterpartyPeer = await deps.resolve(counterpartyAddress);
-              if (counterpartyPeer && counterpartyPeer.transportPubkey && counterpartyPeer.transportPubkey !== dm.senderPubkey) {
-                if (this.config.debug) {
-                  logger.debug(LOG_TAG, `Proposal sender mismatch: expected transport ${counterpartyPeer.transportPubkey?.slice(0, 16)}, got ${dm.senderPubkey?.slice(0, 16)}`);
+              if (counterpartyPeer) {
+                // Peer found: transportPubkey must be present and match sender
+                // If transportPubkey is missing, we cannot verify the sender — reject
+                if (!counterpartyPeer.transportPubkey || counterpartyPeer.transportPubkey !== dm.senderPubkey) {
+                  if (this.config.debug) {
+                    logger.debug(LOG_TAG, `Proposal sender mismatch: expected transport ${counterpartyPeer.transportPubkey?.slice(0, 16) ?? '(none)'}, got ${dm.senderPubkey?.slice(0, 16)}`);
+                  }
+                  return; // Sender mismatch or unverifiable — drop silently
                 }
-                return; // Sender is not the counterparty — drop silently
               }
+              // If counterpartyPeer is null (not yet in relay), allow the proposal to proceed.
+              // v2 proposals have mandatory chain pubkey verification below, which will catch fakes.
+              // v1 proposals rely on transport-layer authentication (NIP-17 sealed-sender).
             } catch {
-              // Best-effort: if resolution fails, allow the proposal (may be a nametag we can't resolve yet)
+              // Resolution error — drop for security (cannot authenticate sender)
+              if (this.config.debug) {
+                logger.debug(LOG_TAG, `Proposal ${manifest.swap_id}: peer resolution error, dropping`);
+              }
+              return;
             }
 
             // v2: Verify proposer's signature and chain pubkey
@@ -1910,6 +2027,13 @@ export class SwapModule {
                 // Clear proposal timer
                 this.clearLocalTimer(swapId);
 
+                // v2: For v2 swaps, REQUIRE v2 acceptance with signature (downgrade attack prevention)
+                if (swap.protocolVersion === 2) {
+                  if (acceptMsg.version !== 2 || !acceptMsg.acceptor_signature || !acceptMsg.acceptor_chain_pubkey) {
+                    logger.debug(LOG_TAG, `Acceptance for ${swapId}: v2 swap requires v2 acceptance with signature (got version=${acceptMsg.version})`);
+                    return; // Reject v1 acceptance on v2 swap
+                  }
+                }
                 // v2: Verify acceptor signature BEFORE state transition
                 if (acceptMsg.version === 2 && acceptMsg.acceptor_signature && acceptMsg.acceptor_chain_pubkey) {
                   const escrowAddr = swap.manifest.escrow_address ?? swap.escrowDirectAddress;
@@ -2180,7 +2304,14 @@ export class SwapModule {
                     // may receive invoice_delivery before acceptance DM), transition directly
                     // to 'announced'.
                     if (swap.progress === 'accepted' || swap.progress === 'proposed') {
+                      // v2 fast path: if invoice_delivery arrives before swap_acceptance DM,
+                      // the swap jumps proposed → announced. Emit swap:accepted synthetically
+                      // so UIs depending on that event don't miss it.
+                      const skippedAccepted = swap.progress === 'proposed';
                       await this.transitionProgress(swap, 'announced');
+                      if (skippedAccepted) {
+                        deps.emitEvent('swap:accepted', { swapId, role: swap.role });
+                      }
                       deps.emitEvent('swap:announced', {
                         swapId,
                         depositInvoiceId: swap.depositInvoiceId ?? '',
@@ -2196,6 +2327,7 @@ export class SwapModule {
                   });
                 } else if (msg.invoice_type === 'payout') {
                   // §12.4.3: Payout invoice delivery
+                  let shouldAutoVerify = false;
                   await this.withSwapGate(swapId, async () => {
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
@@ -2217,13 +2349,19 @@ export class SwapModule {
                       payoutInvoiceId: swap.payoutInvoiceId ?? '',
                     });
 
-                    // Attempt auto-verification (fire-and-forget)
+                    shouldAutoVerify = true;
+                  });
+
+                  // Auto-verification runs OUTSIDE the gate so verifyPayout can acquire its own
+                  // gate without deadlocking. The gate above will have fully released before
+                  // verifyPayout's internal gate runs.
+                  if (shouldAutoVerify) {
                     this.verifyPayout(swapId).catch((err) => {
                       if (this.config.debug) {
                         logger.debug(LOG_TAG, `Auto-verification for swap ${swapId} deferred:`, err);
                       }
                     });
-                  });
+                  }
                 }
                 break;
               }
