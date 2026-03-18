@@ -348,6 +348,12 @@ export interface SphereInitOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /**
+   * Fallback 'since' timestamp (unix seconds) for the DM (gift-wrap) subscription.
+   * Used when no persisted DM timestamp exists in storage (e.g. first connect).
+   * Without this, a fresh wallet starts from "now" and misses older DMs.
+   */
+  dmSince?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -589,6 +595,11 @@ export class Sphere {
     const market = Sphere.resolveMarketConfig(options.market);
 
     const walletExists = await Sphere.exists(options.storage);
+
+    // Pass dmSince fallback to transport before connecting
+    if (options.dmSince != null && options.transport.setFallbackDmSince) {
+      options.transport.setFallbackDmSince(options.dmSince);
+    }
 
     if (walletExists) {
       // Load existing wallet

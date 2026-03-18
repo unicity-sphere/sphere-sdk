@@ -121,8 +121,12 @@ export class NostrTransportProvider implements TransportProvider {
   private storage: TransportStorageAdapter | null = null;
   /** In-memory max event timestamp to avoid read-before-write races in updateLastEventTimestamp. */
   private lastEventTs: number = 0;
+  /** In-memory max DM (gift-wrap) event timestamp. */
+  private lastDmEventTs: number = 0;
   /** Fallback 'since' timestamp for first-time address subscriptions (consumed once). */
   private fallbackSince: number | null = null;
+  /** Fallback 'since' timestamp for DM (gift-wrap) subscriptions (consumed once). */
+  private fallbackDmSince: number | null = null;
   private identity: FullIdentity | null = null;
   private keyManager: NostrKeyManager | null = null;
   private status: ProviderStatus = 'disconnected';
@@ -491,6 +495,10 @@ export class NostrTransportProvider implements TransportProvider {
 
   setFallbackSince(sinceSeconds: number): void {
     this.fallbackSince = sinceSeconds;
+  }
+
+  setFallbackDmSince(sinceSeconds: number): void {
+    this.fallbackDmSince = sinceSeconds;
   }
 
   /**
@@ -1214,6 +1222,20 @@ export class NostrTransportProvider implements TransportProvider {
     });
   }
 
+  /** Persist the max DM (gift-wrap) event timestamp for the since filter on next connect. */
+  private updateLastDmEventTimestamp(createdAt: number): void {
+    if (!this.storage || !this.keyManager) return;
+    if (createdAt <= this.lastDmEventTs) return;
+
+    this.lastDmEventTs = createdAt;
+    const pubkey = this.keyManager.getPublicKeyHex();
+    const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_DM_EVENT_TS}_${pubkey.slice(0, 16)}`;
+
+    this.storage.set(storageKey, createdAt.toString()).catch(err => {
+      logger.debug('Nostr', 'Failed to save last DM event timestamp:', err);
+    });
+  }
+
   private async handleDirectMessage(event: NostrEvent): Promise<void> {
     // NIP-04 (kind 4) is deprecated for DMs - only used for legacy token transfers
     // DMs should come through NIP-17 (kind 1059 gift wrap) via handleGiftWrap
@@ -1228,6 +1250,11 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     try {
+      // Track the outer gift-wrap timestamp for the since filter on next connect.
+      if (event.created_at) {
+        this.updateLastDmEventTimestamp(event.created_at);
+      }
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const pm = NIP17.unwrap(event as any, this.keyManager);
       logger.debug('Nostr', 'Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
@@ -1773,12 +1800,51 @@ export class NostrTransportProvider implements TransportProvider {
     });
     logger.debug('Nostr', 'Wallet subscription created, subId:', this.walletSubscriptionId);
 
-    // Subscribe to chat events (NIP-17 gift wrap) WITHOUT since filter
-    // This matches Sphere app's approach - chat messages rely on deduplication
+    // Determine 'since' for DM (gift-wrap) subscription independently from wallet events.
+    let dmSince: number;
+    if (this.storage) {
+      const dmStorageKey = `${STORAGE_KEYS_GLOBAL.LAST_DM_EVENT_TS}_${nostrPubkey.slice(0, 16)}`;
+      try {
+        const stored = await this.storage.get(dmStorageKey);
+        if (stored) {
+          dmSince = parseInt(stored, 10);
+          this.lastDmEventTs = dmSince;
+          this.fallbackDmSince = null; // Stored value takes priority
+          logger.debug('Nostr', 'DM resuming from stored timestamp:', dmSince);
+        } else if (this.fallbackDmSince !== null) {
+          dmSince = this.fallbackDmSince;
+          this.lastDmEventTs = dmSince;
+          this.fallbackDmSince = null; // Consume once
+          logger.debug('Nostr', 'DM using fallback since timestamp:', dmSince);
+        } else {
+          dmSince = Math.floor(Date.now() / 1000);
+          logger.debug('Nostr', 'No stored DM timestamp, starting from now:', dmSince);
+        }
+      } catch (err) {
+        if (this.fallbackDmSince !== null) {
+          dmSince = this.fallbackDmSince;
+          this.lastDmEventTs = dmSince;
+          this.fallbackDmSince = null;
+          logger.debug('Nostr', 'Storage read failed, using DM fallback since:', dmSince, err);
+        } else {
+          dmSince = Math.floor(Date.now() / 1000);
+          logger.debug('Nostr', 'Failed to read last DM event timestamp, falling back to now:', err);
+        }
+      }
+    } else if (this.fallbackDmSince !== null) {
+      dmSince = this.fallbackDmSince;
+      this.lastDmEventTs = dmSince;
+      this.fallbackDmSince = null;
+      logger.debug('Nostr', 'No storage adapter for DM, using fallback since:', dmSince);
+    } else {
+      dmSince = Math.floor(Date.now() / 1000) - 86400;
+      logger.debug('Nostr', 'No storage adapter for DM, using 24h fallback');
+    }
+
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = [nostrPubkey];
-    // NO since filter for chat - we want real-time messages
+    chatFilter.since = dmSince;
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
