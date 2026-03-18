@@ -1,6 +1,6 @@
 # Swap Module Specification
 
-> **Status:** Draft specification -- no code yet
+> **Status:** Implemented -- `modules/swap/` on `feat/swap-module-spec` branch
 > **Companion:** [Escrow Protocol Spec](../../escrow-service/docs/protocol-spec.md)
 
 ## Table of Contents
@@ -37,14 +37,25 @@ The `SwapModule` provides a high-level API for atomic two-party currency swaps w
 
 The module runs entirely in the wallet. It is a **client** of the escrow service, not a replacement for it. The escrow service holds deposited funds and executes the atomic swap; the `SwapModule` coordinates the wallet-side state machine, DM messaging between counterparties, and interaction with the `AccountingModule` for invoice import, payment, and verification.
 
-### 1.2 Non-Goals
+### 1.2 Protocol Versions
+
+The swap module supports two protocol versions:
+
+| Version | Description | Escrow trust model |
+|---------|-------------|-------------------|
+| **v1** (legacy) | Proposer announces to escrow after receiving acceptance DM. No cryptographic consent proofs. | Escrow trusts that the announcing party is legitimate. |
+| **v2** (signed) | Both parties sign a consent message. The acceptor announces directly to the escrow with both signatures. The escrow verifies both signatures before creating the swap record. | Escrow cryptographically verifies consent from both parties. |
+
+Protocol version is determined at proposal time. When `proposeSwap()` is called, the implementation always builds a v2 manifest (with `escrow_address` and `protocol_version: 2` in the manifest) and signs the proposal. The `SwapRef.protocolVersion` field records which version is in use.
+
+### 1.3 Non-Goals
 
 - **Escrow logic duplication.** The module does not validate deposits, compute coverage, manage timeouts authoritatively, or execute payouts. Those responsibilities belong to the escrow service.
 - **Price discovery or order matching.** The module does not find counterparties or negotiate exchange rates. Deal terms arrive fully specified from the application layer.
 - **Multi-party swaps.** The current design supports exactly two parties (A and B). Multi-leg swaps require a different protocol.
 - **Cross-chain swaps.** Both sides of the swap use L3 tokens on the Unicity network. L1 (ALPHA) swaps are out of scope.
 
-### 1.3 Relationship to AccountingModule
+### 1.4 Relationship to AccountingModule
 
 The `SwapModule` is a **consumer** of the `AccountingModule`, not an extension. It uses the following AccountingModule APIs:
 
@@ -55,14 +66,14 @@ The `SwapModule` is a **consumer** of the `AccountingModule`, not an extension. 
 
 The `SwapModule` does not create invoices, close invoices, or manage auto-return. Those operations are performed by the escrow service on its own `AccountingModule` instance.
 
-### 1.4 Relationship to Escrow Service
+### 1.5 Relationship to Escrow Service
 
 The `SwapModule` communicates with the escrow service exclusively via NIP-17 encrypted DMs through `CommunicationsModule`. The escrow service's DM protocol is defined in [`escrow-service/docs/protocol-spec.md`](../../escrow-service/docs/protocol-spec.md).
 
-Messages sent to the escrow: `announce`, `status`, `request_invoice`.
+Messages sent to the escrow: `announce` (v1 and v2), `status`, `request_invoice`, `cancel`.
 Messages received from the escrow: `announce_result`, `invoice_delivery`, `status_result`, `payment_confirmation`, `swap_cancelled`, `bounce_notification`, `error`.
 
-The `SwapModule` also exchanges peer-to-peer DMs with the counterparty wallet for proposal negotiation (`swap_proposal`, `swap_acceptance`, `swap_rejection`). These messages are NOT sent to the escrow.
+The `SwapModule` also exchanges peer-to-peer DMs with the counterparty wallet for proposal negotiation (`swap_proposal` v1/v2, `swap_acceptance` v1/v2, `swap_rejection`). These messages are NOT sent to the escrow.
 
 ---
 
@@ -114,6 +125,80 @@ interface SwapDeal {
 // =============================================================================
 
 /**
+ * The 8+ manifest fields used for swap_id computation (without swap_id).
+ * Passed to computeSwapId() for SHA-256(JCS(fields)) hashing.
+ * Field names use snake_case to match the escrow's wire format exactly.
+ *
+ * For v1: 8 fields (the 7 core fields + salt).
+ * For v2: 10 fields (same 8 + escrow_address + protocol_version).
+ *
+ * The `!== undefined` check (not truthiness) determines whether v2 fields
+ * are included in the hash.
+ */
+interface ManifestFields {
+  /** Party A's resolved DIRECT:// address */
+  readonly party_a_address: string;
+  /** Party B's resolved DIRECT:// address */
+  readonly party_b_address: string;
+  /** Coin ID party A deposits */
+  readonly party_a_currency_to_change: string;
+  /** Amount party A deposits (positive integer string) */
+  readonly party_a_value_to_change: string;
+  /** Coin ID party B deposits */
+  readonly party_b_currency_to_change: string;
+  /** Amount party B deposits (positive integer string) */
+  readonly party_b_value_to_change: string;
+  /** Timeout in seconds (integer, [60, 86400]) */
+  readonly timeout: number;
+  /** Random salt ensuring unique swap_id even for identical deal terms (32 lowercase hex chars) */
+  readonly salt: string;
+  /** Escrow DIRECT:// address (v2, required when protocol_version === 2) */
+  readonly escrow_address?: string;
+  /** Protocol version (v2: 2, absent for v1) */
+  readonly protocol_version?: number;
+}
+
+/**
+ * Signatures from both parties over the swap consent message.
+ * Each signature is a 130-char hex string (v + r + s) produced by
+ * signMessage() over "swap_consent:{swapId}:{escrowAddress}".
+ */
+interface ManifestSignatures {
+  /** Party A's consent signature (130-char hex) */
+  readonly party_a?: string;
+  /** Party B's consent signature (130-char hex) */
+  readonly party_b?: string;
+}
+
+/**
+ * Nametag binding proof -- proves that the nametag owner authorized
+ * the DIRECT:// address for this swap. The signature covers
+ * "nametag_bind:{nametag}:{directAddress}:{swapId}".
+ */
+interface NametagBindingProof {
+  /** The human-readable nametag (without @) */
+  readonly nametag: string;
+  /** The party's resolved DIRECT:// address */
+  readonly direct_address: string;
+  /** The party's 33-byte compressed chain pubkey (hex) */
+  readonly chain_pubkey: string;
+  /** 130-char hex signature over the binding message */
+  readonly signature: string;
+}
+
+/**
+ * Auxiliary manifest data (nametag bindings).
+ * Not part of swap_id hash -- carried alongside the manifest
+ * for UI enrichment and nametag verification.
+ */
+interface ManifestAuxiliary {
+  /** Nametag binding proof for party A */
+  readonly party_a_binding?: NametagBindingProof;
+  /** Nametag binding proof for party B */
+  readonly party_b_binding?: NametagBindingProof;
+}
+
+/**
  * The swap manifest -- wire format submitted to the escrow service.
  * All addresses are resolved to DIRECT:// before construction.
  * The swap_id is a content-addressed hash ensuring manifest integrity.
@@ -138,6 +223,12 @@ interface SwapManifest {
   readonly party_b_value_to_change: string;
   /** Timeout in seconds (integer, [60, 86400]) */
   readonly timeout: number;
+  /** Random salt ensuring unique swap_id even for identical deal terms (32 lowercase hex chars) */
+  readonly salt: string;
+  /** Escrow DIRECT:// address (v2, required when protocol_version === 2) */
+  readonly escrow_address?: string;
+  /** Protocol version (v2: 2, absent for v1) */
+  readonly protocol_version?: number;
 }
 ```
 
@@ -156,8 +247,8 @@ interface SwapManifest {
  *
  * The client-side progress is a simplified projection:
  *
- *   proposed → accepted → announced → depositing → awaiting_counter
- *     → concluding → completed
+ *   proposed -> accepted -> announced -> depositing -> awaiting_counter
+ *     -> concluding -> completed
  *
  * Terminal states: completed, cancelled, failed
  *
@@ -184,17 +275,20 @@ type SwapRole = 'proposer' | 'acceptor';
 /**
  * Valid SwapProgress transitions.
  * Used by the internal state guard to prevent illegal transitions.
+ *
+ * NOTE: `proposed` can transition directly to `announced` (v2: escrow's
+ * announce_result may arrive before the acceptance DM from the counterparty).
  */
-const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, Set<SwapProgress>> = {
-  proposed:         new Set(['accepted', 'cancelled', 'failed']),
-  accepted:         new Set(['announced', 'cancelled', 'failed']),
-  announced:        new Set(['depositing', 'cancelled', 'failed']),
-  depositing:       new Set(['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed']),
-  awaiting_counter: new Set(['concluding', 'completed', 'cancelled', 'failed']),
-  concluding:       new Set(['completed', 'cancelled', 'failed']),
-  completed:        new Set([]),  // terminal
-  cancelled:        new Set([]),  // terminal
-  failed:           new Set([]),  // terminal
+const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, readonly SwapProgress[]> = {
+  proposed:         ['accepted', 'announced', 'cancelled', 'failed'],
+  accepted:         ['announced', 'cancelled', 'failed'],
+  announced:        ['depositing', 'cancelled', 'failed'],
+  depositing:       ['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed'],
+  awaiting_counter: ['concluding', 'completed', 'cancelled', 'failed'],
+  concluding:       ['completed', 'cancelled', 'failed'],
+  completed:        [],  // terminal
+  cancelled:        [],  // terminal
+  failed:           [],  // terminal
 };
 
 const TERMINAL_PROGRESS: ReadonlySet<SwapProgress> = new Set([
@@ -246,15 +340,30 @@ interface SwapRef {
    */
   escrowState?: string;
   /**
-   * Counterparty's chain pubkey (33-byte compressed secp256k1).
-   * Resolved during proposal or acceptance. Used for DM addressing.
+   * Counterparty's transport pubkey (HKDF-derived, 64-hex).
+   * Set from dm.senderPubkey on incoming proposals, or resolved from
+   * PeerInfo.transportPubkey on outgoing proposals. Used for DM sender
+   * verification on acceptance/rejection messages.
    */
   counterpartyPubkey?: string;
+  /** Human-readable nametag of the counterparty (e.g., 'alice', 'bob'), if known. */
+  counterpartyNametag?: string;
   /**
    * Transfer ID of the local deposit payment (from TransferResult.id).
    * Used to correlate invoice:payment events with the local deposit.
    */
   localDepositTransferId?: string;
+  /**
+   * Transport pubkey of the resolved escrow service (HKDF-derived, 64-hex).
+   * Stored after escrow resolution so that incoming escrow DMs can be
+   * authenticated by comparing dm.senderPubkey against this field.
+   */
+  escrowPubkey?: string;
+  /**
+   * DIRECT:// address of the resolved escrow service.
+   * Used for deposit invoice term verification (target address check).
+   */
+  escrowDirectAddress?: string;
   /**
    * Whether the payout invoice has been verified (correct terms, covered).
    * Set to true by verifyPayout() after successful verification.
@@ -268,6 +377,16 @@ interface SwapRef {
   updatedAt: number;
   /** Error message if progress is 'failed' */
   error?: string;
+  /** Proposer's chain pubkey (33-byte compressed hex, from v2 proposal DM) */
+  readonly proposerChainPubkey?: string;
+  /** Proposer's signature over swap consent message (130-char hex) */
+  readonly proposerSignature?: string;
+  /** Acceptor's signature over swap consent message (130-char hex) */
+  readonly acceptorSignature?: string;
+  /** Auxiliary data (nametag bindings) */
+  readonly auxiliary?: ManifestAuxiliary;
+  /** Protocol version (2 for v2, undefined for v1) */
+  readonly protocolVersion?: number;
 }
 ```
 
@@ -275,7 +394,7 @@ interface SwapRef {
 
 ```typescript
 // =============================================================================
-// Peer-to-Peer DM Messages (wallet ↔ wallet)
+// Peer-to-Peer DM Messages (wallet <-> wallet)
 // =============================================================================
 
 /**
@@ -288,30 +407,44 @@ interface SwapRef {
 interface SwapProposalMessage {
   /** Discriminator */
   readonly type: 'swap_proposal';
-  /** Protocol version (always 1 for forward compatibility) */
-  readonly version: 1;
+  /** Protocol version (1 = legacy, 2 = signed) */
+  readonly version: 1 | 2;
   /** The swap manifest (wire format, addresses already resolved) */
   readonly manifest: SwapManifest;
   /** Escrow service address (@nametag or DIRECT://) */
   readonly escrow: string;
   /** Optional human-readable description of the deal */
   readonly message?: string;
+  /** Proposer's consent signature over "swap_consent:{swap_id}:{escrow_address}" (v2 only, 130 hex chars) */
+  readonly proposer_signature?: string;
+  /** Proposer's 33-byte compressed chain pubkey (v2 only, 66 hex chars) */
+  readonly proposer_chain_pubkey?: string;
+  /** Nametag binding proofs (v2 only) */
+  readonly auxiliary?: ManifestAuxiliary;
 }
 
 /**
  * Swap acceptance DM -- sent from acceptor to proposer.
  * Signals that the acceptor agrees to the deal terms and is ready
- * to proceed. The acceptor will announce the manifest to the escrow.
+ * to proceed.
+ *
+ * In v1: The proposer announces the manifest to the escrow upon receipt.
+ * In v2: Informational only -- the acceptor announces directly to the escrow
+ * with both signatures. The proposer waits for the escrow's announce_result.
  *
  * Wire format: `swap_acceptance:` prefix + JSON.stringify(SwapAcceptanceMessage)
  */
 interface SwapAcceptanceMessage {
   /** Discriminator */
   readonly type: 'swap_acceptance';
-  /** Protocol version */
-  readonly version: 1;
+  /** Protocol version (1 = legacy, 2 = signed) */
+  readonly version: 1 | 2;
   /** Swap ID confirming which proposal is being accepted */
   readonly swap_id: string;
+  /** Acceptor's consent signature over "swap_consent:{swap_id}:{escrow_address}" (v2 only, 130 hex chars) */
+  readonly acceptor_signature?: string;
+  /** Acceptor's 33-byte compressed chain pubkey (v2 only, 66 hex chars) */
+  readonly acceptor_chain_pubkey?: string;
 }
 
 /**
@@ -338,13 +471,22 @@ The escrow DM protocol types are defined in the escrow service specification. Th
 
 | Inbound from Escrow | Fields Used by SwapModule |
 |---|---|
-| `announce_result` | `swap_id`, `state`, `deposit_invoice_id`, `is_new` |
+| `announce_result` | `swap_id`, `state`, `deposit_invoice_id`, `is_new`, `created_at` |
 | `invoice_delivery` | `swap_id`, `invoice_type`, `invoice_id`, `invoice_token`, `payment_instructions` |
-| `status_result` | `swap_id`, `state`, `deposit_status`, `payout_a_invoice_id`, `payout_b_invoice_id` |
-| `payment_confirmation` | `swap_id`, `payout_invoice_id`, `currency`, `amount`, `status` |
+| `status_result` | `swap_id`, `state`, plus extensible extra fields |
+| `payment_confirmation` | `swap_id`, `party`, plus extensible extra fields |
 | `swap_cancelled` | `swap_id`, `reason`, `deposits_returned` |
 | `bounce_notification` | `swap_id`, `reason`, `returned_amount`, `returned_currency` |
-| `error` | `error`, `details` |
+| `error` | `error`, `swap_id?`, `details?` |
+
+**Outbound to Escrow:**
+
+| Outbound to Escrow | Description | v1 | v2 |
+|---|---|---|---|
+| `announce` | Submit manifest to escrow | `{ type: 'announce', manifest }` | `{ type: 'announce', version: 2, manifest, signatures, chain_pubkeys, auxiliary? }` |
+| `status` | Query current swap state | `{ type: 'status', swap_id }` | Same |
+| `request_invoice` | Request (re-)delivery of invoice token | `{ type: 'request_invoice', swap_id, invoice_type }` | Same |
+| `cancel` | Request cancellation and deposit return | `{ type: 'cancel', swap_id, reason }` | Same |
 
 ### 2.6 Result Types
 
@@ -366,19 +508,19 @@ interface SwapProposalResult {
 }
 
 /**
- * Options for getSwapStatus().
- */
-interface GetSwapStatusOptions {
-  /** If true, send a 'status' DM to the escrow and merge the response. Default: false for terminal swaps, true for active swaps. */
-  readonly queryEscrow?: boolean;
-}
-
-/**
  * Options for proposeSwap().
  */
 interface ProposeSwapOptions {
   /** Human-readable message sent to the counterparty in the proposal DM. */
   readonly message?: string;
+}
+
+/**
+ * Options for getSwapStatus().
+ */
+interface GetSwapStatusOptions {
+  /** If true, send a 'status' DM to the escrow and merge the response. Default: false for terminal swaps, true for active swaps. */
+  readonly queryEscrow?: boolean;
 }
 
 /**
@@ -419,7 +561,7 @@ type SwapEventType =
   | 'swap:deposit_returned'
   | 'swap:bounce_received';
 
-// Event payloads — these extend SphereEventMap:
+// Event payloads -- these extend SphereEventMap:
 
 interface SwapEventMap {
   /**
@@ -572,7 +714,7 @@ interface SwapEventMap {
 
   /**
    * A bounce notification was received from the escrow (wrong currency deposit).
-   * Informational — the tokens were already returned.
+   * Informational -- the tokens were already returned.
    */
   'swap:bounce_received': {
     readonly swapId: string;
@@ -599,14 +741,14 @@ interface SwapEventMap {
  */
 interface SwapModuleConfig {
   /** Enable debug logging */
-  debug?: boolean;
+  readonly debug?: boolean;
   /**
    * Pre-configured escrow address (@nametag or DIRECT://).
    * Used as the default when SwapDeal.escrowAddress is omitted.
    * At least one of this or SwapDeal.escrowAddress must be provided
    * for any swap operation.
    */
-  defaultEscrowAddress?: string;
+  readonly defaultEscrowAddress?: string;
   /**
    * Time to wait for the counterparty to accept or reject a proposal (ms).
    * After this timeout, the proposal is marked as 'failed' locally.
@@ -616,7 +758,7 @@ interface SwapModuleConfig {
    * deliverable on Nostr indefinitely -- the counterparty could still
    * respond after this timeout. Late responses are ignored.
    */
-  proposalTimeoutMs?: number;
+  readonly proposalTimeoutMs?: number;
   /**
    * Maximum number of non-terminal swaps tracked simultaneously.
    * Prevents unbounded memory growth from DM spam.
@@ -625,48 +767,72 @@ interface SwapModuleConfig {
    * When the limit is reached, new proposals (both outgoing and incoming)
    * are rejected with SWAP_LIMIT_EXCEEDED.
    */
-  maxPendingSwaps?: number;
+  readonly maxPendingSwaps?: number;
   /**
    * Time to wait for the escrow's announce_result DM after announcing (ms).
    * After this timeout, the announce is considered failed.
    * Default: 30000 (30 seconds).
    */
-  announceTimeoutMs?: number;
+  readonly announceTimeoutMs?: number;
   /**
    * TTL for terminal swap records before they are purged from storage (ms).
    * Completed, cancelled, and failed swaps older than this TTL are removed
    * during load() to prevent unbounded storage growth.
    * Default: 604800000 (7 days).
    */
-  terminalPurgeTtlMs?: number;
+  readonly terminalPurgeTtlMs?: number;
 }
 
 /**
  * Dependencies injected into SwapModule.
  * Follows the same pattern as AccountingModuleDependencies.
+ * Each external module is represented by a narrow interface containing
+ * only the methods the SwapModule actually calls.
  */
 interface SwapModuleDependencies {
-  /** AccountingModule instance (for invoice import, payment, status) */
-  accounting: AccountingModule;
-  /** CommunicationsModule instance (for DM send/receive) */
-  communications: CommunicationsModule;
-  /** Current wallet identity */
-  identity: FullIdentity;
-  /** General storage for persistent swap records */
-  storage: StorageProvider;
-  /** Event emitter (from Sphere) */
-  emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
-  /** PaymentsModule for L3 token validation during payout verification */
+  /**
+   * AccountingModule subset -- invoice import, lookup, status, payment,
+   * and event subscription. Used for deposit invoice import, deposit
+   * payment, and payout verification.
+   */
+  readonly accounting: {
+    importInvoice(token: unknown): Promise<unknown>;
+    getInvoice(invoiceId: string): unknown | null;
+    getInvoiceStatus(invoiceId: string): unknown;
+    payInvoice(invoiceId: string, params: unknown): Promise<TransferResult>;
+    on<T extends SphereEventType>(type: T, handler: (data: SphereEventMap[T]) => void): () => void;
+  };
+  /**
+   * PaymentsModule subset -- L3 token validation during payout verification.
+   */
   readonly payments: {
     validate(): Promise<{ valid: Token[]; invalid: Token[] }>;
   };
   /**
+   * CommunicationsModule subset -- DM send/receive for peer and escrow messaging.
+   */
+  readonly communications: {
+    sendDM(recipientPubkey: string, content: string): Promise<{ eventId: string }>;
+    onDirectMessage(handler: (message: {
+      readonly senderPubkey: string;
+      readonly senderNametag?: string;
+      readonly content: string;
+      readonly timestamp: number;
+    }) => void): () => void;
+  };
+  /** General storage for persistent swap records */
+  readonly storage: StorageProvider;
+  /** Current wallet identity */
+  readonly identity: FullIdentity;
+  /** Event emitter (from Sphere) */
+  readonly emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /**
    * Transport-level peer resolution.
    * Used to resolve @nametag and chain pubkey addresses to DIRECT:// and PeerInfo.
    */
-  resolve: (identifier: string) => Promise<PeerInfo | null>;
+  readonly resolve: (identifier: string) => Promise<PeerInfo | null>;
   /** All tracked wallet addresses (for determining party role) */
-  getActiveAddresses: () => TrackedAddress[];
+  readonly getActiveAddresses: () => TrackedAddress[];
 }
 ```
 
@@ -685,6 +851,17 @@ interface SwapStorageData {
   readonly version: 1;
   readonly swap: SwapRef;
 }
+
+/**
+ * Index entry for the swap_index key.
+ * Lightweight summary for listing/filtering without loading full records.
+ */
+interface SwapIndexEntry {
+  readonly swapId: string;
+  readonly progress: SwapProgress;
+  readonly role: SwapRole;
+  readonly createdAt: number;
+}
 ```
 
 ---
@@ -699,7 +876,7 @@ interface SwapStorageData {
  * Follows the same factory pattern as createAccountingModule().
  *
  * @param config - Module configuration
- * @returns Object with { module, initialize } — call initialize() after construction
+ * @returns Object with { module, initialize } -- call initialize() after construction
  */
 function createSwapModule(config?: SwapModuleConfig): {
   module: SwapModule;
@@ -710,15 +887,16 @@ function createSwapModule(config?: SwapModuleConfig): {
 ### 3.2 Constructor
 
 ```typescript
-constructor(config: SwapModuleConfig)
+constructor(config?: SwapModuleConfig)
 ```
 
 The constructor stores configuration only. No I/O, no subscriptions, no storage access. The module is inert until `initialize()` is called.
 
 Internal state initialized:
 - `swaps: Map<string, SwapRef>` -- empty
-- `swapGates: Map<string, Promise<void>>` -- per-swap mutex chains (empty)
+- `terminalSwapIds: Set<string>` -- empty (dedup set for rejected/cancelled/failed swaps)
 - `localTimers: Map<string, ReturnType<typeof setTimeout>>` -- empty
+- `invoiceToSwapIndex: Map<string, string>` -- empty (invoiceId -> swapId reverse index)
 - `destroyed: boolean` -- false
 - `loaded: boolean` -- false
 
@@ -728,7 +906,7 @@ Internal state initialized:
 initialize(deps: SwapModuleDependencies): void
 ```
 
-Stores dependency references. Does NOT load data or subscribe to events. Called by `Sphere` immediately after factory construction, before `load()`.
+Stores dependency references. Resets the `destroyed` flag (allowing re-initialization after destroy, e.g., for `switchToAddress()`). Does NOT load data or subscribe to events. Called by `Sphere` immediately after factory construction, before `load()`.
 
 ### 3.4 load()
 
@@ -736,25 +914,38 @@ Stores dependency references. Does NOT load data or subscribe to events. Called 
 async load(): Promise<void>
 ```
 
-Called by `Sphere` after all modules are initialized. Steps:
+Called by `Sphere` after all modules are initialized. Re-entrant safe: concurrent `load()` calls share the same promise. Steps:
 
-1. **Load persisted swap records** from storage. Read the `swap_index` key, then load each non-terminal swap record from its per-swap key (`swap:{swapId}`). See [section 14.4](#144-load-pattern) for details.
+1. **Clear in-memory state** (`swaps`, `terminalSwapIds`, `invoiceToSwapIndex`). Set `loaded = false`.
 
-2. **Clean up stale proposals.** For each swap with `progress === 'proposed'`:
-   - If `role === 'proposer'` and `Date.now() - createdAt > config.proposalTimeoutMs`: transition to `'failed'` with error `'Proposal timed out'`.
+2. **Load persisted swap records** from storage. Read the `swap_index` key, then load each non-terminal swap record from its per-swap key (`swap:{swapId}`). Purge terminal swap records older than `terminalPurgeTtlMs`. See [section 14.4](#144-load-pattern) for details.
+
+3. **Clean up stale proposals.** For each swap with `progress === 'proposed'`:
+   - If `role === 'proposer'` and `Date.now() - createdAt > config.proposalTimeoutMs`: transition to `'failed'` with error `'Proposal timed out'`. Track as terminal.
    - If `role === 'acceptor'`: leave as-is (the user may not have seen it yet).
+   - Remove failed proposals from the in-memory `swaps` map (they are terminal).
 
-3. **Register DM handler.** Subscribe to `CommunicationsModule.onDirectMessage()` for incoming swap-related and escrow-related DMs. The handler dispatches by message type prefix:
+4. **Register DM handler.** Subscribe to `CommunicationsModule.onDirectMessage()` for incoming swap-related and escrow-related DMs. The handler dispatches by message type prefix:
    - `swap_proposal:` -- see [section 12.1](#121-swap_proposal-received)
    - `swap_acceptance:` -- see [section 12.2](#122-swap_acceptance-received)
    - `swap_rejection:` -- see [section 12.3](#123-swap_rejection-received)
    - JSON objects with `type` field (`announce_result`, `invoice_delivery`, `status_result`, `payment_confirmation`, `swap_cancelled`, `bounce_notification`, `error`) -- see [section 12.4](#124-escrow-dm-processing)
 
-4. **Subscribe to invoice events.** For each swap with a `depositInvoiceId` or `payoutInvoiceId`, subscribe to relevant `AccountingModule` events. See [section 13](#13-invoice-event-subscriptions).
+5. **Subscribe to invoice events.** See [section 13](#13-invoice-event-subscriptions).
 
-5. **Start local timers.** For each swap in `'announced'`, `'depositing'`, or `'awaiting_counter'` progress, start a local timeout timer. See [section 16](#16-local-timeout-management).
+6. **Rebuild invoiceToSwapIndex.** For each swap with `depositInvoiceId` or `payoutInvoiceId`, populate the reverse index.
 
-6. **Set `loaded = true`.**
+7. **Start local timers.** For each non-terminal swap, resume local timeout timers. See [section 16](#16-local-timeout-management).
+
+8. **Crash recovery** (fire-and-forget per swap). For each non-terminal swap, perform state-specific recovery:
+   - `accepted` (v2 proposer): send status query (Bob already announced).
+   - `accepted` (v2 acceptor): re-announce with v2 format (both signatures).
+   - `accepted` (v1): re-announce with v1 format.
+   - `announced` / `depositing`: send status query + request deposit invoice if missing.
+   - `awaiting_counter`: send status query.
+   - `concluding`: send status query + request payout invoice if missing.
+
+9. **Set `loaded = true`.**
 
 ### 3.5 destroy()
 
@@ -770,9 +961,9 @@ Cleanup sequence:
 
 3. **Clear all local timers** (`localTimers.forEach(clearTimeout)`).
 
-4. **Await in-flight gate operations.** For each entry in `swapGates`, await the current promise chain tail. This drains any queued mutations.
+4. **Await in-flight gate operations.** Drain all entries in the `AsyncGateMap`. This serializes any queued mutations.
 
-5. **Persist dirty state.** Write the current `swaps` map to storage. This is a final-flush -- individual state transitions also persist (persist-before-act), so this is a safety net for any in-flight changes captured in step 4.
+5. **Persist dirty state.** Write the current swap index to storage as a safety net.
 
 ---
 
@@ -794,7 +985,7 @@ async proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapPro
 3. **Resolve escrow address.**
    - `escrowAddress = deal.escrowAddress ?? config.defaultEscrowAddress`
    - If neither is set, throw `SWAP_INVALID_DEAL` with message `'No escrow address: provide deal.escrowAddress or configure defaultEscrowAddress'`.
-   - Resolve via `deps.resolve(escrowAddress)` to obtain the escrow's DIRECT:// address.
+   - Resolve via `deps.resolve(escrowAddress)` to obtain the escrow's DIRECT:// address and transport pubkey.
    - If resolution fails (returns `null`), throw `SWAP_RESOLVE_FAILED` with message `'Cannot resolve escrow address: {escrowAddress}'`.
 
 4. **Resolve party addresses.**
@@ -813,73 +1004,90 @@ async proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapPro
    - Count non-terminal swaps in `this.swaps`.
    - If `count >= config.maxPendingSwaps`, throw `SWAP_LIMIT_EXCEEDED`.
 
-7. **Build SwapManifest.**
+7. **Build SwapManifest (v2).**
+   The manifest always includes the escrow's resolved DIRECT:// address and `protocol_version: 2`. A random salt (32 lowercase hex chars via `randomHex(16)`) is generated to ensure unique swap_id even for identical deal terms.
    ```typescript
-   const manifestFields: ManifestFields = {
-     party_a_address: resolvedPartyA,
-     party_b_address: resolvedPartyB,
-     party_a_currency_to_change: deal.partyACurrency,
-     party_a_value_to_change: deal.partyAAmount,
-     party_b_currency_to_change: deal.partyBCurrency,
-     party_b_value_to_change: deal.partyBAmount,
-     timeout: deal.timeout,
-   };
-   const swapId = computeSwapId(manifestFields);
-   const manifest: SwapManifest = { swap_id: swapId, ...manifestFields };
+   const manifest = buildManifest(
+     resolvedPartyA, resolvedPartyB, deal, deal.timeout, escrowPeer.directAddress,
+   );
+   // manifest includes: party_a_address, party_b_address, currencies, amounts,
+   //   timeout, salt, escrow_address, protocol_version: 2, swap_id (computed)
    ```
 
-8. **Check for duplicate (idempotent).**
+8. **Sign the swap manifest (v2).**
+   ```typescript
+   const proposerSignature = signSwapManifest(
+     deps.identity.privateKey, manifest.swap_id, escrowPeer.directAddress,
+   );
+   // Signs "swap_consent:{swapId}:{escrowAddress}" -> 130-char hex (v+r+s)
+   ```
+
+9. **Create nametag binding (v2, optional).**
+   If the proposer's original address in the deal was a `@nametag`, create a `NametagBindingProof`:
+   ```typescript
+   const binding = createNametagBinding(
+     privateKey, nametag, directAddress, swapId, chainPubkey,
+   );
+   // Signs "nametag_bind:{nametag}:{directAddress}:{swapId}"
+   ```
+   Stored in `auxiliary.party_a_binding` or `auxiliary.party_b_binding` depending on which party the proposer is.
+
+10. **Check for duplicate (idempotent).**
    - If `this.swaps.has(swapId)`, return the existing `SwapProposalResult` without sending a duplicate DM or creating a new record. This makes `proposeSwap()` safe to retry.
+   - If `swapId` is in `terminalSwapIds`, remove it (allow re-proposing a previously rejected/cancelled/failed swap).
 
-9. **Create SwapRef.**
-   ```typescript
-   const swap: SwapRef = {
-     swapId,
-     deal,
-     manifest,
-     role,
-     progress: 'proposed',
-     counterpartyPubkey: counterpartyPeerInfo.chainPubkey,
-     payoutVerified: false,
-     createdAt: Date.now(),
-     updatedAt: Date.now(),
-   };
-   ```
-
-10. **Persist** (persist-before-act): write `SwapRef` to the `swaps` map and persist to storage.
-
-11. **Send proposal DM** to the counterparty.
+11. **Create SwapRef.**
     ```typescript
-    const proposalMsg: SwapProposalMessage = {
-      type: 'swap_proposal',
-      version: 1,
+    const swap: SwapRef = {
+      swapId,
+      deal,
       manifest,
-      escrow: escrowAddress,
-      message: options?.message,
+      role: 'proposer',
+      progress: 'proposed',
+      counterpartyPubkey,
+      counterpartyNametag,
+      escrowPubkey,
+      escrowDirectAddress,
+      payoutVerified: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      proposerSignature,
+      proposerChainPubkey: deps.identity.chainPubkey,
+      auxiliary,
+      protocolVersion: 2,
     };
-    const dmContent = `swap_proposal:${JSON.stringify(proposalMsg)}`;
+    ```
+
+12. **Persist** (persist-before-act): write `SwapRef` to the `swaps` map and persist to storage.
+
+13. **Send proposal DM (v2)** to the counterparty.
+    ```typescript
+    const dmContent = buildProposalDM_v2(
+      manifest, escrowAddress, proposerSignature,
+      deps.identity.chainPubkey, auxiliary, options?.message,
+    );
     await deps.communications.sendDM(counterpartyPubkey, dmContent);
     ```
     - If the DM send fails, transition to `'failed'`, persist, and throw `SWAP_DM_SEND_FAILED`.
 
-12. **Start proposal timeout timer.**
+14. **Start proposal timeout timer.**
     ```typescript
     const timer = setTimeout(() => {
       this.withSwapGate(swapId, async () => {
         const s = this.swaps.get(swapId);
         if (s && s.progress === 'proposed') {
           s.progress = 'failed';
-          s.error = 'Proposal timed out — no response from counterparty';
+          s.error = 'Proposal timed out -- no response from counterparty';
           s.updatedAt = Date.now();
-          await this.persist();
+          await this.persistSwap(s);
           deps.emitEvent('swap:failed', { swapId, error: s.error });
         }
       });
     }, config.proposalTimeoutMs ?? 300000);
-    this.localTimers.set(`proposal:${swapId}`, timer);
+    this.localTimers.set(swapId, timer);
     ```
 
-13. **Emit event.**
+15. **Emit event.**
     ```typescript
     deps.emitEvent('swap:proposed', {
       swapId,
@@ -888,7 +1096,7 @@ async proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapPro
     });
     ```
 
-14. **Return result.**
+16. **Return result.**
     ```typescript
     return { swapId, manifest, swap };
     ```
@@ -913,40 +1121,63 @@ async acceptSwap(swapId: string): Promise<void>
    - If `swap.progress !== 'proposed'`, throw `SWAP_WRONG_STATE` with message `'Cannot accept: swap is in {swap.progress} state'`.
    - If `swap.role !== 'acceptor'`, throw `SWAP_WRONG_STATE` with message `'Cannot accept: you are the proposer, not the acceptor'`.
 
-3. **Enter per-swap gate** (`withSwapGate(swapId, ...)`). All remaining steps execute inside the gate.
+3. **Enter per-swap gate** (`withSwapGate(swapId, ...)`). All remaining steps execute inside the gate. Re-check state inside gate (TOCTOU safety).
 
-4. **Send acceptance DM** to the proposer.
-   ```typescript
-   const acceptMsg: SwapAcceptanceMessage = {
-     type: 'swap_acceptance',
-     version: 1,
-     swap_id: swapId,
-   };
-   await deps.communications.sendDM(swap.counterpartyPubkey!, `swap_acceptance:${JSON.stringify(acceptMsg)}`);
-   ```
-   - On failure: throw `SWAP_DM_SEND_FAILED`. Do NOT change progress (the user can retry).
+4. **Transition to 'accepted'.** (persist-before-act)
 
-5. **Transition to 'accepted'.** Update `swap.progress = 'accepted'`, `swap.updatedAt = Date.now()`. Persist.
+5. **Protocol-specific flow:**
 
-6. **Emit `swap:accepted`** event.
+   **v2 path** (`swap.protocolVersion === 2`):
 
-7. **Announce manifest to escrow.**
-   - Resolve the escrow's transport pubkey from the stored `deal.escrowAddress` (or `config.defaultEscrowAddress`).
-   - Send `announce` DM to escrow:
-     ```typescript
-     const announceMsg = { type: 'announce', manifest: swap.manifest };
-     await deps.communications.sendDM(escrowPubkey, JSON.stringify(announceMsg));
-     ```
-   - On failure: transition to `'failed'` with error `'Failed to send announce to escrow'`. Persist. Emit `swap:failed`. Return.
+   a. **Sign the swap manifest.** Use `manifest.escrow_address` (locked at proposal time) as the escrow address for the consent message:
+      ```typescript
+      const acceptorSignature = signSwapManifest(
+        deps.identity.privateKey, swap.manifest.swap_id, escrowAddressForSignature,
+      );
+      ```
 
-8. **Wait for `announce_result` DM** from the escrow.
-   - This is handled asynchronously by the DM handler (section 12.4). The `acceptSwap()` method does NOT block waiting for the result. The DM handler will:
-     - Parse the `announce_result` and update `swap.depositInvoiceId` and `swap.progress = 'announced'`.
-     - Import the deposit invoice token via `deps.accounting.importInvoice()`.
-     - Emit `swap:announced`.
-   - If the escrow responds with an `error` DM instead, the DM handler transitions to `'failed'`.
+   b. **Create nametag binding (optional).** If the acceptor has a nametag, create a `NametagBindingProof` and merge into the existing auxiliary data.
 
-> **Design note:** The `acceptSwap()` method returns after sending the announce DM. The remaining steps (invoice import, state transition to 'announced') happen asynchronously when the escrow responds. This keeps the API non-blocking and consistent with the event-driven DM model.
+   c. **Store acceptor signature and auxiliary.** Persist to storage.
+
+   d. **Send acceptance DM (v2) to proposer** (best-effort -- in v2, the acceptance DM is informational):
+      ```typescript
+      const acceptDM = buildAcceptanceDM_v2(swapId, acceptorSignature, deps.identity.chainPubkey);
+      await deps.communications.sendDM(swap.counterpartyPubkey, acceptDM);
+      ```
+
+   e. **Emit `swap:accepted`.**
+
+   f. **Announce directly to escrow (v2).** The acceptor sends the v2 announce DM with both party signatures and chain pubkeys:
+      ```typescript
+      const signatures: ManifestSignatures = {
+        party_a: weArePartyA ? acceptorSignature : swap.proposerSignature,
+        party_b: weArePartyA ? swap.proposerSignature : acceptorSignature,
+      };
+      const chainPubkeys = {
+        party_a: weArePartyA ? acceptorChainPubkey : proposerChainPubkey,
+        party_b: weArePartyA ? proposerChainPubkey : acceptorChainPubkey,
+      };
+      await sendAnnounce_v2(communications, escrowPubkey, manifest, signatures, chainPubkeys, auxiliary);
+      ```
+      - On announce failure: transition to `'failed'`, emit `swap:failed`, notify proposer via cancel DM (best-effort).
+
+   **v1 path** (`swap.protocolVersion` is undefined or 1):
+
+   a. **Send acceptance DM (v1) to proposer:**
+      ```typescript
+      const acceptDM = buildAcceptanceDM(swapId);
+      await deps.communications.sendDM(swap.counterpartyPubkey, acceptDM);
+      ```
+      - On failure: throw `SWAP_DM_SEND_FAILED`. Do NOT change progress (the user can retry).
+
+   b. **Emit `swap:accepted`.**
+
+   c. **Resolve and store escrow address** (best-effort for crash recovery).
+
+> **Design note (v2):** In v2, the acceptor announces directly to the escrow instead of relying on the proposer. This means the proposer does NOT need to be online after sending the proposal. The proposer learns about the escrow acknowledgment when the escrow's `announce_result` DM arrives asynchronously.
+
+> **Design note (v1):** In v1, the proposer is responsible for announcing to the escrow after receiving the acceptance DM. The `acceptSwap()` method returns after sending the acceptance DM.
 
 ---
 
@@ -961,36 +1192,42 @@ async rejectSwap(swapId: string, reason?: string): Promise<void>
 1. **Guard checks.** Same as acceptSwap (destroyed, loaded).
 
 2. **Look up SwapRef.**
-   - Must exist, `progress === 'proposed'`, `role === 'acceptor'`.
-   - Throw `SWAP_NOT_FOUND` or `SWAP_WRONG_STATE` as appropriate.
+   - Must exist.
+   - Rejection is allowed at any pre-payout state: `proposed`, `accepted`, `announced`, `depositing`, `awaiting_counter`.
+   - Throw `SWAP_WRONG_STATE` if `progress === 'concluding'` (payouts already in progress).
+   - Throw `SWAP_ALREADY_COMPLETED` if `progress === 'completed'`.
+   - Throw `SWAP_ALREADY_CANCELLED` if `progress === 'cancelled'` or `'failed'`.
 
-3. **Enter per-swap gate.**
+3. **Enter per-swap gate.** Re-check state inside gate (TOCTOU safety).
 
-4. **Send rejection DM** to the proposer.
+4. **Send rejection DM** to the counterparty (best-effort -- failure is non-blocking).
    ```typescript
-   const rejectMsg: SwapRejectionMessage = {
-     type: 'swap_rejection',
-     version: 1,
-     swap_id: swapId,
-     reason,
-   };
-   await deps.communications.sendDM(swap.counterpartyPubkey!, `swap_rejection:${JSON.stringify(rejectMsg)}`);
+   const dmContent = buildRejectionDM(swapId, reason);
+   await deps.communications.sendDM(swap.counterpartyPubkey, dmContent);
    ```
-   - On failure: log warning but continue. The rejection is a courtesy notification; the local state change is authoritative.
 
-5. **Transition to 'cancelled'** (not 'failed' -- rejection is a deliberate user action, not an error).
+5. **Notify escrow** (if post-announcement). If the swap is in `announced`, `depositing`, or `awaiting_counter` state and an escrow pubkey is available, send a cancel DM to the escrow to request cancellation and deposit return:
    ```typescript
-   swap.progress = 'cancelled';
-   swap.updatedAt = Date.now();
+   const cancelDM = buildCancelDM(swapId, reason ?? 'Rejected by user');
+   await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
    ```
-   Persist.
 
-6. **Emit `swap:rejected`** event.
+6. **Clear local timer.**
+
+7. **Transition to 'cancelled'** (not 'failed' -- rejection is a deliberate user action, not an error).
+   ```typescript
+   await this.transitionProgress(swap, 'cancelled', { error: reason ?? 'Rejected by user' });
+   ```
+
+8. **Emit `swap:rejected`.**
    ```typescript
    deps.emitEvent('swap:rejected', { swapId, reason });
    ```
 
-7. **Remove the swap from the `swaps` map** (optional -- rejected proposals can be pruned to save storage). Alternatively, retain for history and prune on next `load()` after a configurable retention period.
+9. **Emit `swap:cancelled`.**
+   ```typescript
+   deps.emitEvent('swap:cancelled', { swapId, reason: 'rejected', depositsReturned: false });
+   ```
 
 ---
 
@@ -1010,9 +1247,7 @@ async deposit(swapId: string): Promise<TransferResult>
    - Throw `SWAP_NOT_FOUND` or `SWAP_WRONG_STATE` as appropriate.
    - Must have `depositInvoiceId` set (set during announcement processing). If missing, throw `SWAP_WRONG_STATE` with message `'Deposit invoice not yet available'`.
 
-3. **Enter per-swap gate.**
-
-4. **Determine asset index.**
+3. **Determine asset index.**
    - The deposit invoice has a single target (the escrow's address) with two assets:
      - Asset index 0 = `party_a_currency_to_change` (party A's deposit)
      - Asset index 1 = `party_b_currency_to_change` (party B's deposit)
@@ -1021,23 +1256,24 @@ async deposit(swapId: string): Promise<TransferResult>
      - If we are party A: `assetIndex = 0`.
      - If we are party B: `assetIndex = 1`.
 
+4. **Enter per-swap gate.** Re-check state inside gate (TOCTOU safety).
+
 5. **Call `accounting.payInvoice()`.**
    ```typescript
    const transferResult = await deps.accounting.payInvoice(swap.depositInvoiceId!, {
      targetIndex: 0,      // single-target deposit invoice
      assetIndex,           // 0 for party A, 1 for party B
-     // amount is omitted — SDK computes remaining needed amount
+     // amount is omitted -- SDK computes remaining needed amount
    });
    ```
    - On failure: throw `SWAP_DEPOSIT_FAILED` wrapping the underlying error. Do NOT change progress (the user can retry after resolving the issue, e.g., insufficient balance).
 
 6. **Update state.**
    ```typescript
-   swap.progress = 'depositing';
-   swap.localDepositTransferId = transferResult.id;
-   swap.updatedAt = Date.now();
+   await this.transitionProgress(swap, 'depositing', {
+     localDepositTransferId: transferResult.id,
+   });
    ```
-   Persist.
 
 7. **Emit `swap:deposit_sent`.**
    ```typescript
@@ -1065,20 +1301,14 @@ async getSwapStatus(swapId: string, options?: GetSwapStatusOptions): Promise<Swa
 
 3. **Optionally refresh from escrow.**
    - Determine whether to query: `const shouldQuery = options?.queryEscrow ?? !TERMINAL_PROGRESS.has(swap.progress)`. If `options.queryEscrow` is explicitly set, use that value; otherwise default to `true` for active swaps and `false` for terminal swaps.
-   - If `shouldQuery` is true AND the swap has an escrow address, send a `status` DM to the escrow:
+   - If `shouldQuery` is true AND the swap has an escrow address, send a `status` DM to the escrow (fire-and-forget -- errors are logged but not propagated):
      ```typescript
-     await deps.communications.sendDM(escrowPubkey, JSON.stringify({
-       type: 'status',
-       swap_id: swapId,
-     }));
+     const statusDM = buildStatusQueryDM(swapId);
+     deps.communications.sendDM(escrowTransportPubkey, statusDM);
      ```
    - The `status_result` response is handled asynchronously by the DM handler. The method does NOT block for the response.
-   - The local `SwapRef` is updated when the `status_result` arrives (see [section 12.4](#124-escrow-dm-processing)).
 
-4. **Return a copy** of the current `SwapRef`.
-   ```typescript
-   return { ...swap };
-   ```
+4. **Return a deep copy** of the current `SwapRef` (prevents external mutation of internal state).
 
 > **Design note:** `getSwapStatus()` is async to support the optional escrow query, but it returns immediately with the current local state. Applications that need the freshest escrow state should call `getSwapStatus()` and then listen for `swap:*` events triggered by the escrow's response.
 
@@ -1093,7 +1323,7 @@ getSwaps(filter?: GetSwapsFilter): SwapRef[]
 ### 9.1 Behavior
 
 - **Synchronous.** Reads from the in-memory `swaps` map. No I/O.
-- Returns copies of `SwapRef` objects (not references to internal state).
+- Returns deep copies of `SwapRef` objects (not references to internal state).
 - Default sort: `updatedAt` descending (most recently active first).
 
 ### 9.2 Filtering
@@ -1118,7 +1348,7 @@ getSwaps(filter?: GetSwapsFilter): SwapRef[] {
   }
 
   results.sort((a, b) => b.updatedAt - a.updatedAt);
-  return results.map(s => ({ ...s }));
+  return results.map(s => ({ ...s, deal: { ...s.deal }, manifest: { ...s.manifest } }));
 }
 ```
 
@@ -1138,17 +1368,16 @@ async verifyPayout(swapId: string): Promise<boolean>
    - Must exist.
    - Must have `payoutInvoiceId` set. If not, throw `SWAP_WRONG_STATE` with message `'Payout invoice not yet received'`.
 
-3. **Get invoice status.**
+3. **Enter per-swap gate.**
+
+4. **Get invoice ref and status.**
    ```typescript
-   const status = await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId!);
+   const invoiceRef = deps.accounting.getInvoice(swap.payoutInvoiceId!);
+   if (!invoiceRef) throw new SphereError('Payout invoice not found', 'SWAP_PAYOUT_VERIFICATION_FAILED');
+   const status = deps.accounting.getInvoiceStatus(swap.payoutInvoiceId!);
    ```
 
-4. **Verify invoice terms match expectations.**
-   - Get the invoice ref to access terms:
-     ```typescript
-     const invoiceRef = deps.accounting.getInvoice(swap.payoutInvoiceId!);
-     if (!invoiceRef) throw new SphereError('Payout invoice not found', 'SWAP_PAYOUT_VERIFICATION_FAILED');
-     ```
+5. **Verify invoice terms match expectations.**
    - Determine expected currency and amount:
      - If we are party A (our DIRECT address matches `manifest.party_a_address`):
        - Expected currency: `manifest.party_b_currency_to_change` (we receive B's currency)
@@ -1163,33 +1392,31 @@ async verifyPayout(swapId: string): Promise<boolean>
      - `invoiceRef.terms.creator` is defined (escrow invoices are non-anonymous)
    - If any check fails: set `swap.payoutVerified = false`, persist, emit `swap:failed` with descriptive error, return `false`.
 
-5. **Verify coverage.**
+6. **Verify coverage.**
    - `status.state` must be `'COVERED'` or `'CLOSED'`.
    - `status.targets[0].coinAssets[0].isCovered` must be `true`.
    - `BigInt(status.targets[0].coinAssets[0].netCoveredAmount) >= BigInt(expectedAmount)`.
    - If not covered: return `false` without error (the payout may still be in progress).
 
-6. **Validate L3 inclusion proofs.**
-   - Call `deps.payments.validate()` on payout tokens to confirm L3 inclusion proofs against the aggregator's Sparse Merkle Tree.
-
-7. **Verify invoice creator matches escrow.**
-   - Verify `invoiceRef.terms.creator` matches the resolved escrow chain pubkey. This prevents a malicious party from crafting a fake payout invoice.
+7. **Verify escrow creator identity.**
+   - Resolve the escrow address and verify `invoiceRef.terms.creator` matches the escrow's chain pubkey.
    - If mismatched: set `swap.payoutVerified = false`, persist, emit `swap:failed` with error `'Payout invoice creator does not match escrow pubkey'`, return `false`.
 
-8. **Update state on success.**
-   ```typescript
-   swap.payoutVerified = true;
-   swap.progress = 'completed';
-   swap.updatedAt = Date.now();
-   ```
-   Persist.
+8. **Validate L3 inclusion proofs.**
+   - Call `deps.payments.validate()` to confirm L3 inclusion proofs against the aggregator's Sparse Merkle Tree.
+   - If any tokens are invalid: set `swap.payoutVerified = false`, persist, emit `swap:failed`, return `false`.
 
-9. **Emit `swap:completed`.**
+9. **Update state on success.**
    ```typescript
-   deps.emitEvent('swap:completed', { swapId, payoutVerified: true });
+   await this.transitionProgress(swap, 'completed', { payoutVerified: true });
    ```
 
-10. **Return `true`.**
+10. **Emit `swap:completed`.**
+    ```typescript
+    deps.emitEvent('swap:completed', { swapId, payoutVerified: true });
+    ```
+
+11. **Return `true`.**
 
 ---
 
@@ -1199,75 +1426,84 @@ async verifyPayout(swapId: string): Promise<boolean>
 async cancelSwap(swapId: string): Promise<void>
 ```
 
-### 11.1 Step-by-Step
+### 11.1 Cancellable States
+
+`cancelSwap` can be called at any progress from `proposed` through `awaiting_counter` (inclusive). Specifically:
+
+| Progress | Cancellation behavior |
+|----------|----------------------|
+| `proposed` | Local-only cancellation. Notifies counterparty via rejection DM (best-effort). |
+| `accepted` | Local-only cancellation. Notifies counterparty. |
+| `announced` | Notifies escrow via cancel DM + counterparty via rejection DM. |
+| `depositing` | Notifies escrow via cancel DM + counterparty. Deposits will be returned by the escrow. |
+| `awaiting_counter` | Notifies escrow via cancel DM + counterparty. Deposits will be returned by the escrow. |
+| `concluding` | **NOT cancellable** -- payouts are already in progress. Throws `SWAP_WRONG_STATE`. |
+| `completed` | Throws `SWAP_ALREADY_COMPLETED`. |
+| `cancelled` / `failed` | Throws `SWAP_ALREADY_CANCELLED`. |
+
+### 11.2 Step-by-Step
 
 1. **Guard checks.** (destroyed, loaded).
 
 2. **Look up SwapRef.**
    - Must exist.
-   - If `swap.progress` is already terminal (`completed`, `cancelled`, `failed`):
-     - If `cancelled`: throw `SWAP_ALREADY_CANCELLED`.
-     - If `completed`: throw `SWAP_ALREADY_COMPLETED`.
-     - If `failed`: throw `SWAP_ALREADY_CANCELLED` (treat failed as implicitly cancelled).
+   - If `swap.progress` is `concluding`: throw `SWAP_WRONG_STATE`.
+   - If `swap.progress` is `completed`: throw `SWAP_ALREADY_COMPLETED`.
+   - If `swap.progress` is `cancelled` or `failed`: throw `SWAP_ALREADY_CANCELLED`.
 
-3. **Enter per-swap gate.**
+3. **Enter per-swap gate.** Re-check state inside gate (TOCTOU safety).
 
-4. **Determine cancellation scope.**
+4. **Clear local timer.**
 
-   **Pre-announcement** (`progress` is `'proposed'`, `'accepted'`):
-   - Mark as cancelled locally. No escrow interaction needed.
+5. **Notify escrow** (if post-announcement). If the swap has `escrowPubkey` and progress is `announced`, `depositing`, or `awaiting_counter`, send a cancel DM:
    ```typescript
-   swap.progress = 'cancelled';
-   swap.updatedAt = Date.now();
+   const cancelDM = buildCancelDM(swapId, 'Cancelled by user');
+   await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
    ```
-   - If `role === 'proposer'` and `progress === 'proposed'`: the proposal may still be pending with the counterparty. Optionally send a `swap_rejection` DM to inform them (best-effort, failure is non-blocking).
+   On failure: log warning, continue.
 
-   **Post-announcement** (`progress` is `'announced'`, `'depositing'`, `'awaiting_counter'`, `'concluding'`):
-   - The escrow does not support explicit cancellation by parties. The only escrow-side cancellation mechanism is timeout.
-   - Mark as cancelled locally. This is a **unilateral local decision** -- the escrow still considers the swap active until timeout.
-   - If deposits were made, they will be returned by the escrow when the timeout fires (assuming the counterparty did not also deposit and trigger completion).
-   - Log a warning: `'Swap cancelled locally but escrow may still be active. Deposits will be returned on escrow timeout.'`.
+6. **Notify counterparty** (best-effort) via rejection DM.
 
-5. **Persist.**
+7. **Transition to 'cancelled'.**
+   ```typescript
+   await this.transitionProgress(swap, 'cancelled', { error: 'Cancelled by user' });
+   ```
 
-6. **Clear local timers** associated with this swap.
-
-7. **Emit `swap:cancelled`.**
+8. **Emit `swap:cancelled`.**
    ```typescript
    deps.emitEvent('swap:cancelled', {
      swapId,
      reason: 'explicit',
-     depositsReturned: undefined, // unknown for local cancellation
+     depositsReturned: false,
    });
    ```
-
-> **Future extension:** When the escrow protocol supports explicit cancellation by parties, this method should send a `cancel` DM to the escrow before marking as locally cancelled. The current implementation is limited to local-only cancellation.
 
 ---
 
 ## 12. Incoming DM Processing
+
+All DM processing uses the `parseSwapDM()` universal parser which returns a typed discriminated union (`ParsedSwapDM`) with kinds: `proposal`, `acceptance`, `rejection`, `escrow`. All errors during DM processing are caught internally and logged -- they NEVER propagate to the calling code.
 
 ### 12.1 swap_proposal Received
 
 Triggered when a DM arrives with the `swap_proposal:` prefix.
 
 1. **Parse message.**
-   - Extract JSON after `swap_proposal:` prefix.
-   - Parse as `SwapProposalMessage`.
-   - On parse failure: silently ignore (treat as regular DM).
+   - Parse via `parseSwapDM()` into a `SwapProposalMessage`.
+   - On parse failure: silently ignore.
 
 2. **Validate version.**
-   - If `version > 1`: silently ignore (forward compatibility).
-   - If `version < 1` or not a number: silently ignore.
+   - Accept `version === 1` and `version === 2`.
+   - Other values: silently ignore.
 
-3. **Validate manifest** (see [section 17.2](#172-manifest-validation)).
-   - Verify `swap_id` matches `SHA-256(JCS(manifestFields))`.
-   - Validate all manifest fields.
-   - On validation failure: silently ignore (do not send error DM -- the sender may be malicious).
+3. **Validate manifest integrity.**
+   - Call `verifyManifestIntegrity(manifest)` to verify `swap_id` matches `SHA-256(JCS(manifestFields))`. Includes `salt`, and for v2, `escrow_address` and `protocol_version`.
+   - Call `validateManifest(manifest)` for field-level validation.
+   - On validation failure: silently ignore.
 
 4. **Check pending swap limit.** If exceeded, silently ignore.
 
-5. **Check for duplicate.** If `swaps.has(swap_id)`, silently ignore.
+5. **Check for duplicate.** If `swaps.has(swap_id)` or `terminalSwapIds.has(swap_id)`, silently ignore.
 
 6. **Determine role.**
    - Compare manifest party addresses against our tracked addresses.
@@ -1275,69 +1511,77 @@ Triggered when a DM arrives with the `swap_proposal:` prefix.
    - If `manifest.party_b_address` matches: we are party B. Counterparty is A. `role = 'acceptor'`.
    - If neither matches: silently ignore (proposal is not for us).
 
-7. **Reconstruct SwapDeal** from the manifest and escrow address in the proposal message.
-   ```typescript
-   const deal: SwapDeal = {
-     partyA: manifest.party_a_address,
-     partyB: manifest.party_b_address,
-     partyACurrency: manifest.party_a_currency_to_change,
-     partyAAmount: manifest.party_a_value_to_change,
-     partyBCurrency: manifest.party_b_currency_to_change,
-     partyBAmount: manifest.party_b_value_to_change,
-     timeout: manifest.timeout,
-     escrowAddress: proposalMsg.escrow,
-   };
-   ```
+7. **Verify sender identity.**
+   - Resolve the counterparty's address from the manifest.
+   - If a peer is found, verify `dm.senderPubkey` matches the peer's `transportPubkey`. If not, silently drop.
+   - If peer resolution returns null: allow v2 proposals to proceed (chain pubkey verification below will catch fakes); v1 relies on transport-layer authentication.
 
-8. **Create SwapRef.**
-   ```typescript
-   const swap: SwapRef = {
-     swapId: manifest.swap_id,
-     deal,
-     manifest,
-     role: 'acceptor',
-     progress: 'proposed',
-     counterpartyPubkey: dm.senderPubkey,
-     payoutVerified: false,
-     createdAt: Date.now(),
-     updatedAt: Date.now(),
-   };
-   ```
+8. **v2 verification (when `version === 2`).**
+   - Verify `proposer_signature` and `proposer_chain_pubkey` are present. If missing, silently drop.
+   - Verify `manifest.escrow_address` is present. If missing, silently drop.
+   - Verify proposer's signature via `verifySwapSignature(swap_id, escrow_address, proposer_signature, proposer_chain_pubkey)`. If invalid, silently drop.
+   - Resolve proposer's address from the manifest and verify `chainPubkey` matches `proposer_chain_pubkey`. If mismatch, silently drop.
+   - Verify any nametag bindings in `auxiliary` via `verifyNametagBinding()`. If invalid, silently drop.
 
-9. **Persist.**
+9. **Reconstruct SwapDeal** from the manifest and escrow address in the proposal message.
 
-10. **Emit `swap:proposal_received`.**
+10. **Resolve escrow address** (best-effort, for DM sender verification later).
+
+11. **Create SwapRef.**
     ```typescript
-    deps.emitEvent('swap:proposal_received', {
+    const swap: SwapRef = {
       swapId: manifest.swap_id,
       deal,
-      senderPubkey: dm.senderPubkey,
-      senderNametag: dm.senderNametag,
-    });
+      manifest,
+      role: 'acceptor',
+      progress: 'proposed',
+      counterpartyPubkey: dm.senderPubkey,
+      counterpartyNametag: dm.senderNametag,
+      escrowPubkey,
+      escrowDirectAddress,
+      payoutVerified: false,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      proposerSignature,            // v2 only
+      proposerChainPubkey,          // v2 only
+      auxiliary: proposalMsg.auxiliary,  // v2 only
+      protocolVersion: proposalMsg.version,
+    };
     ```
+
+12. **Persist.**
+
+13. **Emit `swap:proposal_received`.**
 
 ### 12.2 swap_acceptance Received
 
 Triggered when a DM arrives with the `swap_acceptance:` prefix.
 
-1. **Parse and validate** (same pattern as 12.1).
+1. **Parse and validate.**
 
 2. **Look up SwapRef** by `swap_id`.
-   - Must exist, `progress === 'proposed'`, `role === 'proposer'`.
-   - If any check fails: silently ignore.
+   - Must exist, `role === 'proposer'`.
+   - Must be in `proposed` or `accepted` state. If not, silently ignore.
+   - Skip stale acceptances from a previous proposal instance (timestamp check).
 
 3. **Verify sender** is the expected counterparty (`dm.senderPubkey === swap.counterpartyPubkey`). If not, silently ignore.
 
-4. **Enter per-swap gate.**
+4. **Downgrade attack prevention (v2).** If `swap.protocolVersion === 2`:
+   - **MUST** receive a v2 acceptance (`acceptMsg.version === 2`) with `acceptor_signature` and `acceptor_chain_pubkey`.
+   - A v1-format acceptance on a v2 swap is silently dropped WITHOUT clearing the proposal timer. This prevents a malicious actor from downgrading the security model.
+   - Verify the acceptor's signature via `verifySwapSignature()`. If invalid, silently drop without clearing the timer.
 
-5. **Cancel proposal timeout timer** (`localTimers.delete(`proposal:${swapId}`)`).
+5. **Enter per-swap gate** (only if still in `proposed` state).
 
-6. **Transition to 'accepted'.** Persist.
+6. **Cancel proposal timeout timer.**
 
-7. **Emit `swap:accepted`.**
+7. **Transition to 'accepted'.** Persist. Store verified v2 acceptor signature if present.
 
-8. **Announce to escrow** (same flow as step 7 in acceptSwap -- resolve escrow, send announce DM).
-   - The announce_result handling is asynchronous (section 12.4).
+8. **Emit `swap:accepted`.**
+
+9. **Protocol-specific escrow announcement:**
+   - **v2:** Proposer does NOT announce to escrow. The acceptor already did it. Wait for `announce_result` from escrow.
+   - **v1:** Proposer announces to escrow via `sendAnnounce()`.
 
 ### 12.3 swap_rejection Received
 
@@ -1350,91 +1594,103 @@ Triggered when a DM arrives with the `swap_rejection:` prefix.
 
 3. **Verify sender** is the counterparty.
 
-4. **Enter per-swap gate.**
+4. **Skip stale rejections** (timestamp check against `swap.createdAt`).
 
-5. **Cancel proposal timeout timer.**
+5. **Enter per-swap gate.** Skip if already terminal.
 
-6. **Transition to 'cancelled'.** Store `reason` from the rejection message. Persist.
+6. **Cancel proposal timeout timer.**
 
-7. **Emit `swap:rejected`.**
+7. **Transition to 'cancelled'.** Store `reason` from the rejection message. Persist.
+
+8. **Emit `swap:rejected`.**
    ```typescript
-   deps.emitEvent('swap:rejected', {
-     swapId,
-     reason: rejectionMsg.reason,
-   });
+   deps.emitEvent('swap:rejected', { swapId, reason: rejectionMsg.reason });
    ```
-   Also emit `swap:cancelled`:
+
+9. **Emit `swap:cancelled`.**
    ```typescript
-   deps.emitEvent('swap:cancelled', {
-     swapId,
-     reason: 'rejected',
-   });
+   deps.emitEvent('swap:cancelled', { swapId, reason: 'explicit', depositsReturned: false });
    ```
 
 ### 12.4 Escrow DM Processing
 
-DMs from the escrow are JSON objects. The handler attempts `JSON.parse()` on the DM content. If parsing succeeds and the result has a `type` field matching a known escrow message type, it is dispatched here. If parsing fails or the type is unrecognized, the DM is ignored (it may be a regular conversation message or a peer-to-peer swap message handled by 12.1--12.3).
+DMs from the escrow are JSON objects. The handler attempts `JSON.parse()` on the DM content. If parsing succeeds and the result has a `type` field matching a known escrow message type, it is dispatched here. If parsing fails or the type is unrecognized, the DM is ignored.
 
 **Sender verification:** Before processing any escrow DM, verify that `dm.senderPubkey` matches the escrow's resolved transport pubkey for the associated swap. If not, silently ignore. This prevents a malicious party from spoofing escrow responses.
 
 #### 12.4.1 announce_result
 
 1. Find swap by `swap_id` in the message.
-2. Must be in `'accepted'` progress (we just announced). If not, log and ignore.
-3. Store `depositInvoiceId = msg.deposit_invoice_id`.
-4. Store `escrowState = msg.state`.
+2. Verify escrow sender.
+3. Must be in `'accepted'` or `'proposed'` progress. In v2, the escrow's `announce_result` may arrive before the acceptance DM from the counterparty (because the acceptor announces directly). If not in an accepted state, log and ignore.
+4. Store `depositInvoiceId = msg.deposit_invoice_id`.
+5. Store `escrowState = msg.state`.
+6. Update `invoiceToSwapIndex`. Persist.
+7. Do not transition yet -- wait for `invoice_delivery`.
 
 #### 12.4.2 invoice_delivery (deposit)
 
-**DM ordering note:** The `invoice_delivery` handler must handle the case where `announce_result` hasn't arrived yet. If a swap in `accepted` state receives an `invoice_delivery` for a deposit invoice, the handler should: (1) match by `swap_id` from the invoice memo, (2) set `depositInvoiceId` AND transition to `announced` in one step, (3) skip the `announce_result` handler for this swap (it becomes a no-op duplicate).
+**DM ordering note:** The `invoice_delivery` handler handles the case where `announce_result` hasn't arrived yet. If a swap in `accepted` state receives an `invoice_delivery` for a deposit invoice, the handler: (1) matches by `swap_id` from the invoice memo, (2) sets `depositInvoiceId` AND transitions to `announced` in one step.
 
 1. Find swap by `swap_id`.
-2. `msg.invoice_type` must be `'deposit'`.
-3. Import the invoice token:
+2. Verify escrow sender.
+3. `msg.invoice_type` must be `'deposit'`.
+4. Import the invoice token:
    ```typescript
    await deps.accounting.importInvoice(msg.invoice_token);
    ```
    - On failure: log error, transition to `'failed'`. Return.
-4. Transition to `'announced'`. Set `swap.announcedAt = Date.now()`. Persist.
-5. Start local timeout timer (see [section 16](#16-local-timeout-management)).
-6. Emit `swap:announced` with `depositInvoiceId`.
+5. Verify deposit invoice terms match the manifest (see [section 17.4](#174-deposit-invoice-verification)).
+6. Transition to `'announced'`. Set `swap.announcedAt = Date.now()`. Persist.
+7. Start local timeout timer (see [section 16](#16-local-timeout-management)).
+8. Emit `swap:announced` with `depositInvoiceId`.
 
 #### 12.4.3 invoice_delivery (payout)
 
 1. Find swap by `swap_id`.
-2. `msg.invoice_type` must be `'payout'`.
-3. Import the payout invoice token:
+2. Verify escrow sender.
+3. `msg.invoice_type` must be `'payout'`.
+4. Import the payout invoice token:
    ```typescript
    await deps.accounting.importInvoice(msg.invoice_token);
    ```
-4. Store `payoutInvoiceId = msg.invoice_id`.
-5. Persist.
-6. Emit `swap:payout_received` with `payoutInvoiceId`.
-7. Attempt automatic verification via `verifyPayout(swapId)`. If verification succeeds, the swap transitions to `'completed'` and emits `swap:completed`. If verification returns `false` (payout not yet covered), leave state as-is -- the `invoice:payment` subscription will trigger re-verification when coverage arrives.
+5. Store `payoutInvoiceId = msg.invoice_id`.
+6. Persist.
+7. Emit `swap:payout_received` with `payoutInvoiceId`.
+8. Attempt automatic verification via `verifyPayout(swapId)`. If verification succeeds, the swap transitions to `'completed'` and emits `swap:completed`. If verification returns `false` (payout not yet covered), leave state as-is -- the `invoice:payment` subscription will trigger re-verification when coverage arrives.
 
 #### 12.4.4 status_result
 
 1. Find swap by `swap_id`.
-2. Update `swap.escrowState = msg.state`.
-3. Update deposit status if available:
-   - If `msg.deposit_status.party_a_covered` or `msg.deposit_status.party_b_covered` changed, emit `swap:deposit_confirmed` for the newly-covered party.
-4. Persist.
-5. If `msg.state` is a terminal escrow state (`'COMPLETED'`, `'CANCELLED'`, `'FAILED'`) and our local progress is non-terminal, transition accordingly.
+2. Verify escrow sender.
+3. Update `swap.escrowState = msg.state`.
+4. Map the escrow state to client-side progress via `mapEscrowStateToProgress()`:
+   - `ANNOUNCED`, `DEPOSIT_INVOICE_CREATED` -> `announced`
+   - `PARTIAL_DEPOSIT` -> `depositing`
+   - `DEPOSIT_COVERED` -> `awaiting_counter`
+   - `CONCLUDING` -> `concluding`
+   - `COMPLETED` -> `completed`
+   - `TIMED_OUT`, `CANCELLING`, `CANCELLED` -> `cancelled`
+   - `FAILED` -> `failed`
+5. Persist.
+6. If the mapped progress is a terminal state and our local progress is non-terminal, transition accordingly.
 
 #### 12.4.5 payment_confirmation
 
 1. Find swap by `swap_id`.
-2. Transition to `'concluding'` (if not already). Persist.
-3. Emit `swap:concluding`.
+2. Verify escrow sender.
+3. Transition to `'concluding'` (if not already). Persist.
+4. Emit `swap:concluding`.
 
 #### 12.4.6 swap_cancelled
 
 1. Find swap by `swap_id`.
-2. If already terminal locally, ignore.
-3. Transition to `'cancelled'`.
-4. Clear local timers.
-5. Persist.
-6. Emit `swap:cancelled`:
+2. Verify escrow sender.
+3. If already terminal locally, ignore.
+4. Transition to `'cancelled'`.
+5. Clear local timers.
+6. Persist.
+7. Emit `swap:cancelled`:
    ```typescript
    deps.emitEvent('swap:cancelled', {
      swapId,
@@ -1446,20 +1702,25 @@ DMs from the escrow are JSON objects. The handler attempts `JSON.parse()` on the
 #### 12.4.7 bounce_notification
 
 1. Find swap by `swap_id`.
-2. Log a warning with the bounce reason:
+2. Verify escrow sender.
+3. Log a warning with the bounce reason.
+4. Emit `swap:bounce_received`:
+   ```typescript
+   deps.emitEvent('swap:bounce_received', {
+     swapId,
+     reason: msg.reason,
+     returnedAmount: msg.returned_amount,
+     returnedCurrency: msg.returned_currency,
+   });
    ```
-   Swap {swapId}: deposit bounced by escrow — reason: {msg.reason}
-   ```
-3. If `msg.reason === 'WRONG_CURRENCY'`: this indicates a bug in the deposit logic (sent the wrong coinId). Log error.
-4. If `msg.reason === 'ALREADY_COVERED'`: our deposit arrived after coverage. The escrow will return the tokens. No state change needed.
-5. If `msg.reason === 'SWAP_NOT_FOUND'` or `'SWAP_CLOSED'`: the escrow does not recognize this swap. Transition to `'failed'` with error. Persist. Emit `swap:failed`.
 
 #### 12.4.8 error
 
 1. Find swap by `swap_id` (if the error includes one).
-2. Log the error: `Escrow error for swap {swapId}: {msg.error}`.
-3. If the error is in response to an `announce` (swap in `'accepted'` state): transition to `'failed'` with the escrow's error message. Persist. Emit `swap:failed`.
-4. For other states: log only, do not change state. The error may be transient.
+2. Verify escrow sender (if swap found).
+3. Log the error.
+4. If the swap is in `'accepted'` state (error in response to announce): transition to `'failed'` with the escrow's error message. Persist. Emit `swap:failed`.
+5. For other states: log only, do not change state. The error may be transient.
 
 ---
 
@@ -1471,7 +1732,7 @@ The `SwapModule` subscribes to `AccountingModule` events to track deposit and pa
 
 When an `invoice:payment` event fires for a deposit invoice associated with a swap:
 
-1. **Identify the swap** by looking up which `SwapRef` has `depositInvoiceId === event.invoiceId`.
+1. **Identify the swap** by looking up which `SwapRef` has `depositInvoiceId === event.invoiceId` (via `invoiceToSwapIndex`).
 
 2. **Determine which party's deposit this is.**
    - Inspect the event's `transfer.coinId`:
@@ -1532,7 +1793,7 @@ All swap data is stored per-address, following the same scoping model as `Accoun
 Storage uses per-swap keys and an index key:
 
 - **Per-swap key:** `swap:{swapId}` -- serialized `SwapStorageData` JSON containing the full `SwapRef`.
-- **Index key:** `swap_index` -- JSON array of `{ swapId, progress, role, createdAt }` entries. Provides a lightweight lookup without deserializing every swap record.
+- **Index key:** `swap_index` -- JSON array of `SwapIndexEntry` entries. Provides a lightweight lookup without deserializing every swap record.
 
 Where keys are scoped to the currently active `TrackedAddress.addressId` (e.g., `DIRECT_abc123_xyz789`) via the storage provider's per-address scoping.
 
@@ -1564,7 +1825,7 @@ interface SwapIndexEntry {
 
 ### 14.3 Persist Pattern
 
-On state transition, write the per-swap key and update the index atomically:
+On state transition, write the per-swap key and update the index:
 
 ```typescript
 // Pattern used in every state transition:
@@ -1574,19 +1835,26 @@ async function transitionProgress(
   updates?: Partial<SwapRef>,
 ): Promise<void> {
   // 1. Validate transition
-  if (!VALID_PROGRESS_TRANSITIONS[swap.progress].has(newProgress)) {
-    throw new Error(`Invalid progress transition: ${swap.progress} → ${newProgress}`);
-  }
+  assertTransition(swap.progress, newProgress);
   // 2. Update in memory
   swap.progress = newProgress;
   swap.updatedAt = Date.now();
   if (updates) Object.assign(swap, updates);
-  // 3. Persist per-swap key
+  // 3. Set announcedAt when entering 'announced' state
+  if (newProgress === 'announced' && !swap.announcedAt) {
+    swap.announcedAt = Date.now();
+  }
+  // 4. Persist per-swap key
   const data: SwapStorageData = { version: 1, swap };
   await this.storage.set(`swap:${swap.swapId}`, JSON.stringify(data));
-  // 4. Update index
+  // 5. Update index
   await this.persistIndex();
-  // 5. External action happens AFTER persist returns
+  // 6. Track terminal ID and clear local timer on terminal states
+  if (isTerminalProgress(newProgress)) {
+    this.clearLocalTimer(swap.swapId);
+    this.terminalSwapIds.add(swap.swapId);
+  }
+  // 7. External action happens AFTER persist returns
 }
 ```
 
@@ -1601,7 +1869,8 @@ On `load()`:
    b. Parse JSON as `SwapStorageData`. Validate `version` field. If `version > 1`, log warning and attempt best-effort parsing (ignore unknown fields).
    c. If missing or corrupt, skip (remove from index on next persist).
    d. Populate `this.swaps` with the deserialized `SwapRef`.
-3. Terminal swap records are NOT loaded into memory -- they remain in storage for history queries and are purged after `terminalPurgeTtlMs`.
+3. Terminal swap records are NOT loaded into memory -- they remain in storage for dedup (via `terminalSwapIds`) and are purged after `terminalPurgeTtlMs`.
+4. Purge expired terminal records from storage (delete per-swap key) and re-persist a clean index.
 
 ---
 
@@ -1609,29 +1878,11 @@ On `load()`:
 
 ### 15.1 withSwapGate(swapId, fn)
 
+The `SwapModule` uses `AsyncGateMap` (shared utility from `core/async-gate.ts`) to serialize operations per swap ID:
+
 ```typescript
 private async withSwapGate<T>(swapId: string, fn: () => Promise<T>): Promise<T> {
-  if (this.destroyed) {
-    throw new SphereError('SwapModule is destroyed', 'SWAP_MODULE_DESTROYED');
-  }
-
-  const prev = this.swapGates.get(swapId) ?? Promise.resolve();
-  let resolve: () => void;
-  const next = new Promise<void>(r => { resolve = r; });
-  this.swapGates.set(swapId, next);
-
-  await prev;
-
-  try {
-    if (this.destroyed) return undefined as T; // gate drained during destroy
-    return await fn();
-  } finally {
-    resolve!();
-    // Clean up if this was the last entry
-    if (this.swapGates.get(swapId) === next) {
-      this.swapGates.delete(swapId);
-    }
-  }
+  return this._gateMap.withGate(swapId, fn, () => this.destroyed, 'SWAP_MODULE_DESTROYED');
 }
 ```
 
@@ -1639,22 +1890,25 @@ private async withSwapGate<T>(swapId: string, fn: () => Promise<T>): Promise<T> 
 
 - **Serialization:** Only one mutation runs at a time for a given swap ID.
 - **No global lock:** Different swaps run concurrently.
-- **Drain on destroy:** `destroy()` awaits all gate tails before returning.
+- **Drain on destroy:** `destroy()` calls `_gateMap.drainAll()` before returning.
 - **Starvation prevention:** Each gate entry is a promise chain, not a blocking lock. JavaScript's event loop ensures FIFO ordering.
+- **Destroy-aware:** If the module is destroyed while a gate is in progress, subsequent operations short-circuit with `SWAP_MODULE_DESTROYED`.
 
 ### 15.3 Which Operations Use the Gate
 
 All state-mutating operations enter the gate:
-- `acceptSwap()` (steps 4 onward)
-- `rejectSwap()` (steps 4 onward)
-- `deposit()` (steps 4 onward)
-- `cancelSwap()` (steps 4 onward)
+- `acceptSwap()` (steps 3 onward)
+- `rejectSwap()` (steps 3 onward)
+- `deposit()` (step 4 onward)
+- `cancelSwap()` (steps 3 onward)
+- `verifyPayout()` (verification and state transition)
 - All DM handlers in section 12 that modify `SwapRef`
 - All invoice event handlers in section 13 that modify `SwapRef`
-- Proposal timeout callback (section 4.1 step 12)
+- Proposal timeout callback (section 4.1 step 14)
 - Local timeout callback (section 16)
+- Escrow resolution during crash recovery (section 3.4 step 8)
 
-Read-only operations (`getSwaps()`, `getSwapStatus()`, `verifyPayout()`) do NOT enter the gate. However, `verifyPayout()` calls `getInvoiceStatus()` which may trigger implicit close on the accounting side -- this is acceptable because the swap module does not own the invoice lifecycle.
+Read-only operations (`getSwaps()`, `getSwapStatus()`) do NOT enter the gate.
 
 ---
 
@@ -1674,11 +1928,10 @@ const localTimeoutMs = timeoutMs + 30_000;
 const timer = setTimeout(() => {
   this.withSwapGate(swap.swapId, async () => {
     const s = this.swaps.get(swap.swapId);
-    if (!s || TERMINAL_PROGRESS.has(s.progress)) return; // already resolved
-    s.progress = 'cancelled';
-    s.error = 'Local timeout — escrow did not respond within the expected window';
-    s.updatedAt = Date.now();
-    await this.persist();
+    if (!s || isTerminalProgress(s.progress)) return; // already resolved
+    await this.transitionProgress(s, 'cancelled', {
+      error: 'Local timeout -- escrow did not respond within the expected window',
+    });
     deps.emitEvent('swap:cancelled', {
       swapId: s.swapId,
       reason: 'timeout',
@@ -1691,20 +1944,20 @@ this.localTimers.set(swap.swapId, timer);
 
 **Clear:** Timers are cleared when:
 - The swap reaches any terminal state (`completed`, `cancelled`, `failed`).
-- `deposit:covered` fires (the escrow is proceeding with payouts -- timeout no longer relevant).
+- `deposits_covered` fires (the escrow is proceeding with payouts -- timeout no longer relevant).
 - `destroy()` clears all timers.
 
 **Resume on load:** During `load()`, for non-terminal swaps that were `'announced'` or later, compute the remaining time. If `announcedAt` is undefined (swap not yet announced), skip timer -- the swap will be cancelled by the proposal timeout instead.
 ```typescript
-if (!swap.announcedAt) return; // not yet announced — proposal timeout handles this
+if (!swap.announcedAt) return; // not yet announced -- proposal timeout handles this
 const elapsed = Date.now() - swap.announcedAt;
 const totalTimeout = swap.manifest.timeout * 1000 + 30_000;
 const remaining = totalTimeout - elapsed;
 if (remaining <= 0) {
   // Already expired -- cancel immediately
-  swap.progress = 'cancelled';
-  swap.error = 'Swap timed out during offline period';
-  swap.updatedAt = Date.now();
+  await this.transitionProgress(swap, 'cancelled', {
+    error: 'Swap timed out during offline period',
+  });
 } else {
   // Start timer for remaining duration
   const timer = setTimeout(/* same handler */, remaining);
@@ -1728,7 +1981,7 @@ Called by `proposeSwap()` before any resolution or manifest construction.
 | `partyACurrency` | Non-empty string, alphanumeric, 1-20 chars (`/^[A-Za-z0-9]{1,20}$/`). Aligned with AccountingModule's createInvoice validation (max 20 chars). | `SWAP_INVALID_DEAL: partyACurrency must be 1-20 alphanumeric characters` |
 | `partyBCurrency` | Same rule as partyACurrency | `SWAP_INVALID_DEAL: partyBCurrency must be 1-20 alphanumeric characters` |
 | `partyACurrency` vs `partyBCurrency` | Must differ (case-sensitive) | `SWAP_INVALID_DEAL: currencies must differ` |
-| `partyAAmount` | Positive integer string: `/^[1-9][0-9]*$/`, max 78 chars | `SWAP_INVALID_DEAL: partyAAmount must be a positive integer string` |
+| `partyAAmount` | Positive integer string: `/^[1-9][0-9]*$/` | `SWAP_INVALID_DEAL: partyAAmount must be a positive integer string` |
 | `partyBAmount` | Same rule | `SWAP_INVALID_DEAL: partyBAmount must be a positive integer string` |
 | `timeout` | Integer, range [60, 86400] | `SWAP_INVALID_DEAL: timeout must be an integer between 60 and 86400 seconds` |
 | `escrowAddress` | If provided: non-empty string. If omitted: `config.defaultEscrowAddress` must exist. | `SWAP_INVALID_DEAL: No escrow address` |
@@ -1747,14 +2000,16 @@ Applied when receiving a `swap_proposal` DM. Mirrors the escrow's `manifest-vali
 | `party_a_value_to_change` | Positive integer string (`/^[1-9][0-9]*$/`) | Silent reject |
 | `party_b_value_to_change` | Same rule | Silent reject |
 | `timeout` | Integer in [60, 86400] | Silent reject |
-| `swap_id` integrity | Must equal `SHA-256(JCS(manifestFields))` where `manifestFields` contains all fields except `swap_id` | Silent reject |
+| `salt` | Exactly 32 lowercase hex chars (`/^[0-9a-f]{32}$/`) | Silent reject |
+| `protocol_version` | When present, must be `2` | Silent reject |
+| `escrow_address` | When `protocol_version` is `2`, must be a valid DIRECT:// address | Silent reject |
+| `swap_id` integrity | Must equal `SHA-256(JCS(manifestFields))` where `manifestFields` contains all fields except `swap_id`. For v1: 8 fields. For v2: 10 fields (8 + `escrow_address` + `protocol_version`). The `!== undefined` check determines field inclusion. | Silent reject |
 
 ### 17.3 Swap ID Computation
 
 ```typescript
 import canonicalize from 'canonicalize';
-import { sha256 } from '@noble/hashes/sha256';
-import { bytesToHex } from '@noble/hashes/utils';
+import { sha256 } from '../../core/crypto.js';
 
 interface ManifestFields {
   party_a_address: string;
@@ -1764,6 +2019,9 @@ interface ManifestFields {
   party_b_currency_to_change: string;
   party_b_value_to_change: string;
   timeout: number;
+  salt: string;
+  escrow_address?: string;      // v2 only
+  protocol_version?: number;     // v2 only
 }
 
 function computeSwapId(fields: ManifestFields): string {
@@ -1771,18 +2029,21 @@ function computeSwapId(fields: ManifestFields): string {
   if (!canonical) {
     throw new Error('Failed to canonicalize manifest fields');
   }
-  const hash = sha256(new TextEncoder().encode(canonical));
-  return bytesToHex(hash);
+  return sha256(canonical, 'utf8');
 }
 ```
 
-> **Note:** The SDK uses `@noble/hashes` (browser-compatible). The escrow service uses Node.js `crypto.createHash`. Both produce the same SHA-256 output. The canonicalization library (`canonicalize`) implements RFC 8785 (JSON Canonicalization Scheme) and is deterministic across implementations.
+The `canonicalize` npm package implements RFC 8785 (JSON Canonicalization Scheme). The SDK uses `sha256()` from `core/crypto.ts` which accepts a UTF-8 string input. The escrow service uses Node.js `crypto.createHash('sha256')`. Both produce the same SHA-256 output.
+
+**Field inclusion rule:** Fields with value `!== undefined` are included in the canonical JSON. This means:
+- v1 manifests: 8 fields (party addresses, currencies, amounts, timeout, salt)
+- v2 manifests: 10 fields (same 8 + `escrow_address` + `protocol_version`)
 
 ### 17.4 Deposit Invoice Verification
 
-When the escrow delivers a deposit invoice token via `invoice_delivery` DM, the `SwapModule` verifies the invoice terms before importing:
+When the escrow delivers a deposit invoice token via `invoice_delivery` DM, the `SwapModule` verifies the invoice terms before transitioning to `announced`:
 
-1. Parse the invoice token's terms.
+1. Parse the invoice token's terms via `accounting.getInvoice()`.
 2. Verify:
    - `terms.targets.length === 1` (single-target deposit invoice)
    - `terms.targets[0].assets.length === 2` (two coin assets)
@@ -1792,6 +2053,57 @@ When the escrow delivers a deposit invoice token via `invoice_delivery` DM, the 
    - `terms.targets[0].assets[1].coin![1] === manifest.party_b_value_to_change`
 3. Verify `terms.targets[0].address` matches the resolved escrow DIRECT:// address. If not, reject the invoice -- deposits would go to the wrong address.
 4. If any check fails: reject the invoice, transition to `'failed'` with error `'Deposit invoice terms do not match manifest'`. Emit `swap:failed`.
+
+### 17.5 Downgrade Attack Prevention
+
+A v2 swap MUST reject incoming `swap_acceptance` (v1-format) DMs. Only `swap_acceptance_v2` (version 2 with `acceptor_signature` and `acceptor_chain_pubkey`) is valid for a v2 proposal. A non-v2 acceptance on a v2 swap MUST be silently dropped WITHOUT clearing the proposal timer.
+
+This prevents an attacker from:
+1. Intercepting a v2 proposal
+2. Sending a forged v1 acceptance (without a valid signature)
+3. Disarming the proposal timeout and stranding the swap indefinitely
+
+### 17.6 Swap Consent Signing (v2)
+
+**Signing:**
+```typescript
+function signSwapManifest(privateKey: string, swapId: string, escrowAddress: string): string {
+  const message = `swap_consent:${swapId}:${escrowAddress}`;
+  return signMessage(privateKey, message);
+  // Returns 130-char hex signature (v + r + s)
+}
+```
+
+**Verification:**
+```typescript
+function verifySwapSignature(
+  swapId: string, escrowAddress: string, signature: string, chainPubkey: string,
+): boolean {
+  const message = `swap_consent:${swapId}:${escrowAddress}`;
+  return verifySignedMessage(message, signature, chainPubkey);
+}
+```
+
+### 17.7 Nametag Binding (v2)
+
+**Creation:**
+```typescript
+function createNametagBinding(
+  privateKey: string, nametag: string, directAddress: string, swapId: string, chainPubkey: string,
+): NametagBindingProof {
+  const message = `nametag_bind:${nametag}:${directAddress}:${swapId}`;
+  const signature = signMessage(privateKey, message);
+  return { nametag, direct_address: directAddress, chain_pubkey: chainPubkey, signature };
+}
+```
+
+**Verification:**
+```typescript
+function verifyNametagBinding(proof: NametagBindingProof, swapId: string): boolean {
+  const message = `nametag_bind:${proof.nametag}:${proof.direct_address}:${swapId}`;
+  return verifySignedMessage(message, proof.signature, proof.chain_pubkey);
+}
+```
 
 ---
 
@@ -1805,6 +2117,8 @@ When the escrow delivers a deposit invoice token via `invoice_delivery` DM, the 
 | `defaultEscrowAddress` | `string` | `undefined` | Pre-configured escrow address |
 | `proposalTimeoutMs` | `number` | `300000` (5 min) | Client-side proposal acceptance timeout |
 | `maxPendingSwaps` | `number` | `100` | Maximum non-terminal swaps tracked |
+| `announceTimeoutMs` | `number` | `30000` (30 sec) | Announce response timeout |
+| `terminalPurgeTtlMs` | `number` | `604800000` (7 days) | TTL for terminal swap records before purge |
 
 ### 18.2 Network-Specific Escrow Addresses
 
@@ -1842,27 +2156,27 @@ NETWORKS: {
 
 ## 19. Error Codes
 
-All errors use `SphereError` with the following codes. All codes must be added to the `SphereErrorCode` union type in `core/errors.ts`.
+All errors use `SphereError` with the following codes. All codes are registered in the `SphereErrorCode` union type in `core/errors.ts`.
 
-| Code | Message | When |
-|---|---|---|
-| `SWAP_INVALID_DEAL` | Deal validation failed: {details} | Invalid `SwapDeal` fields in `proposeSwap()` |
-| `SWAP_INVALID_MANIFEST` | Manifest validation failed | Incoming proposal has invalid manifest fields |
-| `SWAP_NOT_FOUND` | Swap not found: {swapId} | Unknown swap ID in any operation |
-| `SWAP_WRONG_STATE` | Cannot {operation}: swap is in {progress} state | Operation incompatible with current progress |
-| `SWAP_RESOLVE_FAILED` | Cannot resolve address: {address} | `deps.resolve()` returned null for a party or escrow address |
-| `SWAP_DM_SEND_FAILED` | Failed to send DM: {details} | `CommunicationsModule.sendDM()` threw |
-| `SWAP_ESCROW_REJECTED` | Escrow rejected manifest: {error} | Escrow responded with `error` message to announce |
-| `SWAP_DEPOSIT_FAILED` | Deposit payment failed: {details} | `accounting.payInvoice()` threw during deposit |
-| `SWAP_PAYOUT_VERIFICATION_FAILED` | Payout verification failed: {details} | Payout invoice terms do not match manifest expectations |
-| `SWAP_ALREADY_EXISTS` | Swap with this ID already exists | Duplicate incoming proposal (proposeSwap is idempotent — returns existing) |
-| `SWAP_ALREADY_COMPLETED` | Swap is already completed | `cancelSwap()` on a completed swap |
-| `SWAP_ALREADY_CANCELLED` | Swap is already cancelled | `cancelSwap()` on a cancelled/failed swap |
-| `SWAP_TIMEOUT` | Swap timed out | Local or escrow timeout fired |
-| `SWAP_LIMIT_EXCEEDED` | Maximum pending swaps ({limit}) exceeded | `proposeSwap()` or incoming proposal when at capacity |
-| `SWAP_ALREADY_INITIALIZED` | SwapModule is already initialized | `initialize()` called twice without `destroy()` |
-| `SWAP_MODULE_DESTROYED` | SwapModule is destroyed | Any public method called after `destroy()` |
-| `SWAP_NOT_INITIALIZED` | SwapModule is not initialized | Any public method called before `load()` completes |
+| Code | When |
+|---|---|
+| `SWAP_INVALID_DEAL` | Invalid `SwapDeal` fields in `proposeSwap()`, or no escrow address configured |
+| `SWAP_INVALID_MANIFEST` | Incoming proposal has invalid manifest fields |
+| `SWAP_NOT_FOUND` | Unknown swap ID in any operation |
+| `SWAP_WRONG_STATE` | Operation incompatible with current progress (e.g., deposit when not announced, cancel when concluding) |
+| `SWAP_RESOLVE_FAILED` | `deps.resolve()` returned null for a party or escrow address |
+| `SWAP_DM_SEND_FAILED` | `CommunicationsModule.sendDM()` threw during proposal/acceptance/announcement |
+| `SWAP_ESCROW_REJECTED` | Escrow responded with `error` message to announce |
+| `SWAP_DEPOSIT_FAILED` | `accounting.payInvoice()` threw during deposit |
+| `SWAP_PAYOUT_VERIFICATION_FAILED` | Payout invoice terms do not match manifest expectations |
+| `SWAP_ALREADY_EXISTS` | Duplicate incoming proposal (proposeSwap is idempotent -- returns existing) |
+| `SWAP_ALREADY_COMPLETED` | `cancelSwap()` on a completed swap |
+| `SWAP_ALREADY_CANCELLED` | `cancelSwap()` on a cancelled/failed swap |
+| `SWAP_TIMEOUT` | Local or escrow timeout fired |
+| `SWAP_LIMIT_EXCEEDED` | `proposeSwap()` or incoming proposal when at capacity |
+| `SWAP_ALREADY_INITIALIZED` | `initialize()` called twice without `destroy()` |
+| `SWAP_MODULE_DESTROYED` | Any public method called after `destroy()` |
+| `SWAP_NOT_INITIALIZED` | Any public method called before `initialize()` or `load()` completes |
 
 **Error propagation:** Errors during DM event processing (section 12) are caught internally and logged. They NEVER propagate to the calling code or interrupt the DM processing pipeline. Only explicit API calls (`proposeSwap`, `acceptSwap`, `deposit`, etc.) throw `SphereError` to the caller.
 
@@ -1905,80 +2219,21 @@ swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symb
 
 3. Validate offer and want amounts are positive integers (regex: `/^[1-9][0-9]*$/`). If either fails:
    ```typescript
-   console.error(`Invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+   console.error(`Invalid amount "${rawAmount}" -- must be a positive integer in smallest units (no decimals, no leading zeros)`);
    process.exit(1);
    ```
 
 4. Validate `--timeout` if provided. Must be an integer in [60, 86400]. Default: `3600`.
-   ```typescript
-   let timeout = 3600;
-   if (timeoutIdx !== -1 && args[timeoutIdx + 1]) {
-     timeout = parseInt(args[timeoutIdx + 1], 10);
-     if (isNaN(timeout) || timeout < 60 || timeout > 86400) {
-       console.error('--timeout must be an integer between 60 and 86400 seconds');
-       process.exit(1);
-     }
-   }
-   ```
 
-5. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled. Initialize with swap support.');
-     process.exit(1);
-   }
-   ```
+5. Call `getSphere()` and check swap module availability.
 
 6. Determine local wallet role. The local wallet is the proposer (partyA); the `--to` recipient is the acceptor (partyB).
 
-7. Build `SwapDeal`:
-   ```typescript
-   const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
-   const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
+7. Build `SwapDeal` and call `sphere.swap.proposeSwap(deal, options)`.
 
-   const deal: SwapDeal = {
-     partyA: sphere.identity!.directAddress!,
-     partyB: args[toIdx + 1],
-     partyACurrency: offerCoin,
-     partyAAmount: offerAmount,
-     partyBCurrency: wantCoin,
-     partyBAmount: wantAmount,
-     timeout: timeout,
-     escrowAddress: escrow,
-   };
-   ```
+8. Print result as structured JSON.
 
-8. Call `sphere.swap.proposeSwap(deal, message ? { message } : undefined)`.
-
-9. Print result as structured JSON:
-   ```typescript
-   console.log('Swap proposed:');
-   console.log(JSON.stringify({
-     swap_id: result.swapId,
-     counterparty: args[toIdx + 1],
-     offer: `${offerAmount} ${offerCoin}`,
-     want: `${wantAmount} ${wantCoin}`,
-     escrow: deal.escrowAddress ?? '(config default)',
-     timeout: timeout,
-     status: result.progress,
-   }, null, 2));
-   ```
-
-10. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| Missing required flag | Print usage string | 1 |
-| Invalid amount | `Invalid amount "{value}" — must be a positive integer in smallest units (no decimals, no leading zeros)` | 1 |
-| Invalid timeout | `--timeout must be an integer between 60 and 86400 seconds` | 1 |
-| `sphere.swap` is null | `Swap module not enabled. Initialize with swap support.` | 1 |
-| `SWAP_INVALID_DEAL` | `Invalid swap deal: {details}` | 1 |
-| `SWAP_LIMIT_EXCEEDED` | `Too many pending swaps. Complete or cancel existing swaps first.` | 1 |
-| `SWAP_RESOLVE_FAILED` | `Cannot resolve address: {address}` | 1 |
-| `SWAP_DM_SEND_FAILED` | `Failed to send proposal to counterparty` | 1 |
+9. Call `closeSphere()`.
 
 ### 20.2 `swap-list`
 
@@ -1988,72 +2243,7 @@ swap-propose --to <recipient> --offer "<amount> <symbol>" --want "<amount> <symb
 swap-list [--all] [--role <proposer|acceptor>] [--progress <state>]
 ```
 
-**Step-by-step specification:**
-
-1. Parse optional flags:
-   ```typescript
-   const allFlag = args.includes('--all');
-   const roleIdx = args.indexOf('--role');
-   const progressIdx = args.indexOf('--progress');
-   ```
-
-2. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled.');
-     process.exit(1);
-   }
-   ```
-
-3. Build filter from flags:
-   ```typescript
-   const filter: GetSwapsFilter = {};
-   if (roleIdx !== -1 && args[roleIdx + 1]) {
-     const role = args[roleIdx + 1];
-     if (role !== 'proposer' && role !== 'acceptor') {
-       console.error('--role must be "proposer" or "acceptor"');
-       process.exit(1);
-     }
-     filter.role = role;
-   }
-   if (progressIdx !== -1 && args[progressIdx + 1]) {
-     filter.progress = args[progressIdx + 1] as SwapProgress;
-   }
-   ```
-
-4. Default filter: exclude terminal states (`completed`, `cancelled`, `failed`) unless `--all` is set:
-   ```typescript
-   if (!allFlag && !filter.progress) {
-     filter.excludeTerminal = true;
-   }
-   ```
-
-5. Call `sphere.swap.getSwaps(filter)`.
-
-6. If no swaps match, print `"No swaps found."` and exit.
-
-7. Print table with columns: SWAP ID (first 8 characters), ROLE, PROGRESS, OFFER, WANT, COUNTERPARTY, CREATED.
-   ```
-   SWAP ID   ROLE       PROGRESS          OFFER          WANT           COUNTERPARTY   CREATED
-   a1b2c3d4  proposer   awaiting_counter  1000000 UCT    500000 USDU    @bob           2 min ago
-   e5f6g7h8  acceptor   proposed          500000 USDU    1000000 UCT    @alice         5 min ago
-   ```
-
-   Implementation notes:
-   - Truncate `swap_id` to the first 8 characters (the full ID is shown in `swap-status`).
-   - Show relative timestamps for the CREATED column (e.g., `"2 min ago"`, `"1 hour ago"`, `"3 days ago"`). Compute from `swap.createdAt` relative to `Date.now()`.
-   - Use `console.log()` with fixed-width column formatting via `String.padEnd()`.
-   - Color progress states if the terminal supports it: green for `completed`, red for `failed` / `cancelled`, yellow for in-progress states. Check `process.stdout.isTTY` before applying ANSI codes.
-
-8. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| `sphere.swap` is null | `Swap module not enabled.` | 1 |
-| Invalid `--role` value | `--role must be "proposer" or "acceptor"` | 1 |
+Default filter: exclude terminal states unless `--all` is set.
 
 ### 20.3 `swap-accept`
 
@@ -2063,73 +2253,7 @@ swap-list [--all] [--role <proposer|acceptor>] [--progress <state>]
 swap-accept <swap_id> [--deposit] [--no-wait]
 ```
 
-**Step-by-step specification:**
-
-1. Parse `<swap_id>` as the first positional argument after the command name:
-   ```typescript
-   const swapId = args[1];
-   if (!swapId) {
-     console.error('Usage: swap-accept <swap_id> [--deposit] [--no-wait]');
-     process.exit(1);
-   }
-   ```
-
-2. Validate `swap_id` is 64 hexadecimal characters:
-   ```typescript
-   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-     console.error('Invalid swap ID — must be 64 hex characters');
-     process.exit(1);
-   }
-   ```
-
-3. Parse optional flags:
-   ```typescript
-   const depositFlag = args.includes('--deposit');
-   const noWaitFlag = args.includes('--no-wait');
-   ```
-
-4. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled.');
-     process.exit(1);
-   }
-   ```
-
-5. Call `sphere.swap.acceptSwap(swapId)`. This sends the acceptance DM and announces to the escrow. The deposit invoice is imported asynchronously when the escrow responds with an `invoice_delivery` DM.
-
-6. Print: `"Swap accepted. Announced to escrow. Waiting for deposit invoice..."`
-
-7. If `--deposit` is set:
-   a. Call `sphere.swap.deposit(swapId)` to pay into the deposit invoice.
-   b. Print: `"Deposit sent: {transferId}"`
-   c. Unless `--no-wait` is set, subscribe to swap events and print live progress:
-      ```
-      [swap] Deposit sent: transfer_abc123
-      [swap] Awaiting counterparty deposit...
-      [swap] Both deposits received. Escrow concluding...
-      [swap] Payout received. Verifying...
-      [swap] Swap completed! Received 500000 USDU
-      ```
-      Wait for `swap:completed`, `swap:cancelled`, or `swap:failed` event, with a timeout of `2 * swap.deal.timeout` seconds. Print the final status on resolution.
-   d. If `--no-wait` is set, print status and exit immediately after deposit.
-
-8. If `--deposit` is not set, print: `"Run 'swap-deposit {swap_id}' to deposit when ready."`
-
-9. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| Missing `swap_id` | Print usage string | 1 |
-| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
-| `sphere.swap` is null | `Swap module not enabled.` | 1 |
-| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
-| `SWAP_WRONG_STATE` | `Cannot accept: swap is in {progress} state` | 1 |
-| `SWAP_DEPOSIT_FAILED` | `Deposit failed: {details}` | 1 |
-| Wait timeout exceeded | `Swap did not complete within timeout. Current progress: {progress}` | 1 |
+Accepts a swap, optionally deposits immediately, optionally waits for completion.
 
 ### 20.4 `swap-status`
 
@@ -2139,69 +2263,7 @@ swap-accept <swap_id> [--deposit] [--no-wait]
 swap-status <swap_id> [--query-escrow]
 ```
 
-**Step-by-step specification:**
-
-1. Parse `<swap_id>` as the first positional argument:
-   ```typescript
-   const swapId = args[1];
-   if (!swapId) {
-     console.error('Usage: swap-status <swap_id> [--query-escrow]');
-     process.exit(1);
-   }
-   ```
-
-2. Validate `swap_id` is 64 hexadecimal characters:
-   ```typescript
-   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-     console.error('Invalid swap ID — must be 64 hex characters');
-     process.exit(1);
-   }
-   ```
-
-3. Parse optional flags:
-   ```typescript
-   const queryEscrow = args.includes('--query-escrow');
-   ```
-
-4. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled.');
-     process.exit(1);
-   }
-   ```
-
-5. Call `sphere.swap.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined)`. If `--query-escrow` is set, the method queries the escrow service for the latest deposit and payout status before returning.
-
-6. Print the full `SwapRef` as structured JSON, including all fields:
-   ```typescript
-   console.log('Swap Status:');
-   console.log(JSON.stringify(status, null, 2));
-   ```
-
-   The output includes: `swapId`, `deal` (full `SwapDeal`), `role`, `progress`, `manifestId`, `depositInvoiceId`, `depositTransferId`, `payoutVerified`, `counterpartyDeposited`, `createdAt`, `updatedAt`, and any error details.
-
-7. If a deposit invoice ID is present, also fetch and print the invoice status:
-   ```typescript
-   if (status.depositInvoiceId && sphere.accounting) {
-     const invoiceStatus = await sphere.accounting.getInvoiceStatus(status.depositInvoiceId);
-     console.log('\nDeposit Invoice Status:');
-     console.log(JSON.stringify(invoiceStatus, null, 2));
-   }
-   ```
-
-8. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| Missing `swap_id` | Print usage string | 1 |
-| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
-| `sphere.swap` is null | `Swap module not enabled.` | 1 |
-| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
-| Escrow query failure | `Failed to query escrow: {details}` (non-fatal, print warning and continue with local data) | 0 |
+Prints the full `SwapRef` as structured JSON. If a deposit invoice ID is present, also fetches and prints the invoice status.
 
 ### 20.5 `swap-deposit`
 
@@ -2213,56 +2275,6 @@ swap-deposit <swap_id>
 
 Manual deposit command for when `swap-accept` was called without `--deposit`.
 
-**Step-by-step specification:**
-
-1. Parse `<swap_id>` as the first positional argument:
-   ```typescript
-   const swapId = args[1];
-   if (!swapId) {
-     console.error('Usage: swap-deposit <swap_id>');
-     process.exit(1);
-   }
-   ```
-
-2. Validate `swap_id` is 64 hexadecimal characters:
-   ```typescript
-   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-     console.error('Invalid swap ID — must be 64 hex characters');
-     process.exit(1);
-   }
-   ```
-
-3. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled.');
-     process.exit(1);
-   }
-   ```
-
-4. Call `sphere.swap.deposit(swapId)`. This pays the local party's share into the deposit invoice managed by the escrow.
-
-5. Print the result:
-   ```typescript
-   console.log('Deposit result:');
-   console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
-   ```
-
-6. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| Missing `swap_id` | Print usage string | 1 |
-| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
-| `sphere.swap` is null | `Swap module not enabled.` | 1 |
-| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
-| `SWAP_WRONG_STATE` | `Cannot deposit: swap is in {progress} state (expected "announced")` | 1 |
-| `SWAP_DEPOSIT_FAILED` | `Deposit failed: {details}` | 1 |
-| Insufficient balance | `Insufficient balance for deposit: need {amount} {coinId}, have {available}` | 1 |
-
 ### 20.6 `swap-reject`
 
 **Usage:**
@@ -2271,60 +2283,7 @@ Manual deposit command for when `swap-accept` was called without `--deposit`.
 swap-reject <swap_id> [reason]
 ```
 
-Reject a swap proposal received from a counterparty. Sends a `swap_rejection` DM to the proposer and moves the local swap record to `rejected` progress state.
-
-**Step-by-step specification:**
-
-1. Parse `<swap_id>` as the first positional argument:
-   ```typescript
-   const swapId = args[1];
-   if (!swapId) {
-     console.error('Usage: swap-reject <swap_id> [reason]');
-     process.exit(1);
-   }
-   ```
-
-2. Validate `swap_id` is 64 hexadecimal characters:
-   ```typescript
-   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-     console.error('Invalid swap ID — must be 64 hex characters');
-     process.exit(1);
-   }
-   ```
-
-3. Parse optional `[reason]` as the second positional argument (may be omitted):
-   ```typescript
-   const reason = args[2]; // undefined if not provided
-   ```
-
-4. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled.');
-     process.exit(1);
-   }
-   ```
-
-5. Call `sphere.swap.rejectSwap(swapId, reason)`.
-
-6. Print confirmation:
-   ```typescript
-   console.log(`Swap ${swapId.slice(0, 8)}... rejected.`);
-   if (reason) console.log(`Reason: ${reason}`);
-   ```
-
-7. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| Missing `swap_id` | Print usage string | 1 |
-| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
-| `sphere.swap` is null | `Swap module not enabled.` | 1 |
-| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
-| `SWAP_WRONG_STATE` | `Cannot reject: swap is in {progress} state (expected "proposed")` | 1 |
+Reject a swap proposal. Sends a `swap_rejection` DM to the proposer and transitions to `cancelled`.
 
 ### 20.7 `swap-cancel`
 
@@ -2334,55 +2293,7 @@ Reject a swap proposal received from a counterparty. Sends a `swap_rejection` DM
 swap-cancel <swap_id>
 ```
 
-Cancel a swap that you proposed or accepted. Sends a `swap_cancellation` DM to the counterparty and moves the local swap record to `cancelled` progress state. If the swap has been announced to an escrow but deposits are not yet complete, the escrow is notified and any existing deposits are returned.
-
-**Step-by-step specification:**
-
-1. Parse `<swap_id>` as the first positional argument:
-   ```typescript
-   const swapId = args[1];
-   if (!swapId) {
-     console.error('Usage: swap-cancel <swap_id>');
-     process.exit(1);
-   }
-   ```
-
-2. Validate `swap_id` is 64 hexadecimal characters:
-   ```typescript
-   if (!/^[0-9a-f]{64}$/i.test(swapId)) {
-     console.error('Invalid swap ID — must be 64 hex characters');
-     process.exit(1);
-   }
-   ```
-
-3. Call `getSphere()` and check swap module availability:
-   ```typescript
-   const sphere = await getSphere();
-   if (!sphere.swap) {
-     console.error('Swap module not enabled.');
-     process.exit(1);
-   }
-   ```
-
-4. Call `sphere.swap.cancelSwap(swapId)`.
-
-5. Print confirmation:
-   ```typescript
-   console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
-   ```
-
-6. Call `closeSphere()`.
-
-**Error handling:**
-
-| Condition | Message | Exit |
-|-----------|---------|------|
-| Missing `swap_id` | Print usage string | 1 |
-| Invalid `swap_id` format | `Invalid swap ID — must be 64 hex characters` | 1 |
-| `sphere.swap` is null | `Swap module not enabled.` | 1 |
-| `SWAP_NOT_FOUND` | `Swap not found: {swapId}` | 1 |
-| `SWAP_WRONG_STATE` | `Cannot cancel: swap is in {progress} state` | 1 |
-| `SWAP_ALREADY_TERMINAL` | `Swap is already in terminal state: {progress}` | 1 |
+Cancel a swap. If post-announcement, notifies the escrow to cancel and return deposits.
 
 ### 20.8 CLI Command Quick Reference
 
