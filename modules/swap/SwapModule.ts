@@ -255,8 +255,17 @@ export class SwapModule {
         swap.error = 'Proposal timed out';
         swap.updatedAt = now;
         await this.persistSwap(swap);
-        // Track as terminal so replayed proposal DMs don't recreate it this session
+        // Track as terminal so replayed proposal DMs don't recreate it this session.
+        // Also add to _storedTerminalEntries so subsequent persistIndex() calls (triggered
+        // by other swap persists) include this entry — without it the record would be
+        // dropped from the index once the cleanup loop removes the swap from this.swaps.
         this.terminalSwapIds.add(swap.swapId);
+        this._storedTerminalEntries.push({
+          swapId: swap.swapId,
+          progress: 'failed',
+          role: swap.role,
+          createdAt: swap.createdAt,
+        });
         if (this.config.debug) {
           logger.debug(LOG_TAG, `Proposal ${swap.swapId} timed out during load`);
         }
@@ -958,9 +967,11 @@ export class SwapModule {
       swap.updatedAt = Date.now();
       // Maintain invariant: all terminal swaps are in terminalSwapIds (not just this.swaps).
       // transitionProgress() is bypassed here, so we must update both collections manually.
+      // IMPORTANT: persistSwap must run while swap is still in this.swaps — persistIndex()
+      // iterates this.swaps to build the index; deleting before persist orphans the record.
       this.terminalSwapIds.add(swapId);
-      this.swaps.delete(swapId);
       await this.persistSwap(swap);
+      this.swaps.delete(swapId);
       throw new SphereError(
         `Failed to send proposal DM: ${err instanceof Error ? err.message : String(err)}`,
         'SWAP_DM_SEND_FAILED',
@@ -1218,10 +1229,11 @@ export class SwapModule {
         await this.withSwapGate(swapId, async () => {
           const currentSwap = this.swaps.get(swapId);
           if (!currentSwap || isTerminalProgress(currentSwap.progress)) return;
-          // Guard: if escrow already acknowledged the announce (depositInvoiceId or escrowState
-          // set by an announce_result DM that arrived while sendAnnounce_v2 was retrying),
-          // the announce actually succeeded. A later retry timeout must not clobber that.
-          if (currentSwap.depositInvoiceId || currentSwap.escrowState) {
+          // Guard: if escrow already acknowledged the announce (depositInvoiceId set by an
+          // announce_result DM that arrived while sendAnnounce_v2 was retrying), the announce
+          // actually succeeded. escrowState alone is insufficient — a rogue/replayed
+          // announce_result could set escrowState without providing a deposit invoice.
+          if (currentSwap.depositInvoiceId) {
             logger.warn(LOG_TAG, `v2 announce for ${swapId.slice(0, 12)} threw but escrow already ack'd — ignoring failure`);
             return;
           }
@@ -2302,8 +2314,9 @@ export class SwapModule {
 
                 await this.withSwapGate(swapId, async () => {
                   // TOCTOU guard — re-check state after acquiring gate.
-                  // A concurrent cancellation or failure may have fired while we waited.
-                  if (isTerminalProgress(swap.progress)) return;
+                  // Must still be in accepted/proposed; a concurrent cancellation, failure,
+                  // or second announce_result DM may have advanced or terminated the swap.
+                  if (swap.progress !== 'accepted' && swap.progress !== 'proposed') return;
 
                   // Store depositInvoiceId and escrowState
                   swap.depositInvoiceId = msg.deposit_invoice_id;
@@ -2635,8 +2648,11 @@ export class SwapModule {
                 // All bounce handling inside the gate so that swap:bounce_received fires
                 // after any state transition — listeners see a consistent swap.progress.
                 await this.withSwapGate(swapId, async () => {
-                  if (!isTerminalProgress(swap.progress) &&
-                      (msg.reason === 'SWAP_NOT_FOUND' || msg.reason === 'SWAP_CLOSED')) {
+                  // TOCTOU guard — if swap became terminal while waiting for gate
+                  // (relay replay, concurrent cancel/fail), suppress all events.
+                  if (isTerminalProgress(swap.progress)) return;
+
+                  if (msg.reason === 'SWAP_NOT_FOUND' || msg.reason === 'SWAP_CLOSED') {
                     await this.transitionProgress(swap, 'failed', {
                       error: `Escrow bounce: ${msg.reason}`,
                     });
@@ -2685,6 +2701,9 @@ export class SwapModule {
                 // If swap is in 'accepted' state (error in response to announce), transition to 'failed'
                 if (swap.progress === 'accepted') {
                   await this.withSwapGate(errorSwapId, async () => {
+                    // TOCTOU guard — swap may have advanced (e.g., to announced) or been
+                    // cancelled/failed by a concurrent handler while we waited for the gate.
+                    if (swap.progress !== 'accepted') return;
                     await this.transitionProgress(swap, 'failed', {
                       error: `Escrow error: ${msg.error}`,
                     });
@@ -2775,12 +2794,17 @@ export class SwapModule {
           coinId: transfer.coinId,
         });
 
-        // Determine local party's currency based on address match
-        const localAddress = deps.identity.directAddress;
+        // Determine local party's currency based on address match.
+        // Use getActiveAddresses() rather than deps.identity.directAddress so that
+        // multi-address wallets (where the swap address may not be the current active
+        // address) are handled correctly.
+        const activeDirectAddresses = new Set(
+          deps.getActiveAddresses().map((a) => a.directAddress),
+        );
         let localCurrency: string | undefined;
-        if (localAddress === swap.manifest.party_a_address) {
+        if (activeDirectAddresses.has(swap.manifest.party_a_address)) {
           localCurrency = swap.manifest.party_a_currency_to_change;
-        } else if (localAddress === swap.manifest.party_b_address) {
+        } else if (activeDirectAddresses.has(swap.manifest.party_b_address)) {
           localCurrency = swap.manifest.party_b_currency_to_change;
         }
 

@@ -504,8 +504,10 @@ function parseAcceptance(json: string): ParsedSwapDM | null {
     type: 'swap_acceptance',
     version,
     swap_id: obj.swap_id as string,
-    ...(typeof obj.acceptor_signature === 'string' ? { acceptor_signature: obj.acceptor_signature } : {}),
-    ...(typeof obj.acceptor_chain_pubkey === 'string' ? { acceptor_chain_pubkey: obj.acceptor_chain_pubkey } : {}),
+    // Only include v2 fields for v2 messages — prevent v1 messages that happen to
+    // carry these fields from being mis-interpreted as v2 acceptances.
+    ...(version === 2 && typeof obj.acceptor_signature === 'string' ? { acceptor_signature: obj.acceptor_signature } : {}),
+    ...(version === 2 && typeof obj.acceptor_chain_pubkey === 'string' ? { acceptor_chain_pubkey: obj.acceptor_chain_pubkey } : {}),
   };
 
   return { kind: 'acceptance', payload };
@@ -651,9 +653,15 @@ function copyExtensibilityKeys(
   for (const key of Object.keys(obj)) {
     if (skipKeys.has(key) || BLOCKED_PAYLOAD_KEYS.has(key)) continue;
     const val = obj[key];
-    // Cap string values to prevent memory amplification
-    if (typeof val === 'string' && val.length > MAX_PAYLOAD_STRING_LEN) continue;
-    target[key] = val;
+    // Only forward safe primitive values — objects and arrays are rejected to prevent
+    // memory amplification from deeply nested or large structures in untrusted payloads.
+    if (typeof val === 'string') {
+      if (val.length > MAX_PAYLOAD_STRING_LEN) continue;
+      target[key] = val;
+    } else if (typeof val === 'number' || typeof val === 'boolean' || val === null) {
+      target[key] = val;
+    }
+    // Skip objects, arrays, undefined
   }
 }
 
