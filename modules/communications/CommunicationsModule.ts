@@ -418,7 +418,10 @@ export class CommunicationsModule {
     // Replay existing messages to new handler — ensures DMs that arrived
     // before this handler was registered (e.g., swap proposals arriving
     // during Sphere.init before SwapModule.load) are not lost.
-    for (const message of this.messages.values()) {
+    // Snapshot to avoid re-entrancy issues if the handler side-effects mutate
+    // this.messages (e.g., via pruneMessages triggered by sendDM → save).
+    const snapshot = Array.from(this.messages.values());
+    for (const message of snapshot) {
       try {
         handler(message);
       } catch {

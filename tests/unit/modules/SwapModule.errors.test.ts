@@ -17,6 +17,7 @@ import {
   injectSwapRef,
   SphereError,
   DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_PARTY_A_PUBKEY,
   DEFAULT_TEST_PARTY_A_ADDRESS,
   DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_PARTY_B_ADDRESS,
@@ -24,6 +25,7 @@ import {
   DEFAULT_TEST_ESCROW_ADDRESS,
   type TestSwapModuleMocks,
 } from './swap-test-helpers.js';
+import { buildManifest } from '../../../modules/swap/manifest.js';
 
 describe('SwapModule.errors', () => {
   let module: SwapModule;
@@ -227,13 +229,21 @@ describe('SwapModule.errors', () => {
   it('UT-SWAP-ERR-009a: announce failure in acceptSwap transitions to failed', async () => {
     vi.useFakeTimers();
 
-    // Create an acceptor swap in 'proposed' state
+    // Create a v2 acceptor swap in 'proposed' state so acceptSwap sends an announce
+    const deal = createTestSwapDeal();
+    const manifest = buildManifest(
+      deal.partyA, deal.partyB, deal, deal.timeout, DEFAULT_TEST_ESCROW_ADDRESS,
+    );
     const ref = createTestSwapRef({
       role: 'acceptor',
       progress: 'proposed',
       counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
       escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
+      manifest,
+      swapId: manifest.swap_id,
+      protocolVersion: 2,
+      proposerChainPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
     });
     injectSwapRef(module, ref);
 

@@ -187,7 +187,7 @@ export function validateManifest(manifest: SwapManifest): { valid: boolean; erro
       timeout: manifest.timeout,
       salt: manifest.salt,
       ...(manifest.escrow_address ? { escrow_address: manifest.escrow_address } : {}),
-      ...(manifest.protocol_version ? { protocol_version: manifest.protocol_version } : {}),
+      ...(manifest.protocol_version !== undefined ? { protocol_version: manifest.protocol_version } : {}),
     };
     const recomputed = computeSwapId(hashFields);
     if (recomputed !== manifest.swap_id) {

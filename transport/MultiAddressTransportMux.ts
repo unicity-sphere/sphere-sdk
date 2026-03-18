@@ -340,7 +340,9 @@ export class MultiAddressTransportMux {
    * before the CLI reads in-memory state.
    */
   async fetchPendingEvents(): Promise<void> {
-    if (!this.nostrClient?.isConnected() || this.addresses.size === 0) return;
+    // Capture client reference to avoid race with concurrent disconnect() call
+    const client = this.nostrClient;
+    if (!client?.isConnected() || this.addresses.size === 0) return;
 
     const allPubkeys: string[] = [];
     for (const entry of this.addresses.values()) {
@@ -364,11 +366,11 @@ export class MultiAddressTransportMux {
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
-        if (subId) this.nostrClient?.unsubscribe(subId);
+        if (subId) client.unsubscribe(subId);
         resolve();
       }, 5000);
 
-      const subId = this.nostrClient!.subscribe(filter, {
+      const subId = client.subscribe(filter, {
         onEvent: (event) => {
           events.push({
             id: event.id,
@@ -382,7 +384,7 @@ export class MultiAddressTransportMux {
         },
         onEndOfStoredEvents: () => {
           clearTimeout(timeout);
-          this.nostrClient?.unsubscribe(subId);
+          client.unsubscribe(subId);
           resolve();
         },
       });

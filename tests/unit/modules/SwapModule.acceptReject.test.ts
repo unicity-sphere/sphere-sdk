@@ -15,11 +15,14 @@ import {
   createTestSwapRef,
   injectSwapRef,
   DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+  DEFAULT_TEST_PARTY_A_PUBKEY,
   DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
   DEFAULT_TEST_ESCROW_ADDRESS,
   SphereError,
 } from './swap-test-helpers.js';
+import { buildManifest } from '../../../modules/swap/manifest.js';
+import { createTestSwapDeal } from './swap-test-helpers.js';
 import type { SwapModule } from '../../../modules/swap/index.js';
 import type { TestSwapModuleMocks } from './swap-test-helpers.js';
 import type { SwapRef } from '../../../modules/swap/types.js';
@@ -66,10 +69,19 @@ let mocks: TestSwapModuleMocks;
 let swapRef: SwapRef;
 
 function setupAcceptorProposed(): SwapRef {
+  // Build a v2 manifest with escrow_address so acceptSwap can sign and announce
+  const deal = createTestSwapDeal();
+  const manifest = buildManifest(
+    deal.partyA, deal.partyB, deal, deal.timeout, DEFAULT_TEST_ESCROW_ADDRESS,
+  );
   const ref = createTestSwapRef({
     role: 'acceptor',
     progress: 'proposed',
     counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
+    manifest,
+    swapId: manifest.swap_id,
+    protocolVersion: 2,
+    proposerChainPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,
   });
   injectSwapRef(module, ref);
   return ref;
