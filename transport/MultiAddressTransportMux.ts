@@ -93,7 +93,9 @@ interface AddressEntry {
   nostrPubkey: string;
   adapter: AddressTransportAdapter;
   lastEventTs: number;
+  lastDmEventTs: number;
   fallbackSince: number | null;
+  fallbackDmSince: number | null;
 }
 
 // =============================================================================
@@ -192,7 +194,9 @@ export class MultiAddressTransportMux {
       nostrPubkey,
       adapter,
       lastEventTs: 0,
+      lastDmEventTs: 0,
       fallbackSince: null,
+      fallbackDmSince: null,
     };
 
     this.addresses.set(index, entry);
@@ -246,6 +250,13 @@ export class MultiAddressTransportMux {
     const entry = this.addresses.get(index);
     if (entry) {
       entry.fallbackSince = sinceSeconds;
+    }
+  }
+
+  setFallbackDmSince(index: number, sinceSeconds: number): void {
+    const entry = this.addresses.get(index);
+    if (entry) {
+      entry.fallbackDmSince = sinceSeconds;
     }
   }
 
@@ -412,13 +423,23 @@ export class MultiAddressTransportMux {
 
     logger.debug('Mux', `Subscribing for ${allPubkeys.length} address(es):`, allPubkeys.map(p => p.slice(0, 12)).join(', '));
 
-    // Determine global 'since' — minimum across all addresses
+    // Determine global 'since' for wallet and DM subscriptions in one pass.
+    // Each address has independent stored timestamps; we take the minimum.
     let globalSince = Math.floor(Date.now() / 1000);
-    for (const entry of this.addresses.values()) {
-      const since = await this.getAddressSince(entry);
-      if (since < globalSince) {
-        globalSince = since;
-      }
+    let globalDmSince = Math.floor(Date.now() / 1000);
+    const entries = [...this.addresses.values()];
+    const sinceResults = await Promise.all(
+      entries.map(async (entry) => {
+        const [walletSince, dmSince] = await Promise.all([
+          this.getAddressSince(entry),
+          this.getAddressDmSince(entry),
+        ]);
+        return { walletSince, dmSince };
+      }),
+    );
+    for (const { walletSince, dmSince } of sinceResults) {
+      if (walletSince < globalSince) globalSince = walletSince;
+      if (dmSince < globalDmSince) globalDmSince = dmSince;
     }
 
     // Subscribe to wallet events for ALL pubkeys
@@ -452,10 +473,10 @@ export class MultiAddressTransportMux {
       },
     });
 
-    // Subscribe to chat events (NIP-17 gift wrap) for ALL pubkeys — no since filter
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = allPubkeys;
+    chatFilter.since = globalDmSince;
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
@@ -578,7 +599,12 @@ export class MultiAddressTransportMux {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const pm = NIP17.unwrap(event as any, entry.keyManager);
 
-        // Successfully decrypted — route to this address
+        // Successfully decrypted — route to this address.
+        // Persist DM timestamp after successful unwrap so failed decryptions
+        // do not advance the since filter and permanently skip events.
+        if (event.created_at) {
+          this.updateLastDmEventTimestamp(entry, event.created_at);
+        }
         logger.debug('Mux', `Gift wrap decrypted by address ${entry.index}, sender: ${pm.senderPubkey?.slice(0, 16)}`);
 
         // Handle self-wrap
@@ -1012,6 +1038,52 @@ export class MultiAddressTransportMux {
     });
   }
 
+  private updateLastDmEventTimestamp(entry: AddressEntry, createdAt: number): void {
+    if (!this.storage) return;
+    if (createdAt <= entry.lastDmEventTs) return;
+
+    entry.lastDmEventTs = createdAt;
+    const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_DM_EVENT_TS}_${entry.nostrPubkey.slice(0, 16)}`;
+
+    this.storage.set(storageKey, createdAt.toString()).catch(err => {
+      logger.debug('Mux', 'Failed to save last DM event timestamp:', err);
+    });
+  }
+
+  private async getAddressDmSince(entry: AddressEntry): Promise<number> {
+    if (this.storage) {
+      const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_DM_EVENT_TS}_${entry.nostrPubkey.slice(0, 16)}`;
+      try {
+        const stored = await this.storage.get(storageKey);
+        const parsed = stored ? parseInt(stored, 10) : NaN;
+        if (Number.isFinite(parsed)) {
+          entry.lastDmEventTs = parsed;
+          entry.fallbackDmSince = null; // Stored value takes priority
+          return parsed;
+        } else if (entry.fallbackDmSince !== null) {
+          const ts = entry.fallbackDmSince;
+          entry.lastDmEventTs = ts;
+          entry.fallbackDmSince = null; // Consume once
+          return ts;
+        }
+      } catch {
+        if (entry.fallbackDmSince !== null) {
+          const ts = entry.fallbackDmSince;
+          entry.lastDmEventTs = ts;
+          entry.fallbackDmSince = null;
+          return ts;
+        }
+      }
+    } else if (entry.fallbackDmSince !== null) {
+      const ts = entry.fallbackDmSince;
+      entry.lastDmEventTs = ts;
+      entry.fallbackDmSince = null;
+      return ts;
+    }
+    // No storage, no fallback — start from now (no historical replay)
+    return Math.floor(Date.now() / 1000);
+  }
+
   // ===========================================================================
   // Mux-level event system
   // ===========================================================================
@@ -1374,6 +1446,10 @@ export class AddressTransportAdapter implements TransportProvider {
 
   setFallbackSince(sinceSeconds: number): void {
     this.mux.setFallbackSince(this.addressIndex, sinceSeconds);
+  }
+
+  setFallbackDmSince(sinceSeconds: number): void {
+    this.mux.setFallbackDmSince(this.addressIndex, sinceSeconds);
   }
 
   async fetchPendingEvents(): Promise<void> {

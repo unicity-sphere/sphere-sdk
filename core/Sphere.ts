@@ -348,6 +348,12 @@ export interface SphereInitOptions {
    * - false/undefined: no auto-discovery (default)
    */
   discoverAddresses?: boolean | DiscoverAddressesOptions;
+  /**
+   * Fallback 'since' timestamp (unix seconds) for the DM (gift-wrap) subscription.
+   * Used when no persisted DM timestamp exists in storage (e.g. first connect).
+   * Without this, a fresh wallet starts from "now" and misses older DMs.
+   */
+  dmSince?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -464,6 +470,8 @@ export class Sphere {
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
   private _transportMux: MultiAddressTransportMux | null = null;
+  /** Fallback DM since timestamp from init options, forwarded to mux on creation. */
+  private _dmSince: number | null = null;
 
   // Stored configs for creating per-address modules
   private _l1Config: L1Config | undefined;
@@ -605,6 +613,10 @@ export class Sphere {
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
       });
+      // Store dmSince for forwarding to transport/mux when subscriptions are set up
+      if (options.dmSince != null) {
+        sphere._dmSince = options.dmSince;
+      }
       return { sphere, created: false };
     }
 
@@ -642,6 +654,9 @@ export class Sphere {
       onProgress: options.onProgress,
     });
 
+    if (options.dmSince != null) {
+      sphere._dmSince = options.dmSince;
+    }
     return { sphere, created: true, generatedMnemonic };
   }
 
@@ -2320,6 +2335,11 @@ export class Sphere {
     // Resolve operations are delegated to the original transport
     const addressTransport: TransportProvider = adapter ?? this._transport;
 
+    // Forward dmSince to the raw transport when no mux is used
+    if (!adapter && this._dmSince != null && addressTransport.setFallbackDmSince) {
+      addressTransport.setFallbackDmSince(this._dmSince);
+    }
+
     // Create fresh module instances for this address
     const payments = createPaymentsModule({ l1: this._l1Config });
     const communications = createCommunicationsModule();
@@ -2430,6 +2450,11 @@ export class Sphere {
       }
 
       logger.debug('Sphere', 'Transport mux created and connected');
+    }
+
+    // Forward dmSince fallback to the mux for this address
+    if (this._dmSince != null) {
+      this._transportMux.setFallbackDmSince(index, this._dmSince);
     }
 
     // Register address in the mux (resolve delegated to original transport)

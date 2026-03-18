@@ -276,6 +276,15 @@ export interface TransportProvider extends BaseProvider {
   setFallbackSince?(sinceSeconds: number): void;
 
   /**
+   * Set fallback 'since' timestamp for DM (gift-wrap) subscriptions.
+   * Used when no persisted DM timestamp exists in storage (e.g. first connect).
+   * Consumed once by the next subscription setup, then cleared.
+   *
+   * @param sinceSeconds - Unix timestamp in seconds
+   */
+  setFallbackDmSince?(sinceSeconds: number): void;
+
+  /**
    * Fetch pending events from transport (one-shot query).
    * Creates a temporary subscription, processes events through normal handlers,
    * and resolves after EOSE (End Of Stored Events).
