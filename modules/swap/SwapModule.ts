@@ -341,6 +341,9 @@ export class SwapModule {
                 // v2 proposer: Bob already announced. Just send a status query.
                 logger.debug(LOG_TAG, `v2 crash recovery: proposer waiting for announce_result ${swapRef.swapId.slice(0, 12)}`);
                 await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
+                // Start bounded timer AFTER the status query is sent so the 30s window
+                // begins from now, not from before the DM was dispatched.
+                this.startAnnounceTimer(swapRef.swapId);
               } else if (swapRef.protocolVersion === 2 && swapRef.role === 'acceptor') {
                 // v2 acceptor: re-announce with v2 format (both signatures)
                 logger.debug(LOG_TAG, `v2 crash recovery: re-announcing swap ${swapRef.swapId.slice(0, 12)}`);
@@ -358,9 +361,14 @@ export class SwapModule {
                     party_b: weArePartyA ? swapRef.proposerChainPubkey : deps.identity.chainPubkey,
                   };
                   await sendAnnounce_v2(deps.communications, escrowPubkey, swapRef.manifest, signatures, chainPubkeys, swapRef.auxiliary);
+                  // Start bounded timer AFTER announce is sent — the 30s window for
+                  // escrow to reply starts now, not before the DM was dispatched.
+                  this.startAnnounceTimer(swapRef.swapId);
                 } else {
                   // Missing signatures — fall back to status query
                   await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
+                  // Same: timer starts after the DM send completes.
+                  this.startAnnounceTimer(swapRef.swapId);
                 }
               } else {
                 // v1: Re-send announce DM to escrow (idempotent — escrow returns existing state)
@@ -979,15 +987,20 @@ export class SwapModule {
       // transitionProgress() is bypassed here, so we must update all three collections manually.
       // IMPORTANT: persistSwap must run while swap is still in this.swaps — persistIndex()
       // iterates this.swaps to build the index; deleting before persist orphans the record.
+      // The finally block ensures _storedTerminalEntries and swaps are updated even if
+      // persistSwap throws (e.g., storage error) so in-memory state stays consistent.
       this.terminalSwapIds.add(swapId);
-      await this.persistSwap(swap);
-      this._storedTerminalEntries.push({
-        swapId,
-        progress: 'failed',
-        role: swap.role,
-        createdAt: swap.createdAt,
-      });
-      this.swaps.delete(swapId);
+      try {
+        await this.persistSwap(swap);
+      } finally {
+        this._storedTerminalEntries.push({
+          swapId,
+          progress: 'failed',
+          role: swap.role,
+          createdAt: swap.createdAt,
+        });
+        this.swaps.delete(swapId);
+      }
       throw new SphereError(
         `Failed to send proposal DM: ${err instanceof Error ? err.message : String(err)}`,
         'SWAP_DM_SEND_FAILED',
@@ -1136,13 +1149,22 @@ export class SwapModule {
       // Assign acceptor signature (v2 only) and auxiliary to swap BEFORE transitioning.
       // transitionProgress calls persistSwap, so these fields are included in the
       // single atomic write — no second persistSwap needed.
+      const prevAcceptorSignature = (swap as { acceptorSignature?: string }).acceptorSignature;
+      const prevAuxiliary = (swap as { auxiliary?: ManifestAuxiliary }).auxiliary;
       if (isV2 && acceptorSignature) {
         (swap as { acceptorSignature?: string }).acceptorSignature = acceptorSignature;
       }
       (swap as { auxiliary?: ManifestAuxiliary }).auxiliary = acceptorAuxiliary;
 
       // Step 4: Transition to 'accepted' (persist-before-act, includes signature + auxiliary)
-      await this.transitionProgress(swap, 'accepted');
+      try {
+        await this.transitionProgress(swap, 'accepted');
+      } catch (err) {
+        // Roll back in-memory mutations so the swap is not left with partial state
+        (swap as { acceptorSignature?: string }).acceptorSignature = prevAcceptorSignature;
+        (swap as { auxiliary?: ManifestAuxiliary }).auxiliary = prevAuxiliary;
+        throw err;
+      }
 
       // Step 5: Send acceptance DM to proposer
       try {
@@ -3050,12 +3072,10 @@ export class SwapModule {
         this.startProposalTimer(swap.swapId);
       }
 
-      // §16.2: For accepted v2 acceptor swaps — announce was already sent but escrow has
-      // not yet delivered invoice_delivery. Start announce timer to fail the swap if
-      // the escrow never responds (e.g., announce_result DM was lost before restart).
-      if (swap.progress === 'accepted' && swap.role === 'acceptor' && swap.protocolVersion === 2) {
-        this.startAnnounceTimer(swap.swapId);
-      }
+      // NOTE: announce timer for accepted v2 acceptor swaps is started in crash recovery
+      // (Step 8) AFTER the announce/status-query DM is sent — not here. Starting it here
+      // would race with the DM send: sendAnnounce_v2 retries for up to ~82s, so a 30s
+      // timer started before that send would fire and fail the swap prematurely.
     }
   }
 
