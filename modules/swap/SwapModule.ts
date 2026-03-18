@@ -2659,6 +2659,8 @@ export class SwapModule {
                     if (isTerminalProgress(swap.progress)) return;
                     // Reject malformed payout deliveries without an invoice_id — we need
                     // the id to track the payout and for idempotency on relay replays.
+                    // If the escrow keeps omitting the id, the local timer will eventually
+                    // cancel the swap; crash recovery re-requests the payout invoice on restart.
                     if (!msg.invoice_id) {
                       logger.warn(LOG_TAG, `Payout invoice_delivery for swap ${swapId} has no invoice_id — ignoring`);
                       return;
@@ -2789,10 +2791,18 @@ export class SwapModule {
                         }
                         // Emit the event corresponding to the reached state so UIs
                         // don't miss state transitions during a catch-up walk.
+                        // NOTE: swap:depositing and swap:awaiting_counter are intentionally
+                        // omitted — their normal-flow events (swap:deposit_sent,
+                        // swap:deposit_confirmed) carry transfer-specific payloads not
+                        // available during catch-up.
                         if (intermediate === 'accepted') {
                           deps.emitEvent('swap:accepted', { swapId, role: swap.role });
-                        } else if (intermediate === 'announced') {
-                          deps.emitEvent('swap:announced', { swapId, depositInvoiceId: swap.depositInvoiceId ?? '' });
+                        } else if (intermediate === 'announced' && swap.depositInvoiceId) {
+                          // Only emit swap:announced if the deposit invoice is available.
+                          // Without depositInvoiceId, the event would tell the user "deposit ready"
+                          // but calling deposit() would throw SWAP_WRONG_STATE. The invoice will
+                          // arrive via a separate invoice_delivery DM and emit swap:announced then.
+                          deps.emitEvent('swap:announced', { swapId, depositInvoiceId: swap.depositInvoiceId });
                         } else if (intermediate === 'concluding') {
                           deps.emitEvent('swap:concluding', { swapId });
                         }
