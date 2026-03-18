@@ -85,6 +85,9 @@ export class SwapModule {
    * Used to reject replayed proposal DMs for swaps that were already processed.
    * Populated during loadFromStorage and updated on terminal transitions. */
   private terminalSwapIds: Set<string> = new Set();
+  /** Terminal index entries loaded from storage — preserved so persistIndex()
+   * can merge them back (terminal swaps are NOT in this.swaps). */
+  private _storedTerminalEntries: SwapIndexEntry[] = [];
   private _gateMap = new AsyncGateMap();
   private localTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private invoiceToSwapIndex: Map<string, string> = new Map(); // invoiceId -> swapId
@@ -218,6 +221,7 @@ export class SwapModule {
     // Step 1: Clear in-memory state
     this.swaps.clear();
     this.terminalSwapIds.clear();
+    this._storedTerminalEntries = [];
     this.invoiceToSwapIndex.clear();
     this.loaded = false;
 
@@ -442,6 +446,11 @@ export class SwapModule {
    * Persist the lightweight swap index to storage.
    * The index contains summary entries for all known swaps (including terminal).
    */
+  /**
+   * Persist the swap index. Merges in-memory active swaps with stored
+   * terminal entries (which are not kept in this.swaps but still need
+   * to be in the index for dedup and TTL purging).
+   */
   private async persistIndex(): Promise<void> {
     const deps = this.deps;
     if (!deps) return;
@@ -455,9 +464,15 @@ export class SwapModule {
       STORAGE_KEYS_ADDRESS.SWAP_INDEX,
     );
 
-    const entries: SwapIndexEntry[] = [];
+    // Start with terminal entries preserved from the last load
+    const indexMap = new Map<string, SwapIndexEntry>();
+    for (const entry of this._storedTerminalEntries) {
+      indexMap.set(entry.swapId, entry);
+    }
+
+    // Overlay with current in-memory swaps (active + newly terminal)
     for (const swap of this.swaps.values()) {
-      entries.push({
+      indexMap.set(swap.swapId, {
         swapId: swap.swapId,
         progress: swap.progress,
         role: swap.role,
@@ -465,7 +480,7 @@ export class SwapModule {
       });
     }
 
-    await deps.storage.set(indexKey, JSON.stringify(entries));
+    await deps.storage.set(indexKey, JSON.stringify([...indexMap.values()]));
   }
 
   /**
@@ -514,7 +529,8 @@ export class SwapModule {
           indexDirty = true;
           continue;
         }
-        // Terminal but not yet expired — skip loading into memory but keep in index
+        // Terminal but not yet expired — skip loading into memory but preserve in index
+        this._storedTerminalEntries.push(entry);
         continue;
       }
 
