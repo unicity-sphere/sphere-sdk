@@ -274,41 +274,67 @@ export class SwapModule {
     // Step 7: Resume local timers
     this.resumeTimers();
 
-    // Step 8: Crash recovery — per-state recovery actions
+    // Step 8: Crash recovery — per-state recovery actions (fire-and-forget)
+    // Each recovery action is async and tolerates failures — the swap will
+    // eventually be resolved by the escrow timeout or the next CLI sync.
     for (const swap of this.swaps.values()) {
-      try {
-        switch (swap.progress) {
-          case 'accepted':
-            // Re-send announce DM to escrow (idempotent)
-            if (this.config.debug) {
-              logger.debug(LOG_TAG, `Crash recovery: re-announcing swap ${swap.swapId}`);
+      void (async () => {
+        try {
+          // Resolve escrow pubkey if not already stored
+          let escrowPubkey = swap.escrowPubkey;
+          if (!escrowPubkey) {
+            try {
+              const resolved = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
+              escrowPubkey = resolved.escrowPubkey;
+              swap.escrowPubkey = escrowPubkey;
+              swap.escrowDirectAddress = resolved.escrowDirectAddress;
+              await this.persistSwap(swap);
+            } catch {
+              logger.warn(LOG_TAG, `Crash recovery: cannot resolve escrow for swap ${swap.swapId.slice(0, 12)}`);
+              return;
             }
-            break;
-          case 'announced':
-          case 'depositing':
-            // Send status DM to escrow, request deposit invoice if missing
-            if (this.config.debug) {
-              logger.debug(LOG_TAG, `Crash recovery: status check for swap ${swap.swapId}`);
-            }
-            break;
-          case 'awaiting_counter':
-            // Send status DM to escrow
-            if (this.config.debug) {
-              logger.debug(LOG_TAG, `Crash recovery: status check for swap ${swap.swapId}`);
-            }
-            break;
-          case 'concluding':
-            // Send status DM, request payout invoice if missing
-            if (this.config.debug) {
-              logger.debug(LOG_TAG, `Crash recovery: concluding check for swap ${swap.swapId}`);
-            }
-            break;
-          default:
-            break;
+          }
+
+          switch (swap.progress) {
+            case 'accepted':
+              // Re-send announce DM to escrow (idempotent — escrow returns existing state)
+              logger.debug(LOG_TAG, `Crash recovery: re-announcing swap ${swap.swapId.slice(0, 12)}`);
+              await sendAnnounce(deps.communications, escrowPubkey, swap.manifest);
+              break;
+
+            case 'announced':
+            case 'depositing':
+              // Send status query to get latest escrow state
+              logger.debug(LOG_TAG, `Crash recovery: status query for swap ${swap.swapId.slice(0, 12)}`);
+              await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
+              // Request deposit invoice if missing
+              if (!swap.depositInvoiceId) {
+                await sendRequestInvoice(deps.communications, escrowPubkey, swap.swapId, 'deposit');
+              }
+              break;
+
+            case 'awaiting_counter':
+              // Send status query to check if both deposits are in
+              logger.debug(LOG_TAG, `Crash recovery: status query for swap ${swap.swapId.slice(0, 12)}`);
+              await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
+              break;
+
+            case 'concluding':
+              // Send status query + request payout invoice if missing
+              logger.debug(LOG_TAG, `Crash recovery: concluding check for swap ${swap.swapId.slice(0, 12)}`);
+              await sendStatusQuery(deps.communications, escrowPubkey, swap.swapId);
+              if (!swap.payoutInvoiceId) {
+                await sendRequestInvoice(deps.communications, escrowPubkey, swap.swapId, 'payout');
+              }
+              break;
+
+            default:
+              break;
+          }
+        } catch (err) {
+          logger.warn(LOG_TAG, `Crash recovery failed for swap ${swap.swapId.slice(0, 12)}:`, err);
         }
-      } catch (err) {
-        logger.warn(LOG_TAG, `Crash recovery failed for swap ${swap.swapId}:`, err);
-      }
+      })();
     }
 
     this.loaded = true;
