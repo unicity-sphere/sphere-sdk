@@ -316,15 +316,15 @@ describe('SwapModule.rejectSwap()', () => {
     );
   });
 
-  it('UT-SWAP-REJECT-004: wrong state throws SWAP_WRONG_STATE', async () => {
-    const announcedRef = createTestSwapRef({
+  it('UT-SWAP-REJECT-004: concluding state throws SWAP_WRONG_STATE (payouts in progress)', async () => {
+    const concludingRef = createTestSwapRef({
       role: 'acceptor',
-      progress: 'announced',
+      progress: 'concluding',
       counterpartyPubkey: DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY,
     });
-    injectSwapRef(module, announcedRef);
+    injectSwapRef(module, concludingRef);
 
-    await expect(module.rejectSwap(announcedRef.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
+    await expect(module.rejectSwap(concludingRef.swapId)).rejects.toMatchObject({ code: 'SWAP_WRONG_STATE' });
   });
 
   it('UT-SWAP-REJECT-005: includes reason in rejection DM', async () => {

@@ -993,31 +993,45 @@ export class SwapModule {
     if (!swap) {
       throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
     }
-    if (swap.progress !== 'proposed') {
-      throw new SphereError(
-        `Cannot reject: swap is in ${swap.progress} state`,
-        'SWAP_WRONG_STATE',
-      );
+
+    // Allow rejection at any pre-payout state
+    if (swap.progress === 'concluding') {
+      throw new SphereError('Cannot reject: payouts are already in progress', 'SWAP_WRONG_STATE');
     }
-    if (swap.role !== 'acceptor') {
-      throw new SphereError(
-        'Cannot reject: you are the proposer, not the acceptor',
-        'SWAP_WRONG_STATE',
-      );
+    if (swap.progress === 'completed') {
+      throw new SphereError('Cannot reject: swap is already completed', 'SWAP_ALREADY_COMPLETED');
+    }
+    if (swap.progress === 'cancelled' || swap.progress === 'failed') {
+      throw new SphereError('Swap is already cancelled', 'SWAP_ALREADY_CANCELLED');
     }
 
     // Step 3: Enter per-swap gate
     await this.withSwapGate(swapId, async () => {
-      // Step 4: Send rejection DM (best-effort, catch errors)
+      // Step 4: Send rejection DM to counterparty (best-effort)
       try {
         const dmContent = buildRejectionDM(swapId, reason);
-        await deps.communications.sendDM(swap.counterpartyPubkey!, dmContent);
+        if (swap.counterpartyPubkey) {
+          await deps.communications.sendDM(swap.counterpartyPubkey, dmContent);
+        }
       } catch (err) {
         logger.warn(LOG_TAG, `Failed to send rejection DM for swap ${swapId}:`, err);
       }
 
+      // Step 4b: If post-announcement, notify escrow to cancel and return deposits
+      if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
+        try {
+          const cancelDM = JSON.stringify({ type: 'cancel', swap_id: swapId, reason: reason ?? 'Rejected by user' });
+          await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to send cancel DM to escrow for swap ${swapId}:`, err);
+        }
+      }
+
+      // Clear local timer
+      this.clearLocalTimer(swapId);
+
       // Step 5: Transition to 'cancelled' with error
-      await this.transitionProgress(swap, 'cancelled', { error: 'Rejected by user' });
+      await this.transitionProgress(swap, 'cancelled', { error: reason ?? 'Rejected by user' });
 
       // Step 6: Emit swap:rejected
       deps.emitEvent('swap:rejected', { swapId, reason });
@@ -1408,7 +1422,10 @@ export class SwapModule {
       throw new SphereError(`Swap not found: ${swapId}`, 'SWAP_NOT_FOUND');
     }
 
-    // Terminal state checks
+    // Block cancellation once payouts have started
+    if (swap.progress === 'concluding') {
+      throw new SphereError('Cannot cancel: payouts are already in progress', 'SWAP_WRONG_STATE');
+    }
     if (swap.progress === 'completed') {
       throw new SphereError('Swap is already completed', 'SWAP_ALREADY_COMPLETED');
     }
@@ -1422,16 +1439,32 @@ export class SwapModule {
       // Clear local timer
       this.clearLocalTimer(swapId);
 
-      // Log warning for post-announcement cancellations
-      if (swap.progress === 'announced' || swap.progress === 'depositing' ||
-          swap.progress === 'awaiting_counter' || swap.progress === 'concluding') {
-        logger.warn(LOG_TAG, `Swap ${swapId} cancelled locally but escrow may still be active. Deposits will be returned on escrow timeout.`);
+      // Notify escrow to cancel and return any deposited assets
+      if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
+        try {
+          const cancelDM = JSON.stringify({ type: 'cancel', swap_id: swapId, reason: 'Cancelled by user' });
+          await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
+          logger.debug(LOG_TAG, `Sent cancel DM to escrow for swap ${swapId.slice(0, 12)}`);
+        } catch (err) {
+          logger.warn(LOG_TAG, `Failed to send cancel DM to escrow for swap ${swapId}:`, err);
+        }
+      }
+
+      // Notify counterparty (best-effort)
+      if (swap.counterpartyPubkey) {
+        try {
+          const dmContent = buildRejectionDM(swapId, 'Cancelled by counterparty');
+          await deps.communications.sendDM(swap.counterpartyPubkey, dmContent);
+        } catch {
+          // Best-effort
+        }
       }
 
       // Transition to cancelled
       await this.transitionProgress(swap, 'cancelled', { error: 'Cancelled by user' });
 
       // Emit swap:cancelled event
+      // depositsReturned will be updated when escrow sends deposit returns
       deps.emitEvent('swap:cancelled', {
         swapId,
         reason: 'explicit',
