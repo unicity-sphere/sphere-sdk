@@ -216,6 +216,22 @@ export function buildRequestInvoiceDM(
   });
 }
 
+/**
+ * Build a cancel DM to the escrow service.
+ * Requests the escrow to cancel the swap and return any deposited assets.
+ *
+ * @param swapId - The swap ID to cancel.
+ * @param reason - Human-readable reason for cancellation.
+ * @returns JSON string for the escrow DM.
+ */
+export function buildCancelDM(swapId: string, reason?: string): string {
+  return JSON.stringify({
+    type: 'cancel',
+    swap_id: swapId,
+    reason: reason ?? 'Cancelled by user',
+  });
+}
+
 // =============================================================================
 // Universal Parser
 // =============================================================================

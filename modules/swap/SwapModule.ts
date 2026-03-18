@@ -27,6 +27,7 @@ import {
   buildRejectionDM,
   buildAnnounceDM,
   buildStatusQueryDM,
+  buildCancelDM,
 } from './dm-protocol.js';
 import {
   computeSwapId,
@@ -1020,7 +1021,7 @@ export class SwapModule {
       // Step 4b: If post-announcement, notify escrow to cancel and return deposits
       if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
         try {
-          const cancelDM = JSON.stringify({ type: 'cancel', swap_id: swapId, reason: reason ?? 'Rejected by user' });
+          const cancelDM = buildCancelDM(swapId, reason ?? 'Rejected by user');
           await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
         } catch (err) {
           logger.warn(LOG_TAG, `Failed to send cancel DM to escrow for swap ${swapId}:`, err);
@@ -1442,7 +1443,7 @@ export class SwapModule {
       // Notify escrow to cancel and return any deposited assets
       if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
         try {
-          const cancelDM = JSON.stringify({ type: 'cancel', swap_id: swapId, reason: 'Cancelled by user' });
+          const cancelDM = buildCancelDM(swapId, 'Cancelled by user');
           await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
           logger.debug(LOG_TAG, `Sent cancel DM to escrow for swap ${swapId.slice(0, 12)}`);
         } catch (err) {
