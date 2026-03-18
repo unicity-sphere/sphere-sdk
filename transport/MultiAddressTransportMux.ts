@@ -598,12 +598,12 @@ export class MultiAddressTransportMux {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const pm = NIP17.unwrap(event as any, entry.keyManager);
 
-        // Successfully decrypted — track timestamp for since filter on next connect
+        // Successfully decrypted — route to this address.
+        // Persist DM timestamp after successful unwrap so failed decryptions
+        // do not advance the since filter and permanently skip events.
         if (event.created_at) {
           this.updateLastDmEventTimestamp(entry, event.created_at);
         }
-
-        // Successfully decrypted — route to this address
         logger.debug('Mux', `Gift wrap decrypted by address ${entry.index}, sender: ${pm.senderPubkey?.slice(0, 16)}`);
 
         // Handle self-wrap
@@ -1054,11 +1054,11 @@ export class MultiAddressTransportMux {
       const storageKey = `${STORAGE_KEYS_GLOBAL.LAST_DM_EVENT_TS}_${entry.nostrPubkey.slice(0, 16)}`;
       try {
         const stored = await this.storage.get(storageKey);
-        if (stored) {
-          const ts = parseInt(stored, 10);
-          entry.lastDmEventTs = ts;
+        const parsed = stored ? parseInt(stored, 10) : NaN;
+        if (Number.isFinite(parsed)) {
+          entry.lastDmEventTs = parsed;
           entry.fallbackDmSince = null; // Stored value takes priority
-          return ts;
+          return parsed;
         } else if (entry.fallbackDmSince !== null) {
           const ts = entry.fallbackDmSince;
           entry.lastDmEventTs = ts;
@@ -1079,7 +1079,8 @@ export class MultiAddressTransportMux {
       entry.fallbackDmSince = null;
       return ts;
     }
-    return Math.floor(Date.now() / 1000);
+    // No storage, no fallback — align with NostrTransportProvider's 24h lookback
+    return Math.floor(Date.now() / 1000) - 86400;
   }
 
   // ===========================================================================

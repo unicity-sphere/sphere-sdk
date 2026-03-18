@@ -841,7 +841,7 @@ describe('Last event timestamp persistence', () => {
       expect(lastSetCall[1]).toBe('1700000300');
     });
 
-    it('should persist DM timestamp for GIFT_WRAP events', async () => {
+    it('should NOT persist DM timestamp when GIFT_WRAP unwrap fails', async () => {
       const mockStorage = {
         get: vi.fn().mockResolvedValue(null),
         set: vi.fn().mockResolvedValue(undefined),
@@ -860,7 +860,7 @@ describe('Last event timestamp persistence', () => {
       chatCallbacks.onEvent({
         id: 'chat-event',
         kind: 1059, // GIFT_WRAP
-        content: '{}',
+        content: '{}', // Invalid gift wrap — unwrap will fail
         tags: [],
         pubkey: 'a'.repeat(64),
         created_at: 1700000500,
@@ -869,11 +869,9 @@ describe('Last event timestamp persistence', () => {
 
       await new Promise(resolve => setTimeout(resolve, 50));
 
-      // Should persist DM event timestamp under last_dm_event_ts key
-      expect(mockStorage.set).toHaveBeenCalledWith(
-        expect.stringContaining('last_dm_event_ts_'),
-        '1700000500',
-      );
+      // Timestamp should NOT be persisted when unwrap fails,
+      // otherwise the event would be permanently skipped on reconnect
+      expect(mockStorage.set).not.toHaveBeenCalled();
     });
 
     it('should handle storage write errors gracefully', async () => {

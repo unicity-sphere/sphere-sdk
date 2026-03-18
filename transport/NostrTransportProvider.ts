@@ -1250,13 +1250,15 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     try {
-      // Track the outer gift-wrap timestamp for the since filter on next connect.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pm = NIP17.unwrap(event as any, this.keyManager);
+
+      // Persist DM timestamp after successful unwrap so failed decryptions
+      // do not advance the since filter and permanently skip events.
       if (event.created_at) {
         this.updateLastDmEventTimestamp(event.created_at);
       }
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const pm = NIP17.unwrap(event as any, this.keyManager);
       logger.debug('Nostr', 'Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
 
       // Handle self-wrap (sent message copy for relay replay)
@@ -1806,8 +1808,9 @@ export class NostrTransportProvider implements TransportProvider {
       const dmStorageKey = `${STORAGE_KEYS_GLOBAL.LAST_DM_EVENT_TS}_${nostrPubkey.slice(0, 16)}`;
       try {
         const stored = await this.storage.get(dmStorageKey);
-        if (stored) {
-          dmSince = parseInt(stored, 10);
+        const parsed = stored ? parseInt(stored, 10) : NaN;
+        if (Number.isFinite(parsed)) {
+          dmSince = parsed;
           this.lastDmEventTs = dmSince;
           this.fallbackDmSince = null; // Stored value takes priority
           logger.debug('Nostr', 'DM resuming from stored timestamp:', dmSince);
