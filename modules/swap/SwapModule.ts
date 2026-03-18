@@ -1361,17 +1361,8 @@ export class SwapModule {
         throw new SphereError('Swap is already cancelled', 'SWAP_ALREADY_CANCELLED');
       }
 
-      // Step 4: Send rejection DM to counterparty (best-effort)
-      try {
-        const dmContent = buildRejectionDM(swapId, reason);
-        if (swap.counterpartyPubkey) {
-          await deps.communications.sendDM(swap.counterpartyPubkey, dmContent);
-        }
-      } catch (err) {
-        logger.warn(LOG_TAG, `Failed to send rejection DM for swap ${swapId}:`, err);
-      }
-
-      // Step 4b: If post-announcement, notify escrow to cancel and return deposits
+      // Step 4: If post-announcement, notify escrow first to cancel and return deposits.
+      // Escrow must be notified before the counterparty so deposits are protected promptly.
       if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
         try {
           const cancelDM = buildCancelDM(swapId, reason ?? 'Rejected by user');
@@ -1379,6 +1370,16 @@ export class SwapModule {
         } catch (err) {
           logger.warn(LOG_TAG, `Failed to send cancel DM to escrow for swap ${swapId}:`, err);
         }
+      }
+
+      // Step 4b: Send rejection DM to counterparty (best-effort, after escrow notified)
+      try {
+        const dmContent = buildRejectionDM(swapId, reason);
+        if (swap.counterpartyPubkey) {
+          await deps.communications.sendDM(swap.counterpartyPubkey, dmContent);
+        }
+      } catch (err) {
+        logger.warn(LOG_TAG, `Failed to send rejection DM for swap ${swapId}:`, err);
       }
 
       // Clear local timer
@@ -1531,11 +1532,13 @@ export class SwapModule {
         throw new SphereError('Payout invoice not yet received', 'SWAP_WRONG_STATE');
       }
 
-      // Idempotent for already-completed swaps: return the stored verification result
-      // rather than throwing a misleading SWAP_WRONG_STATE from assertTransition.
-      if (swap.progress === 'completed') return swap.payoutVerified ?? false;
+      // Idempotent for already-verified swaps: skip re-verification.
+      // IMPORTANT: only short-circuit when payoutVerified is true. If escrow status DM drove
+      // the swap to 'completed' before verifyPayout ran (payoutVerified=false), we must still
+      // allow the verification pass rather than returning false forever.
+      if (swap.progress === 'completed' && swap.payoutVerified === true) return true;
       // For other terminal states (cancelled/failed): clearly reject further verification.
-      if (isTerminalProgress(swap.progress)) {
+      if (isTerminalProgress(swap.progress) && swap.progress !== 'completed') {
         throw new SphereError(
           `Cannot verify payout: swap is already ${swap.progress}`,
           'SWAP_WRONG_STATE',
@@ -1813,7 +1816,9 @@ export class SwapModule {
       this.clearLocalTimer(swapId);
 
       // Notify escrow to cancel and return any deposited assets
-      if (swap.escrowPubkey && ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress)) {
+      const hadDeposits = swap.escrowPubkey &&
+        ['announced', 'depositing', 'awaiting_counter'].includes(swap.progress);
+      if (hadDeposits && swap.escrowPubkey) {
         try {
           const cancelDM = buildCancelDM(swapId, 'Cancelled by user');
           await deps.communications.sendDM(swap.escrowPubkey, cancelDM);
@@ -1843,6 +1848,19 @@ export class SwapModule {
         reason: 'explicit',
         depositsReturned: false,
       });
+
+      // Fallback: if deposits were in-flight, schedule a delayed status query so
+      // the SDK learns whether the escrow processed the cancellation and returned funds.
+      // This is a best-effort safety net — if the escrow is unresponsive, the
+      // invoice:return_received path (from accounting) is the primary signal.
+      if (hadDeposits && swap.escrowPubkey) {
+        const escrowPubkey = swap.escrowPubkey;
+        setTimeout(() => {
+          sendStatusQuery(deps.communications, escrowPubkey, swapId).catch((err) => {
+            logger.warn(LOG_TAG, `Fallback status query after cancel failed for swap ${swapId.slice(0, 12)}:`, err);
+          });
+        }, 30_000);
+      }
     });
   }
 
@@ -2956,30 +2974,28 @@ export class SwapModule {
         const swap = this.swaps.get(swapId);
         if (!swap) return;
 
-        // Emit deposit returned event
-        deps.emitEvent('swap:deposit_returned', {
-          swapId,
-          transfer: data.transfer,
-          returnReason: data.returnReason,
-        });
-
-        // Transition to cancelled if not already terminal
-        if (!isTerminalProgress(swap.progress)) {
-          this.withSwapGate(swapId, async () => {
-            if (!isTerminalProgress(swap.progress)) {
-              await this.transitionProgress(swap, 'cancelled', {
-                error: 'Deposits returned',
-              });
-              deps.emitEvent('swap:cancelled', {
-                swapId,
-                reason: 'timeout',
-                depositsReturned: true,
-              });
-            }
-          }).catch((err) => {
-            logger.warn(LOG_TAG, `Failed to transition swap ${swapId} to cancelled:`, err);
+        // Transition to cancelled (if needed) and emit events — all inside the gate
+        // to ensure consumers observe consistent state (progress=cancelled before event fires).
+        this.withSwapGate(swapId, async () => {
+          if (!isTerminalProgress(swap.progress)) {
+            await this.transitionProgress(swap, 'cancelled', {
+              error: 'Deposits returned',
+            });
+            deps.emitEvent('swap:cancelled', {
+              swapId,
+              reason: 'timeout',
+              depositsReturned: true,
+            });
+          }
+          // Emit deposit_returned after state is consistent (inside gate, after transition).
+          deps.emitEvent('swap:deposit_returned', {
+            swapId,
+            transfer: data.transfer,
+            returnReason: data.returnReason,
           });
-        }
+        }).catch((err) => {
+          logger.warn(LOG_TAG, `Failed to transition swap ${swapId} to cancelled:`, err);
+        });
       } catch (err) {
         logger.warn(LOG_TAG, 'Error handling invoice:return_received for swap:', err);
       }
