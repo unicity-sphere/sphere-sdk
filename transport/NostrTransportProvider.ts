@@ -1257,9 +1257,9 @@ export class NostrTransportProvider implements TransportProvider {
 
       // Persist DM timestamp after successful unwrap so failed decryptions
       // do not advance the since filter and permanently skip events.
-      if (event.created_at) {
-        this.updateLastDmEventTimestamp(event.created_at);
-      }
+      // Use real wall-clock time, NOT event.created_at — NIP-17 gift wraps
+      // randomize created_at by ±2 days for privacy, so it can be in the future.
+      this.updateLastDmEventTimestamp(Math.floor(Date.now() / 1000));
 
       logger.debug('Nostr', 'Gift wrap unwrapped, sender:', pm.senderPubkey?.slice(0, 16), 'kind:', pm.kind);
 
