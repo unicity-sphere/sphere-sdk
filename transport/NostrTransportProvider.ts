@@ -1669,9 +1669,9 @@ export class NostrTransportProvider implements TransportProvider {
         if (subId) {
           this.nostrClient?.unsubscribe(subId);
         }
-        logger.warn('Nostr', `queryEvents timed out after 5s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
+        logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
-      }, 5000);
+      }, 15000);
 
       const subId = this.nostrClient!.subscribe(filter, {
         onEvent: (event) => {
