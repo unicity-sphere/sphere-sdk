@@ -206,20 +206,19 @@ export class GroupChatModule {
     }
   }
 
-  async destroy(): Promise<void> {
+  destroy(): void {
     this.destroyConnection();
 
-    // Flush any pending debounced persist before clearing state
+    // Flush any pending debounced persist before clearing state.
+    // Persist methods capture map data synchronously before their first await,
+    // so fire-and-forget is safe even though maps are cleared below.
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
-    }
-    if (this.deps) {
-      try {
-        if (this.persistPromise) await this.persistPromise;
-        await this.doPersistAll();
-      } catch (err) {
-        logger.debug('GroupChat', 'Persist on destroy failed', err);
+      if (this.deps) {
+        this.doPersistAll().catch((err) =>
+          logger.debug('GroupChat', 'Persist on destroy failed', err),
+        );
       }
     }
 
@@ -1347,18 +1346,10 @@ export class GroupChatModule {
   private getLatestKnownTimestamp(groupIds: string[]): number {
     let latest = 0;
     for (const gid of groupIds) {
-      // Check message timestamps
       const msgs = this.messages.get(gid);
-      if (msgs) {
-        for (const m of msgs) {
-          const ts = Math.floor(m.timestamp / 1000);
-          if (ts > latest) latest = ts;
-        }
-      }
-      // Check group metadata timestamp
-      const group = this.groups.get(gid);
-      if (group) {
-        const ts = Math.floor((group.updatedAt || group.createdAt) / 1000);
+      if (!msgs) continue;
+      for (const m of msgs) {
+        const ts = Math.floor(m.timestamp / 1000);
         if (ts > latest) latest = ts;
       }
     }
