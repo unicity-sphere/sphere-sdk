@@ -377,16 +377,16 @@ export class GroupChatModule {
     const groupIds = Array.from(this.groups.keys());
     if (groupIds.length === 0) return;
 
-    // Use the latest message timestamp across all groups as the `since` floor
+    // Use the latest known event timestamp as the `since` floor
     // so the relay only sends events newer than what we already have.
-    const latestTimestamp = this.getLatestMessageTimestamp(groupIds);
+    const sinceTimestamp = this.getLatestKnownTimestamp(groupIds);
 
     // Subscribe to group messages
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': groupIds,
-        ...(latestTimestamp ? { since: latestTimestamp } : {}),
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -396,6 +396,7 @@ export class GroupChatModule {
       createNip29Filter({
         kinds: [NIP29_KINDS.GROUP_METADATA, NIP29_KINDS.GROUP_MEMBERS, NIP29_KINDS.GROUP_ADMINS],
         '#d': groupIds,
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleMetadataEvent(event) },
     );
@@ -405,6 +406,7 @@ export class GroupChatModule {
       createNip29Filter({
         kinds: [NIP29_KINDS.DELETE_EVENT, NIP29_KINDS.REMOVE_USER, NIP29_KINDS.DELETE_GROUP],
         '#h': groupIds,
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleModerationEvent(event) },
     );
@@ -413,13 +415,13 @@ export class GroupChatModule {
   private subscribeToGroup(groupId: string): void {
     if (!this.client) return;
 
-    const latestTimestamp = this.getLatestMessageTimestamp([groupId]);
+    const sinceTimestamp = this.getLatestKnownTimestamp([groupId]);
 
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': [groupId],
-        ...(latestTimestamp ? { since: latestTimestamp } : {}),
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -428,6 +430,7 @@ export class GroupChatModule {
       createNip29Filter({
         kinds: [NIP29_KINDS.DELETE_EVENT, NIP29_KINDS.REMOVE_USER, NIP29_KINDS.DELETE_GROUP],
         '#h': [groupId],
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleModerationEvent(event) },
     );
@@ -510,7 +513,7 @@ export class GroupChatModule {
       }
       group.updatedAt = event.created_at * 1000;
       this.groups.set(groupId, group);
-      this.persistGroups();
+      this.schedulePersist();
     } else if (event.kind === NIP29_KINDS.GROUP_MEMBERS) {
       this.updateMembersFromEvent(groupId, event);
     } else if (event.kind === NIP29_KINDS.GROUP_ADMINS) {
@@ -534,7 +537,7 @@ export class GroupChatModule {
         }
       }
       this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-      this.persistMessages();
+      this.schedulePersist();
     } else if (event.kind === NIP29_KINDS.REMOVE_USER) {
       if (this.processedEventIds.has(event.id)) return;
 
@@ -611,7 +614,7 @@ export class GroupChatModule {
 
       this.saveMemberToMemory(member);
     }
-    this.persistMembers();
+    this.schedulePersist();
   }
 
   private updateAdminsFromEvent(groupId: string, event: Event): void {
@@ -634,7 +637,7 @@ export class GroupChatModule {
         });
       }
     }
-    this.persistMembers();
+    this.schedulePersist();
   }
 
   // ===========================================================================
@@ -650,13 +653,11 @@ export class GroupChatModule {
     const groupIdsWithMembership = new Set<string>();
 
     await this.oneshotSubscription(
-      new Filter({ kinds: [NIP29_KINDS.GROUP_MEMBERS] }),
+      createNip29Filter({ kinds: [NIP29_KINDS.GROUP_MEMBERS], '#p': [myPubkey] }),
       {
         onEvent: (event: Event) => {
           const groupId = this.getGroupIdFromMetadataEvent(event);
-          if (!groupId) return;
-          const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-          if (pTags.some((tag: string[]) => tag[1] === myPubkey)) {
+          if (groupId) {
             groupIdsWithMembership.add(groupId);
           }
         },
@@ -670,24 +671,26 @@ export class GroupChatModule {
 
     const restoredGroups: GroupData[] = [];
 
-    for (const groupId of groupIdsWithMembership) {
-      if (this.groups.has(groupId)) continue;
+    await Promise.all(
+      Array.from(groupIdsWithMembership).map(async (groupId) => {
+        if (this.groups.has(groupId)) return;
 
-      try {
-        const group = await this.fetchGroupMetadataInternal(groupId);
-        if (group) {
-          this.groups.set(groupId, group);
-          restoredGroups.push(group);
+        try {
+          const group = await this.fetchGroupMetadataInternal(groupId);
+          if (group) {
+            this.groups.set(groupId, group);
+            restoredGroups.push(group);
 
-          await Promise.all([
-            this.fetchAndSaveMembers(groupId),
-            this.fetchMessages(groupId),
-          ]);
+            await Promise.all([
+              this.fetchAndSaveMembers(groupId),
+              this.fetchMessages(groupId),
+            ]);
+          }
+        } catch (error) {
+          logger.warn('GroupChat', 'Failed to restore group', groupId, error);
         }
-      } catch (error) {
-        logger.warn('GroupChat', 'Failed to restore group', groupId, error);
-      }
-    }
+      }),
+    );
 
     if (restoredGroups.length > 0) {
       await this.subscribeToJoinedGroups();
@@ -1178,7 +1181,7 @@ export class GroupChatModule {
     if (group && (group.unreadCount || 0) > 0) {
       group.unreadCount = 0;
       this.groups.set(groupId, group);
-      this.persistGroups();
+      this.schedulePersist();
     }
   }
 
@@ -1206,7 +1209,7 @@ export class GroupChatModule {
       if (eventId) {
         this.removeMemberFromMemory(groupId, userPubkey);
         this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-        this.persistMembers();
+        this.schedulePersist();
         return true;
       }
       return false;
@@ -1233,7 +1236,7 @@ export class GroupChatModule {
       if (eventId) {
         this.deleteMessageFromMemory(groupId, messageId);
         this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-        this.persistMessages();
+        this.schedulePersist();
         return true;
       }
       return false;
@@ -1329,13 +1332,21 @@ export class GroupChatModule {
    * or 0 if no messages exist.  Used to set `since` on subscriptions so the relay
    * only sends events we don't already have.
    */
-  private getLatestMessageTimestamp(groupIds: string[]): number {
+  private getLatestKnownTimestamp(groupIds: string[]): number {
     let latest = 0;
     for (const gid of groupIds) {
+      // Check message timestamps
       const msgs = this.messages.get(gid);
-      if (!msgs) continue;
-      for (const m of msgs) {
-        const ts = Math.floor(m.timestamp / 1000);
+      if (msgs) {
+        for (const m of msgs) {
+          const ts = Math.floor(m.timestamp / 1000);
+          if (ts > latest) latest = ts;
+        }
+      }
+      // Check group metadata timestamp
+      const group = this.groups.get(gid);
+      if (group) {
+        const ts = Math.floor((group.updatedAt || group.createdAt) / 1000);
         if (ts > latest) latest = ts;
       }
     }
@@ -1423,7 +1434,7 @@ export class GroupChatModule {
       }
     }
 
-    this.persistMembers();
+    this.schedulePersist();
   }
 
   private async fetchGroupMembersInternal(groupId: string): Promise<GroupMemberData[]> {
@@ -1570,10 +1581,13 @@ export class GroupChatModule {
 
   private addProcessedEventId(eventId: string): void {
     this.processedEventIds.add(eventId);
-    // Keep max 10,000
+    // Prune oldest half when limit exceeded — avoids rebuilding on every insert
     if (this.processedEventIds.size > 10000) {
-      const arr = Array.from(this.processedEventIds);
-      this.processedEventIds = new Set(arr.slice(arr.length - 10000));
+      let toDelete = 5000;
+      for (const id of this.processedEventIds) {
+        if (toDelete-- <= 0) break;
+        this.processedEventIds.delete(id);
+      }
     }
   }
 
