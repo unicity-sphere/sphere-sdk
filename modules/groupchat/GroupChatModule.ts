@@ -206,8 +206,23 @@ export class GroupChatModule {
     }
   }
 
-  destroy(): void {
+  async destroy(): Promise<void> {
     this.destroyConnection();
+
+    // Flush any pending debounced persist before clearing state
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    if (this.deps) {
+      try {
+        if (this.persistPromise) await this.persistPromise;
+        await this.doPersistAll();
+      } catch (err) {
+        logger.debug('GroupChat', 'Persist on destroy failed', err);
+      }
+    }
+
     this.groups.clear();
     this.messages.clear();
     this.members.clear();
@@ -216,10 +231,7 @@ export class GroupChatModule {
     this.messageHandlers.clear();
     this.relayAdminPubkeys = null;
     this.relayAdminFetchPromise = null;
-    if (this.persistTimer) {
-      clearTimeout(this.persistTimer);
-      this.persistTimer = null;
-    }
+    this.persistPromise = null;
     this.deps = null;
   }
 
@@ -377,8 +389,11 @@ export class GroupChatModule {
     const groupIds = Array.from(this.groups.keys());
     if (groupIds.length === 0) return;
 
-    // Use the latest known event timestamp as the `since` floor
+    // Use the latest known event timestamp as the `since` floor for messages
     // so the relay only sends events newer than what we already have.
+    // Metadata/moderation subscriptions intentionally omit `since`:
+    //  - Metadata kinds (39xxx) are replaceable — at most one event per group per kind
+    //  - Moderation events must not be missed (e.g., kicks that occurred while offline)
     const sinceTimestamp = this.getLatestKnownTimestamp(groupIds);
 
     // Subscribe to group messages
@@ -391,22 +406,20 @@ export class GroupChatModule {
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
 
-    // Subscribe to group metadata changes
+    // Subscribe to group metadata changes (replaceable events — small volume, no since)
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.GROUP_METADATA, NIP29_KINDS.GROUP_MEMBERS, NIP29_KINDS.GROUP_ADMINS],
         '#d': groupIds,
-        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleMetadataEvent(event) },
     );
 
-    // Subscribe to moderation events
+    // Subscribe to moderation events (no since — must not miss offline kicks/deletes)
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.DELETE_EVENT, NIP29_KINDS.REMOVE_USER, NIP29_KINDS.DELETE_GROUP],
         '#h': groupIds,
-        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleModerationEvent(event) },
     );
@@ -430,7 +443,6 @@ export class GroupChatModule {
       createNip29Filter({
         kinds: [NIP29_KINDS.DELETE_EVENT, NIP29_KINDS.REMOVE_USER, NIP29_KINDS.DELETE_GROUP],
         '#h': [groupId],
-        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleModerationEvent(event) },
     );
