@@ -31,6 +31,7 @@ let intentionalClose = false;
 let reconnectAttempts = 0;
 let isBlockSubscribed = false;
 let lastBlockHeader: BlockHeader | null = null;
+let pingTimer: ReturnType<typeof setInterval> | null = null;
 
 // Store timeout IDs for pending requests
 interface PendingRequestWithTimeout extends PendingRequest {
@@ -56,6 +57,7 @@ const MAX_DELAY = 60000; // 1 minute
 // Timeout configuration
 const RPC_TIMEOUT = 30000; // 30 seconds
 const CONNECTION_TIMEOUT = 30000; // 30 seconds
+const PING_INTERVAL = 30000; // 30 seconds keepalive
 
 // ----------------------------------------
 // CONNECTION STATE
@@ -93,6 +95,38 @@ export function waitForConnection(): Promise<void> {
 }
 
 // ----------------------------------------
+// KEEPALIVE PING
+// ----------------------------------------
+function startPingTimer(): void {
+  stopPingTimer();
+  pingTimer = setInterval(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const id = ++requestId;
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'server.ping', params: [] }));
+      // Response will be handled by handleMessage (resolves from pending)
+      // We don't need to track the response — the goal is just to keep the connection alive
+      pending[id] = {
+        resolve: () => {},
+        reject: () => {},
+      };
+      // Clean up after timeout in case response never comes
+      const timeoutId = setTimeout(() => { delete pending[id]; }, 10000);
+      pending[id].timeoutId = timeoutId;
+    } catch {
+      // Send failed — onclose will handle reconnection
+    }
+  }, PING_INTERVAL);
+}
+
+function stopPingTimer(): void {
+  if (pingTimer) {
+    clearInterval(pingTimer);
+    pingTimer = null;
+  }
+}
+
+// ----------------------------------------
 // SINGLETON CONNECT — prevents double connect
 // ----------------------------------------
 export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
@@ -122,6 +156,7 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
       isConnected = true;
       isConnecting = false;
       reconnectAttempts = 0; // Reset reconnect counter on successful connection
+      startPingTimer();
       hasResolved = true;
       resolve();
 
@@ -136,6 +171,7 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
     ws.onclose = () => {
       isConnected = false;
       isBlockSubscribed = false; // Reset block subscription on disconnect
+      stopPingTimer();
 
       // Reject all pending requests and clear their timeouts
       Object.values(pending).forEach((req) => {
@@ -426,6 +462,7 @@ export async function getCurrentBlockHeight(): Promise<number> {
 }
 
 export function disconnect() {
+  stopPingTimer();
   if (ws) {
     intentionalClose = true;
     ws.close();
