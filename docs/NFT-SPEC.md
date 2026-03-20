@@ -119,7 +119,7 @@ full, original, preview, thumbnail
 
 **Key order:**
 ```
-createdAt, creator, description, externalUrl, image, maxSupply, name, royalty, transferable
+createdAt, creator, description, deterministicMinting, externalUrl, image, maxSupply, name, royalty, transferable
 ```
 
 **royalty key order (if present):**
@@ -128,6 +128,7 @@ basisPoints, recipient
 ```
 
 **Null normalization:**
+- `deterministicMinting`: false if absent (default)
 - `externalUrl`: null if absent
 - `image`: null if absent
 - `maxSupply`: null if absent (= unlimited)
@@ -143,6 +144,42 @@ tokenId      = derived by state-transition-sdk from MintTransactionData
 ```
 
 The `collectionId` is computed client-side before any on-chain interaction. It is stable — the same `CollectionDefinition` always produces the same `collectionId`.
+
+### 2.4 Salt Derivation Strategy
+
+The `salt` used in `MintTransactionData` determines the `tokenId`. Two strategies are supported:
+
+#### Strategy A: Random Salt (default)
+
+```
+salt = crypto.getRandomValues(new Uint8Array(32))
+```
+
+Produces a fully random, unpredictable `tokenId`. Suitable for one-off NFTs, art drops, or collections where any authorized wallet can mint independently. The resulting `tokenId` cannot be predicted by anyone before minting.
+
+#### Strategy B: Deterministic Salt (controlled collections)
+
+```
+salt = HMAC-SHA256(privateKey, collectionId || editionCounter)
+```
+
+Where:
+- `privateKey` is the emitter's secp256k1 private key (32 bytes)
+- `collectionId` is the 64-char hex collection ID (32 bytes)
+- `editionCounter` is the edition number encoded as a big-endian uint64 (8 bytes)
+
+This produces a deterministic `tokenId` that is:
+
+1. **Predictable only by the emitter** — only the holder of the private key can compute valid salts and therefore valid tokenIds for a given collection + edition.
+2. **Unpredictable to everyone else** — without the private key, an observer cannot compute the next `tokenId` even if they know the counter and collectionId. HMAC-SHA256 is a PRF (pseudo-random function) — its outputs are indistinguishable from random without the key.
+3. **Idempotent** — re-minting the same edition produces the same `tokenId` and commitment. The aggregator returns `REQUEST_ID_EXISTS` (same pattern as nametag recovery).
+
+**Use cases for deterministic salt:**
+- **Collection integrity:** Only the genuine collection manager/emitter can mint NFTs with valid tokenIds. Third parties cannot pre-mint or front-run editions.
+- **Verifiable sequence:** Given the emitter's public key and the collection definition, anyone can verify that a claimed NFT belongs to the collection by checking the inclusion proof — but no one can predict the next tokenId without the private key.
+- **Crash recovery:** The same wallet can re-derive the salt for a previously minted edition and recover the token from the aggregator (via `REQUEST_ID_EXISTS`).
+
+**Selection:** The strategy is chosen at `createCollection()` time via the `deterministicMinting` flag in `CollectionDefinition`. When `true`, `mintNFT()` uses Strategy B. When `false` or omitted, `mintNFT()` uses Strategy A.
 
 ---
 
@@ -161,6 +198,7 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
 | `externalUrl` | string | No | — | Valid URL, ≤ 2048 chars |
 | `royalty` | RoyaltyConfig | No | — | See §3.1.1 |
 | `transferable` | boolean | No | true | — |
+| `deterministicMinting` | boolean | No | false | When true, salt = HMAC-SHA256(privateKey, collectionId \|\| edition) — only emitter can mint valid tokenIds |
 
 **3.1.1 RoyaltyConfig Validation:**
 
@@ -287,7 +325,13 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
       mintedAt: Date.now()
     }
  7. tokenData = canonicalSerializeNFT(nftTokenData)
- 8. Generate salt: crypto.getRandomValues(new Uint8Array(32))
+ 8. Generate salt (strategy depends on collection definition):
+    IF collection.deterministicMinting:
+      // Strategy B: deterministic — only the emitter can compute valid tokenIds
+      salt = HMAC-SHA256(identity.privateKey, collectionId || uint64BE(edition))
+    ELSE:
+      // Strategy A: random — unpredictable tokenId
+      salt = crypto.getRandomValues(new Uint8Array(32))
  9. Import state-transition-sdk types:
     - MintTransactionData, MintCommitment, Token, TokenType, TokenId
 10. Create MintTransactionData:

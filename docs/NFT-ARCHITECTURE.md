@@ -132,6 +132,18 @@ interface CollectionDefinition {
   readonly royalty?: RoyaltyConfig;
   /** Whether tokens in this collection are transferable (default: true) */
   readonly transferable?: boolean;
+  /**
+   * Whether minting uses deterministic salt derivation (default: false).
+   *
+   * When true, salt = HMAC-SHA256(privateKey, collectionId || editionCounter).
+   * This ensures only the emitter (holder of the private key matching `creator`)
+   * can compute valid tokenIds for this collection. Third parties cannot
+   * pre-mint or front-run editions.
+   *
+   * When false, salt is random (crypto.getRandomValues). TokenIds are
+   * unpredictable to everyone including the emitter.
+   */
+  readonly deterministicMinting?: boolean;
 }
 
 /**
@@ -294,7 +306,8 @@ interface CreateCollectionRequest {
   image?: string;
   externalUrl?: string;
   royalty?: RoyaltyConfig;
-  transferable?: boolean;   // default: true
+  transferable?: boolean;         // default: true
+  deterministicMinting?: boolean; // default: false — see §2.4 Salt Derivation
 }
 
 interface CreateCollectionResult {
@@ -622,7 +635,9 @@ mintNFT(request)
   ├── 2. Validate: maxSupply not exceeded (if set)
   ├── 3. Construct NFTTokenData { collectionId, metadata, edition, mintedAt }
   ├── 4. canonicalSerializeNFT(data) → tokenData string
-  ├── 5. Generate salt (32 random bytes)
+  ├── 5. Generate salt:
+  │       IF deterministicMinting: HMAC-SHA256(privateKey, collectionId || edition)
+  │       ELSE: crypto.getRandomValues(32 bytes)
   ├── 6. Create MintTransactionData {
   │       tokenId: SHA-256(tokenData + salt + recipient),
   │       tokenType: NFT_TOKEN_TYPE_HEX,
