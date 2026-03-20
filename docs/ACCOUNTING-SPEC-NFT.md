@@ -107,15 +107,16 @@ function payInvoiceNFT(invoiceId, terms, params, deps):
        txt: params.freeText,
      }
 
-  10. Send via PaymentsModule:
+  10. Send via PaymentsModule (same field pattern as coin path):
       result = await deps.payments.send({
         recipient: terms.targets[params.targetIndex].address,
         amount: '1',
-        coinId: requestedTokenId,        // fallback identifier
+        coinId: requestedTokenId,              // fallback identifier
         memo: memo,
-        _nftTransfer: true,              // skip token splitting
-        _tokenIds: [requestedTokenId],   // select exact token
-        _message: payload,               // on-chain structured payload
+        _nftTransfer: true,                    // skip token splitting
+        _tokenIds: [requestedTokenId],         // select exact token
+        invoiceRefundAddress: params.refundAddress,  // same as coin path
+        invoiceContact: effectiveContact,            // same as coin path
       })
 
   11. Return result (TransferResult from PaymentsModule)
