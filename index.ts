@@ -436,6 +436,8 @@ export {
   isKnownToken,
   getCoinIdBySymbol,
   getCoinIdByName,
+  normalizeCoinId,
+  coinIdsMatch,
 } from './registry';
 
 export type {

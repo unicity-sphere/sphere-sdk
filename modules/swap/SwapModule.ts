@@ -71,19 +71,8 @@ import type {
 // Logger tag
 const LOG_TAG = 'Swap';
 
-/**
- * Resolve a coinId that may be a short symbol (e.g. "BTC") to its registry
- * hash equivalent. Returns the original string if no mapping is found.
- * Used for comparing manifest currencies against invoice asset coinIds,
- * which may have been normalized to hashes at import time.
- */
-function resolveSymbolToCoinId(coinId: string): string {
-  if (coinId.length <= 20 && /^[A-Za-z0-9]+$/.test(coinId)) {
-    const def = TokenRegistry.getInstance().getDefinitionBySymbol(coinId);
-    if (def?.id) return def.id;
-  }
-  return coinId;
-}
+// Use shared normalizeCoinId from TokenRegistry for symbol↔hash comparisons
+import { normalizeCoinId as resolveSymbolToCoinId, coinIdsMatch } from '../../registry/TokenRegistry.js';
 
 /** Default proposal timeout: 5 minutes. */
 const DEFAULT_PROPOSAL_TIMEOUT_MS = 300_000;
@@ -1736,7 +1725,7 @@ export class SwapModule {
       return failPayout('Payout invoice has no valid target or asset');
     }
 
-    if (targetTerms.assets[0].coin[0] !== expectedCoinId) {
+    if (!coinIdsMatch(targetTerms.assets[0].coin[0], expectedCoinId)) {
       return failPayout(
         `Payout invoice currency mismatch: expected ${expectedCoinId}, got ${targetTerms.assets[0].coin[0]}`,
       );
