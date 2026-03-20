@@ -408,7 +408,7 @@ export class GroupChatModule {
     // Subscribe to group metadata changes (replaceable events — small volume, no since)
     this.trackSubscription(
       createNip29Filter({
-        kinds: [NIP29_KINDS.GROUP_METADATA, NIP29_KINDS.GROUP_MEMBERS, NIP29_KINDS.GROUP_ADMINS],
+        kinds: [NIP29_KINDS.GROUP_METADATA, NIP29_KINDS.GROUP_ADMINS],
         '#d': groupIds,
       }),
       { onEvent: (event: Event) => this.handleMetadataEvent(event) },
@@ -525,8 +525,6 @@ export class GroupChatModule {
       group.updatedAt = event.created_at * 1000;
       this.groups.set(groupId, group);
       this.schedulePersist();
-    } else if (event.kind === NIP29_KINDS.GROUP_MEMBERS) {
-      this.updateMembersFromEvent(groupId, event);
     } else if (event.kind === NIP29_KINDS.GROUP_ADMINS) {
       this.updateAdminsFromEvent(groupId, event);
     }
@@ -603,29 +601,6 @@ export class GroupChatModule {
       this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
       this.schedulePersist();
     }
-  }
-
-  private updateMembersFromEvent(groupId: string, event: Event): void {
-    const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-    const existingMembers = this.members.get(groupId) || [];
-
-    for (const tag of pTags) {
-      const pubkey = tag[1];
-      const roleFromTag = tag[3] as GroupRole | undefined;
-      const existing = existingMembers.find((m) => m.pubkey === pubkey);
-      const role = roleFromTag || existing?.role || GroupRoleEnum.MEMBER;
-
-      const member: GroupMemberData = {
-        pubkey,
-        groupId,
-        role,
-        nametag: existing?.nametag,
-        joinedAt: existing?.joinedAt || event.created_at * 1000,
-      };
-
-      this.saveMemberToMemory(member);
-    }
-    this.schedulePersist();
   }
 
   private updateAdminsFromEvent(groupId: string, event: Event): void {
