@@ -124,8 +124,10 @@ else
 fi
 
 # Wait for escrow to process cancellation + auto-return
+# Auto-return requires: escrow cancel → invoice cancel → auto-return send →
+# token transfer via Nostr → Alice receive. This can take 30-60s.
 log "4c: Waiting for deposit return (up to 120s)..."
-sleep 30
+sleep 60
 
 # Alice should receive her BTC back via auto-return
 ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
