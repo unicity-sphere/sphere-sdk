@@ -30,6 +30,7 @@ import {
 } from '../types/txf';
 import type { Token, TokenStatus } from '../types';
 import { TokenRegistry } from '../registry/TokenRegistry';
+import { NFT_TOKEN_TYPE_HEX } from '../constants';
 
 // =============================================================================
 // SDK Token Normalization
@@ -217,7 +218,7 @@ export function txfToToken(tokenId: string, txf: TxfToken): Token {
   }
 
   const tokenType = txf.genesis.data.tokenType;
-  const isNft = tokenType === '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
+  const isNft = tokenType === NFT_TOKEN_TYPE_HEX;
 
   const now = Date.now();
 

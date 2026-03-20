@@ -386,3 +386,16 @@ export const LIMITS = {
   /** Max message length */
   MESSAGE_MAX_LENGTH: 10000,
 } as const;
+
+// =============================================================================
+// Token Type Constants
+// =============================================================================
+
+/**
+ * NFT token type identifier: SHA-256(UTF-8("unicity.nft.v1"))
+ *
+ * Used in genesis.data.tokenType to identify a token as an NFT.
+ * All NFTs share this base token type. Individual collections are
+ * distinguished by collectionId stored in genesis.data.tokenData.
+ */
+export const NFT_TOKEN_TYPE_HEX = '8b0136c928f34e13ba73274a71bc3e96cd7f6799e876d89842ed4a541d0b963c' as const;
