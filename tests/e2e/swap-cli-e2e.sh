@@ -3,7 +3,7 @@
 # swap-cli-e2e.sh — End-to-end CLI swap flow test
 #
 # Uses two fresh one-time-use wallet profiles so each run starts clean.
-# Escrow must be live at @test-escrow-swap3 on testnet.
+# Escrow must be live at @test-escrow-e2e on testnet.
 #
 # Usage:
 #   bash tests/e2e/swap-cli-e2e.sh
@@ -15,7 +15,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-ESCROW="@test-escrow-swap3"
+ESCROW="@test-escrow-e2e"
 OFFER_COIN="BTC"
 WANT_COIN="ETH"
 OFFER_AMOUNT="1"          # Alice offers 1 BTC
@@ -295,7 +295,7 @@ log "=== STEP 9: Waiting up to ${ESCROW_WAIT}s for escrow to complete swap ==="
 ELAPSED=0
 FINAL_PROGRESS=""
 while [[ $ELAPSED -lt $ESCROW_WAIT ]]; do
-  $CLI wallet use "$ALICE_PROFILE" > /dev/null 2>&1
+  $CLI wallet use "$ALICE_PROFILE" > /dev/null 2>&1 || true
   STATUS_OUT=$($CLI swap-status "${SWAP_ID:0:8}" 2>&1) || true
   FINAL_PROGRESS=$(echo "$STATUS_OUT" | grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' | tail -1)
   log "[${ELAPSED}s] Alice swap progress: ${FINAL_PROGRESS:-unknown}"
@@ -303,8 +303,8 @@ while [[ $ELAPSED -lt $ESCROW_WAIT ]]; do
   if [[ "$FINAL_PROGRESS" == "completed" || "$FINAL_PROGRESS" == "failed" || "$FINAL_PROGRESS" == "cancelled" ]]; then
     break
   fi
-  sleep 10
-  ELAPSED=$((ELAPSED + 10))
+  sleep 15
+  ELAPSED=$((ELAPSED + 15))
 done
 
 if [[ "$FINAL_PROGRESS" == "completed" ]]; then
