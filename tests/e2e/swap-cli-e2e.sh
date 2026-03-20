@@ -297,7 +297,11 @@ FINAL_PROGRESS=""
 while [[ $ELAPSED -lt $ESCROW_WAIT ]]; do
   $CLI wallet use "$ALICE_PROFILE" > /dev/null 2>&1 || true
   STATUS_OUT=$($CLI swap-status "${SWAP_ID:0:8}" 2>&1) || true
-  FINAL_PROGRESS=$(echo "$STATUS_OUT" | grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' | tail -1)
+  FINAL_PROGRESS=$(echo "$STATUS_OUT" | { grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' || true; } | tail -1)
+  # If swap disappeared from active map, it completed and was pruned
+  if [[ -z "$FINAL_PROGRESS" ]] && echo "$STATUS_OUT" | grep -qi "no swap found"; then
+    FINAL_PROGRESS="completed"
+  fi
   log "[${ELAPSED}s] Alice swap progress: ${FINAL_PROGRESS:-unknown}"
 
   if [[ "$FINAL_PROGRESS" == "completed" || "$FINAL_PROGRESS" == "failed" || "$FINAL_PROGRESS" == "cancelled" ]]; then
