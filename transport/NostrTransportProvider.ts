@@ -1620,7 +1620,10 @@ export class NostrTransportProvider implements TransportProvider {
       EventKinds.GIFT_WRAP, // NIP-17 gift-wrapped DMs (swap proposals, invoice receipts, etc.)
     ];
     walletFilter['#p'] = [nostrPubkey];
-    walletFilter.since = Math.floor(Date.now() / 1000) - 86400;
+    // NIP-17 gift wraps have randomized created_at (±172800 s).  Extend the
+    // catch-up window by the full randomization range so events sent recently
+    // but timestamped far in the past are not missed.
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400 - 172800;
 
     // Capture client reference after the guard to avoid a null-deref race:
     // a concurrent disconnect() can set this.nostrClient = null between the
@@ -1899,7 +1902,13 @@ export class NostrTransportProvider implements TransportProvider {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = [nostrPubkey];
-    chatFilter.since = dmSince;
+    // NIP-17 gift wraps use a randomized created_at (±2 days / 172800 s) for privacy.
+    // The relay filters events by created_at, so a gift wrap sent right now may have
+    // created_at up to 172800 s in the past and would be invisible to a filter with
+    // since = dmSince.  Subtract the maximum randomization window so the relay
+    // returns events whose actual send time is >= dmSince even if their created_at
+    // was shifted backwards.  processedEventIds dedup prevents re-processing old events.
+    chatFilter.since = Math.max(0, dmSince - 172800);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {

@@ -50,6 +50,7 @@ import {
   withRetry,
 } from './escrow-client.js';
 import type { TransferResult } from '../../types/index.js';
+import { TokenRegistry } from '../../registry/index.js';
 import type {
   SwapModuleConfig,
   SwapModuleDependencies,
@@ -70,14 +71,28 @@ import type {
 // Logger tag
 const LOG_TAG = 'Swap';
 
+/**
+ * Resolve a coinId that may be a short symbol (e.g. "BTC") to its registry
+ * hash equivalent. Returns the original string if no mapping is found.
+ * Used for comparing manifest currencies against invoice asset coinIds,
+ * which may have been normalized to hashes at import time.
+ */
+function resolveSymbolToCoinId(coinId: string): string {
+  if (coinId.length <= 20 && /^[A-Za-z0-9]+$/.test(coinId)) {
+    const def = TokenRegistry.getInstance().getDefinitionBySymbol(coinId);
+    if (def?.id) return def.id;
+  }
+  return coinId;
+}
+
 /** Default proposal timeout: 5 minutes. */
 const DEFAULT_PROPOSAL_TIMEOUT_MS = 300_000;
 
 /** Default max pending (non-terminal) swaps. */
 const DEFAULT_MAX_PENDING_SWAPS = 100;
 
-/** Default announce timeout: 30 seconds. */
-const DEFAULT_ANNOUNCE_TIMEOUT_MS = 30_000;
+/** Default announce timeout: 120 seconds. */
+const DEFAULT_ANNOUNCE_TIMEOUT_MS = 120_000;
 
 /** Default terminal purge TTL: 7 days. */
 const DEFAULT_TERMINAL_PURGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -256,7 +271,7 @@ export class SwapModule {
       if (
         swap.progress === 'proposed' &&
         swap.role === 'proposer' &&
-        now - swap.createdAt > this.config.proposalTimeoutMs
+        now - swap.createdAt > Math.max(this.config.proposalTimeoutMs, swap.deal.timeout * 1000)
       ) {
         swap.progress = 'failed';
         swap.error = 'Proposal timed out';
@@ -345,10 +360,13 @@ export class SwapModule {
           switch (swapRef.progress) {
             case 'accepted':
               if (swapRef.protocolVersion === 2 && swapRef.role === 'proposer') {
-                // v2 proposer: Bob already announced. Just send a status query.
-                logger.debug(LOG_TAG, `v2 crash recovery: proposer waiting for announce_result ${swapRef.swapId.slice(0, 12)}`);
-                await sendStatusQuery(deps.communications, escrowPubkey, swapRef.swapId);
-                // Start bounded timer AFTER the status query is sent, and only if the swap
+                // v2 proposer crash recovery: send v1-format announce to escrow so our npub
+                // gets registered (escrow only registers the v2 announcer — Bob — on initial
+                // announce). This is idempotent; escrow deduplicates by swap_id and will
+                // deliver the deposit invoice and announce_result in reply.
+                logger.debug(LOG_TAG, `v2 crash recovery: proposer re-announcing to register npub ${swapRef.swapId.slice(0, 12)}`);
+                await sendAnnounce(deps.communications, escrowPubkey, swapRef.manifest);
+                // Start bounded timer AFTER the announce is sent, and only if the swap
                 // is still in 'accepted' state — a concurrent invoice_delivery DM may have
                 // advanced it to 'announced' and started the local expiry timer.
                 if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
@@ -371,13 +389,15 @@ export class SwapModule {
                     party_b: weArePartyA ? swapRef.proposerChainPubkey : deps.identity.chainPubkey,
                   };
                   await sendAnnounce_v2(deps.communications, escrowPubkey, swapRef.manifest, signatures, chainPubkeys, swapRef.auxiliary);
-                  // If the escrow previously sent announce_result (depositInvoiceId is stored)
-                  // but invoice_delivery was never received (e.g. relay purged the event),
-                  // explicitly request the deposit invoice rather than relying on the escrow
-                  // to re-deliver it spontaneously in response to the re-announce.
-                  if (this.swaps.get(swapRef.swapId)?.depositInvoiceId &&
-                      this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
-                    await sendRequestInvoice(deps.communications, escrowPubkey, swapRef.swapId, 'deposit');
+                  // Always request the deposit invoice in crash recovery — the invoice_delivery
+                  // DM may have been lost (relay purge, process restart, or relay latency)
+                  // regardless of whether depositInvoiceId is stored. If escrow hasn't finished
+                  // processing the announce yet, it will reject the request; the re-announce
+                  // above will trigger delivery anyway. This is safe and idempotent.
+                  if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                    await sendRequestInvoice(deps.communications, escrowPubkey, swapRef.swapId, 'deposit').catch(() => {
+                      // Non-fatal: escrow may not have processed the announce yet
+                    });
                   }
                   // Guard: only start timer if still in 'accepted' — concurrent invoice_delivery
                   // may have already moved the swap to 'announced' and started the expiry timer.
@@ -396,6 +416,20 @@ export class SwapModule {
                 // v1: Re-send announce DM to escrow (idempotent — escrow returns existing state)
                 logger.debug(LOG_TAG, `Crash recovery: re-announcing swap ${swapRef.swapId.slice(0, 12)}`);
                 await sendAnnounce(deps.communications, escrowPubkey, swapRef.manifest);
+                // Always request the deposit invoice in crash recovery — invoice_delivery DM
+                // may have been lost regardless of whether depositInvoiceId is stored.
+                if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                  await sendRequestInvoice(deps.communications, escrowPubkey, swapRef.swapId, 'deposit').catch(() => {
+                    // Non-fatal: escrow may not have processed the announce yet
+                  });
+                }
+                // Start announce timer so the swap transitions to 'failed' if the escrow
+                // doesn't deliver the invoice within announceTimeoutMs. Without this, a v1
+                // swap that gets stuck in 'accepted' (e.g. due to escrow timeout or relay
+                // purge) will stay stranded indefinitely across restarts.
+                if (this.swaps.get(swapRef.swapId)?.progress === 'accepted') {
+                  this.startAnnounceTimer(swapRef.swapId);
+                }
               }
               break;
 
@@ -2274,9 +2308,6 @@ export class SwapModule {
             // Verify sender is the counterparty
             if (dm.senderPubkey !== swap.counterpartyPubkey) return;
 
-            // Skip stale acceptances from a previous proposal instance
-            if (dm.timestamp && dm.timestamp < swap.createdAt) return;
-
             const deps = this.deps!;
 
             // Only transition if still in 'proposed'
@@ -2369,22 +2400,43 @@ export class SwapModule {
                   role: swap.role,
                 });
 
-                // v2: Proposer does NOT announce to escrow — Bob already did it.
-                // Just wait for announce_result from escrow.
-                // v1 fallback: announce from proposer side
+                // Resolve escrow pubkey if not already set
+                try {
+                  if (!swap.escrowPubkey) {
+                    const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
+                    swap.escrowPubkey = escrowPubkey;
+                    swap.escrowDirectAddress = escrowDirectAddress;
+                    await this.persistSwap(swap);
+                  }
+                } catch (err) {
+                  logger.warn(LOG_TAG, `Failed to resolve escrow address for swap ${swapId}:`, err);
+                  await this.transitionProgress(swap, 'failed', { error: 'Failed to resolve escrow address' });
+                  deps.emitEvent('swap:failed', { swapId, error: 'Failed to resolve escrow address' });
+                  return;
+                }
+
                 if (!swap.protocolVersion || swap.protocolVersion < 2) {
+                  // v1: Proposer announces to escrow after receiving acceptance
                   try {
-                    if (!swap.escrowPubkey) {
-                      const { escrowPubkey, escrowDirectAddress } = await resolveEscrowAddress(swap.deal, this.config, deps.resolve);
-                      swap.escrowPubkey = escrowPubkey;
-                      swap.escrowDirectAddress = escrowDirectAddress;
-                      await this.persistSwap(swap);
-                    }
                     await sendAnnounce(deps.communications, swap.escrowPubkey!, swap.manifest);
                   } catch (err) {
                     logger.warn(LOG_TAG, `Failed to announce swap ${swapId} to escrow:`, err);
                     await this.transitionProgress(swap, 'failed', { error: 'Failed to announce to escrow' });
                     deps.emitEvent('swap:failed', { swapId, error: 'Failed to announce to escrow' });
+                  }
+                } else {
+                  // v2: Bob already announced to escrow with both signatures. However, escrow only
+                  // registers the npub of the DM sender (Bob). Alice (proposer) needs to send her
+                  // own v1-format announce so escrow registers her npub and delivers the deposit
+                  // invoice to her. This is idempotent — escrow deduplicates by swap_id.
+                  try {
+                    await sendAnnounce(deps.communications, swap.escrowPubkey!, swap.manifest);
+                    this.startAnnounceTimer(swapId);
+                  } catch (err) {
+                    logger.warn(LOG_TAG, `Failed to self-register with escrow for swap ${swapId}:`, err);
+                    // Non-fatal: Alice may still receive the invoice_delivery if escrow
+                    // delivers it proactively. Start the announce timer so we don't strand.
+                    this.startAnnounceTimer(swapId);
                   }
                 }
               });
@@ -2406,10 +2458,6 @@ export class SwapModule {
 
             // Verify sender is counterparty
             if (dm.senderPubkey !== swap.counterpartyPubkey) return;
-
-            // Skip stale rejections from a previous proposal instance
-            // (same swap_id re-proposed after rejection — DM replay delivers the old rejection)
-            if (dm.timestamp && dm.timestamp < swap.createdAt) return;
 
             const deps = this.deps!;
 
@@ -2535,15 +2583,21 @@ export class SwapModule {
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
                     } catch (err) {
-                      logger.error(LOG_TAG, `Failed to import deposit invoice for swap ${swapId}:`, err);
-                      await this.transitionProgress(swap, 'failed', {
-                        error: `Deposit invoice import failed: ${err instanceof Error ? err.message : String(err)}`,
-                      });
-                      deps.emitEvent('swap:failed', {
-                        swapId,
-                        error: 'Deposit invoice import failed',
-                      });
-                      return;
+                      if (err instanceof SphereError && err.code === 'INVOICE_ALREADY_EXISTS') {
+                        // Benign: invoice was already imported (relay re-delivery or
+                        // duplicate DM from a prior sync). Continue with transition logic.
+                        logger.debug(LOG_TAG, `Deposit invoice for swap ${swapId} already imported — relay re-delivery, continuing`);
+                      } else {
+                        logger.error(LOG_TAG, `Failed to import deposit invoice for swap ${swapId}:`, err);
+                        await this.transitionProgress(swap, 'failed', {
+                          error: `Deposit invoice import failed: ${err instanceof Error ? err.message : String(err)}`,
+                        });
+                        deps.emitEvent('swap:failed', {
+                          swapId,
+                          error: 'Deposit invoice import failed',
+                        });
+                        return;
+                      }
                     }
 
                     // Verify deposit invoice terms match expectations
@@ -2603,13 +2657,16 @@ export class SwapModule {
                           deps.emitEvent('swap:failed', { swapId, error: 'Deposit invoice has unexpected number of assets' });
                           return;
                         }
-                        // Match currencies and amounts against manifest
+                        // Match currencies and amounts against manifest.
+                        // Manifest stores symbolic names ("BTC", "ETH"); imported invoice
+                        // terms may have been normalized to hash coinIds at import time.
+                        // Resolve both sides to hashes before comparing.
                         const expectedAssets = [
-                          { coinId: swap.manifest.party_a_currency_to_change, amount: swap.manifest.party_a_value_to_change },
-                          { coinId: swap.manifest.party_b_currency_to_change, amount: swap.manifest.party_b_value_to_change },
+                          { coinId: resolveSymbolToCoinId(swap.manifest.party_a_currency_to_change), amount: swap.manifest.party_a_value_to_change },
+                          { coinId: resolveSymbolToCoinId(swap.manifest.party_b_currency_to_change), amount: swap.manifest.party_b_value_to_change },
                         ];
                         const invoiceAssets = assets.map(a => ({
-                          coinId: a.coin?.[0],
+                          coinId: a.coin?.[0] ? resolveSymbolToCoinId(a.coin[0]) : a.coin?.[0],
                           amount: a.coin?.[1],
                         }));
                         const assetsMatch = expectedAssets.every(ea =>
@@ -2626,8 +2683,10 @@ export class SwapModule {
                       }
                     }
 
-                    // Set depositInvoiceId if not already set (announce_result may not have arrived)
-                    if (msg.invoice_id && !swap.depositInvoiceId) {
+                    // Always update depositInvoiceId from invoice_delivery — msg.invoice_id is the
+                    // canonical key matching what importInvoice stored. announce_result may have
+                    // set a different value (deposit_invoice_id), causing payInvoice to fail.
+                    if (msg.invoice_id) {
                       swap.depositInvoiceId = msg.invoice_id;
                     }
                     if (swap.depositInvoiceId) {
@@ -2678,14 +2737,19 @@ export class SwapModule {
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
                     } catch (err) {
-                      logger.error(LOG_TAG, `Failed to import payout invoice for swap ${swapId}:`, err);
-                      // Mirror the deposit invoice handler: fail the swap so it doesn't strand
-                      // in 'concluding' forever. Crash recovery re-requests on next load.
-                      await this.transitionProgress(swap, 'failed', {
-                        error: `Payout invoice import failed: ${err instanceof Error ? err.message : String(err)}`,
-                      });
-                      deps.emitEvent('swap:failed', { swapId, error: 'Payout invoice import failed' });
-                      return;
+                      if (err instanceof SphereError && err.code === 'INVOICE_ALREADY_EXISTS') {
+                        // Benign: relay re-delivery after prior successful import.
+                        logger.debug(LOG_TAG, `Payout invoice for swap ${swapId} already imported — relay re-delivery, continuing`);
+                      } else {
+                        logger.error(LOG_TAG, `Failed to import payout invoice for swap ${swapId}:`, err);
+                        // Mirror the deposit invoice handler: fail the swap so it doesn't strand
+                        // in 'concluding' forever. Crash recovery re-requests on next load.
+                        await this.transitionProgress(swap, 'failed', {
+                          error: `Payout invoice import failed: ${err instanceof Error ? err.message : String(err)}`,
+                        });
+                        deps.emitEvent('swap:failed', { swapId, error: 'Payout invoice import failed' });
+                        return;
+                      }
                     }
 
                     // Store payoutInvoiceId
@@ -2864,8 +2928,6 @@ export class SwapModule {
                 // Verify escrow sender
                 if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
 
-                // Skip stale cancellation DMs
-                if (dm.timestamp && dm.timestamp < swap.createdAt) return;
                 if (isTerminalProgress(swap.progress)) return;
 
                 const deps = this.deps!;
@@ -2955,9 +3017,6 @@ export class SwapModule {
                 if (!swap) return;
                 if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
 
-                // Skip stale error DMs from before the current swap instance
-                if (dm.timestamp && dm.timestamp < swap.createdAt) return;
-
                 logger.error(LOG_TAG, `Escrow error for swap ${errorSwapId.slice(0, 12)}: ${msg.error}`);
 
                 const deps = this.deps!;
@@ -3006,7 +3065,7 @@ export class SwapModule {
    *          `false` if no escrowPubkey is stored (unknown escrow) or mismatch.
    */
   private isFromExpectedEscrow(senderPubkey: string, swap: SwapRef): boolean {
-    if (!swap.escrowPubkey) return false; // unknown escrow = reject
+    if (!swap.escrowPubkey) return false;
     return senderPubkey === swap.escrowPubkey;
   }
 
@@ -3039,13 +3098,17 @@ export class SwapModule {
 
         const transfer = data.transfer;
 
-        // Determine which party deposited by matching coinId against manifest
+        // Determine which party deposited by matching coinId against manifest.
+        // Manifest stores symbolic names ("BTC", "ETH"); transfers use hash coinIds.
+        // Resolve both sides before comparing.
+        const partyACoinId = resolveSymbolToCoinId(swap.manifest.party_a_currency_to_change);
+        const partyBCoinId = resolveSymbolToCoinId(swap.manifest.party_b_currency_to_change);
         let party: 'A' | 'B';
         let requiredAmount: string;
-        if (transfer.coinId === swap.manifest.party_a_currency_to_change) {
+        if (transfer.coinId === partyACoinId) {
           party = 'A';
           requiredAmount = swap.manifest.party_a_value_to_change;
-        } else if (transfer.coinId === swap.manifest.party_b_currency_to_change) {
+        } else if (transfer.coinId === partyBCoinId) {
           party = 'B';
           requiredAmount = swap.manifest.party_b_value_to_change;
         } else {
@@ -3076,15 +3139,16 @@ export class SwapModule {
         const activeDirectAddresses = new Set(
           deps.getActiveAddresses().map((a) => a.directAddress),
         );
-        let localCurrency: string | undefined;
+        // Resolve local party's currency to a hash coinId for comparison with transfer.coinId
+        let localCurrencyHashId: string | undefined;
         if (activeDirectAddresses.has(swap.manifest.party_a_address)) {
-          localCurrency = swap.manifest.party_a_currency_to_change;
+          localCurrencyHashId = partyACoinId;
         } else if (activeDirectAddresses.has(swap.manifest.party_b_address)) {
-          localCurrency = swap.manifest.party_b_currency_to_change;
+          localCurrencyHashId = partyBCoinId;
         }
 
         // If this is the local party's deposit and we are in 'depositing', advance
-        if (localCurrency && transfer.coinId === localCurrency && swap.progress === 'depositing') {
+        if (localCurrencyHashId && transfer.coinId === localCurrencyHashId && swap.progress === 'depositing') {
           this.withSwapGate(swapId, async () => {
             // Re-check after acquiring gate (state may have changed)
             if (swap.progress === 'depositing') {
@@ -3335,9 +3399,10 @@ export class SwapModule {
   }
 
   /**
-   * Start an announce-response timeout timer for v2 acceptor swaps.
-   * After sendAnnounce_v2 succeeds, if the escrow's announce_result + invoice_delivery
-   * DMs are not received within announceTimeoutMs, the swap is transitioned to 'failed'.
+   * Start an announce-response timeout timer for swaps waiting for escrow invoice delivery.
+   * Used by both v1 (after sendAnnounce) and v2 acceptor (after sendAnnounce_v2).
+   * If the escrow's invoice_delivery DM is not received within announceTimeoutMs,
+   * the swap is transitioned to 'failed'.
    *
    * Cleared automatically when:
    * - invoice_delivery transitions the swap to 'announced' (via startLocalTimer →

@@ -1115,6 +1115,22 @@ export class PaymentsModule {
         // the cancel-then-reacquire race window.
         splitPlan = internal.existingSplitPlan;
       } else {
+        // ── Coin symbol → coinId resolution ────────────────────────────────────
+        // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
+        // while token storage uses 64/68-char hex coinIds. If no tokens match
+        // the literal coinId, attempt to resolve via the token registry.
+        const resolvedCoinId = (() => {
+          const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
+          if (!literalMatch && request.coinId.length <= 20) {
+            const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
+            if (def?.id) return def.id;
+          }
+          return request.coinId;
+        })();
+        if (resolvedCoinId !== request.coinId) {
+          request = { ...request, coinId: resolvedCoinId };
+        }
+
         // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
         const parsedPool = await this.spendPlanner.buildParsedPool(
           Array.from(this.tokens.values()),
@@ -1665,6 +1681,18 @@ export class PaymentsModule {
 
       // ── Spend Queue: reserve tokens (same path as send()) ──
       reservationId = crypto.randomUUID();
+      // Symbol → coinId resolution (same logic as send())
+      const resolvedCoinIdForSplit = (() => {
+        const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
+        if (!literalMatch && request.coinId.length <= 20) {
+          const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
+          if (def?.id) return def.id;
+        }
+        return request.coinId;
+      })();
+      if (resolvedCoinIdForSplit !== request.coinId) {
+        request = { ...request, coinId: resolvedCoinIdForSplit };
+      }
       const parsedPool = await this.spendPlanner.buildParsedPool(
         Array.from(this.tokens.values()),
         request.coinId
@@ -3173,7 +3201,11 @@ export class PaymentsModule {
    * @returns The token, or `undefined` if not found.
    */
   getToken(id: string): Token | undefined {
-    return this.tokens.get(id);
+    const token = this.tokens.get(id);
+    if (!token) {
+      logger.debug('Payments', `getToken: not found id=${id.slice(0, 16)}... mapSize=${this.tokens.size}`);
+    }
+    return token;
   }
 
   // ===========================================================================
@@ -3684,11 +3716,15 @@ export class PaymentsModule {
   async addToken(token: Token): Promise<boolean> {
     this.ensureInitialized();
 
+    logger.debug('Payments', `addToken called: id=${token.id.slice(0, 16)}... coinId=${token.coinId.slice(0, 16)}... status=${token.status}`);
+
     const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
     const incomingStateHash = extractStateHashFromSdkData(token.sdkData);
     const incomingStateKey = incomingTokenId && incomingStateHash
       ? createTokenStateKey(incomingTokenId, incomingStateHash)
       : null;
+
+    logger.debug('Payments', `addToken extract: tokenId=${incomingTokenId?.slice(0, 16) ?? 'null'} stateHash=${incomingStateHash?.slice(0, 16) ?? 'null'}`);
 
     // Check tombstones - reject tokens with exact (tokenId, stateHash) match
     // This prevents spent tokens from being re-added via Nostr re-delivery
@@ -3751,11 +3787,13 @@ export class PaymentsModule {
 
     // Add the new token state
     this.tokens.set(token.id, token);
+    logger.debug('Payments', `addToken: stored id=${token.id.slice(0, 16)}... mapSize=${this.tokens.size}`);
 
     // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
     await this.save();
+    logger.debug('Payments', `addToken: saved id=${token.id.slice(0, 16)}...`);
 
     // Notify observers (e.g., AccountingModule) that a token was added
     this.notifyTokenChange(token);

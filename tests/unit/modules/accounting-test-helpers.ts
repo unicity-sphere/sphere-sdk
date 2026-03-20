@@ -542,11 +542,17 @@ export function createTestToken(terms: InvoiceTerms, tokenId?: string): TxfToken
   if (tokenId) {
     id = tokenId;
   } else {
-    // Use Node.js crypto for synchronous SHA-256 (avoids making this function async)
+    // Replicate the DataHasher + TokenId path used by createInvoice():
+    // DataHasher.SHA256.digest().imprint = [0x00, 0x00] (algorithm tag) + 32-byte SHA-256
+    // TokenId(imprint).toJSON() = 68-char hex (4 chars tag + 64 chars hash).
+    // Using plain sha256 hex (64 chars) would not match the 68-char on-chain tokenId.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const nodeCrypto = require('crypto');
     const serialized = canonicalSerialize(terms);
-    id = nodeCrypto.createHash('sha256').update(serialized).digest('hex');
+    const sha256 = nodeCrypto.createHash('sha256').update(serialized).digest();
+    // Prepend the SHA-256 algorithm tag (0x0000 = 2 bytes) to replicate DataHash.imprint
+    const imprint = Buffer.concat([Buffer.from([0x00, 0x00]), sha256]);
+    id = imprint.toString('hex');
   }
 
   const inclusionProof: TxfInclusionProof = {

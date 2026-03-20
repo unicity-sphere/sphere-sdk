@@ -59,7 +59,9 @@ export function isTerminalProgress(progress: SwapProgress): boolean {
  * state machine transition.
  */
 export function isValidTransition(from: SwapProgress, to: SwapProgress): boolean {
-  return (VALID_PROGRESS_TRANSITIONS[from] as readonly string[]).includes(to);
+  const allowed = VALID_PROGRESS_TRANSITIONS[from];
+  if (!allowed) return false; // unknown 'from' value (e.g., corrupted storage) — reject
+  return (allowed as readonly string[]).includes(to);
 }
 
 /**

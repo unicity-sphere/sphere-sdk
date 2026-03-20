@@ -68,6 +68,12 @@ import {
 const EVENT_KINDS = NOSTR_EVENT_KINDS;
 const COMPOSING_INDICATOR_KIND = 25050;
 
+// NIP-17 gift wraps randomize created_at by ±2 days for privacy.
+// Subscriptions and one-shot queries must look further back by this window
+// so the relay returns events whose actual send time is recent even if their
+// created_at was shifted into the past.
+const NIP17_TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60; // 172800 s
+
 // =============================================================================
 // Nostr Event type (local, matching NostrTransportProvider)
 // =============================================================================
@@ -135,6 +141,7 @@ export class MultiAddressTransportMux {
   private walletSubscriptionId: string | null = null;
   private chatSubscriptionId: string | null = null;
   private chatEoseFired = false;
+  private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
   // Dedup
@@ -328,6 +335,10 @@ export class MultiAddressTransportMux {
   }
 
   async disconnect(): Promise<void> {
+    if (this.resubscribeTimer) {
+      clearTimeout(this.resubscribeTimer);
+      this.resubscribeTimer = null;
+    }
     if (this.nostrClient) {
       this.nostrClient.disconnect();
       this.nostrClient = null;
@@ -371,7 +382,10 @@ export class MultiAddressTransportMux {
       EventKinds.GIFT_WRAP,
     ];
     filter['#p'] = allPubkeys;
-    filter.since = Math.floor(Date.now() / 1000) - 86400; // last 24h
+    // Look back 24h for wallet events, plus the NIP-17 ±2-day randomization
+    // window for gift wraps. Without this, gift wraps whose created_at was
+    // shifted more than 24h into the past would be invisible to the relay filter.
+    filter.since = Math.floor(Date.now() / 1000) - 86400 - NIP17_TIMESTAMP_RANDOMIZATION;
 
     const events: NostrEvent[] = [];
     // Declared outside the Promise so it's available for cleanup after resolve.
@@ -556,14 +570,19 @@ export class MultiAddressTransportMux {
         logger.debug('Mux', 'Wallet subscription EOSE');
       },
       onError: (_subId, error) => {
-        logger.debug('Mux', 'Wallet subscription error:', error);
+        logger.warn('Mux', 'Wallet subscription closed by relay:', error);
+        this.scheduleResubscribe();
       },
     });
 
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = allPubkeys;
-    chatFilter.since = globalDmSince;
+    // NIP-17 gift wraps use a randomized created_at (±2 days) for privacy.
+    // Subtract the maximum randomization window so the relay returns events
+    // whose actual send time is >= globalDmSince even if their created_at
+    // was shifted backwards. processedEventIds dedup prevents re-processing.
+    chatFilter.since = Math.max(0, globalDmSince - NIP17_TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
@@ -587,9 +606,27 @@ export class MultiAddressTransportMux {
         }
       },
       onError: (_subId, error) => {
-        logger.debug('Mux', 'Chat subscription error:', error);
+        logger.warn('Mux', 'Chat subscription closed by relay:', error);
+        this.scheduleResubscribe();
       },
     });
+  }
+
+  /**
+   * Schedule a re-subscription after a relay-initiated subscription closure.
+   * Debounced: if both wallet and chat subscriptions fire onError in quick
+   * succession, only one updateSubscriptions() call runs.
+   */
+  private scheduleResubscribe(): void {
+    if (this.resubscribeTimer) return; // already scheduled
+    this.resubscribeTimer = setTimeout(() => {
+      this.resubscribeTimer = null;
+      if (!this.isConnected()) return;
+      logger.warn('Mux', 'Re-subscribing after relay-initiated subscription closure');
+      this.updateSubscriptions().catch((err) => {
+        logger.warn('Mux', 'Re-subscription failed:', err);
+      });
+    }, 2000);
   }
 
   /**

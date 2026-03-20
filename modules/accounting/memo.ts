@@ -31,13 +31,15 @@ import type { InvoiceMemoRef, TransferMessagePayload } from './types.js';
  *
  * @see ACCOUNTING-SPEC.md §4.4
  */
-export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64})(?::(F|B|RC|RX))?(?: (.+))?$/;
+export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64,68})(?::(F|B|RC|RX))?(?: (.+))?$/;
 
 /**
- * Regex for validating a 64-character lowercase/uppercase hex invoice ID.
+ * Regex for validating a 64-character or 68-character lowercase/uppercase hex invoice ID.
+ * Invoice token IDs are derived from DataHash.imprint (2-byte algorithm prefix + 32-byte SHA256
+ * hash = 34 bytes = 68 hex chars). Legacy/mocked IDs may be 64 chars (raw SHA256 only).
  * Used by {@link buildInvoiceMemo} before constructing outbound memos.
  */
-export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64}$/;
+export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64,68}$/;
 
 /**
  * Maps the canonical payment direction name to its wire code.
@@ -239,7 +241,7 @@ export function decodeTransferMessage(messageBytes: Uint8Array | null | undefine
 
     // Normalize id to lowercase before validation
     const id = (invObj['id'] as string).toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(id)) {
+    if (!/^[0-9a-f]{64,68}$/.test(id)) {
       return null; // invalid invoice ID format
     }
 

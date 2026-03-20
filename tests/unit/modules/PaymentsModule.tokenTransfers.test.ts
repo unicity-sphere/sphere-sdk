@@ -148,6 +148,7 @@ vi.mock('../../../registry', () => ({
       getName: vi.fn().mockReturnValue('Unicity Token'),
       getDecimals: vi.fn().mockReturnValue(18),
       getIconUrl: vi.fn().mockReturnValue(undefined),
+      getDefinitionBySymbol: vi.fn().mockReturnValue(undefined),
     }),
   },
 }));

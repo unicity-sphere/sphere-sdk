@@ -44,7 +44,7 @@ describe('SwapModule Lifecycle', () => {
     const cfg = (mod as any).config;
     expect(cfg.maxPendingSwaps).toBe(5);
     // Defaults applied
-    expect(cfg.announceTimeoutMs).toBe(30_000);
+    expect(cfg.announceTimeoutMs).toBe(120_000);
     expect(cfg.terminalPurgeTtlMs).toBe(7 * 24 * 60 * 60 * 1000);
     expect(cfg.proposalTimeoutMs).toBe(300_000);
     expect(cfg.debug).toBe(false);

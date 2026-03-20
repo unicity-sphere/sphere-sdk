@@ -57,7 +57,9 @@ import type {
 import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
 import { canonicalSerialize } from './serialization.js';
+import { hexToBytes } from '@noble/hashes/utils.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
+import { TokenRegistry } from '../../registry/index.js';
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token.js';
 import { txfToToken } from '../../serialization/txf-serializer.js';
@@ -371,9 +373,9 @@ export class AccountingModule {
           const tokenData = txf.genesis?.data?.tokenData;
           if (!tokenData) continue;
 
-          const terms = this._parseInvoiceTerms(tokenData);
-          if (terms) {
-            this.invoiceTermsCache.set(token.id, terms);
+          const rawTerms = this._parseInvoiceTerms(tokenData);
+          if (rawTerms) {
+            this.invoiceTermsCache.set(token.id, this._normalizeInvoiceTerms(rawTerms));
           }
         } catch (err) {
           logger.warn(LOG_TAG, `Failed to parse invoice token ${token.id}:`, err);
@@ -390,9 +392,9 @@ export class AccountingModule {
           const tokenData = txf.genesis?.data?.tokenData;
           if (!tokenData) continue;
 
-          const terms = this._parseInvoiceTerms(tokenData);
-          if (terms) {
-            this.invoiceTermsCache.set(archivedId, terms);
+          const rawTerms = this._parseInvoiceTerms(tokenData);
+          if (rawTerms) {
+            this.invoiceTermsCache.set(archivedId, this._normalizeInvoiceTerms(rawTerms));
           }
         } catch (err) {
           logger.warn(LOG_TAG, `Failed to parse archived invoice token ${archivedId}:`, err);
@@ -613,6 +615,16 @@ export class AccountingModule {
     // scheduled new _flushPromise chains (e.g., _flushDirtyLedgerEntries from event
     // pipeline code). Drain again to catch any flushes triggered by gated ops.
     await this._drainFlushPromise();
+
+    // Safety flush: if dirty entries exist but no flush was ever scheduled
+    // (e.g., payInvoice() wrote provisional entries but the token removal path
+    // does NOT call notifyTokenChange → _handleTokenChange, so the flush is
+    // never scheduled). This ensures provisional entries reach disk on process exit.
+    if ((this.dirtyLedgerEntries.size > 0 || this.tokenScanDirty) && this.deps) {
+      await this._flushDirtyLedgerEntries().catch((err) => {
+        logger.warn(LOG_TAG, 'Error in safety flush during destroy:', err);
+      });
+    }
 
     // C10 fix: Do NOT call _clearInMemoryState() here. After destroyed=true +
     // unsubscribe + gate drain, the module is inert — all public API methods check
@@ -1186,8 +1198,12 @@ export class AccountingModule {
 
       await deps.payments.addToken(uiToken);
 
-      // Update in-memory invoice terms cache
-      this.invoiceTermsCache.set(invoiceId, terms);
+      // Update in-memory invoice terms cache.
+      // Normalize symbolic coinIds (e.g. "BTC", "ETH") to hash coinIds so that
+      // _handleIncomingTransfer's matchesAsset check can match real token coinIds.
+      // The token was minted with the original `terms` (canonical hash), so this
+      // normalization only affects the in-memory matching cache.
+      this.invoiceTermsCache.set(invoiceId, this._normalizeInvoiceTerms(terms));
 
       // Initialize ledger entry for this invoice in the outer map
       if (!this.invoiceLedger.has(invoiceId)) {
@@ -1312,9 +1328,21 @@ export class AccountingModule {
       );
     }
 
+    // tokenData may be plain JSON or hex-encoded UTF-8 JSON
+    // (state-transition-sdk stores it as hex via HexConverter.encode).
+    let jsonString = tokenData;
+    if (!/^\s*[\[{"]/.test(tokenData)) {
+      // Doesn't look like JSON — attempt hex decode
+      try {
+        const bytes = hexToBytes(tokenData);
+        jsonString = new TextDecoder().decode(bytes);
+      } catch {
+        // not valid hex — fall through to JSON.parse which will produce the proper error
+      }
+    }
     let terms: InvoiceTerms;
     try {
-      terms = JSON.parse(tokenData) as InvoiceTerms;
+      terms = JSON.parse(jsonString) as InvoiceTerms;
     } catch {
       throw new SphereError(
         'Invoice import failed: tokenData is not valid JSON.',
@@ -1466,16 +1494,33 @@ export class AccountingModule {
     // a hash matching the on-chain tokenId. This cryptographically binds the
     // human-readable terms to the on-chain commitment, preventing an attacker from
     // submitting terms with extra fields or alternate key ordering.
-    const reSerializedBytes = new TextEncoder().encode(canonicalSerialize(terms));
-    const reHashBuffer = await crypto.subtle.digest('SHA-256', reSerializedBytes);
-    const reHashHex = Array.from(new Uint8Array(reHashBuffer))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
-    if (reHashHex !== tokenId) {
-      throw new SphereError(
-        'Invoice import failed: parsed terms do not match on-chain token ID (canonical hash mismatch).',
-        'INVOICE_INVALID_DATA',
+    //
+    // IMPORTANT: Must use the same DataHasher + TokenId path as createInvoice().
+    // DataHasher.SHA256.digest().imprint is [2-byte algorithm tag (0x0000)] +
+    // [32-byte SHA-256] = 34 bytes → TokenId.toJSON() = 68-char hex.
+    // crypto.subtle.digest produces only the 32-byte SHA-256 (64-char hex) which
+    // does NOT match the 68-char tokenId stored on-chain.
+    {
+      const { DataHasher } = await import(
+        '@unicitylabs/state-transition-sdk/lib/hash/DataHasher.js'
       );
+      const { HashAlgorithm } = await import(
+        '@unicitylabs/state-transition-sdk/lib/hash/HashAlgorithm.js'
+      );
+      const { TokenId } = await import(
+        '@unicitylabs/state-transition-sdk/lib/token/TokenId.js'
+      );
+      const reSerializedBytes = new TextEncoder().encode(canonicalSerialize(terms));
+      const hash = await new DataHasher(HashAlgorithm.SHA256)
+        .update(reSerializedBytes)
+        .digest();
+      const reTokenId = new TokenId(hash.imprint).toJSON();
+      if (reTokenId !== tokenId) {
+        throw new SphereError(
+          'Invoice import failed: parsed terms do not match on-chain token ID (canonical hash mismatch).',
+          'INVOICE_INVALID_DATA',
+        );
+      }
     }
 
     // ------------------------------------------------------------------
@@ -1531,9 +1576,23 @@ export class AccountingModule {
 
     // ------------------------------------------------------------------
     // Step 6: Store the token via PaymentsModule.addToken()
+    // Invoice tokens have null coinData — build the uiToken directly like
+    // createInvoice() does, rather than using txfToToken() which would crash
+    // calling .reduce() on null.
     // ------------------------------------------------------------------
     try {
-      const uiToken = txfToToken(tokenId, token);
+      const uiToken: import('../../types/index.js').Token = {
+        id: tokenId,
+        coinId: INVOICE_TOKEN_TYPE_HEX,
+        symbol: 'INVOICE',
+        name: 'Invoice',
+        decimals: 0,
+        amount: '0',
+        status: 'confirmed',
+        createdAt: terms.createdAt,
+        updatedAt: terms.createdAt,
+        sdkData: JSON.stringify(token),
+      };
       await deps.payments.addToken(uiToken);
     } catch (err) {
       throw new SphereError(
@@ -1541,6 +1600,37 @@ export class AccountingModule {
         'INVOICE_STORAGE_FAILED',
         err instanceof Error ? err : undefined,
       );
+    }
+
+    // ------------------------------------------------------------------
+    // Step 6b: Normalize coinIds in terms — resolve short symbols to hashes.
+    //
+    // Invoices created by external parties (e.g. escrow) may use symbolic
+    // currency names ("BTC", "ETH") instead of the 64/68-char hex coinId
+    // hashes that token storage uses. The balance computer matches transfer
+    // coinIds against invoice target coinIds by exact string comparison, so
+    // a symbol/hash mismatch causes all payments to be classified as
+    // 'unknown_asset'. Resolve any symbol-looking coinIds to their registry
+    // hashes before storing so computeInvoiceStatus works correctly.
+    // ------------------------------------------------------------------
+    {
+      const registry = TokenRegistry.getInstance();
+      const normalizedTargets = terms.targets.map(target => ({
+        ...target,
+        assets: target.assets.map(asset => {
+          if (!asset.coin) return asset;
+          const [coinId, amount] = asset.coin;
+          // Resolve only if it looks like a short symbol (≤20 alphanumeric chars)
+          if (coinId.length <= 20 && /^[A-Za-z0-9]+$/.test(coinId)) {
+            const def = registry.getDefinitionBySymbol(coinId);
+            if (def?.id && def.id !== coinId) {
+              return { ...asset, coin: [def.id, amount] as [string, string] };
+            }
+          }
+          return asset;
+        }),
+      }));
+      terms = { ...terms, targets: normalizedTargets };
     }
 
     // ------------------------------------------------------------------
@@ -4779,9 +4869,9 @@ export class AccountingModule {
     if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return;
     if (version > 1) return; // forward compat: silently ignore future versions
 
-    // §5.11 step 5c: invoiceId must be 64-char lowercase hex
+    // §5.11 step 5c: invoiceId must be 64- or 68-char lowercase hex (DataHash.imprint format)
     const invoiceId = raw['invoiceId'];
-    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64}$/.test(invoiceId)) return;
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
 
     // §5.11 step 5d: terminalState
     const terminalState = raw['terminalState'];
@@ -4877,9 +4967,9 @@ export class AccountingModule {
     if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return;
     if (version > 1) return; // forward compat
 
-    // §5.12 step 5c: invoiceId must be 64-char lowercase hex
+    // §5.12 step 5c: invoiceId must be 64- or 68-char lowercase hex (DataHash.imprint format)
     const invoiceId = raw['invoiceId'];
-    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64}$/.test(invoiceId)) return;
+    if (typeof invoiceId !== 'string' || !/^[0-9a-f]{64,68}$/.test(invoiceId)) return;
 
     // §5.12 step 5d: senderContribution — object with non-empty senderAddress and bounded assets array
     const senderContribution = raw['senderContribution'];
@@ -5920,17 +6010,55 @@ export class AccountingModule {
    *
    * @param tokenData - JSON string from genesis.data.tokenData.
    */
+  /**
+   * Normalize symbol coinIds (e.g. "BTC", "ETH") to hash coinIds in invoice terms.
+   * Called after parsing to ensure computeInvoiceStatus matches against hash coinIds
+   * from ledger entries (which come from token coinData, always hash format).
+   */
+  private _normalizeInvoiceTerms(terms: InvoiceTerms): InvoiceTerms {
+    const registry = TokenRegistry.getInstance();
+    const normalizedTargets = terms.targets.map(target => ({
+      ...target,
+      assets: target.assets.map(asset => {
+        if (!asset.coin) return asset;
+        const [coinId, amount] = asset.coin;
+        if (coinId.length <= 20 && /^[A-Za-z0-9]+$/.test(coinId)) {
+          const def = registry.getDefinitionBySymbol(coinId);
+          if (def?.id && def.id !== coinId) {
+            return { ...asset, coin: [def.id, amount] as [string, string] };
+          }
+        }
+        return asset;
+      }),
+    }));
+    const hasChanges = normalizedTargets.some((t, i) =>
+      t.assets.some((a, j) => a.coin?.[0] !== terms.targets[i]?.assets[j]?.coin?.[0])
+    );
+    return hasChanges ? { ...terms, targets: normalizedTargets } : terms;
+  }
+
   private _parseInvoiceTerms(tokenData: string): InvoiceTerms | null {
+    // tokenData may be either a plain JSON string or hex-encoded UTF-8 JSON
+    // (state-transition-sdk serialises tokenData as hex via HexConverter.encode).
+    const candidates: string[] = [tokenData];
     try {
-      const terms = JSON.parse(tokenData) as InvoiceTerms;
-      // Basic structural validation
-      if (!terms || typeof terms !== 'object') return null;
-      if (!Array.isArray(terms.targets) || terms.targets.length === 0) return null;
-      if (typeof terms.createdAt !== 'number') return null;
-      return terms;
+      const bytes = hexToBytes(tokenData);
+      candidates.push(new TextDecoder().decode(bytes));
     } catch {
-      return null;
+      // not valid hex — only try the raw string
     }
+    for (const candidate of candidates) {
+      try {
+        const terms = JSON.parse(candidate) as InvoiceTerms;
+        if (!terms || typeof terms !== 'object') continue;
+        if (!Array.isArray(terms.targets) || terms.targets.length === 0) continue;
+        if (typeof terms.createdAt !== 'number') continue;
+        return terms;
+      } catch {
+        // try next candidate
+      }
+    }
+    return null;
   }
 
   // ===========================================================================

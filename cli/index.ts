@@ -4546,14 +4546,18 @@ async function main() {
         // before calling deposit(). Crash recovery fires fire-and-forget after module load
         // so the escrow response may arrive slightly after ensureSync completes.
         const swapStatusBefore = await swapModule.getSwapStatus(swapId);
-        if (swapStatusBefore?.progress === 'accepted') {
-          console.log('Waiting for escrow to deliver deposit invoice (up to 60s)...');
+        if (swapStatusBefore?.progress === 'proposed' || swapStatusBefore?.progress === 'accepted') {
+          const waitLabel = swapStatusBefore.progress === 'proposed'
+            ? 'Waiting for Bob to accept and escrow to confirm (up to 120s)...'
+            : 'Waiting for escrow to deliver deposit invoice (up to 60s)...';
+          console.log(waitLabel);
+          const waitMs = swapStatusBefore.progress === 'proposed' ? 120_000 : 60_000;
           const announced = await new Promise<boolean>((resolve) => {
             const announceUnsubs: (() => void)[] = [];
             const timeout = setTimeout(() => {
               announceUnsubs.forEach(u => u());
               resolve(false);
-            }, 60_000);
+            }, waitMs);
             const done = (ok: boolean) => {
               clearTimeout(timeout);
               announceUnsubs.forEach(u => u());
