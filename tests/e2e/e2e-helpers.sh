@@ -251,7 +251,7 @@ wait_swap_progress() {
     out=$(cli_as "$profile" swap-status "$prefix" 2>&1) || true
     progress=$({ echo "$out" | grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' || true; } | tail -1)
     [[ -z "$progress" ]] && echo "$out" | grep -qi "no swap found" && progress="completed"
-    log "[${elapsed}s] ${profile}: ${progress:-unknown}"
+    log "[${elapsed}s] ${profile}: ${progress:-unknown}" >&2
     if echo "$progress" | grep -qE "^(${targets})$"; then
       echo "$progress"
       return 0
