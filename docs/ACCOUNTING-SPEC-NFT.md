@@ -711,7 +711,7 @@ All errors use `SphereError`. New codes to add to the `SphereErrorCode` union ty
 | NFT-RET-01 | Auto-return NFT on cancellation | Invoice with NFT T1. T1 received. Auto-return enabled. Invoice cancelled. | NFT T1 returned to sender. `payments.send()` called with `_nftTransfer: true`, `_tokenIds: [T1]`, memo `INV:<id>:RX`. `invoice:nft_returned` event fires. |
 | NFT-RET-02 | No auto-return on close | Invoice with NFT T1. T1 received. Auto-return enabled. Invoice closed. | NFT T1 is retained. No return transfer. No `invoice:nft_returned` event. |
 | NFT-RET-03 | Dedup prevents double return | Invoice cancelled. Auto-return runs. Crashes after dedup intent written. Restart and crash recovery. | Dedup ledger has `pending` entry for `${invoiceId}:nft:${T1}`. Recovery retries the send. On success, entry transitions to `completed`. No duplicate send. |
-| NFT-RET-04 | Auto-return with refund address | Invoice cancelled. NFT T1 was sent with `refundAddress = R1`. Auto-return enabled. | Return sent to R1 (not sender's DIRECT address). |
+| NFT-RET-04 | Auto-return with refund address fallback | Invoice cancelled. NFT T1 was sent with `senderAddress = null` and `refundAddress = R1`. Auto-return enabled. | Return sent to R1 (senderAddress is null, so refundAddress is used as fallback per N5.1 sender-first priority). |
 | NFT-RET-05 | Auto-return fails -- NFT not in wallet | Invoice cancelled. NFT T1 was received, then manually sent elsewhere before cancellation. Auto-return enabled. | `payments.send()` throws (token not found). Dedup entry set to `failed`. `invoice:auto_return_failed` event fires. |
 
 ### N10.5 Transfer Classification

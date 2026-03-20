@@ -243,41 +243,50 @@ Following the accounting module's mock patterns:
 
 - **Expected:** `NFT_TOKEN_TYPE_HEX` is 64 lowercase hex chars. Value matches `SHA-256("unicity.nft.v1")`.
 
-#### UT-MINT-002: mintNFT — basic happy path
+#### UT-MINT-002: mintNFT — collection happy path
 
 - **Precondition:** Collection exists
-- **Input:** `{ collectionId, metadata: { name: "Art #1", image: "ipfs://QmHash" } }`
+- **Input:** `mintNFT({ name: "Art #1", image: "ipfs://QmHash" }, collectionId)`
 - **Expected:**
   - Oracle `submitMintCommitment` called once
   - Token stored in TokenStorage with `tokenType === NFT_TOKEN_TYPE_HEX`
   - `genesis.data.coinData` is `[]` (empty array)
-  - `genesis.data.tokenData` contains serialized NFTTokenData
-  - Returns `{ tokenId: <64-hex>, confirmed: true, nft: NFTRef }`
+  - `genesis.data.tokenData` contains serialized NFTTokenData with `collectionId` set
+  - Returns `{ tokenId: <64-hex>, collectionId, confirmed: true, nft: NFTRef }`
+
+#### UT-MINT-002a: mintNFT — standalone happy path (no collection)
+
+- **Input:** `mintNFT({ name: "One-off Art", image: "ipfs://QmStandalone" })`
+- **Expected:**
+  - Token minted with random salt (Strategy A)
+  - NFTTokenData has `collectionId: null`, `edition: 0`, `totalEditions: 0`
+  - Returns `{ tokenId: <64-hex>, collectionId: null, confirmed: true, nft: NFTRef }`
+  - No maxSupply check, no mint counter update
 
 #### UT-MINT-003: mintNFT — with explicit edition
 
-- **Input:** `{ collectionId, metadata: {...}, edition: 42, totalEditions: 100 }`
+- **Input:** `mintNFT(metadata, collectionId, 42, 100)`
 - **Expected:** NFTTokenData in tokenData contains `edition: 42`, `totalEditions: 100`.
 
 #### UT-MINT-004: mintNFT — auto-increment edition
 
 - **Precondition:** Collection exists, no prior mints
-- **Action:** Mint 3 NFTs without specifying edition
+- **Action:** Mint 3 NFTs via `mintNFT(metadata, collectionId)` without specifying edition
 - **Expected:** Editions are 1, 2, 3 respectively.
 
 #### UT-MINT-005: mintNFT — with all metadata fields
 
-- **Input:** Metadata with name, description, image, animationUrl, externalUrl, backgroundColor, attributes (3 items), properties, content
+- **Input:** `mintNFT(fullMetadata, collectionId)` — metadata with name, description, image, animationUrl, externalUrl, backgroundColor, attributes (3 items), properties, content
 - **Expected:** All fields preserved in stored token's genesis.data.tokenData.
 
 #### UT-MINT-006: mintNFT — with recipient (not self)
 
-- **Input:** `{ collectionId, metadata: {...}, recipient: "@bob" }`
+- **Input:** `mintNFT(metadata, collectionId, undefined, undefined, "@bob")`
 - **Expected:** Token minted to resolved recipient address. Oracle receives recipient's DirectAddress.
 
 #### UT-MINT-007: mintNFT — collection not found
 
-- **Input:** `{ collectionId: "unknown_hex_id", metadata: {...} }`
+- **Input:** `mintNFT(metadata, "unknown_hex_id")`
 - **Expected:** Throws `SphereError('NFT_COLLECTION_NOT_FOUND')`.
 
 #### UT-MINT-008: mintNFT — maxSupply exceeded
@@ -374,6 +383,49 @@ Following the accounting module's mock patterns:
 
 - **Action:** Batch mint 3 items without explicit editions
 - **Expected:** Editions are sequential (e.g., 1, 2, 3).
+
+#### UT-MINT-026: mintNFT — standalone NFT has edition=0 and totalEditions=0
+
+- **Input:** `mintNFT(metadata)` (no collectionId)
+- **Expected:** NFTTokenData has `collectionId: null`, `edition: 0`, `totalEditions: 0`.
+
+#### UT-MINT-027: mintNFT — standalone NFT uses random salt (Strategy A)
+
+- **Input:** `mintNFT(metadata)` called twice with identical metadata
+- **Expected:** Different `tokenId` each time (random salt produces different IDs).
+
+#### UT-MINT-028: mintNFT — standalone NFT skips maxSupply check
+
+- **Input:** `mintNFT(metadata)` — no collection, no maxSupply constraint
+- **Expected:** Succeeds without any supply check.
+
+#### UT-MINT-029: batchMintNFT — standalone batch (no collectionId)
+
+- **Input:** `batchMintNFT([{metadata: m1}, {metadata: m2}])` — no collectionId
+- **Expected:** Both minted with `collectionId: null`, `edition: 0`, random salts.
+
+#### UT-MINT-030: mintNFT — deterministic salt produces same tokenId for same edition
+
+- **Precondition:** Collection with `deterministicMinting: true`
+- **Action:** Mint edition 1, destroy module, reload, mint edition 1 again
+- **Expected:** Same `tokenId` both times. Oracle returns `REQUEST_ID_EXISTS` on second attempt.
+
+#### UT-MINT-031: mintNFT — deterministic salt: different editions produce different tokenIds
+
+- **Precondition:** Collection with `deterministicMinting: true`
+- **Action:** Mint edition 1 and edition 2
+- **Expected:** Different `tokenId` values.
+
+#### UT-MINT-032: mintNFT — deterministic salt: different private keys produce different tokenIds
+
+- **Precondition:** Same collection (by definition) on two wallets with different keys
+- **Action:** Both mint edition 1
+- **Expected:** Different `tokenId` values (HMAC key differs).
+
+#### UT-MINT-033: mintNFT — deterministic salt matches HMAC-SHA256 formula
+
+- **Action:** Mint with `deterministicMinting: true`, edition 5
+- **Expected:** `salt === HMAC-SHA256(privateKey, collectionId || uint64BE(5))`. Verify by computing HMAC independently.
 
 ---
 
@@ -743,12 +795,12 @@ Following the accounting module's mock patterns:
 
 #### UT-SER-007: canonicalSerializeCollection — key ordering
 
-- **Expected:** Keys in alphabetical order: `createdAt`, `creator`, `description`, `externalUrl`, `image`, `maxSupply`, `name`, `royalty`, `transferable`.
+- **Expected:** Keys in alphabetical order: `createdAt`, `creator`, `description`, `deterministicMinting`, `externalUrl`, `image`, `maxSupply`, `name`, `royalty`, `transferable`.
 
 #### UT-SER-008: canonicalSerializeCollection — null normalization for optionals
 
 - **Action:** Serialize definition without optional fields
-- **Expected:** `externalUrl: null`, `image: null`, `maxSupply: null`, `royalty: null`.
+- **Expected:** `deterministicMinting: false`, `externalUrl: null`, `image: null`, `maxSupply: null`, `royalty: null`.
 
 #### UT-SER-009: canonicalSerializeCollection — transferable defaults to true
 
@@ -972,7 +1024,7 @@ These tests use real (or near-real) dependencies, not mocks.
 | Section | File | Test Count |
 |---------|------|------------|
 | §2 Collection | `NFTModule.collection.test.ts` | 18 |
-| §3 Minting | `NFTModule.mint.test.ts` | 25 |
+| §3 Minting | `NFTModule.mint.test.ts` | 34 |
 | §4 Transfer | `NFTModule.transfer.test.ts` | 10 |
 | §5 Queries | `NFTModule.query.test.ts` | 16 |
 | §6 Import/Export | `NFTModule.importExport.test.ts` | 11 |
@@ -984,4 +1036,4 @@ These tests use real (or near-real) dependencies, not mocks.
 | §12 Errors | `NFTModule.errors.test.ts` | 9 |
 | §13 Storage | `NFTModule.storage.test.ts` | 6 |
 | §14 Integration | `nft-integration.test.ts` | 7 |
-| **Total** | | **142** |
+| **Total** | | **151** |

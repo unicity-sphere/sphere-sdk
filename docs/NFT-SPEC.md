@@ -684,20 +684,20 @@ private _onIncomingTransfer(transfer: IncomingTransfer): void {
 // types/index.ts — add to SphereEventMap
 'nft:minted': {
   tokenId: string;
-  collectionId: string;
+  collectionId: string | null;  // null for standalone NFTs
   name: string;
   confirmed: boolean;
 };
 'nft:received': {
   tokenId: string;
-  collectionId: string;
+  collectionId: string | null;
   name: string;
   senderPubkey: string;
   senderNametag?: string;
 };
 'nft:transferred': {
   tokenId: string;
-  collectionId: string;
+  collectionId: string | null;
   recipientPubkey: string;
   recipientNametag?: string;
 };
@@ -712,7 +712,7 @@ private _onIncomingTransfer(transfer: IncomingTransfer): void {
 };
 'nft:imported': {
   tokenId: string;
-  collectionId: string;
+  collectionId: string | null;
   name: string;
 };
 ```

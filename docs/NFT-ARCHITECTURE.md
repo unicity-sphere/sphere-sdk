@@ -335,7 +335,7 @@ mintNFT(
 
 interface MintNFTResult {
   tokenId: string;
-  collectionId: string;
+  collectionId: string | null;  // null for standalone NFTs
   confirmed: boolean;
   /** The NFTRef for the newly minted token */
   nft: NFTRef;
@@ -558,15 +558,15 @@ Following the accounting module's pattern, NFT token data is canonically seriali
 function canonicalSerializeNFT(data: NFTTokenData): string {
   // Key ordering: alphabetical, strict
   // 1. attributes: sorted by trait_type (ascending)
-  // 2. collectionId: always present
-  // 3. edition: null if absent
+  // 2. collectionId: string | null (null for standalone NFTs)
+  // 3. edition: number (0 for standalone NFTs)
   // 4. metadata: {
   //      animationUrl, attributes, backgroundColor,
   //      content, description, externalUrl, image, name, properties
   //    }
   // 5. mintedAt: always present
   // 6. minter: null if absent
-  // 7. totalEditions: null if absent
+  // 7. totalEditions: number (0 for standalone NFTs)
   //
   // Compact JSON — no trailing whitespace.
 }
@@ -577,9 +577,10 @@ function canonicalSerializeNFT(data: NFTTokenData): string {
 ```typescript
 function canonicalSerializeCollection(def: CollectionDefinition): string {
   // Key ordering: alphabetical, strict
-  // createdAt, creator, description, externalUrl (null if absent),
-  // image (null if absent), maxSupply (null if absent),
-  // name, royalty (null if absent), transferable (default true)
+  // createdAt, creator, description, deterministicMinting (default false),
+  // externalUrl (null if absent), image (null if absent),
+  // maxSupply (null if absent), name, royalty (null if absent),
+  // transferable (default true)
   //
   // Compact JSON.
 }
