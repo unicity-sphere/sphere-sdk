@@ -721,47 +721,24 @@ export class GroupChatModule {
     if (!this.client) return [];
 
     const groupsMap = new Map<string, GroupData>();
-    const memberCountsMap = new Map<string, number>();
 
-    await Promise.all([
-      this.oneshotSubscription(
-        new Filter({ kinds: [NIP29_KINDS.GROUP_METADATA] }),
-        {
-          onEvent: (event: Event) => {
-            const group = this.parseGroupMetadata(event);
-            if (group && group.visibility === GroupVisibilityEnum.PUBLIC) {
-              const existing = groupsMap.get(group.id);
-              if (!existing || group.createdAt > existing.createdAt) {
-                groupsMap.set(group.id, group);
-              }
+    await this.oneshotSubscription(
+      new Filter({ kinds: [NIP29_KINDS.GROUP_METADATA] }),
+      {
+        onEvent: (event: Event) => {
+          const group = this.parseGroupMetadata(event);
+          if (group && group.visibility === GroupVisibilityEnum.PUBLIC) {
+            const existing = groupsMap.get(group.id);
+            if (!existing || group.createdAt > existing.createdAt) {
+              groupsMap.set(group.id, group);
             }
-          },
-          onComplete: () => {},
-          timeoutMs: 10000,
-          timeoutLabel: 'fetchAvailableGroups(metadata)',
+          }
         },
-      ),
-      this.oneshotSubscription(
-        new Filter({ kinds: [NIP29_KINDS.GROUP_MEMBERS] }),
-        {
-          onEvent: (event: Event) => {
-            const groupId = this.getGroupIdFromMetadataEvent(event);
-            if (groupId) {
-              const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-              memberCountsMap.set(groupId, pTags.length);
-            }
-          },
-          onComplete: () => {},
-          timeoutMs: 10000,
-          timeoutLabel: 'fetchAvailableGroups(members)',
-        },
-      ),
-    ]);
-
-    for (const [groupId, count] of memberCountsMap) {
-      const group = groupsMap.get(groupId);
-      if (group) group.memberCount = count;
-    }
+        onComplete: () => {},
+        timeoutMs: 10000,
+        timeoutLabel: 'fetchAvailableGroups(metadata)',
+      },
+    );
 
     return Array.from(groupsMap.values());
   }
@@ -1755,6 +1732,7 @@ export class GroupChatModule {
       let name = 'Unnamed Group';
       let description: string | undefined;
       let picture: string | undefined;
+      let memberCount: number | undefined;
       let isPrivate = false;
       let writeRestricted = false;
 
@@ -1778,6 +1756,7 @@ export class GroupChatModule {
         if (tag[0] === 'private') isPrivate = true;
         if (tag[0] === 'public' && tag[1] === 'false') isPrivate = true;
         if (tag[0] === 'write-restricted') writeRestricted = true;
+        if (tag[0] === 'member_count' && tag[1]) memberCount = parseInt(tag[1], 10) || undefined;
       }
 
       return {
@@ -1786,6 +1765,7 @@ export class GroupChatModule {
         name,
         description,
         picture,
+        memberCount,
         visibility: isPrivate ? GroupVisibilityEnum.PRIVATE : GroupVisibilityEnum.PUBLIC,
         writeRestricted: writeRestricted || undefined,
         createdAt: event.created_at * 1000,
