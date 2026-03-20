@@ -305,17 +305,20 @@ interface CreateCollectionResult {
 /**
  * Mint a single NFT in a collection.
  * Mints on-chain: creates commitment, waits for inclusion proof, stores token.
+ *
+ * @param collectionId  - 64-char hex collection ID (must exist locally)
+ * @param metadata      - NFT metadata (name, image, attributes, etc.)
+ * @param edition       - Optional edition number (auto-incremented if omitted)
+ * @param totalEditions - Optional total editions (informational)
+ * @param recipient     - Optional recipient (default: self). @nametag, DIRECT://, chain pubkey
  */
-mintNFT(request: MintNFTRequest): Promise<MintNFTResult>
-
-interface MintNFTRequest {
-  collectionId: string;
-  metadata: NFTMetadata;
-  edition?: number;
-  totalEditions?: number;
-  /** Recipient (default: self). Supports @nametag, DIRECT://, chain pubkey */
-  recipient?: string;
-}
+mintNFT(
+  collectionId: string,
+  metadata: NFTMetadata,
+  edition?: number,
+  totalEditions?: number,
+  recipient?: string,
+): Promise<MintNFTResult>
 
 interface MintNFTResult {
   tokenId: string;
@@ -329,17 +332,14 @@ interface MintNFTResult {
  * Mint multiple NFTs in a collection (batch).
  * Each NFT gets its own token ID and inclusion proof.
  * Minting is parallelized where possible.
+ *
+ * @param collectionId - 64-char hex collection ID (must exist locally)
+ * @param items        - Array of { metadata, edition?, recipient? } (1-50 items)
  */
-batchMintNFT(request: BatchMintNFTRequest): Promise<BatchMintNFTResult>
-
-interface BatchMintNFTRequest {
-  collectionId: string;
-  items: Array<{
-    metadata: NFTMetadata;
-    edition?: number;
-    recipient?: string;
-  }>;
-}
+batchMintNFT(
+  collectionId: string,
+  items: Array<{ metadata: NFTMetadata; edition?: number; recipient?: string }>,
+): Promise<BatchMintNFTResult>
 
 interface BatchMintNFTResult {
   results: MintNFTResult[];

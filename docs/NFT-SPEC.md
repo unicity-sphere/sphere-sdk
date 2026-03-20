@@ -235,17 +235,17 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
 
 ## 4. Minting
 
-### 4.1 mintNFT(request)
+### 4.1 mintNFT(collectionId, metadata, edition?, totalEditions?, recipient?)
 
-**Input:** `MintNFTRequest`
+**Signature:** `mintNFT(collectionId: string, metadata: NFTMetadata, edition?: number, totalEditions?: number, recipient?: string): Promise<MintNFTResult>`
 
-| Field | Type | Required | Validation |
-|-------|------|----------|------------|
+| Parameter | Type | Required | Validation |
+|-----------|------|----------|------------|
 | `collectionId` | string | Yes | 64-char hex, collection must exist locally |
 | `metadata` | NFTMetadata | Yes | See §4.1.1 |
 | `edition` | number | No | Integer ≥ 1, ≤ maxSupply if set |
 | `totalEditions` | number | No | Integer ≥ 1 |
-| `recipient` | string | No | Valid recipient identifier |
+| `recipient` | string | No | Valid recipient identifier (default: self) |
 
 **4.1.1 NFTMetadata Validation:**
 
@@ -330,12 +330,12 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
 | Oracle rejection | `NFT_MINT_FAILED` |
 | Recipient not found | Standard transport resolution error |
 
-### 4.2 batchMintNFT(request)
+### 4.2 batchMintNFT(collectionId, items)
 
-**Input:** `BatchMintNFTRequest`
+**Signature:** `batchMintNFT(collectionId: string, items: Array<{ metadata: NFTMetadata; edition?: number; recipient?: string }>): Promise<BatchMintNFTResult>`
 
-| Field | Type | Validation |
-|-------|------|------------|
+| Parameter | Type | Validation |
+|-----------|------|------------|
 | `collectionId` | string | 64-char hex, collection must exist |
 | `items` | Array<{metadata, edition?, recipient?}> | 1-50 items |
 
