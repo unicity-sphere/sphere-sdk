@@ -7,7 +7,9 @@
 # =============================================================================
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-CLI="npm run cli -- "
+# Run CLI via npx tsx from the SDK root so it works from any directory.
+# The --cwd flag ensures wallet profiles are created in CLI_DIR (the workspace).
+CLI_BASE="npx --prefix ${SDK_ROOT} tsx ${SDK_ROOT}/cli/index.ts"
 ESCROW_REPO="${ESCROW_REPO:-https://github.com/unicity-sphere/escrow-service.git}"
 ESCROW_STARTUP_TIMEOUT=120
 
@@ -166,9 +168,8 @@ cleanup() {
     kill -9 "$ESCROW_PID" 2>/dev/null || true
   fi
   if [[ "$KEEP_WALLETS" == "false" ]] && [[ -n "${WORKSPACE:-}" ]]; then
-    local dir="${CLI_DIR:-$WORKSPACE}"
     for p in $WALLETS_TO_DELETE; do
-      (cd "$dir" && $CLI wallet delete "$p" > /dev/null 2>&1 || true)
+      _cli wallet delete "$p" > /dev/null 2>&1 || true
     done
   fi
   if [[ "$KEEP_WORKSPACE" == "false" ]] && [[ -n "$WORKSPACE" ]]; then
@@ -184,31 +185,33 @@ cleanup() {
 # ---------------------------------------------------------------------------
 create_wallet() {
   local profile="$1" nametag="${2:-$1}"
-  local dir="${CLI_DIR:-$WORKSPACE}"
-  (cd "$dir" && $CLI wallet create "$profile" --network testnet > /dev/null 2>&1)
-  (cd "$dir" && $CLI wallet use "$profile" > /dev/null 2>&1)
-  (cd "$dir" && $CLI init --nametag "$nametag" > /dev/null 2>&1)
+  _cli wallet create "$profile" --network testnet > /dev/null 2>&1
+  _cli wallet use "$profile" > /dev/null 2>&1
+  _cli init --nametag "$nametag" > /dev/null 2>&1
   ok "Wallet ${profile} (@${nametag})"
 }
 
 topup_wallet() {
   local profile="$1" coin="$2" amount="$3"
-  local dir="${CLI_DIR:-$WORKSPACE}"
-  (cd "$dir" && $CLI wallet use "$profile" > /dev/null 2>&1)
-  (cd "$dir" && $CLI topup "$amount" "$coin" 2>&1 | tail -2)
-  (cd "$dir" && $CLI balance --finalize > /dev/null 2>&1 || true)
+  _cli wallet use "$profile" > /dev/null 2>&1
+  _cli topup "$amount" "$coin" 2>&1 | tail -2
+  _cli balance --finalize > /dev/null 2>&1 || true
   ok "Topup ${profile}: ${amount} ${coin}"
 }
 
-# Run CLI commands from the workspace so each test has its own .sphere-cli/config.json.
+# Run CLI from the workspace so each test has its own .sphere-cli/config.json.
 # This prevents parallel tests from racing on the shared config file.
 CLI_DIR=""
 
+_cli() {
+  local dir="${CLI_DIR:-$WORKSPACE}"
+  (cd "$dir" && $CLI_BASE "$@")
+}
+
 cli_as() {
   local profile="$1"; shift
-  local dir="${CLI_DIR:-$WORKSPACE}"
-  (cd "$dir" && $CLI wallet use "$profile" > /dev/null 2>&1 || true)
-  (cd "$dir" && $CLI "$@" 2>&1)
+  _cli wallet use "$profile" > /dev/null 2>&1 || true
+  _cli "$@" 2>&1
 }
 
 # ---------------------------------------------------------------------------
