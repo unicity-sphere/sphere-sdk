@@ -414,6 +414,21 @@ export class CommunicationsModule {
    */
   onDirectMessage(handler: (message: DirectMessage) => void): () => void {
     this.dmHandlers.add(handler);
+
+    // Replay existing messages to new handler — ensures DMs that arrived
+    // before this handler was registered (e.g., swap proposals arriving
+    // during Sphere.init before SwapModule.load) are not lost.
+    // Snapshot to avoid re-entrancy issues if the handler side-effects mutate
+    // this.messages (e.g., via pruneMessages triggered by sendDM → save).
+    const snapshot = Array.from(this.messages.values());
+    for (const message of snapshot) {
+      try {
+        handler(message);
+      } catch {
+        // Tolerated — handler may reject messages it doesn't care about
+      }
+    }
+
     return () => this.dmHandlers.delete(handler);
   }
 
@@ -573,8 +588,10 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:dm', message);
 
-    // Notify handlers
-    for (const handler of this.dmHandlers) {
+    // Notify handlers — snapshot Set before iterating to prevent mid-dispatch
+    // registration (JS Set spec: new entries added during for-of are visited)
+    const handlers = Array.from(this.dmHandlers);
+    for (const handler of handlers) {
       try {
         handler(message);
       } catch (error) {
@@ -601,8 +618,8 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('composing:started', composing);
 
-    // Notify handlers
-    for (const handler of this.composingHandlers) {
+    // Notify handlers — snapshot Set to prevent mid-dispatch registration side-effects
+    for (const handler of Array.from(this.composingHandlers)) {
       try {
         handler(composing);
       } catch (error) {
@@ -625,8 +642,8 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:broadcast', message);
 
-    // Notify handlers
-    for (const handler of this.broadcastHandlers) {
+    // Notify handlers — snapshot Set to prevent mid-dispatch registration side-effects
+    for (const handler of Array.from(this.broadcastHandlers)) {
       try {
         handler(message);
       } catch (error) {

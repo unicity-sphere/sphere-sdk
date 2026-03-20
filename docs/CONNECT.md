@@ -269,6 +269,8 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `sphere_l1GetBalance` | — | L1 balance |
 | `sphere_l1GetHistory` | `limit?` | L1 history |
 | `sphere_resolve` | `identifier` | resolved address info |
+| `sphere_getInvoices` | `state?, createdByMe?, targetingMe?, limit?, offset?, sortBy?, sortOrder?` | `InvoiceRef[]` |
+| `sphere_getInvoiceStatus` | `invoiceId` | `InvoiceStatus` |
 | `sphere_subscribe` | `event` | `{ subscribed, event }` |
 | `sphere_unsubscribe` | `event` | `{ unsubscribed, event }` |
 | `sphere_disconnect` | — | `{ disconnected }` |
@@ -283,6 +285,15 @@ The wallet's `onConnectionRequest` receives `silent=true` and must return `{ app
 | `payment_request` | `amount, coinId, description?` |
 | `receive` | `coinId?` |
 | `sign_message` | `message` |
+| `create_invoice` | `targets, dueDate?, memo?, deliveryMethods?, anonymous?` |
+| `close_invoice` | `invoiceId, autoReturn?` |
+| `cancel_invoice` | `invoiceId, autoReturn?` |
+| `pay_invoice` | `invoiceId, targetIndex, assetIndex?, amount?, freeText?, refundAddress?, contact?` |
+| `return_invoice_payment` | `invoiceId, recipient, amount, coinId, freeText?` |
+| `import_invoice` | `token` |
+| `send_invoice_receipts` | `invoiceId, memo?, includeZeroBalance?` |
+| `send_cancellation_notices` | `invoiceId, reason?, dealDescription?, includeZeroBalance?` |
+| `set_auto_return` | `invoiceId, enabled` |
 
 ### sign_message Intent
 
@@ -347,6 +358,8 @@ Permissions are requested during handshake and checked on every request:
 | `intent:sign_message` | `sign_message` intent |
 | `comms:read` | DM conversations |
 | `comms:write` | send DMs |
+| `invoice:read` | `sphere_getInvoices`, `sphere_getInvoiceStatus` |
+| `invoice:write` | `create_invoice`, `close_invoice`, `cancel_invoice`, `import_invoice`, `send_invoice_receipts`, `send_cancellation_notices`, `set_auto_return` intents |
 
 ---
 

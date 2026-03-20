@@ -248,7 +248,9 @@ export class InstantSplitExecutor {
       recipientMintCommitment.transactionData,
       recipientAddress,
       transferSalt,
-      this.signingService
+      this.signingService,
+      undefined, // nametagTokens
+      options?.message // on-chain message (invoice memo bytes, or null)
     );
 
     // Create minted token state for recipient to reconstruct
@@ -403,7 +405,8 @@ export class InstantSplitExecutor {
     recipientAddress: IAddress,
     transferSalt: Uint8Array,
     signingService: SigningService,
-    nametagTokens?: Token<any>[]
+    nametagTokens?: Token<any>[],
+    message?: Uint8Array | null
   ): Promise<TransferCommitment> {
     // Recreate the predicate from mint data
     const predicate = await UnmaskedPredicate.create(
@@ -431,8 +434,8 @@ export class InstantSplitExecutor {
       minimalToken as any,
       recipientAddress,
       transferSalt,
-      null, // recipientData
       null, // recipientDataHash
+      message ?? null, // on-chain message (invoice memo bytes, or null)
       signingService
     );
 

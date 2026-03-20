@@ -15,10 +15,11 @@
 4. [Payment Requests](#payment-requests)
 5. [L1 Payments](#l1-payments)
 6. [Communications](#communications)
-7. [Custom Providers](#custom-providers)
-8. [Events](#events)
-9. [Error Handling](#error-handling)
-10. [Testing](#testing)
+7. [Invoicing / Accounting](#invoicing--accounting)
+8. [Custom Providers](#custom-providers)
+9. [Events](#events)
+10. [Error Handling](#error-handling)
+11. [Testing](#testing)
 
 ---
 
@@ -857,6 +858,523 @@ sphere.communications.onBroadcast((broadcast) => {
 ```typescript
 await sphere.communications.broadcast('Hello world!', ['general']);
 ```
+
+---
+
+## Invoicing / Accounting
+
+The `AccountingModule` manages the full lifecycle of on-chain invoices: creation, sharing, payment attribution, status tracking, returns, and receipts. An invoice is a special token minted on the Unicity aggregator. Its terms (payment targets, amounts, due date, memo) are embedded in the token's genesis data, making them tamper-evident and independently verifiable by any party who holds the token.
+
+### Enable the Accounting Module
+
+The module is opt-in. Pass `accounting: true` (or a config object) when initializing the wallet:
+
+```typescript
+import { Sphere } from '@unicitylabs/sphere-sdk';
+import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
+
+const providers = createNodeProviders({ network: 'testnet', dataDir: './wallet', tokensDir: './tokens' });
+
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,  // Enable with defaults
+});
+
+// Access the module
+const accounting = sphere.accounting!;
+```
+
+Custom configuration:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: {
+    debug: true,                    // Enable debug logging
+    autoTerminateOnReturn: false,   // Do not auto-close invoice when a return arrives (default)
+    maxCoinDataEntries: 50,         // Max coin entries processed per token transaction (default)
+  },
+});
+```
+
+> `sphere.accounting` is `null` when the module is not configured.
+
+### Create an Invoice
+
+An invoice specifies one or more payment targets. Each target has a `DIRECT://` destination address and a list of assets (coin type + amount) it expects to receive.
+
+```typescript
+// Create a simple single-target invoice requesting 1 000 000 UCT
+const result = await accounting.createInvoice({
+  targets: [
+    {
+      address: sphere.identity!.directAddress!,  // Pay to this wallet
+      assets: [
+        { coin: ['UCT', '1000000'] },  // [coinId, amount in smallest units]
+      ],
+    },
+  ],
+  memo: 'Payment for order #1234',
+  dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000,  // Due in 7 days
+});
+
+if (!result.success) {
+  console.error('Invoice creation failed:', result.error);
+} else {
+  console.log('Invoice ID:', result.invoiceId);      // 64-char hex token ID
+  console.log('Terms:', result.terms);               // Parsed InvoiceTerms
+  console.log('Token (TXF):', result.token);         // Raw TxfToken for sharing
+}
+```
+
+Multi-target invoices — where separate parties each receive a different asset — are supported by adding more entries to `targets`. Each target address must be a valid `DIRECT://` address and must appear only once.
+
+### Share an Invoice
+
+The `result.token` is a plain `TxfToken` object (JSON-serializable). Share it with payers over any channel — DM, email, QR code, file, etc.:
+
+```typescript
+// Serialize for transmission
+const invoiceJson = JSON.stringify(result.token);
+
+// Send over DM (example — use your preferred transport)
+await sphere.communications.sendDM('@bob', invoiceJson);
+```
+
+### Import an Invoice (Payer Side)
+
+The payer imports the token to start tracking the invoice locally:
+
+```typescript
+import type { TxfToken } from '@unicitylabs/sphere-sdk';
+
+const token: TxfToken = JSON.parse(receivedJson);
+
+const terms = await accounting.importInvoice(token);
+console.log('Invoice creator:', terms.creator);     // Chain pubkey of issuer
+console.log('Due date:', terms.dueDate ? new Date(terms.dueDate) : 'none');
+console.log('Targets:', terms.targets.length);
+```
+
+`importInvoice()` validates the inclusion proof embedded in the token and rejects tokens with an invalid or tampered proof chain.
+
+### Pay an Invoice
+
+Use `payInvoice()` to send tokens against a specific target and asset within the invoice. The module constructs the correct memo automatically and embeds your return address so the payee can issue refunds.
+
+```typescript
+// Pay the first target's first asset (index 0, 0)
+const transfer = await accounting.payInvoice(invoiceId, {
+  targetIndex: 0,    // Which target to pay
+  assetIndex: 0,     // Which asset within that target (default: 0)
+  // amount is optional — defaults to the remaining uncovered amount
+});
+
+console.log('Transfer ID:', transfer.id);
+console.log('Status:', transfer.status);  // 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
+```
+
+Paying a specific amount (partial payment):
+
+```typescript
+await accounting.payInvoice(invoiceId, {
+  targetIndex: 0,
+  amount: '500000',          // Pay half now
+  freeText: 'First tranche', // Optional note appended to the memo
+  refundAddress: sphere.identity!.directAddress!,  // Explicit refund destination
+});
+```
+
+### Check Invoice Status
+
+`getInvoiceStatus()` computes the current payment state from local transaction history. It returns a full breakdown per target and per coin asset.
+
+```typescript
+const status = await accounting.getInvoiceStatus(invoiceId);
+
+console.log('State:', status.state);
+// 'OPEN'      — no payments yet
+// 'PARTIAL'   — some targets partially covered
+// 'COVERED'   — all targets fully covered, awaiting confirmation
+// 'CLOSED'    — explicitly or implicitly closed
+// 'CANCELLED' — cancelled by a target party
+// 'EXPIRED'   — due date passed, not yet covered
+
+console.log('All confirmed:', status.allConfirmed);
+console.log('Last activity:', new Date(status.lastActivityAt));
+
+// Per-target breakdown
+for (const target of status.targets) {
+  console.log(`Target ${target.address}: covered=${target.isCovered}`);
+  for (const coinAsset of target.coinAssets) {
+    const [coinId, requested] = coinAsset.coin;
+    console.log(`  ${coinId}: ${coinAsset.netCoveredAmount}/${requested}`);
+    if (coinAsset.surplusAmount !== '0') {
+      console.log(`  Surplus: ${coinAsset.surplusAmount}`);
+    }
+  }
+}
+```
+
+`getInvoiceStatus()` has a side effect: when the invoice transitions from `COVERED` to fully confirmed (`allConfirmed === true`), it implicitly closes the invoice, freezes balances, and fires `invoice:closed`.
+
+### List Invoices
+
+`getInvoices()` returns lightweight `InvoiceRef` objects (no status computed unless a state filter is passed):
+
+```typescript
+// All invoices
+const all = await accounting.getInvoices();
+
+// Only open invoices created by this wallet
+const mine = await accounting.getInvoices({
+  state: 'OPEN',
+  createdByMe: true,
+  sortBy: 'dueDate',
+  sortOrder: 'asc',
+  limit: 20,
+  offset: 0,
+});
+
+for (const ref of mine) {
+  console.log(`${ref.invoiceId}: creator=${ref.isCreator} closed=${ref.closed} cancelled=${ref.cancelled}`);
+  console.log(`  Memo: ${ref.terms.memo ?? 'none'}`);
+  console.log(`  Due: ${ref.terms.dueDate ? new Date(ref.terms.dueDate) : 'none'}`);
+}
+
+// Single invoice by ID (synchronous, in-memory)
+const ref = accounting.getInvoice(invoiceId);
+if (!ref) {
+  console.log('Invoice not found locally');
+}
+```
+
+### Close an Invoice (Payee Side)
+
+Only a wallet whose address appears in `terms.targets` can close an invoice. Closing freezes the current balance snapshot and stops further dynamic recomputation.
+
+```typescript
+// Explicit close — balance is frozen at this moment
+await accounting.closeInvoice(invoiceId);
+
+// Close and immediately return any surplus to payers
+await accounting.closeInvoice(invoiceId, { autoReturn: true });
+```
+
+Implicit close happens automatically when `getInvoiceStatus()` detects `state === 'COVERED'` with `allConfirmed === true`.
+
+### Cancel an Invoice
+
+Cancellation is also restricted to target parties. All received payments become eligible for return.
+
+```typescript
+// Cancel and return all payments to payers
+await accounting.cancelInvoice(invoiceId, { autoReturn: true });
+```
+
+### Return a Payment (Manual)
+
+The payee can return tokens to a specific payer at any time. The amount is capped at that payer's net balance for the given coin.
+
+```typescript
+// Return 250 000 UCT to the original payer
+const result = await accounting.returnInvoicePayment(invoiceId, {
+  recipient: 'DIRECT://...',  // Payer's address (from status.targets[i].coinAssets[j].senderBalances)
+  amount: '250000',
+  coinId: 'UCT',
+  freeText: 'Partial refund — order cancelled',
+});
+```
+
+### Auto-Return Setup
+
+Auto-return automatically sends tokens back to payers when an invoice is terminated (closed or cancelled). It can be enabled globally or per invoice.
+
+```typescript
+// Enable for all terminated invoices (global setting)
+await accounting.setAutoReturn('*', true);
+
+// Enable for a specific invoice only
+await accounting.setAutoReturn(invoiceId, true);
+
+// Check current settings
+const settings = accounting.getAutoReturnSettings();
+console.log('Global:', settings.global);
+console.log('Per-invoice:', settings.perInvoice);
+```
+
+When enabled, auto-return fires immediately for invoices already in a terminal state, and continues to process new forward payments that arrive after termination.
+
+### Send Receipts (Payee Side)
+
+After closing or cancelling an invoice, the payee can send structured receipt DMs to each payer confirming their contribution:
+
+```typescript
+// Send receipt to all payers after close
+const result = await accounting.sendInvoiceReceipts(invoiceId, {
+  memo: 'Thank you for your payment — order dispatched',
+  includeZeroBalance: false,  // Skip payers with net balance of 0 (default)
+});
+
+console.log(`Sent: ${result.sent}, Failed: ${result.failed}`);
+```
+
+### Send Cancellation Notices
+
+After cancelling an invoice, the payee can notify payers with a structured cancellation DM:
+
+```typescript
+const result = await accounting.sendCancellationNotices(invoiceId, {
+  reason: 'Item out of stock',
+  dealDescription: 'Limited edition UCT merchandise',
+  includeZeroBalance: false,
+});
+
+console.log(`Notices sent: ${result.sent}, Failed: ${result.failed}`);
+```
+
+### Listen to Invoice Events
+
+Subscribe via `sphere.on()` — the same event bus used by all other modules:
+
+```typescript
+// Invoice created or imported
+sphere.on('invoice:created', ({ invoiceId, confirmed }) => {
+  console.log(`New invoice: ${invoiceId} (confirmed: ${confirmed})`);
+});
+
+// Incoming payment against an invoice
+sphere.on('invoice:payment', ({ invoiceId, transfer, paymentDirection, confirmed }) => {
+  console.log(`Payment on ${invoiceId}: direction=${paymentDirection}`);
+});
+
+// Asset fully covered (requested amount reached for a coin)
+sphere.on('invoice:asset_covered', ({ invoiceId, address, coinId, confirmed }) => {
+  console.log(`${coinId} covered for ${address} on invoice ${invoiceId}`);
+});
+
+// All assets for a target covered
+sphere.on('invoice:target_covered', ({ invoiceId, address, confirmed }) => {
+  console.log(`Target ${address} covered on invoice ${invoiceId}`);
+});
+
+// All targets covered
+sphere.on('invoice:covered', ({ invoiceId, confirmed }) => {
+  console.log(`Invoice ${invoiceId} fully covered`);
+});
+
+// Invoice closed (explicit: user called closeInvoice(); implicit: auto-close after COVERED+confirmed)
+sphere.on('invoice:closed', ({ invoiceId, explicit }) => {
+  console.log(`Invoice ${invoiceId} closed (explicit: ${explicit})`);
+});
+
+// Invoice cancelled
+sphere.on('invoice:cancelled', ({ invoiceId }) => {
+  console.log(`Invoice ${invoiceId} cancelled`);
+});
+
+// Overpayment detected on a coin asset
+sphere.on('invoice:overpayment', ({ invoiceId, address, coinId, surplus, confirmed }) => {
+  console.log(`Overpayment of ${surplus} ${coinId} on invoice ${invoiceId}`);
+});
+
+// Auto-return executed
+sphere.on('invoice:auto_returned', ({ invoiceId, originalTransfer, returnTransfer }) => {
+  console.log(`Auto-return sent for invoice ${invoiceId}`);
+});
+
+// Auto-return failed
+sphere.on('invoice:auto_return_failed', ({ invoiceId, transferId, reason }) => {
+  console.warn(`Auto-return failed for ${invoiceId}: ${reason}`);
+});
+
+// Return received by the payer
+sphere.on('invoice:return_received', ({ invoiceId, transfer, returnReason }) => {
+  console.log(`Return received on ${invoiceId}: reason=${returnReason}`);
+});
+
+// Receipt received (payer side — sent by the payee after close/cancel)
+sphere.on('invoice:receipt_received', ({ invoiceId, receipt }) => {
+  console.log(`Receipt for ${invoiceId} from ${receipt.targetAddress}`);
+  console.log(`State: ${receipt.receipt.terminalState}`);
+  for (const asset of receipt.receipt.senderContribution.assets) {
+    console.log(`  ${asset.coinId}: forwarded=${asset.forwardedAmount} returned=${asset.returnedAmount}`);
+  }
+});
+
+// Cancellation notice received (payer side)
+sphere.on('invoice:cancellation_received', ({ invoiceId, notice }) => {
+  console.log(`Invoice ${invoiceId} was cancelled: ${notice.notice.reason ?? 'no reason given'}`);
+});
+```
+
+### Complete Workflow Example
+
+The following example walks through the full lifecycle from the payee's perspective (creating and closing) and the payer's perspective (importing and paying):
+
+```typescript
+// ---- PAYEE SIDE ----
+
+const { sphere: payee } = await Sphere.init({
+  ...payeeProviders,
+  autoGenerate: true,
+  nametag: 'shop',
+  accounting: true,
+});
+const payeeAccounting = payee.accounting!;
+
+// 1. Create the invoice
+const { invoiceId, token } = await payeeAccounting.createInvoice({
+  targets: [{
+    address: payee.identity!.directAddress!,
+    assets: [{ coin: ['UCT', '2000000'] }],
+  }],
+  memo: 'Order #5678 — 2 items',
+  dueDate: Date.now() + 3 * 24 * 60 * 60 * 1000,
+});
+
+// 2. Share with payer (here via DM)
+await payee.communications.sendDM('@customer', JSON.stringify(token));
+
+// 3. Listen for payments
+payee.on('invoice:covered', async ({ invoiceId: id }) => {
+  // All targets are paid — send receipt
+  await payeeAccounting.sendInvoiceReceipts(id, { memo: 'Your order has been dispatched.' });
+});
+
+// ---- PAYER SIDE ----
+
+const { sphere: payer } = await Sphere.init({
+  ...payerProviders,
+  autoGenerate: true,
+  nametag: 'customer',
+  accounting: true,
+});
+const payerAccounting = payer.accounting!;
+
+// 4. Receive the invoice token via DM
+payer.communications.onDirectMessage(async (msg) => {
+  let token;
+  try { token = JSON.parse(msg.content); } catch { return; }
+
+  // 5. Import and pay
+  await payerAccounting.importInvoice(token);
+
+  const status = await payerAccounting.getInvoiceStatus(token.id);
+  console.log('Invoice state before payment:', status.state);  // 'OPEN'
+
+  await payerAccounting.payInvoice(token.id, { targetIndex: 0 });
+});
+
+// 6. Payer receives a receipt DM once payee confirms
+payer.on('invoice:receipt_received', ({ invoiceId: id, receipt }) => {
+  console.log(`Invoice ${id} settled. Memo: ${receipt.receipt.memo}`);
+});
+```
+
+### Get Related Transfers
+
+Inspect the full transfer history attributed to an invoice, including transfers the module classified as irrelevant (wrong address, wrong asset, self-payment):
+
+```typescript
+const transfers = accounting.getRelatedTransfers(invoiceId);
+
+for (const t of transfers) {
+  console.log(`${t.transferId}: direction=${t.direction} paymentDirection=${t.paymentDirection}`);
+  console.log(`  Amount: ${t.amount} ${t.coinId}`);
+  if ('reason' in t) {
+    // IrrelevantTransfer — did not count toward coverage
+    console.log(`  Irrelevant: ${t.reason}`);
+  }
+}
+```
+
+### Parse an Invoice Memo
+
+When inspecting raw transaction history (e.g., from `sphere.payments.getHistory()`), use `parseInvoiceMemo()` to check whether a memo references an invoice:
+
+```typescript
+const parsed = accounting.parseInvoiceMemo('INV:abc123:F');
+if (parsed) {
+  console.log('Invoice ID:', parsed.invoiceId);           // 'abc123'
+  console.log('Direction:', parsed.paymentDirection);     // 'forward'
+  console.log('Free text:', parsed.freeText ?? 'none');
+}
+```
+
+### Accounting Error Codes
+
+All accounting errors are `SphereError` instances with a typed `.code`. Use `isSphereError()` to handle them:
+
+```typescript
+import { isSphereError } from '@unicitylabs/sphere-sdk';
+
+try {
+  await accounting.closeInvoice(invoiceId);
+} catch (err) {
+  if (isSphereError(err)) {
+    switch (err.code) {
+      case 'INVOICE_NOT_FOUND':
+        console.error('Invoice not found locally — was it imported?');
+        break;
+      case 'INVOICE_NOT_TARGET':
+        console.error('Only target parties can close an invoice');
+        break;
+      case 'INVOICE_ALREADY_CLOSED':
+        console.error('Invoice is already closed');
+        break;
+      case 'INVOICE_ALREADY_CANCELLED':
+        console.error('Invoice is already cancelled');
+        break;
+      case 'INVOICE_TERMINATED':
+        console.error('Cannot pay a closed or cancelled invoice');
+        break;
+      case 'INVOICE_RETURN_EXCEEDS_BALANCE':
+        console.error('Return amount exceeds the payer\'s net balance for this coin');
+        break;
+      case 'INVOICE_MINT_FAILED':
+        console.error('Aggregator submission failed — check network connection');
+        break;
+      case 'INVOICE_NOT_TERMINATED':
+        console.error('Receipts can only be sent for closed or cancelled invoices');
+        break;
+      case 'COMMUNICATIONS_UNAVAILABLE':
+        console.error('DM receipts require the CommunicationsModule to be available');
+        break;
+      default:
+        console.error(err.message);
+    }
+  }
+}
+```
+
+**Full list of accounting error codes:**
+
+| Code | Thrown by | Meaning |
+|------|-----------|---------|
+| `INVOICE_NO_TARGETS` | `createInvoice` | Targets array is empty |
+| `INVOICE_NO_ASSETS` | `createInvoice` | A target has no assets |
+| `INVOICE_INVALID_AMOUNT` | `createInvoice`, `payInvoice` | Asset amount is not a positive integer, or zero-amount send |
+| `INVOICE_INVALID_ADDRESS` | `createInvoice` | A target address is not a valid `DIRECT://` address |
+| `INVOICE_ORACLE_REQUIRED` | `createInvoice` | Oracle provider is not available (required for minting) |
+| `INVOICE_MINT_FAILED` | `createInvoice` | Aggregator submission failed after retries |
+| `INVOICE_INVALID_PROOF` | `importInvoice` | Inclusion proof is invalid or tampered |
+| `INVOICE_WRONG_TOKEN_TYPE` | `importInvoice` | Token is not an invoice token |
+| `INVOICE_INVALID_DATA` | `importInvoice` | `tokenData` cannot be parsed as `InvoiceTerms` |
+| `INVOICE_ALREADY_EXISTS` | `importInvoice` | Invoice token already held locally |
+| `INVOICE_NOT_FOUND` | Most methods | Invoice is not known locally |
+| `INVOICE_NOT_TARGET` | `closeInvoice`, `cancelInvoice`, `returnInvoicePayment`, `sendInvoiceReceipts`, `sendCancellationNotices` | Wallet is not one of the invoice targets |
+| `INVOICE_ALREADY_CLOSED` | `closeInvoice` | Invoice is already in CLOSED state |
+| `INVOICE_ALREADY_CANCELLED` | `cancelInvoice` | Invoice is already in CANCELLED state |
+| `INVOICE_TERMINATED` | `payInvoice` | Invoice is CLOSED or CANCELLED — no further payments accepted |
+| `INVOICE_RETURN_EXCEEDS_BALANCE` | `returnInvoicePayment` | Return amount exceeds per-sender net balance |
+| `INVOICE_NOT_TERMINATED` | `sendInvoiceReceipts` | Invoice must be CLOSED or CANCELLED before sending receipts |
+| `INVOICE_NOT_CANCELLED` | `sendCancellationNotices` | Invoice must be in CANCELLED state |
+| `COMMUNICATIONS_UNAVAILABLE` | `sendInvoiceReceipts`, `sendCancellationNotices` | `CommunicationsModule` is not available |
+| `INVOICE_MEMO_TOO_LONG` | `createInvoice`, `sendInvoiceReceipts`, `sendCancellationNotices` | Memo or reason exceeds 4096 characters |
+| `RATE_LIMITED` | `setAutoReturn('*', ...)` | Global auto-return setting changed within 5-second cooldown |
 
 ---
 

@@ -1617,38 +1617,65 @@ export class NostrTransportProvider implements TransportProvider {
       EVENT_KINDS.TOKEN_TRANSFER,
       EVENT_KINDS.PAYMENT_REQUEST,
       EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+      EventKinds.GIFT_WRAP, // NIP-17 gift-wrapped DMs (swap proposals, invoice receipts, etc.)
     ];
     walletFilter['#p'] = [nostrPubkey];
-    walletFilter.since = Math.floor(Date.now() / 1000) - 86400;
+    // NIP-17 gift wraps have randomized created_at (±172800 s).  Extend the
+    // catch-up window by the full randomization range so events sent recently
+    // but timestamped far in the past are not missed.
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400 - 172800;
+
+    // Capture client reference after the guard to avoid a null-deref race:
+    // a concurrent disconnect() can set this.nostrClient = null between the
+    // isConnected() check above and the subscribe() call below.
+    const client = this.nostrClient;
 
     // Collect events first, then process after EOSE
     const events: NostrEvent[] = [];
+    // Declared outside the Promise so it's available for cleanup after resolve.
+    let subId: string | undefined;
 
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        if (subId) this.nostrClient?.unsubscribe(subId);
+    await new Promise<void>((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      // settle() only resolves the Promise — unsubscribe happens AFTER the Promise
+      // resolves (below), where subId is guaranteed to be the real subscription ID.
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
         resolve();
-      }, 5000);
+      };
 
-      const subId = this.nostrClient!.subscribe(walletFilter, {
-        onEvent: (event) => {
-          events.push({
-            id: event.id,
-            kind: event.kind,
-            content: event.content,
-            tags: event.tags,
-            pubkey: event.pubkey,
-            created_at: event.created_at,
-            sig: event.sig,
-          });
-        },
-        onEndOfStoredEvents: () => {
-          clearTimeout(timeout);
-          this.nostrClient?.unsubscribe(subId);
-          resolve();
-        },
-      });
+      try {
+        subId = client.subscribe(walletFilter, {
+          onEvent: (event) => {
+            events.push({
+              id: event.id,
+              kind: event.kind,
+              content: event.content,
+              tags: event.tags,
+              pubkey: event.pubkey,
+              created_at: event.created_at,
+              sig: event.sig,
+            });
+          },
+          onEndOfStoredEvents: () => settle(),
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      if (!settled) {
+        timeout = setTimeout(() => settle(), 5000);
+      }
     });
+
+    // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
+    // This also ensures onEvent cannot fire while we iterate events below.
+    if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
 
     // Process collected events sequentially (dedup skips already-processed ones)
     for (const event of events) {
@@ -1661,37 +1688,63 @@ export class NostrTransportProvider implements TransportProvider {
       throw new SphereError('No connected relays', 'TRANSPORT_ERROR');
     }
 
+    // Capture client reference after the guard — same disconnect() race as fetchPendingEvents.
+    const client = this.nostrClient;
+
     const events: NostrEvent[] = [];
     const filter = new Filter(filterObj);
+    // Declared outside the Promise so unsubscription can happen after resolve(),
+    // where subId is guaranteed to be the real subscription ID (not in TDZ).
+    let subId: string | undefined;
 
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        if (subId) {
-          this.nostrClient?.unsubscribe(subId);
-        }
-        logger.warn('Nostr', `queryEvents timed out after 5s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
-        resolve(events);
-      }, 5000);
+    await new Promise<void>((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
 
-      const subId = this.nostrClient!.subscribe(filter, {
-        onEvent: (event) => {
-          events.push({
-            id: event.id,
-            kind: event.kind,
-            content: event.content,
-            tags: event.tags,
-            pubkey: event.pubkey,
-            created_at: event.created_at,
-            sig: event.sig,
-          });
-        },
-        onEndOfStoredEvents: () => {
-          clearTimeout(timeout);
-          this.nostrClient?.unsubscribe(subId);
-          resolve(events);
-        },
-      });
+      // settle() only resolves the Promise. Unsubscription happens after the
+      // Promise resolves (below), where subId is always the real value. This
+      // prevents the TDZ ReferenceError if EOSE fires synchronously inside
+      // subscribe() before the const assignment completes.
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+
+      try {
+        subId = client.subscribe(filter, {
+          onEvent: (event) => {
+            events.push({
+              id: event.id,
+              kind: event.kind,
+              content: event.content,
+              tags: event.tags,
+              pubkey: event.pubkey,
+              created_at: event.created_at,
+              sig: event.sig,
+            });
+          },
+          onEndOfStoredEvents: () => settle(),
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      if (!settled) {
+        timeout = setTimeout(() => {
+          logger.warn('Nostr', `queryEvents timed out after 5s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
+          settle();
+        }, 5000);
+      }
     });
+
+    // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
+    // This also prevents onEvent from firing while the caller iterates the events array.
+    if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
+
+    return events;
   }
 
   // ===========================================================================
@@ -1849,7 +1902,13 @@ export class NostrTransportProvider implements TransportProvider {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = [nostrPubkey];
-    chatFilter.since = dmSince;
+    // NIP-17 gift wraps use a randomized created_at (±2 days / 172800 s) for privacy.
+    // The relay filters events by created_at, so a gift wrap sent right now may have
+    // created_at up to 172800 s in the past and would be invisible to a filter with
+    // since = dmSince.  Subtract the maximum randomization window so the relay
+    // returns events whose actual send time is >= dmSince even if their created_at
+    // was shifted backwards.  processedEventIds dedup prevents re-processing old events.
+    chatFilter.since = Math.max(0, dmSince - 172800);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {

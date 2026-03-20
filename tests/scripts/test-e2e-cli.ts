@@ -406,7 +406,7 @@ function runTransferTest(config: TransferTestConfig): TestResult {
 
     // 3. Send
     const modeFlag = transferMode === 'conservative' ? '--conservative' : '--instant';
-    const sendCmd = `send @${receiverNametag} ${amount} --coin ${coinSymbol} ${modeFlag}`;
+    const sendCmd = `send @${receiverNametag} ${amount} ${coinSymbol} ${modeFlag}`;
     console.log(`[2] Sending: ${sendCmd}`);
 
     const { stdout: sendOut, durationMs: sendTime } = cli(sendCmd, senderProfile);

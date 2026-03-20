@@ -255,6 +255,28 @@ export type {
   IntentStatus,
 } from './modules/market';
 
+// Address parsing and validation
+export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
+export type { AddressType, ParsedAddress } from './core/address';
+
+// Swap module
+export { SwapModule, createSwapModule } from './modules/swap/index';
+export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity, signSwapManifest, verifySwapSignature, createNametagBinding, verifyNametagBinding } from './modules/swap/manifest';
+export type {
+  SwapDeal,
+  SwapManifest,
+  ManifestFields,
+  ManifestSignatures,
+  NametagBindingProof,
+  ManifestAuxiliary,
+  SwapProgress,
+  SwapRole,
+  SwapRef,
+  SwapProposalResult,
+  GetSwapsFilter,
+  SwapModuleConfig,
+} from './modules/swap/types';
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -414,6 +436,8 @@ export {
   isKnownToken,
   getCoinIdBySymbol,
   getCoinIdByName,
+  normalizeCoinId,
+  coinIdsMatch,
 } from './registry';
 
 export type {

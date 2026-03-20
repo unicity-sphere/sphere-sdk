@@ -67,6 +67,10 @@ import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
 import { MarketModule, createMarketModule } from '../modules/market';
 import type { MarketModuleConfig } from '../modules/market';
+import { AccountingModule, createAccountingModule } from '../modules/accounting';
+import type { AccountingModuleConfig } from '../modules/accounting';
+import { SwapModule, createSwapModule } from '../modules/swap/index.js';
+import type { SwapModuleConfig } from '../modules/swap/types.js';
 import {
   STORAGE_KEYS_GLOBAL,
   getAddressId,
@@ -190,6 +194,10 @@ export interface SphereCreateOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
+  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  swap?: SwapModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -229,6 +237,10 @@ export interface SphereLoadOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
+  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  swap?: SwapModuleConfig | boolean;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
@@ -276,6 +288,10 @@ export interface SphereImportOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
+  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  swap?: SwapModuleConfig | boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
@@ -338,6 +354,10 @@ export interface SphereInitOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Accounting module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  accounting?: AccountingModuleConfig | boolean;
+  /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
+  swap?: SwapModuleConfig | boolean;
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -437,6 +457,7 @@ export class Sphere {
 
   // State
   private _initialized = false;
+  private _trackedAddressesLoaded = false;
   private _identity: MutableFullIdentity | null = null;
   private _masterKey: MasterKey | null = null;
   private _mnemonic: string | null = null;
@@ -466,6 +487,8 @@ export class Sphere {
   private _communications: CommunicationsModule;
   private _groupChat: GroupChatModule | null = null;
   private _market: MarketModule | null = null;
+  private _accounting: AccountingModule | null = null;
+  private _swap: SwapModule | null = null;
 
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
@@ -499,6 +522,8 @@ export class Sphere {
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
+    accountingConfig?: AccountingModuleConfig,
+    swapConfig?: SwapModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -519,6 +544,8 @@ export class Sphere {
     this._communications = createCommunicationsModule();
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
+    this._accounting = accountingConfig ? createAccountingModule(accountingConfig) : null;
+    this._swap = swapConfig ? createSwapModule(swapConfig) : null;
   }
 
   // ===========================================================================
@@ -595,6 +622,8 @@ export class Sphere {
     // Resolve groupChat config: true → use network-default relays
     const groupChat = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const market = Sphere.resolveMarketConfig(options.market);
+    const accounting = Sphere.resolveAccountingConfig(options.accounting);
+    const swap = Sphere.resolveSwapConfig(options.swap);
 
     const walletExists = await Sphere.exists(options.storage);
 
@@ -609,6 +638,8 @@ export class Sphere {
         price: options.price,
         groupChat,
         market,
+        accounting,
+        swap,
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
@@ -649,6 +680,8 @@ export class Sphere {
       price: options.price,
       groupChat,
       market,
+      accounting,
+      swap,
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
@@ -703,6 +736,34 @@ export class Sphere {
   }
 
   /**
+   * Resolve accounting module config from Sphere.init() options.
+   * - `true` → enable with defaults
+   * - `AccountingModuleConfig` → pass through
+   * - `false`/`undefined` → no accounting module
+   */
+  private static resolveAccountingConfig(
+    config: AccountingModuleConfig | boolean | undefined,
+  ): AccountingModuleConfig | undefined {
+    if (config === false || config === undefined) return undefined;
+    if (config === true) return {};
+    return config;
+  }
+
+  /**
+   * Resolve swap module config from Sphere.init() options.
+   * - `true` → enable with defaults
+   * - `SwapModuleConfig` → pass through
+   * - `false`/`undefined` → no swap module
+   */
+  private static resolveSwapConfig(
+    config: SwapModuleConfig | boolean | undefined,
+  ): SwapModuleConfig | undefined {
+    if (config === false || config === undefined) return undefined;
+    if (config === true) return {};
+    return config;
+  }
+
+  /**
    * Configure TokenRegistry in the main bundle context.
    *
    * The provider factory functions (createBrowserProviders / createNodeProviders)
@@ -744,6 +805,8 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
+    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
+    const swapConfig = Sphere.resolveSwapConfig(options.swap);
 
     const sphere = new Sphere(
       options.storage,
@@ -754,6 +817,8 @@ export class Sphere {
       options.price,
       groupChatConfig,
       marketConfig,
+      accountingConfig,
+      swapConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -837,6 +902,8 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat, options.network);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
+    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
+    const swapConfig = Sphere.resolveSwapConfig(options.swap);
 
     const sphere = new Sphere(
       options.storage,
@@ -847,6 +914,8 @@ export class Sphere {
       options.price,
       groupChatConfig,
       marketConfig,
+      accountingConfig,
+      swapConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -947,6 +1016,8 @@ export class Sphere {
 
     const groupChatConfig = Sphere.resolveGroupChatConfig(options.groupChat);
     const marketConfig = Sphere.resolveMarketConfig(options.market);
+    const accountingConfig = Sphere.resolveAccountingConfig(options.accounting);
+    const swapConfig = Sphere.resolveSwapConfig(options.swap);
 
     const sphere = new Sphere(
       options.storage,
@@ -957,6 +1028,8 @@ export class Sphere {
       options.price,
       groupChatConfig,
       marketConfig,
+      accountingConfig,
+      swapConfig,
     );
     sphere._password = options.password ?? null;
 
@@ -1190,6 +1263,16 @@ export class Sphere {
     return this._market;
   }
 
+  /** Accounting module (invoicing). Null if not configured. */
+  get accounting(): AccountingModule | null {
+    return this._accounting;
+  }
+
+  /** Swap module (atomic token swaps). Null if not configured. */
+  get swap(): SwapModule | null {
+    return this._swap;
+  }
+
   // ===========================================================================
   // Public Properties - State
   // ===========================================================================
@@ -1316,6 +1399,23 @@ export class Sphere {
 
   getTransport(): TransportProvider {
     return this._transport;
+  }
+
+  /**
+   * Fetch pending events from Nostr relay and process them through the
+   * multi-address transport mux. This ensures DMs (swap proposals, invoice
+   * receipts, escrow messages, transfer notifications) are delivered to
+   * module handlers before reading in-memory state.
+   *
+   * Tolerates failures — returns silently if transport is not connected.
+   */
+  async fetchPendingEvents(): Promise<void> {
+    if (this._transportMux) {
+      await this._transportMux.fetchPendingEvents();
+    } else if (this._transport.isConnected() && this._transport.fetchPendingEvents) {
+      // Fallback to raw transport if mux not available
+      await this._transport.fetchPendingEvents();
+    }
   }
 
   getAggregator(): OracleProvider {
@@ -2326,6 +2426,17 @@ export class Sphere {
     identity: FullIdentity,
     tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>,
   ): Promise<AddressModuleSet> {
+    // Destroy swap before accounting — swap depends on accounting.
+    if (this._swap) {
+      await this._swap.destroy();
+    }
+    // W23 fix: Destroy the previous accounting module instance before re-init.
+    // This drains in-flight gated operations (auto-return, implicit close) that
+    // may hold stale ledger references from the previous address.
+    if (this._accounting) {
+      await this._accounting.destroy();
+    }
+
     const emitEvent = this.emitEvent.bind(this);
 
     // Ensure transport mux exists for non-primary addresses
@@ -2376,6 +2487,74 @@ export class Sphere {
       emitEvent,
     });
 
+    if (this._accounting) {
+      const accountingTokenStorage = tokenStorageProviders.values().next().value;
+      if (accountingTokenStorage) {
+        // Resolve trustBase from oracle for invoice proof verification
+        // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
+        // AccountingModule.deps.trustBase is typed as unknown.
+        let trustBase: unknown = null;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
+        } catch {
+          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
+        }
+        // NOTE: If trustBase is null/empty, AccountingModule.importInvoice() will reject imports
+        // that require proof verification. createInvoice() is unaffected.
+
+        this._accounting.initialize({
+          payments,
+          tokenStorage: accountingTokenStorage,
+          oracle: this._oracle,
+          trustBase,
+          identity,
+          getActiveAddresses: () => this._getActiveAddressesInternal(),
+          emitEvent,
+          on: this.on.bind(this),
+          storage: this._storage,
+          communications,
+        });
+      } else {
+        // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
+        // load() throwing NOT_INITIALIZED downstream.
+        logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
+        this._accounting = null;
+      }
+    }
+
+    if (this._swap) {
+      if (this._accounting) {
+        const acctForSwap = this._accounting;
+        const onForSwap = this.on.bind(this);
+        this._swap.initialize({
+          accounting: {
+            importInvoice: (token: unknown) => acctForSwap.importInvoice(token as Parameters<typeof acctForSwap.importInvoice>[0]),
+            getInvoice: (id: string) => acctForSwap.getInvoice(id),
+            getInvoiceStatus: (id: string) => acctForSwap.getInvoiceStatus(id),
+            payInvoice: (id: string, params: unknown) => acctForSwap.payInvoice(id, params as Parameters<typeof acctForSwap.payInvoice>[1]),
+            on: onForSwap,
+          },
+          payments: { validate: () => payments.validate() },
+          communications: {
+            sendDM: async (recipientPubkey: string, content: string) => {
+              const msg = await communications.sendDM(recipientPubkey, content);
+              return { eventId: msg.id };
+            },
+            onDirectMessage: (handler) => communications.onDirectMessage(handler),
+          },
+          storage: this._storage,
+          identity,
+          emitEvent,
+          resolve: (id) => this._transport.resolve?.(id) ?? Promise.resolve(null),
+          getActiveAddresses: () => this._getActiveAddressesInternal(),
+        });
+      } else {
+        logger.warn('Sphere', 'Swap module enabled but accounting module not available — disabling');
+        this._swap = null;
+      }
+    }
+
     // payments.load() is critical — must succeed for wallet to be usable
     await payments.load();
 
@@ -2384,6 +2563,8 @@ export class Sphere {
       communications.load(),
       groupChat?.load(),
       market?.load(),
+      this._accounting?.load(),
+      this._swap?.load(),
     ]);
     for (const r of results) {
       if (r.status === 'rejected') {
@@ -2493,6 +2674,27 @@ export class Sphere {
   deriveAddress(index: number, isChange: boolean = false): AddressInfo {
     this.ensureReady();
     return this._deriveAddressInternal(index, isChange);
+  }
+
+  /**
+   * Internal getActiveAddresses without ensureReady() check.
+   * IMPORTANT: This method skips ensureReady() because it's called during initialization
+   * before _initialized is set. It REQUIRES that loadTrackedAddresses() has already completed.
+   * If this assertion fails, the initialization order in _doLoad() has been broken.
+   */
+  private _getActiveAddressesInternal(): TrackedAddress[] {
+    if (!this._trackedAddressesLoaded) {
+      logger.warn('Sphere', '_getActiveAddressesInternal called before tracked addresses loaded');
+      return [];
+    }
+    const result: TrackedAddress[] = [];
+    for (const entry of this._trackedAddresses.values()) {
+      if (!entry.hidden) {
+        const nametag = this._addressNametags.get(entry.addressId)?.get(0);
+        result.push({ ...entry, nametag });
+      }
+    }
+    return result.sort((a, b) => a.index - b.index);
   }
 
   /**
@@ -3602,6 +3804,21 @@ export class Sphere {
   async destroy(): Promise<void> {
     this.cleanupProviderEventSubscriptions();
 
+    // Destroy swap FIRST — it depends on accounting (which depends on payments)
+    try {
+      await this._swap?.destroy();
+    } catch (err) {
+      logger.warn('Sphere', 'Swap module destroy failed:', err);
+    }
+
+    // Destroy accounting — it may have in-flight operations using payments.send()
+    // Draining accounting gates before destroying payments prevents spurious pending entries
+    try {
+      await this._accounting?.destroy();
+    } catch (err) {
+      logger.warn('Sphere', 'Accounting module destroy failed:', err);
+    }
+
     // Destroy all per-address module sets
     for (const [idx, moduleSet] of this._addressModules.entries()) {
       try {
@@ -3649,6 +3866,7 @@ export class Sphere {
     this._tokenStorageProviders.clear();
 
     this._initialized = false;
+    this._trackedAddressesLoaded = false;
     this._identity = null;
     this._trackedAddresses.clear();
     this._addressIdToIndex.clear();
@@ -3787,6 +4005,7 @@ export class Sphere {
 
     // Load tracked addresses registry (with migration from old format)
     await this.loadTrackedAddresses();
+    this._trackedAddressesLoaded = true;
     // Load nametag cache
     await this.loadAddressNametags();
 
@@ -4079,6 +4298,76 @@ export class Sphere {
       emitEvent,
     });
 
+    if (this._accounting) {
+      const accountingTokenStorage = this._tokenStorageProviders.values().next().value;
+      if (accountingTokenStorage) {
+        // Resolve trustBase from oracle for invoice proof verification
+        // W3-R17 fix: Type as unknown — actual value is RootTrustBase (not Uint8Array),
+        // AccountingModule.deps.trustBase is typed as unknown.
+        let trustBase: unknown = null;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
+        } catch {
+          logger.warn('Sphere', 'Oracle does not support getTrustBase — invoice proof verification will be unavailable');
+        }
+        // NOTE: If trustBase is null/empty, AccountingModule.importInvoice() will reject imports
+        // that require proof verification. createInvoice() is unaffected.
+
+        this._accounting.initialize({
+          payments: this._payments,
+          tokenStorage: accountingTokenStorage,
+          oracle: this._oracle,
+          trustBase,
+          identity: this._identity!,
+          getActiveAddresses: () => this._getActiveAddressesInternal(),
+          emitEvent,
+          on: this.on.bind(this),
+          storage: this._storage,
+          communications: this._communications,
+        });
+      } else {
+        // W2-R17 fix: If no tokenStorage, log and disable accounting to prevent
+        // load() throwing NOT_INITIALIZED downstream.
+        logger.warn('Sphere', 'Accounting module enabled but no token storage available — disabling');
+        this._accounting = null;
+      }
+    }
+
+    if (this._swap) {
+      if (this._accounting) {
+        const acctForSwap = this._accounting;
+        const onForSwap = this.on.bind(this);
+        const paymentsForSwap = this._payments;
+        const commsForSwap = this._communications;
+        this._swap.initialize({
+          accounting: {
+            importInvoice: (token: unknown) => acctForSwap.importInvoice(token as Parameters<typeof acctForSwap.importInvoice>[0]),
+            getInvoice: (id: string) => acctForSwap.getInvoice(id),
+            getInvoiceStatus: (id: string) => acctForSwap.getInvoiceStatus(id),
+            payInvoice: (id: string, params: unknown) => acctForSwap.payInvoice(id, params as Parameters<typeof acctForSwap.payInvoice>[1]),
+            on: onForSwap,
+          },
+          payments: { validate: () => paymentsForSwap.validate() },
+          communications: {
+            sendDM: async (recipientPubkey: string, content: string) => {
+              const msg = await commsForSwap.sendDM(recipientPubkey, content);
+              return { eventId: msg.id };
+            },
+            onDirectMessage: (handler) => commsForSwap.onDirectMessage(handler),
+          },
+          storage: this._storage,
+          identity: this._identity!,
+          emitEvent,
+          resolve: (id) => this._transport.resolve?.(id) ?? Promise.resolve(null),
+          getActiveAddresses: () => this._getActiveAddressesInternal(),
+        });
+      } else {
+        logger.warn('Sphere', 'Swap module enabled but accounting module not available — disabling');
+        this._swap = null;
+      }
+    }
+
     // Load modules in parallel — they are independent of each other.
     // allSettled so one failing module doesn't block the rest.
     const results = await Promise.allSettled([
@@ -4086,6 +4375,8 @@ export class Sphere {
       this._communications.load(),
       this._groupChat?.load(),
       this._market?.load(),
+      this._accounting?.load(),
+      this._swap?.load(),
     ]);
     for (const r of results) {
       if (r.status === 'rejected') {

@@ -606,7 +606,8 @@ describe('Last event timestamp persistence', () => {
       const [chatFilterArg] = mockSubscribe.mock.calls[1];
       const chatFilter = chatFilterArg.toJSON();
       expect(chatFilter.kinds).toContain(1059); // GIFT_WRAP
-      expect(chatFilter.since).toBe(1699999000);
+      // -172800 offset applied to account for NIP-17 gift-wrap created_at randomization (±2 days)
+      expect(chatFilter.since).toBe(1699999000 - 172800);
     });
 
     it('should read storage key based on nostr pubkey prefix', async () => {
