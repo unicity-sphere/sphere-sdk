@@ -2847,13 +2847,22 @@ export class SwapModule {
                     // Walk each intermediate state so the state machine invariants
                     // are respected — e.g. proposed→depositing requires two hops
                     // (proposed→announced→depositing), not a single direct skip.
+                    //
+                    // DEPOSIT BOUNDARY: States past 'announced' require evidence of
+                    // local deposit (localDepositTransferId). Without it, the walk
+                    // stops at 'announced'. This prevents PARTIAL_DEPOSIT (= "one
+                    // party deposited, unknown which") from advancing the non-depositing
+                    // party to 'depositing', which would block their deposit() call.
                     const progressOrder: SwapProgress[] = [
                       'proposed', 'accepted', 'announced', 'depositing', 'awaiting_counter', 'concluding',
                     ];
                     const currentIdx = progressOrder.indexOf(swap.progress);
                     const targetIdx = progressOrder.indexOf(mappedProgress);
-                    if (targetIdx > currentIdx) {
-                      for (let i = currentIdx + 1; i <= targetIdx; i++) {
+                    const announcedIdx = progressOrder.indexOf('announced');
+                    const hasLocalDeposit = !!swap.localDepositTransferId || currentIdx > announcedIdx;
+                    const maxIdx = hasLocalDeposit ? targetIdx : Math.min(targetIdx, announcedIdx);
+                    if (maxIdx > currentIdx) {
+                      for (let i = currentIdx + 1; i <= maxIdx; i++) {
                         const intermediate = progressOrder[i];
                         try {
                           await this.transitionProgress(swap, intermediate);

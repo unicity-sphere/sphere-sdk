@@ -3,7 +3,7 @@
 # swap-cli-e2e.sh — End-to-end CLI swap flow test
 #
 # Uses two fresh one-time-use wallet profiles so each run starts clean.
-# Escrow must be live at @test-escrow-swap2 on testnet.
+# Escrow must be live at @test-escrow-swap3 on testnet.
 #
 # Usage:
 #   bash tests/e2e/swap-cli-e2e.sh
@@ -15,7 +15,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-ESCROW="@test-escrow-swap2"
+ESCROW="@test-escrow-swap3"
 OFFER_COIN="BTC"
 WANT_COIN="ETH"
 OFFER_AMOUNT="1"          # Alice offers 1 BTC

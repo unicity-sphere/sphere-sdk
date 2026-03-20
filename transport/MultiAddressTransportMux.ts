@@ -554,6 +554,8 @@ export class MultiAddressTransportMux {
     walletFilter['#p'] = allPubkeys;
     walletFilter.since = globalSince;
 
+    logger.warn('Mux', `updateSubscriptions: wallet filter kinds=${walletFilter.kinds} pubkeys=[${allPubkeys.map(p => p.slice(0,16)).join(',')}] since=${globalSince}`);
+
     this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
       onEvent: (event) => {
         this.handleEvent({
@@ -610,6 +612,8 @@ export class MultiAddressTransportMux {
         this.scheduleResubscribe();
       },
     });
+
+    logger.warn('Mux', `updateSubscriptions: walletSub=${this.walletSubscriptionId} chatSub=${this.chatSubscriptionId}`);
   }
 
   /**
