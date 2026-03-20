@@ -1373,8 +1373,9 @@ export class AccountingModule {
       );
     }
 
-    // dueDate: if present, must be a positive integer (may be in the past for imports)
-    if (terms.dueDate !== undefined) {
+    // dueDate: if present (and not null), must be a positive integer (may be in the past for imports).
+    // canonicalSerialize normalizes undefined → null, so null means "no dueDate".
+    if (terms.dueDate != null) {
       if (
         typeof terms.dueDate !== 'number' ||
         !Number.isInteger(terms.dueDate) ||
