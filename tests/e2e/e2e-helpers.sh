@@ -66,6 +66,7 @@ parse_e2e_args() {
 setup_workspace() {
   RUN_ID=$(date +%s)
   WORKSPACE=$(mktemp -d /tmp/swap-e2e-XXXXXX)
+  CLI_DIR="$WORKSPACE"
   log "Workspace: ${WORKSPACE}"
 }
 
@@ -164,9 +165,10 @@ cleanup() {
     while kill -0 "$ESCROW_PID" 2>/dev/null && [[ $w -lt 5 ]]; do sleep 1; w=$((w+1)); done
     kill -9 "$ESCROW_PID" 2>/dev/null || true
   fi
-  if [[ "$KEEP_WALLETS" == "false" ]]; then
+  if [[ "$KEEP_WALLETS" == "false" ]] && [[ -n "${WORKSPACE:-}" ]]; then
+    local dir="${CLI_DIR:-$WORKSPACE}"
     for p in $WALLETS_TO_DELETE; do
-      $CLI wallet delete "$p" > /dev/null 2>&1 || true
+      (cd "$dir" && $CLI wallet delete "$p" > /dev/null 2>&1 || true)
     done
   fi
   if [[ "$KEEP_WORKSPACE" == "false" ]] && [[ -n "$WORKSPACE" ]]; then
@@ -182,24 +184,31 @@ cleanup() {
 # ---------------------------------------------------------------------------
 create_wallet() {
   local profile="$1" nametag="${2:-$1}"
-  $CLI wallet create "$profile" --network testnet > /dev/null 2>&1
-  $CLI wallet use "$profile" > /dev/null 2>&1
-  $CLI init --nametag "$nametag" > /dev/null 2>&1
+  local dir="${CLI_DIR:-$WORKSPACE}"
+  (cd "$dir" && $CLI wallet create "$profile" --network testnet > /dev/null 2>&1)
+  (cd "$dir" && $CLI wallet use "$profile" > /dev/null 2>&1)
+  (cd "$dir" && $CLI init --nametag "$nametag" > /dev/null 2>&1)
   ok "Wallet ${profile} (@${nametag})"
 }
 
 topup_wallet() {
   local profile="$1" coin="$2" amount="$3"
-  $CLI wallet use "$profile" > /dev/null 2>&1
-  $CLI topup "$amount" "$coin" 2>&1 | tail -2
-  $CLI balance --finalize > /dev/null 2>&1 || true
+  local dir="${CLI_DIR:-$WORKSPACE}"
+  (cd "$dir" && $CLI wallet use "$profile" > /dev/null 2>&1)
+  (cd "$dir" && $CLI topup "$amount" "$coin" 2>&1 | tail -2)
+  (cd "$dir" && $CLI balance --finalize > /dev/null 2>&1 || true)
   ok "Topup ${profile}: ${amount} ${coin}"
 }
 
+# Run CLI commands from the workspace so each test has its own .sphere-cli/config.json.
+# This prevents parallel tests from racing on the shared config file.
+CLI_DIR=""
+
 cli_as() {
   local profile="$1"; shift
-  $CLI wallet use "$profile" > /dev/null 2>&1 || true
-  $CLI "$@" 2>&1
+  local dir="${CLI_DIR:-$WORKSPACE}"
+  (cd "$dir" && $CLI wallet use "$profile" > /dev/null 2>&1 || true)
+  (cd "$dir" && $CLI "$@" 2>&1)
 }
 
 # ---------------------------------------------------------------------------
