@@ -1,21 +1,75 @@
 #!/usr/bin/env bash
 # =============================================================================
-# swap-cli-e2e.sh — End-to-end CLI swap flow test
+# swap-cli-e2e.sh — End-to-end CLI swap flow test (self-contained)
 #
+# Sets up, launches, and tears down the escrow service automatically.
 # Uses two fresh one-time-use wallet profiles so each run starts clean.
-# Escrow must be live at @test-escrow-e2e on testnet.
+#
+# Modes:
+#   Clone mode (default):  git clone escrow from GitHub, npm install, launch
+#   Dev mode:              --escrow-cmd "cp -r /path/to/escrow $WORKSPACE/escrow"
+#                          User provides command to populate workspace.
+#                          SDK is symlinked via file: reference in package.json.
+#   External mode:         --escrow "@nametag"
+#                          Use a pre-running escrow (no setup/teardown).
 #
 # Usage:
 #   bash tests/e2e/swap-cli-e2e.sh
-#   bash tests/e2e/swap-cli-e2e.sh --keep-wallets   # skip cleanup at end
+#   bash tests/e2e/swap-cli-e2e.sh --escrow-cmd "cp -r ../escrow-service \$WORKSPACE/escrow"
+#   bash tests/e2e/swap-cli-e2e.sh --escrow "@test-escrow-e2e"
+#   bash tests/e2e/swap-cli-e2e.sh --keep-wallets --keep-workspace
 # =============================================================================
 
 set -euo pipefail
 
+SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+ESCROW_CMD=""
+ESCROW_EXTERNAL=""
+KEEP_WALLETS=false
+KEEP_WORKSPACE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --escrow-cmd)
+      ESCROW_CMD="$2"
+      shift 2
+      ;;
+    --escrow)
+      ESCROW_EXTERNAL="$2"
+      shift 2
+      ;;
+    --keep-wallets)
+      KEEP_WALLETS=true
+      shift
+      ;;
+    --keep-workspace)
+      KEEP_WORKSPACE=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Usage: $0 [--escrow-cmd <cmd>] [--escrow <@nametag>] [--keep-wallets] [--keep-workspace]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Determine mode
+if [[ -n "$ESCROW_EXTERNAL" ]]; then
+  MODE="external"
+elif [[ -n "$ESCROW_CMD" ]]; then
+  MODE="dev"
+else
+  MODE="clone"
+fi
+
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-ESCROW="@test-escrow-e2e"
 OFFER_COIN="BTC"
 WANT_COIN="ETH"
 OFFER_AMOUNT="1"          # Alice offers 1 BTC
@@ -27,15 +81,23 @@ CLI="npm run cli --"
 DEPOSIT_WAIT=120   # seconds to wait for swap:announced after deposit
 ESCROW_WAIT=300    # seconds to wait for escrow to complete swap
 
-KEEP_WALLETS=false
-[[ "${1:-}" == "--keep-wallets" ]] && KEEP_WALLETS=true
+ESCROW_REPO="${ESCROW_REPO:-https://github.com/unicity-sphere/escrow-service.git}"
+ESCROW_STARTUP_TIMEOUT=120  # seconds to wait for escrow to start
 
 # ---------------------------------------------------------------------------
-# Unique run ID → unique profile names
+# Unique run ID
 # ---------------------------------------------------------------------------
 RUN_ID=$(date +%s)
 ALICE_PROFILE="e2e_alice_${RUN_ID}"
 BOB_PROFILE="e2e_bob_${RUN_ID}"
+ESCROW_NAMETAG="esc-${RUN_ID}"
+
+# In external mode, use the provided nametag as-is
+if [[ "$MODE" == "external" ]]; then
+  ESCROW="$ESCROW_EXTERNAL"
+else
+  ESCROW="@${ESCROW_NAMETAG}"
+fi
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,7 +129,33 @@ jq_field() {
   echo "$json" | grep -oP "\"${field}\"\s*:\s*\K[^\s,}]+" | head -1 | tr -d '"'
 }
 
+# ---------------------------------------------------------------------------
+# Workspace
+# ---------------------------------------------------------------------------
+WORKSPACE=$(mktemp -d /tmp/swap-e2e-XXXXXX)
+ESCROW_PID=""
+
 cleanup() {
+  local exit_code=$?
+
+  # Kill escrow if we started it
+  if [[ -n "$ESCROW_PID" ]]; then
+    log "Stopping escrow service (PID ${ESCROW_PID})..."
+    kill "$ESCROW_PID" 2>/dev/null || true
+    # Wait up to 5s for graceful shutdown
+    local waited=0
+    while kill -0 "$ESCROW_PID" 2>/dev/null && [[ $waited -lt 5 ]]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    # Force kill if still alive
+    if kill -0 "$ESCROW_PID" 2>/dev/null; then
+      log "Force-killing escrow (PID ${ESCROW_PID})..."
+      kill -9 "$ESCROW_PID" 2>/dev/null || true
+    fi
+  fi
+
+  # Clean up wallets
   if [[ "$KEEP_WALLETS" == "false" ]]; then
     log "Cleaning up test wallets..."
     $CLI wallet delete "$ALICE_PROFILE" > /dev/null 2>&1 || true
@@ -75,12 +163,120 @@ cleanup() {
   else
     log "Keeping wallets: ${ALICE_PROFILE}, ${BOB_PROFILE}"
   fi
+
+  # Clean up workspace
+  if [[ "$KEEP_WORKSPACE" == "false" ]]; then
+    log "Removing workspace: ${WORKSPACE}"
+    rm -rf -- "$WORKSPACE"
+  else
+    log "Keeping workspace: ${WORKSPACE}"
+  fi
+
+  exit "$exit_code"
 }
 trap cleanup EXIT
+
+log "Mode: ${MODE}"
+log "Workspace: ${WORKSPACE}"
+log "SDK root: ${SDK_ROOT}"
+
+# ---------------------------------------------------------------------------
+# Escrow setup (clone or dev mode)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" != "external" ]]; then
+  log ""
+  log "=== ESCROW SETUP ==="
+
+  ESCROW_DIR="${WORKSPACE}/escrow"
+
+  if [[ "$MODE" == "clone" ]]; then
+    log "Cloning escrow from ${ESCROW_REPO}..."
+    git clone --depth 1 "$ESCROW_REPO" "$ESCROW_DIR" 2>&1 | tail -3
+    log "Installing escrow dependencies..."
+    (cd "$ESCROW_DIR" && npm install 2>&1 | tail -5)
+  else
+    # Dev mode: run user-provided command to populate workspace
+    log "Running escrow-cmd to populate workspace..."
+    export WORKSPACE
+    eval "$ESCROW_CMD"
+
+    if [[ ! -d "$ESCROW_DIR" ]]; then
+      die "escrow-cmd did not create ${ESCROW_DIR}"
+    fi
+
+    # Patch package.json to use local SDK via file: reference
+    log "Patching escrow package.json to use local SDK (file:${SDK_ROOT})..."
+    (cd "$ESCROW_DIR" && node -e "
+      const fs = require('fs');
+      const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+      pkg.dependencies['@unicitylabs/sphere-sdk'] = 'file:${SDK_ROOT}';
+      fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+    ")
+
+    log "Installing escrow dependencies (with local SDK link)..."
+    (cd "$ESCROW_DIR" && npm install 2>&1 | tail -5)
+  fi
+
+  # Remove any pre-existing wallet/escrow data from the copied codebase.
+  # The escrow will create a fresh wallet with the one-time nametag on startup.
+  rm -rf "${ESCROW_DIR}/.sphere-escrow" "${ESCROW_DIR}/.escrow-data" 2>/dev/null || true
+
+  # Generate minimal .env
+  log "Generating escrow .env with nametag: ${ESCROW_NAMETAG}"
+  cat > "${ESCROW_DIR}/.env" <<EOF
+NODE_ENV=development
+LOG_LEVEL=info
+SPHERE_WALLET_PATH=./.sphere-escrow
+SPHERE_NETWORK=testnet
+SPHERE_NAMETAG=${ESCROW_NAMETAG}
+ESCROW_DATA_DIR=./.escrow-data
+MAX_PENDING_SWAPS=100
+EOF
+
+  # ── Escrow launch ──
+  log "Launching escrow service..."
+  (cd "$ESCROW_DIR" && npx tsx --env-file=.env src/index.ts > "${WORKSPACE}/escrow.log" 2>&1) &
+  ESCROW_PID=$!
+  log "Escrow PID: ${ESCROW_PID}"
+
+  # Poll for readiness
+  log "Waiting up to ${ESCROW_STARTUP_TIMEOUT}s for escrow to start..."
+  ELAPSED=0
+  while [[ $ELAPSED -lt $ESCROW_STARTUP_TIMEOUT ]]; do
+    # Check process is still alive
+    if ! kill -0 "$ESCROW_PID" 2>/dev/null; then
+      log "Escrow process died. Last 20 lines of log:"
+      tail -20 "${WORKSPACE}/escrow.log" 2>/dev/null || true
+      die "Escrow process exited prematurely"
+    fi
+
+    # Check for startup message
+    if grep -q "Escrow service started successfully" "${WORKSPACE}/escrow.log" 2>/dev/null; then
+      log "Escrow service is ready (took ~${ELAPSED}s)"
+      break
+    fi
+
+    sleep 2
+    ELAPSED=$((ELAPSED + 2))
+  done
+
+  if [[ $ELAPSED -ge $ESCROW_STARTUP_TIMEOUT ]]; then
+    log "Escrow startup timed out. Last 20 lines of log:"
+    tail -20 "${WORKSPACE}/escrow.log" 2>/dev/null || true
+    die "Escrow did not start within ${ESCROW_STARTUP_TIMEOUT}s"
+  fi
+
+  ok "Escrow service running as @${ESCROW_NAMETAG} (PID ${ESCROW_PID})"
+fi
+
+# ===========================================================================
+# SWAP TEST (steps 0-10) — preserved from original script
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # Step 0: Create fresh wallets
 # ---------------------------------------------------------------------------
+log ""
 log "=== STEP 0: Create fresh one-time-use wallets ==="
 
 log "Creating Alice wallet: ${ALICE_PROFILE}"
