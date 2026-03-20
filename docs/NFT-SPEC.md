@@ -144,11 +144,17 @@ basisPoints, recipient
 
 ```
 collectionId = hex(SHA-256(UTF-8(canonicalSerializeCollection(definition))))
-tokenId      = derived by state-transition-sdk from MintTransactionData
-               (includes tokenData, salt, recipient, tokenType)
+tokenId      = hex(SHA-256(tokenDataBytes + salt))
+               // TokenId is derived by the caller (NOT by state-transition-sdk internally).
+               // MintTransactionData.create() takes tokenId as its first argument.
+               // Including salt in the hash guarantees uniqueness even for identical metadata.
 ```
 
 The `collectionId` is computed client-side before any on-chain interaction. It is stable — the same `CollectionDefinition` always produces the same `collectionId`.
+
+The `tokenId` includes the salt in its derivation input. This ensures:
+- Two standalone NFTs with identical metadata but different random salts get different tokenIds.
+- Deterministic minting (same salt for same edition) produces the same tokenId for crash recovery.
 
 ### 2.4 Salt Derivation Strategy
 
@@ -343,6 +349,7 @@ When `collectionId` is omitted (standalone NFT):
       mintedAt: Date.now()
     }
  7. tokenData = canonicalSerializeNFT(nftTokenData)
+    tokenDataBytes = UTF-8 encode tokenData
  8. Generate salt:
     IF collection AND collection.deterministicMinting:
       // Strategy B: deterministic — only the emitter can compute valid tokenIds
@@ -350,36 +357,55 @@ When `collectionId` is omitted (standalone NFT):
     ELSE:
       // Strategy A: random — used for standalone NFTs and non-deterministic collections
       salt = crypto.getRandomValues(new Uint8Array(32))
+ 8a. Persist mint intent for crash recovery (write-ahead):
+    // Ensures re-mint after crash uses identical mintedAt/salt/tokenData.
+    // Without this, Date.now() on retry produces different tokenData → different tokenId.
+    await storage.set(`nft_mint_intent_${collectionId ?? 'standalone'}_${edition}`,
+      JSON.stringify({ collectionId, edition, mintedAt, salt: hex(salt), tokenData }))
  9. Import state-transition-sdk types:
-    - MintTransactionData, MintCommitment, Token, TokenType, TokenId
-10. Create MintTransactionData:
+    - MintTransactionData, MintCommitment, Token, TokenType, TokenId,
+      DataHasher, HashAlgorithm, UnmaskedPredicate, TokenState, SigningService
+10. Derive TokenId from SHA-256(tokenDataBytes + salt):
+    // Include salt in hash to guarantee uniqueness even for identical metadata
+    hash = DataHasher(SHA256).update(tokenDataBytes).update(salt).digest()
+    nftTokenId = new TokenId(hash.imprint)
+11. Create MintTransactionData (8 arguments — matches actual SDK signature):
     tokenType = new TokenType(Buffer.from(NFT_TOKEN_TYPE_HEX, 'hex'))
     mintData = await MintTransactionData.create(
-      tokenId, tokenType, tokenData, [], salt, recipientAddress, recipientAddress
+      nftTokenId,         // tokenId: TokenId
+      tokenType,          // tokenType: TokenType
+      tokenDataBytes,     // tokenData: Uint8Array (NOT string)
+      null,               // coinData: null (NOT [] — SDK expects TokenCoinData | null)
+      recipientAddress,   // recipient: IAddress (DirectAddress)
+      salt,               // salt: Uint8Array
+      null,               // recipientDataHash: null
+      null,               // reason: null
     )
-11. commitment = await MintCommitment.create(mintData)
-12. Submit to oracle:
+12. commitment = await MintCommitment.create(mintData)
+13. Submit to oracle:
     response = await oracleProvider.submitMintCommitment(commitment)
     - Handle SUCCESS → continue
     - Handle REQUEST_ID_EXISTS → idempotent, continue
     - Handle failure → error NFT_MINT_FAILED
-13. Wait for inclusion proof:
+14. Wait for inclusion proof:
     inclusionProof = await waitInclusionProof(trustBase, client, commitment)
-14. Create predicate:
+15. Create predicate:
     predicate = await UnmaskedPredicate.create(
-      tokenId, tokenType, signingService, HashAlgorithm.SHA256, salt
+      nftTokenId, tokenType, signingService, HashAlgorithm.SHA256, salt
     )
-15. Construct token:
+16. Construct token:
     tokenState = new TokenState(predicate, null)
     genesisTransaction = commitment.toTransaction(inclusionProof)
     token = await Token.mint(trustBase, tokenState, genesisTransaction)
-16. Store token:
+17. Store token:
     txfToken = normalizeSdkTokenToStorage(token.toJSON())
-    await tokenStorage.put(addressId, `_${tokenId}`, txfToken)
-17. Update mint counter (collection-only): IF collection → counter + 1
-18. Update in-memory index: add NFTRef
-19. Emit nft:minted { tokenId, collectionId: collectionId ?? null, name: metadata.name, confirmed: true }
-20. Return MintNFTResult { tokenId, collectionId: collectionId ?? null, confirmed: true, nft: nftRef }
+    await tokenStorage.put(addressId, `_${nftTokenId.toJSON()}`, txfToken)
+18. Delete mint intent (crash recovery cleanup):
+    await storage.delete(`nft_mint_intent_${collectionId ?? 'standalone'}_${edition}`)
+19. Update mint counter (collection-only): IF collection → counter + 1
+20. Update in-memory index: add NFTRef
+21. Emit nft:minted { tokenId, collectionId: collectionId ?? null, name: metadata.name, confirmed: true }
+22. Return MintNFTResult { tokenId, collectionId: collectionId ?? null, confirmed: true, nft: nftRef }
 ```
 
 **Errors:**
