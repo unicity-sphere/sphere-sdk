@@ -208,6 +208,20 @@ export class GroupChatModule {
 
   destroy(): void {
     this.destroyConnection();
+
+    // Flush any pending debounced persist before clearing state.
+    // Persist methods capture map data synchronously before their first await,
+    // so fire-and-forget is safe even though maps are cleared below.
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+      if (this.deps) {
+        this.doPersistAll().catch((err) =>
+          logger.debug('GroupChat', 'Persist on destroy failed', err),
+        );
+      }
+    }
+
     this.groups.clear();
     this.messages.clear();
     this.members.clear();
@@ -216,10 +230,7 @@ export class GroupChatModule {
     this.messageHandlers.clear();
     this.relayAdminPubkeys = null;
     this.relayAdminFetchPromise = null;
-    if (this.persistTimer) {
-      clearTimeout(this.persistTimer);
-      this.persistTimer = null;
-    }
+    this.persistPromise = null;
     this.deps = null;
   }
 
@@ -377,30 +388,33 @@ export class GroupChatModule {
     const groupIds = Array.from(this.groups.keys());
     if (groupIds.length === 0) return;
 
-    // Use the latest message timestamp across all groups as the `since` floor
+    // Use the latest known event timestamp as the `since` floor for messages
     // so the relay only sends events newer than what we already have.
-    const latestTimestamp = this.getLatestMessageTimestamp(groupIds);
+    // Metadata/moderation subscriptions intentionally omit `since`:
+    //  - Metadata kinds (39xxx) are replaceable — at most one event per group per kind
+    //  - Moderation events must not be missed (e.g., kicks that occurred while offline)
+    const sinceTimestamp = this.getLatestKnownTimestamp(groupIds);
 
     // Subscribe to group messages
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': groupIds,
-        ...(latestTimestamp ? { since: latestTimestamp } : {}),
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
 
-    // Subscribe to group metadata changes
+    // Subscribe to group metadata changes (replaceable events — small volume, no since)
     this.trackSubscription(
       createNip29Filter({
-        kinds: [NIP29_KINDS.GROUP_METADATA, NIP29_KINDS.GROUP_MEMBERS, NIP29_KINDS.GROUP_ADMINS],
+        kinds: [NIP29_KINDS.GROUP_METADATA, NIP29_KINDS.GROUP_ADMINS],
         '#d': groupIds,
       }),
       { onEvent: (event: Event) => this.handleMetadataEvent(event) },
     );
 
-    // Subscribe to moderation events
+    // Subscribe to moderation events (no since — must not miss offline kicks/deletes)
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.DELETE_EVENT, NIP29_KINDS.REMOVE_USER, NIP29_KINDS.DELETE_GROUP],
@@ -413,13 +427,13 @@ export class GroupChatModule {
   private subscribeToGroup(groupId: string): void {
     if (!this.client) return;
 
-    const latestTimestamp = this.getLatestMessageTimestamp([groupId]);
+    const sinceTimestamp = this.getLatestKnownTimestamp([groupId]);
 
     this.trackSubscription(
       createNip29Filter({
         kinds: [NIP29_KINDS.CHAT_MESSAGE, NIP29_KINDS.THREAD_ROOT, NIP29_KINDS.THREAD_REPLY],
         '#h': [groupId],
-        ...(latestTimestamp ? { since: latestTimestamp } : {}),
+        ...(sinceTimestamp ? { since: sinceTimestamp } : {}),
       }),
       { onEvent: (event: Event) => this.handleGroupEvent(event) },
     );
@@ -510,9 +524,7 @@ export class GroupChatModule {
       }
       group.updatedAt = event.created_at * 1000;
       this.groups.set(groupId, group);
-      this.persistGroups();
-    } else if (event.kind === NIP29_KINDS.GROUP_MEMBERS) {
-      this.updateMembersFromEvent(groupId, event);
+      this.schedulePersist();
     } else if (event.kind === NIP29_KINDS.GROUP_ADMINS) {
       this.updateAdminsFromEvent(groupId, event);
     }
@@ -534,7 +546,7 @@ export class GroupChatModule {
         }
       }
       this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-      this.persistMessages();
+      this.schedulePersist();
     } else if (event.kind === NIP29_KINDS.REMOVE_USER) {
       if (this.processedEventIds.has(event.id)) return;
 
@@ -591,29 +603,6 @@ export class GroupChatModule {
     }
   }
 
-  private updateMembersFromEvent(groupId: string, event: Event): void {
-    const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-    const existingMembers = this.members.get(groupId) || [];
-
-    for (const tag of pTags) {
-      const pubkey = tag[1];
-      const roleFromTag = tag[3] as GroupRole | undefined;
-      const existing = existingMembers.find((m) => m.pubkey === pubkey);
-      const role = roleFromTag || existing?.role || GroupRoleEnum.MEMBER;
-
-      const member: GroupMemberData = {
-        pubkey,
-        groupId,
-        role,
-        nametag: existing?.nametag,
-        joinedAt: existing?.joinedAt || event.created_at * 1000,
-      };
-
-      this.saveMemberToMemory(member);
-    }
-    this.persistMembers();
-  }
-
   private updateAdminsFromEvent(groupId: string, event: Event): void {
     const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
     const existingMembers = this.members.get(groupId) || [];
@@ -634,7 +623,7 @@ export class GroupChatModule {
         });
       }
     }
-    this.persistMembers();
+    this.schedulePersist();
   }
 
   // ===========================================================================
@@ -650,13 +639,11 @@ export class GroupChatModule {
     const groupIdsWithMembership = new Set<string>();
 
     await this.oneshotSubscription(
-      new Filter({ kinds: [NIP29_KINDS.GROUP_MEMBERS] }),
+      createNip29Filter({ kinds: [NIP29_KINDS.GROUP_MEMBERS], '#p': [myPubkey] }),
       {
         onEvent: (event: Event) => {
           const groupId = this.getGroupIdFromMetadataEvent(event);
-          if (!groupId) return;
-          const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-          if (pTags.some((tag: string[]) => tag[1] === myPubkey)) {
+          if (groupId) {
             groupIdsWithMembership.add(groupId);
           }
         },
@@ -670,24 +657,26 @@ export class GroupChatModule {
 
     const restoredGroups: GroupData[] = [];
 
-    for (const groupId of groupIdsWithMembership) {
-      if (this.groups.has(groupId)) continue;
+    await Promise.all(
+      Array.from(groupIdsWithMembership).map(async (groupId) => {
+        if (this.groups.has(groupId)) return;
 
-      try {
-        const group = await this.fetchGroupMetadataInternal(groupId);
-        if (group) {
-          this.groups.set(groupId, group);
-          restoredGroups.push(group);
+        try {
+          const group = await this.fetchGroupMetadataInternal(groupId);
+          if (group) {
+            this.groups.set(groupId, group);
+            restoredGroups.push(group);
 
-          await Promise.all([
-            this.fetchAndSaveMembers(groupId),
-            this.fetchMessages(groupId),
-          ]);
+            await Promise.all([
+              this.fetchAndSaveMembers(groupId),
+              this.fetchMessages(groupId),
+            ]);
+          }
+        } catch (error) {
+          logger.warn('GroupChat', 'Failed to restore group', groupId, error);
         }
-      } catch (error) {
-        logger.warn('GroupChat', 'Failed to restore group', groupId, error);
-      }
-    }
+      }),
+    );
 
     if (restoredGroups.length > 0) {
       await this.subscribeToJoinedGroups();
@@ -707,47 +696,24 @@ export class GroupChatModule {
     if (!this.client) return [];
 
     const groupsMap = new Map<string, GroupData>();
-    const memberCountsMap = new Map<string, number>();
 
-    await Promise.all([
-      this.oneshotSubscription(
-        new Filter({ kinds: [NIP29_KINDS.GROUP_METADATA] }),
-        {
-          onEvent: (event: Event) => {
-            const group = this.parseGroupMetadata(event);
-            if (group && group.visibility === GroupVisibilityEnum.PUBLIC) {
-              const existing = groupsMap.get(group.id);
-              if (!existing || group.createdAt > existing.createdAt) {
-                groupsMap.set(group.id, group);
-              }
+    await this.oneshotSubscription(
+      new Filter({ kinds: [NIP29_KINDS.GROUP_METADATA] }),
+      {
+        onEvent: (event: Event) => {
+          const group = this.parseGroupMetadata(event);
+          if (group && group.visibility === GroupVisibilityEnum.PUBLIC) {
+            const existing = groupsMap.get(group.id);
+            if (!existing || group.createdAt > existing.createdAt) {
+              groupsMap.set(group.id, group);
             }
-          },
-          onComplete: () => {},
-          timeoutMs: 10000,
-          timeoutLabel: 'fetchAvailableGroups(metadata)',
+          }
         },
-      ),
-      this.oneshotSubscription(
-        new Filter({ kinds: [NIP29_KINDS.GROUP_MEMBERS] }),
-        {
-          onEvent: (event: Event) => {
-            const groupId = this.getGroupIdFromMetadataEvent(event);
-            if (groupId) {
-              const pTags = event.tags.filter((t: string[]) => t[0] === 'p');
-              memberCountsMap.set(groupId, pTags.length);
-            }
-          },
-          onComplete: () => {},
-          timeoutMs: 10000,
-          timeoutLabel: 'fetchAvailableGroups(members)',
-        },
-      ),
-    ]);
-
-    for (const [groupId, count] of memberCountsMap) {
-      const group = groupsMap.get(groupId);
-      if (group) group.memberCount = count;
-    }
+        onComplete: () => {},
+        timeoutMs: 10000,
+        timeoutLabel: 'fetchAvailableGroups(metadata)',
+      },
+    );
 
     return Array.from(groupsMap.values());
   }
@@ -1178,7 +1144,7 @@ export class GroupChatModule {
     if (group && (group.unreadCount || 0) > 0) {
       group.unreadCount = 0;
       this.groups.set(groupId, group);
-      this.persistGroups();
+      this.schedulePersist();
     }
   }
 
@@ -1206,7 +1172,7 @@ export class GroupChatModule {
       if (eventId) {
         this.removeMemberFromMemory(groupId, userPubkey);
         this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-        this.persistMembers();
+        this.schedulePersist();
         return true;
       }
       return false;
@@ -1233,7 +1199,7 @@ export class GroupChatModule {
       if (eventId) {
         this.deleteMessageFromMemory(groupId, messageId);
         this.deps!.emitEvent('groupchat:updated', {} as Record<string, never>);
-        this.persistMessages();
+        this.schedulePersist();
         return true;
       }
       return false;
@@ -1329,7 +1295,7 @@ export class GroupChatModule {
    * or 0 if no messages exist.  Used to set `since` on subscriptions so the relay
    * only sends events we don't already have.
    */
-  private getLatestMessageTimestamp(groupIds: string[]): number {
+  private getLatestKnownTimestamp(groupIds: string[]): number {
     let latest = 0;
     for (const gid of groupIds) {
       const msgs = this.messages.get(gid);
@@ -1423,7 +1389,7 @@ export class GroupChatModule {
       }
     }
 
-    this.persistMembers();
+    this.schedulePersist();
   }
 
   private async fetchGroupMembersInternal(groupId: string): Promise<GroupMemberData[]> {
@@ -1570,10 +1536,13 @@ export class GroupChatModule {
 
   private addProcessedEventId(eventId: string): void {
     this.processedEventIds.add(eventId);
-    // Keep max 10,000
+    // Prune oldest half when limit exceeded — avoids rebuilding on every insert
     if (this.processedEventIds.size > 10000) {
-      const arr = Array.from(this.processedEventIds);
-      this.processedEventIds = new Set(arr.slice(arr.length - 10000));
+      let toDelete = 5000;
+      for (const id of this.processedEventIds) {
+        if (toDelete-- <= 0) break;
+        this.processedEventIds.delete(id);
+      }
     }
   }
 
@@ -1738,6 +1707,7 @@ export class GroupChatModule {
       let name = 'Unnamed Group';
       let description: string | undefined;
       let picture: string | undefined;
+      let memberCount: number | undefined;
       let isPrivate = false;
       let writeRestricted = false;
 
@@ -1761,6 +1731,7 @@ export class GroupChatModule {
         if (tag[0] === 'private') isPrivate = true;
         if (tag[0] === 'public' && tag[1] === 'false') isPrivate = true;
         if (tag[0] === 'write-restricted') writeRestricted = true;
+        if (tag[0] === 'member_count' && tag[1]) memberCount = parseInt(tag[1], 10) || undefined;
       }
 
       return {
@@ -1769,6 +1740,7 @@ export class GroupChatModule {
         name,
         description,
         picture,
+        memberCount,
         visibility: isPrivate ? GroupVisibilityEnum.PRIVATE : GroupVisibilityEnum.PUBLIC,
         writeRestricted: writeRestricted || undefined,
         createdAt: event.created_at * 1000,

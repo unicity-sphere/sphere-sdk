@@ -1,6 +1,6 @@
 {
   "name": "@unicitylabs/sphere-sdk",
-  "version": "0.6.10-dev.4",
+  "version": "0.6.10-dev.7",
   "description": "Modular TypeScript SDK for Unicity wallet operations",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -121,7 +121,7 @@
   "dependencies": {
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
-    "@unicitylabs/nostr-js-sdk": "^0.4.0",
+    "@unicitylabs/nostr-js-sdk": "^0.4.1",
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
