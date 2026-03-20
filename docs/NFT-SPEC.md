@@ -85,7 +85,7 @@ The `NFTTokenData` object is serialized to a deterministic JSON string for use a
 **Serialization Rules:**
 
 1. **Key ordering:** Strict alphabetical at every nesting level.
-2. **Null normalization:** Optional fields absent from the input are serialized as `null`.
+2. **Null normalization:** Optional fields absent from the input are serialized as `null`. `collectionId` is `null` for standalone NFTs. `edition` and `totalEditions` are `0` for standalone NFTs (not `null`).
 3. **Attribute sorting:** `metadata.attributes` sorted by `trait_type` (ascending, lexicographic).
 4. **Compact JSON:** No whitespace, no pretty-printing.
 5. **String encoding:** UTF-8.
@@ -110,9 +110,14 @@ display_type, max_value, trait_type, value
 full, original, preview, thumbnail
 ```
 
-**Example:**
+**Example (collection NFT):**
 ```json
-{"collectionId":"a1b2...","edition":1,"metadata":{"animationUrl":null,"attributes":[{"display_type":null,"max_value":null,"trait_type":"Color","value":"Blue"}],"backgroundColor":null,"content":null,"description":"A blue sphere","externalUrl":null,"image":"ipfs://QmHash","name":"Blue Sphere #1","properties":null},"mintedAt":1700000000000,"minter":null,"totalEditions":null}
+{"collectionId":"a1b2...","edition":1,"metadata":{"animationUrl":null,"attributes":[{"display_type":null,"max_value":null,"trait_type":"Color","value":"Blue"}],"backgroundColor":null,"content":null,"description":"A blue sphere","externalUrl":null,"image":"ipfs://QmHash","name":"Blue Sphere #1","properties":null},"mintedAt":1700000000000,"minter":null,"totalEditions":100}
+```
+
+**Example (standalone NFT):**
+```json
+{"collectionId":null,"edition":0,"metadata":{"animationUrl":null,"attributes":null,"backgroundColor":null,"content":null,"description":"One-of-a-kind artwork","externalUrl":null,"image":"ipfs://QmUniqueHash","name":"My Art","properties":null},"mintedAt":1700000000000,"minter":null,"totalEditions":0}
 ```
 
 ### 2.2 CollectionDefinition Serialization
@@ -273,17 +278,23 @@ This produces a deterministic `tokenId` that is:
 
 ## 4. Minting
 
-### 4.1 mintNFT(collectionId, metadata, edition?, totalEditions?, recipient?)
+### 4.1 mintNFT(metadata, collectionId?, edition?, totalEditions?, recipient?)
 
-**Signature:** `mintNFT(collectionId: string, metadata: NFTMetadata, edition?: number, totalEditions?: number, recipient?: string): Promise<MintNFTResult>`
+**Signature:** `mintNFT(metadata: NFTMetadata, collectionId?: string, edition?: number, totalEditions?: number, recipient?: string): Promise<MintNFTResult>`
 
-| Parameter | Type | Required | Validation |
-|-----------|------|----------|------------|
-| `collectionId` | string | Yes | 64-char hex, collection must exist locally |
-| `metadata` | NFTMetadata | Yes | See §4.1.1 |
-| `edition` | number | No | Integer ≥ 1, ≤ maxSupply if set |
-| `totalEditions` | number | No | Integer ≥ 1 |
-| `recipient` | string | No | Valid recipient identifier (default: self) |
+| Parameter | Type | Required | Default | Validation |
+|-----------|------|----------|---------|------------|
+| `metadata` | NFTMetadata | Yes | — | See §4.1.1 |
+| `collectionId` | string | No | null | If set: 64-char hex, collection must exist locally |
+| `edition` | number | No | 0 | If collectionId set: auto-increment or explicit. If no collection: 0 |
+| `totalEditions` | number | No | 0 | Integer ≥ 0 |
+| `recipient` | string | No | self | Valid recipient identifier |
+
+When `collectionId` is omitted (standalone NFT):
+- The NFT is not linked to any collection
+- `edition` and `totalEditions` default to 0
+- Salt is always random (Strategy A) — no deterministic minting without a collection
+- No maxSupply check, no edition auto-increment, no collection-level transferability check
 
 **4.1.1 NFTMetadata Validation:**
 
@@ -302,35 +313,42 @@ This produces a deterministic `tokenId` that is:
 **Algorithm:**
 
 ```
- 1. Validate request fields
- 2. Resolve collection: collectionId → CollectionDefinition
-    - Error NFT_COLLECTION_NOT_FOUND if not registered locally
- 3. Check maxSupply:
-    - If collection.maxSupply is set:
+ 1. Validate metadata fields (see §4.1.1)
+ 2. Resolve collection (if collectionId provided):
+    IF collectionId is set:
+      collection = lookup collectionId → CollectionDefinition
+      - Error NFT_COLLECTION_NOT_FOUND if not registered locally
+    ELSE:
+      collection = null  // standalone NFT
+ 3. Check maxSupply (collection-only):
+    IF collection AND collection.maxSupply is set:
       - Read mint counter for this collection
       - If counter >= maxSupply → error NFT_MAX_SUPPLY_EXCEEDED
  4. Determine edition number:
-    - If request.edition is set → use it
-    - Else → auto-increment from mint counter
+    IF collection:
+      - If edition param is set → use it
+      - Else → auto-increment from mint counter
+    ELSE:
+      - edition = 0  // standalone NFTs have no edition
  5. Resolve recipient:
-    - If request.recipient → transport.resolve(recipient) → DirectAddress
+    - If recipient param → transport.resolve(recipient) → DirectAddress
     - Else → self (identity.directAddress)
  6. Construct NFTTokenData:
     {
-      collectionId: request.collectionId,
-      metadata: request.metadata,
-      edition: resolvedEdition,
-      totalEditions: request.totalEditions ?? null,
+      collectionId: collectionId ?? null,   // null for standalone NFTs
+      metadata: metadata,
+      edition: resolvedEdition,             // 0 for standalone
+      totalEditions: totalEditions ?? 0,    // 0 for standalone
       minter: identity.chainPubkey,
       mintedAt: Date.now()
     }
  7. tokenData = canonicalSerializeNFT(nftTokenData)
- 8. Generate salt (strategy depends on collection definition):
-    IF collection.deterministicMinting:
+ 8. Generate salt:
+    IF collection AND collection.deterministicMinting:
       // Strategy B: deterministic — only the emitter can compute valid tokenIds
       salt = HMAC-SHA256(identity.privateKey, collectionId || uint64BE(edition))
     ELSE:
-      // Strategy A: random — unpredictable tokenId
+      // Strategy A: random — used for standalone NFTs and non-deterministic collections
       salt = crypto.getRandomValues(new Uint8Array(32))
  9. Import state-transition-sdk types:
     - MintTransactionData, MintCommitment, Token, TokenType, TokenId
@@ -358,10 +376,10 @@ This produces a deterministic `tokenId` that is:
 16. Store token:
     txfToken = normalizeSdkTokenToStorage(token.toJSON())
     await tokenStorage.put(addressId, `_${tokenId}`, txfToken)
-17. Update mint counter: counter + 1
+17. Update mint counter (collection-only): IF collection → counter + 1
 18. Update in-memory index: add NFTRef
-19. Emit nft:minted { tokenId, collectionId, name: metadata.name, confirmed: true }
-20. Return MintNFTResult { tokenId, collectionId, confirmed: true, nft: nftRef }
+19. Emit nft:minted { tokenId, collectionId: collectionId ?? null, name: metadata.name, confirmed: true }
+20. Return MintNFTResult { tokenId, collectionId: collectionId ?? null, confirmed: true, nft: nftRef }
 ```
 
 **Errors:**
@@ -374,26 +392,29 @@ This produces a deterministic `tokenId` that is:
 | Oracle rejection | `NFT_MINT_FAILED` |
 | Recipient not found | Standard transport resolution error |
 
-### 4.2 batchMintNFT(collectionId, items)
+### 4.2 batchMintNFT(items, collectionId?)
 
-**Signature:** `batchMintNFT(collectionId: string, items: Array<{ metadata: NFTMetadata; edition?: number; recipient?: string }>): Promise<BatchMintNFTResult>`
+**Signature:** `batchMintNFT(items: Array<{ metadata: NFTMetadata; edition?: number; recipient?: string }>, collectionId?: string): Promise<BatchMintNFTResult>`
 
-| Parameter | Type | Validation |
-|-----------|------|------------|
-| `collectionId` | string | 64-char hex, collection must exist |
-| `items` | Array<{metadata, edition?, recipient?}> | 1-50 items |
+| Parameter | Type | Required | Validation |
+|-----------|------|----------|------------|
+| `items` | Array<{metadata, edition?, recipient?}> | Yes | 1-50 items |
+| `collectionId` | string | No | If set: 64-char hex, collection must exist. If omitted: standalone NFTs. |
 
 **Algorithm:**
 
 ```
-1. Validate collectionId exists
+1. IF collectionId → validate collection exists
 2. Validate items.length ≤ NFT_MAX_BATCH_SIZE
-3. Pre-check maxSupply: if set, ensure currentCount + items.length ≤ maxSupply
-4. Reserve edition range atomically inside the collection gate:
-   - editions = [nextEdition, nextEdition+1, ..., nextEdition+items.length-1]
-   - Update mint counter to nextEdition + items.length
+3. IF collection AND collection.maxSupply → pre-check: currentCount + items.length ≤ maxSupply
+4. IF collection:
+     Reserve edition range atomically inside the collection gate:
+     - editions = [nextEdition, nextEdition+1, ..., nextEdition+items.length-1]
+     - Update mint counter to nextEdition + items.length
+   ELSE:
+     All editions default to 0 (standalone NFTs)
 5. For each item in items (oracle submissions parallelized):
-   a. Call internal _mintSingleNFT() with pre-assigned edition
+   a. Call internal _mintSingleNFT() with pre-assigned edition (or 0 for standalone)
    b. Collect result or error
 6. Aggregate results:
    - results: MintNFTResult[] (successful mints)

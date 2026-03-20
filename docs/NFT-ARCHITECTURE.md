@@ -166,14 +166,14 @@ interface RoyaltyConfig {
  * This is immutable once the token is minted.
  */
 interface NFTTokenData {
-  /** Collection ID (64-char hex) — links this NFT to its collection */
-  readonly collectionId: string;
+  /** Collection ID (64-char hex) — links this NFT to its collection. Null for standalone NFTs. */
+  readonly collectionId: string | null;
   /** NFT metadata (ERC-721-compatible JSON schema) */
   readonly metadata: NFTMetadata;
-  /** Edition number within the collection (1-based, optional) */
-  readonly edition?: number;
-  /** Total editions planned (optional, informational) */
-  readonly totalEditions?: number;
+  /** Edition number (1-based for collection NFTs, 0 for standalone) */
+  readonly edition: number;
+  /** Total editions planned (0 for standalone, informational for collections) */
+  readonly totalEditions: number;
   /** Minter's chain pubkey (may differ from collection creator for delegated minting) */
   readonly minter?: string;
   /** Mint timestamp (ms) */
@@ -243,14 +243,14 @@ interface NFTContent {
 interface NFTRef {
   /** Token ID (= NFT ID, 64-char hex) */
   readonly tokenId: string;
-  /** Collection ID (64-char hex) */
-  readonly collectionId: string;
+  /** Collection ID (64-char hex), or null for standalone NFTs */
+  readonly collectionId: string | null;
   /** NFT name (from metadata) */
   readonly name: string;
   /** Primary image URI */
   readonly image: string;
-  /** Edition number (if applicable) */
-  readonly edition?: number;
+  /** Edition number (0 for standalone NFTs) */
+  readonly edition: number;
   /** Whether this NFT is confirmed (has inclusion proof) */
   readonly confirmed: boolean;
   /** Token status */
@@ -316,18 +316,18 @@ interface CreateCollectionResult {
 }
 
 /**
- * Mint a single NFT in a collection.
+ * Mint a single NFT. Can be standalone or part of a collection.
  * Mints on-chain: creates commitment, waits for inclusion proof, stores token.
  *
- * @param collectionId  - 64-char hex collection ID (must exist locally)
  * @param metadata      - NFT metadata (name, image, attributes, etc.)
- * @param edition       - Optional edition number (auto-incremented if omitted)
- * @param totalEditions - Optional total editions (informational)
+ * @param collectionId  - Optional 64-char hex collection ID. If omitted, mints a standalone NFT.
+ * @param edition       - Optional edition number (auto-incremented if in collection, 0 if standalone)
+ * @param totalEditions - Optional total editions (0 if standalone)
  * @param recipient     - Optional recipient (default: self). @nametag, DIRECT://, chain pubkey
  */
 mintNFT(
-  collectionId: string,
   metadata: NFTMetadata,
+  collectionId?: string,
   edition?: number,
   totalEditions?: number,
   recipient?: string,
@@ -342,16 +342,16 @@ interface MintNFTResult {
 }
 
 /**
- * Mint multiple NFTs in a collection (batch).
+ * Mint multiple NFTs (batch). Can be standalone or part of a collection.
  * Each NFT gets its own token ID and inclusion proof.
  * Minting is parallelized where possible.
  *
- * @param collectionId - 64-char hex collection ID (must exist locally)
  * @param items        - Array of { metadata, edition?, recipient? } (1-50 items)
+ * @param collectionId - Optional 64-char hex collection ID. If omitted, mints standalone NFTs.
  */
 batchMintNFT(
-  collectionId: string,
   items: Array<{ metadata: NFTMetadata; edition?: number; recipient?: string }>,
+  collectionId?: string,
 ): Promise<BatchMintNFTResult>
 
 interface BatchMintNFTResult {
