@@ -178,9 +178,11 @@ Add payloads to `SphereEventMap` — all `collectionId` fields typed `string | n
 
 ## Wave 2: Core Module + Accounting (depends on Wave 1)
 
-> **IMPORTANT:** Tasks T2c → T2d → T2e → T2f all modify `AccountingModule.ts` (4000+ lines).
-> They MUST execute sequentially to avoid merge conflicts. They form a serial chain
-> within Wave 2. The NFT module tasks (T2a-mint, T2a-query) run in parallel alongside.
+> **IMPORTANT:** Tasks T2c, T2d, T2f all modify `AccountingModule.ts` (4000+ lines).
+> T2e modifies `balance-computer.ts` but is logically dependent on T2d's NFT classification.
+> The chain T2c → T2d → T2e → T2f MUST execute sequentially to avoid merge conflicts
+> and maintain logical dependency. The NFT module tasks (T2a-mint, T2a-query) run
+> in parallel alongside on different files.
 
 ### T2a-mint: NFTModule — minting + collections — L
 

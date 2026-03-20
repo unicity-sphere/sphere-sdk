@@ -407,7 +407,7 @@ function autoReturnNFTs(invoiceId, terms, nftAssetStatuses, deps):
       }
       await persistLedger()
 
-      // Send the NFT back
+      // Send the NFT back (same field pattern as coin auto-return)
       try:
         result = await deps.payments.send({
           recipient: recipient,
@@ -416,9 +416,6 @@ function autoReturnNFTs(invoiceId, terms, nftAssetStatuses, deps):
           memo: buildInvoiceMemo(invoiceId, 'RX'),
           _nftTransfer: true,
           _tokenIds: [tokenId],
-          _message: {
-            inv: { id: invoiceId, dir: 'RX' },
-          },
         })
         ledger.entries[dedupKey].status = 'completed'
         ledger.entries[dedupKey].returnTransferId = result.id
