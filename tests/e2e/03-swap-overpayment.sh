@@ -40,11 +40,14 @@ accept_swap "$BOB" "${SWAP_ID:0:8}"
 # --- Wait for announced ---
 wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "announced|depositing|awaiting_counter" 120 > /dev/null || true
 
-# --- Get deposit invoice ---
-DEPOSIT_INV=$(get_deposit_invoice_id "$ALICE" "${SWAP_ID:0:8}")
-[[ -z "$DEPOSIT_INV" ]] && die "No deposit invoice ID"
+# --- Get deposit invoice from Bob's side ---
+# Wait for Bob to reach announced (invoice imported via escrow DMs)
+wait_swap_progress "$BOB" "${SWAP_ID:0:8}" "announced|depositing|awaiting_counter" 120 > /dev/null || true
+DEPOSIT_INV=$(get_deposit_invoice_id "$BOB" "${SWAP_ID:0:8}")
+[[ -z "$DEPOSIT_INV" ]] && die "No deposit invoice ID from Bob"
+log "Deposit invoice: ${DEPOSIT_INV:0:16}..."
 
-# --- Bob OVERPAYS: sends 15 ETH instead of 10 ---
+# --- Bob OVERPAYS: sends 15 ETH instead of required 10 ---
 log ""; log "=== Bob overpays: 15 ETH (required: 10) ==="
 cli_as "$BOB" invoice-pay "${DEPOSIT_INV:0:8}" --amount 15 2>&1 | tail -3
 ok "Bob deposited 15 ETH (overpayment of 5)"

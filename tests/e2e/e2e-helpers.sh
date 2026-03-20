@@ -66,7 +66,8 @@ parse_e2e_args() {
 # setup_workspace — create temp directory
 # ---------------------------------------------------------------------------
 setup_workspace() {
-  RUN_ID=$(date +%s)
+  # Include nanoseconds + random suffix to avoid collisions when tests start in the same second
+  RUN_ID="$(date +%s)$(shuf -i 100-999 -n1)"
   WORKSPACE=$(mktemp -d /tmp/swap-e2e-XXXXXX)
   CLI_DIR="$WORKSPACE"
   log "Workspace: ${WORKSPACE}"

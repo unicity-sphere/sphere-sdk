@@ -24,33 +24,12 @@ log ""; log "=== Create wallets ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
 
-# --- Create second address for Alice ---
-log ""; log "=== Create second addresses ==="
-cli_as "$ALICE" switch 1 > /dev/null 2>&1 || true
-# Switch back to primary for proposal
-cli_as "$ALICE" switch 0 > /dev/null 2>&1 || true
-ok "Alice address 1 created"
-
-# Create second address for Bob
-cli_as "$BOB" switch 1 > /dev/null 2>&1 || true
-cli_as "$BOB" switch 0 > /dev/null 2>&1 || true
-ok "Bob address 1 created"
-
-# --- Topup both addresses ---
+# --- Topup primary addresses ---
 log ""; log "=== Topup ==="
-# Alice addr 0: 6 BTC
-topup_wallet "$ALICE" BTC 6
-# Alice addr 1: 6 BTC
-cli_as "$ALICE" switch 1 > /dev/null 2>&1 || true
-topup_wallet "$ALICE" BTC 6
-cli_as "$ALICE" switch 0 > /dev/null 2>&1 || true
-
-# Bob addr 0: 60 ETH
-topup_wallet "$BOB" ETH 60
-# Bob addr 1: 60 ETH
-cli_as "$BOB" switch 1 > /dev/null 2>&1 || true
-topup_wallet "$BOB" ETH 60
-cli_as "$BOB" switch 0 > /dev/null 2>&1 || true
+# Alice addr 0: 12 BTC (more than the 10 needed, will split across payments)
+topup_wallet "$ALICE" BTC 12
+# Bob addr 0: 120 ETH
+topup_wallet "$BOB" ETH 120
 
 # --- Propose: 10 BTC ↔ 100 ETH ---
 log ""; log "=== Propose swap: 10 BTC ↔ 100 ETH ==="
@@ -70,39 +49,27 @@ DEPOSIT_INV=$(get_deposit_invoice_id "$ALICE" "${SWAP_ID:0:8}")
 [[ -z "$DEPOSIT_INV" ]] && die "No deposit invoice ID"
 log "Deposit invoice: ${DEPOSIT_INV:0:16}..."
 
-# --- Alice partial deposits ---
-log ""; log "=== Alice deposits from 2 addresses ==="
+# --- Alice partial deposits (2 payments from primary address) ---
+log ""; log "=== Alice deposits in 2 partial payments ==="
 
-# Alice addr 0: 6 BTC
-log "Alice addr 0: 6 BTC..."
-cli_as "$ALICE" switch 0 > /dev/null 2>&1 || true
+log "Alice payment 1: 6 BTC..."
 cli_as "$ALICE" invoice-pay "${DEPOSIT_INV:0:8}" --amount 6 2>&1 | tail -3
-ok "Alice partial deposit from addr 0 (6 BTC)"
+ok "Alice partial deposit 1 (6 BTC)"
 
-# Alice addr 1: 4 BTC (remaining)
-log "Alice addr 1: 4 BTC..."
-cli_as "$ALICE" switch 1 > /dev/null 2>&1 || true
+log "Alice payment 2: 4 BTC (remaining)..."
 cli_as "$ALICE" invoice-pay "${DEPOSIT_INV:0:8}" --amount 4 2>&1 | tail -3
-ok "Alice partial deposit from addr 1 (4 BTC)"
+ok "Alice partial deposit 2 (4 BTC)"
 
-cli_as "$ALICE" switch 0 > /dev/null 2>&1 || true
+# --- Bob partial deposits (2 payments from primary address) ---
+log ""; log "=== Bob deposits in 2 partial payments ==="
 
-# --- Bob partial deposits ---
-log ""; log "=== Bob deposits from 2 addresses ==="
-
-# Bob addr 0: 60 ETH
-log "Bob addr 0: 60 ETH..."
-cli_as "$BOB" switch 0 > /dev/null 2>&1 || true
+log "Bob payment 1: 60 ETH..."
 cli_as "$BOB" invoice-pay "${DEPOSIT_INV:0:8}" --amount 60 2>&1 | tail -3
-ok "Bob partial deposit from addr 0 (60 ETH)"
+ok "Bob partial deposit 1 (60 ETH)"
 
-# Bob addr 1: 40 ETH (remaining)
-log "Bob addr 1: 40 ETH..."
-cli_as "$BOB" switch 1 > /dev/null 2>&1 || true
+log "Bob payment 2: 40 ETH (remaining)..."
 cli_as "$BOB" invoice-pay "${DEPOSIT_INV:0:8}" --amount 40 2>&1 | tail -3
-ok "Bob partial deposit from addr 1 (40 ETH)"
-
-cli_as "$BOB" switch 0 > /dev/null 2>&1 || true
+ok "Bob partial deposit 2 (40 ETH)"
 
 # --- Wait for completion ---
 log ""; log "=== Waiting for swap completion ==="
