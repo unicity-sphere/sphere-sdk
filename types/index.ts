@@ -129,6 +129,10 @@ export interface TransferRequest {
   readonly addressMode?: AddressMode;
   /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
   readonly transferMode?: TransferMode;
+  /** @internal NFT transfer flag — skip token splitting logic. Must NOT be accepted from Connect Protocol. */
+  readonly _nftTransfer?: boolean;
+  /** @internal Explicit token IDs to use instead of coinId/amount selection. Must NOT be accepted from Connect Protocol. */
+  readonly _tokenIds?: string[];
 }
 
 /**

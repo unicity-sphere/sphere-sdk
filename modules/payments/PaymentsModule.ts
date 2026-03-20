@@ -1022,17 +1022,68 @@ export class PaymentsModule {
         throw new SphereError('Trust base not available. Oracle provider must implement getTrustBase()', 'AGGREGATOR_ERROR');
       }
 
-      // Calculate optimal split plan
-      const calculator = new TokenSplitCalculator();
-      const availableTokens = Array.from(this.tokens.values());
-      const splitPlan = await calculator.calculateOptimalSplit(
-        availableTokens,
-        BigInt(request.amount),
-        request.coinId
-      );
+      // Token selection: explicit _tokenIds bypass OR spend-planner
+      let splitPlan: import('./TokenSplitCalculator').SplitPlan;
 
-      if (!splitPlan) {
-        throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
+      if (request._tokenIds && request._tokenIds.length > 0) {
+        // -----------------------------------------------------------------
+        // Explicit token ID selection (used by NFT module)
+        // -----------------------------------------------------------------
+        const directTokens: import('./TokenSplitCalculator').TokenWithAmount[] = [];
+        for (const tokenId of request._tokenIds) {
+          const uiToken = this.tokens.get(tokenId);
+          if (!uiToken) {
+            throw new SphereError(
+              `Token not found: ${tokenId}`,
+              'INSUFFICIENT_BALANCE',
+            );
+          }
+          if (uiToken.status === 'transferring') {
+            throw new SphereError(
+              `Token is already being transferred: ${tokenId}`,
+              'INSUFFICIENT_BALANCE',
+            );
+          }
+          if (!uiToken.sdkData) {
+            throw new SphereError(
+              `Token has no SDK data: ${tokenId}`,
+              'INSUFFICIENT_BALANCE',
+            );
+          }
+          const parsed = JSON.parse(uiToken.sdkData);
+          const sdkToken = await SdkToken.fromJSON(parsed);
+          directTokens.push({
+            sdkToken,
+            amount: BigInt(uiToken.amount),
+            uiToken,
+          });
+        }
+        const totalAmount = directTokens.reduce((sum, t) => sum + t.amount, 0n);
+        splitPlan = {
+          tokensToTransferDirectly: directTokens,
+          tokenToSplit: null,
+          splitAmount: null,
+          remainderAmount: null,
+          totalTransferAmount: totalAmount,
+          coinId: request.coinId,
+          requiresSplit: false,
+        };
+      } else {
+        // -----------------------------------------------------------------
+        // Standard spend-planner token selection
+        // -----------------------------------------------------------------
+        const calculator = new TokenSplitCalculator();
+        const availableTokens = Array.from(this.tokens.values());
+        const plan = await calculator.calculateOptimalSplit(
+          availableTokens,
+          BigInt(request.amount),
+          request.coinId
+        );
+
+        if (!plan) {
+          throw new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE');
+        }
+        splitPlan = plan;
       }
 
       // Collect all tokens involved
@@ -1065,8 +1116,8 @@ export class PaymentsModule {
         // CONSERVATIVE MODE: each token sent individually with full proofs
         // =================================================================
 
-        // Handle split if required
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        // Handle split if required (skipped for NFT transfers — tokens are atomic)
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit && !request._nftTransfer) {
           logger.debug('Payments', 'Executing conservative split...');
           const splitExecutor = new TokenSplitExecutor({
             stateTransitionClient: stClient,
@@ -1169,9 +1220,9 @@ export class PaymentsModule {
         // Placeholder ID for the change token — set after sending, read by background callback
         let changeTokenPlaceholderId: string | null = null;
 
-        // 1. Build split bundle (if needed) — does NOT send
+        // 1. Build split bundle (if needed) — does NOT send (skipped for NFT transfers)
         let builtSplit: import('../../types/instant-split').BuildSplitBundleResult | null = null;
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit && !request._nftTransfer) {
           logger.debug('Payments', 'Building instant split bundle...');
           const executor = new InstantSplitExecutor({
             stateTransitionClient: stClient,
@@ -1298,7 +1349,7 @@ export class PaymentsModule {
         }
 
         // 7. Track and remove tokens (removeToken archives + tombstones + saves)
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit && !request._nftTransfer) {
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
