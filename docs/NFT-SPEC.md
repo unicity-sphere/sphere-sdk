@@ -365,12 +365,14 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
 
 ## 5. Transfer
 
-### 5.1 transferNFT(request)
+### 5.1 sendNFT(tokenId, recipient, memo?)
 
-**Input:** `TransferNFTRequest`
+**Signature:** `sendNFT(tokenId: string, recipient: string, memo?: string): Promise<TransferResult>`
 
-| Field | Type | Required | Validation |
-|-------|------|----------|------------|
+Follows the same pattern as `PaymentsModule.send()` — simple positional arguments, no wrapper type.
+
+| Parameter | Type | Required | Validation |
+|-----------|------|----------|------------|
 | `tokenId` | string | Yes | 64-char hex, must exist in wallet, must be NFT type |
 | `recipient` | string | Yes | Valid recipient (@nametag, DIRECT://, pubkey, alpha1...) |
 | `memo` | string | No | ≤ 256 chars |
@@ -388,10 +390,10 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
    - If collection.transferable === false → error NFT_NOT_TRANSFERABLE
 6. Delegate to PaymentsModule:
    result = await payments.send({
-     recipient: request.recipient,
+     recipient,
      amount: "1",
      coinId: tokenId,    // fallback identifier only
-     memo: request.memo,
+     memo,
      // PREREQUISITE: these flags must be added to TransferRequest (see Prerequisites)
      _nftTransfer: true,  // skip token splitting (NFTs are atomic)
      _tokenIds: [tokenId] // PRIMARY token selection — selects by token ID, not coinId

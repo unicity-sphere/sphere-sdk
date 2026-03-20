@@ -36,7 +36,7 @@ The NFT Module extends Sphere SDK with non-fungible token creation, transfer, co
 |  |  Module        |            |                                    ||
 |  |                |  events    |  - mintNFT()                       ||
 |  |  getTokens()   |----------->|  - mintCollection()                ||
-|  |  on(transfer)  |            |  - transferNFT()                   ||
+|  |  on(transfer)  |            |  - sendNFT()                   ||
 |  |                |  send()    |  - getNFT()                        ||
 |  |  send()       |<-----------|  - getNFTs()                       ||
 |  +-------+--------+  (transfer)|  - getCollection()                 ||
@@ -353,19 +353,14 @@ interface BatchMintNFTResult {
 
 ```typescript
 /**
- * Transfer an NFT to another wallet.
- * Uses PaymentsModule.send() under the hood.
+ * Send an NFT to another wallet.
+ * Follows the same pattern as PaymentsModule.send().
+ *
+ * @param tokenId  - 64-char hex token ID of the NFT to send
+ * @param recipient - @nametag, DIRECT://..., chain pubkey, or alpha1...
+ * @param memo     - Optional transfer memo
  */
-transferNFT(request: TransferNFTRequest): Promise<TransferResult>
-
-interface TransferNFTRequest {
-  /** Token ID of the NFT to transfer */
-  tokenId: string;
-  /** Recipient: @nametag, DIRECT://..., chain pubkey, alpha1... */
-  recipient: string;
-  /** Optional memo */
-  memo?: string;
-}
+sendNFT(tokenId: string, recipient: string, memo?: string): Promise<TransferResult>
 ```
 
 ### 5.3 Queries
@@ -649,13 +644,13 @@ mintNFT(request)
 ### 9.3 Transfer Flow
 
 ```
-transferNFT(request)
+sendNFT(tokenId, recipient, memo?)
   ├── 1. Resolve tokenId → Token (must exist, must be NFT)
   ├── 2. Validate: collection.transferable !== false
   ├── 3. Resolve recipient via transport.resolve()
   ├── 4. Delegate to PaymentsModule.send({
   │       recipient, amount: "1", coinId: tokenId,
-  │       memo: request.memo,
+  │       memo,
   │       _nftTransfer: true,     // skip token splitting
   │       _tokenIds: [tokenId]    // explicit token selection
   │     })
@@ -711,7 +706,7 @@ New intent actions:
 
 | Action | User sees | Description |
 |--------|-----------|-------------|
-| `nft_transfer` | Transfer modal | Transfer an NFT to another wallet |
+| `nft_send` | Send modal | Send an NFT to another wallet |
 | `nft_mint` | Mint modal | Mint a new NFT |
 
 New permission scopes:
@@ -719,7 +714,7 @@ New permission scopes:
 | Scope | Grants access to |
 |-------|-----------------|
 | `nft:read` | NFT and collection queries |
-| `intent:nft_transfer` | NFT transfer intent |
+| `intent:nft_send` | NFT send intent |
 | `intent:nft_mint` | NFT mint intent |
 
 ### 10.3 Token Registry Integration

@@ -381,53 +381,53 @@ Following the accounting module's mock patterns:
 
 ### File: `NFTModule.transfer.test.ts`
 
-#### UT-XFER-001: transferNFT — happy path
+#### UT-XFER-001: sendNFT — happy path
 
 - **Precondition:** NFT exists in wallet
 - **Input:** `{ tokenId, recipient: "@bob" }`
 - **Expected:** `PaymentsModule.send()` called with correct parameters. Returns `TransferResult`. NFT removed from in-memory index.
 
-#### UT-XFER-002: transferNFT — emits nft:transferred event
+#### UT-XFER-002: sendNFT — emits nft:transferred event
 
 - **Action:** Successful transfer
 - **Expected:** `emitEvent` called with `('nft:transferred', { tokenId, collectionId, recipientPubkey, recipientNametag })`.
 
-#### UT-XFER-003: transferNFT — NFT not found
+#### UT-XFER-003: sendNFT — NFT not found
 
 - **Input:** `{ tokenId: "nonexistent", recipient: "@bob" }`
 - **Expected:** Throws `SphereError('NFT_NOT_FOUND')`.
 
-#### UT-XFER-004: transferNFT — non-transferable collection
+#### UT-XFER-004: sendNFT — non-transferable collection
 
 - **Precondition:** NFT in collection with `transferable: false`
 - **Expected:** Throws `SphereError('NFT_NOT_TRANSFERABLE')`.
 
-#### UT-XFER-005: transferNFT — wrong token type
+#### UT-XFER-005: sendNFT — wrong token type
 
 - **Precondition:** Token exists but is a fungible token
 - **Expected:** Throws `SphereError('NFT_WRONG_TOKEN_TYPE')`.
 
-#### UT-XFER-006: transferNFT — send() failure propagated
+#### UT-XFER-006: sendNFT — send() failure propagated
 
 - **Precondition:** `PaymentsModule.send()` throws/returns failed status
 - **Expected:** Error propagated to caller.
 
-#### UT-XFER-007: transferNFT — with memo
+#### UT-XFER-007: sendNFT — with memo
 
 - **Input:** `{ tokenId, recipient: "@bob", memo: "Gift for you" }`
 - **Expected:** `send()` called with memo.
 
-#### UT-XFER-008: transferNFT — NFT atomicity (no splitting)
+#### UT-XFER-008: sendNFT — NFT atomicity (no splitting)
 
 - **Action:** Transfer NFT
 - **Expected:** `send()` called with `_nftTransfer: true` and `_tokenIds: [tokenId]` to prevent token splitting and select the exact NFT.
 
-#### UT-XFER-009: transferNFT — recipient resolution
+#### UT-XFER-009: sendNFT — recipient resolution
 
 - **Input:** Different recipient formats: @nametag, DIRECT://, chain pubkey, alpha1...
 - **Expected:** All resolve correctly and pass to `send()`.
 
-#### UT-XFER-010: transferNFT — updates collection tokenCount
+#### UT-XFER-010: sendNFT — updates collection tokenCount
 
 - **Precondition:** Collection with 3 NFTs
 - **Action:** Transfer 1 NFT
