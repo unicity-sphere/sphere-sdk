@@ -77,7 +77,7 @@ export function createTestNFTTokenData(overrides?: Partial<NFTTokenData>): NFTTo
 
 /**
  * Create a valid TxfToken representing an NFT with the given metadata.
- * Sets tokenType = NFT_TOKEN_TYPE_HEX, coinData = null,
+ * Sets tokenType = NFT_TOKEN_TYPE_HEX, coinData = [],
  * tokenData = canonicalSerializeNFT(nftTokenData).
  */
 export function createNFTTxfToken(nftData?: Partial<NFTTokenData>): TxfToken;
@@ -250,7 +250,7 @@ Following the accounting module's mock patterns:
 - **Expected:**
   - Oracle `submitMintCommitment` called once
   - Token stored in TokenStorage with `tokenType === NFT_TOKEN_TYPE_HEX`
-  - `genesis.data.coinData` is `null` or empty array
+  - `genesis.data.coinData` is `[]` (empty array)
   - `genesis.data.tokenData` contains serialized NFTTokenData
   - Returns `{ tokenId: <64-hex>, confirmed: true, nft: NFTRef }`
 
@@ -420,7 +420,7 @@ Following the accounting module's mock patterns:
 #### UT-XFER-008: transferNFT — NFT atomicity (no splitting)
 
 - **Action:** Transfer NFT
-- **Expected:** `send()` called with `_nftTransfer: true` to prevent token splitting.
+- **Expected:** `send()` called with `_nftTransfer: true` and `_tokenIds: [tokenId]` to prevent token splitting and select the exact NFT.
 
 #### UT-XFER-009: transferNFT — recipient resolution
 
@@ -876,11 +876,11 @@ Following the accounting module's mock patterns:
 #### UT-STOR-004: NFT tokens in TokenStorage — correct format
 
 - **Action:** Read raw token from TokenStorage after mint
-- **Expected:** Valid TxfToken with `version: "2.0"`, `genesis.data.tokenType === NFT_TOKEN_TYPE_HEX`, `genesis.data.coinData === null`, `genesis.data.tokenData` is parseable NFTTokenData JSON.
+- **Expected:** Valid TxfToken with `version: "2.0"`, `genesis.data.tokenType === NFT_TOKEN_TYPE_HEX`, `genesis.data.coinData` deepEquals `[]` (empty array), `genesis.data.tokenData` is parseable NFTTokenData JSON.
 
 #### UT-STOR-005: storage key format matches convention
 
-- **Expected:** Keys follow `sphere_{addressIndex}_{key}` pattern.
+- **Expected:** Keys follow `sphere_{addressId}_{key}` pattern (e.g., `sphere_DIRECT_abc_xyz_nft_collections`).
 
 #### UT-STOR-006: multiple addresses — isolated storage
 

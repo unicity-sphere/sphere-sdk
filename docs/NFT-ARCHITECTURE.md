@@ -519,7 +519,7 @@ NFTs are identified by `genesis.data.tokenType === NFT_TOKEN_TYPE_HEX`. No separ
 Collection definitions are stored in the per-address `StorageProvider`:
 
 ```
-StorageProvider key: sphere_{addressIndex}_nft_collections
+StorageProvider key: sphere_{addressId}_nft_collections
 Value: JSON string of Record<collectionId, CollectionDefinition>
 ```
 
@@ -534,7 +534,7 @@ STORAGE_KEYS_ADDRESS.NFT_COLLECTIONS = 'nft_collections'
 Tracks the next edition number for auto-incrementing editions:
 
 ```
-StorageProvider key: sphere_{addressIndex}_nft_mint_counter_{collectionId}
+StorageProvider key: sphere_{addressId}_nft_mint_counter_{collectionId}
 Value: JSON string of number (next edition number)
 ```
 
@@ -656,7 +656,8 @@ transferNFT(request)
   ├── 4. Delegate to PaymentsModule.send({
   │       recipient, amount: "1", coinId: tokenId,
   │       memo: request.memo,
-  │       tokenIds: [tokenId]  // explicit token selection
+  │       _nftTransfer: true,     // skip token splitting
+  │       _tokenIds: [tokenId]    // explicit token selection
   │     })
   ├── 5. Wait for transfer result
   ├── 6. Update in-memory index (remove from local)
