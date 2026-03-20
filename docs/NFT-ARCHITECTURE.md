@@ -17,7 +17,7 @@ The NFT Module extends Sphere SDK with non-fungible token creation, transfer, co
 |-----------|-----------|
 | **NFT IS a token** | An NFT is a minted on-chain token — the metadata lives in the token's genesis `tokenData` field. There is no external state beyond the token itself. The token ID (guaranteed unique by the aggregator) is the NFT ID. |
 | **Predicate-based ownership** | Ownership is proven by satisfying the token's predicate, not by querying a contract ledger. Transfer = predicate transition. Inspired by Cardano's minting policy model. |
-| **Collection = tokenType** | All NFTs minted with the same `tokenType` constant belong to the same collection. The tokenType is derived from SHA-256 of the collection definition — analogous to Cardano's policy ID. |
+| **Collection = collectionId** | All NFTs share a single `tokenType` (`NFT_TOKEN_TYPE_HEX`). Collections are distinguished by `collectionId` — a SHA-256 hash of the collection definition, stored in `genesis.data.tokenData`. Analogous to Cardano's policy ID. |
 | **Immutable genesis, mutable state** | The NFT's metadata (name, description, image, attributes) is immutable once minted (stored in `genesis.data.tokenData`). Only the ownership predicate changes via state transitions. |
 | **Read-only dependency on PaymentsModule** | NFTModule reads from PaymentsModule (getTokens, events) and calls `send()` only for transfers. All other interactions are read-only. |
 | **Compatible metadata format** | NFT metadata follows the ERC-721 JSON schema (name, description, image, attributes) for interoperability with existing tools and marketplaces. |
@@ -100,7 +100,7 @@ The `collectionId` is stored in the NFT's metadata within `genesis.data.tokenDat
 | Fungible (UCT, etc.) | coin-specific hash | `[["UCT", "1000000"]]` | `""` |
 | Nametag | `UNICITY_TOKEN_TYPE_HEX` | `null` | nametag string |
 | Invoice | `INVOICE_TOKEN_TYPE_HEX` | `null` | serialized `InvoiceTerms` |
-| **NFT** | **`NFT_TOKEN_TYPE_HEX`** | **`null`** | **serialized `NFTTokenData`** |
+| **NFT** | **`NFT_TOKEN_TYPE_HEX`** | **`[]`** | **serialized `NFTTokenData`** |
 
 ---
 
@@ -440,7 +440,7 @@ getCollectionNFTs(collectionId: string): NFTRef[]
  * Get the transfer/ownership history of an NFT.
  * Derived from the token's transaction chain.
  */
-getNFTHistory(tokenId: string): NFTHistoryEntry[]
+getNFTHistory(tokenId: string): Promise<NFTHistoryEntry[]>
 
 interface NFTHistoryEntry {
   /** Event type */
@@ -631,7 +631,7 @@ mintNFT(request)
   ├── 6. Create MintTransactionData {
   │       tokenId: SHA-256(tokenData + salt + recipient),
   │       tokenType: NFT_TOKEN_TYPE_HEX,
-  │       coinData: null,  // NFTs have no fungible value
+  │       coinData: [],    // empty — NFTs have no fungible value
   │       tokenData: serialized NFTTokenData,
   │       salt, recipient
   │     }
@@ -738,16 +738,14 @@ interface TokenDefinition {
 }
 ```
 
-### 10.4 TXF Serializer Update
+### 10.4 TXF Serializer Update (DONE)
 
-The existing `txf-serializer.ts` already has a hardcoded NFT detection:
+The `txf-serializer.ts` previously had a hardcoded hash (`455ad872...`, which was actually UCT's coin ID, not an NFT type) for NFT detection. This has been replaced with the canonical `NFT_TOKEN_TYPE_HEX` constant imported from `constants.ts`:
 
 ```typescript
-// serialization/txf-serializer.ts:220
-const isNft = tokenType === '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
+import { NFT_TOKEN_TYPE_HEX } from '../constants';
+const isNft = tokenType === NFT_TOKEN_TYPE_HEX;
 ```
-
-This legacy value (`455ad872...`) does NOT match `SHA-256("unicity.nft.v1")` and must be replaced with the canonical `NFT_TOKEN_TYPE_HEX` constant (`8b0136c9...`).
 
 ---
 

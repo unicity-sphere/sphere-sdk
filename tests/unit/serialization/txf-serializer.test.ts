@@ -20,6 +20,7 @@ import {
 } from '../../../serialization/txf-serializer';
 import type { Token } from '../../../types';
 import type { TxfToken, TxfTransaction, TxfInclusionProof } from '../../../types/txf';
+import { NFT_TOKEN_TYPE_HEX } from '../../../constants';
 
 // =============================================================================
 // TokenRegistry Setup (needed by txfToToken / parseTxfStorageData)
@@ -334,8 +335,7 @@ describe('txfToToken()', () => {
 
   it('should detect NFT tokens', () => {
     const txf = createMockTxf();
-    txf.genesis.data.tokenType =
-      '455ad8720656b08e8dbd5bac1f3c73eeea5431565f6c1c3af742b1aa12d41d89';
+    txf.genesis.data.tokenType = NFT_TOKEN_TYPE_HEX;
 
     const token = txfToToken('test', txf);
 

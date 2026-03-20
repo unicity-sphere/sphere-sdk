@@ -26,6 +26,16 @@
 
 ---
 
+## Prerequisites (must be implemented before NFTModule)
+
+The following changes to existing modules are required before the NFT module can function:
+
+1. **PaymentsModule.send() — `_nftTransfer` flag:** Add optional `_nftTransfer?: boolean` to `TransferRequest`. When `true`, PaymentsModule MUST skip token splitting logic (NFTs are atomic and cannot be split).
+2. **PaymentsModule.send() — `_tokenIds` flag:** Add optional `_tokenIds?: string[]` to `TransferRequest`. When set, PaymentsModule MUST use only the specified tokens (by token ID) instead of selecting by coinId/amount. This is the primary token selection mechanism for NFT transfers.
+3. **TxfGenesisData.coinData — nullable or empty array:** Verify that the minting flow and `txfToToken()` handle `coinData: []` (empty array) without crashing. Currently `txfToToken()` calls `coinData.reduce()` — this works with `[]` but would crash with `null`.
+
+---
+
 ## 1. Constants
 
 ### 1.1 Token Type
@@ -50,7 +60,7 @@ NFT_COLLECTIONS: 'nft_collections',       // Collection definitions registry
 NFT_MINT_COUNTER: 'nft_mint_counter',      // Per-collection edition counters
 ```
 
-Final storage key format: `sphere_{addressIndex}_{key}` (standard pattern).
+Final storage key format: `sphere_{addressId}_{key}` where `addressId` is the DIRECT address ID (e.g., `DIRECT_abc123_xyz789`).
 
 ### 1.3 Limits
 
@@ -283,7 +293,7 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
 10. Create MintTransactionData:
     tokenType = new TokenType(Buffer.from(NFT_TOKEN_TYPE_HEX, 'hex'))
     mintData = await MintTransactionData.create(
-      tokenId, tokenType, tokenData, null, salt, recipientAddress, recipientAddress
+      tokenId, tokenType, tokenData, [], salt, recipientAddress, recipientAddress
     )
 11. commitment = await MintCommitment.create(mintData)
 12. Submit to oracle:
@@ -335,16 +345,19 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
 1. Validate collectionId exists
 2. Validate items.length ≤ NFT_MAX_BATCH_SIZE
 3. Pre-check maxSupply: if set, ensure currentCount + items.length ≤ maxSupply
-4. For each item in items (parallelized where possible):
-   a. Call mintNFT({ collectionId, metadata: item.metadata, edition: item.edition, recipient: item.recipient })
+4. Reserve edition range atomically inside the collection gate:
+   - editions = [nextEdition, nextEdition+1, ..., nextEdition+items.length-1]
+   - Update mint counter to nextEdition + items.length
+5. For each item in items (oracle submissions parallelized):
+   a. Call internal _mintSingleNFT() with pre-assigned edition
    b. Collect result or error
-5. Aggregate results:
+6. Aggregate results:
    - results: MintNFTResult[] (successful mints)
    - errors: Array<{ index, error }> (failed mints)
-6. Return { results, successCount, failureCount, errors }
+7. Return { results, successCount, failureCount, errors }
 ```
 
-**Parallelization:** Mint commitments can be submitted in parallel. However, each commitment needs its own salt and unique token ID. The oracle deduplicates by request ID (idempotent).
+**Parallelization:** Edition numbers are reserved atomically inside the per-collection gate (step 4). After reservation, oracle commitments for individual NFTs can be submitted in parallel since each has its own salt, token ID, and pre-assigned edition. Items within the same collection are NOT individually serialized through the gate — only the edition reservation step is.
 
 **Partial failure:** Batch mint does NOT roll back on partial failure. Successfully minted NFTs remain minted. Failed items are reported in `errors`.
 
@@ -377,11 +390,11 @@ The `collectionId` is computed client-side before any on-chain interaction. It i
    result = await payments.send({
      recipient: request.recipient,
      amount: "1",
-     coinId: tokenId,    // NFT tokenId used as coinId for transfer routing
+     coinId: tokenId,    // fallback identifier only
      memo: request.memo,
-     // Internal flag to prevent splitting (NFTs are atomic)
-     _nftTransfer: true,
-     _tokenIds: [tokenId]
+     // PREREQUISITE: these flags must be added to TransferRequest (see Prerequisites)
+     _nftTransfer: true,  // skip token splitting (NFTs are atomic)
+     _tokenIds: [tokenId] // PRIMARY token selection — selects by token ID, not coinId
    })
 7. On success:
    - Remove from in-memory NFT index
@@ -456,10 +469,12 @@ Equivalent to `getNFTs({ collectionId })` without other filters.
 
 **Input:** `tokenId: string`
 
+**Returns:** `Promise<NFTHistoryEntry[]>`
+
 **Algorithm:**
 
 ```
-1. Get token from TokenStorage
+1. Get token from TokenStorage (async)
 2. If not found or not NFT → return []
 3. Parse TXF transactions array
 4. For each transaction:
@@ -551,6 +566,7 @@ The NFT module subscribes to `transfer:incoming` events from PaymentsModule:
 private _onIncomingTransfer(transfer: IncomingTransfer): void {
   try {
     for (const token of transfer.tokens) {
+      if (!token.sdkData) continue;
       const txf = JSON.parse(token.sdkData);
       if (txf.genesis?.data?.tokenType !== NFT_TOKEN_TYPE_HEX) continue;
 
@@ -640,7 +656,7 @@ private _onIncomingTransfer(transfer: IncomingTransfer): void {
 
 ### 10.1 Collection Registry
 
-**Key:** `sphere_{addressIndex}_nft_collections`
+**Key:** `sphere_{addressId}_nft_collections`
 
 **Value:** JSON string of:
 
@@ -655,7 +671,7 @@ interface NFTCollectionsStorage {
 
 ### 10.2 Mint Counter
 
-**Key:** `sphere_{addressIndex}_nft_mint_counter_{collectionId}`
+**Key:** `sphere_{addressId}_nft_mint_counter_{collectionId}`
 
 **Value:** JSON string of number (next edition number).
 
@@ -827,9 +843,9 @@ In-memory indexes (`_nftIndex`, `_collectionIndex`) are updated synchronously af
 **Write operations:**
 - `send()` — transfer NFT to another wallet
 
-**No modifications to PaymentsModule required** except:
+**PaymentsModule modifications required** (see Prerequisites section):
 1. Accept `_nftTransfer` flag to skip splitting logic
-2. Accept `_tokenIds` for explicit token selection
+2. Accept `_tokenIds` for explicit token selection by token ID
 
 ### 14.2 TokenStorage Integration
 
