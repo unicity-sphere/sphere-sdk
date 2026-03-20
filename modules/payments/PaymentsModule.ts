@@ -1140,8 +1140,17 @@ export class PaymentsModule {
         // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
         // planSend reads free amounts, runs split calculation, and creates a
         // reservation atomically. No concurrent send() can interleave here.
+        // Count pending change tokens (status='transferring') so concurrent sends
+        // queue instead of failing with SEND_INSUFFICIENT_BALANCE.
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+
         const planResult = this.spendPlanner.planSend(
-          request, parsedPool, this.reservationLedger, this.spendQueue, result.id
+          request, parsedPool, this.reservationLedger, this.spendQueue, result.id, pendingChangeAmount
         );
 
         if (planResult === 'queued') {
@@ -1698,8 +1707,14 @@ export class PaymentsModule {
         request.coinId
       );
 
+      let pendingChangeAmount2 = 0n;
+      for (const [, t] of this.tokens) {
+        if (t.coinId === request.coinId && t.status === 'transferring') {
+          pendingChangeAmount2 += BigInt(t.amount || '0');
+        }
+      }
       const planResult = this.spendPlanner.planSend(
-        request, parsedPool, this.reservationLedger, this.spendQueue, reservationId
+        request, parsedPool, this.reservationLedger, this.spendQueue, reservationId, pendingChangeAmount2
       );
 
       let splitPlan;

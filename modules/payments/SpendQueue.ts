@@ -124,7 +124,8 @@ export class SpendPlanner {
     parsedPool: ParsedTokenPool,
     ledger: TokenReservationLedger,
     queue: SpendQueue,
-    reservationId: string
+    reservationId: string,
+    pendingChangeAmount?: bigint,
   ): PlanResult | 'queued' {
     const requestedAmount = BigInt(request.amount);
     const coinId = request.coinId;
@@ -140,6 +141,14 @@ export class SpendPlanner {
       if (freeAmount > 0n) {
         freeView.push({ token: entry.token, sdkToken: entry.sdkToken, amount: freeAmount });
       }
+    }
+
+    // Include pending change tokens (placeholders with status='transferring')
+    // in the total inventory. These tokens can't be planned against yet, but
+    // counting them prevents a hard SEND_INSUFFICIENT_BALANCE when a concurrent
+    // send is waiting for change from a prior split to arrive.
+    if (pendingChangeAmount && pendingChangeAmount > 0n) {
+      totalInventory += pendingChangeAmount;
     }
 
     // Case C: total inventory (ignoring reservations) is insufficient
