@@ -5078,10 +5078,13 @@ async function main() {
               console.error(`Invalid --attribute format: "${args[i + 1]}". Expected "trait:value".`);
               process.exit(1);
             }
-            attributes.push({
-              trait_type: args[i + 1].slice(0, colonIdx),
-              value: args[i + 1].slice(colonIdx + 1),
-            });
+            const traitType = args[i + 1].slice(0, colonIdx);
+            const traitValue = args[i + 1].slice(colonIdx + 1);
+            if (traitType.length === 0) {
+              console.error(`Invalid --attribute: trait_type cannot be empty in "${args[i + 1]}".`);
+              process.exit(1);
+            }
+            attributes.push({ trait_type: traitType, value: traitValue });
           }
         }
 
@@ -5438,7 +5441,7 @@ async function main() {
             const time = new Date(entry.timestamp).toISOString().replace('T', ' ').slice(0, 19);
             const counterparty = entry.counterpartyNametag
               ? `@${entry.counterpartyNametag}`
-              : (entry.counterparty?.slice(0, 18) + '...' || '-');
+              : (entry.counterparty ? entry.counterparty.slice(0, 18) + '...' : '-');
             const row = [
               time.padEnd(24),
               entry.type.padEnd(18),
