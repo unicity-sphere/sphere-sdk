@@ -23,6 +23,15 @@ import { tokenToTxf } from '../serialization/txf-serializer';
 import type { NetworkType } from '../constants';
 import type { TransportProvider } from '../transport/transport-provider';
 import type { ProviderStatus } from '../types';
+import type {
+  NFTRef,
+  NFTMetadata,
+  NFTAttribute,
+  CollectionRef,
+  CreateCollectionRequest,
+  GetNFTsOptions,
+  GetCollectionsOptions,
+} from '../modules/nft/types';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -191,6 +200,7 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     groupChat: true,
     accounting: true,
     swap: true,
+    nft: true,
   });
 
   sphereInstance = result.sphere;
@@ -258,6 +268,44 @@ function parseAssetArg(value: string): { amount: string; coin: string } {
     process.exit(1);
   }
   return { amount: parts[0], coin: parts[1] };
+}
+
+/**
+ * Resolve an NFT token ID from a full ID or unique prefix.
+ * Exits with error if no match or ambiguous.
+ */
+function resolveNFTId(allNFTs: NFTRef[], idOrPrefix: string): string {
+  const exact = allNFTs.find(n => n.tokenId === idOrPrefix);
+  if (exact) return exact.tokenId;
+  const matches = allNFTs.filter(n => n.tokenId.startsWith(idOrPrefix));
+  if (matches.length === 0) {
+    console.error(`No NFT found matching prefix: ${idOrPrefix}`);
+    process.exit(1);
+  }
+  if (matches.length > 1) {
+    console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matches.length} NFTs. Use more characters.`);
+    process.exit(1);
+  }
+  return matches[0].tokenId;
+}
+
+/**
+ * Resolve a collection ID from a full ID or unique prefix.
+ * Exits with error if no match or ambiguous.
+ */
+function resolveCollectionId(allCollections: CollectionRef[], idOrPrefix: string): string {
+  const exact = allCollections.find(c => c.collectionId === idOrPrefix);
+  if (exact) return exact.collectionId;
+  const matches = allCollections.filter(c => c.collectionId.startsWith(idOrPrefix));
+  if (matches.length === 0) {
+    console.error(`No collection found matching prefix: ${idOrPrefix}`);
+    process.exit(1);
+  }
+  if (matches.length > 1) {
+    console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matches.length} collections. Use more characters.`);
+    process.exit(1);
+  }
+  return matches[0].collectionId;
 }
 
 /** Map common symbols to faucet coin names. */
@@ -1135,6 +1183,198 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     ],
   },
 
+  // --- NFTs ---
+  'nft-collection-create': {
+    usage: 'nft-collection-create <name> <description> [--max-supply <n>] [--image <uri>] [--royalty <bps> <recipient>] [--non-transferable] [--deterministic] [--external-url <url>]',
+    description: 'Create a new NFT collection definition. This is a local-only operation that registers the collection for minting. No on-chain transaction occurs. The collection ID is derived deterministically from its definition — the same inputs always produce the same ID.',
+    flags: [
+      { flag: '<name>', description: 'Collection name (1-128 chars)' },
+      { flag: '<description>', description: 'Collection description (1-4096 chars, quote if spaces)' },
+      { flag: '--max-supply <n>', description: 'Maximum number of NFTs (1-1,000,000). Omit for unlimited.' },
+      { flag: '--image <uri>', description: 'Collection image URI (ipfs://, https://, data:)' },
+      { flag: '--royalty <bps> <recipient>', description: 'Royalty in basis points (0-10000) and recipient address' },
+      { flag: '--non-transferable', description: 'Mark as soulbound — NFTs cannot be transferred after minting' },
+      { flag: '--deterministic', description: 'Use deterministic salt derivation — only the creator can mint valid token IDs' },
+      { flag: '--external-url <url>', description: 'External URL for the collection' },
+    ],
+    examples: [
+      'npm run cli -- nft-collection-create "My Art" "Digital artwork collection"',
+      'npm run cli -- nft-collection-create "Badges" "Membership badges" --max-supply 1000 --non-transferable',
+      'npm run cli -- nft-collection-create "Limited" "Rare items" --max-supply 100 --royalty 500 @treasury --deterministic',
+    ],
+    notes: [
+      'Collection IDs are deterministic from the full definition (including creation timestamp). Re-running the command produces a new collection with a different timestamp and therefore a different ID.',
+      'Use --deterministic for controlled collections where only the creator should mint.',
+    ],
+  },
+
+  'nft-collection-list': {
+    usage: 'nft-collection-list [--mine] [--json]',
+    description: 'List all NFT collections known to this wallet. Includes both collections you created and collections from received NFTs.',
+    flags: [
+      { flag: '--mine', description: 'Show only collections created by this wallet' },
+      { flag: '--json', description: 'Output as JSON array instead of table' },
+    ],
+    examples: [
+      'npm run cli -- nft-collection-list',
+      'npm run cli -- nft-collection-list --mine',
+      'npm run cli -- nft-collection-list --json',
+    ],
+  },
+
+  'nft-collection-info': {
+    usage: 'nft-collection-info <collectionId or prefix>',
+    description: 'Show detailed information about a specific collection, including name, creator, supply, royalty, and transferability settings.',
+    flags: [
+      { flag: '<collectionId or prefix>', description: 'Full 64-char collection ID or a unique prefix' },
+    ],
+    examples: [
+      'npm run cli -- nft-collection-info a1b2c3',
+      'npm run cli -- nft-collection-info a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890',
+    ],
+  },
+
+  'nft-mint': {
+    usage: 'nft-mint <name> <image-uri> [--collection <id>] [--description <text>] [--edition <n>] [--total-editions <n>] [--recipient <addr>] [--attribute <trait:value>]...',
+    description: 'Mint a single NFT on-chain. Can be standalone (no collection) or part of a collection. Minting submits a commitment to the aggregator and waits for an inclusion proof.',
+    flags: [
+      { flag: '<name>', description: 'NFT name (1-256 chars, quote if spaces)' },
+      { flag: '<image-uri>', description: 'Primary image URI (ipfs://, https://, data:)' },
+      { flag: '--collection <id>', description: 'Collection ID or prefix — mint into this collection' },
+      { flag: '--description <text>', description: 'NFT description (quote if spaces)' },
+      { flag: '--edition <n>', description: 'Explicit edition number (collection only, otherwise auto-increment)' },
+      { flag: '--total-editions <n>', description: 'Total planned editions (informational)' },
+      { flag: '--recipient <addr>', description: 'Mint to another wallet (@nametag, DIRECT://, pubkey)' },
+      { flag: '--attribute <trait:value>', description: 'Add a trait attribute (repeatable, e.g., --attribute "Color:Blue")' },
+      { flag: '--animation-url <uri>', description: 'Animation/multimedia URI' },
+      { flag: '--external-url <url>', description: 'External URL' },
+      { flag: '--background-color <hex>', description: 'Background color (6-char hex, no # prefix)' },
+    ],
+    examples: [
+      'npm run cli -- nft-mint "My Art" "ipfs://QmImageHash"',
+      'npm run cli -- nft-mint "Sphere #1" "ipfs://QmHash" --collection a1b2c3 --attribute "Color:Blue"',
+      'npm run cli -- nft-mint "Gift" "ipfs://QmGift" --recipient @alice --description "A gift NFT"',
+    ],
+    notes: [
+      'Minting requires an oracle (aggregator) connection.',
+      '--attribute can be specified multiple times for different traits.',
+      'Edition numbers auto-increment within a collection unless --edition is set explicitly.',
+    ],
+  },
+
+  'nft-batch-mint': {
+    usage: 'nft-batch-mint <json-file> [--collection <id>]',
+    description: 'Mint multiple NFTs from a JSON manifest file. Each item in the array defines one NFT. Maximum 50 items per batch. Partial failures are reported — successfully minted NFTs are not rolled back.',
+    flags: [
+      { flag: '<json-file>', description: 'Path to JSON file containing an array of NFT definitions' },
+      { flag: '--collection <id>', description: 'Collection ID or prefix — applies to all items in the batch' },
+    ],
+    examples: [
+      'npm run cli -- nft-batch-mint ./nfts.json',
+      'npm run cli -- nft-batch-mint ./nfts.json --collection a1b2c3',
+    ],
+    notes: [
+      'JSON format: [{ "name": "...", "image": "...", "attributes": [...] }, ...]',
+      'Maximum 50 items per batch (NFT_MAX_BATCH_SIZE).',
+      'Partial failures: successfully minted NFTs remain minted; errors are reported per item.',
+    ],
+  },
+
+  'nft-send': {
+    usage: 'nft-send <tokenId or prefix> <recipient> [--memo <text>]',
+    description: 'Send an NFT to another wallet. The NFT is transferred atomically (cannot be split). Soulbound (non-transferable) NFTs cannot be sent.',
+    flags: [
+      { flag: '<tokenId or prefix>', description: 'Full token ID or unique prefix' },
+      { flag: '<recipient>', description: 'Recipient: @nametag, DIRECT://..., chain pubkey, or alpha1...' },
+      { flag: '--memo <text>', description: 'Transfer memo (max 256 chars)' },
+    ],
+    examples: [
+      'npm run cli -- nft-send a1b2c3 @alice',
+      'npm run cli -- nft-send a1b2c3 @bob --memo "Gift for you"',
+      'npm run cli -- nft-send a1b2c3d4e5f67890 "DIRECT://abc123..."',
+    ],
+    notes: [
+      'NFTs are atomic — they cannot be split or partially transferred.',
+      'Non-transferable (soulbound) NFTs will produce an error.',
+    ],
+  },
+
+  'nft-list': {
+    usage: 'nft-list [--collection <id>] [--status <confirmed|pending>] [--json]',
+    description: 'List all NFTs in the wallet. Can be filtered by collection and status. Operates on the in-memory index — no storage reads required.',
+    flags: [
+      { flag: '--collection <id>', description: 'Filter by collection ID or prefix' },
+      { flag: '--status <status>', description: 'Filter by token status: "confirmed" or "pending"' },
+      { flag: '--json', description: 'Output as JSON array instead of table' },
+    ],
+    examples: [
+      'npm run cli -- nft-list',
+      'npm run cli -- nft-list --collection a1b2c3',
+      'npm run cli -- nft-list --status confirmed --json',
+    ],
+  },
+
+  'nft-info': {
+    usage: 'nft-info <tokenId or prefix>',
+    description: 'Show full details for a single NFT, including all metadata fields, collection definition, edition info, minter, and token status.',
+    flags: [
+      { flag: '<tokenId or prefix>', description: 'Full token ID or unique prefix' },
+    ],
+    examples: [
+      'npm run cli -- nft-info a1b2c3',
+      'npm run cli -- nft-info a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890',
+    ],
+  },
+
+  'nft-history': {
+    usage: 'nft-history <tokenId or prefix>',
+    description: 'Show the ownership and transfer history for an NFT. Events are listed chronologically: mint, transfer_in, transfer_out.',
+    flags: [
+      { flag: '<tokenId or prefix>', description: 'Full token ID or unique prefix' },
+    ],
+    examples: [
+      'npm run cli -- nft-history a1b2c3',
+    ],
+  },
+
+  'nft-export': {
+    usage: 'nft-export <tokenId or prefix> [--output <file>]',
+    description: 'Export an NFT as a complete TXF JSON object. By default, prints to stdout (suitable for piping to jq or redirecting to a file). With --output, writes directly to the specified file.',
+    flags: [
+      { flag: '<tokenId or prefix>', description: 'Full token ID or unique prefix' },
+      { flag: '--output <file>', description: 'Write TXF JSON to file instead of stdout' },
+    ],
+    examples: [
+      'npm run cli -- nft-export a1b2c3',
+      'npm run cli -- nft-export a1b2c3 --output ./my-nft.json',
+      'npm run cli -- nft-export a1b2c3 | jq .genesis.data',
+    ],
+  },
+
+  'nft-import': {
+    usage: 'nft-import <json-file>',
+    description: 'Import an NFT from a TXF JSON file. Validates that the token type is NFT, parses metadata, registers the collection if unknown, and stores the token. Idempotent: importing the same token twice returns the existing NFT.',
+    flags: [
+      { flag: '<json-file>', description: 'Path to TXF JSON file containing the NFT token' },
+    ],
+    examples: [
+      'npm run cli -- nft-import ./my-nft.json',
+      'npm run cli -- nft-import ./received-token.txf.json',
+    ],
+  },
+
+  'nft-verify': {
+    usage: 'nft-verify <tokenId or prefix>',
+    description: 'Verify an NFT against the aggregator/oracle. Checks inclusion proof validity and whether the token has been spent (transferred away). Exits with code 0 if valid and unspent, code 1 otherwise.',
+    flags: [
+      { flag: '<tokenId or prefix>', description: 'Full token ID or unique prefix' },
+    ],
+    examples: [
+      'npm run cli -- nft-verify a1b2c3',
+      'npm run cli -- nft-verify a1b2c3 && echo "VALID" || echo "INVALID"',
+    ],
+  },
+
   // --- DAEMON ---
   'daemon': {
     usage: 'daemon <start|stop|status> [options]',
@@ -1452,6 +1692,20 @@ SWAPS:
   swap-deposit <id|prefix>           Deposit into a swap
   swap-reject <id|prefix> [reason]  Reject a swap proposal
   swap-cancel <id|prefix>           Cancel a swap
+
+NFTs:
+  nft-collection-create             Create a new NFT collection
+  nft-collection-list               List collections
+  nft-collection-info <id>          Show collection details
+  nft-mint <name> <image>           Mint a single NFT
+  nft-batch-mint <file>             Batch mint NFTs from JSON
+  nft-send <id> <recipient>         Send an NFT
+  nft-list                          List all NFTs in wallet
+  nft-info <id>                     Show NFT details
+  nft-history <id>                  Show NFT transfer history
+  nft-export <id>                   Export NFT as TXF JSON
+  nft-import <file>                 Import NFT from TXF JSON
+  nft-verify <id>                   Verify NFT against aggregator
 
 EVENT DAEMON:
   daemon start                      Start persistent event listener
@@ -4641,6 +4895,715 @@ async function main() {
         break;
       }
 
+      // =================================================================
+      // NFT COMMANDS
+      // =================================================================
+
+      case 'nft-collection-create': {
+        const name = args[1];
+        const description = args[2];
+        if (!name || !description) {
+          console.error('Usage: nft-collection-create <name> <description> [--max-supply <n>] [--image <uri>] [--royalty <bps> <recipient>] [--non-transferable] [--deterministic] [--external-url <url>]');
+          process.exit(1);
+        }
+        if (name.length > 128) {
+          console.error('Collection name must be 1-128 characters');
+          process.exit(1);
+        }
+
+        const maxSupplyIdx = args.indexOf('--max-supply');
+        const imageIdx = args.indexOf('--image');
+        const royaltyIdx = args.indexOf('--royalty');
+        const nonTransferable = args.includes('--non-transferable');
+        const deterministic = args.includes('--deterministic');
+        const extUrlIdx = args.indexOf('--external-url');
+
+        const request: CreateCollectionRequest = {
+          name,
+          description,
+          maxSupply: maxSupplyIdx !== -1 && args[maxSupplyIdx + 1] ? (() => {
+            const n = parseInt(args[maxSupplyIdx + 1], 10);
+            if (isNaN(n) || n < 1 || n > 1000000) {
+              console.error('--max-supply must be an integer between 1 and 1000000');
+              process.exit(1);
+            }
+            return n;
+          })() : undefined,
+          image: imageIdx !== -1 ? args[imageIdx + 1] : undefined,
+          externalUrl: extUrlIdx !== -1 ? args[extUrlIdx + 1] : undefined,
+          royalty: royaltyIdx !== -1 ? (() => {
+            const bpsStr = args[royaltyIdx + 1];
+            const recipient = args[royaltyIdx + 2];
+            if (!bpsStr || !recipient) {
+              console.error('--royalty requires both <bps> and <recipient>');
+              process.exit(1);
+            }
+            const bps = parseInt(bpsStr, 10);
+            if (isNaN(bps) || bps < 0 || bps > 10000) {
+              console.error('--royalty basis points must be an integer between 0 and 10000');
+              process.exit(1);
+            }
+            return { basisPoints: bps, recipient };
+          })() : undefined,
+          transferable: nonTransferable ? false : undefined,
+          deterministicMinting: deterministic ? true : undefined,
+        };
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+
+        try {
+          const result = await sphere.nft.createCollection(request);
+          console.log(JSON.stringify({
+            collectionId: result.collectionId,
+            name: result.definition.name,
+            creator: result.definition.creator,
+            maxSupply: result.definition.maxSupply,
+            transferable: result.definition.transferable ?? true,
+            deterministicMinting: result.definition.deterministicMinting ?? false,
+          }, null, 2));
+        } catch (err) {
+          console.error(`Failed to create collection: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-collection-list': {
+        const mineFlag = args.includes('--mine');
+        const jsonFlag = args.includes('--json');
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const collOptions: GetCollectionsOptions = {
+          createdByMe: mineFlag ? true : undefined,
+        };
+        const collections = sphere.nft.getCollections(collOptions);
+
+        if (collections.length === 0) {
+          console.log('No collections found.');
+        } else if (jsonFlag) {
+          console.log(JSON.stringify(collections, null, 2));
+        } else {
+          console.log(`Collections (${collections.length}):\n`);
+          const header = [
+            'ID'.padEnd(18),
+            'Name'.padEnd(20),
+            'Tokens'.padEnd(10),
+            'Max Supply'.padEnd(14),
+            'Creator'.padEnd(16),
+            'Transferable',
+          ].join('');
+          console.log(header);
+          for (const c of collections) {
+            const row = [
+              (c.collectionId.slice(0, 12) + '...').padEnd(18),
+              c.name.slice(0, 18).padEnd(20),
+              String(c.tokenCount).padEnd(10),
+              (c.maxSupply !== null ? String(c.maxSupply) : 'unlimited').padEnd(14),
+              (c.isCreator ? '(you)' : c.creator.slice(0, 12) + '...').padEnd(16),
+              c.transferable ? 'Yes' : 'No',
+            ].join('');
+            console.log(row);
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-collection-info': {
+        const collIdArg = args[1];
+        if (!collIdArg) {
+          console.error('Usage: nft-collection-info <collectionId or prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const allCollections = sphere.nft.getCollections();
+        const collectionId = resolveCollectionId(allCollections, collIdArg);
+        const collection = sphere.nft.getCollection(collectionId);
+        if (!collection) {
+          console.error(`Collection not found: ${collectionId}`);
+          process.exit(1);
+        }
+
+        console.log(JSON.stringify(collection, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-mint': {
+        const nftName = args[1];
+        const imageUri = args[2];
+        if (!nftName || !imageUri || nftName.startsWith('--') || imageUri.startsWith('--')) {
+          console.error('Usage: nft-mint <name> <image-uri> [--collection <id>] [--description <text>] [--edition <n>] [--total-editions <n>] [--recipient <addr>] [--attribute <trait:value>]...');
+          process.exit(1);
+        }
+
+        const collIdx = args.indexOf('--collection');
+        const descIdx = args.indexOf('--description');
+        const editionIdx = args.indexOf('--edition');
+        const totalEdIdx = args.indexOf('--total-editions');
+        const recipIdx = args.indexOf('--recipient');
+        const animIdx = args.indexOf('--animation-url');
+        const extUrlIdxMint = args.indexOf('--external-url');
+        const bgColorIdx = args.indexOf('--background-color');
+        const jsonFlagMint = args.includes('--json');
+
+        // Parse repeatable --attribute flags
+        const attributes: NFTAttribute[] = [];
+        for (let i = 0; i < args.length; i++) {
+          if (args[i] === '--attribute' && args[i + 1]) {
+            const colonIdx = args[i + 1].indexOf(':');
+            if (colonIdx === -1) {
+              console.error(`Invalid --attribute format: "${args[i + 1]}". Expected "trait:value".`);
+              process.exit(1);
+            }
+            attributes.push({
+              trait_type: args[i + 1].slice(0, colonIdx),
+              value: args[i + 1].slice(colonIdx + 1),
+            });
+          }
+        }
+
+        const metadata: NFTMetadata = {
+          name: nftName,
+          image: imageUri,
+          description: descIdx !== -1 ? args[descIdx + 1] : undefined,
+          animationUrl: animIdx !== -1 ? args[animIdx + 1] : undefined,
+          externalUrl: extUrlIdxMint !== -1 ? args[extUrlIdxMint + 1] : undefined,
+          backgroundColor: bgColorIdx !== -1 ? args[bgColorIdx + 1] : undefined,
+          attributes: attributes.length > 0 ? attributes : undefined,
+        };
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        // Resolve collection ID if provided
+        let mintCollectionId: string | undefined;
+        if (collIdx !== -1 && args[collIdx + 1]) {
+          const allColls = sphere.nft.getCollections();
+          mintCollectionId = resolveCollectionId(allColls, args[collIdx + 1]);
+        }
+
+        const edition = editionIdx !== -1 && args[editionIdx + 1] ? parseInt(args[editionIdx + 1], 10) : undefined;
+        const totalEditions = totalEdIdx !== -1 && args[totalEdIdx + 1] ? parseInt(args[totalEdIdx + 1], 10) : undefined;
+        const recipient = recipIdx !== -1 ? args[recipIdx + 1] : undefined;
+
+        try {
+          const result = await sphere.nft.mintNFT(metadata, mintCollectionId, edition, totalEditions, recipient);
+
+          if (jsonFlagMint) {
+            console.log(JSON.stringify({
+              tokenId: result.tokenId,
+              collectionId: result.collectionId,
+              edition: result.nft.edition,
+              confirmed: result.confirmed,
+            }, null, 2));
+          } else {
+            console.log('NFT minted:');
+            console.log(`  Token ID:      ${result.tokenId.slice(0, 16)}...`);
+            console.log(`  Name:          ${nftName}`);
+            if (result.collectionId) {
+              const coll = sphere.nft.getCollection(result.collectionId);
+              const collName = coll ? coll.name : result.collectionId.slice(0, 12) + '...';
+              console.log(`  Collection:    ${result.collectionId.slice(0, 12)}... (${collName})`);
+            }
+            console.log(`  Edition:       ${result.nft.edition}`);
+            console.log(`  Confirmed:     ${result.confirmed}`);
+          }
+        } catch (err) {
+          console.error(`Failed to mint NFT: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-batch-mint': {
+        const batchFile = args[1];
+        if (!batchFile) {
+          console.error('Usage: nft-batch-mint <json-file> [--collection <id>]');
+          process.exit(1);
+        }
+
+        // Read and parse JSON file
+        let batchItems: unknown[];
+        try {
+          const resolvedPath = path.resolve(batchFile);
+          const raw = fs.readFileSync(resolvedPath, 'utf8');
+          batchItems = JSON.parse(raw);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('ENOENT')) {
+            console.error(`File not found: "${batchFile}"`);
+          } else if (msg.includes('Unexpected token') || msg.includes('JSON')) {
+            console.error(`Invalid JSON in batch file "${batchFile}"`);
+          } else {
+            console.error(`Failed to read batch file "${batchFile}"`);
+          }
+          process.exit(1);
+        }
+
+        if (!Array.isArray(batchItems)) {
+          console.error('Batch file must contain a JSON array of NFT definitions');
+          process.exit(1);
+        }
+        if (batchItems.length === 0) {
+          console.error('Batch file must contain at least one item');
+          process.exit(1);
+        }
+        if (batchItems.length > 50) {
+          console.error(`Batch size ${batchItems.length} exceeds maximum of 50`);
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        // Resolve collection if provided
+        const batchCollIdx = args.indexOf('--collection');
+        let batchCollectionId: string | undefined;
+        if (batchCollIdx !== -1 && args[batchCollIdx + 1]) {
+          const allColls = sphere.nft.getCollections();
+          batchCollectionId = resolveCollectionId(allColls, args[batchCollIdx + 1]);
+        }
+
+        // Transform items
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const items = (batchItems as any[]).map((item) => ({
+          metadata: {
+            name: item.name,
+            image: item.image,
+            description: item.description,
+            attributes: item.attributes,
+            animationUrl: item.animationUrl,
+            externalUrl: item.externalUrl,
+            backgroundColor: item.backgroundColor,
+            properties: item.properties,
+          } as NFTMetadata,
+          edition: item.edition as number | undefined,
+          recipient: item.recipient as string | undefined,
+        }));
+
+        try {
+          const result = await sphere.nft.batchMintNFT(items, batchCollectionId);
+
+          console.log('Batch mint complete:');
+          console.log(`  Success: ${result.successCount}/${items.length}`);
+          console.log(`  Failed:  ${result.failureCount}/${items.length}`);
+
+          if (result.results.length > 0) {
+            console.log('\nMinted:');
+            for (let i = 0; i < result.results.length; i++) {
+              const r = result.results[i];
+              console.log(`  [${i}] ${r.tokenId.slice(0, 12)}...  ${r.nft.name}   edition ${r.nft.edition}   ${r.confirmed ? 'confirmed' : 'pending'}`);
+            }
+          }
+
+          if (result.errors && result.errors.length > 0) {
+            console.log('\nErrors:');
+            for (const e of result.errors) {
+              console.log(`  [${e.index}] ${e.error}`);
+            }
+          }
+        } catch (err) {
+          console.error(`Batch mint failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-send': {
+        const tokenIdArg = args[1];
+        const recipientArg = args[2];
+        if (!tokenIdArg || !recipientArg) {
+          console.error('Usage: nft-send <tokenId or prefix> <recipient> [--memo <text>]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        const allNFTs = sphere.nft.getNFTs();
+        const tokenId = resolveNFTId(allNFTs, tokenIdArg);
+
+        const memoIdx = args.indexOf('--memo');
+        const memo = memoIdx !== -1 ? args[memoIdx + 1] : undefined;
+
+        try {
+          const result = await sphere.nft.sendNFT(tokenId, recipientArg, memo);
+          console.log('NFT sent:');
+          console.log(`  Token ID:   ${tokenId.slice(0, 16)}...`);
+          console.log(`  Recipient:  ${recipientArg}`);
+          console.log(`  Status:     ${result.status}`);
+          if (memo) console.log(`  Memo:       ${memo}`);
+        } catch (err) {
+          console.error(`Failed to send NFT: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-list': {
+        const jsonFlagList = args.includes('--json');
+        const statusIdx = args.indexOf('--status');
+        const collFilterIdx = args.indexOf('--collection');
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const nftOptions: GetNFTsOptions = {};
+
+        if (statusIdx !== -1 && args[statusIdx + 1]) {
+          const statusVal = args[statusIdx + 1];
+          if (statusVal !== 'confirmed' && statusVal !== 'pending') {
+            console.error('--status must be "confirmed" or "pending"');
+            process.exit(1);
+          }
+          nftOptions.status = statusVal;
+        }
+
+        if (collFilterIdx !== -1 && args[collFilterIdx + 1]) {
+          const allColls = sphere.nft.getCollections();
+          const collId = resolveCollectionId(allColls, args[collFilterIdx + 1]);
+          nftOptions.collectionId = collId;
+        }
+
+        const nfts = sphere.nft.getNFTs(nftOptions);
+
+        if (nfts.length === 0) {
+          console.log('No NFTs found.');
+        } else if (jsonFlagList) {
+          console.log(JSON.stringify(nfts, null, 2));
+        } else {
+          console.log(`NFTs (${nfts.length}):\n`);
+          const header = [
+            'ID'.padEnd(18),
+            'Name'.padEnd(22),
+            'Collection'.padEnd(18),
+            'Edition'.padEnd(12),
+            'Status',
+          ].join('');
+          console.log(header);
+          for (const nft of nfts) {
+            // Resolve collection name
+            let collName = '(standalone)';
+            if (nft.collectionId) {
+              const coll = sphere.nft.getCollection(nft.collectionId);
+              collName = coll ? coll.name.slice(0, 16) : nft.collectionId.slice(0, 12) + '...';
+            }
+            const editionStr = nft.edition > 0 ? String(nft.edition) : '-';
+            const row = [
+              (nft.tokenId.slice(0, 12) + '...').padEnd(18),
+              nft.name.slice(0, 20).padEnd(22),
+              collName.slice(0, 16).padEnd(18),
+              editionStr.padEnd(12),
+              nft.status,
+            ].join('');
+            console.log(row);
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-info': {
+        const nftIdArg = args[1];
+        if (!nftIdArg) {
+          console.error('Usage: nft-info <tokenId or prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const allNFTs = sphere.nft.getNFTs();
+        const tokenId = resolveNFTId(allNFTs, nftIdArg);
+
+        const detail = await sphere.nft.getNFT(tokenId);
+        if (!detail) {
+          console.error(`NFT not found: ${tokenId}`);
+          process.exit(1);
+        }
+
+        // Build output object without the raw token data
+        const output: Record<string, unknown> = {
+          tokenId: detail.tokenId,
+          name: detail.name,
+          collectionId: detail.collectionId,
+          edition: detail.edition,
+          totalEditions: detail.totalEditions,
+          status: detail.status,
+          mintedAt: detail.mintedAt,
+          minter: detail.minter,
+          metadata: detail.metadata,
+        };
+        if (detail.collection) {
+          output.collection = {
+            name: detail.collection.name,
+            creator: detail.collection.creator,
+            maxSupply: detail.collection.maxSupply,
+            transferable: detail.collection.transferable,
+          };
+        }
+        console.log(JSON.stringify(output, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-history': {
+        const histIdArg = args[1];
+        if (!histIdArg) {
+          console.error('Usage: nft-history <tokenId or prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const allNFTs = sphere.nft.getNFTs();
+        const tokenId = resolveNFTId(allNFTs, histIdArg);
+
+        const history = await sphere.nft.getNFTHistory(tokenId);
+        if (history.length === 0) {
+          console.log(`No history found for NFT ${tokenId}.`);
+        } else {
+          // Get NFT name for display
+          const nftRef = allNFTs.find(n => n.tokenId === tokenId);
+          const nftName = nftRef ? nftRef.name : '';
+          console.log(`History for ${tokenId.slice(0, 12)}... "${nftName}" (${history.length} events):\n`);
+
+          const header = [
+            'Time'.padEnd(24),
+            'Type'.padEnd(18),
+            'Counterparty'.padEnd(22),
+            'Confirmed',
+          ].join('');
+          console.log(`  ${header}`);
+          for (const entry of history) {
+            const time = new Date(entry.timestamp).toISOString().replace('T', ' ').slice(0, 19);
+            const counterparty = entry.counterpartyNametag
+              ? `@${entry.counterpartyNametag}`
+              : (entry.counterparty?.slice(0, 18) + '...' || '-');
+            const row = [
+              time.padEnd(24),
+              entry.type.padEnd(18),
+              counterparty.padEnd(22),
+              entry.confirmed ? 'yes' : 'no',
+            ].join('');
+            console.log(`  ${row}`);
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-export': {
+        const exportIdArg = args[1];
+        if (!exportIdArg) {
+          console.error('Usage: nft-export <tokenId or prefix> [--output <file>]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const allNFTs = sphere.nft.getNFTs();
+        const tokenId = resolveNFTId(allNFTs, exportIdArg);
+
+        const txfToken = await sphere.nft.exportNFT(tokenId);
+        if (!txfToken) {
+          console.error('Failed to export NFT: token not found or not an NFT type');
+          process.exit(1);
+        }
+
+        const jsonStr = JSON.stringify(txfToken, null, 2);
+        const outputIdx = args.indexOf('--output');
+        if (outputIdx !== -1 && args[outputIdx + 1]) {
+          const outputPath = path.resolve(args[outputIdx + 1]);
+          try {
+            fs.writeFileSync(outputPath, jsonStr, 'utf8');
+            console.error(`Exported NFT ${tokenId.slice(0, 12)}... to ${outputPath}`);
+          } catch (err) {
+            console.error(`Failed to write to "${args[outputIdx + 1]}": ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        } else {
+          console.log(jsonStr);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-import': {
+        const importFile = args[1];
+        if (!importFile) {
+          console.error('Usage: nft-import <json-file>');
+          process.exit(1);
+        }
+
+        // Read and parse JSON file
+        let txfData: unknown;
+        try {
+          const resolvedPath = path.resolve(importFile);
+          const raw = fs.readFileSync(resolvedPath, 'utf8');
+          txfData = JSON.parse(raw);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('ENOENT')) {
+            console.error(`File not found: "${importFile}"`);
+          } else if (msg.includes('EACCES') || msg.includes('EPERM')) {
+            console.error(`Access denied: "${importFile}"`);
+          } else if (msg.includes('Unexpected token') || msg.includes('JSON')) {
+            console.error(`Invalid JSON in file "${importFile}"`);
+          } else {
+            console.error(`Failed to read file "${importFile}"`);
+          }
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const nftRef = await sphere.nft.importNFT(txfData as any);
+          console.log('NFT imported:');
+          console.log(`  Token ID:      ${nftRef.tokenId.slice(0, 16)}...`);
+          console.log(`  Name:          ${nftRef.name}`);
+          if (nftRef.collectionId) {
+            const coll = sphere.nft.getCollection(nftRef.collectionId);
+            const collName = coll ? coll.name : nftRef.collectionId.slice(0, 12) + '...';
+            console.log(`  Collection:    ${nftRef.collectionId.slice(0, 12)}... (${collName})`);
+          }
+          console.log(`  Edition:       ${nftRef.edition}`);
+          console.log(`  Status:        ${nftRef.status}`);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('not an NFT') || msg.includes('wrong tokenType')) {
+            console.error('Token is not an NFT (wrong tokenType)');
+          } else if (msg.includes('parse') || msg.includes('PARSE')) {
+            console.error('Failed to parse NFT token data');
+          } else {
+            console.error(`Failed to import NFT: ${msg}`);
+          }
+          process.exit(1);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'nft-verify': {
+        const verifyIdArg = args[1];
+        if (!verifyIdArg) {
+          console.error('Usage: nft-verify <tokenId or prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.nft) {
+          console.error('NFT module not enabled. Initialize with NFT support.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const allNFTs = sphere.nft.getNFTs();
+        const tokenId = resolveNFTId(allNFTs, verifyIdArg);
+
+        try {
+          const result = await sphere.nft.verifyNFT(tokenId);
+
+          console.log('NFT Verification:');
+          console.log(`  Token ID:    ${tokenId.slice(0, 16)}...`);
+          console.log(`  Valid:       ${result.valid}`);
+          console.log(`  Spent:       ${result.spent}`);
+          if (result.stateHash) {
+            console.log(`  State Hash:  ${result.stateHash}`);
+          }
+          if (result.errors && result.errors.length > 0) {
+            console.log('  Errors:');
+            for (const e of result.errors) {
+              console.log(`    - ${e}`);
+            }
+          }
+
+          if (!result.valid || result.spent) {
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error(`Verification failed: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        await closeSphere();
+        break;
+      }
+
       case 'daemon': {
         const sub = args[1] || 'start';
         const { runDaemon, stopDaemon, statusDaemon } = await import('./daemon.js');
@@ -4770,6 +5733,18 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'swap-deposit', description: 'Deposit into a swap' },
     { name: 'swap-reject', description: 'Reject a swap proposal' },
     { name: 'swap-cancel', description: 'Cancel a swap' },
+    { name: 'nft-collection-create', description: 'Create a new NFT collection', flags: ['--max-supply', '--image', '--royalty', '--non-transferable', '--deterministic', '--external-url'] },
+    { name: 'nft-collection-list', description: 'List collections', flags: ['--mine', '--json'] },
+    { name: 'nft-collection-info', description: 'Show collection details' },
+    { name: 'nft-mint', description: 'Mint a single NFT', flags: ['--collection', '--description', '--edition', '--total-editions', '--recipient', '--attribute', '--animation-url', '--external-url', '--background-color'] },
+    { name: 'nft-batch-mint', description: 'Batch mint NFTs from JSON', flags: ['--collection'] },
+    { name: 'nft-send', description: 'Send an NFT', flags: ['--memo'] },
+    { name: 'nft-list', description: 'List all NFTs', flags: ['--collection', '--status', '--json'] },
+    { name: 'nft-info', description: 'Show NFT details' },
+    { name: 'nft-history', description: 'Show NFT transfer history' },
+    { name: 'nft-export', description: 'Export NFT as TXF JSON', flags: ['--output'] },
+    { name: 'nft-import', description: 'Import NFT from TXF JSON' },
+    { name: 'nft-verify', description: 'Verify NFT against aggregator' },
     { name: 'market-post', description: 'Post a market intent', flags: ['--type', '--category', '--price', '--currency', '--location', '--contact', '--expires'] },
     { name: 'market-search', description: 'Search market intents', flags: ['--type', '--category', '--min-price', '--max-price', '--limit'] },
     { name: 'market-my', description: 'List your intents' },
