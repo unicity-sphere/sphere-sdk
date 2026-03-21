@@ -5660,6 +5660,12 @@ export class PaymentsModule {
     const parsed = parseTxfStorageData(data);
     logger.debug('Payments', `loadFromStorageData: parsed ${parsed.tokens.length} tokens, ${parsed.tombstones.length} tombstones, errors=[${parsed.validationErrors.join('; ')}]`);
 
+    // Snapshot current in-memory tokens BEFORE clearing.
+    // Tokens that are in memory but not in the TXF data (e.g., recently added
+    // via addToken() but save() hasn't fully persisted to TXF yet) will be
+    // restored after the reload to prevent loss.
+    const memorySnapshot = new Map(this.tokens);
+
     // Load tombstones FIRST so we can filter tokens
     this.tombstones = parsed.tombstones;
     this.rebuildTombstoneKeySet();
@@ -5678,6 +5684,28 @@ export class PaymentsModule {
       }
 
       this.tokens.set(token.id, token);
+    }
+
+    // Restore tokens that were in memory but missing from TXF storage.
+    // These are tokens recently added via addToken() whose save() → TXF write
+    // may not have completed yet. Without this, the clear() + reload cycle
+    // would silently lose them, breaking concurrent swap deposit detection.
+    let restoredCount = 0;
+    for (const [id, memToken] of memorySnapshot) {
+      if (!this.tokens.has(id)) {
+        // Don't restore tombstoned tokens
+        const sdkTokenId = extractTokenIdFromSdkData(memToken.sdkData);
+        const stateHash = extractStateHashFromSdkData(memToken.sdkData);
+        if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) continue;
+        // Don't restore spent/invalid tokens
+        if (memToken.status === 'spent' || memToken.status === 'invalid') continue;
+
+        this.tokens.set(id, memToken);
+        restoredCount++;
+      }
+    }
+    if (restoredCount > 0) {
+      logger.debug('Payments', `loadFromStorageData: restored ${restoredCount} in-memory token(s) not yet in TXF`);
     }
 
     // Load other data
