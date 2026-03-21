@@ -2546,6 +2546,24 @@ export class AccountingModule {
         );
       }
 
+      // N2.2 step 7: Optional tokenType check
+      const requestedTokenType = asset.nft!.tokenType;
+      if (requestedTokenType !== undefined) {
+        try {
+          const txf = JSON.parse(nftToken.sdkData ?? '{}');
+          const actualTokenType = txf.genesis?.data?.tokenType;
+          if (actualTokenType !== requestedTokenType) {
+            throw new SphereError(
+              `NFT tokenType mismatch: expected ${requestedTokenType}, got ${actualTokenType}`,
+              'INVOICE_NFT_MISMATCH',
+            );
+          }
+        } catch (e) {
+          if (e instanceof SphereError) throw e;
+          // sdkData parse failure — skip type check
+        }
+      }
+
       // N2.2 step 8: Build memo (wire code 'F')
       const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
 

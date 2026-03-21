@@ -824,7 +824,37 @@ export class NFTModule {
     validateNFTMetadata(metadata);
 
     // Step 5: Resolve recipient
-    const recipientAddress = recipient ?? deps.identity.directAddress;
+    // When minting to another party, resolve their identity via transport
+    let recipientPubkey: string | undefined;
+    let recipientDirectAddress: string;
+    if (recipient && recipient !== deps.identity.directAddress && recipient !== deps.identity.chainPubkey) {
+      // Resolve recipient via transport (supports @nametag, DIRECT://, chain pubkey, alpha1...)
+      if (deps.communications) {
+        const peerInfo = await (deps.communications as any).resolve?.(recipient);
+        if (peerInfo) {
+          recipientPubkey = peerInfo.chainPubkey;
+          recipientDirectAddress = peerInfo.directAddress;
+        } else {
+          // Fallback: if recipient looks like a chain pubkey (33-byte hex), use it directly
+          if (/^(02|03)[0-9a-f]{64}$/i.test(recipient)) {
+            recipientPubkey = recipient;
+            recipientDirectAddress = recipient; // will be resolved by the SDK
+          } else {
+            throw new SphereError(`Cannot resolve recipient: ${recipient}`, 'NFT_MINT_FAILED');
+          }
+        }
+      } else {
+        // No communications module — accept chain pubkey directly
+        if (/^(02|03)[0-9a-f]{64}$/i.test(recipient)) {
+          recipientPubkey = recipient;
+          recipientDirectAddress = recipient;
+        } else {
+          throw new SphereError(`Cannot resolve recipient without communications module: ${recipient}`, 'NFT_MINT_FAILED');
+        }
+      }
+    } else {
+      recipientDirectAddress = deps.identity.directAddress ?? '';
+    }
 
     // Step 6: Construct NFTTokenData
     const mintedAt = Date.now();
@@ -932,10 +962,14 @@ export class NFTModule {
       const signingService = await SigningService.createFromSecret(signingKeyBytes);
 
       // Build owner address using UnmaskedPredicateReference
+      // When minting to another party, use their public key for the predicate
+      const ownerPubKeyBytes = recipientPubkey
+        ? hexToBytes(recipientPubkey)
+        : signingService.publicKey;
       const addressRef = await UnmaskedPredicateReference.create(
         nftTokenType,
         signingService.algorithm,
-        signingService.publicKey,
+        ownerPubKeyBytes,
         HashAlgorithm.SHA256,
       );
       const ownerAddress = await addressRef.toAddress();
