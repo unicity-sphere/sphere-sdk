@@ -223,12 +223,9 @@ describe('NFTModule.collection', () => {
       await expect(
         module.createCollection({ name: 'a'.repeat(129), description: 'Valid description' }),
       ).rejects.toThrow(SphereError);
-
-      try {
-        await module.createCollection({ name: 'a'.repeat(129), description: 'Valid description' });
-      } catch (err) {
-        expect((err as SphereError).code).toBe('NFT_INVALID_METADATA');
-      }
+      await expect(
+        module.createCollection({ name: 'a'.repeat(129), description: 'Valid description' }),
+      ).rejects.toMatchObject({ code: 'NFT_INVALID_METADATA' });
     });
 
     it('should accept name at exactly 128 characters', async () => {
