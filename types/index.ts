@@ -446,7 +446,17 @@ export type SphereEventType =
   | 'swap:cancelled'
   | 'swap:failed'
   | 'swap:deposit_returned'
-  | 'swap:bounce_received';
+  | 'swap:bounce_received'
+  // NFT events
+  | 'nft:minted'
+  | 'nft:received'
+  | 'nft:transferred'
+  | 'nft:verified'
+  | 'nft:collection_created'
+  | 'nft:imported'
+  // Invoice NFT events (accounting module)
+  | 'invoice:nft_received'
+  | 'invoice:nft_returned';
 
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
@@ -595,6 +605,16 @@ export interface SphereEventMap {
   'swap:failed': { swapId: string; error: string };
   'swap:deposit_returned': { swapId: string; transfer: import('../modules/accounting/types').InvoiceTransferRef; returnReason: string };
   'swap:bounce_received': { swapId: string; reason: string; returnedAmount: string; returnedCurrency: string };
+  // NFT events
+  'nft:minted': { tokenId: string; collectionId: string | null; name: string; confirmed: boolean };
+  'nft:received': { tokenId: string; collectionId: string | null; name: string; senderPubkey: string; senderNametag?: string };
+  'nft:transferred': { tokenId: string; collectionId: string | null; recipientPubkey: string; recipientNametag?: string };
+  'nft:verified': { tokenId: string; valid: boolean; spent: boolean };
+  'nft:collection_created': { collectionId: string; name: string };
+  'nft:imported': { tokenId: string; collectionId: string | null; name: string };
+  // Invoice NFT events
+  'invoice:nft_received': { invoiceId: string; tokenId: string; address: string; targetIndex: number; assetIndex: number; confirmed: boolean; senderPubkey?: string; senderNametag?: string };
+  'invoice:nft_returned': { invoiceId: string; tokenId: string; recipient: string; transferResult: TransferResult };
 }
 
 export type SphereEventHandler<T extends SphereEventType> = (
