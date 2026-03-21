@@ -180,9 +180,9 @@ describe('NFTModule — Batch Minting', () => {
 
     const result = await mod.batchMintNFT(items, collectionId);
 
-    // Verify totals add up (parallel mints may have mock-induced failures)
-    expect(result.successCount + result.failureCount).toBe(3);
-    expect(result.successCount).toBeGreaterThanOrEqual(1);
+    // All 3 should succeed since mocks return success
+    expect(result.successCount).toBe(3);
+    expect(result.failureCount).toBe(0);
     expect(result.results).toHaveLength(result.successCount);
 
     // Verify each successful result has a valid tokenId and correct collectionId

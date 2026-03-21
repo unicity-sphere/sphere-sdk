@@ -201,11 +201,7 @@ describe('NFTModule.collection', () => {
         module.createCollection({ name: '', description: 'Valid description' }),
       ).rejects.toThrow(SphereError);
 
-      try {
-        await module.createCollection({ name: '', description: 'Valid description' });
-      } catch (err) {
-        expect((err as SphereError).code).toBe('NFT_INVALID_METADATA');
-      }
+      await expect(module.createCollection({ name: '', description: 'Valid description' })).rejects.toMatchObject({ code: 'NFT_INVALID_METADATA' });
     });
 
     it('should throw SphereError for whitespace-only name', async () => {
@@ -258,11 +254,7 @@ describe('NFTModule.collection', () => {
         module.createCollection({ name: 'Test', description: 'Desc', maxSupply: 0 }),
       ).rejects.toThrow(SphereError);
 
-      try {
-        await module.createCollection({ name: 'Test', description: 'Desc', maxSupply: 0 });
-      } catch (err) {
-        expect((err as SphereError).code).toBe('NFT_INVALID_METADATA');
-      }
+      await expect(module.createCollection({ name: 'Test', description: 'Desc', maxSupply: 0 })).rejects.toMatchObject({ code: 'NFT_INVALID_METADATA' });
     });
   });
 
@@ -277,11 +269,7 @@ describe('NFTModule.collection', () => {
         module.createCollection({ name: 'Test', description: 'Desc', maxSupply: 1_000_001 }),
       ).rejects.toThrow(SphereError);
 
-      try {
-        await module.createCollection({ name: 'Test', description: 'Desc', maxSupply: 1_000_001 });
-      } catch (err) {
-        expect((err as SphereError).code).toBe('NFT_INVALID_METADATA');
-      }
+      await expect(module.createCollection({ name: 'Test', description: 'Desc', maxSupply: 1_000_001 })).rejects.toMatchObject({ code: 'NFT_INVALID_METADATA' });
     });
 
     it('should accept maxSupply at exactly 1,000,000', async () => {
@@ -312,15 +300,11 @@ describe('NFTModule.collection', () => {
         }),
       ).rejects.toThrow(SphereError);
 
-      try {
-        await module.createCollection({
+      await expect(module.createCollection({
           name: 'Test',
           description: 'Desc',
           royalty: { recipient: 'DIRECT://addr', basisPoints: 10001 },
-        });
-      } catch (err) {
-        expect((err as SphereError).code).toBe('NFT_INVALID_METADATA');
-      }
+        })).rejects.toMatchObject({ code: 'NFT_INVALID_METADATA' });
     });
   });
 
@@ -339,15 +323,11 @@ describe('NFTModule.collection', () => {
         }),
       ).rejects.toThrow(SphereError);
 
-      try {
-        await module.createCollection({
+      await expect(module.createCollection({
           name: 'Test',
           description: 'Desc',
           royalty: { recipient: 'DIRECT://addr', basisPoints: -1 },
-        });
-      } catch (err) {
-        expect((err as SphereError).code).toBe('NFT_INVALID_METADATA');
-      }
+        })).rejects.toMatchObject({ code: 'NFT_INVALID_METADATA' });
     });
   });
 

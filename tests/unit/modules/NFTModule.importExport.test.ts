@@ -87,11 +87,7 @@ describe('NFTModule.importNFT', () => {
     const txf = createFullFungibleTxfToken();
 
     await expect(module.importNFT(txf)).rejects.toThrow(SphereError);
-    try {
-      await module.importNFT(txf);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('NFT_WRONG_TOKEN_TYPE');
-    }
+    await expect(module.importNFT(txf)).rejects.toMatchObject({ code: 'NFT_WRONG_TOKEN_TYPE' });
   });
 
   // UT-IMP-003: importNFT — invalid tokenData (parse error)
@@ -103,11 +99,7 @@ describe('NFTModule.importNFT', () => {
     txf.genesis.data.tokenData = 'not-valid-json{{{';
 
     await expect(module.importNFT(txf)).rejects.toThrow(SphereError);
-    try {
-      await module.importNFT(txf);
-    } catch (err) {
-      expect((err as SphereError).code).toBe('NFT_PARSE_ERROR');
-    }
+    await expect(module.importNFT(txf)).rejects.toMatchObject({ code: 'NFT_PARSE_ERROR' });
   });
 
   // UT-IMP-004: importNFT — idempotent (duplicate token ID)
