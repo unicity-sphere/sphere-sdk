@@ -113,6 +113,11 @@ export const STORAGE_KEYS_ADDRESS = {
   SWAP_RECORD_PREFIX: 'swap:',
   /** Lightweight index array for listing */
   SWAP_INDEX: 'swap_index',
+  // NFT storage keys
+  /** NFT collection definitions registry (JSON: NFTCollectionsStorage) */
+  NFT_COLLECTIONS: 'nft_collections',
+  /** NFT mint counter prefix — actual key is `nft_mint_counter_{collectionId}` */
+  NFT_MINT_COUNTER: 'nft_mint_counter',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */

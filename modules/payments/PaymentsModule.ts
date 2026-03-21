@@ -1114,6 +1114,52 @@ export class PaymentsModule {
         // W23 fix: Reuse the reservation + plan from instantSplitSend to avoid
         // the cancel-then-reacquire race window.
         splitPlan = internal.existingSplitPlan;
+      } else if (request._tokenIds && request._tokenIds.length > 0) {
+        // ── NFT / explicit token selection path ──────────────────────────────
+        // When _tokenIds is set, select tokens by exact ID instead of
+        // coinId-based pool selection. No splitting, no spend queue.
+        const selectedTokens: TokenWithAmount[] = [];
+        for (const tid of request._tokenIds) {
+          const token = this.tokens.get(tid);
+          if (!token) {
+            throw new SphereError(
+              `Token not found: ${tid}`,
+              'SEND_INSUFFICIENT_BALANCE',
+            );
+          }
+          if (token.status === 'transferring') {
+            throw new SphereError(
+              `Token already in transfer: ${tid}`,
+              'SEND_INSUFFICIENT_BALANCE',
+            );
+          }
+          // Parse SDK token from stored TXF data
+          const txfData = token.sdkData ? JSON.parse(token.sdkData) : null;
+          if (!txfData) {
+            throw new SphereError(
+              `Token ${tid} has no SDK data`,
+              'SEND_INSUFFICIENT_BALANCE',
+            );
+          }
+          const { Token: SdkToken } = await import(
+            '@unicitylabs/state-transition-sdk/lib/token/Token.js'
+          );
+          const sdkToken = await SdkToken.fromJSON(txfData);
+          selectedTokens.push({
+            sdkToken,
+            uiToken: token,
+            amount: BigInt(token.amount || '1'),
+          });
+        }
+        splitPlan = {
+          tokensToTransferDirectly: selectedTokens,
+          tokenToSplit: null,
+          requiresSplit: false,
+          splitAmount: null,
+          remainderAmount: null,
+          totalTransferAmount: selectedTokens.reduce((sum, t) => sum + t.amount, 0n),
+          coinId: request.coinId,
+        };
       } else {
         // ── Coin symbol → coinId resolution ────────────────────────────────────
         // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
@@ -1196,7 +1242,7 @@ export class PaymentsModule {
         // =================================================================
 
         // Handle split if required
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit && !request._nftTransfer) {
           logger.debug('Payments', 'Executing conservative split...');
           const splitExecutor = new TokenSplitExecutor({
             stateTransitionClient: stClient,
@@ -1316,7 +1362,7 @@ export class PaymentsModule {
 
         // 1. Build split bundle (if needed) — does NOT send
         let builtSplit: import('../../types/instant-split').BuildSplitBundleResult | null = null;
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit && !request._nftTransfer) {
           logger.debug('Payments', 'Building instant split bundle...');
           const executor = new InstantSplitExecutor({
             stateTransitionClient: stClient,
@@ -1453,7 +1499,7 @@ export class PaymentsModule {
         this.reservationLedger.commit(result.id);
 
         // 7. Track and remove tokens (removeToken archives + tombstones + saves)
-        if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
+        if (splitPlan.requiresSplit && splitPlan.tokenToSplit && !request._nftTransfer) {
           await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,

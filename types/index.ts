@@ -133,6 +133,10 @@ export interface TransferRequest {
   readonly invoiceRefundAddress?: string;
   /** Invoice contact info — embedded in on-chain message for receipt/notice delivery */
   readonly invoiceContact?: { address: string; url?: string };
+  /** @internal NFT transfer flag — skip token splitting logic. Must NOT be accepted from Connect Protocol. */
+  readonly _nftTransfer?: boolean;
+  /** @internal Explicit token IDs to use instead of coinId/amount selection. Must NOT be accepted from Connect Protocol. */
+  readonly _tokenIds?: string[];
 }
 
 /**

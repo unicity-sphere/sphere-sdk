@@ -103,7 +103,21 @@ export type SphereErrorCode =
   | 'SWAP_LIMIT_EXCEEDED'
   | 'SWAP_ALREADY_INITIALIZED'
   | 'SWAP_MODULE_DESTROYED'
-  | 'SWAP_NOT_INITIALIZED';
+  | 'SWAP_NOT_INITIALIZED'
+  // NFT module error codes
+  | 'NFT_COLLECTION_NOT_FOUND'
+  | 'NFT_NOT_FOUND'
+  | 'NFT_MAX_SUPPLY_EXCEEDED'
+  | 'NFT_NOT_TRANSFERABLE'
+  | 'NFT_INVALID_METADATA'
+  | 'NFT_MINT_FAILED'
+  | 'NFT_PARSE_ERROR'
+  | 'NFT_ALREADY_EXISTS'
+  | 'NFT_WRONG_TOKEN_TYPE'
+  // Invoice NFT error codes (accounting module)
+  | 'INVOICE_NFT_NOT_FOUND'
+  | 'INVOICE_NFT_ALREADY_SENT'
+  | 'INVOICE_NFT_MISMATCH';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
