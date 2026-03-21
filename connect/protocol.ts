@@ -35,6 +35,10 @@ export const RPC_METHODS = {
   MARK_AS_READ: 'sphere_markAsRead',
   GET_INVOICES: 'sphere_getInvoices',
   GET_INVOICE_STATUS: 'sphere_getInvoiceStatus',
+  GET_NFTS: 'sphere_getNFTs',
+  GET_NFT: 'sphere_getNFT',
+  GET_COLLECTIONS: 'sphere_getCollections',
+  GET_COLLECTION_NFTS: 'sphere_getCollectionNFTs',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -59,6 +63,8 @@ export const INTENT_ACTIONS = {
   SEND_INVOICE_RECEIPTS: 'send_invoice_receipts',
   SEND_CANCELLATION_NOTICES: 'send_cancellation_notices',
   SET_AUTO_RETURN: 'set_auto_return',
+  NFT_SEND: 'nft_send',
+  NFT_MINT: 'nft_mint',
 } as const;
 
 export type IntentAction = (typeof INTENT_ACTIONS)[keyof typeof INTENT_ACTIONS];

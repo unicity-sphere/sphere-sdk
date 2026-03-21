@@ -71,6 +71,7 @@ import { AccountingModule, createAccountingModule } from '../modules/accounting'
 import type { AccountingModuleConfig } from '../modules/accounting';
 import { SwapModule, createSwapModule } from '../modules/swap/index.js';
 import type { SwapModuleConfig } from '../modules/swap/types.js';
+import { NFTModule, createNFTModule } from '../modules/nft/index.js';
 import {
   STORAGE_KEYS_GLOBAL,
   getAddressId,
@@ -198,6 +199,8 @@ export interface SphereCreateOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** NFT module. `true` to enable, `false`/`undefined` to disable. */
+  nft?: boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -241,6 +244,8 @@ export interface SphereLoadOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** NFT module. `true` to enable, `false`/`undefined` to disable. */
+  nft?: boolean;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
@@ -292,6 +297,8 @@ export interface SphereImportOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** NFT module. `true` to enable, `false`/`undefined` to disable. */
+  nft?: boolean;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
@@ -358,6 +365,8 @@ export interface SphereInitOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** NFT module. `true` to enable, `false`/`undefined` to disable. */
+  nft?: boolean;
   /** Optional password to encrypt/decrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -489,6 +498,7 @@ export class Sphere {
   private _market: MarketModule | null = null;
   private _accounting: AccountingModule | null = null;
   private _swap: SwapModule | null = null;
+  private _nft: NFTModule | null = null;
 
   // Per-address module instances (Phase 2: independent parallel operation)
   private _addressModules: Map<number, AddressModuleSet> = new Map();
@@ -524,6 +534,7 @@ export class Sphere {
     marketConfig?: MarketModuleConfig,
     accountingConfig?: AccountingModuleConfig,
     swapConfig?: SwapModuleConfig,
+    nftEnabled?: boolean,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -546,6 +557,7 @@ export class Sphere {
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
     this._accounting = accountingConfig ? createAccountingModule(accountingConfig) : null;
     this._swap = swapConfig ? createSwapModule(swapConfig) : null;
+    this._nft = nftEnabled ? createNFTModule() : null;
   }
 
   // ===========================================================================
@@ -640,6 +652,7 @@ export class Sphere {
         market,
         accounting,
         swap,
+        nft: options.nft,
         password: options.password,
         discoverAddresses: options.discoverAddresses,
         onProgress: options.onProgress,
@@ -682,6 +695,7 @@ export class Sphere {
       market,
       accounting,
       swap,
+      nft: options.nft,
       password: options.password,
       discoverAddresses: options.discoverAddresses,
       onProgress: options.onProgress,
@@ -819,6 +833,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.nft === true,
     );
     sphere._password = options.password ?? null;
 
@@ -916,6 +931,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.nft === true,
     );
     sphere._password = options.password ?? null;
 
@@ -1030,6 +1046,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.nft === true,
     );
     sphere._password = options.password ?? null;
 
@@ -1271,6 +1288,11 @@ export class Sphere {
   /** Swap module (atomic token swaps). Null if not configured. */
   get swap(): SwapModule | null {
     return this._swap;
+  }
+
+  /** NFT module (minting, transfer, collection management). Null if not configured. */
+  get nft(): NFTModule | null {
+    return this._nft;
   }
 
   // ===========================================================================
@@ -2426,6 +2448,10 @@ export class Sphere {
     identity: FullIdentity,
     tokenStorageProviders: Map<string, TokenStorageProvider<TxfStorageDataBase>>,
   ): Promise<AddressModuleSet> {
+    // Destroy NFT before swap — NFT depends on payments (read-only).
+    if (this._nft) {
+      await this._nft.destroy();
+    }
     // Destroy swap before accounting — swap depends on accounting.
     if (this._swap) {
       await this._swap.destroy();
@@ -2569,6 +2595,41 @@ export class Sphere {
     for (const r of results) {
       if (r.status === 'rejected') {
         logger.warn('Sphere', 'Module load failed:', r.reason);
+      }
+    }
+
+    // NFT module loads after payments — it calls getTokens() during load
+    if (this._nft) {
+      const nftTokenStorage = tokenStorageProviders.values().next().value;
+      if (nftTokenStorage) {
+        let trustBase: unknown = null;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
+        } catch {
+          logger.warn('Sphere', 'Oracle does not support getTrustBase — NFT minting will be unavailable');
+        }
+        const addressId = getAddressId(identity.directAddress!);
+        try {
+          await this._nft.load({
+            payments,
+            storage: this._storage,
+            tokenStorage: nftTokenStorage,
+            oracle: this._oracle,
+            trustBase,
+            identity,
+            addressId,
+            addressIndex: index,
+            communications,
+            emitEvent,
+            on: this.on.bind(this),
+          });
+        } catch (err) {
+          logger.warn('Sphere', 'NFT module load failed:', err);
+        }
+      } else {
+        logger.warn('Sphere', 'NFT module enabled but no token storage available — disabling');
+        this._nft = null;
       }
     }
 
@@ -3811,6 +3872,14 @@ export class Sphere {
       logger.warn('Sphere', 'Swap module destroy failed:', err);
     }
 
+    // Destroy NFT module — lightweight, no deps on accounting
+    try {
+      await this._nft?.destroy();
+    } catch (err) {
+      logger.warn('Sphere', 'NFT module destroy failed:', err);
+    }
+    this._nft = null;
+
     // Destroy accounting — it may have in-flight operations using payments.send()
     // Draining accounting gates before destroying payments prevents spurious pending entries
     try {
@@ -4381,6 +4450,41 @@ export class Sphere {
     for (const r of results) {
       if (r.status === 'rejected') {
         logger.warn('Sphere', 'Module load failed:', r.reason);
+      }
+    }
+
+    // NFT module loads after payments — it calls getTokens() during load
+    if (this._nft) {
+      const nftTokenStorage = this._tokenStorageProviders.values().next().value;
+      if (nftTokenStorage) {
+        let trustBase: unknown = null;
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          trustBase = (this._oracle as any).getTrustBase?.() ?? null;
+        } catch {
+          logger.warn('Sphere', 'Oracle does not support getTrustBase — NFT minting will be unavailable');
+        }
+        const addressId = getAddressId(this._identity!.directAddress!);
+        try {
+          await this._nft.load({
+            payments: this._payments,
+            storage: this._storage,
+            tokenStorage: nftTokenStorage,
+            oracle: this._oracle,
+            trustBase,
+            identity: this._identity!,
+            addressId,
+            addressIndex: this._currentAddressIndex,
+            communications: this._communications,
+            emitEvent,
+            on: this.on.bind(this),
+          });
+        } catch (err) {
+          logger.warn('Sphere', 'NFT module load failed:', err);
+        }
+      } else {
+        logger.warn('Sphere', 'NFT module enabled but no token storage available — disabling');
+        this._nft = null;
       }
     }
 

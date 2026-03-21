@@ -65,6 +65,12 @@ interface SphereInstance {
     getInvoices(options?: unknown): unknown[];
     getInvoiceStatus(invoiceId: string): unknown;
   } | null;
+  readonly nft?: {
+    getNFTs(options?: unknown): unknown[];
+    getNFT(tokenId: string): Promise<unknown>;
+    getCollections(options?: unknown): unknown[];
+    getCollectionNFTs(collectionId: string): unknown[];
+  } | null;
 }
 
 /** Minimal DM type to avoid circular imports with Sphere core types. */
@@ -363,10 +369,14 @@ export class ConnectHost {
       return;
     }
 
+    // Strip internal NFT flags from dApp intent params — these are set internally
+    // by the wallet and must never be controllable by an external dApp.
+    const { _nftTransfer: _nft, _tokenIds: _tids, ...safeParams } = msg.params;
+
     // Check auto-approve before delegating to wallet UI
     const autoHandler = this.autoApprovedIntents.get(msg.action);
     if (autoHandler) {
-      const autoResponse = await autoHandler(msg.action, msg.params, this.session);
+      const autoResponse = await autoHandler(msg.action, safeParams, this.session);
       if (autoResponse.error) {
         this.sendIntentError(msg.id, autoResponse.error.code, autoResponse.error.message);
       } else {
@@ -376,7 +386,7 @@ export class ConnectHost {
     }
 
     // Delegate to wallet app
-    const response = await this.config.onIntent(msg.action, msg.params, this.session);
+    const response = await this.config.onIntent(msg.action, safeParams, this.session);
 
     if (response.error) {
       this.sendIntentError(msg.id, response.error.code, response.error.message);
@@ -536,6 +546,32 @@ export class ConnectHost {
           throw new SphereError('Missing required parameter: invoiceId', 'VALIDATION_ERROR');
         }
         return this.sphere.accounting.getInvoiceStatus(params.invoiceId as string);
+      }
+
+      case RPC_METHODS.GET_NFTS: {
+        if (!this.sphere.nft) throw new SphereError('NFT module not available', 'MODULE_NOT_AVAILABLE');
+        return this.sphere.nft.getNFTs(params);
+      }
+
+      case RPC_METHODS.GET_NFT: {
+        if (!this.sphere.nft) throw new SphereError('NFT module not available', 'MODULE_NOT_AVAILABLE');
+        if (!params.tokenId || typeof params.tokenId !== 'string') {
+          throw new SphereError('Missing required parameter: tokenId', 'VALIDATION_ERROR');
+        }
+        return this.sphere.nft.getNFT(params.tokenId as string);
+      }
+
+      case RPC_METHODS.GET_COLLECTIONS: {
+        if (!this.sphere.nft) throw new SphereError('NFT module not available', 'MODULE_NOT_AVAILABLE');
+        return this.sphere.nft.getCollections(params);
+      }
+
+      case RPC_METHODS.GET_COLLECTION_NFTS: {
+        if (!this.sphere.nft) throw new SphereError('NFT module not available', 'MODULE_NOT_AVAILABLE');
+        if (!params.collectionId || typeof params.collectionId !== 'string') {
+          throw new SphereError('Missing required parameter: collectionId', 'VALIDATION_ERROR');
+        }
+        return this.sphere.nft.getCollectionNFTs(params.collectionId as string);
       }
 
       default:

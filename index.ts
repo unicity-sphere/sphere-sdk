@@ -259,6 +259,10 @@ export type {
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
 export type { AddressType, ParsedAddress } from './core/address';
 
+// NFT module
+export { NFTModule, createNFTModule } from './modules/nft/index.js';
+export type { CollectionDefinition, NFTMetadata, NFTRef, NFTDetail, CollectionRef, MintNFTResult, BatchMintNFTResult, NFTTokenData, NFTModuleConfig } from './modules/nft/index.js';
+
 // Swap module
 export { SwapModule, createSwapModule } from './modules/swap/index';
 export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity, signSwapManifest, verifySwapSignature, createNametagBinding, verifyNametagBinding } from './modules/swap/manifest';
