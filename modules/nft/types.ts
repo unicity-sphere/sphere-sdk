@@ -389,6 +389,12 @@ export interface NFTModuleConfig {
   readonly tokenStorage: TokenStorageProvider;
   /** Oracle provider (aggregator, for minting and verification) */
   readonly oracle: OracleProvider;
+  /**
+   * Trust base for aggregator proof verification.
+   * Required by waitInclusionProof() and Token.mint() during NFT minting.
+   * Follows the same pattern as AccountingModuleDependencies.trustBase.
+   */
+  readonly trustBase: unknown;
   /** Current wallet identity */
   readonly identity: FullIdentity;
   /** Current address ID (DIRECT address identifier, e.g., "DIRECT_abc123_xyz789") */
@@ -399,6 +405,11 @@ export interface NFTModuleConfig {
   readonly communications?: CommunicationsModule;
   /** Event emitter (from Sphere) */
   readonly emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /**
+   * Sphere event subscription function. Used to subscribe to transfer:incoming
+   * and transfer:confirmed events from PaymentsModule. Returns unsubscribe function.
+   */
+  readonly on: <T extends SphereEventType>(type: T, handler: (data: SphereEventMap[T]) => void) => () => void;
   /** Optional logger for debug output */
   readonly logger?: (...args: unknown[]) => void;
 }

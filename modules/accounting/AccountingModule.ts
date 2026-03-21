@@ -12,7 +12,7 @@
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
-import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
+import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, NFT_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
   TransferRequest,
@@ -25,6 +25,8 @@ import type {
   AccountingModuleConfig,
   AccountingModuleDependencies,
   InvoiceTerms,
+  InvoiceTarget,
+  InvoiceRequestedAsset,
   InvoiceRef,
   InvoiceStatus,
   CreateInvoiceRequest,
@@ -830,6 +832,9 @@ export class AccountingModule {
 
     // No duplicate target addresses and per-target validation
     const seenAddresses = new Set<string>();
+    // Cross-target NFT dedup: a given tokenId can appear in at most one asset
+    // line across ALL targets (ACCOUNTING-SPEC-NFT N3.4).
+    const seenNftIds = new Set<string>();
     for (const target of request.targets) {
       // Each target address starts with 'DIRECT://'
       if (!target.address.startsWith('DIRECT://')) {
@@ -856,7 +861,6 @@ export class AccountingModule {
 
       // Per-asset validation
       const seenCoinIds = new Set<string>();
-      const seenNftIds = new Set<string>();
 
       for (const asset of target.assets) {
         // Each asset has exactly one of coin/nft
@@ -2326,10 +2330,15 @@ export class AccountingModule {
       }
     }
 
+    // ── NFT payment path (ACCOUNTING-SPEC-NFT N2) ──
+    if (asset.nft) {
+      return this._payInvoiceNFT(invoiceId, terms, params, target, asset, assetIndex);
+    }
+
     // Asset must have a coin entry to determine coinId
     if (!asset.coin) {
       throw new SphereError(
-        `Asset at index ${assetIndex} has no coin entry`,
+        `Asset at index ${assetIndex} has no valid coin or nft entry`,
         'INVOICE_INVALID_ASSET_INDEX',
       );
     }
@@ -2441,6 +2450,155 @@ export class AccountingModule {
           ledger.set(entryKey, forwardRef);
           this.dirtyLedgerEntries.add(invoiceId);
           // Invalidate balance cache for this invoice
+          this.balanceCache.delete(invoiceId);
+        }
+
+        return result;
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    });
+  }
+
+  /**
+   * NFT payment path for payInvoice() — ACCOUNTING-SPEC-NFT N2.
+   *
+   * Sends the exact NFT token requested by the invoice asset line.
+   * Amount is always 1 (atomic). Token selection is by tokenId, not coinId.
+   *
+   * @throws {SphereError} `INVOICE_INVALID_AMOUNT` — amount is not undefined or "1".
+   * @throws {SphereError} `INVOICE_TERMINATED` — invoice is CLOSED or CANCELLED.
+   * @throws {SphereError} `INVOICE_NFT_ALREADY_SENT` — NFT already sent for this invoice.
+   * @throws {SphereError} `INVOICE_NFT_NOT_FOUND` — NFT token not found in wallet.
+   */
+  private async _payInvoiceNFT(
+    invoiceId: string,
+    terms: InvoiceTerms,
+    params: PayInvoiceParams,
+    target: InvoiceTarget,
+    asset: InvoiceRequestedAsset,
+    assetIndex: number,
+  ): Promise<TransferResult> {
+    const deps = this.deps!;
+    const requestedTokenId = asset.nft!.tokenId;
+
+    // N2.2 step 2: Validate amount (must be undefined or "1")
+    if (params.amount !== undefined && params.amount !== '1') {
+      throw new SphereError(
+        'NFT payments do not accept a custom amount',
+        'INVOICE_INVALID_AMOUNT',
+      );
+    }
+
+    // §4.7: Auto-populate contact from identity.directAddress when not explicitly provided.
+    if (!deps.identity.directAddress) {
+      throw new SphereError('directAddress required for invoice payments', 'NOT_INITIALIZED');
+    }
+    const effectiveContact: { address: string; url?: string } = params.contact ?? {
+      address: deps.identity.directAddress,
+    };
+
+    // N2.2 steps 3–11: Acquire gate for terminal check, dedup, and send.
+    return this.withInvoiceGate(invoiceId, async () => {
+      this.ensureNotDestroyed();
+
+      // N2.2 step 4: Terminal state check
+      if (this.closedInvoices.has(invoiceId) || this.cancelledInvoices.has(invoiceId)) {
+        throw new SphereError(
+          `Invoice is already terminated (closed or cancelled): ${invoiceId}`,
+          'INVOICE_TERMINATED',
+        );
+      }
+
+      // N2.2 step 5: Already-sent check
+      const ledger = this.invoiceLedger.get(invoiceId);
+      if (ledger) {
+        for (const entry of ledger.values()) {
+          if (
+            entry.direction === 'outbound' &&
+            entry.paymentDirection === 'forward' &&
+            entry.coinId === requestedTokenId
+          ) {
+            throw new SphereError(
+              `NFT ${requestedTokenId} already sent for this invoice`,
+              'INVOICE_NFT_ALREADY_SENT',
+            );
+          }
+        }
+      }
+
+      // N2.2 step 6: Locate the NFT in the local wallet
+      const allTokens = deps.payments.getTokens();
+      const nftToken = allTokens.find((t) => {
+        if (t.id !== requestedTokenId) return false;
+        try {
+          const txf = JSON.parse(t.sdkData ?? '{}');
+          return txf.genesis?.data?.tokenType === NFT_TOKEN_TYPE_HEX;
+        } catch {
+          return false;
+        }
+      });
+      if (!nftToken) {
+        throw new SphereError(
+          `NFT ${requestedTokenId} not found in wallet`,
+          'INVOICE_NFT_NOT_FOUND',
+        );
+      }
+
+      // N2.2 step 8: Build memo (wire code 'F')
+      const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
+
+      if (this.config.debug) {
+        logger.debug(
+          LOG_TAG,
+          `payInvoice NFT(${invoiceId}) → target=${target.address} tokenId=${requestedTokenId}`,
+        );
+      }
+
+      // N2.2 step 10: Send via PaymentsModule with NFT flags
+      const sendPromise = deps.payments.send({
+        recipient: target.address,
+        amount: '1',
+        coinId: requestedTokenId,
+        memo,
+        _nftTransfer: true,
+        _tokenIds: [requestedTokenId],
+        invoiceRefundAddress: params.refundAddress,
+        invoiceContact: effectiveContact,
+      });
+
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new SphereError('payInvoice send() timed out after 60s', 'TIMEOUT')),
+          60_000,
+        );
+      });
+
+      try {
+        const result = await Promise.race([sendPromise, timeoutPromise]);
+
+        // Write provisional forward entry (mirrors coin path)
+        if (result.id) {
+          const forwardRef: InvoiceTransferRef = {
+            transferId: `provisional:${result.id}`,
+            direction: 'outbound',
+            paymentDirection: 'forward',
+            coinId: requestedTokenId,
+            amount: '1',
+            destinationAddress: target.address,
+            timestamp: Date.now(),
+            confirmed: false,
+            senderAddress: deps.identity?.directAddress ?? null,
+          };
+          const entryKey = `provisional:${result.id}::${requestedTokenId}`;
+          let ledgerMap = this.invoiceLedger.get(invoiceId);
+          if (!ledgerMap) {
+            ledgerMap = new Map();
+            this.invoiceLedger.set(invoiceId, ledgerMap);
+          }
+          ledgerMap.set(entryKey, forwardRef);
+          this.dirtyLedgerEntries.add(invoiceId);
           this.balanceCache.delete(invoiceId);
         }
 
