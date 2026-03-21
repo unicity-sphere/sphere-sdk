@@ -1697,19 +1697,22 @@ export class NostrTransportProvider implements TransportProvider {
     // where subId is guaranteed to be the real subscription ID (not in TDZ).
     let subId: string | undefined;
 
-    await new Promise<void>((resolve, reject) => {
-      let timeout: ReturnType<typeof setTimeout> | undefined;
+    return new Promise((resolve) => {
       let settled = false;
+      const timeout = setTimeout(() => {
+        if (subId) {
+          this.nostrClient?.unsubscribe(subId);
+        }
+        logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
+        resolve(events);
+      }, 15000);
 
-      // settle() only resolves the Promise. Unsubscription happens after the
-      // Promise resolves (below), where subId is always the real value. This
-      // prevents the TDZ ReferenceError if EOSE fires synchronously inside
-      // subscribe() before the const assignment completes.
       const settle = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
-        resolve();
+        if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
+        resolve(events);
       };
 
       try {
@@ -1727,24 +1730,12 @@ export class NostrTransportProvider implements TransportProvider {
           },
           onEndOfStoredEvents: () => settle(),
         });
-      } catch (err) {
-        reject(err);
+      } catch {
+        resolve(events);
         return;
       }
 
-      if (!settled) {
-        timeout = setTimeout(() => {
-          logger.warn('Nostr', `queryEvents timed out after 5s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
-          settle();
-        }, 5000);
-      }
     });
-
-    // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
-    // This also prevents onEvent from firing while the caller iterates the events array.
-    if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
-
-    return events;
   }
 
   // ===========================================================================
