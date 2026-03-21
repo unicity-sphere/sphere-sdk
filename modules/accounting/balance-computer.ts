@@ -260,24 +260,55 @@ function buildTargetStatus(
           });
         }
       } else if (asset.nft) {
-        // v1 placeholder: NFT assets always show not received
-        nftAssets.push({
-          nft: asset.nft,
-          received: false,
-          confirmed: false,
-        });
+        // ACCT-NFT N4.3: Compute NFT asset status from ledger entries
+        const nftTokenId = asset.nft.tokenId;
+        const nftAcc = targetAcc.coins.get(nftTokenId);
+        if (nftAcc) {
+          // Count forward vs return entries for this NFT tokenId
+          let forwardCount = 0;
+          let returnCount = 0;
+          let latestForwardConfirmed = false;
+          let latestForwardTimestamp = 0;
+          for (const ref of nftAcc.transfers) {
+            if (ref.paymentDirection === 'forward') {
+              forwardCount++;
+              if (ref.timestamp >= latestForwardTimestamp) {
+                latestForwardTimestamp = ref.timestamp;
+                latestForwardConfirmed = ref.confirmed;
+              }
+            } else {
+              returnCount++;
+            }
+          }
+          const netReceived = forwardCount > returnCount;
+          nftAssets.push({
+            nft: asset.nft,
+            received: netReceived,
+            confirmed: netReceived ? latestForwardConfirmed : false,
+          });
+        } else {
+          // No transfers for this NFT — not received
+          nftAssets.push({
+            nft: asset.nft,
+            received: false,
+            confirmed: false,
+          });
+        }
       }
     }
   }
 
-  // Per spec §5.1 step 6: target isCovered = all coin assets covered (NFTs excluded v1)
-  // A target with no coin assets is considered not covered (nothing requested)
-  const isCovered =
-    coinAssets.length > 0 && coinAssets.every((ca) => ca.isCovered);
+  // Per spec §5.1 step 6 + ACCT-NFT N4.1: target isCovered = all coin AND NFT assets covered
+  const hasCoinAssets = coinAssets.length > 0;
+  const hasNftAssets = nftAssets.length > 0;
+  const coinsCovered = !hasCoinAssets || coinAssets.every((ca) => ca.isCovered);
+  const nftsCovered = !hasNftAssets || nftAssets.every((na) => na.received);
+  const isCovered = (hasCoinAssets || hasNftAssets) && coinsCovered && nftsCovered;
 
-  // confirmed = all coin assets confirmed (targets with zero transfers are not confirmed)
-  const confirmed =
-    coinAssets.length > 0 && coinAssets.every((ca) => ca.confirmed);
+  // confirmed = all coin AND NFT assets confirmed (targets with zero transfers are not confirmed)
+  const coinsConfirmed = !hasCoinAssets || coinAssets.every((ca) => ca.confirmed);
+  const nftsConfirmed = !hasNftAssets || nftAssets.every((na) => !na.received || na.confirmed);
+  const confirmed = (hasCoinAssets || hasNftAssets) && coinsConfirmed && nftsConfirmed;
 
   return {
     address: targetAddress,
@@ -543,8 +574,10 @@ export function computeInvoiceStatus(
   // (CLOSED/CANCELLED already handled above via frozenBalances path)
   // ---------------------------------------------------------------------------
   const allTargetsCovered = targets.length > 0 && targets.every((t) => t.isCovered);
+  // ACCT-NFT N4.4: Include NFT receipts in the anyPayment check for PARTIAL state
   const anyPayment = targets.some((t) =>
-    t.coinAssets.some((ca) => parseBigInt(ca.netCoveredAmount) > 0n),
+    t.coinAssets.some((ca) => parseBigInt(ca.netCoveredAmount) > 0n) ||
+    t.nftAssets.some((na) => na.received),
   );
 
   let state: InvoiceState;

@@ -92,7 +92,8 @@ type IrrelevantReason =
   | 'unknown_address_and_asset'
   | 'self_payment'
   | 'no_coin_data'
-  | 'unauthorized_return';
+  | 'unauthorized_return'
+  | 'nft_mismatch';
 
 // =============================================================================
 // Constants
@@ -3825,6 +3826,136 @@ export class AccountingModule {
         }
       }
     }
+
+    // ── ACCT-NFT N5.1: NFT auto-return loop ──
+    // Only process NFT returns for CANCELLED invoices (direction 'RX').
+    // CLOSED invoices retain received NFTs (per N5.2).
+    if (direction === 'RX') {
+      for (const ft of frozen.targets) {
+        for (const nftStatus of ft.nftAssets) {
+          if (!nftStatus.received) continue;
+
+          const nftTokenId = nftStatus.nft.tokenId;
+          // Dedup key: nft:{tokenId} (per N5.3)
+          const dedupTransferId = `nft:${nftTokenId}`;
+
+          // Check dedup ledger — skip if already completed
+          if (this.autoReturnManager.isDone(invoiceId, dedupTransferId)) continue;
+          const existingEntry = this.autoReturnManager.getEntry(invoiceId, dedupTransferId);
+          if (existingEntry?.status === 'failed') continue;
+
+          // Find the forward transfer entry for this NFT to determine sender
+          const innerMap = this.invoiceLedger.get(invoiceId);
+          let senderAddress: string | null = null;
+          let refundAddress: string | undefined;
+          if (innerMap) {
+            for (const ref of innerMap.values()) {
+              if (ref.coinId === nftTokenId && ref.paymentDirection === 'forward') {
+                senderAddress = ref.senderAddress;
+                refundAddress = ref.refundAddress;
+                break;
+              }
+            }
+          }
+
+          // N5.1 security S1: NFT auto-return PREFERS senderAddress over refundAddress
+          // (inverse of coin priority — irreversible loss for NFTs if sent to wrong address)
+          const recipient = senderAddress ?? refundAddress;
+          if (!recipient) {
+            deps.emitEvent('invoice:auto_return_failed', {
+              invoiceId,
+              transferId: dedupTransferId,
+              reason: 'sender_unresolvable',
+            });
+            continue;
+          }
+
+          // Secondary dedup: check transaction history
+          const memo = buildInvoiceMemo(invoiceId, 'RX', dedupTransferId);
+          const alreadyReturned = historyByMemo.get(memo);
+          if (alreadyReturned) {
+            await this.autoReturnManager.markCompleted(
+              invoiceId,
+              dedupTransferId,
+              alreadyReturned.transferId ?? alreadyReturned.id,
+            );
+            continue;
+          }
+
+          // Write intent (write-first pattern — §7.5 step 3a)
+          await this.autoReturnManager.recordIntent(invoiceId, dedupTransferId, {
+            recipient,
+            amount: '1',
+            coinId: nftTokenId,
+            memo,
+          });
+
+          try {
+            const arSendPromise = deps.payments.send({
+              recipient,
+              amount: '1',
+              coinId: nftTokenId,
+              memo,
+              _nftTransfer: true,
+              _tokenIds: [nftTokenId],
+            } as Parameters<typeof deps.payments.send>[0]);
+            let arSendTimer: ReturnType<typeof setTimeout> | undefined;
+            const arSendTimeout = new Promise<never>((_, reject) => {
+              arSendTimer = setTimeout(
+                () => reject(new SphereError(
+                  `NFT auto-return send() timed out after 60s: ${invoiceId} nft:${nftTokenId}`,
+                  'TIMEOUT',
+                )),
+                60_000,
+              );
+            });
+
+            let result: Awaited<typeof arSendPromise>;
+            try {
+              result = await Promise.race([arSendPromise, arSendTimeout]);
+            } finally {
+              if (arSendTimer !== undefined) clearTimeout(arSendTimer);
+            }
+
+            await this.autoReturnManager.markCompleted(invoiceId, dedupTransferId, result.id);
+
+            deps.emitEvent('invoice:nft_returned', {
+              invoiceId,
+              tokenId: nftTokenId,
+              recipient,
+              transferResult: result,
+            });
+
+            if (this.config.debug) {
+              logger.debug(
+                LOG_TAG,
+                `NFT auto-return (RX) sent: ${invoiceId} nft:${nftTokenId} → ${recipient}`,
+              );
+            }
+          } catch (err) {
+            logger.warn(
+              LOG_TAG,
+              `NFT auto-return (RX) failed for ${invoiceId} nft:${nftTokenId} → ${recipient}:`,
+              err,
+            );
+
+            try {
+              const retryCount = await this.autoReturnManager.incrementRetry(invoiceId, dedupTransferId);
+              if (retryCount >= AutoReturnManager.MAX_RETRY_COUNT) {
+                await this.autoReturnManager.markFailed(invoiceId, dedupTransferId);
+                deps.emitEvent('invoice:auto_return_failed', {
+                  invoiceId,
+                  transferId: dedupTransferId,
+                  reason: 'send_failed',
+                });
+              }
+            } catch {
+              // Storage failure — entry stays 'pending' in memory
+            }
+          }
+        }
+      }
+    }
   }
 
   // ===========================================================================
@@ -3933,6 +4064,118 @@ export class AccountingModule {
             logger.warn(
               LOG_TAG,
               `Termination auto-return (${direction}) failed for ${invoiceId} → ${recipient} ${amount} ${coinId}:`,
+              err,
+            );
+            await this.autoReturnManager.markFailed(invoiceId, dedupTransferId);
+            deps.emitEvent('invoice:auto_return_failed', {
+              invoiceId,
+              transferId: dedupTransferId,
+              reason: 'send_failed',
+            });
+          }
+        }
+      }
+    }
+
+    // ── ACCT-NFT N5.1: NFT auto-return at termination ──
+    // Only process NFT returns for CANCELLED invoices (direction 'RX').
+    // CLOSED invoices retain received NFTs (per N5.2).
+    if (direction === 'RX') {
+      for (const ft of frozen.targets) {
+        for (const nftStatus of ft.nftAssets) {
+          if (!nftStatus.received) continue;
+
+          const nftTokenId = nftStatus.nft.tokenId;
+          const dedupTransferId = `nft:${nftTokenId}`;
+
+          if (this.autoReturnManager.isDone(invoiceId, dedupTransferId)) continue;
+          const existingEntry = this.autoReturnManager.getEntry(invoiceId, dedupTransferId);
+          if (existingEntry?.status === 'failed') continue;
+
+          // Find the forward transfer entry for this NFT to determine sender
+          const innerMap = this.invoiceLedger.get(invoiceId);
+          let senderAddress: string | null = null;
+          let refundAddress: string | undefined;
+          if (innerMap) {
+            for (const ref of innerMap.values()) {
+              if (ref.coinId === nftTokenId && ref.paymentDirection === 'forward') {
+                senderAddress = ref.senderAddress;
+                refundAddress = ref.refundAddress;
+                break;
+              }
+            }
+          }
+
+          // N5.1 security S1: senderAddress first, refundAddress second
+          const recipient = senderAddress ?? refundAddress;
+          if (!recipient) {
+            failedCount++;
+            deps.emitEvent('invoice:auto_return_failed', {
+              invoiceId,
+              transferId: dedupTransferId,
+              reason: 'sender_unresolvable',
+            });
+            continue;
+          }
+
+          // Secondary dedup via history
+          const memo = buildInvoiceMemo(invoiceId, 'RX', dedupTransferId);
+          const alreadyReturned = historyByMemo.get(memo);
+          if (alreadyReturned) {
+            await this.autoReturnManager.markCompleted(
+              invoiceId,
+              dedupTransferId,
+              alreadyReturned.transferId ?? alreadyReturned.id,
+            );
+            continue;
+          }
+
+          await this.autoReturnManager.recordIntent(invoiceId, dedupTransferId, {
+            recipient,
+            amount: '1',
+            coinId: nftTokenId,
+            memo,
+          });
+
+          try {
+            const nftSendPromise = deps.payments.send({
+              recipient,
+              amount: '1',
+              coinId: nftTokenId,
+              memo,
+              _nftTransfer: true,
+              _tokenIds: [nftTokenId],
+            } as Parameters<typeof deps.payments.send>[0]);
+            let nftSendTimer: ReturnType<typeof setTimeout> | undefined;
+            const nftSendTimeout = new Promise<never>((_, reject) => {
+              nftSendTimer = setTimeout(
+                () => reject(new SphereError(
+                  `NFT termination return send() timed out after 60s: ${invoiceId} nft:${nftTokenId}`,
+                  'TIMEOUT',
+                )),
+                60_000,
+              );
+            });
+
+            let result: Awaited<typeof nftSendPromise>;
+            try {
+              result = await Promise.race([nftSendPromise, nftSendTimeout]);
+            } finally {
+              if (nftSendTimer !== undefined) clearTimeout(nftSendTimer);
+            }
+
+            await this.autoReturnManager.markCompleted(invoiceId, dedupTransferId, result.id);
+            deps.emitEvent('invoice:nft_returned', {
+              invoiceId,
+              tokenId: nftTokenId,
+              recipient,
+              transferResult: result,
+            });
+          } catch (err) {
+            failedCount++;
+            logger.warn(
+              LOG_TAG,
+              `NFT termination return (RX) failed for ${invoiceId} nft:${nftTokenId} → ${recipient}:`,
               err,
             );
             await this.autoReturnManager.markFailed(invoiceId, dedupTransferId);
@@ -4450,8 +4693,121 @@ export class AccountingModule {
       };
       const paymentDirection = dirMap[payload.inv.dir] ?? 'forward';
 
+      // ── NFT detection (ACCT-NFT N6.2) ──
+      // MUST be checked BEFORE the coinData.length === 0 guard below.
+      // NFT tokens have tokenType === NFT_TOKEN_TYPE_HEX and empty/absent coinData.
+      // Without this early branch, NFTs would be silently classified as 'no_coin_data'.
+      const tokenType = txf.genesis?.data?.tokenType;
+      const coinDataRaw = txf.genesis?.data?.coinData as [string, string][] | undefined;
+      if (tokenType === NFT_TOKEN_TYPE_HEX && (!coinDataRaw || coinDataRaw.length === 0)) {
+        const nftTokenId = (txf.genesis?.data?.tokenId as string | undefined) ?? tokenId;
+        const transferId = `${tokenId}:${i}`;
+
+        // Determine sender (same heuristic as coin path)
+        const isReturnDir =
+          paymentDirection === 'back' ||
+          paymentDirection === 'return_closed' ||
+          paymentDirection === 'return_cancelled';
+        const nftSenderAddress: string | null =
+          isReturnDir ? null : (i === 0 ? (txf.genesis?.data?.recipient ?? null) : null);
+
+        // Look up invoice terms to match NFT against target asset lines
+        const nftTerms = this.invoiceTermsCache.get(invoiceId);
+        let nftMatched = false;
+
+        if (nftTerms) {
+          for (let ti = 0; ti < nftTerms.targets.length; ti++) {
+            const target = nftTerms.targets[ti];
+            for (let ai = 0; ai < target.assets.length; ai++) {
+              const asset = target.assets[ai];
+              if (asset.nft && asset.nft.tokenId.toLowerCase() === nftTokenId.toLowerCase()) {
+                // Match found — create ledger entry with coinId=nftTokenId, amount='1'
+                const dedupKey = `${transferId}::${nftTokenId}`;
+
+                if (!this.invoiceLedger.has(invoiceId)) {
+                  this.invoiceLedger.set(invoiceId, new Map());
+                  if (!this.invoiceTermsCache.has(invoiceId)) {
+                    this.unknownLedgerCount++;
+                  }
+                }
+                const ledger = this.invoiceLedger.get(invoiceId)!;
+                if (!ledger.has(dedupKey)) {
+                  const tx = transactions[i];
+                  const ref: InvoiceTransferRef = {
+                    transferId,
+                    direction: 'inbound',
+                    paymentDirection,
+                    coinId: nftTokenId,
+                    amount: '1',
+                    destinationAddress: (() => {
+                      const txRecipient = (tx.data as Record<string, unknown>)?.['recipient'];
+                      if (typeof txRecipient === 'string' && txRecipient) return txRecipient;
+                      if (i === 0) return (txf.genesis?.data?.recipient ?? '');
+                      return '';
+                    })(),
+                    timestamp: Date.now(),
+                    confirmed: false,
+                    senderAddress: nftSenderAddress,
+                    refundAddress: payload.inv?.ra,
+                    contact: payload.inv?.ct
+                      ? { address: payload.inv.ct.a, url: payload.inv.ct.u }
+                      : undefined,
+                    senderPubkey: undefined,
+                    senderNametag: undefined,
+                  };
+                  ledger.set(dedupKey, ref);
+
+                  // Invalidate balance cache for this invoice
+                  this.balanceCache.delete(invoiceId);
+                }
+
+                nftMatched = true;
+                break;
+              }
+            }
+            if (nftMatched) break;
+          }
+        }
+
+        if (!nftMatched) {
+          // No NFT target match — classify as irrelevant 'nft_mismatch'
+          // (Still index the transfer so it appears in the ledger for tracking)
+          const dedupKey = `${transferId}::${nftTokenId}`;
+          if (!this.invoiceLedger.has(invoiceId)) {
+            this.invoiceLedger.set(invoiceId, new Map());
+            if (!this.invoiceTermsCache.has(invoiceId)) {
+              this.unknownLedgerCount++;
+            }
+          }
+          const ledger = this.invoiceLedger.get(invoiceId)!;
+          if (!ledger.has(dedupKey)) {
+            const tx = transactions[i];
+            const ref: InvoiceTransferRef = {
+              transferId,
+              direction: 'inbound',
+              paymentDirection,
+              coinId: nftTokenId,
+              amount: '1',
+              destinationAddress: (() => {
+                const txRecipient = (tx.data as Record<string, unknown>)?.['recipient'];
+                if (typeof txRecipient === 'string' && txRecipient) return txRecipient;
+                if (i === 0) return (txf.genesis?.data?.recipient ?? '');
+                return '';
+              })(),
+              timestamp: Date.now(),
+              confirmed: false,
+              senderAddress: null,
+            };
+            ledger.set(dedupKey, ref);
+            this.balanceCache.delete(invoiceId);
+          }
+        }
+
+        continue; // skip coin processing below
+      }
+
       // Extract coin data from genesis — skip tokens without valid coinData
-      const coinData = txf.genesis?.data?.coinData as [string, string][] | undefined;
+      const coinData = coinDataRaw;
       if (!coinData || coinData.length === 0) {
         // Invoice tokens intentionally have null coinData; non-invoice tokens should not.
         if (txf.genesis?.data?.tokenType !== INVOICE_TOKEN_TYPE_HEX) {
@@ -5369,6 +5725,35 @@ export class AccountingModule {
         confirmed,
       });
 
+      // ACCT-NFT N8.2: Emit invoice:nft_received even for terminal invoices
+      if (paymentDirection === 'forward') {
+        const targetNftIdsTerminal = new Set(
+          (terms.targets.find((t) => t.address === syntheticRef.destinationAddress)?.assets ?? [])
+            .filter((a) => a.nft).map((a) => a.nft!.tokenId.toLowerCase()),
+        );
+        if (targetNftIdsTerminal.has(syntheticRef.coinId.toLowerCase())) {
+          const targetIdx = terms.targets.findIndex((t) => t.address === syntheticRef.destinationAddress);
+          const matchingTarget = terms.targets[targetIdx];
+          if (matchingTarget) {
+            const assetIdx = matchingTarget.assets.findIndex(
+              (a) => a.nft && a.nft.tokenId.toLowerCase() === syntheticRef.coinId.toLowerCase(),
+            );
+            if (assetIdx >= 0) {
+              deps.emitEvent('invoice:nft_received', {
+                invoiceId,
+                tokenId: syntheticRef.coinId,
+                address: syntheticRef.destinationAddress,
+                targetIndex: targetIdx,
+                assetIndex: assetIdx,
+                confirmed,
+                senderPubkey: syntheticRef.senderPubkey,
+                senderNametag: syntheticRef.senderNametag,
+              });
+            }
+          }
+        }
+      }
+
       // §6.2 step 5 (auto-return): if enabled and wallet is a target, return the payment
       const autoReturnEnabled =
         this.autoReturnPerInvoice.get(invoiceId) ?? this.autoReturnGlobal;
@@ -5390,7 +5775,13 @@ export class AccountingModule {
     const targetCoinIds = new Set(
       (targetTerms?.assets ?? []).filter((a) => a.coin).map((a) => a.coin![0]),
     );
-    const matchesAsset = matchesTarget && targetCoinIds.has(syntheticRef.coinId);
+    // ACCT-NFT N3.1: Also match NFT tokenIds as valid asset identifiers
+    const targetNftIds = new Set(
+      (targetTerms?.assets ?? []).filter((a) => a.nft).map((a) => a.nft!.tokenId.toLowerCase()),
+    );
+    const matchesCoinAsset = matchesTarget && targetCoinIds.has(syntheticRef.coinId);
+    const matchesNftAsset = matchesTarget && targetNftIds.has(syntheticRef.coinId.toLowerCase());
+    const matchesAsset = matchesCoinAsset || matchesNftAsset;
 
     if (matchesTarget && matchesAsset) {
       // §6.2 step 6a-fix: Ensure ledger entry exists for instant-mode (v5split) tokens.
@@ -5434,14 +5825,47 @@ export class AccountingModule {
         paymentDirection,
         confirmed,
       });
+
+      // ACCT-NFT N8.2: Emit invoice:nft_received for NFT asset matches (after invoice:payment)
+      if (matchesNftAsset && paymentDirection === 'forward') {
+        const targetIdx = terms.targets.findIndex((t) => t.address === syntheticRef.destinationAddress);
+        const matchingTarget = terms.targets[targetIdx];
+        if (matchingTarget) {
+          const assetIdx = matchingTarget.assets.findIndex(
+            (a) => a.nft && a.nft.tokenId.toLowerCase() === syntheticRef.coinId.toLowerCase(),
+          );
+          if (assetIdx >= 0) {
+            deps.emitEvent('invoice:nft_received', {
+              invoiceId,
+              tokenId: syntheticRef.coinId,
+              address: syntheticRef.destinationAddress,
+              targetIndex: targetIdx,
+              assetIndex: assetIdx,
+              confirmed,
+              senderPubkey: syntheticRef.senderPubkey,
+              senderNametag: syntheticRef.senderNametag,
+            });
+          }
+        }
+      }
     } else {
       // §6.2 step 6b: Does not match any target/asset
+      // ACCT-NFT N6.3: Use 'nft_mismatch' for NFT tokens that don't match any NFT target
+      let isNftToken = false;
+      if (transfer.tokens[0]?.sdkData) {
+        try {
+          const txfCheck = JSON.parse(transfer.tokens[0].sdkData) as TxfToken;
+          isNftToken = txfCheck.genesis?.data?.tokenType === NFT_TOKEN_TYPE_HEX;
+        } catch { /* ignore */ }
+      }
       const reason: IrrelevantReason =
-        !matchesTarget && !matchesAsset
-          ? 'unknown_address_and_asset'
-          : !matchesTarget
-            ? 'unknown_address'
-            : 'unknown_asset';
+        isNftToken && matchesTarget
+          ? 'nft_mismatch'
+          : !matchesTarget && !matchesAsset
+            ? 'unknown_address_and_asset'
+            : !matchesTarget
+              ? 'unknown_address'
+              : 'unknown_asset';
 
       deps.emitEvent('invoice:irrelevant', {
         invoiceId,
@@ -5623,7 +6047,13 @@ export class AccountingModule {
     const targetCoinIds = new Set(
       (targetTerms?.assets ?? []).filter((a) => a.coin).map((a) => a.coin![0]),
     );
-    const matchesAsset = matchesTarget && targetCoinIds.has(syntheticRef.coinId);
+    // ACCT-NFT N3.1: Also match NFT tokenIds as valid asset identifiers
+    const targetNftIds = new Set(
+      (targetTerms?.assets ?? []).filter((a) => a.nft).map((a) => a.nft!.tokenId.toLowerCase()),
+    );
+    const matchesCoinAsset = matchesTarget && targetCoinIds.has(syntheticRef.coinId);
+    const matchesNftAsset = matchesTarget && targetNftIds.has(syntheticRef.coinId.toLowerCase());
+    const matchesAsset = matchesCoinAsset || matchesNftAsset;
 
     if (matchesTarget && matchesAsset) {
       // Ensure ledger entry exists (same v5split fix as _processInvoiceTransferEvent)
@@ -5659,13 +6089,50 @@ export class AccountingModule {
         paymentDirection,
         confirmed,
       });
+
+      // ACCT-NFT N8.2: Emit invoice:nft_received for NFT asset matches (after invoice:payment)
+      if (matchesNftAsset && paymentDirection === 'forward') {
+        const targetIdx = terms.targets.findIndex((t) => t.address === syntheticRef.destinationAddress);
+        const matchingTarget = terms.targets[targetIdx];
+        if (matchingTarget) {
+          const assetIdx = matchingTarget.assets.findIndex(
+            (a) => a.nft && a.nft.tokenId.toLowerCase() === syntheticRef.coinId.toLowerCase(),
+          );
+          if (assetIdx >= 0) {
+            deps.emitEvent('invoice:nft_received', {
+              invoiceId,
+              tokenId: syntheticRef.coinId,
+              address: syntheticRef.destinationAddress,
+              targetIndex: targetIdx,
+              assetIndex: assetIdx,
+              confirmed,
+              senderPubkey: syntheticRef.senderPubkey,
+              senderNametag: syntheticRef.senderNametag,
+            });
+          }
+        }
+      }
     } else {
+      // ACCT-NFT N6.3: Use 'nft_mismatch' for NFT tokens that don't match any NFT target
+      let isNftToken = false;
+      if (entry.tokenId) {
+        const allTokens = deps.payments.getTokens();
+        const tok = allTokens.find((t) => t.id === entry.tokenId);
+        if (tok?.sdkData) {
+          try {
+            const txfCheck = JSON.parse(tok.sdkData) as TxfToken;
+            isNftToken = txfCheck.genesis?.data?.tokenType === NFT_TOKEN_TYPE_HEX;
+          } catch { /* ignore */ }
+        }
+      }
       const reason: IrrelevantReason =
-        !matchesTarget && !matchesAsset
-          ? 'unknown_address_and_asset'
-          : !matchesTarget
-            ? 'unknown_address'
-            : 'unknown_asset';
+        isNftToken && matchesTarget
+          ? 'nft_mismatch'
+          : !matchesTarget && !matchesAsset
+            ? 'unknown_address_and_asset'
+            : !matchesTarget
+              ? 'unknown_address'
+              : 'unknown_asset';
 
       deps.emitEvent('invoice:irrelevant', {
         invoiceId,
@@ -5742,8 +6209,19 @@ export class AccountingModule {
       }
       if (existing?.status === 'failed') return null;
 
-      // §6.2: Resolve auto-return destination: refundAddress ?? senderAddress
-      const returnTo = originalRef.refundAddress ?? originalRef.senderAddress;
+      // ACCT-NFT: Detect if this return is for an NFT asset
+      const invoiceTerms = this.invoiceTermsCache.get(invoiceId);
+      const isNftReturn = invoiceTerms?.targets.some((t) =>
+        t.assets.some((a) => a.nft && a.nft.tokenId.toLowerCase() === originalRef.coinId.toLowerCase()),
+      ) ?? false;
+
+      // §6.2: Resolve auto-return destination.
+      // ACCT-NFT N5.1 (security S1): For NFTs, prefer senderAddress over refundAddress
+      // (inverse of coin priority — irreversible loss if sent to wrong address).
+      // For coins: refundAddress ?? senderAddress (existing behavior).
+      const returnTo = isNftReturn
+        ? (originalRef.senderAddress ?? originalRef.refundAddress)
+        : (originalRef.refundAddress ?? originalRef.senderAddress);
       if (!returnTo) {
         deps.emitEvent('invoice:auto_return_failed', {
           invoiceId,
@@ -5765,7 +6243,7 @@ export class AccountingModule {
         memo: returnMemo,
       });
 
-      return { transferId, returnTo, amount: originalRef.amount, coinId: originalRef.coinId, memo: returnMemo };
+      return { transferId, returnTo, amount: originalRef.amount, coinId: originalRef.coinId, memo: returnMemo, isNftReturn };
     });
 
     if (!sendParams) return;
@@ -5777,12 +6255,15 @@ export class AccountingModule {
     // (causing duplicate payment on crash recovery).
     try {
       // Steelman fix: Wrap send() with 60s timeout for consistency with all other send paths.
-      const evtSendPromise = deps.payments.send({
+      // ACCT-NFT: For NFT returns, pass _nftTransfer and _tokenIds flags
+      const sendRequest: TransferRequest = {
         recipient: sendParams.returnTo,
         amount: sendParams.amount,
         coinId: sendParams.coinId,
         memo: sendParams.memo,
-      });
+        ...(sendParams.isNftReturn ? { _nftTransfer: true, _tokenIds: [sendParams.coinId] } : {}),
+      };
+      const evtSendPromise = deps.payments.send(sendRequest);
       let evtSendTimer: ReturnType<typeof setTimeout> | undefined;
       const evtSendTimeout = new Promise<never>((_, reject) => {
         evtSendTimer = setTimeout(
@@ -5821,6 +6302,16 @@ export class AccountingModule {
         originalTransfer: originalRef,
         returnTransfer: returnRef,
       });
+
+      // ACCT-NFT N8.2: Emit invoice:nft_returned for NFT auto-returns
+      if (sendParams.isNftReturn) {
+        deps.emitEvent('invoice:nft_returned', {
+          invoiceId,
+          tokenId: sendParams.coinId,
+          recipient: sendParams.returnTo,
+          transferResult: result,
+        });
+      }
     } catch (err) {
       logger.warn(LOG_TAG, `Auto-return send failed for ${invoiceId} → ${sendParams.returnTo}:`, err);
 
@@ -5948,6 +6439,7 @@ export class AccountingModule {
     const walletAddresses = new Set(activeAddresses.map((a) => a.directAddress));
 
     // Extract coinId/amount from the first token's genesis coinData (if available)
+    // For NFTs: coinId = nftTokenId, amount = '1' (ACCT-NFT N3.5)
     let coinId = '';
     let amount = '0';
     const firstToken = transfer.tokens[0];
@@ -5958,6 +6450,12 @@ export class AccountingModule {
         if (coinData && coinData.length > 0) {
           coinId = coinData[0]![0] ?? '';
           amount = coinData[0]![1] ?? '0';
+        } else if (
+          txf.genesis?.data?.tokenType === NFT_TOKEN_TYPE_HEX
+        ) {
+          // NFT token: use tokenId as coinId, amount is always '1'
+          coinId = (txf.genesis?.data?.tokenId as string | undefined) ?? firstToken.id ?? '';
+          amount = '1';
         }
       } catch {
         // ignore — use empty defaults

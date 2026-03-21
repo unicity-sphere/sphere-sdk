@@ -25,6 +25,10 @@ import type {
   NFTMetadata,
   NFTTokenData,
   NFTRef,
+  NFTDetail,
+  NFTHistoryEntry,
+  NFTVerificationResult,
+  GetNFTsOptions,
   CollectionRef,
   CollectionDefinition,
   CreateCollectionRequest,
@@ -34,7 +38,8 @@ import type {
   BatchMintNFTResult,
 } from './types.js';
 import { NFT_MAX_BATCH_SIZE } from './types.js';
-import type { IncomingTransfer, Token } from '../../types/index.js';
+import type { IncomingTransfer, Token, TransferResult } from '../../types/index.js';
+import type { TxfToken } from '../../types/txf.js';
 
 import { canonicalSerializeNFT, deriveCollectionId, parseNFTTokenData } from './serialization.js';
 import { validateNFTMetadata, validateCreateCollectionRequest } from './validation.js';
@@ -361,6 +366,386 @@ export class NFTModule {
         errors: errors.length > 0 ? errors : undefined,
       };
     });
+  }
+
+  // ==========================================================================
+  // Transfer
+  // ==========================================================================
+
+  /**
+   * Send an NFT to a recipient.
+   * Delegates to PaymentsModule.send() with _nftTransfer and _tokenIds flags.
+   */
+  async sendNFT(tokenId: string, recipient: string, memo?: string): Promise<TransferResult> {
+    this._ensureInitialized();
+
+    // 1. Look up tokenId in NFT index
+    const nftRef = this._nftIndex.get(tokenId);
+    if (!nftRef) {
+      throw new SphereError(`NFT ${tokenId} not found in wallet`, 'NFT_NOT_FOUND');
+    }
+
+    // 2. Check transferability via collection
+    if (nftRef.collectionId) {
+      const collection = this._registry.get(nftRef.collectionId);
+      if (collection && collection.transferable === false) {
+        throw new SphereError(
+          `NFT ${tokenId} belongs to a non-transferable (soulbound) collection`,
+          'NFT_NOT_TRANSFERABLE',
+        );
+      }
+    }
+
+    // 3. Delegate to PaymentsModule
+    const result = await this.deps.payments.send({
+      recipient,
+      amount: '1',
+      coinId: tokenId,
+      memo,
+      _nftTransfer: true,
+      _tokenIds: [tokenId],
+    });
+
+    // 4. On success, remove from index and emit event
+    if (result.status !== 'failed') {
+      this._nftIndex.delete(tokenId);
+      this._updateCollectionTokenCount();
+
+      this.deps.emitEvent('nft:transferred', {
+        tokenId,
+        collectionId: nftRef.collectionId,
+        recipientPubkey: recipient,
+        recipientNametag: undefined,
+      });
+
+      logger.debug(LOG_TAG, `NFT transferred: ${tokenId.slice(0, 16)}... to ${recipient.slice(0, 16)}...`);
+    }
+
+    return result;
+  }
+
+  // ==========================================================================
+  // Queries
+  // ==========================================================================
+
+  /**
+   * Get full details for a single NFT by token ID.
+   */
+  async getNFT(tokenId: string): Promise<NFTDetail | null> {
+    this._ensureInitialized();
+
+    // 1. Look up in index
+    const nftRef = this._nftIndex.get(tokenId);
+    if (!nftRef) return null;
+
+    // 2. Get full token from PaymentsModule
+    const tokens = this.deps.payments.getTokens({ coinId: tokenId });
+    // Also try without coinId filter since NFT coinId might be NFT_TOKEN_TYPE_HEX
+    let token: Token | undefined = tokens[0];
+    if (!token) {
+      const allTokens = this.deps.payments.getTokens();
+      token = allTokens.find((t) => t.id === tokenId);
+    }
+    if (!token) return null;
+
+    // 3. Parse NFTTokenData
+    let nftData: NFTTokenData | null = null;
+    if (token.sdkData) {
+      try {
+        const txf = JSON.parse(token.sdkData);
+        const tokenDataStr = typeof txf?.genesis?.data?.tokenData === 'string'
+          ? txf.genesis.data.tokenData
+          : JSON.stringify(txf?.genesis?.data?.tokenData);
+        nftData = parseNFTTokenData(tokenDataStr);
+      } catch {
+        // Parse failure — continue with what we have
+      }
+    }
+
+    // 4. Look up collection
+    const collection = nftRef.collectionId
+      ? this._registry.get(nftRef.collectionId) ?? undefined
+      : undefined;
+
+    // 5. Construct NFTDetail
+    return {
+      ...nftRef,
+      metadata: nftData?.metadata ?? { name: nftRef.name, image: nftRef.image },
+      collection,
+      totalEditions: nftData?.totalEditions,
+      minter: nftData?.minter,
+      token,
+    };
+  }
+
+  /**
+   * Get all NFTs in the wallet, with optional filtering, sorting, and pagination.
+   * Operates entirely on the in-memory index — no storage reads.
+   */
+  getNFTs(options?: GetNFTsOptions): NFTRef[] {
+    this._ensureInitialized();
+
+    let results = Array.from(this._nftIndex.values());
+
+    // Apply filters
+    if (options?.collectionId) {
+      results = results.filter((n) => n.collectionId === options.collectionId);
+    }
+    if (options?.status) {
+      const statusFilter = Array.isArray(options.status) ? options.status : [options.status];
+      results = results.filter((n) => statusFilter.includes(n.status));
+    }
+
+    // Apply sorting
+    const sortBy = options?.sortBy ?? 'name';
+    const sortOrder = options?.sortOrder ?? 'asc';
+    const dir = sortOrder === 'desc' ? -1 : 1;
+
+    results.sort((a, b) => {
+      let cmp = 0;
+      switch (sortBy) {
+        case 'name':
+          cmp = a.name.localeCompare(b.name);
+          break;
+        case 'mintedAt':
+          cmp = a.mintedAt - b.mintedAt;
+          break;
+        case 'collectionId':
+          cmp = (a.collectionId ?? '').localeCompare(b.collectionId ?? '');
+          break;
+        default:
+          cmp = a.name.localeCompare(b.name);
+      }
+      return cmp * dir;
+    });
+
+    // Apply pagination
+    if (options?.offset) {
+      results = results.slice(options.offset);
+    }
+    if (options?.limit) {
+      results = results.slice(0, options.limit);
+    }
+
+    return results;
+  }
+
+  /**
+   * Get all NFTs belonging to a specific collection.
+   * Shorthand for getNFTs({ collectionId }).
+   */
+  getCollectionNFTs(collectionId: string): NFTRef[] {
+    return this.getNFTs({ collectionId });
+  }
+
+  /**
+   * Get the ownership/transfer history for an NFT.
+   * Parses the token's transaction chain into history entries.
+   */
+  async getNFTHistory(tokenId: string): Promise<NFTHistoryEntry[]> {
+    this._ensureInitialized();
+
+    // Get token from PaymentsModule
+    const allTokens = this.deps.payments.getTokens();
+    const token = allTokens.find((t) => t.id === tokenId);
+    if (!token || !token.sdkData) return [];
+
+    try {
+      const txf = JSON.parse(token.sdkData);
+      if (txf?.genesis?.data?.tokenType !== NFT_TOKEN_TYPE_HEX) return [];
+
+      const history: NFTHistoryEntry[] = [];
+
+      // First entry is always the mint
+      history.push({
+        type: 'mint',
+        counterparty: txf.genesis?.data?.recipient,
+        timestamp: token.createdAt ?? Date.now(),
+        confirmed: true,
+      });
+
+      // Parse subsequent transactions
+      const transactions = txf.transactions;
+      if (Array.isArray(transactions)) {
+        for (const tx of transactions) {
+          const entry: NFTHistoryEntry = {
+            type: tx.type === 'transfer_out' ? 'transfer_out' : 'transfer_in',
+            counterparty: tx.counterparty ?? tx.recipient ?? tx.sender,
+            counterpartyNametag: tx.counterpartyNametag,
+            timestamp: tx.timestamp ?? tx.inclusionProof?.timestamp ?? Date.now(),
+            txHash: tx.txHash ?? tx.hash,
+            confirmed: tx.confirmed !== false,
+          };
+          history.push(entry);
+        }
+      }
+
+      // Sort by timestamp ascending
+      history.sort((a, b) => a.timestamp - b.timestamp);
+
+      return history;
+    } catch {
+      return [];
+    }
+  }
+
+  // ==========================================================================
+  // Import / Export
+  // ==========================================================================
+
+  /**
+   * Import an NFT from a TXF token.
+   * Validates token type, parses metadata, registers collection if unknown,
+   * stores the token, and updates the in-memory index.
+   */
+  async importNFT(token: TxfToken): Promise<NFTRef> {
+    this._ensureInitialized();
+
+    // 1. Validate token type
+    if (token.genesis?.data?.tokenType !== NFT_TOKEN_TYPE_HEX) {
+      throw new SphereError(
+        `Token type ${token.genesis?.data?.tokenType} is not an NFT`,
+        'NFT_WRONG_TOKEN_TYPE',
+      );
+    }
+
+    // 2. Parse NFTTokenData
+    const tokenDataStr = typeof token.genesis.data.tokenData === 'string'
+      ? token.genesis.data.tokenData
+      : JSON.stringify(token.genesis.data.tokenData);
+
+    const nftData = parseNFTTokenData(tokenDataStr);
+    if (!nftData) {
+      throw new SphereError('Failed to parse NFT token data', 'NFT_PARSE_ERROR');
+    }
+
+    // 3. Get tokenId
+    const tokenId = token.genesis.data.tokenId;
+    if (!tokenId) {
+      throw new SphereError('NFT token has no tokenId', 'NFT_PARSE_ERROR');
+    }
+
+    // 4. Check for duplicate (idempotent)
+    const existing = this._nftIndex.get(tokenId);
+    if (existing) {
+      logger.debug(LOG_TAG, `NFT ${tokenId.slice(0, 16)}... already exists (idempotent import)`);
+      return existing;
+    }
+
+    // 5. Register collection if unknown
+    if (nftData.collectionId) {
+      this._ensureCollectionRegistered(nftData.collectionId, nftData);
+    }
+
+    // 6. Store token via PaymentsModule.addToken()
+    const uiToken: Token = {
+      id: tokenId,
+      coinId: NFT_TOKEN_TYPE_HEX,
+      symbol: 'NFT',
+      name: nftData.metadata.name,
+      decimals: 0,
+      amount: '1',
+      status: 'confirmed',
+      createdAt: nftData.mintedAt,
+      updatedAt: Date.now(),
+      sdkData: JSON.stringify(token),
+    };
+
+    await this.deps.payments.addToken(uiToken);
+
+    // 7. Add to in-memory index
+    const nftRef = this._buildNFTRef(tokenId, nftData, true);
+    this._nftIndex.set(tokenId, nftRef);
+    this._updateCollectionTokenCount();
+
+    // 8. Emit event
+    this.deps.emitEvent('nft:imported', {
+      tokenId,
+      collectionId: nftData.collectionId,
+      name: nftData.metadata.name,
+    });
+
+    logger.debug(LOG_TAG, `NFT imported: ${tokenId.slice(0, 16)}... "${nftData.metadata.name}"`);
+
+    return nftRef;
+  }
+
+  /**
+   * Export an NFT as a TXF token for external transfer or backup.
+   * Returns the raw TXF data, or null if the token is not found.
+   */
+  async exportNFT(tokenId: string): Promise<TxfToken | null> {
+    this._ensureInitialized();
+
+    // Get token from PaymentsModule
+    const allTokens = this.deps.payments.getTokens();
+    const token = allTokens.find((t) => t.id === tokenId);
+    if (!token || !token.sdkData) return null;
+
+    try {
+      const txf = JSON.parse(token.sdkData) as TxfToken;
+      // Verify it's an NFT
+      if (txf.genesis?.data?.tokenType !== NFT_TOKEN_TYPE_HEX) return null;
+      return txf;
+    } catch {
+      return null;
+    }
+  }
+
+  // ==========================================================================
+  // Verification
+  // ==========================================================================
+
+  /**
+   * Verify an NFT against the aggregator/oracle.
+   * Checks inclusion proof validity and whether the token has been spent.
+   */
+  async verifyNFT(tokenId: string): Promise<NFTVerificationResult> {
+    this._ensureInitialized();
+
+    // 1. Get token from PaymentsModule
+    const allTokens = this.deps.payments.getTokens();
+    const token = allTokens.find((t) => t.id === tokenId);
+    if (!token || !token.sdkData) {
+      throw new SphereError(`NFT ${tokenId} not found in wallet`, 'NFT_NOT_FOUND');
+    }
+
+    // 2. Parse TXF and verify type
+    const txf = JSON.parse(token.sdkData);
+    if (txf?.genesis?.data?.tokenType !== NFT_TOKEN_TYPE_HEX) {
+      throw new SphereError(`Token ${tokenId} is not an NFT`, 'NFT_WRONG_TOKEN_TYPE');
+    }
+
+    // 3. Delegate to oracle validation
+    const errors: string[] = [];
+    try {
+      const result = await this.deps.oracle.validateToken(txf);
+
+      const verificationResult: NFTVerificationResult = {
+        valid: result.valid,
+        spent: result.spent,
+        stateHash: result.stateHash,
+        errors: result.error ? [result.error] : undefined,
+      };
+
+      // 4. Emit event
+      this.deps.emitEvent('nft:verified', {
+        tokenId,
+        valid: verificationResult.valid,
+        spent: verificationResult.spent,
+      });
+
+      logger.debug(LOG_TAG, `NFT verified: ${tokenId.slice(0, 16)}... valid=${verificationResult.valid} spent=${verificationResult.spent}`);
+
+      return verificationResult;
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
+      return {
+        valid: false,
+        spent: false,
+        errors,
+      };
+    }
   }
 
   // ==========================================================================

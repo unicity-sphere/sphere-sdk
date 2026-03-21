@@ -343,7 +343,7 @@ export interface InvoiceTransferRef {
  */
 export interface IrrelevantTransfer extends InvoiceTransferRef {
   /** Why this transfer is irrelevant */
-  readonly reason: 'unknown_address' | 'unknown_asset' | 'unknown_address_and_asset' | 'self_payment' | 'no_coin_data' | 'unauthorized_return';
+  readonly reason: 'unknown_address' | 'unknown_asset' | 'unknown_address_and_asset' | 'self_payment' | 'no_coin_data' | 'unauthorized_return' | 'nft_mismatch';
 }
 
 /**
