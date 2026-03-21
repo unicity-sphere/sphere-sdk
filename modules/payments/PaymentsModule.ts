@@ -2924,11 +2924,11 @@ export class PaymentsModule {
     // with the persistent subscription.
     await this.deps!.transport.fetchPendingEvents();
 
-    // Reload from storage to get a clean, consistent state.
-    // Handlers save tokens during processing (with potentially different IDs for
-    // V5 pending tokens vs finalized tokens). load() clears the in-memory map
-    // and reloads from TXF + pending V5 storage, ensuring no duplicates.
-    await this.load();
+    // Allow async handlers (AccountingModule._handleIncomingTransfer, token change
+    // notifications, etc.) to complete before reading the token map. These are
+    // fire-and-forget but they run on the microtask queue. A short yield ensures
+    // they finish before we snapshot the new state.
+    await new Promise(resolve => setTimeout(resolve, 200));
 
     // Identify newly added tokens
     const received: IncomingTransfer[] = [];
