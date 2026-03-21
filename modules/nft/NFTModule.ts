@@ -321,11 +321,34 @@ export class NFTModule {
         }
 
         // Reserve edition range atomically
+        // Validate: don't allow mixing explicit and auto-increment editions in a batch
+        // (mixing can cause collisions between explicit values and auto-incremented counter)
+        const hasExplicit = items.some(i => i.edition !== undefined);
+        const hasAuto = items.some(i => i.edition === undefined);
+        if (hasExplicit && hasAuto) {
+          throw new SphereError(
+            'Batch mint cannot mix explicit and auto-incremented editions',
+            'NFT_INVALID_METADATA',
+          );
+        }
+
         editions = [];
-        for (let i = 0; i < items.length; i++) {
-          if (items[i].edition !== undefined) {
-            editions.push(items[i].edition!);
-          } else {
+        if (hasExplicit) {
+          // All explicit — validate no duplicates
+          const seen = new Set<number>();
+          for (const item of items) {
+            if (seen.has(item.edition!)) {
+              throw new SphereError(
+                `Duplicate edition number in batch: ${item.edition}`,
+                'NFT_INVALID_METADATA',
+              );
+            }
+            seen.add(item.edition!);
+            editions.push(item.edition!);
+          }
+        } else {
+          // All auto-increment — reserve range atomically
+          for (let i = 0; i < items.length; i++) {
             const nextEd = await this._registry.getNextEdition(collectionId);
             editions.push(nextEd);
           }
@@ -415,10 +438,12 @@ export class NFTModule {
     }
 
     // 3. Delegate to PaymentsModule
+    // Use NFT_TOKEN_TYPE_HEX as coinId (not the unique tokenId) so the receiver's
+    // NFTModule can index the token correctly on load. Token selection uses _tokenIds.
     const result = await this.deps.payments.send({
       recipient,
       amount: '1',
-      coinId: tokenId,
+      coinId: NFT_TOKEN_TYPE_HEX,
       memo,
       _nftTransfer: true,
       _tokenIds: [tokenId],

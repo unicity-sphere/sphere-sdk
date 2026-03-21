@@ -21,6 +21,23 @@ import type { NFTTokenData, NFTMetadata, NFTAttribute, NFTContent, CollectionDef
 export { NFT_TOKEN_TYPE_HEX } from '../../constants.js';
 
 /**
+ * Recursively sort object keys alphabetically at all nesting levels.
+ * Arrays are preserved in order; non-objects pass through unchanged.
+ */
+function sortObjectKeysDeep(obj: unknown): unknown {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) return obj.map(sortObjectKeysDeep);
+  if (typeof obj === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(obj as Record<string, unknown>).sort()) {
+      sorted[key] = sortObjectKeysDeep((obj as Record<string, unknown>)[key]);
+    }
+    return sorted;
+  }
+  return obj;
+}
+
+/**
  * Produce a deterministic JSON string from NFTTokenData.
  *
  * Top-level key order: collectionId, edition, metadata, mintedAt, minter, totalEditions
@@ -62,7 +79,7 @@ function serializeMetadata(m: NFTMetadata): Record<string, unknown> {
   sorted.externalUrl = m.externalUrl ?? null;
   sorted.image = m.image;
   sorted.name = m.name;
-  sorted.properties = m.properties ?? null;
+  sorted.properties = m.properties ? sortObjectKeysDeep(m.properties) : null;
 
   return sorted;
 }

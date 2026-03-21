@@ -106,7 +106,8 @@ describe('NFTModule — Transfer', () => {
 
     const sendCall = payments.send.mock.calls[0][0];
     expect(sendCall.recipient).toBe('@bob');
-    expect(sendCall.coinId).toBe(nftTokenId);
+    // coinId should be NFT_TOKEN_TYPE_HEX (not the unique tokenId) so receiver indexes correctly
+    expect(sendCall.coinId).toBe(NFT_TOKEN_TYPE_HEX);
     expect(sendCall._nftTransfer).toBe(true);
     expect(sendCall._tokenIds).toEqual([nftTokenId]);
 
@@ -317,9 +318,9 @@ describe('NFTModule — Transfer', () => {
     const result = await mod.sendNFT(standaloneTxf.tokenId, '@bob');
     expect(result.status).toBe('completed');
 
-    // Verify the send call used the tokenId as coinId
+    // Verify the send call used NFT_TOKEN_TYPE_HEX as coinId (not the unique tokenId)
     const sendCall = payments.send.mock.calls[0][0];
-    expect(sendCall.coinId).toBe(standaloneTxf.tokenId);
+    expect(sendCall.coinId).toBe(NFT_TOKEN_TYPE_HEX);
     expect(sendCall._nftTransfer).toBe(true);
 
     // NFT should be removed from index
