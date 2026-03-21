@@ -345,19 +345,24 @@ export class NFTModule {
           0, // totalEditions for batch
           item.recipient,
           false, // ownsEdition = false — batch coordinator owns editions
-        ).then((result) => ({ index, result })),
+        ).then(
+          (result) => ({ index, result }),
+          (err) => { throw Object.assign(err instanceof Error ? err : new Error(String(err)), { batchIndex: index }); },
+        ),
       );
 
       const settled = await Promise.allSettled(mintPromises);
 
       const results: MintNFTResult[] = [];
       const errors: Array<{ index: number; error: string }> = [];
+      let failureCount = 0;
 
       for (const outcome of settled) {
         if (outcome.status === 'fulfilled') {
           results.push(outcome.value.result);
         } else {
-          const idx = (outcome.reason as { index?: number })?.index ?? -1;
+          failureCount++;
+          const idx = (outcome.reason as { batchIndex?: number })?.batchIndex ?? -1;
           errors.push({
             index: idx,
             error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason),
@@ -365,10 +370,17 @@ export class NFTModule {
         }
       }
 
+      // Roll back edition counter for failed mints (batch coordinator owns editions)
+      if (failureCount > 0 && collectionId) {
+        for (let i = 0; i < failureCount; i++) {
+          try { await this._registry.rollbackEdition(collectionId); } catch { /* ignore */ }
+        }
+      }
+
       return {
         results,
         successCount: results.length,
-        failureCount: errors.length,
+        failureCount,
         errors: errors.length > 0 ? errors : undefined,
       };
     });
