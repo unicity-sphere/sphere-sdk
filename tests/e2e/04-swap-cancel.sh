@@ -123,14 +123,21 @@ else
   ok "4c: Cancel command sent"
 fi
 
-# Wait for escrow to process cancellation + auto-return
-# Auto-return requires: escrow cancel → invoice cancel → auto-return send →
-# token transfer via Nostr → Alice receive. This can take 30-60s.
-log "4c: Waiting for deposit return (up to 120s)..."
-sleep 60
-
-# Alice should receive her BTC back via auto-return
-ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
+# Wait for escrow to process cancellation + auto-return.
+# Chain: escrow cancel → invoice cancel → auto-return send → aggregator
+# confirmation → Nostr delivery → Alice receive+finalize. 60-120s on testnet.
+log "4c: Waiting for deposit return (polling up to 180s)..."
+RETURN_ELAPSED=0
+ALICE_BAL=""
+while [[ $RETURN_ELAPSED -lt 180 ]]; do
+  ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
+  if echo "$ALICE_BAL" | grep -q "BTC"; then
+    log "4c: BTC returned after ~${RETURN_ELAPSED}s"
+    break
+  fi
+  sleep 15
+  RETURN_ELAPSED=$((RETURN_ELAPSED + 15))
+done
 log "4c: Alice balance after cancel:"
 echo "$ALICE_BAL" | grep "BTC" || echo "$ALICE_BAL" | tail -5
 
