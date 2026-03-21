@@ -1118,7 +1118,10 @@ export class PaymentsModule {
         // ── NFT / explicit token selection path ──────────────────────────────
         // When _tokenIds is set, select tokens by exact ID instead of
         // coinId-based pool selection. No splitting, no spend queue.
-        const selectedTokens: TokenWithAmount[] = [];
+        //
+        // CRITICAL: Mark tokens as 'transferring' SYNCHRONOUSLY before any await
+        // to prevent concurrent sendNFT() calls from double-spending the same token.
+        const tokensToReserve: Token[] = [];
         for (const tid of request._tokenIds) {
           const token = this.tokens.get(tid);
           if (!token) {
@@ -1133,23 +1136,40 @@ export class PaymentsModule {
               'SEND_INSUFFICIENT_BALANCE',
             );
           }
-          // Parse SDK token from stored TXF data
-          const txfData = token.sdkData ? JSON.parse(token.sdkData) : null;
-          if (!txfData) {
-            throw new SphereError(
-              `Token ${tid} has no SDK data`,
-              'SEND_INSUFFICIENT_BALANCE',
+          tokensToReserve.push(token);
+        }
+        // Mark all selected tokens as transferring BEFORE any async operations
+        for (const token of tokensToReserve) {
+          token.status = 'transferring';
+        }
+
+        const selectedTokens: TokenWithAmount[] = [];
+        try {
+          for (const token of tokensToReserve) {
+            // Parse SDK token from stored TXF data
+            const txfData = token.sdkData ? JSON.parse(token.sdkData) : null;
+            if (!txfData) {
+              throw new SphereError(
+                `Token ${token.id} has no SDK data`,
+                'SEND_INSUFFICIENT_BALANCE',
+              );
+            }
+            const { Token: SdkToken } = await import(
+              '@unicitylabs/state-transition-sdk/lib/token/Token.js'
             );
+            const sdkToken = await SdkToken.fromJSON(txfData);
+            selectedTokens.push({
+              sdkToken,
+              uiToken: token,
+              amount: BigInt(token.amount || '1'),
+            });
           }
-          const { Token: SdkToken } = await import(
-            '@unicitylabs/state-transition-sdk/lib/token/Token.js'
-          );
-          const sdkToken = await SdkToken.fromJSON(txfData);
-          selectedTokens.push({
-            sdkToken,
-            uiToken: token,
-            amount: BigInt(token.amount || '1'),
-          });
+        } catch (e) {
+          // Rollback status on failure
+          for (const token of tokensToReserve) {
+            if (token.status === 'transferring') token.status = 'confirmed';
+          }
+          throw e;
         }
         splitPlan = {
           tokensToTransferDirectly: selectedTokens,

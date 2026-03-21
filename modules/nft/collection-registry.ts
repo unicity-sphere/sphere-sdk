@@ -105,6 +105,23 @@ export class CollectionRegistry {
   }
 
   /**
+   * Roll back the edition counter by decrementing it.
+   * Used when a mint fails after the counter was incremented.
+   * Safe to call multiple times — counter will not go below 1.
+   */
+  async rollbackEdition(collectionId: string): Promise<void> {
+    if (!this.storage) return;
+    const key = getAddressStorageKey(
+      this.addressId,
+      `${STORAGE_KEYS_ADDRESS.NFT_MINT_COUNTER}_${collectionId}`,
+    );
+    const raw = await this.storage.get(key);
+    const current = raw ? parseInt(raw, 10) : 1;
+    const value = isNaN(current) ? 1 : Math.max(1, current - 1);
+    await this.storage.set(key, String(value));
+  }
+
+  /**
    * Get the current edition count without incrementing.
    */
   async getEditionCount(collectionId: string): Promise<number> {

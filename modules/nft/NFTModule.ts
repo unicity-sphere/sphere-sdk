@@ -111,6 +111,11 @@ export class NFTModule {
     });
     this._eventUnsubscribers.push(unsubIncoming);
 
+    // Note: Orphaned mint intents from prior crashes (nft_mint_intent_* keys)
+    // are not scanned here because StorageProvider has no list-by-prefix API.
+    // They are naturally overwritten on next mint for the same collection+edition.
+    // For deterministic minting, crash recovery works via REQUEST_ID_EXISTS.
+
     this._initialized = true;
     logger.debug(LOG_TAG, `Loaded: ${this._nftIndex.size} NFTs, ${this._collectionIndex.size} collections`);
   }
@@ -1128,6 +1133,10 @@ export class NFTModule {
         nft: nftRef,
       };
     } catch (err) {
+      // Roll back edition counter on failure (best-effort)
+      if (collectionId) {
+        try { await this._registry.rollbackEdition(collectionId); } catch { /* ignore */ }
+      }
       // Clean up mint intent on failure (best-effort)
       try {
         await deps.storage.remove(getAddressStorageKey(deps.addressId, mintIntentKey));

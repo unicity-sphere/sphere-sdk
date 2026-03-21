@@ -2626,6 +2626,7 @@ export class Sphere {
           });
         } catch (err) {
           logger.warn('Sphere', 'NFT module load failed:', err);
+          this._nft = null;
         }
       } else {
         logger.warn('Sphere', 'NFT module enabled but no token storage available — disabling');
@@ -4481,6 +4482,7 @@ export class Sphere {
           });
         } catch (err) {
           logger.warn('Sphere', 'NFT module load failed:', err);
+          this._nft = null;
         }
       } else {
         logger.warn('Sphere', 'NFT module enabled but no token storage available — disabling');
