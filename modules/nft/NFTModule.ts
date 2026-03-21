@@ -344,6 +344,7 @@ export class NFTModule {
           editions[index],
           0, // totalEditions for batch
           item.recipient,
+          false, // ownsEdition = false — batch coordinator owns editions
         ).then((result) => ({ index, result })),
       );
 
@@ -801,6 +802,8 @@ export class NFTModule {
     }
     // For standalone NFTs: resolvedEdition stays 0
 
+    // ownsEdition = true only when getNextEdition was called (auto-increment, not explicit)
+    const ownsEdition = collectionId !== undefined && edition === undefined;
     return this._mintSingleNFTInternal(
       metadata,
       collectionId ?? null,
@@ -808,6 +811,7 @@ export class NFTModule {
       resolvedEdition,
       totalEditions ?? 0,
       recipient,
+      ownsEdition,
     );
   }
 
@@ -822,6 +826,8 @@ export class NFTModule {
     edition: number,
     totalEditions: number,
     recipient?: string,
+    /** When true, this function owns the edition allocation and should roll back on failure */
+    ownsEdition = true,
   ): Promise<MintNFTResult> {
     const deps = this.deps;
 
@@ -1134,7 +1140,9 @@ export class NFTModule {
       };
     } catch (err) {
       // Roll back edition counter on failure (best-effort)
-      if (collectionId) {
+      // Only rollback if this function owns the edition (single mint path).
+      // Batch mints allocate editions in the coordinator and should NOT rollback here.
+      if (ownsEdition && collectionId) {
         try { await this._registry.rollbackEdition(collectionId); } catch { /* ignore */ }
       }
       // Clean up mint intent on failure (best-effort)
