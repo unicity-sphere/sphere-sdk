@@ -106,6 +106,7 @@ describe('NFTModule — Transfer', () => {
 
     const sendCall = payments.send.mock.calls[0][0];
     expect(sendCall.recipient).toBe('@bob');
+    expect(sendCall.coinId).toBe(nftTokenId);
     expect(sendCall._nftTransfer).toBe(true);
     expect(sendCall._tokenIds).toEqual([nftTokenId]);
 
@@ -254,5 +255,75 @@ describe('NFTModule — Transfer', () => {
 
     const sendCall = payments.send.mock.calls[0][0];
     expect(sendCall.recipient).toBe('DIRECT://some_address');
+  });
+
+  // UT-XFER-011: sequential sendNFT — second call fails after first succeeds
+  it('UT-XFER-011: sequential sendNFT — second call after successful first fails with NFT_NOT_FOUND', async () => {
+    // First transfer succeeds and removes the NFT from the index
+    const result1 = await mod.sendNFT(nftTokenId, '@alice');
+    expect(result1.status).toBe('completed');
+
+    // Verify NFT was removed from index
+    const nfts = mod.getNFTs();
+    expect(nfts.find((n) => n.tokenId === nftTokenId)).toBeUndefined();
+
+    // Second transfer for the same tokenId should fail with NFT_NOT_FOUND
+    try {
+      await mod.sendNFT(nftTokenId, '@charlie');
+      expect.fail('Should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SphereError);
+      expect((err as SphereError).code).toBe('NFT_NOT_FOUND');
+    }
+  });
+
+  // UT-XFER-012: standalone NFT transfer (collectionId=null)
+  it('UT-XFER-012: sendNFT for standalone NFT (collectionId=null) succeeds', async () => {
+    // Add a standalone NFT (no collection)
+    const standaloneTxf = createNFTTxfToken({
+      collectionId: null,
+      metadata: createTestMetadata({ name: 'Standalone Art' }),
+      edition: 0,
+    });
+
+    const standaloneToken: Token = {
+      id: standaloneTxf.tokenId,
+      coinId: NFT_TOKEN_TYPE_HEX,
+      symbol: 'NFT',
+      name: 'Standalone Art',
+      decimals: 0,
+      amount: '1',
+      status: 'confirmed',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      sdkData: JSON.stringify(standaloneTxf),
+    };
+
+    const payments = config.payments as unknown as MockPaymentsModule;
+    payments._tokens.push(standaloneToken);
+
+    // Reload to pick up the new token
+    await mod.destroy();
+    mod = new NFTModule();
+    await mod.load(config);
+
+    // Verify standalone NFT was indexed
+    const nfts = mod.getNFTs();
+    const found = nfts.find((n) => n.tokenId === standaloneTxf.tokenId);
+    expect(found).toBeDefined();
+    expect(found!.collectionId).toBeNull();
+
+    // Transfer should succeed (no collection means transferable by default)
+    const result = await mod.sendNFT(standaloneTxf.tokenId, '@bob');
+    expect(result.status).toBe('completed');
+
+    // Verify the send call used the tokenId as coinId
+    const sendCall = payments.send.mock.calls[0][0];
+    expect(sendCall.coinId).toBe(standaloneTxf.tokenId);
+    expect(sendCall._nftTransfer).toBe(true);
+
+    // NFT should be removed from index
+    const nftsAfter = mod.getNFTs();
+    expect(nftsAfter.find((n) => n.tokenId === standaloneTxf.tokenId)).toBeUndefined();
   });
 });

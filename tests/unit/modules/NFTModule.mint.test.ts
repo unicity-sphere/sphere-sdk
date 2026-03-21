@@ -19,7 +19,7 @@ import {
   SphereError,
 } from './nft-test-helpers.js';
 import type { NFTModuleConfig } from '../../../modules/nft/types.js';
-import type { MockPaymentsModule, MockOracleProvider } from './nft-test-helpers.js';
+import type { MockPaymentsModule, MockOracleProvider, MockStorageProvider } from './nft-test-helpers.js';
 
 // =============================================================================
 // Mock state-transition-sdk dynamic imports
@@ -127,6 +127,10 @@ describe('NFTModule — Minting', () => {
   let collectionId: string;
 
   beforeEach(async () => {
+    // Reset fakeDataHasher.digest to prevent test interference (UT-MINT-019/027)
+    fakeDataHasher.digest.mockReset();
+    fakeDataHasher.digest.mockResolvedValue(fakeHash);
+
     const loaded = await createLoadedNFTModule();
     mod = loaded.module;
     config = loaded.config;
@@ -166,6 +170,16 @@ describe('NFTModule — Minting', () => {
     // Oracle stClient was called
     const oracle = config.oracle as unknown as MockOracleProvider;
     expect(oracle.getStateTransitionClient).toHaveBeenCalled();
+
+    // Crash recovery intent was written then cleaned up
+    const storage = config.storage as unknown as MockStorageProvider;
+    const setCalls = storage.set.mock.calls.map((c: unknown[]) => c[0] as string);
+    const intentSetCall = setCalls.find((k: string) => k.includes('nft_mint_intent_'));
+    expect(intentSetCall).toBeDefined();
+
+    const removeCalls = storage.remove.mock.calls.map((c: unknown[]) => c[0] as string);
+    const intentRemoveCall = removeCalls.find((k: string) => k.includes('nft_mint_intent_'));
+    expect(intentRemoveCall).toBeDefined();
   });
 
   // UT-MINT-002a: standalone happy path

@@ -459,6 +459,66 @@ describe('NFTModule.serialization', () => {
   });
 
   // ---------------------------------------------------------------------------
+  // UT-SER-013a: real canonicalSerializeNFT produces correct JSON structure
+  // ---------------------------------------------------------------------------
+  describe('UT-SER-013a: real canonicalSerializeNFT produces correct JSON structure', () => {
+    it('should produce alphabetically ordered keys and include required properties', () => {
+      const data = createTestNFTTokenData({
+        collectionId: 'c'.repeat(64),
+        metadata: createTestMetadata({ name: 'Structure Test', description: 'Testing output format' }),
+        edition: 3,
+        totalEditions: 10,
+        minter: TEST_IDENTITY.chainPubkey,
+        mintedAt: 1700000000000,
+      });
+
+      const result = canonicalSerializeNFT(data);
+      const parsed = JSON.parse(result);
+
+      // Verify keys are in alphabetical order at top level
+      const keys = Object.keys(parsed);
+      expect(keys).toEqual([...keys].sort());
+
+      // Verify required properties are present
+      expect(parsed).toHaveProperty('collectionId');
+      expect(parsed).toHaveProperty('metadata');
+      expect(parsed).toHaveProperty('edition');
+      expect(parsed).toHaveProperty('mintedAt');
+      expect(parsed).toHaveProperty('minter');
+      expect(parsed).toHaveProperty('totalEditions');
+
+      // Verify collectionId value
+      expect(parsed.collectionId).toBe('c'.repeat(64));
+
+      // Verify metadata keys are also alphabetically ordered
+      const metaKeys = Object.keys(parsed.metadata);
+      expect(metaKeys).toEqual([...metaKeys].sort());
+
+      // Verify metadata has image and name
+      expect(parsed.metadata.name).toBe('Structure Test');
+      expect(parsed.metadata.image).toBe('ipfs://QmTestHash123');
+    });
+
+    it('should produce correct structure for standalone NFT (null collectionId)', () => {
+      const data = createTestNFTTokenData({
+        collectionId: null,
+        metadata: createTestMetadata({ name: 'Standalone' }),
+        edition: 0,
+        totalEditions: 0,
+        mintedAt: 1700000000000,
+      });
+
+      const result = canonicalSerializeNFT(data);
+      const parsed = JSON.parse(result);
+
+      expect(parsed.collectionId).toBeNull();
+      expect(parsed.edition).toBe(0);
+      expect(parsed.totalEditions).toBe(0);
+      expect(parsed.metadata.name).toBe('Standalone');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // UT-SER-014: unicode in metadata — handled correctly
   // ---------------------------------------------------------------------------
   describe('UT-SER-014: unicode in metadata — handled correctly', () => {
