@@ -318,6 +318,19 @@ try {
 | `sphere.swap.getSwaps(filter?)` | `SwapRef[]` | List swaps with filter |
 | `sphere.swap.verifyPayout(swapId)` | `boolean` | Verify payout received |
 | `sphere.swap.cancelSwap(swapId)` | `void` | Cancel a swap |
+| `sphere.nft.createCollection(request)` | `CreateCollectionResult` | Create NFT collection |
+| `sphere.nft.mintNFT(metadata, collectionId?, ...)` | `MintNFTResult` | Mint a single NFT |
+| `sphere.nft.batchMintNFT(items, collectionId?)` | `BatchMintNFTResult` | Batch mint NFTs |
+| `sphere.nft.sendNFT(tokenId, recipient, memo?)` | `TransferResult` | Send an NFT |
+| `sphere.nft.getNFT(tokenId)` | `NFTDetail \| null` | Get NFT details |
+| `sphere.nft.getNFTs(options?)` | `NFTRef[]` | List NFTs with filters |
+| `sphere.nft.getCollection(collectionId)` | `CollectionRef \| null` | Get collection details |
+| `sphere.nft.getCollections(options?)` | `CollectionRef[]` | List collections |
+| `sphere.nft.getCollectionNFTs(collectionId)` | `NFTRef[]` | List NFTs in a collection |
+| `sphere.nft.importNFT(token)` | `NFTRef` | Import NFT from TXF |
+| `sphere.nft.exportNFT(tokenId)` | `TxfToken \| null` | Export NFT as TXF |
+| `sphere.nft.verifyNFT(tokenId)` | `NFTVerificationResult` | Verify against aggregator |
+| `sphere.nft.getNFTHistory(tokenId)` | `NFTHistoryEntry[]` | NFT ownership/transfer history |
 
 ### Key Events
 
@@ -359,6 +372,12 @@ try {
 | `swap:failed` | `{ swapId, error }` | Swap failed (terminal) |
 | `swap:deposit_returned` | `{ swapId, transfer, returnReason }` | Deposit returned after cancellation |
 | `swap:bounce_received` | `{ swapId, reason, returnedAmount, returnedCurrency }` | Wrong-currency deposit bounced |
+| `nft:minted` | `{ tokenId, collectionId, name, confirmed }` | NFT minted |
+| `nft:received` | `{ tokenId, collectionId, name, senderPubkey, senderNametag? }` | NFT received via transfer |
+| `nft:transferred` | `{ tokenId, collectionId, recipientPubkey, recipientNametag? }` | NFT sent |
+| `nft:verified` | `{ tokenId, valid, spent }` | NFT verification completed |
+| `nft:collection_created` | `{ collectionId, name }` | Collection created |
+| `nft:imported` | `{ tokenId, collectionId, name }` | NFT imported from TXF |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
 
@@ -405,6 +424,11 @@ sphere-sdk/
 │   │   ├── memo.ts                # Invoice memo encoding/decoding
 │   │   ├── serialization.ts       # Canonical serialization + INVOICE_TOKEN_TYPE_HEX
 │   │   └── index.ts               # Barrel exports + createAccountingModule factory
+│   ├── nft/
+│   │   ├── NFTModule.ts           # NFT minting, transfer, collection management
+│   │   ├── types.ts               # NFTMetadata, CollectionDefinition, NFTRef, etc.
+│   │   ├── serialization.ts       # Canonical serialization + NFT_TOKEN_TYPE_HEX
+│   │   └── index.ts               # Barrel exports + createNFTModule factory
 │   ├── groupchat/
 │   │   ├── GroupChatModule.ts     # NIP-29 group chat (relay-based)
 │   │   ├── types.ts               # GroupData, GroupMessageData, etc.
@@ -746,6 +770,28 @@ OPEN / PARTIAL / COVERED  → EXPIRED  (overlay — dueDate passed, not covered 
 **Receipts and cancellation notices.** `sendInvoiceReceipts()` sends a structured `InvoiceReceiptPayload` DM to each contributing sender. `sendCancellationNotices()` sends an `InvoiceCancellationPayload` DM. Both are delivered via `CommunicationsModule` (Nostr NIP-17). Incoming receipts and notices fire `invoice:receipt_received` and `invoice:cancellation_received` events respectively.
 
 **Multi-target invoices.** A single invoice can specify multiple `InvoiceTarget` entries, each with its own `address` and asset list. Status is computed per-target and per-coinId. An invoice is `COVERED` only when every target has met its full requested amount.
+
+### NFT Module
+
+`NFTModule` (`sphere.nft`) manages non-fungible token creation, transfer, collection management, and metadata handling. Enable it by passing `nft: true` to `Sphere.init()`.
+
+**NFT IS a token.** An NFT is a minted on-chain token with `tokenType = NFT_TOKEN_TYPE_HEX` (SHA-256 of `"unicity.nft.v1"`). The NFT metadata (name, image, description, attributes) is serialized into `genesis.data.tokenData` and is immutable once minted. The token ID is the NFT ID -- guaranteed unique by the aggregator.
+
+**Collections.** NFTs can optionally belong to a collection, identified by a `collectionId` (SHA-256 of the canonical collection definition). Collections can enforce supply limits (`maxSupply`), transferability rules (`transferable: false` for soulbound), and deterministic minting (`deterministicMinting: true`). Collection definitions are stored locally and do not require on-chain transactions.
+
+**Standalone vs collection NFTs.** Standalone NFTs have `collectionId: null`, `edition: 0`, and always use random salt. Collection NFTs have a linked `collectionId`, auto-incrementing edition numbers, and optionally use deterministic salt derivation.
+
+**Salt derivation strategies:**
+- **Random (default):** `crypto.getRandomValues(32 bytes)` -- unpredictable token IDs, suitable for most use cases.
+- **Deterministic:** `HMAC-SHA256(privateKey, collectionId || edition)` -- only the emitter can compute valid token IDs. Enables crash recovery (same edition re-derives same token ID) and prevents third-party front-running.
+
+**ERC-721-compatible metadata.** NFT metadata follows the ERC-721 JSON schema (`name`, `description`, `image`, `attributes`) for interoperability with existing tools and marketplaces.
+
+**Read-only dependency on PaymentsModule.** NFTModule reads from PaymentsModule (`getTokens`, transfer events) and calls `send()` only for transfers. Incoming NFTs are detected via `transfer:incoming` events and indexed automatically. Errors during inbound NFT processing never block the underlying token transfer flow.
+
+**Concurrency.** Minting within the same collection is serialized through a per-collection promise chain (`_withCollectionGate`) to prevent edition number conflicts and supply limit races.
+
+See [NFT-ARCHITECTURE.md](docs/NFT-ARCHITECTURE.md), [NFT-SPEC.md](docs/NFT-SPEC.md), and [QUICKSTART-NFT.md](docs/QUICKSTART-NFT.md) for full details.
 
 ## Testing
 
