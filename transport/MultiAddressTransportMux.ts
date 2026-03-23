@@ -700,8 +700,6 @@ export class MultiAddressTransportMux {
     if (event.id && this.processedEventIds.has(event.id)) return;
     if (event.id) this.processedEventIds.add(event.id);
     // Track wallet events (non-gift-wrap) for subscription health check.
-    // Gift wraps (DMs) go through the chat subscription; wallet events
-    // (TOKEN_TRANSFER, etc.) go through the wallet subscription.
     if (event.kind !== EventKinds.GIFT_WRAP) {
       this.lastWalletEventAt = Date.now();
     }
