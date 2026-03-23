@@ -53,6 +53,14 @@ log ""; log "=== Swap A: deposits ==="
 deposit_swap "$BOB" "${SWAP_A:0:8}"
 deposit_swap "$ALICE" "${SWAP_A:0:8}"
 
+# Wait for change tokens from Swap A to be minted and written to disk.
+# Each CLI invocation is a separate process — the change token from Swap A's
+# deposit exists only in that process's memory. The background mint (~2-5s)
+# writes the real change token to TXF storage. Without this wait, Swap B's
+# CLI sees 0 balance.
+log "Waiting 15s for change tokens to finalize..."
+sleep 15
+
 # --- Both deposit into swap B ---
 log ""; log "=== Swap B: deposits ==="
 deposit_swap "$BOB" "${SWAP_B:0:8}"

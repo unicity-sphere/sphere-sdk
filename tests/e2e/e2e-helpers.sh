@@ -249,8 +249,12 @@ deposit_swap() {
   local profile="$1" prefix="$2"
   local out
   out=$(cli_as "$profile" swap-deposit "$prefix" 2>&1) || true
+  # Log the actual output so failures are visible
+  log "deposit_swap ${profile}: $(echo "$out" | grep -E 'status|Error|error|Deposit|announced|Insufficient|WRONG_STATE' | head -3)" >&2
   if echo "$out" | grep -qiE '"status".*"completed"'; then
     ok "${profile} deposit completed"
+  elif echo "$out" | grep -qiE 'error|fail|Insufficient'; then
+    fail "${profile} deposit failed: $(echo "$out" | grep -iE 'error|fail|Insufficient' | head -1)"
   else
     ok "${profile} deposit submitted"
   fi
