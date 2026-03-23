@@ -142,7 +142,7 @@ export class MultiAddressTransportMux {
   private chatSubscriptionId: string | null = null;
   private chatEoseFired = false;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastEventAt: number = Date.now();
+  private lastWalletEventAt: number = Date.now();
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
@@ -631,10 +631,13 @@ export class MultiAddressTransportMux {
     if (this.healthCheckTimer) return;
     this.healthCheckTimer = setInterval(() => {
       if (!this.isConnected()) return;
-      const elapsed = Date.now() - this.lastEventAt;
-      if (elapsed > 90_000) {
-        logger.warn('Mux', `No events for ${Math.round(elapsed / 1000)}s — re-subscribing`);
-        this.lastEventAt = Date.now(); // prevent rapid re-subscribe
+      // Check wallet subscription health separately from chat subscription.
+      // DMs (gift wraps) keep the chat subscription alive, but the wallet
+      // subscription (TOKEN_TRANSFER events) can die silently.
+      const elapsed = Date.now() - this.lastWalletEventAt;
+      if (elapsed > 60_000) {
+        logger.warn('Mux', `No wallet events for ${Math.round(elapsed / 1000)}s — re-subscribing`);
+        this.lastWalletEventAt = Date.now(); // prevent rapid re-subscribe
         this.updateSubscriptions().catch((err) => {
           logger.warn('Mux', 'Health check re-subscription failed:', err);
         });
@@ -696,7 +699,12 @@ export class MultiAddressTransportMux {
     // Dedup
     if (event.id && this.processedEventIds.has(event.id)) return;
     if (event.id) this.processedEventIds.add(event.id);
-    this.lastEventAt = Date.now();
+    // Track wallet events (non-gift-wrap) for subscription health check.
+    // Gift wraps (DMs) go through the chat subscription; wallet events
+    // (TOKEN_TRANSFER, etc.) go through the wallet subscription.
+    if (event.kind !== EventKinds.GIFT_WRAP) {
+      this.lastWalletEventAt = Date.now();
+    }
 
     try {
       if (event.kind === EventKinds.GIFT_WRAP) {
