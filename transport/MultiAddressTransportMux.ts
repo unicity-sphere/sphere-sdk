@@ -142,6 +142,8 @@ export class MultiAddressTransportMux {
   private chatSubscriptionId: string | null = null;
   private chatEoseFired = false;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastEventAt: number = Date.now();
+  private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
   // Dedup
@@ -338,6 +340,10 @@ export class MultiAddressTransportMux {
     if (this.resubscribeTimer) {
       clearTimeout(this.resubscribeTimer);
       this.resubscribeTimer = null;
+    }
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
     }
     if (this.nostrClient) {
       this.nostrClient.disconnect();
@@ -614,6 +620,26 @@ export class MultiAddressTransportMux {
     });
 
     logger.warn('Mux', `updateSubscriptions: walletSub=${this.walletSubscriptionId} chatSub=${this.chatSubscriptionId}`);
+
+    // Start subscription health check — if no events arrive for 90s,
+    // the relay may have silently dropped our subscriptions without
+    // sending CLOSED. Force re-subscribe to recover.
+    this.startHealthCheck();
+  }
+
+  private startHealthCheck(): void {
+    if (this.healthCheckTimer) return;
+    this.healthCheckTimer = setInterval(() => {
+      if (!this.isConnected()) return;
+      const elapsed = Date.now() - this.lastEventAt;
+      if (elapsed > 90_000) {
+        logger.warn('Mux', `No events for ${Math.round(elapsed / 1000)}s — re-subscribing`);
+        this.lastEventAt = Date.now(); // prevent rapid re-subscribe
+        this.updateSubscriptions().catch((err) => {
+          logger.warn('Mux', 'Health check re-subscription failed:', err);
+        });
+      }
+    }, 30_000);
   }
 
   /**
@@ -670,6 +696,7 @@ export class MultiAddressTransportMux {
     // Dedup
     if (event.id && this.processedEventIds.has(event.id)) return;
     if (event.id) this.processedEventIds.add(event.id);
+    this.lastEventAt = Date.now();
 
     try {
       if (event.kind === EventKinds.GIFT_WRAP) {
