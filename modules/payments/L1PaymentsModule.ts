@@ -192,9 +192,9 @@ export class L1PaymentsModule {
   }
 
   destroy(): void {
-    if (isWebSocketConnected()) {
-      l1Disconnect();
-    }
+    // Always disconnect — not just when OPEN. A WebSocket in CONNECTING state
+    // would otherwise be orphaned and keep the Fulcrum connection alive.
+    l1Disconnect();
     this._initialized = false;
     this._identity = undefined;
     this._addresses = [];
@@ -206,9 +206,7 @@ export class L1PaymentsModule {
    */
   disable(): void {
     this._disabled = true;
-    if (isWebSocketConnected()) {
-      l1Disconnect();
-    }
+    l1Disconnect();
   }
 
   /**
