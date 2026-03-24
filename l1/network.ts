@@ -27,11 +27,21 @@ let ws: WebSocket | null = null;
 let isConnected = false;
 let isConnecting = false;
 let requestId = 0;
-let intentionalClose = false;
+// intentionalClose removed — disconnect() detaches handlers before close(),
+// so onclose never fires from an intentional disconnect.
 let reconnectAttempts = 0;
 let isBlockSubscribed = false;
 let lastBlockHeader: BlockHeader | null = null;
 let pingTimer: ReturnType<typeof setInterval> | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Monotonically increasing connection epoch.  Every call to `connect()` that
+ * actually creates a new WebSocket bumps this counter.  The `onclose` handler
+ * captures the epoch at creation time and ignores the event if the epoch has
+ * since advanced — preventing stale handlers from corrupting singleton state.
+ */
+let connectionEpoch = 0;
 
 // Store timeout IDs for pending requests
 interface PendingRequestWithTimeout extends PendingRequest {
@@ -140,6 +150,23 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
 
   isConnecting = true;
 
+  // Clean up any orphaned WebSocket left from a previous cycle (e.g. a
+  // destroy/init race where disconnect() ran but onclose hasn't fired yet).
+  if (ws) {
+    try {
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      ws.close();
+    } catch { /* ignore */ }
+    ws = null;
+  }
+
+  // Bump epoch so that any stale onclose handler from a previously closed
+  // WebSocket will see a mismatch and bail out without corrupting state.
+  const epoch = ++connectionEpoch;
+
   return new Promise((resolve, reject) => {
     let hasResolved = false;
 
@@ -153,6 +180,9 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
     }
 
     ws.onopen = () => {
+      // Stale — a newer connect() already took over
+      if (epoch !== connectionEpoch) return;
+
       isConnected = true;
       isConnecting = false;
       reconnectAttempts = 0; // Reset reconnect counter on successful connection
@@ -169,6 +199,14 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
     };
 
     ws.onclose = () => {
+      // Stale — a newer connect() already took over; ignore to prevent
+      // corrupting isConnecting for the current connection.
+      if (epoch !== connectionEpoch) return;
+
+      // NOTE: This handler only fires for unexpected closes (server drop,
+      // network loss).  Intentional closes via disconnect() never reach here
+      // because disconnect() detaches all handlers before calling ws.close().
+
       isConnected = false;
       isBlockSubscribed = false; // Reset block subscription on disconnect
       stopPingTimer();
@@ -179,20 +217,6 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
         req.reject(new Error('WebSocket connection closed'));
       });
       Object.keys(pending).forEach((key) => delete pending[Number(key)]);
-
-      // Don't reconnect if this was an intentional close
-      if (intentionalClose) {
-        intentionalClose = false;
-        isConnecting = false;
-        reconnectAttempts = 0;
-
-        // Reject if we haven't resolved yet
-        if (!hasResolved) {
-          hasResolved = true;
-          reject(new Error('WebSocket connection closed intentionally'));
-        }
-        return;
-      }
 
       // Check if we've exceeded max reconnect attempts
       if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
@@ -225,7 +249,8 @@ export function connect(endpoint: string = DEFAULT_ENDPOINT): Promise<void> {
 
       // Keep isConnecting true so callers know reconnection is in progress
       // The resolve/reject will happen when reconnection succeeds or fails
-      setTimeout(() => {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
         connect(endpoint)
           .then(() => {
             if (!hasResolved) {
@@ -463,8 +488,19 @@ export async function getCurrentBlockHeight(): Promise<number> {
 
 export function disconnect() {
   stopPingTimer();
+  // Cancel any pending reconnect timer so it doesn't fire after disconnect.
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  // Bump epoch so any in-flight onclose/onopen from the old WebSocket is ignored.
+  connectionEpoch++;
   if (ws) {
-    intentionalClose = true;
+    // Detach handlers BEFORE closing to prevent stale events from firing.
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
     ws.close();
     ws = null;
   }
