@@ -677,8 +677,6 @@ export class PaymentsModule {
 
   // Token State
   private tokens: Map<string, Token> = new Map();
-  /** Tokens added via addToken() since the last loadFromStorageData(). Protected from clear+reload. */
-  private recentlyAddedTokens: Map<string, Token> = new Map();
   private pendingTransfers: Map<string, TransferResult> = new Map();
   private pendingBackgroundTasks: Promise<void>[] = [];
 
@@ -3804,8 +3802,6 @@ export class PaymentsModule {
 
     // Add the new token state
     this.tokens.set(token.id, token);
-    // Track as recently added — protected from loadFromStorageData's clear+reload
-    this.recentlyAddedTokens.set(token.id, token);
     logger.debug('Payments', `addToken: stored id=${token.id.slice(0, 16)}... mapSize=${this.tokens.size}`);
 
     // Archive the token (for recovery purposes)
@@ -5683,28 +5679,6 @@ export class PaymentsModule {
 
       this.tokens.set(token.id, token);
     }
-
-    // Restore recently-added tokens that aren't in the TXF data yet.
-    // These were added via addToken() (e.g., incoming deposits from Nostr)
-    // but the TXF save may not have completed before this reload. Unlike the
-    // previous snapshot approach (which restored ALL in-memory tokens including
-    // sent ones), this only restores tokens explicitly tracked by addToken().
-    let restoredCount = 0;
-    for (const [id, token] of this.recentlyAddedTokens) {
-      if (!this.tokens.has(id)) {
-        const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
-        const stateHash = extractStateHashFromSdkData(token.sdkData);
-        if (sdkTokenId && stateHash && this.isStateTombstoned(sdkTokenId, stateHash)) continue;
-        if (token.status === 'spent' || token.status === 'invalid') continue;
-        this.tokens.set(id, token);
-        restoredCount++;
-      }
-    }
-    if (restoredCount > 0) {
-      logger.debug('Payments', `loadFromStorageData: restored ${restoredCount} recently-added token(s) not yet in TXF`);
-    }
-    // Clear the tracking set — tokens are now either in TXF or restored
-    this.recentlyAddedTokens.clear();
 
     // Load other data
     this.archivedTokens = parsed.archivedTokens;
