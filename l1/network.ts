@@ -509,15 +509,18 @@ export function disconnect() {
   reconnectAttempts = 0;
   isBlockSubscribed = false;
 
-  // Clear all pending request timeouts
+  // Reject all pending RPC requests (they can no longer receive a response)
+  const disconnectError = new Error('WebSocket disconnected');
   Object.values(pending).forEach((req) => {
     if (req.timeoutId) clearTimeout(req.timeoutId);
+    req.reject(disconnectError);
   });
   Object.keys(pending).forEach((key) => delete pending[Number(key)]);
 
-  // Clear connection callback timeouts
+  // Reject all waitForConnection() callers
   connectionCallbacks.forEach((cb) => {
     if (cb.timeoutId) clearTimeout(cb.timeoutId);
+    cb.reject(disconnectError);
   });
   connectionCallbacks.length = 0;
 
