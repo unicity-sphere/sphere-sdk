@@ -58,8 +58,19 @@ deposit_swap "$ALICE" "${SWAP_A:0:8}"
 # deposit exists only in that process's memory. The background mint (~2-5s)
 # writes the real change token to TXF storage. Without this wait, Swap B's
 # CLI sees 0 balance.
-log "Waiting 15s for change tokens to finalize..."
-sleep 15
+# Poll for Alice's balance to include BTC (change token from split).
+# On testnet, the background mint takes 10-30s.
+log "Waiting for change token from Swap A to arrive..."
+CHANGE_ELAPSED=0
+while [[ $CHANGE_ELAPSED -lt 60 ]]; do
+  ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
+  if echo "$ALICE_BAL" | grep -q "BTC"; then
+    log "Change token arrived after ~${CHANGE_ELAPSED}s"
+    break
+  fi
+  sleep 5
+  CHANGE_ELAPSED=$((CHANGE_ELAPSED + 5))
+done
 
 # --- Both deposit into swap B ---
 log ""; log "=== Swap B: deposits ==="
