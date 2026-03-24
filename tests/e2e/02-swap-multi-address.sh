@@ -29,10 +29,15 @@ log ""; log "=== Create wallets ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
 
-# --- Topup ---
+# --- Topup: separate tokens for each swap ---
+# Each topup creates a separate token. Using multiple topups ensures
+# each swap can use its own token without depending on change tokens
+# from prior splits (change tokens require background aggregator round-trip).
 log ""; log "=== Topup ==="
-topup_wallet "$ALICE" BTC 20
-topup_wallet "$BOB" ETH 200
+topup_wallet "$ALICE" BTC 1    # for Swap A
+topup_wallet "$ALICE" BTC 2    # for Swap B
+topup_wallet "$BOB" ETH 10     # for Swap A
+topup_wallet "$BOB" ETH 20     # for Swap B
 
 # --- Propose TWO swaps ---
 log ""; log "=== Propose swap A: 1 BTC ↔ 10 ETH ==="
@@ -58,20 +63,6 @@ deposit_swap "$ALICE" "${SWAP_A:0:8}"
 # deposit exists only in that process's memory. The background mint (~2-5s)
 # writes the real change token to TXF storage. Without this wait, Swap B's
 # CLI sees 0 balance.
-# Poll for Alice's balance to include BTC (change token from split).
-# On testnet, the background mint takes 10-30s.
-log "Waiting for change token from Swap A to arrive..."
-CHANGE_ELAPSED=0
-while [[ $CHANGE_ELAPSED -lt 60 ]]; do
-  ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
-  if echo "$ALICE_BAL" | grep -q "BTC"; then
-    log "Change token arrived after ~${CHANGE_ELAPSED}s"
-    break
-  fi
-  sleep 5
-  CHANGE_ELAPSED=$((CHANGE_ELAPSED + 5))
-done
-
 # --- Both deposit into swap B ---
 log ""; log "=== Swap B: deposits ==="
 deposit_swap "$BOB" "${SWAP_B:0:8}"
