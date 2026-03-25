@@ -757,7 +757,8 @@ export class PaymentsModule {
     };
 
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
-    // Only skip if l1 is explicitly set to null.
+    // Only skip if l1 is explicitly set to null. The module is lazy — it won't
+    // open a WebSocket until the first L1 operation is performed.
     this.l1 = config?.l1 === null ? null : new L1PaymentsModule(config?.l1);
 
     // Initialize spend queue (requires ledger, planner, and access to this.tokens)

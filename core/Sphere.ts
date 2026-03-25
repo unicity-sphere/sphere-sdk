@@ -2899,7 +2899,9 @@ export class Sphere {
       throw new SphereError('Transport provider does not support address discovery', 'INVALID_CONFIG');
     }
 
-    const includeL1Scan = options.includeL1Scan ?? true;
+    // Only run L1 balance scan when L1 is configured — avoids opening a
+    // Fulcrum WebSocket for apps that don't use L1 at all.
+    const includeL1Scan = (options.includeL1Scan ?? true) && !!this._l1Config;
 
     // Phase 1: Transport (Nostr) binding event scan
     const transportResult = await discoverAddressesImpl(

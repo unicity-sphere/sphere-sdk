@@ -51,7 +51,7 @@ export interface DiscoverAddressesOptions {
   gapLimit?: number;
   /** Batch size for transport queries (default: 20) */
   batchSize?: number;
-  /** Also run L1 balance scan (default: true) */
+  /** Also run L1 balance scan (default: true when L1 is configured, false otherwise) */
   includeL1Scan?: boolean;
   /** Progress callback */
   onProgress?: (progress: DiscoverAddressProgress) => void;
