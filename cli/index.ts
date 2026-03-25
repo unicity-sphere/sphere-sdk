@@ -4546,6 +4546,13 @@ async function main() {
         // before calling deposit(). Crash recovery fires fire-and-forget after module load
         // so the escrow response may arrive slightly after ensureSync completes.
         const swapStatusBefore = await swapModule.getSwapStatus(swapId);
+        // Guard: if already deposited, don't re-deposit
+        if (swapStatusBefore?.progress === 'depositing' || swapStatusBefore?.progress === 'awaiting_counter' ||
+            swapStatusBefore?.progress === 'concluding' || swapStatusBefore?.progress === 'completed') {
+          console.log(`Deposit already submitted (current state: ${swapStatusBefore.progress})`);
+          await closeSphere();
+          break;
+        }
         if (swapStatusBefore?.progress === 'proposed' || swapStatusBefore?.progress === 'accepted') {
           const waitLabel = swapStatusBefore.progress === 'proposed'
             ? 'Waiting for Bob to accept and escrow to confirm (up to 120s)...'

@@ -2682,13 +2682,18 @@ export class SwapModule {
                       this.invoiceToSwapIndex.set(swap.depositInvoiceId, swapId);
                     }
 
-                    // DM ORDERING: if swap is still in 'accepted' or 'proposed' (v2: proposer
-                    // may receive invoice_delivery before acceptance DM), transition directly
-                    // to 'announced'.
-                    if (swap.progress === 'accepted' || swap.progress === 'proposed') {
-                      // v2 fast path: if invoice_delivery arrives before swap_acceptance DM,
-                      // the swap jumps proposed → announced. Emit swap:accepted synthetically
-                      // so UIs depending on that event don't miss it.
+                    // DM ORDERING: if swap is still in 'accepted' or 'proposed' (v2: acceptor
+                    // may receive invoice_delivery before the acceptance flow completes),
+                    // transition directly to 'announced'.
+                    // SECURITY: proposers must NOT jump proposed→announced — that would
+                    // let a rogue escrow bypass acceptor consent. Only acceptors can skip
+                    // 'accepted' (they already consented by sending v2_announce).
+                    if (swap.progress === 'proposed' && swap.role === 'proposer') {
+                      logger.debug(LOG_TAG, `Deposit invoice_delivery for proposer swap ${swapId} in 'proposed' — waiting for acceptance first`);
+                      // Store invoice data but do NOT transition yet
+                      swap.updatedAt = Date.now();
+                      await this.persistSwap(swap);
+                    } else if (swap.progress === 'accepted' || swap.progress === 'proposed') {
                       const skippedAccepted = swap.progress === 'proposed';
                       await this.transitionProgress(swap, 'announced');
                       if (skippedAccepted) {

@@ -120,7 +120,7 @@ log "4c cancel: $(echo "$CANCEL_OUT" | tail -3)"
 if echo "$CANCEL_OUT" | grep -qi "cancelled"; then
   ok "4c: Bob cancelled after Alice deposited"
 else
-  ok "4c: Cancel command sent"
+  fail "4c: Cancel did not return 'cancelled' confirmation"
 fi
 
 # Wait for escrow to process cancellation + auto-return.

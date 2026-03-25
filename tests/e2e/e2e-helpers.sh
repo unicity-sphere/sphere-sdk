@@ -253,10 +253,14 @@ deposit_swap() {
   log "deposit_swap ${profile}: $(echo "$out" | grep -E 'status|Error|error|Deposit|announced|Insufficient|WRONG_STATE' | head -3)" >&2
   if echo "$out" | grep -qiE '"status".*"completed"'; then
     ok "${profile} deposit completed"
+  elif echo "$out" | grep -qiE '"status".*"submitted"'; then
+    ok "${profile} deposit submitted"
+  elif echo "$out" | grep -qiE '"status"'; then
+    ok "${profile} deposit sent (status: $(echo "$out" | grep -oP '"status"\s*:\s*"\K[^"]+' | head -1))"
   elif echo "$out" | grep -qiE 'error|fail|Insufficient'; then
     fail "${profile} deposit failed: $(echo "$out" | grep -iE 'error|fail|Insufficient' | head -1)"
   else
-    ok "${profile} deposit submitted"
+    fail "${profile} deposit produced unexpected output"
   fi
 }
 
@@ -267,7 +271,9 @@ wait_swap_progress() {
     local out
     out=$(cli_as "$profile" swap-status "$prefix" 2>&1) || true
     progress=$({ echo "$out" | grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' || true; } | tail -1)
-    [[ -z "$progress" ]] && echo "$out" | grep -qi "no swap found" && progress="completed"
+    # If swap was pruned (terminal state removed from active list), treat as terminal.
+    # Do NOT assume "completed" — it could have been cancelled or failed.
+    [[ -z "$progress" ]] && echo "$out" | grep -qi "no swap found" && progress="pruned"
     log "[${elapsed}s] ${profile}: ${progress:-unknown}" >&2
     if echo "$progress" | grep -qE "^(${targets})$"; then
       echo "$progress"

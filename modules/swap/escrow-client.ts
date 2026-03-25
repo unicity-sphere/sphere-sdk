@@ -157,9 +157,16 @@ export async function resolveEscrowAddress(
     );
   }
 
+  if (!peer.transportPubkey) {
+    throw new SphereError(
+      `Escrow ${escrowAddr} resolved but has no transport pubkey — escrow DMs would be undeliverable`,
+      'SWAP_RESOLVE_FAILED',
+    );
+  }
+
   return {
     escrowDirectAddress: peer.directAddress,
-    escrowPubkey: peer.transportPubkey ?? peer.chainPubkey,
+    escrowPubkey: peer.transportPubkey,
   };
 }
 

@@ -146,8 +146,10 @@ export class MultiAddressTransportMux {
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
-  // Dedup
+  // Dedup — bounded to prevent memory leak in long-running sessions.
+  // Set preserves insertion order; evict oldest entries when cap is reached.
   private processedEventIds = new Set<string>();
+  private static readonly MAX_PROCESSED_IDS = 10_000;
 
   // Event callbacks (mux-level, forwarded to all adapters)
   private eventCallbacks: Set<TransportEventCallback> = new Set();
@@ -560,7 +562,7 @@ export class MultiAddressTransportMux {
     walletFilter['#p'] = allPubkeys;
     walletFilter.since = globalSince;
 
-    logger.warn('Mux', `updateSubscriptions: wallet filter kinds=${walletFilter.kinds} pubkeys=[${allPubkeys.map(p => p.slice(0,16)).join(',')}] since=${globalSince}`);
+    logger.debug('Mux', `updateSubscriptions: wallet filter kinds=${walletFilter.kinds} pubkeys=[${allPubkeys.map(p => p.slice(0,16)).join(',')}] since=${globalSince}`);
 
     this.walletSubscriptionId = this.nostrClient.subscribe(walletFilter, {
       onEvent: (event) => {
@@ -619,7 +621,7 @@ export class MultiAddressTransportMux {
       },
     });
 
-    logger.warn('Mux', `updateSubscriptions: walletSub=${this.walletSubscriptionId} chatSub=${this.chatSubscriptionId}`);
+    logger.debug('Mux', `updateSubscriptions: walletSub=${this.walletSubscriptionId} chatSub=${this.chatSubscriptionId}`);
 
     // Start subscription health check — if no events arrive for 90s,
     // the relay may have silently dropped our subscriptions without
@@ -635,7 +637,7 @@ export class MultiAddressTransportMux {
       // DMs (gift wraps) keep the chat subscription alive, but the wallet
       // subscription (TOKEN_TRANSFER events) can die silently.
       const elapsed = Date.now() - this.lastWalletEventAt;
-      if (elapsed > 60_000) {
+      if (elapsed > 300_000) { // 5 minutes — avoid unnecessary relay churn on idle wallets
         logger.warn('Mux', `No wallet events for ${Math.round(elapsed / 1000)}s — re-subscribing`);
         this.lastWalletEventAt = Date.now(); // prevent rapid re-subscribe
         this.updateSubscriptions().catch((err) => {
@@ -696,9 +698,20 @@ export class MultiAddressTransportMux {
    * Route an incoming Nostr event to the correct address adapter.
    */
   private async handleEvent(event: NostrEvent): Promise<void> {
-    // Dedup
+    // Dedup — bounded set with LRU eviction
     if (event.id && this.processedEventIds.has(event.id)) return;
-    if (event.id) this.processedEventIds.add(event.id);
+    if (event.id) {
+      this.processedEventIds.add(event.id);
+      if (this.processedEventIds.size > MultiAddressTransportMux.MAX_PROCESSED_IDS) {
+        // Evict oldest entries (Set preserves insertion order)
+        const it = this.processedEventIds.values();
+        for (let i = 0; i < MultiAddressTransportMux.MAX_PROCESSED_IDS / 2; i++) {
+          const entry = it.next();
+          if (entry.done) break;
+          this.processedEventIds.delete(entry.value);
+        }
+      }
+    }
     // Track wallet events (non-gift-wrap) for subscription health check.
     if (event.kind !== EventKinds.GIFT_WRAP) {
       this.lastWalletEventAt = Date.now();

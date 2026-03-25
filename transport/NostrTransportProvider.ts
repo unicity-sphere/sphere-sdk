@@ -1700,8 +1700,10 @@ export class NostrTransportProvider implements TransportProvider {
     return new Promise((resolve) => {
       let settled = false;
       const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
         if (subId) {
-          this.nostrClient?.unsubscribe(subId);
+          try { this.nostrClient?.unsubscribe(subId); } catch { /* disconnected */ }
         }
         logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);

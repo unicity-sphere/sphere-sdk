@@ -96,7 +96,7 @@ export function mapEscrowStateToProgress(escrowState: string): SwapProgress | nu
     case 'PARTIAL_DEPOSIT':
       return 'depositing';
     case 'DEPOSIT_COVERED':
-      return 'awaiting_counter';
+      return 'concluding';
     case 'CONCLUDING':
       return 'concluding';
     case 'COMPLETED':
