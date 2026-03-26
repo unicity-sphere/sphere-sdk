@@ -20,8 +20,7 @@ sphere-sdk/
 │   ├── assemble.ts                   # DAG elements -> Token reassembly
 │   ├── element-pool.ts              # ElementPool class (content-addressed store)
 │   ├── instance-chain.ts             # Instance chain management and selection
-│   ├── hash.ts                       # Content hashing (deterministic CBOR -> SHA-256)
-│   ├── cbor.ts                       # Deterministic CBOR encode/decode (dag-cbor subset)
+│   ├── hash.ts                       # Content hashing (computeElementHash wrapper)
 │   ├── diff.ts                       # Package diff/delta computation
 │   ├── verify.ts                     # Package and token integrity verification
 │   ├── ipld.ts                       # IPLD block export / CID computation
@@ -76,11 +75,13 @@ UXF types are also re-exported from the main barrel (`index.ts`) for convenience
 
 UXF does **not** depend on `PaymentsModule`, `Sphere`, or any wallet-lifecycle class. It depends only on:
 
-- `types/txf.ts` -- for `TxfToken`, `TxfGenesis`, `TxfTransaction`, `TxfInclusionProof`, etc.
+- `@unicitylabs/state-transition-sdk` -- for `ITokenJson` (canonical token type)
 - `serialization/txf-serializer.ts` -- for `normalizeSdkTokenToStorage` (bytes-to-hex normalization)
 - `@noble/hashes` -- for SHA-256 (already bundled via `noExternal`)
 
 `PaymentsModule` can optionally consume UXF for persistence (replacing its flat `TxfStorageData` with a `UxfPackage`), but this is a separate integration step -- UXF stands alone first.
+
+A thin adapter `txfToITokenJson(token: TxfToken): ITokenJson` is provided for sphere-sdk integration, converting TXF's simplified nametag strings and derived fields into the canonical ITokenJson form.
 
 The relationship is:
 
@@ -89,7 +90,7 @@ PaymentsModule ──uses──> TxfStorageData (today)
 PaymentsModule ──uses──> UxfPackage     (future, optional wrapper)
                               │
                               ▼
-                         UxfPackage ──reads──> TxfToken (deconstructed into elements)
+                         UxfPackage ──reads──> ITokenJson (deconstructed into elements)
 ```
 
 ---
@@ -140,6 +141,9 @@ export interface UxfElementHeader {
 /**
  * Well-known instance kinds. Extensible via string for future kinds.
  */
+// Version mapping: Semantic version 1 corresponds to state-transition-sdk v2.0 / ITokenJson format.
+// The token-level version string '2.0' in ITokenJson maps to `semantics: 1` in the element header.
+
 export type UxfInstanceKind =
   | 'default'
   | 'individual-proof'
@@ -164,13 +168,11 @@ export type UxfElementType =
   | 'transaction-data'     // Per-transfer parameters (memo, extra fields)
   | 'inclusion-proof'      // SMT proof bundle (references authenticator, merkle-tree-path, unicity-certificate)
   | 'authenticator'        // PubKey + signature + stateHash
-  | 'merkle-tree-path'     // SMT root + steps array
-  | 'merkle-step'          // Single SMT step (data + path)
+  | 'merkle-tree-path'     // SMT root + inline segments array
   | 'unicity-certificate'  // BFT-signed round commitment (hex-encoded CBOR blob)
   | 'predicate'            // Ownership predicate (hex-encoded CBOR)
-  | 'token-state'          // Current state (predicate + data)
-  | 'destination-state'    // Post-genesis/post-tx state (predicate + data)
-  | 'nametag-ref';         // Reference to a nametag token (which is itself a full token-root DAG)
+  | 'token-state'          // Current state (predicate + data), also used for source/destination states
+  | 'destination-state';   // Post-genesis state (predicate + data)
 ```
 
 ### 2.4 UxfElement -- Base DAG Node
@@ -219,6 +221,8 @@ export interface TokenRootChildren {
   readonly state: ContentHash;
   readonly nametags: ContentHash[];      // each points to a token-root (recursive)
 }
+// Note: tokenType is derivable from the genesis MintTransactionData for indexing.
+// The byTokenType index is populated during ingestion by reading genesis data.
 
 // ---- Genesis ----
 export interface GenesisContent {}  // all data is in children
@@ -243,13 +247,13 @@ export interface GenesisDataContent {
 
 // ---- Transaction ----
 export interface TransactionContent {
-  readonly previousStateHash: string;
-  readonly newStateHash?: string;
+  // No inline content -- all data is in children
 }
 export interface TransactionChildren {
-  readonly predicate: ContentHash;          // -> predicate
-  readonly inclusionProof: ContentHash | null;  // null = uncommitted
-  readonly data?: ContentHash;              // -> transaction-data (optional)
+  readonly sourceState: ContentHash;         // -> token-state (state before transition)
+  readonly data: ContentHash | null;         // -> transaction-data (null if uncommitted)
+  readonly inclusionProof: ContentHash | null; // -> inclusion-proof (null if uncommitted)
+  readonly destinationState: ContentHash;    // -> token-state (state after transition)
 }
 
 // ---- Transaction Data ----
@@ -280,17 +284,9 @@ export interface AuthenticatorContent {
 // ---- Merkle Tree Path ----
 export interface MerkleTreePathContent {
   readonly root: string;
+  readonly segments: ReadonlyArray<{ readonly data: string; readonly path: string }>;
 }
-export interface MerkleTreePathChildren {
-  readonly steps: ContentHash[];  // ordered
-}
-
-// ---- Merkle Step ----
-export interface MerkleStepContent {
-  readonly data: string;
-  readonly path: string;
-}
-// No children -- leaf node.
+// No children -- segments are inline leaf data, NOT separate elements.
 
 // ---- Unicity Certificate ----
 export interface UnicityCertificateContent {
@@ -315,13 +311,6 @@ export interface StateContent {
 }
 // No children -- leaf node.
 
-// ---- Nametag Ref ----
-export interface NametagRefContent {
-  readonly name: string;
-}
-export interface NametagRefChildren {
-  readonly tokenRoot: ContentHash;  // points to a full token-root DAG
-}
 ```
 
 ### 2.6 UxfManifest
@@ -490,54 +479,53 @@ export class ElementPool {
 
 Content hashing uses SHA-256 over deterministic CBOR encoding (dag-cbor conventions). The hash is computed over the element's **canonical form** -- header + type + content + children -- never over child element bodies. This ensures structural sharing: identical logical elements produce identical hashes regardless of when they were created.
 
+Content hashing uses `@ipld/dag-cbor` (v9.2.5) for deterministic CBOR encoding, ensuring canonical byte sequences per RFC 8949 Section 4.2.1 with dag-cbor extensions (sorted map keys by CBOR byte order, Tag 42 for CID links, no indefinite-length encodings).
+
 ```typescript
 // uxf/hash.ts
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '../core/crypto';
-import { encodeDeterministicCbor } from './cbor';
+import { encode } from '@ipld/dag-cbor';
 
 /**
  * Compute the content hash of a UxfElement.
- * 
+ *
  * The hash covers:
- *   SHA-256( dag-cbor( [header, type, content, children] ) )
- * 
+ *   SHA-256( dag-cbor( { header, type, content, children } ) )
+ *
+ * The canonical form for hashing is a map (NOT a positional array):
  * - header: [representation, semantics, kind, predecessor]
- * - type: string tag
+ * - type: element type ID (uint)
  * - content: type-specific inline data
  * - children: { role -> hash | hash[] }
- * 
+ *
+ * This map-based form is the ONLY input to hash computation. The positional
+ * array encoding and CBOR tags used in wire format (SPECIFICATION Section 6a)
+ * are NOT included in hash computation.
+ *
  * Children are referenced by hash, not by value.
  * This makes the hash a Merkle hash -- changing any descendant
  * changes all ancestors up to the root.
  */
 export function computeElementHash(element: UxfElement): ContentHash {
-  const canonical = [
-    [
+  const canonical = {
+    header: [
       element.header.representation,
       element.header.semantics,
       element.header.kind,
       element.header.predecessor,
     ],
-    element.type,
-    element.content,
-    element.children,
-  ];
-  const encoded = encodeDeterministicCbor(canonical);
+    type: element.type,
+    content: element.content,
+    children: element.children,
+  };
+  const encoded = encode(canonical);  // @ipld/dag-cbor deterministic encoding
   const digest = sha256(encoded);
   return contentHash(bytesToHex(digest));
 }
 ```
 
-The deterministic CBOR encoder in `uxf/cbor.ts` follows dag-cbor conventions:
-- Map keys sorted lexicographically (byte order)
-- No indefinite-length encodings
-- Canonical integer encoding (shortest form)
-- Strings as UTF-8
-- `null` encoded as CBOR null (0xf6)
-- No CBOR tags (to keep elements interoperable)
-
-The implementation uses a minimal hand-written CBOR encoder (approximately 200 lines) rather than pulling in a full CBOR library. The SDK already avoids large optional dependencies, and the subset needed (maps, arrays, strings, integers, bytes, null) is straightforward.
+The dag-cbor encoder handles canonical key sorting, integer minimality, and Tag 42 for CID links automatically.
 
 ### 3.3 Reference Resolution
 
@@ -605,35 +593,33 @@ The `walkReachable` function traverses the DAG depth-first, following both direc
 
 ## 4. Deconstruction Algorithm
 
-Deconstruction converts a self-contained `TxfToken` into DAG elements and ingests them into the pool. It lives in `/home/vrogojin/uxf/uxf/deconstruct.ts`.
+Deconstruction converts a self-contained `ITokenJson` into DAG elements and ingests them into the pool. It lives in `/home/vrogojin/uxf/uxf/deconstruct.ts`.
 
 ### 4.1 Decomposition Tree
 
-The mapping from TxfToken fields to UxfElement types:
+The mapping from ITokenJson fields to UxfElement types:
 
 ```
-TxfToken
+ITokenJson
 ├── tokenId, version                      -> token-root (content)
 │
 ├── genesis                               -> genesis
 │   ├── genesis.data                      -> genesis-data (leaf)
 │   ├── genesis.inclusionProof            -> inclusion-proof
 │   │   ├── .authenticator                -> authenticator (leaf)
-│   │   ├── .merkleTreePath               -> merkle-tree-path
-│   │   │   └── .steps[]                  -> merkle-step[] (each a leaf)
+│   │   ├── .merkleTreePath               -> merkle-tree-path (segments inline)
 │   │   ├── .unicityCertificate           -> unicity-certificate (leaf, opaque blob)
 │   │   └── .transactionHash              -> inline in inclusion-proof content
 │   └── (destination state inferred)      -> destination-state (leaf)
 │
 ├── transactions[]                        -> transaction[]
-│   ├── .previousStateHash, .newStateHash -> inline in transaction content
-│   ├── .predicate                        -> predicate (leaf)
+│   ├── sourceState, destinationState     -> token-state (child elements)
 │   ├── .inclusionProof                   -> inclusion-proof (same subtree as genesis)
 │   └── .data                             -> transaction-data (leaf, if present)
 │
 ├── state                                 -> token-state (leaf)
 │
-└── nametags[]                            -> nametag-ref[] (each wraps a recursive token-root)
+└── nametags[]                            -> token-root[] (each is a full recursive token sub-DAG)
 ```
 
 ### 4.2 Granularity Rationale
@@ -644,26 +630,26 @@ The decomposition granularity is chosen to maximize deduplication at the points 
 |---------|-------------|-------------------|
 | `unicity-certificate` | Largest single element (~500-2000 bytes). All tokens in the same aggregator round share it. | Very high: N tokens/round share 1 certificate. |
 | `authenticator` | Same signer signs multiple tokens per round. | Moderate: shared across tokens with same signing key in same state. |
-| `merkle-step` | Upper SMT path segments are shared across tokens in the same round. | High: SMT structure means upper steps are identical. |
+| `merkle-tree-path` | SMT path stored as a single node with inline segments. | Moderate: full paths occasionally shared across tokens in the same round. |
 | `predicate` | Tokens owned by the same user share predicate structure. | Moderate. |
 | `genesis-data` | Immutable, unique per token. | Low (unique per token), but referential integrity matters. |
 | `token-state` | Small, often unique. | Low, but needed as a separate addressable unit. |
 
-Elements that stay **inline** (not separated): scalar fields like `previousStateHash`, `newStateHash`, `transactionHash`, `algorithm`. These are small strings with no meaningful dedup opportunity across tokens.
+Elements that stay **inline** (not separated): scalar fields like `transactionHash`, `algorithm`. These are small strings with no meaningful dedup opportunity across tokens.
 
 ### 4.3 Deconstruction Implementation
 
 ```typescript
 /**
- * Deconstruct a TxfToken into elements and ingest into the package.
+ * Deconstruct an ITokenJson into elements and ingest into the package.
  * Returns the content hash of the token-root element.
- * 
+ *
  * Deduplication is automatic: if an element with the same content hash
  * already exists in the pool, it is not re-added.
  */
 export function deconstructToken(
   pool: ElementPool,
-  token: TxfToken,
+  token: ITokenJson,
 ): ContentHash {
   const tokenId = token.genesis.data.tokenId;
 
@@ -679,15 +665,13 @@ export function deconstructToken(
   // 3. Deconstruct current state
   const stateHash = deconstructState(pool, token.state, 'token-state');
 
-  // 4. Deconstruct nametags (recursive -- each is a full token)
+  // 4. Deconstruct nametags (recursive -- each is a full token sub-DAG)
+  // ITokenJson.nametags is Token[], not string[]. Each nametag is recursively
+  // deconstructed as a complete token-root DAG, enabling full deduplication.
   const nametagHashes: ContentHash[] = [];
   if (token.nametags) {
-    for (const nametagName of token.nametags) {
-      // Nametag tokens in TxfToken are stored as string names, not full tokens.
-      // Full nametag token DAGs are ingested separately via ingestNametagToken().
-      // Here we create a nametag-ref placeholder pointing to a name.
-      // If the nametag token's root hash is known, it's linked during a separate pass.
-      nametagHashes.push(deconstructNametagRef(pool, nametagName));
+    for (const nametagToken of token.nametags) {
+      nametagHashes.push(deconstructToken(pool, nametagToken));
     }
   }
 
@@ -768,22 +752,18 @@ function deconstructInclusionProof(
     children: {},
   });
 
-  // Merkle steps -- each is a leaf
-  const stepHashes: ContentHash[] = proof.merkleTreePath.steps.map(step =>
-    pool.put({
-      header: makeHeader(),
-      type: 'merkle-step',
-      content: { data: step.data, path: step.path },
-      children: {},
-    })
-  );
-
-  // Merkle tree path -- references steps
+  // Merkle tree path -- segments are inline, NOT separate elements
   const pathHash = pool.put({
     header: makeHeader(),
     type: 'merkle-tree-path',
-    content: { root: proof.merkleTreePath.root },
-    children: { steps: stepHashes },
+    content: {
+      root: proof.merkleTreePath.root,
+      segments: proof.merkleTreePath.steps.map(step => ({
+        data: step.data,
+        path: step.path,
+      })),
+    },
+    children: {},
   });
 
   // Unicity certificate -- opaque blob, leaf
@@ -807,19 +787,15 @@ function deconstructInclusionProof(
 }
 
 function deconstructTransaction(pool: ElementPool, tx: TxfTransaction): ContentHash {
-  const predicateHash = pool.put({
-    header: makeHeader(),
-    type: 'predicate',
-    content: { raw: tx.predicate },
-    children: {},
-  });
+  // Source state (state before the transition)
+  const sourceStateHash = deconstructState(pool, tx.sourceState, 'token-state');
 
   let proofHash: ContentHash | null = null;
   if (tx.inclusionProof) {
     proofHash = deconstructInclusionProof(pool, tx.inclusionProof);
   }
 
-  let dataHash: ContentHash | undefined;
+  let dataHash: ContentHash | null = null;
   if (tx.data && Object.keys(tx.data).length > 0) {
     dataHash = pool.put({
       header: makeHeader(),
@@ -829,20 +805,19 @@ function deconstructTransaction(pool: ElementPool, tx: TxfTransaction): ContentH
     });
   }
 
-  const children: Record<string, ContentHash | ContentHash[] | null> = {
-    predicate: predicateHash,
-    inclusionProof: proofHash,
-  };
-  if (dataHash) children.data = dataHash;
+  // Destination state (state after the transition)
+  const destinationStateHash = deconstructState(pool, tx.destinationState, 'token-state');
 
   return pool.put({
     header: makeHeader(),
     type: 'transaction',
-    content: {
-      previousStateHash: tx.previousStateHash,
-      newStateHash: tx.newStateHash,
+    content: {},
+    children: {
+      sourceState: sourceStateHash,
+      data: dataHash,
+      inclusionProof: proofHash,
+      destinationState: destinationStateHash,
     },
-    children: children as Record<string, ContentHash | ContentHash[]>,
   });
 }
 
@@ -856,15 +831,6 @@ function deconstructState(
     type,
     content: { data: state.data, predicate: state.predicate },
     children: {},
-  });
-}
-
-function deconstructNametagRef(pool: ElementPool, name: string): ContentHash {
-  return pool.put({
-    header: makeHeader(),
-    type: 'nametag-ref',
-    content: { name },
-    children: {},  // tokenRoot linked separately when nametag token is ingested
   });
 }
 
@@ -885,13 +851,13 @@ Deduplication is automatic because `ElementPool.put()` computes the content hash
 
 1. Ingesting the same token twice adds zero new elements.
 2. Ingesting two tokens that share a unicity certificate adds the certificate once.
-3. Ingesting two tokens with the same nametag creates one nametag-ref element and (if the full nametag token is ingested) one shared nametag token sub-DAG.
+3. Ingesting two tokens with the same nametag recursively deconstructs the nametag token once; subsequent tokens sharing that nametag deduplicate against the existing elements in the pool.
 
 ---
 
 ## 5. Reassembly Algorithm
 
-Reassembly converts DAG elements back into a self-contained `TxfToken`. It lives in `/home/vrogojin/uxf/uxf/assemble.ts`.
+Reassembly converts DAG elements back into a self-contained `ITokenJson`. It lives in `/home/vrogojin/uxf/uxf/assemble.ts`.
 
 ### 5.1 Latest State Reassembly
 
@@ -904,7 +870,7 @@ Reassembly converts DAG elements back into a self-contained `TxfToken`. It lives
  * @param tokenId - Token to reassemble
  * @param instanceChains - Instance chain index
  * @param strategy - Instance selection strategy (default: latest)
- * @returns Complete TxfToken, indistinguishable from the original
+ * @returns Complete ITokenJson, indistinguishable from the original
  */
 export function assembleToken(
   pool: ElementPool,
@@ -912,7 +878,7 @@ export function assembleToken(
   tokenId: string,
   instanceChains: InstanceChainIndex,
   strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
-): TxfToken {
+): ITokenJson {
   const rootHash = manifest.tokens.get(tokenId);
   if (!rootHash) throw new UxfError('TOKEN_NOT_FOUND', `Token ${tokenId} not in manifest`);
 
@@ -934,10 +900,14 @@ export function assembleToken(
     predicate: stateElement.content.predicate as string,
   };
 
+  // Nametags are full recursive token sub-DAGs (ITokenJson.nametags is Token[])
   const nametagHashes = root.children.nametags as ContentHash[] || [];
-  const nametags: string[] = nametagHashes.map(hash => {
-    const ref = resolveElement(pool, hash, instanceChains, strategy);
-    return ref.content.name as string;
+  const nametags: ITokenJson[] = nametagHashes.map(hash => {
+    // Each nametag hash points to a token-root; recursively assemble it
+    const nametagRoot = resolveElement(pool, hash, instanceChains, strategy);
+    assertType(nametagRoot, 'token-root');
+    const nametagTokenId = nametagRoot.content.tokenId as string;
+    return assembleToken(pool, manifest, nametagTokenId, instanceChains, strategy);
   });
 
   return {
@@ -965,7 +935,7 @@ export function assembleTokenAtState(
   stateIndex: number,
   instanceChains: InstanceChainIndex,
   strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
-): TxfToken {
+): ITokenJson {
   const rootHash = manifest.tokens.get(tokenId);
   if (!rootHash) throw new UxfError('TOKEN_NOT_FOUND', `Token ${tokenId} not in manifest`);
 
@@ -1021,12 +991,13 @@ export function assembleTokenAtState(
 
 ### 5.3 Validation During Reassembly
 
-Reassembly performs structural validation:
+Reassembly performs both structural and integrity validation:
 
-1. Every referenced hash must exist in the pool (or an `MISSING_ELEMENT` error is thrown).
+1. Every referenced hash must exist in the pool (or a `MISSING_ELEMENT` error is thrown).
 2. Element types must match expected positions (genesis child must be a `genesis` element, etc.).
 3. Transaction ordering is preserved (array index in `token-root.children.transactions`).
-4. No cryptographic validation during reassembly -- that is the responsibility of `verify()`.
+4. **Every element fetched from the pool is re-hashed and compared against the expected content hash. If any mismatch is detected, reassembly fails with a `VERIFICATION_FAILED` error.** (Decision 7)
+5. Cycle detection: visited element hashes are tracked; revisiting a hash throws `CYCLE_DETECTED`. (Decision 8)
 
 ---
 
@@ -1034,29 +1005,15 @@ Reassembly performs structural validation:
 
 ### 6.1 Deterministic CBOR Encoding
 
+UXF uses `@ipld/dag-cbor` for all CBOR encoding and decoding:
+
 ```typescript
-// uxf/cbor.ts
-
-/**
- * Encode a JavaScript value to deterministic CBOR bytes.
- * Follows dag-cbor conventions:
- * - Map keys sorted by byte order
- * - Shortest integer encoding
- * - No indefinite-length
- * - No tags
- * - UTF-8 strings
- * - null -> CBOR null (0xf6)
- * - undefined values omitted from maps
- */
-export function encodeDeterministicCbor(value: unknown): Uint8Array { ... }
-
-/**
- * Decode CBOR bytes to a JavaScript value.
- */
-export function decodeCbor(bytes: Uint8Array): unknown { ... }
+import { encode, decode } from '@ipld/dag-cbor';
+import { CID } from 'multiformats';
+import { sha256 } from 'multiformats/hashes/sha2';
 ```
 
-The encoder handles: `null`, `boolean`, `number` (integer only -- no floats in element data), `string`, `Uint8Array` (as CBOR bytes), `Array`, and `object` (as CBOR map with sorted keys).
+The dag-cbor encoder handles canonical key sorting, integer minimality, and Tag 42 for CID links automatically. No custom CBOR encoder is needed or exported.
 
 ### 6.2 JSON Encoding
 
@@ -1135,7 +1092,8 @@ export function elementToIpldBlock(element: UxfElement): { cid: CidV1; data: Uin
 
 /**
  * Export the entire package as a CARv1 byte stream.
- * Roots: the manifest root CIDs (one per token).
+ * Root: the CID of the package envelope block (which contains a link to the manifest).
+ * Individual token roots are discoverable by resolving the manifest.
  * Blocks: all elements in the pool.
  */
 export function exportToCar(pkg: UxfPackageData): Uint8Array { ... }
@@ -1284,39 +1242,34 @@ export class UxfPackage {
   // ---------- Ingestion ----------
 
   /**
-   * Deconstruct a TxfToken and add to the package.
+   * Deconstruct an ITokenJson and add to the package.
    * If the token already exists, its manifest entry is updated to the new root.
    */
-  ingest(token: TxfToken): void;
+  ingest(token: ITokenJson): void;
 
   /**
    * Batch ingest multiple tokens.
    */
-  ingestAll(tokens: TxfToken[]): void;
-
-  /**
-   * Ingest a full nametag token (as TxfToken) and link it to existing nametag-ref elements.
-   */
-  ingestNametagToken(name: string, token: TxfToken): void;
+  ingestAll(tokens: ITokenJson[]): void;
 
   // ---------- Reassembly ----------
 
   /**
    * Reassemble a token at its latest state.
-   * @returns Self-contained TxfToken identical to the original.
+   * @returns Self-contained ITokenJson identical to the original.
    */
-  assemble(tokenId: string, strategy?: InstanceSelectionStrategy): TxfToken;
+  assemble(tokenId: string, strategy?: InstanceSelectionStrategy): ITokenJson;
 
   /**
    * Reassemble at a specific historical state.
    * stateIndex=0 -> genesis only. stateIndex=N -> genesis + first N transactions.
    */
-  assembleAtState(tokenId: string, stateIndex: number, strategy?: InstanceSelectionStrategy): TxfToken;
+  assembleAtState(tokenId: string, stateIndex: number, strategy?: InstanceSelectionStrategy): ITokenJson;
 
   /**
    * Assemble all tokens in the manifest.
    */
-  assembleAll(strategy?: InstanceSelectionStrategy): Map<string, TxfToken>;
+  assembleAll(strategy?: InstanceSelectionStrategy): Map<string, ITokenJson>;
 
   // ---------- Token Management ----------
 
@@ -1350,6 +1303,8 @@ export class UxfPackage {
   addInstance(originalHash: ContentHash, newInstance: UxfElement): void;
 
   /**
+   * Phase 2 -- throws NOT_IMPLEMENTED in Phase 1.
+   *
    * Consolidate a range of inclusion proofs for a token into a single
    * consolidated SMT subtree instance.
    * txRange is [startInclusive, endExclusive] indexing into the token's transactions array.
@@ -1434,6 +1389,8 @@ export class UxfPackage {
 }
 ```
 
+**Mutability model:** UxfPackage methods mutate the package in place and return `this` for chaining (builder pattern). This is consistent with the in-memory nature of the element pool. For immutable semantics, callers should clone the package before mutation.
+
 ### 8.2 Free Functions (Functional API)
 
 For consumers who prefer a functional style or need to operate on raw `UxfPackageData`:
@@ -1441,10 +1398,10 @@ For consumers who prefer a functional style or need to operate on raw `UxfPackag
 ```typescript
 // All functions are pure (take data, return data) except where noted.
 
-export function ingest(pkg: UxfPackageData, token: TxfToken): void;
-export function ingestAll(pkg: UxfPackageData, tokens: TxfToken[]): void;
-export function assemble(pkg: UxfPackageData, tokenId: string, strategy?: InstanceSelectionStrategy): TxfToken;
-export function assembleAtState(pkg: UxfPackageData, tokenId: string, stateIndex: number, strategy?: InstanceSelectionStrategy): TxfToken;
+export function ingest(pkg: UxfPackageData, token: ITokenJson): void;
+export function ingestAll(pkg: UxfPackageData, tokens: ITokenJson[]): void;
+export function assemble(pkg: UxfPackageData, tokenId: string, strategy?: InstanceSelectionStrategy): ITokenJson;
+export function assembleAtState(pkg: UxfPackageData, tokenId: string, stateIndex: number, strategy?: InstanceSelectionStrategy): ITokenJson;
 export function removeToken(pkg: UxfPackageData, tokenId: string): void;
 export function merge(target: UxfPackageData, source: UxfPackageData): void;
 export function diff(a: UxfPackageData, b: UxfPackageData): UxfDelta;
@@ -1470,6 +1427,7 @@ export type UxfErrorCode =
   | 'DUPLICATE_TOKEN'
   | 'SERIALIZATION_ERROR'
   | 'VERIFICATION_FAILED'
+  | 'CYCLE_DETECTED'
   | 'INVALID_PACKAGE';
 
 export class UxfError extends Error {
@@ -1554,7 +1512,6 @@ export type {
   GenesisDataContent,
   AuthenticatorContent,
   UnicityCertificateContent,
-  MerkleStepContent,
   PredicateContent,
   StateContent,
 } from './types';
@@ -1586,7 +1543,7 @@ export {
 // Serialization
 export { packageToJson, packageFromJson } from './UxfPackage';
 export { exportToCar, importFromCar, computeCid, elementToIpldBlock } from './ipld';
-export { encodeDeterministicCbor, decodeCbor } from './cbor';
+// CBOR encoding is handled by @ipld/dag-cbor; no custom encoder is exported.
 export { computeElementHash } from './hash';
 
 // Storage adapters
@@ -1615,8 +1572,6 @@ export {
   STRATEGY_ORIGINAL,
   contentHash,
   computeElementHash,
-  encodeDeterministicCbor,
-  decodeCbor,
   packageToJson,
   packageFromJson,
   exportToCar,
@@ -1648,7 +1603,7 @@ export type {
 
 1. **Separate top-level directory** (`uxf/`) rather than under `modules/` -- UXF is a data format/packaging concern, not a wallet-lifecycle module. It has zero runtime dependencies on `Sphere`, `PaymentsModule`, or transport.
 
-2. **Platform-neutral** -- the core UXF module has no platform-specific code. Storage adapters are injected. The CBOR encoder is hand-written (minimal subset) to avoid new dependencies.
+2. **Platform-neutral** -- the core UXF module has no platform-specific code. Storage adapters are injected. CBOR encoding uses `@ipld/dag-cbor` for deterministic serialization.
 
 3. **Content hash = SHA-256 over deterministic CBOR** -- this aligns with IPLD's dag-cbor codec and produces CIDv1-compatible addresses. The same hash serves as both the pool key and the IPLD CID digest.
 
@@ -1658,6 +1613,6 @@ export type {
 
 6. **Explicit garbage collection** -- removing a token from the manifest does not automatically delete its elements (they may be shared). The consumer calls `gc()` when ready. This avoids reference counting overhead and surprise data loss.
 
-7. **Wraps TXF, does not replace it** -- UXF ingests `TxfToken` objects and reassembles them back. The existing `TxfStorageData` format remains the wallet's primary persistence format. UXF is an opt-in layer for deduplication, IPFS export, and multi-token packaging.
+7. **Wraps TXF, does not replace it** -- UXF ingests `ITokenJson` objects (from `@unicitylabs/state-transition-sdk`) and reassembles them back. A thin adapter converts sphere-sdk's `TxfToken` to `ITokenJson` for integration. The existing `TxfStorageData` format remains the wallet's primary persistence format. UXF is an opt-in layer for deduplication, IPFS export, and multi-token packaging.
 
-8. **No new npm dependencies** -- the CBOR encoder is hand-written. SHA-256 comes from `@noble/hashes` (already bundled). CAR file encoding is implemented inline (the format is straightforward: varint-length-prefixed blocks). This keeps the dependency tree unchanged.
+8. **Minimal new dependencies** -- CBOR encoding uses `@ipld/dag-cbor` + `multiformats` (~50-80 KB minified). SHA-256 comes from `@noble/hashes` (already bundled). CAR file import/export uses `@ipld/car`. UXF is a separate tsup entry point, so consumers who don't use UXF don't pay the dependency cost.

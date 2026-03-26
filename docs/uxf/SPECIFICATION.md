@@ -28,7 +28,7 @@
 
 UXF (Universal eXchange Format) is a content-addressable packaging format for storing and exchanging pools of Unicity tokens across users, devices, and distributed storage systems. It provides:
 
-- **Deep deduplication** of shared cryptographic materials at every level of the token hierarchy (unicity certificates, SMT path segments, nametag tokens, predicates).
+- **Deep deduplication** of shared cryptographic materials at every level of the token hierarchy (unicity certificates, SMT paths, nametag tokens).
 - **Efficient extraction** of individual tokens at any historical state.
 - **Incremental updates** -- adding, removing, or updating token records without rewriting the entire package.
 - **Token integrity preservation** -- any extracted token is self-contained and verifiable without access to the full pool.
@@ -101,7 +101,6 @@ ElementType_Predicate               = 0x07
 ElementType_InclusionProof          = 0x08
 ElementType_Authenticator           = 0x09
 ElementType_UnicityCertificate      = 0x0A
-ElementType_SmtPathSegment          = 0x0B
 ElementType_TokenCoinData           = 0x0C
 ElementType_SmtPath                 = 0x0D
 ```
@@ -111,7 +110,7 @@ Reserved ranges:
 | Range | Purpose |
 |-------|---------|
 | 0x00 | Reserved (invalid) |
-| 0x01 -- 0x1F | Core token structure elements |
+| 0x01 -- 0x1F | All v1 element types |
 | 0x20 -- 0x3F | Proof and certificate elements |
 | 0x40 -- 0x5F | Extension elements (future) |
 | 0xF0 -- 0xFF | Experimental / private use |
@@ -132,23 +131,21 @@ The top-level element representing a complete token. Each token in the manifest 
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header (see Section 3) |
 | `tokenId` | bytes(32) | yes | leaf | Unique 32-byte token identifier |
-| `tokenType` | bytes(32) | yes | leaf | 32-byte asset class identifier |
 | `genesis` | hash(32) | yes | @ref -> GenesisTransaction | Content hash of the genesis transaction element |
 | `transactions` | array\<hash(32)\> | yes | @ref -> TransferTransaction[] | Ordered array of content hashes of transfer transaction elements; empty array if never transferred |
 | `state` | hash(32) | yes | @ref -> TokenState | Content hash of the current token state element |
 | `nametags` | array\<hash(32)\> | no | @ref -> TokenRoot[] | Content hashes of embedded nametag token root elements (each is itself a complete token DAG) |
-| `coinData` | hash(32) | yes | @ref -> TokenCoinData | Content hash of the token's fungible value element |
+
+**Note:** `tokenType` is derivable from the genesis MintTransactionData for indexing purposes. It is not stored directly on the TokenRoot to avoid redundancy.
 
 **Mutability:** Instance-chain-eligible. A TokenRoot may have alternative instances when the entire token history is replaced by a ZK proof (the ZK proof instance references the full-history instance as predecessor).
 
 **Mapping from ITokenJson:**
 - `tokenId` -> `genesis.data.tokenId` (extracted to root for manifest indexing)
-- `tokenType` -> `genesis.data.tokenType` (extracted to root for type-based indexing)
 - `genesis` -> deconstructed GenesisTransaction sub-DAG
 - `transactions` -> ordered array of deconstructed TransferTransaction sub-DAGs
 - `state` -> deconstructed TokenState
 - `nametags` -> each nametag token is recursively deconstructed into its own TokenRoot sub-DAG
-- `coinData` -> extracted from `genesis.data.coinData`
 
 #### 2.2.2 GenesisTransaction (0x02)
 
@@ -186,7 +183,7 @@ The immutable parameters of a mint (genesis) transaction.
 | `header` | ElementHeader | yes | -- | Element header |
 | `tokenId` | bytes(32) | yes | leaf | 32-byte unique token identifier |
 | `tokenType` | bytes(32) | yes | leaf | 32-byte asset class identifier |
-| `coinData` | hash(32) | yes | @ref -> TokenCoinData | Content hash of the coin data element |
+| `coinData` | array\<[text, text]\> | yes | leaf | Array of [coinId, amount] pairs (inline leaf data) |
 | `tokenData` | bytes | yes | leaf | Arbitrary metadata (may be empty) |
 | `salt` | bytes(32) | yes | leaf | 32-byte random salt |
 | `recipient` | text | yes | leaf | Recipient address (DIRECT://...) |
@@ -216,7 +213,7 @@ The ownership state of a token at a particular point in its history.
 | Field | Type | Required | Reference | Description |
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header |
-| `predicate` | hash(32) | yes | @ref -> Predicate | Content hash of the predicate defining ownership |
+| `predicate` | bytes | yes | leaf | Hex-encoded CBOR predicate (leaf data, NOT a child reference) |
 | `data` | bytes | no | leaf | Optional state data; empty bytes if absent |
 
 **Mutability:** Single-instance.
@@ -230,12 +227,9 @@ An ownership condition controlling who can authorize state transitions.
 | Field | Type | Required | Reference | Description |
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header |
-| `type` | text | yes | leaf | `"unmasked"` or `"masked"` |
-| `publicKey` | bytes(33) / null | no | leaf | Compressed secp256k1 key (unmasked) |
-| `publicKeyHash` | bytes(32) / null | no | leaf | SHA-256 of public key (masked) |
-| `signingAlgorithm` | text | yes | leaf | e.g., `"secp256k1"` |
-| `hashAlgorithm` | text | yes | leaf | e.g., `"SHA-256"` |
-| `nonce` | bytes / null | no | leaf | Optional nonce for replay protection |
+| `raw` | bytes | yes | leaf | The original CBOR-encoded predicate, preserved verbatim |
+
+**Design rationale:** Stored as opaque CBOR to preserve exact bytes for stable content hashes. Field-level sharing (e.g., common signingAlgorithm) was evaluated and found to provide negligible deduplication benefit (~5 bytes per shared field) relative to the overhead of additional elements.
 
 **Mutability:** Single-instance.
 
@@ -288,23 +282,11 @@ A complete Sparse Merkle Tree path from leaf to root.
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header |
 | `root` | bytes(32) | yes | leaf | SMT root hash |
-| `segments` | array\<hash(32)\> | yes | @ref -> SmtPathSegment[] | Ordered segment content hashes, leaf to root |
+| `segments` | array\<[bytes, bytes]\> | yes | leaf | Array of [data, path] tuples, ordered leaf to root. Each tuple contains the sibling hash and the path direction indicator at that tree level. |
 
 **Mutability:** Instance-chain-eligible (consolidation).
 
-#### 2.2.12 SmtPathSegment (0x0B)
-
-An individual node in a Sparse Merkle Tree path. Proofs from the same round share upper segments.
-
-| Field | Type | Required | Reference | Description |
-|-------|------|----------|-----------|-------------|
-| `header` | ElementHeader | yes | -- | Element header |
-| `data` | bytes | yes | leaf | Sibling hash at this tree level |
-| `path` | bytes | yes | leaf | Path direction indicator |
-
-**Mutability:** Single-instance.
-
-#### 2.2.13 TokenCoinData (0x0C)
+#### 2.2.12 TokenCoinData (0x0C)
 
 The fungible value of a token as an array of (coinId, amount) pairs.
 
@@ -319,19 +301,18 @@ The fungible value of a token as an array of (coinId, amount) pairs.
 
 | Type ID | Name | Child Refs | Instance-Chain-Eligible | Primary Dedup Target |
 |---------|------|-----------|------------------------|---------------------|
-| 0x01 | TokenRoot | genesis, transactions[], state, nametags[], coinData | yes | -- |
+| 0x01 | TokenRoot | genesis, transactions[], state, nametags[] | yes | -- |
 | 0x02 | GenesisTransaction | data, inclusionProof, destinationState | no | -- |
 | 0x03 | TransferTransaction | sourceState, data, inclusionProof, destinationState | no | -- |
-| 0x04 | MintTransactionData | coinData | no | -- |
+| 0x04 | MintTransactionData | (none) | no | -- |
 | 0x05 | TransferTransactionData | (none) | no | -- |
-| 0x06 | TokenState | predicate | no | same-owner states |
-| 0x07 | Predicate | (none) | no | same-owner predicates |
+| 0x06 | TokenState | (none) | no | same-owner states |
+| 0x07 | Predicate | (none) | no | Defined but not referenced by default decomposition in Phase 1 |
 | 0x08 | InclusionProof | authenticator, merkleTreePath, unicityCertificate | yes | same-round proofs |
 | 0x09 | Authenticator | (none) | no | -- |
 | 0x0A | UnicityCertificate | (none) | no | same-round certificates |
-| 0x0B | SmtPathSegment | (none) | no | shared upper segments |
-| 0x0C | TokenCoinData | (none) | no | same-value tokens |
-| 0x0D | SmtPath | segments[] | yes | same-round paths |
+| 0x0C | TokenCoinData | (none) | no | Defined but not referenced by default decomposition in Phase 1 |
+| 0x0D | SmtPath | (none) | yes | same-round paths |
 
 ---
 
@@ -393,7 +374,13 @@ Examples (CBOR diagnostic notation):
 
 Non-null predecessors are 64-character lowercase hex strings.
 
-### 3.5 JSON Schema
+### 3.5 Version Mapping
+
+- Semantic version 1 corresponds to all structures defined in state-transition-sdk v2.0 and sphere-sdk TXF format v2.0
+- The token-level version string (e.g., '2.0' in ITokenJson) maps to semantic version 1
+- Future protocol changes increment the semantic version
+
+### 3.6 JSON Schema
 
 ```json
 {
@@ -436,6 +423,17 @@ The content hash covers the **complete canonical CBOR encoding** of the element,
 - All leaf data fields
 - All child reference fields (as raw 32-byte hash values, NOT resolved content)
 
+The canonical form for hashing is a CBOR map with four keys:
+```
+{
+  "header": <element-header>,
+  "type": <element-type-id>,
+  "content": <map of leaf fields>,
+  "children": <map of child reference fields>
+}
+```
+This map-based form is used for ALL hash computations, regardless of whether the element is transmitted/stored using the positional array CBOR encoding (Section 6a). The positional array encoding and CBOR tags are wire format optimizations; they are NOT included in hash computation.
+
 The content hash does **not** include:
 - The enclosing CBOR tag (identifies type in stream, not part of content)
 - Package-level metadata (manifest entries, index entries)
@@ -460,6 +458,7 @@ Additional UXF rules:
 7. Array fields: order per element type definition. Header always first.
 8. Null encoding: absent optional fields encoded as CBOR null (0xF6), NOT omitted.
 9. Empty arrays: encoded as `[]` (0x80), NOT omitted.
+10. Hash canonical form: the input to SHA-256 is always the deterministic CBOR encoding of the 4-key map form `{header, type, content, children}`, NOT the tagged positional array form used in wire encoding.
 
 ### 4.5 CDDL Types
 
@@ -519,20 +518,20 @@ JSON: keys and values are 64-char lowercase hex strings.
 
 ### 5.5 Instance Chain Index
 
-Provides O(1) lookup from any element hash to its instance chain head.
+Provides O(1) lookup from any element hash (including the head) to its instance chain head and the full ordered chain.
 
 ```cddl
 instance-chain-index = { * content-hash => instance-chain-entry }
 instance-chain-entry = {
   head: content-hash,
-  kind: tstr,
-  length: uint
+  chain: [+ { hash: content-hash, kind: tstr }]
 }
 ```
 
+The key is the content hash of ANY element in any chain (including chain heads). The value includes the chain head hash and the full ordered chain array with per-instance kind annotations.
+
 **Invariants:**
-- Elements that are NOT chain heads have entries pointing to the head.
-- Chain heads are NOT in the index (they are discoverable directly).
+- Every hash in a chain maps to the same InstanceChainEntry, enabling O(1) lookup of the chain head from any element in the chain.
 - The index is an acceleration structure; it can be rebuilt by following predecessor links.
 
 ### 5.6 Secondary Indexes
@@ -593,8 +592,11 @@ element-pool = { * content-hash => tagged-element }
   "instanceChainIndex": {
     "<elementHash_hex>": {
       "head": "<headHash_hex>",
-      "kind": "consolidated-proof",
-      "length": 3
+      "chain": [
+        { "hash": "<hash1_hex>", "kind": "default" },
+        { "hash": "<hash2_hex>", "kind": "re-encoded" },
+        { "hash": "<hash3_hex>", "kind": "consolidated-proof" }
+      ]
     }
   },
   "indexes": {
@@ -644,10 +646,20 @@ element-pool = { * content-hash => tagged-element }
           "type": "object",
           "properties": {
             "head": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-            "kind": { "type": "string" },
-            "length": { "type": "integer", "minimum": 1 }
+            "chain": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "properties": {
+                  "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                  "kind": { "type": "string" }
+                },
+                "required": ["hash", "kind"]
+              }
+            }
           },
-          "required": ["head", "kind", "length"]
+          "required": ["head", "chain"]
         }
       }
     },
@@ -659,7 +671,7 @@ element-pool = { * content-hash => tagged-element }
       "additionalProperties": false
     }
   },
-  "required": ["uxf", "metadata", "manifest", "elements"]
+  "required": ["uxf", "metadata", "manifest", "instanceChainIndex", "elements"]
 }
 ```
 
@@ -683,7 +695,6 @@ element-pool = { * content-hash => tagged-element }
 | InclusionProof | 0xC0008 | 786440 |
 | Authenticator | 0xC0009 | 786441 |
 | UnicityCertificate | 0xC000A | 786442 |
-| SmtPathSegment | 0xC000B | 786443 |
 | TokenCoinData | 0xC000C | 786444 |
 | SmtPath | 0xC000D | 786445 |
 
@@ -705,12 +716,10 @@ nullable-ref = content-hash / null
 token-root = #6.786433([
   header: element-header,
   tokenId: bstr .size 32,
-  tokenType: bstr .size 32,
   genesis: content-hash,
   transactions: [* content-hash],
   state: content-hash,
-  nametags: [* content-hash] / null,
-  coinData: content-hash
+  nametags: [* content-hash] / null
 ])
 
 genesis-transaction = #6.786434([
@@ -732,7 +741,7 @@ mint-transaction-data = #6.786436([
   header: element-header,
   tokenId: bstr .size 32,
   tokenType: bstr .size 32,
-  coinData: content-hash,
+  coinData: [* [tstr, tstr]],
   tokenData: bstr,
   salt: bstr .size 32,
   recipient: tstr,
@@ -750,18 +759,13 @@ transfer-transaction-data = #6.786437([
 
 token-state = #6.786438([
   header: element-header,
-  predicate: content-hash,
+  predicate: bstr,
   data: bstr
 ])
 
 predicate = #6.786439([
   header: element-header,
-  type: tstr,
-  publicKey: bstr .size 33 / null,
-  publicKeyHash: bstr .size 32 / null,
-  signingAlgorithm: tstr,
-  hashAlgorithm: tstr,
-  nonce: bstr / null
+  raw: bstr
 ])
 
 inclusion-proof = #6.786440([
@@ -785,12 +789,6 @@ unicity-certificate = #6.786442([
   rawCbor: bstr
 ])
 
-smt-path-segment = #6.786443([
-  header: element-header,
-  data: bstr,
-  path: bstr
-])
-
 token-coin-data = #6.786444([
   header: element-header,
   coins: [* [tstr, tstr]]
@@ -799,7 +797,7 @@ token-coin-data = #6.786444([
 smt-path = #6.786445([
   header: element-header,
   root: bstr .size 32,
-  segments: [* content-hash]
+  segments: [* [bstr, bstr]]
 ])
 ```
 
@@ -821,9 +819,9 @@ Per RFC 8949 Section 4.2.1 plus additional UXF constraints (see Section 4.4).
 
 Each element in the JSON pool has a `type` field (integer) plus all fields with human-readable names. See Section 2.2 for the complete field list per type.
 
-> The Predicate element uses `predicateType` (not `type`) for its type discriminator field to avoid collision with the element type identifier.
+> The Predicate element stores its content as opaque CBOR bytes in the `raw` field.
 
-Sample encodings for all 13 types are provided in the reference implementation test fixtures.
+Sample encodings for all 12 types are provided in the reference implementation test fixtures.
 
 ### 6c. CAR File Format (for IPFS Export)
 
@@ -842,7 +840,7 @@ For IPLD, child references use CBOR tag 42 (IPLD link) wrapping the child's CID 
 
 #### 6c.3 Root CIDs
 
-The CAR file's root is the CID of the **package manifest block** (dag-cbor encoded manifest + metadata).
+The CAR file has a single root: the CID of the **package envelope block** (dag-cbor encoded, which contains a link to the manifest). Individual token roots are discoverable by resolving the manifest.
 
 #### 6c.4 Block Layout
 
@@ -852,13 +850,14 @@ Ordered for streaming:
 3. Remaining elements in breadth-first traversal
 4. Shared elements appear once at first reference position
 
-#### 6c.5 CAR v2 Structure
+#### 6c.5 CAR v1 Structure
 
 ```
-Header:  version=2, roots=[manifest_CID]
+Header:  version=1, roots=[manifest_CID]
 Data:    ordered IPLD blocks
-Index:   optional CID-to-offset mapping
 ```
+
+**Note:** CARv1 is the baseline format. CARv2 with indexing may be used for large archives but is not required for conformance.
 
 ---
 
@@ -919,9 +918,9 @@ Self-contained token in ITokenJson or TxfToken format.
 |-----------------|------------------|----------|-------|
 | `genesis` | yes | GenesisTransaction | Sub-DAG root |
 | `genesis.data` | yes | MintTransactionData | |
-| `genesis.data.tokenId` | no (inline) | -- | Copied to MintTransactionData and TokenRoot |
-| `genesis.data.tokenType` | no (inline) | -- | Copied to MintTransactionData and TokenRoot |
-| `genesis.data.coinData` | yes | TokenCoinData | Shared element |
+| `genesis.data.tokenId` | no (inline) | -- | Copied to MintTransactionData and TokenRoot (for manifest indexing) |
+| `genesis.data.tokenType` | no (inline) | -- | In MintTransactionData only (derivable from genesis for indexing) |
+| `genesis.data.coinData` | no (inline) | -- | Inlined as [coinId, amount] pairs in MintTransactionData |
 | `genesis.data.tokenData` | no (inline) | -- | In MintTransactionData |
 | `genesis.data.salt` | no (inline) | -- | In MintTransactionData |
 | `genesis.data.recipient` | no (inline) | -- | In MintTransactionData |
@@ -929,9 +928,9 @@ Self-contained token in ITokenJson or TxfToken format.
 | `genesis.data.reason` | no (inline) | -- | In MintTransactionData |
 | `genesis.inclusionProof` | yes | InclusionProof | Sub-DAG root |
 | `genesis.inclusionProof.authenticator` | yes | Authenticator | |
-| `genesis.inclusionProof.merkleTreePath` | yes | SmtPath | Sub-DAG |
+| `genesis.inclusionProof.merkleTreePath` | yes | SmtPath | Contains inline segments |
 | `genesis.inclusionProof.merkleTreePath.root` | no (inline) | -- | In SmtPath |
-| `genesis.inclusionProof.merkleTreePath.steps[]` | yes (each) | SmtPathSegment | One per step |
+| `genesis.inclusionProof.merkleTreePath.steps[]` | no (inline) | -- | Inlined as [data, path] tuples in SmtPath.segments |
 | `genesis.inclusionProof.transactionHash` | no (inline) | -- | In InclusionProof |
 | `genesis.inclusionProof.unicityCertificate` | yes | UnicityCertificate | Major dedup target |
 | genesis destination state | yes | TokenState | Derived |
@@ -940,7 +939,7 @@ Self-contained token in ITokenJson or TxfToken format.
 | `transactions[n].predicate` | -> TokenState | -- | Part of destination state |
 | `transactions[n].data` | yes | TransferTransactionData | If present |
 | `state` | yes | TokenState | Current state |
-| `state.predicate` | yes | Predicate | Extracted |
+| `state.predicate` | no (inline) | -- | Inlined as opaque bytes in TokenState |
 | `state.data` | no (inline) | -- | In TokenState |
 | `nametags[]` | yes (each) | TokenRoot | Full recursive deconstruction |
 | `version` | no | -- | Captured in header semantics |
@@ -952,18 +951,16 @@ Fully recursive. Terminates at leaf data. Typical depth:
 
 ```
 Level 0: TokenRoot
-Level 1: GenesisTransaction, TransferTransaction[], TokenState, TokenCoinData, TokenRoot[] (nametags)
-Level 2: MintTransactionData, InclusionProof, TokenState, TransferTransactionData, Predicate
-Level 3: Authenticator, SmtPath, UnicityCertificate, TokenCoinData, Predicate
-Level 4: SmtPathSegment[]
+Level 1: GenesisTransaction, TransferTransaction[], TokenState, TokenRoot[] (nametags)
+Level 2: MintTransactionData, InclusionProof, TokenState, TransferTransactionData
+Level 3: Authenticator, SmtPath, UnicityCertificate
 ```
 
 ### 8.4 Algorithm
 
 ```
 function deconstruct(token, pool) -> content-hash:
-    coinDataHash = deconstructCoinData(token.genesis.data.coinData, pool)
-    genesisHash = deconstructGenesis(token.genesis, coinDataHash, pool)
+    genesisHash = deconstructGenesis(token.genesis, pool)
     txHashes = []
     prevState = genesis.destinationState
     for tx in token.transactions:
@@ -972,9 +969,9 @@ function deconstruct(token, pool) -> content-hash:
         prevState = tx.destinationState
     currentStateHash = deconstructTokenState(token.state, pool)
     nametagHashes = [deconstruct(nt, pool) for nt in token.nametags]
-    root = TokenRoot { header, tokenId, tokenType, genesis: genesisHash,
+    root = TokenRoot { header, tokenId, genesis: genesisHash,
                        transactions: txHashes, state: currentStateHash,
-                       nametags: nametagHashes, coinData: coinDataHash }
+                       nametags: nametagHashes }
     hash = SHA-256(canonicalCbor(root))
     pool.putIfAbsent(hash, root)
     return hash
@@ -997,6 +994,7 @@ function reassemble(pool, rootHash, strategy) -> ITokenJson:
     transactions = [reassembleTx(pool, h, strategy) for h in root.transactions]
     state = reassembleState(pool, root.state, strategy)
     nametags = [reassemble(pool, h, strategy) for h in (root.nametags or [])]
+    coinData = genesis.data.coinData   ; extracted from MintTransactionData
     return { version: "2.0", genesis, transactions, state, nametags }
 ```
 
@@ -1018,6 +1016,10 @@ To reassemble at state N (N=0 after genesis):
 - State = destination state of transaction N (or genesis destination if N=0).
 - Nametags included in full.
 
+### 9.5 Integrity Verification During Reassembly
+
+During reassembly, every element fetched from the pool MUST be re-hashed and compared against the expected content hash. If any mismatch is detected, reassembly MUST fail with an integrity error. This prevents corrupted or tampered elements from being silently included in reassembled tokens.
+
 ### 9.4 Completeness Guarantee
 
 Reassembled tokens MUST:
@@ -1034,25 +1036,20 @@ Reassembled tokens MUST:
 
 A UCT token minted to Alice, transferred to Bob, then to Carol.
 
-**Element pool after deconstruction (28 elements):**
+**Element pool after deconstruction (23 elements):**
 
 ```
 [H_coindata]     TokenCoinData         coins: [["UCT", "1000000"]]
-[H_pred_alice]   Predicate             type: "unmasked", publicKey: 02alice...
-[H_pred_bob]     Predicate             type: "unmasked", publicKey: 02bob...
-[H_pred_carol]   Predicate             type: "unmasked", publicKey: 02carol...
-[H_state_0]      TokenState            predicate: H_pred_alice, data: ""
-[H_state_1]      TokenState            predicate: H_pred_bob, data: ""
-[H_state_2]      TokenState            predicate: H_pred_carol, data: ""
-[H_mintdata]     MintTransactionData   tokenId, tokenType, coinData: H_coindata, salt, recipient...
-[H_seg_0A]       SmtPathSegment        genesis proof step 0 (unique)
-[H_seg_1_shared] SmtPathSegment        step 1 (SHARED by all 3 proofs)
-[H_seg_2_shared] SmtPathSegment        step 2 (SHARED by all 3 proofs)
-[H_seg_0B]       SmtPathSegment        transfer 1 step 0 (unique)
-[H_seg_0C]       SmtPathSegment        transfer 2 step 0 (unique)
-[H_smtpath_gen]  SmtPath               segments: [H_seg_0A, H_seg_1_shared, H_seg_2_shared]
-[H_smtpath_tx1]  SmtPath               segments: [H_seg_0B, H_seg_1_shared, H_seg_2_shared]
-[H_smtpath_tx2]  SmtPath               segments: [H_seg_0C, H_seg_1_shared, H_seg_2_shared]
+[H_pred_alice]   Predicate             raw: <opaque CBOR predicate for alice>
+[H_pred_bob]     Predicate             raw: <opaque CBOR predicate for bob>
+[H_pred_carol]   Predicate             raw: <opaque CBOR predicate for carol>
+[H_state_0]      TokenState            predicate: <inline bytes>, data: ""
+[H_state_1]      TokenState            predicate: <inline bytes>, data: ""
+[H_state_2]      TokenState            predicate: <inline bytes>, data: ""
+[H_mintdata]     MintTransactionData   tokenId, tokenType, coinData: [["UCT","1000000"]], salt, recipient...
+[H_smtpath_gen]  SmtPath               root: ..., segments: [[data0A, path0A], [data1, path1], [data2, path2]]
+[H_smtpath_tx1]  SmtPath               root: ..., segments: [[data0B, path0B], [data1, path1], [data2, path2]]
+[H_smtpath_tx2]  SmtPath               root: ..., segments: [[data0C, path0C], [data1, path1], [data2, path2]]
 [H_auth_gen]     Authenticator         algorithm, publicKey: alice, signature, stateHash
 [H_auth_tx1]     Authenticator         algorithm, publicKey: alice, signature, stateHash
 [H_auth_tx2]     Authenticator         algorithm, publicKey: bob, signature, stateHash
@@ -1067,10 +1064,10 @@ A UCT token minted to Alice, transferred to Bob, then to Carol.
 [H_genesis]      GenesisTransaction    data: H_mintdata, proof: H_proof_gen, dest: H_state_0
 [H_tx1]          TransferTransaction   src: H_state_0, data: H_txdata_1, proof: H_proof_tx1, dest: H_state_1
 [H_tx2]          TransferTransaction   src: H_state_1, data: H_txdata_2, proof: H_proof_tx2, dest: H_state_2
-[H_root]         TokenRoot             genesis: H_genesis, transactions: [H_tx1, H_tx2], state: H_state_2
+[H_root]         TokenRoot             tokenId: ..., genesis: H_genesis, transactions: [H_tx1, H_tx2], state: H_state_2
 ```
 
-**Deduplication:** `H_seg_1_shared` and `H_seg_2_shared` are stored once, referenced 3x each.
+**Deduplication:** SmtPath segments are inlined, so deduplication of shared path data happens at the SmtPath level -- if two proofs have identical paths (same round, same tree), the entire SmtPath element is deduplicated.
 
 **Manifest:** `{ "aaaa1111...": H_root }`
 
@@ -1083,16 +1080,15 @@ H_cert_200 (UnicityCertificate)  -- stored ONCE, referenced by:
   H_proofA_tx1.unicityCertificate = H_cert_200
   H_proofB_tx1.unicityCertificate = H_cert_200
 
-H_seg_shared_1 (SmtPathSegment) -- upper tree level, stored ONCE, referenced by:
-  H_smtpathA_tx1.segments[1] = H_seg_shared_1
-  H_smtpathB_tx1.segments[1] = H_seg_shared_1
-
-H_seg_shared_2 (SmtPathSegment) -- upper tree level, stored ONCE, referenced by:
-  H_smtpathA_tx1.segments[2] = H_seg_shared_2
-  H_smtpathB_tx1.segments[2] = H_seg_shared_2
+H_smtpath_round200 (SmtPath)    -- if both tokens have identical paths (same round, same tree),
+                                    the entire SmtPath element is stored ONCE, referenced by:
+  H_proofA_tx1.merkleTreePath = H_smtpath_round200
+  H_proofB_tx1.merkleTreePath = H_smtpath_round200
 ```
 
-Without UXF: 4 certificates, 6 SMT segments. With UXF: 3 certificates, 4 segments.
+Paths that are fully identical (same round, same tree) are deduplicated as whole SmtPath elements. Paths that differ only in lower segments are stored as separate SmtPath elements with their segments inlined.
+
+Without UXF: 4 certificates, 6 SMT paths. With UXF: 3 certificates, shared SmtPath elements where paths are identical.
 
 ### 10.3 Instance Chain: Proof Consolidation
 
@@ -1112,9 +1108,12 @@ Pool additions:
   H_consol_2 (kind: "consolidated-proof", predecessor: H_proof_2)
 
 Index:
-  H_proof_0 -> { head: H_consol_0, kind: "consolidated-proof", length: 2 }
-  H_proof_1 -> { head: H_consol_1, kind: "consolidated-proof", length: 2 }
-  H_proof_2 -> { head: H_consol_2, kind: "consolidated-proof", length: 2 }
+  H_proof_0  -> { head: H_consol_0, chain: [{hash: H_proof_0, kind: "default"}, {hash: H_consol_0, kind: "consolidated-proof"}] }
+  H_consol_0 -> { head: H_consol_0, chain: [{hash: H_proof_0, kind: "default"}, {hash: H_consol_0, kind: "consolidated-proof"}] }
+  H_proof_1  -> { head: H_consol_1, chain: [{hash: H_proof_1, kind: "default"}, {hash: H_consol_1, kind: "consolidated-proof"}] }
+  H_consol_1 -> { head: H_consol_1, chain: [{hash: H_proof_1, kind: "default"}, {hash: H_consol_1, kind: "consolidated-proof"}] }
+  H_proof_2  -> { head: H_consol_2, chain: [{hash: H_proof_2, kind: "default"}, {hash: H_consol_2, kind: "consolidated-proof"}] }
+  H_consol_2 -> { head: H_consol_2, chain: [{hash: H_proof_2, kind: "default"}, {hash: H_consol_2, kind: "consolidated-proof"}] }
 ```
 
 **Reassembly with strategy=latest:** Uses consolidated proofs (smaller).
@@ -1141,44 +1140,42 @@ uxf-package = {
               ? creator: tstr, ? description: tstr,
               elementCount: uint, tokenCount: uint },
   manifest: { * token-id => content-hash },
-  instanceChainIndex: { * content-hash => { head: content-hash, kind: tstr, length: uint } },
+  instanceChainIndex: { * content-hash => { head: content-hash, chain: [+ { hash: content-hash, kind: tstr }] } },
   ? indexes: { ? byTokenType: { * token-type => [+ token-id] },
                ? byStateHash: { * content-hash => [+ token-id] } },
   elements: { * content-hash => element }
 }
 
-element = #6.786433([element-header, bstr, bstr, content-hash, [*content-hash], content-hash, [*content-hash]/null, content-hash])
+element = #6.786433([element-header, bstr, content-hash, [*content-hash], content-hash, [*content-hash]/null])
         / #6.786434([element-header, content-hash, content-hash, content-hash])
         / #6.786435([element-header, content-hash, nullable-ref, nullable-ref, content-hash])
-        / #6.786436([element-header, bstr, bstr, content-hash, bstr, bstr, tstr, bstr/null, tstr/null])
+        / #6.786436([element-header, bstr, bstr, [*[tstr,tstr]], bstr, bstr, tstr, bstr/null, tstr/null])
         / #6.786437([element-header, tstr, bstr, bstr/null, {*tstr=>any}/null])
-        / #6.786438([element-header, content-hash, bstr])
-        / #6.786439([element-header, tstr, bstr/null, bstr/null, tstr, tstr, bstr/null])
+        / #6.786438([element-header, bstr, bstr])
+        / #6.786439([element-header, bstr])
         / #6.786440([element-header, content-hash, content-hash, bstr, content-hash])
         / #6.786441([element-header, tstr, bstr, bstr, bstr])
         / #6.786442([element-header, bstr])
-        / #6.786443([element-header, bstr, bstr])
         / #6.786444([element-header, [*[tstr,tstr]]])
-        / #6.786445([element-header, bstr, [*content-hash]])
+        / #6.786445([element-header, bstr, [*[bstr,bstr]]])
 ```
 
 ## Appendix B: Element Type Quick Reference
 
 | ID | Name | Tag | Fields | Child Refs | Mutable |
 |----|------|-----|--------|------------|---------|
-| 0x01 | TokenRoot | 786433 | 8 | 5 | yes |
+| 0x01 | TokenRoot | 786433 | 6 | 4 | yes |
 | 0x02 | GenesisTransaction | 786434 | 4 | 3 | no |
 | 0x03 | TransferTransaction | 786435 | 5 | 4 | no |
-| 0x04 | MintTransactionData | 786436 | 9 | 1 | no |
+| 0x04 | MintTransactionData | 786436 | 9 | 0 | no |
 | 0x05 | TransferTransactionData | 786437 | 5 | 0 | no |
-| 0x06 | TokenState | 786438 | 3 | 1 | no |
-| 0x07 | Predicate | 786439 | 7 | 0 | no |
+| 0x06 | TokenState | 786438 | 3 | 0 | no |
+| 0x07 | Predicate | 786439 | 2 | 0 | no |
 | 0x08 | InclusionProof | 786440 | 5 | 3 | yes |
 | 0x09 | Authenticator | 786441 | 5 | 0 | no |
 | 0x0A | UnicityCertificate | 786442 | 2 | 0 | no |
-| 0x0B | SmtPathSegment | 786443 | 3 | 0 | no |
 | 0x0C | TokenCoinData | 786444 | 2 | 0 | no |
-| 0x0D | SmtPath | 786445 | 3 | 1 | yes |
+| 0x0D | SmtPath | 786445 | 3 | 0 | yes |
 
 ## Appendix C: Glossary
 
