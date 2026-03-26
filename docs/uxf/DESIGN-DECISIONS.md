@@ -164,11 +164,11 @@ True byte-level streaming of reassembly is NOT a goal.
 
 ---
 
-## Decision 13: API Cleanup — ingest vs addToken
+## Decision 13: API Cleanup — Remove addToken, Keep ingest
 
 **Context:** The reviewer (Finding 6.3) noted `ingest()` and `addToken()` appear to do the same thing.
 
-**Decision:** `ingest()` is the core operation (deconstruct + deduplicate + update manifest). `addToken()` is an alias that calls `ingest()` and returns `this` for chaining. Both are public API but `ingest()` is the documented primary method.
+**Decision:** `addToken()` is removed. `ingest()` is the sole method for adding tokens to a package — it deconstructs, deduplicates, and updates the manifest. `ingestAll()` handles batch ingestion. There is no alias or convenience wrapper.
 
 ---
 

@@ -276,8 +276,7 @@ Or as a compact tuple `[repr_version, sem_version, kind, predecessor_hash]` in C
    - `ingestAll(pkg: UxfPackage, tokens: Token[]) -> void`: batch deconstruction of multiple tokens.
    - `assemble(pkg: UxfPackage, tokenId: TokenId) -> Token`: reassemble a token at its latest locally-known state from the element pool. The result is a self-contained, verifiable token.
    - `assembleAtState(pkg: UxfPackage, tokenId: TokenId, stateIndex: number) -> Token`: reassemble at a specific historical state (genesis + first N transitions).
-   - `addToken(pkg: UxfPackage, token: Token) -> UxfPackage`: incremental addition.
-   - `removeToken(pkg: UxfPackage, tokenId: TokenId) -> UxfPackage`: incremental removal.
+   - `removeToken(pkg: UxfPackage, tokenId: TokenId) -> UxfPackage`: remove a token from the manifest (elements are not garbage-collected automatically).
    - `merge(a: UxfPackage, b: UxfPackage) -> UxfPackage`: combine two packages with deduplication.
    - `diff(a: UxfPackage, b: UxfPackage) -> UxfDelta`: compute minimal delta between package versions.
    - `verify(pkg: UxfPackage) -> VerificationResult`: validate package and token integrity.

@@ -1321,11 +1321,6 @@ export class UxfPackage {
   // ---------- Token Management ----------
 
   /**
-   * Add a token (convenience: calls ingest and returns this).
-   */
-  addToken(token: TxfToken): this;
-
-  /**
    * Remove a token from the manifest.
    * Elements are NOT garbage-collected automatically -- call gc() explicitly.
    */
@@ -1450,7 +1445,6 @@ export function ingest(pkg: UxfPackageData, token: TxfToken): void;
 export function ingestAll(pkg: UxfPackageData, tokens: TxfToken[]): void;
 export function assemble(pkg: UxfPackageData, tokenId: string, strategy?: InstanceSelectionStrategy): TxfToken;
 export function assembleAtState(pkg: UxfPackageData, tokenId: string, stateIndex: number, strategy?: InstanceSelectionStrategy): TxfToken;
-export function addToken(pkg: UxfPackageData, token: TxfToken): void;
 export function removeToken(pkg: UxfPackageData, tokenId: string): void;
 export function merge(target: UxfPackageData, source: UxfPackageData): void;
 export function diff(a: UxfPackageData, b: UxfPackageData): UxfDelta;
@@ -1579,7 +1573,6 @@ export {
   ingestAll,
   assemble,
   assembleAtState,
-  addToken,
   removeToken,
   merge,
   diff,
