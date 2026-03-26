@@ -531,7 +531,7 @@ export class NostrTransportProvider implements TransportProvider {
     // Create NIP-17 gift-wrapped message (kind 1059) for recipient
     const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
 
-    await this.publishEvent(giftWrap);
+    await this.publishWithVerification(giftWrap, 3, 'dm');
 
     // NIP-17 self-wrap: send a copy to ourselves so relay can replay sent messages.
     // Content includes recipientPubkey and originalId for dedup against the live-sent record.
@@ -604,7 +604,7 @@ export class NostrTransportProvider implements TransportProvider {
       ]
     );
 
-    await this.publishEvent(event);
+    await this.publishWithVerification(event, 3, 'token_transfer');
 
     this.emitEvent({
       type: 'transfer:sent',
@@ -1602,6 +1602,56 @@ export class NostrTransportProvider implements TransportProvider {
     // Convert to nostr-js-sdk Event and publish
     const sdkEvent = NostrEventClass.fromJSON(event);
     await this.nostrClient.publishEvent(sdkEvent);
+  }
+
+  /**
+   * Publish an event with verification: after publishing, query the relay to
+   * confirm the event was stored. Retries up to `maxAttempts` times on failure.
+   *
+   * This is critical for token transfers and DMs where silent loss means
+   * funds or messages disappear. The nostr-js-sdk's publishEvent resolves on
+   * a 5s timeout even without relay confirmation, so verification is needed.
+   */
+  private async publishWithVerification(
+    event: NostrEvent,
+    maxAttempts: number = 3,
+    label: string = 'event',
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.publishEvent(event);
+      } catch (err) {
+        if (attempt === maxAttempts) throw err;
+        logger.debug('Nostr', `${label} publish attempt ${attempt} failed, retrying...`);
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+
+      // Verify: query the relay for this specific event by ID
+      try {
+        const found = await this.queryEvents({
+          ids: [event.id],
+          limit: 1,
+        });
+        if (found.length > 0) {
+          if (attempt > 1) {
+            logger.debug('Nostr', `${label} verified on relay after ${attempt} attempt(s)`);
+          }
+          return; // confirmed on relay
+        }
+      } catch {
+        // Query failed — can't verify, treat publish as potentially successful
+        logger.debug('Nostr', `${label} verification query failed on attempt ${attempt}`);
+      }
+
+      // Event not found on relay — retry
+      if (attempt < maxAttempts) {
+        logger.debug('Nostr', `${label} not found on relay after publish, retrying (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+      } else {
+        logger.warn('Nostr', `${label} not verified on relay after ${maxAttempts} attempts — delivery uncertain`);
+      }
+    }
   }
 
   async fetchPendingEvents(): Promise<void> {
