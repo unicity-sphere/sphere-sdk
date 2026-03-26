@@ -57,7 +57,8 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   4. `UxfElementType` -- 12-value string literal union (ARCH 2.3). Values: `'token-root'`, `'genesis'`, `'genesis-data'`, `'transaction'`, `'transaction-data'`, `'inclusion-proof'`, `'authenticator'`, `'unicity-certificate'`, `'predicate'`, `'token-state'`, `'token-coin-data'`, `'smt-path'`.
   5. `UxfElement` -- base DAG node interface with `header`, `type`, `content`, `children` (ARCH 2.4).
   6. `UxfElementContent` -- `Readonly<Record<string, unknown>>` (ARCH 2.4).
-  7. Typed element content/children interfaces (ARCH 2.5): `TokenRootContent`, `TokenRootChildren`, `GenesisContent`, `GenesisChildren`, `GenesisDataContent`, `TransactionContent`, `TransactionChildren`, `TransactionDataContent`, `InclusionProofContent`, `InclusionProofChildren`, `AuthenticatorContent`, `SmtPathContent`, `UnicityCertificateContent`, `PredicateContent`, `StateContent`.
+  7. Typed element content/children interfaces (ARCH 2.5): `TokenRootContent`, `TokenRootChildren`, `GenesisContent`, `GenesisChildren`, `GenesisDataContent`, `TransactionContent`, `TransactionChildren`, `TransactionDataContent`, `InclusionProofContent`, `InclusionProofChildren`, `AuthenticatorContent`, `SmtPathContent`, `UnicityCertificateContent`, `PredicateContent`, `StateContent`. **Note on GenesisDataContent.reason:** type is `Uint8Array | null`, NOT `string | null`. For split tokens, this contains dag-cbor encoded ISplitMintReasonJson (a complex object with recursive ITokenJson parent token). For regular mints: null. For simple text reasons: UTF-8 encoded string bytes. Stored as opaque bytes to handle all three cases.
+  **Note on TransactionDataContent (TransferTransactionData):** use explicit fields instead of generic `fields: Record<string, unknown>`: `recipient: string, salt: string, recipientDataHash: string | null, message: string | null, nametagRefs: ContentHash[]`.
   8. `UxfManifest` -- `{ tokens: ReadonlyMap<string, ContentHash> }` (ARCH 2.6).
   9. `InstanceChainEntry` and `InstanceChainIndex` -- chain metadata types (ARCH 2.7).
   10. `InstanceSelectionStrategy` -- discriminated union with `latest`, `original`, `by-representation`, `by-kind`, `custom` variants (ARCH 2.8). Constants `STRATEGY_LATEST` and `STRATEGY_ORIGINAL`.
@@ -73,12 +74,14 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - `contentHash()` must reject uppercase hex, non-hex characters, and wrong-length strings.
   - All interfaces use `readonly` properties per code style.
   - `TransactionChildren.data` and `TransactionChildren.inclusionProof` are `ContentHash | null` (nullable for uncommitted transactions, per SPEC 2.2.3).
+  - `UxfElement.children` type: `Readonly<Record<string, ContentHash | ContentHash[] | null>>` -- includes `null` for nullable child references (e.g., `TransactionChildren.inclusionProof` when uncommitted).
 
 - **Acceptance Criteria:**
   1. All types compile with `tsc --noEmit`.
   2. `contentHash('a'.repeat(64))` succeeds; `contentHash('A'.repeat(64))` throws; `contentHash('xyz')` throws.
   3. `ELEMENT_TYPE_IDS` has exactly 12 entries matching SPEC Section 2.1 integer values.
   4. Every typed content interface matches its ARCHITECTURE Section 2.5 definition field-for-field.
+  5. `GenesisDataContent.reason` accepts `Uint8Array` for complex split token reasons.
 
 ---
 
@@ -153,7 +156,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
 
   Critical implementation detail -- hex-to-bytes normalization:
   - Content hashes stored as hex strings in the in-memory model must be converted to `Uint8Array` before CBOR encoding so they serialize as CBOR `bstr`, not `tstr`. This applies to: `header.predecessor`, all `children` values, and any content fields that are semantically byte data (tokenId, tokenType, salt, publicKey, etc.).
-  - Define a helper `prepareContentForHashing(type, content)` that converts hex-encoded byte fields to `Uint8Array` based on the element type. Reference the SPEC Section 2.2 field types (e.g., `bytes(32)` -> convert, `text` -> keep as string).
+  - Implement `prepareContentForHashing(type: UxfElementType, content: UxfElementContent): unknown` -- converts hex-encoded byte fields to `Uint8Array` before CBOR encoding. Uses the `ELEMENT_TYPE_IDS` mapping to determine which fields are bytes vs strings per DOMAIN-CONSTRAINTS Section 2.5. This is a public export, not just an internal helper.
   - Define a helper `prepareChildrenForHashing(children)` that converts all `ContentHash` values to `Uint8Array`.
 
   Edge cases:
@@ -161,6 +164,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - Empty `content` map: `{}` -- same.
   - `null` children (e.g., `TransactionChildren.data = null`): encode as CBOR null (SPEC 4.4 rule 8).
   - `null` predecessor: encode as CBOR null.
+  - SmtPath segment `path` values are decimal bigint strings, NOT hex. They MUST be stored as CBOR text strings (tstr) or bignums -- do NOT apply `hexToBytes()`. dag-cbor handles `BigInt` natively.
 
 - **Acceptance Criteria:**
   1. Hashing the same element twice produces the same `ContentHash`.
@@ -168,6 +172,8 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   3. The hash is a valid 64-char lowercase hex string.
   4. Two elements with identical logical content but different field order still produce the same hash (dag-cbor sorts keys).
   5. Unit test: construct a known element, hash it, verify against a pre-computed expected hash.
+  6. Hash computation converts hex fields to bytes before CBOR encoding; same element with hex strings and `Uint8Array` fields produces the same hash.
+  7. SmtPath with path value `'340282366920938463463374607431768211456'` round-trips correctly without corruption.
 
 ---
 
@@ -302,7 +308,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
 
   4. `deconstructTransaction(pool: ElementPool, tx): ContentHash` -- deconstructs:
      - `tx.sourceState` -> `token-state` element.
-     - `tx.data` -> `transaction-data` element (if present and non-empty). Content: `{ fields: tx.data }`.
+     - `tx.data` -> `transaction-data` element (if present and non-empty). Content: `{ recipient, salt, recipientDataHash, message, nametagRefs }` (explicit fields per WU-01 TransactionDataContent).
      - `tx.inclusionProof` -> via `deconstructInclusionProof()` (if non-null).
      - `tx.destinationState` -> `token-state` element.
      - Builds `transaction` element. `data` and `inclusionProof` children are `null` for uncommitted transactions (SPEC 2.2.3).
@@ -320,6 +326,13 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - `genesis.data.recipientDataHash` may be null.
   - `genesis.data.reason` may be null.
   - `state.data` may be empty string `""`.
+  - Split token reason handling: if `genesis.data.reason` is an object (ISplitMintReasonJson), serialize via dag-cbor encode to `Uint8Array`. If string, encode as UTF-8 bytes. If null, store as null.
+  - Before deconstructing, check for sentinel values: if input has `_placeholder === true` or `_pendingFinalization` property, throw `UxfError('INVALID_PACKAGE', 'Cannot ingest placeholder or pending finalization tokens')`.
+  - When deconstructing TransferTransactionData, if the source ITokenJson transfer has `data.nametags[]`, recursively deconstruct each nametag token and store their root hashes as a `nametagRefs: ContentHash[]` field in TransferTransactionData content.
+  - All hex string content fields from the input token MUST be lowercased via `.toLowerCase()` before storing in element content. This ensures deterministic content hashes regardless of input hex case.
+  - All function signatures must use ITokenJson sub-types from `@unicitylabs/state-transition-sdk` (`IMintTransactionJson`, `ITransferTransactionJson`, `ITokenStateJson`, `IInclusionProofJson`, `IAuthenticatorJson`), NOT TxfToken sub-types (`TxfGenesis`, `TxfTransaction`, `TxfState`). The ARCHITECTURE pseudocode examples use TxfToken naming -- implementations must map to ITokenJson types.
+  - Store `ITransferTransactionDataJson.message` in TransferTransactionData content as a `message: string | null` field (not buried in extraData).
+  - Phase 1 ACCEPTS tokens with null `inclusionProof` on the last transaction (pending/uncommitted). This diverges from DOMAIN-CONSTRAINTS Section 5.1 recommendation to reject. Null proofs are stored as null child references and restored during reassembly.
 
 - **Acceptance Criteria:**
   1. Deconstructing a token with 1 genesis + 2 transfers produces ~22 elements (per SPEC 10.1).
@@ -328,6 +341,11 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   4. Nametag tokens are recursively deconstructed.
   5. Uncommitted transactions have null data/proof children.
   6. The returned hash is the content hash of the token-root element.
+  7. Ingesting a split token with ISplitMintReasonJson reason preserves the full reason object on round-trip.
+  8. Ingesting a token with `_placeholder` or `_pendingFinalization` throws `INVALID_PACKAGE` error.
+  9. Round-trip of a token whose transfers contain nametag references preserves nametags in both top-level `ITokenJson.nametags` and per-transfer `ITransferTransactionDataJson.nametags`.
+  10. Ingesting a token with mixed-case hex produces the same content hashes as ingesting with lowercase hex.
+  11. Round-trip preserves non-null message in transfer transaction data.
 
 ---
 
@@ -377,6 +395,8 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - Uncommitted transaction: `data` and `inclusionProof` are null in the reassembled transaction.
   - `stateIndex` = 0: state comes from genesis destination state.
   - `stateIndex` > transaction count: throw `STATE_INDEX_OUT_OF_RANGE`.
+  - When reassembling TransferTransactionData, if `content.nametagRefs` exists, resolve each hash via `assembleTokenFromRoot()` and place the resulting `ITokenJson[]` into the reassembled transfer's `data.nametags` field.
+  - During reassembly, restore `message` field from TransferTransactionData content into the reassembled `ITransferTransactionDataJson`.
 
 - **Acceptance Criteria:**
   1. Round-trip: `assemble(deconstruct(token))` produces output semantically identical to the original.
@@ -386,6 +406,8 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   5. DAG cycle throws `CYCLE_DETECTED`.
   6. Missing element throws `MISSING_ELEMENT`.
   7. Wrong element type throws `TYPE_MISMATCH`.
+  8. Nametags are restored to transfer transaction data during reassembly.
+  9. Round-trip preserves non-null message in transfer transaction data.
 
 ---
 
@@ -429,7 +451,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - `consolidateProofs(tokenId, txRange)` -- throws `NOT_IMPLEMENTED` (Decision 9).
 
   Package operations:
-  - `merge(other)` -- merge another package's elements and manifest into this one. For each element in `other.pool`, add to this pool (dedup by hash). For manifest collisions, other's entry wins. Merge instance chain indexes (Decision 6: prefix detection, sibling heads for divergent chains). Rebuild secondary indexes. Returns `this`.
+  - `merge(other)` -- merge another package's elements and manifest into this one. For each element in `other.pool`, re-hash the element via `computeElementHash()` and verify the hash matches its key before inserting into this pool (hash mismatches throw `VERIFICATION_FAILED`). Dedup by hash. For manifest collisions, other's entry wins. Merge instance chain indexes (Decision 6: prefix detection, sibling heads for divergent chains). Rebuild secondary indexes. Returns `this`.
   - `gc()` -- mark-and-sweep from manifest roots (ARCH 3.4, Decision 11). Walk all reachable elements from every manifest root; delete unreachable. Prune orphaned instance chain entries. Returns count removed.
 
   Query methods:
@@ -446,7 +468,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - `tokenCount`, `elementCount`, `estimatedSize`, `packageData` getters.
 
   Free functions (ARCH 8.2):
-  - Export all operations as standalone functions that operate on `UxfPackageData` directly: `ingest()`, `ingestAll()`, `assemble()`, `assembleAtState()`, `removeToken()`, `merge()`, `diff()`, `applyDelta()`, `verify()`, `addInstance()`, `consolidateProofs()`, `collectGarbage()`.
+  - Export all operations as standalone convenience functions that mutate the input `UxfPackageData` in place: `ingest()`, `ingestAll()`, `assemble()`, `assembleAtState()`, `removeToken()`, `merge()`, `diff()`, `applyDelta()`, `verify()`, `addInstance()`, `consolidateProofs()`, `collectGarbage()`. Note: these are NOT pure functions -- they modify the provided `UxfPackageData`.
 
   Secondary index maintenance:
   - On `ingest()`: extract `tokenType` from genesis-data element content, extract `coinId` from genesis-data `coinData[0][0]`, extract current state hash from the state element. Populate `byTokenType`, `byCoinId`, `byStateHash`.
@@ -462,6 +484,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   6. `pkg.tokensByCoinId('UCT')` returns correct token IDs after ingestion.
   7. `pkg.consolidateProofs()` throws `NOT_IMPLEMENTED`.
   8. `pkg.toJson()` and `UxfPackage.fromJson()` round-trip.
+  9. `merge()` rejects a corrupted element from the source package with `VERIFICATION_FAILED`.
 
 ---
 
@@ -517,6 +540,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
 - **Dependencies:** WU-01, WU-02, WU-04
 - **Parallel Group:** PG-3
 - **Estimated Complexity:** M
+- **Phase 1 Priority:** LOW. Consider deferring to Phase 2 if implementation timeline is tight. `merge()` covers the primary use case.
 - **Description:**
 
   Implement diff and delta operations per ARCHITECTURE Section 8.5.
@@ -692,7 +716,7 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   1. `InMemoryUxfStorage` -- trivial in-memory adapter (ARCH 7.3).
   2. `KvUxfStorageAdapter` -- delegates to existing `StorageProvider` via JSON serialization (ARCH 7.4).
 
-  Barrel exports (`index.ts`): re-export everything listed in ARCH 8.6:
+  Barrel exports (`uxf/index.ts`): re-export everything listed in ARCH 8.6:
   - Types (all from `./types`)
   - Constants (`STRATEGY_LATEST`, `STRATEGY_ORIGINAL`, `contentHash`)
   - Classes (`UxfPackage`, `ElementPool`, `UxfError`)
@@ -700,6 +724,8 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
   - Serialization (`packageToJson`, `packageFromJson`, `exportToCar`, `importFromCar`, `computeCid`, `elementToIpldBlock`, `computeElementHash`)
   - Storage adapters
   - Advanced exports (`deconstructToken`, `assembleToken`, `assembleTokenFromRoot`, `assembleTokenAtState`)
+
+  **Important:** The root `index.ts` (main SDK barrel) re-exports UXF TYPES ONLY (using `export type`), NOT runtime classes or functions. Runtime UXF symbols are only available via `@unicitylabs/sphere-sdk/uxf`. This prevents the main bundle from requiring `@ipld/dag-cbor` at build time. See WU-14 for details.
 
 - **Acceptance Criteria:**
   1. `import { UxfPackage } from './uxf'` resolves.
@@ -756,17 +782,17 @@ Layer 6 (Tests)          WU-16 ─┼──────┤          (depends on 
      - `@ipld/car`: `^5.4.2` (runtime dependency for CAR export/import, could be optional)
      - `multiformats` is already in optional/peer deps -- move to regular dependencies since UXF needs it at runtime.
 
-  `index.ts` (main barrel) -- add UXF re-exports per ARCHITECTURE Section 8.7. Types-only re-export for the main barrel to avoid pulling IPLD deps into non-UXF consumers:
+  `index.ts` (main barrel) -- add UXF re-exports per ARCHITECTURE Section 8.7. **The root `index.ts` re-exports UXF TYPES ONLY (using `export type`), NOT runtime classes or functions.** Runtime UXF symbols (UxfPackage, UxfError, ElementPool, etc.) are only available via `@unicitylabs/sphere-sdk/uxf`. This prevents the main bundle from requiring `@ipld/dag-cbor` at build time.
   ```typescript
-  export type { ContentHash, UxfElementHeader, ... } from './uxf';
-  export { UxfPackage, UxfError, ... } from './uxf';
+  export type { ContentHash, UxfElementHeader, UxfElement, UxfPackageData, ... } from './uxf';
+  // NO runtime re-exports: UxfPackage, UxfError, etc. are NOT exported here
   ```
 
 - **Acceptance Criteria:**
   1. `npm run build` succeeds without errors.
   2. `dist/uxf/index.js`, `dist/uxf/index.cjs`, `dist/uxf/index.d.ts` are generated.
   3. `import { UxfPackage } from '@unicitylabs/sphere-sdk/uxf'` resolves in both ESM and CJS.
-  4. Main barrel `import { UxfPackage } from '@unicitylabs/sphere-sdk'` also resolves.
+  4. Main barrel `import type { ContentHash } from '@unicitylabs/sphere-sdk'` resolves; runtime `import { UxfPackage } from '@unicitylabs/sphere-sdk'` does NOT resolve (only available from `@unicitylabs/sphere-sdk/uxf`).
   5. `npm run typecheck` passes.
 
 ---
