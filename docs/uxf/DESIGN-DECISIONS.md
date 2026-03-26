@@ -200,7 +200,7 @@ uxf/
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Element type taxonomy (13 types) | Defined | SmtPathSegment inlined in SmtPath |
+| Element type taxonomy (12 types) | Defined | SmtPathSegment inlined in SmtPath |
 | Element pool (in-memory Map) | Phase 1 | Content-addressed, dedup on insert |
 | Deconstruction (ITokenJson → DAG) | Phase 1 | Recursive, mid-level granularity |
 | Reassembly (DAG → ITokenJson) | Phase 1 | With integrity checks, cycle detection |
