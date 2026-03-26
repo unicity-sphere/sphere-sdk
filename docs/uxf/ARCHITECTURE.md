@@ -162,17 +162,21 @@ export type UxfInstanceKind =
  */
 export type UxfElementType =
   | 'token-root'           // Root of a token DAG (references genesis, transactions[], state, nametags[])
-  | 'genesis'              // Genesis record (references genesis-data, inclusion-proof, destination-state)
+  | 'genesis'              // Genesis record (references genesis-data, inclusion-proof, destination token-state)
   | 'genesis-data'         // Immutable mint parameters (tokenId, tokenType, coinData, salt, recipient)
   | 'transaction'          // State transition (references predicate, inclusion-proof, tx-data)
   | 'transaction-data'     // Per-transfer parameters (memo, extra fields)
-  | 'inclusion-proof'      // SMT proof bundle (references authenticator, merkle-tree-path, unicity-certificate)
+  | 'inclusion-proof'      // SMT proof bundle (references authenticator, smt-path, unicity-certificate)
   | 'authenticator'        // PubKey + signature + stateHash
-  | 'merkle-tree-path'     // SMT root + inline segments array
   | 'unicity-certificate'  // BFT-signed round commitment (hex-encoded CBOR blob)
+  // Phase 1: predicates are stored inline in token-state content.
+  // Predicate elements are defined for future fine-grained dedup.
   | 'predicate'            // Ownership predicate (hex-encoded CBOR)
-  | 'token-state'          // Current state (predicate + data), also used for source/destination states
-  | 'destination-state';   // Post-genesis state (predicate + data)
+  | 'token-state'          // Current state (predicate + data), also used for genesis destination and source/destination states
+  // Phase 1: coinData is stored inline in genesis-data content.
+  // TokenCoinData elements are defined for future same-value dedup.
+  | 'token-coin-data'      // Coin denomination data (for future dedup of same-value tokens)
+  | 'smt-path';            // SMT root + inline segments array
 ```
 
 ### 2.4 UxfElement -- Base DAG Node
@@ -229,7 +233,7 @@ export interface GenesisContent {}  // all data is in children
 export interface GenesisChildren {
   readonly data: ContentHash;             // -> genesis-data
   readonly inclusionProof: ContentHash;   // -> inclusion-proof
-  readonly destinationState: ContentHash; // -> destination-state
+  readonly destinationState: ContentHash; // -> token-state (post-genesis state)
 }
 
 // ---- Genesis Data ----
@@ -268,7 +272,7 @@ export interface InclusionProofContent {
 }
 export interface InclusionProofChildren {
   readonly authenticator: ContentHash;
-  readonly merkleTreePath: ContentHash;
+  readonly merkleTreePath: ContentHash;    // -> smt-path
   readonly unicityCertificate: ContentHash;
 }
 
@@ -281,8 +285,8 @@ export interface AuthenticatorContent {
 }
 // No children -- leaf node.
 
-// ---- Merkle Tree Path ----
-export interface MerkleTreePathContent {
+// ---- SMT Path ----
+export interface SmtPathContent {
   readonly root: string;
   readonly segments: ReadonlyArray<{ readonly data: string; readonly path: string }>;
 }
@@ -304,7 +308,8 @@ export interface PredicateContent {
 }
 // No children -- leaf node.
 
-// ---- Token State / Destination State ----
+// ---- Token State ----
+// Used for current state, source state, destination state (including genesis destination state).
 export interface StateContent {
   readonly data: string;
   readonly predicate: string;
@@ -380,9 +385,9 @@ export const STRATEGY_ORIGINAL: InstanceSelectionStrategy = { type: 'original' }
  * Package envelope metadata.
  */
 export interface UxfEnvelope {
-  /** UXF format version (e.g., 1) */
-  readonly version: number;
-  /** Creation timestamp (ms since epoch) */
+  /** UXF format version (e.g., '1.0.0') */
+  readonly version: string;
+  /** Creation timestamp (Unix timestamp, seconds since epoch) */
   readonly createdAt: number;
   /** Last modification timestamp */
   readonly updatedAt: number;
@@ -507,6 +512,26 @@ import { encode } from '@ipld/dag-cbor';
  * This makes the hash a Merkle hash -- changing any descendant
  * changes all ancestors up to the root.
  */
+/**
+ * Maps UxfElementType string tags to uint type IDs for hash computation.
+ * These IDs are used in the canonical hash form (not in the in-memory model).
+ * See SPECIFICATION Section 2.1 for the normative type ID table.
+ */
+const ELEMENT_TYPE_IDS: Record<UxfElementType, number> = {
+  'token-root': 0x01,
+  'genesis': 0x02,
+  'transaction': 0x03,
+  'genesis-data': 0x04,
+  'transaction-data': 0x05,
+  'token-state': 0x06,
+  'predicate': 0x07,
+  'inclusion-proof': 0x08,
+  'authenticator': 0x09,
+  'unicity-certificate': 0x0A,
+  'token-coin-data': 0x0C,
+  'smt-path': 0x0D,
+};
+
 export function computeElementHash(element: UxfElement): ContentHash {
   const canonical = {
     header: [
@@ -515,7 +540,7 @@ export function computeElementHash(element: UxfElement): ContentHash {
       element.header.kind,
       element.header.predecessor,
     ],
-    type: element.type,
+    type: ELEMENT_TYPE_IDS[element.type],  // maps string tag to uint type ID per SPEC Section 2.1
     content: element.content,
     children: element.children,
   };
@@ -607,10 +632,10 @@ ITokenJson
 │   ├── genesis.data                      -> genesis-data (leaf)
 │   ├── genesis.inclusionProof            -> inclusion-proof
 │   │   ├── .authenticator                -> authenticator (leaf)
-│   │   ├── .merkleTreePath               -> merkle-tree-path (segments inline)
+│   │   ├── .merkleTreePath               -> smt-path (segments inline)
 │   │   ├── .unicityCertificate           -> unicity-certificate (leaf, opaque blob)
 │   │   └── .transactionHash              -> inline in inclusion-proof content
-│   └── (destination state inferred)      -> destination-state (leaf)
+│   └── genesis.destinationState          -> token-state (leaf, post-genesis state)
 │
 ├── transactions[]                        -> transaction[]
 │   ├── sourceState, destinationState     -> token-state (child elements)
@@ -630,7 +655,7 @@ The decomposition granularity is chosen to maximize deduplication at the points 
 |---------|-------------|-------------------|
 | `unicity-certificate` | Largest single element (~500-2000 bytes). All tokens in the same aggregator round share it. | Very high: N tokens/round share 1 certificate. |
 | `authenticator` | Same signer signs multiple tokens per round. | Moderate: shared across tokens with same signing key in same state. |
-| `merkle-tree-path` | SMT path stored as a single node with inline segments. | Moderate: full paths occasionally shared across tokens in the same round. |
+| `smt-path` | SMT path stored as a single node with inline segments. | Moderate: full paths occasionally shared across tokens in the same round. |
 | `predicate` | Tokens owned by the same user share predicate structure. | Moderate. |
 | `genesis-data` | Immutable, unique per token. | Low (unique per token), but referential integrity matters. |
 | `token-state` | Small, often unique. | Low, but needed as a separate addressable unit. |
@@ -663,7 +688,7 @@ export function deconstructToken(
   }
 
   // 3. Deconstruct current state
-  const stateHash = deconstructState(pool, token.state, 'token-state');
+  const stateHash = deconstructState(pool, token.state);
 
   // 4. Deconstruct nametags (recursive -- each is a full token sub-DAG)
   // ITokenJson.nametags is Token[], not string[]. Each nametag is recursively
@@ -710,18 +735,11 @@ function deconstructGenesis(pool: ElementPool, genesis: TxfGenesis): ContentHash
 
   const proofHash = deconstructInclusionProof(pool, genesis.inclusionProof);
 
-  // Destination state is derived from genesis context (the genesis proof's
-  // authenticator stateHash defines the post-genesis state).
-  // We store it as a destination-state element if the genesis has relevant data.
-  const destStateHash = pool.put({
-    header: makeHeader(),
-    type: 'destination-state',
-    content: {
-      data: '',
-      predicate: '',
-    },
-    children: {},
-  });
+  // The genesis destination state is the token state immediately after minting.
+  // In ITokenJson, this is available as genesis.destinationState (the state after
+  // the mint transaction). If no transfers have occurred, this is also the current
+  // token state. We store it as a token-state element with the actual post-genesis data.
+  const destStateHash = deconstructState(pool, genesis.destinationState, 'token-state');
 
   return pool.put({
     header: makeHeader(),
@@ -755,7 +773,7 @@ function deconstructInclusionProof(
   // Merkle tree path -- segments are inline, NOT separate elements
   const pathHash = pool.put({
     header: makeHeader(),
-    type: 'merkle-tree-path',
+    type: 'smt-path',
     content: {
       root: proof.merkleTreePath.root,
       segments: proof.merkleTreePath.steps.map(step => ({
@@ -788,7 +806,7 @@ function deconstructInclusionProof(
 
 function deconstructTransaction(pool: ElementPool, tx: TxfTransaction): ContentHash {
   // Source state (state before the transition)
-  const sourceStateHash = deconstructState(pool, tx.sourceState, 'token-state');
+  const sourceStateHash = deconstructState(pool, tx.sourceState);
 
   let proofHash: ContentHash | null = null;
   if (tx.inclusionProof) {
@@ -806,7 +824,7 @@ function deconstructTransaction(pool: ElementPool, tx: TxfTransaction): ContentH
   }
 
   // Destination state (state after the transition)
-  const destinationStateHash = deconstructState(pool, tx.destinationState, 'token-state');
+  const destinationStateHash = deconstructState(pool, tx.destinationState);
 
   return pool.put({
     header: makeHeader(),
@@ -824,11 +842,10 @@ function deconstructTransaction(pool: ElementPool, tx: TxfTransaction): ContentH
 function deconstructState(
   pool: ElementPool,
   state: TxfState,
-  type: 'token-state' | 'destination-state',
 ): ContentHash {
   return pool.put({
     header: makeHeader(),
-    type,
+    type: 'token-state',
     content: { data: state.data, predicate: state.predicate },
     children: {},
   });
@@ -900,15 +917,14 @@ export function assembleToken(
     predicate: stateElement.content.predicate as string,
   };
 
-  // Nametags are full recursive token sub-DAGs (ITokenJson.nametags is Token[])
+  // Nametags are full recursive token sub-DAGs (ITokenJson.nametags is Token[]).
+  // The hashes in root.children.nametags ARE root hashes of nametag token sub-DAGs
+  // in the pool. We reassemble them directly by root hash -- no manifest lookup needed,
+  // because nametag tokens may not have their own manifest entries.
   const nametagHashes = root.children.nametags as ContentHash[] || [];
-  const nametags: ITokenJson[] = nametagHashes.map(hash => {
-    // Each nametag hash points to a token-root; recursively assemble it
-    const nametagRoot = resolveElement(pool, hash, instanceChains, strategy);
-    assertType(nametagRoot, 'token-root');
-    const nametagTokenId = nametagRoot.content.tokenId as string;
-    return assembleToken(pool, manifest, nametagTokenId, instanceChains, strategy);
-  });
+  const nametags: ITokenJson[] = nametagHashes.map(hash =>
+    assembleTokenFromRoot(pool, hash, instanceChains, strategy)
+  );
 
   return {
     version: (root.content.version as string) || '2.0',
@@ -917,6 +933,27 @@ export function assembleToken(
     transactions,
     nametags: nametags.length > 0 ? nametags : undefined,
   };
+}
+
+/**
+ * Reassemble a token directly from its root hash in the pool.
+ * Same as assembleToken but takes a root hash instead of looking up the manifest.
+ * Used for nametag sub-DAGs whose root hashes are stored in parent token-root children
+ * but may not have their own manifest entries.
+ */
+function assembleTokenFromRoot(
+  pool: ElementPool,
+  rootHash: ContentHash,
+  instanceChains: InstanceChainIndex,
+  strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
+): ITokenJson {
+  const root = resolveElement(pool, rootHash, instanceChains, strategy);
+  assertType(root, 'token-root');
+
+  // Same reassembly logic as assembleToken, but starting from the resolved root element
+  // rather than a manifest lookup. The genesis, transactions, state, and nametags
+  // children are walked identically.
+  // ... (implementation mirrors assembleToken body after root resolution)
 }
 ```
 
@@ -1050,7 +1087,7 @@ JSON format for the package:
 
 ```json
 {
-  "envelope": { "version": 1, "createdAt": 1711929600000, "updatedAt": 1711929600000 },
+  "envelope": { "version": "1.0.0", "createdAt": 1711929600, "updatedAt": 1711929600 },
   "manifest": { "tokens": { "<tokenId>": "<rootHash>", ... } },
   "pool": { "<hash>": { "header": ..., "type": ..., "content": ..., "children": ... }, ... },
   "instanceChains": { "<hash>": { "head": "<hash>", "chain": [...] }, ... },
@@ -1552,7 +1589,7 @@ export { KvUxfStorageAdapter } from './storage-adapters';
 
 // Deconstruction (for advanced use)
 export { deconstructToken } from './deconstruct';
-export { assembleToken, assembleTokenAtState } from './assemble';
+export { assembleToken, assembleTokenFromRoot, assembleTokenAtState } from './assemble';
 ```
 
 ### 8.7 Main SDK Re-Exports

@@ -131,6 +131,7 @@ The top-level element representing a complete token. Each token in the manifest 
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header (see Section 3) |
 | `tokenId` | bytes(32) | yes | leaf | Unique 32-byte token identifier |
+| `version` | text | yes | leaf | Token format version string (e.g., "2.0") |
 | `genesis` | hash(32) | yes | @ref -> GenesisTransaction | Content hash of the genesis transaction element |
 | `transactions` | array\<hash(32)\> | yes | @ref -> TransferTransaction[] | Ordered array of content hashes of transfer transaction elements; empty array if never transferred |
 | `state` | hash(32) | yes | @ref -> TokenState | Content hash of the current token state element |
@@ -142,6 +143,7 @@ The top-level element representing a complete token. Each token in the manifest 
 
 **Mapping from ITokenJson:**
 - `tokenId` -> `genesis.data.tokenId` (extracted to root for manifest indexing)
+- `version` -> `version` field from ITokenJson (e.g., "2.0")
 - `genesis` -> deconstructed GenesisTransaction sub-DAG
 - `transactions` -> ordered array of deconstructed TransferTransaction sub-DAGs
 - `state` -> deconstructed TokenState
@@ -218,6 +220,8 @@ The ownership state of a token at a particular point in its history.
 
 **Mutability:** Single-instance.
 
+**Dual role note:** TokenState elements serve both as current state and as historical destination states within genesis and transfer transactions. There is no separate destination-state type.
+
 **State hash note:** The SDK-level state hash (used in authenticators, `previousStateHash`/`newStateHash`) is computed by the SDK over the predicate and data using the SDK's own algorithm. This is a protocol-level semantic value, distinct from the UXF content hash of the TokenState element.
 
 #### 2.2.7 Predicate (0x07)
@@ -230,6 +234,8 @@ An ownership condition controlling who can authorize state transitions.
 | `raw` | bytes | yes | leaf | The original CBOR-encoded predicate, preserved verbatim |
 
 **Design rationale:** Stored as opaque CBOR to preserve exact bytes for stable content hashes. Field-level sharing (e.g., common signingAlgorithm) was evaluated and found to provide negligible deduplication benefit (~5 bytes per shared field) relative to the overhead of additional elements.
+
+**Phase 1 note:** Defined as an element type for future use. In the default (Phase 1) decomposition, predicates are stored inline within TokenState elements and coinData is stored inline within MintTransactionData. These types become relevant when fine-grained deduplication of predicates or coin values is needed.
 
 **Mutability:** Single-instance.
 
@@ -294,6 +300,8 @@ The fungible value of a token as an array of (coinId, amount) pairs.
 |-------|------|----------|-----------|-------------|
 | `header` | ElementHeader | yes | -- | Element header |
 | `coins` | array\<[text, text]\> | yes | leaf | Array of [coinId, amount] pairs |
+
+**Phase 1 note:** Defined as an element type for future use. In the default (Phase 1) decomposition, predicates are stored inline within TokenState elements and coinData is stored inline within MintTransactionData. These types become relevant when fine-grained deduplication of predicates or coin values is needed.
 
 **Mutability:** Single-instance.
 
@@ -433,6 +441,8 @@ The canonical form for hashing is a CBOR map with four keys:
 }
 ```
 This map-based form is used for ALL hash computations, regardless of whether the element is transmitted/stored using the positional array CBOR encoding (Section 6a). The positional array encoding and CBOR tags are wire format optimizations; they are NOT included in hash computation.
+
+The `type` field in the canonical hash form is the **integer type ID** (uint) from Section 2.1, NOT a string tag. Implementations using string-based type discriminators internally must map to the integer ID before hashing.
 
 The content hash does **not** include:
 - The enclosing CBOR tag (identifies type in stream, not part of content)
@@ -716,6 +726,7 @@ nullable-ref = content-hash / null
 token-root = #6.786433([
   header: element-header,
   tokenId: bstr .size 32,
+  version: tstr,
   genesis: content-hash,
   transactions: [* content-hash],
   state: content-hash,
@@ -942,7 +953,7 @@ Self-contained token in ITokenJson or TxfToken format.
 | `state.predicate` | no (inline) | -- | Inlined as opaque bytes in TokenState |
 | `state.data` | no (inline) | -- | In TokenState |
 | `nametags[]` | yes (each) | TokenRoot | Full recursive deconstruction |
-| `version` | no | -- | Captured in header semantics |
+| `version` | no (inline) | -- | Stored as `version` field on TokenRoot (e.g., "2.0") |
 | `_integrity` | no | -- | TXF-only; not stored |
 
 ### 8.3 Decomposition Depth
@@ -969,9 +980,9 @@ function deconstruct(token, pool) -> content-hash:
         prevState = tx.destinationState
     currentStateHash = deconstructTokenState(token.state, pool)
     nametagHashes = [deconstruct(nt, pool) for nt in token.nametags]
-    root = TokenRoot { header, tokenId, genesis: genesisHash,
-                       transactions: txHashes, state: currentStateHash,
-                       nametags: nametagHashes }
+    root = TokenRoot { header, tokenId, version: token.version,
+                       genesis: genesisHash, transactions: txHashes,
+                       state: currentStateHash, nametags: nametagHashes }
     hash = SHA-256(canonicalCbor(root))
     pool.putIfAbsent(hash, root)
     return hash
@@ -995,7 +1006,7 @@ function reassemble(pool, rootHash, strategy) -> ITokenJson:
     state = reassembleState(pool, root.state, strategy)
     nametags = [reassemble(pool, h, strategy) for h in (root.nametags or [])]
     coinData = genesis.data.coinData   ; extracted from MintTransactionData
-    return { version: "2.0", genesis, transactions, state, nametags }
+    return { version: root.version, genesis, transactions, state, nametags }
 ```
 
 ### 9.2 Instance Selection
@@ -1016,10 +1027,6 @@ To reassemble at state N (N=0 after genesis):
 - State = destination state of transaction N (or genesis destination if N=0).
 - Nametags included in full.
 
-### 9.5 Integrity Verification During Reassembly
-
-During reassembly, every element fetched from the pool MUST be re-hashed and compared against the expected content hash. If any mismatch is detected, reassembly MUST fail with an integrity error. This prevents corrupted or tampered elements from being silently included in reassembled tokens.
-
 ### 9.4 Completeness Guarantee
 
 Reassembled tokens MUST:
@@ -1027,6 +1034,10 @@ Reassembled tokens MUST:
 2. Produce same state hashes at every point.
 3. Be importable by existing SDK (`Token.fromJson()`).
 4. Contain no UXF-internal structures.
+
+### 9.5 Integrity Verification During Reassembly
+
+During reassembly, every element fetched from the pool MUST be re-hashed and compared against the expected content hash. If any mismatch is detected, reassembly MUST fail with an integrity error. This prevents corrupted or tampered elements from being silently included in reassembled tokens.
 
 ---
 
@@ -1036,13 +1047,9 @@ Reassembled tokens MUST:
 
 A UCT token minted to Alice, transferred to Bob, then to Carol.
 
-**Element pool after deconstruction (23 elements):**
+**Element pool after deconstruction (22 elements):**
 
 ```
-[H_coindata]     TokenCoinData         coins: [["UCT", "1000000"]]
-[H_pred_alice]   Predicate             raw: <opaque CBOR predicate for alice>
-[H_pred_bob]     Predicate             raw: <opaque CBOR predicate for bob>
-[H_pred_carol]   Predicate             raw: <opaque CBOR predicate for carol>
 [H_state_0]      TokenState            predicate: <inline bytes>, data: ""
 [H_state_1]      TokenState            predicate: <inline bytes>, data: ""
 [H_state_2]      TokenState            predicate: <inline bytes>, data: ""
@@ -1066,6 +1073,8 @@ A UCT token minted to Alice, transferred to Bob, then to Carol.
 [H_tx2]          TransferTransaction   src: H_state_1, data: H_txdata_2, proof: H_proof_tx2, dest: H_state_2
 [H_root]         TokenRoot             tokenId: ..., genesis: H_genesis, transactions: [H_tx1, H_tx2], state: H_state_2
 ```
+
+**Note:** In the default Phase 1 decomposition, predicates are stored inline within TokenState elements and coinData is stored inline within MintTransactionData. No separate Predicate or TokenCoinData elements are created. The 22 elements break down as: 3 TokenState, 1 MintTransactionData, 3 SmtPath, 3 Authenticator, 3 UnicityCertificate, 3 InclusionProof, 1 GenesisTransaction, 2 TransferTransaction, 2 TransferTransactionData, 1 TokenRoot.
 
 **Deduplication:** SmtPath segments are inlined, so deduplication of shared path data happens at the SmtPath level -- if two proofs have identical paths (same round, same tree), the entire SmtPath element is deduplicated.
 
@@ -1134,19 +1143,24 @@ token-type = bstr .size 32
 
 element-header = [uint, uint, tstr, content-hash / null]
 
+instance-chain-entry = {
+  head: content-hash,
+  chain: [+ { hash: content-hash, kind: tstr }]
+}
+
 uxf-package = {
   magic: bstr .size 8,
   metadata: { version: tstr, createdAt: uint, updatedAt: uint,
               ? creator: tstr, ? description: tstr,
               elementCount: uint, tokenCount: uint },
   manifest: { * token-id => content-hash },
-  instanceChainIndex: { * content-hash => { head: content-hash, chain: [+ { hash: content-hash, kind: tstr }] } },
+  instanceChainIndex: { * content-hash => instance-chain-entry },
   ? indexes: { ? byTokenType: { * token-type => [+ token-id] },
                ? byStateHash: { * content-hash => [+ token-id] } },
   elements: { * content-hash => element }
 }
 
-element = #6.786433([element-header, bstr, content-hash, [*content-hash], content-hash, [*content-hash]/null])
+element = #6.786433([element-header, bstr, tstr, content-hash, [*content-hash], content-hash, [*content-hash]/null])
         / #6.786434([element-header, content-hash, content-hash, content-hash])
         / #6.786435([element-header, content-hash, nullable-ref, nullable-ref, content-hash])
         / #6.786436([element-header, bstr, bstr, [*[tstr,tstr]], bstr, bstr, tstr, bstr/null, tstr/null])
@@ -1164,7 +1178,7 @@ element = #6.786433([element-header, bstr, content-hash, [*content-hash], conten
 
 | ID | Name | Tag | Fields | Child Refs | Mutable |
 |----|------|-----|--------|------------|---------|
-| 0x01 | TokenRoot | 786433 | 6 | 4 | yes |
+| 0x01 | TokenRoot | 786433 | 7 | 4 | yes |
 | 0x02 | GenesisTransaction | 786434 | 4 | 3 | no |
 | 0x03 | TransferTransaction | 786435 | 5 | 4 | no |
 | 0x04 | MintTransactionData | 786436 | 9 | 0 | no |
