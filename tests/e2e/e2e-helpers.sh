@@ -279,8 +279,8 @@ wait_swap_progress() {
       echo "$progress"
       return 0
     fi
-    sleep 15
-    elapsed=$((elapsed + 15))
+    sleep 5
+    elapsed=$((elapsed + 5))
   done
   echo "${progress:-unknown}"
   return 1

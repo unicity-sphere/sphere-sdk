@@ -18,40 +18,40 @@ trap cleanup EXIT
 setup_escrow
 launch_escrow
 
-# Step 0: Wallets
+# Wallets
 log ""; log "=== Create wallets ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
 
-# Step 1: Topup
+# Topup
 log ""; log "=== Topup ==="
 topup_wallet "$ALICE" BTC 10
 topup_wallet "$BOB" ETH 100
 
-# Step 2: Propose
+# Propose
 log ""; log "=== Propose swap: 1 BTC ↔ 10 ETH ==="
 SWAP_ID=$(propose_swap "$ALICE" "$BOB" "1 BTC" "10 ETH" "$ESCROW")
 ok "Proposed ${SWAP_ID:0:8}..."
 
-# Step 3: Accept
+# Accept
 log ""; log "=== Bob accepts ==="
 accept_swap "$BOB" "${SWAP_ID:0:8}"
 
-# Step 4: Both deposit
+# Both deposit
 log ""; log "=== Deposits ==="
 deposit_swap "$BOB" "${SWAP_ID:0:8}"
 deposit_swap "$ALICE" "${SWAP_ID:0:8}"
 
-# Step 5: Wait for completion
+# Wait for completion (poll every 5s, max 120s)
 log ""; log "=== Waiting for swap completion ==="
-FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned" 300) || true
+FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned" 120) || true
 if [[ "$FINAL" == "completed" || "$FINAL" == "pruned" ]]; then
   ok "Swap completed"
 else
   fail "Swap did not complete (final: $FINAL)"
 fi
 
-# Step 6: Verify balances
+# Verify balances
 log ""; log "=== Verify balances ==="
 ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
 if echo "$ALICE_BAL" | grep -q "ETH"; then ok "Alice received ETH"; else fail "Alice missing ETH"; fi
