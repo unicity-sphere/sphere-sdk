@@ -35,3 +35,4 @@ ref_materials/
 
 # Integration test data
 tests/integration/.test-*/
+.claude
