@@ -86,8 +86,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref1 = createTestSwapRef({
       progress: 'proposed',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'UCT',
         partyAAmount: '1000000',
         partyBCurrency: 'USDU',
@@ -100,8 +100,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref2 = createTestSwapRef({
       progress: 'awaiting_counter',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'ALPHA',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
@@ -114,8 +114,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref3 = createTestSwapRef({
       progress: 'completed',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'BTC',
         partyAAmount: '100000',
         partyBCurrency: 'UCT',
@@ -141,8 +141,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref2 = createTestSwapRef({
       progress: 'awaiting_counter',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'ALPHA',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
@@ -154,8 +154,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref3 = createTestSwapRef({
       progress: 'completed',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'BTC',
         partyAAmount: '100000',
         partyBCurrency: 'UCT',
@@ -183,8 +183,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
       role: 'acceptor',
       progress: 'proposed',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'ALPHA',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
@@ -210,8 +210,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref2 = createTestSwapRef({
       progress: 'completed',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'ALPHA',
         partyAAmount: '2000000',
         partyBCurrency: 'USDU',
@@ -223,8 +223,8 @@ describe('SwapModule — getSwapStatus / getSwaps', () => {
     const ref3 = createTestSwapRef({
       progress: 'cancelled',
       deal: {
-        partyA: 'DIRECT://party_a_aaa111',
-        partyB: 'DIRECT://party_b_bbb222',
+        partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+        partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
         partyACurrency: 'BTC',
         partyAAmount: '100000',
         partyBCurrency: 'UCT',

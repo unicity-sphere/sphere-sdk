@@ -13,8 +13,8 @@ import { createTestSwapDeal } from './swap-test-helpers.js';
 
 /** Standard test fields used across multiple tests. */
 const TEST_FIELDS: ManifestFields = {
-  party_a_address: 'DIRECT://party_a_aaa111',
-  party_b_address: 'DIRECT://party_b_bbb222',
+  party_a_address: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+  party_b_address: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
   party_a_currency_to_change: 'UCT',
   party_a_value_to_change: '1000000',
   party_b_currency_to_change: 'USDU',
@@ -51,8 +51,8 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
     // Construct the same fields in different property insertion orders.
     // JCS (RFC 8785) sorts keys lexicographically, so order should not matter.
     const fieldsOrderA: ManifestFields = {
-      party_a_address: 'DIRECT://party_a_aaa111',
-      party_b_address: 'DIRECT://party_b_bbb222',
+      party_a_address: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+      party_b_address: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
       party_a_currency_to_change: 'UCT',
       party_a_value_to_change: '1000000',
       party_b_currency_to_change: 'USDU',
@@ -68,8 +68,8 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
       party_a_value_to_change: '1000000',
       party_b_currency_to_change: 'USDU',
       party_a_currency_to_change: 'UCT',
-      party_b_address: 'DIRECT://party_b_bbb222',
-      party_a_address: 'DIRECT://party_a_aaa111',
+      party_b_address: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
+      party_a_address: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
       salt: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     } as ManifestFields;
 
@@ -115,14 +115,14 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
   it('UT-SWAP-MAN-005: buildManifest constructs correct manifest with DIRECT addresses', () => {
     const deal = createTestSwapDeal();
     const manifest = buildManifest(
-      'DIRECT://party_a_aaa111',
-      'DIRECT://party_b_bbb222',
+      'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+      'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
       deal,
       deal.timeout,
     );
 
-    expect(manifest.party_a_address).toBe('DIRECT://party_a_aaa111');
-    expect(manifest.party_b_address).toBe('DIRECT://party_b_bbb222');
+    expect(manifest.party_a_address).toBe('DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1');
+    expect(manifest.party_b_address).toBe('DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2');
     expect(manifest.party_a_currency_to_change).toBe('UCT');
     expect(manifest.party_a_value_to_change).toBe('1000000');
     expect(manifest.party_b_currency_to_change).toBe('USDU');
@@ -152,8 +152,8 @@ describe('SwapModule — manifest (computeSwapId, buildManifest, validateManifes
     // Build a valid manifest first, then corrupt it
     const deal = createTestSwapDeal();
     const validManifest = buildManifest(
-      'DIRECT://party_a_aaa111',
-      'DIRECT://party_b_bbb222',
+      'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+      'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
       deal,
       deal.timeout,
     );

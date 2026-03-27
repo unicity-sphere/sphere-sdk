@@ -255,13 +255,13 @@ describe('SwapModule Lifecycle', () => {
 
     const deal = {
       partyA: DEFAULT_TEST_PARTY_A_ADDRESS,
-      partyB: 'DIRECT://party_b_bbb222',
+      partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
       partyACurrency: 'UCT',
       partyAAmount: '1000000',
       partyBCurrency: 'USDU',
       partyBAmount: '500000',
       timeout: 300,
-      escrowAddress: 'DIRECT://escrow_eee333',
+      escrowAddress: 'DIRECT://0000eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee3',
     };
 
     // proposeSwap requires loaded state (ensureReady)
@@ -302,13 +302,13 @@ describe('SwapModule Lifecycle', () => {
 
     const deal = {
       partyA: DEFAULT_TEST_PARTY_A_ADDRESS,
-      partyB: 'DIRECT://party_b_bbb222',
+      partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
       partyACurrency: 'UCT',
       partyAAmount: '1000000',
       partyBCurrency: 'USDU',
       partyBAmount: '500000',
       timeout: 300,
-      escrowAddress: 'DIRECT://escrow_eee333',
+      escrowAddress: 'DIRECT://0000eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee3',
     };
 
     // All public methods should throw SWAP_MODULE_DESTROYED

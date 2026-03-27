@@ -50,13 +50,13 @@ export { SphereError };
 
 export const DEFAULT_TEST_PARTY_A_PUBKEY = '02' + 'a'.repeat(64);
 export const DEFAULT_TEST_PARTY_A_TRANSPORT_PUBKEY = 'a'.repeat(64);
-export const DEFAULT_TEST_PARTY_A_ADDRESS = 'DIRECT://party_a_aaa111';
+export const DEFAULT_TEST_PARTY_A_ADDRESS = 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1';
 export const DEFAULT_TEST_PARTY_B_PUBKEY = '02' + 'b'.repeat(64);
 export const DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY = 'b'.repeat(64);
-export const DEFAULT_TEST_PARTY_B_ADDRESS = 'DIRECT://party_b_bbb222';
+export const DEFAULT_TEST_PARTY_B_ADDRESS = 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2';
 export const DEFAULT_TEST_ESCROW_PUBKEY = '02' + 'e'.repeat(64);
 export const DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY = 'e'.repeat(64);
-export const DEFAULT_TEST_ESCROW_ADDRESS = 'DIRECT://escrow_eee333';
+export const DEFAULT_TEST_ESCROW_ADDRESS = 'DIRECT://0000eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee3';
 
 export const DEFAULT_TEST_IDENTITY: FullIdentity = {
   chainPubkey: DEFAULT_TEST_PARTY_A_PUBKEY,

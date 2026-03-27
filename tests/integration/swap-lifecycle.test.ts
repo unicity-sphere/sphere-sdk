@@ -42,14 +42,14 @@ import {
 const PARTY_A_PRIVATE_KEY = 'a'.repeat(64);
 const PARTY_A_PUBKEY = '026a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3';
 const PARTY_A_TRANSPORT_PUBKEY = 'a'.repeat(64);
-const PARTY_A_ADDRESS = 'DIRECT://party_a_aaa111';
+const PARTY_A_ADDRESS = 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1';
 const PARTY_B_PRIVATE_KEY = 'b'.repeat(64);
 const PARTY_B_PUBKEY = '0268680737c76dabb801cb2204f57dbe4e4579e4f710cd67dc1b4227592c81e9b5';
 const PARTY_B_TRANSPORT_PUBKEY = 'b'.repeat(64);
-const PARTY_B_ADDRESS = 'DIRECT://party_b_bbb222';
+const PARTY_B_ADDRESS = 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2';
 const ESCROW_PUBKEY = '02' + 'e'.repeat(64);
 const ESCROW_TRANSPORT_PUBKEY = 'e'.repeat(64);
-const ESCROW_ADDRESS = 'DIRECT://escrow_eee333';
+const ESCROW_ADDRESS = 'DIRECT://0000eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee3';
 
 function randomHex(len: number): string {
   return Array.from({ length: len }, () => Math.floor(Math.random() * 16).toString(16)).join('');

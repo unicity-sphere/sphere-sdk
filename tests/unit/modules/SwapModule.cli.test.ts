@@ -52,7 +52,7 @@ function createMockSphere(swapModule: MockSwapModule) {
     swap: swapModule,
     identity: {
       chainPubkey: '02' + 'a'.repeat(64),
-      directAddress: 'DIRECT://party_a_aaa111',
+      directAddress: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
       l1Address: 'alpha1partyaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       nametag: 'alice',
       privateKey: 'a'.repeat(64),
@@ -380,21 +380,21 @@ function makeSwapRef(overrides?: Partial<SwapRef>): any {
   return {
     swapId: VALID_SWAP_ID,
     deal: {
-      partyA: 'DIRECT://party_a_aaa111',
-      partyB: 'DIRECT://party_b_bbb222',
+      partyA: 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
+      partyB: 'DIRECT://0000bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2',
       partyACurrency: 'UCT',
       partyAAmount: '1000000',
       partyBCurrency: 'USDU',
       partyBAmount: '500000',
       timeout: 300,
-      escrowAddress: 'DIRECT://escrow_eee333',
+      escrowAddress: 'DIRECT://0000eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee3',
     },
     manifest: { swap_id: VALID_SWAP_ID },
     role: 'proposer' as SwapRole,
     progress: 'proposed' as SwapProgress,
     counterpartyPubkey: '02' + 'b'.repeat(64),
     escrowPubkey: '02' + 'e'.repeat(64),
-    escrowDirectAddress: 'DIRECT://escrow_eee333',
+    escrowDirectAddress: 'DIRECT://0000eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee333eee3',
     payoutVerified: false,
     createdAt: now,
     updatedAt: now,
@@ -977,7 +977,7 @@ describe('SwapModule CLI Commands', () => {
 
       const result = await runSwapCommand([
         'swap-propose',
-        '--to', 'DIRECT://party_a_aaa111',
+        '--to', 'DIRECT://0000aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1',
         '--offer', '1000000 UCT',
         '--want', '500000 USDU',
         '--escrow', 'DIRECT://eee',

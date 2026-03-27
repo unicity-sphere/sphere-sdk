@@ -321,8 +321,8 @@ describe('SwapModule — state machine (state-machine.ts)', () => {
       expect(mapEscrowStateToProgress('PARTIAL_DEPOSIT')).toBe('depositing');
     });
 
-    it('DEPOSIT_COVERED -> awaiting_counter', () => {
-      expect(mapEscrowStateToProgress('DEPOSIT_COVERED')).toBe('awaiting_counter');
+    it('DEPOSIT_COVERED -> concluding', () => {
+      expect(mapEscrowStateToProgress('DEPOSIT_COVERED')).toBe('concluding');
     });
 
     it('CONCLUDING -> concluding', () => {
