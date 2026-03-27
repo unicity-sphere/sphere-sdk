@@ -957,7 +957,7 @@ EDGE_DEEP_NAMETAG_5 = {
 | `authenticator` | 12 | One per inclusion-proof |
 | `smt-path` | 12 | One per inclusion-proof |
 | `unicity-certificate` | 11 | 12 proofs - 1 shared cert |
-| `token-state` | 12 | Various; PREDICATE_A and PREDICATE_B shared |
+| `token-state` | 9 | 9 unique states: PRED_A(shared A/B/C), PRED_B(shared B/C), PRED_C, PRED_D, D-own, NT_ALICE, E-src, E-own, F-own |
 | `transaction` | 5 | B(1) + C(3) + E(1) |
 | `transaction-data` | 5 | One per transaction |
 | **Total** | **87** | |
@@ -972,7 +972,7 @@ When implementing the test fixtures, validate these invariants:
 4. **Deconstruct Token D into same pool:** pool.size === 48 + 16 = 64 (no overlap with A-C)
 5. **Deconstruct Token E into same pool:** pool.size === 64 + 23 - 8 = 79 (shared NAMETAG_ALICE)
 6. **Deconstruct Token F into same pool:** pool.size === 79 + 8 = 87 (no overlap)
-7. **Round-trip each token:** `assembleToken(pool, manifest, tokenId)` deeply equals the original input for all 6 tokens (modulo `data: null` -> `""` normalization for state fields, and hex lowercasing).
+7. **Round-trip each token:** `assembleToken(pool, manifest, tokenId)` deeply equals the original input for all 6 tokens (modulo hex lowercasing). Note: `state.data: null` is faithfully preserved — do NOT normalize null to empty string.
 8. **SHARED_CERT content hash:** The content hash of the `unicity-certificate` element from Token B tx0 equals the content hash from Token C tx1.
 9. **NAMETAG_ALICE root hash:** The content hash of the nametag `token-root` from Token D equals the nametagRef hash stored in Token E's `transaction-data`.
 
@@ -1017,7 +1017,7 @@ export const EXPECTED_POOL_SIZE_INCREMENTAL = [8, 22, 48, 64, 79, 87];
 ### 5.3 Round-Trip Normalization
 
 When comparing reassembled tokens to originals, apply these normalizations:
-- `state.data: null` may reassemble as `""` (empty string) -- treat both as equivalent.
+- `state.data: null` is preserved faithfully through round-trip (not coerced to empty string). Assert `null` stays `null`.
 - All hex strings must be lowercased before comparison.
 - `nametags: undefined` should be treated as `nametags: []`.
 - `coinData: null` should be treated as `coinData: []`.

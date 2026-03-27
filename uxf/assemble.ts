@@ -136,7 +136,7 @@ function assembleState(
   pool: ElementPool,
   stateHash: ContentHash,
   ctx: AssemblyContext,
-): { predicate: string; data: string } {
+): { predicate: string; data: string | null } {
   const el = resolveAndVerify(pool, stateHash, ctx, 'token-state');
   const c = el.content as unknown as StateContent;
   return {
@@ -311,7 +311,7 @@ function assembleTransactionData(
   dataHash: ContentHash,
   ctx: AssemblyContext,
 ): {
-  sourceState: { predicate: string; data: string };
+  sourceState: { predicate: string; data: string | null };
   recipient: string;
   salt: string;
   recipientDataHash: string | null;
@@ -354,7 +354,7 @@ function assembleTransaction(
   ctx: AssemblyContext,
 ): {
   data: {
-    sourceState: { predicate: string; data: string };
+    sourceState: { predicate: string; data: string | null };
     recipient: string;
     salt: string;
     recipientDataHash: string | null;
@@ -567,7 +567,7 @@ export function assembleTokenAtState(
   }
 
   // Determine state at the requested index
-  let state: { predicate: string; data: string };
+  let state: { predicate: string; data: string | null };
   if (stateIndex === 0) {
     // State = genesis destination state.
     // The genesis element was already visited during assembleGenesis() above,

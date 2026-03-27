@@ -243,7 +243,7 @@ export interface PredicateContent {
 // ---- Token State ----
 
 export interface StateContent {
-  readonly data: string;
+  readonly data: string | null;
   readonly predicate: string;
 }
 // No children -- leaf node.
