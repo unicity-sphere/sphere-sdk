@@ -82,6 +82,26 @@ export class ElementPool {
   values(): IterableIterator<UxfElement> {
     return this.elements.values();
   }
+
+  /**
+   * Export the pool's contents as a ReadonlyMap.
+   * Returns the internal Map directly (no copy) for efficient read access.
+   */
+  toMap(): ReadonlyMap<ContentHash, UxfElement> {
+    return this.elements;
+  }
+
+  /**
+   * Create an ElementPool pre-populated from a Map.
+   * The entries are copied by reference (no re-hashing).
+   */
+  static fromMap(map: ReadonlyMap<ContentHash, UxfElement>): ElementPool {
+    const pool = new ElementPool();
+    for (const [hash, element] of map) {
+      pool.elements.set(hash, element);
+    }
+    return pool;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,8 @@ import type {
   UxfDelta,
   InstanceChainEntry,
 } from './types.js';
+import { computeElementHash } from './hash.js';
+import { UxfError } from './errors.js';
 
 // ---------------------------------------------------------------------------
 // diff()
@@ -126,9 +128,16 @@ export function applyDelta(pkg: UxfPackageData, delta: UxfDelta): void {
   const mutableManifestTokens = pkg.manifest.tokens as Map<string, ContentHash>;
   const mutableChains = pkg.instanceChains as Map<ContentHash, InstanceChainEntry>;
 
-  // 1. Add elements to pool
+  // 1. Add elements to pool (with hash verification)
   for (const [hash, element] of delta.addedElements) {
     if (!mutablePool.has(hash)) {
+      const recomputed = computeElementHash(element);
+      if (recomputed !== hash) {
+        throw new UxfError(
+          'VERIFICATION_FAILED',
+          `Delta element hash mismatch: key ${hash}, computed ${recomputed}`,
+        );
+      }
       mutablePool.set(hash, element);
     }
   }

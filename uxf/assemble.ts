@@ -53,6 +53,7 @@ interface AssemblyContext {
   readonly visited: Set<string>;
   readonly instanceChains: InstanceChainIndex;
   readonly strategy: InstanceSelectionStrategy;
+  maxDepth: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,11 +321,12 @@ function assembleTransactionData(
   const el = resolveAndVerify(pool, dataHash, ctx, 'transaction-data');
   const c = el.content as unknown as TransactionDataContent;
 
-  // Restore nametag tokens from nametagRefs
+  // Restore nametag tokens from nametagRefs (decrement depth for nested tokens)
   const nametags: unknown[] = [];
   if (c.nametagRefs && c.nametagRefs.length > 0) {
+    const nestedCtx: AssemblyContext = { ...ctx, maxDepth: ctx.maxDepth - 1 };
     for (const ntHash of c.nametagRefs) {
-      nametags.push(assembleTokenFromRootInternal(pool, ntHash, ctx));
+      nametags.push(assembleTokenFromRootInternal(pool, ntHash, nestedCtx));
     }
   }
 
@@ -408,6 +410,10 @@ function assembleTokenFromRootInternal(
   rootHash: ContentHash,
   ctx: AssemblyContext,
 ): unknown {
+  if (ctx.maxDepth <= 0) {
+    throw new UxfError('INVALID_PACKAGE', 'Maximum nametag nesting depth exceeded');
+  }
+
   const root = resolveAndVerify(pool, rootHash, ctx, 'token-root');
   const rc = root.content as unknown as TokenRootContent;
   const rch = root.children as unknown as TokenRootChildren;
@@ -424,11 +430,12 @@ function assembleTokenFromRootInternal(
   // Current state
   const state = assembleState(pool, rch.state, ctx);
 
-  // Nametags (recursive)
+  // Nametags (recursive) -- decrement depth for nested tokens
   const nametags: unknown[] = [];
   if (rch.nametags && rch.nametags.length > 0) {
+    const nestedCtx: AssemblyContext = { ...ctx, maxDepth: ctx.maxDepth - 1 };
     for (const ntHash of rch.nametags) {
-      nametags.push(assembleTokenFromRootInternal(pool, ntHash, ctx));
+      nametags.push(assembleTokenFromRootInternal(pool, ntHash, nestedCtx));
     }
   }
 
@@ -492,6 +499,7 @@ export function assembleTokenFromRoot(
     visited: new Set<string>(),
     instanceChains,
     strategy,
+    maxDepth: 100,
   };
 
   return assembleTokenFromRootInternal(pool, rootHash, ctx);
@@ -532,6 +540,7 @@ export function assembleTokenAtState(
     visited: new Set<string>(),
     instanceChains,
     strategy,
+    maxDepth: 100,
   };
 
   const root = resolveAndVerify(pool, rootHash, ctx, 'token-root');
@@ -560,8 +569,11 @@ export function assembleTokenAtState(
   // Determine state at the requested index
   let state: { predicate: string; data: string };
   if (stateIndex === 0) {
-    // State = genesis destination state
-    const genesisEl = resolveAndVerify(pool, rch.genesis, ctx, 'genesis');
+    // State = genesis destination state.
+    // The genesis element was already visited during assembleGenesis() above,
+    // so we resolve it directly from the pool without going through
+    // resolveAndVerify (which would trigger false CYCLE_DETECTED).
+    const genesisEl = resolveElement(pool, rch.genesis, ctx.instanceChains, ctx.strategy);
     const genCh = genesisEl.children as unknown as GenesisChildren;
     state = assembleState(pool, genCh.destinationState, ctx);
   } else {
@@ -575,11 +587,12 @@ export function assembleTokenAtState(
     state = assembleState(pool, lastTxCh.destinationState, ctx);
   }
 
-  // Nametags (full, regardless of stateIndex)
+  // Nametags (full, regardless of stateIndex) -- decrement depth for nested tokens
   const nametags: unknown[] = [];
   if (rch.nametags && rch.nametags.length > 0) {
+    const nestedCtx: AssemblyContext = { ...ctx, maxDepth: ctx.maxDepth - 1 };
     for (const ntHash of rch.nametags) {
-      nametags.push(assembleTokenFromRootInternal(pool, ntHash, ctx));
+      nametags.push(assembleTokenFromRootInternal(pool, ntHash, nestedCtx));
     }
   }
 

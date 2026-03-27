@@ -20,6 +20,7 @@ import {
   type UxfElementType,
   ELEMENT_TYPE_IDS,
 } from './types.js';
+import { UxfError } from './errors.js';
 
 // ---------------------------------------------------------------------------
 // Hex/Bytes helpers
@@ -30,9 +31,15 @@ import {
  * Each pair of hex characters becomes one byte.
  */
 export function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new UxfError('INVALID_HASH', `Hex string has odd length: ${hex.length}`);
+  }
+  if (!/^[0-9a-fA-F]*$/.test(hex)) {
+    throw new UxfError('INVALID_HASH', 'Hex string contains invalid characters');
+  }
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
   }
   return bytes;
 }

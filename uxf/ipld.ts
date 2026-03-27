@@ -35,6 +35,7 @@ import type {
 import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
 import { UxfError } from './errors.js';
 import {
+  computeElementHash,
   prepareContentForHashing,
   prepareChildrenForHashing,
   hexToBytes,
@@ -396,6 +397,16 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
     };
 
     const element = decodeIpldElement(node);
+
+    // Verify element hash matches the CID-derived hash
+    const recomputed = computeElementHash(element);
+    if (recomputed !== hash) {
+      throw new UxfError(
+        'VERIFICATION_FAILED',
+        `CAR element hash mismatch: CID implies ${hash}, computed ${recomputed}`,
+      );
+    }
+
     pool.set(hash, element);
   }
 
@@ -648,35 +659,42 @@ function rebuildInstanceChains(
 ): Map<ContentHash, InstanceChainEntry> {
   const chains = new Map<ContentHash, InstanceChainEntry>();
 
-  // Build a map of predecessor -> successor(s) for chain traversal
-  // Also find chain heads (elements that are not predecessors of anyone)
-  const successorOf = new Map<ContentHash, ContentHash>();
+  // Build a map of predecessor -> successor(s) for chain traversal.
+  // Use an array of successors to handle branching chains where two
+  // instances share the same predecessor.
+  const successorsOf = new Map<ContentHash, ContentHash[]>();
   const hasPredecessor = new Set<ContentHash>();
 
   for (const [hash, element] of pool) {
     if (element.header.predecessor !== null) {
-      successorOf.set(element.header.predecessor, hash);
+      const existing = successorsOf.get(element.header.predecessor);
+      if (existing) {
+        existing.push(hash);
+      } else {
+        successorsOf.set(element.header.predecessor, [hash]);
+      }
       hasPredecessor.add(hash);
     }
   }
 
   // Find chain heads: elements that have predecessors but are not
-  // themselves predecessors of anything (i.e., the newest in the chain)
-  // OR elements that have no predecessors and are predecessors of others.
-  // We need to find all chains, starting from the head.
+  // themselves predecessors of anything (i.e., the newest in the chain).
+  // With branching, there can be multiple heads per chain.
   const heads = new Set<ContentHash>();
   for (const [hash, element] of pool) {
     // A head is an element that is not a predecessor of any other element
-    if (!successorOf.has(hash) && element.header.predecessor !== null) {
+    if (!successorsOf.has(hash) && element.header.predecessor !== null) {
       heads.add(hash);
     }
   }
-  // Also find heads that are successors of something
-  for (const successorHash of successorOf.values()) {
-    if (!successorOf.has(successorHash)) {
-      const element = pool.get(successorHash);
-      if (element && element.header.predecessor !== null) {
-        heads.add(successorHash);
+  // Also find heads that are successors of something but not predecessors
+  for (const succs of successorsOf.values()) {
+    for (const successorHash of succs) {
+      if (!successorsOf.has(successorHash)) {
+        const element = pool.get(successorHash);
+        if (element && element.header.predecessor !== null) {
+          heads.add(successorHash);
+        }
       }
     }
   }

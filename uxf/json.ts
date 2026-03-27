@@ -35,6 +35,7 @@ import type {
 } from './types.js';
 import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
 import { UxfError } from './errors.js';
+import { computeElementHash } from './hash.js';
 
 // ---------------------------------------------------------------------------
 // Type ID <-> String Tag mapping
@@ -356,6 +357,14 @@ export function packageFromJson(json: string): UxfPackageData {
   for (const [hashStr, jsonElem] of Object.entries(raw.elements)) {
     const hash = contentHash(hashStr);
     const element = deserializeElement(jsonElem);
+    // Verify element hash matches the claimed key (catches hex case mismatches, etc.)
+    const recomputed = computeElementHash(element);
+    if (recomputed !== hash) {
+      throw new UxfError(
+        'SERIALIZATION_ERROR',
+        `Element hash mismatch: key ${hash}, computed ${recomputed}`,
+      );
+    }
     pool.set(hash, element);
   }
 
@@ -456,6 +465,12 @@ function deserializeElement(json: JsonElement): UxfElement {
     }
   }
 
+  // Deserialize content with type-aware fixups:
+  // - genesis-data: convert reason hex string back to Uint8Array
+  // - all types: normalize hex-like string values to lowercase
+  const rawContent = (json.content ?? {}) as Record<string, unknown>;
+  const content = deserializeContent(typeTag, rawContent);
+
   return {
     header: {
       representation: hdr.representation,
@@ -465,9 +480,59 @@ function deserializeElement(json: JsonElement): UxfElement {
         hdr.predecessor !== null ? contentHash(hdr.predecessor) : null,
     },
     type: typeTag,
-    content: (json.content ?? {}) as UxfElementContent,
+    content: content as UxfElementContent,
     children,
   };
+}
+
+/** Hex pattern: 64+ chars of hex (content hashes, keys, signatures, etc.). */
+const HEX_PATTERN = /^[0-9a-fA-F]{64,}$/;
+
+/**
+ * Deserialize element content with type-aware fixups.
+ *
+ * - genesis-data `reason`: hex string -> Uint8Array (inverse of serializeContent)
+ * - All string values matching hex pattern: normalized to lowercase
+ */
+function deserializeContent(
+  type: UxfElementType,
+  content: Record<string, unknown>,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(content)) {
+    // genesis-data reason: hex string -> Uint8Array
+    if (type === 'genesis-data' && key === 'reason') {
+      if (typeof value === 'string') {
+        result[key] = hexStringToUint8Array(value);
+      } else {
+        result[key] = value; // null passthrough
+      }
+      continue;
+    }
+
+    // Normalize hex-like strings to lowercase for consistent hashing
+    if (typeof value === 'string' && HEX_PATTERN.test(value)) {
+      result[key] = value.toLowerCase();
+    } else if (Array.isArray(value)) {
+      result[key] = value.map((item) =>
+        typeof item === 'string' && HEX_PATTERN.test(item)
+          ? item.toLowerCase()
+          : item,
+      );
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+/** Convert a hex string to Uint8Array. */
+function hexStringToUint8Array(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return bytes;
 }
 
 /** Deserialize indexes from JSON. */

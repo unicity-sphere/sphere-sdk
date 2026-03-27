@@ -220,7 +220,7 @@ export function deconstructState(
     'token-state',
     {
       predicate: lowerHex(state.predicate),
-      data: lowerHex(state.data),
+      data: lowerHexNullable(state.data),
     },
     {},
   );
@@ -258,7 +258,7 @@ export function deconstructSmtPath(
   merkleTreePath: SmtPathShape,
 ): ContentHash {
   const segments = merkleTreePath.steps.map((step) => ({
-    data: step.data == null ? '' : lowerHex(step.data),
+    data: step.data == null ? null : lowerHex(step.data),
     path: step.path, // decimal bigint string, keep as-is
   }));
 
@@ -469,13 +469,14 @@ export function deconstructGenesis(
 function deconstructTransferData(
   pool: ElementPool,
   txData: TransferDataShape,
+  maxDepth: number,
 ): ContentHash {
   // Recursively deconstruct nametag tokens embedded in the transfer data
   const nametagRefs: ContentHash[] = [];
   if (Array.isArray(txData.nametags)) {
     for (const nt of txData.nametags) {
       if (isTokenObject(nt)) {
-        nametagRefs.push(deconstructTokenInternal(pool, nt as TokenShape));
+        nametagRefs.push(deconstructTokenInternal(pool, nt as TokenShape, maxDepth - 1));
       }
     }
   }
@@ -507,6 +508,7 @@ export function deconstructTransaction(
   tx: TransferTxShape,
   sourceState: StateShape,
   destinationState: StateShape,
+  maxDepth: number = 100,
 ): ContentHash {
   const sourceStateHash = deconstructState(pool, sourceState);
   const destinationStateHash = deconstructState(pool, destinationState);
@@ -514,7 +516,7 @@ export function deconstructTransaction(
   // Transaction data
   let dataHash: ContentHash | null = null;
   if (tx.data != null) {
-    dataHash = deconstructTransferData(pool, tx.data);
+    dataHash = deconstructTransferData(pool, tx.data, maxDepth);
   }
 
   // Inclusion proof (null for uncommitted)
@@ -558,7 +560,11 @@ function isTokenObject(value: unknown): boolean {
 function deconstructTokenInternal(
   pool: ElementPool,
   token: TokenShape,
+  maxDepth: number = 100,
 ): ContentHash {
+  if (maxDepth <= 0) {
+    throw new UxfError('INVALID_PACKAGE', 'Maximum nametag nesting depth exceeded');
+  }
   // Derive all intermediate states
   const { genesisDestState, txSourceStates, txDestStates } =
     deriveAllStates(token);
@@ -578,6 +584,7 @@ function deconstructTokenInternal(
       token.transactions[i],
       txSourceStates[i],
       txDestStates[i],
+      maxDepth,
     );
     transactionHashes.push(txHash);
   }
@@ -590,7 +597,7 @@ function deconstructTokenInternal(
   if (Array.isArray(token.nametags)) {
     for (const nt of token.nametags) {
       if (isTokenObject(nt)) {
-        nametagHashes.push(deconstructTokenInternal(pool, nt as TokenShape));
+        nametagHashes.push(deconstructTokenInternal(pool, nt as TokenShape, maxDepth - 1));
       }
     }
   }

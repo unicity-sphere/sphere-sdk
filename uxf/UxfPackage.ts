@@ -365,25 +365,17 @@ export class UxfPackage {
  * Many internal functions require ElementPool rather than a plain Map.
  */
 function wrapPool(pkg: UxfPackageData): ElementPool {
-  const pool = new ElementPool();
-  // Copy references from the package's pool to the ElementPool.
-  // The ElementPool wraps a Map internally and we replicate the content.
-  const mutablePool = pool as unknown as { elements: Map<ContentHash, UxfElement> };
-  // Access the internal map via the 'elements' private field.
-  // We need to populate it with the existing pool data.
-  for (const [hash, element] of pkg.pool) {
-    mutablePool.elements.set(hash, element);
-  }
-  return pool;
+  return ElementPool.fromMap(pkg.pool);
 }
 
 /**
  * Sync an ElementPool's contents back into a UxfPackageData pool Map.
  */
 function syncPool(pkg: UxfPackageData, pool: ElementPool): void {
+  const newMap = pool.toMap();
   const mutablePool = pkg.pool as Map<ContentHash, UxfElement>;
   mutablePool.clear();
-  for (const [hash, element] of pool.entries()) {
+  for (const [hash, element] of newMap) {
     mutablePool.set(hash, element);
   }
 }
