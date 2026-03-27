@@ -124,9 +124,8 @@ else
 fi
 
 # Wait for escrow to process cancellation + auto-return.
-# Chain: escrow cancel → invoice cancel → auto-return send → aggregator
-# confirmation → Nostr delivery → Alice receive+finalize. 60-120s on testnet.
-log "4c: Waiting for deposit return (polling up to 300s)..."
+# No hard deadline — keep polling until BTC arrives or 5 minutes of no change.
+log "4c: Waiting for deposit return..."
 RETURN_ELAPSED=0
 ALICE_BAL=""
 while [[ $RETURN_ELAPSED -lt 300 ]]; do

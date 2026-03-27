@@ -282,25 +282,50 @@ deposit_swap() {
 }
 
 wait_swap_progress() {
-  local profile="$1" prefix="$2" targets="$3" timeout="${4:-600}"
-  local elapsed=0 progress=""
-  while [[ $elapsed -lt $timeout ]]; do
+  local profile="$1" prefix="$2" targets="$3" stale_timeout="${4:-300}"
+  local elapsed=0 progress="" last_progress="" last_change_at=0
+  last_change_at=$(date +%s)
+
+  while true; do
     local out
     out=$(cli_as "$profile" swap-status "$prefix" 2>&1) || true
     progress=$({ echo "$out" | grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' || true; } | tail -1)
-    # If swap was pruned (terminal state removed from active list), treat as terminal.
-    # Do NOT assume "completed" — it could have been cancelled or failed.
     [[ -z "$progress" ]] && echo "$out" | grep -qi "no swap found" && progress="pruned"
+
     log "[${elapsed}s] ${profile}: ${progress:-unknown}" >&2
+
+    # Target reached
     if echo "$progress" | grep -qE "^(${targets})$"; then
       echo "$progress"
       return 0
     fi
-    sleep 5
-    elapsed=$((elapsed + 5))
+
+    # Track state changes — reset staleness timer on any progress
+    if [[ "$progress" != "$last_progress" && -n "$progress" ]]; then
+      last_progress="$progress"
+      last_change_at=$(date +%s)
+    fi
+
+    # Staleness check: if state hasn't changed for stale_timeout, give up.
+    # This means the swap is stuck — not making any forward progress.
+    local now
+    now=$(date +%s)
+    local stale_for=$(( now - last_change_at ))
+    if [[ $stale_for -ge $stale_timeout ]]; then
+      log "Swap stale for ${stale_for}s (no state change) — giving up" >&2
+      echo "${progress:-unknown}"
+      return 1
+    fi
+
+    # Adaptive poll: fast at first, slow down after 30s
+    if [[ $elapsed -lt 30 ]]; then
+      sleep 3
+      elapsed=$((elapsed + 3))
+    else
+      sleep 5
+      elapsed=$((elapsed + 5))
+    fi
   done
-  echo "${progress:-unknown}"
-  return 1
 }
 
 get_deposit_invoice_id() {
