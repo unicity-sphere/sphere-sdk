@@ -161,4 +161,22 @@ export default defineConfig([
       'ws',
     ],
   },
+  // UXF (Universal eXchange Format) - platform-agnostic
+  {
+    entry: { 'uxf/index': 'uxf/index.ts' },
+    format: ['esm', 'cjs'],
+    dts: true,
+    clean: false,
+    splitting: false,
+    sourcemap: true,
+    platform: 'neutral',
+    target: 'es2022',
+    noExternal: [/^@noble\//],
+    external: [
+      /^@unicitylabs\//,
+      '@ipld/dag-cbor',
+      '@ipld/car',
+      'multiformats',
+    ],
+  },
 ]);

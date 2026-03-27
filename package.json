@@ -84,6 +84,16 @@
         "types": "./dist/impl/nodejs/connect/index.d.cts",
         "default": "./dist/impl/nodejs/connect/index.cjs"
       }
+    },
+    "./uxf": {
+      "import": {
+        "types": "./dist/uxf/index.d.ts",
+        "default": "./dist/uxf/index.js"
+      },
+      "require": {
+        "types": "./dist/uxf/index.d.cts",
+        "default": "./dist/uxf/index.cjs"
+      }
     }
   },
   "files": [
@@ -119,6 +129,8 @@
     "url": "https://github.com/unicity-sphere/sphere-sdk.git"
   },
   "dependencies": {
+    "@ipld/car": "^5.4.2",
+    "@ipld/dag-cbor": "^9.2.5",
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
     "@unicitylabs/nostr-js-sdk": "^0.4.1",

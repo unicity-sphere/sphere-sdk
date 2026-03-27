@@ -468,3 +468,29 @@ export {
   CoinGeckoPriceProvider,
   createPriceProvider,
 } from './price';
+
+// =============================================================================
+// UXF Types (type-only -- runtime available via @unicitylabs/sphere-sdk/uxf)
+// =============================================================================
+
+export type {
+  ContentHash,
+  UxfElementHeader,
+  UxfElementType,
+  UxfInstanceKind,
+  UxfElement,
+  UxfElementContent,
+  UxfManifest,
+  UxfEnvelope,
+  UxfPackageData,
+  UxfIndexes,
+  InstanceChainEntry,
+  InstanceChainIndex,
+  InstanceSelectionStrategy,
+  UxfStorageAdapter,
+  UxfVerificationResult,
+  UxfVerificationIssue,
+  UxfDelta,
+} from './uxf';
+
+export type { UxfErrorCode } from './uxf';
