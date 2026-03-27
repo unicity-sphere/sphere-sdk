@@ -1614,20 +1614,27 @@ export class NostrTransportProvider implements TransportProvider {
    */
   private async publishWithVerification(
     event: NostrEvent,
-    maxAttempts: number = 3,
+    maxAttempts: number = 5,
     label: string = 'event',
   ): Promise<void> {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         await this.publishEvent(event);
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Permanent rejection — don't retry (e.g., "Event rejected: invalid signature")
+        if (msg.includes('Event rejected') && !msg.includes('rate') && !msg.includes('limit')) {
+          throw err;
+        }
         if (attempt === maxAttempts) throw err;
-        logger.debug('Nostr', `${label} publish attempt ${attempt} failed, retrying...`);
+        logger.debug('Nostr', `${label} publish attempt ${attempt} failed (${msg}), retrying in ${attempt}s...`);
         await new Promise(r => setTimeout(r, 1000 * attempt));
         continue;
       }
 
-      // Verify: query the relay for this specific event by ID
+      // Verify: query the relay for this specific event by ID.
+      // Short delay to let the relay index the event.
+      await new Promise(r => setTimeout(r, 500));
       try {
         const found = await this.queryEvents({
           ids: [event.id],
@@ -1640,14 +1647,19 @@ export class NostrTransportProvider implements TransportProvider {
           return; // confirmed on relay
         }
       } catch {
-        // Query failed — can't verify, treat publish as potentially successful
-        logger.debug('Nostr', `${label} verification query failed on attempt ${attempt}`);
+        // Query failed — can't verify. If this is the last attempt,
+        // accept the publish as best-effort.
+        if (attempt === maxAttempts) {
+          logger.debug('Nostr', `${label} verification query failed — accepting publish as best-effort`);
+          return;
+        }
       }
 
-      // Event not found on relay — retry
+      // Event not found on relay — retry with increasing backoff
       if (attempt < maxAttempts) {
-        logger.debug('Nostr', `${label} not found on relay after publish, retrying (attempt ${attempt}/${maxAttempts})...`);
-        await new Promise(r => setTimeout(r, 1000 * attempt));
+        const delay = Math.min(2000 * attempt, 10000);
+        logger.debug('Nostr', `${label} not found on relay, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(r => setTimeout(r, delay));
       } else {
         logger.warn('Nostr', `${label} not verified on relay after ${maxAttempts} attempts — delivery uncertain`);
       }

@@ -231,7 +231,7 @@ propose_swap() {
 }
 
 accept_swap() {
-  local profile="$1" prefix="$2" max_wait="${3:-300}"
+  local profile="$1" prefix="$2" max_wait="${3:-600}"
   local attempts=$((max_wait / 5))
   for i in $(seq 1 "$attempts"); do
     local try
@@ -246,26 +246,43 @@ accept_swap() {
 }
 
 deposit_swap() {
-  local profile="$1" prefix="$2"
-  local out
-  out=$(cli_as "$profile" swap-deposit "$prefix" 2>&1) || true
-  # Log the actual output so failures are visible
-  log "deposit_swap ${profile}: $(echo "$out" | grep -E 'status|Error|error|Deposit|announced|Insufficient|WRONG_STATE' | head -3)" >&2
-  if echo "$out" | grep -qiE '"status".*"completed"'; then
-    ok "${profile} deposit completed"
-  elif echo "$out" | grep -qiE '"status".*"submitted"'; then
-    ok "${profile} deposit submitted"
-  elif echo "$out" | grep -qiE '"status"'; then
-    ok "${profile} deposit sent (status: $(echo "$out" | grep -oP '"status"\s*:\s*"\K[^"]+' | head -1))"
-  elif echo "$out" | grep -qiE 'error|fail|Insufficient'; then
-    fail "${profile} deposit failed: $(echo "$out" | grep -iE 'error|fail|Insufficient' | head -1)"
+  local profile="$1" prefix="$2" max_attempts="${3:-3}"
+  local out attempt=0
+
+  while [[ $attempt -lt $max_attempts ]]; do
+    attempt=$((attempt + 1))
+    out=$(cli_as "$profile" swap-deposit "$prefix" 2>&1) || true
+    log "deposit_swap ${profile} (attempt ${attempt}): $(echo "$out" | grep -E 'status|Error|error|Deposit|announced|Insufficient|WRONG_STATE' | head -2)" >&2
+
+    # Success
+    if echo "$out" | grep -qiE '"status".*"(completed|submitted|delivered)"'; then
+      ok "${profile} deposit completed"
+      return 0
+    fi
+
+    # Permanent errors — don't retry
+    if echo "$out" | grep -qiE 'SWAP_NOT_FOUND|SWAP_INVALID|SWAP_WRONG_STATE|Insufficient balance|already submitted'; then
+      fail "${profile} deposit failed: $(echo "$out" | grep -iE 'error|fail|Insufficient|WRONG_STATE' | head -1)"
+      return 1
+    fi
+
+    # Transient errors — retry (e.g., "did not reach announced", relay timeout)
+    if [[ $attempt -lt $max_attempts ]]; then
+      log "deposit_swap ${profile}: transient error, retrying in 10s..." >&2
+      sleep 10
+    fi
+  done
+
+  # Exhausted retries
+  if echo "$out" | grep -qiE 'error|fail'; then
+    fail "${profile} deposit failed after ${max_attempts} attempts: $(echo "$out" | grep -iE 'error|fail' | head -1)"
   else
-    fail "${profile} deposit produced unexpected output"
+    fail "${profile} deposit produced unexpected output after ${max_attempts} attempts"
   fi
 }
 
 wait_swap_progress() {
-  local profile="$1" prefix="$2" targets="$3" timeout="${4:-300}"
+  local profile="$1" prefix="$2" targets="$3" timeout="${4:-600}"
   local elapsed=0 progress=""
   while [[ $elapsed -lt $timeout ]]; do
     local out

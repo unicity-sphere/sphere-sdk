@@ -50,7 +50,7 @@ deposit_swap "$ALICE" "${SWAP_ID:0:8}"
 
 # --- Wait for completion ---
 log ""; log "=== Waiting for swap completion ==="
-FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned" 300) || true
+FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned") || true
 if [[ "$FINAL" == "completed" || "$FINAL" == "pruned" ]]; then
   ok "Large swap completed"
 else

@@ -70,7 +70,7 @@ deposit_swap "$ALICE" "${SWAP_B:0:8}"
 
 # --- Wait for both to complete ---
 log ""; log "=== Waiting for swap A completion ==="
-FINAL_A=$(wait_swap_progress "$ALICE" "${SWAP_A:0:8}" "completed|failed|cancelled|pruned" 300) || true
+FINAL_A=$(wait_swap_progress "$ALICE" "${SWAP_A:0:8}" "completed|failed|cancelled|pruned") || true
 if [[ "$FINAL_A" == "completed" || "$FINAL_A" == "pruned" ]]; then
   ok "Swap A completed"
 else
@@ -78,7 +78,7 @@ else
 fi
 
 log ""; log "=== Waiting for swap B completion ==="
-FINAL_B=$(wait_swap_progress "$ALICE" "${SWAP_B:0:8}" "completed|failed|cancelled|pruned" 300) || true
+FINAL_B=$(wait_swap_progress "$ALICE" "${SWAP_B:0:8}" "completed|failed|cancelled|pruned") || true
 if [[ "$FINAL_B" == "completed" || "$FINAL_B" == "pruned" ]]; then
   ok "Swap B completed"
 else

@@ -126,10 +126,10 @@ fi
 # Wait for escrow to process cancellation + auto-return.
 # Chain: escrow cancel → invoice cancel → auto-return send → aggregator
 # confirmation → Nostr delivery → Alice receive+finalize. 60-120s on testnet.
-log "4c: Waiting for deposit return (polling up to 60s)..."
+log "4c: Waiting for deposit return (polling up to 300s)..."
 RETURN_ELAPSED=0
 ALICE_BAL=""
-while [[ $RETURN_ELAPSED -lt 60 ]]; do
+while [[ $RETURN_ELAPSED -lt 300 ]]; do
   ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
   if echo "$ALICE_BAL" | grep -q "BTC"; then
     log "4c: BTC returned after ~${RETURN_ELAPSED}s"
