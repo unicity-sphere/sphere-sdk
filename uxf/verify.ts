@@ -122,30 +122,38 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
       continue;
     }
 
-    // DFS walk from this token's root, detecting cycles within this subgraph
-    const visitedInSubgraph = new Set<ContentHash>();
-    const stack: Array<{
-      hash: ContentHash;
-      parentType?: string;
-      childRole?: string;
-      isArrayChild?: boolean;
-    }> = [{ hash: rootHash }];
+    // DFS walk from this token's root, detecting cycles within this subgraph.
+    // We use path-based cycle detection: `pathStack` tracks ancestor nodes on the
+    // current DFS path, while `visited` tracks fully-explored nodes to skip re-walks.
+    // This correctly handles DAG diamonds (same node via two sibling paths) without
+    // false CYCLE_DETECTED errors, while still catching true back-edge cycles.
+    const visited = new Set<ContentHash>();
+    const pathStack = new Set<ContentHash>();
 
-    while (stack.length > 0) {
-      const { hash, parentType, childRole, isArrayChild } = stack.pop()!;
-
-      // Check 4: Cycle detection within this token's subgraph
-      if (visitedInSubgraph.has(hash)) {
+    // Recursive DFS helper
+    const dfsWalk = (
+      hash: ContentHash,
+      parentType?: string,
+      childRole?: string,
+      isArrayChild?: boolean,
+    ): void => {
+      // Check 4: True cycle detection (back-edge to ancestor)
+      if (pathStack.has(hash)) {
         errors.push({
           code: 'CYCLE_DETECTED',
           message: `Cycle detected: element ${hash} visited twice in token ${tokenId} subgraph`,
           tokenId,
           elementHash: hash,
         });
-        continue;
+        return;
       }
 
-      visitedInSubgraph.add(hash);
+      // Already fully explored (DAG diamond) — skip
+      if (visited.has(hash)) {
+        allReachable.add(hash);
+        return;
+      }
+
       allReachable.add(hash);
       elementsChecked.add(hash);
 
@@ -158,7 +166,7 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
           tokenId,
           elementHash: hash,
         });
-        continue;
+        return;
       }
 
       // Element type consistency check
@@ -179,25 +187,53 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
         }
       }
 
+      // Enter path
+      pathStack.add(hash);
+
       // Also walk instance chain members for this element (mark as reachable)
       const chainEntry = pkg.instanceChains.get(hash);
       if (chainEntry) {
         for (const link of chainEntry.chain) {
-          if (!visitedInSubgraph.has(link.hash)) {
+          if (!visited.has(link.hash)) {
             allReachable.add(link.hash);
             // Walk children of chain members too
             const chainElement = pkg.pool.get(link.hash);
             if (chainElement) {
               elementsChecked.add(link.hash);
-              pushChildren(stack, link.hash, chainElement);
+              walkChildren(hash, chainElement);
             }
           }
         }
       }
 
-      // Push children onto the stack
-      pushChildren(stack, hash, element);
-    }
+      // Walk children
+      walkChildren(hash, element);
+
+      // Leave path, mark fully explored
+      pathStack.delete(hash);
+      visited.add(hash);
+    };
+
+    // Helper to walk children of an element via DFS
+    const walkChildren = (
+      _parentHash: ContentHash,
+      element: UxfElement,
+    ): void => {
+      for (const [role, ref] of Object.entries(element.children)) {
+        if (ref === null) {
+          continue;
+        }
+        if (Array.isArray(ref)) {
+          for (const childHash of ref as ContentHash[]) {
+            dfsWalk(childHash, element.type, role, true);
+          }
+        } else {
+          dfsWalk(ref as ContentHash, element.type, role, false);
+        }
+      }
+    };
+
+    dfsWalk(rootHash);
   }
 
   // -----------------------------------------------------------------------
@@ -363,43 +399,3 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
   };
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Push child references from an element onto the DFS stack.
- */
-function pushChildren(
-  stack: Array<{
-    hash: ContentHash;
-    parentType?: string;
-    childRole?: string;
-    isArrayChild?: boolean;
-  }>,
-  _parentHash: ContentHash,
-  element: UxfElement,
-): void {
-  for (const [role, ref] of Object.entries(element.children)) {
-    if (ref === null) {
-      continue;
-    }
-    if (Array.isArray(ref)) {
-      for (const childHash of ref as ContentHash[]) {
-        stack.push({
-          hash: childHash,
-          parentType: element.type,
-          childRole: role,
-          isArrayChild: true,
-        });
-      }
-    } else {
-      stack.push({
-        hash: ref as ContentHash,
-        parentType: element.type,
-        childRole: role,
-        isArrayChild: false,
-      });
-    }
-  }
-}

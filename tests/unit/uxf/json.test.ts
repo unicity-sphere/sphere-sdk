@@ -143,11 +143,10 @@ describe('packageToJson / packageFromJson', () => {
         expect(restored.pool.has(hash)).toBe(true);
       }
 
-      // Verify structural equality (verify may report CYCLE_DETECTED for
-      // content-addressed dedup'd state nodes, which is expected)
+      // Verify structural equality
       const result = verify(restored);
-      const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-      expect(nonCycleErrors).toHaveLength(0);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
     });
 
     it('round-trip preserves element content', () => {

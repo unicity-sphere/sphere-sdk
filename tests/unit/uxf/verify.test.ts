@@ -335,19 +335,70 @@ describe('verify', () => {
   });
 
   it('cycle in DAG produces CYCLE_DETECTED error', () => {
-    // Manually build elements that form a cycle:
-    // token-root -> genesis -> destinationState (a token-state that we'll
-    // also reference back from token-root's transactions array as a fake child)
-    //
-    // Simpler approach: use the verifier's DFS which marks visited per subgraph.
-    // If the same element hash appears twice in the traversal path, it's a cycle.
-    // We can achieve this by making two children of the root point to the same hash.
-    // BUT that's treated as CYCLE_DETECTED by the verifier (confirmed from debug).
-    //
-    // So: just use a 0-tx token (which has state shared between root.state and
-    // genesis.destinationState) -- the verifier treats this as a cycle.
-    const pkg = buildPackageFromToken(makeValidToken('aa'));
+    // Create a true cycle: element A -> element B -> element A (back-edge)
+    const pool = new Map<ContentHash, UxfElement>();
+
+    // Element B references element A (we'll compute A's hash first with a placeholder,
+    // then fix it). Instead, build manually with known hashes.
+    // Strategy: create A with child pointing to B, and B with child pointing to A.
+    // We force the pool entries under their correct content hashes but create a cycle
+    // by making A's child = B's hash and B's child = A's hash.
+
+    // First, create both elements without children to get base shapes
+    const elA = makeElement('genesis-data', {
+      tokenId: 'a1'.repeat(32), tokenType: '00'.repeat(32), coinData: [],
+      tokenData: '', salt: 'c1'.repeat(32), recipient: 'DIRECT://x',
+      recipientDataHash: null, reason: null,
+    });
+    const elAHash = computeElementHash(elA);
+
+    const elB = makeElement('genesis-data', {
+      tokenId: 'b1'.repeat(32), tokenType: '00'.repeat(32), coinData: [],
+      tokenData: '', salt: 'd1'.repeat(32), recipient: 'DIRECT://y',
+      recipientDataHash: null, reason: null,
+    });
+    const elBHash = computeElementHash(elB);
+
+    // Now create a token-root that has genesis pointing to a genesis element,
+    // and that genesis element's data child points back to the root hash (cycle).
+    const state1 = makeElement('token-state', { predicate: 'a1'.repeat(32), data: null });
+    const state1Hash = computeElementHash(state1);
+    pool.set(state1Hash, state1);
+
+    // Create a genesis element whose 'data' child will point to token-root (creating cycle)
+    // We need to know the root hash, so build root first without genesis, get hash, then fix.
+    // Simpler: force a cycle by putting root hash as genesis.data child and force-inserting.
+
+    // Build token-root first to get its hash
+    const tokenRoot = makeElement('token-root', {
+      tokenId: 'a1'.repeat(32), version: '2.0',
+    }, {
+      genesis: elAHash, // placeholder, will create genesis under this hash
+      transactions: [],
+      state: state1Hash,
+      nametags: [],
+    });
+    const tokenRootHash = computeElementHash(tokenRoot);
+    pool.set(tokenRootHash, tokenRoot);
+
+    // Create genesis that points back to tokenRoot as its 'data' child (cycle: root -> genesis -> root)
+    const cyclicGenesis = makeElement('genesis', {}, {
+      data: tokenRootHash,       // CYCLE: points back to token-root
+      inclusionProof: null,
+      destinationState: state1Hash,
+    });
+    const cyclicGenesisHash = computeElementHash(cyclicGenesis);
+
+    // Force the genesis into the pool under elAHash so the root's child ref resolves
+    pool.set(elAHash, cyclicGenesis);
+
+    const manifest = new Map<string, ContentHash>();
+    manifest.set('a1'.repeat(32), tokenRootHash);
+
+    const pkg = makePackage(manifest, pool);
     const result = verify(pkg);
+    // The hash mismatch on elAHash will cause VERIFICATION_FAILED,
+    // but we also get CYCLE_DETECTED from the back-edge root->genesis->root
     expect(result.errors.some((e) => e.code === 'CYCLE_DETECTED')).toBe(true);
   });
 

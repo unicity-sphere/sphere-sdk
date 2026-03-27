@@ -245,7 +245,7 @@ describe('diff', () => {
 // ---------------------------------------------------------------------------
 
 describe('applyDelta', () => {
-  it('apply then verify produces no errors (besides CYCLE_DETECTED)', () => {
+  it('apply then verify produces no errors', () => {
     const tokenA = makeValidToken('a1');
     const tokenB = makeValidToken('a2', 'b0'.repeat(32));
     const source = buildPackageFromTokens([tokenA]);
@@ -254,9 +254,8 @@ describe('applyDelta', () => {
 
     applyDelta(source, delta);
     const result = verify(source);
-    // The verifier reports CYCLE_DETECTED for content-addressed dedup'd nodes
-    const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-    expect(nonCycleErrors).toHaveLength(0);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
   });
 
   it('corrupted element in delta throws VERIFICATION_FAILED', () => {

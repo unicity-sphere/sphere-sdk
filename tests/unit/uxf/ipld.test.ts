@@ -239,14 +239,13 @@ describe('exportToCar / importFromCar', () => {
     }
   });
 
-  it('round-trip package verifies (no errors besides CYCLE_DETECTED)', async () => {
+  it('round-trip package verifies with no errors', async () => {
     const pkg = buildPackageFromToken(makeValidToken('a1'));
     const car = await exportToCar(pkg);
     const restored = await importFromCar(car);
     const result = verify(restored);
-    // The verifier reports CYCLE_DETECTED for content-addressed dedup'd state nodes
-    const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-    expect(nonCycleErrors).toHaveLength(0);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
   });
 
   it('envelope preserved in round-trip', async () => {

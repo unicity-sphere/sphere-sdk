@@ -63,11 +63,9 @@ describe('full end-to-end flows', () => {
       }
 
       // Verify structural integrity
-      // TODO: verify() reports CYCLE_DETECTED for content-addressed dedup'd state nodes
-      // (e.g., genesis destinationState == token.state), which is valid dedup, not a bug.
       const result = pkg.verify();
-      const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-      expect(nonCycleErrors).toHaveLength(0);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
     });
   });
 
@@ -170,10 +168,10 @@ describe('full end-to-end flows', () => {
       // Dedup means merged element count < sum of both
       expect(pkgA.elementCount).toBeLessThan(sizeA + sizeB);
 
-      // Verify passes (CYCLE_DETECTED is expected for dedup'd state nodes)
+      // Verify passes
       const result = pkgA.verify();
-      const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-      expect(nonCycleErrors).toHaveLength(0);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
     });
   });
 
@@ -198,11 +196,9 @@ describe('full end-to-end flows', () => {
       expect((assembled.genesis as any).data.tokenId).toBe(tokenId(TOKEN_B));
 
       // Verify passes on remaining package
-      // TODO: verify() reports CYCLE_DETECTED for content-addressed dedup'd state nodes
-      // (e.g., genesis destinationState == token.state), which is valid dedup, not a bug.
       const result = pkg.verify();
-      const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-      expect(nonCycleErrors).toHaveLength(0);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
     });
   });
 

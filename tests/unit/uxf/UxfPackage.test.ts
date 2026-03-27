@@ -227,14 +227,12 @@ describe('UxfPackage', () => {
   // -------------------------------------------------------------------------
 
   describe('verify', () => {
-    it('verify on valid package returns no non-cycle errors', () => {
+    it('verify on valid package returns valid=true with no errors', () => {
       const pkg = UxfPackage.create();
       pkg.ingest(TOKEN_A);
       const result = pkg.verify();
-      // CYCLE_DETECTED is expected for content-addressed dedup'd state nodes
-      // (e.g., genesis destinationState == token.state when 0 transactions)
-      const nonCycleErrors = result.errors.filter((e) => e.code !== 'CYCLE_DETECTED');
-      expect(nonCycleErrors).toHaveLength(0);
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
     });
   });
 
