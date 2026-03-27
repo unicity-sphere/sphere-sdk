@@ -1614,7 +1614,7 @@ export class NostrTransportProvider implements TransportProvider {
    */
   private async publishWithVerification(
     event: NostrEvent,
-    maxAttempts: number = 5,
+    maxAttempts: number = 3,
     label: string = 'event',
   ): Promise<void> {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1661,7 +1661,10 @@ export class NostrTransportProvider implements TransportProvider {
         logger.debug('Nostr', `${label} not found on relay, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})...`);
         await new Promise(r => setTimeout(r, delay));
       } else {
-        logger.warn('Nostr', `${label} not verified on relay after ${maxAttempts} attempts — delivery uncertain`);
+        throw new SphereError(
+          `${label} not verified on relay after ${maxAttempts} attempts — delivery failed`,
+          'TRANSPORT_ERROR',
+        );
       }
     }
   }

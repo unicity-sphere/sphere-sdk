@@ -133,17 +133,24 @@ fi
 # The cancel is already verified above. The deposit return requires multiple
 # aggregator round-trips (confirm deposit → send return → confirm return → deliver).
 # Poll for up to 90s; if it arrives, great. If not, the cancel test still passes.
+# Poll for deposit return. After deposit of 5 BTC from 50, Alice has ~45 BTC.
+# After auto-return, she should be back to ~50. Check for balance restoration,
+# not just BTC presence (she always has BTC from the remaining 45).
 log "4c: Waiting for deposit return (up to 90s)..."
 RETURN_ELAPSED=0
 ALICE_BAL=""
 while [[ $RETURN_ELAPSED -lt 90 ]]; do
   ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
-  if echo "$ALICE_BAL" | grep -q "BTC"; then
-    log "4c: BTC returned after ~${RETURN_ELAPSED}s"
-    break
+  ALICE_BTC_NOW=$(echo "$ALICE_BAL" | grep -oP 'BTC:\s*\K[0-9.]+' | head -1) || true
+  # Check if balance is restored to pre-deposit level (or close to it)
+  if [[ -n "$ALICE_BTC_NOW" && -n "$ALICE_BTC_BEFORE" ]]; then
+    if [[ "$ALICE_BTC_NOW" == "$ALICE_BTC_BEFORE" ]]; then
+      log "4c: BTC fully returned after ~${RETURN_ELAPSED}s (balance: ${ALICE_BTC_NOW})"
+      break
+    fi
   fi
-  sleep 5
-  RETURN_ELAPSED=$((RETURN_ELAPSED + 5))
+  sleep 10
+  RETURN_ELAPSED=$((RETURN_ELAPSED + 10))
 done
 log "4c: Alice balance after cancel:"
 echo "$ALICE_BAL" | grep "BTC" || echo "$ALICE_BAL" | tail -5

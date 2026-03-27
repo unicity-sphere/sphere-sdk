@@ -261,7 +261,7 @@ deposit_swap() {
     fi
 
     # Permanent errors — don't retry
-    if echo "$out" | grep -qiE 'SWAP_NOT_FOUND|SWAP_INVALID|SWAP_WRONG_STATE|Insufficient balance|already submitted'; then
+    if echo "$out" | grep -qiE 'SWAP_NOT_FOUND|SWAP_INVALID|SWAP_WRONG_STATE|already submitted'; then
       fail "${profile} deposit failed: $(echo "$out" | grep -iE 'error|fail|Insufficient|WRONG_STATE' | head -1)"
       return 1
     fi
@@ -283,10 +283,11 @@ deposit_swap() {
 
 wait_swap_progress() {
   local profile="$1" prefix="$2" targets="$3" stale_timeout="${4:-300}"
+  local max_elapsed=$((stale_timeout * 3))  # absolute cap: 3x staleness timeout
   local elapsed=0 progress="" last_progress="" last_change_at=0
   last_change_at=$(date +%s)
 
-  while true; do
+  while [[ $elapsed -lt $max_elapsed ]]; do
     local out
     out=$(cli_as "$profile" swap-status "$prefix" 2>&1) || true
     progress=$({ echo "$out" | grep -oP '\b(proposed|accepted|announced|depositing|awaiting_counter|concluding|completed|failed|cancelled)\b' || true; } | tail -1)
