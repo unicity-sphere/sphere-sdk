@@ -78,10 +78,17 @@ else
   fail "4b: Reject did not succeed"
 fi
 
-# Verify Alice sees rejection (give DMs time to propagate)
-sleep 15
-ALICE_STATUS=$(cli_as "$ALICE" swap-status "${SWAP_B:0:8}" 2>&1) || true
-if echo "$ALICE_STATUS" | grep -qiE "cancelled|rejected|failed"; then
+# Verify Alice sees rejection — poll instead of fixed sleep
+ALICE_SEES_REJECT=false
+for i in $(seq 1 10); do
+  ALICE_STATUS=$(cli_as "$ALICE" swap-status "${SWAP_B:0:8}" 2>&1) || true
+  if echo "$ALICE_STATUS" | grep -qiE "cancelled|rejected|failed|no swap found"; then
+    ALICE_SEES_REJECT=true
+    break
+  fi
+  sleep 3
+done
+if $ALICE_SEES_REJECT; then
   ok "4b: Alice sees swap cancelled/rejected"
 elif echo "$ALICE_STATUS" | grep -qi "no swap found"; then
   ok "4b: Swap pruned (terminal)"
@@ -107,8 +114,7 @@ accept_swap "$BOB" "${SWAP_C:0:8}" 300
 # Only Alice deposits
 deposit_swap "$ALICE" "${SWAP_C:0:8}"
 
-# Verify Alice deposited
-sleep 5
+# Verify Alice deposited (no artificial wait — deposit_swap already completed)
 PROGRESS=$(cli_as "$ALICE" swap-list 2>&1 | grep "${SWAP_C:0:8}" | { grep -oP 'depositing|announced' || true; } | head -1)
 log "4c: After Alice deposit: ${PROGRESS:-unknown}"
 
@@ -124,18 +130,20 @@ else
 fi
 
 # Wait for escrow to process cancellation + auto-return.
-# No hard deadline — keep polling until BTC arrives or 5 minutes of no change.
-log "4c: Waiting for deposit return..."
+# The cancel is already verified above. The deposit return requires multiple
+# aggregator round-trips (confirm deposit → send return → confirm return → deliver).
+# Poll for up to 90s; if it arrives, great. If not, the cancel test still passes.
+log "4c: Waiting for deposit return (up to 90s)..."
 RETURN_ELAPSED=0
 ALICE_BAL=""
-while [[ $RETURN_ELAPSED -lt 300 ]]; do
+while [[ $RETURN_ELAPSED -lt 90 ]]; do
   ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
   if echo "$ALICE_BAL" | grep -q "BTC"; then
     log "4c: BTC returned after ~${RETURN_ELAPSED}s"
     break
   fi
-  sleep 10
-  RETURN_ELAPSED=$((RETURN_ELAPSED + 10))
+  sleep 5
+  RETURN_ELAPSED=$((RETURN_ELAPSED + 5))
 done
 log "4c: Alice balance after cancel:"
 echo "$ALICE_BAL" | grep "BTC" || echo "$ALICE_BAL" | tail -5
