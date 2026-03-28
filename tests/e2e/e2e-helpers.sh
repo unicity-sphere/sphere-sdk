@@ -134,7 +134,9 @@ launch_escrow() {
   [[ -d "${ESCROW_DIR}" ]] || die "setup_escrow must be called first"
 
   log "Launching escrow..."
-  (cd "$ESCROW_DIR" && npx tsx --env-file=.env src/index.ts > "${WORKSPACE}/escrow.log" 2>&1) &
+  # Use setsid to create a new process group so we can kill ALL child processes
+  # (npx → tsx → node) cleanly in cleanup, not just the subshell.
+  setsid bash -c "cd '$ESCROW_DIR' && exec npx tsx --env-file=.env src/index.ts" > "${WORKSPACE}/escrow.log" 2>&1 &
   ESCROW_PID=$!
   log "Escrow PID: ${ESCROW_PID}"
 
@@ -163,10 +165,12 @@ cleanup() {
   local exit_code=$?
   if [[ -n "$ESCROW_PID" ]]; then
     log "Stopping escrow (PID ${ESCROW_PID})..."
-    kill "$ESCROW_PID" 2>/dev/null || true
+    # Kill the entire process group (setsid created a new group with PGID = ESCROW_PID).
+    # This ensures npx → tsx → node child processes are all terminated.
+    kill -- -"$ESCROW_PID" 2>/dev/null || kill "$ESCROW_PID" 2>/dev/null || true
     local w=0
     while kill -0 "$ESCROW_PID" 2>/dev/null && [[ $w -lt 5 ]]; do sleep 1; w=$((w+1)); done
-    kill -9 "$ESCROW_PID" 2>/dev/null || true
+    kill -9 -- -"$ESCROW_PID" 2>/dev/null || kill -9 "$ESCROW_PID" 2>/dev/null || true
   fi
   if [[ "$KEEP_WALLETS" == "false" ]] && [[ -n "${WORKSPACE:-}" ]]; then
     for p in $WALLETS_TO_DELETE; do
