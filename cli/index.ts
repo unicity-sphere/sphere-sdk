@@ -4498,6 +4498,7 @@ async function main() {
         const swapModule = (sphere as any).swap;
         if (!swapModule) {
           console.error('Swap module not enabled.');
+          await closeSphere();
           process.exit(1);
         }
         await ensureSync(sphere, 'nostr');
@@ -4508,6 +4509,7 @@ async function main() {
           console.log(JSON.stringify(pong, null, 2));
         } catch (err) {
           console.error('Escrow ping failed:', err instanceof Error ? err.message : err);
+          await closeSphere();
           process.exit(1);
         }
 

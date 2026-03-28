@@ -317,20 +317,33 @@ export async function sendPing(
   timeoutMs: number = 30_000,
 ): Promise<{ escrow_address: string; timestamp: number }> {
   const dm = JSON.stringify({ type: 'ping' });
+  let settled = false;
+  let unsub: (() => void) | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
 
-  // Set up listener before sending to avoid race
+  const cleanup = () => {
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (unsub) { unsub(); unsub = null; }
+  };
+
   const pongPromise = new Promise<{ escrow_address: string; timestamp: number }>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      unsub();
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(new Error('Escrow ping timed out'));
     }, timeoutMs);
 
-    const unsub = onDM((msg) => {
+    unsub = onDM((msg) => {
+      if (settled) return;
+      // Verify sender is the expected escrow — reject pongs from other senders
+      // and ignore replayed historical DMs from non-escrow peers.
+      if (msg.senderPubkey !== escrowPubkey) return;
       try {
         const parsed = JSON.parse(msg.content);
         if (parsed.type === 'pong') {
-          clearTimeout(timer);
-          unsub();
+          settled = true;
+          cleanup();
           resolve({ escrow_address: parsed.escrow_address, timestamp: parsed.timestamp });
         }
       } catch {
@@ -339,7 +352,14 @@ export async function sendPing(
     });
   });
 
-  await communications.sendDM(escrowPubkey, dm);
+  // Send ping — clean up listener if sendDM fails
+  try {
+    await communications.sendDM(escrowPubkey, dm);
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
+
   return pongPromise;
 }
 

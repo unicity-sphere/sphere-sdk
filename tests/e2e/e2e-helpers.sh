@@ -168,7 +168,7 @@ ping_escrow() {
   for attempt in $(seq 1 "$max_attempts"); do
     local out
     out=$(cli_as "$profile" swap-ping "$escrow_addr" 2>&1) || true
-    if echo "$out" | grep -qi "escrow_address"; then
+    if echo "$out" | grep -q '"escrow_address"'; then
       log "Escrow responded to ping (attempt ${attempt})"
       ok "Escrow reachable at ${escrow_addr}"
       return 0
