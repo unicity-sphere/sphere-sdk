@@ -296,6 +296,54 @@ export async function sendRequestInvoice(
 }
 
 // =============================================================================
+// sendPing — Health check ping to escrow
+// =============================================================================
+
+/**
+ * Send a `ping` DM to the escrow service and wait for a `pong` response.
+ *
+ * Returns the pong payload (escrow_address, timestamp) on success,
+ * or throws on timeout/failure.
+ *
+ * @param communications - CommunicationsModule subset for DM sending
+ * @param escrowPubkey - Escrow's transport pubkey (DM recipient)
+ * @param onDM - Callback to register a one-shot DM listener
+ * @param timeoutMs - Max wait for pong response (default 30s)
+ */
+export async function sendPing(
+  communications: SwapModuleDependencies['communications'],
+  escrowPubkey: string,
+  onDM: (handler: (dm: { content: string; senderPubkey: string }) => void) => () => void,
+  timeoutMs: number = 30_000,
+): Promise<{ escrow_address: string; timestamp: number }> {
+  const dm = JSON.stringify({ type: 'ping' });
+
+  // Set up listener before sending to avoid race
+  const pongPromise = new Promise<{ escrow_address: string; timestamp: number }>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsub();
+      reject(new Error('Escrow ping timed out'));
+    }, timeoutMs);
+
+    const unsub = onDM((msg) => {
+      try {
+        const parsed = JSON.parse(msg.content);
+        if (parsed.type === 'pong') {
+          clearTimeout(timer);
+          unsub();
+          resolve({ escrow_address: parsed.escrow_address, timestamp: parsed.timestamp });
+        }
+      } catch {
+        // Not JSON or wrong format — ignore
+      }
+    });
+  });
+
+  await communications.sendDM(escrowPubkey, dm);
+  return pongPromise;
+}
+
+// =============================================================================
 // verifyEscrowSender — Authenticate escrow DMs
 // =============================================================================
 

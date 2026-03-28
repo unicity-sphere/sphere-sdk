@@ -23,6 +23,9 @@ log ""; log "=== Create wallets ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
 
+# Ping escrow to verify it's reachable before proceeding
+ping_escrow "$ALICE" "$ESCROW"
+
 # Topup
 log ""; log "=== Topup ==="
 topup_wallet "$ALICE" BTC 10

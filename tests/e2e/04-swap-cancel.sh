@@ -24,6 +24,7 @@ launch_escrow
 log ""; log "=== Create wallets and topup ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
+ping_escrow "$ALICE" "$ESCROW"
 topup_wallet "$ALICE" BTC 50
 topup_wallet "$BOB" ETH 500
 

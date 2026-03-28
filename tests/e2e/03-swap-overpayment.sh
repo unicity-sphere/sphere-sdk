@@ -30,6 +30,9 @@ log ""; log "=== Create wallets ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
 
+# Ping escrow
+ping_escrow "$ALICE" "$ESCROW"
+
 # --- Generous topup (much more than swap requires) ---
 log ""; log "=== Topup ==="
 topup_wallet "$ALICE" BTC 100

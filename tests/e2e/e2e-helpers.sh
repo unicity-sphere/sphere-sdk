@@ -159,6 +159,28 @@ launch_escrow() {
 }
 
 # ---------------------------------------------------------------------------
+# ping_escrow — verify escrow is reachable via DM round-trip
+# Requires a wallet profile to be active (any profile works).
+# ---------------------------------------------------------------------------
+ping_escrow() {
+  local profile="$1" escrow_addr="$2" max_attempts="${3:-5}"
+  log "Pinging escrow ${escrow_addr}..."
+  for attempt in $(seq 1 "$max_attempts"); do
+    local out
+    out=$(cli_as "$profile" swap-ping "$escrow_addr" 2>&1) || true
+    if echo "$out" | grep -qi "escrow_address"; then
+      log "Escrow responded to ping (attempt ${attempt})"
+      ok "Escrow reachable at ${escrow_addr}"
+      return 0
+    fi
+    if [[ $attempt -lt $max_attempts ]]; then
+      sleep 3
+    fi
+  done
+  die "Escrow ${escrow_addr} did not respond to ping after ${max_attempts} attempts"
+}
+
+# ---------------------------------------------------------------------------
 # cleanup — kill escrow, delete wallets, delete workspace
 # ---------------------------------------------------------------------------
 cleanup() {

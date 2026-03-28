@@ -4486,6 +4486,35 @@ async function main() {
         break;
       }
 
+      case 'swap-ping': {
+        const escrowAddr = args[1];
+        if (!escrowAddr) {
+          console.error('Usage: swap-ping <@nametag_or_address>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        try {
+          const pong = await swapModule.pingEscrow(escrowAddr);
+          console.log('Escrow is online:');
+          console.log(JSON.stringify(pong, null, 2));
+        } catch (err) {
+          console.error('Escrow ping failed:', err instanceof Error ? err.message : err);
+          process.exit(1);
+        }
+
+        await closeSphere();
+        break;
+      }
+
       case 'swap-status': {
         const swapIdArg = args[1];
         if (!swapIdArg) {

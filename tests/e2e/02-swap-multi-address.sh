@@ -29,6 +29,9 @@ log ""; log "=== Create wallets ==="
 create_wallet "$ALICE" "$ALICE"
 create_wallet "$BOB" "$BOB"
 
+# Ping escrow
+ping_escrow "$ALICE" "$ESCROW"
+
 # --- Topup: separate tokens for each swap ---
 # Each topup creates a separate token. Using multiple topups ensures
 # each swap can use its own token without depending on change tokens

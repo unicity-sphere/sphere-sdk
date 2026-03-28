@@ -46,6 +46,7 @@ import {
   sendAnnounce,
   sendAnnounce_v2,
   sendStatusQuery,
+  sendPing,
   sendRequestInvoice,
   withRetry,
 } from './escrow-client.js';
@@ -872,6 +873,38 @@ export class SwapModule {
    * @throws {SphereError} `SWAP_LIMIT_EXCEEDED` if max pending swaps reached.
    * @throws {SphereError} `SWAP_DM_SEND_FAILED` if proposal DM fails to send.
    */
+
+  /**
+   * Ping an escrow service to verify it is online and reachable.
+   *
+   * Resolves the escrow address, sends a `{ type: 'ping' }` DM, and waits
+   * for a `{ type: 'pong', escrow_address, timestamp }` response.
+   *
+   * @param escrowAddress - The escrow's @nametag or DIRECT:// address.
+   * @param timeoutMs - Max wait for pong (default 30s).
+   * @returns The pong payload with the escrow's confirmed address and timestamp.
+   */
+  async pingEscrow(escrowAddress: string, timeoutMs?: number): Promise<{ escrow_address: string; timestamp: number }> {
+    this.ensureNotDestroyed();
+    this.ensureReady();
+    const deps = this.deps!;
+
+    const peer = await deps.resolve(escrowAddress);
+    if (!peer?.transportPubkey) {
+      throw new SphereError(
+        `Cannot resolve escrow address: ${escrowAddress}`,
+        'SWAP_RESOLVE_FAILED',
+      );
+    }
+
+    return sendPing(
+      deps.communications,
+      peer.transportPubkey,
+      (handler) => deps.communications.onDirectMessage(handler),
+      timeoutMs,
+    );
+  }
+
   async proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapProposalResult> {
     this.ensureNotDestroyed();
     this.ensureReady();
