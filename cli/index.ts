@@ -1037,18 +1037,18 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
     description: 'Propose a token swap deal to a counterparty. Both parties deposit tokens into an escrow, which executes the swap atomically.',
     flags: [
       { flag: '--to <recipient>', description: 'Counterparty @nametag or address (required)' },
-      { flag: '--offer "<amount> <coin>"', description: 'Asset you are offering in "<amount> <symbol>" format (e.g., "1000000 UCT")' },
-      { flag: '--want "<amount> <coin>"', description: 'Asset you want in return in "<amount> <symbol>" format (e.g., "500000 USDU")' },
+      { flag: '--offer "<amount> <coin>"', description: 'Asset you are offering (e.g., "10 BTC", "0.5 ETH")' },
+      { flag: '--want "<amount> <coin>"', description: 'Asset you want in return (e.g., "100 USDU", "5 UCT")' },
       { flag: '--escrow <address>', description: 'Custom escrow address (optional, uses config default)' },
       { flag: '--timeout <seconds>', description: 'Swap timeout in seconds (60-86400)', default: '3600' },
       { flag: '--message <text>', description: 'Optional message to the counterparty' },
     ],
     examples: [
-      'npm run cli -- swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU"',
-      'npm run cli -- swap-propose --to @bob --offer "1000000 UCT" --want "500000 USDU" --timeout 7200 --message "Quick trade?"',
+      'npm run cli -- swap-propose --to @bob --offer "10 UCT" --want "5 USDU"',
+      'npm run cli -- swap-propose --to @bob --offer "1 BTC" --want "10 ETH" --timeout 7200 --message "Quick trade?"',
     ],
     notes: [
-      'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+      'Amounts are in human-readable units (e.g., "10 BTC" = 10 whole BTC). Decimals are supported (e.g., "0.5 ETH").',
     ],
   },
   'swap-list': {
@@ -2816,7 +2816,7 @@ async function main() {
 
         const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 
-        // Default amounts for all coins
+        // Default amounts in whole coins (the faucet API converts to smallest units internally).
         const DEFAULT_COINS: Record<string, number> = {
           'unicity': 100,
           'bitcoin': 1,
@@ -2854,6 +2854,7 @@ async function main() {
           const coin = FAUCET_COIN_MAP[coinArg.toUpperCase()] || coinArg.toLowerCase();
           const amount = amountArg ? parseFloat(amountArg) : (DEFAULT_COINS[coin] || 1);
 
+          // The faucet API converts whole-coin amounts to smallest units internally.
           console.log(`Requesting ${amount} ${coin} from faucet for @${nametag}...`);
           const result = await requestFaucet(coin, amount);
 
@@ -4215,18 +4216,6 @@ async function main() {
 
         const offer = parseAssetArg(args[offerIdx + 1]);
         const want = parseAssetArg(args[wantIdx + 1]);
-        const offerAmount = offer.amount;
-        const offerCoinValue = offer.coin;
-        const wantAmount = want.amount;
-        const wantCoinValue = want.coin;
-        if (!/^[1-9][0-9]*$/.test(offerAmount)) {
-          console.error(`Invalid amount "${offerAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
-          process.exit(1);
-        }
-        if (!/^[1-9][0-9]*$/.test(wantAmount)) {
-          console.error(`Invalid amount "${wantAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
-          process.exit(1);
-        }
 
         let timeout = 3600;
         if (timeoutIdx !== -1 && args[timeoutIdx + 1]) {
@@ -4245,16 +4234,31 @@ async function main() {
           process.exit(1);
         }
 
+        // Resolve coin symbols and convert human-readable amounts to smallest units
+        // (e.g., "10 BTC" → 10 * 10^8 = 1000000000 smallest units)
+        const offerCoin = resolveCoin(offer.coin);
+        const wantCoin = resolveCoin(want.coin);
+        const offerSmallest = toSmallestUnit(offer.amount, offerCoin.decimals);
+        const wantSmallest = toSmallestUnit(want.amount, wantCoin.decimals);
+        if (offerSmallest <= 0n) {
+          console.error(`Invalid offer amount "${offer.amount}" — must be a positive number`);
+          process.exit(1);
+        }
+        if (wantSmallest <= 0n) {
+          console.error(`Invalid want amount "${want.amount}" — must be a positive number`);
+          process.exit(1);
+        }
+
         const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
         const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
 
         const deal = {
           partyA: sphere.identity!.directAddress!,
           partyB: args[toIdx + 1],
-          partyACurrency: offerCoinValue,
-          partyAAmount: offerAmount,
-          partyBCurrency: wantCoinValue,
-          partyBAmount: wantAmount,
+          partyACurrency: offerCoin.symbol,
+          partyAAmount: offerSmallest.toString(),
+          partyBCurrency: wantCoin.symbol,
+          partyBAmount: wantSmallest.toString(),
           timeout: timeout,
           escrowAddress: escrow,
         };
@@ -4264,8 +4268,8 @@ async function main() {
         console.log(JSON.stringify({
           swap_id: result.swapId,
           counterparty: args[toIdx + 1],
-          offer: `${offerAmount} ${offerCoinValue}`,
-          want: `${wantAmount} ${wantCoinValue}`,
+          offer: `${offer.amount} ${offerCoin.symbol}`,
+          want: `${want.amount} ${wantCoin.symbol}`,
           escrow: deal.escrowAddress ?? '(config default)',
           timeout: timeout,
           status: result.swap?.progress ?? 'proposed',
@@ -4334,12 +4338,22 @@ async function main() {
 
             // Determine counterparty display
             const isProposer = role === 'proposer';
+            // Format amounts back to human-readable (manifest stores smallest units)
+            const fmtSwapAmt = (amount: string | undefined, currency: string | undefined): string => {
+              if (!amount || !currency) return '';
+              try {
+                const def = resolveCoin(currency);
+                return `${toHumanReadable(amount, def.decimals)} ${def.symbol}`;
+              } catch {
+                return `${amount} ${currency}`;
+              }
+            };
             const offerStr = isProposer
-              ? `${swap.deal?.partyAAmount ?? ''} ${swap.deal?.partyACurrency ?? ''}`
-              : `${swap.deal?.partyBAmount ?? ''} ${swap.deal?.partyBCurrency ?? ''}`;
+              ? fmtSwapAmt(swap.deal?.partyAAmount, swap.deal?.partyACurrency)
+              : fmtSwapAmt(swap.deal?.partyBAmount, swap.deal?.partyBCurrency);
             const wantStr = isProposer
-              ? `${swap.deal?.partyBAmount ?? ''} ${swap.deal?.partyBCurrency ?? ''}`
-              : `${swap.deal?.partyAAmount ?? ''} ${swap.deal?.partyACurrency ?? ''}`;
+              ? fmtSwapAmt(swap.deal?.partyBAmount, swap.deal?.partyBCurrency)
+              : fmtSwapAmt(swap.deal?.partyAAmount, swap.deal?.partyACurrency);
             // Show nametag if available, otherwise truncated address
             let counterparty: string;
             if (swap.counterpartyNametag) {
@@ -4623,6 +4637,8 @@ async function main() {
         console.log('Deposit result:');
         console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
 
+        // Wait for background tasks (e.g., change token creation from instant split)
+        await sphere.payments.waitForPendingOperations();
         await syncAfterWrite(sphere);
         await closeSphere();
         break;

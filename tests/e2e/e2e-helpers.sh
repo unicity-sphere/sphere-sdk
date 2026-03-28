@@ -361,3 +361,83 @@ get_deposit_invoice_id() {
   out=$(cli_as "$profile" swap-status "$prefix" 2>&1) || true
   echo "$out" | grep -oP '"depositInvoiceId"\s*:\s*"\K[^"]+' | head -1
 }
+
+# ---------------------------------------------------------------------------
+# Balance assertion helpers
+# ---------------------------------------------------------------------------
+
+# get_coin_token_count <profile> <symbol>
+# Returns the number of tokens held for a given coin symbol.
+# Parses balance output: "BTC: 0.00000010 (2 tokens)" → 2
+get_coin_token_count() {
+  local profile="$1" symbol="$2"
+  local out
+  out=$(cli_as "$profile" balance --no-sync 2>&1) || true
+  # Match: "BTC: 0.00000010 (2 tokens)" or "BTC: 0.00000005 (1 token)"
+  echo "$out" | grep -P "^${symbol}:" | grep -oP '\((\d+) tokens?\)' | grep -oP '\d+' | head -1
+}
+
+# get_coin_amount <profile> <symbol>
+# Returns the total raw integer amount for a given coin symbol.
+# Sums amounts across all tokens of that coin.
+# Uses a dedicated CLI query: `tokens --no-sync` and parses output.
+get_coin_amount() {
+  local profile="$1" symbol="$2"
+  local out total=0
+  out=$(cli_as "$profile" tokens --no-sync 2>&1) || true
+  # tokens output format:
+  #   Coin: BTC (abcd1234...)
+  #   Amount: 0.00000010 BTC
+  # We need to match the coin line, then extract from the Amount line.
+  # Since amounts are formatted as human-readable decimals, and we need raw
+  # integer amounts, we use the balance line format instead.
+  # Balance format: "BTC: 0.00000010 (2 tokens)"
+  # The displayed value = raw_amount / 10^decimals
+  # For swap assertions, we compare token counts which proves splitting.
+  #
+  # Alternative: use the balance confirmedAmount + unconfirmedAmount fields.
+  # For simplicity, extract the formatted balance and compare as strings.
+  out=$(cli_as "$profile" balance --no-sync 2>&1) || true
+  echo "$out" | grep -P "^${symbol}:" | grep -oP "^${symbol}: \K[0-9.]+" | head -1
+}
+
+# assert_coin_present <profile> <symbol> <label>
+# Asserts that the wallet has at least one token of the given coin.
+assert_coin_present() {
+  local profile="$1" symbol="$2" label="$3"
+  local count
+  count=$(get_coin_token_count "$profile" "$symbol")
+  if [[ -n "$count" && "$count" -gt 0 ]]; then
+    ok "${label}: has ${symbol} (${count} token(s))"
+  else
+    fail "${label}: missing ${symbol} — expected at least 1 token"
+  fi
+}
+
+# assert_coin_token_count <profile> <symbol> <expected_count> <label>
+# Asserts that the wallet has exactly the expected number of tokens for a coin.
+assert_coin_token_count() {
+  local profile="$1" symbol="$2" expected="$3" label="$4"
+  local count
+  count=$(get_coin_token_count "$profile" "$symbol")
+  if [[ "${count:-0}" -eq "$expected" ]]; then
+    ok "${label}: ${symbol} has ${count} token(s)"
+  else
+    fail "${label}: ${symbol} expected ${expected} token(s), got ${count:-0}"
+  fi
+}
+
+# assert_deposit_change <profile> <symbol> <label>
+# After a deposit that required a token split, asserts that the change
+# token exists (i.e., the wallet still holds the original coin).
+# This is the critical assertion: deposit must NOT consume the entire token.
+assert_deposit_change() {
+  local profile="$1" symbol="$2" label="$3"
+  local count
+  count=$(get_coin_token_count "$profile" "$symbol")
+  if [[ -n "$count" && "$count" -ge 1 ]]; then
+    ok "${label}: change token preserved (${count} ${symbol} token(s) remaining)"
+  else
+    fail "${label}: change token MISSING — deposit consumed entire ${symbol} token"
+  fi
+}

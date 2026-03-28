@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 02-swap-multi-address.sh — Two simultaneous swaps from different addresses
+# 02-swap-multi-address.sh — Two simultaneous swaps
 #
-# Tests that the escrow handles multiple concurrent swaps correctly.
-# Alice proposes swap A from addr 0, proposes swap B from addr 0 (different amounts).
+# Alice proposes swap A (1 BTC ↔ 10 ETH) and swap B (2 BTC ↔ 20 ETH).
 # Bob accepts both. Both complete independently.
-#
-# NOTE: Partial deposits via invoice-pay are currently limited by the SDK's
-# ensureSync → load() cycle which can clear token state. When this is fixed,
-# this test should be expanded to use actual multi-address partial deposits.
+# Topup is 10x per swap to verify token splitting works across concurrent swaps.
 # =============================================================================
 set -euo pipefail
 TEST_NAME="02-multi-swap"
@@ -32,15 +28,15 @@ create_wallet "$BOB" "$BOB"
 # Ping escrow
 ping_escrow "$ALICE" "$ESCROW"
 
-# --- Topup: separate tokens for each swap ---
-# Each topup creates a separate token. Using multiple topups ensures
+# --- Topup: separate tokens for each swap (10x each) ---
+# Each topup creates a separate token. Using separate topups ensures
 # each swap can use its own token without depending on change tokens
 # from prior splits (change tokens require background aggregator round-trip).
 log ""; log "=== Topup ==="
-topup_wallet "$ALICE" BTC 1    # for Swap A
-topup_wallet "$ALICE" BTC 2    # for Swap B
-topup_wallet "$BOB" ETH 10     # for Swap A
-topup_wallet "$BOB" ETH 20     # for Swap B
+topup_wallet "$ALICE" BTC 10    # 10x for Swap A (needs 1)
+topup_wallet "$ALICE" BTC 20    # 10x for Swap B (needs 2)
+topup_wallet "$BOB" ETH 100    # 10x for Swap A (needs 10)
+topup_wallet "$BOB" ETH 200    # 10x for Swap B (needs 20)
 
 # --- Propose TWO swaps ---
 log ""; log "=== Propose swap A: 1 BTC ↔ 10 ETH ==="
@@ -61,15 +57,20 @@ log ""; log "=== Swap A: deposits ==="
 deposit_swap "$BOB" "${SWAP_A:0:8}"
 deposit_swap "$ALICE" "${SWAP_A:0:8}"
 
-# Wait for change tokens from Swap A to be minted and written to disk.
-# Each CLI invocation is a separate process — the change token from Swap A's
-# deposit exists only in that process's memory. The background mint (~2-5s)
-# writes the real change token to TXF storage. Without this wait, Swap B's
-# CLI sees 0 balance.
+# Verify change tokens after swap A deposits
+log ""; log "=== Verify post-deposit A balances ==="
+assert_deposit_change "$ALICE" BTC "Alice BTC after swap A deposit"
+assert_deposit_change "$BOB" ETH "Bob ETH after swap A deposit"
+
 # --- Both deposit into swap B ---
 log ""; log "=== Swap B: deposits ==="
 deposit_swap "$BOB" "${SWAP_B:0:8}"
 deposit_swap "$ALICE" "${SWAP_B:0:8}"
+
+# Verify change tokens after swap B deposits
+log ""; log "=== Verify post-deposit B balances ==="
+assert_deposit_change "$ALICE" BTC "Alice BTC after swap B deposit"
+assert_deposit_change "$BOB" ETH "Bob ETH after swap B deposit"
 
 # --- Wait for both to complete ---
 log ""; log "=== Waiting for swap A completion ==="
@@ -88,13 +89,15 @@ else
   fail "Swap B did not complete (final: $FINAL_B)"
 fi
 
-# --- Verify ---
+# --- Verify final balances ---
 log ""; log "=== Verify balances ==="
 ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
 if echo "$ALICE_BAL" | grep -q "ETH"; then ok "Alice received ETH"; else fail "Alice missing ETH"; fi
+if echo "$ALICE_BAL" | grep -q "BTC"; then ok "Alice kept remaining BTC"; else fail "Alice lost all BTC — change tokens missing"; fi
 
 BOB_BAL=$(cli_as "$BOB" balance --finalize 2>&1) || true
 if echo "$BOB_BAL" | grep -q "BTC"; then ok "Bob received BTC"; else fail "Bob missing BTC"; fi
+if echo "$BOB_BAL" | grep -q "ETH"; then ok "Bob kept remaining ETH"; else fail "Bob lost all ETH — change tokens missing"; fi
 
 summary
 [[ $FAIL -gt 0 ]] && exit 1

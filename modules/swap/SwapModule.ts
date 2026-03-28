@@ -3396,10 +3396,16 @@ export class SwapModule {
     this.clearLocalTimer(swapId);
 
     // Compute remaining time, accounting for elapsed time since creation
-    // (important for proposals loaded from storage on restart)
+    // (important for proposals loaded from storage on restart).
+    // Use the SAME Math.max(proposalTimeoutMs, deal.timeout * 1000) logic as the
+    // load() stale-cleanup check — otherwise the timer can expire a swap that the
+    // load check correctly deemed still alive.
     const swap = this.swaps.get(swapId);
     const elapsed = swap ? Date.now() - swap.createdAt : 0;
-    const remaining = this.config.proposalTimeoutMs - elapsed;
+    const effectiveTimeout = swap?.deal?.timeout
+      ? Math.max(this.config.proposalTimeoutMs, swap.deal.timeout * 1000)
+      : this.config.proposalTimeoutMs;
+    const remaining = effectiveTimeout - elapsed;
 
     if (remaining <= 0) {
       // Already expired — transition immediately

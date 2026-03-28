@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 03-swap-overpayment.sh — Large swap with generous topup
+# 03-swap-overpayment.sh — Large swap with generous topup (10x)
 #
-# Tests that the escrow handles a swap where parties have more tokens than
-# needed. The standard deposit path deposits exactly the required amount.
-# Surplus tokens remain in the parties' wallets.
-#
-# NOTE: True overpayment testing (deposit more than required into the invoice)
-# requires the invoice-pay CLI to work after a prior partial payment, which
-# is currently limited by the SDK's ensureSync → load() cycle. This test
-# verifies the basic "deposit exact amount, keep surplus" flow.
+# Tests that the escrow handles a swap where parties have 10x more tokens than
+# needed. The deposit path MUST split the token and preserve the change.
+# After deposit: each party must still hold 9/10 of their original balance.
 # =============================================================================
 set -euo pipefail
 TEST_NAME="03-large-swap"
@@ -33,10 +28,10 @@ create_wallet "$BOB" "$BOB"
 # Ping escrow
 ping_escrow "$ALICE" "$ESCROW"
 
-# --- Generous topup (much more than swap requires) ---
+# --- Generous topup (10x the swap amount) ---
 log ""; log "=== Topup ==="
-topup_wallet "$ALICE" BTC 100
-topup_wallet "$BOB" ETH 1000
+topup_wallet "$ALICE" BTC 50     # swap needs 5
+topup_wallet "$BOB" ETH 500     # swap needs 50
 
 # --- Propose: 5 BTC ↔ 50 ETH ---
 log ""; log "=== Propose: 5 BTC ↔ 50 ETH ==="
@@ -51,6 +46,13 @@ log ""; log "=== Deposits ==="
 deposit_swap "$BOB" "${SWAP_ID:0:8}"
 deposit_swap "$ALICE" "${SWAP_ID:0:8}"
 
+# --- CRITICAL: Verify change tokens survived deposit ---
+# This is THE key assertion for this test. If token splitting is broken,
+# the entire 50 BTC / 500 ETH token is consumed instead of just 5 / 50.
+log ""; log "=== Verify post-deposit balances (change tokens MUST exist) ==="
+assert_deposit_change "$ALICE" BTC "Alice BTC after depositing 5 of 50"
+assert_deposit_change "$BOB" ETH "Bob ETH after depositing 50 of 500"
+
 # --- Wait for completion ---
 log ""; log "=== Waiting for swap completion ==="
 FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned") || true
@@ -60,19 +62,18 @@ else
   fail "Swap did not complete (final: $FINAL)"
 fi
 
-# --- Verify balances ---
+# --- Verify final balances ---
 log ""; log "=== Verify balances ==="
 ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
 log "Alice balance:"
 echo "$ALICE_BAL" | grep -E "BTC|ETH" || echo "$ALICE_BAL" | tail -5
 
-# Alice should have received ETH from swap
+# Alice should have: ETH from payout + remaining BTC from change
 if echo "$ALICE_BAL" | grep -q "ETH"; then ok "Alice received ETH from swap"; else fail "Alice missing ETH"; fi
-# Alice's remaining BTC may or may not be visible depending on token split timing
 if echo "$ALICE_BAL" | grep -q "BTC"; then
-  ok "Alice kept remaining BTC"
+  ok "Alice kept remaining BTC (change token)"
 else
-  log "  Note: Alice's remaining BTC may arrive after token split finalization"
+  fail "Alice lost all BTC — change token missing after split"
 fi
 
 BOB_BAL=$(cli_as "$BOB" balance --finalize 2>&1) || true
@@ -80,11 +81,10 @@ log "Bob balance:"
 echo "$BOB_BAL" | grep -E "BTC|ETH" || echo "$BOB_BAL" | tail -5
 
 if echo "$BOB_BAL" | grep -q "BTC"; then ok "Bob received BTC from swap"; else fail "Bob missing BTC"; fi
-# Bob's remaining ETH may need finalization
 if echo "$BOB_BAL" | grep -q "ETH"; then
-  ok "Bob kept remaining ETH"
+  ok "Bob kept remaining ETH (change token)"
 else
-  log "  Note: Bob's remaining ETH may arrive after token split finalization"
+  fail "Bob lost all ETH — change token missing after split"
 fi
 
 summary

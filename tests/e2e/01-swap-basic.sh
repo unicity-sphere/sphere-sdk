@@ -3,6 +3,7 @@
 # 01-swap-basic.sh — Basic happy-path swap
 #
 # Alice proposes 1 BTC ↔ 10 ETH, Bob accepts, both deposit, escrow completes.
+# Topup is 10x the swap amount to verify token splitting (change tokens).
 # =============================================================================
 set -euo pipefail
 TEST_NAME="01-basic"
@@ -26,10 +27,10 @@ create_wallet "$BOB" "$BOB"
 # Ping escrow to verify it's reachable before proceeding
 ping_escrow "$ALICE" "$ESCROW"
 
-# Topup
+# Topup (10x the swap amount)
 log ""; log "=== Topup ==="
-topup_wallet "$ALICE" BTC 10
-topup_wallet "$BOB" ETH 100
+topup_wallet "$ALICE" BTC 10     # swap needs 1
+topup_wallet "$BOB" ETH 100     # swap needs 10
 
 # Propose
 log ""; log "=== Propose swap: 1 BTC ↔ 10 ETH ==="
@@ -45,7 +46,12 @@ log ""; log "=== Deposits ==="
 deposit_swap "$BOB" "${SWAP_ID:0:8}"
 deposit_swap "$ALICE" "${SWAP_ID:0:8}"
 
-# Wait for completion (poll every 5s, max 120s)
+# Verify change tokens survived the deposit (split must not consume entire token)
+log ""; log "=== Verify post-deposit balances (change tokens) ==="
+assert_deposit_change "$ALICE" BTC "Alice BTC after deposit"
+assert_deposit_change "$BOB" ETH "Bob ETH after deposit"
+
+# Wait for completion
 log ""; log "=== Waiting for swap completion ==="
 FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned") || true
 if [[ "$FINAL" == "completed" || "$FINAL" == "pruned" ]]; then
@@ -54,13 +60,15 @@ else
   fail "Swap did not complete (final: $FINAL)"
 fi
 
-# Verify balances
-log ""; log "=== Verify balances ==="
+# Verify final balances — both parties should have swapped coins + remaining original coins
+log ""; log "=== Verify final balances ==="
 ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
 if echo "$ALICE_BAL" | grep -q "ETH"; then ok "Alice received ETH"; else fail "Alice missing ETH"; fi
+if echo "$ALICE_BAL" | grep -q "BTC"; then ok "Alice kept remaining BTC"; else fail "Alice lost all BTC — change token missing"; fi
 
 BOB_BAL=$(cli_as "$BOB" balance --finalize 2>&1) || true
 if echo "$BOB_BAL" | grep -q "BTC"; then ok "Bob received BTC"; else fail "Bob missing BTC"; fi
+if echo "$BOB_BAL" | grep -q "ETH"; then ok "Bob kept remaining ETH"; else fail "Bob lost all ETH — change token missing"; fi
 
 summary
 [[ $FAIL -gt 0 ]] && exit 1
