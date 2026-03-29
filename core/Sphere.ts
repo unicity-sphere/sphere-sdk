@@ -176,8 +176,8 @@ export interface SphereCreateOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -215,8 +215,8 @@ export interface SphereLoadOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -268,8 +268,8 @@ export interface SphereImportOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -319,8 +319,8 @@ export interface SphereInitOptions {
   derivationPath?: string;
   /** Optional nametag to register (only on create). Token is auto-minted. */
   nametag?: string;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -474,7 +474,7 @@ export class Sphere {
   private _dmSince: number | null = null;
 
   // Stored configs for creating per-address modules
-  private _l1Config: L1Config | undefined;
+  private _l1Config: L1Config | null | undefined;
   private _groupChatConfig: GroupChatModuleConfig | undefined;
   private _marketConfig: MarketModuleConfig | undefined;
 
@@ -495,7 +495,7 @@ export class Sphere {
     transport: TransportProvider,
     oracle: OracleProvider,
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
-    l1Config?: L1Config,
+    l1Config?: L1Config | null,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
