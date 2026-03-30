@@ -494,3 +494,17 @@ export type {
 } from './uxf';
 
 export type { UxfErrorCode } from './uxf';
+
+// =============================================================================
+// Profile Types (type-only -- runtime available via @unicitylabs/sphere-sdk/profile)
+// =============================================================================
+
+export type {
+  ProfileConfig,
+  UxfBundleRef,
+  MigrationPhase,
+  MigrationResult,
+  ProfileEncryptionConfig,
+  ConsolidationPendingState,
+  ProfileErrorCode,
+} from './profile';

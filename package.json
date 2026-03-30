@@ -94,6 +94,36 @@
         "types": "./dist/uxf/index.d.cts",
         "default": "./dist/uxf/index.cjs"
       }
+    },
+    "./profile": {
+      "import": {
+        "types": "./dist/profile/index.d.ts",
+        "default": "./dist/profile/index.js"
+      },
+      "require": {
+        "types": "./dist/profile/index.d.cts",
+        "default": "./dist/profile/index.cjs"
+      }
+    },
+    "./profile/browser": {
+      "import": {
+        "types": "./dist/profile/browser.d.ts",
+        "default": "./dist/profile/browser.js"
+      },
+      "require": {
+        "types": "./dist/profile/browser.d.cts",
+        "default": "./dist/profile/browser.cjs"
+      }
+    },
+    "./profile/node": {
+      "import": {
+        "types": "./dist/profile/node.d.ts",
+        "default": "./dist/profile/node.js"
+      },
+      "require": {
+        "types": "./dist/profile/node.d.cts",
+        "default": "./dist/profile/node.cjs"
+      }
     }
   },
   "files": [
@@ -174,9 +204,17 @@
     "@libp2p/peer-id": ">=6.0.0",
     "ipns": ">=10.0.0",
     "multiformats": ">=13.0.0",
+    "@orbitdb/core": ">=2.0.0",
+    "helia": ">=4.0.0",
     "ws": ">=8.0.0"
   },
   "peerDependenciesMeta": {
+    "@orbitdb/core": {
+      "optional": true
+    },
+    "helia": {
+      "optional": true
+    },
     "ws": {
       "optional": true
     },
