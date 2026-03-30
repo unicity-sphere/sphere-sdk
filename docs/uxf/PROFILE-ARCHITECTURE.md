@@ -642,9 +642,10 @@ DM message content is encrypted with `profileEncryptionKey` before storing in Or
 2. NametagMinter mints nametag token on-chain
 3. Nametag published to Nostr relay
 4. CRITICAL WRITE:
-   a. UxfPackage.ingest(nametagToken) — add to pool
-   b. Profile: addresses.nametags updated
-   c. Flush to IPFS
+   a. UxfPackage.ingest(nametagToken) → toCar() → pin CAR to IPFS → new bundle CID
+   b. db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
+   c. db.put('addresses.nametags', updatedNametagMap)
+5. OrbitDB replicates to peers in background
 ```
 
 ### 7.6 Legacy Migration Flow
