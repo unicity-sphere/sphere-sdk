@@ -26,6 +26,10 @@ import {
 } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+
+// NIP-17 gift wrap timestamp randomization window (±2 days in seconds).
+// Must match the window used when creating gift wraps.
+const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
@@ -298,6 +302,10 @@ export class MultiAddressTransportMux {
         onReconnected: (url) => {
           logger.debug('Mux', 'Reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+          // Re-establish subscriptions — the relay drops them on disconnect.
+          this.updateSubscriptions().catch((err) => {
+            logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
+          });
         },
       });
 
@@ -403,9 +411,10 @@ export class MultiAddressTransportMux {
    * Called whenever addresses are added/removed.
    */
   private async updateSubscriptions(): Promise<void> {
-    if (!this.nostrClient || this.addresses.size === 0) return;
+    if (!this.nostrClient) return;
 
-    // Unsubscribe existing
+    // Always unsubscribe stale IDs first — the relay drops server-side
+    // subscriptions on disconnect, so these IDs are dead after reconnect.
     if (this.walletSubscriptionId) {
       this.nostrClient.unsubscribe(this.walletSubscriptionId);
       this.walletSubscriptionId = null;
@@ -414,6 +423,9 @@ export class MultiAddressTransportMux {
       this.nostrClient.unsubscribe(this.chatSubscriptionId);
       this.chatSubscriptionId = null;
     }
+
+    // Nothing to subscribe to if no addresses registered
+    if (this.addresses.size === 0) return;
 
     // Collect all pubkeys
     const allPubkeys: string[] = [];
@@ -476,7 +488,10 @@ export class MultiAddressTransportMux {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = allPubkeys;
-    chatFilter.since = globalDmSince;
+    // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
+    // Without this offset, ~50% of messages are silently dropped by the relay
+    // because their randomized timestamp lands before the `since` filter.
+    chatFilter.since = globalDmSince - TIMESTAMP_RANDOMIZATION;
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
