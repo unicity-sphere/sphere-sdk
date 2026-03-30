@@ -61,7 +61,7 @@ These exist once per wallet, regardless of how many HD addresses are derived.
 | `identity.currentAddressIndex` | uint | IPFS | Currently active address index |
 | `addresses.tracked` | `TrackedAddress[]` | IPFS | Registry of all derived HD addresses |
 | `addresses.nametags` | `Map<addressId, string>` | IPFS | Nametag cache per address |
-| `tokens.bundles` | `UxfBundleRef[]` | OrbitDB | **Array of UXF bundle references (CIDs) — see Section 2.3** |
+| `tokens.bundle.{CID}` | `UxfBundleRef` | OrbitDB | **Per-bundle reference — one key per UXF bundle (see Section 2.3)** |
 | `transport.lastWalletEventTs` | `Map<pubkey, uint>` | OrbitDB | Last processed Nostr wallet event timestamp per pubkey |
 | `transport.lastDmEventTs` | `Map<pubkey, uint>` | OrbitDB | Last processed Nostr DM event timestamp per pubkey |
 | `groupchat.relayUrl` | string | OrbitDB | Last used group chat relay URL |
@@ -80,6 +80,8 @@ These exist once per wallet, regardless of how many HD addresses are derived.
 | `prices.cacheTs` | uint | Price cache timestamp |
 
 These are regenerated from external APIs and are not replicated. Stored in the local `StorageProvider` (IndexedDB/file) as they are today.
+
+**IPFS/IPNS state keys** (`ipfs.seq`, `ipfs.cid`, `ipfs.ver` per IPNS name) are obsoleted by OrbitDB and are NOT migrated to the Profile. OrbitDB replaces IPNS as the mutable pointer mechanism. During migration (Section 7.6), these keys are consumed for the final IPFS sync but not carried forward.
 
 ### 2.2 Per-Address Keys
 
@@ -108,18 +110,25 @@ These are scoped to a specific HD address. The full key is `{addressId}.{key}` w
 | `{addr}.accounting.tokenScanState` | `Map<tokenId, uint>` | IPFS | Token scan watermarks |
 | `{addr}.swap.index` | `SwapSummary[]` | IPFS | Swap listing index |
 | `{addr}.swap:{swapId}` | `SwapRecord` | IPFS | Per-swap state (dynamic keys) |
+| `{addr}.mintOutbox` | `MintOutboxEntry[]` | OrbitDB | Pending mint operations (CRITICAL — loss means stuck mints) |
+| `{addr}.invalidTokens` | `InvalidTokenEntry[]` | OrbitDB | Tokens flagged as invalid |
+| `{addr}.invalidatedNametags` | `InvalidatedNametagEntry[]` | OrbitDB | Revoked nametags with reason |
+| `{addr}.tombstones` | `TombstoneEntry[]` | OrbitDB | Spent token records (tokenId, stateHash, timestamp) |
 
 ### 2.3 Token Inventory: Multi-Bundle Model
 
-The `tokens.bundles` key stores an **array** of UXF bundle references, not a single CID. This is a key design choice that enables conflict-free multi-device operation:
+Each UXF bundle is stored as a **separate OrbitDB key** using the pattern `tokens.bundle.{CID}`. This ensures that two devices adding different bundles write to different keys — no LWW conflict is possible.
 
 ```
 Profile (OrbitDB KV)
-  └── tokens.bundles: UxfBundleRef[]
-        ├── { cid: CID_1, status: "active", createdAt: 1711929600, device: "browser-a" }
-        ├── { cid: CID_2, status: "active", createdAt: 1711929700, device: "nodejs-b" }
-        └── { cid: CID_3, status: "superseded", supersededBy: CID_4, deleteAfter: 1712534400 }
+  └── tokens.bundle.bafy_CID_1 = { cid: "bafy_CID_1", status: "active", createdAt: 1711929600, device: "browser-a" }
+  └── tokens.bundle.bafy_CID_2 = { cid: "bafy_CID_2", status: "active", createdAt: 1711929700, device: "nodejs-b" }
+  └── tokens.bundle.bafy_CID_3 = { cid: "bafy_CID_3", status: "superseded", supersededBy: "bafy_CID_4", ... }
 ```
+
+- **Adding a bundle:** `db.put('tokens.bundle.' + cid, ref)` — writes a single key, no read-modify-write cycle
+- **Listing bundles:** `db.all()` filtered by prefix `tokens.bundle.` — returns all bundle refs
+- **Removing a bundle:** `db.del('tokens.bundle.' + cid)` — removes a single key
 
 Each `UxfBundleRef`:
 ```typescript
@@ -134,15 +143,14 @@ interface UxfBundleRef {
 }
 ```
 
-**Important:** Old CIDs are removed from the Profile but are **NOT unpinned from IPFS**. IPFS-side garbage collection is a separate future workstream. The `removeFromProfileAfter` field controls only when the reference is cleaned up from the Profile's `tokens.bundles` array — the CAR file remains pinned on IPFS indefinitely until explicit GC logic is implemented.
-```
+**Important:** Old CIDs are removed from the Profile but are **NOT unpinned from IPFS**. IPFS-side garbage collection is a separate future workstream. The `removeFromProfileAfter` field controls only when the reference key is deleted from the Profile — the CAR file remains pinned on IPFS indefinitely until explicit GC logic is implemented.
 
 #### Why Multiple Bundles?
 
 When two devices operate on the same wallet concurrently:
-- **Device A** sends a token → creates a new UXF bundle (CID_A) with the updated inventory → adds CID_A to `tokens.bundles`
-- **Device B** receives a token → creates a new UXF bundle (CID_B) → adds CID_B to `tokens.bundles`
-- OrbitDB's Merkle-CRDT ensures both entries appear in `tokens.bundles` (no conflict — they are appended, not overwritten)
+- **Device A** sends a token → creates a new UXF bundle (CID_A) with the updated inventory → `db.put('tokens.bundle.' + CID_A, ref)`
+- **Device B** receives a token → creates a new UXF bundle (CID_B) → `db.put('tokens.bundle.' + CID_B, ref)`
+- These are **different OrbitDB keys** — no LWW conflict occurs. Both entries appear after replication.
 - The wallet now has **two active bundles** with overlapping content
 
 #### Reading with Multiple Bundles
@@ -150,36 +158,52 @@ When two devices operate on the same wallet concurrently:
 When loading the token inventory, the client reads ALL active bundles and presents a merged view:
 
 ```
-1. Read tokens.bundles → [CID_1, CID_2] (both active)
-2. For each CID: UxfPackage.fromCar(fetch(CID))
-3. Merge all packages: result = UxfPackage.create()
+1. List all keys with prefix 'tokens.bundle.' → { CID_1: ref1, CID_2: ref2 }
+2. Filter to active: refs where status === 'active' → [CID_1, CID_2]
+3. For each CID: UxfPackage.fromCar(fetch(CID))
+4. Merge all packages: result = UxfPackage.create()
    result.merge(pkg1)  // add all tokens from bundle 1
    result.merge(pkg2)  // add all tokens from bundle 2 (dedup by content hash)
-4. The merged result is the complete token inventory
+5. The merged result is the complete token inventory
 ```
 
 Since UXF deduplication is content-addressed, overlapping tokens between bundles produce zero duplication in the merged in-memory view. The merge is cheap — it's just a Map union keyed by content hash.
+
+**CID availability:** If an active bundle's CID cannot be fetched from IPFS (gateway down, CID unpinned externally), the wallet logs a warning and operates with the remaining available bundles. The unavailable tokens are marked as 'unresolvable' in the UI. A periodic pinning verification step checks that all active CIDs are still accessible.
 
 #### Lazy Consolidation
 
 Over time, multiple small bundles accumulate. A background consolidation process merges them:
 
 ```
-1. Read tokens.bundles → [CID_1, CID_2, CID_3] (3 active bundles)
+1. List all keys with prefix 'tokens.bundle.' → filter to active → [CID_1, CID_2, CID_3]
 2. Merge all into one UxfPackage
 3. Export merged package: UxfPackage.toCar() → pin to IPFS → CID_merged
-4. Update tokens.bundles:
-   - Add { cid: CID_merged, status: "active" }
-   - Mark CID_1, CID_2, CID_3 as { status: "superseded", supersededBy: CID_merged, deleteAfter: now + 7 days }
-5. After the safety period (7 days), mark superseded bundles as "pending-deletion"
-6. Eventually, unpinned/deleted from IPFS
+4. Update OrbitDB:
+   - db.put('tokens.bundle.' + CID_merged, { cid: CID_merged, status: 'active', ... })
+   - db.put('tokens.bundle.' + CID_1, { ...existing, status: 'superseded', supersededBy: CID_merged, removeFromProfileAfter: now + 7d })
+   - db.put('tokens.bundle.' + CID_2, { ...existing, status: 'superseded', supersededBy: CID_merged, removeFromProfileAfter: now + 7d })
+   - db.put('tokens.bundle.' + CID_3, { ...existing, status: 'superseded', supersededBy: CID_merged, removeFromProfileAfter: now + 7d })
+5. After the safety period (7 days): db.del('tokens.bundle.' + CID_1), etc.
 ```
 
 The safety period ensures that any device still referencing the old CIDs has time to sync and learn about the consolidated bundle. During the transition, both old and new CIDs are valid — clients that haven't synced yet can still read the old bundles.
 
+**Crash recovery for consolidation:**
+- Before pinning the consolidated CAR, write a `consolidation.pending` key to OrbitDB:
+  `db.put('consolidation.pending', { sourceCids: [...], startedAt: timestamp, device: deviceId })`
+- After pinning: add the new bundle key, mark source bundles as superseded, delete `consolidation.pending`
+- On startup: if `consolidation.pending` exists, check if the consolidated CID was pinned:
+  - If pinned: complete the remaining steps (mark sources superseded, clean up pending key)
+  - If not pinned: delete the pending key and restart consolidation
+
+**Concurrent consolidation guard:** Before starting consolidation, check for `consolidation.pending` key. If another device's consolidation is in progress (started < 5 minutes ago), skip. If the pending entry is older than 5 minutes, assume the other device crashed and proceed.
+
+**Performance limits:** Maximum recommended active bundles: 20. If consolidation consistently fails and bundle count exceeds 20, the wallet enters degraded mode: new writes are blocked until consolidation succeeds or manual intervention clears stale bundles.
+
 #### Consolidation Triggers
 
-- **Automatic:** when `tokens.bundles` has > 3 active entries, consolidate in background
+- **Automatic:** when active bundle count (keys with prefix `tokens.bundle.` and status `active`) exceeds 3, consolidate in background
 - **Manual:** `UxfPackage.consolidateBundles()` API for explicit trigger
 - **On sync:** when the profile loads from OrbitDB and finds multiple active bundles from other devices
 
@@ -189,7 +213,9 @@ The safety period ensures that any device still referencing the old CIDs has tim
 active → superseded (after consolidation) → removed from Profile (after safety period)
 ```
 
-Note: "removed from Profile" means the `UxfBundleRef` entry is deleted from the `tokens.bundles` array. The CAR file remains on IPFS — no unpinning occurs. IPFS-side garbage collection is a separate future concern.
+Note: "removed from Profile" means the `tokens.bundle.{CID}` key is deleted from OrbitDB. The CAR file remains on IPFS — no unpinning occurs. IPFS-side garbage collection is a separate future concern.
+
+**Specification note:** The `UxfBundleRef` type and multi-bundle protocol should be added to SPECIFICATION.md as an appendix or separate specification document in a future update.
 
 ### 2.4 Operational State (TXF Compatibility)
 
@@ -201,14 +227,16 @@ The existing `TxfStorageData` fields map to UXF Profile as follows:
 | `_meta.ipnsName` | Derived from identity key | Not stored |
 | `_meta.version` | `profile.version` | Migrated |
 | `_meta.formatVersion` | `profile.version` | Unified |
-| `_tombstones[]` | Embedded in UXF package metadata | Moved to token inventory |
+| `_tombstones[]` | `{addr}.tombstones` | Migrated |
 | `_outbox[]` | `{addr}.outbox` | Migrated |
 | `_sent[]` | `{addr}.transactionHistory` (type=SENT) | Merged into history |
-| `_invalid[]` | Embedded in UXF package metadata | Moved to token inventory |
+| `_invalid[]` | `{addr}.invalidTokens` | Migrated |
 | `_history[]` | `{addr}.transactionHistory` | Migrated |
+| `_mintOutbox[]` | `{addr}.mintOutbox` | Migrated |
+| `_invalidatedNametags[]` | `{addr}.invalidatedNametags` | Migrated |
 | `_<tokenId>` entries | UXF element pool | Replaced by UXF |
 | `archived-<tokenId>` | UXF element pool (archived flag in manifest) | Replaced |
-| `_forked_<tokenId>_<hash>` | UXF element pool (forked flag in manifest) | Replaced |
+| `_forked_<tokenId>_<hash>` | UXF element pool (forked tokens ingested as separate token entries with metadata) | Migrated |
 | `_nametag` / `_nametags` | `addresses.nametags` + UXF nametag tokens | Split |
 
 ---
@@ -250,7 +278,7 @@ When a critical operation occurs (token send, token receive, nametag registratio
 1. **Write to local cache** (immediate, synchronous from caller's perspective)
 2. **Write to OrbitDB** (async, returns when local OpLog entry is created):
    a. If tokens changed: build new UXF CAR, pin to IPFS, get new CID
-   b. Append new bundle CID to `tokens.bundles` array
+   b. Add new bundle: `db.put('tokens.bundle.' + cid, ref)`
    c. Update affected profile keys via `db.put(key, value)`
    d. OrbitDB creates an OpLog entry (content-addressed, signed)
 3. **Background replication:** OrbitDB replicates the OpLog entry to other peers/devices via libp2p PubSub
@@ -277,7 +305,7 @@ When a critical operation occurs (token send, token receive, nametag registratio
        ├── Replicate OrbitDB OpLog from remote peers
        ├── Derive current state from OpLog (CRDT merge)
        └── Populate local cache, resume operation
-2. Read tokens.bundles → list of active UXF CIDs
+2. List all tokens.bundle.{CID} keys → filter active → list of UXF CIDs
 3. For each CID: check local CAR cache, fetch from IPFS if missing
 4. Merge all bundles in memory → ready to operate
 ```
@@ -286,7 +314,7 @@ When a critical operation occurs (token send, token receive, nametag registratio
 
 The token inventory may span multiple UXF bundles (see Section 2.3). Local storage may not fit all of them. The Profile supports **lazy loading**:
 
-- `tokens.bundles` lists all active CIDs
+- `tokens.bundle.{CID}` keys list all active CIDs
 - The local cache stores:
   - **Manifests from all active bundles** (small, ~1-10 KB each — always cached)
   - **A partial block cache** containing only recently-accessed element blocks
@@ -305,12 +333,12 @@ OrbitDB's Merkle-CRDT OpLog provides automatic conflict resolution:
 | Data Type | OrbitDB Behavior | UXF Integration |
 |-----------|-----------------|-----------------|
 | **Scalar profile keys** (identity, settings) | Last-writer-wins per key (causal ordering via OpLog) | Direct — each `db.put()` is a CRDT operation |
-| **Token bundles** (`tokens.bundles`) | Array append is conflict-free (both devices' bundles appear) | Merged view at read time via `UxfPackage.merge()` |
+| **Token bundles** (`tokens.bundle.{CID}`) | Each bundle is a separate OrbitDB key. Two devices adding different bundles write to different keys — no LWW conflict possible. | Merged view at read time via `UxfPackage.merge()` |
 | **Messages / history** | Each entry is a separate `db.put()` with unique key | Union — OrbitDB preserves all writes from all devices |
 | **Dedup sets** | Each ID is a separate key entry | Union — set grows monotonically |
 | **Pending transfers** | Per-transfer key entries | Both devices' pending entries visible; confirmed entries removed by either device |
 
-**Key insight:** By storing `tokens.bundles` as an array that grows (append new CIDs, mark old ones superseded), we avoid the most complex conflict scenario. Two devices never need to agree on a single CID — they just add their own and the merge view handles the rest.
+**Key insight:** By storing each bundle as a separate OrbitDB key (`tokens.bundle.{CID}`), we avoid all conflict scenarios. Two devices adding different bundles write to different keys — no LWW conflict is possible. Each device simply adds its own key and the merged view at read time handles the rest.
 
 ---
 
@@ -337,7 +365,7 @@ OrbitDB's `keyvalue` type stores each key as a separate OpLog entry. The Profile
 db.put('identity.mnemonic', encryptedBytes)
 db.put('identity.masterKey', encryptedBytes)
 db.put('addresses.tracked', [...])
-db.put('tokens.bundles', [{ cid: 'bafy...', status: 'active', ... }])
+db.put('tokens.bundle.bafy...', { cid: 'bafy...', status: 'active', ... })
 db.put('addr1.transactionHistory', [...])
 db.put('addr1.messages', {...})
 ...
@@ -351,21 +379,30 @@ Each `db.put(key, value)` appends an entry to the Merkle-CRDT OpLog:
 
 ```
 OpLog (append-only, content-addressed)
-├── entry_1: { key: 'tokens.bundles', value: [{cid: CID_1, ...}], clock: 1, device: A }
+├── entry_1: { key: 'tokens.bundle.CID_1', value: {cid: CID_1, status: 'active', ...}, clock: 1, device: A }
 ├── entry_2: { key: 'addr1.messages', value: CID_msgs_v1, clock: 2, device: A }
-├── entry_3: { key: 'tokens.bundles', value: [{cid: CID_2, ...}], clock: 1, device: B }  ← concurrent!
-└── entry_4: { key: 'tokens.bundles', value: [{cid: CID_1, ...}, {cid: CID_2, ...}], clock: 3, device: A }  ← merged
+├── entry_3: { key: 'tokens.bundle.CID_2', value: {cid: CID_2, status: 'active', ...}, clock: 1, device: B }  ← concurrent!
 ```
 
-When two devices write to the same key concurrently, OrbitDB's `keyvalue` type resolves by **last-writer-wins using the Lamport clock** from the OpLog. For `tokens.bundles`, this means the device that writes last includes both bundles in its array — no data is lost because both CIDs are accumulated.
+When two devices add bundles concurrently, they write to **different keys** (`tokens.bundle.CID_1` vs `tokens.bundle.CID_2`). No LWW conflict occurs — both entries coexist after replication. LWW only applies when two devices write to the **same** key (e.g., marking a bundle as superseded), which is resolved by Lamport clock ordering.
 
 ### 4.4 Replication
 
 OrbitDB replicates via libp2p:
 
 - **PubSub (real-time):** When peers are online simultaneously, OpLog entries propagate in sub-second via libp2p gossipsub topic `orbitdb/<dbAddress>`
-- **Nostr relay (persistent store):** OrbitDB OpLog entries are bridged to the existing Nostr relay infrastructure via a thin adapter. This provides persistent storage for OpLog entries — when a device comes online after being offline, it fetches missed entries from the Nostr relay. Reuses the existing `NostrTransportProvider` for both token transport AND profile replication.
+- **Nostr relay as persistence fallback:** OrbitDB OpLog entries can be serialized as Nostr events (kind: 30078, encrypted content) for persistence on the existing relay infrastructure. This is NOT a thin adapter — it requires: (1) serializing OrbitDB OpLog entries to Nostr event format, (2) handling OpLog ordering (Nostr does not guarantee causal order), (3) implementing a custom OrbitDB replication protocol over Nostr. This is a **Phase 2 feature**. Phase 1 relies on standard libp2p PubSub for real-time replication and IPFS block exchange for cold sync.
 - **DHT (fallback):** Standard IPFS DHT-based peer discovery as a last-resort fallback
+
+### 4.5 OpLog Growth Management
+
+OrbitDB's OpLog is append-only and grows indefinitely. For long-lived wallets:
+
+- **Periodic snapshots:** Every N months (configurable), create a fresh OrbitDB database from the current state, replacing the old one. This resets the OpLog.
+- **Write batching:** Batch rapid writes (e.g., multiple message receives) into single `db.put()` calls to reduce OpLog entry count.
+- **Key consolidation:** Use compound values (JSON objects) for frequently-updated keys to reduce the number of OpLog entries.
+
+Expected growth: ~100-500 bytes per OpLog entry. A wallet with 10 operations/day accumulates ~1.5-3.5 MB/year of OpLog data.
 
 ---
 
@@ -407,7 +444,7 @@ The existing `STORAGE_KEYS_GLOBAL` and `STORAGE_KEYS_ADDRESS` map directly to Pr
 | `base_path` | `identity.basePath` |
 | `derivation_mode` | `identity.derivationMode` |
 | `wallet_source` | `identity.walletSource` |
-| `wallet_exists` | Derived (profile exists = wallet exists) |
+| `wallet_exists` | Derived (profile exists = wallet exists). Implementation: `has('wallet_exists')` checks local cache first (synchronous, fast). A `wallet_exists` flag is also maintained in local storage as a fast-path check that does not require OrbitDB access. |
 | `current_address_index` | `identity.currentAddressIndex` |
 | `address_nametags` | `addresses.nametags` |
 | `tracked_addresses` | `addresses.tracked` |
@@ -447,8 +484,8 @@ PaymentsModule.save()
     → UxfPackage.ingest(token) for each changed/new token
     → Handle _tombstones, _outbox, _sent as separate profile keys
     → UxfPackage.toCar() → pin CAR to IPFS → get new CID
-    → Append new UxfBundleRef to tokens.bundles array:
-      db.put('tokens.bundles', [...existing, { cid: newCid, status: 'active', createdAt: now }])
+    → Add new bundle as separate key:
+      db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
     → OrbitDB replicates to peers
 ```
 
@@ -456,8 +493,8 @@ PaymentsModule.save()
 ```
 PaymentsModule.load()
   → ProfileTokenStorageProvider.load()
-    → bundles = db.get('tokens.bundles') → UxfBundleRef[]
-    → activeBundles = bundles.filter(b => b.status === 'active')
+    → allBundles = db.all() filtered by prefix 'tokens.bundle.' → Map<key, UxfBundleRef>
+    → activeBundles = [...allBundles.values()].filter(b => b.status === 'active')
     → mergedPkg = UxfPackage.create()
     → For each active bundle:
         → If local CAR cache has this CID: use local
@@ -475,15 +512,15 @@ PaymentsModule.load()
 OrbitDB replication callback:
   → New OpLog entries arrive from peer device
   → OrbitDB merges via CRDT (automatic)
-  → tokens.bundles now includes bundles from both devices
-  → Next load() will see all bundles and merge them
+  → tokens.bundle.{CID} keys now include bundles from both devices
+  → Next load() will see all bundle keys and merge them
   → Emit 'sync:completed' event
 
 Background consolidation (if > 3 active bundles):
   → Merge all active bundles into one UxfPackage
   → UxfPackage.toCar() → pin to IPFS → consolidatedCid
-  → Update tokens.bundles: mark old bundles as 'superseded', add consolidated
-  → After safety period (7 days): mark superseded as 'pending-deletion'
+  → Add consolidated bundle key, mark old bundle keys as 'superseded'
+  → After safety period (7 days): delete superseded bundle keys from OrbitDB
 ```
 
 ---
@@ -501,6 +538,13 @@ Object stores:
 ```
 
 IndexedDB is used as a pure cache — it can be cleared at any time. The app recovers by re-fetching from IPFS.
+
+**Browser runtime constraints for OrbitDB:**
+- libp2p in browsers requires WebRTC or WebTransport for peer discovery (NAT traversal via relay)
+- WebRTC connection limits (~256 concurrent connections in Chrome)
+- Service workers cannot run libp2p (no WebRTC in service workers)
+- Bundle size: Helia + OrbitDB + libp2p is approximately 500KB-1MB minified
+- Fallback for browsers without WebRTC: HTTP-based IPFS gateway fetch only (degraded mode)
 
 ### 6.2 Node.js: SQLite (better-sqlite3) or LevelDB
 
@@ -536,7 +580,7 @@ The `car-blocks` store can grow large. Eviction policy:
 5. CRITICAL WRITE:
    a. UxfPackage with updated tokens (spent removed, change added)
    b. UxfPackage.toCar() → pin CAR to IPFS → new bundle CID
-   c. db.put('tokens.bundles', [...existing, { cid: newCid, status: 'active' }])
+   c. db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
    d. db.put('{addr}.transactionHistory', [...history, newEntry])
    e. ONLY NOW return success to caller
 6. Local cache updated
@@ -552,7 +596,7 @@ The `car-blocks` store can grow large. Eviction policy:
 3. Token finalized (proof collected from aggregator)
 4. CRITICAL WRITE:
    a. UxfPackage.ingest(receivedToken) → toCar() → pin → new CID
-   b. Append new bundle CID to tokens.bundles
+   b. db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
    c. db.put('{addr}.transactionHistory', [...history, newEntry])
 5. Emit 'transfer:incoming' event to app
 6. OrbitDB replicates to peers in background
@@ -567,8 +611,8 @@ OrbitDB replication is continuous — no polling needed:
 2. OrbitDB discovers peers sharing the same database address
 3. OpLog entries replicate automatically via PubSub
 4. CRDT merge: each key resolves to its latest value
-5. tokens.bundles accumulates CIDs from all devices
-6. Next load() sees all bundles → merge view is up to date
+5. tokens.bundle.{CID} keys accumulate from all devices
+6. Next load() lists all bundle keys → merge view is up to date
 7. Emit 'sync:completed' event
 8. Background consolidation reduces bundle count
 ```
@@ -589,6 +633,8 @@ Receive:
 4. Flush to IPFS (debounced)
 ```
 
+DM message content is encrypted with `profileEncryptionKey` before storing in OrbitDB. The NIP-17 privacy guarantee is preserved — messages are encrypted at rest on IPFS, readable only by the wallet holder. The Nostr relay sees NIP-17 gift-wrapped content; OrbitDB/IPFS sees AES-encrypted content; only the wallet holder can decrypt both.
+
 ### 7.5 Nametag Registration
 
 ```
@@ -607,7 +653,12 @@ When `Sphere.init({ profile: true })` is called on a wallet that has legacy-form
 
 ```
 1. SYNC OLD IPFS DATA FIRST
+   - For wallets that never used IPFS sync (no `sphere_ipfs_seq_*` keys), skip step 1 entirely.
    - Resolve existing IPNS name → get latest old-format CID
+   - If IPNS resolution fails (expired name, network issues), skip step 1 and proceed
+     with local-only data. Log a warning: 'IPNS resolution failed — migrating from
+     local data only. Remote IPFS data may not be included.' The local data is likely
+     more recent than the last IPFS sync.
    - Fetch old TXF data from IPFS
    - Merge with local legacy storage (ensures we have the most recent state)
    - This step MUST complete before transformation begins
@@ -624,29 +675,38 @@ When `Sphere.init({ profile: true })` is called on a wallet that has legacy-form
 3. PERSIST TO ORBITDB
    - Open/create OrbitDB database with wallet identity
    - Write all Profile keys via db.put()
-   - Pin UXF CAR file to IPFS → record CID in tokens.bundles
+   - Pin UXF CAR file to IPFS → record CID via db.put('tokens.bundle.' + cid, ref)
    - Wait for OrbitDB local persistence (OpLog committed to IPFS blockstore)
 
 4. SANITY CHECK (mandatory — blocks until complete)
    a. Read back all Profile keys from OrbitDB → compare with transformed data
    b. Fetch UXF CAR from IPFS by CID → UxfPackage.fromCar()
-   c. Assemble all tokens → verify count matches original
-   d. Verify every tokenId from the original inventory exists in the UXF bundle
-   e. Verify operational state (history entries, message counts, pending transfers)
-   f. If ANY check fails: abort migration, keep legacy data, log error, continue
+   c. For each migrated token:
+      - Verify tokenId exists in the UXF bundle
+      - Verify transaction count matches the original TXF token
+      - Verify the current state hash matches (fast check via SHA-256 of predicate + data)
+   d. For operational state: verify history entry count, conversation count,
+      and pending transfer IDs match
+   e. If ANY check fails: abort migration, keep legacy data, log error, continue
       with legacy storage (no data loss)
 
 5. CLEANUP (only after step 4 passes completely)
    a. Remove all legacy-formatted user data from local storage
-      (old IndexedDB entries, old file-based storage)
-   b. Instruct IPFS node to safely unpin ALL versions of old-format inventory
-      (every CID from the first IPNS publication through the latest one)
+      (old IndexedDB entries, old file-based storage).
+      Note: the `SphereVestingCacheV5` IndexedDB database is NOT deleted during
+      cleanup — it is a standalone cache unrelated to the Profile migration.
+      It will be regenerated naturally by the VestingClassifier.
+   b. Unpin the last known CID from `sphere_ipfs_cid_{ipnsName}` (the only tracked
+      CID). Previous CIDs are not tracked and will be garbage collected by the IPFS
+      pinning service's retention policy.
    c. The old IPNS name is no longer published to
 
 6. DONE — Profile is the sole storage layer from this point forward
 ```
 
-**Idempotency:** If migration is interrupted (app crash, network failure), it restarts from step 1 on next launch. The presence of an OrbitDB profile (step 4 passed previously) skips re-migration.
+**Recovery from interrupted migration:** Track migration state via a local-only key `migration.phase` (values: 'syncing', 'transforming', 'persisting', 'verifying', 'cleaning', 'complete'). On restart, resume from the last completed phase. If `migration.phase = 'verifying'` and OrbitDB profile exists, re-run steps 4 and 5 only.
+
+**Idempotency:** If migration is interrupted (app crash, network failure), it resumes from the last completed phase on next launch. The presence of an OrbitDB profile (step 4 passed previously) skips re-migration.
 
 ---
 
@@ -686,24 +746,30 @@ The `profile: true` option enables the OrbitDB/IPFS persistence model. Without i
 
 ## 9. Security Considerations
 
-### 9.1 No Encryption at Rest (Phase 1)
+### 9.1 Encryption Model: Shared Key
 
-**Phase 1: Token materials and profile data are stored unencrypted on IPFS.** This is a deliberate design choice to preserve content-addressed deduplication.
+All OrbitDB values are encrypted with a key derived from the wallet's master key:
 
-**Rationale:** If two devices encrypt the same UXF bundle with different keys, the encrypted bytes differ and produce different CIDs — defeating the fundamental dedup model. The same token stored by two devices must produce the same CID to enable natural deduplication and multi-bundle merging.
+```
+profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)
+```
 
-Encryption may be added in future phases using one of these approaches:
-- **Shared key model:** derive a single encryption key from the wallet identity via `HKDF(masterKey, "uxf-encryption", 32)`. All devices with the mnemonic derive the same key → identical plaintext produces identical ciphertext → CID dedup works. This adds complexity but preserves dedup.
-- **Transport-level encryption:** encrypt CAR files during upload/download but store plaintext blocks on IPFS. The IPFS pinning service sees plaintext, but data in transit is protected.
-- **Application-level encryption:** encrypt at the Sphere app layer, above UXF. UXF itself remains unencrypted.
+Since the key is derived deterministically from the mnemonic, ALL devices sharing the same wallet derive the same key. This means:
+- Only devices with the mnemonic can decrypt
+- IPFS pinning services and other peers see only encrypted blobs
+- The encryption is transparent to the OrbitDB layer (values are encrypted bytes)
+
+Encryption uses AES-256-GCM with a random IV per value. The IV is prepended to the ciphertext. Since the IV is random, the same plaintext produces different ciphertext on different writes — but this is acceptable because OrbitDB uses LWW (only the latest write matters) and CID dedup applies to the UXF CAR files (which use content-addressed blocks, not the encrypted OrbitDB values).
+
+UXF CAR files on IPFS are also encrypted with the same key before pinning. The CID is computed over the encrypted bytes, so two devices encrypting the same CAR with the same key and same IV-derivation produce the same CID. For CAR files, use a deterministic IV: `IV = HMAC(profileEncryptionKey, carContentHash)[:12]`. This ensures identical CAR content produces identical encrypted bytes and therefore identical CIDs.
 
 ### 9.2 Identity Protection
 
-The `identity.mnemonic` and `identity.masterKey` fields are encrypted with the user-provided password at the application level (consistent with existing `Sphere.init({ password })` behavior). This encryption is independent of UXF — it's the same AES encryption the SDK already uses for mnemonics. The encrypted bytes are stored as-is in OrbitDB.
+The `identity.mnemonic` and `identity.masterKey` fields are encrypted with the user-provided password at the application level (consistent with existing `Sphere.init({ password })` behavior). This encryption is independent of the `profileEncryptionKey` — it's the same AES encryption the SDK already uses for mnemonics. The password-encrypted bytes are then encrypted again with `profileEncryptionKey` before storing in OrbitDB, providing a double layer for these critical fields.
 
 ### 9.3 OrbitDB Access Control
 
-OrbitDB databases are writable only by the identity that created them. The database address is derived from the wallet's secp256k1 key pair. Other peers can replicate (read) the database but cannot write to it. This provides write-protection without encryption.
+OrbitDB databases are writable only by the identity that created them. The database address is derived from the wallet's secp256k1 key pair. Other peers can replicate (read) the database but cannot write to it. Even with read access, peers see only encrypted values — the `profileEncryptionKey` is required to decrypt any content.
 
 ---
 
@@ -712,11 +778,12 @@ OrbitDB databases are writable only by the identity that created them. The datab
 | # | Question | Decision |
 |---|----------|----------|
 | 1 | Cache-only keys in OrbitDB? | **No** — prices and registry cache stay in local storage only. Regenerated from APIs, would bloat OpLog. |
-| 2 | Encryption? | **No encryption in Phase 1.** Encrypting with different keys per device would produce different CIDs for the same content, defeating content-addressed dedup. Encryption deferred to future phase with shared-key model. |
+| 2 | Encryption? | **Shared-key encryption.** All OrbitDB values and UXF CAR files encrypted with `profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)`. All devices with the mnemonic derive the same key. CAR files use deterministic IV to preserve CID dedup. See Section 9.1. |
 | 3 | Migration strategy | **Silent auto-migration** with 6-step flow: sync old IPFS → transform locally → persist to OrbitDB → sanity check → cleanup legacy → done. See Section 7.6. |
 | 4 | Sphere app WalletRepository | **Migrate to ProfileStorageProvider** — separate follow-up task (app-level, not SDK). SDK provides the provider; app migration documented but not blocking. |
 | 5 | OrbitDB bundle size | **Accept the cost.** Replaces ~3,000 lines of custom IPFS sync code. Load via UXF/Profile entry point, lazy-load in browser if needed. |
-| 6 | Offline replication | **Nostr only, no Voyager.** Reuse existing Nostr relay infrastructure. OrbitDB PubSub bridged to Nostr events via thin adapter. |
-| 7 | Consolidation / IPFS cleanup | **Remove from Profile only, do NOT unpin from IPFS.** Superseded bundles removed from `tokens.bundles` after 7-day safety period (configurable, min 24h). IPFS-side GC is a separate future workstream. |
+| 6 | Offline replication | **Nostr as Phase 2 fallback.** Phase 1 uses standard libp2p PubSub + IPFS block exchange. Nostr bridge is complex (requires custom OpLog serialization, causal ordering) — deferred to Phase 2. |
+| 7 | Consolidation / IPFS cleanup | **Remove from Profile only, do NOT unpin from IPFS.** Superseded bundle keys (`tokens.bundle.{CID}`) deleted after 7-day safety period (configurable, min 24h). IPFS-side GC is a separate future workstream. |
 | — | OrbitDB vs raw IPLD DAG | **OrbitDB** — Merkle-CRDTs handle multi-device conflict resolution automatically. |
-| — | Single CID vs multiple bundle CIDs | **Multiple CIDs** — each device appends its own. Lazy consolidation merges over time. |
+| — | Single CID vs multiple bundle CIDs | **Multiple CIDs** — each device writes its own bundle key. Lazy consolidation merges over time. |
+| — | Phase alignment | The Profile architecture advances some Phase 2 concepts (UXF as storage backend). The UXF library itself remains Phase 1-scoped; the Profile layer handles wallet state outside the UXF package. |
