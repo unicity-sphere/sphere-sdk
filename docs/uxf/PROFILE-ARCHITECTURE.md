@@ -51,9 +51,9 @@ These exist once per wallet, regardless of how many HD addresses are derived.
 
 | Key | Value Type | Persistence | Description |
 |-----|-----------|-------------|-------------|
-| `identity.mnemonic` | bytes (encrypted) | IPFS | Encrypted BIP39 mnemonic |
-| `identity.masterKey` | bytes (encrypted) | IPFS | Encrypted master private key |
-| `identity.chainCode` | bytes | IPFS | BIP32 chain code |
+| `identity.mnemonic` | bytes | OrbitDB | BIP39 mnemonic (password-encrypted at application level) |
+| `identity.masterKey` | bytes | OrbitDB | Master private key (password-encrypted at application level) |
+| `identity.chainCode` | bytes | OrbitDB | BIP32 chain code |
 | `identity.derivationPath` | string | IPFS | Full HD derivation path |
 | `identity.basePath` | string | IPFS | Base derivation path |
 | `identity.derivationMode` | string | IPFS | `bip32` / `wif_hmac` / `legacy_hmac` |
@@ -62,16 +62,24 @@ These exist once per wallet, regardless of how many HD addresses are derived.
 | `addresses.tracked` | `TrackedAddress[]` | IPFS | Registry of all derived HD addresses |
 | `addresses.nametags` | `Map<addressId, string>` | IPFS | Nametag cache per address |
 | `tokens.bundles` | `UxfBundleRef[]` | OrbitDB | **Array of UXF bundle references (CIDs) — see Section 2.3** |
-| `tokens.registryCache` | JSON | Cache-only | Token metadata registry (fetched from remote) |
-| `tokens.registryCacheTs` | uint | Cache-only | Registry cache timestamp |
-| `prices.cache` | JSON | Cache-only | Price data from CoinGecko |
-| `prices.cacheTs` | uint | Cache-only | Price cache timestamp |
-| `transport.lastWalletEventTs` | `Map<pubkey, uint>` | IPFS | Last processed Nostr wallet event timestamp per pubkey |
-| `transport.lastDmEventTs` | `Map<pubkey, uint>` | IPFS | Last processed Nostr DM event timestamp per pubkey |
-| `groupchat.relayUrl` | string | IPFS | Last used group chat relay URL |
-| `profile.version` | uint | IPFS | Profile schema version (for migrations) |
-| `profile.createdAt` | uint | IPFS | Profile creation timestamp (seconds) |
-| `profile.updatedAt` | uint | IPFS | Last modification timestamp (seconds) |
+| `transport.lastWalletEventTs` | `Map<pubkey, uint>` | OrbitDB | Last processed Nostr wallet event timestamp per pubkey |
+| `transport.lastDmEventTs` | `Map<pubkey, uint>` | OrbitDB | Last processed Nostr DM event timestamp per pubkey |
+| `groupchat.relayUrl` | string | OrbitDB | Last used group chat relay URL |
+| `profile.version` | uint | OrbitDB | Profile schema version (for migrations) |
+| `profile.createdAt` | uint | OrbitDB | Profile creation timestamp (seconds) |
+| `profile.updatedAt` | uint | OrbitDB | Last modification timestamp (seconds) |
+| `profile.consolidationRetentionMs` | uint | OrbitDB | Safety period before removing superseded bundles (default: 7 days, min: 24h) |
+
+**Cache-only keys (NOT in OrbitDB — local storage only):**
+
+| Key | Value Type | Description |
+|-----|-----------|-------------|
+| `tokens.registryCache` | JSON | Token metadata registry (fetched from remote) |
+| `tokens.registryCacheTs` | uint | Registry cache timestamp |
+| `prices.cache` | JSON | Price data from CoinGecko |
+| `prices.cacheTs` | uint | Price cache timestamp |
+
+These are regenerated from external APIs and are not replicated. Stored in the local `StorageProvider` (IndexedDB/file) as they are today.
 
 ### 2.2 Per-Address Keys
 
@@ -116,14 +124,17 @@ Profile (OrbitDB KV)
 Each `UxfBundleRef`:
 ```typescript
 interface UxfBundleRef {
-  cid: string;              // CID of the UXF CAR file on IPFS
-  status: 'active' | 'superseded' | 'pending-deletion';
-  createdAt: number;        // Unix seconds
-  device?: string;          // Optional device identifier that created this bundle
-  supersededBy?: string;    // CID of the bundle that replaced this one (after consolidation)
-  deleteAfter?: number;     // Unix seconds — safe deletion time (e.g., createdAt + 7 days)
-  tokenCount?: number;      // Number of tokens in this bundle (for quick display)
+  cid: string;                    // CID of the UXF CAR file on IPFS
+  status: 'active' | 'superseded';
+  createdAt: number;              // Unix seconds
+  device?: string;                // Optional device identifier that created this bundle
+  supersededBy?: string;          // CID of the consolidated bundle that includes this one
+  removeFromProfileAfter?: number; // Unix seconds — when to remove this entry from the Profile
+  tokenCount?: number;            // Number of tokens in this bundle (for quick display)
 }
+```
+
+**Important:** Old CIDs are removed from the Profile but are **NOT unpinned from IPFS**. IPFS-side garbage collection is a separate future workstream. The `removeFromProfileAfter` field controls only when the reference is cleaned up from the Profile's `tokens.bundles` array — the CAR file remains pinned on IPFS indefinitely until explicit GC logic is implemented.
 ```
 
 #### Why Multiple Bundles?
@@ -175,8 +186,10 @@ The safety period ensures that any device still referencing the old CIDs has tim
 #### Bundle Lifecycle
 
 ```
-active → superseded (after consolidation) → pending-deletion (after safety period) → deleted (unpinned from IPFS)
+active → superseded (after consolidation) → removed from Profile (after safety period)
 ```
+
+Note: "removed from Profile" means the `UxfBundleRef` entry is deleted from the `tokens.bundles` array. The CAR file remains on IPFS — no unpinning occurs. IPFS-side garbage collection is a separate future concern.
 
 ### 2.4 Operational State (TXF Compatibility)
 
@@ -351,8 +364,8 @@ When two devices write to the same key concurrently, OrbitDB's `keyvalue` type r
 OrbitDB replicates via libp2p:
 
 - **PubSub (real-time):** When peers are online simultaneously, OpLog entries propagate in sub-second via libp2p gossipsub topic `orbitdb/<dbAddress>`
-- **DHT/Relay (cold sync):** When a device comes online after being offline, it discovers peers and fetches missing OpLog entries via IPFS block exchange
-- **Voyager (optional):** OrbitDB's relay service stores OpLog entries for offline peers — acts as a persistent relay. Alternative: use the existing sphere-sdk Nostr relay infrastructure as a fallback replication channel
+- **Nostr relay (persistent store):** OrbitDB OpLog entries are bridged to the existing Nostr relay infrastructure via a thin adapter. This provides persistent storage for OpLog entries — when a device comes online after being offline, it fetches missed entries from the Nostr relay. Reuses the existing `NostrTransportProvider` for both token transport AND profile replication.
+- **DHT (fallback):** Standard IPFS DHT-based peer discovery as a last-resort fallback
 
 ---
 
@@ -588,6 +601,53 @@ Receive:
    c. Flush to IPFS
 ```
 
+### 7.6 Legacy Migration Flow
+
+When `Sphere.init({ profile: true })` is called on a wallet that has legacy-format data (existing IndexedDB/file storage + old-format IPFS inventory), the following migration runs silently:
+
+```
+1. SYNC OLD IPFS DATA FIRST
+   - Resolve existing IPNS name → get latest old-format CID
+   - Fetch old TXF data from IPFS
+   - Merge with local legacy storage (ensures we have the most recent state)
+   - This step MUST complete before transformation begins
+
+2. TRANSFORM LOCAL DATA
+   a. Read all StorageProvider keys → map to Profile key names (Section 5.2)
+   b. Read all TokenStorageProvider tokens (TXF format)
+      → Convert each to ITokenJson via adapter
+      → Ingest all into a single UXF bundle via UxfPackage.ingestAll()
+   c. Collect operational state (_tombstones, _outbox, _sent, _history, etc.)
+      → Write to corresponding Profile per-address keys
+   d. Persist the complete new Profile to local storage (new format)
+
+3. PERSIST TO ORBITDB
+   - Open/create OrbitDB database with wallet identity
+   - Write all Profile keys via db.put()
+   - Pin UXF CAR file to IPFS → record CID in tokens.bundles
+   - Wait for OrbitDB local persistence (OpLog committed to IPFS blockstore)
+
+4. SANITY CHECK (mandatory — blocks until complete)
+   a. Read back all Profile keys from OrbitDB → compare with transformed data
+   b. Fetch UXF CAR from IPFS by CID → UxfPackage.fromCar()
+   c. Assemble all tokens → verify count matches original
+   d. Verify every tokenId from the original inventory exists in the UXF bundle
+   e. Verify operational state (history entries, message counts, pending transfers)
+   f. If ANY check fails: abort migration, keep legacy data, log error, continue
+      with legacy storage (no data loss)
+
+5. CLEANUP (only after step 4 passes completely)
+   a. Remove all legacy-formatted user data from local storage
+      (old IndexedDB entries, old file-based storage)
+   b. Instruct IPFS node to safely unpin ALL versions of old-format inventory
+      (every CID from the first IPNS publication through the latest one)
+   c. The old IPNS name is no longer published to
+
+6. DONE — Profile is the sole storage layer from this point forward
+```
+
+**Idempotency:** If migration is interrupted (app crash, network failure), it restarts from step 1 on next launch. The presence of an OrbitDB profile (step 4 passed previously) skips re-migration.
+
 ---
 
 ## 8. Compatibility Layer
@@ -618,34 +678,32 @@ createBrowserProviders({ network })
   → returns IndexedDBStorageProvider (existing behavior, no change)
 ```
 
-The `profile: true` option enables the IPFS-first persistence model. Without it, the existing local-only behavior is preserved.
+The `profile: true` option enables the OrbitDB/IPFS persistence model. Without it, the existing local-only behavior is preserved.
+
+**Note on Sphere app:** The Sphere web app currently uses `WalletRepository` with raw `localStorage` — a separate, unsynchronized storage layer. Migrating the app to use `ProfileStorageProvider` is a separate follow-up task (app-level change, not SDK change). The SDK provides the `ProfileStorageProvider`; the app migration is documented but not blocked on.
 
 ---
 
 ## 9. Security Considerations
 
-### 9.1 Encryption at Rest
+### 9.1 No Encryption at Rest (Phase 1)
 
-The Profile on IPFS is **encrypted** using a key derived from the wallet's master key:
+**Phase 1: Token materials and profile data are stored unencrypted on IPFS.** This is a deliberate design choice to preserve content-addressed deduplication.
 
-```
-profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)
-```
+**Rationale:** If two devices encrypt the same UXF bundle with different keys, the encrypted bytes differ and produce different CIDs — defeating the fundamental dedup model. The same token stored by two devices must produce the same CID to enable natural deduplication and multi-bundle merging.
 
-Each profile section block is encrypted with AES-256-GCM before IPFS upload. The encrypted blocks are content-addressed (CID of encrypted bytes, not plaintext). Only the wallet holder can decrypt.
+Encryption may be added in future phases using one of these approaches:
+- **Shared key model:** derive a single encryption key from the wallet identity via `HKDF(masterKey, "uxf-encryption", 32)`. All devices with the mnemonic derive the same key → identical plaintext produces identical ciphertext → CID dedup works. This adds complexity but preserves dedup.
+- **Transport-level encryption:** encrypt CAR files during upload/download but store plaintext blocks on IPFS. The IPFS pinning service sees plaintext, but data in transit is protected.
+- **Application-level encryption:** encrypt at the Sphere app layer, above UXF. UXF itself remains unencrypted.
 
-This means:
-- IPFS pinning services see only encrypted blobs
-- Other IPFS users cannot read the profile
-- The encryption key is derived deterministically — any device with the mnemonic can decrypt
+### 9.2 Identity Protection
 
-### 9.2 Identity Block Protection
+The `identity.mnemonic` and `identity.masterKey` fields are encrypted with the user-provided password at the application level (consistent with existing `Sphere.init({ password })` behavior). This encryption is independent of UXF — it's the same AES encryption the SDK already uses for mnemonics. The encrypted bytes are stored as-is in OrbitDB.
 
-The `identity` section (encrypted mnemonic, master key) receives an additional encryption layer with a user-provided password, consistent with existing `Sphere.init({ password })` behavior. Without the password, even the wallet holder cannot decrypt the identity block.
+### 9.3 OrbitDB Access Control
 
-### 9.3 Token Inventory Encryption
-
-The UXF CAR file is encrypted at the CAR level (not per-block) for efficiency. The entire CAR is encrypted with `profileEncryptionKey` before IPFS upload.
+OrbitDB databases are writable only by the identity that created them. The database address is derived from the wallet's secp256k1 key pair. Other peers can replicate (read) the database but cannot write to it. This provides write-protection without encryption.
 
 ---
 
@@ -653,21 +711,12 @@ The UXF CAR file is encrypted at the CAR level (not per-block) for efficiency. T
 
 | # | Question | Decision |
 |---|----------|----------|
-| 5 | OrbitDB vs raw IPLD DAG | **OrbitDB** — Merkle-CRDTs handle multi-device conflict resolution automatically. No manual merge logic. |
-| 3 | Single CID vs multiple bundle CIDs | **Multiple CIDs** — each device appends its own bundle CID. Lazy consolidation merges them over time. Content-addressed dedup ensures no duplication in the merged view. |
-
-## 11. Remaining Open Questions
-
-1. **Should cache-only keys (prices, registry) be stored in OrbitDB at all, or kept entirely in local storage?** They can be regenerated from remote APIs and add bulk to the OrbitDB OpLog.
-
-2. **Should the Profile support selective encryption?** E.g., transaction history encrypted but token inventory not (to enable third-party verification without decryption).
-
-3. **What's the migration strategy for existing wallets?** Should we auto-migrate on first load, or require explicit user action?
-
-4. **What about the Sphere app's `WalletRepository` which uses localStorage directly?** Should the app migrate to use sphere-sdk's ProfileStorageProvider, or keep its own layer?
-
-5. **OrbitDB bundle size in browser (~500KB+ gzipped with libp2p transports).** Is this acceptable for the browser bundle? Should OrbitDB be lazy-loaded, or should we accept the cost since it replaces the existing IPFS sync infrastructure?
-
-6. **Voyager vs Nostr relay for offline replication.** Should we use OrbitDB's Voyager relay service, or reuse the existing sphere-sdk Nostr relay infrastructure as a fallback replication channel for OrbitDB OpLog entries?
-
-7. **Consolidation safety period.** Is 7 days enough before deleting superseded bundles? Should it be configurable?
+| 1 | Cache-only keys in OrbitDB? | **No** — prices and registry cache stay in local storage only. Regenerated from APIs, would bloat OpLog. |
+| 2 | Encryption? | **No encryption in Phase 1.** Encrypting with different keys per device would produce different CIDs for the same content, defeating content-addressed dedup. Encryption deferred to future phase with shared-key model. |
+| 3 | Migration strategy | **Silent auto-migration** with 6-step flow: sync old IPFS → transform locally → persist to OrbitDB → sanity check → cleanup legacy → done. See Section 7.6. |
+| 4 | Sphere app WalletRepository | **Migrate to ProfileStorageProvider** — separate follow-up task (app-level, not SDK). SDK provides the provider; app migration documented but not blocking. |
+| 5 | OrbitDB bundle size | **Accept the cost.** Replaces ~3,000 lines of custom IPFS sync code. Load via UXF/Profile entry point, lazy-load in browser if needed. |
+| 6 | Offline replication | **Nostr only, no Voyager.** Reuse existing Nostr relay infrastructure. OrbitDB PubSub bridged to Nostr events via thin adapter. |
+| 7 | Consolidation / IPFS cleanup | **Remove from Profile only, do NOT unpin from IPFS.** Superseded bundles removed from `tokens.bundles` after 7-day safety period (configurable, min 24h). IPFS-side GC is a separate future workstream. |
+| — | OrbitDB vs raw IPLD DAG | **OrbitDB** — Merkle-CRDTs handle multi-device conflict resolution automatically. |
+| — | Single CID vs multiple bundle CIDs | **Multiple CIDs** — each device appends its own. Lazy consolidation merges over time. |
