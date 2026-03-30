@@ -298,6 +298,10 @@ export class MultiAddressTransportMux {
         onReconnected: (url) => {
           logger.debug('Mux', 'Reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+          // Re-establish subscriptions — the relay drops them on disconnect.
+          this.updateSubscriptions().catch((err) => {
+            logger.error('Mux', 'Failed to re-subscribe after reconnect:', err);
+          });
         },
       });
 

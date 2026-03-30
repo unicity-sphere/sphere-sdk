@@ -258,6 +258,10 @@ export class NostrTransportProvider implements TransportProvider {
         onReconnected: (url) => {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+          // Re-establish subscriptions — the relay drops them on disconnect.
+          this.subscribeToEvents().catch((err) => {
+            logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
+          });
         },
       });
 

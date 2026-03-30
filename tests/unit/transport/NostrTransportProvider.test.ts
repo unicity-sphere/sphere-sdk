@@ -232,6 +232,59 @@ describe('NostrTransportProvider', () => {
 });
 
 // =============================================================================
+// Reconnect Re-subscription Tests
+// =============================================================================
+
+describe('Reconnect re-subscription', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockIsConnected.mockReturnValue(true);
+    mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test']));
+  });
+
+  it('should re-subscribe to events after relay reconnect', async () => {
+    const provider = createProvider(['wss://relay1.test']);
+
+    // Set identity so subscribeToEvents has something to subscribe to
+    provider.setIdentity({
+      privateKey: 'a'.repeat(64),
+      chainPubkey: '02' + 'b'.repeat(64),
+      l1Address: 'alpha1test',
+      directAddress: 'DIRECT://test',
+    });
+
+    await provider.connect();
+
+    // Capture the connection listener registered during connect()
+    expect(mockAddConnectionListener).toHaveBeenCalled();
+    const listener = mockAddConnectionListener.mock.calls[0][0];
+
+    // subscribe was called during initial connect (subscribeToEvents)
+    const subscribeCalls = mockSubscribe.mock.calls.length;
+
+    // Simulate relay reconnect
+    listener.onReconnected('wss://relay1.test');
+
+    // Wait for the async re-subscription
+    await vi.waitFor(() => {
+      expect(mockSubscribe.mock.calls.length).toBeGreaterThan(subscribeCalls);
+    });
+  });
+
+  it('should not throw if reconnect happens without identity', async () => {
+    const provider = createProvider(['wss://relay1.test']);
+
+    // Connect without identity
+    await provider.connect();
+
+    const listener = mockAddConnectionListener.mock.calls[0][0];
+
+    // Should not throw — subscribeToEvents exits early without identity
+    expect(() => listener.onReconnected('wss://relay1.test')).not.toThrow();
+  });
+});
+
+// =============================================================================
 // Nametag Format Tests
 // =============================================================================
 
