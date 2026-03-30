@@ -251,6 +251,9 @@ export interface ProfileDatabase {
    * Returns an unsubscribe function.
    */
   onReplication(callback: () => void): () => void;
+
+  /** Whether `connect()` has been called and `close()` has not. */
+  isConnected(): boolean;
 }
 
 // =============================================================================
@@ -383,3 +386,24 @@ export const CACHE_ONLY_KEYS: ReadonlySet<string> = new Set([
  * (After prefix stripping: ipfs_seq_*, ipfs_cid_*, ipfs_ver_*)
  */
 export const IPFS_STATE_KEYS_PATTERN: RegExp = /^ipfs_(seq|cid|ver)_/;
+
+// =============================================================================
+// Address ID Utility
+// =============================================================================
+
+/**
+ * Compute a short address ID from a DIRECT:// address string.
+ * Format: `DIRECT_{first6}_{last6}` (lowercase hex).
+ *
+ * This matches the address ID format used by sphere-sdk's storage layer
+ * for per-address key scoping.
+ *
+ * @param directAddress - A DIRECT:// address (e.g. `DIRECT://AABBCC...DDEEFF`)
+ * @returns Short address ID (e.g. `DIRECT_aabbcc_ddeeff`)
+ */
+export function computeAddressId(directAddress: string): string {
+  const clean = directAddress.replace('DIRECT://', '');
+  const first6 = clean.slice(0, 6).toLowerCase();
+  const last6 = clean.slice(-6).toLowerCase();
+  return `DIRECT_${first6}_${last6}`;
+}

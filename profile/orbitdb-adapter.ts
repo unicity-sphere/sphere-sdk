@@ -11,90 +11,12 @@
  * @module profile/orbitdb-adapter
  */
 
-// ---------------------------------------------------------------------------
-// Error class -- minimal inline definition.
-// If profile/errors.ts is created by another agent, this can be replaced with
-// an import. The code and format mirror UxfError from uxf/errors.ts.
-// ---------------------------------------------------------------------------
+import { ProfileError } from './errors.js';
+import type { OrbitDbConfig, ProfileDatabase } from './types.js';
 
-/** Error codes specific to the Profile module. */
-export type ProfileErrorCode =
-  | 'PROFILE_NOT_INITIALIZED'
-  | 'ORBITDB_NOT_INSTALLED'
-  | 'ORBITDB_WRITE_FAILED'
-  | 'ORBITDB_READ_FAILED'
-  | 'ORBITDB_CONNECTION_FAILED'
-  | 'BUNDLE_NOT_FOUND'
-  | 'MIGRATION_FAILED'
-  | 'ENCRYPTION_FAILED'
-  | 'DECRYPTION_FAILED';
-
-/**
- * Structured error for Profile operations.
- * Formats as `[PROFILE:<CODE>] <message>` for easy log filtering.
- */
-export class ProfileError extends Error {
-  constructor(
-    readonly code: ProfileErrorCode,
-    message: string,
-    readonly cause?: unknown,
-  ) {
-    super(`[PROFILE:${code}] ${message}`);
-    this.name = 'ProfileError';
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
-/**
- * Configuration for connecting to the OrbitDB-backed Profile database.
- *
- * @see PROFILE-ARCHITECTURE.md Section 4.1 (Database Identity)
- */
-export interface OrbitDbConfig {
-  /** Wallet private key (hex) for OrbitDB identity derivation. */
-  readonly privateKey: string;
-  /** Local storage directory for OrbitDB/IPFS data (Node.js only). */
-  readonly directory?: string;
-  /** libp2p bootstrap peer multiaddrs. */
-  readonly bootstrapPeers?: string[];
-  /** Enable libp2p PubSub for real-time replication (default: true). */
-  readonly enablePubSub?: boolean;
-}
-
-/**
- * Promise-based interface for the Profile's OrbitDB key-value database.
- *
- * All values are opaque `Uint8Array` blobs -- encryption/decryption is handled
- * by the caller (ProfileStorageProvider / ProfileTokenStorageProvider).
- */
-export interface ProfileDatabase {
-  /** Open (or create) the database. Must be called before any other method. */
-  connect(config: OrbitDbConfig): Promise<void>;
-  /** Write a value. Throws `ProfileError` if not connected. */
-  put(key: string, value: Uint8Array): Promise<void>;
-  /** Read a value. Returns `null` if the key does not exist. */
-  get(key: string): Promise<Uint8Array | null>;
-  /** Delete a key. No-op if the key does not exist. */
-  del(key: string): Promise<void>;
-  /**
-   * Return all entries, optionally filtered by a key prefix.
-   * Used for listing `tokens.bundle.*` keys (Section 2.3).
-   */
-  all(prefix?: string): Promise<Map<string, Uint8Array>>;
-  /** Cleanly shut down the database, OrbitDB instance, and Helia/libp2p. */
-  close(): Promise<void>;
-  /**
-   * Subscribe to OrbitDB replication events (Section 4.4).
-   * The callback fires when remote entries are merged into the local database.
-   * @returns An unsubscribe function.
-   */
-  onReplication(callback: () => void): () => void;
-  /** Whether `connect()` has been called and `close()` has not. */
-  isConnected(): boolean;
-}
+// Re-export types so existing consumers that import from this module still work
+export type { OrbitDbConfig, ProfileDatabase };
+export { ProfileError };
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -181,7 +103,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       // 3. Derive deterministic database name from wallet pubkey
       //    Section 4.1: sphere-profile-<first 16 hex chars of pubkey>
-      const publicKeyShort = derivePublicKeyShort(config.privateKey);
+      const publicKeyShort = await derivePublicKeyShort(config.privateKey);
       const dbName = `sphere-profile-${publicKeyShort}`;
 
       // 4. Open (or create) the keyvalue database with access control
@@ -321,7 +243,16 @@ export class OrbitDbAdapter implements ProfileDatabase {
       return; // idempotent
     }
 
-    // Clear all replication listeners
+    // Unsubscribe all replication listeners before closing the database
+    if (this.db?.events?.off) {
+      for (const handler of this.replicationListeners) {
+        try {
+          this.db.events.off('update', handler);
+        } catch {
+          // best-effort cleanup
+        }
+      }
+    }
     this.replicationListeners.clear();
 
     try {
@@ -431,40 +362,36 @@ export class OrbitDbAdapter implements ProfileDatabase {
  * private key hex string. Used to build the deterministic database name:
  * `sphere-profile-<publicKeyShort>`.
  *
- * This performs a lightweight hex-substring extraction. The actual secp256k1
- * public key derivation would require the `@noble/curves` or `elliptic`
- * library at runtime. Because this adapter runs in contexts where those
- * libraries are always present (they are core sphere-sdk dependencies), we
- * attempt a dynamic import of `@noble/curves/secp256k1` first, falling back
- * to using the first 16 hex chars of the private key as a stable identifier
- * (the private key is unique per wallet, so the database name remains
- * deterministic and collision-free).
+ * Uses `@noble/curves/secp256k1` (a mandatory sphere-sdk dependency) to
+ * derive the compressed public key. Falls back to SHA-256 hashing of the
+ * private key via `@noble/hashes` if curves is unavailable for any reason.
+ * Both packages are required sphere-sdk dependencies -- if neither is
+ * present the function throws rather than leaking private key material.
  */
-function derivePublicKeyShort(privateKeyHex: string): string {
-  // Attempt to derive the actual compressed public key from the private key.
-  // This is best-effort -- if @noble/curves is available (it is a core
-  // sphere-sdk dependency), we use it synchronously.
+async function derivePublicKeyShort(privateKeyHex: string): Promise<string> {
+  // Primary: derive the actual compressed public key via @noble/curves
   try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const secp256k1 = require('@noble/curves/secp256k1');
-    const pubKeyBytes: Uint8Array = secp256k1.secp256k1.getPublicKey(privateKeyHex, true);
+    // Dynamic import with type suppression -- @noble/curves is a mandatory
+    // sphere-sdk dependency but may not have type declarations in this context
+    const secp256k1Module: any = await import('@noble/curves/secp256k1' as string);
+    const pubKeyBytes: Uint8Array = secp256k1Module.secp256k1.getPublicKey(privateKeyHex, true);
     return bytesToHex(pubKeyBytes).slice(0, 16);
   } catch {
-    // Fallback: use hash of private key to avoid leaking raw key material.
-    // In practice, @noble/curves is always available in sphere-sdk.
-    // We hash to avoid exposing the private key prefix in the database name.
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { sha256 } = require('@noble/hashes/sha256');
-      const hash = sha256(hexToBytes(privateKeyHex));
-      return bytesToHex(hash).slice(0, 16);
-    } catch {
-      // Last resort: truncate the private key hex. This is acceptable because
-      // the database name is not secret (OrbitDB addresses are public), and
-      // 16 hex chars of a 64-char key reveal limited entropy.
-      return privateKeyHex.slice(0, 16);
-    }
+    // Fallback: use SHA-256 hash of private key to avoid leaking raw key material
   }
+
+  try {
+    const hashModule: any = await import('@noble/hashes/sha256' as string);
+    const hash: Uint8Array = hashModule.sha256(hexToBytes(privateKeyHex));
+    return bytesToHex(hash).slice(0, 16);
+  } catch {
+    // Both mandatory dependencies are missing
+  }
+
+  throw new ProfileError(
+    'ORBITDB_CONNECTION_FAILED',
+    'Cannot derive public key: @noble/curves and @noble/hashes are required',
+  );
 }
 
 /**

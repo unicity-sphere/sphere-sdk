@@ -44,6 +44,7 @@ export {
   PROFILE_KEY_MAPPING,
   CACHE_ONLY_KEYS,
   IPFS_STATE_KEYS_PATTERN,
+  computeAddressId,
 } from './types';
 
 // =============================================================================

@@ -39,9 +39,10 @@ import type {
   StorageEvent,
   HistoryRecord,
 } from '../storage/storage-provider.js';
-import type {
-  UxfBundleRef,
-  ProfileTokenStorageProviderOptions,
+import {
+  type UxfBundleRef,
+  type ProfileTokenStorageProviderOptions,
+  computeAddressId,
 } from './types.js';
 import type { ProfileDatabase } from './orbitdb-adapter.js';
 import { ProfileError } from './errors.js';
@@ -123,6 +124,12 @@ export class ProfileTokenStorageProvider
   // --- Last loaded data (for sync diffing) ---
   private lastLoadedData: TxfStorageDataBase | null = null;
 
+  // --- Computed short address ID ---
+  private addressId: string | null = null;
+
+  // --- Last pinned CID for flush retry (Fix 8) ---
+  private lastPinnedCid: string | null = null;
+
   // --- Config storage for createForAddress ---
   private readonly _db: ProfileDatabase;
   private readonly _encryptionKeyRaw: Uint8Array | null;
@@ -182,6 +189,11 @@ export class ProfileTokenStorageProvider
       } catch (err) {
         this.log(`Failed to derive encryption key: ${err instanceof Error ? err.message : String(err)}`);
       }
+    }
+
+    // Compute the short address ID for per-address key scoping
+    if (identity.directAddress) {
+      this.addressId = computeAddressId(identity.directAddress);
     }
   }
 
@@ -346,7 +358,13 @@ export class ProfileTokenStorageProvider
       for (const [cid] of activeBundles) {
         try {
           const carBytes = await this.fetchCar(cid);
-          const decryptedCar = await decryptProfileValue(this.encryptionKey!, carBytes);
+          if (!this.encryptionKey) {
+            throw new ProfileError(
+              'PROFILE_NOT_INITIALIZED',
+              'Encryption key not derived — call setIdentity() first',
+            );
+          }
+          const decryptedCar = await decryptProfileValue(this.encryptionKey, carBytes);
           const pkg = await UxfPackage.fromCar(decryptedCar);
           mergedPkg.merge(pkg);
         } catch (err) {
@@ -527,12 +545,16 @@ export class ProfileTokenStorageProvider
     }
   }
 
-  createForAddress(): ProfileTokenStorageProvider {
+  createForAddress(addressId?: string): ProfileTokenStorageProvider {
+    const resolvedAddressId = addressId ?? this.getAddressId();
+    const options: ProfileTokenStorageProviderOptions | undefined = this._options
+      ? { ...this._options, addressId: resolvedAddressId }
+      : undefined;
     return new ProfileTokenStorageProvider(
       this._db,
       this._encryptionKeyRaw,
       this._ipfsGateways,
-      this._options,
+      options,
     );
   }
 
@@ -675,10 +697,22 @@ export class ProfileTokenStorageProvider
       const carBytes = await pkg.toCar();
 
       // 4. Encrypt
-      const encryptedCar = await encryptProfileValue(this.encryptionKey!, carBytes);
+      if (!this.encryptionKey) {
+        throw new ProfileError(
+          'PROFILE_NOT_INITIALIZED',
+          'Encryption key not derived — call setIdentity() first',
+        );
+      }
+      const encryptedCar = await encryptProfileValue(this.encryptionKey, carBytes);
 
-      // 5. Pin to IPFS
-      const cid = await this.pinCar(encryptedCar);
+      // 5. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
+      let cid: string;
+      if (this.lastPinnedCid) {
+        cid = this.lastPinnedCid;
+      } else {
+        cid = await this.pinCar(encryptedCar);
+        this.lastPinnedCid = cid;
+      }
 
       // 6. Write bundle ref to OrbitDB
       const bundleRef: UxfBundleRef = {
@@ -691,6 +725,9 @@ export class ProfileTokenStorageProvider
 
       // 7. Write operational state to OrbitDB
       await this.writeOperationalState(opState);
+
+      // Clear the pinned CID tracker after successful OrbitDB write
+      this.lastPinnedCid = null;
 
       // 8. Check consolidation
       if (await this.shouldConsolidate()) {
@@ -790,8 +827,10 @@ export class ProfileTokenStorageProvider
 
   /**
    * Extract token entries from TxfStorageDataBase.
-   * Token keys start with `_` and contain a genesis property (or similar
-   * token-like structure). We identify them by excluding known operational keys.
+   * Token keys include:
+   * - Keys starting with `_` (standard tokens, excluding operational keys)
+   * - Keys starting with `archived-` (archived tokens)
+   * - Keys starting with `_forked_` (forked tokens — also caught by `_` prefix)
    */
   private extractTokensFromTxfData(
     data: TxfStorageDataBase,
@@ -809,12 +848,21 @@ export class ProfileTokenStorageProvider
     ]);
 
     for (const key of Object.keys(data)) {
-      if (!key.startsWith('_')) continue;
-      if (operationalKeys.has(key)) continue;
+      // Standard token keys start with `_` (includes `_forked_` tokens)
+      if (key.startsWith('_') && !operationalKeys.has(key)) {
+        const value = (data as unknown as Record<string, unknown>)[key];
+        if (value && typeof value === 'object') {
+          tokens.set(key, value);
+        }
+        continue;
+      }
 
-      const value = (data as unknown as Record<string, unknown>)[key];
-      if (value && typeof value === 'object') {
-        tokens.set(key, value);
+      // Archived tokens start with `archived-`
+      if (key.startsWith('archived-')) {
+        const value = (data as unknown as Record<string, unknown>)[key];
+        if (value && typeof value === 'object') {
+          tokens.set(key, value);
+        }
       }
     }
 
@@ -1110,13 +1158,16 @@ export class ProfileTokenStorageProvider
 
   /**
    * Get the address ID for per-address key scoping.
+   * Returns the computed short address ID (DIRECT_xxxxxx_yyyyyy format),
+   * falling back to the options addressId or 'default'.
    */
   private getAddressId(): string {
-    return this.options?.addressId ?? this.identity?.directAddress ?? 'default';
+    return this.addressId ?? this.options?.addressId ?? 'default';
   }
 
   /**
    * Extract token IDs from a TxfStorageDataBase for diffing.
+   * Includes standard tokens (`_`-prefixed), archived (`archived-`), and forked (`_forked_`).
    */
   private extractTokenIds(data: TxfStorageDataBase): string[] {
     const ids: string[] = [];
@@ -1127,6 +1178,8 @@ export class ProfileTokenStorageProvider
 
     for (const key of Object.keys(data)) {
       if (key.startsWith('_') && !operationalKeys.has(key)) {
+        ids.push(key);
+      } else if (key.startsWith('archived-')) {
         ids.push(key);
       }
     }

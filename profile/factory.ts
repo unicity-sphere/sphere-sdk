@@ -79,9 +79,11 @@ export function createProfileProviders(
   // Create ProfileTokenStorageProvider
   // The encryption key is null at construction time — it will be derived
   // when setIdentity() is called on the storage provider.
+  // Note: addressId is intentionally omitted here. It will be computed
+  // automatically when setIdentity() is called on the provider.
   const tokenStorageOptions: ProfileTokenStorageProviderOptions = {
     config: resolvedConfig,
-    addressId: '', // Will be set when setIdentity() is called
+    addressId: 'default',
     encrypt: resolvedConfig.encrypt !== false,
     flushDebounceMs: resolvedConfig.flushDebounceMs,
     debug: resolvedConfig.debug,

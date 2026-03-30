@@ -48,9 +48,12 @@ const KEY_LENGTH = 32;
  * @param masterKey - Raw master key bytes (typically 32 bytes from BIP32)
  * @returns 32-byte derived encryption key
  */
+/** Domain-specific salt for HKDF key derivation. */
+const PROFILE_HKDF_SALT = new TextEncoder().encode('sphere-profile-v1');
+
 export function deriveProfileEncryptionKey(masterKey: Uint8Array): Uint8Array {
   const info = new TextEncoder().encode(PROFILE_HKDF_INFO);
-  return hkdf(sha256, masterKey, undefined, info, KEY_LENGTH);
+  return hkdf(sha256, masterKey, PROFILE_HKDF_SALT, info, KEY_LENGTH);
 }
 
 // =============================================================================
