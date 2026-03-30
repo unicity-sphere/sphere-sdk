@@ -407,9 +407,10 @@ export class MultiAddressTransportMux {
    * Called whenever addresses are added/removed.
    */
   private async updateSubscriptions(): Promise<void> {
-    if (!this.nostrClient || this.addresses.size === 0) return;
+    if (!this.nostrClient) return;
 
-    // Unsubscribe existing
+    // Always unsubscribe stale IDs first — the relay drops server-side
+    // subscriptions on disconnect, so these IDs are dead after reconnect.
     if (this.walletSubscriptionId) {
       this.nostrClient.unsubscribe(this.walletSubscriptionId);
       this.walletSubscriptionId = null;
@@ -418,6 +419,9 @@ export class MultiAddressTransportMux {
       this.nostrClient.unsubscribe(this.chatSubscriptionId);
       this.chatSubscriptionId = null;
     }
+
+    // Nothing to subscribe to if no addresses registered
+    if (this.addresses.size === 0) return;
 
     // Collect all pubkeys
     const allPubkeys: string[] = [];
