@@ -659,7 +659,9 @@ describe('Last event timestamp persistence', () => {
       const [chatFilterArg] = mockSubscribe.mock.calls[1];
       const chatFilter = chatFilterArg.toJSON();
       expect(chatFilter.kinds).toContain(1059); // GIFT_WRAP
-      expect(chatFilter.since).toBe(1699999000);
+      // since = stored timestamp - NIP-17 randomization window (±2 days)
+      const TWO_DAYS = 2 * 24 * 60 * 60;
+      expect(chatFilter.since).toBe(1699999000 - TWO_DAYS);
     });
 
     it('should read storage key based on nostr pubkey prefix', async () => {

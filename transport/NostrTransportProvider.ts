@@ -1853,7 +1853,10 @@ export class NostrTransportProvider implements TransportProvider {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = [nostrPubkey];
-    chatFilter.since = dmSince;
+    // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
+    // Without this offset, ~50% of messages are silently dropped by the relay
+    // because their randomized timestamp lands before the `since` filter.
+    chatFilter.since = dmSince - TIMESTAMP_RANDOMIZATION;
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {

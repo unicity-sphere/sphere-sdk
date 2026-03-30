@@ -26,6 +26,10 @@ import {
 } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+
+// NIP-17 gift wrap timestamp randomization window (±2 days in seconds).
+// Must match the window used when creating gift wraps.
+const TIMESTAMP_RANDOMIZATION = 2 * 24 * 60 * 60;
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
   TransportProvider,
@@ -484,7 +488,10 @@ export class MultiAddressTransportMux {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = allPubkeys;
-    chatFilter.since = globalDmSince;
+    // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
+    // Without this offset, ~50% of messages are silently dropped by the relay
+    // because their randomized timestamp lands before the `since` filter.
+    chatFilter.since = globalDmSince - TIMESTAMP_RANDOMIZATION;
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
