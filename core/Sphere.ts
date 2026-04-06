@@ -3288,6 +3288,37 @@ export class Sphere {
     return this._transport.resolve?.(identifier) ?? null;
   }
 
+  /**
+   * Pre-resolve a Unicity address for DM delivery.
+   *
+   * Warms the CommunicationsModule's internal resolution cache so that
+   * subsequent sendDM() calls to this address avoid the network round-trip.
+   * Useful before a batch of DM operations (e.g., sending hello_ack to
+   * multiple tenants, or broadcasting to a list of agents).
+   *
+   * Also useful for validating that an address is resolvable before
+   * attempting a DM send.
+   *
+   * @param address - Any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
+   * @throws SphereError if the address cannot be resolved
+   *
+   * @example
+   * ```ts
+   * // Warm cache before sending multiple messages
+   * await sphere.preResolveDM(tenantAddress);
+   * await sphere.preResolveDM(escrowAddress);
+   *
+   * // These sendDM calls use the cache — no extra resolution latency
+   * await sphere.communications.sendDM(tenantAddress, msg1);
+   * await sphere.communications.sendDM(tenantAddress, msg2);
+   * await sphere.communications.sendDM(escrowAddress, msg3);
+   * ```
+   */
+  async preResolveDM(address: string): Promise<void> {
+    this.ensureReady();
+    await this._communications.preResolve(address);
+  }
+
   /** Compute and cache the PROXY address from the current nametag */
   private async _updateCachedProxyAddress(): Promise<void> {
     const nametag = this._identity?.nametag;
