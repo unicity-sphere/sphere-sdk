@@ -22,7 +22,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.14.0'
           registry-url: 'https://registry.npmjs.org'
 
 
@@ -55,7 +55,7 @@ jobs:
           fi
 
       - name: Upgrade npm for OIDC trusted publishing
-        run: npm install -g npm@11.3.0
+        run: npm install -g npm@latest
 
       - name: Publish to npm
         run: npm publish --access public --tag ${{ steps.dist-tag.outputs.tag }}
