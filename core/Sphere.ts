@@ -191,6 +191,8 @@ export interface SphereCreateOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -230,6 +232,8 @@ export interface SphereLoadOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
@@ -277,6 +281,8 @@ export interface SphereImportOptions {
   groupChat?: GroupChatModuleConfig | boolean;
   /** Market module configuration. true = enable with defaults, object = custom config. */
   market?: MarketModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
