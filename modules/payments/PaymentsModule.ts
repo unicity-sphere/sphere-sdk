@@ -662,6 +662,9 @@ export interface PaymentsModuleDependencies {
   price?: PriceProvider;
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
   disabledProviderIds?: ReadonlySet<string>;
+  /** Shared transport address resolver (from CommunicationsModule). When provided,
+   *  PaymentsModule uses it for transport pubkey resolution (cached, no duplication). */
+  transportResolver?: import('../../core/transport-resolver').TransportAddressResolver;
 }
 
 // =============================================================================
@@ -1090,9 +1093,18 @@ export class PaymentsModule {
     const committedOnChainTokenIds = new Set<string>();
 
     try {
-      // Resolve recipient once — single network query
-      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
-      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      // Resolve recipient: use shared TransportAddressResolver (cached) when available,
+      // fall back to direct transport.resolve() for backward compatibility.
+      let peerInfo: PeerInfo | null = null;
+      let recipientPubkey: string;
+      if (this.deps!.transportResolver) {
+        const resolved = await this.deps!.transportResolver.resolve(request.recipient);
+        recipientPubkey = resolved.pubkey;
+        peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      } else {
+        peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+        recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      }
       const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
       // Create signing service
@@ -1670,9 +1682,18 @@ export class PaymentsModule {
     let tokenToSplitRef: Token | undefined;
 
     try {
-      // Resolve recipient once — single network query
-      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
-      const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      // Resolve recipient: use shared TransportAddressResolver (cached) when available,
+      // fall back to direct transport.resolve() for backward compatibility.
+      let peerInfo: PeerInfo | null = null;
+      let recipientPubkey: string;
+      if (this.deps!.transportResolver) {
+        const resolved = await this.deps!.transportResolver.resolve(request.recipient);
+        recipientPubkey = resolved.pubkey;
+        peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      } else {
+        peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+        recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+      }
       const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
       // Create signing service
@@ -4916,7 +4937,7 @@ export class PaymentsModule {
    * Uses pre-resolved PeerInfo if available, otherwise resolves via transport.
    */
   private resolveTransportPubkey(recipient: string, peerInfo?: PeerInfo | null): string {
-    // If we have PeerInfo, use it
+    // If we already have PeerInfo from a prior resolve() call, use it directly
     if (peerInfo?.transportPubkey) {
       return peerInfo.transportPubkey;
     }

@@ -5,6 +5,7 @@
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { createTransportAddressResolver, type TransportAddressResolver } from '../../core/transport-resolver';
 import type {
   DirectMessage,
   BroadcastMessage,
@@ -85,20 +86,8 @@ export class CommunicationsModule {
   // Timestamp of module initialization — messages older than this are historical
   private initializedAt: number = 0;
 
-  /**
-   * Transport address resolution cache.
-   *
-   * Maps Unicity addresses (DIRECT://, PROXY://, @nametag, compressed pubkey)
-   * to resolved transport-level pubkeys. Avoids redundant network round-trips
-   * when sending multiple DMs to the same recipient.
-   *
-   * Cache entries have a TTL (default 5 minutes) to handle key rotations
-   * and nametag transfers. The cache is per-module-instance and cleared on
-   * destroy().
-   */
-  private resolveCache: Map<string, { pubkey: string; nametag?: string; expiresAt: number }> = new Map();
-  private static readonly RESOLVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-  private static readonly RESOLVE_CACHE_MAX_SIZE = 1000;
+  /** Shared transport address resolver (with cache). Created during initialize(). */
+  private transportResolver: TransportAddressResolver | null = null;
 
   constructor(config?: CommunicationsModuleConfig) {
     this.config = {
@@ -123,6 +112,9 @@ export class CommunicationsModule {
 
     this.deps = deps;
     this.initializedAt = Date.now();
+
+    // Create shared transport address resolver (used by sendDM, sendComposingIndicator, etc.)
+    this.transportResolver = createTransportAddressResolver(deps.transport);
 
     // Subscribe to incoming messages
     this.unsubscribeMessages = deps.transport.onMessage((msg) => {
@@ -715,113 +707,23 @@ export class CommunicationsModule {
 
   /**
    * Resolve a Unicity address to a transport-level pubkey for DM delivery.
-   *
-   * Accepts any valid Unicity address format:
-   *   - @nametag          → resolves via nametag binding
-   *   - DIRECT://...      → resolves via address binding lookup
-   *   - PROXY://...       → resolves via address binding lookup
-   *   - 02/03 + 64 hex   → compressed secp256k1 key (converted to x-only)
-   *   - 64 hex chars      → x-only pubkey (pass-through)
-   *
-   * Results are cached (TTL: 5 minutes, max 1000 entries) to avoid
-   * redundant network round-trips when sending multiple DMs to the
-   * same recipient.
-   *
-   * This method is also exposed publicly as preResolve() for callers
-   * who want to warm the cache before a batch of DM operations.
+   * Delegates to the shared TransportAddressResolver (with cache).
    */
   private async resolveRecipient(recipient: string): Promise<{ pubkey: string; nametag?: string }> {
-    // Check cache first
-    const cached = this.resolveCache.get(recipient);
-    if (cached && cached.expiresAt > Date.now()) {
-      return { pubkey: cached.pubkey, nametag: cached.nametag };
+    if (!this.transportResolver) {
+      throw new SphereError('CommunicationsModule not initialized', 'NOT_INITIALIZED');
     }
-
-    const result = await this.resolveRecipientUncached(recipient);
-
-    // Populate cache (evict oldest if at capacity)
-    if (this.resolveCache.size >= CommunicationsModule.RESOLVE_CACHE_MAX_SIZE) {
-      // Evict first entry (oldest insertion — Map preserves insertion order)
-      const firstKey = this.resolveCache.keys().next().value;
-      if (firstKey !== undefined) this.resolveCache.delete(firstKey);
-    }
-    this.resolveCache.set(recipient, {
-      pubkey: result.pubkey,
-      nametag: result.nametag,
-      expiresAt: Date.now() + CommunicationsModule.RESOLVE_CACHE_TTL_MS,
-    });
-
-    return result;
-  }
-
-  /** Uncached resolution — performs the actual transport lookups. */
-  private async resolveRecipientUncached(recipient: string): Promise<{ pubkey: string; nametag?: string }> {
-    // @nametag — resolve via nametag binding
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
-      if (!pubkey) {
-        throw new SphereError(`Unicity ID not found: ${recipient}`, 'INVALID_RECIPIENT');
-      }
-      return { pubkey, nametag };
-    }
-
-    // DIRECT:// or PROXY:// addresses — resolve via transport to get the
-    // transport-level pubkey. This abstracts away the difference between
-    // Unicity predicate addresses and transport-specific keys.
-    if (recipient.startsWith('DIRECT://') || recipient.startsWith('PROXY://')) {
-      // Try transport.resolve() first (handles all address formats)
-      if (this.deps!.transport.resolve) {
-        const peerInfo = await this.deps!.transport.resolve(recipient);
-        if (peerInfo?.transportPubkey) {
-          return { pubkey: peerInfo.transportPubkey, nametag: peerInfo.nametag };
-        }
-      }
-      // Fallback: try resolveAddressInfo() (more specific)
-      if (this.deps!.transport.resolveAddressInfo) {
-        const peerInfo = await this.deps!.transport.resolveAddressInfo(recipient);
-        if (peerInfo?.transportPubkey) {
-          return { pubkey: peerInfo.transportPubkey, nametag: peerInfo.nametag };
-        }
-      }
-      // Last resort: strip the prefix and try to use the raw value as a key.
-      const prefix = recipient.startsWith('DIRECT://') ? 'DIRECT://' : 'PROXY://';
-      let raw = recipient.slice(prefix.length);
-      if (raw.length === 0) {
-        throw new SphereError(`Invalid ${prefix} address: empty value`, 'INVALID_RECIPIENT');
-      }
-      // Convert compressed (33-byte, 66 hex) to x-only (32-byte, 64 hex)
-      if (raw.length === 66 && (raw.startsWith('02') || raw.startsWith('03'))) {
-        raw = raw.slice(2);
-      }
-      if (raw.length === 64 && /^[0-9a-f]+$/i.test(raw)) {
-        return { pubkey: raw };
-      }
-      throw new SphereError(
-        `Cannot resolve ${prefix} address to transport pubkey. ` +
-        `Ensure the recipient has a registered Unicity ID (nametag).`,
-        'INVALID_RECIPIENT',
-      );
-    }
-
-    // Bare hex pubkey — convert compressed (33-byte) to x-only (32-byte).
-    let pubkey = recipient;
-    if (pubkey.length === 66 && (pubkey.startsWith('02') || pubkey.startsWith('03'))) {
-      pubkey = pubkey.slice(2);
-    }
-    return { pubkey };
+    return this.transportResolver.resolve(recipient);
   }
 
   /**
-   * Pre-resolve a Unicity address to warm the internal cache.
+   * Pre-resolve a Unicity address to warm the transport address cache.
    *
-   * Call this before a batch of DM operations to the same recipient
-   * to avoid the resolution latency on the first sendDM() call.
-   * Subsequent sendDM() calls to the same address will use the cache.
+   * Call before a batch of DM operations to avoid resolution latency
+   * on the first sendDM() call. Subsequent calls use the cache.
    *
    * @param address - Any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
-   * @returns The resolved transport pubkey (caller should NOT use this directly —
-   *          it's transport-specific. Use sendDM() with the original Unicity address.)
+   * @returns The resolved transport pubkey (caller should NOT use this — it's transport-specific)
    */
   async preResolve(address: string): Promise<string> {
     this.ensureInitialized();
@@ -830,15 +732,19 @@ export class CommunicationsModule {
   }
 
   /**
-   * Invalidate the resolution cache for a specific address.
+   * Invalidate the resolution cache for a specific address or all entries.
    * Use after a known key rotation or nametag transfer.
    */
   invalidateResolveCache(address?: string): void {
-    if (address) {
-      this.resolveCache.delete(address);
-    } else {
-      this.resolveCache.clear();
-    }
+    this.transportResolver?.invalidateCache(address);
+  }
+
+  /**
+   * Get the shared transport address resolver (for use by other modules
+   * that need the same resolution + caching, e.g., PaymentsModule).
+   */
+  getTransportResolver(): TransportAddressResolver | null {
+    return this.transportResolver;
   }
 
   private ensureInitialized(): void {
