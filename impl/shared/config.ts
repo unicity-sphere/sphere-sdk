@@ -157,8 +157,8 @@ export interface BaseProviders {
   tokenStorage: TokenStorageProvider<TxfStorageDataBase>;
   transport: TransportProvider;
   oracle: OracleProvider;
-  /** L1 configuration (for passing to Sphere.init) */
-  l1?: L1Config;
+  /** L1 configuration (for passing to Sphere.init). Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Price provider (optional — enables fiat value display) */
   price?: PriceProvider;
 }

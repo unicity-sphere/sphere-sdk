@@ -63,6 +63,7 @@ import type { OracleProvider } from '../oracle';
 import type { PriceProvider } from '../price';
 import { PaymentsModule, createPaymentsModule } from '../modules/payments';
 import { CommunicationsModule, createCommunicationsModule } from '../modules/communications';
+import type { CommunicationsModuleConfig } from '../modules/communications';
 import { GroupChatModule, createGroupChatModule } from '../modules/groupchat';
 import type { GroupChatModuleConfig } from '../modules/groupchat';
 import { MarketModule, createMarketModule } from '../modules/market';
@@ -180,8 +181,8 @@ export interface SphereCreateOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -198,6 +199,8 @@ export interface SphereCreateOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic is stored as plaintext. */
   password?: string;
   /**
@@ -223,8 +226,8 @@ export interface SphereLoadOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -241,6 +244,8 @@ export interface SphereLoadOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to decrypt the wallet. Must match the password used during creation. */
   password?: string;
   /**
@@ -280,8 +285,8 @@ export interface SphereImportOptions {
   transport: TransportProvider;
   /** Oracle provider instance */
   oracle: OracleProvider;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /** Group chat configuration (NIP-29). Omit to disable groupchat. */
@@ -292,6 +297,8 @@ export interface SphereImportOptions {
   accounting?: AccountingModuleConfig | boolean;
   /** Swap module configuration. `true` for defaults, object for custom config, `false`/`undefined` to disable. */
   swap?: SwapModuleConfig | boolean;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Optional password to encrypt the wallet. If omitted, mnemonic/key is stored as plaintext. */
   password?: string;
   /**
@@ -335,8 +342,8 @@ export interface SphereInitOptions {
   derivationPath?: string;
   /** Optional nametag to register (only on create). Token is auto-minted. */
   nametag?: string;
-  /** L1 (ALPHA blockchain) configuration */
-  l1?: L1Config;
+  /** L1 (ALPHA blockchain) configuration. Pass null to disable L1 entirely. */
+  l1?: L1Config | null;
   /** Optional price provider for fiat conversion */
   price?: PriceProvider;
   /**
@@ -374,6 +381,8 @@ export interface SphereInitOptions {
    * Without this, a fresh wallet starts from "now" and misses older DMs.
    */
   dmSince?: number;
+  /** Communications module configuration. */
+  communications?: CommunicationsModuleConfig;
   /** Enable debug logging (default: false) */
   debug?: boolean;
   /** Optional callback to report initialization progress steps */
@@ -497,9 +506,10 @@ export class Sphere {
   private _dmSince: number | null = null;
 
   // Stored configs for creating per-address modules
-  private _l1Config: L1Config | undefined;
+  private _l1Config: L1Config | null | undefined;
   private _groupChatConfig: GroupChatModuleConfig | undefined;
   private _marketConfig: MarketModuleConfig | undefined;
+  private _communicationsConfig: CommunicationsModuleConfig | undefined;
 
   // Events
   private eventHandlers: Map<SphereEventType, Set<SphereEventHandler<SphereEventType>>> = new Map();
@@ -518,12 +528,13 @@ export class Sphere {
     transport: TransportProvider,
     oracle: OracleProvider,
     tokenStorage?: TokenStorageProvider<TxfStorageDataBase>,
-    l1Config?: L1Config,
+    l1Config?: L1Config | null,
     priceProvider?: PriceProvider,
     groupChatConfig?: GroupChatModuleConfig,
     marketConfig?: MarketModuleConfig,
     accountingConfig?: AccountingModuleConfig,
     swapConfig?: SwapModuleConfig,
+    communicationsConfig?: CommunicationsModuleConfig,
   ) {
     this._storage = storage;
     this._transport = transport;
@@ -539,9 +550,10 @@ export class Sphere {
     this._l1Config = l1Config;
     this._groupChatConfig = groupChatConfig;
     this._marketConfig = marketConfig;
+    this._communicationsConfig = communicationsConfig;
 
     this._payments = createPaymentsModule({ l1: l1Config });
-    this._communications = createCommunicationsModule();
+    this._communications = createCommunicationsModule(communicationsConfig);
     this._groupChat = groupChatConfig ? createGroupChatModule(groupChatConfig) : null;
     this._market = marketConfig ? createMarketModule(marketConfig) : null;
     this._accounting = accountingConfig ? createAccountingModule(accountingConfig) : null;
@@ -819,6 +831,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.communications,
     );
     sphere._password = options.password ?? null;
 
@@ -916,6 +929,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.communications,
     );
     sphere._password = options.password ?? null;
 
@@ -1030,6 +1044,7 @@ export class Sphere {
       marketConfig,
       accountingConfig,
       swapConfig,
+      options.communications,
     );
     sphere._password = options.password ?? null;
 
@@ -2453,7 +2468,7 @@ export class Sphere {
 
     // Create fresh module instances for this address
     const payments = createPaymentsModule({ l1: this._l1Config });
-    const communications = createCommunicationsModule();
+    const communications = createCommunicationsModule(this._communicationsConfig);
     const groupChat = this._groupChatConfig ? createGroupChatModule(this._groupChatConfig) : null;
     const market = this._marketConfig ? createMarketModule(this._marketConfig) : null;
 

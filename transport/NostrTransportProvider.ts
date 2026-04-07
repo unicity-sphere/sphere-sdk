@@ -258,6 +258,10 @@ export class NostrTransportProvider implements TransportProvider {
         onReconnected: (url) => {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
           this.emitEvent({ type: 'transport:connected', timestamp: Date.now() });
+          // Re-establish subscriptions — the relay drops them on disconnect.
+          this.subscribeToEvents().catch((err) => {
+            logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
+          });
         },
       });
 
@@ -1960,13 +1964,11 @@ export class NostrTransportProvider implements TransportProvider {
     const chatFilter = new Filter();
     chatFilter.kinds = [EventKinds.GIFT_WRAP];
     chatFilter['#p'] = [nostrPubkey];
-    // NIP-17 gift wraps use a randomized created_at (±2 days / 172800 s) for privacy.
-    // The relay filters events by created_at, so a gift wrap sent right now may have
-    // created_at up to 172800 s in the past and would be invisible to a filter with
-    // since = dmSince.  Subtract the maximum randomization window so the relay
-    // returns events whose actual send time is >= dmSince even if their created_at
-    // was shifted backwards.  processedEventIds dedup prevents re-processing old events.
-    chatFilter.since = Math.max(0, dmSince - 172800);
+    // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
+    // Without this offset, ~50% of messages are silently dropped by the relay
+    // because their randomized timestamp lands before the `since` filter.
+    // Math.max(0, ...) prevents negative timestamps when dmSince is small.
+    chatFilter.since = Math.max(0, dmSince - TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {

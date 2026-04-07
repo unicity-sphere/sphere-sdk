@@ -31,6 +31,12 @@ export interface CommunicationsModuleConfig {
   maxPerConversation?: number;
   /** Enable read receipts */
   readReceipts?: boolean;
+  /** Cache messages in memory and storage (default: true).
+   *  When false, DMs flow through onDirectMessage handlers and events
+   *  but are never stored. Useful for anonymous/ephemeral agents.
+   *  Note: deduplication is skipped when caching is disabled, so duplicate
+   *  events may occur if the relay delivers the same message twice. */
+  cacheMessages?: boolean;
 }
 
 // =============================================================================
@@ -95,6 +101,7 @@ export class CommunicationsModule {
       maxMessages: config?.maxMessages ?? 1000,
       maxPerConversation: config?.maxPerConversation ?? 200,
       readReceipts: config?.readReceipts ?? true,
+      cacheMessages: config?.cacheMessages ?? true,
     };
   }
 
@@ -169,6 +176,7 @@ export class CommunicationsModule {
    * Falls back to legacy global 'direct_messages' key for migration.
    */
   async load(): Promise<void> {
+    if (!this.config.cacheMessages) return;
     this.ensureInitialized();
 
     // Always clear in-memory state before loading new address data.
@@ -254,10 +262,12 @@ export class CommunicationsModule {
       isRead: false,
     };
 
-    // Save
-    this.messages.set(message.id, message);
-    if (this.config.autoSave) {
-      await this.save();
+    // Cache and save (skipped when cacheMessages is false)
+    if (this.config.cacheMessages) {
+      this.messages.set(message.id, message);
+      if (this.config.autoSave) {
+        await this.save();
+      }
     }
 
     return message;
@@ -311,7 +321,7 @@ export class CommunicationsModule {
       }
     }
 
-    if (this.config.autoSave) {
+    if (this.config.cacheMessages && this.config.autoSave) {
       await this.save();
     }
 
@@ -371,6 +381,7 @@ export class CommunicationsModule {
    * Delete all messages in a conversation with a peer
    */
   async deleteConversation(peerPubkey: string): Promise<void> {
+    if (!this.config.cacheMessages) return;
     for (const [id, msg] of this.messages) {
       if (msg.senderPubkey === peerPubkey || msg.recipientPubkey === peerPubkey) {
         this.messages.delete(id);
@@ -540,8 +551,8 @@ export class CommunicationsModule {
 
     // Self-wrap replay: sent message recovered from relay
     if (msg.isSelfWrap && msg.recipientTransportPubkey) {
-      // Dedup: skip if already known
-      if (this.messages.has(msg.id)) return;
+      // Dedup: skip if already known (only relevant when caching)
+      if (this.config.cacheMessages && this.messages.has(msg.id)) return;
 
       const message: DirectMessage = {
         id: msg.id,
@@ -553,12 +564,14 @@ export class CommunicationsModule {
         isRead: isHistorical,
       };
 
-      this.messages.set(message.id, message);
+      if (this.config.cacheMessages) {
+        this.messages.set(message.id, message);
+      }
 
       // Emit as sent message replay (same event, UI can pick it up)
       this.deps!.emitEvent('message:dm', message);
 
-      if (this.config.autoSave) {
+      if (this.config.cacheMessages && this.config.autoSave) {
         this.save();
       }
       return;
@@ -577,8 +590,8 @@ export class CommunicationsModule {
           tp === ownChainPubkey.slice(2)) return;
     }
 
-    // Dedup: skip if already known
-    if (this.messages.has(msg.id)) return;
+    // Dedup: skip if already known (only relevant when caching)
+    if (this.config.cacheMessages && this.messages.has(msg.id)) return;
 
     const message: DirectMessage = {
       id: msg.id,
@@ -590,7 +603,9 @@ export class CommunicationsModule {
       isRead: isHistorical,
     };
 
-    this.messages.set(message.id, message);
+    if (this.config.cacheMessages) {
+      this.messages.set(message.id, message);
+    }
 
     // Emit event
     this.deps!.emitEvent('message:dm', message);
@@ -606,13 +621,13 @@ export class CommunicationsModule {
       }
     }
 
-    // Auto-save
-    if (this.config.autoSave) {
-      this.save();
+    // Auto-save and prune (only when caching)
+    if (this.config.cacheMessages) {
+      if (this.config.autoSave) {
+        this.save();
+      }
+      this.pruneIfNeeded();
     }
-
-    // Prune if needed
-    this.pruneIfNeeded();
   }
 
   private handleComposingIndicator(indicator: ComposingIndicator): void {

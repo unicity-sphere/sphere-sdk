@@ -552,6 +552,31 @@ const { sphere } = await Sphere.init({
 
 Once the SDK processes DMs, the timestamp is persisted and `dmSince` is ignored on subsequent connects.
 
+### Ephemeral Mode (No Caching)
+
+For anonymous agents or LLM bots that don't need message history, disable DM caching:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  communications: { cacheMessages: false },
+});
+
+// Stream-only: receive, process, forget
+sphere.communications.onDirectMessage((msg) => {
+  processAndReply(msg);
+});
+
+// sendDM still works — message is sent but not stored locally
+await sphere.communications.sendDM('@alice', 'response');
+```
+
+When `cacheMessages` is `false`:
+- `onDirectMessage()` handlers and `message:dm` events fire normally
+- Messages are never stored in memory or persisted to storage
+- `getConversation()` / `getConversations()` return empty results
+- Deduplication is skipped (duplicate relay deliveries may trigger duplicate events)
+
 ## L1 (ALPHA Blockchain) Operations
 
 Access L1 payments through `sphere.payments.l1`:
