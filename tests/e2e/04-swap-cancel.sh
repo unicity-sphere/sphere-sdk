@@ -113,11 +113,11 @@ accept_swap "$BOB" "${SWAP_C:0:8}" 300
 # Only Alice deposits
 deposit_swap "$ALICE" "${SWAP_C:0:8}"
 
-# CRITICAL: Verify Alice's change token survived the deposit
-# Alice had 50 BTC (minus amounts from 4a/4b proposals that don't deposit),
-# deposited 5 BTC — must still have BTC from the change token.
-log "4c: Verifying change token after deposit..."
-assert_deposit_change "$ALICE" BTC "4c: Alice BTC change after depositing 5"
+# CRITICAL: Verify Alice's exact balance after deposit
+# Alice had 50 BTC, deposited 5 BTC → should have exactly 45 BTC remaining.
+# (4a and 4b proposals don't deposit, so no BTC was consumed by them.)
+log "4c: Verifying exact balance after deposit..."
+assert_balance "$ALICE" BTC "45" "4c: Alice BTC after depositing 5 of 50"
 
 # Verify Alice deposited (no artificial wait — deposit_swap already completed)
 PROGRESS=$(cli_as "$ALICE" swap-list 2>&1 | grep "${SWAP_C:0:8}" | { grep -oP 'depositing|announced' || true; } | head -1)

@@ -57,20 +57,24 @@ log ""; log "=== Swap A: deposits ==="
 deposit_swap "$BOB" "${SWAP_A:0:8}"
 deposit_swap "$ALICE" "${SWAP_A:0:8}"
 
-# Verify change tokens after swap A deposits
+# Verify change after swap A deposits
+# Alice deposited 1 BTC from 30 total → 29 remaining
+# Bob deposited 10 ETH from 300 total → 290 remaining
 log ""; log "=== Verify post-deposit A balances ==="
-assert_deposit_change "$ALICE" BTC "Alice BTC after swap A deposit"
-assert_deposit_change "$BOB" ETH "Bob ETH after swap A deposit"
+assert_balance "$ALICE" BTC "29" "Alice BTC after swap A deposit (30 - 1)"
+assert_balance "$BOB" ETH "290" "Bob ETH after swap A deposit (300 - 10)"
 
 # --- Both deposit into swap B ---
 log ""; log "=== Swap B: deposits ==="
 deposit_swap "$BOB" "${SWAP_B:0:8}"
 deposit_swap "$ALICE" "${SWAP_B:0:8}"
 
-# Verify change tokens after swap B deposits
+# Verify change after swap B deposits
+# Alice deposited 2 more BTC → 29 - 2 = 27 remaining
+# Bob deposited 20 more ETH → 290 - 20 = 270 remaining
 log ""; log "=== Verify post-deposit B balances ==="
-assert_deposit_change "$ALICE" BTC "Alice BTC after swap B deposit"
-assert_deposit_change "$BOB" ETH "Bob ETH after swap B deposit"
+assert_balance "$ALICE" BTC "27" "Alice BTC after swap B deposit (29 - 2)"
+assert_balance "$BOB" ETH "270" "Bob ETH after swap B deposit (290 - 20)"
 
 # --- Check swap A status after all deposits ---
 log ""; log "=== Swap A intermediate status ==="
@@ -102,15 +106,17 @@ else
   fail "Swap B did not complete (final: $FINAL_B)"
 fi
 
-# --- Verify final balances ---
-log ""; log "=== Verify balances ==="
-ALICE_BAL=$(cli_as "$ALICE" balance --finalize 2>&1) || true
-if echo "$ALICE_BAL" | grep -q "ETH"; then ok "Alice received ETH"; else fail "Alice missing ETH"; fi
-if echo "$ALICE_BAL" | grep -q "BTC"; then ok "Alice kept remaining BTC"; else fail "Alice lost all BTC — change tokens missing"; fi
+# --- Verify exact final balances ---
+# Alice: topup 10+20=30 BTC, deposited 1+2=3 → 27 BTC remaining + 10+20=30 ETH payout
+# Bob: topup 100+200=300 ETH, deposited 10+20=30 → 270 ETH remaining + 1+2=3 BTC payout
+log ""; log "=== Verify final balances ==="
+cli_as "$ALICE" balance --finalize > /dev/null 2>&1 || true
+cli_as "$BOB" balance --finalize > /dev/null 2>&1 || true
 
-BOB_BAL=$(cli_as "$BOB" balance --finalize 2>&1) || true
-if echo "$BOB_BAL" | grep -q "BTC"; then ok "Bob received BTC"; else fail "Bob missing BTC"; fi
-if echo "$BOB_BAL" | grep -q "ETH"; then ok "Bob kept remaining ETH"; else fail "Bob lost all ETH — change tokens missing"; fi
+assert_balance "$ALICE" BTC "27" "Alice BTC remaining (30 - 3)"
+assert_balance "$ALICE" ETH "30" "Alice ETH payout (10 + 20)"
+assert_balance "$BOB" ETH "270" "Bob ETH remaining (300 - 30)"
+assert_balance "$BOB" BTC "3" "Bob BTC payout (1 + 2)"
 
 summary
 [[ $FAIL -gt 0 ]] && exit 1

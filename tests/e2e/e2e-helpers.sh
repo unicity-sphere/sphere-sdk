@@ -453,3 +453,30 @@ assert_deposit_change() {
     fail "${label}: change token MISSING — deposit consumed entire ${symbol} token"
   fi
 }
+
+# assert_balance <profile> <symbol> <expected_human> <label>
+# Asserts that the wallet's balance for a coin matches the expected
+# human-readable amount (e.g., "9" for 9 BTC, "90" for 90 ETH).
+# Uses string comparison on the formatted balance output.
+assert_balance() {
+  local profile="$1" symbol="$2" expected="$3" label="$4"
+  local actual
+  actual=$(get_coin_amount "$profile" "$symbol")
+  if [[ "$actual" == "$expected" ]]; then
+    ok "${label}: ${symbol} = ${actual}"
+  else
+    fail "${label}: ${symbol} expected ${expected}, got ${actual:-empty}"
+  fi
+}
+
+# assert_balance_changed <before> <after> <expected_after> <label>
+# Asserts that a balance changed to the expected value.
+# All values are human-readable strings from get_coin_amount.
+assert_balance_changed() {
+  local before="$1" after="$2" expected="$3" label="$4"
+  if [[ "$after" == "$expected" ]]; then
+    ok "${label}: ${before} → ${after}"
+  else
+    fail "${label}: expected ${expected}, got ${after:-empty} (was ${before})"
+  fi
+}
