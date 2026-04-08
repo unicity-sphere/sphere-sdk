@@ -274,7 +274,7 @@ accept_swap() {
   for i in $(seq 1 "$attempts"); do
     local try
     try=$(cli_as "$profile" swap-accept "$prefix" 2>&1) || true
-    if echo "$try" | grep -qiE "Swap accepted|announced|deposit invoice"; then
+    if echo "$try" | grep -qE "Swap accepted\.|Announced to escrow|deposit invoice"; then
       ok "Swap accepted by ${profile} (attempt ${i})"
       return 0
     fi
@@ -293,7 +293,7 @@ deposit_swap() {
     log "deposit_swap ${profile} (attempt ${attempt}): $(echo "$out" | grep -E 'status|Error|error|Deposit|announced|Insufficient|WRONG_STATE' | head -2)" >&2
 
     # Success
-    if echo "$out" | grep -qiE '"status".*"(completed|submitted|delivered)"'; then
+    if echo "$out" | grep -qE '"status"\s*:\s*"(completed|submitted|delivered)"'; then
       ok "${profile} deposit completed"
       return 0
     fi
@@ -390,25 +390,11 @@ get_coin_token_count() {
 }
 
 # get_coin_amount <profile> <symbol>
-# Returns the total raw integer amount for a given coin symbol.
-# Sums amounts across all tokens of that coin.
-# Uses a dedicated CLI query: `tokens --no-sync` and parses output.
+# Returns the human-readable balance for a coin symbol (e.g., "9" for 9 BTC).
+# Parses balance output: "BTC: 9 (1 token)" → "9"
 get_coin_amount() {
   local profile="$1" symbol="$2"
-  local out total=0
-  out=$(cli_as "$profile" tokens --no-sync 2>&1) || true
-  # tokens output format:
-  #   Coin: BTC (abcd1234...)
-  #   Amount: 0.00000010 BTC
-  # We need to match the coin line, then extract from the Amount line.
-  # Since amounts are formatted as human-readable decimals, and we need raw
-  # integer amounts, we use the balance line format instead.
-  # Balance format: "BTC: 0.00000010 (2 tokens)"
-  # The displayed value = raw_amount / 10^decimals
-  # For swap assertions, we compare token counts which proves splitting.
-  #
-  # Alternative: use the balance confirmedAmount + unconfirmedAmount fields.
-  # For simplicity, extract the formatted balance and compare as strings.
+  local out
   out=$(cli_as "$profile" balance --no-sync 2>&1) || true
   echo "$out" | grep "^${symbol}:" | sed -n "s/^${symbol}: \([0-9.]*\).*/\1/p" | head -1
 }

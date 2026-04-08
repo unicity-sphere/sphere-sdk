@@ -165,7 +165,7 @@ else
   # The cancel itself succeeded (verified above). The return is async.
   log "  Note: Auto-return requires aggregator confirmation of deposit tokens — may take >180s on testnet"
   log "  The cancel command succeeded; deposit return is a known timing limitation"
-  ok "4c: Cancel succeeded (deposit return is async, may exceed test timeout)"
+  log "4c: Cancel succeeded (deposit return is async, may exceed test timeout)"
 fi
 
 summary

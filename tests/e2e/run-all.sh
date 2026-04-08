@@ -69,8 +69,7 @@ for test_script in "${TESTS[@]}"; do
   echo "[$(date '+%H:%M:%S')] Starting: ${name}"
 
   if $SEQUENTIAL; then
-    bash "$test_script" "${PASSTHROUGH[@]}" > "$log_file" 2>&1 || true
-    PIDS+=("0")  # placeholder
+    bash "$test_script" "${PASSTHROUGH[@]}" > "$log_file" 2>&1 && PIDS+=("0") || PIDS+=("$?")
   else
     bash "$test_script" "${PASSTHROUGH[@]}" > "$log_file" 2>&1 &
     PIDS+=("$!")
@@ -87,8 +86,7 @@ fi
 RESULTS=()
 for i in "${!PIDS[@]}"; do
   if $SEQUENTIAL; then
-    # Check the log for the summary line
-    if grep -q ' 0 failed' "${RESULTS_DIR}/${NAMES[$i]}.log" 2>/dev/null; then
+    if [[ "${PIDS[$i]}" -eq 0 ]]; then
       RESULTS+=("PASS")
     else
       RESULTS+=("FAIL")

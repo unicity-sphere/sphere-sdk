@@ -85,8 +85,10 @@ log "All swaps after deposits:"
 # --- Wait for both to complete ---
 log ""; log "=== Waiting for swap A completion ==="
 FINAL_A=$(wait_swap_progress "$ALICE" "${SWAP_A:0:8}" "completed|failed|cancelled|pruned") || true
-if [[ "$FINAL_A" == "completed" || "$FINAL_A" == "pruned" ]]; then
+if [[ "$FINAL_A" == "completed" ]]; then
   ok "Swap A completed"
+elif [[ "$FINAL_A" == "pruned" ]]; then
+  log "Swap A pruned — balance assertions below verify success"
 elif [[ "$FINAL_A" == "failed" ]]; then
   # Dump full status for post-mortem — the escrow may have completed but the SDK
   # misinterpreted a DM (known race in multi-swap scenarios)
@@ -100,10 +102,12 @@ fi
 
 log ""; log "=== Waiting for swap B completion ==="
 FINAL_B=$(wait_swap_progress "$ALICE" "${SWAP_B:0:8}" "completed|failed|cancelled|pruned") || true
-if [[ "$FINAL_B" == "completed" || "$FINAL_B" == "pruned" ]]; then
+if [[ "$FINAL_B" == "completed" ]]; then
   ok "Swap B completed"
+elif [[ "$FINAL_B" == "pruned" ]]; then
+  log "Swap B pruned — balance assertions below verify success"
 else
-  fail "Swap B did not complete (final: $FINAL_B)"
+  fail "Swap B did not complete (final: ${FINAL_B:-unknown})"
 fi
 
 # --- Verify exact final balances ---

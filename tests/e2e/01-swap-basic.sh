@@ -60,10 +60,12 @@ assert_balance "$BOB" ETH "90" "Bob ETH after depositing 10 of 100"
 # Wait for completion
 log ""; log "=== Waiting for swap completion ==="
 FINAL=$(wait_swap_progress "$ALICE" "${SWAP_ID:0:8}" "completed|failed|cancelled|pruned") || true
-if [[ "$FINAL" == "completed" || "$FINAL" == "pruned" ]]; then
+if [[ "$FINAL" == "completed" ]]; then
   ok "Swap completed"
+elif [[ "$FINAL" == "pruned" ]]; then
+  log "Swap pruned — balance assertions below verify success"
 else
-  fail "Swap did not complete (final: $FINAL)"
+  fail "Swap did not complete (final: ${FINAL:-unknown})"
 fi
 
 # Verify final balances with exact amounts

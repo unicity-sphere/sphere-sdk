@@ -92,6 +92,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
   let escrowNametag: string;
   let aliceSphere: Sphere | null = null;
   let bobSphere: Sphere | null = null;
+  let escrowLogFd: number | null = null;
 
   beforeAll(async () => {
     // Create workspace
@@ -128,10 +129,10 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
     // Launch escrow as a persistent process
     console.log(`Launching escrow @${escrowNametag}...`);
     const escrowLog = join(workspace, 'escrow.log');
-    const logFd = require('fs').openSync(escrowLog, 'w');
+    escrowLogFd = require('fs').openSync(escrowLog, 'w');
     escrowProcess = spawn('npx', ['tsx', '--env-file=.env', 'src/index.ts'], {
       cwd: escrowDir,
-      stdio: ['ignore', logFd, logFd],
+      stdio: ['ignore', escrowLogFd, escrowLogFd],
       detached: true,
     });
 
@@ -162,6 +163,12 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
       try { process.kill(-escrowProcess.pid, 'SIGTERM'); } catch { /* ignore */ }
       await sleep(2000);
       try { process.kill(-escrowProcess.pid, 'SIGKILL'); } catch { /* ignore */ }
+    }
+
+    // Close escrow log fd
+    if (escrowLogFd !== null) {
+      try { require('fs').closeSync(escrowLogFd); } catch { /* ignore */ }
+      escrowLogFd = null;
     }
 
     // Preserve escrow log on failure (for diagnosis)
@@ -329,7 +336,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
             lastProgress = status?.progress;
             console.log(`  ${label}: ${lastProgress} [${Math.round((Date.now() - start) / 1000)}s]`);
           }
-          if (['completed', 'concluding', 'failed', 'cancelled'].includes(status?.progress)) {
+          if (['completed', 'failed', 'cancelled'].includes(status?.progress)) {
             return status.progress;
           }
         } catch { /* swap may be pruned */ }
@@ -342,22 +349,8 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
       waitWithLog(bobSphere, 'Bob'),
     ]);
     console.log(`Alice: ${aliceFinal}, Bob: ${bobFinal}`);
-
-    // If still concluding, wait longer for completed — the escrow needs to
-    // confirm deposits, create payout invoices, pay payouts, deliver tokens.
-    if (aliceFinal === 'concluding' || bobFinal === 'concluding') {
-      console.log('Swap concluding — waiting for completed...');
-      const [aliceCompleted, bobCompleted] = await Promise.all([
-        waitWithLog(aliceSphere, 'Alice'),
-        waitWithLog(bobSphere, 'Bob'),
-      ]);
-      console.log(`After extended wait — Alice: ${aliceCompleted}, Bob: ${bobCompleted}`);
-      expect(['completed', 'concluding']).toContain(aliceCompleted);
-      expect(['completed', 'concluding']).toContain(bobCompleted);
-    } else {
-      expect(aliceFinal).toBe('completed');
-      expect(bobFinal).toBe('completed');
-    }
+    expect(aliceFinal).toBe('completed');
+    expect(bobFinal).toBe('completed');
 
     // ── Verify payout tokens received ──
     // Poll receive() to pick up the payout invoice tokens delivered by the escrow.
@@ -407,8 +400,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
   it('DM delivery latency between long-running instances', async () => {
     // Use the already-running Alice and Bob from the previous test
     if (!aliceSphere || !bobSphere) {
-      console.log('Skipping — Alice/Bob not initialized (previous test may have been skipped)');
-      return;
+      expect.fail('Alice/Bob not initialized — previous test may have failed or been skipped');
     }
 
     // Send a DM from Alice to Bob and measure delivery time
