@@ -284,7 +284,7 @@ accept_swap() {
 }
 
 deposit_swap() {
-  local profile="$1" prefix="$2" max_attempts="${3:-3}"
+  local profile="$1" prefix="$2" max_attempts="${3:-6}"
   local out attempt=0
 
   while [[ $attempt -lt $max_attempts ]]; do
