@@ -2698,10 +2698,11 @@ export class Sphere {
    * If this assertion fails, the initialization order in _doLoad() has been broken.
    */
   private _getActiveAddressesInternal(): TrackedAddress[] {
-    if (!this._trackedAddressesLoaded) {
-      logger.warn('Sphere', '_getActiveAddressesInternal called before tracked addresses loaded');
-      return [];
-    }
+    // No guard on _trackedAddressesLoaded — the map is authoritative.
+    // If empty, callers get an empty array (correct behavior).
+    // The previous guard returned [] when the flag was false, which
+    // caused proposeSwap to fail with "neither party A nor party B"
+    // when _trackedAddressesLoaded wasn't set (timing/bundle issues).
     const result: TrackedAddress[] = [];
     for (const entry of this._trackedAddresses.values()) {
       if (!entry.hidden) {

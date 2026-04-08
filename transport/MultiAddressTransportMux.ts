@@ -144,6 +144,7 @@ export class MultiAddressTransportMux {
   private chatEoseFired = false;
   private resubscribeTimer: ReturnType<typeof setTimeout> | null = null;
   private lastWalletEventAt: number = Date.now();
+  private lastChatEventAt: number = Date.now();
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private chatEoseHandlers: Array<() => void> = [];
 
@@ -359,6 +360,8 @@ export class MultiAddressTransportMux {
     this.walletSubscriptionId = null;
     this.chatSubscriptionId = null;
     this.chatEoseFired = false;
+    this.lastWalletEventAt = Date.now();
+    this.lastChatEventAt = Date.now();
     this.status = 'disconnected';
     this.emitEvent({ type: 'transport:disconnected', timestamp: Date.now() });
   }
@@ -530,6 +533,10 @@ export class MultiAddressTransportMux {
       this.chatSubscriptionId = null;
     }
 
+    // Reset health check timestamps — fresh subscriptions start clean.
+    this.lastWalletEventAt = Date.now();
+    this.lastChatEventAt = Date.now();
+
     // Nothing to subscribe to if no addresses registered
     if (this.addresses.size === 0) return;
 
@@ -645,13 +652,26 @@ export class MultiAddressTransportMux {
       // Check wallet subscription health separately from chat subscription.
       // DMs (gift wraps) keep the chat subscription alive, but the wallet
       // subscription (TOKEN_TRANSFER events) can die silently.
-      const elapsed = Date.now() - this.lastWalletEventAt;
-      if (elapsed > 300_000) { // 5 minutes — avoid unnecessary relay churn on idle wallets
-        logger.warn('Mux', `No wallet events for ${Math.round(elapsed / 1000)}s — re-subscribing`);
+      const walletElapsed = Date.now() - this.lastWalletEventAt;
+      if (walletElapsed > 300_000) { // 5 minutes — avoid unnecessary relay churn on idle wallets
+        logger.warn('Mux', `No wallet events for ${Math.round(walletElapsed / 1000)}s — re-subscribing`);
         this.lastWalletEventAt = Date.now(); // prevent rapid re-subscribe
+        this.lastChatEventAt = Date.now();   // updateSubscriptions refreshes both
         this.updateSubscriptions().catch((err) => {
           logger.warn('Mux', 'Health check re-subscription failed:', err);
         });
+      } else {
+        // Chat subscription health — shorter threshold because DMs are
+        // latency-sensitive for swap protocol messages.
+        const chatElapsed = Date.now() - this.lastChatEventAt;
+        if (chatElapsed > 60_000) { // 1 minute
+          logger.warn('Mux', `No chat events for ${Math.round(chatElapsed / 1000)}s — re-subscribing`);
+          this.lastChatEventAt = Date.now();   // prevent rapid re-subscribe
+          this.lastWalletEventAt = Date.now(); // updateSubscriptions refreshes both
+          this.updateSubscriptions().catch((err) => {
+            logger.warn('Mux', 'Chat health check re-subscription failed:', err);
+          });
+        }
       }
     }, 30_000);
   }
@@ -721,9 +741,12 @@ export class MultiAddressTransportMux {
         }
       }
     }
-    // Track wallet events (non-gift-wrap) for subscription health check.
+    // Track wallet and chat events separately for subscription health checks.
     if (event.kind !== EventKinds.GIFT_WRAP) {
       this.lastWalletEventAt = Date.now();
+    }
+    if (event.kind === EventKinds.GIFT_WRAP) {
+      this.lastChatEventAt = Date.now();
     }
 
     try {
