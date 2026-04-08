@@ -147,7 +147,7 @@ while [[ $RETURN_ELAPSED -lt 90 ]]; do
   ALICE_BTC_COUNT=$(get_coin_token_count "$ALICE" BTC)
   log "4c: [${RETURN_ELAPSED}s] Alice BTC tokens: ${ALICE_BTC_COUNT:-0}"
   # After deposit return, Alice should have 2+ BTC tokens (change + returned deposit)
-  if [[ -n "$ALICE_BTC_COUNT" && "$ALICE_BTC_COUNT" -ge 2 ]]; then
+  if [[ "${ALICE_BTC_COUNT:-0}" -ge 2 ]]; then
     log "4c: Deposit returned after ~${RETURN_ELAPSED}s"
     break
   fi

@@ -106,11 +106,13 @@ describe('CommunicationsModule - Composing Indicators', () => {
       deps = createDeps({ transport });
       comms.initialize(deps);
 
-      await comms.sendComposingIndicator('recipient-pubkey-hex');
+      const recipientPubkey = '02' + 'c'.repeat(64);
+      const recipientXOnly = 'c'.repeat(64);
+      await comms.sendComposingIndicator(recipientPubkey);
 
       expect(transport.sendComposingIndicator).toHaveBeenCalledOnce();
       const [recipientArg, contentArg] = (transport.sendComposingIndicator as ReturnType<typeof vi.fn>).mock.calls[0];
-      expect(recipientArg).toBe('recipient-pubkey-hex');
+      expect(recipientArg).toBe(recipientXOnly);
 
       const parsed = JSON.parse(contentArg);
       expect(parsed.senderNametag).toBe('testuser');

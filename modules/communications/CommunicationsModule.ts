@@ -274,27 +274,36 @@ export class CommunicationsModule {
   }
 
   /**
-   * Get conversation with peer
+   * Get conversation with peer.
+   * Normalizes the key to x-only format so lookups work regardless of whether
+   * the caller passes a compressed (02.../03...) or x-only (64-char) pubkey.
    */
   getConversation(peerPubkey: string): DirectMessage[] {
+    const normalized = CommunicationsModule._normalizeKey(peerPubkey);
     return Array.from(this.messages.values())
       .filter(
-        (m) => m.senderPubkey === peerPubkey || m.recipientPubkey === peerPubkey
+        (m) =>
+          CommunicationsModule._normalizeKey(m.senderPubkey) === normalized ||
+          CommunicationsModule._normalizeKey(m.recipientPubkey) === normalized
       )
       .sort((a, b) => a.timestamp - b.timestamp);
   }
 
   /**
-   * Get all conversations grouped by peer
+   * Get all conversations grouped by peer.
+   * Keys are normalized to x-only format so compressed and x-only pubkeys
+   * map to the same conversation.
    */
   getConversations(): Map<string, DirectMessage[]> {
     const conversations = new Map<string, DirectMessage[]>();
+    const ownKey = CommunicationsModule._normalizeKey(this.deps?.identity.chainPubkey ?? '');
 
     for (const message of this.messages.values()) {
-      const peer =
-        message.senderPubkey === this.deps?.identity.chainPubkey
+      const rawPeer =
+        CommunicationsModule._normalizeKey(message.senderPubkey) === ownKey
           ? message.recipientPubkey
           : message.senderPubkey;
+      const peer = CommunicationsModule._normalizeKey(rawPeer);
 
       if (!conversations.has(peer)) {
         conversations.set(peer, []);
@@ -766,6 +775,21 @@ export class CommunicationsModule {
     if (!this.deps) {
       throw new SphereError('CommunicationsModule not initialized', 'NOT_INITIALIZED');
     }
+  }
+
+  /**
+   * Normalize a pubkey to x-only (64-char lowercase hex) for consistent lookups.
+   * Compressed keys (02.../03... 66-char) are stripped to x-only.
+   * Already x-only keys are lowercased. Non-hex strings pass through unchanged.
+   */
+  static _normalizeKey(key: string): string {
+    if (key.length === 66 && /^0[23][0-9a-f]{64}$/i.test(key)) {
+      return key.slice(2).toLowerCase();
+    }
+    if (key.length === 64 && /^[0-9a-f]{64}$/i.test(key)) {
+      return key.toLowerCase();
+    }
+    return key;
   }
 }
 

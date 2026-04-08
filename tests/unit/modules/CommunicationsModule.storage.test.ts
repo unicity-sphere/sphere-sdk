@@ -67,6 +67,7 @@ function createMockStorage(): StorageProvider {
 
 const MY_PUBKEY = '02' + 'a'.repeat(64);
 const PEER_A_PUBKEY = '02' + 'b'.repeat(64);
+const PEER_A_PUBKEY_XONLY = 'b'.repeat(64);
 const PEER_B_PUBKEY = '02' + 'c'.repeat(64);
 
 function createMockIdentity(): FullIdentity {
@@ -136,13 +137,15 @@ describe('CommunicationsModule — storage & pagination', () => {
       mod.initialize(deps);
 
       // Simulate sending a message so in-memory state is populated
+      // sendDM resolves compressed pubkey to x-only for transport, so the
+      // stored message uses the x-only recipientPubkey.
       await mod.sendDM(PEER_A_PUBKEY, 'first');
-      expect(mod.getConversation(PEER_A_PUBKEY)).toHaveLength(1);
+      expect(mod.getConversation(PEER_A_PUBKEY_XONLY)).toHaveLength(1);
 
       // Now load — storage returns null for all keys, so in-memory should be cleared
       await mod.load();
 
-      expect(mod.getConversation(PEER_A_PUBKEY)).toHaveLength(0);
+      expect(mod.getConversation(PEER_A_PUBKEY_XONLY)).toHaveLength(0);
     });
 
     it('should migrate from legacy global key filtering by identity', async () => {

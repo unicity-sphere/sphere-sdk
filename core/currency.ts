@@ -52,6 +52,7 @@ export function toSmallestUnit(amount: number | string, decimals: number = DEFAU
  * ```
  */
 export function toHumanReadable(amount: bigint | string, decimals: number = DEFAULT_TOKEN_DECIMALS): string {
+  if (!decimals || decimals < 0 || !Number.isFinite(decimals)) return amount.toString();
   const str = amount.toString().padStart(decimals + 1, '0');
   const integer = str.slice(0, -decimals) || '0';
   const fraction = str.slice(-decimals).replace(/0+$/, '');

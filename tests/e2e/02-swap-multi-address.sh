@@ -72,11 +72,24 @@ log ""; log "=== Verify post-deposit B balances ==="
 assert_deposit_change "$ALICE" BTC "Alice BTC after swap B deposit"
 assert_deposit_change "$BOB" ETH "Bob ETH after swap B deposit"
 
+# --- Check swap A status after all deposits ---
+log ""; log "=== Swap A intermediate status ==="
+SWAP_A_MID=$(cli_as "$ALICE" swap-list --all 2>&1) || true
+log "All swaps after deposits:"
+{ echo "$SWAP_A_MID" | grep -E "${SWAP_A:0:8}|${SWAP_B:0:8}" || echo "(none visible)"; } >&2
+
 # --- Wait for both to complete ---
 log ""; log "=== Waiting for swap A completion ==="
 FINAL_A=$(wait_swap_progress "$ALICE" "${SWAP_A:0:8}" "completed|failed|cancelled|pruned") || true
 if [[ "$FINAL_A" == "completed" || "$FINAL_A" == "pruned" ]]; then
   ok "Swap A completed"
+elif [[ "$FINAL_A" == "failed" ]]; then
+  # Dump full status for post-mortem — the escrow may have completed but the SDK
+  # misinterpreted a DM (known race in multi-swap scenarios)
+  SWAP_A_STATUS=$(cli_as "$ALICE" swap-status "${SWAP_A:0:8}" 2>&1) || true
+  log "Swap A ended in 'failed' — full status for diagnosis:"
+  echo "$SWAP_A_STATUS" >&2
+  fail "Swap A did not complete (final: $FINAL_A)"
 else
   fail "Swap A did not complete (final: $FINAL_A)"
 fi

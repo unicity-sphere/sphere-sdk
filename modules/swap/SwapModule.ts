@@ -261,7 +261,7 @@ export class SwapModule {
       if (
         swap.progress === 'proposed' &&
         swap.role === 'proposer' &&
-        now - swap.createdAt > Math.max(this.config.proposalTimeoutMs, swap.deal.timeout * 1000)
+        now - swap.createdAt > Math.max(this.config.proposalTimeoutMs, (swap.deal?.timeout ?? 0) * 1000)
       ) {
         swap.progress = 'failed';
         swap.error = 'Proposal timed out';
@@ -791,6 +791,11 @@ export class SwapModule {
 
     // Persist per-swap key
     await this.persistSwap(swap);
+
+    // Log terminal transitions for diagnosis (especially 'failed').
+    if (to === 'failed') {
+      logger.warn(LOG_TAG, `Swap ${swap.swapId.slice(0, 12)} → failed: ${(swap as { error?: string }).error ?? 'none'}`);
+    }
 
     // Clear local timer and track terminal ID on terminal states.
     // Also push to _storedTerminalEntries so that subsequent persistIndex() calls
@@ -1664,11 +1669,18 @@ export class SwapModule {
     } | null;
 
     if (!invoiceRef) {
-      throw new SphereError('Payout invoice not found', 'SWAP_PAYOUT_VERIFICATION_FAILED');
+      // Payout invoice ID is set (from invoice_delivery DM) but the token hasn't
+      // been imported into AccountingModule yet. This is a timing issue — the import
+      // may still be in progress or the token was lost. Return false (unverified)
+      // instead of throwing — the swap stays completed with payoutVerified=false.
+      // Throwing here would transition the swap to 'failed' via the catch in the
+      // auto-verify caller, which is wrong when the escrow genuinely completed.
+      logger.warn(LOG_TAG, `verifyPayout(${swapId.slice(0, 12)}): payout invoice ${swap.payoutInvoiceId?.slice(0, 12)} not found — returning unverified`);
+      return returnFalse();
     }
 
     // Get invoice status for coverage check
-    const status = deps.accounting.getInvoiceStatus(swap.payoutInvoiceId) as {
+    const status = await deps.accounting.getInvoiceStatus(swap.payoutInvoiceId) as {
       state: string;
       targets: Array<{
         coinAssets: Array<{
@@ -1708,6 +1720,7 @@ export class SwapModule {
     // We must replicate the side effects of transitionProgress() via direct mutation instead
     // so that fraud is surfaced rather than silently swallowed by a SWAP_WRONG_STATE throw.
     const failPayout = async (error: string): Promise<false> => {
+      logger.warn(LOG_TAG, `failPayout(${swapId.slice(0, 12)}): ${error}`);
       if (swap.progress === 'completed') {
         // Direct mutation: completed → failed bypass (invalid state machine edge).
         // Side effects are replicated manually (clearLocalTimer, terminalSwapIds,
@@ -1781,8 +1794,11 @@ export class SwapModule {
     }
 
     // Verify coverage from invoice status
+    if (!status?.targets) {
+      return returnFalse();
+    }
     const targetStatus = status.targets[0];
-    if (!targetStatus || !targetStatus.coinAssets[0]) {
+    if (!targetStatus || !targetStatus.coinAssets?.[0]) {
       return returnFalse();
     }
 
@@ -3299,7 +3315,7 @@ export class SwapModule {
     this.clearLocalTimer(swap.swapId);
 
     // Compute total timeout: escrow timeout (seconds -> ms) + 30s grace
-    const totalTimeoutMs = swap.deal.timeout * 1000 + LOCAL_TIMEOUT_GRACE_MS;
+    const totalTimeoutMs = (swap.deal?.timeout ?? 0) * 1000 + LOCAL_TIMEOUT_GRACE_MS;
     const elapsed = Date.now() - swap.announcedAt;
     const remaining = totalTimeoutMs - elapsed;
 
@@ -3409,6 +3425,7 @@ export class SwapModule {
 
     if (remaining <= 0) {
       // Already expired — transition immediately
+      logger.warn(LOG_TAG, `Proposal timer expired: ${swapId.slice(0, 12)} elapsed=${elapsed}ms timeout=${effectiveTimeout}ms progress=${swap?.progress}`);
       void this.withSwapGate(swapId, async () => {
         const s = this.swaps.get(swapId);
         if (!s || s.progress !== 'proposed') return;

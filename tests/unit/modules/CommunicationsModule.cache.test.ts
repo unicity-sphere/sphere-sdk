@@ -67,6 +67,7 @@ function createMockStorage(): StorageProvider {
 
 const MY_PUBKEY = '02' + 'a'.repeat(64);
 const PEER_PUBKEY = '02' + 'b'.repeat(64);
+const PEER_PUBKEY_XONLY = 'b'.repeat(64);
 
 function createMockIdentity(): FullIdentity {
   return {
@@ -164,7 +165,7 @@ describe('CommunicationsModule cacheMessages option', () => {
     it('sendDM sends via transport but does not cache', async () => {
       const message = await mod.sendDM(PEER_PUBKEY, 'hi');
 
-      expect(deps.transport.sendMessage).toHaveBeenCalledWith(PEER_PUBKEY, 'hi');
+      expect(deps.transport.sendMessage).toHaveBeenCalledWith(PEER_PUBKEY_XONLY, 'hi');
       expect(message).toMatchObject({ content: 'hi' });
       expect(mod.getConversation(PEER_PUBKEY)).toEqual([]);
       expect(deps.storage.set).not.toHaveBeenCalled();

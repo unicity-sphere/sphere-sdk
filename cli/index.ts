@@ -4345,7 +4345,7 @@ async function main() {
                 const def = resolveCoin(currency);
                 return `${toHumanReadable(amount, def.decimals)} ${def.symbol}`;
               } catch {
-                return `${amount} ${currency}`;
+                return `${amount} ${currency} (raw)`;
               }
             };
             const offerStr = isProposer

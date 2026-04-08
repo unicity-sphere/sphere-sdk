@@ -88,7 +88,7 @@ RESULTS=()
 for i in "${!PIDS[@]}"; do
   if $SEQUENTIAL; then
     # Check the log for the summary line
-    if grep -q "0 failed" "${RESULTS_DIR}/${NAMES[$i]}.log" 2>/dev/null; then
+    if grep -q ' 0 failed' "${RESULTS_DIR}/${NAMES[$i]}.log" 2>/dev/null; then
       RESULTS+=("PASS")
     else
       RESULTS+=("FAIL")
@@ -130,12 +130,20 @@ echo "  Total: ${#TESTS[@]} tests, ${TOTAL_PASS} passed, ${TOTAL_FAIL} failed"
 echo "================================================================="
 echo ""
 
-# Show tail of failed test logs
+# Show tail of failed test logs + collect preserved escrow logs
 for i in "${!NAMES[@]}"; do
   if [[ "${RESULTS[$i]}" == "FAIL" ]]; then
     echo "--- Last 40 lines of ${NAMES[$i]}.log ---"
     tail -40 "${RESULTS_DIR}/${NAMES[$i]}.log" 2>/dev/null || true
     echo ""
+
+    # Collect preserved escrow log. cleanup() writes it as /tmp/escrow-${TEST_NAME}-${ts}.log.
+    # TEST_NAME differs from script filename, so grep for any escrow log newer than test start.
+    local_escrow_log=$(find /tmp -maxdepth 1 -name "escrow-*-*.log" -newer "${RESULTS_DIR}/${NAMES[$i]}.log" 2>/dev/null | head -1)
+    if [[ -n "$local_escrow_log" ]]; then
+      cp "$local_escrow_log" "${RESULTS_DIR}/${NAMES[$i]}-escrow.log" 2>/dev/null || true
+      echo "  Escrow log: ${RESULTS_DIR}/${NAMES[$i]}-escrow.log"
+    fi
   fi
 done
 

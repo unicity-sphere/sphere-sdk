@@ -194,6 +194,18 @@ cleanup() {
     while kill -0 "$ESCROW_PID" 2>/dev/null && [[ $w -lt 5 ]]; do sleep 1; w=$((w+1)); done
     kill -9 -- -"$ESCROW_PID" 2>/dev/null || kill -9 "$ESCROW_PID" 2>/dev/null || true
   fi
+
+  # On failure: preserve escrow log for post-mortem diagnosis.
+  # Copy to a stable location that survives workspace cleanup.
+  if [[ $exit_code -ne 0 || $FAIL -gt 0 ]] && [[ -n "${WORKSPACE:-}" ]]; then
+    local escrow_log="${WORKSPACE}/escrow.log"
+    if [[ -f "$escrow_log" ]]; then
+      local preserved="/tmp/escrow-${TEST_NAME}-$(date +%s).log"
+      cp "$escrow_log" "$preserved" 2>/dev/null || true
+      log "Escrow log preserved: ${preserved}"
+    fi
+  fi
+
   if [[ "$KEEP_WALLETS" == "false" ]] && [[ -n "${WORKSPACE:-}" ]]; then
     for p in $WALLETS_TO_DELETE; do
       _cli wallet delete "$p" > /dev/null 2>&1 || true
@@ -374,7 +386,7 @@ get_coin_token_count() {
   local out
   out=$(cli_as "$profile" balance --no-sync 2>&1) || true
   # Match: "BTC: 0.00000010 (2 tokens)" or "BTC: 0.00000005 (1 token)"
-  echo "$out" | grep -P "^${symbol}:" | grep -oP '\((\d+) tokens?\)' | grep -oP '\d+' | head -1
+  echo "$out" | grep "^${symbol}:" | sed -n 's/.*(\([0-9]*\) token.*/\1/p' | head -1
 }
 
 # get_coin_amount <profile> <symbol>
@@ -398,7 +410,7 @@ get_coin_amount() {
   # Alternative: use the balance confirmedAmount + unconfirmedAmount fields.
   # For simplicity, extract the formatted balance and compare as strings.
   out=$(cli_as "$profile" balance --no-sync 2>&1) || true
-  echo "$out" | grep -P "^${symbol}:" | grep -oP "^${symbol}: \K[0-9.]+" | head -1
+  echo "$out" | grep "^${symbol}:" | sed -n "s/^${symbol}: \([0-9.]*\).*/\1/p" | head -1
 }
 
 # assert_coin_present <profile> <symbol> <label>
