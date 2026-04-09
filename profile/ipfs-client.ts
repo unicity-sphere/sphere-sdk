@@ -143,12 +143,21 @@ export async function fetchFromIpfs(
         }
       }
 
-      // If Content-Length is absent, use a streaming reader with a byte counter
-      if (contentLength == null && response.body != null) {
+      // Always use streaming reader with size enforcement.
+      // Content-Length is only a fast-reject pre-check — a malicious gateway
+      // can set Content-Length: 1000 but stream 500MB.
+      if (response.body != null) {
         return await readStreamWithLimit(response.body, maxSizeBytes, gateway);
       }
 
+      // Fallback for environments without ReadableStream (unlikely in Node 18+)
       const buffer = await response.arrayBuffer();
+      if (buffer.byteLength > maxSizeBytes) {
+        throw new ProfileError(
+          'BUNDLE_NOT_FOUND',
+          `Response ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
+        );
+      }
       return new Uint8Array(buffer);
     } catch (err) {
       if (err instanceof ProfileError) throw err;

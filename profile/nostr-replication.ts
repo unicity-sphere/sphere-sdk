@@ -11,7 +11,7 @@
  * understanding OrbitDB internals.
  *
  * Nostr event format:
- *   kind: 30078 (parameterized replaceable -- custom app data)
+ *   kind: 29000 (custom — non-replaceable, all entries preserved)
  *   tags: [["d", dbAddress], ["t", "orbitdb-oplog"], ["seq", sequenceNumber]]
  *   content: hex(encrypt(serialized_entry))
  *
@@ -25,8 +25,14 @@ import { encryptProfileValue, decryptProfileValue } from './encryption.js';
 // Constants
 // =============================================================================
 
-/** Nostr event kind for parameterized replaceable events (NIP-33). */
-const NOSTR_KIND_APP_DATA = 30078;
+/**
+ * Nostr event kind for OrbitDB OpLog entries.
+ * Uses kind 29000 (ephemeral-ish custom range) — NOT a replaceable kind.
+ * Kind 30078 was wrong: NIP-33 parameterized replaceable events retain only
+ * the latest event per (pubkey, kind, d-tag) triple, which would silently
+ * overwrite all previous OpLog entries. We need ALL entries preserved.
+ */
+const NOSTR_KIND_ORBITDB_OPLOG = 29000;
 
 /** Tag value used to filter OrbitDB OpLog events on the relay. */
 const OPLOG_TAG = 'orbitdb-oplog';
@@ -185,7 +191,7 @@ export class NostrReplicationBridge {
    * Publish an OrbitDB OpLog entry to the Nostr relay.
    *
    * The entry data is encrypted with the profile encryption key (AES-256-GCM),
-   * hex-encoded, and published as the content of a kind-30078 Nostr event.
+   * hex-encoded, and published as the content of a kind-29000 Nostr event.
    *
    * @param entryData - Raw serialized OpLog entry bytes.
    * @throws Error if the bridge is not started or publishing fails.
@@ -203,7 +209,7 @@ export class NostrReplicationBridge {
     const event = await this.buildSignedEvent({
       pubkey: this.pubkey!,
       created_at: Math.floor(Date.now() / 1000),
-      kind: NOSTR_KIND_APP_DATA,
+      kind: NOSTR_KIND_ORBITDB_OPLOG,
       tags: [
         ['d', this.config.dbAddress],
         ['t', OPLOG_TAG],
@@ -235,7 +241,7 @@ export class NostrReplicationBridge {
 
     const subId = randomSubscriptionId();
     const filter = {
-      kinds: [NOSTR_KIND_APP_DATA],
+      kinds: [NOSTR_KIND_ORBITDB_OPLOG],
       '#d': [this.config.dbAddress],
       '#t': [OPLOG_TAG],
       authors: [this.pubkey!],
@@ -267,7 +273,11 @@ export class NostrReplicationBridge {
         if (!Array.isArray(parsed)) return;
 
         if (parsed[0] === 'EVENT' && parsed[1] === subId && parsed[2]) {
-          events.push(parsed[2] as NostrEvent);
+          const evt = parsed[2] as NostrEvent;
+          // Verify event is from our wallet (relay filter is advisory — verify locally)
+          if (evt.pubkey !== this.pubkey) return;
+          if (evt.kind !== NOSTR_KIND_ORBITDB_OPLOG) return;
+          events.push(evt);
         } else if (parsed[0] === 'EOSE' && parsed[1] === subId) {
           settled = true;
           clearTimeout(timeout);
