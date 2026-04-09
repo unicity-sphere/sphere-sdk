@@ -1653,3 +1653,23 @@ export type {
 7. **Wraps TXF, does not replace it** -- UXF ingests `ITokenJson` objects (from `@unicitylabs/state-transition-sdk`) and reassembles them back. A thin adapter converts sphere-sdk's `TxfToken` to `ITokenJson` for integration. The existing `TxfStorageData` format remains the wallet's primary persistence format. UXF is an opt-in layer for deduplication, IPFS export, and multi-token packaging.
 
 8. **Minimal new dependencies** -- CBOR encoding uses `@ipld/dag-cbor` + `multiformats` (~50-80 KB minified). SHA-256 comes from `@noble/hashes` (already bundled). CAR file import/export uses `@ipld/car`. UXF is a separate tsup entry point, so consumers who don't use UXF don't pay the dependency cost.
+
+---
+
+## 9. Profile Module Integration
+
+The Profile module (`@unicitylabs/sphere-sdk/profile`) extends UXF with
+OrbitDB-backed wallet storage. It uses UxfPackage for token packaging
+and adds:
+
+- **ProfileStorageProvider** -- implements StorageProvider with OrbitDB + local cache
+- **ProfileTokenStorageProvider** -- implements TokenStorageProvider using multi-bundle UXF
+- **OrbitDB adapter** -- dynamic-import wrapper for @orbitdb/core
+- **Encryption** -- AES-256-GCM with HKDF-derived shared key
+- **Migration engine** -- 6-step legacy-to-Profile conversion
+
+The Profile module is a separate entry point (`./profile`) with its own
+dependencies (@orbitdb/core, helia as optional peerDependencies). It does
+not modify any existing SDK files -- factories are standalone.
+
+See docs/uxf/PROFILE-ARCHITECTURE.md for the full specification.

@@ -81,6 +81,13 @@ export { ProfileStorageProvider } from './profile-storage-provider';
 export { ProfileTokenStorageProvider } from './profile-token-storage-provider';
 
 // =============================================================================
+// Consolidation
+// =============================================================================
+
+export { ConsolidationEngine } from './consolidation';
+export type { ConsolidationResult } from './consolidation';
+
+// =============================================================================
 // Migration
 // =============================================================================
 

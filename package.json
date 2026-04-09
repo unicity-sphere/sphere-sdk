@@ -159,6 +159,7 @@
     "url": "https://github.com/unicity-sphere/sphere-sdk.git"
   },
   "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14.1.2",
     "@ipld/car": "^5.4.2",
     "@ipld/dag-cbor": "^9.2.5",
     "@noble/curves": "^2.0.1",
@@ -202,10 +203,10 @@
   "peerDependencies": {
     "@libp2p/crypto": ">=5.0.0",
     "@libp2p/peer-id": ">=6.0.0",
+    "@orbitdb/core": "^3.0.2",
+    "helia": "^6.1.1",
     "ipns": ">=10.0.0",
     "multiformats": ">=13.0.0",
-    "@orbitdb/core": ">=2.0.0",
-    "helia": ">=4.0.0",
     "ws": ">=8.0.0"
   },
   "peerDependenciesMeta": {

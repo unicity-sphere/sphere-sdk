@@ -1217,4 +1217,38 @@ element = #6.786433([element-header, bstr, tstr, content-hash, [*content-hash], 
 | Version | Date | Description |
 |---------|------|-------------|
 | 1.0.0-draft | 2026-03-26 | Initial draft specification |
+| 1.0.0-draft | 2026-03-30 | Added Appendix E: Multi-Bundle Protocol |
+
+## Appendix E: Multi-Bundle Protocol
+
+### E.1 UxfBundleRef
+
+Each UXF bundle in a Profile is referenced by a per-key entry in OrbitDB:
+
+Key pattern: `tokens.bundle.{CID}`
+
+Value (UxfBundleRef):
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| cid | text | yes | CID of the encrypted UXF CAR file on IPFS |
+| status | text | yes | 'active' or 'superseded' |
+| createdAt | uint | yes | Unix seconds |
+| device | text | no | Device identifier |
+| supersededBy | text | no | CID of consolidated bundle |
+| removeFromProfileAfter | uint | no | Unix seconds -- when to remove from Profile |
+| tokenCount | uint | no | Token count for quick display |
+
+### E.2 Multi-Bundle Read (Merge)
+When loading tokens, all active bundles are fetched, decrypted, deserialized
+via UxfPackage.fromCar(), and merged via UxfPackage.merge(). Content-addressed
+dedup ensures no duplication in the merged view.
+
+### E.3 Bundle Lifecycle
+active -> superseded (after consolidation) -> removed from Profile (after safety period)
+Old CIDs are NOT unpinned from IPFS. IPFS-side GC is a separate concern.
+
+### E.4 Consolidation
+When active bundle count exceeds 3, background consolidation merges all
+into one package. Two-phase commit via `consolidation.pending` key prevents
+crash-induced orphans.
 

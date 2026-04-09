@@ -72,15 +72,43 @@ export class OrbitDbAdapter implements ProfileDatabase {
     }
 
     try {
-      // 1. Create Helia IPFS node
+      // 1. Create Helia IPFS node with gossipsub (required by OrbitDB v3 Sync)
       const createHelia = heliaModule.createHelia ?? heliaModule.default?.createHelia;
+      const libp2pDefaults = heliaModule.libp2pDefaults ?? heliaModule.default?.libp2pDefaults;
       if (typeof createHelia !== 'function') {
         throw new Error('Could not resolve createHelia from helia module');
+      }
+
+      // OrbitDB v3 requires pubsub (gossipsub) in Helia's libp2p services.
+      // Helia v6 does not include gossipsub by default, so we must inject it.
+      let gossipsubFactory: any = null;
+      try {
+        const gossipsubModule: any = await import('@chainsafe/libp2p-gossipsub' as string);
+        gossipsubFactory = gossipsubModule.gossipsub ?? gossipsubModule.default?.gossipsub ?? gossipsubModule.default;
+      } catch {
+        // gossipsub not installed -- OrbitDB Sync will fail if it tries to use pubsub
       }
 
       const heliaOptions: Record<string, unknown> = {};
       if (config.directory) {
         heliaOptions.directory = config.directory;
+      }
+
+      // Build libp2p config with gossipsub if available
+      if (gossipsubFactory && typeof libp2pDefaults === 'function') {
+        const libp2pConfig = libp2pDefaults();
+        libp2pConfig.services = {
+          ...libp2pConfig.services,
+          pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
+        };
+        heliaOptions.libp2p = libp2pConfig;
+      } else if (gossipsubFactory) {
+        // libp2pDefaults not available -- pass minimal libp2p with gossipsub
+        heliaOptions.libp2p = {
+          services: {
+            pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
+          },
+        };
       }
 
       this.helia = await createHelia(heliaOptions);
@@ -201,9 +229,19 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // all entries as an object or iterable.
       const allEntries = await this.db.all();
 
-      // allEntries may be an object, a Map, or an async iterable depending
-      // on the OrbitDB version. Handle each case.
-      if (allEntries && typeof allEntries[Symbol.asyncIterator] === 'function') {
+      // allEntries may be an array of {key,value,hash}, an async iterable,
+      // a Map, or a plain object depending on the OrbitDB version.
+      if (Array.isArray(allEntries)) {
+        // OrbitDB v3 keyvalue `all()` returns Array<{key, value, hash}>
+        for (const entry of allEntries) {
+          const entryKey: string = entry.key ?? entry[0];
+          const entryValue = entry.value ?? entry[1];
+          if (prefix && !entryKey.startsWith(prefix)) {
+            continue;
+          }
+          result.set(entryKey, coerceToUint8Array(entryValue));
+        }
+      } else if (allEntries && typeof allEntries[Symbol.asyncIterator] === 'function') {
         for await (const entry of allEntries) {
           const entryKey: string = entry.key ?? entry[0];
           const entryValue = entry.value ?? entry[1];
@@ -373,7 +411,7 @@ async function derivePublicKeyShort(privateKeyHex: string): Promise<string> {
   try {
     // Dynamic import with type suppression -- @noble/curves is a mandatory
     // sphere-sdk dependency but may not have type declarations in this context
-    const secp256k1Module: any = await import('@noble/curves/secp256k1' as string);
+    const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
     const pubKeyBytes: Uint8Array = secp256k1Module.secp256k1.getPublicKey(privateKeyHex, true);
     return bytesToHex(pubKeyBytes).slice(0, 16);
   } catch {
@@ -381,7 +419,7 @@ async function derivePublicKeyShort(privateKeyHex: string): Promise<string> {
   }
 
   try {
-    const hashModule: any = await import('@noble/hashes/sha256' as string);
+    const hashModule: any = await import('@noble/hashes/sha2.js' as string);
     const hash: Uint8Array = hashModule.sha256(hexToBytes(privateKeyHex));
     return bytesToHex(hash).slice(0, 16);
   } catch {
