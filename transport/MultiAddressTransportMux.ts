@@ -118,10 +118,14 @@ export interface MultiAddressTransportMuxConfig {
   createWebSocket: WebSocketFactory;
   generateUUID?: UUIDGenerator;
   storage?: TransportStorageAdapter;
+  /** Private key for the Mux's NostrClient identity. If provided, the Mux
+   *  authenticates as this key — required for relays that filter gift-wrap
+   *  event delivery to the recipient's subscription. */
+  identityPrivateKey?: Uint8Array;
 }
 
 export class MultiAddressTransportMux {
-  private config: Required<Omit<MultiAddressTransportMuxConfig, 'createWebSocket' | 'generateUUID' | 'storage'>> & {
+  private config: Required<Omit<MultiAddressTransportMuxConfig, 'createWebSocket' | 'generateUUID' | 'storage' | 'identityPrivateKey'>> & {
     createWebSocket: WebSocketFactory;
     generateUUID: UUIDGenerator;
   };
@@ -156,7 +160,12 @@ export class MultiAddressTransportMux {
   // Event callbacks (mux-level, forwarded to all adapters)
   private eventCallbacks: Set<TransportEventCallback> = new Set();
 
+  // Identity key for the Mux's NostrClient — relays may filter gift-wrap
+  // delivery to the recipient's subscription key.
+  private readonly identityPrivateKey: Uint8Array | undefined;
+
   constructor(config: MultiAddressTransportMuxConfig) {
+    this.identityPrivateKey = config.identityPrivateKey;
     this.config = {
       relays: config.relays ?? [...DEFAULT_NOSTR_RELAYS],
       timeout: config.timeout ?? TIMEOUTS.WEBSOCKET_CONNECT,
@@ -282,11 +291,19 @@ export class MultiAddressTransportMux {
     this.status = 'connecting';
 
     try {
-      // Create primary keyManager if none exists
+      // Use the identity key if provided (avoids relay filtering issues where
+      // gift-wrap events are only pushed to subscriptions from the recipient's key).
+      // Falls back to random key.
       if (!this.primaryKeyManager) {
-        const tempKey = Buffer.alloc(32);
-        crypto.getRandomValues(tempKey);
-        this.primaryKeyManager = NostrKeyManager.fromPrivateKey(tempKey);
+        if (this.identityPrivateKey) {
+          this.primaryKeyManager = NostrKeyManager.fromPrivateKey(
+            Buffer.from(this.identityPrivateKey),
+          );
+        } else {
+          const tempKey = Buffer.alloc(32);
+          crypto.getRandomValues(tempKey);
+          this.primaryKeyManager = NostrKeyManager.fromPrivateKey(tempKey);
+        }
       }
 
       this.nostrClient = new NostrClient(this.primaryKeyManager, {
@@ -652,26 +669,21 @@ export class MultiAddressTransportMux {
       // Check wallet subscription health separately from chat subscription.
       // DMs (gift wraps) keep the chat subscription alive, but the wallet
       // subscription (TOKEN_TRANSFER events) can die silently.
+      // Check BOTH subscriptions independently — chat is more latency-sensitive.
+      const chatElapsed = Date.now() - this.lastChatEventAt;
       const walletElapsed = Date.now() - this.lastWalletEventAt;
-      if (walletElapsed > 300_000) { // 5 minutes — avoid unnecessary relay churn on idle wallets
-        logger.warn('Mux', `No wallet events for ${Math.round(walletElapsed / 1000)}s — re-subscribing`);
-        this.lastWalletEventAt = Date.now(); // prevent rapid re-subscribe
-        this.lastChatEventAt = Date.now();   // updateSubscriptions refreshes both
+      const needResubscribe = chatElapsed > 60_000 || walletElapsed > 300_000;
+
+      if (needResubscribe) {
+        const reason = chatElapsed > 60_000
+          ? `No chat events for ${Math.round(chatElapsed / 1000)}s`
+          : `No wallet events for ${Math.round(walletElapsed / 1000)}s`;
+        logger.warn('Mux', `${reason} — re-subscribing`);
+        this.lastChatEventAt = Date.now();
+        this.lastWalletEventAt = Date.now();
         this.updateSubscriptions().catch((err) => {
           logger.warn('Mux', 'Health check re-subscription failed:', err);
         });
-      } else {
-        // Chat subscription health — shorter threshold because DMs are
-        // latency-sensitive for swap protocol messages.
-        const chatElapsed = Date.now() - this.lastChatEventAt;
-        if (chatElapsed > 60_000) { // 1 minute
-          logger.warn('Mux', `No chat events for ${Math.round(chatElapsed / 1000)}s — re-subscribing`);
-          this.lastChatEventAt = Date.now();   // prevent rapid re-subscribe
-          this.lastWalletEventAt = Date.now(); // updateSubscriptions refreshes both
-          this.updateSubscriptions().catch((err) => {
-            logger.warn('Mux', 'Chat health check re-subscription failed:', err);
-          });
-        }
       }
     }, 30_000);
   }
@@ -1078,7 +1090,8 @@ export class MultiAddressTransportMux {
     addressIndex: number,
     kind: number,
     content: string,
-    tags: string[][]
+    tags: string[][],
+    options?: { verify?: boolean; maxAttempts?: number; label?: string }
   ): Promise<string> {
     const entry = this.addresses.get(addressIndex);
     if (!entry) throw new SphereError('Address not registered in mux', 'NOT_INITIALIZED');
@@ -1102,8 +1115,96 @@ export class MultiAddressTransportMux {
       tags: signedEvent.tags, pubkey: signedEvent.pubkey,
       created_at: signedEvent.created_at, sig: signedEvent.sig,
     });
-    await this.nostrClient.publishEvent(nostrEvent);
+
+    const verify = options?.verify ?? false;
+    if (!verify) {
+      await this.nostrClient.publishEvent(nostrEvent);
+      return signedEvent.id;
+    }
+
+    // Verified publish: publish → query-back → retry.
+    // Matches NostrTransportProvider.publishWithVerification() pattern.
+    const maxAttempts = options?.maxAttempts ?? 3;
+    const label = options?.label ?? 'event';
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.nostrClient.publishEvent(nostrEvent);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('Event rejected') && !msg.includes('rate') && !msg.includes('limit')) {
+          throw err;
+        }
+        if (attempt === maxAttempts) throw err;
+        logger.debug('Mux', `${label} publish attempt ${attempt} failed (${msg}), retrying...`);
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+
+      // Verify: query relay for this event
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const found = await this._queryEventById(signedEvent.id);
+        if (found) {
+          if (attempt > 1) {
+            logger.debug('Mux', `${label} verified on relay after ${attempt} attempt(s)`);
+          }
+          return signedEvent.id;
+        }
+      } catch {
+        if (attempt === maxAttempts) {
+          logger.debug('Mux', `${label} verification query failed — accepting as best-effort`);
+          return signedEvent.id;
+        }
+      }
+
+      if (attempt < maxAttempts) {
+        const delay = Math.min(2000 * attempt, 10000);
+        logger.debug('Mux', `${label} not found on relay, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw new SphereError(
+          `${label} not verified on relay after ${maxAttempts} attempts — delivery failed`,
+          'TRANSPORT_ERROR',
+        );
+      }
+    }
+
     return signedEvent.id;
+  }
+
+  /**
+   * Query the relay for a specific event by ID.
+   * Returns true if the event exists, false otherwise.
+   */
+  private async _queryEventById(eventId: string): Promise<boolean> {
+    if (!this.nostrClient) return false;
+    const filter = new Filter();
+    filter.ids = [eventId];
+    filter.limit = 1;
+
+    return new Promise<boolean>((resolve) => {
+      let found = false;
+      let subId: string | undefined;
+      const timeout = setTimeout(() => {
+        if (subId) { try { this.nostrClient!.unsubscribe(subId); } catch { /* */ } }
+        resolve(found);
+      }, 3000);
+
+      try {
+        subId = this.nostrClient!.subscribe(filter, {
+          onEvent: () => { found = true; },
+          onEndOfStoredEvents: () => {
+            clearTimeout(timeout);
+            if (subId) { try { this.nostrClient!.unsubscribe(subId); } catch { /* */ } }
+            resolve(found);
+          },
+        });
+      } catch {
+        clearTimeout(timeout);
+        resolve(false);
+      }
+    });
   }
 
   /**
@@ -1447,7 +1548,8 @@ export class AddressTransportAdapter implements TransportProvider {
       this.addressIndex,
       EVENT_KINDS.TOKEN_TRANSFER,
       content,
-      [['p', recipientPubkey], ['d', uniqueD], ['type', 'token_transfer']]
+      [['p', recipientPubkey], ['d', uniqueD], ['type', 'token_transfer']],
+      { verify: true, maxAttempts: 3, label: 'token_transfer' }
     );
   }
 
