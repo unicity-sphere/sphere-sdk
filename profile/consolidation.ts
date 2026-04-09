@@ -169,10 +169,22 @@ export class ConsolidationEngine {
     };
     await this.writePendingState(pendingState);
 
+    // TOCTOU mitigation: wait briefly then read back to detect concurrent consolidation.
+    // If another device wrote a different pending state in the race window, we abort.
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const readBack = await this.readPendingState();
+    if (readBack && readBack.device !== deviceId) {
+      this.log(
+        `Concurrent consolidation detected from device ${readBack.device} — aborting our attempt`,
+      );
+      return { consolidated: false, consolidatedCid: undefined, sourceBundleCount: 0, tokenCount: 0 };
+    }
+
     try {
       // Step 4-5: fetch, decrypt, merge
       const { UxfPackage } = await import('../uxf/UxfPackage.js');
       const mergedPkg = UxfPackage.create({ description: 'consolidated' });
+      const successfullyMergedCids: string[] = [];
 
       for (const cid of sourceCids) {
         try {
@@ -180,13 +192,21 @@ export class ConsolidationEngine {
           const carBytes = await decryptProfileValue(this.encryptionKey, encryptedCar);
           const pkg = await UxfPackage.fromCar(carBytes);
           mergedPkg.merge(pkg);
+          successfullyMergedCids.push(cid);
         } catch (err) {
           this.log(
-            `Failed to load bundle ${cid} during consolidation: ` +
+            `Failed to load bundle ${cid} during consolidation — ` +
+            `keeping it active (will retry next consolidation): ` +
             `${err instanceof Error ? err.message : String(err)}`,
           );
-          // Continue with remaining bundles -- partial merge is acceptable
+          // Do NOT mark this bundle as superseded — it stays active for retry
         }
+      }
+
+      // If no bundles were successfully merged, abort
+      if (successfullyMergedCids.length === 0) {
+        await this.db.del(CONSOLIDATION_PENDING_KEY);
+        return { consolidated: false, consolidatedCid: undefined, sourceBundleCount: 0, tokenCount: 0 };
       }
 
       // Step 6: export, encrypt, pin
@@ -197,23 +217,25 @@ export class ConsolidationEngine {
       // Count tokens in the merged package
       const tokenCount = mergedPkg.assembleAll().size;
 
-      // Steps 7-9: finalize
+      // Steps 7-9: finalize — ONLY supersede bundles that were successfully merged
       await this.finalizeConsolidation(
         consolidatedCid,
         tokenCount,
-        sourceCids,
+        successfullyMergedCids,  // NOT sourceCids — prevents data loss on partial merge
         activeBundles,
       );
 
+      const skippedCount = sourceCids.length - successfullyMergedCids.length;
       this.log(
-        `Consolidation complete: ${sourceCids.length} bundles merged into ${consolidatedCid} ` +
-        `(${tokenCount} tokens)`,
+        `Consolidation complete: ${successfullyMergedCids.length} of ${sourceCids.length} bundles ` +
+        `merged into ${consolidatedCid} (${tokenCount} tokens)` +
+        (skippedCount > 0 ? `, ${skippedCount} bundles kept active for retry` : ''),
       );
 
       return {
         consolidated: true,
         consolidatedCid,
-        sourceBundleCount: sourceCids.length,
+        sourceBundleCount: successfullyMergedCids.length,
         tokenCount,
       };
     } catch (err) {
