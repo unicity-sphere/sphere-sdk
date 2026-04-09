@@ -74,11 +74,24 @@ export {
 export { OrbitDbAdapter } from './orbitdb-adapter';
 
 // =============================================================================
+// Nostr Replication Bridge
+// =============================================================================
+
+export { NostrReplicationBridge } from './nostr-replication';
+export type { NostrReplicationConfig } from './nostr-replication';
+
+// =============================================================================
 // Storage Providers
 // =============================================================================
 
 export { ProfileStorageProvider } from './profile-storage-provider';
 export { ProfileTokenStorageProvider } from './profile-token-storage-provider';
+
+// =============================================================================
+// IPFS Client
+// =============================================================================
+
+export { pinToIpfs, fetchFromIpfs, verifyCidAccessible } from './ipfs-client';
 
 // =============================================================================
 // Consolidation

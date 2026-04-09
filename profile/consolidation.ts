@@ -29,6 +29,7 @@ import {
   encryptProfileValue,
   decryptProfileValue,
 } from './encryption.js';
+import { pinToIpfs, fetchFromIpfs } from './ipfs-client.js';
 
 // =============================================================================
 // Constants
@@ -49,8 +50,6 @@ const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 /** Threshold: consolidation is needed when active count exceeds this. */
 const CONSOLIDATION_THRESHOLD = 3;
 
-/** Default IPFS gateway URL. */
-const DEFAULT_IPFS_API_URL = 'https://ipfs.unicity.network';
 
 // =============================================================================
 // ConsolidationResult
@@ -188,7 +187,7 @@ export class ConsolidationEngine {
 
       for (const cid of sourceCids) {
         try {
-          const encryptedCar = await this.fetchCar(cid);
+          const encryptedCar = await fetchFromIpfs(this.ipfsGateways, cid);
           const carBytes = await decryptProfileValue(this.encryptionKey, encryptedCar);
           const pkg = await UxfPackage.fromCar(carBytes);
           mergedPkg.merge(pkg);
@@ -212,7 +211,7 @@ export class ConsolidationEngine {
       // Step 6: export, encrypt, pin
       const consolidatedCar = await mergedPkg.toCar();
       const encryptedCar = await encryptProfileValue(this.encryptionKey, consolidatedCar);
-      const consolidatedCid = await this.pinCar(encryptedCar);
+      const consolidatedCid = await pinToIpfs(this.ipfsGateways, encryptedCar);
 
       // Count tokens in the merged package
       const tokenCount = mergedPkg.assembleAll().size;
@@ -501,79 +500,6 @@ export class ConsolidationEngine {
     const serialized = new TextEncoder().encode(JSON.stringify(state));
     const encrypted = await encryptProfileValue(this.encryptionKey, serialized);
     await this.db.put(CONSOLIDATION_PENDING_KEY, encrypted);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Private: IPFS CAR helpers (duplicated from ProfileTokenStorageProvider)
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Pin an encrypted CAR file to IPFS and return the CID.
-   */
-  private async pinCar(encryptedCarBytes: Uint8Array): Promise<string> {
-    const gatewayUrl = this.ipfsGateways[0] ?? DEFAULT_IPFS_API_URL;
-    const url = `${gatewayUrl.replace(/\/$/, '')}/api/v0/dag/put`;
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/octet-stream',
-      },
-      body: encryptedCarBytes,
-    });
-
-    if (!response.ok) {
-      throw new ProfileError(
-        'ORBITDB_WRITE_FAILED',
-        `IPFS pin failed: HTTP ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const result = (await response.json()) as { Cid?: { '/': string }; Hash?: string };
-    const cid = result.Cid?.['/'] ?? result.Hash;
-    if (!cid) {
-      throw new ProfileError(
-        'ORBITDB_WRITE_FAILED',
-        'IPFS pin response did not contain a CID',
-      );
-    }
-
-    return cid;
-  }
-
-  /**
-   * Fetch an encrypted CAR file from IPFS by CID.
-   * Tries each configured gateway in order until one succeeds.
-   */
-  private async fetchCar(cid: string): Promise<Uint8Array> {
-    const gateways =
-      this.ipfsGateways.length > 0 ? this.ipfsGateways : [DEFAULT_IPFS_API_URL];
-
-    let lastError: Error | null = null;
-
-    for (const gateway of gateways) {
-      try {
-        const url = `${gateway.replace(/\/$/, '')}/ipfs/${cid}`;
-        const response = await fetch(url, {
-          headers: { Accept: 'application/octet-stream' },
-        });
-
-        if (!response.ok) {
-          lastError = new Error(`HTTP ${response.status} from ${gateway}`);
-          continue;
-        }
-
-        const buffer = await response.arrayBuffer();
-        return new Uint8Array(buffer);
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-      }
-    }
-
-    throw new ProfileError(
-      'BUNDLE_NOT_FOUND',
-      `Failed to fetch CAR ${cid} from all gateways: ${lastError?.message ?? 'unknown error'}`,
-    );
   }
 
   // ---------------------------------------------------------------------------

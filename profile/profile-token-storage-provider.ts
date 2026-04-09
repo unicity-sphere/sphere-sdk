@@ -51,6 +51,7 @@ import {
   decryptProfileValue,
   deriveProfileEncryptionKey,
 } from './encryption.js';
+import { pinToIpfs, fetchFromIpfs } from './ipfs-client.js';
 
 // =============================================================================
 // Constants
@@ -64,9 +65,6 @@ const DEFAULT_FLUSH_DEBOUNCE_MS = 2000;
 
 /** Threshold for logging a consolidation warning. */
 const CONSOLIDATION_WARNING_THRESHOLD = 3;
-
-/** Default IPFS gateway for CAR upload/fetch (used when none provided). */
-const DEFAULT_IPFS_API_URL = 'https://ipfs.unicity.network';
 
 // =============================================================================
 // Operational State Shape
@@ -357,7 +355,7 @@ export class ProfileTokenStorageProvider
       // 3. For each active bundle: fetch, decrypt, deserialize, merge
       for (const [cid] of activeBundles) {
         try {
-          const carBytes = await this.fetchCar(cid);
+          const carBytes = await fetchFromIpfs(this._ipfsGateways, cid);
           if (!this.encryptionKey) {
             throw new ProfileError(
               'PROFILE_NOT_INITIALIZED',
@@ -710,7 +708,7 @@ export class ProfileTokenStorageProvider
       if (this.lastPinnedCid) {
         cid = this.lastPinnedCid;
       } else {
-        cid = await this.pinCar(encryptedCar);
+        cid = await pinToIpfs(this._ipfsGateways, encryptedCar);
         this.lastPinnedCid = cid;
       }
 
@@ -1043,79 +1041,6 @@ export class ProfileTokenStorageProvider
     } catch {
       return null;
     }
-  }
-
-  // ===========================================================================
-  // Private: IPFS CAR operations (WU-P09 inlined)
-  // ===========================================================================
-
-  /**
-   * Pin an encrypted CAR file to IPFS and return the CID.
-   */
-  private async pinCar(encryptedCarBytes: Uint8Array): Promise<string> {
-    const gatewayUrl = this._ipfsGateways[0] ?? DEFAULT_IPFS_API_URL;
-    const url = `${gatewayUrl.replace(/\/$/, '')}/api/v0/dag/put`;
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/octet-stream',
-      },
-      body: encryptedCarBytes,
-    });
-
-    if (!response.ok) {
-      throw new ProfileError(
-        'ORBITDB_WRITE_FAILED',
-        `IPFS pin failed: HTTP ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const result = (await response.json()) as { Cid?: { '/': string }; Hash?: string };
-    const cid = result.Cid?.['/'] ?? result.Hash;
-    if (!cid) {
-      throw new ProfileError(
-        'ORBITDB_WRITE_FAILED',
-        'IPFS pin response did not contain a CID',
-      );
-    }
-
-    return cid;
-  }
-
-  /**
-   * Fetch an encrypted CAR file from IPFS by CID.
-   * Tries each configured gateway in order until one succeeds.
-   */
-  private async fetchCar(cid: string): Promise<Uint8Array> {
-    const gateways =
-      this._ipfsGateways.length > 0 ? this._ipfsGateways : [DEFAULT_IPFS_API_URL];
-
-    let lastError: Error | null = null;
-
-    for (const gateway of gateways) {
-      try {
-        const url = `${gateway.replace(/\/$/, '')}/ipfs/${cid}`;
-        const response = await fetch(url, {
-          headers: { Accept: 'application/octet-stream' },
-        });
-
-        if (!response.ok) {
-          lastError = new Error(`HTTP ${response.status} from ${gateway}`);
-          continue;
-        }
-
-        const buffer = await response.arrayBuffer();
-        return new Uint8Array(buffer);
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-      }
-    }
-
-    throw new ProfileError(
-      'BUNDLE_NOT_FOUND',
-      `Failed to fetch CAR ${cid} from all gateways: ${lastError?.message ?? 'unknown error'}`,
-    );
   }
 
   // ===========================================================================
