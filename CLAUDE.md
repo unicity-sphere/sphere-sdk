@@ -653,34 +653,18 @@ sphere-cli completions fish > ~/.config/fish/completions/sphere-cli.fish  # fish
 - Identity binding events include both for cross-resolution
 
 ### Token Registry (Remote + Cached)
-- `TokenRegistry` is a singleton that provides token metadata (symbol, name, decimals, icons) by coin ID
-- **No bundled data** — starts empty, data comes from remote URL + persistent cache
-- Configured in two places due to tsup bundle duplication (see below):
-  - By `createBrowserProviders()` / `createNodeProviders()` — configures the impl bundle's singleton
-  - By `Sphere.init()` / `Sphere.load()` / `Sphere.create()` — configures the main bundle's singleton
-- **Data flow:** on `configure()` → `performInitialLoad()`: try cache first (if fresh) → fall back to remote fetch (if `autoRefresh` is true) → start periodic auto-refresh
-- **Readiness:** `TokenRegistry.waitForReady(timeoutMs?)` — returns a promise that resolves when initial data is loaded (cache or remote). `PaymentsModule.load()` awaits this before parsing tokens to ensure metadata is available.
-- **Graceful degradation:** if no cache and no network, lookup methods return fallbacks (truncated coinId for symbol, 0 for decimals)
-- Remote URL per network: `constants.ts` → `NETWORKS[network].tokenRegistryUrl`
-- Cache keys: `STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE` (JSON) and `TOKEN_REGISTRY_CACHE_TS` (timestamp)
-- Race-safe: cache load skipped if remote data is already newer (`lastRefreshAt > cacheTs`)
-- Concurrent `refreshFromRemote()` calls are deduplicated (only one fetch at a time)
-- `TokenRegistry.destroy()` stops auto-refresh and resets singleton
-
-**tsup bundle duplication note:** tsup compiles multiple entry points (`index.ts`, `impl/browser/index.ts`, etc.) into separate bundles, each inlining its own copy of `TokenRegistry`. The static singleton in `dist/impl/browser/index.js` is a different instance from the one in `dist/index.js`. This is why `Sphere` must call `TokenRegistry.configure()` in its own bundle context, not rely on the factory functions alone.
+- Singleton providing token metadata (symbol, name, decimals, icons) by coin ID; no bundled data
+- Configured both by `createBrowser/NodeProviders()` AND by `Sphere.init/load/create()` due to tsup bundle duplication (impl and main bundles each inline their own `TokenRegistry` singleton)
+- On `configure()`: try cache → fall back to remote fetch → start periodic auto-refresh
+- `TokenRegistry.waitForReady(timeoutMs?)` — awaited by `PaymentsModule.load()` before parsing tokens
+- Cache keys: `STORAGE_KEYS_GLOBAL.TOKEN_REGISTRY_CACHE` + `TOKEN_REGISTRY_CACHE_TS`; remote URL per network in `constants.ts`
+- Graceful fallback if offline (truncated coinId, 0 decimals); concurrent `refreshFromRemote()` deduplicated
 
 ### Price Provider (CoinGecko)
-- `CoinGeckoPriceProvider` fetches token prices from CoinGecko API with multi-layer caching
-- **In-memory cache:** prices cached with configurable TTL (`cacheTtlMs`, default 60s)
-- **Persistent cache:** when `StorageProvider` is passed, prices are persisted to survive page reloads
-  - Cache keys: `STORAGE_KEYS_GLOBAL.PRICE_CACHE` (JSON) and `PRICE_CACHE_TS` (timestamp)
-  - On first `getPrices()` call: loads from storage if within TTL, populates in-memory cache
-  - After each successful API fetch: saves all cached prices to storage (fire-and-forget)
-  - Factory functions (`createBrowserProviders`, `createNodeProviders`) pass storage automatically
-- **Unlisted tokens:** tokens not found on CoinGecko (e.g., UCT, USDU) are cached with zero-price `TokenPrice` entries (`priceUsd: 0`), persisted to storage, and not re-requested until TTL expires
-- **Request deduplication:** concurrent `getPrices()` calls share an in-flight fetch promise if all requested tokens are covered by the current request
-- **Rate-limit backoff:** on 429 response, extends stale cache entries by 60s to prevent retry hammering
-- **Error resilience:** on fetch failure, returns stale cached data if available; corrupted storage data is silently ignored
+- `CoinGeckoPriceProvider` with in-memory TTL cache (`cacheTtlMs`, default 60s) + persistent cache via `StorageProvider`
+- Cache keys: `STORAGE_KEYS_GLOBAL.PRICE_CACHE` + `PRICE_CACHE_TS`; factory functions pass storage automatically
+- Unlisted tokens (e.g., UCT, USDU) cached with `priceUsd: 0` to avoid re-requesting
+- In-flight fetch deduplication; 429 backoff extends stale entries 60s; on fetch failure returns stale data
 
 ### Event Timestamp Persistence
 - Transport persists last processed wallet event timestamp via `TransportStorageAdapter`
@@ -749,45 +733,7 @@ OPEN / PARTIAL / COVERED  → EXPIRED  (overlay — dueDate passed, not covered 
 
 ## Testing
 
-**Framework:** Vitest
-**Total tests:** 2213 (110 test files)
-
-Key test files:
-- `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
-- `tests/unit/core/Sphere.clear.test.ts` - Wallet data cleanup (storage + tokenStorage + vesting)
-- `tests/unit/transport/NostrTransportProvider.test.ts` - Transport layer, event timestamp persistence
-- `tests/unit/modules/PaymentsModule.test.ts` - Payment operations
-- `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
-- `tests/unit/modules/CommunicationsModule.storage.test.ts` - DM per-address storage, migration, pagination
-- `tests/unit/modules/CommunicationsModule.resolve.test.ts` - Peer nametag resolution via transport fallback
-- `tests/unit/modules/AccountingModule.lifecycle.test.ts` - Module init, load, destroy lifecycle
-- `tests/unit/modules/AccountingModule.createInvoice.test.ts` - Invoice creation and minting
-- `tests/unit/modules/AccountingModule.importInvoice.test.ts` - Invoice import from received TXF token
-- `tests/unit/modules/AccountingModule.getInvoiceStatus.test.ts` - Status computation (state machine, balances)
-- `tests/unit/modules/AccountingModule.getInvoices.test.ts` - List/filter/sort/paginate invoices
-- `tests/unit/modules/AccountingModule.closeCancel.test.ts` - close/cancel terminal state transitions
-- `tests/unit/modules/AccountingModule.payReturn.test.ts` - payInvoice and returnInvoicePayment
-- `tests/unit/modules/AccountingModule.autoReturn.test.ts` - Auto-return settings and dedup ledger
-- `tests/unit/modules/AccountingModule.autoTerminate.test.ts` - autoTerminateOnReturn config
-- `tests/unit/modules/AccountingModule.storage.test.ts` - Persistent state (terminal sets, frozen balances)
-- `tests/unit/modules/AccountingModule.events.test.ts` - Event emission for all invoice state changes
-- `tests/unit/modules/AccountingModule.receipts.test.ts` - sendInvoiceReceipts and sendCancellationNotices
-- `tests/unit/modules/AccountingModule.dmProcessing.test.ts` - Incoming receipt/cancellation DM handling
-- `tests/unit/modules/AccountingModule.concurrency.test.ts` - Per-invoice async mutex (withInvoiceGate)
-- `tests/unit/modules/AccountingModule.onChain.test.ts` - On-chain transfer attribution
-- `tests/unit/modules/AccountingModule.minting.test.ts` - Invoice token minting via PaymentsModule
-- `tests/unit/modules/AccountingModule.memo.test.ts` - Invoice memo encoding/decoding
-- `tests/unit/modules/AccountingModule.surplus.test.ts` - Overpayment detection and surplus events
-- `tests/unit/modules/AccountingModule.validation.test.ts` - Input validation and error paths
-- `tests/unit/modules/AccountingModule.errors.test.ts` - Error codes and SphereError propagation
-- `tests/unit/modules/AccountingModule.relatedTransfers.test.ts` - getRelatedTransfers index
-- `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
-- `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider: caching, deduplication, rate-limit backoff, persistent storage, unlisted tokens
-- `tests/unit/l1/*.test.ts` - L1 blockchain utilities (incl. vesting Node.js fallback)
-- `tests/unit/l1/L1PaymentsHistory.test.ts` - L1 transaction history direction/amounts
-- `tests/unit/impl/browser/IndexedDBStorageProvider.test.ts` - IndexedDB kv storage, per-address scoping
-- `tests/integration/tracked-addresses.test.ts` - Tracked addresses registry
-- `tests/relay/groupchat-relay.test.ts` - GroupChat NIP-29 relay integration (Docker + remote)
+**Framework:** Vitest (2213 tests across 110 files). Tests organized under `tests/unit/` (by module) and `tests/integration/`. Relay tests under `tests/relay/`.
 
 ### Relay Integration Tests
 

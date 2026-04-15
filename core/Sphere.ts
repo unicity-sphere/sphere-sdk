@@ -2630,10 +2630,20 @@ export class Sphere {
 
     // Create mux on first call
     if (!this._transportMux) {
+      // Pass the identity's private key so the Mux's NostrClient authenticates
+      // as the wallet. Some relays only deliver gift-wrap (kind 1059) events
+      // to subscriptions from the recipient's key.
+      const identityKey = identity.privateKey
+        ? (typeof identity.privateKey === 'string'
+            ? Buffer.from(identity.privateKey, 'hex')
+            : Buffer.from(identity.privateKey))
+        : undefined;
+
       this._transportMux = new MultiAddressTransportMux({
         relays: nostrTransport.getConfiguredRelays(),
         createWebSocket: nostrTransport.getWebSocketFactory(),
         storage: nostrTransport.getStorageAdapter() ?? undefined,
+        identityPrivateKey: identityKey,
       });
 
       // Connect the mux
