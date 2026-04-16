@@ -6,17 +6,17 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 
 - **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
 - **L1 Payments** - ALPHA blockchain transactions via Fulcrum WebSocket
-- **L3 Payments** - Token transfers with state transition proofs
+- **L3 Payments** - Token transfers with state transition proofs, concurrent-send safety (SpendQueue)
+- **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs
+- **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
-- **Nostr Transport** - P2P messaging with NIP-04 encryption
+- **Nostr Transport** - Resilient P2P messaging with verified publish, health checks, NIP-17 gift-wrap
 - **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
-- **Token Splitting** - Partial transfer amount calculations
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
-- **TXF Serialization** - Token eXchange Format for storage and transfer
 - **Token Validation** - Aggregator-based token verification
-- **Core Utilities** - Crypto, currency, bech32, base58 functions
 - **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
+- **CLI** - Comprehensive command-line interface with shell auto-completion
 
 ## Installation
 

@@ -20,6 +20,8 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   nametag: 'alice',          // Optional: register @alice on create
   l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
   price: priceProvider,      // Optional PriceProvider
+  accounting: true,          // Optional: enable invoicing module
+  swap: true,                // Optional: enable swap module (requires accounting)
   derivationPath: "m/44'/0'/0'", // Optional custom path
   dmSince: Math.floor(Date.now() / 1000) - 86400, // Optional: DM history fallback (unix seconds)
 });
@@ -66,6 +68,8 @@ await Sphere.clear(storage);
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
 | `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
+| `accounting` | `AccountingModule \| null` | Invoice lifecycle and payment attribution |
+| `swap` | `SwapModule \| null` | P2P token swap orchestration |
 
 ### Instance Methods
 

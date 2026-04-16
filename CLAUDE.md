@@ -33,6 +33,8 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   autoGenerate: true,   // Generate mnemonic if no wallet exists
   nametag: 'alice',     // Optional: register @alice for receiving payments
   password: 'secret',   // Optional: encrypt mnemonic (plaintext if omitted)
+  accounting: true,     // Enable accounting/invoicing module
+  swap: true,           // Enable token swap module
 });
 
 if (created && generatedMnemonic) {
@@ -112,6 +114,18 @@ sphere.payments.onPaymentRequest((req) => {
   sphere.payments.payPaymentRequest(req.id);  // or rejectPaymentRequest()
 });
 
+// 12a. Invoicing (requires accounting: true in init)
+const invoice = await sphere.accounting.createInvoice({
+  targets: [{ address: identity.directAddress!, assets: [{ coin: ['UCT', '1000000'] }] }],
+  memo: 'Order #1234',
+});
+
+// 12b. Token swaps (requires swap: true in init)
+const swap = await sphere.swap.proposeSwap({
+  give: { currency: 'UCT', amount: '1000000' },
+  receive: { currency: 'USDU', amount: '500000' },
+}, { recipient: '@bob', escrowAddress: 'DIRECT://escrow...' });
+
 // 13. Cleanup
 await sphere.destroy();
 ```
@@ -120,141 +134,22 @@ await sphere.destroy();
 
 ## Connect Protocol (dApp ↔ Wallet Integration)
 
-The SDK ships a full **Connect Protocol** — a typed RPC layer that allows web dApps to communicate with the Sphere wallet without exposing private keys.
-
-> Full guide: [`docs/CONNECT.md`](docs/CONNECT.md)
-
-### Key Concepts
+Typed RPC layer for dApp ↔ wallet communication. Full guide: [`docs/CONNECT.md`](docs/CONNECT.md)
 
 | Role | Class | Where it runs |
 |------|-------|--------------|
 | dApp (client) | `ConnectClient` | any web page / app |
 | Wallet (host) | `ConnectHost` | Sphere app / extension background |
 
-### Transport Types
+**Transports:** `PostMessageTransport` (iframe/popup), `ExtensionTransport` (browser extension), `WebSocketTransport` (Node.js).
 
-| Transport | Import path | When to use |
-|-----------|-------------|-------------|
-| `PostMessageTransport` | `@unicitylabs/sphere-sdk/connect/browser` | dApp inside iframe OR wallet popup |
-| `ExtensionTransport` | `@unicitylabs/sphere-sdk/connect/browser` | Sphere browser extension installed |
-| `WebSocketTransport` | `@unicitylabs/sphere-sdk/connect/nodejs` | Node.js server-side wallet host |
+**Queries:** `sphere_getIdentity`, `sphere_getBalance`, `sphere_getFiatBalance`, `sphere_l1GetBalance`, `sphere_getAssets`, `sphere_getTokens`, `sphere_getHistory`, `sphere_l1GetHistory`, `sphere_resolve`.
 
-### ConnectClient (dApp side)
+**Intents:** `send`, `l1_send`, `dm`, `payment_request`, `receive`, `sign_message`.
 
-```typescript
-import { ConnectClient } from '@unicitylabs/sphere-sdk/connect';
-import { ExtensionTransport, PostMessageTransport } from '@unicitylabs/sphere-sdk/connect/browser';
+**Permissions:** `identity:read`, `balance:read`, `history:read`, `assets:read`, `intent:send`, `intent:l1_send`, `intent:dm`, `intent:payment_request`, `intent:receive`, `intent:sign_message`.
 
-// Priority-based transport selection
-let transport: ConnectTransport;
-if (isInIframe())       transport = PostMessageTransport.forClient();          // P1
-else if (hasExt())      transport = ExtensionTransport.forClient();            // P2
-else                    transport = PostMessageTransport.forClient({ target: popup, targetOrigin: WALLET_URL }); // P3
-
-const client = new ConnectClient({
-  transport,
-  dapp: { name: 'My App', description: '...', url: location.origin },
-  silent: true,      // fast-fail if not approved yet (no popup, no UI)
-  resumeSessionId,   // optional: resume popup session across reloads
-});
-
-const { identity, permissions, sessionId } = await client.connect();
-
-// Queries (read-only, no user interaction)
-const balance = await client.query('sphere_getBalance');
-const assets  = await client.query('sphere_getAssets');
-
-// Intents (require user confirmation in wallet)
-await client.intent('send', { recipient: '@alice', amount: 100, coinId: 'USDC' });
-await client.intent('sign_message', { message: 'I agree to ToS' });
-
-// Events (real-time push from wallet)
-const unsub = client.on('transfer:incoming', (data) => { ... });
-
-await client.disconnect();
-```
-
-### ConnectHost (wallet side)
-
-```typescript
-import { ConnectHost } from '@unicitylabs/sphere-sdk/connect';
-import { ExtensionTransport } from '@unicitylabs/sphere-sdk/connect/browser';
-
-const host = new ConnectHost({
-  sphere,          // Sphere instance (unlocked wallet)
-  transport: ExtensionTransport.forHost(chromeApi),
-  onConnectionRequest: async (dapp, requestedPermissions, silent) => {
-    // silent=true → fast-check approved list, no popup
-    // silent=false → show approval UI
-    return { approved: true, grantedPermissions: requestedPermissions };
-  },
-  onIntent: async (action, params, session) => {
-    // Route to correct UI (send modal, sign modal, etc.)
-    return { result: { ... } };
-  },
-  onDisconnect: async (session) => {
-    // dApp called disconnect() — revoke approval if needed
-  },
-});
-
-host.destroy(); // call on wallet lock
-```
-
-### Silent Mode (auto-connect on page load)
-
-```typescript
-// On mount: check silently if origin already approved
-const client = new ConnectClient({ transport, dapp, silent: true });
-try {
-  const result = await client.connect(); // instant success if approved
-} catch {
-  // Not approved — show Connect button, no error displayed
-}
-```
-
-**Extension behavior with `silent=true`:**
-- Origin in approved storage → approve immediately (no popup)
-- Origin NOT in storage → reject immediately (no popup)
-
-### Available RPC Methods
-
-| Method | Description |
-|--------|-------------|
-| `sphere_getIdentity` | Public identity (nametag, addresses) |
-| `sphere_getBalance` | L3 token balances |
-| `sphere_getFiatBalance` | USD value |
-| `sphere_l1GetBalance` | L1 (ALPHA) balance |
-| `sphere_getAssets` | Assets grouped by coin |
-| `sphere_getTokens` | Individual tokens |
-| `sphere_getHistory` | Transaction history |
-| `sphere_l1GetHistory` | L1 transaction history |
-| `sphere_resolve` | Resolve nametag/address |
-
-### Available Intent Actions
-
-| Action | User sees | Description |
-|--------|-----------|-------------|
-| `send` | Send modal | Send L3 tokens |
-| `l1_send` | L1 send modal | Send L1 transaction |
-| `dm` | DM modal | Send direct message |
-| `payment_request` | Request modal | Create payment request |
-| `receive` | Receive modal | Show receive address |
-| `sign_message` | Sign modal | Sign arbitrary message |
-
-### Permission Scopes
-
-| Scope | Grants access to |
-|-------|-----------------|
-| `identity:read` | Public identity info |
-| `balance:read` | Balance queries |
-| `history:read` | Transaction history |
-| `assets:read` | Asset/token list |
-| `intent:send` | Send intent |
-| `intent:l1_send` | L1 send intent |
-| `intent:dm` | DM intent |
-| `intent:payment_request` | Payment request intent |
-| `intent:receive` | Receive intent |
-| `intent:sign_message` | Sign message intent |
+**Silent mode:** `new ConnectClient({ ..., silent: true })` — fast-check approved list without UI popup.
 
 ---
 
@@ -296,6 +191,16 @@ try {
 | `sphere.switchToAddress(index)` | `void` | Switch HD address |
 | `sphere.getActiveAddresses()` | `TrackedAddress[]` | Non-hidden tracked addresses |
 | `sphere.on(event, handler)` | `() => void` (unsubscribe) | Subscribe to events |
+| `sphere.accounting.createInvoice(request)` | `CreateInvoiceResult` | Mint a new invoice token |
+| `sphere.accounting.importInvoice(token)` | `InvoiceTerms` | Import a received invoice TXF token |
+| `sphere.accounting.getInvoiceStatus(invoiceId)` | `InvoiceStatus` | Full status with per-target balances |
+| `sphere.accounting.payInvoice(invoiceId, params)` | `TransferResult` | Send payment referencing an invoice |
+| `sphere.accounting.closeInvoice(invoiceId)` | `void` | Explicitly close (terminal state) |
+| `sphere.accounting.cancelInvoice(invoiceId)` | `void` | Cancel and optionally auto-return |
+| `sphere.swap.proposeSwap(deal, options?)` | `SwapProposalResult` | Propose a token swap |
+| `sphere.swap.acceptSwap(swapId)` | `void` | Accept a swap proposal |
+| `sphere.swap.deposit(swapId)` | `TransferResult` | Deposit into a swap |
+| `sphere.swap.getSwaps(filter?)` | `SwapRef[]` | List swaps with filter |
 
 ### Key Events
 
@@ -310,6 +215,16 @@ try {
 | `address:activated` | `{ address: TrackedAddress }` | New address tracked |
 | `sync:provider` | `{ providerId, success, added, removed }` | Per-provider sync result |
 | `payment_request:incoming` | `IncomingPaymentRequest` | Received payment request |
+| `invoice:created` | `{ invoiceId, confirmed }` | Invoice token minted or imported |
+| `invoice:payment` | `{ invoiceId, transfer, paymentDirection, confirmed }` | Payment attributed to invoice |
+| `invoice:covered` | `{ invoiceId, confirmed }` | All targets fully covered |
+| `invoice:closed` | `{ invoiceId, explicit }` | Invoice moved to CLOSED |
+| `invoice:cancelled` | `{ invoiceId }` | Invoice moved to CANCELLED |
+| `swap:proposal_received` | `{ swapId, deal, senderPubkey, senderNametag? }` | Incoming swap proposal |
+| `swap:accepted` | `{ swapId, role }` | Swap accepted |
+| `swap:deposit_confirmed` | `{ swapId, party, amount, coinId }` | Deposit confirmed by escrow |
+| `swap:completed` | `{ swapId, payoutVerified }` | Swap completed (terminal) |
+| `swap:cancelled` | `{ swapId, reason, depositsReturned? }` | Swap cancelled (terminal) |
 
 See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) for detailed guides.
 
@@ -321,7 +236,7 @@ See [QUICKSTART-BROWSER.md](docs/QUICKSTART-BROWSER.md) and [QUICKSTART-NODEJS.m
 - **L1 (ALPHA blockchain)** - UTXO-based blockchain transactions via Electrum
 - **L3 (Unicity state transition network)** - Token transfers with state proofs via Aggregator
 
-**Version:** 0.3.3
+**Version:** 0.6.14
 **License:** MIT
 **Target:** Node.js >= 18.0.0, Browser (ESM/CJS)
 
@@ -348,6 +263,19 @@ sphere-sdk/
 │   │   ├── TokenSplitCalculator.ts
 │   │   ├── TokenSplitExecutor.ts
 │   │   └── NametagMinter.ts       # On-chain nametag minting
+│   ├── accounting/
+│   │   ├── AccountingModule.ts    # Invoice lifecycle and payment attribution
+│   │   ├── types.ts               # InvoiceTerms, InvoiceStatus, etc.
+│   │   ├── balance-computer.ts    # Per-target status computation
+│   │   ├── auto-return.ts         # Automatic refund management
+│   │   ├── memo.ts                # Invoice memo encoding + hashInvoiceId
+│   │   └── serialization.ts       # Canonical invoice serialization
+│   ├── swap/
+│   │   ├── SwapModule.ts          # P2P token swap lifecycle
+│   │   ├── dm-protocol.ts         # NIP-17 swap DM message protocol
+│   │   ├── escrow-client.ts       # Escrow service interaction
+│   │   ├── manifest.ts            # Swap manifest signing/verification
+│   │   └── state-machine.ts       # Swap progress transitions
 │   ├── groupchat/
 │   │   ├── GroupChatModule.ts     # NIP-29 group chat (relay-based)
 │   │   ├── types.ts               # GroupData, GroupMessageData, etc.
@@ -621,10 +549,32 @@ TxfStorageDataBase {
 }
 ```
 
+### Accounting / Invoicing
+
+`AccountingModule` (`sphere.accounting`) manages the full invoice lifecycle.
+
+**Invoice IS a token.** Minted as an L3 token with `tokenType = INVOICE_TOKEN_TYPE_HEX`. Terms serialized into `genesis.data.tokenData`.
+
+**State machine:** `OPEN -> PARTIAL -> COVERED -> CLOSED` (or `CANCELLED`, `EXPIRED`). Terminal states freeze balances.
+
+**Privacy: hashed invoice IDs.** On-chain memos embed `SHA-256(invoiceId)` instead of the raw ID. Third parties cannot correlate tokens to invoices. Recipients verify by re-hashing their known ID. Backward-compatible with legacy raw-ID memos via `resolveInvoiceRef()`.
+
+**Auto-return.** When enabled, automatically refunds payments to closed/cancelled invoices with dedup ledger to prevent double-refunds.
+
+### Token Swaps
+
+`SwapModule` (`sphere.swap`) orchestrates P2P token swaps via an escrow service.
+
+**Protocol v2:** Proposals include signed manifests with nametag binding proofs. All messages use NIP-17 encrypted DMs. Escrow holds deposits and executes payouts.
+
+**State machine:** `proposed -> accepted -> announced -> depositing -> concluding -> completed` (or `cancelled`, `failed` at any point).
+
+**Deposit via invoice.** Each party deposits by paying an escrow-created invoice. Payout is verified locally via `verifyPayout()`.
+
 ## Testing
 
 **Framework:** Vitest
-**Total tests:** 1613 (63 test files)
+**Total tests:** 2539 (124 test files)
 
 Key test files:
 - `tests/unit/core/Sphere.nametag-sync.test.ts` - Nametag sync/recovery
@@ -634,6 +584,8 @@ Key test files:
 - `tests/unit/modules/NametagMinter.test.ts` - Nametag minting
 - `tests/unit/modules/CommunicationsModule.storage.test.ts` - DM per-address storage, migration, pagination
 - `tests/unit/modules/CommunicationsModule.resolve.test.ts` - Peer nametag resolution via transport fallback
+- `tests/unit/modules/AccountingModule.*.test.ts` - Invoice lifecycle, status, auto-return, receipts, etc.
+- `tests/unit/modules/SwapModule.*.test.ts` - Swap lifecycle, deposits, payouts, cancellation
 - `tests/unit/registry/TokenRegistry.test.ts` - Token registry: remote fetch, caching, auto-refresh, waitForReady
 - `tests/unit/price/CoinGeckoPriceProvider.test.ts` - Price provider: caching, deduplication, rate-limit backoff, persistent storage, unlisted tokens
 - `tests/unit/l1/*.test.ts` - L1 blockchain utilities (incl. vesting Node.js fallback)
@@ -669,9 +621,10 @@ RELAY_URL=wss://sphere-relay.unicity.network npm run test:relay
 ## File Size Reference
 
 Largest files (for context):
-- `modules/payments/PaymentsModule.ts` - 88KB (main payment logic)
-- `core/Sphere.ts` - 72KB (wallet lifecycle)
-- `transport/NostrTransportProvider.ts` - ~15KB (Nostr messaging)
+- `modules/payments/PaymentsModule.ts` - ~200KB (main payment logic)
+- `core/Sphere.ts` - ~160KB (wallet lifecycle)
+- `modules/swap/SwapModule.ts` - ~150KB (swap lifecycle)
+- `modules/accounting/AccountingModule.ts` - ~130KB (invoice lifecycle)
 
 ## Code Style
 
