@@ -15,6 +15,7 @@ import {
   buildInvoiceMemo,
   decodeTransferMessage,
   encodeTransferMessage,
+  parseInvoiceMemoForOnChain,
   hashInvoiceId,
 } from '../../../modules/accounting/memo.js';
 import { SphereError } from '../../../core/errors.js';
@@ -136,6 +137,20 @@ describe('AccountingModule Memo Utilities', () => {
     expect(parsed!.invoiceId).toBe(hashInvoiceId(VALID_ID));
     expect(parsed!.paymentDirection).toBe('back');
     expect(parsed!.freeText).toBe('some text');
+  });
+
+  it('on-chain message contains single hash (not double-hash)', () => {
+    const memo = buildInvoiceMemo(VALID_ID, 'F');
+    const onChainBytes = parseInvoiceMemoForOnChain(memo);
+
+    expect(onChainBytes).not.toBeNull();
+    const payload = JSON.parse(new TextDecoder().decode(onChainBytes!));
+    const singleHash = hashInvoiceId(VALID_ID);
+    const doubleHash = hashInvoiceId(singleHash);
+
+    expect(payload.inv.id).toBe(singleHash);
+    expect(payload.inv.id).not.toBe(doubleHash);
+    expect(payload.inv.id).not.toBe(VALID_ID);
   });
 
   // UT-MEMO-009

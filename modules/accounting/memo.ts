@@ -442,10 +442,9 @@ export function parseInvoiceMemoForOnChain(
     }
   }
 
-  // Embed the hash of the invoice ID (not the raw ID) for on-chain privacy.
-  // The recipient can verify the binding by hashing their known invoice ID.
+  // ref.invoiceId is already hashed by buildInvoiceMemo — pass through as-is.
   const inv: NonNullable<TransferMessagePayload['inv']> = {
-    id: hashInvoiceId(ref.invoiceId),
+    id: ref.invoiceId,
     dir: DIRECTION_TO_CODE[ref.paymentDirection],
     ...(validRefundAddress ? { ra: validRefundAddress } : {}),
     ...(validContact ? { ct: validContact } : {}),
