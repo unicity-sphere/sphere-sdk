@@ -1531,8 +1531,18 @@ async function main() {
         if (networkIndex !== -1 && args[networkIndex + 1]) {
           network = args[networkIndex + 1] as NetworkType;
         }
-        if (mnemonicIndex !== -1 && args[mnemonicIndex + 1]) {
-          mnemonic = args[mnemonicIndex + 1];
+        if (mnemonicIndex !== -1) {
+          if (args[mnemonicIndex + 1] && !args[mnemonicIndex + 1].startsWith('--')) {
+            mnemonic = args[mnemonicIndex + 1];
+            // Clear from argv to reduce exposure in /proc/<pid>/cmdline
+            args[mnemonicIndex + 1] = '***';
+          } else {
+            // Interactive prompt — mnemonic never appears in process args
+            const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+            mnemonic = await new Promise<string>((resolve) => {
+              rl.question('Enter mnemonic phrase: ', (answer) => { rl.close(); resolve(answer.trim()); });
+            });
+          }
         }
 
         const nametagIndex = args.indexOf('--nametag');
@@ -1641,6 +1651,17 @@ async function main() {
       }
 
       case 'clear': {
+        if (!flags['yes'] && !flags['y']) {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+          const answer = await new Promise<string>((resolve) => {
+            rl.question('This will permanently delete ALL wallet data (keys, tokens, history). Type "yes" to confirm: ', (a) => { rl.close(); resolve(a.trim()); });
+          });
+          if (answer !== 'yes') {
+            console.log('Aborted.');
+            break;
+          }
+        }
+
         const config = loadConfig();
         const providers = createNodeProviders({
           network: config.network,
@@ -1721,6 +1742,10 @@ async function main() {
             if (!profileName) {
               console.error('Usage: wallet create <name> [--network testnet|mainnet|dev]');
               console.error('Example: npm run cli -- wallet create mywalletname');
+              process.exit(1);
+            }
+            if (!/^[a-zA-Z0-9_-]+$/.test(profileName)) {
+              console.error('Profile name must contain only letters, digits, hyphens, and underscores.');
               process.exit(1);
             }
 
@@ -2676,12 +2701,18 @@ async function main() {
         const wif = hexToWIF(privateKey);
         const addressInfo = generateAddressFromMasterKey(privateKey, 0);
 
-        console.log(JSON.stringify({
-          privateKey,
-          publicKey,
-          wif,
-          address: addressInfo.address,
-        }, null, 2));
+        if (flags['unsafe-print']) {
+          console.log(JSON.stringify({
+            privateKey,
+            publicKey,
+            wif,
+            address: addressInfo.address,
+          }, null, 2));
+        } else {
+          console.log(`Public Key: ${publicKey}`);
+          console.log(`Address: ${addressInfo.address}`);
+          console.log('(private key and WIF hidden — use --unsafe-print to display)');
+        }
         break;
       }
 
@@ -5007,4 +5038,8 @@ function generateFishCompletions(): string {
   return lines.join('\n') + '\n';
 }
 
-main().then(() => process.exit(0));
+main().then(() => process.exit(0)).catch((err) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`Fatal error: ${msg}`);
+  process.exit(1);
+});
