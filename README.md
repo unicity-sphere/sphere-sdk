@@ -68,10 +68,10 @@ npm run cli -- receive
 npm run cli -- receive --finalize
 
 # Send tokens (instant mode, default)
-npm run cli -- send @alice 1 --coin UCT --instant
+npm run cli -- send @alice 1 UCT --instant
 
 # Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 --coin UCT --conservative
+npm run cli -- send @alice 1 UCT --conservative
 
 # Request test tokens from faucet
 npm run cli -- topup
@@ -101,9 +101,9 @@ npm run cli -- verify-balance
 | **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
 | | `tokens` | List all tokens with details |
 | | `l1-balance` | Show L1 (ALPHA) balance |
-| | `topup [coin] [amount]` | Request test tokens from faucet |
+| | `topup [<amount> <symbol>]` | Request test tokens from faucet |
 | | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
-| **Transfers** | `send <to> <amount> [--coin SYM] [--instant\|--conservative]` | Send tokens |
+| **Transfers** | `send <to> <amount> <symbol> [--instant\|--conservative]` | Send tokens |
 | | `receive [--finalize]` | Check for incoming transfers |
 | | `history [limit]` | Show transaction history |
 | **Nametags** | `nametag <name>` | Register a nametag |
@@ -115,6 +115,8 @@ npm run cli -- verify-balance
 | | `parse-wallet <file>` | Parse wallet file |
 
 CLI data is stored in `./.sphere-cli/` directory.
+
+> **Shell completion:** Run `npm link && sphere-cli completions bash >> ~/.bashrc` for tab-completion of all commands. See [CLI Quickstart](docs/QUICKSTART-CLI.md) for details.
 
 ## Quick Start
 
