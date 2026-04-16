@@ -54,7 +54,7 @@ import type {
   SentNoticeInfo,
   FailedNoticeInfo,
 } from './types.js';
-import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage } from './memo.js';
+import { parseInvoiceMemo, buildInvoiceMemo, decodeTransferMessage, hashInvoiceId } from './memo.js';
 import { AutoReturnManager } from './auto-return.js';
 import { canonicalSerialize } from './serialization.js';
 import { hexToBytes } from '@noble/hashes/utils.js';
@@ -147,6 +147,11 @@ export class AccountingModule {
   // ---------------------------------------------------------------------------
 
   private invoiceTermsCache: Map<string, InvoiceTerms> = new Map();
+
+  // Privacy: SHA-256(invoiceId) → invoiceId. Enables lookup when on-chain
+  // messages contain hashed IDs instead of raw IDs. Built from invoiceTermsCache
+  // during load() and updated on createInvoice()/importInvoice().
+  private invoiceIdHashIndex: Map<string, string> = new Map();
 
   // ---------------------------------------------------------------------------
   // Terminal state tracking (in-memory, persisted via storage)
@@ -401,8 +406,11 @@ export class AccountingModule {
         }
       }
 
+      // Build hash→ID index for privacy-preserving on-chain lookups
+      this._rebuildHashIndex();
+
       if (this.config.debug) {
-        logger.debug(LOG_TAG, `Loaded ${this.invoiceTermsCache.size} invoice token(s)`);
+        logger.debug(LOG_TAG, `Loaded ${this.invoiceTermsCache.size} invoice token(s), hash index: ${this.invoiceIdHashIndex.size}`);
       }
     } catch (err) {
       logger.warn(LOG_TAG, 'Failed to enumerate tokens via PaymentsModule:', err);
@@ -1204,6 +1212,7 @@ export class AccountingModule {
       // The token was minted with the original `terms` (canonical hash), so this
       // normalization only affects the in-memory matching cache.
       this.invoiceTermsCache.set(invoiceId, this._normalizeInvoiceTerms(terms));
+      this._addToHashIndex(invoiceId);
 
       // Initialize ledger entry for this invoice in the outer map
       if (!this.invoiceLedger.has(invoiceId)) {
@@ -1642,6 +1651,7 @@ export class AccountingModule {
       this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
     }
     this.invoiceTermsCache.set(tokenId, terms);
+    this._addToHashIndex(tokenId);
 
     if (!this.invoiceLedger.has(tokenId)) {
       this.invoiceLedger.set(tokenId, new Map());
@@ -3821,6 +3831,7 @@ export class AccountingModule {
     this.unsubscribeDMs = null;
 
     this.invoiceTermsCache.clear();
+    this.invoiceIdHashIndex.clear();
     this.cancelledInvoices.clear();
     this.closedInvoices.clear();
     this.frozenBalances.clear();
@@ -3836,6 +3847,44 @@ export class AccountingModule {
     this.balanceCache.clear();
     this.dirtyLedgerEntries.clear();
     this._gateMap = new AsyncGateMap();
+  }
+
+  // ===========================================================================
+  // Internal: Invoice ID hash index (privacy-preserving lookup)
+  // ===========================================================================
+
+  /**
+   * Rebuild the hash→invoiceId index from all known invoices.
+   * Called after invoiceTermsCache is fully populated during load().
+   */
+  private _rebuildHashIndex(): void {
+    this.invoiceIdHashIndex.clear();
+    for (const invoiceId of this.invoiceTermsCache.keys()) {
+      this.invoiceIdHashIndex.set(hashInvoiceId(invoiceId), invoiceId);
+    }
+  }
+
+  /**
+   * Register a single invoice ID in the hash index.
+   * Called when a new invoice is created or imported at runtime.
+   */
+  private _addToHashIndex(invoiceId: string): void {
+    this.invoiceIdHashIndex.set(hashInvoiceId(invoiceId), invoiceId);
+  }
+
+  /**
+   * Resolve an invoice reference (from an on-chain memo) to a known invoice ID.
+   *
+   * Tries two paths:
+   * 1. Direct match: the reference IS the invoice ID (legacy / transport memos)
+   * 2. Hash match: the reference is SHA-256(invoiceId) (privacy-preserving on-chain memos)
+   *
+   * @param ref - The hex string from the parsed memo (raw ID or hash)
+   * @returns The resolved invoice ID, or null if not found
+   */
+  resolveInvoiceRef(ref: string): string | null {
+    if (this.invoiceTermsCache.has(ref)) return ref;
+    return this.invoiceIdHashIndex.get(ref) ?? null;
   }
 
   // ===========================================================================
@@ -4270,18 +4319,15 @@ export class AccountingModule {
 
       if (!payload?.inv?.id) continue;
 
-      const invoiceId = payload.inv.id.toLowerCase();
+      const memoRef = payload.inv.id.toLowerCase();
+      // Resolve the memo reference: may be a raw invoice ID (legacy) or
+      // SHA-256(invoiceId) (privacy-preserving). resolveInvoiceRef tries
+      // direct match first, then hash index.
+      const invoiceId = this.resolveInvoiceRef(memoRef) ?? memoRef;
+
       // Proactive indexing: index invoice-referencing transactions so that
       // when an invoice is later imported via importInvoice(), its transfer
       // entries are already in the ledger — no need to rescan all tokens.
-      // The tokenScanState watermark is advanced regardless, so skipping would
-      // cause a permanent gap: the watermark passes these transactions and
-      // importInvoice()'s retroactive scan finds nothing new.
-      //
-      // W5 fix: Cap the number of unknown invoice IDs to prevent unbounded
-      // storage growth from attacker-crafted transfers with fake invoice IDs.
-      // Known invoices (in invoiceTermsCache) are always indexed. Unknown ones
-      // are indexed only up to the cap.
       const MAX_UNKNOWN_INVOICE_IDS = 500;
       if (!this.invoiceTermsCache.has(invoiceId) && !this.invoiceLedger.has(invoiceId)) {
         // W11: O(1) check using cached counter instead of full ledger scan
@@ -4606,15 +4652,12 @@ export class AccountingModule {
     const memoRef = parseInvoiceMemo(memo);
     if (!memoRef) return;
 
-    const { invoiceId, paymentDirection: memoParsedDirection } = memoRef;
-    let paymentDirection = memoParsedDirection;
+    // Resolve: memo invoiceId may be a hash (privacy-preserving) or raw ID (legacy)
+    const invoiceId = this.resolveInvoiceRef(memoRef.invoiceId) ?? memoRef.invoiceId;
+    let paymentDirection = memoRef.paymentDirection;
     const confirmed = false; // transfer:incoming = unconfirmed
     const deps = this.deps!;
 
-    // W3 fix: Prefer on-chain direction over transport memo direction.
-    // The ledger entries from _processTokenTransactions (run above) have the
-    // authoritative direction from the on-chain message bytes. If the transport
-    // memo direction disagrees (e.g., compromised relay), use the on-chain one.
     const ledger = this.invoiceLedger.get(invoiceId);
     if (ledger) {
       for (const token of transfer.tokens) {
@@ -4803,9 +4846,9 @@ export class AccountingModule {
     const memoRef = parseInvoiceMemo(memo);
     if (!memoRef) return;
 
-    const { invoiceId, paymentDirection } = memoRef;
-    // History entries may be unconfirmed at time of 'history:updated' fire;
-    // confirmation arrives separately via 'transfer:confirmed'.
+    // Resolve: memo invoiceId may be a hash (privacy-preserving) or raw ID (legacy)
+    const invoiceId = this.resolveInvoiceRef(memoRef.invoiceId) ?? memoRef.invoiceId;
+    const { paymentDirection } = memoRef;
     const confirmed = false;
     const deps = this.deps!;
 

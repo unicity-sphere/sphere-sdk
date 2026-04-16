@@ -14,6 +14,8 @@
  * @see ACCOUNTING-SPEC.md §4 — Invoice Reference Encoding
  */
 
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 import { SphereError } from '../../core/errors.js';
 import type { InvoiceMemoRef, TransferMessagePayload } from './types.js';
 
@@ -40,6 +42,23 @@ export const INVOICE_MEMO_REGEX = /^INV:([0-9a-fA-F]{64,68})(?::(F|B|RC|RX))?(?:
  * Used by {@link buildInvoiceMemo} before constructing outbound memos.
  */
 export const INVOICE_ID_REGEX = /^[0-9a-fA-F]{64,68}$/;
+
+/**
+ * Compute a privacy-preserving hash of an invoice ID for on-chain embedding.
+ *
+ * Instead of embedding the raw invoice ID in on-chain transaction messages
+ * (which would let any third party correlate tokens to invoices), we embed
+ * SHA-256(invoiceId). The recipient — who knows the invoice ID — can verify
+ * the binding by re-hashing. A third party who only sees the token cannot
+ * discover which invoice it references without brute-forcing the ID space
+ * (infeasible for 64-char hex hashes).
+ *
+ * @param invoiceId - The raw invoice ID (64-68 char hex string)
+ * @returns 64-char lowercase hex SHA-256 hash
+ */
+export function hashInvoiceId(invoiceId: string): string {
+  return bytesToHex(sha256(new TextEncoder().encode(invoiceId.toLowerCase())));
+}
 
 /**
  * Maps the canonical payment direction name to its wire code.
@@ -116,6 +135,9 @@ export function parseInvoiceMemo(memo: string): InvoiceMemoRef | null {
     ? [...rawFreeText].slice(0, 1024).join('')
     : undefined;
 
+  // The extracted ID may be either a raw invoice ID (legacy) or a
+  // SHA-256 hash of the invoice ID (privacy-preserving). Both are 64-char
+  // hex strings. The AccountingModule disambiguates via its hash index.
   return {
     invoiceId: match[1].toLowerCase(),
     paymentDirection,
@@ -167,7 +189,8 @@ export function buildInvoiceMemo(
     : undefined;
 
   const text = sanitized ? ` ${sanitized}` : '';
-  return `INV:${invoiceId.toLowerCase()}:${direction}${text}`;
+  const hashedId = hashInvoiceId(invoiceId);
+  return `INV:${hashedId}:${direction}${text}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -419,8 +442,10 @@ export function parseInvoiceMemoForOnChain(
     }
   }
 
+  // Embed the hash of the invoice ID (not the raw ID) for on-chain privacy.
+  // The recipient can verify the binding by hashing their known invoice ID.
   const inv: NonNullable<TransferMessagePayload['inv']> = {
-    id: ref.invoiceId,
+    id: hashInvoiceId(ref.invoiceId),
     dir: DIRECTION_TO_CODE[ref.paymentDirection],
     ...(validRefundAddress ? { ra: validRefundAddress } : {}),
     ...(validContact ? { ct: validContact } : {}),
