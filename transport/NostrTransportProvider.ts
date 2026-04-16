@@ -1802,6 +1802,7 @@ export class NostrTransportProvider implements TransportProvider {
           onEndOfStoredEvents: () => settle(),
         });
       } catch {
+        clearTimeout(timeout);
         resolve(events);
         return;
       }

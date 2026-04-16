@@ -1178,7 +1178,8 @@ export class MultiAddressTransportMux {
    * Returns true if the event exists, false otherwise.
    */
   private async _queryEventById(eventId: string): Promise<boolean> {
-    if (!this.nostrClient) return false;
+    const client = this.nostrClient;
+    if (!client) return false;
     const filter = new Filter();
     filter.ids = [eventId];
     filter.limit = 1;
@@ -1187,16 +1188,16 @@ export class MultiAddressTransportMux {
       let found = false;
       let subId: string | undefined;
       const timeout = setTimeout(() => {
-        if (subId) { try { this.nostrClient!.unsubscribe(subId); } catch { /* */ } }
+        if (subId) { try { client.unsubscribe(subId); } catch { /* */ } }
         resolve(found);
       }, 3000);
 
       try {
-        subId = this.nostrClient!.subscribe(filter, {
+        subId = client.subscribe(filter, {
           onEvent: () => { found = true; },
           onEndOfStoredEvents: () => {
             clearTimeout(timeout);
-            if (subId) { try { this.nostrClient!.unsubscribe(subId); } catch { /* */ } }
+            if (subId) { try { client.unsubscribe(subId); } catch { /* */ } }
             resolve(found);
           },
         });
