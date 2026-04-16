@@ -3759,6 +3759,15 @@ export class AccountingModule {
             let result: Awaited<typeof sendPromise>;
             try {
               result = await Promise.race([sendPromise, sendTimeoutPromise]);
+            } catch (raceErr) {
+              // If timeout won the race, the background send may still complete.
+              // Attach a handler to mark it completed if it does, preventing
+              // duplicate refunds on crash recovery.
+              sendPromise.then(
+                (r) => this.autoReturnManager.markCompleted(invoiceId, dedupTransferId, r.id).catch(() => {}),
+                () => {},
+              );
+              throw raceErr;
             } finally {
               if (sendTimer !== undefined) clearTimeout(sendTimer);
             }
@@ -4920,6 +4929,20 @@ export class AccountingModule {
     if (typeof raw['memo'] === 'string' && raw['memo'].length > 4096) {
       raw['memo'] = raw['memo'].slice(0, 4096);
     }
+    // Validate numeric fields in senderContribution.assets to prevent UI spoofing
+    const sc = raw['senderContribution'];
+    if (sc && typeof sc === 'object' && Array.isArray((sc as Record<string, unknown>)['assets'])) {
+      for (const asset of (sc as Record<string, unknown>)['assets'] as unknown[]) {
+        if (typeof asset !== 'object' || asset === null) continue;
+        const a = asset as Record<string, unknown>;
+        for (const field of ['forwardedAmount', 'returnedAmount', 'netAmount', 'requestedAmount']) {
+          if (a[field] !== undefined && (typeof a[field] !== 'string' || !/^\d{1,78}$/.test(a[field] as string))) {
+            return; // malformed amount — drop silently
+          }
+        }
+      }
+    }
+
     const receipt: InvoiceReceiptPayload = raw as unknown as InvoiceReceiptPayload;
 
     // §5.11 step 6: nametag fallback — DM sender nametag takes priority over payload field
@@ -5016,6 +5039,20 @@ export class AccountingModule {
     if (typeof raw['dealDescription'] === 'string' && raw['dealDescription'].length > 4096) {
       raw['dealDescription'] = raw['dealDescription'].slice(0, 4096);
     }
+    // Validate numeric fields in senderContribution.assets
+    const csc = raw['senderContribution'];
+    if (csc && typeof csc === 'object' && Array.isArray((csc as Record<string, unknown>)['assets'])) {
+      for (const asset of (csc as Record<string, unknown>)['assets'] as unknown[]) {
+        if (typeof asset !== 'object' || asset === null) continue;
+        const a = asset as Record<string, unknown>;
+        for (const field of ['forwardedAmount', 'returnedAmount', 'netAmount', 'requestedAmount']) {
+          if (a[field] !== undefined && (typeof a[field] !== 'string' || !/^\d{1,78}$/.test(a[field] as string))) {
+            return;
+          }
+        }
+      }
+    }
+
     const notice: InvoiceCancellationPayload = raw as unknown as InvoiceCancellationPayload;
 
     // §5.12 step 6: nametag fallback — DM sender nametag takes priority over payload field
@@ -5639,6 +5676,12 @@ export class AccountingModule {
       let result: Awaited<typeof evtSendPromise>;
       try {
         result = await Promise.race([evtSendPromise, evtSendTimeout]);
+      } catch (raceErr) {
+        evtSendPromise.then(
+          (r) => this.autoReturnManager.markCompleted(invoiceId, sendParams.transferId, r.id).catch(() => {}),
+          () => {},
+        );
+        throw raceErr;
       } finally {
         if (evtSendTimer !== undefined) clearTimeout(evtSendTimer);
       }

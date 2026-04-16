@@ -167,7 +167,7 @@ export function buildInvoiceMemo(
     : undefined;
 
   const text = sanitized ? ` ${sanitized}` : '';
-  return `INV:${invoiceId}:${direction}${text}`;
+  return `INV:${invoiceId.toLowerCase()}:${direction}${text}`;
 }
 
 // ---------------------------------------------------------------------------
