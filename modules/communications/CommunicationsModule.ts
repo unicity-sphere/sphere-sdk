@@ -5,6 +5,7 @@
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { createTransportAddressResolver, type TransportAddressResolver } from '../../core/transport-resolver';
 import type {
   DirectMessage,
   BroadcastMessage,
@@ -91,6 +92,9 @@ export class CommunicationsModule {
   // Timestamp of module initialization — messages older than this are historical
   private initializedAt: number = 0;
 
+  /** Shared transport address resolver (with cache). Created during initialize(). */
+  private transportResolver: TransportAddressResolver | null = null;
+
   constructor(config?: CommunicationsModuleConfig) {
     this.config = {
       autoSave: config?.autoSave ?? true,
@@ -115,6 +119,9 @@ export class CommunicationsModule {
 
     this.deps = deps;
     this.initializedAt = Date.now();
+
+    // Create shared transport address resolver (used by sendDM, sendComposingIndicator, etc.)
+    this.transportResolver = createTransportAddressResolver(deps.transport);
 
     // Subscribe to incoming messages
     this.unsubscribeMessages = deps.transport.onMessage((msg) => {
@@ -267,27 +274,36 @@ export class CommunicationsModule {
   }
 
   /**
-   * Get conversation with peer
+   * Get conversation with peer.
+   * Normalizes the key to x-only format so lookups work regardless of whether
+   * the caller passes a compressed (02.../03...) or x-only (64-char) pubkey.
    */
   getConversation(peerPubkey: string): DirectMessage[] {
+    const normalized = CommunicationsModule._normalizeKey(peerPubkey);
     return Array.from(this.messages.values())
       .filter(
-        (m) => m.senderPubkey === peerPubkey || m.recipientPubkey === peerPubkey
+        (m) =>
+          CommunicationsModule._normalizeKey(m.senderPubkey) === normalized ||
+          CommunicationsModule._normalizeKey(m.recipientPubkey) === normalized
       )
       .sort((a, b) => a.timestamp - b.timestamp);
   }
 
   /**
-   * Get all conversations grouped by peer
+   * Get all conversations grouped by peer.
+   * Keys are normalized to x-only format so compressed and x-only pubkeys
+   * map to the same conversation.
    */
   getConversations(): Map<string, DirectMessage[]> {
     const conversations = new Map<string, DirectMessage[]>();
+    const ownKey = CommunicationsModule._normalizeKey(this.deps?.identity.chainPubkey ?? '');
 
     for (const message of this.messages.values()) {
-      const peer =
-        message.senderPubkey === this.deps?.identity.chainPubkey
+      const rawPeer =
+        CommunicationsModule._normalizeKey(message.senderPubkey) === ownKey
           ? message.recipientPubkey
           : message.senderPubkey;
+      const peer = CommunicationsModule._normalizeKey(rawPeer);
 
       if (!conversations.has(peer)) {
         conversations.set(peer, []);
@@ -425,6 +441,21 @@ export class CommunicationsModule {
    */
   onDirectMessage(handler: (message: DirectMessage) => void): () => void {
     this.dmHandlers.add(handler);
+
+    // Replay existing messages to new handler — ensures DMs that arrived
+    // before this handler was registered (e.g., swap proposals arriving
+    // during Sphere.init before SwapModule.load) are not lost.
+    // Snapshot to avoid re-entrancy issues if the handler side-effects mutate
+    // this.messages (e.g., via pruneMessages triggered by sendDM → save).
+    const snapshot = Array.from(this.messages.values());
+    for (const message of snapshot) {
+      try {
+        handler(message);
+      } catch {
+        // Tolerated — handler may reject messages it doesn't care about
+      }
+    }
+
     return () => this.dmHandlers.delete(handler);
   }
 
@@ -588,8 +619,10 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:dm', message);
 
-    // Notify handlers
-    for (const handler of this.dmHandlers) {
+    // Notify handlers — snapshot Set before iterating to prevent mid-dispatch
+    // registration (JS Set spec: new entries added during for-of are visited)
+    const handlers = Array.from(this.dmHandlers);
+    for (const handler of handlers) {
       try {
         handler(message);
       } catch (error) {
@@ -616,8 +649,8 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('composing:started', composing);
 
-    // Notify handlers
-    for (const handler of this.composingHandlers) {
+    // Notify handlers — snapshot Set to prevent mid-dispatch registration side-effects
+    for (const handler of Array.from(this.composingHandlers)) {
       try {
         handler(composing);
       } catch (error) {
@@ -640,8 +673,8 @@ export class CommunicationsModule {
     // Emit event
     this.deps!.emitEvent('message:broadcast', message);
 
-    // Notify handlers
-    for (const handler of this.broadcastHandlers) {
+    // Notify handlers — snapshot Set to prevent mid-dispatch registration side-effects
+    for (const handler of Array.from(this.broadcastHandlers)) {
       try {
         handler(message);
       } catch (error) {
@@ -696,22 +729,67 @@ export class CommunicationsModule {
   // Private: Helpers
   // ===========================================================================
 
+  /**
+   * Resolve a Unicity address to a transport-level pubkey for DM delivery.
+   * Delegates to the shared TransportAddressResolver (with cache).
+   */
   private async resolveRecipient(recipient: string): Promise<{ pubkey: string; nametag?: string }> {
-    if (recipient.startsWith('@')) {
-      const nametag = recipient.slice(1);
-      const pubkey = await this.deps!.transport.resolveNametag?.(nametag);
-      if (!pubkey) {
-        throw new SphereError(`Unicity ID not found: ${recipient}`, 'INVALID_RECIPIENT');
-      }
-      return { pubkey, nametag };
+    if (!this.transportResolver) {
+      throw new SphereError('CommunicationsModule not initialized', 'NOT_INITIALIZED');
     }
-    return { pubkey: recipient };
+    return this.transportResolver.resolve(recipient);
+  }
+
+  /**
+   * Pre-resolve a Unicity address to warm the transport address cache.
+   *
+   * Call before a batch of DM operations to avoid resolution latency
+   * on the first sendDM() call. Subsequent calls use the cache.
+   *
+   * @param address - Any valid Unicity address (@nametag, DIRECT://, PROXY://, hex pubkey)
+   * @returns The resolved transport pubkey (caller should NOT use this — it's transport-specific)
+   */
+  async preResolve(address: string): Promise<string> {
+    this.ensureInitialized();
+    const result = await this.resolveRecipient(address);
+    return result.pubkey;
+  }
+
+  /**
+   * Invalidate the resolution cache for a specific address or all entries.
+   * Use after a known key rotation or nametag transfer.
+   */
+  invalidateResolveCache(address?: string): void {
+    this.transportResolver?.invalidateCache(address);
+  }
+
+  /**
+   * Get the shared transport address resolver (for use by other modules
+   * that need the same resolution + caching, e.g., PaymentsModule).
+   */
+  getTransportResolver(): TransportAddressResolver | null {
+    return this.transportResolver;
   }
 
   private ensureInitialized(): void {
     if (!this.deps) {
       throw new SphereError('CommunicationsModule not initialized', 'NOT_INITIALIZED');
     }
+  }
+
+  /**
+   * Normalize a pubkey to x-only (64-char lowercase hex) for consistent lookups.
+   * Compressed keys (02.../03... 66-char) are stripped to x-only.
+   * Already x-only keys are lowercased. Non-hex strings pass through unchanged.
+   */
+  static _normalizeKey(key: string): string {
+    if (key.length === 66 && /^0[23][0-9a-f]{64}$/i.test(key)) {
+      return key.slice(2).toLowerCase();
+    }
+    if (key.length === 64 && /^[0-9a-f]{64}$/i.test(key)) {
+      return key.toLowerCase();
+    }
+    return key;
   }
 }
 

@@ -164,7 +164,9 @@ describe('CommunicationsModule cacheMessages option', () => {
     it('sendDM sends via transport but does not cache', async () => {
       const message = await mod.sendDM(PEER_PUBKEY, 'hi');
 
-      expect(deps.transport.sendMessage).toHaveBeenCalledWith(PEER_PUBKEY, 'hi');
+      // Transport receives x-only key (02 prefix stripped by resolver)
+      const xOnlyPeer = 'b'.repeat(64);
+      expect(deps.transport.sendMessage).toHaveBeenCalledWith(xOnlyPeer, 'hi');
       expect(message).toMatchObject({ content: 'hi' });
       expect(mod.getConversation(PEER_PUBKEY)).toEqual([]);
       expect(deps.storage.set).not.toHaveBeenCalled();

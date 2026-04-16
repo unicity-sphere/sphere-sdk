@@ -535,7 +535,7 @@ export class NostrTransportProvider implements TransportProvider {
     // Create NIP-17 gift-wrapped message (kind 1059) for recipient
     const giftWrap = NIP17.createGiftWrap(this.keyManager!, nostrRecipient, wrappedContent);
 
-    await this.publishEvent(giftWrap);
+    await this.publishWithVerification(giftWrap, 3, 'dm');
 
     // NIP-17 self-wrap: send a copy to ourselves so relay can replay sent messages.
     // Content includes recipientPubkey and originalId for dedup against the live-sent record.
@@ -608,7 +608,7 @@ export class NostrTransportProvider implements TransportProvider {
       ]
     );
 
-    await this.publishEvent(event);
+    await this.publishWithVerification(event, 3, 'token_transfer');
 
     this.emitEvent({
       type: 'transfer:sent',
@@ -1608,6 +1608,71 @@ export class NostrTransportProvider implements TransportProvider {
     await this.nostrClient.publishEvent(sdkEvent);
   }
 
+  /**
+   * Publish an event with verification: after publishing, query the relay to
+   * confirm the event was stored. Retries up to `maxAttempts` times on failure.
+   *
+   * This is critical for token transfers and DMs where silent loss means
+   * funds or messages disappear. The nostr-js-sdk's publishEvent resolves on
+   * a 5s timeout even without relay confirmation, so verification is needed.
+   */
+  private async publishWithVerification(
+    event: NostrEvent,
+    maxAttempts: number = 3,
+    label: string = 'event',
+  ): Promise<void> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.publishEvent(event);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Permanent rejection — don't retry (e.g., "Event rejected: invalid signature")
+        if (msg.includes('Event rejected') && !msg.includes('rate') && !msg.includes('limit')) {
+          throw err;
+        }
+        if (attempt === maxAttempts) throw err;
+        logger.debug('Nostr', `${label} publish attempt ${attempt} failed (${msg}), retrying in ${attempt}s...`);
+        await new Promise(r => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+
+      // Verify: query the relay for this specific event by ID.
+      // Short delay to let the relay index the event.
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const found = await this.queryEvents({
+          ids: [event.id],
+          limit: 1,
+        });
+        if (found.length > 0) {
+          if (attempt > 1) {
+            logger.debug('Nostr', `${label} verified on relay after ${attempt} attempt(s)`);
+          }
+          return; // confirmed on relay
+        }
+      } catch {
+        // Query failed — can't verify. If this is the last attempt,
+        // accept the publish as best-effort.
+        if (attempt === maxAttempts) {
+          logger.debug('Nostr', `${label} verification query failed — accepting publish as best-effort`);
+          return;
+        }
+      }
+
+      // Event not found on relay — retry with increasing backoff
+      if (attempt < maxAttempts) {
+        const delay = Math.min(2000 * attempt, 10000);
+        logger.debug('Nostr', `${label} not found on relay, retrying in ${delay}ms (attempt ${attempt}/${maxAttempts})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw new SphereError(
+          `${label} not verified on relay after ${maxAttempts} attempts — delivery failed`,
+          'TRANSPORT_ERROR',
+        );
+      }
+    }
+  }
+
   async fetchPendingEvents(): Promise<void> {
     if (!this.nostrClient?.isConnected() || !this.keyManager) {
       throw new SphereError('Transport not connected', 'TRANSPORT_ERROR');
@@ -1621,38 +1686,65 @@ export class NostrTransportProvider implements TransportProvider {
       EVENT_KINDS.TOKEN_TRANSFER,
       EVENT_KINDS.PAYMENT_REQUEST,
       EVENT_KINDS.PAYMENT_REQUEST_RESPONSE,
+      EventKinds.GIFT_WRAP, // NIP-17 gift-wrapped DMs (swap proposals, invoice receipts, etc.)
     ];
     walletFilter['#p'] = [nostrPubkey];
-    walletFilter.since = Math.floor(Date.now() / 1000) - 86400;
+    // NIP-17 gift wraps have randomized created_at (±172800 s).  Extend the
+    // catch-up window by the full randomization range so events sent recently
+    // but timestamped far in the past are not missed.
+    walletFilter.since = Math.floor(Date.now() / 1000) - 86400 - 172800;
+
+    // Capture client reference after the guard to avoid a null-deref race:
+    // a concurrent disconnect() can set this.nostrClient = null between the
+    // isConnected() check above and the subscribe() call below.
+    const client = this.nostrClient;
 
     // Collect events first, then process after EOSE
     const events: NostrEvent[] = [];
+    // Declared outside the Promise so it's available for cleanup after resolve.
+    let subId: string | undefined;
 
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        if (subId) this.nostrClient?.unsubscribe(subId);
+    await new Promise<void>((resolve, reject) => {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      // settle() only resolves the Promise — unsubscribe happens AFTER the Promise
+      // resolves (below), where subId is guaranteed to be the real subscription ID.
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
         resolve();
-      }, 5000);
+      };
 
-      const subId = this.nostrClient!.subscribe(walletFilter, {
-        onEvent: (event) => {
-          events.push({
-            id: event.id,
-            kind: event.kind,
-            content: event.content,
-            tags: event.tags,
-            pubkey: event.pubkey,
-            created_at: event.created_at,
-            sig: event.sig,
-          });
-        },
-        onEndOfStoredEvents: () => {
-          clearTimeout(timeout);
-          this.nostrClient?.unsubscribe(subId);
-          resolve();
-        },
-      });
+      try {
+        subId = client.subscribe(walletFilter, {
+          onEvent: (event) => {
+            events.push({
+              id: event.id,
+              kind: event.kind,
+              content: event.content,
+              tags: event.tags,
+              pubkey: event.pubkey,
+              created_at: event.created_at,
+              sig: event.sig,
+            });
+          },
+          onEndOfStoredEvents: () => settle(),
+        });
+      } catch (err) {
+        reject(err);
+        return;
+      }
+
+      if (!settled) {
+        timeout = setTimeout(() => settle(), 5000);
+      }
     });
+
+    // Unsubscribe AFTER the Promise resolves — subId is now the real subscription ID.
+    // This also ensures onEvent cannot fire while we iterate events below.
+    if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
 
     // Process collected events sequentially (dedup skips already-processed ones)
     for (const event of events) {
@@ -1665,36 +1757,55 @@ export class NostrTransportProvider implements TransportProvider {
       throw new SphereError('No connected relays', 'TRANSPORT_ERROR');
     }
 
+    // Capture client reference after the guard — same disconnect() race as fetchPendingEvents.
+    const client = this.nostrClient;
+
     const events: NostrEvent[] = [];
     const filter = new Filter(filterObj);
+    // Declared outside the Promise so unsubscription can happen after resolve(),
+    // where subId is guaranteed to be the real subscription ID (not in TDZ).
+    let subId: string | undefined;
 
     return new Promise((resolve) => {
+      let settled = false;
       const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
         if (subId) {
-          this.nostrClient?.unsubscribe(subId);
+          try { this.nostrClient?.unsubscribe(subId); } catch { /* disconnected */ }
         }
         logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
       }, 15000);
 
-      const subId = this.nostrClient!.subscribe(filter, {
-        onEvent: (event) => {
-          events.push({
-            id: event.id,
-            kind: event.kind,
-            content: event.content,
-            tags: event.tags,
-            pubkey: event.pubkey,
-            created_at: event.created_at,
-            sig: event.sig,
-          });
-        },
-        onEndOfStoredEvents: () => {
-          clearTimeout(timeout);
-          this.nostrClient?.unsubscribe(subId);
-          resolve(events);
-        },
-      });
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (subId) { try { client.unsubscribe(subId); } catch { /* disconnected */ } }
+        resolve(events);
+      };
+
+      try {
+        subId = client.subscribe(filter, {
+          onEvent: (event) => {
+            events.push({
+              id: event.id,
+              kind: event.kind,
+              content: event.content,
+              tags: event.tags,
+              pubkey: event.pubkey,
+              created_at: event.created_at,
+              sig: event.sig,
+            });
+          },
+          onEndOfStoredEvents: () => settle(),
+        });
+      } catch {
+        resolve(events);
+        return;
+      }
+
     });
   }
 
@@ -1856,7 +1967,8 @@ export class NostrTransportProvider implements TransportProvider {
     // NIP-17 gift wraps have created_at randomized ±2 days for privacy.
     // Without this offset, ~50% of messages are silently dropped by the relay
     // because their randomized timestamp lands before the `since` filter.
-    chatFilter.since = dmSince - TIMESTAMP_RANDOMIZATION;
+    // Math.max(0, ...) prevents negative timestamps when dmSince is small.
+    chatFilter.since = Math.max(0, dmSince - TIMESTAMP_RANDOMIZATION);
 
     this.chatSubscriptionId = this.nostrClient.subscribe(chatFilter, {
       onEvent: (event) => {
