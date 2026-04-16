@@ -14,9 +14,10 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 
-// Skip entire file on Node.js < 22 (OrbitDB v3 requires Promise.withResolvers)
+// Skip in CI (no IPFS network) or on Node.js < 22 (OrbitDB v3 needs Promise.withResolvers)
 const nodeVersion = parseInt(process.versions.node.split('.')[0], 10);
-const describeOrSkip = nodeVersion >= 22 ? describe : describe.skip;
+const isCI = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
+const describeOrSkip = (!isCI && nodeVersion >= 22) ? describe : describe.skip;
 import { OrbitDbAdapter } from '../../profile/orbitdb-adapter.js';
 import { randomBytes } from 'crypto';
 import * as os from 'os';
