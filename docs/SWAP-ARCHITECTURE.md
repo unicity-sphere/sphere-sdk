@@ -432,7 +432,7 @@ The implementation uses a 9-state machine (not the 11-state spec). Acceptors use
 const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, readonly SwapProgress[]> = {
   proposed:         ['accepted', 'announced', 'cancelled', 'failed'],
   accepted:         ['announced', 'cancelled', 'failed'],
-  announced:        ['depositing', 'cancelled', 'failed'],
+  announced:        ['depositing', 'concluding', 'cancelled', 'failed'],
   depositing:       ['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed'],
   awaiting_counter: ['concluding', 'completed', 'cancelled', 'failed'],
   concluding:       ['completed', 'cancelled', 'failed'],
@@ -466,7 +466,7 @@ The SwapModule's local states do not have a 1:1 correspondence with the escrow s
 | `ANNOUNCED` | `announced` | Escrow created record |
 | `DEPOSIT_INVOICE_CREATED` | `announced` | Invoice ready |
 | `PARTIAL_DEPOSIT` | `depositing` | One party paid |
-| `DEPOSIT_COVERED` | `awaiting_counter` | Both deposits in |
+| `DEPOSIT_COVERED` | `concluding` | Both deposits in |
 | `CONCLUDING` | `concluding` | Escrow settling |
 | `COMPLETED` | `completed` | Both verified |
 | `TIMED_OUT` | `cancelled` | Escrow timeout |
@@ -687,7 +687,7 @@ interface SwapModuleConfig {
   defaultEscrowAddress?: string;
   proposalTimeoutMs?: number;     // Default: 300000 (5 min)
   maxPendingSwaps?: number;       // Default: 100
-  announceTimeoutMs?: number;     // Default: 30000 (30s)
+  announceTimeoutMs?: number;     // Default: 120000 (2 min)
   terminalPurgeTtlMs?: number;    // Default: 604800000 (7 days)
 }
 ```

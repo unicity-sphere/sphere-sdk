@@ -282,7 +282,7 @@ type SwapRole = 'proposer' | 'acceptor';
 const VALID_PROGRESS_TRANSITIONS: Record<SwapProgress, readonly SwapProgress[]> = {
   proposed:         ['accepted', 'announced', 'cancelled', 'failed'],
   accepted:         ['announced', 'cancelled', 'failed'],
-  announced:        ['depositing', 'cancelled', 'failed'],
+  announced:        ['depositing', 'concluding', 'cancelled', 'failed'],
   depositing:       ['awaiting_counter', 'concluding', 'completed', 'cancelled', 'failed'],
   awaiting_counter: ['concluding', 'completed', 'cancelled', 'failed'],
   concluding:       ['completed', 'cancelled', 'failed'],
@@ -771,7 +771,7 @@ interface SwapModuleConfig {
   /**
    * Time to wait for the escrow's announce_result DM after announcing (ms).
    * After this timeout, the announce is considered failed.
-   * Default: 30000 (30 seconds).
+   * Default: 120000 (2 minutes).
    */
   readonly announceTimeoutMs?: number;
   /**
@@ -1667,7 +1667,7 @@ DMs from the escrow are JSON objects. The handler attempts `JSON.parse()` on the
 4. Map the escrow state to client-side progress via `mapEscrowStateToProgress()`:
    - `ANNOUNCED`, `DEPOSIT_INVOICE_CREATED` -> `announced`
    - `PARTIAL_DEPOSIT` -> `depositing`
-   - `DEPOSIT_COVERED` -> `awaiting_counter`
+   - `DEPOSIT_COVERED` -> `concluding`
    - `CONCLUDING` -> `concluding`
    - `COMPLETED` -> `completed`
    - `TIMED_OUT`, `CANCELLING`, `CANCELLED` -> `cancelled`
