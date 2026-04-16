@@ -74,6 +74,7 @@ export function createTransportAddressResolver(
   const ttlMs = config?.cacheTtlMs ?? DEFAULT_TTL_MS;
   const maxSize = config?.cacheMaxSize ?? DEFAULT_MAX_SIZE;
   const cache = new Map<string, { result: ResolvedTransport; expiresAt: number }>();
+  const inflight = new Map<string, Promise<ResolvedTransport>>();
 
   // ---------------------------------------------------------------------------
   // Cache helpers
@@ -181,23 +182,28 @@ export function createTransportAddressResolver(
   // Public interface
   // ---------------------------------------------------------------------------
 
-  return {
-    async resolve(address: string): Promise<ResolvedTransport> {
-      const cached = getCached(address);
-      if (cached) return cached;
+  async function resolveWithDedup(address: string): Promise<ResolvedTransport> {
+    const cached = getCached(address);
+    if (cached) return cached;
 
-      const result = await resolveUncached(address);
+    const existing = inflight.get(address);
+    if (existing) return existing;
+
+    const promise = resolveUncached(address).then((result) => {
       setCache(address, result);
       return result;
-    },
+    }).finally(() => {
+      inflight.delete(address);
+    });
+    inflight.set(address, promise);
+    return promise;
+  }
+
+  return {
+    resolve: resolveWithDedup,
 
     async preResolve(...addresses: string[]): Promise<void> {
-      await Promise.all(addresses.map(async (addr) => {
-        if (!getCached(addr)) {
-          const result = await resolveUncached(addr);
-          setCache(addr, result);
-        }
-      }));
+      await Promise.all(addresses.map((addr) => resolveWithDedup(addr)));
     },
 
     invalidateCache(address?: string): void {

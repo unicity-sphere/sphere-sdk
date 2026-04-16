@@ -1772,7 +1772,7 @@ export class NostrTransportProvider implements TransportProvider {
         if (settled) return;
         settled = true;
         if (subId) {
-          try { this.nostrClient?.unsubscribe(subId); } catch { /* disconnected */ }
+          try { client.unsubscribe(subId); } catch { /* disconnected */ }
         }
         logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);

@@ -86,6 +86,7 @@ export class CommunicationsModule {
 
   // Handlers
   private dmHandlers: Set<(message: DirectMessage) => void> = new Set();
+  private replayedHandlers: WeakSet<(message: DirectMessage) => void> = new WeakSet();
   private composingHandlers: Set<(indicator: ComposingIndicator) => void> = new Set();
   private broadcastHandlers: Set<(message: BroadcastMessage) => void> = new Set();
 
@@ -351,12 +352,14 @@ export class CommunicationsModule {
    * Get unread count
    */
   getUnreadCount(peerPubkey?: string): number {
+    const ownKey = CommunicationsModule._normalizeKey(this.deps?.identity.chainPubkey ?? '');
     let messages = Array.from(this.messages.values()).filter(
-      (m) => !m.isRead && m.senderPubkey !== this.deps?.identity.chainPubkey
+      (m) => !m.isRead && CommunicationsModule._normalizeKey(m.senderPubkey) !== ownKey
     );
 
     if (peerPubkey) {
-      messages = messages.filter((m) => m.senderPubkey === peerPubkey);
+      const normalized = CommunicationsModule._normalizeKey(peerPubkey);
+      messages = messages.filter((m) => CommunicationsModule._normalizeKey(m.senderPubkey) === normalized);
     }
 
     return messages.length;
@@ -369,11 +372,13 @@ export class CommunicationsModule {
   getConversationPage(peerPubkey: string, options?: GetConversationPageOptions): ConversationPage {
     const limit = options?.limit ?? 20;
     const before = options?.before ?? Infinity;
+    const normalized = CommunicationsModule._normalizeKey(peerPubkey);
 
     const all = Array.from(this.messages.values())
       .filter(
         (m) =>
-          (m.senderPubkey === peerPubkey || m.recipientPubkey === peerPubkey) &&
+          (CommunicationsModule._normalizeKey(m.senderPubkey) === normalized ||
+           CommunicationsModule._normalizeKey(m.recipientPubkey) === normalized) &&
           m.timestamp < before,
       )
       .sort((a, b) => b.timestamp - a.timestamp); // newest first for slicing
@@ -391,8 +396,10 @@ export class CommunicationsModule {
    */
   async deleteConversation(peerPubkey: string): Promise<void> {
     if (!this.config.cacheMessages) return;
+    const normalized = CommunicationsModule._normalizeKey(peerPubkey);
     for (const [id, msg] of this.messages) {
-      if (msg.senderPubkey === peerPubkey || msg.recipientPubkey === peerPubkey) {
+      if (CommunicationsModule._normalizeKey(msg.senderPubkey) === normalized ||
+          CommunicationsModule._normalizeKey(msg.recipientPubkey) === normalized) {
         this.messages.delete(id);
       }
     }
@@ -445,14 +452,17 @@ export class CommunicationsModule {
     // Replay existing messages to new handler — ensures DMs that arrived
     // before this handler was registered (e.g., swap proposals arriving
     // during Sphere.init before SwapModule.load) are not lost.
-    // Snapshot to avoid re-entrancy issues if the handler side-effects mutate
-    // this.messages (e.g., via pruneMessages triggered by sendDM → save).
-    const snapshot = Array.from(this.messages.values());
-    for (const message of snapshot) {
-      try {
-        handler(message);
-      } catch {
-        // Tolerated — handler may reject messages it doesn't care about
+    // Guard: only replay once per handler reference to prevent duplicate
+    // processing when a handler is unsubscribed and re-registered.
+    if (!this.replayedHandlers.has(handler)) {
+      this.replayedHandlers.add(handler);
+      const snapshot = Array.from(this.messages.values());
+      for (const message of snapshot) {
+        try {
+          handler(message);
+        } catch {
+          // Tolerated — handler may reject messages it doesn't care about
+        }
       }
     }
 
@@ -693,13 +703,15 @@ export class CommunicationsModule {
   }
 
   private pruneIfNeeded(): void {
-    // Per-conversation pruning
+    // Per-conversation pruning (normalize keys for consistent grouping)
+    const ownKey = CommunicationsModule._normalizeKey(this.deps?.identity.chainPubkey ?? '');
     const byPeer = new Map<string, DirectMessage[]>();
     for (const msg of this.messages.values()) {
-      const peer =
-        msg.senderPubkey === this.deps?.identity.chainPubkey
+      const rawPeer =
+        CommunicationsModule._normalizeKey(msg.senderPubkey) === ownKey
           ? msg.recipientPubkey
           : msg.senderPubkey;
+      const peer = CommunicationsModule._normalizeKey(rawPeer);
       if (!byPeer.has(peer)) byPeer.set(peer, []);
       byPeer.get(peer)!.push(msg);
     }
