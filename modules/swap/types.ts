@@ -723,7 +723,7 @@ export interface SwapModuleConfig {
   /**
    * Time to wait for the escrow's announce_result DM after announcing (ms).
    * After this timeout, the announce is considered failed.
-   * Default: 30000 (30 seconds).
+   * Default: 120000 (2 minutes).
    */
   readonly announceTimeoutMs?: number;
   /**

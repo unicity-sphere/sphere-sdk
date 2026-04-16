@@ -2082,10 +2082,7 @@ export class SwapModule {
     readonly senderNametag?: string;
     readonly timestamp?: number;
   }): void {
-    // Quick check: skip non-swap DMs early
-    if (!isSwapDM(dm.content)) return;
-
-    // Parse the DM into a typed discriminated union
+    // Parse the DM into a typed discriminated union (returns null for non-swap DMs)
     const parsed = parseSwapDM(dm.content);
     if (!parsed) return;
 
@@ -3157,10 +3154,10 @@ export class SwapModule {
         const partyBCoinId = resolveSymbolToCoinId(swap.manifest.party_b_currency_to_change);
         let party: 'A' | 'B';
         let requiredAmount: string;
-        if (transfer.coinId === partyACoinId) {
+        if (coinIdsMatch(transfer.coinId, partyACoinId)) {
           party = 'A';
           requiredAmount = swap.manifest.party_a_value_to_change;
-        } else if (transfer.coinId === partyBCoinId) {
+        } else if (coinIdsMatch(transfer.coinId, partyBCoinId)) {
           party = 'B';
           requiredAmount = swap.manifest.party_b_value_to_change;
         } else {
@@ -3432,6 +3429,7 @@ export class SwapModule {
         await this.transitionProgress(s, 'failed', {
           error: 'Proposal timed out',
         });
+        this.deps?.emitEvent('swap:failed', { swapId, error: 'Proposal timed out' });
       }).catch((err) => {
         logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
       });
@@ -3446,9 +3444,7 @@ export class SwapModule {
         await this.transitionProgress(s, 'failed', {
           error: 'Proposal timed out',
         });
-        if (this.config.debug) {
-          logger.debug(LOG_TAG, `Proposal ${swapId} timed out`);
-        }
+        this.deps?.emitEvent('swap:failed', { swapId, error: 'Proposal timed out' });
       }).catch((err) => {
         logger.warn(LOG_TAG, `Failed to expire proposal ${swapId}:`, err);
       });
