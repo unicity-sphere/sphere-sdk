@@ -642,4 +642,30 @@ describe('Invoice ID hash index', () => {
     expect(module.resolveInvoiceRef(id1)).toBe(id1);
     expect(module.resolveInvoiceRef(id2)).toBe(id2);
   });
+
+  it('hash index is cleared on _clearInMemoryState (address switch)', async () => {
+    const { hashInvoiceId } = await import('../../../modules/accounting/memo.js');
+    const terms = {
+      createdAt: 1000,
+      targets: [{ address: 'DIRECT://target_1', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
+    };
+    const txf = createTestToken(terms);
+    const invoiceId = txf.genesis.data.tokenId;
+
+    mocks.payments._tokens = [{
+      id: invoiceId, coinId: INVOICE_TOKEN_TYPE_HEX,
+      symbol: 'INVOICE', name: 'Invoice', decimals: 0, amount: '0',
+      status: 'confirmed', createdAt: 1000, updatedAt: 1000,
+      sdkData: JSON.stringify(txf),
+    }];
+
+    await module.load();
+    expect(module.resolveInvoiceRef(hashInvoiceId(invoiceId))).toBe(invoiceId);
+
+    // Simulate address switch: reload with no tokens clears the index
+    mocks.payments._tokens = [];
+    await module.load();
+
+    expect(module.resolveInvoiceRef(hashInvoiceId(invoiceId))).toBeNull();
+  });
 });

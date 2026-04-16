@@ -1653,6 +1653,25 @@ export class AccountingModule {
     this.invoiceTermsCache.set(tokenId, terms);
     this._addToHashIndex(tokenId);
 
+    // Migrate orphaned ledger entries: payments indexed before this invoice
+    // was imported are keyed by hash(invoiceId). Now that we know the real
+    // ID, merge them into the real-keyed ledger and remove the hash-keyed entry.
+    const hashedKey = hashInvoiceId(tokenId);
+    if (hashedKey !== tokenId) {
+      const orphanedLedger = this.invoiceLedger.get(hashedKey);
+      if (orphanedLedger && orphanedLedger.size > 0) {
+        const realLedger = this.invoiceLedger.get(tokenId) ?? new Map();
+        for (const [key, ref] of orphanedLedger) {
+          if (!realLedger.has(key)) realLedger.set(key, ref);
+        }
+        this.invoiceLedger.set(tokenId, realLedger);
+        this.invoiceLedger.delete(hashedKey);
+        this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
+        this.balanceCache.delete(hashedKey);
+        logger.debug(LOG_TAG, `Migrated ${orphanedLedger.size} ledger entries from hash-keyed to real ID: ${tokenId.slice(0, 16)}...`);
+      }
+    }
+
     if (!this.invoiceLedger.has(tokenId)) {
       this.invoiceLedger.set(tokenId, new Map());
     }
