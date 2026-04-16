@@ -8,9 +8,15 @@
  * These tests are slow (Helia + libp2p bootstrap takes several seconds).
  * The outer describe block has a 60-second timeout; individual tests that
  * need more time override with their own timeout.
+ *
+ * REQUIRES Node.js >= 22 (OrbitDB v3 / Helia v6 use Promise.withResolvers).
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
+
+// Skip entire file on Node.js < 22 (OrbitDB v3 requires Promise.withResolvers)
+const nodeVersion = parseInt(process.versions.node.split('.')[0], 10);
+const describeOrSkip = nodeVersion >= 22 ? describe : describe.skip;
 import { OrbitDbAdapter } from '../../profile/orbitdb-adapter.js';
 import { randomBytes } from 'crypto';
 import * as os from 'os';
@@ -84,7 +90,7 @@ function decode(buf: Uint8Array): string {
 // Test Suite
 // ---------------------------------------------------------------------------
 
-describe('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => {
+describeOrSkip('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => {
   let adapter: OrbitDbAdapter;
   let testDir: string;
   const testKey = randomKey();
@@ -288,7 +294,7 @@ describe('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => {
 // Replication test (two adapters, same key)
 // ---------------------------------------------------------------------------
 
-describe('OrbitDB Adapter replication (same key)', { timeout: 60_000 }, () => {
+describeOrSkip('OrbitDB Adapter replication (same key)', { timeout: 60_000 }, () => {
   let adapterA: OrbitDbAdapter;
   let adapterB: OrbitDbAdapter;
   let dirA: string;
