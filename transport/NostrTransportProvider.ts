@@ -1604,10 +1604,17 @@ export class NostrTransportProvider implements TransportProvider {
     }
 
     const MAX_ATTEMPTS = 3;
-    const RETRY_DELAY_MS = 500;
+    const RETRY_BASE_DELAY_MS = 500;
+    const RETRY_JITTER_MS = 200;
 
     let lastError: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Re-check on each iteration — disconnect() may null this.nostrClient
+      // during the retry delay between attempts.
+      if (!this.nostrClient) {
+        throw new SphereError('Transport disconnected during retry', 'TRANSPORT_ERROR');
+      }
+
       try {
         // Re-create SDK event each attempt to avoid reusing the same event ID
         // in nostr-js-sdk's pendingOks map (which would leak timers from prior attempts)
@@ -1616,32 +1623,38 @@ export class NostrTransportProvider implements TransportProvider {
         return;
       } catch (err: unknown) {
         lastError = err;
-        const message = err instanceof Error ? err.message : String(err);
+        const rawMessage = err instanceof Error ? err.message : String(err);
 
         // Only retry relay-level rejections (nostr-js-sdk wraps these as "Event rejected: <reason>")
         // or relay broadcast failures ("sent 0 of N"). All other errors (disconnected, closed,
         // no connected relays) are non-transient and should fail immediately.
+        // Case-insensitive match — different relay implementations vary in capitalization.
+        const lowered = rawMessage.toLowerCase();
         const isRelayRejection =
-          message.startsWith('Event rejected:') ||
-          message.startsWith('sent 0 of');
+          lowered.startsWith('event rejected:') ||
+          lowered.startsWith('sent 0 of');
 
         if (!isRelayRejection || attempt === MAX_ATTEMPTS) {
           break;
         }
 
+        // Add jitter to desynchronize retries across concurrent clients
+        const delay = RETRY_BASE_DELAY_MS + Math.floor(Math.random() * RETRY_JITTER_MS);
         logger.debug(
           'Nostr',
-          `publishEvent attempt ${attempt}/${MAX_ATTEMPTS} failed (${message}); retrying in ${RETRY_DELAY_MS}ms`
+          `publishEvent attempt ${attempt}/${MAX_ATTEMPTS} failed (${rawMessage}); retrying in ${delay}ms`
         );
-        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        await new Promise((r) => setTimeout(r, delay));
       }
     }
 
     const reason = lastError instanceof Error ? lastError.message : String(lastError);
     logger.error('Nostr', `publishEvent failed after ${MAX_ATTEMPTS} attempts: ${reason}`);
+    // Chain the original error as `cause` to preserve context for debugging
     throw new SphereError(
       `Failed to publish event: ${reason}`,
-      'TRANSPORT_ERROR'
+      'TRANSPORT_ERROR',
+      lastError
     );
   }
 

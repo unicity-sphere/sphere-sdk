@@ -68,6 +68,10 @@ function createMockNostrEvent() {
   };
 }
 
+// Retry delay is 500ms + random jitter up to 200ms. Advance by the max possible
+// to guarantee the setTimeout callback fires regardless of Math.random() value.
+const MAX_DELAY_MS = 700;
+
 /**
  * Run publishEvent with fake timers, advancing through retry delays.
  * Immediately attaches a catch handler to prevent unhandled rejection warnings.
@@ -84,7 +88,7 @@ async function publishWithRetries(
   });
 
   for (let i = 0; i < expectedRetries; i++) {
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(MAX_DELAY_MS);
   }
   await promise;
 
@@ -97,9 +101,17 @@ async function publishWithRetries(
 
 describe('publishEvent retry logic', () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    // mockReset (not just clearAllMocks) is required to drop any queued
+    // `.mockResolvedValueOnce` / `.mockRejectedValueOnce` leftovers from
+    // prior tests. Tests that queue more Once values than the code consumes
+    // (e.g. "4th would succeed" tests) would otherwise bleed into subsequent tests.
+    mockPublishEvent.mockReset();
+    mockConnect.mockReset();
+    mockIsConnected.mockReset();
+    mockGetConnectedRelays.mockReset();
     vi.useFakeTimers();
     mockPublishEvent.mockResolvedValue('mock-event-id');
+    mockConnect.mockResolvedValue(undefined);
     mockIsConnected.mockReturnValue(true);
     mockGetConnectedRelays.mockReturnValue(new Set(['wss://relay1.test']));
   });
@@ -285,6 +297,95 @@ describe('publishEvent retry logic', () => {
       expect(error).toBeDefined();
       expect(error.code).toBe('TRANSPORT_ERROR');
       expect(mockPublishEvent).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  describe('case-insensitive relay pattern matching', () => {
+    it('should retry on capitalized "Event Rejected:" variants', async () => {
+      const provider = createProvider();
+      await provider.connect();
+
+      mockPublishEvent
+        .mockRejectedValueOnce(new Error('Event Rejected: policy violation'))
+        .mockResolvedValueOnce('mock-event-id');
+
+      const { error } = await publishWithRetries(provider, createMockNostrEvent(), 1);
+
+      expect(error).toBeUndefined();
+      expect(mockPublishEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it('should retry on capitalized "Sent 0 of" variants (strfry style)', async () => {
+      const provider = createProvider();
+      await provider.connect();
+
+      mockPublishEvent
+        .mockRejectedValueOnce(new Error('Sent 0 of 1 report'))
+        .mockResolvedValueOnce('mock-event-id');
+
+      const { error } = await publishWithRetries(provider, createMockNostrEvent(), 1);
+
+      expect(error).toBeUndefined();
+      expect(mockPublishEvent).toHaveBeenCalledTimes(2);
+    });
+
+    it('should retry on SHOUTED rejection messages', async () => {
+      const provider = createProvider();
+      await provider.connect();
+
+      mockPublishEvent
+        .mockRejectedValueOnce(new Error('EVENT REJECTED: BLOCKED'))
+        .mockResolvedValueOnce('mock-event-id');
+
+      const { error } = await publishWithRetries(provider, createMockNostrEvent(), 1);
+
+      expect(error).toBeUndefined();
+      expect(mockPublishEvent).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('disconnect race during retry', () => {
+    it('should fail fast if nostrClient becomes null between attempts', async () => {
+      const provider = createProvider();
+      await provider.connect();
+
+      // First attempt rejects with a retryable error. After we catch, null out
+      // the client to simulate a concurrent disconnect() call during the delay.
+      mockPublishEvent.mockRejectedValueOnce(new Error('Event rejected: sent 0 of 1'));
+
+      let caughtError: any;
+      const runPromise = (provider as any).publishEvent(createMockNostrEvent()).catch((err: any) => {
+        caughtError = err;
+      });
+
+      // Let the first attempt fail (microtask flush), then null out the client
+      // before advancing past the retry delay.
+      await vi.advanceTimersByTimeAsync(0);
+      (provider as any).nostrClient = null;
+      await vi.advanceTimersByTimeAsync(MAX_DELAY_MS);
+      await runPromise;
+
+      expect(caughtError).toBeDefined();
+      expect(caughtError.code).toBe('TRANSPORT_ERROR');
+      expect(caughtError.message).toMatch(/disconnected/i);
+      // Only one publish attempt — the retry short-circuits on the null check
+      expect(mockPublishEvent).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('error cause chaining', () => {
+    it('should attach the original error as cause on the thrown SphereError', async () => {
+      const provider = createProvider();
+      await provider.connect();
+
+      const originalError = new Error('Event rejected: sent 0 of 1 report');
+      mockPublishEvent.mockRejectedValue(originalError);
+
+      const { error } = await publishWithRetries(provider, createMockNostrEvent(), 2);
+
+      expect(error).toBeDefined();
+      expect(error.code).toBe('TRANSPORT_ERROR');
+      expect(error.cause).toBe(originalError);
     });
   });
 
