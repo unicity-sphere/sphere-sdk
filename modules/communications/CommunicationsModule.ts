@@ -460,8 +460,8 @@ export class CommunicationsModule {
       for (const message of snapshot) {
         try {
           handler(message);
-        } catch {
-          // Tolerated — handler may reject messages it doesn't care about
+        } catch (err) {
+          logger.debug('Communications', `DM replay handler threw for message ${message.id}: ${err}`);
         }
       }
     }

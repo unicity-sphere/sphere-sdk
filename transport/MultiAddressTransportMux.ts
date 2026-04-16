@@ -1141,8 +1141,8 @@ export class MultiAddressTransportMux {
         continue;
       }
 
-      // Verify: query relay for this event
-      await new Promise(r => setTimeout(r, 500));
+      // Verify: query relay for this event (jittered delay to reduce fingerprinting)
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 1200));
       try {
         const found = await this._queryEventById(signedEvent.id);
         if (found) {

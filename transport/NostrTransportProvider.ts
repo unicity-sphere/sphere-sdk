@@ -1637,8 +1637,8 @@ export class NostrTransportProvider implements TransportProvider {
       }
 
       // Verify: query the relay for this specific event by ID.
-      // Short delay to let the relay index the event.
-      await new Promise(r => setTimeout(r, 500));
+      // Jittered delay to let relay index + reduce temporal fingerprinting.
+      await new Promise(r => setTimeout(r, 300 + Math.random() * 1200));
       try {
         const found = await this.queryEvents({
           ids: [event.id],

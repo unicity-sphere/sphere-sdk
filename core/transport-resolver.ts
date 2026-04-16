@@ -64,7 +64,8 @@ export interface TransportAddressResolver {
   invalidateCache(address?: string): void;
 }
 
-const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes (address/pubkey)
+const NAMETAG_TTL_MS = 60 * 1000;     // 1 minute (relay-dependent, higher risk)
 const DEFAULT_MAX_SIZE = 1000;
 
 export function createTransportAddressResolver(
@@ -93,7 +94,8 @@ export function createTransportAddressResolver(
       const firstKey = cache.keys().next().value;
       if (firstKey !== undefined) cache.delete(firstKey);
     }
-    cache.set(key, { result, expiresAt: Date.now() + ttlMs });
+    const effectiveTtl = key.startsWith('@') ? NAMETAG_TTL_MS : ttlMs;
+    cache.set(key, { result, expiresAt: Date.now() + effectiveTtl });
   }
 
   // ---------------------------------------------------------------------------
