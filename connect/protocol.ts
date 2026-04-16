@@ -33,6 +33,8 @@ export const RPC_METHODS = {
   GET_MESSAGES: 'sphere_getMessages',
   GET_DM_UNREAD_COUNT: 'sphere_getDMUnreadCount',
   MARK_AS_READ: 'sphere_markAsRead',
+  GET_INVOICES: 'sphere_getInvoices',
+  GET_INVOICE_STATUS: 'sphere_getInvoiceStatus',
 } as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[keyof typeof RPC_METHODS];
@@ -48,6 +50,15 @@ export const INTENT_ACTIONS = {
   PAYMENT_REQUEST: 'payment_request',
   RECEIVE: 'receive',
   SIGN_MESSAGE: 'sign_message',
+  CREATE_INVOICE: 'create_invoice',
+  CLOSE_INVOICE: 'close_invoice',
+  CANCEL_INVOICE: 'cancel_invoice',
+  PAY_INVOICE: 'pay_invoice',
+  RETURN_INVOICE_PAYMENT: 'return_invoice_payment',
+  IMPORT_INVOICE: 'import_invoice',
+  SEND_INVOICE_RECEIPTS: 'send_invoice_receipts',
+  SEND_CANCELLATION_NOTICES: 'send_cancellation_notices',
+  SET_AUTO_RETURN: 'set_auto_return',
 } as const;
 
 export type IntentAction = (typeof INTENT_ACTIONS)[keyof typeof INTENT_ACTIONS];

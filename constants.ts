@@ -93,6 +93,21 @@ export const STORAGE_KEYS_ADDRESS = {
   PROCESSED_SPLIT_GROUP_IDS: 'processed_split_group_ids',
   /** Processed V6 combined transfer IDs for Nostr re-delivery dedup */
   PROCESSED_COMBINED_TRANSFER_IDS: 'processed_combined_transfer_ids',
+  // Invoice / Accounting storage keys
+  /** Set of cancelled invoice IDs (JSON string array) */
+  CANCELLED_INVOICES: 'cancelled_invoices',
+  /** Set of closed invoice IDs (JSON string array) */
+  CLOSED_INVOICES: 'closed_invoices',
+  /** Frozen balances for terminated invoices (JSON map: invoiceId → FrozenInvoiceBalances) */
+  FROZEN_BALANCES: 'frozen_balances',
+  /** Auto-return settings (JSON: AutoReturnSettings) */
+  AUTO_RETURN: 'auto_return',
+  /** Auto-return dedup ledger (JSON: AutoReturnLedger) */
+  AUTO_RETURN_LEDGER: 'auto_return_ledger',
+  /** Invoice-transfer index metadata (JSON: Record<invoiceId, { terminated, frozenAt? }>) */
+  INV_LEDGER_INDEX: 'inv_ledger_index',
+  /** Token scan state watermarks (JSON: Record<tokenId, txCount>) */
+  TOKEN_SCAN_STATE: 'token_scan_state',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */
@@ -376,6 +391,8 @@ export const HOST_READY_TYPE = 'sphere-connect:host-ready' as const;
 export const HOST_READY_TIMEOUT = 30_000;
 
 /** Validation limits */
+export const INVOICE_TOKEN_TYPE_HEX = '14676a280bda4275baf865b67cd4c611bcd58c9bf8226d508acaa10a8fcaccc6' as const;
+
 export const LIMITS = {
   /** Min nametag length */
   NAMETAG_MIN_LENGTH: 3,

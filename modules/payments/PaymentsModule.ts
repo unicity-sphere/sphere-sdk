@@ -66,6 +66,7 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -1192,7 +1193,11 @@ export class PaymentsModule {
 
       const transferMode = request.transferMode ?? 'instant';
 
-      const onChainMessage: Uint8Array | null = null;
+      const onChainMessage = parseInvoiceMemoForOnChain(
+        request.memo,
+        request.invoiceRefundAddress,
+        request.invoiceContact,
+      );
 
       if (transferMode === 'conservative') {
         // =================================================================
@@ -3805,6 +3810,8 @@ export class PaymentsModule {
       this.spendQueue.notifyChange(token.coinId);
     }
 
+    this.notifyTokenChange(token);
+
     logger.debug('Payments', `Added token ${token.id}, total: ${this.tokens.size}`);
     return true;
   }
@@ -4921,7 +4928,7 @@ export class PaymentsModule {
     token: Token,
     recipientAddress: IAddress,
     signingService: SigningService,
-    message?: Uint8Array | null
+    onChainMessage?: Uint8Array | null
   ): Promise<TransferCommitment> {
     // Parse SDK token from stored data
     const tokenData = token.sdkData
@@ -4939,7 +4946,7 @@ export class PaymentsModule {
       recipientAddress,
       salt,
       null, // recipientDataHash
-      message ?? null, // on-chain message bytes, or null
+      onChainMessage ?? null, // on-chain message bytes
       signingService
     );
 
