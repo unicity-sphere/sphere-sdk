@@ -468,3 +468,25 @@ export {
   CoinGeckoPriceProvider,
   createPriceProvider,
 } from './price';
+
+// Swap module
+export { SwapModule, createSwapModule } from './modules/swap/index';
+export { computeSwapId, buildManifest, validateManifest, verifyManifestIntegrity, signSwapManifest, verifySwapSignature, createNametagBinding, verifyNametagBinding } from './modules/swap/manifest';
+export type {
+  SwapDeal,
+  SwapManifest,
+  ManifestFields,
+  ManifestSignatures,
+  NametagBindingProof,
+  ManifestAuxiliary,
+  SwapProgress,
+  SwapRole,
+  SwapRef,
+  SwapProposalResult,
+  GetSwapsFilter,
+  SwapModuleConfig,
+} from './modules/swap/types';
+
+// Address parsing
+export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
+export type { AddressType, ParsedAddress } from './core/address';
