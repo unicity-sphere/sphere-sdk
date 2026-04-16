@@ -541,3 +541,105 @@ describe('UT-LIFECYCLE-009: load-subscribe gap re-scan', () => {
     expect(callCount).toBeGreaterThanOrEqual(2);
   });
 });
+
+// =============================================================================
+// Invoice ID Hash Index (privacy-preserving lookups)
+// =============================================================================
+
+describe('Invoice ID hash index', () => {
+  beforeEach(() => setup());
+
+  it('resolveInvoiceRef resolves a raw legacy ID via direct match', async () => {
+    const terms = {
+      createdAt: 1000,
+      targets: [{ address: 'DIRECT://target_1', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
+    };
+    const txf = createTestToken(terms);
+    const invoiceId = txf.genesis.data.tokenId;
+
+    mocks.payments._tokens = [{
+      id: invoiceId,
+      coinId: INVOICE_TOKEN_TYPE_HEX,
+      symbol: 'INVOICE', name: 'Invoice', decimals: 0, amount: '0',
+      status: 'confirmed', createdAt: 1000, updatedAt: 1000,
+      sdkData: JSON.stringify(txf),
+    }];
+
+    await module.load();
+
+    // Raw ID should resolve directly (backward compatibility)
+    expect(module.resolveInvoiceRef(invoiceId)).toBe(invoiceId);
+  });
+
+  it('resolveInvoiceRef resolves a hashed ID via hash index', async () => {
+    const { hashInvoiceId } = await import('../../../modules/accounting/memo.js');
+    const terms = {
+      createdAt: 1000,
+      targets: [{ address: 'DIRECT://target_1', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
+    };
+    const txf = createTestToken(terms);
+    const invoiceId = txf.genesis.data.tokenId;
+
+    mocks.payments._tokens = [{
+      id: invoiceId,
+      coinId: INVOICE_TOKEN_TYPE_HEX,
+      symbol: 'INVOICE', name: 'Invoice', decimals: 0, amount: '0',
+      status: 'confirmed', createdAt: 1000, updatedAt: 1000,
+      sdkData: JSON.stringify(txf),
+    }];
+
+    await module.load();
+
+    // Hashed ID should resolve via hash index
+    const hashed = hashInvoiceId(invoiceId);
+    expect(hashed).not.toBe(invoiceId);
+    expect(module.resolveInvoiceRef(hashed)).toBe(invoiceId);
+  });
+
+  it('resolveInvoiceRef returns null for unknown ID/hash', async () => {
+    await module.load();
+    expect(module.resolveInvoiceRef('f'.repeat(64))).toBeNull();
+  });
+
+  it('hash index is rebuilt on load from existing invoices', async () => {
+    const { hashInvoiceId } = await import('../../../modules/accounting/memo.js');
+
+    const terms1 = {
+      createdAt: 1000,
+      targets: [{ address: 'DIRECT://target_1', assets: [{ coin: ['UCT', '100'] as [string, string] }] }],
+    };
+    const terms2 = {
+      createdAt: 2000,
+      targets: [{ address: 'DIRECT://target_2', assets: [{ coin: ['UCT', '200'] as [string, string] }] }],
+    };
+    const txf1 = createTestToken(terms1);
+    const txf2 = createTestToken(terms2);
+    const id1 = txf1.genesis.data.tokenId;
+    const id2 = txf2.genesis.data.tokenId;
+
+    mocks.payments._tokens = [
+      {
+        id: id1, coinId: INVOICE_TOKEN_TYPE_HEX,
+        symbol: 'INVOICE', name: 'Invoice', decimals: 0, amount: '0',
+        status: 'confirmed', createdAt: 1000, updatedAt: 1000,
+        sdkData: JSON.stringify(txf1),
+      },
+      {
+        id: id2, coinId: INVOICE_TOKEN_TYPE_HEX,
+        symbol: 'INVOICE', name: 'Invoice', decimals: 0, amount: '0',
+        status: 'confirmed', createdAt: 2000, updatedAt: 2000,
+        sdkData: JSON.stringify(txf2),
+      },
+    ];
+
+    await module.load();
+
+    // Both should resolve via hash index
+    expect(module.resolveInvoiceRef(hashInvoiceId(id1))).toBe(id1);
+    expect(module.resolveInvoiceRef(hashInvoiceId(id2))).toBe(id2);
+
+    // And direct match still works
+    expect(module.resolveInvoiceRef(id1)).toBe(id1);
+    expect(module.resolveInvoiceRef(id2)).toBe(id2);
+  });
+});
