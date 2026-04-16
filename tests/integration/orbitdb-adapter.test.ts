@@ -14,7 +14,14 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 
-// Skip in CI (no IPFS network) or on Node.js < 22 (OrbitDB v3 needs Promise.withResolvers)
+// TODO(MUST-FIX): Re-enable this test in CI once the following are resolved:
+//   1. CI runner has access to an IPFS node (or a local in-process Helia is used
+//      with in-memory blockstore and no network bootstrap)
+//   2. Node.js 20 is dropped from the CI matrix (OrbitDB v3 requires Node 22+)
+//   Tracked in: sphere-sdk#105 — "OrbitDB integration test skipped in CI"
+//
+// Skip in CI (no IPFS network — Helia/libp2p hangs on peer discovery, causing
+// 12+ minute timeout) or on Node.js < 22 (OrbitDB v3 needs Promise.withResolvers)
 const nodeVersion = parseInt(process.versions.node.split('.')[0], 10);
 const isCI = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
 const describeOrSkip = (!isCI && nodeVersion >= 22) ? describe : describe.skip;
