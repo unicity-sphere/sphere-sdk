@@ -68,9 +68,18 @@ function createMockNostrEvent() {
   };
 }
 
-// Retry delay is 500ms + random jitter up to 200ms. Advance by the max possible
-// to guarantee the setTimeout callback fires regardless of Math.random() value.
-const MAX_DELAY_MS = 700;
+// Retry delay is RETRY_BASE_DELAY_MS + random jitter up to RETRY_JITTER_MS.
+// These constants must stay in sync with the constants in
+// `transport/NostrTransportProvider.ts::publishEvent`:
+//   RETRY_BASE_DELAY_MS = 500
+//   RETRY_JITTER_MS     = 200
+// The test advances by `MAX_DELAY_MS` — the strict upper bound of the actual
+// delay (max jitter is `JITTER - 1` due to Math.floor). Using the upper bound
+// rather than the exact max guarantees the setTimeout callback fires on every
+// run, regardless of the non-deterministic Math.random() value.
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_JITTER_MS = 200;
+const MAX_DELAY_MS = RETRY_BASE_DELAY_MS + RETRY_JITTER_MS; // 700ms
 
 /**
  * Run publishEvent with fake timers, advancing through retry delays.
@@ -345,6 +354,36 @@ describe('publishEvent retry logic', () => {
   });
 
   describe('disconnect race during retry', () => {
+    it('should not TypeError if nostrClient is nulled during the in-flight await', async () => {
+      // Regression test for the local-snapshot pattern: if we wrote
+      // `await this.nostrClient.publishEvent(...)` directly, nulling
+      // `this.nostrClient` during the await would cause the next attempt
+      // to throw `TypeError: Cannot read properties of null`. With the
+      // local `client` snapshot, the in-flight call completes with the
+      // mock's rejection and the retry loop's own null check handles the
+      // disconnect gracefully on the next iteration.
+      const provider = createProvider();
+      await provider.connect();
+
+      mockPublishEvent.mockRejectedValue(new Error('Event rejected: sent 0 of 1'));
+
+      let caughtError: any;
+      const runPromise = (provider as any).publishEvent(createMockNostrEvent()).catch((err: any) => {
+        caughtError = err;
+      });
+
+      // Drain the first mock rejection's microtask, then immediately null
+      // the client — simulating a concurrent disconnect mid-retry-window.
+      await vi.advanceTimersByTimeAsync(0);
+      (provider as any).nostrClient = null;
+      await vi.advanceTimersByTimeAsync(MAX_DELAY_MS);
+      await runPromise;
+
+      expect(caughtError).toBeDefined();
+      expect(caughtError.code).toBe('TRANSPORT_ERROR');
+      expect(caughtError.message).not.toMatch(/TypeError|null/);
+    });
+
     it('should fail fast if nostrClient becomes null between attempts', async () => {
       const provider = createProvider();
       await provider.connect();

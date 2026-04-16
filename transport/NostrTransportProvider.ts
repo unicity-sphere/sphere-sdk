@@ -1609,9 +1609,12 @@ export class NostrTransportProvider implements TransportProvider {
 
     let lastError: unknown;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      // Re-check on each iteration — disconnect() may null this.nostrClient
-      // during the retry delay between attempts.
-      if (!this.nostrClient) {
+      // Snapshot this.nostrClient at the top of each iteration. Using a local
+      // reference (instead of `this.nostrClient.publishEvent(...)`) prevents a
+      // concurrent disconnect() during the subsequent await from turning the
+      // call into a TypeError on null.
+      const client = this.nostrClient;
+      if (!client) {
         throw new SphereError('Transport disconnected during retry', 'TRANSPORT_ERROR');
       }
 
@@ -1619,7 +1622,7 @@ export class NostrTransportProvider implements TransportProvider {
         // Re-create SDK event each attempt to avoid reusing the same event ID
         // in nostr-js-sdk's pendingOks map (which would leak timers from prior attempts)
         const sdkEvent = NostrEventClass.fromJSON(event);
-        await this.nostrClient.publishEvent(sdkEvent);
+        await client.publishEvent(sdkEvent);
         return;
       } catch (err: unknown) {
         lastError = err;
@@ -1628,8 +1631,9 @@ export class NostrTransportProvider implements TransportProvider {
         // Only retry relay-level rejections (nostr-js-sdk wraps these as "Event rejected: <reason>")
         // or relay broadcast failures ("sent 0 of N"). All other errors (disconnected, closed,
         // no connected relays) are non-transient and should fail immediately.
-        // Case-insensitive match — different relay implementations vary in capitalization.
-        const lowered = rawMessage.toLowerCase();
+        // Locale-invariant match with `en-US` to avoid Turkish-locale surprises
+        // where `'I'.toLowerCase()` yields `'ı'` (dotless i).
+        const lowered = rawMessage.toLocaleLowerCase('en-US');
         const isRelayRejection =
           lowered.startsWith('event rejected:') ||
           lowered.startsWith('sent 0 of');
