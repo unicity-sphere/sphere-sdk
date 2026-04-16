@@ -1136,7 +1136,11 @@ class AccountingModule {
  * Parsed invoice reference from a transfer memo.
  */
 interface InvoiceMemoRef {
-  /** Invoice token ID (64-char hex) */
+  /**
+   * Invoice reference ID (64-char hex). This is the SHA-256 hash of the
+   * invoice token ID (as produced by `hashInvoiceId()`), NOT the raw
+   * invoice token ID. Use `resolveInvoiceRef()` to resolve to the real ID.
+   */
   readonly invoiceId: string;
   /** Payment direction (matches InvoiceTransferRef.paymentDirection values) */
   readonly paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
@@ -1503,7 +1507,20 @@ The `TransferTransactionData.message` field (`Uint8Array | null`) carries a UTF-
 interface TransferMessagePayload {
   /** Invoice reference (present only for invoice-related transfers) */
   readonly inv?: {
-    /** Invoice token ID (64-char hex, lowercase) */
+    /**
+     * SHA-256 hash of the invoice token ID (64-char hex, lowercase).
+     *
+     * PRIVACY: The raw invoice ID is NEVER embedded on-chain or in transport
+     * memos. Instead, `hashInvoiceId(invoiceId)` computes `SHA-256(invoiceId)`
+     * and the resulting hash is stored in `inv.id`. This prevents third parties
+     * (who can observe on-chain data) from correlating tokens to invoices
+     * without knowing the invoice ID. The recipient — who already knows the
+     * invoice ID — can verify the binding by re-hashing.
+     *
+     * The `AccountingModule` maintains an `invoiceIdHashIndex`
+     * (`Map<hash, invoiceId>`) built from `invoiceTermsCache` to resolve
+     * hashed references back to real invoice IDs. See `resolveInvoiceRef()`.
+     */
     readonly id: string;
     /** Direction code: F=forward, B=back, RC=return-closed, RX=return-cancelled */
     readonly dir: 'F' | 'B' | 'RC' | 'RX';
@@ -1625,7 +1642,7 @@ function decodeTransferMessage(txfTransaction: TxfTransaction): TransferMessageP
 }
 ```
 
-**Validation:** The `inv.id` field MUST be a 64-char lowercase hex string. The `inv.dir` field MUST be one of `'F'`, `'B'`, `'RC'`, `'RX'`. The `inv.ra` and `inv.ct` fields are validated leniently on inbound (malformed values silently stripped) and strictly on outbound (`INVOICE_INVALID_REFUND_ADDRESS` / `INVOICE_INVALID_CONTACT`). Payloads failing `inv.id` or `inv.dir` validation are treated as non-invoice transfers (no error thrown, silently ignored).
+**Validation:** The `inv.id` field MUST be a 64-char lowercase hex string (it contains `SHA-256(invoiceId)`, not the raw invoice ID -- see §4.10). The `inv.dir` field MUST be one of `'F'`, `'B'`, `'RC'`, `'RX'`. The `inv.ra` and `inv.ct` fields are validated leniently on inbound (malformed values silently stripped) and strictly on outbound (`INVOICE_INVALID_REFUND_ADDRESS` / `INVOICE_INVALID_CONTACT`). Payloads failing `inv.id` or `inv.dir` validation are treated as non-invoice transfers (no error thrown, silently ignored).
 
 **On-chain / transport disagreement:** When both the on-chain message and the transport memo contain invoice references, the on-chain reference is authoritative (§4.8). The transport memo is ignored for balance computation. If the two disagree (different invoiceId or direction), no error is raised — the on-chain reference wins silently. This can happen if a sender modifies the transport memo after constructing the on-chain commitment, or if a relay replays a stale transport message.
 
@@ -1725,7 +1742,11 @@ function buildInvoiceMemo(
     ? Array.from(freeText.replace(/[\r\n]/g, ' ')).slice(0, 256).join('')
     : undefined;
   const text = sanitized ? ` ${sanitized}` : '';
-  return `INV:${invoiceId}${dirMap[direction]}${text}`;
+  // PRIVACY: Hash the invoice ID before embedding in the memo.
+  // The raw invoice ID is never exposed on-chain or in transport memos.
+  // See hashInvoiceId() — computes SHA-256(invoiceId).
+  const hashedId = hashInvoiceId(invoiceId);
+  return `INV:${hashedId}${dirMap[direction]}${text}`;
 }
 ```
 
@@ -1785,6 +1806,8 @@ function parseInvoiceMemoForOnChain(
   const ref = parseInvoiceMemo(memo);
   if (ref) {
     // Invoice-related: encode as structured TransferMessagePayload
+    // ref.invoiceId is already the SHA-256 hash (produced by buildInvoiceMemo),
+    // so it is passed through as-is to the on-chain payload.
     const dirMap = { forward: 'F', back: 'B', return_closed: 'RC', return_cancelled: 'RX' } as const;
     const inv: TransferMessagePayload['inv'] = {
       id: ref.invoiceId,
@@ -1848,7 +1871,8 @@ When resolving invoice references for a transfer, the accounting module uses thi
 ### 4.9 Security
 
 - **On-chain references are tamper-evident.** The `TransferTransactionData.message` is included in the transaction data hash committed to the aggregator. Modifying it would invalidate the inclusion proof.
-- **Invoice ID validation:** Only 64-char lowercase hex strings are accepted. Guaranteed by SHA-256 token ID derivation.
+- **Invoice ID hashing (privacy).** The `inv.id` field in on-chain payloads and transport memos contains `SHA-256(invoiceId)`, not the raw invoice token ID. This prevents third-party correlation of tokens to invoices. See §4.10 for the full hashing and resolution mechanism.
+- **Invoice ID validation:** Only 64-char lowercase hex strings are accepted for `inv.id`. Both raw invoice IDs and their SHA-256 hashes satisfy this format.
 - **Direction code enforcement:** Only `F`, `B`, `RC`, `RX` are recognized. Unrecognized values cause the reference to be ignored.
 - **Sender validation for returns:** Inbound `B`/`RC`/`RX` transfers are validated against invoice target addresses (see §6.2 step 3).
 - **Self-payment exclusion:** Forward payments where sender == destination == target are excluded (see §5.2). **Limitation (Sybil):** Self-payment detection is per-address only — it does not prevent a target from creating a second wallet (different HD address or different mnemonic) and fabricating forward payments from that wallet. Cross-wallet self-payment detection is impossible in a privacy-preserving system. Applications requiring verified external payments should use out-of-band identity verification or trusted intermediaries.
@@ -1857,7 +1881,45 @@ When resolving invoice references for a transfer, the accounting module uses thi
 - **Contact URL sanitization.** Inbound `ct.u` values are validated for scheme (`https://` or `wss://` only), length (≤ 2048 chars), and control characters (codepoints < 0x20 rejected to prevent newline/header injection). Applications MUST still sanitize `ct.u` before use in HTML attributes, HTTP headers, or WebSocket handshakes — the SDK strips known-bad patterns but does not guarantee full URL safety.
 - Applications MUST use the SDK's decoding functions — never parse on-chain messages or transport memos manually.
 
-### 4.10 Receipt DM Format
+### 4.10 Invoice ID Hashing (Privacy-Preserving References)
+
+Both on-chain `TransferMessagePayload.inv.id` and transport memo `INV:<id>` contain a **SHA-256 hash** of the invoice ID, NOT the raw invoice token ID. This is a privacy measure: a third party observing on-chain data or transport messages cannot determine which invoice a transfer references without knowing the original invoice ID (brute-forcing the 64-char hex ID space is infeasible).
+
+**`hashInvoiceId()` function:**
+
+```typescript
+function hashInvoiceId(invoiceId: string): string {
+  return bytesToHex(sha256(new TextEncoder().encode(invoiceId.toLowerCase())));
+}
+```
+
+**Flow:**
+
+1. `buildInvoiceMemo(invoiceId, direction, freeText)` calls `hashInvoiceId(invoiceId)` and embeds the hash (not the raw ID) in the `INV:<hash>:<dir>` transport memo.
+2. `parseInvoiceMemoForOnChain()` parses the transport memo (which already contains the hash) and passes `ref.invoiceId` (the hash) through to `TransferMessagePayload.inv.id`.
+3. Both the on-chain payload and the transport memo therefore contain `SHA-256(invoiceId)`.
+
+**Resolution (`resolveInvoiceRef`):**
+
+The `AccountingModule` maintains an `invoiceIdHashIndex` (`Map<string, string>`, mapping `SHA-256(invoiceId) -> invoiceId`) built from `invoiceTermsCache`. When resolving an invoice reference from a parsed memo:
+
+1. **Direct match:** Check if the reference is a known invoice ID in `invoiceTermsCache` (backward-compatible with legacy raw-ID memos).
+2. **Hash match:** Look up the reference in `invoiceIdHashIndex` to resolve the hash to the real invoice ID.
+
+```typescript
+resolveInvoiceRef(ref: string): string | null {
+  if (this.invoiceTermsCache.has(ref)) return ref;       // direct match (legacy)
+  return this.invoiceIdHashIndex.get(ref) ?? null;        // hash match
+}
+```
+
+**Hash index lifecycle:**
+
+- **`_rebuildHashIndex()`** — called after `invoiceTermsCache` is fully populated during `load()`. Iterates all known invoice IDs and populates `invoiceIdHashIndex`.
+- **`_addToHashIndex(invoiceId)`** — called when a new invoice is created or imported at runtime.
+- **Orphan migration on `importInvoice()`:** When an invoice is imported, any ledger entries previously indexed by hash (because the invoice was not yet known when the payment arrived) are migrated to the real invoice ID key. The hash-keyed ledger entry is deleted and its entries merged into the real-keyed ledger.
+
+### 4.11 Receipt DM Format
 
 Receipt DMs use a prefix-based content format, following the same pattern as `payment_request:` in `NostrTransportProvider` (line ~570).
 
@@ -1899,7 +1961,7 @@ invoice_receipt:{"type":"invoice_receipt","version":1,"invoiceId":"a1b2c3...64he
 - The `memo` field in the receipt payload is untrusted user input — applications MUST sanitize before rendering in HTML/DOM contexts.
 - Receipt DMs are stored by `CommunicationsModule` as regular DMs. The `invoice_receipt:` prefix allows UI layers to render them with structured formatting. **UI dedup guidance:** Applications rendering both DM conversations and structured receipt cards SHOULD use the `invoice_receipt:` prefix to suppress raw text rendering of receipt DMs in conversation views, replacing them with a structured receipt component. The `IncomingInvoiceReceipt.dmId` field allows correlation between the structured `invoice:receipt_received` event and the stored DM.
 
-### 4.11 Cancellation Notice DM Format
+### 4.12 Cancellation Notice DM Format
 
 Cancellation notice DMs use the same prefix-based pattern as receipt DMs (§4.10).
 
