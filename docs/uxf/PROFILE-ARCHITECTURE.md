@@ -227,7 +227,7 @@ The existing `TxfStorageData` fields map to UXF Profile as follows:
 | `_meta.ipnsName` | Derived from identity key | Not stored |
 | `_meta.version` | `profile.version` | Migrated |
 | `_meta.formatVersion` | `profile.version` | Unified |
-| `_tombstones[]` | `{addr}.tombstones` | Migrated |
+| `_tombstones[]` | **DERIVED** — not migrated to OrbitDB, rebuilt from oracle spent-checks | Not migrated |
 | `_outbox[]` | `{addr}.outbox` | Migrated |
 | `_sent[]` | **DERIVED** — rebuilt from token ownership predicates | Not migrated; history derived from pool |
 | `_invalid[]` | `{addr}.invalidTokens` | Migrated |
@@ -482,7 +482,7 @@ PaymentsModule.save()
   → ProfileTokenStorageProvider.save(txfData)
     → Convert each TxfToken to ITokenJson (adapter)
     → UxfPackage.ingest(token) for each changed/new token
-    → Handle _tombstones, _outbox, _sent as separate profile keys
+    → Handle _outbox, _mintOutbox as separate profile keys (_tombstones, _sent, _history are DERIVED from token pool, not written)
     → UxfPackage.toCar() → pin CAR to IPFS → get new CID
     → Add new bundle as separate key:
       db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
@@ -669,8 +669,7 @@ When `Sphere.init({ profile: true })` is called on a wallet that has legacy-form
    b. Read all TokenStorageProvider tokens (TXF format)
       → Convert each to ITokenJson via adapter
       → Ingest all into a single UXF bundle via UxfPackage.ingestAll()
-   c. Collect operational state (_tombstones, _outbox, _sent, _history, etc.)
-      → Write to corresponding Profile per-address keys
+   c. Collect operational state: migrate _outbox, _mintOutbox, _invalidatedNametags to Profile per-address keys. Skip _tombstones, _sent, _history (these are DERIVED from the token pool after migration)
    d. Persist the complete new Profile to local storage (new format)
 
 3. PERSIST TO ORBITDB

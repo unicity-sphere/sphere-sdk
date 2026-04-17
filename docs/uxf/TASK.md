@@ -28,7 +28,7 @@ The existing SDK serialization (`ITokenJson`, CBOR) handles individual token rou
 
 ### Tokens as Append-Only Structures
 
-A token is an ever-growing, append-only data structure. Once an element (e.g., a transaction, genesis record) is added to a token, it cannot be modified or removed — the token's integrity depends on the immutability of its historical chain. The sole exception is **unicity proofs**, which may be updated in place (e.g., replaced with a more compact or more recent proof) because their semantics — proving that a specific state transition was committed exactly once — remain invariant regardless of the proof's representation.
+A token is an ever-growing, append-only data structure. Once an element (e.g., a transaction, genesis record) is added to a token, it cannot be modified or removed — the token's integrity depends on the immutability of its historical chain. The sole exception is **unicity proofs**, which may have alternative representations added via instance chains (see Versioning Model) (e.g., replaced with a more compact or more recent proof) because their semantics — proving that a specific state transition was committed exactly once — remain invariant regardless of the proof's representation.
 
 **Invariant:** The semantics of any element, once committed to a token, must never change. Representation (encoding, field ordering, compression) may evolve across versions, but the logical meaning of the element must be preserved exactly.
 

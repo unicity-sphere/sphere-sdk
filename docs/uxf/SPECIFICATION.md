@@ -1230,7 +1230,7 @@ Key pattern: `tokens.bundle.{CID}`
 Value (UxfBundleRef):
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| cid | text | yes | CID of the encrypted UXF CAR file on IPFS |
+| cid | text | yes | CID of the UXF CAR file on IPFS |
 | status | text | yes | 'active' or 'superseded' |
 | createdAt | uint | yes | Unix seconds |
 | device | text | no | Device identifier |
@@ -1239,8 +1239,7 @@ Value (UxfBundleRef):
 | tokenCount | uint | no | Token count for quick display |
 
 ### E.2 Multi-Bundle Read (Merge)
-When loading tokens, all active bundles are fetched, decrypted, deserialized
-via UxfPackage.fromCar(), and merged via UxfPackage.merge(). Content-addressed
+When loading tokens, all active bundles are fetched and deserialized via UxfPackage.fromCar(), and merged via UxfPackage.merge(). Content-addressed
 dedup ensures no duplication in the merged view.
 
 ### E.3 Bundle Lifecycle
