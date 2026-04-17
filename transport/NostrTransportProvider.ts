@@ -1603,9 +1603,63 @@ export class NostrTransportProvider implements TransportProvider {
       throw new SphereError('NostrClient not initialized', 'NOT_INITIALIZED');
     }
 
-    // Convert to nostr-js-sdk Event and publish
-    const sdkEvent = NostrEventClass.fromJSON(event);
-    await this.nostrClient.publishEvent(sdkEvent);
+    const MAX_ATTEMPTS = 3;
+    const RETRY_BASE_DELAY_MS = 500;
+    const RETRY_JITTER_MS = 200;
+
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      // Snapshot this.nostrClient at the top of each iteration. Using a local
+      // reference (instead of `this.nostrClient.publishEvent(...)`) prevents a
+      // concurrent disconnect() during the subsequent await from turning the
+      // call into a TypeError on null.
+      const client = this.nostrClient;
+      if (!client) {
+        throw new SphereError('Transport disconnected during retry', 'TRANSPORT_ERROR');
+      }
+
+      try {
+        // Re-create SDK event each attempt to avoid reusing the same event ID
+        // in nostr-js-sdk's pendingOks map (which would leak timers from prior attempts)
+        const sdkEvent = NostrEventClass.fromJSON(event);
+        await client.publishEvent(sdkEvent);
+        return;
+      } catch (err: unknown) {
+        lastError = err;
+        const rawMessage = err instanceof Error ? err.message : String(err);
+
+        // Only retry relay-level rejections (nostr-js-sdk wraps these as "Event rejected: <reason>")
+        // or relay broadcast failures ("sent 0 of N"). All other errors (disconnected, closed,
+        // no connected relays) are non-transient and should fail immediately.
+        // Locale-invariant match with `en-US` to avoid Turkish-locale surprises
+        // where `'I'.toLowerCase()` yields `'ı'` (dotless i).
+        const lowered = rawMessage.toLocaleLowerCase('en-US');
+        const isRelayRejection =
+          lowered.startsWith('event rejected:') ||
+          lowered.startsWith('sent 0 of');
+
+        if (!isRelayRejection || attempt === MAX_ATTEMPTS) {
+          break;
+        }
+
+        // Add jitter to desynchronize retries across concurrent clients
+        const delay = RETRY_BASE_DELAY_MS + Math.floor(Math.random() * RETRY_JITTER_MS);
+        logger.debug(
+          'Nostr',
+          `publishEvent attempt ${attempt}/${MAX_ATTEMPTS} failed (${rawMessage}); retrying in ${delay}ms`
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+
+    const reason = lastError instanceof Error ? lastError.message : String(lastError);
+    logger.error('Nostr', `publishEvent failed after ${MAX_ATTEMPTS} attempts: ${reason}`);
+    // Chain the original error as `cause` to preserve context for debugging
+    throw new SphereError(
+      `Failed to publish event: ${reason}`,
+      'TRANSPORT_ERROR',
+      lastError
+    );
   }
 
   /**
