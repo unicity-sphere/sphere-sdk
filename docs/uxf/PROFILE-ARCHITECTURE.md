@@ -93,7 +93,7 @@ These are scoped to a specific HD address. The full key is `{addressId}.{key}` w
 | `{addr}.outbox` | `OutboxEntry[]` | IPFS | Transfer outbox |
 | `{addr}.conversations` | `Conversation[]` | IPFS | DM conversation metadata |
 | `{addr}.messages` | `Map<peerId, Message[]>` | IPFS | DM message content |
-| `{addr}.transactionHistory` | `HistoryRecord[]` | IPFS | Transaction history entries |
+| ~~`{addr}.transactionHistory`~~ | — | **DERIVED** | **Not stored in UXF/OrbitDB.** Rebuilt on the fly by scanning token ownership chain predicates. Cached in local storage. See Section 10.3. |
 | `{addr}.pendingV5Tokens` | `PendingV5Token[]` | IPFS | Unconfirmed instant-split tokens |
 | `{addr}.groupchat.groups` | `GroupData[]` | IPFS | Joined NIP-29 groups |
 | `{addr}.groupchat.messages` | `Map<groupId, Message[]>` | IPFS | Group chat messages |
@@ -113,7 +113,7 @@ These are scoped to a specific HD address. The full key is `{addressId}.{key}` w
 | `{addr}.mintOutbox` | `MintOutboxEntry[]` | OrbitDB | Pending mint operations (CRITICAL — loss means stuck mints) |
 | `{addr}.invalidTokens` | `InvalidTokenEntry[]` | OrbitDB | Tokens flagged as invalid |
 | `{addr}.invalidatedNametags` | `InvalidatedNametagEntry[]` | OrbitDB | Revoked nametags with reason |
-| `{addr}.tombstones` | `TombstoneEntry[]` | OrbitDB | Spent token records (tokenId, stateHash, timestamp) |
+| ~~`{addr}.tombstones`~~ | — | **DERIVED** | **Not stored in UXF/OrbitDB.** Derived from oracle spent-checks during token status derivation. Cached in local storage. See Section 10.5. |
 
 ### 2.3 Token Inventory: Multi-Bundle Model
 
@@ -886,107 +886,256 @@ manifest:
 
 **Key distinction:** "latest known" is NOT necessarily "latest globally." Once a token has been transferred to another user, the original holder stops receiving updates. The token may have been transferred further N times by the new owner — the original holder's UXF pool still has the version from when they last held it.
 
-### 10.3 Multi-Bundle Manifest Consolidation
+### 10.3 UXF Minimalism Principle
 
-When merging multiple bundles, the same `tokenId` may appear in two bundles with different DAG versions (e.g., Device A has version with 2 transactions, Device B has version with 3 transactions after receiving an update via Nostr).
+**The UXF bundle must be minimalistic** — it stores only the absolute minimum information needed for full profile reconstruction. All secondary structures (transaction history, balance summaries, nametag lookups, etc.) are **derived on the fly** from the token pool and cached in local storage.
 
-**Consolidation rule:** For the same `tokenId`, keep the DAG with **the most transactions** (longest history = most recent version). This is safe because:
-- Transactions are append-only — a longer chain is strictly a superset of a shorter one
-- The newer version's elements include all elements from the older version (shared via content hash)
-- The older version's unique elements (its TokenRoot with fewer children) become orphans and get GC'd
+**What UXF stores:**
+- Token DAGs (the cryptographic proof materials)
+- Manifest (tokenId → root hash mapping)
+
+**What UXF does NOT store (derived instead):**
+- Transaction history — scanned from token ownership chain predicates
+- Balance summaries — computed from owned token coin data
+- Nametag lookup tables — extracted from nametag-type tokens
+- Invoice listings — extracted from invoice-type tokens
+- Tombstones — derived from oracle spent-checks
+
+If a token was sent to an unknown destination (no sync), the transaction history entry simply records "destination: unknown" — derived from the fact that the current predicate doesn't match us and no destination data is available.
+
+### 10.3.1 Token Inventory Cleanup
+
+Not all tokens in the pool belong to the user or serve a purpose. A cleanup method should remove unnecessary tokens:
+
+- Tokens **not currently owned** AND **not a nametag** AND **not an invoice** AND **never owned** → can be removed
+- Tokens flagged as **invalid/conflicting** → can be removed after investigation period
+- This is a user-triggered or GC-triggered operation, not automatic
 
 ```
-Bundle A manifest: tokenId_x → hash_R2 (2 transactions)
-Bundle B manifest: tokenId_x → hash_R3 (3 transactions)
-Merged manifest:   tokenId_x → hash_R3 (kept the longer chain)
+sphere.payments.cleanupInventory(): {
+  removed: number,       // tokens removed
+  kept: {
+    owned: number,       // currently owned (spendable)
+    nametags: number,    // nametag tokens (for PROXY resolution)
+    invoices: number,    // invoice tokens (accounting)
+    archived: number,    // previously owned (history)
+    invalid: number,     // kept for investigation
+  }
+}
 ```
 
-### 10.4 Oracle Validation: Non-Spend Proof
+### 10.4 Multi-Bundle JOIN Operation
 
-**UXF stores the latest version known to the user, but this may be stale.** The only authoritative way to confirm a token is genuinely in its latest state (unspent) is to query the **Unicity oracle** (aggregator) for a non-inclusion proof.
+When multiple UXF bundles exist (from multiple devices or sync gaps), they are merged via a **JOIN** operation. This is a client-side operation — the IPFS node stores content but never performs joins.
 
-The oracle returns one of two responses for a given token state:
+**JOIN rules:**
+
+1. **Manifests are UNIONED** — all tokenId entries from all bundles are combined
+2. **Element pools are UNIONED** — all DAG nodes from all bundles are combined (content-hash dedup)
+3. **Same tokenId in multiple bundles** — keep the longest **valid** chain:
+   - Validate each chain: every transaction must have a valid inclusion proof (or be the last pending tx)
+   - Longest valid chain wins (more transactions = more recent version)
+   - If a longer chain is INVALID (broken proof, mismatched unicity proof), discard it and keep the shorter valid chain
+   - If both chains are valid but diverge (conflicting transactions spending same state), see Section 10.7
+
+4. **Proof and element enrichment** — during JOIN, elements from one bundle can enrich another:
+   - Bundle A has token T with 3 txs but tx[2] has no inclusion proof (pending)
+   - Bundle B has token T with 3 txs and tx[2] HAS the inclusion proof (finalized on another device)
+   - JOIN result: token T with 3 txs, all with proofs (enriched from B)
+   - Same for missing nametag sub-DAGs: if one bundle has the nametag token and the other doesn't, the JOIN includes it
+
+5. **OrbitDB may contain multiple non-joined bundles temporarily** — this is accepted by design. JOIN happens on the client when loading. Between loads, bundles coexist independently in OrbitDB.
+
+```
+JOIN(Bundle_A, Bundle_B):
+  1. Union all element pools (dedup by content hash)
+  2. For each tokenId in union of manifests:
+     a. If only in one bundle → take it
+     b. If in both → validate both chains
+        - Both valid, one longer → keep longer
+        - Both valid, same length but one has more proofs → keep the enriched one
+        - One valid, one invalid → keep valid
+        - Both invalid → keep both, flag as conflicting
+        - Divergent (conflicting txs on same state) → see Section 10.7
+  3. Build consolidated manifest
+  4. Export as single UXF package
+```
+
+### 10.5 Oracle Validation
+
+**UXF stores the latest version known to the user, but this may be stale.** The only authoritative way to confirm a token is genuinely unspent is to query the **Unicity oracle** (aggregator).
+
+#### 10.5.1 Non-Spend Check
 
 | Oracle Response | Meaning | Token Status |
 |---|---|---|
 | **Non-inclusion proof** (state NOT in SMT) | This state has not been spent | **UNSPENT** — token is genuinely current |
-| **Inclusion proof** (state IS in SMT) | This state was committed (spent) | **SPENT** — someone transitioned the token further, but we don't have the new state |
+| **Inclusion proof** (state IS in SMT) | This state was committed (spent) | **SPENT** — someone transitioned further without sync |
 
-**When to query the oracle:**
+#### 10.5.2 Finalization (Acquiring Missing Proofs)
 
-1. **On token load from UXF** — after reassembling a token from the element pool, query the oracle for the current state's spend status. This validates that the UXF data is current.
+A transaction in the token DAG **contains all necessary information** to submit to the Unicity oracle and acquire its inclusion proof. If a transaction is pending (no proof):
 
-2. **Before spending** — the PaymentsModule already does this as part of the transfer flow. If the oracle says the state was spent, the transfer fails and the token is marked as spent-to-unknown.
+1. Submit the transaction to the oracle
+2. Oracle returns either:
+   - **Matching inclusion proof** → transaction is finalized, token is valid
+   - **Inclusion proof for a DIFFERENT transaction** on the same state → **double-spend detected** — another transaction spent this state first. Our transaction is invalid.
+3. If double-spend: mark the token version with the mismatched proof as **CONFLICTING/INVALID**
 
-3. **Periodic background validation** — the existing `payments.validate()` method checks all tokens against the oracle. This can run on a timer or on user request.
+#### 10.5.3 When to Query the Oracle
 
-**Spent-to-unknown scenario:**
+1. **On token load from UXF** — validate ownership claims against the oracle
+2. **Before spending** — PaymentsModule already does this
+3. **Periodic background validation** — `payments.validate()` checks all owned tokens
+4. **During finalization** — when acquiring proofs for pending transactions
 
-```
-User A has token T in UXF (state S3, after 3 transfers)
-Meanwhile, User A's OTHER device (or another app) spent T → state S4
-User A's UXF still shows T at state S3
-
-On load from UXF:
-  1. Reassemble token T from pool → ITokenJson with state S3
-  2. Query oracle: is S3 spent?
-  3. Oracle returns: inclusion proof for S3 → YES, S3 was spent
-  4. Token T is marked as SPENT (destination unknown)
-  5. The token moves to archived status in the TXF structures
-  6. If the new state S4 is later received (via Nostr sync from other device),
-     the UXF pool is updated with the newer DAG
-```
-
-### 10.5 Token Status Derivation (Complete Algorithm)
+### 10.6 Token Status Derivation (Complete Algorithm)
 
 Given the user's `pubkey` and a reassembled `ITokenJson` from UXF:
 
 ```
-Step 1: PREDICATE CHECK (local, instant)
-  • Decode current state predicate → extract owner pubkey
-  • If owner === userPubkey → potentially OWNED (proceed to Step 2)
-  • If owner !== userPubkey → NOT CURRENT OWNER
-    - Check transaction history predicates for userPubkey
-    - If found → PREVIOUSLY OWNED (sent away, kept for history)
-    - If not found → REFERENCE token (nametag for PROXY resolution)
+Step 1: CHAIN VALIDATION (local, instant)
+  • Verify all inclusion proofs in the transaction chain are valid
+  • Verify each transaction's proof matches the transaction (not another tx)
+  • If any proof mismatches → INVALID/CONFLICTING token
+  • If chain is structurally broken → INVALID
 
-Step 2: ORACLE CHECK (network, async — only for tokens with owner === userPubkey)
+Step 2: PREDICATE CHECK (local, instant)
+  • Decode current state predicate → extract owner pubkey
+  • If owner === userPubkey → potentially OWNED (proceed to Step 3)
+  • If owner !== userPubkey → NOT CURRENT OWNER
+    - Scan all transaction predicates for userPubkey
+    - If found → PREVIOUSLY OWNED (sent away)
+    - If not found → check token type:
+      · Nametag type → REFERENCE (for PROXY resolution)
+      · Invoice type → REFERENCE INVOICE
+      · Other → UNRELATED (candidate for cleanup)
+
+Step 3: FINALIZATION CHECK (local + network)
+  • If last transaction has inclusionProof → FINALIZED
+  • If last transaction has NO proof:
+    a. Submit transaction to oracle
+    b. Oracle returns matching proof → FINALIZED (proof acquired)
+    c. Oracle returns mismatched proof → DOUBLE-SPEND DETECTED
+       - Mark as CONFLICTING/INVALID
+       - Store the mismatched proof in the token DAG for investigation
+       - Do NOT count toward balances
+    d. Oracle returns non-inclusion → transaction not yet committed
+       - Mark as PENDING (retry later)
+
+Step 4: ORACLE SPEND CHECK (network, async — only for finalized owned tokens)
   • Compute RequestId from (pubkey, stateHash) for the current state
   • Query Unicity oracle for non-inclusion proof
-  • If non-inclusion proof → CONFIRMED UNSPENT, SPENDABLE
-  • If inclusion proof → SPENT TO UNKNOWN DESTINATION
-    - Mark as spent, archive, add tombstone
-    - Log warning: "Token spent by another device/app without sync"
+  • Non-inclusion proof → CONFIRMED UNSPENT, SPENDABLE
+  • Inclusion proof → SPENT TO UNKNOWN DESTINATION
+    - Keep in manifest (for history), flag as spent-unknown
+    - When sync delivers the new state → update DAG
 
-Step 3: FINALIZATION CHECK (local, instant)
-  • If last transaction has inclusionProof !== null → FINALIZED
-  • If last transaction has inclusionProof === null → PENDING
-    - Pending tokens are NOT queryable against the oracle
-    - They must be finalized first (proof collected from aggregator)
-
-Step 4: TOKEN TYPE CLASSIFICATION (local, instant)
+Step 5: TYPE CLASSIFICATION (local, instant)
   • tokenType === f8aa1383...7509 → NAMETAG
   • tokenType matches invoice pattern → INVOICE
   • Otherwise → FUNGIBLE
 ```
 
-### 10.6 Load Pipeline from UXF to TXF
+### 10.7 Conflicting Token Versions
+
+The same token can exist in two conflicting versions when two different transactions attempt to spend the same state (double-spend scenario, or two unsynced Sphere instances creating different transactions):
 
 ```
-UxfPackage.assembleAll() → Map<tokenId, ITokenJson>
+Token T at state S2:
+  Version A: S2 → tx_A → S3a (sends to Alice)
+  Version B: S2 → tx_B → S3b (sends to Bob)
+```
+
+**Resolution:**
+
+1. **One has a valid unicity proof, the other doesn't** → the proven one wins. The unicity proof is the authoritative record of which transaction was committed.
+
+2. **Neither has a proof yet** → try to finalize both:
+   - Submit tx_A to oracle → if accepted (non-inclusion for S2 means no prior spend), tx_A wins
+   - If tx_A's finalization returns a proof for tx_B → tx_B was committed first, tx_A is invalid
+   - **Prioritize the transaction that sends to OUR address** — if one version spends into our wallet, attempt to finalize that one first
+
+3. **Both claimed to have proofs** → verify both proofs:
+   - Only one can be valid for a given state (unicity guarantee)
+   - The one with a valid proof matching its transaction is correct
+   - The other's proof is either forged or for a different transaction → INVALID
+
+**Storage of conflicting versions:**
+
+Both versions are kept in the UXF pool for investigation. The manifest can reference both:
+
+```
+manifest:
+  tokenId_x → {
+    primary: hash_R3a,          // the valid/finalized version
+    conflicting: [hash_R3b],    // alternative version(s) for investigation
+    status: 'conflict-resolved' // or 'conflict-pending'
+  }
+```
+
+Invalid tokens:
+- Do NOT count toward coin balances
+- Are visible in a special "conflicts" view for investigation
+- Can be removed by `cleanupInventory()` after investigation
+
+### 10.8 Profile Version History and Rogue Instance Protection
+
+OrbitDB's Merkle-CRDT OpLog is **append-only** — every write creates a new OpLog entry without destroying previous state. This provides inherent version history:
+
+- Every profile state is recoverable by replaying the OpLog to a specific point
+- A rogue Sphere instance that corrupts data creates new OpLog entries but doesn't destroy old ones
+- Rolling back to a previous state: replay OpLog up to the last known-good entry
+
+**Rogue instance mitigation:**
+
+1. **Detection:** When joining bundles, validate all token chains. If a bundle contains invalid chains (broken proofs, mismatched unicity proofs), flag it as potentially rogue.
+
+2. **Isolation:** A rogue bundle's tokens are not merged into the primary manifest. They are quarantined in a `conflicting` list.
+
+3. **Recovery:** Since OrbitDB preserves the complete OpLog, a recovery tool can:
+   - List all bundle CIDs ever written (from OpLog history)
+   - Identify the last known-good bundle set
+   - Rebuild the manifest from the good bundles only
+   - The rogue bundle's elements remain on IPFS (no unpinning) but are excluded from the active manifest
+
+4. **Space efficiency:** Version history doesn't consume much additional IPFS space because:
+   - Different profile versions reference overlapping DAGs
+   - Only changed elements produce new blocks
+   - OrbitDB OpLog entries are small (key + encrypted value reference)
+   - The actual token elements are shared across versions via content-hash dedup
+
+### 10.9 Load Pipeline from UXF to TXF
+
+```
+UxfPackage (after JOIN of all active bundles)
     │
     ▼
-For each token: derive status (Steps 1-4 above)
+assembleAll() → Map<tokenId, ITokenJson>
     │
-    ├── OWNED + UNSPENT + CONFIRMED  → TXF: _<tokenId> (active, spendable)
-    ├── OWNED + UNSPENT + PENDING    → TXF: _<tokenId> (status=submitted)
-    ├── OWNED + SPENT TO UNKNOWN     → TXF: archived-<tokenId> + tombstone
-    ├── PREVIOUSLY OWNED (sent away) → TXF: archived-<tokenId> + tombstone
-    ├── MY NAMETAG                   → TXF: _<tokenId> + _nametags entry
-    ├── MY INVOICE                   → TXF: _<tokenId> (accounting module)
-    ├── REFERENCE (other's nametag)  → keep in memory for PROXY resolution,
-    │                                   NOT in TXF active tokens
-    └── NOT MINE (shouldn't happen)  → log warning, skip
+    ▼
+For each token: derive status (Steps 1-5 above)
+    │
+    ├── OWNED + UNSPENT + CONFIRMED   → TXF: _<tokenId> (active, spendable)
+    ├── OWNED + UNSPENT + PENDING     → TXF: _<tokenId> (status=submitted)
+    ├── OWNED + SPENT TO UNKNOWN      → TXF: archived-<tokenId>
+    ├── PREVIOUSLY OWNED (sent away)  → TXF: archived-<tokenId>
+    ├── MY NAMETAG (owned)            → TXF: _<tokenId> + _nametags entry
+    ├── MY INVOICE (owned)            → TXF: _<tokenId> (accounting module)
+    ├── REFERENCE NAMETAG (not mine)  → memory only (for PROXY resolution)
+    ├── REFERENCE INVOICE (not mine)  → memory only (accounting reference)
+    ├── UNRELATED (not mine, not ref) → kept in pool, candidate for cleanup
+    ├── CONFLICTING/INVALID           → flagged, NOT in balances, for investigation
+    └── INVALID CHAIN                 → flagged, NOT in balances, for investigation
+
+Transaction history: DERIVED from token ownership chain scanning
+  • For each token where user was ever an owner:
+    - Extract transfer records from the transaction chain
+    - Source/destination from predicate pubkeys
+    - Amounts from coin data
+    - Timestamps from proof inclusion records
+    - Destination "unknown" when current predicate is not ours and no sync data
+  • Cache in local storage, rebuild on demand
 ```
 
 ---
