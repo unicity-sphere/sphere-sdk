@@ -2,7 +2,7 @@
 
 **Status:** Draft — requires manual approval before implementation
 **Date:** 2026-03-30
-**Updated:** 2026-03-30 — OrbitDB for conflict resolution, multi-bundle CIDs with lazy consolidation
+**Updated:** 2026-04-17 — Split encryption model: encrypted manifests + unencrypted elements for cross-user dedup
 
 ---
 
@@ -355,7 +355,7 @@ OrbitDB identity = OrbitDBIdentity(secp256k1PrivateKey(walletPrivateKey))
 Database address = /orbitdb/<hash>/sphere-profile-<walletPubkeyShort>
 ```
 
-Only the wallet holder can write to this database (OrbitDB access control via identity). Any peer can read (for discovery), but values are encrypted (Section 9).
+Only the wallet holder can write to this database (OrbitDB access control via identity). Any peer can replicate, but all values are AES-256-GCM encrypted — only the wallet holder can decrypt (Section 9).
 
 ### 4.2 Data Organization in OrbitDB
 
@@ -633,7 +633,7 @@ Receive:
 4. Flush to IPFS (debounced)
 ```
 
-DM message content is encrypted with `profileEncryptionKey` before storing in OrbitDB. The NIP-17 privacy guarantee is preserved — messages are encrypted at rest on IPFS, readable only by the wallet holder. The Nostr relay sees NIP-17 gift-wrapped content; OrbitDB/IPFS sees AES-encrypted content; only the wallet holder can decrypt both.
+DM message content is encrypted with `profileEncryptionKey` before storing in OrbitDB (see Section 9.6). The NIP-17 privacy guarantee is preserved — messages are encrypted in both the Nostr relay (gift-wrap) and OrbitDB (AES-256-GCM). Only the wallet holder can decrypt.
 
 ### 7.5 Nametag Registration
 
@@ -747,30 +747,115 @@ The `profile: true` option enables the OrbitDB/IPFS persistence model. Without i
 
 ## 9. Security Considerations
 
-### 9.1 Encryption Model: Shared Key
+### 9.1 Storage Model: Unencrypted Elements, Encrypted Manifests
 
-All OrbitDB values are encrypted with a key derived from the wallet's master key:
+UXF element blocks on IPFS are stored **unencrypted** (plaintext). This is a deliberate design choice that enables **cross-user deduplication** — the core value proposition of UXF.
 
 ```
-profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)
+IPFS (public, content-addressed, cross-user dedup):
+  element[hash_A] — unicity certificate (shared by N users, stored ONCE)
+  element[hash_B] — authenticator
+  element[hash_C] — SMT path
+  element[hash_D] — nametag token sub-DAG
+  ...
+
+OrbitDB (private, per-user, encrypted):
+  tokens.bundle.{CID} — encrypted manifest + metadata (which tokens you own)
+  {addr}.transactionHistory — encrypted (who you transacted with)
+  {addr}.messages — encrypted (DM content)
+  identity.mnemonic — password-encrypted (private keys)
+  ...
 ```
 
-Since the key is derived deterministically from the mnemonic, ALL devices sharing the same wallet derive the same key. This means:
-- Only devices with the mnemonic can decrypt
-- IPFS pinning services and other peers see only encrypted blobs
-- The encryption is transparent to the OrbitDB layer (values are encrypted bytes)
+**What is encrypted (in OrbitDB):** All profile KV values — identity, manifests, history, messages, operational state. These reveal **which** tokens a user owns, **who** they transacted with, and **what** messages they exchanged. Encrypted with `profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)` using AES-256-GCM with random IV.
 
-Encryption uses AES-256-GCM with a random IV per value. The IV is prepended to the ciphertext. Since the IV is random, the same plaintext produces different ciphertext on different writes — but this is acceptable because OrbitDB uses LWW (only the latest write matters) and CID dedup applies to the UXF CAR files (which use content-addressed blocks, not the encrypted OrbitDB values).
+**What is NOT encrypted (on IPFS):** Individual UXF element blocks — token genesis data, state transitions, inclusion proofs, unicity certificates, predicates, authenticators, SMT paths. These are **cryptographic proof materials**, not secrets.
 
-UXF CAR files on IPFS are also encrypted with the same key before pinning. The CID is computed over the encrypted bytes, so two devices encrypting the same CAR with the same key and same IV-derivation produce the same CID. For CAR files, use a deterministic IV: `IV = HMAC(profileEncryptionKey, carContentHash)[:12]`. This ensures identical CAR content produces identical encrypted bytes and therefore identical CIDs.
+### 9.2 Why Token Elements Are Not Secrets (Privacy Analysis)
 
-### 9.2 Identity Protection
+A common security concern is: "if token data is public on IPFS, can someone steal funds?" The answer is **no**, and here is why:
 
-The `identity.mnemonic` and `identity.masterKey` fields are encrypted with the user-provided password at the application level (consistent with existing `Sphere.init({ password })` behavior). This encryption is independent of the `profileEncryptionKey` — it's the same AES encryption the SDK already uses for mnemonics. The password-encrypted bytes are then encrypted again with `profileEncryptionKey` before storing in OrbitDB, providing a double layer for these critical fields.
+**Token elements are cryptographic proofs, not authorization credentials.** To perform a state transition (transfer a token), an attacker needs the **private key** corresponding to the token's current predicate. The token elements on IPFS contain:
 
-### 9.3 OrbitDB Access Control
+| Element | Contains | Can an observer steal funds? | Can an observer learn anything? |
+|---------|----------|-------|------|
+| **UnicityCertificate** | BFT validator signatures for an aggregator round | No — proves round commitment, not ownership | Which aggregator round a transition was committed in |
+| **Authenticator** | Public key + signature + state hash | No — signature proves a past transition, not future authorization | The public key that authorized a past transition |
+| **Predicate** | Public key, signing algorithm, nonce | No — knowing the pubkey doesn't reveal the private key | The current owner's public key (already public in Nostr binding events) |
+| **SMT Path** | Merkle tree path segments | No — proves inclusion in the aggregator's tree | Position in the Sparse Merkle Tree |
+| **Genesis Data** | Token ID, type, coin data, recipient address | No — address is already public | Token denomination and recipient (already visible to aggregator) |
+| **Token State** | Current predicate + data | No — same as Predicate above | Current ownership state |
 
-OrbitDB databases are writable only by the identity that created them. The database address is derived from the wallet's secp256k1 key pair. Other peers can replicate (read) the database but cannot write to it. Even with read access, peers see only encrypted values — the `profileEncryptionKey` is required to decrypt any content.
+**The critical insight:** Unicity tokens derive their security from **private key custody**, not from data secrecy. The entire state transition chain is designed to be **publicly verifiable** — that's the point of inclusion proofs and unicity certificates. Hiding token elements behind encryption would be like encrypting a blockchain — it defeats the purpose of the transparency/verifiability model.
+
+**What IS private and must be encrypted:**
+- **Manifests** — reveal which tokens a user owns (balance disclosure)
+- **Transaction history** — reveals counterparties and amounts
+- **DM messages** — private communications
+- **Identity keys** — mnemonic and master key (fund access)
+- **Operational state** — pending transfers, outbox (reveals intent)
+
+These are all stored in OrbitDB and encrypted with the profile key.
+
+### 9.3 Cross-User Deduplication (Why This Matters)
+
+By storing UXF elements unencrypted, we achieve **cross-user deduplication at the IPFS level**:
+
+```
+User A has token T (genesis + 3 transactions + proofs)
+User B receives token T from A (same genesis + 3 transactions + 1 new transaction)
+
+With encryption (broken model):
+  User A: encrypt(CAR_A, key_A) → CID_X (encrypted blob, 15 KB)
+  User B: encrypt(CAR_B, key_B) → CID_Y (different encrypted blob, 20 KB)
+  IPFS stores: 35 KB (zero dedup — different keys produce different CIDs)
+
+Without encryption (correct model):
+  User A: UXF elements → individual IPLD blocks → CIDs based on content
+  User B: UXF elements → same blocks for shared history + 1 new block
+  IPFS stores: 20 KB (15 KB shared + 5 KB new — 43% saved)
+
+At scale (1000 users, 100 tokens each, tokens passing through ~5 owners on average):
+  With encryption: ~1000 × 100 × 15 KB = 1.5 GB (no dedup)
+  Without encryption: ~200 × 100 × 15 KB = 300 MB (80% dedup from shared elements)
+```
+
+The unicity certificates alone (shared by all tokens in the same aggregator round) represent 25-40% of token data. With 1000 users, the same certificate is stored once instead of thousands of times.
+
+### 9.4 Identity and Key Protection
+
+The `identity.mnemonic` and `identity.masterKey` fields receive **two layers of protection**:
+
+1. **Application-level password encryption** — the user's password encrypts the mnemonic via AES (consistent with existing `Sphere.init({ password })` behavior). Without the password, the mnemonic cannot be recovered even by someone with the profile encryption key.
+
+2. **Profile-level encryption** — the password-encrypted bytes are further encrypted with `profileEncryptionKey` before storing in OrbitDB. This prevents OrbitDB replication from exposing even the password-encrypted form to peers.
+
+### 9.5 OrbitDB Access Control
+
+OrbitDB databases are **writable only by the wallet identity** (secp256k1 key pair). The database address is derived from the wallet's public key. Other peers:
+- **Cannot write** — OrbitDB `OrbitDBAccessController` restricts writes to the owner identity
+- **Can replicate** — OrbitDB's libp2p PubSub allows peers to replicate the OpLog
+- **Cannot decrypt** — all values are AES-256-GCM encrypted; the `profileEncryptionKey` is derived from the mnemonic which only the wallet holder possesses
+
+Even if a peer replicates the OrbitDB database, they see only encrypted blobs for all profile values. The only unencrypted data is on IPFS (UXF element blocks), which as analyzed in Section 9.2, contains only publicly-verifiable cryptographic proof materials.
+
+### 9.6 DM Message Privacy
+
+DM message content is encrypted with `profileEncryptionKey` before storing in OrbitDB. The NIP-17 gift-wrap privacy model is preserved:
+- **Nostr relay** sees NIP-17 gift-wrapped (encrypted) events
+- **OrbitDB/IPFS** sees AES-encrypted values
+- **Only the wallet holder** can decrypt both layers
+
+### 9.7 Threat Model Summary
+
+| Threat | Mitigation | Residual Risk |
+|--------|-----------|---------------|
+| Attacker reads UXF elements on IPFS | Elements are cryptographic proofs, not secrets. Cannot steal funds without private key. | Attacker learns token structure (denomination, proof chain) — same as inspecting a public blockchain. |
+| Attacker reads OrbitDB values | AES-256-GCM encryption. Key derived from mnemonic via HKDF. | None — ciphertext without key is computationally infeasible to break. |
+| Attacker correlates CIDs to users | Manifests are encrypted in OrbitDB. CIDs of individual elements don't reveal ownership. | Attacker who monitors IPFS pin timing may correlate activity patterns (same as any network observer). |
+| Attacker forges OrbitDB entries | OrbitDB access controller restricts writes to the wallet identity. | A compromised Helia node could present stale data (denial of service, not data theft). |
+| Attacker compromises IPFS node | Token elements are public proof materials (no loss). Profile values are encrypted (no disclosure). | Storage denial — attacker could unpin data. Mitigated by multi-node pinning. |
+| Attacker obtains mnemonic | Game over — full access to wallet, tokens, and profile. | Same as any wallet — mnemonic custody is the security boundary. |
 
 ---
 
@@ -779,7 +864,7 @@ OrbitDB databases are writable only by the identity that created them. The datab
 | # | Question | Decision |
 |---|----------|----------|
 | 1 | Cache-only keys in OrbitDB? | **No** — prices and registry cache stay in local storage only. Regenerated from APIs, would bloat OpLog. |
-| 2 | Encryption? | **Shared-key encryption.** All OrbitDB values and UXF CAR files encrypted with `profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)`. All devices with the mnemonic derive the same key. CAR files use deterministic IV to preserve CID dedup. See Section 9.1. |
+| 2 | Encryption? | **Split model: encrypted manifests, unencrypted elements.** OrbitDB profile values (manifests, history, messages, identity) encrypted with `profileEncryptionKey`. UXF element blocks on IPFS stored unencrypted (plaintext) to enable cross-user content-addressed deduplication. Token elements are cryptographic proofs, not secrets — see Section 9.2 privacy analysis. |
 | 3 | Migration strategy | **Silent auto-migration** with 6-step flow: sync old IPFS → transform locally → persist to OrbitDB → sanity check → cleanup legacy → done. See Section 7.6. |
 | 4 | Sphere app WalletRepository | **Migrate to ProfileStorageProvider** — separate follow-up task (app-level, not SDK). SDK provides the provider; app migration documented but not blocking. |
 | 5 | OrbitDB bundle size | **Accept the cost.** Replaces ~3,000 lines of custom IPFS sync code. Load via UXF/Profile entry point, lazy-load in browser if needed. |
