@@ -738,4 +738,46 @@ describe('PaymentsModule Concurrency', () => {
       expect(r2).toBe('queued');
     });
   });
+
+  // ===========================================================================
+  // Reservation Cleanup on Error
+  // ===========================================================================
+
+  describe('Reservation cleanup on error', () => {
+    it('reservation is released when send logic throws after planSend reserves tokens', () => {
+      const pool = buildPool(makeParsedEntry('tok-1', 1000000n));
+
+      const result = planner.planSend(
+        { amount: '500000', coinId: 'UCT' }, pool, ledger, {} as SpendQueue, 'res-err'
+      );
+      expect(result).not.toBe('queued');
+      expect(ledger.hasActiveReservation('tok-1')).toBe(true);
+      expect(ledger.getFreeAmount('tok-1', 1000000n)).toBeLessThan(1000000n);
+
+      // Simulate error path: caller cancels reservation
+      ledger.cancel('res-err');
+
+      expect(ledger.getFreeAmount('tok-1', 1000000n)).toBe(1000000n);
+      expect(ledger.hasActiveReservation('tok-1')).toBe(false);
+    });
+
+    it('cancelled reservation frees tokens for subsequent senders', () => {
+      const pool = buildPool(makeParsedEntry('tok-1', 1000000n));
+      const mockQueue = { enqueue: vi.fn() } as unknown as SpendQueue;
+
+      // First send reserves all
+      planner.planSend({ amount: '1000000', coinId: 'UCT' }, pool, ledger, mockQueue, 'res-1');
+
+      // Second send queued
+      const r2 = planner.planSend({ amount: '500000', coinId: 'UCT' }, pool, ledger, mockQueue, 'res-2');
+      expect(r2).toBe('queued');
+
+      // First send fails → cancel
+      ledger.cancel('res-1');
+
+      // Third send succeeds immediately
+      const r3 = planner.planSend({ amount: '500000', coinId: 'UCT' }, pool, ledger, mockQueue, 'res-3');
+      expect(r3).not.toBe('queued');
+    });
+  });
 });

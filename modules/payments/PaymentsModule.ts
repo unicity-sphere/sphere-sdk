@@ -29,7 +29,7 @@ import type {
   NametagData,
 } from '../../types/txf';
 import { L1PaymentsModule, type L1PaymentsModuleConfig } from './L1PaymentsModule';
-import { TokenSplitCalculator } from './TokenSplitCalculator';
+import { TokenSplitCalculator, type SplitPlan, type TokenWithAmount } from './TokenSplitCalculator';
 import { TokenSplitExecutor } from './TokenSplitExecutor';
 import { TokenReservationLedger } from './TokenReservationLedger';
 import { SpendPlanner, SpendQueue, type ParsedTokenEntry, type ParsedTokenPool } from './SpendQueue';
@@ -736,6 +736,9 @@ export class PaymentsModule {
   /** Sync coalescing: concurrent sync() calls share the same operation */
   private _syncInProgress: Promise<{ added: number; removed: number }> | null = null;
 
+  /** Token change observers — notified when a token is added, updated, or removed */
+  private tokenChangeCallbacks: Array<(tokenId: string, sdkData: string) => void> = [];
+
   // Token Spend Queue — concurrent send race condition prevention
   private readonly reservationLedger = new TokenReservationLedger();
   private readonly spendPlanner = new SpendPlanner();
@@ -773,6 +776,41 @@ export class PaymentsModule {
    */
   getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
     return this.moduleConfig;
+  }
+
+  /**
+   * Register a callback to be notified when a token is added or updated.
+   *
+   * The callback receives the token's genesis `tokenId` (64-hex) and the raw
+   * `sdkData` JSON string. This enables consumers (e.g., AccountingModule) to
+   * index token transactions at mutation time rather than doing periodic scans.
+   *
+   * @param cb - Callback: `(tokenId: string, sdkData: string) => void`
+   * @returns Unsubscribe function.
+   */
+  onTokenChange(cb: (tokenId: string, sdkData: string) => void): () => void {
+    this.tokenChangeCallbacks.push(cb);
+    return () => {
+      this.tokenChangeCallbacks = this.tokenChangeCallbacks.filter((c) => c !== cb);
+    };
+  }
+
+  /**
+   * Notify all registered token change observers.
+   * Called from addToken(), updateToken() after successful mutation.
+   * Errors in callbacks are silently caught to prevent disrupting the caller.
+   */
+  private notifyTokenChange(token: Token): void {
+    if (this.tokenChangeCallbacks.length === 0) return;
+    const tokenId = extractTokenIdFromSdkData(token.sdkData);
+    if (!tokenId || !token.sdkData) return;
+    for (const cb of this.tokenChangeCallbacks) {
+      try {
+        cb(tokenId, token.sdkData);
+      } catch {
+        // Silently ignore callback errors
+      }
+    }
   }
 
   /** Price provider (optional) */
@@ -1019,8 +1057,16 @@ export class PaymentsModule {
   /**
    * Send tokens to recipient
    * Supports automatic token splitting when exact amount is needed
+   *
+   * @param request - Transfer request.
+   * @param internal - Internal options (not part of the public API).
+   *   `existingReservationId` and `existingSplitPlan` allow callers (e.g. instantSplitSend)
+   *   to pass an already-acquired reservation, skipping the planSend() critical section.
    */
-  async send(request: TransferRequest): Promise<TransferResult> {
+  async send(
+    request: TransferRequest,
+    internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
+  ): Promise<TransferResult> {
     this.ensureInitialized();
 
     // Track this send() so switchToAddress() waits for it via waitForPendingOperations().
@@ -1032,15 +1078,19 @@ export class PaymentsModule {
 
     // Use mutable result for building the transfer
     const result: { -readonly [K in keyof TransferResult]: TransferResult[K] } = {
-      id: crypto.randomUUID(),
+      id: internal?.existingReservationId ?? crypto.randomUUID(),
       status: 'pending',
       tokens: [],
       tokenTransfers: [],
     };
 
+    // W23-R2 fix: Track tokens committed on-chain so the error handler doesn't
+    // restore already-spent tokens (e.g., split source token after on-chain split).
+    const committedOnChainTokenIds = new Set<string>();
+
     try {
-      // Resolve recipient once — single network query
-      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      // Resolve recipient
+      const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
       const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
       const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
@@ -1058,26 +1108,58 @@ export class PaymentsModule {
         throw new SphereError('Trust base not available. Oracle provider must implement getTrustBase()', 'AGGREGATOR_ERROR');
       }
 
-      // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
-      const parsedPool = await this.spendPlanner.buildParsedPool(
-        Array.from(this.tokens.values()),
-        request.coinId
-      );
+      let splitPlan: SplitPlan;
 
-      // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
-      // planSend reads free amounts, runs split calculation, and creates a
-      // reservation atomically. No concurrent send() can interleave here.
-      const planResult = this.spendPlanner.planSend(
-        request, parsedPool, this.reservationLedger, this.spendQueue, result.id
-      );
-
-      let splitPlan;
-      if (planResult === 'queued') {
-        // Wait for change tokens to arrive and wake this entry
-        const queueResult = await this.spendQueue.waitForEntry(result.id);
-        splitPlan = queueResult.splitPlan;
+      if (internal?.existingSplitPlan) {
+        // W23 fix: Reuse the reservation + plan from instantSplitSend to avoid
+        // the cancel-then-reacquire race window.
+        splitPlan = internal.existingSplitPlan;
       } else {
-        splitPlan = planResult.splitPlan;
+        // ── Coin symbol → coinId resolution ────────────────────────────────────
+        // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
+        // while token storage uses 64/68-char hex coinIds. If no tokens match
+        // the literal coinId, attempt to resolve via the token registry.
+        const resolvedCoinId = (() => {
+          const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
+          if (!literalMatch && request.coinId.length <= 20) {
+            const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
+            if (def?.id) return def.id;
+          }
+          return request.coinId;
+        })();
+        if (resolvedCoinId !== request.coinId) {
+          request = { ...request, coinId: resolvedCoinId };
+        }
+
+        // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId
+        );
+
+        // ── Spend Queue: SYNCHRONOUS CRITICAL SECTION (no awaits) ──────────────
+        // planSend reads free amounts, runs split calculation, and creates a
+        // reservation atomically. No concurrent send() can interleave here.
+        // Count pending change tokens (status='transferring') so concurrent sends
+        // queue instead of failing with SEND_INSUFFICIENT_BALANCE.
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+
+        const planResult = this.spendPlanner.planSend(
+          request, parsedPool, this.reservationLedger, this.spendQueue, result.id, pendingChangeAmount
+        );
+
+        if (planResult === 'queued') {
+          // Wait for change tokens to arrive and wake this entry
+          const queueResult = await this.spendQueue.waitForEntry(result.id);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
       }
 
       if (!splitPlan) {
@@ -1085,7 +1167,7 @@ export class PaymentsModule {
       }
 
       // Collect all tokens involved
-      const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map(t => t.uiToken);
+      const tokensToSend: Token[] = splitPlan.tokensToTransferDirectly.map((t: TokenWithAmount) => t.uiToken);
       if (splitPlan.tokenToSplit) {
         tokensToSend.push(splitPlan.tokenToSplit.uiToken);
       }
@@ -1110,6 +1192,8 @@ export class PaymentsModule {
 
       const transferMode = request.transferMode ?? 'instant';
 
+      const onChainMessage: Uint8Array | null = null;
+
       if (transferMode === 'conservative') {
         // =================================================================
         // CONSERVATIVE MODE: each token sent individually with full proofs
@@ -1130,7 +1214,11 @@ export class PaymentsModule {
             splitPlan.remainderAmount!,
             splitPlan.coinId,
             recipientAddress,
+            onChainMessage,
           );
+
+          // Mark split source token as committed on-chain — cannot be restored on error
+          committedOnChainTokenIds.add(splitPlan.tokenToSplit!.uiToken.id);
 
           // Save change token
           const changeTokenData = splitResult.tokenForSender.toJSON();
@@ -1163,11 +1251,7 @@ export class PaymentsModule {
             ? Array.from(splitCommitmentRequestId).map((b: number) => b.toString(16).padStart(2, '0')).join('')
             : splitCommitmentRequestId ? String(splitCommitmentRequestId) : undefined;
 
-          // Commit reservation BEFORE removing tokens — prevents cancelForToken()
-          // from cancelling our own active reservation
-          this.reservationLedger.commit(result.id);
-
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1176,15 +1260,10 @@ export class PaymentsModule {
           logger.debug('Payments', 'Conservative split transfer completed');
         }
 
-        // Commit reservation if not already committed by split path above
-        if (!splitPlan.requiresSplit) {
-          this.reservationLedger.commit(result.id);
-        }
-
         // Transfer direct tokens
         for (const tokenWithAmount of splitPlan.tokensToTransferDirectly) {
           const token = tokenWithAmount.uiToken;
-          const commitment = await this.createSdkCommitment(token, recipientAddress, signingService);
+          const commitment = await this.createSdkCommitment(token, recipientAddress, signingService, onChainMessage);
 
           logger.debug('Payments', `CONSERVATIVE: Sending direct token ${token.id.slice(0, 8)}... to ${recipientPubkey.slice(0, 8)}...`);
 
@@ -1192,6 +1271,8 @@ export class PaymentsModule {
           if (submitResponse.status !== 'SUCCESS' && submitResponse.status !== 'REQUEST_ID_EXISTS') {
             throw new SphereError(`Transfer commitment failed: ${submitResponse.status}`, 'TRANSFER_FAILED');
           }
+          // W23-R3 fix: Mark token as committed on-chain — cannot be restored on error
+          committedOnChainTokenIds.add(token.id);
 
           const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
           const transferTx = commitment.toTransaction(inclusionProof);
@@ -1214,7 +1295,7 @@ export class PaymentsModule {
             requestIdHex,
           });
           logger.debug('Payments', `Token ${token.id} sent via CONSERVATIVE, requestId: ${requestIdHex}`);
-          await this.removeToken(token.id);
+          await this.removeToken(token.id, result.id);
         }
       } else {
         // =================================================================
@@ -1247,6 +1328,7 @@ export class PaymentsModule {
             recipientAddress,
             {
               memo: request.memo,
+              message: onChainMessage,
               onChangeTokenCreated: async (changeToken) => {
                 const changeTokenData = changeToken.toJSON();
                 // Remove placeholder — it was a temporary UI stand-in
@@ -1276,17 +1358,21 @@ export class PaymentsModule {
             }
           );
           logger.debug('Payments', `Split bundle built: splitGroupId=${builtSplit.splitGroupId}`);
+          // W23-R3 fix: Mark split source token as committed on-chain in instant mode too.
+          // buildSplitBundle submits the burn commitment; if subsequent steps fail,
+          // the catch block must NOT restore this already-spent token.
+          committedOnChainTokenIds.add(splitPlan.tokenToSplit!.uiToken.id);
         }
 
         // 2. Prepare direct token entries in parallel — does NOT send
         const directCommitments = await Promise.all(
-          splitPlan.tokensToTransferDirectly.map(tw =>
-            this.createSdkCommitment(tw.uiToken, recipientAddress, signingService)
+          splitPlan.tokensToTransferDirectly.map((tw: TokenWithAmount) =>
+            this.createSdkCommitment(tw.uiToken, recipientAddress, signingService, onChainMessage)
           )
         );
 
         const directTokenEntries: DirectTokenEntry[] = splitPlan.tokensToTransferDirectly.map(
-          (tw, i) => ({
+          (tw: TokenWithAmount, i: number) => ({
             sourceToken: JSON.stringify(tw.sdkToken.toJSON()),
             commitmentData: JSON.stringify(directCommitments[i].toJSON()),
             amount: tw.uiToken.amount,
@@ -1356,14 +1442,9 @@ export class PaymentsModule {
           );
         }
 
-        // Commit reservation BEFORE removing tokens — prevents cancelForToken()
-        // from cancelling our own active reservation and waking queued sends
-        // that could re-plan against already-spent tokens.
-        this.reservationLedger.commit(result.id);
-
         // 7. Track and remove tokens (removeToken archives + tombstones + saves)
         if (splitPlan.requiresSplit && splitPlan.tokenToSplit) {
-          await this.removeToken(splitPlan.tokenToSplit.uiToken.id);
+          await this.removeToken(splitPlan.tokenToSplit.uiToken.id, result.id);
           result.tokenTransfers.push({
             sourceTokenId: splitPlan.tokenToSplit.uiToken.id,
             method: 'split',
@@ -1385,7 +1466,7 @@ export class PaymentsModule {
             method: 'direct',
             requestIdHex,
           });
-          await this.removeToken(token.id);
+          await this.removeToken(token.id, result.id);
         }
 
         logger.debug('Payments', 'V6 combined transfer completed');
@@ -1426,7 +1507,7 @@ export class PaymentsModule {
         tokenIds: sentTokenIds.length > 0 ? sentTokenIds : undefined,
       });
 
-      // Commit reservation (idempotent — may already be committed by mode-specific code above)
+      // Commit reservation — all tokens have been sent on-chain and removed.
       this.reservationLedger.commit(result.id);
 
       this.deps!.emitEvent('transfer:confirmed', result);
@@ -1438,8 +1519,20 @@ export class PaymentsModule {
       result.status = 'failed';
       result.error = error instanceof Error ? error.message : String(error);
 
-      // Restore tokens and re-add to spend queue cache
+      // Restore tokens and re-add to spend queue cache.
+      // W23-R2/R3 fix: Skip tokens that were already committed on-chain or removed
+      // (tombstoned) during this send. Restoring those would create phantom tokens.
       for (const token of result.tokens) {
+        if (committedOnChainTokenIds.has(token.id)) {
+          logger.warn('Payments', `Skipping restoration of on-chain-committed token ${token.id}`);
+          continue;
+        }
+        // Skip tokens that were already removeToken()'d (archived + tombstoned)
+        // during a partially-successful conservative send loop
+        if (!this.tokens.has(token.id)) {
+          logger.warn('Payments', `Skipping restoration of already-removed token ${token.id}`);
+          continue;
+        }
         token.status = 'confirmed';
         this.tokens.set(token.id, token);
         if (token.sdkData) {
@@ -1557,8 +1650,8 @@ export class PaymentsModule {
     let tokenToSplitRef: Token | undefined;
 
     try {
-      // Resolve recipient once — single network query
-      const peerInfo = await this.deps!.transport.resolve?.(request.recipient) ?? null;
+      // Resolve recipient
+      const peerInfo: PeerInfo | null = await this.deps!.transport.resolve?.(request.recipient) ?? null;
       const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
       const recipientAddress = await this.resolveRecipientAddress(request.recipient, request.addressMode, peerInfo);
 
@@ -1578,13 +1671,31 @@ export class PaymentsModule {
 
       // ── Spend Queue: reserve tokens (same path as send()) ──
       reservationId = crypto.randomUUID();
+      // Symbol → coinId resolution (same logic as send())
+      const resolvedCoinIdForSplit = (() => {
+        const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
+        if (!literalMatch && request.coinId.length <= 20) {
+          const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
+          if (def?.id) return def.id;
+        }
+        return request.coinId;
+      })();
+      if (resolvedCoinIdForSplit !== request.coinId) {
+        request = { ...request, coinId: resolvedCoinIdForSplit };
+      }
       const parsedPool = await this.spendPlanner.buildParsedPool(
         Array.from(this.tokens.values()),
         request.coinId
       );
 
+      let pendingChangeAmount2 = 0n;
+      for (const [, t] of this.tokens) {
+        if (t.coinId === request.coinId && t.status === 'transferring') {
+          pendingChangeAmount2 += BigInt(t.amount || '0');
+        }
+      }
       const planResult = this.spendPlanner.planSend(
-        request, parsedPool, this.reservationLedger, this.spendQueue, reservationId
+        request, parsedPool, this.reservationLedger, this.spendQueue, reservationId, pendingChangeAmount2
       );
 
       let splitPlan;
@@ -1600,13 +1711,13 @@ export class PaymentsModule {
       }
 
       if (!splitPlan.requiresSplit || !splitPlan.tokenToSplit) {
-        // For direct transfers without split, release reservation and fall back to standard flow.
-        // send() will create its own reservation. Notify AFTER send() completes so a racing
-        // queued entry doesn't grab the freed tokens before send() can re-reserve.
-        this.reservationLedger.cancel(reservationId);
+        // W23 fix: For direct transfers without split, fall back to standard send()
+        // but pass the existing reservation ID so send() can reuse it instead of
+        // creating a new one. This closes the race window where freed tokens could
+        // be grabbed by a concurrent queued entry between cancel and re-reserve.
         logger.debug('Payments', 'No split required, falling back to standard send()');
         try {
-          const result = await this.send(request);
+          const result = await this.send(request, { existingReservationId: reservationId, existingSplitPlan: splitPlan });
           return {
             success: result.status === 'completed',
             criticalPathDurationMs: performance.now() - startTime,
@@ -1630,6 +1741,8 @@ export class PaymentsModule {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const devMode = options?.devMode ?? (this.deps!.oracle as any).isDevMode?.() ?? false;
 
+      const onChainMessage: Uint8Array | null = null;
+
       // Create instant split executor
       const executor = new InstantSplitExecutor({
         stateTransitionClient: stClient,
@@ -1650,6 +1763,7 @@ export class PaymentsModule {
         {
           ...options,
           memo: request.memo,
+          message: onChainMessage,
           onChangeTokenCreated: async (changeToken) => {
             // Save change token when background completes
             const changeTokenData = changeToken.toJSON();
@@ -1682,11 +1796,12 @@ export class PaymentsModule {
           this.pendingBackgroundTasks.push(result.backgroundPromise);
         }
 
-        // Commit reservation BEFORE removing token
+        // Commit reservation AFTER transfer — removing token passes excludeReservationId
+        // to prevent cancelForToken() from cancelling our own in-flight reservation.
         this.reservationLedger.commit(reservationId);
 
         // Remove the original token
-        await this.removeToken(tokenToSplit.id);
+        await this.removeToken(tokenToSplit.id, reservationId);
 
         // Add to transaction history (single entry for the actual sent amount)
         const recipientNametag = peerInfo?.nametag
@@ -3078,7 +3193,11 @@ export class PaymentsModule {
    * @returns The token, or `undefined` if not found.
    */
   getToken(id: string): Token | undefined {
-    return this.tokens.get(id);
+    const token = this.tokens.get(id);
+    if (!token) {
+      logger.debug('Payments', `getToken: not found id=${id.slice(0, 16)}... mapSize=${this.tokens.size}`);
+    }
+    return token;
   }
 
   // ===========================================================================
@@ -3589,11 +3708,15 @@ export class PaymentsModule {
   async addToken(token: Token): Promise<boolean> {
     this.ensureInitialized();
 
+    logger.debug('Payments', `addToken called: id=${token.id.slice(0, 16)}... coinId=${token.coinId.slice(0, 16)}... status=${token.status}`);
+
     const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
     const incomingStateHash = extractStateHashFromSdkData(token.sdkData);
     const incomingStateKey = incomingTokenId && incomingStateHash
       ? createTokenStateKey(incomingTokenId, incomingStateHash)
       : null;
+
+    logger.debug('Payments', `addToken extract: tokenId=${incomingTokenId?.slice(0, 16) ?? 'null'} stateHash=${incomingStateHash?.slice(0, 16) ?? 'null'}`);
 
     // Check tombstones - reject tokens with exact (tokenId, stateHash) match
     // This prevents spent tokens from being re-added via Nostr re-delivery
@@ -3656,11 +3779,16 @@ export class PaymentsModule {
 
     // Add the new token state
     this.tokens.set(token.id, token);
+    logger.debug('Payments', `addToken: stored id=${token.id.slice(0, 16)}... mapSize=${this.tokens.size}`);
 
     // Archive the token (for recovery purposes)
     await this.archiveToken(token);
 
     await this.save();
+    logger.debug('Payments', `addToken: saved id=${token.id.slice(0, 16)}...`);
+
+    // Notify observers (e.g., AccountingModule) that a token was added
+    this.notifyTokenChange(token);
 
     // Spend Queue: cache parsed token and wake queued sends
     if (token.sdkData && token.status === 'confirmed') {
@@ -3736,6 +3864,10 @@ export class PaymentsModule {
     await this.archiveToken(token);
 
     await this.save();
+
+    // Notify observers (e.g., AccountingModule) that a token was updated
+    this.notifyTokenChange(token);
+
     logger.debug('Payments', `Updated token ${token.id}`);
   }
 
@@ -3748,14 +3880,15 @@ export class PaymentsModule {
    *
    * @param tokenId - Local UUID of the token to remove.
    */
-  async removeToken(tokenId: string): Promise<void> {
+  async removeToken(tokenId: string, excludeReservationId?: string): Promise<void> {
     this.ensureInitialized();
 
     const token = this.tokens.get(tokenId);
     if (!token) return;
 
-    // Spend Queue: cancel any active reservations referencing this token
-    this.reservationLedger.cancelForToken(tokenId);
+    // Spend Queue: cancel any OTHER active reservations referencing this token.
+    // excludeReservationId prevents cancelling the caller's own in-flight reservation.
+    this.reservationLedger.cancelForToken(tokenId, excludeReservationId);
     this.parsedTokenCache.delete(tokenId);
 
     // Archive before removing
@@ -4760,7 +4893,7 @@ export class PaymentsModule {
    * Uses pre-resolved PeerInfo if available, otherwise resolves via transport.
    */
   private resolveTransportPubkey(recipient: string, peerInfo?: PeerInfo | null): string {
-    // If we have PeerInfo, use it
+    // If we already have PeerInfo from a prior resolve() call, use it directly
     if (peerInfo?.transportPubkey) {
       return peerInfo.transportPubkey;
     }
@@ -4787,7 +4920,8 @@ export class PaymentsModule {
   private async createSdkCommitment(
     token: Token,
     recipientAddress: IAddress,
-    signingService: SigningService
+    signingService: SigningService,
+    message?: Uint8Array | null
   ): Promise<TransferCommitment> {
     // Parse SDK token from stored data
     const tokenData = token.sdkData
@@ -4804,8 +4938,8 @@ export class PaymentsModule {
       sdkToken,
       recipientAddress,
       salt,
-      null, // recipientData
       null, // recipientDataHash
+      message ?? null, // on-chain message bytes, or null
       signingService
     );
 
@@ -5507,11 +5641,24 @@ export class PaymentsModule {
     // Load tombstones FIRST so we can filter tokens
     this.tombstones = parsed.tombstones;
     this.rebuildTombstoneKeySet();
-    // Load tokens, filtering out tombstoned ones
-    // NOTE: Only filter by exact (tokenId, stateHash) match to avoid over-blocking
-    // When state hash is unavailable, we can't reliably distinguish old from new
+    // Load tokens, filtering out tombstoned ones.
+    // Preserve tokens with 'transferring' status — they are part of an in-flight send().
+    const preservedTransferring = new Map<string, Token>();
+    for (const [id, token] of this.tokens) {
+      if (token.status === 'transferring') {
+        preservedTransferring.set(id, token);
+      }
+    }
+
     this.tokens.clear();
+    for (const [id, token] of preservedTransferring) {
+      this.tokens.set(id, token);
+    }
+
     for (const token of parsed.tokens) {
+      // Don't overwrite in-flight tokens preserved above
+      if (preservedTransferring.has(token.id)) continue;
+
       const sdkTokenId = extractTokenIdFromSdkData(token.sdkData);
       const stateHash = extractStateHashFromSdkData(token.sdkData);
 

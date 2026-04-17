@@ -92,27 +92,8 @@ export async function scanAddressesImpl(
   const { onProgress, signal, resolveNametag } = options;
 
   // Dynamic import to avoid hard dependency on L1 for non-L1 consumers
-  const { connect, disconnect, getBalance } = await import('../l1/network');
-
-  // Race connect against a timeout — L1 must never block L3 wallet init.
-  // connect() has its own reconnect loop (10 attempts, exponential backoff
-  // up to 60s each ≈ 6 min total). We fail fast so callers like
-  // discoverAddresses() can catch and continue without L1.
-  const L1_CONNECT_TIMEOUT_MS = 10_000;
-  let connectTimer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      connect(),
-      new Promise<never>((_, reject) => {
-        connectTimer = setTimeout(() => {
-          disconnect(); // kill the background reconnect loop
-          reject(new Error('L1 connect timeout'));
-        }, L1_CONNECT_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    clearTimeout(connectTimer);
-  }
+  const { connect, getBalance } = await import('../l1/network');
+  await connect();
 
   const foundAddresses: ScannedAddressResult[] = [];
   let totalBalance = 0;

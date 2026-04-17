@@ -561,7 +561,7 @@ describe('SpendPlanner', () => {
       expect(mockQueue.enqueue).not.toHaveBeenCalled();
     });
 
-    it('error message contains available and required amounts', () => {
+    it('error message does not leak exact balance', () => {
       const pool = buildPool(['tok-1', 'UCT', 300_000n]);
 
       try {
@@ -571,8 +571,9 @@ describe('SpendPlanner', () => {
         );
         expect.fail('Should have thrown');
       } catch (err: any) {
-        expect(err.message).toContain('300000');
-        expect(err.message).toContain('500000');
+        expect(err.code).toBe('SEND_INSUFFICIENT_BALANCE');
+        expect(err.message).not.toContain('300000');
+        expect(err.message).not.toContain('500000');
       }
     });
 
@@ -808,6 +809,36 @@ describe('SpendPlanner', () => {
       for (const id of allTokenIds) {
         expect(pool.get(id)!.token.coinId).toBe('UCT');
       }
+    });
+  });
+
+  describe('pendingChangeAmount', () => {
+    it('prevents false SEND_INSUFFICIENT_BALANCE when pending change covers the gap', () => {
+      // Pool has 500k but all reserved; total inventory = 500k.
+      // Request for 800k would normally throw SEND_INSUFFICIENT_BALANCE.
+      // But pendingChangeAmount = 600k makes totalInventory = 1.1M >= 800k.
+      // Should queue (Case B) instead of throwing.
+      const pool = buildPool(['tok-1', 'UCT', 500_000n]);
+      ledger.reserve('res-existing', [{ tokenId: 'tok-1', amount: 500_000n, tokenAmount: 500_000n }], 'UCT');
+
+      const result = planner.planSend(
+        { amount: '800000', coinId: 'UCT' },
+        pool, ledger, mockQueue, 'res-new',
+        600_000n, // pendingChangeAmount
+      );
+
+      expect(result).toBe('queued');
+      expect(mockQueue.enqueue).toHaveBeenCalledTimes(1);
+    });
+
+    it('still throws SEND_INSUFFICIENT_BALANCE when pending change is not enough', () => {
+      const pool = buildPool(['tok-1', 'UCT', 500_000n]);
+
+      expect(() => planner.planSend(
+        { amount: '2000000', coinId: 'UCT' },
+        pool, ledger, mockQueue, 'res-new',
+        100_000n, // totalInventory = 600k < 2M
+      )).toThrow('Insufficient balance');
     });
   });
 });
