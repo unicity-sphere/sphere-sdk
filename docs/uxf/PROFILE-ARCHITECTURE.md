@@ -229,9 +229,9 @@ The existing `TxfStorageData` fields map to UXF Profile as follows:
 | `_meta.formatVersion` | `profile.version` | Unified |
 | `_tombstones[]` | `{addr}.tombstones` | Migrated |
 | `_outbox[]` | `{addr}.outbox` | Migrated |
-| `_sent[]` | `{addr}.transactionHistory` (type=SENT) | Merged into history |
+| `_sent[]` | **DERIVED** — rebuilt from token ownership predicates | Not migrated; history derived from pool |
 | `_invalid[]` | `{addr}.invalidTokens` | Migrated |
-| `_history[]` | `{addr}.transactionHistory` | Migrated |
+| `_history[]` | **DERIVED** — rebuilt from token ownership predicates | Not migrated; history derived from pool |
 | `_mintOutbox[]` | `{addr}.mintOutbox` | Migrated |
 | `_invalidatedNametags[]` | `{addr}.invalidatedNametags` | Migrated |
 | `_<tokenId>` entries | UXF element pool | Replaced by UXF |
@@ -366,7 +366,7 @@ db.put('identity.mnemonic', encryptedBytes)
 db.put('identity.masterKey', encryptedBytes)
 db.put('addresses.tracked', [...])
 db.put('tokens.bundle.bafy...', { cid: 'bafy...', status: 'active', ... })
-db.put('addr1.transactionHistory', [...])
+// transactionHistory: DERIVED from token pool, not stored in OrbitDB
 db.put('addr1.messages', {...})
 ...
 ```
@@ -459,7 +459,7 @@ The existing `STORAGE_KEYS_GLOBAL` and `STORAGE_KEYS_ADDRESS` map directly to Pr
 | `{addr}_outbox` | `{addr}.outbox` |
 | `{addr}_conversations` | `{addr}.conversations` |
 | `{addr}_messages` | `{addr}.messages` |
-| `{addr}_transaction_history` | `{addr}.transactionHistory` |
+| `{addr}_transaction_history` | ~~`{addr}.transactionHistory`~~ **DERIVED** — not migrated to OrbitDB, rebuilt from token pool |
 | `{addr}_pending_v5_tokens` | `{addr}.pendingV5Tokens` |
 | `{addr}_group_chat_*` | `{addr}.groupchat.*` |
 | `{addr}_processed_split_group_ids` | `{addr}.processedSplitGroupIds` |
@@ -581,9 +581,9 @@ The `car-blocks` store can grow large. Eviction policy:
    a. UxfPackage with updated tokens (spent removed, change added)
    b. UxfPackage.toCar() → pin CAR to IPFS → new bundle CID
    c. db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
-   d. db.put('{addr}.transactionHistory', [...history, newEntry])
-   e. ONLY NOW return success to caller
-6. Local cache updated
+   d. ONLY NOW return success to caller
+   (Transaction history NOT written to OrbitDB — derived from token pool on next read)
+6. Local cache updated (incl. derived tx history cache refresh)
 7. OrbitDB replicates to peers in background
 8. Background: if > 3 active bundles, trigger consolidation
 ```
@@ -597,7 +597,7 @@ The `car-blocks` store can grow large. Eviction policy:
 4. CRITICAL WRITE:
    a. UxfPackage.ingest(receivedToken) → toCar() → pin → new CID
    b. db.put('tokens.bundle.' + newCid, { cid: newCid, status: 'active', createdAt: now })
-   c. db.put('{addr}.transactionHistory', [...history, newEntry])
+   (Transaction history derived from token pool, not written to OrbitDB)
 5. Emit 'transfer:incoming' event to app
 6. OrbitDB replicates to peers in background
 ```
@@ -760,14 +760,14 @@ IPFS (public, content-addressed, cross-user dedup):
   ...
 
 OrbitDB (private, per-user, encrypted):
-  tokens.bundle.{CID} — encrypted manifest + metadata (which tokens you own)
-  {addr}.transactionHistory — encrypted (who you transacted with)
+  tokens.bundle.{CID} — encrypted bundle reference (CID, status, device)
+  (transactionHistory is DERIVED from token pool, not stored)
   {addr}.messages — encrypted (DM content)
   identity.mnemonic — password-encrypted (private keys)
   ...
 ```
 
-**What is encrypted (in OrbitDB):** All profile KV values — identity, manifests, history, messages, operational state. These reveal **which** tokens a user owns, **who** they transacted with, and **what** messages they exchanged. Encrypted with `profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)` using AES-256-GCM with random IV.
+**What is encrypted (in OrbitDB):** All profile KV values — identity, bundle references (which CIDs belong to this user), messages, operational state. These reveal **which** bundles a user owns, **who** they transacted with, and **what** messages they exchanged. Note: the bundle manifests inside the CAR files on IPFS are unencrypted (they list tokenId→hash mappings but without user context this reveals nothing about ownership). Encrypted with `profileEncryptionKey = HKDF(masterKey, "uxf-profile-encryption", 32)` using AES-256-GCM with random IV.
 
 **What is NOT encrypted (on IPFS):** Individual UXF element blocks — token genesis data, state transitions, inclusion proofs, unicity certificates, predicates, authenticators, SMT paths. These are **cryptographic proof materials**, not secrets.
 
@@ -874,29 +874,52 @@ tokenId: aaa111...
 
 All three DAGs share most elements (genesis, first proof, certificate) — only the new transaction elements and the updated TokenRoot differ. The element pool deduplicates the shared parts.
 
-### 10.2 Manifest Is Derived (Not Stored)
+### 10.2 Two Kinds of Manifest
 
-The manifest (tokenId → rootHash mapping) is **not stored** in the UXF bundle. It is **computed** by scanning the element pool for `TokenRoot` elements and extracting their `tokenId` fields. This follows the UXF minimalism principle — the bundle is literally just the element pool (a bag of content-addressed DAG nodes).
+The term "manifest" is used in two distinct contexts that must not be confused:
 
-**Manifest reconstruction algorithm:**
+#### 10.2.1 Bundle Manifest (package-level, STORED)
+
+The **bundle manifest** is a structural artifact of the UXF/CAR package format. It lists the DAG nodes contained in a specific bundle and how they link together. This is defined in SPECIFICATION.md Section 5.4 and is ALWAYS stored inside the CAR file as part of the package envelope.
+
 ```
-For each element in pool where type === 'token-root':
-  tokenId = element.content.tokenId
-  rootHash = computeElementHash(element)
-  If tokenId already in manifest:
-    Compare transaction counts (root.children.transactions.length)
-    Keep the version with MORE transactions (longest VALID chain)
-  Else:
-    Add to manifest: tokenId → rootHash
+Bundle Manifest (inside CAR file):
+  Envelope → manifest block → { tokenId_aaa: hash_R3, tokenId_bbb: hash_R1 }
 ```
 
-The manifest is reconstructed:
-- On load from IPFS/OrbitDB
-- After JOIN of multiple bundles
-- After receiving a token transfer
-- Cached in local storage for fast subsequent reads
+Every standalone UXF bundle carries its bundle manifest. This makes the package **self-describing** — you can inspect a CAR file and know which tokens it contains without scanning every block. This is the SPECIFICATION's manifest, and the ARCHITECTURE's `UxfManifest` type (`Map<string, ContentHash>`).
 
-**Key distinction:** "latest known" is NOT necessarily "latest globally." Once a token has been transferred to another user, the original holder stops receiving updates. The token may have been transferred further N times by the new owner — the original holder's UXF pool still has the version from when they last held it.
+#### 10.2.2 Token Manifest (wallet-level, DERIVED)
+
+The **token manifest** is a Unicity-level artifact that maps tokens to their latest valid DAG versions WITH status information. It is **never stored** — it is computed client-side after loading and joining one or more bundles. It incorporates oracle validation results, chain integrity checks, conflict detection, and ownership predicates.
+
+```typescript
+interface TokenManifestEntry {
+  rootHash: ContentHash;           // root of the primary (valid) DAG
+  status: 'valid' | 'invalid' | 'conflicting' | 'pending';
+  conflictingRoots?: ContentHash[];  // alternative DAGs for investigation
+  invalidReason?: string;
+}
+
+// Token manifest: derived, never stored
+Map<tokenId, TokenManifestEntry>
+```
+
+The token manifest is **derived** by:
+1. Reading bundle manifests from all active UXF bundles
+2. JOINing them (union, longest valid chain per tokenId, proof enrichment)
+3. Running the status derivation algorithm (Section 10.6) with oracle checks
+4. Cached in local storage for fast reads, rebuilt on demand
+
+| | Bundle Manifest | Token Manifest |
+|---|---|---|
+| **Level** | Package/CAR structure | Wallet/Unicity semantics |
+| **Stored?** | Yes (in CAR envelope) | No (derived client-side) |
+| **Contents** | tokenId → rootHash (simple) | tokenId → { rootHash, status, conflicts } |
+| **When created** | On `toCar()` serialization | On load/JOIN, after oracle validation |
+| **Defined in** | SPECIFICATION.md Section 5.4 | PROFILE-ARCHITECTURE.md Section 10.11 |
+
+**Key distinction:** "latest known" in a bundle manifest is NOT necessarily "latest globally." Once a token has been transferred to another user, the original holder stops receiving updates. The token manifest's `status` field (via oracle checks) reveals whether the bundle manifest's version is still current or stale.
 
 ### 10.3 UXF Minimalism Principle
 
@@ -1296,14 +1319,14 @@ Import from archive:
 
 #### 10.10.4 UXF Bundle Content Summary
 
-| Use Case | Element Pool | Manifest | Encrypted? | OrbitDB? |
-|---|---|---|---|---|
-| **Profile storage** | All user's tokens | Derived (not stored) | Elements: no. Bundle ref in OrbitDB: yes. | CID stored in OrbitDB |
-| **Token send** | Only tokens being sent + deps | Derived | No (public transfer data) | No (sent via Nostr) |
-| **Token receive** | Received tokens | Derived | No | Merged into profile bundle |
-| **Archive/export** | Selected or all tokens | Derived | Optional (user choice) | No (offline file) |
+| Use Case | Element Pool | Bundle Manifest | Token Manifest | Encrypted? | OrbitDB? |
+|---|---|---|---|---|---|
+| **Profile storage** | All user's tokens | Stored in CAR | Derived on load | Elements: no. Bundle ref: yes. | CID in OrbitDB |
+| **Token send** | Only selected + deps | Stored in CAR | N/A (recipient derives) | No | No (via Nostr) |
+| **Token receive** | Received tokens | Stored in CAR | Derived after merge | No | Merged into profile |
+| **Archive/export** | Selected or all | Stored in CAR | Derived on import | Optional | No (offline file) |
 
-In ALL cases, the UXF bundle is just the element pool. The manifest is always derived by scanning for TokenRoot elements. No metadata, no history, no caches — pure cryptographic proof materials.
+In ALL cases, the UXF bundle contains the element pool plus a **bundle manifest** (the structural DAG index, per SPECIFICATION.md Section 5). The **token manifest** (wallet-level with status, conflicts, oracle validation) is always derived client-side — never stored in the bundle. No history, no caches in the bundle — proof materials plus structural index only.
 
 #### 10.10.5 CAR Batch Transfer
 
@@ -1365,9 +1388,9 @@ The IPFS Kubo node can be extended with a **Unicity token semantic plugin** that
 
 **Kubo remains trustless.** The semantic plugin improves storage hygiene by filtering out garbage, but does not change the trust model. All data stored by Kubo is self-authenticated via content hashing — clients always verify independently. The plugin is a quality filter, not a trust authority.
 
-### 10.11 Manifest Status and Invalid Tokens
+### 10.11 Token Manifest: Status and Invalid Tokens
 
-The derived manifest is NOT a simple `tokenId → rootHash` map. It includes token validity status:
+The **token manifest** (derived, wallet-level — see Section 10.2.2) is NOT a simple `tokenId → rootHash` map. It includes token validity status derived from oracle checks and chain validation:
 
 ```typescript
 interface ManifestEntry {
