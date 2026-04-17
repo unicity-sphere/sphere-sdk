@@ -859,7 +859,141 @@ DM message content is encrypted with `profileEncryptionKey` before storing in Or
 
 ---
 
-## 10. Decided Questions
+## 10. Token Versioning, Manifest Consolidation, and Oracle Validation
+
+### 10.1 Token DAG Versioning
+
+A token's DAG changes with every state transition. When a new transaction is appended, the TokenRoot element gets new children (the new transaction) and therefore a new content hash. The same `tokenId` can reference **multiple DAGs** representing the token at different points in its history:
+
+```
+tokenId: aaa111...
+  ├── DAG v1 (hash_R1): genesis only           ← initial mint
+  ├── DAG v2 (hash_R2): genesis + 1 transfer   ← after first transfer
+  └── DAG v3 (hash_R3): genesis + 2 transfers  ← after second transfer
+```
+
+All three DAGs share most elements (genesis, first proof, certificate) — only the new transaction elements and the updated TokenRoot differ. The element pool deduplicates the shared parts.
+
+### 10.2 Manifest: Latest Known Version
+
+The manifest maps each `tokenId` to the **latest version known to this user**:
+
+```
+manifest:
+  aaa111... → hash_R3  (latest known: 2 transfers)
+  bbb222... → hash_R1  (latest known: just minted)
+```
+
+**Key distinction:** "latest known" is NOT necessarily "latest globally." Once a token has been transferred to another user, the original holder stops receiving updates. The token may have been transferred further N times by the new owner — the original holder's UXF pool still has the version from when they last held it.
+
+### 10.3 Multi-Bundle Manifest Consolidation
+
+When merging multiple bundles, the same `tokenId` may appear in two bundles with different DAG versions (e.g., Device A has version with 2 transactions, Device B has version with 3 transactions after receiving an update via Nostr).
+
+**Consolidation rule:** For the same `tokenId`, keep the DAG with **the most transactions** (longest history = most recent version). This is safe because:
+- Transactions are append-only — a longer chain is strictly a superset of a shorter one
+- The newer version's elements include all elements from the older version (shared via content hash)
+- The older version's unique elements (its TokenRoot with fewer children) become orphans and get GC'd
+
+```
+Bundle A manifest: tokenId_x → hash_R2 (2 transactions)
+Bundle B manifest: tokenId_x → hash_R3 (3 transactions)
+Merged manifest:   tokenId_x → hash_R3 (kept the longer chain)
+```
+
+### 10.4 Oracle Validation: Non-Spend Proof
+
+**UXF stores the latest version known to the user, but this may be stale.** The only authoritative way to confirm a token is genuinely in its latest state (unspent) is to query the **Unicity oracle** (aggregator) for a non-inclusion proof.
+
+The oracle returns one of two responses for a given token state:
+
+| Oracle Response | Meaning | Token Status |
+|---|---|---|
+| **Non-inclusion proof** (state NOT in SMT) | This state has not been spent | **UNSPENT** — token is genuinely current |
+| **Inclusion proof** (state IS in SMT) | This state was committed (spent) | **SPENT** — someone transitioned the token further, but we don't have the new state |
+
+**When to query the oracle:**
+
+1. **On token load from UXF** — after reassembling a token from the element pool, query the oracle for the current state's spend status. This validates that the UXF data is current.
+
+2. **Before spending** — the PaymentsModule already does this as part of the transfer flow. If the oracle says the state was spent, the transfer fails and the token is marked as spent-to-unknown.
+
+3. **Periodic background validation** — the existing `payments.validate()` method checks all tokens against the oracle. This can run on a timer or on user request.
+
+**Spent-to-unknown scenario:**
+
+```
+User A has token T in UXF (state S3, after 3 transfers)
+Meanwhile, User A's OTHER device (or another app) spent T → state S4
+User A's UXF still shows T at state S3
+
+On load from UXF:
+  1. Reassemble token T from pool → ITokenJson with state S3
+  2. Query oracle: is S3 spent?
+  3. Oracle returns: inclusion proof for S3 → YES, S3 was spent
+  4. Token T is marked as SPENT (destination unknown)
+  5. The token moves to archived status in the TXF structures
+  6. If the new state S4 is later received (via Nostr sync from other device),
+     the UXF pool is updated with the newer DAG
+```
+
+### 10.5 Token Status Derivation (Complete Algorithm)
+
+Given the user's `pubkey` and a reassembled `ITokenJson` from UXF:
+
+```
+Step 1: PREDICATE CHECK (local, instant)
+  • Decode current state predicate → extract owner pubkey
+  • If owner === userPubkey → potentially OWNED (proceed to Step 2)
+  • If owner !== userPubkey → NOT CURRENT OWNER
+    - Check transaction history predicates for userPubkey
+    - If found → PREVIOUSLY OWNED (sent away, kept for history)
+    - If not found → REFERENCE token (nametag for PROXY resolution)
+
+Step 2: ORACLE CHECK (network, async — only for tokens with owner === userPubkey)
+  • Compute RequestId from (pubkey, stateHash) for the current state
+  • Query Unicity oracle for non-inclusion proof
+  • If non-inclusion proof → CONFIRMED UNSPENT, SPENDABLE
+  • If inclusion proof → SPENT TO UNKNOWN DESTINATION
+    - Mark as spent, archive, add tombstone
+    - Log warning: "Token spent by another device/app without sync"
+
+Step 3: FINALIZATION CHECK (local, instant)
+  • If last transaction has inclusionProof !== null → FINALIZED
+  • If last transaction has inclusionProof === null → PENDING
+    - Pending tokens are NOT queryable against the oracle
+    - They must be finalized first (proof collected from aggregator)
+
+Step 4: TOKEN TYPE CLASSIFICATION (local, instant)
+  • tokenType === f8aa1383...7509 → NAMETAG
+  • tokenType matches invoice pattern → INVOICE
+  • Otherwise → FUNGIBLE
+```
+
+### 10.6 Load Pipeline from UXF to TXF
+
+```
+UxfPackage.assembleAll() → Map<tokenId, ITokenJson>
+    │
+    ▼
+For each token: derive status (Steps 1-4 above)
+    │
+    ├── OWNED + UNSPENT + CONFIRMED  → TXF: _<tokenId> (active, spendable)
+    ├── OWNED + UNSPENT + PENDING    → TXF: _<tokenId> (status=submitted)
+    ├── OWNED + SPENT TO UNKNOWN     → TXF: archived-<tokenId> + tombstone
+    ├── PREVIOUSLY OWNED (sent away) → TXF: archived-<tokenId> + tombstone
+    ├── MY NAMETAG                   → TXF: _<tokenId> + _nametags entry
+    ├── MY INVOICE                   → TXF: _<tokenId> (accounting module)
+    ├── REFERENCE (other's nametag)  → keep in memory for PROXY resolution,
+    │                                   NOT in TXF active tokens
+    └── NOT MINE (shouldn't happen)  → log warning, skip
+```
+
+---
+
+## 11. Decided Questions
+
+> Section numbers shifted: previous Section 10 → Section 11, previous Section 11 → Section 12.
 
 | # | Question | Decision |
 |---|----------|----------|
@@ -876,7 +1010,7 @@ DM message content is encrypted with `profileEncryptionKey` before storing in Or
 
 ---
 
-## 11. Required SDK API Additions
+## 12. Required SDK API Additions
 
 The following API gaps must be addressed for proper token-type-based access to the inventory:
 
