@@ -1354,13 +1354,16 @@ The IPFS Kubo node can be extended with a **Unicity token semantic plugin** that
 | **Predicate structure validation** | Predicate CBOR encodes a valid secp256k1 public key | Prevents malformed ownership claims |
 | **Token chain validation** | Transaction chains are append-only, each tx's source state matches previous destination | Prevents fabricated token histories |
 
+**Critical: Quick send mode compatibility.** The validation MUST NOT reject tokens with missing or pending inclusion proofs. Unfinalized transactions are valid submissions — the quick send flow persists tokens to IPFS *before* oracle finalization. The plugin only rejects structurally **broken** data (malformed CBOR, corrupted hashes, fabricated chains with impossible state transitions), not incomplete data (pending proofs, partial histories).
+
 **Implementation approach:** A Kubo plugin (Go) or sidecar service that intercepts `dag/put` requests, decodes the DAG-CBOR blocks, validates UXF structure, and rejects invalid submissions before they are pinned. This is a separate infrastructure component — not part of the sphere-sdk.
 
 **Benefits of server-side validation:**
-- Reduced storage waste (invalid data never pinned)
-- Cross-user data quality (all elements in the pool are validated)
+- Reduced storage waste (trash and corrupted data never pinned)
+- Cross-user data quality (all elements in the pool are structurally valid)
 - Defense against malicious submissions (forged proofs, fake certificates)
-- The Kubo node becomes a **trusted UXF element store**, not just a dumb blob store
+
+**Kubo remains trustless.** The semantic plugin improves storage hygiene by filtering out garbage, but does not change the trust model. All data stored by Kubo is self-authenticated via content hashing — clients always verify independently. The plugin is a quality filter, not a trust authority.
 
 ### 10.11 Manifest Status and Invalid Tokens
 
