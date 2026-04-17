@@ -652,3 +652,37 @@ export function getCoinIdBySymbol(symbol: string): string | undefined {
 export function getCoinIdByName(name: string): string | undefined {
   return TokenRegistry.getInstance().getCoinIdByName(name);
 }
+
+/**
+ * Normalize a coin identifier to its canonical hash coinId.
+ *
+ * Accepts both symbolic names ("BTC", "ETH") and hash coinIds (64-char hex).
+ * If the input is a short symbol, resolves it via the TokenRegistry.
+ * Returns the input unchanged if it's already a hash coinId or unknown.
+ *
+ * @param coinId - A symbolic name or hash coinId.
+ * @returns The canonical hash coinId, or the original string if not resolvable.
+ */
+export function normalizeCoinId(coinId: string): string {
+  // Short alphanumeric strings are likely symbolic names (BTC, ETH, USDU, etc.)
+  if (coinId.length <= 20 && /^[A-Za-z0-9]+$/.test(coinId)) {
+    const resolved = getCoinIdBySymbol(coinId);
+    if (resolved) return resolved;
+  }
+  return coinId;
+}
+
+/**
+ * Compare two coin identifiers for equality, normalizing both sides.
+ *
+ * Handles mixed-format comparisons: "BTC" vs hash coinId, or two hash coinIds.
+ * Both values are normalized to hash coinIds via the TokenRegistry before comparison.
+ *
+ * @param a - First coin identifier (symbol or hash coinId).
+ * @param b - Second coin identifier (symbol or hash coinId).
+ * @returns true if both resolve to the same canonical coinId.
+ */
+export function coinIdsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  return normalizeCoinId(a) === normalizeCoinId(b);
+}
