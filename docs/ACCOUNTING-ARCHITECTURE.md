@@ -1,6 +1,6 @@
 # Accounting Module Architecture
 
-> **Status:** Draft specification — no code yet
+> **Status:** Implemented
 > **Module path:** `modules/accounting/AccountingModule.ts`
 > **Barrel:** `modules/accounting/index.ts`
 
@@ -229,8 +229,10 @@ Invoice references are recorded **on-chain** in the `TransferTransactionData.mes
 
 The on-chain `message` carries a structured `TransferMessagePayload`:
 ```
-{ inv: { id: "<64-hex invoiceId>", dir: "F"|"B"|"RC"|"RX", ra?: "<DIRECT://...>", ct?: { a: "<DIRECT://...>", u?: "<URL>" } }, txt?: "..." }
+{ inv: { id: "<64-hex SHA-256(invoiceId)>", dir: "F"|"B"|"RC"|"RX", ra?: "<DIRECT://...>", ct?: { a: "<DIRECT://...>", u?: "<URL>" } }, txt?: "..." }
 ```
+
+**Privacy: hashed invoice IDs.** The `inv.id` field contains `SHA-256(invoiceId)` — NOT the raw invoice ID. This prevents third parties who read the token's on-chain data from correlating it to a specific invoice. The recipient (who knows the invoice ID) verifies the binding by re-hashing. The module maintains an `invoiceIdHashIndex` (Map from hash→ID) built from known invoices, enabling `resolveInvoiceRef()` to resolve both raw IDs (legacy backward compatibility) and hashed IDs. On `importInvoice()`, orphaned ledger entries keyed by hash are migrated to the real ID.
 
 The optional `ra` (refund address) field provides an explicit return destination for the payer. When the sender uses a masked predicate, the sender address becomes unresolvable, making `ra` essential. For unmasked predicates, `ra` overrides the sender address as the return destination and per-sender balance key. It is set by the payer via `payInvoice({ refundAddress })` and is NOT included in the transport memo (privacy: transport memos are human-readable). Auto-return destination priority: `ra` → sender address → fail.
 
