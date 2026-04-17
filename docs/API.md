@@ -20,6 +20,8 @@ const { sphere, created, generatedMnemonic } = await Sphere.init({
   nametag: 'alice',          // Optional: register @alice on create
   l1: { electrumUrl: '...' }, // Optional L1 config (enabled by default)
   price: priceProvider,      // Optional PriceProvider
+  accounting: true,          // Optional: enable invoicing module
+  swap: true,                // Optional: enable swap module (requires accounting)
   derivationPath: "m/44'/0'/0'", // Optional custom path
   dmSince: Math.floor(Date.now() / 1000) - 86400, // Optional: DM history fallback (unix seconds)
 });
@@ -66,6 +68,8 @@ await Sphere.clear(storage);
 | `payments` | `PaymentsModule` | L3 token operations + L1 via `.l1` |
 | `payments.l1` | `L1PaymentsModule` | L1 ALPHA operations |
 | `communications` | `CommunicationsModule` | Messaging operations |
+| `accounting` | `AccountingModule \| null` | Invoice lifecycle and payment attribution |
+| `swap` | `SwapModule \| null` | P2P token swap orchestration |
 
 ### Instance Methods
 
@@ -1856,6 +1860,93 @@ interface AggregatorClient {
 
 ---
 
+## TokenRegistry
+
+Singleton that provides token metadata (symbol, name, decimals, icons, asset kind) by coin ID. Data is fetched from a remote registry URL and cached locally.
+
+### Setup
+
+`TokenRegistry` is configured automatically by `createBrowserProviders()` / `createNodeProviders()` and by `Sphere.init()`. No manual setup is needed for typical usage.
+
+```typescript
+import { TokenRegistry } from '@unicitylabs/sphere-sdk';
+
+const registry = TokenRegistry.getInstance();
+```
+
+### Static Methods
+
+```typescript
+// Get the singleton instance (creates one if needed)
+TokenRegistry.getInstance(): TokenRegistry
+
+// Configure the registry (called automatically by Sphere.init)
+TokenRegistry.configure(options: TokenRegistryConfig): void
+
+// Wait until initial data is loaded (from cache or remote)
+TokenRegistry.waitForReady(timeoutMs?: number): Promise<boolean>
+
+// Stop auto-refresh and reset singleton
+TokenRegistry.destroy(): void
+```
+
+### Instance Methods
+
+```typescript
+// Look up by coin ID (hex string)
+getDefinition(coinId: string): TokenDefinition | undefined
+
+// Look up by symbol (e.g., 'UCT') — case-insensitive
+getDefinitionBySymbol(symbol: string): TokenDefinition | undefined
+
+// Look up by name (e.g., 'bitcoin') — case-insensitive
+getDefinitionByName(name: string): TokenDefinition | undefined
+
+// Shorthand accessors (return fallback values if not found)
+getSymbol(coinId: string): string      // fallback: truncated coinId
+getDecimals(coinId: string): number    // fallback: 0
+
+// List all definitions
+getAllDefinitions(): TokenDefinition[]
+
+// Filtered lists
+getFungibleDefinitions(): TokenDefinition[]
+getNonFungibleDefinitions(): TokenDefinition[]
+
+// Reverse lookups (symbol/name → coinId)
+getCoinIdBySymbol(symbol: string): string | undefined
+getCoinIdByName(name: string): string | undefined
+
+// Force refresh from remote
+refreshFromRemote(): Promise<boolean>
+```
+
+### TokenDefinition
+
+```typescript
+interface TokenDefinition {
+  id: string;               // Hex coin identifier (64 characters)
+  symbol: string;           // Short symbol (e.g., 'UCT')
+  name: string;             // Full name (e.g., 'Unicity Token')
+  decimals: number;         // Decimal places
+  assetKind: 'fungible' | 'non-fungible';
+  iconUrl?: string;         // Icon URL
+  coingeckoId?: string;     // CoinGecko identifier (for price lookups)
+}
+```
+
+### Standalone Helpers
+
+```typescript
+import { getTokenDefinition, getTokenSymbol, getTokenDecimals } from '@unicitylabs/sphere-sdk';
+
+const def = getTokenDefinition(coinId);   // TokenDefinition | undefined
+const sym = getTokenSymbol(coinId);       // string (with fallback)
+const dec = getTokenDecimals(coinId);     // number (with fallback)
+```
+
+---
+
 ## PriceProvider
 
 Optional provider for fetching token market prices. Enables `getBalance()` (total USD value) and price enrichment in `getAssets()`.
@@ -2210,6 +2301,827 @@ Sync Flow:
 ```
 
 See [IPFS Storage Guide](./IPFS-STORAGE.md) for complete documentation.
+
+---
+
+## AccountingModule (Invoicing)
+
+Access via `sphere.accounting` (once registered on the `Sphere` instance).
+
+Manages the full invoice lifecycle: creation, import, payment attribution, status tracking, balance computation, auto-return, and receipt/cancellation-notice delivery. Persists invoice tokens, terminal-state sets, frozen balances, and an incremental invoice-transfer index (§5.4).
+
+### Lifecycle
+
+```typescript
+import { AccountingModule } from '@unicitylabs/sphere-sdk';
+
+// 1. Construct (once, optional config)
+const accounting = new AccountingModule({ debug: false });
+
+// 2. Inject dependencies (must come before load())
+accounting.initialize({
+  payments,        // PaymentsModule
+  tokenStorage,    // TokenStorageProvider
+  oracle,          // OracleProvider
+  trustBase,       // aggregator trust base (from oracle config)
+  identity,        // FullIdentity
+  getActiveAddresses: () => sphere.getActiveAddresses(),
+  emitEvent: (type, data) => sphere.emit(type, data),
+  on: (type, handler) => sphere.on(type, handler),
+  storage,         // StorageProvider
+  communications,  // CommunicationsModule (optional, enables receipt DMs)
+});
+
+// 3. Load persisted state and subscribe to events
+await accounting.load();
+
+// 4. Use public API methods (see below)
+
+// 5. Cleanup on wallet lock / app shutdown
+await accounting.destroy();
+```
+
+### Quick Usage Example
+
+```typescript
+// --- Invoice creator (seller) ---
+
+// Create an invoice requesting 1 000 000 UCT to your DIRECT address
+const { invoiceId, token, terms } = await accounting.createInvoice({
+  targets: [{
+    address: identity.directAddress!,
+    assets: [{ coin: ['UCT', '1000000'] }],
+  }],
+  memo: 'Order #42 — coffee beans',
+  dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000,  // 7 days
+});
+
+// Export the raw TXF token to share with the buyer
+const txfToken = await sphere.payments.getTokens().find(t => t.id === invoiceId);
+
+// --- Payer (buyer) ---
+
+// Import the invoice token received out-of-band
+const terms = await accounting.importInvoice(txfToken);
+
+// Pay the first target's first asset
+const result = await accounting.payInvoice(invoiceId!, {
+  targetIndex: 0,
+  assetIndex: 0,
+  refundAddress: identity.directAddress,  // enables auto-return if invoice is cancelled
+});
+
+// --- Invoice creator (after payment arrives) ---
+
+// Query status
+const status = await accounting.getInvoiceStatus(invoiceId!);
+console.log(status.state);  // 'COVERED' or 'CLOSED'
+
+// Explicitly close the invoice and send receipts to payers
+await accounting.closeInvoice(invoiceId!);
+const receipts = await accounting.sendInvoiceReceipts(invoiceId!, {
+  memo: 'Thank you for your order!',
+});
+console.log(`Sent ${receipts.sent} receipt(s)`);
+```
+
+---
+
+### Lifecycle Methods
+
+#### `initialize(deps: AccountingModuleDependencies): void`
+
+Inject dependencies. Must be called before `load()`. Calling again replaces deps without resetting in-memory state — always follow with `load()`.
+
+#### `load(): Promise<void>`
+
+Load persisted state (invoice tokens, terminal sets, frozen balances, auto-return settings) and subscribe to `PaymentsModule` and `CommunicationsModule` event streams.
+
+Calling `load()` while already loading returns the same promise (re-entry safe). Calling `load()` again after initial load re-runs the full restore sequence.
+
+**Throws:**
+- `NOT_INITIALIZED` — `initialize()` has not been called.
+- `MODULE_DESTROYED` — module has been destroyed.
+
+#### `destroy(): Promise<void>`
+
+Unsubscribe from all events, drain in-flight operations, and mark the module as destroyed. After this call all public API methods throw `MODULE_DESTROYED`. Safe to call multiple times.
+
+---
+
+### Invoice CRUD
+
+#### `createInvoice(request: CreateInvoiceRequest): Promise<CreateInvoiceResult>`
+
+Mint a new invoice token on-chain via the Aggregator. The token IS the invoice: its genesis `tokenData` field contains the serialized `InvoiceTerms`.
+
+```typescript
+interface CreateInvoiceRequest {
+  /** Payment targets — at least one required, at most 100. */
+  readonly targets: InvoiceTarget[];
+  /** Optional due date (ms). Must be in the future if provided. */
+  readonly dueDate?: number;
+  /** Optional free-text memo (max 4096 chars). */
+  readonly memo?: string;
+  /**
+   * Ordered delivery method URLs (placeholder — Nostr delivery only in v1).
+   * Max 10 entries, each https:// or wss://, max 2048 chars.
+   */
+  readonly deliveryMethods?: string[];
+  /**
+   * If false, omit the creator's chain pubkey from InvoiceTerms.
+   * Defaults to true (identified invoice).
+   */
+  readonly anonymous?: boolean;
+}
+
+interface InvoiceTarget {
+  /** Destination DIRECT:// address. */
+  readonly address: string;
+  /** Assets to request at this address. */
+  readonly assets: InvoiceRequestedAsset[];
+}
+
+interface InvoiceRequestedAsset {
+  /** Fungible: [coinId, amount in smallest units]. */
+  readonly coin?: CoinEntry;  // [string, string]
+  /** NFT (placeholder — not implemented in v1). */
+  readonly nft?: NFTEntry;
+}
+
+interface CreateInvoiceResult {
+  readonly success: boolean;
+  readonly invoiceId?: string;     // Invoice token ID (64-char hex)
+  readonly token?: TxfToken;       // Raw TXF token
+  readonly terms?: InvoiceTerms;   // Parsed invoice terms
+  readonly error?: string;
+}
+```
+
+**Throws:**
+- `INVOICE_NO_TARGETS` — targets array is empty.
+- `INVOICE_TOO_MANY_TARGETS` — more than 100 targets.
+- `INVOICE_INVALID_ADDRESS` — a target address is not a valid `DIRECT://` address.
+- `INVOICE_NO_ASSETS` — a target has no assets.
+- `INVOICE_TOO_MANY_ASSETS` — a target has more than 10 assets.
+- `INVOICE_INVALID_ASSET` — an asset has neither `coin` nor `nft`, or has both.
+- `INVOICE_INVALID_AMOUNT` — a coin amount is not a positive integer string.
+- `INVOICE_INVALID_COIN` — a coin ID is empty or not a string.
+- `INVOICE_DUPLICATE_ADDRESS` — duplicate target addresses.
+- `INVOICE_DUPLICATE_COIN` — duplicate coin IDs within a target.
+- `INVOICE_PAST_DUE_DATE` — `dueDate` is not in the future.
+- `INVOICE_MEMO_TOO_LONG` — memo exceeds 4096 characters.
+- `INVOICE_TERMS_TOO_LARGE` — serialized terms exceed storage limit.
+- `INVOICE_INVALID_DELIVERY_METHOD` — delivery method fails scheme/length validation.
+- `INVOICE_MINT_FAILED` — aggregator submission failed after retries.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `importInvoice(token: TxfToken): Promise<InvoiceTerms>`
+
+Import an invoice token received out-of-band (e.g., shared by a creator via IPFS, DM, or QR code). Validates token type and parses `InvoiceTerms`. Persists the token in `TokenStorage` and adds it to the in-memory cache. Idempotent for the same token but fails if already exists with a different state.
+
+**Returns:** Parsed `InvoiceTerms`.
+
+**Throws:**
+- `INVOICE_WRONG_TOKEN_TYPE` — token's `tokenType` is not the invoice type constant.
+- `INVOICE_INVALID_DATA` — `tokenData` field is missing or cannot be parsed as `InvoiceTerms`.
+- `INVOICE_ALREADY_EXISTS` — an invoice with this token ID is already stored locally.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `getInvoice(invoiceId: string): InvoiceRef | null`
+
+Get a lightweight invoice reference by token ID. **Synchronous** — reads from in-memory cache populated during `load()`.
+
+```typescript
+interface InvoiceRef {
+  readonly invoiceId: string;
+  readonly terms: InvoiceTerms;
+  /** True if terms.creator matches the current wallet's chainPubkey. */
+  readonly isCreator: boolean;
+  readonly cancelled: boolean;
+  readonly closed: boolean;
+}
+```
+
+Returns `null` if the invoice is not found locally. Does **not** throw `INVOICE_NOT_FOUND`.
+
+**Throws:**
+- `NOT_INITIALIZED`
+
+#### `getInvoices(options?: GetInvoicesOptions): Promise<InvoiceRef[]>`
+
+List all locally known invoices with optional filtering and sorting. Status (OPEN, PARTIAL, COVERED, etc.) is **not** included in `InvoiceRef` — call `getInvoiceStatus()` per invoice when needed.
+
+```typescript
+interface GetInvoicesOptions {
+  /** Filter by computed state (requires status computation — may be slower). */
+  readonly state?: InvoiceState | InvoiceState[];
+  /** Only invoices created by this wallet. */
+  readonly createdByMe?: boolean;
+  /** Only invoices where this wallet is a target. */
+  readonly targetingMe?: boolean;
+  readonly limit?: number;
+  readonly offset?: number;
+  /** Sort field. Invoices without dueDate sort last when sortBy='dueDate'. */
+  readonly sortBy?: 'createdAt' | 'dueDate';
+  readonly sortOrder?: 'asc' | 'desc';
+}
+```
+
+**Throws:**
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `getInvoiceStatus(invoiceId: string): Promise<InvoiceStatus>`
+
+Compute the current status of an invoice. For non-terminal invoices (OPEN, PARTIAL, COVERED, EXPIRED) the status is derived fresh on every call from the in-memory invoice-transfer index. For terminal invoices (CLOSED, CANCELLED) the persisted frozen balances are returned.
+
+**Side effect:** if the invoice reaches implicit close (state=COVERED and all tokens confirmed), this call acquires the per-invoice gate, freezes balances, persists them, and may trigger surplus auto-return.
+
+```typescript
+type InvoiceState = 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED';
+
+interface InvoiceStatus {
+  readonly invoiceId: string;
+  readonly state: InvoiceState;
+  /** Per-target breakdown. */
+  readonly targets: InvoiceTargetStatus[];
+  /** Transfers referencing this invoice that do not match any target or asset. */
+  readonly irrelevantTransfers: IrrelevantTransfer[];
+  /** Sum of all forward payments per coinId (across all targets). */
+  readonly totalForward: Record<string, string>;
+  /** Sum of all back/return payments per coinId (across all targets). */
+  readonly totalBack: Record<string, string>;
+  /** Whether ALL related tokens are confirmed (always dynamic, never frozen). */
+  readonly allConfirmed: boolean;
+  /** Timestamp of the most recent related transfer. */
+  readonly lastActivityAt: number;
+  /** Whether the invoice was explicitly closed (true) or implicitly (false). Only meaningful when state=CLOSED. */
+  readonly explicitClose?: boolean;
+}
+```
+
+**Throws:**
+- `INVOICE_NOT_FOUND` — invoice not in local cache.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+---
+
+### Invoice Termination
+
+Both methods require the calling wallet to be a **target** of the invoice.
+
+#### `closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>`
+
+Explicitly close an invoice. Freezes current balances, persists the CLOSED state, and fires `invoice:closed` with `{ explicit: true }`. If `options.autoReturn` is `true`, enables auto-return for this invoice and immediately returns any surplus to payers.
+
+**Throws:**
+- `INVOICE_NOT_FOUND` / `INVOICE_NOT_TARGET` / `INVOICE_ALREADY_CLOSED` / `INVOICE_ALREADY_CANCELLED`
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `cancelInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>`
+
+Cancel an invoice. Freezes current balances, persists the CANCELLED state, and fires `invoice:cancelled`. If `options.autoReturn` is `true`, enables auto-return and immediately returns all forwarded payments to payers.
+
+**Throws:**
+- `INVOICE_NOT_FOUND` / `INVOICE_NOT_TARGET` / `INVOICE_ALREADY_CLOSED` / `INVOICE_ALREADY_CANCELLED`
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+---
+
+### Payments
+
+#### `payInvoice(invoiceId: string, params: PayInvoiceParams): Promise<TransferResult>`
+
+Send a payment toward an invoice. Builds the structured memo (`INV:<invoiceId>:F`), optionally embeds a refund address and contact info in the on-chain `TransferMessagePayload`, and delegates to `PaymentsModule.send()`.
+
+```typescript
+interface PayInvoiceParams {
+  /** Index into invoice.terms.targets[]. */
+  readonly targetIndex: number;
+  /** Index into target.assets[]. Defaults to 0. */
+  readonly assetIndex?: number;
+  /**
+   * Amount in smallest units. Defaults to the remaining amount needed to
+   * fully cover the requested asset (i.e., requested − already paid).
+   */
+  readonly amount?: string;
+  /** Optional free text appended after the structured memo prefix. */
+  readonly freeText?: string;
+  /**
+   * Explicit refund address (DIRECT:// format). Embedded on-chain in the
+   * TransferMessagePayload inv.ra field — not in the transport memo.
+   * Required for masked-predicate wallets that cannot be resolved for return.
+   * Auto-populated from identity.directAddress when omitted.
+   */
+  readonly refundAddress?: string;
+  /**
+   * Contact info for the target to reach the payer (receipts, notices).
+   * Embedded on-chain in inv.ct. Not in transport memo.
+   * Auto-populated from identity.directAddress when omitted.
+   */
+  readonly contact?: { address: string; url?: string };
+}
+```
+
+Returns the `TransferResult` from `PaymentsModule.send()`.
+
+**Throws:**
+- `INVOICE_NOT_FOUND` — invoice not found locally.
+- `INVOICE_TERMINATED` — invoice is already closed or cancelled.
+- `INVOICE_INVALID_TARGET` — targetIndex out of range.
+- `INVOICE_INVALID_ASSET_INDEX` — assetIndex out of range.
+- `INVOICE_INVALID_REFUND_ADDRESS` — not a valid `DIRECT://` address.
+- `INVOICE_INVALID_CONTACT` — contact.address or contact.url fails validation.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `returnInvoicePayment(invoiceId: string, params: ReturnPaymentParams): Promise<TransferResult>`
+
+Manually return a payment to a payer. Requires the calling wallet to be a target. Validates that the return amount does not exceed the payer's net balance for the given coin. Serialized inside the per-invoice gate to prevent concurrent over-refunds.
+
+```typescript
+interface ReturnPaymentParams {
+  /** The payer's effective address (DIRECT:// format) to return funds to. */
+  readonly recipient: string;
+  /** Amount in smallest units. */
+  readonly amount: string;
+  readonly coinId: string;
+  /** Optional free text appended to the return memo. */
+  readonly freeText?: string;
+}
+```
+
+**Throws:**
+- `INVOICE_NOT_FOUND` / `INVOICE_NOT_TARGET`
+- `INVOICE_RETURN_EXCEEDS_BALANCE` — amount exceeds the payer's net balance.
+- `INVOICE_INVALID_AMOUNT` — amount is not a positive integer string.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+---
+
+### Auto-Return
+
+Auto-return automatically sends back surplus or full payments to payers when an invoice is terminated (closed or cancelled). It operates on frozen per-sender balances.
+
+#### `setAutoReturn(invoiceId: string | '*', enabled: boolean): Promise<void>`
+
+Enable or disable auto-return.
+
+- **`invoiceId`**: Enable/disable auto-return for a specific invoice. If enabling on a terminated invoice, surplus return is triggered immediately.
+- **`'*'`**: Enable/disable globally for all terminated invoices. Enabling `'*'` immediately triggers return on all currently terminated invoices (up to 100). Rate-limited to one call per 5 seconds.
+
+**Throws:**
+- `INVOICE_NOT_FOUND` — `invoiceId` is not `'*'` and the invoice does not exist.
+- `RATE_LIMITED` — `'*'` was called within the 5-second cooldown.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `getAutoReturnSettings(): AutoReturnSettings`
+
+Get current auto-return settings. **Synchronous**.
+
+```typescript
+interface AutoReturnSettings {
+  /** Global flag — applies to all terminated invoices unless overridden. */
+  readonly global: boolean;
+  /** Per-invoice overrides: invoiceId → enabled. */
+  readonly perInvoice: Record<string, boolean>;
+}
+```
+
+**Throws:**
+- `NOT_INITIALIZED`
+
+---
+
+### Receipts and Cancellation Notices
+
+Both methods require `CommunicationsModule` to be provided in `AccountingModuleDependencies`. They send structured DMs to each payer who contributed to the invoice.
+
+#### `sendInvoiceReceipts(invoiceId: string, options?: SendInvoiceReceiptsOptions): Promise<SendReceiptsResult>`
+
+Send receipt DMs to payers of a terminated invoice (CLOSED or CANCELLED). One DM per unique effective sender address per target. Requires `CommunicationsModule`.
+
+```typescript
+interface SendInvoiceReceiptsOptions {
+  /** Optional memo / deal description included in each receipt. Max 4096 chars. */
+  readonly memo?: string;
+  /** Send receipts to senders with net balance of 0 (default: false). */
+  readonly includeZeroBalance?: boolean;
+}
+
+interface SendReceiptsResult {
+  readonly sent: number;
+  readonly failed: number;
+  readonly sentReceipts: SentReceiptInfo[];
+  readonly failedReceipts: FailedReceiptInfo[];
+}
+```
+
+**Throws:**
+- `INVOICE_NOT_FOUND` / `INVOICE_NOT_TARGET`
+- `INVOICE_NOT_TERMINATED` — invoice is not in CLOSED or CANCELLED state.
+- `COMMUNICATIONS_UNAVAILABLE` — `CommunicationsModule` not provided.
+- `INVOICE_MEMO_TOO_LONG` — memo exceeds 4096 characters.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `sendCancellationNotices(invoiceId: string, options?: SendCancellationNoticesOptions): Promise<SendNoticesResult>`
+
+Send cancellation notice DMs to payers of a CANCELLED invoice. Unlike receipts (which apply to both terminal states), cancellation notices carry cancellation-specific context.
+
+```typescript
+interface SendCancellationNoticesOptions {
+  /** Free-text cancellation reason. Max 4096 chars. */
+  readonly reason?: string;
+  /** Context about the deal/service being cancelled. Max 4096 chars. */
+  readonly dealDescription?: string;
+  /** Send notices to senders with net balance of 0 (default: false). */
+  readonly includeZeroBalance?: boolean;
+}
+
+interface SendNoticesResult {
+  readonly sent: number;
+  readonly failed: number;
+  readonly sentNotices: SentNoticeInfo[];
+  readonly failedNotices: FailedNoticeInfo[];
+}
+```
+
+**Throws:**
+- `INVOICE_NOT_FOUND` / `INVOICE_NOT_TARGET`
+- `INVOICE_NOT_CANCELLED` — invoice is not in CANCELLED state (use `sendInvoiceReceipts()` for CLOSED).
+- `COMMUNICATIONS_UNAVAILABLE` — `CommunicationsModule` not provided.
+- `INVOICE_MEMO_TOO_LONG` — reason or dealDescription exceeds 4096 characters.
+- `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+---
+
+### Utilities
+
+#### `getRelatedTransfers(invoiceId: string): (InvoiceTransferRef | IrrelevantTransfer)[]`
+
+Get all transfers indexed for an invoice, sorted by timestamp ascending. Includes both relevant (forward/back/return) and irrelevant transfers. **Synchronous**.
+
+```typescript
+interface InvoiceTransferRef {
+  readonly transferId: string;
+  readonly direction: 'inbound' | 'outbound';
+  readonly paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
+  readonly coinId: string;
+  readonly amount: string;
+  readonly destinationAddress: string;
+  readonly timestamp: number;
+  readonly confirmed: boolean;
+  readonly senderAddress: string | null;  // null if sender predicate is masked
+  readonly refundAddress?: string;
+  readonly contact?: { address: string; url?: string };
+  readonly senderPubkey?: string;
+  readonly senderNametag?: string;
+  readonly recipientPubkey?: string;
+  readonly recipientNametag?: string;
+}
+
+interface IrrelevantTransfer extends InvoiceTransferRef {
+  readonly reason:
+    | 'unknown_address'
+    | 'unknown_asset'
+    | 'unknown_address_and_asset'
+    | 'self_payment'
+    | 'no_coin_data'
+    | 'unauthorized_return';
+}
+```
+
+**Throws:**
+- `INVOICE_NOT_FOUND` / `NOT_INITIALIZED` / `MODULE_DESTROYED`
+
+#### `parseInvoiceMemo(memo: string): InvoiceMemoRef | null`
+
+Parse a transfer memo string and extract invoice reference information. Pure function — no side effects, no state requirements.
+
+```typescript
+interface InvoiceMemoRef {
+  readonly invoiceId: string;  // 64-char hex token ID
+  readonly paymentDirection: 'forward' | 'back' | 'return_closed' | 'return_cancelled';
+  readonly freeText?: string;  // Optional text after the structured prefix
+}
+
+// Memo format: 'INV:<invoiceId>:<direction>[:<freeText>]'
+// Direction codes: F=forward, B=back, RC=return-closed, RX=return-cancelled
+```
+
+Returns `null` if the memo does not match the `INV:` format.
+
+---
+
+### Invoice Events
+
+All invoice events are emitted via `sphere.on(eventType, handler)`.
+
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `invoice:created` | `{ invoiceId, confirmed }` | Invoice token minted and saved |
+| `invoice:payment` | `{ invoiceId, transfer, paymentDirection, confirmed }` | New payment transfer indexed |
+| `invoice:asset_covered` | `{ invoiceId, address, coinId, confirmed }` | A single coin asset fully covered |
+| `invoice:target_covered` | `{ invoiceId, address, confirmed }` | All assets for a target covered |
+| `invoice:covered` | `{ invoiceId, confirmed }` | All targets covered (full invoice) |
+| `invoice:closed` | `{ invoiceId, explicit }` | Invoice closed (explicit=false if auto-closed on COVERED+confirmed) |
+| `invoice:cancelled` | `{ invoiceId }` | Invoice cancelled |
+| `invoice:expired` | `{ invoiceId }` | Invoice passed its dueDate while OPEN or PARTIAL |
+| `invoice:unknown_reference` | `{ invoiceId, transfer }` | Transfer references an unknown invoice (not in local cache) |
+| `invoice:overpayment` | `{ invoiceId, address, coinId, surplus, confirmed }` | Payment exceeds requested amount |
+| `invoice:irrelevant` | `{ invoiceId, transfer, reason, confirmed }` | Transfer references invoice but matches no target/asset |
+| `invoice:auto_returned` | `{ invoiceId, originalTransfer, returnTransfer }` | Auto-return sent successfully |
+| `invoice:auto_return_failed` | `{ invoiceId, transferId, reason, refundAddress?, contactAddresses? }` | Auto-return failed |
+| `invoice:return_received` | `{ invoiceId, transfer, returnReason }` | Payer received a return transfer |
+| `invoice:over_refund_warning` | `{ invoiceId, senderAddress, coinId, forwardedAmount, returnedAmount }` | Returned amount would exceed forwarded (defense event) |
+| `invoice:receipt_sent` | `{ invoiceId, sent, failed }` | Receipt DMs sent |
+| `invoice:receipt_received` | `{ invoiceId, receipt }` | Payer received a receipt DM |
+| `invoice:cancellation_sent` | `{ invoiceId, sent, failed }` | Cancellation notice DMs sent |
+| `invoice:cancellation_received` | `{ invoiceId, notice }` | Payer received a cancellation notice DM |
+
+---
+
+### Invoice Error Codes
+
+| Code | Description |
+|------|-------------|
+| `INVOICE_NO_TARGETS` | `CreateInvoiceRequest.targets` is empty |
+| `INVOICE_TOO_MANY_TARGETS` | More than 100 targets |
+| `INVOICE_INVALID_ADDRESS` | Target address is not a valid `DIRECT://` address |
+| `INVOICE_NO_ASSETS` | A target has no assets |
+| `INVOICE_TOO_MANY_ASSETS` | A target has more than 10 assets |
+| `INVOICE_INVALID_ASSET` | Asset has neither `coin` nor `nft`, or has both |
+| `INVOICE_INVALID_AMOUNT` | Amount is not a positive integer string (max 78 digits) |
+| `INVOICE_INVALID_COIN` | Coin ID is empty or not a string |
+| `INVOICE_INVALID_NFT` | NFT entry is malformed |
+| `INVOICE_PAST_DUE_DATE` | `dueDate` is not in the future |
+| `INVOICE_DUPLICATE_ADDRESS` | Duplicate target addresses in one invoice |
+| `INVOICE_DUPLICATE_COIN` | Duplicate coin IDs within a single target |
+| `INVOICE_DUPLICATE_NFT` | Duplicate NFT IDs within a single target |
+| `INVOICE_MEMO_TOO_LONG` | Memo, reason, or dealDescription exceeds 4096 characters |
+| `INVOICE_TERMS_TOO_LARGE` | Serialized `InvoiceTerms` exceeds the storage size limit |
+| `INVOICE_INVALID_DELIVERY_METHOD` | Delivery method fails scheme (`https://`/`wss://`) or length validation |
+| `INVOICE_INVALID_REFUND_ADDRESS` | refundAddress is not a valid `DIRECT://` address |
+| `INVOICE_INVALID_CONTACT` | contact.address or contact.url is malformed |
+| `INVOICE_MINT_FAILED` | Aggregator token mint failed after retries |
+| `INVOICE_INVALID_PROOF` | Aggregator inclusion proof is invalid |
+| `INVOICE_WRONG_TOKEN_TYPE` | Token type does not match the invoice type constant |
+| `INVOICE_INVALID_DATA` | `tokenData` is missing, not JSON, or not a valid `InvoiceTerms` object |
+| `INVOICE_ALREADY_EXISTS` | Invoice with this token ID already exists locally |
+| `INVOICE_NOT_FOUND` | Invoice token not found in local cache |
+| `INVOICE_NOT_TARGET` | Calling wallet is not a target of this invoice |
+| `INVOICE_ALREADY_CLOSED` | Invoice is already in CLOSED state |
+| `INVOICE_ALREADY_CANCELLED` | Invoice is already in CANCELLED state |
+| `INVOICE_TERMINATED` | Invoice is in a terminal state (CLOSED or CANCELLED) |
+| `INVOICE_NOT_TERMINATED` | Invoice is not yet in a terminal state |
+| `INVOICE_NOT_CANCELLED` | Invoice is not in CANCELLED state (sendCancellationNotices only) |
+| `INVOICE_ORACLE_REQUIRED` | Oracle provider is required but not configured |
+| `INVOICE_INVALID_TARGET` | `targetIndex` is out of range |
+| `INVOICE_INVALID_ASSET_INDEX` | `assetIndex` is out of range |
+| `INVOICE_RETURN_EXCEEDS_BALANCE` | Return amount exceeds the payer's net balance |
+| `INVOICE_INVALID_ID` | Invoice ID is not a valid 64-character hex string |
+| `INVOICE_STORAGE_FAILED` | A storage read/write operation failed |
+
+---
+
+## SwapModule (Token Swaps)
+
+Orchestrates two-party atomic token swaps via an escrow service. The module manages the wallet-side state machine, DM-based negotiation with the counterparty, escrow interaction, deposit payment (via AccountingModule invoices), and payout verification.
+
+The module is a **client** of the escrow service -- it does not hold funds or execute payouts. Those responsibilities belong to the escrow.
+
+### Lifecycle
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,   // Required -- swap uses invoices internally
+  swap: true,         // Enable with defaults
+  // swap: { defaultEscrowAddress: '@escrow-testnet', proposalTimeoutMs: 300000 },
+});
+
+const swap = sphere.swap!;
+```
+
+### Configuration
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `defaultEscrowAddress` | `string` | `undefined` | Default escrow `@nametag` or `DIRECT://` address |
+| `proposalTimeoutMs` | `number` | `300000` (5 min) | Client-side timeout for proposal acceptance |
+| `maxPendingSwaps` | `number` | `100` | Max non-terminal swaps tracked simultaneously |
+| `announceTimeoutMs` | `number` | `30000` (30 sec) | Timeout for escrow announce response |
+| `terminalPurgeTtlMs` | `number` | `604800000` (7 days) | TTL before completed/cancelled swaps are purged from storage |
+
+### Core Types
+
+#### `SwapDeal`
+
+User-facing description of what is being exchanged. Passed to `proposeSwap()`.
+
+```typescript
+interface SwapDeal {
+  readonly partyA: string;          // Proposer address: @nametag, DIRECT://, or chain pubkey
+  readonly partyB: string;          // Counterparty address
+  readonly partyACurrency: string;  // Coin ID party A deposits (e.g., 'UCT')
+  readonly partyAAmount: string;    // Amount in smallest units (positive integer string)
+  readonly partyBCurrency: string;  // Coin ID party B deposits
+  readonly partyBAmount: string;    // Amount in smallest units
+  readonly timeout: number;         // Swap timeout in seconds [60, 86400]
+  readonly escrowAddress?: string;  // Escrow service address (falls back to config default)
+}
+```
+
+#### `SwapRef`
+
+The persistent swap record stored locally. Contains all state needed to resume across restarts.
+
+```typescript
+interface SwapRef {
+  readonly swapId: string;           // 64 hex chars, content-addressed from manifest
+  readonly deal: SwapDeal;
+  readonly manifest: SwapManifest;   // Wire-format manifest (DIRECT:// addresses)
+  readonly role: SwapRole;           // 'proposer' | 'acceptor'
+  progress: SwapProgress;            // Current state in the client-side state machine
+  depositInvoiceId?: string;         // Set after escrow announcement
+  payoutInvoiceId?: string;          // Set after escrow delivers payout
+  escrowState?: string;              // Last known escrow state (informational)
+  counterpartyPubkey?: string;       // Resolved counterparty chain pubkey
+  localDepositTransferId?: string;   // Transfer ID of local deposit
+  escrowPubkey?: string;             // Resolved escrow chain pubkey
+  payoutVerified: boolean;           // Whether payout was verified
+  readonly createdAt: number;        // ms timestamp
+  announcedAt?: number;              // ms timestamp when escrow acknowledged
+  updatedAt: number;                 // ms timestamp of last state change
+  error?: string;                    // Error message if progress is 'failed'
+}
+```
+
+#### `SwapProgress`
+
+Client-side state machine:
+
+```
+proposed -> accepted -> announced -> depositing -> awaiting_counter
+  -> concluding -> completed
+
+Terminal states: completed, cancelled, failed
+```
+
+| State | Description |
+|-------|-------------|
+| `proposed` | Proposal sent (proposer) or received (acceptor) |
+| `accepted` | Counterparty accepted, announcing to escrow |
+| `announced` | Escrow acknowledged, deposit invoice available |
+| `depositing` | Local deposit sent, awaiting confirmation |
+| `awaiting_counter` | Local deposit confirmed, waiting for counterparty |
+| `concluding` | Both deposited, escrow executing payouts |
+| `completed` | Swap done, tokens exchanged (terminal) |
+| `cancelled` | Swap cancelled (terminal) |
+| `failed` | Unrecoverable error (terminal) |
+
+### Methods
+
+#### `proposeSwap(deal: SwapDeal, options?: ProposeSwapOptions): Promise<SwapProposalResult>`
+
+Propose a swap to a counterparty. Resolves addresses, computes the content-addressed swap ID, sends a proposal DM, and creates a local `SwapRef` with `progress='proposed'`.
+
+```typescript
+const result = await swap.proposeSwap({
+  partyA: sphere.identity!.directAddress!,
+  partyB: '@bob',
+  partyACurrency: 'UCT',
+  partyAAmount: '1000000',
+  partyBCurrency: 'USDU',
+  partyBAmount: '500000',
+  timeout: 3600,
+  escrowAddress: '@escrow-testnet',
+}, { message: 'Trading 1 UCT for 0.5 USDU' });
+
+console.log(result.swapId);     // 64-char hex
+console.log(result.manifest);   // Wire-format manifest
+console.log(result.swap);       // SwapRef
+```
+
+**Throws:** `SWAP_LIMIT_EXCEEDED`, `INVALID_RECIPIENT`, `TRANSPORT_ERROR`
+
+#### `acceptSwap(swapId: string): Promise<void>`
+
+Accept a swap proposal. Sends an acceptance DM to the proposer, announces the manifest to the escrow, and waits for the escrow's `announce_result`. After successful announcement, the swap transitions to `announced` and a deposit invoice is available.
+
+```typescript
+await swap.acceptSwap(swapId);
+// swap.progress is now 'announced'
+```
+
+**Throws:** `SWAP_NOT_FOUND`, `SWAP_INVALID_STATE` (if not in `proposed` state)
+
+#### `rejectSwap(swapId: string, reason?: string): Promise<void>`
+
+Reject a swap proposal. Sends a rejection DM to the proposer. The swap transitions to `cancelled` locally.
+
+```typescript
+await swap.rejectSwap(swapId, 'Price too high');
+```
+
+#### `deposit(swapId: string): Promise<TransferResult>`
+
+Deposit into an announced swap. Pays the escrow's deposit invoice with the correct currency and amount for this party's role.
+
+```typescript
+const result = await swap.deposit(swapId);
+console.log(result.id, result.status);
+```
+
+**Throws:** `SWAP_NOT_FOUND`, `SWAP_INVALID_STATE` (if not `announced` or `awaiting_counter`), `INSUFFICIENT_BALANCE`
+
+#### `getSwapStatus(swapId: string, options?: GetSwapStatusOptions): Promise<SwapRef>`
+
+Get the current swap status. By default, queries the escrow for active swaps (not for terminal swaps).
+
+```typescript
+const ref = await swap.getSwapStatus(swapId, { queryEscrow: true });
+console.log(ref.progress, ref.escrowState);
+```
+
+**Options:**
+- `queryEscrow?: boolean` -- If true, sends a status DM to the escrow and merges the response.
+
+#### `getSwaps(filter?: GetSwapsFilter): SwapRef[]`
+
+List swaps with optional filtering.
+
+```typescript
+// All active swaps
+const active = swap.getSwaps({ excludeTerminal: true });
+
+// Only swaps where I am the proposer
+const proposed = swap.getSwaps({ role: 'proposer' });
+
+// Specific progress state
+const depositing = swap.getSwaps({ progress: 'depositing' });
+
+// Multiple progress states
+const pending = swap.getSwaps({ progress: ['proposed', 'accepted', 'announced'] });
+```
+
+**Filter options:**
+- `progress?: SwapProgress | SwapProgress[]` -- Filter by state(s)
+- `role?: SwapRole` -- Filter by `'proposer'` or `'acceptor'`
+- `excludeTerminal?: boolean` -- Exclude completed/cancelled/failed swaps
+
+#### `verifyPayout(swapId: string): Promise<boolean>`
+
+Verify that the payout invoice has been correctly fulfilled. Checks that the payout invoice terms match the swap manifest and that the invoice is covered. Returns `true` if verification passes, `false` otherwise.
+
+```typescript
+const verified = await swap.verifyPayout(swapId);
+console.log('Payout verified:', verified);
+```
+
+#### `cancelSwap(swapId: string): Promise<void>`
+
+Cancel a swap locally. The swap transitions to `cancelled`. This does NOT communicate with the escrow -- use this for local cleanup of swaps that are stuck in non-terminal states.
+
+```typescript
+await swap.cancelSwap(swapId);
+```
+
+**Throws:** `SWAP_NOT_FOUND`, `SWAP_INVALID_STATE` (if already terminal)
+
+### Swap Events
+
+| Event | Payload | When |
+|-------|---------|------|
+| `swap:proposal_received` | `{ swapId, deal, senderPubkey, senderNametag? }` | Incoming swap proposal DM |
+| `swap:proposed` | `{ swapId, deal, recipientPubkey }` | Outgoing proposal sent |
+| `swap:accepted` | `{ swapId, role }` | Swap accepted (either side) |
+| `swap:rejected` | `{ swapId, reason? }` | Swap rejected (either side) |
+| `swap:announced` | `{ swapId, depositInvoiceId }` | Escrow acknowledged, deposit invoice ready |
+| `swap:deposit_sent` | `{ swapId, transferResult }` | Local deposit payment sent |
+| `swap:deposit_confirmed` | `{ swapId, party, amount, coinId }` | Deposit confirmed by escrow |
+| `swap:deposits_covered` | `{ swapId }` | Both deposits fully covered |
+| `swap:concluding` | `{ swapId }` | Escrow executing payouts |
+| `swap:payout_received` | `{ swapId, payoutInvoiceId }` | Payout invoice token received |
+| `swap:completed` | `{ swapId, payoutVerified }` | Swap completed (terminal) |
+| `swap:cancelled` | `{ swapId, reason, depositsReturned? }` | Swap cancelled (terminal) |
+| `swap:failed` | `{ swapId, error }` | Swap failed (terminal) |
+| `swap:deposit_returned` | `{ swapId, transfer, returnReason }` | Deposit returned after cancellation |
+| `swap:bounce_received` | `{ swapId, reason, returnedAmount, returnedCurrency }` | Wrong-currency deposit bounced back |
+
+### Escrow Communication
+
+The swap module communicates with the escrow service via encrypted DMs (NIP-17). The escrow sends the following message types:
+
+| Type | When | Key Fields |
+|------|------|------------|
+| `announce_result` | After manifest announcement | `swap_id`, `state`, `deposit_invoice_id` |
+| `invoice_delivery` | Deposit or payout invoice token | `swap_id`, `invoice_type`, `invoice_token` |
+| `status_result` | In response to status query | `swap_id`, `state` |
+| `payment_confirmation` | After escrow pays payout invoice | `swap_id`, `party` |
+| `swap_cancelled` | Swap cancelled (timeout/manual) | `swap_id`, `reason`, `deposits_returned?` |
+| `bounce_notification` | Wrong-currency deposit returned | `swap_id`, `reason`, `returned_amount` |
+| `error` | Escrow-side error | `error`, `swap_id?` |
 
 ---
 

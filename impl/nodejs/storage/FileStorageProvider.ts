@@ -58,20 +58,49 @@ export class FileStorageProvider implements StorageProvider {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
 
-    // Load existing data
+    // Load existing data. If the file is corrupt (partial write from a crash),
+    // try the .tmp backup (which is the pre-rename version from the last
+    // successful atomic write).
     if (fs.existsSync(this.filePath)) {
       try {
         const content = fs.readFileSync(this.filePath, 'utf-8').trim();
         if (this.isTxtMode) {
-          // .txt file: entire content is the mnemonic (plaintext or encrypted)
           if (content) {
             this.data = { [STORAGE_KEYS_GLOBAL.MNEMONIC]: content };
           }
         } else {
           this.data = JSON.parse(content);
         }
-      } catch {
-        this.data = {};
+      } catch (mainErr) {
+        // Main file exists but is corrupt. Try .tmp fallback before failing.
+        const tmpPath = this.filePath + '.tmp';
+        if (fs.existsSync(tmpPath)) {
+          try {
+            const tmpContent = fs.readFileSync(tmpPath, 'utf-8').trim();
+            this.data = this.isTxtMode
+              ? (tmpContent ? { [STORAGE_KEYS_GLOBAL.MNEMONIC]: tmpContent } : {})
+              : JSON.parse(tmpContent);
+            // Preserve the corrupt file for forensic inspection
+            const corruptPath = this.filePath + '.corrupt';
+            try { fs.renameSync(this.filePath, corruptPath); } catch { /* best-effort */ }
+            // Restore from .tmp
+            fs.renameSync(tmpPath, this.filePath);
+          } catch {
+            // Both files corrupt — this is a hard failure, NOT a silent reset.
+            // Silently falling back to {} would cause Sphere.exists() to return
+            // false, leading to accidental identity replacement.
+            throw new Error(
+              `Wallet file "${this.filePath}" is corrupt and no valid backup exists. ` +
+              `Manual recovery required. Check "${this.filePath}.corrupt" for the damaged file.`
+            );
+          }
+        } else {
+          // Main file corrupt, no .tmp fallback — hard failure.
+          throw new Error(
+            `Wallet file "${this.filePath}" is corrupt (${mainErr instanceof Error ? mainErr.message : 'parse error'}). ` +
+            `No backup (.tmp) file found. Manual recovery required.`
+          );
+        }
       }
     }
 
@@ -172,13 +201,27 @@ export class FileStorageProvider implements StorageProvider {
     if (!fs.existsSync(this.dataDir)) {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
+
+    let content: string;
     if (this.isTxtMode) {
-      // .txt file: persist only the mnemonic
-      const mnemonic = this.data[STORAGE_KEYS_GLOBAL.MNEMONIC] ?? '';
-      fs.writeFileSync(this.filePath, mnemonic);
+      content = this.data[STORAGE_KEYS_GLOBAL.MNEMONIC] ?? '';
     } else {
-      fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
+      content = JSON.stringify(this.data);
     }
+
+    // Atomic write: write to temp file, fsync, then rename.
+    // This prevents wallet.json corruption on kill/crash — the rename
+    // is atomic on POSIX filesystems, so the file is either fully old
+    // or fully new, never partially written.
+    const tmpPath = this.filePath + '.tmp';
+    const fd = fs.openSync(tmpPath, 'w', 0o600);
+    try {
+      fs.writeSync(fd, content);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, this.filePath);
   }
 }
 

@@ -6,17 +6,17 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 
 - **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
 - **L1 Payments** - ALPHA blockchain transactions via Fulcrum WebSocket
-- **L3 Payments** - Token transfers with state transition proofs
+- **L3 Payments** - Token transfers with state transition proofs, concurrent-send safety (SpendQueue)
+- **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs
+- **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
 - **Group Chat** - NIP-29 relay-based group messaging with moderation
-- **Nostr Transport** - P2P messaging with NIP-04 encryption
+- **Nostr Transport** - Resilient P2P messaging with verified publish, health checks, NIP-17 gift-wrap
 - **IPFS Storage** - Decentralized token backup via HTTP API (browser + Node.js)
-- **Token Splitting** - Partial transfer amount calculations
 - **Multi-Address** - HD address derivation (BIP32/BIP44)
-- **TXF Serialization** - Token eXchange Format for storage and transfer
 - **Token Validation** - Aggregator-based token verification
-- **Core Utilities** - Crypto, currency, bech32, base58 functions
 - **Connect Protocol** - dApp ↔ wallet communication via `ConnectClient` / `ConnectHost` (browser extension + popup)
+- **CLI** - Comprehensive command-line interface with shell auto-completion
 
 ## Installation
 
@@ -68,10 +68,10 @@ npm run cli -- receive
 npm run cli -- receive --finalize
 
 # Send tokens (instant mode, default)
-npm run cli -- send @alice 1 --coin UCT --instant
+npm run cli -- send @alice 1 UCT --instant
 
 # Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 --coin UCT --conservative
+npm run cli -- send @alice 1 UCT --conservative
 
 # Request test tokens from faucet
 npm run cli -- topup
@@ -101,9 +101,9 @@ npm run cli -- verify-balance
 | **Balance** | `balance [--finalize]` | Show L3 token balance (--finalize: fetch pending + resolve) |
 | | `tokens` | List all tokens with details |
 | | `l1-balance` | Show L1 (ALPHA) balance |
-| | `topup [coin] [amount]` | Request test tokens from faucet |
+| | `topup [<amount> <symbol>]` | Request test tokens from faucet |
 | | `verify-balance [--remove] [-v]` | Verify tokens against aggregator |
-| **Transfers** | `send <to> <amount> [--coin SYM] [--instant\|--conservative]` | Send tokens |
+| **Transfers** | `send <to> <amount> <symbol> [--instant\|--conservative]` | Send tokens |
 | | `receive [--finalize]` | Check for incoming transfers |
 | | `history [limit]` | Show transaction history |
 | **Nametags** | `nametag <name>` | Register a nametag |
@@ -115,6 +115,8 @@ npm run cli -- verify-balance
 | | `parse-wallet <file>` | Parse wallet file |
 
 CLI data is stored in `./.sphere-cli/` directory.
+
+> **Shell completion:** Run `npm link && sphere-cli completions bash >> ~/.bashrc` for tab-completion of all commands. See [CLI Quickstart](docs/QUICKSTART-CLI.md) for details.
 
 ## Quick Start
 

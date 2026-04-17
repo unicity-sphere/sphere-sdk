@@ -189,6 +189,8 @@ async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; 
     nametag: options?.nametag,
     market: true,
     groupChat: true,
+    accounting: true,
+    swap: true,
   });
 
   sphereInstance = result.sphere;
@@ -208,19 +210,131 @@ async function closeSphere(): Promise<void> {
   }
 }
 
-async function syncIfEnabled(sphere: Sphere, skip: boolean): Promise<void> {
-  if (skip) return;
+/** Push local state changes to IPFS after write operations. Tolerates failures. */
+async function syncAfterWrite(sphere: Sphere): Promise<void> {
   try {
-    console.log('Syncing with IPFS...');
-    const result = await sphere.payments.sync();
-    if (result.added > 0 || result.removed > 0) {
-      console.log(`  Synced: +${result.added} added, -${result.removed} removed`);
-    } else {
-      console.log('  Up to date.');
-    }
-  } catch (err) {
-    console.warn(`  Sync warning: ${err instanceof Error ? err.message : err}`);
+    await sphere.payments.sync();
+  } catch {
+    // Tolerated — IPFS may be unavailable
   }
+}
+
+/**
+ * Resolve a coin identifier (symbol, name, or hex ID) to its registry definition.
+ * Tries symbol first, then name, then raw hex ID.
+ * Exits with error if not found.
+ */
+function resolveCoin(identifier: string): { coinId: string; symbol: string; decimals: number; name: string } {
+  const registry = TokenRegistry.getInstance();
+  let def = registry.getDefinitionBySymbol(identifier);
+  if (!def) def = registry.getDefinitionByName(identifier);
+  if (!def) def = registry.getDefinition(identifier);
+  if (!def) {
+    console.error(`Unknown asset: "${identifier}"`);
+    console.error('Use "npm run cli -- assets" to list all registered assets.');
+    process.exit(1);
+  }
+  return {
+    coinId: def.id,
+    symbol: def.symbol || identifier,
+    decimals: def.decimals ?? 8,
+    name: def.name || identifier,
+  };
+}
+
+/**
+ * Parse an asset argument in "<amount> <symbol>" format.
+ * Examples: "1000000 UCT", "10.5 BTC", "500000 USDU"
+ */
+/**
+ * Resolve a swap ID prefix to a full 64-char swap ID.
+ * Accepts full IDs or unique prefixes (like invoice commands do).
+ */
+
+function parseAssetArg(value: string): { amount: string; coin: string } {
+  const parts = value.trim().split(/\s+/);
+  if (parts.length !== 2) {
+    console.error(`Invalid asset format: "${value}". Expected "<amount> <symbol>" (e.g., "1000000 UCT")`);
+    process.exit(1);
+  }
+  return { amount: parts[0], coin: parts[1] };
+}
+
+/** Map common symbols to faucet coin names. */
+const FAUCET_COIN_MAP: Record<string, string> = {
+  'UCT': 'unicity', 'BTC': 'bitcoin', 'ETH': 'ethereum',
+  'SOL': 'solana', 'USDT': 'tether', 'USDC': 'usd-coin',
+  'USDU': 'unicity-usd', 'EURU': 'unicity-eur', 'ALPHT': 'alpha-token',
+};
+
+/**
+ * Ensure wallet state is synced before reading:
+ * 1. Wait for Nostr transport to deliver pending wallet events (DMs, transfers)
+ * 2. Process incoming transfers (receive)
+ * 3. Sync with IPFS
+ *
+ * Replaces the old syncIfEnabled(). All CLI commands that read wallet state
+ * should call this before accessing in-memory data.
+ */
+/**
+ * Sync wallet state before executing a command.
+ * All sync steps tolerate failures (Nostr timeout, IPFS unreachable).
+ * Nostr WRITES (sendDM in swap-propose, swap-accept) propagate errors
+ * naturally through the SwapModule — they are NOT part of this sync.
+ *
+ * Two sync modes:
+ *
+ * - **'nostr'**: Fetch pending Nostr events only (DMs: swap proposals,
+ *   invoice receipts, escrow messages, transfer notifications).
+ *   Used by: swap-list, swap-accept, swap-status, receive, dm-inbox, dm-history.
+ *
+ * - **'full'**: Nostr fetch + receive incoming transfers + IPFS sync.
+ *   Gives the most up-to-date token inventory and invoice state.
+ *   Used by: send, balance, tokens, history, verify-balance, sync,
+ *   invoice-pay, invoice-close, invoice-cancel, invoice-transfers, swap-deposit.
+ */
+async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void> {
+  console.log('Syncing...');
+
+  // Step 1: Always fetch pending Nostr events through the multi-address
+  // transport mux. This ensures DMs (swap proposals, invoice receipts,
+  // escrow messages) are delivered to all module handlers.
+  // Tolerates relay being down — continues after timeout.
+  try {
+    await sphere.fetchPendingEvents();
+    // Allow async DM handlers (swap proposal processing, invoice import, etc.)
+    // to complete before reading in-memory state. These fire-and-forget handlers
+    // resolve addresses, validate manifests, and persist state asynchronously.
+    await new Promise(resolve => setTimeout(resolve, 500));
+  } catch {
+    // Tolerated — relay may be unreachable for reads
+  }
+
+  if (mode === 'full') {
+    // Step 2: Process incoming token transfers via Nostr.
+    // Tolerates failures — tokens may arrive later.
+    try {
+      const result = await sphere.payments.receive();
+      if (result.transfers?.length > 0) {
+        console.log(`  Received ${result.transfers.length} transfer(s)`);
+      }
+    } catch {
+      // Tolerated
+    }
+
+    // Step 3: Sync with IPFS remote storage.
+    // Tolerates IPFS being down for both read and write.
+    try {
+      const result = await sphere.payments.sync();
+      if (result.added > 0 || result.removed > 0) {
+        console.log(`  IPFS: +${result.added} added, -${result.removed} removed`);
+      }
+    } catch {
+      // Tolerated — IPFS may be unavailable
+    }
+  }
+
+  console.log('  Ready.');
 }
 
 // =============================================================================
@@ -240,202 +354,1137 @@ function _prompt(question: string): Promise<string> {
   });
 }
 
+// =============================================================================
+// Per-command help definitions
+// =============================================================================
+
+interface CommandHelp {
+  usage: string;
+  description: string;
+  flags?: Array<{ flag: string; description: string; default?: string }>;
+  examples: string[];
+  notes?: string[];
+}
+
+const COMMAND_HELP: Record<string, CommandHelp> = {
+  // --- WALLET ---
+  'init': {
+    usage: 'init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]',
+    description: 'Create a new wallet or import an existing one from a mnemonic phrase. If no mnemonic is provided, a new 24-word mnemonic is generated automatically.',
+    flags: [
+      { flag: '--network <net>', description: 'Network to use (mainnet, testnet, dev)', default: 'testnet' },
+      { flag: '--mnemonic "<words>"', description: 'Import wallet from BIP-39 mnemonic phrase (24 words in quotes)' },
+      { flag: '--nametag <name>', description: 'Register a nametag during initialization (mints on-chain)' },
+      { flag: '--no-nostr', description: 'Disable Nostr transport (use no-op transport)' },
+    ],
+    examples: [
+      'npm run cli -- init --network testnet',
+      'npm run cli -- init --mnemonic "word1 word2 ... word24"',
+      'npm run cli -- init --nametag alice --network mainnet',
+    ],
+    notes: [
+      'If a wallet already exists in the current profile, it will be loaded instead of creating a new one.',
+      'Back up the generated mnemonic immediately -- it cannot be retrieved later.',
+    ],
+  },
+  'status': {
+    usage: 'status',
+    description: 'Show wallet identity information including L1 address, Direct address, chain public key, nametag, and current network/profile.',
+    examples: [
+      'npm run cli -- status',
+    ],
+  },
+  'config': {
+    usage: 'config [set <key> <value>]',
+    description: 'Show current CLI configuration or update a specific setting. Without arguments, displays all config values as JSON.',
+    flags: [
+      { flag: 'set network <value>', description: 'Set network (mainnet, testnet, dev)' },
+      { flag: 'set dataDir <path>', description: 'Set wallet data directory path' },
+      { flag: 'set tokensDir <path>', description: 'Set token storage directory path' },
+    ],
+    examples: [
+      'npm run cli -- config',
+      'npm run cli -- config set network mainnet',
+      'npm run cli -- config set dataDir ./.my-wallet',
+    ],
+  },
+  'clear': {
+    usage: 'clear',
+    description: 'Delete all wallet data including keys, tokens, and storage. This is irreversible -- make sure you have your mnemonic backed up.',
+    examples: [
+      'npm run cli -- clear',
+    ],
+    notes: [
+      'This deletes everything in the current profile data and token directories.',
+    ],
+  },
+  'wallet': {
+    usage: 'wallet <subcommand>',
+    description: 'Manage wallet profiles. Each profile has its own data directory, token storage, and network configuration.',
+    examples: [
+      'npm run cli -- wallet list',
+      'npm run cli -- wallet create myprofile',
+      'npm run cli -- wallet use myprofile',
+      'npm run cli -- wallet current',
+      'npm run cli -- wallet delete myprofile',
+    ],
+    notes: [
+      'Subcommands: list, create, use, current, delete',
+      'Use "help wallet <subcommand>" for detailed help on each.',
+    ],
+  },
+  'wallet list': {
+    usage: 'wallet list',
+    description: 'List all wallet profiles with their network and data directory. The current active profile is marked with an arrow.',
+    examples: [
+      'npm run cli -- wallet list',
+    ],
+  },
+  'wallet create': {
+    usage: 'wallet create <name> [--network <net>]',
+    description: 'Create a new wallet profile and switch to it. The profile stores its data in .sphere-cli-<name>/. After creating, run "init" to initialize the wallet.',
+    flags: [
+      { flag: '--network <net>', description: 'Network for the profile (mainnet, testnet, dev)', default: 'testnet' },
+    ],
+    examples: [
+      'npm run cli -- wallet create alice',
+      'npm run cli -- wallet create bob --network mainnet',
+    ],
+    notes: [
+      'Profile names must be unique. After creation, initialize with: npm run cli -- init --nametag <name>',
+    ],
+  },
+  'wallet use': {
+    usage: 'wallet use <name>',
+    description: 'Switch the active wallet profile. All subsequent commands will operate on this profile.',
+    examples: [
+      'npm run cli -- wallet use alice',
+    ],
+  },
+  'wallet current': {
+    usage: 'wallet current',
+    description: 'Show the currently active wallet profile, its network, data directory, and identity (if initialized).',
+    examples: [
+      'npm run cli -- wallet current',
+    ],
+  },
+  'wallet delete': {
+    usage: 'wallet delete <name>',
+    description: 'Remove a wallet profile from the profiles list. The on-disk data directory is NOT deleted -- remove it manually if needed.',
+    examples: [
+      'npm run cli -- wallet delete bob',
+    ],
+    notes: [
+      'Cannot delete the currently active profile. Switch to a different profile first.',
+    ],
+  },
+
+  // --- BALANCE & TOKENS ---
+  'balance': {
+    usage: 'balance [--finalize] [--no-sync]',
+    description: 'Show L3 token balance grouped by coin. Receives any pending incoming transfers before displaying. Shows confirmed and unconfirmed amounts, token counts, and USD value.',
+    flags: [
+      { flag: '--finalize', description: 'Wait for unconfirmed tokens to be finalized (may take several seconds)' },
+      { flag: '--no-sync', description: 'Skip IPFS sync before showing balance' },
+    ],
+    examples: [
+      'npm run cli -- balance',
+      'npm run cli -- balance --finalize',
+      'npm run cli -- balance --no-sync',
+    ],
+  },
+  'tokens': {
+    usage: 'tokens [--no-sync]',
+    description: 'List all individual tokens with their ID, coin type, amount, and status.',
+    flags: [
+      { flag: '--no-sync', description: 'Skip IPFS sync before listing tokens' },
+    ],
+    examples: [
+      'npm run cli -- tokens',
+      'npm run cli -- tokens --no-sync',
+    ],
+  },
+  'assets': {
+    usage: 'assets [--type <fungible|nft>]',
+    description: 'List all registered assets (coins and NFTs) from the token registry. Shows symbol, name, kind, decimals, and coin ID.',
+    flags: [
+      { flag: '--type <kind>', description: 'Filter by asset kind: fungible (or coin/coins), nft (or nfts/non-fungible)' },
+    ],
+    examples: [
+      'npm run cli -- assets',
+      'npm run cli -- assets --type fungible',
+      'npm run cli -- assets --type nft',
+    ],
+    notes: [
+      'Requires wallet initialization (to load the token registry from the network).',
+      'The registry is fetched from a remote URL and cached locally.',
+    ],
+  },
+  'asset-info': {
+    usage: 'asset-info <symbol|name|coinId>',
+    description: 'Show detailed information for a specific asset. Looks up by symbol (UCT), name (bitcoin), or coin ID hex.',
+    examples: [
+      'npm run cli -- asset-info UCT',
+      'npm run cli -- asset-info bitcoin',
+      'npm run cli -- asset-info 0a1b2c3d4e5f...',
+    ],
+    notes: [
+      'Use "assets" command first to see all available assets.',
+      'Lookup is case-insensitive for symbols and names.',
+    ],
+  },
+  'l1-balance': {
+    usage: 'l1-balance',
+    description: 'Show L1 (ALPHA blockchain) balance including confirmed and unconfirmed amounts. Connects to Fulcrum electrum server on first use.',
+    examples: [
+      'npm run cli -- l1-balance',
+    ],
+  },
+  'topup': {
+    usage: 'topup [<amount> <coin>]',
+    description: 'Request test tokens from the Unicity faucet. Without arguments, requests default amounts of all supported coins. With amount and coin, requests a specific coin.',
+    flags: [
+      { flag: '<amount>', description: 'Amount to request (numeric)' },
+      { flag: '<coin>', description: 'Coin symbol (UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT) or faucet name (unicity, bitcoin, ethereum, solana, tether, usd-coin, unicity-usd)' },
+    ],
+    examples: [
+      'npm run cli -- topup',
+      'npm run cli -- topup 100 UCT',
+      'npm run cli -- topup 2 BTC',
+      'npm run cli -- topup 42 ETH',
+    ],
+    notes: [
+      'Requires a registered nametag. The faucet is only available on testnet.',
+      'Also accessible as "top-up" or "faucet".',
+    ],
+  },
+  'top-up': {
+    usage: 'top-up [<amount> <coin>]',
+    description: 'Alias for "topup". Request test tokens from the Unicity faucet.',
+    examples: [
+      'npm run cli -- top-up',
+      'npm run cli -- top-up 2 BTC',
+    ],
+    notes: [
+      'This is an alias for the "topup" command. See "help topup" for full details.',
+    ],
+  },
+  'faucet': {
+    usage: 'faucet [<amount> <coin>]',
+    description: 'Alias for "topup". Request test tokens from the Unicity faucet.',
+    examples: [
+      'npm run cli -- faucet',
+      'npm run cli -- faucet 100 ETH',
+    ],
+    notes: [
+      'This is an alias for the "topup" command. See "help topup" for full details.',
+    ],
+  },
+  'verify-balance': {
+    usage: 'verify-balance [--remove] [-v|--verbose]',
+    description: 'Verify all tokens against the aggregator to detect spent tokens that were not properly removed from local storage. Useful for cleaning up stale token state.',
+    flags: [
+      { flag: '--remove', description: 'Move detected spent tokens to the Sent (archive) folder' },
+      { flag: '-v, --verbose', description: 'Show all tokens, not just spent ones; show progress and errors' },
+    ],
+    examples: [
+      'npm run cli -- verify-balance',
+      'npm run cli -- verify-balance --verbose',
+      'npm run cli -- verify-balance --remove',
+    ],
+  },
+  'sync': {
+    usage: 'sync',
+    description: 'Sync tokens with IPFS remote storage. Uploads local tokens and downloads any tokens stored remotely.',
+    examples: [
+      'npm run cli -- sync',
+    ],
+  },
+
+  // --- TRANSFERS ---
+  'send': {
+    usage: 'send <recipient> <amount> <coin> [--direct|--proxy] [--instant|--conservative] [--no-sync]',
+    description: 'Send L3 tokens to a recipient. The recipient can be a @nametag, DIRECT:// address, chain public key (02/03 prefix), or alpha1... L1 address. Amount is in decimal (e.g., 0.5) and is converted to smallest units automatically.',
+    flags: [
+      { flag: '<coin>', description: 'Asset symbol (UCT, BTC) as positional argument after amount', default: 'UCT' },
+      { flag: '--direct', description: 'Force DirectAddress transfer (requires nametag with directAddress)' },
+      { flag: '--proxy', description: 'Force PROXY address transfer (works with any nametag)' },
+      { flag: '--instant', description: 'Send immediately via Nostr; receiver gets unconfirmed token', default: 'yes' },
+      { flag: '--conservative', description: 'Collect all proofs first; receiver gets confirmed token' },
+      { flag: '--no-sync', description: 'Skip IPFS sync after sending' },
+    ],
+    examples: [
+      'npm run cli -- send @alice 10 UCT',
+      'npm run cli -- send @alice 0.5 BTC',
+      'npm run cli -- send DIRECT://0000be36... 500000 UCT --conservative',
+      'npm run cli -- send @bob 100 USDU --no-sync',
+    ],
+    notes: [
+      'Cannot use both --direct and --proxy simultaneously.',
+      'Cannot use both --instant and --conservative simultaneously.',
+    ],
+  },
+  'receive': {
+    usage: 'receive [--finalize] [--no-sync]',
+    description: 'Check for incoming token transfers via Nostr. Displays receive addresses and fetches any pending transfers.',
+    flags: [
+      { flag: '--finalize', description: 'Wait for unconfirmed tokens to be finalized before returning' },
+      { flag: '--no-sync', description: 'Skip IPFS sync after receiving' },
+    ],
+    examples: [
+      'npm run cli -- receive',
+      'npm run cli -- receive --finalize',
+    ],
+  },
+  'history': {
+    usage: 'history [limit] [--no-sync]',
+    description: 'Show transaction history ordered by most recent first. Each entry shows date, direction, amount, coin, and counterparty.',
+    flags: [
+      { flag: '<limit>', description: 'Maximum number of transactions to show', default: '10' },
+      { flag: '--no-sync', description: 'Skip sync before showing history' },
+    ],
+    examples: [
+      'npm run cli -- history',
+      'npm run cli -- history 20',
+    ],
+  },
+
+  // --- ADDRESSES ---
+  'addresses': {
+    usage: 'addresses',
+    description: 'List all tracked HD addresses with their index, L1 address, DIRECT address, nametag, and hidden status. The currently active address is marked with an arrow.',
+    examples: [
+      'npm run cli -- addresses',
+    ],
+  },
+  'switch': {
+    usage: 'switch <index>',
+    description: 'Switch to a different HD-derived address by index. Index 0 is the default. New addresses are created on first switch.',
+    examples: [
+      'npm run cli -- switch 1',
+      'npm run cli -- switch 0',
+    ],
+  },
+  'hide': {
+    usage: 'hide <index>',
+    description: 'Hide an address from the active address list. Hidden addresses are excluded from getActiveAddresses() but still tracked.',
+    examples: [
+      'npm run cli -- hide 2',
+    ],
+  },
+  'unhide': {
+    usage: 'unhide <index>',
+    description: 'Unhide a previously hidden address, making it visible in the active address list again.',
+    examples: [
+      'npm run cli -- unhide 2',
+    ],
+  },
+
+  // --- NAMETAGS ---
+  'nametag': {
+    usage: 'nametag <name>',
+    description: 'Register a nametag (@name) for the current address. Mints a nametag token on-chain and publishes to Nostr relay. The name should not include the @ prefix.',
+    examples: [
+      'npm run cli -- nametag alice',
+      'npm run cli -- nametag myname',
+    ],
+  },
+  'nametag-info': {
+    usage: 'nametag-info <name>',
+    description: 'Look up information about a nametag, including the associated public key and addresses. Resolves via the Nostr relay.',
+    examples: [
+      'npm run cli -- nametag-info alice',
+      'npm run cli -- nametag-info bob',
+    ],
+  },
+  'my-nametag': {
+    usage: 'my-nametag',
+    description: 'Show the nametag registered for the current address.',
+    examples: [
+      'npm run cli -- my-nametag',
+    ],
+  },
+  'nametag-sync': {
+    usage: 'nametag-sync',
+    description: 'Re-publish the current nametag identity binding with chainPubkey. Useful for fixing legacy nametags that were registered without the chainPubkey field.',
+    examples: [
+      'npm run cli -- nametag-sync',
+    ],
+  },
+
+  // --- MESSAGING ---
+  'dm': {
+    usage: 'dm <@nametag|pubkey> <message>',
+    description: 'Send an encrypted direct message to a peer via Nostr (NIP-17 gift-wrapped).',
+    examples: [
+      'npm run cli -- dm @alice "Hello, how are you?"',
+      'npm run cli -- dm @bob "Payment sent for order #42"',
+    ],
+  },
+  'dm-inbox': {
+    usage: 'dm-inbox',
+    description: 'List all DM conversations with unread counts and last message preview.',
+    examples: [
+      'npm run cli -- dm-inbox',
+    ],
+  },
+  'dm-history': {
+    usage: 'dm-history <@nametag|pubkey> [--limit <n>]',
+    description: 'Show message history for a specific conversation. Resolves @nametag to pubkey automatically.',
+    flags: [
+      { flag: '--limit <n>', description: 'Maximum number of messages to display', default: '50' },
+    ],
+    examples: [
+      'npm run cli -- dm-history @alice',
+      'npm run cli -- dm-history @alice --limit 20',
+    ],
+  },
+
+  // --- GROUP CHAT ---
+  'group-create': {
+    usage: 'group-create <name> [--description <text>] [--private]',
+    description: 'Create a new NIP-29 group chat on the relay.',
+    flags: [
+      { flag: '--description <text>', description: 'Group description text' },
+      { flag: '--private', description: 'Create a private (invite-only) group' },
+    ],
+    examples: [
+      'npm run cli -- group-create "Trading Chat"',
+      'npm run cli -- group-create "Team Alpha" --description "Internal team chat" --private',
+    ],
+  },
+  'group-list': {
+    usage: 'group-list',
+    description: 'List all available public groups on the relay with their names, IDs, descriptions, and member counts.',
+    examples: [
+      'npm run cli -- group-list',
+    ],
+  },
+  'group-my': {
+    usage: 'group-my',
+    description: 'List groups you have joined, with unread message counts and last message preview.',
+    examples: [
+      'npm run cli -- group-my',
+    ],
+  },
+  'group-join': {
+    usage: 'group-join <groupId> [--invite <code>]',
+    description: 'Join a group by its ID. Private groups require an invite code.',
+    flags: [
+      { flag: '--invite <code>', description: 'Invite code for private groups' },
+    ],
+    examples: [
+      'npm run cli -- group-join tradingchat',
+      'npm run cli -- group-join privatechat --invite abc123',
+    ],
+  },
+  'group-leave': {
+    usage: 'group-leave <groupId>',
+    description: 'Leave a group you have previously joined.',
+    examples: [
+      'npm run cli -- group-leave tradingchat',
+    ],
+  },
+  'group-send': {
+    usage: 'group-send <groupId> <message> [--reply <eventId>]',
+    description: 'Send a message to a group. Optionally reply to a specific message by event ID.',
+    flags: [
+      { flag: '--reply <eventId>', description: 'Event ID of the message to reply to' },
+    ],
+    examples: [
+      'npm run cli -- group-send tradingchat "Hello everyone!"',
+      'npm run cli -- group-send tradingchat "I agree" --reply abc123def',
+    ],
+  },
+  'group-messages': {
+    usage: 'group-messages <groupId> [--limit <n>]',
+    description: 'Show recent messages in a group. Fetches from relay and marks the group as read.',
+    flags: [
+      { flag: '--limit <n>', description: 'Maximum number of messages to display', default: '50' },
+    ],
+    examples: [
+      'npm run cli -- group-messages tradingchat',
+      'npm run cli -- group-messages tradingchat --limit 20',
+    ],
+  },
+  'group-members': {
+    usage: 'group-members <groupId>',
+    description: 'List members of a group with their nametags, roles (ADMIN/MOD), and join dates.',
+    examples: [
+      'npm run cli -- group-members tradingchat',
+    ],
+  },
+  'group-info': {
+    usage: 'group-info <groupId>',
+    description: 'Show detailed information about a group including name, visibility, description, member count, creation date, and relay URL.',
+    examples: [
+      'npm run cli -- group-info tradingchat',
+    ],
+  },
+
+  // --- MARKET ---
+  'market-post': {
+    usage: 'market-post <description> --type <type> [options]',
+    description: 'Post an intent to the market bulletin board. Type is required.',
+    flags: [
+      { flag: '--type <type>', description: 'Intent type: buy, sell, service, announcement, other (required)' },
+      { flag: '--category <cat>', description: 'Intent category for filtering' },
+      { flag: '--price <n>', description: 'Price amount (numeric)' },
+      { flag: '--currency <code>', description: 'Currency code (USD, UCT, etc.)' },
+      { flag: '--location <loc>', description: 'Location for geographic filtering' },
+      { flag: '--contact <handle>', description: 'Contact handle (e.g., @nametag, email)' },
+      { flag: '--expires <days>', description: 'Expiration in days', default: '30' },
+    ],
+    examples: [
+      'npm run cli -- market-post "Buying 100 UCT" --type buy',
+      'npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD',
+      'npm run cli -- market-post "Web dev services" --type service --contact @alice',
+    ],
+  },
+  'market-search': {
+    usage: 'market-search <query> [options]',
+    description: 'Search the market bulletin board using semantic search. Returns intents ranked by relevance score.',
+    flags: [
+      { flag: '--type <type>', description: 'Filter by intent type' },
+      { flag: '--category <cat>', description: 'Filter by category' },
+      { flag: '--min-price <n>', description: 'Minimum price filter' },
+      { flag: '--max-price <n>', description: 'Maximum price filter' },
+      { flag: '--min-score <0-1>', description: 'Minimum similarity score threshold' },
+      { flag: '--location <loc>', description: 'Location filter' },
+      { flag: '--limit <n>', description: 'Maximum results to return', default: '10' },
+    ],
+    examples: [
+      'npm run cli -- market-search "UCT tokens" --type sell --limit 5',
+      'npm run cli -- market-search "tokens" --min-score 0.7',
+      'npm run cli -- market-search "services" --min-price 10 --max-price 100',
+    ],
+  },
+  'market-my': {
+    usage: 'market-my',
+    description: 'List all intents you have posted to the market.',
+    examples: [
+      'npm run cli -- market-my',
+    ],
+  },
+  'market-close': {
+    usage: 'market-close <id>',
+    description: 'Close (delete) one of your market intents by its ID.',
+    examples: [
+      'npm run cli -- market-close abc123',
+    ],
+  },
+  'market-feed': {
+    usage: 'market-feed [--rest]',
+    description: 'Watch the live market listing feed via WebSocket. Shows new intents in real time. Use --rest for a one-shot fetch instead.',
+    flags: [
+      { flag: '--rest', description: 'Use REST fallback: fetch recent listings once and exit' },
+    ],
+    examples: [
+      'npm run cli -- market-feed',
+      'npm run cli -- market-feed --rest',
+    ],
+    notes: [
+      'WebSocket mode runs indefinitely. Press Ctrl+C to stop.',
+    ],
+  },
+
+  // --- INVOICES ---
+  'invoice-create': {
+    usage: 'invoice-create --target <address> --asset "<amount> <coin>" [options]',
+    description: 'Create a new invoice by specifying a target address and requested payment. Alternatively, load full terms from a JSON file with --terms. The invoice is minted as an on-chain token.',
+    flags: [
+      { flag: '--target <address>', description: 'Target address (@nametag or DIRECT:// address) (required unless --terms)' },
+      { flag: '--asset "<amount> <coin>"', description: 'Requested asset in "<amount> <symbol>" format (e.g., "1000000 UCT")' },
+      { flag: '--nft <id>', description: 'Request a specific NFT by token ID (instead of coin+amount)' },
+      { flag: '--due <ISO-date>', description: 'Due date in ISO-8601 format (e.g., 2026-12-31)' },
+      { flag: '--memo <text>', description: 'Invoice memo text' },
+      { flag: '--delivery <method>', description: 'Delivery method description' },
+      { flag: '--terms <json-file>', description: 'Load full CreateInvoiceRequest from a JSON file (overrides other flags)' },
+    ],
+    examples: [
+      'npm run cli -- invoice-create --target @alice --asset "1000000 UCT"',
+      'npm run cli -- invoice-create --target @alice --asset "500000 BTC" --memo "Order #42" --due 2026-12-31',
+      'npm run cli -- invoice-create --terms invoice-terms.json',
+    ],
+    notes: [
+      'Amounts must be positive integers in smallest units (no decimals, no leading zeros).',
+    ],
+  },
+  'invoice-import': {
+    usage: 'invoice-import <token-file>',
+    description: 'Import an invoice from a TXF token JSON file. Parses the invoice terms from the token data and adds it to local tracking.',
+    examples: [
+      'npm run cli -- invoice-import ./received-invoice.json',
+    ],
+  },
+  'invoice-list': {
+    usage: 'invoice-list [--state <states>] [--role <creator|payer>] [--limit <n>]',
+    description: 'List invoices with optional filtering by state and role. States can be comma-separated.',
+    flags: [
+      { flag: '--state <states>', description: 'Filter by state: OPEN, PARTIAL, COVERED, CLOSED, CANCELLED, EXPIRED (comma-separated)' },
+      { flag: '--role <role>', description: 'Filter by role: "creator" (invoices you created) or "payer" (invoices targeting you)' },
+      { flag: '--limit <n>', description: 'Maximum number of invoices to return' },
+    ],
+    examples: [
+      'npm run cli -- invoice-list',
+      'npm run cli -- invoice-list --state OPEN,PARTIAL --limit 5',
+      'npm run cli -- invoice-list --role creator',
+    ],
+  },
+  'invoice-status': {
+    usage: 'invoice-status <id-or-prefix>',
+    description: 'Show detailed invoice status including state, per-target balance breakdown, total forward/back payments, and confirmation status. Accepts full ID or unique prefix.',
+    examples: [
+      'npm run cli -- invoice-status a1b2c3d4',
+      'npm run cli -- invoice-status a1b2c3d4e5f6...',
+    ],
+  },
+  'invoice-close': {
+    usage: 'invoice-close <id-or-prefix> [--auto-return]',
+    description: 'Close an invoice (terminal state). Freezes balances and stops dynamic recomputation. Optionally triggers auto-return for overpayments.',
+    flags: [
+      { flag: '--auto-return', description: 'Trigger auto-return of excess payments on close' },
+    ],
+    examples: [
+      'npm run cli -- invoice-close a1b2c3d4',
+      'npm run cli -- invoice-close a1b2c3d4 --auto-return',
+    ],
+  },
+  'invoice-cancel': {
+    usage: 'invoice-cancel <id-or-prefix>',
+    description: 'Cancel an invoice (terminal state). If auto-return is enabled, payments will be automatically refunded.',
+    examples: [
+      'npm run cli -- invoice-cancel a1b2c3d4',
+    ],
+  },
+  'invoice-pay': {
+    usage: 'invoice-pay <id-or-prefix> [--amount <value>] [--target-index <n>]',
+    description: 'Pay an invoice. By default pays the remaining amount for the first target. For multi-target invoices, specify --target-index.',
+    flags: [
+      { flag: '--amount <value>', description: 'Amount to pay in smallest units (positive integer). Defaults to remaining amount.' },
+      { flag: '--target-index <n>', description: 'Target index for multi-target invoices (0-based)', default: '0' },
+    ],
+    examples: [
+      'npm run cli -- invoice-pay a1b2c3d4',
+      'npm run cli -- invoice-pay a1b2c3d4 --amount 500000',
+      'npm run cli -- invoice-pay a1b2c3d4 --target-index 1 --amount 250000',
+    ],
+  },
+  'invoice-return': {
+    usage: 'invoice-return <id-or-prefix> --recipient <address> --asset "<amount> <coin>"',
+    description: 'Manually return a payment to a sender for a specific invoice.',
+    flags: [
+      { flag: '--recipient <address>', description: 'Recipient address or @nametag (required)' },
+      { flag: '--asset "<amount> <coin>"', description: 'Asset to return in "<amount> <symbol>" format (e.g., "100000 UCT")' },
+    ],
+    examples: [
+      'npm run cli -- invoice-return a1b2c3d4 --recipient @bob --asset "100000 UCT"',
+    ],
+  },
+  'invoice-receipts': {
+    usage: 'invoice-receipts <id-or-prefix>',
+    description: 'Send payment receipts via DM to each sender who contributed to this invoice. Typically used after closing an invoice.',
+    examples: [
+      'npm run cli -- invoice-receipts a1b2c3d4',
+    ],
+  },
+  'invoice-notices': {
+    usage: 'invoice-notices <id-or-prefix>',
+    description: 'Send cancellation notice DMs to each sender who contributed to a cancelled invoice.',
+    examples: [
+      'npm run cli -- invoice-notices a1b2c3d4',
+    ],
+  },
+  'invoice-auto-return': {
+    usage: 'invoice-auto-return [--enable|--disable] [--invoice <id>]',
+    description: 'Show or configure auto-return settings. Without flags, displays current settings. Auto-return automatically refunds payments received against closed or cancelled invoices.',
+    flags: [
+      { flag: '--enable', description: 'Enable auto-return' },
+      { flag: '--disable', description: 'Disable auto-return' },
+      { flag: '--invoice <id>', description: 'Target a specific invoice (default: global "*" scope)' },
+    ],
+    examples: [
+      'npm run cli -- invoice-auto-return',
+      'npm run cli -- invoice-auto-return --enable',
+      'npm run cli -- invoice-auto-return --disable --invoice a1b2c3d4',
+    ],
+  },
+  'invoice-transfers': {
+    usage: 'invoice-transfers <id-or-prefix>',
+    description: 'List all transfers related to an invoice in chronological order, including forward payments and returns.',
+    examples: [
+      'npm run cli -- invoice-transfers a1b2c3d4',
+    ],
+  },
+  'invoice-export': {
+    usage: 'invoice-export <id-or-prefix>',
+    description: 'Export an invoice to a JSON file. The file is saved as invoice-<prefix>.json in the current directory.',
+    examples: [
+      'npm run cli -- invoice-export a1b2c3d4',
+    ],
+  },
+  'invoice-parse-memo': {
+    usage: 'invoice-parse-memo <memo-string>',
+    description: 'Parse an invoice memo string (INV:...) and display its decoded fields.',
+    examples: [
+      'npm run cli -- invoice-parse-memo "INV:a1b2c3d4...:F"',
+    ],
+  },
+
+  // --- SWAPS ---
+  'swap-propose': {
+    usage: 'swap-propose --to <recipient> --offer "<amount> <coin>" --want "<amount> <coin>" [options]',
+    description: 'Propose a token swap deal to a counterparty. Both parties deposit tokens into an escrow, which executes the swap atomically.',
+    flags: [
+      { flag: '--to <recipient>', description: 'Counterparty @nametag or address (required)' },
+      { flag: '--offer "<amount> <coin>"', description: 'Asset you are offering (e.g., "10 BTC", "0.5 ETH")' },
+      { flag: '--want "<amount> <coin>"', description: 'Asset you want in return (e.g., "100 USDU", "5 UCT")' },
+      { flag: '--escrow <address>', description: 'Custom escrow address (optional, uses config default)' },
+      { flag: '--timeout <seconds>', description: 'Swap timeout in seconds (60-86400)', default: '3600' },
+      { flag: '--message <text>', description: 'Optional message to the counterparty' },
+    ],
+    examples: [
+      'npm run cli -- swap-propose --to @bob --offer "10 UCT" --want "5 USDU"',
+      'npm run cli -- swap-propose --to @bob --offer "1 BTC" --want "10 ETH" --timeout 7200 --message "Quick trade?"',
+    ],
+    notes: [
+      'Amounts are in human-readable units (e.g., "10 BTC" = 10 whole BTC). Decimals are supported (e.g., "0.5 ETH").',
+    ],
+  },
+  'swap-list': {
+    usage: 'swap-list [--all] [--role <proposer|acceptor>] [--progress <state>]',
+    description: 'List swap deals. By default shows only open and in-progress swaps. Use --all to include completed/cancelled/failed swaps.',
+    flags: [
+      { flag: '--all', description: 'Include terminal states (completed, cancelled, failed)' },
+      { flag: '--role <role>', description: 'Filter by your role: "proposer" or "acceptor"' },
+      { flag: '--progress <state>', description: 'Filter by progress state' },
+    ],
+    examples: [
+      'npm run cli -- swap-list',
+      'npm run cli -- swap-list --all',
+      'npm run cli -- swap-list --role proposer',
+      'npm run cli -- swap-list --all --role proposer',
+    ],
+  },
+  'swap-accept': {
+    usage: 'swap-accept <swap_id_or_prefix> [--deposit] [--no-wait]',
+    description: 'Accept a proposed swap deal. Announces acceptance to the escrow.',
+    flags: [
+      { flag: '--deposit', description: 'Immediately deposit after accepting' },
+      { flag: '--no-wait', description: 'Do not wait for swap completion after depositing (only with --deposit)' },
+    ],
+    examples: [
+      'npm run cli -- swap-accept 3611a464',
+      'npm run cli -- swap-accept 3611a464 --deposit',
+      'npm run cli -- swap-accept 3611a464 --deposit --no-wait',
+    ],
+    notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
+      'Without --deposit, run "swap-deposit <id>" separately when ready.',
+    ],
+  },
+  'swap-status': {
+    usage: 'swap-status <swap_id_or_prefix> [--query-escrow]',
+    description: 'Show detailed status of a swap deal including progress, deal terms, and deposit information.',
+    flags: [
+      { flag: '--query-escrow', description: 'Query the escrow service for the latest status' },
+    ],
+    examples: [
+      'npm run cli -- swap-status 3611a464',
+      'npm run cli -- swap-status 3611a464 --query-escrow',
+    ],
+    notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
+      'If the swap has an associated deposit invoice, its status is also displayed.',
+    ],
+  },
+  'swap-deposit': {
+    usage: 'swap-deposit <swap_id_or_prefix>',
+    description: 'Deposit tokens into an accepted swap. The swap must be in the "announced" state (accepted and awaiting deposits).',
+    examples: [
+      'npm run cli -- swap-deposit 3611a464',
+    ],
+    notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
+    ],
+  },
+
+  'swap-reject': {
+    usage: 'swap-reject <swap_id_or_prefix> [reason]',
+    description: 'Reject an incoming swap proposal. Sends a rejection DM to the proposer and marks the swap as cancelled.',
+    examples: [
+      'npm run cli -- swap-reject 3611a464',
+      'npm run cli -- swap-reject 3611a464 "Price too high"',
+    ],
+    notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
+      'Only works on proposals you received (role: acceptor, progress: proposed).',
+      'The optional reason is included in the rejection DM sent to the proposer.',
+    ],
+  },
+  'swap-cancel': {
+    usage: 'swap-cancel <swap_id_or_prefix>',
+    description: 'Cancel a swap you proposed or accepted. Works before deposits are confirmed by the escrow.',
+    examples: [
+      'npm run cli -- swap-cancel 3611a464',
+    ],
+    notes: [
+      'Accepts full 64-char swap ID or a unique prefix (min 4 chars).',
+      'Pre-deposit cancellation is local only (no escrow notification).',
+      'Post-deposit cancellation: escrow handles timeout and returns deposits automatically.',
+    ],
+  },
+
+  // --- DAEMON ---
+  'daemon': {
+    usage: 'daemon <start|stop|status> [options]',
+    description: 'Manage the persistent event listener daemon. The daemon listens for wallet events and triggers configured actions.',
+    examples: [
+      'npm run cli -- daemon start --event transfer:incoming --action auto-receive',
+      'npm run cli -- daemon start --detach --event "*" --action "log:./events.jsonl"',
+      'npm run cli -- daemon stop',
+      'npm run cli -- daemon status',
+    ],
+  },
+  'daemon start': {
+    usage: 'daemon start [options]',
+    description: 'Start the persistent event listener. Can subscribe to specific events and trigger actions (auto-receive, webhook, bash command, or log file).',
+    flags: [
+      { flag: '--config <path>', description: 'Config file path', default: '.sphere-cli/daemon.json' },
+      { flag: '--detach', description: 'Run in background (fork process, PID file, redirect logs)' },
+      { flag: '--log <path>', description: 'Override log file path' },
+      { flag: '--pid <path>', description: 'Override PID file path' },
+      { flag: '--event <type>', description: 'Event type to subscribe to (repeatable). Use "*" for all events.' },
+      { flag: '--action <spec>', description: 'Action to trigger: auto-receive, bash:<cmd>, webhook:<url>, log:<path>' },
+      { flag: '--market-feed', description: 'Also subscribe to the market WebSocket feed' },
+      { flag: '--verbose', description: 'Print full event JSON in logs' },
+    ],
+    examples: [
+      'npm run cli -- daemon start --event transfer:incoming --action auto-receive',
+      'npm run cli -- daemon start --event "transfer:*" --action "webhook:https://example.com/hook" --detach',
+      'npm run cli -- daemon start --event "*" --action "log:./events.jsonl" --verbose',
+      'npm run cli -- daemon start --event message:dm --action "bash:echo DM from \\$SPHERE_SENDER"',
+      'npm run cli -- daemon start --config ./my-daemon.json --detach',
+    ],
+  },
+  'daemon stop': {
+    usage: 'daemon stop',
+    description: 'Stop the running daemon process.',
+    examples: [
+      'npm run cli -- daemon stop',
+    ],
+  },
+  'daemon status': {
+    usage: 'daemon status',
+    description: 'Check if the daemon is currently running and show its PID.',
+    examples: [
+      'npm run cli -- daemon status',
+    ],
+  },
+
+  // --- ENCRYPTION ---
+  'encrypt': {
+    usage: 'encrypt <data> <password>',
+    description: 'Encrypt a string with AES using a password. Outputs the encrypted result as JSON.',
+    examples: [
+      'npm run cli -- encrypt "my secret data" mypassword',
+    ],
+  },
+  'decrypt': {
+    usage: 'decrypt <encrypted-json> <password>',
+    description: 'Decrypt an AES-encrypted JSON blob using a password. Outputs the original plaintext.',
+    examples: [
+      'npm run cli -- decrypt \'{"iv":"...","data":"..."}\' mypassword',
+    ],
+  },
+
+  // --- WALLET PARSING ---
+  'parse-wallet': {
+    usage: 'parse-wallet <file> [password]',
+    description: 'Parse a wallet backup file (.txt or .dat format). If the file is encrypted, a password is required.',
+    examples: [
+      'npm run cli -- parse-wallet wallet.txt',
+      'npm run cli -- parse-wallet wallet.txt mypassword',
+      'npm run cli -- parse-wallet wallet.dat',
+    ],
+  },
+  'wallet-info': {
+    usage: 'wallet-info <file>',
+    description: 'Show metadata about a wallet file: format (.txt, .dat, .json), whether it is encrypted, and other format-specific info.',
+    examples: [
+      'npm run cli -- wallet-info wallet.txt',
+      'npm run cli -- wallet-info backup.dat',
+    ],
+  },
+
+  // --- KEY OPERATIONS ---
+  'generate-key': {
+    usage: 'generate-key',
+    description: 'Generate a random secp256k1 private key and derive the public key, WIF, and L1 address from it.',
+    examples: [
+      'npm run cli -- generate-key',
+    ],
+  },
+  'validate-key': {
+    usage: 'validate-key <hex>',
+    description: 'Validate whether a hex string is a valid secp256k1 private key. Exits with code 0 if valid, 1 if invalid.',
+    examples: [
+      'npm run cli -- validate-key 0a1b2c3d...',
+    ],
+  },
+  'hex-to-wif': {
+    usage: 'hex-to-wif <hex>',
+    description: 'Convert a hex private key to Wallet Import Format (WIF).',
+    examples: [
+      'npm run cli -- hex-to-wif 0a1b2c3d...',
+    ],
+  },
+  'derive-pubkey': {
+    usage: 'derive-pubkey <private-key-hex>',
+    description: 'Derive the compressed secp256k1 public key from a private key.',
+    examples: [
+      'npm run cli -- derive-pubkey 0a1b2c3d...',
+    ],
+  },
+  'derive-address': {
+    usage: 'derive-address <private-key-hex> [index]',
+    description: 'Derive an L1 (alpha1...) address from a private key at the given HD derivation index.',
+    flags: [
+      { flag: '<index>', description: 'HD derivation index', default: '0' },
+    ],
+    examples: [
+      'npm run cli -- derive-address 0a1b2c3d...',
+      'npm run cli -- derive-address 0a1b2c3d... 3',
+    ],
+  },
+
+  // --- CURRENCY ---
+  'to-smallest': {
+    usage: 'to-smallest <amount> <coin>',
+    description: 'Convert a human-readable amount to the smallest unit. Use the coin symbol to apply the correct decimals for a specific asset. Default uses 8 decimals if no coin specified.',
+    flags: [
+      { flag: '<coin>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID. Determines decimal precision.' },
+    ],
+    examples: [
+      'npm run cli -- to-smallest 1.5 UCT',
+      'npm run cli -- to-smallest 0.001 BTC',
+      'npm run cli -- to-smallest 100.5 USDT',
+    ],
+    notes: [
+      'When a coin is provided, the wallet is loaded briefly to access the token registry.',
+    ],
+  },
+  'to-human': {
+    usage: 'to-human <amount> <coin>',
+    description: 'Convert an amount in smallest units back to human-readable format. Use the coin symbol to apply the correct decimals for a specific asset. Default uses 8 decimals if no coin specified.',
+    flags: [
+      { flag: '<coin>', description: 'Asset symbol (UCT, BTC), name (bitcoin), or hex coin ID. Determines decimal precision.' },
+    ],
+    examples: [
+      'npm run cli -- to-human 150000000 UCT',
+      'npm run cli -- to-human 1000000 BTC',
+      'npm run cli -- to-human 1000000 USDT',
+    ],
+    notes: [
+      'When a coin is provided, the wallet is loaded briefly to access the token registry.',
+    ],
+  },
+  'format': {
+    usage: 'format <amount> [decimals]',
+    description: 'Format an amount with the specified number of decimal places.',
+    flags: [
+      { flag: '<decimals>', description: 'Number of decimal places', default: '8' },
+    ],
+    examples: [
+      'npm run cli -- format 150000000',
+      'npm run cli -- format 150000000 6',
+    ],
+  },
+
+  // --- ENCODING ---
+  'base58-encode': {
+    usage: 'base58-encode <hex>',
+    description: 'Encode a hex string to Base58.',
+    examples: [
+      'npm run cli -- base58-encode 0a1b2c3d',
+    ],
+  },
+  'base58-decode': {
+    usage: 'base58-decode <string>',
+    description: 'Decode a Base58 string to hex.',
+    examples: [
+      'npm run cli -- base58-decode 2NEpo7TZRhna',
+    ],
+  },
+};
+
+function printCommandHelp(cmdName: string): void {
+  const help = COMMAND_HELP[cmdName];
+  if (!help) {
+    console.error(`No help available for command: ${cmdName}`);
+    console.error('Run "npm run cli -- help" for a list of all commands.');
+    process.exit(1);
+  }
+
+  console.log(`\n  ${cmdName}\n`);
+  console.log(`  Usage: npm run cli -- ${help.usage}\n`);
+  console.log(`  ${help.description}\n`);
+
+  if (help.flags && help.flags.length > 0) {
+    console.log('  Flags:');
+    const maxFlagLen = Math.max(...help.flags.map(f => f.flag.length));
+    for (const f of help.flags) {
+      const defaultStr = f.default ? ` (default: ${f.default})` : '';
+      console.log(`    ${f.flag.padEnd(maxFlagLen + 2)}${f.description}${defaultStr}`);
+    }
+    console.log('');
+  }
+
+  if (help.examples.length > 0) {
+    console.log('  Examples:');
+    for (const ex of help.examples) {
+      console.log(`    ${ex}`);
+    }
+    console.log('');
+  }
+
+  if (help.notes && help.notes.length > 0) {
+    console.log('  Notes:');
+    for (const note of help.notes) {
+      console.log(`    - ${note}`);
+    }
+    console.log('');
+  }
+}
+
 function printUsage() {
   console.log(`
-Sphere SDK CLI v0.2.2
+Sphere SDK CLI v0.3.0
 
 Usage: npm run cli -- <command> [args...]
    or: npx tsx cli/index.ts <command> [args...]
+   or: npm run cli -- help <command>     Show detailed help for a command
 
-WALLET MANAGEMENT:
-  init [--network <net>]            Create new wallet (mainnet|testnet|dev)
-  init --mnemonic "<words>"         Import wallet from mnemonic
-  status                            Show wallet status and identity
-  clear                             Delete all wallet data (keys + tokens)
-  config                            Show current configuration
-  config set <key> <value>          Set configuration (network, dataDir, tokensDir)
+WALLET:
+  init                              Create or import wallet
+  status                            Show wallet identity
+  config                            Show or set CLI configuration
+  clear                             Delete all wallet data
 
 WALLET PROFILES:
   wallet list                       List all wallet profiles
+  wallet create <name>              Create a new wallet profile
   wallet use <name>                 Switch to a wallet profile
-  wallet create <name> [--network]  Create a new wallet profile
+  wallet current                    Show active profile
   wallet delete <name>              Delete a wallet profile
-  wallet current                    Show current wallet profile
 
 BALANCE & TOKENS:
-  balance [--finalize] [--no-sync]  Show L3 token balance
-                                    --finalize: wait for unconfirmed tokens to be finalized
-                                    --no-sync: skip IPFS sync before showing balance
-  tokens [--no-sync]                List all tokens with details
-  l1-balance                        Show L1 (ALPHA) balance
-  topup [coin] [amount]             Request test tokens from faucet
-                                    Without args: requests all supported coins
-                                    With coin: requests specific coin (bitcoin, ethereum, etc.)
-  verify-balance [--remove] [-v]    Verify tokens against aggregator
-                                    Detects spent tokens not removed from storage
-                                    --remove: Remove spent tokens from storage
-                                    -v/--verbose: Show all tokens, not just spent
-  sync                              Sync tokens with IPFS remote storage
+  balance                           Show L3 token balance
+  tokens                            List individual tokens
+  assets                            List all registered assets (coins & NFTs)
+  asset-info <id>                   Show detailed info for an asset
+  l1-balance                        L1 (ALPHA) balance
+  topup [<amount> <coin>]            Request test tokens from faucet
+  verify-balance                    Detect spent tokens via aggregator
+  sync                              Sync tokens with IPFS
 
 TRANSFERS:
-  send <to> <amount> [options]      Send tokens (to: @nametag or address)
-                                    --coin SYM       Token symbol (UCT/BTC/ETH/SOL)
-                                    --direct         Force DirectAddress transfer
-                                    --proxy          Force PROXY address transfer
-                                    --instant        Send immediately via Nostr (default)
-                                    --conservative   Collect all proofs first, then send
-                                    --no-sync        Skip IPFS sync after sending
-  receive [--finalize] [--no-sync]  Check for incoming transfers
-                                    --finalize: wait for unconfirmed tokens to be finalized
-                                    --no-sync: skip IPFS sync after receiving
-  history [limit]                   Show transaction history
+  send <to> <amount> <coin>         Send L3 tokens
+  receive                           Check for incoming transfers
+  history [limit]                   Transaction history
 
 ADDRESSES:
-  addresses                         List all tracked addresses
-  switch <index>                    Switch to address at HD index
-  hide <index>                      Hide address from active list
+  addresses                         List tracked addresses
+  switch <index>                    Switch to HD address
+  hide <index>                      Hide address
   unhide <index>                    Unhide address
 
 NAMETAGS:
-  nametag <name>                    Register a nametag (@name)
-  nametag-info <name>               Lookup nametag info
+  nametag <name>                    Register a nametag
+  nametag-info <name>               Look up nametag info
   my-nametag                        Show current nametag
-  nametag-sync                      Re-publish nametag with chainPubkey (fixes legacy nametags)
+  nametag-sync                      Re-publish nametag binding to Nostr
 
-MESSAGING (Direct Messages):
-  dm <@nametag> <message>            Send a direct message
-  dm-inbox                           List conversations and unread counts
-  dm-history <@nametag|pubkey>       Show conversation history
-                                     --limit <n>  Max messages (default: 50)
+MESSAGING:
+  dm <@nametag> <message>           Send a direct message
+  dm-inbox                          List conversations and unread counts
+  dm-history <@nametag|pubkey>      Show conversation history
 
-GROUP CHAT (NIP-29):
-  group-create <name>                Create a new group
-                                     --description <text>  Group description
-                                     --private             Create private group
-  group-list                         List available groups on relay
-  group-my                           List your joined groups
-  group-join <groupId>               Join a group
-                                     --invite <code>       Invite code (for private groups)
-  group-leave <groupId>              Leave a group
-  group-send <groupId> <message>     Send a message to a group
-                                     --reply <eventId>     Reply to a message
-  group-messages <groupId>           Show group messages
-                                     --limit <n>           Max messages (default: 50)
-  group-members <groupId>            List group members
-  group-info <groupId>               Show group details
+GROUP CHAT:
+  group-create <name>               Create a new group
+  group-list                        List available groups on relay
+  group-my                          List your joined groups
+  group-join <groupId>              Join a group
+  group-leave <groupId>             Leave a group
+  group-send <groupId> <message>    Send a message to a group
+  group-messages <groupId>          Show group messages
+  group-members <groupId>           List group members
+  group-info <groupId>              Show group details
 
-MARKET (Intent Bulletin Board):
-  market-post <desc> --type <type>     Post an intent (buy, sell, service, announcement, other)
-                                      --category <cat>   Intent category
-                                      --price <n>        Price amount
-                                      --currency <code>  Currency (USD, UCT, etc.)
-                                      --location <loc>   Location filter
-                                      --contact <handle> Contact handle
-                                      --expires <days>   Expiration in days (default: 30)
-  market-search <query>               Search intents (semantic)
-                                      --type <type>      Filter by type
-                                      --category <cat>   Filter by category
-                                      --min-price <n>    Min price filter
-                                      --max-price <n>    Max price filter
-                                      --min-score <0-1>  Min similarity score
-                                      --location <loc>   Location filter
-                                      --limit <n>        Max results (default: 10)
-  market-my                           List your own intents
-  market-close <id>                   Close (delete) an intent
-  market-feed                         Watch the live listing feed (WebSocket)
-                                      --rest              Use REST fallback instead of WebSocket
+MARKET:
+  market-post <desc> --type <type>  Post an intent
+  market-search <query>             Search intents (semantic)
+  market-my                         List your own intents
+  market-close <id>                 Close (delete) an intent
+  market-feed                       Watch the live listing feed
+
+INVOICES:
+  invoice-create                    Create invoice
+  invoice-import <file>             Import invoice from token file
+  invoice-list                      List invoices
+  invoice-status <id>               Show invoice status
+  invoice-pay <id>                  Pay an invoice
+  invoice-close <id>                Close an invoice
+  invoice-cancel <id>               Cancel an invoice
+  invoice-return <id>               Return payment to sender
+  invoice-receipts <id>             Send receipts
+  invoice-notices <id>              Send cancellation notices
+  invoice-auto-return               Show/set auto-return settings
+  invoice-transfers <id>            List related transfers
+  invoice-export <id>               Export invoice to JSON file
+  invoice-parse-memo <memo>         Parse invoice memo string
+
+SWAPS:
+  swap-propose                      Propose a token swap deal
+  swap-list                         List swap deals
+  swap-accept <id|prefix>            Accept a swap deal
+  swap-status <id|prefix>            Show swap status
+  swap-deposit <id|prefix>           Deposit into a swap
+  swap-reject <id|prefix> [reason]  Reject a swap proposal
+  swap-cancel <id|prefix>           Cancel a swap
 
 EVENT DAEMON:
-  daemon start [options]              Start persistent event listener
-                                      --config <path>    Config file (default: .sphere-cli/daemon.json)
-                                      --detach           Run in background (fork, PID file, log redirect)
-                                      --log <path>       Override log file path
-                                      --pid <path>       Override PID file path
-                                      --event <type>     Quick mode: subscribe to event (repeatable)
-                                      --action <spec>    Quick mode: auto-receive, bash:cmd, webhook:url, log:path
-                                      --market-feed      Subscribe to market WebSocket feed
-                                      --verbose          Print full event JSON in logs
-  daemon stop                         Stop running daemon
-  daemon status                       Check if daemon is running
+  daemon start                      Start persistent event listener
+  daemon stop                       Stop running daemon
+  daemon status                     Check if daemon is running
 
-ENCRYPTION:
+UTILITIES:
   encrypt <data> <password>         Encrypt data with password
   decrypt <json> <password>         Decrypt encrypted JSON data
-
-WALLET PARSING:
   parse-wallet <file> [password]    Parse wallet file (.txt, .dat)
-  wallet-info <file>                Show wallet file info (encrypted?, format)
+  wallet-info <file>                Show wallet file info
+  generate-key                      Generate new private key
+  validate-key <key>                Validate a private key
+  hex-to-wif <hex>                  Convert hex to WIF
+  derive-pubkey <key>               Derive public key
+  derive-address <key> [index]      Derive L1 address
+  to-smallest <amount> <coin>       Convert to smallest unit
+  to-human <amount> <coin>          Convert to human-readable
+  format <amount> [decimals]        Format amount
+  base58-encode <hex>               Base58 encode
+  base58-decode <b58>               Base58 decode
 
-KEY OPERATIONS:
-  generate-key                      Generate random private key
-  validate-key <hex>                Validate secp256k1 private key
-  hex-to-wif <hex>                  Convert hex to WIF format
-  derive-pubkey <hex>               Derive public key from private
-  derive-address <hex> [index]      Derive address at index (default: 0)
-
-CURRENCY:
-  to-smallest <amount>              Convert to smallest unit (satoshi)
-  to-human <amount>                 Convert from smallest to human readable
-  format <amount> [decimals]        Format amount with decimals
-
-ENCODING:
-  base58-encode <hex>               Encode hex to base58
-  base58-decode <string>            Decode base58 to hex
+Run "npm run cli -- help <command>" for detailed help on any command.
 
 Examples:
   npm run cli -- init --network testnet
   npm run cli -- init --mnemonic "word1 word2 ... word24"
   npm run cli -- status
   npm run cli -- balance
-  npm run cli -- send @alice 1000000 --coin ETH
+  npm run cli -- send @alice 1000000 ETH
   npm run cli -- nametag myname
   npm run cli -- history 10
-
-Wallet Profile Examples:
-  npm run cli -- wallet create alice              Create profile "alice"
-  npm run cli -- init --nametag alice             Initialize wallet in profile
-  npm run cli -- wallet create bob                Create another profile
-  npm run cli -- init --nametag bob               Initialize second wallet
-  npm run cli -- wallet list                      List all profiles
-  npm run cli -- wallet use alice                 Switch to alice
-  npm run cli -- send @bob 0.1 --coin BTC         Send from alice to bob
-  npm run cli -- wallet use bob                   Switch to bob
-  npm run cli -- balance                          Check bob's balance
-
-Messaging Examples:
-  npm run cli -- dm @alice "Hello, how are you?"
-  npm run cli -- dm-inbox
-  npm run cli -- dm-history @alice --limit 20
-
-Group Chat Examples:
-  npm run cli -- group-list
-  npm run cli -- group-create "Trading Chat" --description "Discuss trades"
-  npm run cli -- group-join <groupId>
-  npm run cli -- group-send <groupId> "Hello everyone!"
-  npm run cli -- group-messages <groupId> --limit 20
-  npm run cli -- group-members <groupId>
-  npm run cli -- group-leave <groupId>
-
-Market Examples:
-  npm run cli -- market-post "Buying 100 UCT" --type buy             Post buy intent
-  npm run cli -- market-post "Selling ETH" --type sell --price 50 --currency USD   Post sell intent
-  npm run cli -- market-post "Web dev services" --type service       Post service intent
-  npm run cli -- market-post "New feature release" --type announcement   Post announcement
-  npm run cli -- market-search "UCT tokens" --type sell --limit 5    Search intents
-  npm run cli -- market-search "tokens" --min-score 0.7              Search with score threshold
-  npm run cli -- market-my                                           List own intents
-  npm run cli -- market-close <id>                                   Close an intent
-  npm run cli -- market-feed                                         Watch live feed
-  npm run cli -- market-feed --rest                                  Fetch recent (REST fallback)
-
-Daemon Examples:
-  npm run cli -- daemon start --event transfer:incoming --action auto-receive
-  npm run cli -- daemon start --event "transfer:*" --action "webhook:https://example.com/hook" --detach
-  npm run cli -- daemon start --event "*" --action "log:./events.jsonl" --verbose
-  npm run cli -- daemon start --event message:dm --action "bash:echo DM from \\$SPHERE_SENDER"
-  npm run cli -- daemon start --config ./my-daemon.json --detach
-  npm run cli -- daemon status
-  npm run cli -- daemon stop
+  npm run cli -- help send
 `);
 }
 
@@ -443,8 +1492,28 @@ async function main() {
   // Global flag: --no-nostr disables Nostr transport (uses no-op)
   noNostrGlobal = args.includes('--no-nostr');
 
-  if (!command || command === 'help' || command === '--help' || command === '-h') {
+  if (!command || command === '--help' || command === '-h') {
     printUsage();
+    process.exit(0);
+  }
+
+  if (command === 'help') {
+    const helpTarget = args[1];
+    if (!helpTarget || helpTarget === '--help' || helpTarget === '-h' || helpTarget === 'help') {
+      printUsage();
+      process.exit(0);
+    }
+    // Try compound key first (e.g., "wallet create", "daemon start")
+    const compoundKey = args[2] ? `${helpTarget} ${args[2]}` : undefined;
+    if (compoundKey && COMMAND_HELP[compoundKey]) {
+      printCommandHelp(compoundKey);
+    } else if (COMMAND_HELP[helpTarget]) {
+      printCommandHelp(helpTarget);
+    } else {
+      console.error(`No help available for command: ${helpTarget}`);
+      console.error('Run "npm run cli -- help" for a list of all commands.');
+      process.exit(1);
+    }
     process.exit(0);
   }
 
@@ -462,8 +1531,18 @@ async function main() {
         if (networkIndex !== -1 && args[networkIndex + 1]) {
           network = args[networkIndex + 1] as NetworkType;
         }
-        if (mnemonicIndex !== -1 && args[mnemonicIndex + 1]) {
-          mnemonic = args[mnemonicIndex + 1];
+        if (mnemonicIndex !== -1) {
+          if (args[mnemonicIndex + 1] && !args[mnemonicIndex + 1].startsWith('--')) {
+            mnemonic = args[mnemonicIndex + 1];
+            // Clear from argv to reduce exposure in /proc/<pid>/cmdline
+            args[mnemonicIndex + 1] = '***';
+          } else {
+            // Interactive prompt — mnemonic never appears in process args
+            const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+            mnemonic = await new Promise<string>((resolve) => {
+              rl.question('Enter mnemonic phrase: ', (answer) => { rl.close(); resolve(answer.trim()); });
+            });
+          }
         }
 
         const nametagIndex = args.indexOf('--nametag');
@@ -572,6 +1651,17 @@ async function main() {
       }
 
       case 'clear': {
+        if (!flags['yes'] && !flags['y']) {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+          const answer = await new Promise<string>((resolve) => {
+            rl.question('This will permanently delete ALL wallet data (keys, tokens, history). Type "yes" to confirm: ', (a) => { rl.close(); resolve(a.trim()); });
+          });
+          if (answer !== 'yes') {
+            console.log('Aborted.');
+            break;
+          }
+        }
+
         const config = loadConfig();
         const providers = createNodeProviders({
           network: config.network,
@@ -652,6 +1742,10 @@ async function main() {
             if (!profileName) {
               console.error('Usage: wallet create <name> [--network testnet|mainnet|dev]');
               console.error('Example: npm run cli -- wallet create mywalletname');
+              process.exit(1);
+            }
+            if (!/^[a-zA-Z0-9_-]+$/.test(profileName)) {
+              console.error('Profile name must contain only letters, digits, hyphens, and underscores.');
               process.exit(1);
             }
 
@@ -775,7 +1869,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await syncIfEnabled(sphere, noSync);
+        if (!noSync) await ensureSync(sphere, 'full');
 
         console.log(finalize ? '\nFetching and finalizing tokens...' : '\nFetching tokens...');
         const result = await sphere.payments.receive({
@@ -842,7 +1936,7 @@ async function main() {
         const noSync = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        await syncIfEnabled(sphere, noSync);
+        if (!noSync) await ensureSync(sphere, 'full');
 
         const tokens = sphere.payments.getTokens();
         const registry = TokenRegistry.getInstance();
@@ -863,6 +1957,104 @@ async function main() {
             console.log(`  Amount: ${formatted} ${symbol}`);
             console.log(`  Status: ${token.status || 'active'}`);
             console.log('');
+          }
+        }
+        console.log('─'.repeat(50));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'assets': {
+        // Initialize Sphere so TokenRegistry is loaded with remote data
+        const sphere = await getSphere();
+        const registry = TokenRegistry.getInstance();
+        const allDefs = registry.getAllDefinitions();
+
+        const typeFilter = args.indexOf('--type');
+        const filterValue = typeFilter !== -1 ? args[typeFilter + 1] : undefined;
+
+        let defs = allDefs;
+        if (filterValue === 'fungible' || filterValue === 'coin' || filterValue === 'coins') {
+          defs = registry.getFungibleTokens();
+        } else if (filterValue === 'nft' || filterValue === 'nfts' || filterValue === 'non-fungible') {
+          defs = registry.getNonFungibleTokens();
+        }
+
+        if (defs.length === 0) {
+          console.log('No registered assets found.');
+          console.log('The token registry may not have loaded yet. Try again in a moment.');
+        } else {
+          // Table header
+          console.log('');
+          console.log(`${'SYMBOL'.padEnd(10)} ${'NAME'.padEnd(20)} ${'KIND'.padEnd(14)} ${'DECIMALS'.padEnd(10)} ${'COIN ID'}`);
+          console.log('─'.repeat(90));
+
+          // Sort: fungible first (by symbol), then NFTs (by name)
+          const sorted = [...defs].sort((a, b) => {
+            if (a.assetKind !== b.assetKind) return a.assetKind === 'fungible' ? -1 : 1;
+            const aLabel = a.symbol || a.name || a.id;
+            const bLabel = b.symbol || b.name || b.id;
+            return aLabel.localeCompare(bLabel);
+          });
+
+          for (const def of sorted) {
+            const symbol = (def.symbol || '—').padEnd(10);
+            const name = (def.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : '—').padEnd(20);
+            const kind = def.assetKind.padEnd(14);
+            const decimals = (def.decimals !== undefined ? String(def.decimals) : '—').padEnd(10);
+            const coinId = def.id.slice(0, 16) + '...';
+            console.log(`${symbol} ${name} ${kind} ${decimals} ${coinId}`);
+          }
+
+          console.log('─'.repeat(90));
+          console.log(`Total: ${defs.length} asset(s)`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'asset-info': {
+        const identifier = args[1];
+        if (!identifier) {
+          console.error('Usage: asset-info <symbol|name|coinId>');
+          console.error('Examples:');
+          console.error('  npm run cli -- asset-info UCT');
+          console.error('  npm run cli -- asset-info bitcoin');
+          console.error('  npm run cli -- asset-info 0a1b2c3d...');
+          process.exit(1);
+        }
+
+        // Initialize Sphere so TokenRegistry is loaded
+        const sphere = await getSphere();
+        const registry = TokenRegistry.getInstance();
+
+        // Try multiple lookup strategies
+        let def = registry.getDefinitionBySymbol(identifier);
+        if (!def) def = registry.getDefinitionByName(identifier);
+        if (!def) def = registry.getDefinition(identifier); // by coinId hex
+
+        if (!def) {
+          console.error(`Asset not found: "${identifier}"`);
+          console.error('Use "assets" command to list all registered assets.');
+          process.exit(1);
+        }
+
+        console.log('');
+        console.log('Asset Details');
+        console.log('─'.repeat(50));
+        console.log(`  Symbol:      ${def.symbol || '—'}`);
+        console.log(`  Name:        ${def.name ? def.name.charAt(0).toUpperCase() + def.name.slice(1) : '—'}`);
+        console.log(`  Kind:        ${def.assetKind}`);
+        console.log(`  Decimals:    ${def.decimals !== undefined ? def.decimals : '—'}`);
+        console.log(`  Coin ID:     ${def.id}`);
+        console.log(`  Network:     ${def.network}`);
+        console.log(`  Description: ${def.description || '—'}`);
+        if (def.icons && def.icons.length > 0) {
+          console.log(`  Icons:`);
+          for (const icon of def.icons) {
+            console.log(`    - ${icon.url}`);
           }
         }
         console.log('─'.repeat(50));
@@ -898,6 +2090,7 @@ async function main() {
         const verbose = args.includes('--verbose') || args.includes('-v');
 
         const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
         const tokens = sphere.payments.getTokens();
         const identity = sphere.identity;
 
@@ -1026,7 +2219,7 @@ async function main() {
 
       case 'sync': {
         const sphere = await getSphere();
-        await syncIfEnabled(sphere, false);
+        await ensureSync(sphere, 'full');
         await closeSphere();
         break;
       }
@@ -1035,10 +2228,10 @@ async function main() {
       case 'send': {
         const [, recipient, amountStr] = args;
         if (!recipient || !amountStr) {
-          console.error('Usage: send <recipient> <amount> [--coin <symbol>] [--direct|--proxy] [--instant|--conservative]');
+          console.error('Usage: send <recipient> <amount> <coin> [--direct|--proxy] [--instant|--conservative]');
           console.error('  recipient: @nametag or DIRECT:// address');
           console.error('  amount: decimal amount (e.g., 0.5, 100)');
-          console.error('  --coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
+          console.error('  coin: token symbol (e.g., UCT, BTC, ETH, SOL) - default: UCT');
           console.error('  --direct: force DirectAddress transfer (requires new nametag with directAddress)');
           console.error('  --proxy: force PROXY address transfer (works with any nametag)');
           console.error('  --instant: send via Nostr immediately (default, receiver gets unconfirmed token)');
@@ -1046,9 +2239,13 @@ async function main() {
           process.exit(1);
         }
 
-        // Parse --coin option (symbol like UCT, BTC, ETH)
-        const coinIndex = args.indexOf('--coin');
-        const coinSymbol = coinIndex !== -1 && args[coinIndex + 1] ? args[coinIndex + 1] : 'UCT';
+        // Parse coin: positional arg[3]
+        let coinSymbol: string;
+        if (args[3] && !args[3].startsWith('--')) {
+          coinSymbol = args[3];
+        } else {
+          coinSymbol = 'UCT'; // default
+        }
 
         // Parse --direct and --proxy options
         const forceDirect = args.includes('--direct');
@@ -1069,25 +2266,21 @@ async function main() {
         const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
 
         // Initialize Sphere first so TokenRegistry is loaded
+        const noSyncSend = args.includes('--no-sync');
         const sphere = await getSphere();
 
-        // Resolve symbol to coinId hex and get decimals
-        const registry = TokenRegistry.getInstance();
-        const coinDef = registry.getDefinitionBySymbol(coinSymbol);
-        if (!coinDef) {
-          console.error(`Unknown coin symbol: ${coinSymbol}`);
-          console.error('Available symbols: UCT, BTC, ETH, SOL, USDT, USDC, USDU, EURU, ALPHT');
-          process.exit(1);
-        }
-        const coinIdHex = coinDef.id;
-        const decimals = coinDef.decimals ?? 8;
+        // Sync token inventory (need latest state for spending)
+        if (!noSyncSend) await ensureSync(sphere, 'full');
+
+        // Resolve symbol/name/hex to coinId and get decimals
+        const { coinId: coinIdHex, symbol: resolvedSymbol, decimals } = resolveCoin(coinSymbol);
 
         // Convert amount to smallest units (supports decimal input like "0.2")
         const amountSmallest = toSmallestUnit(amountStr, decimals).toString();
 
         const modeLabel = addressMode === 'auto' ? '' : ` (${addressMode})`;
         const txModeLabel = forceConservative ? ' [conservative]' : '';
-        console.log(`\nSending ${amountStr} ${coinSymbol} to ${recipient}${modeLabel}${txModeLabel}...`);
+        console.log(`\nSending ${amountStr} ${resolvedSymbol} to ${recipient}${modeLabel}${txModeLabel}...`);
 
         const result = await sphere.payments.send({
           recipient,
@@ -1107,8 +2300,7 @@ async function main() {
 
         // Wait for background tasks (e.g., change token creation from instant split)
         await sphere.payments.waitForPendingOperations();
-        const noSyncSend = args.includes('--no-sync');
-        await syncIfEnabled(sphere, noSyncSend);
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
@@ -1117,6 +2309,10 @@ async function main() {
         const finalize = args.includes('--finalize');
         const noSyncRecv = args.includes('--no-sync');
         const sphere = await getSphere();
+
+        // Sync from Nostr to get incoming transfers
+        if (!noSyncRecv) await ensureSync(sphere, 'nostr');
+
         const identity = sphere.identity;
 
         if (!identity) {
@@ -1168,16 +2364,18 @@ async function main() {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
         }
 
-        await syncIfEnabled(sphere, noSyncRecv);
+        await syncAfterWrite(sphere);
         await closeSphere();
         break;
       }
 
       case 'history': {
-        const [, limitStr = '10'] = args;
+        const limitStr = (args[1] && !args[1].startsWith('--')) ? args[1] : '10';
         const limit = parseInt(limitStr);
+        const noSync = args.includes('--no-sync');
 
         const sphere = await getSphere();
+        if (!noSync) await ensureSync(sphere, 'full');
         const history = sphere.payments.getHistory();
         const limited = history.slice(0, limit);
 
@@ -1503,12 +2701,18 @@ async function main() {
         const wif = hexToWIF(privateKey);
         const addressInfo = generateAddressFromMasterKey(privateKey, 0);
 
-        console.log(JSON.stringify({
-          privateKey,
-          publicKey,
-          wif,
-          address: addressInfo.address,
-        }, null, 2));
+        if (flags['unsafe-print']) {
+          console.log(JSON.stringify({
+            privateKey,
+            publicKey,
+            wif,
+            address: addressInfo.address,
+          }, null, 2));
+        } else {
+          console.log(`Public Key: ${publicKey}`);
+          console.log(`Address: ${addressInfo.address}`);
+          console.log('(private key and WIF hidden — use --unsafe-print to display)');
+        }
         break;
       }
 
@@ -1561,20 +2765,34 @@ async function main() {
       case 'to-smallest': {
         const [, amount] = args;
         if (!amount) {
-          console.error('Usage: to-smallest <amount>');
+          console.error('Usage: to-smallest <amount> <coin>');
           process.exit(1);
         }
-        console.log(toSmallestUnit(amount));
+        const coinArgSmallest: string | undefined = (args[2] && !args[2].startsWith('--')) ? args[2] : undefined;
+        let decimalsSmallest = 8;
+        if (coinArgSmallest) {
+          await getSphere();
+          decimalsSmallest = resolveCoin(coinArgSmallest).decimals;
+          await closeSphere();
+        }
+        console.log(toSmallestUnit(amount, decimalsSmallest));
         break;
       }
 
       case 'to-human': {
         const [, amount] = args;
         if (!amount) {
-          console.error('Usage: to-human <amount>');
+          console.error('Usage: to-human <amount> <coin>');
           process.exit(1);
         }
-        console.log(toHumanReadable(amount));
+        const coinArgHuman: string | undefined = (args[2] && !args[2].startsWith('--')) ? args[2] : undefined;
+        let decimalsHuman = 8;
+        if (coinArgHuman) {
+          await getSphere();
+          decimalsHuman = resolveCoin(coinArgHuman).decimals;
+          await closeSphere();
+        }
+        console.log(toHumanReadable(amount, decimalsHuman));
         break;
       }
 
@@ -1623,13 +2841,13 @@ async function main() {
           process.exit(1);
         }
 
-        // Parse options
-        const coinArg = args[1];  // Optional: specific coin
-        const amountArg = args[2]; // Optional: specific amount
+        // Parse options: topup [<amount> <coin>]
+        const amountArg: string | undefined = args[1];
+        const coinArg: string | undefined = args[2];
 
         const FAUCET_URL = 'https://faucet.unicity.network/api/v1/faucet/request';
 
-        // Default amounts for all coins
+        // Default amounts in whole coins (the faucet API converts to smallest units internally).
         const DEFAULT_COINS: Record<string, number> = {
           'unicity': 100,
           'bitcoin': 1,
@@ -1663,10 +2881,11 @@ async function main() {
         }
 
         if (coinArg) {
-          // Request specific coin
-          const coin = coinArg.toLowerCase();
+          // Request specific coin — accept symbols (UCT, BTC) as well as faucet names (unicity, bitcoin)
+          const coin = FAUCET_COIN_MAP[coinArg.toUpperCase()] || coinArg.toLowerCase();
           const amount = amountArg ? parseFloat(amountArg) : (DEFAULT_COINS[coin] || 1);
 
+          // The faucet API converts whole-coin amounts to smallest units internally.
           console.log(`Requesting ${amount} ${coin} from faucet for @${nametag}...`);
           const result = await requestFaucet(coin, amount);
 
@@ -1725,6 +2944,7 @@ async function main() {
 
       case 'dm-inbox': {
         const sphere = await getSphere();
+        await ensureSync(sphere, 'nostr');
         const conversations = sphere.communications.getConversations();
         const totalUnread = sphere.communications.getUnreadCount();
 
@@ -1769,6 +2989,7 @@ async function main() {
         const limit = limitIndex !== -1 && args[limitIndex + 1] ? parseInt(args[limitIndex + 1]) : 50;
 
         const sphere = await getSphere();
+        await ensureSync(sphere, 'nostr');
 
         // Resolve @nametag to pubkey if needed
         let peerPubkey = peer;
@@ -2371,6 +3592,1140 @@ async function main() {
         break;
       }
 
+      // =================================================================
+      // INVOICE MANAGEMENT (AccountingModule)
+      // =================================================================
+
+      case 'invoice-create': {
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled. Initialize with accounting support.');
+          process.exit(1);
+        }
+
+        // Parse options
+        const targetIdx = args.indexOf('--target');
+        const assetIdx = args.indexOf('--asset');
+        const nftIdx = args.indexOf('--nft');
+        const dueIdx = args.indexOf('--due');
+        const memoIdx = args.indexOf('--memo');
+        const deliveryIdx = args.indexOf('--delivery');
+        const termsIdx = args.indexOf('--terms');
+
+        if (termsIdx !== -1 && args[termsIdx + 1]) {
+          // Load terms from JSON file
+          const termsFile = args[termsIdx + 1];
+          let termsJson: unknown;
+          try {
+            const resolvedPath = path.resolve(termsFile);
+            const raw = fs.readFileSync(resolvedPath, 'utf8');
+            termsJson = JSON.parse(raw);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // Sanitize: only show whether it was a file read or JSON parse error
+            if (msg.includes('ENOENT')) {
+              console.error(`File not found: "${termsFile}"`);
+            } else if (msg.includes('EACCES') || msg.includes('EPERM')) {
+              console.error(`Access denied: "${termsFile}"`);
+            } else if (msg.includes('Unexpected token') || msg.includes('JSON')) {
+              console.error(`Invalid JSON in terms file "${termsFile}"`);
+            } else {
+              console.error(`Failed to read terms file "${termsFile}"`);
+            }
+            process.exit(1);
+          }
+          let result;
+          try {
+            result = await sphere.accounting.createInvoice(termsJson as import('../modules/accounting/types').CreateInvoiceRequest);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`Failed to create invoice from terms file: ${msg}`);
+            process.exit(1);
+          }
+          console.log('Invoice created:');
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          // Build from individual options
+          if (targetIdx === -1 || !args[targetIdx + 1]) {
+            console.error('Usage: invoice-create --target <address> --asset "<amount> <coin>" [--nft <id>] [--due <ISO-date>] [--memo <text>] [--delivery <method>] [--terms <json-file>]');
+            process.exit(1);
+          }
+          const targetAddress = args[targetIdx + 1];
+          const nftId = nftIdx !== -1 ? args[nftIdx + 1] : undefined;
+          const dueDate = dueIdx !== -1 ? new Date(args[dueIdx + 1]).getTime() : undefined;
+          if (dueDate !== undefined && isNaN(dueDate)) {
+            console.error('Invalid due date format. Use ISO-8601, e.g. 2026-12-31');
+            process.exit(1);
+          }
+          const memo = memoIdx !== -1 ? args[memoIdx + 1] : undefined;
+          const delivery = deliveryIdx !== -1 ? args[deliveryIdx + 1] : undefined;
+
+          const assets: import('../modules/accounting/types').InvoiceRequestedAsset[] = [];
+          if (assetIdx !== -1 && args[assetIdx + 1]) {
+            const parsed = parseAssetArg(args[assetIdx + 1]);
+            if (!/^[1-9][0-9]*$/.test(parsed.amount)) {
+              console.error(`Invalid amount "${parsed.amount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+              process.exit(1);
+            }
+            const { coinId: resolvedCoinId } = resolveCoin(parsed.coin);
+            assets.push({ coin: [resolvedCoinId, parsed.amount] });
+          } else if (nftId) {
+            assets.push({ nft: { tokenId: nftId } });
+          }
+
+          const request: import('../modules/accounting/types').CreateInvoiceRequest = {
+            targets: [{ address: targetAddress, assets }],
+            dueDate,
+            memo,
+            deliveryMethods: delivery ? [delivery] : undefined,
+          };
+          const result = await sphere.accounting.createInvoice(request);
+          console.log('Invoice created:');
+          console.log(JSON.stringify(result, null, 2));
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-import': {
+        const tokenFile = args[1];
+        if (!tokenFile) {
+          console.error('Usage: invoice-import <token-file>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        let tokenJson: unknown;
+        try {
+          tokenJson = JSON.parse(fs.readFileSync(path.resolve(tokenFile), 'utf8'));
+        } catch (err: unknown) {
+          // W23-R2 fix: Sanitize error messages to avoid leaking file system paths
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'ENOENT') {
+            console.error(`Token file not found: "${tokenFile}"`);
+          } else if (code === 'EACCES') {
+            console.error(`Permission denied reading: "${tokenFile}"`);
+          } else if (err instanceof SyntaxError) {
+            console.error(`Invalid JSON in token file: "${tokenFile}"`);
+          } else {
+            console.error(`Failed to read token file: "${tokenFile}"`);
+          }
+          process.exit(1);
+        }
+
+        let terms;
+        try {
+          terms = await sphere.accounting.importInvoice(tokenJson as import('../types/txf').TxfToken);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`Failed to import invoice: ${msg}`);
+          process.exit(1);
+        }
+        console.log('Invoice imported:');
+        console.log(JSON.stringify(terms, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-list': {
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const stateIdx = args.indexOf('--state');
+        const limitIdx2 = args.indexOf('--limit');
+        const createdByMe = args.includes('--role') && args[args.indexOf('--role') + 1] === 'creator';
+        const targetingMe = args.includes('--role') && args[args.indexOf('--role') + 1] === 'payer';
+        const stateFilter = stateIdx !== -1 ? args[stateIdx + 1] : undefined;
+
+        const validStates = new Set(['OPEN', 'PARTIAL', 'COVERED', 'CLOSED', 'CANCELLED', 'EXPIRED']);
+        const options: import('../modules/accounting/types').GetInvoicesOptions = {};
+        if (createdByMe) options.createdByMe = true;
+        if (targetingMe) options.targetingMe = true;
+        if (stateFilter) {
+          const stateValues = stateFilter.split(',').map(s => s.trim());
+          const invalid = stateValues.filter(s => !validStates.has(s));
+          if (invalid.length > 0) {
+            console.error(`Invalid state(s): ${invalid.join(', ')}. Valid: ${[...validStates].join(', ')}`);
+            process.exit(1);
+          }
+          options.state = stateValues.length === 1 ? stateValues[0] as any : stateValues as any;
+        }
+        if (limitIdx2 !== -1 && args[limitIdx2 + 1]) {
+          const limit = parseInt(args[limitIdx2 + 1], 10);
+          if (!Number.isNaN(limit) && limit > 0) {
+            options.limit = limit;
+          }
+        }
+
+        const invoices = await sphere.accounting.getInvoices(options);
+
+        if (invoices.length === 0) {
+          console.log('No invoices found.');
+        } else {
+          console.log(`Invoices (${invoices.length}):`);
+          console.log('─'.repeat(60));
+          for (const inv of invoices) {
+            console.log(`ID:        ${inv.invoiceId}`);
+            console.log(`Creator:   ${inv.isCreator ? 'yes' : 'no'}`);
+            console.log(`Cancelled: ${inv.cancelled}`);
+            console.log(`Closed:    ${inv.closed}`);
+            if (inv.terms.dueDate) console.log(`Due:       ${new Date(inv.terms.dueDate).toISOString()}`);
+            if (inv.terms.memo) console.log(`Memo:      ${inv.terms.memo}`);
+            console.log('─'.repeat(60));
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-status': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-status <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        // Resolve ID from prefix
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices. Use more characters.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const status = await sphere.accounting.getInvoiceStatus(invoiceId);
+        console.log('Invoice Status:');
+        console.log(JSON.stringify(status, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-close': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-close <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const autoReturn = args.includes('--auto-return');
+        await sphere.accounting.closeInvoice(invoiceId, autoReturn ? { autoReturn: true } : undefined);
+        console.log(`Invoice ${invoiceId} closed.${autoReturn ? ' Auto-return triggered.' : ''}`);
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-cancel': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-cancel <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        await sphere.accounting.cancelInvoice(invoiceId);
+        console.log(`Invoice ${invoiceId} cancelled.`);
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-pay': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-pay <id-or-prefix> [--amount <value>] [--target-index <n>]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const amountIdx2 = args.indexOf('--amount');
+        const targetIndexIdx = args.indexOf('--target-index');
+
+        const rawTargetIdx = targetIndexIdx !== -1 ? args[targetIndexIdx + 1] : undefined;
+        const targetIndex = rawTargetIdx !== undefined ? parseInt(rawTargetIdx, 10) : 0;
+        if (isNaN(targetIndex) || targetIndex < 0) {
+          console.error('--target-index must be a non-negative integer');
+          process.exit(1);
+        }
+
+        const payParams: import('../modules/accounting/types').PayInvoiceParams = {
+          targetIndex,
+        };
+        if (amountIdx2 !== -1 && args[amountIdx2 + 1]) {
+          const rawAmount = args[amountIdx2 + 1];
+          if (!/^[1-9][0-9]*$/.test(rawAmount)) {
+            console.error(`Invalid amount "${rawAmount}" — must be a positive integer in smallest units (no decimals, no leading zeros)`);
+            process.exit(1);
+          }
+          payParams.amount = rawAmount;
+        }
+
+        const result = await sphere.accounting.payInvoice(invoiceId, payParams);
+        console.log('Payment result:');
+        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-return': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-return <id-or-prefix> --recipient <address> --asset "<amount> <coin>"');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const recipientIdx = args.indexOf('--recipient');
+        const assetIdx3 = args.indexOf('--asset');
+
+        if (recipientIdx === -1 || !args[recipientIdx + 1]) {
+          console.error('--recipient <address> is required for invoice-return');
+          process.exit(1);
+        }
+
+        let returnAmount: string;
+        let returnCoinId: string;
+
+        if (assetIdx3 !== -1 && args[assetIdx3 + 1]) {
+          const parsed = parseAssetArg(args[assetIdx3 + 1]);
+          returnAmount = parsed.amount;
+          returnCoinId = resolveCoin(parsed.coin).coinId;
+        } else {
+          console.error('--asset "<amount> <coin>" is required for invoice-return');
+          process.exit(1);
+        }
+
+        if (!/^[1-9][0-9]*$/.test(returnAmount)) {
+          console.error(`Invalid amount "${returnAmount}" — must be a positive integer string (smallest unit, no leading zeros, e.g. 1000000)`);
+          process.exit(1);
+        }
+
+        const returnParams: import('../modules/accounting/types').ReturnPaymentParams = {
+          recipient: args[recipientIdx + 1],
+          amount: returnAmount,
+          coinId: returnCoinId,
+        };
+
+        const result = await sphere.accounting.returnInvoicePayment(invoiceId, returnParams);
+        console.log('Return payment result:');
+        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-receipts': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-receipts <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const result = await sphere.accounting.sendInvoiceReceipts(invoiceId);
+        console.log('Receipts result:');
+        console.log(JSON.stringify(result, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-notices': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-notices <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const result = await sphere.accounting.sendCancellationNotices(invoiceId);
+        console.log('Cancellation notices result:');
+        console.log(JSON.stringify(result, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-auto-return': {
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const enableFlag = args.includes('--enable');
+        const disableFlag = args.includes('--disable');
+        const invoiceIdx = args.indexOf('--invoice');
+        // W7-R17 fix: Validate --invoice has a following argument
+        if (invoiceIdx !== -1 && !args[invoiceIdx + 1]) {
+          console.error('--invoice requires an invoice ID');
+          process.exit(1);
+        }
+        const specificInvoice = invoiceIdx !== -1 ? args[invoiceIdx + 1] : undefined;
+
+        if (!enableFlag && !disableFlag) {
+          // Show current settings
+          const settings = sphere.accounting.getAutoReturnSettings();
+          console.log('Auto-return settings:');
+          console.log(JSON.stringify(settings, null, 2));
+        } else if (enableFlag && disableFlag) {
+          console.error('Cannot use both --enable and --disable');
+          process.exit(1);
+        } else {
+          const enabled = enableFlag;
+          const invoiceId = specificInvoice ?? '*';
+          await sphere.accounting.setAutoReturn(invoiceId, enabled);
+          const scope = invoiceId === '*' ? 'globally' : `for invoice ${invoiceId}`;
+          console.log(`Auto-return ${enabled ? 'enabled' : 'disabled'} ${scope}.`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-transfers': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-transfers <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        const transfers = sphere.accounting.getRelatedTransfers(invoiceId);
+        if (transfers.length === 0) {
+          console.log('No related transfers found.');
+        } else {
+          console.log(`Related transfers (${transfers.length}):`);
+          console.log(JSON.stringify(transfers, null, 2));
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-export': {
+        const idOrPrefix = args[1];
+        if (!idOrPrefix) {
+          console.error('Usage: invoice-export <id-or-prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const allInvoices = await sphere.accounting.getInvoices();
+        const matched = allInvoices.filter(inv => inv.invoiceId.startsWith(idOrPrefix));
+        if (matched.length === 0) {
+          console.error(`No invoice found matching prefix: ${idOrPrefix}`);
+          process.exit(1);
+        }
+        if (matched.length > 1) {
+          console.error(`Ambiguous prefix "${idOrPrefix}" matches ${matched.length} invoices.`);
+          process.exit(1);
+        }
+        const invoiceId = matched[0].invoiceId;
+
+        // Get the invoice ref via getInvoice
+        const invoiceRef = sphere.accounting.getInvoice(invoiceId);
+        if (!invoiceRef) {
+          console.error(`Invoice ${invoiceId} not found in memory.`);
+          process.exit(1);
+        }
+
+        const outFile = `invoice-${invoiceId.slice(0, 8)}.json`;
+        fs.writeFileSync(outFile, JSON.stringify(invoiceRef, null, 2));
+        console.log(`Invoice exported to: ${outFile}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'invoice-parse-memo': {
+        const memoStr = args[1];
+        if (!memoStr) {
+          console.error('Usage: invoice-parse-memo <memo-string>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        if (!sphere.accounting) {
+          console.error('Accounting module not enabled.');
+          process.exit(1);
+        }
+
+        const parsed = sphere.accounting.parseInvoiceMemo(memoStr);
+        if (!parsed) {
+          console.log('Not a valid invoice memo.');
+        } else {
+          console.log('Parsed invoice memo:');
+          console.log(JSON.stringify(parsed, null, 2));
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      // =====================================================================
+      // Swap Commands
+      // =====================================================================
+
+      case 'swap-propose': {
+        const toIdx = args.indexOf('--to');
+        const escrowIdx = args.indexOf('--escrow');
+        const timeoutIdx = args.indexOf('--timeout');
+        const messageIdx = args.indexOf('--message');
+
+        // Combined format: --offer "<amount> <coin>" --want "<amount> <coin>"
+        const offerIdx = args.indexOf('--offer');
+        const wantIdx = args.indexOf('--want');
+
+        if (toIdx === -1 || !args[toIdx + 1] ||
+            offerIdx === -1 || !args[offerIdx + 1] || args[offerIdx + 1].startsWith('--') ||
+            wantIdx === -1 || !args[wantIdx + 1] || args[wantIdx + 1].startsWith('--')) {
+          console.error('Usage: swap-propose --to <recipient> --offer "<amount> <coin>" --want "<amount> <coin>" [--escrow <address>] [--timeout <seconds>] [--message <text>]');
+          process.exit(1);
+        }
+
+        const offer = parseAssetArg(args[offerIdx + 1]);
+        const want = parseAssetArg(args[wantIdx + 1]);
+
+        let timeout = 3600;
+        if (timeoutIdx !== -1 && args[timeoutIdx + 1]) {
+          timeout = parseInt(args[timeoutIdx + 1], 10);
+          if (isNaN(timeout) || timeout < 60 || timeout > 86400) {
+            console.error('--timeout must be an integer between 60 and 86400 seconds');
+            process.exit(1);
+          }
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled. Initialize with swap support.');
+          process.exit(1);
+        }
+
+        // Resolve coin symbols and convert human-readable amounts to smallest units
+        // (e.g., "10 BTC" → 10 * 10^8 = 1000000000 smallest units)
+        const offerCoin = resolveCoin(offer.coin);
+        const wantCoin = resolveCoin(want.coin);
+        const offerSmallest = toSmallestUnit(offer.amount, offerCoin.decimals);
+        const wantSmallest = toSmallestUnit(want.amount, wantCoin.decimals);
+        if (offerSmallest <= 0n) {
+          console.error(`Invalid offer amount "${offer.amount}" — must be a positive number`);
+          process.exit(1);
+        }
+        if (wantSmallest <= 0n) {
+          console.error(`Invalid want amount "${want.amount}" — must be a positive number`);
+          process.exit(1);
+        }
+
+        const escrow = escrowIdx !== -1 ? args[escrowIdx + 1] : undefined;
+        const message = messageIdx !== -1 ? args[messageIdx + 1] : undefined;
+
+        const deal = {
+          partyA: sphere.identity!.directAddress!,
+          partyB: args[toIdx + 1],
+          partyACurrency: offerCoin.symbol,
+          partyAAmount: offerSmallest.toString(),
+          partyBCurrency: wantCoin.symbol,
+          partyBAmount: wantSmallest.toString(),
+          timeout: timeout,
+          escrowAddress: escrow,
+        };
+
+        const result = await swapModule.proposeSwap(deal, message ? { message } : undefined);
+        console.log('Swap proposed:');
+        console.log(JSON.stringify({
+          swap_id: result.swapId,
+          counterparty: args[toIdx + 1],
+          offer: `${offer.amount} ${offerCoin.symbol}`,
+          want: `${want.amount} ${wantCoin.symbol}`,
+          escrow: deal.escrowAddress ?? '(config default)',
+          timeout: timeout,
+          status: result.swap?.progress ?? 'proposed',
+        }, null, 2));
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-list': {
+        const allFlag = args.includes('--all');
+        const roleIdx = args.indexOf('--role');
+        const progressIdx = args.indexOf('--progress');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const filter: any = {};
+        if (roleIdx !== -1 && args[roleIdx + 1]) {
+          const role = args[roleIdx + 1];
+          if (role !== 'proposer' && role !== 'acceptor') {
+            console.error('--role must be "proposer" or "acceptor"');
+            process.exit(1);
+          }
+          filter.role = role;
+        }
+        if (progressIdx !== -1 && args[progressIdx + 1]) {
+          filter.progress = args[progressIdx + 1];
+        }
+        if (!allFlag && !filter.progress) {
+          filter.excludeTerminal = true;
+        }
+
+        const swaps = await swapModule.getSwaps(filter);
+        if (!swaps || swaps.length === 0) {
+          console.log('No swaps found.');
+        } else {
+          const isTTY = process.stdout.isTTY;
+          const green = isTTY ? '\x1b[32m' : '';
+          const red = isTTY ? '\x1b[31m' : '';
+          const yellow = isTTY ? '\x1b[33m' : '';
+          const reset = isTTY ? '\x1b[0m' : '';
+
+          const header = [
+            'SWAP ID'.padEnd(10),
+            'ROLE'.padEnd(12),
+            'PROGRESS'.padEnd(20),
+            'OFFER'.padEnd(18),
+            'WANT'.padEnd(18),
+            'COUNTERPARTY'.padEnd(16),
+            'CREATED',
+          ].join('');
+          console.log(header);
+
+          for (const swap of swaps) {
+            const id = (swap.swapId || '').slice(0, 8);
+            const role = swap.role || '';
+            const progress = swap.progress || '';
+
+            // Determine counterparty display
+            const isProposer = role === 'proposer';
+            // Format amounts back to human-readable (manifest stores smallest units)
+            const fmtSwapAmt = (amount: string | undefined, currency: string | undefined): string => {
+              if (!amount || !currency) return '';
+              try {
+                const def = resolveCoin(currency);
+                return `${toHumanReadable(amount, def.decimals)} ${def.symbol}`;
+              } catch {
+                return `${amount} ${currency} (raw)`;
+              }
+            };
+            const offerStr = isProposer
+              ? fmtSwapAmt(swap.deal?.partyAAmount, swap.deal?.partyACurrency)
+              : fmtSwapAmt(swap.deal?.partyBAmount, swap.deal?.partyBCurrency);
+            const wantStr = isProposer
+              ? fmtSwapAmt(swap.deal?.partyBAmount, swap.deal?.partyBCurrency)
+              : fmtSwapAmt(swap.deal?.partyAAmount, swap.deal?.partyACurrency);
+            // Show nametag if available, otherwise truncated address
+            let counterparty: string;
+            if (swap.counterpartyNametag) {
+              counterparty = '@' + swap.counterpartyNametag;
+            } else if (isProposer) {
+              counterparty = (swap.deal?.partyB ?? '').slice(0, 14);
+            } else {
+              counterparty = (swap.deal?.partyA ?? '').slice(0, 14);
+            }
+
+            // Relative time
+            const elapsed = Date.now() - (swap.createdAt || 0);
+            let timeStr: string;
+            if (elapsed < 60_000) timeStr = 'just now';
+            else if (elapsed < 3_600_000) timeStr = `${Math.floor(elapsed / 60_000)} min ago`;
+            else if (elapsed < 86_400_000) timeStr = `${Math.floor(elapsed / 3_600_000)} hour ago`;
+            else timeStr = `${Math.floor(elapsed / 86_400_000)} days ago`;
+
+            // Color progress
+            let coloredProgress = progress;
+            if (progress === 'completed') coloredProgress = `${green}${progress}${reset}`;
+            else if (progress === 'failed' || progress === 'cancelled') coloredProgress = `${red}${progress}${reset}`;
+            else coloredProgress = `${yellow}${progress}${reset}`;
+
+            const row = [
+              id.padEnd(10),
+              role.padEnd(12),
+              // Pad the raw progress (color codes are zero-width for terminal)
+              coloredProgress + ' '.repeat(Math.max(0, 20 - progress.length)),
+              offerStr.padEnd(18),
+              wantStr.padEnd(18),
+              counterparty.padEnd(16),
+              timeStr,
+            ].join('');
+            console.log(row);
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-accept': {
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-accept <swap_id_or_prefix> [--deposit] [--no-wait]');
+          process.exit(1);
+        }
+
+        const depositFlag = args.includes('--deposit');
+        const noWaitFlag = args.includes('--no-wait');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const swapId = swapModule.resolveSwapId(swapIdArg);
+        await swapModule.acceptSwap(swapId);
+        console.log('Swap accepted. Announced to escrow. Waiting for deposit invoice...');
+
+        if (depositFlag) {
+          // acceptSwap() sends the announce to the escrow but the escrow's invoice_delivery
+          // DM arrives asynchronously. Wait for swap:announced before depositing.
+          const acceptAnnounced = await new Promise<boolean>((resolve) => {
+            const acceptUnsubs: (() => void)[] = [];
+            const timeout = setTimeout(() => {
+              acceptUnsubs.forEach(u => u());
+              resolve(false);
+            }, 60_000);
+            const done = (ok: boolean) => {
+              clearTimeout(timeout);
+              acceptUnsubs.forEach(u => u());
+              resolve(ok);
+            };
+            acceptUnsubs.push(sphere.on('swap:announced', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(true);
+            }));
+            acceptUnsubs.push(sphere.on('swap:failed', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+            acceptUnsubs.push(sphere.on('swap:cancelled', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+          });
+          if (!acceptAnnounced) {
+            const finalStatus = await swapModule.getSwapStatus(swapId);
+            console.error(`Swap did not reach 'announced' state (current: ${finalStatus?.progress ?? 'unknown'}). Check swap-status for details.`);
+            await closeSphere();
+            process.exit(1);
+          }
+
+          const depositResult = await swapModule.deposit(swapId);
+          console.log(`Deposit sent: ${depositResult.id}`);
+
+          if (!noWaitFlag) {
+            // Wait for terminal event
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const swapRef = await swapModule.getSwapStatus(swapId);
+            const waitTimeout = 2 * (swapRef?.deal?.timeout ?? 3600) * 1000;
+            const unsubs: (() => void)[] = [];
+            await new Promise<void>((resolve, reject) => {
+              const timer = setTimeout(() => {
+                unsubs.forEach(u => u());
+                reject(new Error(`Swap did not complete within timeout. Current progress: ${swapRef?.progress ?? 'unknown'}`));
+              }, waitTimeout);
+
+              const done = (msg: string) => {
+                clearTimeout(timer);
+                unsubs.forEach(u => u());
+                console.log(msg);
+                resolve();
+              };
+
+              unsubs.push(sphere.on('swap:completed', (e: { swapId: string }) => {
+                if (e.swapId === swapId) done('[swap] Swap completed!');
+              }));
+              unsubs.push(sphere.on('swap:cancelled', (e: { swapId: string }) => {
+                if (e.swapId === swapId) done('[swap] Swap cancelled.');
+              }));
+              unsubs.push(sphere.on('swap:failed', (e: { swapId: string; error: string }) => {
+                if (e.swapId === swapId) done(`[swap] Swap failed: ${e.error}`);
+              }));
+              unsubs.push(sphere.on('swap:deposit_confirmed', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] Deposit confirmed by escrow.');
+              }));
+              unsubs.push(sphere.on('swap:deposits_covered', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] All deposits covered. Escrow concluding...');
+              }));
+              unsubs.push(sphere.on('swap:payout_received', (e: { swapId: string }) => {
+                if (e.swapId === swapId) console.log('[swap] Payout received. Verifying...');
+              }));
+            });
+          }
+        } else {
+          console.log(`Run 'swap-deposit ${swapId}' to deposit when ready.`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-ping': {
+        const escrowAddr = args[1];
+        if (!escrowAddr) {
+          console.error('Usage: swap-ping <@nametag_or_address>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          await closeSphere();
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        try {
+          const pong = await swapModule.pingEscrow(escrowAddr);
+          console.log('Escrow is online:');
+          console.log(JSON.stringify(pong, null, 2));
+        } catch (err) {
+          console.error('Escrow ping failed:', err instanceof Error ? err.message : err);
+          await closeSphere();
+          process.exit(1);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-status': {
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-status <swap_id_or_prefix> [--query-escrow]');
+          process.exit(1);
+        }
+
+        const queryEscrow = args.includes('--query-escrow');
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const swapId = swapModule.resolveSwapId(swapIdArg);
+        const status = await swapModule.getSwapStatus(swapId, queryEscrow ? { queryEscrow: true } : undefined);
+        console.log('Swap Status:');
+        console.log(JSON.stringify(status, null, 2));
+
+        if (status.depositInvoiceId && sphere.accounting) {
+          try {
+            const invoiceStatus = await sphere.accounting.getInvoiceStatus(status.depositInvoiceId);
+            console.log('\nDeposit Invoice Status:');
+            console.log(JSON.stringify(invoiceStatus, null, 2));
+          } catch {
+            // Non-fatal: invoice may not be imported yet
+          }
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-deposit': {
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-deposit <swap_id_or_prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'full');
+
+        const swapId = swapModule.resolveSwapId(swapIdArg);
+
+        // If the swap is still in 'accepted' (crash recovery re-announced to escrow but
+        // the escrow's invoice_delivery DM hasn't arrived yet), wait for swap:announced
+        // before calling deposit(). Crash recovery fires fire-and-forget after module load
+        // so the escrow response may arrive slightly after ensureSync completes.
+        const swapStatusBefore = await swapModule.getSwapStatus(swapId);
+        // Guard: if already deposited, don't re-deposit
+        if (swapStatusBefore?.progress === 'depositing' || swapStatusBefore?.progress === 'awaiting_counter' ||
+            swapStatusBefore?.progress === 'concluding' || swapStatusBefore?.progress === 'completed') {
+          console.log(`Deposit already submitted (current state: ${swapStatusBefore.progress})`);
+          await closeSphere();
+          break;
+        }
+        if (swapStatusBefore?.progress === 'proposed' || swapStatusBefore?.progress === 'accepted') {
+          const waitLabel = swapStatusBefore.progress === 'proposed'
+            ? 'Waiting for Bob to accept and escrow to confirm (up to 120s)...'
+            : 'Waiting for escrow to deliver deposit invoice (up to 60s)...';
+          console.log(waitLabel);
+          const waitMs = swapStatusBefore.progress === 'proposed' ? 120_000 : 60_000;
+          const announced = await new Promise<boolean>((resolve) => {
+            const announceUnsubs: (() => void)[] = [];
+            const timeout = setTimeout(() => {
+              announceUnsubs.forEach(u => u());
+              resolve(false);
+            }, waitMs);
+            const done = (ok: boolean) => {
+              clearTimeout(timeout);
+              announceUnsubs.forEach(u => u());
+              resolve(ok);
+            };
+            announceUnsubs.push(sphere.on('swap:announced', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(true);
+            }));
+            announceUnsubs.push(sphere.on('swap:failed', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+            announceUnsubs.push(sphere.on('swap:cancelled', (e: { swapId: string }) => {
+              if (e.swapId === swapId) done(false);
+            }));
+          });
+          if (!announced) {
+            const finalStatus = await swapModule.getSwapStatus(swapId);
+            console.error(`Swap did not reach 'announced' state (current: ${finalStatus?.progress ?? 'unknown'}). Try again shortly or check swap-status.`);
+            await closeSphere();
+            process.exit(1);
+          }
+        }
+
+        const result = await swapModule.deposit(swapId);
+        console.log('Deposit result:');
+        console.log(JSON.stringify({ id: result.id, status: result.status }, null, 2));
+
+        // Wait for background tasks (e.g., change token creation from instant split)
+        await sphere.payments.waitForPendingOperations();
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-reject': {
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-reject <swap_id_or_prefix> [reason]');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const swapId = swapModule.resolveSwapId(swapIdArg);
+        // Optional reason from remaining args
+        const reason = args.slice(2).filter((a: string) => !a.startsWith('--')).join(' ') || undefined;
+
+        await swapModule.rejectSwap(swapId, reason);
+        console.log(`Swap ${swapId.slice(0, 8)}... rejected.${reason ? ` Reason: ${reason}` : ''}`);
+
+        await closeSphere();
+        break;
+      }
+
+      case 'swap-cancel': {
+        const swapIdArg = args[1];
+        if (!swapIdArg) {
+          console.error('Usage: swap-cancel <swap_id_or_prefix>');
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const swapModule = (sphere as any).swap;
+        if (!swapModule) {
+          console.error('Swap module not enabled.');
+          process.exit(1);
+        }
+        await ensureSync(sphere, 'nostr');
+
+        const swapId = swapModule.resolveSwapId(swapIdArg);
+        await swapModule.cancelSwap(swapId);
+        console.log(`Swap ${swapId.slice(0, 8)}... cancelled.`);
+
+        await closeSphere();
+        break;
+      }
+
       case 'daemon': {
         const sub = args[1] || 'start';
         const { runDaemon, stopDaemon, statusDaemon } = await import('./daemon.js');
@@ -2392,6 +4747,25 @@ async function main() {
         break;
       }
 
+      case 'completions': {
+        const shell = args[1];
+        if (!shell || !['bash', 'zsh', 'fish'].includes(shell)) {
+          console.error('Usage: completions <bash|zsh|fish>');
+          console.error('Generate shell completion script for tab-completion.');
+          console.error('\nSetup:');
+          console.error('  sphere-cli completions bash >> ~/.bashrc');
+          console.error('  sphere-cli completions zsh > ~/.zsh/completions/_sphere-cli');
+          console.error('  sphere-cli completions fish > ~/.config/fish/completions/sphere-cli.fish');
+          process.exit(1);
+        }
+        switch (shell) {
+          case 'bash': console.log(generateBashCompletions()); break;
+          case 'zsh': console.log(generateZshCompletions()); break;
+          case 'fish': console.log(generateFishCompletions()); break;
+        }
+        break;
+      }
+
       default:
         console.error('Unknown command:', command);
         console.error('Run with --help for usage');
@@ -2403,4 +4777,269 @@ async function main() {
   }
 }
 
-main().then(() => process.exit(0));
+// =============================================================================
+// Shell Completion Generators
+// =============================================================================
+
+interface CompletionCommand {
+  name: string;
+  description: string;
+  flags?: string[];
+  subcommands?: CompletionCommand[];
+}
+
+function getCompletionCommands(): CompletionCommand[] {
+  return [
+    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr'] },
+    { name: 'status', description: 'Show wallet identity' },
+    { name: 'config', description: 'Show or set CLI configuration' },
+    { name: 'clear', description: 'Delete all wallet data' },
+    { name: 'wallet', description: 'Manage wallet profiles', subcommands: [
+      { name: 'list', description: 'List all wallet profiles' },
+      { name: 'create', description: 'Create a new wallet profile', flags: ['--network'] },
+      { name: 'use', description: 'Switch to a wallet profile' },
+      { name: 'current', description: 'Show active profile' },
+      { name: 'delete', description: 'Delete a wallet profile' },
+    ]},
+    { name: 'balance', description: 'Show L3 token balance', flags: ['--finalize', '--no-sync'] },
+    { name: 'tokens', description: 'List all tokens', flags: ['--no-sync'] },
+    { name: 'assets', description: 'List registered assets (coins & NFTs)', flags: ['--type'] },
+    { name: 'asset-info', description: 'Show detailed info for an asset' },
+    { name: 'l1-balance', description: 'Show L1 (ALPHA) balance' },
+    { name: 'topup', description: 'Request test tokens from faucet' },
+    { name: 'top-up', description: 'Alias for topup' },
+    { name: 'faucet', description: 'Alias for topup' },
+    { name: 'verify-balance', description: 'Verify tokens against aggregator', flags: ['--remove', '-v', '--verbose'] },
+    { name: 'sync', description: 'Sync tokens with IPFS' },
+    { name: 'send', description: 'Send L3 tokens', flags: ['--direct', '--proxy', '--instant', '--conservative', '--no-sync'] },
+    { name: 'receive', description: 'Check for incoming transfers', flags: ['--finalize', '--no-sync'] },
+    { name: 'history', description: 'Show transaction history' },
+    { name: 'addresses', description: 'List tracked addresses' },
+    { name: 'switch', description: 'Switch to HD address' },
+    { name: 'hide', description: 'Hide address' },
+    { name: 'unhide', description: 'Unhide address' },
+    { name: 'nametag', description: 'Register a nametag' },
+    { name: 'nametag-info', description: 'Look up nametag info' },
+    { name: 'my-nametag', description: 'Show current nametag' },
+    { name: 'nametag-sync', description: 'Re-publish nametag binding' },
+    { name: 'dm', description: 'Send a direct message' },
+    { name: 'dm-inbox', description: 'List conversations' },
+    { name: 'dm-history', description: 'Show conversation history', flags: ['--limit'] },
+    { name: 'group-create', description: 'Create a new group', flags: ['--description', '--private'] },
+    { name: 'group-list', description: 'List available groups' },
+    { name: 'group-my', description: 'List your joined groups' },
+    { name: 'group-join', description: 'Join a group', flags: ['--invite'] },
+    { name: 'group-leave', description: 'Leave a group' },
+    { name: 'group-send', description: 'Send a message to a group', flags: ['--reply'] },
+    { name: 'group-messages', description: 'Show group messages', flags: ['--limit'] },
+    { name: 'group-members', description: 'List group members' },
+    { name: 'group-info', description: 'Show group details' },
+    { name: 'invoice-create', description: 'Create an invoice', flags: ['--target', '--asset', '--nft', '--due', '--memo', '--delivery', '--anonymous', '--terms'] },
+    { name: 'invoice-import', description: 'Import invoice from token file' },
+    { name: 'invoice-list', description: 'List invoices', flags: ['--state', '--limit'] },
+    { name: 'invoice-status', description: 'Show invoice status' },
+    { name: 'invoice-close', description: 'Close an invoice' },
+    { name: 'invoice-cancel', description: 'Cancel an invoice' },
+    { name: 'invoice-pay', description: 'Pay an invoice', flags: ['--target-index', '--amount'] },
+    { name: 'invoice-return', description: 'Return payment to sender', flags: ['--recipient', '--asset'] },
+    { name: 'invoice-receipts', description: 'Send payment receipts' },
+    { name: 'invoice-notices', description: 'Send cancellation notices' },
+    { name: 'invoice-auto-return', description: 'Show/set auto-return settings', flags: ['--enable', '--disable', '--invoice'] },
+    { name: 'invoice-transfers', description: 'List related transfers' },
+    { name: 'invoice-export', description: 'Export invoice to JSON file' },
+    { name: 'invoice-parse-memo', description: 'Parse invoice memo string' },
+    { name: 'swap-propose', description: 'Propose a token swap', flags: ['--to', '--offer', '--want', '--escrow', '--timeout', '--message'] },
+    { name: 'swap-list', description: 'List swap deals', flags: ['--all', '--role', '--progress'] },
+    { name: 'swap-accept', description: 'Accept a swap deal', flags: ['--deposit', '--no-wait'] },
+    { name: 'swap-status', description: 'Show swap status', flags: ['--query-escrow'] },
+    { name: 'swap-deposit', description: 'Deposit into a swap' },
+    { name: 'swap-reject', description: 'Reject a swap proposal' },
+    { name: 'swap-cancel', description: 'Cancel a swap' },
+    { name: 'market-post', description: 'Post a market intent', flags: ['--type', '--category', '--price', '--currency', '--location', '--contact', '--expires'] },
+    { name: 'market-search', description: 'Search market intents', flags: ['--type', '--category', '--min-price', '--max-price', '--limit'] },
+    { name: 'market-my', description: 'List your intents' },
+    { name: 'market-close', description: 'Close an intent' },
+    { name: 'market-feed', description: 'Watch live listing feed', flags: ['--rest'] },
+    { name: 'daemon', description: 'Manage event daemon', subcommands: [
+      { name: 'start', description: 'Start daemon', flags: ['--config', '--detach', '--log', '--pid', '--event', '--action', '--verbose'] },
+      { name: 'stop', description: 'Stop daemon' },
+      { name: 'status', description: 'Check daemon status' },
+    ]},
+    { name: 'encrypt', description: 'Encrypt data with password' },
+    { name: 'decrypt', description: 'Decrypt encrypted data' },
+    { name: 'parse-wallet', description: 'Parse wallet file' },
+    { name: 'wallet-info', description: 'Show wallet file info' },
+    { name: 'generate-key', description: 'Generate random private key' },
+    { name: 'validate-key', description: 'Validate a private key' },
+    { name: 'hex-to-wif', description: 'Convert hex to WIF' },
+    { name: 'derive-pubkey', description: 'Derive public key' },
+    { name: 'derive-address', description: 'Derive L1 address' },
+    { name: 'to-smallest', description: 'Convert to smallest unit' },
+    { name: 'to-human', description: 'Convert to human-readable' },
+    { name: 'format', description: 'Format amount' },
+    { name: 'base58-encode', description: 'Encode hex to base58' },
+    { name: 'base58-decode', description: 'Decode base58 to hex' },
+    { name: 'completions', description: 'Generate shell completion script' },
+    { name: 'help', description: 'Show help for a command' },
+  ];
+}
+
+function generateBashCompletions(): string {
+  const cmds = getCompletionCommands();
+  const topLevel = cmds.map(c => c.name).join(' ');
+
+  const subcommandCases: string[] = [];
+  const flagCases: string[] = [];
+
+  for (const cmd of cmds) {
+    if (cmd.subcommands) {
+      const subs = cmd.subcommands.map(s => s.name).join(' ');
+      subcommandCases.push(`    ${cmd.name})\n      if [[ $cword -eq 2 ]]; then\n        COMPREPLY=($(compgen -W "${subs}" -- "$cur"))\n        return\n      fi\n      ;;`);
+      for (const sub of cmd.subcommands) {
+        if (sub.flags?.length) {
+          flagCases.push(`    "${cmd.name} ${sub.name}") flags="${sub.flags.join(' ')}" ;;`);
+        }
+      }
+    }
+    if (cmd.flags?.length) {
+      flagCases.push(`    ${cmd.name}) flags="${cmd.flags.join(' ')}" ;;`);
+    }
+  }
+
+  return `# Bash completion for sphere-cli
+# Generated by: sphere-cli completions bash
+#
+# Installation:
+#   sphere-cli completions bash >> ~/.bashrc
+#   # or
+#   sphere-cli completions bash > /etc/bash_completion.d/sphere-cli
+#   # or with npm:
+#   eval "$(npm run --silent cli -- completions bash)"
+
+_sphere_cli() {
+  local cur prev words cword
+  _init_completion || return
+
+  local commands="${topLevel}"
+
+  if [[ $cword -eq 1 ]]; then
+    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+    return
+  fi
+
+  # Subcommands
+  case "\${words[1]}" in
+${subcommandCases.join('\n')}
+  esac
+
+  # Flag completion
+  if [[ "$cur" == -* ]]; then
+    local flags=""
+    local cmd_key="\${words[1]}"
+    if [[ $cword -ge 3 ]]; then
+      cmd_key="\${words[1]} \${words[2]}"
+    fi
+    case "$cmd_key" in
+${flagCases.join('\n')}
+    esac
+    if [[ -n "$flags" ]]; then
+      COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+    fi
+  fi
+}
+
+complete -F _sphere_cli sphere-cli
+# Also complete for npm run cli -- usage:
+complete -F _sphere_cli npx
+`;
+}
+
+function generateZshCompletions(): string {
+  const cmds = getCompletionCommands();
+
+  const commandList = cmds.map(c => `    '${c.name}:${c.description.replace(/'/g, "'\\''")}'`).join('\n');
+
+  const subcases: string[] = [];
+  for (const cmd of cmds) {
+    if (cmd.subcommands) {
+      const subList = cmd.subcommands.map(s => `'${s.name}:${s.description.replace(/'/g, "'\\''")}'`).join(' ');
+      subcases.push(`        ${cmd.name})\n          _describe 'subcommand' ${subList}\n          ;;`);
+    } else {
+      const flagArgs = (cmd.flags || []).map(f => `'${f}[${cmd.description.replace(/'/g, "'\\''").slice(0, 30)}]'`).join(' ');
+      if (flagArgs) {
+        subcases.push(`        ${cmd.name})\n          _arguments ${flagArgs}\n          ;;`);
+      }
+    }
+  }
+
+  return `#compdef sphere-cli
+# Zsh completion for sphere-cli
+# Generated by: sphere-cli completions zsh
+#
+# Installation:
+#   mkdir -p ~/.zsh/completions
+#   sphere-cli completions zsh > ~/.zsh/completions/_sphere-cli
+#   # Add to .zshrc: fpath=(~/.zsh/completions $fpath) && autoload -Uz compinit && compinit
+
+_sphere_cli() {
+  local -a commands
+  commands=(
+${commandList}
+  )
+
+  _arguments -C \\
+    '1:command:->command' \\
+    '*::arg:->args'
+
+  case "$state" in
+    command)
+      _describe 'command' commands
+      ;;
+    args)
+      case "\${words[1]}" in
+${subcases.join('\n')}
+      esac
+      ;;
+  esac
+}
+
+_sphere_cli "$@"
+`;
+}
+
+function generateFishCompletions(): string {
+  const cmds = getCompletionCommands();
+  const lines: string[] = [
+    '# Fish completion for sphere-cli',
+    '# Generated by: sphere-cli completions fish',
+    '#',
+    '# Installation:',
+    '#   sphere-cli completions fish > ~/.config/fish/completions/sphere-cli.fish',
+    '',
+  ];
+
+  for (const cmd of cmds) {
+    if (cmd.subcommands) {
+      lines.push(`complete -c sphere-cli -n '__fish_use_subcommand' -a '${cmd.name}' -d '${cmd.description}'`);
+      for (const sub of cmd.subcommands) {
+        lines.push(`complete -c sphere-cli -n '__fish_seen_subcommand_from ${cmd.name}' -a '${sub.name}' -d '${sub.description}'`);
+        for (const flag of sub.flags || []) {
+          lines.push(`complete -c sphere-cli -n '__fish_seen_subcommand_from ${cmd.name}' -l '${flag.replace(/^--/, '')}' -d '${sub.description}'`);
+        }
+      }
+    } else {
+      lines.push(`complete -c sphere-cli -n '__fish_use_subcommand' -a '${cmd.name}' -d '${cmd.description}'`);
+      for (const flag of cmd.flags || []) {
+        lines.push(`complete -c sphere-cli -n '__fish_seen_subcommand_from ${cmd.name}' -l '${flag.replace(/^--/, '')}' -d '${flag}'`);
+      }
+    }
+  }
+
+  return lines.join('\n') + '\n';
+}
+
+main().then(() => process.exit(0)).catch((err) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error(`Fatal error: ${msg}`);
+  process.exit(1);
+});

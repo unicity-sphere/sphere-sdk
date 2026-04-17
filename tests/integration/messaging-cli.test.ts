@@ -46,7 +46,7 @@ describe('Messaging CLI commands', () => {
   describe('help text', () => {
     it('should include MESSAGING section', async () => {
       const { stdout } = await runCli(['--help']);
-      expect(stdout).toContain('MESSAGING (Direct Messages)');
+      expect(stdout).toContain('MESSAGING:');
       expect(stdout).toContain('dm <@nametag> <message>');
       expect(stdout).toContain('dm-inbox');
       expect(stdout).toContain('dm-history');
@@ -54,7 +54,7 @@ describe('Messaging CLI commands', () => {
 
     it('should include GROUP CHAT section', async () => {
       const { stdout } = await runCli(['--help']);
-      expect(stdout).toContain('GROUP CHAT (NIP-29)');
+      expect(stdout).toContain('GROUP CHAT:');
       expect(stdout).toContain('group-create');
       expect(stdout).toContain('group-list');
       expect(stdout).toContain('group-my');
@@ -66,18 +66,18 @@ describe('Messaging CLI commands', () => {
       expect(stdout).toContain('group-info');
     });
 
-    it('should include messaging examples', async () => {
+    it('should include messaging commands with descriptions', async () => {
       const { stdout } = await runCli(['--help']);
-      expect(stdout).toContain('Messaging Examples:');
-      expect(stdout).toContain('dm @alice');
-      expect(stdout).toContain('dm-history @alice');
+      expect(stdout).toContain('Send a direct message');
+      expect(stdout).toContain('List conversations');
+      expect(stdout).toContain('Show conversation history');
     });
 
-    it('should include group chat examples', async () => {
+    it('should include group chat commands with descriptions', async () => {
       const { stdout } = await runCli(['--help']);
-      expect(stdout).toContain('Group Chat Examples:');
-      expect(stdout).toContain('group-create');
-      expect(stdout).toContain('group-send');
+      expect(stdout).toContain('Create a new group');
+      expect(stdout).toContain('Send a message to a group');
+      expect(stdout).toContain('Show group messages');
     });
   });
 

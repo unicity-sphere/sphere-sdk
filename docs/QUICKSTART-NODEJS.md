@@ -19,6 +19,8 @@ npm install @unicitylabs/sphere-sdk ws
 
 ## CLI (Quick Testing)
 
+> **Tip:** For shell auto-completion of all CLI commands, run `npm link` then `sphere-cli completions bash >> ~/.bashrc`. See [QUICKSTART-CLI.md](QUICKSTART-CLI.md) for full setup.
+
 The SDK includes a built-in CLI for quick testing without writing code:
 
 ```bash
@@ -38,10 +40,10 @@ npm run cli -- balance
 npm run cli -- balance --finalize
 
 # Send tokens (instant mode — default, ~2-3s sender latency)
-npm run cli -- send @alice 1 --coin UCT --instant
+npm run cli -- send @alice 1 UCT --instant
 
 # Send tokens (conservative mode — collect all proofs first)
-npm run cli -- send @alice 1 --coin UCT --conservative
+npm run cli -- send @alice 1 UCT --conservative
 
 # Show receive address
 npm run cli -- receive
@@ -128,7 +130,7 @@ npm run cli -- wallet create bob                # Create another profile
 npm run cli -- init --nametag bob               # Initialize second wallet
 npm run cli -- wallet list                      # List all profiles
 npm run cli -- wallet use alice                 # Switch to alice
-npm run cli -- send @bob 0.1 --coin BTC         # Send from alice to bob
+npm run cli -- send @bob 0.1 BTC                 # Send from alice to bob
 npm run cli -- wallet use bob                   # Switch to bob
 npm run cli -- balance --finalize               # Check bob's balance (fetch + finalize)
 ```
@@ -286,6 +288,30 @@ console.log('Total USD:', totalUsd); // number | null
 const l1Balance = await sphere.payments.l1.getBalance();
 console.log('L1 Balance:', l1Balance);
 ```
+
+### Look Up Asset Metadata
+
+The `TokenRegistry` provides metadata (symbol, name, decimals, icons) for all registered assets on the network:
+
+```typescript
+import { TokenRegistry } from '@unicitylabs/sphere-sdk';
+
+const registry = TokenRegistry.getInstance();
+
+// List all registered assets
+const allAssets = registry.getAllDefinitions();
+const coins = registry.getFungibleDefinitions();
+const nfts = registry.getNonFungibleDefinitions();
+
+// Look up a specific asset
+const uct = registry.getDefinitionBySymbol('UCT');
+console.log(uct?.name, uct?.decimals);  // 'Unicity Token', 8
+
+// Reverse lookup: symbol → coin ID
+const coinId = registry.getCoinIdBySymbol('UCT');
+```
+
+> **Note:** The registry is configured automatically by `createNodeProviders()` and `Sphere.init()`. Data is fetched from the network and cached to disk.
 
 ### Send Tokens
 
@@ -488,6 +514,191 @@ sphere.on('identity:changed', handler);
 // Unsubscribe
 const unsubscribe = sphere.on('transfer:incoming', handler);
 unsubscribe(); // Stop listening
+```
+
+## Invoicing
+
+The `AccountingModule` handles the full invoice lifecycle — creation, status queries, payment, and closing. Enable it by passing `accounting: true` to `Sphere.init()`.
+
+> **Note:** The accounting module requires the Oracle (Aggregator) provider, which is included by default with `createNodeProviders()`.
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,   // Enable with defaults
+});
+
+const accounting = sphere.accounting!;
+```
+
+### Create an Invoice
+
+```typescript
+const result = await accounting.createInvoice({
+  targets: [
+    {
+      address: sphere.identity!.directAddress!,  // Pay to own address
+      assets: [
+        { coin: ['UCT', '1000000'] },            // 1 UCT in smallest units
+      ],
+    },
+  ],
+  memo: 'Order #1234',
+  dueDate: Date.now() + 7 * 24 * 60 * 60 * 1000, // 7 days from now
+});
+
+if (result.success) {
+  console.log('Invoice ID:', result.invoiceId);
+  console.log('Terms:', result.terms);
+}
+```
+
+### Check Invoice Status
+
+```typescript
+const status = await accounting.getInvoiceStatus(result.invoiceId!);
+
+// state: 'OPEN' | 'PARTIAL' | 'COVERED' | 'CLOSED' | 'CANCELLED' | 'EXPIRED'
+console.log('State:', status.state);
+console.log('All confirmed:', status.allConfirmed);
+
+for (const target of status.targets) {
+  for (const asset of target.assets) {
+    console.log(`  ${asset.coinId}: paid ${asset.totalForward} of ${asset.requested}`);
+  }
+}
+```
+
+### Pay an Invoice
+
+```typescript
+// Pay the first asset of the first target (defaults to the remaining needed amount)
+const transfer = await accounting.payInvoice(invoiceId, {
+  targetIndex: 0,
+  assetIndex: 0,    // Optional, defaults to 0
+});
+
+console.log('Transfer status:', transfer.status);
+```
+
+### List All Invoices
+
+```typescript
+// All invoices
+const all = await accounting.getInvoices();
+
+// Filter by state
+const open = await accounting.getInvoices({ state: 'OPEN' });
+const mine = await accounting.getInvoices({ createdByMe: true });
+```
+
+### Close an Invoice
+
+```typescript
+// Marks invoice as CLOSED; no further payments are attributed
+await accounting.closeInvoice(invoiceId);
+
+// Optionally auto-return any overpayments before closing
+await accounting.closeInvoice(invoiceId, { autoReturn: true });
+```
+
+### Listen to Invoice Events
+
+```typescript
+sphere.on('invoice:created', ({ invoiceId, confirmed }) => {
+  console.log('Invoice minted:', invoiceId, confirmed ? '(confirmed)' : '(unconfirmed)');
+});
+
+sphere.on('invoice:payment', ({ invoiceId, paymentDirection, confirmed }) => {
+  console.log(`Payment on ${invoiceId}: direction=${paymentDirection}`);
+});
+
+sphere.on('invoice:covered', ({ invoiceId, confirmed }) => {
+  console.log('Invoice fully covered:', invoiceId);
+});
+
+sphere.on('invoice:closed', ({ invoiceId, explicit }) => {
+  console.log('Invoice closed:', invoiceId, explicit ? '(by owner)' : '(auto)');
+});
+
+sphere.on('invoice:overpayment', ({ invoiceId, coinId, surplus }) => {
+  console.log(`Overpayment on ${invoiceId}: +${surplus} ${coinId}`);
+});
+```
+
+## Token Swaps
+
+The swap module enables trustless two-party token exchanges via an escrow service. Enable it when initializing:
+
+```typescript
+const { sphere } = await Sphere.init({
+  ...providers,
+  autoGenerate: true,
+  accounting: true,  // Required (swap uses invoices internally)
+  swap: true,        // Enable swap module
+});
+```
+
+**Propose a swap:**
+
+```typescript
+const result = await sphere.swap!.proposeSwap({
+  partyA: sphere.identity!.directAddress!,
+  partyB: '@bob',
+  partyACurrency: 'UCT',
+  partyAAmount: '1000000',
+  partyBCurrency: 'USDU',
+  partyBAmount: '500000',
+  timeout: 3600,
+  escrowAddress: '@escrow-testnet',
+});
+
+console.log('Swap ID:', result.swapId);
+```
+
+**Accept and deposit (counterparty side):**
+
+```typescript
+sphere.on('swap:proposal_received', async (data) => {
+  console.log('Swap proposal from:', data.senderNametag ?? data.senderPubkey);
+
+  await sphere.swap!.acceptSwap(data.swapId);
+  const transfer = await sphere.swap!.deposit(data.swapId);
+  console.log('Deposit sent:', transfer.id);
+});
+```
+
+**Deposit (proposer side, after counterparty accepts):**
+
+```typescript
+sphere.on('swap:announced', async (data) => {
+  const transfer = await sphere.swap!.deposit(data.swapId);
+  console.log('Deposit sent:', transfer.id);
+});
+```
+
+**Monitor swap lifecycle:**
+
+```typescript
+sphere.on('swap:completed', ({ swapId, payoutVerified }) => {
+  console.log('Swap completed:', swapId, 'Verified:', payoutVerified);
+});
+
+sphere.on('swap:cancelled', ({ swapId, reason, depositsReturned }) => {
+  console.log('Swap cancelled:', swapId, reason, 'Returned:', depositsReturned);
+});
+
+sphere.on('swap:failed', ({ swapId, error }) => {
+  console.log('Swap failed:', swapId, error);
+});
+```
+
+**List and query:**
+
+```typescript
+const swaps = sphere.swap!.getSwaps({ excludeTerminal: true });
+const status = await sphere.swap!.getSwapStatus(swapId, { queryEscrow: true });
 ```
 
 ## Error Handling
