@@ -2,7 +2,7 @@
 
 **Status:** Draft — requires manual approval before implementation
 **Date:** 2026-03-30
-**Updated:** 2026-04-17 — Split encryption model: encrypted manifests + unencrypted elements for cross-user dedup
+**Updated:** 2026-04-17 — CAR batch transfer, server-side validation, manifest status, outbox CIDs, Kubo semantic plugin
 
 ---
 
@@ -1304,6 +1304,151 @@ Import from archive:
 | **Archive/export** | Selected or all tokens | Derived | Optional (user choice) | No (offline file) |
 
 In ALL cases, the UXF bundle is just the element pool. The manifest is always derived by scanning for TokenRoot elements. No metadata, no history, no caches — pure cryptographic proof materials.
+
+#### 10.10.5 CAR Batch Transfer
+
+UXF bundles are serialized as CARv1 files. A single CAR file transfers the **entire element pool as a batch** in one HTTP request — no per-element round trips:
+
+**Upload (client → IPFS):**
+```
+POST /api/v0/dag/put
+Content-Type: multipart/form-data
+Body: <CAR file containing all element blocks>
+
+IPFS node unpacks the CAR, stores each block individually.
+All blocks pinned atomically. One request = entire token pool.
+```
+
+**Download (IPFS → client):**
+```
+GET /ipfs/{rootCID}?format=car
+Accept: application/vnd.ipld.car
+
+IPFS node traverses the DAG from the root CID,
+packages all reachable blocks into a CAR file,
+streams it back in a single response.
+```
+
+This is efficient for both storage saves (entire pool in one upload) and token transfers (selected tokens as a mini-CAR).
+
+#### 10.10.6 IPFS Server-Side Validation
+
+The IPFS Kubo node validates all submitted material and drops invalid submissions to prevent corrupted data storage:
+
+**Level 1: Block-level validation (standard Kubo)**
+- Verify each block's CID matches its content hash (reject corrupted blocks)
+- Verify DAG-CBOR encoding is well-formed (reject malformed CBOR)
+- Reject blocks exceeding size limits (50 MB per `dag/put`)
+- Rate limit by IP (configured in nginx)
+
+**Level 2: UXF semantic validation (Kubo plugin — future)**
+
+The IPFS Kubo node can be extended with a **Unicity token semantic plugin** that understands UXF element structure:
+
+| Validation | What it checks | Benefit |
+|---|---|---|
+| **Element type verification** | Submitted blocks are valid UXF elements with correct headers (type ID, version) | Prevents garbage data from consuming storage |
+| **Hash chain integrity** | Parent elements' child references point to valid existing blocks | Prevents orphaned references |
+| **Inclusion proof verification** | Unicity proofs are structurally valid (correct CBOR tags, valid SMT path) | Prevents fake proofs from polluting the pool |
+| **Unicity certificate verification** | BFT signatures in certificates are valid against known validator set | Prevents forged certificates |
+| **Predicate structure validation** | Predicate CBOR encodes a valid secp256k1 public key | Prevents malformed ownership claims |
+| **Token chain validation** | Transaction chains are append-only, each tx's source state matches previous destination | Prevents fabricated token histories |
+
+**Implementation approach:** A Kubo plugin (Go) or sidecar service that intercepts `dag/put` requests, decodes the DAG-CBOR blocks, validates UXF structure, and rejects invalid submissions before they are pinned. This is a separate infrastructure component — not part of the sphere-sdk.
+
+**Benefits of server-side validation:**
+- Reduced storage waste (invalid data never pinned)
+- Cross-user data quality (all elements in the pool are validated)
+- Defense against malicious submissions (forged proofs, fake certificates)
+- The Kubo node becomes a **trusted UXF element store**, not just a dumb blob store
+
+### 10.11 Manifest Status and Invalid Tokens
+
+The derived manifest is NOT a simple `tokenId → rootHash` map. It includes token validity status:
+
+```typescript
+interface ManifestEntry {
+  rootHash: ContentHash;           // root of the primary (valid) DAG
+  status: 'valid' | 'invalid' | 'conflicting' | 'pending';
+  conflictingRoots?: ContentHash[];  // alternative DAGs (for investigation/history)
+  invalidReason?: string;            // why the token is invalid (if applicable)
+}
+
+// Derived manifest:
+Map<tokenId, ManifestEntry>
+```
+
+**Token status in the manifest:**
+
+| Status | Meaning | Counts in balance? | Action |
+|---|---|---|---|
+| `valid` | Chain validated, proofs correct | Yes (if owned + unspent) | Normal operation |
+| `invalid` | Chain broken, mismatched proof, or double-spend detected | **No** | Kept for investigation, removable by GC |
+| `conflicting` | Two alternative DAGs exist for same tokenId | **No** | Oracle decides winner during finalization |
+| `pending` | Last transaction awaiting proof from oracle | **No** (until finalized) | Submit to oracle to finalize |
+
+**Invalid tokens are preserved in the pool** for investigation and debugging. They are:
+- Visible in a "conflicts/invalid" view in the UI
+- Excluded from balance calculations
+- Removable via `cleanupInventory()`
+- Useful for detecting double-spend attempts, rogue instances, or sync issues
+
+**Conflicting tokens:** When two DAG versions exist with divergent transactions spending the same state, both are kept:
+```
+manifest:
+  tokenId_x → {
+    rootHash: hash_R3a,           // the version we're trying to finalize
+    status: 'conflicting',
+    conflictingRoots: [hash_R3b], // the other version
+  }
+```
+
+After oracle resolution (one version gets a valid proof, the other gets a mismatched proof), the winner becomes `valid` and the loser becomes `invalid`.
+
+### 10.12 Outbox: In-Flight Transfer Tracking via CIDs
+
+The outbox tracks UXF bundles currently being sent to recipients. Each entry references the **CID of the UXF bundle** being transferred:
+
+```typescript
+interface OutboxEntry {
+  /** Unique transfer identifier */
+  id: string;
+  /** CID of the UXF CAR file containing the tokens being sent */
+  bundleCid: string;
+  /** Token IDs included in this bundle */
+  tokenIds: string[];
+  /** Recipient identifier (@nametag, DIRECT address, pubkey) */
+  recipient: string;
+  /** Delivery status */
+  status: 'packaging' | 'pinned' | 'sending' | 'delivered' | 'confirmed' | 'failed';
+  /** How the bundle is being delivered */
+  deliveryMethod: 'car-over-nostr' | 'cid-over-nostr';
+  /** Timestamps */
+  createdAt: number;
+  updatedAt: number;
+  /** Error info if failed */
+  error?: string;
+  /** Retry count */
+  retryCount: number;
+}
+```
+
+**Outbox lifecycle:**
+```
+1. packaging  — building UXF bundle with selected tokens
+2. pinned     — CAR pinned to IPFS, CID obtained
+3. sending    — Nostr event published (CAR bytes or CID)
+4. delivered  — recipient acknowledged receipt
+5. confirmed  — recipient finalized tokens (oracle confirmed)
+6. failed     — delivery failed (retry or abort)
+```
+
+The outbox is stored in **OrbitDB** (`{addr}.outbox`), encrypted. This allows:
+- Multi-device visibility of in-flight transfers
+- Retry after app crash (CID is preserved, just re-send the Nostr event)
+- Tracking delivery status across devices
+
+Once a transfer is confirmed, the outbox entry can be cleaned up. The sent tokens remain in the pool as `previously owned` (archived) with the destination derived from the transaction predicate.
 
 ---
 
