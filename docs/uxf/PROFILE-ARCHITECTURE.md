@@ -873,3 +873,46 @@ DM message content is encrypted with `profileEncryptionKey` before storing in Or
 | — | OrbitDB vs raw IPLD DAG | **OrbitDB** — Merkle-CRDTs handle multi-device conflict resolution automatically. |
 | — | Single CID vs multiple bundle CIDs | **Multiple CIDs** — each device writes its own bundle key. Lazy consolidation merges over time. |
 | — | Phase alignment | The Profile architecture advances some Phase 2 concepts (UXF as storage backend). The UXF library itself remains Phase 1-scoped; the Profile layer handles wallet state outside the UXF package. |
+
+---
+
+## 11. Required SDK API Additions
+
+The following API gaps must be addressed for proper token-type-based access to the inventory:
+
+### 11.1 PaymentsModule: Nametag Token Access (MISSING)
+
+The PaymentsModule has no public method for listing or extracting nametag tokens. Nametag tokens are regular tokens in the inventory with `tokenType = f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509`. Currently they are accessed ad-hoc via internal `findNametagToken()` callbacks and `_nametag`/`_nametags` TXF fields.
+
+**Required additions:**
+- `payments.getNametagTokens(): Token[]` — returns all nametag tokens for the current address, filtered by tokenType from the inventory
+- `payments.getNametagToken(name: string): Token | undefined` — returns the specific nametag token for a given name
+
+These should use `UxfPackage.tokensByTokenType(NAMETAG_TOKEN_TYPE_HEX)` under the hood when Profile mode is active.
+
+### 11.2 AccountingModule: Invoice Token Access (EXISTS)
+
+The AccountingModule already provides comprehensive invoice access:
+- `accounting.getInvoices(options?)` → `InvoiceRef[]` (listing)
+- `accounting.getInvoice(invoiceId)` → `InvoiceRef | null` (single lookup)
+- `accounting.getInvoiceStatus(invoiceId)` → `InvoiceStatus` with parsed `InvoiceTerms`
+- `accounting.importInvoice(token)` → parses `InvoiceTerms` from `genesis.data.tokenData`
+- `accounting.createInvoice(...)` → mints invoice token
+
+No changes needed — the accounting module correctly treats invoices as tokens and extracts structured data from `tokenData`.
+
+### 11.3 UxfPackage: Token Type Index (EXISTS)
+
+`UxfPackage.tokensByTokenType(tokenTypeHex)` already provides the underlying index lookup. Both PaymentsModule and AccountingModule should use this when operating in Profile/UXF mode, instead of scanning TXF fields directly.
+
+### 11.4 Token Type Constants (MISSING)
+
+Define well-known token type constants in the SDK:
+```typescript
+export const TOKEN_TYPES = {
+  NAMETAG: 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509',
+  INVOICE: '<invoice token type hex>',  // TBD — needs verification from AccountingModule
+} as const;
+```
+
+This avoids hardcoding hex strings across the codebase.
