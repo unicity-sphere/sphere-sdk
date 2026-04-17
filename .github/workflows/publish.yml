@@ -36,8 +36,10 @@ jobs:
       - name: Update package version
         run: npm version ${{ inputs.version }} --no-git-tag-version
 
-      - name: Install dependencies (including optional)
-        run: npm install --include=optional
+      - name: Install dependencies
+        run: |
+          npm install --include=optional --ignore-scripts
+          npm rebuild
 
       - name: Run tests
         run: npm run test:run

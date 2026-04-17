@@ -1,12 +1,12 @@
 /**
  * SpendQueue.starvation.test.ts
  *
- * Deep dive into starvation protection and skip-ahead fairness guarantees
- * of the SpendQueue class. Tests the skip-count mechanism that prevents
- * large sends from being starved indefinitely by smaller ones.
+ * Deep dive into skip-ahead fairness guarantees of the SpendQueue class.
+ * Tests that the queue never blocks on any single entry — entries behind
+ * a blocked one are always scanned and served if tokens are available.
  *
  * Key constants under test:
- *   MAX_SKIP_COUNT = 10   — after 10 skips, entry blocks the queue
+ *   MAX_SKIP_COUNT = 10   — skipCount tracks how many times an entry was skipped
  *   QUEUE_TIMEOUT_MS = 30000 — entries expire after 30s
  */
 
@@ -276,10 +276,10 @@ describe('SpendQueue Starvation Protection', () => {
   });
 
   // =========================================================================
-  // 3. Starvation bound — MAX_SKIP_COUNT blocks the queue
+  // 3. Starvation bound — MAX_SKIP_COUNT tracking (queue never blocks)
   // =========================================================================
   describe('Starvation bound', () => {
-    it('blocks queue when entry reaches MAX_SKIP_COUNT', () => {
+    it('continues past entry that reaches MAX_SKIP_COUNT to serve later entries', () => {
       const coinId = 'UCT';
 
       // All entries always fail to plan — this lets us count skip increments
@@ -296,21 +296,27 @@ describe('SpendQueue Starvation Protection', () => {
         queue.notifyChange(coinId);
       }
 
-      // Now large-1 has skipCount = MAX_SKIP_COUNT, which means on the next
-      // notify it will block. All 3 still in queue since nothing can be planned.
+      // All 3 still in queue since nothing can be planned.
       expect(queue.size(coinId)).toBe(3);
 
-      // Now make small plannable but large still fails
+      // Now make small plannable but large still fails.
+      // Use two different tokens so both smalls can be served independently.
+      const smallToken2 = makeToken('UCT', 100_000n, 'small-tok-2');
+      parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
+      parsedCache.set(smallToken2.id, makeParsedEntry(smallToken2, 100_000n));
+      let smallCallCount = 0;
       calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null;
-        return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
+        smallCallCount++;
+        if (smallCallCount === 1) return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
+        return makeDirectPlan([{ token: smallToken2, amount: 100_000n }], 100_000n);
       });
 
       queue.notifyChange(coinId);
 
-      // large-1 blocks (skipCount >= MAX_SKIP_COUNT), so small-1 and small-2
-      // are NOT reached. All 3 still in queue.
-      expect(queue.size(coinId)).toBe(3);
+      // Queue continues past large-1 and serves both small-1 and small-2.
+      // Only large-1 remains.
+      expect(queue.size(coinId)).toBe(1);
     });
 
     it('large entry that reaches MAX_SKIP_COUNT is served when tokens become available', async () => {
@@ -405,20 +411,23 @@ describe('SpendQueue Starvation Protection', () => {
       expect(queue.size(coinId)).toBe(1);
     });
 
-    it('skipCount does not increment for entries behind a blocking entry', () => {
+    it('skipCount increments for all entries and entries behind a blocked one are served', async () => {
       const coinId = 'UCT';
       calculateSpy.mockReturnValue(null);
 
       catchUnhandled(enqueueEntry('blocker', coinId, 1_000_000n));
       catchUnhandled(enqueueEntry('behind', coinId, 100_000n));
 
-      // Push blocker to MAX_SKIP_COUNT
+      // Push both entries' skipCounts up — both get incremented each round
       for (let i = 0; i < MAX_SKIP_COUNT; i++) {
         queue.notifyChange(coinId);
       }
 
-      // Now blocker is at MAX_SKIP_COUNT. Next notify halts at blocker.
-      // Make 'behind' plannable — but it should NOT be reached
+      // Both still queued since nothing could be planned
+      expect(queue.size(coinId)).toBe(2);
+
+      // Make 'behind' plannable — queue continues past blocker and serves it
+      parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
       calculateSpy.mockImplementation((_c: any, targetAmount: bigint) => {
         if (targetAmount === 1_000_000n) return null;
         return makeDirectPlan([{ token: smallToken, amount: 100_000n }], 100_000n);
@@ -426,8 +435,8 @@ describe('SpendQueue Starvation Protection', () => {
 
       queue.notifyChange(coinId);
 
-      // Both still queued — behind was not scanned
-      expect(queue.size(coinId)).toBe(2);
+      // behind was served, only blocker remains
+      expect(queue.size(coinId)).toBe(1);
     });
 
     it('successfully planned entry is removed without affecting others', () => {
@@ -514,7 +523,7 @@ describe('SpendQueue Starvation Protection', () => {
   // 6. Edge: skipCount reaches limit on same pass as another entry served
   // =========================================================================
   describe('Edge cases', () => {
-    it('when blocker reaches MAX_SKIP_COUNT, entries behind it are not served on that pass', () => {
+    it('when blocker reaches MAX_SKIP_COUNT, entries behind it are still served on that pass', () => {
       const coinId = 'UCT';
       const tinyTok = makeToken(coinId, 50_000n, 'tiny-tok');
       parsedCache.set(tinyTok.id, makeParsedEntry(tinyTok, 50_000n));
@@ -539,9 +548,7 @@ describe('SpendQueue Starvation Protection', () => {
         ledger.cancel('tiny');
       }
 
-      // large skipCount = 9, small skipCount = 9 (both failed each round)
-      // tiny was served and removed each round, but we only have 3 entries initially
-      // Actually: tiny gets served and removed on the first notify. So after round 1:
+      // tiny gets served and removed on the first notify. So after round 1:
       // queue = [large(skip=1), small(skip=1)]
       // Subsequent rounds: both fail, both get skip incremented.
       // After 9 rounds: large(skip=9), small(skip=9)
@@ -549,11 +556,12 @@ describe('SpendQueue Starvation Protection', () => {
       // Re-add tiny
       catchUnhandled(enqueueEntry('tiny-2', coinId, 50_000n));
 
-      // This notify: large hits 10 (MAX), breaks. small and tiny-2 not scanned.
+      // This notify: large can't plan (skip=10), small can't plan (skip=10),
+      // tiny-2 is served. Queue continues past blocked entries.
       queue.notifyChange(coinId);
 
-      // All 3 still in queue (large blocked, others behind it)
-      expect(queue.size(coinId)).toBe(3);
+      // tiny-2 served, large and small remain (both unplannable)
+      expect(queue.size(coinId)).toBe(2);
     });
 
     it('entry at MAX_SKIP_COUNT - 1 gets served on that pass if tokens arrive', async () => {
@@ -685,17 +693,19 @@ describe('SpendQueue Starvation Protection', () => {
         ledger.cancel(`possible-${i}`);
       }
 
-      // impossible now at skipCount = 9. One more notify pushes it to 10 and blocks.
-      catchUnhandled(enqueueEntry('possible-last', coinId, 100_000n));
+      // impossible now at skipCount = 9. One more notify pushes it to 10.
+      // Queue continues past impossible and serves possible-last.
+      const possibleLastPromise = enqueueEntry('possible-last', coinId, 100_000n);
       queue.notifyChange(coinId);
 
-      // impossible blocks, possible-last stuck behind it
-      expect(queue.size(coinId)).toBe(2);
+      // possible-last served immediately (queue scans past impossible)
+      await possibleLastPromise;
+      expect(queue.size(coinId)).toBe(1); // only impossible remains
 
       // Advance past timeout
       vi.advanceTimersByTime(QUEUE_TIMEOUT_MS + 1);
 
-      // notifyChange expires the impossible entry and serves possible-last
+      // notifyChange expires the impossible entry
       queue.notifyChange(coinId);
 
       await expect(impossiblePromise).rejects.toThrow('Send queue timeout');
@@ -788,7 +798,7 @@ describe('SpendQueue Starvation Protection', () => {
   // 9. Timeout interaction with starvation
   // =========================================================================
   describe('Timeout interaction', () => {
-    it('timed-out entry at head unblocks entries behind it', async () => {
+    it('entries behind a blocked head are served immediately without waiting for timeout', async () => {
       const coinId = 'UCT';
       parsedCache.set(smallToken.id, makeParsedEntry(smallToken, 100_000n));
 
@@ -799,7 +809,7 @@ describe('SpendQueue Starvation Protection', () => {
 
       const headPromise = catchUnhandled(enqueueEntry('head', coinId, 999_999n));
 
-      // Push head to MAX_SKIP_COUNT so it blocks
+      // Push head to MAX_SKIP_COUNT so its skipCount is high
       for (let i = 0; i < MAX_SKIP_COUNT; i++) {
         queue.notifyChange(coinId);
       }
@@ -809,20 +819,19 @@ describe('SpendQueue Starvation Protection', () => {
 
       const behindPromise = enqueueEntry('behind', coinId, 100_000n);
 
-      // Head blocks — behind cannot be served
+      // Queue continues past head and serves behind immediately
       queue.notifyChange(coinId);
-      expect(queue.size(coinId)).toBe(2);
+      const behindResult = await behindPromise;
+      expect(behindResult.reservationId).toBe('behind');
+      expect(queue.size(coinId)).toBe(1); // only head remains
 
-      // Advance past head's timeout but not behind's
+      // Advance past head's timeout
       vi.advanceTimersByTime((QUEUE_TIMEOUT_MS / 2) + 1);
 
-      // notifyChange should expire head (timed out) and then serve behind
+      // notifyChange expires the head entry
       queue.notifyChange(coinId);
 
       await expect(headPromise).rejects.toThrow('Send queue timeout');
-
-      const behindResult = await behindPromise;
-      expect(behindResult.reservationId).toBe('behind');
       expect(queue.size(coinId)).toBe(0);
     });
 

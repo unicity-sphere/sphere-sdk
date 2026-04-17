@@ -46,7 +46,8 @@ export type SphereErrorCode =
   | 'SEND_INSUFFICIENT_BALANCE'
   | 'SEND_RESERVATION_CANCELLED'
   | 'SEND_QUEUE_FULL'
-  | 'MODULE_DESTROYED';
+  | 'MODULE_DESTROYED'
+  | 'REENTRANT_GATE';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

@@ -162,9 +162,11 @@ export class TokenReservationLedger {
 
   /**
    * Cancels ALL active reservations referencing tokenId.
+   * @param excludeReservationId - If provided, skip this reservation (used by send()
+   *   to prevent removeToken() from cancelling its own in-flight reservation).
    * @returns Array of cancelled reservationIds.
    */
-  cancelForToken(tokenId: string): string[] {
+  cancelForToken(tokenId: string, excludeReservationId?: string): string[] {
     const set = this.tokenIndex.get(tokenId);
     if (!set) return [];
 
@@ -173,19 +175,23 @@ export class TokenReservationLedger {
     const reservationIds = [...set];
 
     for (const resId of reservationIds) {
+      if (resId === excludeReservationId) continue;
       const entry = this.reservations.get(resId);
       if (!entry) continue;
 
       if (entry.status === 'active') {
         entry.status = 'cancelled';
         cancelled.push(resId);
-        // Remove this reservation from ALL its token index entries
         this.removeFromTokenIndex(entry);
+        this.reservations.delete(resId);
       }
     }
 
-    // Ensure tokenId itself is cleaned from the index
-    this.tokenIndex.delete(tokenId);
+    // Clean tokenId from index only if no reservations remain
+    const remaining = this.tokenIndex.get(tokenId);
+    if (remaining && remaining.size === 0) {
+      this.tokenIndex.delete(tokenId);
+    }
 
     return cancelled;
   }

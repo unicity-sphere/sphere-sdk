@@ -188,7 +188,7 @@ Creates a new reservation.
 
 **Parameters:**
 - `reservationId: string` — must be unique across all active reservations. Callers use the `TransferResult.id` (a UUID from `crypto.randomUUID()`).
-- `entries: Array<{ tokenId: string; amount: bigint }>` — one entry per token to be reserved.
+- `entries: Array<{ tokenId: string; amount: bigint; tokenAmount: bigint }>` — one entry per token to be reserved. `tokenAmount` is the total amount of the token, used to verify sufficient free capacity.
 - `coinId: string` — the coin being transferred. All tokens in `entries` must belong to this coin.
 
 **Preconditions (must be checked synchronously before writing):**
@@ -221,7 +221,7 @@ Marks a reservation as committed. Called immediately before `removeToken()` to s
 - If `status === 'cancelled'`: log a warning (unexpected), no-op. A cancelled reservation should never be committed.
 - If `status === 'active'`: set `status = 'committed'`.
 
-**Note on tokenIndex:** The committed reservation remains in `tokenIndex` until `cleanup()` or until the token itself is removed (which triggers `cancelForToken()`). `getFreeAmount()` must treat committed reservations as still consuming the token's amount, because the token has not yet been physically removed from `this.tokens`. The token disappears from `this.tokens` a few lines after `commit()` in the send flow.
+**Immediate removal:** On commit, the reservation is immediately removed from both `reservations` and `tokenIndex`. The committed tokens are about to be removed from the wallet, so the reservation is no longer needed for capacity tracking.
 
 ---
 
@@ -235,7 +235,7 @@ Releases a reservation, making the reserved amounts available again.
 - If `status === 'cancelled'`: no-op (idempotent).
 - If `status === 'active'`: set `status = 'cancelled'`, remove from `tokenIndex` for all referenced tokens.
 
-**Post-cancel state:** The cancelled entry MAY remain in `this.reservations` until `cleanup()` runs. This is acceptable because `getFreeAmount()` only sums reservations with `status === 'active'`.
+**Immediate removal:** On cancel, the reservation is immediately removed from both `reservations` and `tokenIndex`. The cancelled entry does not linger in the maps.
 
 ---
 
@@ -255,21 +255,25 @@ Cancels all active reservations that reference `tokenId`. Called by `removeToken
 
 ---
 
-#### `getFreeAmount(tokenId): bigint`
+#### `getFreeAmount(tokenId, tokenAmount): bigint`
 
 Returns the amount of `tokenId` that is available for new reservations.
+
+**Parameters:**
+- `tokenId: string` — The token to check.
+- `tokenAmount: bigint` — The total amount of the token (the ledger does not store token references itself).
 
 **Computation:**
 
 ```
-freeAmount = token.amount − Σ{ entry.amounts.get(tokenId) | entry ∈ reservations, entry.status ∈ { 'active', 'committed' } }
+freeAmount = tokenAmount − Σ{ entry.amounts.get(tokenId) | entry ∈ reservations, entry.status ∈ { 'active', 'committed' } }
 ```
 
 Both active and committed reservations are subtracted. Committed reservations still hold the token amount until the token is physically removed.
 
 **Returns:**
 - The free amount as a `bigint >= 0`.
-- If `tokenId` does not exist in `this.tokens` (as maintained by the caller, `PaymentsModule`): returns `0n`.
+- Returns `0n` if the result would be negative (defensive, satisfies I-RL-1).
 
 **This operation must be O(k)** where k is the number of reservations referencing this token. Use `tokenIndex` for lookup.
 
@@ -294,14 +298,6 @@ getFreeAmount(tokenId) + getTotalReserved(tokenId) = token.amount
 for any token that exists in the pool.
 
 ---
-
-#### `getActiveCoinReservations(coinId): Map<string, bigint>`
-
-Returns a map of all amounts reserved for `coinId` across all active reservations.
-
-**Returns:** `Map<tokenId, totalReservedAmount>` where `totalReservedAmount` is the sum of all active-reservation amounts for that token within the given coin. Committed and cancelled reservations are excluded.
-
-**Use case:** Used by `SpendPlanner` to build the "free view" of the token pool before calling `calculateOptimalSplitSync`.
 
 ---
 
@@ -452,7 +448,8 @@ planSend(
   parsedPool: ParsedTokenPool,
   ledger: TokenReservationLedger,
   queue: SpendQueue,
-  reservationId: string
+  reservationId: string,
+  pendingChangeAmount?: bigint
 ): { reservationId: string; splitPlan: SplitPlan } | 'queued'
 ```
 
@@ -471,7 +468,10 @@ This method contains **no `await`**. The entire body runs synchronously.
 3. Compute totalAvailable (free): sum of freeView amounts
 
 4. Compute totalInventory: sum of ALL parsedPool amounts for this coinId
-   (regardless of reservations)
+   (regardless of reservations) + pendingChangeAmount (if provided).
+   pendingChangeAmount represents in-flight change tokens (placeholder tokens with
+   status='transferring') that cannot be planned against yet but should be counted
+   to avoid false SEND_INSUFFICIENT_BALANCE rejections during concurrent sends.
 
 5. Determine outcome:
       Case A — plan !== null (sufficient free tokens):
@@ -507,7 +507,7 @@ Note: for a split token, only `splitAmount` (the portion being sent) is reserved
 
 ```
 // (async context, but planSend itself is synchronous)
-const planResult = this.spendPlanner.planSend(request, parsedPool, ledger, queue, result.id);
+const planResult = this.spendPlanner.planSend(request, parsedPool, ledger, queue, result.id, pendingChangeAmount);
 if (planResult === 'queued') {
   // Await the promise from the queue
   const { reservationId, splitPlan } = await this.spendQueue.waitForEntry(result.id);
@@ -559,18 +559,14 @@ interface QueueEntry {
   /** Wall-clock time when this entry was enqueued */
   readonly enqueuedAt: number;
 
-  /**
-   * Number of times this entry has been skipped (i.e., notifyChange fired but
-   * this entry could not be served while a later entry could).
-   * Used for starvation protection.
-   */
-  skipCount: number;
-
   /** Resolve the promise returned to the send() caller */
   resolve: (result: PlanResult) => void;
 
   /** Reject the promise returned to the send() caller */
   reject: (error: SphereError) => void;
+
+  /** Per-entry timeout handle (setTimeout) for QUEUE_TIMEOUT_MS expiry */
+  timeout: ReturnType<typeof setTimeout>;
 }
 
 interface PlanResult {
@@ -606,9 +602,8 @@ When `notifyChange(coinId)` fires, new tokens may have arrived that were not in 
         Remove entry from queue
 
    e. If plan NOT found:
-        entry.skipCount++
-        If entry.skipCount >= MAX_SKIP_COUNT:
-            Stop iterating (starvation protection — wait for this entry to be served)
+        Skip this entry (pass-over) — smaller entries behind it can still proceed.
+        Entries that remain unsatisfied will be rejected by the per-entry timeout.
 ```
 
 **Parsing new tokens synchronously:** Step (a) requires synchronous access to parsed token data for tokens added since enqueue. To support this, `addToken()` must cache the parsed `SdkToken` and `amount` in a `parsedTokenCache: Map<string, ParsedTokenEntry>` maintained on `PaymentsModule`. This cache is populated at `addToken()` time (async, not in the critical section) and consulted synchronously in `notifyChange`. The cache is invalidated at `removeToken()` time.
@@ -619,15 +614,14 @@ When `notifyChange(coinId)` fires, new tokens may have arrived that were not in 
 
 ---
 
-#### `enqueue(entry: Omit<QueueEntry, 'skipCount' | 'resolve' | 'reject'>): Promise<PlanResult>`
+#### `enqueue(entry: Omit<QueueEntry, 'resolve' | 'reject' | 'timeout'>): Promise<PlanResult>`
 
 Adds an entry to the queue and returns a promise that resolves when the entry is eventually planned.
 
 **Behavior:**
 1. Check `size()` against `QUEUE_MAX_SIZE` (100). If at capacity, immediately reject with `SEND_QUEUE_FULL`.
 2. Create a deferred promise, capturing `resolve` and `reject`.
-3. Set `entry.skipCount = 0`.
-4. Append to the per-coinId queue (a `Map<string, QueueEntry[]>`).
+3. Append to the per-coinId queue (a `Map<string, QueueEntry[]>`).
 5. Schedule `entry.enqueuedAt + QUEUE_TIMEOUT_MS` timeout. On fire: reject with `SEND_QUEUE_TIMEOUT` and remove from queue.
 6. Return the deferred promise.
 
@@ -666,11 +660,7 @@ while i < entries.length:
         entries.splice(i, 1)
         continue  // do NOT increment i (next entry shifts to position i)
 
-    // Could not serve this entry
-    entry.skipCount++
-    if entry.skipCount >= MAX_SKIP_COUNT:
-        break  // starvation protection: stop here, this entry must be served next
-
+    // Could not serve this entry — pass over it, try later ones
     i++
 
 // Update queue
@@ -680,7 +670,7 @@ else:
     this.queue.set(coinId, entries)
 ```
 
-**Starvation protection detail:** When `entry.skipCount >= MAX_SKIP_COUNT`, the loop breaks immediately, preventing later entries from jumping ahead of a starving entry. On the next `notifyChange()`, the same entry is evaluated first again. `skipCount` is NOT reset on failed re-evaluation — it only stops incrementing past MAX_SKIP_COUNT.
+**Pass-over behavior:** There is no explicit `skipCount` or starvation-promotion mechanism. The queue uses simple FIFO with pass-over: entries that cannot be planned are skipped, and smaller entries behind them can proceed. Entries that remain unsatisfied are eventually rejected by the per-entry timeout (`QUEUE_TIMEOUT_MS`).
 
 ---
 
@@ -713,16 +703,13 @@ Returns the number of queued entries.
 - If `coinId` provided: count for that coin only.
 - If omitted: total across all coins.
 
-### 6.5 Periodic Timeout Check
+### 6.5 Timeout Mechanism
 
-In addition to per-entry timeout scheduling (set in `enqueue()`), the `SpendQueue` runs a periodic timer every `QUEUE_CHECK_INTERVAL_MS = 1000` milliseconds.
+Each queued entry has a per-entry `setTimeout` set at `enqueue()` time, firing after `QUEUE_TIMEOUT_MS` milliseconds. When the timeout fires, the entry is immediately rejected with `SEND_QUEUE_TIMEOUT` and removed from the queue.
 
-**Timer behavior:**
-1. Call `ledger.cleanup(RESERVATION_TIMEOUT_MS)` to remove stale reservations.
-2. For each coinId with stale reservations (returned by `cleanup()`): call `notifyChange(coinId)`.
-3. Scan all queued entries for timeout expiry (belt-and-suspenders for the per-entry timer).
+Additionally, `notifyChange()` checks each entry's `enqueuedAt` against `QUEUE_TIMEOUT_MS` before attempting to plan it. This provides a synchronous belt-and-suspenders check in case the per-entry timer is delayed by event loop saturation.
 
-This dual-timeout mechanism ensures that entries are evicted even if the per-entry `setTimeout` is delayed by event loop saturation.
+There is no periodic `setInterval` timer. All timeout enforcement is per-entry.
 
 ---
 
@@ -973,9 +960,7 @@ If a token that is currently reserved is detected as spent (via aggregator valid
 **Notification to affected sends:**
 The `send()` calls that were waiting for those reservations need to be notified. This is handled implicitly: the reservation is cancelled, so when those sends proceed to `commit()` or check their reservation status, they will find it cancelled.
 
-**Implementation:** `SpendPlanner` should expose a `onReservationCancelled(reservationId, reason)` callback that `PaymentsModule` registers. When `cancelForToken()` returns a list of IDs, `PaymentsModule` calls this callback for each, which causes the corresponding `send()` to fail with `SEND_RESERVATION_CANCELLED`.
-
-Alternatively, `send()` can check `ledger.getStatus(reservationId)` before proceeding to the execution phase, and throw `SEND_RESERVATION_CANCELLED` if the status is `'cancelled'`. This check occurs synchronously after `waitForEntry()` resolves.
+**Implementation:** `cancelForToken()` immediately cancels all active reservations referencing the removed token and returns the list of cancelled reservation IDs. The corresponding `send()` calls will discover their reservation is gone when they attempt `commit()` (which becomes a no-op for a cancelled reservation). The send's error handling path will then fire, cleaning up token statuses.
 
 ### 9.4 Queue Timeout (30 Seconds)
 
@@ -1009,7 +994,6 @@ The following error codes are new (added to `SphereError` code registry):
 |------|------|-------------|--------------|----------------|
 | `SEND_QUEUE_TIMEOUT` | `SphereError` | Queued send exceeded `QUEUE_TIMEOUT_MS` (30s) without being served | Yes | Retry immediately; likely cause was concurrent sends with a slow aggregator round-trip |
 | `SEND_INSUFFICIENT_BALANCE` | `SphereError` | Total token inventory (including all reserved tokens) is less than the requested amount | No | User needs more tokens; do not retry automatically |
-| `SEND_RESERVATION_CANCELLED` | `SphereError` | A token that was reserved for this send was removed (spent, invalidated, or sync-removed) while the send was in progress | Yes | Retry; the conflicting token is gone, new selection will avoid it |
 | `MODULE_DESTROYED` | `SphereError` | `destroy()` was called while the send was queued or in-flight | No | Do not retry; the wallet is shutting down |
 | `SEND_QUEUE_FULL` | `SphereError` | Queue has reached `QUEUE_MAX_SIZE` (100) entries for this coin | Yes | Back off and retry after a short delay |
 
@@ -1062,7 +1046,7 @@ The critical section is not a lock. It is defined as the contiguous synchronous 
 ```
 ─── (await buildParsedPool resolves) ────────────────────────────────────────
   START OF CRITICAL SECTION
-  ledger.getActiveCoinReservations(coinId)   [sync read]
+  ledger.getFreeAmount(tokenId, tokenAmount)  [sync read, per-token]
   calculateOptimalSplitSync(freeView)        [sync compute]
   ledger.reserve(...)                        [sync write]
   ─── OR ───
@@ -1096,7 +1080,7 @@ A deadlock requires a circular wait: resource A waits for B, and B waits for A. 
 | Operation | Complexity | Expected Duration |
 |-----------|------------|-------------------|
 | `buildParsedPool()` | O(n × parse cost) | ~1-5ms for typical wallets (10-100 tokens) |
-| `getActiveCoinReservations()` | O(r) where r = active reservations | <1µs for typical r < 10 |
+| `getFreeAmount()` | O(k) where k = reservations for that token | <1µs for typical k < 10 |
 | `calculateOptimalSplitSync()` | O(n²) worst case (combinations) | <1ms for n ≤ 100 tokens |
 | `ledger.reserve()` | O(k) where k = tokens in plan | <1µs for typical k ≤ 5 |
 | `planSend()` total | O(n² + r) | <2ms total critical section |
@@ -1148,15 +1132,13 @@ All constants defined in a single location (e.g., `modules/payments/spend-queue-
 | `QUEUE_TIMEOUT_MS` | `30_000` | Queued send expiry (ms from enqueue time) |
 | `MAX_SKIP_COUNT` | `10` | Max times an entry can be skipped before starvation protection halts forward progress |
 | `QUEUE_MAX_SIZE` | `100` | Maximum queue depth per coinId before new enqueues are rejected |
-| `QUEUE_CHECK_INTERVAL_MS` | `1_000` | Periodic cleanup timer interval (ms) |
 
 **Rationale:**
 
 - `RESERVATION_TIMEOUT_MS = 30s`: Covers the conservative-mode round-trip (~42s would be too short, but the retry path handles that). Set at 30s to match `QUEUE_TIMEOUT_MS`.
 - `QUEUE_TIMEOUT_MS = 30s`: Long enough for instant-mode change tokens (~2.3s) plus network variance. Short enough to surface failures promptly.
-- `MAX_SKIP_COUNT = 10`: After being skipped 10 times, an entry is almost certainly dealing with starvation rather than a transient unavailability. At ~2.3s per change token, 10 skips ≈ 23s before starvation protection kicks in, well within the 30s timeout.
+- `MAX_SKIP_COUNT = 10`: Exported for test compatibility but not used by production queue logic. The queue uses simple FIFO with pass-over; starvation is prevented by the per-entry timeout.
 - `QUEUE_MAX_SIZE = 100`: Prevents unbounded memory growth. 100 concurrent sends of the same coin is far beyond any realistic usage.
-- `QUEUE_CHECK_INTERVAL_MS = 1s`: Provides timely timeout detection without significant overhead.
 
 ---
 
@@ -1191,8 +1173,7 @@ The following invariants must hold at all times during normal operation. Violati
 | I-SQ-1 | Every queued entry has a corresponding deferred promise that will eventually be resolved or rejected |
 | I-SQ-2 | No entry remains in the queue after its deferred promise has been resolved or rejected |
 | I-SQ-3 | `notifyChange()` is synchronous |
-| I-SQ-4 | An entry's `skipCount` never decreases |
-| I-SQ-5 | An entry that has reached `MAX_SKIP_COUNT` is always evaluated before any entry with lower `skipCount` in the same `notifyChange()` pass |
+| I-SQ-4 | An entry that cannot be planned is passed over, not removed — it remains in the queue until served or timed out |
 
 ### PaymentsModule Integration Invariants
 
@@ -1248,10 +1229,7 @@ The following test scenarios must be covered by unit tests. All tests use mocked
 
 - [ ] `enqueue` returns a Promise that resolves when `notifyChange` makes tokens available
 - [ ] `notifyChange` serves FIFO entries when possible
-- [ ] `notifyChange` skips entries and serves later ones when skip-ahead applicable
-- [ ] `skipCount` increments on skip
-- [ ] Starvation protection: loop halts when first entry reaches `MAX_SKIP_COUNT`
-- [ ] `skipCount` does not decrement
+- [ ] `notifyChange` passes over blocked entries and serves later ones when possible
 - [ ] Entry timeout: rejected after `QUEUE_TIMEOUT_MS`
 - [ ] `cancelAll` rejects all entries with the provided reason
 - [ ] `size()` returns correct counts
@@ -1268,7 +1246,7 @@ The following test scenarios must be covered by unit tests. All tests use mocked
 - [ ] Failed send releases reservation, wakes queued send
 - [ ] `destroy()` during queued send: rejected with `MODULE_DESTROYED`
 - [ ] Queue timeout (simulated): rejected with `SEND_QUEUE_TIMEOUT`, reservation cleaned up
-- [ ] Token removed while reserved: `SEND_RESERVATION_CANCELLED` for affected sends
+- [ ] Token removed while reserved: reservation cancelled, affected sends fail gracefully
 - [ ] Reservation committed before `removeToken` in success path
 - [ ] Reservation cancelled before `emitEvent('transfer:failed')` in failure path
 - [ ] `parsedTokenCache` populated on `addToken`, cleared on `removeToken`

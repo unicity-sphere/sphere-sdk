@@ -364,7 +364,7 @@ function runScenarioA(
     // Execute N transfers
     for (let i = 0; i < transferCount; i++) {
       const transferNum = i + 1;
-      const sendCmd = `send @${receiverNametag} ${amount} --coin ${coinSymbol} --instant`;
+      const sendCmd = `send @${receiverNametag} ${amount} ${coinSymbol} --instant`;
 
       console.log(`  [${transferNum}/${transferCount}] ${sendCmd}`);
 
@@ -530,7 +530,7 @@ function runScenarioB(
 
     for (let i = 0; i < transferCount; i++) {
       const transferNum = i + 1;
-      const sendCmd = `send @${receiverNametag} ${amount} --coin ${coinSymbol} --instant`;
+      const sendCmd = `send @${receiverNametag} ${amount} ${coinSymbol} --instant`;
 
       try {
         const { stdout: sendOut, durationMs: sendTime } = cli(sendCmd, senderProfile);

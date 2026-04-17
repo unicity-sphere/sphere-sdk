@@ -50,7 +50,7 @@ PaymentsModule
 │
 ├── TokenReservationLedger                (NEW)
 │   ├── reserved: Map<tokenId, ReservationEntry[]>
-│   └── API: reserve(), release(), commit(), getFreeAmount()
+│   └── API: reserve(), commit(), cancel(), getFreeAmount()
 │
 ├── SpendPlanner                          (NEW)
 │   ├── plan(): synchronous critical section
@@ -61,8 +61,8 @@ PaymentsModule
 ├── SpendQueue                            (NEW)
 │   ├── queue: QueueEntry[]
 │   ├── enqueue(): add pending request
-│   ├── tryAdvance(): attempt to serve next satisfiable entry
-│   └── drain(): wake all waiters on destroy
+│   ├── notifyChange(): attempt to serve next satisfiable entry
+│   └── destroy(): reject all waiters and mark queue destroyed
 │
 ├── TokenSplitCalculator                  (existing — receives filtered view)
 │
@@ -81,33 +81,31 @@ The ledger is the single source of truth for which portions of which tokens have
 
 ```
 ReservationEntry {
-  reservationId: string          // UUID, matches the TransferResult.id of the originating send
-  tokenId:       string          // ID of the token being reserved
-  amount:        bigint          // Amount claimed from this token by this reservation
-  coinId:        string          // Coin type (for validation)
-  state:         'pending'       // Only one state — reservation is either present or absent
-  createdAt:     number          // ms timestamp (for timeout cleanup)
+  reservationId: string                  // UUID, matches the TransferResult.id of the originating send
+  amounts:       Map<string, bigint>     // tokenId → reserved amount (a single reservation may span multiple tokens)
+  coinId:        string                  // Coin type (all tokens share the same coin)
+  createdAt:     number                  // ms timestamp (for timeout cleanup)
+  status:        'active' | 'committed' | 'cancelled'
 }
 
 TokenReservationLedger {
-  // Primary index: tokenId → list of active reservations on that token
-  byToken:          Map<string, ReservationEntry[]>
+  // Primary index: reservationId → ReservationEntry
+  reservations:   Map<string, ReservationEntry>
 
-  // Secondary index: reservationId → list of entries belonging to this reservation
-  // (a single send may reserve partial amounts from multiple tokens)
-  byReservation:    Map<string, ReservationEntry[]>
+  // Secondary index (acceleration): tokenId → Set<reservationId>
+  // Maintained in sync with reservations map at all mutation points
+  tokenIndex:     Map<string, Set<string>>
 }
 ```
 
 ### 4.3 Volume-Aware Free Amount
 
-For a given `(tokenId, coinId)` pair, the free amount available for new reservations is:
+For a given `(tokenId, tokenAmount)` pair, the free amount available for new reservations is:
 
 ```
-freeAmount(tokenId, coinId) =
-    token.amount (as bigint)
-  - sum of entry.amount for all ReservationEntry where entry.tokenId === tokenId
-                                                      AND entry.coinId === coinId
+getFreeAmount(tokenId, tokenAmount) =
+    tokenAmount (as bigint)
+  - sum of entry.amounts.get(tokenId) for all ReservationEntry where entry.status in ('active', 'committed')
 ```
 
 This subtraction happens in a synchronous read — no `await` points. This is the key invariant that makes the critical section safe.
@@ -133,17 +131,17 @@ reserve(reservationId, [(tokenId, amount, coinId), ...])
   → creates ReservationEntry records in byToken and byReservation
   → MUST be called from within the synchronous critical section
 
-release(reservationId)
+cancel(reservationId)
   → synchronous
   → removes all ReservationEntry records for this reservationId
   → MUST be called from within the synchronous critical section or failure path
-  → triggers SpendQueue.tryAdvance() after removal
+  → triggers SpendQueue.notifyChange() after removal
 
 commit(reservationId)
   → called after tokens are physically removed from pool (removeToken completes)
   → removes entries from the ledger (they are no longer needed)
-  → distinct from release: commit is the happy path, release is the error path
-  → triggers SpendQueue.tryAdvance() after removal
+  → distinct from cancel: commit is the happy path, cancel is the error path
+  → triggers SpendQueue.notifyChange() after removal
 ```
 
 ### 4.6 Why No "committed" State in the Ledger
@@ -152,12 +150,12 @@ Once `removeToken()` is called and the token is archived, the reservation entry 
 
 ### 4.7 Timeout / Cleanup
 
-Reservations that are never committed or released (e.g., due to an unhandled exception that bypassed the finally block) would permanently reduce the perceived free amount of a token. To defend against this:
+Reservations that are never committed or cancelled (e.g., due to an unhandled exception that bypassed the finally block) would permanently reduce the perceived free amount of a token. To defend against this:
 
 - Each `ReservationEntry` carries a `createdAt` timestamp.
-- A background sweep runs every 120 seconds and releases any reservation older than 90 seconds.
-- 90 seconds is chosen as a safe upper bound — the longest expected `send()` duration is the conservative-mode path with proof collection (~42s). A 90-second timeout leaves 2x headroom.
-- The sweep calls `release(reservationId)` which triggers `SpendQueue.tryAdvance()`.
+- Each queued entry has its own `setTimeout` that fires after `RESERVATION_TIMEOUT_MS = 30_000` milliseconds.
+- 30 seconds matches the queue timeout (`QUEUE_TIMEOUT_MS`) — a reservation that has not been committed or cancelled within this window is considered stale.
+- The timeout calls `cancel(reservationId)` which triggers `SpendQueue.notifyChange()`.
 - A warning is logged whenever a timeout-expired reservation is cleaned up, as this indicates a bug in the lifecycle management code.
 
 ---
@@ -184,10 +182,15 @@ The critical section cannot `await`. Therefore all async work that informs the p
 ### 5.4 Decision Logic (synchronous)
 
 ```
-plan(request: TransferRequest, parsedTokens: ParsedTokenPool): PlanDecision
+planSend(request, parsedPool, ledger, queue, reservationId, pendingChangeAmount?): PlanResult | 'queued'
 
-  freeTokens = tokens where freeAmount(t.id, coinId) === t.amount  (fully free)
-  partiallyFreeTokens = tokens where freeAmount(t.id, coinId) > 0 AND < t.amount
+  pendingChangeAmount is an optional bigint representing the total amount of change
+  tokens currently in-flight (status='transferring', placeholder tokens). These are
+  counted toward totalInventory to avoid false SEND_INSUFFICIENT_BALANCE rejections
+  when concurrent sends are waiting for change from prior splits.
+
+  freeTokens = tokens where getFreeAmount(t.id, t.amount) === t.amount  (fully free)
+  partiallyFreeTokens = tokens where getFreeAmount(t.id, t.amount) > 0 AND < t.amount
 
   // Pass the effective free view to the split calculator
   // (freeTokens + partial tokens with their reduced free amounts)
@@ -236,7 +239,7 @@ The split calculator must see only the free portion of each token. For tokens wi
 
 ### 5.7 notifyChange()
 
-When a change token arrives (via `onChangeTokenCreated` callback) or a reservation is released, `SpendPlanner.notifyChange(coinId)` is called. This triggers `SpendQueue.tryAdvance(coinId)` to attempt to serve waiting requests.
+When a change token arrives (via `onChangeTokenCreated` callback) or a reservation is cancelled, `SpendPlanner.notifyChange(coinId)` is called. This triggers `SpendQueue.notifyChange(coinId)` to attempt to serve waiting requests.
 
 ---
 
@@ -250,64 +253,70 @@ The `SpendQueue` holds spend requests that cannot be served immediately because 
 
 ```
 QueueEntry {
-  requestId:        string              // matches TransferResult.id
+  id:               string              // matches TransferResult.id
   request:          TransferRequest
   coinId:           string
   amount:           bigint
-  resolve:          (splitPlan: SplitPlan) => void   // unblocks the waiting send()
+  resolve:          (result: PlanResult) => void     // unblocks the waiting send()
   reject:           (err: Error) => void
   enqueuedAt:       number              // ms timestamp
   parsedPool:       ParsedTokenPool     // snapshot of parsed tokens at enqueue time
+  timeout:          ReturnType<typeof setTimeout>    // per-entry timeout handle
 }
 
 SpendQueue {
-  entries:  QueueEntry[]               // ordered by arrival time
+  queues:   Map<string, QueueEntry[]>  // per-coinId FIFO queues
 }
 ```
 
 ### 6.3 Enqueue
 
-`enqueue()` creates a `QueueEntry` and returns a `Promise<SplitPlan>`. The `send()` call `await`s this promise. The promise is resolved when `tryAdvance()` finds that the request can now be served.
+`enqueue()` creates a `QueueEntry` and returns a `Promise<SplitPlan>`. The `send()` call `await`s this promise. The promise is resolved when `notifyChange()` finds that the request can now be served.
 
 `enqueue()` is called from the synchronous critical section. The promise itself is created synchronously; the executor function captures `resolve` and `reject` for later use.
 
-### 6.4 tryAdvance(coinId?)
+### 6.4 notifyChange(coinId?)
 
-`tryAdvance()` is called whenever the free pool increases (change token arrival, reservation release/commit). It iterates the queue and attempts to serve requests:
+`notifyChange()` is called whenever the free pool increases (change token arrival, reservation cancel/commit). It iterates the queue and attempts to serve requests:
 
 ```
-tryAdvance(coinId?: string):
-  for each entry in entries (in order):
-    if coinId is specified and entry.coinId !== coinId: continue
+notifyChange(coinId: string):
+  entries = per-coinId queue for coinId
+  i = 0
+  while i < entries.length:
+    entry = entries[i]
 
-    // Re-enter the synchronous critical section
-    decision = spendPlanner.plan(entry.request, rebuildParsedPool())
-    if decision.type === 'proceed':
-      remove entry from queue
-      entry.resolve(decision.splitPlan)
-      // Note: the reservation is NOW held by this entry's reservationId
-      continue  // keep trying for remaining entries
-
-    if decision.type === 'reject':
-      // Total inventory no longer sufficient (tokens were consumed by another path)
-      remove entry from queue
-      entry.reject(new SphereError('Insufficient balance', 'INSUFFICIENT_BALANCE'))
+    // Check timeout first
+    if Date.now() - entry.enqueuedAt > QUEUE_TIMEOUT_MS:
+      entry.reject(new SphereError('Send queue timeout', 'SEND_QUEUE_TIMEOUT'))
+      entries.splice(i, 1)
       continue
 
-    // Still blocked — leave in queue
+    // Build merged pool (original snapshot + fresh parsedTokenCache entries)
+    // Try to plan with currently free tokens
+    plan = calculateOptimalSplitSync(freeView, entry.amount)
+
+    if plan !== null:
+      ledger.reserve(entry.id, planEntries(plan), entry.coinId)
+      entry.resolve({ reservationId: entry.id, splitPlan: plan })
+      entries.splice(i, 1)
+      continue
+
+    // Could not plan — skip this entry, try later ones (pass-over)
+    i++
 ```
 
-**Skip-ahead behavior:** `tryAdvance()` does not stop at the first blocked entry. It continues iterating to find any satisfiable entry further in the queue. This implements the "smart queue" requirement: a small send that can be served with available tokens is not blocked by a larger send waiting for a specific change token.
+**Skip-ahead behavior:** `notifyChange()` does not stop at the first blocked entry. It continues iterating to find any satisfiable entry further in the queue. This implements the "smart queue" requirement: a small send that can be served with available tokens is not blocked by a larger send waiting for a specific change token.
 
-**Starvation prevention:** A queue entry that has been skipped N times (tracked by a `skipCount` field) is promoted to head position when `skipCount >= MAX_SKIP_COUNT` (default: 10). Once promoted, subsequent `tryAdvance()` calls will not skip it — other entries behind it must wait until this entry is served or rejected.
+**Pass-over behavior:** Entries that cannot be planned are simply skipped, and smaller entries behind them proceed. There is no explicit `skipCount` or starvation-promotion mechanism — the queue uses simple FIFO with pass-over. Entries that remain unsatisfied will eventually be rejected by the per-entry timeout (`QUEUE_TIMEOUT_MS`).
 
 ### 6.5 Queue Ordering and Fairness
 
-The queue is approximately FIFO with skip-ahead. Entries are appended in arrival order. `tryAdvance()` scans forward and serves the first satisfiable entry it finds, then continues to find more. Starvation is bounded by `MAX_SKIP_COUNT`.
+The queue is approximately FIFO with pass-over. Entries are appended in arrival order. `notifyChange()` scans forward and serves the first satisfiable entry it finds, then continues to find more. Entries that cannot be planned are passed over and remain in the queue until served or timed out.
 
 ### 6.6 Queue Timeout
 
-A queued request that has not been served after 30 seconds is automatically rejected with `QUEUE_TIMEOUT`. The timer is started at `enqueuedAt` and checked during `tryAdvance()`. On rejection, the entry is removed and `entry.reject()` is called.
+A queued request that has not been served after 30 seconds is automatically rejected with `QUEUE_TIMEOUT`. The timer is started at `enqueuedAt` and checked during `notifyChange()`. On rejection, the entry is removed and `entry.reject()` is called.
 
 The 30-second timeout is chosen to be:
 - Long enough to accommodate the instant-mode change token latency (~2.3 seconds typical, up to ~10s under load)
@@ -329,11 +338,11 @@ onChangeTokenCreated: async (changeToken) => {
 }
 ```
 
-After step 3, `this.tokens` has grown. This is the trigger for `SpendQueue.tryAdvance()`.
+After step 3, `this.tokens` has grown. This is the trigger for `SpendQueue.notifyChange()`.
 
 ### 7.2 Integration Point
 
-`addToken()` is the single integration point. After `this.tokens.set(uiToken.id, uiToken)` completes inside `addToken()`, it calls `this.spendQueue.notifyChange(uiToken.coinId)`. This is a synchronous call that initiates `tryAdvance()`.
+`addToken()` is the single integration point. After `this.tokens.set(uiToken.id, uiToken)` completes inside `addToken()`, it calls `this.spendQueue.notifyChange(uiToken.coinId)`. This is a synchronous call that initiates `notifyChange()`.
 
 No other integration points are required. External token arrivals (Nostr receive) also go through `addToken()`, so they naturally trigger queue advancement as well — this is the correct behavior described in edge case G.3.
 
@@ -345,28 +354,28 @@ The current code creates a placeholder token with `status: 'transferring'` immed
 
 ### 7.4 Race: Change Token Arrives Before Queue Check
 
-If a change token arrives and `tryAdvance()` runs before the caller's `send()` has re-entered the critical section, the token is in the pool and available. The queue entry will be served on the `tryAdvance()` pass. The `send()` call will find its promise already resolved when it `await`s — no deadlock.
+If a change token arrives and `notifyChange()` runs before the caller's `send()` has re-entered the critical section, the token is in the pool and available. The queue entry will be served on the `notifyChange()` pass. The `send()` call will find its promise already resolved when it `await`s — no deadlock.
 
 ### 7.5 Race: Multiple Queued Requests, Single Change Token
 
 If change token C (amount 400) arrives and two queued requests each need 300 from that coin:
 
-- `tryAdvance()` runs.
+- `notifyChange()` runs.
 - First satisfiable entry (say request A needs 300): planner finds C is free (400 >= 300). Plans A using C (split: 300 to recipient, 100 remainder). Reserves 300 from C. Resolves A's promise.
 - Continues iterating. Request B needs 300. Planner finds C has only 100 free. Total inventory for coinId: existing tokens + C's unreserved 100. If sufficient with other tokens, B is served. If not, B remains queued.
-- A's send() resumes. Its split produces a new change token (100). `addToken()` fires. `tryAdvance()` runs again. If B needs that 100 combined with something else, it may now be served.
+- A's send() resumes. Its split produces a new change token (100). `addToken()` fires. `notifyChange()` runs again. If B needs that 100 combined with something else, it may now be served.
 
 ### 7.6 The Circular Dependency Risk
 
 Risk: request B is waiting for request A's change token. Request A is waiting in the queue behind request B. Both wait forever.
 
-This cannot happen with the skip-ahead queue: `tryAdvance()` does not block at B; it skips B and serves A first, producing the change token that will eventually serve B.
+This cannot happen with the skip-ahead queue: `notifyChange()` does not block at B; it skips B and serves A first, producing the change token that will eventually serve B.
 
 The only way circular waiting can occur is if:
 - All entries in the queue are mutually blocked on each other's change tokens
 - No change token from any other source arrives
 
-This is an inherently unresolvable situation (deadlock-equivalent). The 30-second queue timeout prevents indefinite blocking. Requests are rejected with a `QUEUE_TIMEOUT` error, freeing all reserved amounts and triggering another `tryAdvance()` pass that may unblock remaining entries.
+This is an inherently unresolvable situation (deadlock-equivalent). The 30-second queue timeout prevents indefinite blocking. Requests are rejected with a `QUEUE_TIMEOUT` error, freeing all reserved amounts and triggering another `notifyChange()` pass that may unblock remaining entries.
 
 ---
 
@@ -376,26 +385,26 @@ This is an inherently unresolvable situation (deadlock-equivalent). The 30-secon
 
 The `send()` method has a `try/catch` block. On entry into the catch block, the following cleanup must occur:
 
-1. `ledger.release(reservationId)` — synchronous, frees reserved amounts immediately
+1. `ledger.cancel(reservationId)` — synchronous, frees reserved amounts immediately
 2. `spendQueue.notifyChange(request.coinId)` — may unblock waiting requests
 3. Restore `token.status = 'confirmed'` for any tokens already marked `'transferring'` — existing behavior, unchanged
 
 The existing catch block at line 1360 already handles step 3. Steps 1 and 2 are added to the same catch block.
 
-If the failure occurs before the reservation was created (e.g., recipient resolution failed), no ledger entry exists. The release call must be a no-op in that case — `ledger.release()` checks for existence before removing.
+If the failure occurs before the reservation was created (e.g., recipient resolution failed), no ledger entry exists. The cancel call must be a no-op in that case — `ledger.cancel()` checks for existence before removing.
 
 ### 8.2 Aggregator Rejection (REQUEST_ID_EXISTS)
 
-This is the existing scenario where a concurrent send happened to produce the same `requestId`. The aggregator accepts the commitment but notes the ID already exists. The current code treats this as a success (`SUCCESS` or `REQUEST_ID_EXISTS`). No change needed from the queue's perspective — the reservation is committed (not released) and the token is removed normally.
+This is the existing scenario where a concurrent send happened to produce the same `requestId`. The aggregator accepts the commitment but notes the ID already exists. The current code treats this as a success (`SUCCESS` or `REQUEST_ID_EXISTS`). No change needed from the queue's perspective — the reservation is committed (not cancelled) and the token is removed normally.
 
 With the spend queue in place, the TOCTOU race that caused duplicate `requestId` values is eliminated. `REQUEST_ID_EXISTS` should become exceedingly rare. It is retained as a defensive case.
 
 ### 8.3 Reservation Timeout
 
-When the 90-second background sweep fires and expires a stale reservation (section 4.7):
-1. `ledger.release(reservationId)` removes the stale entry
+When the 30-second per-entry timeout fires and expires a stale reservation (section 4.7):
+1. `ledger.cancel(reservationId)` removes the stale entry
 2. `spendQueue.notifyChange(coinId)` runs
-3. The corresponding `send()` is almost certainly already in its catch block (or completed). The release is idempotent — if the send already called `release()`, the entry is already gone and the sweep is a no-op.
+3. The corresponding `send()` is almost certainly already in its catch block (or completed). The cancel is idempotent — if the send already called `cancel()`, the entry is already gone and the sweep is a no-op.
 
 The sweep must not call `send()`'s existing error-path token-status restoration, since that is the send's responsibility. The sweep only manages the ledger.
 
@@ -404,9 +413,9 @@ The sweep must not call `send()`'s existing error-path token-status restoration,
 When `PaymentsModule.destroy()` is called (or will be called — the module does not currently have a `destroy()` method for the payments layer; this is a future concern noted in the existing `pendingBackgroundTasks` pattern):
 
 1. Set a `destroyed` flag.
-2. Call `spendQueue.drain()` — rejects all queued entries with `MODULE_DESTROYED` error.
+2. Call `spendQueue.destroy()` — rejects all queued entries with `MODULE_DESTROYED` error.
 3. The `send()` calls awaiting those promises throw `MODULE_DESTROYED` and proceed to their catch blocks.
-4. Catch blocks call `ledger.release()` and restore token statuses.
+4. Catch blocks call `ledger.cancel()` and restore token statuses.
 
 This mirrors the `withInvoiceGate` destroyed-check pattern in `AccountingModule`.
 
@@ -461,7 +470,7 @@ For every token T in the pool:
 sum(entry.amount for all entries where entry.tokenId === T.id) <= T.amount
 ```
 
-This invariant is maintained by the synchronous critical section. I3 can temporarily be violated only if a reservation is released after its `removeToken()` has already been called — this is prevented by always calling `commit()` (not `release()`) on the happy path.
+This invariant is maintained by the synchronous critical section. I3 can temporarily be violated only if a reservation is released after its `removeToken()` has already been called — this is prevented by always calling `commit()` (not `cancel()`) on the happy path.
 
 ### I4 — Queue Entry Has Reservation or No Entry
 
@@ -469,9 +478,9 @@ A send that is waiting in the queue has **no active reservation** in the ledger.
 
 This avoids the situation where queued requests pre-reserve tokens they cannot yet use, further reducing the free pool and blocking other requests.
 
-### I5 — Change Token Triggers Exactly One tryAdvance Pass
+### I5 — Change Token Triggers Exactly One notifyChange Pass
 
-Each `addToken()` call triggers exactly one `tryAdvance()` pass. Multiple change tokens arriving in rapid succession each trigger their own pass. Passes are synchronous (no `await`) and therefore cannot interleave. This ensures no change token arrival is silently missed by the queue.
+Each `addToken()` call triggers exactly one `notifyChange()` pass. Multiple change tokens arriving in rapid succession each trigger their own pass. Passes are synchronous (no `await`) and therefore cannot interleave. This ensures no change token arrival is silently missed by the queue.
 
 ### I6 — Destroy Rejects All Queue Entries Before Cleanup
 
@@ -486,10 +495,10 @@ After `destroy()` returns (or its promise resolves), no queued entry has a pendi
 Scenario: All tokens are reserved by concurrent sends. One send fails at the aggregator level without producing a change token (e.g., the background `startBackground()` throws and the `onChangeTokenCreated` callback never fires).
 
 Handling:
-- The failed send's catch block calls `ledger.release(reservationId)`.
+- The failed send's catch block calls `ledger.cancel(reservationId)`.
 - `spendQueue.notifyChange()` runs — queued requests may now be served.
 - The split token that was consumed is archived by `removeToken()`. No change token entered the pool.
-- If total remaining inventory (after archival) is insufficient for queued requests, `tryAdvance()` will call `entry.reject(INSUFFICIENT_BALANCE)` for each affected entry.
+- If total remaining inventory (after archival) is insufficient for queued requests, `notifyChange()` will call `entry.reject(INSUFFICIENT_BALANCE)` for each affected entry.
 
 ### E2 — Rapid-Fire Sends Exhausting the Pool
 
@@ -519,13 +528,13 @@ Scenario: A token is received via Nostr while 3 sends are waiting in the queue.
 Handling:
 - Nostr reception calls `addToken(newToken)`.
 - `addToken()` adds to `this.tokens` and calls `spendQueue.notifyChange(coinId)`.
-- `tryAdvance()` runs and may serve one or more queued requests using the new token.
+- `notifyChange()` runs and may serve one or more queued requests using the new token.
 
 This is the correct behavior. External arrivals are indistinguishable from change token arrivals at the queue level.
 
 ### E4 — destroy() Called While Queue Has Pending Requests
 
-Handling described in section 8.4. The key requirement is that `drain()` runs synchronously (no `await`), rejecting all entries immediately so their catch blocks can run synchronously in the same event-loop turn if the runtime permits, or in the next microtask batch.
+Handling described in section 8.4. The key requirement is that `destroy()` runs synchronously (no `await`), rejecting all entries immediately so their catch blocks can run synchronously in the same event-loop turn if the runtime permits, or in the next microtask batch.
 
 ### E5 — Split Produces Change Token Immediately Needed by Queued Request
 
@@ -533,11 +542,11 @@ Scenario: Queued request B is waiting for 100 UCT. Send A completes and its chan
 
 Handling:
 - `addToken()` fires for the 150 UCT change token.
-- `tryAdvance()` runs. B is examined.
+- `notifyChange()` runs. B is examined.
 - The planner sees 150 free UCT. B needs 100. Plans a split on the change token: 100 to recipient, 50 remainder. Reserves 100.
 - B's promise resolves. B's `send()` resumes with the pre-built split plan.
 - B executes the split, producing a 50 UCT change token.
-- `addToken()` fires for the 50 UCT change token. `tryAdvance()` runs again (in case more queue entries were waiting for this coin).
+- `addToken()` fires for the 50 UCT change token. `notifyChange()` runs again (in case more queue entries were waiting for this coin).
 
 ### E6 — Queue Entry Becomes Unfulfillable Mid-Wait
 
@@ -546,7 +555,7 @@ Scenario: Queued request B is waiting for 100 UCT. While waiting, a `sync()` ope
 Handling:
 - Token removal calls `removeToken()`.
 - `removeToken()` should call `spendQueue.notifyChange(coinId)` (new integration point — in addition to `addToken()`).
-- `tryAdvance()` runs. For B, `decision.type === 'reject'` (total inventory < 100). B is rejected with `INSUFFICIENT_BALANCE`.
+- `notifyChange()` runs. For B, `decision.type === 'reject'` (total inventory < 100). B is rejected with `INSUFFICIENT_BALANCE`.
 
 This requires `removeToken()` to trigger a queue advance check, same as `addToken()`.
 
@@ -556,7 +565,7 @@ This requires `removeToken()` to trigger a queue advance check, same as `addToke
 
 | File | Change Required |
 |------|----------------|
-| `modules/payments/PaymentsModule.ts` | Add `TokenReservationLedger`, `SpendQueue`, `SpendPlanner` instances; modify `send()` and `sendInstant()` to go through the synchronous critical section; call `ledger.release()` / `ledger.commit()` in catch/finally blocks; call `spendQueue.notifyChange()` from `addToken()` and `removeToken()` |
+| `modules/payments/PaymentsModule.ts` | Add `TokenReservationLedger`, `SpendQueue`, `SpendPlanner` instances; modify `send()` and `sendInstant()` to go through the synchronous critical section; call `ledger.cancel()` / `ledger.commit()` in catch/success paths; call `spendQueue.notifyChange()` from `addToken()` and `removeToken()` |
 | `modules/payments/TokenSplitCalculator.ts` | Add `calculateOptimalSplitSync()` accepting a pre-parsed pool and free-amount map; existing `calculateOptimalSplit()` becomes a thin async wrapper |
 | `modules/payments/TokenReservationLedger.ts` | New file — implements the ledger (section 4) |
 | `modules/payments/SpendQueue.ts` | New file — implements the queue and planner (sections 5, 6) |
@@ -593,13 +602,13 @@ The `AccountingModule`, `InstantSplitExecutor`, `TokenSplitExecutor`, and `Backg
 
 **Alternative considered:** Return a `TEMPORARILY_INSUFFICIENT` error and let callers retry. Rejected because retry timing is non-trivial (change token latency is ~2.3s but variable), and coordinating retries across concurrent callers is complex.
 
-### ADR-004: Skip-Ahead Queue with Starvation Bound
+### ADR-004: FIFO Queue with Pass-Over
 
-**Decision:** `tryAdvance()` scans the entire queue and serves any satisfiable entry, not just the head. Starvation is bounded by `MAX_SKIP_COUNT = 10`.
+**Decision:** `notifyChange()` scans the entire queue and serves any satisfiable entry, not just the head. Entries that cannot be planned are passed over.
 
-**Rationale:** Strict FIFO would block a small send (10 UCT) behind a large send (10,000 UCT) that is waiting for a large change token. Skip-ahead maximizes throughput for independent requests.
+**Rationale:** Strict FIFO would block a small send (10 UCT) behind a large send (10,000 UCT) that is waiting for a large change token. Pass-over maximizes throughput for independent requests.
 
-**Starvation bound rationale:** Without a bound, a large request waiting for a specific change token could be starved indefinitely by a stream of small requests. `MAX_SKIP_COUNT = 10` is chosen empirically — a request that has been skipped 10 times has been waiting long enough that fairness demands it be served next.
+**Starvation prevention:** Entries that remain unsatisfied are eventually rejected by the per-entry timeout (`QUEUE_TIMEOUT_MS = 30s`). No explicit `skipCount` or promotion mechanism is implemented — the timeout provides the starvation bound.
 
 ### ADR-005: No Cross-Module Coupling
 

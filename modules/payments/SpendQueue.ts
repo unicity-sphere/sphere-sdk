@@ -29,7 +29,7 @@ export const RESERVATION_TIMEOUT_MS = 30_000;
 /** How long a queued entry waits before being rejected with SEND_QUEUE_TIMEOUT. */
 export const QUEUE_TIMEOUT_MS = 30_000;
 
-/** Max times an entry can be skipped (no plan found) before it blocks the queue head. */
+/** Exported for test compatibility. Not used by production queue logic. */
 export const MAX_SKIP_COUNT = 10;
 
 /** Maximum number of entries allowed in the queue across all coinIds. */
@@ -64,7 +64,6 @@ export interface QueueEntry {
   readonly coinId: string;
   readonly amount: bigint;
   readonly enqueuedAt: number;
-  skipCount: number;
   resolve: (result: PlanResult) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
@@ -124,12 +123,20 @@ export class SpendPlanner {
     parsedPool: ParsedTokenPool,
     ledger: TokenReservationLedger,
     queue: SpendQueue,
-    reservationId: string
+    reservationId: string,
+    pendingChangeAmount?: bigint,
   ): PlanResult | 'queued' {
+    if (!request.amount || !/^\d+$/.test(request.amount)) {
+      throw new SphereError('Invalid send amount', 'VALIDATION_ERROR');
+    }
     const requestedAmount = BigInt(request.amount);
+    if (requestedAmount <= 0n) {
+      throw new SphereError('Send amount must be positive', 'VALIDATION_ERROR');
+    }
     const coinId = request.coinId;
 
-    // Build free view: entries with positive free amounts after subtracting reservations
+    // Build free view: only fully-free tokens (no partial reservations).
+    // Matches buildFreeView() in SpendQueue — whole-token transfer semantics.
     const freeView: Array<{ token: Token; sdkToken: SdkToken<any>; amount: bigint }> = [];
     let totalInventory = 0n;
 
@@ -137,15 +144,23 @@ export class SpendPlanner {
       if (entry.token.coinId !== coinId) continue;
       totalInventory += entry.amount;
       const freeAmount = ledger.getFreeAmount(entry.token.id, entry.amount);
-      if (freeAmount > 0n) {
+      if (freeAmount > 0n && freeAmount === entry.amount) {
         freeView.push({ token: entry.token, sdkToken: entry.sdkToken, amount: freeAmount });
       }
+    }
+
+    // Include pending change tokens (placeholders with status='transferring')
+    // in the total inventory. These tokens can't be planned against yet, but
+    // counting them prevents a hard SEND_INSUFFICIENT_BALANCE when a concurrent
+    // send is waiting for change from a prior split to arrive.
+    if (pendingChangeAmount && pendingChangeAmount > 0n) {
+      totalInventory += pendingChangeAmount;
     }
 
     // Case C: total inventory (ignoring reservations) is insufficient
     if (totalInventory < requestedAmount) {
       throw new SphereError(
-        `Insufficient balance. Available: ${totalInventory}, Required: ${requestedAmount}`,
+        'Insufficient balance for this transaction',
         'SEND_INSUFFICIENT_BALANCE'
       );
     }
@@ -211,12 +226,15 @@ export class SpendPlanner {
       return this.createDirectPlan([asTokenWithAmount(exactMatch)], targetAmount);
     }
 
-    // Strategy 2: Combination search (up to 5 tokens)
-    const maxCombinationSize = Math.min(5, sorted.length);
-    for (let size = 2; size <= maxCombinationSize; size++) {
-      const combo = this.findCombinationOfSize(sorted, targetAmount, size, asTokenWithAmount);
-      if (combo) {
-        return this.createDirectPlan(combo, targetAmount);
+    // Strategy 2: Combination search (up to 5 tokens).
+    // Skip if too many candidates — C(n,5) is exponential.
+    if (sorted.length <= 20) {
+      const maxCombinationSize = Math.min(5, sorted.length);
+      for (let size = 2; size <= maxCombinationSize; size++) {
+        const combo = this.findCombinationOfSize(sorted, targetAmount, size, asTokenWithAmount);
+        if (combo) {
+          return this.createDirectPlan(combo, targetAmount);
+        }
       }
     }
 
@@ -369,17 +387,27 @@ export class SpendQueue {
    * later by notifyChange().
    */
   enqueue(
-    entry: Omit<QueueEntry, 'skipCount' | 'resolve' | 'reject' | 'timeout'>
+    entry: Omit<QueueEntry, 'resolve' | 'reject' | 'timeout'>
   ): Promise<PlanResult> {
+    if (this.destroyed) {
+      const p = Promise.reject(
+        new SphereError('Module has been destroyed', 'MODULE_DESTROYED')
+      );
+      p.catch(() => {});
+      return p;
+    }
+
     // Check queue size limit
     let totalSize = 0;
     for (const [, q] of this.queues) {
       totalSize += q.length;
     }
     if (totalSize >= QUEUE_MAX_SIZE) {
-      return Promise.reject(
+      const p = Promise.reject(
         new SphereError('Send queue is full', 'SEND_QUEUE_FULL')
       );
+      p.catch(() => {});
+      return p;
     }
 
     let resolvePromise!: (result: PlanResult) => void;
@@ -396,7 +424,6 @@ export class SpendQueue {
 
     const fullEntry: QueueEntry = {
       ...entry,
-      skipCount: 0,
       resolve: resolvePromise,
       reject: rejectPromise,
       timeout,
@@ -460,12 +487,28 @@ export class SpendQueue {
         continue;
       }
 
-      // Build merged pool: start from original parsedPool, override with fresh cache entries
-      const mergedPool: ParsedTokenPool = new Map(entry.parsedPool);
+      // W23 fix: Build merged pool preferring fresh parsedTokenCache entries.
+      // parsedPool is the snapshot from enqueue time — sdkToken objects may be stale
+      // (outdated state hash) if the token was updated between enqueue and wake-up.
+      // Start from parsedTokenCache (always fresh), fall back to parsedPool only for
+      // tokens not in the cache. buildFreeView's liveness check filters removed tokens.
+      const mergedPool: ParsedTokenPool = new Map();
+      // First: add all fresh cache entries for this coinId
       for (const [id, cached] of this.parsedTokenCache) {
         if (cached.token.coinId === coinId) {
           mergedPool.set(id, cached);
         }
+      }
+      // Then: add original entries only if not already in cache (stale fallback)
+      let staleCount = 0;
+      for (const [id, original] of entry.parsedPool) {
+        if (!mergedPool.has(id)) {
+          mergedPool.set(id, original);
+          staleCount++;
+        }
+      }
+      if (staleCount > 0) {
+        logger.warn(TAG, `Queue entry ${entry.id}: ${staleCount} token(s) using stale pool data`);
       }
 
       // Build free view and try planning
@@ -498,14 +541,9 @@ export class SpendQueue {
         continue;
       }
 
-      // Could not plan — skip
-      entry.skipCount++;
-      if (entry.skipCount >= MAX_SKIP_COUNT) {
-        // Starvation protection: stop processing this coinId queue
-        // so that the head entry is not starved indefinitely
-        logger.debug(TAG, `Queue entry ${entry.id} reached max skip count (${MAX_SKIP_COUNT}), halting queue scan`);
-        break;
-      }
+      // Could not plan — skip this entry and try later ones.
+      // Skip over the entry — smaller entries behind a large blocked one can
+      // still be planned, preventing starvation.
 
       i++;
     }
@@ -554,7 +592,16 @@ export class SpendQueue {
   // Private helpers
   // ---------------------------------------------------------------------------
 
-  /** Build a free-amount view from a parsed pool, consulting the ledger. */
+  /**
+   * Build a free-amount view from a parsed pool, consulting the ledger.
+   *
+   * W23 fix: Only include tokens where freeAmount === tokenAmount (fully free).
+   * A direct transfer sends the entire token — if another reservation holds part
+   * of it, the token cannot be sent directly. The planner's calculateOptimalSplitSync
+   * would select a partially-free token thinking it's available, but the reservation
+   * would fail with INSUFFICIENT_FREE_AMOUNT because extractReservationEntries
+   * correctly reserves the full token amount.
+   */
   private buildFreeView(
     pool: ParsedTokenPool,
     coinId: string
@@ -568,7 +615,9 @@ export class SpendQueue {
       const liveToken = liveTokens.get(tokenId);
       if (!liveToken || liveToken.status !== 'confirmed') continue;
       const freeAmount = this.ledger.getFreeAmount(entry.token.id, entry.amount);
-      if (freeAmount > 0n) {
+      // Only include fully-free tokens — partially reserved tokens cannot be
+      // used for direct transfers and would cause INSUFFICIENT_FREE_AMOUNT
+      if (freeAmount > 0n && freeAmount === entry.amount) {
         view.push({ token: entry.token, sdkToken: entry.sdkToken, amount: freeAmount });
       }
     }

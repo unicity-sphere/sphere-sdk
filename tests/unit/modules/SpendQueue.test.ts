@@ -823,7 +823,7 @@ describe('SpendQueue', () => {
       await largeProm.catch(() => {});
     });
 
-    it('halts queue scan when head entry reaches MAX_SKIP_COUNT', () => {
+    it('continues queue scan past entry that reaches MAX_SKIP_COUNT', () => {
       const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 50n }]);
       parsedTokenCache.set('tok-1', pool.get('tok-1')!);
 
@@ -851,17 +851,18 @@ describe('SpendQueue', () => {
       enq({ id: 'small-a', request: { amount: '50', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 50n, enqueuedAt: Date.now() });
       enq({ id: 'small-b', request: { amount: '50', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 50n, enqueuedAt: Date.now() });
 
-      // Round 10: large skipCount 9 -> 10, triggers break. small-a and small-b not processed.
+      // Round 10: large skipCount 9 -> 10, can't plan. Queue continues to small-a and small-b.
       spy.mockReset();
       spy.mockReturnValueOnce(null); // large
-      spy.mockReturnValueOnce(directPlan(pool.get('tok-1')!, 'UCT')); // would be small-a, but break fires first
+      spy.mockReturnValueOnce(directPlan(pool.get('tok-1')!, 'UCT')); // small-a served
+      spy.mockReturnValueOnce(null); // small-b can't plan (token reserved by small-a)
 
       queue.notifyChange('UCT');
 
-      // Planner called once (for large), then break -- starvation protection
-      expect(spy).toHaveBeenCalledTimes(1);
-      // Queue: large + small-a + small-b
-      expect(queue.size('UCT')).toBe(3);
+      // Planner called for all 3 entries — queue does not halt on blocked entry
+      expect(spy).toHaveBeenCalledTimes(3);
+      // Queue: large + small-b (small-a was served)
+      expect(queue.size('UCT')).toBe(2);
     });
 
     it('after head entry is served, later entries can proceed normally', async () => {
@@ -1140,6 +1141,81 @@ describe('SpendQueue', () => {
 
       // After resolution, the promise is deleted from internal map
       await expect(queue.waitForEntry(id)).rejects.toThrow('Queue entry not found');
+    });
+  });
+
+  describe('enqueue after destroy', () => {
+    it('rejects immediately with MODULE_DESTROYED', async () => {
+      queue.destroy();
+
+      const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 1000n }]);
+      const promise = queue.enqueue({
+        id: nextId(),
+        request: { amount: '500', coinId: 'UCT' },
+        parsedPool: pool,
+        coinId: 'UCT',
+        amount: 500n,
+        enqueuedAt: Date.now(),
+      });
+
+      await expect(promise).rejects.toThrow('Module has been destroyed');
+    });
+
+    it('does not add entry to queue after destroy', () => {
+      queue.destroy();
+      expect(queue.size()).toBe(0);
+
+      queue.enqueue({
+        id: nextId(),
+        request: { amount: '500', coinId: 'UCT' },
+        parsedPool: new Map(),
+        coinId: 'UCT',
+        amount: 500n,
+        enqueuedAt: Date.now(),
+      }).catch(() => {});
+
+      expect(queue.size()).toBe(0);
+    });
+  });
+
+  describe('fully-free invariant (W23)', () => {
+    it('partially-reserved token is excluded from free view', () => {
+      const pool = buildPool([{ id: 'tok-1', coinId: 'UCT', amount: 1000n }]);
+      parsedTokenCache.set('tok-1', pool.get('tok-1')!);
+      tokensMap.set('tok-1', pool.get('tok-1')!.token);
+
+      // Reserve 500 of 1000 — token is now partially reserved
+      ledger.reserve('res-partial', [{ tokenId: 'tok-1', amount: 500n, tokenAmount: 1000n }], 'UCT');
+
+      const id = nextId();
+      enq({ id, request: { amount: '400', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 400n, enqueuedAt: Date.now() });
+
+      // The planner should NOT be called with tok-1 because it's partially reserved
+      const spy = vi.spyOn(planner, 'calculateOptimalSplitSync').mockReturnValue(null);
+      queue.notifyChange('UCT');
+
+      if (spy.mock.calls.length > 0) {
+        const freeView = spy.mock.calls[0][0] as Array<{ token: Token; amount: bigint }>;
+        const tokenIds = freeView.map(e => e.token.id);
+        expect(tokenIds).not.toContain('tok-1');
+      }
+    });
+
+    it('fully-free token is included in free view', () => {
+      const pool = buildPool([{ id: 'tok-2', coinId: 'UCT', amount: 1000n }]);
+      parsedTokenCache.set('tok-2', pool.get('tok-2')!);
+      tokensMap.set('tok-2', pool.get('tok-2')!.token);
+
+      const id = nextId();
+      enq({ id, request: { amount: '800', coinId: 'UCT' }, parsedPool: pool, coinId: 'UCT', amount: 800n, enqueuedAt: Date.now() });
+
+      const spy = vi.spyOn(planner, 'calculateOptimalSplitSync').mockReturnValue(null);
+      queue.notifyChange('UCT');
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      const freeView = spy.mock.calls[0][0] as Array<{ token: Token; amount: bigint }>;
+      const tokenIds = freeView.map(e => e.token.id);
+      expect(tokenIds).toContain('tok-2');
     });
   });
 });
