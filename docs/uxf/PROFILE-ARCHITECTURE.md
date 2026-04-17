@@ -874,15 +874,27 @@ tokenId: aaa111...
 
 All three DAGs share most elements (genesis, first proof, certificate) — only the new transaction elements and the updated TokenRoot differ. The element pool deduplicates the shared parts.
 
-### 10.2 Manifest: Latest Known Version
+### 10.2 Manifest Is Derived (Not Stored)
 
-The manifest maps each `tokenId` to the **latest version known to this user**:
+The manifest (tokenId → rootHash mapping) is **not stored** in the UXF bundle. It is **computed** by scanning the element pool for `TokenRoot` elements and extracting their `tokenId` fields. This follows the UXF minimalism principle — the bundle is literally just the element pool (a bag of content-addressed DAG nodes).
 
+**Manifest reconstruction algorithm:**
 ```
-manifest:
-  aaa111... → hash_R3  (latest known: 2 transfers)
-  bbb222... → hash_R1  (latest known: just minted)
+For each element in pool where type === 'token-root':
+  tokenId = element.content.tokenId
+  rootHash = computeElementHash(element)
+  If tokenId already in manifest:
+    Compare transaction counts (root.children.transactions.length)
+    Keep the version with MORE transactions (longest VALID chain)
+  Else:
+    Add to manifest: tokenId → rootHash
 ```
+
+The manifest is reconstructed:
+- On load from IPFS/OrbitDB
+- After JOIN of multiple bundles
+- After receiving a token transfer
+- Cached in local storage for fast subsequent reads
 
 **Key distinction:** "latest known" is NOT necessarily "latest globally." Once a token has been transferred to another user, the original holder stops receiving updates. The token may have been transferred further N times by the new owner — the original holder's UXF pool still has the version from when they last held it.
 
@@ -1137,6 +1149,161 @@ Transaction history: DERIVED from token ownership chain scanning
     - Destination "unknown" when current predicate is not ours and no sync data
   • Cache in local storage, rebuild on demand
 ```
+
+### 10.10 Dual-Purpose UXF: Storage and Exchange
+
+UXF serves two distinct purposes with the same format but different scope:
+
+#### 10.10.1 Purpose 1: Profile Storage (replacing IPFS sync)
+
+UXF replaces the legacy TXF-over-IPFS storage with a streamlined approach:
+
+**Saving user profile to IPFS:**
+```
+Sphere SDK (TXF in memory)
+    │
+    ▼
+SMART FILTER: what goes into UXF vs what is skipped
+    │
+    ├── INCLUDE in UXF bundle:
+    │   • All token DAGs (owned, nametags, invoices, archived, references)
+    │   • Token elements (genesis, transactions, proofs, predicates, certs)
+    │
+    ├── STORE in OrbitDB (encrypted, not in UXF):
+    │   • Identity keys, addresses, nametag name mappings
+    │   • DM messages, conversations, group chat data
+    │   • Outbox, pending transfers, swap state
+    │   • Accounting settings (auto-return, frozen balances)
+    │
+    └── SKIP entirely (local cache, regenerated from APIs):
+        • Price cache, token registry cache
+        • Other users' nametag resolution cache
+        • Transaction history (derived from token pool)
+        • Tombstones (derived from oracle checks)
+        • Balance summaries (derived from owned tokens)
+
+Result: UXF bundle = pure element pool (bag of DAG nodes)
+Pin to IPFS → get CID → store CID in OrbitDB tokens.bundle.{CID}
+```
+
+**Recovering user profile from IPFS:**
+```
+OrbitDB tokens.bundle.{CID} keys → list of UXF bundle CIDs
+    │
+    ▼
+Fetch each CID from IPFS → UXF element pools
+    │
+    ▼
+JOIN all bundles → single merged element pool
+    │
+    ▼
+Reconstruct manifest (scan pool for TokenRoot elements)
+    │
+    ▼
+For each token: derive status (Section 10.6)
+    │
+    ▼
+Populate TXF structures:
+    ├── Active tokens → _<tokenId> (spendable)
+    ├── Archived tokens → archived-<tokenId>
+    ├── Nametag tokens → _nametags + PROXY resolution cache
+    ├── Invoice tokens → accounting module
+    ├── Reference tokens → memory cache
+    └── Invalid tokens → flagged for investigation
+
+Rebuild derived structures → cache locally:
+    ├── Transaction history (scan ownership predicates)
+    ├── Balances (sum owned token coinData)
+    ├── Tombstones (oracle spent-checks)
+    └── Nametag/invoice lookups
+```
+
+#### 10.10.2 Purpose 2: Token Exchange (sending/receiving)
+
+UXF bundles are used to package tokens for transfer between users. The exchange bundle contains ONLY the tokens being transferred — not the sender's entire profile.
+
+**Sending tokens via UXF:**
+```
+Sender selects tokens to send
+    │
+    ▼
+Build UXF bundle with ONLY the selected tokens:
+    • The token DAGs being sent
+    • Their nametag sub-DAGs (if PROXY transfer)
+    • Shared elements (certs, proofs) that the tokens reference
+    • NOT the sender's other tokens, history, or profile data
+    │
+    ▼
+Two delivery options:
+
+Option A: Send UXF as CAR over Nostr
+    • UxfPackage.toCar() → CAR bytes
+    • Embed CAR in Nostr TOKEN_TRANSFER event content
+    • Recipient receives CAR, imports via UxfPackage.fromCar()
+    • Best for: small transfers (< 256 KB, few tokens)
+
+Option B: Pin UXF to IPFS, send CID over Nostr
+    • UxfPackage.toCar() → pin to IPFS → CID
+    • Send CID in Nostr TOKEN_TRANSFER event
+    • Recipient fetches CAR from IPFS by CID
+    • Best for: large transfers (many tokens, split operations)
+```
+
+**Receiving tokens via UXF:**
+```
+Receive UXF bundle (CAR bytes or CID → fetch)
+    │
+    ▼
+UxfPackage.fromCar(carBytes)
+    │
+    ▼
+For each token in received bundle:
+    • Validate chain (all proofs correct)
+    • Verify current predicate assigns ownership to us
+    • Finalize if needed (submit pending tx to oracle)
+    │
+    ▼
+Merge into our pool: UxfPackage.merge(receivedPkg)
+    • Content-hash dedup: shared elements not duplicated
+    • New tokens appear in our manifest
+    │
+    ▼
+Pin updated bundle → OrbitDB → synced to other devices
+```
+
+#### 10.10.3 Archive/Export
+
+UXF also supports archiving and exporting:
+
+```
+Export specific tokens:
+    sphere.export({ tokenIds: ['aaa...', 'bbb...'] })
+    → builds UXF bundle with only those tokens
+    → returns CAR bytes or file
+
+Export entire profile:
+    sphere.exportProfile()
+    → builds UXF bundle with ALL tokens from manifest
+    → includes all token types (fungible, nametag, invoice)
+    → returns CAR bytes or file
+    → can be imported on another device or backed up offline
+
+Import from archive:
+    sphere.import(carBytes)
+    → UxfPackage.fromCar() → validate → merge into pool
+    → oracle check all imported tokens
+```
+
+#### 10.10.4 UXF Bundle Content Summary
+
+| Use Case | Element Pool | Manifest | Encrypted? | OrbitDB? |
+|---|---|---|---|---|
+| **Profile storage** | All user's tokens | Derived (not stored) | Elements: no. Bundle ref in OrbitDB: yes. | CID stored in OrbitDB |
+| **Token send** | Only tokens being sent + deps | Derived | No (public transfer data) | No (sent via Nostr) |
+| **Token receive** | Received tokens | Derived | No | Merged into profile bundle |
+| **Archive/export** | Selected or all tokens | Derived | Optional (user choice) | No (offline file) |
+
+In ALL cases, the UXF bundle is just the element pool. The manifest is always derived by scanning for TokenRoot elements. No metadata, no history, no caches — pure cryptographic proof materials.
 
 ---
 
