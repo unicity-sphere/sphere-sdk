@@ -34,7 +34,42 @@ const mockCalculateOptimalSplit = vi.fn();
 vi.mock('../../../modules/payments/TokenSplitCalculator', () => ({
   TokenSplitCalculator: class {
     calculateOptimalSplit = mockCalculateOptimalSplit;
+    calculateOptimalSplitSync = vi.fn();
   },
+}));
+
+// Mock SpendPlanner + SpendQueue — bridge planSend() to mockCalculateOptimalSplit
+let currentSplitPlan: any = null;
+{
+  const _orig = mockCalculateOptimalSplit.mockResolvedValue.bind(mockCalculateOptimalSplit);
+  mockCalculateOptimalSplit.mockResolvedValue = (value: any) => {
+    currentSplitPlan = value;
+    return _orig(value);
+  };
+}
+vi.mock('../../../modules/payments/SpendQueue', () => ({
+  SpendPlanner: class {
+    buildParsedPool = vi.fn().mockResolvedValue(new Map());
+    planSend = vi.fn().mockImplementation(
+      (_req: any, _pool: any, _ledger: any, _queue: any, reservationId: string) => {
+        if (currentSplitPlan === null) {
+          throw new Error('Insufficient balance');
+        }
+        return { reservationId, splitPlan: currentSplitPlan };
+      }
+    );
+  },
+  SpendQueue: class {
+    enqueue = vi.fn();
+    waitForEntry = vi.fn();
+    notifyChange = vi.fn();
+    cancelAll = vi.fn();
+    destroy = vi.fn();
+  },
+  RESERVATION_TIMEOUT_MS: 30000,
+  QUEUE_TIMEOUT_MS: 30000,
+  MAX_SKIP_COUNT: 10,
+  QUEUE_MAX_SIZE: 100,
 }));
 
 const mockExecuteSplitInstant = vi.fn();
