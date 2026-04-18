@@ -162,28 +162,26 @@
     "@chainsafe/libp2p-gossipsub": "^14.1.2",
     "@ipld/car": "^5.4.2",
     "@ipld/dag-cbor": "^9.2.5",
+    "@libp2p/bootstrap": "^12.0.11",
+    "@libp2p/crypto": "^5.1.13",
+    "@libp2p/peer-id": "^6.0.4",
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
+    "@orbitdb/core": "^3.0.2",
     "@unicitylabs/nostr-js-sdk": "^0.4.1",
     "@unicitylabs/state-transition-sdk": "1.6.1-rc.f37cb85",
     "bip39": "^3.1.0",
     "buffer": "^6.0.3",
     "canonicalize": "^3.0.0",
     "crypto-js": "^4.2.0",
-    "elliptic": "^6.6.1"
-  },
-  "optionalDependencies": {
-    "@libp2p/crypto": "^5.1.13",
-    "@libp2p/peer-id": "^6.0.4",
+    "elliptic": "^6.6.1",
+    "helia": "^6.1.1",
     "ipns": "^10.0.0",
     "multiformats": "^13.4.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
-    "@libp2p/bootstrap": "^12.0.11",
-    "@libp2p/crypto": "^5.1.13",
     "@libp2p/interface": "^3.1.0",
-    "@libp2p/peer-id": "^6.0.4",
     "@types/crypto-js": "^4.2.2",
     "@types/elliptic": "^6.4.18",
     "@types/node": "^22.0.0",
@@ -192,7 +190,6 @@
     "@typescript-eslint/parser": "^8.54.0",
     "eslint": "^9.39.2",
     "fake-indexeddb": "^6.2.5",
-    "multiformats": "^13.4.2",
     "testcontainers": "^11.11.0",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
@@ -202,34 +199,10 @@
     "ws": "^8.18.1"
   },
   "peerDependencies": {
-    "@libp2p/crypto": ">=5.0.0",
-    "@libp2p/peer-id": ">=6.0.0",
-    "@orbitdb/core": "^3.0.2",
-    "helia": "^6.1.1",
-    "ipns": ">=10.0.0",
-    "multiformats": ">=13.0.0",
     "ws": ">=8.0.0"
   },
   "peerDependenciesMeta": {
-    "@orbitdb/core": {
-      "optional": true
-    },
-    "helia": {
-      "optional": true
-    },
     "ws": {
-      "optional": true
-    },
-    "@libp2p/crypto": {
-      "optional": true
-    },
-    "@libp2p/peer-id": {
-      "optional": true
-    },
-    "ipns": {
-      "optional": true
-    },
-    "multiformats": {
       "optional": true
     }
   },
