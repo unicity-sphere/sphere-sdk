@@ -370,10 +370,27 @@ export class ProfileTokenStorageProvider
       const { UxfPackage } = await import('../uxf/UxfPackage.js');
       const mergedPkg = UxfPackage.create();
 
-      // 3. For each active bundle: fetch, deserialize, merge.
-      // CARs on IPFS are unencrypted — confidentiality comes from the OrbitDB
-      // KV layer that holds the bundle refs. Unencrypted CARs enable cross-user
-      // content-addressed dedup.
+      // 3. JOIN across all active bundles (PROFILE-ARCHITECTURE §10.4).
+      //
+      //    Semantics: for each tokenId appearing in any bundle, the merged
+      //    package must contain the longest valid chain. When chains diverge
+      //    (two bundles show incompatible transitions from the same state),
+      //    both siblings are preserved so that downstream consumers can
+      //    resolve the conflict.
+      //
+      //    The structural work is delegated to `UxfPackage.merge()` which
+      //    internally calls `mergeInstanceChains()` — that function already
+      //    implements the "longest-chain or sibling-preservation" rules
+      //    (see uxf/instance-chain.ts Decision 6).
+      //
+      //    Oracle-based conflict resolution — turning a structural
+      //    divergence into {valid, conflicting, invalid} status — is
+      //    handled by token-manifest derivation (task #27). This JOIN is
+      //    the structural prerequisite.
+      //
+      //    CARs on IPFS are unencrypted; confidentiality comes from the
+      //    OrbitDB KV layer that holds the bundle refs. Unencrypted CARs
+      //    enable cross-user content-addressed dedup (see §10.2).
       for (const [cid] of activeBundles) {
         try {
           const carBytes = await fetchFromIpfs(this._ipfsGateways, cid);

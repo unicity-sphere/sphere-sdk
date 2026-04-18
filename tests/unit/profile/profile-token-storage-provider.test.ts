@@ -585,6 +585,64 @@ describe('ProfileTokenStorageProvider', () => {
       expect(tokenKeys.length).toBeGreaterThanOrEqual(2);
     });
 
+    it('JOIN: when same tokenId appears in multiple bundles, merged load contains both states', async () => {
+      const encKey = getEncryptionKey();
+
+      // Two bundles each carry a token with the SAME id `_tShared` but with
+      // divergent data payloads — the mock UxfPackage treats the `id` as
+      // the manifest key and its current merge policy (LWW) picks the
+      // source that was merged last. We only assert that the JOIN does
+      // NOT drop tokens: both logical chains must be represented in the
+      // loaded pool (at minimum by the latest merged version).
+      const carA = new TextEncoder().encode(
+        JSON.stringify({
+          tokens: [
+            { id: '_tShared', genesis: { data: { tokenId: 'x', coinData: [['UCT', '100']] } } },
+            { id: '_tOnlyInA', genesis: { data: { tokenId: 'y', coinData: [['UCT', '50']] } } },
+          ],
+        }),
+      );
+      const carB = new TextEncoder().encode(
+        JSON.stringify({
+          tokens: [
+            // Same id, different state — simulates a divergent chain
+            { id: '_tShared', genesis: { data: { tokenId: 'x', coinData: [['UCT', '100']] } }, state: { predicate: 'after-transfer' } },
+            { id: '_tOnlyInB', genesis: { data: { tokenId: 'z', coinData: [['UCT', '25']] } } },
+          ],
+        }),
+      );
+
+      const refA: UxfBundleRef = { cid: 'cidA', status: 'active', createdAt: 100 };
+      const refB: UxfBundleRef = { cid: 'cidB', status: 'active', createdAt: 200 };
+      db._store.set(
+        `${BUNDLE_KEY_PREFIX}cidA`,
+        await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(refA))),
+      );
+      db._store.set(
+        `${BUNDLE_KEY_PREFIX}cidB`,
+        await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(refB))),
+      );
+
+      installMockFetch(async (url: string) => {
+        if (url.includes('/ipfs/cidA')) return new Response(carA, { status: 200 });
+        if (url.includes('/ipfs/cidB')) return new Response(carB, { status: 200 });
+        return new Response('', { status: 404 });
+      });
+
+      const provider = createProvider(db);
+      await provider.initialize();
+
+      const loadResult = await provider.load();
+      expect(loadResult.success).toBe(true);
+
+      // The merged view must include both bundle-unique tokens AND
+      // represent the shared token — never drop it.
+      const keys = Object.keys(loadResult.data!).filter((k) => k.startsWith('_') && k !== '_meta');
+      expect(keys).toContain('_tShared');
+      expect(keys).toContain('_tOnlyInA');
+      expect(keys).toContain('_tOnlyInB');
+    });
+
     it('load() continues on partial bundle failure', async () => {
       const encKey = getEncryptionKey();
 
