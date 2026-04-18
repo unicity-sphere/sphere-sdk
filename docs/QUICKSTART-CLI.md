@@ -187,7 +187,7 @@ npm install
 The `init` command creates a new wallet or imports an existing one. It is the single entry point for both paths.
 
 ```bash
-# Create a new wallet on testnet (default)
+# Create a new wallet on testnet (default — uses OrbitDB Profile storage)
 npm run cli -- init
 
 # Specify network: mainnet | testnet | dev
@@ -206,6 +206,42 @@ npm run cli -- init --mnemonic
 
 # Import with a nametag registration in one step
 npm run cli -- init --mnemonic "word1 ..." --nametag alice
+```
+
+#### Storage Mode (profile vs legacy)
+
+New wallets default to **Profile** mode: OrbitDB-backed wallet state plus a content-addressed UXF element pool on IPFS. Profile mode gives you multi-device sync via OrbitDB CRDT and efficient storage via IPFS dedup.
+
+The previous **legacy** mode (file-based JSON wallet + per-address TXF token files with IPNS sync) is still available for backward compatibility and does not require OrbitDB / Helia network peers.
+
+```bash
+# Default: Profile (OrbitDB)
+npm run cli -- init
+
+# Opt into legacy (file-based) at creation time
+npm run cli -- init --legacy
+
+# Force Profile (error if @orbitdb/core / helia not installed)
+npm run cli -- init --profile
+```
+
+**Rules:**
+
+- **Mode is locked per wallet.** Once a dataDir is initialised, every subsequent CLI command honours the same mode. Re-running `init` with a mismatched flag exits with an explicit error — no silent clobbering.
+- **Existing legacy wallets are detected automatically.** If a legacy `wallet.json` is found in the dataDir, the CLI continues in legacy mode even when no `storageMode` is recorded in config. Upgrade path: run `init` without any storage-mode flag — it will auto-detect legacy and record it in config.
+- **Fresh wallets default to Profile.** If no wallet exists and `@orbitdb/core` + `helia` are installed (they are by default), the CLI picks Profile. If those peer deps are missing the CLI silently falls back to legacy with a one-line note.
+- **To switch modes:** `clear --yes` wipes the wallet and resets `storageMode`, then re-run `init [--legacy|--profile]`.
+
+`status` shows which mode the wallet is using:
+
+```bash
+npm run cli -- status
+# Wallet Status:
+# ─────────────────────────────────────────────
+# Network:       testnet
+# Storage:       profile            # or "legacy"
+# L1 Address:    alpha1...
+# ...
 ```
 
 > **Security:** Using `--mnemonic` without a value prompts interactively, keeping the mnemonic out of shell history and `/proc/<pid>/cmdline`. Prefer this mode for production wallets.
@@ -239,8 +275,9 @@ Store this safely! You will need it to recover your wallet.
 All CLI data is stored in the current working directory under `.sphere-cli/`:
 
 ```
+# Legacy mode layout:
 .sphere-cli/
-  config.json          # Active network, dataDir, tokensDir
+  config.json          # Active network, dataDir, tokensDir, storageMode
   profiles.json        # Named wallet profiles
   wallet.json          # Wallet keys (plaintext or encrypted mnemonic)
   tokens/              # Token storage (one JSON file per token)
@@ -248,9 +285,17 @@ All CLI data is stored in the current working directory under `.sphere-cli/`:
   daemon.log           # Daemon log file
   daemon.pid           # Daemon PID file
 
+# Profile mode layout:
+.sphere-cli/
+  config.json          # Active network + "storageMode": "profile"
+  profiles.json        # Named wallet profiles
+  wallet.json          # Local cache only (not the source of truth)
+  orbitdb/             # OrbitDB OpLog + identity
+    <dbHash>/          # KV database per wallet identity
+  daemon.*             # Same as legacy
+
 .sphere-cli-alice/     # Per-profile directory (if using wallet profiles)
-  wallet.json
-  tokens/
+  ...
 ```
 
 ### Show Wallet Status
@@ -264,6 +309,7 @@ Wallet Status:
 ──────────────────────────────────────────────────
 Profile:       alice
 Network:       testnet
+Storage:       profile
 L1 Address:    alpha1qxy...
 Direct Addr:   DIRECT://0000be36...
 Chain Pubkey:  02abc123...
@@ -488,9 +534,14 @@ Transaction History (last 10):
 ```bash
 # Delete all wallet data for the active profile (keys + tokens)
 npm run cli -- clear
+
+# Skip the confirmation prompt (for scripting)
+npm run cli -- clear --yes
 ```
 
 > **Warning:** This permanently deletes the wallet keys and all tokens from local storage. Only tokens synced to IPFS can be recovered afterward.
+
+> **Note:** `clear` is mode-aware — it tears down the correct backend (legacy file-based storage or OrbitDB Profile) based on what was recorded in config. It also resets the `storageMode` in config so the next `init` can pick a fresh mode (including switching between profile and legacy).
 
 ---
 
@@ -639,6 +690,49 @@ Checking for incoming transfers...
 Received 2 new transfer(s):
   100.00000000 UCT
   0.04200000 ETH [unconfirmed]
+```
+
+### Offline Token Transfer (export / import to file)
+
+For offline transfer, air-gapped transport, or bulk backup, the CLI exposes two commands that write/read token files in either **UXF** (content-addressable CAR) or **TXF** (JSON array) format. The wire format is TXF-compatible in both cases — a file produced by a Profile-mode wallet can be imported by a legacy-mode wallet and vice-versa.
+
+```bash
+# Export everything to a UXF CAR (compact, content-addressable)
+npm run cli -- tokens-export wallet-backup.uxf
+
+# Export only UCT tokens to a TXF JSON (legacy-compatible)
+npm run cli -- tokens-export uct-only.txf.json --coin UCT
+
+# Explicit format override
+npm run cli -- tokens-export all.bin --format uxf
+npm run cli -- tokens-export all.json --format txf
+
+# Export specific local IDs
+npm run cli -- tokens-export picked.uxf --ids uuid-1,uuid-2,uuid-3
+
+# Import (format auto-detected from file content — CAR magic bytes vs JSON)
+npm run cli -- tokens-import wallet-backup.uxf
+npm run cli -- tokens-import uct-only.txf.json
+
+# Force a specific format
+npm run cli -- tokens-import unknown.bin --format uxf
+```
+
+Import behaviour:
+
+- Tokens already owned by the wallet (same genesis tokenId + stateHash) are reported as **skipped**.
+- Tokens that were previously spent from this wallet (tombstoned) are also **skipped** — this prevents double-accepting state you have already transitioned.
+- Malformed tokens are reported as **rejected** with a per-token reason, but do not abort the rest of the import.
+
+Output:
+
+```
+Importing 12 token(s) from UXF file...
+
+✓ Import complete:
+  Added:    10
+  Skipped:  2 (already owned / tombstoned)
+  Rejected: 0
 ```
 
 ### Request Test Tokens (Testnet Faucet)
