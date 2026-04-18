@@ -41,6 +41,22 @@ interface CliConfig {
   dataDir: string;
   tokensDir: string;
   currentProfile?: string;
+  /**
+   * On-disk storage backend for wallet + tokens.
+   *
+   * - `'profile'` (new default): OrbitDB-backed wallet profile with IPFS
+   *    element pool. Requires `@orbitdb/core` + `helia` to be installable
+   *    at runtime (falls back to legacy if not).
+   * - `'legacy'`: File-based JSON wallet + per-address TXF token files
+   *    with IPFS/IPNS sync. The pre-UXF format; all earlier CLI wallets
+   *    use this.
+   *
+   * Once a wallet is created, the mode is locked — migration between
+   * modes is a separate workflow. If unset on an existing dataDir, the
+   * mode is auto-detected from on-disk artefacts the first time the
+   * CLI runs (and persisted here).
+   */
+  storageMode?: 'profile' | 'legacy';
 }
 
 interface WalletProfile {
@@ -136,6 +152,110 @@ function switchToProfile(name: string): boolean {
 }
 
 // =============================================================================
+// Storage Mode Detection
+// =============================================================================
+
+/**
+ * Check whether a legacy file-based wallet already exists at this dataDir.
+ *
+ * `createFileStorageProvider` writes `{dataDir}/wallet.json` (default file
+ * name). Its existence with non-empty content is the authoritative signal
+ * that the wallet was created under the legacy storage model.
+ */
+function legacyWalletExists(dataDir: string, walletFileName = 'wallet.json'): boolean {
+  const walletPath = path.join(dataDir, walletFileName);
+  try {
+    const st = fs.statSync(walletPath);
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Probe whether the optional Profile/OrbitDB dependencies are installable.
+ *
+ * `@orbitdb/core` + `helia` are peer dependencies of the SDK. They are
+ * dynamically imported on first use. This helper does a cheap, one-off
+ * import and returns false (with a reason) if either fails. Cached per
+ * process — the probe is not re-run for every CLI call.
+ */
+let profileDepsAvailable: boolean | null = null;
+let profileDepsUnavailableReason: string | null = null;
+
+async function areProfileDepsAvailable(): Promise<boolean> {
+  if (profileDepsAvailable !== null) return profileDepsAvailable;
+  try {
+    await import('@orbitdb/core' as string);
+    await import('helia' as string);
+    profileDepsAvailable = true;
+    return true;
+  } catch (err) {
+    profileDepsAvailable = false;
+    profileDepsUnavailableReason = err instanceof Error ? err.message : String(err);
+    return false;
+  }
+}
+
+/**
+ * Resolve the storage mode for the current dataDir. Explicit user intent
+ * (config.storageMode, `--legacy`, `--profile`) wins. Otherwise detect:
+ *
+ *   - legacy wallet files present → legacy (honor existing installs)
+ *   - no wallet files yet → profile (new default, if deps available)
+ *   - deps missing → legacy + warn
+ *
+ * The resolved mode is persisted back to config so subsequent commands
+ * stay consistent.
+ */
+async function resolveStorageMode(
+  config: CliConfig,
+  explicit?: 'profile' | 'legacy',
+): Promise<'profile' | 'legacy'> {
+  if (explicit) {
+    if (explicit === 'profile' && !(await areProfileDepsAvailable())) {
+      console.error(
+        `Cannot use --profile mode: ${profileDepsUnavailableReason ?? 'dependencies missing'}.`,
+      );
+      console.error('Install with: npm install @orbitdb/core helia @chainsafe/libp2p-gossipsub');
+      process.exit(1);
+    }
+    if (config.storageMode !== explicit) {
+      saveConfig({ ...config, storageMode: explicit });
+    }
+    return explicit;
+  }
+
+  if (config.storageMode) {
+    // Wallet already committed to a mode — respect it.
+    return config.storageMode;
+  }
+
+  // First-time detection.
+  if (legacyWalletExists(config.dataDir)) {
+    // Pre-existing legacy wallet on disk: honor it even though the config
+    // didn't record a mode. This is the upgrade path for users who used
+    // the CLI before this setting existed.
+    saveConfig({ ...config, storageMode: 'legacy' });
+    return 'legacy';
+  }
+
+  // Fresh wallet: prefer profile if deps are available.
+  if (await areProfileDepsAvailable()) {
+    saveConfig({ ...config, storageMode: 'profile' });
+    return 'profile';
+  }
+
+  // Profile deps missing; silently fall back to legacy.
+  console.error(
+    `Note: @orbitdb/core / helia not installed — falling back to legacy storage.\n` +
+      `      Install them to enable OrbitDB-backed Profile mode.`,
+  );
+  saveConfig({ ...config, storageMode: 'legacy' });
+  return 'legacy';
+}
+
+// =============================================================================
 // Sphere Instance Management
 // =============================================================================
 
@@ -165,18 +285,59 @@ function createNoopTransport(): TransportProvider {
   };
 }
 
-async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; nametag?: string }): Promise<Sphere> {
+async function getSphere(options?: {
+  autoGenerate?: boolean;
+  mnemonic?: string;
+  nametag?: string;
+  /**
+   * Override the detected storage mode. Passed from `init` when the user
+   * supplies `--legacy` or `--profile`. Unused commands inherit the mode
+   * persisted in config (or auto-detected on first run).
+   */
+  storageMode?: 'profile' | 'legacy';
+}): Promise<Sphere> {
   if (sphereInstance) return sphereInstance;
 
   const config = loadConfig();
-  const providers = createNodeProviders({
-    network: config.network,
-    dataDir: config.dataDir,
-    tokensDir: config.tokensDir,
-    tokenSync: { ipfs: { enabled: true } },
-    market: true,
-    groupChat: true,
-  });
+  const mode = await resolveStorageMode(config, options?.storageMode);
+
+  // Build providers based on resolved storage mode.
+  let providers;
+  if (mode === 'profile') {
+    // Profile (OrbitDB + IPFS element pool) — new default.
+    const { createNodeProfileProviders } = await import('../profile/node.js');
+    const profileProviders = createNodeProfileProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+    });
+    // Still need transport/oracle/market/groupChat/L1/price from the
+    // legacy node factory — just not its storage/tokenStorage.
+    const legacyForNonStorage = createNodeProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+      tokensDir: config.tokensDir,
+      // IPFS sync is redundant under Profile — OrbitDB replicates state.
+      tokenSync: { ipfs: { enabled: false } },
+      market: true,
+      groupChat: true,
+    });
+    providers = {
+      ...legacyForNonStorage,
+      storage: profileProviders.storage,
+      tokenStorage: profileProviders.tokenStorage,
+      ipfsTokenStorage: undefined,
+    };
+  } else {
+    // Legacy: file-based wallet + per-address token files + IPNS sync.
+    providers = createNodeProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+      tokensDir: config.tokensDir,
+      tokenSync: { ipfs: { enabled: true } },
+      market: true,
+      groupChat: true,
+    });
+  }
 
   const initProviders = noNostrGlobal
     ? { ...providers, transport: createNoopTransport() }
@@ -369,21 +530,26 @@ interface CommandHelp {
 const COMMAND_HELP: Record<string, CommandHelp> = {
   // --- WALLET ---
   'init': {
-    usage: 'init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]',
+    usage: 'init [--network <net>] [--mnemonic "<words>"] [--nametag <name>] [--legacy | --profile]',
     description: 'Create a new wallet or import an existing one from a mnemonic phrase. If no mnemonic is provided, a new 24-word mnemonic is generated automatically.',
     flags: [
       { flag: '--network <net>', description: 'Network to use (mainnet, testnet, dev)', default: 'testnet' },
       { flag: '--mnemonic "<words>"', description: 'Import wallet from BIP-39 mnemonic phrase (24 words in quotes)' },
       { flag: '--nametag <name>', description: 'Register a nametag during initialization (mints on-chain)' },
+      { flag: '--legacy', description: 'Use file-based JSON wallet + IPNS sync (pre-UXF format). Default is OrbitDB/Profile.' },
+      { flag: '--profile', description: 'Force OrbitDB Profile mode. Requires @orbitdb/core + helia installed.' },
       { flag: '--no-nostr', description: 'Disable Nostr transport (use no-op transport)' },
     ],
     examples: [
-      'npm run cli -- init --network testnet',
+      'npm run cli -- init --network testnet              # default: OrbitDB Profile mode',
+      'npm run cli -- init --legacy                       # opt into file-based storage',
       'npm run cli -- init --mnemonic "word1 word2 ... word24"',
       'npm run cli -- init --nametag alice --network mainnet',
     ],
     notes: [
       'If a wallet already exists in the current profile, it will be loaded instead of creating a new one.',
+      'Storage mode: new wallets default to OrbitDB Profile (content-addressed element pool, multi-device via OrbitDB CRDT). Falls back to --legacy silently if @orbitdb/core / helia are not installed.',
+      'The storage mode is locked per wallet. Once a dataDir is initialised, subsequent commands honour that mode. To switch, clear the wallet and re-init.',
       'Back up the generated mnemonic immediately -- it cannot be retrieved later.',
     ],
   },
@@ -1556,6 +1722,40 @@ async function main() {
           nametag = args[nametagIndex + 1];
         }
 
+        // Storage mode selection.
+        //   Default: profile (OrbitDB + IPFS element pool)
+        //   --legacy: file-based JSON + IPNS sync (pre-UXF format)
+        //   --profile: force profile (useful mainly for explicit docs)
+        // Mutually exclusive; conflicting flags exit with an error.
+        const forceLegacy = args.includes('--legacy');
+        const forceProfile = args.includes('--profile');
+        if (forceLegacy && forceProfile) {
+          console.error('Cannot combine --legacy and --profile');
+          process.exit(1);
+        }
+        const explicitMode: 'profile' | 'legacy' | undefined = forceLegacy
+          ? 'legacy'
+          : forceProfile
+            ? 'profile'
+            : undefined;
+
+        // Refuse to clobber an existing wallet with a mismatched mode.
+        const existingConfig = loadConfig();
+        if (
+          existingConfig.storageMode &&
+          explicitMode &&
+          existingConfig.storageMode !== explicitMode
+        ) {
+          console.error(
+            `This dataDir is already initialised in ${existingConfig.storageMode} mode; ` +
+              `cannot re-init with --${explicitMode}.`,
+          );
+          console.error(
+            `Use a different --dataDir, clear the wallet first, or drop the flag to honour the existing mode.`,
+          );
+          process.exit(1);
+        }
+
         // Save config
         const config = loadConfig();
         config.network = network;
@@ -1568,6 +1768,7 @@ async function main() {
           autoGenerate: !mnemonic,
           mnemonic,
           nametag,
+          storageMode: explicitMode,
         });
 
         const identity = sphere.identity;
@@ -1618,6 +1819,7 @@ async function main() {
             console.log(`Profile:       ${config.currentProfile}`);
           }
           console.log(`Network:       ${config.network}`);
+          console.log(`Storage:       ${config.storageMode ?? '(auto-detect)'}`);
           console.log(`L1 Address:    ${identity.l1Address}`);
           console.log(`Direct Addr:   ${identity.directAddress || '(not set)'}`);
           console.log(`Chain Pubkey:  ${identity.chainPubkey}`);
@@ -1669,21 +1871,48 @@ async function main() {
         }
 
         const config = loadConfig();
-        const providers = createNodeProviders({
-          network: config.network,
-          dataDir: config.dataDir,
-          tokensDir: config.tokensDir,
-        });
+        // Honour the wallet's recorded storage mode when clearing so we
+        // tear down the correct backend. Falls back to legacy if unset.
+        const clearMode = config.storageMode ?? 'legacy';
 
-        await providers.storage.connect();
-        await providers.tokenStorage.initialize();
+        let clearStorage: import('../storage').StorageProvider;
+        let clearTokenStorage: import('../storage').TokenStorageProvider<
+          import('../storage').TxfStorageDataBase
+        >;
 
-        console.log('Clearing all wallet data...');
-        await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+        if (clearMode === 'profile') {
+          const { createNodeProfileProviders } = await import('../profile/node.js');
+          const p = createNodeProfileProviders({
+            network: config.network,
+            dataDir: config.dataDir,
+          });
+          clearStorage = p.storage;
+          clearTokenStorage = p.tokenStorage;
+        } else {
+          const p = createNodeProviders({
+            network: config.network,
+            dataDir: config.dataDir,
+            tokensDir: config.tokensDir,
+          });
+          clearStorage = p.storage;
+          clearTokenStorage = p.tokenStorage;
+        }
+
+        await clearStorage.connect();
+        await clearTokenStorage.initialize();
+
+        console.log(`Clearing all wallet data (mode: ${clearMode})...`);
+        await Sphere.clear({ storage: clearStorage, tokenStorage: clearTokenStorage });
         console.log('All wallet data cleared.');
 
-        await providers.storage.disconnect();
-        await providers.tokenStorage.shutdown();
+        // Reset storageMode so the next init re-detects (picks profile
+        // by default on a fresh dataDir).
+        const cfg = loadConfig();
+        delete cfg.storageMode;
+        saveConfig(cfg);
+
+        await clearStorage.disconnect();
+        await clearTokenStorage.shutdown();
         break;
       }
 
@@ -5011,7 +5240,7 @@ interface CompletionCommand {
 
 function getCompletionCommands(): CompletionCommand[] {
   return [
-    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr'] },
+    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr', '--legacy', '--profile'] },
     { name: 'status', description: 'Show wallet identity' },
     { name: 'config', description: 'Show or set CLI configuration' },
     { name: 'clear', description: 'Delete all wallet data' },
