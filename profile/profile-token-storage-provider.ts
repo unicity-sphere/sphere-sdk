@@ -171,6 +171,13 @@ export class ProfileTokenStorageProvider
     history: HistoryRecord[];
   }> | null = null;
 
+  // --- One-time legacy-key cleanup flag ---
+  // After a successful atomic `deriver.{addr}.all` write, we best-effort
+  // delete the three legacy per-key entries so future reads cannot be
+  // confused by stale data on cache-key downgrade. Guard with a flag
+  // so we don't attempt the delete on every save.
+  private legacyKeysCleaned = false;
+
   constructor(
     private readonly db: ProfileDatabase,
     encryptionKey: Uint8Array | null,
@@ -330,14 +337,15 @@ export class ProfileTokenStorageProvider
 
     this.emitEvent({ type: 'storage:saving', timestamp });
 
-    // Accept into local state immediately.
-    // Whenever pendingData is overwritten, invalidate the lastPinnedCid
-    // retry cache — otherwise a retry after a partially-failed flush could
-    // re-register an OLD CID against NEW token data, producing a bundle
-    // ref whose tokenCount does not match the pinned CAR contents.
-    if (this.pendingData !== null && this.pendingData !== data) {
-      this.lastPinnedCid = null;
-    }
+    // Any new save() invalidates the lastPinnedCid retry cache
+    // unconditionally. A reference-identity check is insufficient: a
+    // caller that mutates the same object in place and re-calls save()
+    // would otherwise leave a stale CID pinned. The only safe policy
+    // is "fresh save → re-pin from scratch". The tiny cost (one extra
+    // pin on legitimate retries with identical content) is worth the
+    // correctness guarantee that the pinned CID always matches the
+    // currently flushed bytes.
+    this.lastPinnedCid = null;
     this.pendingData = data;
     this.lastLoadedData = data;
 
@@ -373,6 +381,19 @@ export class ProfileTokenStorageProvider
         source: 'cache',
         timestamp,
       };
+    }
+
+    // If a flush is in flight, await it before reading OrbitDB. Without
+    // this the read window between "pendingData cleared" and "OrbitDB
+    // bundle ref written" returns a stale snapshot that omits the
+    // in-flight bundle.
+    if (this.flushPromise) {
+      try {
+        await this.flushPromise;
+      } catch {
+        // Flush failures are already surfaced via storage:error events
+        // by scheduleFlush; we proceed to read whatever state exists.
+      }
     }
 
     this.emitEvent({ type: 'storage:loading', timestamp });
@@ -818,8 +839,14 @@ export class ProfileTokenStorageProvider
       // 7. Write operational state:
       //    - synced portion to OrbitDB (outbox, mintOutbox, etc.)
       //    - derived portion to local cache (tombstones, sent, history)
+      // The derived-cache write is best-effort. A failure is surfaced
+      // via storage:error AND via the boolean return; we log here so
+      // flush telemetry records it alongside the CID.
       await this.writeOrbitOperationalState(opState);
-      await this.writeLocalDerivedCache(opState);
+      const derivedOk = await this.writeLocalDerivedCache(opState);
+      if (!derivedOk) {
+        this.log(`Derived-cache write failed; next load will rebuild from pool`);
+      }
 
       // Clear the pinned CID tracker after successful OrbitDB write
       this.lastPinnedCid = null;
@@ -1091,7 +1118,8 @@ export class ProfileTokenStorageProvider
     opState: Pick<OperationalState, 'tombstones' | 'sent' | 'history'>,
   ): Promise<boolean> {
     if (!this.localCache) return true;
-    const key = `deriver.${this.getAddressId()}.all`;
+    const addr = this.getAddressId();
+    const key = `deriver.${addr}.all`;
     const payload = {
       tombstones: opState.tombstones,
       sent: opState.sent,
@@ -1099,6 +1127,22 @@ export class ProfileTokenStorageProvider
     };
     try {
       await this.localCache.set(key, JSON.stringify(payload));
+      // One-time cleanup of pre-atomic legacy per-key layout. Leaving
+      // them around risks stale reads if the atomic key is ever lost
+      // (downgrade / test rollback). Best-effort — cleanup errors are
+      // logged but do not fail the write.
+      if (!this.legacyKeysCleaned) {
+        this.legacyKeysCleaned = true;
+        for (const legacy of [
+          `deriver.${addr}.tombstones`,
+          `deriver.${addr}.sent`,
+          `deriver.${addr}.history`,
+        ]) {
+          this.localCache.remove(legacy).catch((err) => {
+            this.log(`Legacy cache cleanup failed for "${legacy}": ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+      }
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1141,6 +1185,11 @@ export class ProfileTokenStorageProvider
    * Falls back to reading the pre-atomic legacy per-key layout on miss
    * so that caches written before the atomic migration continue to work
    * until their next rewrite.
+   *
+   * **Error rate-limiting**: at most one `storage:error` event is
+   * emitted per call, even when multiple underlying reads fail.
+   * Subscribers should not see an event flood when the cache is
+   * globally corrupted.
    */
   private async readLocalDerivedCache(): Promise<{
     tombstones: TxfTombstone[];
@@ -1152,31 +1201,62 @@ export class ProfileTokenStorageProvider
     }
     const addr = this.getAddressId();
 
+    // Rate-limit: swallow events during this call; emit at most one
+    // aggregate event at the end if any read failed.
+    const failedKeys: string[] = [];
+    const readSilent = async <T>(key: string): Promise<T | null> => {
+      try {
+        const raw = await this.localCache!.get(key);
+        if (raw === null) return null;
+        return JSON.parse(raw) as T;
+      } catch (err) {
+        this.log(`Failed to read local cache "${key}": ${err instanceof Error ? err.message : String(err)}`);
+        failedKeys.push(key);
+        return null;
+      }
+    };
+
+    let result: {
+      tombstones: TxfTombstone[];
+      sent: TxfSentEntry[];
+      history: HistoryRecord[];
+    };
+
     // Prefer the atomic single-key layout.
-    const combined = await this.readLocalJson<{
+    const combined = await readSilent<{
       tombstones?: TxfTombstone[];
       sent?: TxfSentEntry[];
       history?: HistoryRecord[];
     }>(`deriver.${addr}.all`);
     if (combined) {
-      return {
+      result = {
         tombstones: combined.tombstones ?? [],
         sent: combined.sent ?? [],
         history: combined.history ?? [],
       };
+    } else {
+      // Legacy per-key layout — read all three and heal on next write.
+      const [tombRaw, sentRaw, histRaw] = await Promise.all([
+        readSilent<TxfTombstone[]>(`deriver.${addr}.tombstones`),
+        readSilent<TxfSentEntry[]>(`deriver.${addr}.sent`),
+        readSilent<HistoryRecord[]>(`deriver.${addr}.history`),
+      ]);
+      result = {
+        tombstones: tombRaw ?? [],
+        sent: sentRaw ?? [],
+        history: histRaw ?? [],
+      };
     }
 
-    // Legacy per-key layout — read all three and heal on next write.
-    const [tombRaw, sentRaw, histRaw] = await Promise.all([
-      this.readLocalJson<TxfTombstone[]>(`deriver.${addr}.tombstones`),
-      this.readLocalJson<TxfSentEntry[]>(`deriver.${addr}.sent`),
-      this.readLocalJson<HistoryRecord[]>(`deriver.${addr}.history`),
-    ]);
-    return {
-      tombstones: tombRaw ?? [],
-      sent: sentRaw ?? [],
-      history: histRaw ?? [],
-    };
+    if (failedKeys.length > 0) {
+      this.emitEvent({
+        type: 'storage:error',
+        timestamp: Date.now(),
+        error: `Local derived cache read failures: ${failedKeys.join(', ')}`,
+      });
+    }
+
+    return result;
   }
 
   /**
@@ -1184,6 +1264,10 @@ export class ProfileTokenStorageProvider
    * parse failure. A parse failure is surfaced via `storage:error` so
    * it is not silently swallowed — corrupted cache data should be
    * visible to callers, not masked as "fresh device".
+   *
+   * This helper is used by non-derived-cache read paths that want the
+   * per-call event semantics. The derived-cache read path in
+   * `readLocalDerivedCache` uses its own rate-limited reader instead.
    */
   private async readLocalJson<T>(key: string): Promise<T | null> {
     if (!this.localCache) return null;
@@ -1220,11 +1304,20 @@ export class ProfileTokenStorageProvider
     sent: TxfSentEntry[];
     history: HistoryRecord[];
   }> {
-    if (this.rebuildPromise) return this.rebuildPromise;
-    this.rebuildPromise = this.rebuildDerivedCacheInner(data).finally(() => {
-      this.rebuildPromise = null;
-    });
-    return this.rebuildPromise;
+    if (!this.rebuildPromise) {
+      this.rebuildPromise = this.rebuildDerivedCacheInner(data).finally(() => {
+        this.rebuildPromise = null;
+      });
+    }
+    // Clone per-awaiter so that a downstream consumer mutating its
+    // arrays (e.g. PaymentsModule pushing a new tombstone) cannot
+    // affect the arrays observed by a concurrent load().
+    const shared = await this.rebuildPromise;
+    return {
+      tombstones: [...shared.tombstones],
+      sent: [...shared.sent],
+      history: [...shared.history],
+    };
   }
 
   private async rebuildDerivedCacheInner(

@@ -174,10 +174,25 @@ export async function fetchFromIpfs(
       // substitute arbitrary bytes for any CID. After we removed CAR-level
       // encryption (see module doc) this check is the only authentication
       // layer against gateway tampering — do not remove it.
-      verifyCidMatchesBytes(cid, bytes);
+      //
+      // NB: verification failures are RECOVERABLE — the next gateway may
+      // return legitimate bytes. We must NOT short-circuit the outer
+      // fallback loop with `throw err` the way size-limit failures do.
+      // Catch and record as lastError so the next gateway is tried.
+      try {
+        verifyCidMatchesBytes(cid, bytes);
+      } catch (verifyErr) {
+        lastError =
+          verifyErr instanceof Error ? verifyErr : new Error(String(verifyErr));
+        continue;
+      }
 
       return bytes;
     } catch (err) {
+      // Size-limit ProfileError is fatal for this request (not per-gateway)
+      // because the caller already constrained maxSizeBytes; retrying won't
+      // make the content smaller. Other errors are per-gateway transient
+      // failures — try the next gateway.
       if (err instanceof ProfileError) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
     }

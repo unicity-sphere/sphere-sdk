@@ -91,4 +91,50 @@ describe('fetchFromIpfs CID verification (integration with fetch mock)', () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it('multi-gateway fallback tries the next gateway when the first returns tampered bytes', async () => {
+    // Regression test for steelman finding: CID-mismatch ProfileError
+    // must NOT short-circuit the multi-gateway loop. A single
+    // malicious/misbehaving gateway should not DoS the request when
+    // another gateway can serve correct bytes.
+    const good = new TextEncoder().encode('good content');
+    const cid = cidForBytes(good);
+    const evil = new TextEncoder().encode('tampered payload');
+
+    mockOnce(async (url: string) => {
+      if (url.includes('gateway-evil.test')) {
+        return new Response(evil, { status: 200 });
+      }
+      if (url.includes('gateway-good.test')) {
+        return new Response(good, { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    try {
+      const result = await fetchFromIpfs(
+        ['https://gateway-evil.test', 'https://gateway-good.test'],
+        cid,
+        1000,
+      );
+      // Must have fallen through to the second gateway.
+      expect(new TextDecoder().decode(result)).toBe('good content');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fails with a clear error when ALL gateways return tampered bytes', async () => {
+    const good = new TextEncoder().encode('good content');
+    const cid = cidForBytes(good);
+
+    mockOnce(async (_url) => new Response(new TextEncoder().encode('bad'), { status: 200 }));
+    try {
+      await expect(
+        fetchFromIpfs(['https://g1.test', 'https://g2.test'], cid, 1000),
+      ).rejects.toThrow(ProfileError);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });

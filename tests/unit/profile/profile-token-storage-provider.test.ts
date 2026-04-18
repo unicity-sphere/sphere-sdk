@@ -1357,7 +1357,12 @@ describe('ProfileTokenStorageProvider', () => {
   // =========================================================================
 
   describe('error handling', () => {
-    it('flush retry reuses lastPinnedCid', async () => {
+    it('save() after OrbitDB-write failure re-pins (fresh save invalidates lastPinnedCid)', async () => {
+      // Old invariant: a retry reused lastPinnedCid to save a pin call.
+      // New invariant (steelman-driven): any new save() unconditionally
+      // invalidates lastPinnedCid so we can never register a stale CID
+      // against mutated content. The tiny cost is one extra pin per
+      // user-initiated retry; correctness trumps that.
       vi.useRealTimers();
 
       let pinCallCount = 0;
@@ -1366,7 +1371,7 @@ describe('ProfileTokenStorageProvider', () => {
       installMockFetch(async (url: string) => {
         if (url.includes('/api/v0/dag/put')) {
           pinCallCount++;
-          return new Response(JSON.stringify({ Cid: { '/': 'cid-retry' } }), { status: 200 });
+          return new Response(JSON.stringify({ Cid: { '/': 'bafkreipinresponsenotverifiedbecausesavepathdoesnotrefetch23456a' } }), { status: 200 });
         }
         return new Response('', { status: 404 });
       });
@@ -1374,7 +1379,8 @@ describe('ProfileTokenStorageProvider', () => {
       const provider = createProvider(db, { flushDebounceMs: 50 });
       await provider.initialize();
 
-      // Make db.put fail once (simulating OrbitDB write failure after successful pin)
+      // Make db.put fail once on the bundle key (simulating OrbitDB
+      // write failure after successful pin).
       const originalPut = db.put.bind(db);
       db.put = async (key: string, value: Uint8Array) => {
         if (key.startsWith(BUNDLE_KEY_PREFIX) && dbPutFailOnce) {
@@ -1386,18 +1392,22 @@ describe('ProfileTokenStorageProvider', () => {
 
       const txfData = buildTxfData({ _t1: { id: '_t1' } });
       await provider.save(txfData);
-
-      // First flush: pin succeeds, db.put fails, data re-queued
       await new Promise((r) => setTimeout(r, 200));
 
-      // The data was re-queued by the catch block. Trigger a new save to schedule another flush.
+      // User-initiated retry: second save with same data reference.
+      // Under the new invariant, save() clears lastPinnedCid, so this
+      // triggers a fresh pin — not a reuse.
       await provider.save(txfData);
-
-      // Second flush: should reuse lastPinnedCid and not call pinCar again
       await new Promise((r) => setTimeout(r, 200));
 
-      // pinCar should only have been called once (reuses lastPinnedCid on retry)
-      expect(pinCallCount).toBe(1);
+      // Two saves → two pins (fresh-pin invariant).
+      expect(pinCallCount).toBe(2);
+
+      // Bundle ref must exist after the successful retry.
+      const bundleKeys = Array.from(db._store.keys()).filter((k) =>
+        k.startsWith(BUNDLE_KEY_PREFIX),
+      );
+      expect(bundleKeys.length).toBeGreaterThanOrEqual(1);
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
     });
