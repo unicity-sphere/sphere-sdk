@@ -7,9 +7,18 @@
  * Extracted from `ProfileTokenStorageProvider` and `ConsolidationEngine` to
  * eliminate ~120 lines of duplicated IPFS pin/fetch logic.
  *
+ * Fetched bytes are content-address verified: `sha256(bytes)` must match
+ * the multihash digest encoded in the requested CID. This protects against
+ * a malicious or compromised gateway substituting different content.
+ * Without encryption on the CAR payloads (see PROFILE-ARCHITECTURE.md
+ * §10.2), the CID check is the sole authentication boundary between
+ * "the bytes I pinned" and "the bytes a gateway hands me back".
+ *
  * @module profile/ipfs-client
  */
 
+import { sha256 } from '@noble/hashes/sha2.js';
+import { CID } from 'multiformats/cid';
 import { ProfileError } from './errors.js';
 
 // =============================================================================
@@ -146,19 +155,28 @@ export async function fetchFromIpfs(
       // Always use streaming reader with size enforcement.
       // Content-Length is only a fast-reject pre-check — a malicious gateway
       // can set Content-Length: 1000 but stream 500MB.
+      let bytes: Uint8Array;
       if (response.body != null) {
-        return await readStreamWithLimit(response.body, maxSizeBytes, gateway);
+        bytes = await readStreamWithLimit(response.body, maxSizeBytes, gateway);
+      } else {
+        // Fallback for environments without ReadableStream (unlikely in Node 18+)
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength > maxSizeBytes) {
+          throw new ProfileError(
+            'BUNDLE_NOT_FOUND',
+            `Response ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
+          );
+        }
+        bytes = new Uint8Array(buffer);
       }
 
-      // Fallback for environments without ReadableStream (unlikely in Node 18+)
-      const buffer = await response.arrayBuffer();
-      if (buffer.byteLength > maxSizeBytes) {
-        throw new ProfileError(
-          'BUNDLE_NOT_FOUND',
-          `Response ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
-        );
-      }
-      return new Uint8Array(buffer);
+      // Content-address verification. Without this, a malicious gateway can
+      // substitute arbitrary bytes for any CID. After we removed CAR-level
+      // encryption (see module doc) this check is the only authentication
+      // layer against gateway tampering — do not remove it.
+      verifyCidMatchesBytes(cid, bytes);
+
+      return bytes;
     } catch (err) {
       if (err instanceof ProfileError) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));
@@ -170,6 +188,52 @@ export async function fetchFromIpfs(
     `Failed to fetch CAR ${cid} from all gateways: ${lastError?.message ?? 'unknown error'}`,
     lastError,
   );
+}
+
+/**
+ * Verify that `sha256(bytes)` matches the multihash digest encoded in
+ * `cidString`. Only sha256 multihash is supported — this is the hash
+ * used by every CID our pin path produces. Any other multihash codec
+ * is treated as a verification failure and the bytes are rejected.
+ *
+ * @throws {ProfileError} `BUNDLE_NOT_FOUND` on mismatch or unsupported
+ *         multihash code, so that the caller can try the next gateway.
+ */
+export function verifyCidMatchesBytes(cidString: string, bytes: Uint8Array): void {
+  let parsed: CID;
+  try {
+    parsed = CID.parse(cidString);
+  } catch (err) {
+    throw new ProfileError(
+      'BUNDLE_NOT_FOUND',
+      `Cannot parse CID ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // 0x12 == sha2-256 multihash code
+  if (parsed.multihash.code !== 0x12) {
+    throw new ProfileError(
+      'BUNDLE_NOT_FOUND',
+      `Unsupported multihash code 0x${parsed.multihash.code.toString(16)} for CID ${cidString}; only sha2-256 is verified`,
+    );
+  }
+
+  const expected = parsed.multihash.digest;
+  const actual = sha256(bytes);
+  if (!bytesEqual(expected, actual)) {
+    throw new ProfileError(
+      'BUNDLE_NOT_FOUND',
+      `CID verification failed for ${cidString}: gateway returned bytes whose sha256 does not match the CID`,
+    );
+  }
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
 
 /**

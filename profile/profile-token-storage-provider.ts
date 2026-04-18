@@ -160,6 +160,17 @@ export class ProfileTokenStorageProvider
   // PROFILE-ARCHITECTURE.md Q1 decision (Section 10).
   private readonly localCache: StorageProvider | null;
 
+  // --- Deduplication guard for concurrent rebuild attempts ---
+  // When two load() calls both see an empty cache and both invoke
+  // rebuildDerivedCache(), the second awaits the first's Promise
+  // rather than starting a parallel rebuild that could interleave
+  // writes. See rebuildDerivedCache().
+  private rebuildPromise: Promise<{
+    tombstones: TxfTombstone[];
+    sent: TxfSentEntry[];
+    history: HistoryRecord[];
+  }> | null = null;
+
   constructor(
     private readonly db: ProfileDatabase,
     encryptionKey: Uint8Array | null,
@@ -319,7 +330,14 @@ export class ProfileTokenStorageProvider
 
     this.emitEvent({ type: 'storage:saving', timestamp });
 
-    // Accept into local state immediately
+    // Accept into local state immediately.
+    // Whenever pendingData is overwritten, invalidate the lastPinnedCid
+    // retry cache — otherwise a retry after a partially-failed flush could
+    // re-register an OLD CID against NEW token data, producing a bundle
+    // ref whose tokenCount does not match the pinned CAR contents.
+    if (this.pendingData !== null && this.pendingData !== data) {
+      this.lastPinnedCid = null;
+    }
     this.pendingData = data;
     this.lastLoadedData = data;
 
@@ -1056,25 +1074,41 @@ export class ProfileTokenStorageProvider
    * NOT be replicated — a corrupt or malicious remote instance would
    * otherwise poison them everywhere simultaneously.
    *
+   * **Atomicity**: all three fields are serialized into a single key
+   * `deriver.{addressId}.all`. A crash or disk-full error between two
+   * individual writes would otherwise leave the cache in an inconsistent
+   * state that subsequent empty-checks would silently trust (since one
+   * field being non-empty bypasses the rebuild).
+   *
+   * **Error surfacing**: a write failure emits a `storage:error` event
+   * AND returns false, so callers can react (retry, degrade, alert).
+   * Previously the failure was only logged — hiding corruption.
+   *
    * If no local cache was injected, this is a no-op and the deriver
    * will rebuild from the token pool on next load.
    */
-  private async writeLocalDerivedCache(opState: OperationalState): Promise<void> {
-    if (!this.localCache) return;
-    const addr = this.getAddressId();
-
-    const writes: Array<[string, unknown]> = [
-      [`deriver.${addr}.tombstones`, opState.tombstones],
-      [`deriver.${addr}.sent`, opState.sent],
-      [`deriver.${addr}.history`, opState.history],
-    ];
-
-    for (const [key, value] of writes) {
-      try {
-        await this.localCache.set(key, JSON.stringify(value));
-      } catch (err) {
-        this.log(`Failed to write local derived cache "${key}": ${err instanceof Error ? err.message : String(err)}`);
-      }
+  private async writeLocalDerivedCache(
+    opState: Pick<OperationalState, 'tombstones' | 'sent' | 'history'>,
+  ): Promise<boolean> {
+    if (!this.localCache) return true;
+    const key = `deriver.${this.getAddressId()}.all`;
+    const payload = {
+      tombstones: opState.tombstones,
+      sent: opState.sent,
+      history: opState.history,
+    };
+    try {
+      await this.localCache.set(key, JSON.stringify(payload));
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`Failed to write local derived cache "${key}": ${msg}`);
+      this.emitEvent({
+        type: 'storage:error',
+        timestamp: Date.now(),
+        error: `Local derived cache write failed: ${msg}`,
+      });
+      return false;
     }
   }
 
@@ -1103,6 +1137,10 @@ export class ProfileTokenStorageProvider
    * Read LOCAL-ONLY derived cache. Returns empty arrays if no cache
    * exists or no StorageProvider was injected. Callers that need a
    * populated cache should invoke `rebuildDerivedCache()` afterwards.
+   *
+   * Falls back to reading the pre-atomic legacy per-key layout on miss
+   * so that caches written before the atomic migration continue to work
+   * until their next rewrite.
    */
   private async readLocalDerivedCache(): Promise<{
     tombstones: TxfTombstone[];
@@ -1114,12 +1152,26 @@ export class ProfileTokenStorageProvider
     }
     const addr = this.getAddressId();
 
+    // Prefer the atomic single-key layout.
+    const combined = await this.readLocalJson<{
+      tombstones?: TxfTombstone[];
+      sent?: TxfSentEntry[];
+      history?: HistoryRecord[];
+    }>(`deriver.${addr}.all`);
+    if (combined) {
+      return {
+        tombstones: combined.tombstones ?? [],
+        sent: combined.sent ?? [],
+        history: combined.history ?? [],
+      };
+    }
+
+    // Legacy per-key layout — read all three and heal on next write.
     const [tombRaw, sentRaw, histRaw] = await Promise.all([
       this.readLocalJson<TxfTombstone[]>(`deriver.${addr}.tombstones`),
       this.readLocalJson<TxfSentEntry[]>(`deriver.${addr}.sent`),
       this.readLocalJson<HistoryRecord[]>(`deriver.${addr}.history`),
     ]);
-
     return {
       tombstones: tombRaw ?? [],
       sent: sentRaw ?? [],
@@ -1129,7 +1181,9 @@ export class ProfileTokenStorageProvider
 
   /**
    * Read a JSON value from the local cache, returning null on miss or
-   * parse failure.
+   * parse failure. A parse failure is surfaced via `storage:error` so
+   * it is not silently swallowed — corrupted cache data should be
+   * visible to callers, not masked as "fresh device".
    */
   private async readLocalJson<T>(key: string): Promise<T | null> {
     if (!this.localCache) return null;
@@ -1138,7 +1192,13 @@ export class ProfileTokenStorageProvider
       if (raw === null) return null;
       return JSON.parse(raw) as T;
     } catch (err) {
-      this.log(`Failed to read local cache "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`Failed to read local cache "${key}": ${msg}`);
+      this.emitEvent({
+        type: 'storage:error',
+        timestamp: Date.now(),
+        error: `Local derived cache read failed for "${key}": ${msg}`,
+      });
       return null;
     }
   }
@@ -1148,8 +1208,26 @@ export class ProfileTokenStorageProvider
    * cache is empty on a fresh device or after corruption. Oracle-based
    * tombstone validation is deferred — this best-effort rebuild uses
    * archived tokens as the sole source.
+   *
+   * **Race guard**: concurrent load() calls are deduplicated — if a
+   * rebuild is in flight, the second caller awaits the same Promise
+   * rather than starting a second rebuild that could interleave writes.
    */
   private async rebuildDerivedCache(
+    data: TxfStorageDataBase,
+  ): Promise<{
+    tombstones: TxfTombstone[];
+    sent: TxfSentEntry[];
+    history: HistoryRecord[];
+  }> {
+    if (this.rebuildPromise) return this.rebuildPromise;
+    this.rebuildPromise = this.rebuildDerivedCacheInner(data).finally(() => {
+      this.rebuildPromise = null;
+    });
+    return this.rebuildPromise;
+  }
+
+  private async rebuildDerivedCacheInner(
     data: TxfStorageDataBase,
   ): Promise<{
     tombstones: TxfTombstone[];
@@ -1160,17 +1238,9 @@ export class ProfileTokenStorageProvider
     const sent = deriveSentFromArchived(data);
     const history = deriveHistoryFromArchived(data, this.getAddressId());
 
-    // Persist for next load
+    // Persist atomically for next load.
     if (this.localCache) {
-      await this.writeLocalDerivedCache({
-        tombstones,
-        sent,
-        history,
-        outbox: [],
-        invalid: [],
-        mintOutbox: [],
-        invalidatedNametags: [],
-      });
+      await this.writeLocalDerivedCache({ tombstones, sent, history });
     }
 
     return { tombstones, sent, history };

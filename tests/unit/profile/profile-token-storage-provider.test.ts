@@ -23,6 +23,21 @@ import {
   encryptString,
   decryptString,
 } from '../../../profile/encryption';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { CID } from 'multiformats/cid';
+import * as raw from 'multiformats/codecs/raw';
+import { create as createDigest } from 'multiformats/hashes/digest';
+
+/**
+ * Compute the CIDv1 (raw codec, sha256 multihash) that `fetchFromIpfs`
+ * will verify for the given bytes. Needed because the CID verification
+ * fix in profile/ipfs-client.ts rejects any gateway response whose
+ * sha256 does not match the requested CID.
+ */
+function cidForBytes(bytes: Uint8Array): string {
+  const digest = createDigest(0x12, sha256(bytes));
+  return CID.createV1(raw.code, digest).toString();
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -543,30 +558,32 @@ describe('ProfileTokenStorageProvider', () => {
       const carData1 = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_tokenA' }, { id: '_tokenB' }] }),
       );
+      const cidA = cidForBytes(carData1);
 
       // Bundle 2: token C
       const carData2 = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_tokenC' }] }),
       );
+      const cidB = cidForBytes(carData2);
 
       // Write bundle refs to OrbitDB (refs remain encrypted in KV)
-      const ref1: UxfBundleRef = { cid: 'cidA', status: 'active', createdAt: 100 };
-      const ref2: UxfBundleRef = { cid: 'cidB', status: 'active', createdAt: 200 };
+      const ref1: UxfBundleRef = { cid: cidA, status: 'active', createdAt: 100 };
+      const ref2: UxfBundleRef = { cid: cidB, status: 'active', createdAt: 200 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cidA`,
+        `${BUNDLE_KEY_PREFIX}${cidA}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref1))),
       );
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cidB`,
+        `${BUNDLE_KEY_PREFIX}${cidB}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref2))),
       );
 
       // Mock fetch for CAR retrieval
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cidA')) {
+        if (url.includes(`/ipfs/${cidA}`)) {
           return new Response(carData1, { status: 200 });
         }
-        if (url.includes('/ipfs/cidB')) {
+        if (url.includes(`/ipfs/${cidB}`)) {
           return new Response(carData2, { status: 200 });
         }
         return new Response('', { status: 404 });
@@ -612,20 +629,22 @@ describe('ProfileTokenStorageProvider', () => {
         }),
       );
 
-      const refA: UxfBundleRef = { cid: 'cidA', status: 'active', createdAt: 100 };
-      const refB: UxfBundleRef = { cid: 'cidB', status: 'active', createdAt: 200 };
+      const cidAjoin = cidForBytes(carA);
+      const cidBjoin = cidForBytes(carB);
+      const refA: UxfBundleRef = { cid: cidAjoin, status: 'active', createdAt: 100 };
+      const refB: UxfBundleRef = { cid: cidBjoin, status: 'active', createdAt: 200 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cidA`,
+        `${BUNDLE_KEY_PREFIX}${cidAjoin}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(refA))),
       );
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cidB`,
+        `${BUNDLE_KEY_PREFIX}${cidBjoin}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(refB))),
       );
 
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cidA')) return new Response(carA, { status: 200 });
-        if (url.includes('/ipfs/cidB')) return new Response(carB, { status: 200 });
+        if (url.includes(`/ipfs/${cidAjoin}`)) return new Response(carA, { status: 200 });
+        if (url.includes(`/ipfs/${cidBjoin}`)) return new Response(carB, { status: 200 });
         return new Response('', { status: 404 });
       });
 
@@ -651,22 +670,24 @@ describe('ProfileTokenStorageProvider', () => {
         JSON.stringify({ tokens: [{ id: '_tokenOK' }] }),
       );
 
-      const ref1: UxfBundleRef = { cid: 'cidOK', status: 'active', createdAt: 100 };
-      const ref2: UxfBundleRef = { cid: 'cidFail', status: 'active', createdAt: 200 };
+      const cidOK = cidForBytes(carData1);
+      const cidFail = 'bafkreiabcdefghijklmnopqrstuvwxyz234567wrongbytesdontmatter4a';
+      const ref1: UxfBundleRef = { cid: cidOK, status: 'active', createdAt: 100 };
+      const ref2: UxfBundleRef = { cid: cidFail, status: 'active', createdAt: 200 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cidOK`,
+        `${BUNDLE_KEY_PREFIX}${cidOK}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref1))),
       );
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cidFail`,
+        `${BUNDLE_KEY_PREFIX}${cidFail}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref2))),
       );
 
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cidOK')) {
+        if (url.includes(`/ipfs/${cidOK}`)) {
           return new Response(carData1, { status: 200 });
         }
-        if (url.includes('/ipfs/cidFail')) {
+        if (url.includes(`/ipfs/${cidFail}`)) {
           return new Response('', { status: 500 });
         }
         return new Response('', { status: 404 });
@@ -723,23 +744,26 @@ describe('ProfileTokenStorageProvider', () => {
 
     it('listActiveBundles filters by status', async () => {
       const encKey = getEncryptionKey();
+      const activeCarData = new TextEncoder().encode(JSON.stringify({ tokens: [{ id: '_t1' }] }));
+      const cidActive = cidForBytes(activeCarData);
+      const cidOld = 'bafkreiobsoleteoldoldoldoldoldoldoldoldoldoldoldoldoldoldolo';
 
       // Active bundle
-      const activeRef: UxfBundleRef = { cid: 'cid-active', status: 'active', createdAt: 100 };
+      const activeRef: UxfBundleRef = { cid: cidActive, status: 'active', createdAt: 100 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid-active`,
+        `${BUNDLE_KEY_PREFIX}${cidActive}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(activeRef))),
       );
 
       // Superseded bundle
       const supersededRef: UxfBundleRef = {
-        cid: 'cid-old',
+        cid: cidOld,
         status: 'superseded',
         createdAt: 50,
-        supersededBy: 'cid-active',
+        supersededBy: cidActive,
       };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid-old`,
+        `${BUNDLE_KEY_PREFIX}${cidOld}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(supersededRef))),
       );
 
@@ -748,12 +772,11 @@ describe('ProfileTokenStorageProvider', () => {
 
       // Use load() to trigger active bundle listing
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cid-active')) {
-          const carData = new TextEncoder().encode(JSON.stringify({ tokens: [{ id: '_t1' }] }));
-          return new Response(carData, { status: 200 });
+        if (url.includes(`/ipfs/${cidActive}`)) {
+          return new Response(activeCarData, { status: 200 });
         }
-        // cid-old should NOT be fetched (superseded)
-        if (url.includes('/ipfs/cid-old')) {
+        // Superseded bundles must NOT be fetched
+        if (url.includes(`/ipfs/${cidOld}`)) {
           throw new Error('Should not fetch superseded bundle');
         }
         return new Response('', { status: 404 });
@@ -823,10 +846,13 @@ describe('ProfileTokenStorageProvider', () => {
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.transactionHistory`)).toBe(false);
 
-      // Local derived cache: tombstones + sent land here
+      // Local derived cache: all three fields land in a single atomic key
       const lc = getMockLocalCache(provider)!;
-      expect(lc._kv.has(`deriver.${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(true);
-      expect(lc._kv.has(`deriver.${EXPECTED_ADDRESS_ID}.sent`)).toBe(true);
+      const derivedRaw = lc._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.all`);
+      expect(derivedRaw).toBeDefined();
+      const derived = JSON.parse(derivedRaw!);
+      expect(Array.isArray(derived.tombstones)).toBe(true);
+      expect(Array.isArray(derived.sent)).toBe(true);
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
     });
@@ -850,28 +876,31 @@ describe('ProfileTokenStorageProvider', () => {
 
       // Add a dummy active bundle so load() goes through the full merge path
       // (with 0 bundles, load() returns early without reading operational state)
-      const dummyRef: UxfBundleRef = { cid: 'cid-dummy', status: 'active', createdAt: 100 };
+      const emptyCarData = new TextEncoder().encode(JSON.stringify({ tokens: [] }));
+      const cidDummy = cidForBytes(emptyCarData);
+      const dummyRef: UxfBundleRef = { cid: cidDummy, status: 'active', createdAt: 100 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid-dummy`,
+        `${BUNDLE_KEY_PREFIX}${cidDummy}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(dummyRef))),
       );
 
       // Mock fetch to return an unencrypted CAR with no tokens
-      const emptyCarData = new TextEncoder().encode(JSON.stringify({ tokens: [] }));
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cid-dummy')) {
+        if (url.includes(`/ipfs/${cidDummy}`)) {
           return new Response(emptyCarData, { status: 200 });
         }
         return new Response('', { status: 404 });
       });
 
-      // Local (derived) state: tombstones, sent, history — never in OrbitDB
+      // Local (derived) state: tombstones, sent, history — never in OrbitDB.
+      // Written in the new atomic single-key layout.
       const tombstones = [{ tokenId: 't1', stateHash: 'h1', timestamp: 1000 }];
       const sent = [{ tokenId: 't1', recipient: 'bob', txHash: 'hash1', sentAt: 2000 }];
       const localCache = createMockLocalCache();
-      localCache._kv.set(`deriver.${addr}.tombstones`, JSON.stringify(tombstones));
-      localCache._kv.set(`deriver.${addr}.sent`, JSON.stringify(sent));
-      localCache._kv.set(`deriver.${addr}.history`, JSON.stringify([]));
+      localCache._kv.set(
+        `deriver.${addr}.all`,
+        JSON.stringify({ tombstones, sent, history: [] }),
+      );
 
       const provider = createProvider(db, { localCache });
       await provider.initialize();
@@ -905,18 +934,19 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.initialize();
 
       // Simulate a remote device adding a bundle
-      const ref: UxfBundleRef = { cid: 'cid-new', status: 'active', createdAt: 300 };
+      const carData = new TextEncoder().encode(
+        JSON.stringify({ tokens: [{ id: '_newToken' }] }),
+      );
+      const cidNew = cidForBytes(carData);
+      const ref: UxfBundleRef = { cid: cidNew, status: 'active', createdAt: 300 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid-new`,
+        `${BUNDLE_KEY_PREFIX}${cidNew}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref))),
       );
 
       // Mock fetch for the new bundle (CAR unencrypted)
-      const carData = new TextEncoder().encode(
-        JSON.stringify({ tokens: [{ id: '_newToken' }] }),
-      );
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cid-new')) {
+        if (url.includes(`/ipfs/${cidNew}`)) {
           return new Response(carData, { status: 200 });
         }
         return new Response('', { status: 404 });
@@ -931,25 +961,30 @@ describe('ProfileTokenStorageProvider', () => {
     it('sync() detects removed bundles', async () => {
       const encKey = getEncryptionKey();
 
-      // Start with 2 bundles
-      const ref1: UxfBundleRef = { cid: 'cid1', status: 'active', createdAt: 100 };
-      const ref2: UxfBundleRef = { cid: 'cid2', status: 'active', createdAt: 200 };
+      // Start with 2 bundles — content is identical so CID is the same,
+      // but we need two distinct OrbitDB keys, so use a spacer.
+      const carData1 = new TextEncoder().encode(
+        JSON.stringify({ tokens: [{ id: '_t1' }] }),
+      );
+      const carData2 = new TextEncoder().encode(
+        JSON.stringify({ tokens: [{ id: '_t1' }, { id: '_t2' }] }),
+      );
+      const cid1 = cidForBytes(carData1);
+      const cid2 = cidForBytes(carData2);
+      const ref1: UxfBundleRef = { cid: cid1, status: 'active', createdAt: 100 };
+      const ref2: UxfBundleRef = { cid: cid2, status: 'active', createdAt: 200 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid1`,
+        `${BUNDLE_KEY_PREFIX}${cid1}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref1))),
       );
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid2`,
+        `${BUNDLE_KEY_PREFIX}${cid2}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref2))),
       );
 
-      const carData = new TextEncoder().encode(
-        JSON.stringify({ tokens: [{ id: '_t1' }] }),
-      );
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/')) {
-          return new Response(carData, { status: 200 });
-        }
+        if (url.includes(`/ipfs/${cid1}`)) return new Response(carData1, { status: 200 });
+        if (url.includes(`/ipfs/${cid2}`)) return new Response(carData2, { status: 200 });
         return new Response('', { status: 404 });
       });
 
@@ -957,7 +992,7 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.initialize();
 
       // Now remove one bundle (simulate remote device)
-      db._store.delete(`${BUNDLE_KEY_PREFIX}cid2`);
+      db._store.delete(`${BUNDLE_KEY_PREFIX}${cid2}`);
 
       const localData = buildTxfData({ _t1: { id: '_t1' }, _t2: { id: '_t2' } });
       const syncResult = await provider.sync(localData);
@@ -1190,15 +1225,11 @@ describe('ProfileTokenStorageProvider', () => {
     it('derived cache (tombstones/sent/history) round-trips through the local store', async () => {
       vi.useRealTimers();
 
+      // The save path doesn't re-fetch after pin, so the pin response CID
+      // is not verified in this test — any well-formed CID is fine.
       installMockFetch(async (url: string) => {
         if (url.includes('/api/v0/dag/put')) {
-          return new Response(JSON.stringify({ Cid: { '/': 'cid-derived' } }), { status: 200 });
-        }
-        if (url.includes('/ipfs/cid-derived')) {
-          return new Response(
-            new TextEncoder().encode(JSON.stringify({ tokens: [] })),
-            { status: 200 },
-          );
+          return new Response(JSON.stringify({ Cid: { '/': 'bafkreiunverifiedfakepinresponsecidforsavepath234567890123456a' } }), { status: 200 });
         }
         return new Response('', { status: 404 });
       });
@@ -1234,14 +1265,13 @@ describe('ProfileTokenStorageProvider', () => {
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.transactionHistory`)).toBe(false);
 
-      // All derived keys present in the local cache
-      expect(JSON.parse(localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.tombstones`)!)).toEqual(
-        tombstones,
-      );
-      expect(JSON.parse(localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.sent`)!)).toEqual(sent);
-      expect(JSON.parse(localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.history`)!)).toEqual(
-        history,
-      );
+      // All three derived fields present in a single atomic key in the local cache
+      const derivedRaw = localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.all`);
+      expect(derivedRaw).toBeDefined();
+      const derived = JSON.parse(derivedRaw!);
+      expect(derived.tombstones).toEqual(tombstones);
+      expect(derived.sent).toEqual(sent);
+      expect(derived.history).toEqual(history);
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
     });
@@ -1276,14 +1306,15 @@ describe('ProfileTokenStorageProvider', () => {
       );
 
       const encKey = getEncryptionKey();
-      const ref: UxfBundleRef = { cid: 'cid-arch', status: 'active', createdAt: 100 };
+      const cidArch = cidForBytes(carData);
+      const ref: UxfBundleRef = { cid: cidArch, status: 'active', createdAt: 100 };
       db._store.set(
-        `${BUNDLE_KEY_PREFIX}cid-arch`,
+        `${BUNDLE_KEY_PREFIX}${cidArch}`,
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref))),
       );
 
       installMockFetch(async (url: string) => {
-        if (url.includes('/ipfs/cid-arch')) {
+        if (url.includes(`/ipfs/${cidArch}`)) {
           return new Response(carData, { status: 200 });
         }
         return new Response('', { status: 404 });
@@ -1301,9 +1332,10 @@ describe('ProfileTokenStorageProvider', () => {
       // buildTxfStorageData prefixes it as `_archived-xyz`. Whether that
       // downstream key is treated as archived by the deriver is out of
       // scope here — we only assert that the local cache received a
-      // write-through after rebuild attempt.
-      const tombsRaw = localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.tombstones`);
-      expect(tombsRaw).toBeDefined();
+      // write-through after rebuild attempt (the atomic single-key
+      // layout).
+      const derivedRaw = localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.all`);
+      expect(derivedRaw).toBeDefined();
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
     });

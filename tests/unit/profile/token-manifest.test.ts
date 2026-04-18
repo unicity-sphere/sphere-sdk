@@ -165,4 +165,32 @@ describe('deriveStructuralManifest', () => {
     expect(entry?.conflictingHeads?.length).toBe(3);
     expect([...(entry?.conflictingHeads ?? [])].sort()).toEqual(['headA', 'headB', 'headD']);
   });
+
+  it('does NOT mis-attribute sibling heads across tokens that share a mid-chain hash', () => {
+    // Regression test for steelman finding: pre-fix, collectHeads used
+    // "any hash in chain" as the relatedness test, so two different
+    // tokens sharing a common mid-chain element (e.g. a shared
+    // predicate) would be flagged as each other's siblings. Post-fix,
+    // sibling detection anchors on the chain tail only.
+
+    // Token A — chain [headA, sharedMid, tailA]
+    const chainA = chainEntry('headA', ['headA', 'sharedMid', 'tailA']);
+    // Token B — chain [headB, sharedMid, tailB] (different tail → unrelated)
+    const chainB = chainEntry('headB', ['headB', 'sharedMid', 'tailB']);
+
+    const idx = new Map<ContentHash, InstanceChainEntry>();
+    idx.set('tailA', chainA);
+    idx.set('headA', chainA);
+    idx.set('sharedMid', chainA); // LWW in index — sharedMid lands on chainA
+    idx.set('tailB', chainB);
+    idx.set('headB', chainB);
+
+    const pkg = mockPackage({ tokenA: 'tailA', tokenB: 'tailB' }, idx);
+    const manifest = deriveStructuralManifest(pkg);
+
+    expect(manifest.get('tokenA')?.status).toBe('valid');
+    expect(manifest.get('tokenB')?.status).toBe('valid');
+    expect(manifest.get('tokenA')?.conflictingHeads).toBeUndefined();
+    expect(manifest.get('tokenB')?.conflictingHeads).toBeUndefined();
+  });
 });

@@ -98,15 +98,17 @@ export type TokenManifest = Map<string, TokenManifestEntry>;
  * rooted at `startHash`.
  *
  * After `mergeInstanceChains()` processes divergent bundles, sibling
- * chains share some hashes (typically the common prefix back to a
- * common ancestor state) but have distinct `head` values. To enumerate
- * them we cannot simply walk the primary chain — that finds only the
- * primary entry. We must scan every distinct `InstanceChainEntry` in
- * the index and keep those whose chain overlaps with the primary's
- * hash set.
+ * chains share a common prefix back to the genesis/tail element but
+ * have distinct `head` values. Sibling detection must be **anchored
+ * to the chain tail**, not to arbitrary overlap: two chains belonging
+ * to the same token always share their tail hash, whereas two chains
+ * belonging to DIFFERENT tokens that happen to share a mid-chain
+ * element (e.g. a shared predicate or mint-batch state) must NOT be
+ * treated as siblings. Tail equality as the anchor prevents cross-token
+ * mis-attribution.
  *
- * Cost: O(distinctEntries × averageChainLength). For typical bundle
- * counts (handful per wallet) this is negligible.
+ * Cost: O(distinctEntries). For typical bundle counts (handful per
+ * wallet) this is negligible.
  */
 function collectHeads(
   pkg: UxfPackageData,
@@ -122,10 +124,10 @@ function collectHeads(
     return heads;
   }
 
-  // Primary chain's hashes — sibling chains are those that share any
-  // of these hashes but head somewhere else.
-  const primaryHashes = new Set<ContentHash>();
-  for (const link of seed.chain) primaryHashes.add(link.hash);
+  // Tail = the genesis/original element that every sibling chain of
+  // this token must share. InstanceChainEntry.chain is ordered
+  // head → … → original, so the last element is the tail.
+  const primaryTail = seed.chain[seed.chain.length - 1]?.hash;
 
   // Enumerate every distinct InstanceChainEntry in the index. The index
   // is a Map from hash → entry, and multiple hashes map to the same
@@ -136,21 +138,15 @@ function collectHeads(
   }
 
   for (const entry of uniqueEntries) {
-    // Is this entry related to our token's chain? An entry is related
-    // when its chain shares at least one hash with the primary chain.
-    let related = false;
-    for (const link of entry.chain) {
-      if (primaryHashes.has(link.hash)) {
-        related = true;
-        break;
-      }
-    }
-    if (related) heads.add(entry.head);
+    // Tail-anchored: an entry belongs to this token's conflict set if
+    // and only if its chain tail matches the primary chain's tail.
+    // This rejects cross-token overlap via shared mid-chain elements.
+    const tail = entry.chain[entry.chain.length - 1]?.hash;
+    if (tail === primaryTail) heads.add(entry.head);
   }
 
-  // Edge case: if the seed itself wasn't the primary (nothing shared
-  // with itself — impossible since own chain always overlaps) we still
-  // want the manifest root treated as a head.
+  // Edge case: if somehow no heads were collected, fall back to the
+  // seed's head so the caller always gets a definite root.
   if (heads.size === 0) heads.add(seed.head);
   return heads;
 }
