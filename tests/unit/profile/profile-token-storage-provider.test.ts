@@ -448,19 +448,17 @@ describe('ProfileTokenStorageProvider', () => {
     it('load() merges multiple active bundles', async () => {
       const encKey = getEncryptionKey();
 
-      // Bundle 1: tokens A, B
+      // Bundle 1: tokens A, B (CAR is unencrypted on IPFS)
       const carData1 = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_tokenA' }, { id: '_tokenB' }] }),
       );
-      const encCar1 = await encryptProfileValue(encKey, carData1);
 
       // Bundle 2: token C
       const carData2 = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_tokenC' }] }),
       );
-      const encCar2 = await encryptProfileValue(encKey, carData2);
 
-      // Write bundle refs to OrbitDB
+      // Write bundle refs to OrbitDB (refs remain encrypted in KV)
       const ref1: UxfBundleRef = { cid: 'cidA', status: 'active', createdAt: 100 };
       const ref2: UxfBundleRef = { cid: 'cidB', status: 'active', createdAt: 200 };
       db._store.set(
@@ -475,10 +473,10 @@ describe('ProfileTokenStorageProvider', () => {
       // Mock fetch for CAR retrieval
       installMockFetch(async (url: string) => {
         if (url.includes('/ipfs/cidA')) {
-          return new Response(encCar1, { status: 200 });
+          return new Response(carData1, { status: 200 });
         }
         if (url.includes('/ipfs/cidB')) {
-          return new Response(encCar2, { status: 200 });
+          return new Response(carData2, { status: 200 });
         }
         return new Response('', { status: 404 });
       });
@@ -499,11 +497,10 @@ describe('ProfileTokenStorageProvider', () => {
     it('load() continues on partial bundle failure', async () => {
       const encKey = getEncryptionKey();
 
-      // Bundle 1: succeeds
+      // Bundle 1: succeeds (CAR unencrypted)
       const carData1 = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_tokenOK' }] }),
       );
-      const encCar1 = await encryptProfileValue(encKey, carData1);
 
       const ref1: UxfBundleRef = { cid: 'cidOK', status: 'active', createdAt: 100 };
       const ref2: UxfBundleRef = { cid: 'cidFail', status: 'active', createdAt: 200 };
@@ -518,7 +515,7 @@ describe('ProfileTokenStorageProvider', () => {
 
       installMockFetch(async (url: string) => {
         if (url.includes('/ipfs/cidOK')) {
-          return new Response(encCar1, { status: 200 });
+          return new Response(carData1, { status: 200 });
         }
         if (url.includes('/ipfs/cidFail')) {
           return new Response('', { status: 500 });
@@ -604,8 +601,7 @@ describe('ProfileTokenStorageProvider', () => {
       installMockFetch(async (url: string) => {
         if (url.includes('/ipfs/cid-active')) {
           const carData = new TextEncoder().encode(JSON.stringify({ tokens: [{ id: '_t1' }] }));
-          const encCar = await encryptProfileValue(encKey, carData);
-          return new Response(encCar, { status: 200 });
+          return new Response(carData, { status: 200 });
         }
         // cid-old should NOT be fetched (superseded)
         if (url.includes('/ipfs/cid-old')) {
@@ -709,12 +705,11 @@ describe('ProfileTokenStorageProvider', () => {
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(dummyRef))),
       );
 
-      // Mock fetch to return an encrypted CAR with no tokens
+      // Mock fetch to return an unencrypted CAR with no tokens
       const emptyCarData = new TextEncoder().encode(JSON.stringify({ tokens: [] }));
-      const encEmptyCar = await encryptProfileValue(encKey, emptyCarData);
       installMockFetch(async (url: string) => {
         if (url.includes('/ipfs/cid-dummy')) {
-          return new Response(encEmptyCar, { status: 200 });
+          return new Response(emptyCarData, { status: 200 });
         }
         return new Response('', { status: 404 });
       });
@@ -757,14 +752,13 @@ describe('ProfileTokenStorageProvider', () => {
         await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref))),
       );
 
-      // Mock fetch for the new bundle
+      // Mock fetch for the new bundle (CAR unencrypted)
       const carData = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_newToken' }] }),
       );
-      const encCar = await encryptProfileValue(encKey, carData);
       installMockFetch(async (url: string) => {
         if (url.includes('/ipfs/cid-new')) {
-          return new Response(encCar, { status: 200 });
+          return new Response(carData, { status: 200 });
         }
         return new Response('', { status: 404 });
       });
@@ -793,10 +787,9 @@ describe('ProfileTokenStorageProvider', () => {
       const carData = new TextEncoder().encode(
         JSON.stringify({ tokens: [{ id: '_t1' }] }),
       );
-      const encCar = await encryptProfileValue(encKey, carData);
       installMockFetch(async (url: string) => {
         if (url.includes('/ipfs/')) {
-          return new Response(encCar, { status: 200 });
+          return new Response(carData, { status: 200 });
         }
         return new Response('', { status: 404 });
       });
@@ -967,7 +960,7 @@ describe('ProfileTokenStorageProvider', () => {
   // =========================================================================
 
   describe('encryption', () => {
-    it('CAR files are encrypted before pinning', async () => {
+    it('CAR files are pinned unencrypted (content-addressed dedup)', async () => {
       let pinnedBytes: Uint8Array | null = null;
 
       installMockFetch(async (url: string, init?: RequestInit) => {
@@ -990,18 +983,13 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.save(txfData);
       await vi.advanceTimersByTimeAsync(100);
 
-      // The pinned bytes should not be the raw CAR content
+      // The pinned bytes must be the raw CAR content (unencrypted) so that
+      // identical token pools across wallets produce the same CID.
+      expect(pinnedBytes).not.toBeNull();
       if (pinnedBytes) {
         const rawText = new TextDecoder().decode(pinnedBytes);
-        // If it were unencrypted, it would be valid JSON with "tokens"
-        let isRawJson = false;
-        try {
-          const parsed = JSON.parse(rawText);
-          if (parsed.tokens) isRawJson = true;
-        } catch {
-          // Expected: encrypted data is not valid JSON
-        }
-        expect(isRawJson).toBe(false);
+        const parsed = JSON.parse(rawText);
+        expect(parsed.tokens).toBeDefined();
       }
     });
 

@@ -114,9 +114,9 @@ export class ConsolidationEngine {
    *  1. Check for concurrent consolidation (pending key < 5 min old) -- skip if so
    *  2. List active bundles -- skip if count <= 3
    *  3. Write `consolidation.pending` to OrbitDB
-   *  4. Fetch and decrypt each active bundle CAR from IPFS
+   *  4. Fetch each active bundle CAR from IPFS (unencrypted)
    *  5. Merge all into a single UxfPackage
-   *  6. Export to CAR, encrypt, pin to IPFS
+   *  6. Export to CAR, pin to IPFS (unencrypted)
    *  7. Add consolidated bundle ref to OrbitDB
    *  8. Mark all source bundles as superseded
    *  9. Delete `consolidation.pending` key
@@ -180,15 +180,14 @@ export class ConsolidationEngine {
     }
 
     try {
-      // Step 4-5: fetch, decrypt, merge
+      // Step 4-5: fetch, merge (CARs are unencrypted on IPFS)
       const { UxfPackage } = await import('../uxf/UxfPackage.js');
       const mergedPkg = UxfPackage.create({ description: 'consolidated' });
       const successfullyMergedCids: string[] = [];
 
       for (const cid of sourceCids) {
         try {
-          const encryptedCar = await fetchFromIpfs(this.ipfsGateways, cid);
-          const carBytes = await decryptProfileValue(this.encryptionKey, encryptedCar);
+          const carBytes = await fetchFromIpfs(this.ipfsGateways, cid);
           const pkg = await UxfPackage.fromCar(carBytes);
           mergedPkg.merge(pkg);
           successfullyMergedCids.push(cid);
@@ -208,10 +207,9 @@ export class ConsolidationEngine {
         return { consolidated: false, consolidatedCid: undefined, sourceBundleCount: 0, tokenCount: 0 };
       }
 
-      // Step 6: export, encrypt, pin
+      // Step 6: export, pin (unencrypted)
       const consolidatedCar = await mergedPkg.toCar();
-      const encryptedCar = await encryptProfileValue(this.encryptionKey, consolidatedCar);
-      const consolidatedCid = await pinToIpfs(this.ipfsGateways, encryptedCar);
+      const consolidatedCid = await pinToIpfs(this.ipfsGateways, consolidatedCar);
 
       // Count tokens in the merged package
       const tokenCount = mergedPkg.assembleAll().size;

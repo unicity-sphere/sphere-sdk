@@ -7,15 +7,20 @@
  *
  * This is the bridge between:
  * - **TxfStorageDataBase** (what PaymentsModule reads/writes)
- * - **UXF bundles** (encrypted CAR files pinned to IPFS, referenced via OrbitDB)
+ * - **UXF bundles** (unencrypted CAR files pinned to IPFS, referenced via OrbitDB)
+ *
+ * CAR payloads are stored unencrypted so that identical token pools produced
+ * by different wallets hash to the same CID (cross-user content-addressed
+ * dedup). Confidentiality is provided by the OrbitDB KV layer, which encrypts
+ * bundle refs and operational state with a per-wallet key.
  *
  * Write-behind buffer: `save()` accepts data immediately and debounces IPFS
  * pin + OrbitDB writes (2 seconds by default). Multiple rapid `save()` calls
  * coalesce into a single flush.
  *
  * Multi-bundle merge on load: all active `tokens.bundle.*` keys from OrbitDB
- * are fetched, decrypted, deserialized from CAR, and merged into a single
- * UxfPackage before reassembling into TxfStorageDataBase format.
+ * are fetched, deserialized from CAR, and merged into a single UxfPackage
+ * before reassembling into TxfStorageDataBase format.
  *
  * @see PROFILE-ARCHITECTURE.md Section 2.3 (Multi-Bundle Model)
  * @see PROFILE-ARCHITECTURE.md Section 5.3 (Token Storage Flow)
@@ -352,18 +357,14 @@ export class ProfileTokenStorageProvider
       const { UxfPackage } = await import('../uxf/UxfPackage.js');
       const mergedPkg = UxfPackage.create();
 
-      // 3. For each active bundle: fetch, decrypt, deserialize, merge
+      // 3. For each active bundle: fetch, deserialize, merge.
+      // CARs on IPFS are unencrypted — confidentiality comes from the OrbitDB
+      // KV layer that holds the bundle refs. Unencrypted CARs enable cross-user
+      // content-addressed dedup.
       for (const [cid] of activeBundles) {
         try {
           const carBytes = await fetchFromIpfs(this._ipfsGateways, cid);
-          if (!this.encryptionKey) {
-            throw new ProfileError(
-              'PROFILE_NOT_INITIALIZED',
-              'Encryption key not derived — call setIdentity() first',
-            );
-          }
-          const decryptedCar = await decryptProfileValue(this.encryptionKey, carBytes);
-          const pkg = await UxfPackage.fromCar(decryptedCar);
+          const pkg = await UxfPackage.fromCar(carBytes);
           mergedPkg.merge(pkg);
         } catch (err) {
           this.log(`Failed to load bundle ${cid}: ${err instanceof Error ? err.message : String(err)}`);
@@ -691,24 +692,15 @@ export class ProfileTokenStorageProvider
         pkg.ingestAll(tokenValues);
       }
 
-      // 3. Export to CAR
+      // 3. Export to CAR (unencrypted — see class doc)
       const carBytes = await pkg.toCar();
 
-      // 4. Encrypt
-      if (!this.encryptionKey) {
-        throw new ProfileError(
-          'PROFILE_NOT_INITIALIZED',
-          'Encryption key not derived — call setIdentity() first',
-        );
-      }
-      const encryptedCar = await encryptProfileValue(this.encryptionKey, carBytes);
-
-      // 5. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
+      // 4. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
       let cid: string;
       if (this.lastPinnedCid) {
         cid = this.lastPinnedCid;
       } else {
-        cid = await pinToIpfs(this._ipfsGateways, encryptedCar);
+        cid = await pinToIpfs(this._ipfsGateways, carBytes);
         this.lastPinnedCid = cid;
       }
 
