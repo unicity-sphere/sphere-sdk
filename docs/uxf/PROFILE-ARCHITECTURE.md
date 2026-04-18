@@ -896,7 +896,7 @@ The **token manifest** is a Unicity-level artifact that maps tokens to their lat
 interface TokenManifestEntry {
   rootHash: ContentHash;           // root of the primary (valid) DAG
   status: 'valid' | 'invalid' | 'conflicting' | 'pending';
-  conflictingRoots?: ContentHash[];  // alternative DAGs for investigation
+  conflictingHeads?: ContentHash[];  // alternative DAGs for investigation
   invalidReason?: string;
 }
 
@@ -1395,7 +1395,7 @@ The **token manifest** (derived, wallet-level — see Section 10.2.2) is NOT a s
 interface ManifestEntry {
   rootHash: ContentHash;           // root of the primary (valid) DAG
   status: 'valid' | 'invalid' | 'conflicting' | 'pending';
-  conflictingRoots?: ContentHash[];  // alternative DAGs (for investigation/history)
+  conflictingHeads?: ContentHash[];  // alternative DAGs (for investigation/history)
   invalidReason?: string;            // why the token is invalid (if applicable)
 }
 
@@ -1424,7 +1424,7 @@ manifest:
   tokenId_x → {
     rootHash: hash_R3a,           // the version we're trying to finalize
     status: 'conflicting',
-    conflictingRoots: [hash_R3b], // the other version
+    conflictingHeads: [hash_R3b], // the other version
   }
 ```
 

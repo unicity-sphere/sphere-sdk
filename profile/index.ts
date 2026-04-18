@@ -107,6 +107,30 @@ export type { ConsolidationResult } from './consolidation';
 export { ProfileMigration } from './migration';
 
 // =============================================================================
+// Deriver (local-cached structural views)
+// =============================================================================
+
+export {
+  deriveTombstonesFromArchived,
+  deriveSentFromArchived,
+  deriveHistoryFromArchived,
+} from './deriver';
+
+// =============================================================================
+// Token Manifest (structural JOIN result)
+// =============================================================================
+
+export {
+  deriveStructuralManifest,
+  conflictingTokenIds,
+} from './token-manifest';
+export type {
+  TokenManifest,
+  TokenManifestEntry,
+  TokenManifestStatus,
+} from './token-manifest';
+
+// =============================================================================
 // Shared Factory
 // =============================================================================
 

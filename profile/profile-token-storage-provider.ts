@@ -63,6 +63,10 @@ import {
   deriveHistoryFromArchived,
   deriveTombstonesFromArchived,
 } from './deriver.js';
+import {
+  deriveStructuralManifest,
+  type TokenManifest,
+} from './token-manifest.js';
 
 // =============================================================================
 // Constants
@@ -132,6 +136,12 @@ export class ProfileTokenStorageProvider
 
   // --- Last loaded data (for sync diffing) ---
   private lastLoadedData: TxfStorageDataBase | null = null;
+
+  // --- Last derived structural token manifest ---
+  // Structural-only: status ∈ {valid, conflicting}. Oracle enrichment
+  // (pending, invalid, spent) is a future layer. See
+  // profile/token-manifest.ts.
+  private lastTokenManifest: TokenManifest | null = null;
 
   // --- Computed short address ID ---
   private addressId: string | null = null;
@@ -402,7 +412,19 @@ export class ProfileTokenStorageProvider
         }
       }
 
-      // 4. Assemble all tokens from merged package
+      // 4. Derive the structural token manifest from the joined package
+      //    (conflicts detected, oracle status deferred to future layer)
+      //    and cache for getTokenManifest(). See profile/token-manifest.ts.
+      //    Wrapped because the derivation touches UxfPackage internals;
+      //    a deriver failure must not fail the load itself.
+      try {
+        this.lastTokenManifest = deriveStructuralManifest(mergedPkg);
+      } catch (err) {
+        this.log(`Token manifest derivation failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.lastTokenManifest = new Map();
+      }
+
+      // 5. Assemble all tokens from merged package
       const assembledTokens = mergedPkg.assembleAll();
 
       // 5. Read operational state:
@@ -590,6 +612,19 @@ export class ProfileTokenStorageProvider
       this.log(`clear() failed: ${err instanceof Error ? err.message : String(err)}`);
       return false;
     }
+  }
+
+  /**
+   * Return the latest **structural** token manifest derived during
+   * load(). Returns null if no load has completed yet.
+   *
+   * Structural-only: entries carry `status ∈ {'valid', 'conflicting'}`.
+   * Oracle-based status (spent, pending, invalid) is produced by a
+   * future higher-layer enrichment pass. See PROFILE-ARCHITECTURE.md
+   * §10.2.2 and §10.6, and profile/token-manifest.ts for details.
+   */
+  getTokenManifest(): TokenManifest | null {
+    return this.lastTokenManifest;
   }
 
   createForAddress(addressId?: string): ProfileTokenStorageProvider {
