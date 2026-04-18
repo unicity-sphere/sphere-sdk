@@ -22,7 +22,32 @@ const mockCalculateOptimalSplit = vi.fn();
 vi.mock('../../../modules/payments/TokenSplitCalculator', () => ({
   TokenSplitCalculator: class {
     calculateOptimalSplit = mockCalculateOptimalSplit;
+    calculateOptimalSplitSync = vi.fn();
   },
+}));
+
+// Mock SpendPlanner + SpendQueue — the spend queue integration uses these
+// instead of TokenSplitCalculator for the conservative send() path.
+// We bridge planSend() to use the same mockCalculateOptimalSplit value.
+let currentSplitPlan: any = null;
+const mockBuildParsedPool = vi.fn().mockResolvedValue(new Map());
+const mockPlanSend = vi.fn();
+vi.mock('../../../modules/payments/SpendQueue', () => ({
+  SpendPlanner: class {
+    buildParsedPool = mockBuildParsedPool;
+    planSend = mockPlanSend;
+  },
+  SpendQueue: class {
+    enqueue = vi.fn();
+    waitForEntry = vi.fn();
+    notifyChange = vi.fn();
+    cancelAll = vi.fn();
+    destroy = vi.fn();
+  },
+  RESERVATION_TIMEOUT_MS: 30000,
+  QUEUE_TIMEOUT_MS: 30000,
+  MAX_SKIP_COUNT: 10,
+  QUEUE_MAX_SIZE: 100,
 }));
 
 // Mock InstantSplitExecutor — controls split execution result
@@ -123,6 +148,7 @@ vi.mock('../../../registry', () => ({
       getName: vi.fn().mockReturnValue('Unicity Token'),
       getDecimals: vi.fn().mockReturnValue(18),
       getIconUrl: vi.fn().mockReturnValue(undefined),
+      getDefinitionBySymbol: vi.fn().mockReturnValue(undefined),
     }),
   },
 }));
@@ -243,6 +269,24 @@ describe('TransferResult.tokenTransfers', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    currentSplitPlan = null;
+
+    // Bridge: whenever mockCalculateOptimalSplit is configured, also track for planSend
+    const origMockResolvedValue = mockCalculateOptimalSplit.mockResolvedValue.bind(mockCalculateOptimalSplit);
+    mockCalculateOptimalSplit.mockResolvedValue = (value: any) => {
+      currentSplitPlan = value;
+      return origMockResolvedValue(value);
+    };
+
+    // Set up mockPlanSend to return the configured split plan synchronously
+    mockPlanSend.mockImplementation(
+      (_request: any, _pool: any, _ledger: any, _queue: any, reservationId: string) => {
+        if (currentSplitPlan === null) {
+          throw new Error('Insufficient balance');
+        }
+        return { reservationId, splitPlan: currentSplitPlan };
+      }
+    );
 
     module = createPaymentsModule({ debug: false });
     mockTransport = createMockTransport();

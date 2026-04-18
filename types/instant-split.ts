@@ -294,6 +294,9 @@ export interface InstantSplitOptions {
   /** Optional memo/message to include with the transfer */
   memo?: string;
 
+  /** On-chain message bytes to embed in TransferTransactionData.message */
+  message?: Uint8Array | null;
+
   /** Timeout for Nostr delivery in ms (default: 30000) */
   nostrTimeoutMs?: number;
 

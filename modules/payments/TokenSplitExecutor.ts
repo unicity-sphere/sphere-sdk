@@ -86,7 +86,8 @@ export class TokenSplitExecutor {
     splitAmount: bigint,
     remainderAmount: bigint,
     coinIdHex: string,
-    recipientAddress: any
+    recipientAddress: any,
+    message?: Uint8Array | null
   ): Promise<SplitResult> {
     const tokenIdHex = toHex(tokenToSplit.id.bytes);
     logger.debug('TokenSplit', `Splitting token ${tokenIdHex.slice(0, 8)}...`);
@@ -184,8 +185,8 @@ export class TokenSplitExecutor {
       recipientTokenBeforeTransfer,
       recipientAddress,
       transferSalt,
-      null,
-      null,
+      null, // recipientDataHash
+      message ?? null, // on-chain message (invoice memo bytes, or null)
       this.signingService
     );
 
