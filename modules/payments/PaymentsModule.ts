@@ -59,6 +59,7 @@ import type {
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   tokenToTxf,
+  txfToToken,
   getCurrentStateHash,
   buildTxfStorageData,
   parseTxfStorageData,
@@ -3203,6 +3204,133 @@ export class PaymentsModule {
       logger.debug('Payments', `getToken: not found id=${id.slice(0, 16)}... mapSize=${this.tokens.size}`);
     }
     return token;
+  }
+
+  // ===========================================================================
+  // Public API - Token Import / Export
+  // ===========================================================================
+
+  /**
+   * Export owned tokens as TXF wire-format objects.
+   *
+   * The returned TxfToken array is the canonical inter-wallet wire
+   * format used by {@link send} / {@link receive} and by the legacy
+   * TXF serializer. Callers may write it to a file (as JSON) or wrap
+   * it into a UXF CAR (via `UxfPackage.ingestAll` + `toCar`) for
+   * content-addressable distribution.
+   *
+   * @param options.ids - Export only these local token IDs.
+   * @param options.coinId - Export only tokens of this coin.
+   * @param options.includeUnconfirmed - Include tokens whose status is
+   *   not 'confirmed'. Default false. Unconfirmed tokens still carry
+   *   valid TxfToken structure but the receiving wallet may reject
+   *   them during finalization.
+   * @returns Array of `{ localId, genesisTokenId, txf }` triples. A
+   *   token is skipped if its `sdkData` does not parse to a valid TXF
+   *   shape (should not happen for healthy tokens).
+   */
+  exportTokens(options?: {
+    ids?: readonly string[];
+    coinId?: string;
+    includeUnconfirmed?: boolean;
+  }): Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> {
+    this.ensureInitialized();
+
+    let candidates = Array.from(this.tokens.values());
+    if (options?.ids) {
+      const idSet = new Set(options.ids);
+      candidates = candidates.filter((t) => idSet.has(t.id));
+    }
+    if (options?.coinId) {
+      candidates = candidates.filter((t) => t.coinId === options.coinId);
+    }
+    if (!options?.includeUnconfirmed) {
+      candidates = candidates.filter((t) => t.status === 'confirmed');
+    }
+
+    const out: Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> = [];
+    for (const token of candidates) {
+      const txf = tokenToTxf(token);
+      if (!txf) continue;
+      const genesisTokenId = txf.genesis?.data?.tokenId;
+      if (!genesisTokenId) continue;
+      out.push({ localId: token.id, genesisTokenId, txf });
+    }
+    return out;
+  }
+
+  /**
+   * Import tokens from TXF wire-format objects.
+   *
+   * Each token receives a fresh local UUID. Dedup is delegated to
+   * {@link addToken}, which enforces the tombstone + `(tokenId,
+   * stateHash)` guard — previously-spent tokens are rejected, exact
+   * duplicates are skipped. Malformed entries are reported as
+   * `rejected` with a reason so the caller can surface them.
+   *
+   * @param txfTokens - Array of TxfToken objects (as produced by
+   *   {@link exportTokens}, a legacy TXF file, or a UXF CAR that has
+   *   been reassembled).
+   * @returns Counts and identifiers for each outcome category.
+   */
+  async importTokens(
+    txfTokens: readonly TxfToken[],
+  ): Promise<{
+    added: Array<{ localId: string; genesisTokenId: string }>;
+    skipped: Array<{ genesisTokenId: string; reason: string }>;
+    rejected: Array<{ genesisTokenId: string | null; reason: string }>;
+  }> {
+    this.ensureInitialized();
+
+    const added: Array<{ localId: string; genesisTokenId: string }> = [];
+    const skipped: Array<{ genesisTokenId: string; reason: string }> = [];
+    const rejected: Array<{ genesisTokenId: string | null; reason: string }> = [];
+
+    for (const txf of txfTokens) {
+      const genesisTokenId = txf?.genesis?.data?.tokenId ?? null;
+      if (!genesisTokenId) {
+        rejected.push({ genesisTokenId: null, reason: 'Missing genesis.data.tokenId' });
+        continue;
+      }
+      if (!txf.state || !txf.genesis) {
+        rejected.push({ genesisTokenId, reason: 'Missing state or genesis section' });
+        continue;
+      }
+
+      // Fresh local UUID so imported tokens are addressable without
+      // colliding with the wallet's existing local IDs.
+      const localId = crypto.randomUUID();
+      let uiToken: Token;
+      try {
+        uiToken = txfToToken(localId, txf);
+      } catch (err) {
+        rejected.push({
+          genesisTokenId,
+          reason: `txfToToken failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+
+      try {
+        const addedOk = await this.addToken(uiToken);
+        if (addedOk) {
+          added.push({ localId, genesisTokenId });
+        } else {
+          // addToken returns false for duplicate / tombstoned entries
+          skipped.push({
+            genesisTokenId,
+            reason: 'Already owned, previously spent (tombstoned), or superseded',
+          });
+        }
+      } catch (err) {
+        rejected.push({
+          genesisTokenId,
+          reason: `addToken failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+
+    return { added, skipped, rejected };
   }
 
   // ===========================================================================

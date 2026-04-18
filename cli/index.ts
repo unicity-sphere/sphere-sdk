@@ -1393,6 +1393,12 @@ TRANSFERS:
   receive                           Check for incoming transfers
   history [limit]                   Transaction history
 
+FILE I/O (offline token transfer / backup):
+  tokens-export <file> [options]    Export owned tokens to a file
+  tokens-import <file>              Import tokens from a file
+    Formats: .uxf|.car (content-addressed CAR); .txf|.json (TXF JSON array)
+    Auto-detected from file extension on export and from content on import.
+
 ADDRESSES:
   addresses                         List tracked addresses
   switch <index>                    Switch to HD address
@@ -2362,6 +2368,221 @@ async function main() {
           console.log('\nWarning: finalization timed out, some tokens still unconfirmed.');
         } else if (finalize && result.finalizationDurationMs) {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'tokens-export': {
+        const outFile = args[1];
+        if (!outFile) {
+          console.error('Usage: tokens-export <file> [options]');
+          console.error('  file: output path — extension determines format');
+          console.error('        .uxf or .car → UXF CAR (content-addressable)');
+          console.error('        .txf or .json → TXF JSON array (legacy, backward-compatible)');
+          console.error('  Options:');
+          console.error('    --format uxf|txf|json  Force format (overrides extension)');
+          console.error('    --coin <symbol>        Export only tokens of this coin');
+          console.error('    --ids <id1,id2,...>    Export only these local token IDs');
+          console.error('    --all                  (default) Export all confirmed tokens');
+          console.error('    --include-unconfirmed  Include provisional tokens');
+          process.exit(1);
+        }
+
+        // Resolve format
+        const formatArgIdx = args.indexOf('--format');
+        const formatArg = formatArgIdx >= 0 ? args[formatArgIdx + 1] : undefined;
+        let format: 'uxf' | 'txf';
+        if (formatArg) {
+          if (formatArg === 'uxf' || formatArg === 'car') format = 'uxf';
+          else if (formatArg === 'txf' || formatArg === 'json') format = 'txf';
+          else {
+            console.error(`Unknown --format: ${formatArg}. Use uxf|car|txf|json.`);
+            process.exit(1);
+          }
+        } else {
+          const ext = path.extname(outFile).toLowerCase();
+          if (ext === '.uxf' || ext === '.car') format = 'uxf';
+          else if (ext === '.txf' || ext === '.json') format = 'txf';
+          else {
+            console.error(`Cannot infer format from extension "${ext}". Pass --format uxf|txf.`);
+            process.exit(1);
+          }
+        }
+
+        // Selection
+        const coinArgIdx = args.indexOf('--coin');
+        const coinArg = coinArgIdx >= 0 ? args[coinArgIdx + 1] : undefined;
+        const idsArgIdx = args.indexOf('--ids');
+        const idsArg = idsArgIdx >= 0 ? args[idsArgIdx + 1] : undefined;
+        const includeUnconfirmed = args.includes('--include-unconfirmed');
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+
+        // Resolve coin symbol → coinId hex (so user can say "--coin UCT")
+        let coinIdFilter: string | undefined;
+        if (coinArg) {
+          try {
+            coinIdFilter = resolveCoin(coinArg).coinId;
+          } catch {
+            // Fall back to treating the arg as a literal coinId.
+            coinIdFilter = coinArg;
+          }
+        }
+
+        const ids = idsArg ? idsArg.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+
+        const exported = sphere.payments.exportTokens({
+          ids,
+          coinId: coinIdFilter,
+          includeUnconfirmed,
+        });
+
+        if (exported.length === 0) {
+          console.error('No tokens match the selection.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        const txfTokens = exported.map((e) => e.txf);
+
+        if (format === 'uxf') {
+          const { UxfPackage } = await import('../uxf/UxfPackage.js');
+          const pkg = UxfPackage.create({
+            description: `sphere-cli export: ${exported.length} token(s)`,
+          });
+          pkg.ingestAll(txfTokens);
+          const carBytes = await pkg.toCar();
+          fs.writeFileSync(path.resolve(outFile), carBytes);
+          console.log(`\n✓ Exported ${exported.length} token(s) as UXF CAR`);
+          console.log(`  File: ${outFile}`);
+          console.log(`  Size: ${carBytes.byteLength} bytes`);
+          console.log(`  Pool elements: ${pkg.elementCount}`);
+        } else {
+          const json = JSON.stringify(txfTokens, null, 2);
+          fs.writeFileSync(path.resolve(outFile), json);
+          console.log(`\n✓ Exported ${exported.length} token(s) as TXF JSON`);
+          console.log(`  File: ${outFile}`);
+          console.log(`  Size: ${Buffer.byteLength(json)} bytes`);
+        }
+
+        // Summary by coin
+        const byCoin = new Map<string, number>();
+        for (const e of exported) {
+          byCoin.set(e.txf.genesis.data.coinData[0]?.[0] ?? 'unknown',
+            (byCoin.get(e.txf.genesis.data.coinData[0]?.[0] ?? 'unknown') ?? 0) + 1);
+        }
+        console.log('  Tokens by coin:');
+        for (const [coin, count] of byCoin) {
+          console.log(`    ${coin}: ${count}`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'tokens-import': {
+        const inFile = args[1];
+        if (!inFile) {
+          console.error('Usage: tokens-import <file> [--format auto|uxf|txf|json]');
+          console.error('  file: input path (auto-detects CAR vs JSON by default)');
+          console.error('  --format: force specific format (auto is usually correct)');
+          process.exit(1);
+        }
+
+        const formatArgIdx = args.indexOf('--format');
+        const formatArg = formatArgIdx >= 0 ? args[formatArgIdx + 1] : 'auto';
+
+        let bytes: Buffer;
+        try {
+          bytes = fs.readFileSync(path.resolve(inFile));
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'ENOENT') console.error(`File not found: "${inFile}"`);
+          else if (code === 'EACCES') console.error(`Permission denied: "${inFile}"`);
+          else console.error(`Failed to read file: "${inFile}"`);
+          process.exit(1);
+        }
+
+        // Determine format
+        type DetectedFormat = 'uxf' | 'txf';
+        const detect = (b: Buffer): DetectedFormat => {
+          // JSON almost always starts with '[' or '{' (after optional BOM/whitespace).
+          // CAR v1 starts with a varint-encoded header length — typically a
+          // small positive byte, not a printable ASCII.
+          for (let i = 0; i < Math.min(b.length, 16); i++) {
+            const c = b[i];
+            // Skip leading whitespace/BOM
+            if (c === 0x09 || c === 0x0a || c === 0x0d || c === 0x20 || c === 0xef || c === 0xbb || c === 0xbf) continue;
+            if (c === 0x5b /* '[' */ || c === 0x7b /* '{' */) return 'txf';
+            return 'uxf';
+          }
+          return 'uxf';
+        };
+
+        let format: DetectedFormat;
+        if (formatArg === 'auto') {
+          format = detect(bytes);
+        } else if (formatArg === 'uxf' || formatArg === 'car') {
+          format = 'uxf';
+        } else if (formatArg === 'txf' || formatArg === 'json') {
+          format = 'txf';
+        } else {
+          console.error(`Unknown --format: ${formatArg}. Use auto|uxf|car|txf|json.`);
+          process.exit(1);
+        }
+
+        // Parse tokens from file bytes
+        let txfTokens: import('../types/txf').TxfToken[];
+        if (format === 'uxf') {
+          try {
+            const { UxfPackage } = await import('../uxf/UxfPackage.js');
+            const pkg = await UxfPackage.fromCar(new Uint8Array(bytes));
+            const assembled = pkg.assembleAll();
+            txfTokens = Array.from(assembled.values()) as import('../types/txf').TxfToken[];
+          } catch (err) {
+            console.error(`Failed to parse UXF CAR: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        } else {
+          try {
+            const parsed: unknown = JSON.parse(bytes.toString('utf8'));
+            txfTokens = (Array.isArray(parsed) ? parsed : [parsed]) as import('../types/txf').TxfToken[];
+          } catch (err) {
+            console.error(`Failed to parse TXF JSON: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        }
+
+        if (txfTokens.length === 0) {
+          console.error('File contains no tokens.');
+          process.exit(1);
+        }
+
+        console.log(`\nImporting ${txfTokens.length} token(s) from ${format.toUpperCase()} file...`);
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+
+        const result = await sphere.payments.importTokens(txfTokens);
+
+        console.log(`\n✓ Import complete:`);
+        console.log(`  Added:    ${result.added.length}`);
+        console.log(`  Skipped:  ${result.skipped.length} (already owned / tombstoned)`);
+        console.log(`  Rejected: ${result.rejected.length}`);
+
+        if (result.rejected.length > 0) {
+          console.log('\n  Rejected tokens:');
+          for (const r of result.rejected.slice(0, 10)) {
+            const idLabel = r.genesisTokenId ? `${r.genesisTokenId.slice(0, 16)}...` : '(no tokenId)';
+            console.log(`    ${idLabel}: ${r.reason}`);
+          }
+          if (result.rejected.length > 10) {
+            console.log(`    (... ${result.rejected.length - 10} more)`);
+          }
         }
 
         await syncAfterWrite(sphere);
@@ -4813,6 +5034,8 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'sync', description: 'Sync tokens with IPFS' },
     { name: 'send', description: 'Send L3 tokens', flags: ['--direct', '--proxy', '--instant', '--conservative', '--no-sync'] },
     { name: 'receive', description: 'Check for incoming transfers', flags: ['--finalize', '--no-sync'] },
+    { name: 'tokens-export', description: 'Export owned tokens to a file (TXF/JSON or UXF/CAR)', flags: ['--format', '--coin', '--ids', '--all', '--include-unconfirmed'] },
+    { name: 'tokens-import', description: 'Import tokens from a file (auto-detects TXF/JSON or UXF/CAR)', flags: ['--format'] },
     { name: 'history', description: 'Show transaction history' },
     { name: 'addresses', description: 'List tracked addresses' },
     { name: 'switch', description: 'Switch to HD address' },
