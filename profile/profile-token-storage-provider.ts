@@ -43,6 +43,7 @@ import type {
   StorageEventCallback,
   StorageEvent,
   HistoryRecord,
+  StorageProvider,
 } from '../storage/storage-provider.js';
 import {
   type UxfBundleRef,
@@ -57,6 +58,11 @@ import {
   deriveProfileEncryptionKey,
 } from './encryption.js';
 import { pinToIpfs, fetchFromIpfs } from './ipfs-client.js';
+import {
+  deriveSentFromArchived,
+  deriveHistoryFromArchived,
+  deriveTombstonesFromArchived,
+} from './deriver.js';
 
 // =============================================================================
 // Constants
@@ -139,16 +145,23 @@ export class ProfileTokenStorageProvider
   private readonly _ipfsGateways: string[];
   private readonly _options: ProfileTokenStorageProviderOptions | undefined;
 
+  // --- Local-only derived cache (per-device, never replicated) ---
+  // Holds tombstones, sent, history. See profile/deriver.ts and
+  // PROFILE-ARCHITECTURE.md Q1 decision (Section 10).
+  private readonly localCache: StorageProvider | null;
+
   constructor(
     private readonly db: ProfileDatabase,
     encryptionKey: Uint8Array | null,
     ipfsGateways: string[],
     private readonly options?: ProfileTokenStorageProviderOptions,
+    localCache?: StorageProvider | null,
   ) {
     this._db = db;
     this._encryptionKeyRaw = encryptionKey;
     this._ipfsGateways = ipfsGateways;
     this._options = options;
+    this.localCache = localCache ?? null;
     this.flushDebounceMs =
       options?.flushDebounceMs ?? options?.config?.flushDebounceMs ?? DEFAULT_FLUSH_DEBOUNCE_MS;
 
@@ -375,11 +388,29 @@ export class ProfileTokenStorageProvider
       // 4. Assemble all tokens from merged package
       const assembledTokens = mergedPkg.assembleAll();
 
-      // 5. Read operational state from OrbitDB
+      // 5. Read operational state:
+      //    - synced portion from OrbitDB (outbox, mintOutbox, etc.)
+      //    - derived portion from local cache (tombstones, sent, history)
       const opState = await this.readOperationalState();
 
-      // 6. Build TxfStorageDataBase
+      // 6. Build TxfStorageDataBase — uses whatever we have so far
       const txfData = this.buildTxfStorageData(assembledTokens, opState);
+
+      // 7. If the local derived cache is empty, rebuild from the token
+      //    pool and patch the result. This covers fresh-device onboarding
+      //    and local-cache corruption. The derived caches are then
+      //    persisted locally for next load.
+      const cacheIsEmpty =
+        opState.tombstones.length === 0 &&
+        opState.sent.length === 0 &&
+        opState.history.length === 0;
+      if (cacheIsEmpty && assembledTokens.size > 0) {
+        const rebuilt = await this.rebuildDerivedCache(txfData);
+        if (rebuilt.tombstones.length > 0) txfData._tombstones = rebuilt.tombstones;
+        if (rebuilt.sent.length > 0) txfData._sent = rebuilt.sent;
+        if (rebuilt.history.length > 0) txfData._history = rebuilt.history;
+      }
+
       this.lastLoadedData = txfData;
 
       this.emitEvent({ type: 'storage:loaded', timestamp: Date.now() });
@@ -554,6 +585,7 @@ export class ProfileTokenStorageProvider
       this._encryptionKeyRaw,
       this._ipfsGateways,
       options,
+      this.localCache,
     );
   }
 
@@ -713,8 +745,11 @@ export class ProfileTokenStorageProvider
       };
       await this.addBundle(cid, bundleRef);
 
-      // 7. Write operational state to OrbitDB
-      await this.writeOperationalState(opState);
+      // 7. Write operational state:
+      //    - synced portion to OrbitDB (outbox, mintOutbox, etc.)
+      //    - derived portion to local cache (tombstones, sent, history)
+      await this.writeOrbitOperationalState(opState);
+      await this.writeLocalDerivedCache(opState);
 
       // Clear the pinned CID tracker after successful OrbitDB write
       this.lastPinnedCid = null;
@@ -935,23 +970,24 @@ export class ProfileTokenStorageProvider
   // ===========================================================================
 
   /**
-   * Write operational state fields as separate OrbitDB keys.
+   * Write the SYNCED portion of operational state to OrbitDB.
+   *
+   * Keys written: outbox, invalid, mintOutbox, invalidatedNametags.
+   * These are authoritative across all Sphere instances sharing the
+   * wallet identity.
+   *
+   * `tombstones`, `sent`, and `history` are NOT written here — they go
+   * to the local-only cache via `writeLocalDerivedCache()`. See
+   * PROFILE-ARCHITECTURE.md §10 (Q1 decision) for rationale.
    */
-  private async writeOperationalState(opState: OperationalState): Promise<void> {
+  private async writeOrbitOperationalState(opState: OperationalState): Promise<void> {
     const addr = this.getAddressId();
     const writes: Array<[string, unknown]> = [
-      [`${addr}.tombstones`, opState.tombstones],
       [`${addr}.outbox`, opState.outbox],
-      [`${addr}.sent`, opState.sent],
       [`${addr}.invalid`, opState.invalid],
       [`${addr}.mintOutbox`, opState.mintOutbox],
       [`${addr}.invalidatedNametags`, opState.invalidatedNametags],
     ];
-
-    // History is written via transactionHistory key
-    if (opState.history.length > 0) {
-      writes.push([`${addr}.transactionHistory`, opState.history]);
-    }
 
     for (const [key, value] of writes) {
       try {
@@ -963,30 +999,146 @@ export class ProfileTokenStorageProvider
   }
 
   /**
-   * Read all operational state from OrbitDB.
+   * Write the LOCAL-ONLY derived cache (tombstones, sent, history) to
+   * the injected StorageProvider. These views are per-device and MUST
+   * NOT be replicated — a corrupt or malicious remote instance would
+   * otherwise poison them everywhere simultaneously.
+   *
+   * If no local cache was injected, this is a no-op and the deriver
+   * will rebuild from the token pool on next load.
    */
-  private async readOperationalState(): Promise<OperationalState> {
+  private async writeLocalDerivedCache(opState: OperationalState): Promise<void> {
+    if (!this.localCache) return;
     const addr = this.getAddressId();
 
-    const [tombstones, outbox, sent, invalid, history, mintOutbox, invalidatedNametags] =
-      await Promise.all([
-        this.readProfileKeyJson<TxfTombstone[]>(`${addr}.tombstones`),
-        this.readProfileKeyJson<TxfOutboxEntry[]>(`${addr}.outbox`),
-        this.readProfileKeyJson<TxfSentEntry[]>(`${addr}.sent`),
-        this.readProfileKeyJson<TxfInvalidEntry[]>(`${addr}.invalid`),
-        this.readProfileKeyJson<HistoryRecord[]>(`${addr}.transactionHistory`),
-        this.readProfileKeyJson<unknown[]>(`${addr}.mintOutbox`),
-        this.readProfileKeyJson<unknown[]>(`${addr}.invalidatedNametags`),
-      ]);
+    const writes: Array<[string, unknown]> = [
+      [`deriver.${addr}.tombstones`, opState.tombstones],
+      [`deriver.${addr}.sent`, opState.sent],
+      [`deriver.${addr}.history`, opState.history],
+    ];
+
+    for (const [key, value] of writes) {
+      try {
+        await this.localCache.set(key, JSON.stringify(value));
+      } catch (err) {
+        this.log(`Failed to write local derived cache "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  /**
+   * Read SYNCED operational state from OrbitDB.
+   */
+  private async readOrbitOperationalState(): Promise<Omit<OperationalState, 'tombstones' | 'sent' | 'history'>> {
+    const addr = this.getAddressId();
+
+    const [outbox, invalid, mintOutbox, invalidatedNametags] = await Promise.all([
+      this.readProfileKeyJson<TxfOutboxEntry[]>(`${addr}.outbox`),
+      this.readProfileKeyJson<TxfInvalidEntry[]>(`${addr}.invalid`),
+      this.readProfileKeyJson<unknown[]>(`${addr}.mintOutbox`),
+      this.readProfileKeyJson<unknown[]>(`${addr}.invalidatedNametags`),
+    ]);
 
     return {
-      tombstones: tombstones ?? [],
       outbox: outbox ?? [],
-      sent: sent ?? [],
       invalid: invalid ?? [],
-      history: history ?? [],
       mintOutbox: mintOutbox ?? [],
       invalidatedNametags: invalidatedNametags ?? [],
+    };
+  }
+
+  /**
+   * Read LOCAL-ONLY derived cache. Returns empty arrays if no cache
+   * exists or no StorageProvider was injected. Callers that need a
+   * populated cache should invoke `rebuildDerivedCache()` afterwards.
+   */
+  private async readLocalDerivedCache(): Promise<{
+    tombstones: TxfTombstone[];
+    sent: TxfSentEntry[];
+    history: HistoryRecord[];
+  }> {
+    if (!this.localCache) {
+      return { tombstones: [], sent: [], history: [] };
+    }
+    const addr = this.getAddressId();
+
+    const [tombRaw, sentRaw, histRaw] = await Promise.all([
+      this.readLocalJson<TxfTombstone[]>(`deriver.${addr}.tombstones`),
+      this.readLocalJson<TxfSentEntry[]>(`deriver.${addr}.sent`),
+      this.readLocalJson<HistoryRecord[]>(`deriver.${addr}.history`),
+    ]);
+
+    return {
+      tombstones: tombRaw ?? [],
+      sent: sentRaw ?? [],
+      history: histRaw ?? [],
+    };
+  }
+
+  /**
+   * Read a JSON value from the local cache, returning null on miss or
+   * parse failure.
+   */
+  private async readLocalJson<T>(key: string): Promise<T | null> {
+    if (!this.localCache) return null;
+    try {
+      const raw = await this.localCache.get(key);
+      if (raw === null) return null;
+      return JSON.parse(raw) as T;
+    } catch (err) {
+      this.log(`Failed to read local cache "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Rebuild the local derived cache from the token pool. Used when the
+   * cache is empty on a fresh device or after corruption. Oracle-based
+   * tombstone validation is deferred — this best-effort rebuild uses
+   * archived tokens as the sole source.
+   */
+  private async rebuildDerivedCache(
+    data: TxfStorageDataBase,
+  ): Promise<{
+    tombstones: TxfTombstone[];
+    sent: TxfSentEntry[];
+    history: HistoryRecord[];
+  }> {
+    const tombstones = deriveTombstonesFromArchived(data);
+    const sent = deriveSentFromArchived(data);
+    const history = deriveHistoryFromArchived(data, this.getAddressId());
+
+    // Persist for next load
+    if (this.localCache) {
+      await this.writeLocalDerivedCache({
+        tombstones,
+        sent,
+        history,
+        outbox: [],
+        invalid: [],
+        mintOutbox: [],
+        invalidatedNametags: [],
+      });
+    }
+
+    return { tombstones, sent, history };
+  }
+
+  /**
+   * Read the full operational state (synced + local-cached) for use
+   * when building a TxfStorageDataBase on load.
+   */
+  private async readOperationalState(): Promise<OperationalState> {
+    const [orbit, local] = await Promise.all([
+      this.readOrbitOperationalState(),
+      this.readLocalDerivedCache(),
+    ]);
+
+    return {
+      ...orbit,
+      tombstones: local.tombstones,
+      sent: local.sent,
+      history: local.history,
     };
   }
 

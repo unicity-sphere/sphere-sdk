@@ -89,11 +89,15 @@ export function createProfileProviders(
     debug: resolvedConfig.debug,
   };
 
+  // The cacheStorage is also used as the per-device local cache for
+  // derived operational state (tombstones, sent, history) — these are
+  // never replicated via OrbitDB. See profile/deriver.ts.
   const tokenStorage = new ProfileTokenStorageProvider(
     db,
     null, // encryption key derived later via setIdentity()
     ipfsGateways,
     tokenStorageOptions,
+    cacheStorage,
   );
 
   return { storage, tokenStorage };

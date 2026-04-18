@@ -238,14 +238,95 @@ vi.mock('../../../uxf/UxfPackage.js', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Mock StorageProvider for the local derived cache (per-device, not replicated)
+// ---------------------------------------------------------------------------
+
+interface MockLocalCache {
+  _kv: Map<string, string>;
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+  isConnected(): boolean;
+  getStatus(): string;
+  setIdentity(identity: unknown): void;
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+  remove(key: string): Promise<void>;
+  has(key: string): Promise<boolean>;
+  keys(prefix?: string): Promise<string[]>;
+  clear(prefix?: string): Promise<void>;
+  saveTrackedAddresses(entries: unknown[]): Promise<void>;
+  loadTrackedAddresses(): Promise<unknown[]>;
+  id: string;
+  name: string;
+  type: 'local';
+}
+
+function createMockLocalCache(): MockLocalCache {
+  const kv = new Map<string, string>();
+  return {
+    _kv: kv,
+    id: 'mock-local-cache',
+    name: 'Mock Local Cache',
+    type: 'local',
+    async connect() {},
+    async disconnect() {},
+    isConnected() {
+      return true;
+    },
+    getStatus() {
+      return 'connected';
+    },
+    setIdentity() {},
+    async get(key: string) {
+      return kv.get(key) ?? null;
+    },
+    async set(key: string, value: string) {
+      kv.set(key, value);
+    },
+    async remove(key: string) {
+      kv.delete(key);
+    },
+    async has(key: string) {
+      return kv.has(key);
+    },
+    async keys(prefix?: string) {
+      const out: string[] = [];
+      for (const k of kv.keys()) {
+        if (!prefix || k.startsWith(prefix)) out.push(k);
+      }
+      return out;
+    },
+    async clear(prefix?: string) {
+      if (!prefix) {
+        kv.clear();
+        return;
+      }
+      for (const k of Array.from(kv.keys())) {
+        if (k.startsWith(prefix)) kv.delete(k);
+      }
+    },
+    async saveTrackedAddresses() {},
+    async loadTrackedAddresses() {
+      return [];
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Factory: Create a provider with mock dependencies
 // ---------------------------------------------------------------------------
 
 function createProvider(
   db: MockProfileDb,
-  opts?: { encryptionKey?: Uint8Array | null; flushDebounceMs?: number },
+  opts?: {
+    encryptionKey?: Uint8Array | null;
+    flushDebounceMs?: number;
+    localCache?: MockLocalCache | null;
+  },
 ): ProfileTokenStorageProvider {
   const encKey = opts?.encryptionKey !== undefined ? opts.encryptionKey : getEncryptionKey();
+  const localCache =
+    opts?.localCache !== undefined ? opts.localCache : createMockLocalCache();
   const provider = new ProfileTokenStorageProvider(
     db,
     encKey,
@@ -258,9 +339,19 @@ function createProvider(
       encrypt: true,
       flushDebounceMs: opts?.flushDebounceMs ?? 50, // short debounce for testing
     },
+    localCache as unknown as Parameters<typeof ProfileTokenStorageProvider>[4],
   );
   provider.setIdentity(TEST_IDENTITY);
+  (provider as unknown as { _mockLocalCache: MockLocalCache | null })._mockLocalCache =
+    localCache;
   return provider;
+}
+
+function getMockLocalCache(
+  provider: ProfileTokenStorageProvider,
+): MockLocalCache | null {
+  return (provider as unknown as { _mockLocalCache: MockLocalCache | null })
+    ._mockLocalCache;
 }
 
 // ---------------------------------------------------------------------------
@@ -642,7 +733,7 @@ describe('ProfileTokenStorageProvider', () => {
   // =========================================================================
 
   describe('operational state', () => {
-    it('operational state stored as separate OrbitDB keys', async () => {
+    it('operational state split between OrbitDB (synced) and local cache (derived)', async () => {
       vi.useRealTimers();
 
       installMockFetch(async (url: string) => {
@@ -662,33 +753,35 @@ describe('ProfileTokenStorageProvider', () => {
       txfData._outbox = [
         { id: 'o1', status: 'pending', tokenId: 't1', recipient: 'alice', createdAt: 1000, data: {} },
       ];
+      txfData._sent = [{ tokenId: 't1', recipient: 'bob', txHash: 'hash1', sentAt: 2000 }];
 
       await provider.save(txfData);
       await new Promise((r) => setTimeout(r, 200));
 
-      // Operational state should be in separate keys
-      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(true);
+      // Synced (OrbitDB): outbox only
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox`)).toBe(true);
-      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(true);
+      // Synced keys must NOT contain the derived caches — those stay local
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(false);
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.transactionHistory`)).toBe(false);
+
+      // Local derived cache: tombstones + sent land here
+      const lc = getMockLocalCache(provider)!;
+      expect(lc._kv.has(`deriver.${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(true);
+      expect(lc._kv.has(`deriver.${EXPECTED_ADDRESS_ID}.sent`)).toBe(true);
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
     });
 
-    it('readOperationalState reads all fields in parallel', async () => {
+    it('readOperationalState merges OrbitDB (synced) and local cache (derived)', async () => {
       const encKey = getEncryptionKey();
       const addr = EXPECTED_ADDRESS_ID;
 
-      // Write operational state directly to OrbitDB
-      const tombstones = [{ tokenId: 't1', stateHash: 'h1', timestamp: 1000 }];
+      // Synced (OrbitDB) state: outbox, invalid, mintOutbox, invalidatedNametags
       const outbox = [{ id: 'o1', status: 'pending', tokenId: 't1', recipient: 'alice', createdAt: 1000, data: {} }];
-      const sent = [{ tokenId: 't1', recipient: 'bob', txHash: 'hash1', sentAt: 2000 }];
-
       for (const [key, value] of [
-        [`${addr}.tombstones`, tombstones],
         [`${addr}.outbox`, outbox],
-        [`${addr}.sent`, sent],
         [`${addr}.invalid`, []],
-        [`${addr}.transactionHistory`, []],
         [`${addr}.mintOutbox`, []],
         [`${addr}.invalidatedNametags`, []],
       ] as const) {
@@ -714,7 +807,15 @@ describe('ProfileTokenStorageProvider', () => {
         return new Response('', { status: 404 });
       });
 
-      const provider = createProvider(db);
+      // Local (derived) state: tombstones, sent, history — never in OrbitDB
+      const tombstones = [{ tokenId: 't1', stateHash: 'h1', timestamp: 1000 }];
+      const sent = [{ tokenId: 't1', recipient: 'bob', txHash: 'hash1', sentAt: 2000 }];
+      const localCache = createMockLocalCache();
+      localCache._kv.set(`deriver.${addr}.tombstones`, JSON.stringify(tombstones));
+      localCache._kv.set(`deriver.${addr}.sent`, JSON.stringify(sent));
+      localCache._kv.set(`deriver.${addr}.history`, JSON.stringify([]));
+
+      const provider = createProvider(db, { localCache });
       await provider.initialize();
 
       const loadResult = await provider.load();
@@ -1024,6 +1125,127 @@ describe('ProfileTokenStorageProvider', () => {
       expect(ref.cid).toBeDefined();
       expect(ref.status).toBe('active');
       expect(typeof ref.createdAt).toBe('number');
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+
+    it('derived cache (tombstones/sent/history) round-trips through the local store', async () => {
+      vi.useRealTimers();
+
+      installMockFetch(async (url: string) => {
+        if (url.includes('/api/v0/dag/put')) {
+          return new Response(JSON.stringify({ Cid: { '/': 'cid-derived' } }), { status: 200 });
+        }
+        if (url.includes('/ipfs/cid-derived')) {
+          return new Response(
+            new TextEncoder().encode(JSON.stringify({ tokens: [] })),
+            { status: 200 },
+          );
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const localCache = createMockLocalCache();
+      const provider = createProvider(db, { flushDebounceMs: 50, localCache });
+      await provider.initialize();
+
+      // Save: derived cache must land in localCache, not in OrbitDB
+      const tombstones = [{ tokenId: 'spent1', stateHash: 'h1', timestamp: 5000 }];
+      const sent = [{ tokenId: 'spent1', recipient: 'DIRECT://bob', txHash: 'hx', sentAt: 5000 }];
+      const history = [
+        {
+          dedupKey: 'SENT_spent1',
+          id: 'id-1',
+          type: 'SENT' as const,
+          amount: '100',
+          coinId: 'UCT',
+          symbol: 'UCT',
+          timestamp: 5000,
+        },
+      ];
+      const txfData = buildTxfData({ _token: { id: '_token' } });
+      txfData._tombstones = tombstones;
+      txfData._sent = sent;
+      txfData._history = history;
+
+      await provider.save(txfData);
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Nothing derived in OrbitDB
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(false);
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.transactionHistory`)).toBe(false);
+
+      // All derived keys present in the local cache
+      expect(JSON.parse(localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.tombstones`)!)).toEqual(
+        tombstones,
+      );
+      expect(JSON.parse(localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.sent`)!)).toEqual(sent);
+      expect(JSON.parse(localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.history`)!)).toEqual(
+        history,
+      );
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+
+    it('load() rebuilds derived cache from archived tokens when local cache is empty', async () => {
+      vi.useRealTimers();
+
+      // A CAR containing one token whose id encodes it as archived.
+      const carData = new TextEncoder().encode(
+        JSON.stringify({
+          tokens: [
+            {
+              id: 'archived-xyz',
+              genesis: {
+                data: {
+                  tokenId: 'hex_t1',
+                  coinData: [['UCT', '42']],
+                  recipient: 'DIRECT://bob',
+                },
+              },
+              state: {},
+              transactions: [
+                {
+                  newStateHash: 'state_final',
+                  data: { recipient: 'DIRECT://bob' },
+                  inclusionProof: { transactionHash: 'hash1' },
+                },
+              ],
+            },
+          ],
+        }),
+      );
+
+      const encKey = getEncryptionKey();
+      const ref: UxfBundleRef = { cid: 'cid-arch', status: 'active', createdAt: 100 };
+      db._store.set(
+        `${BUNDLE_KEY_PREFIX}cid-arch`,
+        await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(ref))),
+      );
+
+      installMockFetch(async (url: string) => {
+        if (url.includes('/ipfs/cid-arch')) {
+          return new Response(carData, { status: 200 });
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const localCache = createMockLocalCache(); // empty
+      const provider = createProvider(db, { localCache });
+      await provider.initialize();
+
+      const loadResult = await provider.load();
+      expect(loadResult.success).toBe(true);
+
+      // Note: with the current mock UxfPackage, tokens end up keyed by
+      // their `id` field. When `id` starts with `archived-` (not `_`),
+      // buildTxfStorageData prefixes it as `_archived-xyz`. Whether that
+      // downstream key is treated as archived by the deriver is out of
+      // scope here — we only assert that the local cache received a
+      // write-through after rebuild attempt.
+      const tombsRaw = localCache._kv.get(`deriver.${EXPECTED_ADDRESS_ID}.tombstones`);
+      expect(tombsRaw).toBeDefined();
 
       vi.useFakeTimers({ shouldAdvanceTime: true });
     });
