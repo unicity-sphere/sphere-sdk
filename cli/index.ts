@@ -155,104 +155,37 @@ function switchToProfile(name: string): boolean {
 // Storage Mode Detection
 // =============================================================================
 
-/**
- * Check whether a legacy file-based wallet already exists at this dataDir.
- *
- * `createFileStorageProvider` writes `{dataDir}/wallet.json` (default file
- * name). Its existence with non-empty content is the authoritative signal
- * that the wallet was created under the legacy storage model.
- */
-function legacyWalletExists(dataDir: string, walletFileName = 'wallet.json'): boolean {
-  const walletPath = path.join(dataDir, walletFileName);
-  try {
-    const st = fs.statSync(walletPath);
-    return st.isFile() && st.size > 0;
-  } catch {
-    return false;
-  }
+import {
+  resolveStorageMode as resolveStorageModeCore,
+  defaultLegacyWalletProbe,
+  defaultProfileDepsProbe,
+  type StorageMode,
+} from './storage-mode';
+
+// Cache the Profile-deps probe result across CLI calls within this
+// process — it's an expensive dynamic import chain that never changes
+// once resolved.
+let _profileProbeCache: Awaited<ReturnType<typeof defaultProfileDepsProbe>> | null = null;
+async function cachedProfileProbe(): Promise<
+  Awaited<ReturnType<typeof defaultProfileDepsProbe>>
+> {
+  if (_profileProbeCache) return _profileProbeCache;
+  _profileProbeCache = await defaultProfileDepsProbe();
+  return _profileProbeCache;
 }
 
-/**
- * Probe whether the optional Profile/OrbitDB dependencies are installable.
- *
- * `@orbitdb/core` + `helia` are peer dependencies of the SDK. They are
- * dynamically imported on first use. This helper does a cheap, one-off
- * import and returns false (with a reason) if either fails. Cached per
- * process — the probe is not re-run for every CLI call.
- */
-let profileDepsAvailable: boolean | null = null;
-let profileDepsUnavailableReason: string | null = null;
-
-async function areProfileDepsAvailable(): Promise<boolean> {
-  if (profileDepsAvailable !== null) return profileDepsAvailable;
-  try {
-    await import('@orbitdb/core' as string);
-    await import('helia' as string);
-    profileDepsAvailable = true;
-    return true;
-  } catch (err) {
-    profileDepsAvailable = false;
-    profileDepsUnavailableReason = err instanceof Error ? err.message : String(err);
-    return false;
-  }
-}
-
-/**
- * Resolve the storage mode for the current dataDir. Explicit user intent
- * (config.storageMode, `--legacy`, `--profile`) wins. Otherwise detect:
- *
- *   - legacy wallet files present → legacy (honor existing installs)
- *   - no wallet files yet → profile (new default, if deps available)
- *   - deps missing → legacy + warn
- *
- * The resolved mode is persisted back to config so subsequent commands
- * stay consistent.
- */
 async function resolveStorageMode(
   config: CliConfig,
-  explicit?: 'profile' | 'legacy',
-): Promise<'profile' | 'legacy'> {
-  if (explicit) {
-    if (explicit === 'profile' && !(await areProfileDepsAvailable())) {
-      console.error(
-        `Cannot use --profile mode: ${profileDepsUnavailableReason ?? 'dependencies missing'}.`,
-      );
-      console.error('Install with: npm install @orbitdb/core helia @chainsafe/libp2p-gossipsub');
-      process.exit(1);
-    }
-    if (config.storageMode !== explicit) {
-      saveConfig({ ...config, storageMode: explicit });
-    }
-    return explicit;
-  }
-
-  if (config.storageMode) {
-    // Wallet already committed to a mode — respect it.
-    return config.storageMode;
-  }
-
-  // First-time detection.
-  if (legacyWalletExists(config.dataDir)) {
-    // Pre-existing legacy wallet on disk: honor it even though the config
-    // didn't record a mode. This is the upgrade path for users who used
-    // the CLI before this setting existed.
-    saveConfig({ ...config, storageMode: 'legacy' });
-    return 'legacy';
-  }
-
-  // Fresh wallet: prefer profile if deps are available.
-  if (await areProfileDepsAvailable()) {
-    saveConfig({ ...config, storageMode: 'profile' });
-    return 'profile';
-  }
-
-  // Profile deps missing; silently fall back to legacy.
-  console.error(
-    `Note: @orbitdb/core / helia not installed — falling back to legacy storage.\n` +
-      `      Install them to enable OrbitDB-backed Profile mode.`,
-  );
-  saveConfig({ ...config, storageMode: 'legacy' });
-  return 'legacy';
+  explicit?: StorageMode,
+): Promise<StorageMode> {
+  return resolveStorageModeCore({
+    config,
+    explicit,
+    legacyProbe: defaultLegacyWalletProbe,
+    profileProbe: cachedProfileProbe,
+    persist: (patch) => saveConfig({ ...loadConfig(), ...patch }),
+    notify: (msg) => console.error(msg),
+  });
 }
 
 // =============================================================================
