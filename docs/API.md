@@ -343,6 +343,42 @@ const confirmed = sphere.payments.getTokens({ status: 'confirmed' });
 
 Get a single token by ID.
 
+#### `exportTokens(options?): Array<{ localId, genesisTokenId, txf }>`
+
+Export owned tokens as TXF wire-format objects — the same shape used by `send` / `receive` and by the legacy TXF serializer. Callers may write the array directly as JSON or wrap it in a UXF CAR (`UxfPackage.ingestAll` + `toCar`) for content-addressable distribution.
+
+```typescript
+interface ExportOptions {
+  readonly ids?: readonly string[];        // Only these local token IDs
+  readonly coinId?: string;                // Only tokens of this coin
+  readonly includeUnconfirmed?: boolean;   // Default false — only 'confirmed'
+}
+
+const entries = sphere.payments.exportTokens({ coinId: 'UCT_HEX' });
+// entries: [{ localId: 'uuid', genesisTokenId: 'hex', txf: TxfToken }, ...]
+```
+
+Unconfirmed tokens are skipped by default — they still have a valid TxfToken structure but the receiving wallet may reject them during finalization.
+
+#### `importTokens(txfTokens): Promise<{ added, skipped, rejected }>`
+
+Import TXF wire-format objects into the wallet. Each token receives a fresh local UUID. Dedup is enforced by the same tombstone + `(tokenId, stateHash)` guard as `addToken`:
+
+- **added** — tokens the wallet now owns, with their assigned local IDs
+- **skipped** — already owned, tombstoned (previously spent), or superseded
+- **rejected** — malformed entries, with a per-token reason
+
+```typescript
+const result = await sphere.payments.importTokens(txfArray);
+// result: {
+//   added: Array<{ localId, genesisTokenId }>,
+//   skipped: Array<{ genesisTokenId, reason }>,
+//   rejected: Array<{ genesisTokenId: string | null, reason }>,
+// }
+```
+
+Used by the `tokens-import` CLI command and by any consumer implementing offline token transfer. Works identically on legacy (file-based) and Profile (OrbitDB) wallets — the wire format is mode-agnostic.
+
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
 Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token.

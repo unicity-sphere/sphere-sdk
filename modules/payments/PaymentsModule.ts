@@ -59,6 +59,7 @@ import type {
 import { STORAGE_KEYS_ADDRESS } from '../../constants';
 import {
   tokenToTxf,
+  txfToToken,
   getCurrentStateHash,
   buildTxfStorageData,
   parseTxfStorageData,
@@ -112,6 +113,68 @@ import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/Ro
  * Single source of truth: {@link HistoryRecord} in `storage/storage-provider.ts`.
  */
 export type TransactionHistoryEntry = import('../../storage').HistoryRecord;
+
+// =============================================================================
+// importTokens result types
+// =============================================================================
+
+/**
+ * Outcome of a single token in `importTokens`. Codes are stable enums
+ * suitable for switch-on-code logic in callers (CLI, scripting, UI).
+ */
+export type ImportAddedCode =
+  /** Token was new to the wallet — fresh acquisition. */
+  | 'added'
+  /**
+   * Lenient mode only: token's genesis was already owned at a
+   * different state; the prior state has been archived and the
+   * imported state is now authoritative. Reported in `added` (the
+   * wallet does now own the imported state) but discriminator allows
+   * UI to highlight "this overwrote your previous state".
+   */
+  | 'state-replaced';
+
+export type ImportSkipCode =
+  /** Exact (tokenId, stateHash) already in the wallet. */
+  | 'duplicate'
+  /** (tokenId, stateHash) was previously spent from this wallet. */
+  | 'tombstoned'
+  /**
+   * Strict-mode only: tokenId is in the wallet at a DIFFERENT state
+   * and we refuse to clobber that state from an import.
+   */
+  | 'genesis-exists'
+  /** addToken returned false despite the pre-checks (race or unknown). */
+  | 'unknown';
+
+export type ImportRejectCode =
+  /** TxfToken structure is invalid (missing fields, wrong types, etc.). */
+  | 'malformed'
+  /** addToken threw an unexpected error during the write path. */
+  | 'add-failed';
+
+export interface ImportAdded {
+  readonly localId: string;
+  readonly genesisTokenId: string;
+  readonly code: ImportAddedCode;
+  /** Optional human-readable note (set when code is non-trivial). */
+  readonly note?: string;
+}
+export interface ImportSkipped {
+  readonly genesisTokenId: string;
+  readonly code: ImportSkipCode;
+  readonly reason: string;
+}
+export interface ImportRejected {
+  readonly genesisTokenId: string | null;
+  readonly code: ImportRejectCode;
+  readonly reason: string;
+}
+export interface ImportTokensResult {
+  readonly added: ImportAdded[];
+  readonly skipped: ImportSkipped[];
+  readonly rejected: ImportRejected[];
+}
 
 /**
  * Compute a dedup key for a history entry.
@@ -3203,6 +3266,232 @@ export class PaymentsModule {
       logger.debug('Payments', `getToken: not found id=${id.slice(0, 16)}... mapSize=${this.tokens.size}`);
     }
     return token;
+  }
+
+  // ===========================================================================
+  // Public API - Token Import / Export
+  // ===========================================================================
+
+  /**
+   * Export owned tokens as TXF wire-format objects.
+   *
+   * The returned TxfToken array is the canonical inter-wallet wire
+   * format used by {@link send} / {@link receive} and by the legacy
+   * TXF serializer. Callers may write it to a file (as JSON) or wrap
+   * it into a UXF CAR (via `UxfPackage.ingestAll` + `toCar`) for
+   * content-addressable distribution.
+   *
+   * @param options.ids - Export only these local token IDs.
+   * @param options.coinId - Export only tokens of this coin.
+   * @param options.includeUnconfirmed - Include tokens whose status is
+   *   not 'confirmed'. Default false. Unconfirmed tokens still carry
+   *   valid TxfToken structure but the receiving wallet may reject
+   *   them during finalization.
+   * @returns Array of `{ localId, genesisTokenId, txf }` triples. A
+   *   token is skipped if its `sdkData` does not parse to a valid TXF
+   *   shape (should not happen for healthy tokens).
+   */
+  exportTokens(options?: {
+    ids?: readonly string[];
+    coinId?: string;
+    includeUnconfirmed?: boolean;
+  }): Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> {
+    this.ensureInitialized();
+
+    let candidates = Array.from(this.tokens.values());
+    if (options?.ids) {
+      const idSet = new Set(options.ids);
+      candidates = candidates.filter((t) => idSet.has(t.id));
+    }
+    if (options?.coinId) {
+      candidates = candidates.filter((t) => t.coinId === options.coinId);
+    }
+    if (!options?.includeUnconfirmed) {
+      candidates = candidates.filter((t) => t.status === 'confirmed');
+    }
+
+    const out: Array<{ localId: string; genesisTokenId: string; txf: TxfToken }> = [];
+    for (const token of candidates) {
+      const txf = tokenToTxf(token);
+      if (!txf) continue;
+      const genesisTokenId = txf.genesis?.data?.tokenId;
+      if (!genesisTokenId) continue;
+      out.push({ localId: token.id, genesisTokenId, txf });
+    }
+    return out;
+  }
+
+  // (See ImportTokensResult and friends defined at module scope.)
+  /**
+   * Import tokens from TXF wire-format objects.
+   *
+   * Each token receives a fresh local UUID. Dedup is performed in-line
+   * (not just via addToken) so that the per-token outcome includes a
+   * specific reason code instead of an opaque "skipped" flag:
+   *
+   *   - **'duplicate'**       — exact (tokenId, stateHash) match already owned.
+   *   - **'tombstoned'**      — (tokenId, stateHash) was previously spent
+   *                            from this wallet; refusing avoids re-accepting
+   *                            a state we have already transitioned past.
+   *   - **'genesis-exists'**  — strict-mode only: tokenId is owned in a
+   *                            DIFFERENT state. Importing would otherwise
+   *                            regress the wallet via {@link addToken}'s
+   *                            CASE 2 state-update path.
+   *   - **'state-replaced'**  — lenient-mode only: the imported token's
+   *                            state is taken as authoritative; the
+   *                            previously held state of the same tokenId
+   *                            is archived. Reported in `added` (with a
+   *                            note) rather than `skipped`, because the
+   *                            wallet now owns the new state.
+   *
+   * **Strict mode (`skipExistingGenesis: true`)** disables the
+   * state-update behaviour of {@link addToken}: any imported token
+   * whose genesis tokenId already exists in the wallet is skipped
+   * outright, regardless of stateHash. Use this when the import is
+   * intended as an additive UNION (legacy migration, multi-source
+   * file import) — without it, an imported older state would archive
+   * the wallet's current state, regressing the wallet's view of that
+   * token. Forked / reissued token entries (`_forked_*`) are never
+   * promoted to active under strict mode for the same reason.
+   *
+   * @param txfTokens - Array of TxfToken objects (as produced by
+   *   {@link exportTokens}, a legacy TXF file, or a UXF CAR that has
+   *   been reassembled).
+   * @param options.skipExistingGenesis - Default false (lenient).
+   * @returns Counts and identifiers for each outcome category.
+   */
+  async importTokens(
+    txfTokens: readonly TxfToken[],
+    options?: { skipExistingGenesis?: boolean },
+  ): Promise<ImportTokensResult> {
+    this.ensureInitialized();
+
+    const added: ImportAdded[] = [];
+    const skipped: ImportSkipped[] = [];
+    const rejected: ImportRejected[] = [];
+
+    for (const txf of txfTokens) {
+      const genesisTokenId = txf?.genesis?.data?.tokenId ?? null;
+      if (!genesisTokenId) {
+        rejected.push({
+          genesisTokenId: null,
+          code: 'malformed',
+          reason: 'Missing genesis.data.tokenId',
+        });
+        continue;
+      }
+      if (!txf.state || !txf.genesis) {
+        rejected.push({
+          genesisTokenId,
+          code: 'malformed',
+          reason: 'Missing state or genesis section',
+        });
+        continue;
+      }
+
+      // Determine the incoming state hash from the TxfToken's
+      // inclusion-proof authenticator. Same field addToken would
+      // extract via parseSdkDataCached.
+      const incomingStateHash =
+        txf.genesis?.inclusionProof?.authenticator?.stateHash ?? '';
+
+      // -- Pre-check 1: tombstoned (previously spent). This mirrors
+      //    addToken's first guard so we can surface a precise reason
+      //    instead of "addToken returned false" ambiguity.
+      if (incomingStateHash && this.isStateTombstoned(genesisTokenId, incomingStateHash)) {
+        skipped.push({
+          genesisTokenId,
+          code: 'tombstoned',
+          reason: `(tokenId, stateHash) previously spent from this wallet`,
+        });
+        continue;
+      }
+
+      // Scan in-memory wallet for matching genesis / state.
+      let exactDuplicateLocalId: string | null = null;
+      let genesisMatchLocalId: string | null = null;
+      for (const [existingId, existing] of this.tokens) {
+        const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
+        if (existingTokenId !== genesisTokenId) continue;
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
+        if (incomingStateHash && existingStateHash === incomingStateHash) {
+          exactDuplicateLocalId = existingId;
+          break;
+        }
+        genesisMatchLocalId = existingId;
+      }
+
+      // -- Pre-check 2: exact duplicate.
+      if (exactDuplicateLocalId) {
+        skipped.push({
+          genesisTokenId,
+          code: 'duplicate',
+          reason: 'Exact (tokenId, stateHash) already owned',
+        });
+        continue;
+      }
+
+      // -- Pre-check 3: strict-mode genesis collision.
+      if (options?.skipExistingGenesis && genesisMatchLocalId) {
+        skipped.push({
+          genesisTokenId,
+          code: 'genesis-exists',
+          reason: 'Genesis tokenId owned at a different state; strict mode preserves current state',
+        });
+        continue;
+      }
+
+      // Build the UI token. Failures here are malformed-input
+      // rejections, not skips.
+      const localId = crypto.randomUUID();
+      let uiToken: Token;
+      try {
+        uiToken = txfToToken(localId, txf);
+      } catch (err) {
+        rejected.push({
+          genesisTokenId,
+          code: 'malformed',
+          reason: `txfToToken failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        continue;
+      }
+
+      // Hand off to addToken. Pre-checks above mean addToken should
+      // not return false here — but defend against it just in case.
+      try {
+        const addedOk = await this.addToken(uiToken);
+        if (addedOk) {
+          // Lenient mode: a same-genesis match means addToken archived
+          // the prior state. Mark the entry so callers can distinguish
+          // a "new acquisition" from a "state override".
+          if (genesisMatchLocalId) {
+            added.push({
+              localId,
+              genesisTokenId,
+              code: 'state-replaced',
+              note: 'Replaced an existing state of the same tokenId (lenient mode)',
+            });
+          } else {
+            added.push({ localId, genesisTokenId, code: 'added' });
+          }
+        } else {
+          // Defensive — addToken returned false despite our pre-checks.
+          skipped.push({
+            genesisTokenId,
+            code: 'unknown',
+            reason: 'addToken returned false after pre-checks (race or unrecognised guard)',
+          });
+        }
+      } catch (err) {
+        rejected.push({
+          genesisTokenId,
+          code: 'add-failed',
+          reason: `addToken failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+    }
+
+    return { added, skipped, rejected };
   }
 
   // ===========================================================================

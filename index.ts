@@ -490,3 +490,43 @@ export type {
 // Address parsing
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
 export type { AddressType, ParsedAddress } from './core/address';
+
+// =============================================================================
+// UXF Types (type-only -- runtime available via @unicitylabs/sphere-sdk/uxf)
+// =============================================================================
+
+export type {
+  ContentHash,
+  UxfElementHeader,
+  UxfElementType,
+  UxfInstanceKind,
+  UxfElement,
+  UxfElementContent,
+  UxfManifest,
+  UxfEnvelope,
+  UxfPackageData,
+  UxfIndexes,
+  InstanceChainEntry,
+  InstanceChainIndex,
+  InstanceSelectionStrategy,
+  UxfStorageAdapter,
+  UxfVerificationResult,
+  UxfVerificationIssue,
+  UxfDelta,
+} from './uxf';
+
+export type { UxfErrorCode } from './uxf';
+
+// =============================================================================
+// Profile Types (type-only -- runtime available via @unicitylabs/sphere-sdk/profile)
+// =============================================================================
+
+export type {
+  ProfileConfig,
+  UxfBundleRef,
+  MigrationPhase,
+  MigrationResult,
+  ProfileEncryptionConfig,
+  ConsolidationPendingState,
+  ProfileErrorCode,
+} from './profile';

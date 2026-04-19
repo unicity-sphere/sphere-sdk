@@ -41,6 +41,22 @@ interface CliConfig {
   dataDir: string;
   tokensDir: string;
   currentProfile?: string;
+  /**
+   * On-disk storage backend for wallet + tokens.
+   *
+   * - `'profile'` (new default): OrbitDB-backed wallet profile with IPFS
+   *    element pool. Requires `@orbitdb/core` + `helia` to be installable
+   *    at runtime (falls back to legacy if not).
+   * - `'legacy'`: File-based JSON wallet + per-address TXF token files
+   *    with IPFS/IPNS sync. The pre-UXF format; all earlier CLI wallets
+   *    use this.
+   *
+   * Once a wallet is created, the mode is locked — migration between
+   * modes is a separate workflow. If unset on an existing dataDir, the
+   * mode is auto-detected from on-disk artefacts the first time the
+   * CLI runs (and persisted here).
+   */
+  storageMode?: 'profile' | 'legacy';
 }
 
 interface WalletProfile {
@@ -136,6 +152,45 @@ function switchToProfile(name: string): boolean {
 }
 
 // =============================================================================
+// Storage Mode Detection
+// =============================================================================
+
+import {
+  resolveStorageMode as resolveStorageModeCore,
+  defaultLegacyWalletProbe,
+  defaultProfileWalletProbe,
+  defaultProfileDepsProbe,
+  type StorageMode,
+} from './storage-mode';
+
+// Cache the Profile-deps probe result across CLI calls within this
+// process — it's an expensive dynamic import chain that never changes
+// once resolved.
+let _profileProbeCache: Awaited<ReturnType<typeof defaultProfileDepsProbe>> | null = null;
+async function cachedProfileProbe(): Promise<
+  Awaited<ReturnType<typeof defaultProfileDepsProbe>>
+> {
+  if (_profileProbeCache) return _profileProbeCache;
+  _profileProbeCache = await defaultProfileDepsProbe();
+  return _profileProbeCache;
+}
+
+async function resolveStorageMode(
+  config: CliConfig,
+  explicit?: StorageMode,
+): Promise<StorageMode> {
+  return resolveStorageModeCore({
+    config,
+    explicit,
+    legacyProbe: defaultLegacyWalletProbe,
+    profileWalletProbe: defaultProfileWalletProbe,
+    profileProbe: cachedProfileProbe,
+    persist: (patch) => saveConfig({ ...loadConfig(), ...patch }),
+    notify: (msg) => console.error(msg),
+  });
+}
+
+// =============================================================================
 // Sphere Instance Management
 // =============================================================================
 
@@ -165,18 +220,59 @@ function createNoopTransport(): TransportProvider {
   };
 }
 
-async function getSphere(options?: { autoGenerate?: boolean; mnemonic?: string; nametag?: string }): Promise<Sphere> {
+async function getSphere(options?: {
+  autoGenerate?: boolean;
+  mnemonic?: string;
+  nametag?: string;
+  /**
+   * Override the detected storage mode. Passed from `init` when the user
+   * supplies `--legacy` or `--profile`. Unused commands inherit the mode
+   * persisted in config (or auto-detected on first run).
+   */
+  storageMode?: 'profile' | 'legacy';
+}): Promise<Sphere> {
   if (sphereInstance) return sphereInstance;
 
   const config = loadConfig();
-  const providers = createNodeProviders({
-    network: config.network,
-    dataDir: config.dataDir,
-    tokensDir: config.tokensDir,
-    tokenSync: { ipfs: { enabled: true } },
-    market: true,
-    groupChat: true,
-  });
+  const mode = await resolveStorageMode(config, options?.storageMode);
+
+  // Build providers based on resolved storage mode.
+  let providers;
+  if (mode === 'profile') {
+    // Profile (OrbitDB + IPFS element pool) — new default.
+    const { createNodeProfileProviders } = await import('../profile/node.js');
+    const profileProviders = createNodeProfileProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+    });
+    // Still need transport/oracle/market/groupChat/L1/price from the
+    // legacy node factory — just not its storage/tokenStorage.
+    const legacyForNonStorage = createNodeProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+      tokensDir: config.tokensDir,
+      // IPFS sync is redundant under Profile — OrbitDB replicates state.
+      tokenSync: { ipfs: { enabled: false } },
+      market: true,
+      groupChat: true,
+    });
+    providers = {
+      ...legacyForNonStorage,
+      storage: profileProviders.storage,
+      tokenStorage: profileProviders.tokenStorage,
+      ipfsTokenStorage: undefined,
+    };
+  } else {
+    // Legacy: file-based wallet + per-address token files + IPNS sync.
+    providers = createNodeProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+      tokensDir: config.tokensDir,
+      tokenSync: { ipfs: { enabled: true } },
+      market: true,
+      groupChat: true,
+    });
+  }
 
   const initProviders = noNostrGlobal
     ? { ...providers, transport: createNoopTransport() }
@@ -368,22 +464,50 @@ interface CommandHelp {
 
 const COMMAND_HELP: Record<string, CommandHelp> = {
   // --- WALLET ---
+  'migrate-to-profile': {
+    usage: 'migrate-to-profile --legacy-dir <path> [--legacy-tokens <path>] [--dry-run] [--delete-legacy] [--no-verify]',
+    description:
+      'Import the token inventory of a legacy (file-based) Sphere CLI wallet into the current Profile (OrbitDB) wallet. Explicit, non-destructive, and re-runnable: legacy data is preserved by default, and re-running yields the joint inventory (deduplicated by tokenId+stateHash). Token statuses are recalculated automatically by the Profile load path.',
+    flags: [
+      { flag: '--legacy-dir <path>', description: 'Source dataDir of the legacy wallet (REQUIRED)' },
+      { flag: '--legacy-tokens <path>', description: 'Override legacy tokens dir (default: <legacy-dir>/tokens)' },
+      { flag: '--dry-run', description: 'Report what would be migrated without writing' },
+      { flag: '--delete-legacy', description: 'Remove legacy artefacts AFTER successful import (default: preserve)' },
+      { flag: '--no-verify', description: 'Skip identity verification (use only when sure both wallets share the mnemonic)' },
+    ],
+    examples: [
+      'npm run cli -- migrate-to-profile --legacy-dir ~/old-wallet',
+      'npm run cli -- migrate-to-profile --legacy-dir ~/old-wallet --dry-run',
+      'npm run cli -- migrate-to-profile --legacy-dir ~/old-wallet --delete-legacy',
+    ],
+    notes: [
+      'Current dataDir must already be a Profile wallet — run `init --profile` first (typically in a new dataDir, using the same mnemonic as the legacy wallet).',
+      'Re-running is safe: previously-imported tokens are skipped, new legacy tokens are added.',
+      'Identity verification compares the encrypted mnemonic blobs in both stores. If they differ (e.g. different passwords), pass --no-verify after confirming both wallets share the same mnemonic.',
+      'Legacy is NEVER deleted unless --delete-legacy is passed AND the import succeeded with zero rejections.',
+    ],
+  },
   'init': {
-    usage: 'init [--network <net>] [--mnemonic "<words>"] [--nametag <name>]',
+    usage: 'init [--network <net>] [--mnemonic "<words>"] [--nametag <name>] [--legacy | --profile]',
     description: 'Create a new wallet or import an existing one from a mnemonic phrase. If no mnemonic is provided, a new 24-word mnemonic is generated automatically.',
     flags: [
       { flag: '--network <net>', description: 'Network to use (mainnet, testnet, dev)', default: 'testnet' },
       { flag: '--mnemonic "<words>"', description: 'Import wallet from BIP-39 mnemonic phrase (24 words in quotes)' },
       { flag: '--nametag <name>', description: 'Register a nametag during initialization (mints on-chain)' },
+      { flag: '--legacy', description: 'Use file-based JSON wallet + IPNS sync (pre-UXF format). Default is OrbitDB/Profile.' },
+      { flag: '--profile', description: 'Force OrbitDB Profile mode. Requires @orbitdb/core + helia installed.' },
       { flag: '--no-nostr', description: 'Disable Nostr transport (use no-op transport)' },
     ],
     examples: [
-      'npm run cli -- init --network testnet',
+      'npm run cli -- init --network testnet              # default: OrbitDB Profile mode',
+      'npm run cli -- init --legacy                       # opt into file-based storage',
       'npm run cli -- init --mnemonic "word1 word2 ... word24"',
       'npm run cli -- init --nametag alice --network mainnet',
     ],
     notes: [
       'If a wallet already exists in the current profile, it will be loaded instead of creating a new one.',
+      'Storage mode: new wallets default to OrbitDB Profile (content-addressed element pool, multi-device via OrbitDB CRDT). Falls back to --legacy silently if @orbitdb/core / helia are not installed.',
+      'The storage mode is locked per wallet. Once a dataDir is initialised, subsequent commands honour that mode. To switch, clear the wallet and re-init.',
       'Back up the generated mnemonic immediately -- it cannot be retrieved later.',
     ],
   },
@@ -1393,6 +1517,18 @@ TRANSFERS:
   receive                           Check for incoming transfers
   history [limit]                   Transaction history
 
+FILE I/O (offline token transfer / backup):
+  tokens-export <file> [options]    Export owned tokens to a file
+  tokens-import <file>              Import tokens from a file
+    Formats: .uxf|.car (content-addressed CAR); .txf|.json (TXF JSON array)
+    Auto-detected from file extension on export and from content on import.
+
+LEGACY → PROFILE MIGRATION:
+  migrate-to-profile --legacy-dir <path>
+                                    Import legacy wallet tokens into current Profile
+                                    Explicit, non-destructive, re-runnable.
+                                    --dry-run, --delete-legacy, --no-verify available.
+
 ADDRESSES:
   addresses                         List tracked addresses
   switch <index>                    Switch to HD address
@@ -1550,6 +1686,40 @@ async function main() {
           nametag = args[nametagIndex + 1];
         }
 
+        // Storage mode selection.
+        //   Default: profile (OrbitDB + IPFS element pool)
+        //   --legacy: file-based JSON + IPNS sync (pre-UXF format)
+        //   --profile: force profile (useful mainly for explicit docs)
+        // Mutually exclusive; conflicting flags exit with an error.
+        const forceLegacy = args.includes('--legacy');
+        const forceProfile = args.includes('--profile');
+        if (forceLegacy && forceProfile) {
+          console.error('Cannot combine --legacy and --profile');
+          process.exit(1);
+        }
+        const explicitMode: 'profile' | 'legacy' | undefined = forceLegacy
+          ? 'legacy'
+          : forceProfile
+            ? 'profile'
+            : undefined;
+
+        // Refuse to clobber an existing wallet with a mismatched mode.
+        const existingConfig = loadConfig();
+        if (
+          existingConfig.storageMode &&
+          explicitMode &&
+          existingConfig.storageMode !== explicitMode
+        ) {
+          console.error(
+            `This dataDir is already initialised in ${existingConfig.storageMode} mode; ` +
+              `cannot re-init with --${explicitMode}.`,
+          );
+          console.error(
+            `Use a different --dataDir, clear the wallet first, or drop the flag to honour the existing mode.`,
+          );
+          process.exit(1);
+        }
+
         // Save config
         const config = loadConfig();
         config.network = network;
@@ -1562,6 +1732,7 @@ async function main() {
           autoGenerate: !mnemonic,
           mnemonic,
           nametag,
+          storageMode: explicitMode,
         });
 
         const identity = sphere.identity;
@@ -1612,6 +1783,7 @@ async function main() {
             console.log(`Profile:       ${config.currentProfile}`);
           }
           console.log(`Network:       ${config.network}`);
+          console.log(`Storage:       ${config.storageMode ?? '(auto-detect)'}`);
           console.log(`L1 Address:    ${identity.l1Address}`);
           console.log(`Direct Addr:   ${identity.directAddress || '(not set)'}`);
           console.log(`Chain Pubkey:  ${identity.chainPubkey}`);
@@ -1663,21 +1835,52 @@ async function main() {
         }
 
         const config = loadConfig();
-        const providers = createNodeProviders({
-          network: config.network,
-          dataDir: config.dataDir,
-          tokensDir: config.tokensDir,
-        });
+        // Honour the wallet's recorded storage mode when clearing so we
+        // tear down the correct backend. Falls back to legacy if unset.
+        const clearMode = config.storageMode ?? 'legacy';
 
-        await providers.storage.connect();
-        await providers.tokenStorage.initialize();
+        let clearStorage: import('../storage').StorageProvider;
+        let clearTokenStorage: import('../storage').TokenStorageProvider<
+          import('../storage').TxfStorageDataBase
+        >;
 
-        console.log('Clearing all wallet data...');
-        await Sphere.clear({ storage: providers.storage, tokenStorage: providers.tokenStorage });
+        if (clearMode === 'profile') {
+          const { createNodeProfileProviders } = await import('../profile/node.js');
+          const p = createNodeProfileProviders({
+            network: config.network,
+            dataDir: config.dataDir,
+          });
+          clearStorage = p.storage;
+          clearTokenStorage = p.tokenStorage;
+        } else {
+          const p = createNodeProviders({
+            network: config.network,
+            dataDir: config.dataDir,
+            tokensDir: config.tokensDir,
+          });
+          clearStorage = p.storage;
+          clearTokenStorage = p.tokenStorage;
+        }
+
+        await clearStorage.connect();
+        await clearTokenStorage.initialize();
+
+        // Atomic-ish ordering: reset storageMode in config FIRST, then
+        // delete the data. If the process dies mid-clear, the config
+        // is already in a "no committed mode" state — the next `init`
+        // will auto-detect from disk (or default to profile on a
+        // pristine dir) instead of pointing at gone-but-config-locked
+        // legacy/profile data.
+        const cfgBefore = loadConfig();
+        delete cfgBefore.storageMode;
+        saveConfig(cfgBefore);
+
+        console.log(`Clearing all wallet data (mode: ${clearMode})...`);
+        await Sphere.clear({ storage: clearStorage, tokenStorage: clearTokenStorage });
         console.log('All wallet data cleared.');
 
-        await providers.storage.disconnect();
-        await providers.tokenStorage.shutdown();
+        await clearStorage.disconnect();
+        await clearTokenStorage.shutdown();
         break;
       }
 
@@ -2362,6 +2565,540 @@ async function main() {
           console.log('\nWarning: finalization timed out, some tokens still unconfirmed.');
         } else if (finalize && result.finalizationDurationMs) {
           console.log(`\nAll tokens finalized in ${(result.finalizationDurationMs / 1000).toFixed(1)}s.`);
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'tokens-export': {
+        const outFile = args[1];
+        if (!outFile) {
+          console.error('Usage: tokens-export <file> [options]');
+          console.error('  file: output path — extension determines format');
+          console.error('        .uxf or .car → UXF CAR (content-addressable)');
+          console.error('        .txf or .json → TXF JSON array (legacy, backward-compatible)');
+          console.error('  Options:');
+          console.error('    --format uxf|txf|json  Force format (overrides extension)');
+          console.error('    --coin <symbol>        Export only tokens of this coin');
+          console.error('    --ids <id1,id2,...>    Export only these local token IDs');
+          console.error('    --all                  (default) Export all confirmed tokens');
+          console.error('    --include-unconfirmed  Include provisional tokens');
+          process.exit(1);
+        }
+
+        // Resolve format
+        const formatArgIdx = args.indexOf('--format');
+        const formatArg = formatArgIdx >= 0 ? args[formatArgIdx + 1] : undefined;
+        let format: 'uxf' | 'txf';
+        if (formatArg) {
+          if (formatArg === 'uxf' || formatArg === 'car') format = 'uxf';
+          else if (formatArg === 'txf' || formatArg === 'json') format = 'txf';
+          else {
+            console.error(`Unknown --format: ${formatArg}. Use uxf|car|txf|json.`);
+            process.exit(1);
+          }
+        } else {
+          const ext = path.extname(outFile).toLowerCase();
+          if (ext === '.uxf' || ext === '.car') format = 'uxf';
+          else if (ext === '.txf' || ext === '.json') format = 'txf';
+          else {
+            console.error(`Cannot infer format from extension "${ext}". Pass --format uxf|txf.`);
+            process.exit(1);
+          }
+        }
+
+        // Selection
+        const coinArgIdx = args.indexOf('--coin');
+        const coinArg = coinArgIdx >= 0 ? args[coinArgIdx + 1] : undefined;
+        const idsArgIdx = args.indexOf('--ids');
+        const idsArg = idsArgIdx >= 0 ? args[idsArgIdx + 1] : undefined;
+        const includeUnconfirmed = args.includes('--include-unconfirmed');
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+
+        // Resolve coin symbol → coinId hex (so user can say "--coin UCT").
+        // If the symbol is unknown but looks like a 64-char hex coinId,
+        // accept it verbatim. Otherwise resolveCoin's own diagnostics
+        // (which call process.exit) handle the user-visible error.
+        let coinIdFilter: string | undefined;
+        if (coinArg) {
+          if (/^[0-9a-fA-F]{64}$/.test(coinArg)) {
+            coinIdFilter = coinArg.toLowerCase();
+          } else {
+            coinIdFilter = resolveCoin(coinArg).coinId;
+          }
+        }
+
+        const ids = idsArg ? idsArg.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
+
+        const exported = sphere.payments.exportTokens({
+          ids,
+          coinId: coinIdFilter,
+          includeUnconfirmed,
+        });
+
+        if (exported.length === 0) {
+          console.error('No tokens match the selection.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        const txfTokens = exported.map((e) => e.txf);
+
+        if (format === 'uxf') {
+          const { UxfPackage } = await import('../uxf/UxfPackage.js');
+          const pkg = UxfPackage.create({
+            description: `sphere-cli export: ${exported.length} token(s)`,
+          });
+          pkg.ingestAll(txfTokens);
+          const carBytes = await pkg.toCar();
+          fs.writeFileSync(path.resolve(outFile), carBytes);
+          console.log(`\n✓ Exported ${exported.length} token(s) as UXF CAR`);
+          console.log(`  File: ${outFile}`);
+          console.log(`  Size: ${carBytes.byteLength} bytes`);
+          console.log(`  Pool elements: ${pkg.elementCount}`);
+        } else {
+          const json = JSON.stringify(txfTokens, null, 2);
+          fs.writeFileSync(path.resolve(outFile), json);
+          console.log(`\n✓ Exported ${exported.length} token(s) as TXF JSON`);
+          console.log(`  File: ${outFile}`);
+          console.log(`  Size: ${Buffer.byteLength(json)} bytes`);
+        }
+
+        // Summary by coin
+        const byCoin = new Map<string, number>();
+        for (const e of exported) {
+          byCoin.set(e.txf.genesis.data.coinData[0]?.[0] ?? 'unknown',
+            (byCoin.get(e.txf.genesis.data.coinData[0]?.[0] ?? 'unknown') ?? 0) + 1);
+        }
+        console.log('  Tokens by coin:');
+        for (const [coin, count] of byCoin) {
+          console.log(`    ${coin}: ${count}`);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'tokens-import': {
+        const inFile = args[1];
+        if (!inFile) {
+          console.error('Usage: tokens-import <file> [--format auto|uxf|txf|json]');
+          console.error('  file: input path (auto-detects CAR vs JSON by default)');
+          console.error('  --format: force specific format (auto is usually correct)');
+          process.exit(1);
+        }
+
+        const formatArgIdx = args.indexOf('--format');
+        const formatArg = formatArgIdx >= 0 ? args[formatArgIdx + 1] : 'auto';
+
+        // Hard size cap to prevent OOM on a malicious / mistyped path.
+        // 100MB accommodates very large wallet backups without giving an
+        // attacker an unbounded read primitive.
+        const MAX_IMPORT_SIZE = 100 * 1024 * 1024;
+        let bytes: Buffer;
+        try {
+          const stat = fs.statSync(path.resolve(inFile));
+          if (stat.size > MAX_IMPORT_SIZE) {
+            console.error(
+              `Refusing to read "${inFile}": ${stat.size} bytes exceeds ` +
+                `the ${MAX_IMPORT_SIZE}-byte import limit.`,
+            );
+            process.exit(1);
+          }
+          bytes = fs.readFileSync(path.resolve(inFile));
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'ENOENT') console.error(`File not found: "${inFile}"`);
+          else if (code === 'EACCES') console.error(`Permission denied: "${inFile}"`);
+          else console.error(`Failed to read file: "${inFile}"`);
+          process.exit(1);
+        }
+
+        if (bytes.length === 0) {
+          console.error(`Refusing to import empty file: "${inFile}"`);
+          process.exit(1);
+        }
+
+        // Determine format
+        type DetectedFormat = 'uxf' | 'txf';
+        const detect = (b: Buffer): DetectedFormat => {
+          // JSON almost always starts with '[' or '{' (after optional BOM/whitespace).
+          // CAR v1 starts with a varint-encoded header length — typically a
+          // small positive byte, not a printable ASCII.
+          for (let i = 0; i < Math.min(b.length, 16); i++) {
+            const c = b[i];
+            // Skip leading whitespace/BOM
+            if (c === 0x09 || c === 0x0a || c === 0x0d || c === 0x20 || c === 0xef || c === 0xbb || c === 0xbf) continue;
+            if (c === 0x5b /* '[' */ || c === 0x7b /* '{' */) return 'txf';
+            return 'uxf';
+          }
+          return 'uxf';
+        };
+
+        let format: DetectedFormat;
+        if (formatArg === 'auto') {
+          format = detect(bytes);
+        } else if (formatArg === 'uxf' || formatArg === 'car') {
+          format = 'uxf';
+        } else if (formatArg === 'txf' || formatArg === 'json') {
+          format = 'txf';
+        } else {
+          console.error(`Unknown --format: ${formatArg}. Use auto|uxf|car|txf|json.`);
+          process.exit(1);
+        }
+
+        // Parse tokens from file bytes
+        let txfTokens: import('../types/txf').TxfToken[];
+        if (format === 'uxf') {
+          try {
+            const { UxfPackage } = await import('../uxf/UxfPackage.js');
+            const pkg = await UxfPackage.fromCar(new Uint8Array(bytes));
+            const assembled = pkg.assembleAll();
+            txfTokens = Array.from(assembled.values()) as import('../types/txf').TxfToken[];
+          } catch (err) {
+            console.error(`Failed to parse UXF CAR: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        } else {
+          try {
+            const parsed: unknown = JSON.parse(bytes.toString('utf8'));
+            txfTokens = (Array.isArray(parsed) ? parsed : [parsed]) as import('../types/txf').TxfToken[];
+          } catch (err) {
+            console.error(`Failed to parse TXF JSON: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        }
+
+        if (txfTokens.length === 0) {
+          console.error('File contains no tokens.');
+          process.exit(1);
+        }
+
+        console.log(`\nImporting ${txfTokens.length} token(s) from ${format.toUpperCase()} file...`);
+
+        const sphere = await getSphere();
+        await ensureSync(sphere, 'full');
+
+        const result = await sphere.payments.importTokens(txfTokens);
+
+        // Tally per-code skips so the user gets specific diagnostics.
+        const skipCounts: Record<string, number> = {};
+        for (const s of result.skipped) {
+          skipCounts[s.code] = (skipCounts[s.code] ?? 0) + 1;
+        }
+
+        console.log(`\n✓ Import complete:`);
+        console.log(`  Added:    ${result.added.length}`);
+        console.log(`  Skipped:  ${result.skipped.length}`);
+        if (skipCounts.duplicate) console.log(`    duplicate:      ${skipCounts.duplicate}`);
+        if (skipCounts.tombstoned) console.log(`    tombstoned:     ${skipCounts.tombstoned}`);
+        if (skipCounts['genesis-exists']) console.log(`    genesis-exists: ${skipCounts['genesis-exists']}`);
+        if (skipCounts.unknown) console.log(`    unknown:        ${skipCounts.unknown}`);
+        console.log(`  Rejected: ${result.rejected.length}`);
+
+        if (result.rejected.length > 0) {
+          console.log('\n  Rejected tokens:');
+          for (const r of result.rejected.slice(0, 10)) {
+            const idLabel = r.genesisTokenId ? `${r.genesisTokenId.slice(0, 16)}...` : '(no tokenId)';
+            console.log(`    ${idLabel}: ${r.reason}`);
+          }
+          if (result.rejected.length > 10) {
+            console.log(`    (... ${result.rejected.length - 10} more)`);
+          }
+          // Surface partial-failure to scripting / CI: any rejected
+          // entries cause a non-zero exit. Use exitCode (not exit())
+          // so cleanup below still runs.
+          process.exitCode = 2;
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'migrate-to-profile': {
+        // Explicit, non-destructive, re-runnable migration of TXF
+        // tokens from a legacy storage directory into the current
+        // Profile (OrbitDB) wallet. Legacy data is NEVER deleted
+        // unless --delete-legacy is passed AND the import succeeded
+        // with zero rejections AND the Profile state has been flushed.
+        const legacyDirRaw = (() => {
+          const i = args.indexOf('--legacy-dir');
+          return i >= 0 ? args[i + 1] : undefined;
+        })();
+        const legacyTokensDirRaw = (() => {
+          const i = args.indexOf('--legacy-tokens');
+          return i >= 0 ? args[i + 1] : undefined;
+        })();
+
+        const dryRun = args.includes('--dry-run');
+        const deleteLegacy = args.includes('--delete-legacy');
+        const noVerify = args.includes('--no-verify');
+
+        if (!legacyDirRaw) {
+          console.error('Usage: migrate-to-profile --legacy-dir <path> [options]');
+          console.error('  --legacy-dir <path>   Source dataDir of the legacy wallet (REQUIRED)');
+          console.error('  --legacy-tokens <p>   Override legacy tokens dir (default: <legacy-dir>/tokens)');
+          console.error('  --dry-run             Report what would be migrated, do not write');
+          console.error('  --delete-legacy       Remove legacy artefacts after a successful import');
+          console.error('                        (off by default — legacy is preserved)');
+          console.error('  --no-verify           Skip identity verification (use with caution)');
+          console.error('');
+          console.error('Notes:');
+          console.error('  - Current dataDir must already be a Profile wallet (run `init` here first).');
+          console.error('  - Source and target must share the same mnemonic.');
+          console.error('  - Re-run any time: tokens are deduplicated and the inventory is the union.');
+          process.exit(1);
+        }
+
+        // Resolve user-supplied paths to absolutes so we can do a
+        // safe same-dir check below regardless of the shell's cwd.
+        const legacyDir = path.resolve(legacyDirRaw);
+        const legacyTokensDir = legacyTokensDirRaw
+          ? path.resolve(legacyTokensDirRaw)
+          : path.join(legacyDir, 'tokens');
+
+        // Pre-check 1: refuse same-dir migration. The cleanup branch
+        // below would otherwise wipe the current Profile's wallet.json
+        // (which Profile's local-cache FileStorage shares with legacy).
+        const currentConfig = loadConfig();
+        const profileDir = path.resolve(currentConfig.dataDir);
+        const profileTokensDir = path.resolve(currentConfig.tokensDir);
+        if (legacyDir === profileDir || legacyTokensDir === profileTokensDir) {
+          console.error(
+            `Refusing migration: --legacy-dir resolves to the current Profile dataDir ` +
+              `(${profileDir}). Source and target must be distinct directories — ` +
+              `point --legacy-dir at the OLD wallet location.`,
+          );
+          process.exit(1);
+        }
+
+        // Pre-check 2: target must already be Profile.
+        if (currentConfig.storageMode === 'legacy') {
+          console.error(
+            'Refusing migration: the current dataDir is in legacy mode. ' +
+              'Initialise a Profile wallet (e.g. in a fresh dataDir using the same mnemonic) ' +
+              'and re-run this command from there.',
+          );
+          process.exit(1);
+        }
+
+        // Load the current Profile sphere — this is the import target.
+        const sphere = await getSphere();
+        if (!sphere.identity) {
+          console.error('Profile wallet not initialised. Run `init --profile` first.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Open the legacy storage providers read-only against the
+        // user-supplied paths. We do not initialise a full Sphere
+        // against them — we only need the mnemonic (for identity
+        // verification) and the TokenStorageProvider's load() output.
+        const { createFileStorageProvider } = await import('../impl/nodejs/storage/FileStorageProvider.js');
+        const { createFileTokenStorageProvider } = await import('../impl/nodejs/storage/FileTokenStorageProvider.js');
+
+        const legacyStorage = createFileStorageProvider({ dataDir: legacyDir });
+        const legacyTokenStorage = createFileTokenStorageProvider({
+          tokensDir: legacyTokensDir,
+        });
+
+        // Acquire a cross-process file lock on the legacy dataDir so
+        // a concurrent CLI invocation (or any external process that
+        // honours `proper-lockfile`) cannot mutate the source under
+        // us mid-import. The lock is released in the finally even on
+        // error / process.exit() paths.
+        const properLockfile = await import('proper-lockfile' as string) as {
+          lock(file: string, opts?: Record<string, unknown>): Promise<() => Promise<void>>;
+        };
+        let releaseLock: (() => Promise<void>) | null = null;
+        try {
+          // Lock the legacy dataDir's wallet.json (or the dir itself
+          // if no wallet.json yet — proper-lockfile creates a sibling
+          // .lock file based on the resolved path).
+          const lockTarget = path.join(legacyDir, 'wallet.json');
+          // proper-lockfile requires the target to exist, so fall back
+          // to locking the dir if wallet.json is missing — the
+          // identity-blob check below will reject that case anyway.
+          const lockable = fs.existsSync(lockTarget) ? lockTarget : legacyDir;
+          if (!fs.existsSync(lockable)) {
+            console.error(`Legacy dataDir does not exist: "${legacyDir}"`);
+            process.exit(1);
+          }
+          releaseLock = await properLockfile.lock(lockable, {
+            // Wait up to 10s if another migration is in progress.
+            retries: { retries: 10, factor: 1.2, minTimeout: 200, maxTimeout: 2000 },
+            stale: 60_000, // 60s — releases stuck locks from killed processes.
+          });
+        } catch (err) {
+          console.error(
+            `Could not acquire lock on legacy dataDir "${legacyDir}": ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+          console.error(
+            'This usually means another sphere-cli process is currently migrating ' +
+              'or interacting with this dataDir. Wait for it to finish, or remove a ' +
+              'stuck lock file (.lock suffix in the dir).',
+          );
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Track an exit code we want to surface to the shell. We avoid
+        // process.exit() inside the try/finally so file handles get
+        // closed cleanly on every error path.
+        let earlyExitCode: number | null = null;
+        let earlyExitReason: string | null = null;
+
+        try {
+          await legacyStorage.connect();
+          await legacyTokenStorage.initialize();
+
+          // Identity verification: read the encrypted mnemonic blob
+          // from both stores and compare byte-equally. If they match,
+          // the wallets share an identity (same plaintext + same
+          // encryption material). If they differ — either different
+          // mnemonics OR same mnemonic with different password/salt —
+          // we can't decide without decryption credentials, so refuse
+          // unless the user passes --no-verify.
+          const legacyMnemonicBlob = await legacyStorage.get('mnemonic');
+          if (!legacyMnemonicBlob) {
+            earlyExitReason = `No wallet mnemonic found at "${legacyDir}". Is this a legacy Sphere CLI dataDir?`;
+            earlyExitCode = 1;
+          } else {
+            const profileMnemonicBlob = await sphere.getStorage().get('mnemonic');
+            if (!noVerify && profileMnemonicBlob !== legacyMnemonicBlob) {
+              earlyExitReason =
+                'Refusing migration: cannot confirm same identity between legacy and Profile wallet.\n' +
+                '  - The encrypted mnemonic blobs differ. This usually means different mnemonics,\n' +
+                '    but can also happen when the same mnemonic was encrypted with different\n' +
+                '    passwords or salts.\n' +
+                '  - If you are SURE the wallets share the same mnemonic, re-run with --no-verify.';
+              earlyExitCode = 1;
+            }
+          }
+
+          if (earlyExitCode === null) {
+            if (noVerify) {
+              console.log(
+                'Note: --no-verify supplied — skipping identity check. ' +
+                  'Tokens with predicates that do not match this wallet will be unspendable.',
+              );
+            }
+
+            // Identity matches — set it on the legacy token storage so
+            // its load() targets the right address scope.
+            legacyTokenStorage.setIdentity(sphere.identity!);
+
+            const { importLegacyTokens } = await import('../profile/import-from-legacy.js');
+            console.log(
+              `\nMigrating tokens from "${legacyDir}" → current Profile (${dryRun ? 'DRY RUN' : 'LIVE'})...`,
+            );
+            const result = await importLegacyTokens(legacyTokenStorage, sphere.payments, {
+              dryRun,
+            });
+
+            console.log(`\n✓ Migration complete:`);
+            console.log(`  Tokens found:    ${result.tokensFound}`);
+            if (result.forksSkipped > 0) {
+              console.log(`  Forks skipped:   ${result.forksSkipped} (manual handling required)`);
+            }
+            if (!dryRun) {
+              console.log(`  Added:           ${result.tokensAdded}`);
+              console.log(`  Skipped:         ${result.tokensSkipped}`);
+              const sb = result.skippedByCode;
+              if (sb.duplicate > 0) console.log(`    duplicate:     ${sb.duplicate} (already owned)`);
+              if (sb.tombstoned > 0) console.log(`    tombstoned:    ${sb.tombstoned} (previously spent)`);
+              if (sb['genesis-exists'] > 0) console.log(`    genesis-exists:${sb['genesis-exists']} (preserved current state)`);
+              if (sb.unknown > 0) console.log(`    unknown:       ${sb.unknown}`);
+              console.log(`  Rejected:        ${result.tokensRejected}`);
+            }
+            console.log(`  Duration:        ${result.durationMs}ms`);
+
+            if (result.rejections.length > 0) {
+              console.log('\n  Rejected tokens:');
+              for (const r of result.rejections.slice(0, 10)) {
+                const idLabel = r.genesisTokenId
+                  ? `${r.genesisTokenId.slice(0, 16)}...`
+                  : '(no tokenId)';
+                console.log(`    ${idLabel}: ${r.reason}`);
+              }
+              if (result.rejectionsTruncated) {
+                console.log(`    (... ${result.tokensRejected - result.rejections.length} more rejection reasons truncated)`);
+              } else if (result.rejections.length > 10) {
+                console.log(`    (... ${result.rejections.length - 10} more)`);
+              }
+              // Surface partial-failure to scripting
+              process.exitCode = 2;
+            }
+
+            if (!result.success) {
+              earlyExitReason = `\nMigration failed: ${result.error}`;
+              earlyExitCode = 1;
+            } else if (deleteLegacy && !dryRun) {
+              if (result.tokensRejected > 0) {
+                console.log(
+                  '\nNot deleting legacy: some tokens were rejected. ' +
+                    'Re-run after fixing those, or omit --delete-legacy.',
+                );
+              } else if (result.forksSkipped > 0) {
+                console.log(
+                  '\nNot deleting legacy: forked-token entries were skipped. ' +
+                    'Inspect them in the legacy dataDir before removing.',
+                );
+              } else {
+                // Flush Profile state to OrbitDB / IPFS BEFORE wiping
+                // legacy. Without this, a crash between the two ops
+                // could lose both copies.
+                console.log('\nFlushing Profile state before legacy cleanup...');
+                await sphere.payments.waitForPendingOperations();
+                await sphere.payments.sync();
+
+                console.log(`Deleting legacy artefacts at "${legacyDir}"...`);
+                // Direct delete on the legacy providers — do NOT use
+                // Sphere.clear (it destroys the running singleton's
+                // sphere instance, which is the current Profile, not
+                // the legacy wallet we're trying to wipe).
+                if (legacyTokenStorage.clear) {
+                  await legacyTokenStorage.clear();
+                }
+                if (legacyStorage.isConnected()) {
+                  await legacyStorage.clear();
+                }
+                console.log('Legacy data cleared.');
+              }
+            } else if (!dryRun) {
+              console.log(
+                `\nLegacy data preserved at "${legacyDir}" (pass --delete-legacy to remove).`,
+              );
+            }
+          }
+        } finally {
+          await legacyStorage.disconnect().catch(() => {});
+          await legacyTokenStorage.shutdown().catch(() => {});
+          // Release the cross-process lock LAST so concurrent invocations
+          // remain blocked until our cleanup finishes.
+          if (releaseLock) {
+            await releaseLock().catch((err: unknown) => {
+              console.error(
+                `Warning: failed to release lock on "${legacyDir}": ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+              );
+            });
+          }
+        }
+
+        // If something went wrong, log + set exit code; cleanup above
+        // has already run because we routed all error paths through
+        // the local variables instead of process.exit().
+        if (earlyExitCode !== null) {
+          if (earlyExitReason) console.error(earlyExitReason);
+          await closeSphere();
+          process.exit(earlyExitCode);
         }
 
         await syncAfterWrite(sphere);
@@ -4790,7 +5527,7 @@ interface CompletionCommand {
 
 function getCompletionCommands(): CompletionCommand[] {
   return [
-    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr'] },
+    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr', '--legacy', '--profile'] },
     { name: 'status', description: 'Show wallet identity' },
     { name: 'config', description: 'Show or set CLI configuration' },
     { name: 'clear', description: 'Delete all wallet data' },
@@ -4813,6 +5550,9 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'sync', description: 'Sync tokens with IPFS' },
     { name: 'send', description: 'Send L3 tokens', flags: ['--direct', '--proxy', '--instant', '--conservative', '--no-sync'] },
     { name: 'receive', description: 'Check for incoming transfers', flags: ['--finalize', '--no-sync'] },
+    { name: 'tokens-export', description: 'Export owned tokens to a file (TXF/JSON or UXF/CAR)', flags: ['--format', '--coin', '--ids', '--all', '--include-unconfirmed'] },
+    { name: 'tokens-import', description: 'Import tokens from a file (auto-detects TXF/JSON or UXF/CAR)', flags: ['--format'] },
+    { name: 'migrate-to-profile', description: 'Import legacy wallet tokens into the current Profile (non-destructive, re-runnable)', flags: ['--legacy-dir', '--legacy-tokens', '--dry-run', '--delete-legacy', '--no-verify'] },
     { name: 'history', description: 'Show transaction history' },
     { name: 'addresses', description: 'List tracked addresses' },
     { name: 'switch', description: 'Switch to HD address' },

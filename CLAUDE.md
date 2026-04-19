@@ -617,6 +617,14 @@ RELAY_URL=wss://sphere-relay.unicity.network npm run test:relay
 - `@libp2p/crypto` - Ed25519 key generation for IPNS
 - `@libp2p/peer-id` - PeerId derivation for IPNS names
 - `ipns` - IPNS record creation and marshalling
+- `multiformats` - CID parsing and content-address verification
+
+**Profile (OrbitDB) storage (built-in):**
+- `@orbitdb/core` - OrbitDB key-value database for per-wallet Profile
+- `helia` - IPFS node runtime (dynamically imported by Profile backend)
+- `@libp2p/bootstrap` - Peer discovery for Helia
+- `@chainsafe/libp2p-gossipsub` - PubSub required by OrbitDB v3
+- `@ipld/car`, `@ipld/dag-cbor` - CAR file serialization for UXF bundles
 
 ## File Size Reference
 
