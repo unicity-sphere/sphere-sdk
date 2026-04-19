@@ -158,6 +158,7 @@ function switchToProfile(name: string): boolean {
 import {
   resolveStorageMode as resolveStorageModeCore,
   defaultLegacyWalletProbe,
+  defaultProfileWalletProbe,
   defaultProfileDepsProbe,
   type StorageMode,
 } from './storage-mode';
@@ -182,6 +183,7 @@ async function resolveStorageMode(
     config,
     explicit,
     legacyProbe: defaultLegacyWalletProbe,
+    profileWalletProbe: defaultProfileWalletProbe,
     profileProbe: cachedProfileProbe,
     persist: (patch) => saveConfig({ ...loadConfig(), ...patch }),
     notify: (msg) => console.error(msg),
@@ -1834,15 +1836,19 @@ async function main() {
         await clearStorage.connect();
         await clearTokenStorage.initialize();
 
+        // Atomic-ish ordering: reset storageMode in config FIRST, then
+        // delete the data. If the process dies mid-clear, the config
+        // is already in a "no committed mode" state — the next `init`
+        // will auto-detect from disk (or default to profile on a
+        // pristine dir) instead of pointing at gone-but-config-locked
+        // legacy/profile data.
+        const cfgBefore = loadConfig();
+        delete cfgBefore.storageMode;
+        saveConfig(cfgBefore);
+
         console.log(`Clearing all wallet data (mode: ${clearMode})...`);
         await Sphere.clear({ storage: clearStorage, tokenStorage: clearTokenStorage });
         console.log('All wallet data cleared.');
-
-        // Reset storageMode so the next init re-detects (picks profile
-        // by default on a fresh dataDir).
-        const cfg = loadConfig();
-        delete cfg.storageMode;
-        saveConfig(cfg);
 
         await clearStorage.disconnect();
         await clearTokenStorage.shutdown();
@@ -2584,14 +2590,16 @@ async function main() {
         const sphere = await getSphere();
         await ensureSync(sphere, 'full');
 
-        // Resolve coin symbol → coinId hex (so user can say "--coin UCT")
+        // Resolve coin symbol → coinId hex (so user can say "--coin UCT").
+        // If the symbol is unknown but looks like a 64-char hex coinId,
+        // accept it verbatim. Otherwise resolveCoin's own diagnostics
+        // (which call process.exit) handle the user-visible error.
         let coinIdFilter: string | undefined;
         if (coinArg) {
-          try {
+          if (/^[0-9a-fA-F]{64}$/.test(coinArg)) {
+            coinIdFilter = coinArg.toLowerCase();
+          } else {
             coinIdFilter = resolveCoin(coinArg).coinId;
-          } catch {
-            // Fall back to treating the arg as a literal coinId.
-            coinIdFilter = coinArg;
           }
         }
 
@@ -2658,14 +2666,31 @@ async function main() {
         const formatArgIdx = args.indexOf('--format');
         const formatArg = formatArgIdx >= 0 ? args[formatArgIdx + 1] : 'auto';
 
+        // Hard size cap to prevent OOM on a malicious / mistyped path.
+        // 100MB accommodates very large wallet backups without giving an
+        // attacker an unbounded read primitive.
+        const MAX_IMPORT_SIZE = 100 * 1024 * 1024;
         let bytes: Buffer;
         try {
+          const stat = fs.statSync(path.resolve(inFile));
+          if (stat.size > MAX_IMPORT_SIZE) {
+            console.error(
+              `Refusing to read "${inFile}": ${stat.size} bytes exceeds ` +
+                `the ${MAX_IMPORT_SIZE}-byte import limit.`,
+            );
+            process.exit(1);
+          }
           bytes = fs.readFileSync(path.resolve(inFile));
         } catch (err: unknown) {
           const code = (err as NodeJS.ErrnoException)?.code;
           if (code === 'ENOENT') console.error(`File not found: "${inFile}"`);
           else if (code === 'EACCES') console.error(`Permission denied: "${inFile}"`);
           else console.error(`Failed to read file: "${inFile}"`);
+          process.exit(1);
+        }
+
+        if (bytes.length === 0) {
+          console.error(`Refusing to import empty file: "${inFile}"`);
           process.exit(1);
         }
 
@@ -2745,6 +2770,10 @@ async function main() {
           if (result.rejected.length > 10) {
             console.log(`    (... ${result.rejected.length - 10} more)`);
           }
+          // Surface partial-failure to scripting / CI: any rejected
+          // entries cause a non-zero exit. Use exitCode (not exit())
+          // so cleanup below still runs.
+          process.exitCode = 2;
         }
 
         await syncAfterWrite(sphere);
