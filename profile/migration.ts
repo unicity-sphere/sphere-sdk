@@ -118,7 +118,23 @@ interface TransformedData {
 /**
  * Orchestrates the 6-step migration from legacy storage to Profile format.
  *
- * Usage:
+ * @deprecated Prefer the import-based migration via `importLegacyTokens`
+ * (see profile/import-from-legacy.ts). The 6-step destructive flow this
+ * class implements predates the explicit / non-destructive / re-runnable
+ * model the CLI now uses. Kept for backwards compatibility with consumers
+ * that already wire it. New consumers should use the import path:
+ *
+ * ```ts
+ * import { importLegacyTokens } from '@unicitylabs/sphere-sdk/profile';
+ *
+ * const result = await importLegacyTokens(
+ *   legacyTokenStorage,
+ *   profileSphere.payments,
+ *   { dryRun: false },
+ * );
+ * ```
+ *
+ * Usage (legacy):
  * ```ts
  * const migration = new ProfileMigration();
  * if (await migration.needsMigration(legacyStorage)) {

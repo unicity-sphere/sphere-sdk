@@ -692,6 +692,58 @@ Received 2 new transfer(s):
   0.04200000 ETH [unconfirmed]
 ```
 
+### Migrate a Legacy Wallet to Profile (OrbitDB)
+
+If you have an existing legacy (file-based) Sphere CLI wallet and want to switch to the new Profile (OrbitDB) backend, the recommended workflow is **explicit, non-destructive, and re-runnable**:
+
+```bash
+# 1. From a NEW dataDir, create a Profile wallet using the same mnemonic
+#    as your legacy wallet.
+mkdir -p ~/sphere-profile && cd ~/sphere-profile
+npm run cli -- init --profile --mnemonic   # interactive prompt for mnemonic
+
+# 2. Import the legacy wallet's tokens into the Profile.
+#    Legacy data is preserved by default — pass --delete-legacy only after
+#    you have verified the migration succeeded.
+npm run cli -- migrate-to-profile --legacy-dir ~/sphere-legacy
+
+# 3. (optional) Dry-run first to see what would be imported.
+npm run cli -- migrate-to-profile --legacy-dir ~/sphere-legacy --dry-run
+
+# 4. (optional) Re-run any time. Subsequent runs add only NEW tokens
+#    (deduplicated by tokenId+stateHash); previously imported tokens
+#    are skipped, previously spent ones are refused via tombstone.
+npm run cli -- migrate-to-profile --legacy-dir ~/sphere-legacy
+
+# 5. (optional) After multiple runs and full verification, delete legacy.
+npm run cli -- migrate-to-profile --legacy-dir ~/sphere-legacy --delete-legacy
+```
+
+**Properties of `migrate-to-profile`:**
+
+- **Explicit** — never auto-runs, always requires the user command.
+- **Non-destructive by default** — legacy storage is preserved unless `--delete-legacy` is passed AND the import succeeded with zero rejections.
+- **Re-runnable / idempotent** — every run produces the joint inventory of legacy + Profile, with `addToken`'s tombstone + (tokenId, stateHash) dedup gating duplicates.
+- **Identity-verified** — refuses to migrate when the legacy and Profile wallets do not share the same encrypted mnemonic blob. Override with `--no-verify` when you know they're the same wallet but were encrypted with different passwords.
+- **Token statuses recalculated automatically** — Profile's load path runs the structural manifest deriver and the local cache deriver after every import.
+
+**Output:**
+
+```
+Migrating tokens from "/Users/me/sphere-legacy" → current Profile (LIVE)...
+
+✓ Migration complete:
+  Tokens found:    47
+  Added:           47
+  Skipped:         0 (already owned / tombstoned)
+  Rejected:        0
+  Duration:        342ms
+
+Legacy data preserved at "/Users/me/sphere-legacy" (pass --delete-legacy to remove).
+```
+
+> **Note on in-place upgrade:** the steelman safety check in `init --profile` refuses to clobber a dataDir that contains a legacy `wallet.json`. This is intentional — to upgrade in place, use a separate dataDir for Profile and migrate as above. After verification, you can `clear --yes` the legacy dir and rename the Profile dir if desired.
+
 ### Offline Token Transfer (export / import to file)
 
 For offline transfer, air-gapped transport, or bulk backup, the CLI exposes two commands that write/read token files in either **UXF** (content-addressable CAR) or **TXF** (JSON array) format. The wire format is TXF-compatible in both cases — a file produced by a Profile-mode wallet can be imported by a legacy-mode wallet and vice-versa.

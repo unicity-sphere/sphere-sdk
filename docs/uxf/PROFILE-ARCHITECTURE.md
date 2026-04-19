@@ -650,7 +650,25 @@ DM message content is encrypted with `profileEncryptionKey` before storing in Or
 
 ### 7.6 Legacy Migration Flow
 
-When `Sphere.init({ profile: true })` is called on a wallet that has legacy-format data (existing IndexedDB/file storage + old-format IPFS inventory), the following migration runs silently:
+> **Updated model (current):** Migration is **explicit, non-destructive, and re-runnable** — invoked via the CLI `migrate-to-profile` command (or the SDK helper `importLegacyTokens`). The previous "auto-run on init + cleanup after sanity check" flow described below remains in the codebase as `ProfileMigration` (deprecated, kept for backwards compatibility), but new code paths and the CLI use the import-based model.
+>
+> **Current flow (recommended):**
+>
+> 1. User explicitly creates a Profile wallet in a fresh dataDir using the same mnemonic as the legacy wallet (`init --profile --mnemonic ...`).
+> 2. User explicitly invokes `migrate-to-profile --legacy-dir <path>` to import legacy tokens. The command:
+>    - Verifies identity (compares encrypted-mnemonic blobs).
+>    - Reads tokens from the legacy `TokenStorageProvider` (read-only).
+>    - Calls `PaymentsModule.importTokens(...)` against the Profile target — same dedup as the file-based `tokens-import` command.
+>    - Reports counts (added / skipped / rejected) with rejection reasons.
+> 3. Re-running is safe and idempotent: tombstone + (tokenId, stateHash) dedup gives the joint inventory.
+> 4. Token statuses, the structural manifest, and the local derived cache (tombstones / sent / history) are recalculated automatically by the Profile load path.
+> 5. Legacy data is preserved by default; `--delete-legacy` opts in to cleanup AFTER a successful zero-rejection import.
+>
+> See `cli migrate-to-profile`, `profile/import-from-legacy.ts`, and `docs/QUICKSTART-CLI.md`.
+
+#### Legacy 6-step flow (deprecated `ProfileMigration` class)
+
+When `Sphere.init({ profile: true })` was called on a wallet that has legacy-format data (existing IndexedDB/file storage + old-format IPFS inventory), the following migration ran silently. Retained for backwards compatibility but no longer the recommended path:
 
 ```
 1. SYNC OLD IPFS DATA FIRST

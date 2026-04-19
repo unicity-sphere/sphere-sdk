@@ -104,7 +104,21 @@ export type { ConsolidationResult } from './consolidation';
 // Migration
 // =============================================================================
 
+/**
+ * @deprecated Prefer the import-based migration via `importLegacyTokens`
+ * (re-exported below). The 6-step destructive `ProfileMigration`
+ * predates the explicit / non-destructive / re-runnable model the CLI
+ * now uses. Kept for backwards compatibility.
+ */
 export { ProfileMigration } from './migration';
+
+// Import-based migration (current model): non-destructive, idempotent,
+// joint-inventory semantics. See profile/import-from-legacy.ts.
+export { importLegacyTokens } from './import-from-legacy';
+export type {
+  LegacyImportOptions,
+  LegacyImportResult,
+} from './import-from-legacy';
 
 // =============================================================================
 // Deriver (local-cached structural views)
