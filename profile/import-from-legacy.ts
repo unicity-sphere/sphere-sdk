@@ -56,19 +56,33 @@ export interface LegacyImportOptions {
 
 export interface LegacyImportResult {
   readonly success: boolean;
-  /** Total TxfTokens extracted from legacy storage (active + archived + forked). */
+  /** Active + archived TxfTokens extracted from legacy storage. */
   readonly tokensFound: number;
+  /**
+   * Forked-token entries (`_forked_*`) found in legacy. Forks are
+   * NOT routed through the standard import path — their semantics
+   * (alternate state of an existing token) would otherwise collide
+   * with the active state in the Profile. They are reported here for
+   * visibility; manual handling is recommended.
+   */
+  readonly forksSkipped: number;
   /** Tokens newly added to the target Profile. */
   readonly tokensAdded: number;
   /** Tokens skipped (already owned, tombstoned, or superseded). */
   readonly tokensSkipped: number;
   /** Tokens rejected (malformed input). */
   readonly tokensRejected: number;
-  /** Per-token rejection reasons (truncated to 100 entries). */
+  /**
+   * Per-token rejection reasons. Truncated to at most 100 entries to
+   * avoid memory blow-up; check `rejectionsTruncated` to know if the
+   * caller should poke at the source for the full picture.
+   */
   readonly rejections: ReadonlyArray<{
     readonly genesisTokenId: string | null;
     readonly reason: string;
   }>;
+  /** True iff `rejections` contains fewer entries than `tokensRejected`. */
+  readonly rejectionsTruncated: boolean;
   /** Wall-clock duration of the import. */
   readonly durationMs: number;
   /** Set when the helper exited early due to an error. */
@@ -116,43 +130,51 @@ export async function importLegacyTokens(
   }
 
   // 2. Extract TxfToken values from the storage data. We collect from
-  //    every token-like key:
-  //      - active tokens (`_<tokenId>`)
-  //      - archived tokens (`archived-<tokenId>`)
-  //      - forked tokens (`_forked_<tokenId>_<stateHash>`)
+  //    active and archived keys; forked entries (`_forked_*`) are
+  //    counted but NOT imported — see LegacyImportResult.forksSkipped.
   //    Operational keys (_meta, _tombstones, _outbox, etc.) are skipped.
-  const txfTokens = extractTxfTokensFromStorageData(loaded.data);
+  const { tokens: txfTokens, forksSkipped } = extractTxfTokensFromStorageData(loaded.data);
 
   if (options.dryRun) {
     return {
       success: true,
       tokensFound: txfTokens.length,
+      forksSkipped,
       tokensAdded: 0,
       tokensSkipped: 0,
       tokensRejected: 0,
       rejections: [],
+      rejectionsTruncated: false,
       durationMs: Date.now() - startTime,
     };
   }
 
-  // 3. Hand off to PaymentsModule.importTokens — same code path as
-  //    the file-based `tokens-import` CLI, with identical dedup +
-  //    tombstone semantics. Re-running yields the joint inventory.
+  // 3. Hand off to PaymentsModule.importTokens with strict-mode on:
+  //    - Same dedup + tombstone semantics as file-based `tokens-import`.
+  //    - PLUS: skip any tokenId that already exists in the Profile,
+  //      regardless of stateHash. Without this, addToken's CASE 2
+  //      "newer state" path would archive the Profile's current state
+  //      whenever legacy carries an older copy — silent regression.
+  //    Re-running with strict mode yields the additive joint inventory.
   if (txfTokens.length === 0) {
     return {
       success: true,
       tokensFound: 0,
+      forksSkipped,
       tokensAdded: 0,
       tokensSkipped: 0,
       tokensRejected: 0,
       rejections: [],
+      rejectionsTruncated: false,
       durationMs: Date.now() - startTime,
     };
   }
 
   let importResult;
   try {
-    importResult = await targetPayments.importTokens(txfTokens);
+    importResult = await targetPayments.importTokens(txfTokens, {
+      skipExistingGenesis: true,
+    });
   } catch (err) {
     return emptyResult({
       durationMs: Date.now() - startTime,
@@ -160,13 +182,16 @@ export async function importLegacyTokens(
     });
   }
 
+  const REJECTION_CAP = 100;
   return {
     success: true,
     tokensFound: txfTokens.length,
+    forksSkipped,
     tokensAdded: importResult.added.length,
     tokensSkipped: importResult.skipped.length,
     tokensRejected: importResult.rejected.length,
-    rejections: importResult.rejected.slice(0, 100),
+    rejections: importResult.rejected.slice(0, REJECTION_CAP),
+    rejectionsTruncated: importResult.rejected.length > REJECTION_CAP,
     durationMs: Date.now() - startTime,
   };
 }
@@ -175,27 +200,42 @@ export async function importLegacyTokens(
 // Internal helpers
 // =============================================================================
 
-function extractTxfTokensFromStorageData(data: TxfStorageDataBase): TxfToken[] {
-  const out: TxfToken[] = [];
+function extractTxfTokensFromStorageData(data: TxfStorageDataBase): {
+  tokens: TxfToken[];
+  forksSkipped: number;
+} {
+  const tokens: TxfToken[] = [];
+  let forksSkipped = 0;
   for (const [key, value] of Object.entries(data)) {
     if (!value || typeof value !== 'object') continue;
-    if (!(isTokenKey(key) || isArchivedKey(key) || isForkedKey(key))) continue;
     const candidate = value as Partial<TxfToken>;
-    if (candidate.genesis && candidate.state) {
-      out.push(value as TxfToken);
+
+    if (isForkedKey(key)) {
+      // Forks are NOT imported — promoting a fork would archive the
+      // Profile's active state for that tokenId. Surface the count
+      // so the caller can prompt the user to investigate.
+      if (candidate.genesis && candidate.state) forksSkipped++;
+      continue;
+    }
+    if (!(isTokenKey(key) || isArchivedKey(key))) continue;
+
+    if (candidate.genesis && candidate.state && candidate.genesis.data?.tokenId) {
+      tokens.push(value as TxfToken);
     }
   }
-  return out;
+  return { tokens, forksSkipped };
 }
 
 function emptyResult(extra: Partial<LegacyImportResult> & { durationMs: number }): LegacyImportResult {
   return {
     success: false,
     tokensFound: 0,
+    forksSkipped: 0,
     tokensAdded: 0,
     tokensSkipped: 0,
     tokensRejected: 0,
     rejections: [],
+    rejectionsTruncated: false,
     ...extra,
   };
 }

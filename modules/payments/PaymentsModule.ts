@@ -3268,13 +3268,25 @@ export class PaymentsModule {
    * duplicates are skipped. Malformed entries are reported as
    * `rejected` with a reason so the caller can surface them.
    *
+   * **Strict mode (`skipExistingGenesis: true`)** disables the
+   * state-update behaviour of {@link addToken}: any imported token
+   * whose genesis tokenId already exists in the wallet is skipped
+   * outright, regardless of stateHash. Use this when the import is
+   * intended as an additive UNION (legacy migration, multi-source
+   * file import) — without it, an imported older state would archive
+   * the wallet's current state, regressing the wallet's view of that
+   * token. Forked / reissued token entries (`_forked_*`) are never
+   * promoted to active under strict mode for the same reason.
+   *
    * @param txfTokens - Array of TxfToken objects (as produced by
    *   {@link exportTokens}, a legacy TXF file, or a UXF CAR that has
    *   been reassembled).
+   * @param options.skipExistingGenesis - Default false (lenient).
    * @returns Counts and identifiers for each outcome category.
    */
   async importTokens(
     txfTokens: readonly TxfToken[],
+    options?: { skipExistingGenesis?: boolean },
   ): Promise<{
     added: Array<{ localId: string; genesisTokenId: string }>;
     skipped: Array<{ genesisTokenId: string; reason: string }>;
@@ -3300,6 +3312,28 @@ export class PaymentsModule {
       // Fresh local UUID so imported tokens are addressable without
       // colliding with the wallet's existing local IDs.
       const localId = crypto.randomUUID();
+      // Strict mode: reject any genesis tokenId that already exists in
+      // the wallet, regardless of stateHash. Prevents addToken's
+      // state-update path (line ~3893) from regressing the wallet's
+      // current state when an older copy is being imported.
+      if (options?.skipExistingGenesis) {
+        let alreadyOwned = false;
+        for (const existing of this.tokens.values()) {
+          const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
+          if (existingTokenId === genesisTokenId) {
+            alreadyOwned = true;
+            break;
+          }
+        }
+        if (alreadyOwned) {
+          skipped.push({
+            genesisTokenId,
+            reason: 'Genesis tokenId already in wallet (strict mode); legacy copy ignored to preserve current state',
+          });
+          continue;
+        }
+      }
+
       let uiToken: Token;
       try {
         uiToken = txfToToken(localId, txf);

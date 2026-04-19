@@ -2814,23 +2814,29 @@ async function main() {
         // Explicit, non-destructive, re-runnable migration of TXF
         // tokens from a legacy storage directory into the current
         // Profile (OrbitDB) wallet. Legacy data is NEVER deleted
-        // unless --delete-legacy is passed AND the import succeeded.
-        const legacyDirIdx = args.indexOf('--legacy-dir');
-        const legacyDir = legacyDirIdx >= 0 ? args[legacyDirIdx + 1] : undefined;
-
-        const legacyTokensDirIdx = args.indexOf('--legacy-tokens');
-        const legacyTokensDir = legacyTokensDirIdx >= 0 ? args[legacyTokensDirIdx + 1] : undefined;
+        // unless --delete-legacy is passed AND the import succeeded
+        // with zero rejections AND the Profile state has been flushed.
+        const legacyDirRaw = (() => {
+          const i = args.indexOf('--legacy-dir');
+          return i >= 0 ? args[i + 1] : undefined;
+        })();
+        const legacyTokensDirRaw = (() => {
+          const i = args.indexOf('--legacy-tokens');
+          return i >= 0 ? args[i + 1] : undefined;
+        })();
 
         const dryRun = args.includes('--dry-run');
         const deleteLegacy = args.includes('--delete-legacy');
+        const noVerify = args.includes('--no-verify');
 
-        if (!legacyDir) {
+        if (!legacyDirRaw) {
           console.error('Usage: migrate-to-profile --legacy-dir <path> [options]');
           console.error('  --legacy-dir <path>   Source dataDir of the legacy wallet (REQUIRED)');
           console.error('  --legacy-tokens <p>   Override legacy tokens dir (default: <legacy-dir>/tokens)');
           console.error('  --dry-run             Report what would be migrated, do not write');
           console.error('  --delete-legacy       Remove legacy artefacts after a successful import');
           console.error('                        (off by default — legacy is preserved)');
+          console.error('  --no-verify           Skip identity verification (use with caution)');
           console.error('');
           console.error('Notes:');
           console.error('  - Current dataDir must already be a Profile wallet (run `init` here first).');
@@ -2839,10 +2845,29 @@ async function main() {
           process.exit(1);
         }
 
-        // Pre-check: the current wallet must be Profile mode. Migrating
-        // INTO a legacy wallet does not make sense — the destination is
-        // explicitly the new format.
+        // Resolve user-supplied paths to absolutes so we can do a
+        // safe same-dir check below regardless of the shell's cwd.
+        const legacyDir = path.resolve(legacyDirRaw);
+        const legacyTokensDir = legacyTokensDirRaw
+          ? path.resolve(legacyTokensDirRaw)
+          : path.join(legacyDir, 'tokens');
+
+        // Pre-check 1: refuse same-dir migration. The cleanup branch
+        // below would otherwise wipe the current Profile's wallet.json
+        // (which Profile's local-cache FileStorage shares with legacy).
         const currentConfig = loadConfig();
+        const profileDir = path.resolve(currentConfig.dataDir);
+        const profileTokensDir = path.resolve(currentConfig.tokensDir);
+        if (legacyDir === profileDir || legacyTokensDir === profileTokensDir) {
+          console.error(
+            `Refusing migration: --legacy-dir resolves to the current Profile dataDir ` +
+              `(${profileDir}). Source and target must be distinct directories — ` +
+              `point --legacy-dir at the OLD wallet location.`,
+          );
+          process.exit(1);
+        }
+
+        // Pre-check 2: target must already be Profile.
         if (currentConfig.storageMode === 'legacy') {
           console.error(
             'Refusing migration: the current dataDir is in legacy mode. ' +
@@ -2869,8 +2894,14 @@ async function main() {
 
         const legacyStorage = createFileStorageProvider({ dataDir: legacyDir });
         const legacyTokenStorage = createFileTokenStorageProvider({
-          tokensDir: legacyTokensDir ?? `${legacyDir.replace(/\/$/, '')}/tokens`,
+          tokensDir: legacyTokensDir,
         });
+
+        // Track an exit code we want to surface to the shell. We avoid
+        // process.exit() inside the try/finally so file handles get
+        // closed cleanly on every error path.
+        let earlyExitCode: number | null = null;
+        let earlyExitReason: string | null = null;
 
         try {
           await legacyStorage.connect();
@@ -2883,119 +2914,125 @@ async function main() {
           // mnemonics OR same mnemonic with different password/salt —
           // we can't decide without decryption credentials, so refuse
           // unless the user passes --no-verify.
-          const noVerify = args.includes('--no-verify');
           const legacyMnemonicBlob = await legacyStorage.get('mnemonic');
           if (!legacyMnemonicBlob) {
-            console.error(
-              `No wallet mnemonic found at "${legacyDir}". ` +
-                `Is this a legacy Sphere CLI dataDir?`,
-            );
-            await legacyStorage.disconnect();
-            await legacyTokenStorage.shutdown();
-            await closeSphere();
-            process.exit(1);
-          }
-          // The current sphere's storage holds the same key under MNEMONIC.
-          // We compare against THAT (not the decrypted form) so that a
-          // password-encrypted wallet still verifies cleanly.
-          const profileMnemonicBlob = await sphere.getStorage().get('mnemonic');
-          if (!noVerify && profileMnemonicBlob !== legacyMnemonicBlob) {
-            console.error(
-              'Refusing migration: cannot confirm same identity between legacy and Profile wallet.',
-            );
-            console.error(
-              '  - The encrypted mnemonic blobs differ. This usually means different mnemonics,',
-            );
-            console.error(
-              '    but can also happen when the same mnemonic was encrypted with different',
-            );
-            console.error(
-              '    passwords or salts.',
-            );
-            console.error(
-              '  - If you are SURE the wallets share the same mnemonic, re-run with --no-verify.',
-            );
-            await legacyStorage.disconnect();
-            await legacyTokenStorage.shutdown();
-            await closeSphere();
-            process.exit(1);
-          }
-          if (noVerify) {
-            console.log(
-              'Note: --no-verify supplied — skipping identity check. ' +
-                'Tokens with predicates that do not match this wallet will be unspendable.',
-            );
-          }
-
-          // Identity matches — set it on the legacy token storage so
-          // its load() targets the right address scope.
-          legacyTokenStorage.setIdentity(sphere.identity!);
-
-          const { importLegacyTokens } = await import('../profile/import-from-legacy.js');
-          console.log(
-            `\nMigrating tokens from "${legacyDir}" → current Profile (${dryRun ? 'DRY RUN' : 'LIVE'})...`,
-          );
-          const result = await importLegacyTokens(legacyTokenStorage, sphere.payments, {
-            dryRun,
-          });
-
-          console.log(`\n✓ Migration complete:`);
-          console.log(`  Tokens found:    ${result.tokensFound}`);
-          if (!dryRun) {
-            console.log(`  Added:           ${result.tokensAdded}`);
-            console.log(`  Skipped:         ${result.tokensSkipped} (already owned / tombstoned)`);
-            console.log(`  Rejected:        ${result.tokensRejected}`);
-          }
-          console.log(`  Duration:        ${result.durationMs}ms`);
-
-          if (result.rejections.length > 0) {
-            console.log('\n  Rejected tokens:');
-            for (const r of result.rejections.slice(0, 10)) {
-              const idLabel = r.genesisTokenId
-                ? `${r.genesisTokenId.slice(0, 16)}...`
-                : '(no tokenId)';
-              console.log(`    ${idLabel}: ${r.reason}`);
+            earlyExitReason = `No wallet mnemonic found at "${legacyDir}". Is this a legacy Sphere CLI dataDir?`;
+            earlyExitCode = 1;
+          } else {
+            const profileMnemonicBlob = await sphere.getStorage().get('mnemonic');
+            if (!noVerify && profileMnemonicBlob !== legacyMnemonicBlob) {
+              earlyExitReason =
+                'Refusing migration: cannot confirm same identity between legacy and Profile wallet.\n' +
+                '  - The encrypted mnemonic blobs differ. This usually means different mnemonics,\n' +
+                '    but can also happen when the same mnemonic was encrypted with different\n' +
+                '    passwords or salts.\n' +
+                '  - If you are SURE the wallets share the same mnemonic, re-run with --no-verify.';
+              earlyExitCode = 1;
             }
-            if (result.rejections.length > 10) {
-              console.log(`    (... ${result.rejections.length - 10} more)`);
-            }
-            // Surface partial-failure to scripting
-            process.exitCode = 2;
           }
 
-          if (!result.success) {
-            console.error(`\nMigration failed: ${result.error}`);
-            await legacyStorage.disconnect();
-            await legacyTokenStorage.shutdown();
-            await closeSphere();
-            process.exit(1);
-          }
-
-          // Optional cleanup — only on explicit opt-in AND a successful
-          // (non-dry-run) import with zero rejections. We never wipe
-          // legacy when there is anything left unaccounted for.
-          if (deleteLegacy && !dryRun) {
-            if (result.tokensRejected > 0) {
+          if (earlyExitCode === null) {
+            if (noVerify) {
               console.log(
-                '\nNot deleting legacy: some tokens were rejected. ' +
-                  'Re-run after fixing those, or omit --delete-legacy.',
+                'Note: --no-verify supplied — skipping identity check. ' +
+                  'Tokens with predicates that do not match this wallet will be unspendable.',
               );
-            } else {
-              console.log(`\nDeleting legacy artefacts at "${legacyDir}"...`);
-              await Sphere.clear({
-                storage: legacyStorage,
-                tokenStorage: legacyTokenStorage,
-              });
-              console.log('Legacy data cleared.');
             }
-          } else if (!dryRun) {
+
+            // Identity matches — set it on the legacy token storage so
+            // its load() targets the right address scope.
+            legacyTokenStorage.setIdentity(sphere.identity!);
+
+            const { importLegacyTokens } = await import('../profile/import-from-legacy.js');
             console.log(
-              `\nLegacy data preserved at "${legacyDir}" (pass --delete-legacy to remove).`,
+              `\nMigrating tokens from "${legacyDir}" → current Profile (${dryRun ? 'DRY RUN' : 'LIVE'})...`,
             );
+            const result = await importLegacyTokens(legacyTokenStorage, sphere.payments, {
+              dryRun,
+            });
+
+            console.log(`\n✓ Migration complete:`);
+            console.log(`  Tokens found:    ${result.tokensFound}`);
+            if (result.forksSkipped > 0) {
+              console.log(`  Forks skipped:   ${result.forksSkipped} (manual handling required)`);
+            }
+            if (!dryRun) {
+              console.log(`  Added:           ${result.tokensAdded}`);
+              console.log(`  Skipped:         ${result.tokensSkipped} (already owned / tombstoned)`);
+              console.log(`  Rejected:        ${result.tokensRejected}`);
+            }
+            console.log(`  Duration:        ${result.durationMs}ms`);
+
+            if (result.rejections.length > 0) {
+              console.log('\n  Rejected tokens:');
+              for (const r of result.rejections.slice(0, 10)) {
+                const idLabel = r.genesisTokenId
+                  ? `${r.genesisTokenId.slice(0, 16)}...`
+                  : '(no tokenId)';
+                console.log(`    ${idLabel}: ${r.reason}`);
+              }
+              if (result.rejectionsTruncated) {
+                console.log(`    (... ${result.tokensRejected - result.rejections.length} more rejection reasons truncated)`);
+              } else if (result.rejections.length > 10) {
+                console.log(`    (... ${result.rejections.length - 10} more)`);
+              }
+              // Surface partial-failure to scripting
+              process.exitCode = 2;
+            }
+
+            if (!result.success) {
+              earlyExitReason = `\nMigration failed: ${result.error}`;
+              earlyExitCode = 1;
+            } else if (deleteLegacy && !dryRun) {
+              if (result.tokensRejected > 0) {
+                console.log(
+                  '\nNot deleting legacy: some tokens were rejected. ' +
+                    'Re-run after fixing those, or omit --delete-legacy.',
+                );
+              } else if (result.forksSkipped > 0) {
+                console.log(
+                  '\nNot deleting legacy: forked-token entries were skipped. ' +
+                    'Inspect them in the legacy dataDir before removing.',
+                );
+              } else {
+                // Flush Profile state to OrbitDB / IPFS BEFORE wiping
+                // legacy. Without this, a crash between the two ops
+                // could lose both copies.
+                console.log('\nFlushing Profile state before legacy cleanup...');
+                await sphere.payments.waitForPendingOperations();
+                await sphere.payments.sync();
+
+                console.log(`Deleting legacy artefacts at "${legacyDir}"...`);
+                // Direct delete on the legacy providers — do NOT use
+                // Sphere.clear (it destroys the running singleton's
+                // sphere instance, which is the current Profile, not
+                // the legacy wallet we're trying to wipe).
+                if (legacyTokenStorage.clear) {
+                  await legacyTokenStorage.clear();
+                }
+                if (legacyStorage.isConnected()) {
+                  await legacyStorage.clear();
+                }
+                console.log('Legacy data cleared.');
+              }
+            } else if (!dryRun) {
+              console.log(
+                `\nLegacy data preserved at "${legacyDir}" (pass --delete-legacy to remove).`,
+              );
+            }
           }
         } finally {
           await legacyStorage.disconnect().catch(() => {});
           await legacyTokenStorage.shutdown().catch(() => {});
+        }
+
+        // If something went wrong, log + set exit code; cleanup above
+        // has already run because we routed all error paths through
+        // the local variables instead of process.exit().
+        if (earlyExitCode !== null) {
+          if (earlyExitReason) console.error(earlyExitReason);
+          await closeSphere();
+          process.exit(earlyExitCode);
         }
 
         await syncAfterWrite(sphere);
