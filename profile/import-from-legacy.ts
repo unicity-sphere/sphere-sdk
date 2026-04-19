@@ -73,16 +73,28 @@ export interface LegacyImportResult {
   /** Tokens rejected (malformed input). */
   readonly tokensRejected: number;
   /**
-   * Per-token rejection reasons. Truncated to at most 100 entries to
-   * avoid memory blow-up; check `rejectionsTruncated` to know if the
-   * caller should poke at the source for the full picture.
+   * Per-token rejection details, truncated at 100 entries (see
+   * `rejectionsTruncated`).
    */
   readonly rejections: ReadonlyArray<{
     readonly genesisTokenId: string | null;
+    readonly code: 'malformed' | 'add-failed';
     readonly reason: string;
   }>;
   /** True iff `rejections` contains fewer entries than `tokensRejected`. */
   readonly rejectionsTruncated: boolean;
+  /**
+   * Per-skip-code counts for diagnostics. Sums across all tokens that
+   * the importer chose not to write. Buckets:
+   *   - 'duplicate'      : exact (tokenId, stateHash) already owned
+   *   - 'tombstoned'     : (tokenId, stateHash) was previously spent
+   *   - 'genesis-exists' : strict-mode refused to clobber a different state
+   *   - 'unknown'        : addToken returned false despite pre-checks
+   */
+  readonly skippedByCode: Readonly<Record<
+    'duplicate' | 'tombstoned' | 'genesis-exists' | 'unknown',
+    number
+  >>;
   /** Wall-clock duration of the import. */
   readonly durationMs: number;
   /** Set when the helper exited early due to an error. */
@@ -145,6 +157,7 @@ export async function importLegacyTokens(
       tokensRejected: 0,
       rejections: [],
       rejectionsTruncated: false,
+      skippedByCode: { duplicate: 0, tombstoned: 0, 'genesis-exists': 0, unknown: 0 },
       durationMs: Date.now() - startTime,
     };
   }
@@ -166,6 +179,7 @@ export async function importLegacyTokens(
       tokensRejected: 0,
       rejections: [],
       rejectionsTruncated: false,
+      skippedByCode: { duplicate: 0, tombstoned: 0, 'genesis-exists': 0, unknown: 0 },
       durationMs: Date.now() - startTime,
     };
   }
@@ -182,6 +196,16 @@ export async function importLegacyTokens(
     });
   }
 
+  const skippedByCode = {
+    duplicate: 0,
+    tombstoned: 0,
+    'genesis-exists': 0,
+    unknown: 0,
+  };
+  for (const s of importResult.skipped) {
+    skippedByCode[s.code] = (skippedByCode[s.code] ?? 0) + 1;
+  }
+
   const REJECTION_CAP = 100;
   return {
     success: true,
@@ -190,8 +214,13 @@ export async function importLegacyTokens(
     tokensAdded: importResult.added.length,
     tokensSkipped: importResult.skipped.length,
     tokensRejected: importResult.rejected.length,
-    rejections: importResult.rejected.slice(0, REJECTION_CAP),
+    rejections: importResult.rejected.slice(0, REJECTION_CAP).map((r) => ({
+      genesisTokenId: r.genesisTokenId,
+      code: r.code,
+      reason: r.reason,
+    })),
     rejectionsTruncated: importResult.rejected.length > REJECTION_CAP,
+    skippedByCode,
     durationMs: Date.now() - startTime,
   };
 }
@@ -236,6 +265,7 @@ function emptyResult(extra: Partial<LegacyImportResult> & { durationMs: number }
     tokensRejected: 0,
     rejections: [],
     rejectionsTruncated: false,
+    skippedByCode: { duplicate: 0, tombstoned: 0, 'genesis-exists': 0, unknown: 0 },
     ...extra,
   };
 }

@@ -177,11 +177,13 @@
     "elliptic": "^6.6.1",
     "helia": "^6.1.1",
     "ipns": "^10.0.0",
-    "multiformats": "^13.4.2"
+    "multiformats": "^13.4.2",
+    "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
     "@types/crypto-js": "^4.2.2",
+    "@types/proper-lockfile": "^4.1.4",
     "@types/elliptic": "^6.4.18",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",

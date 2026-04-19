@@ -2785,9 +2785,19 @@ async function main() {
 
         const result = await sphere.payments.importTokens(txfTokens);
 
+        // Tally per-code skips so the user gets specific diagnostics.
+        const skipCounts: Record<string, number> = {};
+        for (const s of result.skipped) {
+          skipCounts[s.code] = (skipCounts[s.code] ?? 0) + 1;
+        }
+
         console.log(`\n✓ Import complete:`);
         console.log(`  Added:    ${result.added.length}`);
-        console.log(`  Skipped:  ${result.skipped.length} (already owned / tombstoned)`);
+        console.log(`  Skipped:  ${result.skipped.length}`);
+        if (skipCounts.duplicate) console.log(`    duplicate:      ${skipCounts.duplicate}`);
+        if (skipCounts.tombstoned) console.log(`    tombstoned:     ${skipCounts.tombstoned}`);
+        if (skipCounts['genesis-exists']) console.log(`    genesis-exists: ${skipCounts['genesis-exists']}`);
+        if (skipCounts.unknown) console.log(`    unknown:        ${skipCounts.unknown}`);
         console.log(`  Rejected: ${result.rejected.length}`);
 
         if (result.rejected.length > 0) {
@@ -2897,6 +2907,47 @@ async function main() {
           tokensDir: legacyTokensDir,
         });
 
+        // Acquire a cross-process file lock on the legacy dataDir so
+        // a concurrent CLI invocation (or any external process that
+        // honours `proper-lockfile`) cannot mutate the source under
+        // us mid-import. The lock is released in the finally even on
+        // error / process.exit() paths.
+        const properLockfile = await import('proper-lockfile' as string) as {
+          lock(file: string, opts?: Record<string, unknown>): Promise<() => Promise<void>>;
+        };
+        let releaseLock: (() => Promise<void>) | null = null;
+        try {
+          // Lock the legacy dataDir's wallet.json (or the dir itself
+          // if no wallet.json yet — proper-lockfile creates a sibling
+          // .lock file based on the resolved path).
+          const lockTarget = path.join(legacyDir, 'wallet.json');
+          // proper-lockfile requires the target to exist, so fall back
+          // to locking the dir if wallet.json is missing — the
+          // identity-blob check below will reject that case anyway.
+          const lockable = fs.existsSync(lockTarget) ? lockTarget : legacyDir;
+          if (!fs.existsSync(lockable)) {
+            console.error(`Legacy dataDir does not exist: "${legacyDir}"`);
+            process.exit(1);
+          }
+          releaseLock = await properLockfile.lock(lockable, {
+            // Wait up to 10s if another migration is in progress.
+            retries: { retries: 10, factor: 1.2, minTimeout: 200, maxTimeout: 2000 },
+            stale: 60_000, // 60s — releases stuck locks from killed processes.
+          });
+        } catch (err) {
+          console.error(
+            `Could not acquire lock on legacy dataDir "${legacyDir}": ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+          console.error(
+            'This usually means another sphere-cli process is currently migrating ' +
+              'or interacting with this dataDir. Wait for it to finish, or remove a ' +
+              'stuck lock file (.lock suffix in the dir).',
+          );
+          await closeSphere();
+          process.exit(1);
+        }
+
         // Track an exit code we want to surface to the shell. We avoid
         // process.exit() inside the try/finally so file handles get
         // closed cleanly on every error path.
@@ -2958,7 +3009,12 @@ async function main() {
             }
             if (!dryRun) {
               console.log(`  Added:           ${result.tokensAdded}`);
-              console.log(`  Skipped:         ${result.tokensSkipped} (already owned / tombstoned)`);
+              console.log(`  Skipped:         ${result.tokensSkipped}`);
+              const sb = result.skippedByCode;
+              if (sb.duplicate > 0) console.log(`    duplicate:     ${sb.duplicate} (already owned)`);
+              if (sb.tombstoned > 0) console.log(`    tombstoned:    ${sb.tombstoned} (previously spent)`);
+              if (sb['genesis-exists'] > 0) console.log(`    genesis-exists:${sb['genesis-exists']} (preserved current state)`);
+              if (sb.unknown > 0) console.log(`    unknown:       ${sb.unknown}`);
               console.log(`  Rejected:        ${result.tokensRejected}`);
             }
             console.log(`  Duration:        ${result.durationMs}ms`);
@@ -3024,6 +3080,16 @@ async function main() {
         } finally {
           await legacyStorage.disconnect().catch(() => {});
           await legacyTokenStorage.shutdown().catch(() => {});
+          // Release the cross-process lock LAST so concurrent invocations
+          // remain blocked until our cleanup finishes.
+          if (releaseLock) {
+            await releaseLock().catch((err: unknown) => {
+              console.error(
+                `Warning: failed to release lock on "${legacyDir}": ` +
+                  `${err instanceof Error ? err.message : String(err)}`,
+              );
+            });
+          }
         }
 
         // If something went wrong, log + set exit code; cleanup above

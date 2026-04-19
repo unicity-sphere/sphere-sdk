@@ -347,6 +347,46 @@ describe('PaymentsModule.exportTokens / importTokens', () => {
       expect(result.added).toHaveLength(0);
       expect(result.skipped).toHaveLength(1);
       expect(result.skipped[0].genesisTokenId).toBe(TOKEN_A_ID);
+      // Granular code: previous-spend, not just an opaque "skipped".
+      expect(result.skipped[0].code).toBe('tombstoned');
+    });
+
+    it('reports duplicate skip code for an exact (tokenId, stateHash) match', async () => {
+      const tokenUi = buildToken({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      await module.addToken(tokenUi);
+
+      const dupTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      const result = await module.importTokens([dupTxf]);
+
+      expect(result.added).toHaveLength(0);
+      expect(result.skipped).toHaveLength(1);
+      expect(result.skipped[0].code).toBe('duplicate');
+    });
+
+    it('reports genesis-exists skip code in strict mode for a different state', async () => {
+      const tokenUi = buildToken({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      await module.addToken(tokenUi);
+
+      const sameGenesisTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_2 });
+      const result = await module.importTokens([sameGenesisTxf], {
+        skipExistingGenesis: true,
+      });
+
+      expect(result.added).toHaveLength(0);
+      expect(result.skipped).toHaveLength(1);
+      expect(result.skipped[0].code).toBe('genesis-exists');
+    });
+
+    it('lenient mode: same-genesis import marks added entry as state-replaced', async () => {
+      const tokenUi = buildToken({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      await module.addToken(tokenUi);
+
+      const newStateTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_2 });
+      const result = await module.importTokens([newStateTxf]);
+
+      expect(result.added).toHaveLength(1);
+      expect(result.added[0].code).toBe('state-replaced');
+      expect(result.added[0].note).toMatch(/Replaced/);
     });
 
     it('reports rejection reason for malformed TxfToken (no tokenId)', async () => {
