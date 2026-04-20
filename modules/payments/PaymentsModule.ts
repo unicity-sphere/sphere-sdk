@@ -548,21 +548,17 @@ function fromHex(hex: string): Uint8Array {
 
 /**
  * Compute a deterministic dedup key for a pending-mint (pre-finalization)
- * token, whose genesis.inclusionProof.authenticator.stateHash is not yet
- * available.
+ * token, whose `getCurrentStateHash` is empty because the aggregator
+ * hasn't returned an inclusion proof yet.
  *
- * The real stateHash of a mint gets anchored only after the aggregator
- * returns the inclusion proof. Until then, importTokens cannot
- * deduplicate pending tokens by (tokenId, stateHash) because stateHash
- * is empty. Instead, we hash the genesis DATA itself — `tokenId`,
- * `tokenType`, `salt`, `recipient`, `tokenData`, `recipientDataHash`
- * — to produce a stable identifier. A genesis with the same content
- * produces the same fallback key, so two imports of the same pending
- * mint collapse cleanly as `duplicate` instead of fighting via
- * addToken's state-update path.
+ * We hash a canonical JSON encoding of the GENESIS DATA so the same
+ * genesis always produces the same key. JSON.stringify (not pipe-
+ * delimiting) ensures that any future field additions, `null` vs
+ * `undefined` vs `''` distinctions, and field-values containing
+ * special characters don't cause cross-genesis collisions.
  *
- * The returned key is prefixed with `pending-` so it can never collide
- * with a real stateHash (which is always a 64-hex SHA-256).
+ * The returned key is prefixed `pending-` so it can never collide
+ * with a real state hash (which is always a 64-hex SHA-256).
  *
  * @param txf - A TxfToken (typically the incoming import candidate).
  * @returns `pending-<64 hex>` — deterministic per genesis content.
@@ -580,37 +576,49 @@ function pendingMintDedupKey(txf: {
   };
 }): string {
   const d = txf.genesis?.data ?? {};
-  const fields = [
-    d.tokenId ?? '',
-    d.tokenType ?? '',
-    d.salt ?? '',
-    d.recipient ?? '',
-    d.tokenData ?? '',
-    d.recipientDataHash ?? '',
-  ].join('|');
-  const digest = sha256(new TextEncoder().encode(fields));
+  // Canonical JSON (fixed field order) preserves null-vs-undefined-vs-''
+  // distinctions and is robust against any special characters in field
+  // values. We explicitly list the fields rather than stringifying `d`
+  // to avoid unrelated keys on `d` (e.g., future SDK additions) changing
+  // the key for tokens already minted against the old schema.
+  const canonical = JSON.stringify([
+    d.tokenId ?? null,
+    d.tokenType ?? null,
+    d.salt ?? null,
+    d.recipient ?? null,
+    d.tokenData ?? null,
+    d.recipientDataHash ?? null,
+  ]);
+  const digest = sha256(new TextEncoder().encode(canonical));
   let hex = '';
   for (const b of digest) hex += b.toString(16).padStart(2, '0');
   return 'pending-' + hex;
 }
 
 /**
- * Given an incoming TxfToken OR an existing Token's TXF-shaped
- * sdkData, return the dedup key to use for duplicate detection in
- * `importTokens`:
- *   - the real `stateHash` when it exists (finalized tokens)
+ * Given an incoming TxfToken, return the dedup key to use for
+ * duplicate detection in `importTokens`:
+ *   - the token's CURRENT state hash when available (via
+ *     `getCurrentStateHash`, which looks at the last transaction's
+ *     `newStateHash` first, then authenticator, then genesis)
  *   - the pending-mint fallback otherwise
+ *
+ * Using `getCurrentStateHash` rather than reading only the genesis
+ * path is load-bearing: a token that has been transferred has a
+ * genesis hash that NEVER changes, but a current state hash that
+ * tracks the latest transaction. If we keyed on genesis, two
+ * different live states of the same token would collide as
+ * "duplicate" and valid state updates would be silently dropped
+ * on re-import.
  *
  * The return is a non-empty opaque string suitable for equality
  * comparison. Different shapes (real vs pending) never collide
  * because the pending variant is prefixed.
  */
-function effectiveDedupKey(txf: Parameters<typeof pendingMintDedupKey>[0] & {
-  genesis?: {
-    inclusionProof?: { authenticator?: { stateHash?: string } };
-  };
-}): string {
-  const stateHash = txf.genesis?.inclusionProof?.authenticator?.stateHash ?? '';
+function effectiveDedupKey(
+  txf: Parameters<typeof pendingMintDedupKey>[0] & Parameters<typeof getCurrentStateHash>[0],
+): string {
+  const stateHash = getCurrentStateHash(txf as TxfToken) ?? '';
   if (stateHash) return stateHash;
   return pendingMintDedupKey(txf);
 }
@@ -3476,21 +3484,21 @@ export class PaymentsModule {
         continue;
       }
 
-      // Determine the incoming state hash from the TxfToken's
-      // inclusion-proof authenticator. Same field addToken would
-      // extract via parseSdkDataCached. For pending-mint tokens
-      // this is empty '' — we fall back to a content-hash of the
-      // genesis (see `effectiveDedupKey`) so pending imports
-      // still deduplicate cleanly.
-      const incomingStateHash =
-        txf.genesis?.inclusionProof?.authenticator?.stateHash ?? '';
+      // Effective dedup key combines current-state hash (for
+      // finalized tokens) and a genesis-content hash (for pending-
+      // mint tokens). See `effectiveDedupKey`.
       const incomingDedupKey = effectiveDedupKey(txf);
 
-      // -- Pre-check 1: tombstoned (previously spent). Only meaningful
-      //    when we have a real stateHash — tombstones are keyed on
-      //    the concrete post-spend hash, which pending tokens don't
-      //    have. A pending token can never be "already spent" (by
-      //    definition its first state transition hasn't happened yet).
+      // Real stateHash for the tombstone check — via the canonical
+      // `parseSdkDataCached` path. Tombstones are only keyed on
+      // concrete post-spend hashes, so pending tokens can never
+      // match one (by definition their first state transition
+      // hasn't happened yet).
+      const incomingStateHash = extractStateHashFromSdkData(
+        JSON.stringify(txf),
+      );
+
+      // -- Pre-check 1: tombstoned (previously spent).
       if (incomingStateHash && this.isStateTombstoned(genesisTokenId, incomingStateHash)) {
         skipped.push({
           genesisTokenId,
@@ -3503,26 +3511,38 @@ export class PaymentsModule {
       // Scan in-memory wallet for matching genesis / state. Track
       // the matched token's status so we can distinguish a true
       // "state replaced a live state" from "stale bookkeeping record
-      // (spent/invalid) was overwritten" downstream. Uses the
-      // effective dedup key so pending-mint duplicates are caught.
+      // (spent/invalid) was overwritten" downstream.
+      //
+      // For the dedup-key comparison we reuse `parseSdkDataCached`
+      // via extractStateHashFromSdkData rather than re-parsing each
+      // existing token's sdkData in the loop (was O(N×M) JSON.parse
+      // on large wallets). For pending existing tokens with empty
+      // stateHash, we fall through to the one-off JSON.parse — rare
+      // path.
       let exactDuplicateLocalId: string | null = null;
       let genesisMatchLocalId: string | null = null;
       let genesisMatchStatus: TokenStatus | null = null;
+      let genesisMatchIsPending = false;
       for (const [existingId, existing] of this.tokens) {
         const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
         if (existingTokenId !== genesisTokenId) continue;
 
-        // Compare via effective dedup key: real stateHash if present,
-        // content-hash of genesis otherwise. Both-pending with same
-        // genesis → key match → duplicate. One-finalized + one-pending
-        // → different keys → falls through to genesis-match branch.
+        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
         let existingDedupKey: string;
-        if (existing.sdkData) {
+        let existingIsPending = false;
+        if (existingStateHash) {
+          // Fast path: both via the cached parser — no re-parse.
+          existingDedupKey = existingStateHash;
+        } else if (existing.sdkData) {
+          // Pending existing (empty stateHash). Compute the fallback
+          // the same way we did for the incoming token.
           try {
             const existingTxf = JSON.parse(existing.sdkData) as Parameters<typeof effectiveDedupKey>[0];
             existingDedupKey = effectiveDedupKey(existingTxf);
+            existingIsPending = true;
           } catch {
-            // Malformed existing sdkData — treat as genesis-only match.
+            // Malformed sdkData — treat as genesis-only match with
+            // no identifiable current state.
             genesisMatchLocalId = existingId;
             genesisMatchStatus = existing.status;
             continue;
@@ -3539,6 +3559,7 @@ export class PaymentsModule {
         }
         genesisMatchLocalId = existingId;
         genesisMatchStatus = existing.status;
+        genesisMatchIsPending = existingIsPending;
       }
 
       // -- Pre-check 2: exact duplicate.
@@ -3552,13 +3573,26 @@ export class PaymentsModule {
       }
 
       // -- Pre-check 3: strict-mode genesis collision.
+      // Exception: if the wallet's existing copy is a pending-mint
+      // (empty current stateHash) and the incoming is finalized
+      // (has a real stateHash), allow the upgrade — the incoming
+      // carries strictly more information than what we already have,
+      // and refusing would leave the wallet stuck on the pending
+      // record. This is the common "migrated legacy while mint was
+      // in flight, now rerun after finalization" pattern.
       if (options?.skipExistingGenesis && genesisMatchLocalId) {
-        skipped.push({
-          genesisTokenId,
-          code: 'genesis-exists',
-          reason: 'Genesis tokenId owned at a different state; strict mode preserves current state',
-        });
-        continue;
+        const incomingIsPending = incomingDedupKey.startsWith('pending-');
+        const upgradingPendingToFinalized = genesisMatchIsPending && !incomingIsPending;
+        if (!upgradingPendingToFinalized) {
+          skipped.push({
+            genesisTokenId,
+            code: 'genesis-exists',
+            reason: 'Genesis tokenId owned at a different state; strict mode preserves current state',
+          });
+          continue;
+        }
+        // Fall through — the incoming finalized state will replace
+        // the prior pending record via addToken's state-update path.
       }
 
       // Build the UI token. Failures here are malformed-input

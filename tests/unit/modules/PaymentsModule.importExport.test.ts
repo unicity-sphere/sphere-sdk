@@ -84,9 +84,19 @@ const STATE_HASH_2 = '2222000000000000000000000000000000000000000000000000000000
 
 function buildTxf(opts: {
   tokenId: string;
-  stateHash: string;
+  stateHash: string;  // "genesis" stateHash; for transacted tokens see `transactions`
   coinId?: string;
   amount?: string;
+  /**
+   * Optional transactions array. When non-empty, `getCurrentStateHash`
+   * returns `lastTx.newStateHash` instead of the genesis's stateHash —
+   * which is the correct "current state" identity for dedup.
+   */
+  transactions?: Array<{
+    previousStateHash?: string;
+    newStateHash?: string;
+    predicate?: string;
+  }>;
 }): TxfToken {
   return {
     version: '2.0',
@@ -114,7 +124,7 @@ function buildTxf(opts: {
       },
     },
     state: { data: 'statedata', predicate: 'predicate' },
-    transactions: [],
+    transactions: (opts.transactions ?? []) as TxfToken['transactions'],
   };
 }
 
@@ -392,6 +402,56 @@ describe('PaymentsModule.exportTokens / importTokens', () => {
       }
     });
 
+    it('transacted tokens dedup on CURRENT state (lastTx.newStateHash), not genesis', async () => {
+      // Regression for steelman finding: `effectiveDedupKey` must
+      // use `getCurrentStateHash` (which prefers lastTx.newStateHash)
+      // rather than reading only the genesis hash. Without this fix,
+      // two different live states of the same token — same genesis,
+      // different lastTx — collide as "duplicate" and valid state
+      // updates get silently dropped on re-import.
+      const stateAfterTx1 = 'ee' + '11'.repeat(31);
+      const stateAfterTx2 = 'ff' + '22'.repeat(31);
+
+      // Wallet owns TOKEN_A at state-after-tx1.
+      const tokenAtState1 = buildToken({
+        tokenId: TOKEN_A_ID,
+        stateHash: STATE_HASH_1,  // genesis hash (never changes)
+      });
+      // Manually stamp the current-state marker into sdkData so
+      // getCurrentStateHash returns stateAfterTx1 (not the genesis).
+      tokenAtState1.sdkData = JSON.stringify(
+        buildTxf({
+          tokenId: TOKEN_A_ID,
+          stateHash: STATE_HASH_1,
+          transactions: [
+            {
+              previousStateHash: STATE_HASH_1,
+              newStateHash: stateAfterTx1,
+              predicate: 'tx1-predicate',
+            },
+          ],
+        }),
+      );
+      await module.addToken(tokenAtState1);
+
+      // Now import the SAME token at a DIFFERENT later state.
+      const importAtState2 = buildTxf({
+        tokenId: TOKEN_A_ID,
+        stateHash: STATE_HASH_1,  // same genesis
+        transactions: [
+          { previousStateHash: STATE_HASH_1, newStateHash: stateAfterTx1, predicate: 'tx1' },
+          { previousStateHash: stateAfterTx1, newStateHash: stateAfterTx2, predicate: 'tx2' },
+        ],
+      });
+
+      // In lenient mode, it must be recognised as a different state —
+      // NOT as a duplicate of the current record.
+      const result = await module.importTokens([importAtState2]);
+      expect(result.skipped).toHaveLength(0);
+      expect(result.added).toHaveLength(1);
+      expect(result.added[0].code).toBe('state-replaced');
+    });
+
     it('pending-mint tokens deduplicate correctly via genesis fallback key', async () => {
       // Regression for steelman finding: a token without a finalized
       // stateHash (pending mint, mid-aggregator) used to fall through
@@ -413,6 +473,42 @@ describe('PaymentsModule.exportTokens / importTokens', () => {
       expect(second.added).toHaveLength(0);
       expect(second.skipped).toHaveLength(1);
       expect(second.skipped[0].code).toBe('duplicate');
+    });
+
+    it('strict mode allows pending→finalized upgrade (pending existing, finalized incoming)', async () => {
+      // Regression for steelman LOW finding: strict mode was refusing
+      // genuine upgrades. If the wallet has a pending-mint record and
+      // we import the SAME token now that it is finalized, the
+      // finalized state carries strictly more information and should
+      // replace the pending record — even in strict mode. Without
+      // this exception, users would be stuck with pending records
+      // they can't spend and can't resolve via re-migration.
+      const pendingTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: '' });
+      await module.importTokens([pendingTxf]);
+
+      const finalizedTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      const result = await module.importTokens([finalizedTxf], {
+        skipExistingGenesis: true,
+      });
+      expect(result.skipped).toHaveLength(0);
+      expect(result.added).toHaveLength(1);
+      expect(result.added[0].code).toBe('state-replaced');
+    });
+
+    it('strict mode still refuses finalized→pending downgrades and finalized↔finalized conflicts', async () => {
+      // Negative of the previous test: the strict upgrade is one-way.
+      // A finalized existing + pending incoming is NOT an upgrade —
+      // strict mode correctly refuses to regress.
+      const finalizedTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      await module.importTokens([finalizedTxf]);
+
+      const pendingTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: '' });
+      const result = await module.importTokens([pendingTxf], {
+        skipExistingGenesis: true,
+      });
+      expect(result.added).toHaveLength(0);
+      expect(result.skipped).toHaveLength(1);
+      expect(result.skipped[0].code).toBe('genesis-exists');
     });
 
     it('pending + finalized with the same genesis are NOT duplicates (different states)', async () => {
