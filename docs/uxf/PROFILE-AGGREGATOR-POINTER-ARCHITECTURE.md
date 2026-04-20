@@ -1,9 +1,9 @@
 # UXF Profile — Aggregator-Anchored OpLog Pointer
 
-**Status:** Draft v2 — revised after reviewer consolidation
+**Status:** Draft v3 — arch↔spec byte-level reconciliation
 **Date:** 2026-04-20
 **Supersedes:** `profile/profile-ipns.ts` (IPNS snapshot stopgap)
-**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) (bit-level formulas, algorithms, error codes)
+**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
 **Related:**
 - [`docs/uxf/PROFILE-ARCHITECTURE.md`](./PROFILE-ARCHITECTURE.md) §2.3 (multi-bundle model), §7.6 (migration), §2.1 (global-keys model)
 - [`state-transition-sdk`](https://github.com/unicitylabs/state-transition-sdk) — all cryptographic primitives are consumed from this SDK wherever possible (§4.6)
@@ -118,7 +118,7 @@ The aggregator operator (and any passive observer with database access) sees lea
 - fingerprint "this request ID family" as belonging to the Profile-pointer product,
 - test which gateway serves which CAR bundle and cross-correlate with wallet activity.
 
-XOR-blinding with `xorKey(V, side) = HKDF-Expand(xorSeed, info=[side] || be32(V), L=32)` (§4.3) gives each leaf the distribution of uniformly-random 32-byte strings. Without `xorSeed`, an observer cannot distinguish a blinded leaf from any other 32-byte random payload the aggregator holds.
+XOR-blinding with `xorKey_{side, V} = SHA-256(xorSeed || [side] || be32(V) || bytes_of("xor"))` (bare SHA-256 via DataHasher; see §4.3) gives each leaf the distribution of uniformly-random 32-byte strings. Without `xorSeed`, an observer cannot distinguish a blinded leaf from any other 32-byte random payload the aggregator holds.
 
 ### 2.5 Why exclusion proofs as the "end" signal?
 
@@ -134,7 +134,7 @@ Any party holding `pointerSecret` can compute the four request IDs, fetch the fo
 
 ### 2.6 One-sentence publish flow
 
-> *Compute next version `V`; persist `(V, H(cidBytes))` to local crash-safety storage (§7.2); pin the bundle CAR to IPFS; derive `r_A(V)`, `r_B(V)`, `xorKey(V,A)`, `xorKey(V,B)` via HKDF; XOR-blind the CID halves (with deterministic padding — §4.5); sign two aggregator commitments via the SDK's `Authenticator.create(signingService, transactionHash, stateHash)`; submit both in parallel via the aggregator client; confirm both succeeded via `InclusionProof.verify(trustBase, requestId)`.*
+> *Compute next version `V`; persist `(V, H(cidBytes))` to local crash-safety storage (§7.2); pin the bundle CAR to IPFS; derive `r_A(V)`, `r_B(V)` via the SDK's `RequestId.createFromImprint` formula (§4.3) and derive `xorKey_{A,V}`, `xorKey_{B,V}` as bare SHA-256 over `xorSeed || [side] || be32(V) || "xor"`; XOR-blind the CID halves (with deterministic padding — §4.5); sign two aggregator commitments via the SDK's `Authenticator.create(signingService, transactionHash, stateHash)`; submit both in parallel via the aggregator client; confirm both succeeded via `InclusionProof.verify(trustBase, requestId)`.*
 
 ### 2.7 One-sentence recovery flow
 
@@ -262,16 +262,19 @@ Let `mk` denote the wallet's 32-byte secp256k1 private key — **the same key us
       ├── HKDF-Expand(info = "uxf-profile-pointer-xor-v1",  L=32)  →  xorSeed
       │                                                              │
       │                                                              ▼
-      │                                       xorKey(side, V) = HKDF-Expand(xorSeed,
-      │                                                                    info=[side]||be32(V),
-      │                                                                    L=32)
+      │                                       xorKey_{side, V} = SHA-256(xorSeed ||
+      │                                                                  [side] ||
+      │                                                                  be32(V) ||
+      │                                                                  bytes_of("xor"))
+      │                                       (bare SHA-256 via DataHasher; 40-byte preimage, 32-byte output)
       │
       └── HKDF-Expand(info = "uxf-profile-pointer-pad-v1",  L=32)  →  padSeed
                                                                      │
                                                                      ▼
-                                             padding(V) = HKDF-Expand(padSeed,
-                                                                      info=[side]||be32(V),
-                                                                      L=PADDING_LEN)
+                                             padBytes_V = HKDF-Expand(padSeed,
+                                                                      info = be32(V) || bytes_of("pad"),
+                                                                      L = 63 − cidLen)
+                                             (shared across both sides)
 ```
 
 The four info strings are:
@@ -295,7 +298,7 @@ These use **`state-transition-sdk` primitives exclusively** — this design does
 
 | Name | Derivation |
 |---|---|
-| `stateHashDigest(side, V)` | `DataHasher(SHA256).update(pointerSecret \|\| [side] \|\| be32(V) \|\| "state").digest()` → `DataHash` |
+| `stateHashDigest(side, V)` | `DataHasher(SHA256).update(xorSeed).update([side]).update(be32(V)).update(bytes_of("state")).digest()` → `DataHash` (42-byte preimage) |
 | `stateHash(side, V).imprint` | 2-byte algorithm tag (`[0x00, 0x00]` for SHA-256) ‖ 32-byte digest — provided by `DataHash.imprint` |
 | `requestId(side, V)` | `RequestId.createFromImprint(signingPubKey, stateHash(side, V).imprint)` — **this is the canonical SDK formula**; equivalent to `sha256(signingPubKey \|\| imprint)` |
 
@@ -332,12 +335,15 @@ CIDs longer than 63 bytes are rejected at publish time with `AGGREGATOR_POINTER_
 
 ### 4.5 Deterministic padding (reviewer W-5)
 
-Padding bytes are NOT generated from a CSPRNG. They are derived deterministically:
+Padding bytes are NOT generated from a CSPRNG. They are derived deterministically, **once per version and shared across both sides** (not per-side):
 
 ```
-PADDING_LEN      = 64 − 1 − L          (always ≥ 0 since L ∈ [1, 63])
-padding          = HKDF-Expand(padSeed, info=[side] || be32(V), L=PADDING_LEN)
+cidLen       = len(cidBytes)           (1 ≤ cidLen ≤ 63)
+padLength    = 63 − cidLen             (always ≥ 0)
+padBytes_V   = HKDF-Expand(padSeed, info = be32(V) || bytes_of("pad"), L = padLength)
 ```
+
+The single `padBytes_V` buffer occupies plaintext offsets `[1 + cidLen .. 64)` of the 64-byte envelope (spanning side A and side B, see §4.4 layout); there is no per-side padding.
 
 Benefits:
 
@@ -345,7 +351,7 @@ Benefits:
 - **No CSPRNG dependency** at publish time.
 - Privacy-neutral: `padSeed` is secret-derived; the ciphertext is still uniformly-random-looking to any observer without `pointerSecret`.
 
-Under the random-oracle model, `padding(V)` is independent of `xorKey(V)` and `stateHashDigest(V)` because all three use different HKDF info strings.
+Under the random-oracle model, `padBytes_V` is independent of `xorKey_{side, V}` and `stateHashDigest_{side, V}` because padding derives from `padSeed` under a `"pad"` suffix, while the `xorKey` and `stateHashDigest` are bare SHA-256 over `xorSeed`-prefixed preimages under `"xor"` and `"state"` suffixes respectively (see §4.3). Domain separation via distinct seeds and distinct suffixes makes the three outputs computationally independent.
 
 ### 4.6 SDK primitives used (reviewer N-4)
 
@@ -355,7 +361,7 @@ Every cryptographic or aggregator-facing operation in this scheme maps onto an e
 |---|---|
 | HKDF-SHA256 from wallet secret | `@noble/hashes/hkdf` — already used in `impl/shared/ipfs/ipns-key-derivation.ts`. Non-SDK dependency, permitted. |
 | SHA-256 digest | `new DataHasher(HashAlgorithm.SHA256).update(bytes).digest()` — returns a `DataHash` |
-| Derive signing keypair from seed | `SigningService.createFromSecret(signingSeed)` or equivalent SDK constructor — returns a service whose `publicKey` is the 33-byte compressed secp256k1 pubkey |
+| Derive signing keypair from seed | `SigningService.createFromSecret(signingSeed)` — returns a service whose `publicKey` is the 33-byte compressed secp256k1 pubkey. **Rationale (load-bearing): the `createFromSecret` form SHA-256-hashes its input before using it as the secp256k1 private-key scalar. This provides free rejection-sampling-equivalent uniformity across the curve's group order and is required for interoperability between implementations. The raw constructor `new SigningService(seed)` would produce a DIFFERENT `signingPubKey` for the same seed and MUST NOT be used.** |
 | Compute request ID | `RequestId.createFromImprint(signingPubKey, stateHash.imprint)` |
 | Build authenticator | `Authenticator.create(signingService, transactionHash, stateHash)` |
 | Build submission | `SubmitCommitmentRequest` (fields: `requestId`, `transactionHash`, `authenticator`) |
@@ -532,15 +538,17 @@ A wallet that has never published (new mnemonic, freshly imported, no activity) 
 
 **Previous behavior (rejected):** log a warning and proceed with empty state, letting the next publish act as if `V = 1` were the first version. This is unsafe — if the aggregator was merely unreachable, the next publish overwrites a legitimate remote history at `V = 1`.
 
-**Mandated behavior:**
+**Mandated behavior (narrative; spec §10.2 owns the byte-level state machine):**
 
-- `initialize()` proceeds with empty state only for **read-only** operation.
-- The wallet enters a **"pointer not verified" state** (emitting `pointer:publish_blocked`).
-- Any subsequent user-originated write that enters the local OpLog sets a **publish-blocked flag**.
-- `publishAggregatorPointerBestEffort` refuses to run while this flag is set. Before publishing, the SDK MUST either:
-  - (a) successfully probe the aggregator at `r_A(1)` and `r_B(1)` and obtain verified **exclusion** proofs (confirming "no pointer exists yet"), OR
-  - (b) successfully discover a `V_true > 0` via the full recovery flow, fetch the CAR, merge, and bump `localVersion` to `V_true`.
-- Only then is the publish-blocked flag cleared.
+The wallet maintains a per-wallet **persistent** BLOCKED flag — the canonical storage key is `BLOCKED_FLAG_KEY = "profile.pointer.blocked." + hex(signingPubKey)` (spec §10.2.1). The flag survives process restarts. An absent key is equivalent to `false`. When BLOCKED is set, `publishAggregatorPointerBestEffort` refuses to run and the publish attempt surfaces `AGGREGATOR_POINTER_UNREACHABLE_RECOVERY_BLOCKED`. The state flips as follows:
+
+- **SET BLOCKED** when ALL of these hold (spec §10.2.2): (i) recovery (`initialize()` or a subsequent reconciliation) hit a **categorical** transport error (timeout, connection refused, DNS failure, TLS error — NOT a transient 5xx); (ii) the local OpLog contains at least one **user-originated** write; (iii) at least one retry with exponential backoff has already failed. Re-SET on the same category of error during a subsequent publish.
+- **User-originated write** is defined as an OpLog entry authored by THIS device's signing identity — `entry.signedBy == localSigningPubKey` (spec §10.2.3). Replicated entries from other devices (OrbitDB gossipsub, Nostr DM ingest, any inbound replication) are NOT user-originated and do NOT justify blocking.
+- **CLEAR BLOCKED** only after EITHER (spec §10.2.4):
+  - (a) a trustlessly-verified **exclusion** proof at `requestId_{A,1}` AND `requestId_{B,1}` (applies only when `localVersion == 0`), OR
+  - (b) a successful `recoverLatest()` yielding `V_true > 0` AND the CAR is fetched from IPFS AND the remote bundle is merged into the local OpLog.
+  Reachability-only probes, UI "dismiss" actions, and user-preference toggles MUST NOT clear BLOCKED.
+- **User override protocol** (optional; spec §10.2.5). For permanent-outage scenarios (regional outage, deprecated testnet, air-gapped recovery), implementations MAY expose an opt-in, per-call, capability-gated override that bypasses BLOCKED. Each use emits `pointer:publish_override_used { version, reason }` telemetry. v1 implementations MAY omit the override entirely.
 
 This preserves user-visible write semantics (the wallet appears to function, local OpLog fills) while guaranteeing that the next on-aggregator commit cannot silently overwrite a remote history.
 
@@ -597,13 +605,13 @@ This preserves user-visible write semantics (the wallet appears to function, loc
 
 **How the vulnerability arises.** A crash between "compute payload for CID₁" and "submit" followed by a restart where the wallet has advanced OpLog state (now reflecting CID₂) and re-uses `V` would produce a second submission at the same `(V, side)` with a different plaintext. The aggregator rejects the second request (duplicate requestId) — but if the first submission had partially leaked (e.g., side A landed, side B didn't, and the first run's side B was never submitted), a passive observer could be in possession of partial ciphertexts for both plaintexts.
 
-**Mitigation — persist before submitting.** Before computing payloads for a given `V`, the publisher MUST persist `(V, H(cidBytes))` to local storage (key: `profile.pointer.pending.{V}`). On restart:
+**Mitigation — the `pending_version` marker (narrative; spec §7.1 owns the byte-level discipline).** Before computing payloads for a given `V`, the publisher MUST persist a `(v, cidHash)` record — spec §7.1 calls this the `pending_version` marker — keyed under `PENDING_VERSION_KEY = "profile.pointer.pending_version." + hex(signingPubKey)` (per-wallet scoping). The critical section (read marker → write marker → submit → clear marker) runs under the per-wallet exclusive mutex `MUTEX_KEY = "profile.pointer.publish.lock"` (spec §7.1.1). The marker write MUST be **durable** before any downstream derivation runs — IndexedDB backends await `transaction.oncomplete`; file-based backends issue an explicit `fsync`; storage backends that cannot guarantee durability MUST refuse to initialize the pointer layer (spec §7.1.3). `cidHash` is a full-length `SHA-256(cidBytes)` (32 bytes) — not truncated. On restart:
 
-- If no pending tuple exists, proceed normally.
-- If a pending tuple `(V, H(cidBytes_prev))` exists AND the current CID bytes hash matches, this is a legitimate retry of the *same* CID at the *same* `V` — retry with byte-identical payloads (safe; requestIds are deterministic, aggregator treats duplicate as idempotent-accept).
-- If a pending tuple exists AND the current CID bytes hash does NOT match, the publisher MUST refuse to reuse `V`. It instead increments to `V + 1`, persists `(V+1, H(new cidBytes))`, and submits there. The pending entry for `V` is marked abandoned (or probed via `r_A(V)` to learn whether the aggregator recorded the previous attempt).
+- If no marker exists, proceed normally.
+- If a marker `(v, cidHash_prev)` exists AND the current `SHA-256(cidBytes)` matches `cidHash_prev`, this is a legitimate retry of the *same* CID at the *same* `v` — retry with byte-identical payloads (safe; `requestId`s are deterministic, aggregator treats duplicate as idempotent-accept).
+- If a marker exists AND the hashes differ (a crashed publisher is re-entering with a DIFFERENT CID), the publisher MUST NOT reuse `v`. The rollback-safe rule (spec §7.1): treat any `previousEntry.v >= v` as a signal to advance, setting `v = max(v, previousEntry.v) + 1`, persisting a fresh marker at the new `v`, and submitting there. The stale marker is cleared only after the new submission resolves.
 
-The pending tuples form a small append-only journal. Entries older than the current `localVersion` can be compacted by a background task.
+The marker is cleared only after a successful publish (both sides committed, `localVersion` persisted) or after the publisher definitively abandons the version (e.g., a non-retryable `REQUEST_ID_MISMATCH`). See spec §7.1.5 and §7.1.6 for exhaustive transition rules.
 
 ### 7.3 Retry backoff with jitter (reviewer W-3)
 
@@ -613,7 +621,7 @@ Deterministic payloads allow idempotent retry. Backoff must include jitter to pr
 backoff(n) = BASE_MS × 2^n × uniform(0.5, 1.5)
 ```
 
-Without jitter, multi-device contention degenerates to synchronous retries at `T`, `2T`, `4T`, `...`, re-colliding at every step. The ×0.5..×1.5 jitter range de-synchronizes retries while keeping the base exponential growth. Concrete values live in the spec (`PUBLISH_RETRY_BACKOFF_BASE_MS`, `_MAX_MS`, `PUBLISH_RETRY_BUDGET`).
+Without jitter, multi-device contention degenerates to synchronous retries at `T`, `2T`, `4T`, `...`, re-colliding at every step. The ×0.5..×1.5 jitter range de-synchronizes retries while keeping the base exponential growth. Concrete values live in the spec (`PUBLISH_BACKOFF_BASE_MS`, `PUBLISH_BACKOFF_MAX_MS`, `PUBLISH_RETRY_BUDGET`).
 
 ### 7.4 Events emitted (reviewer W-9)
 
@@ -626,6 +634,7 @@ To match existing SDK patterns (`transfer:confirmed`, `nametag:registered`):
 | `pointer:publish_failed` | `{ version, code }` |
 | `pointer:recovered` | `{ version, bundleCount }` |
 | `pointer:publish_blocked` | `{ reason }` (aggregator unreachable; write staged) |
+| `pointer:publish_override_used` | `{ version, reason }` (emitted only if the user-override path §6.7 / spec §10.2.5 is invoked) |
 
 ---
 
@@ -703,7 +712,7 @@ Out of scope:
 
 ### 9.3 Forward secrecy across versions
 
-Each version uses a fresh `xorKey(side, V) = HKDF-Expand(xorSeed, info=[side] || be32(V), L=32)`. Knowing the plaintext CID at version `V` does not reveal `xorKey(A, V)` or `xorKey(B, V)` without `xorSeed`. Therefore:
+Each version uses a fresh `xorKey_{side, V} = SHA-256(xorSeed || [side] || be32(V) || bytes_of("xor"))` (bare SHA-256 via DataHasher; NOT HKDF-Expand). Knowing the plaintext CID at version `V` does not reveal `xorKey(A, V)` or `xorKey(B, V)` without `xorSeed`. Therefore:
 
 - Compromise of one version's plaintext (e.g., via a leaked IPFS CAR) does NOT compromise any other version's ciphertext.
 - Compromise of the blinded leaf values does NOT compromise the plaintext without `xorSeed`.
@@ -762,33 +771,30 @@ At ~100 ms per RPC and `V_true = 10^6`, ~20 probes ≈ 2 seconds. Seeding from `
 
 ```
 fn findLatestVersion(pointerSecret, signingPubKey, trustBase, localVersion):
-    V_init := max(localVersion, 1024)   // W-7: seed from hint if available
+    // W-7: localVersion was persisted after a successful publish at that V,
+    // so bothSidesIncluded(localVersion) is an invariant; binary-searching
+    // below it would waste probes. Seed lo from localVersion.
+    lo := max(0, localVersion)
+    hi := max(DISCOVERY_INITIAL_VERSION, lo + 1)
 
     // Phase 1: exponential expansion
-    hi := V_init
-    lo := 0
-    while bothSidesIncluded(hi):
+    while probe(hi):
         lo := hi
-        hi := min(hi * 2, HARD_CEILING)
-        if hi == HARD_CEILING and bothSidesIncluded(hi):
-            return Err DISCOVERY_OVERFLOW
+        hi := hi * 2
 
-    // Invariant: bothSidesIncluded(lo) OR lo == 0; neitherFullyIncluded(hi)
-
-    if lo == 0 and not bothSidesIncluded(1):
-        return 0   // no pointer ever published
+    // Invariant: probe(lo) == true (or lo == 0); probe(hi) == false
 
     // Phase 2: binary search on (lo, hi)
     while hi - lo > 1:
         mid := (lo + hi) / 2
-        if bothSidesIncluded(mid):
+        if probe(mid):
             lo := mid
         else:
             hi := mid
-    return lo
+    return lo   // 0 means "no pointer ever published"
 ```
 
-Where `bothSidesIncluded(V)` fetches AND verifies inclusion/exclusion proofs for `r_A(V)` and `r_B(V)` in parallel; unverifiable proofs abort.
+Where `probe(V)` (a.k.a. `bothSidesIncluded(V)`) fetches AND verifies inclusion/exclusion proofs for `r_A(V)` and `r_B(V)` in parallel; unverifiable proofs abort. `DISCOVERY_HARD_CEILING` handling is described in spec §8.2.
 
 ---
 
@@ -913,7 +919,7 @@ Expanded per reviewer W-10. Each row's rejection reason is load-bearing; none of
 | `profile/profile-token-storage-provider.ts` → `recoverFromIpnsSnapshot` | **Removed; replaced** by `recoverFromAggregatorPointer`. |
 | `profile/types.ts` → `ipnsSnapshot` config flag | **Renamed** to `pointerAnchor` (same opt-out semantics). |
 | Local-storage key `profile.ipns.sequence` | **Renamed** to `profile.pointer.version`. No data migration — the legacy key is orphaned in local storage; wiped on any subsequent `StorageProvider.clear()`. |
-| New local-storage key `profile.pointer.pending.{V}` | **Added** for crash-safety tuples (§7.2). |
+| New local-storage keys `profile.pointer.pending_version.{hex(signingPubKey)}`, `profile.pointer.blocked.{hex(signingPubKey)}`, and mutex id `profile.pointer.publish.lock` | **Added** for crash-safety marker, BLOCKED flag, and publish mutex (§7.2, §6.7; spec §7.1, §10.2). |
 | `impl/shared/ipfs/ipns-key-derivation.ts` | **Unchanged.** Still used by the legacy non-Profile IPFS IPNS path. Profile switches to four new HKDF info strings (§4.1). |
 | `tests/unit/profile/profile-token-storage-provider.test.ts` | **Updated.** Tests referencing `publishIpnsSnapshotBestEffort` / `recoverFromIpnsSnapshot` migrate to the new helpers. |
 | `tests/e2e/profile-sync.test.ts` and siblings exercising IPNS isolated-publish | **Updated or removed.** Replace IPNS-publish paths with aggregator-pointer equivalents; drop tests that exercise IPNS-specific semantics no longer reachable. |
@@ -944,21 +950,7 @@ No external consumers read the Profile IPNS records directly — the only reader
 
 ## 16. Open Questions
 
-Unified, single-scheme question list (reviewer N-2). This supersedes both the v1 arch §12.2 list and the v1 spec §15 list.
-
-| # | Question | Owner | Blocker? |
-|---|---|---|---|
-| Q-1 | Is the TOFU trust-base bootstrap (§6.5, step 1) acceptable for v1? If not, is the multi-mirror cross-check (step 2) a required ship gate? | Security | Yes (if step 2 is required for ship) |
-| Q-2 | Confirm `RequestId.createFromImprint(pubkey, imprint)` is the exact SDK call and its output matches `sha256(pubkey ‖ imprint)` including the 2-byte algorithm tag in `imprint`. | SDK team | Yes — affects every request ID derivation |
-| Q-3 | Does the aggregator expose a cheap `has` / `exists` endpoint distinct from `getInclusionProof`? Determines discovery cost — but not correctness. | Aggregator team | No |
-| Q-4 | Maximum tolerable publish latency under contention (sets `PUBLISH_RETRY_BUDGET` and backoff caps). | UX / SDK team | No |
-| Q-5 | Is `DISCOVERY_HARD_CEILING = 2^22` sufficient for foreseeable per-wallet lifetimes? Per-minute publish cadence scenarios may need 2^24. | SDK team | No |
-| Q-6 | Test-vector finalization: compute and freeze vectors in `test-vectors.json` before merge. | Test engineer | Yes |
-| Q-7 | Per-version throwaway signing keys (§9.2 deferred mitigation) — should this be roadmap-tracked explicitly, or left for opportunistic pickup? | Security / SDK team | No |
-| Q-8 | L1-anchored trust base (§6.5 v2) — what is the minimum L1 anchoring mechanism that makes the anchored root verifiable by a fresh wallet? | Unicity Architect | No |
-| Q-9 | Is atomic batched submission of `(r_A, r_B)` at the aggregator protocol layer feasible? Would eliminate partial-publish class entirely. | Unicity Architect | No — current design handles partial correctly |
-| Q-10 | Aggregator-reset migration: does `Profile.resetPointerVersion()` need a confirmation dialog in consuming apps, or can it run silently on detected reset? | UX | No |
-| Q-11 | Should `signingSeed` ever be reused beyond signing pointer commits (e.g., for a future "please locate my OpLog head" public query)? | Security auditor | No — any such reuse requires a new info string and separate threat model |
+The canonical open-items list lives in the companion spec at [`PROFILE-AGGREGATOR-POINTER-SPEC.md` §15.1](./PROFILE-AGGREGATOR-POINTER-SPEC.md#151-remaining-open-items). The spec tracks the items as `O-1 .. O-N` with owner and blocker status. This architecture document does not maintain a parallel list — all questions route through spec §15.1 as the single source of truth. Reviewer sign-off gates referenced elsewhere in this doc (§17) are satisfied by resolving the spec's open items.
 
 ---
 
@@ -977,3 +969,13 @@ Before the follow-up implementation PR is merged, sign-off is required from:
 - **UX reviewer.** Sign off on the `pointer:*` event surface (§7.4), the blocked-publish regime (§6.7), and the `pointer:publish_blocked` user-visible state.
 
 Once all five approvals are recorded and the spec's Reviewer Sign-Off Checklist is ticked, implementation begins.
+
+---
+
+## Revision History
+
+| Version | Date | Summary |
+|---|---|---|
+| v1 | (initial draft) | First architecture writeup paired with a co-drafted spec v1. |
+| v2 | 2026-04-20 | Reviewer consolidation: unified Q-list, reviewer findings (C-1..C-6, W-1..W-10, N-1..N-10) incorporated. |
+| v3 | 2026-04-20 | Byte-for-byte alignment with spec across stateHash preimage (`xorSeed`, not `pointerSecret`), xorKey (bare SHA-256 via DataHasher, not HKDF-Expand), padding (shared across both sides, `"pad"` suffix in info), constant naming (`PUBLISH_BACKOFF_BASE_MS`/`PUBLISH_BACKOFF_MAX_MS` — no `RETRY_` infix on timings), discovery init seeded from `localVersion`, BLOCKED state machine hardened (persistent flag, user-originated-write criterion, override protocol), `pending_version` marker discipline cross-referenced to spec §7.1, observability override event added. Spec is canonical; arch narrates. Open Questions routed to spec §15.1 as single source of truth. |
