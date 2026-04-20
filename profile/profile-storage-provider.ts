@@ -331,31 +331,55 @@ export class ProfileStorageProvider implements StorageProvider {
   // ===========================================================================
 
   async connect(): Promise<void> {
-    if (this.status === 'connected') return;
-    this.status = 'connecting';
+    // Two-phase connect that tolerates being called before `setIdentity()`:
+    //
+    //   Phase A — base connection: opens the local cache. Runs once.
+    //   Phase B — OrbitDB attach: requires identity + orbitDb config.
+    //             Runs lazily whenever both become available and the
+    //             database is not yet connected.
+    //
+    // Sphere's startup calls connect() BEFORE identity is known (to
+    // read wallet-exists) and AGAIN after setIdentity(). The previous
+    // implementation returned early on the second call because status
+    // was already 'connected', leaving OrbitDB un-attached. Callers
+    // then hit `ensureConnected` errors during module load.
 
-    try {
-      // 1. Open the local cache provider
-      await this.localCache.connect();
+    // Phase A — idempotent base connection
+    if (this.status !== 'connected' && this.status !== 'connecting') {
+      this.status = 'connecting';
+      try {
+        await this.localCache.connect();
+        this.status = 'connected';
+        this.log('Local cache connected');
+      } catch (err) {
+        this.status = 'error';
+        throw new ProfileError(
+          'PROFILE_NOT_INITIALIZED',
+          `Failed to connect ProfileStorageProvider (local cache): ${err instanceof Error ? err.message : String(err)}`,
+          err,
+        );
+      }
+    }
 
-      // 2. Open OrbitDB via adapter (requires identity to have been set)
-      if (this.identity && this.options?.config?.orbitDb) {
+    // Phase B — lazy OrbitDB attach. Fires on every connect() call
+    // until the database is open, so the second call that follows
+    // setIdentity() does the work.
+    if (!this.dbConnected && this.identity && this.options?.config?.orbitDb) {
+      try {
         await this.db.connect({
           ...this.options.config.orbitDb,
           privateKey: this.identity.privateKey,
         });
         this.dbConnected = true;
+        this.log('OrbitDB attached');
+      } catch (err) {
+        this.status = 'error';
+        throw new ProfileError(
+          'PROFILE_NOT_INITIALIZED',
+          `Failed to attach OrbitDB: ${err instanceof Error ? err.message : String(err)}`,
+          err,
+        );
       }
-
-      this.status = 'connected';
-      this.log('Connected');
-    } catch (err) {
-      this.status = 'error';
-      throw new ProfileError(
-        'PROFILE_NOT_INITIALIZED',
-        `Failed to connect ProfileStorageProvider: ${err instanceof Error ? err.message : String(err)}`,
-        err,
-      );
     }
   }
 
@@ -385,7 +409,17 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   isConnected(): boolean {
-    return this.status === 'connected';
+    // Fully connected means local cache AND OrbitDB are both attached.
+    // If an identity + orbitDb config were supplied, the attach must
+    // have completed — otherwise reads will hit the adapter's
+    // ensureConnected() guard. Reporting false in that half-attached
+    // state signals callers (Sphere.initializeProviders) to re-call
+    // connect() so the lazy-attach branch fires.
+    if (this.status !== 'connected') return false;
+    if (this.identity && this.options?.config?.orbitDb && !this.dbConnected) {
+      return false;
+    }
+    return true;
   }
 
   getStatus(): ProviderStatus {

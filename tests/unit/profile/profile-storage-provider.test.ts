@@ -435,4 +435,145 @@ describe('ProfileStorageProvider', () => {
       expect(rawText).not.toBe('test');
     });
   });
+
+  // =========================================================================
+  // Two-phase connect (regression: Sphere.init calls connect() twice)
+  // =========================================================================
+
+  describe('two-phase connect', () => {
+    // Fresh DB mock that STARTS DISCONNECTED so we can observe the
+    // real attach sequence. The suite-wide beforeEach fakes
+    // dbConnected=true, bypassing this path entirely.
+
+    function createUnconnectedDb() {
+      const store = new Map<string, Uint8Array>();
+      let connected = false;
+      const connectCalls: Array<{ privateKey: string; directory?: string }> = [];
+      return {
+        _store: store,
+        _connectCalls: connectCalls,
+        async connect(config: any) {
+          connectCalls.push(config);
+          connected = true;
+        },
+        async put(key: string, value: Uint8Array) {
+          store.set(key, value);
+        },
+        async get(key: string) {
+          return store.get(key) ?? null;
+        },
+        async del(key: string) {
+          store.delete(key);
+        },
+        async all() {
+          return new Map<string, Uint8Array>();
+        },
+        async close() {
+          connected = false;
+        },
+        onReplication() {
+          return () => {};
+        },
+        isConnected() {
+          return connected;
+        },
+      };
+    }
+
+    it('regression: connect() called before setIdentity() then again after → OrbitDB attaches on second call', async () => {
+      // This reproduces the Sphere.init ordering that triggered
+      // PROFILE_NOT_INITIALIZED during `init --profile` in the CLI:
+      //
+      //   1. sphere.create() runs storage.connect() pre-identity
+      //      (to detect wallet-exists). No identity → OrbitDB skip.
+      //   2. After identity is derived, sphere.initializeProviders()
+      //      calls storage.connect() again — but the previous
+      //      implementation's early-return left OrbitDB un-attached.
+      //   3. Module load hits ensureConnected() → throws.
+      //
+      // Post-fix: the second connect() completes the lazy attach.
+      const freshDb = createUnconnectedDb();
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        config: {
+          orbitDb: { privateKey: '__will-be-overridden__', directory: '/tmp/orbitdb-x' },
+        },
+        encrypt: true,
+      });
+
+      // Call 1: no identity yet → local cache connects, OrbitDB skipped.
+      await freshProvider.connect();
+      expect(freshDb.isConnected()).toBe(false);
+      expect(freshDb._connectCalls).toHaveLength(0);
+
+      // Identity arrives.
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      // Call 2: same connect(), but OrbitDB must now attach using the
+      // real private key from the identity.
+      await freshProvider.connect();
+      expect(freshDb.isConnected()).toBe(true);
+      expect(freshDb._connectCalls).toHaveLength(1);
+      expect(freshDb._connectCalls[0].privateKey).toBe(TEST_IDENTITY.privateKey);
+    });
+
+    it('connect() is idempotent once OrbitDB is attached', async () => {
+      const freshDb = createUnconnectedDb();
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-y' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+      await freshProvider.connect();
+      await freshProvider.connect();
+      await freshProvider.connect();
+      expect(freshDb._connectCalls).toHaveLength(1);
+    });
+
+    it('isConnected() returns FALSE between the two connect() calls (so Sphere re-calls connect)', async () => {
+      // Regression for the Sphere.initializeProviders guard:
+      //   if (!this._storage.isConnected()) { await this._storage.connect(); }
+      // If isConnected() returned true after the pre-identity call,
+      // the second call would be skipped and OrbitDB would never attach.
+      const freshDb = createUnconnectedDb();
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-z' },
+        },
+        encrypt: true,
+      });
+
+      // Phase 1: pre-identity connect.
+      await freshProvider.connect();
+      // Local cache is connected, OrbitDB isn't. We must report FALSE
+      // so Sphere's guard re-calls connect() after setIdentity().
+      // (Identity is not yet set → orbitDb config requirement not met → OK)
+      // After setIdentity but before attach, isConnected MUST be false.
+      freshProvider.setIdentity(TEST_IDENTITY);
+      expect(freshProvider.isConnected()).toBe(false);
+
+      // Second connect completes the attach; isConnected flips true.
+      await freshProvider.connect();
+      expect(freshProvider.isConnected()).toBe(true);
+    });
+
+    it('connect() without orbitDb config skips OrbitDB and reports status=connected', async () => {
+      // Edge case: some test setups / custom wiring build a
+      // ProfileStorageProvider without an OrbitDB config (local-only).
+      // The base connection should still succeed.
+      const freshDb = createUnconnectedDb();
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+      await freshProvider.connect();
+      expect(freshProvider.isConnected()).toBe(true);
+      expect(freshDb._connectCalls).toHaveLength(0);
+    });
+  });
 });

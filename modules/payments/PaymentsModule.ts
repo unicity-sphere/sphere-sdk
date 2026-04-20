@@ -1089,11 +1089,36 @@ export class PaymentsModule {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
-            // Address guard: reject data from a different address
+            // Address guard: reject data from a different address.
+            // Three accepted representations in practice:
+            //   - L1 bech32 (legacy file storage writes this)
+            //   - chain pubkey (some providers record the pubkey)
+            //   - Profile short ID (`DIRECT_{first6}_{last6}` — written
+            //     by ProfileTokenStorageProvider, derived from the
+            //     directAddress via computeAddressId)
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
             const currentL1 = this.deps!.identity.l1Address;
             const currentChain = this.deps!.identity.chainPubkey;
-            if (loadedMeta?.address && currentL1 && loadedMeta.address !== currentL1 && loadedMeta.address !== currentChain) {
+            const currentDirect = this.deps!.identity.directAddress;
+            // Compute the Profile short ID from the current identity's
+            // directAddress for comparison. Lazy-import to avoid
+            // dragging profile/ into non-profile builds.
+            let currentProfileShortId: string | null = null;
+            if (currentDirect) {
+              try {
+                const { computeAddressId } = await import('../../profile/types.js');
+                currentProfileShortId = computeAddressId(currentDirect);
+              } catch {
+                // Profile module not available — short ID check is skipped
+              }
+            }
+            if (
+              loadedMeta?.address &&
+              currentL1 &&
+              loadedMeta.address !== currentL1 &&
+              loadedMeta.address !== currentChain &&
+              loadedMeta.address !== currentProfileShortId
+            ) {
               logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
               continue;
             }
