@@ -15,7 +15,7 @@
  * path is gated behind E2E_NETWORK=1 and not run in CI).
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   createPaymentsModule,
   type PaymentsModuleDependencies,
@@ -29,6 +29,7 @@ import type {
 import type { TransportProvider } from '../../../transport';
 import type { OracleProvider } from '../../../oracle';
 import { computeAddressId } from '../../../profile/types';
+import { logger } from '../../../core/logger';
 
 // ---------------------------------------------------------------------------
 // Minimal SDK mocks (match dual-mode test)
@@ -197,26 +198,40 @@ const IDENTITY: FullIdentity = {
 // ---------------------------------------------------------------------------
 
 describe('PaymentsModule address guard', () => {
-  let warnSpy: ReturnType<typeof vi.spyOn>;
+  // Structural log capture: install a custom logger handler so tests don't
+  // depend on the default handler routing to console.warn. Previously this
+  // used `vi.spyOn(console, 'warn')`, which (a) is fragile if the default
+  // handler is reconfigured elsewhere in the suite, and (b) silently passes
+  // "warned=false" if the warning message is reworded.
+  const capturedWarnings: Array<{ tag: string; message: string; args: unknown[] }> = [];
+  let originalHandler: unknown = null;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // logger.warn routes through console.warn in the default logger config.
-    warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    capturedWarnings.length = 0;
+    originalHandler = (globalThis as any).__sphere_sdk_logger__?.handler ?? null;
+    logger.configure({
+      handler: (level, tag, message, ...args) => {
+        if (level === 'warn') capturedWarnings.push({ tag, message, args });
+      },
+    });
   });
 
-  async function loadWithMeta(address: string | null): Promise<{ warned: boolean; warnArg: string | null }> {
+  afterEach(() => {
+    logger.configure({ handler: originalHandler as any });
+  });
+
+  async function loadWithMeta(address: string | null): Promise<{ warned: boolean; warnMessage: string | null }> {
     const provider = createProviderWithData(address !== null ? { address } : null);
     const module = createPaymentsModule({ debug: false, autoSync: false });
     module.initialize(createDeps(provider, IDENTITY));
     await module.load();
-    const calls = warnSpy.mock.calls;
-    const mismatchCall = calls.find((args) =>
-      args.some((a) => typeof a === 'string' && a.includes('address mismatch')),
+    const mismatch = capturedWarnings.find(
+      (w) => w.tag === 'Payments' && w.message.includes('address mismatch'),
     );
     return {
-      warned: mismatchCall !== undefined,
-      warnArg: mismatchCall ? String(mismatchCall.find((a) => typeof a === 'string' && a.includes('address mismatch'))) : null,
+      warned: mismatch !== undefined,
+      warnMessage: mismatch?.message ?? null,
     };
   }
 
@@ -240,12 +255,12 @@ describe('PaymentsModule address guard', () => {
   it('rejects data whose _meta.address is an unrelated short ID', async () => {
     // Address belonging to a different wallet — guard must fire.
     const foreign = 'DIRECT_ffffff_eeeeee';
-    const { warned, warnArg } = await loadWithMeta(foreign);
+    const { warned, warnMessage } = await loadWithMeta(foreign);
     expect(warned).toBe(true);
     // Warning should show all three accepted forms, not just L1.
-    expect(warnArg).toContain('profile=');
-    expect(warnArg).toContain('L1=');
-    expect(warnArg).toContain('chain=');
+    expect(warnMessage).toContain('profile=');
+    expect(warnMessage).toContain('L1=');
+    expect(warnMessage).toContain('chain=');
   });
 
   it('rejects data whose _meta.address is an unrelated L1 bech32', async () => {

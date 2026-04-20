@@ -232,7 +232,7 @@ describe('Profile Integration', () => {
       await mockDb.connect({} as any);
 
       // Access internal connection state
-      (storageA as any).dbConnected = true;
+      (storageA as any).dbStatus = "attached";
       await storageA.set('mnemonic', 'encrypt me');
 
       // Provider B reads from the same OrbitDB with fresh cache
@@ -242,7 +242,7 @@ describe('Profile Integration', () => {
         encrypt: true,
       });
       storageB.setIdentity(TEST_IDENTITY);
-      (storageB as any).dbConnected = true;
+      (storageB as any).dbStatus = "attached";
 
       // Clear cache so it falls through to OrbitDB
       const value = await storageB.get('mnemonic');
@@ -266,7 +266,7 @@ describe('Profile Integration', () => {
         encrypt: false,
       });
       storageA.setIdentity(TEST_IDENTITY);
-      (storageA as any).dbConnected = true;
+      (storageA as any).dbStatus = "attached";
       await storageA.set('mnemonic', 'shared secret');
 
       // Provider B
@@ -276,7 +276,7 @@ describe('Profile Integration', () => {
         encrypt: false,
       });
       storageB.setIdentity(TEST_IDENTITY);
-      (storageB as any).dbConnected = true;
+      (storageB as any).dbStatus = "attached";
 
       // B should see A's data via OrbitDB fallback
       const value = await storageB.get('mnemonic');

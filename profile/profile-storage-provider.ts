@@ -24,6 +24,7 @@ import {
 } from './types';
 import { ProfileError } from './errors';
 import { deriveProfileEncryptionKey, encryptString, decryptString } from './encryption';
+import { logger } from '../core/logger';
 
 // =============================================================================
 // Constants
@@ -319,26 +320,47 @@ export class ProfileStorageProvider implements StorageProvider {
    */
   private status: ProviderStatus = 'disconnected';
   /**
-   * Independent sub-status for the OrbitDB attach phase. Callers inspect
-   * `isConnected()` to see the composite state; this field is intentionally
-   * private so the invariants stay inside this class.
+   * Independent sub-status for the OrbitDB attach phase.
+   *
+   *   'disconnected' → initial / after disconnect
+   *   'attaching'    → Phase B in progress
+   *   'attached'     → OrbitDB is ready for reads/writes
+   *   'error'        → transient failure (may be retried by next connect())
+   *   'fatal'        → permanent failure (e.g. missing dependency); no retry
    */
-  private dbStatus: 'disconnected' | 'attaching' | 'attached' | 'error' = 'disconnected';
+  private dbStatus: 'disconnected' | 'attaching' | 'attached' | 'error' | 'fatal' = 'disconnected';
   private addressId: string | null = null;
   private encryptionEnabled: boolean;
   private debug: boolean;
   /**
-   * Retained for backward-compat with existing guards throughout this file
-   * (e.g. `if (this.dbConnected)` in get/set/clear). Mirrors
-   * `dbStatus === 'attached'`.
+   * Identity pubkey captured at the last successful Phase B attach.
+   * Used by `setIdentity()` to detect a key swap after attach — which
+   * would cause writes encrypted under key-B to hit an OrbitDB whose
+   * access controller was initialised with key-A, silently rejecting
+   * them. The warning gives operators a breadcrumb to diagnose.
    */
-  private dbConnected = false;
+  private attachedChainPubkey: string | null = null;
   /**
    * In-flight connect() promise. Deduplicates concurrent callers so Phase A
    * and Phase B each run at most once per observable result. Cleared on
    * completion (success or failure) so the next caller can retry.
    */
   private connectPromise: Promise<void> | null = null;
+  /**
+   * In-flight disconnect() promise. Blocks new connect() calls from
+   * piggy-backing on a dying attach while disconnect awaits connectPromise.
+   * Without this, a concurrent connect() could return success while the DB
+   * is being torn down, and subsequent writes would hit a closing OrbitDB.
+   */
+  private disconnectPromise: Promise<void> | null = null;
+
+  /**
+   * Derived: true iff OrbitDB has been attached.
+   * Single source of truth — no separate `dbConnected` field to diverge.
+   */
+  private get dbConnected(): boolean {
+    return this.dbStatus === 'attached';
+  }
 
   constructor(
     private readonly localCache: StorageProvider,
@@ -367,11 +389,22 @@ export class ProfileStorageProvider implements StorageProvider {
     // was already 'connected', leaving OrbitDB un-attached. Callers
     // then hit `ensureConnected` errors during module load.
     //
-    // Concurrency: the private `connectPromise` dedupes parallel callers
-    // so Phase A and Phase B each run at most once per observable result.
-    // Without this, two concurrent connect() calls could race on the
-    // OrbitDB adapter and attempt two `createHelia()` calls against the
-    // same directory lock.
+    // Concurrency: two promise latches dedupe callers.
+    //   * `disconnectPromise` — if a teardown is in flight, NEW
+    //     connect() calls MUST wait for it to drain. Otherwise a
+    //     concurrent connect() piggy-backing on the in-flight connect
+    //     (that disconnect is awaiting) returns success just as the DB
+    //     is being closed, and subsequent writes hit a dying OrbitDB.
+    //   * `connectPromise` — dedupes parallel connect() calls so Phase A
+    //     and Phase B each run at most once per observable result.
+
+    if (this.disconnectPromise) {
+      try {
+        await this.disconnectPromise;
+      } catch {
+        // swallowed — disconnect() already rethrew to its caller if needed
+      }
+    }
 
     if (this.connectPromise) {
       return this.connectPromise;
@@ -419,31 +452,37 @@ export class ProfileStorageProvider implements StorageProvider {
       }
     }
 
-    // Phase B — lazy OrbitDB attach. Fires whenever both identity and
-    // orbitDb config are available and the database isn't yet open.
-    // A Phase-B failure is tracked in `dbStatus` alone; the base
-    // `status` is NOT flipped to 'error' because the local cache is
-    // still valid — a defensive `disconnect()` must not tear down a
-    // working cache just because OrbitDB couldn't attach.
-    const needsAttach =
+    // Phase B — lazy OrbitDB attach. Inline guard (no intermediate
+    // `needsAttach` const) so TypeScript's control-flow narrowing
+    // propagates `identityAtStart !== null` and `orbitDbConfig !== null`
+    // into the branch body — avoiding fragile `!` non-null assertions.
+    //
+    //   dbStatus='fatal'        — permanent failure (e.g. missing dep);
+    //                             no retry, caller must disconnect() first.
+    //   dbStatus='attached'/'attaching' — already done / in progress.
+    if (
       this.dbStatus !== 'attached' &&
       this.dbStatus !== 'attaching' &&
+      this.dbStatus !== 'fatal' &&
       identityAtStart !== null &&
-      orbitDbConfig !== null;
-
-    if (needsAttach) {
+      orbitDbConfig !== null
+    ) {
       this.dbStatus = 'attaching';
       try {
         await this.db.connect({
-          ...orbitDbConfig!,
-          privateKey: identityAtStart!.privateKey,
+          ...orbitDbConfig,
+          privateKey: identityAtStart.privateKey,
         });
         this.dbStatus = 'attached';
-        this.dbConnected = true;
+        this.attachedChainPubkey = identityAtStart.chainPubkey ?? null;
         this.log('OrbitDB attached');
       } catch (err) {
-        this.dbStatus = 'error';
-        this.dbConnected = false;
+        // Terminal / configuration failures are marked 'fatal' so the
+        // retry loop in `connect()` doesn't hammer an unrecoverable
+        // condition on every startup hop.
+        const isFatal =
+          err instanceof ProfileError && err.code === 'ORBITDB_NOT_INSTALLED';
+        this.dbStatus = isFatal ? 'fatal' : 'error';
         throw new ProfileError(
           'PROFILE_NOT_INITIALIZED',
           `Failed to attach OrbitDB: ${err instanceof Error ? err.message : String(err)}`,
@@ -454,6 +493,19 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   async disconnect(): Promise<void> {
+    // Dedupe concurrent disconnect() calls.
+    if (this.disconnectPromise) {
+      return this.disconnectPromise;
+    }
+    this.disconnectPromise = this.doDisconnect();
+    try {
+      await this.disconnectPromise;
+    } finally {
+      this.disconnectPromise = null;
+    }
+  }
+
+  private async doDisconnect(): Promise<void> {
     this.log('Disconnecting');
 
     // If a connect() is still in flight, wait for it to settle before
@@ -467,16 +519,16 @@ export class ProfileStorageProvider implements StorageProvider {
       }
     }
 
-    // 1. Close OrbitDB
+    // 1. Close OrbitDB (if attached)
     try {
-      if (this.dbConnected) {
+      if (this.dbStatus === 'attached') {
         await this.db.close();
       }
     } catch {
       // best-effort
     } finally {
-      this.dbConnected = false;
       this.dbStatus = 'disconnected';
+      this.attachedChainPubkey = null;
     }
 
     // 2. Close local cache
@@ -526,6 +578,23 @@ export class ProfileStorageProvider implements StorageProvider {
    * Does NOT open OrbitDB — that is deferred to `connect()`.
    */
   setIdentity(identity: FullIdentity): void {
+    // Identity-swap detection: if OrbitDB is already attached under a
+    // different pubkey, any writes from here on will be encrypted with
+    // the new identity's key but OrbitDB's AccessController was
+    // initialized with the old key — writes will be silently rejected.
+    // Warn loudly; the caller should disconnect() and reconnect() to
+    // rebind OrbitDB properly.
+    if (
+      this.dbStatus === 'attached' &&
+      this.attachedChainPubkey !== null &&
+      identity.chainPubkey !== this.attachedChainPubkey
+    ) {
+      logger.warn(
+        'ProfileStorage',
+        'setIdentity called with a different chainPubkey while OrbitDB is attached — OrbitDB AccessController will reject writes under the new key. Call disconnect() and reconnect() to rebind.',
+      );
+    }
+
     this.identity = identity;
 
     // Derive the profile encryption key from the private key bytes

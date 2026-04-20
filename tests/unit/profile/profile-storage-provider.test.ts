@@ -172,8 +172,10 @@ describe('ProfileStorageProvider', () => {
     });
     // Set identity so encryption key is derived and addressId is set
     provider.setIdentity(TEST_IDENTITY);
-    // Mark as connected for tests (bypass connect flow that requires real OrbitDB)
-    (provider as any).dbConnected = true;
+    // Mark as connected for tests (bypass connect flow that requires real OrbitDB).
+    // dbConnected is now a derived getter (dbStatus === 'attached') — no direct
+    // assignment possible. Set the underlying fields instead.
+    (provider as any).dbStatus = 'attached';
     (provider as any).status = 'connected';
   });
 
@@ -425,7 +427,7 @@ describe('ProfileStorageProvider', () => {
       expect(cacheSpy).toHaveBeenCalledWith(TEST_IDENTITY);
 
       // Verify encryption key was derived (set a value and check it is encrypted in OrbitDB)
-      (newProvider as any).dbConnected = true;
+      (newProvider as any).dbStatus = 'attached';
       (newProvider as any).status = 'connected';
       await newProvider.set('mnemonic', 'test');
       const stored = db._store.get('identity.mnemonic');
@@ -758,6 +760,137 @@ describe('ProfileStorageProvider', () => {
       await freshProvider.connect();
       expect(freshProvider.isConnected()).toBe(true);
       expect(freshDb._connectCalls).toHaveLength(2);
+    });
+
+    it('concurrent disconnect() and connect() — connect waits for teardown', async () => {
+      // Regression for the piggy-back race introduced in commit 9f05c49:
+      // if disconnect() was awaiting the in-flight connectPromise and a
+      // second connect() call arrived, the second caller would share the
+      // same promise, return "connected" from the attach, and then issue
+      // writes against a DB that disconnect() was simultaneously closing.
+      //
+      // Post-fix: disconnect sets `disconnectPromise`; a concurrent
+      // connect() waits for it to drain, then starts a fresh attach.
+      let closeCount = 0;
+      const store = new Map<string, Uint8Array>();
+      let connected = false;
+      const slowDb: any = {
+        async connect(_cfg: any) {
+          await new Promise((r) => setTimeout(r, 20));
+          connected = true;
+        },
+        async close() {
+          closeCount += 1;
+          await new Promise((r) => setTimeout(r, 5));
+          connected = false;
+        },
+        async put(k: string, v: Uint8Array) { store.set(k, v); },
+        async get(k: string) { return store.get(k) ?? null; },
+        async del(k: string) { store.delete(k); },
+        async all() { return new Map<string, Uint8Array>(); },
+        onReplication() { return () => {}; },
+        isConnected() { return connected; },
+      };
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, slowDb, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-race2' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      // Initial attach completes.
+      await freshProvider.connect();
+      expect(freshProvider.isConnected()).toBe(true);
+
+      // Start disconnect and a concurrent connect().
+      const disconnectP = freshProvider.disconnect();
+      const reconnectP = freshProvider.connect();
+      await Promise.all([disconnectP, reconnectP]);
+
+      // After the dust settles, we should be CONNECTED (the reconnect
+      // ran after the teardown), and close() ran exactly once.
+      expect(freshProvider.isConnected()).toBe(true);
+      expect(closeCount).toBe(1);
+    });
+
+    it('fatal Phase B failures do NOT retry — ORBITDB_NOT_INSTALLED is sticky', async () => {
+      // Regression for recursive-steelman #4: a permanent error
+      // (missing dependency) should not be retried forever. Transient
+      // failures are retried; fatal ones stop the loop until the
+      // caller explicitly disconnect()s.
+      const { ProfileError } = await import('../../../profile/errors');
+      let attempts = 0;
+      const fatalDb: any = {
+        async connect() {
+          attempts += 1;
+          throw new ProfileError('ORBITDB_NOT_INSTALLED', 'missing @orbitdb/core');
+        },
+        async close() {},
+        async put() {}, async get() { return null; }, async del() {},
+        async all() { return new Map(); },
+        onReplication() { return () => {}; },
+        isConnected() { return false; },
+      };
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, fatalDb, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-fatal' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      await expect(freshProvider.connect()).rejects.toThrow();
+      expect(attempts).toBe(1);
+
+      // Second connect() should NOT retry — dbStatus is now 'fatal'.
+      await expect(freshProvider.connect()).resolves.toBeUndefined();
+      expect(attempts).toBe(1);
+      expect(freshProvider.isConnected()).toBe(false);
+    });
+
+    it('setIdentity() warns when swapping chainPubkey on an attached DB', async () => {
+      // Regression for recursive-steelman #6: after attach, swapping
+      // identity silently breaks writes (encryption under new key,
+      // access controller under old key). Emit a loud warning so
+      // operators can trace the misuse.
+      const { logger } = await import('../../../core/logger');
+      const warnings: Array<{ tag: string; message: string }> = [];
+      const originalHandler = (globalThis as any).__sphere_sdk_logger__?.handler ?? null;
+      logger.configure({
+        handler: (level, tag, message) => {
+          if (level === 'warn') warnings.push({ tag, message });
+        },
+      });
+      try {
+        const freshDb = createUnconnectedDb();
+        const freshCache = createMockCache();
+        const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+          config: {
+            orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-swap' },
+          },
+          encrypt: true,
+        });
+        freshProvider.setIdentity(TEST_IDENTITY);
+        await freshProvider.connect();
+
+        // Swap to a different chainPubkey while still attached.
+        const OTHER: FullIdentity = {
+          ...TEST_IDENTITY,
+          chainPubkey: '03' + 'ff'.repeat(32),
+          privateKey: 'cafebabe'.repeat(8),
+        };
+        freshProvider.setIdentity(OTHER);
+
+        const swapWarning = warnings.find(
+          (w) => w.tag === 'ProfileStorage' && w.message.includes('different chainPubkey'),
+        );
+        expect(swapWarning).toBeDefined();
+      } finally {
+        logger.configure({ handler: originalHandler });
+      }
     });
   });
 });
