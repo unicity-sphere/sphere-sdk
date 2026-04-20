@@ -402,7 +402,16 @@ export const IPFS_STATE_KEYS_PATTERN: RegExp = /^ipfs_(seq|cid|ver)_/;
  * @returns Short address ID (e.g. `DIRECT_aabbcc_ddeeff`)
  */
 export function computeAddressId(directAddress: string): string {
-  const clean = directAddress.replace('DIRECT://', '');
+  // Accept both `DIRECT://` and degenerate `DIRECT:` prefixes. The former is
+  // canonical; the latter appears in some legacy/profile code paths.
+  let clean: string;
+  if (directAddress.startsWith('DIRECT://')) {
+    clean = directAddress.slice(9);
+  } else if (directAddress.startsWith('DIRECT:')) {
+    clean = directAddress.slice(7);
+  } else {
+    clean = directAddress;
+  }
   const first6 = clean.slice(0, 6).toLowerCase();
   const last6 = clean.slice(-6).toLowerCase();
   return `DIRECT_${first6}_${last6}`;

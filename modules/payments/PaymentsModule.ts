@@ -69,6 +69,12 @@ import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+// `profile/types` is a pure types + constants module with zero runtime
+// dependencies — safe to import statically in every build. The previous
+// dynamic import was motivated by a bundle-size concern that didn't apply
+// here; it silently swallowed import errors in consumer builds lacking
+// matching bundler rules and made Profile-mode data load paths fragile.
+import { computeAddressId } from '../../profile/types.js';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -1084,42 +1090,43 @@ export class PaymentsModule {
 
       // Load metadata from TokenStorageProviders (archived, tombstones, forked)
       // Active tokens are NOT stored in TXF - they are loaded from token-xxx files
+      //
+      // Address guard: reject data whose `_meta.address` doesn't match the
+      // current identity. Accept three representations (one per writer):
+      //   - L1 bech32 (legacy file storage writes this)
+      //   - chain pubkey (some providers record the pubkey)
+      //   - Profile short ID (`DIRECT_{first6}_{last6}` — written by
+      //     ProfileTokenStorageProvider, derived via `computeAddressId`)
+      //
+      // NOTE: This guard is an integrity check (catch misrouted or
+      // corrupted data), not a security boundary. A writer with storage
+      // access can forge `_meta.address` trivially.
+      const currentL1 = this.deps!.identity.l1Address;
+      const currentChain = this.deps!.identity.chainPubkey;
+      const currentDirect = this.deps!.identity.directAddress;
+      const currentProfileShortId = currentDirect ? computeAddressId(currentDirect) : null;
+
       const providers = this.getTokenStorageProviders();
       for (const [id, provider] of providers) {
         try {
           const result = await provider.load();
           if (result.success && result.data) {
-            // Address guard: reject data from a different address.
-            // Three accepted representations in practice:
-            //   - L1 bech32 (legacy file storage writes this)
-            //   - chain pubkey (some providers record the pubkey)
-            //   - Profile short ID (`DIRECT_{first6}_{last6}` — written
-            //     by ProfileTokenStorageProvider, derived from the
-            //     directAddress via computeAddressId)
             const loadedMeta = (result.data as TxfStorageDataBase)?._meta;
-            const currentL1 = this.deps!.identity.l1Address;
-            const currentChain = this.deps!.identity.chainPubkey;
-            const currentDirect = this.deps!.identity.directAddress;
-            // Compute the Profile short ID from the current identity's
-            // directAddress for comparison. Lazy-import to avoid
-            // dragging profile/ into non-profile builds.
-            let currentProfileShortId: string | null = null;
-            if (currentDirect) {
-              try {
-                const { computeAddressId } = await import('../../profile/types.js');
-                currentProfileShortId = computeAddressId(currentDirect);
-              } catch {
-                // Profile module not available — short ID check is skipped
-              }
-            }
             if (
               loadedMeta?.address &&
-              currentL1 &&
               loadedMeta.address !== currentL1 &&
               loadedMeta.address !== currentChain &&
               loadedMeta.address !== currentProfileShortId
             ) {
-              logger.warn('Payments', `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 20)}... expected=${currentL1.slice(0, 20)}...)`);
+              const accepted = [
+                currentL1 ? `L1=${currentL1.slice(0, 16)}…` : null,
+                currentChain ? `chain=${currentChain.slice(0, 16)}…` : null,
+                currentProfileShortId ? `profile=${currentProfileShortId}` : null,
+              ].filter(Boolean).join(', ');
+              logger.warn(
+                'Payments',
+                `Load: rejecting data from provider ${id} — address mismatch (got=${loadedMeta.address.slice(0, 24)} accepted=[${accepted}])`,
+              );
               continue;
             }
 

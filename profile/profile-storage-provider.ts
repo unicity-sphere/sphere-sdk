@@ -20,6 +20,7 @@ import {
   PROFILE_KEY_MAPPING,
   CACHE_ONLY_KEYS,
   IPFS_STATE_KEYS_PATTERN,
+  computeAddressId,
 } from './types';
 import { ProfileError } from './errors';
 import { deriveProfileEncryptionKey, encryptString, decryptString } from './encryption';
@@ -310,12 +311,34 @@ export class ProfileStorageProvider implements StorageProvider {
   // --- Internal state ---
   private identity: FullIdentity | null = null;
   private profileEncryptionKey: Uint8Array | null = null;
+  /**
+   * Base provider status — reflects LOCAL CACHE connectivity only.
+   * A Phase-B (OrbitDB attach) failure does not poison this status because
+   * the local cache is still usable; callers who defensively disconnect()
+   * shouldn't destroy the working cache just because OrbitDB couldn't attach.
+   */
   private status: ProviderStatus = 'disconnected';
+  /**
+   * Independent sub-status for the OrbitDB attach phase. Callers inspect
+   * `isConnected()` to see the composite state; this field is intentionally
+   * private so the invariants stay inside this class.
+   */
+  private dbStatus: 'disconnected' | 'attaching' | 'attached' | 'error' = 'disconnected';
   private addressId: string | null = null;
   private encryptionEnabled: boolean;
   private debug: boolean;
-  /** Whether OrbitDB has been connected via this provider. */
+  /**
+   * Retained for backward-compat with existing guards throughout this file
+   * (e.g. `if (this.dbConnected)` in get/set/clear). Mirrors
+   * `dbStatus === 'attached'`.
+   */
   private dbConnected = false;
+  /**
+   * In-flight connect() promise. Deduplicates concurrent callers so Phase A
+   * and Phase B each run at most once per observable result. Cleared on
+   * completion (success or failure) so the next caller can retry.
+   */
+  private connectPromise: Promise<void> | null = null;
 
   constructor(
     private readonly localCache: StorageProvider,
@@ -343,8 +366,43 @@ export class ProfileStorageProvider implements StorageProvider {
     // implementation returned early on the second call because status
     // was already 'connected', leaving OrbitDB un-attached. Callers
     // then hit `ensureConnected` errors during module load.
+    //
+    // Concurrency: the private `connectPromise` dedupes parallel callers
+    // so Phase A and Phase B each run at most once per observable result.
+    // Without this, two concurrent connect() calls could race on the
+    // OrbitDB adapter and attempt two `createHelia()` calls against the
+    // same directory lock.
 
-    // Phase A — idempotent base connection
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    this.connectPromise = this.doConnect();
+    try {
+      await this.connectPromise;
+    } finally {
+      this.connectPromise = null;
+    }
+  }
+
+  /**
+   * Serialized connect logic — always invoked through the `connectPromise`
+   * guard in `connect()`. Must not be called directly.
+   */
+  private async doConnect(): Promise<void> {
+    // Snapshot identity at ENTRY, before any await. If a caller invokes
+    // setIdentity() while connect() is in flight, the snapshot holds the
+    // identity that was current when this attach started. The next
+    // connect() call (after the swap) will see dbStatus='attached', skip
+    // Phase B, and the caller is responsible for disconnect()+reconnect()
+    // if they intended to rebind. This preserves the invariant that the
+    // OrbitDB key and the encryption key used for reads are the same.
+    const identityAtStart = this.identity;
+    const orbitDbConfig = this.options?.config?.orbitDb ?? null;
+
+    // Phase A — base connection (local cache). Runs at most once per
+    // `disconnected`/`error` cycle. A Phase-B failure does NOT reset
+    // `status` to 'error'; the local cache remains usable.
     if (this.status !== 'connected' && this.status !== 'connecting') {
       this.status = 'connecting';
       try {
@@ -361,19 +419,31 @@ export class ProfileStorageProvider implements StorageProvider {
       }
     }
 
-    // Phase B — lazy OrbitDB attach. Fires on every connect() call
-    // until the database is open, so the second call that follows
-    // setIdentity() does the work.
-    if (!this.dbConnected && this.identity && this.options?.config?.orbitDb) {
+    // Phase B — lazy OrbitDB attach. Fires whenever both identity and
+    // orbitDb config are available and the database isn't yet open.
+    // A Phase-B failure is tracked in `dbStatus` alone; the base
+    // `status` is NOT flipped to 'error' because the local cache is
+    // still valid — a defensive `disconnect()` must not tear down a
+    // working cache just because OrbitDB couldn't attach.
+    const needsAttach =
+      this.dbStatus !== 'attached' &&
+      this.dbStatus !== 'attaching' &&
+      identityAtStart !== null &&
+      orbitDbConfig !== null;
+
+    if (needsAttach) {
+      this.dbStatus = 'attaching';
       try {
         await this.db.connect({
-          ...this.options.config.orbitDb,
-          privateKey: this.identity.privateKey,
+          ...orbitDbConfig!,
+          privateKey: identityAtStart!.privateKey,
         });
+        this.dbStatus = 'attached';
         this.dbConnected = true;
         this.log('OrbitDB attached');
       } catch (err) {
-        this.status = 'error';
+        this.dbStatus = 'error';
+        this.dbConnected = false;
         throw new ProfileError(
           'PROFILE_NOT_INITIALIZED',
           `Failed to attach OrbitDB: ${err instanceof Error ? err.message : String(err)}`,
@@ -386,15 +456,27 @@ export class ProfileStorageProvider implements StorageProvider {
   async disconnect(): Promise<void> {
     this.log('Disconnecting');
 
+    // If a connect() is still in flight, wait for it to settle before
+    // tearing down — otherwise we could race against an in-progress
+    // OrbitDB attach and leave a live Helia instance around.
+    if (this.connectPromise) {
+      try {
+        await this.connectPromise;
+      } catch {
+        // swallowed — connect() already rethrew to its caller
+      }
+    }
+
     // 1. Close OrbitDB
     try {
       if (this.dbConnected) {
         await this.db.close();
-        this.dbConnected = false;
       }
     } catch {
-      this.dbConnected = false;
       // best-effort
+    } finally {
+      this.dbConnected = false;
+      this.dbStatus = 'disconnected';
     }
 
     // 2. Close local cache
@@ -409,14 +491,22 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   isConnected(): boolean {
-    // Fully connected means local cache AND OrbitDB are both attached.
-    // If an identity + orbitDb config were supplied, the attach must
-    // have completed — otherwise reads will hit the adapter's
-    // ensureConnected() guard. Reporting false in that half-attached
-    // state signals callers (Sphere.initializeProviders) to re-call
-    // connect() so the lazy-attach branch fires.
+    // Fully connected means the local cache is up AND — if this provider
+    // was configured with OrbitDB — the database is attached. Reporting
+    // false in the half-attached state signals callers
+    // (Sphere.initializeProviders) to re-call connect() so the lazy-attach
+    // branch fires.
+    //
+    // Note: we check the orbitDb config, NOT `identity`, to decide whether
+    // an attach is required. Previously the check gated on identity too,
+    // which meant a provider constructed with orbitDb config but without
+    // an identity yet would report `true` even though all DB operations
+    // would silently fall back to the local cache — users could then make
+    // writes that are never backfilled to OrbitDB once identity arrives.
+    // Now, if orbitDb is configured, isConnected() stays false until the
+    // attach completes (which in turn requires setIdentity()).
     if (this.status !== 'connected') return false;
-    if (this.identity && this.options?.config?.orbitDb && !this.dbConnected) {
+    if (this.options?.config?.orbitDb && this.dbStatus !== 'attached') {
       return false;
     }
     return true;
@@ -759,22 +849,6 @@ export class ProfileStorageProvider implements StorageProvider {
 // =============================================================================
 // Utility Functions
 // =============================================================================
-
-/**
- * Compute an address ID from a direct address string.
- * Mirrors `getAddressId` from constants.ts.
- */
-function computeAddressId(directAddress: string): string {
-  let hash = directAddress;
-  if (hash.startsWith('DIRECT://')) {
-    hash = hash.slice(9);
-  } else if (hash.startsWith('DIRECT:')) {
-    hash = hash.slice(7);
-  }
-  const first = hash.slice(0, 6).toLowerCase();
-  const last = hash.slice(-6).toLowerCase();
-  return `DIRECT_${first}_${last}`;
-}
 
 /**
  * Convert a hex string to Uint8Array.

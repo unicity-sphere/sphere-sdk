@@ -441,11 +441,13 @@ describe('ProfileStorageProvider', () => {
   // =========================================================================
 
   describe('two-phase connect', () => {
-    // Fresh DB mock that STARTS DISCONNECTED so we can observe the
-    // real attach sequence. The suite-wide beforeEach fakes
-    // dbConnected=true, bypassing this path entirely.
+    // DO NOT consolidate createUnconnectedDb / createCountingCache with the
+    // suite-wide helpers. They are deliberately distinct: the suite mocks
+    // fake `connected=true` from construction, which bypasses the real
+    // two-phase connect path these tests are designed to exercise.
+    // See commit 5f1fc85 for the bug these tests guard against.
 
-    function createUnconnectedDb() {
+    function createUnconnectedDb(opts?: { failOn?: 'connect' }) {
       const store = new Map<string, Uint8Array>();
       let connected = false;
       const connectCalls: Array<{ privateKey: string; directory?: string }> = [];
@@ -454,6 +456,9 @@ describe('ProfileStorageProvider', () => {
         _connectCalls: connectCalls,
         async connect(config: any) {
           connectCalls.push(config);
+          if (opts?.failOn === 'connect') {
+            throw new Error('synthetic-phase-b-failure');
+          }
           connected = true;
         },
         async put(key: string, value: Uint8Array) {
@@ -574,6 +579,185 @@ describe('ProfileStorageProvider', () => {
       await freshProvider.connect();
       expect(freshProvider.isConnected()).toBe(true);
       expect(freshDb._connectCalls).toHaveLength(0);
+    });
+
+    it('isConnected() is FALSE after pre-identity connect when orbitDb is configured', async () => {
+      // Sphere.initializeProviders relies on this invariant:
+      //   if (!this._storage.isConnected()) { await this._storage.connect(); }
+      // If isConnected() returned true after pre-identity connect with
+      // orbitDb configured, the post-setIdentity call would be skipped
+      // and OrbitDB would never attach. (The previous implementation
+      // gated on `identity`, which was null pre-setIdentity — so it
+      // incorrectly returned true here.)
+      const freshDb = createUnconnectedDb();
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-invariant' },
+        },
+        encrypt: true,
+      });
+
+      await freshProvider.connect(); // pre-identity
+      expect(freshProvider.isConnected()).toBe(false);
+    });
+
+    it('concurrent connect() calls dedupe — db.connect is invoked exactly once', async () => {
+      // Without an in-flight promise, two parallel connect() calls could
+      // both observe `dbStatus !== 'attached'` and race into `db.connect()`,
+      // creating two Helia instances against the same directory lock.
+      // The `connectPromise` shared-latch should dedupe.
+      const freshDb = createUnconnectedDb();
+      // Slow connect so we observably race.
+      const origConnect = freshDb.connect.bind(freshDb);
+      freshDb.connect = async (config: any) => {
+        await new Promise((r) => setTimeout(r, 20));
+        return origConnect(config);
+      };
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-race' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      await Promise.all([
+        freshProvider.connect(),
+        freshProvider.connect(),
+        freshProvider.connect(),
+        freshProvider.connect(),
+      ]);
+
+      expect(freshDb._connectCalls).toHaveLength(1);
+      expect(freshProvider.isConnected()).toBe(true);
+    });
+
+    it('Phase B failure does NOT poison base status — local cache remains connected', async () => {
+      // Regression: the previous code flipped `this.status = 'error'` on
+      // Phase B failure. That lied to external callers (local cache was
+      // still up) AND caused a defensive `disconnect()` to tear down a
+      // working cache. Post-fix: base status stays 'connected', only
+      // `dbStatus` flips to 'error'.
+      const failingDb = createUnconnectedDb({ failOn: 'connect' });
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, failingDb as any, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-fail-b' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      await expect(freshProvider.connect()).rejects.toThrow(/PROFILE_NOT_INITIALIZED/);
+
+      // Base status remains 'connected' — local cache is fine.
+      expect(freshProvider.getStatus()).toBe('connected');
+      // Composite isConnected() is false because OrbitDB attach failed.
+      expect(freshProvider.isConnected()).toBe(false);
+    });
+
+    it('Phase B failure permits retry — db.connect is re-invoked on next connect()', async () => {
+      // If Phase B fails, a subsequent connect() should try again. This
+      // is important for transient OrbitDB/Helia startup failures where
+      // the user/Sphere caller may retry.
+      let attempts = 0;
+      const store = new Map<string, Uint8Array>();
+      let connected = false;
+      const flakyDb: any = {
+        _store: store,
+        async connect(_config: any) {
+          attempts += 1;
+          if (attempts === 1) throw new Error('transient-failure');
+          connected = true;
+        },
+        async put(k: string, v: Uint8Array) { store.set(k, v); },
+        async get(k: string) { return store.get(k) ?? null; },
+        async del(k: string) { store.delete(k); },
+        async all() { return new Map<string, Uint8Array>(); },
+        async close() { connected = false; },
+        onReplication() { return () => {}; },
+        isConnected() { return connected; },
+      };
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, flakyDb, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-retry' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      await expect(freshProvider.connect()).rejects.toThrow(/transient-failure/);
+      expect(attempts).toBe(1);
+
+      // Retry — Phase A is already done, Phase B should fire again.
+      await freshProvider.connect();
+      expect(attempts).toBe(2);
+      expect(freshProvider.isConnected()).toBe(true);
+    });
+
+    it('Phase B snapshots identity at attach time — prevents mid-flight key swap', async () => {
+      // If `setIdentity()` is called between the Phase A checkpoint and
+      // the Phase B adapter invocation, the OLD identity's private key
+      // must still be used (snapshot captured at attach start).
+      // This is a defensive contract: current call sites are sequential,
+      // but a future parallelization must not silently send the wrong
+      // key to OrbitDB while the rest of the class is encrypting under
+      // a different one.
+      let identityObserved: string | null = null;
+      const slowDb: any = {
+        async connect(config: any) {
+          await new Promise((r) => setTimeout(r, 20));
+          identityObserved = config.privateKey;
+        },
+        async put() {}, async get() { return null; }, async del() {},
+        async all() { return new Map(); }, async close() {},
+        onReplication() { return () => {}; }, isConnected() { return true; },
+      };
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, slowDb, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-snap' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      const connectPromise = freshProvider.connect();
+      // Swap identity mid-flight — the attach should still use the
+      // original identity's privateKey.
+      const OTHER_IDENTITY: FullIdentity = {
+        ...TEST_IDENTITY,
+        privateKey: 'deadbeef'.repeat(8),
+      };
+      freshProvider.setIdentity(OTHER_IDENTITY);
+
+      await connectPromise;
+      expect(identityObserved).toBe(TEST_IDENTITY.privateKey);
+    });
+
+    it('connect() after disconnect() reconnects both phases', async () => {
+      const freshDb = createUnconnectedDb();
+      const freshCache = createMockCache();
+      const freshProvider = new ProfileStorageProvider(freshCache, freshDb as any, {
+        config: {
+          orbitDb: { privateKey: '__unused__', directory: '/tmp/orbitdb-cycle' },
+        },
+        encrypt: true,
+      });
+      freshProvider.setIdentity(TEST_IDENTITY);
+
+      await freshProvider.connect();
+      expect(freshProvider.isConnected()).toBe(true);
+
+      await freshProvider.disconnect();
+      expect(freshProvider.isConnected()).toBe(false);
+
+      await freshProvider.connect();
+      expect(freshProvider.isConnected()).toBe(true);
+      expect(freshDb._connectCalls).toHaveLength(2);
     });
   });
 });
