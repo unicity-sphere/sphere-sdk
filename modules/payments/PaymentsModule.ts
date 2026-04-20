@@ -126,13 +126,20 @@ export type ImportAddedCode =
   /** Token was new to the wallet — fresh acquisition. */
   | 'added'
   /**
-   * Lenient mode only: token's genesis was already owned at a
-   * different state; the prior state has been archived and the
-   * imported state is now authoritative. Reported in `added` (the
-   * wallet does now own the imported state) but discriminator allows
-   * UI to highlight "this overwrote your previous state".
+   * Lenient mode only: an active (confirmed or submitted) state of
+   * the same genesis tokenId existed in the wallet and has been
+   * archived by addToken's state-update path. The imported state is
+   * now authoritative. Distinct from `'stale-record-replaced'` below.
    */
-  | 'state-replaced';
+  | 'state-replaced'
+  /**
+   * Lenient mode only: the wallet already held a record for the same
+   * genesis tokenId but its status was `'spent'` or `'invalid'` — the
+   * prior entry was a dead bookkeeping record, not an active state.
+   * Import simply resurrected the tokenId. UI should treat this as
+   * effectively fresh ('added'-like) with no warning.
+   */
+  | 'stale-record-replaced';
 
 export type ImportSkipCode =
   /** Exact (tokenId, stateHash) already in the wallet. */
@@ -153,13 +160,23 @@ export type ImportRejectCode =
   /** addToken threw an unexpected error during the write path. */
   | 'add-failed';
 
-export interface ImportAdded {
-  readonly localId: string;
-  readonly genesisTokenId: string;
-  readonly code: ImportAddedCode;
-  /** Optional human-readable note (set when code is non-trivial). */
-  readonly note?: string;
-}
+/**
+ * Discriminated union so `note` is structurally required on the
+ * `'state-replaced'` and `'stale-record-replaced'` branches — consumers
+ * don't need `!` assertions after switch-on-code.
+ */
+export type ImportAdded =
+  | {
+      readonly localId: string;
+      readonly genesisTokenId: string;
+      readonly code: 'added';
+    }
+  | {
+      readonly localId: string;
+      readonly genesisTokenId: string;
+      readonly code: 'state-replaced' | 'stale-record-replaced';
+      readonly note: string;
+    };
 export interface ImportSkipped {
   readonly genesisTokenId: string;
   readonly code: ImportSkipCode;
@@ -3407,9 +3424,13 @@ export class PaymentsModule {
         continue;
       }
 
-      // Scan in-memory wallet for matching genesis / state.
+      // Scan in-memory wallet for matching genesis / state. Track
+      // the matched token's status so we can distinguish a true
+      // "state replaced a live state" from "stale bookkeeping record
+      // (spent/invalid) was overwritten" downstream.
       let exactDuplicateLocalId: string | null = null;
       let genesisMatchLocalId: string | null = null;
+      let genesisMatchStatus: TokenStatus | null = null;
       for (const [existingId, existing] of this.tokens) {
         const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
         if (existingTokenId !== genesisTokenId) continue;
@@ -3419,6 +3440,7 @@ export class PaymentsModule {
           break;
         }
         genesisMatchLocalId = existingId;
+        genesisMatchStatus = existing.status;
       }
 
       // -- Pre-check 2: exact duplicate.
@@ -3461,21 +3483,38 @@ export class PaymentsModule {
       try {
         const addedOk = await this.addToken(uiToken);
         if (addedOk) {
-          // Lenient mode: a same-genesis match means addToken archived
-          // the prior state. Mark the entry so callers can distinguish
-          // a "new acquisition" from a "state override".
           if (genesisMatchLocalId) {
+            // Differentiate:
+            //   - Replacing a LIVE state (confirmed/submitted/...):
+            //     the user previously held this state of the token;
+            //     UI should highlight the overwrite.
+            //   - Replacing a DEAD record (spent/invalid): the prior
+            //     entry was bookkeeping for a token we no longer
+            //     controlled; no user-visible state was lost.
+            const isStaleRecord =
+              genesisMatchStatus === 'spent' || genesisMatchStatus === 'invalid';
             added.push({
               localId,
               genesisTokenId,
-              code: 'state-replaced',
-              note: 'Replaced an existing state of the same tokenId (lenient mode)',
+              code: isStaleRecord ? 'stale-record-replaced' : 'state-replaced',
+              note: isStaleRecord
+                ? 'Overwrote a stale spent/invalid record of the same tokenId'
+                : 'Replaced an existing state of the same tokenId (lenient mode)',
             });
           } else {
             added.push({ localId, genesisTokenId, code: 'added' });
           }
         } else {
           // Defensive — addToken returned false despite our pre-checks.
+          // This indicates a race (the wallet mutated between our
+          // pre-check scan and addToken's own guard) or a guard
+          // pattern we didn't enumerate. Log at warn level so field
+          // operators can correlate it with transport activity.
+          logger.warn(
+            'Payments',
+            `importTokens: addToken unexpectedly refused token ${genesisTokenId.slice(0, 16)}... ` +
+              `after pre-checks (possible race with incoming transfer). Marking as skipped/unknown.`,
+          );
           skipped.push({
             genesisTokenId,
             code: 'unknown',

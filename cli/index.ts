@@ -2907,42 +2907,77 @@ async function main() {
           tokensDir: legacyTokensDir,
         });
 
-        // Acquire a cross-process file lock on the legacy dataDir so
-        // a concurrent CLI invocation (or any external process that
-        // honours `proper-lockfile`) cannot mutate the source under
-        // us mid-import. The lock is released in the finally even on
-        // error / process.exit() paths.
-        const properLockfile = await import('proper-lockfile' as string) as {
+        // Dir existence + writability check BEFORE lock acquisition.
+        // Keeping this out of the lock try gives the user a clear
+        // "does not exist / not accessible" error instead of the
+        // opaque "could not acquire lock" that proper-lockfile would
+        // emit for the same condition.
+        if (!fs.existsSync(legacyDir)) {
+          console.error(`Legacy dataDir does not exist: "${legacyDir}"`);
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Cross-process file lock on the legacy dataDir. **Advisory-only**:
+        // only commands that explicitly acquire the same lock respect it.
+        // Today only `migrate-to-profile` does — so this protects against
+        // two concurrent migrations of the same source, but NOT against
+        // a concurrent `send` / `receive` / `tokens-export` against the
+        // legacy wallet. The migration is read-only on the source, so
+        // the worst case is an inconsistent snapshot; the target Profile
+        // still enforces dedup via tombstones.
+        //
+        // Stale locks from killed processes are auto-released after 60s
+        // (see `stale`). proper-lockfile auto-refreshes the lock's mtime
+        // every ~30s so a legitimately long migration doesn't time out.
+        const properLockfile = (await import('proper-lockfile')) as {
           lock(file: string, opts?: Record<string, unknown>): Promise<() => Promise<void>>;
         };
+        // Pin the lockfile to a known-writable path INSIDE the legacy
+        // dataDir (not the sibling `.lock` that would land next to the
+        // target's parent, which may be unwritable for paths like
+        // `/etc/sphere-wallet`).
+        const lockfilePath = path.join(legacyDir, '.migrate.lock');
         let releaseLock: (() => Promise<void>) | null = null;
         try {
-          // Lock the legacy dataDir's wallet.json (or the dir itself
-          // if no wallet.json yet — proper-lockfile creates a sibling
-          // .lock file based on the resolved path).
-          const lockTarget = path.join(legacyDir, 'wallet.json');
-          // proper-lockfile requires the target to exist, so fall back
-          // to locking the dir if wallet.json is missing — the
-          // identity-blob check below will reject that case anyway.
-          const lockable = fs.existsSync(lockTarget) ? lockTarget : legacyDir;
-          if (!fs.existsSync(lockable)) {
-            console.error(`Legacy dataDir does not exist: "${legacyDir}"`);
-            process.exit(1);
-          }
-          releaseLock = await properLockfile.lock(lockable, {
+          releaseLock = await properLockfile.lock(legacyDir, {
+            lockfilePath,
+            realpath: false, // legacyDir is already path.resolve'd
             // Wait up to 10s if another migration is in progress.
             retries: { retries: 10, factor: 1.2, minTimeout: 200, maxTimeout: 2000 },
             stale: 60_000, // 60s — releases stuck locks from killed processes.
           });
+          // If user also overrode --legacy-tokens to a location OUTSIDE
+          // the legacy dataDir, acquire a second lock there so a
+          // concurrent migration aimed at the same tokens dir is also
+          // blocked. We don't need this when tokens dir is the default
+          // (inside legacyDir) because the first lock already covers it.
+          const tokensInsideLegacy =
+            path.resolve(legacyTokensDir).startsWith(path.resolve(legacyDir) + path.sep);
+          if (!tokensInsideLegacy && fs.existsSync(legacyTokensDir)) {
+            const tokensLockfilePath = path.join(legacyTokensDir, '.migrate.lock');
+            const releaseTokensLock = await properLockfile.lock(legacyTokensDir, {
+              lockfilePath: tokensLockfilePath,
+              realpath: false,
+              retries: { retries: 10, factor: 1.2, minTimeout: 200, maxTimeout: 2000 },
+              stale: 60_000,
+            });
+            const firstRelease = releaseLock;
+            releaseLock = async () => {
+              await releaseTokensLock().catch(() => {});
+              await firstRelease();
+            };
+          }
         } catch (err) {
           console.error(
-            `Could not acquire lock on legacy dataDir "${legacyDir}": ` +
+            `Could not acquire lock on legacy dataDir "${legacyDir}" ` +
+              `(lockfile: ${lockfilePath}): ` +
               `${err instanceof Error ? err.message : String(err)}`,
           );
           console.error(
-            'This usually means another sphere-cli process is currently migrating ' +
-              'or interacting with this dataDir. Wait for it to finish, or remove a ' +
-              'stuck lock file (.lock suffix in the dir).',
+            'This usually means another sphere-cli migrate-to-profile is running. ' +
+              'Wait for it to finish, or — if the previous process was killed (SIGKILL) — ' +
+              `wait ~60s for the stale-lock timeout, or manually remove "${lockfilePath}".`,
           );
           await closeSphere();
           process.exit(1);

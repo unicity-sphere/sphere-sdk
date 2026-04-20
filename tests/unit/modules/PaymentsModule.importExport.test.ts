@@ -386,7 +386,31 @@ describe('PaymentsModule.exportTokens / importTokens', () => {
 
       expect(result.added).toHaveLength(1);
       expect(result.added[0].code).toBe('state-replaced');
-      expect(result.added[0].note).toMatch(/Replaced/);
+      // Discriminated union narrowing — note is required on state-replaced.
+      if (result.added[0].code === 'state-replaced') {
+        expect(result.added[0].note).toMatch(/Replaced/);
+      }
+    });
+
+    it('lenient mode: replacing a SPENT token record is labelled stale-record-replaced, not state-replaced', async () => {
+      // Regression for steelman finding: addToken's CASE 1 fires on a
+      // spent/invalid pre-existing entry and returns true via the same
+      // code path. We must distinguish this from replacing a live state.
+      const tokenUi = buildToken({
+        tokenId: TOKEN_A_ID,
+        stateHash: STATE_HASH_1,
+        status: 'spent',
+      });
+      await module.addToken(tokenUi);
+
+      const freshTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_2 });
+      const result = await module.importTokens([freshTxf]);
+
+      expect(result.added).toHaveLength(1);
+      expect(result.added[0].code).toBe('stale-record-replaced');
+      if (result.added[0].code === 'stale-record-replaced') {
+        expect(result.added[0].note).toMatch(/stale spent\/invalid/);
+      }
     });
 
     it('reports rejection reason for malformed TxfToken (no tokenId)', async () => {

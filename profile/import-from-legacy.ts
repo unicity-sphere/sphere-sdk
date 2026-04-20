@@ -196,14 +196,24 @@ export async function importLegacyTokens(
     });
   }
 
-  const skippedByCode = {
+  const skippedByCode: Record<
+    'duplicate' | 'tombstoned' | 'genesis-exists' | 'unknown',
+    number
+  > = {
     duplicate: 0,
     tombstoned: 0,
     'genesis-exists': 0,
     unknown: 0,
   };
   for (const s of importResult.skipped) {
-    skippedByCode[s.code] = (skippedByCode[s.code] ?? 0) + 1;
+    // Defensive: if a new code is added upstream and we forget to
+    // extend this aggregator, bucket it under 'unknown' so nothing
+    // is silently dropped.
+    if (s.code in skippedByCode) {
+      skippedByCode[s.code] = skippedByCode[s.code] + 1;
+    } else {
+      skippedByCode.unknown = skippedByCode.unknown + 1;
+    }
   }
 
   const REJECTION_CAP = 100;
