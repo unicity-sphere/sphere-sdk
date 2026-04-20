@@ -147,8 +147,37 @@ function switchToProfile(name: string): boolean {
   config.tokensDir = profile.tokensDir;
   config.network = profile.network;
   config.currentProfile = name;
+  // Clear the previous profile's committed storageMode so the next
+  // invocation re-detects it from the NEW profile's dataDir. Without
+  // this, switching from a Profile-mode wallet to a legacy-mode
+  // wallet would leave `storageMode: 'profile'` in config and the
+  // resolver would honour it — wrong mode opened.
+  delete config.storageMode;
   saveConfig(config);
   return true;
+}
+
+/**
+ * Detect the storage mode of a given dataDir by probing on-disk
+ * artefacts. Returns `null` if nothing identifiable is present
+ * (fresh / never-initialised profile).
+ */
+function detectProfileStorageMode(dataDir: string): 'profile' | 'legacy' | null {
+  try {
+    const orbitdbPath = path.join(dataDir, 'orbitdb');
+    const st = fs.statSync(orbitdbPath);
+    if (st.isDirectory()) return 'profile';
+  } catch {
+    // no orbitdb dir
+  }
+  try {
+    const walletPath = path.join(dataDir, 'wallet.json');
+    const st = fs.statSync(walletPath);
+    if (st.isFile() && st.size > 0) return 'legacy';
+  } catch {
+    // no wallet.json
+  }
+  return null;
 }
 
 // =============================================================================
@@ -1902,9 +1931,19 @@ async function main() {
               for (const profile of store.profiles) {
                 const isCurrent = config.currentProfile === profile.name;
                 const marker = isCurrent ? '→ ' : '  ';
+                // Detect storage mode from on-disk artefacts. For the
+                // active profile, also check the committed
+                // `config.storageMode` (set by `init` or the resolver)
+                // so a pristine-but-intended profile shows its pending
+                // mode instead of blank.
+                const detected = detectProfileStorageMode(profile.dataDir);
+                const storage = detected
+                  ?? (isCurrent ? config.storageMode : undefined)
+                  ?? '(not initialised)';
                 console.log(`${marker}${profile.name}`);
                 console.log(`    Network: ${profile.network}`);
                 console.log(`    DataDir: ${profile.dataDir}`);
+                console.log(`    Storage: ${storage}`);
               }
             }
             console.log('─'.repeat(60));
@@ -2013,6 +2052,10 @@ async function main() {
 
             console.log(`DataDir:   ${config.dataDir}`);
             console.log(`Network:   ${config.network}`);
+            const detectedStorage = detectProfileStorageMode(config.dataDir);
+            console.log(
+              `Storage:   ${detectedStorage ?? config.storageMode ?? '(not initialised)'}`,
+            );
 
             // Try to get identity
             try {
