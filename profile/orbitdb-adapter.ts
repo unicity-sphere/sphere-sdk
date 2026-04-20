@@ -97,6 +97,36 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // Build libp2p config with gossipsub if available
       if (gossipsubFactory && typeof libp2pDefaults === 'function') {
         const libp2pConfig = libp2pDefaults();
+
+        // Strip WebRTC transports in Node. `@libp2p/webrtc` relies on
+        // `node-datachannel` which is browser-first; on Node it emits
+        // `DataChannel is closed` errors during shutdown and isn't
+        // actually reachable from peers without signalling. TCP +
+        // WebSocket + circuit-relay cover every peer-to-peer path we
+        // actually use (Helia gateway dials, OrbitDB OpLog replication
+        // via gossipsub, NAT traversal via dcutr on a relay).
+        //
+        // Each transport in `libp2pDefaults()` is a factory function
+        // whose `.toString()` reveals its constructor (e.g.
+        // `new WebRTCTransport(...)`). Matching on the source string
+        // is the only portable identifier across libp2p versions that
+        // don't set `[Symbol.toStringTag]` on the factory.
+        if (!isBrowserEnvironment() && Array.isArray(libp2pConfig.transports)) {
+          libp2pConfig.transports = libp2pConfig.transports.filter((factory: any) => {
+            try {
+              const src = typeof factory === 'function' ? factory.toString() : '';
+              return !src.includes('WebRTC');
+            } catch {
+              return true; // keep on inspection failure
+            }
+          });
+        }
+        if (!isBrowserEnvironment() && libp2pConfig.addresses?.listen) {
+          libp2pConfig.addresses.listen = libp2pConfig.addresses.listen.filter(
+            (addr: string) => !addr.includes('webrtc'),
+          );
+        }
+
         libp2pConfig.services = {
           ...libp2pConfig.services,
           pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
@@ -471,4 +501,15 @@ function coerceToUint8Array(value: unknown): Uint8Array {
   }
   // If the value is something unexpected, return an empty array.
   return new Uint8Array(0);
+}
+
+/**
+ * True when running in a browser-like environment (Window present).
+ * In browsers we keep WebRTC because it's the only viable direct
+ * peer-to-peer transport from a page — TCP/WebSocket-only browser
+ * nodes can't initiate inbound connections. In Node we strip it
+ * because `node-datachannel` is a workaround rather than real support.
+ */
+function isBrowserEnvironment(): boolean {
+  return typeof (globalThis as { window?: unknown }).window !== 'undefined';
 }
