@@ -1,9 +1,9 @@
 # UXF Profile — Aggregator-Anchored OpLog Pointer
 
-**Status:** Draft v3 — arch↔spec byte-level reconciliation
+**Status:** Draft v3.1 — arch↔spec byte-level reconciliation + hardening narration
 **Date:** 2026-04-20
 **Supersedes:** `profile/profile-ipns.ts` (IPNS snapshot stopgap)
-**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
+**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3.1, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
 **Related:**
 - [`docs/uxf/PROFILE-ARCHITECTURE.md`](./PROFILE-ARCHITECTURE.md) §2.3 (multi-bundle model), §7.6 (migration), §2.1 (global-keys model)
 - [`state-transition-sdk`](https://github.com/unicitylabs/state-transition-sdk) — all cryptographic primitives are consumed from this SDK wherever possible (§4.6)
@@ -216,7 +216,7 @@ The body of `recoverFromIpnsSnapshot` is replaced by `recoverFromAggregatorPoint
 | No-pointer-yet case | Silent no-op, verified via an aggregator-provided exclusion proof at `V=1` |
 | Aggregator unreachable | **Logged warning; proceed; BUT the next user-originated publish is blocked until reachability is confirmed (§6.7, C-5).** This prevents a transient outage from silently overwriting a legitimate remote history. |
 | Partial publish detected | Handled per §12.3 (retry side B idempotently at the same `V`) |
-| Proof verification | Every inclusion or exclusion proof is verified via `InclusionProof.verify(trustBase, requestId)`. Unverifiable proofs abort recovery with `AGGREGATOR_POINTER_PROOF_INVALID`. |
+| Proof verification | Every inclusion or exclusion proof is verified via `InclusionProof.verify(trustBase, requestId)`. Unverifiable proofs abort recovery with `AGGREGATOR_POINTER_UNTRUSTED_PROOF`. |
 
 ### 3.4 Interactions with existing layers
 
@@ -271,7 +271,7 @@ Let `mk` denote the wallet's 32-byte secp256k1 private key — **the same key us
       └── HKDF-Expand(info = "uxf-profile-pointer-pad-v1",  L=32)  →  padSeed
                                                                      │
                                                                      ▼
-                                             padBytes_V = HKDF-Expand(padSeed,
+                                             paddingBytes_v = HKDF-Expand(padSeed,
                                                                       info = be32(V) || bytes_of("pad"),
                                                                       L = 63 − cidLen)
                                              (shared across both sides)
@@ -340,10 +340,10 @@ Padding bytes are NOT generated from a CSPRNG. They are derived deterministicall
 ```
 cidLen       = len(cidBytes)           (1 ≤ cidLen ≤ 63)
 padLength    = 63 − cidLen             (always ≥ 0)
-padBytes_V   = HKDF-Expand(padSeed, info = be32(V) || bytes_of("pad"), L = padLength)
+paddingBytes_v   = HKDF-Expand(padSeed, info = be32(V) || bytes_of("pad"), L = padLength)
 ```
 
-The single `padBytes_V` buffer occupies plaintext offsets `[1 + cidLen .. 64)` of the 64-byte envelope (spanning side A and side B, see §4.4 layout); there is no per-side padding.
+The single `paddingBytes_v` buffer occupies plaintext offsets `[1 + cidLen .. 64)` of the 64-byte envelope (spanning side A and side B, see §4.4 layout); there is no per-side padding.
 
 Benefits:
 
@@ -351,7 +351,7 @@ Benefits:
 - **No CSPRNG dependency** at publish time.
 - Privacy-neutral: `padSeed` is secret-derived; the ciphertext is still uniformly-random-looking to any observer without `pointerSecret`.
 
-Under the random-oracle model, `padBytes_V` is independent of `xorKey_{side, V}` and `stateHashDigest_{side, V}` because padding derives from `padSeed` under a `"pad"` suffix, while the `xorKey` and `stateHashDigest` are bare SHA-256 over `xorSeed`-prefixed preimages under `"xor"` and `"state"` suffixes respectively (see §4.3). Domain separation via distinct seeds and distinct suffixes makes the three outputs computationally independent.
+Under the random-oracle model, `paddingBytes_v` is independent of `xorKey_{side, V}` and `stateHashDigest_{side, V}` because padding derives from `padSeed` under a `"pad"` suffix, while the `xorKey` and `stateHashDigest` are bare SHA-256 over `xorSeed`-prefixed preimages under `"xor"` and `"state"` suffixes respectively (see §4.3). Domain separation via distinct seeds and distinct suffixes makes the three outputs computationally independent.
 
 ### 4.6 SDK primitives used (reviewer N-4)
 
@@ -474,7 +474,7 @@ Recovery is triggered in `ProfileTokenStorageProvider::initialize` when the loca
 2. **Obtain the trust base.** Load `RootTrustBase` per §6.5. If unavailable, abort recovery with a diagnostic — we will not accept unverified aggregator claims.
 3. **Probe reachability.** A single probe at `V = 1` tells us whether the aggregator is reachable AND whether any pointer exists. If the aggregator is unreachable, enter the blocked state (§6.7).
 4. **Discover `V_true`.** Run exponential + binary search (§10). **Probe both `r_A(V)` and `r_B(V)` at every probed version** (reviewer C-3). Seed the search with `max(localVersion, 0)` if a stale local counter is available (reviewer W-7).
-5. **Fetch and verify.** Request inclusion proofs at `(r_A(V), r_B(V))` and exclusion proofs at `(r_A(V+1), r_B(V+1))`. Verify each via `InclusionProof.verify(trustBase, requestId)`. If any verification fails, abort with `AGGREGATOR_POINTER_PROOF_INVALID`.
+5. **Fetch and verify.** Request inclusion proofs at `(r_A(V), r_B(V))` and exclusion proofs at `(r_A(V+1), r_B(V+1))`. Verify each via `InclusionProof.verify(trustBase, requestId)`. If any verification fails, abort with `AGGREGATOR_POINTER_UNTRUSTED_PROOF`.
 6. **Decrypt.** Compute `xorKey(A, V)` and `xorKey(B, V)`. XOR each leaf's ciphertext digest to recover the plaintext halves.
 7. **Reconstruct the CID.** Read `L = plainA[0]`, assemble `cid = (plainA[1..32] ‖ plainB[0..])[0..L]`, attempt CID decode (codec, multihash check). On failure, emit `AGGREGATOR_POINTER_CORRUPT` and abort — see §12.4.
 8. **Fetch the CAR.** Via existing `fetchFromIpfs(cid)`. If unavailable on all gateways, log and proceed with empty state (same fallback as IPNS today).
@@ -489,7 +489,7 @@ fn recover(mk, trustBase):
     signingService := SigningService.createFromSecret(signingSeed)
     signingPubKey := signingService.publicKey
 
-    V := findLatestVersion(pointerSecret, signingPubKey, trustBase)
+    V := findLatestVersion(pointerSecret, signingPubKey, trustBase, localVersion)
     if V == 0:
         return EmptyProfile
 
@@ -522,13 +522,12 @@ Every proof returned by the aggregator is verified locally via `InclusionProof.v
 
 **Problem on a fresh device with only a mnemonic.** No prior trust-base fingerprint is stored locally.
 
-**Layered mitigation strategy:**
+**Layered mitigation strategy (v3.1 hardening: multi-mirror cross-check promoted from RECOMMENDED to MANDATORY):**
 
-1. **Initial TOFU (Trust-On-First-Use).** On the very first aggregator contact from a fresh device, the wallet accepts the advertised trust-base root as correct. This is the minimum bootstrap level for v1.
-2. **Multi-mirror cross-check (v1.5).** Query 2+ independent aggregator mirrors and require matching roots. Any mismatch → abort with operator alert. Cheap; recommended as a fast-follow.
-3. **L1-anchored pinning (v2).** The aggregator root is periodically anchored to an ALPHA (L1) coinbase height. The wallet pins the most recent L1-anchored root and rejects aggregator roots that do not chain to it. Strongest guarantee; requires the L1 anchoring mechanism, which is outside this PR.
+1. **TOFU + MANDATORY multi-mirror cross-check.** On the very first aggregator contact from a fresh-install / mnemonic-only device, the wallet MUST query **at least `MIN_MIRROR_COUNT = 2` independently-addressed aggregator mirrors** (spec §3 / §8.4) and require their advertised `RootTrustBase` values to be byte-identical. Any divergence aborts recovery with `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` and surfaces an operator alert. **Single-mirror TOFU is NOT permitted in v1 shipping builds.** This closes the cold-start MITM attack where a single compromised mirror serves a forged trust base that then verifies any fabricated inclusion/exclusion proof the attacker wishes. See spec §8.4 for the normative rule and `MIN_MIRROR_COUNT` constant.
+2. **L1-anchored pinning (v2).** The aggregator root is periodically anchored to an ALPHA (L1) coinbase height. The wallet pins the most recent L1-anchored root and rejects aggregator roots that do not chain to it. Strongest guarantee; requires the L1 anchoring mechanism, which is outside this PR.
 
-The architecture document does NOT mandate (2) or (3) for the initial implementation — they are documented as the roadmap. What IS mandated is that (1) the TOFU path is explicit, logged, and user-visible, and (2) verification is never skipped.
+The architecture document does NOT mandate (2) for the initial implementation — it is documented as the roadmap. What IS mandated is that (1) is applied on every fresh-install recovery, the trust-base values across mirrors are compared byte-identically, verification is never skipped, and the code path is explicit, logged, and user-visible.
 
 ### 6.6 Fresh-wallet / no-pointer-yet case
 
@@ -542,8 +541,14 @@ A wallet that has never published (new mnemonic, freshly imported, no activity) 
 
 The wallet maintains a per-wallet **persistent** BLOCKED flag — the canonical storage key is `BLOCKED_FLAG_KEY = "profile.pointer.blocked." + hex(signingPubKey)` (spec §10.2.1). The flag survives process restarts. An absent key is equivalent to `false`. When BLOCKED is set, `publishAggregatorPointerBestEffort` refuses to run and the publish attempt surfaces `AGGREGATOR_POINTER_UNREACHABLE_RECOVERY_BLOCKED`. The state flips as follows:
 
-- **SET BLOCKED** when ALL of these hold (spec §10.2.2): (i) recovery (`initialize()` or a subsequent reconciliation) hit a **categorical** transport error (timeout, connection refused, DNS failure, TLS error — NOT a transient 5xx); (ii) the local OpLog contains at least one **user-originated** write; (iii) at least one retry with exponential backoff has already failed. Re-SET on the same category of error during a subsequent publish.
-- **User-originated write** is defined as an OpLog entry authored by THIS device's signing identity — `entry.signedBy == localSigningPubKey` (spec §10.2.3). Replicated entries from other devices (OrbitDB gossipsub, Nostr DM ingest, any inbound replication) are NOT user-originated and do NOT justify blocking.
+- **SET BLOCKED** when ALL of these hold (spec §10.2.2 enumerates four explicit conditions; arch presents them in the same order — see spec for the normative list):
+  - (i) `initialize()` — or any subsequent reconciliation pass — has actually attempted to reach the aggregator for recovery (the precondition that a probe was even issued);
+  - (ii) that attempt hit a **categorical** transport error (timeout, connection refused, DNS failure, TLS error — NOT a transient 5xx that may retry-succeed);
+  - (iii) the local OpLog contains at least one **user-originated** write (see next bullet);
+  - (iv) at least one retry with exponential backoff has already been attempted AND failed (to avoid flapping on single transient failures).
+
+  Re-SET on the same category of error during a subsequent publish.
+- **User-originated write** is defined as an OpLog entry authored by THIS device's signing identity — `entry.signedBy == localChainKeyPublicKey` (i.e., the wallet's chain-key secp256k1 public key, NOT the pointer-layer `signingPubKey` from §4.1). The spec uses this as `localSigningPubKey` in §10.2.3 and defines it normatively as "the wallet's chain-key `SigningService` on this device"; the arch document uses `localChainKeyPublicKey` to keep the distinction from the pointer-layer signing key explicit. Replicated entries from other devices (OrbitDB gossipsub, Nostr DM ingest, any inbound replication) are NOT user-originated and do NOT justify blocking.
 - **CLEAR BLOCKED** only after EITHER (spec §10.2.4):
   - (a) a trustlessly-verified **exclusion** proof at `requestId_{A,1}` AND `requestId_{B,1}` (applies only when `localVersion == 0`), OR
   - (b) a successful `recoverLatest()` yielding `V_true > 0` AND the CAR is fetched from IPFS AND the remote bundle is merged into the local OpLog.
@@ -551,6 +556,8 @@ The wallet maintains a per-wallet **persistent** BLOCKED flag — the canonical 
 - **User override protocol** (optional; spec §10.2.5). For permanent-outage scenarios (regional outage, deprecated testnet, air-gapped recovery), implementations MAY expose an opt-in, per-call, capability-gated override that bypasses BLOCKED. Each use emits `pointer:publish_override_used { version, reason }` telemetry. v1 implementations MAY omit the override entirely.
 
 This preserves user-visible write semantics (the wallet appears to function, local OpLog fills) while guaranteeing that the next on-aggregator commit cannot silently overwrite a remote history.
+
+**Fresh-install corrupt-payload case (v3.1 hardening).** A fresh-install wallet with `localVersion == 0` whose recovery produces a corrupt XOR-decoded payload — i.e., discovery returns a verified pointer at `V > 0` but the decoded bytes fail `isValidCid` — MUST also enter BLOCKED, even though the fresh OpLog contains zero user-originated writes and conditions (iii)/(iv) above are not literally satisfied. This closes the MITM attack where a forged aggregator mirror serves garbage at cold-start to coax the client into "no pointer exists → publish at `v = 1`" behavior that silently overwrites legitimate remote history the moment the MITM lifts. BLOCKED in this sub-case clears only after a multi-mirror-verified recovery (§12) that produces a non-corrupt payload; repeated `AGGREGATOR_POINTER_CORRUPT` or any `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` keeps BLOCKED set. See spec §10.2.6 for the formal rule.
 
 ---
 
@@ -736,6 +743,19 @@ The 1-byte length prefix is XOR-blinded by the same pad as the rest of the leaf.
 | Observer infers version count | — | Observable via probe patterns (acknowledged) |
 | Observer infers activity cadence | — | Observable (acknowledged) |
 | IP / timing correlation of a signing-key-clustered commit stream | — | Observable; linkability deanonymizes the stream (documented, deferred mitigation) |
+| Probe-sequence fingerprint across sessions (§9.7) | — | Observable per-session; cross-session clustering even when IP rotates (documented, v2 mitigations deferred) |
+
+### 9.7 Probe-sequence fingerprint (v3.1 disclosure)
+
+The discovery algorithm's probe sequence (Phase 1 exponential expansion, Phase 2 binary search — §10) is **deterministic in `(V_true, localVersion)`**. An aggregator operator who logs per-session probe sequences across many sessions can correlate sessions originating from the same wallet by recognizing the characteristic `(lo, hi, mid_1, mid_2, ...)` pattern that falls out of the seeded binary search, **even when the wallet rotates IPs between sessions**. This is a strictly stronger clustering signal than `signingPubKey` alone: `signingPubKey` is sent in every authenticator at publish time, but probe-GET traffic during pure recovery need not include it — yet the probe pattern itself still betrays the wallet.
+
+Mitigations considered but deferred to v2 future work:
+
+- **Randomized Phase 1 exponential base** (e.g., each session draws a fresh factor in `[1.5, 2.5]` from a session-local PRNG so the doubling schedule varies).
+- **Decoy probes** — each real probe is accompanied by `k` fake probes at unrelated request IDs drawn from the same `pointerSecret`-derived family, making the operator's job `O(C(real+fake, real))` harder.
+- **Batching across sessions to reuse cached `V_true`** — avoid repeating the search when `localVersion` is already known.
+
+None of these are part of v1; all are explicitly called out as probe-sequence hardening to ship later. See spec §11.10.
 
 ---
 
@@ -873,6 +893,23 @@ Exclusion proofs are verifiable against the SMT root. A lying aggregator must fo
 
 See §5.5. Explicit `Profile.resetPointerVersion()` migration hook.
 
+### 12.9 CAR unavailable after successful recovery (v3.1)
+
+When discovery yields a verified pointer at `V > 0` and both the inclusion proofs at `(r_A(V), r_B(V))` AND the exclusion proofs at `(r_A(V+1), r_B(V+1))` pass `InclusionProof.verify`, but `fetchFromIpfs(cid)` returns 404 / unreachable / times out on *every* configured gateway, the wallet enters an `AGGREGATOR_POINTER_CAR_UNAVAILABLE` state. This is distinct from §12.2 BLOCKED: here the aggregator IS reachable and `V_true` is trustlessly known; only the CAR bytes are missing.
+
+Behavior (narrative; spec §10.4 owns the normative rule):
+
+- Raise `AGGREGATOR_POINTER_CAR_UNAVAILABLE` to the caller.
+- Do NOT advance `localVersion` past `V_true`.
+- Refuse subsequent `publish()` calls until EITHER the CAR becomes fetchable on retry OR the caller invokes the explicit operator override `acceptCarLoss(version)` with user consent. Advancing `localVersion` past an unfetchable bundle would silently overwrite legitimate remote history the instant fetch becomes possible again — a data-loss path that the caller must opt into.
+- Emit `pointer:recover_car_unavailable { version, cid }` for UI surfacing; emit `pointer:car_loss_accepted { version }` when the override is invoked.
+
+Also subject to v3.1 CAR size/fetch caps and associated error codes (spec §3.1 / §10.4): excessively large CARs or fetches exceeding `MAX_CAR_FETCH_MS` abort locally rather than blocking progress indefinitely.
+
+### 12.10 Async-await convention in arch pseudocode (v3.1)
+
+All SDK calls shown in arch pseudocode (`.digest()`, `SigningService.createFromSecret`, `RequestId.createFromImprint`, `Authenticator.create`, `aggregatorClient.submitCommitment`, `InclusionProof.verify`) are asynchronous; the `await` keyword is elided for readability. See spec §4 footnote for the normative convention.
+
 ---
 
 ## 13. Observability
@@ -886,6 +923,14 @@ The SDK MUST emit structured telemetry events (reviewer W-8) to allow operators 
 | `pointer.discover.probe` | `{ version, included, latencyMs }` | Every probe in the logarithmic search |
 | `pointer.recover.outcome` | `{ foundVersion, cidDecodeOk, carFetchMs, outcome }` | End of recovery flow |
 | `pointer.conflict.detected` | `{ atVersion, retryAttempt }` | Every conflict-triggered reconciliation |
+
+v3.1 hardening adds the following UI-facing events (normative taxonomy in spec §13):
+
+| Event | Fields | When |
+|---|---|---|
+| `pointer:recover_car_unavailable` | `{ version, cid }` | Discovery succeeded with a trustlessly-verified pointer at `V > 0`, but every IPFS gateway failed to return the CAR (§12.9; spec §10.4) |
+| `pointer:car_loss_accepted` | `{ version }` | The caller invoked `acceptCarLoss(version)` to opt into data loss and unblock publish (§12.9; spec §13 API surface) |
+| `pointer:marker_cleared` | `{ version, reason }` | An explicit `clearPendingMarker()` removed a stuck `pending_version` marker — operator escape hatch for corrupt or orphan markers (spec §7.1 / §13 API surface) |
 
 These complement the UI-facing events in §7.4 (`pointer:publish_started`, etc.). Telemetry events are for operators; UI events are for application integrators.
 
@@ -933,6 +978,16 @@ Expanded per reviewer W-10. Each row's rejection reason is load-bearing; none of
 - Token-manifest derivation.
 - All `TokenStorageProvider` contract semantics visible to `PaymentsModule`.
 
+### 15.2.1 New SDK surface (v3.1 hardening)
+
+Implementations of the pointer layer gain three new API methods on the pointer module, driven by v3.1 failure-mode handling (§12.9, §6.7) and operator escape hatches:
+
+- `acceptCarLoss(version: number): void` — caller opt-in that unblocks publish after §12.9 `AGGREGATOR_POINTER_CAR_UNAVAILABLE`; emits `pointer:car_loss_accepted` telemetry.
+- `clearPendingMarker(): void` — operator escape hatch that removes a stuck `pending_version` marker (e.g., corrupted, orphan after a non-recoverable crash); emits `pointer:marker_cleared` telemetry.
+- `getProbeFingerprint(): ProbeFingerprint | undefined` — optional diagnostic returning a session-local summary of the probe sequence used during discovery, intended for operator analysis of the §9.7 fingerprint disclosure. Implementations MAY omit this method in v1.
+
+Spec §13 is the normative owner of these signatures.
+
 ### 15.3 Grace period
 
 No external consumers read the Profile IPNS records directly — the only reader is `recoverFromIpnsSnapshot`, replaced in the same PR. **No grace period required.** Wallets that had published an IPNS snapshot before the cutover find their IPNS record orphaned post-upgrade and fall through to "proceed with empty state" until their first post-upgrade flush writes a proper aggregator pointer. Live-peer OpLog replication still delivers data in the interim.
@@ -979,3 +1034,4 @@ Once all five approvals are recorded and the spec's Reviewer Sign-Off Checklist 
 | v1 | (initial draft) | First architecture writeup paired with a co-drafted spec v1. |
 | v2 | 2026-04-20 | Reviewer consolidation: unified Q-list, reviewer findings (C-1..C-6, W-1..W-10, N-1..N-10) incorporated. |
 | v3 | 2026-04-20 | Byte-for-byte alignment with spec across stateHash preimage (`xorSeed`, not `pointerSecret`), xorKey (bare SHA-256 via DataHasher, not HKDF-Expand), padding (shared across both sides, `"pad"` suffix in info), constant naming (`PUBLISH_BACKOFF_BASE_MS`/`PUBLISH_BACKOFF_MAX_MS` — no `RETRY_` infix on timings), discovery init seeded from `localVersion`, BLOCKED state machine hardened (persistent flag, user-originated-write criterion, override protocol), `pending_version` marker discipline cross-referenced to spec §7.1, observability override event added. Spec is canonical; arch narrates. Open Questions routed to spec §15.1 as single source of truth. |
+| v3.1 | 2026-04-20 | Hardening pass applied from steelman findings on v3: marker version-jump clamp, retry-window ciphertext zeroization, mandatory multi-mirror TOFU with fresh-install corrupt-payload BLOCKED, CAR size caps and unavailable-state handling, `originated` tag for user-originated OpLog writes, probe-sequence fingerprint disclosure, test-vector runtime rejection, new API methods (`acceptCarLoss`, `clearPendingMarker`, `getProbeFingerprint`). Error-code name aligned (`AGGREGATOR_POINTER_UNTRUSTED_PROOF`). BLOCKED SET conditions aligned (four conditions, "attempted AND failed" phrasing). Symbol naming aligned (`paddingBytes_v`). `findLatestVersion` call-site arity corrected. `localSigningPubKey` disambiguated as wallet chain-key pubkey (`localChainKeyPublicKey`) throughout. Async-await convention footnote added. Note: spec change log F-numbering skips F6 (reserved, not used in v3); arch does not enumerate F-items, so no renumbering is required on the arch side. Spec is canonical; arch narrates. |
