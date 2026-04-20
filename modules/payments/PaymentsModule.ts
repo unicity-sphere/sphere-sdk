@@ -68,6 +68,7 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 // Instant split imports
 import { InstantSplitExecutor } from './InstantSplitExecutor';
@@ -543,6 +544,75 @@ function fromHex(hex: string): Uint8Array {
     bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
   }
   return bytes;
+}
+
+/**
+ * Compute a deterministic dedup key for a pending-mint (pre-finalization)
+ * token, whose genesis.inclusionProof.authenticator.stateHash is not yet
+ * available.
+ *
+ * The real stateHash of a mint gets anchored only after the aggregator
+ * returns the inclusion proof. Until then, importTokens cannot
+ * deduplicate pending tokens by (tokenId, stateHash) because stateHash
+ * is empty. Instead, we hash the genesis DATA itself — `tokenId`,
+ * `tokenType`, `salt`, `recipient`, `tokenData`, `recipientDataHash`
+ * — to produce a stable identifier. A genesis with the same content
+ * produces the same fallback key, so two imports of the same pending
+ * mint collapse cleanly as `duplicate` instead of fighting via
+ * addToken's state-update path.
+ *
+ * The returned key is prefixed with `pending-` so it can never collide
+ * with a real stateHash (which is always a 64-hex SHA-256).
+ *
+ * @param txf - A TxfToken (typically the incoming import candidate).
+ * @returns `pending-<64 hex>` — deterministic per genesis content.
+ */
+function pendingMintDedupKey(txf: {
+  genesis?: {
+    data?: {
+      tokenId?: string;
+      tokenType?: string;
+      salt?: string;
+      recipient?: string | null;
+      tokenData?: string | null;
+      recipientDataHash?: string | null;
+    };
+  };
+}): string {
+  const d = txf.genesis?.data ?? {};
+  const fields = [
+    d.tokenId ?? '',
+    d.tokenType ?? '',
+    d.salt ?? '',
+    d.recipient ?? '',
+    d.tokenData ?? '',
+    d.recipientDataHash ?? '',
+  ].join('|');
+  const digest = sha256(new TextEncoder().encode(fields));
+  let hex = '';
+  for (const b of digest) hex += b.toString(16).padStart(2, '0');
+  return 'pending-' + hex;
+}
+
+/**
+ * Given an incoming TxfToken OR an existing Token's TXF-shaped
+ * sdkData, return the dedup key to use for duplicate detection in
+ * `importTokens`:
+ *   - the real `stateHash` when it exists (finalized tokens)
+ *   - the pending-mint fallback otherwise
+ *
+ * The return is a non-empty opaque string suitable for equality
+ * comparison. Different shapes (real vs pending) never collide
+ * because the pending variant is prefixed.
+ */
+function effectiveDedupKey(txf: Parameters<typeof pendingMintDedupKey>[0] & {
+  genesis?: {
+    inclusionProof?: { authenticator?: { stateHash?: string } };
+  };
+}): string {
+  const stateHash = txf.genesis?.inclusionProof?.authenticator?.stateHash ?? '';
+  if (stateHash) return stateHash;
+  return pendingMintDedupKey(txf);
 }
 
 /**
@@ -3408,13 +3478,19 @@ export class PaymentsModule {
 
       // Determine the incoming state hash from the TxfToken's
       // inclusion-proof authenticator. Same field addToken would
-      // extract via parseSdkDataCached.
+      // extract via parseSdkDataCached. For pending-mint tokens
+      // this is empty '' — we fall back to a content-hash of the
+      // genesis (see `effectiveDedupKey`) so pending imports
+      // still deduplicate cleanly.
       const incomingStateHash =
         txf.genesis?.inclusionProof?.authenticator?.stateHash ?? '';
+      const incomingDedupKey = effectiveDedupKey(txf);
 
-      // -- Pre-check 1: tombstoned (previously spent). This mirrors
-      //    addToken's first guard so we can surface a precise reason
-      //    instead of "addToken returned false" ambiguity.
+      // -- Pre-check 1: tombstoned (previously spent). Only meaningful
+      //    when we have a real stateHash — tombstones are keyed on
+      //    the concrete post-spend hash, which pending tokens don't
+      //    have. A pending token can never be "already spent" (by
+      //    definition its first state transition hasn't happened yet).
       if (incomingStateHash && this.isStateTombstoned(genesisTokenId, incomingStateHash)) {
         skipped.push({
           genesisTokenId,
@@ -3427,15 +3503,37 @@ export class PaymentsModule {
       // Scan in-memory wallet for matching genesis / state. Track
       // the matched token's status so we can distinguish a true
       // "state replaced a live state" from "stale bookkeeping record
-      // (spent/invalid) was overwritten" downstream.
+      // (spent/invalid) was overwritten" downstream. Uses the
+      // effective dedup key so pending-mint duplicates are caught.
       let exactDuplicateLocalId: string | null = null;
       let genesisMatchLocalId: string | null = null;
       let genesisMatchStatus: TokenStatus | null = null;
       for (const [existingId, existing] of this.tokens) {
         const existingTokenId = extractTokenIdFromSdkData(existing.sdkData);
         if (existingTokenId !== genesisTokenId) continue;
-        const existingStateHash = extractStateHashFromSdkData(existing.sdkData);
-        if (incomingStateHash && existingStateHash === incomingStateHash) {
+
+        // Compare via effective dedup key: real stateHash if present,
+        // content-hash of genesis otherwise. Both-pending with same
+        // genesis → key match → duplicate. One-finalized + one-pending
+        // → different keys → falls through to genesis-match branch.
+        let existingDedupKey: string;
+        if (existing.sdkData) {
+          try {
+            const existingTxf = JSON.parse(existing.sdkData) as Parameters<typeof effectiveDedupKey>[0];
+            existingDedupKey = effectiveDedupKey(existingTxf);
+          } catch {
+            // Malformed existing sdkData — treat as genesis-only match.
+            genesisMatchLocalId = existingId;
+            genesisMatchStatus = existing.status;
+            continue;
+          }
+        } else {
+          genesisMatchLocalId = existingId;
+          genesisMatchStatus = existing.status;
+          continue;
+        }
+
+        if (existingDedupKey === incomingDedupKey) {
           exactDuplicateLocalId = existingId;
           break;
         }

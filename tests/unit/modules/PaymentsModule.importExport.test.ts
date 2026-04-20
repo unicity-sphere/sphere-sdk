@@ -392,6 +392,45 @@ describe('PaymentsModule.exportTokens / importTokens', () => {
       }
     });
 
+    it('pending-mint tokens deduplicate correctly via genesis fallback key', async () => {
+      // Regression for steelman finding: a token without a finalized
+      // stateHash (pending mint, mid-aggregator) used to fall through
+      // the exact-duplicate check because `incomingStateHash && ...`
+      // short-circuited on ''. Two imports of the same pending mint
+      // then churned through addToken's CASE 3 (archive + replace by
+      // local UUID), producing misleading 'state-replaced' entries.
+      //
+      // Fix: `effectiveDedupKey` falls back to a content-hash of the
+      // genesis data when stateHash is empty. Two imports of the same
+      // pending genesis now collide as 'duplicate'.
+      const pendingTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: '' });
+
+      const first = await module.importTokens([pendingTxf]);
+      expect(first.added).toHaveLength(1);
+      expect(first.added[0].code).toBe('added');
+
+      const second = await module.importTokens([pendingTxf]);
+      expect(second.added).toHaveLength(0);
+      expect(second.skipped).toHaveLength(1);
+      expect(second.skipped[0].code).toBe('duplicate');
+    });
+
+    it('pending + finalized with the same genesis are NOT duplicates (different states)', async () => {
+      // Sanity: the fallback key must never collide with a real
+      // stateHash. A pending-mint and its finalized counterpart live
+      // at different dedup keys — second one goes through the
+      // genesis-match branch (state-replaced in lenient mode).
+      const pendingTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: '' });
+      await module.importTokens([pendingTxf]);
+
+      const finalizedTxf = buildTxf({ tokenId: TOKEN_A_ID, stateHash: STATE_HASH_1 });
+      const result = await module.importTokens([finalizedTxf]);
+      expect(result.skipped).toHaveLength(0);
+      // Added, but flagged as state-replaced (prior pending record exists)
+      expect(result.added).toHaveLength(1);
+      expect(result.added[0].code).toBe('state-replaced');
+    });
+
     it('lenient mode: replacing a SPENT token record is labelled stale-record-replaced, not state-replaced', async () => {
       // Regression for steelman finding: addToken's CASE 1 fires on a
       // spent/invalid pre-existing entry and returns true via the same
