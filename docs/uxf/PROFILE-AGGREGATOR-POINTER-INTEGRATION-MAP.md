@@ -18,11 +18,11 @@ Read first: `PROFILE-AGGREGATOR-POINTER-SPEC.md`, `PROFILE-AGGREGATOR-POINTER-AR
 | `core/Sphere.ts` | 3827 (`destroy()`) | **Extend** to release pointer-layer mutex, stop probe-fingerprint telemetry, flush BLOCKED flag state | SPEC §7.1.1 mutex cleanup | Low |
 | `core/errors.ts` | 27–107 (`SphereErrorCode` union) | **Extend** with 27 `AGGREGATOR_POINTER_*` codes + `SECURITY_ORIGIN_MISMATCH` | SPEC §12 | Low — additive; error-code consumers (Connect dApps) need documentation only |
 | `constants.ts` | 22–62 (`STORAGE_KEYS_GLOBAL`) | **Add** 3 keys: `POINTER_VERSION` (scoped), `POINTER_PENDING_VERSION`, `POINTER_BLOCKED_FLAG`, `POINTER_MUTEX` | SPEC §7.1.1, §7.1.2, §10.2.1 | Low — additive |
-| `constants.ts` | anywhere after §NETWORKS | **Add** `POINTER_*` timing/retry constants from SPEC §3 (`PUBLISH_RETRY_BUDGET`, `PUBLISH_BACKOFF_MAX_MS`, `DISCOVERY_INITIAL_VERSION`, `DISCOVERY_HARD_CEILING`, `DISCOVERY_CORRUPT_WALKBACK`, `MARKER_MAX_JUMP`, `CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS`, `CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS`, `POINTER_PEER_DISCOVERY_MS`, `MAX_CAR_BYTES`, `MAX_CAR_FETCH_TOTAL_MS`, `MAX_CAR_FETCH_STALL_MS`, `MIN_MIRROR_COUNT`, `PROBE_REQUEST_TIMEOUT_MS`, `VERSION_MIN`, `VERSION_MAX`, `CID_MAX_BYTES`, `MIRROR_LIST_SHA256`, `MIRROR_CERT_PINS`) | SPEC §3 (normative) | Low |
+| `constants.ts` | anywhere after §NETWORKS | **Add** `POINTER_*` timing/retry constants from SPEC §3 (`PUBLISH_RETRY_BUDGET`, `PUBLISH_BACKOFF_MAX_MS`, `DISCOVERY_INITIAL_VERSION`, `DISCOVERY_HARD_CEILING`, `DISCOVERY_CORRUPT_WALKBACK`, `MARKER_MAX_JUMP`, `CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS`, `CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS`, `POINTER_PEER_DISCOVERY_MS`, `MAX_CAR_BYTES`, `MAX_CAR_FETCH_TOTAL_MS`, `MAX_CAR_FETCH_STALL_MS`, `PROBE_REQUEST_TIMEOUT_MS`, `VERSION_MIN`, `VERSION_MAX`, `CID_MAX_BYTES`). SPEC v3.4 removed `MIN_MIRROR_COUNT`, `MIRROR_LIST_SHA256`, `MIRROR_CERT_PINS`. | SPEC §3 (normative, v3.4) | Low |
 | `oracle/oracle-provider.ts` | 25–88 | **Minor extend**: declare optional `submitPointerCommitment?(req)` and `getExclusionProof?(requestId)`, OR require consumers to call `getAggregatorClient()` and use the SDK client directly (no interface change) | SPEC §4.6, §8.1 | Low if latter route taken |
 | `oracle/UnicityAggregatorProvider.ts` | 123–310 | **No change** — already exposes `getAggregatorClient()` which returns the underlying `@unicitylabs/state-transition-sdk/AggregatorClient`. Pointer layer uses that directly | ARCH §3.4, §4.6 | Low |
 | `impl/shared/ipfs/ipns-key-derivation.ts` | full file | **Keep** (still used by non-Profile IPFS path); pointer layer uses the same HKDF pattern with different info strings | ARCH §3.4 | Low |
-| `impl/shared/trustbase-loader.ts` | full file | **Extend** to expose a `RootTrustBase` ready for multi-mirror TOFU (SPEC §8.4). Currently returns a single embedded TrustBase per network | ARCH §6.5, SPEC §8.4 | Medium — multi-mirror design not yet reflected in loader interface |
+| `impl/shared/trustbase-loader.ts` | full file | **Consumed unchanged** (SPEC v3.4 §8.4 embedded-trust-base model). No refactor needed: the existing single-embedded-TrustBase-per-network loader is the v1 correct pattern. Pointer layer obtains the same instance via `OracleProvider.getRootTrustBase()` (T-C7). | ARCH §6.5, SPEC v3.4 §8.4 | None in v1 — multi-mirror TOFU deferred to v2 |
 | `impl/shared/ipfs/ipfs-http-client.ts` | full file | **Extend** with CAR-fetch stall-rate enforcement, content-encoding rejection, multi-gateway race with timeouts | SPEC §3 (`MAX_CAR_FETCH_STALL_MS`), §10.7, §12 `CAR_UNEXPECTED_ENCODING` | Medium — shared with existing non-Profile IPFS paths |
 | `impl/browser/index.ts` + `createBrowserProviders` | factory function | **Extend** to inject Web Locks API verification (reject fallback) for pointer mutex (SPEC §7.1.1) and pass the `RootTrustBase` to the Profile storage provider | SPEC §7.1.1 | Medium |
 | `impl/nodejs/index.ts` + `createNodeProviders` | factory function | **Extend** to configure `proper-lockfile`-based publish mutex at `<dataDir>/profile/<hex(pubkey)>/publish.lock` | SPEC §7.1.1 | Low — `proper-lockfile` already a dep |
@@ -53,6 +53,8 @@ The `OracleProvider` interface in `oracle/oracle-provider.ts:25–88` already ha
 
 **Open question:** should we add a discoverability hint to `OracleProvider` (e.g., `supportsRawCommitments: boolean`) or just fail loudly if `getAggregatorClient()` returns `undefined`? Prefer the latter — fewer interface surfaces.
 
+**SPEC v3.4 addition:** `OracleProvider.getRootTrustBase()` (added by T-C7) returns the embedded `RootTrustBase` instance from `assets/trustbase/<network>.ts` — the same instance `PaymentsModule` / L4 consumes (H6 shared-base contract, SPEC v3.4 §8.4.2). The pointer layer consumes this getter directly; no mirror list, no multi-mirror cross-check, no runtime fetch. Multi-mirror TOFU is v2 future work.
+
 ### 2.2 Nostr transport
 Not reused. Pointer layer is strict HTTP JSON-RPC to the aggregator. The one cross-call is the `POINTER_PEER_DISCOVERY_MS` poll over OrbitDB gossipsub / Nostr for the `acceptCarLoss` protocol (SPEC §10.7.1 step 3) — this uses the existing `NostrTransportProvider` and OrbitDB gossipsub pubsub, no new transport.
 
@@ -60,13 +62,13 @@ Not reused. Pointer layer is strict HTTP JSON-RPC to the aggregator. The one cro
 SPEC §4 requires `pointerSecret = HKDF-SHA256-Extract+Expand(walletPrivateKey, info="uxf-profile-aggregator-pointer-v1")`. The existing wallet private key is available via `FullIdentity.privateKey` (hex) in Sphere and Profile; the existing `deriveProfileIpnsIdentity` in `profile/profile-ipns.ts:111–127` already shows the correct HKDF pattern. **No changes needed to BIP32 derivation** — pointer layer derives from the private key post-BIP32 via HKDF, not a new BIP32 path.
 
 ### 2.4 HTTP client / fetch wrapper
-`impl/shared/ipfs/ipfs-http-client.ts` is a shared fetch wrapper. The pointer layer's aggregator JSON-RPC path reuses the AggregatorClient's internal HTTP transport (from `state-transition-sdk`), not this one. However, multi-mirror TOFU (SPEC §8.4) and CAR-fetch with stall-rate enforcement (SPEC §10.7) DO need a hardened HTTP layer with:
-- TLS cert pinning per `MIRROR_CERT_PINS` (SPEC §3, H9).
-- Bundled mirror-list integrity check via `MIRROR_LIST_SHA256`.
+`impl/shared/ipfs/ipfs-http-client.ts` is a shared fetch wrapper. The pointer layer's aggregator JSON-RPC path reuses the AggregatorClient's internal HTTP transport (from `state-transition-sdk`), not this one. CAR-fetch with stall-rate enforcement (SPEC §10.7) needs a hardened HTTP layer with:
 - Content-encoding header rejection for CAR fetches.
-- Multi-mirror parallel fetch with byte-identical cross-check.
+- Per-gateway timeout + retry.
 
-**Open question:** should this live in `impl/shared/ipfs/` (reuse existing HTTP client) or in a new `profile/pointer/http-client.ts` isolated to the pointer path? I recommend isolated — the cert-pinning + mirror-list checks are pointer-specific trust-base bootstrap, not general IPFS.
+**SPEC v3.4 scope reduction:** TLS cert pinning (formerly via `MIRROR_CERT_PINS`), bundled mirror-list integrity (formerly via `MIRROR_LIST_SHA256`), and multi-mirror parallel fetch with byte-identical cross-check are **deferred to v2** under the embedded-trust-base model. No pointer-specific HTTP hardening beyond the CAR-fetch stall/encoding concerns above.
+
+**Open question:** should this live in `impl/shared/ipfs/` (reuse existing HTTP client) or in a new `profile/pointer/http-client.ts` isolated to the pointer path? Under SPEC v3.4 reduced scope, reusing the shared IPFS HTTP client is preferable — no pointer-specific cert-pinning / mirror-list hardening to isolate.
 
 ---
 
@@ -100,9 +102,9 @@ SPEC §4 requires `pointerSecret = HKDF-SHA256-Extract+Expand(walletPrivateKey, 
 - **Test coverage needed:** every error code must have at least one emitting test case; TEST-SPEC explicitly enumerates scenarios N1–N14 covering most codes.
 
 ### 3.5 `constants.ts`
-- **What changes:** Add a new block `POINTER_CONSTANTS` mirroring SPEC §3 exactly. Include the mirror cert-pin fingerprints and `MIRROR_LIST_SHA256` as string constants.
+- **What changes:** Add a new block `POINTER_CONSTANTS` mirroring SPEC §3 (v3.4) exactly. SPEC v3.4 removed `MIN_MIRROR_COUNT`, `MIRROR_LIST_SHA256`, `MIRROR_CERT_PINS` — none to bundle.
 - **Why:** SPEC §3 is normative; constants must be in-bundle so they can't be tampered via runtime config.
-- **Risk:** Low. **Open question:** should `MIRROR_LIST_SHA256` live in `assets/` alongside the bundled trustbase data instead? That's where `trustbase-loader.ts` pulls from. Recommend YES for consistency.
+- **Risk:** Low. Mirror-related constants are absent in v1; if multi-mirror TOFU returns in v2, they will be reintroduced alongside the bundled trustbase assets.
 - **Test coverage needed:** Constants freeze test — verify no runtime mutation.
 
 ### 3.6 `package.json`
@@ -229,13 +231,13 @@ Scanned `package.json` (lines 161–181). Required primitives per SPEC §4.6:
 
 ## §9 Surprises / unknowns
 
-1. **Duplicate TokenRegistry bundles (existing, CLAUDE.md-documented).** `Sphere.configureTokenRegistry()` (Sphere.ts:787) runs TWICE — once in `createBrowserProviders`, once in `Sphere.init`, because tsup duplicates the singleton. The pointer layer has a similar risk with its `RootTrustBase` bundled constants. Recommend: make the pointer layer a pure function module with no singleton state; pass `trustBase` / `mirrors` explicitly.
+1. **Duplicate TokenRegistry bundles (existing, CLAUDE.md-documented).** `Sphere.configureTokenRegistry()` (Sphere.ts:787) runs TWICE — once in `createBrowserProviders`, once in `Sphere.init`, because tsup duplicates the singleton. The pointer layer has a similar risk with its `RootTrustBase` bundled constants. Recommend: make the pointer layer a pure function module with no singleton state; pass `trustBase` explicitly (the embedded instance obtained via `OracleProvider.getRootTrustBase()` per SPEC v3.4 §8.4.2). No `mirrors` parameter in v1.
 
 2. **IPNS fallback contradicts ARCH §15.1 "delete the file".** ARCH declares `profile/profile-ipns.ts` deleted wholesale. But §5 backward compatibility requires it for N14 (pre-pointer wallet cold-start). **Open question:** strict migration (break N14, matching ARCH §15.3 "no grace period") or compat window? The spec's own test case N14 assumes compat exists — contradiction.
 
 3. **`ipnsSnapshot` flag rename to `pointerAnchor`.** `ProfileConfig.ipnsSnapshot` (profile/types.ts:67) is documented as default `true`. Renaming per ARCH §15.1 breaks every downstream consumer that sets it explicitly (tests, config files). Recommend: add `pointerAnchor` alongside `ipnsSnapshot`, deprecate the latter across one release.
 
-4. **Multi-mirror trustbase loader.** `impl/shared/trustbase-loader.ts` returns ONE embedded TrustBase per network (getEmbeddedTrustBase, line 16). SPEC §8.4 requires `MIN_MIRROR_COUNT = 2` diverse mirrors with byte-identical cross-check. The loader's interface is not multi-mirror-aware. This is a moderate refactor, not a small tweak.
+4. ~~**Multi-mirror trustbase loader.**~~ **RESOLVED in SPEC v3.4.** The single-embedded-TrustBase-per-network loader (`impl/shared/trustbase-loader.ts:getEmbeddedTrustBase`) is the correct v1 model. No refactor needed per SPEC v3.4 amendment — embedded trust base is the correct v1 model. Multi-mirror TOFU is deferred to v2 and will be a moderate refactor then, not now.
 
 5. **`OracleProvider.submitCommitment` signature mismatch.** The existing `TransferCommitment` (oracle/oracle-provider.ts:94–103) requires a `sourceToken` — pointer commitments have no source token. Using `oracle.getAggregatorClient()` bypasses this cleanly, but introduces a tighter coupling to the SDK client version. **Flag:** if `@unicitylabs/state-transition-sdk` bumps its commitment API, the pointer layer breaks along with the oracle module.
 

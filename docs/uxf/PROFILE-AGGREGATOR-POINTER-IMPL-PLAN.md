@@ -1,10 +1,12 @@
 # Profile Aggregator Pointer — Implementation Plan
 
-**Status:** Draft 4 — steelman round 2: 7 critical structural fixes applied
-**Spec:** [`PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) (v3.3)
-**Architecture:** [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) (v3.3)
-**Test Spec:** [`PROFILE-AGGREGATOR-POINTER-TEST-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-TEST-SPEC.md) (v2, 146 scenarios)
+**Status:** Draft 5 — aligned with SPEC v3.4 embedded-trust-base amendments
+**Spec:** [`PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) (v3.4)
+**Architecture:** [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) (v3.4)
+**Test Spec:** [`PROFILE-AGGREGATOR-POINTER-TEST-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-TEST-SPEC.md) (v2.2, 142 scenarios)
 **Audit:** [`PROFILE-AGGREGATOR-POINTER-PLAN-AUDIT.md`](./PROFILE-AGGREGATOR-POINTER-PLAN-AUDIT.md)
+
+**v5 (2026-04-21):** aligned with SPEC v3.4 — removed T-C3 (mirror-tofu module), T-C3b (trustbase-loader refactor). Closed 3 open items (O-2, O-6, O-7). Embedded trust base per L4 pattern: L4 and pointer layer share the same bundled `RootTrustBase` from `assets/trustbase/<network>.ts`, consumed via `OracleProvider.getRootTrustBase()`. Multi-mirror TOFU (H3) and cert pinning (H9) downgraded to v2 future work.
 
 ---
 
@@ -25,7 +27,7 @@ The implementation is:
 
 **Risk level:** **Medium-High**. Cryptographic module (OTP + zeroization), 146 conformance tests, 5 external blockers, worker_threads mutex gap (R-17), lock-ordering invariant (R-18), TEST-SPEC P3 orphan (R-19), JOIN rules assumption (R-20), WeakSet registry gap (R-21). Mitigations enumerated in §6.
 
-**Total tasks: 77** (68 from v2 + 9 new).
+**Total tasks: 75** (v4 stated 77 − 2 removed in v5: T-C3, T-C3b). T-C10 also tombstoned as a cascaded consequence (its subject matter — mirror-tofu unit tests — has no remaining target). 3 tombstone rows retained for traceability. A pre-existing inconsistency between the v4 header count (77) and the literal §4 row count (80) is preserved; the user-facing count tracks the v4 header.
 
 ---
 
@@ -60,8 +62,8 @@ graph TD
         AS[pointer/aggregator-submit.ts]
         ASZ[aggregator-submit.ts :: scheduled-zero T-C1c]
         AP[pointer/aggregator-probe.ts]
-        MT[pointer/mirror-tofu.ts]
-        MT2[oracle/trustbase-loader.ts :: multi-mirror refactor T-C3b]
+        %% T-C3 pointer/mirror-tofu.ts — REMOVED in v5 (SPEC v3.4 embedded trust base)
+        %% T-C3b oracle/trustbase-loader.ts multi-mirror refactor — REMOVED in v5 (SPEC v3.4 embedded trust base)
         TR[pointer/trust-base-rotation.ts]
         CL[pointer/car-loss-tracker.ts]
         IC[profile/ipfs-client.ts :: progress-rate]
@@ -118,8 +120,6 @@ graph TD
     T --> AS
     T --> AP
     AS --> ASZ
-    MT --> AP
-    MT --> MT2
     TR --> AP
     IC --> CL
     CL --> BL
@@ -133,7 +133,6 @@ graph TD
     OT --> PUB
 
     AP --> DISC
-    MT2 --> DISC
     TR --> DISC
     IC --> DISC
 
@@ -176,11 +175,11 @@ Estimated depth: 15 nodes.
 
 ### Phase A — Foundations (SPEC §3, §4, §5, §11.12)
 
-**Scope:** constants, HKDF primitives, key derivation, payload encoding, HEALTH_CHECK_REQUEST_ID derivation, error taxonomy (30 codes), type surface, `MasterPrivateKey` branded newtype, secret-key wrapper + log-scrub test, denylist. Zero runtime dependencies beyond `@noble/hashes` and `@unicitylabs/state-transition-sdk`.
+**Scope:** constants, HKDF primitives, key derivation, payload encoding, HEALTH_CHECK_REQUEST_ID derivation, error taxonomy (27 codes per SPEC v3.4), type surface, `MasterPrivateKey` branded newtype, secret-key wrapper + log-scrub test, denylist. Zero runtime dependencies beyond `@noble/hashes` and `@unicitylabs/state-transition-sdk`.
 
 **Deliverables:**
-- `constants.ts` additions — all SPEC §3 constants verbatim; `IPNS_RESOLVE_TIMEOUT_MS` retained pending SPEC editor O-3 decision (T-A1c)
-- `pointer/errors.ts` — all 30 error codes with stable string codes (§12)
+- `constants.ts` additions — all SPEC §3 constants verbatim; `IPNS_RESOLVE_TIMEOUT_MS` retained pending SPEC editor O-3 decision (T-A1c); SPEC v3.4 removed `MIN_MIRROR_COUNT`, `MIRROR_LIST_SHA256`, `MIRROR_CERT_PINS`
+- `pointer/errors.ts` — all 27 error codes with stable string codes (§12); SPEC v3.4 removed `AGGREGATOR_POINTER_CERT_PIN_MISMATCH`, `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`, `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE`
 - `pointer/types.ts` — `PointerLayerConfig`, `PublishResult`, `RecoverResult`, `Marker`, `OriginatedTag`, `ClassifyResult`, event types, `MasterPrivateKey` branded newtype
 - `pointer/hkdf-derivation.ts` — `hkdfSha256(ikm, info, L)` with inline byte-exact info strings (root = 33 bytes ASCII, subkeys = 26 bytes each), salt = `new Uint8Array(0)`, pairwise distinctness KAT
 - `pointer/key-derivation.ts` — `derivePointerKeyMaterial(masterKey: MasterPrivateKey)` returning `{ signingService, signingPubKey, xorSeed, padSeed }` via `SigningService.createFromSecret` only
@@ -201,7 +200,7 @@ Estimated depth: 15 nodes.
 
 **Gate criteria (to enter Phase B):**
 - All SPEC §3 constants exported verbatim; `grep -F` against spec returns zero diffs
-- `grep -c "AGGREGATOR_POINTER_" errors.ts` returns exactly 30
+- `grep -c "AGGREGATOR_POINTER_" errors.ts` returns exactly 27
 - Vector-1 + Vector-2 hex-identical to SPEC §14 (diff output empty)
 - `.sha256` CI check green; one forced-drift failure demonstrated and caught
 - HKDF info string byte-length assertions (33 + 26 × 3) pass as unit tests
@@ -249,28 +248,27 @@ Estimated depth: 15 nodes.
 
 ### Phase C — External integrations (SPEC §6, §8, §10.7)
 
-**Scope:** aggregator submit with full H8 state-machine (genuine vs idempotent REJECTED) and both zeroization paths; aggregator probe with `classifyVersion` three-way; multi-mirror TOFU + `trustbase-loader.ts` full refactor from single-mirror; trust-base rotation with atomic pin replacement; CAR loss tracker with wired gossipsub; IPFS client H10 amendments.
+**Scope:** aggregator submit with full H8 state-machine (genuine vs idempotent REJECTED) and both zeroization paths; aggregator probe with `classifyVersion` three-way; trust-base rotation via embedded `RootTrustBase` epoch-mismatch detection (per SPEC v3.4); CAR loss tracker with wired gossipsub; IPFS client H10 amendments.
 
 **Deliverables:**
 - `pointer/aggregator-submit.ts` (T-C1) — 13 §7.3 rows; H8 state-machine table; `OracleProvider.getAggregatorClient()` routing only; no direct `AggregatorClient` construction
 - `aggregator-submit.ts` finally-zero (T-C1b) — `Uint8Array.fill(0)` in `finally` block; honest acceptance: documents SDK internal-copy residual risk (R-11)
 - `aggregator-submit.ts` scheduled-zero (T-C1c) — `setTimeout(() => buf.fill(0), 500)` on retry-window ciphertext; non-suppressible
 - `pointer/aggregator-probe.ts` (T-C2) — H2 OR-predicate; `classifyVersion` returning `VALID` / `SEMANTICALLY_INVALID` / `TRANSIENT_UNAVAILABLE`; `isReachable` via `deriveHealthCheckRequestId`
-- `pointer/mirror-tofu.ts` (T-C3) — `MIN_MIRROR_COUNT = 2`; byte-identical cross-mirror check (necessary but not sufficient); cert pin H9; IP + CA diversity
-- `oracle/trustbase-loader.ts` refactor (T-C3b) — single-mirror replaced with multi-mirror; atomic pin rewrite; crash-between-phases test `C3b-crash-1`
-- `pointer/trust-base-rotation.ts` (T-C4) — epoch monotonicity; atomic rotation; crash-between-rotation test; H6 shared-base via `getPinnedTrustBase()`
+- T-C3 (pointer/mirror-tofu.ts) — REMOVED in v5 (SPEC v3.4 §8.4 embedded trust base; no runtime mirror TOFU in v1)
+- T-C3b (oracle/trustbase-loader.ts multi-mirror refactor) — REMOVED in v5 (SPEC v3.4 §8.4 embedded trust base; loader consumed unchanged)
+- `pointer/trust-base-rotation.ts` (T-C4) — embedded-trust-base model: detect rotation via epoch mismatch between aggregator response and the bundled `RootTrustBase`; raise `TRUST_BASE_STALE` requiring an SDK update. H6 shared-base via `OracleProvider.getRootTrustBase()` (same instance L4 uses)
 - `pointer/car-loss-tracker.ts` (T-C5) — persistent-retry ledger wall-clock enforced; gossipsub/Nostr listener wired via `NostrTransportProvider` (peer-advertisement schema agreed before merge); H7 republish-before-advance
 - `profile/ipfs-client.ts` amendments (T-C6) — H10 three-tier timeout; HTTP Range resume; `Content-Encoding` rejection; D6 byte-cap
 
 **Parallel streams:**
 1. aggregator-submit + T-C1b + T-C1c (security-auditor primary, backend-architect assists; S11–S12; serialize T-C1b and T-C1c after T-C1)
 2. aggregator-probe + classifyVersion (backend-architect; S11)
-3. mirror-tofu (security-auditor; S11) → trustbase-loader refactor (T-C3b; S12; same-file: serialize T-C3b after T-C3)
-4. trust-base-rotation (security-auditor; S12; depends on T-C3b)
-5. car-loss-tracker (backend-architect; S11)
-6. ipfs-client amendments (typescript-pro; S11)
-7. oracle getter T-C7 (backend-architect; S11)
-8. Unit tests T-C8, T-C9, T-C10 (test-automator × 3; S13)
+3. trust-base-rotation (security-auditor; S12; consumes embedded `RootTrustBase` via `OracleProvider.getRootTrustBase()`; epoch-mismatch detection only)
+4. car-loss-tracker (backend-architect; S11)
+5. ipfs-client amendments (typescript-pro; S11)
+6. oracle getter T-C7 (backend-architect; S11)
+7. Unit tests T-C8, T-C9 (test-automator × 2; S13; T-C10 removed — tested scenarios D14/D15/D16 deleted in SPEC v3.4)
 
 **Gate criteria (to enter Phase D):**
 - All 13 §7.3 outcome rows have named unit tests with distinct test IDs
@@ -278,8 +276,7 @@ Estimated depth: 15 nodes.
 - Zero `new AggregatorClient(` in `profile/aggregator-pointer/` — security-auditor code review sign-off
 - T-C1b: finally-zero test green even on throw path
 - T-C1c: scheduled-zero test: non-zero at t=0, zero at t=510ms
-- D14 single-mirror-abort test green; `C3b-crash-1` crash-atomicity test green
-- T-C4 crash-between-rotation-phases test green
+- T-C4 epoch-mismatch detection test green: aggregator responds with epoch ≠ embedded `RootTrustBase` epoch → raise `TRUST_BASE_STALE`
 - CAR loss: G2 republish-before-advance test green; gossipsub listener integration confirmed (not stub); peer-advertisement schema agreed with NostrTransportProvider author
 - D5/D6/D7 IPFS client tests green
 - `classifyVersion` three-way: E6 (VALID) + E7 (SEMANTICALLY_INVALID) + E8 (TRANSIENT_UNAVAILABLE) green
@@ -325,7 +322,7 @@ Estimated depth: 15 nodes.
 - Adapter downgrade: security-auditor code review confirms downgrade occurs before `OpLog.append()`
 - `.d.ts` comparison script exits 0: method signatures byte-for-byte match SPEC §13 literal
 - `getProbeFingerprint` KAT vector green (T-A9 pinned)
-- H6 getter: `getPinnedTrustBase()` present in `UnicityAggregatorProvider.d.ts`
+- H6 getter: `getRootTrustBase()` present in `UnicityAggregatorProvider.d.ts` (returns the embedded `RootTrustBase` instance from `assets/trustbase/<network>.ts`; identical instance to the one L4 / `PaymentsModule` consumes — no mirror list)
 - T-D12b bundle check passes (identity equality or dual-configure implemented)
 - O-2 CI guard: PR with `"O-2-UNRESOLVED"` in config triggers failure (demonstrated)
 - T-E26 production-build guard: throws `CAPABILITY_DENIED` in production mode with overrides (test green)
@@ -359,7 +356,7 @@ Estimated depth: 15 nodes.
 - All four CLI commands present; `cli-flush-1` integration test green
 - `grep "no-pointer\|profile-ipns" cli/index.ts` returns empty
 - T-E22b version-read guard green
-- T-E25 go/no-go: security-auditor + backend-architect sign-off; `"O-2-UNRESOLVED"` absent from all config files; 2-week testnet soak documented
+- T-E25 go/no-go: security-auditor + backend-architect sign-off; `"O-2-UNRESOLVED"` absent from all config files (O-2/O-6/O-7 now closed by SPEC v3.4 — guard remains as defensive lint); 2-week testnet soak documented
 
 ---
 
@@ -369,8 +366,8 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 
 | Task ID | Phase | P-group | File path | Agent | Depends on | Acceptance | SPEC ref |
 |---|---|---|---|---|---|---|---|
-| T-A1 | A | A-1 | `constants.ts` (edit) | typescript-pro | — | All §3 constants exported; values match verbatim; `IPNS_RESOLVE_TIMEOUT_MS` present only if SPEC §3 retains it (T-A1c judgment: include with comment "retained pending O-3 IPNS-removal audit") | §3 |
-| T-A2 | A | A-1 | `profile/aggregator-pointer/errors.ts` | typescript-pro | T-A1 | All 30 error codes from SPEC §12: `AGGREGATOR_POINTER_CONFLICT`, `_STALE`, `_CORRUPT`, `_NOT_FOUND`, `_PARTIAL`, `_REJECTED`, `_RETRY_EXHAUSTED`, `_CID_TOO_LARGE`, `_VERSION_OUT_OF_RANGE`, `_DISCOVERY_OVERFLOW`, `_NETWORK_ERROR`, `_UNTRUSTED_PROOF`, `_UNREACHABLE_RECOVERY_BLOCKED`, `_TRUST_BASE_DIVERGENCE`, `_MARKER_CORRUPT`, `_CAR_TOO_LARGE`, `_CAR_FETCH_TIMEOUT`, `_CAR_UNAVAILABLE`, `_CORRUPT_STREAK`, `SECURITY_ORIGIN_MISMATCH`, `_UNSUPPORTED_RUNTIME`, `_PUBLISH_BUSY`, `_TRUST_BASE_STALE`, `_CERT_PIN_MISMATCH`, `_MIRROR_LIST_TAMPERED`, `_CAR_UNEXPECTED_ENCODING`, `_AGGREGATOR_REJECTED`, `_PROTOCOL_ERROR`, `_WALKBACK_FLOOR`, `_CAPABILITY_DENIED`; `grep -c "AGGREGATOR_POINTER_" errors.ts` returns 30 | §12 |
+| T-A1 | A | A-1 | `constants.ts` (edit) | typescript-pro | — | All §3 constants exported; values match verbatim; `IPNS_RESOLVE_TIMEOUT_MS` present only if SPEC §3 retains it (T-A1c judgment: include with comment "retained pending O-3 IPNS-removal audit"); SPEC v3.4 removed `MIN_MIRROR_COUNT`, `MIRROR_LIST_SHA256`, `MIRROR_CERT_PINS` — final constant count 27 | §3 |
+| T-A2 | A | A-1 | `profile/aggregator-pointer/errors.ts` | typescript-pro | T-A1 | All 27 error codes from SPEC §12 (v3.4): `AGGREGATOR_POINTER_CONFLICT`, `_STALE`, `_CORRUPT`, `_NOT_FOUND`, `_PARTIAL`, `_REJECTED`, `_RETRY_EXHAUSTED`, `_CID_TOO_LARGE`, `_VERSION_OUT_OF_RANGE`, `_DISCOVERY_OVERFLOW`, `_NETWORK_ERROR`, `_UNTRUSTED_PROOF`, `_UNREACHABLE_RECOVERY_BLOCKED`, `_MARKER_CORRUPT`, `_CAR_TOO_LARGE`, `_CAR_FETCH_TIMEOUT`, `_CAR_UNAVAILABLE`, `_CORRUPT_STREAK`, `SECURITY_ORIGIN_MISMATCH`, `_UNSUPPORTED_RUNTIME`, `_PUBLISH_BUSY`, `_TRUST_BASE_STALE`, `_CAR_UNEXPECTED_ENCODING`, `_AGGREGATOR_REJECTED`, `_PROTOCOL_ERROR`, `_WALKBACK_FLOOR`, `_CAPABILITY_DENIED`; SPEC v3.4 removed `_TRUST_BASE_DIVERGENCE`, `_CERT_PIN_MISMATCH`, `_MIRROR_LIST_TAMPERED`; `grep -c "AGGREGATOR_POINTER_" errors.ts` returns 27 | §12 |
 | T-A3 | A | A-1 | `profile/aggregator-pointer/types.ts` | typescript-pro | T-A2 | `PointerLayerConfig`, `PublishResult`, `RecoverResult`, `Marker`, `OriginatedTag`, `ClassifyResult`, event types; `MasterPrivateKey` branded newtype (see T-A5b) | §13, §10.2 |
 | T-A4 ⚑ | A | A-2 | `profile/aggregator-pointer/hkdf-derivation.ts` | security-auditor | T-A1 | `hkdfSha256(ikm, info, L)` wrapping `@noble/hashes/hkdf`; IKM = BIP32 master private key scalar (32 bytes); salt = empty (`new Uint8Array(0)`); root info = `"uxf-profile-aggregator-pointer-v1"` (33 bytes ASCII, per H12); signing subkey info = `"uxf-profile-pointer-sig-v1"` (26 bytes); xor subkey info = `"uxf-profile-pointer-xor-v1"` (26 bytes); pad subkey info = `"uxf-profile-pointer-pad-v1"` (26 bytes); KAT: with IKM = `01`×32, root output prefix first 4 bytes pinned to `[0xXX, 0xXX, 0xXX, 0xXX]` from SPEC §14.2 (fill from T-A9 computation); pairwise distinctness of all four subkeys asserted in unit test; `PROFILE_POINTER_HKDF_INFO` byte-length assertion = 33 | §2.1, §4.1 |
 | T-A5b ⚑ | A | A-2 (S3a) | `profile/aggregator-pointer/types.ts` + `core/Sphere.ts` (edit) | security-auditor | T-A4 | `MasterPrivateKey` branded newtype (`{ readonly _brand: 'MasterPrivateKey'; readonly bytes: Uint8Array }`); `MasterPrivateKey.createFromWalletRoot(ikm, walletRootContext)` is the **only exported constructor**; `Sphere.init()` / `Sphere.load()` / `Sphere.create()` / `Sphere.import()` each call `createFromWalletRoot` and add the instance to a `WeakSet<MasterPrivateKey>` registry; `derivePointerKeyMaterial` checks the registry at entry and throws `AGGREGATOR_POINTER_PROTOCOL_ERROR` if the instance is not registered; unit test: pass a cast object matching the shape but not registered → must throw; prevents child-key substitution at both compile time (type mismatch) and runtime (registry miss) | §4.1 W1 |
@@ -395,15 +392,15 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | T-C1b ⚑ | C | C-1 | `profile/aggregator-pointer/aggregator-submit.ts` (finally-zero) | security-auditor | T-C1 | H14(b) finally-zero: `Uint8Array.fill(0)` on local reference buffers `ctA`, `ctB`, `partA`, `partB` in `finally` block immediately post-submit; acceptance is **honest**: documents that SDK may retain internal copies via JSON/base64 encoding — this is a known residual risk (R-11) documented in runbook; unit test verifies zero-fill executes even on throw path | §11.11(b) |
 | T-C1c ⚑ | C | C-1 | `profile/aggregator-pointer/aggregator-submit.ts` (scheduled-zero) | security-auditor | T-C1b | H14(a′) scheduled zero: `setTimeout(() => buf.fill(0), MAX_CT_RESIDENT_MS)` where `MAX_CT_RESIDENT_MS` = 500 (SPEC §3 §11.11(a′)) on any ciphertext buffer held across a retry window; unit test: buffer is non-zero at t=0, zero at t=500ms + 10ms jitter; test does not suppress the `setTimeout` | §11.11(a′) |
 | T-C2 | C | C-2 | `profile/aggregator-pointer/aggregator-probe.ts` | backend-architect | T-A5, T-A6, T-A6c | H2 OR-predicate; `classifyVersion` three-way (H1); `isReachable` via `deriveHealthCheckRequestId` (W12, T-A6c output); probe fingerprint | §8.1, §8.2, §8.3, §13 W12 |
-| T-C3 ⚑ | C | C-3 | `profile/aggregator-pointer/mirror-tofu.ts` | security-auditor | T-A3, T-C2 | `MIN_MIRROR_COUNT = 2` MANDATORY; byte-identical `InclusionProof.verify` responses across mirrors (necessary but not sufficient for H3 — also requires CA + IP diversity enforcement); cert pin (H9); `MIRROR_LIST_SHA256` gate; `MIRROR_CERT_PINS` check | §8.4, §8.4.3 |
-| T-C3b ⚑ | C | C-3 | `oracle/trustbase-loader.ts` (full refactor) | security-auditor | T-C3 | Replace existing single-mirror implementation with multi-mirror cross-check; `MIN_MIRROR_COUNT = 2` enforced at loader level; trust-base pin rewrite is **atomic** (write new pin, verify, then replace — not in-place mutation); crash-between-phases test: process killed after write but before verify; on restart, old pin still valid (test ID `C3b-crash-1`); D14 single-mirror-bootstrap abort test green | §8.4, H3 |
-| T-C4 ⚑ | C | C-3 | `profile/aggregator-pointer/trust-base-rotation.ts` | security-auditor | T-C3b | H5 rotation-vs-forgery via epoch compare; monotone epoch enforcement; H6 shared-base contract; reads trust base via `OracleProvider.getPinnedTrustBase()`; trust-base pin replacement is atomic (T-C3b pattern); crash-between-rotation-phases test | §8.4.1, §8.4.2 |
+| ~~T-C3~~ | ~~C~~ | — | ~~`profile/aggregator-pointer/mirror-tofu.ts`~~ | — | — | **REMOVED in v5.** SPEC v3.4 §8.4 replaced multi-mirror TOFU with embedded `RootTrustBase`. H3 (multi-mirror TOFU cross-check) downgraded to v2 future work. | — |
+| ~~T-C3b~~ | ~~C~~ | — | ~~`oracle/trustbase-loader.ts`~~ | — | — | **REMOVED in v5.** SPEC v3.4 §8.4 retains the existing single-embedded-TrustBase loader unchanged; no multi-mirror refactor needed. Loader is consumed as-is by pointer layer. | — |
+| T-C4 ⚑ | C | C-3 | `profile/aggregator-pointer/trust-base-rotation.ts` | security-auditor | T-C2 | Embedded-trust-base model (SPEC v3.4 §8.4): detect rotation via epoch mismatch between aggregator response and bundled `RootTrustBase`; on mismatch raise `AGGREGATOR_POINTER_TRUST_BASE_STALE` requiring SDK update. H6 shared-base contract: reads via `OracleProvider.getRootTrustBase()` — the same instance L4 / `PaymentsModule` consumes. No atomic pin replacement, no multi-mirror refresh (v2 future work). Unit test: aggregator returns epoch > embedded epoch → `TRUST_BASE_STALE` raised with correct error payload | §8.4.1, §8.4.2 |
 | T-C5 | C | C-4 | `profile/aggregator-pointer/car-loss-tracker.ts` | backend-architect | T-B1, T-B5 | Persistent-retry ledger (wall-clock across restarts); peer-availability poll wired to real OrbitDB gossipsub/Nostr listener via `NostrTransportProvider` (co-task with NostrTransportProvider author; peer-advertisement schema must be specified — Nostr event kind or OrbitDB topic — and agreed before T-C5 merges); H7 republish-before-advance helper | §10.7, §10.7.1 |
 | T-C6 | C | C-5 | `profile/ipfs-client.ts` (edit) | typescript-pro | T-A1 | H10 three-tier timeout; HTTP Range resume; `Content-Encoding` rejection; D6 streaming byte-cap | §8.5 (H10, D6) |
-| T-C7 | C | C-6 | `oracle/UnicityAggregatorProvider.ts` (edit) | backend-architect | T-C4 | Expose `getPinnedTrustBase()` + `getMirrorClients()` for H6 sharing | §8.4.2 H6 |
+| T-C7 | C | C-6 | `oracle/UnicityAggregatorProvider.ts` (edit) | backend-architect | T-C4 | Expose `getRootTrustBase()` returning the embedded `RootTrustBase` instance that L4 / `PaymentsModule` uses (SPEC v3.4 §8.4.2 H6 shared-base contract); pointer layer consumes via the same method | §8.4.2 H6 |
 | T-C8 | C | C-7 | `tests/unit/pointer/submit.test.ts` | test-automator | T-C1, T-C1b, T-C1c | All §7.3 rows; H8-genuine + H8-idempotent sub-cases; finally-zero test; scheduled-zero timer test | TEST §D, §H |
 | T-C9 | C | C-7 | `tests/unit/pointer/probe.test.ts` | test-automator | T-C2 | Category E + classifyVersion three-way + `isReachable` via health-check RID (W12) | TEST §E |
-| T-C10 | C | C-7 | `tests/unit/pointer/mirror-tofu.test.ts` | test-automator | T-C3b | D14 (single-mirror abort), D15 (cert-pin mismatch), D16 (mirror-list tampered), H3-R sub-cases A/B/C; verify byte-identical cross-mirror check | TEST §D |
+| ~~T-C10~~ | ~~C~~ | — | ~~`tests/unit/pointer/mirror-tofu.test.ts`~~ | — | — | **REMOVED in v5.** SPEC v3.4 deleted the covered scenarios (D14/D15/D16/H3-R) along with the mirror-tofu module (T-C3). H3 and H9 are v2 future work. | — |
 | T-D0 | D | D-0 | `docs/uxf/PROFILE-AGGREGATOR-POINTER-JOIN-AUDIT.md` | backend-architect | T-A3 | Audit `profile-token-storage-provider` + `profile/orbitdb-adapter.ts` for PROFILE-ARCHITECTURE.md §10.4 JOIN rules 1–5; produce gap report; close all gaps before Phase D entry; this task BLOCKS all other D-series tasks | PROFILE-ARCHITECTURE.md §10.4, R-20 |
 | T-D1 | D | D-1 | `profile/aggregator-pointer/publish-algorithm.ts` | backend-architect | T-B2, T-B4b, T-B5, T-C1c | §7.1 critical-section + §7.2 payload + §7.3 parallel submit + §7.4 backoff; H4 `max(validV, includedV)+1` | §7 |
 | T-D2 | D | D-1 | `profile/aggregator-pointer/discover-algorithm.ts` | backend-architect | T-C2 | §8.2 three-phase; returns `{ validV, includedV }`; W7 walkback floor; `DISCOVERY_CORRUPT_WALKBACK` bail | §8.2, §10.8 |
@@ -439,7 +436,7 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | T-E11 | E | E-3 | `tests/integration/pointer/category-C.test.ts` | test-automator | T-D4, T-PRE-E | C1–C10 multi-device contention | TEST §C |
 | T-E12 | E | E-3 | `tests/integration/pointer/category-D.test.ts` | test-automator | T-C6, T-PRE-E | D1–D18 network pathology | TEST §D |
 | T-E13 | E | E-3 | `tests/integration/pointer/category-G.test.ts` | test-automator | T-C5, T-PRE-E | G1–G7 acceptCarLoss | TEST §G |
-| T-E14 | E | E-3 | `tests/integration/pointer/category-H.test.ts` | test-automator | T-B2, T-PRE-E | H1–H4, H3-R, H8-R, H14-R; H8-R split into H8-genuine-R and H8-idempotent-R | TEST §H |
+| T-E14 | E | E-3 | `tests/integration/pointer/category-H.test.ts` | test-automator | T-B2, T-PRE-E | H1–H4, H8-R, H14-R; H8-R split into H8-genuine-R and H8-idempotent-R. (H3-R deleted in SPEC v3.4 / TEST-SPEC v2.2 — multi-mirror TOFU regression test not applicable to embedded-trust-base model.) | TEST §H |
 | T-E15 | E | E-3 | `tests/integration/pointer/category-I.test.ts` | test-automator | T-D2, T-PRE-E | I1–I4 acceptCorruptStreak | TEST §I |
 | T-E16 | E | E-3 | `tests/integration/pointer/category-J.test.ts` | test-automator | T-C6, T-PRE-E | J1–J8 CAR integrity | TEST §J |
 | T-E17 | E | E-3 | `tests/integration/pointer/category-M.test.ts` | test-automator | T-D4, T-D7–T-D11b, T-PRE-E | M1–M5, M8–M15, M17 token conservation | TEST §M |
@@ -451,9 +448,9 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | T-E22b | E | E-7 | `.github/workflows/pointer-sdk-canary.yml` (edit) | test-automator | T-E22 | CI step reads `package.json` version field at build time; asserts pointer-layer major version matches `package.json` major; prevents silent version skew on npm publish | O-8 |
 | T-E23 | E | E-7 | `tests/conformance/pointer/coverage-matrix-audit.ts` | test-automator | T-E5–T-E17 | Parses TEST §4 matrix; fails if any H/W finding lacks PRIMARY + SECONDARY coverage | TEST §4 |
 | T-E24 | E | E-8 | `docs/uxf/PROFILE-AGGREGATOR-POINTER-RUNBOOK.md` | documentation-generation | T-D4 | Operator runbook: BLOCKED recovery (both CLEAR paths), CAR loss, corrupt streak, backup/restore, migration procedure, SDK residual-copy risk disclosure (R-11) | §11.13 |
-| T-E25 | E | E-9 | Release go/no-go checkpoint | backend-architect (coordinator) | all Phase E | Explicit checklist: (1) all DONE criteria green, (2) O-2 + O-6 + O-7 resolved (literal `"O-2-UNRESOLVED"` absent from all config files), (3) 2-week testnet soak complete, (4) security-auditor sign-off on SPEC §15.2 checklist items, (5) T-E26 production-build guard test green | §15.2 |
+| T-E25 | E | E-9 | Release go/no-go checkpoint | backend-architect (coordinator) | all Phase E | Explicit checklist: (1) all DONE criteria green, (2) O-2 + O-6 + O-7 confirmed CLOSED per SPEC v3.4 (literal `"O-2-UNRESOLVED"` absent from all config files as defensive lint), (3) 2-week testnet soak complete, (4) security-auditor sign-off on SPEC §15.2 checklist items, (5) T-E26 production-build guard test green | §15.2 |
 
-**Total: 77 tasks.** Critical-path depth ≈ 15 serial hops. Task count cross-check: count rows in §4 table = 77.
+**Total: 75 tasks** (v4 header: 77 − 2 removed in v5: T-C3, T-C3b — tombstoned rows retained for traceability; T-C10 also tombstoned as cascaded consequence). Critical-path depth ≈ 15 serial hops.
 
 ---
 
@@ -485,9 +482,9 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 |---|---|---|---|---|
 | **R-1: SDK call-signature drift (W8)** | Med | High | Pin `1.6.1-rc.f37cb85`; CI canary T-E22 + T-E22b | Lock to current pin |
 | **R-2: HKDF KAT vector computation blocks Phase B** (O-1) | Med | High | T-A9 blocks Phase B; security-auditor first | Placeholder vectors + `skip-pending` markers |
-| **R-3: O-2 RootTrustBase source undefined** | High | High | Escalate at Phase-A start; CI guard (T-A10) fails on `"O-2-UNRESOLVED"` placeholder | Static-bundled v1 with runbook |
-| **R-4: O-6 Mirror URL list not finalized** | High | High | Escalate before Phase-C start | `allowInsecureGateways` warning at init; DO NOT ship v1 |
-| **R-5: O-7 MIRROR_LIST_SHA256 + MIRROR_CERT_PINS not computed** | High | Med | CI placeholder; fill at release time | Placeholder + check-off task |
+| ~~**R-3: O-2 RootTrustBase source undefined**~~ | — | — | **CLOSED / OBSOLETE in v5.** SPEC v3.4 §8.4 resolves O-2 by mandating embedded trust base in `assets/trustbase/<network>.ts` (same pattern L4 uses). CI guard on `"O-2-UNRESOLVED"` retained as defensive lint but is expected never to fire. | — |
+| ~~**R-4: O-6 Mirror URL list not finalized**~~ | — | — | **CLOSED / OBSOLETE in v5.** SPEC v3.4 removed runtime mirror-list infrastructure from v1. No URL list to finalize. | — |
+| ~~**R-5: O-7 MIRROR_LIST_SHA256 + MIRROR_CERT_PINS not computed**~~ | — | — | **CLOSED / OBSOLETE in v5.** SPEC v3.4 deleted both constants. Mirror list integrity / cert pinning is v2 future work. | — |
 | **R-6: N-series testnet flakiness** | High | Med | Tier-2 tests (optional on merge); nightly run | Mock aggregator + IPFS via testcontainers |
 | **R-7: M17 double-spend test** | Med | Med | state-transition-sdk test fixtures | Move to tier-2; manual-verification |
 | **R-8: Web Locks API absent in older browsers** | Med | Med | T-B3 raises `UNSUPPORTED_RUNTIME` by design | Browser-support matrix in README |
@@ -497,7 +494,7 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | **R-12: Concurrent-agent file conflicts** — `profile-token-storage-provider.ts` (T-D6, T-D11), `cli/index.ts` (T-E1–T-E4b) | Med | Low | Serialize per §10 file-overlap check; CLI tasks single-agent-serial | Coordinator enforces |
 | **R-13: W11 originated-tag migration misses a writer** | Med | High | T-B6 fail-closed; P5 AST-grep; CI grep: zero untagged OpLog writes | CI mandatory on merge |
 | **R-14: PUBLISH_RETRY_BUDGET reset semantics ambiguous** | Low | Low | T-D3 unit test pins current behavior; SPEC issue filed | Assume non-resetting |
-| **R-15: OracleProvider missing getPinnedTrustBase()** | Low | Low | T-C7 adds getter | Backward-compat shim |
+| **R-15: OracleProvider missing getRootTrustBase()** | Low | Low | T-C7 adds getter exposing the embedded `RootTrustBase` (SPEC v3.4 §8.4.2) | Backward-compat shim |
 | **R-16: Discovery probe fingerprint privacy** (§11.10 C7) | Med | Low | Runbook disclosure; v2 randomization deferred | — |
 | **R-17: worker_threads mutex gap in Node.js** — `proper-lockfile` does not protect threads within same process | Med | High | T-B4b stacks `async-mutex` Mutex above file lock; T-B8 stress test | Architectural constraint: single-threaded publish enforced |
 | **R-18: Lock-ordering invariant** — if any code acquires in-process Mutex AFTER file lock, deadlock or priority-inversion possible | Med | High | T-B4b specifies acquisition order (in-process first, file second) and LIFO release; T-B8 spy test verifies order; CI lint rule added to flag any out-of-order lock acquisition pattern | Audit all future changes to mutex-lock.ts at review |
@@ -512,12 +509,12 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | ID | Deliverable | Owner | Blocks | Gate event |
 |---|---|---|---|---|
 | **O-1** | Canonical test vectors §14.2 + §14.5 + health-check RID KAT + `.sha256` | SDK team (us) | Phase B unit tests, CI canary | Implementation PR merge |
-| **O-2** | `RootTrustBase` source specification | Aggregator team | T-C3, T-C4, T-D4 | First release; CI guard enforced |
+| ~~**O-2**~~ | ~~`RootTrustBase` source specification~~ | — | — | **CLOSED in v5 (SPEC v3.4).** Embedded trust base in `assets/trustbase/<network>.ts` per L4 pattern. No runtime source spec needed. |
 | **O-3** | `DISCOVERY_INITIAL_VERSION` tuning | SDK team | None | Post-release v1.1 |
 | **O-4** | `isValidCid` codec set decision | SDK team | T-A6 decode path | None for v1 |
 | **O-5** | BLOCKED override protocol inclusion (§10.2.5) | Product/SDK | T-D4 API | Not blocking v1; `allowUnverifiedOverride` raises `CAPABILITY_DENIED` |
-| **O-6** | Finalized mirror URL list | Infra team | T-C3, T-C3b | Spec sign-off |
-| **O-7** | `MIRROR_LIST_SHA256` + `MIRROR_CERT_PINS` + CA/IP diversity cert | Infra team | T-C3, T-A1 | Implementation PR merge |
+| ~~**O-6**~~ | ~~Finalized mirror URL list~~ | — | — | **CLOSED in v5 (SPEC v3.4).** No runtime mirror list in v1. |
+| ~~**O-7**~~ | ~~`MIRROR_LIST_SHA256` + `MIRROR_CERT_PINS` + CA/IP diversity cert~~ | — | — | **CLOSED in v5 (SPEC v3.4).** Constants deleted; cert pinning and mirror-list integrity are v2 future work. |
 | **O-8** | SDK version pin + CI canary | SDK team (us) | T-E22, T-E22b | Implementation PR merge |
 
 ---
@@ -537,9 +534,9 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | **S8** | B | T-B2, T-B4, T-B5 | 3 (backend-architect × 2 + typescript-pro) | Marker + Node file-lock + BlockedState (SET path) |
 | **S9** | B | T-B4b | 1 (typescript-pro + security-auditor co-review) | In-process mutex layer; depends on T-B4 |
 | **S10** | B | T-B7, T-B8 | 2 (test-automator × 2) | Unit tests; T-B8 covers worker_threads + lock-order spy |
-| **S11** | C | T-C1, T-C2, T-C3, T-C5, T-C6, T-C7 | 6 (peak Phase-C) | Submit + probe + mirror-tofu + car-loss + ipfs-client + oracle getter |
-| **S12** | C | T-C1b, T-C1c, T-C3b, T-C4 | 4 (security-auditor × 3 + backend-architect) | Finally-zero + scheduled-zero + trustbase-loader refactor + trust-base rotation |
-| **S13** | C | T-C8, T-C9, T-C10 | 3 (test-automator × 3) | C-group unit tests |
+| **S11** | C | T-C1, T-C2, T-C5, T-C6, T-C7 | 5 | Submit + probe + car-loss + ipfs-client + oracle getter. (T-C3 mirror-tofu REMOVED in v5.) |
+| **S12** | C | T-C1b, T-C1c, T-C4 | 3 (security-auditor × 3) | Finally-zero + scheduled-zero + trust-base rotation (epoch-mismatch on embedded `RootTrustBase`). (T-C3b trustbase-loader refactor REMOVED in v5.) |
+| **S13** | C | T-C8, T-C9 | 2 (test-automator × 2) | C-group unit tests. (T-C10 mirror-tofu tests REMOVED in v5.) |
 | **S14** | D | T-D0 | 1 (backend-architect) | JOIN rules audit; **pre-gate: all D tasks blocked until done** |
 | **S15** | D | T-D1, T-D2, T-D5 | 2 (backend-architect × 1 + typescript-pro × 1) | Publish + Discover + Config (no disablePointer) |
 | **S16a** | D | T-D3 | 1 (backend-architect) | Reconcile algorithm only; T-D3b depends on T-D3 — must not run in parallel |
@@ -560,7 +557,7 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 | **S30** | E | T-E22, T-E22b, T-E23, T-E24 | 4 (test-automator × 3 + doc-gen) | Canary + version-read guard + coverage audit + runbook |
 | **S31** | E | T-E25 | 1 (backend-architect coordinator) | Release go/no-go; all prior slots must be green |
 
-**Peak concurrency: 7 agents (S28).** Critical path: S1→S2→S3a→S3b→S4→S5→S6→S7→S8→S9→S11→S12→S14→S15→S16a→S16b→S17→S18→S20→S21→S26→S28→S29→S30→S31 = **25 wall-clock slots**. With 5-agent dispatcher: ≈ 10–12 working days agent-wall-time.
+**Peak concurrency: 7 agents (S28).** (Phase C S11 peak dropped from 6 → 5 after T-C3 removal; S12 from 4 → 3 after T-C3b removal. E-phase remains the overall peak.) Critical path: S1→S2→S3a→S3b→S4→S5→S6→S7→S8→S9→S11→S12→S14→S15→S16a→S16b→S17→S18→S20→S21→S26→S28→S29→S30→S31 = **25 wall-clock slots** (unchanged — T-C4 still depends on T-C2 rather than T-C3b, and keeps the S12 slot populated). With 5-agent dispatcher: ≈ 10–12 working days agent-wall-time.
 
 ---
 
@@ -597,8 +594,8 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 - [ ] H8 state-machine: `H8-genuine` + `H8-idempotent` test cases both green and exercise distinct branches
 - [ ] T-C1b finally-zero: test verifies zeroing in `finally` block even on throw
 - [ ] T-C1c scheduled-zero: test verifies buffer non-zero at t=0, zero at t=510ms (500ms + 10ms jitter window)
-- [ ] `trustbase-loader.ts` multi-mirror: D14 single-mirror-abort green; crash-between-phases `C3b-crash-1` green
-- [ ] T-C4 crash-between-rotation-phases test green; trust-base pin replacement is atomic
+- [ ] T-C4 epoch-mismatch detection green: aggregator returns epoch ≠ embedded `RootTrustBase` epoch → raises `AGGREGATOR_POINTER_TRUST_BASE_STALE` (SPEC v3.4 §8.4.1)
+- [ ] SPEC v3.4 no longer requires multi-mirror atomic pin replacement; `trustbase-loader.ts` consumed unchanged from L4
 - [ ] CAR loss: G2 republish-before-advance green; gossipsub listener integration confirmed (peer-advertisement schema agreed with NostrTransportProvider author)
 - [ ] D5/D6/D7 IPFS client tests green
 - [ ] `classifyVersion` three-way: E6 (VALID) + E7 (SEMANTICALLY_INVALID) + E8 (TRANSIENT_UNAVAILABLE) green
@@ -618,9 +615,9 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 - [ ] `profile-ipns.ts` absent: `git ls-files profile/profile-ipns.ts` empty; `git grep 'profile-ipns' -- '*.ts' '*.js' ':!docs/' ':!tests/fixtures/'` empty
 - [ ] W11 originated-tag: `git grep "OpLog.write\|OpLog.append" -- '*.ts' | grep -v "originated:"` returns empty
 - [ ] Adapter downgrade before `OpLog.append()`: security-auditor code review sign-off
-- [ ] H6 getter: `UnicityAggregatorProvider.getPinnedTrustBase()` in generated `.d.ts`
+- [ ] H6 getter: `UnicityAggregatorProvider.getRootTrustBase()` in generated `.d.ts`; returns embedded `RootTrustBase` identical to the L4 instance (SPEC v3.4 §8.4.2)
 - [ ] Bundle duplication check: T-D12b passes with identity equality OR dual-configure pattern (no "document only" outcome)
-- [ ] O-2 CI guard: PR with `"O-2-UNRESOLVED"` in config triggers CI failure (demonstrated)
+- [ ] O-2 CI guard (defensive lint, v5): PR with `"O-2-UNRESOLVED"` in config still triggers CI failure; guard retained even though O-2 is closed by SPEC v3.4 embedded trust base
 - [ ] T-E26 production-build guard: init throws `CAPABILITY_DENIED` in production mode with overrides enabled (test green)
 - [ ] `allowUnverifiedOverride: true` raises `CAPABILITY_DENIED` at init (O-5 deferral implemented)
 
@@ -635,7 +632,7 @@ Legend: ⚑ = security-auditor MANDATORY co-reviewer. **P-group** = parallel-dis
 - [ ] CLI: `sphere profile pointer status`, `sphere profile pointer recover`, `sphere profile unblock`, `sphere profile flush` all present; `cli-flush-1` integration test green
 - [ ] `grep "no-pointer\|profile-ipns" cli/index.ts` returns empty
 - [ ] T-E22b version-read guard green
-- [ ] T-E25 go/no-go: signed off by security-auditor + backend-architect coordinator; O-2 placeholder absent from all config files
+- [ ] T-E25 go/no-go: signed off by security-auditor + backend-architect coordinator; O-2 placeholder absent from all config files (O-2/O-6/O-7 closed by SPEC v3.4; guard retained as defensive lint)
 
 ---
 
@@ -658,7 +655,7 @@ comm -12 /tmp/pr-files.txt /tmp/other-files.txt
 If `comm -12` output is non-empty, serialize PRs or combine tasks. Known mandated serializations:
 - `profile-token-storage-provider.ts`: T-D6 merges first, then T-D11
 - `cli/index.ts`: T-E1 → T-E2 → T-E3 → T-E4 → T-E4b (single-agent sequential, one PR)
-- `oracle/trustbase-loader.ts`: T-C3 merges first, then T-C3b
+- ~~`oracle/trustbase-loader.ts`: T-C3 merges first, then T-C3b~~ — REMOVED in v5; no edits to this file required per SPEC v3.4
 
 ### Commit message convention
 
@@ -670,7 +667,7 @@ feat(pointer): HEALTH_CHECK_REQUEST_ID derivation + KAT (T-A6c)
 feat(pointer): log-scrub integration test (T-A7b)
 feat(pointer/mutex): in-process async-mutex + lock-order stress test (T-B4b)
 feat(pointer/submit): H8 state-machine + finally-zero + scheduled-zero (T-C1, T-C1b, T-C1c)
-feat(pointer/trustbase): multi-mirror refactor + crash-atomicity (T-C3b)
+# (removed in v5) feat(pointer/trustbase): multi-mirror refactor + crash-atomicity (T-C3b)
 chore(pointer): JOIN rules audit + gap report (T-D0)
 feat(pointer/reconcile): fetchAndJoin wiring + BLOCKED CLEAR paths (T-D3, T-D3b, T-D3c)
 feat(pointer/api): ProfilePointerLayer + getProbeFingerprint KAT (T-D4)
@@ -734,7 +731,7 @@ Run `/steelman` before every phase branch merges to `main`. The reviewing agent 
 
 - **v1.0.0-rc1:** Phase D DONE + `profile-ipns.ts` absent from repo + T-D0 gap report closed + T-E26 production-build guard green. Ship to internal dogfood only.
 - **v1.0.0-rc2:** Phase E DONE + all N-scripts green on real testnet + T-E25 preliminary sign-off (O-2 may still be placeholder with CI guard active).
-- **v1.0.0:** T-E25 final go/no-go sign-off: O-2 + O-6 + O-7 all resolved (literal `"O-2-UNRESOLVED"` absent), 2-week testnet soak documented, security-auditor SPEC §15.2 checklist signed.
+- **v1.0.0:** T-E25 final go/no-go sign-off: O-2 + O-6 + O-7 confirmed CLOSED per SPEC v3.4 (literal `"O-2-UNRESOLVED"` absent as defensive lint), 2-week testnet soak documented, security-auditor SPEC §15.2 checklist signed.
 
 ---
 
@@ -747,11 +744,11 @@ The following items require decisions from the SPEC editor or Aggregator team be
 | ID | Question | Blocks | Default assumption if unresolved |
 |---|---|---|---|
 | **Q-1 (R-19)** | TEST-SPEC P3 references `AGGREGATOR_POINTER_PROOF_STALE` and `MAX_PROOF_AGE`, absent from SPEC §3/§12. Retain or remove? | T-PRE-E → all Phase E tests | Remove P3 from TEST-SPEC |
-| **Q-2 (R-3)** | `RootTrustBase` source: static-bundled, remote-fetched, or hybrid? Literal `"O-2-UNRESOLVED"` blocks CI until resolved | T-C3, T-C4, T-D4, T-E25 | Static-bundled v1 with `O-2-TBD.md` runbook |
+| ~~**Q-2 (R-3)**~~ | ~~`RootTrustBase` source: static-bundled, remote-fetched, or hybrid?~~ | — | **RESOLVED in SPEC v3.4:** embedded static bundle in `assets/trustbase/<network>.ts`, identical to L4's. No remote-fetch path in v1. O-2 closed. |
 | **Q-3 (R-14)** | Does `PUBLISH_RETRY_BUDGET` reset after a long idle period? SPEC §3 + §9.4 are silent | T-D3 pin test documents behavior | Non-resetting; pin test locks current behavior |
 | **Q-4 (T-A1c)** | Is `IPNS_RESOLVE_TIMEOUT_MS` retained in SPEC §3 after IPNS removal, or removed? | T-A1 constant | Retained with deprecation comment pending O-3 audit |
 | **Q-5** | Peer-advertisement schema for T-C5 gossipsub/Nostr listener: Nostr event kind or OrbitDB topic string? | T-C5 merge gate | Must be agreed with NostrTransportProvider author before T-C5 merges |
 
 ---
 
-**Plan v3 — 77 tasks, 31 wall-clock slots, peak 7 parallel agents. Every task ID, dependency, acceptance criterion, and SPEC reference is load-bearing. IPNS is fully removed; no `--no-pointer` flag; no escape-hatch documentation substitute for implementation. T-D0 (JOIN rules audit) and T-PRE-E (P3 reconciliation) are explicit pre-gates. This plan is terminal for all architectural decisions enumerated herein.**
+**Plan v5 — 75 tasks (77 − 2 removed: T-C3, T-C3b), 31 wall-clock slots, peak 7 parallel agents. Aligned with SPEC v3.4 embedded-trust-base amendments. Every task ID, dependency, acceptance criterion, and SPEC reference is load-bearing. IPNS is fully removed; no `--no-pointer` flag; no escape-hatch documentation substitute for implementation. T-D0 (JOIN rules audit) and T-PRE-E (P3 reconciliation) are explicit pre-gates. Multi-mirror TOFU (H3), cert pinning (H9), and mirror-list integrity are v2 future work. This plan is terminal for all architectural decisions enumerated herein.**

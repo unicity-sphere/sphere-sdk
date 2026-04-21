@@ -1,9 +1,9 @@
 # UXF Profile — Aggregator-Anchored OpLog Pointer
 
-**Status:** Draft v3.3 — final hardening pass H1–H14 + W1–W12 (token-loss paths closed; trust-base rotation; CAR persistent-retry; TLS cert pinning; publish deadlock fix)
+**Status:** Draft v3.4 — embedded `RootTrustBase` deployment model (multi-mirror TOFU + mirror-list infrastructure deferred to v2; trust base shared with L4 / `PaymentsModule`; single-aggregator + single-IPFS topology)
 **Date:** 2026-04-21
 **Supersedes:** `profile/profile-ipns.ts` (IPNS snapshot stopgap)
-**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3.3, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
+**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3.4, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
 **Related:**
 - [`docs/uxf/PROFILE-ARCHITECTURE.md`](./PROFILE-ARCHITECTURE.md) §2.3 (multi-bundle model), §7.6 (migration), §2.1 (global-keys model)
 - [`state-transition-sdk`](https://github.com/unicitylabs/state-transition-sdk) — all cryptographic primitives are consumed from this SDK wherever possible (§4.6)
@@ -534,18 +534,17 @@ fn recover(mk, trustBase):
 
 The difference from the v3.2 text: the old §6.4 required verified *exclusion* at `V+1` as a termination condition. That requirement is removed. Discovery now returns the latest VALID version; the aggregator may hold corrupt-but-included entries at higher version numbers and discovery skips them. See §9.8 for the narrative of why and spec §10.3 / §8.2 Phase 3 for the canonical rule.
 
-### 6.5 Trust base and the TOFU problem (reviewer C-6)
+### 6.5 Trust base — embedded anchor model (v3.4)
 
-Every proof returned by the aggregator is verified locally via `InclusionProof.verify(trustBase, requestId)` against a `RootTrustBase` the wallet obtained through a trusted channel.
+Every proof returned by the aggregator is verified locally via `InclusionProof.verify(trustBase, requestId)` against a `RootTrustBase`. In v1 Sphere, that trust base is shipped inside the SDK bundle and shared with L4.
 
-**Problem on a fresh device with only a mnemonic.** No prior trust-base fingerprint is stored locally.
+**Embedded `RootTrustBase` (v3.4 — the authoritative rule).** The SDK ships `RootTrustBase` statically under `assets/trustbase/<network>.ts` and loads it via `impl/shared/trustbase-loader.ts`. This is the SAME instance L4 / `PaymentsModule` already consumes through `OracleProvider` in the current Sphere deployment. The pointer layer MUST consume that same instance (spec §8.4, §8.4.2). Fresh devices with only a mnemonic load the bundled trust base at init time — there is no runtime fetch of trust-base bytes, therefore no "fresh boot" TOFU dilemma.
 
-**Layered mitigation strategy (v3.1 hardening: multi-mirror cross-check promoted from RECOMMENDED to MANDATORY):**
+- **Single canonical source of truth.** L4 already decided it — the pointer layer adopts the same decision. Asymmetric trust surfaces (pointer layer trusting a different `RootTrustBase` from L4) are explicitly prohibited.
+- **Rotation.** `RootTrustBase` rotation is driven by SDK releases: when BFT validators rotate epochs, Sphere ships a new build whose bundled trust base carries the new epoch. Runtime detection is via `NOT_AUTHENTICATED` + epoch mismatch surfacing as `AGGREGATOR_POINTER_TRUST_BASE_STALE` (spec §8.4.1); the wallet does NOT attempt a runtime refetch.
+- **Residual risk = bundle supply chain.** The attacker's only path to a forged trust base is compromising the SDK release itself. This is a known v1 trade-off, closed in v2 by L1-alpha-anchored trust-base fingerprinting (§12).
 
-1. **TOFU + MANDATORY multi-mirror cross-check.** On the very first aggregator contact from a fresh-install / mnemonic-only device, the wallet MUST query **at least `MIN_MIRROR_COUNT = 2` independently-addressed aggregator mirrors** (spec §3 / §8.4) and require their advertised `RootTrustBase` values to be byte-identical. Any divergence aborts recovery with `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` and surfaces an operator alert. **Single-mirror TOFU is NOT permitted in v1 shipping builds.** This closes the cold-start MITM attack where a single compromised mirror serves a forged trust base that then verifies any fabricated inclusion/exclusion proof the attacker wishes. See spec §8.4 for the normative rule and `MIN_MIRROR_COUNT` constant.
-2. **L1-anchored pinning (v2).** The aggregator root is periodically anchored to an ALPHA (L1) coinbase height. The wallet pins the most recent L1-anchored root and rejects aggregator roots that do not chain to it. Strongest guarantee; requires the L1 anchoring mechanism, which is outside this PR.
-
-The architecture document does NOT mandate (2) for the initial implementation — it is documented as the roadmap. What IS mandated is that (1) is applied on every fresh-install recovery, the trust-base values across mirrors are compared byte-identically, verification is never skipped, and the code path is explicit, logged, and user-visible.
+**Multi-mirror TOFU deferred to v2 (retained as narrative for reviewers).** Earlier revisions required a mandatory multi-mirror TOFU cross-check (≥ 2 independently-addressed aggregator mirrors returning byte-identical trust bases) on first-boot recovery. v3.4 deletes that rule because the deployed Sphere topology is a single aggregator (`aggregator.unicity.network` or `goggregator-test.unicity.network`) and a single IPFS node (`ipfs.unicity.network`), and the trust base is already bundled rather than runtime-fetched. Multi-mirror TOFU re-emerges as a meaningful defense only alongside v2 runtime-fetched trust-base infrastructure — see §12 and spec §11.13 item (i). The v2 plan pairs runtime fetch with L1-alpha anchoring and re-introduces multi-mirror cross-check on top of that foundation.
 
 ### 6.6 Fresh-wallet / no-pointer-yet case
 
@@ -581,7 +580,7 @@ The wallet maintains a per-wallet **persistent** BLOCKED flag — the canonical 
 
 This preserves user-visible write semantics (the wallet appears to function, local OpLog fills) while guaranteeing that the next on-aggregator commit cannot silently overwrite a remote history.
 
-**Fresh-install corrupt-payload at cold start (v3.2).** The r3.1 "BLOCKED on corrupt-payload when `localVersion == 0`" rule is **removed**. Corrupt versions are now treated as semantically ignored residue in the aggregator SMT; discovery walks back past them to the latest valid version rather than blocking publish. The MITM concern r3.1 cited is absorbed into the broader valid-version-continuity model (§9.8) together with the multi-mirror trust-base cross-check (§6.5), and the corrupt-streak bail-out (spec §10.8). See §9.8 and spec §10.3 for the v3.2 rule.
+**Fresh-install corrupt-payload at cold start (v3.2).** The r3.1 "BLOCKED on corrupt-payload when `localVersion == 0`" rule is **removed**. Corrupt versions are now treated as semantically ignored residue in the aggregator SMT; discovery walks back past them to the latest valid version rather than blocking publish. The MITM concern r3.1 cited is absorbed into the broader valid-version-continuity model (§9.8) together with the shared embedded `RootTrustBase` (§6.5), and the corrupt-streak bail-out (spec §10.8). See §9.8 and spec §10.3 for the v3.2 rule.
 
 ---
 
@@ -813,17 +812,11 @@ Revision 3.3 closes four surface-area issues in the privacy/security argument wi
 
 **Probe predicate changed to OR (narrow usage).** The inclusion predicate used inside discovery remains AND-over-sides for the global Phase 1 / Phase 2 search (§10.5). Spec §8.1 also defines an OR-over-sides predicate used by a narrow partial-publish retry window, so a single-side landed commit does not non-monotonically "disappear" from later probe traces. From the arch-level privacy angle: this does not change the §9.7 fingerprint disclosure, because the probe sequence is still deterministic in `(V_true, localVersion, corrupt-version set)`. No new observability surface is introduced.
 
-**Trust base rotation (spec §8.4.1).** The pinned `RootTrustBase` ages out. When the aggregator rotates its BFT validator set, the wallet's locally-pinned trust base no longer verifies fresh proofs (`NOT_AUTHENTICATED`). The arch-level rule: treat `NOT_AUTHENTICATED` as a rotation signal, not as BLOCKED-trigger material. Refresh the trust base against the bundled mirror list (§6.5) with `MIN_MIRROR_COUNT` byte-identical cross-check, verify fresh proofs under the refreshed base, and ONLY after two successive rotation-refresh cycles fail to produce verifiable proofs should BLOCKED escalate. This closes a "trust-base age-out bricks otherwise-live wallets" failure mode.
+**Trust base rotation (spec §8.4.1, simplified v3.4).** The bundled `RootTrustBase` ages out. When the aggregator rotates its BFT validator set, the SDK-bundled trust base no longer verifies fresh proofs (`NOT_AUTHENTICATED`). The arch-level rule: treat `NOT_AUTHENTICATED` plus an epoch mismatch as a rotation signal (not as BLOCKED-trigger material); surface `AGGREGATOR_POINTER_TRUST_BASE_STALE` and require an SDK update whose bundled trust base carries the new epoch. There is no runtime-refresh flow in v1 — rotation remediation is release-shipped. This closes a "trust-base age-out bricks otherwise-live wallets" failure mode, traded for SDK-release cadence as the rotation bottleneck.
 
-**Shared trust base vs L4 (spec §8.4.2).** The `RootTrustBase` the pointer layer consumes MUST be the same instance the outer SDK uses for L4 token verification. Implementations that derive or load two separate trust bases (e.g., pointer layer fetches its own on `initialize()`, L4 verifies tokens against another) create an asymmetric MITM surface: an attacker who can only MITM the pointer layer's trust-base fetch can forge pointers while L4 transfers continue to verify correctly. The arch-level rule is a simple invariant: `RootTrustBase` is a wallet-global shared resource.
+**Shared trust base vs L4 (spec §8.4.2 — canonical rule as of v3.4).** The `RootTrustBase` the pointer layer consumes MUST be the same instance the outer SDK uses for L4 token verification — specifically, consumed via `OracleProvider.getRootTrustBase()` (or the equivalent SDK hook). Implementations MUST NOT instantiate a separate trust base for the pointer layer. Asymmetric trust bases create an attacker path where one surface is forgeable and the other is not, which is enough to compromise wallet state regardless of which layer is "stronger." Shared trust collapses both attack surfaces into one — and is trivially satisfied in v3.4 because the bundled trust base already flows through L4's `OracleProvider` today.
 
-**TLS cert pinning + CA diversity (spec §8.4.3).** Fresh-boot TOFU is no longer "any HTTPS succeeds." v3.3 adds three defenses layered on top of the `MIN_MIRROR_COUNT` cross-check already in §6.5:
-
-- Mirror list integrity: the bundled mirror list is hashed (`MIRROR_LIST_SHA256`, release-time) and verified on init; tampering aborts with `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`.
-- Per-mirror cert pinning: each mirror has pinned leaf/intermediate SHA-256 fingerprints (`MIRROR_CERT_PINS`). A mismatch on the TLS handshake aborts with `AGGREGATOR_POINTER_CERT_PIN_MISMATCH`.
-- CA diversity: the bundled mirrors MUST be distributed across at least two distinct Certificate Authorities and two distinct IP ranges, so an attacker who compromises one CA cannot silently impersonate all mirrors simultaneously.
-
-These three are specified canonically in spec §8.4.3; the arch-level takeaway is that cold-start TOFU is now a multi-axis integrity check, not a single-point trust decision.
+**TLS simplified to standard WebPKI (spec §8.4.3).** Aggregator HTTPS uses TLS ≥ 1.3 with standard WebPKI validation. Because `RootTrustBase` is embedded in the SDK bundle (not fetched over the network), an on-path TLS MITM cannot forge `InclusionProof.verify` outcomes — the cryptographic anchor lives in the SDK, independent of the TLS session. Runtime cert pinning, CA diversity, IP diversity, and bundled mirror-list integrity — all retired in v3.4 — applied only when the trust base was fetched over the wire, and will re-emerge in v2 alongside runtime-fetched trust-base + L1-alpha-anchored fingerprinting (§12).
 
 ---
 
@@ -888,8 +881,8 @@ Where `probe(V)` (a.k.a. `bothSidesIncluded(V)`) fetches AND verifies inclusion/
 
 Known trade-offs deferred to v2 — see spec §11.13 for the canonical list. These are decided-and-deferred (not open questions):
 
-- **Bundled mirror list as centralized trust root.** The `MIN_MIRROR_COUNT` cross-check (§6.5) presupposes a client-bundled list of aggregator mirrors; the list itself is a centralized trust root, re-introducing a degree of the dependency the Profile architecture works to remove.
-- **MANDATORY multi-mirror DDoS surface.** Every fresh-install recovery fans out to `MIN_MIRROR_COUNT` independently-addressed mirrors in parallel; coordinated cold-start cohorts (post-incident restore waves, testnet resets) amplify aggregate load.
+- **Bundled trust base as centralized trust root (v3.4).** v1 ships `RootTrustBase` inside the SDK bundle (§6.5). Supply-chain compromise of an SDK release beats every downstream wallet at once — L4 and the pointer layer are both anchored to the same bundle.
+- **Runtime-fetched trust base with L1-alpha-anchored fingerprint (v2 work).** Replace the SDK-bundled trust base with a runtime-fetched one whose fingerprint is committed to the ALPHA (L1) chain (e.g., a coinbase OP_RETURN or governance-signed record). Wallets then verify at init time that the trust base delivered by the aggregator matches the latest L1 attestation. This closes the supply-chain gap of the bundled-trust-base model AND unblocks multi-mirror TOFU (≥ 2 independently-addressed aggregator mirrors returning byte-identical trust bases) as a meaningful defense — together with cert pinning, CA diversity, and mirror-list integrity. All of these become applicable only once runtime fetch is in scope, and are consequently paired in the v2 roadmap. See spec §11.13 item (i).
 - **Backup/restore `MARKER_CORRUPT` UX.** A `pending_version` marker restored from a backup taken mid-publish surfaces as `AGGREGATOR_POINTER_MARKER_CORRUPT`, which today requires the operator escape hatch (`clearPendingMarker()`) — not ideal for end-user recovery flows.
 - **Denylist governance.** The well-known-test-key denylist (spec §11.12) is client-bundled; updates require a client release cycle, and there is no signed revocation channel.
 
@@ -1104,14 +1097,14 @@ Revision 3.3 adds constants, error codes, and events that the implementation PR 
 
 - `MARKER_MAX_JUMP` — carried over from v3.1 (`1024` versions).
 - `MAX_CT_RESIDENT_MS` — carried over from v3.1 (`500` ms).
-- `MIN_MIRROR_COUNT` — carried over from v3.1 (`2` mirrors).
+- ~~`MIN_MIRROR_COUNT` — carried over from v3.1 (`2` mirrors).~~ **Removed in v3.4** (multi-mirror TOFU deferred to v2; see §6.5).
 - `MAX_CAR_BYTES` — `100 MiB` (replaces and renames the v3.1 constant; same value).
 - `MAX_CAR_FETCH_INITIAL_RESPONSE_MS` — `10 s` (v3.3 new).
 - `MAX_CAR_FETCH_STALL_MS` — `30 s` (v3.3 new — progress-rate enforcement between chunks).
 - `MAX_CAR_FETCH_TOTAL_MS` — `300 s` / 5 min (v3.3 new; replaces `MAX_CAR_FETCH_MS = 60 s` with a progress-aware cap).
 - `MAX_CAR_FETCH_RETRY` — `3` per-gateway attempts (v3.3 new).
-- `MIRROR_LIST_SHA256` — computed at release time (v3.3 new — integrity hash of bundled mirror list).
-- `MIRROR_CERT_PINS` — per-mirror pinned leaf/intermediate SHA-256 cert fingerprints (v3.3 new).
+- ~~`MIRROR_LIST_SHA256` — computed at release time (v3.3 new — integrity hash of bundled mirror list).~~ **Removed in v3.4.**
+- ~~`MIRROR_CERT_PINS` — per-mirror pinned leaf/intermediate SHA-256 cert fingerprints (v3.3 new).~~ **Removed in v3.4.**
 - `CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS` — `12` (v3.3 new — persistent hourly retries before `acceptCarLoss`).
 - `CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS` — `24 h` (v3.3 new — wall-clock minimum before `acceptCarLoss`).
 - `POINTER_PEER_DISCOVERY_MS` — `10 min` (v3.3 new — peer-availability poll window).
@@ -1120,9 +1113,9 @@ Revision 3.3 adds constants, error codes, and events that the implementation PR 
 
 **New error codes (spec §12):**
 
-- `AGGREGATOR_POINTER_TRUST_BASE_STALE` — trust base aged out; rotation required.
-- `AGGREGATOR_POINTER_CERT_PIN_MISMATCH` — TLS cert fingerprint does not match pinned value.
-- `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED` — bundled mirror list integrity check failed.
+- `AGGREGATOR_POINTER_TRUST_BASE_STALE` — trust base aged out; rotation remediation is SDK release in v3.4 (see §6.5, spec §8.4.1).
+- ~~`AGGREGATOR_POINTER_CERT_PIN_MISMATCH` — TLS cert fingerprint does not match pinned value.~~ **Removed in v3.4** (cert pinning deferred to v2).
+- ~~`AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED` — bundled mirror list integrity check failed.~~ **Removed in v3.4** (mirror-list infrastructure deferred to v2).
 - `AGGREGATOR_POINTER_PUBLISH_BUSY` — mutex contention exhausted retry budget.
 - `AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME` — platform lacks required primitives (e.g., Web Locks API).
 - `AGGREGATOR_POINTER_CAR_UNEXPECTED_ENCODING` — CAR payload has unexpected encoding/codec.
@@ -1175,3 +1168,4 @@ Once all five approvals are recorded and the spec's Reviewer Sign-Off Checklist 
 | v3.1 | 2026-04-20 | Hardening pass applied from steelman findings on v3: marker version-jump clamp, retry-window ciphertext zeroization, mandatory multi-mirror TOFU with fresh-install corrupt-payload BLOCKED, CAR size caps and unavailable-state handling, `originated` tag for user-originated OpLog writes, probe-sequence fingerprint disclosure, test-vector runtime rejection, new API methods (`acceptCarLoss`, `clearPendingMarker`, `getProbeFingerprint`). Error-code name aligned (`AGGREGATOR_POINTER_UNTRUSTED_PROOF`). BLOCKED SET conditions aligned (four conditions, "attempted AND failed" phrasing). Symbol naming aligned (`paddingBytes_v`). `findLatestVersion` call-site arity corrected. `localSigningPubKey` disambiguated as wallet chain-key pubkey (`localChainKeyPublicKey`) throughout. Async-await convention footnote added. Note: spec change log F-numbering skips F6 (reserved, not used in v3); arch does not enumerate F-items, so no renumbering is required on the arch side. Spec is canonical; arch narrates. |
 | v3.2 | 2026-04-21 | Apply r3.1 steelman findings: API signatures aligned with spec (`Promise<Result<void>>`); §6.7 user-originated rewritten to reference `originated` tag rule (spec §10.2.3); valid-version-continuity narrative added (§9.8) replacing the v3.1 fresh-install BLOCKED-on-corrupt rule; event payloads harmonized; cross-references to spec §10.7 (was §10.4) fixed; spec §3 (was §3.1) fixed; residual trade-offs documented in spec §11.13. |
 | v3.3 | 2026-04-21 | Final hardening pass closing 14 critical + 12 warning findings from 6-agent final review. Token-loss paths closed: transient CAR skip (spec §8.2 Phase 3 + §8.5), probe predicate non-monotonicity (§8.1 OR), mutex cross-context scope (§7.1.1 Web Locks / file lock), publish deadlock on corrupt residue (§9 max(validV, includedV)+1), trust base rotation bricking (§8.4.1), asymmetric trust base vs L4 (§8.4.2), acceptCarLoss token loss (§10.7.1 republish-before-advance), REJECTED OTP reuse (§7.3 burn v), TLS MITM on TOFU (§8.4.3 cert pinning + CA diversity + mirror-list integrity), CAR fetch wall-clock timeout on slow networks (§8.5 progress-rate + HTTP Range resume), §7.1.4 idempotent-retry case preserved (§7.1.4), §11.11 zeroization relaxed to achievable target. Editorial: HKDF info byte count typo corrected (33 bytes), walletPrivateKey pinned to BIP32 master, HTTPS mandated for IPFS gateways, HTTP status-code outcome matrix expanded, network timeouts added, identity-swap-during-publish rules, capability gates on operator overrides, SDK version pinning open item added, isReachable() specified as live probe. Originated-tag writer enumeration added for migration PR. Arch narrates; spec is canonical. |
+| v3.4 | 2026-04-21 | **Embedded `RootTrustBase` deployment model.** §6.5 rewritten to describe the SDK-bundled trust base at `assets/trustbase/<network>.ts` (shared with L4 / `PaymentsModule` via `OracleProvider`); multi-mirror TOFU narrative deleted and marked as v2 future work. §6.7 cross-ref to §6.5 updated (shared embedded trust base replaces multi-mirror cross-check). §9.9 v3.3 security-and-privacy additions rewritten: trust-base rotation becomes "`TRUST_BASE_STALE` + ship SDK update" (no runtime refresh); shared-trust-base-vs-L4 rule promoted to canonical v3.4 rule; TLS section simplified to standard WebPKI. §10.6 trade-offs updated: "bundled trust base as centralized trust root" replaces the former "bundled mirror list" entry; new "runtime-fetched trust base with L1-alpha-anchored fingerprint" v2 work item added (unblocks multi-mirror TOFU as a meaningful defense when runtime fetch ships). §15.5 v3.3 migration delta annotated: `MIN_MIRROR_COUNT`, `MIRROR_LIST_SHA256`, `MIRROR_CERT_PINS`, `AGGREGATOR_POINTER_CERT_PIN_MISMATCH`, `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED` marked "Removed in v3.4". Header bumped to v3.4. Rationale: v1 Sphere deployment is single aggregator + single IPFS node with embedded trust base already consumed by L4 (confirmed by user); multi-mirror TOFU is neither deployable nor meaningful against that topology without the v2 runtime-fetch + L1-anchor prerequisite shipping first. Spec §3 / §8.4 / §8.4.1 / §8.4.3 / §11.13 / §12 hold the byte-level corollaries. |

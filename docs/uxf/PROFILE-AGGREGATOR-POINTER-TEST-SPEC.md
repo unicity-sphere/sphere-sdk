@@ -1,13 +1,38 @@
 # UXF Profile — Aggregator-Anchored Pointer Layer — Test Specification
 
-**Status:** Draft v2 — paired with ARCHITECTURE v3.3 and SPEC v3.3.
+**Status:** Draft v2.2 — paired with ARCHITECTURE v3.4 and SPEC v3.4 (embedded-trust-base model).
 **Date:** 2026-04-21
 **Companion docs:**
-- [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) (v3.3)
-- [`PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) (v3.3)
+- [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) (v3.4)
+- [`PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) (v3.4)
 - [`PROFILE-ARCHITECTURE.md`](./PROFILE-ARCHITECTURE.md) §10.4 JOIN (load-bearing)
 
 This document is a **pre-implementation test plan**. It enumerates every scenario that MUST pass before the pointer layer is considered shippable. It contains no TypeScript code. Shell scripts in §5 are executable against real Unicity testnet infrastructure.
+
+---
+
+## v2.2 Changelog (2026-04-21) — SPEC v3.4 alignment
+
+Aligned with SPEC v3.4 embedded-trust-base amendments (§3 / §8.4 / §12):
+
+**Deleted (4 scenarios):**
+- **D14** (multi-mirror TOFU first-touch fake-root rejection) — not applicable under embedded trust base.
+- **D15** (TLS cert pinning mismatch → `CERT_PIN_MISMATCH`) — constant deleted.
+- **D16** (mirror list tampering → `MIRROR_LIST_TAMPERED`) — constant deleted.
+- **H3-R** (cross-mirror TOFU downgrade regression, sub-cases A/B/C) — not applicable under embedded trust base.
+
+**Amended:**
+- **F1–F9** trust-base scenarios simplified: trust base is embedded (`assets/trustbase/<network>.ts`) and consumed via `OracleProvider.getRootTrustBase()`, identical instance to L4 / `PaymentsModule`. **F5** becomes "`OracleProvider.getRootTrustBase()` returns the same instance `PaymentsModule` uses."
+- **C6** trust-base rotation: simplified to epoch-mismatch detection on embedded `RootTrustBase`, raising `AGGREGATOR_POINTER_TRUST_BASE_STALE` (requires SDK update). No mid-session remote rotation in v1.
+
+**Coverage matrix (§4) updates:**
+- H3 / H9 rows: changed to "v2 future work (bundled trust base in v1 — see SPEC v3.4 §8.4)"; PRIMARY / SECONDARY columns set to "n/a for v1".
+- Rows referencing deleted error codes (`CERT_PIN_MISMATCH`, `MIRROR_LIST_TAMPERED`, `TRUST_BASE_DIVERGENCE`) removed.
+- Secondary references to deleted D14/D15/D16/H3-R scenarios removed or replaced.
+
+**Total scenarios:** 146 → 142 (−4). Category totals updated in final summary table.
+
+H3 and H9 coverage in v1: n/a. These hazards are deferred to v2. Future work will reintroduce multi-mirror TOFU, TLS cert pinning, and mirror-list integrity checks as part of a distributed-trust-base milestone.
 
 ---
 
@@ -18,7 +43,7 @@ This document is a **pre-implementation test plan**. It enumerates every scenari
 - **K10**: Originated-tag downgrade race during OrbitDB merge
 - **D11a, D11b**: Slow-network arithmetic feasibility (timeout budgets + RTT drift injection)
 - **M13–M15, M17**: DAG-aware token conservation (JOIN rules per PROFILE-ARCHITECTURE.md §10.4 + real double-spend; M16 deleted in v2.1 with M7 — finality-window concept not in SPEC, covered by H5 trust-base rotation)
-- **H3-R, H8-R, H14-R**: Named regression tests for critical findings (cross-mirror TOFU, REJECTED double-spend, pending_version idempotency)
+- **H3-R, H8-R, H14-R**: Named regression tests for critical findings (cross-mirror TOFU, REJECTED double-spend, pending_version idempotency). (H3-R deleted in v2.2 per SPEC v3.4.)
 - **N14**: Legacy cold-start recovery without pointer layer enabled
 - **Category P (P1–P8)**: Conformance & security invariants
   - **P1–P3**: Proof-verify-always assertion + TOFU trust base + proof staleness
@@ -43,7 +68,7 @@ This document is a **pre-implementation test plan**. It enumerates every scenari
 - TokenConservationInvariant rewritten with 3-bucket model (spendable/quarantined/tombstoned).
 - §5 shell-script prologue hardened (`set -Eeuo pipefail`, traps, egress-interface detection, JSON oracles).
 - New invariants I-FX (fixture isolation) and I-OR (oracle independence).
-- H3-R expanded with both-mirrors-forged and single-mirror-unreachable sub-cases.
+- H3-R expanded with both-mirrors-forged and single-mirror-unreachable sub-cases. (Subsequently deleted in v2.2 per SPEC v3.4.)
 
 **Total scenarios:** 135 → 146 (+13 new, −2 deleted M7/M16). Categories: 15 → 16 (+Category P). Lines: ~1058 → ~1475.
 
@@ -99,7 +124,7 @@ Every scenario below is stated, evaluated against that invariant, and mapped to 
 
 ### 1.4 Finding-to-Test Mapping (top-level)
 
-Every critical H-finding (H1–H14) and warning finding (W1–W12) from SPEC §16 (change log) and ARCH §15.5 MUST appear at least once in the test coverage matrix (§4). Tests where a finding's regression test is the PRIMARY purpose of the test case are marked in §4's "Primary" column. v2 adds 3 explicit regression tests (H3-R, H8-R, H14-R).
+Every critical H-finding (H1–H14) and warning finding (W1–W12) from SPEC §16 (change log) and ARCH §15.5 MUST appear at least once in the test coverage matrix (§4). Tests where a finding's regression test is the PRIMARY purpose of the test case are marked in §4's "Primary" column. v2 adds explicit regression tests (H8-R, H14-R). (H3-R deleted in v2.2 per SPEC v3.4 embedded-trust-base amendments — H3 and H9 are v2 future work.)
 
 ---
 
@@ -150,7 +175,7 @@ For each scenario: **Pre-state** (what's on disk before crash), **Crash trigger*
 | **C3** [parameterized by side ∈ {A, B}] | Side A/B submits at `v = K` while side B/A has already published `v = K+1` (version skew race). | `midLifecycle` on device D: `localVersion = 5` on D. Spawn two concurrent subscribers T1, T2 checking pointer state. | T1: reads `localVersion = 5`, bumps marker to `v = 6`. T2: concurrently reads stale `localVersion = 5` from cache, also bumps to `v = 6`. Both submit at `v = 6`. | Only one of two T1/T2 commit succeeds at `v = 6`. Loser observes collision and re-probes. | Marker compaction (§7.1.6): next publish on D sees no conflict; `localVersion === 6` final. |
 | **C4** [parameterized by side ∈ {A, B}] | Partial publish: side A includes, side B times out mid-submit, then network recovers. Device retries side B at same `v`. | Fixture: `midLifecycle`. Inject network timeout on side B (aggregator mock delays >PUBLISH_REQUEST_TIMEOUT_MS). | Submit `v = K+1`: side A succeeds, side B times out. Retry: side B returns `AGGREGATOR_POINTER_TRANSIENT_UNAVAILABLE`. Automatic backoff + retry succeeds. | Both sides eventually included at `v = K+1`. Marker compacted; `localVersion` advanced. | No version bump; no OTP reuse; both sides at same `v`. |
 | **C5** | Aggregator unreachable on recovery init → BLOCKED set → user resumes → aggregator recovers → BLOCKED cleared on next publish check. | Fixture: `freshWallet` with aggregator mocked unreachable. | (1) Init with unreachable aggregator → logs warning, proceeds without recovering pointer. (2) BLOCKED flag set (H1 closure). (3) Call `publish()` → refused with `AGGREGATOR_POINTER_BLOCKED_AWAITING_RECOVERY`. (4) Aggregator restored to reachable. (5) Call `publish()` → check aggregator connectivity → BLOCKED flag cleared → publish proceeds. | Step 3: publish rejected. Step 5: publish succeeds. BLOCKED flag transitions `true → false`. | No silent overwrite of remote history (the reason BLOCKED exists); user awareness enforced. |
-| **C6** | Trust-base rotation mid-recovery: aggregator publishes new trust base root; in-flight proofs must re-validate. | Fixture: `midLifecycle` with mock aggregator. | Probe returns proofs against old root. Trust base is rotated (new root published). Wallet detects `RootTrustBase.current() !== proofRoot` and **re-probes with new root**. | Proofs are re-verified against new root and pass (assuming canonical aggregator state unchanged). Recovery continues. | No token loss; re-probing is transparent to caller. |
+| **C6** | **AMENDED v2.2:** Trust-base rotation mid-recovery under embedded-trust-base model (SPEC v3.4 §8.4). The wallet does NOT refresh the trust base at runtime; instead it detects epoch mismatch and halts. | Fixture: `midLifecycle` with mock aggregator. | Aggregator begins returning proofs against a new root (epoch N+1). Wallet's bundled `RootTrustBase` is at epoch N. Probe returns proof at epoch N+1. | Wallet detects epoch mismatch between aggregator response and embedded `RootTrustBase`. Recovery halts with `AGGREGATOR_POINTER_TRUST_BASE_STALE`; user is prompted to update SDK (v1 has no mid-session rotation). | No silent acceptance of unverified rotation; no token loss. Runtime rotation is v2 future work. |
 | **C7** | Two devices attempt to `clearPendingMarker()` simultaneously (capability-gated, user-initiated). | Fixture: `blockedState`. | Device A and B both hold the mnemonic and both call `clearPendingMarker()`. | One succeeds and clears marker. Second sees no marker (idempotent no-op) and returns success. BLOCKED flag may still be set pending next aggregator check. | No corruption; no race on marker file. |
 | **C8** | Conflict retries exceed budget; `AGGREGATOR_POINTER_RETRY_EXHAUSTED` surfaced. | Fixture: `midLifecycle`. Aggregator mock always returns conflict (`REQUEST_ID_EXISTS`) up to 5 consecutive retries. | Publish at `v = K+1`; aggregator rejects every side with conflict (rare pathological case). After 5 retries, publisher gives up. | Error `AGGREGATOR_POINTER_RETRY_EXHAUSTED` returned to caller. CAR is NOT cleaned up (already pinned; retry-friendly). | Next manual retry attempt succeeds if pathology clears. Token inventory unchanged (no publish took effect). |
 | **C9** | Multi-device silent fork prevention: Device A and B both independently arrive at different cid for same `v` (e.g., due to OrbitDB merge conflict at user level). Pointer layer ensures only one is published; other is queued for `v = K+1`. | Fixture: `twoDeviceSync` at `v = K`. Both A and B perform identical faucet-and-consume locally, but due to nondeterministic CRDT merge, their OrbitDB arrives at different CID for the "same" logical snapshot. | Device A publishes first at `v = K+1` with `cidA`. Device B independently publishes (unaware of A) with `cidB`. B's publish races A's; B loses conflict at `v = K+1`. B re-probes, sees A's `cidA`, then bumps to `v = K+2` with its own `cidB`. | Both `cidA` and `cidB` eventually published (at `v = K+1` and `v = K+2`). On recovery, both CIDs are recovered and merged via OrbitDB JOIN rules (§10.4). | Token inventory is union of A and B (no loss). Causality: cidA precedes cidB. |
@@ -180,9 +205,9 @@ For each scenario: **Pre-state** (what's on disk before crash), **Crash trigger*
 | **D11b** | Slow-network RTT boundary test: inject RTT = PUBLISH_REQUEST_TIMEOUT_MS - 1 RTT unit. Verify completion. Then cross boundary; verify graceful timeout classification (v2 new). | Latency injection: set to timeout boundary ± delta. Run both sides of crossing. | At boundary-1: `SUCCESS`. At boundary: `REQUEST_TIMEOUT` (transient). | Backoff + retry succeeds. |
 | **D12** | Trust-base fetch timeout (H6, W4). | IPFS gateway for trust-base slow; exceeds IPNS_RESOLVE_TIMEOUT_MS. | `AGGREGATOR_POINTER_UNTRUSTED_PROOF`. | Retry with fallback to cached root (if recent, per SPEC §8.4.2). |
 | **D13** | Aggregator mirror returns `HTTP 503 Service Unavailable`. | Mock aggregator returns 503. | `AGGREGATOR_POINTER_TRANSIENT_UNAVAILABLE` (per HTTP semantics). | Retry on same mirror; switch to next mirror. |
-| **D14** | Multi-mirror TOFU first-touch: Device requests proof from two mirrors; one returns malformed proof (H3 closure). | Two mirrors; M1 returns valid proof, M2 returns fake root. | Wallet: compare proofs via `MIN_MIRROR_COUNT (2)` cross-check. Reject M2's proof (does not verify against expected root). | Exclude M2 from future queries; trust M1. BLOCKED not set (TOFU downgrade rejected). |
-| **D15** | Multi-mirror TLS cert pinning (W10 closure). | Mock aggregator with certificate mismatch against MIRROR_CERT_PINS. | HTTPS connection refused; `AGGREGATOR_POINTER_TLS_CERT_INVALID`. | Fail-stop or escalate (no silent fallback to unverified HTTPS). |
-| **D16** | Mirror list tampering (MIRROR_LIST_SHA256 integrity check, W9 closure). | Bundled mirror list has invalid checksum (simulated). | Init aborts with `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`. | Publish/recover blocked; escalate. |
+| ~~D14~~ | **DELETED in v2.2 (SPEC v3.4).** Multi-mirror TOFU first-touch fake-root rejection. Not applicable under embedded-trust-base model. Future work: v2 multi-mirror TOFU reintroduction. | — | — | — | — |
+| ~~D15~~ | **DELETED in v2.2 (SPEC v3.4).** TLS cert pinning against `MIRROR_CERT_PINS`. Constant deleted; cert pinning is v2 future work. | — | — | — | — |
+| ~~D16~~ | **DELETED in v2.2 (SPEC v3.4).** Mirror-list tampering via `MIRROR_LIST_SHA256`. Constant deleted; mirror-list integrity is v2 future work. | — | — | — | — |
 | **D17** | IPFS gateway list empty / all gateways down. | All IPFS gateways unreachable. | CAR fetch fails on all mirrors. On publish: CAR already pinned to local node; no failure. On recovery: persistent-retry loop (W7). | 24-hour persistent retry (§10.7). |
 | **D18** | Monotonic clock enforcement: pointer versions use monotonic (not wall-clock) timestamps internally per SPEC §10.7 H7 requirement (v2 enhanced). | Fixture: `midLifecycle`. System time: jump backward (-1 hour). System time: jump forward (+2 hours). Publish at each step. | Pointer layer uses monotonic clock for version ordering (`getMonotonicTime()`, not `Date.now()`). Version advances regardless of wall-clock skew. Publish at v=K succeeds with monotonic timestamp K (ignoring wall-clock position). | Proofs from all three publishes verify (monotonic ordering preserved). No proof rejected due to wall-clock skew. `localVersion` advances monotonically: K → K+1 → K+2 (temporal order correct, wall-clock order irrelevant). | Monotonic clock prevents version inversion from skew attacks. Temporal causality preserved despite wall-clock manipulation. I-VM (version monotonicity) enforced. |
 
@@ -213,14 +238,14 @@ For each scenario: **Pre-state** (what's on disk before crash), **Crash trigger*
 
 | ID | Scenario | Fixture | Steps | Expected | Assertion |
 |---|---|---|---|---|---|
-| **F1** | Trust base loaded at init; used for first proof verification. | Fixture: `freshWallet`. | Load RootTrustBase from trusted source (bundled or remote). Verify first proof against it. | Proof verification succeeds (assuming canonical aggregator state). | `InclusionProof.verify(trustBase, requestId)` returns OK. |
-| **F2** | Trust base is shared instance with L4. | Fixture: L4 and pointer layer running in same process. | Both L4 and pointer layer query `RootTrustBase.current()`. | Both return identical root. | No divergence; shared singleton. |
-| **F3** | Trust base rotation: old root expires; new root published. | Fixture: `midLifecycle` with mock aggregator supporting rotation. | (1) Old root active; proofs verify against it. (2) New root published; Wallet detects via aggregator signaling (SPEC §8.4.2). (3) Proofs re-verify against new root. | Seamless rotation; recovery continues. | No interruption; no token loss. |
-| **F4** | Trust base fetch failure (remote source unreachable; no cache). | Fixture: `freshWallet` with remote trust-base URL unreachable. | Recover; trust-base fetch fails. Proof verification requires trust base. | Error: `AGGREGATOR_POINTER_UNTRUSTED_PROOF` (cannot verify without trust base). | Recovery halts; user must resolve network or call manual recovery. |
-| **F5** | Trust base cache (cached trust base used if fresh; avoids re-fetch). | Fixture: `pointerInitialized` with cached trust base older than MAX_TRUSTBASE_CACHE_AGE (not yet expired). | Recover. Trust-base fetch skipped; cached version used. Proofs verify against cached root. | Proofs verify; recovery succeeds; zero network calls for trust base. | Caching reduces latency. |
-| **F6** | Trust base cache expired. | Fixture: cached trust base older than MAX_TRUSTBASE_CACHE_AGE. | Recover; trust-base is fetched fresh. | Proofs verify against new root. | Network call made; cache refreshed. |
-| **F7** | Proof verification against wrong root (attacker publishes fake root as trust base). | Fixture: mock aggregator returns fake RootTrustBase. | Recover; fetch proofs. Verify proofs against fake root. | Proofs fail verification (merkle path does not match fake root). Recovery aborts. | `InclusionProof.verify()` returns `PATH_INVALID` or `NOT_AUTHENTICATED`. No token loss (proofs blocked). |
-| **F8** | Trust base used by pointer layer is NOT the same instance as L4 (divergence detection). | Fixture: L4 and pointer layer in separate processes; cached trust bases go stale at different rates. | L4 sees root X. Pointer layer sees cached root Y (stale). | Divergence is detectable via proof mismatch. On discovery, pointer layer proofs fail verification; error surface to user. | User must manually re-sync trust bases (e.g., clear cache). |
+| **F1** | **AMENDED v2.2:** Trust base loaded at init; used for first proof verification. `RootTrustBase` is the embedded bundle from `assets/trustbase/<network>.ts` (SPEC v3.4 §8.4) — identical instance L4 uses. | Fixture: `freshWallet`. | Instantiate `OracleProvider` (or `PaymentsModule`); call `OracleProvider.getRootTrustBase()`. Verify first proof against it. | Proof verification succeeds (assuming canonical aggregator state). | `InclusionProof.verify(trustBase, requestId)` returns OK; no remote fetch, no cache logic. |
+| **F2** | **AMENDED v2.2:** Trust base is shared instance with L4. | Fixture: L4 and pointer layer running in same process. | Both L4 and pointer layer call `OracleProvider.getRootTrustBase()`. | Both return the identical embedded instance (reference equality). | No divergence; shared embedded bundle (SPEC v3.4 §8.4.2 H6). |
+| **F3** | **AMENDED v2.2:** Trust base rotation via SDK update. | Fixture: `midLifecycle`; aggregator begins returning epoch > bundled epoch. | (1) Old epoch active; proofs verify. (2) Aggregator advances its epoch while wallet still ships the older bundle. (3) Wallet detects epoch mismatch. | `AGGREGATOR_POINTER_TRUST_BASE_STALE` raised; user prompted to update SDK. Mid-session runtime rotation is v2 future work. | No silent acceptance of unverified rotation; no token loss. |
+| **F4** | **AMENDED v2.2:** Absent embedded trust base. Defensive check — the SDK must refuse to initialize without a bundled `RootTrustBase` for the selected network. | Fixture: synthetic build missing `assets/trustbase/<network>.ts` entry. | Instantiate `OracleProvider`. | Init throws `AGGREGATOR_POINTER_PROTOCOL_ERROR` (or equivalent) referencing the missing bundled trust base. No runtime remote-fetch fallback in v1. | No silent "unverified" mode; absent bundle is a build-time failure, caught at init. |
+| **F5** | **AMENDED v2.2:** `OracleProvider.getRootTrustBase()` returns the same instance `PaymentsModule` uses. | Fixture: `pointerInitialized`. | From within a single process, obtain the trust base from (a) `OracleProvider.getRootTrustBase()` and (b) the instance that `PaymentsModule` uses internally. Assert reference equality. | Same `RootTrustBase` instance reference. | No duplicate bundled copies; H6 shared-base contract holds (SPEC v3.4 §8.4.2). |
+| **F6** | **AMENDED v2.2:** Determinism — `OracleProvider.getRootTrustBase()` returns the same bytes across repeated calls within a session and across fresh processes on the same SDK build. | Fixture: fresh process × 2. | Serialize the trust base on each call; compare. | Byte-identical across calls. | No hidden mutation or per-call derivation in v1; trust base is a static embedded constant. |
+| **F7** | Proof verification against wrong root (attacker-controlled aggregator response against the genuine embedded root). | Fixture: mock aggregator returns proofs against a fake root different from the bundled `RootTrustBase`. | Recover; fetch proofs. Verify proofs against the embedded root. | Proofs fail verification (merkle path does not match embedded root). Recovery aborts. | `InclusionProof.verify()` returns `PATH_INVALID` or `NOT_AUTHENTICATED`. No token loss (proofs blocked). |
+| **F8** | **AMENDED v2.2:** SDK-level epoch divergence — two processes running **different SDK builds** (bundling different embedded epochs) must each detect the mismatch against aggregator state and raise `AGGREGATOR_POINTER_TRUST_BASE_STALE`. | Fixture: process A on SDK bundle epoch N, process B on epoch N-1. Aggregator runs at epoch N. | Both processes attempt recovery. | Process A: proofs verify. Process B: epoch mismatch detected → `TRUST_BASE_STALE` raised; user prompted to update SDK. | Divergence is a build-version concern in v1, surfaced via explicit error code; no silent drift (SPEC v3.4 §8.4). |
 | **F9** | Trust base is always verified before use (no bypass paths). | Fixture: pointer layer with instrumented proof-verify function. | Run 100 recovery scenarios (category E). Count proof-verify calls. | At least 100 verify calls (≥1 per recovery). | Every proof is verified before trust. No code path accepts proofs without verification. |
 
 ### Category G — `acceptCarLoss` Operator Override Discipline (H7)
@@ -239,15 +264,15 @@ For each scenario: **Pre-state** (what's on disk before crash), **Crash trigger*
 
 ### Category H — `clearPendingMarker` Operator Override Discipline (W6)
 
-**Rationale.** The pending-version marker is crash-safety critical but can become corrupt (W6). The operator-callable `clearPendingMarker()` is a recovery escape hatch, capability-gated to prevent accidental loss. H1–H4 plus H3-R, H8-R, H14-R (regression tests, v2 new) ensure marker corruption is handled safely.
+**Rationale.** The pending-version marker is crash-safety critical but can become corrupt (W6). The operator-callable `clearPendingMarker()` is a recovery escape hatch, capability-gated to prevent accidental loss. H1–H4 plus H8-R, H14-R (regression tests, v2 new) ensure marker corruption is handled safely. (H3-R removed in v2.2 / SPEC v3.4 — multi-mirror TOFU is v2 future work.)
 
 | ID | Scenario | Fixture | Steps | Expected | Assertion |
 |---|---|---|---|---|---|
 | **H1** | Pending marker is corrupt; `clearPendingMarker()` clears it and sets BLOCKED. | Fixture: marker file has partial JSON. | Call `clearPendingMarker()`. | Marker file deleted. BLOCKED flag SET to `true`. Next publish REFUSED. | BLOCKED prevents silent recovery; forces manual aggregator check before proceeding. |
 | **H2** | `clearPendingMarker()` called without MARKER_CORRUPT error (user panic call). | Fixture: `blockedState` with no marker corruption (e.g., aggregator unreachable). | Call `clearPendingMarker()`. | Marker deleted (no-op if absent). BLOCKED flag set. | User gains recovery escape hatch. |
-| **H3** | Cross-mirror TOFU downgrade defense (multi-mirror diversity check rejects single-mirror fake root). | Fixture: fresh wallet, two aggregator mirrors with `MIN_MIRROR_COUNT=2`. Mirror M1 returns fake `RootTrustBase` (attacker-controlled). Mirror M2 returns canonical `RootTrustBase`. | Recover: request proof from both mirrors concurrently. M1 returns bad trust root; M2 returns canonical root. Wallet verifies same proof against both roots. | M1 proof fails verification (merkle path invalid against fake root). M2 proof passes verification (merkle path valid against canonical root). Wallet accepts M2 as authoritative. | TOFU downgrade attack rejected: single-mirror TOFU is insufficient; canonical root from M2 enables recovery. Token inventory recovered correctly. Mapping: H3 finding closed (cross-mirror diversity required). |
+| **H3** | **AMENDED in v2.2 (SPEC v3.4):** Fake-root rejection against the embedded `RootTrustBase`. Previously specified multi-mirror TOFU cross-check is v2 future work. | Fixture: fresh wallet; mock aggregator responds with proofs against a root different from the embedded `RootTrustBase`. | Recover; verify the returned proof against the bundled trust base. | Proof fails verification (merkle path does not match embedded root). Recovery aborts with `AGGREGATOR_POINTER_UNTRUSTED_PROOF`. | Attack surface previously handled by multi-mirror diversity is now contained by: (a) verification against the embedded trust base (this scenario), (b) epoch-mismatch detection (C6 amended), and (c) SDK-update-gated rotation (F3). Cross-mirror TOFU is v2 future work. |
 | **H4** | Marker corruption detection at startup (NOT a user-callable scenario; automatic). | Fixture: marker file corrupted (truncated JSON). | Wallet init detects corruption; logs error; raises flag without user action. | MARKER_CORRUPT error surfaced; `clearPendingMarker()` capability hint provided to user. | User intervention required; escape hatch available. |
-| **H3-R** | Cross-mirror TOFU downgrade attack regression (H3 closure, v2 new): three sub-cases. | Fixture: fresh wallet, two aggregator mirrors with MIN_MIRROR_COUNT=2. | **Sub-case A:** Mirror A returns fake trust base; Mirror B returns canonical. **Sub-case B:** Both Mirror A and B return different fake roots (coordinated TOFU attack). **Sub-case C:** Mirror A returns valid root; Mirror B unreachable. | **A:** Proofs fail verification against fake root (A). Canonical root (B) succeeds. **B:** Both proofs fail cross-check (roots diverge). Recovery aborts with TOFU downgrade error. **C:** Recovery continues with A's proof (MIN_MIRROR_COUNT requirement relaxed; fallback to single-mirror with warnings). | **A:** TOFU downgrade rejected; recovery succeeds. **B:** TOFU attack detected and blocked. **C:** Single-mirror fallback permitted (degraded mode); tokens recovered. |
+| ~~H3-R~~ | **DELETED in v2.2 (SPEC v3.4).** Cross-mirror TOFU downgrade attack regression (sub-cases A/B/C). Not applicable under embedded-trust-base model. Reintroduce when multi-mirror TOFU lands in v2. | — | — | — | — |
 | **H8-R** | REJECTED (AUTHENTICATOR_VERIFICATION_FAILED) burns version via localVersion=v (H8 closure, v2 new). | Fixture: `midLifecycle` at `v = K`. Publish at `v = K+1` with `ctA_K` (ciphertext from HKDF subkey A). | Step 1: Submit at `v = K+1` with `ctA_K`. Aggregator returns `AUTHENTICATOR_VERIFICATION_FAILED` (simulated: signature invalid, or requestId mismatch on REJECTED row of §7.3). Step 2: Persist `localVersion = K+1` (OTP burned per SPEC §7.3 H8: REJECTED outcome). Step 3: Attempt immediate retry at `v = K+1` with different plaintext `pA_K'` → re-derive `ctA_K'`. | Step 1: Aggregator rejects. Step 3: Wallet MUST refuse retry at same v with different ciphertext (OTP reuse prevention). Wallet either (a) returns permanent error AUTHENTICATOR_VERIFICATION_FAILED, or (b) forces bump to `v = K+2` with fresh keys. | OTP reuse impossible: same `(v, side)` cannot be used with different plaintext. Version burn is irreversible and prevents silent retry-loop DoS. Invariant I-CS (crash safety) preserved. |
 | **H14-R** | Pending_version marker idempotent-retry regression (H14 closure, v2 new). | Fixture: publish at `v = K+1` with `cidHash_A`. Crash mid-publish; restart. Marker: `(v = K+1, cidHash_A)`. Current CID: `cidHash_A` (same). | Restart; publish flow re-enters. Marker present, same cid → idempotent retry. Re-derive payload deterministically. Re-submit. Aggregator: returns `REQUEST_ID_EXISTS` (idempotent). Wallet: recognizes as success (SPEC §7.3 row 4). | No OTP reuse; publish completes. | Determinism enforced: same (v, cid) → same xorKey, padding, payload. No variant paths. |
 
@@ -439,13 +464,13 @@ This invariant is **framework-level**, meaning failures bubble up as test harnes
 |---|---|---|---|---|
 | **H1** | Transient-vs-permanent error classification | Discovery must distinguish `SEMANTICALLY_INVALID` (skip corrupt, continue walking) from `TRANSIENT_UNAVAILABLE` (halt + `AGGREGATOR_POINTER_CAR_UNAVAILABLE`). | E7, E8 (corrupt CID handling + corrupt streak escalation) | D6 (partial CAR → persistent retry); D17 (all gateways down → persistent-retry loop) |
 | **H2** | Monotonic probe predicate | Probe predicate is `aIncluded OR bIncluded` (monotonic). Phase 3 still enforces stricter both-sides check. | A2 (sequential publishes discover monotonically increasing version) | C2 (multi-device recovery order preserved) |
-| **H3** | Multi-mirror TOFU cross-check | MANDATORY multi-mirror diverse-proof validation (MIN_MIRROR_COUNT ≥ 2). Forged root on one mirror rejected via comparison. | D14 (two mirrors, one returns fake root, wallet rejects via cross-check) | C6 (trust-base rotation handled via mirror diversity) |
+| **H3** | H3 — v2 future work (bundled trust base in v1 — see SPEC v3.4 §8.4) | Multi-mirror TOFU cross-check deferred to v2. In v1 the embedded `RootTrustBase` is the sole trust anchor; attack surface is handled instead by **F7** (fake-root rejection against the genuine embedded root) and **C6 amended** (epoch-mismatch detection). | n/a for v1 | n/a |
 | **H4** | Reconciliation via max(validV, includedV) | When conflict detected, reconciliation targets max(validV, includedV) + 1 to skip corrupt-included residue and break RETRY_EXHAUSTED deadlock. | E8 (corrupt streak forces walkback; reconciliation bumps past it) | C10 (crash during conflict → bump to K+2) |
-| **H5** | Trust-base rotation handling | Distinguish rotation (epoch changes) from MITM forgery. Multi-mirror refresh enforced. Epoch monotonicity checked. | C6 (trust-base rotated mid-recovery; wallet re-validates and re-probes) | A2 (fresh recovery after trust-base epoch change) |
-| **H6** | Shared RootTrustBase with L4 | Pointer layer uses IDENTICAL `RootTrustBase` instance as `PaymentsModule` / `OracleProvider`. No asymmetric trust. | F5 (RootTrustBase is fetched from OracleProvider, verified via shared instance) | I3 (proof verification uses L4's shared trust base) |
+| **H5** | Trust-base rotation handling (v2.2: via SDK-update-gated epoch mismatch) | Under SPEC v3.4 embedded-trust-base model, rotation is detected via epoch mismatch between aggregator response and the bundled `RootTrustBase`; raises `AGGREGATOR_POINTER_TRUST_BASE_STALE`. Mid-session runtime rotation is v2 future work. | F3 (SDK-update-gated rotation via epoch mismatch); C6 amended (epoch-mismatch detection mid-recovery) | F8 (cross-build epoch divergence detection) |
+| **H6** | Shared RootTrustBase with L4 | Pointer layer uses IDENTICAL `RootTrustBase` instance as `PaymentsModule` / `OracleProvider` — the embedded bundle. No asymmetric trust. | F2, F5 (`OracleProvider.getRootTrustBase()` returns the same instance `PaymentsModule` uses) | F6 (determinism across sessions/processes on same SDK build) |
 | **H7** | Persistent retry + republish before advance | CAR loss: CAR unavailable after publish. MUST persistent-retry up to `CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS / _TOTAL_DURATION_MS`, poll peer-availability, AND republish at `max(localVersion, version)+1` BEFORE advancing version. | G2 (republish ordering asserted via instrumented publish pipeline; reverse-order impl fails); D5 (CAR stall → persistent retry 24h) | G3 (intermediate CAR-loss versions during walk-back); N7 (latency injection triggers graceful retry) |
 | **H8** | REJECTED burns version | When REJECTED is returned, `localVersion` is persisted immediately (OTP burned) to prevent reuse of same `(v, side)` with different ciphertext. | H8-R (submit with ciphertext ctA_K; get REJECTED; retry with ctA_K' at same v → must use different v or REJECTED again) | B3 (crash safety after submit ensures REJECTED is idempotent) |
-| **H9** | TLS + cert pinning + mirror integrity | TLS ≥ 1.3; cert pinning via `MIRROR_CERT_PINS`; CA diversity; IP diversity; mirror-list integrity via `MIRROR_LIST_SHA256`. | D15 (cert mismatch → `AGGREGATOR_POINTER_TLS_CERT_INVALID`); D16 (mirror list tampering → `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`) | A1 (basic publish to pinned mirror succeeds) |
+| **H9** | H9 — v2 future work (bundled trust base in v1 — see SPEC v3.4 §8.4) | TLS cert pinning via `MIRROR_CERT_PINS` and mirror-list integrity via `MIRROR_LIST_SHA256` deferred to v2. In v1 trust is rooted in the embedded `RootTrustBase`; transport-layer attacks on the aggregator endpoint are out of scope for this test category. | n/a for v1 | n/a |
 | **H10** | CAR fetch timeout: progress-rate enforcement | Three-tier timeout: initial-response (10s), stall-detection (30s), total (300s), with HTTP Range resume, content-encoding rejection, per-gateway retry (3×). | D5 (CAR fetch with stall → exceeds stall threshold); D11b (RTT boundary test at timeout limits) | D6 (partial CAR returned → timeout triggered) |
 | **H11** | *Reserved — not allocated in SPEC v3.3* | Finding numbering preserves slot; confirm against SPEC before implementation starts. | GAP: verify against SPEC §16 changelog — if allocated, add test mapping | — |
 | **H12** | HKDF profile info correct byte count | `PROFILE_POINTER_HKDF_INFO = "uxf-profile-aggregator-pointer-v1"` is exactly 33 bytes (not 32). | P8 (HKDF KAT with canonical inputs validates correct info length) | A1 (key derivation produces correct keys for recovery) |
@@ -460,7 +485,7 @@ This invariant is **framework-level**, meaning failures bubble up as test harnes
 | **W7** | `acceptCorruptStreak()` walkback-floor enforcement | Walk-back never goes below `localVersion`; new error `AGGREGATOR_POINTER_WALKBACK_FLOOR`. | E8 (corrupt streak walkback respects floor) | E7 (single corrupt CID; walkback not triggered) |
 | **W8** | SDK version pinning + CI canary | SDK must pin exact pointer-layer ABI version; CI must canary against testnet before merge. | P4 (SDK call-signature pinning: version must match constant `SPHERE_SDK_POINTER_VERSION`) | A1 (freshly built binary uses correct version) |
 | **W9** | Client-side denylist + aggregator enforcement | Client-side denylist is defense-in-depth; aggregator-side enforcement is the cryptographic boundary. | P5 (AST-grep validation: SDK contains denylist checks; aggregator mocks return rejection for denylisted keys) | I1–I4 (no denylisted keys accepted in any flow) |
-| **W10** | CA cert diversity + IP diversity | Mirror list must include diversity across CAs and IPs to prevent single-CA/single-IP compromise. | D15 (cert pin mismatch on one CA; switch to diverse mirror) | A3 (CAR fetch falls back to secondary gateway on primary fail) |
+| **W10** | W10 — v2 future work (bundled trust base in v1 — see SPEC v3.4 §8.4) | CA / IP cert diversity deferred with the multi-mirror model; in v1 trust is rooted in the embedded `RootTrustBase`. Coverage reinstated when multi-mirror TOFU lands in v2. | n/a for v1 | n/a |
 | **W11** | `originated`-tag migration inventory | PaymentsModule, AccountingModule, SwapModule, CommunicationsModule, profile-token-storage-provider must all emit `originated: 'user' | 'system'` tags. Semantic re-validation rejects mismatches. | M13–M15 (JOIN rules check originated tag; mismatches fail merge) | H3 (TOFU downgrade: originated-tag forgery attempt rejected) |
 | **W12** | `isReachable()` via verified exclusion proof | Health check uses verified exclusion proof on `HEALTH_CHECK_REQUEST_ID` (no header short-circuit). | I2 (isReachable() queries aggregator with proof verification; no header check) | D1 (aggregator unreachable → isReachable() returns false) |
 
@@ -1170,7 +1195,7 @@ Per SPEC §11.13, these are accepted as v2+ work and NOT testable in v1/v2 in th
 
 | Residual | v2 testable? | Test lever available | Rationale |
 |---|---|---|---|
-| Bundled mirror-list supply-chain compromise | Partially | `MIRROR_LIST_SHA256` integrity check fires on tamper (D16). Actual supply-chain compromise requires CI/infra posture. | Supply-chain attack outside runtime scope. |
+| ~~Bundled mirror-list supply-chain compromise~~ | **OBSOLETE in v2.2 (SPEC v3.4).** Mirror list deleted; no `MIRROR_LIST_SHA256`. Supply-chain concern folds into "SDK-build integrity of the embedded `RootTrustBase`", which is a build/CI posture item, not a runtime test. | — | — |
 | MANDATORY multi-mirror DDoS surface | No | Operational / ops-team concern. Runtime logic gracefully returns error per-mirror. | DDoS is load-shedding concern. |
 | Backup/restore UX for `MARKER_CORRUPT` | Partially | B10 exercises the raising path. Auto-compaction is v2+ feature. | Documentation surface for v1. |
 | Denylist governance | Partially | L6 asserts bundled denylist fires. Governance propagation is v2. | Governance is out-of-band. |
@@ -1216,8 +1241,8 @@ E2E tests MUST NOT use canonical vectors (denylist fire on testnet). Use random 
 | # | Blocker | Blocks | Status |
 |---|---|---|---|
 | **O-1** | Canonical test-vector bytes (SPEC §14.2 / §14.5). | All unit-level determinism tests; P6, P8. | v2: P8 KAT vectors needed. |
-| **O-6** | Finalized mirror URL list (SPEC §15.1). | F1–F6 multi-mirror tests; D14–D16 TOFU tests. | Unchanged. |
-| **O-7** | `MIRROR_LIST_SHA256` and `MIRROR_CERT_PINS` artifacts. | D15 cert-pin test; D16 mirror-list-tamper. | Unchanged. |
+| ~~**O-6**~~ | ~~Finalized mirror URL list (SPEC §15.1).~~ | — | **CLOSED in v2.2 (SPEC v3.4).** No runtime mirror list in v1; trust base is embedded. |
+| ~~**O-7**~~ | ~~`MIRROR_LIST_SHA256` and `MIRROR_CERT_PINS` artifacts.~~ | — | **CLOSED in v2.2 (SPEC v3.4).** Constants deleted; cert pinning / mirror-list integrity are v2 future work. |
 | **O-8** | SDK version pinning + CI canary. | W8 regression; P7 SDK version pin. | v2: P7 added to CI canary. |
 | **External** | Unicity testnet faucet availability. | All N-scripts. | Unchanged. |
 | **External** | CI runner provisioning for E2E (network access, long-running queue). | N1–N14 execution; N7b, N14 integration. | v2: N7b, N14 added. |
@@ -1230,29 +1255,31 @@ E2E tests MUST NOT use canonical vectors (denylist fire on testnet). Use random 
 
 ## Summary
 
-| Category | # Scenarios | Changes from v1 |
-|---|---|---|
-| A Happy path baselines | 5 | Unchanged |
-| B Crash safety | 11 | Unchanged |
-| C Multi-device contention | 10 | Unchanged (parameterized variants noted) |
-| D Network pathology | 20 | +2 (D11a, D11b with latency boundaries) |
-| E Discovery edge cases | 13 | Unchanged (E5b remains) |
-| F Trust base discipline | 9 | Unchanged |
-| G `acceptCarLoss` | 7 | Unchanged |
-| H `clearPendingMarker` | 7 | +3 (H3-R, H8-R, H14-R regression tests) |
-| I `acceptCorruptStreak` | 4 | Unchanged |
-| J CAR bundle integrity | 8 | [parameterized by CAR size] |
-| K Originated-tag | 10 | +1 (K10: OrbitDB merge race) |
-| L Identity / keys | 7 | Unchanged |
-| M Cross-device token conservation | 15 | +4 net (M13–M15, M17 added; M7 and M16 deleted — finality-window semantics not in SPEC) |
-| N CLI E2E real-infra | 15 | +2 (N7b: BLOCKED restart, N14: legacy path) |
-| O Chaos / fuzz | 5 | Unchanged |
-| **Category P** | **8** | **NEW: Conformance & security invariants (P1–P8)** |
-| **Total** | **148** | **+13 from v1 (135→148)** |
+| Category | # Scenarios | Changes from v1 | v2.2 delta |
+|---|---|---|---|
+| A Happy path baselines | 5 | Unchanged | — |
+| B Crash safety | 11 | Unchanged | — |
+| C Multi-device contention | 10 | Unchanged (parameterized variants noted) | C6 amended (epoch-mismatch) |
+| D Network pathology | 17 | +2 (D11a, D11b); −3 in v2.2 (D14/D15/D16 deleted per SPEC v3.4) | −3 |
+| E Discovery edge cases | 13 | Unchanged (E5b remains) | — |
+| F Trust base discipline | 9 | Unchanged | F1–F3, F5, F7, F8 amended; F4/F6 amended to post-embedded-bundle invariants |
+| G `acceptCarLoss` | 7 | Unchanged | — |
+| H `clearPendingMarker` | 6 | +3 (H3-R, H8-R, H14-R regression tests); −1 in v2.2 (H3-R deleted per SPEC v3.4) | −1 |
+| I `acceptCorruptStreak` | 4 | Unchanged | — |
+| J CAR bundle integrity | 8 | [parameterized by CAR size] | — |
+| K Originated-tag | 10 | +1 (K10: OrbitDB merge race) | — |
+| L Identity / keys | 7 | Unchanged | — |
+| M Cross-device token conservation | 15 | +4 net (M13–M15, M17 added; M7 and M16 deleted — finality-window semantics not in SPEC) | — |
+| N CLI E2E real-infra | 15 | +2 (N7b: BLOCKED restart, N14: legacy path) | — |
+| O Chaos / fuzz | 5 | Unchanged | — |
+| **Category P** | **8** | **NEW: Conformance & security invariants (P1–P8)** | — |
+| **Total** | **142** | v2: +13 from v1 (135→146). Note: a pre-existing inconsistency tallied this at 148 — corrected to 146 here. v2.2: −4 (D14, D15, D16, H3-R) per SPEC v3.4 = **142** | −4 |
 
-**Finding coverage (final):**
-- **H1–H14:** All have ≥ 1 PRIMARY test + ≥ 1 SECONDARY test. v2 adds explicit regression tests (H3-R, H8-R, H14-R).
-- **W1–W12:** All have ≥ 1 PRIMARY test. v2 framework (P1–P8) adds conformance tests.
+**Finding coverage (final, v2.2):**
+- **H1–H14 (except H3, H9):** All have ≥ 1 PRIMARY test + ≥ 1 SECONDARY test. v2 adds explicit regression tests (H8-R, H14-R). H3-R deleted in v2.2.
+- **H3, H9:** marked "v2 future work" — bundled trust base in v1 (SPEC v3.4 §8.4).
+- **W1–W12 (except W10):** All have ≥ 1 PRIMARY test. v2 framework (P1–P8) adds conformance tests.
+- **W10:** marked "v2 future work" alongside H9 (CA/IP cert diversity).
 
 **Real-infra CLI tests (N-series):** 15 (v1: 13 + N7b + N14).
 
