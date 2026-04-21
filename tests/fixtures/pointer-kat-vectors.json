@@ -1,0 +1,47 @@
+{
+  "$schema": "SPEC §14 KAT vectors for Profile Aggregator Pointer Layer",
+  "description": "Known-Answer Test vectors. Inputs are non-secret test values. Outputs pinned from a correct impl of SPEC §3, §4.",
+  "spec_version": "v3.3",
+  "computed_at": "2026-04-21T13:47:07.070Z",
+  "inputs": {
+    "walletPrivateKey_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "walletPrivateKey_note": "32 bytes, all 0x01 — canonical test value, NOT a real wallet",
+    "PROFILE_POINTER_HKDF_INFO_utf8": "uxf-profile-aggregator-pointer-v1",
+    "PROFILE_POINTER_HKDF_INFO_hex": "7578662d70726f66696c652d61676772656761746f722d706f696e7465722d7631",
+    "PROFILE_POINTER_HKDF_INFO_len": 33,
+    "SIGNING_SEED_INFO_utf8": "uxf-profile-pointer-sig-v1",
+    "SIGNING_SEED_INFO_hex": "7578662d70726f66696c652d706f696e7465722d7369672d7631",
+    "XOR_SEED_INFO_utf8": "uxf-profile-pointer-xor-v1",
+    "XOR_SEED_INFO_hex": "7578662d70726f66696c652d706f696e7465722d786f722d7631",
+    "PAD_SEED_INFO_utf8": "uxf-profile-pointer-pad-v1",
+    "PAD_SEED_INFO_hex": "7578662d70726f66696c652d706f696e7465722d7061642d7631",
+    "version_v": 1,
+    "cidLen_bytes": 36
+  },
+  "derived_keys": {
+    "pointerSecret_hex": "518d6c8345b1d7627fb8c949da4ba03fc807cf85e2b03ab11ec859b9295c25c2",
+    "signingSeed_hex": "12f93cecbf9ce82acc8f6cca0b68d8d2785f97df3e323eb18cd604abbff5df88",
+    "xorSeed_hex": "fc6a39782f385661ff26a3041d28025e565a7d020100aab41f6c4bce27ce085d",
+    "padSeed_hex": "94e467b5b2b249e63845daf215af681b3a82340d6817fc1ece47277ffaa67117",
+    "signingScalar_hex": "8daffba2847ff017ce1d4462fa390209662a0ca1811dbadcc527798864155d62",
+    "signingPubKey_hex": "03464815898a4f571f94703df31a1643117ec4075c9f16c8c172ef4d8b3cadda1f",
+    "signingPubKey_len": 33
+  },
+  "per_version_per_side": {
+    "v_1": {
+      "stateHashDigest_A_hex": "58c2f39661b2893100f05611711d72a77e1922bbdda4134c0e05917184747a9b",
+      "stateHashDigest_B_hex": "a2c778dbeb54ae2c677d201dc7d3aa4c20b67f38857e243e89cba459b8c6e4fe",
+      "xorKey_A_hex": "87d3ee76e9a590dd162e6c954aa69ddd749bc58aa05ad7ae28157e83b7ea0339",
+      "xorKey_B_hex": "8f781a5e84b640c069888d97d63ac59c5579cd77147403c0647e57943068da8e",
+      "paddingBytes_cidLen36_hex": "84cd9cfbf5b8b68d96bd358df4c11b2007d9e52774a0d00653920a",
+      "paddingBytes_cidLen36_len": 27,
+      "requestId_A_hex": "c12cbfef6146507daee1b5874e54c2670a523cb37d65dbde8ccce7a93037b821",
+      "requestId_B_hex": "a521d2a2a71cc08722d0a57629a2b4af2d8ab2b1e56f88972a4201caa3aef588"
+    }
+  },
+  "domain_separation_check": {
+    "signingSeed_eq_xorSeed": false,
+    "signingSeed_eq_padSeed": false,
+    "xorSeed_eq_padSeed": false
+  }
+}
