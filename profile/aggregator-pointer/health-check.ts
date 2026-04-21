@@ -17,7 +17,9 @@ const HEALTH_CHECK_INFO = new TextEncoder().encode('profile-pointer-health-check
  */
 export function deriveHealthCheckRequestId(signingPubKey: Uint8Array): Uint8Array {
   if (signingPubKey.length !== 33) {
-    throw new Error(`signingPubKey must be 33-byte compressed secp256k1, got ${signingPubKey.length}`);
+    throw new RangeError(
+      `signingPubKey must be 33-byte compressed secp256k1, got ${signingPubKey.length}`,
+    );
   }
   const preimage = new Uint8Array(HEALTH_CHECK_INFO.length + signingPubKey.length);
   preimage.set(HEALTH_CHECK_INFO, 0);

@@ -20,8 +20,8 @@ describe('MasterPrivateKey (T-A5b)', () => {
     expect(master.bytes).toEqual(bytes);
   });
 
-  it('rejects bytes of wrong length', () => {
-    expect(() => createMasterPrivateKey(new Uint8Array(16))).toThrow(/must be exactly 32 bytes/);
+  it('rejects bytes of wrong length with RangeError', () => {
+    expect(() => createMasterPrivateKey(new Uint8Array(16))).toThrow(RangeError);
     expect(() => createMasterPrivateKey(new Uint8Array(33))).toThrow(/must be exactly 32 bytes/);
   });
 

@@ -34,14 +34,16 @@ const registry = new WeakSet<MasterPrivateKey>();
  */
 export function createMasterPrivateKey(bytes: Uint8Array): MasterPrivateKey {
   if (bytes.length !== 32) {
-    throw new AggregatorPointerError(
-      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+    throw new RangeError(
       `MasterPrivateKey must be exactly 32 bytes, got ${bytes.length}`,
     );
   }
   // The [_brand] field is compile-time only — TypeScript erases it and
   // `declare const _brand` has no runtime value. Object.freeze here
-  // provides shallow immutability; the WeakSet registry is the
+  // provides shallow object immutability; the underlying Uint8Array
+  // remains mutable in place — that is a documented limitation: we
+  // trust the Sphere init call sites not to hand out MasterPrivateKey
+  // references to untrusted code. The WeakSet registry is the
   // load-bearing runtime guard (see assertAuthorizedMasterKey).
   const instance = Object.freeze({
     bytes: new Uint8Array(bytes),
@@ -59,6 +61,10 @@ export function isAuthorizedMasterKey(candidate: MasterPrivateKey): boolean {
  * Guard helper: throws PROTOCOL_ERROR if the supplied master key was
  * not constructed through the authorized path. Called at the top of
  * every pointer-key-derivation function that consumes a MasterPrivateKey.
+ *
+ * PROTOCOL_ERROR is intentional: an unauthorized master key reaching
+ * a derivation function is a protocol-level misuse (caller bypassed
+ * the Sphere init path), not a type error. Fail closed.
  */
 export function assertAuthorizedMasterKey(candidate: MasterPrivateKey): void {
   if (!registry.has(candidate)) {

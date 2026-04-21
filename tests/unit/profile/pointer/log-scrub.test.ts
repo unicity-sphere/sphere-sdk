@@ -70,10 +70,26 @@ describe('log-scrub (T-A7b)', () => {
       captured.push(inspect({ kmWrapped: { inner: km } }, { depth: 10 }));
       captured.push(`${km.pointerSecret}`);
       captured.push(`${km.signingSeed}`);
+      // Object.keys / spread / Object.entries / Object.assign — the
+      // surfaces a TypeScript `private` modifier fails to protect.
+      captured.push(JSON.stringify(Object.keys(km.signingSeed)));
+      captured.push(JSON.stringify(Object.entries(km.signingSeed)));
+      captured.push(JSON.stringify({ ...km.signingSeed }));
+      captured.push(JSON.stringify(Object.assign({}, km.xorSeed)));
+      captured.push(JSON.stringify(Object.getOwnPropertyNames(km.padSeed)));
       // Error objects may get toString'd in stack traces
       const err = new Error(`something happened involving ${km.xorSeed}`);
       captured.push(String(err));
       captured.push(inspect(err));
+      // Also try to structuredClone — should throw, but in case impl
+      // ever changes to a plain-object shape, catch would let the
+      // test exercise the clone output.
+      try {
+        const cloned = structuredClone(km as unknown as Record<string, unknown>);
+        captured.push(inspect(cloned));
+      } catch {
+        // Expected path for private-fields-based SecretKey.
+      }
 
       // Exercise downstream uses — signer, per-version derivations,
       // health-check — to ensure those code paths don't leak.
@@ -93,6 +109,10 @@ describe('log-scrub (T-A7b)', () => {
       void xorB;
       void pad;
       void healthRid;
+
+      // Sanity check: the capture harness actually captured something.
+      // Without this, a broken harness could silently pass the test.
+      expect(captured.length).toBeGreaterThan(10);
 
       // Now grep the capture buffer for ANY of the secret hex strings.
       const joined = captured.join('\n');

@@ -156,4 +156,10 @@ describe('be32', () => {
   it('rejects > 0xffffffff', () => {
     expect(() => be32(0x1_0000_0000)).toThrow();
   });
+
+  it('encodes VERSION_MAX (2^31 - 1) correctly', async () => {
+    const { VERSION_MAX } = await import('../../../../profile/aggregator-pointer/index.js');
+    const out = be32(VERSION_MAX);
+    expect(Array.from(out)).toEqual([0x7f, 0xff, 0xff, 0xff]);
+  });
 });

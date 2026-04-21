@@ -101,7 +101,7 @@ export function deriveStateHashDigest(xorSeed: SecretKey, side: Side, v: Pointer
 
 /**
  * xorKey_{side, v} = SHA256(xorSeed || [side] || be32(v) || "xor")
- * per SPEC §4.5. 39-byte preimage, 32-byte output.
+ * per SPEC §4.5. 40-byte preimage (32 + 1 + 4 + 3), 32-byte output.
  */
 export function deriveXorKey(xorSeed: SecretKey, side: Side, v: PointerVersion): Uint8Array {
   const seed = xorSeed.reveal();

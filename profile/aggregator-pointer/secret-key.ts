@@ -2,11 +2,16 @@
  * SecretKey wrapper (T-A7) — hides derived secret bytes from
  * serialization paths per SPEC §11.11(d).
  *
- * Every intermediate secret (pointerSecret, signingSeed, xorSeed,
- * padSeed) is wrapped before being handed to any code path that
- * might serialize. toString / toJSON / util.inspect.custom all
- * redact. Raw bytes are retrievable only via explicit .reveal() —
- * call sites that use .reveal() are audit points.
+ * Uses ECMAScript private fields (`#bytes`, `#label`) — genuinely
+ * invisible to `Object.keys`, `{...spread}`, `structuredClone`,
+ * `JSON.stringify`, `util.inspect` (via the custom hook), and
+ * `console.log` (which falls through to toString). TypeScript
+ * `private` is erased at compile time and does NOT provide this
+ * guarantee; private fields do.
+ *
+ * Raw bytes are retrievable only via explicit `.reveal()` — each
+ * call site is an audit point. `.reveal()` returns a COPY; callers
+ * are responsible for zeroizing the copy after use.
  *
  * This does NOT prevent JS engines from retaining copies; complete
  * zeroization is impossible in GC'd runtimes. See §11.11(a′)
@@ -16,51 +21,67 @@
 const REDACTED = '[REDACTED SecretKey]';
 
 export class SecretKey {
-  private readonly _bytes: Uint8Array;
-  private readonly _label: string;
+  #bytes: Uint8Array;
+  #label: string;
+  #zeroized = false;
 
   constructor(bytes: Uint8Array, label: string) {
     if (bytes.length === 0) {
-      throw new Error('SecretKey cannot wrap empty bytes');
+      throw new RangeError('SecretKey cannot wrap empty bytes');
     }
-    this._bytes = new Uint8Array(bytes);
-    this._label = label;
-  }
-
-  /** Return a COPY of the bytes. Audit every call site. */
-  reveal(): Uint8Array {
-    return new Uint8Array(this._bytes);
-  }
-
-  get length(): number {
-    return this._bytes.length;
-  }
-
-  get label(): string {
-    return this._label;
-  }
-
-  toString(): string {
-    return `${REDACTED} <${this._label}>`;
-  }
-
-  toJSON(): string {
-    return `${REDACTED} <${this._label}>`;
-  }
-
-  // Node.js util.inspect customization — same redaction.
-  // Symbol lookup via globalThis avoids hard import of 'util' in browser.
-  [Symbol.for('nodejs.util.inspect.custom')](): string {
-    return `${REDACTED} <${this._label}>`;
+    this.#bytes = new Uint8Array(bytes);
+    this.#label = label;
   }
 
   /**
-   * Best-effort zeroization: overwrites the underlying buffer with zeros.
-   * Valid only for the wrapped SecretKey's own buffer — prior copies
-   * handed out via reveal() are untouched. Callers that use reveal()
-   * are responsible for zeroizing their copy after use.
+   * Return a COPY of the bytes. Audit every call site.
+   * Throws after zeroize() to prevent silent-zero correctness bombs.
+   */
+  reveal(): Uint8Array {
+    if (this.#zeroized) {
+      throw new Error('SecretKey already zeroized; reveal() would return zeros');
+    }
+    return new Uint8Array(this.#bytes);
+  }
+
+  get length(): number {
+    return this.#bytes.length;
+  }
+
+  get label(): string {
+    return this.#label;
+  }
+
+  toString(): string {
+    return `${REDACTED} <${this.#label}>`;
+  }
+
+  toJSON(): string {
+    return `${REDACTED} <${this.#label}>`;
+  }
+
+  // Node.js util.inspect customization — same redaction.
+  // The symbol lookup is string-based to avoid a hard 'util' import in browser.
+  [Symbol.for('nodejs.util.inspect.custom')](): string {
+    return `${REDACTED} <${this.#label}>`;
+  }
+
+  // Browser devtools / template-literal coercion fallback.
+  [Symbol.toPrimitive](_hint: string): string {
+    return `${REDACTED} <${this.#label}>`;
+  }
+
+  /**
+   * Best-effort zeroization: overwrites the underlying buffer with zeros
+   * and flags the wrapper so subsequent reveal() throws. Prior copies
+   * handed out via reveal() are untouched — callers must zeroize their own.
    */
   zeroize(): void {
-    this._bytes.fill(0);
+    this.#bytes.fill(0);
+    this.#zeroized = true;
+  }
+
+  isZeroized(): boolean {
+    return this.#zeroized;
   }
 }
