@@ -1,6 +1,6 @@
 # UXF Profile Aggregator Pointer — Technical Specification
 
-**Status:** Draft — revision 3.1 (hardening pass C1–C16 on top of revision 3; SDK-native; secp256k1-only)
+**Status:** Draft — revision 3.2 (valid-version-continuity pass D1–D11 on top of revision 3.1; SDK-native; secp256k1-only)
 **Companion document:** [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) (the "why")
 **This document:** the "exactly how" — byte layouts, formulas, algorithms. Narrative rationale lives in the architecture doc and is not repeated here.
 
@@ -112,6 +112,7 @@ This spec MUST be implemented by calling these SDK classes directly. The only no
 | `MIN_MIRROR_COUNT` | `2` | mirrors | Minimum number of independently-addressed aggregator mirrors required for TOFU trust-base cross-check on fresh-install recovery (§8.4). |
 | `MAX_CAR_BYTES` | `100 * 1024 * 1024` | bytes (100 MiB) | Maximum CAR byte size the IPFS client MUST enforce on fetch (§8.5). |
 | `MAX_CAR_FETCH_MS` | `60000` | ms | Maximum wall-clock time the IPFS client MUST enforce on a single CAR fetch (§8.5). |
+| `DISCOVERY_CORRUPT_WALKBACK` | `64` | versions | Maximum number of consecutive corrupt (undecodable / non-CID / non-fetchable) versions to skip during §8.2 Phase 3 walk-back before bailing with `AGGREGATOR_POINTER_CORRUPT_STREAK` (§10.8). A distinct error from ordinary `AGGREGATOR_POINTER_CORRUPT`, intended to distinguish a pathological OpLog (long tail of consecutive prior-client bugs or adversarial grinding) from ordinary one-off corruption. Implementations MAY tune this higher under explicit operator consent via `acceptCorruptStreak()` (§13). |
 
 All constants are locked. Any change is a spec bump and requires the `v1` → `v2` rename of `PROFILE_POINTER_HKDF_INFO`.
 
@@ -482,7 +483,15 @@ storage.write(PENDING_VERSION_KEY, { v, cidHash })           // durable per 7.1.
 
 This closes the "localVersion rolled back by tamper/corruption" path where the previous `v == v && cidHash != cidHash` check fell through silently.
 
-**Rationale for the clamp (C1).** Without this check a single malicious or corrupted marker write (e.g., `previousEntry.v = 2^31 − 2`) would propagate into `v := previousEntry.v + 1 = 2^31 − 1`, and the next legitimate publish would require `v = 2^31`, which exceeds `VERSION_MAX` and surfaces as `AGGREGATOR_POINTER_VERSION_OUT_OF_RANGE` — permanently bricking the wallet from a single bad write. A legitimate marker can never skip more than `PUBLISH_RETRY_BUDGET` versions (bounded by local retry bumps in §7.1.4). A gap larger than `MARKER_MAX_JUMP` therefore indicates tampering or storage corruption, and the marker MUST be discarded with `AGGREGATOR_POINTER_MARKER_CORRUPT`. Recovery from this error is via the operator-facing `clearPendingMarker()` API (§13).
+**Rationale for the clamp (C1, tightened in D4).** Without this check a single malicious or corrupted marker write (e.g., `previousEntry.v = 2^31 − 2`) would propagate into `v := previousEntry.v + 1 = 2^31 − 1`, and the next legitimate publish would require `v = 2^31`, which exceeds `VERSION_MAX` and surfaces as `AGGREGATOR_POINTER_VERSION_OUT_OF_RANGE` — permanently bricking the wallet from a single bad write. A legitimate marker gap is bounded by:
+
+- `PUBLISH_RETRY_BUDGET = 5` — per-attempt bumps during a conflict-retry arc (§9).
+- Small cohort contention allowances — multi-device races typically chain ≤ 32 bumps (§9.2 reconciliation at `V_true + 1` across a 32-way active cohort).
+- Headroom for unusual-but-legitimate scenarios: manual backup/restore from another device, OrbitDB manifest reorgs, test-vector switches, and operator-initiated network migrations.
+
+`MARKER_MAX_JUMP = 1024` is sized generously (approximately 32× the typical ≤ 32 ceiling) to avoid false-positives on these legitimate-but-unusual flows, at the cost of NOT catching subtle same-window tampering within `[prev.v, prev.v + 1024]`. Tighter thresholds (e.g., 32) are suitable for deployments that can afford to surface `AGGREGATOR_POINTER_MARKER_CORRUPT` on legitimate manual backup-restore flows; operators who lower `MARKER_MAX_JUMP` below 1024 MUST also add explicit UX surfacing of the `clearPendingMarker()` API (§13) for backup-restore scenarios, otherwise a legitimate user restoring state across devices will face an opaque error with no recovery path. See §11.13 item 3 for the documented residual risk.
+
+Recovery from `AGGREGATOR_POINTER_MARKER_CORRUPT` (regardless of threshold) is via the operator-facing `clearPendingMarker()` API (§13).
 
 **7.1.5 cidHash integrity.** Implementations MUST NOT truncate the `cidHash`. A marker with `|cidHash| != 32` MUST be treated as corrupt and the publish refused with `AGGREGATOR_POINTER_MARKER_CORRUPT`.
 
@@ -597,44 +606,80 @@ async fun probe(v) -> boolean:
 
 Probing both sides per step defends against partial-publish ambiguity: a single-side probe could be misled by a half-published `v` (A committed, B missing) into treating `v` as "published" when the decoded payload would be unusable.
 
-### 8.2 Phase 1 — exponential expansion (serial)
+### 8.2 Discovery algorithm — valid-version continuity (D1)
 
-Phase 1 uses the locally persisted `localVersion` as a lower-bound hint when available; otherwise starts from 0.
+Discovery returns the **latest VALID version**, not simply the latest-included version.
 
-```
-lo = max(0, localVersion)
-hi = max(DISCOVERY_INITIAL_VERSION, lo + 1)
+**Definition — "valid version".** A version `v` is valid iff ALL of the following hold:
 
-while await probe(hi):
-    lo = hi
-    hi = hi * 2
-    if hi > DISCOVERY_HARD_CEILING:
-        if await probe(DISCOVERY_HARD_CEILING):
-            raise AGGREGATOR_POINTER_DISCOVERY_OVERFLOW
-        hi = DISCOVERY_HARD_CEILING
-        break
-```
+1. Both `requestId_{A, v}` and `requestId_{B, v}` have verified inclusion proofs from the aggregator (i.e., `probe(v) == true` per §8.1).
+2. After XOR-decoding both halves (§8.5), the resulting 64-byte `full` buffer has a length prefix `cidLen ∈ [1, CID_MAX_BYTES]`.
+3. `full[1 .. 1 + cidLen)` parses as a valid CID (sha2-256 multihash, within-buffer bounds, well-formed varints per §8.5).
+4. The decoded CID is fetchable from IPFS via `fetchFromIpfs(cid)` with both `MAX_CAR_BYTES` and `MAX_CAR_FETCH_MS` caps satisfied.
+5. The fetched CAR bundle deserializes successfully as a UXF package.
 
-Invariant after Phase 1: `probe(lo) == true` (or `lo == 0`) AND `probe(hi) == false`.
+A version that is included (condition 1) but fails ANY of (2)–(5) is **invalid / corrupt**. Corrupt versions are permanent SMT residue; they are semantically IGNORED by discovery — the pointer layer considers the latest VALID version to be authoritative.
 
-### 8.3 Phase 2 — binary search (serial)
+Phase 1 uses the locally persisted `localVersion` as a lower-bound hint when available; otherwise starts from 0. Phases 1 and 2 use inclusion-only (`probe(v)`) to bracket the latest-included version. Phase 3 walks backwards through any corrupt trailing versions to find the latest valid one.
 
 ```
-while hi - lo > 1:
-    mid = (lo + hi) / 2                 // integer division, rounded down
-    if await probe(mid):
-        lo = mid
-    else:
-        hi = mid
+findLatestValidVersion():
+    # Phase 1 — exponential expansion: find an upper bound using INCLUSION only
+    lo = max(0, localVersion)
+    hi = max(DISCOVERY_INITIAL_VERSION, lo + 1)
 
-return lo                                // 0 means "no pointer ever published"
+    while await probe(hi):
+        lo = hi
+        hi = hi * 2
+        if hi > DISCOVERY_HARD_CEILING:
+            if await probe(DISCOVERY_HARD_CEILING):
+                raise AGGREGATOR_POINTER_DISCOVERY_OVERFLOW
+            hi = DISCOVERY_HARD_CEILING
+            break
+
+    # Invariant after Phase 1: probe(lo) == true (or lo == 0) AND probe(hi) == false
+
+    # Phase 2 — binary search for latest INCLUDED version
+    while hi - lo > 1:
+        mid = (lo + hi) / 2                        # integer division, rounded down
+        if await probe(mid):
+            lo = mid
+        else:
+            hi = mid
+    candidate = lo                                   # latest INCLUDED version (may be corrupt)
+
+    # Phase 3 — walk back through corrupt versions.
+    # Corrupt versions are rare; this walk is bounded by DISCOVERY_CORRUPT_WALKBACK.
+    walked = 0
+    while candidate > 0 and walked < DISCOVERY_CORRUPT_WALKBACK:
+        if await isVersionValid(candidate):
+            return candidate
+        emit pointer:discover_corrupt_skipped { version: candidate }
+        candidate = candidate - 1
+        walked = walked + 1
+
+    if candidate == 0:
+        return 0    # no valid version exists
+
+    # Too many corrupt versions in a row — bail out with a distinct error.
+    raise AGGREGATOR_POINTER_CORRUPT_STREAK       # see §10.8
 ```
 
-Probe count bounds:
+Invariant after a successful return: either `candidate == 0` (no pointer ever published) OR `isVersionValid(candidate) == true` AND every version in `(candidate, latestIncluded]` was corrupt and skipped.
 
-- Phase 1: at most `log2(DISCOVERY_HARD_CEILING / max(1, lo)) + 1` doublings.
-- Phase 2: at most `log2(hi − lo) ≤ 22` iterations.
-- Each probe = 2 parallel aggregator round trips + 2 parallel local verifications.
+`isVersionValid(v)` performs the full validation chain from (1)–(5) above; its implementation is the §8.5 CID-reconstruction path composed with the IPFS fetch and CAR deserialization steps. `probe(v)` (§8.1) covers only condition (1).
+
+### 8.3 Probe count bounds and walk-back cost
+
+The §8.2 algorithm has three phases; the first two use inclusion-only `probe(v)`, the third uses the more expensive `isVersionValid(v)` (includes XOR decode + CID parse + IPFS fetch + CAR deserialization).
+
+- Phase 1 (exponential): at most `log2(DISCOVERY_HARD_CEILING / max(1, lo)) + 1` doublings. Each doubling = one inclusion `probe`.
+- Phase 2 (binary search): at most `log2(hi − lo) ≤ 22` iterations. Each iteration = one inclusion `probe`.
+- Phase 3 (walk-back): at most `DISCOVERY_CORRUPT_WALKBACK` iterations, each calling `isVersionValid(v)`. In the common case (no corruption), Phase 3 completes in a single iteration and the returned version matches the Phase 2 `candidate`.
+- Each `probe` = 2 parallel aggregator round trips + 2 parallel local verifications.
+- Each `isVersionValid` = 1 `probe` + 1 IPFS fetch (bounded by `MAX_CAR_BYTES` / `MAX_CAR_FETCH_MS`) + 1 CAR deserialization.
+
+A version that is included but fails `isVersionValid` is called "corrupt" throughout the remainder of this spec (see §10.3 and §10.8).
 
 ### 8.4 Trustless proof verification (MANDATORY)
 
@@ -647,7 +692,7 @@ status  = await resp.inclusionProof.verify(trustBase, requestId)   // InclusionP
 
 Where `trustBase` is a `RootTrustBase` loaded by the wallet from a trusted source configured out-of-band. The wallet MUST NOT accept inclusion or exclusion claims based on unverified responses. (Editorial note C12: the variable is `resp.inclusionProof` — matching §8.1 — not a locally-named `proof`; this avoids ambiguity with the r2 `.proof.` field-access bug fixed by F1/r3.)
 
-**TOFU degradation (accepted for v1).** On a fresh-device first boot with no pre-installed trust base, the wallet falls back to trust-on-first-use — it accepts the first `RootTrustBase` served by the configured aggregator and pins it locally. This is explicitly acknowledged as a known-weak posture for v1. v2 mitigations (anchor to L1 alpha chain) are tracked as future work in `PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md §12`.
+**TOFU degradation — multi-mirror only (D3).** On fresh-device first boot with no pre-installed trust base, the wallet performs **multi-mirror TOFU**: query `MIN_MIRROR_COUNT` (= 2) independently-addressed mirrors in parallel, require byte-identical responses, and pin the accepted `RootTrustBase` locally. Single-mirror TOFU is NOT permitted in v1 shipping builds (see the MANDATORY rule immediately below). Subsequent boots use the pinned trust base without re-running TOFU unless explicitly re-bootstrapped by the operator. v2 mitigations (anchor the `RootTrustBase` fingerprint to the L1 alpha chain for out-of-band verification) are tracked as future work in `PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md §12`.
 
 **Multi-mirror TOFU cross-check (MANDATORY for v1).** Implementations MUST query at least `MIN_MIRROR_COUNT` (= 2) independently-addressed aggregator mirrors (different DNS names; ideally different autonomous systems) on first-boot recovery and require the returned trust bases to match byte-for-byte. A single mirror disagreeing with the others MUST abort recovery with `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE`. The SDK MUST ship with a statically-bundled list of ≥ 2 mirror URLs per network (testnet/mainnet); O-6 tracks finalization of the list. Single-mirror TOFU is NOT permitted in v1 shipping builds — this rule was `RECOMMENDED` in r3 and is promoted to `MANDATORY` in r3.1 because a fresh-install mnemonic re-import with a MITM'd network under single-mirror TOFU accepts an attacker-forged `RootTrustBase`, and §10.2 BLOCKED is not yet set at that moment (no user-originated writes exist on a fresh OpLog), so the attacker wins silently. Future work: pin a `RootTrustBase` fingerprint to the alpha L1 chain for out-of-band verification.
 
@@ -691,6 +736,17 @@ return { cid: cidBytes, version: V }
 The CID parser used by `isValidCid` MUST bound all reads to the provided `cidBytes` slice, reject malformed varints, and accept only the codecs supported by the upstream `profile/ipfs-client.ts verifyCidMatchesBytes` (in practice: sha2-256 multihashes; expand as the upstream expands).
 
 **Post-decode invariant (C4 — CAR fetch caps).** The resolved CID MUST be fetched via an IPFS client that enforces `MAX_CAR_BYTES` (100 MiB) and `MAX_CAR_FETCH_MS` (60 s). If either cap is exceeded, the client MUST raise `AGGREGATOR_POINTER_CAR_TOO_LARGE` or `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT` respectively. The pointer layer treats these as recovery failures; the caller MAY choose to abort recovery or to fetch from a different gateway, but MUST NOT silently advance `localVersion` past an unfetchable bundle. See §10.7 for the related "CAR unavailable" persistent state.
+
+**Streaming byte-count enforcement (D6 — MANDATORY).** Implementers MUST enforce `MAX_CAR_BYTES` via a **streaming byte-count on the response body**, independently of any `Content-Length` header supplied by the gateway. The byte count MUST abort the underlying socket / reader within one additional chunk of exceeding `MAX_CAR_BYTES` — i.e., the implementation MUST NOT buffer an entire oversized response before checking the cap.
+
+Implementations MUST NOT rely solely on `Content-Length` headers for size verification. A malicious gateway can set a small `Content-Length` and stream arbitrary amounts of data beyond it; clients that trust the header are vulnerable to memory-exhaustion DoS. Correct implementations therefore:
+
+1. Initialize a running byte counter to zero before beginning the response read loop.
+2. Increment the counter by `chunk.length` after each chunk read.
+3. If `counter > MAX_CAR_BYTES`, abort the socket (close reader, release resources) and raise `AGGREGATOR_POINTER_CAR_TOO_LARGE` within one additional chunk of the overflow.
+4. Enforce `MAX_CAR_FETCH_MS` via an independent wall-clock timer on the whole fetch operation, not via any server-supplied hint.
+
+The `Content-Length` header MAY be used as an early-reject optimization (if `Content-Length > MAX_CAR_BYTES`, abort immediately before reading any body) but MUST NOT be used as the sole cap enforcement.
 
 ---
 
@@ -776,7 +832,7 @@ Implementations MUST expose this state via the `AGGREGATOR_POINTER_UNREACHABLE_R
 1. `initialize()` — or any subsequent reconciliation pass — attempts to reach the aggregator for recovery;
 2. the transport error is **categorical**: network timeout, connection refused, DNS failure, TLS error (or equivalent). A non-categorical error (e.g., 5xx that may retry-succeed) MUST NOT set BLOCKED on first occurrence;
 3. the local OpLog contains **at least one user-originated write** (see 10.2.3);
-4. at least one retry with exponential backoff has already been attempted (to avoid flapping on single transient failures).
+4. at least one retry with exponential backoff has already been attempted AND failed (to avoid flapping on single transient failures).
 
 Additionally, re-SET BLOCKED (reentry) when a publish attempt fails with `AGGREGATOR_POINTER_NETWORK_ERROR` whose error category matches the transport-categorical list in (2).
 
@@ -791,6 +847,14 @@ The `originated` tag MUST be stamped at write time by the module authoring the e
 > **Note on the prior `signedBy` rule (r3).** The earlier "`entry.signedBy == localSigningPubKey`" heuristic was ambiguous in two directions: (i) a session-receipt write signed by the chain key counts as user-originated under that rule and spuriously SETs BLOCKED; (ii) a "touch" write that isn't signed at all slips past and BLOCKED never SETs even though the user authored a visible action. The `originated` tag is orthogonal to `signedBy` — system-authored entries MAY still be signed by `localSigningPubKey`. Implementations migrating from r3 MUST stamp all emitted entries before C6 ships.
 
 This distinction is load-bearing: replicated entries from other devices do not themselves justify blocking, because their author's device is responsible for publishing its own pointer advance.
+
+**Semantic re-validation (D5).** The stamped `originated` tag is caller-asserted and therefore potentially forgeable by a malicious writer who stamps `'system'` on a token-send entry to silently disarm BLOCKED. To close this bypass, recipients MUST re-validate the stamped `originated` tag against the entry's OpLog type:
+
+- Entries whose type is in the **known user-action set** — `token_send`, `token_receive`, `nametag_register`, `dm_send`, `invoice_mint`, `invoice_pay`, `swap_propose`, `swap_accept`, `swap_deposit`, and any future member of this set that modules add — MUST have `originated = 'user'` regardless of the stamped value. Any other tag on a user-action entry MUST be rejected as `SECURITY_ORIGIN_MISMATCH` and MUST NOT be replicated further.
+- Entries whose type is in the **known system set** — `session_receipt`, `cache_index`, `last_opened_ts` — MUST have `originated = 'system'` regardless of the stamped value.
+- Entries of an **unknown type** are handled per the fail-closed rule above: missing / malformed / unknown ⇒ treated conservatively as `'user'`.
+
+This re-validation runs at two points: (i) on every locally-authored write, before durable persistence; (ii) on every replicated write, before the replica is accepted into the local OpLog. The check is byte-cheap (string-equality on the entry type) and closes the tag-forgery bypass.
 
 **10.2.4 CLEAR on (exit conditions).** CLEAR BLOCKED only after EITHER:
 
@@ -809,17 +873,27 @@ Clearing on any OTHER condition — reachability-only probes, user preference ch
 
 v1 implementations MAY omit the override entirely and accept permanent read-only mode until the aggregator is reachable again. The override is explicitly NOT required for v1 sign-off.
 
-**10.2.6 Fresh-install corrupt-payload at cold start.** On cold start where `localVersion == 0` AND discovery returns a pointer at `V > 0` whose CID XOR-decodes to a payload that fails `isValidCid` (§8.5), the wallet MUST SET BLOCKED even though no user-originated writes exist yet on the local OpLog. Rationale: the corrupt payload is a strong MITM signal (either the mirror returned a forged inclusion proof that survived `InclusionProof.verify` under a forged trust base — which is why C3 mandates multi-mirror cross-check — or the ciphertext was otherwise tampered), and proceeding to publish at `v = 1` would silently overwrite the legitimate remote history on the real aggregator once the MITM lifts. This BLOCKED state is cleared only after a successful multi-mirror-verified recovery that does NOT produce a corrupt payload; categorical failure (`AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` or repeated `AGGREGATOR_POINTER_CORRUPT`) keeps BLOCKED set.
+**10.2.6 Deleted in r3.2.** The r3.1 rule "SET BLOCKED on fresh-install corrupt-payload at cold start" is superseded by the valid-version-continuity rule (§10.3). Corrupt versions are SKIPPED during discovery (§8.2 Phase 3) rather than treated as MITM signals. Any remaining references to §10.2.6 elsewhere in this spec should be read as references to §10.3.
 
-### 10.3 Malformed recovered payload
+### 10.3 Malformed recovered payload — valid-version continuity (D1)
 
-Occurs when §8.5 decodes a length-prefix + CID that fails `isValidCid` or `cidLen` bounds. Raise `AGGREGATOR_POINTER_CORRUPT`. Do NOT attempt repair. Log the failing version, the `pointerSecret`-derived `signingPubKey`, and the raw ciphertext halves for triage.
+A XOR-decoded payload that fails length-prefix bounds, `isValidCid`, IPFS fetch, or CAR deserialization (any of the conditions 2–5 in §8.2's "valid version" definition) is NOT treated as a MITM signal. Such versions are permanent SMT residue that the pointer layer **semantically ignores**.
 
-Possible root causes:
+**Discovery rule.** Invalid versions are SKIPPED during discovery (§8.2 Phase 3 walk-back). The pointer layer considers the latest VALID version authoritative.
+
+**Publish rule.** Publishing a NEW valid version at `latest_valid_V + 1` is legitimate and does NOT require resolving the intermediate corrupt versions. The next legitimate publisher simply bumps `localVersion` from the latest valid version and proceeds. Each client performs valid-version continuity independently; **no inter-client coordination is needed**.
+
+**Error rule.** `AGGREGATOR_POINTER_CORRUPT` is raised only by the caller of `recoverLatest()` when the caller explicitly asked for the decoded payload at a specific corrupt version (e.g., a forensic diagnostic path). Ordinary discovery silently skips corrupt versions; it does NOT surface `AGGREGATOR_POINTER_CORRUPT` per-skip. Each skip MAY emit `pointer:discover_corrupt_skipped { version }` for telemetry visibility.
+
+**Implementation note.** This design accepts that corrupt versions MAY exist in the aggregator SMT — whether from buggy prior clients, aborted mid-migration publishes, transient gateway-level CAR corruption that later becomes valid as other gateways heal, or adversarial grinding by a publisher who has access to the wallet's `pointerSecret` (infeasible for an external attacker). They are permanent SMT residue but semantically ignored. The bounded walk-back (`DISCOVERY_CORRUPT_WALKBACK`) protects against pathological streaks via §10.8.
+
+Possible root causes for an observed corrupt version:
 
 - Key derivation drift between publisher and recoverer (library version skew in HKDF or SigningService).
 - Wrong mnemonic imported (pointer decryption produces garbage; length prefix happens to be "valid-looking" but CID parse fails).
 - Publisher violated §7.1 and reused `(v)` across two different CIDs — in which case both ciphertexts are now mutually recoverable by an observer (see §11).
+- A prior client crashed mid-publish in a way that bypassed the §7.1 marker discipline (e.g., on a storage backend that silently violated the durability contract).
+- Transient CAR gateway-level data corruption at fetch time (may self-heal; re-running discovery later MAY return a now-valid version).
 
 ### 10.4 CID too large
 
@@ -848,6 +922,22 @@ For deployments wanting stronger guarantees, cross-check against multiple aggreg
 
 **Why this is distinct from §10.2 BLOCKED.** §10.2 BLOCKED covers "aggregator unreachable → can't discover `V_true`". §10.7 CAR-unavailable covers "aggregator reachable, `V_true` discovered and verified, but the IPFS bundle itself can't be fetched". Advancing `localVersion` past an unfetchable bundle would silently replace legitimate remote history the moment fetch becomes possible again — a data-loss path. The caller opts into that loss only through `acceptCarLoss(version)`.
 
+### 10.8 Recovery bail on corrupt streak (D1)
+
+If §8.2 Phase 3 walk-back encounters `DISCOVERY_CORRUPT_WALKBACK` consecutive corrupt versions without finding a valid one, the client raises `AGGREGATOR_POINTER_CORRUPT_STREAK`.
+
+This is a **distinct** error from `AGGREGATOR_POINTER_CORRUPT`. It indicates either:
+
+(a) a pathological sequence of consecutive prior-client bugs (e.g., an old SDK release shipped with a broken encoder and every publish from that release is corrupt); OR
+
+(b) an adversary grinding garbage at the wallet's `requestId` space — possible only if the adversary has `pointerSecret`, which is computationally infeasible for any external attacker under the HKDF-SHA256 security argument (§11.1).
+
+**Recovery path.** The user MAY invoke the `acceptCorruptStreak(walkbackLimit?)` API (§13) which raises the walkback ceiling for a single recovery attempt, capped at an implementation-defined safety ceiling (e.g., 4096). Each use is audited via `pointer:corrupt_streak_override_used { walkbackLimit }` telemetry.
+
+**Why not SET BLOCKED on corrupt streak.** Unlike §10.2 (aggregator-unreachable) and the deleted r3.1 §10.2.6 rule, a long corrupt streak is not a MITM signal — MITM defenses now live entirely in §8.4 (multi-mirror TOFU) and §8.1 (trustless `InclusionProof.verify`). A legitimate mnemonic holder who has NOT been MITM'd but who is staring at a corrupt-heavy OpLog can progress past it by either accepting the streak and continuing discovery, or by publishing a new valid version (valid-version continuity, §10.3) and letting future recovery anchor on that new valid version instead.
+
+**Interaction with publish.** `AGGREGATOR_POINTER_CORRUPT_STREAK` does NOT SET BLOCKED. A caller who chose to accept the streak and recover successfully can publish normally from `latest_valid_V + 1`. A caller who declines to accept the streak remains in a read-only state but MAY still publish — the next legitimate publish at `localVersion + 1` will itself become the new latest-valid version and will anchor future recoveries by other devices.
+
 ---
 
 ## 11. Security Considerations
@@ -872,7 +962,7 @@ For deployments wanting stronger guarantees, cross-check against multiple aggreg
 
 10. **Timing side channels.** The aggregator observes publish and probe cadence. "This wallet has approximately `V` versions" is inferable from probe patterns; "this wallet is active now" is inferable from commit arrivals. Not mitigated at this layer. See `ARCHITECTURE §12`.
 
-    Additionally, **discovery probe-sequence fingerprint (C7).** The sequence of `(v, side)` request-IDs probed during recovery (§8.2 exponential phase + §8.3 binary-search phase) is a deterministic function of `(V_true, localVersion)`. An aggregator operator or on-path observer who logs probe IDs across sessions can correlate two sessions from the same wallet as "same probe signature" even when the wallet uses different IP addresses, Tor exit nodes, or mirror rotations. This is a stronger clustering signal than `signingPubKey` alone (which already leaks across A/B at the same `v`; see bullet 4 above) because it ties together sessions separated in time. Mitigations (deferred to v2): (a) randomize the Phase 1 exponential base — e.g., start `hi = DISCOVERY_INITIAL_VERSION + random_jitter()` where `random_jitter` is a uniform draw with variance comparable to the expected bin-search depth; (b) insert decoy probes at random versions during discovery; (c) probe via a small anonymity set of pointer-layer identities rotated per session. None of these are required for v1 ship; document as a known limitation that the §13 `getProbeFingerprint()` API may surface to UIs.
+    Additionally, **discovery probe-sequence fingerprint (C7).** The sequence of `(v, side)` request-IDs probed during recovery (§8.2 Phase 1 exponential + Phase 2 binary-search + Phase 3 walk-back) is a deterministic function of `(V_true, localVersion, {corrupt-version set})`. An aggregator operator or on-path observer who logs probe IDs across sessions can correlate two sessions from the same wallet as "same probe signature" even when the wallet uses different IP addresses, Tor exit nodes, or mirror rotations. This is a stronger clustering signal than `signingPubKey` alone (which already leaks across A/B at the same `v`; see bullet 4 above) because it ties together sessions separated in time. Mitigations (deferred to v2): (a) randomize the Phase 1 exponential base — e.g., start `hi = DISCOVERY_INITIAL_VERSION + random_jitter()` where `random_jitter` is a uniform draw with variance comparable to the expected bin-search depth; (b) insert decoy probes at random versions during discovery; (c) probe via a small anonymity set of pointer-layer identities rotated per session. None of these are required for v1 ship; document as a known limitation that the §13 `getProbeFingerprint()` API may surface to UIs.
 
 11. **Retry-rejected ciphertexts are sensitive.** A ciphertext computed for `(v, side)` that the wallet submits and the aggregator rejects with `REQUEST_ID_EXISTS` (because another device's commit landed first) shares `xorKey_{side, v}` with the committed ciphertext. An attacker who captures BOTH the rejected ciphertext (from local retry buffer, HTTP retry log, process memory, or crash dump) AND the committed ciphertext (from the aggregator) can XOR them to reveal the plaintext differential `partSide_ours XOR partSide_theirs`. Since CID bytes have low entropy in their prefix (varint version, multihash code) and `partA` additionally begins with a 1-byte `cidLen` prefix, this can leak most of both CIDs.
 
@@ -891,6 +981,18 @@ For deployments wanting stronger guarantees, cross-check against multiple aggreg
     d. RECOMMENDED: wrap the signing identity's private material in a `SecretKey` type that rejects `toString()` / `JSON.stringify()` / the default Node.js `util.inspect` hook / equivalent browser introspection paths.
 
 12. **Denylisted keys (C8).** Implementations SHOULD maintain a denylist of well-known test keys and refuse to bind the pointer layer to any such key in non-test networks. The denylist MUST include at minimum the §14.1 canonical vector (`walletPrivateKey = 0x01 × 32`, checked via `SHA-256(walletPrivateKey) == SHA-256(0x01 × 32)` to avoid storing the raw scalar in the denylist itself). The check occurs at `Profile.init()` time, before any pointer-layer derivation runs, and fires only when `config.network != 'test-vectors'`. Implementations MAY extend the denylist with other well-known public test keys (Bitcoin "1 × 32" vectors, secp256k1 test-suite vectors, etc.) as they become aware of them. A positive denylist hit MUST abort init with a distinct, non-ignorable error; falling back to a warning is explicitly NOT permitted.
+
+13. **Residual risks documented as trade-offs (v2 work) (D10).** Revision 3.2 fixes all objective bugs surfaced by the r3.1 steelman reviews, but the following trade-offs remain. They are NOT bugs; they are consequences of the scheme's design choices that would require deeper changes (L1 anchoring, governance, protocol redesign) to resolve and are deferred to v2.
+
+    (i) **Bundled mirror list = centralized trust root.** The MANDATORY multi-mirror TOFU (§8.4) defends against network-path compromise but NOT against supply-chain compromise of the bundled mirror list itself. A compromised SDK release beats every downstream wallet simultaneously — an attacker who can publish a poisoned SDK release can set every mirror URL to attacker-controlled hosts, and every fresh-install wallet will TOFU-pin the attacker's `RootTrustBase`. **v2 work:** sign the bundled mirror list with a rotating release key; OR pin the mirror-list hash to an L1 anchor; OR expose user-configurable mirror overrides at `Sphere.init()` time so security-conscious operators can inject their own list.
+
+    (ii) **MANDATORY multi-mirror widens the availability attack surface.** DDoSing `MIN_MIRROR_COUNT` (= 2) mirrors blocks all fresh-install onboardings. A single-mirror TOFU fallback would tolerate one mirror's outage at the cost of security. **v2 work:** expose a graceful single-mirror fallback behind an operator capability gate after N (≥ 3) retry attempts against the full mirror set, emitting `pointer:single_mirror_fallback_used { mirror }` telemetry and surfacing prominent UX warning.
+
+    (iii) **Manual backup/restore across devices triggers `MARKER_CORRUPT`.** A legitimate user flow — copying `.profile/` state from device A (at `v = 2000`) to device B (at `v = 0`) — produces a marker on device B whose version gap exceeds `MARKER_MAX_JUMP = 1024`, triggering `AGGREGATOR_POINTER_MARKER_CORRUPT` (§7.1.4). Recovery IS available via `clearPendingMarker()` (§13) but implementations MUST surface UX guidance for backup-restore scenarios; a user without the guidance faces an opaque error. **v2 work:** on first-boot when the only persistent state is a mismatched marker (no `localVersion`, no OpLog entries, no other signals of a legitimate prior session), auto-call `clearPendingMarker()` and emit `pointer:marker_cleared { reason: 'auto_compacted' }`.
+
+    (iv) **Denylist governance (C8 extension).** §11.12 requires runtime rejection of known test keys. v1 ships with a single hard-coded entry (the §14.1 canonical vector). There is no formal governance for adding entries as new public test keys become known. **v2 work:** define where the canonical denylist lives (in-SDK, IPNS-published, L1-anchored), how it versions (monotonic seq + signed root), how new entries propagate to shipped wallets (lazy check against a remote manifest at init time), and whether the list is signed by a release key, a multisig, or both.
+
+    (v) **Corrupt streak as a legitimate-use DoS vector.** §10.8 bails with `AGGREGATOR_POINTER_CORRUPT_STREAK` after `DISCOVERY_CORRUPT_WALKBACK = 64` consecutive corrupt versions. A publisher who crashes-mid-publish at a high rate (≥ 64 consecutive times) produces a legitimate-use corrupt streak that legitimate recoverers then see. The user can `acceptCorruptStreak()` but this is a UX papercut. **v2 work:** distinguish crash-mid-publish residue from adversarial grinding via a fingerprint on the XOR-decoded plaintext (e.g., a short marker byte that publishers always include, so unmarked corrupt versions can be skipped at higher rates without raising the bail threshold).
 
 ---
 
@@ -916,6 +1018,8 @@ For deployments wanting stronger guarantees, cross-check against multiple aggreg
 | `AGGREGATOR_POINTER_CAR_TOO_LARGE` | IPFS client returned a CAR exceeding `MAX_CAR_BYTES` during recovery fetch. | §8.5 |
 | `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT` | IPFS client exceeded `MAX_CAR_FETCH_MS` during recovery fetch. | §8.5 |
 | `AGGREGATOR_POINTER_CAR_UNAVAILABLE` | All configured IPFS gateways returned 404 / unreachable despite a trustlessly-verified inclusion proof at `V_true`. Blocks further publishes until retry succeeds or `acceptCarLoss()` is invoked. | §10.7 |
+| `AGGREGATOR_POINTER_CORRUPT_STREAK` | §8.2 Phase 3 walk-back encountered `DISCOVERY_CORRUPT_WALKBACK` consecutive corrupt versions without finding a valid one. Distinct from `AGGREGATOR_POINTER_CORRUPT`. Recover via `acceptCorruptStreak()` (§13). | §8.2, §10.8 |
+| `SECURITY_ORIGIN_MISMATCH` | OpLog entry rejected because its stamped `originated` tag semantically mismatches its entry type (user-action entry tagged `'system'` or vice versa). Non-retryable; the entry MUST NOT be replicated further. | §10.2.3 |
 
 ---
 
@@ -986,7 +1090,12 @@ interface ProfilePointerLayer {
   /**
    * Operator-facing recovery for §7.1.4 / C1 version-jump-clamp failure.
    * Clears a corrupt `PENDING_VERSION_KEY` marker so publish() can resume.
-   * Emits `pointer:marker_cleared { previousMarker }` telemetry.
+   * Emits `pointer:marker_cleared { previousMarker: { v, cidHash }, reason: 'user_requested' | 'auto_compacted' }` telemetry.
+   * `previousMarker` captures the cleared marker's `v` and `cidHash` (exactly
+   * the fields stored under `PENDING_VERSION_KEY` per §7.1.4); `reason` is
+   * `'user_requested'` when invoked via this API and `'auto_compacted'` when
+   * the SDK clears a stale marker automatically (e.g., the §7.1.4
+   * `previousEntry.v < currentLocalVersion` stale-drop branch).
    * Preconditions: `AGGREGATOR_POINTER_MARKER_CORRUPT` was observed on
    *                the most recent publish attempt.
    * Postconditions: `PENDING_VERSION_KEY` is cleared; subsequent publish
@@ -999,12 +1108,39 @@ interface ProfilePointerLayer {
 
   /**
    * Optional telemetry — returns a short stable hash of the last
-   * discovery probe sequence (§8.2 + §8.3). Intended for UIs that want
+   * discovery probe sequence (§8.2 three-phase + §8.3 bounds). Intended for UIs that want
    * to surface "same-wallet clustering" signal to users (per §11 bullet
    * 10 C7). Returns empty string if no probe has been run since init.
    * The returned hash is NOT secret and MAY be logged.
    */
   getProbeFingerprint(): string
+
+  /**
+   * Operator override for §10.8 corrupt-streak bail (D1 / D11).
+   * Raises the `DISCOVERY_CORRUPT_WALKBACK` ceiling for a single
+   * subsequent recovery attempt, up to an implementation-defined safety
+   * ceiling (e.g., 4096).
+   *
+   * Preconditions:
+   *   - The most recent recovery attempt returned
+   *     AGGREGATOR_POINTER_CORRUPT_STREAK (§10.8).
+   *
+   * Postconditions:
+   *   - The next `recoverLatest()` / `discoverLatestVersion()` call runs
+   *     Phase 3 walk-back with the raised limit. On completion (success
+   *     or a second bail), the ceiling reverts to the default
+   *     DISCOVERY_CORRUPT_WALKBACK for all subsequent recoveries; the
+   *     override is one-shot.
+   *   - Returns the walkback limit actually used (the request may be
+   *     clamped to the implementation's safety ceiling).
+   *
+   * Emits `pointer:corrupt_streak_override_used { walkbackLimit }`
+   * telemetry for auditability.
+   *
+   * @param walkbackLimit — desired ceiling for this recovery. Omit to
+   *   use the implementation's safety ceiling directly.
+   */
+  acceptCorruptStreak(walkbackLimit?: number): Promise<Result<{ walkbackUsed: number }>>
 }
 ```
 
@@ -1105,7 +1241,7 @@ Most revision-1 questions are resolved:
 
 ### 15.2 Reviewer sign-off checklist
 
-Revision 3 is **Stable** only after the following checkboxes are explicitly ticked. Comments MUST be attached to any unchecked item.
+Revision 3.2 is **Stable** only after the following checkboxes are explicitly ticked. Comments MUST be attached to any unchecked item.
 
 - [ ] **Security auditor** — subkey separation (§4.2), one-time-pad discipline + crash-retry marker (§7.1, §11.2), deterministic padding rationale (§4.6, §11.3), TOFU acceptance (§8.4, §11.5) reviewed and approved.
 - [ ] **Aggregator team** — `SubmitCommitmentRequest` / `SubmitCommitmentResponse` usage (§6.5), `REQUEST_ID_EXISTS` idempotent-replay handling (§7.3, §10.1), `RootTrustBase` source (O-2) reviewed and approved.
@@ -1123,3 +1259,4 @@ Revision 3 is **Stable** only after the following checkboxes are explicitly tick
 | 2 | Reviewer findings applied; locked on secp256k1 (Ed25519 removed); `RequestId.createFromImprint` formula pinned with explicit 67-byte preimage including the 2-byte algorithm tag; deterministic padding; trustless proof verification mandatory with TOFU accepted for v1 first-boot only. |
 | 3 | **Steelman review fixes F1–F11 per commit b9545ab.** F1: `.proof.` → `.inclusionProof.` throughout probe/recovery pseudocode. F2: split `(EXISTS, EXISTS)` outcome row into idempotent-replay vs genuine-conflict branches based on `pending_version` marker match. F3: hardened §7.1 pending-version discipline (exclusive mutex, per-wallet scoping, durability, rollback-safe `v` bump, integrity-checked `cidHash`, marker-clear atomicity). F4: formalized §10.2 BLOCKED state (persistent flag, categorical-error SET conditions, strict CLEAR conditions, user-originated-write definition, optional per-call operator override). F5: async-`digest()` convention footnote added to §4 header. F7: multi-mirror TOFU cross-check added to §8.4; `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` registered in §12. F8: retry-rejected-ciphertext secrecy requirements added to §11.11 (zeroize, no-log, `SecretKey` wrapper). F9: canonical test-vector inputs inlined for vectors #1 (all-0x01 key, CIDv1-raw of "hello world") and #2 (`SHA-256("uxf-profile-pointer-test-2")`). F10: O-1 demoted to "blocking on impl-PR merge only"; O-5 (BLOCKED override), O-6 (mirror list) added. F11: `isPublishBlocked(): boolean` added to §13 API surface. Additional constant registrations in §3: `MUTEX_KEY`, `PENDING_VERSION_KEY`, `BLOCKED_FLAG_KEY`. Additional error code: `AGGREGATOR_POINTER_MARKER_CORRUPT`. Section numbering preserved where possible; §14 added subsections §14.4 / §14.5 without renumbering the existing §14.3. |
 | 3.1 | (2026-04-21) **Hardening pass applying steelman findings on v3.** C1: marker version-jump clamp (`MARKER_MAX_JUMP = 1024`) added to §7.1.4 to block single-write brick attacks; C2: retry-window ciphertext zeroization requirement added to §11.11(a′) with `MAX_CT_RESIDENT_MS = 500`; C3: multi-mirror TOFU cross-check promoted from RECOMMENDED to **MANDATORY** in §8.4 with `MIN_MIRROR_COUNT = 2`, and fresh-install corrupt-payload BLOCKED rule added as §10.2.6; C4: CAR fetch caps `MAX_CAR_BYTES = 100 MiB` and `MAX_CAR_FETCH_MS = 60 s` added to §3 and §8.5; C5: CAR-unavailable persistent state formalized as §10.7 with `acceptCarLoss()` override API; C6: `originated` metadata tag replaces the `signedBy` heuristic for §10.2.3 user-originated-write definition; C7: probe-sequence fingerprint disclosure documented in §11 bullet 10 with v2 mitigation sketches; C8: public-test-key WARNING block added to §14.1 and denylisted-keys policy registered as §11.12; C9: §13 API surface extended with `acceptCarLoss()`, `clearPendingMarker()`, `getProbeFingerprint()`; `isPublishBlocked()` signature made `Promise<boolean>`; C10: arch-doc name alignment tracked separately (spec unchanged; see arch-doc change log); C11: async-await footnote in §4 expanded to cover `SigningService.createFromSecret`, `RequestId.createFromImprint/create`, `Authenticator.create`, `AggregatorClient` methods; C12: §8.4 proof-variable identifier ambiguity resolved via §8.1 `resp.inclusionProof.verify(...)` convention; C13: `DataHasher(X) ≡ new DataHasher(X)` convention note added to §4; C15: new constants `MARKER_MAX_JUMP`, `MAX_CT_RESIDENT_MS`, `MIN_MIRROR_COUNT`, `MAX_CAR_BYTES`, `MAX_CAR_FETCH_MS` registered in §3; new error codes `AGGREGATOR_POINTER_CAR_TOO_LARGE`, `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT`, `AGGREGATOR_POINTER_CAR_UNAVAILABLE` registered in §12; C16: O-6 promoted to BLOCKING spec sign-off. No byte-level formulas or pre-existing constants changed. |
+| 3.2 | (2026-04-21) **Apply steelman findings on r3.1.** **D1 valid-version-continuity** — corrupt versions are SKIPPED during discovery (§8.2 Phase 3 walk-back) rather than treated as MITM signals; REPLACES r3.1 §10.2.6 BLOCKED-on-corrupt rule entirely (§10.2.6 deleted, §10.3 rewritten, new §10.8 recovery-bail); new constant `DISCOVERY_CORRUPT_WALKBACK = 64` and new error `AGGREGATOR_POINTER_CORRUPT_STREAK`; publishing a NEW valid version at `latest_valid_V + 1` after a corrupt one is legitimate and needs no inter-client coordination. **D2** §10.2.2(4) verb aligned with arch §6.7 ("already been attempted AND failed"). **D3** §8.4 single-mirror-TOFU paragraph rewritten to describe multi-mirror degraded mode only; contradiction with adjacent MANDATORY rule resolved. **D4** §7.1.4 `MARKER_MAX_JUMP = 1024` rationale tightened with three-factor breakdown (PUBLISH_RETRY_BUDGET, cohort contention, operational headroom) and documented trade-off of NOT catching subtle same-window tampering. **D5** §10.2.3 semantic `originated`-tag re-validation added to close the tag-forgery bypass (user-action entry types MUST be `'user'`, system entry types MUST be `'system'`, mismatches rejected); new error `SECURITY_ORIGIN_MISMATCH`. **D6** §8.5 streaming byte-count enforcement mandated; `Content-Length` header cannot be sole cap enforcement. **D7** `pointer:marker_cleared` telemetry payload canonicalized: `{ previousMarker: { v, cidHash }, reason: 'user_requested' \| 'auto_compacted' }`. **D8** version heading bumped to 3.2. **D9** this row. **D10** new §11.13 residual-risk block documenting five trade-offs as v2 work: bundled mirror list as centralized trust root; MANDATORY multi-mirror as availability risk; backup/restore triggering MARKER_CORRUPT; denylist governance; corrupt streak as legitimate-use DoS vector. **D11** new API `acceptCorruptStreak(walkbackLimit?)` for §10.8 recovery bail. No byte-level formulas or pre-existing constants changed. |

@@ -1,9 +1,9 @@
 # UXF Profile — Aggregator-Anchored OpLog Pointer
 
-**Status:** Draft v3.1 — arch↔spec byte-level reconciliation + hardening narration
-**Date:** 2026-04-20
+**Status:** Draft v3.2 — r3.1 steelman findings applied (arch↔spec API-signature alignment, `originated` tag rule, valid-version-continuity)
+**Date:** 2026-04-21
 **Supersedes:** `profile/profile-ipns.ts` (IPNS snapshot stopgap)
-**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3.1, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
+**Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3.2, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
 **Related:**
 - [`docs/uxf/PROFILE-ARCHITECTURE.md`](./PROFILE-ARCHITECTURE.md) §2.3 (multi-bundle model), §7.6 (migration), §2.1 (global-keys model)
 - [`state-transition-sdk`](https://github.com/unicitylabs/state-transition-sdk) — all cryptographic primitives are consumed from this SDK wherever possible (§4.6)
@@ -548,7 +548,12 @@ The wallet maintains a per-wallet **persistent** BLOCKED flag — the canonical 
   - (iv) at least one retry with exponential backoff has already been attempted AND failed (to avoid flapping on single transient failures).
 
   Re-SET on the same category of error during a subsequent publish.
-- **User-originated write** is defined as an OpLog entry authored by THIS device's signing identity — `entry.signedBy == localChainKeyPublicKey` (i.e., the wallet's chain-key secp256k1 public key, NOT the pointer-layer `signingPubKey` from §4.1). The spec uses this as `localSigningPubKey` in §10.2.3 and defines it normatively as "the wallet's chain-key `SigningService` on this device"; the arch document uses `localChainKeyPublicKey` to keep the distinction from the pointer-layer signing key explicit. Replicated entries from other devices (OrbitDB gossipsub, Nostr DM ingest, any inbound replication) are NOT user-originated and do NOT justify blocking.
+- **User-originated write.** An OpLog entry is *user-originated* iff its `originated` metadata tag equals `'user'` (spec §10.2.3). Writers MUST stamp each entry with one of:
+  - `'user'` — deliberate user action (token send/receive, nametag register, DM send, invoice, swap)
+  - `'system'` — SDK-internal bookkeeping (session receipt, last-opened timestamp)
+  - `'replicated'` — arrived via OrbitDB gossipsub or Nostr ingest
+
+  Only `'user'` entries satisfy SET condition (iii) of §6.7. Recipients semantically re-validate the tag — entries of known-user-action types MUST have `'user'` regardless of the stamped value (spec §10.2.3 closes the tag-forgery bypass via `SECURITY_ORIGIN_MISMATCH`). This replaces the r3 `signedBy == localSigningPubKey` heuristic, which was ambiguous in both directions (a signed session-receipt spuriously satisfied it; an unsigned "touch" write slipped past).
 - **CLEAR BLOCKED** only after EITHER (spec §10.2.4):
   - (a) a trustlessly-verified **exclusion** proof at `requestId_{A,1}` AND `requestId_{B,1}` (applies only when `localVersion == 0`), OR
   - (b) a successful `recoverLatest()` yielding `V_true > 0` AND the CAR is fetched from IPFS AND the remote bundle is merged into the local OpLog.
@@ -557,7 +562,7 @@ The wallet maintains a per-wallet **persistent** BLOCKED flag — the canonical 
 
 This preserves user-visible write semantics (the wallet appears to function, local OpLog fills) while guaranteeing that the next on-aggregator commit cannot silently overwrite a remote history.
 
-**Fresh-install corrupt-payload case (v3.1 hardening).** A fresh-install wallet with `localVersion == 0` whose recovery produces a corrupt XOR-decoded payload — i.e., discovery returns a verified pointer at `V > 0` but the decoded bytes fail `isValidCid` — MUST also enter BLOCKED, even though the fresh OpLog contains zero user-originated writes and conditions (iii)/(iv) above are not literally satisfied. This closes the MITM attack where a forged aggregator mirror serves garbage at cold-start to coax the client into "no pointer exists → publish at `v = 1`" behavior that silently overwrites legitimate remote history the moment the MITM lifts. BLOCKED in this sub-case clears only after a multi-mirror-verified recovery (§12) that produces a non-corrupt payload; repeated `AGGREGATOR_POINTER_CORRUPT` or any `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` keeps BLOCKED set. See spec §10.2.6 for the formal rule.
+**Fresh-install corrupt-payload at cold start (v3.2).** The r3.1 "BLOCKED on corrupt-payload when `localVersion == 0`" rule is **removed**. Corrupt versions are now treated as semantically ignored residue in the aggregator SMT; discovery walks back past them to the latest valid version rather than blocking publish. The MITM concern r3.1 cited is absorbed into the broader valid-version-continuity model (§9.8) together with the multi-mirror trust-base cross-check (§6.5), and the corrupt-streak bail-out (spec §10.8). See §9.8 and spec §10.3 for the v3.2 rule.
 
 ---
 
@@ -757,6 +762,18 @@ Mitigations considered but deferred to v2 future work:
 
 None of these are part of v1; all are explicitly called out as probe-sequence hardening to ship later. See spec §11.10.
 
+### 9.8 Valid-version continuity (v3.2)
+
+The pointer layer treats discovery as a search for the latest VALID version, not simply the latest-included version. A "valid" version has: verified inclusion proofs for both sides, a well-formed XOR-decoded payload, a parseable sha2-256 CID, a fetchable CAR within `MAX_CAR_BYTES` / `MAX_CAR_FETCH_MS`, and a deserializable UXF package. Any version failing these checks is "corrupt" — it may exist in the aggregator SMT (from prior buggy clients, aborted publishes, or gateway-level CAR corruption), but it is SEMANTICALLY IGNORED.
+
+Discovery finds the latest INCLUDED version via exponential+binary search (§10.2), then walks backward skipping up to `DISCOVERY_CORRUPT_WALKBACK` corrupt versions (spec §8.2 Phase 3). The first valid version found is returned. New valid publishes at `latest_valid_V + 1` are legitimate — a publisher does NOT need to resolve or clean up intermediate corrupt versions; they are permanent SMT residue that everyone skips.
+
+Critically, each Sphere client implements this independently; no coordination is needed. Two clients looking at the same wallet pointer stream with corrupt versions at `v = 7` and `v = 8` will both skip to `v = 9` (or earlier) as the latest valid and continue from there. There is no consensus step — the rule is a pure client-side skip policy.
+
+If Phase 3 walk-back exhausts `DISCOVERY_CORRUPT_WALKBACK` consecutive corrupt versions (default `64`), recovery bails with `AGGREGATOR_POINTER_CORRUPT_STREAK`. The operator-facing `acceptCorruptStreak(walkbackLimit)` API (§15.2.1) extends the walkback for a single attempt. See spec §10.8 for the normative rule.
+
+This rule REPLACES the r3.1 §10.2.6 "fresh-install corrupt-payload → BLOCKED" behavior, which was both narrower (it only fired when `localVersion == 0`) and harder to recover from (each corrupt residue version required a distinct operator override). Valid-version-continuity generalizes to any position in the version stream and restores self-healing publish semantics.
+
 ---
 
 ## 10. Logarithmic Version Discovery
@@ -815,6 +832,15 @@ fn findLatestVersion(pointerSecret, signingPubKey, trustBase, localVersion):
 ```
 
 Where `probe(V)` (a.k.a. `bothSidesIncluded(V)`) fetches AND verifies inclusion/exclusion proofs for `r_A(V)` and `r_B(V)` in parallel; unverifiable proofs abort. `DISCOVERY_HARD_CEILING` handling is described in spec §8.2.
+
+### 10.6 Known trade-offs deferred to v2
+
+Known trade-offs deferred to v2 — see spec §11.13 for the canonical list. These are decided-and-deferred (not open questions):
+
+- **Bundled mirror list as centralized trust root.** The `MIN_MIRROR_COUNT` cross-check (§6.5) presupposes a client-bundled list of aggregator mirrors; the list itself is a centralized trust root, re-introducing a degree of the dependency the Profile architecture works to remove.
+- **MANDATORY multi-mirror DDoS surface.** Every fresh-install recovery fans out to `MIN_MIRROR_COUNT` independently-addressed mirrors in parallel; coordinated cold-start cohorts (post-incident restore waves, testnet resets) amplify aggregate load.
+- **Backup/restore `MARKER_CORRUPT` UX.** A `pending_version` marker restored from a backup taken mid-publish surfaces as `AGGREGATOR_POINTER_MARKER_CORRUPT`, which today requires the operator escape hatch (`clearPendingMarker()`) — not ideal for end-user recovery flows.
+- **Denylist governance.** The well-known-test-key denylist (spec §11.12) is client-bundled; updates require a client release cycle, and there is no signed revocation channel.
 
 ---
 
@@ -897,14 +923,14 @@ See §5.5. Explicit `Profile.resetPointerVersion()` migration hook.
 
 When discovery yields a verified pointer at `V > 0` and both the inclusion proofs at `(r_A(V), r_B(V))` AND the exclusion proofs at `(r_A(V+1), r_B(V+1))` pass `InclusionProof.verify`, but `fetchFromIpfs(cid)` returns 404 / unreachable / times out on *every* configured gateway, the wallet enters an `AGGREGATOR_POINTER_CAR_UNAVAILABLE` state. This is distinct from §12.2 BLOCKED: here the aggregator IS reachable and `V_true` is trustlessly known; only the CAR bytes are missing.
 
-Behavior (narrative; spec §10.4 owns the normative rule):
+Behavior (narrative; spec §10.7 owns the normative rule):
 
 - Raise `AGGREGATOR_POINTER_CAR_UNAVAILABLE` to the caller.
 - Do NOT advance `localVersion` past `V_true`.
 - Refuse subsequent `publish()` calls until EITHER the CAR becomes fetchable on retry OR the caller invokes the explicit operator override `acceptCarLoss(version)` with user consent. Advancing `localVersion` past an unfetchable bundle would silently overwrite legitimate remote history the instant fetch becomes possible again — a data-loss path that the caller must opt into.
 - Emit `pointer:recover_car_unavailable { version, cid }` for UI surfacing; emit `pointer:car_loss_accepted { version }` when the override is invoked.
 
-Also subject to v3.1 CAR size/fetch caps and associated error codes (spec §3.1 / §10.4): excessively large CARs or fetches exceeding `MAX_CAR_FETCH_MS` abort locally rather than blocking progress indefinitely.
+Also subject to v3.1 CAR size/fetch caps and associated error codes (spec §3 / §10.7): excessively large CARs or fetches exceeding `MAX_CAR_FETCH_MS` abort locally rather than blocking progress indefinitely.
 
 ### 12.10 Async-await convention in arch pseudocode (v3.1)
 
@@ -928,9 +954,11 @@ v3.1 hardening adds the following UI-facing events (normative taxonomy in spec �
 
 | Event | Fields | When |
 |---|---|---|
-| `pointer:recover_car_unavailable` | `{ version, cid }` | Discovery succeeded with a trustlessly-verified pointer at `V > 0`, but every IPFS gateway failed to return the CAR (§12.9; spec §10.4) |
+| `pointer:recover_car_unavailable` | `{ version, cid }` | Discovery succeeded with a trustlessly-verified pointer at `V > 0`, but every IPFS gateway failed to return the CAR (§12.9; spec §10.7) |
 | `pointer:car_loss_accepted` | `{ version }` | The caller invoked `acceptCarLoss(version)` to opt into data loss and unblock publish (§12.9; spec §13 API surface) |
-| `pointer:marker_cleared` | `{ version, reason }` | An explicit `clearPendingMarker()` removed a stuck `pending_version` marker — operator escape hatch for corrupt or orphan markers (spec §7.1 / §13 API surface) |
+| `pointer:marker_cleared` | `{ previousMarker: { v, cidHash }, reason: 'user_requested' \| 'auto_compacted' }` | An explicit `clearPendingMarker()` removed a stuck `pending_version` marker — operator escape hatch for corrupt or orphan markers (spec §7.1 / §13 API surface) |
+| `pointer:discover_corrupt_skipped` | `{ version }` | Emitted per skipped corrupt version during §9.8 / spec §8.2 Phase 3 walk-back (v3.2) |
+| `pointer:corrupt_streak_override_used` | `{ walkbackLimit }` | Emitted when the operator-gated `acceptCorruptStreak()` override (§15.2.1, spec §13) is invoked to extend the walk-back beyond `DISCOVERY_CORRUPT_WALKBACK` (v3.2) |
 
 These complement the UI-facing events in §7.4 (`pointer:publish_started`, etc.). Telemetry events are for operators; UI events are for application integrators.
 
@@ -978,15 +1006,14 @@ Expanded per reviewer W-10. Each row's rejection reason is load-bearing; none of
 - Token-manifest derivation.
 - All `TokenStorageProvider` contract semantics visible to `PaymentsModule`.
 
-### 15.2.1 New SDK surface (v3.1 hardening)
+### 15.2.1 New SDK surface (v3.1/v3.2 hardening)
 
-Implementations of the pointer layer gain three new API methods on the pointer module, driven by v3.1 failure-mode handling (§12.9, §6.7) and operator escape hatches:
+Implementations of the pointer layer gain new API methods on the pointer module, driven by v3.1 failure-mode handling (§12.9, §6.7), v3.2 valid-version-continuity (§9.8), and operator escape hatches. Spec §13 is the normative owner of all signatures; the arch document reproduces them verbatim:
 
-- `acceptCarLoss(version: number): void` — caller opt-in that unblocks publish after §12.9 `AGGREGATOR_POINTER_CAR_UNAVAILABLE`; emits `pointer:car_loss_accepted` telemetry.
-- `clearPendingMarker(): void` — operator escape hatch that removes a stuck `pending_version` marker (e.g., corrupted, orphan after a non-recoverable crash); emits `pointer:marker_cleared` telemetry.
-- `getProbeFingerprint(): ProbeFingerprint | undefined` — optional diagnostic returning a session-local summary of the probe sequence used during discovery, intended for operator analysis of the §9.7 fingerprint disclosure. Implementations MAY omit this method in v1.
-
-Spec §13 is the normative owner of these signatures.
+- `acceptCarLoss(version: number): Promise<Result<void>>` — caller opt-in that unblocks publish after §12.9 `AGGREGATOR_POINTER_CAR_UNAVAILABLE`; emits `pointer:car_loss_accepted` telemetry.
+- `clearPendingMarker(): Promise<Result<void>>` — operator escape hatch that removes a stuck `pending_version` marker (e.g., corrupted, orphan after a non-recoverable crash); emits `pointer:marker_cleared` telemetry.
+- `getProbeFingerprint(): string` — optional diagnostic returning a short stable hash of the last discovery probe sequence, intended for operator analysis of the §9.7 fingerprint disclosure. Returns empty string if no probe has run since init. Not secret; MAY be logged.
+- `acceptCorruptStreak(walkbackLimit?: number): Promise<Result<{ walkbackUsed: number }>>` — v3.2 operator escape hatch that extends the §9.8 corrupt-version walk-back beyond `DISCOVERY_CORRUPT_WALKBACK` for a single attempt, used when a pathological OpLog of consecutive corrupt residue (long tail of prior-client bugs or adversarial grinding) has exhausted the default cap with `AGGREGATOR_POINTER_CORRUPT_STREAK`.
 
 ### 15.3 Grace period
 
@@ -1035,3 +1062,4 @@ Once all five approvals are recorded and the spec's Reviewer Sign-Off Checklist 
 | v2 | 2026-04-20 | Reviewer consolidation: unified Q-list, reviewer findings (C-1..C-6, W-1..W-10, N-1..N-10) incorporated. |
 | v3 | 2026-04-20 | Byte-for-byte alignment with spec across stateHash preimage (`xorSeed`, not `pointerSecret`), xorKey (bare SHA-256 via DataHasher, not HKDF-Expand), padding (shared across both sides, `"pad"` suffix in info), constant naming (`PUBLISH_BACKOFF_BASE_MS`/`PUBLISH_BACKOFF_MAX_MS` — no `RETRY_` infix on timings), discovery init seeded from `localVersion`, BLOCKED state machine hardened (persistent flag, user-originated-write criterion, override protocol), `pending_version` marker discipline cross-referenced to spec §7.1, observability override event added. Spec is canonical; arch narrates. Open Questions routed to spec §15.1 as single source of truth. |
 | v3.1 | 2026-04-20 | Hardening pass applied from steelman findings on v3: marker version-jump clamp, retry-window ciphertext zeroization, mandatory multi-mirror TOFU with fresh-install corrupt-payload BLOCKED, CAR size caps and unavailable-state handling, `originated` tag for user-originated OpLog writes, probe-sequence fingerprint disclosure, test-vector runtime rejection, new API methods (`acceptCarLoss`, `clearPendingMarker`, `getProbeFingerprint`). Error-code name aligned (`AGGREGATOR_POINTER_UNTRUSTED_PROOF`). BLOCKED SET conditions aligned (four conditions, "attempted AND failed" phrasing). Symbol naming aligned (`paddingBytes_v`). `findLatestVersion` call-site arity corrected. `localSigningPubKey` disambiguated as wallet chain-key pubkey (`localChainKeyPublicKey`) throughout. Async-await convention footnote added. Note: spec change log F-numbering skips F6 (reserved, not used in v3); arch does not enumerate F-items, so no renumbering is required on the arch side. Spec is canonical; arch narrates. |
+| v3.2 | 2026-04-21 | Apply r3.1 steelman findings: API signatures aligned with spec (`Promise<Result<void>>`); §6.7 user-originated rewritten to reference `originated` tag rule (spec §10.2.3); valid-version-continuity narrative added (§9.8) replacing the v3.1 fresh-install BLOCKED-on-corrupt rule; event payloads harmonized; cross-references to spec §10.7 (was §10.4) fixed; spec §3 (was §3.1) fixed; residual trade-offs documented in spec §11.13. |
