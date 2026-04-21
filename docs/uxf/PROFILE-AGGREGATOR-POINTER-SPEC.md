@@ -1,6 +1,6 @@
 # UXF Profile Aggregator Pointer — Technical Specification
 
-**Status:** Draft — revision 3.2 (valid-version-continuity pass D1–D11 on top of revision 3.1; SDK-native; secp256k1-only)
+**Status:** Draft — revision 3.3 (final hardening pass H1–H14 + W1–W12 on top of revision 3.2; SDK-native; secp256k1-only)
 **Companion document:** [`PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md`](./PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md) (the "why")
 **This document:** the "exactly how" — byte layouts, formulas, algorithms. Narrative rationale lives in the architecture doc and is not repeated here.
 
@@ -85,7 +85,7 @@ This spec MUST be implemented by calling these SDK classes directly. The only no
 
 | Name | Value | Units | Notes |
 |---|---|---|---|
-| `PROFILE_POINTER_HKDF_INFO` | `bytes_of("uxf-profile-aggregator-pointer-v1")` | 32 bytes | Domain-separation label for the pointer-layer PRK. Versioned (`v1`). |
+| `PROFILE_POINTER_HKDF_INFO` | `bytes_of("uxf-profile-aggregator-pointer-v1")` | 33 bytes | Domain-separation label for the pointer-layer PRK. Versioned (`v1`). |
 | `SIGNING_SEED_INFO` | `bytes_of("uxf-profile-pointer-sig-v1")` | 26 bytes | Info string used to derive the subkey for `SigningService`. |
 | `XOR_SEED_INFO` | `bytes_of("uxf-profile-pointer-xor-v1")` | 26 bytes | Info string used to derive the subkey for per-version `xorKey` and `stateHash` material. |
 | `PAD_SEED_INFO` | `bytes_of("uxf-profile-pointer-pad-v1")` | 26 bytes | Info string used to derive the subkey for deterministic padding. |
@@ -104,15 +104,27 @@ This spec MUST be implemented by calling these SDK classes directly. The only no
 | `PUBLISH_BACKOFF_JITTER_LO` | `0.5` | multiplier | Lower bound of the uniform jitter multiplier applied to exponential backoff. |
 | `PUBLISH_BACKOFF_JITTER_HI` | `1.5` | multiplier | Upper bound of the uniform jitter multiplier applied to exponential backoff. |
 | `AGGREGATOR_ALG_TAG_SHA256` | `[0x00, 0x00]` | 2 bytes | Big-endian algorithm tag for `HashAlgorithm.SHA256` (value `0`). Used as the 2-byte prefix of every `DataHash.imprint` in this spec. |
-| `MUTEX_KEY` | `"profile.pointer.publish.lock"` | string | Per-wallet exclusive publish mutex identifier (§7.1.1). |
+| `MUTEX_KEY` | `"profile.pointer.publish.lock." + hex(signingPubKey)` | string (templated) | Per-wallet exclusive publish mutex identifier (§7.1.1). |
 | `PENDING_VERSION_KEY` | `"profile.pointer.pending_version." + hex(signingPubKey)` | string (templated) | Per-wallet crash-safety marker key (§7.1.2). |
 | `BLOCKED_FLAG_KEY` | `"profile.pointer.blocked." + hex(signingPubKey)` | string (templated) | Per-wallet persistent BLOCKED-state flag key (§10.2). Boolean; absent ≡ `false`. |
 | `MARKER_MAX_JUMP` | `1024` | versions | Maximum allowed gap between `previousEntry.v` and `currentLocalVersion` before the marker is treated as corrupt (§7.1.4). |
 | `MAX_CT_RESIDENT_MS` | `500` | ms | Maximum in-memory retention of a rejected retry ciphertext before it MUST be zeroized and re-derived (§11.11(a′)). |
 | `MIN_MIRROR_COUNT` | `2` | mirrors | Minimum number of independently-addressed aggregator mirrors required for TOFU trust-base cross-check on fresh-install recovery (§8.4). |
 | `MAX_CAR_BYTES` | `100 * 1024 * 1024` | bytes (100 MiB) | Maximum CAR byte size the IPFS client MUST enforce on fetch (§8.5). |
-| `MAX_CAR_FETCH_MS` | `60000` | ms | Maximum wall-clock time the IPFS client MUST enforce on a single CAR fetch (§8.5). |
+| `MAX_CAR_FETCH_INITIAL_RESPONSE_MS` | `10000` | ms | Maximum time from request to first response headers (§8.5). |
+| `MAX_CAR_FETCH_STALL_MS` | `30000` | ms | Maximum interval between received bytes (§8.5). |
+| `MAX_CAR_FETCH_TOTAL_MS` | `300000` | ms (5 min) | Absolute cap on a single CAR fetch including retries (§8.5). Replaces the former `MAX_CAR_FETCH_MS = 60000` progress-unaware timeout; see H10 in §16. |
+| `MAX_CAR_FETCH_RETRY` | `3` | attempts | Per-gateway retry budget for CAR fetch on transient failure (§8.5, §8.2 Phase 3). |
+| `MAX_CAR_FETCH_RETRY_BACKOFF_BASE_MS` | `500` | ms | Base delay for exponential backoff between CAR fetch retries. |
+| `CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS` | `12` | attempts | Hourly retries across the full gateway set over `CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS` before `acceptCarLoss()` may be invoked (§10.7). |
+| `CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS` | `86400000` | ms (24 h) | Minimum wall-clock duration of persistent-retry window before `acceptCarLoss()` may be invoked (§10.7). Persisted across restarts. |
+| `POINTER_PEER_DISCOVERY_MS` | `600000` | ms (10 min) | Peer availability poll window on OrbitDB gossipsub / Nostr before `acceptCarLoss()` may advance (§10.7). |
+| `MIRROR_LIST_SHA256` | `"<placeholder — computed at release time>"` | hex string | Integrity hash of the bundled mirror list (§8.4.3). Mismatch aborts init with `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`. |
+| `MIRROR_CERT_PINS` | `Record<string, string[]>` | map | Per-mirror pinned leaf/intermediate SHA-256 cert fingerprints (§8.4.3). Rotated quarterly at most. |
 | `DISCOVERY_CORRUPT_WALKBACK` | `64` | versions | Maximum number of consecutive corrupt (undecodable / non-CID / non-fetchable) versions to skip during §8.2 Phase 3 walk-back before bailing with `AGGREGATOR_POINTER_CORRUPT_STREAK` (§10.8). A distinct error from ordinary `AGGREGATOR_POINTER_CORRUPT`, intended to distinguish a pathological OpLog (long tail of consecutive prior-client bugs or adversarial grinding) from ordinary one-off corruption. Implementations MAY tune this higher under explicit operator consent via `acceptCorruptStreak()` (§13). |
+| `PUBLISH_REQUEST_TIMEOUT_MS` | `30000` | ms | Per-request timeout for `submitCommitment` RPC (W4). |
+| `PROBE_REQUEST_TIMEOUT_MS` | `10000` | ms | Per-request timeout for `getInclusionProof` during probes (W4). |
+| `IPNS_RESOLVE_TIMEOUT_MS` | `20000` | ms | Per-resolution timeout for IPNS lookups (W4). |
 
 All constants are locked. Any change is a spec bump and requires the `v1` → `v2` rename of `PROFILE_POINTER_HKDF_INFO`.
 
@@ -140,6 +152,8 @@ pointerSecret = HKDF(
 Where `walletPrivateKey` is the same 32-byte secp256k1 private key the wallet uses for L3 token operations (the HKDF pattern matches `impl/shared/ipfs/ipns-key-derivation.ts`). HKDF is one-way; disclosure of `pointerSecret` does not compromise `walletPrivateKey`.
 
 `pointerSecret` MUST NOT leave the wallet process.
+
+**W1 — BIP32 key position (normative).** `walletPrivateKey` MUST be the 32-byte BIP32 master private key derived from the wallet's mnemonic (not a child key, not an address-level leaf key). This matches `PROFILE-ARCHITECTURE.md §2.1`'s global-keys model, where `identity.masterKey` is wallet-scoped and shared across HD addresses. Implementations that derive `pointerSecret` from any other key position (e.g., `m/44'/coin'/0'` or an address leaf) produce a different pointer chain and break interoperability across Sphere releases.
 
 ### 4.2 Subkey separation
 
@@ -437,11 +451,27 @@ Transport-level failures (network, timeout, malformed response) surface as throw
 
 Before any per-version derivation (`paddingBytes_v`, `partA`, `partB`, `ctA`, `ctB`, authenticators), the publisher MUST reserve `v` against the CID in local storage, under the discipline below.
 
-**7.1.1 Exclusive publish mutex.** The sequence "read `pending_version` → compute XOR payload → submit both sides → update `pending_version`" MUST hold an exclusive per-wallet mutex. Implementations MUST reject concurrent entries — either by returning a "busy" status or by serializing via a promise queue. Without this, two concurrent publish pipelines (e.g., debounced flush timer + manual sync) can produce OTP-reuse by both deriving payloads under the same `(v, side, xorKey)` with different plaintexts. Mutex key:
+**7.1.1 Cross-context mutual exclusion (tightened in H3).** The sequence "read `pending_version` → compute XOR payload → submit both sides → update `pending_version`" MUST hold an exclusive per-wallet mutex across ALL execution contexts that share the wallet's storage (browser tabs, Node processes, service workers). Without this, two concurrent publish pipelines (e.g., debounced flush timer + manual sync, or two open tabs against the same IndexedDB) can produce OTP-reuse by both deriving payloads under the same `(v, side, xorKey)` with different plaintexts.
+
+Mutex key:
 
 ```
-MUTEX_KEY = "profile.pointer.publish.lock"                 // per-wallet
+MUTEX_KEY = "profile.pointer.publish.lock." + hex(signingPubKey)
 ```
+
+**Browser runtime.** Implementations MUST use the Web Locks API:
+
+```
+navigator.locks.request(MUTEX_KEY, { mode: 'exclusive' }, asyncCallback)
+```
+
+If the Web Locks API is unavailable (pre-Chrome-69 / pre-Safari-15.4 browsers), implementations MUST refuse to initialize the pointer layer with `AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME`.
+
+**Node.js runtime.** Implementations MUST acquire an exclusive file lock (e.g., `proper-lockfile`) at the path `<dataDir>/profile/<hex(signingPubKey)>/publish.lock`, held for the duration of the publish critical section. The lock file MUST be created with `O_EXCL` semantics. Stale locks (process died without releasing) are detected via the standard `proper-lockfile` stale-lock timeout and are force-breakable only after `PUBLISH_BACKOFF_MAX_MS * 2 = 8000 ms`.
+
+**Cross-process contention.** If the lock is held by another process or tab, implementations MUST back off with jittered retry up to `PUBLISH_RETRY_BUDGET` attempts before surfacing `AGGREGATOR_POINTER_PUBLISH_BUSY`.
+
+**Critical-section boundary.** The lock MUST be acquired BEFORE reading `pending_version` and released ONLY AFTER both `localVersion` persist AND marker clear have completed (per §7.1.6 ordering). An identity change (`setIdentity()`) or `disconnect()` during the critical section MUST wait on the lock; the mutex being keyed on `hex(signingPubKey)` ensures a different identity acquires a different lock and does not block the outgoing publish.
 
 **7.1.2 Per-wallet scoping of the marker.** The pending-version slot MUST be namespaced by the pointer layer's signing pubkey so that multi-wallet devices never share a single slot:
 
@@ -453,35 +483,44 @@ See §3 for the constant registration.
 
 **7.1.3 Durability.** The `pending_version` write MUST be durable (fsync / flush-completed) BEFORE any downstream derivation runs. For IndexedDB this means awaiting `transaction.oncomplete`; for file-based storage, explicit `fsync`. Storage backends that cannot guarantee durability MUST refuse to initialize the pointer layer.
 
-**7.1.4 Rollback-safe version selection.** The marker read + v-bump logic is:
+**7.1.4 Rollback-safe version selection (tightened in H13).** The marker read + v-bump logic is:
 
 ```
-cidHash = SHA-256(cidBytes)
-
-previousEntry = storage.read(PENDING_VERSION_KEY)
+cidHash := SHA-256(cidBytes)
+previousEntry := storage.read(PENDING_VERSION_KEY)
 if previousEntry is not null:
-    // Version-jump clamp (C1): reject tampered / corrupted markers before
-    // they can be consumed by the max() rule below. A legitimate marker
-    // can never skip more than PUBLISH_RETRY_BUDGET versions ahead of
-    // currentLocalVersion; a gap larger than MARKER_MAX_JUMP indicates
-    // filesystem tampering or storage corruption.
+    // Idempotent-replay case (H13, matches arch §7.2): same v AND same cid →
+    // this is our own crashed publish resuming. KEEP v, re-derive the
+    // deterministic payload from (§4.6), and re-submit. The aggregator's
+    // write-once keying on requestId yields idempotence for free.
+    if previousEntry.v == v AND previousEntry.cidHash == cidHash:
+        /* no bump; proceed with idempotent retry */
+
+    // Stale-localVersion case: marker is behind current state (e.g., crash
+    // after localVersion persist but before marker clear per §7.1.6).
+    elif previousEntry.v < currentLocalVersion:
+        clear previousEntry
+        /* marker discarded as stale; use v unchanged */
+
+    // Rollback-safe bump: legitimate marker ahead of current v OR different
+    // cid at the same v (the OTP-reuse danger case). Clamped by
+    // MARKER_MAX_JUMP (C1) below; additionally post-clamped by H4 against
+    // latest_included_V (§8.2) in the caller.
+    else:
+        v := max(v, previousEntry.v) + 1
+
+    // Tamper check (C1): gap exceeds clamp → marker corrupt. Runs AFTER
+    // the cases above so that a legitimate idempotent retry whose marker
+    // was written before a localVersion rollback is not mis-classified.
     if previousEntry.v > currentLocalVersion + MARKER_MAX_JUMP:
         clear previousEntry
         raise AGGREGATOR_POINTER_MARKER_CORRUPT
 
-    if previousEntry.v >= v:
-        // Never reuse or regress below a historically reserved v.
-        // Handles: stale marker left by a crashed attempt, AND
-        // adversarial rollback of localVersion (tamper / corruption).
-        v := max(v, previousEntry.v) + 1
-    if previousEntry.v < currentLocalVersion:
-        // Stale marker; harmless to drop.
-        clear previousEntry
-
-storage.write(PENDING_VERSION_KEY, { v, cidHash })           // durable per 7.1.3
+// Record marker for crash safety (durable per 7.1.3).
+storage.write(PENDING_VERSION_KEY, { v, cidHash })
 ```
 
-This closes the "localVersion rolled back by tamper/corruption" path where the previous `v == v && cidHash != cidHash` check fell through silently.
+This closes the "localVersion rolled back by tamper/corruption" path where the previous `v == v && cidHash != cidHash` check fell through silently, while preserving the idempotent-retry case described in `PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md §7.2` (a crashed publisher resuming with the same CID MUST keep its v so that re-derivation produces byte-identical ciphertext and the aggregator returns `REQUEST_ID_EXISTS` harmlessly).
 
 **Rationale for the clamp (C1, tightened in D4).** Without this check a single malicious or corrupted marker write (e.g., `previousEntry.v = 2^31 − 2`) would propagate into `v := previousEntry.v + 1 = 2^31 − 1`, and the next legitimate publish would require `v = 2^31`, which exceeds `VERSION_MAX` and surfaces as `AGGREGATOR_POINTER_VERSION_OUT_OF_RANGE` — permanently bricking the wallet from a single bad write. A legitimate marker gap is bounded by:
 
@@ -505,6 +544,8 @@ A crash between (1) and (2) leaves a stale marker at the just-completed `v`, whi
 **Threat defended.** Partial execution + process restart with a different CID. Without this marker, a crashed publisher could re-enter with a new CID at the same `v`, reusing `xorKey_{side, v}` against a different plaintext — a trivial OTP break if both plaintexts ever hit the SMT.
 
 The `pending_version` slot is cleared only after a successful publish (§7.3, per 7.1.6) or after the publisher definitively abandons the version (e.g., `REQUEST_ID_MISMATCH` — non-retryable).
+
+**7.1.7 Identity discipline during the critical section (W5).** At publish critical-section entry, the implementation MUST capture `signingPubKey`, `walletPrivateKey`, and all keyed derivations (`pointerSecret`, `signingSeed`, `xorSeed`, `padSeed`, `signingService`) into local constants. These MUST NOT be re-read from a shared identity source during the critical section. Calls to `Sphere.setIdentity()` / `switchToAddress()` while the publish lock is held MUST be queued — they MUST NOT change the publisher's captured key mid-flight. The `MUTEX_KEY` keyed on `hex(signingPubKey)` (§7.1.1) ensures this ordering across async boundaries: a concurrent identity switch that takes the lock for a different signing pubkey does not block the in-flight publish, but a switch targeting the SAME pubkey waits on the lock.
 
 ### 7.2 Payload build
 
@@ -559,7 +600,13 @@ Outcome matrix:
 | `SUCCESS` | network error | Retry B at same `(v, SIDE_B)` with same deterministic payload (§10.1). |
 | network error | `SUCCESS` | Retry A at same `(v, SIDE_A)` with same deterministic payload. |
 | network error | network error | Retry the whole `(v)` publish (both sides) with the same payload. |
-| `AUTHENTICATOR_VERIFICATION_FAILED` or `REQUEST_ID_MISMATCH` (either side) | (any) | Non-retryable. Clear `pending_version`. Raise `AGGREGATOR_POINTER_REJECTED`. |
+| `AUTHENTICATOR_VERIFICATION_FAILED` or `REQUEST_ID_MISMATCH` (either side) | (any) | **Non-retryable and v-burning (H8).** Persist `localVersion = v` (BURN this `v` — it is permanently consumed even though the commit failed); clear `pending_version`. Raise `AGGREGATOR_POINTER_REJECTED { v, failedSide, reason }`. **Rationale:** the OTHER side may have already been accepted by the aggregator at `(v, other_side)` — the aggregator's write-once `requestId` semantics mean that ciphertext is permanently in the SMT. A retry at the same `v` with different `cidBytes` would reuse `xorKey_{side,v}` with a different plaintext, producing an OTP-reuse vulnerability. Burning `v` forces the next publish to use `v+1` with fresh keys. |
+| HTTP 429 / 503 with `Retry-After` header (either side) | (any) | Honor `Retry-After` (cap 600 s). Do NOT consume a retry-budget slot. Do NOT SET BLOCKED. Retry same `(v, side)` with identical payload. |
+| HTTP 5xx without `Retry-After` (either side) | (any) | Retry with jittered exponential backoff (§7.4) up to `PUBLISH_RETRY_BUDGET`. Counts as a retry-budget slot. |
+| HTTP 4xx other than 429 (either side) | (any) | Permanent failure. Raise `AGGREGATOR_POINTER_AGGREGATOR_REJECTED`. Do NOT retry. (W3) |
+| JSON-RPC error code `-32006 ConcurrencyLimit` (either side) | (any) | Treat as synthetic HTTP 503 with `Retry-After: 1s` (aggregator overloaded; brief back-off). |
+| JSON parse failure / missing required fields | (any) | Raise `AGGREGATOR_POINTER_PROTOCOL_ERROR`. Do NOT advance `localVersion`. Retry after longer backoff (30 s). |
+| Unknown `SubmitCommitmentStatus` enum value (forward-compat hazard) | (any) | Raise `AGGREGATOR_POINTER_PROTOCOL_ERROR`. Fail closed. |
 
 ### 7.4 Retry with jittered exponential backoff
 
@@ -601,10 +648,12 @@ async fun probe(v) -> boolean:
        statusA == NOT_AUTHENTICATED or statusB == NOT_AUTHENTICATED:
         raise AGGREGATOR_POINTER_UNTRUSTED_PROOF
 
-    return aIncluded and bIncluded
+    return aIncluded OR bIncluded                    // H2 — OR-monotonic predicate
 ```
 
-Probing both sides per step defends against partial-publish ambiguity: a single-side probe could be misled by a half-published `v` (A committed, B missing) into treating `v` as "published" when the decoded payload would be unusable.
+**H2 — OR-monotonic predicate.** The probe returns `aIncluded OR bIncluded`, matching invariant I-1 ("at every `V' ≤ V_true`, at least one side is included"), which is monotonic under partial-publish residue. The earlier `AND` predicate was non-monotonic: a partial-residue version (one side committed, the other absent) could cause the Phase-2 binary search to converge to a stale `V_true`, orphaning bundles. Phase 3 (§8.2) already enforces the stricter validity check (BOTH sides + XOR-decodable + IPFS-fetchable + CAR-deserializable) via `classifyVersion(v)`, so partial-residue versions are correctly walked past there.
+
+Probing both sides per step still defends against partial-publish ambiguity at recovery: a single-side probe could be misled by a half-published `v` into ambiguous interpretation. With BOTH proofs fetched and verified per probe, Phase 3 has all the material it needs to classify the version definitively.
 
 ### 8.2 Discovery algorithm — valid-version continuity (D1)
 
@@ -623,12 +672,12 @@ A version that is included (condition 1) but fails ANY of (2)–(5) is **invalid
 Phase 1 uses the locally persisted `localVersion` as a lower-bound hint when available; otherwise starts from 0. Phases 1 and 2 use inclusion-only (`probe(v)`) to bracket the latest-included version. Phase 3 walks backwards through any corrupt trailing versions to find the latest valid one.
 
 ```
-findLatestValidVersion():
-    # Phase 1 — exponential expansion: find an upper bound using INCLUSION only
+findLatestValidVersion():                           # H4 — returns { validV, includedV }
+    # Phase 1 — exponential expansion: find an upper bound using OR-monotonic probe
     lo = max(0, localVersion)
     hi = max(DISCOVERY_INITIAL_VERSION, lo + 1)
 
-    while await probe(hi):
+    while await probe(hi):                          # H2 — probe = aIncluded OR bIncluded
         lo = hi
         hi = hi * 2
         if hi > DISCOVERY_HARD_CEILING:
@@ -646,28 +695,74 @@ findLatestValidVersion():
             lo = mid
         else:
             hi = mid
-    candidate = lo                                   # latest INCLUDED version (may be corrupt)
+    includedV = lo                                  # latest INCLUDED version (may be corrupt)
+    candidate = includedV
 
-    # Phase 3 — walk back through corrupt versions.
-    # Corrupt versions are rare; this walk is bounded by DISCOVERY_CORRUPT_WALKBACK.
+    # Phase 3 — walk back through SEMANTICALLY-INVALID versions only (H1).
+    # Transient-unavailable versions propagate up as AGGREGATOR_POINTER_CAR_UNAVAILABLE
+    # so we do NOT skip past them — tokens at those versions may still exist.
     walked = 0
     while candidate > 0 and walked < DISCOVERY_CORRUPT_WALKBACK:
-        if await isVersionValid(candidate):
-            return candidate
-        emit pointer:discover_corrupt_skipped { version: candidate }
-        candidate = candidate - 1
-        walked = walked + 1
+        status = await classifyVersion(candidate)   # see helper below
+        if status == VALID:
+            return { validV: candidate, includedV: includedV }
+        elif status == SEMANTICALLY_INVALID:
+            emit pointer:discover_corrupt_skipped { version: candidate, reason: "invalid" }
+            candidate = candidate - 1
+            walked = walked + 1
+        else:                                       # TRANSIENT_UNAVAILABLE
+            # Tokens at this version may still exist; do NOT walk back.
+            # Surface up so the caller can retry later or enter §10.7 handling.
+            raise AGGREGATOR_POINTER_CAR_UNAVAILABLE { version: candidate }
 
     if candidate == 0:
-        return 0    # no valid version exists
+        return { validV: 0, includedV: includedV }  # no valid version exists
 
-    # Too many corrupt versions in a row — bail out with a distinct error.
-    raise AGGREGATOR_POINTER_CORRUPT_STREAK       # see §10.8
+    # Too many consecutively SEMANTICALLY_INVALID versions — bail out.
+    raise AGGREGATOR_POINTER_CORRUPT_STREAK         # see §10.8
+
+# H1 — three-way classification helper (replaces the old isVersionValid binary check).
+classifyVersion(v) -> { VALID, SEMANTICALLY_INVALID, TRANSIENT_UNAVAILABLE }:
+    # (1) Inclusion proofs: fetch from multi-mirror set and verify via
+    #     InclusionProof.verify(trustBase, requestId). MUST be OK on both sides.
+    (statusA, statusB) = verify both inclusion proofs (§8.1)
+    if either side missing / invalid inclusion proof:
+        # Partial-residue or truly absent at this v — treated as semantically invalid
+        # for Phase 3 purposes (the XOR decode below cannot produce a valid CID).
+        return SEMANTICALLY_INVALID
+
+    # (2) XOR-decode; length-prefix or CID parse failure → SEMANTICALLY_INVALID.
+    try:
+        cidBytes = reconstruct-cid (§8.5)
+    except AGGREGATOR_POINTER_CORRUPT:
+        return SEMANTICALLY_INVALID
+
+    # (3) Fetch CAR from IPFS with MAX_CAR_FETCH_RETRY per gateway and
+    #     exponential backoff (MAX_CAR_FETCH_RETRY_BACKOFF_BASE_MS).
+    carResult = fetchFromIpfs(cidBytes) with per-gateway retries (§8.5)
+
+    if carResult == all_gateways_network_error_or_timeout_or_5xx:
+        return TRANSIENT_UNAVAILABLE
+    if carResult == content_address_mismatch (CID hash ≠ bytes digest):
+        return SEMANTICALLY_INVALID                 # content-address verification failed
+    if carResult == car_deserialization_failed:
+        return SEMANTICALLY_INVALID
+
+    return VALID
 ```
 
-Invariant after a successful return: either `candidate == 0` (no pointer ever published) OR `isVersionValid(candidate) == true` AND every version in `(candidate, latestIncluded]` was corrupt and skipped.
+**Return shape (H4).** `findLatestValidVersion()` returns `{ validV, includedV }`:
+- `validV` — the latest version that passes full validation (Phases 1+2+3). `0` if no valid version exists.
+- `includedV` — the latest version with inclusion proofs on at least one side (Phase 2 result, before walk-back).
 
-`isVersionValid(v)` performs the full validation chain from (1)–(5) above; its implementation is the §8.5 CID-reconstruction path composed with the IPFS fetch and CAR deserialization steps. `probe(v)` (§8.1) covers only condition (1).
+Invariant after a successful return: either `validV == 0` (no pointer ever published) OR `classifyVersion(validV) == VALID` AND every version in `(validV, includedV]` was `SEMANTICALLY_INVALID` and skipped (Phase 3 never walks past a `TRANSIENT_UNAVAILABLE` version).
+
+**Why three-way classification (H1).** The prior two-way `isVersionValid` walked back on ANY CAR-fetch failure including transient (gateway outage, 5xx, network timeout). This could ORPHAN TOKENS during a temporary IPFS gateway outage — the legitimate latest version would be skipped, and a subsequent publish at walked-back-V+1 would strand the skipped version's inventory. The three-way classification:
+- **VALID** — fully reconstructible; return this version.
+- **SEMANTICALLY_INVALID** — permanent residue (unparseable CID, content-address mismatch, failed CAR deserialization). Skip and continue walk-back.
+- **TRANSIENT_UNAVAILABLE** — all configured IPFS gateways returned network errors, timeouts, or 5xx after `MAX_CAR_FETCH_RETRY = 3` attempts per gateway with exponential backoff. Surface as `AGGREGATOR_POINTER_CAR_UNAVAILABLE` so §10.7 handles it correctly; DO NOT walk back.
+
+**H4 — publisher uses `max(validV, includedV) + 1`.** The caller of §9 reconciliation MUST target `max(validV, includedV) + 1` as the next publish version. If the SMT has corrupt-included residue at `validV + 1` from a prior buggy client, publishing at `validV + 1` would get `REQUEST_ID_EXISTS`, re-trigger §9 reconciliation, re-discover the same `validV`, and retry at the same v — an infinite loop that exhausts `PUBLISH_RETRY_BUDGET` with `AGGREGATOR_POINTER_RETRY_EXHAUSTED`. Skipping past corrupt-included residue by using `includedV + 1` breaks this deadlock cleanly.
 
 ### 8.3 Probe count bounds and walk-back cost
 
@@ -675,11 +770,11 @@ The §8.2 algorithm has three phases; the first two use inclusion-only `probe(v)
 
 - Phase 1 (exponential): at most `log2(DISCOVERY_HARD_CEILING / max(1, lo)) + 1` doublings. Each doubling = one inclusion `probe`.
 - Phase 2 (binary search): at most `log2(hi − lo) ≤ 22` iterations. Each iteration = one inclusion `probe`.
-- Phase 3 (walk-back): at most `DISCOVERY_CORRUPT_WALKBACK` iterations, each calling `isVersionValid(v)`. In the common case (no corruption), Phase 3 completes in a single iteration and the returned version matches the Phase 2 `candidate`.
+- Phase 3 (walk-back): at most `DISCOVERY_CORRUPT_WALKBACK` iterations, each calling `classifyVersion(v)` (H1). In the common case (no corruption), Phase 3 completes in a single iteration and the returned `validV` matches the Phase 2 `includedV`.
 - Each `probe` = 2 parallel aggregator round trips + 2 parallel local verifications.
-- Each `isVersionValid` = 1 `probe` + 1 IPFS fetch (bounded by `MAX_CAR_BYTES` / `MAX_CAR_FETCH_MS`) + 1 CAR deserialization.
+- Each `classifyVersion` = 1 `probe` + 1 IPFS fetch with up to `MAX_CAR_FETCH_RETRY` per gateway (bounded by `MAX_CAR_BYTES` / `MAX_CAR_FETCH_TOTAL_MS`) + 1 CAR deserialization.
 
-A version that is included but fails `isVersionValid` is called "corrupt" throughout the remainder of this spec (see §10.3 and §10.8).
+A version that is included but classified `SEMANTICALLY_INVALID` is called "corrupt" throughout the remainder of this spec (see §10.3 and §10.8). A version classified `TRANSIENT_UNAVAILABLE` is NOT corrupt — the walk halts and `AGGREGATOR_POINTER_CAR_UNAVAILABLE` propagates up so §10.7 handles it.
 
 ### 8.4 Trustless proof verification (MANDATORY)
 
@@ -695,6 +790,38 @@ Where `trustBase` is a `RootTrustBase` loaded by the wallet from a trusted sourc
 **TOFU degradation — multi-mirror only (D3).** On fresh-device first boot with no pre-installed trust base, the wallet performs **multi-mirror TOFU**: query `MIN_MIRROR_COUNT` (= 2) independently-addressed mirrors in parallel, require byte-identical responses, and pin the accepted `RootTrustBase` locally. Single-mirror TOFU is NOT permitted in v1 shipping builds (see the MANDATORY rule immediately below). Subsequent boots use the pinned trust base without re-running TOFU unless explicitly re-bootstrapped by the operator. v2 mitigations (anchor the `RootTrustBase` fingerprint to the L1 alpha chain for out-of-band verification) are tracked as future work in `PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md §12`.
 
 **Multi-mirror TOFU cross-check (MANDATORY for v1).** Implementations MUST query at least `MIN_MIRROR_COUNT` (= 2) independently-addressed aggregator mirrors (different DNS names; ideally different autonomous systems) on first-boot recovery and require the returned trust bases to match byte-for-byte. A single mirror disagreeing with the others MUST abort recovery with `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE`. The SDK MUST ship with a statically-bundled list of ≥ 2 mirror URLs per network (testnet/mainnet); O-6 tracks finalization of the list. Single-mirror TOFU is NOT permitted in v1 shipping builds — this rule was `RECOMMENDED` in r3 and is promoted to `MANDATORY` in r3.1 because a fresh-install mnemonic re-import with a MITM'd network under single-mirror TOFU accepts an attacker-forged `RootTrustBase`, and §10.2 BLOCKED is not yet set at that moment (no user-originated writes exist on a fresh OpLog), so the attacker wins silently. Future work: pin a `RootTrustBase` fingerprint to the alpha L1 chain for out-of-band verification.
+
+**§8.4.1 Trust base rotation handling (H5).**
+
+When `InclusionProof.verify` returns `NOT_AUTHENTICATED`, implementations MUST:
+
+1. **Distinguish rotation from forgery.** If the trust base's `epoch` field differs from the certificate's referenced epoch in the returned proof, rotation is suspected. Rotation is a legitimate operational event (BFT validator set churn); forgery is adversarial.
+2. **On suspected rotation, refresh under the same multi-mirror TOFU rules.** Refetch `RootTrustBase` from the multi-mirror set, verify the new trust base's `epoch` is STRICTLY GREATER than the pinned one, and require byte-identical responses across mirrors (same rules as initial TOFU).
+3. **On refresh success.** Atomically replace the pinned trust base in local storage, then retry the original verification.
+4. **On refresh failure OR epoch decrease OR mirror divergence.** Raise `AGGREGATOR_POINTER_TRUST_BASE_STALE` (distinct from `AGGREGATOR_POINTER_UNTRUSTED_PROOF`) so callers can distinguish recoverable rotation from adversarial proof forgery.
+
+Implementations MUST NOT silently accept a trust base with `epoch` equal to or less than the pinned one — that indicates replay or forgery. Without rotation handling, pinned `RootTrustBase` goes stale when BFT validators rotate, every subsequent proof returns `NOT_AUTHENTICATED`, and the wallet becomes permanently bricked.
+
+**§8.4.2 Shared trust base with L4 (H6).**
+
+The `RootTrustBase` used by the pointer layer MUST be the SAME instance used by `PaymentsModule` and any other L4 token-verification path in Sphere. The multi-mirror TOFU cross-check described above is a Sphere-SDK-level bootstrap that runs once per wallet session and produces a single pinned `RootTrustBase` shared with all consumers.
+
+Implementations MUST NOT instantiate a separate `TrustBase` provider for the pointer layer; doing so creates asymmetric trust guarantees and defeats the v3.1 multi-mirror hardening against MITM attackers. An MITM attacker who cannot forge the pointer-layer trust base but CAN forge the L4 trust base still steals tokens via the L4 path.
+
+This requires the Sphere SDK's `OracleProvider` (or equivalent) to expose a getter for the currently-pinned `RootTrustBase`. The pointer layer consumes this provider, not its own. This is an integration-shape requirement, not a byte-level change.
+
+**§8.4.3 TLS and certificate discipline (H9).**
+
+All aggregator communication MUST use HTTPS with TLS ≥ 1.3.
+
+For fresh-install TOFU, implementations MUST ALSO verify:
+
+1. **Cert pinning.** The SDK ships with pinned SHA-256 fingerprints for the expected leaf cert or intermediate CA of each mirror in `MIRROR_CERT_PINS` (§3). Connections whose cert chain doesn't match a pinned fingerprint MUST fail with `AGGREGATOR_POINTER_CERT_PIN_MISMATCH`. Pins SHOULD rotate with cert renewals (quarterly at most).
+2. **CA diversity.** Across the `MIN_MIRROR_COUNT` mirror set, at least two mirrors MUST use certs from DIFFERENT issuing CAs (different root or intermediate). A build-time check in the SDK release pipeline enforces this; a runtime check confirms at fresh-boot.
+3. **IP diversity.** Each mirror's resolved IP MUST be in a distinct `/24` (IPv4) or `/48` (IPv6). Runtime check at fresh-boot.
+4. **Bundled mirror list integrity.** The bundled mirror list MUST be integrity-checked via `MIRROR_LIST_SHA256` (§3), hard-coded in a separate build artifact from the mirror list itself. Mismatch aborts init with `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`.
+
+Without this discipline, multi-mirror TOFU passes even under captive-portal TLS MITM if both mirrors return the same attacker-forged trust base. CA diversity + cert pinning together ensure an attacker needs to compromise multiple independent trust roots simultaneously.
 
 ### 8.5 CID reconstruction
 
@@ -735,7 +862,22 @@ return { cid: cidBytes, version: V }
 
 The CID parser used by `isValidCid` MUST bound all reads to the provided `cidBytes` slice, reject malformed varints, and accept only the codecs supported by the upstream `profile/ipfs-client.ts verifyCidMatchesBytes` (in practice: sha2-256 multihashes; expand as the upstream expands).
 
-**Post-decode invariant (C4 — CAR fetch caps).** The resolved CID MUST be fetched via an IPFS client that enforces `MAX_CAR_BYTES` (100 MiB) and `MAX_CAR_FETCH_MS` (60 s). If either cap is exceeded, the client MUST raise `AGGREGATOR_POINTER_CAR_TOO_LARGE` or `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT` respectively. The pointer layer treats these as recovery failures; the caller MAY choose to abort recovery or to fetch from a different gateway, but MUST NOT silently advance `localVersion` past an unfetchable bundle. See §10.7 for the related "CAR unavailable" persistent state.
+**W2 — HTTPS-only gateway pool.** IPFS gateway URLs in the SDK's shipped configuration MUST use the HTTPS scheme. HTTP gateways MUST NOT be included in the multi-gateway fetch pool. Implementations MAY allow a user-configurable override for local/test deployments, gated behind an explicit capability flag `allowInsecureGateways: true` with a prominent startup warning.
+
+**Post-decode invariant (C4 / H10 — CAR fetch caps).** The resolved CID MUST be fetched via an IPFS client that enforces `MAX_CAR_BYTES` (100 MiB) and progress-rate timeouts (see H10 below). If caps are exceeded, the client MUST raise `AGGREGATOR_POINTER_CAR_TOO_LARGE` or `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT` respectively. The pointer layer treats these as recovery failures; the caller MAY choose to abort recovery or to fetch from a different gateway, but MUST NOT silently advance `localVersion` past an unfetchable bundle. See §10.7 for the related "CAR unavailable" persistent state.
+
+**H10 — Progress-rate CAR fetch timeout.** The earlier single-shot `MAX_CAR_FETCH_MS = 60s` timeout aborted legitimate slow-network fetches. r3.3 replaces it with progress-rate semantics. A CAR fetch aborts if ANY of the following hold:
+
+1. Initial response headers not received within `MAX_CAR_FETCH_INITIAL_RESPONSE_MS` (10 s).
+2. No bytes received for `MAX_CAR_FETCH_STALL_MS` (30 s) after any previous byte.
+3. Total elapsed time exceeds `MAX_CAR_FETCH_TOTAL_MS` (5 min) including all retries.
+4. Total bytes received exceed `MAX_CAR_BYTES` (100 MiB).
+
+Implementations MUST support HTTP Range (`bytes=N-`) requests: on stall or transient failure, retry from the last successfully-received byte offset rather than starting over. The retry budget for resume attempts is `MAX_CAR_FETCH_RETRY = 3` per gateway with exponential backoff based on `MAX_CAR_FETCH_RETRY_BACKOFF_BASE_MS`.
+
+Implementations MUST NOT rely on `Content-Length` header for size verification. All size enforcement is streaming byte-count.
+
+`Content-Encoding: gzip | deflate | br` MUST be rejected on CAR responses (CAR format is already efficiently binary-encoded; compression adds only attack surface). A gateway returning `Content-Encoding` triggers `AGGREGATOR_POINTER_CAR_UNEXPECTED_ENCODING`.
 
 **Streaming byte-count enforcement (D6 — MANDATORY).** Implementers MUST enforce `MAX_CAR_BYTES` via a **streaming byte-count on the response body**, independently of any `Content-Length` header supplied by the gateway. The byte count MUST abort the underlying socket / reader within one additional chunk of exceeding `MAX_CAR_BYTES` — i.e., the implementation MUST NOT buffer an entire oversized response before checking the cap.
 
@@ -744,7 +886,7 @@ Implementations MUST NOT rely solely on `Content-Length` headers for size verifi
 1. Initialize a running byte counter to zero before beginning the response read loop.
 2. Increment the counter by `chunk.length` after each chunk read.
 3. If `counter > MAX_CAR_BYTES`, abort the socket (close reader, release resources) and raise `AGGREGATOR_POINTER_CAR_TOO_LARGE` within one additional chunk of the overflow.
-4. Enforce `MAX_CAR_FETCH_MS` via an independent wall-clock timer on the whole fetch operation, not via any server-supplied hint.
+4. Enforce the progress-rate timers from H10 independently of any server-supplied hint.
 
 The `Content-Length` header MAY be used as an early-reject optimization (if `Content-Length > MAX_CAR_BYTES`, abort immediately before reading any body) but MUST NOT be used as the sole cap enforcement.
 
@@ -765,20 +907,27 @@ async fun publishWithConflictHandling(cidProducer, attempts = 0):
     if attempts >= PUBLISH_RETRY_BUDGET:
         raise AGGREGATOR_POINTER_RETRY_EXHAUSTED
 
-    cid    = cidProducer()                          // recompute against current local state
-    localV = storage.read("profile.pointer.version") ?? 0
-    result = await publish(cid, localV + 1)
+    cid = cidProducer()                                              // recompute against current local state
+
+    // H4 — target next publish at max(validV, includedV) + 1 to skip
+    // past corrupt-included residue. Without this, a corrupt leaf at
+    // validV+1 causes REQUEST_ID_EXISTS → re-discover same validV →
+    // retry at same v → infinite loop until RETRY_EXHAUSTED.
+    { validV, includedV } = await findLatestValidVersion()           // §8.2 (H4 return shape)
+    nextV = max(validV, includedV) + 1
+    result = await publish(cid, nextV)
 
     if result.ok:
         return result
 
     if result.err == AGGREGATOR_POINTER_CONFLICT:
-        V_true    = await discoverLatestVersion()                   // §8
-        remote    = await recoverLatest()                            // §8.5 (CID at V_true)
+        // Another device raced and published BEYOND includedV. Re-discover and retry.
+        { validV, includedV } = await findLatestValidVersion()
+        remote = await recoverLatest()                                // §8.5 (CID at validV)
         // Outer Profile layer fetches CAR via DEFAULT_IPFS_GATEWAYS and
         // merges the bundle into local OrbitDB per PROFILE-ARCHITECTURE §10.4.
         await profileLayer.fetchAndJoin(remote.cid)
-        storage.write("profile.pointer.version", V_true)
+        storage.write("profile.pointer.version", validV)
 
         sleep(backoff(attempts))                                     // §7.4
         return publishWithConflictHandling(cidProducer, attempts + 1)
@@ -856,6 +1005,19 @@ This distinction is load-bearing: replicated entries from other devices do not t
 
 This re-validation runs at two points: (i) on every locally-authored write, before durable persistence; (ii) on every replicated write, before the replica is accepted into the local OpLog. The check is byte-cheap (string-equality on the entry type) and closes the tag-forgery bypass.
 
+**§10.2.3.1 Migration — stamping existing OpLog writers (W11).**
+
+Every module that writes OpLog entries MUST stamp the `originated` tag. The following modules are affected in the current Sphere SDK:
+
+- `modules/payments/PaymentsModule.ts`: `token_send`, `token_receive`, `nametag_register`, transfer events → `'user'`.
+- `modules/accounting/AccountingModule.ts`: `invoice_mint`, `invoice_pay`, `invoice_close` → `'user'`.
+- `modules/swap/SwapModule.ts`: `swap_propose`, `swap_accept`, `swap_deposit`, payout → `'user'`.
+- `modules/communications/CommunicationsModule.ts`: `dm_send` → `'user'`; `dm_receive` → `'replicated'` (receiver stamps as replicated regardless of the sender's stamp).
+- `profile-token-storage-provider.ts flushToIpfs`: batch bundle events → `'system'`.
+- Any session / cache / index writes → `'system'`.
+
+The implementation PR MUST update all listed modules atomically with the pointer layer. Deploying the pointer layer without the writer updates leaves BLOCKED state semantically inert: untagged entries default to `'user'` per the fail-closed rule above, causing spurious BLOCKED on every system write.
+
 **10.2.4 CLEAR on (exit conditions).** CLEAR BLOCKED only after EITHER:
 
 (a) A trustlessly-verified **exclusion** proof for `requestId_{A, 1}` AND `requestId_{B, 1}` — i.e., `PATH_NOT_INCLUDED` under `InclusionProof.verify(trustBase, ...)`. Applies ONLY when `localVersion == 0` (wallets that have never successfully published). OR
@@ -875,11 +1037,13 @@ v1 implementations MAY omit the override entirely and accept permanent read-only
 
 **10.2.6 Deleted in r3.2.** The r3.1 rule "SET BLOCKED on fresh-install corrupt-payload at cold start" is superseded by the valid-version-continuity rule (§10.3). Corrupt versions are SKIPPED during discovery (§8.2 Phase 3) rather than treated as MITM signals. Any remaining references to §10.2.6 elsewhere in this spec should be read as references to §10.3.
 
-### 10.3 Malformed recovered payload — valid-version continuity (D1)
+### 10.3 Malformed recovered payload — valid-version continuity (D1, H1-refined)
 
-A XOR-decoded payload that fails length-prefix bounds, `isValidCid`, IPFS fetch, or CAR deserialization (any of the conditions 2–5 in §8.2's "valid version" definition) is NOT treated as a MITM signal. Such versions are permanent SMT residue that the pointer layer **semantically ignores**.
+A XOR-decoded payload that fails length-prefix bounds, `isValidCid`, or CAR deserialization — or whose fetched CAR bytes fail content-address verification (CID hash ≠ bytes digest) — is `SEMANTICALLY_INVALID` in the H1 classification and is NOT treated as a MITM signal. Such versions are permanent SMT residue that the pointer layer **semantically ignores**.
 
-**Discovery rule.** Invalid versions are SKIPPED during discovery (§8.2 Phase 3 walk-back). The pointer layer considers the latest VALID version authoritative.
+**Reconciliation with §10.7 (H1).** A version whose CAR cannot be fetched due to transient IPFS gateway outage is DIFFERENT: it is classified `TRANSIENT_UNAVAILABLE`, NOT `SEMANTICALLY_INVALID`, and Phase 3 DOES NOT walk past it. `TRANSIENT_UNAVAILABLE` propagates up as `AGGREGATOR_POINTER_CAR_UNAVAILABLE` so §10.7 handles it correctly: the wallet waits for gateways to recover, or follows the `acceptCarLoss()` protocol in §10.7.1.
+
+**Discovery rule.** `SEMANTICALLY_INVALID` versions are SKIPPED during discovery (§8.2 Phase 3 walk-back). The pointer layer considers the latest VALID version authoritative. `TRANSIENT_UNAVAILABLE` versions are NOT skipped; they surface up.
 
 **Publish rule.** Publishing a NEW valid version at `latest_valid_V + 1` is legitimate and does NOT require resolving the intermediate corrupt versions. The next legitimate publisher simply bumps `localVersion` from the latest valid version and proceeds. Each client performs valid-version continuity independently; **no inter-client coordination is needed**.
 
@@ -911,16 +1075,29 @@ For deployments wanting stronger guarantees, cross-check against multiple aggreg
 
 ### 10.7 CAR unavailable after successful recovery
 
-**Scenario.** After Phase 2 discovery returns `V_true > 0` AND the CID decoded in §8.5 passes `isValidCid` AND `InclusionProof.verify(trustBase, ...)` returned `OK` for both sides, the caller invokes `fetchFromIpfs(cid)`. All configured IPFS gateways return 404 / unreachable / time out under `MAX_CAR_FETCH_MS`. The CID is provably pinned at `V_true` by a trustlessly-verified inclusion proof, but the bundle bytes are not retrievable.
+**Scenario.** After Phase 2 discovery returns a `V_true > 0` AND the CID decoded in §8.5 passes `isValidCid` AND `InclusionProof.verify(trustBase, ...)` returned `OK` for both sides, the caller invokes `fetchFromIpfs(cid)`. All configured IPFS gateways return 404 / unreachable / 5xx / time out under the H10 progress-rate budget. The CID is provably pinned at `V_true` by a trustlessly-verified inclusion proof, but the bundle bytes are not retrievable right now.
 
 **Behavior.** The pointer layer MUST:
 
 1. Raise `AGGREGATOR_POINTER_CAR_UNAVAILABLE` to the caller.
 2. NOT advance `localVersion`. Treat `V_true` as known-but-uningested.
-3. Refuse all subsequent `publish()` calls until EITHER the CAR becomes fetchable on retry, OR the caller invokes an explicit operator override `acceptCarLoss(version)` (§13) with user consent. The override MUST emit `pointer:car_loss_accepted { version }` telemetry.
+3. Refuse all subsequent `publish()` calls until EITHER the CAR becomes fetchable on retry, OR the caller invokes the `acceptCarLoss(version)` protocol in §10.7.1 with full operator consent.
 4. Emit a `pointer:recover_car_unavailable { version, cid }` event for UI surfacing.
 
-**Why this is distinct from §10.2 BLOCKED.** §10.2 BLOCKED covers "aggregator unreachable → can't discover `V_true`". §10.7 CAR-unavailable covers "aggregator reachable, `V_true` discovered and verified, but the IPFS bundle itself can't be fetched". Advancing `localVersion` past an unfetchable bundle would silently replace legitimate remote history the moment fetch becomes possible again — a data-loss path. The caller opts into that loss only through `acceptCarLoss(version)`.
+**Why this is distinct from §10.2 BLOCKED.** §10.2 BLOCKED covers "aggregator unreachable → can't discover `V_true`". §10.7 CAR-unavailable covers "aggregator reachable, `V_true` discovered and verified, but the IPFS bundle itself can't be fetched". Advancing `localVersion` past an unfetchable bundle would silently replace legitimate remote history the moment fetch becomes possible again — a data-loss path. The caller opts into that loss only through the §10.7.1 protocol below.
+
+### 10.7.1 `acceptCarLoss` discipline (H7)
+
+`acceptCarLoss(version)` MUST NOT silently advance `localVersion`. The earlier v3.2 semantics ("advance localVersion past unfetchable bundle") could lose tokens that existed ONLY in the lost bundle. The H7 protocol closes this gap:
+
+1. **Capability gate.** Requires `Sphere.init({ allowOperatorOverrides: true })`. Naïve consumers cannot stumble into data loss.
+2. **Prior persistent-retry exhaustion (wall-clock enforced).** At least `CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS` (= 12) attempts across ALL configured gateways at 1-hour intervals over `CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS` (= 24 h) must have elapsed. Implementations MUST enforce the wall-clock duration by persisting attempt timestamps to local storage so the duration is preserved across restarts.
+3. **Peer-availability check.** Before advancing, emit `pointer:car_loss_pending { version, retriesRemaining, peerDiscoveryActive }` and poll OrbitDB gossipsub / Nostr for responders advertising this wallet's bundle for `POINTER_PEER_DISCOVERY_MS` (= 10 min). If ANY peer responds with a matching bundle, the CAR is NOT definitively lost; ABORT `acceptCarLoss` with `pointer:car_loss_aborted_peer_found { version, peer }` and resume fetch attempts.
+4. **MANDATORY republish BEFORE advance.** On confirmed total unavailability, the wallet MUST IMMEDIATELY republish its current local OpLog state as a fresh bundle at `max(localVersion, version) + 1`, BEFORE advancing past `version`. This closes the "tokens only in the lost bundle" gap: if any local OpLog entries exist that weren't in the lost bundle, they are anchored in the new publish. If no new OpLog entries exist, an empty republish still establishes a recovery point.
+5. **Advance only after republish.** Only AFTER the republish succeeds does `localVersion` advance to the republished version.
+6. **Telemetry.** Emit `pointer:car_loss_accepted { version, republishedCID, republishedAt }`.
+
+**UI requirement.** The override MUST be presented to the user with the warning: *"Tokens added on other devices that only exist in the lost bundle will be permanently unrecoverable from this device. Consider waiting for network recovery or checking if other devices have this data."*
 
 ### 10.8 Recovery bail on corrupt streak (D1)
 
@@ -964,23 +1141,31 @@ This is a **distinct** error from `AGGREGATOR_POINTER_CORRUPT`. It indicates eit
 
     Additionally, **discovery probe-sequence fingerprint (C7).** The sequence of `(v, side)` request-IDs probed during recovery (§8.2 Phase 1 exponential + Phase 2 binary-search + Phase 3 walk-back) is a deterministic function of `(V_true, localVersion, {corrupt-version set})`. An aggregator operator or on-path observer who logs probe IDs across sessions can correlate two sessions from the same wallet as "same probe signature" even when the wallet uses different IP addresses, Tor exit nodes, or mirror rotations. This is a stronger clustering signal than `signingPubKey` alone (which already leaks across A/B at the same `v`; see bullet 4 above) because it ties together sessions separated in time. Mitigations (deferred to v2): (a) randomize the Phase 1 exponential base — e.g., start `hi = DISCOVERY_INITIAL_VERSION + random_jitter()` where `random_jitter` is a uniform draw with variance comparable to the expected bin-search depth; (b) insert decoy probes at random versions during discovery; (c) probe via a small anonymity set of pointer-layer identities rotated per session. None of these are required for v1 ship; document as a known limitation that the §13 `getProbeFingerprint()` API may surface to UIs.
 
-11. **Retry-rejected ciphertexts are sensitive.** A ciphertext computed for `(v, side)` that the wallet submits and the aggregator rejects with `REQUEST_ID_EXISTS` (because another device's commit landed first) shares `xorKey_{side, v}` with the committed ciphertext. An attacker who captures BOTH the rejected ciphertext (from local retry buffer, HTTP retry log, process memory, or crash dump) AND the committed ciphertext (from the aggregator) can XOR them to reveal the plaintext differential `partSide_ours XOR partSide_theirs`. Since CID bytes have low entropy in their prefix (varint version, multihash code) and `partA` additionally begins with a 1-byte `cidLen` prefix, this can leak most of both CIDs.
+11. **Retry-rejected ciphertexts are sensitive (H14 — achievable target).** A ciphertext computed for `(v, side)` that the wallet submits and the aggregator rejects with `REQUEST_ID_EXISTS` (because another device's commit landed first) shares `xorKey_{side, v}` with the committed ciphertext. An attacker who captures BOTH the rejected ciphertext AND the committed ciphertext can XOR them to reveal the plaintext differential.
 
-    Implementations MUST:
+    Implementations SHOULD minimize in-memory residence of secret material derived from the mnemonic. JavaScript / TypeScript runtimes offer no guaranteed memory zeroization (GC-managed memory, move-on-minor-GC, immutable strings), so the requirements below are scoped to what is actually achievable at the SDK layer:
 
-    a′. Retry ciphertext residency (C2). During the network-retry loop (§10.1), the same `(v, side)` ciphertext is re-submitted across up to `PUBLISH_RETRY_BUDGET` attempts, each separated by jittered exponential backoff (up to ~8 s cumulatively). Ciphertext bytes held in memory across these retries are attacker-visible via memory dump, swap, or crash-report capture. Implementations MUST therefore either (i) re-derive the ciphertext fresh on each retry from the deterministic keys (`xorKey_{side, v}`, `paddingBytes_v`) and zeroize the previous attempt's backing bytes immediately after the SDK call returns, OR (ii) cap in-memory ciphertext retention to `MAX_CT_RESIDENT_MS` (recommended 500 ms) after which the buffer MUST be zeroized and re-derived if a further retry fires. Ciphertext bytes held in closure state across `await` boundaries MUST NOT live beyond the current retry attempt. This requirement is additive to bullet (a) below (zeroization on `REQUEST_ID_EXISTS`) — (a′) covers the window BEFORE a final response, (a) covers the window AFTER a `REQUEST_ID_EXISTS` response.
+    (a) **Re-derivation discipline — primary defense (normative).** The ciphertext for each retry MUST be freshly derived from the deterministic key material (`xorKey_{side, v}`, `paddingBytes_v`) rather than retained across retries. Deterministic padding (§4.6) guarantees byte-identity across re-derivations, so the aggregator's write-once `requestId` semantics still yield idempotence. Re-derivation is computationally cheap (two HKDF-Expand + one XOR per side) and closes the OTP-reuse window deterministically.
 
-    a. Zeroize rejected ciphertexts **immediately** upon observing `REQUEST_ID_EXISTS` on either side. "Zeroize" means overwriting the backing buffer with zeros before releasing it; it MUST NOT be a no-op on any GC-backed runtime.
-    b. NEVER log the raw ciphertext bytes at any verbosity level — including at debug/trace levels used in CI or development builds. Ciphertext-containing structures MUST be excluded from any serializer used for log emission.
-    c. Treat the following intermediate values as SECRET. They MUST NOT appear in logs, error struct fields, persistent storage outside of the signing identity module, telemetry events, stack traces, or any crash-report capture surface:
+    (b) **Caller-owned buffer zeroization — best effort.** Implementations SHOULD zero-fill `Uint8Array` buffers the CALLER owns (e.g., intermediate ciphertext buffers before they're handed to the SDK) immediately after use. SDK-internal copies (`DataHash._data`, `Authenticator.signature`, `Signature.bytes`, JSON-RPC transport hex strings) are OUT OF SCOPE for this spec — they are not reachable from the caller and are not reliably zeroizable in JS.
+
+    (c) **Runtime-provided protections — recommended where available.** Node.js implementations MAY use `Buffer.allocUnsafeSlow` + `sodium_memzero` for seed-material storage when running in a native-extension-enabled environment. Browsers have no equivalent; accept this limitation.
+
+    (d) **Secret-value denylist (normative).** The following values MUST NOT appear in any log, telemetry event, error message, stack trace, or persistent storage outside the encryption module boundary:
        - `pointerSecret`
-       - `signingSeed`
-       - `xorSeed`
-       - `padSeed`
+       - `signingSeed`, `xorSeed`, `padSeed`
        - `signingService.privateKey`
-    d. RECOMMENDED: wrap the signing identity's private material in a `SecretKey` type that rejects `toString()` / `JSON.stringify()` / the default Node.js `util.inspect` hook / equivalent browser introspection paths.
+       - `walletPrivateKey` (the master key itself)
+       - retry-rejected ciphertext bytes (may leak `xorKey` via differential analysis per the opening paragraph)
+    Ciphertext-containing structures MUST be excluded from any serializer used for log emission. This rule applies at ALL verbosity levels including debug/trace in CI or development builds.
+
+    (e) **Wrapper type (recommended).** Implementations MAY wrap secret-material in a `SecretKey` type whose `toString` / `toJSON` / `util.inspect` hooks return a redaction marker rather than the underlying bytes.
+
+    **Rationale.** The r3.1 "zeroize backing buffer immediately" language was not achievable given SDK-internal copies and immutable hex strings in JS. The H14 rewrite makes (a) the primary defense (re-derivation per retry, cryptographically sound) and treats (b)-(c) as defense-in-depth best effort. The full hardening target — guaranteed memory zeroization requiring native-memory primitives — is deferred to future work.
 
 12. **Denylisted keys (C8).** Implementations SHOULD maintain a denylist of well-known test keys and refuse to bind the pointer layer to any such key in non-test networks. The denylist MUST include at minimum the §14.1 canonical vector (`walletPrivateKey = 0x01 × 32`, checked via `SHA-256(walletPrivateKey) == SHA-256(0x01 × 32)` to avoid storing the raw scalar in the denylist itself). The check occurs at `Profile.init()` time, before any pointer-layer derivation runs, and fires only when `config.network != 'test-vectors'`. Implementations MAY extend the denylist with other well-known public test keys (Bitcoin "1 × 32" vectors, secp256k1 test-suite vectors, etc.) as they become aware of them. A positive denylist hit MUST abort init with a distinct, non-ignorable error; falling back to a warning is explicitly NOT permitted.
+
+    **Note on defense-in-depth (W9).** The client-side runtime check is a policy boundary, not a cryptographic one. An attacker who compiles without the check (or disables it via debugger) can still use the denylisted key. Aggregator-side enforcement — rejecting submissions signed by known test-key pubkeys on non-test networks — is the only cryptographically binding defense and is tracked in §11.13 item (iv). The aggregator team has NOT yet committed to this check; until then, client-side enforcement is defense-in-depth only.
 
 13. **Residual risks documented as trade-offs (v2 work) (D10).** Revision 3.2 fixes all objective bugs surfaced by the r3.1 steelman reviews, but the following trade-offs remain. They are NOT bugs; they are consequences of the scheme's design choices that would require deeper changes (L1 anchoring, governance, protocol redesign) to resolve and are deferred to v2.
 
@@ -1018,8 +1203,18 @@ This is a **distinct** error from `AGGREGATOR_POINTER_CORRUPT`. It indicates eit
 | `AGGREGATOR_POINTER_CAR_TOO_LARGE` | IPFS client returned a CAR exceeding `MAX_CAR_BYTES` during recovery fetch. | §8.5 |
 | `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT` | IPFS client exceeded `MAX_CAR_FETCH_MS` during recovery fetch. | §8.5 |
 | `AGGREGATOR_POINTER_CAR_UNAVAILABLE` | All configured IPFS gateways returned 404 / unreachable despite a trustlessly-verified inclusion proof at `V_true`. Blocks further publishes until retry succeeds or `acceptCarLoss()` is invoked. | §10.7 |
-| `AGGREGATOR_POINTER_CORRUPT_STREAK` | §8.2 Phase 3 walk-back encountered `DISCOVERY_CORRUPT_WALKBACK` consecutive corrupt versions without finding a valid one. Distinct from `AGGREGATOR_POINTER_CORRUPT`. Recover via `acceptCorruptStreak()` (§13). | §8.2, §10.8 |
+| `AGGREGATOR_POINTER_CORRUPT_STREAK` | §8.2 Phase 3 walk-back encountered `DISCOVERY_CORRUPT_WALKBACK` consecutive `SEMANTICALLY_INVALID` versions without finding a valid one. Distinct from `AGGREGATOR_POINTER_CORRUPT`. Recover via `acceptCorruptStreak()` (§13). | §8.2, §10.8 |
 | `SECURITY_ORIGIN_MISMATCH` | OpLog entry rejected because its stamped `originated` tag semantically mismatches its entry type (user-action entry tagged `'system'` or vice versa). Non-retryable; the entry MUST NOT be replicated further. | §10.2.3 |
+| `AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME` | Runtime lacks required mutex primitive (Web Locks API in browser) and cannot provide cross-context mutual exclusion for the publish critical section (H3). | §7.1.1 |
+| `AGGREGATOR_POINTER_PUBLISH_BUSY` | Cross-process / cross-tab mutex contention: lock held by another process or tab across `PUBLISH_RETRY_BUDGET` backoff attempts (H3). | §7.1.1 |
+| `AGGREGATOR_POINTER_TRUST_BASE_STALE` | `InclusionProof.verify` returned `NOT_AUTHENTICATED` and the trust-base epoch refresh could not be completed (rotation suspected but refresh failed or epoch non-monotone) (H5). Distinct from `_UNTRUSTED_PROOF`, which is the adversarial-forgery signal. | §8.4.1 |
+| `AGGREGATOR_POINTER_CERT_PIN_MISMATCH` | Aggregator mirror's TLS cert chain did not match any entry in `MIRROR_CERT_PINS` (H9). | §8.4.3 |
+| `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED` | Bundled mirror list failed integrity check against `MIRROR_LIST_SHA256` (H9). | §8.4.3 |
+| `AGGREGATOR_POINTER_CAR_UNEXPECTED_ENCODING` | CAR fetch response included a `Content-Encoding` header (gzip / deflate / br). CAR format is binary-encoded; compression is rejected as attack surface (H10). | §8.5 |
+| `AGGREGATOR_POINTER_AGGREGATOR_REJECTED` | HTTP 4xx other than 429 (permanent aggregator rejection; distinct from `_REJECTED` which covers the in-band SDK-level `AUTHENTICATOR_VERIFICATION_FAILED` / `REQUEST_ID_MISMATCH` statuses) (W3). | §7.3 |
+| `AGGREGATOR_POINTER_PROTOCOL_ERROR` | JSON parse failure, missing required fields, unknown `SubmitCommitmentStatus` enum value. Fail closed (W3). | §7.3 |
+| `AGGREGATOR_POINTER_WALKBACK_FLOOR` | `acceptCorruptStreak(walkbackLimit)` invocation would cause the effective walk-back floor to cross below `localVersion` (W7). | §13 |
+| `AGGREGATOR_POINTER_CAPABILITY_DENIED` | Operator-override API invoked without the required `Sphere.init({ allowOperatorOverrides: true })` capability flag (W6, H7). | §13 |
 
 ---
 
@@ -1049,13 +1244,26 @@ interface ProfilePointerLayer {
 
   /**
    * Run only the discovery phase (no payload fetch, no XOR-decode, no CID parse).
-   * Errors: AGGREGATOR_POINTER_DISCOVERY_OVERFLOW, _NETWORK_ERROR, _UNTRUSTED_PROOF.
+   * Returns both the latest valid version AND the latest included version
+   * (H4 — caller uses max(validV, includedV) + 1 to skip past corrupt-included
+   * residue when publishing).
+   * Errors: AGGREGATOR_POINTER_DISCOVERY_OVERFLOW, _NETWORK_ERROR, _UNTRUSTED_PROOF,
+   *         _CAR_UNAVAILABLE (on TRANSIENT_UNAVAILABLE classification, H1).
    */
-  discoverLatestVersion(): Promise<Result<number>>
+  discoverLatestVersion(): Promise<Result<{ validV: number; includedV: number }>>
 
   /**
-   * Cheap probe to learn whether the aggregator is reachable right now.
-   * Used by the §10.2 blocking check.
+   * Probe aggregator reachability via a trustlessly-verified exclusion proof.
+   * Implementation (W12): POST getInclusionProof(requestId=HEALTH_CHECK_REQUEST_ID)
+   * where HEALTH_CHECK_REQUEST_ID = SHA-256(bytes_of("profile-pointer-health-check")
+   *                                         || signingPubKey).
+   * Verify the returned exclusion proof via InclusionProof.verify(trustBase, ...).
+   * Returns true iff verify status is PATH_NOT_INCLUDED with isPathValid=true.
+   * Returns false on any network error, verify failure, or timeout
+   * (PROBE_REQUEST_TIMEOUT_MS, W4).
+   * MUST NOT cache results; every call is a live probe. MUST NOT short-circuit
+   * on HTTP response headers alone — full verify is required to defeat
+   * captive-portal / DNS-hijack false positives.
    */
   isReachable(): Promise<boolean>
 
@@ -1073,22 +1281,32 @@ interface ProfilePointerLayer {
   isPublishBlocked(): Promise<boolean>
 
   /**
-   * Operator override for §10.7 CAR-unavailable state.
-   * Accepts the loss of the unfetchable bundle at `version` and unblocks
-   * subsequent publish() calls. Emits `pointer:car_loss_accepted { version }`.
-   * Preconditions:
-   *   - The pointer layer was previously in the CAR-unavailable state for
-   *     this `version` (i.e., `recoverLatest()` returned
-   *     `AGGREGATOR_POINTER_CAR_UNAVAILABLE` for `version`).
-   * Postconditions: localVersion is advanced to `version` and the
-   *                 CAR-unavailable state is cleared. The caller accepts
-   *                 that the remote OpLog content at `version` is now lost
-   *                 from this device's perspective.
+   * Operator override for §10.7 CAR-unavailable state (H7 — republish-before-advance).
+   * Accepts the loss of the unfetchable bundle at `version` ONLY AFTER:
+   *   (1) Capability flag `Sphere.init({ allowOperatorOverrides: true })` is set.
+   *   (2) Persistent-retry window of CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS (24h)
+   *       has elapsed with CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS (12) attempts
+   *       across ALL configured gateways (wall-clock enforced via persisted
+   *       attempt timestamps).
+   *   (3) Peer-availability poll on OrbitDB gossipsub / Nostr for
+   *       POINTER_PEER_DISCOVERY_MS (10 min) returned no peer advertising
+   *       the bundle (otherwise ABORT with pointer:car_loss_aborted_peer_found).
+   *   (4) A fresh bundle is republished at max(localVersion, version) + 1
+   *       BEFORE localVersion advances — closes the "tokens only in the
+   *       lost bundle" gap.
+   * Only AFTER the republish succeeds does localVersion advance.
+   * Emits `pointer:car_loss_accepted { version, republishedCID, republishedAt }`.
+   * Errors:
+   *   - AGGREGATOR_POINTER_CAPABILITY_DENIED if allowOperatorOverrides not set.
+   * UI requirement: present the warning "Tokens added on other devices that
+   *   only exist in the lost bundle will be permanently unrecoverable from
+   *   this device. Consider waiting for network recovery or checking if
+   *   other devices have this data."
    */
   acceptCarLoss(version: number): Promise<Result<void>>
 
   /**
-   * Operator-facing recovery for §7.1.4 / C1 version-jump-clamp failure.
+   * Operator-facing recovery for §7.1.4 / C1 version-jump-clamp failure (W6 — gated).
    * Clears a corrupt `PENDING_VERSION_KEY` marker so publish() can resume.
    * Emits `pointer:marker_cleared { previousMarker: { v, cidHash }, reason: 'user_requested' | 'auto_compacted' }` telemetry.
    * `previousMarker` captures the cleared marker's `v` and `cidHash` (exactly
@@ -1096,10 +1314,23 @@ interface ProfilePointerLayer {
    * `'user_requested'` when invoked via this API and `'auto_compacted'` when
    * the SDK clears a stale marker automatically (e.g., the §7.1.4
    * `previousEntry.v < currentLocalVersion` stale-drop branch).
-   * Preconditions: `AGGREGATOR_POINTER_MARKER_CORRUPT` was observed on
-   *                the most recent publish attempt.
-   * Postconditions: `PENDING_VERSION_KEY` is cleared; subsequent publish
-   *                 attempts re-derive `v` from `localVersion + 1`.
+   *
+   * Preconditions (W6 — tightened):
+   *   - `Sphere.init({ allowOperatorOverrides: true })` capability flag set —
+   *     prevents programmatic invocation by Connect dApps, bugs, or malicious
+   *     code from clearing a legitimate marker mid-publish and triggering
+   *     OTP-reuse.
+   *   - Human-in-loop confirmation via UX layer (synchronous acknowledgment).
+   *   - `AGGREGATOR_POINTER_MARKER_CORRUPT` was observed on the most recent
+   *     publish attempt.
+   * Side effects:
+   *   - Removes PENDING_VERSION_KEY.
+   *   - SETs BLOCKED (requires subsequent verified recovery to CLEAR) — this
+   *     forces the next pass through §10.2.4 CLEAR conditions, closing the
+   *     bypass where clearing a marker alone would resume publish without
+   *     re-verification.
+   * Errors:
+   *   - AGGREGATOR_POINTER_CAPABILITY_DENIED if `allowOperatorOverrides` not set.
    * This API is a manual recovery path — implementations SHOULD surface
    * it to UIs only when a corrupt marker is actually detected, not as a
    * routine option.
@@ -1124,6 +1355,13 @@ interface ProfilePointerLayer {
    * Preconditions:
    *   - The most recent recovery attempt returned
    *     AGGREGATOR_POINTER_CORRUPT_STREAK (§10.8).
+   *   - Sphere.init({ allowOperatorOverrides: true }) capability flag set.
+   *   - W7 floor check: `walkbackLimit` (if provided) MUST NOT cause the
+   *     effective walk-back floor to cross below `localVersion`. That is,
+   *     walk-back from DISCOVERY_INITIAL_VERSION goes down to
+   *     max(0, localVersion). Crossing below `localVersion` is rejected
+   *     with AGGREGATOR_POINTER_WALKBACK_FLOOR — it would walk past
+   *     versions this wallet has already confirmed as its own.
    *
    * Postconditions:
    *   - The next `recoverLatest()` / `discoverLatestVersion()` call runs
@@ -1136,6 +1374,9 @@ interface ProfilePointerLayer {
    *
    * Emits `pointer:corrupt_streak_override_used { walkbackLimit }`
    * telemetry for auditability.
+   *
+   * Cap: implementation-defined safety ceiling (recommend 4096 for the
+   * walkbackLimit parameter).
    *
    * @param walkbackLimit — desired ceiling for this recovery. Omit to
    *   use the implementation's safety ceiling directly.
@@ -1238,6 +1479,8 @@ Most revision-1 questions are resolved:
 | O-4 | Decide whether `isValidCid` accepts codecs beyond sha2-256 multihashes (track upstream `profile/ipfs-client.ts`). | SDK team | No. |
 | O-5 | BLOCKED state override protocol — confirm whether v1 ships with the opt-in override (§10.2.5) or omits it entirely. | Product / SDK team | **Not blocking.** |
 | O-6 | Mirror URL list for multi-mirror TOFU cross-check — finalize the static mirror list and embed in the Sphere SDK config (referenced from §8.4). | Infra team | **BLOCKING spec sign-off** (r3.1 promoted multi-mirror from RECOMMENDED to MANDATORY; without the finalized list the MANDATORY rule cannot be implemented). |
+| O-7 | Bundle `MIRROR_LIST_SHA256` and `MIRROR_CERT_PINS` (§3) artifacts in the SDK release pipeline. `MIRROR_LIST_SHA256` MUST be computed from the finalized mirror list in a separate build artifact for tamper-detection (H9 §8.4.3 item 4). `MIRROR_CERT_PINS` MUST be refreshed on each cert rotation (quarterly at most). | Infra team | **BLOCKING impl-PR merge.** Without computed values the MANDATORY TLS discipline is not runnable. |
+| O-8 | **SDK compatibility assertion (W8).** The pointer spec depends byte-precisely on `state-transition-sdk` primitives (§4.3, §4.7, §6.4, §8.3). Implementation PR MUST: (1) pin the SDK version range in `package.json` (e.g., `^1.6.1 <2.0.0`); (2) add a CI canary that computes canonical test vector #1 against the pinned SDK version and fails the build if output bytes change; (3) document the SDK-upgrade protocol: a major-version bump requires re-running the full test-vector suite plus cross-implementation verification. | SDK team | **BLOCKING impl-PR merge.** |
 
 ### 15.2 Reviewer sign-off checklist
 
@@ -1260,3 +1503,4 @@ Revision 3.2 is **Stable** only after the following checkboxes are explicitly ti
 | 3 | **Steelman review fixes F1–F11 per commit b9545ab.** F1: `.proof.` → `.inclusionProof.` throughout probe/recovery pseudocode. F2: split `(EXISTS, EXISTS)` outcome row into idempotent-replay vs genuine-conflict branches based on `pending_version` marker match. F3: hardened §7.1 pending-version discipline (exclusive mutex, per-wallet scoping, durability, rollback-safe `v` bump, integrity-checked `cidHash`, marker-clear atomicity). F4: formalized §10.2 BLOCKED state (persistent flag, categorical-error SET conditions, strict CLEAR conditions, user-originated-write definition, optional per-call operator override). F5: async-`digest()` convention footnote added to §4 header. F7: multi-mirror TOFU cross-check added to §8.4; `AGGREGATOR_POINTER_TRUST_BASE_DIVERGENCE` registered in §12. F8: retry-rejected-ciphertext secrecy requirements added to §11.11 (zeroize, no-log, `SecretKey` wrapper). F9: canonical test-vector inputs inlined for vectors #1 (all-0x01 key, CIDv1-raw of "hello world") and #2 (`SHA-256("uxf-profile-pointer-test-2")`). F10: O-1 demoted to "blocking on impl-PR merge only"; O-5 (BLOCKED override), O-6 (mirror list) added. F11: `isPublishBlocked(): boolean` added to §13 API surface. Additional constant registrations in §3: `MUTEX_KEY`, `PENDING_VERSION_KEY`, `BLOCKED_FLAG_KEY`. Additional error code: `AGGREGATOR_POINTER_MARKER_CORRUPT`. Section numbering preserved where possible; §14 added subsections §14.4 / §14.5 without renumbering the existing §14.3. |
 | 3.1 | (2026-04-21) **Hardening pass applying steelman findings on v3.** C1: marker version-jump clamp (`MARKER_MAX_JUMP = 1024`) added to §7.1.4 to block single-write brick attacks; C2: retry-window ciphertext zeroization requirement added to §11.11(a′) with `MAX_CT_RESIDENT_MS = 500`; C3: multi-mirror TOFU cross-check promoted from RECOMMENDED to **MANDATORY** in §8.4 with `MIN_MIRROR_COUNT = 2`, and fresh-install corrupt-payload BLOCKED rule added as §10.2.6; C4: CAR fetch caps `MAX_CAR_BYTES = 100 MiB` and `MAX_CAR_FETCH_MS = 60 s` added to §3 and §8.5; C5: CAR-unavailable persistent state formalized as §10.7 with `acceptCarLoss()` override API; C6: `originated` metadata tag replaces the `signedBy` heuristic for §10.2.3 user-originated-write definition; C7: probe-sequence fingerprint disclosure documented in §11 bullet 10 with v2 mitigation sketches; C8: public-test-key WARNING block added to §14.1 and denylisted-keys policy registered as §11.12; C9: §13 API surface extended with `acceptCarLoss()`, `clearPendingMarker()`, `getProbeFingerprint()`; `isPublishBlocked()` signature made `Promise<boolean>`; C10: arch-doc name alignment tracked separately (spec unchanged; see arch-doc change log); C11: async-await footnote in §4 expanded to cover `SigningService.createFromSecret`, `RequestId.createFromImprint/create`, `Authenticator.create`, `AggregatorClient` methods; C12: §8.4 proof-variable identifier ambiguity resolved via §8.1 `resp.inclusionProof.verify(...)` convention; C13: `DataHasher(X) ≡ new DataHasher(X)` convention note added to §4; C15: new constants `MARKER_MAX_JUMP`, `MAX_CT_RESIDENT_MS`, `MIN_MIRROR_COUNT`, `MAX_CAR_BYTES`, `MAX_CAR_FETCH_MS` registered in §3; new error codes `AGGREGATOR_POINTER_CAR_TOO_LARGE`, `AGGREGATOR_POINTER_CAR_FETCH_TIMEOUT`, `AGGREGATOR_POINTER_CAR_UNAVAILABLE` registered in §12; C16: O-6 promoted to BLOCKING spec sign-off. No byte-level formulas or pre-existing constants changed. |
 | 3.2 | (2026-04-21) **Apply steelman findings on r3.1.** **D1 valid-version-continuity** — corrupt versions are SKIPPED during discovery (§8.2 Phase 3 walk-back) rather than treated as MITM signals; REPLACES r3.1 §10.2.6 BLOCKED-on-corrupt rule entirely (§10.2.6 deleted, §10.3 rewritten, new §10.8 recovery-bail); new constant `DISCOVERY_CORRUPT_WALKBACK = 64` and new error `AGGREGATOR_POINTER_CORRUPT_STREAK`; publishing a NEW valid version at `latest_valid_V + 1` after a corrupt one is legitimate and needs no inter-client coordination. **D2** §10.2.2(4) verb aligned with arch §6.7 ("already been attempted AND failed"). **D3** §8.4 single-mirror-TOFU paragraph rewritten to describe multi-mirror degraded mode only; contradiction with adjacent MANDATORY rule resolved. **D4** §7.1.4 `MARKER_MAX_JUMP = 1024` rationale tightened with three-factor breakdown (PUBLISH_RETRY_BUDGET, cohort contention, operational headroom) and documented trade-off of NOT catching subtle same-window tampering. **D5** §10.2.3 semantic `originated`-tag re-validation added to close the tag-forgery bypass (user-action entry types MUST be `'user'`, system entry types MUST be `'system'`, mismatches rejected); new error `SECURITY_ORIGIN_MISMATCH`. **D6** §8.5 streaming byte-count enforcement mandated; `Content-Length` header cannot be sole cap enforcement. **D7** `pointer:marker_cleared` telemetry payload canonicalized: `{ previousMarker: { v, cidHash }, reason: 'user_requested' \| 'auto_compacted' }`. **D8** version heading bumped to 3.2. **D9** this row. **D10** new §11.13 residual-risk block documenting five trade-offs as v2 work: bundled mirror list as centralized trust root; MANDATORY multi-mirror as availability risk; backup/restore triggering MARKER_CORRUPT; denylist governance; corrupt streak as legitimate-use DoS vector. **D11** new API `acceptCorruptStreak(walkbackLimit?)` for §10.8 recovery bail. No byte-level formulas or pre-existing constants changed. |
+| 3.3 | (2026-04-20) **Final hardening pass — closes 14 critical + 12 warning findings from 6-agent multi-domain review** (security, code, concurrency, network, unicity-architect, aggregator, SDK-integration). **H1** §8.2 Phase 3 walk-back now distinguishes `SEMANTICALLY_INVALID` (skip) from `TRANSIENT_UNAVAILABLE` (halt + `AGGREGATOR_POINTER_CAR_UNAVAILABLE`) via new `classifyVersion(v)` helper; closes the transient-IPFS-outage orphaning path. **H2** §8.1 probe predicate changed from `aIncluded AND bIncluded` (non-monotonic) to `aIncluded OR bIncluded` (monotonic, matches invariant I-1); Phase 3 still enforces the stricter both-sides check. **H3** §7.1.1 mutex primitives named (Web Locks API in browser, `proper-lockfile` in Node); `MUTEX_KEY` now keyed on `hex(signingPubKey)` for cross-tab / cross-process coverage; new errors `AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME` and `AGGREGATOR_POINTER_PUBLISH_BUSY`. **H4** §8.2 `findLatestValidVersion()` return shape becomes `{ validV, includedV }`; §9.2 reconciliation targets `max(validV, includedV) + 1` to skip past corrupt-included residue and break the RETRY_EXHAUSTED deadlock. **H5** §8.4.1 trust-base rotation handling added (distinguish rotation from forgery via epoch comparison, multi-mirror refresh, monotone epoch enforcement); new error `AGGREGATOR_POINTER_TRUST_BASE_STALE`. **H6** §8.4.2 mandates SHARED `RootTrustBase` with L4 `PaymentsModule` / OracleProvider; closes asymmetric-trust MITM path. **H7** §10.7.1 `acceptCarLoss` discipline rewritten to REQUIRE persistent-retry (`CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS` / `_TOTAL_DURATION_MS` with wall-clock enforcement across restarts), peer-availability poll (`POINTER_PEER_DISCOVERY_MS`), AND mandatory republish BEFORE advance — closes "tokens only in the lost bundle" gap. **H8** §7.3 REJECTED outcome now BURNS `v` (persist `localVersion = v`) to prevent OTP-reuse on retry at same v with different ciphertext. **H9** §8.4.3 TLS discipline added (TLS ≥ 1.3, cert pinning via `MIRROR_CERT_PINS`, CA diversity, IP diversity, mirror-list integrity via `MIRROR_LIST_SHA256`); new errors `AGGREGATOR_POINTER_CERT_PIN_MISMATCH`, `AGGREGATOR_POINTER_MIRROR_LIST_TAMPERED`. **H10** §3 + §8.5 CAR fetch timeout rewritten as progress-rate: `MAX_CAR_FETCH_INITIAL_RESPONSE_MS = 10s`, `MAX_CAR_FETCH_STALL_MS = 30s`, `MAX_CAR_FETCH_TOTAL_MS = 300s`, `MAX_CAR_FETCH_RETRY = 3` per gateway with HTTP Range resume, `Content-Encoding` rejected; former `MAX_CAR_FETCH_MS = 60s` superseded; new error `AGGREGATOR_POINTER_CAR_UNEXPECTED_ENCODING`. **H12** §3 `PROFILE_POINTER_HKDF_INFO` byte count corrected from 32 to 33 (actual ASCII length of `"uxf-profile-aggregator-pointer-v1"`). **H13** §7.1.4 rewritten to PRESERVE the idempotent-retry case (same v AND same cidHash → keep v and re-derive deterministic payload) alongside the rollback-safe bump; reconciles with arch §7.2. **H14** §11.11 zeroization relaxed to achievable JS target: (a) re-derivation discipline as PRIMARY defense (normative), (b) caller-owned zeroization as best-effort, (c) runtime-specific hardening where available, (d) secret-value denylist normative, (e) `SecretKey` wrapper recommended. Warning fixes: **W1** §4.1 walletPrivateKey pinned to BIP32 master. **W2** §8.5 HTTPS-only gateway pool mandated. **W3** §7.3 HTTP status-code outcome rows added (429/503 Retry-After, 5xx backoff, 4xx permanent, JSON-RPC ConcurrencyLimit, protocol-error fail-closed); new error `AGGREGATOR_POINTER_AGGREGATOR_REJECTED`, `AGGREGATOR_POINTER_PROTOCOL_ERROR`. **W4** §3 request timeouts `PUBLISH_REQUEST_TIMEOUT_MS`, `PROBE_REQUEST_TIMEOUT_MS`, `IPNS_RESOLVE_TIMEOUT_MS`. **W5** §7.1.7 identity-capture discipline during critical section. **W6** §13 `clearPendingMarker()` gated on `allowOperatorOverrides` and now SETs BLOCKED. **W7** §13 `acceptCorruptStreak` walk-back floor enforced (never below `localVersion`); new error `AGGREGATOR_POINTER_WALKBACK_FLOOR`. **W8** §15 O-8 SDK version pinning + CI canary. **W9** §11.12 note: client-side denylist is defense-in-depth only; aggregator-side enforcement is the cryptographic boundary. **W11** §10.2.3.1 originated-tag migration inventory (PaymentsModule, AccountingModule, SwapModule, CommunicationsModule, profile-token-storage-provider). **W12** §13 `isReachable()` specified via verified exclusion proof on `HEALTH_CHECK_REQUEST_ID` (no header short-circuit). Also: new error `AGGREGATOR_POINTER_CAPABILITY_DENIED` for operator-override APIs; §14 canonical test vectors unchanged; byte-level formulas (§4 derivations, §5 payload, §6 commitment, §7.1 marker structure) UNCHANGED. Spec is canonical; arch narrates. |
