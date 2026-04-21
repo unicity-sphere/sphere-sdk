@@ -415,22 +415,15 @@ The returned `Authenticator` fields:
 ### 6.5 Submission request
 
 ```
-commitment_{side, v} = new SubmitCommitmentRequest(
+response = await aggregatorClient.submitCommitment(
   /* requestId       */ requestId_{side, v},
   /* transactionHash */ transactionHash_{side, v},
   /* authenticator   */ authenticator_{side, v},
   /* receipt         */ false
 )
-
-response = await aggregatorClient.submitCommitment(
-  requestId_{side, v},
-  transactionHash_{side, v},
-  authenticator_{side, v},
-  /* receipt */ false
-)
 ```
 
-The RPC method name and JSON body layout are owned by the SDK (see `AggregatorClient.submitCommitment` and `SubmitCommitmentRequest.toJSON`). This spec does not re-specify them.
+The RPC method name, positional argument order, and JSON body layout are owned by the SDK (see `AggregatorClient.submitCommitment` and `SubmitCommitmentRequest.toJSON`). This spec does not re-specify them. Note: `AggregatorClient.submitCommitment` accepts the four fields positionally; do NOT construct a standalone `SubmitCommitmentRequest` instance to pass — the client's method signature takes `(requestId, transactionHash, authenticator, receipt)` directly.
 
 `response.status` takes one of:
 
