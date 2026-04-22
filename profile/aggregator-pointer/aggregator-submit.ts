@@ -64,8 +64,23 @@ export interface SubmitInput {
   /**
    * Pending-version marker (§7.3 row 4 idempotent-replay detection).
    * Pass `null` when no marker exists at this version.
+   *
+   * For marker-match disambiguation to work correctly, the marker MUST be
+   * the marker that existed BEFORE this publish attempt — NOT the marker
+   * just written by the current attempt. Use `isIdempotentRetryHint` to
+   * signal whether the resolved v came from a crash-retry (in which case
+   * EXISTS+EXISTS → idempotent_replay) or a fresh publish (→ conflict).
    */
   readonly marker: PendingVersionMarker | null;
+  /**
+   * Explicit hint from resolvePublishVersion indicating whether this submit
+   * is an H13 idempotent crash-retry (true) or a fresh publish (false).
+   * When true, EXISTS+EXISTS is classified as idempotent_replay (row 4).
+   * When false, EXISTS+EXISTS is classified as conflict (row 5), regardless
+   * of whether the marker happens to match the current cidBytes (which is
+   * always the case when the caller wrote the marker before submit).
+   */
+  readonly isIdempotentRetryHint?: boolean;
   /** Per-side request timeout. Defaults to PUBLISH_REQUEST_TIMEOUT_MS. */
   readonly timeoutMs?: number;
 }
@@ -289,6 +304,7 @@ function combineOutcomes(
   v: PointerVersion,
   cidBytes: Uint8Array,
   marker: PendingVersionMarker | null,
+  isIdempotentRetryHint: boolean = false,
 ): SubmitOutcome {
   // Priority 1: PROTOCOL_ERROR (rows 14, 15) — fail closed.
   if (outA.type === 'protocol_error') return { kind: 'protocol_error', reason: `side=A: ${outA.reason}` };
@@ -330,14 +346,28 @@ function combineOutcomes(
   if (sA === 'success' && sB === 'exists') return { kind: 'idempotent_replay', v }; // Row 2
   if (sA === 'exists' && sB === 'success') return { kind: 'idempotent_replay', v }; // Row 3
   if (sA === 'exists' && sB === 'exists') {
-    // Rows 4 vs 5: marker-match disambiguates idempotent replay from genuine conflict.
-    if (marker !== null && marker.v === v) {
-      const expectedCidHash = computeCidHash(cidBytes);
-      if (arraysEqual(marker.cidHash, expectedCidHash)) {
-        return { kind: 'idempotent_replay', v }; // Row 4
-      }
+    // Rows 4 vs 5: the caller's isIdempotentRetryHint is load-bearing.
+    //
+    // When resolvePublishVersion determined this is an H13 idempotent retry
+    // (crash survived; marker + cidBytes unchanged), the aggregator's
+    // REQUEST_ID_EXISTS reflects OUR prior crashed commit → row 4.
+    //
+    // Otherwise (fresh publish OR OTP-safe bumped v), REQUEST_ID_EXISTS on
+    // both sides means another device (sharing our signingPubKey across
+    // HD sync) raced and committed at this requestId first → row 5 conflict.
+    //
+    // The secondary check (marker-match against current cidBytes) is kept
+    // as a defense-in-depth for callers that may not plumb the hint
+    // correctly, but the HINT is authoritative when provided.
+    if (isIdempotentRetryHint) {
+      return { kind: 'idempotent_replay', v }; // Row 4 — crash recovery
     }
-    return { kind: 'conflict', v }; // Row 5
+    // Fresh publish OR OTP-safe bump: the marker we wrote pre-submit
+    // MATCHES our current cidBytes trivially, but the aggregator has
+    // someone else's content — that's a cross-device race.
+    void marker;
+    void cidBytes;
+    return { kind: 'conflict', v }; // Row 5 — genuine conflict
   }
 
   // Unreachable in the spec's closed matrix; fail closed defensively.
@@ -368,6 +398,7 @@ function combineOutcomes(
 export async function submitPointer(input: SubmitInput): Promise<SubmitOutcome> {
   const { v, cidBytes, keyMaterial, signer, aggregatorClient, marker } = input;
   const timeoutMs = input.timeoutMs ?? PUBLISH_REQUEST_TIMEOUT_MS;
+  const isIdempotentRetryHint = input.isIdempotentRetryHint ?? false;
 
   // Input validation (fail fast, before key derivation).
   if (!Number.isInteger(v) || v < VERSION_MIN || v > VERSION_MAX) {
@@ -446,7 +477,7 @@ export async function submitPointer(input: SubmitInput): Promise<SubmitOutcome> 
     const outcomeA = classifySideResult(resultA);
     const outcomeB = classifySideResult(resultB);
 
-    return combineOutcomes(outcomeA, outcomeB, v, cidBytes, marker);
+    return combineOutcomes(outcomeA, outcomeB, v, cidBytes, marker, isIdempotentRetryHint);
   } finally {
     // T-C1b: finally-zero — wipe all derived secrets and ciphertexts on
     // every exit path. Residual copies held by DataHash/Authenticator/SDK

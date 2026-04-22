@@ -17,7 +17,7 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes as nobleHexToBytes } from '@noble/hashes/utils.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
-import { MARKER_MAX_JUMP, VERSION_MIN, VERSION_MAX } from './constants.js';
+import { CID_MAX_BYTES, MARKER_MAX_JUMP, VERSION_MIN, VERSION_MAX } from './constants.js';
 import type { FlagStore } from './flag-store.js';
 import type { PendingVersionMarker, PointerVersion } from './types.js';
 
@@ -111,8 +111,14 @@ export async function writeMarker(
   cidBytes: Uint8Array,
 ): Promise<void> {
   assertVersionInRange(v, 'writeMarker');
-  if (cidBytes.length !== 32) {
-    throw new RangeError(`writeMarker: cidBytes must be exactly 32 bytes; got ${cidBytes.length}`);
+  // cidBytes is the full CID (1..CID_MAX_BYTES bytes); marker stores its
+  // SHA-256 hash. The length check enforces the same envelope as the
+  // payload codec (§4.6) so a marker write cannot store a CID that would
+  // later fail the publish-time CID_TOO_LARGE guard.
+  if (cidBytes.length < 1 || cidBytes.length > CID_MAX_BYTES) {
+    throw new RangeError(
+      `writeMarker: cidBytes length must be in [1, ${CID_MAX_BYTES}]; got ${cidBytes.length}`,
+    );
   }
   const rec: MarkerRecord = {
     v,
@@ -141,11 +147,15 @@ export interface MarkerResolution {
 
 /**
  * Resolve the publish version given the current marker, currentLocalVersion,
- * and the CID of the bundle being published.
+ * an optional caller-supplied candidate v (H4 target), and the CID.
  *
- * Implements SPEC §7.1.4 + H13 logic:
+ * Implements SPEC §7.1.4 + H13 logic. When `candidateV` is provided, it
+ * becomes the default publish target when the marker does NOT override
+ * (no marker, stale marker, matching-cid idempotent retry). This lets
+ * reconcile-algorithm target `max(validV, includedV) + 1` rather than
+ * always `currentLocalVersion + 1`.
  *
- *   Case 1 (H13 idempotent retry): marker.v === currentLocalVersion+1
+ *   Case 1 (H13 idempotent retry): marker.v === candidateV
  *     AND cidHash matches newCidBytes → re-use marker.v, isIdempotentRetry = true
  *
  *   Case 2 (marker stale / already completed): marker.v <= currentLocalVersion
@@ -154,32 +164,32 @@ export interface MarkerResolution {
  *   Case 3 (MARKER_MAX_JUMP exceeded): marker.v - currentLocalVersion > MARKER_MAX_JUMP
  *     → throw MARKER_CORRUPT
  *
- *   Case 4 (OTP-safe bump): cidHash mismatch on marker.v → advance PAST marker.v
- *     when marker.v == currentLocalVersion+1 (may have emitted ciphertext at that v);
- *     advance to currentLocalVersion+1 otherwise (fresh v, safe)
+ *   Case 4 (OTP-safe bump): cidHash mismatch on marker → advance PAST marker.v
+ *     when marker.v == candidateV (may have emitted ciphertext at that v);
+ *     use max(candidateV, marker.v) + 1 otherwise (fresh v, safe)
  *
- *   Case 5 (no marker): v = currentLocalVersion + 1
+ *   Case 5 (no marker): v = candidateV
  */
 export async function resolvePublishVersion(
   store: FlagStore,
   currentLocalVersion: PointerVersion,
   newCidBytes: Uint8Array,
+  candidateV?: PointerVersion,
 ): Promise<MarkerResolution> {
+  const target = candidateV ?? ((currentLocalVersion + 1) as PointerVersion);
   const marker = await readMarker(store);
 
   if (marker === null) {
-    const v = currentLocalVersion + 1 as PointerVersion;
-    assertVersionInRange(v, 'resolvePublishVersion(no-marker)');
-    return { v, isIdempotentRetry: false, wasCompacted: false };
+    assertVersionInRange(target, 'resolvePublishVersion(no-marker)');
+    return { v: target, isIdempotentRetry: false, wasCompacted: false };
   }
 
   // Case 2: stale marker (crash happened before localVersion was persisted,
   // but after a previous successful publish cleared the marker).
   if (marker.v <= currentLocalVersion) {
     await clearMarker(store);
-    const v = currentLocalVersion + 1 as PointerVersion;
-    assertVersionInRange(v, 'resolvePublishVersion(stale-compact)');
-    return { v, isIdempotentRetry: false, wasCompacted: true };
+    assertVersionInRange(target, 'resolvePublishVersion(stale-compact)');
+    return { v: target, isIdempotentRetry: false, wasCompacted: true };
   }
 
   const jump = marker.v - currentLocalVersion;
@@ -199,23 +209,24 @@ export async function resolvePublishVersion(
     marker.cidHash.length === newCidHash.length &&
     marker.cidHash.every((b, i) => b === newCidHash[i]);
 
-  if (marker.v === currentLocalVersion + 1 && cidHashMatch) {
+  if (marker.v === target && cidHashMatch) {
     return { v: marker.v, isIdempotentRetry: true, wasCompacted: false };
   }
 
   // Case 4: cidHash mismatch — OTP-safe bump.
   //
-  // If marker.v === currentLocalVersion + 1, a prior crashed publish attempt
-  // may have already emitted a ciphertext to the aggregator derived from
-  // xorKey_{side, marker.v}.  Reusing marker.v with a different plaintext
-  // would XOR under the same key, collapsing the one-time-pad to
-  //   C_old XOR C_new = P_old XOR P_new.
-  //
+  // If marker.v === target, a prior crashed publish attempt may have already
+  // emitted a ciphertext to the aggregator derived from xorKey_{side, marker.v}.
+  // Reusing marker.v with a different plaintext would XOR under the same key,
+  // collapsing the one-time-pad to C_old XOR C_new = P_old XOR P_new.
   // We therefore advance PAST marker.v to guarantee a fresh xorKey.
-  // For any other jump (marker.v > currentLocalVersion + 1), the candidate
-  // v is currentLocalVersion + 1 which is already fresh (not marker.v), safe.
+  //
+  // For marker.v > target, use max(target, marker.v) + 1 — advances past
+  // the marker (safe) while respecting the caller's H4 target.
   const safeV =
-    marker.v === currentLocalVersion + 1 ? marker.v + 1 : currentLocalVersion + 1;
+    marker.v === target
+      ? marker.v + 1
+      : Math.max(target, marker.v) + 1;
   assertVersionInRange(safeV, 'resolvePublishVersion(otp-bump)');
   return { v: safeV as PointerVersion, isIdempotentRetry: false, wasCompacted: false };
 }

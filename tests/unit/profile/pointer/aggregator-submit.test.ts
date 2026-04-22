@@ -202,7 +202,8 @@ describe('submitPointer — §7.3 state machine', () => {
     expect(out).toEqual({ kind: 'idempotent_replay', v: 7 });
   });
 
-  it('Row 4: EXISTS + EXISTS with marker match → idempotent_replay', async () => {
+  it('Row 4: EXISTS + EXISTS with isIdempotentRetryHint=true → idempotent_replay', async () => {
+    // H13 crash-retry: resolvePublishVersion detected idempotent retry; hint=true.
     const { keyMaterial, signer } = await buildFixtures();
     const { client } = mockClient(async () => mockResponse(SubmitCommitmentStatus.REQUEST_ID_EXISTS));
     const marker = { v: 10, cidHash: computeCidHash(VALID_CID) };
@@ -213,8 +214,26 @@ describe('submitPointer — §7.3 state machine', () => {
       signer,
       aggregatorClient: client,
       marker,
+      isIdempotentRetryHint: true,
     });
     expect(out).toEqual({ kind: 'idempotent_replay', v: 10 });
+  });
+
+  it('Row 5: EXISTS + EXISTS with marker-match but hint=false → conflict (hint is authoritative)', async () => {
+    // Critical: pre-submit marker always matches current cidBytes. Hint disambiguates.
+    const { keyMaterial, signer } = await buildFixtures();
+    const { client } = mockClient(async () => mockResponse(SubmitCommitmentStatus.REQUEST_ID_EXISTS));
+    const marker = { v: 10, cidHash: computeCidHash(VALID_CID) };
+    const out = await submitPointer({
+      v: 10,
+      cidBytes: VALID_CID,
+      keyMaterial,
+      signer,
+      aggregatorClient: client,
+      marker,
+      isIdempotentRetryHint: false,
+    });
+    expect(out).toEqual({ kind: 'conflict', v: 10 });
   });
 
   it('Row 5: EXISTS + EXISTS with no marker → conflict', async () => {

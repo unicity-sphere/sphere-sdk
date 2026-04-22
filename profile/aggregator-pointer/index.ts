@@ -77,3 +77,23 @@ export {
   assertAcceptCarLossEligible,
 } from './car-loss-tracker.js';
 export type { CarFetchAttempt, AcceptCarLossGate } from './car-loss-tracker.js';
+
+// Phase D — integration layer
+export { publishOnceAtVersion } from './publish-algorithm.js';
+export type { PublishInput, PublishOutcome } from './publish-algorithm.js';
+export { findLatestValidVersion, computeProbeFingerprint } from './discover-algorithm.js';
+export type { DiscoverInput, DiscoverResult } from './discover-algorithm.js';
+export { reconcileAndPublish } from './reconcile-algorithm.js';
+export type { ReconcileInput, ReconcileOutcome, FetchAndJoinCallback } from './reconcile-algorithm.js';
+export {
+  assertConfigCapabilities,
+  operatorOverridesAllowed,
+  assertOperatorOverridesAllowed,
+} from './config.js';
+export type { PointerLayerConfig } from './config.js';
+export { ProfilePointerLayer } from './ProfilePointerLayer.js';
+export type {
+  ProfilePointerLayerInit,
+  PublishResult,
+  RecoverResult,
+} from './ProfilePointerLayer.js';

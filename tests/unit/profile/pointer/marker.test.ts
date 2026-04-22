@@ -77,11 +77,14 @@ describe('readMarker / writeMarker / clearMarker (T-B2)', () => {
     expect(await readMarker(fs)).toBeNull();
   });
 
-  it('B4: writeMarker rejects cidBytes.length != 32', async () => {
+  it('B4: writeMarker rejects cidBytes outside [1, CID_MAX_BYTES]', async () => {
     const fs = makeFlagStore();
-    await expect(writeMarker(fs, 1, new Uint8Array(31))).rejects.toThrow(RangeError);
-    await expect(writeMarker(fs, 1, new Uint8Array(33))).rejects.toThrow(RangeError);
     await expect(writeMarker(fs, 1, new Uint8Array(0))).rejects.toThrow(RangeError);
+    await expect(writeMarker(fs, 1, new Uint8Array(64))).rejects.toThrow(RangeError);
+    // Valid lengths (anywhere in [1, 63]) must succeed — marker hashes internally.
+    await expect(writeMarker(fs, 1, new Uint8Array(1))).resolves.toBeUndefined();
+    await expect(writeMarker(fs, 2, new Uint8Array(34))).resolves.toBeUndefined();
+    await expect(writeMarker(fs, 3, new Uint8Array(63))).resolves.toBeUndefined();
   });
 
   it('B5: readMarker throws MARKER_CORRUPT for invalid JSON', async () => {
@@ -152,11 +155,12 @@ describe('resolvePublishVersion (T-B2, H13)', () => {
     expect(r.isIdempotentRetry).toBe(false);
   });
 
-  it('rollback-safe bump: cidHash mismatch + marker.v > currentLocal+1 → v = currentLocal + 1', async () => {
+  it('rollback-safe bump: cidHash mismatch + marker.v > currentLocal+1 → v = max(target, marker.v)+1', async () => {
     await writeMarker(fs, 8, CID_A);
-    // marker.v (8) > currentLocal+1 (5+1=6), so candidate v=6 is fresh (not marker.v) — safe.
+    // marker.v (8) > target (default=currentLocal+1=6) → safeV = max(6, 8)+1 = 9
+    // per SPEC §7.1.4: v := max(v, previousEntry.v) + 1
     const r = await resolvePublishVersion(fs, 5, CID_B);
-    expect(r.v).toBe(6);
+    expect(r.v).toBe(9);
     expect(r.isIdempotentRetry).toBe(false);
   });
 
@@ -180,9 +184,10 @@ describe('resolvePublishVersion (T-B2, H13)', () => {
   it('MARKER_MAX_JUMP exactly → does NOT throw (boundary)', async () => {
     const boundaryV = 5 + MARKER_MAX_JUMP;
     await writeMarker(fs, boundaryV, CID_A);
-    // cidHash mismatch → rollback-safe bump (not idempotent), but not CORRUPT
+    // cidHash mismatch → rollback-safe bump: v = max(target=6, marker.v=1029)+1 = 1030
+    // per SPEC §7.1.4. Not CORRUPT because jump <= MARKER_MAX_JUMP.
     const r = await resolvePublishVersion(fs, 5, CID_B);
-    expect(r.v).toBe(6);
+    expect(r.v).toBe(1030);
   });
 });
 
