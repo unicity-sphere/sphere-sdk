@@ -6178,7 +6178,42 @@ export class PaymentsModule {
   // Private: Storage
   // ===========================================================================
 
+  /**
+   * Save-chain single-flight (steelman fix #3 — concurrent-save race).
+   *
+   * Many call sites invoke save() (incoming-transfer handlers, 10-s resolver
+   * tick, manual sync, addToken, removeToken, etc.). Without serialization,
+   * concurrent saves read different snapshots of this.tokens, pin different
+   * CIDs (each with a random IV → different content-address), and race on
+   * OrbitDB LWW. If save A reads `{T1}` and save B reads `{T1,T2}`, but
+   * A's storage.set lands LAST, the OpLog points at A's CID `{T1}`. T2 is
+   * lost forever because V5 tokens are not in TXF storage.
+   *
+   * The single-flight pattern serializes saves through a promise chain:
+   * each save() awaits the previous save's completion before reading
+   * this.tokens. This eliminates the torn-snapshot race.
+   *
+   * Caveat: saves are still independent units — a failure in save N does
+   * not abort save N+1 (we catch to clear the chain state). The chain
+   * guarantees ORDERING, not atomicity.
+   */
+  private _saveChain: Promise<void> = Promise.resolve();
+
   private async save(): Promise<void> {
+    // Chain onto the previous save. Failure in prior save is isolated via
+    // .catch() so it does not block subsequent saves — each save is
+    // independently attempted and reported via logger.
+    const mySave = this._saveChain
+      .catch(() => {
+        // Previous save failed; don't let the error propagate to block us.
+        // The previous save's caller already received the rejection.
+      })
+      .then(() => this._doSave());
+    this._saveChain = mySave;
+    return mySave;
+  }
+
+  private async _doSave(): Promise<void> {
     // Save to TokenStorageProviders (IndexedDB/files)
     const providers = this.getTokenStorageProviders();
     // Debug: log token serialization status

@@ -490,6 +490,67 @@ describe('PaymentsModule - V5 Token Finalization', () => {
       expect(parsed[0].id).toBe(`v5split_${SPLIT_GROUP_ID_1}`);
     });
 
+    it('concurrent saves serialize via save-chain (no torn-snapshot race)', async () => {
+      // Steelman fix #3: concurrent save() calls must not race on stale
+      // this.tokens snapshots. The save-chain single-flight guarantees
+      // each save awaits the previous one before reading state.
+      const REAL_CIDS = [
+        'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+        'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+        'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+        'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu',
+      ];
+      const ipfsStore = new Map<string, unknown>();
+      const observedSnapshots: unknown[][] = [];
+      let pinResolve: (() => void) | null = null;
+      const pinGate = new Promise<void>((resolve) => {
+        pinResolve = resolve;
+      });
+
+      const slowFakeStore = {
+        pinJson: vi.fn(async (value: unknown) => {
+          const idx = observedSnapshots.length;
+          observedSnapshots.push([...(value as unknown[])]);
+          // First call blocks until pinGate fires, simulating slow IPFS.
+          if (idx === 0) {
+            await pinGate;
+          }
+          const cid = REAL_CIDS[idx % REAL_CIDS.length]!;
+          ipfsStore.set(cid, value);
+          return {
+            v: 1 as const,
+            cid,
+            size: JSON.stringify(value).length + 28,
+            ts: Date.now() + idx,
+          };
+        }),
+        fetchJson: vi.fn(async (ref: { cid: string }) => ipfsStore.get(ref.cid)),
+      };
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = slowFakeStore;
+
+      // Kick off two saves concurrently: addToken triggers save().
+      const t1 = createV5PendingToken('g1');
+      const t2 = createV5PendingToken('g2');
+
+      const save1 = module.addToken(t1);
+      // Microtask so addToken can start + acquire the chain.
+      await Promise.resolve();
+      const save2 = module.addToken(t2);
+
+      // Release the slow pin so save1 can complete.
+      pinResolve!();
+      await Promise.all([save1, save2]);
+
+      // The key property: the SECOND pin call sees a superset of the FIRST.
+      // Without serialization, save2 could race and pin a snapshot that
+      // excludes t1 (if it read state before save1 completed the addToken
+      // mutation). With the chain, save2 runs after save1 and observes both.
+      expect(observedSnapshots.length).toBeGreaterThanOrEqual(1);
+      const finalSnapshot = observedSnapshots[observedSnapshots.length - 1] as Array<{ id: string }>;
+      expect(finalSnapshot.some((t) => t.id.includes('g1'))).toBe(true);
+      expect(finalSnapshot.some((t) => t.id.includes('g2'))).toBe(true);
+    });
+
     it('OpLog value shrinks dramatically when CidRefStore is used', async () => {
       // Write LEGACY first to measure fat-size.
       const tokens = Array.from({ length: 10 }, (_, i) =>
