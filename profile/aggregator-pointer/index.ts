@@ -50,3 +50,30 @@ export {
   ALL_ENTRY_TYPES,
 } from './originated-tag.js';
 export type { OriginTag, OpLogEntryType, UserActionType, SystemActionType } from './originated-tag.js';
+
+// Phase C — external integrations
+export { submitPointer } from './aggregator-submit.js';
+export type { SubmitInput, SubmitOutcome } from './aggregator-submit.js';
+export { probeVersion, classifyVersion, isReachable } from './aggregator-probe.js';
+export type {
+  ProbeInput,
+  ClassifyInput,
+  ReachableInput,
+  VersionClassification,
+  CarFetchResult,
+  CarFetcher,
+  CidDecodeResult,
+  CidDecoder,
+} from './aggregator-probe.js';
+export { classifyTrustBaseRotation, raiseForTrustBaseMismatch } from './trust-base-rotation.js';
+export type { TrustBaseRotationResult } from './trust-base-rotation.js';
+export { fetchCarFromGateway } from './ipfs-car-fetch.js';
+export type { CarFetchOptions, CarFetchOutcome, CarFetchFailure } from './ipfs-car-fetch.js';
+export {
+  recordAttempt,
+  getAttempts,
+  clearAttempts,
+  canInvokeAcceptCarLoss,
+  assertAcceptCarLossEligible,
+} from './car-loss-tracker.js';
+export type { CarFetchAttempt, AcceptCarLossGate } from './car-loss-tracker.js';

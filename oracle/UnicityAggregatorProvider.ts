@@ -129,6 +129,16 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return this.trustBase;
   }
 
+  /**
+   * Get the bundled RootTrustBase (H6 — SPEC §8.4.2).
+   *
+   * Alias for getTrustBase(), exposed under the spec-canonical name so the
+   * pointer layer can consume the same bundled trust base as L4.
+   */
+  getRootTrustBase(): RootTrustBase | null {
+    return this.trustBase;
+  }
+
   /** Get the state transition client */
   getStateTransitionClient(): StateTransitionClient | null {
     return this.stateTransitionClient;

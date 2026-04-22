@@ -81,6 +81,15 @@ export interface OracleProvider extends BaseProvider {
   getAggregatorClient?(): unknown;
 
   /**
+   * Get the bundled RootTrustBase (if available).
+   *
+   * Pointer-layer (H6, SPEC §8.4.2) requires the shared trust base consumed
+   * by L4/PaymentsModule to be reused rather than a parallel trust-base
+   * provider — see PROFILE-AGGREGATOR-POINTER-SPEC.md §8.4.
+   */
+  getRootTrustBase?(): unknown;
+
+  /**
    * Wait for inclusion proof using SDK commitment (if available)
    * Used for transfer flows with SDK TransferCommitment
    */
