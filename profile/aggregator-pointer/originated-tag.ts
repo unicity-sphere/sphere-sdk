@@ -2,24 +2,30 @@
  * Originated-tag discipline (T-B6, SPEC §10.2.3, §10.2.3.1).
  *
  * Every OpLog write MUST carry an `originated` tag indicating who initiated
- * the write.  The re-validation check runs:
- *   (i)  on every locally-authored write, before durable persistence
- *   (ii) on every replicated write, before the replica is accepted
+ * the write.  Two separate validators enforce context-specific rules:
+ *
+ *   assertOriginTagLocal       — local writes only ('user' or 'system', NOT 'replicated')
+ *   assertOriginTagReplicated  — replicated writes only (MUST be 'replicated')
  *
  * Fail-closed: missing or unrecognised tags are rejected with
- * SECURITY_ORIGIN_MISMATCH.
+ * SECURITY_ORIGIN_MISMATCH.  `assertOriginTag` (the original single-function
+ * variant) has been removed — it accepted 'replicated' for all entry types,
+ * which created a forgery bypass if callers forgot to call downgradeForReplication.
  */
 
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
-// ── User-action types (9 total) ────────────────────────────────────────────
+// ── User-action types (12 total) ───────────────────────────────────────────
 const USER_ACTION_TYPES = [
   'token_send',
   'token_receive',
   'nametag_register',
   'dm_send',
+  'dm_receive',
   'invoice_mint',
   'invoice_pay',
+  'invoice_close',
+  'invoice_cancel',
   'swap_propose',
   'swap_accept',
   'swap_deposit',
@@ -41,40 +47,59 @@ export type OpLogEntryType = UserActionType | SystemActionType;
 // ── Origin values ──────────────────────────────────────────────────────────
 export type OriginTag = 'user' | 'system' | 'replicated';
 
-/** All 12 known entry types, for exhaustiveness checks. */
-export const ALL_ENTRY_TYPES: readonly OpLogEntryType[] = [
+/** All 15 known entry types, frozen to prevent runtime mutation. */
+export const ALL_ENTRY_TYPES: readonly OpLogEntryType[] = Object.freeze([
   ...USER_ACTION_TYPES,
   ...SYSTEM_ACTION_TYPES,
-];
+]);
 
 const USER_ACTION_SET = new Set<string>(USER_ACTION_TYPES);
 const SYSTEM_ACTION_SET = new Set<string>(SYSTEM_ACTION_TYPES);
 
+// Module-load invariant: USER and SYSTEM sets must be disjoint.
+for (const t of USER_ACTION_TYPES) {
+  if (SYSTEM_ACTION_SET.has(t)) {
+    throw new Error(
+      `originated-tag: BUG — "${t}" appears in both USER_ACTION_TYPES and SYSTEM_ACTION_TYPES`,
+    );
+  }
+}
+
 /**
  * Stamp an originated tag onto an OpLog entry payload.
  * Returns a new object with `originated` set; does not mutate the input.
+ *
+ * @throws AggregatorPointerError(SECURITY_ORIGIN_MISMATCH) if the entry
+ *   already carries an `originated` field (double-stamp guard).
  */
 export function stampOriginated<T extends Record<string, unknown>>(
   entry: T,
   tag: OriginTag,
 ): T & { originated: OriginTag } {
+  if ((entry as Record<string, unknown>).originated !== undefined) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
+      `stampOriginated: entry already carries originated='${String((entry as Record<string, unknown>).originated)}' — double-stamp guard (SPEC §10.2.3).`,
+      { existingTag: (entry as Record<string, unknown>).originated },
+    );
+  }
   return { ...entry, originated: tag };
 }
 
 /**
- * Validate the originated tag on an incoming OpLog entry.
+ * Validate the originated tag on a LOCALLY-authored OpLog entry.
  *
- * Rules (SPEC §10.2.3 D5):
+ * Rules (SPEC §10.2.3 D5 — local-write path):
  *   - User-action entry types MUST carry `originated = 'user'`
  *   - System entry types MUST carry `originated = 'system'`
- *   - Replicated entries may carry `originated = 'replicated'`
- *     (downgrade applied by the replication entry point per §10.2.3)
+ *   - `originated = 'replicated'` is REJECTED here (use assertOriginTagReplicated
+ *     at the replication ingress instead)
  *
  * Fail-closed: missing `originated` field is treated as a mismatch.
  *
  * @throws AggregatorPointerError(SECURITY_ORIGIN_MISMATCH) on any violation.
  */
-export function assertOriginTag(entryType: string, originated: unknown): void {
+export function assertOriginTagLocal(entryType: string, originated: unknown): void {
   if (typeof originated !== 'string') {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
@@ -84,10 +109,10 @@ export function assertOriginTag(entryType: string, originated: unknown): void {
   }
 
   if (USER_ACTION_SET.has(entryType)) {
-    if (originated !== 'user' && originated !== 'replicated') {
+    if (originated !== 'user') {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
-        `User-action entry type "${entryType}" must carry originated='user' or 'replicated', got '${originated}'.`,
+        `Local user-action entry type "${entryType}" must carry originated='user', got '${originated}'.`,
         { entryType, originated },
       );
     }
@@ -95,10 +120,10 @@ export function assertOriginTag(entryType: string, originated: unknown): void {
   }
 
   if (SYSTEM_ACTION_SET.has(entryType)) {
-    if (originated !== 'system' && originated !== 'replicated') {
+    if (originated !== 'system') {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
-        `System entry type "${entryType}" must carry originated='system' or 'replicated', got '${originated}'.`,
+        `Local system entry type "${entryType}" must carry originated='system', got '${originated}'.`,
         { entryType, originated },
       );
     }
@@ -113,15 +138,65 @@ export function assertOriginTag(entryType: string, originated: unknown): void {
 }
 
 /**
+ * Validate the originated tag on a REPLICATED OpLog entry.
+ *
+ * Rules (SPEC §10.2.3 — replication ingress):
+ *   - All known entry types MUST carry `originated = 'replicated'`
+ *   - Any other value is rejected (prevents a malicious peer from injecting
+ *     writes that appear as local user or system actions)
+ *
+ * Fail-closed: missing `originated` field is treated as a mismatch.
+ *
+ * @throws AggregatorPointerError(SECURITY_ORIGIN_MISMATCH) on any violation.
+ */
+export function assertOriginTagReplicated(entryType: string, originated: unknown): void {
+  if (typeof originated !== 'string') {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
+      `Replicated OpLog entry type "${entryType}" is missing the originated tag (fail-closed; SPEC §10.2.3).`,
+      { entryType, originated },
+    );
+  }
+
+  if (!USER_ACTION_SET.has(entryType) && !SYSTEM_ACTION_SET.has(entryType)) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
+      `Unknown OpLog entry type "${entryType}" — cannot validate originated tag.`,
+      { entryType, originated },
+    );
+  }
+
+  if (originated !== 'replicated') {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
+      `Replicated entry type "${entryType}" must carry originated='replicated', got '${originated}' — possible tag-forgery attempt.`,
+      { entryType, originated },
+    );
+  }
+}
+
+/**
  * Downgrade originated tag at replication entry point (SPEC §10.2.3).
  *
- * Any incoming replicated write that arrives with `originated = 'user'`
- * must be downgraded to `'replicated'` before being appended to the
- * local OpLog.  This closes the tag-forgery bypass: a malicious peer
- * cannot make its writes appear as local user actions.
+ * Any incoming replicated write MUST already carry an `originated` field
+ * (set by the originating node).  This function stamps it as `'replicated'`
+ * to prevent a malicious peer from making writes appear as local user actions.
+ *
+ * Fail-closed: throws SECURITY_ORIGIN_MISMATCH if the entry has no `originated`
+ * field — an entry arriving at the replication edge without a tag is a protocol
+ * violation (could indicate a tampered or malformed entry).
+ *
+ * @throws AggregatorPointerError(SECURITY_ORIGIN_MISMATCH) if `originated` is absent.
  */
-export function downgradeForReplication<T extends { originated?: OriginTag }>(
+export function downgradeForReplication<T extends Record<string, unknown>>(
   entry: T,
 ): T & { originated: 'replicated' } {
+  if ((entry as Record<string, unknown>).originated === undefined) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
+      `downgradeForReplication: entry has no originated tag — protocol violation at replication edge (SPEC §10.2.3).`,
+      { entry },
+    );
+  }
   return { ...entry, originated: 'replicated' as const };
 }

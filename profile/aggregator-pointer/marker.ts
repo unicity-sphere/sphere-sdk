@@ -15,8 +15,9 @@
  */
 
 import { sha256 } from '@noble/hashes/sha2.js';
+import { hexToBytes as nobleHexToBytes } from '@noble/hashes/utils.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
-import { MARKER_MAX_JUMP } from './constants.js';
+import { MARKER_MAX_JUMP, VERSION_MIN, VERSION_MAX } from './constants.js';
 import type { FlagStore } from './flag-store.js';
 import type { PendingVersionMarker, PointerVersion } from './types.js';
 
@@ -26,14 +27,6 @@ const MARKER_KEY = 'pending_version';
 interface MarkerRecord {
   v: number;
   cidHash: string; // hex-encoded 32 bytes
-}
-
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
 }
 
 function bytesToHex(b: Uint8Array): string {
@@ -76,20 +69,21 @@ export async function readMarker(store: FlagStore): Promise<PendingVersionMarker
   if (
     typeof r.v !== 'number' ||
     !Number.isInteger(r.v) ||
-    r.v < 1 ||
+    r.v < VERSION_MIN ||
+    r.v > VERSION_MAX ||
     typeof r.cidHash !== 'string' ||
     !/^[0-9a-f]{64}$/.test(r.cidHash)
   ) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.MARKER_CORRUPT,
-      `pending_version marker failed integrity check: cidHash must be 64 hex chars, v must be positive integer (SPEC §7.1.5).`,
+      `pending_version marker failed integrity check: cidHash must be 64 hex chars, v must be in [${VERSION_MIN}, ${VERSION_MAX}] (SPEC §7.1.5).`,
       { record: rec },
     );
   }
 
   return {
     v: r.v as PointerVersion,
-    cidHash: hexToBytes(r.cidHash),
+    cidHash: nobleHexToBytes(r.cidHash),
   };
 }
 
@@ -149,8 +143,9 @@ export interface MarkerResolution {
  *   Case 3 (MARKER_MAX_JUMP exceeded): marker.v - currentLocalVersion > MARKER_MAX_JUMP
  *     → throw MARKER_CORRUPT
  *
- *   Case 4 (rollback-safe bump): cidHash mismatch on marker.v → advance to
- *     currentLocalVersion + 1 (do NOT reuse marker.v with different plaintext)
+ *   Case 4 (OTP-safe bump): cidHash mismatch on marker.v → advance PAST marker.v
+ *     when marker.v == currentLocalVersion+1 (may have emitted ciphertext at that v);
+ *     advance to currentLocalVersion+1 otherwise (fresh v, safe)
  *
  *   Case 5 (no marker): v = currentLocalVersion + 1
  */
@@ -193,6 +188,18 @@ export async function resolvePublishVersion(
     return { v: marker.v, isIdempotentRetry: true, wasCompacted: false };
   }
 
-  // Case 4: cidHash mismatch → rollback-safe bump.
-  return { v: currentLocalVersion + 1, isIdempotentRetry: false, wasCompacted: false };
+  // Case 4: cidHash mismatch — OTP-safe bump.
+  //
+  // If marker.v === currentLocalVersion + 1, a prior crashed publish attempt
+  // may have already emitted a ciphertext to the aggregator derived from
+  // xorKey_{side, marker.v}.  Reusing marker.v with a different plaintext
+  // would XOR under the same key, collapsing the one-time-pad to
+  //   C_old XOR C_new = P_old XOR P_new.
+  //
+  // We therefore advance PAST marker.v to guarantee a fresh xorKey.
+  // For any other jump (marker.v > currentLocalVersion + 1), the candidate
+  // v is currentLocalVersion + 1 which is already fresh (not marker.v), safe.
+  const safeV =
+    marker.v === currentLocalVersion + 1 ? marker.v + 1 : currentLocalVersion + 1;
+  return { v: safeV, isIdempotentRetry: false, wasCompacted: false };
 }

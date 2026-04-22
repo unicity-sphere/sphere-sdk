@@ -44,7 +44,8 @@ export { createPointerMutex } from './mutex-lock.js';
 export type { PointerMutex, MutexHandle, MutexAcquireOptions, MutexFactoryOptions, NodeLockPrimitives } from './mutex-lock.js';
 export {
   stampOriginated,
-  assertOriginTag,
+  assertOriginTagLocal,
+  assertOriginTagReplicated,
   downgradeForReplication,
   ALL_ENTRY_TYPES,
 } from './originated-tag.js';

@@ -18,8 +18,13 @@ import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js'
  * durability (fsync / IndexedDB transaction.oncomplete) expose this symbol
  * as a property set to `true`.  Backends that omit it are treated as
  * non-durable and rejected at init.
+ *
+ * IMPORTANT: This is a module-local Symbol (NOT Symbol.for).  Only code that
+ * imports `DURABLE_STORAGE` from this module can mark a backend durable.
+ * A package using Symbol.for('aggregator-pointer:durable-storage') would get
+ * a DIFFERENT symbol and cannot forge the durability claim.
  */
-export const DURABLE_STORAGE = Symbol.for('aggregator-pointer:durable-storage');
+export const DURABLE_STORAGE = Symbol('aggregator-pointer:durable-storage');
 
 export interface DurableStorageProvider extends StorageProvider {
   [DURABLE_STORAGE]: true;
@@ -60,8 +65,13 @@ export class FlagStore {
     return new FlagStore(storage, signingPubKeyHex);
   }
 
-  /** Scoped key = prefix + localKey */
+  /** Scoped key = prefix + localKey.  localKey must match /^[a-z][a-z0-9_]*$/. */
   scopedKey(localKey: string): string {
+    if (!/^[a-z][a-z0-9_]*$/.test(localKey)) {
+      throw new RangeError(
+        `FlagStore: localKey "${localKey}" is invalid — must match /^[a-z][a-z0-9_]*$/`,
+      );
+    }
     return this.#prefix + localKey;
   }
 

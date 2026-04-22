@@ -99,11 +99,28 @@ describe('isBlocked / setBlocked / clearBlocked (T-B5)', () => {
     expect(stateB.blocked).toBe(false);
   });
 
-  it('isBlocked returns false for corrupt stored record (fail-open for reads)', async () => {
-    // Write corrupt JSON.
+  it('isBlocked throws CORRUPT for invalid JSON (fail-closed)', async () => {
     await (fs as unknown as { set(k: string, v: string): Promise<void> }).set('blocked', 'bad-json');
-    const state = await isBlocked(fs);
-    expect(state.blocked).toBe(false);
+    await expect(isBlocked(fs)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.CORRUPT,
+    });
+  });
+
+  it('isBlocked throws CORRUPT for valid JSON with wrong shape', async () => {
+    await (fs as unknown as { set(k: string, v: string): Promise<void> }).set('blocked', '{}');
+    await expect(isBlocked(fs)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.CORRUPT,
+    });
+  });
+
+  it('isBlocked throws CORRUPT for valid JSON with unknown reason', async () => {
+    await (fs as unknown as { set(k: string, v: string): Promise<void> }).set(
+      'blocked',
+      JSON.stringify({ blocked: true, reason: 'future_reason', setAt: Date.now() }),
+    );
+    await expect(isBlocked(fs)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.CORRUPT,
+    });
   });
 });
 

@@ -143,11 +143,19 @@ describe('resolvePublishVersion (T-B2, H13)', () => {
     expect(r.wasCompacted).toBe(false);
   });
 
-  it('rollback-safe bump: cidHash mismatch → v = currentLocal + 1', async () => {
+  it('rollback-safe OTP bump: cidHash mismatch + marker.v === currentLocal+1 → v = marker.v + 1', async () => {
     await writeMarker(fs, 6, CID_A);
-    // Different CID being published now → rollback-safe.
+    // Different CID — marker.v (6) === currentLocal+1 (5+1), so OTP-safe: advance PAST marker.v.
     const r = await resolvePublishVersion(fs, 5, CID_B);
-    expect(r.v).toBe(6); // still bumps to 6 (currentLocal+1)
+    expect(r.v).toBe(7); // must skip v=6 to avoid reusing xorKey with different plaintext
+    expect(r.isIdempotentRetry).toBe(false);
+  });
+
+  it('rollback-safe bump: cidHash mismatch + marker.v > currentLocal+1 → v = currentLocal + 1', async () => {
+    await writeMarker(fs, 8, CID_A);
+    // marker.v (8) > currentLocal+1 (5+1=6), so candidate v=6 is fresh (not marker.v) — safe.
+    const r = await resolvePublishVersion(fs, 5, CID_B);
+    expect(r.v).toBe(6);
     expect(r.isIdempotentRetry).toBe(false);
   });
 

@@ -87,24 +87,57 @@ interface BlockedRecord {
   setAt: number;
 }
 
+const KNOWN_BLOCKED_REASONS = new Set<string>([
+  'retry_exhausted',
+  'network_timeout',
+  'dns_failure',
+  'tls_failure',
+  'aggregator_rejected',
+  'protocol_error',
+]);
+
 /**
  * Read the current BLOCKED state.  Returns `{ blocked: false }` if no flag
- * is present or if the stored record is unparseable (fail-open for reads).
+ * is present (normal — wallet never blocked).
+ *
+ * Fail-closed for integrity violations: if the stored record is present but
+ * malformed, throws AGGREGATOR_POINTER_CORRUPT rather than silently returning
+ * unblocked.  A corrupt record must be investigated — it could indicate
+ * storage tampering or a migration bug.
  */
 export async function isBlocked(store: FlagStore): Promise<BlockedState> {
   const raw = await store.get(BLOCKED_KEY);
   if (raw === null) return { blocked: false };
 
+  let rec: unknown;
   try {
-    const rec = JSON.parse(raw) as Partial<BlockedRecord>;
-    if (rec.blocked === true && typeof rec.reason === 'string' && typeof rec.setAt === 'number') {
-      return { blocked: true, reason: rec.reason, setAt: rec.setAt };
-    }
+    rec = JSON.parse(raw);
   } catch {
-    // Corrupt stored record — treat as unblocked (fail-open for reads).
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.CORRUPT,
+      'BLOCKED flag storage contains invalid JSON — possible corruption or tampering (SPEC §10.2).',
+      { raw: raw.slice(0, 200) },
+    );
   }
 
-  return { blocked: false };
+  const r = rec as Partial<BlockedRecord>;
+  if (r.blocked !== true || typeof r.reason !== 'string' || typeof r.setAt !== 'number') {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.CORRUPT,
+      'BLOCKED flag storage record failed shape check — possible corruption (SPEC §10.2).',
+      { record: rec },
+    );
+  }
+
+  if (!KNOWN_BLOCKED_REASONS.has(r.reason)) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.CORRUPT,
+      `BLOCKED flag record has unrecognized reason "${r.reason}" — possible storage corruption.`,
+      { reason: r.reason },
+    );
+  }
+
+  return { blocked: true, reason: r.reason as BlockedReason, setAt: r.setAt };
 }
 
 /**

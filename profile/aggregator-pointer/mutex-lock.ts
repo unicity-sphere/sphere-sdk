@@ -34,7 +34,12 @@ export interface PointerMutex {
 // ── Runtime detection ──────────────────────────────────────────────────────
 
 function isBrowser(): boolean {
-  return typeof globalThis.navigator !== 'undefined' && typeof globalThis.window !== 'undefined';
+  return (
+    typeof globalThis.navigator !== 'undefined' &&
+    typeof globalThis.window !== 'undefined' &&
+    // Exclude Electron renderer (needs file-based cross-process locking).
+    !(typeof process !== 'undefined' && process.versions?.electron)
+  );
 }
 
 function isNode(): boolean {
@@ -60,6 +65,7 @@ class BrowserMutex implements PointerMutex {
     const timeoutMs = opts?.timeoutMs ?? 30_000;
 
     return new Promise<MutexHandle>((resolve, reject) => {
+      let timedOut = false;
       let released = false;
       let releaseCallback: (() => void) | null = null;
 
@@ -68,39 +74,49 @@ class BrowserMutex implements PointerMutex {
       });
 
       const timer = setTimeout(() => {
-        if (!released) {
-          reject(
-            new AggregatorPointerError(
-              AggregatorPointerErrorCode.PUBLISH_BUSY,
-              `Web Locks mutex "${this.#lockName}" not acquired within ${timeoutMs}ms.`,
-            ),
-          );
-        }
+        timedOut = true;
+        reject(
+          new AggregatorPointerError(
+            AggregatorPointerErrorCode.PUBLISH_BUSY,
+            `Web Locks mutex "${this.#lockName}" not acquired within ${timeoutMs}ms.`,
+          ),
+        );
       }, timeoutMs);
 
       navigator.locks
         .request(this.#lockName, { mode: 'exclusive' }, async (_lock) => {
           clearTimeout(timer);
-          if (released) return; // timed-out caller already rejected
+          if (timedOut) {
+            // Lock granted AFTER caller already timed out — release immediately
+            // to prevent the lock from being held forever (zombie lock).
+            releaseCallback!();
+            return;
+          }
+          let alreadyReleased = false;
           resolve({
             release: async () => {
+              if (alreadyReleased) return;
+              alreadyReleased = true;
               released = true;
               releaseCallback!();
             },
           });
-          // Keep the lock held until release() is called.
+          // Hold the lock until release() is called.
           await releasePromise;
+          void released; // silence unused warning
         })
         .catch((err: unknown) => {
           clearTimeout(timer);
-          reject(
-            new AggregatorPointerError(
-              AggregatorPointerErrorCode.UNSUPPORTED_RUNTIME,
-              `Web Locks request failed: ${String(err)}`,
-              undefined,
-              { cause: err },
-            ),
-          );
+          if (!timedOut) {
+            reject(
+              new AggregatorPointerError(
+                AggregatorPointerErrorCode.UNSUPPORTED_RUNTIME,
+                `Web Locks request failed: ${String(err)}`,
+                undefined,
+                { cause: err },
+              ),
+            );
+          }
         });
     });
   }
@@ -131,6 +147,7 @@ async function defaultNodeLockPrimitives(lockFilePath: string): Promise<NodeLock
 class NodeMutex implements PointerMutex {
   readonly #lockFilePath: string;
   #primitives: NodeLockPrimitives | null = null;
+  #primitivesInitialized = false;
 
   constructor(lockFilePath: string) {
     this.#lockFilePath = lockFilePath;
@@ -139,13 +156,24 @@ class NodeMutex implements PointerMutex {
   async #getPrimitives(): Promise<NodeLockPrimitives> {
     if (!this.#primitives) {
       this.#primitives = await defaultNodeLockPrimitives(this.#lockFilePath);
+      this.#primitivesInitialized = true;
     }
     return this.#primitives;
   }
 
-  /** For testing only: inject spy-instrumented primitives. */
+  /**
+   * For testing only: inject spy-instrumented primitives.
+   * MUST be called before the first acquire(); throws if called after.
+   */
   _injectPrimitives(primitives: NodeLockPrimitives): void {
+    if (this.#primitivesInitialized) {
+      throw new Error(
+        '_injectPrimitives may not be called after the first acquire() — ' +
+          'replacing primitives mid-flight would break mutual exclusion.',
+      );
+    }
     this.#primitives = primitives;
+    this.#primitivesInitialized = true;
   }
 
   async acquire(opts?: MutexAcquireOptions): Promise<MutexHandle> {
@@ -153,7 +181,24 @@ class NodeMutex implements PointerMutex {
     const prim = await this.#getPrimitives();
 
     // Step 1: acquire in-process mutex (R-18: always first).
+    //
+    // Orphan prevention: if the timeout fires before acquireInProcess resolves,
+    // we must still release the lock when it eventually resolves — otherwise
+    // async-mutex is permanently stuck for this process.
+    let timedOut = false;
     let inProcessRelease: (() => void) | null = null;
+
+    const inProcessAcquirePromise = prim.acquireInProcess();
+
+    // Safety handler: release lock on late resolution after timeout.
+    void inProcessAcquirePromise.then((release) => {
+      if (timedOut) {
+        try { release(); } catch { /* noop — async-mutex release on abandoned lock */ }
+      }
+    });
+
+    const inProcessTimer = setTimeout(() => { timedOut = true; }, timeoutMs);
+
     const inProcessTimeout = new Promise<never>((_, reject) =>
       setTimeout(
         () =>
@@ -167,7 +212,13 @@ class NodeMutex implements PointerMutex {
       ),
     );
 
-    inProcessRelease = await Promise.race([prim.acquireInProcess(), inProcessTimeout]);
+    try {
+      inProcessRelease = await Promise.race([inProcessAcquirePromise, inProcessTimeout]);
+    } catch (err) {
+      clearTimeout(inProcessTimer);
+      throw err;
+    }
+    clearTimeout(inProcessTimer);
 
     // Step 2: acquire file lock (cross-process).
     const deadline = Date.now() + timeoutMs;
@@ -181,14 +232,15 @@ class NodeMutex implements PointerMutex {
       } catch (err: unknown) {
         const code = (err as NodeJS.ErrnoException)?.code;
         if (code === 'ELOCKED') {
-          if (Date.now() + retryMs > deadline) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) {
             inProcessRelease!();
             throw new AggregatorPointerError(
               AggregatorPointerErrorCode.PUBLISH_BUSY,
               `File lock "${this.#lockFilePath}" held by another process; timed out after ${timeoutMs}ms.`,
             );
           }
-          await new Promise((res) => setTimeout(res, retryMs));
+          await new Promise((res) => setTimeout(res, Math.min(retryMs, remaining)));
           continue;
         }
         inProcessRelease!();
@@ -201,13 +253,19 @@ class NodeMutex implements PointerMutex {
       }
     }
 
+    let alreadyReleased = false;
     return {
       release: async () => {
-        // LIFO: file lock first, then in-process mutex.
+        // Guard against double-release.
+        if (alreadyReleased) return;
+        alreadyReleased = true;
+        // LIFO: file lock released first, then in-process mutex.
         try {
           await fileLockRelease!();
         } finally {
-          inProcessRelease!();
+          if (typeof inProcessRelease === 'function') {
+            try { inProcessRelease(); } catch { /* noop */ }
+          }
         }
       },
     };
@@ -229,6 +287,7 @@ export interface MutexFactoryOptions {
  *
  * - Browser: Web Locks API (key = lockName)
  * - Node.js:  async-mutex + proper-lockfile (path = lockFilePath)
+ * - Electron renderer: treated as Node.js (file-based locking)
  *
  * Throws AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME when:
  *   - Browser but Web Locks API is unavailable
