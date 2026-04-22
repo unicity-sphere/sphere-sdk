@@ -48,6 +48,23 @@ export class OrbitDbAdapter implements ProfileDatabase {
   private connected = false;
   /** Registered replication listeners for cleanup. */
   private replicationListeners: Set<() => void> = new Set();
+  /**
+   * Keys written by LOCAL `putEntry` calls during this session. Used by
+   * `getEntry` to decide whether to trust the stored `originated` tag
+   * (local write → trust) or force-downgrade to 'replicated' (peer write).
+   *
+   * Security invariant: `getEntry(key)` without `trustLocalClaim:true`
+   * returns `originated:'replicated'` UNLESS the key is in this set AND
+   * no replication event has fired for the key since we wrote it. This
+   * closes the "peer forges 'user' tag in envelope, plain getEntry
+   * returns it verbatim" attack surface.
+   *
+   * Set is session-scoped — cleared on `close()` / re-connect. That's
+   * correct: a key we wrote in session N cannot be trusted across
+   * sessions because a remote peer may have overwritten it (LWW) while
+   * we were offline. Local writes are always re-stamped on next write.
+   */
+  private localAuthoredKeys: Set<string> = new Set();
 
   // ---------- ProfileDatabase implementation ----------
 
@@ -278,6 +295,9 @@ export class OrbitDbAdapter implements ProfileDatabase {
     try {
       const cborBytes = encodeEntry(entry);
       await this.db.put(key, cborBytes);
+      // Track this key as locally authored. `getEntry` uses this set to
+      // decide whether to trust the stored `originated` tag.
+      this.localAuthoredKeys.add(key);
     } catch (err) {
       throw new ProfileError(
         'ORBITDB_WRITE_FAILED',
@@ -288,31 +308,72 @@ export class OrbitDbAdapter implements ProfileDatabase {
   }
 
   /**
+   * Also track local authorship when code takes the legacy `put()` path.
+   * This is called by ProfileStorageProvider.writeEnvelope's fallback branch
+   * (for adapters without structured-entry support). We track it here so
+   * getEntry's trust decision is uniform regardless of which API wrote.
+   */
+  markLocallyAuthored(key: string): void {
+    this.localAuthoredKeys.add(key);
+  }
+
+  /**
    * Read a structured OpLog entry envelope at `key`, or `null` if absent.
+   *
+   * SECURITY DEFAULT (post-steelman): the returned envelope's
+   * `originated` field is forced to `'replicated'` UNLESS the key was
+   * written by a local `putEntry` in THIS session AND no replication
+   * event has fired for this key since. Callers that specifically need
+   * the stored tag (e.g., debug tools) must pass `trustLocalClaim: true`.
    *
    * Legacy opaque-bytes entries (from pre-schema wallets) are wrapped
    * in a synthetic envelope per §7.1 — callers can detect them via
    * `isLegacyEntry(envelope)` from `profile/oplog-entry.ts`.
    *
-   * @param opts.downgradeAsReplicated  — When true, applies the
-   *   `decodeAndDowngradeReplicated` helper: the returned envelope's
-   *   `originated` field is forced to `'replicated'` regardless of
-   *   what the stored bytes claim. Callers handling replication
-   *   events MUST pass `true` so peer-claimed `'user'`/`'system'`
-   *   tags cannot leak into local state (§5.2).
+   * @param opts.downgradeAsReplicated  — LEGACY: when true, forces
+   *   downgrade via `decodeAndDowngradeReplicated`. Kept for backward
+   *   compat but largely redundant since downgrade is now the DEFAULT.
+   * @param opts.trustLocalClaim  — EXPLICIT: when true, returns the
+   *   envelope's stored `originated` tag verbatim. Callers use this
+   *   when they've already authenticated the source (e.g., immediately
+   *   after putEntry). Legacy entries (v=0) always downgrade regardless.
    */
   async getEntry(
     key: string,
-    opts: { downgradeAsReplicated?: boolean } = {},
+    opts: {
+      downgradeAsReplicated?: boolean;
+      trustLocalClaim?: boolean;
+    } = {},
   ): Promise<OpLogEntryEnvelope | null> {
     this.ensureConnected();
     try {
       const raw = await this.db.get(key);
       if (raw === undefined || raw === null) return null;
       const bytes = coerceToUint8Array(raw);
-      return opts.downgradeAsReplicated === true
-        ? decodeAndDowngradeReplicated(bytes)
-        : decodeEntry(bytes);
+
+      // Explicit downgrade requested → route through the ingress path.
+      if (opts.downgradeAsReplicated === true) {
+        return decodeAndDowngradeReplicated(bytes);
+      }
+
+      // Default: decode, then enforce the downgrade UNLESS the caller
+      // explicitly trusts the local claim AND the key is known locally.
+      const envelope = decodeEntry(bytes);
+
+      // Legacy entries (v=0) always carry the synthesized system tag —
+      // pass through unchanged; the v=0 sentinel tells the caller.
+      if (envelope.v === 0) {
+        return envelope;
+      }
+
+      const trusted = opts.trustLocalClaim === true && this.localAuthoredKeys.has(key);
+      if (trusted) {
+        return envelope;
+      }
+
+      // Non-trusted read → force downgrade to 'replicated'. Peer-claimed
+      // 'user'/'system' tags are overridden here.
+      return decodeAndDowngradeReplicated(bytes);
     } catch (err) {
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
@@ -393,6 +454,10 @@ export class OrbitDbAdapter implements ProfileDatabase {
       }
     }
     this.replicationListeners.clear();
+    // Clear session-scoped locally-authored key set so a reconnect doesn't
+    // trust keys from the prior session (post-session peer writes may have
+    // overwritten them).
+    this.localAuthoredKeys.clear();
 
     try {
       if (this.db) {
@@ -428,7 +493,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
     this.ensureConnected();
 
     // OrbitDB databases emit 'update' events when remote entries are merged.
+    // Invalidate the locally-authored set: a replication event means a peer
+    // may have overwritten any of our keys (LWW per-key), so we can no
+    // longer trust the stored `originated` tag for ANY key without
+    // re-authoring. This is conservative (over-invalidates) but safe.
     const handler = () => {
+      this.localAuthoredKeys.clear();
       callback();
     };
 

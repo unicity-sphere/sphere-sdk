@@ -552,6 +552,9 @@ export class ProfileStorageProvider implements StorageProvider {
     } finally {
       this.dbStatus = 'disconnected';
       this.attachedChainPubkey = null;
+      // Reset capability cache so a re-connect re-probes (adapter could
+      // have been swapped between disconnect/connect cycles, e.g. in tests).
+      this._envelopesSupported = null;
     }
 
     // 2. Close local cache
@@ -738,9 +741,42 @@ export class ProfileStorageProvider implements StorageProvider {
   // ---------- Envelope helpers (PROFILE-OPLOG-SCHEMA.md §5) ----------
 
   /**
+   * Computed ONCE lazily from the adapter's capability surface. Both
+   * putEntry AND getEntry must exist together, OR both must be absent —
+   * an asymmetric adapter (one method but not the other) would silently
+   * corrupt reads, so we treat it as a configuration error.
+   *
+   * Value is cached after first probe to avoid repeated `typeof` checks
+   * on hot paths; reset in `disconnect()` on re-connect.
+   */
+  private _envelopesSupported: boolean | null = null;
+
+  /** Probe both putEntry + getEntry exactly once; throw on asymmetry. */
+  private supportsEnvelopes(): boolean {
+    if (this._envelopesSupported !== null) return this._envelopesSupported;
+    const hasPut = typeof this.db.putEntry === 'function';
+    const hasGet = typeof this.db.getEntry === 'function';
+    if (hasPut !== hasGet) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `ProfileDatabase adapter has asymmetric envelope support: putEntry=${hasPut}, ` +
+          `getEntry=${hasGet}. Adapter must implement BOTH methods or NEITHER — ` +
+          `asymmetric support would silently corrupt reads of envelope-wrapped writes ` +
+          `(PROFILE-OPLOG-SCHEMA.md §7).`,
+      );
+    }
+    this._envelopesSupported = hasPut;
+    return hasPut;
+  }
+
+  /**
    * Write `encryptedPayload` to OrbitDB wrapped in a structured envelope.
    * Falls back to raw-bytes `db.put` if the underlying adapter does not
-   * implement `putEntry` (test-only stubs or partial implementations).
+   * implement putEntry (legacy test stubs, older adapter versions).
+   *
+   * Capability probe is symmetric: the first call asserts that putEntry
+   * and getEntry are either both present or both absent. See
+   * `supportsEnvelopes()`.
    */
   private async writeEnvelope(
     profileKey: string,
@@ -748,18 +784,26 @@ export class ProfileStorageProvider implements StorageProvider {
     entryType: OpLogEntryType = 'cache_index',
   ): Promise<void> {
     const originated = deriveOriginForType(entryType);
-    if (typeof this.db.putEntry === 'function') {
+    if (this.supportsEnvelopes()) {
       const envelope = buildLocalEntry({
         type: entryType,
         originated,
         payload: encryptedPayload,
       });
-      await this.db.putEntry(profileKey, envelope);
+      await this.db.putEntry!(profileKey, envelope);
     } else {
       // Legacy adapter without putEntry support — write raw bytes.
-      // Readers using getEntry see a synthetic legacy envelope (payload
-      // round-trips; no semantic change).
+      // Readers using the companion legacy path (also no getEntry) see
+      // raw bytes via db.get. getEntry's legacy fallback wraps raw
+      // bytes on decode for MIXED adapters where only part of the surface
+      // has migrated — which the symmetric probe above forbids.
       await this.db.put(profileKey, encryptedPayload);
+      // Mark locally-authored for adapters that support the tracking hook
+      // (OrbitDbAdapter exposes markLocallyAuthored as a non-interface method).
+      const markHook = (this.db as { markLocallyAuthored?: (k: string) => void }).markLocallyAuthored;
+      if (typeof markHook === 'function') {
+        markHook.call(this.db, profileKey);
+      }
     }
   }
 
@@ -768,10 +812,17 @@ export class ProfileStorageProvider implements StorageProvider {
    * the key is absent. Legacy raw-bytes entries are auto-wrapped by
    * `getEntry`'s legacy fallback (§7.1), so this helper works on both
    * pre-schema and post-schema OpLog contents.
+   *
+   * Passes `trustLocalClaim: true` — callers at this layer have already
+   * established that this wallet's OrbitDB instance is its own source of
+   * truth (no cross-wallet sharing). Peer writes reach this path only
+   * through replication events, which clear the locally-authored set.
    */
   private async readEnvelopePayload(profileKey: string): Promise<Uint8Array | null> {
-    if (typeof this.db.getEntry === 'function') {
-      const envelope = (await this.db.getEntry(profileKey)) as OpLogEntryEnvelope | null;
+    if (this.supportsEnvelopes()) {
+      const envelope = (await this.db.getEntry!(profileKey, {
+        trustLocalClaim: true,
+      })) as OpLogEntryEnvelope | null;
       return envelope ? envelope.payload : null;
     }
     return this.db.get(profileKey);

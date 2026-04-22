@@ -1046,5 +1046,38 @@ describe('ProfileStorageProvider', () => {
     //   - orbitdb-adapter-entries.test.ts (adapter getEntry legacy path)
     // Integration via ProfileStorageProvider is covered by the "legacy db
     // without putEntry" test above (structured API unavailable → raw bytes).
+
+    it('asymmetric adapter (putEntry without getEntry) fails at first write', async () => {
+      // Post-steelman Fix D: asymmetric capability is a configuration error.
+      // A partial adapter that writes envelopes but reads raw would silently
+      // corrupt reads — reject at first write instead.
+      const db = createMockDb();
+      (db as unknown as { putEntry: unknown }).putEntry = async () => { /* stub */ };
+      // Deliberately NOT adding getEntry.
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await expect(provider.set('mnemonic', 'val')).rejects.toMatchObject({
+        code: 'PROFILE_NOT_INITIALIZED',
+      });
+    });
+
+    it('asymmetric adapter (getEntry without putEntry) fails at first write', async () => {
+      const db = createMockDb();
+      (db as unknown as { getEntry: unknown }).getEntry = async () => null;
+      // Deliberately NOT adding putEntry.
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await expect(provider.set('mnemonic', 'val')).rejects.toMatchObject({
+        code: 'PROFILE_NOT_INITIALIZED',
+      });
+    });
   });
 });

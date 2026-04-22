@@ -286,13 +286,20 @@ export interface ProfileDatabase {
    * Read a structured OpLog entry envelope. Auto-wraps legacy opaque
    * bytes in a synthetic envelope (§7.1). Returns null if key absent.
    *
-   * Pass `opts.downgradeAsReplicated = true` when consuming entries from
-   * a replication event — the returned envelope's `originated` field is
-   * forced to `'replicated'` regardless of peer claims (§5.2).
+   * SECURITY DEFAULT: returned envelope's `originated` is forced to
+   * `'replicated'` UNLESS caller passes `trustLocalClaim: true` AND the
+   * key was written by a local putEntry in this session. Prevents peer-
+   * forged `'user'`/`'system'` tags from leaking into local state (§5.2).
+   *
+   * @param opts.downgradeAsReplicated  — Legacy flag: force downgrade
+   *   regardless. Kept for backward compat; new callers use the default.
+   * @param opts.trustLocalClaim  — When true, returns the stored tag
+   *   verbatim IF the key is known to be locally-authored. Otherwise
+   *   still downgrades.
    */
   getEntry?(
     key: string,
-    opts?: { downgradeAsReplicated?: boolean },
+    opts?: { downgradeAsReplicated?: boolean; trustLocalClaim?: boolean },
   ): Promise<unknown | null>;
 }
 

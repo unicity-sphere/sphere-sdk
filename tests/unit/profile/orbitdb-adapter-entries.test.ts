@@ -61,7 +61,26 @@ describe('OrbitDbAdapter.putEntry + getEntry — round-trip', () => {
     ({ adapter, store } = makeAdapterWithFakeDb());
   });
 
-  it('writes structured envelope via putEntry; reads it via getEntry', async () => {
+  it('writes structured envelope via putEntry; reads it via getEntry with trustLocalClaim', async () => {
+    const entry = buildLocalEntry({
+      type: 'token_send',
+      originated: 'user',
+      payload: PAYLOAD,
+    });
+    await adapter.putEntry('tokens.bundle.abc', entry);
+    // trustLocalClaim: true is required to see the stored 'user' tag.
+    // Without it, the adapter defaults to replicated-downgrade (security).
+    const read = await adapter.getEntry('tokens.bundle.abc', { trustLocalClaim: true });
+    expect(read).not.toBeNull();
+    expect(read!.type).toBe('token_send');
+    expect(read!.originated).toBe('user');
+    expect(Array.from(read!.payload)).toEqual(Array.from(PAYLOAD));
+    expect(read!.ts).toBe(entry.ts);
+  });
+
+  it('default getEntry downgrades locally-written entries when trustLocalClaim omitted', async () => {
+    // Security default: even for locally-authored entries, plain getEntry
+    // returns 'replicated' unless caller explicitly trusts.
     const entry = buildLocalEntry({
       type: 'token_send',
       originated: 'user',
@@ -69,11 +88,8 @@ describe('OrbitDbAdapter.putEntry + getEntry — round-trip', () => {
     });
     await adapter.putEntry('tokens.bundle.abc', entry);
     const read = await adapter.getEntry('tokens.bundle.abc');
-    expect(read).not.toBeNull();
+    expect(read!.originated).toBe('replicated');
     expect(read!.type).toBe('token_send');
-    expect(read!.originated).toBe('user');
-    expect(Array.from(read!.payload)).toEqual(Array.from(PAYLOAD));
-    expect(read!.ts).toBe(entry.ts);
   });
 
   it('getEntry returns null when key absent', async () => {
@@ -86,7 +102,7 @@ describe('OrbitDbAdapter.putEntry + getEntry — round-trip', () => {
       type: 'cache_index',
       originated: 'system',
       payload: PAYLOAD,
-      ts: 42,
+      ts: 1700000000000, // plausible real-wallet ts (>= MIN_PLAUSIBLE_TS)
     });
     await adapter.putEntry('key', entry);
     const raw = store.get('key');
@@ -108,17 +124,28 @@ describe('OrbitDbAdapter.getEntry — legacy fallback (§7)', () => {
   });
 
   it('wraps pre-schema opaque bytes in synthetic envelope', async () => {
-    // Pre-schema wallet wrote raw encrypted bytes directly (not CBOR envelope).
-    const legacyBytes = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+    // Pre-schema OrbitDB stored raw Uint8Array values which IPLD-CBOR
+    // encodes as CBOR byte-strings. Simulate that wire format.
+    const { encode } = await import('@ipld/dag-cbor');
+    const legacyPayload = new Uint8Array([0x01, 0x02, 0x03, 0x04]);
+    const legacyBytes = encode(legacyPayload);
     store.set('profile.identity', legacyBytes);
 
     const read = await adapter.getEntry('profile.identity');
     expect(read).not.toBeNull();
-    expect(read!.v).toBe(OPLOG_ENTRY_SCHEMA_VERSION);
-    expect(read!.type).toBe('cache_index'); // synthetic default
+    expect(read!.v).toBe(0); // OPLOG_ENTRY_LEGACY_VERSION sentinel
+    expect(read!.type).toBe('cache_index');
     expect(read!.originated).toBe('system');
-    expect(read!.ts).toBe(0); // legacy marker
-    expect(Array.from(read!.payload)).toEqual(Array.from(legacyBytes));
+    expect(read!.ts).toBe(0);
+    expect(Array.from(read!.payload)).toEqual(Array.from(legacyPayload));
+  });
+
+  it('non-CBOR raw garbage FAILS CLOSED (steelman hardening)', async () => {
+    // Post-steelman: random bytes must NOT be promoted to trusted system entries.
+    store.set('bad.key', new Uint8Array([0xff, 0xfe, 0xfd, 0xfc]));
+    await expect(adapter.getEntry('bad.key')).rejects.toMatchObject({
+      code: 'ORBITDB_READ_FAILED',
+    });
   });
 });
 
@@ -131,8 +158,11 @@ describe('OrbitDbAdapter.getEntry — downgradeAsReplicated (§5.2)', () => {
     ({ adapter } = makeAdapterWithFakeDb());
   });
 
-  it('overrides peer-claimed originated=user → replicated', async () => {
-    // Write an envelope that claims user origin (simulating a peer's write).
+  it('default read overrides peer-claimed originated=user → replicated', async () => {
+    // Post-steelman: downgrade is the DEFAULT, not opt-in. Writing an
+    // envelope claiming 'user' origin is a local write (we're doing
+    // putEntry ourselves in this test), so trustLocalClaim:true returns
+    // the stored tag. Plain get() forces replicated regardless.
     const peerEnvelope: OpLogEntryEnvelope = {
       v: OPLOG_ENTRY_SCHEMA_VERSION,
       type: 'token_send',
@@ -142,17 +172,39 @@ describe('OrbitDbAdapter.getEntry — downgradeAsReplicated (§5.2)', () => {
     };
     await adapter.putEntry('tokens.bundle.xyz', peerEnvelope);
 
-    // Normal read preserves peer claim (caller controls trust model).
+    // Default read: forces downgrade (even on locally-written entry).
     const plain = await adapter.getEntry('tokens.bundle.xyz');
-    expect(plain!.originated).toBe('user');
+    expect(plain!.originated).toBe('replicated');
+    expect(plain!.type).toBe('token_send');
 
-    // Replication-ingress read downgrades peer claim.
+    // trustLocalClaim:true + key known locally → returns stored tag.
+    const trusted = await adapter.getEntry('tokens.bundle.xyz', { trustLocalClaim: true });
+    expect(trusted!.originated).toBe('user');
+
+    // Explicit downgrade (legacy flag, still works).
     const downgraded = await adapter.getEntry('tokens.bundle.xyz', {
       downgradeAsReplicated: true,
     });
     expect(downgraded!.originated).toBe('replicated');
-    expect(downgraded!.type).toBe('token_send'); // type preserved
-    expect(downgraded!.ts).toBe(1700000000000); // author's timestamp preserved
+    expect(downgraded!.ts).toBe(1700000000000);
+  });
+
+  it('trustLocalClaim:true does NOT trust keys not locally-authored', async () => {
+    const { adapter, store } = makeAdapterWithFakeDb();
+    // Simulate a peer-authored write directly into the store (bypass putEntry).
+    const { encodeEntry } = await import('../../../profile/oplog-entry');
+    const peerEnvelope: OpLogEntryEnvelope = {
+      v: OPLOG_ENTRY_SCHEMA_VERSION,
+      type: 'token_send',
+      originated: 'user', // peer's forgery
+      ts: 1700000000000,
+      payload: PAYLOAD,
+    };
+    store.set('tokens.bundle.peer', encodeEntry(peerEnvelope));
+
+    // Key not in localAuthoredKeys → even with trustLocalClaim, downgrade.
+    const read = await adapter.getEntry('tokens.bundle.peer', { trustLocalClaim: true });
+    expect(read!.originated).toBe('replicated');
   });
 
   it('downgradeAsReplicated returns null when key absent', async () => {
@@ -160,14 +212,17 @@ describe('OrbitDbAdapter.getEntry — downgradeAsReplicated (§5.2)', () => {
     expect(read).toBeNull();
   });
 
-  it('downgradeAsReplicated on legacy bytes yields replicated system entry', async () => {
+  it('downgradeAsReplicated REJECTS legacy-shaped bytes (peers cannot deliver pre-schema)', async () => {
+    // Post-steelman: legacy format is strictly a LOCAL read-time synthesis.
+    // A peer delivering legacy-shaped bytes at replication ingress is a
+    // protocol violation (SPEC §7 amended by steelman hardening).
+    const { encode } = await import('@ipld/dag-cbor');
     const { adapter, store } = makeAdapterWithFakeDb();
-    store.set('legacy', new Uint8Array([0xff, 0xfe]));
+    store.set('legacy', encode(new Uint8Array([0xde, 0xad])));
 
-    const read = await adapter.getEntry('legacy', { downgradeAsReplicated: true });
-    expect(read!.originated).toBe('replicated');
-    expect(read!.type).toBe('cache_index'); // legacy synthetic default
-    expect(read!.ts).toBe(0);
+    await expect(
+      adapter.getEntry('legacy', { downgradeAsReplicated: true }),
+    ).rejects.toMatchObject({ code: 'ORBITDB_READ_FAILED' });
   });
 });
 

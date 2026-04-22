@@ -1,6 +1,6 @@
 # Profile OpLog Entry Schema — Structured Envelope
 
-**Status:** Draft 1 — foundation for Phase D wiring (W11 / T-D11b / originated-tag discipline enforcement)
+**Status:** Draft 2 — post-steelman hardening (replication-edge authentication, DoS guards, symmetric capability probe, v=0 legacy sentinel)
 **Precedes:** PROFILE-ARCHITECTURE.md §4 (OrbitDB integration); POINTER-SPEC.md §10.2.3 (originated-tag discipline)
 **Supersedes:** the implicit `(key, encryptedBytes)` OpLog schema from PROFILE-ARCHITECTURE.md §4.2.
 
@@ -154,6 +154,50 @@ Full metadata privacy is a Phase 2 feature (onion routing, mixnet, timing-obfusc
 ### 3.3 Encryption primitive
 
 `payload` uses the existing `encryptProfileValue` / `decryptProfileValue` primitives (AES-256-GCM, wallet-derived key from `profile/encryption.ts` or equivalent). The envelope itself is NOT re-encrypted — only the payload.
+
+### 3.4 Replication-ingress attack surface (post-steelman)
+
+The `originated` tag is the load-bearing security field. A peer that can get a write accepted by OrbitDB's access controller will author envelopes of its choice — including `originated: 'user'` forgery attempts. Without defense-in-depth, any local code path that reads envelopes and trusts the stored tag would treat peer forgery as authentic local activity.
+
+**Authentication boundary: `OrbitDbAdapter.getEntry()` is the choke point.**
+
+Default behavior (post-steelman):
+
+```typescript
+// Default — replicated-downgrade enforced:
+const envelope = await adapter.getEntry(key);
+// → envelope.originated is ALWAYS 'replicated' (or v=0 legacy sentinel)
+
+// Explicit trust — requires BOTH the caller's signal AND local authorship:
+const envelope = await adapter.getEntry(key, { trustLocalClaim: true });
+// → envelope.originated is the stored tag IFF the key was written via
+//   putEntry in THIS session AND no replication event has fired since.
+```
+
+The adapter maintains a session-scoped `localAuthoredKeys: Set<string>` that:
+- Gains an entry on every local `putEntry(key, ...)` call.
+- Is CLEARED entirely on every `onReplication` event (conservative: a peer may have overwritten any key via OrbitDB's LWW-per-key CRDT).
+- Is CLEARED on `close()` / session end.
+
+A key written in session N cannot be trusted across sessions — a remote peer may have overwritten it (LWW) while we were offline. Local writes are always re-stamped on next write, so long-lived trust is not required.
+
+**What this defeats:**
+- Peer publishes `{originated: 'user', type: 'token_send', ...}` → default `getEntry` returns `originated: 'replicated'`. Local code that conditionally trusts 'user' origins does not conditionally trust this envelope.
+- Peer replays a forgery after a local write → the replication event fires → `localAuthoredKeys` clears → subsequent trusted reads downgrade again.
+- Peer crafts legacy-shaped CBOR (bare `Uint8Array`) at replication ingress → `decodeAndDowngradeReplicated` rejects with `OpLogEntryCorrupt` (legacy format is strictly local synthesis).
+
+**What this does NOT defeat** (out-of-scope for this layer):
+- An attacker with local code execution — they can call `markLocallyAuthored()` directly or bypass the adapter entirely.
+- A compromised OrbitDB identity used to write from a trusted device — indistinguishable from a legitimate local write.
+- Timing attacks inferring wallet activity from replication-event timing.
+
+### 3.5 DoS guards
+
+CBOR decode of untrusted replicated data is protected by:
+- `MAX_ENVELOPE_BYTES` = 256 KiB (pre-decode byte cap — rejects 4 GB-declared byte strings before allocation).
+- `MAX_PAYLOAD_BYTES` = 128 KiB (post-decode payload cap).
+- Strict shape check: envelope MUST contain exactly the five known fields `(v, type, originated, ts, payload)` — extra fields rejected.
+- `MIN_PLAUSIBLE_TS` = 2020-01-01 UTC: real envelopes must carry ts >= this value. `ts = 0` is reserved for the legacy sentinel; `ts < MIN_PLAUSIBLE_TS` is treated as corruption.
 
 ---
 
@@ -328,10 +372,39 @@ async get(key: string): Promise<Uint8Array | null>;
 
 // New (structured envelope — callers migrate one module at a time)
 async putEntry(key: string, entry: OpLogEntryEnvelope): Promise<void>;
-async getEntry(key: string): Promise<OpLogEntryEnvelope | null>;
+async getEntry(key: string, opts?: { trustLocalClaim?: boolean }): Promise<OpLogEntryEnvelope | null>;
 ```
 
 Once all callers have migrated, the legacy methods are deprecated in a single follow-up (not this design doc's scope).
+
+### 7.4 Deployment sequencing ⚠️ LOAD-BEARING
+
+**Strict requirement: all devices sharing an OrbitDB instance MUST upgrade to the new SDK before ANY of them write envelopes.**
+
+The migration is asymmetric by design:
+
+| Writer | Reader | Outcome |
+|--------|--------|---------|
+| Old SDK (raw bytes) | Old SDK | ✓ raw round-trip (pre-schema behavior) |
+| New SDK (envelope) | New SDK | ✓ envelope round-trip with downgrade enforcement |
+| Old SDK (raw bytes) | New SDK | ✓ legacy fallback wraps raw Uint8Array CBOR as synthetic v=0 envelope |
+| **New SDK (envelope)** | **Old SDK** | ❌ **BREAKS** — old SDK passes envelope bytes to `decryptProfileValue`, which interprets CBOR header bytes as AES-GCM nonce → `DECRYPTION_FAILED`. Wallet sees data as missing. |
+
+**Consequence:** if a user runs the new SDK on one device and the old SDK on another, the second device breaks the moment the first writes anything. Multi-device wallets MUST coordinate upgrades.
+
+**Deployment patterns:**
+
+1. **Coordinated fleet upgrade (simplest):** release the new SDK with a version-gate on an external signal (e.g., operator-controlled feature flag) and flip it after all known devices have updated. Keep the new SDK in legacy mode (reads only, does not write envelopes) until the flag flips. Not implemented in this schema — would require a per-adapter config flag.
+
+2. **Dual-write transition window (future hardening):** during a deprecation period, write BOTH formats under parallel keys (`key` = raw legacy, `key.v1` = envelope) and have new readers prefer the envelope form. After all old SDKs are decommissioned, dual-writing can stop. Not in scope for the initial rollout.
+
+3. **Big-bang upgrade (current default):** ship the new SDK with clear release notes: "all devices must upgrade together". Acceptable for early adopters. NOT acceptable once there's a production user base with multi-device wallets.
+
+**Recommendation:** production deployment SHOULD gate the envelope-write path on an explicit `enableEnvelopeWrites: boolean` configuration flag, defaulting to `false` in release builds until a fleet-upgrade window is complete.
+
+### 7.5 Symmetric capability probe
+
+`ProfileStorageProvider.supportsEnvelopes()` runs a one-shot probe on first access: both `putEntry` AND `getEntry` must exist on the adapter, or NEITHER. An asymmetric adapter (one method but not the other) throws `PROFILE_NOT_INITIALIZED` at the first write. This prevents the silent-corruption mode where an adapter writes envelopes but reads raw bytes (or vice versa) — a scenario that would otherwise leave unreadable data on disk with no error at write time.
 
 ---
 
