@@ -893,4 +893,158 @@ describe('ProfileStorageProvider', () => {
       }
     });
   });
+
+  // ===========================================================================
+  // OpLog envelope adoption (PROFILE-OPLOG-SCHEMA.md §5)
+  // ===========================================================================
+
+  describe('OpLog envelope adoption', () => {
+    /** Extension of the base mock db that also implements putEntry/getEntry. */
+    function createStructuredDb() {
+      const store = new Map<string, Uint8Array>();
+      const entryWrites: Array<{ key: string; type: string; originated: string }> = [];
+      let connected = true;
+      const db: ProfileDatabase = {
+        async connect(_config: OrbitDbConfig) { connected = true; },
+        async put(key: string, value: Uint8Array) { store.set(key, value); },
+        async get(key: string) { return store.get(key) ?? null; },
+        async del(key: string) { store.delete(key); },
+        async all(prefix?: string) {
+          const out = new Map<string, Uint8Array>();
+          for (const [k, v] of store) {
+            if (!prefix || k.startsWith(prefix)) out.set(k, v);
+          }
+          return out;
+        },
+        async close() { connected = false; },
+        onReplication() { return () => {}; },
+        isConnected() { return connected; },
+        async putEntry(key: string, entry: unknown) {
+          const { encodeEntry } = await import('../../../profile/oplog-entry');
+          const envelope = entry as { type: string; originated: string };
+          entryWrites.push({ key, type: envelope.type, originated: envelope.originated });
+          store.set(key, encodeEntry(entry as never));
+        },
+        async getEntry(key: string) {
+          const { decodeEntry } = await import('../../../profile/oplog-entry');
+          const raw = store.get(key);
+          return raw ? decodeEntry(raw) : null;
+        },
+      };
+      return { db, store, entryWrites };
+    }
+
+    it('set() writes via putEntry with cache_index/system default tag', async () => {
+      const { db, entryWrites } = createStructuredDb();
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      // Bypass real connect flow (same pattern as existing tests).
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await provider.set('mnemonic', 'test-mnemonic');
+
+      const setWrite = entryWrites.find((w) => w.key === 'identity.mnemonic');
+      expect(setWrite).toBeDefined();
+      expect(setWrite!.type).toBe('cache_index');
+      expect(setWrite!.originated).toBe('system');
+    });
+
+    it('setEntry() stamps user-action type with originated=user', async () => {
+      const { db, entryWrites } = createStructuredDb();
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      // Bypass real connect flow (same pattern as existing tests).
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await provider.setEntry('mnemonic', 'val', 'token_send');
+      const write = entryWrites.find((w) => w.key === 'identity.mnemonic');
+      expect(write!.type).toBe('token_send');
+      expect(write!.originated).toBe('user');
+    });
+
+    it('saveTrackedAddresses writes envelope with cache_index tag', async () => {
+      const { db, entryWrites } = createStructuredDb();
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      // Bypass real connect flow (same pattern as existing tests).
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const addrs: TrackedAddressEntry[] = [
+        { index: 0, addressId: EXPECTED_ADDRESS_ID, hidden: false, createdAt: 1, updatedAt: 1 },
+      ];
+      await provider.saveTrackedAddresses(addrs);
+      const write = entryWrites.find((w) => w.key === 'addresses.tracked');
+      expect(write).toBeDefined();
+      expect(write!.type).toBe('cache_index');
+      expect(write!.originated).toBe('system');
+    });
+
+    it('get() reads payload from envelope transparently', async () => {
+      const { db } = createStructuredDb();
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      // Bypass real connect flow (same pattern as existing tests).
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await provider.set('mnemonic', 'test-value');
+      // Clear local cache so read hits OrbitDB.
+      cache._store.clear();
+      const read = await provider.get('mnemonic');
+      expect(read).toBe('test-value');
+    });
+
+    it('stored bytes are CBOR-decodable envelopes', async () => {
+      const { db, store } = createStructuredDb();
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      // Bypass real connect flow (same pattern as existing tests).
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await provider.set('mnemonic', 'val');
+      const bytes = store.get('identity.mnemonic');
+      expect(bytes).toBeDefined();
+
+      const { decodeEntry, OPLOG_ENTRY_SCHEMA_VERSION } = await import('../../../profile/oplog-entry');
+      const env = decodeEntry(bytes!);
+      expect(env.v).toBe(OPLOG_ENTRY_SCHEMA_VERSION);
+      expect(env.type).toBe('cache_index');
+      expect(env.originated).toBe('system');
+      expect(env.ts).toBeGreaterThan(0);
+    });
+
+    it('legacy db without putEntry falls back to raw put/get', async () => {
+      // Use the original createMockDb (no putEntry/getEntry).
+      const db = createMockDb();
+      const cache = createMockCache();
+      const provider = new ProfileStorageProvider(cache, db);
+      provider.setIdentity(TEST_IDENTITY);
+      // Bypass real connect flow (same pattern as existing tests).
+      (provider as unknown as { dbStatus: string }).dbStatus = 'attached';
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await provider.set('mnemonic', 'legacy-value');
+      // The raw store contains encrypted bytes (not envelope CBOR).
+      expect(db._store.size).toBeGreaterThan(0);
+      // Read round-trips via the legacy path.
+      cache._store.clear();
+      const read = await provider.get('mnemonic');
+      expect(read).toBe('legacy-value');
+    });
+
+    // Pre-schema raw-bytes legacy fallback is covered by:
+    //   - oplog-entry.test.ts §7.1 (decode-legacy wrapper)
+    //   - orbitdb-adapter-entries.test.ts (adapter getEntry legacy path)
+    // Integration via ProfileStorageProvider is covered by the "legacy db
+    // without putEntry" test above (structured API unavailable → raw bytes).
+  });
 });

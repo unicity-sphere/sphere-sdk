@@ -24,6 +24,11 @@ import {
 } from './types';
 import { ProfileError } from './errors';
 import { deriveProfileEncryptionKey, encryptString, decryptString } from './encryption';
+import {
+  buildLocalEntry,
+  type OpLogEntryEnvelope,
+} from './oplog-entry';
+import type { OpLogEntryType } from './aggregator-pointer/originated-tag';
 import { logger } from '../core/logger';
 
 // =============================================================================
@@ -53,6 +58,24 @@ const TRANSPORT_KEY_PATTERNS: ReadonlyArray<{
  * Captures the address ID and swap ID.
  */
 const SWAP_KEY_PATTERN = /^(.+)_swap:(.+)$/;
+
+/**
+ * System-action types from originated-tag.ts SYSTEM_ACTION_TYPES.
+ * Kept as a local const to avoid runtime-importing a private constant;
+ * validated at write time by `assertOriginTagLocal` inside
+ * `buildLocalEntry`, so drift between this set and the canonical list
+ * produces an error at the write site.
+ */
+const SYSTEM_ACTION_TYPE_SET: ReadonlySet<OpLogEntryType> = new Set<OpLogEntryType>([
+  'session_receipt',
+  'cache_index',
+  'last_opened_ts',
+]);
+
+/** Derive the originated tag for a given entry type. */
+function deriveOriginForType(entryType: OpLogEntryType): 'user' | 'system' {
+  return SYSTEM_ACTION_TYPE_SET.has(entryType) ? 'system' : 'user';
+}
 
 // =============================================================================
 // Key Mapping Utilities
@@ -643,7 +666,7 @@ export class ProfileStorageProvider implements StorageProvider {
       return null;
     }
 
-    const encrypted = await this.db.get(translated.profileKey);
+    const encrypted = await this.readEnvelopePayload(translated.profileKey);
     if (encrypted === null) {
       return null;
     }
@@ -665,8 +688,14 @@ export class ProfileStorageProvider implements StorageProvider {
    * Set value by key.
    * Cache-only keys are written to local cache only.
    * All other keys are encrypted and written to both local cache AND OrbitDB.
+   *
+   * PROFILE-OPLOG-SCHEMA.md §5.1: the encrypted payload is wrapped in a
+   * structured envelope carrying an originated tag. Generic `set` calls
+   * default to `type='cache_index', originated='system'` — a safe
+   * conservative classification. Callers that know the action semantics
+   * SHOULD use `setEntry()` (see below) which accepts an explicit type.
    */
-  async set(key: string, value: string): Promise<void> {
+  async set(key: string, value: string, opts?: { entryType?: OpLogEntryType }): Promise<void> {
     const translated = translateKey(key, this.addressId);
 
     // Excluded keys — silently drop
@@ -682,11 +711,70 @@ export class ProfileStorageProvider implements StorageProvider {
       return;
     }
 
-    // 3. Write to OrbitDB (encrypted)
+    // 3. Write to OrbitDB (encrypted envelope)
     if (this.dbConnected) {
       const encrypted = await this.encrypt(value);
-      await this.db.put(translated.profileKey, encrypted);
+      await this.writeEnvelope(translated.profileKey, encrypted, opts?.entryType ?? 'cache_index');
     }
+  }
+
+  /**
+   * Typed-entry write helper — lets callers pass an explicit OpLogEntryType
+   * for W11 originated-tag discipline. Maps the user's `OpLogEntryType` to
+   * the envelope's `(type, originated)` pair via the originated-tag coherence
+   * rules (user-action types → 'user'; system types → 'system').
+   *
+   * Delegates to `set()` for local-cache write + key translation;
+   * the envelope wrap happens internally.
+   */
+  async setEntry(
+    key: string,
+    value: string,
+    entryType: OpLogEntryType,
+  ): Promise<void> {
+    return this.set(key, value, { entryType });
+  }
+
+  // ---------- Envelope helpers (PROFILE-OPLOG-SCHEMA.md §5) ----------
+
+  /**
+   * Write `encryptedPayload` to OrbitDB wrapped in a structured envelope.
+   * Falls back to raw-bytes `db.put` if the underlying adapter does not
+   * implement `putEntry` (test-only stubs or partial implementations).
+   */
+  private async writeEnvelope(
+    profileKey: string,
+    encryptedPayload: Uint8Array,
+    entryType: OpLogEntryType = 'cache_index',
+  ): Promise<void> {
+    const originated = deriveOriginForType(entryType);
+    if (typeof this.db.putEntry === 'function') {
+      const envelope = buildLocalEntry({
+        type: entryType,
+        originated,
+        payload: encryptedPayload,
+      });
+      await this.db.putEntry(profileKey, envelope);
+    } else {
+      // Legacy adapter without putEntry support — write raw bytes.
+      // Readers using getEntry see a synthetic legacy envelope (payload
+      // round-trips; no semantic change).
+      await this.db.put(profileKey, encryptedPayload);
+    }
+  }
+
+  /**
+   * Read an envelope's encrypted payload from OrbitDB. Returns null if
+   * the key is absent. Legacy raw-bytes entries are auto-wrapped by
+   * `getEntry`'s legacy fallback (§7.1), so this helper works on both
+   * pre-schema and post-schema OpLog contents.
+   */
+  private async readEnvelopePayload(profileKey: string): Promise<Uint8Array | null> {
+    if (typeof this.db.getEntry === 'function') {
+      const envelope = (await this.db.getEntry(profileKey)) as OpLogEntryEnvelope | null;
+      return envelope ? envelope.payload : null;
+    }
+    return this.db.get(profileKey);
   }
 
   /**
@@ -737,7 +825,7 @@ export class ProfileStorageProvider implements StorageProvider {
     if (key === 'wallet_exists' || key === `${STORAGE_PREFIX}wallet_exists`) {
       if (this.dbConnected) {
         // Check if the profile was cleared
-        const clearedBytes = await this.db.get(PROFILE_CLEARED_KEY);
+        const clearedBytes = await this.readEnvelopePayload(PROFILE_CLEARED_KEY);
         if (clearedBytes !== null) {
           const clearedStr = await this.decrypt(clearedBytes);
           if (clearedStr === 'true') {
@@ -754,7 +842,7 @@ export class ProfileStorageProvider implements StorageProvider {
 
     // 4. Check OrbitDB
     if (this.dbConnected) {
-      const value = await this.db.get(translated.profileKey);
+      const value = await this.readEnvelopePayload(translated.profileKey);
       return value !== null;
     }
 
@@ -806,7 +894,8 @@ export class ProfileStorageProvider implements StorageProvider {
     if (this.dbConnected) {
       if (!prefix) {
         const clearedBytes = await this.encrypt('true');
-        await this.db.put(PROFILE_CLEARED_KEY, clearedBytes);
+        // 'cache_index' classification: wallet-clear marker is a system event.
+        await this.writeEnvelope(PROFILE_CLEARED_KEY, clearedBytes, 'cache_index');
       } else {
         // Prefix-scoped clear: delete matching keys from OrbitDB
         const allEntries = await this.db.all();
@@ -835,7 +924,9 @@ export class ProfileStorageProvider implements StorageProvider {
     // 2. Write to OrbitDB
     if (this.dbConnected) {
       const encrypted = await this.encrypt(json);
-      await this.db.put(TRACKED_ADDRESSES_PROFILE_KEY, encrypted);
+      // Tracked addresses list is wallet-configuration metadata —
+      // classified as a system event (not a user action).
+      await this.writeEnvelope(TRACKED_ADDRESSES_PROFILE_KEY, encrypted, 'cache_index');
     }
   }
 
@@ -854,7 +945,7 @@ export class ProfileStorageProvider implements StorageProvider {
       return [];
     }
 
-    const encrypted = await this.db.get(TRACKED_ADDRESSES_PROFILE_KEY);
+    const encrypted = await this.readEnvelopePayload(TRACKED_ADDRESSES_PROFILE_KEY);
     if (encrypted === null) {
       return [];
     }
