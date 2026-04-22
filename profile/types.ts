@@ -52,6 +52,19 @@ export interface ProfileConfig {
   readonly flushDebounceMs?: number;
   /** Custom bootstrap peers for OrbitDB (convenience alias for orbitDb.bootstrapPeers) */
   readonly profileOrbitDbPeers?: string[];
+  /**
+   * Publish a wallet-keyed IPNS snapshot of active bundle CIDs after
+   * every flush, and attempt to resolve it on cold-start when the
+   * local OrbitDB has no bundles. Default: true.
+   *
+   * This is an OrbitDB-layer parity assist — without it, a freshly
+   * re-imported wallet on a wiped device cannot discover its own
+   * bundles unless another live peer is replicating the OrbitDB
+   * OpLog. Publish is best-effort (never fails the flush).
+   *
+   * Tests and specialised deployments can opt out with `false`.
+   */
+  readonly ipnsSnapshot?: boolean;
   /** Enable debug logging (default: false) */
   readonly debug?: boolean;
 }
@@ -219,6 +232,13 @@ export interface ProfileTokenStorageProviderOptions {
  * Abstract interface for the OrbitDB key-value database.
  * Implemented by the OrbitDB adapter (WU-P03). The rest of the Profile
  * system never imports @orbitdb/core directly -- it uses this interface.
+ *
+ * Two write/read APIs coexist during the OpLog-schema migration
+ * (PROFILE-OPLOG-SCHEMA.md §7):
+ *   - Legacy opaque-bytes: `put(key, Uint8Array)` / `get(key)`
+ *   - Structured envelope: `putEntry(key, OpLogEntryEnvelope)` / `getEntry(key)`
+ * Callers migrate one module at a time. `getEntry` auto-wraps legacy
+ * opaque bytes in a synthetic envelope, so a partial migration reads cleanly.
  */
 export interface ProfileDatabase {
   /**
@@ -254,6 +274,26 @@ export interface ProfileDatabase {
 
   /** Whether `connect()` has been called and `close()` has not. */
   isConnected(): boolean;
+
+  /**
+   * Write a structured OpLog entry envelope (PROFILE-OPLOG-SCHEMA.md §5).
+   * Type is imported lazily via `import type` elsewhere; declared as
+   * `unknown` here to avoid a circular types dependency.
+   */
+  putEntry?(key: string, entry: unknown): Promise<void>;
+
+  /**
+   * Read a structured OpLog entry envelope. Auto-wraps legacy opaque
+   * bytes in a synthetic envelope (§7.1). Returns null if key absent.
+   *
+   * Pass `opts.downgradeAsReplicated = true` when consuming entries from
+   * a replication event — the returned envelope's `originated` field is
+   * forced to `'replicated'` regardless of peer claims (§5.2).
+   */
+  getEntry?(
+    key: string,
+    opts?: { downgradeAsReplicated?: boolean },
+  ): Promise<unknown | null>;
 }
 
 // =============================================================================

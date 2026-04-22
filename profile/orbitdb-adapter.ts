@@ -12,11 +12,18 @@
  */
 
 import { ProfileError } from './errors.js';
+import {
+  decodeAndDowngradeReplicated,
+  decodeEntry,
+  encodeEntry,
+  type OpLogEntryEnvelope,
+} from './oplog-entry.js';
 import type { OrbitDbConfig, ProfileDatabase } from './types.js';
 
 // Re-export types so existing consumers that import from this module still work
 export type { OrbitDbConfig, ProfileDatabase };
 export { ProfileError };
+export type { OpLogEntryEnvelope };
 
 // ---------------------------------------------------------------------------
 // Implementation
@@ -246,6 +253,70 @@ export class OrbitDbAdapter implements ProfileDatabase {
       throw new ProfileError(
         'ORBITDB_WRITE_FAILED',
         `Failed to delete key "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+  }
+
+  // ---------- Structured-entry API (PROFILE-OPLOG-SCHEMA.md §5) ----------
+
+  /**
+   * Write a structured OpLog entry envelope at `key`.
+   *
+   * Encodes via deterministic CBOR (@ipld/dag-cbor) and stores the bytes
+   * in the underlying OrbitDB keyvalue database. OrbitDB signs the
+   * (key, cborBytes) pair, binding the envelope's originated tag to the
+   * author's identity.
+   *
+   * Callers SHOULD construct envelopes via `buildLocalEntry()` or the
+   * replication-downgrade helpers from `profile/oplog-entry.ts` rather
+   * than hand-rolling — those helpers enforce the (type, originated)
+   * coherence check.
+   */
+  async putEntry(key: string, entry: OpLogEntryEnvelope): Promise<void> {
+    this.ensureConnected();
+    try {
+      const cborBytes = encodeEntry(entry);
+      await this.db.put(key, cborBytes);
+    } catch (err) {
+      throw new ProfileError(
+        'ORBITDB_WRITE_FAILED',
+        `Failed to write structured entry at "${key}": ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+  }
+
+  /**
+   * Read a structured OpLog entry envelope at `key`, or `null` if absent.
+   *
+   * Legacy opaque-bytes entries (from pre-schema wallets) are wrapped
+   * in a synthetic envelope per §7.1 — callers can detect them via
+   * `isLegacyEntry(envelope)` from `profile/oplog-entry.ts`.
+   *
+   * @param opts.downgradeAsReplicated  — When true, applies the
+   *   `decodeAndDowngradeReplicated` helper: the returned envelope's
+   *   `originated` field is forced to `'replicated'` regardless of
+   *   what the stored bytes claim. Callers handling replication
+   *   events MUST pass `true` so peer-claimed `'user'`/`'system'`
+   *   tags cannot leak into local state (§5.2).
+   */
+  async getEntry(
+    key: string,
+    opts: { downgradeAsReplicated?: boolean } = {},
+  ): Promise<OpLogEntryEnvelope | null> {
+    this.ensureConnected();
+    try {
+      const raw = await this.db.get(key);
+      if (raw === undefined || raw === null) return null;
+      const bytes = coerceToUint8Array(raw);
+      return opts.downgradeAsReplicated === true
+        ? decodeAndDowngradeReplicated(bytes)
+        : decodeEntry(bytes);
+    } catch (err) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Failed to read structured entry at "${key}": ${err instanceof Error ? err.message : String(err)}`,
         err,
       );
     }
