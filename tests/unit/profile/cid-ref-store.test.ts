@@ -18,7 +18,14 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
 import { create as createDigest } from 'multiformats/hashes/digest';
-import { CID_REF_SCHEMA_VERSION, CidRefStore, type CidRef } from '../../../profile/cid-ref-store';
+import {
+  AES_GCM_OVERHEAD_BYTES,
+  CID_REF_SCHEMA_VERSION,
+  CidRefStore,
+  FETCH_SIZE_TOLERANCE_BYTES,
+  type CidRef,
+} from '../../../profile/cid-ref-store';
+import { ProfileError } from '../../../profile/errors';
 
 // ── Test fixtures ─────────────────────────────────────────────────────────
 
@@ -369,3 +376,126 @@ describe('CidRefStore — end-to-end migration pattern', () => {
     gateway.cleanup();
   });
 });
+
+// ── Steelman-fix tests (hardened after recursive review) ──────────────────
+
+describe('CidRefStore — steelman hardening', () => {
+  let gateway: ReturnType<typeof installFakeIpfsGateway>;
+  let store: CidRefStore;
+
+  beforeEach(() => {
+    gateway = installFakeIpfsGateway();
+    store = new CidRefStore({
+      gateways: ['https://ipfs.example.com'],
+      encryptionKey: TEST_KEY,
+    });
+  });
+
+  describe('size-bounded fetch (DoS guard)', () => {
+    it('throws CID_REF_SIZE_MISMATCH when fetched encrypted size greatly exceeds ref.size', async () => {
+      // Pin a 10 KB payload but CRAFT a ref claiming size=100 (poisoned).
+      const realPayload = new Uint8Array(10 * 1024).fill(0x42);
+      const realRef = await store.pinBytes(realPayload);
+
+      // Poisoned ref: same cid (content is real), but declared size is
+      // tiny. Simulates an LWW replication attack.
+      const poisonedRef: CidRef = { ...realRef, size: 100 };
+      await expect(store.fetchBytes(poisonedRef)).rejects.toThrow(ProfileError);
+      await expect(store.fetchBytes(poisonedRef)).rejects.toMatchObject({
+        code: 'CID_REF_SIZE_MISMATCH',
+      });
+      gateway.cleanup();
+    });
+
+    it('tolerance window allows small size drift', async () => {
+      const payload = new Uint8Array(1000).fill(0x77);
+      const realRef = await store.pinBytes(payload);
+      // Within tolerance — should succeed.
+      const slightlyOff: CidRef = {
+        ...realRef,
+        size: realRef.size - (FETCH_SIZE_TOLERANCE_BYTES - 1),
+      };
+      const fetched = await store.fetchBytes(slightlyOff);
+      expect(fetched.byteLength).toBe(payload.byteLength);
+      gateway.cleanup();
+    });
+
+    it('AES_GCM_OVERHEAD_BYTES constant matches primitive', async () => {
+      const plaintext = new Uint8Array([1, 2, 3]);
+      const ref = await store.pinBytes(plaintext);
+      expect(ref.size).toBe(plaintext.byteLength + AES_GCM_OVERHEAD_BYTES);
+      gateway.cleanup();
+    });
+  });
+
+  describe('typed error codes', () => {
+    it('validateRef throws CID_REF_CORRUPT (not BUNDLE_NOT_FOUND) on bad cid', async () => {
+      const bad: CidRef = { v: 1, cid: 'not-a-valid-cid', size: 100, ts: 1 };
+      await expect(store.fetchBytes(bad)).rejects.toMatchObject({
+        code: 'CID_REF_CORRUPT',
+      });
+      gateway.cleanup();
+    });
+
+    it('stringifyRef throws CID_REF_CORRUPT on bad cid', () => {
+      expect(() =>
+        CidRefStore.stringifyRef({ v: 1, cid: 'not-a-valid-cid', size: 100, ts: 1 }),
+      ).toThrow(
+        expect.objectContaining({ code: 'CID_REF_CORRUPT' }),
+      );
+    });
+  });
+
+  describe('tryParseRef — strengthened discriminator', () => {
+    const VALID_CID = 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze';
+
+    it('rejects ts=0 (was previously accepted → legacy false-positive risk)', () => {
+      const badTs = JSON.stringify({ v: 1, cid: VALID_CID, size: 100, ts: 0 });
+      expect(CidRefStore.tryParseRef(badTs)).toBeNull();
+    });
+
+    it('rejects non-integer ts (floating point)', () => {
+      const badTs = JSON.stringify({ v: 1, cid: VALID_CID, size: 100, ts: 1700000000000.5 });
+      expect(CidRefStore.tryParseRef(badTs)).toBeNull();
+    });
+
+    it('rejects non-integer size', () => {
+      const badSize = JSON.stringify({ v: 1, cid: VALID_CID, size: 100.5, ts: 1700000000000 });
+      expect(CidRefStore.tryParseRef(badSize)).toBeNull();
+    });
+
+    it('rejects cid strings that are not valid CIDs (legacy false-positive guard)', () => {
+      const bad = JSON.stringify({ v: 1, cid: 'not-a-real-cid', size: 100, ts: 1700000000000 });
+      expect(CidRefStore.tryParseRef(bad)).toBeNull();
+    });
+
+    it('accepts a well-formed ref with valid CID', () => {
+      const good = JSON.stringify({ v: 1, cid: VALID_CID, size: 100, ts: 1700000000000 });
+      const parsed = CidRefStore.tryParseRef(good);
+      expect(parsed).not.toBeNull();
+      expect(parsed!.cid).toBe(VALID_CID);
+    });
+  });
+
+  describe('pinJson — circular ref / non-serializable', () => {
+    it('throws ENCRYPTION_FAILED on circular refs (before async boundary)', async () => {
+      const circular: { self?: unknown } = {};
+      circular.self = circular;
+      await expect(store.pinJson(circular)).rejects.toMatchObject({
+        code: 'ENCRYPTION_FAILED',
+      });
+      gateway.cleanup();
+    });
+
+    it('throws ENCRYPTION_FAILED when top-level value is not JSON-serializable', async () => {
+      await expect(store.pinJson(undefined)).rejects.toMatchObject({
+        code: 'ENCRYPTION_FAILED',
+      });
+      await expect(store.pinJson(() => 1)).rejects.toMatchObject({
+        code: 'ENCRYPTION_FAILED',
+      });
+      gateway.cleanup();
+    });
+  });
+});
+

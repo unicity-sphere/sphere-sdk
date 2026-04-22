@@ -23,17 +23,33 @@
  * @module profile/cid-ref-store
  */
 
+import { CID } from 'multiformats/cid';
 import {
   decryptProfileValue,
   encryptProfileValue,
 } from './encryption.js';
 import { ProfileError } from './errors.js';
-import { fetchFromIpfs, pinToIpfs, verifyCidMatchesBytes } from './ipfs-client.js';
+import { fetchFromIpfs, pinToIpfs } from './ipfs-client.js';
 
 // ── CidRef envelope ───────────────────────────────────────────────────────
 
 /** Schema version of the CidRef envelope. */
 export const CID_REF_SCHEMA_VERSION = 1 as const;
+
+/**
+ * AES-256-GCM overhead: 12-byte IV + 16-byte auth tag = 28 bytes per
+ * encrypted blob. `encrypted.byteLength` always equals
+ * `plaintext.byteLength + 28`. Used for plaintext-size budget derivation.
+ */
+export const AES_GCM_OVERHEAD_BYTES = 28;
+
+/**
+ * Fetch-path tolerance around the declared `ref.size`. In the current
+ * AES-GCM primitive the ciphertext length is deterministic so we could
+ * match exactly, but a small tolerance accommodates future primitive
+ * changes (AES-GCM-SIV, header format bump) without a schema bump.
+ */
+export const FETCH_SIZE_TOLERANCE_BYTES = 128;
 
 /**
  * Reference envelope written inline in an OpLog value. Small (~100-150 bytes
@@ -139,9 +155,29 @@ export class CidRefStore {
     return ref;
   }
 
-  /** Convenience: JSON-stringify + UTF-8 encode + pin. */
+  /**
+   * Convenience: JSON-stringify + UTF-8 encode + pin. Wraps the synchronous
+   * JSON.stringify throw path (circular refs, BigInt) so callers see a
+   * typed ProfileError at the async boundary.
+   */
   async pinJson(value: unknown, contentV?: number): Promise<CidRef> {
-    const json = JSON.stringify(value);
+    let json: string;
+    try {
+      json = JSON.stringify(value);
+    } catch (err) {
+      throw new ProfileError(
+        'ENCRYPTION_FAILED',
+        `CidRefStore.pinJson: JSON.stringify failed — value has circular ref or unserializable type (${err instanceof Error ? err.message : String(err)}).`,
+        err,
+      );
+    }
+    if (json === undefined) {
+      // e.g. `undefined`, a function, or a symbol was passed at the top level.
+      throw new ProfileError(
+        'ENCRYPTION_FAILED',
+        `CidRefStore.pinJson: value is not JSON-serializable (got undefined after stringify).`,
+      );
+    }
     const bytes = new TextEncoder().encode(json);
     return this.pinBytes(bytes, contentV);
   }
@@ -151,21 +187,71 @@ export class CidRefStore {
   /**
    * Fetch encrypted blob by CID, verify content-address, decrypt, return plaintext.
    *
-   * Content-verification: `verifyCidMatchesBytes` asserts that the fetched
-   * bytes hash to the expected CID. Protects against a malicious / compromised
-   * gateway substituting different content.
+   * Size-bounding (steelman fix): the fetch cap is `ref.size +
+   * FETCH_SIZE_TOLERANCE_BYTES`, NOT the instance-wide `#maxFetchBytes`.
+   * This prevents a hostile peer (via OrbitDB LWW) from crafting a
+   * poisoned ref with small `size` but pointing to a huge blob — the
+   * fetch aborts before 50 MiB are allocated.
+   *
+   * Post-fetch the exact size is asserted — an attacker who matches the
+   * cap but pads the blob internally still triggers CID_REF_SIZE_MISMATCH.
+   *
+   * Content-verification is handled by fetchFromIpfs's internal
+   * verifyCidMatchesBytes; we rely on that invariant (redundant call
+   * removed per steelman — it masks regressions rather than catching them).
    */
   async fetchBytes(ref: CidRef): Promise<Uint8Array> {
     validateRef(ref);
-    const encrypted = await fetchFromIpfs(
-      [...this.#gateways],
-      ref.cid,
-      this.#fetchTimeoutMs,
+
+    // Per-ref byte cap — tighter than instance-wide #maxFetchBytes.
+    const perRefCap = Math.min(
+      ref.size + FETCH_SIZE_TOLERANCE_BYTES,
       this.#maxFetchBytes,
     );
-    // Belt-and-braces: fetchFromIpfs already verifies, but double-check here in
-    // case a caller passes a gateway list that bypasses the shared path.
-    verifyCidMatchesBytes(ref.cid, encrypted);
+
+    // If fetchFromIpfs's internal cap aborts because content exceeds our
+    // per-ref cap, translate the error code to CID_REF_SIZE_MISMATCH so
+    // callers see the authentic semantic (not generic "bundle not found").
+    let encrypted: Uint8Array;
+    try {
+      encrypted = await fetchFromIpfs(
+        [...this.#gateways],
+        ref.cid,
+        this.#fetchTimeoutMs,
+        perRefCap,
+      );
+    } catch (err) {
+      if (
+        err instanceof ProfileError &&
+        err.code === 'BUNDLE_NOT_FOUND' &&
+        /size limit|exceeded|\d+ bytes/i.test(err.message)
+      ) {
+        // fetchFromIpfs's size-limit abort. Relabel as size mismatch.
+        throw new ProfileError(
+          'CID_REF_SIZE_MISMATCH',
+          `CidRef size cap (${perRefCap} bytes from declared ${ref.size}) exceeded ` +
+            `during fetch of cid=${ref.cid}. Possible poisoned ref from LWW replication. ` +
+            `Original: ${err.message}`,
+          err,
+        );
+      }
+      throw err;
+    }
+
+    // Hard size check: the declared ref.size MUST match the actual fetched
+    // size within our tolerance. A mismatch means either replication
+    // corruption or a poisoned ref (content equal to or smaller than cap
+    // but deliberately not matching ref.size). Fail BEFORE decrypt.
+    const sizeDelta = Math.abs(encrypted.byteLength - ref.size);
+    if (sizeDelta > FETCH_SIZE_TOLERANCE_BYTES) {
+      throw new ProfileError(
+        'CID_REF_SIZE_MISMATCH',
+        `CidRef declared size ${ref.size} but fetched ${encrypted.byteLength} bytes ` +
+          `(delta ${sizeDelta} > tolerance ${FETCH_SIZE_TOLERANCE_BYTES}). ` +
+          `Possible replication corruption or poisoned ref at cid=${ref.cid}.`,
+      );
+    }
+
     const plaintext = await decryptProfileValue(this.#encryptionKey, encrypted);
     this.#log?.(
       `CidRefStore.fetchBytes: fetched ${encrypted.byteLength} bytes from ${ref.cid} (plaintext ${plaintext.byteLength} bytes)`,
@@ -193,9 +279,16 @@ export class CidRefStore {
    * input is NOT a CidRef — callers use that signal to fall back to the
    * legacy inline-JSON read path (PROFILE-CID-REFERENCES.md §6).
    *
-   * Intentionally strict: malformed refs or wrong schema versions return
-   * null (read-path fallback) rather than throwing. Writers always produce
-   * valid refs via `pinJson` / `pinBytes`.
+   * Intentionally strict (hardened per steelman):
+   *   - `v === 1` (unknown versions fail-closed)
+   *   - `cid` must parse via multiformats CID.parse (rejects arbitrary
+   *     strings, legacy values that happen to have a `cid`-named field)
+   *   - `size` must be finite non-negative integer
+   *   - `ts` must be a plausible wall-clock value (> 0 — rejects legacy
+   *     values carrying `ts: 0` as an absence marker)
+   *   - `contentV` if present must be finite number
+   *
+   * Writers always produce valid refs via `pinJson` / `pinBytes` / `stringifyRef`.
    */
   static tryParseRef(value: string | null | undefined): CidRef | null {
     if (value == null || value === '') return null;
@@ -211,8 +304,22 @@ export class CidRefStore {
     const r = parsed as Partial<CidRef>;
     if (r.v !== CID_REF_SCHEMA_VERSION) return null;
     if (typeof r.cid !== 'string' || r.cid.length === 0) return null;
-    if (typeof r.size !== 'number' || !Number.isFinite(r.size) || r.size < 0) return null;
-    if (typeof r.ts !== 'number' || !Number.isFinite(r.ts) || r.ts < 0) return null;
+    // Strict CID validation — a legacy JSON field named 'cid' with a random
+    // string won't match; a real CID string will. Catches legacy false-positives.
+    try {
+      CID.parse(r.cid);
+    } catch {
+      return null;
+    }
+    if (typeof r.size !== 'number' || !Number.isFinite(r.size) || r.size < 0 || !Number.isInteger(r.size)) {
+      return null;
+    }
+    // ts MUST be > 0 — real refs always carry Date.now() (>0). Legacy
+    // values could happen to have a ts:0 field, so the strict positivity
+    // check reduces discriminator false-positives.
+    if (typeof r.ts !== 'number' || !Number.isFinite(r.ts) || r.ts <= 0 || !Number.isInteger(r.ts)) {
+      return null;
+    }
     if (r.contentV !== undefined && (typeof r.contentV !== 'number' || !Number.isFinite(r.contentV))) {
       return null;
     }
@@ -231,14 +338,23 @@ export class CidRefStore {
 function validateRef(ref: CidRef): void {
   if (ref.v !== CID_REF_SCHEMA_VERSION) {
     throw new ProfileError(
-      'BUNDLE_NOT_FOUND',
+      'CID_REF_CORRUPT',
       `CidRef has unknown schema version ${String(ref.v)} (expected ${CID_REF_SCHEMA_VERSION}).`,
     );
   }
   if (typeof ref.cid !== 'string' || ref.cid.length === 0) {
-    throw new ProfileError('BUNDLE_NOT_FOUND', `CidRef has invalid cid "${String(ref.cid)}".`);
+    throw new ProfileError('CID_REF_CORRUPT', `CidRef has invalid cid "${String(ref.cid)}".`);
+  }
+  try {
+    CID.parse(ref.cid);
+  } catch (err) {
+    throw new ProfileError(
+      'CID_REF_CORRUPT',
+      `CidRef has unparseable cid "${ref.cid}": ${err instanceof Error ? err.message : String(err)}`,
+      err,
+    );
   }
   if (typeof ref.size !== 'number' || !Number.isFinite(ref.size) || ref.size < 0) {
-    throw new ProfileError('BUNDLE_NOT_FOUND', `CidRef has invalid size ${String(ref.size)}.`);
+    throw new ProfileError('CID_REF_CORRUPT', `CidRef has invalid size ${String(ref.size)}.`);
   }
 }

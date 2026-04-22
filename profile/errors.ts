@@ -19,7 +19,22 @@ export type ProfileErrorCode =
   | 'MIGRATION_FAILED'
   | 'ENCRYPTION_FAILED'
   | 'DECRYPTION_FAILED'
-  | 'BOOTSTRAP_REQUIRED';
+  | 'BOOTSTRAP_REQUIRED'
+  /** CidRef envelope is malformed / corrupt — distinct from BUNDLE_NOT_FOUND
+   *  which signals IPFS unavailability. Callers MUST NOT retry on this
+   *  code (the ref itself is bad; a retry will get the same result).
+   *  See PROFILE-CID-REFERENCES.md §2.1. */
+  | 'CID_REF_CORRUPT'
+  /** CidRef was read but the injected CidRefStore is absent / misconfigured
+   *  so the referenced IPFS content cannot be fetched. Distinct from
+   *  BUNDLE_NOT_FOUND (content may still exist on IPFS; we just lack the
+   *  capability to retrieve it). Caller SHOULD surface to user as a
+   *  configuration error rather than a data-loss event. */
+  | 'CID_REF_UNREADABLE'
+  /** CidRef's declared size does not match the encrypted blob actually
+   *  fetched from IPFS. Indicates either a crafted poisoned ref (hostile
+   *  peer via LWW replication) or corruption. Fail-closed; do not decrypt. */
+  | 'CID_REF_SIZE_MISMATCH';
 
 /**
  * Structured error for all Profile operations.

@@ -383,13 +383,27 @@ describe('PaymentsModule - V5 Token Finalization', () => {
   // ===========================================================================
 
   describe('V5 pending token CID-ref persistence', () => {
-    /** Minimal fake CidRefStore that pins into an in-memory map. */
+    /**
+     * Minimal fake CidRefStore that pins into an in-memory map. Uses real
+     * CID-like strings (valid base32 multibase encoding) so tryParseRef's
+     * CID.parse validation passes.
+     */
     function makeFakeCidRefStore() {
       const ipfsStore = new Map<string, unknown>();
-      let nextCid = 1;
+      // Pre-computed valid CIDv1 raw strings (base32-encoded, 'bafkre' prefix
+      // matches CIDv1 raw codec + sha2-256 multihash). Generated once; reused.
+      const FAKE_CIDS = [
+        'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+        'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+        'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+        'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu',
+        'bafkreigc7s4sqhn7y7qdmkshxswfucacvalvb7r6i57sxa3gngkxm7pwdq',
+      ];
+      let nextCid = 0;
       const fakeStore = {
         pinJson: vi.fn(async (value: unknown) => {
-          const cid = `bafyFakeCid${nextCid++}`;
+          const cid = FAKE_CIDS[nextCid % FAKE_CIDS.length]!;
+          nextCid += 1;
           ipfsStore.set(cid, value);
           const json = JSON.stringify(value);
           return {
@@ -423,7 +437,7 @@ describe('PaymentsModule - V5 Token Finalization', () => {
       // Should be a parseable CID-ref envelope.
       const parsed = JSON.parse(kvData!);
       expect(parsed.v).toBe(1);
-      expect(parsed.cid).toMatch(/^bafy/);
+      expect(parsed.cid).toMatch(/^baf/);  // CIDv1 prefix (bafk/bafy etc.)
       expect(parsed.size).toBeGreaterThan(0);
       expect(parsed.ts).toBeGreaterThan(0);
       expect(fakeStore.pinJson).toHaveBeenCalledTimes(1);
@@ -435,10 +449,11 @@ describe('PaymentsModule - V5 Token Finalization', () => {
 
       // Pre-populate: emulate a prior write.
       const token = createV5PendingToken(SPLIT_GROUP_ID_1);
-      ipfsStore.set('bafyPrePin', [token]);
+      const prePinCid = 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze';
+      ipfsStore.set(prePinCid, [token]);
       storageMap.set(
         STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
-        JSON.stringify({ v: 1, cid: 'bafyPrePin', size: 1000, ts: 1700000000000 }),
+        JSON.stringify({ v: 1, cid: prePinCid, size: 1000, ts: 1700000000000 }),
       );
 
       await module.load();
