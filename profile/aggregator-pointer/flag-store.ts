@@ -59,7 +59,7 @@ export class FlagStore {
     }
     if (!/^[0-9a-f]{66}$/.test(signingPubKeyHex)) {
       throw new RangeError(
-        `signingPubKeyHex must be 66 hex chars (33-byte compressed secp256k1); got "${signingPubKeyHex}"`,
+        `signingPubKeyHex must be 66 lowercase hex chars (33-byte compressed secp256k1); got "${signingPubKeyHex}"`,
       );
     }
     return new FlagStore(storage, signingPubKeyHex);

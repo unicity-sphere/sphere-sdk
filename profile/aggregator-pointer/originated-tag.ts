@@ -191,7 +191,7 @@ export function assertOriginTagReplicated(entryType: string, originated: unknown
 export function downgradeForReplication<T extends Record<string, unknown>>(
   entry: T,
 ): T & { originated: 'replicated' } {
-  if ((entry as Record<string, unknown>).originated === undefined) {
+  if ((entry as Record<string, unknown>).originated == null) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH,
       `downgradeForReplication: entry has no originated tag — protocol violation at replication edge (SPEC §10.2.3).`,

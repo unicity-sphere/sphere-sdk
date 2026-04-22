@@ -130,11 +130,10 @@ export async function isBlocked(store: FlagStore): Promise<BlockedState> {
   }
 
   if (!KNOWN_BLOCKED_REASONS.has(r.reason)) {
-    throw new AggregatorPointerError(
-      AggregatorPointerErrorCode.CORRUPT,
-      `BLOCKED flag record has unrecognized reason "${r.reason}" — possible storage corruption.`,
-      { reason: r.reason },
-    );
+    // Forward-compatibility: a newer spec version may write a reason unknown to
+    // this version.  Treating it as CORRUPT would brick wallets on version
+    // downgrade — instead, remain blocked (safe default) with the stored reason.
+    return { blocked: true, reason: r.reason as BlockedReason, setAt: r.setAt };
   }
 
   return { blocked: true, reason: r.reason as BlockedReason, setAt: r.setAt };
@@ -147,7 +146,19 @@ export async function isBlocked(store: FlagStore): Promise<BlockedState> {
  * (preserves the earliest block event for diagnostics).
  */
 export async function setBlocked(store: FlagStore, reason: BlockedReason): Promise<void> {
-  const existing = await isBlocked(store);
+  // Idempotency check: if a valid BLOCKED record exists, preserve it.
+  // If the record is corrupt, overwrite it — registering the block is more
+  // important than preserving a broken flag (fail-forward on corruption).
+  let existing: BlockedState;
+  try {
+    existing = await isBlocked(store);
+  } catch (err) {
+    if (err instanceof AggregatorPointerError && err.code === AggregatorPointerErrorCode.CORRUPT) {
+      existing = { blocked: false };
+    } else {
+      throw err;
+    }
+  }
   if (existing.blocked) return; // idempotent — keep original setAt
 
   const rec: BlockedRecord = { blocked: true, reason, setAt: Date.now() };

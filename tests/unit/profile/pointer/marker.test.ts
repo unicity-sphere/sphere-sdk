@@ -15,6 +15,7 @@ import {
   FlagStore,
   AggregatorPointerErrorCode,
   MARKER_MAX_JUMP,
+  VERSION_MAX,
 } from '../../../../profile/aggregator-pointer/index.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -182,5 +183,35 @@ describe('resolvePublishVersion (T-B2, H13)', () => {
     // cidHash mismatch → rollback-safe bump (not idempotent), but not CORRUPT
     const r = await resolvePublishVersion(fs, 5, CID_B);
     expect(r.v).toBe(6);
+  });
+});
+
+describe('writeMarker v validation', () => {
+  it('throws VERSION_OUT_OF_RANGE for v = 0', async () => {
+    const fs = makeFlagStore();
+    await expect(writeMarker(fs, 0 as never, CID_A)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.VERSION_OUT_OF_RANGE,
+    });
+  });
+
+  it('throws VERSION_OUT_OF_RANGE for negative v', async () => {
+    const fs = makeFlagStore();
+    await expect(writeMarker(fs, -1 as never, CID_A)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.VERSION_OUT_OF_RANGE,
+    });
+  });
+
+  it('accepts v = VERSION_MIN (1)', async () => {
+    const fs = makeFlagStore();
+    await expect(writeMarker(fs, 1, CID_A)).resolves.toBeUndefined();
+  });
+});
+
+describe('resolvePublishVersion VERSION_MAX overflow guard', () => {
+  it('throws VERSION_OUT_OF_RANGE when currentLocalVersion === VERSION_MAX', async () => {
+    const fs = makeFlagStore();
+    await expect(resolvePublishVersion(fs, VERSION_MAX as never, CID_A)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.VERSION_OUT_OF_RANGE,
+    });
   });
 });

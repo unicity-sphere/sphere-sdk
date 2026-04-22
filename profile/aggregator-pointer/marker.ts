@@ -21,6 +21,16 @@ import { MARKER_MAX_JUMP, VERSION_MIN, VERSION_MAX } from './constants.js';
 import type { FlagStore } from './flag-store.js';
 import type { PendingVersionMarker, PointerVersion } from './types.js';
 
+function assertVersionInRange(v: number, context: string): asserts v is PointerVersion {
+  if (!Number.isInteger(v) || v < VERSION_MIN || v > VERSION_MAX) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.VERSION_OUT_OF_RANGE,
+      `${context}: version ${v} is outside valid range [${VERSION_MIN}, ${VERSION_MAX}].`,
+      { v },
+    );
+  }
+}
+
 // Storage key suffix (scoped by FlagStore prefix).
 const MARKER_KEY = 'pending_version';
 
@@ -100,6 +110,7 @@ export async function writeMarker(
   v: PointerVersion,
   cidBytes: Uint8Array,
 ): Promise<void> {
+  assertVersionInRange(v, 'writeMarker');
   if (cidBytes.length !== 32) {
     throw new RangeError(`writeMarker: cidBytes must be exactly 32 bytes; got ${cidBytes.length}`);
   }
@@ -157,14 +168,18 @@ export async function resolvePublishVersion(
   const marker = await readMarker(store);
 
   if (marker === null) {
-    return { v: currentLocalVersion + 1, isIdempotentRetry: false, wasCompacted: false };
+    const v = currentLocalVersion + 1 as PointerVersion;
+    assertVersionInRange(v, 'resolvePublishVersion(no-marker)');
+    return { v, isIdempotentRetry: false, wasCompacted: false };
   }
 
   // Case 2: stale marker (crash happened before localVersion was persisted,
   // but after a previous successful publish cleared the marker).
   if (marker.v <= currentLocalVersion) {
     await clearMarker(store);
-    return { v: currentLocalVersion + 1, isIdempotentRetry: false, wasCompacted: true };
+    const v = currentLocalVersion + 1 as PointerVersion;
+    assertVersionInRange(v, 'resolvePublishVersion(stale-compact)');
+    return { v, isIdempotentRetry: false, wasCompacted: true };
   }
 
   const jump = marker.v - currentLocalVersion;
@@ -201,5 +216,6 @@ export async function resolvePublishVersion(
   // v is currentLocalVersion + 1 which is already fresh (not marker.v), safe.
   const safeV =
     marker.v === currentLocalVersion + 1 ? marker.v + 1 : currentLocalVersion + 1;
-  return { v: safeV, isIdempotentRetry: false, wasCompacted: false };
+  assertVersionInRange(safeV, 'resolvePublishVersion(otp-bump)');
+  return { v: safeV as PointerVersion, isIdempotentRetry: false, wasCompacted: false };
 }

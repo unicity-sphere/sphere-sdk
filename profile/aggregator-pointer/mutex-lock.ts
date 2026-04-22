@@ -180,6 +180,11 @@ class NodeMutex implements PointerMutex {
     const timeoutMs = opts?.timeoutMs ?? 30_000;
     const prim = await this.#getPrimitives();
 
+    // Single deadline for the entire acquire (Step 1 + Step 2 combined).
+    // Computing it here prevents deadline doubling where Step 1 consumes
+    // nearly all of timeoutMs and Step 2 then gets a fresh budget.
+    const deadline = Date.now() + timeoutMs;
+
     // Step 1: acquire in-process mutex (R-18: always first).
     //
     // Orphan prevention: if the timeout fires before acquireInProcess resolves,
@@ -199,8 +204,11 @@ class NodeMutex implements PointerMutex {
 
     const inProcessTimer = setTimeout(() => { timedOut = true; }, timeoutMs);
 
-    const inProcessTimeout = new Promise<never>((_, reject) =>
-      setTimeout(
+    // Save the inner timer handle so it can be cleared if the acquire wins
+    // the race — prevents an unhandled rejection in --unhandled-rejections=strict.
+    let inProcessTimeoutHandle!: ReturnType<typeof setTimeout>;
+    const inProcessTimeout = new Promise<never>((_, reject) => {
+      inProcessTimeoutHandle = setTimeout(
         () =>
           reject(
             new AggregatorPointerError(
@@ -209,38 +217,41 @@ class NodeMutex implements PointerMutex {
             ),
           ),
         timeoutMs,
-      ),
-    );
+      );
+    });
+    // Suppress the unhandled rejection if the acquire wins the race.
+    void inProcessTimeout.catch(() => {});
 
     try {
       inProcessRelease = await Promise.race([inProcessAcquirePromise, inProcessTimeout]);
     } catch (err) {
       clearTimeout(inProcessTimer);
+      clearTimeout(inProcessTimeoutHandle);
       throw err;
     }
     clearTimeout(inProcessTimer);
+    clearTimeout(inProcessTimeoutHandle);
 
     // Step 2: acquire file lock (cross-process).
-    const deadline = Date.now() + timeoutMs;
     const retryMs = 250;
     let fileLockRelease: (() => Promise<void>) | null = null;
 
     while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        inProcessRelease!();
+        throw new AggregatorPointerError(
+          AggregatorPointerErrorCode.PUBLISH_BUSY,
+          `File lock "${this.#lockFilePath}" held by another process; timed out after ${timeoutMs}ms.`,
+        );
+      }
       try {
         fileLockRelease = await prim.acquireFileLock(this.#lockFilePath, 8000);
         break;
       } catch (err: unknown) {
         const code = (err as NodeJS.ErrnoException)?.code;
         if (code === 'ELOCKED') {
-          const remaining = deadline - Date.now();
-          if (remaining <= 0) {
-            inProcessRelease!();
-            throw new AggregatorPointerError(
-              AggregatorPointerErrorCode.PUBLISH_BUSY,
-              `File lock "${this.#lockFilePath}" held by another process; timed out after ${timeoutMs}ms.`,
-            );
-          }
-          await new Promise((res) => setTimeout(res, Math.min(retryMs, remaining)));
+          await new Promise((res) => setTimeout(res, Math.min(retryMs, deadline - Date.now())));
           continue;
         }
         inProcessRelease!();

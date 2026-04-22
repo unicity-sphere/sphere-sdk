@@ -86,6 +86,13 @@ describe('stampOriginated (K2)', () => {
       expect.objectContaining({ code: AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH }),
     );
   });
+
+  it('double-stamp guard: triggered by originated=null (not just undefined)', () => {
+    const entry = { type: 'token_send', originated: null };
+    expect(() => stampOriginated(entry as unknown as Record<string, unknown>, 'user')).toThrow(
+      expect.objectContaining({ code: AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH }),
+    );
+  });
 });
 
 describe('assertOriginTagLocal — user-action types (K3–K5)', () => {
@@ -216,6 +223,13 @@ describe('downgradeForReplication (K12)', () => {
 
   it('fail-closed: throws when originated is undefined explicitly', () => {
     const entry = { type: 'token_send', originated: undefined };
+    expect(() => downgradeForReplication(entry as unknown as Record<string, unknown>)).toThrow(
+      expect.objectContaining({ code: AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH }),
+    );
+  });
+
+  it('fail-closed: throws when originated is null (not just undefined)', () => {
+    const entry = { type: 'token_send', originated: null };
     expect(() => downgradeForReplication(entry as unknown as Record<string, unknown>)).toThrow(
       expect.objectContaining({ code: AggregatorPointerErrorCode.SECURITY_ORIGIN_MISMATCH }),
     );

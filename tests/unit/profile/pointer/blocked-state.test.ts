@@ -113,14 +113,23 @@ describe('isBlocked / setBlocked / clearBlocked (T-B5)', () => {
     });
   });
 
-  it('isBlocked throws CORRUPT for valid JSON with unknown reason', async () => {
+  it('isBlocked returns blocked=true for unknown reason (forward-compat)', async () => {
     await (fs as unknown as { set(k: string, v: string): Promise<void> }).set(
       'blocked',
       JSON.stringify({ blocked: true, reason: 'future_reason', setAt: Date.now() }),
     );
-    await expect(isBlocked(fs)).rejects.toMatchObject({
-      code: AggregatorPointerErrorCode.CORRUPT,
-    });
+    const state = await isBlocked(fs);
+    expect(state.blocked).toBe(true);
+  });
+
+  it('setBlocked overwrites a corrupt record (fail-forward on corruption)', async () => {
+    // Write a corrupt record first.
+    await (fs as unknown as { set(k: string, v: string): Promise<void> }).set('blocked', 'bad-json');
+    // setBlocked should still work — it overwrites the corrupt record.
+    await setBlocked(fs, 'retry_exhausted');
+    const state = await isBlocked(fs);
+    expect(state.blocked).toBe(true);
+    expect(state.reason).toBe('retry_exhausted');
   });
 });
 
