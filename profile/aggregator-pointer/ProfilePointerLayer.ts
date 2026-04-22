@@ -251,7 +251,7 @@ export class ProfilePointerLayer {
     assertOperatorOverridesAllowed(this.#config, 'clearPendingMarker');
     await clearMarker(this.#init.flagStore);
     // SET BLOCKED as documented in SPEC §13 clearPendingMarker contract.
-    await setBlocked(this.#init.flagStore, 'protocol_error' as BlockedReason);
+    await setBlocked(this.#init.flagStore, 'marker_corrupt' as BlockedReason);
   }
 
   // ── acceptCarLoss ────────────────────────────────────────────────────────

@@ -30,7 +30,8 @@ export type BlockedReason =
   | 'dns_failure'
   | 'tls_failure'
   | 'aggregator_rejected'
-  | 'protocol_error';
+  | 'protocol_error'
+  | 'marker_corrupt';
 
 /**
  * Classify an error into a BlockedReason, or null if the error does not
@@ -49,6 +50,8 @@ export function classifyBlockedReason(err: unknown): BlockedReason | null {
         return 'aggregator_rejected';
       case AggregatorPointerErrorCode.PROTOCOL_ERROR:
         return 'protocol_error';
+      case AggregatorPointerErrorCode.MARKER_CORRUPT:
+        return 'marker_corrupt';
       case AggregatorPointerErrorCode.NETWORK_ERROR: {
         // Sub-classify by error message heuristics (§10.2.2 categorical).
         const msg = err.message.toLowerCase();
@@ -94,6 +97,7 @@ const KNOWN_BLOCKED_REASONS = new Set<string>([
   'tls_failure',
   'aggregator_rejected',
   'protocol_error',
+  'marker_corrupt',
 ]);
 
 /**

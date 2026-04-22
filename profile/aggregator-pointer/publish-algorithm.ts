@@ -24,7 +24,7 @@
 import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 
 import { submitPointer, type SubmitOutcome } from './aggregator-submit.js';
-import { isBlocked, maybeSetBlocked } from './blocked-state.js';
+import { isBlocked, maybeSetBlocked, setBlocked } from './blocked-state.js';
 import {
   PUBLISH_BACKOFF_BASE_MS,
   PUBLISH_BACKOFF_JITTER_HI,
@@ -125,6 +125,13 @@ function sleep(ms: number): Promise<void> {
  *   - RETRY_EXHAUSTED (budget exhausted within this attempt)
  *   - NETWORK_ERROR (after budget exhaustion on network path)
  */
+/**
+ * Maximum cumulative retry_after wait within a single publishOnce call.
+ * Prevents a malicious or misconfigured aggregator from wedging the mutex
+ * via unbounded Retry-After directives (DoS-by-aggregator).
+ */
+const MAX_CUMULATIVE_RETRY_AFTER_MS = 60_000;
+
 async function publishOnce(
   input: PublishInput,
   v: PointerVersion,
@@ -134,7 +141,7 @@ async function publishOnce(
   const { cidBytes, keyMaterial, signer, aggregatorClient, flagStore } = input;
 
   let retriesConsumed = 0;
-  let lastNetworkFailure = false;
+  let cumulativeRetryAfterMs = 0;
 
   for (;;) {
     // Read current marker — submit needs it for row 4 marker-match disambiguation.
@@ -187,6 +194,18 @@ async function publishOnce(
 
       case 'retry_after': {
         // Row 10 / 13: honor Retry-After. No budget consumption (SPEC §7.3 row 10).
+        // Steelman: cumulative cap prevents a malicious aggregator from wedging
+        // the mutex via unbounded Retry-After directives.
+        cumulativeRetryAfterMs += outcome.retryAfterMs;
+        if (cumulativeRetryAfterMs > MAX_CUMULATIVE_RETRY_AFTER_MS) {
+          throw new AggregatorPointerError(
+            AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+            `publish at v=${v}: cumulative retry_after ${cumulativeRetryAfterMs}ms ` +
+              `exceeds cap ${MAX_CUMULATIVE_RETRY_AFTER_MS}ms. ` +
+              `Aggregator is returning persistent Retry-After; giving up.`,
+            { v, cumulativeRetryAfterMs },
+          );
+        }
         await sleep(outcome.retryAfterMs);
         continue;
       }
@@ -210,7 +229,6 @@ async function publishOnce(
         // Rows 6, 7, 8: network-level failure on one or both sides.
         // We re-submit the whole v (aggregator idempotency on per-requestId
         // ensures the already-succeeded side is a no-op REQUEST_ID_EXISTS).
-        lastNetworkFailure = true;
         if (retriesConsumed >= attemptOpts.maxRetries) {
           // Surface as NETWORK_ERROR — triggers the BLOCKED classifier.
           throw new AggregatorPointerError(
@@ -224,8 +242,6 @@ async function publishOnce(
         continue;
       }
     }
-    // Exhaustive check — TypeScript will complain if a case is missing.
-    void lastNetworkFailure;
   }
 }
 
@@ -252,14 +268,9 @@ export async function publishOnceAtVersion(
   const { cidBytes, candidateV, currentLocalVersion, flagStore, mutex } = input;
   const mutexTimeoutMs = input.mutexTimeoutMs ?? 30_000;
 
-  // Step 1: acquire mutex (§7.1.1).
-  let handle: MutexHandle;
-  try {
-    handle = await mutex.acquire({ timeoutMs: mutexTimeoutMs });
-  } catch (err) {
-    // The mutex module already returns PUBLISH_BUSY; re-throw unchanged.
-    throw err;
-  }
+  // Step 1: acquire mutex (§7.1.1). The mutex module already raises
+  // PUBLISH_BUSY on timeout — let it propagate.
+  const handle: MutexHandle = await mutex.acquire({ timeoutMs: mutexTimeoutMs });
 
   try {
     // Step 2: check BLOCKED (§10.2). A blocked wallet cannot publish until
@@ -277,7 +288,24 @@ export async function publishOnceAtVersion(
     // Step 3: resolve publish version via marker (§7.1.4 + H13 idempotent retry).
     // candidateV is the caller's H4 target (max(validV, includedV) + 1).
     // The marker may override (bump further) if crash-safety demands it.
-    const resolution = await resolvePublishVersion(flagStore, currentLocalVersion, cidBytes, candidateV);
+    //
+    // Steelman: a MARKER_CORRUPT error here MUST SET BLOCKED — per SPEC §13
+    // clearPendingMarker contract, marker corruption forces the operator
+    // through verified recovery before publish can resume.
+    let resolution;
+    try {
+      resolution = await resolvePublishVersion(flagStore, currentLocalVersion, cidBytes, candidateV);
+    } catch (err) {
+      if (
+        err instanceof AggregatorPointerError &&
+        err.code === AggregatorPointerErrorCode.MARKER_CORRUPT
+      ) {
+        try {
+          await setBlocked(flagStore, 'marker_corrupt');
+        } catch { /* noop — setBlocked error is observational */ }
+      }
+      throw err;
+    }
     const resolvedV = resolution.v;
 
     // Step 4: write marker durably (§7.1.2, §7.1.3). Skip if this is an
@@ -295,21 +323,28 @@ export async function publishOnceAtVersion(
     try {
       outcome = await publishOnce(input, resolvedV, attemptOpts, resolution.isIdempotentRetry);
     } catch (submitErr) {
-      // On REJECTED (H8 v-burning): persist localVersion=resolvedV + clear marker.
+      // Steelman: on REJECTED (H8 v-burning), perform the three bookkeeping
+      // steps in SAFETY-FIRST order: SET BLOCKED first (operator's alarm
+      // signal), then persist localVersion, then clearMarker. Each step is
+      // independently wrapped so a disk-full / quota error in one doesn't
+      // silently skip the others.
       if (
         submitErr instanceof AggregatorPointerError &&
         submitErr.code === AggregatorPointerErrorCode.REJECTED
       ) {
-        // §7.1.6 atomicity — persist first, clear marker second.
-        await input.persistLocalVersion(resolvedV);
-        await clearMarker(flagStore);
-        // SET BLOCKED per §10.2.2 — REJECTED is a categorical aggregator
-        // failure; operator must investigate.
-        await maybeSetBlocked(flagStore, submitErr);
+        // 1) SET BLOCKED first — operator MUST see the alarm even if
+        //    downstream storage writes fail.
+        try { await maybeSetBlocked(flagStore, submitErr); } catch { /* noop */ }
+        // 2) Persist localVersion (H8 v-burn accounting). A failure here
+        //    is surfaced; marker.ts's stale-compact path covers the
+        //    marker-ahead-of-localVersion case on next publish.
+        try { await input.persistLocalVersion(resolvedV); } catch { /* noop */ }
+        // 3) Clear marker.
+        try { await clearMarker(flagStore); } catch { /* noop */ }
       } else {
         // On other aggregator/network errors, maybe SET BLOCKED (classifier
         // filters by category). Do NOT clear marker — next retry needs it.
-        await maybeSetBlocked(flagStore, submitErr);
+        try { await maybeSetBlocked(flagStore, submitErr); } catch { /* noop */ }
       }
       throw submitErr;
     }

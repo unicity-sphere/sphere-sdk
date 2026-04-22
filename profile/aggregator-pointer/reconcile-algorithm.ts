@@ -218,10 +218,35 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     probeHistory.push(...rediscovery.probeVersions);
 
     if (rediscovery.validV > 0) {
-      const remoteCid = await input.resolveRemoteCid(rediscovery.validV);
-      await input.fetchAndJoin(remoteCid, rediscovery.validV);
-      await input.persistLocalVersion(rediscovery.validV);
-      currentLocalVersion = rediscovery.validV;
+      // Steelman: wrap the remote-fetch + join + persist block with a sleep
+      // guard so a caller who immediately re-invokes publish() on throw
+      // cannot hot-loop against the aggregator.
+      try {
+        const remoteCid = await input.resolveRemoteCid(rediscovery.validV);
+        await input.fetchAndJoin(remoteCid, rediscovery.validV);
+        await input.persistLocalVersion(rediscovery.validV);
+        currentLocalVersion = rediscovery.validV;
+      } catch (err) {
+        // Non-transient failures (IPFS unreachable, OrbitDB merge bug,
+        // resolveRemoteCid classification flip) bubble out — but sleep
+        // backoff first so the caller can't DDoS the aggregator.
+        await sleep(computeBackoffMs(attempts));
+        throw err;
+      }
+    } else if (rediscovery.includedV > currentLocalVersion) {
+      // Conflict signaled by the aggregator, but rediscovery found NO valid
+      // version AND the remote advanced past us into corrupt-only residue.
+      // This is distinct from "no pointer ever published" (validV === 0 &&
+      // includedV === 0). Signal the anomaly rather than looping silently
+      // toward RETRY_EXHAUSTED.
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.CORRUPT_STREAK,
+        `Reconcile: aggregator signaled conflict at v>${currentLocalVersion} but ` +
+          `no valid version found (includedV=${rediscovery.includedV}, validV=0). ` +
+          `Remote state is corrupt-only residue; operator may invoke ` +
+          `acceptCorruptStreak(walkbackLimit) for extended walkback.`,
+        { currentLocalVersion, includedV: rediscovery.includedV },
+      );
     }
 
     // Backoff before next attempt (SPEC §7.4 / §9 sequencing).

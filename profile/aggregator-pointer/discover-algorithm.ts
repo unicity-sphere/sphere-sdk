@@ -159,6 +159,11 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
       );
     }
 
+    // Record this Phase 3 visit in the probe sequence so the probe fingerprint
+    // reflects the corruption walkback — clustering's MAIN use case is
+    // detecting same-corrupt-prefix wallets.
+    probeVersions.push(candidate);
+
     const status = await classifyVersion({
       v: candidate,
       keyMaterial,
