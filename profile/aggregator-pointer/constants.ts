@@ -76,3 +76,9 @@ export const IPNS_RESOLVE_TIMEOUT_MS = 20_000;
 export const NODE_ENV_KEY = 'NODE_ENV';
 export const SPHERE_ALLOW_OVERRIDES_KEY = 'SPHERE_ALLOW_OVERRIDES';
 export const SPHERE_ALLOW_OVERRIDES_VALUE = '1';
+
+// Trust-base rotation bound (T-C4 steelman). A forged certificate claiming
+// an epoch wildly beyond the bundled trust base would otherwise wedge the
+// wallet permanently in "update SDK" state. Cap the plausible rotation
+// window; anything beyond is classified as forgery, not rotation.
+export const MAX_PLAUSIBLE_EPOCH_GAP = 1024n;

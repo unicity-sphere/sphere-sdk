@@ -82,6 +82,13 @@ interface FetchAttemptResult {
   readonly contentLength: number | null;
   readonly complete: boolean;
   readonly stalled: boolean;
+  /**
+   * True iff we asked for a Range (rangeStart > 0) but the server returned
+   * 200 (full body) instead of 206 (partial). Caller must discard any
+   * previously-accumulated bytes in this case to avoid duplicate-prefix
+   * corruption when splicing.
+   */
+  readonly rangeIgnored: boolean;
 }
 
 /**
@@ -168,15 +175,34 @@ async function fetchAttempt(
   }
 
   // Content-Length pre-check (optional) — fail fast on huge responses.
+  // Strict integer validation: reject negative, decimals, trailing garbage.
   const contentLengthHeader = response.headers.get('content-length');
-  const contentLength = contentLengthHeader !== null ? Number.parseInt(contentLengthHeader, 10) : null;
-  if (contentLength !== null && Number.isFinite(contentLength) && rangeStart + contentLength > maxBytes) {
+  let contentLength: number | null = null;
+  if (contentLengthHeader !== null) {
+    const trimmed = contentLengthHeader.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const parsed = Number.parseInt(trimmed, 10);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        contentLength = parsed;
+      }
+    }
+    // Non-integer / negative / malformed → contentLength stays null,
+    // streaming guard is the authority.
+  }
+  if (contentLength !== null && rangeStart + contentLength > maxBytes) {
     clearTimeout(totalTimer);
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.CAR_TOO_LARGE,
       `CAR fetch from ${url} advertises ${contentLength} bytes; combined with offset ${rangeStart} exceeds cap ${maxBytes}.`,
     );
   }
+
+  // Validate Range-resume status: if we asked for a range (rangeStart > 0),
+  // the server MUST respond with 206 Partial Content. A 200 OK means the
+  // server ignored the Range header and is returning the full body — we
+  // must discard any previously accumulated bytes and treat this as a fresh
+  // fetch, otherwise splicing would produce duplicate-prefix corruption.
+  const rangeIgnored = rangeStart > 0 && response.status === 200;
 
   const acceptRanges = (response.headers.get('accept-ranges') ?? '').toLowerCase().includes('bytes');
 
@@ -246,6 +272,16 @@ async function fetchAttempt(
   } finally {
     if (stallTimer !== undefined) clearTimeout(stallTimer);
     clearTimeout(totalTimer);
+    // On stall, explicitly cancel the underlying stream so the server can
+    // tear down the connection — otherwise the body continues streaming in
+    // the background even though we won't consume it, leaking a socket.
+    if (stalled) {
+      try {
+        await reader.cancel('CAR_FETCH_STALL');
+      } catch {
+        /* cancel may fail if reader is already released — noop */
+      }
+    }
     try {
       reader.releaseLock();
     } catch {
@@ -260,6 +296,7 @@ async function fetchAttempt(
     contentLength,
     complete,
     stalled,
+    rangeIgnored,
   };
 }
 
@@ -316,8 +353,13 @@ export async function fetchCarFromGateway(
     }
 
     if (attempt.complete) {
+      // Range-ignored safety: if we requested a byte range but the server
+      // returned 200 (full body), our previously-accumulated prefix would
+      // cause duplicate-prefix corruption on concat. Discard old partials.
+      if (attempt.rangeIgnored) {
+        return { ok: true, bytes: attempt.bytes };
+      }
       if (accumulated.length === 0) {
-        // No previous partials — return directly.
         return { ok: true, bytes: attempt.bytes };
       }
       accumulated.push(attempt.bytes);

@@ -443,10 +443,11 @@ describe('submitPointer — §7.3 state machine', () => {
     expect(out).toEqual({ kind: 'retry_after', retryAfterMs: 1000, burnedBudget: false });
   });
 
-  it('Row 14: JSON parse error → protocol_error', async () => {
+  it('Row 14: SyntaxError (JSON parse) → protocol_error', async () => {
     const { keyMaterial, signer } = await buildFixtures();
     const { client } = mockClient(async () => {
-      throw new Error('Unexpected end of JSON input');
+      // JSON.parse throws SyntaxError on malformed JSON — simulate authentically.
+      throw new SyntaxError('Unexpected end of JSON input');
     });
     const out = await submitPointer({
       v: 1,
@@ -457,6 +458,39 @@ describe('submitPointer — §7.3 state machine', () => {
       marker: null,
     });
     expect(out.kind).toBe('protocol_error');
+  });
+
+  it('Row 14: "Invalid response format" exact-prefix → protocol_error', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    const { client } = mockClient(async () => {
+      throw new Error('Invalid response format for block height');
+    });
+    const out = await submitPointer({
+      v: 1,
+      cidBytes: VALID_CID,
+      keyMaterial,
+      signer,
+      aggregatorClient: client,
+      marker: null,
+    });
+    expect(out.kind).toBe('protocol_error');
+  });
+
+  it('Row 14 false-positive fixed: DNS error mentioning "json" → network_error (not protocol_error)', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    const { client } = mockClient(async () => {
+      // Previously this would misclassify as protocol_error due to substring match.
+      throw new Error('getaddrinfo ENOTFOUND json-api.example.com');
+    });
+    const out = await submitPointer({
+      v: 1,
+      cidBytes: VALID_CID,
+      keyMaterial,
+      signer,
+      aggregatorClient: client,
+      marker: null,
+    });
+    expect(out.kind).toBe('retry_both'); // both sides network_error → retry_both
   });
 
   it('Row 15: unknown SubmitCommitmentStatus → protocol_error', async () => {
@@ -591,15 +625,14 @@ describe('submitPointer — T-C1c scheduled-zero', () => {
 // ── T-C1b finally-zero (zeroize on throw) ──────────────────────────────────
 
 describe('submitPointer — T-C1b finally-zero', () => {
-  it('does not leak secrets when submit throws non-RPC error', async () => {
-    // This test verifies that the `try { ... } finally { ctA.fill(0); ... }` pattern
+  it('does not propagate errors — finally block runs on throw path', async () => {
+    // This test verifies that the try { ... } finally { ctA.fill(0); ... } pattern
     // survives thrown errors. Since we cannot observe internal buffers directly, we
-    // rely on the code structure: the finally block is syntactically present.
-    // We additionally verify that a thrown SubmitCommitment does not propagate its
-    // message unchanged (the classifier catches it and returns protocol_error / network_error).
+    // rely on the code structure plus the observation that submitPointer always
+    // returns a SubmitOutcome rather than throwing (except for input-validation).
     const { keyMaterial, signer } = await buildFixtures();
     const { client } = mockClient(async () => {
-      throw new Error('Unexpected token in JSON at position 42');
+      throw new SyntaxError('Unexpected token in JSON at position 42');
     });
     const out = await submitPointer({
       v: 1,
@@ -609,7 +642,7 @@ describe('submitPointer — T-C1b finally-zero', () => {
       aggregatorClient: client,
       marker: null,
     });
-    // Classifier routes this to protocol_error (row 14).
+    // SyntaxError → protocol_error (row 14).
     expect(out.kind).toBe('protocol_error');
   });
 });

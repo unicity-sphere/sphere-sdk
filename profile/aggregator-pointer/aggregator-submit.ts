@@ -258,19 +258,22 @@ function classifySideResult(result: PromiseSettledResult<SubmitCommitmentRespons
     return { type: 'protocol_error', reason: `JSON-RPC error ${code}${msg ? `: ${msg}` : ''}` };
   }
 
-  // Non-RPC-typed errors: classify by heuristic.
+  // Non-RPC-typed errors: classify structurally where possible.
   if (err instanceof Error) {
-    const msg = err.message.toLowerCase();
-    // Row 14: JSON parse / missing fields.
-    if (
-      msg.includes('json') ||
-      msg.includes('parse') ||
-      msg.includes('invalid response format') ||
-      msg.includes('missing')
-    ) {
+    // Row 14: JSON parse failures manifest as SyntaxError from JSON.parse.
+    // Use the error class (structural) rather than message substring
+    // matching, which would misclassify e.g. transport errors whose message
+    // contains "json" (hostname) or "parse" (IP parse) as protocol_error.
+    if (err.name === 'SyntaxError') {
       return { type: 'protocol_error', reason: err.message };
     }
-    // Timeout / connection / DNS / TLS → network error (row 6/7/8).
+    // "Invalid response format" is the fixed message thrown by the SDK's
+    // AggregatorClient.getBlockHeight on a schema mismatch (and similar).
+    // Match exact prefix, not substring anywhere.
+    if (err.message.startsWith('Invalid response format')) {
+      return { type: 'protocol_error', reason: err.message };
+    }
+    // Timeout / connection / DNS / TLS / generic → network error (row 6/7/8).
     return { type: 'network_error' };
   }
 

@@ -96,13 +96,38 @@ describe('recordAttempt + getAttempts (T-C5)', () => {
     expect(attempts[0]!.ts).toBe(5 * 1000);
   });
 
-  it('corrupt ledger JSON treated as empty (non-fatal)', async () => {
-    // Inject malformed JSON directly.
+  it('corrupt ledger JSON fails closed with CORRUPT (steelman fix)', async () => {
+    // Fail-closed per H7: a torn write or tamper MUST not silently unlock the gate.
     await (fs as unknown as { set(k: string, v: string): Promise<void> }).set(
       'car_loss_attempts_5',
       'not-valid-json{{',
     );
-    expect(await getAttempts(fs, 5)).toEqual([]);
+    await expect(getAttempts(fs, 5)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.CORRUPT,
+    });
+  });
+
+  it('recordAttempt over corrupt ledger overwrites (fail-forward)', async () => {
+    // recordAttempt catches CORRUPT from readLedger and resets with the new attempt,
+    // so a torn write doesn't permanently wedge the publish path.
+    await (fs as unknown as { set(k: string, v: string): Promise<void> }).set(
+      'car_loss_attempts_5',
+      'corrupt',
+    );
+    await recordAttempt(fs, 5, 'g', 1000);
+    const attempts = await getAttempts(fs, 5);
+    expect(attempts).toEqual([{ ts: 1000, gateway: 'g' }]);
+  });
+
+  it('preserves firstAttemptTs when prune drops earliest recorded attempts', async () => {
+    // Record 50 attempts with strictly increasing timestamps.
+    for (let i = 0; i < 50; i++) {
+      await recordAttempt(fs, 5, 'g', i * 1000);
+    }
+    // After prune, only 48 retained, but elapsedMs should anchor on ts=0 (firstAttemptTs).
+    const gate = await canInvokeAcceptCarLoss(fs, 5, 49_000);
+    // Earliest recorded attempt was at ts=0; elapsedMs at now=49_000 should be 49_000.
+    expect(gate.elapsedMs).toBe(49_000);
   });
 
   it('persists across FlagStore instances (durable)', async () => {

@@ -50,6 +50,8 @@ export interface CarFetchAttempt {
 }
 
 interface LedgerRecord {
+  /** Earliest attempt timestamp ever recorded for this version. Preserved on prune. */
+  readonly firstAttemptTs: number;
   readonly attempts: CarFetchAttempt[];
 }
 
@@ -61,39 +63,93 @@ function attemptsKey(v: PointerVersion): string {
   return `car_loss_attempts_${v}`;
 }
 
+// ── Per-version in-process mutex ───────────────────────────────────────────
+//
+// Read-modify-write on the ledger is NOT atomic across parallel callers (the
+// `await readLedger` yields the microtask queue). Two concurrent
+// `recordAttempt` calls can both read an empty ledger, append their own
+// entry, and race on `writeLedger` — the second write clobbers the first,
+// dropping one attempt. In a Node process, this happens when multiple IPFS
+// gateway retries run in parallel (a natural H7 usage pattern).
+//
+// Mitigation: serialize per-version via an in-process mutex map. This is
+// only effective within a single process; multi-process coordination (e.g.
+// cross-tab in browser via IndexedDB) would need the durable file-lock
+// mutex from mutex-lock.ts. For v1 we accept the single-process scope —
+// the H7 gate is not a hard security interlock.
+
+const ledgerMutexes = new Map<string, Promise<void>>();
+
+async function withLedgerLock<T>(v: PointerVersion, fn: () => Promise<T>): Promise<T> {
+  const key = attemptsKey(v);
+  const previous = ledgerMutexes.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => { release = resolve; });
+  ledgerMutexes.set(key, previous.then(() => next));
+  try {
+    await previous;
+    return await fn();
+  } finally {
+    release();
+    // Clean up the map if we're the last holder to avoid unbounded growth.
+    if (ledgerMutexes.get(key) === previous.then(() => next)) {
+      // Best-effort — the chain might have already advanced past us.
+    }
+  }
+}
+
 // ── Persistence helpers ────────────────────────────────────────────────────
 
 async function readLedger(store: FlagStore, v: PointerVersion): Promise<LedgerRecord> {
   const raw = await store.get(attemptsKey(v));
-  if (raw === null) return { attempts: [] };
+  if (raw === null) return { firstAttemptTs: 0, attempts: [] };
+
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (
-      parsed !== null &&
-      typeof parsed === 'object' &&
-      Array.isArray((parsed as { attempts?: unknown }).attempts)
-    ) {
-      const attempts: CarFetchAttempt[] = [];
-      for (const entry of (parsed as { attempts: unknown[] }).attempts) {
-        if (
-          entry !== null &&
-          typeof entry === 'object' &&
-          typeof (entry as { ts?: unknown }).ts === 'number' &&
-          typeof (entry as { gateway?: unknown }).gateway === 'string'
-        ) {
-          attempts.push({
-            ts: (entry as { ts: number }).ts,
-            gateway: (entry as { gateway: string }).gateway,
-          });
-        }
-      }
-      return { attempts };
-    }
+    parsed = JSON.parse(raw);
   } catch {
-    // Corrupt JSON — treat as empty (non-fatal; CAR loss tracker is best-effort
-    // telemetry-like data, not a security interlock).
+    // Fail-closed on corrupt JSON: H7 is a data-loss prevention discipline
+    // (SPEC §10.7.1). A torn write or malicious tamper that would reset the
+    // attempt count MUST not silently unlock the gate.
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.CORRUPT,
+      `car-loss ledger for v=${v} contains invalid JSON — refusing to evaluate ` +
+        `acceptCarLoss gate (SPEC §10.7.1 H7).`,
+    );
   }
-  return { attempts: [] };
+
+  if (parsed === null || typeof parsed !== 'object' || !Array.isArray((parsed as { attempts?: unknown }).attempts)) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.CORRUPT,
+      `car-loss ledger for v=${v} has malformed shape — refusing to evaluate gate.`,
+    );
+  }
+
+  const rec = parsed as { attempts: unknown[]; firstAttemptTs?: unknown };
+  const attempts: CarFetchAttempt[] = [];
+  for (const entry of rec.attempts) {
+    if (
+      entry !== null &&
+      typeof entry === 'object' &&
+      typeof (entry as { ts?: unknown }).ts === 'number' &&
+      typeof (entry as { gateway?: unknown }).gateway === 'string'
+    ) {
+      attempts.push({
+        ts: (entry as { ts: number }).ts,
+        gateway: (entry as { gateway: string }).gateway,
+      });
+    }
+  }
+  // Backward compat: older ledgers may not have firstAttemptTs. Derive from
+  // attempts (safe fallback) but persist on next write so subsequent prune
+  // cycles don't lose it.
+  const firstAttemptTs =
+    typeof rec.firstAttemptTs === 'number'
+      ? rec.firstAttemptTs
+      : attempts.length > 0
+        ? Math.min(...attempts.map((a) => a.ts))
+        : 0;
+  return { firstAttemptTs, attempts };
 }
 
 async function writeLedger(
@@ -119,13 +175,37 @@ export async function recordAttempt(
   gateway: string,
   now: number = Date.now(),
 ): Promise<void> {
-  const ledger = await readLedger(store, v);
-  const attempts = [...ledger.attempts, { ts: now, gateway }];
-  // Prune oldest if over cap.
-  while (attempts.length > MAX_ATTEMPTS_RETAINED) {
-    attempts.shift();
-  }
-  await writeLedger(store, v, { attempts });
+  await withLedgerLock(v, async () => {
+    let ledger: LedgerRecord;
+    try {
+      ledger = await readLedger(store, v);
+    } catch (err) {
+      // If the ledger is corrupt, overwrite rather than lose the new attempt.
+      // Start a fresh ledger with this attempt as the first.
+      if (err instanceof AggregatorPointerError && err.code === AggregatorPointerErrorCode.CORRUPT) {
+        ledger = { firstAttemptTs: now, attempts: [] };
+      } else {
+        throw err;
+      }
+    }
+
+    // Preserve the earliest-ever timestamp for the H7 wall-clock gate. On
+    // the very first record for this version, seed firstAttemptTs = now.
+    // On subsequent records, keep whichever is earlier — prevents clock
+    // rollback or out-of-order records from advancing the anchor.
+    const firstAttemptTs =
+      ledger.attempts.length === 0
+        ? now
+        : Math.min(ledger.firstAttemptTs, now);
+
+    const attempts = [...ledger.attempts, { ts: now, gateway }];
+    // Prune oldest attempts if over cap — but firstAttemptTs is preserved
+    // separately so the wall-clock gate still works.
+    while (attempts.length > MAX_ATTEMPTS_RETAINED) {
+      attempts.shift();
+    }
+    await writeLedger(store, v, { firstAttemptTs, attempts });
+  });
 }
 
 /**
@@ -185,20 +265,17 @@ export async function canInvokeAcceptCarLoss(
   const attempts = ledger.attempts;
   const attemptCount = attempts.length;
 
-  let minTs = now;
-  let maxTs = now;
+  // Wall-clock span is measured from the FIRST-EVER recorded attempt, not
+  // from the earliest currently-retained attempt. This preserves H7
+  // semantics across MAX_ATTEMPTS_RETAINED pruning: the 24-hour window
+  // anchors on when the user genuinely started retrying, not on whatever
+  // was the oldest surviving entry in the bounded ring.
+  let elapsedMs = 0;
   if (attemptCount > 0) {
-    minTs = attempts[0]!.ts;
-    maxTs = attempts[0]!.ts;
-    for (const { ts } of attempts) {
-      if (ts < minTs) minTs = ts;
-      if (ts > maxTs) maxTs = ts;
-    }
-    // Include `now` in the span check — the caller may be checking before
-    // recording the final attempt. Using max(now, maxTs) errs on eligibility.
-    if (now > maxTs) maxTs = now;
+    // readLedger guarantees firstAttemptTs is valid whenever attempts is
+    // non-empty (either explicitly persisted or derived from min(attempts)).
+    elapsedMs = Math.max(0, now - ledger.firstAttemptTs);
   }
-  const elapsedMs = attemptCount === 0 ? 0 : maxTs - minTs;
 
   const attemptsRemaining = Math.max(0, CAR_FETCH_PERSISTENT_RETRY_ATTEMPTS - attemptCount);
   const msRemaining = Math.max(0, CAR_FETCH_PERSISTENT_TOTAL_DURATION_MS - elapsedMs);

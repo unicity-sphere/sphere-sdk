@@ -26,6 +26,7 @@
 import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof.js';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
 
+import { MAX_PLAUSIBLE_EPOCH_GAP } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
 /**
@@ -79,6 +80,26 @@ export function raiseForTrustBaseMismatch(
   const { isRotation, localEpoch, certEpoch } = classifyTrustBaseRotation(trustBase, proof);
 
   if (isRotation) {
+    // Steelman guard (T-C4): a forged certificate claiming an epoch wildly
+    // beyond the bundled trust base would permanently wedge the wallet in
+    // "update SDK" state.  Cap the plausible rotation window; anything
+    // beyond is classified as forgery, not rotation.
+    const gap = certEpoch - localEpoch;
+    if (gap > MAX_PLAUSIBLE_EPOCH_GAP) {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.UNTRUSTED_PROOF,
+        `${context}: certificate claims epoch ${certEpoch.toString()} — ` +
+          `gap of ${gap.toString()} from bundled epoch ${localEpoch.toString()} ` +
+          `exceeds MAX_PLAUSIBLE_EPOCH_GAP=${MAX_PLAUSIBLE_EPOCH_GAP.toString()}; ` +
+          `rejecting as forgery (SPEC §8.4.1 H5 + T-C4 DoS guard).`,
+        {
+          localEpoch: localEpoch.toString(),
+          certEpoch: certEpoch.toString(),
+          gap: gap.toString(),
+          maxPlausibleGap: MAX_PLAUSIBLE_EPOCH_GAP.toString(),
+        },
+      );
+    }
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.TRUST_BASE_STALE,
       `${context}: aggregator returned a proof signed under epoch ${certEpoch.toString()}, ` +
