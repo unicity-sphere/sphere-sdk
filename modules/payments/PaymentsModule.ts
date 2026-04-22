@@ -826,6 +826,13 @@ export interface PaymentsModuleDependencies {
   price?: PriceProvider;
   /** Set of disabled provider IDs — disabled providers are skipped during sync/save */
   disabledProviderIds?: ReadonlySet<string>;
+  /**
+   * Optional CID-reference store for offloading fat KV values (pending V5
+   * tokens, V5 outbox) to IPFS. When absent, those values fall back to
+   * inline JSON in storage.set — acceptable for legacy wallets and tests
+   * but unbounded growth for heavy users. See PROFILE-CID-REFERENCES.md.
+   */
+  cidRefStore?: import('../../profile/cid-ref-store.js').CidRefStore;
 }
 
 // =============================================================================
@@ -4107,30 +4114,44 @@ export class PaymentsModule {
         pendingTokens.push(token);
       }
     }
-    if (pendingTokens.length > 0) {
-      const json = JSON.stringify(pendingTokens);
-      logger.debug('Payments', `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')} (${json.length} bytes)`);
-      await this.deps!.storage.set(
-        STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
-        json
-      );
-      // Verify write
-      const verify = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
-      if (!verify) {
-        logger.error('Payments', '[V5-PERSIST] CRITICAL: KV write succeeded but read-back is empty!');
-      } else {
-        logger.debug('Payments', `[V5-PERSIST] Verified: read-back ${verify.length} bytes`);
-      }
-    } else {
+    if (pendingTokens.length === 0) {
       logger.debug('Payments', `[V5-PERSIST] No pending V5 tokens to save (total tokens: ${this.tokens.size}), clearing KV`);
-      // Clean up when no pending tokens remain
       await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
+      return;
     }
+
+    // PROFILE-CID-REFERENCES.md §8.1 — pendingV5 tokens are fat (sdkData
+    // can be 5-20 KB per token). When a CidRefStore is available, write
+    // a small CID reference to OpLog and pin the content to IPFS. Falls
+    // back to legacy inline JSON when CidRefStore is absent (tests,
+    // legacy wallets).
+    const cidRefStore = this.deps!.cidRefStore;
+    if (cidRefStore) {
+      const ref = await cidRefStore.pinJson(pendingTokens);
+      const refStr = (await import('../../profile/cid-ref-store.js')).CidRefStore.stringifyRef(ref);
+      logger.debug(
+        'Payments',
+        `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s) via CID ref (cid=${ref.cid}, encryptedSize=${ref.size} bytes, OpLog value=${refStr.length} bytes)`,
+      );
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr);
+      return;
+    }
+
+    // Legacy path: inline JSON (deprecated for heavy wallets — see CID-refs doc).
+    const json = JSON.stringify(pendingTokens);
+    logger.debug(
+      'Payments',
+      `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s) inline (${json.length} bytes — consider providing cidRefStore)`,
+    );
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, json);
   }
 
   /**
    * Load pending V5 tokens from key-value storage and merge into tokens map.
    * Called during load() to restore tokens that TXF format can't represent.
+   *
+   * PROFILE-CID-REFERENCES.md §6 — dual-read: detect CID-ref via
+   * tryParseRef; fall back to legacy inline JSON otherwise.
    */
   private async loadPendingV5Tokens(): Promise<void> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
@@ -4138,8 +4159,33 @@ export class PaymentsModule {
     if (!data) return;
 
     try {
-      const pendingTokens = JSON.parse(data) as Token[];
-      logger.debug('Payments', `[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map(t => t.id.slice(0, 16)).join(', ')}`);
+      const { CidRefStore } = await import('../../profile/cid-ref-store.js');
+      const ref = CidRefStore.tryParseRef(data);
+      let pendingTokens: Token[];
+
+      if (ref && this.deps!.cidRefStore) {
+        // New path: CID reference → fetch from IPFS.
+        logger.debug(
+          'Payments',
+          `[V5-PERSIST] Reading via CID ref (cid=${ref.cid}, encryptedSize=${ref.size})`,
+        );
+        pendingTokens = await this.deps!.cidRefStore.fetchJson<Token[]>(ref);
+      } else if (ref && !this.deps!.cidRefStore) {
+        // Ref in storage but no CidRefStore injected — configuration error.
+        logger.error(
+          'Payments',
+          `[V5-PERSIST] KV contains CID ref but no cidRefStore provided; cannot load pending V5 tokens.`,
+        );
+        return;
+      } else {
+        // Legacy path: inline JSON (pre-CID-refs wallet).
+        pendingTokens = JSON.parse(data) as Token[];
+      }
+
+      logger.debug(
+        'Payments',
+        `[V5-PERSIST] Parsed ${pendingTokens.length} pending V5 token(s): ${pendingTokens.map((t) => t.id.slice(0, 16)).join(', ')}`,
+      );
       for (const token of pendingTokens) {
         // Only restore if not already in the map (e.g., already resolved)
         if (!this.tokens.has(token.id)) {

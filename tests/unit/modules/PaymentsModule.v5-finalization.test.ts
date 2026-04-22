@@ -379,6 +379,128 @@ describe('PaymentsModule - V5 Token Finalization', () => {
   });
 
   // ===========================================================================
+  // 1a. V5 pending token persistence via CID reference (PROFILE-CID-REFERENCES.md)
+  // ===========================================================================
+
+  describe('V5 pending token CID-ref persistence', () => {
+    /** Minimal fake CidRefStore that pins into an in-memory map. */
+    function makeFakeCidRefStore() {
+      const ipfsStore = new Map<string, unknown>();
+      let nextCid = 1;
+      const fakeStore = {
+        pinJson: vi.fn(async (value: unknown) => {
+          const cid = `bafyFakeCid${nextCid++}`;
+          ipfsStore.set(cid, value);
+          const json = JSON.stringify(value);
+          return {
+            v: 1 as const,
+            cid,
+            size: new TextEncoder().encode(json).byteLength + 28, // + IV+tag
+            ts: Date.now(),
+          };
+        }),
+        fetchJson: vi.fn(async (ref: { cid: string }) => {
+          const data = ipfsStore.get(ref.cid);
+          if (data === undefined) throw new Error(`CID not found: ${ref.cid}`);
+          return data;
+        }),
+      };
+      return { fakeStore, ipfsStore };
+    }
+
+    it('writes CID reference to OpLog when cidRefStore is provided', async () => {
+      const { fakeStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      await module.addToken(token);
+
+      // OpLog value is now a CID ref JSON (~100-200 bytes), NOT the full token.
+      const kvData = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+      expect(kvData).toBeDefined();
+      // Should NOT contain the token ID directly (that's in IPFS now).
+      expect(kvData).not.toContain(`v5split_${SPLIT_GROUP_ID_1}`);
+      // Should be a parseable CID-ref envelope.
+      const parsed = JSON.parse(kvData!);
+      expect(parsed.v).toBe(1);
+      expect(parsed.cid).toMatch(/^bafy/);
+      expect(parsed.size).toBeGreaterThan(0);
+      expect(parsed.ts).toBeGreaterThan(0);
+      expect(fakeStore.pinJson).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads CID reference from OpLog and fetches content from IPFS', async () => {
+      const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      // Pre-populate: emulate a prior write.
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      ipfsStore.set('bafyPrePin', [token]);
+      storageMap.set(
+        STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS,
+        JSON.stringify({ v: 1, cid: 'bafyPrePin', size: 1000, ts: 1700000000000 }),
+      );
+
+      await module.load();
+      const tokens = module.getTokens();
+      expect(tokens.some((t) => t.id === `v5split_${SPLIT_GROUP_ID_1}`)).toBe(true);
+      expect(fakeStore.fetchJson).toHaveBeenCalledTimes(1);
+    });
+
+    it('legacy inline JSON still reads correctly when cidRefStore is provided (migration)', async () => {
+      const { fakeStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      // Pre-populate KV with LEGACY inline JSON (pre-CID-refs wallet format).
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      storageMap.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, JSON.stringify([token]));
+
+      await module.load();
+      const tokens = module.getTokens();
+      expect(tokens.some((t) => t.id === `v5split_${SPLIT_GROUP_ID_1}`)).toBe(true);
+      // fetchJson NOT called — tryParseRef returned null, legacy path taken.
+      expect(fakeStore.fetchJson).not.toHaveBeenCalled();
+    });
+
+    it('inline JSON fallback still works when cidRefStore is absent (backward compat)', async () => {
+      // cidRefStore deliberately not set — legacy path.
+      const token = createV5PendingToken(SPLIT_GROUP_ID_1);
+      await module.addToken(token);
+
+      const kvData = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS);
+      expect(kvData).toBeDefined();
+      // Without cidRefStore, writes fall back to inline JSON.
+      const parsed = JSON.parse(kvData!);
+      expect(Array.isArray(parsed)).toBe(true);
+      expect(parsed[0].id).toBe(`v5split_${SPLIT_GROUP_ID_1}`);
+    });
+
+    it('OpLog value shrinks dramatically when CidRefStore is used', async () => {
+      // Write LEGACY first to measure fat-size.
+      const tokens = Array.from({ length: 10 }, (_, i) =>
+        createV5PendingToken(`group${i}`),
+      );
+      for (const t of tokens) await module.addToken(t);
+
+      const legacySize = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)!.length;
+
+      // Now rewrite via CidRefStore.
+      const { fakeStore } = makeFakeCidRefStore();
+      (deps as unknown as { cidRefStore: unknown }).cidRefStore = fakeStore;
+
+      // Trigger a re-save: add another token to dirty state, then save.
+      const newToken = createV5PendingToken('group_new');
+      await module.addToken(newToken);
+
+      const refSize = storageMap.get(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS)!.length;
+
+      // Legacy blob scales with token count; ref is small constant.
+      expect(refSize).toBeLessThan(300);
+      expect(refSize).toBeLessThan(legacySize);
+    });
+  });
+
+  // ===========================================================================
   // 2. Processed splitGroupId Dedup Persistence
   // ===========================================================================
 
