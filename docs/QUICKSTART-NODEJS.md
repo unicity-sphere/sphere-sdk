@@ -19,9 +19,14 @@ npm install @unicitylabs/sphere-sdk ws
 
 ## CLI (Quick Testing)
 
-> **Tip:** For shell auto-completion of all CLI commands, run `npm link` then `sphere-cli completions bash >> ~/.bashrc`. See [QUICKSTART-CLI.md](QUICKSTART-CLI.md) for full setup.
+The CLI has moved to a dedicated package — [`@unicity-sphere/cli`](https://github.com/unicity-sphere/sphere-cli). See [QUICKSTART-CLI.md](QUICKSTART-CLI.md) for the full command reference.
 
-The SDK includes a built-in CLI for quick testing without writing code:
+```bash
+npm install -g @unicity-sphere/cli
+sphere --help
+```
+
+The examples below use `sphere <command>` — replace any old `npm run cli -- <command>` references accordingly.
 
 ```bash
 # Initialize wallet (no token minted)

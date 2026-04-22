@@ -490,3 +490,48 @@ export type {
 // Address parsing
 export { parseAddress, isValidAddress, isValidDirectAddress, normalizeAddress, addressesMatch } from './core/address';
 export type { AddressType, ParsedAddress } from './core/address';
+
+// =============================================================================
+// Exports added for @unicity-sphere/cli consumption (phase 2 extraction).
+// These were previously only reachable via relative paths from sphere-sdk/cli/.
+// Added to public surface so the external CLI can import them without depending
+// on internal layout. Safe to export — they are all existing stable utilities.
+// =============================================================================
+
+// Encryption (strong Argon2 + ChaCha20 flow)
+export {
+  encrypt,
+  decrypt,
+  decryptJson,
+  encryptSimple,
+  decryptSimple,
+  decryptWithSalt,
+  encryptMnemonic,
+  decryptMnemonic,
+} from './core/encryption';
+export type { EncryptedData } from './core/encryption';
+
+// L1 low-level crypto + address utilities (in addition to L1.* namespace export)
+export {
+  generatePrivateKey,
+  hexToWIF,
+  encryptWallet,
+  decryptWallet,
+} from './l1/crypto';
+
+export { generateAddressFromMasterKey } from './l1/address';
+
+// Accounting module types
+export type {
+  CreateInvoiceRequest,
+  InvoiceRequestedAsset,
+  GetInvoicesOptions,
+  PayInvoiceParams,
+  ReturnPaymentParams,
+} from './modules/accounting/types';
+
+// TxfToken type for serialization workflows
+export type { TxfToken } from './types/txf';
+
+// Master-key provider status re-export (already re-exported via ./types barrel,
+// but keeping explicit here for consumers that want to import direct types).

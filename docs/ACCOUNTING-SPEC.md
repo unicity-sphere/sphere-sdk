@@ -4221,7 +4221,7 @@ Note: `INVOICE_INVALID_ID` and `INVOICE_MINT_FAILED` are thrown from internal ut
 
 ## 11. CLI Commands
 
-This section specifies 14 CLI commands that fully cover the AccountingModule API (§2.1). These are documentation-only specifications — no implementation code yet. When implemented, they will be added to `cli/index.ts` following the existing patterns (manual arg parsing, switch-case dispatch, `getSphere()` / `closeSphere()` lifecycle).
+This section specifies 14 CLI commands that fully cover the AccountingModule API (§2.1). These are implemented in [`@unicity-sphere/cli`](https://github.com/unicity-sphere/sphere-cli) — the standalone Sphere CLI package (moved from `sphere-sdk/cli/` in v0.8.0).
 
 ### 11.1 Shared Conventions
 
