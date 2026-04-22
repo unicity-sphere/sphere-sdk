@@ -31,7 +31,8 @@ export type BlockedReason =
   | 'tls_failure'
   | 'aggregator_rejected'
   | 'protocol_error'
-  | 'marker_corrupt';
+  | 'marker_corrupt'
+  | 'rejected';
 
 /**
  * Classify an error into a BlockedReason, or null if the error does not
@@ -52,6 +53,11 @@ export function classifyBlockedReason(err: unknown): BlockedReason | null {
         return 'protocol_error';
       case AggregatorPointerErrorCode.MARKER_CORRUPT:
         return 'marker_corrupt';
+      case AggregatorPointerErrorCode.REJECTED:
+        // H8 v-burning: the aggregator permanently rejected a commit.
+        // Operator MUST investigate (possible key material corruption,
+        // signing-service bug, or aggregator reconfiguration).
+        return 'rejected';
       case AggregatorPointerErrorCode.NETWORK_ERROR: {
         // Sub-classify by error message heuristics (§10.2.2 categorical).
         const msg = err.message.toLowerCase();
@@ -98,6 +104,7 @@ const KNOWN_BLOCKED_REASONS = new Set<string>([
   'aggregator_rejected',
   'protocol_error',
   'marker_corrupt',
+  'rejected',
 ]);
 
 /**

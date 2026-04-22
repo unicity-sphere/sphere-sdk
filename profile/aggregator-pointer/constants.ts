@@ -82,3 +82,10 @@ export const SPHERE_ALLOW_OVERRIDES_VALUE = '1';
 // wallet permanently in "update SDK" state. Cap the plausible rotation
 // window; anything beyond is classified as forgery, not rotation.
 export const MAX_PLAUSIBLE_EPOCH_GAP = 1024n;
+
+// Publish retry_after cumulative cap (T-D1 steelman). A malicious or
+// misconfigured aggregator could wedge the publish mutex indefinitely via
+// unbounded Retry-After directives. Cap the total wait time within a
+// single publishOnce invocation. Sized to accommodate three legitimate
+// 60-second load-shed cycles before failing.
+export const MAX_CUMULATIVE_RETRY_AFTER_MS = 180_000;

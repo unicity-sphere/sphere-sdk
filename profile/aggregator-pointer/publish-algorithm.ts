@@ -24,8 +24,9 @@
 import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 
 import { submitPointer, type SubmitOutcome } from './aggregator-submit.js';
-import { isBlocked, maybeSetBlocked, setBlocked } from './blocked-state.js';
+import { isBlocked, maybeSetBlocked } from './blocked-state.js';
 import {
+  MAX_CUMULATIVE_RETRY_AFTER_MS,
   PUBLISH_BACKOFF_BASE_MS,
   PUBLISH_BACKOFF_JITTER_HI,
   PUBLISH_BACKOFF_JITTER_LO,
@@ -125,13 +126,6 @@ function sleep(ms: number): Promise<void> {
  *   - RETRY_EXHAUSTED (budget exhausted within this attempt)
  *   - NETWORK_ERROR (after budget exhaustion on network path)
  */
-/**
- * Maximum cumulative retry_after wait within a single publishOnce call.
- * Prevents a malicious or misconfigured aggregator from wedging the mutex
- * via unbounded Retry-After directives (DoS-by-aggregator).
- */
-const MAX_CUMULATIVE_RETRY_AFTER_MS = 60_000;
-
 async function publishOnce(
   input: PublishInput,
   v: PointerVersion,
@@ -296,14 +290,10 @@ export async function publishOnceAtVersion(
     try {
       resolution = await resolvePublishVersion(flagStore, currentLocalVersion, cidBytes, candidateV);
     } catch (err) {
-      if (
-        err instanceof AggregatorPointerError &&
-        err.code === AggregatorPointerErrorCode.MARKER_CORRUPT
-      ) {
-        try {
-          await setBlocked(flagStore, 'marker_corrupt');
-        } catch { /* noop — setBlocked error is observational */ }
-      }
+      // maybeSetBlocked classifies MARKER_CORRUPT → 'marker_corrupt' internally.
+      // Using the classifier (not a direct setBlocked) keeps the single
+      // source of truth in blocked-state.ts.
+      try { await maybeSetBlocked(flagStore, err); } catch { /* noop */ }
       throw err;
     }
     const resolvedV = resolution.v;
@@ -323,24 +313,61 @@ export async function publishOnceAtVersion(
     try {
       outcome = await publishOnce(input, resolvedV, attemptOpts, resolution.isIdempotentRetry);
     } catch (submitErr) {
-      // Steelman: on REJECTED (H8 v-burning), perform the three bookkeeping
-      // steps in SAFETY-FIRST order: SET BLOCKED first (operator's alarm
-      // signal), then persist localVersion, then clearMarker. Each step is
-      // independently wrapped so a disk-full / quota error in one doesn't
-      // silently skip the others.
+      // Steelman: on REJECTED (H8 v-burning), perform three bookkeeping steps:
+      //   1) SET BLOCKED (classifier maps REJECTED → 'rejected' reason; operator alarm)
+      //   2) Clear marker FIRST — a stale marker with a NOW-mismatched cidHash
+      //      would trigger Case 4 OTP-safe bump on next publish, wasting a
+      //      version. Clearing removes the ambiguity.
+      //   3) Persist localVersion (H8 v-burn accounting) — must record that
+      //      resolvedV is permanently consumed.
+      //
+      // Order (1 → 2 → 3) prefers SAFETY over storage consistency: even if
+      // steps 2 or 3 fail, step 1 is the load-bearing alarm that forces the
+      // operator through §10.2.4 verified recovery before publish resumes.
+      //
+      // Each step's failure is recorded on the thrown error's context so
+      // callers / UIs / telemetry can surface partial-failure warnings
+      // (closing the "silent swallow" hole from prior hardening pass).
       if (
         submitErr instanceof AggregatorPointerError &&
         submitErr.code === AggregatorPointerErrorCode.REJECTED
       ) {
-        // 1) SET BLOCKED first — operator MUST see the alarm even if
-        //    downstream storage writes fail.
-        try { await maybeSetBlocked(flagStore, submitErr); } catch { /* noop */ }
-        // 2) Persist localVersion (H8 v-burn accounting). A failure here
-        //    is surfaced; marker.ts's stale-compact path covers the
-        //    marker-ahead-of-localVersion case on next publish.
-        try { await input.persistLocalVersion(resolvedV); } catch { /* noop */ }
-        // 3) Clear marker.
-        try { await clearMarker(flagStore); } catch { /* noop */ }
+        const bookkeeping: {
+          blockedSet: boolean;
+          markerCleared: boolean;
+          localVersionPersisted: boolean;
+          failures: string[];
+        } = {
+          blockedSet: false,
+          markerCleared: false,
+          localVersionPersisted: false,
+          failures: [],
+        };
+        try {
+          const reason = await maybeSetBlocked(flagStore, submitErr);
+          bookkeeping.blockedSet = reason !== null;
+          if (reason === null) {
+            bookkeeping.failures.push('maybeSetBlocked returned null (classifier gap — REJECTED must map to a known reason)');
+          }
+        } catch (e) {
+          bookkeeping.failures.push(`maybeSetBlocked threw: ${String(e)}`);
+        }
+        try {
+          await clearMarker(flagStore);
+          bookkeeping.markerCleared = true;
+        } catch (e) {
+          bookkeeping.failures.push(`clearMarker threw: ${String(e)}`);
+        }
+        try {
+          await input.persistLocalVersion(resolvedV);
+          bookkeeping.localVersionPersisted = true;
+        } catch (e) {
+          bookkeeping.failures.push(`persistLocalVersion threw: ${String(e)}`);
+        }
+        // Attach diagnostics to the thrown error so the caller / UI / telemetry
+        // can surface partial-failure warnings. Using `details` (the existing
+        // AggregatorPointerError field) rather than mutating a new field.
+        (submitErr as unknown as { h8Bookkeeping?: typeof bookkeeping }).h8Bookkeeping = bookkeeping;
       } else {
         // On other aggregator/network errors, maybe SET BLOCKED (classifier
         // filters by category). Do NOT clear marker — next retry needs it.

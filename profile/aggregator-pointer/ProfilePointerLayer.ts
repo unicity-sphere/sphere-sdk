@@ -44,7 +44,6 @@ import {
   isBlocked as readBlockedState,
   setBlocked,
 } from './blocked-state.js';
-import type { BlockedReason } from './blocked-state.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 import {
   computeProbeFingerprint,
@@ -251,7 +250,7 @@ export class ProfilePointerLayer {
     assertOperatorOverridesAllowed(this.#config, 'clearPendingMarker');
     await clearMarker(this.#init.flagStore);
     // SET BLOCKED as documented in SPEC §13 clearPendingMarker contract.
-    await setBlocked(this.#init.flagStore, 'marker_corrupt' as BlockedReason);
+    await setBlocked(this.#init.flagStore, 'marker_corrupt');
   }
 
   // ── acceptCarLoss ────────────────────────────────────────────────────────

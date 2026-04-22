@@ -185,8 +185,9 @@ describe('publishOnceAtVersion (T-D1)', () => {
     const client = mockClient(async () =>
       mockResp(SubmitCommitmentStatus.AUTHENTICATOR_VERIFICATION_FAILED),
     );
-    await expect(
-      publishOnceAtVersion({
+    let caughtErr: unknown;
+    try {
+      await publishOnceAtVersion({
         cidBytes: VALID_CID,
         candidateV: 1,
         currentLocalVersion: 0,
@@ -196,12 +197,64 @@ describe('publishOnceAtVersion (T-D1)', () => {
         flagStore,
         mutex,
         persistLocalVersion,
-      }),
-    ).rejects.toMatchObject({ code: AggregatorPointerErrorCode.REJECTED });
+      });
+    } catch (e) {
+      caughtErr = e;
+    }
+    expect(caughtErr).toBeDefined();
+    expect((caughtErr as { code: string }).code).toBe(AggregatorPointerErrorCode.REJECTED);
 
-    // H8: localVersion advanced to v=1 (burned), marker cleared.
+    // H8 bookkeeping: localVersion advanced to v=1 (burned), marker cleared.
     expect(persistedVersion).toBe(1);
     expect(await readMarker(flagStore)).toBeNull();
+
+    // BLOCKED must be SET (recursive steelman: classifier now maps REJECTED → 'rejected').
+    const { isBlocked } = await import('../../../../profile/aggregator-pointer/index.js');
+    const state = await isBlocked(flagStore);
+    expect(state.blocked).toBe(true);
+    expect(state.reason).toBe('rejected');
+
+    // Diagnostic struct attached to the thrown error (recursive steelman fix).
+    const bookkeeping = (caughtErr as { h8Bookkeeping?: { blockedSet: boolean; markerCleared: boolean; localVersionPersisted: boolean; failures: string[] } }).h8Bookkeeping;
+    expect(bookkeeping).toBeDefined();
+    expect(bookkeeping!.blockedSet).toBe(true);
+    expect(bookkeeping!.markerCleared).toBe(true);
+    expect(bookkeeping!.localVersionPersisted).toBe(true);
+    expect(bookkeeping!.failures).toEqual([]);
+  });
+
+  it('H8 bookkeeping records failures when storage writes throw', async () => {
+    const client = mockClient(async () =>
+      mockResp(SubmitCommitmentStatus.AUTHENTICATOR_VERIFICATION_FAILED),
+    );
+    // Make persistLocalVersion throw — verify the failure is recorded, not swallowed.
+    const persistThatFails = async () => {
+      throw new Error('disk full');
+    };
+
+    let caughtErr: unknown;
+    try {
+      await publishOnceAtVersion({
+        cidBytes: VALID_CID,
+        candidateV: 1,
+        currentLocalVersion: 0,
+        keyMaterial,
+        signer,
+        aggregatorClient: client,
+        flagStore,
+        mutex,
+        persistLocalVersion: persistThatFails,
+      });
+    } catch (e) {
+      caughtErr = e;
+    }
+    expect((caughtErr as { code: string }).code).toBe(AggregatorPointerErrorCode.REJECTED);
+
+    const bookkeeping = (caughtErr as { h8Bookkeeping?: { localVersionPersisted: boolean; failures: string[] } }).h8Bookkeeping;
+    expect(bookkeeping).toBeDefined();
+    expect(bookkeeping!.localVersionPersisted).toBe(false);
+    expect(bookkeeping!.failures.length).toBeGreaterThan(0);
+    expect(bookkeeping!.failures.some((f) => f.includes('disk full'))).toBe(true);
   });
 
   it('BLOCKED gate: pre-existing BLOCKED state → UNREACHABLE_RECOVERY_BLOCKED', async () => {
