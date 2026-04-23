@@ -238,7 +238,7 @@ describe('CommunicationsModule — DM CID-ref persistence', () => {
     expect(parsed[0].id).toBe('m1');
   });
 
-  it('empty messages list clears KV and memoization state', async () => {
+  it('empty messages list writes "[]" sentinel and clears memoization', async () => {
     const store = new Map<string, string>();
     const storage = createMockStorage(store);
     const { fakeStore } = makeFakeCidRefStore();
@@ -257,9 +257,41 @@ describe('CommunicationsModule — DM CID-ref persistence', () => {
     (mod as unknown as { messages: Map<string, DirectMessage> }).messages.clear();
     await (mod as unknown as { save: () => Promise<void> }).save();
 
-    expect(store.get(STORAGE_KEYS_ADDRESS.MESSAGES)).toBe('');
+    // "[]" — truthy sentinel, NOT empty string. See _doSave for rationale:
+    // empty string would trigger legacy-fallback resurrection on next load.
+    expect(store.get(STORAGE_KEYS_ADDRESS.MESSAGES)).toBe('[]');
     expect((mod as unknown as { _lastPinnedMessagesJson: unknown })._lastPinnedMessagesJson).toBeNull();
     expect((mod as unknown as { _lastPinnedMessagesRef: unknown })._lastPinnedMessagesRef).toBeNull();
+  });
+
+  it('regression: empty save does NOT resurrect legacy DMs on next load', async () => {
+    // User story:
+    //   1. Wallet has legacy 'direct_messages' data (pre-CID-refs).
+    //   2. User migrates, per-address MESSAGES populated.
+    //   3. User deletes every DM.
+    //   4. User reloads.
+    // Pre-fix: step 3 wrote '' → step 4 fell through to legacy → DMs
+    // silently reappear. This test pins the regression closed.
+    const store = new Map<string, string>();
+    const storage = createMockStorage(store);
+    const deps = createDeps({ storage });
+    mod.initialize(deps);
+
+    // Seed legacy data and an empty per-address save.
+    const legacyMessages = [makeMessage('m_legacy', PEER_A_PUBKEY, MY_PUBKEY, 1000)];
+    store.set('direct_messages', JSON.stringify(legacyMessages));
+
+    // Intentional-empty save.
+    await (mod as unknown as { save: () => Promise<void> }).save();
+    expect(store.get(STORAGE_KEYS_ADDRESS.MESSAGES)).toBe('[]');
+
+    // Re-load into a fresh module instance.
+    const mod2 = new CommunicationsModule();
+    mod2.initialize(createDeps({ storage }));
+    await mod2.load();
+
+    const loaded = (mod2 as unknown as { messages: Map<string, DirectMessage> }).messages;
+    expect(loaded.size).toBe(0); // deletion honoured — legacy NOT resurrected
   });
 
   it('memoizes identical plaintext and skips re-pin', async () => {
@@ -329,42 +361,77 @@ describe('CommunicationsModule — DM CID-ref persistence', () => {
     expect(refSize).toBeLessThan(legacySize);
   });
 
-  it('concurrent save() calls serialize via save-chain (no lost writes)', async () => {
+  it('concurrent save() calls serialize via save-chain (no torn snapshots)', async () => {
+    // Strong race test: gate pinJson so save1 is still PINNING when save2
+    // fires. Without the chain, save2's _doSave would run while save1's
+    // storage.set is still in flight → both writes race. With the chain,
+    // save2 waits until save1 fully completes before reading the Map.
+    //
+    // Invariant checked: the SECOND pinJson call observes a snapshot that
+    // is a superset of the first (strict ordering). If the chain is broken,
+    // the second pinJson can observe a snapshot that's stale relative to
+    // interleaved Map mutations.
     const store = new Map<string, string>();
     const storage = createMockStorage(store);
-    const { fakeStore } = makeFakeCidRefStore();
-    const deps = createDeps({ storage, cidRefStore: fakeStore as never });
+    const deps = createDeps({ storage });
     mod.initialize(deps);
-
     const modMessages = (mod as unknown as { messages: Map<string, DirectMessage> }).messages;
 
-    // Capture the pinned snapshots to verify ordering.
+    const REAL_CIDS = [
+      'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+      'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+      'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+    ];
     const observedSnapshots: DirectMessage[][] = [];
-    fakeStore.pinJson.mockImplementation(async (value: unknown) => {
-      observedSnapshots.push([...(value as DirectMessage[])]);
-      return {
-        v: 1 as const,
-        cid: 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
-        size: 100,
-        ts: Date.now() + observedSnapshots.length,
-      };
+    let pinResolve: (() => void) | null = null;
+    const pinGate = new Promise<void>((resolve) => {
+      pinResolve = resolve;
     });
 
-    // Two concurrent saves — with different Map state snapshots between them.
+    const slowFakeStore = {
+      pinJson: vi.fn(async (value: unknown) => {
+        const idx = observedSnapshots.length;
+        observedSnapshots.push([...(value as DirectMessage[])]);
+        // First pin blocks until we release it — simulating slow IPFS so a
+        // second save() can race in without the chain's protection.
+        if (idx === 0) await pinGate;
+        return {
+          v: 1 as const,
+          cid: REAL_CIDS[idx % REAL_CIDS.length]!,
+          size: 100,
+          ts: Date.now() + idx,
+        };
+      }),
+      fetchJson: vi.fn(),
+    };
+    (mod as unknown as { deps: CommunicationsModuleDependencies }).deps.cidRefStore = slowFakeStore as never;
+
+    // Setup: add m1, kick off save1 — it will enter pinJson and block.
     modMessages.set('m1', makeMessage('m1', PEER_A_PUBKEY, MY_PUBKEY, 1000));
     const save1 = (mod as unknown as { save: () => Promise<void> }).save();
+
+    // Yield so save1's microtask runs (enters pinJson → blocked on gate).
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Now mutate state + kick off save2. Without the chain, save2 would
+    // race save1 here. With the chain, save2 must wait for save1 to fully
+    // complete before reading modMessages.
     modMessages.set('m2', makeMessage('m2', PEER_A_PUBKEY, MY_PUBKEY, 2000));
     const save2 = (mod as unknown as { save: () => Promise<void> }).save();
 
+    // Release the gate — save1 now completes with its pre-mutation snapshot,
+    // then save2 runs and observes the post-mutation snapshot.
+    pinResolve!();
     await Promise.all([save1, save2]);
 
-    // The final snapshot must include BOTH messages. Without the chain,
-    // save2 could race with save1 and write a snapshot missing m1 or m2
-    // depending on ordering.
-    const finalSnapshot = observedSnapshots[observedSnapshots.length - 1]!;
-    const ids = finalSnapshot.map((m) => m.id).sort();
-    expect(ids).toContain('m1');
-    expect(ids).toContain('m2');
+    // Two pins observed. First pin saw only m1 (pre-gate-release snapshot).
+    // Second pin must see BOTH m1 and m2 (post-gate-release snapshot) —
+    // the chain forced save2 to wait.
+    expect(observedSnapshots.length).toBe(2);
+    expect(observedSnapshots[0]!.map((m) => m.id)).toEqual(['m1']);
+    const secondIds = observedSnapshots[1]!.map((m) => m.id).sort();
+    expect(secondIds).toEqual(['m1', 'm2']);
   });
 
   it('legacy global-key migration still works (predates CID-refs)', async () => {

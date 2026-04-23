@@ -826,9 +826,17 @@ export class CommunicationsModule {
     const cidRefStore = this.deps!.cidRefStore;
 
     if (messages.length === 0) {
-      // Empty list: write empty string and clear memo so the next non-empty
-      // save re-pins (can't reuse a stale ref).
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, '');
+      // Empty list: write a truthy JSON sentinel ("[]") rather than the empty
+      // string. Reason: `load()` treats falsy KV values as "no data" and
+      // falls through to the legacy global `direct_messages` key for
+      // migration. If we wrote '' here, a user who deleted every DM would
+      // see those DMs resurrect from the legacy key on the next reload.
+      // Writing "[]" keeps load() on the per-address branch and decodes
+      // cleanly to an empty array.
+      //
+      // Diverges intentionally from outbox/pendingV5 which have no legacy
+      // fallback and can safely use the empty-string sentinel.
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, '[]');
       this._lastPinnedMessagesJson = null;
       this._lastPinnedMessagesRef = null;
       return;
