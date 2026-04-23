@@ -428,6 +428,39 @@ describe('fetchAndJoin (T-D3c)', () => {
     });
   });
 
+  it('persists the local version BEFORE writing the OrbitDB bundle ref', async () => {
+    // Critical ordering: persistLocalVersion must run first so a
+    // db.put failure does not leave the cursor advanced past a
+    // bundle ref that was never written. Steelman finding #3.
+    const order: string[] = [];
+    const db = createMockDb();
+    const originalPut = db.put.bind(db);
+    db.put = async (k, v) => {
+      order.push('db.put');
+      return originalPut(k, v);
+    };
+
+    const { fetchFromIpfs } = await import('../../../profile/ipfs-client');
+    const fetchMock = fetchFromIpfs as ReturnType<typeof vi.fn>;
+    fetchMock.mockReset();
+    fetchMock.mockImplementation(async () => new Uint8Array([0xbe, 0xef]));
+
+    const { __internal } = await import('../../../profile/pointer-wiring');
+    const { CID } = await import('multiformats/cid');
+
+    const callback = __internal.buildFetchAndJoin({
+      db,
+      gateways: ['https://ipfs.example'],
+      persistLocalVersion: async () => {
+        order.push('persistLocalVersion');
+      },
+      bundleEncryptionKey: new Uint8Array(32),
+    });
+
+    await callback(CID.parse(TEST_CID_STRING).bytes, 11);
+    expect(order).toEqual(['persistLocalVersion', 'db.put']);
+  });
+
   it('written bundle ref round-trips through decryptProfileValue', async () => {
     // Guards against a future regression where fetchAndJoin and
     // ProfileTokenStorageProvider.listBundles drift on the encryption

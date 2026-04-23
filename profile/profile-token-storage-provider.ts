@@ -67,6 +67,34 @@ import {
   deriveStructuralManifest,
   type TokenManifest,
 } from './token-manifest.js';
+import { CID } from 'multiformats/cid';
+
+/**
+ * Pointer-layer error codes that indicate a permanent integrity /
+ * configuration problem. These MUST be surfaced to the user rather
+ * than silently swallowed — either the wallet is poisoned (marker
+ * corrupt, streak of corrupt versions), the aggregator rotated its
+ * trust base (SDK upgrade needed), the wallet was rejected (v-burn
+ * that will never succeed again), or we hit an integrity-class
+ * failure (untrusted proof, security origin mismatch).
+ *
+ * Unknown / missing codes default to TRANSIENT (see
+ * `isPermanentPointerError`) — "keep running and retry" is safer
+ * than "break the wallet" when classification is ambiguous.
+ */
+const PERMANENT_POINTER_ERROR_CODES: ReadonlySet<string> = new Set([
+  'AGGREGATOR_POINTER_UNREACHABLE_RECOVERY_BLOCKED',
+  'AGGREGATOR_POINTER_REJECTED',
+  'AGGREGATOR_POINTER_UNTRUSTED_PROOF',
+  'AGGREGATOR_POINTER_TRUST_BASE_STALE',
+  'AGGREGATOR_POINTER_MARKER_CORRUPT',
+  'AGGREGATOR_POINTER_CORRUPT_STREAK',
+  'AGGREGATOR_POINTER_AGGREGATOR_REJECTED',
+  'SECURITY_ORIGIN_MISMATCH',
+  'AGGREGATOR_POINTER_CAPABILITY_DENIED',
+  'AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME',
+  'AGGREGATOR_POINTER_PROTOCOL_ERROR',
+]);
 
 // =============================================================================
 // Constants
@@ -984,13 +1012,43 @@ export class ProfileTokenStorageProvider
   // ===========================================================================
 
   /**
+   * Classify a pointer-layer error as TRANSIENT (retry on next flush
+   * / cold-start, no user action needed) or PERMANENT (user / operator
+   * must intervene — wallet state is poisoned or aggregator rotation
+   * requires SDK update). Used to decide whether to silently swallow
+   * the error or surface it via a `storage:error` event.
+   *
+   * Non-exhaustive — unknown codes default to TRANSIENT on the premise
+   * that "keep running and retry" is safer than "break the wallet".
+   * Add to PERMANENT_POINTER_ERROR_CODES below when a new permanent
+   * failure mode is introduced.
+   */
+  private isPermanentPointerError(err: unknown): boolean {
+    if (!err || typeof err !== 'object') return false;
+    const code = (err as { code?: unknown }).code;
+    if (typeof code !== 'string') return false;
+    return PERMANENT_POINTER_ERROR_CODES.has(code);
+  }
+
+  /**
    * Publish the just-flushed CID to the aggregator pointer layer.
    *
-   * Best-effort: failures are logged but never thrown. The authoritative
-   * state (CAR pinned + OrbitDB bundle ref) is already written by the
-   * time this runs, so a failed pointer publish only delays cold-start
-   * recovery for this flush. The next flush will retry publishing the
-   * then-current CID.
+   * TRANSIENT failures (NETWORK_ERROR, CAR_UNAVAILABLE, PUBLISH_BUSY,
+   * CONFLICT, RETRY_EXHAUSTED, CAR_*_TIMEOUT, CAR_TOO_LARGE,
+   * CAR_UNEXPECTED_ENCODING) are silently logged — the CAR is already
+   * pinned and the OrbitDB bundle ref is already written, so the
+   * next flush can retry the publish.
+   *
+   * PERMANENT failures (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
+   * UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
+   * SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
+   * PROTOCOL_ERROR, AGGREGATOR_REJECTED) are surfaced via a
+   * `storage:error` event with the error code in the payload. The UI
+   * can then prompt the user (upgrade SDK on TRUST_BASE_STALE, enter
+   * recovery on UNREACHABLE_RECOVERY_BLOCKED, etc.). Without this
+   * surface, permanent failures are retried forever on every flush —
+   * accumulating CAR pins (cost) and OrbitDB refs (bloat) with no
+   * anchor.
    *
    * Semantic note: `cidProducer` returns the SAME CID on retry — we
    * are anchoring THIS flush's bundle. If a publish-conflict triggers
@@ -1002,16 +1060,24 @@ export class ProfileTokenStorageProvider
     if (!pointer) return;
 
     try {
-      const { CID } = await import('multiformats/cid');
       const cidBytes = CID.parse(cidString).bytes;
       const result = await pointer.publish(async () => cidBytes);
       this.log(
         `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
       );
     } catch (err) {
-      this.log(
-        `Pointer publish failed (best-effort): ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const msg = err instanceof Error ? err.message : String(err);
+      if (this.isPermanentPointerError(err)) {
+        const code = (err as { code?: string }).code ?? 'UNKNOWN';
+        this.log(`Pointer publish PERMANENT failure (${code}): ${msg}`);
+        this.emitEvent({
+          type: 'storage:error',
+          timestamp: Date.now(),
+          error: `Pointer publish failed: ${code}. ${msg}`,
+        });
+      } else {
+        this.log(`Pointer publish failed (transient, best-effort): ${msg}`);
+      }
     }
   }
 
@@ -1019,8 +1085,17 @@ export class ProfileTokenStorageProvider
    * Try to rebuild the local bundle set from the aggregator pointer
    * layer's last valid CID. Returns `true` iff a bundle ref was
    * recorded (caller should skip the IPNS fallback). Returns `false`
-   * when the pointer layer is unavailable, has no anchor yet, or
-   * throws — caller falls through to IPNS.
+   * when the pointer has no anchor yet or transiently failed — the
+   * caller falls through to IPNS.
+   *
+   * PERMANENT failures (TRUST_BASE_STALE, UNTRUSTED_PROOF,
+   * SECURITY_ORIGIN_MISMATCH, PROTOCOL_ERROR, UNSUPPORTED_RUNTIME,
+   * UNREACHABLE_RECOVERY_BLOCKED) indicate integrity problems — a
+   * silent fallthrough to IPNS would be a downgrade attack surface.
+   * These are surfaced via `storage:error` AND return `true` so the
+   * IPNS fallback does NOT fire. The bundle set may be empty; the
+   * next flush can seed fresh anchors once the operator has fixed
+   * the underlying problem.
    *
    * Content-address verify: `recoverLatest()` internally goes through
    * discovery → classifyVersion (which fetches + verifies the CAR
@@ -1031,16 +1106,34 @@ export class ProfileTokenStorageProvider
     const pointer = this._options?.getPointerLayer?.() ?? null;
     if (!pointer) return false;
 
+    let recovered: { readonly cid: Uint8Array; readonly version: number } | null;
     try {
-      const recovered = await pointer.recoverLatest();
-      if (!recovered) {
-        this.log('Pointer recover: no anchor published yet');
-        return false;
+      recovered = await pointer.recoverLatest();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (this.isPermanentPointerError(err)) {
+        const code = (err as { code?: string }).code ?? 'UNKNOWN';
+        this.log(`Pointer recover PERMANENT failure (${code}): ${msg}`);
+        this.emitEvent({
+          type: 'storage:error',
+          timestamp: Date.now(),
+          error: `Pointer recover failed: ${code}. ${msg}`,
+        });
+        // Do NOT fall through to IPNS on permanent integrity
+        // failures — return true so the IPNS path is skipped.
+        return true;
       }
+      this.log(`Pointer recover failed (transient, best-effort): ${msg}`);
+      return false;
+    }
 
-      const { CID } = await import('multiformats/cid');
+    if (!recovered) {
+      this.log('Pointer recover: no anchor published yet');
+      return false;
+    }
+
+    try {
       const cidString = CID.decode(recovered.cid).toString();
-
       // Idempotent: if the bundle already exists locally, this is a
       // no-op. Token count is unknown from the pointer alone — the
       // next flush re-counts.
@@ -1052,12 +1145,21 @@ export class ProfileTokenStorageProvider
       this.log(
         `Pointer recover ok: cid=${cidString} version=${recovered.version}`,
       );
+      // recoverLatest() succeeded and we certified the pointer
+      // anchor. Even if addBundle failed transiently (handled via
+      // the throw path below), the pointer layer has successfully
+      // identified this wallet's state — IPNS fallback would only
+      // add noise. Return true on success; throw on addBundle error.
       return true;
     } catch (err) {
-      this.log(
-        `Pointer recover failed (best-effort): ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
+      // A post-recoverLatest error (most likely addBundle / OrbitDB
+      // write failure). Treat as transient — the next flush /
+      // reconnect will retry and the pointer anchor is already known
+      // to be VALID. Fall back to IPNS? No: pointer already certified
+      // the anchor; IPNS can only return something less trusted.
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`Pointer recover: addBundle failed post-recover: ${msg}`);
+      return true;
     }
   }
 

@@ -203,4 +203,53 @@ describe('ProfileTokenStorageProvider pointer recovery (T-D6 wiring)', () => {
     await expect(provider.initialize()).resolves.toBe(true);
     expect(db._store.size).toBe(0);
   });
+
+  it('surfaces a storage:error event when the pointer fails with TRUST_BASE_STALE (permanent)', async () => {
+    const staleError = Object.assign(
+      new Error('embedded trust base is older than aggregator epoch'),
+      { code: 'AGGREGATOR_POINTER_TRUST_BASE_STALE' },
+    );
+    const recoverLatest = vi.fn(async () => {
+      throw staleError;
+    });
+    const pointer = stubPointer({ recoverLatest });
+
+    const provider = createProvider({ db, getPointerLayer: () => pointer });
+
+    const errorEvents: string[] = [];
+    provider.onEvent((evt) => {
+      if (evt.type === 'storage:error') {
+        errorEvents.push(evt.error ?? '');
+      }
+    });
+
+    // initialize must still succeed (best-effort) — but the error
+    // event must fire AND no IPNS fallback should run (bundle set
+    // stays empty).
+    await expect(provider.initialize()).resolves.toBe(true);
+    expect(errorEvents.length).toBe(1);
+    expect(errorEvents[0]).toContain('AGGREGATOR_POINTER_TRUST_BASE_STALE');
+  });
+
+  it('does NOT surface events for transient pointer errors (network / unavailable)', async () => {
+    const transientError = Object.assign(
+      new Error('aggregator offline'),
+      { code: 'AGGREGATOR_POINTER_NETWORK_ERROR' },
+    );
+    const pointer = stubPointer({
+      recoverLatest: vi.fn(async () => {
+        throw transientError;
+      }),
+    });
+
+    const provider = createProvider({ db, getPointerLayer: () => pointer });
+
+    const errorEvents: string[] = [];
+    provider.onEvent((evt) => {
+      if (evt.type === 'storage:error') errorEvents.push(evt.error ?? '');
+    });
+
+    await expect(provider.initialize()).resolves.toBe(true);
+    expect(errorEvents).toEqual([]);
+  });
 });
