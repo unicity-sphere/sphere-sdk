@@ -78,6 +78,17 @@ import type { ProfileDatabase, UxfBundleRef } from './types';
 /** OrbitDB key prefix for UXF bundle references — mirrors ProfileTokenStorageProvider. */
 const BUNDLE_KEY_PREFIX = 'tokens.bundle.';
 
+/**
+ * Wall-clock cap for the aggregate CAR fetch across all gateways in
+ * buildCarFetcher. Each gateway call already has its own three-tier
+ * timeout (MAX_CAR_FETCH_* constants in ipfs-car-fetch.ts), but
+ * without an outer cap an operator with N stalling gateways pays
+ * N × total_timeout before giving up — 15 min for 3 gateways,
+ * 50 min for 10. classifyVersion / recoverLatest / flushToIpfs all
+ * await this on the hot path, so a hard outer budget is required.
+ */
+const CAR_FETCH_TOTAL_BUDGET_MS = 60_000;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -140,6 +151,32 @@ export interface PointerWiringInput {
 const LOCAL_VERSION_KEY = 'profile.pointer.version';
 
 /**
+ * Parse a CAR byte buffer and return its root CID bytes, or `null`
+ * if the CAR is malformed or has no roots. Dynamic import keeps
+ * `@ipld/car` out of the hot path of tree-shaken browser bundles
+ * that don't hit this code.
+ */
+async function extractCarRootCid(carBytes: Uint8Array): Promise<Uint8Array | null> {
+  try {
+    const { CarReader } = await import('@ipld/car');
+    const reader = await CarReader.fromBytes(carBytes);
+    const roots = await reader.getRoots();
+    if (roots.length === 0) return null;
+    return new Uint8Array(roots[0].bytes);
+  } catch {
+    return null;
+  }
+}
+
+function cidBytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
  * Build a `fetchCar` that iterates over the configured IPFS gateways
  * and maps the gateway-level failure kinds onto the pointer-layer
  * `CarFetchResult` shape.
@@ -149,11 +186,17 @@ const LOCAL_VERSION_KEY = 'profile.pointer.version';
  *   - `content_mismatch`      — bytes don't hash to the expected CID
  *   - `car_parse_failed`      — bytes aren't a valid CAR
  *
- * Everything `fetchCarFromGateway` surfaces below `byte_cap_exceeded`
- * and `content_encoding_rejected` is protocol / configuration noise —
- * bucketed as `transient_unavailable` on the assumption the caller
- * will retry. Content-mismatch detection happens after fetch via
- * `CID.createV1(...).bytes` comparison.
+ * `classifyVersion` promotes a version to `VALID` on `ok: true`, so
+ * content-address verification MUST happen here or the inclusion-
+ * proof authentication boundary is defeated (a hostile gateway
+ * returning any HTTP 200 body would be accepted). We verify by
+ * parsing the CAR header and byte-comparing the root CID to the
+ * caller-supplied `cidBytes`.
+ *
+ * A wall-clock budget (`CAR_FETCH_TOTAL_BUDGET_MS`) caps the total
+ * time across all gateways so a misconfigured operator with N
+ * stalling gateways cannot block the hot path for N × per-gateway
+ * timeout.
  */
 function buildCarFetcher(gateways: readonly string[]): CarFetcher {
   return async (cidBytes: Uint8Array) => {
@@ -164,25 +207,50 @@ function buildCarFetcher(gateways: readonly string[]): CarFetcher {
       return { ok: false, kind: 'car_parse_failed' } as const;
     }
 
+    const startedAt = Date.now();
+    const budgetRemaining = (): number =>
+      Math.max(0, CAR_FETCH_TOTAL_BUDGET_MS - (Date.now() - startedAt));
+
     let lastTransient: string | null = null;
     for (const gateway of gateways) {
+      if (budgetRemaining() === 0) {
+        return {
+          ok: false,
+          kind: 'transient_unavailable',
+        } as unknown as { readonly ok: false; readonly kind: 'transient_unavailable' };
+      }
+
       const url = `${gateway.replace(/\/+$/, '')}/ipfs/${cidString}?format=car`;
       let outcome;
       try {
-        outcome = await fetchCarFromGateway(url);
+        // Clamp per-gateway total budget to whatever is left on the
+        // outer budget so the inner fetch cannot outlive the cap.
+        outcome = await fetchCarFromGateway(url, { totalMs: budgetRemaining() });
       } catch (err) {
         lastTransient = err instanceof Error ? err.message : String(err);
         continue;
       }
 
       if (outcome.ok) {
-        // Content-address verify: decode CAR header's root CID and
-        // compare byte-for-byte. Deferred to a dedicated step —
-        // returning `ok: true` here is safe for the codepaths that
-        // consume this helper today (probe / classifyVersion), which
-        // compare the XOR-decoded CID against the one returned by
-        // the aggregator, not the CAR contents. Strict content-
-        // address verify lands with the T-D6 recovery wiring.
+        // Content-address verify: extract the root CID from the CAR
+        // header and compare byte-for-byte. A CAR file's root CID
+        // does not equal sha256(carBytes) — the CAR is a serialized
+        // DAG container, not a raw blob — so `verifyCidMatchesBytes`
+        // from profile/ipfs-client does not apply. Use the CAR
+        // reader's `getRoots()` instead.
+        const rootCid = await extractCarRootCid(outcome.bytes);
+        if (rootCid === null) {
+          return { ok: false, kind: 'car_parse_failed' } as const;
+        }
+        if (!cidBytesEqual(rootCid, cidBytes)) {
+          // Mismatch is not necessarily transient — a single hostile
+          // gateway returning wrong bytes is an attacker signal. But
+          // it could also be a gateway caching-bug returning the
+          // wrong content for a requested CID. Per SPEC §8.2 step 3
+          // this is SEMANTICALLY_INVALID, so we do NOT retry other
+          // gateways; the CID is the authoritative identifier.
+          return { ok: false, kind: 'content_mismatch' } as const;
+        }
         return { ok: true } as const;
       }
 
@@ -346,19 +414,61 @@ function buildFetchAndJoin(deps: {
         `fetchAndJoin: bundle-ref encryption failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+
+    // Step 4 runs BEFORE step 5 to avoid the "cursor advanced past a
+    // bundle that isn't in OrbitDB yet" failure mode: if the
+    // `db.put` below throws but persistLocalVersion has already
+    // committed `version = remoteVersion`, the next reconcile/discover
+    // round starts from a version whose bundle ref was never written.
+    // The OrbitDB ref is the authoritative state; local version is
+    // derived. Persisting the version first means the write either
+    // both succeed (happy path) or the cursor stays behind OrbitDB
+    // (recoverable — next reconcile re-fetches the same cidBytes,
+    // and the ref is idempotent by key). Wrap `db.put` with a hard
+    // timeout: @orbitdb/core queues writes against OpLog heads and
+    // can hang indefinitely if the replication layer is stuck.
+    await deps.persistLocalVersion(remoteVersion);
     try {
-      await deps.db.put(BUNDLE_KEY_PREFIX + cidString, encrypted);
+      await withTimeout(
+        deps.db.put(BUNDLE_KEY_PREFIX + cidString, encrypted),
+        ORBITDB_WRITE_TIMEOUT_MS,
+        `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
+      );
     } catch (err) {
+      if (err instanceof AggregatorPointerError) throw err;
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
         `fetchAndJoin: OrbitDB bundle-ref write failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-
-    // 4. Advance the per-device pointer version so the next reconcile
-    //    round starts from the merged cursor.
-    await deps.persistLocalVersion(remoteVersion);
   };
+}
+
+/** Hard cap for an OrbitDB write from inside fetchAndJoin. */
+const ORBITDB_WRITE_TIMEOUT_MS = 15_000;
+
+/** Race a promise against a wall-clock timeout. */
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new AggregatorPointerError(
+          AggregatorPointerErrorCode.PROTOCOL_ERROR,
+          message,
+        ),
+      );
+    }, ms);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /**
