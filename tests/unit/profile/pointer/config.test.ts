@@ -100,6 +100,25 @@ describe('assertConfigCapabilities — allowOperatorOverrides', () => {
     process.env.SPHERE_ALLOW_OVERRIDES = '1';
     expect(() => assertConfigCapabilities({ allowOperatorOverrides: true })).not.toThrow();
   });
+
+  it('T-E26 case-insensitive: CAPABILITY_DENIED when NODE_ENV=PRODUCTION (uppercase)', () => {
+    // A misconfigured CI or Windows env can deliver the string in a
+    // non-canonical case. The guard must normalize before comparing
+    // to prevent a trivial bypass.
+    process.env.NODE_ENV = 'PRODUCTION';
+    process.env.SPHERE_ALLOW_OVERRIDES = '1';
+    expect(() => assertConfigCapabilities({ allowOperatorOverrides: true })).toThrow(
+      expect.objectContaining({ code: AggregatorPointerErrorCode.CAPABILITY_DENIED }),
+    );
+  });
+
+  it('T-E26 case-insensitive: CAPABILITY_DENIED when NODE_ENV=Production (mixed case)', () => {
+    process.env.NODE_ENV = 'Production';
+    process.env.SPHERE_ALLOW_OVERRIDES = '1';
+    expect(() => assertConfigCapabilities({ allowOperatorOverrides: true })).toThrow(
+      expect.objectContaining({ code: AggregatorPointerErrorCode.CAPABILITY_DENIED }),
+    );
+  });
 });
 
 describe('operatorOverridesAllowed + assertOperatorOverridesAllowed', () => {

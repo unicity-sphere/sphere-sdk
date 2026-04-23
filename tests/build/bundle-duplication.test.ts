@@ -77,13 +77,17 @@ function grepExportsNaming(content: string, symbol: string): string[] {
 /**
  * Check for blanket `export * from '...aggregator-pointer...'` which
  * would transitively re-export ProfilePointerLayer without naming it.
+ * Also catches the namespace form `export * as NS from '...'`, which
+ * inlines the module into the second bundle under an alias — same
+ * footgun as a direct wildcard re-export.
  */
 function grepWildcardReExport(content: string): string[] {
   const hits: string[] = [];
   const lines = content.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^\s*export\s*\*\s*from/.test(line) && line.includes('aggregator-pointer')) {
+    // `export * from '…'` OR `export * as Name from '…'`
+    if (/^\s*export\s*\*\s*(as\s+\w+\s+)?from/.test(line) && line.includes('aggregator-pointer')) {
       hits.push(`line ${i + 1}: ${line.trim()}`);
     }
   }

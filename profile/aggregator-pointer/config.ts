@@ -81,17 +81,23 @@ export function assertConfigCapabilities(config: PointerLayerConfig): void {
     // below; a genuine operator-override deployment would set
     // NODE_ENV to something other than 'production' (e.g. 'staging'
     // or leave it unset for a dev-tools build).
-    const nodeEnv =
+    //
+    // Normalize to lowercase so accidental `PRODUCTION` / `Production`
+    // from a misconfigured CI still fails closed. Node ecosystem
+    // convention is lowercase-only but we do not rely on the caller
+    // getting that right — the guard must hold regardless of case.
+    const nodeEnvRaw =
       typeof process !== 'undefined' && typeof process.env === 'object' && process.env !== null
         ? process.env[NODE_ENV_KEY]
         : undefined;
+    const nodeEnv = typeof nodeEnvRaw === 'string' ? nodeEnvRaw.toLowerCase() : nodeEnvRaw;
     if (nodeEnv === 'production') {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.CAPABILITY_DENIED,
         `PointerLayerConfig.allowOperatorOverrides is forbidden in production builds ` +
-          `(NODE_ENV=production). Remove the flag or rebuild with a non-production ` +
+          `(NODE_ENV=${String(nodeEnvRaw)}). Remove the flag or rebuild with a non-production ` +
           `NODE_ENV. SPEC §13 / T-E26 production-build guard.`,
-        { allowOperatorOverrides: true, nodeEnv: 'production' },
+        { allowOperatorOverrides: true, nodeEnv: String(nodeEnvRaw) },
       );
     }
 
