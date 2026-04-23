@@ -456,6 +456,13 @@ function buildFetchAndJoin(deps: {
           ORBITDB_WRITE_TIMEOUT_MS,
           `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
         );
+        // Mirror the markLocallyAuthored convention — see the same
+        // fallback in ProfileTokenStorageProvider.addBundle.
+        const markHook = (deps.db as { markLocallyAuthored?: (k: string) => void })
+          .markLocallyAuthored;
+        if (typeof markHook === 'function') {
+          markHook.call(deps.db, bundleKey);
+        }
       }
     } catch (err) {
       if (err instanceof AggregatorPointerError) throw err;

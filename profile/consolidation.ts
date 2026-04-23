@@ -25,6 +25,7 @@ import { logger } from '../core/logger.js';
 import type { ProfileDatabase } from './types.js';
 import type { UxfBundleRef, ConsolidationPendingState } from './types.js';
 import { ProfileError } from './errors.js';
+import { buildLocalEntry, decodeEntry } from './oplog-entry.js';
 import {
   encryptProfileValue,
   decryptProfileValue,
@@ -422,6 +423,15 @@ export class ConsolidationEngine {
 
   /**
    * List all bundle refs from OrbitDB (all statuses).
+   *
+   * Post-T-D11, `ProfileTokenStorageProvider.addBundle` writes bundle
+   * refs as envelope-stamped entries when the adapter supports
+   * `putEntry` (originated='system', type='cache_index'). This
+   * reader mirrors `ProfileTokenStorageProvider.listBundles`: try
+   * envelope decode first, fall through to raw-bytes on throw. A
+   * wallet with a mixed population (legacy raw-bytes from pre-T-D11
+   * flushes alongside new stamped envelopes) round-trips in both
+   * directions.
    */
   private async listAllBundles(): Promise<Map<string, UxfBundleRef>> {
     const rawEntries = await this.db.all(BUNDLE_KEY_PREFIX);
@@ -430,7 +440,21 @@ export class ConsolidationEngine {
     for (const [key, value] of rawEntries) {
       const cid = key.slice(BUNDLE_KEY_PREFIX.length);
       try {
-        const decrypted = await decryptProfileValue(this.encryptionKey, value);
+        // Extract the encrypted payload from either a stamped
+        // envelope (T-D11 write shape) or raw bytes (legacy). A
+        // successful decode whose `v===1` wins; anything else falls
+        // through to treating `value` as the encrypted payload
+        // directly.
+        let encryptedPayload: Uint8Array = value;
+        try {
+          const envelope = decodeEntry(value);
+          if (envelope.v === 1) {
+            encryptedPayload = envelope.payload;
+          }
+        } catch {
+          // Not an envelope — raw-bytes legacy entry, use `value`.
+        }
+        const decrypted = await decryptProfileValue(this.encryptionKey, encryptedPayload);
         const ref = JSON.parse(new TextDecoder().decode(decrypted)) as UxfBundleRef;
         result.set(cid, ref);
       } catch (err) {
@@ -459,12 +483,33 @@ export class ConsolidationEngine {
   }
 
   /**
-   * Write a bundle ref to OrbitDB (encrypted).
+   * Write a bundle ref to OrbitDB (encrypted, system-stamped).
+   *
+   * Mirrors ProfileTokenStorageProvider.addBundle's T-D11 W11
+   * stamping: envelope with originated='system' when putEntry is
+   * available, raw-bytes fallback otherwise (readers auto-wrap as
+   * v=0 legacy with synthesized originated='system' at read time).
    */
   private async addBundle(cid: string, ref: UxfBundleRef): Promise<void> {
     const serialized = new TextEncoder().encode(JSON.stringify(ref));
-    const encrypted = await encryptProfileValue(this.encryptionKey, serialized);
-    await this.db.put(BUNDLE_KEY_PREFIX + cid, encrypted);
+    const encryptedPayload = await encryptProfileValue(this.encryptionKey, serialized);
+
+    const key = BUNDLE_KEY_PREFIX + cid;
+    if (typeof this.db.putEntry === 'function') {
+      const envelope = buildLocalEntry({
+        type: 'cache_index',
+        originated: 'system',
+        payload: encryptedPayload,
+      });
+      await this.db.putEntry(key, envelope);
+    } else {
+      await this.db.put(key, encryptedPayload);
+      const markHook = (this.db as { markLocallyAuthored?: (k: string) => void })
+        .markLocallyAuthored;
+      if (typeof markHook === 'function') {
+        markHook.call(this.db, key);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------

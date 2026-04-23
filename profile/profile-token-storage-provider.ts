@@ -1034,6 +1034,15 @@ export class ProfileTokenStorageProvider
       await this.db.putEntry(key, envelope);
     } else {
       await this.db.put(key, encryptedPayload);
+      // Mark locally-authored on the fallback path too, so any
+      // downstream `getEntry` consumer that consults
+      // `localAuthoredKeys` sees this write as local rather than
+      // force-downgrading it to 'replicated'. Mirrors the
+      // convention in profile/profile-storage-provider.ts:writeEnvelope.
+      const markHook = (this.db as { markLocallyAuthored?: (k: string) => void }).markLocallyAuthored;
+      if (typeof markHook === 'function') {
+        markHook.call(this.db, key);
+      }
     }
     this.knownBundleCids.add(cid);
   }
