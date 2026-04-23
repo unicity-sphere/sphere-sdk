@@ -73,6 +73,7 @@ import { AggregatorPointerError, AggregatorPointerErrorCode } from './aggregator
 import { fetchCarFromGateway } from './aggregator-pointer/ipfs-car-fetch';
 import { fetchFromIpfs } from './ipfs-client';
 import { deriveProfileEncryptionKey, encryptProfileValue } from './encryption';
+import { buildLocalEntry } from './oplog-entry';
 import type { ProfileDatabase, UxfBundleRef } from './types';
 
 /** OrbitDB key prefix for UXF bundle references — mirrors ProfileTokenStorageProvider. */
@@ -417,23 +418,45 @@ function buildFetchAndJoin(deps: {
 
     // Step 4 runs BEFORE step 5 to avoid the "cursor advanced past a
     // bundle that isn't in OrbitDB yet" failure mode: if the
-    // `db.put` below throws but persistLocalVersion has already
-    // committed `version = remoteVersion`, the next reconcile/discover
-    // round starts from a version whose bundle ref was never written.
-    // The OrbitDB ref is the authoritative state; local version is
-    // derived. Persisting the version first means the write either
-    // both succeed (happy path) or the cursor stays behind OrbitDB
-    // (recoverable — next reconcile re-fetches the same cidBytes,
-    // and the ref is idempotent by key). Wrap `db.put` with a hard
-    // timeout: @orbitdb/core queues writes against OpLog heads and
-    // can hang indefinitely if the replication layer is stuck.
+    // bundle-ref write below throws but persistLocalVersion has
+    // already committed `version = remoteVersion`, the next
+    // reconcile/discover round starts from a version whose bundle
+    // ref was never written. The OrbitDB ref is the authoritative
+    // state; local version is derived. Persisting the version first
+    // means the write either both succeed (happy path) or the
+    // cursor stays behind OrbitDB (recoverable — next reconcile
+    // re-fetches the same cidBytes, and the ref is idempotent by
+    // key). Wrap the write with a hard timeout: @orbitdb/core queues
+    // writes against OpLog heads and can hang indefinitely if the
+    // replication layer is stuck.
+    //
+    // T-D11 W11: stamp the write with originated='system'.
+    // fetchAndJoin's bundle-ref writes mirror addBundle — both are
+    // system-generated cache-index events (not user actions), so
+    // the envelope tag matches ProfileTokenStorageProvider.addBundle.
+    // This keeps the peer's replication view consistent regardless
+    // of which local path produced the ref.
     await deps.persistLocalVersion(remoteVersion);
+    const bundleKey = BUNDLE_KEY_PREFIX + cidString;
     try {
-      await withTimeout(
-        deps.db.put(BUNDLE_KEY_PREFIX + cidString, encrypted),
-        ORBITDB_WRITE_TIMEOUT_MS,
-        `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
-      );
+      if (typeof deps.db.putEntry === 'function') {
+        const envelope = buildLocalEntry({
+          type: 'cache_index',
+          originated: 'system',
+          payload: encrypted,
+        });
+        await withTimeout(
+          deps.db.putEntry(bundleKey, envelope),
+          ORBITDB_WRITE_TIMEOUT_MS,
+          `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
+        );
+      } else {
+        await withTimeout(
+          deps.db.put(bundleKey, encrypted),
+          ORBITDB_WRITE_TIMEOUT_MS,
+          `fetchAndJoin: OrbitDB bundle-ref write timed out after ${ORBITDB_WRITE_TIMEOUT_MS}ms for ${cidString}`,
+        );
+      }
     } catch (err) {
       if (err instanceof AggregatorPointerError) throw err;
       throw new AggregatorPointerError(

@@ -67,6 +67,7 @@ import {
   deriveStructuralManifest,
   type TokenManifest,
 } from './token-manifest.js';
+import { buildLocalEntry, decodeEntry } from './oplog-entry.js';
 import { CID } from 'multiformats/cid';
 
 /**
@@ -955,6 +956,15 @@ export class ProfileTokenStorageProvider
 
   /**
    * List all bundle refs from OrbitDB (all statuses).
+   *
+   * Bundle refs are written as system-stamped envelopes by
+   * `addBundle` (T-D11). Legacy wallets may have raw-bytes entries
+   * (pre-envelope writes) — we detect those by attempting the
+   * structured decode first, falling back to treating the stored
+   * bytes as the encrypted payload directly. On the fallback path
+   * the entry acts as a `v=0` legacy entry under the oplog-schema
+   * contract (synthetic `originated='system'` at read time via the
+   * adapter's legacy-wrapping).
    */
   private async listBundles(): Promise<Map<string, UxfBundleRef>> {
     const rawEntries = await this.db.all(BUNDLE_KEY_PREFIX);
@@ -963,9 +973,25 @@ export class ProfileTokenStorageProvider
     for (const [key, value] of rawEntries) {
       const cid = key.slice(BUNDLE_KEY_PREFIX.length);
       try {
+        // Extract the encrypted payload from either a stamped
+        // envelope (new path, T-D11) or the raw bytes (legacy). A
+        // successful envelope decode whose `v===1` wins; anything
+        // else — decode throws, or `v===0` legacy sentinel — falls
+        // through to treating `value` as the raw encrypted payload.
+        let encryptedPayload: Uint8Array = value;
+        try {
+          const envelope = decodeEntry(value);
+          if (envelope.v === 1) {
+            encryptedPayload = envelope.payload;
+          }
+        } catch {
+          // Not an envelope — raw-bytes legacy write. Use `value`
+          // directly.
+        }
+
         const decrypted = this.encryptionKey
-          ? await decryptProfileValue(this.encryptionKey, value)
-          : value;
+          ? await decryptProfileValue(this.encryptionKey, encryptedPayload)
+          : encryptedPayload;
         const ref = JSON.parse(new TextDecoder().decode(decrypted)) as UxfBundleRef;
         result.set(cid, ref);
       } catch (err) {
@@ -977,14 +1003,38 @@ export class ProfileTokenStorageProvider
   }
 
   /**
-   * Write a bundle ref to OrbitDB.
+   * Write a bundle ref to OrbitDB under a system-stamped envelope
+   * (T-D11 W11). Bundle events are system-generated cache-index
+   * writes; they are NOT user-actions (they reflect a token-pool
+   * flush produced by the wallet itself, not a user intent to
+   * commit tokens). Stamping `originated='system'` means peers
+   * replicating the ref see it as a replicated system event after
+   * the orbitdb-adapter's read-time downgrade, not a forged user
+   * action.
+   *
+   * If the underlying adapter lacks `putEntry` (very old code paths
+   * or test stubs), fall back to `db.put` of raw encrypted bytes —
+   * readers auto-wrap raw writes as legacy entries (`v=0`, synthetic
+   * `type='cache_index'`, `originated='system'`), so the semantic
+   * outcome is identical and replication remains safe.
    */
   private async addBundle(cid: string, ref: UxfBundleRef): Promise<void> {
     const serialized = new TextEncoder().encode(JSON.stringify(ref));
-    const encrypted = this.encryptionKey
+    const encryptedPayload = this.encryptionKey
       ? await encryptProfileValue(this.encryptionKey, serialized)
       : serialized;
-    await this.db.put(BUNDLE_KEY_PREFIX + cid, encrypted);
+
+    const key = BUNDLE_KEY_PREFIX + cid;
+    if (typeof this.db.putEntry === 'function') {
+      const envelope = buildLocalEntry({
+        type: 'cache_index',
+        originated: 'system',
+        payload: encryptedPayload,
+      });
+      await this.db.putEntry(key, envelope);
+    } else {
+      await this.db.put(key, encryptedPayload);
+    }
     this.knownBundleCids.add(cid);
   }
 
