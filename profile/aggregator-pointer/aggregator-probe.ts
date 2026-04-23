@@ -121,6 +121,24 @@ async function fetchProofWithTimeout(
   });
   try {
     const response = await Promise.race([client.getInclusionProof(requestId), timeoutPromise]);
+    // Shape guard: SDK drift (rename, added envelope, nullable shape) would
+    // otherwise raise an unclassified TypeError that the outer try/catch in
+    // classifyVersion buckets as 'transient'. That's wrong for a permanent
+    // SDK-shape breakage. Explicitly reject with PROTOCOL_ERROR so the
+    // caller surfaces a clear diagnostic instead of a silent retry loop.
+    if (
+      response === null ||
+      typeof response !== 'object' ||
+      !('inclusionProof' in response) ||
+      response.inclusionProof === null ||
+      response.inclusionProof === undefined
+    ) {
+      const err = new Error(
+        `getInclusionProof response missing inclusionProof (SDK shape mismatch)`,
+      );
+      err.name = 'PointerProtocolError';
+      throw err;
+    }
     return response.inclusionProof;
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);

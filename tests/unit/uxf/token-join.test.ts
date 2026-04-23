@@ -160,42 +160,21 @@ describe('resolveTokenRoot', () => {
     expect(outcome.rootHash).toBe(rootAH);
   });
 
-  it('returns `truncated` when a shorter chain outranks a longer one on committed txs', () => {
-    // Short chain: 2 committed. Long chain: 3 txs but only 1 committed
-    // (the last two are uncommitted). Short wins on proof coverage.
+  it('picks longest-valid when one chain is a prefix of the other with extra uncommitted txs', () => {
+    // Prefix-relation semantics under content-addressed transactions:
+    // shared tx hashes are bit-identical → identical committedness
+    // on the common prefix. So the longer chain always has
+    // ≥ committed-count of the shorter. The old `truncated` outcome
+    // (which would have enriched the longer chain with the
+    // shorter's "better" proof coverage) is unreachable under these
+    // semantics and has been removed. Rule 4 (synthetic proof-
+    // enriched root) is a separate future work item that will
+    // re-introduce a distinct variant for that case.
     const [t0H, t0] = makeTransaction('0', { committed: true });
     const [t1H, t1] = makeTransaction('1', { committed: true });
     const [t2H, t2] = makeTransaction('2', { committed: false });
-    const [t3H, t3] = makeTransaction('3', { committed: false });
 
     const [shortRootH, shortRoot] = makeTokenRoot('short', [t0H, t1H]);
-    // Long chain shares the first tx with the short chain but its
-    // second and third are uncommitted — so Rule 4 would prefer the
-    // short chain's proof coverage. Because the two chains share
-    // only a 1-element prefix, `isPrefix` is false → divergent.
-    // To test `truncated` cleanly we need a genuine prefix relation
-    // where committed-count-on-winner < longer-candidate-length.
-    // Construct: short = [t0, t1] both committed, long = [t0, t1, t2]
-    // where t2 is uncommitted. Then long has 2 committed vs short's
-    // 2 — tied committed-count but long is longer, so long wins via
-    // `longest-valid`. That's NOT the `truncated` case.
-    //
-    // `truncated` requires: prefix relation AND winner has FEWER
-    // txs. That happens when the longer chain added uncommitted
-    // txs on top but the SHORTER chain has MORE committed txs than
-    // the longer — which can only happen if the longer chain lost
-    // committed txs somewhere (impossible under prefix relation,
-    // since prefix txs are identical).
-    //
-    // Conclusion: under pure prefix-relation semantics, the longer
-    // chain always has ≥ committed-count of the shorter. So the
-    // `truncated` outcome is unreachable in practice for prefix
-    // relations — it only fires as a safety net if the pool is
-    // inconsistent. We assert that the resolver still picks the
-    // longer chain (longest-valid) here, and leave the `truncated`
-    // branch as documented dead-code-for-now.
-    const [, , , ] = [t2H, t2, t3H, t3]; // keep fixtures declared
-
     const [longRootH, longRoot] = makeTokenRoot('long', [t0H, t1H, t2H]);
 
     const pool = buildPool(
@@ -263,5 +242,21 @@ describe('resolveTokenRoot', () => {
         pool: new Map(),
       }),
     ).toThrow('empty candidates');
+  });
+
+  it('dedupes identical rootHashes — `[rh, rh, rh]` is treated as single candidate', () => {
+    // A degenerate multi-source merge where the same rootHash shows
+    // up N times should not produce N-1 fake losers. Dedup at entry.
+    const [txH, tx] = makeTransaction('0', { committed: true });
+    const [rootH, root] = makeTokenRoot('A', [txH]);
+    const pool = buildPool([txH, tx], [rootH, root]);
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [rootH, rootH, rootH],
+      pool,
+    });
+    expect(outcome.kind).toBe('single');
+    expect(outcome.rootHash).toBe(rootH);
   });
 });

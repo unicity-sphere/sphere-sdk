@@ -345,14 +345,34 @@ export function privateKeyToAddressInfo(
 // =============================================================================
 
 /**
- * Convert hex string to Uint8Array
+ * Convert hex string to Uint8Array.
+ *
+ * Rejects invalid inputs rather than silently coercing to zero bytes:
+ * odd-length strings throw `RangeError`, and non-hex characters
+ * produce `NaN` from `parseInt`, which coerce to 0 in `Uint8Array.from`
+ * — that used to mean a single bad character silently corrupted the
+ * derived bytes without any caller-visible signal, and in key-
+ * derivation paths (IPNS Ed25519 seed, pointer master key) a handful
+ * of zeros in the "private" material produces a weak, predictable
+ * key. We now fail closed on any malformation.
+ *
+ * Accepts an optional `0x` prefix for ergonomic compatibility with
+ * external callers; the prefix is stripped before validation.
  */
 export function hexToBytes(hex: string): Uint8Array {
-  const matches = hex.match(/../g);
-  if (!matches) {
-    return new Uint8Array(0);
+  const clean = hex.startsWith('0x') || hex.startsWith('0X') ? hex.slice(2) : hex;
+  if (clean.length === 0) return new Uint8Array(0);
+  if ((clean.length & 1) !== 0) {
+    throw new RangeError(`hexToBytes: odd-length hex string (length=${clean.length})`);
   }
-  return Uint8Array.from(matches.map((x) => parseInt(x, 16)));
+  if (!/^[0-9a-fA-F]+$/.test(clean)) {
+    throw new RangeError('hexToBytes: non-hex character in input');
+  }
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < clean.length; i += 2) {
+    out[i / 2] = parseInt(clean.slice(i, i + 2), 16);
+  }
+  return out;
 }
 
 /**

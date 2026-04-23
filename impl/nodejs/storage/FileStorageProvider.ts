@@ -220,10 +220,14 @@ export class FileStorageProvider implements StorageProvider {
       content = JSON.stringify(this.data);
     }
 
-    // Atomic write: write to temp file, fsync, then rename.
-    // This prevents wallet.json corruption on kill/crash — the rename
-    // is atomic on POSIX filesystems, so the file is either fully old
-    // or fully new, never partially written.
+    // Atomic write: write to temp file, fsync, rename, then fsync
+    // the parent directory. This prevents wallet.json corruption on
+    // kill/crash — the rename is atomic on POSIX filesystems, so the
+    // file is either fully old or fully new, never partially written.
+    // The parent-dir fsync ensures the rename itself is durable; on
+    // ext4/xfs a power-loss after rename but before dir flush can
+    // lose the new inode, leaving only the stale (now unreachable)
+    // file. Required by the DURABLE_STORAGE contract (SPEC §7.1.3).
     const tmpPath = this.filePath + '.tmp';
     const fd = fs.openSync(tmpPath, 'w', 0o600);
     try {
@@ -233,6 +237,22 @@ export class FileStorageProvider implements StorageProvider {
       fs.closeSync(fd);
     }
     fs.renameSync(tmpPath, this.filePath);
+
+    // Parent-directory fsync. Best-effort in environments where
+    // openSync on a directory is not supported (Windows) — we
+    // swallow the error there. On POSIX this is the load-bearing
+    // step for rename durability.
+    try {
+      const dirFd = fs.openSync(this.dataDir, 'r');
+      try {
+        fs.fsyncSync(dirFd);
+      } finally {
+        fs.closeSync(dirFd);
+      }
+    } catch {
+      // Non-POSIX fallback — rename-durability on these filesystems
+      // is a platform concern, not a correctness regression.
+    }
   }
 }
 

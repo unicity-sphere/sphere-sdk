@@ -65,12 +65,6 @@ export type ResolveOutcome =
       readonly losers: readonly ContentHash[];
     }
   | {
-      readonly kind: 'truncated';
-      readonly rootHash: ContentHash;
-      readonly losers: readonly ContentHash[];
-      readonly droppedSuffixTxCount: number;
-    }
-  | {
       readonly kind: 'divergent';
       readonly rootHash: ContentHash;
       readonly losers: readonly ContentHash[];
@@ -174,22 +168,29 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
     // contract is immediately obvious.
     throw new Error('resolveTokenRoot: empty candidates list');
   }
-  if (candidates.length === 1) {
-    return { kind: 'single', rootHash: candidates[0] };
+
+  // Dedupe identical rootHashes. Callers may pass [rh, rh, rh] on
+  // degenerate multi-source merges; without this a 3-way "collision"
+  // of the same rootHash would be treated as 3 candidates and drop
+  // into the longest-valid arm with two fake losers. De-duping keeps
+  // the output faithful to the real candidate set.
+  const unique = Array.from(new Set(candidates));
+
+  if (unique.length === 1) {
+    return { kind: 'single', rootHash: unique[0] };
   }
 
-  // Stable sort by rootHash for deterministic tie-break. Clone to
-  // avoid mutating the caller's array.
-  const sorted = [...candidates].sort();
-
   // Collect per-candidate metadata once; avoids repeated pool reads.
+  // No pre-sort: the final sort below establishes deterministic
+  // order via (committedCount DESC, txs.length DESC, rootHash ASC),
+  // which is independent of input ordering.
   interface CandidateInfo {
     readonly rootHash: ContentHash;
     readonly txns: readonly ContentHash[];
     readonly committedCount: number;
   }
   const infos: CandidateInfo[] = [];
-  for (const rh of sorted) {
+  for (const rh of unique) {
     const txns = getTokenRootTxns(rh, pool);
     if (txns === null) {
       // Skip malformed candidates — they cannot win. If ALL candidates
@@ -206,12 +207,14 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
   }
 
   if (infos.length === 0) {
-    // All candidates malformed. Return the first sorted rootHash as
-    // `divergent` so the caller knows they got a best-effort fallback.
+    // All candidates malformed. Return the lexicographically first
+    // rootHash as `divergent` so the caller knows they got a
+    // best-effort fallback (deterministic across devices).
+    const sortedUnique = [...unique].sort();
     return {
       kind: 'divergent',
-      rootHash: sorted[0],
-      losers: sorted.slice(1),
+      rootHash: sortedUnique[0],
+      losers: sortedUnique.slice(1),
     };
   }
   if (infos.length === 1) {
@@ -287,21 +290,17 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
     return { kind: 'divergent', rootHash: winner.rootHash, losers };
   }
 
-  // Linear-chain case. If the winner is the longest AND has more
-  // committed txs than every shorter candidate → `longest-valid`.
-  // Otherwise a shorter candidate outranks on committed count →
-  // `truncated` (Rule 4 would enrich the longer chain with missing
-  // proofs here; deferred).
-  const longestLength = Math.max(...infos.map((c) => c.txns.length));
-  if (winner.txns.length === longestLength) {
-    return { kind: 'longest-valid', rootHash: winner.rootHash, losers };
-  }
-  return {
-    kind: 'truncated',
-    rootHash: winner.rootHash,
-    losers,
-    droppedSuffixTxCount: longestLength - winner.txns.length,
-  };
+  // Linear-chain case (one chain is a prefix of the other, or they
+  // are identical). Under content-addressed transactions, identical
+  // tx hashes guarantee identical committedness on the common
+  // prefix — so the longer chain always has ≥ committed-tx count of
+  // the shorter. The ranking above therefore picks the longest
+  // compatible chain; `longest-valid` is the only reachable outcome
+  // here. Rule 4 proof enrichment (synthetic root built from
+  // per-element proof lifting across bundles) would re-introduce a
+  // `truncated` / synthetic variant, but that requires new element
+  // hashing and pool mutation and is deferred (see scope comment).
+  return { kind: 'longest-valid', rootHash: winner.rootHash, losers };
 }
 
 // =============================================================================

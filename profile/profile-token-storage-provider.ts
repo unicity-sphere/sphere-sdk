@@ -920,8 +920,17 @@ export class ProfileTokenStorageProvider
       //    the OrbitDB bundle ref is already written, so a failed
       //    publish only delays cold-start recovery for this flush —
       //    subsequent flushes retry.
-      await this.publishAggregatorPointerBestEffort(cid);
-      await this.publishIpnsSnapshotBestEffort();
+      //
+      //    Run in parallel via allSettled: the two channels are
+      //    independent, and serializing them means a slow pointer
+      //    publish (up to 60s under the CAR-fetch budget) delays the
+      //    IPNS snapshot AND the shutdown-flush wait. allSettled
+      //    preserves the best-effort semantics (neither can reject
+      //    past this await).
+      await Promise.allSettled([
+        this.publishAggregatorPointerBestEffort(cid),
+        this.publishIpnsSnapshotBestEffort(),
+      ]);
 
       this.emitEvent({
         type: 'storage:saved',
