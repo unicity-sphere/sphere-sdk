@@ -285,7 +285,11 @@ export class IpfsHttpClient {
       }
 
       const text = await response.text();
-      const parsed = await parseRoutingApiResponse(text);
+      // Pass ipnsName so parseRoutingApiResponse verifies the
+      // record's Ed25519 signature against the pubkey embedded in
+      // the peer ID — protects against a hostile gateway returning
+      // forged records pointing to attacker-chosen CIDs.
+      const parsed = await parseRoutingApiResponse(text, ipnsName);
 
       if (!parsed) return null;
 
