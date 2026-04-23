@@ -48,6 +48,7 @@ import { verify as verifyImpl } from './verify.js';
 import { diff as diffImpl, applyDelta as applyDeltaImpl } from './diff.js';
 import { packageToJson, packageFromJson } from './json.js';
 import { exportToCar, importFromCar } from './ipld.js';
+import { resolveTokenRoot } from './token-join.js';
 
 // ---------------------------------------------------------------------------
 // UxfPackage Class
@@ -489,9 +490,27 @@ function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
     }
   }
 
-  // Merge manifest: source entries win on collision
-  for (const [tokenId, rootHash] of source.manifest.tokens) {
-    mutableManifest.set(tokenId, rootHash);
+  // Merge manifest: run the per-token JOIN resolver on collision
+  // rather than blind last-writer-wins. Rule 3 of §10.4 (longest
+  // valid chain) is honored here; Rule 4 (proof-enriched synthetic
+  // root) is deferred — see uxf/token-join.ts scope comment. The
+  // resolver is deterministic in its output for a given (tokenId,
+  // candidates, pool), so cross-device agreement holds.
+  for (const [tokenId, incomingRoot] of source.manifest.tokens) {
+    const existingRoot = mutableManifest.get(tokenId);
+    if (existingRoot === undefined) {
+      mutableManifest.set(tokenId, incomingRoot);
+      continue;
+    }
+    if (existingRoot === incomingRoot) {
+      continue;
+    }
+    const outcome = resolveTokenRoot({
+      tokenId,
+      candidates: [existingRoot, incomingRoot],
+      pool: mutablePool,
+    });
+    mutableManifest.set(tokenId, outcome.rootHash);
   }
 
   // Merge instance chains (Decision 6)
