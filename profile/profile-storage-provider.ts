@@ -94,6 +94,33 @@ function deriveOriginForType(entryType: OpLogEntryType): 'user' | 'system' {
  */
 const PAYLOAD_SIZE_WARN_BYTES = 8 * 1024;
 
+/**
+ * Truncate identifier-like suffixes from profile keys before logging.
+ *
+ * Dynamic profile keys embed sensitive identifiers (pubkeys, swap IDs,
+ * group IDs) in their suffix — e.g., `transport.lastWalletEventTs.02ab…cd`
+ * encodes a wallet pubkey. Log-aggregation pipelines (Sentry, Datadog, …)
+ * commonly ship warn-level lines off-host, so full keys can leak identity
+ * fingerprints.
+ *
+ * Heuristic: redact any trailing segment after the last `.` or `:` that
+ * looks like an identifier (16+ chars of base32/hex/base64 alphabet). This
+ * catches every known dynamic key shape (pubkey hex, CID-like IDs, UUIDs)
+ * while leaving static keys (`identity.mnemonic`, `addresses.tracked`,
+ * `DIRECT_abc_def.outbox`) untouched — their suffixes are short English
+ * words.
+ *
+ * The first 4 chars of the suffix survive, which is enough to distinguish
+ * different wallets/swaps/groups during triage without reconstructing the
+ * full identifier.
+ */
+function redactProfileKey(key: string): string {
+  return key.replace(
+    /([.:])([A-Za-z0-9_-]{16,})$/,
+    (_, sep: string, suffix: string) => `${sep}${suffix.slice(0, 4)}…`,
+  );
+}
+
 // =============================================================================
 // Key Mapping Utilities
 // =============================================================================
@@ -807,12 +834,14 @@ export class ProfileStorageProvider implements StorageProvider {
     // attackers). This lets the write proceed — the hard failure is at
     // MAX_PAYLOAD_BYTES in oplog-entry.ts.
     if (encryptedPayload.byteLength > PAYLOAD_SIZE_WARN_BYTES) {
+      // Redact sensitive dynamic suffixes (pubkey / swap ID / group ID)
+      // so the warning is safe to ship to off-host log aggregation.
       logger.warn(
         'ProfileStorage',
         `[PAYLOAD-SIZE] OpLog write exceeds ${PAYLOAD_SIZE_WARN_BYTES} B ` +
           `soft-warn threshold — consider migrating this write site to a CID ` +
           `reference (PROFILE-CID-REFERENCES.md §8). ` +
-          `key=${profileKey} type=${entryType} size=${encryptedPayload.byteLength}`,
+          `key=${redactProfileKey(profileKey)} type=${entryType} size=${encryptedPayload.byteLength}`,
       );
     }
     const originated = deriveOriginForType(entryType);

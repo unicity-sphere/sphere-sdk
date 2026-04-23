@@ -1123,7 +1123,9 @@ describe('ProfileStorageProvider', () => {
 
     it('warning message includes key, type, and size (diagnostic context)', async () => {
       const fatValue = 'y'.repeat(10 * 1024);
-      await provider.setEntry('mnemonic', fatValue, 'profile_write');
+      // `token_send` is a canonical user-action type from originated-tag.ts —
+      // using it here ensures the test documents a realistic call shape.
+      await provider.setEntry('mnemonic', fatValue, 'token_send');
 
       const payloadWarnings = warnSpy.mock.calls.filter(
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
@@ -1131,7 +1133,7 @@ describe('ProfileStorageProvider', () => {
       expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
       const warnMsg = payloadWarnings[0]![1] as string;
       expect(warnMsg).toContain('key=identity.mnemonic');
-      expect(warnMsg).toContain('type=profile_write');
+      expect(warnMsg).toContain('type=token_send');
       expect(warnMsg).toMatch(/size=\d+/);
     });
 
@@ -1168,6 +1170,45 @@ describe('ProfileStorageProvider', () => {
         (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
       );
       expect(payloadWarnings.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('warning redacts pubkey suffix from dynamic transport keys', async () => {
+      // transport.lastWalletEventTs.{pubkey} — the pubkey suffix MUST NOT
+      // appear in logs if they are shipped off-host (Sentry/Datadog/etc).
+      // 64-hex pubkey; redactProfileKey preserves the static prefix and the
+      // first 4 chars of the pubkey for triage, eliding the rest.
+      const fullPubkey = '02' + 'abcdef1234567890'.repeat(4); // 66 hex chars total
+      const legacyKey = `last_wallet_event_ts_${fullPubkey}`;
+      const fatValue = 'r'.repeat(10 * 1024);
+
+      await provider.set(legacyKey, fatValue);
+
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
+      const warnMsg = payloadWarnings[0]![1] as string;
+      // Full pubkey MUST NOT be in the log line — that's the privacy bug.
+      expect(warnMsg).not.toContain(fullPubkey);
+      // Redaction format: static prefix retained + first 4 chars of suffix + `…`.
+      expect(warnMsg).toContain('key=transport.lastWalletEventTs.02ab…');
+    });
+
+    it('warning does NOT redact static keys with short suffixes', async () => {
+      // `identity.mnemonic` has no dynamic suffix to redact; the key should
+      // appear as-is so operators can see exactly which static site is
+      // oversized.
+      const fatValue = 's'.repeat(10 * 1024);
+      await provider.set('mnemonic', fatValue);
+
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
+      const warnMsg = payloadWarnings[0]![1] as string;
+      expect(warnMsg).toContain('key=identity.mnemonic');
+      // No redaction marker for static keys.
+      expect(warnMsg).not.toContain('identity.mnem…');
     });
   });
 });
