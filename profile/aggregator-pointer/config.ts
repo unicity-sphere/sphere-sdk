@@ -73,6 +73,28 @@ export function assertConfigCapabilities(config: PointerLayerConfig): void {
   }
 
   if (config.allowOperatorOverrides === true) {
+    // T-E26 production-build guard. Operator overrides are
+    // defense-in-depth capability gates; permitting them in a
+    // production-released wallet is a configuration error that must
+    // fail loudly rather than silently expose the dangerous APIs.
+    // Dev builds and staging can opt in explicitly via the env var
+    // below; a genuine operator-override deployment would set
+    // NODE_ENV to something other than 'production' (e.g. 'staging'
+    // or leave it unset for a dev-tools build).
+    const nodeEnv =
+      typeof process !== 'undefined' && typeof process.env === 'object' && process.env !== null
+        ? process.env[NODE_ENV_KEY]
+        : undefined;
+    if (nodeEnv === 'production') {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.CAPABILITY_DENIED,
+        `PointerLayerConfig.allowOperatorOverrides is forbidden in production builds ` +
+          `(NODE_ENV=production). Remove the flag or rebuild with a non-production ` +
+          `NODE_ENV. SPEC §13 / T-E26 production-build guard.`,
+        { allowOperatorOverrides: true, nodeEnv: 'production' },
+      );
+    }
+
     // Check that SPHERE_ALLOW_OVERRIDES env var matches — prevents a library
     // default enabling overrides without explicit operator signal.
     const envValue =

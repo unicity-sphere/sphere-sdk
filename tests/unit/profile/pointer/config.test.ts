@@ -77,6 +77,29 @@ describe('assertConfigCapabilities — allowOperatorOverrides', () => {
       expect.objectContaining({ code: AggregatorPointerErrorCode.CAPABILITY_DENIED }),
     );
   });
+
+  it('T-E26 production-build guard: CAPABILITY_DENIED when NODE_ENV=production even with SPHERE_ALLOW_OVERRIDES=1', () => {
+    // Production builds cannot enable operator overrides regardless
+    // of env var. The error message must reference NODE_ENV so the
+    // operator understands why the otherwise-correct env override
+    // was rejected.
+    process.env.NODE_ENV = 'production';
+    process.env.SPHERE_ALLOW_OVERRIDES = '1';
+    expect(() => assertConfigCapabilities({ allowOperatorOverrides: true })).toThrow(
+      expect.objectContaining({
+        code: AggregatorPointerErrorCode.CAPABILITY_DENIED,
+        message: expect.stringContaining('NODE_ENV=production'),
+      }),
+    );
+  });
+
+  it('permitted when NODE_ENV=staging + SPHERE_ALLOW_OVERRIDES=1', () => {
+    // Production guard is strict on 'production' only; any other
+    // value (staging, test, canary, unset) passes.
+    process.env.NODE_ENV = 'staging';
+    process.env.SPHERE_ALLOW_OVERRIDES = '1';
+    expect(() => assertConfigCapabilities({ allowOperatorOverrides: true })).not.toThrow();
+  });
 });
 
 describe('operatorOverridesAllowed + assertOperatorOverridesAllowed', () => {
