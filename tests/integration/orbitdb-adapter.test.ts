@@ -14,17 +14,24 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 
-// TODO(MUST-FIX): Re-enable this test in CI once the following are resolved:
-//   1. CI runner has access to an IPFS node (or a local in-process Helia is used
-//      with in-memory blockstore and no network bootstrap)
-//   2. Node.js 20 is dropped from the CI matrix (OrbitDB v3 requires Node 22+)
-//   Tracked in: sphere-sdk#105 — "OrbitDB integration test skipped in CI"
+// The CI hang that led to sphere-sdk#105 was caused by libp2pDefaults()
+// unconditionally including a bootstrap peer-discovery service. On a CI
+// runner without outbound IPFS connectivity, bootstrap retries forever
+// and the suite timed out after 12+ minutes.
 //
-// Skip in CI (no IPFS network — Helia/libp2p hangs on peer discovery, causing
-// 12+ minute timeout) or on Node.js < 22 (OrbitDB v3 needs Promise.withResolvers)
+// Fix landed in the OrbitDbAdapter: passing `bootstrapPeers: []` now
+// switches libp2p into "isolated mode" — peerDiscovery and every
+// outbound-discovery service are dropped, leaving only the local
+// identify/ping/keychain surface + gossipsub (required by OrbitDB v3).
+// The adapter still works for single-process operations, which is all
+// this integration test exercises.
+//
+// With isolated mode, the test runs in CI. The Node ≥ 22 gate stays
+// because @orbitdb/core v3 uses Promise.withResolvers, which is a
+// Node 22+ feature. CI's Node-20 matrix leg is excluded here; when
+// the project drops Node 20 (see #105 follow-up) this guard can go.
 const nodeVersion = parseInt(process.versions.node.split('.')[0], 10);
-const isCI = process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true';
-const describeOrSkip = (!isCI && nodeVersion >= 22) ? describe : describe.skip;
+const describeOrSkip = nodeVersion >= 22 ? describe : describe.skip;
 import { OrbitDbAdapter } from '../../profile/orbitdb-adapter.js';
 import { randomBytes } from 'crypto';
 import * as os from 'os';
@@ -111,6 +118,12 @@ describeOrSkip('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => 
       privateKey: testKey,
       directory: testDir,
       enablePubSub: false,
+      // Isolated mode — see adapter's libp2p config block for rationale.
+      // An empty bootstrap list strips peerDiscovery so libp2p doesn't
+      // hang on bootstrap retries when the CI runner has no outbound
+      // IPFS connectivity. Test exercises local CRUD only; no cross-
+      // peer flow is needed.
+      bootstrapPeers: [],
     });
   });
 
@@ -253,6 +266,7 @@ describeOrSkip('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => 
       privateKey: randomKey(),
       directory: tempDir,
       enablePubSub: false,
+      bootstrapPeers: [],
     });
     expect(tempAdapter.isConnected()).toBe(true);
 
@@ -270,6 +284,7 @@ describeOrSkip('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => 
       privateKey: randomKey(),
       directory: tempDir,
       enablePubSub: false,
+      bootstrapPeers: [],
     });
 
     await tempAdapter.close();
@@ -286,6 +301,7 @@ describeOrSkip('OrbitDB Adapter (live integration)', { timeout: 60_000 }, () => 
       privateKey: randomKey(),
       directory: tempDir,
       enablePubSub: false,
+      bootstrapPeers: [],
     });
     await tempAdapter.close();
 
@@ -319,6 +335,7 @@ describeOrSkip('OrbitDB Adapter replication (same key)', { timeout: 60_000 }, ()
       privateKey: sharedKey,
       directory: dirA,
       enablePubSub: false,
+      bootstrapPeers: [],
     });
 
     adapterB = new OrbitDbAdapter();
@@ -326,6 +343,7 @@ describeOrSkip('OrbitDB Adapter replication (same key)', { timeout: 60_000 }, ()
       privateKey: sharedKey,
       directory: dirB,
       enablePubSub: false,
+      bootstrapPeers: [],
     });
   });
 

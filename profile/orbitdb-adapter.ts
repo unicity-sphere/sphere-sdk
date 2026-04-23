@@ -151,6 +151,60 @@ export class OrbitDbAdapter implements ProfileDatabase {
           );
         }
 
+        // **Isolated / test mode** — an explicit empty `bootstrapPeers`
+        // array signals "do not attempt peer discovery."
+        //
+        // Why: `libp2pDefaults()` unconditionally includes
+        // `peerDiscovery: [bootstrap(bootstrapConfig)]` pointing at the
+        // canonical IPFS bootstrap list. On a CI runner with no
+        // outbound IPFS connectivity, bootstrap retries indefinitely
+        // and the OrbitDB integration test hangs past its 12-minute
+        // suite timeout (originally tracked in sphere-sdk#105, which
+        // led to the test being skipped in CI wholesale).
+        //
+        // With `bootstrapPeers: []`, we keep gossipsub (so OrbitDB v3
+        // doesn't fail on missing pubsub) and the local-only services
+        // (keychain, identify, ping) but drop every outbound-discovery
+        // surface: peerDiscovery, DHT, autoNAT, dcutr, delegated
+        // routing. The adapter remains fully functional for single-
+        // process OrbitDB operations — which is all the CI integration
+        // test needs.
+        //
+        // Production callers who want real peer discovery either omit
+        // `bootstrapPeers` (getting libp2pDefaults behaviour) or pass
+        // a non-empty list (wired here).
+        const isIsolated = Array.isArray(config.bootstrapPeers) &&
+          config.bootstrapPeers.length === 0;
+        if (isIsolated) {
+          libp2pConfig.peerDiscovery = [];
+          if (libp2pConfig.services) {
+            const isolatedServices: Record<string, unknown> = {};
+            // Allow-list of services that do NOT perform outbound
+            // discovery on startup. Every other service in
+            // libp2pDefaults (autoNAT, dcutr, dht, delegatedRouting,
+            // http, ipnsFetch, ipnsPublish) issues network requests.
+            const allowed = new Set(['identify', 'identifyPush', 'keychain', 'ping']);
+            for (const [k, v] of Object.entries(libp2pConfig.services)) {
+              if (allowed.has(k)) isolatedServices[k] = v;
+            }
+            libp2pConfig.services = isolatedServices;
+          }
+          libp2pConfig.addresses = { listen: [] };
+        } else if (config.bootstrapPeers && config.bootstrapPeers.length > 0) {
+          // Non-empty bootstrap list — replace the default peers with
+          // the caller's. Keeps peerDiscovery active but uses the
+          // caller-supplied peer set.
+          try {
+            const bootstrapModule: any = await import('@libp2p/bootstrap' as string);
+            const bootstrapFactory = bootstrapModule.bootstrap ?? bootstrapModule.default?.bootstrap ?? bootstrapModule.default;
+            if (typeof bootstrapFactory === 'function') {
+              libp2pConfig.peerDiscovery = [bootstrapFactory({ list: [...config.bootstrapPeers] })];
+            }
+          } catch {
+            // @libp2p/bootstrap unavailable — leave the defaults in place.
+          }
+        }
+
         libp2pConfig.services = {
           ...libp2pConfig.services,
           pubsub: gossipsubFactory({ allowPublishToZeroTopicPeers: true }),
