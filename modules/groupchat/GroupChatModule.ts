@@ -23,6 +23,24 @@ import type {
 import type { StorageProvider } from '../../storage';
 import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS, NIP29_KINDS } from '../../constants';
 
+/**
+ * Prefixes for per-groupId storage keys (PROFILE-CID-REFERENCES.md §8.5).
+ *
+ * Before this refactor, `group_chat_messages` and `group_chat_members` each
+ * stored ALL groups' data in a single global blob. The spec calls for
+ * per-groupId partitioning — each group gets its own KV key so a group's
+ * state can be read/written independently, and future CID-ref migrations
+ * can pin per-group rather than per-wallet-blob.
+ *
+ * `group_chat_groups` stays single-keyed — the spec allows this because it
+ * is bounded by group count (typically <100).
+ *
+ * `group_chat_processed_events` stays single-keyed — it is a dedup set not
+ * addressed by the spec.
+ */
+const GROUP_CHAT_MESSAGES_PREFIX = 'group_chat_messages:';
+const GROUP_CHAT_MEMBERS_PREFIX = 'group_chat_members:';
+
 import type {
   GroupData,
   GroupMessageData,
@@ -98,6 +116,18 @@ export class GroupChatModule {
   private processedEventIds: Set<string> = new Set();
   private pendingLeaves: Set<string> = new Set();
 
+  /**
+   * Orphan-cleanup tracking for per-groupId storage keys. Records which
+   * groupIds currently have a per-group messages/members key in storage
+   * so that, on persist, we can delete keys for groups the user has left
+   * (otherwise per-group blobs would leak indefinitely).
+   *
+   * Populated on `load()` (from observed keys) and on each successful
+   * persist (with the just-written groupIds).
+   */
+  private _lastWrittenMessageGroupIds: Set<string> = new Set();
+  private _lastWrittenMemberGroupIds: Set<string> = new Set();
+
   // Persistence debounce
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private persistPromise: Promise<void> | null = null;
@@ -146,6 +176,10 @@ export class GroupChatModule {
     this.messages.clear();
     this.members.clear();
     this.processedEventIds.clear();
+    // Reset orphan-cleanup tracking — the load() below repopulates it with
+    // whatever keys actually exist in storage for this address.
+    this._lastWrittenMessageGroupIds.clear();
+    this._lastWrittenMemberGroupIds.clear();
 
     // Load groups
     const groupsJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS);
@@ -160,37 +194,84 @@ export class GroupChatModule {
       }
     }
 
-    // Load messages
-    const messagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
-    if (messagesJson) {
+    // Load messages — per-group keys take precedence over the legacy
+    // all-in-one blob. See GROUP_CHAT_MESSAGES_PREFIX for the migration
+    // rationale (PROFILE-CID-REFERENCES.md §8.5).
+    //
+    // Read strategy:
+    //   1. For each known group, try the per-group key.
+    //   2. If nothing was found across any group, fall back to the legacy
+    //      blob and migrate it forward (persist per-group + delete legacy).
+    //   3. Tracks what was loaded from storage so later persist() calls
+    //      know which stale per-group keys to remove on group-leave.
+    let messagesPerGroupFound = false;
+    for (const groupId of this.groups.keys()) {
+      const json = await storage.get(GROUP_CHAT_MESSAGES_PREFIX + groupId);
+      if (!json) continue;
+      messagesPerGroupFound = true;
+      this._lastWrittenMessageGroupIds.add(groupId);
       try {
-        const parsed: GroupMessageData[] = JSON.parse(messagesJson);
-        for (const m of parsed) {
-          const groupId = m.groupId;
-          if (!this.messages.has(groupId)) {
-            this.messages.set(groupId, []);
-          }
-          this.messages.get(groupId)!.push(m);
-        }
+        const parsed: GroupMessageData[] = JSON.parse(json);
+        this.messages.set(groupId, parsed);
       } catch {
-        // Corrupted data, start fresh
+        // Corrupted per-group entry — skip; the group's messages will
+        // rehydrate from the relay on next subscription.
+      }
+    }
+    if (!messagesPerGroupFound) {
+      const legacyJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
+      if (legacyJson) {
+        try {
+          const parsed: GroupMessageData[] = JSON.parse(legacyJson);
+          for (const m of parsed) {
+            const groupId = m.groupId;
+            if (!this.messages.has(groupId)) {
+              this.messages.set(groupId, []);
+            }
+            this.messages.get(groupId)!.push(m);
+          }
+          // Migrate forward: write per-group keys + drop the legacy blob.
+          await this.persistMessages();
+          await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
+          logger.debug('GroupChat', `Migrated ${parsed.length} messages across ${this.messages.size} group(s) to per-group keys`);
+        } catch {
+          // Corrupted legacy data — leave it in place, start fresh.
+        }
       }
     }
 
-    // Load members
-    const membersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
-    if (membersJson) {
+    // Load members — same dual-read pattern.
+    let membersPerGroupFound = false;
+    for (const groupId of this.groups.keys()) {
+      const json = await storage.get(GROUP_CHAT_MEMBERS_PREFIX + groupId);
+      if (!json) continue;
+      membersPerGroupFound = true;
+      this._lastWrittenMemberGroupIds.add(groupId);
       try {
-        const parsed: GroupMemberData[] = JSON.parse(membersJson);
-        for (const m of parsed) {
-          const groupId = m.groupId;
-          if (!this.members.has(groupId)) {
-            this.members.set(groupId, []);
-          }
-          this.members.get(groupId)!.push(m);
-        }
+        const parsed: GroupMemberData[] = JSON.parse(json);
+        this.members.set(groupId, parsed);
       } catch {
-        // Corrupted data, start fresh
+        // Corrupted per-group entry — skip; rehydrates from relay.
+      }
+    }
+    if (!membersPerGroupFound) {
+      const legacyJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
+      if (legacyJson) {
+        try {
+          const parsed: GroupMemberData[] = JSON.parse(legacyJson);
+          for (const m of parsed) {
+            const groupId = m.groupId;
+            if (!this.members.has(groupId)) {
+              this.members.set(groupId, []);
+            }
+            this.members.get(groupId)!.push(m);
+          }
+          await this.persistMembers();
+          await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
+          logger.debug('GroupChat', `Migrated ${parsed.length} members across ${this.members.size} group(s) to per-group keys`);
+        } catch {
+          // Corrupted legacy data — leave in place.
+        }
       }
     }
 
@@ -1591,22 +1672,48 @@ export class GroupChatModule {
     await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(data));
   }
 
+  /**
+   * Write messages partitioned by groupId. See GROUP_CHAT_MESSAGES_PREFIX
+   * comment for the storage-layout rationale (PROFILE-CID-REFERENCES.md
+   * §8.5). On each persist:
+   *   1. Write a per-group key for every groupId currently in memory.
+   *   2. Delete per-group keys for groupIds that were written on a previous
+   *      persist but are no longer present (e.g., after leave-group).
+   *      Without this, orphaned blobs would leak indefinitely.
+   */
   private async persistMessages(): Promise<void> {
     if (!this.deps) return;
-    const allMessages: GroupMessageData[] = [];
-    for (const msgs of this.messages.values()) {
-      allMessages.push(...msgs);
+    const storage = this.deps.storage;
+
+    const current = new Set<string>();
+    for (const [groupId, msgs] of this.messages) {
+      await storage.set(GROUP_CHAT_MESSAGES_PREFIX + groupId, JSON.stringify(msgs));
+      current.add(groupId);
     }
-    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES, JSON.stringify(allMessages));
+    // Orphan cleanup — groups dropped since the last persist.
+    for (const oldId of this._lastWrittenMessageGroupIds) {
+      if (!current.has(oldId)) {
+        await storage.remove(GROUP_CHAT_MESSAGES_PREFIX + oldId);
+      }
+    }
+    this._lastWrittenMessageGroupIds = current;
   }
 
   private async persistMembers(): Promise<void> {
     if (!this.deps) return;
-    const allMembers: GroupMemberData[] = [];
-    for (const mems of this.members.values()) {
-      allMembers.push(...mems);
+    const storage = this.deps.storage;
+
+    const current = new Set<string>();
+    for (const [groupId, mems] of this.members) {
+      await storage.set(GROUP_CHAT_MEMBERS_PREFIX + groupId, JSON.stringify(mems));
+      current.add(groupId);
     }
-    await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS, JSON.stringify(allMembers));
+    for (const oldId of this._lastWrittenMemberGroupIds) {
+      if (!current.has(oldId)) {
+        await storage.remove(GROUP_CHAT_MEMBERS_PREFIX + oldId);
+      }
+    }
+    this._lastWrittenMemberGroupIds = current;
   }
 
   private async persistProcessedEvents(): Promise<void> {
