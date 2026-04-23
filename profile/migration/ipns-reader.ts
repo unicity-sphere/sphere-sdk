@@ -30,6 +30,7 @@
 
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { CID } from 'multiformats/cid';
 import { IpfsCache } from '../../impl/shared/ipfs/ipfs-cache.js';
 import { IpfsHttpClient } from '../../impl/shared/ipfs/ipfs-http-client.js';
 import { hexToBytes } from '../../core/crypto.js';
@@ -287,6 +288,18 @@ export interface RunMigrationParams {
    * Optional logger hook. Defaults to the shared `logger` namespace.
    */
   readonly log?: (message: string) => void;
+  /**
+   * Optional resolver override. Defaults to the real
+   * `resolveProfileSnapshot` (which hits IPFS gateways). Tests pass
+   * a fake so the orchestrator's control-flow can be exercised
+   * without network I/O — and, critically, so future orchestrator
+   * edits are caught by existing tests rather than silently
+   * diverging from a copy-pasted shim.
+   */
+  readonly resolver?: (params: {
+    gateways: string[];
+    privateKeyHex: string;
+  }) => Promise<{ snapshot: ProfileSnapshot; cid: string; sequence: bigint } | null>;
 }
 
 export interface MigrationResult {
@@ -322,9 +335,10 @@ export async function runIpnsToPointerMigration(
     };
   }
 
+  const resolver = params.resolver ?? resolveProfileSnapshot;
   let resolved: Awaited<ReturnType<typeof resolveProfileSnapshot>>;
   try {
-    resolved = await resolveProfileSnapshot({
+    resolved = await resolver({
       gateways: params.gateways,
       privateKeyHex: params.privateKeyHex,
     });
@@ -341,13 +355,23 @@ export async function runIpnsToPointerMigration(
   }
 
   if (!resolved) {
-    // Legacy sequence existed locally but no IPNS record on-network.
-    // That can happen when a publish was never successful. Stamp the
-    // marker so we don't retry forever — the wallet has no legacy
-    // state to migrate, and the next flush seeds the pointer anchor
-    // fresh.
-    log('no legacy IPNS record found; marking migration done');
-    await params.localCache.set(MIGRATION_DONE_KEY, String(Date.now()));
+    // `resolveProfileSnapshot` returns null for BOTH "no record on
+    // network" and "every gateway was transiently unreachable" —
+    // `IpfsHttpClient.resolveIpns` swallows per-gateway failures and
+    // returns `{ best: null }` without signalling which case fired.
+    //
+    // We must NOT stamp MIGRATION_DONE_KEY here: a transient failure
+    // during first cold-start would permanently disable migration
+    // for that wallet, causing real data loss on the next load when
+    // the gateways are reachable again. The cost of not stamping is
+    // a cheap IPNS lookup on every load for the rare case of a
+    // wallet that has a dangling `profile.ipns.sequence` local key
+    // but no on-network record (a never-successful legacy publish).
+    // That lookup is << a single pointer probe, and it self-resolves
+    // once the wallet starts publishing via the pointer layer —
+    // first successful pointer publish can optionally stamp the
+    // migration marker, but is not required.
+    log('legacy IPNS resolve returned null — retrying on next load');
     return { migrated: false, bundlesImported: 0, skipped: 'no-record' };
   }
 
@@ -357,8 +381,31 @@ export async function runIpnsToPointerMigration(
   );
 
   let imported = 0;
+  let skippedMalformed = 0;
   for (const b of resolved.snapshot.bundles) {
     if (b.status !== 'active') continue;
+
+    // Validate the CID string before handing it to onBundle. The
+    // snapshot body is fetched via `/ipfs/<cid>` which does NOT
+    // content-address verify (UnixFS-wrapped payload), so a hostile
+    // gateway that MITMs the snapshot fetch — even though the IPNS
+    // record itself is signature-verified — could inject arbitrary
+    // strings into `bundles[].cid`. Unparseable CIDs would poison
+    // downstream consumers (`listActiveBundles` deserializes and
+    // iterates keys by prefix). Reject non-CID strings here.
+    if (typeof b.cid !== 'string' || b.cid.length === 0) {
+      skippedMalformed++;
+      log(`migration: dropping bundle with empty/non-string cid`);
+      continue;
+    }
+    try {
+      CID.parse(b.cid);
+    } catch {
+      skippedMalformed++;
+      log(`migration: dropping bundle with malformed cid=${b.cid.slice(0, 40)}…`);
+      continue;
+    }
+
     try {
       await params.onBundle(b.cid, {
         cid: b.cid,
@@ -375,6 +422,9 @@ export async function runIpnsToPointerMigration(
   }
 
   await params.localCache.set(MIGRATION_DONE_KEY, String(Date.now()));
-  log(`migration complete: ${imported}/${resolved.snapshot.bundles.length} bundles imported`);
+  log(
+    `migration complete: ${imported}/${resolved.snapshot.bundles.length} bundles imported` +
+      (skippedMalformed > 0 ? ` (${skippedMalformed} malformed dropped)` : ''),
+  );
   return { migrated: true, bundlesImported: imported };
 }
