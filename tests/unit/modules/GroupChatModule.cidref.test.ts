@@ -717,6 +717,125 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     expect(survivorIds).toEqual(['m1', 'm3']);
   });
 
+  // ---------------------------------------------------------------------------
+  // Pattern B hardening — caps against hostile indexes (steelman fixes)
+  // ---------------------------------------------------------------------------
+
+  it('hardening: rejects index exceeding MAX_INDEX_ITEMS (10 000)', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+
+    // Craft a hostile index claiming 10 001 items — exceeds the cap.
+    // We don't need 10 001 valid sub-CIDs because the cap check fires
+    // BEFORE any per-message fetch.
+    const hostileIndex = {
+      v: 1,
+      items: Array.from({ length: 10_001 }, (_, i) => ({
+        id: `m${i}`,
+        ts: 1000 + i,
+        cid: 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+        size: 100,
+      })),
+    };
+    const indexBytes = new TextEncoder().encode(JSON.stringify(hostileIndex));
+    // Install the hostile content into ipfsStore directly + seed the KV
+    // with a ref envelope pointing at it.
+    const fakeCid = 'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau';
+    ipfsStore.set(fakeCid, { bytes: indexBytes, enc: false });
+    storage._data.set(
+      MESSAGES_PREFIX + 'g1',
+      JSON.stringify({ v: 1, cid: fakeCid, size: indexBytes.byteLength, ts: 1700000000000, enc: false }),
+    );
+
+    await mod.load();
+
+    // Per-message fetchJson must NOT have been called — cap check fires
+    // BEFORE spawning the parallel fetches. The fake's fetchJson is
+    // invoked once (for the index itself); anything more would mean the
+    // cap was bypassed.
+    const perMessageFetches = (fakeStore.fetchJson as any).mock.calls.length - 1; // subtract index fetch
+    expect(perMessageFetches).toBe(0);
+    // Group's messages map should NOT be populated from the rejected index.
+    expect((mod as any).messages.has('g1')).toBe(false);
+  });
+
+  it('hardening: skips index items exceeding MAX_GROUP_MESSAGE_SIZE (64 KiB)', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+
+    // Index with one legitimate message and one oversized attacker-crafted
+    // item pointing at our legitimate content (we don't need to actually
+    // pin oversized content — the size-cap check aborts before fetch).
+    const legitMessage = makeMessage('m_ok', 'g1', 1000);
+    const legitRef = await fakeStore.pinJson(legitMessage, { encrypted: false });
+
+    const hostileIndex = {
+      v: 1,
+      items: [
+        { id: 'm_ok', ts: 1000, cid: legitRef.cid, size: legitRef.size },
+        {
+          id: 'm_evil',
+          ts: 2000,
+          cid: legitRef.cid, // irrelevant, cap fires before fetch
+          size: 50 * 1024 * 1024, // 50 MiB — way over the 64 KiB cap
+        },
+      ],
+    };
+    const indexBytes = new TextEncoder().encode(JSON.stringify(hostileIndex));
+    const indexCid = 'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu';
+    ipfsStore.set(indexCid, { bytes: indexBytes, enc: false });
+    storage._data.set(
+      MESSAGES_PREFIX + 'g1',
+      JSON.stringify({ v: 1, cid: indexCid, size: indexBytes.byteLength, ts: 1700000000000, enc: false }),
+    );
+
+    await mod.load();
+
+    // Legit message loaded; oversized one dropped.
+    const loaded = (mod as any).messages.get('g1') as GroupMessageData[];
+    expect(loaded.map((m) => m.id)).toEqual(['m_ok']);
+  });
+
+  it('hardening: skips malformed index items (missing / wrong-type fields)', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+
+    const legitMessage = makeMessage('m_ok', 'g1', 1000);
+    const legitRef = await fakeStore.pinJson(legitMessage, { encrypted: false });
+
+    // Index with one legitimate item plus three malformed variants:
+    //   * null entry
+    //   * primitive (number)
+    //   * object missing `cid` field
+    const hostileIndex = {
+      v: 1,
+      items: [
+        { id: 'm_ok', ts: 1000, cid: legitRef.cid, size: legitRef.size },
+        null,
+        42,
+        { id: 'm_no_cid', ts: 2000, size: 100 }, // no cid
+      ],
+    };
+    const indexBytes = new TextEncoder().encode(JSON.stringify(hostileIndex));
+    const indexCid = 'bafkreigc7s4sqhn7y7qdmkshxswfucacvalvb7r6i57sxa3gngkxm7pwdq';
+    ipfsStore.set(indexCid, { bytes: indexBytes, enc: false });
+    storage._data.set(
+      MESSAGES_PREFIX + 'g1',
+      JSON.stringify({ v: 1, cid: indexCid, size: indexBytes.byteLength, ts: 1700000000000, enc: false }),
+    );
+
+    await mod.load();
+
+    const loaded = (mod as any).messages.get('g1') as GroupMessageData[];
+    expect(loaded.map((m) => m.id)).toEqual(['m_ok']);
+  });
+
   it('leaving a group evicts the per-group memo (next rejoin pins fresh)', async () => {
     const { fakeStore } = makeFakeCidRefStore();
     const mod = new GroupChatModule();

@@ -55,6 +55,26 @@ const GROUP_CHAT_MEMBERS_PREFIX = 'group_chat_members:';
  */
 const GROUP_CHAT_MESSAGES_INDEX_V = 1 as const;
 
+/**
+ * Per-item size cap for the Pattern B message fetch path (steelman
+ * hardening — closes a bandwidth-DoS attack where a hostile index
+ * declares oversized items pointing at attacker-controlled IPFS
+ * content). Legitimate NIP-29 chat messages are text + light metadata;
+ * 64 KiB is a generous bound for structured content + attachment refs.
+ * Items exceeding this are skipped on load with a logger.error.
+ */
+const MAX_GROUP_MESSAGE_SIZE = 64 * 1024;
+
+/**
+ * Upper bound on items per index blob. A hostile index at the
+ * cidRefStore.maxFetchBytes limit (50 MiB default) could otherwise
+ * declare ~625k items and trigger that many parallel IPFS fetches on
+ * load, exhausting file descriptors / memory / socket pool. The
+ * spec's Phase-2 archive mechanism triggers at 5000 entries (§8.4);
+ * 10k is double that — any legitimate group is well under this cap.
+ */
+const MAX_INDEX_ITEMS = 10_000;
+
 interface GroupChatMessagesIndexItem {
   /** Stable message id (from Nostr event id). Always present for persisted messages. */
   readonly id: string;
@@ -72,7 +92,11 @@ interface GroupChatMessagesIndex {
 }
 
 /** Pattern B index shape discriminator. Distinguishes from Pattern A
- *  (plain message array) during the dual-read migration window. */
+ *  (plain message array) during the dual-read migration window.
+ *
+ *  Structural check only at this layer — per-item field validation
+ *  happens at load time (`isValidIndexItem`) so malformed items can
+ *  be skipped individually rather than aborting the whole group. */
 function isMessagesIndex(value: unknown): value is GroupChatMessagesIndex {
   return (
     typeof value === 'object' &&
@@ -80,6 +104,21 @@ function isMessagesIndex(value: unknown): value is GroupChatMessagesIndex {
     !Array.isArray(value) &&
     (value as GroupChatMessagesIndex).v === GROUP_CHAT_MESSAGES_INDEX_V &&
     Array.isArray((value as GroupChatMessagesIndex).items)
+  );
+}
+
+/** Per-item validation for index items loaded from a potentially-hostile
+ *  source (attacker-controlled LWW replication could plant malformed
+ *  items — we fail-closed per-item rather than abort the whole group). */
+function isValidIndexItem(v: unknown): v is GroupChatMessagesIndexItem {
+  if (v === null || typeof v !== 'object') return false;
+  const item = v as Partial<GroupChatMessagesIndexItem>;
+  return (
+    typeof item.id === 'string' && item.id.length > 0 &&
+    typeof item.ts === 'number' && Number.isFinite(item.ts) &&
+    typeof item.cid === 'string' && item.cid.length > 0 &&
+    typeof item.size === 'number' && Number.isFinite(item.size) &&
+    item.size >= 0
   );
 }
 
@@ -376,15 +415,52 @@ export class GroupChatModule {
           // Pattern B: resolve each message CID in parallel. Parallel
           // fetch bounds total load latency to ~max(1 message) instead
           // of N × single-fetch — matters for groups with many messages.
+          //
+          // Steelman hardening:
+          //   * Reject oversized indexes BEFORE spawning fetches. An
+          //     attacker-crafted index at the 50 MiB cidRefStore cap
+          //     could declare ~625k items; without this check we'd
+          //     spawn that many parallel IPFS requests.
+          //   * Validate each item's shape; malformed items logged +
+          //     skipped without aborting the group.
+          //   * Cap per-item size at MAX_GROUP_MESSAGE_SIZE before
+          //     handing to cidRefStore.fetchJson — closes the
+          //     (50 MiB × N-items) bandwidth DoS where a hostile index
+          //     declares item.size near the cidRefStore cap.
+          if (fetched.items.length > MAX_INDEX_ITEMS) {
+            logger.error(
+              'GroupChat',
+              `[GROUP_MESSAGES] index for ${groupId} has ${fetched.items.length} items, exceeds cap ${MAX_INDEX_ITEMS}; refusing to load.`,
+            );
+            continue;
+          }
           const cidRefStoreRef = this.deps!.cidRefStore;
           const fetches = fetched.items.map(async (item) => {
+            if (!isValidIndexItem(item)) {
+              logger.error(
+                'GroupChat',
+                `[GROUP_MESSAGES] malformed index item for ${groupId}; skipping.`,
+              );
+              return null;
+            }
+            if (item.size > MAX_GROUP_MESSAGE_SIZE) {
+              logger.error(
+                'GroupChat',
+                `[GROUP_MESSAGES] index item for ${groupId} msg=${item.id} declares size ${item.size} > cap ${MAX_GROUP_MESSAGE_SIZE}; skipping.`,
+              );
+              return null;
+            }
             try {
               const msg = await cidRefStoreRef.fetchJson<GroupMessageData>({
                 v: 1,
                 cid: item.cid,
                 size: item.size,
-                ts: 1, // >0 satisfies tryParseRef ts-positive constraint; this
-                       // reconstructed ref is passed directly, not round-tripped.
+                // Use Date.now() rather than a hardcoded sentinel — the
+                // synthetic ref is passed directly to fetchJson (not
+                // through tryParseRef), but using a plausible wall-clock
+                // value makes this resilient to any future validateRef
+                // plausibility checks.
+                ts: Date.now(),
                 enc: false,
               });
               // Seed the per-message CID memo so the next persist can
