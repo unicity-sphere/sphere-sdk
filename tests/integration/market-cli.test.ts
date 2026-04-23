@@ -19,6 +19,12 @@ const exec = promisify(execFile);
 const CLI_PATH = path.resolve(__dirname, '../../cli/index.ts');
 const TSX = 'npx';
 
+// Subprocess cold-start (tsx transpile + SDK load) can exceed the 10s under
+// CPU contention. Subprocess timeout stays under the 30s vitest testTimeout
+// (set globally in vitest.config.ts) so vitest can collect the failure cleanly
+// instead of aborting mid-CLI.
+const CLI_SUBPROCESS_TIMEOUT_MS = 25000;
+
 /** Run a CLI command via tsx, returns { stdout, stderr } */
 async function runCli(
   args: string[],
@@ -26,7 +32,7 @@ async function runCli(
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   try {
     const result = await exec(TSX, ['tsx', CLI_PATH, ...args], {
-      timeout: options?.timeout ?? 15000,
+      timeout: options?.timeout ?? CLI_SUBPROCESS_TIMEOUT_MS,
       env: { ...process.env, NODE_NO_WARNINGS: '1' },
     });
     return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
