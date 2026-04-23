@@ -235,8 +235,22 @@ export class GroupChatModule {
     }
     const legacyMessagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
     if (legacyMessagesJson) {
+      // Narrow try/catch: ONLY JSON.parse goes inside the try. Errors from
+      // persistMessages / storage.remove must propagate with their original
+      // semantics instead of being misreported as "JSON parse failed."
+      let parsed: unknown;
+      let parseOk = false;
       try {
-        const parsed = JSON.parse(legacyMessagesJson);
+        parsed = JSON.parse(legacyMessagesJson);
+        parseOk = true;
+      } catch (err) {
+        logger.error(
+          'GroupChat',
+          '[GROUP_MESSAGES_LEGACY] JSON parse failed; leaving legacy blob in place.',
+          err,
+        );
+      }
+      if (parseOk) {
         if (!Array.isArray(parsed)) {
           logger.error(
             'GroupChat',
@@ -268,6 +282,9 @@ export class GroupChatModule {
           }
           if (newlyAddedCount > 0) {
             // Write per-group keys for the groups we just filled in.
+            // Throws here propagate to the caller — a persist failure is a
+            // real error and should NOT be silently mislabelled as a parse
+            // failure. Legacy blob stays in place; next load retries.
             await this.persistMessages();
             logger.debug(
               'GroupChat',
@@ -277,17 +294,9 @@ export class GroupChatModule {
           // Remove legacy only after a successful migration pass (or a
           // no-op pass if all groups were already covered). If a prior
           // partial migration left the legacy blob in place, this call
-          // is idempotent.
+          // is idempotent. Throws propagate.
           await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
         }
-      } catch (err) {
-        // Corrupted legacy blob — leave in place for forensic preservation
-        // and to avoid inadvertent data loss on transient parse failures.
-        logger.error(
-          'GroupChat',
-          '[GROUP_MESSAGES_LEGACY] JSON parse failed; leaving legacy blob in place.',
-          err,
-        );
       }
     }
 
@@ -319,16 +328,26 @@ export class GroupChatModule {
     }
     const legacyMembersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
     if (legacyMembersJson) {
+      // Narrow try/catch — see messages-legacy block above for rationale.
+      let parsed: unknown;
+      let parseOk = false;
       try {
-        const parsed = JSON.parse(legacyMembersJson);
+        parsed = JSON.parse(legacyMembersJson);
+        parseOk = true;
+      } catch (err) {
+        logger.error(
+          'GroupChat',
+          '[GROUP_MEMBERS_LEGACY] JSON parse failed; leaving legacy blob in place.',
+          err,
+        );
+      }
+      if (parseOk) {
         if (!Array.isArray(parsed)) {
           logger.error(
             'GroupChat',
             `[GROUP_MEMBERS_LEGACY] data is not an array (got ${typeof parsed}); leaving legacy blob in place.`,
           );
         } else {
-          // Snapshot of groups already covered — see messages path for
-          // rationale.
           const perGroupCovered = new Set(this.members.keys());
           let newlyAddedCount = 0;
           for (const m of parsed as GroupMemberData[]) {
@@ -350,12 +369,6 @@ export class GroupChatModule {
           }
           await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
         }
-      } catch (err) {
-        logger.error(
-          'GroupChat',
-          '[GROUP_MEMBERS_LEGACY] JSON parse failed; leaving legacy blob in place.',
-          err,
-        );
       }
     }
 
