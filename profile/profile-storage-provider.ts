@@ -582,16 +582,43 @@ export class ProfileStorageProvider implements StorageProvider {
     // any missing precondition (no oracle, no aggregator client, no
     // trust base, storage not durable, etc.) is logged as a skip
     // reason and the provider continues without a pointer layer.
-    // Only attempted once per attach cycle and only when the
-    // OrbitDB attach succeeded above.
+    //
+    // The gate distinguishes RETRYABLE vs STICKY skip reasons. A
+    // retryable reason reflects external state that can change
+    // between calls (no oracle wired, aggregator/trust base not yet
+    // loaded). Re-running connect() with updated options must
+    // re-attempt construction rather than silently staying in the
+    // skipped state — otherwise a caller that calls `connect()`
+    // once without an oracle and again with one wired never gets
+    // the pointer layer. Sticky reasons (permanent config errors,
+    // unrecoverable init failures) short-circuit the next attempt.
     if (
       this.dbStatus === 'attached' &&
       this.pointerLayer === null &&
-      this.pointerSkipReason === null &&
+      !this.isPointerSkipSticky() &&
       identityAtStart !== null
     ) {
       await this.tryBuildPointerLayer(identityAtStart);
     }
+  }
+
+  /**
+   * Is the current skip reason a terminal config error that will not
+   * be resolved by another connect() attempt? Terminal cases:
+   *   - `lock_file_path_missing` — Node without a lock path; fixing
+   *     it requires re-constructing the provider
+   *   - `pointer_init_failed`    — crypto stack failure (denylist,
+   *     malformed key); re-attempting against the same inputs will
+   *     fail identically
+   * Everything else (oracle_missing, aggregator_client_unavailable,
+   * trust_base_unavailable, storage_not_durable, identity_missing)
+   * reflects state the caller can fix between connects.
+   */
+  private isPointerSkipSticky(): boolean {
+    return (
+      this.pointerSkipReason === 'lock_file_path_missing' ||
+      this.pointerSkipReason === 'pointer_init_failed'
+    );
   }
 
   /**
@@ -687,7 +714,27 @@ export class ProfileStorageProvider implements StorageProvider {
       }
     }
 
-    // 1. Close OrbitDB (if attached)
+    // 1. Drain the pointer layer BEFORE closing OrbitDB. Any in-
+    //    flight publish holds the publish mutex (Node file-lock
+    //    and/or Web Lock). If we drop the reference without draining
+    //    and the process exits, the file lock can be orphaned —
+    //    next publish blocks until proper-lockfile's stale detector
+    //    reclaims it. Await the pointer layer's drain hook so any
+    //    running operation finishes releasing its mutex handle.
+    //    Pointer layer may not expose a drain API in older builds;
+    //    fall through gracefully when absent.
+    try {
+      const drainable = this.pointerLayer as unknown as {
+        shutdown?: () => Promise<void>;
+      } | null;
+      if (drainable && typeof drainable.shutdown === 'function') {
+        await drainable.shutdown();
+      }
+    } catch {
+      // best-effort
+    }
+
+    // 2. Close OrbitDB (if attached)
     try {
       if (this.dbStatus === 'attached') {
         await this.db.close();
@@ -707,7 +754,7 @@ export class ProfileStorageProvider implements StorageProvider {
       this.pointerSkipReason = null;
     }
 
-    // 2. Close local cache
+    // 3. Close local cache
     try {
       await this.localCache.disconnect();
     } catch {
