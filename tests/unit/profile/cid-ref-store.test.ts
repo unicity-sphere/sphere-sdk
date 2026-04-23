@@ -354,6 +354,72 @@ describe('CidRefStore — plaintext pin mode (encrypted: false)', () => {
   });
 });
 
+// ── Defense-in-depth: requireEncrypted fetch option (commit 7b steelman) ────
+// Strict callers whose protocol produces only encrypted refs can demand
+// that mode at fetch time. A ref claiming `enc:false` is refused with
+// CID_REF_CORRUPT regardless of what its CID points to.
+
+describe('CidRefStore — fetch { requireEncrypted: true }', () => {
+  let gateway: ReturnType<typeof installFakeIpfsGateway>;
+  let store: CidRefStore;
+
+  beforeEach(() => {
+    gateway = installFakeIpfsGateway();
+    store = new CidRefStore({
+      gateways: ['https://ipfs.example.com'],
+      encryptionKey: TEST_KEY,
+    });
+  });
+
+  it('rejects a plaintext ref with CID_REF_CORRUPT', async () => {
+    const plainRef = await store.pinJson({ foo: 'bar' }, { encrypted: false });
+    await expect(store.fetchJson(plainRef, { requireEncrypted: true }))
+      .rejects.toMatchObject({ code: 'CID_REF_CORRUPT' });
+    gateway.cleanup();
+  });
+
+  it('accepts an encrypted ref when requireEncrypted is true', async () => {
+    const encRef = await store.pinJson({ foo: 'bar' });
+    const fetched = await store.fetchJson(encRef, { requireEncrypted: true });
+    expect(fetched).toEqual({ foo: 'bar' });
+    gateway.cleanup();
+  });
+
+  it('accepts a pre-#98b ref (no enc field) when requireEncrypted is true', async () => {
+    // Backward-compat: pre-#98b refs lack the enc field entirely. They
+    // are encrypted by convention, and `ref.enc === false` is specifically
+    // what requireEncrypted guards against — undefined passes.
+    const encRef = await store.pinJson({ foo: 'bar' });
+    expect(encRef.enc).toBeUndefined();
+    const fetched = await store.fetchJson(encRef, { requireEncrypted: true });
+    expect(fetched).toEqual({ foo: 'bar' });
+    gateway.cleanup();
+  });
+
+  it('fetchBytes also honors requireEncrypted', async () => {
+    const plainRef = await store.pinBytes(new TextEncoder().encode('x'), { encrypted: false });
+    await expect(store.fetchBytes(plainRef, { requireEncrypted: true }))
+      .rejects.toMatchObject({ code: 'CID_REF_CORRUPT' });
+    gateway.cleanup();
+  });
+
+  it('poisoned-ref scenario: encrypted protocol + attacker-crafted plaintext ref is blocked', async () => {
+    // Attacker scenario: a hostile peer crafts a CidRef with enc:false
+    // pointing to their own plaintext content (pinned to any public
+    // gateway) and inserts it into the victim's OpLog via LWW
+    // replication. Without requireEncrypted the victim silently reads
+    // attacker-controlled plaintext as "message content." With
+    // requireEncrypted the fetch fails fast.
+    const attackerPayload = new TextEncoder().encode('<evil plaintext crafted by attacker>');
+    const hostileRef = await store.pinBytes(attackerPayload, { encrypted: false });
+    // Even though we could technically decrypt from this store, our
+    // protocol contract said "everything is encrypted" — reject.
+    await expect(store.fetchBytes(hostileRef, { requireEncrypted: true }))
+      .rejects.toThrow(/poisoned ref/);
+    gateway.cleanup();
+  });
+});
+
 // ── stringifyRef / tryParseRef ─────────────────────────────────────────────
 
 describe('CidRefStore.stringifyRef + tryParseRef — discriminator', () => {

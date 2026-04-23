@@ -105,6 +105,28 @@ export interface PinOptions {
   readonly encrypted?: boolean;
 }
 
+/**
+ * Options bag for fetch operations. Callers with strict encryption
+ * policies (every in-tree caller except group-chat-messages) should
+ * set `requireEncrypted: true` so a hostile ref claiming `enc: false`
+ * cannot trick the fetch path into returning attacker-controlled
+ * plaintext as if it were the legitimate ciphertext payload.
+ */
+export interface FetchOptions {
+  /**
+   * When true, reject refs whose `enc === false` with CID_REF_CORRUPT.
+   * Defense-in-depth: OrbitDB origin-tag validation at a higher layer
+   * is the primary defense, but a caller who KNOWS their protocol
+   * produces only encrypted refs should enforce that at every fetch
+   * boundary. Default false (honor whatever the ref says).
+   *
+   * Symmetric opposite (`requirePlaintext`) is intentionally not
+   * provided — a ref's `enc` field is a declaration, not a request,
+   * and rejecting encrypted content serves no real threat model.
+   */
+  readonly requireEncrypted?: boolean;
+}
+
 // ── Config / deps ─────────────────────────────────────────────────────────
 
 export interface CidRefStoreOptions {
@@ -250,8 +272,20 @@ export class CidRefStore {
    * verifyCidMatchesBytes; we rely on that invariant (redundant call
    * removed per steelman — it masks regressions rather than catching them).
    */
-  async fetchBytes(ref: CidRef): Promise<Uint8Array> {
+  async fetchBytes(ref: CidRef, opts?: FetchOptions): Promise<Uint8Array> {
     validateRef(ref);
+
+    // Defense-in-depth: callers whose protocol produces only encrypted
+    // refs should demand that at fetch time. A hostile peer who smuggles
+    // an `enc:false` ref past origin-tag validation would otherwise get
+    // attacker-controlled plaintext treated as legitimate content.
+    if (opts?.requireEncrypted && ref.enc === false) {
+      throw new ProfileError(
+        'CID_REF_CORRUPT',
+        `CidRef declares enc=false but caller required encrypted mode — ` +
+          `possible poisoned ref at cid=${ref.cid}. Refusing to fetch.`,
+      );
+    }
 
     // Per-ref byte cap — tighter than instance-wide #maxFetchBytes.
     const perRefCap = Math.min(
@@ -321,8 +355,8 @@ export class CidRefStore {
   }
 
   /** Convenience: fetchBytes + UTF-8 decode + JSON.parse. */
-  async fetchJson<T = unknown>(ref: CidRef): Promise<T> {
-    const bytes = await this.fetchBytes(ref);
+  async fetchJson<T = unknown>(ref: CidRef, opts?: FetchOptions): Promise<T> {
+    const bytes = await this.fetchBytes(ref, opts);
     const json = new TextDecoder().decode(bytes);
     return JSON.parse(json) as T;
   }

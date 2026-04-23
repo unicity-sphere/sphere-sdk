@@ -22,6 +22,7 @@ import type {
 } from '../../types';
 import type { StorageProvider } from '../../storage';
 import { STORAGE_KEYS_GLOBAL, STORAGE_KEYS_ADDRESS, NIP29_KINDS } from '../../constants';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
 
 /**
  * Prefixes for per-groupId storage keys (PROFILE-CID-REFERENCES.md §8.5).
@@ -61,6 +62,20 @@ export interface GroupChatModuleDependencies {
   identity: FullIdentity;
   storage: StorageProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /**
+   * Optional CID-reference store for OpLog fat-data migration
+   * (PROFILE-CID-REFERENCES.md §8.5). When present, group state is
+   * pinned to IPFS with a split encryption policy:
+   *   - `groupChatGroups` → encrypted (per-wallet membership view)
+   *   - `groupChatMembers:<groupId>` → encrypted (per-wallet view of
+   *     the group, small)
+   *   - `groupChatMessages:<groupId>` → PLAINTEXT (NIP-29 messages are
+   *     relay-plaintext anyway; plaintext pins enable full IPFS
+   *     content dedup across member wallets — a 100-member group
+   *     stores each message ONCE globally instead of 100×)
+   * When absent, falls back to legacy inline JSON storage.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================
@@ -128,6 +143,21 @@ export class GroupChatModule {
   private _lastWrittenMessageGroupIds: Set<string> = new Set();
   private _lastWrittenMemberGroupIds: Set<string> = new Set();
 
+  /**
+   * Memoized (plaintext JSON → CidRef) pairs for each persist target.
+   * AES-GCM uses random IVs so re-pinning identical plaintext encrypted
+   * produces a different CID; for plaintext pins the CID is deterministic,
+   * but we still avoid the round-trip cost on unchanged state. Both paths
+   * benefit from memoization.
+   *
+   * Groups memo: single ref (one key for the whole groups list).
+   * Members/messages memos: keyed by groupId (one ref per group).
+   */
+  private _lastPinnedGroupsJson: string | null = null;
+  private _lastPinnedGroupsRef: CidRef | null = null;
+  private _lastPinnedMembersByGroup = new Map<string, { json: string; ref: CidRef }>();
+  private _lastPinnedMessagesByGroup = new Map<string, { json: string; ref: CidRef }>();
+
   // Persistence debounce
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private persistPromise: Promise<void> | null = null;
@@ -180,17 +210,52 @@ export class GroupChatModule {
     // whatever keys actually exist in storage for this address.
     this._lastWrittenMessageGroupIds.clear();
     this._lastWrittenMemberGroupIds.clear();
+    // Reset CID-ref memoization — a load-from-cold-storage doesn't know
+    // which CIDs were last pinned by the prior module lifecycle.
+    this._lastPinnedGroupsJson = null;
+    this._lastPinnedGroupsRef = null;
+    this._lastPinnedMembersByGroup.clear();
+    this._lastPinnedMessagesByGroup.clear();
 
-    // Load groups
+    // Load groups — dual-read: CID ref envelope → fetch from IPFS
+    // (encrypted, requireEncrypted strict); otherwise legacy inline JSON.
     const groupsJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS);
     if (groupsJson) {
-      try {
-        const parsed: GroupData[] = JSON.parse(groupsJson);
+      const ref = CidRefStore.tryParseRef(groupsJson);
+      let parsed: GroupData[] | null = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          const { ProfileError } = await import('../../profile/errors.js');
+          throw new ProfileError(
+            'CID_REF_UNREADABLE',
+            `GroupChatModule.load: groups key contains a CID ref (cid=${ref.cid}) ` +
+              `but no cidRefStore was injected. Check module init.`,
+          );
+        }
+        try {
+          parsed = await this.deps!.cidRefStore.fetchJson<GroupData[]>(
+            ref,
+            { requireEncrypted: true },
+          );
+        } catch (err) {
+          logger.error('GroupChat', '[GROUP_CHAT_GROUPS] CID-ref fetch failed', err);
+        }
+      } else {
+        try {
+          parsed = JSON.parse(groupsJson) as GroupData[];
+        } catch (err) {
+          logger.error('GroupChat', '[GROUP_CHAT_GROUPS] legacy JSON parse failed', err);
+        }
+      }
+      if (Array.isArray(parsed)) {
         for (const g of parsed) {
           this.groups.set(g.id, g);
         }
-      } catch {
-        // Corrupted data, start fresh
+      } else if (parsed !== null) {
+        logger.error(
+          'GroupChat',
+          `[GROUP_CHAT_GROUPS] decoded data is not an array (got ${typeof parsed}); skipping.`,
+        );
       }
     }
 
@@ -214,24 +279,49 @@ export class GroupChatModule {
     for (const groupId of this.groups.keys()) {
       const json = await storage.get(GROUP_CHAT_MESSAGES_PREFIX + groupId);
       if (!json) continue;
-      try {
-        const parsed = JSON.parse(json);
-        if (!Array.isArray(parsed)) {
+      // Dual-read: CID ref (plaintext-pin mode for messages — see
+      // persistMessages doc) OR legacy inline JSON.
+      //
+      // No `requireEncrypted` flag here — messages are the one key class
+      // that legitimately uses plaintext pins for dedup. The ref.enc
+      // field drives the fetch path.
+      const ref = CidRefStore.tryParseRef(json);
+      let parsed: unknown = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          const { ProfileError } = await import('../../profile/errors.js');
+          throw new ProfileError(
+            'CID_REF_UNREADABLE',
+            `GroupChatModule.load: messages:${groupId} contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected.`,
+          );
+        }
+        try {
+          parsed = await this.deps!.cidRefStore.fetchJson(ref);
+        } catch (err) {
+          logger.error('GroupChat', `[GROUP_MESSAGES] CID-ref fetch failed for ${groupId}`, err);
+          continue;
+        }
+      } else {
+        try {
+          parsed = JSON.parse(json);
+        } catch (err) {
           logger.error(
             'GroupChat',
-            `[GROUP_MESSAGES] per-group blob for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+            `[GROUP_MESSAGES] per-group blob for ${groupId} JSON parse failed; skipping.`,
+            err,
           );
           continue;
         }
-        this.messages.set(groupId, parsed as GroupMessageData[]);
-      } catch (err) {
-        // Corrupted per-group entry — skip; rehydrates from relay.
+      }
+      if (!Array.isArray(parsed)) {
         logger.error(
           'GroupChat',
-          `[GROUP_MESSAGES] per-group blob for ${groupId} JSON parse failed; skipping.`,
-          err,
+          `[GROUP_MESSAGES] decoded data for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
         );
+        continue;
       }
+      this.messages.set(groupId, parsed as GroupMessageData[]);
     }
     const legacyMessagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
     if (legacyMessagesJson) {
@@ -308,23 +398,45 @@ export class GroupChatModule {
     for (const groupId of this.groups.keys()) {
       const json = await storage.get(GROUP_CHAT_MEMBERS_PREFIX + groupId);
       if (!json) continue;
-      try {
-        const parsed = JSON.parse(json);
-        if (!Array.isArray(parsed)) {
+      // Dual-read: CID ref (encrypted — requireEncrypted strict) OR
+      // legacy inline JSON.
+      const ref = CidRefStore.tryParseRef(json);
+      let parsed: unknown = null;
+      if (ref) {
+        if (!this.deps!.cidRefStore) {
+          const { ProfileError } = await import('../../profile/errors.js');
+          throw new ProfileError(
+            'CID_REF_UNREADABLE',
+            `GroupChatModule.load: members:${groupId} contains a CID ref ` +
+              `(cid=${ref.cid}) but no cidRefStore was injected.`,
+          );
+        }
+        try {
+          parsed = await this.deps!.cidRefStore.fetchJson(ref, { requireEncrypted: true });
+        } catch (err) {
+          logger.error('GroupChat', `[GROUP_MEMBERS] CID-ref fetch failed for ${groupId}`, err);
+          continue;
+        }
+      } else {
+        try {
+          parsed = JSON.parse(json);
+        } catch (err) {
           logger.error(
             'GroupChat',
-            `[GROUP_MEMBERS] per-group blob for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+            `[GROUP_MEMBERS] per-group blob for ${groupId} JSON parse failed; skipping.`,
+            err,
           );
           continue;
         }
-        this.members.set(groupId, parsed as GroupMemberData[]);
-      } catch (err) {
+      }
+      if (!Array.isArray(parsed)) {
         logger.error(
           'GroupChat',
-          `[GROUP_MEMBERS] per-group blob for ${groupId} JSON parse failed; skipping.`,
-          err,
+          `[GROUP_MEMBERS] decoded data for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
         );
+        continue;
       }
+      this.members.set(groupId, parsed as GroupMemberData[]);
     }
     const legacyMembersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
     if (legacyMembersJson) {
@@ -1766,6 +1878,32 @@ export class GroupChatModule {
   private async persistGroups(): Promise<void> {
     if (!this.deps) return;
     const data = Array.from(this.groups.values());
+    const cidRefStore = this.deps.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(data);
+      // Memo hit — identical plaintext reuses the cached ref instead of
+      // re-pinning. For encrypted pins, re-pinning would produce a fresh
+      // CID (random IV) even on unchanged plaintext — wasted IPFS churn.
+      if (this._lastPinnedGroupsRef && this._lastPinnedGroupsJson === json) {
+        await this.deps.storage.set(
+          STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS,
+          CidRefStore.stringifyRef(this._lastPinnedGroupsRef),
+        );
+        return;
+      }
+      // Groups list is per-wallet membership view — ENCRYPTED.
+      const ref = await cidRefStore.pinJson(data);
+      await this.deps.storage.set(
+        STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS,
+        CidRefStore.stringifyRef(ref),
+      );
+      this._lastPinnedGroupsJson = json;
+      this._lastPinnedGroupsRef = ref;
+      return;
+    }
+
+    // Legacy inline path.
     await this.deps.storage.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(data));
   }
 
@@ -1773,41 +1911,93 @@ export class GroupChatModule {
    * Write messages partitioned by groupId. See GROUP_CHAT_MESSAGES_PREFIX
    * comment for the storage-layout rationale (PROFILE-CID-REFERENCES.md
    * §8.5). On each persist:
-   *   1. Write a per-group key for every groupId currently in memory.
+   *   1. Write a per-group key for every groupId currently in memory
+   *      (via CID ref when cidRefStore is available, inline JSON otherwise).
    *   2. Delete per-group keys for groupIds that were written on a previous
    *      persist but are no longer present (e.g., after leave-group).
    *      Without this, orphaned blobs would leak indefinitely.
+   *
+   * **Encryption policy: PLAINTEXT PINS.** Group-chat messages transit
+   * through the Nostr relay as plaintext (signed but unencrypted —
+   * grep the module for `NIP17|giftWrap|encrypt|decrypt` to verify zero
+   * hits). Per-wallet AES-GCM encryption on IPFS under that threat model
+   * buys no real privacy and defeats content-addressed dedup (random
+   * IV → 100 members produce 100 different CIDs for the same message).
+   * Plaintext pins make one CID serve all members of a group.
    */
   private async persistMessages(): Promise<void> {
     if (!this.deps) return;
     const storage = this.deps.storage;
+    const cidRefStore = this.deps.cidRefStore;
 
     const current = new Set<string>();
     for (const [groupId, msgs] of this.messages) {
-      await storage.set(GROUP_CHAT_MESSAGES_PREFIX + groupId, JSON.stringify(msgs));
+      const key = GROUP_CHAT_MESSAGES_PREFIX + groupId;
+
+      if (cidRefStore) {
+        const json = JSON.stringify(msgs);
+        const cached = this._lastPinnedMessagesByGroup.get(groupId);
+        if (cached && cached.json === json) {
+          await storage.set(key, CidRefStore.stringifyRef(cached.ref));
+        } else {
+          // PLAINTEXT pin — see method doc for rationale.
+          const ref = await cidRefStore.pinJson(msgs, { encrypted: false });
+          await storage.set(key, CidRefStore.stringifyRef(ref));
+          this._lastPinnedMessagesByGroup.set(groupId, { json, ref });
+        }
+      } else {
+        await storage.set(key, JSON.stringify(msgs));
+      }
       current.add(groupId);
     }
     // Orphan cleanup — groups dropped since the last persist.
     for (const oldId of this._lastWrittenMessageGroupIds) {
       if (!current.has(oldId)) {
         await storage.remove(GROUP_CHAT_MESSAGES_PREFIX + oldId);
+        // Evict the orphan's memo so a future rejoin forces a fresh pin.
+        this._lastPinnedMessagesByGroup.delete(oldId);
       }
     }
     this._lastWrittenMessageGroupIds = current;
   }
 
+  /**
+   * Write members partitioned by groupId. Encryption policy: ENCRYPTED
+   * (per-wallet). Member lists are this wallet's view of group membership
+   * at a point in time and don't share the "all members see identical
+   * content verbatim" property of messages — dedup wouldn't help. Apply
+   * the default wallet-key AES-GCM encryption for consistency with every
+   * other CID-refs migration in the suite.
+   */
   private async persistMembers(): Promise<void> {
     if (!this.deps) return;
     const storage = this.deps.storage;
+    const cidRefStore = this.deps.cidRefStore;
 
     const current = new Set<string>();
     for (const [groupId, mems] of this.members) {
-      await storage.set(GROUP_CHAT_MEMBERS_PREFIX + groupId, JSON.stringify(mems));
+      const key = GROUP_CHAT_MEMBERS_PREFIX + groupId;
+
+      if (cidRefStore) {
+        const json = JSON.stringify(mems);
+        const cached = this._lastPinnedMembersByGroup.get(groupId);
+        if (cached && cached.json === json) {
+          await storage.set(key, CidRefStore.stringifyRef(cached.ref));
+        } else {
+          // Encrypted (default — omit the `encrypted` option).
+          const ref = await cidRefStore.pinJson(mems);
+          await storage.set(key, CidRefStore.stringifyRef(ref));
+          this._lastPinnedMembersByGroup.set(groupId, { json, ref });
+        }
+      } else {
+        await storage.set(key, JSON.stringify(mems));
+      }
       current.add(groupId);
     }
     for (const oldId of this._lastWrittenMemberGroupIds) {
       if (!current.has(oldId)) {
         await storage.remove(GROUP_CHAT_MEMBERS_PREFIX + oldId);
+        this._lastPinnedMembersByGroup.delete(oldId);
       }
     }
     this._lastWrittenMemberGroupIds = current;
