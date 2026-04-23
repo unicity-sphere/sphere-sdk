@@ -15,28 +15,63 @@
 #   5. Mode-mismatch rejection — re-running `init --legacy` on a profile
 #      dir (or vice-versa) exits with an error, no silent clobber.
 #   6. `clear` resets the mode so the next init can pick again.
+#   7. tokens-export/import across legacy/profile modes.
 #
-# Parts that need to hit testnet (`init`, `tokens-export/import` against
-# real storage backends) run only when E2E_NETWORK=1 is set. The
-# resolver / config checks run unconditionally.
+# **Exit-code discipline (no silent skips).** Tests 3-7 require a live
+# testnet deployment (aggregator + Nostr relay + IPFS gateway via
+# testnet's URLs). Without E2E_NETWORK=1 those tests would be skipped,
+# and the old behaviour was "echo SKIP and exit 0" — a false-positive
+# green bar that masked the fact that 5 of 7 tests never ran. The fix:
+#
+#   * Default invocation with no flags and no E2E_NETWORK fails with a
+#     clear error listing the options. There is no "green by omission"
+#     mode anymore.
+#   * `--local-only` runs only Tests 1+2 (the genuinely network-
+#     independent ones) and reports pass/fail of JUST those. Use this
+#     when you want a fast local check without live infra.
+#   * `E2E_NETWORK=1` runs everything; pass/fail reflects actual tests.
 #
 # Usage:
-#   bash tests/e2e/cli-storage-modes.sh
-#   E2E_NETWORK=1 bash tests/e2e/cli-storage-modes.sh
-#   bash tests/e2e/cli-storage-modes.sh --keep-workspace
+#   E2E_NETWORK=1 bash tests/e2e/cli-storage-modes.sh       # full run
+#   bash tests/e2e/cli-storage-modes.sh --local-only        # resolver/config only
+#   bash tests/e2e/cli-storage-modes.sh --keep-workspace    # preserve tmpdir
 # =============================================================================
 
 set -euo pipefail
 
 SDK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 KEEP_WORKSPACE=false
+LOCAL_ONLY=false
 
 for arg in "$@"; do
   case "$arg" in
     --keep-workspace) KEEP_WORKSPACE=true ;;
+    --local-only) LOCAL_ONLY=true ;;
+    -h|--help)
+      sed -n '2,30p' "${BASH_SOURCE[0]}"
+      exit 0
+      ;;
     *) echo "Unknown arg: $arg"; exit 2 ;;
   esac
 done
+
+# Enforce explicit mode selection — no silent "green-by-omission" runs.
+# Either the caller opts into local-only (they know they're not testing
+# the network path) or E2E_NETWORK=1 gates the full run. Neither set =
+# usage error, NOT a silent skip masquerading as a pass.
+if [ "$LOCAL_ONLY" = false ] && [ -z "${E2E_NETWORK:-}" ]; then
+  cat <<EOF >&2
+ERROR: cli-storage-modes.sh requires an explicit mode:
+
+  E2E_NETWORK=1 bash tests/e2e/cli-storage-modes.sh    # full run (needs live testnet)
+  bash tests/e2e/cli-storage-modes.sh --local-only     # run only no-network tests (1, 2)
+
+Running with neither flag used to silently skip tests 3-7 and exit 0 —
+a false positive that masked the fact 5 of 7 tests never ran. That
+behaviour is no longer supported.
+EOF
+  exit 2
+fi
 
 WORKSPACE="$(mktemp -d -t sphere-cli-storage-modes-XXXXXX)"
 cleanup() {
@@ -51,7 +86,11 @@ trap cleanup EXIT
 echo "═══════════════════════════════════════════════════════════════════"
 echo "  CLI storage-modes e2e"
 echo "  Workspace: $WORKSPACE"
-echo "  Network tests: ${E2E_NETWORK:-0}"
+if [ "$LOCAL_ONLY" = true ]; then
+  echo "  Mode: LOCAL-ONLY (Tests 3-7 intentionally skipped, will not run)"
+else
+  echo "  Mode: FULL (E2E_NETWORK=1)"
+fi
 echo "═══════════════════════════════════════════════════════════════════"
 
 CLI="npx --prefix $SDK_ROOT tsx $SDK_ROOT/cli/index.ts"
@@ -62,7 +101,9 @@ CLI="npx --prefix $SDK_ROOT tsx $SDK_ROOT/cli/index.ts"
 
 PASS=0
 FAIL=0
+SKIPPED=0
 FAIL_NAMES=()
+SKIPPED_NAMES=()
 
 pass() {
   PASS=$((PASS + 1))
@@ -76,6 +117,15 @@ fail() {
   if [ -n "${2:-}" ]; then
     echo "    $2"
   fi
+}
+
+# Mark a test as intentionally skipped (local-only mode). Tracked in a
+# separate counter so the summary distinguishes "passed", "failed", and
+# "deliberately not run in local-only mode" — NEVER silent.
+skipped() {
+  SKIPPED=$((SKIPPED + 1))
+  SKIPPED_NAMES+=("$1")
+  echo "  ∅ SKIPPED (local-only): $1"
 }
 
 # Every subtest runs inside an isolated directory; the CLI's dataDir /
@@ -146,9 +196,11 @@ popd >/dev/null
 # Test 3: network-only — init --legacy, then verify artefacts
 # ---------------------------------------------------------------------------
 
-if [ -n "${E2E_NETWORK:-}" ]; then
-  echo
-  echo "── Test 3: init --legacy persists storageMode=legacy"
+echo
+echo "── Test 3: init --legacy persists storageMode=legacy"
+if [ "$LOCAL_ONLY" = true ]; then
+  skipped "Test 3 (init --legacy)"
+else
   T="$(new_test_dir t3-init-legacy)"
   pushd "$T" >/dev/null
 
@@ -178,18 +230,17 @@ if [ -n "${E2E_NETWORK:-}" ]; then
   fi
 
   popd >/dev/null
-else
-  echo
-  echo "── Test 3: SKIP (set E2E_NETWORK=1 to exercise init --legacy)"
 fi
 
 # ---------------------------------------------------------------------------
 # Test 4: network-only — init --profile, verify artefacts
 # ---------------------------------------------------------------------------
 
-if [ -n "${E2E_NETWORK:-}" ]; then
-  echo
-  echo "── Test 4: init --profile persists storageMode=profile"
+echo
+echo "── Test 4: init --profile persists storageMode=profile"
+if [ "$LOCAL_ONLY" = true ]; then
+  skipped "Test 4 (init --profile)"
+else
   T="$(new_test_dir t4-init-profile)"
   pushd "$T" >/dev/null
 
@@ -219,18 +270,17 @@ if [ -n "${E2E_NETWORK:-}" ]; then
   fi
 
   popd >/dev/null
-else
-  echo
-  echo "── Test 4: SKIP (set E2E_NETWORK=1 to exercise init --profile)"
 fi
 
 # ---------------------------------------------------------------------------
 # Test 5: mode-mismatch rejection
 # ---------------------------------------------------------------------------
 
-if [ -n "${E2E_NETWORK:-}" ]; then
-  echo
-  echo "── Test 5: re-init with mismatched mode is rejected"
+echo
+echo "── Test 5: re-init with mismatched mode is rejected"
+if [ "$LOCAL_ONLY" = true ]; then
+  skipped "Test 5 (mode-mismatch rejection)"
+else
   T="$(new_test_dir t5-mismatch)"
   pushd "$T" >/dev/null
 
@@ -252,18 +302,17 @@ if [ -n "${E2E_NETWORK:-}" ]; then
   fi
 
   popd >/dev/null
-else
-  echo
-  echo "── Test 5: SKIP (set E2E_NETWORK=1)"
 fi
 
 # ---------------------------------------------------------------------------
 # Test 6: clear resets storageMode
 # ---------------------------------------------------------------------------
 
-if [ -n "${E2E_NETWORK:-}" ]; then
-  echo
-  echo "── Test 6: clear resets storageMode for next init"
+echo
+echo "── Test 6: clear resets storageMode for next init"
+if [ "$LOCAL_ONLY" = true ]; then
+  skipped "Test 6 (clear resets storageMode)"
+else
   T="$(new_test_dir t6-clear)"
   pushd "$T" >/dev/null
 
@@ -284,19 +333,17 @@ if [ -n "${E2E_NETWORK:-}" ]; then
   fi
 
   popd >/dev/null
-else
-  echo
-  echo "── Test 6: SKIP (set E2E_NETWORK=1)"
 fi
 
 # ---------------------------------------------------------------------------
 # Test 7: cross-mode file transfer (tokens-export/import across modes)
 # ---------------------------------------------------------------------------
 
-if [ -n "${E2E_NETWORK:-}" ]; then
-  echo
-  echo "── Test 7: cross-mode tokens-export/import (legacy ↔ profile)"
-
+echo
+echo "── Test 7: cross-mode tokens-export/import (legacy ↔ profile)"
+if [ "$LOCAL_ONLY" = true ]; then
+  skipped "Test 7 (cross-mode tokens-export/import)"
+else
   # Wallet A in legacy mode
   WA="$(new_test_dir t7-wallet-A-legacy)"
   pushd "$WA" >/dev/null
@@ -326,9 +373,6 @@ if [ -n "${E2E_NETWORK:-}" ]; then
   # Tokens-import without a funded faucet will typically run an empty
   # flow — the key assertion is that the CLI accepts the file format
   # regardless of source mode.
-else
-  echo
-  echo "── Test 7: SKIP (set E2E_NETWORK=1)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -337,14 +381,29 @@ fi
 
 echo
 echo "═══════════════════════════════════════════════════════════════════"
-echo "  Storage-modes e2e: $PASS passed, $FAIL failed"
+echo "  Storage-modes e2e: $PASS passed, $FAIL failed, $SKIPPED skipped (local-only)"
 if [ $FAIL -gt 0 ]; then
+  echo "  Failures:"
   for name in "${FAIL_NAMES[@]}"; do
+    echo "    - $name"
+  done
+fi
+if [ $SKIPPED -gt 0 ]; then
+  echo "  Skipped (local-only mode — re-run with E2E_NETWORK=1 to exercise):"
+  for name in "${SKIPPED_NAMES[@]}"; do
     echo "    - $name"
   done
 fi
 echo "═══════════════════════════════════════════════════════════════════"
 
+# Exit policy:
+#   * FAIL > 0  → non-zero (tests failed)
+#   * SKIPPED > 0 in local-only mode → zero (explicit opt-in; caller
+#                                    knew they were skipping network tests)
+#   * Otherwise → zero
+# NB: the top-of-script guard already enforces "E2E_NETWORK=1 OR
+# --local-only OR error" — there is no invocation path where skipped
+# tests appear silently in what looks like a full-network run.
 if [ $FAIL -gt 0 ]; then
   exit 1
 fi
