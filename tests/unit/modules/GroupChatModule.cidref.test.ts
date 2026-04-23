@@ -447,14 +447,20 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     (mod as any).messages.set('g1', [makeMessage('m1', 'g1')]);
     (mod as any).messages.set('g2', [makeMessage('m2', 'g2')]);
     await (mod as any).persistMessages();
-    expect(fakeStore.pinJson).toHaveBeenCalledTimes(2);
+    // Pattern B: per-message pin + per-group index pin.
+    // First persist = 2 groups × (1 message + 1 index) = 4 pins.
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(4);
 
-    // Mutate only g2.
+    // Mutate only g2 — append one new message.
     (mod as any).messages.get('g2').push(makeMessage('m3', 'g2'));
     await (mod as any).persistMessages();
 
-    // g1 memo hit; g2 re-pinned → exactly 3 pin calls total.
-    expect(fakeStore.pinJson).toHaveBeenCalledTimes(3);
+    // Expected delta on the second persist:
+    //   g1: index memo hit → 0 pins (messages unchanged).
+    //   g2: m2 is in the per-message memo → no re-pin; m3 is new → 1 pin;
+    //       index changed → 1 index pin.
+    // Total delta = 2. Cumulative = 4 + 2 = 6.
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(6);
   });
 
   // ---------------------------------------------------------------------------
@@ -476,6 +482,241 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
   // Orphan cleanup + memo eviction
   // ---------------------------------------------------------------------------
 
+  // ---------------------------------------------------------------------------
+  // Pattern B: per-message CID index (commit 7c / task #101)
+  // ---------------------------------------------------------------------------
+
+  it('Pattern B: persistMessages writes an index blob referencing per-message CIDs', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+    await mod.load();
+
+    const messages = [makeMessage('m1', 'g1', 1000), makeMessage('m2', 'g1', 2000)];
+    (mod as any).messages.set('g1', messages);
+    await (mod as any).persistMessages();
+
+    // KV has the index ref.
+    const kv = storage._data.get(MESSAGES_PREFIX + 'g1')!;
+    const indexRef = JSON.parse(kv);
+    expect(indexRef.v).toBe(1);
+    expect(indexRef.cid).toMatch(/^baf/);
+    expect(indexRef.enc).toBe(false); // plaintext mode
+
+    // IPFS content at indexRef.cid is a Pattern B index, not a message array.
+    const indexBytes = ipfsStore.get(indexRef.cid)!.bytes;
+    const index = JSON.parse(new TextDecoder().decode(indexBytes));
+    expect(index.v).toBe(1);
+    expect(index.items).toHaveLength(2);
+    expect(index.items[0]).toMatchObject({ id: 'm1', ts: 1000 });
+    expect(index.items[1]).toMatchObject({ id: 'm2', ts: 2000 });
+    expect(index.items[0].cid).toMatch(/^baf/);
+    expect(index.items[0].cid).not.toBe(index.items[1].cid); // different messages → different CIDs
+    expect(typeof index.items[0].size).toBe('number');
+
+    // Each message CID's content is the individual message (not the whole array).
+    const m1Bytes = ipfsStore.get(index.items[0].cid)!.bytes;
+    const m1 = JSON.parse(new TextDecoder().decode(m1Bytes));
+    expect(m1).toEqual(messages[0]);
+  });
+
+  it('Pattern B: load reconstructs message array from index + per-message fetches', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+    await mod.load();
+
+    // Round-trip: persist, then recreate a fresh module and load — assert
+    // reconstructed state matches what we persisted.
+    const original = [
+      makeMessage('m1', 'g1', 1000),
+      makeMessage('m2', 'g1', 2000),
+      makeMessage('m3', 'g1', 3000),
+    ];
+    (mod as any).messages.set('g1', original);
+    await (mod as any).persistMessages();
+
+    const mod2 = new GroupChatModule();
+    mod2.initialize(createDeps(storage, fakeStore));
+    await mod2.load();
+
+    const reconstructed = (mod2 as any).messages.get('g1') as GroupMessageData[];
+    expect(reconstructed).toHaveLength(3);
+    const ids = reconstructed.map((m) => m.id).sort();
+    expect(ids).toEqual(['m1', 'm2', 'm3']);
+  });
+
+  it('Pattern B dedup property: identical messages produce identical message CIDs across wallets', async () => {
+    // The whole point of Pattern B — one CID per (content of) message,
+    // regardless of array position, regardless of which wallet pinned it.
+    // Use two CidRefStore fakes with DIFFERENT "wallet keys" (indicated by
+    // separate stores; fakes honor encrypted:false by recording raw bytes,
+    // so identical plaintext → identical CID lookup under a content-hash).
+    const VALID_CIDS = [
+      'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+      'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+      'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+      'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu',
+      'bafkreigc7s4sqhn7y7qdmkshxswfucacvalvb7r6i57sxa3gngkxm7pwdq',
+      'bafkreif5kllzmkgl2euhmuarujbx2c4qc6ys4ezbdkotl4vfzywifgj36i',
+      'bafkreihgwgjb76y4evzixnyhurnscy46rtuekx2gojy63zvyexmptzq4pi',
+      'bafkreib5rv2rsfv3d7x57grexkl2prw2wmz4eojpyk2xmeugzszvtefyfy',
+    ];
+    function cidFromContent(bytes: Uint8Array): string {
+      let h = 0x811c9dc5;
+      for (const b of bytes) h = Math.imul(h ^ b, 0x01000193) >>> 0;
+      return VALID_CIDS[h % VALID_CIDS.length]!;
+    }
+    function makeContentAddressingFake() {
+      const localIpfs = new Map<string, Uint8Array>();
+      return {
+        localIpfs,
+        store: {
+          pinJson: vi.fn(async (value: unknown, opts?: { encrypted?: boolean }) => {
+            const bytes = new TextEncoder().encode(JSON.stringify(value));
+            const encryptedMode = opts?.encrypted ?? true;
+            // Plaintext mode: content-addressed CID.
+            // Encrypted mode: random CID (different per invocation — simulate IV).
+            const cid = encryptedMode
+              ? VALID_CIDS[Math.floor(Math.random() * VALID_CIDS.length)]!
+              : cidFromContent(bytes);
+            localIpfs.set(cid, bytes);
+            return {
+              v: 1 as const,
+              cid,
+              size: bytes.byteLength,
+              ts: Date.now(),
+              ...(!encryptedMode ? { enc: false as const } : {}),
+            };
+          }),
+          fetchJson: vi.fn(),
+          pinBytes: vi.fn(),
+          fetchBytes: vi.fn(),
+        },
+      };
+    }
+
+    const aliceFake = makeContentAddressingFake();
+    const bobFake = makeContentAddressingFake();
+
+    // Alice has [m1, m2, m3] in THIS order.
+    const aliceMessages = [
+      makeMessage('m1', 'g1', 1000),
+      makeMessage('m2', 'g1', 2000),
+      makeMessage('m3', 'g1', 3000),
+    ];
+    // Bob has the SAME messages in DIFFERENT order — this is the scenario
+    // Pattern A couldn't dedup. Under Pattern B, individual message CIDs
+    // are identical regardless of position; only the index CID differs.
+    const bobMessages = [
+      makeMessage('m1', 'g1', 1000),
+      makeMessage('m3', 'g1', 3000),
+      makeMessage('m2', 'g1', 2000),
+    ];
+
+    const aliceMod = new GroupChatModule();
+    aliceMod.initialize(createDeps(createMockStorage(), aliceFake.store));
+    (aliceMod as any).groups.set('g1', makeGroup('g1'));
+    (aliceMod as any).messages.set('g1', aliceMessages);
+    await (aliceMod as any).persistMessages();
+
+    const bobMod = new GroupChatModule();
+    bobMod.initialize(createDeps(createMockStorage(), bobFake.store));
+    (bobMod as any).groups.set('g1', makeGroup('g1'));
+    (bobMod as any).messages.set('g1', bobMessages);
+    await (bobMod as any).persistMessages();
+
+    // Collect the per-message CIDs each wallet pinned (exclude the index
+    // CID, which differs because of array-order differences).
+    // Each pinJson call for a message returns a ref whose cid is in localIpfs.
+    // The index is the LAST pinJson call per wallet in our persistMessages
+    // implementation. Strip it and compare the remaining message CIDs.
+    const aliceMessageCids = Array.from(aliceFake.localIpfs.keys()).slice(0, 3).sort();
+    const bobMessageCids = Array.from(bobFake.localIpfs.keys()).slice(0, 3).sort();
+
+    // Same content → same CIDs across wallets, independent of pin order.
+    expect(aliceMessageCids).toEqual(bobMessageCids);
+  });
+
+  it('Pattern B: per-message memo deduplicates re-pinning within a wallet across persists', async () => {
+    const { fakeStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+    await mod.load();
+
+    // First persist: 5 messages + 1 index = 6 pins.
+    const msgs = [0, 1, 2, 3, 4].map((i) => makeMessage(`m${i}`, 'g1', 1000 + i));
+    (mod as any).messages.set('g1', msgs);
+    await (mod as any).persistMessages();
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(6);
+
+    // Append one message. Re-persist.
+    // Expected: 5 old messages memo hit → 0 re-pins; 1 new message pin;
+    // index changed → 1 new index pin. Delta = 2. Cumulative = 6 + 2 = 8.
+    (mod as any).messages.get('g1').push(makeMessage('m5', 'g1', 1005));
+    await (mod as any).persistMessages();
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(8);
+  });
+
+  it('Pattern B backward-compat: loads Pattern A content (direct array) and migrates on next persist', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+
+    // Seed: groups + a Pattern A ref (whole array pinned as one CID).
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+    const patternAMessages = [makeMessage('m1', 'g1', 1000), makeMessage('m2', 'g1', 2000)];
+    const patternARef = await fakeStore.pinJson(patternAMessages, { encrypted: false });
+    storage._data.set(MESSAGES_PREFIX + 'g1', JSON.stringify(patternARef));
+
+    await mod.load();
+    // Loaded from Pattern A content.
+    const loaded = (mod as any).messages.get('g1') as GroupMessageData[];
+    expect(loaded.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
+
+    // Migrate on next persist — KV now holds a Pattern B index ref.
+    await (mod as any).persistMessages();
+    const newKv = storage._data.get(MESSAGES_PREFIX + 'g1')!;
+    const newRef = JSON.parse(newKv);
+    // The ref points to a new index CID (not the Pattern A array CID).
+    expect(newRef.cid).not.toBe(patternARef.cid);
+    const newContent = JSON.parse(new TextDecoder().decode(ipfsStore.get(newRef.cid)!.bytes));
+    expect(newContent.v).toBe(1);
+    expect(Array.isArray(newContent.items)).toBe(true);
+    expect(newContent.items).toHaveLength(2);
+  });
+
+  it('Pattern B: partial fetch failure on load preserves other messages', async () => {
+    const { fakeStore, ipfsStore } = makeFakeCidRefStore();
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, fakeStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+    await mod.load();
+
+    const msgs = [makeMessage('m1', 'g1', 1000), makeMessage('m2', 'g1', 2000), makeMessage('m3', 'g1', 3000)];
+    (mod as any).messages.set('g1', msgs);
+    await (mod as any).persistMessages();
+
+    // Corrupt one message's IPFS content by removing it from the fake
+    // store. On reload, that fetch fails; the other two still load.
+    const kv = JSON.parse(storage._data.get(MESSAGES_PREFIX + 'g1')!);
+    const index = JSON.parse(new TextDecoder().decode(ipfsStore.get(kv.cid)!.bytes));
+    ipfsStore.delete(index.items[1].cid); // delete m2's content
+
+    const mod2 = new GroupChatModule();
+    mod2.initialize(createDeps(storage, fakeStore));
+    await mod2.load();
+    const survivors = (mod2 as any).messages.get('g1') as GroupMessageData[];
+    // 2 of 3 messages survive — the m2 fetch failure was logged and
+    // skipped without aborting the whole group.
+    expect(survivors).toHaveLength(2);
+    const survivorIds = survivors.map((m) => m.id).sort();
+    expect(survivorIds).toEqual(['m1', 'm3']);
+  });
+
   it('leaving a group evicts the per-group memo (next rejoin pins fresh)', async () => {
     const { fakeStore } = makeFakeCidRefStore();
     const mod = new GroupChatModule();
@@ -490,7 +731,8 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     (mod as any).messages.set('g1', [makeMessage('m1', 'g1')]);
     (mod as any).messages.set('g2', [makeMessage('m2', 'g2')]);
     await (mod as any).persistMessages();
-    expect(fakeStore.pinJson).toHaveBeenCalledTimes(2);
+    // 2 groups × (1 message pin + 1 index pin) = 4 pins.
+    expect(fakeStore.pinJson).toHaveBeenCalledTimes(4);
 
     // Leave g2.
     (mod as any).messages.delete('g2');

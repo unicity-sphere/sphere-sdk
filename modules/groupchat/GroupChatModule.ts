@@ -42,6 +42,47 @@ import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
 const GROUP_CHAT_MESSAGES_PREFIX = 'group_chat_messages:';
 const GROUP_CHAT_MEMBERS_PREFIX = 'group_chat_members:';
 
+/**
+ * Pattern B index schema (PROFILE-CID-REFERENCES.md §8.4 / §8.5).
+ *
+ * The KV value at `group_chat_messages:<groupId>` carries a CidRef that
+ * points to an index blob of this shape. Each `items[i].cid` is itself
+ * a plaintext CidRef over the corresponding message's JSON. This lets
+ * identical messages (same content across wallets) share one IPFS CID
+ * regardless of their position in any wallet's array — the dedup unit
+ * drops from "whole message list" (Pattern A) to "single message"
+ * (Pattern B).
+ */
+const GROUP_CHAT_MESSAGES_INDEX_V = 1 as const;
+
+interface GroupChatMessagesIndexItem {
+  /** Stable message id (from Nostr event id). Always present for persisted messages. */
+  readonly id: string;
+  /** Message timestamp (ms since epoch) — lets readers sort without fetching bodies. */
+  readonly ts: number;
+  /** Content-addressed CID of the individual message pin. */
+  readonly cid: string;
+  /** Size in bytes of the pinned message content. */
+  readonly size: number;
+}
+
+interface GroupChatMessagesIndex {
+  readonly v: typeof GROUP_CHAT_MESSAGES_INDEX_V;
+  readonly items: readonly GroupChatMessagesIndexItem[];
+}
+
+/** Pattern B index shape discriminator. Distinguishes from Pattern A
+ *  (plain message array) during the dual-read migration window. */
+function isMessagesIndex(value: unknown): value is GroupChatMessagesIndex {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as GroupChatMessagesIndex).v === GROUP_CHAT_MESSAGES_INDEX_V &&
+    Array.isArray((value as GroupChatMessagesIndex).items)
+  );
+}
+
 import type {
   GroupData,
   GroupMessageData,
@@ -151,12 +192,31 @@ export class GroupChatModule {
    * benefit from memoization.
    *
    * Groups memo: single ref (one key for the whole groups list).
-   * Members/messages memos: keyed by groupId (one ref per group).
+   * Members memo: keyed by groupId (one ref per group).
+   * Messages memo: keyed by groupId → per-group-INDEX ref (Pattern B —
+   * the stored ref points at an index blob, NOT the message array
+   * directly). The per-message CIDs are cached separately in
+   * `_pinnedMessageCids` so identical messages don't re-pin across
+   * persists.
    */
   private _lastPinnedGroupsJson: string | null = null;
   private _lastPinnedGroupsRef: CidRef | null = null;
   private _lastPinnedMembersByGroup = new Map<string, { json: string; ref: CidRef }>();
   private _lastPinnedMessagesByGroup = new Map<string, { json: string; ref: CidRef }>();
+
+  /**
+   * Pattern B per-message CID cache — maps a message's serialized JSON
+   * to the CID it was pinned under. Lets repeated persists for the same
+   * group reuse CIDs for unchanged messages (saves ~N pin round-trips
+   * per re-persist when only one message was added).
+   *
+   * Keyed by `JSON.stringify(message)` so any semantic change (content,
+   * id, metadata, anything) invalidates the memo automatically. Cache
+   * entries evict when the containing group is removed from
+   * `_lastPinnedMessagesByGroup` (group-leave → whole group's message
+   * memos drop).
+   */
+  private _pinnedMessageCids = new Map<string, { cid: string; size: number }>();
 
   // Persistence debounce
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -216,6 +276,7 @@ export class GroupChatModule {
     this._lastPinnedGroupsRef = null;
     this._lastPinnedMembersByGroup.clear();
     this._lastPinnedMessagesByGroup.clear();
+    this._pinnedMessageCids.clear();
 
     // Load groups — dual-read: CID ref envelope → fetch from IPFS
     // (encrypted, requireEncrypted strict); otherwise legacy inline JSON.
@@ -279,14 +340,21 @@ export class GroupChatModule {
     for (const groupId of this.groups.keys()) {
       const json = await storage.get(GROUP_CHAT_MESSAGES_PREFIX + groupId);
       if (!json) continue;
-      // Dual-read: CID ref (plaintext-pin mode for messages — see
-      // persistMessages doc) OR legacy inline JSON.
+      // Dual-read layers (ordered):
+      //   1. CID ref envelope → fetch content.
+      //       1a. Content is Pattern B index { v:1, items: [...] }
+      //           → fetch each message CID in parallel, assemble the
+      //             in-memory array. Failed individual fetches are
+      //             logged and skipped — other messages still load.
+      //       1b. Content is a plain array (Pattern A)
+      //           → use directly; migration will upgrade to B on next
+      //             persist.
+      //   2. Legacy inline JSON — use directly.
       //
-      // No `requireEncrypted` flag here — messages are the one key class
-      // that legitimately uses plaintext pins for dedup. The ref.enc
-      // field drives the fetch path.
+      // No `requireEncrypted` flag — messages legitimately use plaintext
+      // pins for IPFS dedup (see persistMessages doc).
       const ref = CidRefStore.tryParseRef(json);
-      let parsed: unknown = null;
+      let assembledMessages: GroupMessageData[] | null = null;
       if (ref) {
         if (!this.deps!.cidRefStore) {
           const { ProfileError } = await import('../../profile/errors.js');
@@ -296,13 +364,68 @@ export class GroupChatModule {
               `(cid=${ref.cid}) but no cidRefStore was injected.`,
           );
         }
+        let fetched: unknown;
         try {
-          parsed = await this.deps!.cidRefStore.fetchJson(ref);
+          fetched = await this.deps!.cidRefStore.fetchJson(ref);
         } catch (err) {
           logger.error('GroupChat', `[GROUP_MESSAGES] CID-ref fetch failed for ${groupId}`, err);
           continue;
         }
+
+        if (isMessagesIndex(fetched)) {
+          // Pattern B: resolve each message CID in parallel. Parallel
+          // fetch bounds total load latency to ~max(1 message) instead
+          // of N × single-fetch — matters for groups with many messages.
+          const cidRefStoreRef = this.deps!.cidRefStore;
+          const fetches = fetched.items.map(async (item) => {
+            try {
+              const msg = await cidRefStoreRef.fetchJson<GroupMessageData>({
+                v: 1,
+                cid: item.cid,
+                size: item.size,
+                ts: 1, // >0 satisfies tryParseRef ts-positive constraint; this
+                       // reconstructed ref is passed directly, not round-tripped.
+                enc: false,
+              });
+              // Seed the per-message CID memo so the next persist can
+              // skip re-pinning unchanged messages.
+              this._pinnedMessageCids.set(JSON.stringify(msg), {
+                cid: item.cid,
+                size: item.size,
+              });
+              return msg;
+            } catch (err) {
+              logger.error(
+                'GroupChat',
+                `[GROUP_MESSAGES] per-message CID fetch failed for ${groupId} msg=${item.id}; skipping.`,
+                err,
+              );
+              return null;
+            }
+          });
+          const results = await Promise.all(fetches);
+          assembledMessages = results.filter((m): m is GroupMessageData => m !== null);
+          // Seed the per-group index memo so an immediate re-persist
+          // doesn't re-pin the whole index for unchanged state.
+          this._lastPinnedMessagesByGroup.set(groupId, {
+            json: JSON.stringify(fetched),
+            ref,
+          });
+        } else if (Array.isArray(fetched)) {
+          // Pattern A content — backward compat for data written pre-#101.
+          // Not seeding per-message memo because these weren't pinned
+          // individually; next persist will transparently migrate to B.
+          assembledMessages = fetched as GroupMessageData[];
+        } else {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES] CID-ref content for ${groupId} is neither an index nor an array (got ${typeof fetched}); skipping.`,
+          );
+          continue;
+        }
       } else {
+        // Legacy inline JSON — direct array.
+        let parsed: unknown;
         try {
           parsed = JSON.parse(json);
         } catch (err) {
@@ -313,15 +436,19 @@ export class GroupChatModule {
           );
           continue;
         }
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES] legacy data for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+          );
+          continue;
+        }
+        assembledMessages = parsed as GroupMessageData[];
       }
-      if (!Array.isArray(parsed)) {
-        logger.error(
-          'GroupChat',
-          `[GROUP_MESSAGES] decoded data for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
-        );
-        continue;
+
+      if (assembledMessages !== null) {
+        this.messages.set(groupId, assembledMessages);
       }
-      this.messages.set(groupId, parsed as GroupMessageData[]);
     }
     const legacyMessagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
     if (legacyMessagesJson) {
@@ -1935,17 +2062,51 @@ export class GroupChatModule {
       const key = GROUP_CHAT_MESSAGES_PREFIX + groupId;
 
       if (cidRefStore) {
-        const json = JSON.stringify(msgs);
+        // Pattern B: pin each message individually, build an index of
+        // {id, ts, cid, size}, pin the index, write its ref. The dedup
+        // unit is the individual message — Alice's [m1,m2,m3] and
+        // Bob's [m1,m3,m2] share message CIDs even though the array
+        // orders differ.
+        //
+        // Messages without an `id` (transient optimistic state, should
+        // not exist in this.messages but the type permits undefined)
+        // are skipped — they'll persist next round once they get an id.
+        const indexItems: GroupChatMessagesIndexItem[] = [];
+        for (const m of msgs) {
+          if (!m.id) continue;
+          const messageJson = JSON.stringify(m);
+          let cachedPin = this._pinnedMessageCids.get(messageJson);
+          if (!cachedPin) {
+            const ref = await cidRefStore.pinJson(m, { encrypted: false });
+            cachedPin = { cid: ref.cid, size: ref.size };
+            this._pinnedMessageCids.set(messageJson, cachedPin);
+          }
+          indexItems.push({
+            id: m.id,
+            ts: m.timestamp,
+            cid: cachedPin.cid,
+            size: cachedPin.size,
+          });
+        }
+        const index: GroupChatMessagesIndex = {
+          v: GROUP_CHAT_MESSAGES_INDEX_V,
+          items: indexItems,
+        };
+        const indexJson = JSON.stringify(index);
+
+        // Per-group index-ref memo — same plaintext → same CID, so
+        // unchanged state reuses the ref without a pin round-trip.
         const cached = this._lastPinnedMessagesByGroup.get(groupId);
-        if (cached && cached.json === json) {
+        if (cached && cached.json === indexJson) {
           await storage.set(key, CidRefStore.stringifyRef(cached.ref));
         } else {
-          // PLAINTEXT pin — see method doc for rationale.
-          const ref = await cidRefStore.pinJson(msgs, { encrypted: false });
-          await storage.set(key, CidRefStore.stringifyRef(ref));
-          this._lastPinnedMessagesByGroup.set(groupId, { json, ref });
+          const indexRef = await cidRefStore.pinJson(index, { encrypted: false });
+          await storage.set(key, CidRefStore.stringifyRef(indexRef));
+          this._lastPinnedMessagesByGroup.set(groupId, { json: indexJson, ref: indexRef });
         }
       } else {
+        // Legacy inline fallback when no cidRefStore is available —
+        // unchanged from pre-Pattern-B behaviour.
         await storage.set(key, JSON.stringify(msgs));
       }
       current.add(groupId);
@@ -1955,6 +2116,10 @@ export class GroupChatModule {
       if (!current.has(oldId)) {
         await storage.remove(GROUP_CHAT_MESSAGES_PREFIX + oldId);
         // Evict the orphan's memo so a future rejoin forces a fresh pin.
+        // The per-message CID cache is shared across groups and is not
+        // invalidated by single-group eviction — identical messages in
+        // a later group rejoin dedup correctly. (Cache-level GC is the
+        // Phase-2 pin-ledger workstream's concern.)
         this._lastPinnedMessagesByGroup.delete(oldId);
       }
     }
