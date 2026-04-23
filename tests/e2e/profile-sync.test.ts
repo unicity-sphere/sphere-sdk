@@ -195,55 +195,15 @@ describe('Profile (OrbitDB + IPFS) Sync E2E', () => {
   // Test 3: Profile IPNS snapshot publish + resolve round-trip
   // -------------------------------------------------------------------------
 
-  it('publishes a Profile IPNS snapshot and resolves it back via Unicity gateways', async () => {
-    // Isolates the IPNS layer from OrbitDB entirely: sign, publish,
-    // then resolve the same record via HTTP. Validates that the
-    // Unicity IPFS gateway routes the Profile IPNS key space and
-    // that our marshalled record format is accepted.
-    const { publishProfileSnapshot, resolveProfileSnapshot } = await import(
-      '../../profile/profile-ipns'
-    );
-
-    const privateKeyHex = randomHex(32);
-    const walletPubkey = '03' + randomHex(32);
-    const snapshot = {
-      version: 1 as const,
-      walletPubkey,
-      timestamp: Date.now(),
-      bundles: [
-        { cid: 'bafy' + randomHex(20), status: 'active' as const, createdAt: Math.floor(Date.now() / 1000) },
-      ],
-    };
-
-    const publishResult = await publishProfileSnapshot({
-      gateways: [...DEFAULT_IPFS_GATEWAYS],
-      privateKeyHex,
-      snapshot,
-      sequence: 1n,
-    });
-    // Dump failure details so a failure here tells us WHERE.
-    if (!publishResult.success) {
-      console.log('publishResult:', JSON.stringify(publishResult, null, 2));
-    }
-    expect(publishResult.success).toBe(true);
-    expect(publishResult.ipnsName).toMatch(/^12D3Koo/);
-    expect(publishResult.cid).toBeTruthy();
-
-    // Allow gateway propagation — retry for up to 60s.
-    let resolved: Awaited<ReturnType<typeof resolveProfileSnapshot>> = null;
-    for (let i = 0; i < 12; i++) {
-      resolved = await resolveProfileSnapshot({
-        gateways: [...DEFAULT_IPFS_GATEWAYS],
-        privateKeyHex,
-      });
-      if (resolved !== null) break;
-      await new Promise((r) => setTimeout(r, 5000));
-    }
-
-    expect(resolved).not.toBeNull();
-    expect(resolved!.cid).toBe(publishResult.cid!);
-    expect(resolved!.snapshot.walletPubkey).toBe(walletPubkey);
-    expect(resolved!.snapshot.bundles).toHaveLength(1);
-    expect(resolved!.snapshot.bundles[0].cid).toBe(snapshot.bundles[0].cid);
-  }, 120_000);
+  // IPNS publish is removed in T-D6c — the pointer layer is now the
+  // sole publish channel. The READ path survives in
+  // `profile/migration/ipns-reader.ts` as a one-shot migration for
+  // legacy wallets. `it.skip` here preserves the original test
+  // shape for future reference if a resolve-only regression test
+  // against real gateways is ever added.
+  it.skip('publishes a Profile IPNS snapshot and resolves it back via Unicity gateways (REMOVED in T-D6c)', async () => {
+    // Obsolete: publishProfileSnapshot no longer exists. The
+    // migration reader exposes `resolveProfileSnapshot` for
+    // read-only legacy recovery; no corresponding publisher remains.
+  });
 });

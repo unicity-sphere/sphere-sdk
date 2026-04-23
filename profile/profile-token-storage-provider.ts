@@ -300,25 +300,23 @@ export class ProfileTokenStorageProvider
       // after a wipe). Rebuild the active bundle set without waiting
       // for a live peer.
       //
-      // Two channels in priority order:
-      //   (1) aggregator pointer layer — authoritative. On a successful
-      //       recoverLatest the CID is trust-verified via inclusion
-      //       proof + CAR content-address verify. Lands as a new
-      //       bundle ref that the next JOIN pass assembles.
-      //   (2) legacy IPNS snapshot — fallback during rollout. Used
-      //       when (a) no pointer anchor exists yet (wallet pre-dates
-      //       the pointer layer), (b) the pointer layer is
-      //       unavailable (no oracle, BLOCKED, storage non-durable),
-      //       or (c) pointer recovery threw. Will be removed under
-      //       T-D6c once the migration reader takes over.
-      //
-      // Both channels are best-effort: a failure at either leaves us
-      // with an empty bundle set, and the next save() seeds the
-      // anchor afresh.
+      // Priority (T-D6 / T-D6b):
+      //   (1) aggregator pointer layer — authoritative source of
+      //       truth. On a successful recoverLatest the CID is
+      //       trust-verified via inclusion proof + CAR content-
+      //       address verify. Lands as a new bundle ref that the
+      //       next JOIN pass assembles.
+      //   (2) one-shot legacy IPNS → pointer migration. Only fires
+      //       if the local cache carries a legacy `profile.ipns.
+      //       sequence` key and no `profile.pointer.migration.done`
+      //       marker. Reads the legacy IPNS snapshot ONE TIME,
+      //       hydrates the bundle set into OrbitDB, and stamps the
+      //       marker so subsequent loads go straight to the pointer
+      //       path. New wallets (no IPNS history) skip this entirely.
       if (this.knownBundleCids.size === 0) {
         const pointerRecovered = await this.recoverFromAggregatorPointerBestEffort();
         if (!pointerRecovered) {
-          await this.recoverFromIpnsSnapshot();
+          await this.runLegacyIpnsMigrationBestEffort();
         }
       }
 
@@ -914,23 +912,14 @@ export class ProfileTokenStorageProvider
         );
       }
 
-      // 9. Publish to the two cold-start recovery channels (see the
-      //    symmetrical note in `initialize()` for the priority model).
-      //    Both calls are best-effort: the CAR is already pinned and
-      //    the OrbitDB bundle ref is already written, so a failed
-      //    publish only delays cold-start recovery for this flush —
-      //    subsequent flushes retry.
-      //
-      //    Run in parallel via allSettled: the two channels are
-      //    independent, and serializing them means a slow pointer
-      //    publish (up to 60s under the CAR-fetch budget) delays the
-      //    IPNS snapshot AND the shutdown-flush wait. allSettled
-      //    preserves the best-effort semantics (neither can reject
-      //    past this await).
-      await Promise.allSettled([
-        this.publishAggregatorPointerBestEffort(cid),
-        this.publishIpnsSnapshotBestEffort(),
-      ]);
+      // 9. Publish to the pointer layer for cold-start recovery.
+      //    Best-effort: the CAR is already pinned and the OrbitDB
+      //    bundle ref is already written, so a failed publish only
+      //    delays cold-start recovery for this flush — subsequent
+      //    flushes retry. IPNS is no longer published (T-D6c) —
+      //    the one-shot migration reader is the only remaining
+      //    legacy touchpoint and it's read-only.
+      await this.publishAggregatorPointerBestEffort(cid);
 
       this.emitEvent({
         type: 'storage:saved',
@@ -1173,127 +1162,53 @@ export class ProfileTokenStorageProvider
   }
 
   // ===========================================================================
-  // Private: IPNS snapshot (cold-start recovery — legacy fallback)
+  // Private: one-shot IPNS → pointer migration (T-D6b)
   // ===========================================================================
 
   /**
-   * Build a snapshot of the current active bundle set and publish it
-   * to IPNS. Best-effort — logs failures but never throws, because
-   * the authoritative state (CAR + OrbitDB bundle ref) is already
-   * written by the time this runs.
-   */
-  private async publishIpnsSnapshotBestEffort(): Promise<void> {
-    if (!this.identity || this._ipfsGateways.length === 0) return;
-    if (this._options?.config?.ipnsSnapshot === false) return;
-
-    try {
-      const active = await this.listActiveBundles();
-      if (active.size === 0) {
-        // Nothing to publish yet — would produce an empty snapshot.
-        return;
-      }
-
-      const bundles = [...active.entries()].map(([cid, ref]) => ({
-        cid,
-        status: 'active' as const,
-        createdAt: ref.createdAt,
-      }));
-
-      const { publishProfileSnapshot, readSequence, writeSequence } = await import(
-        './profile-ipns.js'
-      );
-
-      // Monotonic sequence per wallet — persisted via the local cache
-      // that the Profile provider owns (same device scope as OrbitDB
-      // state).
-      let nextSequence = 1n;
-      if (this.localCache) {
-        const prev = await readSequence({
-          get: (k) => this.localCache!.get(k),
-        });
-        nextSequence = prev + 1n;
-      }
-
-      const result = await publishProfileSnapshot({
-        gateways: this._ipfsGateways,
-        privateKeyHex: this.identity.privateKey,
-        snapshot: {
-          version: 1,
-          walletPubkey: this.identity.chainPubkey,
-          timestamp: Date.now(),
-          bundles,
-        },
-        sequence: nextSequence,
-      });
-
-      if (result.success && this.localCache) {
-        await writeSequence(
-          { set: (k, v) => this.localCache!.set(k, v) },
-          nextSequence,
-        );
-        this.log(
-          `IPNS snapshot published: ipns=${result.ipnsName} cid=${result.cid} seq=${nextSequence}`,
-        );
-      } else if (!result.success) {
-        this.log(`IPNS publish failed: ${result.error ?? 'unknown'}`);
-      }
-    } catch (err) {
-      this.log(
-        `IPNS snapshot publish threw: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-
-  /**
-   * Resolve the Profile's IPNS record (if any) and write the bundle
-   * refs it describes back into OrbitDB. Called during
-   * `initialize()` when the local OrbitDB has no bundles — the
-   * classic cold-start-after-wipe scenario.
+   * Run the legacy IPNS → pointer migration if the wallet pre-dates
+   * the pointer layer. No-op for fresh wallets or wallets that have
+   * already migrated. Never throws — any failure logs and returns,
+   * leaving subsequent flushes to seed the anchor via the pointer
+   * layer directly.
    *
-   * Best-effort: no record → no-op; network failure → logged and
-   * proceed with empty state.
+   * See profile/migration/ipns-reader.ts for the legacy detection
+   * heuristic and the one-shot orchestrator. This wrapper binds the
+   * migration's `onBundle` callback to `this.addBundle` so the
+   * imported refs respect the provider's encryption conventions.
    */
-  private async recoverFromIpnsSnapshot(): Promise<void> {
+  private async runLegacyIpnsMigrationBestEffort(): Promise<void> {
     if (!this.identity || this._ipfsGateways.length === 0) return;
-    if (this._options?.config?.ipnsSnapshot === false) return;
+    if (!this.localCache) return;
 
     try {
-      const { resolveProfileSnapshot } = await import('./profile-ipns.js');
-      const result = await resolveProfileSnapshot({
-        gateways: this._ipfsGateways,
-        privateKeyHex: this.identity.privateKey,
-      });
-      if (!result) {
-        this.log('IPNS snapshot: no record found (fresh wallet or first publish)');
-        return;
-      }
-
-      this.log(
-        `IPNS snapshot resolved: cid=${result.cid} seq=${result.sequence} bundles=${result.snapshot.bundles.length}`,
+      const { runIpnsToPointerMigration } = await import(
+        './migration/ipns-reader.js'
       );
-
-      // Bootstrap each bundle ref into OrbitDB. `addBundle` is
-      // idempotent at the key level (OrbitDB put with the same key
-      // overwrites). If the OpLog later catches up via gossipsub,
-      // the more recent entry wins.
-      for (const b of result.snapshot.bundles) {
-        if (b.status !== 'active') continue;
-        try {
-          await this.addBundle(b.cid, {
-            cid: b.cid,
-            status: 'active',
-            createdAt: b.createdAt,
-            tokenCount: 0, // unknown; refreshed on next flush
-          });
-        } catch (err) {
-          this.log(
-            `IPNS snapshot: addBundle(${b.cid}) failed: ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+      const result = await runIpnsToPointerMigration({
+        localCache: {
+          get: (k) => this.localCache!.get(k),
+          set: (k, v) => this.localCache!.set(k, v),
+        },
+        privateKeyHex: this.identity.privateKey,
+        gateways: this._ipfsGateways,
+        onBundle: async (cid, ref) => this.addBundle(cid, ref),
+        log: (msg) => this.log(msg),
+      });
+      if (result.migrated) {
+        this.log(
+          `Legacy IPNS → pointer migration: imported ${result.bundlesImported} bundles`,
+        );
+      } else if (result.skipped === 'not-legacy') {
+        // Fresh install post-pointer — expected silent no-op.
+      } else {
+        this.log(
+          `Legacy migration skipped: ${result.skipped ?? 'transient-failure'}`,
+        );
       }
     } catch (err) {
       this.log(
-        `IPNS recovery threw: ${err instanceof Error ? err.message : String(err)}`,
+        `Legacy IPNS migration threw: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
