@@ -432,6 +432,22 @@ describe('CommunicationsModule — DM CID-ref persistence', () => {
     expect(observedSnapshots[0]!.map((m) => m.id)).toEqual(['m1']);
     const secondIds = observedSnapshots[1]!.map((m) => m.id).sort();
     expect(secondIds).toEqual(['m1', 'm2']);
+
+    // Distinguishing invariant — this is the assertion that actually proves
+    // the save-chain closes the race. Without the chain, save2 completes
+    // its storage.set BEFORE save1 resumes from the gate and overwrites it
+    // with the stale REAL_CIDS[0] ref. With the chain, save1 fully completes
+    // first (writing REAL_CIDS[0]), THEN save2 runs and writes REAL_CIDS[1].
+    // The final KV value corresponds to save2's fresh snapshot.
+    //
+    // The observedSnapshots assertions above hold in both cases (both
+    // pins happen with the same values); only the FINAL STORAGE STATE
+    // differs. Without this assertion the test passes even with a broken
+    // chain.
+    const finalKv = store.get(STORAGE_KEYS_ADDRESS.MESSAGES);
+    expect(finalKv).toBeDefined();
+    const finalRef = JSON.parse(finalKv!);
+    expect(finalRef.cid).toBe(REAL_CIDS[1]);
   });
 
   it('legacy global-key migration still works (predates CID-refs)', async () => {
