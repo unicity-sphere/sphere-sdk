@@ -6,6 +6,7 @@
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { createTransportAddressResolver, type TransportAddressResolver } from '../../core/transport-resolver';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store';
 import type {
   DirectMessage,
   BroadcastMessage,
@@ -65,6 +66,13 @@ export interface CommunicationsModuleDependencies {
   storage: StorageProvider;
   transport: TransportProvider;
   emitEvent: <T extends SphereEventType>(type: T, data: SphereEventMap[T]) => void;
+  /**
+   * Optional CID-reference store for OpLog fat-data migration
+   * (PROFILE-CID-REFERENCES.md §8.4). When present, DM arrays are pinned
+   * to IPFS and the OpLog holds a small ref envelope instead of the fat
+   * inline JSON. When absent, falls back to legacy inline storage.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================
@@ -185,21 +193,36 @@ export class CommunicationsModule {
     // would leave the previous address's messages visible.
     this.messages.clear();
 
-    // Try per-address key first
-    let data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.MESSAGES);
+    // Try per-address key first — dual-read (CID ref envelope or legacy inline).
+    const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.MESSAGES);
 
     if (data) {
-      const messages = JSON.parse(data) as DirectMessage[];
+      const messages = await this.parseMessagesPayload(data, STORAGE_KEYS_ADDRESS.MESSAGES);
       for (const msg of messages) {
         this.messages.set(msg.id, msg);
       }
       return;
     }
 
-    // Migration: fall back to legacy global key, filter for current identity
-    data = await this.deps!.storage.get('direct_messages');
-    if (data) {
-      const allMessages = JSON.parse(data) as DirectMessage[];
+    // Migration: fall back to legacy global key, filter for current identity.
+    // The legacy global key predates CID-refs and is always inline JSON —
+    // no dual-read needed here.
+    const legacy = await this.deps!.storage.get('direct_messages');
+    if (legacy) {
+      let allMessages: DirectMessage[];
+      try {
+        allMessages = JSON.parse(legacy) as DirectMessage[];
+      } catch (err) {
+        if (err instanceof SyntaxError) {
+          logger.error('Communications', '[MESSAGES] Legacy global key JSON parse failed:', err);
+          return;
+        }
+        throw err;
+      }
+      if (!Array.isArray(allMessages)) {
+        logger.error('Communications', `[MESSAGES] Legacy global key is not an array (got ${typeof allMessages}); skipping.`);
+        return;
+      }
       const myPubkey = this.deps!.identity.chainPubkey;
       const myMessages = allMessages.filter(
         (m) => m.senderPubkey === myPubkey || m.recipientPubkey === myPubkey,
@@ -209,11 +232,66 @@ export class CommunicationsModule {
         this.messages.set(msg.id, msg);
       }
 
-      // Persist to new per-address key
+      // Persist to new per-address key (will write via CID ref if available).
       if (myMessages.length > 0) {
         await this.save();
         logger.debug('Communications', `Migrated ${myMessages.length} messages to per-address storage`);
       }
+    }
+  }
+
+  /**
+   * Parse the raw KV payload for `<addr>.messages`.
+   *
+   * Dual-read per PROFILE-CID-REFERENCES.md §6:
+   *   - If the payload is a CID ref envelope → fetch content from IPFS
+   *     via `cidRefStore`. Errors propagate with typed codes.
+   *   - If no cidRefStore is injected but a ref is found → throw typed
+   *     `ProfileError('CID_REF_UNREADABLE')`. Silent fallback would mean
+   *     silently losing all stored DMs for this address.
+   *   - Otherwise parse as legacy inline JSON with narrow SyntaxError catch.
+   */
+  private async parseMessagesPayload(data: string, keyForDiagnostic: string): Promise<DirectMessage[]> {
+    const ref = CidRefStore.tryParseRef(data);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `CommunicationsModule.load: KV at ${keyForDiagnostic} contains a CID ref ` +
+            `(cid=${ref.cid}) but no cidRefStore was injected. DMs cannot be ` +
+            `restored without IPFS access. Check CommunicationsModule init — ` +
+            `is cidRefStore provided?`,
+        );
+      }
+      const fetched = await this.deps!.cidRefStore.fetchJson<DirectMessage[]>(ref);
+      if (!Array.isArray(fetched)) {
+        logger.error(
+          'Communications',
+          `[MESSAGES] CID-ref content at ${ref.cid} is not an array (got ${typeof fetched}); treating as empty.`,
+        );
+        return [];
+      }
+      return fetched;
+    }
+
+    // Legacy inline JSON — narrow catch for corruption.
+    try {
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        logger.error(
+          'Communications',
+          `[MESSAGES] Decoded data is not an array (got ${typeof parsed}); treating as empty.`,
+        );
+        return [];
+      }
+      return parsed;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.error('Communications', '[MESSAGES] Legacy JSON parse failed (corrupted inline data):', err);
+        return [];
+      }
+      throw err;
     }
   }
 
@@ -697,8 +775,87 @@ export class CommunicationsModule {
   // Private: Storage
   // ===========================================================================
 
+  /**
+   * Memoized plaintext + CID ref for the last messages pin. See
+   * `_lastPinnedV5Json` in PaymentsModule for rationale: AES-GCM uses
+   * random IVs so re-pinning identical plaintext produces a different CID.
+   * We'd rather write the cached ref than thrash the IPFS gateway.
+   */
+  private _lastPinnedMessagesJson: string | null = null;
+  private _lastPinnedMessagesRef: CidRef | null = null;
+
+  /**
+   * Single-flight chain for save() — DMs arrive over the Nostr subscription
+   * and can trigger multiple concurrent save() invocations (one per event).
+   * Without serialization, two concurrent saves both read the same Map
+   * snapshot and the second clobbers the first. The chain mirrors
+   * PaymentsModule._saveChain / _outboxChain discipline.
+   *
+   * Caveat: guarantees ORDERING, not atomicity — a failing save doesn't
+   * roll back state but also doesn't block the next save.
+   */
+  private _saveChain: Promise<void> = Promise.resolve();
+
   private async save(): Promise<void> {
+    const chained = this._saveChain
+      .catch(() => {
+        /* isolate prior failure */
+      })
+      .then(() => this._doSave());
+    this._saveChain = chained.then(
+      () => undefined,
+      () => undefined,
+    );
+    return chained;
+  }
+
+  /**
+   * Write the current messages Map — via CID reference when `cidRefStore`
+   * is injected, inline JSON otherwise. PROFILE-CID-REFERENCES.md §8.4.
+   *
+   * Note on pattern choice: §8.4 specifies Pattern B (index of per-message
+   * CIDs). This implementation uses Pattern A (single CID for the whole
+   * array) for parity with PaymentsModule's migration. Pattern B is a
+   * future Phase-2 optimization — both share the same OpLog envelope
+   * shape, so the migration path from A → B is transparent to peers.
+   * Pattern A is adequate for typical wallets (<1000 DMs per address);
+   * Pattern B matters once conversations get very long.
+   */
+  private async _doSave(): Promise<void> {
     const messages = Array.from(this.messages.values());
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (messages.length === 0) {
+      // Empty list: write empty string and clear memo so the next non-empty
+      // save re-pins (can't reuse a stale ref).
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, '');
+      this._lastPinnedMessagesJson = null;
+      this._lastPinnedMessagesRef = null;
+      return;
+    }
+
+    if (cidRefStore) {
+      const json = JSON.stringify(messages);
+
+      // Skip re-pin if plaintext is byte-identical to the last successful pin.
+      if (this._lastPinnedMessagesRef && this._lastPinnedMessagesJson === json) {
+        const refStr = CidRefStore.stringifyRef(this._lastPinnedMessagesRef);
+        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, refStr);
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(messages);
+      const refStr = CidRefStore.stringifyRef(ref);
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, refStr);
+      // Update memo AFTER storage.set — see PaymentsModule equivalent for
+      // the rationale (a set-failure must not leave us pointing at a CID
+      // the caller thinks is live).
+      this._lastPinnedMessagesJson = json;
+      this._lastPinnedMessagesRef = ref;
+      return;
+    }
+
+    // Legacy path: inline JSON (deprecated for heavy wallets — see §8.4).
     await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, JSON.stringify(messages));
   }
 
