@@ -836,6 +836,105 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
     expect(loaded.map((m) => m.id)).toEqual(['m_ok']);
   });
 
+  // ---------------------------------------------------------------------------
+  // Save-chain — serializes persist invocations so a fresh message arriving
+  // mid-persist can't race the in-flight persist's storage.set.
+  // ---------------------------------------------------------------------------
+
+  it('save-chain: concurrent persists serialize — final KV reflects latest state', async () => {
+    // Under Pattern B, persistMessages does N+1 awaits. A fresh message
+    // arriving while persist-1 is mid-fetch would, pre-chain, kick off
+    // persist-2 concurrently. Whoever writes storage last wins; persist-1
+    // could finish AFTER persist-2 and overwrite storage with its
+    // stale-snapshot index ref.
+    //
+    // With the chain: persist-2 must wait until persist-1 fully completes
+    // before starting. storage.set calls happen in strict order; the
+    // LATER persist's ref is the one that ends up in KV.
+    const ipfsStore = new Map<string, { bytes: Uint8Array; enc: boolean }>();
+    const cidSequence = [
+      'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+      'bafkreif4jkpxy2j7hezb2kjfb2mk23wsq5s7vzlqfkwnofkcfxsikiznna',
+      'bafkreihjkz4shxhcbw2dsvsplsx5bwjv4uibkivyu3vzmhcuhaibcmxpau',
+      'bafkreibnx2xlk3nv6r5tmsdtp3kvo5j2zh5y3qhqnvp7z4z5yblcvchyqu',
+      'bafkreigc7s4sqhn7y7qdmkshxswfucacvalvb7r6i57sxa3gngkxm7pwdq',
+      'bafkreif5kllzmkgl2euhmuarujbx2c4qc6ys4ezbdkotl4vfzywifgj36i',
+      'bafkreihgwgjb76y4evzixnyhurnscy46rtuekx2gojy63zvyexmptzq4pi',
+      'bafkreib5rv2rsfv3d7x57grexkl2prw2wmz4eojpyk2xmeugzszvtefyfy',
+    ];
+    let cidIdx = 0;
+
+    // Gate the FIRST pin call to create a race window — persist-1 is
+    // suspended on pinJson while persist-2 is kicked off.
+    let pinGateResolve: (() => void) | null = null;
+    const pinGate = new Promise<void>((resolve) => {
+      pinGateResolve = resolve;
+    });
+    let pinCallCount = 0;
+
+    const gatedStore = {
+      pinJson: vi.fn(async (value: unknown, opts?: { encrypted?: boolean }) => {
+        const call = pinCallCount++;
+        const cid = cidSequence[call % cidSequence.length]!;
+        if (call === 0) {
+          // First pin blocks until the test releases it — persist-2 will
+          // attempt to schedule during this window.
+          await pinGate;
+        }
+        const bytes = new TextEncoder().encode(JSON.stringify(value));
+        const encryptedMode = opts?.encrypted ?? true;
+        ipfsStore.set(cid, { bytes, enc: encryptedMode });
+        return {
+          v: 1 as const,
+          cid,
+          size: bytes.byteLength,
+          ts: Date.now() + call,
+          ...(!encryptedMode ? { enc: false as const } : {}),
+        };
+      }),
+      fetchJson: vi.fn(),
+      pinBytes: vi.fn(),
+      fetchBytes: vi.fn(),
+    };
+
+    const mod = new GroupChatModule();
+    mod.initialize(createDeps(storage, gatedStore));
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify([makeGroup('g1')]));
+    await mod.load();
+
+    // Seed initial state.
+    (mod as any).messages.set('g1', [makeMessage('m1', 'g1', 1000)]);
+
+    // Kick off persist #1 (blocked on pinGate on its first pin call).
+    const persist1 = (mod as any).persistAll();
+
+    // Yield so persist #1 enters the gated pin.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Fresh message arrives mid-persist. Kick off persist #2.
+    (mod as any).messages.get('g1').push(makeMessage('m2', 'g1', 2000));
+    const persist2 = (mod as any).persistAll();
+
+    // Release the gate — persist #1 completes, then persist #2 runs
+    // (chain serializes).
+    pinGateResolve!();
+    await Promise.all([persist1, persist2]);
+
+    // Distinguishing invariant: the final KV ref points at the INDEX
+    // produced by persist #2 (which saw BOTH m1 and m2). Under a broken
+    // chain, persist #1's stale-snapshot index ref would have clobbered
+    // persist #2's.
+    const finalKv = storage._data.get(MESSAGES_PREFIX + 'g1')!;
+    const finalRef = JSON.parse(finalKv);
+    // Resolve the final index and verify it contains both messages.
+    const indexBytes = ipfsStore.get(finalRef.cid)!.bytes;
+    const index = JSON.parse(new TextDecoder().decode(indexBytes));
+    expect(index.v).toBe(1);
+    const ids = (index.items as Array<{ id: string }>).map((i) => i.id).sort();
+    expect(ids).toEqual(['m1', 'm2']);
+  });
+
   it('leaving a group evicts the per-group memo (next rejoin pins fresh)', async () => {
     const { fakeStore } = makeFakeCidRefStore();
     const mod = new GroupChatModule();

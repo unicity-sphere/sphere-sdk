@@ -259,7 +259,23 @@ export class GroupChatModule {
 
   // Persistence debounce
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
-  private persistPromise: Promise<void> | null = null;
+  /**
+   * Single-flight chain serializing all persist work (debounced +
+   * explicit-flush + destroy-path). Every `doPersistAll()` invocation
+   * chains onto the previous tail via `.then()`, so two writers can
+   * never race — critical under Pattern B where `persistMessages` does
+   * N+1 awaits (per-message pin + index pin), leaving a wide window
+   * for a fresh message to arrive mid-persist and trigger a second
+   * persist that would otherwise race the in-flight one's storage.set.
+   *
+   * Prior failures are isolated via `.catch()` so one failed persist
+   * does not block subsequent persists. Mirrors
+   * PaymentsModule._saveChain and CommunicationsModule._saveChain.
+   *
+   * The tail is also what `destroy()` and the explicit `persistAll()`
+   * await to observe "all queued persists complete."
+   */
+  private persistPromise: Promise<void> = Promise.resolve();
 
   // Relay admin cache
   private relayAdminPubkeys: Set<string> | null = null;
@@ -702,16 +718,21 @@ export class GroupChatModule {
   destroy(): void {
     this.destroyConnection();
 
-    // Flush any pending debounced persist before clearing state.
-    // Persist methods capture map data synchronously before their first await,
-    // so fire-and-forget is safe even though maps are cleared below.
+    // Flush any pending debounced persist before clearing state. The
+    // persist is chained onto the existing persistPromise so it runs
+    // strictly AFTER any in-flight one, guaranteeing the final writes
+    // reflect the last-known state. Fire-and-forget (not awaited) — the
+    // chain head holds all in-flight work and will resolve independently.
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
       if (this.deps) {
-        this.doPersistAll().catch((err) =>
-          logger.debug('GroupChat', 'Persist on destroy failed', err),
-        );
+        this.persistPromise = this.persistPromise
+          .catch(() => { /* isolate prior */ })
+          .then(() => this.doPersistAll())
+          .catch((err) =>
+            logger.debug('GroupChat', 'Persist on destroy failed', err),
+          );
       }
     }
 
@@ -723,7 +744,11 @@ export class GroupChatModule {
     this.messageHandlers.clear();
     this.relayAdminPubkeys = null;
     this.relayAdminFetchPromise = null;
-    this.persistPromise = null;
+    // Reset chain tail to a fresh resolved promise — any in-flight
+    // persist queued above still holds its own reference and completes
+    // independently, but future schedulePersist() calls on a re-init
+    // start from a clean tail.
+    this.persistPromise = Promise.resolve();
     this.deps = null;
   }
 
@@ -2048,25 +2073,40 @@ export class GroupChatModule {
     if (this.persistTimer) return; // Already scheduled
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      this.persistPromise = this.doPersistAll().catch((err) => {
-        logger.error('GroupChat', 'Persistence error:', err);
-      }).finally(() => {
-        this.persistPromise = null;
-      });
+      // Chain onto the existing persistPromise so we can't race an
+      // in-flight persist. Errors from prior persists are isolated
+      // (.catch) so one failed attempt doesn't block subsequent ones;
+      // errors from THIS persist get logged here.
+      this.persistPromise = this.persistPromise
+        .catch(() => { /* isolate prior failure */ })
+        .then(() => this.doPersistAll())
+        .catch((err) => {
+          logger.error('GroupChat', 'Persistence error:', err);
+        });
     }, 200);
   }
 
-  /** Persist immediately (for explicit flush points). */
+  /** Persist immediately (for explicit flush points).
+   *
+   *  Joins the persist chain like `schedulePersist` but returns a
+   *  promise that resolves (or rejects) with THIS persist's outcome,
+   *  so explicit-flush callers see real errors instead of the
+   *  log-and-swallow treatment applied to the background chain. */
   private async persistAll(): Promise<void> {
-    // Wait for any pending debounced persist
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
-    if (this.persistPromise) {
-      await this.persistPromise;
-    }
-    await this.doPersistAll();
+    // Build the chained persist. Prior-failure isolation on entry so a
+    // broken background persist doesn't poison the explicit flush.
+    const mine = this.persistPromise
+      .catch(() => { /* isolate prior failure */ })
+      .then(() => this.doPersistAll());
+    // Advance the shared tail so the next scheduled/explicit persist
+    // chains onto us. Swallow errors on the shared tail (they're
+    // surfaced via `mine` to the direct caller).
+    this.persistPromise = mine.catch(() => { /* isolated */ });
+    await mine;
   }
 
   private async doPersistAll(): Promise<void> {
