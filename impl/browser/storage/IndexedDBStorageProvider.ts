@@ -8,6 +8,7 @@ import { SphereError } from '../../../core/errors';
 import type { ProviderStatus, FullIdentity, TrackedAddressEntry } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
+import { DURABLE_STORAGE } from '../../../profile/aggregator-pointer';
 
 // =============================================================================
 // Configuration
@@ -38,6 +39,16 @@ export class IndexedDBStorageProvider implements StorageProvider {
   readonly name = 'IndexedDB Storage';
   readonly type = 'local' as const;
   readonly description = 'Browser IndexedDB for large-capacity persistence';
+
+  /**
+   * Durability marker consumed by the aggregator-pointer FlagStore
+   * (SPEC §7.1.3). Write methods (`idbPut` / `idbDelete` / `idbClear`)
+   * resolve their Promises on `tx.oncomplete` — at which point the
+   * transaction has been committed by the IndexedDB engine and the
+   * data survives a page reload or tab crash. Callers can therefore
+   * treat a resolved `set()` / `remove()` as durable.
+   */
+  readonly [DURABLE_STORAGE] = true as const;
 
   private prefix: string;
   private dbName: string;
@@ -333,23 +344,38 @@ export class IndexedDBStorageProvider implements StorageProvider {
     });
   }
 
+  // Write paths resolve on `tx.oncomplete`, not `request.onsuccess`.
+  // A successful put/delete request only means the op was queued
+  // inside an uncommitted transaction — if the tab dies between
+  // onsuccess and commit (or the browser flushes the transaction
+  // later than the microtask that resolves our Promise), the write
+  // would be lost. The pointer layer requires the DURABLE_STORAGE
+  // contract (SPEC §7.1.3), which is defined as "the Promise
+  // resolves only after the transaction commits" — IndexedDB fires
+  // `tx.oncomplete` precisely at that moment. Errors surface via
+  // `tx.onerror`/`tx.onabort` in addition to the request-level
+  // error, so both event streams are listened on.
   private idbPut(entry: { k: string; v: string }): Promise<void> {
     return new Promise((resolve, reject) => {
       const tx = this.db!.transaction(STORE_NAME, 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
       const store = tx.objectStore(STORE_NAME);
       const request = store.put(entry);
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
     });
   }
 
   private idbDelete(key: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const tx = this.db!.transaction(STORE_NAME, 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
       const store = tx.objectStore(STORE_NAME);
       const request = store.delete(key);
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
     });
   }
 
@@ -376,10 +402,12 @@ export class IndexedDBStorageProvider implements StorageProvider {
   private idbClear(): Promise<void> {
     return new Promise((resolve, reject) => {
       const tx = this.db!.transaction(STORE_NAME, 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
       const store = tx.objectStore(STORE_NAME);
       const request = store.clear();
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
     });
   }
 

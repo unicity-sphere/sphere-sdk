@@ -8,6 +8,7 @@ import * as path from 'path';
 import type { StorageProvider } from '../../../storage';
 import type { FullIdentity, ProviderStatus, TrackedAddressEntry } from '../../../types';
 import { STORAGE_KEYS_ADDRESS, STORAGE_KEYS_GLOBAL, getAddressId } from '../../../constants';
+import { DURABLE_STORAGE } from '../../../profile/aggregator-pointer';
 
 export interface FileStorageProviderConfig {
   /** Directory to store wallet data */
@@ -20,6 +21,16 @@ export class FileStorageProvider implements StorageProvider {
   readonly id = 'file-storage';
   readonly name = 'File Storage';
   readonly type = 'local' as const;
+
+  /**
+   * Durability marker consumed by the aggregator-pointer FlagStore
+   * (SPEC §7.1.3). Writes go through `fs.fsyncSync()` on a temp file
+   * followed by an atomic rename, which is a POSIX-durable write. Any
+   * re-ordering by the OS page cache is flushed by fsync before the
+   * rename commits the new inode — readers observe either the prior
+   * or new state, never a torn write.
+   */
+  readonly [DURABLE_STORAGE] = true as const;
 
   private dataDir: string;
   private filePath: string;
