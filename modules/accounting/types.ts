@@ -13,6 +13,7 @@ import type { StorageProvider, TokenStorageProvider } from '../../storage/storag
 import type { OracleProvider } from '../../oracle/oracle-provider';
 import type { PaymentsModule } from '../payments/PaymentsModule';
 import type { CommunicationsModule } from '../communications/CommunicationsModule';
+import type { CidRefStore } from '../../profile/cid-ref-store';
 
 // =============================================================================
 // §1.1 Shared Asset Types (reused from TXF genesis coinData format)
@@ -671,6 +672,14 @@ export interface AccountingModuleDependencies {
    * - Payer-side receipt and cancellation notice detection is disabled (no subscription)
    */
   communications?: CommunicationsModule;
+  /**
+   * Optional CID-reference store for OpLog fat-data migration
+   * (PROFILE-CID-REFERENCES.md §8.3). When present, invoice ledger entries
+   * are pinned to IPFS per-invoice and the OpLog stores a small ref envelope
+   * instead of the fat inline JSON. When absent, falls back to legacy inline
+   * storage.
+   */
+  cidRefStore?: CidRefStore;
 }
 
 // =============================================================================

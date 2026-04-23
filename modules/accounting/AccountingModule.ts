@@ -12,6 +12,7 @@
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
+import { CidRefStore, type CidRef } from '../../profile/cid-ref-store.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
 import type {
   IncomingTransfer,
@@ -213,6 +214,18 @@ export class AccountingModule {
 
   /** W2 fix: Serialization guard for _flushDirtyLedgerEntries. */
   private _flushPromise: Promise<void> | null = null;
+
+  /**
+   * Memoization of the last successful CID pin per invoice
+   * (PROFILE-CID-REFERENCES.md §8.3). AES-GCM uses random IVs so re-pinning
+   * identical plaintext produces a different CID; the memo skips re-pinning
+   * when the entries-for-invoice JSON is byte-identical to the last pin.
+   *
+   * Keyed by invoiceId — each invoice has its own KV key and therefore its
+   * own pin lifecycle. Memo entries are cleared when an invoice is
+   * terminated (closed/cancelled) since no further writes should occur.
+   */
+  private _lastPinnedLedgerByInvoice = new Map<string, { json: string; ref: CidRef }>();
 
   // ---------------------------------------------------------------------------
   // Per-invoice concurrency gate (promise chain)
@@ -4150,7 +4163,18 @@ export class AccountingModule {
       try {
         const raw = await this.deps!.storage.get(key);
         if (!raw) continue;
-        const entries = JSON.parse(raw) as Record<string, InvoiceTransferRef>;
+        // Dual-read per PROFILE-CID-REFERENCES.md §6: detects CID ref and
+        // fetches from IPFS, or falls through to legacy inline JSON.
+        // `_parseLedgerPayload` returns `null` on corrupt shape (not an
+        // object) — caller treats the same as the existing parse-error path:
+        // reset the inner map and rescan. CID_REF_UNREADABLE (ref present +
+        // no cidRefStore) propagates through the outer try/catch as a
+        // corruption signal (safe — the reset-and-rescan path rebuilds from
+        // on-chain data).
+        const entries = await this._parseLedgerPayload(raw, invoiceId);
+        if (entries === null) {
+          throw new Error(`_parseLedgerPayload returned null for invoice ${invoiceId}`);
+        }
         const innerMap = this.invoiceLedger.get(invoiceId)!;
         const now = Date.now();
         const PROVISIONAL_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -6049,10 +6073,7 @@ export class AccountingModule {
         entries[k] = v;
       }
       try {
-        await this.deps!.storage.set(
-          this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`),
-          JSON.stringify(entries),
-        );
+        await this._persistLedgerForInvoice(invoiceId, entries);
         written.add(invoiceId);
       } catch (err) {
         logger.warn(LOG_TAG, `Failed to persist ledger for invoice ${invoiceId} — aborting flush`, err);
@@ -6104,6 +6125,109 @@ export class AccountingModule {
       this.tokenInvoiceMap.set(tokenId, set);
     }
     set.add(invoiceId);
+  }
+
+  // ===========================================================================
+  // Internal: Per-invoice ledger CID-ref persistence (PROFILE-CID-REFERENCES.md §8.3)
+  // ===========================================================================
+
+  /**
+   * Persist an invoice's ledger entries — via CID reference when
+   * `cidRefStore` is injected, inline JSON otherwise. Pattern A per-invoice
+   * per spec §8.3. Each invoice has its own KV key and its own memo slot,
+   * so pins/refs for different invoices never collide.
+   *
+   * Memoization: if the serialized entries match the last successful pin
+   * for this invoice, reuse the cached ref rather than re-pinning (AES-GCM
+   * random IVs would otherwise churn a new CID on every unchanged flush).
+   */
+  private async _persistLedgerForInvoice(
+    invoiceId: string,
+    entries: Record<string, InvoiceTransferRef>,
+  ): Promise<void> {
+    const key = this.getStorageKey(`${INV_LEDGER_PREFIX}${invoiceId}`);
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (cidRefStore) {
+      const json = JSON.stringify(entries);
+
+      // Memo hit — identical plaintext, reuse cached ref.
+      const cached = this._lastPinnedLedgerByInvoice.get(invoiceId);
+      if (cached && cached.json === json) {
+        await this.deps!.storage.set(key, CidRefStore.stringifyRef(cached.ref));
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(entries);
+      await this.deps!.storage.set(key, CidRefStore.stringifyRef(ref));
+      // Update memo AFTER successful storage.set — a set-failure must not
+      // leave us pointing at a CID the caller thinks is live.
+      this._lastPinnedLedgerByInvoice.set(invoiceId, { json, ref });
+      return;
+    }
+
+    // Legacy path: inline JSON.
+    await this.deps!.storage.set(key, JSON.stringify(entries));
+  }
+
+  /**
+   * Parse a raw ledger KV payload for one invoice — dual-read per §6:
+   *   - CID ref envelope → fetch from IPFS via `cidRefStore`.
+   *   - No cidRefStore but ref present → throw CID_REF_UNREADABLE (silent
+   *     fallback would mean silently losing all tracked payments for this
+   *     invoice, corrupting balance computation).
+   *   - Legacy inline JSON → parse with narrow SyntaxError catch.
+   *
+   * Returns `null` on malformed non-ref data; caller treats that as
+   * "reset this invoice's inner map and force rescan" (same contract as
+   * the pre-refactor try/catch at the load call site).
+   */
+  private async _parseLedgerPayload(
+    raw: string,
+    invoiceId: string,
+  ): Promise<Record<string, InvoiceTransferRef> | null> {
+    const ref = CidRefStore.tryParseRef(raw);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `AccountingModule._parseLedgerPayload: ledger for invoice ${invoiceId} ` +
+            `contains a CID ref (cid=${ref.cid}) but no cidRefStore was injected. ` +
+            `Invoice payments cannot be restored without IPFS access. ` +
+            `Check AccountingModule init — is cidRefStore provided?`,
+        );
+      }
+      const fetched = await this.deps!.cidRefStore.fetchJson<Record<string, InvoiceTransferRef>>(ref);
+      // Defensive shape check — IPFS content should be a plain object map.
+      if (fetched === null || typeof fetched !== 'object' || Array.isArray(fetched)) {
+        logger.warn(
+          LOG_TAG,
+          `[LEDGER] CID-ref content at ${ref.cid} for invoice ${invoiceId} is not an object (got ${typeof fetched}); treating as corrupt.`,
+        );
+        return null;
+      }
+      return fetched;
+    }
+
+    // Legacy inline JSON — narrow catch for corruption.
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        logger.warn(
+          LOG_TAG,
+          `[LEDGER] Decoded data for invoice ${invoiceId} is not an object (got ${typeof parsed}); treating as corrupt.`,
+        );
+        return null;
+      }
+      return parsed as Record<string, InvoiceTransferRef>;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.warn(LOG_TAG, `[LEDGER] Legacy JSON parse failed for invoice ${invoiceId}:`, err);
+        return null;
+      }
+      throw err;
+    }
   }
 
   // ===========================================================================
