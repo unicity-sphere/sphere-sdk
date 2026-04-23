@@ -223,8 +223,133 @@ describe('CidRefStore — pinJson / fetchJson', () => {
   });
 
   it('contentV is preserved', async () => {
-    const ref = await store.pinJson({ data: 'x' }, 42);
+    // Signature changed in the commit-7b CidRefStore API extension:
+    // `pinJson(value, opts?: PinOptions)` — pass contentV via the options
+    // bag instead of the old positional `number` arg.
+    const ref = await store.pinJson({ data: 'x' }, { contentV: 42 });
     expect(ref.contentV).toBe(42);
+    gateway.cleanup();
+  });
+});
+
+// ── Plaintext pin mode (commit 7b) ─────────────────────────────────────────
+// For content whose transit privacy is already public (e.g., NIP-29
+// group-chat messages) the per-wallet encryption defeats IPFS dedup without
+// adding realistic privacy. Plaintext pins expose the same content under
+// a single CID across all wallets → full dedup.
+
+describe('CidRefStore — plaintext pin mode (encrypted: false)', () => {
+  let gateway: ReturnType<typeof installFakeIpfsGateway>;
+  let store: CidRefStore;
+
+  beforeEach(() => {
+    gateway = installFakeIpfsGateway();
+    store = new CidRefStore({
+      gateways: ['https://ipfs.example.com'],
+      encryptionKey: TEST_KEY,
+    });
+  });
+
+  it('pinBytes with encrypted:false stores plaintext — content matches byte-for-byte', async () => {
+    const payload = new TextEncoder().encode('public group chat message');
+    const ref = await store.pinBytes(payload, { encrypted: false });
+    expect(ref.enc).toBe(false);
+    // Size equals plaintext (no 28-byte AES-GCM overhead).
+    expect(ref.size).toBe(payload.byteLength);
+    // Stored bytes ARE the plaintext (the whole point — global dedup).
+    const storedBytes = gateway.store.get(ref.cid)!;
+    expect(Array.from(storedBytes)).toEqual(Array.from(payload));
+    gateway.cleanup();
+  });
+
+  it('encrypted (default) pins carry no `enc` field — backward compat', async () => {
+    const payload = new TextEncoder().encode('private');
+    const ref = await store.pinBytes(payload);
+    expect(ref.enc).toBeUndefined();
+    // Pre-existing refs in the wild have no `enc` field and this commit
+    // preserves that byte-for-byte — older wallets reading them don't see
+    // a new field they'd fail-closed on.
+    gateway.cleanup();
+  });
+
+  it('fetchBytes reads plaintext pin without attempting decrypt', async () => {
+    const payload = new TextEncoder().encode('public payload');
+    const ref = await store.pinBytes(payload, { encrypted: false });
+    const fetched = await store.fetchBytes(ref);
+    // Round-trip — plaintext in, plaintext out, no decryption step.
+    expect(Array.from(fetched)).toEqual(Array.from(payload));
+    gateway.cleanup();
+  });
+
+  it('pinJson + fetchJson round-trip in plaintext mode', async () => {
+    const payload = { groupId: 'g1', msgs: [{ id: 'm1', text: 'hello group' }] };
+    const ref = await store.pinJson(payload, { encrypted: false });
+    expect(ref.enc).toBe(false);
+    const fetched = await store.fetchJson(ref);
+    expect(fetched).toEqual(payload);
+    gateway.cleanup();
+  });
+
+  it('IPFS dedup property: two wallets pinning the same plaintext produce identical CIDs', async () => {
+    // Two CidRefStore instances with DIFFERENT wallet keys — the scenario
+    // the dedup was designed for (Alice and Bob both store the same group
+    // message content; their per-wallet-encrypted pins would have DIFFERENT
+    // CIDs, but plaintext pins converge to ONE CID).
+    const DIFFERENT_KEY = new Uint8Array(32).fill(0xAA);
+    const otherStore = new CidRefStore({
+      gateways: ['https://ipfs.example.com'],
+      encryptionKey: DIFFERENT_KEY,
+    });
+    const payload = new TextEncoder().encode('group:g1 msg:m42');
+    const refAlice = await store.pinBytes(payload, { encrypted: false });
+    const refBob = await otherStore.pinBytes(payload, { encrypted: false });
+    expect(refAlice.cid).toBe(refBob.cid);
+    // Encrypted version would have DIFFERENT CIDs — confirm as contrast.
+    const refAliceEncrypted = await store.pinBytes(payload);
+    const refBobEncrypted = await otherStore.pinBytes(payload);
+    expect(refAliceEncrypted.cid).not.toBe(refBobEncrypted.cid);
+    gateway.cleanup();
+  });
+
+  it('self-describing: encrypted pin still decrypts correctly in mixed-mode store', async () => {
+    // A single CidRefStore should handle both encrypted and plaintext
+    // refs interleaved — the ref.enc field drives the fetch path.
+    const encRef = await store.pinJson({ private: 'secret' });
+    const plainRef = await store.pinJson({ public: 'open' }, { encrypted: false });
+    const encFetched = await store.fetchJson(encRef);
+    const plainFetched = await store.fetchJson(plainRef);
+    expect(encFetched).toEqual({ private: 'secret' });
+    expect(plainFetched).toEqual({ public: 'open' });
+    gateway.cleanup();
+  });
+
+  it('tryParseRef preserves enc field (self-describing round-trip through OpLog)', async () => {
+    const ref = await store.pinJson({ data: 'x' }, { encrypted: false });
+    const serialized = CidRefStore.stringifyRef(ref);
+    const parsed = CidRefStore.tryParseRef(serialized);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.enc).toBe(false);
+    gateway.cleanup();
+  });
+
+  it('tryParseRef rejects non-boolean enc (corruption guard)', () => {
+    const bogus = JSON.stringify({
+      v: 1,
+      cid: 'bafkreieyqvmjr6zq5adijx2kzlcfmdvexmy2i6knyj4w2pybmzxmvg6bze',
+      size: 10,
+      ts: 1700000000000,
+      enc: 'false', // string — not boolean
+    });
+    expect(CidRefStore.tryParseRef(bogus)).toBeNull();
+  });
+
+  it('size validation still fires on plaintext pin (poisoned-ref protection)', async () => {
+    const payload = new TextEncoder().encode('legit');
+    const ref = await store.pinBytes(payload, { encrypted: false });
+    // Tamper the stored CID contents to be much larger than declared.
+    const tampered = new Uint8Array(10_000).fill(0x42);
+    gateway.store.set(ref.cid, tampered);
+    await expect(store.fetchBytes(ref)).rejects.toThrow(/CID_REF_SIZE_MISMATCH/);
     gateway.cleanup();
   });
 });

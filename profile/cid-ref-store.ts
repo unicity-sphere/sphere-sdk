@@ -60,14 +60,49 @@ export const FETCH_SIZE_TOLERANCE_BYTES = 128;
 export interface CidRef {
   /** Schema version — must equal CID_REF_SCHEMA_VERSION. */
   readonly v: typeof CID_REF_SCHEMA_VERSION;
-  /** IPFS CID of the encrypted content. sha2-256 multihash expected. */
+  /** IPFS CID of the pinned content. sha2-256 multihash expected. */
   readonly cid: string;
-  /** Size in bytes of the encrypted blob pinned to IPFS. Used for telemetry + size-budget checks. */
+  /** Size in bytes of the blob pinned to IPFS. Used for telemetry + size-budget checks. */
   readonly size: number;
   /** Wall-clock timestamp (ms since epoch) when this ref was created. */
   readonly ts: number;
   /** Caller-supplied content-version tag for layered schema evolution. */
   readonly contentV?: number;
+  /**
+   * When false, the pinned bytes are plaintext (unencrypted). When absent
+   * or true, the pinned bytes are AES-GCM ciphertext using the wallet's
+   * encryption key — the default, matches every pre-existing CidRef.
+   *
+   * Rationale for the plaintext mode: for content whose transit privacy
+   * is already bounded by another layer (e.g., NIP-29 group-chat messages
+   * flow through a relay as plaintext — see PROFILE-CID-REFERENCES.md §8.5
+   * and the module-level discussion in GroupChatModule), encryption per
+   * wallet defeats IPFS content-addressed dedup without adding any
+   * realistic privacy. Setting `enc: false` makes the CID a global
+   * dedup key across all wallets that store the same content.
+   *
+   * The field is self-describing — fetch decrypts iff `enc !== false`,
+   * so a caller that switches modes between write and read can't
+   * silently corrupt.
+   */
+  readonly enc?: boolean;
+}
+
+/**
+ * Options bag for pin operations. Supersedes the prior
+ * `pinBytes(bytes, contentV?)` positional signature (no in-tree caller
+ * passed contentV positionally as of commit 5cdeae6).
+ */
+export interface PinOptions {
+  /** Caller-supplied content-version tag for schema evolution. */
+  readonly contentV?: number;
+  /**
+   * Default true (AES-GCM encrypt before pinning). Set false to pin
+   * plaintext bytes — enables IPFS content-dedup across wallets. ONLY
+   * use for content whose transit privacy is already public (e.g.,
+   * NIP-29 group-chat messages). See the `CidRef.enc` doc for rationale.
+   */
+  readonly encrypted?: boolean;
 }
 
 // ── Config / deps ─────────────────────────────────────────────────────────
@@ -135,22 +170,34 @@ export class CidRefStore {
   // ── Pin primitives ──────────────────────────────────────────────────────
 
   /**
-   * Encrypt `plaintextBytes` with the wallet key, pin to IPFS, return a
-   * CidRef. The CID is content-addressed over the ciphertext — the
-   * plaintext never leaves the wallet.
+   * Pin `plaintextBytes` to IPFS. By default the bytes are AES-GCM
+   * encrypted first — the CID is content-addressed over the ciphertext
+   * and the plaintext never leaves the wallet.
+   *
+   * Pass `{ encrypted: false }` to pin the plaintext directly. The CID
+   * then becomes a global dedup key across wallets. Use ONLY for content
+   * whose transit privacy is already public (see `CidRef.enc`).
    */
-  async pinBytes(plaintextBytes: Uint8Array, contentV?: number): Promise<CidRef> {
-    const encrypted = await encryptProfileValue(this.#encryptionKey, plaintextBytes);
-    const cid = await pinToIpfs([...this.#gateways], encrypted, this.#pinTimeoutMs);
+  async pinBytes(plaintextBytes: Uint8Array, opts?: PinOptions): Promise<CidRef> {
+    const encryptedMode = opts?.encrypted ?? true;
+    const bytesToPin = encryptedMode
+      ? await encryptProfileValue(this.#encryptionKey, plaintextBytes)
+      : plaintextBytes;
+    const cid = await pinToIpfs([...this.#gateways], bytesToPin, this.#pinTimeoutMs);
     const ref: CidRef = {
       v: CID_REF_SCHEMA_VERSION,
       cid,
-      size: encrypted.byteLength,
+      size: bytesToPin.byteLength,
       ts: Date.now(),
-      ...(contentV !== undefined ? { contentV } : {}),
+      ...(opts?.contentV !== undefined ? { contentV: opts.contentV } : {}),
+      // Only serialize `enc` when it's NON-default (false). Keeps every
+      // pre-existing ref envelope byte-identical — the flag's absence
+      // means "encrypted" per backward-compat rule.
+      ...(!encryptedMode ? { enc: false as const } : {}),
     };
     this.#log?.(
-      `CidRefStore.pinBytes: pinned ${encrypted.byteLength} bytes to ${cid} (plaintext ${plaintextBytes.byteLength} bytes)`,
+      `CidRefStore.pinBytes: pinned ${bytesToPin.byteLength} bytes to ${cid} ` +
+        `(plaintext ${plaintextBytes.byteLength} bytes, encrypted=${encryptedMode})`,
     );
     return ref;
   }
@@ -159,8 +206,11 @@ export class CidRefStore {
    * Convenience: JSON-stringify + UTF-8 encode + pin. Wraps the synchronous
    * JSON.stringify throw path (circular refs, BigInt) so callers see a
    * typed ProfileError at the async boundary.
+   *
+   * Options are forwarded to `pinBytes` — pass `{ encrypted: false }` for
+   * plaintext pins (see CidRef.enc).
    */
-  async pinJson(value: unknown, contentV?: number): Promise<CidRef> {
+  async pinJson(value: unknown, opts?: PinOptions): Promise<CidRef> {
     let json: string;
     try {
       json = JSON.stringify(value);
@@ -179,7 +229,7 @@ export class CidRefStore {
       );
     }
     const bytes = new TextEncoder().encode(json);
-    return this.pinBytes(bytes, contentV);
+    return this.pinBytes(bytes, opts);
   }
 
   // ── Fetch primitives ────────────────────────────────────────────────────
@@ -212,9 +262,9 @@ export class CidRefStore {
     // If fetchFromIpfs's internal cap aborts because content exceeds our
     // per-ref cap, translate the error code to CID_REF_SIZE_MISMATCH so
     // callers see the authentic semantic (not generic "bundle not found").
-    let encrypted: Uint8Array;
+    let fetched: Uint8Array;
     try {
-      encrypted = await fetchFromIpfs(
+      fetched = await fetchFromIpfs(
         [...this.#gateways],
         ref.cid,
         this.#fetchTimeoutMs,
@@ -242,19 +292,30 @@ export class CidRefStore {
     // size within our tolerance. A mismatch means either replication
     // corruption or a poisoned ref (content equal to or smaller than cap
     // but deliberately not matching ref.size). Fail BEFORE decrypt.
-    const sizeDelta = Math.abs(encrypted.byteLength - ref.size);
+    const sizeDelta = Math.abs(fetched.byteLength - ref.size);
     if (sizeDelta > FETCH_SIZE_TOLERANCE_BYTES) {
       throw new ProfileError(
         'CID_REF_SIZE_MISMATCH',
-        `CidRef declared size ${ref.size} but fetched ${encrypted.byteLength} bytes ` +
+        `CidRef declared size ${ref.size} but fetched ${fetched.byteLength} bytes ` +
           `(delta ${sizeDelta} > tolerance ${FETCH_SIZE_TOLERANCE_BYTES}). ` +
           `Possible replication corruption or poisoned ref at cid=${ref.cid}.`,
       );
     }
 
-    const plaintext = await decryptProfileValue(this.#encryptionKey, encrypted);
+    // Self-describing encryption: `ref.enc === false` means the pinned
+    // content is plaintext; absent or true → AES-GCM ciphertext. Backward
+    // compat: all pre-#98b refs have no `enc` field and are encrypted.
+    const isEncrypted = ref.enc !== false;
+    if (!isEncrypted) {
+      this.#log?.(
+        `CidRefStore.fetchBytes: fetched ${fetched.byteLength} plaintext bytes from ${ref.cid} (enc=false)`,
+      );
+      return fetched;
+    }
+
+    const plaintext = await decryptProfileValue(this.#encryptionKey, fetched);
     this.#log?.(
-      `CidRefStore.fetchBytes: fetched ${encrypted.byteLength} bytes from ${ref.cid} (plaintext ${plaintext.byteLength} bytes)`,
+      `CidRefStore.fetchBytes: fetched ${fetched.byteLength} bytes from ${ref.cid} (plaintext ${plaintext.byteLength} bytes)`,
     );
     return plaintext;
   }
@@ -323,12 +384,18 @@ export class CidRefStore {
     if (r.contentV !== undefined && (typeof r.contentV !== 'number' || !Number.isFinite(r.contentV))) {
       return null;
     }
+    // `enc` is optional; when present must be a boolean. Any other shape
+    // is either corruption or a legacy collision — fail-closed.
+    if (r.enc !== undefined && typeof r.enc !== 'boolean') {
+      return null;
+    }
     return {
       v: CID_REF_SCHEMA_VERSION,
       cid: r.cid,
       size: r.size,
       ts: r.ts,
       ...(r.contentV !== undefined ? { contentV: r.contentV } : {}),
+      ...(r.enc !== undefined ? { enc: r.enc } : {}),
     };
   }
 }
