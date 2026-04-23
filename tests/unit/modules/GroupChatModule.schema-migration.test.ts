@@ -75,7 +75,10 @@ function createMockStorage(): StorageProvider & { _data: Map<string, string> } {
     set: vi.fn().mockImplementation((key: string, value: string) => { store.set(key, value); return Promise.resolve(); }),
     remove: vi.fn().mockImplementation((key: string) => { store.delete(key); return Promise.resolve(); }),
     has: vi.fn().mockImplementation((key: string) => Promise.resolve(store.has(key))),
-    keys: vi.fn().mockResolvedValue([]),
+    keys: vi.fn().mockImplementation((prefix?: string) => {
+      const all = Array.from(store.keys());
+      return Promise.resolve(prefix == null ? all : all.filter((k) => k.startsWith(prefix)));
+    }),
     clear: vi.fn().mockResolvedValue(undefined),
     saveTrackedAddresses: vi.fn().mockResolvedValue(undefined),
     loadTrackedAddresses: vi.fn().mockResolvedValue([]),
@@ -295,5 +298,93 @@ describe('GroupChatModule — per-groupId schema migration', () => {
     const messagesMap = (mod as any).messages as Map<string, GroupMessageData[]>;
     expect(messagesMap.has('g1')).toBe(false); // corrupt → skipped
     expect(messagesMap.get('g2')).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Steelman fixes — critical + warnings
+  // ---------------------------------------------------------------------------
+
+  it('regression: partial migration across groups completes on next load (critical fix)', async () => {
+    // Scenario: a prior migration wrote per-group messages for g1 but
+    // crashed before g2/g3. Legacy blob was never removed. On the next
+    // load, g2 and g3 must still migrate — pre-fix, the presence of g1's
+    // per-group key caused the whole legacy migration to be skipped.
+    const groups = [makeGroup('g1'), makeGroup('g2'), makeGroup('g3')];
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(groups));
+    // g1 already migrated to per-group (fresher data — per-group wins).
+    storage._data.set(
+      MESSAGES_PREFIX + 'g1',
+      JSON.stringify([makeMessage('m1_new', 'g1', 5000)]),
+    );
+    // Legacy still present with g1 (stale) + g2 + g3.
+    const legacy: GroupMessageData[] = [
+      makeMessage('m1_stale', 'g1', 1000), // superseded by per-group
+      makeMessage('m2', 'g2', 2000),
+      makeMessage('m3a', 'g3', 3000),
+      makeMessage('m3b', 'g3', 3500),     // multiple messages per group — must all migrate
+    ];
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES, JSON.stringify(legacy));
+
+    await mod.load();
+
+    const messagesMap = (mod as any).messages as Map<string, GroupMessageData[]>;
+    // Per-group data for g1 preserved (newer — "per-group wins" policy).
+    expect(messagesMap.get('g1')?.map((m) => m.id)).toEqual(['m1_new']);
+    // g2 migrated from legacy.
+    expect(messagesMap.get('g2')?.map((m) => m.id)).toEqual(['m2']);
+    // g3 migrated from legacy — BOTH messages, not just the first
+    // (guards the perGroupCovered snapshot fix).
+    expect(messagesMap.get('g3')?.map((m) => m.id).sort()).toEqual(['m3a', 'm3b']);
+    // Per-group keys written for the migrated groups.
+    expect(storage._data.has(MESSAGES_PREFIX + 'g2')).toBe(true);
+    expect(storage._data.has(MESSAGES_PREFIX + 'g3')).toBe(true);
+    // Legacy blob removed after successful migration.
+    expect(storage._data.has(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES)).toBe(false);
+  });
+
+  it('pre-existing orphan cleanup: persist removes keys for groups not in current membership', async () => {
+    // Simulate: prior session wrote per-group keys for g1/g2/g3. Current
+    // session only knows about g1/g2 (user left g3 while offline, groups
+    // blob updated on the relay). On first persist, the stale g3 key
+    // should be removed — pre-fix, only keys written IN this session were
+    // tracked for cleanup, so g3 would orphan indefinitely.
+    const groups = [makeGroup('g1'), makeGroup('g2')];
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(groups));
+    storage._data.set(MESSAGES_PREFIX + 'g1', JSON.stringify([makeMessage('m1', 'g1')]));
+    storage._data.set(MESSAGES_PREFIX + 'g2', JSON.stringify([makeMessage('m2', 'g2')]));
+    // Orphan from a prior session — g3 no longer in this.groups.
+    storage._data.set(MESSAGES_PREFIX + 'g3', JSON.stringify([makeMessage('m3', 'g3')]));
+
+    await mod.load();
+    // Trigger a persist — any mutation path would do; here we call directly.
+    await (mod as any).persistMessages();
+
+    expect(storage._data.has(MESSAGES_PREFIX + 'g1')).toBe(true);
+    expect(storage._data.has(MESSAGES_PREFIX + 'g2')).toBe(true);
+    // Pre-fix: g3 stayed. Post-fix: cleaned up because `keys()`-seeded
+    // tracking observed it.
+    expect(storage._data.has(MESSAGES_PREFIX + 'g3')).toBe(false);
+  });
+
+  it('non-array legacy data: leaves legacy blob in place, no migration', async () => {
+    // Parses cleanly but is an object, not an array — e.g., schema drift
+    // or mixed-up file. Pre-fix, the for-of loop would have produced
+    // `undefined` groupIds and polluted storage with `group_chat_messages:undefined`.
+    // Post-fix, the Array.isArray guard bails out early.
+    const groups = [makeGroup('g1')];
+    storage._data.set(STORAGE_KEYS_ADDRESS.GROUP_CHAT_GROUPS, JSON.stringify(groups));
+    storage._data.set(
+      STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES,
+      JSON.stringify({ notAnArray: true }),
+    );
+
+    await mod.load();
+
+    const messagesMap = (mod as any).messages as Map<string, GroupMessageData[]>;
+    expect(messagesMap.size).toBe(0);
+    // Legacy left in place (forensic preservation).
+    expect(storage._data.has(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES)).toBe(true);
+    // No `group_chat_messages:undefined` garbage key.
+    expect(storage._data.has(MESSAGES_PREFIX + 'undefined')).toBe(false);
   });
 });

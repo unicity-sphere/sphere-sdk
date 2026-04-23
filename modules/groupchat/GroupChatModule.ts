@@ -194,84 +194,168 @@ export class GroupChatModule {
       }
     }
 
-    // Load messages — per-group keys take precedence over the legacy
-    // all-in-one blob. See GROUP_CHAT_MESSAGES_PREFIX for the migration
-    // rationale (PROFILE-CID-REFERENCES.md §8.5).
+    // Load messages — dual-read per PROFILE-CID-REFERENCES.md §8.5.
     //
-    // Read strategy:
-    //   1. For each known group, try the per-group key.
-    //   2. If nothing was found across any group, fall back to the legacy
-    //      blob and migrate it forward (persist per-group + delete legacy).
-    //   3. Tracks what was loaded from storage so later persist() calls
-    //      know which stale per-group keys to remove on group-leave.
-    let messagesPerGroupFound = false;
+    // Strategy (post-steelman): ALWAYS consult the legacy blob when present.
+    // Per-group data wins on collision (it represents the most recent
+    // migration state), legacy fills in groups that weren't migrated yet.
+    // This closes the partial-migration data-loss bug: if a prior migration
+    // attempt wrote per-group keys for some groups but crashed before
+    // others, the remaining groups still migrate on the next load rather
+    // than being silently skipped because "some per-group keys exist."
+    //
+    // Orphan-cleanup tracking is seeded from `storage.keys(prefix)` so that
+    // stale per-group keys left over from prior sessions (e.g., groups the
+    // wallet has since left) are detected on the next persist and removed.
+    const existingMessageKeys = await storage.keys(GROUP_CHAT_MESSAGES_PREFIX);
+    for (const key of existingMessageKeys) {
+      this._lastWrittenMessageGroupIds.add(key.slice(GROUP_CHAT_MESSAGES_PREFIX.length));
+    }
     for (const groupId of this.groups.keys()) {
       const json = await storage.get(GROUP_CHAT_MESSAGES_PREFIX + groupId);
       if (!json) continue;
-      messagesPerGroupFound = true;
-      this._lastWrittenMessageGroupIds.add(groupId);
       try {
-        const parsed: GroupMessageData[] = JSON.parse(json);
-        this.messages.set(groupId, parsed);
-      } catch {
-        // Corrupted per-group entry — skip; the group's messages will
-        // rehydrate from the relay on next subscription.
+        const parsed = JSON.parse(json);
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES] per-group blob for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+          );
+          continue;
+        }
+        this.messages.set(groupId, parsed as GroupMessageData[]);
+      } catch (err) {
+        // Corrupted per-group entry — skip; rehydrates from relay.
+        logger.error(
+          'GroupChat',
+          `[GROUP_MESSAGES] per-group blob for ${groupId} JSON parse failed; skipping.`,
+          err,
+        );
       }
     }
-    if (!messagesPerGroupFound) {
-      const legacyJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
-      if (legacyJson) {
-        try {
-          const parsed: GroupMessageData[] = JSON.parse(legacyJson);
-          for (const m of parsed) {
-            const groupId = m.groupId;
-            if (!this.messages.has(groupId)) {
-              this.messages.set(groupId, []);
-            }
-            this.messages.get(groupId)!.push(m);
+    const legacyMessagesJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
+    if (legacyMessagesJson) {
+      try {
+        const parsed = JSON.parse(legacyMessagesJson);
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MESSAGES_LEGACY] data is not an array (got ${typeof parsed}); leaving legacy blob in place.`,
+          );
+        } else {
+          // Snapshot the set of groups ALREADY covered by per-group reads
+          // BEFORE we start mutating this.messages. If we used
+          // `this.messages.has(groupId)` inside the loop, the first legacy
+          // message for g2 would populate the key, and every subsequent
+          // legacy message for g2 would be wrongly skipped.
+          const perGroupCovered = new Set(this.messages.keys());
+          let newlyAddedCount = 0;
+          for (const m of parsed as GroupMessageData[]) {
+            const groupId = m?.groupId;
+            if (!groupId) continue;
+            // Filter: only migrate for groups the wallet is currently in.
+            // Orphans (groups the user has left) are dropped — they
+            // wouldn't surface in the UI anyway and migrating them would
+            // pollute per-group keys forever.
+            if (!this.groups.has(groupId)) continue;
+            // Per-group wins on collision — only fill in groups with no
+            // per-group data pre-loop.
+            if (perGroupCovered.has(groupId)) continue;
+            const bucket = this.messages.get(groupId) ?? [];
+            if (bucket.length === 0) this.messages.set(groupId, bucket);
+            bucket.push(m);
+            newlyAddedCount++;
           }
-          // Migrate forward: write per-group keys + drop the legacy blob.
-          await this.persistMessages();
+          if (newlyAddedCount > 0) {
+            // Write per-group keys for the groups we just filled in.
+            await this.persistMessages();
+            logger.debug(
+              'GroupChat',
+              `Migrated ${newlyAddedCount} legacy messages into per-group keys`,
+            );
+          }
+          // Remove legacy only after a successful migration pass (or a
+          // no-op pass if all groups were already covered). If a prior
+          // partial migration left the legacy blob in place, this call
+          // is idempotent.
           await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MESSAGES);
-          logger.debug('GroupChat', `Migrated ${parsed.length} messages across ${this.messages.size} group(s) to per-group keys`);
-        } catch {
-          // Corrupted legacy data — leave it in place, start fresh.
         }
+      } catch (err) {
+        // Corrupted legacy blob — leave in place for forensic preservation
+        // and to avoid inadvertent data loss on transient parse failures.
+        logger.error(
+          'GroupChat',
+          '[GROUP_MESSAGES_LEGACY] JSON parse failed; leaving legacy blob in place.',
+          err,
+        );
       }
     }
 
-    // Load members — same dual-read pattern.
-    let membersPerGroupFound = false;
+    // Load members — same dual-read pattern as messages.
+    const existingMemberKeys = await storage.keys(GROUP_CHAT_MEMBERS_PREFIX);
+    for (const key of existingMemberKeys) {
+      this._lastWrittenMemberGroupIds.add(key.slice(GROUP_CHAT_MEMBERS_PREFIX.length));
+    }
     for (const groupId of this.groups.keys()) {
       const json = await storage.get(GROUP_CHAT_MEMBERS_PREFIX + groupId);
       if (!json) continue;
-      membersPerGroupFound = true;
-      this._lastWrittenMemberGroupIds.add(groupId);
       try {
-        const parsed: GroupMemberData[] = JSON.parse(json);
-        this.members.set(groupId, parsed);
-      } catch {
-        // Corrupted per-group entry — skip; rehydrates from relay.
+        const parsed = JSON.parse(json);
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MEMBERS] per-group blob for ${groupId} is not an array (got ${typeof parsed}); skipping.`,
+          );
+          continue;
+        }
+        this.members.set(groupId, parsed as GroupMemberData[]);
+      } catch (err) {
+        logger.error(
+          'GroupChat',
+          `[GROUP_MEMBERS] per-group blob for ${groupId} JSON parse failed; skipping.`,
+          err,
+        );
       }
     }
-    if (!membersPerGroupFound) {
-      const legacyJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
-      if (legacyJson) {
-        try {
-          const parsed: GroupMemberData[] = JSON.parse(legacyJson);
-          for (const m of parsed) {
-            const groupId = m.groupId;
-            if (!this.members.has(groupId)) {
-              this.members.set(groupId, []);
-            }
-            this.members.get(groupId)!.push(m);
+    const legacyMembersJson = await storage.get(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
+    if (legacyMembersJson) {
+      try {
+        const parsed = JSON.parse(legacyMembersJson);
+        if (!Array.isArray(parsed)) {
+          logger.error(
+            'GroupChat',
+            `[GROUP_MEMBERS_LEGACY] data is not an array (got ${typeof parsed}); leaving legacy blob in place.`,
+          );
+        } else {
+          // Snapshot of groups already covered — see messages path for
+          // rationale.
+          const perGroupCovered = new Set(this.members.keys());
+          let newlyAddedCount = 0;
+          for (const m of parsed as GroupMemberData[]) {
+            const groupId = m?.groupId;
+            if (!groupId) continue;
+            if (!this.groups.has(groupId)) continue;
+            if (perGroupCovered.has(groupId)) continue;
+            const bucket = this.members.get(groupId) ?? [];
+            if (bucket.length === 0) this.members.set(groupId, bucket);
+            bucket.push(m);
+            newlyAddedCount++;
           }
-          await this.persistMembers();
+          if (newlyAddedCount > 0) {
+            await this.persistMembers();
+            logger.debug(
+              'GroupChat',
+              `Migrated ${newlyAddedCount} legacy members into per-group keys`,
+            );
+          }
           await storage.remove(STORAGE_KEYS_ADDRESS.GROUP_CHAT_MEMBERS);
-          logger.debug('GroupChat', `Migrated ${parsed.length} members across ${this.members.size} group(s) to per-group keys`);
-        } catch {
-          // Corrupted legacy data — leave in place.
         }
+      } catch (err) {
+        logger.error(
+          'GroupChat',
+          '[GROUP_MEMBERS_LEGACY] JSON parse failed; leaving legacy blob in place.',
+          err,
+        );
       }
     }
 
