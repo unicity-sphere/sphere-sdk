@@ -29,6 +29,11 @@ import {
   type OpLogEntryEnvelope,
 } from './oplog-entry';
 import type { OpLogEntryType } from './aggregator-pointer/originated-tag';
+import type { ProfilePointerLayer } from './aggregator-pointer';
+import {
+  buildProfilePointerLayer,
+  type PointerWiringSkipReason,
+} from './pointer-wiring';
 import { logger } from '../core/logger';
 
 // =============================================================================
@@ -420,6 +425,20 @@ export class ProfileStorageProvider implements StorageProvider {
    * is being torn down, and subsequent writes would hit a closing OrbitDB.
    */
   private disconnectPromise: Promise<void> | null = null;
+  /**
+   * Aggregator pointer layer (Phase D). Constructed lazily after Phase B
+   * OrbitDB attach when an OracleProvider is configured AND all
+   * preconditions are met (see profile/pointer-wiring.ts). Null when the
+   * preconditions are not met — the caller falls back to the legacy
+   * recovery path until T-D6 removes it.
+   */
+  private pointerLayer: ProfilePointerLayer | null = null;
+  /**
+   * Reason pointer construction was skipped (or null when successful /
+   * not yet attempted). Surfaced via getPointerSkipReason() for
+   * diagnostics and test assertions.
+   */
+  private pointerSkipReason: PointerWiringSkipReason | null = null;
 
   /**
    * Derived: true iff OrbitDB has been attached.
@@ -557,6 +576,88 @@ export class ProfileStorageProvider implements StorageProvider {
         );
       }
     }
+
+    // Phase C — pointer-layer construction (Phase D wiring per
+    // PROFILE-AGGREGATOR-POINTER-INTEGRATION-MAP.md §3.2). Fail-open:
+    // any missing precondition (no oracle, no aggregator client, no
+    // trust base, storage not durable, etc.) is logged as a skip
+    // reason and the provider continues without a pointer layer.
+    // Only attempted once per attach cycle and only when the
+    // OrbitDB attach succeeded above.
+    if (
+      this.dbStatus === 'attached' &&
+      this.pointerLayer === null &&
+      this.pointerSkipReason === null &&
+      identityAtStart !== null
+    ) {
+      await this.tryBuildPointerLayer(identityAtStart);
+    }
+  }
+
+  /**
+   * Attempt to construct the pointer layer. Never throws — sets
+   * `pointerLayer` on success, `pointerSkipReason` otherwise. Runs
+   * at most once per attach cycle (reset on disconnect()).
+   */
+  private async tryBuildPointerLayer(identity: FullIdentity): Promise<void> {
+    const oracle = this.options?.oracle;
+    if (!oracle) {
+      // Oracle is optional during rollout — no warning, no skip
+      // reason set (nothing to report: the caller opted out).
+      return;
+    }
+
+    const gateways = this.options?.config?.ipfsGateways ?? [];
+    const orbitDbDir = this.options?.config?.orbitDb?.directory;
+    // Node-only lock path: peer lock-file with the OrbitDB data dir
+    // so ownership/permissions align with the rest of the wallet
+    // state on disk.
+    const lockFilePath = orbitDbDir
+      ? `${orbitDbDir.replace(/\/+$/, '')}/profile-pointer-publish.lock`
+      : undefined;
+
+    const result = await buildProfilePointerLayer({
+      identity,
+      localCache: this.localCache,
+      db: this.db,
+      oracle,
+      ipfsGateways: gateways,
+      lockFilePath,
+      debug: this.debug,
+    });
+
+    if (result.ok) {
+      this.pointerLayer = result.layer;
+      this.pointerSkipReason = null;
+      this.log('Pointer layer constructed');
+    } else {
+      this.pointerLayer = null;
+      this.pointerSkipReason = result.reason;
+      logger.warn(
+        'ProfileStorage',
+        `pointer layer skipped: ${result.reason}${result.detail ? ` — ${result.detail}` : ''}`,
+      );
+    }
+  }
+
+  /**
+   * Accessor for the constructed pointer layer. Returns null when the
+   * layer could not be built (see `getPointerSkipReason()` for why).
+   * Downstream call sites (T-D6 recovery/publish wiring) use this to
+   * decide whether to go through the pointer layer or fall back to
+   * the legacy path.
+   */
+  getPointerLayer(): ProfilePointerLayer | null {
+    return this.pointerLayer;
+  }
+
+  /**
+   * Returns the reason pointer-layer construction was skipped on the
+   * last attach attempt, or null when construction succeeded or was
+   * not yet attempted (no oracle configured).
+   */
+  getPointerSkipReason(): PointerWiringSkipReason | null {
+    return this.pointerSkipReason;
   }
 
   async disconnect(): Promise<void> {
@@ -599,6 +700,11 @@ export class ProfileStorageProvider implements StorageProvider {
       // Reset capability cache so a re-connect re-probes (adapter could
       // have been swapped between disconnect/connect cycles, e.g. in tests).
       this._envelopesSupported = null;
+      // Reset pointer-layer state so the next connect() re-probes — an
+      // oracle or durability marker may be wired in only on the second
+      // connect cycle.
+      this.pointerLayer = null;
+      this.pointerSkipReason = null;
     }
 
     // 2. Close local cache

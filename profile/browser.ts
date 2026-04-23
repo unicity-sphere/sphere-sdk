@@ -32,6 +32,7 @@
 import type { ProfileConfig } from './types';
 import type { ProfileStorageProvider } from './profile-storage-provider';
 import type { ProfileTokenStorageProvider } from './profile-token-storage-provider';
+import type { OracleProvider } from '../oracle';
 import { createProfileProviders } from './factory';
 import { createIndexedDBStorageProvider } from '../impl/browser/storage/IndexedDBStorageProvider';
 import { getNetworkConfig } from '../impl/shared';
@@ -46,6 +47,13 @@ export interface BrowserProfileProvidersConfig {
   readonly network: NetworkType;
   /** Profile-specific configuration overrides */
   readonly profileConfig?: Partial<ProfileConfig>;
+  /**
+   * Oracle provider for the aggregator pointer layer. Pass the same
+   * `oracle` instance that will be handed to `Sphere.init` / L4 so the
+   * embedded `RootTrustBase` is shared (SPEC §8.4.2 H6). Optional during
+   * rollout; required once pointer-layer recovery replaces IPNS (T-D6).
+   */
+  readonly oracle?: OracleProvider;
 }
 
 /**
@@ -97,7 +105,11 @@ export function createBrowserProfileProviders(
     debug: config.profileConfig?.debug,
   };
 
-  const { storage, tokenStorage } = createProfileProviders(profileConfig, localCache);
+  const { storage, tokenStorage } = createProfileProviders(
+    profileConfig,
+    localCache,
+    config.oracle,
+  );
 
   return { storage, tokenStorage };
 }

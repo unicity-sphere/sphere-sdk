@@ -13,6 +13,7 @@
  */
 
 import type { StorageProvider } from '../storage/storage-provider';
+import type { OracleProvider } from '../oracle';
 import type { ProfileConfig, ProfileTokenStorageProviderOptions } from './types';
 import { OrbitDbAdapter } from './orbitdb-adapter';
 import { ProfileStorageProvider } from './profile-storage-provider';
@@ -43,11 +44,16 @@ export interface ProfileProviders {
  *
  * @param config - Profile configuration (OrbitDB settings, encryption, gateways)
  * @param cacheStorage - Local cache provider (IndexedDB or file-based)
+ * @param oracle - Oracle provider used by the aggregator pointer layer (optional
+ *   during rollout; required once T-D6 replaces IPNS recovery). Must be the
+ *   same instance passed to L4 / `PaymentsModule` so the embedded
+ *   `RootTrustBase` is shared (SPEC §8.4.2 H6).
  * @returns Profile-backed storage and token storage providers
  */
 export function createProfileProviders(
   config: ProfileConfig,
   cacheStorage: StorageProvider,
+  oracle?: OracleProvider,
 ): ProfileProviders {
   // Merge custom bootstrap peers from the convenience alias
   const resolvedConfig: ProfileConfig = config.profileOrbitDbPeers
@@ -70,6 +76,7 @@ export function createProfileProviders(
   const storage = new ProfileStorageProvider(cacheStorage, db, {
     config: resolvedConfig,
     encrypt: resolvedConfig.encrypt !== false,
+    oracle,
     debug: resolvedConfig.debug,
   });
 
@@ -86,6 +93,12 @@ export function createProfileProviders(
     addressId: 'default',
     encrypt: resolvedConfig.encrypt !== false,
     flushDebounceMs: resolvedConfig.flushDebounceMs,
+    oracle,
+    // Lazy accessor: the pointer layer is built inside
+    // `storage.doConnect()` after OrbitDB attach, long after the
+    // token-storage constructor runs. A closure defers the read
+    // until it is actually needed (inside initialize() / flushToIpfs).
+    getPointerLayer: () => storage.getPointerLayer(),
     debug: resolvedConfig.debug,
   };
 

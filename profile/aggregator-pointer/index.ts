@@ -54,10 +54,12 @@ export type { OriginTag, OpLogEntryType, UserActionType, SystemActionType } from
 // Phase C — external integrations
 export { submitPointer } from './aggregator-submit.js';
 export type { SubmitInput, SubmitOutcome } from './aggregator-submit.js';
-export { probeVersion, classifyVersion, isReachable } from './aggregator-probe.js';
+export { probeVersion, classifyVersion, decodeVersionCid, isReachable } from './aggregator-probe.js';
 export type {
   ProbeInput,
   ClassifyInput,
+  DecodeVersionCidInput,
+  DecodeVersionCidResult,
   ReachableInput,
   VersionClassification,
   CarFetchResult,

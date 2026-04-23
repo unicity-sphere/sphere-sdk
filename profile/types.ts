@@ -8,6 +8,9 @@
  * (PROFILE_KEY_MAPPING, CACHE_ONLY_KEYS, IPFS_STATE_KEYS_PATTERN).
  */
 
+import type { OracleProvider } from '../oracle';
+import type { ProfilePointerLayer } from './aggregator-pointer';
+
 // =============================================================================
 // OrbitDB Configuration
 // =============================================================================
@@ -200,6 +203,13 @@ export interface ProfileStorageProviderOptions {
   readonly encrypt?: boolean;
   /** Encryption configuration overrides */
   readonly encryptionConfig?: Partial<ProfileEncryptionConfig>;
+  /**
+   * Oracle provider used by the aggregator pointer layer (Phase D wiring).
+   * The pointer layer consumes `getAggregatorClient()` and `getRootTrustBase()`
+   * from this instance — the same oracle passed to L4 / `PaymentsModule` so
+   * the embedded `RootTrustBase` is shared (SPEC §8.4.2 H6).
+   */
+  readonly oracle?: OracleProvider;
   /** Enable debug logging */
   readonly debug?: boolean;
 }
@@ -220,6 +230,24 @@ export interface ProfileTokenStorageProviderOptions {
   readonly encryptionConfig?: Partial<ProfileEncryptionConfig>;
   /** Write-behind debounce window in ms (default: 2000) */
   readonly flushDebounceMs?: number;
+  /**
+   * Oracle provider used by the aggregator pointer layer (Phase D wiring).
+   * Forwarded from the Profile factory. See ProfileStorageProviderOptions.
+   */
+  readonly oracle?: OracleProvider;
+  /**
+   * Lazy accessor for the aggregator pointer layer owned by the
+   * companion `ProfileStorageProvider`. The pointer layer is
+   * constructed asynchronously after Phase B OrbitDB attach, so at
+   * factory-time it does not exist yet — callers pass a closure that
+   * reads `storage.getPointerLayer()` on demand. Returns `null` when
+   * the pointer is unavailable (no oracle, BLOCKED state, storage not
+   * durable, etc.); consumers fall back to the legacy IPNS path.
+   *
+   * Optional during rollout. When absent, token storage runs in the
+   * pre-pointer mode (IPNS-only cold-start recovery).
+   */
+  readonly getPointerLayer?: () => ProfilePointerLayer | null;
   /** Enable debug logging */
   readonly debug?: boolean;
 }

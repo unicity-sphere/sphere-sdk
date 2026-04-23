@@ -32,7 +32,6 @@ import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/trans
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
 
 import { PROBE_REQUEST_TIMEOUT_MS } from './constants.js';
-import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 import { deriveHealthCheckRequestId } from './health-check.js';
 import { deriveStateHashDigest, deriveXorKey, type PointerKeyMaterial } from './key-derivation.js';
 import type { PointerSigner } from './signing.js';
@@ -200,17 +199,37 @@ export interface ClassifyInput {
 }
 
 /**
- * Three-way classify per SPEC §8.2 classifyVersion helper:
- *   VALID                 — both sides verified + CID parseable + CAR fetched
- *   SEMANTICALLY_INVALID  — proof partial, CID corrupt, or CAR fails content-address
- *   TRANSIENT_UNAVAILABLE — all IPFS gateways transient-fail; tokens may still exist
+ * Shared Phase 1+2 primitive: fetch inclusion proofs + XOR-decode the
+ * 64-byte plaintext + delegate CID parsing. Consumed by both
+ * `classifyVersion` (which then does Phase 3 CAR verify) and
+ * `decodeVersionCid` (used by the Phase-D `resolveRemoteCid` callback
+ * after discovery has already classified the version).
  *
- * classifyVersion requires BOTH sides included (stricter than probe's OR).
+ * Emits one of three outcomes:
+ *   - `{ ok: 'cid', cidBytes }` — proofs verified, CID decoded
+ *   - `{ ok: 'transient' }`     — proof fetch failed (network-class)
+ *   - `{ ok: 'semantic' }`      — partial inclusion, malformed CT, or
+ *                                 CID decoder rejected the plaintext
+ *
+ * Trust-base rotation / forgery (`NOT_AUTHENTICATED`, `PATH_INVALID`)
+ * short-circuits to `raiseForTrustBaseMismatch` and throws — the
+ * caller always sees either one of the three outcomes or a thrown
+ * `AggregatorPointerError`.
  */
-export async function classifyVersion(input: ClassifyInput): Promise<VersionClassification> {
-  const { v, keyMaterial, signer, aggregatorClient, trustBase, decodeCid, fetchCar } = input;
-  const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
+type DecodePhaseOutcome =
+  | { readonly ok: 'cid'; readonly cidBytes: Uint8Array }
+  | { readonly ok: 'transient' }
+  | { readonly ok: 'semantic' };
 
+async function runDecodePhases(
+  v: PointerVersion,
+  keyMaterial: PointerKeyMaterial,
+  signer: PointerSigner,
+  aggregatorClient: AggregatorClient,
+  trustBase: RootTrustBase,
+  decodeCid: CidDecoder,
+  timeoutMs: number,
+): Promise<DecodePhaseOutcome> {
   // Step 1: both inclusion proofs (§8.2 step 1).
   const { reqA, reqB } = await buildRequestIds(keyMaterial, signer, v);
 
@@ -223,7 +242,7 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
     ]);
   } catch {
     // Network failure while fetching proofs — transient, not corrupt.
-    return 'TRANSIENT_UNAVAILABLE';
+    return { ok: 'transient' };
   }
 
   const [statusA, statusB] = await Promise.all([
@@ -245,13 +264,13 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
     raiseForTrustBaseMismatch(trustBase, proofB, `classifyVersion(v=${v}, side=B)`);
   }
 
-  // classifyVersion requires BOTH sides included. A missing side → semantic
-  // invalidity for this version (XOR decode will not yield a full plaintext).
+  // Both sides required for a full XOR decode. A missing side yields
+  // SEMANTICALLY_INVALID (the XOR plaintext would be truncated).
   if (
     statusA !== InclusionProofVerificationStatus.OK ||
     statusB !== InclusionProofVerificationStatus.OK
   ) {
-    return 'SEMANTICALLY_INVALID';
+    return { ok: 'semantic' };
   }
 
   // Step 2: XOR-decode + CID parse (§8.2 step 2).
@@ -262,13 +281,12 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
   const txHashA = proofA.transactionHash;
   const txHashB = proofB.transactionHash;
   if (txHashA === null || txHashB === null) {
-    // No transactionHash in the proof — structurally invalid for our purposes.
-    return 'SEMANTICALLY_INVALID';
+    return { ok: 'semantic' };
   }
   const ctA = txHashA.data;
   const ctB = txHashB.data;
   if (ctA.length !== 32 || ctB.length !== 32) {
-    return 'SEMANTICALLY_INVALID';
+    return { ok: 'semantic' };
   }
 
   const xorKeyA = deriveXorKey(keyMaterial.xorSeed, SIDE_A_NUM, v);
@@ -281,27 +299,101 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
 
     const decoded = decodeCid(full);
     if (!decoded.ok) {
-      return 'SEMANTICALLY_INVALID';
+      return { ok: 'semantic' };
     }
-
-    // Step 3: fetch + content-address verify (§8.2 step 3).
-    const carResult = await fetchCar(decoded.cidBytes);
-    if (carResult.ok) {
-      return 'VALID';
-    }
-    switch (carResult.kind) {
-      case 'transient_unavailable':
-        return 'TRANSIENT_UNAVAILABLE';
-      case 'content_mismatch':
-      case 'car_parse_failed':
-      default:
-        return 'SEMANTICALLY_INVALID';
-    }
+    // Copy out — caller keeps the CID bytes; `full` is zeroed in
+    // `finally`. `decoded.cidBytes` may alias a buffer backed by the
+    // multiformats lib; we clone so the consumer owns a stable slice.
+    return { ok: 'cid', cidBytes: new Uint8Array(decoded.cidBytes) };
   } finally {
     full.fill(0);
     xorKeyA.fill(0);
     xorKeyB.fill(0);
   }
+}
+
+/**
+ * Three-way classify per SPEC §8.2 classifyVersion helper:
+ *   VALID                 — both sides verified + CID parseable + CAR fetched
+ *   SEMANTICALLY_INVALID  — proof partial, CID corrupt, or CAR fails content-address
+ *   TRANSIENT_UNAVAILABLE — all IPFS gateways transient-fail; tokens may still exist
+ *
+ * classifyVersion requires BOTH sides included (stricter than probe's OR).
+ */
+export async function classifyVersion(input: ClassifyInput): Promise<VersionClassification> {
+  const { v, keyMaterial, signer, aggregatorClient, trustBase, decodeCid, fetchCar } = input;
+  const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
+
+  const phase12 = await runDecodePhases(
+    v,
+    keyMaterial,
+    signer,
+    aggregatorClient,
+    trustBase,
+    decodeCid,
+    timeoutMs,
+  );
+  if (phase12.ok === 'transient') return 'TRANSIENT_UNAVAILABLE';
+  if (phase12.ok === 'semantic') return 'SEMANTICALLY_INVALID';
+
+  // Step 3: fetch + content-address verify (§8.2 step 3).
+  const carResult = await fetchCar(phase12.cidBytes);
+  if (carResult.ok) {
+    return 'VALID';
+  }
+  switch (carResult.kind) {
+    case 'transient_unavailable':
+      return 'TRANSIENT_UNAVAILABLE';
+    case 'content_mismatch':
+    case 'car_parse_failed':
+    default:
+      return 'SEMANTICALLY_INVALID';
+  }
+}
+
+// ── decodeVersionCid ───────────────────────────────────────────────────────
+
+/**
+ * Phase 1+2 of classifyVersion, exposed standalone.
+ *
+ * Used by `ProfilePointerLayer.recoverLatest()`'s `resolveRemoteCid`
+ * callback: discovery has already certified the version as VALID
+ * (via an earlier classifyVersion pass), so the caller only needs the
+ * CID bytes without re-running the CAR fetch. Skipping Phase 3 avoids
+ * a second IPFS round-trip on the happy path.
+ *
+ * Semantic and transient failures map 1:1 onto pointer-layer error
+ * codes so the caller can propagate a clear diagnostic.
+ */
+export interface DecodeVersionCidInput {
+  readonly v: PointerVersion;
+  readonly keyMaterial: PointerKeyMaterial;
+  readonly signer: PointerSigner;
+  readonly aggregatorClient: AggregatorClient;
+  readonly trustBase: RootTrustBase;
+  readonly decodeCid: CidDecoder;
+  readonly timeoutMs?: number;
+}
+
+export type DecodeVersionCidResult =
+  | { readonly ok: true; readonly cidBytes: Uint8Array }
+  | { readonly ok: false; readonly reason: 'transient' | 'semantic' };
+
+export async function decodeVersionCid(input: DecodeVersionCidInput): Promise<DecodeVersionCidResult> {
+  const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
+  const outcome = await runDecodePhases(
+    input.v,
+    input.keyMaterial,
+    input.signer,
+    input.aggregatorClient,
+    input.trustBase,
+    input.decodeCid,
+    timeoutMs,
+  );
+  if (outcome.ok === 'cid') {
+    return { ok: true, cidBytes: outcome.cidBytes };
+  }
+  return { ok: false, reason: outcome.ok === 'transient' ? 'transient' : 'semantic' };
 }
 
 // ── isReachable (health check) ─────────────────────────────────────────────
@@ -371,4 +463,5 @@ export async function isReachable(input: ReachableInput): Promise<boolean> {
 export const __internal = {
   buildRequestIds,
   fetchProofWithTimeout,
+  runDecodePhases,
 };
