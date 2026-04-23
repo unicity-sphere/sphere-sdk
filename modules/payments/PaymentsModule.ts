@@ -6244,21 +6244,162 @@ export class PaymentsModule {
     await this.savePendingV5Tokens();
   }
 
+  /**
+   * Memoized plaintext + CID ref for the last outbox pin. See the V5-tokens
+   * equivalent (`_lastPinnedV5Json` / `_lastPinnedV5Ref`) for rationale: AES-GCM
+   * uses random IVs, so re-pinning identical plaintext produces a different
+   * CID; we'd rather write the cached ref than thrash the IPFS gateway.
+   */
+  private _lastPinnedOutboxJson: string | null = null;
+  private _lastPinnedOutboxRef: CidRef | null = null;
+
+  /**
+   * Single-flight chain for outbox mutations. `saveToOutbox` and
+   * `removeFromOutbox` do a load → mutate → write sequence, which races
+   * without serialization: two concurrent `send()` calls (or a `send()`
+   * racing a `finalize()`) can both read the same snapshot and the second
+   * writer silently clobbers the first. Chaining ops through a promise
+   * guarantees ordering. Mirrors `_saveChain` for pendingV5 tokens.
+   *
+   * Caveat: guarantees ORDERING, not atomicity — a failing op doesn't roll
+   * back but also doesn't block the next op (prior failure is isolated
+   * via .catch() so it doesn't propagate).
+   */
+  private _outboxChain: Promise<void> = Promise.resolve();
+
+  private enqueueOutboxOp<T>(op: () => Promise<T>): Promise<T> {
+    const chained = this._outboxChain
+      .catch(() => {
+        /* isolate prior failure — the caller of the failing op already
+           received the rejection; subsequent ops should not be blocked. */
+      })
+      .then(op);
+    // Keep the chain alive across failures so ordering holds for the next op.
+    this._outboxChain = chained.then(
+      () => undefined,
+      () => undefined,
+    );
+    return chained;
+  }
+
   private async saveToOutbox(transfer: TransferResult, recipient: string): Promise<void> {
-    const outbox = await this.loadOutbox();
-    outbox.push({ transfer, recipient, createdAt: Date.now() });
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(outbox));
+    return this.enqueueOutboxOp(async () => {
+      const outbox = await this.loadOutbox();
+      outbox.push({ transfer, recipient, createdAt: Date.now() });
+      await this.writeOutbox(outbox);
+    });
   }
 
   private async removeFromOutbox(transferId: string): Promise<void> {
-    const outbox = await this.loadOutbox();
-    const filtered = outbox.filter((e) => e.transfer.id !== transferId);
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(filtered));
+    return this.enqueueOutboxOp(async () => {
+      const outbox = await this.loadOutbox();
+      const filtered = outbox.filter((e) => e.transfer.id !== transferId);
+      await this.writeOutbox(filtered);
+    });
   }
 
+  /**
+   * Write the outbox list — via CID reference when `cidRefStore` is injected,
+   * inline JSON otherwise. PROFILE-CID-REFERENCES.md §8.2 (Pattern A).
+   *
+   * Outbox entries wrap `TransferResult`, which contains `Token[]` with fat
+   * `sdkData` (5–20 KB/token). Even modest wallets routinely push the inline
+   * blob past 100 KB — hence the migration to an IPFS-pinned envelope that
+   * shows up in the OpLog as a ~150-byte reference.
+   */
+  private async writeOutbox(
+    list: Array<{ transfer: TransferResult; recipient: string; createdAt: number }>,
+  ): Promise<void> {
+    const cidRefStore = this.deps!.cidRefStore;
+
+    if (list.length === 0) {
+      // Empty outbox: write empty string to match legacy behaviour and clear
+      // the memo so the next non-empty save re-pins (can't reuse a stale ref).
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, '');
+      this._lastPinnedOutboxJson = null;
+      this._lastPinnedOutboxRef = null;
+      return;
+    }
+
+    if (cidRefStore) {
+      const json = JSON.stringify(list);
+
+      // Skip pin if plaintext is byte-identical to the last pin. Common on
+      // concurrent writers that observe the same snapshot.
+      if (this._lastPinnedOutboxRef && this._lastPinnedOutboxJson === json) {
+        const refStr = CidRefStore.stringifyRef(this._lastPinnedOutboxRef);
+        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, refStr);
+        return;
+      }
+
+      const ref = await cidRefStore.pinJson(list);
+      const refStr = CidRefStore.stringifyRef(ref);
+      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, refStr);
+      // Update memo AFTER a successful storage.set — see pendingV5 equivalent.
+      this._lastPinnedOutboxJson = json;
+      this._lastPinnedOutboxRef = ref;
+      return;
+    }
+
+    // Legacy path: inline JSON (deprecated — see PROFILE-CID-REFERENCES.md).
+    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(list));
+  }
+
+  /**
+   * Load the outbox — dual-read per PROFILE-CID-REFERENCES.md §6. Detects
+   * CID-ref envelope via `tryParseRef`; falls back to legacy inline JSON.
+   *
+   * Error handling (matches `loadPendingV5Tokens`):
+   *   - CID ref present but no cidRefStore injected → throws a typed
+   *     `ProfileError('CID_REF_UNREADABLE')`. The caller surfaces a
+   *     configuration error rather than silently dropping outgoing transfers
+   *     (which would leak user funds in the pending state).
+   *   - IPFS fetch / verify / decrypt errors propagate with their typed codes.
+   *   - Legacy-JSON parse failures are caught narrowly (SyntaxError only).
+   */
   private async loadOutbox(): Promise<Array<{ transfer: TransferResult; recipient: string; createdAt: number }>> {
     const data = await this.deps!.storage.get(STORAGE_KEYS_ADDRESS.OUTBOX);
-    return data ? JSON.parse(data) : [];
+    if (!data) return [];
+
+    const ref = CidRefStore.tryParseRef(data);
+    if (ref) {
+      if (!this.deps!.cidRefStore) {
+        const { ProfileError } = await import('../../profile/errors.js');
+        throw new ProfileError(
+          'CID_REF_UNREADABLE',
+          `PaymentsModule.loadOutbox: KV at ${STORAGE_KEYS_ADDRESS.OUTBOX} ` +
+            `contains a CID ref (cid=${ref.cid}) but no cidRefStore was injected. ` +
+            `Outbox cannot be restored without IPFS access. ` +
+            `Check PaymentsModule init — is cidRefStore provided?`,
+        );
+      }
+      return await this.deps!.cidRefStore.fetchJson<
+        Array<{ transfer: TransferResult; recipient: string; createdAt: number }>
+      >(ref);
+    }
+
+    // Legacy inline JSON. Narrow catch: only swallow SyntaxError from a
+    // corrupted legacy blob; unknown errors propagate.
+    try {
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) {
+        // Matches pendingV5 defensive path — log so corruption is visible
+        // rather than silently returning [] (which would mask data loss and
+        // allow a subsequent saveToOutbox to overwrite the forensic evidence).
+        logger.error(
+          'Payments',
+          `[OUTBOX] Decoded data is not an array (got ${typeof parsed}); treating as empty.`,
+        );
+        return [];
+      }
+      return parsed;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.error('Payments', '[OUTBOX] Legacy JSON parse failed (corrupted inline data):', err);
+        return [];
+      }
+      throw err;
+    }
   }
 
   private async createStorageData(): Promise<TxfStorageDataBase> {
