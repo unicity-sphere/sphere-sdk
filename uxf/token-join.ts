@@ -280,7 +280,9 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
     if (a.txns.length !== b.txns.length) {
       return b.txns.length - a.txns.length; // longer first
     }
-    // Already lexicographic-sorted input, preserve that tiebreak.
+    // Final deterministic tiebreak: lexicographic rootHash. Total
+    // order (rootHashes are content-addressed and unique after the
+    // entry dedup), so this ranking is independent of input order.
     return a.rootHash < b.rootHash ? -1 : a.rootHash > b.rootHash ? 1 : 0;
   });
   const winner = infos[0];

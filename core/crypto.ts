@@ -349,28 +349,30 @@ export function privateKeyToAddressInfo(
  *
  * Rejects invalid inputs rather than silently coercing to zero bytes:
  * odd-length strings throw `RangeError`, and non-hex characters
- * produce `NaN` from `parseInt`, which coerce to 0 in `Uint8Array.from`
- * — that used to mean a single bad character silently corrupted the
- * derived bytes without any caller-visible signal, and in key-
- * derivation paths (IPNS Ed25519 seed, pointer master key) a handful
- * of zeros in the "private" material produces a weak, predictable
- * key. We now fail closed on any malformation.
+ * throw — previously a single bad character coerced to a zero byte
+ * via `parseInt('xy', 16) → NaN → 0` in Uint8Array.from, silently
+ * corrupting derived bytes. In key-derivation paths (IPNS Ed25519
+ * seed, pointer master key) a handful of zeros produces a weak,
+ * predictable key. We now fail closed on any malformation.
  *
- * Accepts an optional `0x` prefix for ergonomic compatibility with
- * external callers; the prefix is stripped before validation.
+ * Does NOT auto-strip a leading `0x` prefix. Every internal caller
+ * passes raw un-prefixed hex (HD-derived private keys, chain pubkeys,
+ * request IDs), so prefix-stripping would silently change the bytes
+ * for any future caller that intends `0x` as literal data. External
+ * code that needs prefix-stripping should do it explicitly at the
+ * call site, where the semantic choice is visible.
  */
 export function hexToBytes(hex: string): Uint8Array {
-  const clean = hex.startsWith('0x') || hex.startsWith('0X') ? hex.slice(2) : hex;
-  if (clean.length === 0) return new Uint8Array(0);
-  if ((clean.length & 1) !== 0) {
-    throw new RangeError(`hexToBytes: odd-length hex string (length=${clean.length})`);
+  if (hex.length === 0) return new Uint8Array(0);
+  if ((hex.length & 1) !== 0) {
+    throw new RangeError(`hexToBytes: odd-length hex string (length=${hex.length})`);
   }
-  if (!/^[0-9a-fA-F]+$/.test(clean)) {
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
     throw new RangeError('hexToBytes: non-hex character in input');
   }
-  const out = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < clean.length; i += 2) {
-    out[i / 2] = parseInt(clean.slice(i, i + 2), 16);
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    out[i / 2] = parseInt(hex.slice(i, i + 2), 16);
   }
   return out;
 }

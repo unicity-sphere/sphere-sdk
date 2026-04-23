@@ -345,6 +345,31 @@ describe('classifyVersion — H1 three-way (SPEC §8.2)', () => {
       }),
     ).rejects.toMatchObject({ code: AggregatorPointerErrorCode.TRUST_BASE_STALE });
   });
+
+  it('raises PROTOCOL_ERROR when SDK response is missing inclusionProof (shape drift)', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    // Simulate SDK shape drift: getInclusionProof returns a response
+    // object without the inclusionProof field. Previously this threw
+    // a TypeError that was caught as transient and retried forever;
+    // now it raises AggregatorPointerError(PROTOCOL_ERROR) that the
+    // caller can surface cleanly.
+    const malformedClient = {
+      getInclusionProof: vi.fn(async () => ({ /* no inclusionProof */ })),
+    } as unknown as AggregatorClient;
+    const trustBase = fakeTrustBase();
+
+    await expect(
+      classifyVersion({
+        v: 5,
+        keyMaterial,
+        signer,
+        aggregatorClient: malformedClient,
+        trustBase,
+        decodeCid: okDecoder,
+        fetchCar: validFetcher,
+      }),
+    ).rejects.toMatchObject({ code: AggregatorPointerErrorCode.PROTOCOL_ERROR });
+  });
 });
 
 // ── isReachable (health check) ─────────────────────────────────────────────

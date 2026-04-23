@@ -32,6 +32,7 @@ import type { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/trans
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
 
 import { PROBE_REQUEST_TIMEOUT_MS } from './constants.js';
+import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 import { deriveHealthCheckRequestId } from './health-check.js';
 import { deriveStateHashDigest, deriveXorKey, type PointerKeyMaterial } from './key-derivation.js';
 import type { PointerSigner } from './signing.js';
@@ -258,8 +259,24 @@ async function runDecodePhases(
       fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs),
       fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs),
     ]);
-  } catch {
-    // Network failure while fetching proofs — transient, not corrupt.
+  } catch (err) {
+    // Discriminate on error class:
+    //   PointerProtocolError — SDK shape drift (missing inclusionProof
+    //     field in getInclusionProof response). This is a DETERMINISTIC
+    //     failure — the aggregator/SDK combination will fail identically
+    //     on every retry. Surface it as AggregatorPointerError with
+    //     PROTOCOL_ERROR so classifyVersion / recoverLatest / publish
+    //     callers see a stable error code, not a transient-class retry.
+    //   Everything else — network failure, timeout, serialization error.
+    //     Transient by design; caller retries.
+    if (err instanceof Error && err.name === 'PointerProtocolError') {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.PROTOCOL_ERROR,
+        err.message,
+        undefined,
+        { cause: err },
+      );
+    }
     return { ok: 'transient' };
   }
 
