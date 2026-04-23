@@ -349,6 +349,11 @@ function createProvider(
     {
       config: {
         orbitDb: { privateKey: TEST_PRIVATE_KEY },
+        // IPNS publish/resolve is exercised end-to-end in the e2e
+        // suite against real infrastructure. Unit tests count
+        // pinToIpfs invocations and would otherwise be perturbed
+        // by the extra snapshot pin.
+        ipnsSnapshot: false,
       },
       addressId: EXPECTED_ADDRESS_ID,
       encrypt: true,

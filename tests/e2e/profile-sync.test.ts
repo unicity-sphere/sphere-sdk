@@ -191,13 +191,59 @@ describe('Profile (OrbitDB + IPFS) Sync E2E', () => {
     expect(loadResult.data).toBeTruthy();
   }, 300_000);
 
-  // Note on cross-instance replication coverage: this is deliberately
-  // tested at the higher Sphere.init() level in
-  // `profile-token-persistence.test.ts` and
-  // `profile-multi-device-sync.test.ts`, where real wallet identities
-  // bind to the Unicity testnet and exercise the full Profile flow
-  // (CAR pin → OrbitDB op → libp2p pubsub). Two fresh ephemeral Helia
-  // nodes with only IPFS gateways as bootstrap peers cannot reliably
-  // discover each other without a DHT/rendezvous service, so a pure
-  // cross-instance OrbitDB test at this layer is not meaningful.
+  // -------------------------------------------------------------------------
+  // Test 3: Profile IPNS snapshot publish + resolve round-trip
+  // -------------------------------------------------------------------------
+
+  it('publishes a Profile IPNS snapshot and resolves it back via Unicity gateways', async () => {
+    // Isolates the IPNS layer from OrbitDB entirely: sign, publish,
+    // then resolve the same record via HTTP. Validates that the
+    // Unicity IPFS gateway routes the Profile IPNS key space and
+    // that our marshalled record format is accepted.
+    const { publishProfileSnapshot, resolveProfileSnapshot } = await import(
+      '../../profile/profile-ipns'
+    );
+
+    const privateKeyHex = randomHex(32);
+    const walletPubkey = '03' + randomHex(32);
+    const snapshot = {
+      version: 1 as const,
+      walletPubkey,
+      timestamp: Date.now(),
+      bundles: [
+        { cid: 'bafy' + randomHex(20), status: 'active' as const, createdAt: Math.floor(Date.now() / 1000) },
+      ],
+    };
+
+    const publishResult = await publishProfileSnapshot({
+      gateways: [...DEFAULT_IPFS_GATEWAYS],
+      privateKeyHex,
+      snapshot,
+      sequence: 1n,
+    });
+    // Dump failure details so a failure here tells us WHERE.
+    if (!publishResult.success) {
+      console.log('publishResult:', JSON.stringify(publishResult, null, 2));
+    }
+    expect(publishResult.success).toBe(true);
+    expect(publishResult.ipnsName).toMatch(/^12D3Koo/);
+    expect(publishResult.cid).toBeTruthy();
+
+    // Allow gateway propagation — retry for up to 60s.
+    let resolved: Awaited<ReturnType<typeof resolveProfileSnapshot>> = null;
+    for (let i = 0; i < 12; i++) {
+      resolved = await resolveProfileSnapshot({
+        gateways: [...DEFAULT_IPFS_GATEWAYS],
+        privateKeyHex,
+      });
+      if (resolved !== null) break;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+
+    expect(resolved).not.toBeNull();
+    expect(resolved!.cid).toBe(publishResult.cid!);
+    expect(resolved!.snapshot.walletPubkey).toBe(walletPubkey);
+    expect(resolved!.snapshot.bundles).toHaveLength(1);
+    expect(resolved!.snapshot.bundles[0].cid).toBe(snapshot.bundles[0].cid);
+  }, 120_000);
 });

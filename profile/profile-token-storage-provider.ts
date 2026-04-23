@@ -267,6 +267,33 @@ export class ProfileTokenStorageProvider
       // Load known bundle CIDs from OrbitDB
       await this.refreshKnownBundles();
 
+      // COLD-START RECOVERY: if OrbitDB has no bundles locally, this
+      // is likely a fresh device (wallet re-imported from mnemonic
+      // after a wipe). Rebuild the active bundle set without waiting
+      // for a live peer.
+      //
+      // Two channels in priority order:
+      //   (1) aggregator pointer layer — authoritative. On a successful
+      //       recoverLatest the CID is trust-verified via inclusion
+      //       proof + CAR content-address verify. Lands as a new
+      //       bundle ref that the next JOIN pass assembles.
+      //   (2) legacy IPNS snapshot — fallback during rollout. Used
+      //       when (a) no pointer anchor exists yet (wallet pre-dates
+      //       the pointer layer), (b) the pointer layer is
+      //       unavailable (no oracle, BLOCKED, storage non-durable),
+      //       or (c) pointer recovery threw. Will be removed under
+      //       T-D6c once the migration reader takes over.
+      //
+      // Both channels are best-effort: a failure at either leaves us
+      // with an empty bundle set, and the next save() seeds the
+      // anchor afresh.
+      if (this.knownBundleCids.size === 0) {
+        const pointerRecovered = await this.recoverFromAggregatorPointerBestEffort();
+        if (!pointerRecovered) {
+          await this.recoverFromIpnsSnapshot();
+        }
+      }
+
       // Subscribe to OrbitDB replication events for real-time sync
       this.replicationUnsub = this.db.onReplication(() => {
         this.handleReplication().catch((err) => {
@@ -859,6 +886,15 @@ export class ProfileTokenStorageProvider
         );
       }
 
+      // 9. Publish to the two cold-start recovery channels (see the
+      //    symmetrical note in `initialize()` for the priority model).
+      //    Both calls are best-effort: the CAR is already pinned and
+      //    the OrbitDB bundle ref is already written, so a failed
+      //    publish only delays cold-start recovery for this flush —
+      //    subsequent flushes retry.
+      await this.publishAggregatorPointerBestEffort(cid);
+      await this.publishIpnsSnapshotBestEffort();
+
       this.emitEvent({
         type: 'storage:saved',
         timestamp: Date.now(),
@@ -941,6 +977,214 @@ export class ProfileTokenStorageProvider
   private async refreshKnownBundles(): Promise<void> {
     const bundles = await this.listActiveBundles();
     this.knownBundleCids = new Set(bundles.keys());
+  }
+
+  // ===========================================================================
+  // Private: aggregator pointer layer (cold-start recovery — primary channel)
+  // ===========================================================================
+
+  /**
+   * Publish the just-flushed CID to the aggregator pointer layer.
+   *
+   * Best-effort: failures are logged but never thrown. The authoritative
+   * state (CAR pinned + OrbitDB bundle ref) is already written by the
+   * time this runs, so a failed pointer publish only delays cold-start
+   * recovery for this flush. The next flush will retry publishing the
+   * then-current CID.
+   *
+   * Semantic note: `cidProducer` returns the SAME CID on retry — we
+   * are anchoring THIS flush's bundle. If a publish-conflict triggers
+   * `fetchAndJoin`, the remote bundle is merged as a separate ref and
+   * our CID still anchors our local contribution at the next version.
+   */
+  private async publishAggregatorPointerBestEffort(cidString: string): Promise<void> {
+    const pointer = this._options?.getPointerLayer?.() ?? null;
+    if (!pointer) return;
+
+    try {
+      const { CID } = await import('multiformats/cid');
+      const cidBytes = CID.parse(cidString).bytes;
+      const result = await pointer.publish(async () => cidBytes);
+      this.log(
+        `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
+      );
+    } catch (err) {
+      this.log(
+        `Pointer publish failed (best-effort): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Try to rebuild the local bundle set from the aggregator pointer
+   * layer's last valid CID. Returns `true` iff a bundle ref was
+   * recorded (caller should skip the IPNS fallback). Returns `false`
+   * when the pointer layer is unavailable, has no anchor yet, or
+   * throws — caller falls through to IPNS.
+   *
+   * Content-address verify: `recoverLatest()` internally goes through
+   * discovery → classifyVersion (which fetches + verifies the CAR
+   * hash) → resolveRemoteCid. By the time we have the CID bytes here
+   * they have been trust-verified end-to-end.
+   */
+  private async recoverFromAggregatorPointerBestEffort(): Promise<boolean> {
+    const pointer = this._options?.getPointerLayer?.() ?? null;
+    if (!pointer) return false;
+
+    try {
+      const recovered = await pointer.recoverLatest();
+      if (!recovered) {
+        this.log('Pointer recover: no anchor published yet');
+        return false;
+      }
+
+      const { CID } = await import('multiformats/cid');
+      const cidString = CID.decode(recovered.cid).toString();
+
+      // Idempotent: if the bundle already exists locally, this is a
+      // no-op. Token count is unknown from the pointer alone — the
+      // next flush re-counts.
+      await this.addBundle(cidString, {
+        cid: cidString,
+        status: 'active',
+        createdAt: Math.floor(Date.now() / 1000),
+      });
+      this.log(
+        `Pointer recover ok: cid=${cidString} version=${recovered.version}`,
+      );
+      return true;
+    } catch (err) {
+      this.log(
+        `Pointer recover failed (best-effort): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  // ===========================================================================
+  // Private: IPNS snapshot (cold-start recovery — legacy fallback)
+  // ===========================================================================
+
+  /**
+   * Build a snapshot of the current active bundle set and publish it
+   * to IPNS. Best-effort — logs failures but never throws, because
+   * the authoritative state (CAR + OrbitDB bundle ref) is already
+   * written by the time this runs.
+   */
+  private async publishIpnsSnapshotBestEffort(): Promise<void> {
+    if (!this.identity || this._ipfsGateways.length === 0) return;
+    if (this._options?.config?.ipnsSnapshot === false) return;
+
+    try {
+      const active = await this.listActiveBundles();
+      if (active.size === 0) {
+        // Nothing to publish yet — would produce an empty snapshot.
+        return;
+      }
+
+      const bundles = [...active.entries()].map(([cid, ref]) => ({
+        cid,
+        status: 'active' as const,
+        createdAt: ref.createdAt,
+      }));
+
+      const { publishProfileSnapshot, readSequence, writeSequence } = await import(
+        './profile-ipns.js'
+      );
+
+      // Monotonic sequence per wallet — persisted via the local cache
+      // that the Profile provider owns (same device scope as OrbitDB
+      // state).
+      let nextSequence = 1n;
+      if (this.localCache) {
+        const prev = await readSequence({
+          get: (k) => this.localCache!.get(k),
+        });
+        nextSequence = prev + 1n;
+      }
+
+      const result = await publishProfileSnapshot({
+        gateways: this._ipfsGateways,
+        privateKeyHex: this.identity.privateKey,
+        snapshot: {
+          version: 1,
+          walletPubkey: this.identity.chainPubkey,
+          timestamp: Date.now(),
+          bundles,
+        },
+        sequence: nextSequence,
+      });
+
+      if (result.success && this.localCache) {
+        await writeSequence(
+          { set: (k, v) => this.localCache!.set(k, v) },
+          nextSequence,
+        );
+        this.log(
+          `IPNS snapshot published: ipns=${result.ipnsName} cid=${result.cid} seq=${nextSequence}`,
+        );
+      } else if (!result.success) {
+        this.log(`IPNS publish failed: ${result.error ?? 'unknown'}`);
+      }
+    } catch (err) {
+      this.log(
+        `IPNS snapshot publish threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Resolve the Profile's IPNS record (if any) and write the bundle
+   * refs it describes back into OrbitDB. Called during
+   * `initialize()` when the local OrbitDB has no bundles — the
+   * classic cold-start-after-wipe scenario.
+   *
+   * Best-effort: no record → no-op; network failure → logged and
+   * proceed with empty state.
+   */
+  private async recoverFromIpnsSnapshot(): Promise<void> {
+    if (!this.identity || this._ipfsGateways.length === 0) return;
+    if (this._options?.config?.ipnsSnapshot === false) return;
+
+    try {
+      const { resolveProfileSnapshot } = await import('./profile-ipns.js');
+      const result = await resolveProfileSnapshot({
+        gateways: this._ipfsGateways,
+        privateKeyHex: this.identity.privateKey,
+      });
+      if (!result) {
+        this.log('IPNS snapshot: no record found (fresh wallet or first publish)');
+        return;
+      }
+
+      this.log(
+        `IPNS snapshot resolved: cid=${result.cid} seq=${result.sequence} bundles=${result.snapshot.bundles.length}`,
+      );
+
+      // Bootstrap each bundle ref into OrbitDB. `addBundle` is
+      // idempotent at the key level (OrbitDB put with the same key
+      // overwrites). If the OpLog later catches up via gossipsub,
+      // the more recent entry wins.
+      for (const b of result.snapshot.bundles) {
+        if (b.status !== 'active') continue;
+        try {
+          await this.addBundle(b.cid, {
+            cid: b.cid,
+            status: 'active',
+            createdAt: b.createdAt,
+            tokenCount: 0, // unknown; refreshed on next flush
+          });
+        } catch (err) {
+          this.log(
+            `IPNS snapshot: addBundle(${b.cid}) failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    } catch (err) {
+      this.log(
+        `IPNS recovery threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // ===========================================================================
