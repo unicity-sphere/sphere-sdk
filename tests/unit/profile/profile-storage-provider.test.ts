@@ -1080,4 +1080,94 @@ describe('ProfileStorageProvider', () => {
       });
     });
   });
+
+  // ==========================================================================
+  // Payload-size telemetry guard (PROFILE-CID-REFERENCES.md §9 — commit 8)
+  // ==========================================================================
+
+  describe('payload-size telemetry guard', () => {
+    // Observability path — we assert against logger.warn rather than
+    // console.warn because ProfileStorageProvider uses the project logger.
+    // The logger forwards to console.warn for 'warn' level in the default
+    // runtime; test captures via spy.
+    //
+    // Import within the test block to keep the existing test file structure.
+    // The logger module is a singleton; spying once per test is sufficient.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let warnSpy: any;
+
+    beforeEach(async () => {
+      const { logger } = await import('../../../core/logger');
+      warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    });
+
+    it('does NOT warn for small payloads (<8 KiB)', async () => {
+      await provider.set('mnemonic', 'a small value');
+      // Any unrelated warnings from setup are fine; assert none mention PAYLOAD-SIZE.
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      expect(payloadWarnings).toHaveLength(0);
+    });
+
+    it('warns when encrypted payload exceeds 8 KiB soft threshold', async () => {
+      // Plaintext ~10 KiB (encrypted will be ~10 KiB + ~28 B AES-GCM overhead).
+      const fatValue = 'x'.repeat(10 * 1024);
+      await provider.set('mnemonic', fatValue);
+
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('warning message includes key, type, and size (diagnostic context)', async () => {
+      const fatValue = 'y'.repeat(10 * 1024);
+      await provider.setEntry('mnemonic', fatValue, 'profile_write');
+
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      expect(payloadWarnings.length).toBeGreaterThanOrEqual(1);
+      const warnMsg = payloadWarnings[0]![1] as string;
+      expect(warnMsg).toContain('key=identity.mnemonic');
+      expect(warnMsg).toContain('type=profile_write');
+      expect(warnMsg).toMatch(/size=\d+/);
+    });
+
+    it('warning does NOT contain payload content (privacy — size is already a fingerprint)', async () => {
+      const sensitive = 'SECRET_MARKER_' + 'z'.repeat(10 * 1024);
+      await provider.set('mnemonic', sensitive);
+
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      for (const args of payloadWarnings) {
+        const msg = args[1] as string;
+        expect(msg).not.toContain('SECRET_MARKER_');
+      }
+    });
+
+    it('write still succeeds despite warning (non-fatal)', async () => {
+      const fatValue = 'q'.repeat(10 * 1024);
+      await expect(provider.set('mnemonic', fatValue)).resolves.toBeUndefined();
+      // Round-trip: we can still read it back.
+      const roundTrip = await provider.get('mnemonic');
+      expect(roundTrip).toBe(fatValue);
+    });
+
+    it('warning fires once per write — no rate-limit deduplication', async () => {
+      // Two writes above threshold should produce two warnings so observers
+      // see that a write site is CHRONICALLY oversized, not just the first
+      // occurrence.
+      const fatValue = 'p'.repeat(10 * 1024);
+      await provider.set('mnemonic', fatValue);
+      await provider.set('mnemonic', fatValue + '-v2');
+
+      const payloadWarnings = warnSpy.mock.calls.filter(
+        (args: unknown[]) => typeof args[1] === 'string' && (args[1] as string).includes('[PAYLOAD-SIZE]'),
+      );
+      expect(payloadWarnings.length).toBeGreaterThanOrEqual(2);
+    });
+  });
 });

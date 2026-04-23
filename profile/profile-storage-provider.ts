@@ -77,6 +77,23 @@ function deriveOriginForType(entryType: OpLogEntryType): 'user' | 'system' {
   return SYSTEM_ACTION_TYPE_SET.has(entryType) ? 'system' : 'user';
 }
 
+/**
+ * Soft-warn threshold for OpLog payload size (PROFILE-CID-REFERENCES.md §9).
+ *
+ * Writes exceeding this size emit a warning at the write site. Not an error
+ * — the hard cap is MAX_PAYLOAD_BYTES in oplog-entry.ts (128 KiB). This
+ * threshold catches regressions before they approach the cap: any payload
+ * >8 KiB should almost certainly be stored as a CID reference (Pattern A
+ * in PROFILE-CID-REFERENCES.md) rather than inline in the OpLog.
+ *
+ * A correctly-migrated write site produces envelopes of ~200 bytes
+ * (encrypted CID ref), so the threshold has a wide margin before it fires.
+ * If you see this warning in production logs: either a new write site was
+ * added without CID-ref migration, or a legacy wallet is replaying unmigrated
+ * inline data — both actionable signals.
+ */
+const PAYLOAD_SIZE_WARN_BYTES = 8 * 1024;
+
 // =============================================================================
 // Key Mapping Utilities
 // =============================================================================
@@ -783,6 +800,21 @@ export class ProfileStorageProvider implements StorageProvider {
     encryptedPayload: Uint8Array,
     entryType: OpLogEntryType = 'cache_index',
   ): Promise<void> {
+    // Soft-warn when a payload approaches the fat-data regime. See
+    // PAYLOAD_SIZE_WARN_BYTES comment and PROFILE-CID-REFERENCES.md §9.
+    // We log the key + type + size but NEVER the payload itself (ciphertext
+    // would leak nothing, but plaintext len is a fingerprint for some
+    // attackers). This lets the write proceed — the hard failure is at
+    // MAX_PAYLOAD_BYTES in oplog-entry.ts.
+    if (encryptedPayload.byteLength > PAYLOAD_SIZE_WARN_BYTES) {
+      logger.warn(
+        'ProfileStorage',
+        `[PAYLOAD-SIZE] OpLog write exceeds ${PAYLOAD_SIZE_WARN_BYTES} B ` +
+          `soft-warn threshold — consider migrating this write site to a CID ` +
+          `reference (PROFILE-CID-REFERENCES.md §8). ` +
+          `key=${profileKey} type=${entryType} size=${encryptedPayload.byteLength}`,
+      );
+    }
     const originated = deriveOriginForType(entryType);
     if (this.supportsEnvelopes()) {
       const envelope = buildLocalEntry({
