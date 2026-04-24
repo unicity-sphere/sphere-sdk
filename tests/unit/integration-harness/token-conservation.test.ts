@@ -247,6 +247,34 @@ describe('assertTokenConservation — input validation guards', () => {
     ).toThrow(/negative/);
   });
 
+  it('byCoin rejects Reflect.defineProperty attack (prior proxy was bypassed by own-property shadow)', () => {
+    // Steelman round 2 C1: `Reflect.defineProperty(violation.byCoin,
+    // 'size', {value: 0})` installed an own-property shadow on the
+    // underlying Map, which `Reflect.get(target, 'size', target)`
+    // then returned INSTEAD of the real Map.prototype.size
+    // accessor. A hostile / buggy reporter could zero out the map
+    // silently. The Proxy now intercepts defineProperty + set +
+    // deleteProperty + preventExtensions + setPrototypeOf.
+    const before = captureSnapshot('before', [tok('t1', 'UCT', 100n)]);
+    const after = captureSnapshot('after', [tok('t1', 'UCT', 50n)]);
+    try {
+      assertTokenConservation(before, after);
+      throw new Error('expected violation');
+    } catch (err) {
+      const e = err as TokenConservationViolation;
+      expect(() =>
+        Reflect.defineProperty(e.byCoin, 'size', { value: 0 }),
+      ).toThrow(/read-only/);
+      expect(() => Reflect.set(e.byCoin, 'hack', 'value')).toThrow(/read-only/);
+      expect(() => Reflect.deleteProperty(e.byCoin, 'UCT')).toThrow(/read-only/);
+      expect(() => Reflect.preventExtensions(e.byCoin)).toThrow(/read-only/);
+      expect(() => Reflect.setPrototypeOf(e.byCoin, null)).toThrow(/read-only/);
+      // Size unchanged, entry intact.
+      expect(e.byCoin.size).toBe(1);
+      expect(e.byCoin.get('UCT')).toBeDefined();
+    }
+  });
+
   it('byCoin map on the thrown violation is frozen (cannot be mutated by reporters)', () => {
     const before = captureSnapshot('before', [tok('t1', 'UCT', 100n)]);
     const after = captureSnapshot('after', [tok('t1', 'UCT', 50n)]);

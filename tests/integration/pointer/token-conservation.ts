@@ -187,25 +187,47 @@ export class TokenConservationViolation extends Error {
     // frozen Map is not actually immutable at runtime. Proxy trap
     // the three mutators to throw; leave every other method/get
     // untouched so the ReadonlyMap surface is fully usable.
-    // Proxy-trap the three mutators to throw. Other members
-    // (size, get, has, entries, keys, values, forEach, Symbol.iterator)
-    // are forwarded to the underlying Map. We use `target` as the
-    // receiver on `Reflect.get` because Map accessors (notably `size`)
-    // rely on an internal [[MapData]] slot check that fails if the
-    // receiver is the Proxy; binding function results to `target`
-    // keeps the internal-slot machinery pointed at the real Map.
+    // Proxy-trap EVERY mutation vector to make the map genuinely
+    // read-only at runtime, not just at the Map.prototype interface.
+    //
+    // The obvious traps (set / delete / clear) block the Map API
+    // mutators. But a naïve proxy is defeatable via direct property
+    // writes: `Object.defineProperty(byCoin, 'size', { value: 0 })`
+    // installs an own-property shadow that wins over Map.prototype's
+    // `size` accessor when `Reflect.get(target, 'size', target)` is
+    // called — the proxy's own-property shadow poisons the Map for
+    // every subsequent consumer. Test reporters (Vitest serializers,
+    // custom error pretty-printers, anything that iterates error
+    // objects for display) can do this inadvertently. The full
+    // lock-down traps every write-class reflective operation.
     const inner = new Map(byCoin);
+    const blockMutation = (op: string): never => {
+      throw new TypeError(
+        `TokenConservationViolation.byCoin is read-only; ${op} is not permitted`,
+      );
+    };
     this.byCoin = new Proxy(inner, {
       get(target, prop) {
         if (prop === 'set' || prop === 'delete' || prop === 'clear') {
-          return () => {
-            throw new TypeError(
-              `TokenConservationViolation.byCoin is read-only; ${String(prop)} is not permitted`,
-            );
-          };
+          return () => blockMutation(String(prop));
         }
         const value = Reflect.get(target, prop, target);
         return typeof value === 'function' ? value.bind(target) : value;
+      },
+      set() {
+        return blockMutation('property assignment');
+      },
+      defineProperty() {
+        return blockMutation('defineProperty');
+      },
+      deleteProperty() {
+        return blockMutation('deleteProperty');
+      },
+      preventExtensions() {
+        return blockMutation('preventExtensions');
+      },
+      setPrototypeOf() {
+        return blockMutation('setPrototypeOf');
       },
     }) as ReadonlyMap<string, { expected: bigint; observed: bigint; delta: bigint }>;
   }

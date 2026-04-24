@@ -539,6 +539,94 @@ describe('resolveTokenRoot', () => {
     expect(outcome.kind).toBe('divergent');
   });
 
+  it('Rule 4 — synthetic root carries ENRICHED_SYNTHETIC_KIND and null predecessor (steelman C1)', async () => {
+    // Steelman round 2 C1: synthetic with predecessor=winner.rootHash
+    // caused rebuildInstanceChainIndex (public export) to record
+    // phantom instance-chain links between natural roots and
+    // synthetic merge-artifacts. Fix: set predecessor=null and
+    // tag kind='enriched-synthetic' so downstream consumers can
+    // distinguish and filter.
+    const { ENRICHED_SYNTHETIC_KIND, isEnrichedSyntheticRoot } = await import(
+      '../../../uxf/token-join'
+    );
+
+    const t0 = makeTransaction('0', { committed: true });
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA = 'c'.repeat(64);
+    const HEX_PROOF = 'd'.repeat(64);
+    const t1Unproved: PoolEntry = [
+      hexTag('tx1-unproved'),
+      {
+        header: {
+          representation: 1,
+          semantics: 1,
+          kind: 'default' as const,
+          predecessor: null,
+        },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: HEX_STATE_A,
+          data: HEX_DATA,
+          inclusionProof: null,
+          destinationState: HEX_STATE_B,
+        },
+      },
+    ];
+    const t1Proved: PoolEntry = [
+      hexTag('tx1-proved'),
+      {
+        header: {
+          representation: 1,
+          semantics: 1,
+          kind: 'default' as const,
+          predecessor: null,
+        },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: HEX_STATE_A,
+          data: HEX_DATA,
+          inclusionProof: HEX_PROOF,
+          destinationState: HEX_STATE_B,
+        },
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1Proved[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1Unproved[0], t2[0]]);
+    const pool = buildPool(
+      t0,
+      t1Unproved,
+      t1Proved,
+      t2,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+    });
+    expect(outcome.kind).toBe('enriched');
+    if (outcome.kind !== 'enriched') return;
+
+    // predecessor null → not indexed as a successor by
+    // rebuildInstanceChainIndex.
+    expect(outcome.syntheticRoot.header.predecessor).toBeNull();
+
+    // Distinct kind tag → downstream consumers can filter.
+    expect(outcome.syntheticRoot.header.kind).toBe(ENRICHED_SYNTHETIC_KIND);
+    expect(isEnrichedSyntheticRoot(outcome.syntheticRoot)).toBe(true);
+
+    // The original natural roots should NOT report as synthetic.
+    const winnerEl = pool.get(longRootH);
+    expect(winnerEl && isEnrichedSyntheticRoot(winnerEl)).toBe(false);
+  });
+
   it('Rule 4 — synthetic root is deterministic (same inputs, any order → same hash)', () => {
     // Use the same scenario as the happy-path Rule 4 test above:
     // the LONG chain has an unproved t1 + extra tail; the SHORT

@@ -495,12 +495,36 @@ function tryEnrichLongestWithProofs(
   }
   clonedChildren.transactions = enrichedTxns;
 
+  // Header choice for the synthetic:
+  //
+  //   predecessor = null
+  //     Setting this to `winner.rootHash` caused the synthetic to
+  //     appear as a successor of the winner in
+  //     `rebuildInstanceChainIndex` (uxf/instance-chain.ts:441),
+  //     which scans every pool element for predecessor links with
+  //     no type / kind filter. A publicly-exported index function
+  //     polluted by phantom token-root chains is a brittle
+  //     invariant — set predecessor=null so the synthetic is a
+  //     stand-alone ref in the pool, not a pseudo-instance-of the
+  //     winner. Consumers that want the "which winner produced this
+  //     synthetic" relation read the manifest (the synthetic is
+  //     the manifest head; the winner is in ResolveOutcome.losers).
+  //
+  //   kind = 'enriched-synthetic'
+  //     Distinct UxfInstanceKind (the `(string & {})` branch of the
+  //     type accepts custom tags) so downstream `isSynthetic` /
+  //     `kind`-filtering consumers can detect these ephemeral
+  //     merge-artifacts even if they end up in secondary indexes
+  //     via other code paths. Tags a future failure mode: if a
+  //     synthetic accidentally survives into a CAR export, its
+  //     `kind` field carries a clear signature for a linter or
+  //     consistency-check to catch.
   const syntheticRoot: UxfElement = {
     header: {
       representation: winnerRoot.header.representation,
       semantics: winnerRoot.header.semantics,
-      kind: winnerRoot.header.kind,
-      predecessor: winner.rootHash,
+      kind: ENRICHED_SYNTHETIC_KIND,
+      predecessor: null,
     },
     type: 'token-root',
     content: { ...winnerRoot.content },
@@ -509,6 +533,30 @@ function tryEnrichLongestWithProofs(
 
   const rootHash = computeElementHash(syntheticRoot);
   return { rootHash, syntheticRoot };
+}
+
+/**
+ * UxfInstanceKind for the Rule 4 synthetic TokenRoot. Exposed so
+ * downstream consumers can detect merge-artifacts:
+ *   if (element.header.kind === ENRICHED_SYNTHETIC_KIND) { … }
+ *
+ * Exported from the token-join barrel so tests and external
+ * consumers reference this constant instead of hard-coding the
+ * string.
+ */
+export const ENRICHED_SYNTHETIC_KIND = 'enriched-synthetic' as const;
+
+/**
+ * True iff the element is a Rule 4 synthetic TokenRoot produced by
+ * `resolveTokenRoot`. Synthetic roots are ephemeral merge-artifacts;
+ * consumers building durable indexes (instance chains, archive
+ * snapshots, export manifests) SHOULD filter them out.
+ */
+export function isEnrichedSyntheticRoot(element: UxfElement): boolean {
+  return (
+    element.type === 'token-root' &&
+    element.header.kind === ENRICHED_SYNTHETIC_KIND
+  );
 }
 
 // =============================================================================
