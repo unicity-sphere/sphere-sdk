@@ -557,9 +557,13 @@ export class AccountingModule {
     // C5 fix: Await the save — fire-and-forget risks losing reconstructed
     // frozen balances on crash, leaving recovery in a loop.
     if (anyReconstructed) {
+      // W11 (T-D8): reconciliation snapshot of derived state —
+      // housekeeping, not a user action (the original close/cancel
+      // that generated this terminal state happened in a prior session).
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
     }
 
@@ -2136,14 +2140,19 @@ export class AccountingModule {
       // The terminal set write is the commit point — if we crash between writes,
       // the invoice is NOT terminal on recovery (safe to re-close).
       this.frozenBalances.set(invoiceId, frozen);
+      // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+      // the CLOSED-set write below is the commit point that carries the
+      // `invoice_close` user-action tag.
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
       this.closedInvoices.add(invoiceId);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'invoice_close',
       );
 
       if (this.config.debug) {
@@ -2236,14 +2245,19 @@ export class AccountingModule {
       // The terminal set write is the commit point — if we crash between writes,
       // the invoice is NOT terminal on recovery (safe to re-cancel).
       this.frozenBalances.set(invoiceId, frozen);
+      // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+      // the CANCELLED-set write below is the commit point that carries the
+      // `invoice_cancel` user-action tag.
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
         Object.fromEntries(this.frozenBalances),
+        'cache_index',
       );
       this.cancelledInvoices.add(invoiceId);
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'invoice_cancel',
       );
 
       if (this.config.debug) {
@@ -3505,19 +3519,26 @@ export class AccountingModule {
     // frozen balances FIRST, then terminal set. The terminal set write is the
     // commit point — crash between writes = not terminal on recovery.
     this.frozenBalances.set(invoiceId, frozen);
+    // W11 (T-D8): frozen balances snapshot is derived-state housekeeping;
+    // the terminal-set write below carries the `invoice_close` /
+    // `invoice_cancel` user-action tag matching the implicit termination
+    // direction.
     await this.saveJsonToStorage(
       STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
       Object.fromEntries(this.frozenBalances),
+      'cache_index',
     );
     if (state === 'CLOSED') {
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'invoice_close',
       );
     } else {
       await this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'invoice_cancel',
       );
     }
 
@@ -3923,39 +3944,76 @@ export class AccountingModule {
   // Internal: Terminal set persistence helpers
   // ===========================================================================
 
-  /** Persist frozen balances map to storage. */
+  /**
+   * Persist frozen balances map to storage.
+   *
+   * W11 (T-D8): frozen balances are derived-state housekeeping — the
+   * user action that triggered the freeze (close / cancel / implicit
+   * terminate) is committed by a separate terminal-set write that
+   * carries the `invoice_close` / `invoice_cancel` tag. Hence
+   * `cache_index` here is correct regardless of caller context.
+   */
   private async _persistFrozenBalances(): Promise<void> {
     const frozenObj: FrozenBalancesStorage = {};
     for (const [invoiceId, frozen] of this.frozenBalances) {
       frozenObj[invoiceId] = frozen;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.FROZEN_BALANCES, frozenObj);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.FROZEN_BALANCES,
+      frozenObj,
+      'cache_index',
+    );
   }
 
-  /** Persist both terminal sets (CANCELLED and CLOSED) to storage. */
+  /**
+   * Persist both terminal sets (CANCELLED and CLOSED) to storage.
+   *
+   * W11 (T-D8): this helper is a bulk snapshot of BOTH sets — called
+   * from contexts where either set may have changed (load
+   * reconciliation, auto-close on coverage). Classifying as
+   * `cache_index` is a deliberate choice: the caller-side user-action
+   * commit points in `closeInvoice` / `cancelInvoice` / `_terminateInvoice`
+   * already write only the single mutated set with the specific
+   * `invoice_close` / `invoice_cancel` tag; this bulk re-snapshot is
+   * defensive housekeeping (and on the load path the "user action"
+   * already happened in a prior session).
+   */
   private async _persistTerminalSets(): Promise<void> {
     await Promise.all([
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CANCELLED_INVOICES,
         Array.from(this.cancelledInvoices),
+        'cache_index',
       ),
       this.saveJsonToStorage(
         STORAGE_KEYS_ADDRESS.CLOSED_INVOICES,
         Array.from(this.closedInvoices),
+        'cache_index',
       ),
     ]);
   }
 
-  /** Persist auto-return settings (global flag + per-invoice map) to storage. */
+  /**
+   * Persist auto-return settings (global flag + per-invoice map) to storage.
+   *
+   * W11 (T-D8): auto-return settings are preferences / housekeeping
+   * state (per SPEC §10.2.3 → "auto-return ledger" is `cache_index`).
+   * The user-action triggers (close / cancel) carry their own tag at
+   * the terminal-set commit point; this settings write is ancillary.
+   */
   private async _persistAutoReturnSettings(): Promise<void> {
     const perInvoice: Record<string, boolean> = {};
     for (const [id, enabled] of this.autoReturnPerInvoice.entries()) {
       perInvoice[id] = enabled;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.AUTO_RETURN, {
-      global: this.autoReturnGlobal,
-      perInvoice,
-    });
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.AUTO_RETURN,
+      {
+        global: this.autoReturnGlobal,
+        perInvoice,
+      },
+      'cache_index',
+    );
   }
 
   // ===========================================================================
@@ -6090,13 +6148,23 @@ export class AccountingModule {
     if (step1Failed) return;
 
     // Step 2: Write token_scan_state
+    // W11 (T-D8): the scan watermark is per-token processing state —
+    // pure bookkeeping, not itself a user action. The user action
+    // (payment attribution) is already persisted by step 1's per-invoice
+    // ledger write which carries the `invoice_pay` tag.
     const scanStateObj: Record<string, number> = {};
     for (const [tokenId, count] of this.tokenScanState.entries()) {
       scanStateObj[tokenId] = count;
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE, scanStateObj);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.TOKEN_SCAN_STATE,
+      scanStateObj,
+      'cache_index',
+    );
 
     // Step 3: Write INV_LEDGER_INDEX
+    // W11 (T-D8): the index is a derived-state metadata snapshot of
+    // which invoices exist and their terminal/frozen state — housekeeping.
     const indexMeta: InvLedgerIndex = {};
     for (const invoiceId of this.invoiceLedger.keys()) {
       indexMeta[invoiceId] = {
@@ -6104,7 +6172,11 @@ export class AccountingModule {
         frozenAt: this.frozenBalances.get(invoiceId)?.frozenAt,
       };
     }
-    await this.saveJsonToStorage(STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX, indexMeta);
+    await this.saveJsonToStorage(
+      STORAGE_KEYS_ADDRESS.INV_LEDGER_INDEX,
+      indexMeta,
+      'cache_index',
+    );
 
     // W9 fix: clear tokenScanDirty AFTER all 3 steps complete, not between steps 2 and 3.
     // If step 3 fails, the dirty flag remains set so the next flush retries.
@@ -6154,12 +6226,14 @@ export class AccountingModule {
       // Memo hit — identical plaintext, reuse cached ref.
       const cached = this._lastPinnedLedgerByInvoice.get(invoiceId);
       if (cached && cached.json === json) {
-        await this.deps!.storage.set(key, CidRefStore.stringifyRef(cached.ref));
+        // W11 (T-D8): per-invoice ledger entries persist payment
+        // attributions for this invoice — user action `invoice_pay`.
+        await this.setStorageEntry(key, CidRefStore.stringifyRef(cached.ref), 'invoice_pay');
         return;
       }
 
       const ref = await cidRefStore.pinJson(entries);
-      await this.deps!.storage.set(key, CidRefStore.stringifyRef(ref));
+      await this.setStorageEntry(key, CidRefStore.stringifyRef(ref), 'invoice_pay');
       // Update memo AFTER successful storage.set — a set-failure must not
       // leave us pointing at a CID the caller thinks is live.
       this._lastPinnedLedgerByInvoice.set(invoiceId, { json, ref });
@@ -6167,7 +6241,7 @@ export class AccountingModule {
     }
 
     // Legacy path: inline JSON.
-    await this.deps!.storage.set(key, JSON.stringify(entries));
+    await this.setStorageEntry(key, JSON.stringify(entries), 'invoice_pay');
   }
 
   /**
@@ -6327,18 +6401,94 @@ export class AccountingModule {
   }
 
   /**
-   * JSON-serialize and save a value to storage.
+   * JSON-serialize and save a value to storage with an explicit W11
+   * originated-tag classification (T-D8, SPEC §10.2.3).
    *
-   * @param key   - Storage key (will be scoped via getStorageKey).
-   * @param value - Value to serialize and store.
+   * Callers MUST choose `entryType` at the call site — the helper does
+   * not infer. Mis-classification is caught at runtime by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH. TypeScript catches unknown tags at
+   * compile time via the narrow union.
+   *
+   * @param key       - Storage key (will be scoped via getStorageKey).
+   * @param value     - Value to serialize and store.
+   * @param entryType - W11 classification (see setStorageEntry).
    */
-  private async saveJsonToStorage(key: string, value: unknown): Promise<void> {
+  private async saveJsonToStorage(
+    key: string,
+    value: unknown,
+    entryType: 'invoice_close' | 'invoice_cancel' | 'cache_index',
+  ): Promise<void> {
     try {
-      await this.deps!.storage.set(this.getStorageKey(key), JSON.stringify(value));
+      await this.setStorageEntry(
+        this.getStorageKey(key),
+        JSON.stringify(value),
+        entryType,
+      );
     } catch (err) {
       logger.warn(LOG_TAG, `Failed to save storage key "${key}":`, err);
     }
   }
+
+  /**
+   * W11 originated-tag dispatcher (T-D8, SPEC §10.2.3). Writes through
+   * `storage.setEntry` when the provider supports it so the OpLog
+   * envelope carries an explicit `originated` tag matching the semantic
+   * class of the write. Providers without envelope-storage (plain
+   * IndexedDB / file KV) fall through to the plain `set()` — semantics
+   * are identical, only the peer-replicated classification differs.
+   *
+   * Classification (see profile/aggregator-pointer/originated-tag.ts):
+   *   - `invoice_pay`    — per-invoice ledger entry persists a payment
+   *                         attribution (user action on the target side).
+   *   - `invoice_close`  — explicit or implicit CLOSED-set commit point.
+   *   - `invoice_cancel` — explicit or implicit CANCELLED-set commit point.
+   *   - `cache_index`    — derived-state snapshots (frozen balances,
+   *                         auto-return settings, token scan watermark,
+   *                         INV_LEDGER_INDEX, bulk terminal-set
+   *                         re-writes, load-time reconciliation).
+   *
+   * `invoice_mint` is deliberately NOT in the union: invoice mint
+   * persists the token via `PaymentsModule.addToken` (TokenStorageProvider
+   * — envelope-stamped separately in T-D11) and never reaches this
+   * KV-level helper.
+   *
+   * Callers MUST choose the classification at the call site — the
+   * helper does NOT infer. Mis-classification is caught by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'invoice_pay' | 'invoice_close' | 'invoice_cancel' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = (storage as { constructor?: { name?: string } }).constructor?.name
+      ?? 'UnknownStorage';
+    if (!AccountingModule._w11FallbackLogged.has(providerClass)) {
+      AccountingModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        LOG_TAG,
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
 }
 
 // =============================================================================
