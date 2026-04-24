@@ -144,7 +144,9 @@ export class CommunicationsModule {
         // Only process if this is our own sent message being read by the recipient
         if (msg && msg.senderPubkey === this.deps!.identity.chainPubkey) {
           msg.isRead = true;
-          this.save();
+          // W11: read-state marker update triggered by peer's read receipt
+          // — state maintenance of an outgoing message, not a user action.
+          this.save('cache_index');
           this.deps!.emitEvent('message:read', {
             messageIds: [receipt.messageEventId],
             peerPubkey: receipt.senderTransportPubkey,
@@ -234,7 +236,9 @@ export class CommunicationsModule {
 
       // Persist to new per-address key (will write via CID ref if available).
       if (myMessages.length > 0) {
-        await this.save();
+        // W11: one-time migration of legacy global → per-address storage.
+        // Not a user action — system-level schema maintenance.
+        await this.save('cache_index');
         logger.debug('Communications', `Migrated ${myMessages.length} messages to per-address storage`);
       }
     }
@@ -345,7 +349,9 @@ export class CommunicationsModule {
     if (this.config.cacheMessages) {
       this.messages.set(message.id, message);
       if (this.config.autoSave) {
-        await this.save();
+        // W11: user-initiated outbound DM — the canonical 'dm_send' case.
+        // (SPEC §10.2.3.1: outgoing DM → originated='user'.)
+        await this.save('dm_send');
       }
     }
 
@@ -410,7 +416,10 @@ export class CommunicationsModule {
     }
 
     if (this.config.cacheMessages && this.config.autoSave) {
-      await this.save();
+      // W11: read-state marker update — marking messages read is a local
+      // bookkeeping action (displayed as unread-count change, not as a
+      // user-replayable action). Classify as cache_index.
+      await this.save('cache_index');
     }
 
     // Send NIP-17 read receipts for incoming messages
@@ -482,7 +491,12 @@ export class CommunicationsModule {
       }
     }
     if (this.config.autoSave) {
-      await this.save();
+      // W11: conversation deletion is local bookkeeping — the originated-tag
+      // spec (§10.2.3) reserves user-action types for message-lifecycle
+      // operations (dm_send, dm_receive). Bulk local deletion lacks a
+      // dedicated type, so it maps to cache_index (closest semantic
+      // neighbour — a local-state maintenance operation).
+      await this.save('cache_index');
     }
   }
 
@@ -669,7 +683,13 @@ export class CommunicationsModule {
       this.deps!.emitEvent('message:dm', message);
 
       if (this.config.cacheMessages && this.config.autoSave) {
-        this.save();
+        // W11: self-wrap replay recovers an outgoing DM from the relay —
+        // delivered through the transport's onMessage handler, so the SAVE
+        // triggers from passive receipt rather than a fresh user action.
+        // Route through the raw path (same as true incoming DMs) for
+        // uniform treatment of transport-triggered saves; the stored
+        // envelope's origin tag is resolved by receiver-authority on read.
+        this.save('raw');
       }
       return;
     }
@@ -721,7 +741,12 @@ export class CommunicationsModule {
     // Auto-save and prune (only when caching)
     if (this.config.cacheMessages) {
       if (this.config.autoSave) {
-        this.save();
+        // W11: incoming DM from a peer — SPEC §10.2.3.1 ORIGIN-SIDE
+        // 'replicated' case. The local write bypasses setEntry (which
+        // rejects 'replicated' via assertOriginTagLocal); receiver-authority
+        // downgrade in OrbitDbAdapter.getEntry labels peer-replicated
+        // reads as 'replicated' for downstream wallets.
+        this.save('raw');
       }
       this.pruneIfNeeded();
     }
@@ -796,12 +821,39 @@ export class CommunicationsModule {
    */
   private _saveChain: Promise<void> = Promise.resolve();
 
-  private async save(): Promise<void> {
+  /**
+   * W11 classification sentinel passed through `save()` → `_doSave()`.
+   *
+   * SPEC §10.2.3 requires each OpLog write to carry an originated tag that
+   * matches the intent of the local author at the site of the write. DMs
+   * introduce a directional wrinkle (SPEC §10.2.3.1): outgoing sends are
+   * user actions (`dm_send`, originated='user'), while an incoming receipt
+   * is ORIGIN-SIDE `'replicated'` — the ONE place in the codebase where
+   * `replicated` applies at call time rather than via receiver-authority
+   * downgrade.
+   *
+   * Because `ProfileStorageProvider.setEntry` validates via
+   * `assertOriginTagLocal` (which rejects `replicated`), we route the
+   * incoming-DM save through plain `storage.set` instead (the `'raw'`
+   * sentinel below). The read path in `OrbitDbAdapter.getEntry` forces
+   * replicated-downgrade for keys NOT in `localAuthoredKeys` — i.e., for
+   * peers who see the replicated entry. Locally, the stored envelope
+   * defaults to `cache_index/system`; that classification is benign for
+   * a snapshot that mixes directions, and receiver-authority downgrade
+   * makes it correct for peers either way.
+   *
+   * Cache/metadata writes (read-state markers, legacy migration, etc.)
+   * are passed as `'cache_index'` — system maintenance of the messages
+   * snapshot rather than a user action.
+   */
+  private async save(
+    entryType: 'dm_send' | 'cache_index' | 'raw' = 'cache_index',
+  ): Promise<void> {
     const chained = this._saveChain
       .catch(() => {
         /* isolate prior failure */
       })
-      .then(() => this._doSave());
+      .then(() => this._doSave(entryType));
     this._saveChain = chained.then(
       () => undefined,
       () => undefined,
@@ -820,8 +872,19 @@ export class CommunicationsModule {
    * shape, so the migration path from A → B is transparent to peers.
    * Pattern A is adequate for typical wallets (<1000 DMs per address);
    * Pattern B matters once conversations get very long.
+   *
+   * W11 `entryType` dispatch (see `save()` docstring):
+   *   - 'dm_send'     → setStorageEntry (outgoing user action)
+   *   - 'cache_index' → setStorageEntry (system maintenance)
+   *   - 'raw'         → plain storage.set (incoming DM — read-time
+   *                     downgrade supplies the 'replicated' tag to peers;
+   *                     the locally stored envelope defaults to
+   *                     cache_index/system, which is benign for a snapshot
+   *                     that mixes directions).
    */
-  private async _doSave(): Promise<void> {
+  private async _doSave(
+    entryType: 'dm_send' | 'cache_index' | 'raw',
+  ): Promise<void> {
     const messages = Array.from(this.messages.values());
     const cidRefStore = this.deps!.cidRefStore;
 
@@ -836,7 +899,7 @@ export class CommunicationsModule {
       //
       // Diverges intentionally from outbox/pendingV5 which have no legacy
       // fallback and can safely use the empty-string sentinel.
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, '[]');
+      await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, '[]', entryType);
       this._lastPinnedMessagesJson = null;
       this._lastPinnedMessagesRef = null;
       return;
@@ -848,13 +911,13 @@ export class CommunicationsModule {
       // Skip re-pin if plaintext is byte-identical to the last successful pin.
       if (this._lastPinnedMessagesRef && this._lastPinnedMessagesJson === json) {
         const refStr = CidRefStore.stringifyRef(this._lastPinnedMessagesRef);
-        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, refStr);
+        await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, refStr, entryType);
         return;
       }
 
       const ref = await cidRefStore.pinJson(messages);
       const refStr = CidRefStore.stringifyRef(ref);
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, refStr);
+      await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, refStr, entryType);
       // Update memo AFTER storage.set — see PaymentsModule equivalent for
       // the rationale (a set-failure must not leave us pointing at a CID
       // the caller thinks is live).
@@ -864,8 +927,79 @@ export class CommunicationsModule {
     }
 
     // Legacy path: inline JSON (deprecated for heavy wallets — see §8.4).
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.MESSAGES, JSON.stringify(messages));
+    await this.writeMessagesKey(STORAGE_KEYS_ADDRESS.MESSAGES, JSON.stringify(messages), entryType);
   }
+
+  /**
+   * Single write funnel for the `<addr>.messages` key. Dispatches between
+   * `setStorageEntry` (classified writes) and plain `storage.set` (raw
+   * writes used for incoming DM receipts — see the `save()` docstring for
+   * the receiver-authority model). Keeping the dispatch on one line of
+   * code avoids four-way duplication in `_doSave()`.
+   */
+  private async writeMessagesKey(
+    key: string,
+    value: string,
+    entryType: 'dm_send' | 'cache_index' | 'raw',
+  ): Promise<void> {
+    if (entryType === 'raw') {
+      // Incoming DM path — SPEC §10.2.3.1. The origin-side tag for a
+      // received peer message is `'replicated'`, which
+      // `ProfileStorageProvider.setEntry → assertOriginTagLocal` rejects
+      // at the local write edge. We bypass the envelope-typed helper here
+      // and write raw bytes; the resulting envelope defaults to
+      // `cache_index/system`, which receiver-authority downgrade in
+      // `OrbitDbAdapter.getEntry` overrides to `'replicated'` for any
+      // peer that replicates this key.
+      await this.deps!.storage.set(key, value);
+      return;
+    }
+    await this.setStorageEntry(key, value, entryType);
+  }
+
+  /**
+   * W11 originated-tag helper (SPEC §10.2.3). Mirrors
+   * `PaymentsModule.setStorageEntry` — routes through
+   * `storage.setEntry(key, value, entryType)` when the provider implements
+   * the envelope-typed API, falls back to plain `set()` otherwise.
+   *
+   * Narrow union: `'dm_send' | 'cache_index'`. The third class of write
+   * for this module — an incoming DM received from a peer — is NOT routed
+   * through this helper (see `writeMessagesKey` and `save()` docstring).
+   *
+   * A once-per-provider-class debug log on fallback surfaces silent loss
+   * of W11 stamping during a mixed-provider migration.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'dm_send' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = storage.constructor?.name ?? 'UnknownStorage';
+    if (!CommunicationsModule._w11FallbackLogged.has(providerClass)) {
+      CommunicationsModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        'Communications',
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
 
   private pruneIfNeeded(): void {
     // Per-conversation pruning (normalize keys for consistent grouping)

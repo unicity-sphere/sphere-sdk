@@ -21,6 +21,24 @@ declare const _brand: unique symbol;
 export interface MasterPrivateKey {
   readonly [_brand]: 'MasterPrivateKey';
   readonly bytes: Uint8Array;
+  /**
+   * Zero the underlying 32-byte buffer and revoke the instance from
+   * the authorized registry (SPEC §11.11, R-11 residual-risk narrowing).
+   *
+   * After calling zeroize():
+   *   - The `bytes` buffer is filled with 0x00 (same reference, zeroed in place).
+   *   - isAuthorizedMasterKey() returns false.
+   *   - assertAuthorizedMasterKey() throws PROTOCOL_ERROR.
+   *   - derivePointerKeyMaterial() / any other registry-gated consumer
+   *     throws PROTOCOL_ERROR rather than operating on zeroed bytes.
+   *
+   * Idempotent: calling zeroize() more than once is safe.
+   *
+   * Callers MUST invoke this in a `finally` block as soon as the key
+   * material is no longer needed (typically immediately after HKDF
+   * derivation produces the downstream SecretKey wrappers).
+   */
+  zeroize(): void;
 }
 
 const registry = new WeakSet<MasterPrivateKey>();
@@ -31,6 +49,10 @@ const registry = new WeakSet<MasterPrivateKey>();
  * ONLY Sphere.init/load/create/import may call this. The instance is
  * added to the authorized registry; consumers downstream verify via
  * isAuthorizedMasterKey().
+ *
+ * The caller SHOULD zero its own copy of the input bytes after this
+ * function returns — createMasterPrivateKey copies into an internal
+ * buffer and no longer references the caller's array.
  */
 export function createMasterPrivateKey(bytes: Uint8Array): MasterPrivateKey {
   if (bytes.length !== 32) {
@@ -45,33 +67,48 @@ export function createMasterPrivateKey(bytes: Uint8Array): MasterPrivateKey {
   // trust the Sphere init call sites not to hand out MasterPrivateKey
   // references to untrusted code. The WeakSet registry is the
   // load-bearing runtime guard (see assertAuthorizedMasterKey).
+  const internalBytes = new Uint8Array(bytes);
   const instance = Object.freeze({
-    bytes: new Uint8Array(bytes),
+    bytes: internalBytes,
+    zeroize(): void {
+      // Wipe the underlying buffer in place. Callers that retain a
+      // reference to `bytes` see it zeroed — that is intentional and
+      // documented. Remove from the registry so downstream guards
+      // fail fast rather than silently processing zeros.
+      internalBytes.fill(0);
+      registry.delete(instance);
+    },
   }) as unknown as MasterPrivateKey;
   registry.add(instance);
   return instance;
 }
 
-/** True iff the instance was produced by createMasterPrivateKey(). */
+/**
+ * True iff the instance was produced by createMasterPrivateKey() and
+ * has not been zeroized. Returns false once zeroize() has been called.
+ */
 export function isAuthorizedMasterKey(candidate: MasterPrivateKey): boolean {
   return registry.has(candidate);
 }
 
 /**
  * Guard helper: throws PROTOCOL_ERROR if the supplied master key was
- * not constructed through the authorized path. Called at the top of
- * every pointer-key-derivation function that consumes a MasterPrivateKey.
+ * not constructed through the authorized path or has already been
+ * zeroized. Called at the top of every pointer-key-derivation function
+ * that consumes a MasterPrivateKey.
  *
- * PROTOCOL_ERROR is intentional: an unauthorized master key reaching
- * a derivation function is a protocol-level misuse (caller bypassed
- * the Sphere init path), not a type error. Fail closed.
+ * PROTOCOL_ERROR is intentional: an unauthorized or post-zeroize
+ * master key reaching a derivation function is a protocol-level misuse
+ * (caller bypassed the Sphere init path or used the key after its
+ * lifetime ended), not a type error. Fail closed.
  */
 export function assertAuthorizedMasterKey(candidate: MasterPrivateKey): void {
   if (!registry.has(candidate)) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
       'MasterPrivateKey was not produced by createMasterPrivateKey(); ' +
-        'raw or cast instances are rejected to prevent child-key substitution.',
+        'raw, cast, or zeroized instances are rejected to prevent ' +
+        'child-key substitution and use-after-wipe.',
     );
   }
 }

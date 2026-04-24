@@ -586,9 +586,30 @@ export async function buildProfilePointerLayer(
   //    surfaces as `pointer_init_failed` — we do not leak the
   //    underlying error to avoid seeding stack traces with anything
   //    the log-scrub test would flag.
+  // Raw 32-byte private key bytes — copied into MasterPrivateKey's internal
+  // buffer by createMasterPrivateKey, and zeroed here as soon as that copy
+  // completes. Scoped outside the try so the finally block can wipe it even
+  // if an exception propagates out of the async init sequence. SPEC §11.11
+  // residual-risk narrowing (R-11): minimize heap residency of master secrets.
+  let rawPrivKeyBytes: Uint8Array | null = null;
+  let masterKey: ReturnType<typeof createMasterPrivateKey> | null = null;
+
   try {
-    const masterKey = createMasterPrivateKey(hexToBytes(input.identity.privateKey));
+    rawPrivKeyBytes = hexToBytes(input.identity.privateKey);
+    masterKey = createMasterPrivateKey(rawPrivKeyBytes);
+    // createMasterPrivateKey copies into its own buffer — the caller's
+    // array can be zeroed immediately. Defence in depth: both the caller
+    // copy and the master-key copy will be wiped on exit.
+    rawPrivKeyBytes.fill(0);
+    rawPrivKeyBytes = null;
+
     const keyMaterial = derivePointerKeyMaterial(masterKey);
+    // HKDF derivation is complete; the master key is no longer needed
+    // downstream. Wipe it now — keyMaterial (SecretKey wrappers) and
+    // signer bind their own independently-lifecycled secrets.
+    masterKey.zeroize();
+    masterKey = null;
+
     const signer = await buildPointerSigner(keyMaterial.signingSeed);
 
     const flagStore = FlagStore.create(input.localCache, signer.signingPubKeyHex);
@@ -665,6 +686,19 @@ export async function buildProfilePointerLayer(
     const detail = err instanceof Error ? err.message : String(err);
     logger.warn('PointerWiring', `pointer layer init failed: ${detail}`);
     return { ok: false, reason: 'pointer_init_failed', detail };
+  } finally {
+    // Defence-in-depth wipe: under normal success the try-block nulls
+    // both locals after their one-shot use, so these branches are
+    // no-ops. They only fire if an exception propagated out of the
+    // async init before the explicit wipes were reached — guaranteeing
+    // no master-key residue remains on the heap on any exit path.
+    // SPEC §11.11, R-11 residual-risk narrowing.
+    if (rawPrivKeyBytes) {
+      rawPrivKeyBytes.fill(0);
+    }
+    if (masterKey) {
+      masterKey.zeroize();
+    }
   }
 }
 
