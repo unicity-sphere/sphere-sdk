@@ -65,14 +65,33 @@ export async function pinToIpfs(
 
   for (const gateway of effectiveGateways) {
     try {
-      const url = `${gateway.replace(/\/$/, '')}/api/v0/dag/put`;
+      // Kubo `/api/v0/dag/put` REQUIRES multipart/form-data with a
+      // `data` field name — the raw-body-with-application/octet-stream
+      // shape this code used previously returns HTTP 400
+      // "file argument 'object data' is required" on any real Kubo.
+      //
+      // Query params:
+      //   input-codec=raw    — treat the uploaded bytes as raw (no CBOR decode)
+      //   store-codec=raw    — persist under the raw codec (CID prefix bafkrei…)
+      //   pin=true           — keep the block pinned so the gateway
+      //                        doesn't GC it before the aggregator
+      //                        layer records the ref
+      //   hash=sha2-256      — default, explicit for clarity
+      // Result: CID.createV1(raw, sha256(data)) — byte-verifiable
+      // via verifyCidMatchesBytes on fetch.
+      const url =
+        `${gateway.replace(/\/$/, '')}/api/v0/dag/put` +
+        `?input-codec=raw&store-codec=raw&pin=true&hash=sha2-256`;
+
+      const form = new FormData();
+      // `new Blob([data])` where `data: Uint8Array` is safe across
+      // Node 18+ (undici FormData) and browsers. The filename is
+      // arbitrary but required by some server-side multipart parsers.
+      form.append('data', new Blob([data as BlobPart]), 'data');
 
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/octet-stream',
-        },
-        body: data,
+        body: form,
         signal: AbortSignal.timeout(timeoutMs),
       });
 
@@ -81,6 +100,9 @@ export async function pinToIpfs(
         continue;
       }
 
+      // Kubo returns one line of JSON: `{"Cid":{"/":"bafkrei…"}}`.
+      // Defensively handle both `Cid.` (current) and legacy `Hash`
+      // shapes.
       const result = (await response.json()) as { Cid?: { '/': string }; Hash?: string };
       const cid = result.Cid?.['/'] ?? result.Hash;
       if (!cid) {

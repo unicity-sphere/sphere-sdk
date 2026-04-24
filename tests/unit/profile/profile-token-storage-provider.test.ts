@@ -1164,8 +1164,16 @@ describe('ProfileTokenStorageProvider', () => {
 
       installMockFetch(async (url: string, init?: RequestInit) => {
         if (url.includes('/api/v0/dag/put') && init?.body) {
-          // Capture the bytes sent to IPFS
-          if (init.body instanceof Uint8Array) {
+          // Capture the bytes sent to IPFS. Production uses
+          // multipart/form-data (Kubo RPC contract); extract the
+          // `data` field. Legacy Uint8Array / ArrayBuffer paths
+          // kept for any test that still passes raw bodies.
+          if (init.body instanceof FormData) {
+            const entry = init.body.get('data');
+            if (entry instanceof Blob) {
+              pinnedBytes = new Uint8Array(await entry.arrayBuffer());
+            }
+          } else if (init.body instanceof Uint8Array) {
             pinnedBytes = init.body;
           } else if (init.body instanceof ArrayBuffer) {
             pinnedBytes = new Uint8Array(init.body);

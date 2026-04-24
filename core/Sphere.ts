@@ -4175,14 +4175,28 @@ export class Sphere {
       provider.setIdentity(this._identity!);
     }
 
-    // Connect providers (skip if already connected, e.g. after setIdentity reconnect)
+    // Connect providers. Ordering matters:
+    //
+    //   1. Oracle first — `oracle.initialize()` loads the embedded
+    //      RootTrustBase and constructs the AggregatorClient. This
+    //      is load-bearing for the Profile aggregator pointer layer:
+    //      ProfileStorageProvider.doConnect() Phase C calls
+    //      `oracle.getAggregatorClient()` / `getRootTrustBase()` to
+    //      build ProfilePointerLayer. If storage connects before
+    //      oracle, Phase C exits early with
+    //      `aggregator_client_unavailable` and the pointer channel
+    //      stays dark until a later explicit retry.
+    //   2. Storage second — Phase A (local cache) + Phase B
+    //      (OrbitDB attach) + Phase C (pointer layer construction,
+    //      reads oracle state).
+    //   3. Transport third — Nostr connection, independent.
+    await this._oracle.initialize();
     if (!this._storage.isConnected()) {
       await this._storage.connect();
     }
     if (!this._transport.isConnected()) {
       await this._transport.connect();
     }
-    await this._oracle.initialize();
 
     // Initialize all token storage providers in parallel
     await Promise.all(

@@ -586,9 +586,21 @@ export async function buildProfilePointerLayer(
   //    surfaces as `pointer_init_failed` — we do not leak the
   //    underlying error to avoid seeding stack traces with anything
   //    the log-scrub test would flag.
+  //
+  // Residual-risk narrowing (SPEC §11.11, R-11): master key bytes
+  // are wiped as soon as HKDF derivation completes. `rawPrivKeyBytes`
+  // is the input to createMasterPrivateKey (which copies internally);
+  // we fill(0) it immediately after the copy so the hex-decode
+  // intermediate doesn't linger in heap. `masterKey.zeroize()` wipes
+  // the internal copy after derivePointerKeyMaterial returns.
+  const rawPrivKeyBytes = hexToBytes(input.identity.privateKey);
+  let masterKey: ReturnType<typeof createMasterPrivateKey> | null = null;
   try {
-    const masterKey = createMasterPrivateKey(hexToBytes(input.identity.privateKey));
+    masterKey = createMasterPrivateKey(rawPrivKeyBytes);
+    rawPrivKeyBytes.fill(0);
     const keyMaterial = derivePointerKeyMaterial(masterKey);
+    masterKey.zeroize();
+    masterKey = null;
     const signer = await buildPointerSigner(keyMaterial.signingSeed);
 
     const flagStore = FlagStore.create(input.localCache, signer.signingPubKeyHex);
@@ -665,6 +677,14 @@ export async function buildProfilePointerLayer(
     const detail = err instanceof Error ? err.message : String(err);
     logger.warn('PointerWiring', `pointer layer init failed: ${detail}`);
     return { ok: false, reason: 'pointer_init_failed', detail };
+  } finally {
+    // Residual-risk narrowing: if we threw BEFORE the explicit
+    // zeroize() above (e.g., inside derivePointerKeyMaterial or
+    // later), wipe the leftover master-key copy + raw hex buffer
+    // here. Safe-idempotent: zeroize() is a no-op on an already-
+    // zeroized instance.
+    if (masterKey !== null) masterKey.zeroize();
+    rawPrivKeyBytes.fill(0);
   }
 }
 

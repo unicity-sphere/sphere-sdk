@@ -43,10 +43,22 @@ function installFakeIpfsGateway(): { store: Map<string, Uint8Array>; cleanup: ()
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
 
-    // Pin (POST /api/v0/dag/put)
+    // Pin (POST /api/v0/dag/put). Production uses multipart/form-data
+    // with a `data` field (Kubo RPC contract). Extract the payload
+    // from the FormData body; fall back to raw-bytes body for any
+    // legacy test that still passes Uint8Array directly.
     if (url.includes('/api/v0/dag/put')) {
-      const body = init!.body as Uint8Array;
-      // Compute a proper CIDv1 with raw codec (0x55) + sha2-256 multihash (0x12).
+      let body: Uint8Array;
+      if (init?.body instanceof FormData) {
+        const entry = init.body.get('data');
+        if (entry instanceof Blob) {
+          body = new Uint8Array(await entry.arrayBuffer());
+        } else {
+          return new Response('bad form', { status: 400 }) as unknown as Response;
+        }
+      } else {
+        body = init!.body as Uint8Array;
+      }
       const hashBytes = sha256(body);
       const digest = createDigest(0x12, hashBytes);
       const cid = CID.createV1(0x55, digest).toString();
