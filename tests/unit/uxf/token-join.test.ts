@@ -17,17 +17,42 @@ import { resolveTokenRoot } from '../../../uxf/token-join';
 // Element factories — minimal enough to satisfy the resolver's reads.
 // ---------------------------------------------------------------------------
 
+/**
+ * Content-hash-shaped identifiers. computeElementHash canonicalizes
+ * children by hexToBytes(hash), so any ContentHash value that
+ * reaches the element-hashing path must be 64-char lowercase hex.
+ * Short fixtures would throw `UXF:INVALID_HASH` inside the Rule 4
+ * synthesis path. We derive unique hex from a SHA-256 of the tag
+ * so fixtures stay readable at the call site.
+ */
+function hexTag(tag: string): ContentHash {
+  // Deterministic cheap hash: build a hex string by expanding each
+  // char's code-point to 4 hex digits, then truncate/pad to 64.
+  // Tags are short (≤16 chars) and this produces valid hex.
+  let out = '';
+  for (const ch of tag) {
+    out += ch.charCodeAt(0).toString(16).padStart(4, '0');
+  }
+  if (out.length >= 64) return out.slice(0, 64) as ContentHash;
+  return (out + '0'.repeat(64 - out.length)) as ContentHash;
+}
+
 function makeTransaction(id: string, opts: { committed: boolean }): [ContentHash, UxfElement] {
-  const hash = `tx-${id}` as ContentHash;
+  const hash = hexTag(`tx-${id}`);
   const el: UxfElement = {
-    header: { version: '2.0' } as never,
+    header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
     type: 'transaction',
     content: {},
     children: {
-      sourceState: `state-src-${id}`,
-      data: opts.committed ? `tx-data-${id}` : null,
-      inclusionProof: opts.committed ? `proof-${id}` : null,
-      destinationState: `state-dst-${id}`,
+      sourceState: hexTag(`src-${id}`),
+      data: opts.committed ? hexTag(`data-${id}`) : null,
+      inclusionProof: opts.committed ? hexTag(`proof-${id}`) : null,
+      destinationState: hexTag(`dst-${id}`),
     },
   };
   return [hash, el];
@@ -37,15 +62,22 @@ function makeTokenRoot(
   rootName: string,
   txnHashes: ContentHash[],
 ): [ContentHash, UxfElement] {
-  const hash = `root-${rootName}` as ContentHash;
+  const hash = hexTag(`root-${rootName}`);
   const el: UxfElement = {
-    header: { version: '2.0' } as never,
+    header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
     type: 'token-root',
-    content: { tokenId: 'T', version: '2.0' },
+    // tokenId is a BYTE_FIELD for 'token-root' (see uxf/hash.ts:56)
+    // — must be valid hex. version is semantic-string, left free.
+    content: { tokenId: hexTag('tkn-T'), version: '2.0' },
     children: {
-      genesis: 'genesis-X',
+      genesis: hexTag('genesis-X'),
       transactions: txnHashes,
-      state: 'state-X',
+      state: hexTag('state-X'),
       nametags: [],
     },
   };
@@ -242,6 +274,258 @@ describe('resolveTokenRoot', () => {
         pool: new Map(),
       }),
     ).toThrow('empty candidates');
+  });
+
+  it('Rule 4 — enriches the longer chain when a same-position tx has a proof in a shorter chain', () => {
+    // Position 0: t0 committed in both chains (identical hash).
+    // Position 1: long has unproved version (t1_unproved), short
+    //   has proved version (t1_proved). Under content-addressed
+    //   encoding these produce different ContentHashes but same
+    //   sourceState/data/destinationState children — the resolver
+    //   should detect this and adopt the proved element.
+    // Position 2: only in the longer chain (uncommitted tail).
+    //
+    // Expected outcome: `enriched` with a synthetic root whose
+    // transactions array is [t0, t1_proved, t2_unproved]. The
+    // synthetic root's ContentHash differs from both candidates.
+
+    const t0 = makeTransaction('0', { committed: true });
+    // ContentHashes must be 64-char lowercase hex — computeElementHash
+    // calls hexToBytes() on every child ref during canonicalization.
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA_1 = 'c'.repeat(64);
+    const HEX_PROOF_1 = 'd'.repeat(64);
+    const t1UnprovedChildren = {
+      sourceState: HEX_STATE_A,
+      data: HEX_DATA_1,
+      inclusionProof: null,
+      destinationState: HEX_STATE_B,
+    };
+    const t1ProvedChildren = {
+      sourceState: HEX_STATE_A,
+      data: HEX_DATA_1,
+      inclusionProof: HEX_PROOF_1,
+      destinationState: HEX_STATE_B,
+    };
+    const t1Unproved: PoolEntry = [
+      hexTag('tx1u'),
+      {
+        header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
+        type: 'transaction',
+        content: {},
+        children: t1UnprovedChildren,
+      },
+    ];
+    const t1Proved: PoolEntry = [
+      hexTag('tx1p'),
+      {
+        header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
+        type: 'transaction',
+        content: {},
+        children: t1ProvedChildren,
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1Proved[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1Unproved[0], t2[0]]);
+
+    const pool = buildPool(
+      t0,
+      t1Unproved,
+      t1Proved,
+      t2,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+    });
+
+    expect(outcome.kind).toBe('enriched');
+    if (outcome.kind !== 'enriched') return;
+
+    // Synthetic root is a NEW element with a different hash.
+    expect(outcome.rootHash).not.toBe(shortRootH);
+    expect(outcome.rootHash).not.toBe(longRootH);
+
+    // Both original roots are losers (the longer chain is
+    // superseded by the synthetic).
+    expect(outcome.losers).toContain(shortRootH);
+    expect(outcome.losers).toContain(longRootH);
+
+    // Synthetic root has the enriched tx list: [t0, t1_proved, t2].
+    const syntheticTxns = outcome.syntheticRoot.children.transactions;
+    expect(syntheticTxns).toEqual([t0[0], t1Proved[0], t2[0]]);
+    expect(outcome.syntheticRoot.type).toBe('token-root');
+  });
+
+  it('Rule 4 — does NOT enrich when the shorter chain has no better-proofed tx', () => {
+    // Both chains have uncommitted t1 (same hash). Common prefix is
+    // identical. Tail differs. Resolver picks longest-valid, no
+    // enrichment.
+    const t0 = makeTransaction('0', { committed: true });
+    const t1 = makeTransaction('1', { committed: false });
+    const t2 = makeTransaction('2', { committed: false });
+
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1[0], t2[0]]);
+
+    const pool = buildPool(t0, t1, t2, [shortRootH, shortRoot], [longRootH, longRoot]);
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+    });
+    expect(outcome.kind).toBe('longest-valid');
+    expect(outcome.rootHash).toBe(longRootH);
+  });
+
+  it('Rule 4 — does NOT enrich when the proved-alt has DIFFERENT core fields (not same-core-different-proof)', () => {
+    // Position 1 differs in sourceState — this is a real divergence,
+    // not a proof mismatch. Resolver should classify as divergent or
+    // fall through to longest-valid.
+    const t0 = makeTransaction('0', { committed: true });
+
+    const t1A: PoolEntry = [
+      hexTag('tx1a'),
+      {
+        header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: 'state-0-dst',
+          data: 'tx-data-1',
+          inclusionProof: null,
+          destinationState: 'state-1-dst-A',
+        },
+      },
+    ];
+    const t1B: PoolEntry = [
+      hexTag('tx1b'),
+      {
+        header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: 'state-0-dst',
+          data: 'tx-data-1',
+          inclusionProof: 'proof-1',
+          // DIFFERENT destinationState — this is a divergent transition, not
+          // a proof lift. Even though t1B has a proof, Rule 4 must decline.
+          destinationState: 'state-1-dst-B',
+        },
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1B[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1A[0], t2[0]]);
+
+    const pool = buildPool(t0, t1A, t1B, t2, [shortRootH, shortRoot], [longRootH, longRoot]);
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+    });
+    // The chains have different tx hashes at position 1 and the
+    // txns arrays no longer satisfy the prefix relation — this is
+    // a divergent pair.
+    expect(outcome.kind).toBe('divergent');
+  });
+
+  it('Rule 4 — synthetic root is deterministic (same inputs, any order → same hash)', () => {
+    // Use the same scenario as the happy-path Rule 4 test above:
+    // the LONG chain has an unproved t1 + extra tail; the SHORT
+    // chain has a proved t1. Enrichment is a genuine fire here.
+    const t0 = makeTransaction('0', { committed: true });
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA_1 = 'c'.repeat(64);
+    const HEX_PROOF_1 = 'd'.repeat(64);
+    const t1Unproved: PoolEntry = [
+      hexTag('tx1u'),
+      {
+        header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: HEX_STATE_A,
+          data: HEX_DATA_1,
+          inclusionProof: null,
+          destinationState: HEX_STATE_B,
+        },
+      },
+    ];
+    const t1Proved: PoolEntry = [
+      hexTag('tx1p'),
+      {
+        header: {
+      representation: 1,
+      semantics: 1,
+      kind: 'default' as const,
+      predecessor: null,
+    },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: HEX_STATE_A,
+          data: HEX_DATA_1,
+          inclusionProof: HEX_PROOF_1,
+          destinationState: HEX_STATE_B,
+        },
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1Proved[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1Unproved[0], t2[0]]);
+    const pool = buildPool(
+      t0,
+      t1Unproved,
+      t1Proved,
+      t2,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+
+    const a = resolveTokenRoot({ tokenId: 'T', candidates: [shortRootH, longRootH], pool });
+    const b = resolveTokenRoot({ tokenId: 'T', candidates: [longRootH, shortRootH], pool });
+    expect(a.kind).toBe('enriched');
+    expect(b.kind).toBe('enriched');
+    if (a.kind !== 'enriched' || b.kind !== 'enriched') return;
+    expect(a.rootHash).toBe(b.rootHash);
   });
 
   it('dedupes identical rootHashes — `[rh, rh, rh]` is treated as single candidate', () => {

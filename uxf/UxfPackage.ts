@@ -491,10 +491,9 @@ function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
   }
 
   // Merge manifest: run the per-token JOIN resolver on collision
-  // rather than blind last-writer-wins. Rule 3 of §10.4 (longest
-  // valid chain) is honored here; Rule 4 (proof-enriched synthetic
-  // root) is deferred — see uxf/token-join.ts scope comment. The
-  // resolver is deterministic in its output for a given (tokenId,
+  // rather than blind last-writer-wins. Rules 3 + 4 of §10.4 are
+  // honored here (longest-valid-chain + proof-enriched synthetic
+  // root). The resolver is deterministic for a given (tokenId,
   // candidates, pool), so cross-device agreement holds.
   for (const [tokenId, incomingRoot] of source.manifest.tokens) {
     const existingRoot = mutableManifest.get(tokenId);
@@ -510,6 +509,14 @@ function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
       candidates: [existingRoot, incomingRoot],
       pool: mutablePool,
     });
+    // Rule 4: a synthetic proof-enriched TokenRoot must be inserted
+    // into the pool under the resolver's returned rootHash so the
+    // manifest's ref is resolvable. The resolver is pure (does not
+    // touch the pool) — the insert is the caller's responsibility
+    // here.
+    if (outcome.kind === 'enriched') {
+      mutablePool.set(outcome.rootHash, outcome.syntheticRoot);
+    }
     mutableManifest.set(tokenId, outcome.rootHash);
   }
 

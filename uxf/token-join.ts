@@ -46,6 +46,7 @@
  */
 
 import type { ContentHash, UxfElement } from './types';
+import { computeElementHash } from './hash';
 
 // =============================================================================
 // Public types
@@ -68,6 +69,24 @@ export type ResolveOutcome =
       readonly kind: 'divergent';
       readonly rootHash: ContentHash;
       readonly losers: readonly ContentHash[];
+    }
+  /**
+   * Rule 4 synthetic proof-enriched root. One chain was a linear
+   * extension of another (same genesis, same tail direction) but at
+   * one or more positions in the common prefix, the shorter chain
+   * carried a transaction element with an inclusion proof where the
+   * longer chain's element at the same position had none. The
+   * resolver emits a new TokenRoot whose transactions array is the
+   * pointwise max-proof selection on the common prefix, followed by
+   * the longer chain's tail. The caller MUST insert `syntheticRoot`
+   * into the pool under `rootHash` before consuming the manifest
+   * winner, otherwise the ref dangles.
+   */
+  | {
+      readonly kind: 'enriched';
+      readonly rootHash: ContentHash;
+      readonly losers: readonly ContentHash[];
+      readonly syntheticRoot: UxfElement;
     };
 
 export interface ResolveInput {
@@ -223,66 +242,63 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
     return { kind: 'single', rootHash: infos[0].rootHash };
   }
 
-  // Pairwise prefix analysis. For each pair, classify:
-  //   - a is prefix of b (or vice versa)      → linear chain relation
-  //   - neither is a prefix of the other      → divergent (double-spend)
+  // Pairwise compatibility analysis. Two chains are COMPATIBLE iff
+  // every position up to min(lenA, lenB) is either:
+  //   - the SAME ContentHash on both sides, OR
+  //   - a same-core-different-proof tx pair (Rule 4 candidate —
+  //     same sourceState/data/destinationState, differing
+  //     inclusionProof).
+  // Incompatible at any position → divergent (double-spend / fork).
   //
   // With >2 candidates we walk all pairs: any divergent pair forces
-  // the whole tokenId into 'divergent' outcome (conservative; a more
-  // sophisticated resolver could partition and pick a winner per
-  // partition).
+  // the whole tokenId into 'divergent' outcome (conservative; a
+  // more sophisticated resolver could partition).
   let foundDivergent = false;
   for (let i = 0; i < infos.length; i++) {
     for (let j = i + 1; j < infos.length; j++) {
       const a = infos[i];
       const b = infos[j];
-      // Identical chains with the same rootHash would have been
-      // deduped by the Map; here identical txn lists with different
-      // rootHashes indicates differing ancillary content (state,
-      // nametags). We treat that as non-divergent but call it out
-      // via the prefix-check: neither is a strict prefix, so this
-      // falls into the "divergent" branch unless we handle it.
-      if (a.txns.length === b.txns.length) {
-        // Same length — if identical arrays, neither is a strict
-        // prefix, but the chains are compatible. We still need to
-        // pick one; defer to committed-count tiebreak below.
-        let same = true;
-        for (let k = 0; k < a.txns.length; k++) {
-          if (a.txns[k] !== b.txns[k]) {
-            same = false;
-            break;
-          }
-        }
-        if (!same) {
-          foundDivergent = true;
-        }
-        continue;
+      const commonLen = Math.min(a.txns.length, b.txns.length);
+      for (let k = 0; k < commonLen; k++) {
+        if (a.txns[k] === b.txns[k]) continue;
+        // Different hash at position k — OK only if same-core-
+        // different-proof (Rule 4 enrichment candidate).
+        if (sameCoreDifferentProof(a.txns[k], b.txns[k], pool)) continue;
+        foundDivergent = true;
+        break;
       }
-      if (a.txns.length < b.txns.length) {
-        if (!isPrefix(a.txns, b.txns)) foundDivergent = true;
-      } else {
-        if (!isPrefix(b.txns, a.txns)) foundDivergent = true;
-      }
+      if (foundDivergent) break;
     }
     if (foundDivergent) break;
   }
 
-  // Score function for ranking: committed-tx count is primary, total
-  // txn length is secondary, rootHash ascending as the final
-  // deterministic tiebreak. When `foundDivergent`, all candidates
-  // are siblings of one another (chain-incompatible) — we still pick
-  // the one with the highest committed count so downstream code can
-  // proceed, but emit `divergent` so operators can investigate.
+  // Score function for ranking. Two regimes:
+  //
+  //   foundDivergent — chains are chain-incompatible (genuine fork).
+  //     Rank by committedCount desc first (prefer more proofs),
+  //     then length desc (longer tie-break), then rootHash asc.
+  //     The resolver cannot repair the fork; the highest-ranked
+  //     candidate wins the manifest slot but outcome = 'divergent'
+  //     so operators are alerted.
+  //
+  //   Linear-compatible — chains share a common prefix (with
+  //     optional same-core-different-proof substitutions at
+  //     individual positions, which Rule 4 will enrich below).
+  //     Rank by LENGTH desc first so the skeleton for enrichment
+  //     is the longest chain — enrichment then pointwise upgrades
+  //     positions on that skeleton from any shorter candidate
+  //     with a better-proved same-core tx. Without this regime
+  //     split, a shorter-but-more-proved chain would win the
+  //     rank and be incapable of extending to the longer chain's
+  //     tail, forcing the resolver to lose the tail.
   infos.sort((a, b) => {
-    if (a.committedCount !== b.committedCount) {
-      return b.committedCount - a.committedCount; // higher first
+    if (foundDivergent) {
+      if (a.committedCount !== b.committedCount) return b.committedCount - a.committedCount;
+      if (a.txns.length !== b.txns.length) return b.txns.length - a.txns.length;
+    } else {
+      if (a.txns.length !== b.txns.length) return b.txns.length - a.txns.length;
+      if (a.committedCount !== b.committedCount) return b.committedCount - a.committedCount;
     }
-    if (a.txns.length !== b.txns.length) {
-      return b.txns.length - a.txns.length; // longer first
-    }
-    // Final deterministic tiebreak: lexicographic rootHash. Total
-    // order (rootHashes are content-addressed and unique after the
-    // entry dedup), so this ranking is independent of input order.
     return a.rootHash < b.rootHash ? -1 : a.rootHash > b.rootHash ? 1 : 0;
   });
   const winner = infos[0];
@@ -292,17 +308,165 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
     return { kind: 'divergent', rootHash: winner.rootHash, losers };
   }
 
-  // Linear-chain case (one chain is a prefix of the other, or they
-  // are identical). Under content-addressed transactions, identical
-  // tx hashes guarantee identical committedness on the common
-  // prefix — so the longer chain always has ≥ committed-tx count of
-  // the shorter. The ranking above therefore picks the longest
-  // compatible chain; `longest-valid` is the only reachable outcome
-  // here. Rule 4 proof enrichment (synthetic root built from
-  // per-element proof lifting across bundles) would re-introduce a
-  // `truncated` / synthetic variant, but that requires new element
-  // hashing and pool mutation and is deferred (see scope comment).
+  // Linear-chain case (one chain is a prefix of the other, or one
+  // extends the other with additional uncommitted tail). Under
+  // strictly content-addressed transactions where identical tx
+  // hashes appear on the common prefix, the longer chain wins
+  // cleanly via `longest-valid`. But when two bundles captured the
+  // same logical tx at different commit states (e.g., tx_i was
+  // written uncommitted into chain A, later proved and re-written
+  // in chain B before the next step), the two chains have DIFFERENT
+  // tx ContentHashes at position i even though the logical state
+  // transition is the same. The shorter chain may hold the proved
+  // version and the longer chain may hold the unproved version at
+  // that position — Rule 4 synthesis produces a merged chain that
+  // keeps the longer tail AND adopts the proved element on the
+  // common prefix.
+  const enrichment = tryEnrichLongestWithProofs(winner, infos, pool);
+  if (enrichment !== null) {
+    return {
+      kind: 'enriched',
+      rootHash: enrichment.rootHash,
+      losers: [...losers, winner.rootHash], // the old longest is superseded
+      syntheticRoot: enrichment.syntheticRoot,
+    };
+  }
   return { kind: 'longest-valid', rootHash: winner.rootHash, losers };
+}
+
+// =============================================================================
+// Rule 4 — proof-enriched synthetic root (T-D0 audit follow-up)
+// =============================================================================
+
+/**
+ * Does the transaction at `txHash` carry an inclusion proof?
+ *
+ * Safe lookup: a missing pool entry or malformed element returns
+ * false. Callers treat "missing" as "not proven" — a conservative
+ * choice that prefers NOT enriching over enriching from an
+ * incomplete source bundle.
+ */
+function txHasProof(txHash: ContentHash, pool: ReadonlyMap<ContentHash, UxfElement>): boolean {
+  const tx = pool.get(txHash);
+  if (!tx || tx.type !== 'transaction') return false;
+  const proof = tx.children.inclusionProof;
+  return typeof proof === 'string' && proof.length > 0;
+}
+
+/**
+ * Two transaction elements are "same core, different proof" iff
+ * their sourceState + data + destinationState children match
+ * byte-for-byte but their inclusionProof children differ. Under
+ * content-addressed encoding, same-core-same-proof would produce
+ * the same ContentHash, so the two input hashes must already be
+ * different to reach this helper.
+ */
+function sameCoreDifferentProof(
+  hashA: ContentHash,
+  hashB: ContentHash,
+  pool: ReadonlyMap<ContentHash, UxfElement>,
+): boolean {
+  if (hashA === hashB) return false;
+  const a = pool.get(hashA);
+  const b = pool.get(hashB);
+  if (!a || !b) return false;
+  if (a.type !== 'transaction' || b.type !== 'transaction') return false;
+  const ca = a.children as Record<string, ContentHash | ContentHash[] | null>;
+  const cb = b.children as Record<string, ContentHash | ContentHash[] | null>;
+  return (
+    ca.sourceState === cb.sourceState &&
+    ca.data === cb.data &&
+    ca.destinationState === cb.destinationState
+  );
+}
+
+/**
+ * Walk the common prefix of the winner's tx chain vs every OTHER
+ * candidate. For each position where winner has no proof and some
+ * other candidate has a same-core-different-proof tx with a proof,
+ * adopt the proved version. If at least one position was adopted,
+ * synthesize a new TokenRoot with the enriched tx list and return
+ * it. Otherwise return null — caller falls through to
+ * `longest-valid`.
+ *
+ * Out of scope for this MVP:
+ *   - Multi-winner proof sets (picking proofs from N>2 chains):
+ *     we walk candidates in `infos` order and take the first
+ *     proved-alternative at each position. Deterministic because
+ *     `infos` is sorted.
+ *   - Proof validity check: we trust the proof element's mere
+ *     presence as a "has proof" signal. Real proof verification
+ *     (signature + merkle path) happens at the oracle layer.
+ *   - Nametags / state-child reconciliation: we copy from the
+ *     winner's TokenRoot unchanged. Nametags on the common prefix
+ *     are identical by genesis invariant; tail-only nametags would
+ *     survive as the winner already carries them.
+ */
+function tryEnrichLongestWithProofs(
+  winner: {
+    readonly rootHash: ContentHash;
+    readonly txns: readonly ContentHash[];
+    readonly committedCount: number;
+  },
+  infos: readonly {
+    readonly rootHash: ContentHash;
+    readonly txns: readonly ContentHash[];
+    readonly committedCount: number;
+  }[],
+  pool: ReadonlyMap<ContentHash, UxfElement>,
+): { rootHash: ContentHash; syntheticRoot: UxfElement } | null {
+  const winnerRoot = pool.get(winner.rootHash);
+  if (!winnerRoot || winnerRoot.type !== 'token-root') return null;
+
+  const enrichedTxns: ContentHash[] = [...winner.txns];
+  let enriched = false;
+
+  for (let pos = 0; pos < enrichedTxns.length; pos++) {
+    const curHash = enrichedTxns[pos];
+    if (txHasProof(curHash, pool)) continue;
+
+    // Scan other candidates for a same-core-with-proof alternative
+    // at this position.
+    for (const other of infos) {
+      if (other.rootHash === winner.rootHash) continue;
+      if (pos >= other.txns.length) continue;
+      const altHash = other.txns[pos];
+      if (altHash === curHash) continue;
+      if (!txHasProof(altHash, pool)) continue;
+      if (!sameCoreDifferentProof(curHash, altHash, pool)) continue;
+
+      enrichedTxns[pos] = altHash;
+      enriched = true;
+      break; // first proved-alternative wins; deterministic by infos order
+    }
+  }
+
+  if (!enriched) return null;
+
+  // Build the synthetic TokenRoot. Copy the winner's header /
+  // content / non-transactions children wholesale; only the
+  // `transactions` child is replaced with the enriched array. The
+  // synthetic points at the original winner's rootHash as its
+  // predecessor — the enriched chain is a refinement of the
+  // winner, not an independent lineage. The caller (mergePkg) is
+  // responsible for inserting this element into the pool.
+  const syntheticRoot: UxfElement = {
+    header: {
+      representation: winnerRoot.header.representation,
+      semantics: winnerRoot.header.semantics,
+      kind: winnerRoot.header.kind,
+      predecessor: winner.rootHash,
+    },
+    type: 'token-root',
+    content: { ...winnerRoot.content },
+    children: {
+      ...winnerRoot.children,
+      transactions: enrichedTxns,
+    },
+  };
+
+  const rootHash = computeElementHash(syntheticRoot);
+  return { rootHash, syntheticRoot };
 }
 
 // =============================================================================
@@ -313,4 +477,5 @@ export const __internal = {
   getTokenRootTxns,
   countCommittedTxns,
   isPrefix,
+  tryEnrichLongestWithProofs,
 };
