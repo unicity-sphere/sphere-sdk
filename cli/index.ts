@@ -301,13 +301,12 @@ async function getSphere(options?: {
   let providers;
   if (mode === 'profile') {
     // Profile (OrbitDB + IPFS element pool) — new default.
-    const { createNodeProfileProviders } = await import('../profile/node.js');
-    const profileProviders = createNodeProfileProviders({
-      network: config.network,
-      dataDir: config.dataDir,
-    });
-    // Still need transport/oracle/market/groupChat/L1/price from the
-    // legacy node factory — just not its storage/tokenStorage.
+    // The aggregator pointer layer requires the oracle instance; we
+    // construct legacyForNonStorage FIRST so its oracle can be
+    // threaded into the Profile factory. Without this, Phase C of
+    // ProfileStorageProvider.doConnect() skips pointer-layer
+    // construction with reason='oracle_missing' and the pointer
+    // channel is dark at runtime.
     const legacyForNonStorage = createNodeProviders({
       network: config.network,
       dataDir: config.dataDir,
@@ -316,6 +315,12 @@ async function getSphere(options?: {
       tokenSync: { ipfs: { enabled: false } },
       market: true,
       groupChat: true,
+    });
+    const { createNodeProfileProviders } = await import('../profile/node.js');
+    const profileProviders = createNodeProfileProviders({
+      network: config.network,
+      dataDir: config.dataDir,
+      oracle: legacyForNonStorage.oracle,
     });
     providers = {
       ...legacyForNonStorage,
@@ -5607,6 +5612,135 @@ async function main() {
           case 'bash': console.log(generateBashCompletions()); break;
           case 'zsh': console.log(generateZshCompletions()); break;
           case 'fish': console.log(generateFishCompletions()); break;
+        }
+        break;
+      }
+
+      // === POINTER LAYER (T-E1–T-E4b) ===
+      // Top-level `pointer` with subcommands — kept narrow so the
+      // CLI surface matches SPEC §13 method signatures 1-for-1. Each
+      // subcommand is a thin wrapper that locates the pointer layer
+      // via the Profile storage provider and invokes the
+      // corresponding ProfilePointerLayer method. Fails loudly if
+      // the pointer layer is not constructed (legacy storage mode,
+      // no oracle, durability mark missing — see getPointerSkipReason).
+      case 'pointer': {
+        const [, subCmd] = args;
+        const sphere = await getSphere();
+        const storage = (sphere as unknown as {
+          storage?: {
+            getPointerLayer?: () => unknown;
+            getPointerSkipReason?: () => string | null;
+          };
+        }).storage;
+
+        const pointer = (storage?.getPointerLayer?.() ?? null) as {
+          isReachable(): Promise<boolean>;
+          isPublishBlocked(): Promise<boolean>;
+          getBlockedState(): Promise<{ blocked: boolean; reason?: string; setAt?: number }>;
+          getProbeFingerprint(): Promise<string>;
+          recoverLatest(): Promise<{ cid: Uint8Array; version: number } | null>;
+          publish(cidProducer: () => Promise<Uint8Array>): Promise<{ version: number; attemptsUsed: number }>;
+          clearBlocked(): Promise<void>;
+          clearPendingMarker(): Promise<void>;
+          acceptCarLoss(version: number, cidProducer: () => Promise<Uint8Array>): Promise<{ version: number }>;
+          acceptCorruptStreak(walkbackLimit?: number): Promise<{ walkbackUsed: number }>;
+        } | null;
+
+        if (!pointer) {
+          const reason = storage?.getPointerSkipReason?.() ?? 'not-constructed';
+          console.error(`Pointer layer not available: ${reason}`);
+          console.error('Ensure Profile storage mode is active and oracle is configured.');
+          process.exit(1);
+        }
+
+        switch (subCmd) {
+          case 'status': {
+            const reachable = await pointer.isReachable();
+            const blockedState = await pointer.getBlockedState();
+            const fp = await pointer.getProbeFingerprint();
+            console.log('\nPointer Layer Status:');
+            console.log('─'.repeat(60));
+            console.log(`  Reachable:    ${reachable ? 'yes' : 'no'}`);
+            console.log(`  Blocked:      ${blockedState.blocked ? 'YES' : 'no'}`);
+            if (blockedState.blocked) {
+              console.log(`    Reason:     ${blockedState.reason ?? '(unknown)'}`);
+              if (blockedState.setAt) {
+                console.log(`    Set at:     ${new Date(blockedState.setAt).toISOString()}`);
+              }
+            }
+            console.log(`  Probe FP:     ${fp || '(no probes yet)'}`);
+            console.log('─'.repeat(60));
+            break;
+          }
+
+          case 'recover': {
+            const recovered = await pointer.recoverLatest();
+            if (!recovered) {
+              console.log('No pointer anchor published yet — nothing to recover.');
+              break;
+            }
+            const { CID } = await import('multiformats/cid');
+            const cidString = CID.decode(recovered.cid).toString();
+            console.log(`Recovered v=${recovered.version} cid=${cidString}`);
+            break;
+          }
+
+          case 'unblock': {
+            const state = await pointer.getBlockedState();
+            if (!state.blocked) {
+              console.log('Pointer layer is not blocked.');
+              break;
+            }
+            // Route to the appropriate CLEAR path by reason category.
+            // Integrity-class reasons (UNTRUSTED_PROOF,
+            // SECURITY_ORIGIN_MISMATCH, AGGREGATOR_REJECTED) are
+            // explicitly refused — operator must investigate, not
+            // auto-recover. See RUNBOOK §3.2.
+            const integrityReasons = new Set([
+              'untrusted_proof',
+              'security_origin_mismatch',
+              'aggregator_rejected',
+            ]);
+            if (state.reason && integrityReasons.has(state.reason)) {
+              console.error(
+                `Refusing to unblock: reason='${state.reason}' indicates an integrity event. ` +
+                  `Investigate before clearing. See RUNBOOK §3.2 / §8.`,
+              );
+              process.exit(1);
+            }
+            if (state.reason === 'marker_corrupt') {
+              await pointer.clearPendingMarker();
+              console.log('Pending marker cleared. BLOCKED remains set pending successful recovery.');
+              break;
+            }
+            await pointer.clearBlocked();
+            console.log(`Cleared BLOCKED state (previous reason: ${state.reason ?? 'unknown'}).`);
+            break;
+          }
+
+          case 'flush': {
+            // Force a pointer publish by running a save through the
+            // token storage provider. Useful for tests and operator
+            // smoke-checks — does not take an argument.
+            const providers = sphere.payments?.getTokenStorageProviders?.();
+            if (providers && typeof providers.size === 'number' && providers.size > 0) {
+              // Trigger the save chain; flushToIpfs awaits the pointer publish.
+              await (sphere.payments as unknown as { save?: () => Promise<void> }).save?.();
+            }
+            const fp = await pointer.getProbeFingerprint();
+            console.log(`Flush complete. Probe fingerprint: ${fp || '(none yet)'}.`);
+            break;
+          }
+
+          default:
+            console.error('Unknown pointer subcommand:', subCmd);
+            console.log('\nUsage:');
+            console.log('  pointer status           Show reachable / blocked / probe-fingerprint');
+            console.log('  pointer recover          Invoke recoverLatest and print CID');
+            console.log('  pointer unblock          Clear BLOCKED if safe (routes by reason)');
+            console.log('  pointer flush            Trigger a save + pointer publish round-trip');
+            process.exit(1);
         }
         break;
       }
