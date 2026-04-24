@@ -49,6 +49,7 @@ import { diff as diffImpl, applyDelta as applyDeltaImpl } from './diff.js';
 import { packageToJson, packageFromJson } from './json.js';
 import { exportToCar, importFromCar } from './ipld.js';
 import { resolveTokenRoot } from './token-join.js';
+import { logger } from '../core/logger.js';
 
 // ---------------------------------------------------------------------------
 // UxfPackage Class
@@ -470,12 +471,76 @@ export function removeToken(pkg: UxfPackageData, tokenId: string): void {
  * Manifest entries from source are added (or overwritten if tokenId collides).
  * Instance chains are merged per Decision 6.
  * Secondary indexes are rebuilt from scratch.
+ *
+ * ------------------------------------------------------------------
+ * Per-token atomicity contract
+ * ------------------------------------------------------------------
+ *
+ * The merge is **per-token atomic** rather than whole-merge atomic:
+ *   - Whole-bundle pool verification (Decision 7) is a fast-fail
+ *     gate. If ANY source pool element fails its hash re-check, the
+ *     entire merge aborts and target state is unchanged — a corrupt
+ *     pool is a whole-bundle integrity failure and cannot be
+ *     localised to a single tokenId.
+ *   - Once the pool verifies, each source manifest entry is
+ *     processed independently. If `resolveTokenRoot` throws for
+ *     tokenId N (e.g. `computeElementHash` rejects a malformed
+ *     child inside a Rule 4 synthetic rebuild), the failure is
+ *     logged via `logger.warn('UxfPackage', …)` citing tokenId +
+ *     error, and iteration CONTINUES for the remaining tokenIds.
+ *     One poisoned entry must not deny the user their good tokens.
+ *
+ * Implementation:
+ *   1. Stage the pool-verify pass into a proposed-inserts map
+ *      without touching target.pool.
+ *   2. Build a temporary "virtual pool" (target.pool ∪ stagedPool)
+ *      that the resolver can read through, without any commits.
+ *   3. For each source manifest entry: invoke the resolver, stage
+ *      its manifest write + any Rule 4 synthetic root insert. Skip
+ *      on throw.
+ *   4. Apply all staged writes to target.pool and target.manifest
+ *      atomically (synchronous Map.set calls — no I/O inside the
+ *      apply phase).
+ *
+ * Pool-rollback policy for partially-merged tokens:
+ *
+ *   Source pool elements are retained even when the owning source
+ *   manifest entry was skipped on a resolver throw. Rationale:
+ *     - The pool is content-addressed. Duplicate keys are no-ops;
+ *       unused pool growth is bounded at roughly ~500 bytes per
+ *       orphaned element and removed by `gc()` on demand.
+ *     - Transaction / state / predicate elements authored for a
+ *       skipped tokenId may be legitimately referenced by a
+ *       surviving tokenId's instance chain (shared nametag tokens,
+ *       shared predicates). A reachability-aware rollback would
+ *       have to re-implement `walkReachable` + set arithmetic on
+ *       the staged inserts — needless complexity for cheap bloat.
+ *     - GC is already the documented contract for pruning
+ *       unreachable elements after `removeToken` / partial imports.
+ *
+ * Multi-source (3+ candidate) refactor note (W3):
+ *
+ *   `resolveTokenRoot`'s `divergent` outcome is whole-set when
+ *   candidates ≥ 3: if any pair diverges the whole tokenId falls
+ *   into `divergent`. Today mergePkg is strictly 2-candidate
+ *   (existingRoot + incomingRoot) so this is latent. A future
+ *   multi-source JOIN (merging K ≥ 2 source bundles in one pass)
+ *   should either (a) fold sources pairwise with this 2-candidate
+ *   resolver, accepting that pairwise JOIN is not associative for
+ *   the `divergent` case, or (b) extend the resolver to return a
+ *   compatibility partition and pick the majority class. Leave the
+ *   refactor — just documenting.
  */
 function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
   const mutablePool = target.pool as Map<ContentHash, UxfElement>;
   const mutableManifest = target.manifest.tokens as Map<string, ContentHash>;
 
-  // Re-hash and verify every incoming element (Decision 7)
+  // ---- Phase 1: stage pool inserts with whole-bundle hash verify ----
+  //
+  // Decision 7 — every incoming element's hash must match its key.
+  // A failure here is a whole-bundle corruption and aborts the
+  // merge before ANY target state is touched.
+  const stagedPoolInserts = new Map<ContentHash, UxfElement>();
   for (const [hash, element] of source.pool) {
     const recomputed = computeElementHash(element);
     if (recomputed !== hash) {
@@ -484,43 +549,94 @@ function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
         `Hash mismatch for incoming element ${hash}: computed ${recomputed}`,
       );
     }
-    // Dedup by hash: only insert if not already present
+    // Dedup by hash: only stage if target doesn't already have it.
     if (!mutablePool.has(hash)) {
-      mutablePool.set(hash, element);
+      stagedPoolInserts.set(hash, element);
     }
   }
 
-  // Merge manifest: run the per-token JOIN resolver on collision
-  // rather than blind last-writer-wins. Rules 3 + 4 of §10.4 are
-  // honored here (longest-valid-chain + proof-enriched synthetic
-  // root). The resolver is deterministic for a given (tokenId,
-  // candidates, pool), so cross-device agreement holds.
+  // Virtual read-only pool view: target ∪ staged inserts. The
+  // resolver reads through `get`; a plain Map union is simpler
+  // than a proxy and correct for this call path.
+  const virtualPool: ReadonlyMap<ContentHash, UxfElement> = new Map([
+    ...mutablePool,
+    ...stagedPoolInserts,
+  ]);
+
+  // ---- Phase 2: stage per-token manifest writes + synthetic inserts ----
+  //
+  // Each source manifest entry is processed in a try/catch so one
+  // poisoned tokenId (resolver throws from e.g. Rule 4
+  // `computeElementHash` rejecting a malformed child) does not
+  // abort the merge for the other tokens.
+  const stagedManifestWrites = new Map<string, ContentHash>();
+  const stagedSyntheticInserts = new Map<ContentHash, UxfElement>();
+
   for (const [tokenId, incomingRoot] of source.manifest.tokens) {
-    const existingRoot = mutableManifest.get(tokenId);
-    if (existingRoot === undefined) {
-      mutableManifest.set(tokenId, incomingRoot);
-      continue;
+    try {
+      const existingRoot = mutableManifest.get(tokenId);
+      if (existingRoot === undefined) {
+        stagedManifestWrites.set(tokenId, incomingRoot);
+        continue;
+      }
+      if (existingRoot === incomingRoot) {
+        continue;
+      }
+      // Per-token JOIN resolver (Rules 3 + 4 of §10.4).
+      // Deterministic for a given (tokenId, candidates, pool).
+      const outcome = resolveTokenRoot({
+        tokenId,
+        candidates: [existingRoot, incomingRoot],
+        pool: virtualPool,
+      });
+      // Rule 4: a synthetic proof-enriched TokenRoot must be
+      // inserted into the pool under the resolver's returned
+      // rootHash so the manifest's ref is resolvable. The resolver
+      // is pure (does not touch the pool) — the insert is the
+      // caller's responsibility here.
+      if (outcome.kind === 'enriched') {
+        stagedSyntheticInserts.set(outcome.rootHash, outcome.syntheticRoot);
+      }
+      stagedManifestWrites.set(tokenId, outcome.rootHash);
+    } catch (err) {
+      // One poisoned tokenId must not abort the whole merge.
+      // Skip this entry, log it for telemetry / operator review,
+      // and continue. Target state for this tokenId stays at its
+      // pre-merge value (whatever `mutableManifest.get(tokenId)`
+      // was — possibly undefined, i.e. the entry is simply
+      // absent from the merged manifest).
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        'UxfPackage',
+        `mergePkg: skipping tokenId ${tokenId} — resolver threw: ${message}`,
+      );
     }
-    if (existingRoot === incomingRoot) {
-      continue;
-    }
-    const outcome = resolveTokenRoot({
-      tokenId,
-      candidates: [existingRoot, incomingRoot],
-      pool: mutablePool,
-    });
-    // Rule 4: a synthetic proof-enriched TokenRoot must be inserted
-    // into the pool under the resolver's returned rootHash so the
-    // manifest's ref is resolvable. The resolver is pure (does not
-    // touch the pool) — the insert is the caller's responsibility
-    // here.
-    if (outcome.kind === 'enriched') {
-      mutablePool.set(outcome.rootHash, outcome.syntheticRoot);
-    }
-    mutableManifest.set(tokenId, outcome.rootHash);
   }
 
-  // Merge instance chains (Decision 6)
+  // ---- Phase 3: atomic apply ----
+  //
+  // Synchronous Map.set calls. No I/O, no throws in this block —
+  // all inputs were validated during staging. If ANY of the
+  // following stages throws (indicating a programmer error, not
+  // data corruption) the target is partially mutated and the
+  // caller should treat the package as tainted. This is the
+  // narrowest window possible given the API shape.
+  for (const [hash, element] of stagedPoolInserts) {
+    mutablePool.set(hash, element);
+  }
+  for (const [hash, syntheticRoot] of stagedSyntheticInserts) {
+    mutablePool.set(hash, syntheticRoot);
+  }
+  for (const [tokenId, rootHash] of stagedManifestWrites) {
+    mutableManifest.set(tokenId, rootHash);
+  }
+
+  // Merge instance chains (Decision 6). Operates on the committed
+  // target pool and mutates target.instanceChains in place. If this
+  // throws, per-token manifest writes above have already committed
+  // — but instance-chain merging is defensively pool-driven and a
+  // throw here indicates a programmer error rather than a
+  // data-shape failure. Not wrapping.
   const targetPool = wrapPool(target);
   mergeInstanceChains(
     target.instanceChains as MutableInstanceChainIndex,
