@@ -409,6 +409,48 @@ function sameCoreDifferentProof(
 }
 
 /**
+ * Steelman remediation: header-equality gate layered on top of
+ * sameCoreDifferentProof for Rule 4 enrichment. Rejects alts whose
+ * header differs from the winner's — prevents a malicious source
+ * from sneaking a forward-protocol-version or attacker-tagged
+ * transaction into the winner's chain via proof-lift.
+ */
+function sameHeaderShape(a: UxfElement, b: UxfElement): boolean {
+  return (
+    a.header.representation === b.header.representation &&
+    a.header.semantics === b.header.semantics &&
+    a.header.kind === b.header.kind &&
+    a.header.predecessor === b.header.predecessor
+  );
+}
+
+/**
+ * Steelman remediation: structural well-formedness check on an alt's
+ * inclusionProof when the proof element is present in the pool.
+ * Rule 4 does NOT run oracle-layer cryptographic verification (that
+ * happens at the aggregator boundary). But if the proof element
+ * exists in the pool, we require it to carry the expected sub-elements
+ * (authenticator + smtPath). Dangling proof references are permitted
+ * (verify.ts catches those upstream); this gate closes the
+ * "attacker-crafted proof element in the pool" path.
+ */
+function altProofIsStructurallyValid(
+  altElement: UxfElement,
+  pool: ReadonlyMap<ContentHash, UxfElement>,
+): boolean {
+  const children = altElement.children as Record<string, ContentHash | ContentHash[] | null>;
+  const proofHash = children.inclusionProof;
+  if (typeof proofHash !== 'string') return false;
+  const proofEl = pool.get(proofHash);
+  if (!proofEl) return true; // dangling — verify.ts upstream catches it
+  if (proofEl.type !== 'inclusion-proof') return false;
+  const pc = proofEl.children as Record<string, unknown>;
+  if (typeof pc.authenticator !== 'string') return false;
+  if (typeof pc.smtPath !== 'string') return false;
+  return true;
+}
+
+/**
  * Walk the common prefix of the winner's tx chain vs every OTHER
  * candidate. For each position where winner has no proof and some
  * other candidate has a same-core-different-proof tx with a proof,
@@ -462,6 +504,18 @@ function tryEnrichLongestWithProofs(
       if (altHash === curHash) continue;
       if (!txHasProof(altHash, pool)) continue;
       if (!sameCoreDifferentProof(curHash, altHash, pool)) continue;
+
+      // Steelman remediation gates layered on top of sameCore:
+      //   (a) header shapes must match — guards against attacker-
+      //       tagged forward-protocol-version transactions slipping
+      //       through proof-lift into the winner's chain.
+      //   (b) alt's inclusion-proof element (when present in pool)
+      //       must be well-formed.
+      const curEl = pool.get(curHash);
+      const altEl = pool.get(altHash);
+      if (!curEl || !altEl) continue;
+      if (!sameHeaderShape(curEl, altEl)) continue;
+      if (!altProofIsStructurallyValid(altEl, pool)) continue;
 
       enrichedTxns[pos] = altHash;
       enriched = true;

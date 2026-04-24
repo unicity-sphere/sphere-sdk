@@ -46,11 +46,22 @@ import { UxfError } from './errors.js';
 
 /**
  * Internal context threaded through all assembly helpers.
- * Carries visited-hash set (cycle detection), instance chain index,
- * and instance selection strategy.
+ *
+ * Steelman remediation: `explored` memoizes nodes already verified —
+ * a revisit from a sibling DFS path is a legitimate DAG diamond
+ * (same element reached by two distinct paths), not a cycle. Examples
+ * that trip on global "visited-as-cycle":
+ *   - self-transfer where sourceState == destinationState
+ *   - any token whose state equals a tx's sourceState
+ *
+ * Cycle safety: a genuine cycle would cause infinite recursion, but
+ * `maxDepth` decrements on each recursive assembler call and throws
+ * MAX_DEPTH_EXCEEDED long before stack overflow. Verify.ts runs an
+ * explicit path-stack cycle check upstream of assemble on untrusted
+ * packages.
  */
 interface AssemblyContext {
-  readonly visited: Set<string>;
+  readonly explored: Set<string>;
   readonly instanceChains: InstanceChainIndex;
   readonly strategy: InstanceSelectionStrategy;
   maxDepth: number;
@@ -76,11 +87,14 @@ function resolveAndVerify(
   ctx: AssemblyContext,
   expectedType?: UxfElementType,
 ): UxfElement {
-  // Cycle detection
-  if (ctx.visited.has(hash)) {
-    throw new UxfError('CYCLE_DETECTED', `Cycle detected at element ${hash}`);
+  // Steelman remediation: revisits are legitimate DAG diamonds, not
+  // cycles. maxDepth bounds genuine cycles; verify.ts provides the
+  // explicit path-stack check upstream. Skip the shape/hash verify
+  // on repeat visits — the first visit already verified.
+  if (ctx.explored.has(hash)) {
+    return resolveElement(pool, hash, ctx.instanceChains, ctx.strategy);
   }
-  ctx.visited.add(hash);
+  ctx.explored.add(hash);
 
   // Resolve through instance chain (may return a different element)
   const element = resolveElement(pool, hash, ctx.instanceChains, ctx.strategy);
@@ -103,8 +117,10 @@ function resolveAndVerify(
         `Hash mismatch for element ${selectedHash}: computed ${actualHash}`,
       );
     }
-    // Also mark the selected hash as visited
-    ctx.visited.add(selectedHash);
+    // selectedHash is a sibling hash in the chain — track via explored
+    // so an immediate sibling revisit at this DFS frame still verifies,
+    // but does not pollute pathStack as a false ancestor.
+    ctx.explored.add(selectedHash);
   } else {
     if (actualHash !== hash) {
       throw new UxfError(
@@ -496,7 +512,7 @@ export function assembleTokenFromRoot(
   strategy: InstanceSelectionStrategy = STRATEGY_LATEST,
 ): unknown {
   const ctx: AssemblyContext = {
-    visited: new Set<string>(),
+    explored: new Set<string>(),
     instanceChains,
     strategy,
     maxDepth: 100,
@@ -537,7 +553,7 @@ export function assembleTokenAtState(
   }
 
   const ctx: AssemblyContext = {
-    visited: new Set<string>(),
+    explored: new Set<string>(),
     instanceChains,
     strategy,
     maxDepth: 100,

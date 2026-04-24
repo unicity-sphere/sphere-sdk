@@ -5692,30 +5692,44 @@ async function main() {
               console.log('Pointer layer is not blocked.');
               break;
             }
-            // Route to the appropriate CLEAR path by reason category.
-            // Integrity-class reasons (UNTRUSTED_PROOF,
-            // SECURITY_ORIGIN_MISMATCH, AGGREGATOR_REJECTED) are
-            // explicitly refused — operator must investigate, not
-            // auto-recover. See RUNBOOK §3.2.
-            const integrityReasons = new Set([
-              'untrusted_proof',
-              'security_origin_mismatch',
-              'aggregator_rejected',
+            // Steelman remediation: inverted allowlist. Previously an
+            // integrity denylist meant a typo or novel protocol reason
+            // fell through to auto-clear — a silent integrity bypass
+            // on any future reason string. SAFE reasons are explicit;
+            // anything else requires operator investigation + --force.
+            // See RUNBOOK §3.2.
+            const safeReasonsAutoClear = new Set([
+              'network_error',
+              'timeout',
+              'transient_failure',
             ]);
-            if (state.reason && integrityReasons.has(state.reason)) {
-              console.error(
-                `Refusing to unblock: reason='${state.reason}' indicates an integrity event. ` +
-                  `Investigate before clearing. See RUNBOOK §3.2 / §8.`,
-              );
-              process.exit(1);
-            }
+            // marker_corrupt has its own distinct recovery path.
             if (state.reason === 'marker_corrupt') {
               await pointer.clearPendingMarker();
               console.log('Pending marker cleared. BLOCKED remains set pending successful recovery.');
               break;
             }
+            const force = args.includes('--force');
+            if (state.reason && safeReasonsAutoClear.has(state.reason)) {
+              await pointer.clearBlocked();
+              console.log(`Cleared BLOCKED state (previous reason: ${state.reason}).`);
+              break;
+            }
+            if (!force) {
+              console.error(
+                `Refusing to unblock: reason='${state.reason ?? 'unknown'}' is not on the ` +
+                  `auto-clear allowlist. This may indicate an integrity event (untrusted_proof, ` +
+                  `security_origin_mismatch, aggregator_rejected, rejected) OR a novel protocol-level ` +
+                  `reason. Investigate first; re-run with --force if you understand the risk. ` +
+                  `See RUNBOOK §3.2 / §8.`,
+              );
+              process.exit(1);
+            }
             await pointer.clearBlocked();
-            console.log(`Cleared BLOCKED state (previous reason: ${state.reason ?? 'unknown'}).`);
+            console.log(
+              `FORCE-cleared BLOCKED state (previous reason: ${state.reason ?? 'unknown'}). ` +
+                `Operator assumed responsibility via --force.`,
+            );
             break;
           }
 

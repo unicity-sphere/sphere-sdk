@@ -183,6 +183,25 @@ export function elementToIpldBlock(element: UxfElement): {
  * @returns The complete CAR bytes.
  */
 export async function exportToCar(pkg: UxfPackageData): Promise<Uint8Array> {
+  // Steelman remediation: refuse to export a package whose manifest
+  // head is a Rule 4 ENRICHED_SYNTHETIC_KIND token-root. Synthetic
+  // roots are ephemeral merge artifacts — they carry a synthesized
+  // signature-free tx chain that downstream peers would otherwise
+  // ingest as canonical. Callers must "finalize" before export
+  // (replace the synthetic head with a real signed root, or drop
+  // the affected token). See uxf/token-join.ts `ENRICHED_SYNTHETIC_KIND`.
+  for (const [tokenId, rootHash] of pkg.manifest.tokens) {
+    const rootEl = pkg.pool.get(rootHash);
+    if (rootEl && rootEl.header.kind === 'enriched-synthetic') {
+      throw new UxfError(
+        'VERIFICATION_FAILED',
+        `Refusing to export package with synthetic (Rule 4 enriched) manifest head ` +
+          `for token ${tokenId} (rootHash=${rootHash}). Finalize the merge first: ` +
+          `resolve the synthetic to a signed root or remove the token from the manifest.`,
+      );
+    }
+  }
+
   // -- Build manifest IPLD block --
   // Manifest: { tokens: { tokenId: CID, ... } }
   const manifestTokens: Record<string, CID> = {};
