@@ -119,7 +119,28 @@ type CoinTotals = Map<string, bigint>;
 function totalize(tokens: ReadonlyArray<ConservationToken>): CoinTotals {
   const totals: CoinTotals = new Map();
   for (const t of tokens) {
+    // Duplicate-coinId detection WITHIN a single token's coins[]. A
+    // token should list each coinId at most once; a fixture that
+    // lists `[{UCT, 5n}, {UCT, 5n}]` silently totalled to 10 UCT
+    // under the old impl — exactly the kind of typo that masks a
+    // real conservation violation. Reject at the source.
+    const seenInToken = new Set<string>();
     for (const c of t.coins) {
+      // W1: negative amounts are definitionally nonsensical (tokens
+      // cannot hold negative coin balances). A negative amount in a
+      // fixture would self-cancel during totalization and mask
+      // real violations — fail loudly at the snapshot edge instead.
+      if (c.amount < 0n) {
+        throw new Error(
+          `TokenConservation: token ${t.tokenId} coin ${c.coinId} has negative amount ${c.amount}; fixtures must use non-negative bigints`,
+        );
+      }
+      if (seenInToken.has(c.coinId)) {
+        throw new Error(
+          `TokenConservation: token ${t.tokenId} lists coinId '${c.coinId}' more than once; each token should carry at most one entry per coinId (duplicate would silently sum and mask violations)`,
+        );
+      }
+      seenInToken.add(c.coinId);
       totals.set(c.coinId, (totals.get(c.coinId) ?? 0n) + c.amount);
     }
   }
@@ -157,7 +178,36 @@ export class TokenConservationViolation extends Error {
   ) {
     super(message);
     this.name = 'TokenConservationViolation';
-    this.byCoin = byCoin;
+    // Freeze each entry so a consumer cannot mutate the recorded
+    // expected/observed/delta in place.
+    for (const v of byCoin.values()) Object.freeze(v);
+    // Expose as a genuine read-only Map: Object.freeze does NOT
+    // block Map.prototype.set/delete/clear on an otherwise-frozen
+    // Map instance (the mutators bypass property descriptors), so a
+    // frozen Map is not actually immutable at runtime. Proxy trap
+    // the three mutators to throw; leave every other method/get
+    // untouched so the ReadonlyMap surface is fully usable.
+    // Proxy-trap the three mutators to throw. Other members
+    // (size, get, has, entries, keys, values, forEach, Symbol.iterator)
+    // are forwarded to the underlying Map. We use `target` as the
+    // receiver on `Reflect.get` because Map accessors (notably `size`)
+    // rely on an internal [[MapData]] slot check that fails if the
+    // receiver is the Proxy; binding function results to `target`
+    // keeps the internal-slot machinery pointed at the real Map.
+    const inner = new Map(byCoin);
+    this.byCoin = new Proxy(inner, {
+      get(target, prop) {
+        if (prop === 'set' || prop === 'delete' || prop === 'clear') {
+          return () => {
+            throw new TypeError(
+              `TokenConservationViolation.byCoin is read-only; ${String(prop)} is not permitted`,
+            );
+          };
+        }
+        const value = Reflect.get(target, prop, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as ReadonlyMap<string, { expected: bigint; observed: bigint; delta: bigint }>;
   }
 }
 
@@ -183,6 +233,20 @@ export function assertTokenConservation(
   const mintedTotals = totalize(expected.minted ?? []);
   const burnedTotals = totalize(expected.burned ?? []);
   const tolerance = expected.tolerance ?? new Map<string, bigint>();
+
+  // W2: a negative tolerance would flip the absDelta comparison at
+  // line below into a state where EVEN zero-delta (observed ===
+  // expected) reports as a violation (|0| > -1 is true). Pre-
+  // validate so a typo at the tolerance fixture edge fails here
+  // instead of reporting confusing false-positives across every
+  // coinId in the snapshot.
+  for (const [coinId, tol] of tolerance) {
+    if (tol < 0n) {
+      throw new Error(
+        `TokenConservation: tolerance for ${coinId} is negative (${tol}); tolerances must be non-negative`,
+      );
+    }
+  }
 
   const allCoins = unionKeys(beforeTotals, afterTotals, mintedTotals, burnedTotals);
 

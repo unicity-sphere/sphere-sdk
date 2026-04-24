@@ -211,6 +211,64 @@ describe('assertTokenConservation — tolerance', () => {
 // diffSnapshots
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Input validation — steelman W1/W2/W3
+// ---------------------------------------------------------------------------
+
+describe('assertTokenConservation — input validation guards', () => {
+  it('rejects a fixture with a negative coin amount (W1 false-negative guard)', () => {
+    const bad = captureSnapshot('bad', [tok('t1', 'UCT', -10n)]);
+    const empty = captureSnapshot('empty', []);
+    expect(() => assertTokenConservation(bad, empty)).toThrow(/negative amount/);
+    expect(() => assertTokenConservation(empty, bad)).toThrow(/negative amount/);
+  });
+
+  it('rejects a fixture with a duplicate coinId in one token (W3 silent-sum guard)', () => {
+    const bad: ConservationToken = {
+      tokenId: 't1',
+      coins: [
+        { coinId: 'UCT', amount: 5n },
+        { coinId: 'UCT', amount: 5n },
+      ],
+    };
+    const snap = captureSnapshot('snap', [bad]);
+    expect(() =>
+      assertTokenConservation(snap, captureSnapshot('empty', [])),
+    ).toThrow(/more than once/);
+  });
+
+  it('rejects a negative tolerance (W2 false-positive guard)', () => {
+    const a = captureSnapshot('a', [tok('t1', 'UCT', 10n)]);
+    const b = captureSnapshot('b', [tok('t1', 'UCT', 10n)]);
+    expect(() =>
+      assertTokenConservation(a, b, {
+        tolerance: new Map([['UCT', -1n]]),
+      }),
+    ).toThrow(/negative/);
+  });
+
+  it('byCoin map on the thrown violation is frozen (cannot be mutated by reporters)', () => {
+    const before = captureSnapshot('before', [tok('t1', 'UCT', 100n)]);
+    const after = captureSnapshot('after', [tok('t1', 'UCT', 50n)]);
+    try {
+      assertTokenConservation(before, after);
+      throw new Error('expected violation');
+    } catch (err) {
+      const e = err as TokenConservationViolation;
+      // Map.set on a frozen map throws in strict mode; in sloppy
+      // mode it silently no-ops. Assert the resulting state is
+      // unchanged either way.
+      const before = e.byCoin.size;
+      try {
+        (e.byCoin as unknown as Map<string, unknown>).set('hack', {});
+      } catch {
+        // expected TypeError on frozen map
+      }
+      expect(e.byCoin.size).toBe(before);
+    }
+  });
+});
+
 describe('diffSnapshots', () => {
   it('returns a per-coin diff sorted by coinId', () => {
     const a = captureSnapshot('a', [
