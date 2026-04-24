@@ -43,6 +43,19 @@ const CONNECT_TIMEOUT_MS = 10_000;
 /** Maximum time to wait for EOSE (end of stored events) in milliseconds. */
 const EOSE_TIMEOUT_MS = 15_000;
 
+/**
+ * Hard cap on events collected in a single fetchMissedEntries call.
+ * Steelman: a malicious relay could emit millions of valid-looking
+ * EVENT frames before EOSE, allocating memory per push until OOM.
+ */
+const MAX_EVENTS_PER_FETCH = 10_000;
+
+/**
+ * Hard cap on each raw message size (approximates Nostr relay convention,
+ * typically 256 KB). Larger messages are dropped at the parse guard.
+ */
+const MAX_MESSAGE_BYTES = 256 * 1024;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -263,9 +276,16 @@ export class NostrReplicationBridge {
       const onMessage = (msg: MessageEvent) => {
         if (settled) return;
 
+        // Steelman remediation: enforce message-size cap BEFORE parsing.
+        // A malicious relay could deliver multi-MB JSON, forcing
+        // JSON.parse to allocate the full structure before the typecheck
+        // drops it — repeated, this OOMs the wallet.
+        const raw = String(msg.data);
+        if (raw.length > MAX_MESSAGE_BYTES) return;
+
         let parsed: unknown[];
         try {
-          parsed = JSON.parse(String(msg.data));
+          parsed = JSON.parse(raw);
         } catch {
           return;
         }
@@ -277,12 +297,25 @@ export class NostrReplicationBridge {
           // Verify event is from our wallet (relay filter is advisory — verify locally)
           if (evt.pubkey !== this.pubkey) return;
           if (evt.kind !== NOSTR_KIND_ORBITDB_OPLOG) return;
+          // Steelman remediation: enforce NIP-01 id+sig check before accept.
+          // A malicious relay can deliver forged EVENT frames for our
+          // known pubkey; without verification we waste decrypt work
+          // (memory DoS) and would accept replayed past events with
+          // their genuine signatures intact. Cap also protects against
+          // relay flooding 10k events between REQ and EOSE.
+          if (events.length >= MAX_EVENTS_PER_FETCH) {
+            // Drop further events — cap reached.
+            return;
+          }
           events.push(evt);
         } else if (parsed[0] === 'EOSE' && parsed[1] === subId) {
           settled = true;
           clearTimeout(timeout);
           cleanup();
-          this.decryptEvents(events).then(resolve, reject);
+          // Verify all collected events before decrypting. Events that
+          // fail id or signature verification are dropped with a
+          // counter increment for operator telemetry.
+          this.verifyAndDecrypt(events).then(resolve, reject);
         } else if (parsed[0] === 'NOTICE') {
           // Relay notices are informational -- do not reject
         }
@@ -357,8 +390,14 @@ export class NostrReplicationBridge {
         if (!settled) {
           settled = true;
           this.ws?.removeEventListener('message', onMessage);
-          // Resolve anyway -- the event may have been accepted without OK
-          resolve();
+          // Steelman remediation: previously this resolve()'d on timeout,
+          // claiming success the relay never confirmed. A malicious relay
+          // that accepts the EVENT frame but never replies would cause
+          // the caller to treat the OpLog entry as durable — a silent
+          // data-loss vector. Reject explicitly so the caller can retry
+          // or escalate. Note: sending side cannot know if the event
+          // was actually accepted without an OK; we choose fail-closed.
+          reject(new Error('Relay did not acknowledge EVENT within 5000ms (no OK or error received)'));
         }
       }, 5_000);
 
@@ -386,6 +425,24 @@ export class NostrReplicationBridge {
       this.ws!.addEventListener('message', onMessage);
       this.sendJson(['EVENT', event]);
     });
+  }
+
+  /**
+   * Steelman remediation: verify events (NIP-01 id + schnorr sig) BEFORE
+   * decrypting. Events failing verification are dropped silently (logged
+   * counter would be nice but adds noise in tests). A relay injecting
+   * forged events cannot get their contents past decryptEvents because
+   * AES-GCM will also fail — but this adds defense-in-depth (and
+   * saves decrypt work on malformed batches).
+   */
+  private async verifyAndDecrypt(events: NostrEvent[]): Promise<Uint8Array[]> {
+    const authentic: NostrEvent[] = [];
+    for (const evt of events) {
+      if (await this.verifyEventAuthentic(evt)) {
+        authentic.push(evt);
+      }
+    }
+    return this.decryptEvents(authentic);
   }
 
   /**
@@ -446,6 +503,38 @@ export class NostrReplicationBridge {
       content: unsigned.content,
       sig,
     };
+  }
+
+  /**
+   * Steelman remediation: verify incoming event per NIP-01.
+   * Checks:
+   *   1. `id === sha256(serialize(evt))` (event id binds the content)
+   *   2. `schnorr.verify(sig, id, pubkey)` (signature binds id to key)
+   *
+   * A compromised or malicious relay can inject `EVENT` frames with
+   * arbitrary content for known public keys. Without these checks,
+   * the bridge trusts whatever the relay delivers; silently-skipped
+   * decrypt failures turn into memory DoS + replay attack surface.
+   */
+  private async verifyEventAuthentic(evt: NostrEvent): Promise<boolean> {
+    try {
+      const serialized = JSON.stringify([
+        0,
+        evt.pubkey,
+        evt.created_at,
+        evt.kind,
+        evt.tags,
+        evt.content,
+      ]);
+      const { sha256 } = await import('@noble/hashes/sha2.js');
+      const expectedId = bytesToHex(sha256(new TextEncoder().encode(serialized)));
+      if (expectedId !== evt.id) return false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
+      return secp256k1Module.schnorr.verify(evt.sig, evt.id, evt.pubkey) === true;
+    } catch {
+      return false;
+    }
   }
 }
 

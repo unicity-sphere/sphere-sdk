@@ -297,17 +297,44 @@ export class OrbitDbAdapter implements ProfileDatabase {
       if (value === undefined || value === null) {
         return null;
       }
-      // Ensure we return a Uint8Array even if OrbitDB returns a different type
+      // Ensure we return a Uint8Array even if OrbitDB returns a different type.
       if (value instanceof Uint8Array) {
         return value;
       }
-      // OrbitDB may store/return values through IPLD serialization which can
-      // produce a plain object with numeric keys. Coerce gracefully.
+      // OrbitDB may return values through IPLD serialization which can
+      // produce a plain object with numeric keys. Steelman remediation:
+      // validate the object shape BEFORE coercing. A malicious peer write
+      // replicated via LWW can contain:
+      //   - huge `length` (OOM via `new Uint8Array(1e9)`)
+      //   - non-numeric entries (silently coerced to NaN → 0, masking
+      //     corruption)
+      //   - strings, nested objects, or inherited properties
+      // Reject anything that doesn't look like a dense byte-valued map.
       if (typeof value === 'object' && value !== null) {
-        return new Uint8Array(Object.values(value) as number[]);
+        const values = Object.values(value);
+        if (values.length > 1 << 20) {
+          // 1 MiB of bytes via object coercion is already pathological.
+          throw new ProfileError(
+            'ORBITDB_READ_FAILED',
+            `Refusing to coerce object with ${values.length} entries to Uint8Array for key "${key}"`,
+          );
+        }
+        const bytes = new Uint8Array(values.length);
+        for (let i = 0; i < values.length; i++) {
+          const v = values[i];
+          if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
+            throw new ProfileError(
+              'ORBITDB_READ_FAILED',
+              `Invalid byte value at index ${i} for key "${key}": ${typeof v} (expected integer 0-255)`,
+            );
+          }
+          bytes[i] = v;
+        }
+        return bytes;
       }
       return null;
     } catch (err) {
+      if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
         `Failed to read key "${key}": ${err instanceof Error ? err.message : String(err)}`,

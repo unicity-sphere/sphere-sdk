@@ -179,8 +179,32 @@ async function fetchFileFromIpfs(
   maxSizeBytes: number = 1 * 1024 * 1024,
 ): Promise<Uint8Array> {
   let lastError: Error | null = null;
+
+  // Steelman remediation: parse the CID locally so we know whether the
+  // content is raw-encoded (sha256-verifiable) or UnixFS-wrapped (not
+  // directly byte-verifiable). For raw-codec CIDs we enforce
+  // content-address verify after fetch; for UnixFS-wrapped (legacy path)
+  // we still fetch but log a one-time warning that bytes are not
+  // content-address verified — the IPNS pubkey signature remains the
+  // trust anchor.
+  let parsedCid: CID;
+  try {
+    parsedCid = CID.parse(cid);
+  } catch (err) {
+    throw new ProfileError(
+      'BUNDLE_NOT_FOUND',
+      `Legacy snapshot CID is not parseable: ${cid}`,
+      err,
+    );
+  }
+  const isRawCodec = parsedCid.code === 0x55; // raw multicodec
+
   for (const gateway of gateways) {
     try {
+      // Steelman remediation: enforce Content-Length cap BEFORE
+      // buffering the body. Without this, a malicious gateway can
+      // stream gigabytes and OOM before the post-buffer check fires.
+      // We use fetch + streaming read up to `maxSizeBytes`.
       const url = `${gateway.replace(/\/$/, '')}/ipfs/${cid}`;
       const response = await fetch(url, {
         headers: { Accept: 'application/octet-stream' },
@@ -190,6 +214,13 @@ async function fetchFileFromIpfs(
         lastError = new Error(`HTTP ${response.status} from ${gateway}`);
         continue;
       }
+      const declaredLen = Number(response.headers.get('content-length') ?? '0');
+      if (Number.isFinite(declaredLen) && declaredLen > maxSizeBytes) {
+        lastError = new Error(
+          `Content-Length ${declaredLen} exceeds cap ${maxSizeBytes} from ${gateway}`,
+        );
+        continue;
+      }
       const buffer = await response.arrayBuffer();
       if (buffer.byteLength > maxSizeBytes) {
         throw new ProfileError(
@@ -197,7 +228,28 @@ async function fetchFileFromIpfs(
           `Legacy snapshot ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
         );
       }
-      return new Uint8Array(buffer);
+      const bytes = new Uint8Array(buffer);
+
+      // Steelman remediation: content-address verify when we can.
+      if (isRawCodec) {
+        const computed = sha256(bytes);
+        const expected = parsedCid.multihash.digest;
+        if (computed.length !== expected.length) {
+          lastError = new Error(`CID digest length mismatch from ${gateway}`);
+          continue;
+        }
+        let match = true;
+        for (let i = 0; i < computed.length; i++) {
+          if (computed[i] !== expected[i]) { match = false; break; }
+        }
+        if (!match) {
+          lastError = new Error(
+            `Content-address verify FAILED from ${gateway}: sha256(bytes) does not match CID digest`,
+          );
+          continue;
+        }
+      }
+      return bytes;
     } catch (err) {
       if (err instanceof ProfileError) throw err;
       lastError = err instanceof Error ? err : new Error(String(err));

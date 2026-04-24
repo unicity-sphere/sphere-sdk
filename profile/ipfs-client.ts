@@ -19,6 +19,8 @@
 
 import { sha256 } from '@noble/hashes/sha2.js';
 import { CID } from 'multiformats/cid';
+import * as raw from 'multiformats/codecs/raw';
+import { create as createMultihash } from 'multiformats/hashes/digest';
 import { ProfileError } from './errors.js';
 
 // =============================================================================
@@ -104,13 +106,27 @@ export async function pinToIpfs(
       // Defensively handle both `Cid.` (current) and legacy `Hash`
       // shapes.
       const result = (await response.json()) as { Cid?: { '/': string }; Hash?: string };
-      const cid = result.Cid?.['/'] ?? result.Hash;
-      if (!cid) {
+      const returnedCid = result.Cid?.['/'] ?? result.Hash;
+      if (!returnedCid) {
         lastError = new Error('IPFS pin response did not contain a CID');
         continue;
       }
 
-      return cid;
+      // Steelman remediation: do NOT trust the gateway's returned CID.
+      // A malicious/misconfigured gateway could return any CID (redirecting
+      // the wallet's pointer anchor to attacker-controlled content).
+      // Compute the CID locally from the uploaded bytes — with
+      // `input-codec=raw&store-codec=raw&hash=sha2-256` the expected
+      // CID is deterministic: `CID.createV1(raw.code, sha256(data))`.
+      // If the gateway returned a different CID, we IGNORE it and
+      // return our locally-computed CID. A subsequent fetch against
+      // that CID will succeed on any honest gateway that pinned the
+      // bytes. A gateway that intentionally pinned OUR bytes under a
+      // DIFFERENT CID reduces to a pin-failure from our perspective
+      // (404 on next lookup); attacker cannot redirect the wallet's
+      // anchor to attacker-chosen content.
+      const expectedCid = CID.createV1(raw.code, createMultihash(0x12, sha256(data))).toString();
+      return expectedCid;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
     }
