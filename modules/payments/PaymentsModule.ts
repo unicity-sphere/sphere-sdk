@@ -6235,10 +6235,26 @@ export class PaymentsModule {
       .setEntry;
     if (typeof setEntryFn === 'function') {
       await setEntryFn.call(storage, key, value, entryType);
-    } else {
-      await storage.set(key, value);
+      return;
     }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = storage.constructor?.name ?? 'UnknownStorage';
+    if (!PaymentsModule._w11FallbackLogged.has(providerClass)) {
+      PaymentsModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        'Payments',
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
   }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
 
   private async save(): Promise<void> {
     // Chain onto the previous save. Failure in prior save is isolated via
