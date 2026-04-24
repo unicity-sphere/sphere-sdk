@@ -230,6 +230,9 @@ async function buildLayer(opts: {
           const next = queue.shift();
           if (next) next();
         },
+        assertHeld: () => {
+          if (!held) throw new Error('fake mutex: lock lost');
+        },
       };
     },
   };

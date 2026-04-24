@@ -130,16 +130,42 @@ async function publishOnce(
   input: PublishInput,
   v: PointerVersion,
   attemptOpts: AttemptOptions,
-  isIdempotentRetryHint: boolean,
+  isIdempotentRetryHintInitial: boolean,
+  mutexHandle: MutexHandle,
 ): Promise<PublishOutcome> {
   const { cidBytes, keyMaterial, signer, aggregatorClient, flagStore } = input;
 
   let retriesConsumed = 0;
   let cumulativeRetryAfterMs = 0;
 
+  // Steelman remediation (finding #7): read the marker ONCE before the
+  // retry loop. Previously the marker was re-read on every iteration;
+  // a torn IndexedDB write during a retry (Safari aggressive eviction)
+  // would throw MARKER_CORRUPT mid-loop, burning the wallet to BLOCKED
+  // even though an earlier iteration may have successfully committed.
+  // The mutex is held throughout publishOnce, so no concurrent writer
+  // can change the marker — re-reading inside the loop was strictly
+  // redundant and unsafe.
+  const marker = await readMarker(flagStore);
+
+  // Steelman remediation (finding #5): `isIdempotentRetryHint` is load-
+  // bearing for Row 4 vs Row 5 disambiguation. If a prior iteration of
+  // this loop observed `retry_side` (one side committed, the other
+  // had a transient network error), the subsequent iteration will see
+  // EXISTS+EXISTS — that is OUR own commit replaying, not a genuine
+  // cross-device conflict. We must escalate the hint to true once we
+  // have observed partial success, to prevent spurious Row 5 conflict
+  // classification + pointless fetchAndJoin of our own state.
+  let isIdempotentRetryHint = isIdempotentRetryHintInitial;
+
   for (;;) {
-    // Read current marker — submit needs it for row 4 marker-match disambiguation.
-    const marker = await readMarker(flagStore);
+    // Steelman remediation: verify the publish mutex is still held before
+    // every submit. In browsers, BFCache/freeze/tab-discard can release
+    // Web Locks while our async continuation is suspended; if we resume
+    // and submit at a stale `v` another tab has already advanced past,
+    // we violate mutual exclusion. assertHeld() throws PUBLISH_BUSY
+    // if the lock is gone.
+    mutexHandle.assertHeld();
 
     const outcome: SubmitOutcome = await submitPointer({
       v,
@@ -231,6 +257,17 @@ async function publishOnce(
             { v },
           );
         }
+        // Steelman remediation (finding #5): `retry_side` guarantees one
+        // side committed (combineOutcomes Priority 6 excludes protocol/
+        // rejected/aggregator_rejected/retry_after/backoff paths — by
+        // the time we reach `retry_side` the non-flaky side must have
+        // returned success or exists). Escalate the hint so the NEXT
+        // iteration's EXISTS+EXISTS is classified as Row 4 idempotent
+        // replay (our own commit) rather than Row 5 conflict. `retry_both`
+        // is left alone — neither side committed.
+        if (outcome.kind === 'retry_side') {
+          isIdempotentRetryHint = true;
+        }
         await sleep(computeBackoffMs(retriesConsumed));
         retriesConsumed += 1;
         continue;
@@ -311,7 +348,7 @@ export async function publishOnceAtVersion(
     // always match the current cidBytes.
     let outcome: PublishOutcome;
     try {
-      outcome = await publishOnce(input, resolvedV, attemptOpts, resolution.isIdempotentRetry);
+      outcome = await publishOnce(input, resolvedV, attemptOpts, resolution.isIdempotentRetry, handle);
     } catch (submitErr) {
       // Steelman: on REJECTED (H8 v-burning), perform three bookkeeping steps:
       //   1) SET BLOCKED (classifier maps REJECTED → 'rejected' reason; operator alarm)

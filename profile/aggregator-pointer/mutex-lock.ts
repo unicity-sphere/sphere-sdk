@@ -25,6 +25,20 @@ export interface MutexAcquireOptions {
 
 export interface MutexHandle {
   release(): Promise<void>;
+  /**
+   * Steelman remediation (BFCache / tab-discard race): verify the
+   * underlying lock is still held by this handle. Browser Web Locks
+   * may be lost when the tab is frozen (BFCache) or discarded for
+   * memory reclaim; the page may then resume from BFCache and try
+   * to continue publishing at a stale version — violating the
+   * mutual-exclusion contract other tabs rely on. Callers SHOULD
+   * invoke `assertHeld()` before each commit-side network submit
+   * so lost-lock resumes fail closed with PUBLISH_BUSY.
+   *
+   * Throws AggregatorPointerError(PUBLISH_BUSY) if the lock is no
+   * longer held. Returns normally otherwise.
+   */
+  assertHeld(): void;
 }
 
 export interface PointerMutex {
@@ -93,12 +107,40 @@ class BrowserMutex implements PointerMutex {
             return;
           }
           let alreadyReleased = false;
+          // Steelman remediation: listen for page-lifecycle events that
+          // may release the Web Lock out from under us (BFCache freeze,
+          // tab discard for memory reclaim, page unload). Flip a local
+          // validity flag; assertHeld() then fails closed.
+          let lockStillValid = true;
+          const invalidate = (): void => {
+            lockStillValid = false;
+          };
+          const win = typeof globalThis.window !== 'undefined' ? globalThis.window : undefined;
+          const hasListeners = typeof win?.addEventListener === 'function' && typeof win?.removeEventListener === 'function';
+          if (hasListeners) {
+            win!.addEventListener('freeze', invalidate);
+            win!.addEventListener('pagehide', invalidate);
+          }
+          const lockName = this.#lockName;
           resolve({
             release: async () => {
               if (alreadyReleased) return;
               alreadyReleased = true;
               released = true;
+              if (hasListeners) {
+                win!.removeEventListener('freeze', invalidate);
+                win!.removeEventListener('pagehide', invalidate);
+              }
               releaseCallback!();
+            },
+            assertHeld: () => {
+              if (!lockStillValid || alreadyReleased) {
+                throw new AggregatorPointerError(
+                  AggregatorPointerErrorCode.PUBLISH_BUSY,
+                  `Web Locks mutex "${lockName}" was lost (BFCache/freeze/discard). ` +
+                    `Aborting to avoid submitting at a stale version after lock loss.`,
+                );
+              }
             },
           });
           // Hold the lock until release() is called.
@@ -277,6 +319,18 @@ class NodeMutex implements PointerMutex {
           if (typeof inProcessRelease === 'function') {
             try { inProcessRelease(); } catch { /* noop */ }
           }
+        }
+      },
+      assertHeld: () => {
+        // Node processes do not lose file locks transparently the way
+        // browser BFCache can lose Web Locks; a released lock is
+        // detectable only via the `alreadyReleased` flag. If the
+        // process itself was killed, the handle is gone with it.
+        if (alreadyReleased) {
+          throw new AggregatorPointerError(
+            AggregatorPointerErrorCode.PUBLISH_BUSY,
+            'Node mutex handle already released; cannot proceed with submit.',
+          );
         }
       },
     };
