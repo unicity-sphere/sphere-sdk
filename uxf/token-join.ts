@@ -355,11 +355,19 @@ function txHasProof(txHash: ContentHash, pool: ReadonlyMap<ContentHash, UxfEleme
 
 /**
  * Two transaction elements are "same core, different proof" iff
- * their sourceState + data + destinationState children match
- * byte-for-byte but their inclusionProof children differ. Under
- * content-addressed encoding, same-core-same-proof would produce
- * the same ContentHash, so the two input hashes must already be
- * different to reach this helper.
+ * every child field OTHER THAN `inclusionProof` matches byte-for-
+ * byte, and `inclusionProof` differs. Under content-addressed
+ * encoding, same-core-same-proof would produce the same
+ * ContentHash, so the two input hashes must already be different
+ * to reach this helper.
+ *
+ * Exhaustive field comparison (not an allowlist of known fields):
+ * if a future TransactionChildren schema adds a new child slot,
+ * this helper must NOT silently collapse two elements that differ
+ * only in the new field — that would enrich across a genuine
+ * state divergence and produce a synthetic root asserting a
+ * transition that neither input ever claimed. Fail-closed by key-
+ * set equality + pointwise child equality.
  */
 function sameCoreDifferentProof(
   hashA: ContentHash,
@@ -373,11 +381,31 @@ function sameCoreDifferentProof(
   if (a.type !== 'transaction' || b.type !== 'transaction') return false;
   const ca = a.children as Record<string, ContentHash | ContentHash[] | null>;
   const cb = b.children as Record<string, ContentHash | ContentHash[] | null>;
-  return (
-    ca.sourceState === cb.sourceState &&
-    ca.data === cb.data &&
-    ca.destinationState === cb.destinationState
-  );
+
+  const keysA = Object.keys(ca);
+  const keysB = Object.keys(cb);
+  if (keysA.length !== keysB.length) return false;
+  for (const k of keysA) {
+    if (!(k in cb)) return false;
+  }
+  // inclusionProof must actually differ (the "different proof" half
+  // of the name). If both are identical there, the two hashes would
+  // have been equal and we'd have returned at the top.
+  if (ca.inclusionProof === cb.inclusionProof) return false;
+  for (const k of keysA) {
+    if (k === 'inclusionProof') continue;
+    const va = ca[k];
+    const vb = cb[k];
+    if (Array.isArray(va) && Array.isArray(vb)) {
+      if (va.length !== vb.length) return false;
+      for (let i = 0; i < va.length; i++) {
+        if (va[i] !== vb[i]) return false;
+      }
+    } else if (va !== vb) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -450,6 +478,23 @@ function tryEnrichLongestWithProofs(
   // predecessor — the enriched chain is a refinement of the
   // winner, not an independent lineage. The caller (mergePkg) is
   // responsible for inserting this element into the pool.
+  //
+  // Deep-clone any array children (nametags today; future array
+  // children transparently) so the synthetic does NOT share array
+  // references with the input winner element. Mutation of the
+  // synthetic's children must never leak back into the pool's
+  // original element; UxfElement children are typed `readonly` but
+  // TypeScript does not enforce this at runtime. Defense-in-depth.
+  const clonedChildren: Record<string, ContentHash | ContentHash[] | null> = {};
+  for (const [key, value] of Object.entries(winnerRoot.children)) {
+    if (Array.isArray(value)) {
+      clonedChildren[key] = [...value];
+    } else {
+      clonedChildren[key] = value;
+    }
+  }
+  clonedChildren.transactions = enrichedTxns;
+
   const syntheticRoot: UxfElement = {
     header: {
       representation: winnerRoot.header.representation,
@@ -459,10 +504,7 @@ function tryEnrichLongestWithProofs(
     },
     type: 'token-root',
     content: { ...winnerRoot.content },
-    children: {
-      ...winnerRoot.children,
-      transactions: enrichedTxns,
-    },
+    children: clonedChildren,
   };
 
   const rootHash = computeElementHash(syntheticRoot);

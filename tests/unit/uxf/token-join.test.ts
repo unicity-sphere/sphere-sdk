@@ -396,6 +396,85 @@ describe('resolveTokenRoot', () => {
     expect(outcome.rootHash).toBe(longRootH);
   });
 
+  it('Rule 4 — schema-evolution guard: extra child field present on one side alone blocks enrichment', () => {
+    // Steelman C1: if a future TransactionChildren schema adds a
+    // new non-inclusionProof field (say `receipt`), two tx elements
+    // that differ ONLY in that new field must NOT be considered
+    // same-core-different-proof. The exhaustive key-set check
+    // rejects them so the resolver cannot enrich across a genuine
+    // state divergence it cannot reason about.
+    const t0 = makeTransaction('0', { committed: true });
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA = 'c'.repeat(64);
+    const HEX_PROOF = 'd'.repeat(64);
+    const HEX_RECEIPT = 'e'.repeat(64);
+
+    const t1WithReceipt: PoolEntry = [
+      hexTag('tx1+receipt'),
+      {
+        header: {
+          representation: 1,
+          semantics: 1,
+          kind: 'default' as const,
+          predecessor: null,
+        },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: HEX_STATE_A,
+          data: HEX_DATA,
+          inclusionProof: HEX_PROOF,
+          destinationState: HEX_STATE_B,
+          // Hypothetical future-schema field — not in today's
+          // TransactionChildren but the resolver must defend
+          // against the scenario.
+          receipt: HEX_RECEIPT,
+        } as unknown as Record<string, ContentHash | ContentHash[] | null>,
+      },
+    ];
+    const t1NoReceipt: PoolEntry = [
+      hexTag('tx1-noreceipt'),
+      {
+        header: {
+          representation: 1,
+          semantics: 1,
+          kind: 'default' as const,
+          predecessor: null,
+        },
+        type: 'transaction',
+        content: {},
+        children: {
+          sourceState: HEX_STATE_A,
+          data: HEX_DATA,
+          inclusionProof: null,
+          destinationState: HEX_STATE_B,
+        },
+      },
+    ];
+
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1WithReceipt[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1NoReceipt[0]]);
+
+    const pool = buildPool(
+      t0,
+      t1WithReceipt,
+      t1NoReceipt,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+    });
+    // Key sets differ (receipt only in one). Compatibility check
+    // returns false → divergent path. Resolver must NOT produce
+    // 'enriched' here.
+    expect(outcome.kind).toBe('divergent');
+  });
+
   it('Rule 4 — does NOT enrich when the proved-alt has DIFFERENT core fields (not same-core-different-proof)', () => {
     // Position 1 differs in sourceState — this is a real divergence,
     // not a proof mismatch. Resolver should classify as divergent or
