@@ -595,10 +595,25 @@ export async function buildProfilePointerLayer(
   // the internal copy after derivePointerKeyMaterial returns.
   const rawPrivKeyBytes = hexToBytes(input.identity.privateKey);
   let masterKey: ReturnType<typeof createMasterPrivateKey> | null = null;
+  let bundleEncryptionKey: Uint8Array | null = null;
   try {
     masterKey = createMasterPrivateKey(rawPrivKeyBytes);
     rawPrivKeyBytes.fill(0);
     const keyMaterial = derivePointerKeyMaterial(masterKey);
+    // Steelman remediation (R-11): derive the bundle AES key from the
+    // SAME masterKey while it is live, using a defensive copy that we
+    // wipe in the finally block below. The previous implementation
+    // called `hexToBytes(input.identity.privateKey)` a SECOND time at
+    // layer-construction, leaking an unwiped plaintext private-key
+    // copy to the heap for the lifetime of the layer.
+    {
+      const masterBytesCopy = masterKey.bytes;
+      try {
+        bundleEncryptionKey = deriveProfileEncryptionKey(masterBytesCopy);
+      } finally {
+        masterBytesCopy.fill(0);
+      }
+    }
     masterKey.zeroize();
     masterKey = null;
     const signer = await buildPointerSigner(keyMaterial.signingSeed);
@@ -639,14 +654,17 @@ export async function buildProfilePointerLayer(
       decodeCid,
     });
 
-    // The same per-wallet encryption key ProfileTokenStorageProvider
-    // uses for bundle refs. Bundle-ref reads go through
-    // `decryptProfileValue` with this key — writing raw bytes here
-    // would cause decrypt failures on read. Deterministic derivation
-    // from the wallet private key means both sides compute the same
-    // key without needing to share state.
-    const privKeyBytes = hexToBytes(input.identity.privateKey);
-    const bundleEncryptionKey = deriveProfileEncryptionKey(privKeyBytes);
+    // `bundleEncryptionKey` was derived above from the live masterKey
+    // (steelman R-11 remediation). Guarded against the earlier-throw
+    // path via a non-null assertion: if we reach here the derivation
+    // succeeded. Bundle-ref reads go through `decryptProfileValue` with
+    // this key — writing raw bytes here would cause decrypt failures
+    // on read. Deterministic derivation from the wallet private key
+    // means both sides compute the same key without needing to share
+    // state.
+    if (bundleEncryptionKey === null) {
+      throw new Error('pointer-wiring invariant: bundleEncryptionKey not derived');
+    }
 
     const fetchAndJoin = buildFetchAndJoin({
       db: input.db,

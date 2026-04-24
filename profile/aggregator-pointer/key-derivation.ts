@@ -43,19 +43,25 @@ export interface PointerKeyMaterial {
 export function derivePointerKeyMaterial(masterKey: MasterPrivateKey): PointerKeyMaterial {
   assertAuthorizedMasterKey(masterKey);
 
+  // masterKey.bytes now returns a DEFENSIVE COPY (steelman remediation).
+  // Wipe it post-HKDF to narrow heap residue window.
   const walletPrivateKey = masterKey.bytes;
-  const pointerSecretBytes = hkdf(sha256, walletPrivateKey, new Uint8Array(0), PROFILE_POINTER_HKDF_INFO, 32);
+  try {
+    const pointerSecretBytes = hkdf(sha256, walletPrivateKey, new Uint8Array(0), PROFILE_POINTER_HKDF_INFO, 32);
 
-  const signingSeedBytes = expand(sha256, pointerSecretBytes, SIGNING_SEED_INFO, 32);
-  const xorSeedBytes = expand(sha256, pointerSecretBytes, XOR_SEED_INFO, 32);
-  const padSeedBytes = expand(sha256, pointerSecretBytes, PAD_SEED_INFO, 32);
+    const signingSeedBytes = expand(sha256, pointerSecretBytes, SIGNING_SEED_INFO, 32);
+    const xorSeedBytes = expand(sha256, pointerSecretBytes, XOR_SEED_INFO, 32);
+    const padSeedBytes = expand(sha256, pointerSecretBytes, PAD_SEED_INFO, 32);
 
-  return {
-    pointerSecret: new SecretKey(pointerSecretBytes, 'pointerSecret'),
-    signingSeed: new SecretKey(signingSeedBytes, 'signingSeed'),
-    xorSeed: new SecretKey(xorSeedBytes, 'xorSeed'),
-    padSeed: new SecretKey(padSeedBytes, 'padSeed'),
-  };
+    return {
+      pointerSecret: new SecretKey(pointerSecretBytes, 'pointerSecret'),
+      signingSeed: new SecretKey(signingSeedBytes, 'signingSeed'),
+      xorSeed: new SecretKey(xorSeedBytes, 'xorSeed'),
+      padSeed: new SecretKey(padSeedBytes, 'padSeed'),
+    };
+  } finally {
+    walletPrivateKey.fill(0);
+  }
 }
 
 /** big-endian 4-byte encoding of v (§4.4, §4.5). */

@@ -110,7 +110,14 @@ export class ProfilePointerLayer {
 
   constructor(init: ProfilePointerLayerInit) {
     this.#init = init;
-    this.#config = init.config ?? {};
+    // Steelman remediation: clone + freeze so post-construction mutation
+    // of `init.config.allowOperatorOverrides = true` does not bypass the
+    // production guard below. Previously the constructor stored the
+    // caller's reference directly, letting operator-override APIs
+    // (clearBlocked / acceptCarLoss / clearPendingMarker /
+    // acceptCorruptStreak) be enabled at runtime in production builds.
+    const suppliedConfig: PointerLayerConfig = init.config ?? {};
+    this.#config = Object.freeze({ ...suppliedConfig });
     // T-E26 production guard runs at init.
     assertConfigCapabilities(this.#config);
   }

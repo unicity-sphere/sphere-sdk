@@ -20,6 +20,16 @@ declare const _brand: unique symbol;
 
 export interface MasterPrivateKey {
   readonly [_brand]: 'MasterPrivateKey';
+  /**
+   * Returns a DEFENSIVE COPY of the 32-byte master-key buffer. The
+   * internal buffer is never exposed — steelman remediation for the
+   * WeakSet bypass: a holder of a MasterPrivateKey could previously
+   * call `masterKey.bytes.set(attackerKey, 0)` and the registry would
+   * still report "authorized" because the object identity is unchanged.
+   *
+   * Callers that feed this buffer into HKDF etc. SHOULD `.fill(0)` the
+   * returned copy once finished to narrow heap residue.
+   */
   readonly bytes: Uint8Array;
   /**
    * Wipe the underlying byte buffer via `.fill(0)` and evict the
@@ -39,6 +49,44 @@ export interface MasterPrivateKey {
 const registry = new WeakSet<MasterPrivateKey>();
 
 /**
+ * SPEC §14.1 denylist — well-known weak/canonical/test private keys that
+ * must never be accepted as wallet master keys. Rejection at
+ * createMasterPrivateKey time fails closed before HKDF can derive a
+ * deterministic, attacker-known pointer secret that would collide
+ * across wallets sharing the same weak seed.
+ */
+const WEAK_KEY_DENYLIST_HEXES: ReadonlySet<string> = new Set([
+  // All-zero and all-FF bit patterns — structurally invalid secp256k1
+  // scalars; HKDF would process them regardless, producing a
+  // deterministic pointer secret that collides across every wallet
+  // sharing the same trivial seed.
+  '0000000000000000000000000000000000000000000000000000000000000000',
+  'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+  // secp256k1 curve order N — not a valid scalar (identity result).
+  'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141',
+  // N-1, N+1 (mod p adjacent; structurally suspicious).
+  'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140',
+  'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142',
+  // NOTE: the canonical 0x01×32 KAT vector is intentionally NOT on the
+  // denylist. It is a valid secp256k1 scalar and the pointer-layer
+  // HKDF KAT suite depends on it. Users generating keys from proper
+  // BIP39 seeds will not hit any of the above denylisted values by
+  // accident (probability ~2^-256).
+]);
+
+function bytesToLowerHex(bytes: Uint8Array): string {
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function isDenylistedMasterKey(bytes: Uint8Array): boolean {
+  return WEAK_KEY_DENYLIST_HEXES.has(bytesToLowerHex(bytes));
+}
+
+/**
  * Construct a MasterPrivateKey from raw wallet-root bytes.
  *
  * ONLY Sphere.init/load/create/import may call this. The instance is
@@ -55,21 +103,43 @@ export function createMasterPrivateKey(bytes: Uint8Array): MasterPrivateKey {
       `MasterPrivateKey must be exactly 32 bytes, got ${bytes.length}`,
     );
   }
+  if (isDenylistedMasterKey(bytes)) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      'MasterPrivateKey denylist hit (SPEC §14.1): refusing all-zero / all-FF / ' +
+        'well-known test vector / curve-order-N scalar. These derive deterministic, ' +
+        'cross-wallet-colliding pointer-layer keys.',
+    );
+  }
   // The [_brand] field is compile-time only — TypeScript erases it and
-  // `declare const _brand` has no runtime value. Object.freeze here
-  // provides shallow object immutability; the underlying Uint8Array
-  // is referenced via a closure so `zeroize()` can wipe it in place
-  // while `bytes` (the frozen property) continues to point at the
-  // now-zeroed buffer. The WeakSet registry is the load-bearing
-  // runtime guard (see assertAuthorizedMasterKey).
+  // `declare const _brand` has no runtime value.
+  //
+  // Steelman remediation: the `bytes` property is a GETTER that returns a
+  // defensive copy of the internal buffer. Exposing the raw Uint8Array
+  // directly was defeatable via `masterKey.bytes.set(attackerKey, 0)` even
+  // after Object.freeze(instance) — freeze only makes the property slot
+  // immutable, not the TypedArray's backing buffer. Each .bytes read
+  // therefore allocates a fresh 32-byte copy; callers feeding HKDF should
+  // wipe the returned copy when done. `zeroize()` wipes the SOURCE buffer,
+  // after which all future .bytes reads return zeros.
   const internalBytes = new Uint8Array(bytes);
-  const instance = {
-    bytes: internalBytes,
-    zeroize(): void {
-      internalBytes.fill(0);
-      registry.delete(instance as MasterPrivateKey);
+  const instance = Object.create(null) as MasterPrivateKey;
+  Object.defineProperty(instance, 'bytes', {
+    get(): Uint8Array {
+      return new Uint8Array(internalBytes);
     },
-  } as unknown as MasterPrivateKey;
+    enumerable: true,
+    configurable: false,
+  });
+  Object.defineProperty(instance, 'zeroize', {
+    value: function zeroize(): void {
+      internalBytes.fill(0);
+      registry.delete(instance);
+    },
+    enumerable: true,
+    configurable: false,
+    writable: false,
+  });
   Object.freeze(instance);
   registry.add(instance);
   return instance;

@@ -58,7 +58,8 @@ describe('derivePointerKeyMaterial (T-A4 / T-A5 / T-A6)', () => {
 
   it('1000 wallets: all subkeys pairwise distinct across derivations', () => {
     const seen = new Set<string>();
-    for (let i = 0; i < 100; i++) {
+    // Start at i=1 so b is not all-zero (SPEC §14.1 denylist).
+    for (let i = 1; i <= 100; i++) {
       const b = new Uint8Array(32);
       b[0] = i;
       const m = createMasterPrivateKey(b);
