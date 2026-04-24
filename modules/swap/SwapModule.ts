@@ -538,6 +538,84 @@ export class SwapModule {
   // =========================================================================
 
   /**
+   * W11 originated-tag helper (SPEC §10.2.3, T-D9). Writes through
+   * `storage.setEntry` when the provider supports it so the OpLog
+   * envelope carries an explicit `originated` tag matching the
+   * semantic class of the write. Providers without envelope-storage
+   * (plain IndexedDB / file KV) fall through to the plain `set()` —
+   * semantics are identical, only the peer-replicated classification
+   * differs.
+   *
+   * Classification (see profile/aggregator-pointer/originated-tag.ts):
+   *   - `swap_propose`  — proposer/acceptor records a new proposal
+   *   - `swap_accept`   — acceptor transitions 'proposed' → 'accepted'
+   *   - `swap_deposit`  — post-accept lifecycle progression
+   *                       (announced / depositing / concluding / terminal).
+   *                       The three swap user-action edges defined by the
+   *                       spec collapse post-accept progression into
+   *                       `swap_deposit`; this covers both the deposit
+   *                       payment itself and the downstream transitions
+   *                       emitted by escrow DM handlers.
+   *   - `cache_index`   — swap-index refresh, dedup / cleanup
+   *
+   * Callers MUST choose the classification at the call site — the
+   * helper does NOT infer. Mis-classification is caught by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'swap_propose' | 'swap_accept' | 'swap_deposit' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+      return;
+    }
+    // Fallback: provider has no envelope-storage layer (plain IndexedDB
+    // / file KV). Log once per provider-class so a silent loss of W11
+    // stamping during a migration is visible in ops. Subsequent calls
+    // from the same class are silent to avoid log spam.
+    const providerClass = storage.constructor?.name ?? 'UnknownStorage';
+    if (!SwapModule._w11FallbackLogged.has(providerClass)) {
+      SwapModule._w11FallbackLogged.add(providerClass);
+      logger.debug(
+        LOG_TAG,
+        `[W11] storage.setEntry not available on ${providerClass}; originated tags will not be stamped ` +
+          `(this is expected for plain IndexedDB / file storage, unexpected when ProfileStorageProvider is in the chain).`,
+      );
+    }
+    await storage.set(key, value);
+  }
+
+  /** Per-class dedup set for the W11 fallback log (see setStorageEntry). */
+  private static _w11FallbackLogged: Set<string> = new Set();
+
+  /**
+   * Classify a swap record write by the swap's current progress. Used
+   * by `persistSwap` to stamp the OpLog entry with the correct user-
+   * action originated-tag.
+   *
+   * Mapping (SPEC §10.2.3):
+   *   - 'proposed'  → 'swap_propose'
+   *   - 'accepted'  → 'swap_accept'
+   *   - all other progress values (announced, depositing,
+   *     awaiting_counter, concluding, completed, cancelled, failed)
+   *     → 'swap_deposit' (closest spec-defined user-action edge for
+   *     post-accept progression, including escrow-driven terminals).
+   */
+  private classifySwapWrite(
+    progress: SwapProgress,
+  ): 'swap_propose' | 'swap_accept' | 'swap_deposit' {
+    if (progress === 'proposed') return 'swap_propose';
+    if (progress === 'accepted') return 'swap_accept';
+    return 'swap_deposit';
+  }
+
+  /**
    * Persist a single swap record to storage.
    * Writes the per-swap key and updates the index.
    *
@@ -561,7 +639,11 @@ export class SwapModule {
     );
 
     const data: SwapStorageData = { version: 1, swap };
-    await deps.storage.set(storageKey, JSON.stringify(data));
+    await this.setStorageEntry(
+      storageKey,
+      JSON.stringify(data),
+      this.classifySwapWrite(swap.progress),
+    );
 
     // Update the index
     await this.persistIndex();
@@ -605,7 +687,11 @@ export class SwapModule {
       });
     }
 
-    await deps.storage.set(indexKey, JSON.stringify([...indexMap.values()]));
+    await this.setStorageEntry(
+      indexKey,
+      JSON.stringify([...indexMap.values()]),
+      'cache_index',
+    );
   }
 
   /**
@@ -713,7 +799,11 @@ export class SwapModule {
           cleanIndex.push(entry);
         }
       }
-      await deps.storage.set(indexKey, JSON.stringify(cleanIndex));
+      await this.setStorageEntry(
+        indexKey,
+        JSON.stringify(cleanIndex),
+        'cache_index',
+      );
     }
 
     if (this.config.debug) {
