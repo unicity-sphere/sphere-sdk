@@ -30,6 +30,27 @@ export interface StorageProvider extends BaseProvider {
   set(key: string, value: string): Promise<void>;
 
   /**
+   * Optional: set value with an explicit OpLog entry type for W11
+   * originated-tag discipline. Callers that know the semantic
+   * classification of the write (e.g. `'token_send'` on a transfer,
+   * `'cache_index'` on a dedup table write) SHOULD use this to
+   * stamp the storage-level envelope so peers replicating the
+   * entry see the correct classification after the receiver-
+   * authority downgrade.
+   *
+   * Providers that do not implement an OpLog-envelope storage layer
+   * (plain IndexedDB / file KV) omit this method entirely; callers
+   * fall back to `set()` and lose the stamp but the operation
+   * otherwise behaves identically. See profile/aggregator-pointer/
+   * originated-tag.ts for the `OpLogEntryType` union.
+   *
+   * Only declared here as a loose `string` type to avoid a circular
+   * dependency into profile/aggregator-pointer. Implementations
+   * validate via `assertOriginTagLocal`.
+   */
+  setEntry?(key: string, value: string, entryType: string): Promise<void>;
+
+  /**
    * Remove key
    */
   remove(key: string): Promise<void>;

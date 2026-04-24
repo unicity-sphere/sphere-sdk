@@ -2398,9 +2398,11 @@ export class PaymentsModule {
   private async saveProcessedCombinedTransferIds(): Promise<void> {
     const ids = Array.from(this.processedCombinedTransferIds);
     if (ids.length > 0) {
-      await this.deps!.storage.set(
+      // Dedup ledger — pure operational state, not a user action.
+      await this.setStorageEntry(
         STORAGE_KEYS_ADDRESS.PROCESSED_COMBINED_TRANSFER_IDS,
-        JSON.stringify(ids)
+        JSON.stringify(ids),
+        'cache_index',
       );
     }
   }
@@ -4128,7 +4130,9 @@ export class PaymentsModule {
     }
     if (pendingTokens.length === 0) {
       logger.debug('Payments', `[V5-PERSIST] No pending V5 tokens to save (total tokens: ${this.tokens.size}), clearing KV`);
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '');
+      // Clearing the pending set is operational cleanup after the
+      // inbound transfer(s) finalized; not itself a user action.
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, '', 'cache_index');
       this._lastPinnedV5Json = null;
       this._lastPinnedV5Ref = null;
       return;
@@ -4154,7 +4158,7 @@ export class PaymentsModule {
           'Payments',
           `[V5-PERSIST] Pending set unchanged, reusing cached CID ref (cid=${this._lastPinnedV5Ref.cid})`,
         );
-        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr);
+        await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr, 'token_receive');
         return;
       }
 
@@ -4164,7 +4168,7 @@ export class PaymentsModule {
         'Payments',
         `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s) via CID ref (cid=${ref.cid}, encryptedSize=${ref.size} bytes, OpLog value=${refStr.length} bytes)`,
       );
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr);
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, refStr, 'token_receive');
       // Update memo AFTER successful storage.set so a set-failure does
       // not leave us thinking the CID is live.
       this._lastPinnedV5Json = json;
@@ -4178,7 +4182,7 @@ export class PaymentsModule {
       'Payments',
       `[V5-PERSIST] Saving ${pendingTokens.length} pending V5 token(s) inline (${json.length} bytes — consider providing cidRefStore)`,
     );
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, json);
+    await this.setStorageEntry(STORAGE_KEYS_ADDRESS.PENDING_V5_TOKENS, json, 'token_receive');
   }
 
   /**
@@ -4274,9 +4278,12 @@ export class PaymentsModule {
   private async saveProcessedSplitGroupIds(): Promise<void> {
     const ids = Array.from(this.processedSplitGroupIds);
     if (ids.length > 0) {
-      await this.deps!.storage.set(
+      // Dedup ledger — operational state protecting against duplicate
+      // Nostr re-deliveries; not itself a user action.
+      await this.setStorageEntry(
         STORAGE_KEYS_ADDRESS.PROCESSED_SPLIT_GROUP_IDS,
-        JSON.stringify(ids)
+        JSON.stringify(ids),
+        'cache_index',
       );
     }
   }
@@ -6199,6 +6206,40 @@ export class PaymentsModule {
    */
   private _saveChain: Promise<void> = Promise.resolve();
 
+  /**
+   * W11 originated-tag helper (SPEC §10.2.3). Writes through
+   * `storage.setEntry` when the provider supports it so the
+   * OpLog envelope carries an explicit `originated` tag matching
+   * the semantic class of the write. Providers without
+   * envelope-storage (plain IndexedDB / file KV) fall through to
+   * the plain `set()` — semantics are identical, only the
+   * peer-replicated classification differs.
+   *
+   * Classification (see profile/aggregator-pointer/originated-tag.ts):
+   *   - `token_send`      — user-initiated outbound transfer
+   *   - `token_receive`   — user-initiated inbound pending transfer
+   *   - `cache_index`     — dedup / state-empty / operational state
+   *
+   * Callers MUST choose the classification at the call site — the
+   * helper does NOT infer. Mis-classification is caught by
+   * `assertOriginTagLocal` inside the storage layer and surfaced as
+   * SECURITY_ORIGIN_MISMATCH.
+   */
+  private async setStorageEntry(
+    key: string,
+    value: string,
+    entryType: 'token_send' | 'token_receive' | 'cache_index',
+  ): Promise<void> {
+    const storage = this.deps!.storage;
+    const setEntryFn = (storage as { setEntry?: (k: string, v: string, t: string) => Promise<void> })
+      .setEntry;
+    if (typeof setEntryFn === 'function') {
+      await setEntryFn.call(storage, key, value, entryType);
+    } else {
+      await storage.set(key, value);
+    }
+  }
+
   private async save(): Promise<void> {
     // Chain onto the previous save. Failure in prior save is isolated via
     // .catch() so it does not block subsequent saves — each save is
@@ -6315,7 +6356,9 @@ export class PaymentsModule {
     if (list.length === 0) {
       // Empty outbox: write empty string to match legacy behaviour and clear
       // the memo so the next non-empty save re-pins (can't reuse a stale ref).
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, '');
+      // Classification: `cache_index` — the user action (token_send) has
+      // already completed; this write is operational cleanup.
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, '', 'cache_index');
       this._lastPinnedOutboxJson = null;
       this._lastPinnedOutboxRef = null;
       return;
@@ -6328,13 +6371,13 @@ export class PaymentsModule {
       // concurrent writers that observe the same snapshot.
       if (this._lastPinnedOutboxRef && this._lastPinnedOutboxJson === json) {
         const refStr = CidRefStore.stringifyRef(this._lastPinnedOutboxRef);
-        await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, refStr);
+        await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, refStr, 'token_send');
         return;
       }
 
       const ref = await cidRefStore.pinJson(list);
       const refStr = CidRefStore.stringifyRef(ref);
-      await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, refStr);
+      await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, refStr, 'token_send');
       // Update memo AFTER a successful storage.set — see pendingV5 equivalent.
       this._lastPinnedOutboxJson = json;
       this._lastPinnedOutboxRef = ref;
@@ -6342,7 +6385,7 @@ export class PaymentsModule {
     }
 
     // Legacy path: inline JSON (deprecated — see PROFILE-CID-REFERENCES.md).
-    await this.deps!.storage.set(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(list));
+    await this.setStorageEntry(STORAGE_KEYS_ADDRESS.OUTBOX, JSON.stringify(list), 'token_send');
   }
 
   /**
