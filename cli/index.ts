@@ -20,6 +20,7 @@ import { createNodeProviders } from '../impl/nodejs';
 import {
   parseIpfsGatewayOverride as parseIpfsGatewayOverrideFromArgv,
   stripLeadingGlobalFlags,
+  validateLeadingGlobalFlags,
 } from './global-flags';
 import { TokenRegistry } from '../registry/TokenRegistry';
 import { TokenValidator } from '../validation/token-validator';
@@ -29,10 +30,10 @@ import type { TransportProvider } from '../transport/transport-provider';
 import type { ProviderStatus } from '../types';
 
 const args = process.argv.slice(2);
-// Wave F.5/F.9/F.10: strip GLOBAL flags from the args array so the
+// Wave F.5/F.9/F.10/F.11: strip GLOBAL flags from the args array so the
 // subcommand name resolves correctly regardless of flag position.
 //
-// History (Steelman rounds 7 → 8):
+// History (Steelman rounds 7 → 9):
 //   F.5  introduced --ipfs-gateway and a strip that walked the whole
 //        argv. This mangled subcommand args that legitimately contained
 //        `--ipfs-gateway` as a value (e.g., a token-name arg).
@@ -40,20 +41,20 @@ const args = process.argv.slice(2);
 //        first non-flag token) and added --no-nostr handling. This fixed
 //        the prologue-style `--no-nostr init` invocations used by every
 //        N-script (N1, N2, N5, N13, N14).
-//   F.10 (this commit) extracts a single source of truth —
-//        `findLeadingGlobalFlagsEnd` — used by the strip,
-//        parseIpfsGatewayOverride, and noNostrGlobal detection. Adds a
-//        loud warning when --ipfs-gateway is placed AFTER the subcommand
-//        (silently dropped post-F.9) so out-of-tree callers that relied
-//        on the F.5 full-argv scan are not surprised.
+//   F.10 extracted the helpers into `cli/global-flags.ts` for testability
+//        and added a loud warning for misplaced --ipfs-gateway.
+//   F.11 (this commit, steelman⁹) added value validation + equals form:
+//        `--ipfs-gateway init` (greedy consumption) and `--ipfs-gateway=URL`
+//        (silent unrecognized) both produced confusing UX. Now both fail
+//        loudly via `validateLeadingGlobalFlags`.
 //
 // `_globalFlagPreStrip` is the snapshot read by parsers that need to
 // see the original flag values (e.g., parseIpfsGatewayOverride); the
 // live `args` array has them removed.
 //
-// The leading-region scanner, the strip, and the value parser all live
-// in `cli/global-flags.ts` so the contract can be exercised by unit
-// tests (`tests/unit/cli/global-flags.test.ts`).
+// The leading-region scanner, the strip, the validator, and the value
+// parser all live in `cli/global-flags.ts` so the contract can be
+// exercised by unit tests (`tests/unit/cli/global-flags.test.ts`).
 //
 // CONTRACT: any new value-bearing global flag MUST be added to
 // `VALUE_BEARING_GLOBAL_FLAGS` in `cli/global-flags.ts`, and any new
@@ -62,6 +63,16 @@ const args = process.argv.slice(2);
 // downstream code sees it either as `--help` (handled) or "Unknown
 // command" (rejected).
 const _globalFlagPreStrip = [...args];
+{
+  // F.11: validate global-flag values BEFORE the strip mutates argv.
+  // Loud failure is better than silent printUsage when a user typos
+  // `--ipfs-gateway init` (greedy swallow → command=undefined).
+  const validationError = validateLeadingGlobalFlags(args);
+  if (validationError) {
+    console.error(`[sphere-cli] error: ${validationError}`);
+    process.exit(1);
+  }
+}
 stripLeadingGlobalFlags(args);
 const command = args[0];
 

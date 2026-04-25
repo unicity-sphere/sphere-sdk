@@ -1,14 +1,18 @@
 /**
  * Tests for `cli/global-flags.ts` — the leading-flag region parser
- * shared by the CLI strip, parseIpfsGatewayOverride, and noNostrGlobal
- * detection.
+ * shared by the CLI strip, parseIpfsGatewayOverride, validation, and
+ * noNostrGlobal detection.
  *
- * History (Wave F.10, steelman⁸):
+ * History (Waves F.10 + F.11, steelman rounds 8 → 9):
  *   These tests lock in the leading-region contract that prevents
  *   regressions like:
  *     F.5 → strip walked whole argv, mangled subcommand args.
  *     F.9 → narrowed strip but `--no-nostr` strip handler missing.
  *     F.10 → extracted helpers + warning for misplaced --ipfs-gateway.
+ *     F.11 → validation + equals form, fixes 2 critical UX bugs:
+ *       (a) `--ipfs-gateway init` greedily consumed `init` as URL,
+ *           command=undefined → silent printUsage (no diagnostic).
+ *       (b) `--ipfs-gateway=URL` was unrecognized → "Unknown command".
  *
  * The forward-compat block at the end documents the rule for adding
  * future global flags: register in the appropriate set or be treated
@@ -20,6 +24,7 @@ import {
   findLeadingGlobalFlagsEnd,
   parseIpfsGatewayOverride,
   stripLeadingGlobalFlags,
+  validateLeadingGlobalFlags,
   VALUE_BEARING_GLOBAL_FLAGS,
   BOOLEAN_GLOBAL_FLAGS,
 } from '../../../cli/global-flags';
@@ -262,5 +267,237 @@ describe('flag registry contract (forward-compat)', () => {
     stripLeadingGlobalFlags(argvCopy);
     expect(argvCopy).toEqual(['--newflag', 'value', 'init']);
     // Downstream behavior: command='--newflag' → "Unknown command".
+  });
+});
+
+// ============================================================================
+// Wave F.11 — equals form, value validation (steelman⁹ critical fixes)
+// ============================================================================
+
+describe('--flag=value equals form (F.11)', () => {
+  it('findLeadingGlobalFlagsEnd consumes --ipfs-gateway=URL as one token', () => {
+    expect(findLeadingGlobalFlagsEnd(['--ipfs-gateway=http://gw1', 'init'])).toBe(1);
+  });
+
+  it('strip removes equals-form token cleanly', () => {
+    const argv = ['--ipfs-gateway=http://gw1', '--no-nostr', 'pointer', 'flush'];
+    stripLeadingGlobalFlags(argv);
+    expect(argv).toEqual(['pointer', 'flush']);
+  });
+
+  it('parser extracts URL from equals form', () => {
+    expect(
+      parseIpfsGatewayOverride(['--ipfs-gateway=http://gw1', 'pointer', 'flush']),
+    ).toEqual(['http://gw1']);
+  });
+
+  it('parser handles equals-form comma list', () => {
+    expect(
+      parseIpfsGatewayOverride(['--ipfs-gateway=http://gw1,http://gw2', 'init']),
+    ).toEqual(['http://gw1', 'http://gw2']);
+  });
+
+  it('parser mixes equals-form and space-separated occurrences', () => {
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway=http://gw1',
+        '--ipfs-gateway',
+        'http://gw2',
+        'pointer',
+        'flush',
+      ]),
+    ).toEqual(['http://gw1', 'http://gw2']);
+  });
+
+  it('rejects --no-nostr=value (boolean flags do not take values)', () => {
+    expect(findLeadingGlobalFlagsEnd(['--no-nostr=true', 'init'])).toBe(0);
+    // Token stays in argv, downstream surfaces it as "Unknown command".
+    const argv = ['--no-nostr=true', 'init'];
+    stripLeadingGlobalFlags(argv);
+    expect(argv).toEqual(['--no-nostr=true', 'init']);
+  });
+
+  it('rejects malformed equals form `--=value` (eqIdx <= 2)', () => {
+    expect(findLeadingGlobalFlagsEnd(['--=foo', 'init'])).toBe(0);
+  });
+});
+
+describe('value validation — single-dash and missing-URL guards (F.11)', () => {
+  it('refuses to consume `-h` as --ipfs-gateway value', () => {
+    // F.10 would have consumed `-h` (only `--` was rejected). F.11
+    // tightens to any leading dash. Result: scanner stops at the
+    // `--ipfs-gateway` token, leaving everything in argv for downstream.
+    const argv = ['--ipfs-gateway', '-h', 'init'];
+    expect(findLeadingGlobalFlagsEnd(argv)).toBe(0);
+  });
+
+  it('refuses to consume `-` (single dash) as --ipfs-gateway value', () => {
+    expect(findLeadingGlobalFlagsEnd(['--ipfs-gateway', '-', 'init'])).toBe(0);
+  });
+
+  it('still consumes URLs that contain dashes inside (not at start)', () => {
+    expect(
+      findLeadingGlobalFlagsEnd([
+        '--ipfs-gateway',
+        'http://gateway-1.example.com',
+        'init',
+      ]),
+    ).toBe(2);
+  });
+
+  it('parser silently filters non-URL entries (no `://`)', () => {
+    // `init` happens to look like a non-URL — the scanner consumed it
+    // (doesn't start with `-`), but the parser drops it as malformed.
+    // The final defense for users is `validateLeadingGlobalFlags` in
+    // the CLI entry point — not the parser.
+    expect(parseIpfsGatewayOverride(['--ipfs-gateway', 'init'])).toEqual([]);
+  });
+
+  it('parser silently filters dash-prefix entries from comma list', () => {
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway',
+        'http://gw1,-bogus,http://gw2',
+        'init',
+      ]),
+    ).toEqual(['http://gw1', 'http://gw2']);
+  });
+});
+
+describe('validateLeadingGlobalFlags (F.11 — loud failure on typos)', () => {
+  it('returns null when no global flags are present', () => {
+    expect(validateLeadingGlobalFlags([])).toBeNull();
+    expect(validateLeadingGlobalFlags(['init'])).toBeNull();
+    expect(validateLeadingGlobalFlags(['init', '--foo', 'bar'])).toBeNull();
+  });
+
+  it('returns null on well-formed leading flags', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--no-nostr',
+        '--ipfs-gateway',
+        'http://gw1',
+        'pointer',
+        'flush',
+      ]),
+    ).toBeNull();
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway=https://gw1', 'init']),
+    ).toBeNull();
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1,https://gw2', 'init']),
+    ).toBeNull();
+  });
+
+  it('catches the F.11 critical case: --ipfs-gateway init (subcommand-as-value)', () => {
+    const err = validateLeadingGlobalFlags(['--ipfs-gateway', 'init']);
+    expect(err).not.toBeNull();
+    expect(err).toContain("'init' is not a URL");
+    expect(err).toContain('Did you forget the URL?');
+  });
+
+  it('catches --ipfs-gateway with single-dash value (`-h`)', () => {
+    const err = validateLeadingGlobalFlags(['--ipfs-gateway', '-h', 'init']);
+    expect(err).not.toBeNull();
+    expect(err).toContain('--ipfs-gateway');
+    expect(err).toContain('requires a value');
+  });
+
+  it('catches --ipfs-gateway with no value at all (last in argv)', () => {
+    expect(validateLeadingGlobalFlags(['--ipfs-gateway'])).toContain(
+      'requires a value',
+    );
+  });
+
+  it('catches --ipfs-gateway with empty equals value', () => {
+    expect(validateLeadingGlobalFlags(['--ipfs-gateway=', 'init'])).toContain(
+      'cannot be empty',
+    );
+  });
+
+  it('catches --ipfs-gateway with empty space-separated value (empty string)', () => {
+    // Empty string passes the `isUsableSpaceSeparatedValue` check
+    // (doesn't start with `-`), so the scanner consumes it. The
+    // validator then catches it via the empty-value branch.
+    expect(validateLeadingGlobalFlags(['--ipfs-gateway', '', 'init'])).toContain(
+      'cannot be empty',
+    );
+  });
+
+  it('catches `,,,,` malformed value (no usable URLs)', () => {
+    const err = validateLeadingGlobalFlags(['--ipfs-gateway', ',,,,', 'init']);
+    expect(err).not.toBeNull();
+    expect(err).toContain('contained no usable URLs');
+  });
+
+  it('catches comma-list with one bad entry', () => {
+    const err = validateLeadingGlobalFlags([
+      '--ipfs-gateway',
+      'http://gw1,bogus-no-scheme,http://gw2',
+      'init',
+    ]);
+    expect(err).not.toBeNull();
+    expect(err).toContain('bogus-no-scheme');
+    expect(err).toContain('not a URL');
+  });
+
+  it('catches --no-nostr=value (boolean flag with equals)', () => {
+    const err = validateLeadingGlobalFlags(['--no-nostr=true', 'init']);
+    expect(err).not.toBeNull();
+    expect(err).toContain('--no-nostr');
+    expect(err).toContain('does not take a value');
+  });
+
+  it('returns the FIRST error when multiple are present', () => {
+    const err = validateLeadingGlobalFlags([
+      '--ipfs-gateway',
+      'init',
+      '--ipfs-gateway=', // also bad, but first one wins
+      'pointer',
+    ]);
+    expect(err).not.toBeNull();
+    expect(err).toContain("'init' is not a URL");
+  });
+
+  it('does not validate post-subcommand tokens', () => {
+    // `--ipfs-gateway` post-subcommand is the parser's `onMisplaced`
+    // case, NOT the validator's job.
+    expect(
+      validateLeadingGlobalFlags([
+        'init',
+        '--ipfs-gateway',
+        'init', // subcommand-internal; ignored.
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe('strip + parse + snapshot interaction (F.11 integration)', () => {
+  it('snapshot survives strip and remains parseable', () => {
+    // Mirrors the production flow in cli/index.ts:
+    //   const _globalFlagPreStrip = [...args];
+    //   stripLeadingGlobalFlags(args);
+    //   parseIpfsGatewayOverride(_globalFlagPreStrip);
+    const args = ['--ipfs-gateway', 'http://gw1', '--no-nostr', 'pointer', 'flush'];
+    const snapshot = [...args];
+    stripLeadingGlobalFlags(args);
+    expect(args).toEqual(['pointer', 'flush']);
+    expect(parseIpfsGatewayOverride(snapshot)).toEqual(['http://gw1']);
+    // Snapshot is unmutated:
+    expect(snapshot).toEqual([
+      '--ipfs-gateway',
+      'http://gw1',
+      '--no-nostr',
+      'pointer',
+      'flush',
+    ]);
+  });
+
+  it('equals-form snapshot survives strip and remains parseable', () => {
+    const args = ['--ipfs-gateway=http://gw1', '--no-nostr', 'init'];
+    const snapshot = [...args];
+    stripLeadingGlobalFlags(args);
+    expect(args).toEqual(['init']);
+    expect(parseIpfsGatewayOverride(snapshot)).toEqual(['http://gw1']);
   });
 });
