@@ -7,7 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
-import { pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 import { encrypt, decrypt } from '../core/encryption';
 import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from '../serialization/wallet-text';
 import { parseWalletDat, isSQLiteDatabase, isWalletDatEncrypted } from '../serialization/wallet-dat';
@@ -69,11 +69,21 @@ const args = process.argv.slice(2);
 // that importing this module as a library (currently no consumer, but
 // a long-running latent risk for any future test or tool) does NOT
 // trigger argv parsing, validation, or `process.exit(1)` against the
-// importer's process.argv. The CLI binary still runs normally.
+// importer's process.argv.
+//
+// F.19 (steelman¹⁶): use `realpathSync` symmetry on both sides of the
+// equality. F.18 used `pathToFileURL(process.argv[1]) === import.meta.url`
+// which fails under symlinks: Node's ESM loader resolves import.meta.url
+// to the REAL path, but process.argv[1] retains the symlink path. Result:
+// invoking via symlink (npm-link layouts, monorepos, dev tools) silently
+// exited 0 with no output — the worst failure mode. Fix: realpath both
+// sides, compare resolved paths.
 const isCliEntryPoint: boolean = (() => {
   try {
     if (!process.argv[1]) return false;
-    return import.meta.url === pathToFileURL(process.argv[1]).href;
+    const moduleRealPath = fs.realpathSync(fileURLToPath(import.meta.url));
+    const entryRealPath = fs.realpathSync(process.argv[1]);
+    return moduleRealPath === entryRealPath;
   } catch {
     return false;
   }
@@ -1780,8 +1790,11 @@ UTILITIES:
 
 GLOBAL FLAGS (apply to any subcommand):
   --no-nostr                        Disable Nostr transport (use no-op).
-                                    Position-agnostic; works leading or
-                                    post-subcommand.
+                                    Position-agnostic — bare token activates
+                                    anywhere in argv. NOTE: --no-nostr=value
+                                    (equals form) is rejected loudly only
+                                    in leading position; post-subcommand
+                                    occurrences are silently ignored.
   --ipfs-gateway <url[,url2,...]>   Override the IPFS gateway list for this
                                     invocation. MUST appear BEFORE the
                                     subcommand. Equals form supported:
