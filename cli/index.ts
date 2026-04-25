@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import { pathToFileURL } from 'url';
 import { encrypt, decrypt } from '../core/encryption';
 import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from '../serialization/wallet-text';
 import { parseWalletDat, isSQLiteDatabase, isWalletDatEncrypted } from '../serialization/wallet-dat';
@@ -63,8 +64,24 @@ const args = process.argv.slice(2);
 // Otherwise the leading-region scanner stops at the unknown flag and
 // downstream code sees it either as `--help` (handled) or "Unknown
 // command" (rejected).
+// F.18 (steelman¹⁵ deferred from R11/R12/R13/R14/R15): the validate +
+// strip + main() invocation are now guarded by an entry-point check so
+// that importing this module as a library (currently no consumer, but
+// a long-running latent risk for any future test or tool) does NOT
+// trigger argv parsing, validation, or `process.exit(1)` against the
+// importer's process.argv. The CLI binary still runs normally.
+const isCliEntryPoint: boolean = (() => {
+  try {
+    if (!process.argv[1]) return false;
+    return import.meta.url === pathToFileURL(process.argv[1]).href;
+  } catch {
+    return false;
+  }
+})();
+
 const _globalFlagPreStrip = [...args];
-{
+let command: string | undefined;
+if (isCliEntryPoint) {
   // F.11: validate global-flag values BEFORE the strip mutates argv.
   // Loud failure is better than silent printUsage when a user typos
   // `--ipfs-gateway init` (greedy swallow → command=undefined).
@@ -73,9 +90,9 @@ const _globalFlagPreStrip = [...args];
     console.error(`[sphere-cli] error: ${validationError}`);
     process.exit(1);
   }
+  stripLeadingGlobalFlags(args);
+  command = args[0];
 }
-stripLeadingGlobalFlags(args);
-const command = args[0];
 
 // =============================================================================
 // CLI Configuration
@@ -1761,6 +1778,16 @@ UTILITIES:
   base58-encode <hex>               Base58 encode
   base58-decode <b58>               Base58 decode
 
+GLOBAL FLAGS (apply to any subcommand):
+  --no-nostr                        Disable Nostr transport (use no-op).
+                                    Position-agnostic; works leading or
+                                    post-subcommand.
+  --ipfs-gateway <url[,url2,...]>   Override the IPFS gateway list for this
+                                    invocation. MUST appear BEFORE the
+                                    subcommand. Equals form supported:
+                                    --ipfs-gateway=https://gw.example.com
+                                    Comma-separated values accumulate.
+
 Run "npm run cli -- help <command>" for detailed help on any command.
 
 Examples:
@@ -1772,6 +1799,7 @@ Examples:
   npm run cli -- nametag myname
   npm run cli -- history 10
   npm run cli -- help send
+  npm run cli -- --no-nostr --ipfs-gateway https://ipfs.unicity.network pointer flush
 `);
 }
 
@@ -6173,8 +6201,12 @@ function generateFishCompletions(): string {
   return lines.join('\n') + '\n';
 }
 
-main().then(() => process.exit(0)).catch((err) => {
-  const msg = err instanceof Error ? err.message : String(err);
-  console.error(`Fatal error: ${msg}`);
-  process.exit(1);
-});
+// F.18: only run main() when this module is the CLI entry point.
+// Library imports must not trigger CLI execution.
+if (isCliEntryPoint) {
+  main().then(() => process.exit(0)).catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Fatal error: ${msg}`);
+    process.exit(1);
+  });
+}
