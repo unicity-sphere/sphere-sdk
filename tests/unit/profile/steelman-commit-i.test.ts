@@ -23,7 +23,7 @@ class FakeWebSocket extends EventTarget {
   readonly sent: string[] = [];
   readyState = 1;
   url: string;
-  binaryType: 'arraybuffer' = 'arraybuffer';
+  binaryType = 'arraybuffer' as const;
   constructor(url: string) {
     super();
     this.url = url;

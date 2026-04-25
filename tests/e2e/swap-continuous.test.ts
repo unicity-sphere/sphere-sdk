@@ -25,7 +25,7 @@
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { Sphere } from '../../core/Sphere';
 import { execSync, spawn, ChildProcess } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, cpSync, readFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, cpSync, readFileSync, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -129,7 +129,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
     // Launch escrow as a persistent process
     console.log(`Launching escrow @${escrowNametag}...`);
     const escrowLog = join(workspace, 'escrow.log');
-    escrowLogFd = require('fs').openSync(escrowLog, 'w');
+    escrowLogFd = openSync(escrowLog, 'w');
     escrowProcess = spawn('npx', ['tsx', '--env-file=.env', 'src/index.ts'], {
       cwd: escrowDir,
       stdio: ['ignore', escrowLogFd, escrowLogFd],
@@ -167,7 +167,7 @@ describe.skipIf(SKIP)('Continuous-process swap E2E (full lifecycle)', () => {
 
     // Close escrow log fd
     if (escrowLogFd !== null) {
-      try { require('fs').closeSync(escrowLogFd); } catch { /* ignore */ }
+      try { closeSync(escrowLogFd); } catch { /* ignore */ }
       escrowLogFd = null;
     }
 

@@ -159,7 +159,7 @@ describe('Commit B + E — state machine steelman² remediations', () => {
       //
       // Here we exercise the discrimination path directly via the
       // exported combineOutcomes helper.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
+       
       const submit = await import('../../../../profile/aggregator-pointer/aggregator-submit');
       const combine = (submit.__internal as { combineOutcomes?: unknown }).combineOutcomes as
         | ((outA: unknown, outB: unknown, v: number, cidBytes: Uint8Array, marker: unknown, hint?: boolean) => { kind: string; committedSideKind?: string })

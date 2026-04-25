@@ -862,7 +862,7 @@ describe('GroupChatModule — CID-refs persistence (commit 7b.2)', () => {
       'bafkreihgwgjb76y4evzixnyhurnscy46rtuekx2gojy63zvyexmptzq4pi',
       'bafkreib5rv2rsfv3d7x57grexkl2prw2wmz4eojpyk2xmeugzszvtefyfy',
     ];
-    let cidIdx = 0;
+    const cidIdx = 0;
 
     // Gate the FIRST pin call to create a race window — persist-1 is
     // suspended on pinJson while persist-2 is kicked off.

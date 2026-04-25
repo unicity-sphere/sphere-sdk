@@ -1265,7 +1265,7 @@ export class ProfileStorageProvider implements StorageProvider {
 
   private log(...args: unknown[]): void {
     if (this.debug) {
-      // eslint-disable-next-line no-console
+       
       console.debug('[ProfileStorage]', ...args);
     }
   }

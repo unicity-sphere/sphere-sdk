@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* global process */
 // Wrapper for sphere-cli that uses tsx to run TypeScript directly
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';

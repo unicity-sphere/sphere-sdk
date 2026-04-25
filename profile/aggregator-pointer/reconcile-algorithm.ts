@@ -147,23 +147,18 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     const cidBytes = await input.cidProducer();
 
     // Step B: discover V_true and target nextV = max(validV, includedV) + 1 (H4).
-    let discovery: DiscoverResult;
-    try {
-      discovery = await findLatestValidVersion({
-        currentLocalVersion,
-        keyMaterial: input.keyMaterial,
-        signer: input.signer,
-        aggregatorClient: input.aggregatorClient,
-        trustBase: input.trustBase,
-        decodeCid: input.decodeCid,
-        fetchCar: input.fetchCar,
-      });
-    } catch (err) {
-      // Discovery errors propagate unchanged (DISCOVERY_OVERFLOW, CAR_UNAVAILABLE,
-      // CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF). Reconcile cannot
-      // make progress without a valid V_true.
-      throw err;
-    }
+    // Discovery errors propagate unchanged (DISCOVERY_OVERFLOW, CAR_UNAVAILABLE,
+    // CORRUPT_STREAK, TRUST_BASE_STALE, UNTRUSTED_PROOF). Reconcile cannot
+    // make progress without a valid V_true.
+    const discovery: DiscoverResult = await findLatestValidVersion({
+      currentLocalVersion,
+      keyMaterial: input.keyMaterial,
+      signer: input.signer,
+      aggregatorClient: input.aggregatorClient,
+      trustBase: input.trustBase,
+      decodeCid: input.decodeCid,
+      fetchCar: input.fetchCar,
+    });
     probeHistory.push(...discovery.probeVersions);
     const nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
 
@@ -200,21 +195,16 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
     //   3. fetchAndJoin remote bundle.
     //   4. Persist localVersion = validV.
     //   5. sleep(backoff), recurse.
-    let rediscovery: DiscoverResult;
-    try {
-      rediscovery = await findLatestValidVersion({
-        currentLocalVersion,
-        keyMaterial: input.keyMaterial,
-        signer: input.signer,
-        aggregatorClient: input.aggregatorClient,
-        trustBase: input.trustBase,
-        decodeCid: input.decodeCid,
-        fetchCar: input.fetchCar,
-      });
-    } catch (err) {
-      // Re-discovery failure during conflict reconciliation — propagate.
-      throw err;
-    }
+    // Re-discovery failure during conflict reconciliation — propagate unchanged.
+    const rediscovery: DiscoverResult = await findLatestValidVersion({
+      currentLocalVersion,
+      keyMaterial: input.keyMaterial,
+      signer: input.signer,
+      aggregatorClient: input.aggregatorClient,
+      trustBase: input.trustBase,
+      decodeCid: input.decodeCid,
+      fetchCar: input.fetchCar,
+    });
     probeHistory.push(...rediscovery.probeVersions);
 
     if (rediscovery.validV > 0) {

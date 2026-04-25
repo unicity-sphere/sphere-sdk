@@ -5336,7 +5336,7 @@ async function main() {
 
           if (!noWaitFlag) {
             // Wait for terminal event
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+             
             const swapRef = await swapModule.getSwapStatus(swapId);
             const waitTimeout = 2 * (swapRef?.deal?.timeout ?? 3600) * 1000;
             const unsubs: (() => void)[] = [];

@@ -622,7 +622,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
           `  Values (sorted):`,
           ...[...aggregatorCodes].sort().map((v) => `    ${v}`),
         ].join('\n');
-        // eslint-disable-next-line no-console
+         
         console.error(`P7 detailed census:\n${details}`);
       }
 
@@ -737,7 +737,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
         expect(declared).toBe(PROFILE_POINTER_HKDF_INFO.length);
       } else {
         // Some older fixture shapes omit the length field — skip gracefully.
-        // eslint-disable-next-line no-console
+         
         console.warn('P8: fixture omits PROFILE_POINTER_HKDF_INFO_len; skipping length cross-check');
       }
     });
@@ -759,7 +759,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
       const walletHex = vectors.inputs?.walletPrivateKey_hex;
       const pinned = vectors.derived_keys;
       if (!walletHex || !pinned) {
-        // eslint-disable-next-line no-console
+         
         console.warn('P8: fixture missing walletPrivateKey_hex or derived_keys — cannot run KAT');
         return;
       }
@@ -786,7 +786,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
       const walletHex = vectors.inputs?.walletPrivateKey_hex;
       const pinnedPub = vectors.derived_keys?.signingPubKey_hex;
       if (!walletHex || !pinnedPub) {
-        // eslint-disable-next-line no-console
+         
         console.warn('P8: fixture missing walletPrivateKey_hex or signingPubKey_hex — skipping signer KAT');
         return;
       }

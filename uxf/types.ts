@@ -143,7 +143,7 @@ export interface TokenRootChildren {
 // ---- Genesis ----
 
 /** All data lives in children; no inline content. */
-export interface GenesisContent {}
+export type GenesisContent = Record<string, never>;
 
 export interface GenesisChildren {
   readonly data: ContentHash;              // -> genesis-data
@@ -174,7 +174,7 @@ export interface GenesisDataContent {
 // ---- Transaction ----
 
 /** All data lives in children; no inline content. */
-export interface TransactionContent {}
+export type TransactionContent = Record<string, never>;
 
 export interface TransactionChildren {
   readonly sourceState: ContentHash;             // -> token-state (state before transition)

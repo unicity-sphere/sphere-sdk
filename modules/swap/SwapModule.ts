@@ -1072,7 +1072,7 @@ export class SwapModule {
     if (!matchesPartyA && !matchesPartyB) {
       throw new SphereError('SWAP_INVALID_DEAL: Local wallet is neither party A nor party B', 'SWAP_INVALID_DEAL');
     }
-    const role: 'proposer' = 'proposer';
+    const role = 'proposer' as const;
     const counterpartyPeer = matchesPartyA ? peerB : peerA;
     const counterpartyPubkey = counterpartyPeer.transportPubkey ?? counterpartyPeer.chainPubkey;
     const counterpartyNametag = counterpartyPeer.nametag;

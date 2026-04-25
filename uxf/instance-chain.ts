@@ -497,7 +497,7 @@ export function rebuildInstanceChainIndex(
       visited.add(startHash);
 
       let currentHash = startHash;
-      // eslint-disable-next-line no-constant-condition
+       
       while (true) {
         const succs = successorOf.get(currentHash);
         if (!succs || succs.length === 0) {

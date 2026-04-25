@@ -61,7 +61,7 @@ import { canonicalSerialize } from './serialization.js';
 import { hexToBytes } from '@noble/hashes/utils.js';
 import { computeInvoiceStatus, freezeBalances } from './balance-computer.js';
 import { TokenRegistry } from '../../registry/index.js';
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+ 
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token.js';
 import { txfToToken } from '../../serialization/txf-serializer.js';
 
@@ -1044,7 +1044,7 @@ export class AccountingModule {
       const { TokenState } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/TokenState.js'
       );
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+       
       const { Token: SdkToken } = await import(
         '@unicitylabs/state-transition-sdk/lib/token/Token.js'
       );
@@ -1357,7 +1357,7 @@ export class AccountingModule {
     // tokenData may be plain JSON or hex-encoded UTF-8 JSON
     // (state-transition-sdk stores it as hex via HexConverter.encode).
     let jsonString = tokenData;
-    if (!/^\s*[\[{"]/.test(tokenData)) {
+    if (!/^\s*[[{"]/.test(tokenData)) {
       // Doesn't look like JSON — attempt hex decode
       try {
         const bytes = hexToBytes(tokenData);

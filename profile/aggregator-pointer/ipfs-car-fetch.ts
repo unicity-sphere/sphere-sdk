@@ -323,7 +323,7 @@ export async function fetchCarFromGateway(
   const startTime = Date.now();
   const remaining = (): number => Math.max(0, totalMs - (Date.now() - startTime));
 
-  let accumulated: Uint8Array[] = [];
+  const accumulated: Uint8Array[] = [];
   let rangeOffset = 0;
   let attemptedResume = false;
 

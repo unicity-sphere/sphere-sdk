@@ -1,3 +1,4 @@
+/* global TextEncoder, Buffer, console */
 // O-1 KAT vector computation for Profile Aggregator Pointer Layer
 // Reads SPEC §3 constants and §4 derivations; produces test-vectors.json
 
