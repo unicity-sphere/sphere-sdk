@@ -6,19 +6,22 @@
 # offline. Recover using the cached version hint; aggregator query is
 # skipped.
 #
-# STATUS: TODO — placeholder.
+# STATUS: TODO (v2) — placeholder.
 #
-# Why not implemented yet in this wave:
-#   * SPEC §5.11 flags this as PENDING-IMPL: "sphere CLI should support
-#     --offline or --cached-pointer-version flag". Until that ships,
-#     there's no way to force the cache path without cutting network at
-#     the OS level (same sudo/iptables blocker as N6).
-#   * The offline-cache lookup path is covered by unit tests in
-#     tests/unit/profile/pointer/cache-*.test.ts.
+# Why not implemented in v1:
+#   * SPEC §5.11 flags this as PENDING-IMPL. The pointer layer's
+#     `recoverLatest()` is currently aggregator-driven by design — a
+#     true offline mode would require a NEW code path that uses
+#     `currentLocalVersion` + cached probe history to skip the
+#     aggregator query entirely. This is a feature, not just a flag.
+#   * The offline-cache lookup path that this would build on is
+#     covered indirectly by tests/integration/pointer/category-C.test.ts
+#     (multi-device contention with mocked aggregator).
 #
-# Next step: add `--offline` flag to pointer recover, then script a
-# publish followed by an offline recover and assert the cached version
-# is used.
+# v2 plan: add `recoverLatest({ offline: true })` to ProfilePointerLayer,
+# then surface as `pointer recover --offline` in the CLI, then script
+# a publish followed by an offline recover and assert the cached
+# version is used without aggregator round-trip.
 # =============================================================================
 set -Eeuo pipefail
 TEST_NAME="pointer-N9"

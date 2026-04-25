@@ -25,6 +25,18 @@ import type { TransportProvider } from '../transport/transport-provider';
 import type { ProviderStatus } from '../types';
 
 const args = process.argv.slice(2);
+// Wave F.5: strip --ipfs-gateway <value> from args at module load so
+// the flag may appear before the subcommand. `parseIpfsGatewayOverride`
+// is still called against `process.argv.slice(2)` directly via a
+// pre-strip snapshot when needed — but for command resolution we
+// need args[0] to be the actual command name regardless of where the
+// global flag appeared.
+const _ipfsGatewayPreStrip = [...args];
+for (let i = args.length - 1; i >= 0; i--) {
+  if (args[i] === '--ipfs-gateway' && i + 1 < args.length && !args[i + 1].startsWith('--')) {
+    args.splice(i, 2);
+  }
+}
 const command = args[0];
 
 // =============================================================================
@@ -281,6 +293,32 @@ function createNoopTransport(): TransportProvider {
   };
 }
 
+/**
+ * Parse `--ipfs-gateway <url[,url2,...]>` from argv. Returns the URL
+ * array (possibly empty) — empty means "use the network default".
+ *
+ * Multiple invocations of the flag accumulate. Comma-separated single
+ * argument also accepted. Trailing slashes are normalized away.
+ *
+ * Wave F.5 — unblocks N5 (SPEC §5.6 IPFS gateway failover) which
+ * needs to drive the pointer layer's CAR fetcher with a specific
+ * non-default gateway list.
+ */
+function parseIpfsGatewayOverride(argv: readonly string[]): string[] {
+  const gateways: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--ipfs-gateway' && i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
+      const raw = argv[i + 1];
+      for (const entry of raw.split(',')) {
+        const trimmed = entry.trim().replace(/\/+$/, '');
+        if (trimmed.length > 0) gateways.push(trimmed);
+      }
+      i++; // skip value
+    }
+  }
+  return gateways;
+}
+
 async function getSphere(options?: {
   autoGenerate?: boolean;
   mnemonic?: string;
@@ -296,6 +334,15 @@ async function getSphere(options?: {
 
   const config = loadConfig();
   const mode = await resolveStorageMode(config, options?.storageMode);
+
+  // Wave F.5 — `--ipfs-gateway <url[,url2,...]>` global override.
+  // Threaded into the Profile factory's profileConfig.ipfsGateways so
+  // pointer-layer CAR fetches and IPFS pin operations rotate through
+  // exactly the supplied gateway list (in order). Unblocks N5 testnet
+  // script (SPEC §5.6 — gateway-failover assertion).
+  // Read from the pre-strip snapshot — the live `args` array had the
+  // flag removed at module load so command resolution would work.
+  const gatewayOverride = parseIpfsGatewayOverride(_ipfsGatewayPreStrip);
 
   // Build providers based on resolved storage mode.
   let providers;
@@ -321,6 +368,9 @@ async function getSphere(options?: {
       network: config.network,
       dataDir: config.dataDir,
       oracle: legacyForNonStorage.oracle,
+      ...(gatewayOverride.length > 0
+        ? { profileConfig: { ipfsGateways: gatewayOverride } }
+        : {}),
     });
     providers = {
       ...legacyForNonStorage,
