@@ -107,6 +107,13 @@ export class ProfilePointerLayer {
   readonly #init: ProfilePointerLayerInit;
   readonly #config: PointerLayerConfig;
   #lastProbeVersions: readonly PointerVersion[] = [];
+  /**
+   * Tracks all in-flight publish/recover/probe operations so `shutdown()`
+   * can drain them. The set holds Promises (resolution status irrelevant);
+   * `Promise.allSettled` waits for every entry. Each operation removes
+   * itself from the set in a `finally` block.
+   */
+  readonly #inFlight = new Set<Promise<unknown>>();
 
   constructor(init: ProfilePointerLayerInit) {
     this.#init = init;
@@ -119,12 +126,63 @@ export class ProfilePointerLayer {
     // coercion also defensively rejects truthy non-boolean values
     // (e.g., `'yes'`, `1`) which could otherwise sneak through.
     const suppliedConfig: PointerLayerConfig = init.config ?? {};
+    // T-E26 production guard runs against the RAW input so the
+    // `allowUnverifiedOverride` v1-deferral marker (raises CAPABILITY_DENIED
+    // outside NODE_ENV=development per SPEC §13.4 / O-5) still fires
+    // even though the field is not retained in the normalized snapshot.
+    assertConfigCapabilities(suppliedConfig);
+    // Steelman² remediation: extract just the known boolean field into
+    // a normalized frozen snapshot. This drops `allowUnverifiedOverride`
+    // post-guard — defense-in-depth, since the field has no behavior
+    // effect in v1 and won't be read by any code path.
     this.#config = Object.freeze({
       allowOperatorOverrides: suppliedConfig.allowOperatorOverrides === true,
-      allowUnverifiedOverride: suppliedConfig.allowUnverifiedOverride === true,
     });
-    // T-E26 production guard runs at init.
-    assertConfigCapabilities(this.#config);
+  }
+
+  /**
+   * Wrap an async operation so it's tracked in `#inFlight` and removes
+   * itself on settle. Used by the public publish/recover/probe entry
+   * points so `shutdown()` can drain them.
+   *
+   * Implementation note: we use `op.then(cleanup, cleanup)` with both
+   * handlers wired explicitly — NOT `op.finally(cleanup)` — to avoid
+   * a dangling-rejection chain. `op.finally(...)` returns a NEW promise
+   * that propagates the original rejection; if nothing awaits that
+   * resulting promise (we don't — we return `op` directly), the
+   * rejection surfaces as an unhandledRejection. The two-handler
+   * `.then` form swallows the rejection on the CLEANUP chain only;
+   * the caller's `await op` still observes the original rejection.
+   */
+  #tracked<T>(op: Promise<T>): Promise<T> {
+    this.#inFlight.add(op);
+    void op.then(
+      () => { this.#inFlight.delete(op); },
+      () => { this.#inFlight.delete(op); },
+    );
+    return op;
+  }
+
+  /**
+   * Wave F.2 architecture-advisory remediation: drain in-flight
+   * publish/recover/probe operations before the surrounding
+   * ProfileStorageProvider tears down OrbitDB. Previously the
+   * disconnect path duck-typed `pointerLayer.shutdown?.()` and silently
+   * no-op'd because the method did not exist — leaving an in-flight
+   * Node publish able to leak its proper-lockfile mutex for up to
+   * 8 seconds (until proper-lockfile's stale detector reclaimed it).
+   *
+   * `shutdown()` waits for all tracked operations to settle. It does
+   * NOT cancel them — cancellation would require unwinding partial
+   * publish state which is unsafe. Callers that need a hard timeout
+   * should wrap in `Promise.race([layer.shutdown(), timeoutPromise])`.
+   *
+   * Idempotent — safe to call multiple times.
+   */
+  async shutdown(): Promise<void> {
+    if (this.#inFlight.size === 0) return;
+    const pending = [...this.#inFlight];
+    await Promise.allSettled(pending);
   }
 
   // ── publish ──────────────────────────────────────────────────────────────
@@ -141,6 +199,10 @@ export class ProfilePointerLayer {
    *   merged from fetchAndJoin on prior conflicts.
    */
   async publish(cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
+    return this.#tracked(this.#publishInner(cidProducer));
+  }
+
+  async #publishInner(cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
     const currentLocalVersion = await this.#init.readLocalVersion();
     const result = await reconcileAndPublish({
       cidProducer,

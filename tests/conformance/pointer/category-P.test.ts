@@ -765,7 +765,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
       }
 
       const walletPrivateKey = hexToBytes(walletHex);
-      const master = createMasterPrivateKey(walletPrivateKey);
+      const master = createMasterPrivateKey(walletPrivateKey, 'test-vectors');
       const km = derivePointerKeyMaterial(master);
 
       if (pinned.pointerSecret_hex) {
@@ -790,7 +790,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
         console.warn('P8: fixture missing walletPrivateKey_hex or signingPubKey_hex — skipping signer KAT');
         return;
       }
-      const master = createMasterPrivateKey(hexToBytes(walletHex));
+      const master = createMasterPrivateKey(hexToBytes(walletHex), 'test-vectors');
       const km = derivePointerKeyMaterial(master);
       const signer = await buildPointerSigner(km.signingSeed);
       expect(signer.signingPubKeyHex).toBe(pinnedPub);
@@ -799,7 +799,7 @@ describe('Category P — Conformance & Security Invariants (TEST-SPEC §P)', () 
     it('KAT — four derived seeds are pairwise distinct (H12 domain separation)', () => {
       const walletHex = vectors.inputs?.walletPrivateKey_hex;
       if (!walletHex) return;
-      const master = createMasterPrivateKey(hexToBytes(walletHex));
+      const master = createMasterPrivateKey(hexToBytes(walletHex), 'test-vectors');
       const km = derivePointerKeyMaterial(master);
       const seeds = [
         bytesToHex(km.pointerSecret.reveal()),

@@ -43,6 +43,14 @@ export interface ProfileConfig {
   readonly orbitDb: OrbitDbConfig;
   /** Whether to encrypt values stored in OrbitDB (default: true) */
   readonly encrypt?: boolean;
+  /**
+   * Network identifier — passed through to the pointer layer's
+   * SPEC §14.1 / §11.12 denylist enforcement. Pass 'test-vectors' to
+   * accept the canonical 0x01×32 KAT vector for fixture-driven tests.
+   * Production deployments should use 'mainnet' / 'testnet' / 'dev'
+   * (or leave undefined; any non-'test-vectors' value rejects the KAT).
+   */
+  readonly network?: string;
   /** IPFS gateway URLs for CAR file pinning/fetching */
   readonly ipfsGateways?: string[];
   /** Maximum local cache size in bytes (optional, platform-dependent) */

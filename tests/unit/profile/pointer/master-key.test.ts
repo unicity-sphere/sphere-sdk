@@ -15,14 +15,14 @@ describe('MasterPrivateKey (T-A5b)', () => {
   const bytes = new Uint8Array(32).fill(0x01);
 
   it('createMasterPrivateKey produces an authorized instance', () => {
-    const master = createMasterPrivateKey(bytes);
+    const master = createMasterPrivateKey(bytes, 'test-vectors');
     expect(isAuthorizedMasterKey(master)).toBe(true);
     expect(master.bytes).toEqual(bytes);
   });
 
   it('rejects bytes of wrong length with RangeError', () => {
-    expect(() => createMasterPrivateKey(new Uint8Array(16))).toThrow(RangeError);
-    expect(() => createMasterPrivateKey(new Uint8Array(33))).toThrow(/must be exactly 32 bytes/);
+    expect(() => createMasterPrivateKey(new Uint8Array(16, 'test-vectors'))).toThrow(RangeError);
+    expect(() => createMasterPrivateKey(new Uint8Array(33, 'test-vectors'))).toThrow(/must be exactly 32 bytes/);
   });
 
   it('isAuthorizedMasterKey returns false for cast raw objects', () => {
@@ -45,7 +45,7 @@ describe('MasterPrivateKey (T-A5b)', () => {
   });
 
   it('derivePointerKeyMaterial accepts authorized instances', () => {
-    const master = createMasterPrivateKey(bytes);
+    const master = createMasterPrivateKey(bytes, 'test-vectors');
     expect(() => derivePointerKeyMaterial(master)).not.toThrow();
   });
 
@@ -61,7 +61,7 @@ describe('MasterPrivateKey (T-A5b)', () => {
   });
 
   it('frozen instance: bytes cannot be mutated', () => {
-    const master = createMasterPrivateKey(bytes);
+    const master = createMasterPrivateKey(bytes, 'test-vectors');
     // Can still mutate the underlying TypedArray, but not replace the property.
     // This is a defense-in-depth check that the top-level object is frozen.
     expect(Object.isFrozen(master)).toBe(true);
@@ -69,7 +69,7 @@ describe('MasterPrivateKey (T-A5b)', () => {
 
   it('copy discipline: mutating the input does not affect the stored key', () => {
     const input = new Uint8Array(32).fill(0x42);
-    const master = createMasterPrivateKey(input);
+    const master = createMasterPrivateKey(input, 'test-vectors');
     input[0] = 0xff;
     expect(master.bytes[0]).toBe(0x42);
   });

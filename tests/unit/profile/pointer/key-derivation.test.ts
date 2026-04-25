@@ -18,7 +18,7 @@ import {
 
 describe('derivePointerKeyMaterial (T-A4 / T-A5 / T-A6)', () => {
   const bytes = new Uint8Array(32).fill(0x01);
-  const master = createMasterPrivateKey(bytes);
+  const master = createMasterPrivateKey(bytes, 'test-vectors');
 
   it('outputs are 32 bytes each', () => {
     const km = derivePointerKeyMaterial(master);
@@ -50,7 +50,7 @@ describe('derivePointerKeyMaterial (T-A4 / T-A5 / T-A6)', () => {
 
   it('different wallet keys → different derivations', () => {
     const bytes2 = new Uint8Array(32).fill(0x02);
-    const master2 = createMasterPrivateKey(bytes2);
+    const master2 = createMasterPrivateKey(bytes2, 'test-vectors');
     const km1 = derivePointerKeyMaterial(master);
     const km2 = derivePointerKeyMaterial(master2);
     expect(bytesToHex(km1.pointerSecret.reveal())).not.toBe(bytesToHex(km2.pointerSecret.reveal()));
@@ -62,7 +62,7 @@ describe('derivePointerKeyMaterial (T-A4 / T-A5 / T-A6)', () => {
     for (let i = 1; i <= 100; i++) {
       const b = new Uint8Array(32);
       b[0] = i;
-      const m = createMasterPrivateKey(b);
+      const m = createMasterPrivateKey(b, 'test-vectors');
       const km = derivePointerKeyMaterial(m);
       const all = [
         bytesToHex(km.pointerSecret.reveal()),
@@ -81,7 +81,7 @@ describe('derivePointerKeyMaterial (T-A4 / T-A5 / T-A6)', () => {
 
 describe('per-version / per-side derivations', () => {
   const bytes = new Uint8Array(32).fill(0x01);
-  const master = createMasterPrivateKey(bytes);
+  const master = createMasterPrivateKey(bytes, 'test-vectors');
   const km = derivePointerKeyMaterial(master);
 
   it('stateHashDigest is side-dependent', () => {

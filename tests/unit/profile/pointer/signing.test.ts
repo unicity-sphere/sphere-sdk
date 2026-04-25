@@ -17,7 +17,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 
 describe('buildPointerSigner (T-A8)', () => {
   const walletBytes = new Uint8Array(32).fill(0x01);
-  const master = createMasterPrivateKey(walletBytes);
+  const master = createMasterPrivateKey(walletBytes, 'test-vectors');
 
   it('produces a 33-byte compressed secp256k1 pubkey', async () => {
     const km = derivePointerKeyMaterial(master);

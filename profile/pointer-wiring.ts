@@ -140,6 +140,14 @@ export interface PointerWiringInput {
    * runtimes when this is absent. Ignored in the browser (Web Locks).
    */
   readonly lockFilePath?: string;
+  /**
+   * Network identifier — passed through to `createMasterPrivateKey`
+   * for SPEC §14.1 / §11.12 denylist enforcement. Pass 'test-vectors'
+   * to accept the canonical 0x01×32 KAT vector; any other value (or
+   * undefined) rejects it. Production deployments should leave this
+   * undefined or set to 'mainnet' / 'testnet' / 'dev'.
+   */
+  readonly network?: string;
   /** Turn on verbose logging for the wiring helper itself. */
   readonly debug?: boolean;
 }
@@ -597,7 +605,7 @@ export async function buildProfilePointerLayer(
   let masterKey: ReturnType<typeof createMasterPrivateKey> | null = null;
   let bundleEncryptionKey: Uint8Array | null = null;
   try {
-    masterKey = createMasterPrivateKey(rawPrivKeyBytes);
+    masterKey = createMasterPrivateKey(rawPrivKeyBytes, input.network);
     rawPrivKeyBytes.fill(0);
     const keyMaterial = derivePointerKeyMaterial(masterKey);
     // Steelman remediation (R-11): derive the bundle AES key from the

@@ -79,11 +79,17 @@ describe('Commit A — crypto steelman remediations', () => {
       });
     }
 
-    it('canonical 0x01×32 KAT vector remains accepted (KAT preservation)', () => {
-      // Documented exemption: the canonical test vector is a valid scalar,
-      // the pointer-layer KAT suite depends on it, and probability of
-      // accidental collision via BIP39 seed is astronomically low.
-      const mk = createMasterPrivateKey(new Uint8Array(32).fill(0x01));
+    it('canonical 0x01×32 KAT vector accepted only with network="test-vectors" (Wave F.2)', () => {
+      // SPEC §14.1 / §11.12 — the canonical KAT vector is denylisted
+      // by default. Production networks reject it; only tests passing
+      // network='test-vectors' accept it.
+      expect(() => createMasterPrivateKey(new Uint8Array(32).fill(0x01))).toThrow(
+        expect.objectContaining({ code: AggregatorPointerErrorCode.PROTOCOL_ERROR }),
+      );
+      expect(() => createMasterPrivateKey(new Uint8Array(32).fill(0x01), 'mainnet')).toThrow(
+        expect.objectContaining({ code: AggregatorPointerErrorCode.PROTOCOL_ERROR }),
+      );
+      const mk = createMasterPrivateKey(new Uint8Array(32).fill(0x01), 'test-vectors');
       expect(mk.bytes.every((b) => b === 0x01)).toBe(true);
     });
 

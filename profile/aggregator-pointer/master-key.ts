@@ -67,6 +67,9 @@ const registry = new WeakSet<MasterPrivateKey>();
  * the test "is this MY key denylisted?" can hit them). No hex string
  * is ever materialized for legitimate keys.
  */
+/** Canonical KAT vector — accepted only when network='test-vectors' (SPEC §14.1). */
+const KAT_CANONICAL_VECTOR = new Uint8Array(32).fill(0x01);
+
 const WEAK_KEY_DENYLIST_BYTES: ReadonlyArray<Uint8Array> = Object.freeze([
   // All-zero — structurally invalid secp256k1 scalar.
   new Uint8Array(32),
@@ -93,25 +96,37 @@ const WEAK_KEY_DENYLIST_BYTES: ReadonlyArray<Uint8Array> = Object.freeze([
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
     0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x42,
   ]),
-  // NOTE: the canonical 0x01×32 KAT vector is intentionally NOT on the
-  // denylist. It is a valid secp256k1 scalar and the pointer-layer
-  // HKDF KAT suite depends on it. Users generating keys from proper
-  // BIP39 seeds will not hit any of the above denylisted values by
-  // accident (probability ~2^-256).
 ]);
 
-function isDenylistedMasterKey(bytes: Uint8Array): boolean {
+function bytesEqual32(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== 32 || b.length !== 32) return false;
+  for (let i = 0; i < 32; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function isStructurallyInvalid(bytes: Uint8Array): boolean {
   if (bytes.length !== 32) return false;
   for (const candidate of WEAK_KEY_DENYLIST_BYTES) {
-    let match = true;
-    for (let i = 0; i < 32; i++) {
-      if (bytes[i] !== candidate[i]) {
-        match = false;
-        break;
-      }
-    }
-    if (match) return true;
+    if (bytesEqual32(bytes, candidate)) return true;
   }
+  return false;
+}
+
+function isCanonicalKatVector(bytes: Uint8Array): boolean {
+  return bytesEqual32(bytes, KAT_CANONICAL_VECTOR);
+}
+
+/**
+ * SPEC §14.1 / §11.12 denylist trigger: returns true iff the bytes
+ * MUST be rejected at construction. Structurally invalid scalars
+ * (all-zero, all-FF, N, N±1) are ALWAYS rejected. The canonical KAT
+ * vector (0x01×32) is rejected unless `network === 'test-vectors'`.
+ */
+function isDenylistedMasterKey(bytes: Uint8Array, network: string | undefined): boolean {
+  if (isStructurallyInvalid(bytes)) return true;
+  if (isCanonicalKatVector(bytes) && network !== 'test-vectors') return true;
   return false;
 }
 
@@ -122,22 +137,40 @@ function isDenylistedMasterKey(bytes: Uint8Array): boolean {
  * added to the authorized registry; consumers downstream verify via
  * isAuthorizedMasterKey().
  *
+ * SPEC §14.1 / §11.12 denylist enforcement: the canonical KAT vector
+ * (0x01×32) and structurally-invalid scalars (all-zero, all-FF, N,
+ * N±1) are rejected with PROTOCOL_ERROR. The KAT vector is accepted
+ * only when `network === 'test-vectors'` — required by the pointer-
+ * layer KAT fixture suite.
+ *
+ * @param bytes - 32 raw wallet-root bytes
+ * @param network - Optional network identifier; pass 'test-vectors' to
+ *   accept the canonical 0x01×32 KAT vector. All other values (including
+ *   undefined / 'mainnet' / 'testnet' / 'dev') reject it.
+ *
  * Lifetime: the caller SHOULD call `instance.zeroize()` in a finally
  * block as soon as the HKDF derivation completes. See
  * profile/pointer-wiring.ts for the canonical pattern.
  */
-export function createMasterPrivateKey(bytes: Uint8Array): MasterPrivateKey {
+export function createMasterPrivateKey(
+  bytes: Uint8Array,
+  network?: string,
+): MasterPrivateKey {
   if (bytes.length !== 32) {
     throw new RangeError(
       `MasterPrivateKey must be exactly 32 bytes, got ${bytes.length}`,
     );
   }
-  if (isDenylistedMasterKey(bytes)) {
+  if (isDenylistedMasterKey(bytes, network)) {
+    const isKat = isCanonicalKatVector(bytes);
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
-      'MasterPrivateKey denylist hit (SPEC §14.1): refusing all-zero / all-FF / ' +
-        'well-known test vector / curve-order-N scalar. These derive deterministic, ' +
-        'cross-wallet-colliding pointer-layer keys.',
+      isKat
+        ? 'MasterPrivateKey denylist hit (SPEC §14.1): canonical 0x01×32 KAT vector ' +
+          'is reserved for test fixtures. Pass network="test-vectors" to accept it.'
+        : 'MasterPrivateKey denylist hit (SPEC §14.1): refusing all-zero / all-FF / ' +
+          'curve-order-N scalar. These derive deterministic, ' +
+          'cross-wallet-colliding pointer-layer keys.',
     );
   }
   // The [_brand] field is compile-time only — TypeScript erases it and

@@ -38,8 +38,13 @@ describe('Commit F — steelman² hardening regressions', () => {
         expect.objectContaining({ code: AggregatorPointerErrorCode.PROTOCOL_ERROR }),
       );
     });
-    it('canonical 0x01×32 KAT vector still allowed', () => {
-      const mk = createMasterPrivateKey(new Uint8Array(32).fill(0x01));
+    it('canonical 0x01×32 KAT vector requires network="test-vectors" (Wave F.2)', () => {
+      // SPEC §14.1 / §11.12 — denylisted by default; KAT-fixture tests
+      // pass 'test-vectors' to accept.
+      expect(() => createMasterPrivateKey(new Uint8Array(32).fill(0x01))).toThrow(
+        expect.objectContaining({ code: AggregatorPointerErrorCode.PROTOCOL_ERROR }),
+      );
+      const mk = createMasterPrivateKey(new Uint8Array(32).fill(0x01), 'test-vectors');
       expect(mk.bytes.every((b) => b === 0x01)).toBe(true);
     });
     it('typical random key still allowed', () => {

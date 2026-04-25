@@ -650,6 +650,10 @@ export class ProfileStorageProvider implements StorageProvider {
       oracle,
       ipfsGateways: gateways,
       lockFilePath,
+      // SPEC §14.1 / §11.12 denylist gate: pass network through so
+      // the pointer layer's master-key construction can reject the
+      // canonical 0x01×32 KAT vector outside test-vectors deployments.
+      network: this.options?.config?.network,
       debug: this.debug,
     });
 

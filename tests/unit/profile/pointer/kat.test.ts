@@ -66,7 +66,7 @@ describe('KAT vectors (T-A9 / P8)', () => {
   const v = vectors.inputs.version_v;
   const cidLen = vectors.inputs.cidLen_bytes;
 
-  const master = createMasterPrivateKey(walletPrivateKey);
+  const master = createMasterPrivateKey(walletPrivateKey, 'test-vectors');
   const km = derivePointerKeyMaterial(master);
 
   it('derives pointerSecret to expected bytes', () => {
