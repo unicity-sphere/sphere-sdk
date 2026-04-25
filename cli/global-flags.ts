@@ -87,6 +87,30 @@ function isUsableSpaceSeparatedValue(value: string | undefined): boolean {
 }
 
 /**
+ * Strict gateway URL validator.
+ *
+ * F.11 used `entry.includes('://')` which was too permissive — it
+ * accepted `=http://gw1` (from `--ipfs-gateway==http://gw1` double
+ * equals; the parser splits on the FIRST `=` leaving `=http://gw1` as
+ * the value), `ftp://gw1`, `javascript://anything`, and any other
+ * scheme that happens to contain `://`. Steelman¹⁰ caught this — the
+ * malformed value silently propagated to IPFS code and produced
+ * confusing errors far from the CLI.
+ *
+ * F.12 tightens to: must be parseable by `new URL(entry)` AND have an
+ * http(s) protocol. IPFS gateways are HTTP(S) by definition; rejecting
+ * other schemes is loss-less.
+ */
+function isValidGatewayUrl(entry: string): boolean {
+  try {
+    const url = new URL(entry);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Compute the index where the leading global-flag region ends. Every
  * argv token at indices [0, end) is either a known global flag or the
  * value of the immediately-preceding flag. The token at index `end`
@@ -150,18 +174,21 @@ export function findLeadingGlobalFlagsEnd(argv: readonly string[]): number {
  * string), or `null` if all flags are well-formed. Caller is expected
  * to print the message and exit cleanly on error.
  *
- * Errors caught (Wave F.11, from steelman⁹):
+ * Errors caught (Wave F.11 + F.12, from steelman⁹ + ¹⁰):
  *   - `--ipfs-gateway` with no value at all (`--ipfs-gateway` last in argv)
  *   - `--ipfs-gateway` with empty value (`--ipfs-gateway ""`, `--ipfs-gateway=`)
  *   - `--ipfs-gateway VALUE` where VALUE starts with `-` (probably a flag)
- *   - `--ipfs-gateway VALUE` where VALUE doesn't contain `://` (not a URL —
- *     catches the typo case `--ipfs-gateway init`)
- *   - `--ipfs-gateway URL_LIST` with malformed entries (any of the above
- *     for any comma-separated entry)
- *   - `--no-nostr=anything` (boolean flag with equals-form value)
+ *   - `--ipfs-gateway VALUE` where VALUE is not a parseable http(s) URL
+ *     (catches `--ipfs-gateway init`, `=http://gw1` from double-equals,
+ *     `ftp://gw1`, `javascript://anything`, etc.)
+ *   - `--ipfs-gateway URL_LIST` with any malformed comma-separated entry
+ *   - `--no-nostr=anything` (boolean flag with equals-form value) — caught
+ *     ANYWHERE in argv, not just the leading region (F.12 fix for the
+ *     `cli init --no-nostr=true` silent-no-op hazard).
  *
- * The validator walks the SAME structural region as `findLeadingGlobalFlagsEnd`
- * but with stricter value checks. It does not modify argv.
+ * The validator walks the structural leading region for value-bearing
+ * flags, then the FULL argv for boolean equals-form errors. It does
+ * not modify argv.
  */
 export function validateLeadingGlobalFlags(argv: readonly string[]): string | null {
   let i = 0;
@@ -201,10 +228,13 @@ export function validateLeadingGlobalFlags(argv: readonly string[]): string | nu
             `Did you forget the URL?`
           );
         }
-        if (!entry.includes('://')) {
+        if (!isValidGatewayUrl(entry)) {
+          // F.12: stricter than `includes('://')` — catches double-equals
+          // (`=http://gw1`), non-http schemes (`ftp://`, `javascript://`),
+          // and otherwise malformed URLs.
           return (
-            `${name}: '${entry}' is not a URL ` +
-            `(missing scheme like http:// or https://). ` +
+            `${name}: '${entry}' is not a valid http(s) URL. ` +
+            `Expected something like http://gw.example.com or https://gw.example.com. ` +
             `Did you forget the URL?`
           );
         }
@@ -221,6 +251,23 @@ export function validateLeadingGlobalFlags(argv: readonly string[]): string | nu
     }
     // Unknown leading flag — not our concern; downstream handles it.
     break;
+  }
+  // F.12: walk FULL argv for boolean global flags with equals form.
+  // Booleans are position-agnostic by design (e.g., `init --no-nostr`
+  // is the documented init-local form), but they STILL never take a
+  // value. Pre-F.12 the validator only walked the leading region, so
+  // `cli init --no-nostr=true` was silently accepted by validation
+  // and then silently DROPPED by `noNostrGlobal = .includes('--no-nostr')`
+  // (exact-string match doesn't catch `--no-nostr=true`). Steelman¹⁰
+  // critical: operators expecting Nostr disabled got real Nostr.
+  // F.12 catches this loudly anywhere in argv.
+  for (let j = i; j < argv.length; j++) {
+    const tok = argv[j];
+    if (!tok.startsWith('--')) continue;
+    const { name, inlineValue } = parseFlagToken(tok);
+    if (BOOLEAN_GLOBAL_FLAGS.has(name) && inlineValue !== undefined) {
+      return `${name} does not take a value (got '${tok}').`;
+    }
   }
   return null;
 }
@@ -239,7 +286,7 @@ export function validateLeadingGlobalFlags(argv: readonly string[]): string | nu
  * `--ipfs-gateway` after the subcommand, the `onMisplaced` callback
  * fires (typically wired to `console.error` for a loud warning).
  *
- * Value-shape errors (empty, dash-prefix, missing `://`) are NOT
+ * Value-shape errors (empty, dash-prefix, non-http(s) scheme) are NOT
  * reported here — call `validateLeadingGlobalFlags` first to surface
  * them. This function silently filters bad entries so downstream code
  * keeps a usable (possibly empty) gateway list even after validation
@@ -273,12 +320,19 @@ export function parseIpfsGatewayOverride(
         const trimmed = entry.trim().replace(/\/+$/, '');
         if (trimmed.length === 0) continue;
         if (trimmed.startsWith('-')) continue; // looks like a flag, skip
-        if (!trimmed.includes('://')) continue; // not a URL, skip
+        // F.12: defense in depth — same strict URL validity used by the
+        // validator. Catches `=http://gw1` from double-equals form,
+        // non-http schemes, and otherwise-malformed URLs even if the
+        // validator is bypassed (e.g., in tests).
+        if (!isValidGatewayUrl(trimmed)) continue;
         gateways.push(trimmed);
       }
       continue;
     }
-    // Other leading-region tokens (boolean flags) — skip.
+    // Other leading-region tokens (boolean flags or other registered
+    // global flags) — step over one token at a time. The scanner has
+    // already validated the structural shape; we just skip non-target
+    // tokens here.
     i++;
   }
   if (onMisplaced) {

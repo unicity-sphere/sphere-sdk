@@ -392,7 +392,8 @@ describe('validateLeadingGlobalFlags (F.11 — loud failure on typos)', () => {
   it('catches the F.11 critical case: --ipfs-gateway init (subcommand-as-value)', () => {
     const err = validateLeadingGlobalFlags(['--ipfs-gateway', 'init']);
     expect(err).not.toBeNull();
-    expect(err).toContain("'init' is not a URL");
+    expect(err).toContain("'init'");
+    expect(err).toContain('not a valid http(s) URL');
     expect(err).toContain('Did you forget the URL?');
   });
 
@@ -438,7 +439,7 @@ describe('validateLeadingGlobalFlags (F.11 — loud failure on typos)', () => {
     ]);
     expect(err).not.toBeNull();
     expect(err).toContain('bogus-no-scheme');
-    expect(err).toContain('not a URL');
+    expect(err).toContain('not a valid http(s) URL');
   });
 
   it('catches --no-nostr=value (boolean flag with equals)', () => {
@@ -456,7 +457,8 @@ describe('validateLeadingGlobalFlags (F.11 — loud failure on typos)', () => {
       'pointer',
     ]);
     expect(err).not.toBeNull();
-    expect(err).toContain("'init' is not a URL");
+    expect(err).toContain("'init'");
+    expect(err).toContain('not a valid http(s) URL');
   });
 
   it('does not validate post-subcommand tokens', () => {
@@ -499,5 +501,128 @@ describe('strip + parse + snapshot interaction (F.11 integration)', () => {
     stripLeadingGlobalFlags(args);
     expect(args).toEqual(['init']);
     expect(parseIpfsGatewayOverride(snapshot)).toEqual(['http://gw1']);
+  });
+});
+
+// ============================================================================
+// Wave F.12 — strict URL validity + boolean=value anywhere (steelman¹⁰ fixes)
+// ============================================================================
+
+describe('strict URL validation (F.12 — steelman¹⁰ critical 1)', () => {
+  it('rejects double-equals form `--ipfs-gateway==http://gw1` (the F.12 critical)', () => {
+    // parseFlagToken splits on FIRST `=`, so the inlineValue is
+    // `=http://gw1`. Pre-F.12 `includes('://')` accepted this and
+    // pushed garbage into the gateway list. F.12 uses `new URL()`
+    // which rejects `=http://gw1` because `=http` isn't a valid scheme.
+    const err = validateLeadingGlobalFlags(['--ipfs-gateway==http://gw1', 'init']);
+    expect(err).not.toBeNull();
+    expect(err).toContain('not a valid http(s) URL');
+  });
+
+  it('parser drops double-equals garbage entry', () => {
+    // Defense in depth — even if validator is bypassed, the parser
+    // does not propagate `=http://gw1` to downstream IPFS code.
+    expect(
+      parseIpfsGatewayOverride(['--ipfs-gateway==http://gw1', 'init']),
+    ).toEqual([]);
+  });
+
+  it('rejects ftp:// scheme', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'ftp://gw1', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects javascript:// pseudo-URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'javascript://alert(1)', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects file:// scheme', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'file:///etc/passwd', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('accepts http:// with port', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://localhost:8080',
+        'init',
+      ]),
+    ).toBeNull();
+  });
+
+  it('accepts https:// with path', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'https://gw.example.com/ipfs',
+        'init',
+      ]),
+    ).toBeNull();
+  });
+
+  it('accepts comma-list of valid http(s) URLs', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://gw1.example.com,https://gw2.example.com',
+        'init',
+      ]),
+    ).toBeNull();
+  });
+
+  it('parser accepts only http(s), drops other schemes from comma list', () => {
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway',
+        'http://gw1,ftp://gw2,https://gw3',
+        'init',
+      ]),
+    ).toEqual(['http://gw1', 'https://gw3']);
+  });
+});
+
+describe('boolean=value caught anywhere (F.12 — steelman¹⁰ critical 2)', () => {
+  it('catches `cli init --no-nostr=true` post-subcommand (the F.12 critical)', () => {
+    // Pre-F.12 the validator only walked the leading region, and
+    // `noNostrGlobal = .includes('--no-nostr')` exact-match did NOT
+    // recognize `--no-nostr=true`. Result: silent no-op when operator
+    // expected Nostr disabled. F.12 walks full argv for boolean
+    // equals-form errors.
+    const err = validateLeadingGlobalFlags(['init', '--no-nostr=true']);
+    expect(err).not.toBeNull();
+    expect(err).toContain('--no-nostr');
+    expect(err).toContain('does not take a value');
+  });
+
+  it('catches `cli init --network testnet --no-nostr=true` (deeper position)', () => {
+    const err = validateLeadingGlobalFlags([
+      'init',
+      '--network',
+      'testnet',
+      '--no-nostr=true',
+    ]);
+    expect(err).not.toBeNull();
+    expect(err).toContain('--no-nostr');
+    expect(err).toContain('does not take a value');
+  });
+
+  it('catches `--no-nostr=false` (operator wants ON; not how we work)', () => {
+    expect(
+      validateLeadingGlobalFlags(['init', '--no-nostr=false']),
+    ).toContain('does not take a value');
+  });
+
+  it('still accepts `cli init --no-nostr` (no value, position-agnostic)', () => {
+    // The legitimate post-subcommand boolean usage stays clean.
+    expect(validateLeadingGlobalFlags(['init', '--no-nostr'])).toBeNull();
+  });
+
+  it('still accepts `cli --no-nostr init` (leading boolean, no value)', () => {
+    expect(validateLeadingGlobalFlags(['--no-nostr', 'init'])).toBeNull();
   });
 });
