@@ -5692,16 +5692,22 @@ async function main() {
               console.log('Pointer layer is not blocked.');
               break;
             }
-            // Steelman remediation: inverted allowlist. Previously an
-            // integrity denylist meant a typo or novel protocol reason
-            // fell through to auto-clear — a silent integrity bypass
-            // on any future reason string. SAFE reasons are explicit;
-            // anything else requires operator investigation + --force.
-            // See RUNBOOK §3.2.
-            const safeReasonsAutoClear = new Set([
-              'network_error',
-              'timeout',
-              'transient_failure',
+            // Steelman² remediation: allowlist now uses the canonical
+            // BlockedReason vocabulary from `profile/aggregator-pointer/
+            // blocked-state.ts`. Previous fix used invented strings
+            // ('network_error', 'timeout', 'transient_failure') that
+            // never matched any actual reason → every legitimate
+            // transient required --force.
+            //
+            // Safe-to-auto-clear reasons (categorical transient
+            // failures per SPEC §10.2.2): network_timeout, dns_failure,
+            // tls_failure. Everything else (retry_exhausted,
+            // aggregator_rejected, protocol_error, rejected,
+            // novel/unknown reasons) requires explicit --force.
+            const safeReasonsAutoClear: ReadonlySet<string> = new Set([
+              'network_timeout',
+              'dns_failure',
+              'tls_failure',
             ]);
             // marker_corrupt has its own distinct recovery path.
             if (state.reason === 'marker_corrupt') {
@@ -5709,7 +5715,10 @@ async function main() {
               console.log('Pending marker cleared. BLOCKED remains set pending successful recovery.');
               break;
             }
-            const force = args.includes('--force');
+            // Subcommand-scoped --force flag. Use slice to avoid honoring
+            // a global flag accidentally placed before the subcommand.
+            const subArgs = args.slice(1);
+            const force = subArgs.includes('--force');
             if (state.reason && safeReasonsAutoClear.has(state.reason)) {
               await pointer.clearBlocked();
               console.log(`Cleared BLOCKED state (previous reason: ${state.reason}).`);
@@ -5718,9 +5727,10 @@ async function main() {
             if (!force) {
               console.error(
                 `Refusing to unblock: reason='${state.reason ?? 'unknown'}' is not on the ` +
-                  `auto-clear allowlist. This may indicate an integrity event (untrusted_proof, ` +
-                  `security_origin_mismatch, aggregator_rejected, rejected) OR a novel protocol-level ` +
-                  `reason. Investigate first; re-run with --force if you understand the risk. ` +
+                  `auto-clear allowlist (network_timeout, dns_failure, tls_failure). ` +
+                  `This may indicate an integrity event (retry_exhausted, aggregator_rejected, ` +
+                  `protocol_error, rejected) OR a novel protocol-level reason. ` +
+                  `Investigate first; re-run with --force if you understand the risk. ` +
                   `See RUNBOOK §3.2 / §8.`,
               );
               process.exit(1);

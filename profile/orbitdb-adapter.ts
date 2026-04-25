@@ -297,42 +297,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
       if (value === undefined || value === null) {
         return null;
       }
-      // Ensure we return a Uint8Array even if OrbitDB returns a different type.
-      if (value instanceof Uint8Array) {
-        return value;
-      }
-      // OrbitDB may return values through IPLD serialization which can
-      // produce a plain object with numeric keys. Steelman remediation:
-      // validate the object shape BEFORE coercing. A malicious peer write
-      // replicated via LWW can contain:
-      //   - huge `length` (OOM via `new Uint8Array(1e9)`)
-      //   - non-numeric entries (silently coerced to NaN → 0, masking
-      //     corruption)
-      //   - strings, nested objects, or inherited properties
-      // Reject anything that doesn't look like a dense byte-valued map.
-      if (typeof value === 'object' && value !== null) {
-        const values = Object.values(value);
-        if (values.length > 1 << 20) {
-          // 1 MiB of bytes via object coercion is already pathological.
-          throw new ProfileError(
-            'ORBITDB_READ_FAILED',
-            `Refusing to coerce object with ${values.length} entries to Uint8Array for key "${key}"`,
-          );
-        }
-        const bytes = new Uint8Array(values.length);
-        for (let i = 0; i < values.length; i++) {
-          const v = values[i];
-          if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
-            throw new ProfileError(
-              'ORBITDB_READ_FAILED',
-              `Invalid byte value at index ${i} for key "${key}": ${typeof v} (expected integer 0-255)`,
-            );
-          }
-          bytes[i] = v;
-        }
-        return bytes;
-      }
-      return null;
+      // Steelman² remediation: shape validation now lives inside
+      // `coerceToUint8Array` (single source of truth shared with
+      // getEntry() and all()). A peer-crafted LWW write that puts a
+      // pathological object in the value slot is rejected uniformly
+      // across all three entry points.
+      return coerceToUint8Array(value);
     } catch (err) {
       if (err instanceof ProfileError) throw err;
       throw new ProfileError(
@@ -707,9 +677,31 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 /**
+ * Steelman² remediation: hard cap on the object-coercion fallback. A
+ * peer-replicated LWW write can put a pathological object in the value
+ * slot — without a cap, `new Uint8Array(Object.values(...))` would
+ * allocate proportional to attacker-chosen `length`. 1 MiB is well
+ * above any legitimate envelope (CIDs + metadata) and well below an
+ * OOM-inducing allocation.
+ */
+const COERCE_OBJECT_VALUE_CAP = 1 << 20;
+
+/**
  * Coerce a value returned by OrbitDB into a Uint8Array.
- * OrbitDB's IPLD serialization may return plain objects with numeric keys
- * instead of raw Uint8Array instances.
+ *
+ * Steelman² remediation: validates object shape BEFORE coercing. A
+ * peer-crafted LWW write can put any object in the value slot:
+ *   - huge `length` → OOM via `new Uint8Array(1e9)`
+ *   - non-numeric entries → silently coerced to NaN→0, masking corruption
+ *   - strings, nested objects, inherited properties, etc.
+ * Reject anything that doesn't look like a dense byte-valued map.
+ *
+ * Throws ProfileError('ORBITDB_READ_FAILED') on malformed input — same
+ * code path the previous in-line validator used. Callers that already
+ * wrap in their own try/catch propagate it correctly.
+ *
+ * Single source of truth shared across `get()`, `getEntry()`, and
+ * `all()` so no entry point bypasses the validation.
  */
 function coerceToUint8Array(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) {
@@ -719,7 +711,25 @@ function coerceToUint8Array(value: unknown): Uint8Array {
     return new Uint8Array(value);
   }
   if (typeof value === 'object' && value !== null) {
-    return new Uint8Array(Object.values(value as Record<string, number>));
+    const values = Object.values(value);
+    if (values.length > COERCE_OBJECT_VALUE_CAP) {
+      throw new ProfileError(
+        'ORBITDB_READ_FAILED',
+        `Refusing to coerce object with ${values.length} entries to Uint8Array (cap=${COERCE_OBJECT_VALUE_CAP})`,
+      );
+    }
+    const bytes = new Uint8Array(values.length);
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (typeof v !== 'number' || !Number.isInteger(v) || v < 0 || v > 255) {
+        throw new ProfileError(
+          'ORBITDB_READ_FAILED',
+          `Invalid byte value at index ${i}: ${typeof v} (expected integer 0-255)`,
+        );
+      }
+      bytes[i] = v;
+    }
+    return bytes;
   }
   // If the value is something unexpected, return an empty array.
   return new Uint8Array(0);

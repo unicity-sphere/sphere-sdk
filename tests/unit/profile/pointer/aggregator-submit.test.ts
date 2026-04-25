@@ -295,7 +295,10 @@ describe('submitPointer — §7.3 state machine', () => {
       aggregatorClient: client,
       marker: null,
     });
-    expect(out).toEqual({ kind: 'retry_side', side: SIDE_B_NUM });
+    // Steelman² fix: retry_side now carries committedSideKind to
+    // distinguish "our commit accepted on the other side" (success)
+    // from "another HD-synced device beat us" (exists).
+    expect(out).toEqual({ kind: 'retry_side', side: SIDE_B_NUM, committedSideKind: 'success' });
   });
 
   it('Row 7: network error + SUCCESS → retry_side A', async () => {
@@ -312,7 +315,7 @@ describe('submitPointer — §7.3 state machine', () => {
       aggregatorClient: client,
       marker: null,
     });
-    expect(out).toEqual({ kind: 'retry_side', side: SIDE_A_NUM });
+    expect(out).toEqual({ kind: 'retry_side', side: SIDE_A_NUM, committedSideKind: 'success' });
   });
 
   it('Row 8: network error + network error → retry_both', async () => {

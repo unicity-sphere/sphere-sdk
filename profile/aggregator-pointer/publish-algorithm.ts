@@ -257,15 +257,16 @@ async function publishOnce(
             { v },
           );
         }
-        // Steelman remediation (finding #5): `retry_side` guarantees one
-        // side committed (combineOutcomes Priority 6 excludes protocol/
-        // rejected/aggregator_rejected/retry_after/backoff paths — by
-        // the time we reach `retry_side` the non-flaky side must have
-        // returned success or exists). Escalate the hint so the NEXT
-        // iteration's EXISTS+EXISTS is classified as Row 4 idempotent
-        // replay (our own commit) rather than Row 5 conflict. `retry_both`
-        // is left alone — neither side committed.
-        if (outcome.kind === 'retry_side') {
+        // Steelman² remediation: only escalate when `committedSideKind`
+        // is 'success' (OUR commit accepted on the non-flaky side). If
+        // it's 'exists', the OTHER side observed a pre-existing commit
+        // at our requestId — which on HD-synced wallets sharing the
+        // pointer signing key (a designed feature) means a SIBLING
+        // device beat us. The next iteration's EXISTS+EXISTS is then
+        // a genuine cross-device conflict (Row 5), NOT our idempotent
+        // replay (Row 4). Unconditional escalation would silently
+        // overwrite our publish with the sibling's CID.
+        if (outcome.kind === 'retry_side' && outcome.committedSideKind === 'success') {
           isIdempotentRetryHint = true;
         }
         await sleep(computeBackoffMs(retriesConsumed));

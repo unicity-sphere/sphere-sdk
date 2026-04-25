@@ -99,8 +99,23 @@ export type SubmitOutcome =
   | { readonly kind: 'idempotent_replay'; readonly v: PointerVersion }
   /** Row 5: both REQUEST_ID_EXISTS with no marker match → §9 reconciliation. */
   | { readonly kind: 'conflict'; readonly v: PointerVersion }
-  /** Rows 6, 7: one SUCCESS, other network error → retry just the failed side. */
-  | { readonly kind: 'retry_side'; readonly side: Side }
+  /**
+   * Rows 6, 7: one SUCCESS, other network error → retry just the failed side.
+   *
+   * `committedSideKind` tells the caller WHAT the non-flaky side returned:
+   *   - 'success': the other side accepted our commit (Row 6/7 happy path).
+   *     The next iteration's EXISTS+EXISTS is OUR own replay → escalate
+   *     `isIdempotentRetryHint` to true so combineOutcomes maps Row 4.
+   *   - 'exists': the other side already had a commit at our requestId
+   *     (cross-device race — HD-synced sibling wallet beat us). The
+   *     next iteration's EXISTS+EXISTS is a GENUINE conflict; do NOT
+   *     escalate the hint. Without this discrimination, escalation
+   *     silently overwrites our publish with the sibling's CID.
+   *
+   * (Steelman² fix: previously this distinction was lost in the
+   * combined outcome.)
+   */
+  | { readonly kind: 'retry_side'; readonly side: Side; readonly committedSideKind: 'success' | 'exists' }
   /** Row 8: both network error → retry whole publish. */
   | { readonly kind: 'retry_both' }
   /** Rows 10, 13: HTTP 429/503+Retry-After or -32006 → honor delay, no retry-budget burn. */
@@ -336,8 +351,18 @@ function combineOutcomes(
   const netA = outA.type === 'network_error';
   const netB = outB.type === 'network_error';
   if (netA && netB) return { kind: 'retry_both' };
-  if (netA) return { kind: 'retry_side', side: SIDE_A_NUM };
-  if (netB) return { kind: 'retry_side', side: SIDE_B_NUM };
+  if (netA) {
+    // By priority order, when netA is true and netB is false, outB MUST be
+    // 'success' or 'exists' (other types are caught earlier). Surface
+    // which one so the caller can correctly classify the next iteration's
+    // EXISTS+EXISTS — see SubmitOutcome.retry_side docstring.
+    const committedSideKind: 'success' | 'exists' = outB.type === 'success' ? 'success' : 'exists';
+    return { kind: 'retry_side', side: SIDE_A_NUM, committedSideKind };
+  }
+  if (netB) {
+    const committedSideKind: 'success' | 'exists' = outA.type === 'success' ? 'success' : 'exists';
+    return { kind: 'retry_side', side: SIDE_B_NUM, committedSideKind };
+  }
 
   // Priority 7: SUCCESS / REQUEST_ID_EXISTS combinations (rows 1–5).
   const sA = outA.type;

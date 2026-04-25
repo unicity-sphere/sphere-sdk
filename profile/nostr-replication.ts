@@ -429,18 +429,35 @@ export class NostrReplicationBridge {
 
   /**
    * Steelman remediation: verify events (NIP-01 id + schnorr sig) BEFORE
-   * decrypting. Events failing verification are dropped silently (logged
-   * counter would be nice but adds noise in tests). A relay injecting
-   * forged events cannot get their contents past decryptEvents because
-   * AES-GCM will also fail — but this adds defense-in-depth (and
-   * saves decrypt work on malformed batches).
+   * decrypting. Events failing verification are dropped silently.
+   *
+   * Steelman² remediation: verify in PARALLEL CHUNKS rather than
+   * sequentially-awaited. Sequential await over up to 10k events at
+   * ~1-2ms each pegged the main thread for 10-20 seconds against a
+   * malicious relay — a UI freeze. We chunk into batches of
+   * VERIFY_BATCH_SIZE and Promise.all each batch (allowing libuv worker
+   * scheduling to overlap), with a hard wall-clock cap to bound CPU
+   * time and a yield (setImmediate-equivalent) between batches so the
+   * event loop can drain UI tasks.
    */
   private async verifyAndDecrypt(events: NostrEvent[]): Promise<Uint8Array[]> {
+    const VERIFY_BATCH_SIZE = 64;
+    const VERIFY_TOTAL_BUDGET_MS = 5_000;
+    const startedAt = Date.now();
     const authentic: NostrEvent[] = [];
-    for (const evt of events) {
-      if (await this.verifyEventAuthentic(evt)) {
-        authentic.push(evt);
+    for (let i = 0; i < events.length; i += VERIFY_BATCH_SIZE) {
+      if (Date.now() - startedAt > VERIFY_TOTAL_BUDGET_MS) {
+        // CPU budget exhausted — refuse to spend more time verifying a
+        // potentially-hostile batch. Drop remaining events.
+        break;
       }
+      const batch = events.slice(i, i + VERIFY_BATCH_SIZE);
+      const verdicts = await Promise.all(batch.map((evt) => this.verifyEventAuthentic(evt)));
+      for (let j = 0; j < batch.length; j++) {
+        if (verdicts[j]) authentic.push(batch[j]);
+      }
+      // Yield to the event loop between batches so UI tasks aren't starved.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
     return this.decryptEvents(authentic);
   }
