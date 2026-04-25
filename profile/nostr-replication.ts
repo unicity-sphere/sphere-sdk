@@ -266,6 +266,17 @@ export class NostrReplicationBridge {
 
     return new Promise<Uint8Array[]>((resolve, reject) => {
       const events: NostrEvent[] = [];
+      // Steelman⁴ remediation: count ALL parsed EVENT frames (not just
+      // matching ones). Previous version's `events.length` cap only
+      // counted pubkey/kind-matching events — a relay flooding with
+      // EVENT frames whose pubkey/kind didn't match our filter would
+      // never increment events.length, so the cap never engaged. The
+      // attacker still drove full JSON.parse + filter dispatch CPU per
+      // frame. Bound dispatch by ALL parsed events with a separate
+      // counter, capped at MAX_EVENTS_PER_FETCH * 2 to allow some
+      // legitimate filter slop.
+      const TOTAL_EVENT_DISPATCH_CAP = MAX_EVENTS_PER_FETCH * 2;
+      let totalParsedEvents = 0;
       let settled = false;
 
       const timeout = setTimeout(() => {
@@ -304,7 +315,33 @@ export class NostrReplicationBridge {
 
         if (!Array.isArray(parsed)) return;
 
-        if (parsed[0] === 'EVENT' && parsed[1] === subId && parsed[2]) {
+        if (parsed[0] === 'EVENT' && parsed[1] === subId) {
+          // Steelman⁴ remediation: count EVERY parsed EVENT frame for our
+          // subId (regardless of pubkey/kind match) so a flood of filter-
+          // failing events can't drive arbitrary CPU dispatch. Bound
+          // total dispatch at TOTAL_EVENT_DISPATCH_CAP.
+          totalParsedEvents += 1;
+          if (totalParsedEvents >= TOTAL_EVENT_DISPATCH_CAP) {
+            settled = true;
+            clearTimeout(timeout);
+            cleanup();
+            const truncErr: Error & {
+              droppedCount?: number;
+              authenticCount?: number;
+              reason?: string;
+            } = new Error(
+              `Nostr fetchMissedEntries dispatch cap exceeded ` +
+                `(${TOTAL_EVENT_DISPATCH_CAP} EVENT frames parsed). ` +
+                `Subscription closed. Caller MUST NOT advance \`since\` — ` +
+                `re-fetch missed window from a different relay.`,
+            );
+            truncErr.reason = 'dispatch_cap';
+            truncErr.droppedCount = -1; // unknown — relay was still streaming
+            truncErr.authenticCount = events.length;
+            reject(truncErr);
+            return;
+          }
+          if (!parsed[2]) return;
           const evt = parsed[2] as NostrEvent;
           // Verify event is from our wallet (relay filter is advisory — verify locally)
           if (evt.pubkey !== this.pubkey) return;
@@ -316,15 +353,30 @@ export class NostrReplicationBridge {
           // their genuine signatures intact. Cap also protects against
           // relay flooding 10k events between REQ and EOSE.
           if (events.length >= MAX_EVENTS_PER_FETCH) {
-            // Steelman³ remediation: cap reached → close the subscription
-            // and finalize early, instead of letting the relay keep
-            // streaming (each ignored event still costs JSON.parse +
-            // size-check + dispatch CPU). The cleanup() helper sends
-            // CLOSE and removes the message listener.
+            // Steelman⁴ remediation: SYMMETRIC truncation handling with
+            // verifyAndDecrypt's budget-exhaust path. Previous version
+            // silently called verifyAndDecrypt(events).then(resolve,...)
+            // — a caller advancing \`since = max(events.created_at)\`
+            // would lose events 10001+ permanently. Now throws a
+            // labeled error mirroring H.3, instructing the caller NOT
+            // to advance \`since\`.
             settled = true;
             clearTimeout(timeout);
             cleanup();
-            this.verifyAndDecrypt(events).then(resolve, reject);
+            const truncErr: Error & {
+              droppedCount?: number;
+              authenticCount?: number;
+              reason?: string;
+            } = new Error(
+              `Nostr fetchMissedEntries cap reached ` +
+                `(${MAX_EVENTS_PER_FETCH} matching events). ` +
+                `Subscription closed. Caller MUST NOT advance \`since\` — ` +
+                `re-fetch missed window with a tighter time slice.`,
+            );
+            truncErr.reason = 'event_cap';
+            truncErr.droppedCount = -1; // unknown — relay was still streaming
+            truncErr.authenticCount = events.length;
+            reject(truncErr);
             return;
           }
           events.push(evt);
@@ -555,8 +607,12 @@ export class NostrReplicationBridge {
     const hash = sha256(new TextEncoder().encode(serialized));
     const id = bytesToHex(hash);
 
+    // Steelman⁴ remediation: convert hex → bytes for schnorr.sign too.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
-    const sigBytes: Uint8Array = secp256k1Module.schnorr.sign(id, this.config.transportPrivateKey);
+    const idBytes = hexToBytes(id);
+    const privKeyBytes = hexToBytes(this.config.transportPrivateKey);
+    const sigBytes: Uint8Array = secp256k1Module.schnorr.sign(idBytes, privKeyBytes);
     const sig = bytesToHex(sigBytes);
 
     return {
@@ -596,7 +652,14 @@ export class NostrReplicationBridge {
       if (expectedId !== evt.id) return false;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
-      return secp256k1Module.schnorr.verify(evt.sig, evt.id, evt.pubkey) === true;
+      // Steelman⁴ remediation: schnorr.verify also needs Uint8Array on
+      // newer @noble/curves versions. Convert hex → bytes for all three
+      // arguments. Malformed-hex inputs throw inside hexToBytes which
+      // is caught by the surrounding try/catch → returns false.
+      const sigBytes = hexToBytes(evt.sig);
+      const idBytes = hexToBytes(evt.id);
+      const pubKeyBytes = hexToBytes(evt.pubkey);
+      return secp256k1Module.schnorr.verify(sigBytes, idBytes, pubKeyBytes) === true;
     } catch {
       return false;
     }
@@ -610,10 +673,18 @@ export class NostrReplicationBridge {
 /**
  * Derive the x-only public key (32 bytes, hex) from a secp256k1 private key.
  * Nostr uses x-only (schnorr) public keys per NIP-01.
+ *
+ * Steelman⁴ remediation: convert hex → Uint8Array before calling schnorr.
+ * Newer @noble/curves versions reject hex-string inputs to schnorr APIs;
+ * the previous code only happened to work on the older string-tolerant
+ * version. Converting upfront makes the call version-portable and
+ * fail-loudly on malformed hex.
  */
 async function derivePublicKeyHex(privateKeyHex: string): Promise<string> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
-  const pubBytes: Uint8Array = secp256k1Module.schnorr.getPublicKey(privateKeyHex);
+  const privKeyBytes = hexToBytes(privateKeyHex);
+  const pubBytes: Uint8Array = secp256k1Module.schnorr.getPublicKey(privKeyBytes);
   return bytesToHex(pubBytes);
 }
 
