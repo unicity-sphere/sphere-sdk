@@ -325,9 +325,15 @@ export class NostrReplicationBridge {
             settled = true;
             clearTimeout(timeout);
             cleanup();
+            // Steelman⁵ remediation: rename `authenticCount` →
+            // `collectedCount` on cap paths. At cap-engage time `events`
+            // is the PRE-VERIFY array (verifyAndDecrypt was intentionally
+            // skipped to avoid the verify cost on a hostile flood).
+            // Telemetry consumers must distinguish "collected, not yet
+            // schnorr-verified" from H.3's post-verify `authenticCount`.
             const truncErr: Error & {
               droppedCount?: number;
-              authenticCount?: number;
+              collectedCount?: number;
               reason?: string;
             } = new Error(
               `Nostr fetchMissedEntries dispatch cap exceeded ` +
@@ -337,7 +343,7 @@ export class NostrReplicationBridge {
             );
             truncErr.reason = 'dispatch_cap';
             truncErr.droppedCount = -1; // unknown — relay was still streaming
-            truncErr.authenticCount = events.length;
+            truncErr.collectedCount = events.length;
             reject(truncErr);
             return;
           }
@@ -363,9 +369,10 @@ export class NostrReplicationBridge {
             settled = true;
             clearTimeout(timeout);
             cleanup();
+            // Steelman⁵: collectedCount (pre-verify), not authenticCount.
             const truncErr: Error & {
               droppedCount?: number;
-              authenticCount?: number;
+              collectedCount?: number;
               reason?: string;
             } = new Error(
               `Nostr fetchMissedEntries cap reached ` +
@@ -375,7 +382,7 @@ export class NostrReplicationBridge {
             );
             truncErr.reason = 'event_cap';
             truncErr.droppedCount = -1; // unknown — relay was still streaming
-            truncErr.authenticCount = events.length;
+            truncErr.collectedCount = events.length;
             reject(truncErr);
             return;
           }
@@ -701,8 +708,26 @@ function bytesToHex(bytes: Uint8Array): string {
 
 /**
  * Convert a hex string to a Uint8Array.
+ *
+ * Steelman⁵ remediation: throws on malformed input (odd length, non-hex
+ * chars). The previous implementation silently truncated odd-length
+ * input (`len = hex.length / 2`) and coerced parseInt NaN to 0,
+ * producing a wrong-size or zero-padded byte array without any
+ * indication of failure. Commit I's comments at the schnorr call sites
+ * (`derivePublicKeyHex`, `buildSignedEvent`, `verifyEventAuthentic`)
+ * assumed throwing semantics — those assumptions are now actually
+ * guaranteed by this validator.
+ *
+ * Throws Error if `hex.length` is odd or any character is not in
+ * [0-9a-fA-F]. Empty string is treated as valid (returns empty array).
  */
 function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new Error(`hexToBytes: odd-length hex string (length ${hex.length})`);
+  }
+  if (!/^[0-9a-fA-F]*$/.test(hex)) {
+    throw new Error('hexToBytes: hex string contains non-hex characters');
+  }
   const len = hex.length / 2;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {
