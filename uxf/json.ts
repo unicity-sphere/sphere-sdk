@@ -423,6 +423,26 @@ export function packageFromJson(json: string): UxfPackageData {
     };
   }
 
+  // Steelman³ remediation: symmetric synthetic-root guard. The serialize
+  // side (packageToJson + exportToCar) refuses to write packages whose
+  // manifest head is an ENRICHED_SYNTHETIC_KIND token-root. The receiver
+  // must mirror that gate — a hostile peer could otherwise bypass the
+  // serialize check by hand-crafting a JSON package directly. Pool the
+  // elements first (so the hash-recompute check above runs on every
+  // element, validating the kind didn't change post-encoding), then
+  // verify no manifest root carries the synthetic kind.
+  for (const [tokenId, rootHash] of manifest.tokens) {
+    const rootEl = pool.get(rootHash);
+    if (rootEl && rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
+      throw new UxfError(
+        'VERIFICATION_FAILED',
+        `Refusing to import package with synthetic (Rule 4 enriched) manifest head ` +
+          `for token ${tokenId} (rootHash=${rootHash}). Synthetic roots are ephemeral ` +
+          `merge artifacts that must NOT cross peer boundaries.`,
+      );
+    }
+  }
+
   return {
     envelope,
     manifest,

@@ -11,6 +11,7 @@
  * @module profile/orbitdb-adapter
  */
 
+import { logger } from '../core/logger.js';
 import { ProfileError } from './errors.js';
 import {
   decodeAndDowngradeReplicated,
@@ -426,6 +427,12 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // 'user'/'system' tags are overridden here.
       return decodeAndDowngradeReplicated(bytes);
     } catch (err) {
+      // Steelman³ remediation: pass ProfileError through unchanged.
+      // Re-wrapping double-prefixes the error code (`[PROFILE:ORBITDB_READ_FAILED]
+      // ... [PROFILE:ORBITDB_READ_FAILED]`) and obscures the original
+      // diagnostic — particularly for malformed-bytes errors thrown by
+      // coerceToUint8Array.
+      if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
         `Failed to read structured entry at "${key}": ${err instanceof Error ? err.message : String(err)}`,
@@ -442,6 +449,29 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // all entries as an object or iterable.
       const allEntries = await this.db.all();
 
+      // Steelman³ remediation: skip malformed values rather than throwing.
+      // `keys()` and `clear()` use `all()` purely for key enumeration —
+      // a single peer-replicated bad value would otherwise DoS those
+      // operations entirely. Skipping with a logged-once warning keeps
+      // legitimate flows working while surfacing the corruption.
+      let skippedCount = 0;
+      const tryCoerce = (key: string, value: unknown): boolean => {
+        try {
+          result.set(key, coerceToUint8Array(value));
+          return true;
+        } catch (err) {
+          skippedCount += 1;
+          if (skippedCount <= 3) {
+            // Log first few; suppress thereafter to avoid log spam.
+            logger.warn(
+              'OrbitDbAdapter',
+              `all(): skipping malformed entry at key="${key}": ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          return false;
+        }
+      };
+
       // allEntries may be an array of {key,value,hash}, an async iterable,
       // a Map, or a plain object depending on the OrbitDB version.
       if (Array.isArray(allEntries)) {
@@ -452,7 +482,7 @@ export class OrbitDbAdapter implements ProfileDatabase {
           if (prefix && !entryKey.startsWith(prefix)) {
             continue;
           }
-          result.set(entryKey, coerceToUint8Array(entryValue));
+          tryCoerce(entryKey, entryValue);
         }
       } else if (allEntries && typeof allEntries[Symbol.asyncIterator] === 'function') {
         for await (const entry of allEntries) {
@@ -461,26 +491,34 @@ export class OrbitDbAdapter implements ProfileDatabase {
           if (prefix && !entryKey.startsWith(prefix)) {
             continue;
           }
-          result.set(entryKey, coerceToUint8Array(entryValue));
+          tryCoerce(entryKey, entryValue);
         }
       } else if (allEntries instanceof Map) {
         for (const [entryKey, entryValue] of allEntries) {
           if (prefix && !entryKey.startsWith(prefix)) {
             continue;
           }
-          result.set(entryKey, coerceToUint8Array(entryValue));
+          tryCoerce(entryKey, entryValue);
         }
       } else if (typeof allEntries === 'object' && allEntries !== null) {
         for (const [entryKey, entryValue] of Object.entries(allEntries)) {
           if (prefix && !entryKey.startsWith(prefix)) {
             continue;
           }
-          result.set(entryKey, coerceToUint8Array(entryValue as Uint8Array | Record<string, number>));
+          tryCoerce(entryKey, entryValue);
         }
+      }
+
+      if (skippedCount > 3) {
+        logger.warn(
+          'OrbitDbAdapter',
+          `all(): skipped ${skippedCount} malformed entries total (further details suppressed).`,
+        );
       }
 
       return result;
     } catch (err) {
+      if (err instanceof ProfileError) throw err;
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
         `Failed to read all entries${prefix ? ` with prefix "${prefix}"` : ''}: ${err instanceof Error ? err.message : String(err)}`,
@@ -711,11 +749,31 @@ function coerceToUint8Array(value: unknown): Uint8Array {
     return new Uint8Array(value);
   }
   if (typeof value === 'object' && value !== null) {
+    // Steelman³ remediation: count keys via a bounded for-in loop FIRST,
+    // before any Object.values()/Object.keys() allocation. A peer-crafted
+    // object with 10M numeric-keyed entries would otherwise allocate
+    // an 80MB+ string array for the keys before the cap fires. Bounded
+    // counting closes that pre-allocation OOM window.
+    let keyCount = 0;
+    for (const k in value) {
+      if (Object.prototype.hasOwnProperty.call(value, k)) {
+        keyCount += 1;
+        if (keyCount > COERCE_OBJECT_VALUE_CAP) {
+          throw new ProfileError(
+            'ORBITDB_READ_FAILED',
+            `Refusing to coerce object with > ${COERCE_OBJECT_VALUE_CAP} entries to Uint8Array (key-count cap exceeded)`,
+          );
+        }
+      }
+    }
+    // Now safe to materialize values — bounded by the cap.
     const values = Object.values(value);
     if (values.length > COERCE_OBJECT_VALUE_CAP) {
+      // Defensive: keyCount above SHOULD have caught this, but the for-in
+      // loop excludes inherited enumerables which Object.values does not.
       throw new ProfileError(
         'ORBITDB_READ_FAILED',
-        `Refusing to coerce object with ${values.length} entries to Uint8Array (cap=${COERCE_OBJECT_VALUE_CAP})`,
+        `Refusing to coerce object with ${values.length} entries to Uint8Array (post-allocation cap)`,
       );
     }
     const bytes = new Uint8Array(values.length);

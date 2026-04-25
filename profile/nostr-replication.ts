@@ -51,10 +51,13 @@ const EOSE_TIMEOUT_MS = 15_000;
 const MAX_EVENTS_PER_FETCH = 10_000;
 
 /**
- * Hard cap on each raw message size (approximates Nostr relay convention,
- * typically 256 KB). Larger messages are dropped at the parse guard.
+ * Hard cap on each raw message LENGTH (approximates Nostr relay
+ * convention of 256K bytes). For string-type WebSocket frames, this
+ * is UTF-16 code-unit count (NOT bytes — CJK input is ~3× larger
+ * in actual UTF-8 bytes). Renamed from MAX_MESSAGE_BYTES to clarify
+ * the unit. The cap is applied per-message at the parse boundary.
  */
-const MAX_MESSAGE_BYTES = 256 * 1024;
+const MAX_MESSAGE_LEN = 256 * 1024;
 
 // =============================================================================
 // Types
@@ -283,14 +286,14 @@ export class NostrReplicationBridge {
         // allocated 10MB of string by the time we checked.
         const data = msg.data;
         if (typeof data === 'string') {
-          if (data.length > MAX_MESSAGE_BYTES) return;
+          if (data.length > MAX_MESSAGE_LEN) return;
         } else if (data instanceof ArrayBuffer) {
-          if (data.byteLength > MAX_MESSAGE_BYTES) return;
+          if (data.byteLength > MAX_MESSAGE_LEN) return;
         } else if (typeof Buffer !== 'undefined' && data instanceof Buffer) {
-          if (data.length > MAX_MESSAGE_BYTES) return;
+          if (data.length > MAX_MESSAGE_LEN) return;
         }
         const raw = typeof data === 'string' ? data : String(data);
-        if (raw.length > MAX_MESSAGE_BYTES) return;
+        if (raw.length > MAX_MESSAGE_LEN) return;
 
         let parsed: unknown[];
         try {
@@ -313,7 +316,15 @@ export class NostrReplicationBridge {
           // their genuine signatures intact. Cap also protects against
           // relay flooding 10k events between REQ and EOSE.
           if (events.length >= MAX_EVENTS_PER_FETCH) {
-            // Drop further events — cap reached.
+            // Steelman³ remediation: cap reached → close the subscription
+            // and finalize early, instead of letting the relay keep
+            // streaming (each ignored event still costs JSON.parse +
+            // size-check + dispatch CPU). The cleanup() helper sends
+            // CLOSE and removes the message listener.
+            settled = true;
+            clearTimeout(timeout);
+            cleanup();
+            this.verifyAndDecrypt(events).then(resolve, reject);
             return;
           }
           events.push(evt);
@@ -418,14 +429,14 @@ export class NostrReplicationBridge {
         // wallet. Reject oversized frames at parse time.
         const data = msg.data;
         if (typeof data === 'string') {
-          if (data.length > MAX_MESSAGE_BYTES) return;
+          if (data.length > MAX_MESSAGE_LEN) return;
         } else if (data instanceof ArrayBuffer) {
-          if (data.byteLength > MAX_MESSAGE_BYTES) return;
+          if (data.byteLength > MAX_MESSAGE_LEN) return;
         } else if (typeof Buffer !== 'undefined' && data instanceof Buffer) {
-          if (data.length > MAX_MESSAGE_BYTES) return;
+          if (data.length > MAX_MESSAGE_LEN) return;
         }
         const raw = typeof data === 'string' ? data : String(data);
-        if (raw.length > MAX_MESSAGE_BYTES) return;
+        if (raw.length > MAX_MESSAGE_LEN) return;
         let parsed: unknown[];
         try {
           parsed = JSON.parse(raw);
@@ -454,24 +465,28 @@ export class NostrReplicationBridge {
    * Steelman remediation: verify events (NIP-01 id + schnorr sig) BEFORE
    * decrypting. Events failing verification are dropped silently.
    *
-   * Steelman² remediation: verify in PARALLEL CHUNKS rather than
-   * sequentially-awaited. Sequential await over up to 10k events at
-   * ~1-2ms each pegged the main thread for 10-20 seconds against a
-   * malicious relay — a UI freeze. We chunk into batches of
-   * VERIFY_BATCH_SIZE and Promise.all each batch (allowing libuv worker
-   * scheduling to overlap), with a hard wall-clock cap to bound CPU
-   * time and a yield (setImmediate-equivalent) between batches so the
-   * event loop can drain UI tasks.
+   * Steelman² remediation: verify in chunked batches (size=64) with a
+   * 5s wall-clock budget and event-loop yield between batches. Sequential
+   * await over up to 10k events at ~1-2ms each pegged the main thread
+   * for 10-20 seconds against a malicious relay — UI freeze.
+   *
+   * Steelman³ remediation: budget exhaustion is no longer silent. Throws
+   * a labeled Error so the caller (and any caller that persists a
+   * `since` timestamp) sees the truncation rather than treating an
+   * incomplete event set as authoritative — which would silently lose
+   * OpLog entries from sibling HD-synced devices on persistent caller-
+   * advanced `since`. The thrown error includes the dropped count and
+   * authentic count for telemetry.
    */
   private async verifyAndDecrypt(events: NostrEvent[]): Promise<Uint8Array[]> {
     const VERIFY_BATCH_SIZE = 64;
     const VERIFY_TOTAL_BUDGET_MS = 5_000;
     const startedAt = Date.now();
     const authentic: NostrEvent[] = [];
+    let droppedCount = 0;
     for (let i = 0; i < events.length; i += VERIFY_BATCH_SIZE) {
       if (Date.now() - startedAt > VERIFY_TOTAL_BUDGET_MS) {
-        // CPU budget exhausted — refuse to spend more time verifying a
-        // potentially-hostile batch. Drop remaining events.
+        droppedCount = events.length - i;
         break;
       }
       const batch = events.slice(i, i + VERIFY_BATCH_SIZE);
@@ -481,6 +496,16 @@ export class NostrReplicationBridge {
       }
       // Yield to the event loop between batches so UI tasks aren't starved.
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    if (droppedCount > 0) {
+      const err: Error & { droppedCount?: number; authenticCount?: number } = new Error(
+        `Nostr verifyAndDecrypt budget exhausted (${VERIFY_TOTAL_BUDGET_MS}ms): ` +
+          `dropped ${droppedCount} events; verified ${authentic.length}. ` +
+          `Caller MUST NOT advance \`since\` — re-fetch missed window.`,
+      );
+      err.droppedCount = droppedCount;
+      err.authenticCount = authentic.length;
+      throw err;
     }
     return this.decryptEvents(authentic);
   }

@@ -205,16 +205,21 @@ describe('Commit B + E — state machine steelman² remediations', () => {
       // identified by requestId. We need to know which side this is —
       // simpler: alternate calls represent A then B. Real impl issues
       // them in parallel (Promise.all), so we use call index.
+      //
+      // Steelman³ remediation: import the canonical SubmitCommitmentStatus
+      // enum so this test isn't brittle to changes in the enum's runtime
+      // representation (string→numeric, etc.).
+      const { SubmitCommitmentStatus } = await import('@unicitylabs/state-transition-sdk/lib/api/SubmitCommitmentResponse.js');
       let callIdx = 0;
       const fakeAggregator = {
-        async submitCommitment(req: { requestId: { toString: () => string } }): Promise<{ status: string }> {
+        async submitCommitment(req: { requestId: { toString: () => string } }): Promise<{ status: unknown }> {
           callIdx++;
           // Iteration 1: A returns REQUEST_ID_EXISTS, B throws (network).
-          if (callIdx === 1) return { status: 'REQUEST_ID_EXISTS' };
+          if (callIdx === 1) return { status: SubmitCommitmentStatus.REQUEST_ID_EXISTS };
           if (callIdx === 2) throw new Error('network error');
           // Iteration 2: BOTH return REQUEST_ID_EXISTS.
-          if (callIdx === 3) return { status: 'REQUEST_ID_EXISTS' };
-          if (callIdx === 4) return { status: 'REQUEST_ID_EXISTS' };
+          if (callIdx === 3) return { status: SubmitCommitmentStatus.REQUEST_ID_EXISTS };
+          if (callIdx === 4) return { status: SubmitCommitmentStatus.REQUEST_ID_EXISTS };
           throw new Error('unexpected call');
         },
         async getInclusionProof(): Promise<unknown> { return null; },

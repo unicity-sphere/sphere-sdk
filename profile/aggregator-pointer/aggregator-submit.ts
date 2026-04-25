@@ -114,8 +114,16 @@ export type SubmitOutcome =
    *
    * (Steelman² fix: previously this distinction was lost in the
    * combined outcome.)
+   *
+   * Steelman³ remediation: the field is OPTIONAL to preserve
+   * backwards compatibility for external consumers who construct
+   * SubmitOutcome literals (e.g., for testing). When `undefined`,
+   * `publish-algorithm.ts`'s `=== 'success'` check fails closed —
+   * the hint is NOT escalated. Internal calls from combineOutcomes
+   * always set the field; only externally-constructed values may
+   * omit it. Treat absent as "do not escalate."
    */
-  | { readonly kind: 'retry_side'; readonly side: Side; readonly committedSideKind: 'success' | 'exists' }
+  | { readonly kind: 'retry_side'; readonly side: Side; readonly committedSideKind?: 'success' | 'exists' }
   /** Row 8: both network error → retry whole publish. */
   | { readonly kind: 'retry_both' }
   /** Rows 10, 13: HTTP 429/503+Retry-After or -32006 → honor delay, no retry-budget burn. */

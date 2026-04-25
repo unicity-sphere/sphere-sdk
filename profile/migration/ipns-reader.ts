@@ -228,7 +228,13 @@ async function fetchFileFromIpfs(
       // Streaming read with running cap.
       const bytes = await readStreamWithLimitLocal(response, maxSizeBytes, gateway);
       if (bytes === null) {
-        // Cap exceeded mid-stream; recorded as lastError; try next gateway.
+        // Steelman³ remediation: actually set lastError. Previous
+        // version commented "recorded as lastError" but never assigned
+        // it — final user-facing error was "...failed: unknown".
+        // Now the cap-exceeded path produces a useful diagnostic.
+        lastError = new Error(
+          `Stream exceeded ${maxSizeBytes}-byte cap (or body unavailable) from ${gateway}`,
+        );
         continue;
       }
 
@@ -284,13 +290,14 @@ async function readStreamWithLimitLocal(
 ): Promise<Uint8Array | null> {
   const reader = response.body?.getReader();
   if (!reader) {
-    // Body is not a stream — fall back to arrayBuffer (with post-buffer cap).
-    const buffer = await response.arrayBuffer();
-    if (buffer.byteLength > maxBytes) {
-      void gateway;
-      return null;
-    }
-    return new Uint8Array(buffer);
+    // Steelman³ remediation: refuse to fall back to the unbounded
+    // arrayBuffer() path. The previous fallback first allocated the
+    // full body THEN checked size — defeating the streaming-cap's
+    // claim of "abort the moment running total exceeds cap." A
+    // gateway that returns a non-streamable body is treated as an
+    // error and the caller rotates to the next gateway.
+    void gateway;
+    return null;
   }
   const chunks: Uint8Array[] = [];
   let total = 0;
