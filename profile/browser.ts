@@ -96,6 +96,8 @@ export function createBrowserProfileProviders(
       ...(config.profileConfig?.orbitDb ?? {}),
     },
     encrypt: config.profileConfig?.encrypt ?? true,
+    // Wave F.9: thread network through (parity with profile/node.ts).
+    network,
     ipfsGateways: config.profileConfig?.ipfsGateways ?? [...networkConfig.ipfsGateways ?? DEFAULT_IPFS_GATEWAYS],
     cacheMaxSizeBytes: config.profileConfig?.cacheMaxSizeBytes,
     consolidationRetentionMs: config.profileConfig?.consolidationRetentionMs,

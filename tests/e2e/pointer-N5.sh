@@ -54,7 +54,9 @@ MN_A=$(extract_mnemonic "$INIT_A")
 ok "device A initialized (mnemonic ${MN_A%% *}…)"
 
 log "=== Step 2: device A pointer flush via ${GW_PRIMARY} ==="
-_cd_cli "$DD_A" --ipfs-gateway "${GW_PRIMARY}" pointer flush 2>&1 \
+# --no-nostr applied consistently across all CLI invocations: this script
+# is the IPFS-only path (Nostr replication is N6's territory).
+_cd_cli "$DD_A" --no-nostr --ipfs-gateway "${GW_PRIMARY}" pointer flush 2>&1 \
   | tail -3 | sed 's/^/    /' || die "A flush failed"
 ok "device A flush succeeded via primary gateway"
 
@@ -65,7 +67,7 @@ _cd_cli "$DD_B" --no-nostr --ipfs-gateway "${GW_SECONDARY}" \
 ok "device B initialized via mnemonic (different gateway list)"
 
 log "=== Step 4: device B recovers A's published pointer via ${GW_SECONDARY} ==="
-RECOVER_B=$(_cd_cli "$DD_B" --ipfs-gateway "${GW_SECONDARY}" pointer recover 2>&1) \
+RECOVER_B=$(_cd_cli "$DD_B" --no-nostr --ipfs-gateway "${GW_SECONDARY}" pointer recover 2>&1) \
   || die "B recover errored"
 echo "$RECOVER_B" | tail -3 | sed 's/^/    /'
 if echo "$RECOVER_B" | grep -qE 'Recovered v=[0-9]+ cid='; then

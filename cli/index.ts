@@ -25,17 +25,53 @@ import type { TransportProvider } from '../transport/transport-provider';
 import type { ProviderStatus } from '../types';
 
 const args = process.argv.slice(2);
-// Wave F.5: strip --ipfs-gateway <value> from args at module load so
-// the flag may appear before the subcommand. `parseIpfsGatewayOverride`
-// is still called against `process.argv.slice(2)` directly via a
-// pre-strip snapshot when needed — but for command resolution we
-// need args[0] to be the actual command name regardless of where the
-// global flag appeared.
-const _ipfsGatewayPreStrip = [...args];
-for (let i = args.length - 1; i >= 0; i--) {
-  if (args[i] === '--ipfs-gateway' && i + 1 < args.length && !args[i + 1].startsWith('--')) {
-    args.splice(i, 2);
+// Wave F.5/F.9: strip GLOBAL flags from the args array so the
+// subcommand name resolves correctly regardless of flag position.
+// Steelman⁷ caught two issues with the F.5 strip:
+//   (a) only --ipfs-gateway was stripped — --no-nostr was NOT, so
+//       prologue-style `--no-nostr init` invocations failed with
+//       "Unknown command: --no-nostr". This broke every implemented
+//       N-script (N1, N2, N5, N13, N14).
+//   (b) the strip walked the WHOLE argv, mangling subcommand args
+//       that legitimately contained `--ipfs-gateway` as a value.
+//
+// Fix: strip only the LEADING flag region (args before the first
+// non-flag token). Subcommand-internal flags are left alone.
+//
+// `_globalFlagPreStrip` is the snapshot read by parsers that need to
+// see the original flag values (e.g., parseIpfsGatewayOverride); the
+// live `args` array has them removed.
+const _globalFlagPreStrip = [...args];
+{
+  // Identify the leading flag region: args[0..k) where every entry
+  // either starts with `--` (a flag) OR is the value of the
+  // immediately-preceding flag. The first entry that isn't either
+  // is the subcommand.
+  const VALUE_BEARING_GLOBAL_FLAGS = new Set(['--ipfs-gateway']);
+  const stripped: string[] = [];
+  let i = 0;
+  while (i < args.length) {
+    const tok = args[i];
+    if (!tok.startsWith('--')) break; // first non-flag = subcommand
+    if (VALUE_BEARING_GLOBAL_FLAGS.has(tok) && i + 1 < args.length && !args[i + 1].startsWith('--')) {
+      // Skip flag + value (don't add to stripped — we're removing them).
+      i += 2;
+      continue;
+    }
+    if (tok === '--no-nostr') {
+      // Boolean global flag — remove from args; presence is detected
+      // separately via _globalFlagPreStrip.includes('--no-nostr').
+      i++;
+      continue;
+    }
+    // Unknown leading flag — leave in place (e.g. --help). Stop the
+    // strip so we don't accidentally swallow tokens past it.
+    stripped.push(tok);
+    i++;
+    break;
   }
+  // Rebuild args with the unrecognized-leading-flag prefix + the rest.
+  args.splice(0, i, ...stripped);
 }
 const command = args[0];
 
@@ -306,15 +342,25 @@ function createNoopTransport(): TransportProvider {
  */
 function parseIpfsGatewayOverride(argv: readonly string[]): string[] {
   const gateways: string[] = [];
+  // Wave F.9: scan only the leading global-flag region. Stop at the
+  // first non-flag token (the subcommand). Avoids colliding with a
+  // subcommand-internal token that happens to spell `--ipfs-gateway`.
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--ipfs-gateway' && i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
+    const tok = argv[i];
+    if (!tok.startsWith('--')) break; // subcommand starts here
+    if (tok === '--ipfs-gateway' && i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
       const raw = argv[i + 1];
       for (const entry of raw.split(',')) {
         const trimmed = entry.trim().replace(/\/+$/, '');
         if (trimmed.length > 0) gateways.push(trimmed);
       }
       i++; // skip value
+      continue;
     }
+    if (tok === '--no-nostr') continue; // boolean global flag
+    // Unknown leading flag — stop scan to avoid swallowing past
+    // tokens that we don't recognize.
+    break;
   }
   return gateways;
 }
@@ -342,7 +388,9 @@ async function getSphere(options?: {
   // script (SPEC §5.6 — gateway-failover assertion).
   // Read from the pre-strip snapshot — the live `args` array had the
   // flag removed at module load so command resolution would work.
-  const gatewayOverride = parseIpfsGatewayOverride(_ipfsGatewayPreStrip);
+  // Wave F.9: only scan the leading flag region of the snapshot to
+  // avoid colliding with subcommand-internal `--ipfs-gateway` tokens.
+  const gatewayOverride = parseIpfsGatewayOverride(_globalFlagPreStrip);
 
   // Build providers based on resolved storage mode.
   let providers;
@@ -1741,8 +1789,10 @@ Examples:
 }
 
 async function main() {
-  // Global flag: --no-nostr disables Nostr transport (uses no-op)
-  noNostrGlobal = args.includes('--no-nostr');
+  // Global flag: --no-nostr disables Nostr transport (uses no-op).
+  // Read from the pre-strip snapshot — the live `args` array had it
+  // removed by the leading-flag stripper at module load.
+  noNostrGlobal = _globalFlagPreStrip.includes('--no-nostr');
 
   if (!command || command === '--help' || command === '-h') {
     printUsage();
@@ -5831,6 +5881,15 @@ async function main() {
             console.log('  pointer flush            Trigger a save + pointer publish round-trip');
             process.exit(1);
         }
+        // Wave F.9 critical fix: drain pending writes before exit.
+        // Steelman⁷ caught that `pointer flush` was fire-and-forget —
+        // sphere.payments.save() schedules a 2s debounced flush via
+        // setTimeout, then returns. The handler's "Flush complete"
+        // message printed BEFORE the timer fired, then process.exit(0)
+        // cancelled the pending flush entirely. closeSphere() on
+        // ProfileTokenStorageProvider triggers the synchronous final
+        // flush + awaits the IPFS pin + pointer.publish() chain.
+        await closeSphere();
         break;
       }
 

@@ -102,6 +102,13 @@ export function createNodeProfileProviders(
       ...(config.profileConfig?.orbitDb ?? {}),
     },
     encrypt: config.profileConfig?.encrypt ?? true,
+    // Wave F.9: thread network through to ProfileConfig so the pointer
+    // layer's SPEC §14.1 / §11.12 denylist gate (createMasterPrivateKey
+    // network parameter) reaches createMasterPrivateKey via
+    // ProfileStorageProvider → buildProfilePointerLayer. Previously
+    // the factory dropped this field — production callers couldn't
+    // opt into network='test-vectors' through the standard factory.
+    network,
     ipfsGateways: config.profileConfig?.ipfsGateways ?? [...networkConfig.ipfsGateways ?? DEFAULT_IPFS_GATEWAYS],
     cacheMaxSizeBytes: config.profileConfig?.cacheMaxSizeBytes,
     consolidationRetentionMs: config.profileConfig?.consolidationRetentionMs,

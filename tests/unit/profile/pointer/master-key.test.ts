@@ -21,8 +21,12 @@ describe('MasterPrivateKey (T-A5b)', () => {
   });
 
   it('rejects bytes of wrong length with RangeError', () => {
-    expect(() => createMasterPrivateKey(new Uint8Array(16, 'test-vectors'))).toThrow(RangeError);
-    expect(() => createMasterPrivateKey(new Uint8Array(33, 'test-vectors'))).toThrow(/must be exactly 32 bytes/);
+    // Wave F.9 fix: 'test-vectors' belongs as the SECOND arg to
+    // createMasterPrivateKey, not inside the Uint8Array constructor
+    // (which silently ignores it). Length-check still fires first
+    // regardless of network parameter.
+    expect(() => createMasterPrivateKey(new Uint8Array(16), 'test-vectors')).toThrow(RangeError);
+    expect(() => createMasterPrivateKey(new Uint8Array(33), 'test-vectors')).toThrow(/must be exactly 32 bytes/);
   });
 
   it('isAuthorizedMasterKey returns false for cast raw objects', () => {
