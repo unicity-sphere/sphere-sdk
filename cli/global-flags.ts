@@ -114,11 +114,21 @@ function isUsableSpaceSeparatedValue(value: string | undefined): boolean {
  * Anything else is rejected loudly.
  */
 function isValidGatewayUrl(entry: string): boolean {
-  // F.14: reject C0 controls + DEL — WHATWG URL parser silently absorbs
-  // CR/LF/TAB and shifts the host invisibly. The control-char regex is
-  // intentional; the lint rule is meant for accidental binary noise.
+  // F.15 (steelman¹³): reject any non-printable-ASCII char (everything
+  // outside 0x21-0x7E). This is strictly broader than F.14's
+  // `[\x00-\x1F\x7F]` (C0 + DEL) and closes the steelman¹³ critical:
+  // WHATWG URL parser silently strips Unicode format chars (ZWSP,
+  // BOM, ZWJ, bidi marks, etc.) so `http://gw1<U+200B>.test` passed
+  // F.14 validation but `new URL().host` was `gw1.test` — the typed
+  // bytes and the contacted host differ invisibly.
+  //
+  // Rejecting non-ASCII forces operators to use punycode (`xn--`) for
+  // IDN gateways, which is reasonable for infrastructure config: the
+  // operator-typed host equals the bytes sent to fetch, byte-for-byte.
+  // The lint rule is meant for accidental binary noise; the rejection
+  // here is intentional.
   // eslint-disable-next-line no-control-regex
-  if (/[\x00-\x1F\x7F]/.test(entry)) return false;
+  if (/[^\x21-\x7E]/.test(entry)) return false;
   // F.14: require literal `://` followed immediately by a non-slash,
   // non-?, non-#, non-whitespace char — the start of the host. This
   // catches `http:foo` (F.13), `http:///path` (3-slash path promoted
@@ -378,4 +388,38 @@ export function stripLeadingGlobalFlags(argv: string[]): string[] {
   const end = findLeadingGlobalFlagsEnd(argv);
   argv.splice(0, end);
   return argv;
+}
+
+/**
+ * Detect the position-agnostic `--no-nostr` global flag.
+ *
+ * Recursive history (steelman⁸ → ¹³):
+ *   F.10 used `Array.includes('--no-nostr')` exact-match. Worked for
+ *        the legitimate cases (leading and post-subcommand bare form)
+ *        but had a known limitation: `init --no-nostr=true` (typo with
+ *        equals form) silently no-op'd because exact-match doesn't
+ *        recognize the equals form.
+ *   F.12 attempted to error LOUDLY on `--no-nostr=anything` anywhere
+ *        via a full-argv validator walk. Closed the silent-no-op typo
+ *        case but was a latent landmine for any subcommand whose
+ *        free-text flag value happened to match the pattern.
+ *   F.14 dropped the F.12 walk and changed noNostrGlobal to use
+ *        parseFlagToken (recognize `--no-nostr=anything` as flag).
+ *        Steelman¹³ caught: this re-creates the F.12 false positive
+ *        in a SILENT failure mode — `cli invoice-create --memo
+ *        --no-nostr=fake-memo` activates noNostrGlobal=true → Sphere
+ *        boots with no-op transport while operator expected real Nostr.
+ *        Strictly worse than F.12 (silent failure > loud refusal).
+ *   F.15 (this version) reverts to F.10's exact-match semantics. The
+ *        `init --no-nostr=true` typo case silently no-op's (the original
+ *        known limitation; documented as not-supported). The legitimate
+ *        cases (`--no-nostr init`, `init --no-nostr`) work; free-text
+ *        flag values like `--memo --no-nostr=fake-memo` do NOT activate.
+ *
+ * The exact-match contract is intentional and tested. DO NOT switch
+ * to parseFlagToken — the steelman¹³ regression is exactly that
+ * change.
+ */
+export function detectNoNostrGlobalFlag(argv: readonly string[]): boolean {
+  return argv.includes('--no-nostr');
 }

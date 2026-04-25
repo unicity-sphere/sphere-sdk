@@ -18,7 +18,7 @@ import { generateAddressFromMasterKey } from '../l1/address';
 import { Sphere } from '../core/Sphere';
 import { createNodeProviders } from '../impl/nodejs';
 import {
-  parseFlagToken,
+  detectNoNostrGlobalFlag,
   parseIpfsGatewayOverride as parseIpfsGatewayOverrideFromArgv,
   stripLeadingGlobalFlags,
   validateLeadingGlobalFlags,
@@ -1792,20 +1792,18 @@ async function main() {
   // meaning — `parseIpfsGatewayOverride` is leading-only and warns
   // when the flag is misplaced.
   //
-  // F.14: use parseFlagToken so post-subcommand `--no-nostr=anything`
-  // (any equals form) is recognized as Nostr-disabling intent. Pre-F.14
-  // `Array.includes('--no-nostr')` exact-match did NOT recognize
-  // `--no-nostr=true`, leading to silent no-op when operator typed
-  // `cli init --no-nostr=true`. F.12 had attempted to fix this with a
-  // loud-error full-argv validator walk, but that produced false
-  // positives on legitimate `--memo --no-nostr=fake-memo` (steelman¹²).
-  // F.14 strikes a middle ground: silently accept any `--no-nostr=...`
-  // form post-subcommand (functional intent honored, no false
-  // positives), still error loudly on `--no-nostr=...` in leading
-  // position via validateLeadingGlobalFlags.
-  noNostrGlobal = _globalFlagPreStrip.some(
-    (tok) => parseFlagToken(tok).name === '--no-nostr',
-  );
+  // F.15 (steelman¹³): exact-match contract via `detectNoNostrGlobalFlag`
+  // helper. Recursive history of attempts at recognizing the equals
+  // form (`--no-nostr=true`):
+  //   - F.12 used a full-argv validator walk → loud error → false
+  //     positives on legitimate `--memo --no-nostr=fake-memo`.
+  //   - F.14 used parseFlagToken in noNostrGlobal → SILENT transport
+  //     disable on the same false-positive shape (worse UX).
+  //   - F.15 reverts to F.10's exact-match semantics. Operators who
+  //     type `init --no-nostr=true` get the documented silent no-op
+  //     (boolean flags don't take values; the typo isn't recognized).
+  //     This is the only behavior that has zero false positives.
+  noNostrGlobal = detectNoNostrGlobalFlag(_globalFlagPreStrip);
 
   if (!command || command === '--help' || command === '-h') {
     printUsage();

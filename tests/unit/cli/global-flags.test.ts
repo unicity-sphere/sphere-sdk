@@ -21,6 +21,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import {
+  detectNoNostrGlobalFlag,
   findLeadingGlobalFlagsEnd,
   parseIpfsGatewayOverride,
   stripLeadingGlobalFlags,
@@ -950,5 +951,163 @@ describe('userinfo URL rejection (F.14 — steelman¹² warning fix)', () => {
         'init',
       ]),
     ).toEqual(['http://gw1', 'http://gw2']);
+  });
+});
+
+// ============================================================================
+// Wave F.15 — detectNoNostrGlobalFlag exact-match contract (steelman¹³ critical 1)
+// ============================================================================
+
+describe('detectNoNostrGlobalFlag exact-match contract (F.15 — steelman¹³ critical 1)', () => {
+  // Recursive history: F.10 used Array.includes() exact match. F.14
+  // switched to parseFlagToken. Steelman¹³ caught a SILENT
+  // transport-disable false positive: `cli invoice-create --memo
+  // --no-nostr=fake-memo` activated noNostrGlobal=true because
+  // parseFlagToken('--no-nostr=fake-memo').name === '--no-nostr'.
+  //
+  // F.15 reverts to exact match. The legitimate cases (leading and
+  // post-subcommand bare `--no-nostr`) work; equals-form typos like
+  // `init --no-nostr=true` silently no-op (the documented original
+  // behavior — boolean flags don't take values).
+
+  it('matches leading bare `--no-nostr`', () => {
+    expect(detectNoNostrGlobalFlag(['--no-nostr', 'init'])).toBe(true);
+  });
+
+  it('matches post-subcommand bare `--no-nostr` (init-local form, e2e dependency)', () => {
+    // tests/e2e/cli-storage-modes.sh runs:
+    //   init --network testnet --legacy --no-nostr
+    // and depends on no-op transport activation. Exact-match honors
+    // this position.
+    expect(detectNoNostrGlobalFlag(['init', '--no-nostr'])).toBe(true);
+    expect(
+      detectNoNostrGlobalFlag(['init', '--network', 'testnet', '--legacy', '--no-nostr']),
+    ).toBe(true);
+  });
+
+  it('does NOT match equals form `--no-nostr=true` (the F.14 regression source)', () => {
+    // This is the documented silent-no-op case. Operators who type
+    // `=true` with a boolean flag get the typo treated as not-recognized.
+    // Compare to leading `--no-nostr=true` which the validator rejects
+    // loudly (validateLeadingGlobalFlags returns an error).
+    expect(detectNoNostrGlobalFlag(['init', '--no-nostr=true'])).toBe(false);
+    expect(detectNoNostrGlobalFlag(['init', '--no-nostr=false'])).toBe(false);
+    expect(detectNoNostrGlobalFlag(['init', '--no-nostr=anything'])).toBe(false);
+  });
+
+  it('THE F.15 CRITICAL: --memo --no-nostr=fake-memo does NOT activate', () => {
+    // Steelman¹³ regression: F.14's parseFlagToken-based detection
+    // returned true here, silently activating no-op transport when
+    // the operator passed `--no-nostr=fake-memo` as the VALUE of
+    // a free-text `--memo` flag. F.15 must NOT match this shape.
+    expect(
+      detectNoNostrGlobalFlag([
+        'invoice-create',
+        '--target',
+        '@alice',
+        '--memo',
+        '--no-nostr=fake-memo',
+      ]),
+    ).toBe(false);
+  });
+
+  it('does NOT match other free-text flag value patterns', () => {
+    expect(
+      detectNoNostrGlobalFlag(['send', '--description', '--no-nostr=hi']),
+    ).toBe(false);
+    expect(
+      detectNoNostrGlobalFlag(['payment-request', '--message', '--no-nostr=test']),
+    ).toBe(false);
+  });
+
+  it('returns false on empty argv', () => {
+    expect(detectNoNostrGlobalFlag([])).toBe(false);
+  });
+
+  it('returns false when --no-nostr is absent', () => {
+    expect(detectNoNostrGlobalFlag(['init', '--network', 'testnet'])).toBe(false);
+  });
+
+  it('matches `--no-nostr` even with --ipfs-gateway leading', () => {
+    expect(
+      detectNoNostrGlobalFlag([
+        '--ipfs-gateway',
+        'http://gw',
+        '--no-nostr',
+        'init',
+      ]),
+    ).toBe(true);
+  });
+});
+
+// ============================================================================
+// Wave F.15 — Unicode/non-ASCII URL rejection (steelman¹³ critical 2)
+// ============================================================================
+
+describe('non-printable-ASCII URL rejection (F.15 — steelman¹³ critical 2)', () => {
+  // F.14 rejected only C0 controls + DEL. WHATWG URL parser silently
+  // strips Unicode format chars (ZWSP, BOM, etc.) → host shifts
+  // invisibly. F.15 broadens to reject anything outside 0x21-0x7E.
+
+  it('rejects ZWSP (U+200B) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1​.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects BOM (U+FEFF) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1﻿.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects ZWJ (U+200D) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1‍.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects LRM (U+200E left-to-right mark) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1‎.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects RLM (U+200F right-to-left mark) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1‏.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects raw IDN domains (Cyrillic example) — operator must use punycode', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://пример.рф', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects emoji in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw1🚀.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('still accepts punycode IDN form (ASCII-only, valid)', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://xn--e1afmkfd.xn--p1ai', // punycode for пример.рф
+        'init',
+      ]),
+    ).toBeNull();
+  });
+
+  it('parser drops Unicode-poisoned entries from comma list', () => {
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway',
+        'http://gw1.test,http://gw2​.test,http://gw3.test',
+        'init',
+      ]),
+    ).toEqual(['http://gw1.test', 'http://gw3.test']);
   });
 });
