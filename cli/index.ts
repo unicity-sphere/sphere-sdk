@@ -647,7 +647,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       { flag: '--nametag <name>', description: 'Register a nametag during initialization (mints on-chain)' },
       { flag: '--legacy', description: 'Use file-based JSON wallet + IPNS sync (pre-UXF format). Default is OrbitDB/Profile.' },
       { flag: '--profile', description: 'Force OrbitDB Profile mode. Requires @orbitdb/core + helia installed.' },
-      { flag: '--no-nostr', description: 'GLOBAL flag — must precede subcommand: `cli --no-nostr init`. Disables Nostr transport.' },
+      { flag: '--no-nostr', description: 'Disable Nostr transport (use no-op transport). Position-agnostic global flag.' },
     ],
     examples: [
       'npm run cli -- init --network testnet              # default: OrbitDB Profile mode',
@@ -1780,29 +1780,23 @@ async function main() {
   //
   // Position-agnostic by design (Wave F.10 documentation):
   //   `--no-nostr` is BOTH a leading global flag AND a subcommand-local
-  //   flag (declared on `init` in the help table at line ~5961). It
-  //   means "use no-op transport for this invocation" regardless of
-  //   placement. Steelman⁸ flagged the position-agnostic detection as a
-  //   subtle inconsistency vs. the leading-only strip, but the dual
-  //   semantics are intentional — see tests/e2e/cli-storage-modes.sh
-  //   which invokes `init --network testnet --legacy --no-nostr`
-  //   (post-subcommand) and depends on no-op transport activation.
+  //   flag (declared on `init` in the help table). It means "use no-op
+  //   transport for this invocation" regardless of placement. The dual
+  //   semantics are intentional — daemon tests, e2e scripts, and docs
+  //   all use post-subcommand position; leading position works for
+  //   pointer-N* scripts.
   //
   // Contrast with `--ipfs-gateway`, which has NO subcommand-local
   // meaning — `parseIpfsGatewayOverride` is leading-only and warns
   // when the flag is misplaced.
   //
-  // F.15 (steelman¹³): exact-match contract via `detectNoNostrGlobalFlag`
-  // helper. Recursive history of attempts at recognizing the equals
-  // form (`--no-nostr=true`):
-  //   - F.12 used a full-argv validator walk → loud error → false
-  //     positives on legitimate `--memo --no-nostr=fake-memo`.
-  //   - F.14 used parseFlagToken in noNostrGlobal → SILENT transport
-  //     disable on the same false-positive shape (worse UX).
-  //   - F.15 reverts to F.10's exact-match semantics. Operators who
-  //     type `init --no-nostr=true` get the documented silent no-op
-  //     (boolean flags don't take values; the typo isn't recognized).
-  //     This is the only behavior that has zero false positives.
+  // F.17 (steelman¹⁵): position-agnostic exact-match. The detector
+  // helper `detectNoNostrGlobalFlag` returns
+  // `argv.includes('--no-nostr')` — full argv scan. See helper docstring
+  // in cli/global-flags.ts for the full recursive history (F.10 →
+  // F.17, 8 rounds). The known limitation is `cli send --memo
+  // --no-nostr` (memo VALUE = literal `--no-nostr`) silently activates
+  // no-op transport — vanishingly rare, documented.
   noNostrGlobal = detectNoNostrGlobalFlag(_globalFlagPreStrip);
 
   if (!command || command === '--help' || command === '-h') {
@@ -5928,7 +5922,7 @@ interface CompletionCommand {
 
 function getCompletionCommands(): CompletionCommand[] {
   return [
-    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--legacy', '--profile'] },
+    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr', '--legacy', '--profile'] },
     { name: 'status', description: 'Show wallet identity' },
     { name: 'config', description: 'Show or set CLI configuration' },
     { name: 'clear', description: 'Delete all wallet data' },

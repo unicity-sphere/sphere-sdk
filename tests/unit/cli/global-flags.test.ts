@@ -974,17 +974,23 @@ describe('detectNoNostrGlobalFlag exact-match contract (F.15 — steelman¹³ cr
     expect(detectNoNostrGlobalFlag(['--no-nostr', 'init'])).toBe(true);
   });
 
-  it('does NOT match post-subcommand `--no-nostr` (F.16 — steelman¹⁴ scope tightening)', () => {
-    // F.15 used full-argv exact match. Steelman¹⁴ caught the bare-form
-    // false positive: `cli send --memo --no-nostr` (memo VALUE = literal
-    // `--no-nostr`) silently activated noNostrGlobal.
-    // F.16 scopes detection to the LEADING global-flag region only.
-    // Operators must use `cli --no-nostr init` (leading) instead of
-    // `cli init --no-nostr`. e2e scripts updated accordingly.
-    expect(detectNoNostrGlobalFlag(['init', '--no-nostr'])).toBe(false);
+  it('matches post-subcommand bare `--no-nostr` (F.17 — steelman¹⁵ revert)', () => {
+    // F.16 scoped detection to leading region only. Steelman¹⁵
+    // revealed this silently broke 14+ daemon-cli.test.ts invocations
+    // (`['daemon', 'start', '--no-nostr', ...]`), the IPFS-only
+    // recovery test, 9+ doc examples, and operator workflows.
+    // F.17 reverts to F.10/F.15's full-argv exact-match. The narrow
+    // false-positive (`--memo --no-nostr` where memo VALUE is
+    // literally `--no-nostr`) is accepted as a documented known
+    // limitation — vanishingly rare in practice.
+    expect(detectNoNostrGlobalFlag(['init', '--no-nostr'])).toBe(true);
     expect(
       detectNoNostrGlobalFlag(['init', '--network', 'testnet', '--legacy', '--no-nostr']),
-    ).toBe(false);
+    ).toBe(true);
+    // Daemon test invocation pattern (the steelman¹⁵ regression source)
+    expect(
+      detectNoNostrGlobalFlag(['daemon', 'start', '--no-nostr', '--config', '/foo.json']),
+    ).toBe(true);
   });
 
   it('does NOT match equals form `--no-nostr=true` (the F.14 regression source)', () => {
@@ -1013,15 +1019,25 @@ describe('detectNoNostrGlobalFlag exact-match contract (F.15 — steelman¹³ cr
     ).toBe(false);
   });
 
-  it('THE F.16 CRITICAL: --memo --no-nostr (bare form free-text value) does NOT activate', () => {
-    // Steelman¹⁴ caught the bare-form false positive that F.15 missed.
-    // `cli send --memo --no-nostr` — the literal token `--no-nostr` is
-    // the VALUE of --memo, not a global flag. F.15's full-argv exact
-    // match returned true here, silently activating no-op transport.
-    // F.16 scopes to leading region only — closes the bug.
+  it('KNOWN LIMITATION (F.17): --memo --no-nostr (bare-form free-text VALUE) silently activates', () => {
+    // F.10/F.15/F.17 contract: exact-match across full argv. If an
+    // operator literally passes `--no-nostr` as the VALUE of a
+    // free-text flag like --memo, this detector returns true — the
+    // memo gets set to '--no-nostr' AND no-op transport activates.
+    //
+    // Tradeoff (steelman¹⁵ analysis):
+    //   - F.16 scoped to leading region to close this; broke 14+
+    //     daemon-cli tests + IPFS-only recovery test + 9+ docs.
+    //   - F.17 accepts this narrow false-positive: it requires the
+    //     operator to literally type `--no-nostr` as a memo string,
+    //     which is vanishingly rare in practice. The failure mode
+    //     (Nostr disabled when expected) is detectable at runtime.
+    //
+    // Tests below DOCUMENT the (unfortunate) behavior so any future
+    // fix attempt is aware of the contract being committed to.
     expect(
       detectNoNostrGlobalFlag(['send', '--memo', '--no-nostr']),
-    ).toBe(false);
+    ).toBe(true); // documented known limitation
     expect(
       detectNoNostrGlobalFlag([
         'invoice-create',
@@ -1030,27 +1046,18 @@ describe('detectNoNostrGlobalFlag exact-match contract (F.15 — steelman¹³ cr
         '--memo',
         '--no-nostr',
       ]),
-    ).toBe(false);
-    // Same hazard with --mnemonic: operator could have a mnemonic word
-    // sequence ending with `--no-nostr` (extremely unlikely, but the
-    // bug class is identical).
-    expect(
-      detectNoNostrGlobalFlag(['init', '--mnemonic', '--no-nostr']),
-    ).toBe(false);
+    ).toBe(true); // documented known limitation
   });
 
-  it('does NOT match other free-text flag value patterns (equals OR bare form)', () => {
+  it('does NOT match equals form (--no-nostr=value) — exact match is precise here', () => {
+    // Array.includes('--no-nostr') is byte-exact; the equals form is
+    // a different string. So free-text values like `--no-nostr=fake`
+    // legitimately don't match. The rare collision is bare form only.
     expect(
-      detectNoNostrGlobalFlag(['send', '--description', '--no-nostr=hi']),
-    ).toBe(false);
-    expect(
-      detectNoNostrGlobalFlag(['send', '--description', '--no-nostr']),
+      detectNoNostrGlobalFlag(['send', '--memo', '--no-nostr=fake']),
     ).toBe(false);
     expect(
       detectNoNostrGlobalFlag(['payment-request', '--message', '--no-nostr=test']),
-    ).toBe(false);
-    expect(
-      detectNoNostrGlobalFlag(['payment-request', '--message', '--no-nostr']),
     ).toBe(false);
   });
 

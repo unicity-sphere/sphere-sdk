@@ -391,41 +391,47 @@ export function stripLeadingGlobalFlags(argv: string[]): string[] {
 }
 
 /**
- * Detect the `--no-nostr` global flag.
+ * Detect the position-agnostic `--no-nostr` global flag.
  *
- * Recursive history (steelman⁸ → ¹⁴):
- *   F.10 used `Array.includes('--no-nostr')` exact-match across full
- *        argv. Position-agnostic by intent; bare-form free-text flag
- *        values (`cli send --memo --no-nostr`, where the memo VALUE is
- *        literally `--no-nostr`) silently activated.
- *   F.11 documented `init --no-nostr=true` (equals-form typo) as a
- *        silent no-op (not recognized as a flag).
- *   F.12 added full-argv validator walk to catch `--no-nostr=anything`
- *        loudly. False positives on legitimate `--memo --no-nostr=fake`.
- *   F.14 used parseFlagToken in noNostrGlobal — silent failure version
- *        of the F.12 bug (steelman¹²).
- *   F.15 reverted to F.10's exact-match across full argv. Steelman¹³
- *        flagged the equals-form bug in this round. F.15's commit
- *        message claimed "zero false positives" — but only for the
- *        equals form. Steelman¹⁴ caught the SAME bug class for the
- *        bare form (memo value = literal `--no-nostr`).
- *   F.16 (this version) scopes detection to the LEADING global-flag
- *        region. Post-subcommand `--no-nostr` is the subcommand's
- *        own concern, NOT a global signal. Closes ALL free-text-flag
- *        false-positive shapes (bare AND equals forms) at the cost
- *        of breaking the documented `init --no-nostr` post-subcommand
- *        idiom. e2e tests/scripts updated to use leading position.
+ * Recursive history (steelman⁸ → ¹⁵, the longest-running thread):
+ *   F.10 — `Array.includes('--no-nostr')` exact-match across full argv.
+ *   F.12 — added full-argv validator walk for `--no-nostr=anything`.
+ *          Caught the equals-form typo loudly. Steelman¹⁰: false
+ *          positive on `--memo --no-nostr=fake-memo`.
+ *   F.14 — switched noNostrGlobal to parseFlagToken-based detection.
+ *          Steelman¹²: silent transport-disable on the same shape.
+ *   F.15 — reverted to F.10 exact-match. Steelman¹³: equals-form
+ *          bug acknowledged as known limitation. Steelman¹⁴: SAME
+ *          bug for bare form (memo VALUE = literal `--no-nostr`).
+ *   F.16 — scoped to leading region only. Steelman¹⁵: silently broke
+ *          14+ daemon-cli.test.ts invocations, the IPFS-only recovery
+ *          test, and 9+ doc examples. Tests can pass spuriously while
+ *          their named contract is gone.
+ *   F.17 (this version) — reverts to F.15/F.10 full-argv exact-match.
+ *          The narrow false positive (operator literally passing
+ *          `--no-nostr` as a free-text flag VALUE like
+ *          `cli send --memo --no-nostr`) is a documented known
+ *          limitation. Tradeoff analysis (steelman¹⁵ verdict):
+ *            F.16 cost: ~25 silent regressions in real-world tests,
+ *                       docs, and operator workflows.
+ *            F.15 cost: vanishingly rare typo where operator types
+ *                       a flag-shape string as a memo/description.
+ *          F.15 wins on practical impact. The `--memo --no-nostr`
+ *          shape requires deliberate operator effort; the F.16
+ *          break of `daemon start --no-nostr` (and similar) is
+ *          everyday-CLI muscle memory.
  *
- * Operators who want no-op transport must place `--no-nostr` BEFORE
- * the subcommand name:
- *   ✓ `cli --no-nostr init`
- *   ✓ `cli --no-nostr --ipfs-gateway URL pointer flush`
- *   ✗ `cli init --no-nostr` (no longer activates global no-nostr)
+ * KNOWN LIMITATION: if an operator passes a free-text subcommand flag
+ * value that is LITERALLY the string `--no-nostr` (e.g., `cli send
+ * --memo --no-nostr`), this detector returns true and Sphere boots
+ * with no-op transport. Affected free-text flags across all current
+ * subcommands: `--memo` (invoice-create, send), `--description`
+ * (group-create), `--message` (swap-propose, payment-request).
+ * Mitigation: document; acceptable because (a) memo strings shaped
+ * exactly like a CLI flag are vanishingly rare, (b) the failure mode
+ * (Nostr disabled when expected) is detectable at runtime via a
+ * connection error rather than silent data loss.
  */
 export function detectNoNostrGlobalFlag(argv: readonly string[]): boolean {
-  const end = findLeadingGlobalFlagsEnd(argv);
-  for (let i = 0; i < end; i++) {
-    if (argv[i] === '--no-nostr') return true;
-  }
-  return false;
+  return argv.includes('--no-nostr');
 }
