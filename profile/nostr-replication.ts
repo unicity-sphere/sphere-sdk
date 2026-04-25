@@ -737,6 +737,21 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 /**
+ * Test-only export of hexToBytes for direct regression coverage of
+ * the validation contract introduced in steelman⁵ commit J. Steelman⁶
+ * caught that the indirect test (via verifyEventAuthentic) couldn't
+ * distinguish "hexToBytes throws" from "schnorr.verify throws on
+ * wrong-size bytes" — both paths fail closed via the same try/catch.
+ * Direct coverage is the only way to assert the validation contract
+ * itself rather than its downstream consequences.
+ *
+ * NOT part of the public API.
+ */
+export const __testInternal = {
+  hexToBytes,
+};
+
+/**
  * Generate a random subscription ID for Nostr REQ messages.
  */
 function randomSubscriptionId(): string {
