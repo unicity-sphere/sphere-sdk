@@ -89,22 +89,36 @@ function isUsableSpaceSeparatedValue(value: string | undefined): boolean {
 /**
  * Strict gateway URL validator.
  *
- * F.11 used `entry.includes('://')` which was too permissive — it
- * accepted `=http://gw1` (from `--ipfs-gateway==http://gw1` double
- * equals; the parser splits on the FIRST `=` leaving `=http://gw1` as
- * the value), `ftp://gw1`, `javascript://anything`, and any other
- * scheme that happens to contain `://`. Steelman¹⁰ caught this — the
- * malformed value silently propagated to IPFS code and produced
- * confusing errors far from the CLI.
+ * Recursive history:
+ *   F.11 used `entry.includes('://')` — too permissive: accepted
+ *        `=http://gw1` (from `--ipfs-gateway==http://gw1` double equals)
+ *        and any non-http(s) scheme that contains `://`.
+ *   F.12 switched to `new URL(entry)` + protocol whitelist — caught
+ *        the F.11 issues but introduced a NEW one: WHATWG URL parsing
+ *        treats `http:` as a "special" scheme, so `new URL('http:foo')`,
+ *        `new URL('http:/gw')`, and friends succeed (parser interprets
+ *        the rest as host or path). Steelman¹¹ caught this — F.11's
+ *        `://` check would have rejected these.
+ *   F.13 (this version) requires BOTH:
+ *        (a) the original entry literally starts with `http://` or
+ *            `https://` (case-insensitive); rejects scheme-only forms
+ *            without authority delimiter.
+ *        (b) `new URL(entry)` succeeds with the authority producing a
+ *            non-empty host.
+ *        (c) protocol is http: or https:.
  *
- * F.12 tightens to: must be parseable by `new URL(entry)` AND have an
- * http(s) protocol. IPFS gateways are HTTP(S) by definition; rejecting
- * other schemes is loss-less.
+ * IPFS gateways are HTTP(S) URLs of the form `scheme://host[:port][/path]`.
+ * Anything else is rejected loudly.
  */
 function isValidGatewayUrl(entry: string): boolean {
+  // F.13: require literal `://` (catches `http:foo`, `http:/gw`,
+  // `=http://gw`, etc. that WHATWG-permissively accepts as URLs).
+  if (!/^https?:\/\//i.test(entry)) return false;
   try {
     const url = new URL(entry);
-    return url.protocol === 'http:' || url.protocol === 'https:';
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (url.host === '') return false; // defensive: `http://` alone
+    return true;
   } catch {
     return false;
   }

@@ -626,3 +626,128 @@ describe('boolean=value caught anywhere (F.12 — steelman¹⁰ critical 2)', ()
     expect(validateLeadingGlobalFlags(['--no-nostr', 'init'])).toBeNull();
   });
 });
+
+// ============================================================================
+// Wave F.13 — missing-authority URL forms (steelman¹¹ critical fix)
+// ============================================================================
+
+describe('missing-authority URL rejection (F.13 — steelman¹¹ critical)', () => {
+  // F.12's `new URL()` accepted scheme-only forms like `http:foo` because
+  // WHATWG URL parsing treats `http:` as "special" — it interprets the
+  // remainder as host or path. F.11's `includes('://')` would have
+  // rejected these. F.13 restores that intuition by also requiring the
+  // literal `://` prefix.
+
+  it('rejects `http:foo` (scheme + colon, no slashes) — the F.13 critical', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http:foo', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http:gw.example.com` (looks like a URL but missing `//`)', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http:gw.example.com',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `https:foo` (https variant of the same typo)', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'https:foo', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http:/gw` (single slash after colon)', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http:/gw', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http://` alone (scheme + authority delimiter, no host)', () => {
+    // The trailing-slash strip turns `http://` into `http:` which fails
+    // the regex AND new URL.
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://', 'init']),
+    ).not.toBeNull();
+  });
+
+  it('rejects equals-form `--ipfs-gateway=http:foo`', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway=http:foo', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects mixed comma list `http://gw1,http:foo`', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://gw1,http:foo',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('parser drops missing-authority entries from comma list', () => {
+    // Defense in depth — even if validator is bypassed, the parser
+    // does not propagate `http:foo` to downstream IPFS code.
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway',
+        'http://gw1,http:foo,https://gw2',
+        'init',
+      ]),
+    ).toEqual(['http://gw1', 'https://gw2']);
+  });
+
+  it('still accepts forgiving extra-slashes `http:////gw` (URL parser normalizes)', () => {
+    // `http:////gw` matches `^https?://` regex (it has `://` at the
+    // start). `new URL('http:////gw')` produces `http://gw/`. The user
+    // typed extra slashes; the parser is forgiving. fetch() will
+    // normalize correctly when the gateway is used.
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http:////gw.example.com', 'init']),
+    ).toBeNull();
+  });
+});
+
+describe('error precedence (F.13 — lock in lexical-first ordering)', () => {
+  it('URL error wins over post-subcommand bool=value when both present', () => {
+    // Lexical-first ordering: validator's first loop catches URL error
+    // before reaching the second loop's full-argv bool walk.
+    const err = validateLeadingGlobalFlags([
+      '--ipfs-gateway',
+      'http:foo',
+      'init',
+      '--no-nostr=true',
+    ]);
+    expect(err).toContain('not a valid http(s) URL');
+    expect(err).not.toContain('does not take a value');
+  });
+
+  it('leading bool=value wins over post-subcommand bool=value (both invalid)', () => {
+    // First-loop catches the leading `--no-nostr=true` before walking
+    // the rest.
+    const err = validateLeadingGlobalFlags([
+      '--no-nostr=leading',
+      'init',
+      '--no-nostr=trailing',
+    ]);
+    expect(err).toContain("'--no-nostr=leading'");
+  });
+
+  it('post-subcommand bool=value caught when no leading errors exist', () => {
+    // First loop returns null (no leading errors); second loop catches
+    // the post-subcommand boolean=value form.
+    const err = validateLeadingGlobalFlags([
+      '--ipfs-gateway',
+      'http://gw1', // valid
+      'init',
+      '--no-nostr=true', // invalid, post-subcommand
+    ]);
+    expect(err).toContain('--no-nostr');
+    expect(err).toContain('does not take a value');
+  });
+});
