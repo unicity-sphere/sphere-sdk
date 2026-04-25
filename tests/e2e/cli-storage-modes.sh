@@ -204,7 +204,7 @@ else
   T="$(new_test_dir t3-init-legacy)"
   pushd "$T" >/dev/null
 
-  if $CLI init --network testnet --legacy --no-nostr >/dev/null 2>&1; then
+  if $CLI --no-nostr init --network testnet --legacy >/dev/null 2>&1; then
     pass "init --legacy succeeds"
   else
     fail "init --legacy failed"
@@ -244,7 +244,7 @@ else
   T="$(new_test_dir t4-init-profile)"
   pushd "$T" >/dev/null
 
-  if $CLI init --network testnet --profile --no-nostr >/dev/null 2>&1; then
+  if $CLI --no-nostr init --network testnet --profile >/dev/null 2>&1; then
     pass "init --profile succeeds"
   else
     fail "init --profile failed (requires @orbitdb/core + helia installed)"
@@ -285,10 +285,10 @@ else
   pushd "$T" >/dev/null
 
   # Set up a legacy wallet
-  $CLI init --network testnet --legacy --no-nostr >/dev/null 2>&1 || true
+  $CLI --no-nostr init --network testnet --legacy >/dev/null 2>&1 || true
 
   # Try to re-init as profile — should fail with a clear error
-  if $CLI init --network testnet --profile --no-nostr 2>&1 | grep -q "already initialised in legacy mode"; then
+  if $CLI --no-nostr init --network testnet --profile 2>&1 | grep -q "already initialised in legacy mode"; then
     pass "re-init with --profile is rejected with a clear error"
   else
     fail "mismatched re-init not rejected"
@@ -316,7 +316,7 @@ else
   T="$(new_test_dir t6-clear)"
   pushd "$T" >/dev/null
 
-  $CLI init --network testnet --legacy --no-nostr >/dev/null 2>&1 || true
+  $CLI --no-nostr init --network testnet --legacy >/dev/null 2>&1 || true
 
   if grep -q '"storageMode": "legacy"' .sphere-cli/config.json 2>/dev/null; then
     pass "storageMode=legacy before clear"
@@ -324,7 +324,7 @@ else
     fail "setup: storageMode=legacy not recorded"
   fi
 
-  $CLI clear --yes --no-nostr >/dev/null 2>&1 || true
+  $CLI --no-nostr clear --yes >/dev/null 2>&1 || true
 
   if grep -q '"storageMode"' .sphere-cli/config.json 2>/dev/null; then
     fail "storageMode not cleared after clear"
@@ -347,7 +347,7 @@ else
   # Wallet A in legacy mode
   WA="$(new_test_dir t7-wallet-A-legacy)"
   pushd "$WA" >/dev/null
-  $CLI init --network testnet --legacy --no-nostr >/dev/null 2>&1 || true
+  $CLI --no-nostr init --network testnet --legacy >/dev/null 2>&1 || true
   # Would need a funded wallet to actually have tokens. This test just
   # verifies the flow doesn't error; real token transfer is left for
   # integration-level runs with a faucet.
@@ -361,7 +361,7 @@ else
   # Wallet B in profile mode
   WB="$(new_test_dir t7-wallet-B-profile)"
   pushd "$WB" >/dev/null
-  $CLI init --network testnet --profile --no-nostr >/dev/null 2>&1 || true
+  $CLI --no-nostr init --network testnet --profile >/dev/null 2>&1 || true
   if $CLI tokens-export "$WORKSPACE/b-export.uxf" --format uxf 2>&1 | grep -qE "No tokens|Exported"; then
     pass "wallet B tokens-export runs in profile mode"
   else

@@ -974,15 +974,17 @@ describe('detectNoNostrGlobalFlag exact-match contract (F.15 — steelman¹³ cr
     expect(detectNoNostrGlobalFlag(['--no-nostr', 'init'])).toBe(true);
   });
 
-  it('matches post-subcommand bare `--no-nostr` (init-local form, e2e dependency)', () => {
-    // tests/e2e/cli-storage-modes.sh runs:
-    //   init --network testnet --legacy --no-nostr
-    // and depends on no-op transport activation. Exact-match honors
-    // this position.
-    expect(detectNoNostrGlobalFlag(['init', '--no-nostr'])).toBe(true);
+  it('does NOT match post-subcommand `--no-nostr` (F.16 — steelman¹⁴ scope tightening)', () => {
+    // F.15 used full-argv exact match. Steelman¹⁴ caught the bare-form
+    // false positive: `cli send --memo --no-nostr` (memo VALUE = literal
+    // `--no-nostr`) silently activated noNostrGlobal.
+    // F.16 scopes detection to the LEADING global-flag region only.
+    // Operators must use `cli --no-nostr init` (leading) instead of
+    // `cli init --no-nostr`. e2e scripts updated accordingly.
+    expect(detectNoNostrGlobalFlag(['init', '--no-nostr'])).toBe(false);
     expect(
       detectNoNostrGlobalFlag(['init', '--network', 'testnet', '--legacy', '--no-nostr']),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it('does NOT match equals form `--no-nostr=true` (the F.14 regression source)', () => {
@@ -1011,12 +1013,44 @@ describe('detectNoNostrGlobalFlag exact-match contract (F.15 — steelman¹³ cr
     ).toBe(false);
   });
 
-  it('does NOT match other free-text flag value patterns', () => {
+  it('THE F.16 CRITICAL: --memo --no-nostr (bare form free-text value) does NOT activate', () => {
+    // Steelman¹⁴ caught the bare-form false positive that F.15 missed.
+    // `cli send --memo --no-nostr` — the literal token `--no-nostr` is
+    // the VALUE of --memo, not a global flag. F.15's full-argv exact
+    // match returned true here, silently activating no-op transport.
+    // F.16 scopes to leading region only — closes the bug.
+    expect(
+      detectNoNostrGlobalFlag(['send', '--memo', '--no-nostr']),
+    ).toBe(false);
+    expect(
+      detectNoNostrGlobalFlag([
+        'invoice-create',
+        '--target',
+        '@alice',
+        '--memo',
+        '--no-nostr',
+      ]),
+    ).toBe(false);
+    // Same hazard with --mnemonic: operator could have a mnemonic word
+    // sequence ending with `--no-nostr` (extremely unlikely, but the
+    // bug class is identical).
+    expect(
+      detectNoNostrGlobalFlag(['init', '--mnemonic', '--no-nostr']),
+    ).toBe(false);
+  });
+
+  it('does NOT match other free-text flag value patterns (equals OR bare form)', () => {
     expect(
       detectNoNostrGlobalFlag(['send', '--description', '--no-nostr=hi']),
     ).toBe(false);
     expect(
+      detectNoNostrGlobalFlag(['send', '--description', '--no-nostr']),
+    ).toBe(false);
+    expect(
       detectNoNostrGlobalFlag(['payment-request', '--message', '--no-nostr=test']),
+    ).toBe(false);
+    expect(
+      detectNoNostrGlobalFlag(['payment-request', '--message', '--no-nostr']),
     ).toBe(false);
   });
 

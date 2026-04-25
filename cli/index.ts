@@ -647,7 +647,7 @@ const COMMAND_HELP: Record<string, CommandHelp> = {
       { flag: '--nametag <name>', description: 'Register a nametag during initialization (mints on-chain)' },
       { flag: '--legacy', description: 'Use file-based JSON wallet + IPNS sync (pre-UXF format). Default is OrbitDB/Profile.' },
       { flag: '--profile', description: 'Force OrbitDB Profile mode. Requires @orbitdb/core + helia installed.' },
-      { flag: '--no-nostr', description: 'Disable Nostr transport (use no-op transport)' },
+      { flag: '--no-nostr', description: 'GLOBAL flag — must precede subcommand: `cli --no-nostr init`. Disables Nostr transport.' },
     ],
     examples: [
       'npm run cli -- init --network testnet              # default: OrbitDB Profile mode',
@@ -5928,7 +5928,7 @@ interface CompletionCommand {
 
 function getCompletionCommands(): CompletionCommand[] {
   return [
-    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--no-nostr', '--legacy', '--profile'] },
+    { name: 'init', description: 'Create or import wallet', flags: ['--network', '--mnemonic', '--nametag', '--password', '--legacy', '--profile'] },
     { name: 'status', description: 'Show wallet identity' },
     { name: 'config', description: 'Show or set CLI configuration' },
     { name: 'clear', description: 'Delete all wallet data' },

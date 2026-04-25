@@ -391,35 +391,41 @@ export function stripLeadingGlobalFlags(argv: string[]): string[] {
 }
 
 /**
- * Detect the position-agnostic `--no-nostr` global flag.
+ * Detect the `--no-nostr` global flag.
  *
- * Recursive history (steelman⁸ → ¹³):
- *   F.10 used `Array.includes('--no-nostr')` exact-match. Worked for
- *        the legitimate cases (leading and post-subcommand bare form)
- *        but had a known limitation: `init --no-nostr=true` (typo with
- *        equals form) silently no-op'd because exact-match doesn't
- *        recognize the equals form.
- *   F.12 attempted to error LOUDLY on `--no-nostr=anything` anywhere
- *        via a full-argv validator walk. Closed the silent-no-op typo
- *        case but was a latent landmine for any subcommand whose
- *        free-text flag value happened to match the pattern.
- *   F.14 dropped the F.12 walk and changed noNostrGlobal to use
- *        parseFlagToken (recognize `--no-nostr=anything` as flag).
- *        Steelman¹³ caught: this re-creates the F.12 false positive
- *        in a SILENT failure mode — `cli invoice-create --memo
- *        --no-nostr=fake-memo` activates noNostrGlobal=true → Sphere
- *        boots with no-op transport while operator expected real Nostr.
- *        Strictly worse than F.12 (silent failure > loud refusal).
- *   F.15 (this version) reverts to F.10's exact-match semantics. The
- *        `init --no-nostr=true` typo case silently no-op's (the original
- *        known limitation; documented as not-supported). The legitimate
- *        cases (`--no-nostr init`, `init --no-nostr`) work; free-text
- *        flag values like `--memo --no-nostr=fake-memo` do NOT activate.
+ * Recursive history (steelman⁸ → ¹⁴):
+ *   F.10 used `Array.includes('--no-nostr')` exact-match across full
+ *        argv. Position-agnostic by intent; bare-form free-text flag
+ *        values (`cli send --memo --no-nostr`, where the memo VALUE is
+ *        literally `--no-nostr`) silently activated.
+ *   F.11 documented `init --no-nostr=true` (equals-form typo) as a
+ *        silent no-op (not recognized as a flag).
+ *   F.12 added full-argv validator walk to catch `--no-nostr=anything`
+ *        loudly. False positives on legitimate `--memo --no-nostr=fake`.
+ *   F.14 used parseFlagToken in noNostrGlobal — silent failure version
+ *        of the F.12 bug (steelman¹²).
+ *   F.15 reverted to F.10's exact-match across full argv. Steelman¹³
+ *        flagged the equals-form bug in this round. F.15's commit
+ *        message claimed "zero false positives" — but only for the
+ *        equals form. Steelman¹⁴ caught the SAME bug class for the
+ *        bare form (memo value = literal `--no-nostr`).
+ *   F.16 (this version) scopes detection to the LEADING global-flag
+ *        region. Post-subcommand `--no-nostr` is the subcommand's
+ *        own concern, NOT a global signal. Closes ALL free-text-flag
+ *        false-positive shapes (bare AND equals forms) at the cost
+ *        of breaking the documented `init --no-nostr` post-subcommand
+ *        idiom. e2e tests/scripts updated to use leading position.
  *
- * The exact-match contract is intentional and tested. DO NOT switch
- * to parseFlagToken — the steelman¹³ regression is exactly that
- * change.
+ * Operators who want no-op transport must place `--no-nostr` BEFORE
+ * the subcommand name:
+ *   ✓ `cli --no-nostr init`
+ *   ✓ `cli --no-nostr --ipfs-gateway URL pointer flush`
+ *   ✗ `cli init --no-nostr` (no longer activates global no-nostr)
  */
 export function detectNoNostrGlobalFlag(argv: readonly string[]): boolean {
-  return argv.includes('--no-nostr');
+  const end = findLeadingGlobalFlagsEnd(argv);
+  for (let i = 0; i < end; i++) {
+    if (argv[i] === '--no-nostr') return true;
+  }
+  return false;
 }
