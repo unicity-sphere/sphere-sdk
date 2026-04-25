@@ -586,44 +586,80 @@ describe('strict URL validation (F.12 — steelman¹⁰ critical 1)', () => {
   });
 });
 
-describe('boolean=value caught anywhere (F.12 — steelman¹⁰ critical 2)', () => {
-  it('catches `cli init --no-nostr=true` post-subcommand (the F.12 critical)', () => {
-    // Pre-F.12 the validator only walked the leading region, and
-    // `noNostrGlobal = .includes('--no-nostr')` exact-match did NOT
-    // recognize `--no-nostr=true`. Result: silent no-op when operator
-    // expected Nostr disabled. F.12 walks full argv for boolean
-    // equals-form errors.
-    const err = validateLeadingGlobalFlags(['init', '--no-nostr=true']);
+describe('boolean=value: leading rejected, post-subcommand silently accepted (F.14 — steelman¹² fix)', () => {
+  // F.12 had the validator walk the FULL argv looking for boolean
+  // flags with equals form (e.g. `--no-nostr=true`). Steelman¹² caught
+  // a real false-positive: `cli invoice-create --memo --no-nostr=fake`
+  // (legitimate free-text value of --memo) was rejected. F.14 drops
+  // the full-argv walk and instead uses parseFlagToken in noNostrGlobal
+  // detection (see cli/index.ts) so post-subcommand `--no-nostr=true`
+  // is still recognized as Nostr-disabling intent — silently accepted,
+  // not loudly rejected.
+  //
+  // Net behavior:
+  //   --no-nostr=value LEADING        → loud error (validator rejects)
+  //   --no-nostr=value POST-SUBCOMMAND → silently accepted (functional)
+
+  it('LEADING `--no-nostr=true` still loud-errors', () => {
+    const err = validateLeadingGlobalFlags(['--no-nostr=true', 'init']);
     expect(err).not.toBeNull();
     expect(err).toContain('--no-nostr');
     expect(err).toContain('does not take a value');
   });
 
-  it('catches `cli init --network testnet --no-nostr=true` (deeper position)', () => {
-    const err = validateLeadingGlobalFlags([
-      'init',
-      '--network',
-      'testnet',
-      '--no-nostr=true',
-    ]);
-    expect(err).not.toBeNull();
-    expect(err).toContain('--no-nostr');
-    expect(err).toContain('does not take a value');
+  it('POST-SUBCOMMAND `cli init --no-nostr=true` is silently accepted (F.14)', () => {
+    // Pre-F.14: validator threw "does not take a value" — but this
+    // false-positives on `--memo --no-nostr=fake-memo`. F.14 drops the
+    // full-argv walk; functional intent is honored via parseFlagToken
+    // in noNostrGlobal detection.
+    expect(validateLeadingGlobalFlags(['init', '--no-nostr=true'])).toBeNull();
   });
 
-  it('catches `--no-nostr=false` (operator wants ON; not how we work)', () => {
+  it('POST-SUBCOMMAND deeper position is silently accepted', () => {
     expect(
-      validateLeadingGlobalFlags(['init', '--no-nostr=false']),
-    ).toContain('does not take a value');
+      validateLeadingGlobalFlags([
+        'init',
+        '--network',
+        'testnet',
+        '--no-nostr=true',
+      ]),
+    ).toBeNull();
+  });
+
+  it('POST-SUBCOMMAND `--no-nostr=false` is silently accepted', () => {
+    // Per F.14 contract: post-subcommand validation is permissive;
+    // operator typed `=false` thinking it inverts; actual semantics
+    // (Nostr disabled) is set by noNostrGlobal detection regardless.
+    expect(validateLeadingGlobalFlags(['init', '--no-nostr=false'])).toBeNull();
   });
 
   it('still accepts `cli init --no-nostr` (no value, position-agnostic)', () => {
-    // The legitimate post-subcommand boolean usage stays clean.
     expect(validateLeadingGlobalFlags(['init', '--no-nostr'])).toBeNull();
   });
 
   it('still accepts `cli --no-nostr init` (leading boolean, no value)', () => {
     expect(validateLeadingGlobalFlags(['--no-nostr', 'init'])).toBeNull();
+  });
+
+  it('NO false positive on subcommand free-text flag value (the F.14 critical fix)', () => {
+    // Steelman¹² critical: `--memo --no-nostr=fake-memo` is legitimate
+    // for invoice-create (--memo is a free-text flag). F.12's
+    // full-argv walk false-positived. F.14 must not.
+    expect(
+      validateLeadingGlobalFlags([
+        'invoice-create',
+        '--target',
+        '@alice',
+        '--memo',
+        '--no-nostr=fake-memo',
+      ]),
+    ).toBeNull();
+  });
+
+  it('NO false positive on subcommand free-text flag value (--description variant)', () => {
+    expect(
+      validateLeadingGlobalFlags(['send', '--description', '--no-nostr=hi']),
+    ).toBeNull();
   });
 });
 
@@ -702,14 +738,18 @@ describe('missing-authority URL rejection (F.13 — steelman¹¹ critical)', () 
     ).toEqual(['http://gw1', 'https://gw2']);
   });
 
-  it('still accepts forgiving extra-slashes `http:////gw` (URL parser normalizes)', () => {
-    // `http:////gw` matches `^https?://` regex (it has `://` at the
-    // start). `new URL('http:////gw')` produces `http://gw/`. The user
-    // typed extra slashes; the parser is forgiving. fetch() will
-    // normalize correctly when the gateway is used.
+  it('rejects extra-slashes `http:////gw` (F.14 — strict authority required)', () => {
+    // F.13 forgivingly accepted this. F.14 tightens: regex requires a
+    // non-slash char immediately after `://`. Extra slashes promote
+    // path segments to host in URL parsing — surface to operator
+    // rather than silently normalize.
     expect(
-      validateLeadingGlobalFlags(['--ipfs-gateway', 'http:////gw.example.com', 'init']),
-    ).toBeNull();
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http:////gw.example.com',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
   });
 });
 
@@ -727,9 +767,11 @@ describe('error precedence (F.13 — lock in lexical-first ordering)', () => {
     expect(err).not.toContain('does not take a value');
   });
 
-  it('leading bool=value wins over post-subcommand bool=value (both invalid)', () => {
-    // First-loop catches the leading `--no-nostr=true` before walking
-    // the rest.
+  it('leading bool=value rejected; post-subcommand bool=value silently accepted (F.14)', () => {
+    // F.14: only the leading `--no-nostr=leading` is rejected.
+    // Post-subcommand `--no-nostr=trailing` is silently accepted by
+    // the validator (functional intent honored via noNostrGlobal
+    // detection in cli/index.ts using parseFlagToken).
     const err = validateLeadingGlobalFlags([
       '--no-nostr=leading',
       'init',
@@ -738,16 +780,175 @@ describe('error precedence (F.13 — lock in lexical-first ordering)', () => {
     expect(err).toContain("'--no-nostr=leading'");
   });
 
-  it('post-subcommand bool=value caught when no leading errors exist', () => {
-    // First loop returns null (no leading errors); second loop catches
-    // the post-subcommand boolean=value form.
-    const err = validateLeadingGlobalFlags([
-      '--ipfs-gateway',
-      'http://gw1', // valid
-      'init',
-      '--no-nostr=true', // invalid, post-subcommand
-    ]);
-    expect(err).toContain('--no-nostr');
-    expect(err).toContain('does not take a value');
+  it('post-subcommand bool=value silently accepted (F.14 — no full-argv walk)', () => {
+    // Post-F.14: the validator does NOT scan post-subcommand for
+    // boolean=value forms. functional intent is honored via
+    // parseFlagToken in cli/index.ts noNostrGlobal detection.
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://gw1', // valid
+        'init',
+        '--no-nostr=true', // post-subcommand: silently accepted
+      ]),
+    ).toBeNull();
+  });
+});
+
+// ============================================================================
+// Wave F.14 — control-char + 3-slash + userinfo rejection (steelman¹² fixes)
+// ============================================================================
+
+describe('control-char URL rejection (F.14 — steelman¹² critical 1)', () => {
+  // WHATWG URL parser silently strips C0 control chars (CR/LF/TAB)
+  // from URLs. `new URL('http://gw\rextra')` produces host=`gwextra`.
+  // F.13's protocol whitelist + ://-anchor regex didn't catch this —
+  // host shifts silently between operator input and downstream fetch.
+  // F.14 rejects any C0 control or DEL in the entry.
+
+  it('rejects CR (carriage return) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw\rextra', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects LF (newline) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw\nextra', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects TAB in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw\textra', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects NUL byte in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw\x00.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects DEL char (0x7F) in URL', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://gw\x7F.test', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('parser drops control-char entries from comma list', () => {
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway',
+        'http://gw1,http://gw\rinjected,http://gw2',
+        'init',
+      ]),
+    ).toEqual(['http://gw1', 'http://gw2']);
+  });
+});
+
+describe('3-slash path-as-host rejection (F.14 — steelman¹² critical 2)', () => {
+  // `new URL('http:///etc/passwd')` produces host=`etc`, pathname=`/passwd`.
+  // F.13's regex `^https?:\/\//` accepted this. F.14 tightens to
+  // require a non-slash, non-?, non-#, non-whitespace char immediately
+  // after `://`.
+
+  it('rejects `http:///etc/passwd` (file-path-shape promoted to host)', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http:///etc/passwd', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http:///gw.example.com` (extra slash)', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http:///gw.example.com',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http://?query=foo` (query-only no host)', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://?query=foo', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http://#fragment` (fragment-only no host)', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://#fragment', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http:// ` (whitespace as host start)', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http:// gw', 'init']),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('still accepts IPv6 hosts `http://[::1]:8080`', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://[::1]:8080', 'init']),
+    ).toBeNull();
+  });
+
+  it('still accepts IPv4 hosts `http://127.0.0.1:8080`', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'http://127.0.0.1:8080', 'init']),
+    ).toBeNull();
+  });
+
+  it('still accepts mixed-case scheme `HTTPS://GW.example.com`', () => {
+    expect(
+      validateLeadingGlobalFlags(['--ipfs-gateway', 'HTTPS://GW.example.com', 'init']),
+    ).toBeNull();
+  });
+});
+
+describe('userinfo URL rejection (F.14 — steelman¹² warning fix)', () => {
+  // `http://trusted.com@evil.com` → host=`evil.com`, username=`trusted.com`.
+  // Phishing-shaped: substring `trusted.com` is visible but request
+  // routes to `evil.com`. IPFS gateways don't use HTTP basic auth;
+  // reject userinfo unconditionally.
+
+  it('rejects `http://trusted.com@evil.com` (phishing-shaped)', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://trusted.com@evil.com',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http://user:pass@gw.example.com` (basic auth)', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://user:pass@gw.example.com',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('rejects `http://user@gw.example.com` (username-only)', () => {
+    expect(
+      validateLeadingGlobalFlags([
+        '--ipfs-gateway',
+        'http://user@gw.example.com',
+        'init',
+      ]),
+    ).toContain('not a valid http(s) URL');
+  });
+
+  it('parser drops userinfo entries from comma list', () => {
+    expect(
+      parseIpfsGatewayOverride([
+        '--ipfs-gateway',
+        'http://gw1,http://user@evil.com,http://gw2',
+        'init',
+      ]),
+    ).toEqual(['http://gw1', 'http://gw2']);
   });
 });

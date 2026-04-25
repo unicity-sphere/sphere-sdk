@@ -61,7 +61,7 @@ export const BOOLEAN_GLOBAL_FLAGS: ReadonlySet<string> = new Set([
  * Tokens that don't start with `--` are returned with `name=tok` and
  * no inline value — caller is responsible for the leading-`--` check.
  */
-function parseFlagToken(tok: string): { name: string; inlineValue: string | undefined } {
+export function parseFlagToken(tok: string): { name: string; inlineValue: string | undefined } {
   if (!tok.startsWith('--')) return { name: tok, inlineValue: undefined };
   const eqIdx = tok.indexOf('=');
   if (eqIdx > 2) {
@@ -90,34 +90,47 @@ function isUsableSpaceSeparatedValue(value: string | undefined): boolean {
  * Strict gateway URL validator.
  *
  * Recursive history:
- *   F.11 used `entry.includes('://')` — too permissive: accepted
- *        `=http://gw1` (from `--ipfs-gateway==http://gw1` double equals)
- *        and any non-http(s) scheme that contains `://`.
- *   F.12 switched to `new URL(entry)` + protocol whitelist — caught
- *        the F.11 issues but introduced a NEW one: WHATWG URL parsing
- *        treats `http:` as a "special" scheme, so `new URL('http:foo')`,
- *        `new URL('http:/gw')`, and friends succeed (parser interprets
- *        the rest as host or path). Steelman¹¹ caught this — F.11's
- *        `://` check would have rejected these.
- *   F.13 (this version) requires BOTH:
- *        (a) the original entry literally starts with `http://` or
- *            `https://` (case-insensitive); rejects scheme-only forms
- *            without authority delimiter.
- *        (b) `new URL(entry)` succeeds with the authority producing a
- *            non-empty host.
- *        (c) protocol is http: or https:.
+ *   F.11 used `entry.includes('://')` — too permissive.
+ *   F.12 switched to `new URL(entry)` + protocol whitelist — closed
+ *        F.11 issues but accepted `http:foo` (no `//`).
+ *   F.13 added regex pre-check `^https?://` — closed F.12 missing-
+ *        authority hole but `^https?:\/\//` was still loose: third
+ *        char could be `/`/`?`/`#` and `new URL()` silently absorbed
+ *        embedded CR/LF/TAB to shift the host.
+ *   F.14 (this version, steelman¹²) closes:
+ *        (a) `http:///etc/passwd` → host=`etc` (3-slash promotes path
+ *            segment to host). Tightened regex to require a non-slash,
+ *            non-?, non-#, non-whitespace character immediately after
+ *            `://`.
+ *        (b) `http://gw\rextra` → host=`gwextra` (WHATWG URL parser
+ *            silently strips C0 control chars; downstream `fetch`
+ *            normalizes to a different host than the operator typed).
+ *            Reject any C0 control char or DEL in the entry.
+ *        (c) `http://trusted.com@evil.com` → host=`evil.com` (userinfo
+ *            silently swallowed). IPFS gateways don't use HTTP basic
+ *            auth; reject userinfo to prevent phishing-shaped values.
  *
  * IPFS gateways are HTTP(S) URLs of the form `scheme://host[:port][/path]`.
  * Anything else is rejected loudly.
  */
 function isValidGatewayUrl(entry: string): boolean {
-  // F.13: require literal `://` (catches `http:foo`, `http:/gw`,
-  // `=http://gw`, etc. that WHATWG-permissively accepts as URLs).
-  if (!/^https?:\/\//i.test(entry)) return false;
+  // F.14: reject C0 controls + DEL — WHATWG URL parser silently absorbs
+  // CR/LF/TAB and shifts the host invisibly. The control-char regex is
+  // intentional; the lint rule is meant for accidental binary noise.
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1F\x7F]/.test(entry)) return false;
+  // F.14: require literal `://` followed immediately by a non-slash,
+  // non-?, non-#, non-whitespace char — the start of the host. This
+  // catches `http:foo` (F.13), `http:///path` (3-slash path promoted
+  // to host, F.14), `http://?query`, `http://#frag`, and `http://`+ws.
+  if (!/^https?:\/\/[^/?#\s]/i.test(entry)) return false;
   try {
     const url = new URL(entry);
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
-    if (url.host === '') return false; // defensive: `http://` alone
+    if (url.host === '') return false; // defensive: scanner already covers
+    // F.14: reject userinfo. IPFS gateways are public HTTP endpoints;
+    // `http://trusted.com@evil.com` shape is phishing-prone.
+    if (url.username !== '' || url.password !== '') return false;
     return true;
   } catch {
     return false;
@@ -266,23 +279,18 @@ export function validateLeadingGlobalFlags(argv: readonly string[]): string | nu
     // Unknown leading flag — not our concern; downstream handles it.
     break;
   }
-  // F.12: walk FULL argv for boolean global flags with equals form.
-  // Booleans are position-agnostic by design (e.g., `init --no-nostr`
-  // is the documented init-local form), but they STILL never take a
-  // value. Pre-F.12 the validator only walked the leading region, so
-  // `cli init --no-nostr=true` was silently accepted by validation
-  // and then silently DROPPED by `noNostrGlobal = .includes('--no-nostr')`
-  // (exact-string match doesn't catch `--no-nostr=true`). Steelman¹⁰
-  // critical: operators expecting Nostr disabled got real Nostr.
-  // F.12 catches this loudly anywhere in argv.
-  for (let j = i; j < argv.length; j++) {
-    const tok = argv[j];
-    if (!tok.startsWith('--')) continue;
-    const { name, inlineValue } = parseFlagToken(tok);
-    if (BOOLEAN_GLOBAL_FLAGS.has(name) && inlineValue !== undefined) {
-      return `${name} does not take a value (got '${tok}').`;
-    }
-  }
+  // F.14 (steelman¹²): the F.12 full-argv boolean walk was REMOVED.
+  // It produced false positives on legitimate subcommand invocations
+  // like `cli invoice-create --memo --no-nostr=fake-memo` where the
+  // value of a free-text subcommand flag happens to match the
+  // `--no-nostr=...` pattern. The legitimate-no-op concern that
+  // motivated the F.12 walk (`cli init --no-nostr=true` silently
+  // failing) is addressed instead by `noNostrGlobal` detection in
+  // cli/index.ts which now uses parseFlagToken so post-subcommand
+  // `--no-nostr=anything` is recognized as Nostr-disabling intent.
+  // Tradeoff: lose the loud-error UX for typos in post-subcommand
+  // position; gain zero false positives across all current and
+  // future subcommands' free-text flag values.
   return null;
 }
 

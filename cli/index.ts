@@ -18,6 +18,7 @@ import { generateAddressFromMasterKey } from '../l1/address';
 import { Sphere } from '../core/Sphere';
 import { createNodeProviders } from '../impl/nodejs';
 import {
+  parseFlagToken,
   parseIpfsGatewayOverride as parseIpfsGatewayOverrideFromArgv,
   stripLeadingGlobalFlags,
   validateLeadingGlobalFlags,
@@ -1790,7 +1791,21 @@ async function main() {
   // Contrast with `--ipfs-gateway`, which has NO subcommand-local
   // meaning — `parseIpfsGatewayOverride` is leading-only and warns
   // when the flag is misplaced.
-  noNostrGlobal = _globalFlagPreStrip.includes('--no-nostr');
+  //
+  // F.14: use parseFlagToken so post-subcommand `--no-nostr=anything`
+  // (any equals form) is recognized as Nostr-disabling intent. Pre-F.14
+  // `Array.includes('--no-nostr')` exact-match did NOT recognize
+  // `--no-nostr=true`, leading to silent no-op when operator typed
+  // `cli init --no-nostr=true`. F.12 had attempted to fix this with a
+  // loud-error full-argv validator walk, but that produced false
+  // positives on legitimate `--memo --no-nostr=fake-memo` (steelman¹²).
+  // F.14 strikes a middle ground: silently accept any `--no-nostr=...`
+  // form post-subcommand (functional intent honored, no false
+  // positives), still error loudly on `--no-nostr=...` in leading
+  // position via validateLeadingGlobalFlags.
+  noNostrGlobal = _globalFlagPreStrip.some(
+    (tok) => parseFlagToken(tok).name === '--no-nostr',
+  );
 
   if (!command || command === '--help' || command === '-h') {
     printUsage();
