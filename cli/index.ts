@@ -17,6 +17,10 @@ import { getPublicKey } from '../core/crypto';
 import { generateAddressFromMasterKey } from '../l1/address';
 import { Sphere } from '../core/Sphere';
 import { createNodeProviders } from '../impl/nodejs';
+import {
+  parseIpfsGatewayOverride as parseIpfsGatewayOverrideFromArgv,
+  stripLeadingGlobalFlags,
+} from './global-flags';
 import { TokenRegistry } from '../registry/TokenRegistry';
 import { TokenValidator } from '../validation/token-validator';
 import { tokenToTxf } from '../serialization/txf-serializer';
@@ -25,54 +29,40 @@ import type { TransportProvider } from '../transport/transport-provider';
 import type { ProviderStatus } from '../types';
 
 const args = process.argv.slice(2);
-// Wave F.5/F.9: strip GLOBAL flags from the args array so the
+// Wave F.5/F.9/F.10: strip GLOBAL flags from the args array so the
 // subcommand name resolves correctly regardless of flag position.
-// Steelman⁷ caught two issues with the F.5 strip:
-//   (a) only --ipfs-gateway was stripped — --no-nostr was NOT, so
-//       prologue-style `--no-nostr init` invocations failed with
-//       "Unknown command: --no-nostr". This broke every implemented
-//       N-script (N1, N2, N5, N13, N14).
-//   (b) the strip walked the WHOLE argv, mangling subcommand args
-//       that legitimately contained `--ipfs-gateway` as a value.
 //
-// Fix: strip only the LEADING flag region (args before the first
-// non-flag token). Subcommand-internal flags are left alone.
+// History (Steelman rounds 7 → 8):
+//   F.5  introduced --ipfs-gateway and a strip that walked the whole
+//        argv. This mangled subcommand args that legitimately contained
+//        `--ipfs-gateway` as a value (e.g., a token-name arg).
+//   F.9  narrowed the strip to the LEADING flag region (args before the
+//        first non-flag token) and added --no-nostr handling. This fixed
+//        the prologue-style `--no-nostr init` invocations used by every
+//        N-script (N1, N2, N5, N13, N14).
+//   F.10 (this commit) extracts a single source of truth —
+//        `findLeadingGlobalFlagsEnd` — used by the strip,
+//        parseIpfsGatewayOverride, and noNostrGlobal detection. Adds a
+//        loud warning when --ipfs-gateway is placed AFTER the subcommand
+//        (silently dropped post-F.9) so out-of-tree callers that relied
+//        on the F.5 full-argv scan are not surprised.
 //
 // `_globalFlagPreStrip` is the snapshot read by parsers that need to
 // see the original flag values (e.g., parseIpfsGatewayOverride); the
 // live `args` array has them removed.
+//
+// The leading-region scanner, the strip, and the value parser all live
+// in `cli/global-flags.ts` so the contract can be exercised by unit
+// tests (`tests/unit/cli/global-flags.test.ts`).
+//
+// CONTRACT: any new value-bearing global flag MUST be added to
+// `VALUE_BEARING_GLOBAL_FLAGS` in `cli/global-flags.ts`, and any new
+// boolean global flag MUST be added to `BOOLEAN_GLOBAL_FLAGS`.
+// Otherwise the leading-region scanner stops at the unknown flag and
+// downstream code sees it either as `--help` (handled) or "Unknown
+// command" (rejected).
 const _globalFlagPreStrip = [...args];
-{
-  // Identify the leading flag region: args[0..k) where every entry
-  // either starts with `--` (a flag) OR is the value of the
-  // immediately-preceding flag. The first entry that isn't either
-  // is the subcommand.
-  const VALUE_BEARING_GLOBAL_FLAGS = new Set(['--ipfs-gateway']);
-  const stripped: string[] = [];
-  let i = 0;
-  while (i < args.length) {
-    const tok = args[i];
-    if (!tok.startsWith('--')) break; // first non-flag = subcommand
-    if (VALUE_BEARING_GLOBAL_FLAGS.has(tok) && i + 1 < args.length && !args[i + 1].startsWith('--')) {
-      // Skip flag + value (don't add to stripped — we're removing them).
-      i += 2;
-      continue;
-    }
-    if (tok === '--no-nostr') {
-      // Boolean global flag — remove from args; presence is detected
-      // separately via _globalFlagPreStrip.includes('--no-nostr').
-      i++;
-      continue;
-    }
-    // Unknown leading flag — leave in place (e.g. --help). Stop the
-    // strip so we don't accidentally swallow tokens past it.
-    stripped.push(tok);
-    i++;
-    break;
-  }
-  // Rebuild args with the unrecognized-leading-flag prefix + the rest.
-  args.splice(0, i, ...stripped);
-}
+stripLeadingGlobalFlags(args);
 const command = args[0];
 
 // =============================================================================
@@ -341,28 +331,13 @@ function createNoopTransport(): TransportProvider {
  * non-default gateway list.
  */
 function parseIpfsGatewayOverride(argv: readonly string[]): string[] {
-  const gateways: string[] = [];
-  // Wave F.9: scan only the leading global-flag region. Stop at the
-  // first non-flag token (the subcommand). Avoids colliding with a
-  // subcommand-internal token that happens to spell `--ipfs-gateway`.
-  for (let i = 0; i < argv.length; i++) {
-    const tok = argv[i];
-    if (!tok.startsWith('--')) break; // subcommand starts here
-    if (tok === '--ipfs-gateway' && i + 1 < argv.length && !argv[i + 1].startsWith('--')) {
-      const raw = argv[i + 1];
-      for (const entry of raw.split(',')) {
-        const trimmed = entry.trim().replace(/\/+$/, '');
-        if (trimmed.length > 0) gateways.push(trimmed);
-      }
-      i++; // skip value
-      continue;
-    }
-    if (tok === '--no-nostr') continue; // boolean global flag
-    // Unknown leading flag — stop scan to avoid swallowing past
-    // tokens that we don't recognize.
-    break;
-  }
-  return gateways;
+  return parseIpfsGatewayOverrideFromArgv(argv, () => {
+    console.error(
+      '[sphere-cli] warning: --ipfs-gateway must precede the subcommand. ' +
+        'Subcommand-internal occurrence ignored. ' +
+        'Move it before the subcommand to apply the override.',
+    );
+  });
 }
 
 async function getSphere(options?: {
@@ -1790,8 +1765,20 @@ Examples:
 
 async function main() {
   // Global flag: --no-nostr disables Nostr transport (uses no-op).
-  // Read from the pre-strip snapshot — the live `args` array had it
-  // removed by the leading-flag stripper at module load.
+  //
+  // Position-agnostic by design (Wave F.10 documentation):
+  //   `--no-nostr` is BOTH a leading global flag AND a subcommand-local
+  //   flag (declared on `init` in the help table at line ~5961). It
+  //   means "use no-op transport for this invocation" regardless of
+  //   placement. Steelman⁸ flagged the position-agnostic detection as a
+  //   subtle inconsistency vs. the leading-only strip, but the dual
+  //   semantics are intentional — see tests/e2e/cli-storage-modes.sh
+  //   which invokes `init --network testnet --legacy --no-nostr`
+  //   (post-subcommand) and depends on no-op transport activation.
+  //
+  // Contrast with `--ipfs-gateway`, which has NO subcommand-local
+  // meaning — `parseIpfsGatewayOverride` is leading-only and warns
+  // when the flag is misplaced.
   noNostrGlobal = _globalFlagPreStrip.includes('--no-nostr');
 
   if (!command || command === '--help' || command === '-h') {
