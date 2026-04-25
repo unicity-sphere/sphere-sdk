@@ -110,14 +110,19 @@ export class ProfilePointerLayer {
 
   constructor(init: ProfilePointerLayerInit) {
     this.#init = init;
-    // Steelman remediation: clone + freeze so post-construction mutation
-    // of `init.config.allowOperatorOverrides = true` does not bypass the
-    // production guard below. Previously the constructor stored the
-    // caller's reference directly, letting operator-override APIs
-    // (clearBlocked / acceptCarLoss / clearPendingMarker /
-    // acceptCorruptStreak) be enabled at runtime in production builds.
+    // Steelman² remediation: extract just the known boolean fields
+    // into a normalized frozen snapshot. Previous fix used spread +
+    // Object.freeze, which is SHALLOW — a future config schema with
+    // nested objects (e.g. `{ gateways: { trusted: [...] } }`) would
+    // silently re-introduce the post-construction-mutation bug for
+    // nested fields. Normalizing to known fields with `=== true`
+    // coercion also defensively rejects truthy non-boolean values
+    // (e.g., `'yes'`, `1`) which could otherwise sneak through.
     const suppliedConfig: PointerLayerConfig = init.config ?? {};
-    this.#config = Object.freeze({ ...suppliedConfig });
+    this.#config = Object.freeze({
+      allowOperatorOverrides: suppliedConfig.allowOperatorOverrides === true,
+      allowUnverifiedOverride: suppliedConfig.allowUnverifiedOverride === true,
+    });
     // T-E26 production guard runs at init.
     assertConfigCapabilities(this.#config);
   }

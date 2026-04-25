@@ -54,19 +54,45 @@ const registry = new WeakSet<MasterPrivateKey>();
  * createMasterPrivateKey time fails closed before HKDF can derive a
  * deterministic, attacker-known pointer secret that would collide
  * across wallets sharing the same weak seed.
+ *
+ * Steelman² remediation: the denylist is stored as BYTES, not as a
+ * hex Set. The previous hex-Set approach computed
+ * `bytesToLowerHex(masterKeyBytes)` on every construction — building a
+ * 64-character immutable string of the master key on the heap. JS
+ * strings are immutable; `.fill(0)` does not exist for strings. That
+ * inadvertently leaked every master key as a heap-resident hex string
+ * via the very guard intended to protect it.
+ *
+ * Byte comparison is straightforward (denylist values are PUBLIC; only
+ * the test "is this MY key denylisted?" can hit them). No hex string
+ * is ever materialized for legitimate keys.
  */
-const WEAK_KEY_DENYLIST_HEXES: ReadonlySet<string> = new Set([
-  // All-zero and all-FF bit patterns — structurally invalid secp256k1
-  // scalars; HKDF would process them regardless, producing a
-  // deterministic pointer secret that collides across every wallet
-  // sharing the same trivial seed.
-  '0000000000000000000000000000000000000000000000000000000000000000',
-  'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-  // secp256k1 curve order N — not a valid scalar (identity result).
-  'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141',
-  // N-1, N+1 (mod p adjacent; structurally suspicious).
-  'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140',
-  'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142',
+const WEAK_KEY_DENYLIST_BYTES: ReadonlyArray<Uint8Array> = Object.freeze([
+  // All-zero — structurally invalid secp256k1 scalar.
+  new Uint8Array(32),
+  // All-FF.
+  new Uint8Array(32).fill(0xff),
+  // secp256k1 curve order N.
+  new Uint8Array([
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
+    0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+  ]),
+  // N-1.
+  new Uint8Array([
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
+    0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x40,
+  ]),
+  // N+1.
+  new Uint8Array([
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
+    0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x42,
+  ]),
   // NOTE: the canonical 0x01×32 KAT vector is intentionally NOT on the
   // denylist. It is a valid secp256k1 scalar and the pointer-layer
   // HKDF KAT suite depends on it. Users generating keys from proper
@@ -74,16 +100,19 @@ const WEAK_KEY_DENYLIST_HEXES: ReadonlySet<string> = new Set([
   // accident (probability ~2^-256).
 ]);
 
-function bytesToLowerHex(bytes: Uint8Array): string {
-  let hex = '';
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, '0');
-  }
-  return hex;
-}
-
 function isDenylistedMasterKey(bytes: Uint8Array): boolean {
-  return WEAK_KEY_DENYLIST_HEXES.has(bytesToLowerHex(bytes));
+  if (bytes.length !== 32) return false;
+  for (const candidate of WEAK_KEY_DENYLIST_BYTES) {
+    let match = true;
+    for (let i = 0; i < 32; i++) {
+      if (bytes[i] !== candidate[i]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
 }
 
 /**

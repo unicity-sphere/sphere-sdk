@@ -34,6 +34,7 @@ import type {
   UxfInstanceKind,
 } from './types.js';
 import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
+import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
 
@@ -152,6 +153,24 @@ function uint8ArrayToHex(bytes: Uint8Array): string {
  * @returns A JSON string representation.
  */
 export function packageToJson(pkg: UxfPackageData): string {
+  // Steelman² remediation: refuse to serialize a package whose
+  // manifest head is a Rule 4 ENRICHED_SYNTHETIC_KIND token-root.
+  // Synthetic roots are ephemeral merge artifacts; persisting them
+  // via JSON (storage-adapters, network exchange) lets downstream
+  // peers ingest forged-looking signed roots — same threat model as
+  // exportToCar's guard. Both paths now share the same gate.
+  for (const [tokenId, rootHash] of pkg.manifest.tokens) {
+    const rootEl = pkg.pool.get(rootHash);
+    if (rootEl && rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
+      throw new UxfError(
+        'VERIFICATION_FAILED',
+        `Refusing to serialize package with synthetic (Rule 4 enriched) manifest head ` +
+          `for token ${tokenId} (rootHash=${rootHash}). Finalize the merge first: ` +
+          `resolve the synthetic to a signed root or remove the token from the manifest.`,
+      );
+    }
+  }
+
   const envelope = pkg.envelope;
 
   // -- metadata --

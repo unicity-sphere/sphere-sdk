@@ -201,10 +201,13 @@ async function fetchFileFromIpfs(
 
   for (const gateway of gateways) {
     try {
-      // Steelman remediation: enforce Content-Length cap BEFORE
-      // buffering the body. Without this, a malicious gateway can
-      // stream gigabytes and OOM before the post-buffer check fires.
-      // We use fetch + streaming read up to `maxSizeBytes`.
+      // Steelman² remediation: stream the body with a STREAMING cap.
+      // Previous fix only checked Content-Length when present and
+      // honestly declared; a gateway omitting CL or sending CL=0 then
+      // streaming gigabytes bypassed that gate (response.arrayBuffer()
+      // is unbounded). We now read chunk-by-chunk and abort the moment
+      // the running total exceeds maxSizeBytes — closing the OOM
+      // window for missing/lying CL entirely.
       const url = `${gateway.replace(/\/$/, '')}/ipfs/${cid}`;
       const response = await fetch(url, {
         headers: { Accept: 'application/octet-stream' },
@@ -214,21 +217,20 @@ async function fetchFileFromIpfs(
         lastError = new Error(`HTTP ${response.status} from ${gateway}`);
         continue;
       }
-      const declaredLen = Number(response.headers.get('content-length') ?? '0');
+      // Defense-in-depth Content-Length pre-check (when honestly declared).
+      const declaredLen = Number(response.headers.get('content-length') ?? '');
       if (Number.isFinite(declaredLen) && declaredLen > maxSizeBytes) {
         lastError = new Error(
           `Content-Length ${declaredLen} exceeds cap ${maxSizeBytes} from ${gateway}`,
         );
         continue;
       }
-      const buffer = await response.arrayBuffer();
-      if (buffer.byteLength > maxSizeBytes) {
-        throw new ProfileError(
-          'BUNDLE_NOT_FOUND',
-          `Legacy snapshot ${buffer.byteLength} bytes exceeds limit ${maxSizeBytes} from ${gateway}`,
-        );
+      // Streaming read with running cap.
+      const bytes = await readStreamWithLimitLocal(response, maxSizeBytes, gateway);
+      if (bytes === null) {
+        // Cap exceeded mid-stream; recorded as lastError; try next gateway.
+        continue;
       }
-      const bytes = new Uint8Array(buffer);
 
       // Steelman remediation: content-address verify when we can.
       if (isRawCodec) {
@@ -260,6 +262,59 @@ async function fetchFileFromIpfs(
     `Legacy snapshot fetch failed on all gateways: ${lastError?.message ?? 'unknown'}`,
     lastError,
   );
+}
+
+/**
+ * Read a Response body via a streaming reader, aborting the moment the
+ * running total exceeds `maxBytes`. Returns the assembled Uint8Array
+ * on success, or `null` if the cap was breached (caller falls through
+ * to next gateway).
+ *
+ * Closure over `lastError` would leak across gateway iterations; we
+ * use an outer reference passed via the `gateway` label for messages.
+ *
+ * Steelman² remediation: gateway-omitted Content-Length cannot OOM
+ * the wallet — the stream is bounded by `maxBytes` regardless of
+ * declared size.
+ */
+async function readStreamWithLimitLocal(
+  response: Response,
+  maxBytes: number,
+  gateway: string,
+): Promise<Uint8Array | null> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    // Body is not a stream — fall back to arrayBuffer (with post-buffer cap).
+    const buffer = await response.arrayBuffer();
+    if (buffer.byteLength > maxBytes) {
+      void gateway;
+      return null;
+    }
+    return new Uint8Array(buffer);
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch { /* noop */ }
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* noop */ }
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 /**

@@ -276,11 +276,20 @@ export class NostrReplicationBridge {
       const onMessage = (msg: MessageEvent) => {
         if (settled) return;
 
-        // Steelman remediation: enforce message-size cap BEFORE parsing.
-        // A malicious relay could deliver multi-MB JSON, forcing
-        // JSON.parse to allocate the full structure before the typecheck
-        // drops it — repeated, this OOMs the wallet.
-        const raw = String(msg.data);
+        // Steelman² remediation: cap BEFORE coercion to string. The
+        // previous String(msg.data) eagerly allocated a string copy
+        // of the entire payload (UTF-8 decoding for Buffer/ArrayBuffer)
+        // BEFORE the size cap fired — a 10MB binary frame already
+        // allocated 10MB of string by the time we checked.
+        const data = msg.data;
+        if (typeof data === 'string') {
+          if (data.length > MAX_MESSAGE_BYTES) return;
+        } else if (data instanceof ArrayBuffer) {
+          if (data.byteLength > MAX_MESSAGE_BYTES) return;
+        } else if (typeof Buffer !== 'undefined' && data instanceof Buffer) {
+          if (data.length > MAX_MESSAGE_BYTES) return;
+        }
+        const raw = typeof data === 'string' ? data : String(data);
         if (raw.length > MAX_MESSAGE_BYTES) return;
 
         let parsed: unknown[];
@@ -403,9 +412,23 @@ export class NostrReplicationBridge {
 
       const onMessage = (msg: MessageEvent) => {
         if (settled) return;
+        // Steelman² remediation: same size cap as fetchMissedEntries.
+        // A malicious relay could spam multi-MB OK frames while we
+        // wait for the genuine OK; without the cap this OOMs the
+        // wallet. Reject oversized frames at parse time.
+        const data = msg.data;
+        if (typeof data === 'string') {
+          if (data.length > MAX_MESSAGE_BYTES) return;
+        } else if (data instanceof ArrayBuffer) {
+          if (data.byteLength > MAX_MESSAGE_BYTES) return;
+        } else if (typeof Buffer !== 'undefined' && data instanceof Buffer) {
+          if (data.length > MAX_MESSAGE_BYTES) return;
+        }
+        const raw = typeof data === 'string' ? data : String(data);
+        if (raw.length > MAX_MESSAGE_BYTES) return;
         let parsed: unknown[];
         try {
-          parsed = JSON.parse(String(msg.data));
+          parsed = JSON.parse(raw);
         } catch {
           return;
         }

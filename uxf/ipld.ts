@@ -33,6 +33,7 @@ import type {
   UxfInstanceKind,
 } from './types.js';
 import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
+import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
 import {
   computeElementHash,
@@ -192,7 +193,10 @@ export async function exportToCar(pkg: UxfPackageData): Promise<Uint8Array> {
   // the affected token). See uxf/token-join.ts `ENRICHED_SYNTHETIC_KIND`.
   for (const [tokenId, rootHash] of pkg.manifest.tokens) {
     const rootEl = pkg.pool.get(rootHash);
-    if (rootEl && rootEl.header.kind === 'enriched-synthetic') {
+    // Steelman² remediation: import the constant rather than hardcode
+    // the string literal. A future rename would otherwise silently
+    // break the guard.
+    if (rootEl && rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
       throw new UxfError(
         'VERIFICATION_FAILED',
         `Refusing to export package with synthetic (Rule 4 enriched) manifest head ` +
