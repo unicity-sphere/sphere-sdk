@@ -5747,11 +5747,26 @@ async function main() {
             // Force a pointer publish by running a save through the
             // token storage provider. Useful for tests and operator
             // smoke-checks — does not take an argument.
+            //
+            // Wave F.2 architecture advisory MEDIUM remediation: error
+            // out explicitly when no token storage providers are
+            // initialized rather than printing a misleading
+            // "Flush complete" with only a probe fingerprint. Previously
+            // a fresh wallet with no providers silently skipped the
+            // publish path entirely while the success message implied
+            // the round-trip ran.
             const providers = sphere.payments?.getTokenStorageProviders?.();
-            if (providers && typeof providers.size === 'number' && providers.size > 0) {
-              // Trigger the save chain; flushToIpfs awaits the pointer publish.
-              await (sphere.payments as unknown as { save?: () => Promise<void> }).save?.();
+            if (!providers || typeof providers.size !== 'number' || providers.size === 0) {
+              console.error(
+                'pointer flush: no token storage providers are initialized. ' +
+                  'The save → pin → publish round-trip cannot run on an empty wallet. ' +
+                  'Initialize at least one address (e.g. via `init` or `address create`) ' +
+                  'before invoking flush.',
+              );
+              process.exit(1);
             }
+            // Trigger the save chain; flushToIpfs awaits the pointer publish.
+            await (sphere.payments as unknown as { save?: () => Promise<void> }).save?.();
             const fp = await pointer.getProbeFingerprint();
             console.log(`Flush complete. Probe fingerprint: ${fp || '(none yet)'}.`);
             break;

@@ -92,6 +92,26 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
   const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
   const walkbackLimit = input.walkbackLimit ?? DISCOVERY_CORRUPT_WALKBACK;
 
+  // Wave F.2 security advisory MEDIUM-2 remediation: assert currentLocalVersion
+  // is within the discovery search space. A locally-corrupted cache that
+  // wrote `localVersion >= DISCOVERY_HARD_CEILING` would force Phase 1 to
+  // probe at-or-above the ceiling on the very first iteration, leaking
+  // information through the noisy probe pattern. Fail-fast with PROTOCOL_ERROR
+  // so storage corruption surfaces clearly instead of as an opaque
+  // DISCOVERY_OVERFLOW.
+  if (
+    !Number.isInteger(currentLocalVersion) ||
+    currentLocalVersion < 0 ||
+    currentLocalVersion >= DISCOVERY_HARD_CEILING
+  ) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `Discovery: currentLocalVersion=${currentLocalVersion} is outside [0, ${DISCOVERY_HARD_CEILING}). ` +
+        `Local cache likely corrupted. Run \`pointer recover\` after investigating storage integrity.`,
+      { currentLocalVersion, hardCeiling: DISCOVERY_HARD_CEILING },
+    );
+  }
+
   const probeVersions: PointerVersion[] = [];
   const probeAndRecord = async (v: PointerVersion): Promise<boolean> => {
     probeVersions.push(v);

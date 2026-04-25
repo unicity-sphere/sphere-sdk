@@ -115,15 +115,16 @@ export type SubmitOutcome =
    * (Steelman² fix: previously this distinction was lost in the
    * combined outcome.)
    *
-   * Steelman³ remediation: the field is OPTIONAL to preserve
-   * backwards compatibility for external consumers who construct
-   * SubmitOutcome literals (e.g., for testing). When `undefined`,
-   * `publish-algorithm.ts`'s `=== 'success'` check fails closed —
-   * the hint is NOT escalated. Internal calls from combineOutcomes
-   * always set the field; only externally-constructed values may
-   * omit it. Treat absent as "do not escalate."
+   * Wave F.2 architecture advisory MEDIUM remediation: the field is
+   * REQUIRED. The optional-field design from Steelman³ existed only
+   * to preserve backwards compatibility for external test fixtures
+   * constructing SubmitOutcome literals — but optional was a brittle
+   * compromise that invited silent "fail-open if undefined" reasoning
+   * in future refactors. Internal callers (combineOutcomes) always
+   * set it; external consumers must too. The change is type-only
+   * (TS-level breaking change) — runtime semantics unchanged.
    */
-  | { readonly kind: 'retry_side'; readonly side: Side; readonly committedSideKind?: 'success' | 'exists' }
+  | { readonly kind: 'retry_side'; readonly side: Side; readonly committedSideKind: 'success' | 'exists' }
   /** Row 8: both network error → retry whole publish. */
   | { readonly kind: 'retry_both' }
   /** Rows 10, 13: HTTP 429/503+Retry-After or -32006 → honor delay, no retry-budget burn. */

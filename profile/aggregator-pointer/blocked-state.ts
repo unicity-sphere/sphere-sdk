@@ -35,6 +35,16 @@ export type BlockedReason =
   | 'rejected';
 
 /**
+ * Wave F.2 security advisory MEDIUM-3 remediation: typed network-error
+ * category attached to error.details. Throw sites that produce
+ * NETWORK_ERROR can SET this field directly with the canonical category;
+ * the classifier uses it preferentially over substring matching of
+ * error messages. Substring matching is preserved as a fallback for
+ * raw Node.js errors and pre-existing throws that don't yet annotate.
+ */
+export type NetworkErrorCategory = 'network_timeout' | 'dns_failure' | 'tls_failure';
+
+/**
  * Classify an error into a BlockedReason, or null if the error does not
  * trigger the BLOCKED state.
  *
@@ -59,7 +69,13 @@ export function classifyBlockedReason(err: unknown): BlockedReason | null {
         // signing-service bug, or aggregator reconfiguration).
         return 'rejected';
       case AggregatorPointerErrorCode.NETWORK_ERROR: {
-        // Sub-classify by error message heuristics (§10.2.2 categorical).
+        // Wave F.2 MEDIUM-3: prefer the structured `category` field
+        // when the throw site annotated the error. Falls back to
+        // substring heuristics otherwise.
+        const cat = (err.details as { category?: unknown } | undefined)?.category;
+        if (cat === 'network_timeout' || cat === 'dns_failure' || cat === 'tls_failure') {
+          return cat;
+        }
         const msg = err.message.toLowerCase();
         if (msg.includes('timeout') || msg.includes('timed out')) return 'network_timeout';
         if (msg.includes('dns') || msg.includes('enotfound') || msg.includes('getaddrinfo'))
