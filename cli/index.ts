@@ -78,17 +78,36 @@ const args = process.argv.slice(2);
 // invoking via symlink (npm-link layouts, monorepos, dev tools) silently
 // exited 0 with no output — the worst failure mode. Fix: realpath both
 // sides, compare resolved paths.
+//
+// F.20 (steelman¹⁷): emit a stderr breadcrumb on `realpathSync` failure
+// instead of swallowing silently. Edge cases where realpath throws
+// (ENOENT/EACCES/ELOOP/missing argv[1]) historically resolved to
+// `isCliEntryPoint = false` → silent exit 0 with no output, identical
+// to F.18's symlink failure pathology that motivated F.19. The
+// breadcrumb gives operators a diagnostic without changing semantics.
 const isCliEntryPoint: boolean = (() => {
   try {
     if (!process.argv[1]) return false;
     const moduleRealPath = fs.realpathSync(fileURLToPath(import.meta.url));
     const entryRealPath = fs.realpathSync(process.argv[1]);
     return moduleRealPath === entryRealPath;
-  } catch {
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(
+      `[sphere-cli] entry-point check failed: ${msg}. Treating as library import.\n`,
+    );
     return false;
   }
 })();
 
+// NOTE (R16 LOW#3, deferred): args/command/noNostrGlobal/_globalFlagPreStrip
+// are module-scope state that main() closes over. This is intentional for
+// the F.18 entry-point gating model — argv is parsed at module load,
+// gated at exec. Refactoring main() to take argv as a parameter would
+// require reworking the gating order. If main() is ever EXPORTED, this
+// closure becomes a footgun: library callers could invoke main()
+// against the importer's argv. DO NOT export main() without first
+// converting it to `function main(argv: string[])`.
 const _globalFlagPreStrip = [...args];
 let command: string | undefined;
 if (isCliEntryPoint) {
@@ -1795,6 +1814,11 @@ GLOBAL FLAGS (apply to any subcommand):
                                     (equals form) is rejected loudly only
                                     in leading position; post-subcommand
                                     occurrences are silently ignored.
+                                    NOTE: also activates if --no-nostr
+                                    appears as the literal VALUE of a
+                                    free-text flag (e.g., --memo
+                                    --no-nostr). Quote memo values that
+                                    start with two dashes.
   --ipfs-gateway <url[,url2,...]>   Override the IPFS gateway list for this
                                     invocation. MUST appear BEFORE the
                                     subcommand. Equals form supported:
