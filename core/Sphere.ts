@@ -4032,6 +4032,47 @@ export class Sphere {
     const savedSource = await this._storage.get(STORAGE_KEYS_GLOBAL.WALLET_SOURCE);
     const savedAddressIndex = await this._storage.get(STORAGE_KEYS_GLOBAL.CURRENT_ADDRESS_INDEX);
 
+    // Steelman⁵² CRITICAL: detect partial-write corruption. F.56's
+    // best-effort rollback in storeMnemonic/storeMasterKey may itself
+    // fail (e.g., if remove() also hits the same lock contention)
+    // — the wallet file would then have MNEMONIC/MASTER_KEY plus
+    // SOME metadata keys but be missing OTHERS. We only fire on the
+    // partial state — if all three metadata keys are missing, treat
+    // as a legacy / external-app-created wallet (e.g., a plaintext
+    // mnemonic dropped into wallet.json by an external tool, or an
+    // older SDK build that did not write the metadata triplet).
+    // Defaults apply for those flows.
+    //
+    // The genuine corruption signature is "at least one metadata
+    // key written, at least one missing" — that pattern can only
+    // result from an aborted multi-key write whose rollback also
+    // failed, and silently applying defaults to the missing fields
+    // would derive the wrong identity for the persisted MNEMONIC.
+    if (encryptedMnemonic || encryptedMasterKey) {
+      const present: string[] = [];
+      const missing: string[] = [];
+      (savedBasePath ? present : missing).push('BASE_PATH');
+      (savedDerivationMode ? present : missing).push('DERIVATION_MODE');
+      (savedSource ? present : missing).push('WALLET_SOURCE');
+      // Steelman⁵² + ⁵² test fix: only fire on STRONG partial-write
+      // signature — at least 2 of the 3 metadata keys present and
+      // at least 1 missing. This pattern is unique to modern writes
+      // that got most of the way through but not all the way; a
+      // legacy / external-app wallet typically has 0 or 1 of these
+      // keys (no metadata or just WALLET_SOURCE for older SDK
+      // builds), and we don't want to brick load() for those.
+      if (present.length >= 2 && missing.length > 0) {
+        throw new SphereError(
+          `Wallet storage is in an inconsistent state — key material is present along ` +
+            `with partial metadata (have: ${present.join(', ')}; missing: ${missing.join(', ')}). ` +
+            `This indicates a partial-write corruption (e.g., an aborted Sphere.create / ` +
+            `Sphere.import whose rollback also failed). Run Sphere.clear() and re-import ` +
+            `the wallet from its mnemonic to recover.`,
+          'STORAGE_CORRUPTED',
+        );
+      }
+    }
+
     // Restore wallet metadata
     this._basePath = savedBasePath ?? DEFAULT_BASE_PATH;
     this._derivationMode = (savedDerivationMode as DerivationMode) ?? 'bip32';
