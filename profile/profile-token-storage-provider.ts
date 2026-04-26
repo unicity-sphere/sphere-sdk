@@ -403,6 +403,15 @@ export class ProfileTokenStorageProvider
       return { success: false, error: 'Provider not initialized', timestamp };
     }
 
+    // Steelman⁴¹ note: a save() concurrent with shutdown() sets
+    // pendingData but scheduleFlush below will skip arming a timer
+    // (it gates on isShuttingDown). The shutdown path then flushes
+    // pendingData via the direct flushToIpfs() call. So late saves
+    // ARE persisted — the gate lives in scheduleFlush, not here. This
+    // explicit comment documents the design so a future contributor
+    // doesn't add a reactive `if (isShuttingDown) return` here that
+    // would silently drop legitimate concurrent writes.
+
     this.emitEvent({ type: 'storage:saving', timestamp });
 
     // Any new save() invalidates the lastPinnedCid retry cache
@@ -1070,9 +1079,21 @@ export class ProfileTokenStorageProvider
 
     if (corruptCids.length > 0) {
       const ev = this.buildErrorEvent('storage:error', firstCorruptError, 'CID_REF_CORRUPT');
-      // Attach the full list of corrupt CIDs so consumers can react
-      // proportionally (e.g., one warning, list in details).
-      this.emitEvent({ ...ev, data: { corruptCids, count: corruptCids.length } });
+      // Steelman⁴¹ note: cap the inline-listed CIDs at 100 entries.
+      // For wholesale corruption (1000+ bundles) the unbounded list
+      // could bloat downstream loggers and JSON serialization. The
+      // `count` field is always exact; `truncated` flags when the
+      // list was clipped.
+      const CORRUPT_CIDS_PREVIEW_CAP = 100;
+      const truncated = corruptCids.length > CORRUPT_CIDS_PREVIEW_CAP;
+      this.emitEvent({
+        ...ev,
+        data: {
+          corruptCids: truncated ? corruptCids.slice(0, CORRUPT_CIDS_PREVIEW_CAP) : corruptCids,
+          truncated,
+          count: corruptCids.length,
+        },
+      });
     }
 
     return result;

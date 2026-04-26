@@ -124,6 +124,31 @@ describe('decrypt()', () => {
     expect(() => decrypt(tampered, TEST_PASSWORD)).toThrow(/MAC verification failed/);
   });
 
+  // Steelman⁴¹ regression coverage for the iterations DoS guard.
+  it('should reject record with iterations below 1000 (DoS guard)', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const tampered = { ...encrypted, iterations: 999 };
+    expect(() => decrypt(tampered, TEST_PASSWORD)).toThrow(/DoS guard/);
+  });
+
+  it('should reject record with iterations above 10M (DoS guard)', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const tampered = { ...encrypted, iterations: 10_000_001 };
+    expect(() => decrypt(tampered, TEST_PASSWORD)).toThrow(/DoS guard/);
+  });
+
+  it('should reject record with non-integer iterations', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const tampered = { ...encrypted, iterations: 1.5 };
+    expect(() => decrypt(tampered, TEST_PASSWORD)).toThrow(/DoS guard/);
+  });
+
+  it('should reject record with NaN iterations', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const tampered = { ...encrypted, iterations: NaN };
+    expect(() => decrypt(tampered, TEST_PASSWORD)).toThrow(/DoS guard/);
+  });
+
   it('should still read legacy unauthenticated aes-256-cbc records', () => {
     // Build a legacy-shape record by stripping the mac field and changing
     // the algorithm — this simulates on-disk records written before the

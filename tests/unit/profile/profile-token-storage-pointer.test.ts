@@ -216,10 +216,10 @@ describe('ProfileTokenStorageProvider pointer recovery (T-D6 wiring)', () => {
 
     const provider = createProvider({ db, getPointerLayer: () => pointer });
 
-    // Steelman⁴⁰: typed `code` field on the event is now load-bearing;
-    // the legacy substring-match in `evt.error` still works because
-    // the error message contains the code, but consumers should
-    // prefer the typed field.
+    // Steelman⁴⁰/⁴¹: typed `code` field on the event is the
+    // load-bearing API. The legacy substring-match on `evt.error` no
+    // longer works — F.45's buildErrorEvent removed the code prefix
+    // from the error message. Consumers MUST use the typed `code` field.
     const errorEvents: Array<{ error?: string; code?: string }> = [];
     provider.onEvent((evt) => {
       if (evt.type === 'storage:error') {
