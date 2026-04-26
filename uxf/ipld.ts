@@ -194,10 +194,20 @@ export async function exportToCar(pkg: UxfPackageData): Promise<Uint8Array> {
   // the affected token). See uxf/token-join.ts `ENRICHED_SYNTHETIC_KIND`.
   for (const [tokenId, rootHash] of pkg.manifest.tokens) {
     const rootEl = pkg.pool.get(rootHash);
+    // Steelman⁴⁸ NOTE: also fail on dangling manifest (mirrors
+    // packageToJson). Previously the guard short-circuited on missing
+    // elements, allowing CAR export of broken packages.
+    if (!rootEl) {
+      throw new UxfError(
+        'MISSING_ELEMENT',
+        `Refusing to export package: manifest entry for token ${tokenId} ` +
+          `references rootHash ${rootHash} but no such element exists in pool.`,
+      );
+    }
     // Steelman² remediation: import the constant rather than hardcode
     // the string literal. A future rename would otherwise silently
     // break the guard.
-    if (rootEl && rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
+    if (rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
       throw new UxfError(
         'VERIFICATION_FAILED',
         `Refusing to export package with synthetic (Rule 4 enriched) manifest head ` +

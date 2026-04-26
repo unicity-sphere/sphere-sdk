@@ -68,12 +68,32 @@ export class OrbitDbAdapter implements ProfileDatabase {
    */
   private localAuthoredKeys: Set<string> = new Set();
 
+  /**
+   * Steelman⁴⁸ WARNING: dedup concurrent connect() calls.
+   * Two callers racing on init both saw connected=false, both
+   * proceeded to create Helia + OrbitDB + open db. The second
+   * overwrote helia/orbitdb/db, leaking the first instance's
+   * resources (no future close() could find them). Now both callers
+   * await the same connect promise.
+   */
+  private connectInFlight: Promise<void> | null = null;
+
   // ---------- ProfileDatabase implementation ----------
 
   async connect(config: OrbitDbConfig): Promise<void> {
     if (this.connected) {
       return; // idempotent
     }
+    if (this.connectInFlight) {
+      return this.connectInFlight;
+    }
+    this.connectInFlight = this.connectInner(config).finally(() => {
+      this.connectInFlight = null;
+    });
+    return this.connectInFlight;
+  }
+
+  private async connectInner(config: OrbitDbConfig): Promise<void> {
 
     // --- Dynamic import of @orbitdb/core ---
     let orbitdbModule: any;
@@ -584,6 +604,20 @@ export class OrbitDbAdapter implements ProfileDatabase {
   }
 
   async close(): Promise<void> {
+    // Steelman⁴⁸ WARNING: if a connect() is currently in flight, await
+    // it before short-circuiting. Without this, close() observes
+    // connected=false (still mid-init), returns, and the eventual
+    // connect resolution leaves resources stranded with no cleanup
+    // path. Best-effort: wait for connectInFlight; if it succeeded
+    // we'll then clean up; if it failed (cleanupOnError already ran)
+    // we return idempotently.
+    if (this.connectInFlight) {
+      try {
+        await this.connectInFlight;
+      } catch {
+        /* already cleaned up via cleanupOnError */
+      }
+    }
     if (!this.connected) {
       return; // idempotent
     }

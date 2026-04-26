@@ -142,6 +142,17 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
   // Track the EVOLVING localVersion across conflicts (fetchAndJoin updates it).
   let currentLocalVersion = input.currentLocalVersion;
 
+  // Steelman⁴⁸ WARNING: compute ONE wall-clock deadline at the top
+  // of reconcile and pass it into both findLatestValidVersion calls
+  // (initial + rediscovery). Previously, each call derived its own
+  // ~21-min default deadline, so PUBLISH_RETRY_BUDGET=5 × 2 calls/
+  // attempt could occupy the publish mutex for up to ~3.5 hours.
+  // The shared deadline gives the entire reconcile-and-publish a
+  // single budget — saturated by the slowest discovery — and short-
+  // circuits subsequent retries once it's gone.
+  const RECONCILE_WALL_CLOCK_BUDGET_MS = 5 * 60 * 1000; // 5 minutes
+  const reconcileDeadlineMs = Date.now() + RECONCILE_WALL_CLOCK_BUDGET_MS;
+
   for (let attempts = 0; attempts < maxAttempts; attempts++) {
     // Step A: produce a fresh CID (may include state merged on prior conflict).
     const cidBytes = await input.cidProducer();
@@ -158,6 +169,7 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
       trustBase: input.trustBase,
       decodeCid: input.decodeCid,
       fetchCar: input.fetchCar,
+      discoveryDeadlineMs: reconcileDeadlineMs,
     });
     probeHistory.push(...discovery.probeVersions);
     const nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
@@ -204,6 +216,7 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
       trustBase: input.trustBase,
       decodeCid: input.decodeCid,
       fetchCar: input.fetchCar,
+      discoveryDeadlineMs: reconcileDeadlineMs,
     });
     probeHistory.push(...rediscovery.probeVersions);
 

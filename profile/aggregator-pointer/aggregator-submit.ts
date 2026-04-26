@@ -553,27 +553,41 @@ export async function submitPointer(input: SubmitInput): Promise<SubmitOutcome> 
     const outcomeA = classifySideResult(resultA);
     const outcomeB = classifySideResult(resultB);
 
-    // Steelman⁴⁷ NOTE: if Promise.allSettled actually completed both
-    // sides BEFORE the abort signal fired (the network was faster
-    // than the deadline timer), the aggregator already holds the
-    // commit. Returning AbortError here would force the caller to
-    // re-publish at v+1 even though v is now firmly committed — a
-    // wasted reconcile cycle, and a violation of the H8 v-burning
-    // discipline (we'd burn v silently). Inspect the per-side
-    // outcomes: if both classified as success/exists/idempotent, the
-    // commit landed and we MUST surface the spec outcome rather than
-    // throwing AbortError. Only if at least one side did NOT classify
-    // (network_error, timeout, abort) AND the abort signal is set, do
-    // we surface AbortError — that's the genuine abandonment case.
+    // Steelman⁴⁷ → ⁴⁸ NOTE/HIGH: if Promise.allSettled actually
+    // completed both sides BEFORE the abort signal fired (the
+    // network was faster than the deadline timer), the aggregator
+    // already holds a decided outcome — success, REQUEST_ID_EXISTS,
+    // AUTHENTICATOR_VERIFICATION_FAILED, REQUEST_ID_MISMATCH, HTTP
+    // 4xx, etc. Returning AbortError in those cases would silently
+    // drop the spec outcome:
+    //   - 'rejected'   (Row 9) → H8 v-burning would not register
+    //     and the next attempt at v=resolvedV loops on REQUEST_ID_
+    //     EXISTS forever.
+    //   - 'aggregator_rejected' (Row 12) → permanent 4xx swallowed,
+    //     caller retries unnecessarily until budget exhausted.
+    //   - 'protocol_error' (Rows 14, 15) → fail-closed signal lost.
+    //
+    // The F.47 fix only treated 'success'/'exists' as "decided"; this
+    // F.48 fix expands the set to all spec-decided side outcomes.
+    // AbortError is reserved for the genuine abandonment case where
+    // at least one side is NOT decided (network_error, retry_after,
+    // backoff — i.e., classes that do require retry / abandonment).
     if (input.abortSignal?.aborted) {
-      const aClassified = outcomeA.type === 'success' || outcomeA.type === 'exists';
-      const bClassified = outcomeB.type === 'success' || outcomeB.type === 'exists';
-      if (!(aClassified && bClassified)) {
+      const isSideDecided = (t: SideOutcome['type']): boolean =>
+        t === 'success' ||
+        t === 'exists' ||
+        t === 'rejected' ||
+        t === 'aggregator_rejected' ||
+        t === 'protocol_error';
+      const aDecided = isSideDecided(outcomeA.type);
+      const bDecided = isSideDecided(outcomeB.type);
+      if (!(aDecided && bDecided)) {
         const err = new Error('submitPointer aborted by caller');
         err.name = 'AbortError';
         throw err;
       }
-      // Both sides committed before abort; fall through to combine.
+      // Both sides decided before abort; fall through to combine so
+      // the spec §7.3 state machine sees the real outcome.
     }
 
     return combineOutcomes(outcomeA, outcomeB, v, cidBytes, marker, isIdempotentRetryHint);

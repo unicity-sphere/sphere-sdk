@@ -477,6 +477,14 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
   // whose indexes weren't built AND indexes pointing at tokens whose
   // manifest entries got rolled back. On throw, ROLL BACK both the
   // manifest entries AND the index entries we added.
+  //
+  // Steelman⁴⁸ WARNING: also snapshot the pre-existing pool keys so a
+  // throw during the manifest/index loop can roll back any pool
+  // entries inserted by `syncPool` above. Previously the docstring
+  // claimed "atomic commit" but only manifest+indexes were rolled
+  // back — orphan pool elements survived (would only be reclaimed by
+  // gc()). True rollback now restores pool to its pre-syncPool state.
+  const prePoolKeys = new Set<string>(pkg.pool.keys());
   syncPool(pkg, pool);
   const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
   const previousManifest = new Map<string, ContentHash | undefined>();
@@ -512,6 +520,15 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
     for (const [tokenId, prev] of previousManifest) {
       if (prev === undefined) mutableManifest.delete(tokenId);
       else mutableManifest.set(tokenId, prev);
+    }
+    // Steelman⁴⁸: roll back pool inserts to satisfy the "atomic
+    // commit" docstring contract. Delete any element added by
+    // syncPool that wasn't in the pre-existing key set.
+    const mutablePool = pkg.pool as Map<ContentHash, UxfElement>;
+    for (const key of [...mutablePool.keys()]) {
+      if (!prePoolKeys.has(key)) {
+        try { mutablePool.delete(key); } catch { /* best-effort */ }
+      }
     }
     throw err;
   }

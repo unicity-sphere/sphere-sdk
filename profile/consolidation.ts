@@ -123,8 +123,15 @@ export class ConsolidationEngine {
    *  9. Delete `consolidation.pending` key
    * 10. Return result
    */
-  async consolidate(): Promise<ConsolidationResult> {
+  async consolidate(opts?: { abortSignal?: AbortSignal }): Promise<ConsolidationResult> {
     // Step 1: concurrent guard
+    // Steelman⁴⁸ WARNING: caller can pass an AbortSignal to short-
+    // circuit the long TOCTOU sleep on engine shutdown. Without this,
+    // a 30s sleep would block shutdown drain and could lead to
+    // post-teardown reads that throw PROFILE_NOT_INITIALIZED in
+    // confusing ways. The signal triggers a typed
+    // CONSOLIDATION_ABORTED error so callers can distinguish from
+    // CONSOLIDATION_IN_PROGRESS / IO failures.
     const pending = await this.readPendingState();
     if (pending) {
       const ageMs = Date.now() - pending.startedAt * 1000;
@@ -175,7 +182,40 @@ export class ConsolidationEngine {
     // was too short — two devices both proceeded past abort, both
     // consolidated in parallel, both pinned redundant CARs.
     // If another device wrote a different pending state in the race window, we abort.
-    await new Promise(resolve => setTimeout(resolve, 30_000));
+    // Steelman⁴⁸: race the sleep against the abort signal so shutdown
+    // can pre-empt the 30s wait. On signal, throw a typed error.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (opts?.abortSignal) opts.abortSignal.removeEventListener('abort', onAbort);
+        resolve();
+      }, 30_000);
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        reject(
+          Object.assign(
+            new Error('Consolidation aborted by caller (TOCTOU sleep pre-empted)'),
+            { code: 'CONSOLIDATION_ABORTED' },
+          ),
+        );
+      };
+      if (opts?.abortSignal) {
+        if (opts.abortSignal.aborted) {
+          clearTimeout(timer);
+          reject(
+            Object.assign(
+              new Error('Consolidation aborted by caller (signal already aborted)'),
+              { code: 'CONSOLIDATION_ABORTED' },
+            ),
+          );
+          return;
+        }
+        opts.abortSignal.addEventListener('abort', onAbort, { once: true });
+      }
+      // Don't keep Node alive for the timer — it's a wait, not work.
+      if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+        (timer as { unref: () => void }).unref();
+      }
+    });
     const readBack = await this.readPendingState();
     if (readBack && readBack.device !== deviceId) {
       this.log(

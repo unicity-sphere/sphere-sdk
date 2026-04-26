@@ -163,7 +163,18 @@ export function packageToJson(pkg: UxfPackageData): string {
   // exportToCar's guard. Both paths now share the same gate.
   for (const [tokenId, rootHash] of pkg.manifest.tokens) {
     const rootEl = pkg.pool.get(rootHash);
-    if (rootEl && rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
+    // Steelman⁴⁸ NOTE: dangling manifest entry — manifest references
+    // a rootHash whose element is missing from the pool. Soft-fail
+    // (continue) used to mask serialization of broken packages until
+    // a downstream verify() ran. Now fail at the parse boundary.
+    if (!rootEl) {
+      throw new UxfError(
+        'MISSING_ELEMENT',
+        `Refusing to serialize package: manifest entry for token ${tokenId} ` +
+          `references rootHash ${rootHash} but no such element exists in pool.`,
+      );
+    }
+    if (rootEl.header.kind === ENRICHED_SYNTHETIC_KIND) {
       throw new UxfError(
         'VERIFICATION_FAILED',
         `Refusing to serialize package with synthetic (Rule 4 enriched) manifest head ` +
