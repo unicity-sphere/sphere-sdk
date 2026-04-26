@@ -46,25 +46,34 @@ export type MutableInstanceChainIndex = Map<ContentHash, InstanceChainEntry>;
  * version is caught here too (rather than only when the next instance
  * is added, by which point chain reconstruction may already be broken).
  */
+function isSafeNonNegativeInteger(v: unknown): v is number {
+  return (
+    typeof v === 'number' &&
+    Number.isFinite(v) &&
+    Number.isInteger(v) &&
+    v >= 0 &&
+    v <= Number.MAX_SAFE_INTEGER
+  );
+}
+
 function assertVersionField(
   fieldName: 'semantics' | 'representation',
   newValue: unknown,
   predecessorValue: unknown,
 ): void {
-  if (typeof newValue !== 'number' || !Number.isFinite(newValue) || !Number.isInteger(newValue)) {
+  // Steelman²⁰ warning: bound BOTH below (>=0; versions are
+  // non-negative monotone) AND above (<= MAX_SAFE_INTEGER; values
+  // beyond 2^53 lose precision and `<` comparisons become unreliable).
+  if (!isSafeNonNegativeInteger(newValue)) {
     throw new UxfError(
       'INVALID_INSTANCE_CHAIN',
-      `New instance has invalid ${fieldName}=${String(newValue)} (must be a finite integer)`,
+      `New instance has invalid ${fieldName}=${String(newValue)} (must be a non-negative safe integer)`,
     );
   }
-  if (
-    typeof predecessorValue !== 'number' ||
-    !Number.isFinite(predecessorValue) ||
-    !Number.isInteger(predecessorValue)
-  ) {
+  if (!isSafeNonNegativeInteger(predecessorValue)) {
     throw new UxfError(
       'INVALID_INSTANCE_CHAIN',
-      `Predecessor has invalid ${fieldName}=${String(predecessorValue)} (must be a finite integer) — chain head is corrupt`,
+      `Predecessor has invalid ${fieldName}=${String(predecessorValue)} (must be a non-negative safe integer) — chain head is corrupt`,
     );
   }
   if (newValue < predecessorValue) {
@@ -591,6 +600,11 @@ export function rebuildInstanceChainIndex(
           currentHash = nextHash;
         } else {
           // Branch: each successor starts its own sub-chain.
+          // Each recursive walkBranch call records its own complete
+          // chain (prefix + branch); the prefix is intentionally NOT
+          // recorded standalone here, because doing so would create a
+          // duplicate index entry that races the recursive entries
+          // (last index.set wins, behavior depends on iteration order).
           const currentElement = pool.get(currentHash);
           if (!currentElement) return;
           for (const nextHash of succs) {

@@ -27,10 +27,17 @@ import type { Side, PointerVersion } from './types.js';
 // Steelman¹⁹: cache Uint8Array.prototype.fill at module load. Defends
 // against late prototype-pollution turning every secret-wipe into a
 // no-op or a leak. All wipes in this module must use safeWipe().
+//
+// Steelman²⁰ critical #2: safeWipe() itself MUST NOT throw or the
+// catch-path cleanup chain breaks. Wrap the inner fill in try/catch so
+// a hostile prototype mutation (or a Proxy on `buf`) cannot abort the
+// cleanup loop and leak SecretKey wrappers downstream.
 const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
 function safeWipe(buf: Uint8Array | null | undefined): void {
   if (!buf) return;
-  TYPED_ARRAY_FILL.call(buf, 0);
+  try {
+    TYPED_ARRAY_FILL.call(buf, 0);
+  } catch { /* best-effort wipe; never throw out of cleanup */ }
 }
 
 export interface PointerKeyMaterial {
@@ -65,6 +72,17 @@ export function derivePointerKeyMaterial(masterKey: MasterPrivateKey): PointerKe
   // a constructor failure mid-sequence can zeroize the partially-built
   // ones (each holds a defensive copy of the bare bytes).
   const builtKeys: SecretKey[] = [];
+
+  // Steelman²⁰ critical #1: success flag + try/finally (NOT try/catch+finally)
+  // unifies all cleanup. Previous structure had separate success-path and
+  // catch-path wipes; if any safeWipe in the catch threw, subsequent wipes
+  // and the SecretKey-wrapper zeroization loop were skipped, leaking four
+  // 32-byte derived secrets. With try/finally, every wipe and the
+  // wrapper-cleanup loop ALWAYS run; safeWipe is now also throw-proof
+  // (see TYPED_ARRAY_FILL definition).  An index-based wrapper loop
+  // avoids dependency on `Array.prototype[Symbol.iterator]` which could
+  // be polluted by attacker code.
+  let success = false;
   try {
     pointerSecretBytes = hkdf(sha256, walletPrivateKey, new Uint8Array(0), PROFILE_POINTER_HKDF_INFO, 32);
     signingSeedBytes = expand(sha256, pointerSecretBytes, SIGNING_SEED_INFO, 32);
@@ -74,6 +92,10 @@ export function derivePointerKeyMaterial(masterKey: MasterPrivateKey): PointerKe
     // Build SecretKey wrappers SEQUENTIALLY (not via object-literal
     // evaluation order which could short-circuit on partial throw). Each
     // wrapper copies the bytes via SecretKey(bytes) → new Uint8Array(bytes).
+    // SAFETY: wipes of the bare buffers (in finally) MUST NOT happen before
+    // these constructors run, because expand()/hkdf() consume their inputs
+    // synchronously and SecretKey's ctor deep-copies — but the BARE buffers
+    // remain populated until the finally block.
     const pointerSecret = new SecretKey(pointerSecretBytes, 'pointerSecret');
     builtKeys.push(pointerSecret);
     const signingSeed = new SecretKey(signingSeedBytes, 'signingSeed');
@@ -83,29 +105,23 @@ export function derivePointerKeyMaterial(masterKey: MasterPrivateKey): PointerKe
     const padSeed = new SecretKey(padSeedBytes, 'padSeed');
     builtKeys.push(padSeed);
 
-    // Steelman¹⁹ critical #1: SUCCESS-PATH wipe of bare buffers. Each
-    // SecretKey constructor took its own copy; the bare Uint8Arrays here
-    // are now redundant copies of derived key material that must NOT be
-    // abandoned to GC. Without this, every successful derivation leaks
-    // four 32-byte derived secrets.
-    safeWipe(pointerSecretBytes);
-    safeWipe(signingSeedBytes);
-    safeWipe(xorSeedBytes);
-    safeWipe(padSeedBytes);
-
+    success = true;
     return { pointerSecret, signingSeed, xorSeed, padSeed };
-  } catch (err) {
-    // Zero any partially-derived bare buffers.
+  } finally {
+    // Always wipe the bare buffers — on success they're redundant copies of
+    // derived secrets; on failure they hold partial derivation residue.
     safeWipe(pointerSecretBytes);
     safeWipe(signingSeedBytes);
     safeWipe(xorSeedBytes);
     safeWipe(padSeedBytes);
-    // Zero any SecretKey wrappers that were built before the exception.
-    for (const k of builtKeys) {
-      try { k.zeroize(); } catch { /* noop — best effort */ }
+    // ON FAILURE only, zero the partially-built SecretKey wrappers (each
+    // holds a deep copy that the caller will never see, so it must not
+    // linger). Index-based loop avoids iterator-protocol pollution.
+    if (!success) {
+      for (let i = 0; i < builtKeys.length; i++) {
+        try { builtKeys[i].zeroize(); } catch { /* best effort */ }
+      }
     }
-    throw err;
-  } finally {
     safeWipe(walletPrivateKey);
   }
 }

@@ -473,6 +473,35 @@ function deserializeElement(json: JsonElement): UxfElement {
       'Element header must be an object',
     );
   }
+  // Steelman²⁰ warning: validate representation/semantics at the parse
+  // boundary, not deep inside addInstance / rebuildInstanceChainIndex.
+  // A malformed header (string, null, NaN, fractional) would otherwise
+  // sit in the pool and only surface as INVALID_INSTANCE_CHAIN much
+  // later — possibly long after the parse error became unobservable.
+  if (
+    typeof hdr.representation !== 'number' ||
+    !Number.isFinite(hdr.representation) ||
+    !Number.isInteger(hdr.representation) ||
+    hdr.representation < 0 ||
+    hdr.representation > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Element header.representation must be a non-negative safe integer, got ${String(hdr.representation)}`,
+    );
+  }
+  if (
+    typeof hdr.semantics !== 'number' ||
+    !Number.isFinite(hdr.semantics) ||
+    !Number.isInteger(hdr.semantics) ||
+    hdr.semantics < 0 ||
+    hdr.semantics > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `Element header.semantics must be a non-negative safe integer, got ${String(hdr.semantics)}`,
+    );
+  }
 
   // type: integer -> string tag
   const typeId = json.type;

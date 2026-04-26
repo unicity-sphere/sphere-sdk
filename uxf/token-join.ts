@@ -376,7 +376,7 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
  */
 function txHasProof(txHash: ContentHash, pool: ReadonlyMap<ContentHash, UxfElement>): boolean {
   const tx = pool.get(txHash);
-  if (!tx || tx.type !== 'transaction') return false;
+  if (!tx || tx.type !== ELEMENT_TYPE_TRANSACTION) return false;
   const proof = tx.children.inclusionProof;
   return typeof proof === 'string' && proof.length > 0;
 }
@@ -406,7 +406,7 @@ function sameCoreDifferentProof(
   const a = pool.get(hashA);
   const b = pool.get(hashB);
   if (!a || !b) return false;
-  if (a.type !== 'transaction' || b.type !== 'transaction') return false;
+  if (a.type !== ELEMENT_TYPE_TRANSACTION || b.type !== ELEMENT_TYPE_TRANSACTION) return false;
   const ca = a.children as Record<string, ContentHash | ContentHash[] | null>;
   const cb = b.children as Record<string, ContentHash | ContentHash[] | null>;
 
@@ -471,7 +471,7 @@ function altProofIsStructurallyValid(
   if (typeof proofHash !== 'string') return false;
   const proofEl = pool.get(proofHash);
   if (!proofEl) return true; // dangling — verify.ts upstream catches it
-  if (proofEl.type !== 'inclusion-proof') return false;
+  if (proofEl.type !== ELEMENT_TYPE_INCLUSION_PROOF) return false;
   const pc = proofEl.children as Record<string, unknown>;
   if (typeof pc.authenticator !== 'string') return false;
   if (typeof pc.smtPath !== 'string') return false;
@@ -516,7 +516,7 @@ function _tryEnrichLongestWithProofs(
   pool: ReadonlyMap<ContentHash, UxfElement>,
 ): { rootHash: ContentHash; syntheticRoot: UxfElement } | null {
   const winnerRoot = pool.get(winner.rootHash);
-  if (!winnerRoot || winnerRoot.type !== 'token-root') return null;
+  if (!winnerRoot || winnerRoot.type !== ELEMENT_TYPE_TOKEN_ROOT) return null;
 
   const enrichedTxns: ContentHash[] = [...winner.txns];
   let enriched = false;
@@ -610,7 +610,7 @@ function _tryEnrichLongestWithProofs(
       kind: ENRICHED_SYNTHETIC_KIND,
       predecessor: null,
     },
-    type: 'token-root',
+    type: ELEMENT_TYPE_TOKEN_ROOT,
     content: { ...winnerRoot.content },
     children: clonedChildren,
   };
@@ -638,7 +638,7 @@ export const ENRICHED_SYNTHETIC_KIND = 'enriched-synthetic' as const;
  */
 export function isEnrichedSyntheticRoot(element: UxfElement): boolean {
   return (
-    element.type === 'token-root' &&
+    element.type === ELEMENT_TYPE_TOKEN_ROOT &&
     element.header.kind === ENRICHED_SYNTHETIC_KIND
   );
 }

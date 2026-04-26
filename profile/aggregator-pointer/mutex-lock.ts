@@ -16,6 +16,7 @@
  * SPEC §7.1.1, R-17, R-18.
  */
 
+import { FILE_LOCK_STALE_MS } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
 export interface MutexAcquireOptions {
@@ -34,26 +35,31 @@ export interface MutexAcquireOptions {
  * Reject all of these with PROTOCOL_ERROR so misuse fails loudly.
  */
 function validateTimeoutMs(timeoutMs: number, mutexName: string): number {
+  // Steelman²⁰ note: cap upper bound to 1 hour. Number.MAX_SAFE_INTEGER
+  // would overflow `Date.now() + timeoutMs` to Infinity, defeating the
+  // deadline math in the same way safeMaxRetries was capped to prevent.
+  // 1 hour is far above any legitimate use; setTimeout would clamp longer
+  // values to ~24.8 days anyway.
+  const TIMEOUT_HARD_CEILING_MS = 3_600_000;
   if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
       `Mutex "${mutexName}" acquire: timeoutMs must be a positive finite number, got ${String(timeoutMs)}.`,
     );
   }
+  if (timeoutMs > TIMEOUT_HARD_CEILING_MS) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `Mutex "${mutexName}" acquire: timeoutMs ${timeoutMs}ms exceeds upper bound ${TIMEOUT_HARD_CEILING_MS}ms (1 hour).`,
+    );
+  }
   return timeoutMs;
 }
 
-/**
- * Steelman¹⁹ warning: file-lock staleness must be ≥ the maximum time
- * the publish mutex can be held in a single critical section. publishOnce
- * loopDeadline = MAX_CUMULATIVE_RETRY_AFTER_MS (180s) + maxRetries × 8s
- * = ~220s upper bound. Setting staleMs to 240s ensures proper-lockfile
- * does not consider a busy publishOnce iteration "stale" and let a
- * second process take the same lock (silent mutex violation). The
- * cost is that crashed-process recovery takes ~4 minutes, which is
- * acceptable for an interactive wallet.
- */
-const FILE_LOCK_STALE_MS = 240_000;
+// Steelman²⁰ critical: FILE_LOCK_STALE_MS is now defined in constants.ts
+// and coupled to ATTEMPT_MAX_RETRIES_HARD_CAP so it always exceeds the
+// worst-case publishOnce hold time. Importing it here ensures the two
+// stay in sync.
 
 export interface MutexHandle {
   release(): Promise<void>;

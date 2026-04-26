@@ -361,7 +361,11 @@ export class ProfilePointerLayer {
       return await readBlockedState(this.#init.flagStore);
     } catch (err) {
       if (err instanceof AggregatorPointerError && err.code === AggregatorPointerErrorCode.CORRUPT) {
-        return { blocked: true, reason: 'corrupt', setAt: 0 };
+        // Steelman²⁰: setAt = Date.now() (capture-time of the synthetic
+        // event) so downstream `Date.now() - setAt` math returns small
+        // values, not "blocked since 1970". 'corrupt' is now a recognized
+        // synthetic-only BlockedReason in the union (see blocked-state.ts).
+        return { blocked: true, reason: 'corrupt', setAt: Date.now() };
       }
       throw err;
     }

@@ -26,6 +26,7 @@ import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api
 import { submitPointer, type SubmitOutcome } from './aggregator-submit.js';
 import { isBlocked, maybeSetBlocked } from './blocked-state.js';
 import {
+  ATTEMPT_MAX_RETRIES_HARD_CAP,
   MAX_CUMULATIVE_RETRY_AFTER_MS,
   PUBLISH_BACKOFF_BASE_MS,
   PUBLISH_BACKOFF_JITTER_HI,
@@ -142,7 +143,8 @@ async function publishOnce(
   // arithmetic. AttemptOptions.maxRetries has no upper bound at the type
   // level; passing Number.MAX_SAFE_INTEGER would overflow Date.now() +
   // (huge × 4000 × 2) to Infinity, defeating the deadline gate.
-  const ATTEMPT_MAX_RETRIES_HARD_CAP = 100;
+  // Cap is now defined in constants.ts (ATTEMPT_MAX_RETRIES_HARD_CAP)
+  // so FILE_LOCK_STALE_MS can be sized to exceed worst-case publishOnce hold.
   const safeMaxRetries =
     !Number.isInteger(attemptOpts.maxRetries) || attemptOpts.maxRetries < 0
       ? PUBLISH_RETRY_BUDGET
@@ -348,9 +350,13 @@ export async function publishOnceAtVersion(
         corruptErr instanceof AggregatorPointerError &&
         corruptErr.code === AggregatorPointerErrorCode.CORRUPT
       ) {
+        // Steelman²⁰: pass corruptErr as 4th-arg `options.cause` so it joins
+        // the standard Error.cause chain. Putting it in `details` (3rd arg)
+        // hid it from util.inspect / console.error / standard tooling.
         throw new AggregatorPointerError(
           AggregatorPointerErrorCode.UNREACHABLE_RECOVERY_BLOCKED,
           'publish refused: BLOCKED-state record is corrupt — wallet must be unblocked via operator override before publish can resume.',
+          undefined,
           { cause: corruptErr },
         );
       }

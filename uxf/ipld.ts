@@ -555,6 +555,37 @@ function decodeIpldElement(node: {
       'Invalid IPLD element header format',
     );
   }
+  // Steelman²⁰ warning: validate representation/semantics at the parse
+  // boundary. CBOR-decoded values can be anything (string, BigInt, array,
+  // null) — the `as number` cast is compile-time only. Without runtime
+  // validation, a malformed header sits in the pool until addInstance or
+  // rebuildInstanceChainIndex tries to compare it.
+  const reprRaw = hdrArray[0];
+  const semRaw = hdrArray[1];
+  if (
+    typeof reprRaw !== 'number' ||
+    !Number.isFinite(reprRaw) ||
+    !Number.isInteger(reprRaw) ||
+    reprRaw < 0 ||
+    reprRaw > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `IPLD element header[0] (representation) must be a non-negative safe integer, got ${String(reprRaw)}`,
+    );
+  }
+  if (
+    typeof semRaw !== 'number' ||
+    !Number.isFinite(semRaw) ||
+    !Number.isInteger(semRaw) ||
+    semRaw < 0 ||
+    semRaw > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `IPLD element header[1] (semantics) must be a non-negative safe integer, got ${String(semRaw)}`,
+    );
+  }
 
   const predecessor = hdrArray[3];
   const predecessorHash: ContentHash | null =

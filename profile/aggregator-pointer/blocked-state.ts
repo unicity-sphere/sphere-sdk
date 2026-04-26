@@ -32,7 +32,17 @@ export type BlockedReason =
   | 'aggregator_rejected'
   | 'protocol_error'
   | 'marker_corrupt'
-  | 'rejected';
+  | 'rejected'
+  /**
+   * Steelman²⁰: synthetic read-side reason emitted by
+   * ProfilePointerLayer.getBlockedState() / .isPublishBlocked() when the
+   * stored blocked-state record is corrupt. NEVER persisted: it is
+   * deliberately excluded from KNOWN_BLOCKED_REASONS so a stored record
+   * with `reason: 'corrupt'` is still rejected as CORRUPT.
+   * UI / telemetry consumers should add a 'corrupt' branch to their
+   * reason switches.
+   */
+  | 'corrupt';
 
 /**
  * Wave F.2 security advisory MEDIUM-3 remediation: typed network-error
@@ -112,6 +122,11 @@ interface BlockedRecord {
   setAt: number;
 }
 
+// Steelman²⁰: 'corrupt' is intentionally NOT in KNOWN_BLOCKED_REASONS.
+// It is a SYNTHETIC reason emitted ONLY by the read-side wrapper in
+// ProfilePointerLayer when the stored record fails validation. A stored
+// record with `reason: 'corrupt'` is still rejected by isBlocked() as
+// CORRUPT (the wrapper then synthesizes a stable read-side response).
 const KNOWN_BLOCKED_REASONS = new Set<string>([
   'retry_exhausted',
   'network_timeout',

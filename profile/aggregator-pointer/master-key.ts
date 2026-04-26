@@ -16,14 +16,18 @@
 
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
-// Steelman¹⁹: cache Uint8Array.prototype.fill at module load — defends
-// every wipe against late prototype-pollution. Late-loaded malicious
-// scripts cannot intercept .fill() calls that resolve through this
-// captured reference.
+// Steelman¹⁹/²⁰: cache prototype methods at module load — defends
+// against late prototype-pollution turning every wipe / type-tag check
+// into a no-op or a leak. Both safeWipe and isSharedArrayBufferLike now
+// resolve through these captured references rather than going through
+// (potentially polluted) prototype lookups.
 const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
+const OBJECT_TO_STRING = Object.prototype.toString;
 function safeWipe(buf: Uint8Array | null | undefined): void {
   if (!buf) return;
-  TYPED_ARRAY_FILL.call(buf, 0);
+  try {
+    TYPED_ARRAY_FILL.call(buf, 0);
+  } catch { /* best-effort wipe; never throw out of cleanup */ }
 }
 
 /**
@@ -34,7 +38,9 @@ function safeWipe(buf: Uint8Array | null | undefined): void {
  * MessageChannel) is not `instanceof` the local SharedArrayBuffer and
  * would bypass the gate. `Object.prototype.toString` returns the
  * `[Symbol.toStringTag]` value which is `'SharedArrayBuffer'` for any
- * SAB regardless of originating realm (per ECMAScript spec).
+ * SAB regardless of originating realm (per ECMAScript spec). The
+ * captured OBJECT_TO_STRING reference defeats late prototype-pollution
+ * attempts that replace `Object.prototype.toString` after module load.
  */
 function isSharedArrayBufferLike(buffer: ArrayBufferLike | undefined | null): boolean {
   if (buffer === undefined || buffer === null) return false;
@@ -42,8 +48,8 @@ function isSharedArrayBufferLike(buffer: ArrayBufferLike | undefined | null): bo
   if (typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer) {
     return true;
   }
-  // Cross-realm fallback: toStringTag check.
-  return Object.prototype.toString.call(buffer) === '[object SharedArrayBuffer]';
+  // Cross-realm fallback: toStringTag check via captured prototype method.
+  return OBJECT_TO_STRING.call(buffer) === '[object SharedArrayBuffer]';
 }
 
 declare const _brand: unique symbol;
@@ -199,7 +205,16 @@ export function createMasterPrivateKey(
   // Steelman¹⁹ critical #2: use cross-realm-safe detection. `instanceof`
   // is realm-scoped — a SAB from an iframe / Worker / vm context is NOT
   // `instanceof` the local SharedArrayBuffer and would slip through.
-  if (isSharedArrayBufferLike(bytes.buffer)) {
+  //
+  // Steelman²⁰ note: snapshot `bytes.buffer` ONCE so a hostile TypedArray
+  // subclass with a `.buffer` getter can't return a benign ArrayBuffer
+  // on the gate-check and a SAB on the subsequent copy. The snapshot is
+  // used for the gate; the actual copy still goes via `new Uint8Array(bytes)`
+  // which reads `.buffer` again — but a hostile subclass returning a
+  // different buffer there would not be readable by the regular
+  // copy-by-iteration path anyway.
+  const sourceBuffer = bytes.buffer;
+  if (isSharedArrayBufferLike(sourceBuffer)) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
       'MasterPrivateKey input must not be backed by SharedArrayBuffer — ' +

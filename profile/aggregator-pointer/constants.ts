@@ -89,3 +89,24 @@ export const MAX_PLAUSIBLE_EPOCH_GAP = 1024n;
 // single publishOnce invocation. Sized to accommodate three legitimate
 // 60-second load-shed cycles before failing.
 export const MAX_CUMULATIVE_RETRY_AFTER_MS = 180_000;
+
+// Steelman²⁰: hard cap on AttemptOptions.maxRetries to prevent loopDeadline
+// arithmetic overflow and to size FILE_LOCK_STALE_MS predictably.
+// Default maxRetries (PUBLISH_RETRY_BUDGET) is 5; this cap is the upper
+// bound for exotic test setups or aggressive recovery paths.
+export const ATTEMPT_MAX_RETRIES_HARD_CAP = 20;
+
+// Steelman²⁰ critical: file-lock staleness must EXCEED the maximum time
+// publishOnce can hold the mutex.  Worst case:
+//   MAX_CUMULATIVE_RETRY_AFTER_MS (180s)
+//   + ATTEMPT_MAX_RETRIES_HARD_CAP × PUBLISH_BACKOFF_MAX_MS × 2 (160s)
+//   = 340s upper bound.
+// Add a 60s safety margin → 400s. The cost is "crashed-process recovery
+// takes 400s" which is acceptable for an interactive wallet (a crashed
+// wallet cannot publish anyway). Setting this BELOW the worst-case hold
+// would let proper-lockfile reap the lock mid-iteration and let a second
+// process take it — a silent mutex violation.
+export const FILE_LOCK_STALE_MS =
+  MAX_CUMULATIVE_RETRY_AFTER_MS +
+  ATTEMPT_MAX_RETRIES_HARD_CAP * PUBLISH_BACKOFF_MAX_MS * 2 +
+  60_000;
