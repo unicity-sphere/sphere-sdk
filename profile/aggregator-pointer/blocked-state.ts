@@ -282,6 +282,16 @@ export async function hasUnrecognizedBlockedReason(store: FlagStore): Promise<bo
   if (r.blocked !== true || typeof r.reason !== 'string' || typeof r.setAt !== 'number') {
     return false; // shape-malformed: caller's CORRUPT path is correct
   }
+  // Steelman⁴⁷ HIGH: tighten the "well-formed but unknown" predicate.
+  // Empty string and whitespace-padded reasons MUST be treated as
+  // malformed (caller's CORRUPT path), not as forward-compat
+  // unknowns. Otherwise an attacker with storage write access could
+  // set `reason: ''` or `reason: 'retry_exhausted '` and have the UI
+  // present a self-clearing prompt that bypasses the operator-
+  // override gate. A genuine forward-compat reason looks like a
+  // proper [a-z_]+ identifier.
+  if (r.reason.length === 0 || r.reason.trim() !== r.reason) return false;
+  if (!/^[a-z][a-z0-9_]*$/.test(r.reason)) return false;
   return !KNOWN_BLOCKED_REASONS.has(r.reason);
 }
 

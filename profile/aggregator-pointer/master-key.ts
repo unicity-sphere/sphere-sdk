@@ -218,32 +218,37 @@ const WEAK_KEY_DENYLIST_BYTES: ReadonlyArray<Uint8Array> = Object.freeze([
   ]),
 ]);
 
-// Fingerprint each entry as a 64-char lowercase hex string at module
-// load. These primitive strings are immutable and become the trust
-// anchor for runtime denylist integrity.
-function bytesToHexInternal(b: Uint8Array): string {
+// Steelman⁴⁷: declared as `const` arrow (immutable binding), not
+// `function` (which is a writable module-scope binding). Matches the
+// captured-prototype discipline elsewhere in this file. Renamed from
+// `bytesToHexInternal` to `denylistFingerprintHex` to make the
+// intended use site obvious — this helper MUST NOT be called on
+// secret material, since it materializes a heap-resident hex string
+// that defeats the steelman² rationale for not using `bytes.toString
+// (CryptoJS.enc.Hex)` on master-key bytes.
+const denylistFingerprintHex: (b: Uint8Array) => string = (b: Uint8Array): string => {
   let s = '';
   for (let i = 0; i < b.length; i++) {
     const v = b[i] ?? 0;
     s += (v < 0x10 ? '0' : '') + v.toString(16);
   }
   return s;
-}
+};
 const WEAK_KEY_DENYLIST_FINGERPRINT: ReadonlyArray<string> = Object.freeze(
-  WEAK_KEY_DENYLIST_BYTES.map((b) => bytesToHexInternal(b)),
+  WEAK_KEY_DENYLIST_BYTES.map((b) => denylistFingerprintHex(b)),
 );
 
-function assertDenylistIntact(): void {
+const assertDenylistIntact: () => void = (): void => {
   for (let i = 0; i < WEAK_KEY_DENYLIST_BYTES.length; i++) {
     const live = WEAK_KEY_DENYLIST_BYTES[i];
     if (!live || live.length !== 32) {
       throw new Error('master-key: WEAK_KEY_DENYLIST integrity violation (length)');
     }
-    if (bytesToHexInternal(live) !== WEAK_KEY_DENYLIST_FINGERPRINT[i]) {
+    if (denylistFingerprintHex(live) !== WEAK_KEY_DENYLIST_FINGERPRINT[i]) {
       throw new Error('master-key: WEAK_KEY_DENYLIST integrity violation (mutated bytes)');
     }
   }
-}
+};
 
 /**
  * Steelman⁴⁶ NOTE: previously short-circuited on first byte mismatch,

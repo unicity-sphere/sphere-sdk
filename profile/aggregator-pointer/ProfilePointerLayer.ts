@@ -454,8 +454,25 @@ export class ProfilePointerLayer {
     return this.#tracked(this.#clearBlockedInner());
   }
   async #clearBlockedInner(): Promise<void> {
+    // Steelman⁴⁷ MEDIUM: TOCTOU between the unrecognized-reason probe
+    // and the clear. A sibling process can flip an unrecognized
+    // reason to a recognized one between the two reads, allowing the
+    // clear to land without operator-override authority. Defense:
+    // re-read inside the critical section just before clearing and
+    // require the reason to STILL be unrecognized (or assert the
+    // override).  If the override is present, no re-read is needed.
+    if (this.#config.allowOperatorOverrides) {
+      await clearBlockedFlag(this.#init.flagStore);
+      return;
+    }
     const isUnrecognized = await hasUnrecognizedBlockedReason(this.#init.flagStore);
     if (!isUnrecognized) {
+      assertOperatorOverridesAllowed(this.#config, 'clearBlocked');
+    }
+    // Re-read just before the destructive remove. If the reason is
+    // no longer unrecognized (sibling rewrote it), enforce the gate.
+    const stillUnrecognized = await hasUnrecognizedBlockedReason(this.#init.flagStore);
+    if (!stillUnrecognized) {
       assertOperatorOverridesAllowed(this.#config, 'clearBlocked');
     }
     await clearBlockedFlag(this.#init.flagStore);

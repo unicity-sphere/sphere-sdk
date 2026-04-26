@@ -141,7 +141,14 @@ function constantTimeHexEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-const LOWERCASE_HEX_RE = /^[0-9a-f]+$/;
+// Steelman⁴⁷: tighten to 64-char fixed length. HMAC-SHA256 output is
+// always 32 bytes = 64 hex chars; a shorter or longer mac field is
+// always malformed. Previously the regex accepted any non-empty
+// lowercase hex, so a `mac: 'a'` would parse cleanly and only fail at
+// the constantTimeHexEqual length-mismatch branch — which surfaces as
+// "MAC verification failed" instead of "malformed mac field",
+// confusing telemetry.
+const LOWERCASE_HEX_RE = /^[0-9a-f]{64}$/;
 
 // =============================================================================
 // Encryption Functions
@@ -204,8 +211,24 @@ export function encrypt(
  *   - 'aes-256-cbc' (legacy): decrypt without authentication, log
  *     a one-shot warning, return result. New writes don't produce
  *     this format — but existing on-disk records remain readable.
+ *
+ * Steelman⁴⁷ HIGH: the legacy unauthenticated CBC branch is now gated
+ * behind the explicit `allowLegacyUnauthenticated` opt-in. By default,
+ * `decrypt()` refuses any record with `algorithm === 'aes-256-cbc'` —
+ * matching the v2-envelope gate in `decryptSimple` so direct callers
+ * (CLI tools, ad-hoc invocations) cannot reach the padding-oracle-
+ * exploitable legacy path with arbitrary attacker-supplied input.
+ *
+ * Internal call sites that legitimately need to read legacy records
+ * (read-only on-disk migration) MUST pass `{ allowLegacyUnauthenticated:
+ * true }` and gate the surrounding flow on the same authority that
+ * guards the legacy data source.
  */
-export function decrypt(encryptedData: EncryptedData, password: string): string {
+export function decrypt(
+  encryptedData: EncryptedData,
+  password: string,
+  options?: { allowLegacyUnauthenticated?: boolean },
+): string {
   // Steelman⁴⁰ note: validate `iterations` BEFORE running PBKDF2.
   // An attacker-controlled record with `iterations: 2^31` or huge
   // values would either hang the call or coerce to something bad.
@@ -269,6 +292,16 @@ export function decrypt(encryptedData: EncryptedData, password: string): string 
     return result;
   }
 
+  // Steelman⁴⁷ HIGH: legacy unauthenticated CBC is opt-in only.
+  // External callers (CLI ad-hoc decrypt command) cannot reach this
+  // path without explicitly setting allowLegacyUnauthenticated=true.
+  if (options?.allowLegacyUnauthenticated !== true) {
+    throw new SphereError(
+      'Decryption failed: refusing to decrypt unauthenticated legacy record without explicit opt-in. ' +
+        'Pass { allowLegacyUnauthenticated: true } if the data source is trusted (read-only on-disk migration).',
+      'DECRYPTION_ERROR',
+    );
+  }
   // Legacy unauthenticated path. Log a one-shot warning so operators
   // can audit how many records still need re-encryption.
   //
@@ -276,6 +309,9 @@ export function decrypt(encryptedData: EncryptedData, password: string): string 
   // shapes vs RETURN empty on others. Distinguishable error modes
   // give attackers a (weak) padding-oracle distinguisher. Normalize
   // all failure paths to the same SphereError code+message.
+  // Steelman⁴⁷: rethrow ONLY DECRYPTION_ERROR-coded SphereErrors;
+  // collapse any other SphereError into a generic DECRYPTION_ERROR
+  // so internal validation codes don't leak via this oracle path.
   warnLegacyUnauthenticatedOnce();
   try {
     const key = deriveKey(password, salt, encryptedData.iterations);
@@ -294,7 +330,7 @@ export function decrypt(encryptedData: EncryptedData, password: string): string 
     }
     return result;
   } catch (err) {
-    if (err instanceof SphereError) throw err;
+    if (err instanceof SphereError && err.code === 'DECRYPTION_ERROR') throw err;
     throw new SphereError(
       'Decryption failed: invalid password or corrupted data',
       'DECRYPTION_ERROR',

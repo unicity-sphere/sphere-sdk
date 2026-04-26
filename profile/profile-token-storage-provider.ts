@@ -1568,11 +1568,20 @@ export class ProfileTokenStorageProvider
     // are present in the remote state. If divergence is detected
     // (sibling process clobbered our merge), redo the merge against
     // the freshly-observed remote and retry up to MAX_RMW_RETRIES.
-    // After exhausting retries, log and accept lossy convergence —
-    // outbox processing is idempotent (re-reading from the token pool
-    // on next load reconstructs missing entries) so eventual
-    // consistency holds.
+    //
+    // Steelman⁴⁷ MEDIUM: bound the retry loop with a wall-clock
+    // budget. Each retry can hit slow OrbitDB+IPFS roundtrips; on
+    // degraded networks the 3 retries can occupy the flush hot path
+    // for tens of seconds, blocking shutdown drain. After the budget
+    // expires, log and surface a `storage:error` event so callers
+    // know convergence was incomplete (the previous "outbox rebuild
+    // on next load" reassurance was incorrect — the loader rebuilds
+    // tombstones/sent/history but reads outbox/invalid/mintOutbox
+    // directly from OrbitDB, so a clobbered entry IS lost until
+    // the originating flow re-adds it via a fresh save).
     const MAX_RMW_RETRIES = 3;
+    const RMW_WALL_CLOCK_BUDGET_MS = 10_000;
+    const rmwStart = Date.now();
     const localOutboxIds = new Set(opState.outbox.map((e) => (e as unknown as Record<string, unknown>).id).filter((v) => v !== undefined));
     const localInvalidIds = new Set(opState.invalid.map((e) => (e as unknown as Record<string, unknown>).tokenId).filter((v) => v !== undefined));
     const localMintIds = new Set(opState.mintOutbox.map((e) => (e as unknown as Record<string, unknown>).tokenId).filter((v) => v !== undefined));
@@ -1580,6 +1589,20 @@ export class ProfileTokenStorageProvider
 
     let attempt = 0;
     while (attempt <= MAX_RMW_RETRIES) {
+      // Steelman⁴⁷: wall-clock guard.
+      if (Date.now() - rmwStart > RMW_WALL_CLOCK_BUDGET_MS) {
+        this.log(
+          `writeOrbitOperationalState: wall-clock budget ${RMW_WALL_CLOCK_BUDGET_MS}ms exceeded ` +
+            `after ${attempt} retries; surfacing storage:error and returning lossy.`,
+        );
+        this.emitEvent(
+          this.buildErrorEvent(
+            'storage:error',
+            new Error('writeOrbitOperationalState: convergence budget exhausted; entries may be lost until next flush'),
+          ),
+        );
+        return;
+      }
       const remote = await this.readOperationalState();
       const merged: OperationalState = {
         tombstones: opState.tombstones,
@@ -1603,6 +1626,11 @@ export class ProfileTokenStorageProvider
         [`${addr}.invalidatedNametags`, merged.invalidatedNametags],
       ];
 
+      // Steelman⁴⁷ MEDIUM: abort the loop on the first write failure
+      // so the remaining keys are not committed in isolation, leaving
+      // OrbitDB inconsistent. Surface the error and return without
+      // retrying — write errors are likely environmental and will be
+      // corrected by the next flush; partial commits would not.
       let writeFailed = false;
       for (const [key, value] of writes) {
         try {
@@ -1610,9 +1638,11 @@ export class ProfileTokenStorageProvider
         } catch (err) {
           writeFailed = true;
           this.log(`Failed to write operational state key "${key}": ${err instanceof Error ? err.message : String(err)}`);
+          this.emitEvent(this.buildErrorEvent('storage:error', err));
+          break;
         }
       }
-      if (writeFailed) return; // a write error is its own concern; don't retry
+      if (writeFailed) return;
 
       // Verification re-read: confirm our local primary keys made it
       // into the remote state. If a sibling process clobbered our
@@ -1636,7 +1666,18 @@ export class ProfileTokenStorageProvider
       if (attempt > MAX_RMW_RETRIES) {
         this.log(
           `writeOrbitOperationalState: divergence persisted after ${MAX_RMW_RETRIES} retries; ` +
-            `accepting eventual consistency (outbox rebuild on next load will reconcile)`,
+            `surfacing storage:error — sibling-clobbered entries are lost until next flush.`,
+        );
+        // Steelman⁴⁷: corrected the misleading "outbox rebuild on next
+        // load" comment — readers actually pull outbox/invalid/
+        // mintOutbox directly from OrbitDB, so a clobbered entry is
+        // gone until its originator re-saves. Surface as event so
+        // callers can react.
+        this.emitEvent(
+          this.buildErrorEvent(
+            'storage:error',
+            new Error('writeOrbitOperationalState: convergence retries exhausted; entries may be lost until next flush'),
+          ),
         );
         return;
       }

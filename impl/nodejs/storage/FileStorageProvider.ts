@@ -296,11 +296,22 @@ export class FileStorageProvider implements StorageProvider {
       // a crashed lock. Throwing surfaces this to the caller (who can
       // emit a typed StorageEvent and let the user retry) instead of
       // proceeding with broken cross-process semantics.
-      releaseFileLock = await lockfileModule.lock(this.filePath, {
-        stale: 10_000,
-        retries: { retries: 50, minTimeout: 50, maxTimeout: 500 },
-        realpath: false,
-      });
+      try {
+        releaseFileLock = await lockfileModule.lock(this.filePath, {
+          stale: 10_000,
+          retries: { retries: 50, minTimeout: 50, maxTimeout: 500 },
+          realpath: false,
+        });
+      } catch (err) {
+        // Steelman⁴⁷: tag with a stable code so operator tooling can
+        // distinguish lock contention from generic save failures and
+        // implement targeted retry/backoff at higher layers.
+        const wrapped = new Error(
+          `FileStorageProvider: failed to acquire cross-process lock after retries: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        (wrapped as Error & { code?: string }).code = 'STORAGE_LOCK_CONTENDED';
+        throw wrapped;
+      }
     }
 
     try {

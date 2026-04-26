@@ -149,34 +149,38 @@ describe('decrypt()', () => {
     expect(() => decrypt(tampered, TEST_PASSWORD)).toThrow(/DoS guard/);
   });
 
-  it('should still read legacy unauthenticated aes-256-cbc records', () => {
+  it('should still read legacy unauthenticated aes-256-cbc records (opt-in)', () => {
     // Build a legacy-shape record by stripping the mac field and changing
     // the algorithm — this simulates on-disk records written before the
     // F.43 migration.
     const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
-    // Re-create a CBC-only record by re-encrypting with the legacy key
-    // derivation (single PBKDF2, used as the encryption key).
-    // This test just verifies the routing — actual legacy data was written
-    // by a prior version; we synthesize one by using `legacyEncryptForTest`
-    // semantics: same salt+iv+iterations, key from deriveKey (not split).
-    // For simplicity here, we verify the algorithm-routing path: any
-    // record with algorithm='aes-256-cbc' and no mac field is accepted
-    // by isEncryptedData and routed to the legacy decrypt path.
     const legacyShape = {
       ...encrypted,
       algorithm: 'aes-256-cbc' as const,
     };
     delete (legacyShape as Partial<typeof legacyShape>).mac;
-    // The synthesized record won't actually decrypt cleanly because the
-    // ciphertext was produced under the SPLIT enc key, not the unsplit
-    // legacy key. So we assert that the legacy code path runs (warning
-    // emitted) and either succeeds or fails on padding — both are fine
-    // for the routing assertion. We assert no MAC error is thrown.
+    // Steelman⁴⁷: legacy path now requires explicit opt-in. The test
+    // verifies that with the opt-in, the legacy routing runs (no MAC
+    // error thrown). The synthesized record may still fail on padding
+    // because of the split-key derivation difference — both outcomes
+    // are acceptable for the routing assertion.
     try {
-      decrypt(legacyShape, TEST_PASSWORD);
+      decrypt(legacyShape, TEST_PASSWORD, { allowLegacyUnauthenticated: true });
     } catch (err) {
       expect(String(err)).not.toMatch(/MAC verification failed/);
     }
+  });
+
+  it('should refuse legacy unauthenticated aes-256-cbc records without opt-in (steelman⁴⁷)', () => {
+    const encrypted = encrypt(TEST_PLAINTEXT, TEST_PASSWORD);
+    const legacyShape = {
+      ...encrypted,
+      algorithm: 'aes-256-cbc' as const,
+    };
+    delete (legacyShape as Partial<typeof legacyShape>).mac;
+    expect(() => decrypt(legacyShape, TEST_PASSWORD)).toThrow(
+      /refusing to decrypt unauthenticated legacy record/,
+    );
   });
 
   it('should handle special characters', () => {

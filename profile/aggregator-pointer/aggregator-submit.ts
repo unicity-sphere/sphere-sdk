@@ -550,17 +550,31 @@ export async function submitPointer(input: SubmitInput): Promise<SubmitOutcome> 
       submitOneSide(aggregatorClient, requestIdB, transactionHashB, authenticatorB, timeoutMs, input.abortSignal),
     ]);
 
-    // After Promise.allSettled returns, if the abort signal fired during
-    // submit, prefer surfacing the abort to the caller over the spec
-    // outcome — the loop deadline is the source of truth.
-    if (input.abortSignal?.aborted) {
-      const err = new Error('submitPointer aborted by caller');
-      err.name = 'AbortError';
-      throw err;
-    }
-
     const outcomeA = classifySideResult(resultA);
     const outcomeB = classifySideResult(resultB);
+
+    // Steelman⁴⁷ NOTE: if Promise.allSettled actually completed both
+    // sides BEFORE the abort signal fired (the network was faster
+    // than the deadline timer), the aggregator already holds the
+    // commit. Returning AbortError here would force the caller to
+    // re-publish at v+1 even though v is now firmly committed — a
+    // wasted reconcile cycle, and a violation of the H8 v-burning
+    // discipline (we'd burn v silently). Inspect the per-side
+    // outcomes: if both classified as success/exists/idempotent, the
+    // commit landed and we MUST surface the spec outcome rather than
+    // throwing AbortError. Only if at least one side did NOT classify
+    // (network_error, timeout, abort) AND the abort signal is set, do
+    // we surface AbortError — that's the genuine abandonment case.
+    if (input.abortSignal?.aborted) {
+      const aClassified = outcomeA.type === 'success' || outcomeA.type === 'exists';
+      const bClassified = outcomeB.type === 'success' || outcomeB.type === 'exists';
+      if (!(aClassified && bClassified)) {
+        const err = new Error('submitPointer aborted by caller');
+        err.name = 'AbortError';
+        throw err;
+      }
+      // Both sides committed before abort; fall through to combine.
+    }
 
     return combineOutcomes(outcomeA, outcomeB, v, cidBytes, marker, isIdempotentRetryHint);
   } finally {

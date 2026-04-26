@@ -7,6 +7,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as readline from 'readline';
+import * as crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { encrypt, decrypt } from '../core/encryption';
 import { parseWalletText, isTextWalletEncrypted, parseAndDecryptWalletText } from '../serialization/wallet-text';
@@ -198,7 +199,9 @@ function saveConfig(config: CliConfig): void {
   // contract claimed in the function header.
   const dir = path.dirname(CONFIG_FILE);
   fs.mkdirSync(dir, { recursive: true });
-  const tmp = CONFIG_FILE + '.tmp.' + process.pid + '.' + Date.now();
+  // Steelman⁴⁷: include 4 random bytes so two saves within the same
+  // ms in the same process can't collide on temp filename.
+  const tmp = CONFIG_FILE + '.tmp.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(4).toString('hex');
   const fd = fs.openSync(tmp, 'w', 0o600);
   try {
     fs.writeSync(fd, JSON.stringify(config, null, 2));
@@ -241,7 +244,8 @@ function saveProfiles(store: ProfilesStore): void {
   // Steelman⁴⁶ WARNING: durable atomic via fsync(file) + rename + fsync(dir).
   const dir = path.dirname(PROFILES_FILE);
   fs.mkdirSync(dir, { recursive: true });
-  const tmp = PROFILES_FILE + '.tmp.' + process.pid + '.' + Date.now();
+  // Steelman⁴⁷: random suffix prevents same-ms collision.
+  const tmp = PROFILES_FILE + '.tmp.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(4).toString('hex');
   const fd = fs.openSync(tmp, 'w', 0o600);
   try {
     fs.writeSync(fd, JSON.stringify(store, null, 2));

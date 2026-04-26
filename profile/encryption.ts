@@ -105,6 +105,19 @@ export async function encryptProfileValue(
   plaintext: Uint8Array,
   aad?: Uint8Array,
 ): Promise<Uint8Array> {
+  // Steelman⁴⁷: an empty AAD authenticates DIFFERENTLY than no AAD in
+  // AES-GCM (the auth tag depends on it). Treating `new Uint8Array(0)`
+  // as equivalent to `undefined` would silently produce a ciphertext
+  // that decryption (with the same empty-vs-undefined inconsistency)
+  // could not authenticate. Reject empty AAD as caller misuse so the
+  // distinction is visible in the source rather than at runtime
+  // mid-decrypt.
+  if (aad !== undefined && aad.length === 0) {
+    throw new ProfileError(
+      'ENCRYPTION_FAILED',
+      'empty AAD is rejected — pass undefined to skip AAD or pass non-empty bytes',
+    );
+  }
   try {
     const iv = globalThis.crypto.getRandomValues(new Uint8Array(IV_LENGTH));
     const cryptoKey = await importKey(key);
@@ -154,6 +167,13 @@ export async function decryptProfileValue(
   encrypted: Uint8Array,
   aad?: Uint8Array,
 ): Promise<Uint8Array> {
+  // Steelman⁴⁷: see encryptProfileValue — empty AAD is caller misuse.
+  if (aad !== undefined && aad.length === 0) {
+    throw new ProfileError(
+      'DECRYPTION_FAILED',
+      'empty AAD is rejected — pass undefined to skip AAD or pass non-empty bytes',
+    );
+  }
   if (encrypted.length < IV_LENGTH + 1) {
     throw new ProfileError(
       'DECRYPTION_FAILED',
