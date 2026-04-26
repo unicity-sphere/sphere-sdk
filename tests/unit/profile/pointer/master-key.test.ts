@@ -77,4 +77,68 @@ describe('MasterPrivateKey (T-A5b)', () => {
     input[0] = 0xff;
     expect(master.bytes[0]).toBe(0x42);
   });
+
+  // Steelman²⁶ regression coverage for hostile-TypedArray-subclass attacks.
+  describe('hostile TypedArray subclass defenses (steelman²³–²⁵)', () => {
+    it('rejects subclass with forged toStringTag and custom .buffer/.slice', () => {
+      // The fake .buffer claims to be an ArrayBuffer (toStringTag forged) and
+      // exposes a .slice() returning attacker-supplied bytes. The captured
+      // ArrayBuffer.prototype.slice.call rejects this because the receiver
+      // lacks the [[ArrayBufferData]] internal slot.
+      const fakeBuffer = {
+        byteLength: 200,
+        slice: (_s: number, _e: number) => {
+          // Attacker would put a non-denylisted weak scalar here
+          // (e.g., 0x02×32) to deterministically derive a known key.
+          return new ArrayBuffer(32);
+        },
+        [Symbol.toStringTag]: 'ArrayBuffer',
+      };
+      class HostileBytes extends Uint8Array {
+        get buffer(): ArrayBufferLike {
+          return fakeBuffer as unknown as ArrayBufferLike;
+        }
+      }
+      const real = new Uint8Array(32).fill(0x42);
+      const hostile = new HostileBytes(real.buffer);
+      expect(() => createMasterPrivateKey(hostile, 'test-vectors')).toThrow(
+        /not a real ArrayBuffer/i,
+      );
+    });
+
+    it('rejects subclass with negative byteOffset', () => {
+      // Hostile byteOffset getter returning -64 on a 64-byte buffer would
+      // cause ArrayBuffer.slice(-64, -32) to clamp to slice(0, 32),
+      // reading 32 bytes from a different region.  Pre-validation rejects.
+      const realArrayBuffer = new ArrayBuffer(64);
+      class HostileOffset extends Uint8Array {
+        constructor(buf: ArrayBufferLike) {
+          super(buf, 32, 32);
+        }
+        get byteOffset(): number {
+          return -64;
+        }
+      }
+      const hostile = new HostileOffset(realArrayBuffer);
+      expect(() => createMasterPrivateKey(hostile, 'test-vectors')).toThrow(
+        /invalid byteOffset/i,
+      );
+    });
+
+    it('rejects subclass with non-integer length', () => {
+      const realArrayBuffer = new ArrayBuffer(64);
+      class HostileLen extends Uint8Array {
+        constructor(buf: ArrayBufferLike) {
+          super(buf, 0, 32);
+        }
+        get length(): number {
+          return 32.5;
+        }
+      }
+      const hostile = new HostileLen(realArrayBuffer);
+      expect(() => createMasterPrivateKey(hostile, 'test-vectors')).toThrow(
+        /must be exactly 32 bytes/,
+      );
+    });
+  });
 });

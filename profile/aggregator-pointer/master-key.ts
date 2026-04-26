@@ -16,11 +16,16 @@
 
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
-// Steelman¹⁹/²⁰/²⁵: cache prototype methods at module load — defends
-// against late prototype-pollution turning every wipe / type-tag check
-// into a no-op or a leak. All security-critical operations now resolve
-// through these captured references rather than going through
-// (potentially polluted or attacker-overridden) prototype lookups.
+// Steelman¹⁹/²⁰/²⁵/²⁶: cache prototype methods AND globals at module load
+// — defends against late prototype-pollution turning every wipe / type-tag
+// check / numeric validation into a no-op or a leak. All security-critical
+// operations resolve through these captured references rather than going
+// through (potentially polluted or attacker-overridden) prototype lookups
+// or `globalThis` reads.
+//
+// IMPORTANT: this defense is contingent on this module loading BEFORE any
+// untrusted code modifies these prototypes/globals. Bundle this module
+// early in the import graph; downstream poisoning is then defeated.
 const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
 const OBJECT_TO_STRING = Object.prototype.toString;
 // Steelman²⁵ critical: capture ArrayBuffer.prototype.slice for use as the
@@ -31,6 +36,16 @@ const OBJECT_TO_STRING = Object.prototype.toString;
 // internal slot). This is the bedrock check that defeats hostile
 // TypedArray subclasses regardless of which surface property they spoof.
 const ARRAY_BUFFER_SLICE = ArrayBuffer.prototype.slice;
+// Steelman²⁶ warning: numeric validation should use captured references
+// for consistency with the captured-method discipline above. Late
+// pollution `Number.isInteger = () => true` would otherwise nullify
+// every range check.
+const NUMBER_IS_INTEGER = Number.isInteger;
+const NUMBER_MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+// Steelman²⁶ warning: capture Uint8Array constructor so a late
+// `globalThis.Uint8Array = HostileSubclass` cannot inject an
+// attacker-controlled wrapper around the just-sliced bytes.
+const UINT8_ARRAY_CTOR = Uint8Array;
 function safeWipe(buf: Uint8Array | null | undefined): void {
   if (!buf) return;
   try {
@@ -257,9 +272,9 @@ export function createMasterPrivateKey(
   const sourceOffset = bytes.byteOffset;
   const sourceLen = bytes.length;
   if (
-    !Number.isInteger(sourceOffset) ||
+    !NUMBER_IS_INTEGER(sourceOffset) ||
     sourceOffset < 0 ||
-    sourceOffset > Number.MAX_SAFE_INTEGER
+    sourceOffset > NUMBER_MAX_SAFE_INTEGER
   ) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
@@ -267,7 +282,7 @@ export function createMasterPrivateKey(
     );
   }
   if (
-    !Number.isInteger(sourceLen) ||
+    !NUMBER_IS_INTEGER(sourceLen) ||
     sourceLen !== 32
   ) {
     throw new RangeError(
@@ -319,7 +334,7 @@ export function createMasterPrivateKey(
   // therefore allocates a fresh 32-byte copy; callers feeding HKDF should
   // wipe the returned copy when done. `zeroize()` wipes the SOURCE buffer,
   // after which all future .bytes reads return zeros.
-  const internalBytes = new Uint8Array(
+  const internalBytes = new UINT8_ARRAY_CTOR(
     copyArrayBufferRange(sourceBuffer, sourceOffset, sourceOffset + sourceLen),
   );
   // Steelman²² critical defense-in-depth: re-assert the copy length.
