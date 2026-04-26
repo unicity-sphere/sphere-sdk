@@ -62,6 +62,13 @@ export interface DiscoverInput {
    * indicates the caller invoked acceptCorruptStreak; W7 floor check runs.
    */
   readonly walkbackLimit?: number;
+  /**
+   * Absolute wall-clock deadline (Date.now() epoch ms) for the entire
+   * discovery operation across all three phases. Defaults to a computed
+   * upper bound based on PROBE_REQUEST_TIMEOUT_MS and phase iteration limits.
+   * Provide a tighter value when the caller holds a mutex with a hard timeout.
+   */
+  readonly discoveryDeadlineMs?: number;
 }
 
 export interface DiscoverResult {
@@ -91,6 +98,24 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
   } = input;
   const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
   const walkbackLimit = input.walkbackLimit ?? DISCOVERY_CORRUPT_WALKBACK;
+  // Steelman¹⁸: bound total discovery time so the mutex is not held forever.
+  // Default upper bound: phase ceilings × per-request timeout.
+  //   Phase 1: log2(HARD_CEILING / INITIAL) ≈ 12 + Phase 2: 22 ≈ 34 probes
+  //   Phase 3: walkbackLimit probes
+  // Each probe allows up to timeoutMs. An extra 2× factor absorbs backoff.
+  const defaultDeadline =
+    Date.now() + (34 + walkbackLimit) * timeoutMs * 2;
+  const discoveryDeadlineMs = input.discoveryDeadlineMs ?? defaultDeadline;
+
+  const checkDeadline = (): void => {
+    if (Date.now() > discoveryDeadlineMs) {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+        `Discovery exceeded wall-clock deadline after ${Date.now() - (discoveryDeadlineMs - (34 + walkbackLimit) * timeoutMs * 2)}ms.`,
+        { currentLocalVersion },
+      );
+    }
+  };
 
   // Wave F.2 security advisory MEDIUM-2 remediation: assert currentLocalVersion
   // is within the discovery search space. A locally-corrupted cache that
@@ -114,6 +139,7 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
 
   const probeVersions: PointerVersion[] = [];
   const probeAndRecord = async (v: PointerVersion): Promise<boolean> => {
+    checkDeadline();
     probeVersions.push(v);
     return probeVersion({ v, keyMaterial, signer, aggregatorClient, trustBase, timeoutMs });
   };
@@ -182,6 +208,7 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
     // Record this Phase 3 visit in the probe sequence so the probe fingerprint
     // reflects the corruption walkback — clustering's MAIN use case is
     // detecting same-corrupt-prefix wallets.
+    checkDeadline();
     probeVersions.push(candidate);
 
     const status = await classifyVersion({

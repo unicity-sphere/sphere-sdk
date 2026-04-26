@@ -46,19 +46,34 @@ export function derivePointerKeyMaterial(masterKey: MasterPrivateKey): PointerKe
   // masterKey.bytes now returns a DEFENSIVE COPY (steelman remediation).
   // Wipe it post-HKDF to narrow heap residue window.
   const walletPrivateKey = masterKey.bytes;
+  // Declare intermediates outside the try so the catch block can zero them on
+  // any partial-derivation error path (steelman¹⁸ finding: expand() throwing
+  // mid-chain left already-derived bytes abandoned to GC without zeroing).
+  let pointerSecretBytes: Uint8Array | null = null;
+  let signingSeedBytes: Uint8Array | null = null;
+  let xorSeedBytes: Uint8Array | null = null;
+  let padSeedBytes: Uint8Array | null = null;
   try {
-    const pointerSecretBytes = hkdf(sha256, walletPrivateKey, new Uint8Array(0), PROFILE_POINTER_HKDF_INFO, 32);
-
-    const signingSeedBytes = expand(sha256, pointerSecretBytes, SIGNING_SEED_INFO, 32);
-    const xorSeedBytes = expand(sha256, pointerSecretBytes, XOR_SEED_INFO, 32);
-    const padSeedBytes = expand(sha256, pointerSecretBytes, PAD_SEED_INFO, 32);
-
+    pointerSecretBytes = hkdf(sha256, walletPrivateKey, new Uint8Array(0), PROFILE_POINTER_HKDF_INFO, 32);
+    signingSeedBytes = expand(sha256, pointerSecretBytes, SIGNING_SEED_INFO, 32);
+    xorSeedBytes = expand(sha256, pointerSecretBytes, XOR_SEED_INFO, 32);
+    padSeedBytes = expand(sha256, pointerSecretBytes, PAD_SEED_INFO, 32);
     return {
       pointerSecret: new SecretKey(pointerSecretBytes, 'pointerSecret'),
       signingSeed: new SecretKey(signingSeedBytes, 'signingSeed'),
       xorSeed: new SecretKey(xorSeedBytes, 'xorSeed'),
       padSeed: new SecretKey(padSeedBytes, 'padSeed'),
     };
+  } catch (err) {
+    // Zero any partially-derived buffers before re-throwing.
+    // SecretKey constructor takes ownership on the success path; these
+    // bare Uint8Arrays are only present here when an error interrupted
+    // derivation before wrapping completed.
+    pointerSecretBytes?.fill(0);
+    signingSeedBytes?.fill(0);
+    xorSeedBytes?.fill(0);
+    padSeedBytes?.fill(0);
+    throw err;
   } finally {
     walletPrivateKey.fill(0);
   }

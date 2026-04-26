@@ -113,13 +113,18 @@ describe('isBlocked / setBlocked / clearBlocked (T-B5)', () => {
     });
   });
 
-  it('isBlocked returns blocked=true for unknown reason (forward-compat)', async () => {
+  it('isBlocked throws CORRUPT for unrecognized reason (fail-closed, not forward-compat)', async () => {
+    // Steelman¹⁸ remediation: unknown reasons must throw CORRUPT, not silently
+    // return blocked=true. An attacker with storage write access could persist
+    // { blocked:true, reason:"anything" } and brick the wallet permanently.
+    // Unrecognized reasons surface the anomaly for operator investigation.
     await (fs as unknown as { set(k: string, v: string): Promise<void> }).set(
       'blocked',
       JSON.stringify({ blocked: true, reason: 'future_reason', setAt: Date.now() }),
     );
-    const state = await isBlocked(fs);
-    expect(state.blocked).toBe(true);
+    await expect(isBlocked(fs)).rejects.toMatchObject({
+      code: AggregatorPointerErrorCode.CORRUPT,
+    });
   });
 
   it('setBlocked overwrites a corrupt record (fail-forward on corruption)', async () => {

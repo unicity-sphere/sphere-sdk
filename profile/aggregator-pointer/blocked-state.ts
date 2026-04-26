@@ -157,10 +157,20 @@ export async function isBlocked(store: FlagStore): Promise<BlockedState> {
   }
 
   if (!KNOWN_BLOCKED_REASONS.has(r.reason)) {
-    // Forward-compatibility: a newer spec version may write a reason unknown to
-    // this version.  Treating it as CORRUPT would brick wallets on version
-    // downgrade — instead, remain blocked (safe default) with the stored reason.
-    return { blocked: true, reason: r.reason as BlockedReason, setAt: r.setAt };
+    // Steelman¹⁸: forward-compat unknown-reason is exploitable — anyone with
+    // storage write access can persist { blocked:true, reason:"anything" } and
+    // brick the wallet permanently (clearBlocked is gated on operator overrides).
+    // Treat unrecognized reasons as CORRUPT: the record may be from a newer
+    // spec version, but it may also be attacker-injected.  Failing closed here
+    // surfaces the anomaly so operators can investigate rather than silently
+    // accepting a permanent block with an unknown cause.
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.CORRUPT,
+      `BLOCKED flag storage contains unrecognized reason "${r.reason}" — ` +
+        'possible storage tampering or a newer spec version. ' +
+        'Remove the BLOCKED flag manually or upgrade the SDK.',
+      { record: rec },
+    );
   }
 
   return { blocked: true, reason: r.reason as BlockedReason, setAt: r.setAt };

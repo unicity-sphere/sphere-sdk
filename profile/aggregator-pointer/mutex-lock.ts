@@ -232,34 +232,41 @@ class NodeMutex implements PointerMutex {
     // Orphan prevention: if the timeout fires before acquireInProcess resolves,
     // we must still release the lock when it eventually resolves — otherwise
     // async-mutex is permanently stuck for this process.
+    //
+    // Steelman¹⁸ fix: previously two separate setTimeout calls were used —
+    // one to set `timedOut = true` and one to reject the timeout promise.
+    // A late-resolving inProcessAcquirePromise could see `timedOut = false`
+    // if it resolved between the two timer firings (same delay, different
+    // event-loop entries), leaving an orphaned mutex hold for the process
+    // lifetime. Fix: collapse to a single timer that sets the flag and
+    // rejects atomically in the same synchronous callback.
     let timedOut = false;
     let inProcessRelease: (() => void) | null = null;
 
     const inProcessAcquirePromise = prim.acquireInProcess();
 
     // Safety handler: release lock on late resolution after timeout.
+    // `timedOut` is guaranteed to be true before this handler can observe
+    // a "caller already threw" state because the flag is set synchronously
+    // inside the timeout callback that also enqueues the rejection.
     void inProcessAcquirePromise.then((release) => {
       if (timedOut) {
         try { release(); } catch { /* noop — async-mutex release on abandoned lock */ }
       }
     });
 
-    const inProcessTimer = setTimeout(() => { timedOut = true; }, timeoutMs);
-
-    // Save the inner timer handle so it can be cleared if the acquire wins
-    // the race — prevents an unhandled rejection in --unhandled-rejections=strict.
+    // Single timer: sets `timedOut` and rejects atomically.
     let inProcessTimeoutHandle!: ReturnType<typeof setTimeout>;
     const inProcessTimeout = new Promise<never>((_, reject) => {
-      inProcessTimeoutHandle = setTimeout(
-        () =>
-          reject(
-            new AggregatorPointerError(
-              AggregatorPointerErrorCode.PUBLISH_BUSY,
-              `In-process mutex for "${this.#lockFilePath}" not acquired within ${timeoutMs}ms.`,
-            ),
+      inProcessTimeoutHandle = setTimeout(() => {
+        timedOut = true; // must precede reject() — same sync callback
+        reject(
+          new AggregatorPointerError(
+            AggregatorPointerErrorCode.PUBLISH_BUSY,
+            `In-process mutex for "${this.#lockFilePath}" not acquired within ${timeoutMs}ms.`,
           ),
-        timeoutMs,
-      );
+        );
+      }, timeoutMs);
     });
     // Suppress the unhandled rejection if the acquire wins the race.
     void inProcessTimeout.catch(() => {});
@@ -267,11 +274,9 @@ class NodeMutex implements PointerMutex {
     try {
       inProcessRelease = await Promise.race([inProcessAcquirePromise, inProcessTimeout]);
     } catch (err) {
-      clearTimeout(inProcessTimer);
       clearTimeout(inProcessTimeoutHandle);
       throw err;
     }
-    clearTimeout(inProcessTimer);
     clearTimeout(inProcessTimeoutHandle);
 
     // Step 2: acquire file lock (cross-process).
@@ -293,7 +298,11 @@ class NodeMutex implements PointerMutex {
       } catch (err: unknown) {
         const code = (err as NodeJS.ErrnoException)?.code;
         if (code === 'ELOCKED') {
-          await new Promise((res) => setTimeout(res, Math.min(retryMs, deadline - Date.now())));
+          // Math.max(0, …) guards against a negative delay when the deadline
+          // has already elapsed during the acquireFileLock call above; without
+          // it, Node coerces the negative value to 0 and spins a tight loop
+          // iteration before the next `remaining <= 0` check fires.
+          await new Promise((res) => setTimeout(res, Math.max(0, Math.min(retryMs, deadline - Date.now()))));
           continue;
         }
         inProcessRelease!();

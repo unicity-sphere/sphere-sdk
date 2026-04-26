@@ -138,6 +138,15 @@ async function publishOnce(
   let retriesConsumed = 0;
   let cumulativeRetryAfterMs = 0;
 
+  // Steelman¹⁸ wall-clock deadline: count-based budget + cumulative
+  // retry_after cap are each individually bounded, but an adversarial
+  // aggregator alternating the two strategies could compound them.
+  // A hard deadline caps the total time this function can hold the mutex.
+  const loopDeadline =
+    Date.now() +
+    MAX_CUMULATIVE_RETRY_AFTER_MS +
+    attemptOpts.maxRetries * PUBLISH_BACKOFF_MAX_MS * 2;
+
   // Steelman remediation (finding #7): read the marker ONCE before the
   // retry loop. Previously the marker was re-read on every iteration;
   // a torn IndexedDB write during a retry (Safari aggressive eviction)
@@ -159,6 +168,13 @@ async function publishOnce(
   let isIdempotentRetryHint = isIdempotentRetryHintInitial;
 
   for (;;) {
+    if (Date.now() > loopDeadline) {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+        `publishOnce exceeded wall-clock deadline after ${Date.now() - (loopDeadline - MAX_CUMULATIVE_RETRY_AFTER_MS - attemptOpts.maxRetries * PUBLISH_BACKOFF_MAX_MS * 2)}ms.`,
+        { v, retriesConsumed, cumulativeRetryAfterMs },
+      );
+    }
     // Steelman remediation: verify the publish mutex is still held before
     // every submit. In browsers, BFCache/freeze/tab-discard can release
     // Web Locks while our async continuation is suspended; if we resume
@@ -390,17 +406,24 @@ export async function publishOnceAtVersion(
         } catch (e) {
           bookkeeping.failures.push(`maybeSetBlocked threw: ${String(e)}`);
         }
-        try {
-          await clearMarker(flagStore);
-          bookkeeping.markerCleared = true;
-        } catch (e) {
-          bookkeeping.failures.push(`clearMarker threw: ${String(e)}`);
-        }
+        // Steelman¹⁸ fix: persist localVersion BEFORE clearing the marker.
+        // Previous order (clearMarker → persistLocalVersion) meant that if
+        // persistLocalVersion threw, the marker was already gone — the next
+        // publish would re-target the same resolvedV and re-burn it.
+        // With this order, a persistLocalVersion failure leaves the marker
+        // intact so the next publish detects the burned version via the
+        // Case 4 OTP-safe bump and advances past it without re-burning.
         try {
           await input.persistLocalVersion(resolvedV);
           bookkeeping.localVersionPersisted = true;
         } catch (e) {
           bookkeeping.failures.push(`persistLocalVersion threw: ${String(e)}`);
+        }
+        try {
+          await clearMarker(flagStore);
+          bookkeeping.markerCleared = true;
+        } catch (e) {
+          bookkeeping.failures.push(`clearMarker threw: ${String(e)}`);
         }
         // Attach diagnostics to the thrown error so the caller / UI / telemetry
         // can surface partial-failure warnings. Using `details` (the existing

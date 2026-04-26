@@ -122,6 +122,18 @@ export function addInstance(
     );
   }
 
+  // Rule 3b (steelman¹⁸): representation must be >= predecessor's.
+  // An attacker could keep semantics constant while downgrading representation,
+  // silently replacing the chain head with an older-format element. Consumers
+  // using the 'latest' selection strategy would then receive a downgraded
+  // element without any error signal.
+  if (newInstance.header.representation < currentHeadElement.header.representation) {
+    throw new UxfError(
+      'INVALID_INSTANCE_CHAIN',
+      `Representation version regression: new instance has ${newInstance.header.representation} but predecessor has ${currentHeadElement.header.representation}`,
+    );
+  }
+
   // Insert new instance into pool.
   const newHash = pool.put(newInstance);
 
@@ -508,15 +520,25 @@ export function rebuildInstanceChainIndex(
         if (succs.length === 1) {
           const nextHash = succs[0];
           if (visited.has(nextHash)) break; // cycle protection
-          visited.add(nextHash);
           const nextElement = pool.get(nextHash)!;
+          // Steelman¹⁸: enforce type equality along the chain. Two elements of
+          // different types that share a predecessor hash (e.g., via an attacker-
+          // controlled pool insertion) would otherwise merge into a mixed-type
+          // chain here.  addInstance enforces the type gate on the write path;
+          // rebuild must enforce it on the read path for consistency.
+          const tailElement = pool.get(chain[chain.length - 1]?.hash ?? tailHash)!;
+          if (nextElement.type !== tailElement.type) break;
+          visited.add(nextHash);
           chain.push({ hash: nextHash, kind: nextElement.header.kind });
           currentHash = nextHash;
         } else {
           // Branch: each successor starts its own sub-chain.
+          const currentElement = pool.get(currentHash)!;
           for (const nextHash of succs) {
             if (visited.has(nextHash)) continue;
             const nextElement = pool.get(nextHash)!;
+            // Same type-equality gate for branching paths.
+            if (nextElement.type !== currentElement.type) continue;
             walkBranch(nextHash, nextElement.header.kind, chain);
           }
           return;

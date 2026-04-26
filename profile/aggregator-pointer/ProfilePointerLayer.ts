@@ -114,6 +114,10 @@ export class ProfilePointerLayer {
    * itself from the set in a `finally` block.
    */
   readonly #inFlight = new Set<Promise<unknown>>();
+  // Steelman¹⁸: set by shutdown() to prevent new operations from being
+  // enqueued during drain.  Public methods check this flag and reject
+  // immediately after shutdown starts.
+  #shuttingDown = false;
 
   constructor(init: ProfilePointerLayerInit) {
     this.#init = init;
@@ -163,6 +167,16 @@ export class ProfilePointerLayer {
     return op;
   }
 
+  /** Throw if shutdown is in progress — used by all public entry points. */
+  #assertNotShuttingDown(opName: string): void {
+    if (this.#shuttingDown) {
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.PUBLISH_BUSY,
+        `ProfilePointerLayer.${opName}() called after shutdown() started — operation rejected.`,
+      );
+    }
+  }
+
   /**
    * Wave F.2 architecture-advisory remediation: drain in-flight
    * publish/recover/probe operations before the surrounding
@@ -177,12 +191,19 @@ export class ProfilePointerLayer {
    * publish state which is unsafe. Callers that need a hard timeout
    * should wrap in `Promise.race([layer.shutdown(), timeoutPromise])`.
    *
-   * Idempotent — safe to call multiple times.
+   * Steelman¹⁸: sets #shuttingDown to block new operations from being
+   * enqueued during the drain. Concurrent calls both participate in
+   * draining (via Promise.allSettled) rather than racing on a snapshot.
+   * Safe to call multiple times — subsequent calls drain any operations
+   * enqueued after the previous shutdown() completed.
    */
   async shutdown(): Promise<void> {
-    if (this.#inFlight.size === 0) return;
-    const pending = [...this.#inFlight];
-    await Promise.allSettled(pending);
+    this.#shuttingDown = true;
+    // Drain in a loop: new operations can complete and self-remove while
+    // we await, so re-check until the set is empty.
+    while (this.#inFlight.size > 0) {
+      await Promise.allSettled([...this.#inFlight]);
+    }
   }
 
   // ── publish ──────────────────────────────────────────────────────────────
@@ -199,6 +220,7 @@ export class ProfilePointerLayer {
    *   merged from fetchAndJoin on prior conflicts.
    */
   async publish(cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
+    this.#assertNotShuttingDown('publish');
     return this.#tracked(this.#publishInner(cidProducer));
   }
 
@@ -234,6 +256,11 @@ export class ProfilePointerLayer {
    * CAR successfully.
    */
   async recoverLatest(): Promise<RecoverResult | null> {
+    this.#assertNotShuttingDown('recoverLatest');
+    return this.#tracked(this.#recoverLatestInner());
+  }
+
+  async #recoverLatestInner(): Promise<RecoverResult | null> {
     const discovery = await this.discoverLatestVersion();
     if (discovery.validV === 0) return null;
     const cid = await this.#init.resolveRemoteCid(discovery.validV);
@@ -248,6 +275,11 @@ export class ProfilePointerLayer {
    * validation per SPEC §8.2 step 3). Returns { validV, includedV } per H4.
    */
   async discoverLatestVersion(walkbackLimit?: number): Promise<DiscoverResult> {
+    this.#assertNotShuttingDown('discoverLatestVersion');
+    return this.#tracked(this.#discoverLatestVersionInner(walkbackLimit));
+  }
+
+  async #discoverLatestVersionInner(walkbackLimit?: number): Promise<DiscoverResult> {
     const currentLocalVersion = await this.#init.readLocalVersion();
     const result = await findLatestValidVersion({
       currentLocalVersion,
@@ -271,10 +303,13 @@ export class ProfilePointerLayer {
    * permissible PATH_NOT_INCLUDED). False only on network-level failure.
    */
   async isReachable(): Promise<boolean> {
-    return isReachable({
-      signingPubKey: this.#init.signer.signingPubKey,
-      aggregatorClient: this.#init.aggregatorClient,
-    });
+    this.#assertNotShuttingDown('isReachable');
+    return this.#tracked(
+      isReachable({
+        signingPubKey: this.#init.signer.signingPubKey,
+        aggregatorClient: this.#init.aggregatorClient,
+      }),
+    );
   }
 
   // ── isPublishBlocked ─────────────────────────────────────────────────────
@@ -342,7 +377,12 @@ export class ProfilePointerLayer {
    * @throws AggregatorPointerError(UNREACHABLE_RECOVERY_BLOCKED) if gate not met.
    */
   async acceptCarLoss(version: PointerVersion, cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
+    this.#assertNotShuttingDown('acceptCarLoss');
     assertOperatorOverridesAllowed(this.#config, 'acceptCarLoss');
+    return this.#tracked(this.#acceptCarLossInner(version, cidProducer));
+  }
+
+  async #acceptCarLossInner(version: PointerVersion, cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
     // Step 1: H7 wall-clock gate.
     await assertAcceptCarLossEligible(this.#init.flagStore, version);
     // Step 2: MANDATORY republish BEFORE advance (H7 step 4).

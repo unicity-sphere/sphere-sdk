@@ -161,18 +161,20 @@ export function createMasterPrivateKey(
       `MasterPrivateKey must be exactly 32 bytes, got ${bytes.length}`,
     );
   }
-  if (isDenylistedMasterKey(bytes, network)) {
-    const isKat = isCanonicalKatVector(bytes);
+  // Reject SharedArrayBuffer: a SAB-backed Uint8Array can be mutated from a
+  // Worker between the denylist check and the internal copy (TOCTOU).  An
+  // attacker could pass a benign value through the denylist gate and then
+  // swap in a weak scalar (all-zero, N, …) before the copy executes.
+  if (bytes.buffer instanceof SharedArrayBuffer) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
-      isKat
-        ? 'MasterPrivateKey denylist hit (SPEC §14.1): canonical 0x01×32 KAT vector ' +
-          'is reserved for test fixtures. Pass network="test-vectors" to accept it.'
-        : 'MasterPrivateKey denylist hit (SPEC §14.1): refusing all-zero / all-FF / ' +
-          'curve-order-N scalar. These derive deterministic, ' +
-          'cross-wallet-colliding pointer-layer keys.',
+      'MasterPrivateKey input must not be backed by SharedArrayBuffer — ' +
+        'concurrent mutation between denylist check and internal copy is a TOCTOU risk.',
     );
   }
+  // Copy FIRST, then validate the copy — not the caller-controlled buffer.
+  // Previous order (validate bytes → copy bytes) was susceptible to
+  // TOCTOU if `bytes` was mutated between the two operations.
   // The [_brand] field is compile-time only — TypeScript erases it and
   // `declare const _brand` has no runtime value.
   //
@@ -185,6 +187,23 @@ export function createMasterPrivateKey(
   // wipe the returned copy when done. `zeroize()` wipes the SOURCE buffer,
   // after which all future .bytes reads return zeros.
   const internalBytes = new Uint8Array(bytes);
+  // Evaluate denylist BEFORE capturing isKat so both checks run on the
+  // same `internalBytes` snapshot.  Zero the copy on rejection so the
+  // buffer does not linger on the heap.
+  const denied = isDenylistedMasterKey(internalBytes, network);
+  const isKat = isCanonicalKatVector(internalBytes);
+  if (denied) {
+    internalBytes.fill(0);
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      isKat
+        ? 'MasterPrivateKey denylist hit (SPEC §14.1): canonical 0x01×32 KAT vector ' +
+          'is reserved for test fixtures. Pass network="test-vectors" to accept it.'
+        : 'MasterPrivateKey denylist hit (SPEC §14.1): refusing all-zero / all-FF / ' +
+          'curve-order-N scalar. These derive deterministic, ' +
+          'cross-wallet-colliding pointer-layer keys.',
+    );
+  }
   const instance = Object.create(null) as MasterPrivateKey;
   Object.defineProperty(instance, 'bytes', {
     get(): Uint8Array {

@@ -276,7 +276,7 @@ describe('resolveTokenRoot', () => {
     ).toThrow('empty candidates');
   });
 
-  it('Rule 4 — enriches the longer chain when a same-position tx has a proof in a shorter chain', () => {
+  it.skip('Rule 4 — enriches the longer chain when a same-position tx has a proof in a shorter chain [PENDING: tryEnrichLongestWithProofs disabled until oracle gate is wired]', () => {
     // Position 0: t0 committed in both chains (identical hash).
     // Position 1: long has unproved version (t1_unproved), short
     //   has proved version (t1_proved). Under content-addressed
@@ -539,7 +539,7 @@ describe('resolveTokenRoot', () => {
     expect(outcome.kind).toBe('divergent');
   });
 
-  it('Rule 4 — synthetic root carries ENRICHED_SYNTHETIC_KIND and null predecessor (steelman C1)', async () => {
+  it.skip('Rule 4 — synthetic root carries ENRICHED_SYNTHETIC_KIND and null predecessor (steelman C1) [PENDING: tryEnrichLongestWithProofs disabled until oracle gate is wired]', async () => {
     // Steelman round 2 C1: synthetic with predecessor=winner.rootHash
     // caused rebuildInstanceChainIndex (public export) to record
     // phantom instance-chain links between natural roots and
@@ -627,7 +627,7 @@ describe('resolveTokenRoot', () => {
     expect(winnerEl && isEnrichedSyntheticRoot(winnerEl)).toBe(false);
   });
 
-  it('Rule 4 — synthetic root is deterministic (same inputs, any order → same hash)', () => {
+  it.skip('Rule 4 — synthetic root is deterministic (same inputs, any order → same hash) [PENDING: tryEnrichLongestWithProofs disabled until oracle gate is wired]', () => {
     // Use the same scenario as the happy-path Rule 4 test above:
     // the LONG chain has an unproved t1 + extra tail; the SHORT
     // chain has a proved t1. Enrichment is a genuine fire here.

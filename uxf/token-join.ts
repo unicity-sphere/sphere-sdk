@@ -141,9 +141,16 @@ function countCommittedTxns(
     const tx = pool.get(h);
     if (!tx || tx.type !== 'transaction') continue;
     const proof = tx.children.inclusionProof;
-    if (proof && typeof proof === 'string') {
-      n++;
-    }
+    // Steelman¹⁸: a dangling hash string (not in pool) must NOT count as
+    // "committed" — an attacker could craft a transaction with
+    // `children.inclusionProof: '<any 64-hex string>'` that resolves to
+    // nothing, inflate their committed count, win the JOIN rank, and
+    // combine with the synthetic-root enricher to poison the merge.
+    // Require the proof element to exist in the pool and be the right type.
+    if (typeof proof !== 'string') continue;
+    const proofEl = pool.get(proof);
+    if (!proofEl || proofEl.type !== 'inclusion-proof') continue;
+    n++;
   }
   return n;
 }
@@ -322,15 +329,21 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
   // that position — Rule 4 synthesis produces a merged chain that
   // keeps the longer tail AND adopts the proved element on the
   // common prefix.
-  const enrichment = tryEnrichLongestWithProofs(winner, infos, pool);
-  if (enrichment !== null) {
-    return {
-      kind: 'enriched',
-      rootHash: enrichment.rootHash,
-      losers: [...losers, winner.rootHash], // the old longest is superseded
-      syntheticRoot: enrichment.syntheticRoot,
-    };
-  }
+  // Steelman¹⁸: tryEnrichLongestWithProofs is DISABLED pending oracle
+  // validation gate.  The enricher checks only structural well-formedness
+  // (proof element exists, has authenticator + smtPath children); it does NOT
+  // verify the authenticator signature or replay the SMT path against a known
+  // root.  An attacker controlling one bundle in a multi-source merge could
+  // supply a fabricated inclusion-proof element that passes the structural
+  // check and wins the rank (via the countCommittedTxns inflator), causing the
+  // enricher to build a synthetic token-root carrying that fake proof — a root
+  // whose hash was never signed by any real aggregator, yet verify() accepts
+  // because it only checks DAG well-formedness.
+  //
+  // To re-enable: wire an OracleProvider into resolveTokenRoot, call
+  // oracle.verifyInclusionProof(proofEl) inside tryEnrichLongestWithProofs,
+  // and return null on any cryptographic failure.  Until that gate exists,
+  // the enriched path is unreachable — Rule 4 resolves as longest-valid.
   return { kind: 'longest-valid', rootHash: winner.rootHash, losers };
 }
 
