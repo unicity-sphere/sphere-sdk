@@ -71,11 +71,22 @@ export function diff(source: UxfPackageData, target: UxfPackageData): UxfDelta {
   }
 
   // --- Instance chain diff ---
-  // Find chain entries in target that are not in source (by hash key).
-  // We compare by checking if the source has the same hash with the same
-  // head and chain length. If not, it is a new or changed entry.
+  // Steelman²⁸ critical: compare every (hash, kind) pair across the
+  // chain — not just `head` and `length`. The previous shallow check
+  // missed any middle-link substitution, making the diff non-lossless:
+  // applying (source ∪ delta) ≠ target when intermediate links differ.
   const addedChainEntries = new Map<ContentHash, InstanceChainEntry>();
   const processedEntries = new Set<InstanceChainEntry>();
+
+  const chainsEqual = (a: InstanceChainEntry, b: InstanceChainEntry): boolean => {
+    if (a.head !== b.head) return false;
+    if (a.chain.length !== b.chain.length) return false;
+    for (let i = 0; i < a.chain.length; i++) {
+      if (a.chain[i].hash !== b.chain[i].hash) return false;
+      if (a.chain[i].kind !== b.chain[i].kind) return false;
+    }
+    return true;
+  };
 
   for (const [hash, targetEntry] of target.instanceChains) {
     if (processedEntries.has(targetEntry)) {
@@ -84,8 +95,7 @@ export function diff(source: UxfPackageData, target: UxfPackageData): UxfDelta {
     processedEntries.add(targetEntry);
 
     const sourceEntry = source.instanceChains.get(hash);
-    if (!sourceEntry || sourceEntry.head !== targetEntry.head ||
-        sourceEntry.chain.length !== targetEntry.chain.length) {
+    if (!sourceEntry || !chainsEqual(sourceEntry, targetEntry)) {
       // New or changed chain entry -- add under the head hash
       addedChainEntries.set(targetEntry.head, targetEntry);
     }
@@ -142,9 +152,42 @@ export function applyDelta(pkg: UxfPackageData, delta: UxfDelta): void {
     }
   }
 
-  // 2. Remove elements from pool
-  for (const hash of delta.removedElements) {
-    mutablePool.delete(hash);
+  // 2. Remove elements from pool, AND prune any instance-chain entries
+  // that referenced the removed hashes.
+  // Steelman²⁸ critical: previously the chain index was left dangling —
+  // entries kept pointing at hashes no longer in the pool. The next
+  // verify() reported MISSING_ELEMENT and walkReachable silently stopped
+  // at dead hashes, breaking GC and reachability analysis.
+  if (delta.removedElements.size > 0) {
+    const removedSet =
+      delta.removedElements instanceof Set
+        ? delta.removedElements
+        : new Set(delta.removedElements);
+    for (const hash of removedSet) {
+      mutablePool.delete(hash);
+    }
+    // Rebuild affected chain entries with the remaining (live) links.
+    const affectedChainEntries = new Set<InstanceChainEntry>();
+    for (const hash of removedSet) {
+      const entry = mutableChains.get(hash);
+      if (entry) affectedChainEntries.add(entry);
+      mutableChains.delete(hash);
+    }
+    for (const oldEntry of affectedChainEntries) {
+      const remainingLinks = oldEntry.chain.filter(
+        (link) => !removedSet.has(link.hash),
+      );
+      if (remainingLinks.length <= 1) {
+        // Chain is trivial after pruning — drop all remaining mappings.
+        for (const link of remainingLinks) mutableChains.delete(link.hash);
+        continue;
+      }
+      const newEntry: InstanceChainEntry = {
+        head: remainingLinks[0].hash,
+        chain: remainingLinks,
+      };
+      for (const link of remainingLinks) mutableChains.set(link.hash, newEntry);
+    }
   }
 
   // 3. Add/update manifest entries

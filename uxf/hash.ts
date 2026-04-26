@@ -135,6 +135,16 @@ export function prepareContentForHashing(
     }
 
     // Hex-encoded byte fields -> Uint8Array
+    //
+    // NOTE: empty-string and null produce DIFFERENT CBOR encodings
+    // (bstr(0) vs null), and therefore different content hashes. This
+    // is a known canonicalization caveat (steelman²⁸) — addressed by
+    // normalizing wire-format input at the parse boundary rather than
+    // here, since the encoding-level normalization broke wire-format
+    // round-trip tests that rely on the bytes-vs-null distinction.
+    // The mitigation chosen for now: validate at deconstruct boundary
+    // that byte-field values are either non-empty hex OR explicit null,
+    // never empty string. See deconstruct.ts validateToken / lowerHex.
     if (byteFields.has(key) && typeof value === 'string') {
       result[key] = hexToBytes(value);
       continue;

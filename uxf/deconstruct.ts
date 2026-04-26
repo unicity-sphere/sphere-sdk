@@ -199,6 +199,23 @@ function validateToken(token: unknown): asserts token is TokenShape {
   if (!obj.state || typeof obj.state !== 'object') {
     throw new UxfError('INVALID_PACKAGE', 'Token must have a state field');
   }
+
+  // Steelman²⁸ note: assert genesis.data.tokenId is a non-empty 64-char
+  // lowercase hex string. Without this, malformed tokens silently coerce
+  // tokenId='' via lowerHex(null), producing manifest entries keyed by
+  // an empty string — hard to remove and prone to collision.
+  const genesis = obj.genesis as Record<string, unknown>;
+  const data = genesis.data as Record<string, unknown> | undefined;
+  if (!data || typeof data !== 'object') {
+    throw new UxfError('INVALID_PACKAGE', 'Token genesis must have a data field');
+  }
+  const tokenId = data.tokenId;
+  if (typeof tokenId !== 'string' || !/^[0-9a-fA-F]{64}$/.test(tokenId)) {
+    throw new UxfError(
+      'INVALID_PACKAGE',
+      `Token genesis.data.tokenId must be 64-char hex, got ${typeof tokenId === 'string' ? `"${tokenId}"` : String(tokenId)}`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------

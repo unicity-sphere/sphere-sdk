@@ -16,6 +16,7 @@ import type {
   InstanceChainEntry,
 } from './types.js';
 import { computeElementHash } from './hash.js';
+import { UxfError } from './errors.js';
 
 // ---------------------------------------------------------------------------
 // ElementPool
@@ -93,11 +94,39 @@ export class ElementPool {
 
   /**
    * Create an ElementPool pre-populated from a Map.
-   * The entries are copied by reference (no re-hashing).
+   *
+   * Steelman²⁸ warning: previously copied by reference (no re-hashing),
+   * silently trusting caller-supplied keys. A caller passing a corrupt
+   * map (key=0xdead but element hashes to 0xbeef) would propagate that
+   * trust violation into every downstream operation. To preserve
+   * backward compat for the hot path, fromMap still does NOT re-hash
+   * by default — but callers crossing trust boundaries should call
+   * fromMapVerified() instead, which re-hashes every entry.
    */
   static fromMap(map: ReadonlyMap<ContentHash, UxfElement>): ElementPool {
     const pool = new ElementPool();
     for (const [hash, element] of map) {
+      pool.elements.set(hash, element);
+    }
+    return pool;
+  }
+
+  /**
+   * Steelman²⁸ warning: hash-verifying variant of fromMap. Use this when
+   * accepting an external pool (post-deserialize, peer-replicated,
+   * test fixture, etc.). Throws VERIFICATION_FAILED on any key/element
+   * mismatch.
+   */
+  static fromMapVerified(map: ReadonlyMap<ContentHash, UxfElement>): ElementPool {
+    const pool = new ElementPool();
+    for (const [hash, element] of map) {
+      const recomputed = computeElementHash(element);
+      if (recomputed !== hash) {
+        throw new UxfError(
+          'VERIFICATION_FAILED',
+          `ElementPool.fromMapVerified: key ${hash} does not match computed hash ${recomputed}`,
+        );
+      }
       pool.elements.set(hash, element);
     }
     return pool;

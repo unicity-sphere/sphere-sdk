@@ -93,7 +93,30 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
 
   // -----------------------------------------------------------------------
   // Check 3: Content hash integrity for ALL elements in pool
+  //
+  // Steelman²⁸ warning: cap the maximum pool size to prevent a 1M-entry
+  // bloat-DoS. Verifying every element re-hashes it; without a cap a
+  // hostile package can force 1M SHA-256 calls. The 1_000_000 cap is
+  // far above any legitimate package and well below the 5–10s budget.
   // -----------------------------------------------------------------------
+  const VERIFY_MAX_POOL_SIZE = 1_000_000;
+  if (pkg.pool.size > VERIFY_MAX_POOL_SIZE) {
+    errors.push({
+      code: 'INVALID_PACKAGE',
+      message: `Pool size ${pkg.pool.size} exceeds VERIFY_MAX_POOL_SIZE=${VERIFY_MAX_POOL_SIZE} — refusing to verify (bloat-DoS protection).`,
+    });
+    return {
+      valid: false,
+      errors,
+      warnings,
+      stats: {
+        tokensChecked: 0,
+        elementsChecked: 0,
+        orphanedElements: 0,
+        instanceChainsChecked: 0,
+      },
+    };
+  }
   for (const [hash, element] of pkg.pool) {
     const recomputed = computeElementHash(element);
     if (recomputed !== hash) {
@@ -130,13 +153,30 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
     const visited = new Set<ContentHash>();
     const pathStack = new Set<ContentHash>();
 
+    // Steelman²⁸ warning: explicit depth cap. V8 stack frames are ~10K
+    // deep before overflow — a hand-crafted DAG with deeply nested
+    // nametag chains (or other recursive child structures) can crash
+    // verify before any check runs. 4096 is comfortably below the V8
+    // limit and far above any legitimate DAG depth.
+    const VERIFY_MAX_DEPTH = 4096;
+
     // Recursive DFS helper
     const dfsWalk = (
       hash: ContentHash,
       parentType?: string,
       childRole?: string,
       isArrayChild?: boolean,
+      depth: number = 0,
     ): void => {
+      if (depth > VERIFY_MAX_DEPTH) {
+        errors.push({
+          code: 'CYCLE_DETECTED',
+          message: `Verify exceeded VERIFY_MAX_DEPTH=${VERIFY_MAX_DEPTH} in token ${tokenId} subgraph at ${hash}; possible deeply-nested DAG or undetected cycle.`,
+          tokenId,
+          elementHash: hash,
+        });
+        return;
+      }
       // Check 4: True cycle detection (back-edge to ancestor)
       if (pathStack.has(hash)) {
         errors.push({
@@ -200,14 +240,14 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
             const chainElement = pkg.pool.get(link.hash);
             if (chainElement) {
               elementsChecked.add(link.hash);
-              walkChildren(hash, chainElement);
+              walkChildren(hash, chainElement, depth);
             }
           }
         }
       }
 
       // Walk children
-      walkChildren(hash, element);
+      walkChildren(hash, element, depth);
 
       // Leave path, mark fully explored
       pathStack.delete(hash);
@@ -215,9 +255,12 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
     };
 
     // Helper to walk children of an element via DFS
+    // Steelman²⁸: receives current depth so recursive calls can enforce
+    // the VERIFY_MAX_DEPTH cap (passed through to dfsWalk).
     const walkChildren = (
       _parentHash: ContentHash,
       element: UxfElement,
+      currentDepth: number,
     ): void => {
       for (const [role, ref] of Object.entries(element.children)) {
         if (ref === null) {
@@ -225,10 +268,10 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
         }
         if (Array.isArray(ref)) {
           for (const childHash of ref as ContentHash[]) {
-            dfsWalk(childHash, element.type, role, true);
+            dfsWalk(childHash, element.type, role, true, currentDepth + 1);
           }
         } else {
-          dfsWalk(ref as ContentHash, element.type, role, false);
+          dfsWalk(ref as ContentHash, element.type, role, false, currentDepth + 1);
         }
       }
     };

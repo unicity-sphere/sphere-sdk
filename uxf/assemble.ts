@@ -91,8 +91,21 @@ function resolveAndVerify(
   // cycles. maxDepth bounds genuine cycles; verify.ts provides the
   // explicit path-stack check upstream. Skip the shape/hash verify
   // on repeat visits — the first visit already verified.
+  //
+  // Steelman²⁸ warning: re-validate the EXPECTED type on revisit.
+  // The cached resolution from the first visit may have been at a
+  // different DAG position with a different expectedType; without this
+  // check, the same element could be accepted for a role it doesn't fit
+  // (e.g., once-as-token-state, then-as-transaction).
   if (ctx.explored.has(hash)) {
-    return resolveElement(pool, hash, ctx.instanceChains, ctx.strategy);
+    const cached = resolveElement(pool, hash, ctx.instanceChains, ctx.strategy);
+    if (expectedType && cached.type !== expectedType) {
+      throw new UxfError(
+        'TYPE_MISMATCH',
+        `Expected element type '${expectedType}' but got '${cached.type}' at ${hash} (revisit)`,
+      );
+    }
+    return cached;
   }
   ctx.explored.add(hash);
 
