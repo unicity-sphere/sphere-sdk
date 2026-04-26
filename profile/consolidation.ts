@@ -223,8 +223,15 @@ export class ConsolidationEngine {
         }
       });
     } catch (abortErr) {
+      // Steelman⁵⁰ WARNING: only delete the pending key if it's still
+      // OURS. During the 30s sleep, another device may have written
+      // its own pending state — unconditionally deleting would
+      // break their TOCTOU detection on their post-sleep readBack.
       try {
-        await this.db.del(CONSOLIDATION_PENDING_KEY);
+        const current = await this.readPendingState();
+        if (current && current.device === deviceId) {
+          await this.db.del(CONSOLIDATION_PENDING_KEY);
+        }
       } catch {
         /* best-effort cleanup; do not mask abort error */
       }

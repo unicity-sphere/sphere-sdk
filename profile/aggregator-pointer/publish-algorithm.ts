@@ -220,11 +220,22 @@ async function publishOnce(
     // moment the deadline fires. Aborting unblocks the publish loop;
     // any HTTP socket already on the wire remains until per-side
     // timeoutMs fires, but its eventual response is no longer observed.
+    // Steelman⁵⁰ CRITICAL: we hold a reference to the submitPointer
+    // promise so on deadline-win we can await its eventual outcome
+    // (with a hard cap) and process H8 v-burning / conflict / etc.
+    // before propagating RETRY_EXHAUSTED. F.54's earlier attempt
+    // removed the in-submit short-circuit — but the OUTER race in
+    // this function still silently discarded submitPointer's eventual
+    // result when deadlineRace won. The aggregator could have
+    // committed one side; the local state would never reflect it.
+    // Now we drain submitPointer cooperatively before throwing.
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let deadlineFired = false;
     const submitAbort = new AbortController();
     const deadlineRace = new Promise<never>((_, reject) => {
       const remaining = Math.max(0, loopDeadline - Date.now());
       deadlineTimer = setTimeout(() => {
+        deadlineFired = true;
         try {
           submitAbort.abort();
         } catch {
@@ -239,21 +250,73 @@ async function publishOnce(
         );
       }, remaining);
     });
+    const submitPromise = submitPointer({
+      v,
+      cidBytes,
+      keyMaterial,
+      signer,
+      aggregatorClient,
+      marker,
+      isIdempotentRetryHint,
+      abortSignal: submitAbort.signal,
+    });
     let outcome: SubmitOutcome;
     try {
-      outcome = await Promise.race([
-        submitPointer({
-          v,
-          cidBytes,
-          keyMaterial,
-          signer,
-          aggregatorClient,
-          marker,
-          isIdempotentRetryHint,
-          abortSignal: submitAbort.signal,
-        }),
-        deadlineRace,
-      ]);
+      outcome = await Promise.race([submitPromise, deadlineRace]);
+    } catch (raceErr) {
+      if (deadlineFired) {
+        // Steelman⁵⁰: deadline fired but submitPointer may still be
+        // running — drain it with a small hard cap to capture any
+        // aggregator-decided outcome. If it settles within the cap
+        // with a decided per-side classification (success / rejected
+        // / aggregator_rejected / protocol_error / idempotent_replay
+        // / conflict), use THAT outcome (so H8/v-burn/conflict are
+        // registered) rather than the generic RETRY_EXHAUSTED. If
+        // the drain itself times out OR returns 'retry_*' /
+        // 'retry_side', re-throw the original RETRY_EXHAUSTED.
+        const DRAIN_HARD_CAP_MS = 5_000;
+        let drainedOutcome: SubmitOutcome | null = null;
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        const drainTimeout = new Promise<null>((resolve) => {
+          drainTimer = setTimeout(() => resolve(null), DRAIN_HARD_CAP_MS);
+          if (typeof drainTimer === 'object' && drainTimer !== null && 'unref' in drainTimer) {
+            (drainTimer as { unref: () => void }).unref();
+          }
+        });
+        try {
+          drainedOutcome = await Promise.race([
+            submitPromise.then((o) => o).catch(() => null),
+            drainTimeout,
+          ]);
+        } finally {
+          if (drainTimer !== undefined) clearTimeout(drainTimer);
+        }
+        if (drainedOutcome) {
+          const k = drainedOutcome.kind;
+          if (
+            k === 'success' ||
+            k === 'idempotent_replay' ||
+            k === 'conflict' ||
+            k === 'rejected' ||
+            k === 'aggregator_rejected' ||
+            k === 'protocol_error'
+          ) {
+            outcome = drainedOutcome;
+          } else {
+            // retry_side / retry_both / retry_after / retry_backoff —
+            // not spec-decided; preserve RETRY_EXHAUSTED.
+            throw raceErr;
+          }
+        } else {
+          // Drain timed out or submitPromise rejected — preserve
+          // the original RETRY_EXHAUSTED. The submitPromise's
+          // eventual settlement is captured by the orphan-handler
+          // attached below.
+          throw raceErr;
+        }
+      } else {
+        throw raceErr;
+      }
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       // Steelman⁴⁶: ensure the controller is aborted even if Promise.race
@@ -266,6 +329,11 @@ async function publishOnce(
           /* noop */
         }
       }
+      // Steelman⁵⁰: attach an empty catch to the orphan submitPromise
+      // so a late rejection (after we've already returned RETRY_
+      // EXHAUSTED via the drain timeout) doesn't surface as
+      // unhandledRejection.
+      submitPromise.catch(() => undefined);
     }
 
     switch (outcome.kind) {

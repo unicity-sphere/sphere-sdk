@@ -172,6 +172,23 @@ class BrowserMutex implements PointerMutex {
               releaseCallback!();
             },
             assertHeld: () => {
+              // Steelman⁵⁰ NOTE: this check trusts the local
+              // lockStillValid flag, set by `freeze`/`pagehide`
+              // listeners. Browser CAN release the lock without
+              // firing those events — tab discard under memory
+              // pressure, document detachment, hard kill — and
+              // the Web Locks API has no synchronous "is still
+              // held" query. Residual hazard: in those rare
+              // cases, assertHeld passes a false positive and
+              // a stale-version submit can land. Mitigations:
+              //   - the publish-loop wall-clock deadline (F.53)
+              //     bounds total exposure;
+              //   - the §7.3 idempotency-replay handling makes
+              //     accidental duplicate submits at the same v
+              //     observably benign;
+              //   - the marker / pending-version disambiguates
+              //     genuine retry from a re-acquired-mutex case.
+              // This is documented as accepted residual per SPEC.
               if (!lockStillValid || alreadyReleased) {
                 throw new AggregatorPointerError(
                   AggregatorPointerErrorCode.PUBLISH_BUSY,
