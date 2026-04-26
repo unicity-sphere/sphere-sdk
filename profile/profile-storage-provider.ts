@@ -1281,8 +1281,27 @@ export class ProfileStorageProvider implements StorageProvider {
 
 /**
  * Convert a hex string to Uint8Array.
+ *
+ * Steelman²⁸ critical: previously silently truncated odd-length input
+ * via `Math.floor(hex.length / 2)` and silently coerced non-hex chars
+ * to 0 via `parseInt(garbage, 16) === NaN` → unsigned-shift coerced to
+ * 0. setIdentity() derived the encryption key via this function; a
+ * tampered or malformed identity record would have produced a
+ * wrong-but-valid key, silently corrupting the wallet's ability to
+ * read its own data on subsequent reads.
+ *
+ * Now strict: reject odd-length input and reject any non-hex character.
  */
 function hexToBytes(hex: string): Uint8Array {
+  if (typeof hex !== 'string') {
+    throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
+  }
+  if (hex.length % 2 !== 0) {
+    throw new RangeError(`hexToBytes: odd-length hex string (${hex.length} chars)`);
+  }
+  if (hex.length > 0 && !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new RangeError('hexToBytes: contains non-hex characters');
+  }
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
     bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);

@@ -142,6 +142,11 @@ interface UnsignedEvent {
  * ```
  */
 export class NostrReplicationBridge {
+  // Steelman²⁸: replay-protection cache. Bounded LRU-ish set of event
+  // ids we have already accepted in this session.
+  static readonly SEEN_EVENT_CACHE_MAX = 10_000;
+  readonly #seenEventIds = new Set<string>();
+
   private ws: WebSocket | null = null;
   private pubkey: string | null = null;
   private running = false;
@@ -431,6 +436,22 @@ export class NostrReplicationBridge {
    */
   private connectWebSocket(): Promise<WebSocket> {
     return new Promise<WebSocket>((resolve, reject) => {
+      // Steelman²⁸ note: enforce wss:// unless SPHERE_ALLOW_INSECURE_RELAY=1.
+      // Plaintext ws:// exposes the encrypted-blob signature flow to MITM
+      // event injection (signatures still verify, but throughput-shaping
+      // attacks become feasible). Operators in lab setups can opt in via
+      // env var.
+      const url = this.config.relayUrl;
+      if (
+        !url.toLowerCase().startsWith('wss://') &&
+        process.env.SPHERE_ALLOW_INSECURE_RELAY !== '1'
+      ) {
+        reject(new Error(
+          `Nostr relay URL must use wss:// (got "${url}"). Set ` +
+            `SPHERE_ALLOW_INSECURE_RELAY=1 to allow plaintext ws://.`,
+        ));
+        return;
+      }
       const factory = this.config.createWebSocket ?? ((url: string) => new WebSocket(url));
       const ws = factory(this.config.relayUrl);
 
@@ -566,7 +587,26 @@ export class NostrReplicationBridge {
       err.authenticCount = authentic.length;
       throw err;
     }
-    return this.decryptEvents(authentic);
+    // Steelman²⁸ warning: in-process replay-protection cache. Reject any
+    // event whose id we have already accepted in this session. Without
+    // this, a relay that records and replays our own past EVENT frames
+    // can re-merge OpLog entries (delete-then-recreate sequences could
+    // resurrect deleted state). The cache is bounded — when full, the
+    // oldest half is evicted (LRU-ish) so memory is bounded under high
+    // event volume.
+    const replayFiltered: NostrEvent[] = [];
+    for (const evt of authentic) {
+      if (this.#seenEventIds.has(evt.id)) continue;
+      this.#seenEventIds.add(evt.id);
+      replayFiltered.push(evt);
+    }
+    if (this.#seenEventIds.size > NostrReplicationBridge.SEEN_EVENT_CACHE_MAX) {
+      // Evict oldest half — JS Set preserves insertion order.
+      const ids = [...this.#seenEventIds];
+      this.#seenEventIds.clear();
+      for (const id of ids.slice(ids.length / 2)) this.#seenEventIds.add(id);
+    }
+    return this.decryptEvents(replayFiltered);
   }
 
   /**
@@ -615,11 +655,23 @@ export class NostrReplicationBridge {
     const id = bytesToHex(hash);
 
     // Steelman⁴ remediation: convert hex → bytes for schnorr.sign too.
+    // Steelman²⁸ warning: WIPE the per-call privKeyBytes immediately
+    // after schnorr.sign returns. Without the wipe, every publishEntry
+    // leaves a 32-byte heap-resident copy of the transport key alive
+    // until GC; high-frequency wallets accumulate many short-lived
+    // copies. The wipe doesn't help the underlying hex-string lifetime
+    // (the config slot is still alive), but it narrows the window for
+    // each derived bytes copy.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const secp256k1Module: any = await import('@noble/curves/secp256k1.js' as string);
     const idBytes = hexToBytes(id);
     const privKeyBytes = hexToBytes(this.config.transportPrivateKey);
-    const sigBytes: Uint8Array = secp256k1Module.schnorr.sign(idBytes, privKeyBytes);
+    let sigBytes: Uint8Array;
+    try {
+      sigBytes = secp256k1Module.schnorr.sign(idBytes, privKeyBytes);
+    } finally {
+      privKeyBytes.fill(0);
+    }
     const sig = bytesToHex(sigBytes);
 
     return {

@@ -240,8 +240,18 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       // 3. Derive deterministic database name from wallet pubkey
       //    Section 4.1: sphere-profile-<first 16 hex chars of pubkey>
-      const publicKeyShort = await derivePublicKeyShort(config.privateKey);
-      const dbName = `sphere-profile-${publicKeyShort}`;
+      //
+      // Steelman²⁸ critical: prefer caller-supplied dbNameOverride
+      // (which was derived from a wipeable Uint8Array). Falling back to
+      // derivePublicKeyShort(config.privateKey) keeps backward compat
+      // but is a memory-safety hazard documented on OrbitDbConfig.
+      let dbName: string;
+      if (config.dbNameOverride) {
+        dbName = config.dbNameOverride;
+      } else {
+        const publicKeyShort = await derivePublicKeyShort(config.privateKey);
+        dbName = `sphere-profile-${publicKeyShort}`;
+      }
 
       // 4. Open (or create) the keyvalue database with access control
       //    Only the wallet identity can write.
@@ -454,12 +464,33 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // a single peer-replicated bad value would otherwise DoS those
       // operations entirely. Skipping with a logged-once warning keeps
       // legitimate flows working while surfacing the corruption.
+      //
+      // Steelman²⁸ warning: enforce a per-call AGGREGATE memory budget so
+      // a malicious peer publishing thousands of near-cap values cannot
+      // sum into a multi-GB OOM. 256 MiB is far above any legitimate
+      // session payload total.
+      const ALL_AGGREGATE_BYTES_CAP = 256 * 1024 * 1024;
+      let aggregateBytes = 0;
       let skippedCount = 0;
       const tryCoerce = (key: string, value: unknown): boolean => {
         try {
-          result.set(key, coerceToUint8Array(value));
+          const coerced = coerceToUint8Array(value);
+          aggregateBytes += coerced.byteLength;
+          if (aggregateBytes > ALL_AGGREGATE_BYTES_CAP) {
+            throw new ProfileError(
+              'ORBITDB_READ_FAILED',
+              `all(): aggregate value bytes exceeded ${ALL_AGGREGATE_BYTES_CAP} ` +
+                `(at key="${key}"). Refusing to load further entries — possible ` +
+                `OOM attack from a malicious peer.`,
+            );
+          }
+          result.set(key, coerced);
           return true;
         } catch (err) {
+          if (err instanceof ProfileError && err.code === 'ORBITDB_READ_FAILED' && err.message.includes('aggregate value bytes')) {
+            // Hard fail-stop on aggregate cap.
+            throw err;
+          }
           skippedCount += 1;
           if (skippedCount <= 3) {
             // Log first few; suppress thereafter to avoid log spam.

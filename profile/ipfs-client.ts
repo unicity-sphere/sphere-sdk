@@ -162,6 +162,24 @@ export async function fetchFromIpfs(
   maxSizeBytes: number = DEFAULT_MAX_SIZE_BYTES,
 ): Promise<Uint8Array> {
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  // Steelman²⁸ warning: validate gateway URLs at the call boundary.
+  // A malformed or hostile config could include javascript:, file:,
+  // or scheme-less paths. Reject anything that isn't http(s)://.
+  for (const gateway of effectiveGateways) {
+    try {
+      const u = new URL(gateway);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        throw new Error(
+          `IPFS gateway URL must use http:// or https://, got "${gateway}" (protocol="${u.protocol}")`,
+        );
+      }
+      if (u.username !== '' || u.password !== '') {
+        throw new Error(`IPFS gateway URL must not contain userinfo: "${gateway}"`);
+      }
+    } catch (err) {
+      throw new Error(`Invalid IPFS gateway URL "${gateway}": ${String(err)}`);
+    }
+  }
   let lastError: Error | null = null;
 
   for (const gateway of effectiveGateways) {
