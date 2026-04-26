@@ -3049,6 +3049,29 @@ async function main() {
             console.error(`Failed to parse TXF JSON: ${err instanceof Error ? err.message : String(err)}`);
             process.exit(1);
           }
+          // Steelman⁴⁴ critical: verify TXF tokens via UXF DAG round-trip
+          // (deconstruct → verify → assemble). Without this, JSON-format
+          // imports bypass the same integrity hardening that F.47 added
+          // to the UXF/CAR path.  ingest() runs the same instance-chain,
+          // version-bound, and content-hash validators verify() does.
+          try {
+            const { UxfPackage } = await import('../uxf/UxfPackage.js');
+            const validationPkg = UxfPackage.create();
+            for (const tok of txfTokens) {
+              validationPkg.ingest(tok);
+            }
+            const verifyResult = validationPkg.verify();
+            if (!verifyResult.valid) {
+              const errs = verifyResult.errors.slice(0, 5).map((e) => `  - ${e.code}: ${e.message}`).join('\n');
+              console.error(
+                `Refusing to import: TXF JSON verification failed (${verifyResult.errors.length} errors).\nFirst:\n${errs}`,
+              );
+              process.exit(1);
+            }
+          } catch (err) {
+            console.error(`TXF integrity check failed: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
         }
 
         if (txfTokens.length === 0) {

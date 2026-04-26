@@ -257,29 +257,63 @@ export class FileStorageProvider implements StorageProvider {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
 
-    // Steelman⁴³: re-read on-disk snapshot and merge our mutations on
-    // top. Other processes' writes since our last save survive; our
-    // writes overwrite only the keys we actually touched.
-    if (!this.isTxtMode && fs.existsSync(this.filePath)) {
-      try {
-        const onDisk = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as Record<string, string>;
-        // Start from on-disk, then apply our mutations.
-        const merged: Record<string, string> = { ...onDisk };
-        for (const key of this.mutatedKeys) {
-          if (key in this.data) merged[key] = this.data[key];
-        }
-        for (const key of this.removedKeys) {
-          delete merged[key];
-        }
-        this.data = merged;
-      } catch {
-        // Disk read or JSON parse failed — proceed with in-memory data only.
-        // (Existing behavior; the corruption-rename path at L96 handles fatal cases.)
+    // Steelman⁴⁴ critical: cross-process file lock around the
+    // read-merge-write critical section. Without this, two processes'
+    // saveInner runs can interleave: A reads disk → B reads disk →
+    // A renames → B renames clobbering A's write. proper-lockfile
+    // gives us cross-process mutual exclusion via O_EXCL on a sibling
+    // .lock directory; stale=10s reaps locks from crashed writers.
+    let releaseFileLock: (() => Promise<void>) | null = null;
+    try {
+      const lockfile = await import('proper-lockfile');
+      // The file may not exist yet (first save); proper-lockfile needs
+      // the target to exist. Touch it first if absent.
+      if (!fs.existsSync(this.filePath)) {
+        try { fs.writeFileSync(this.filePath, this.isTxtMode ? '' : '{}', { flag: 'a' }); }
+        catch { /* best-effort */ }
       }
+      releaseFileLock = await lockfile.lock(this.filePath, {
+        stale: 10_000,
+        retries: { retries: 50, minTimeout: 50, maxTimeout: 500 },
+        realpath: false,
+      });
+    } catch (err) {
+      // If proper-lockfile isn't available or fails, log and proceed
+      // (best-effort — we have in-process serialization via saveInFlight).
+      // Don't reject the save — the user expects their data to land.
+      // eslint-disable-next-line no-console
+      console.warn('[FileStorageProvider] file-lock unavailable; saving without cross-process lock:', err instanceof Error ? err.message : String(err));
     }
-    // Reset mutation tracking after merge.
-    this.mutatedKeys = new Set();
-    this.removedKeys = new Set();
+
+    try {
+      // Steelman⁴³/⁴⁴: re-read on-disk snapshot UNDER THE LOCK and merge
+      // our mutations on top. Other processes' writes since our last
+      // save survive; our writes overwrite only the keys we actually
+      // touched. With the file lock, the read-merge-write section is
+      // truly atomic across processes.
+      if (!this.isTxtMode && fs.existsSync(this.filePath)) {
+        try {
+          const raw = fs.readFileSync(this.filePath, 'utf8');
+          if (raw.length > 0) {
+            const onDisk = JSON.parse(raw) as Record<string, string>;
+            const merged: Record<string, string> = { ...onDisk };
+            for (const key of this.mutatedKeys) {
+              if (key in this.data) merged[key] = this.data[key];
+            }
+            for (const key of this.removedKeys) {
+              delete merged[key];
+            }
+            this.data = merged;
+          }
+        } catch {
+          // Disk read or JSON parse failed — proceed with in-memory
+          // data only.  (Existing behavior; the corruption-rename
+          // path at L96 handles fatal cases.)
+        }
+      }
+      // Reset mutation tracking after merge.
+      this.mutatedKeys = new Set();
+      this.removedKeys = new Set();
 
     let content: string;
     if (this.isTxtMode) {
@@ -320,6 +354,15 @@ export class FileStorageProvider implements StorageProvider {
     } catch {
       // Non-POSIX fallback — rename-durability on these filesystems
       // is a platform concern, not a correctness regression.
+    }
+    } finally {
+      // Steelman⁴⁴ critical: always release the file lock, even on
+      // error paths. proper-lockfile is robust against process exit
+      // (it tracks PIDs), but explicit release minimizes the stale-
+      // lock window for the next save.
+      if (releaseFileLock !== null) {
+        try { await releaseFileLock(); } catch { /* best-effort */ }
+      }
     }
   }
 }
