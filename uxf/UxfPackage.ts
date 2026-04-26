@@ -459,11 +459,31 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
   // returns the newly-deconstructed elements), then manifest, then
   // indexes. If an earlier deconstructToken threw, we never reach here
   // and the package state is unchanged.
+  //
+  // Steelman³² warning: wrap the index loop in try/catch. Today
+  // updateIndexesForToken is no-throw (silent if/return on missing
+  // elements), but future changes could add throws — without the
+  // catch, a partial commit would leave manifest pointing at tokens
+  // whose indexes weren't built. On throw, ROLL BACK the manifest
+  // entries we just added so the caller sees an all-or-nothing batch.
   syncPool(pkg, pool);
   const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
-  for (const { tokenId, rootHash } of newTokens) {
-    mutableManifest.set(tokenId, rootHash);
-    updateIndexesForToken(pkg, tokenId, rootHash);
+  const previousManifest = new Map<string, ContentHash | undefined>();
+  for (const { tokenId } of newTokens) {
+    previousManifest.set(tokenId, mutableManifest.get(tokenId));
+  }
+  try {
+    for (const { tokenId, rootHash } of newTokens) {
+      mutableManifest.set(tokenId, rootHash);
+      updateIndexesForToken(pkg, tokenId, rootHash);
+    }
+  } catch (err) {
+    // Roll back manifest mutations.
+    for (const [tokenId, prev] of previousManifest) {
+      if (prev === undefined) mutableManifest.delete(tokenId);
+      else mutableManifest.set(tokenId, prev);
+    }
+    throw err;
   }
   (pkg.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
 }

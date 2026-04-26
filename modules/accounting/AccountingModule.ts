@@ -984,13 +984,20 @@ export class AccountingModule {
     if (!privateKeyHex) {
       throw new SphereError('Private key required for invoice creation', 'NOT_INITIALIZED');
     }
-    const hexMatches = privateKeyHex.match(/.{1,2}/g);
-    if (!hexMatches) {
-      throw new SphereError('Invalid private key format', 'NOT_INITIALIZED');
+    // Steelman³² warning: validate strictly — reject odd-length and
+    // non-hex inputs. Previously `match(/.{1,2}/g)` silently truncated
+    // odd-length and `parseInt('zz',16)===NaN` coerced to 0, producing
+    // a degenerate signing key.
+    if (privateKeyHex.length === 0 || privateKeyHex.length % 2 !== 0) {
+      throw new SphereError('Invalid private key format (length)', 'NOT_INITIALIZED');
     }
-    const signingKeyBytes = new Uint8Array(
-      hexMatches.map((byte) => parseInt(byte, 16)),
-    );
+    if (!/^[0-9a-fA-F]+$/.test(privateKeyHex)) {
+      throw new SphereError('Invalid private key format (non-hex chars)', 'NOT_INITIALIZED');
+    }
+    const signingKeyBytes = new Uint8Array(privateKeyHex.length / 2);
+    for (let i = 0; i < privateKeyHex.length; i += 2) {
+      signingKeyBytes[i / 2] = parseInt(privateKeyHex.slice(i, i + 2), 16);
+    }
     const saltInput = new Uint8Array(signingKeyBytes.length + invoiceBytesEncoded.length);
     saltInput.set(signingKeyBytes, 0);
     saltInput.set(invoiceBytesEncoded, signingKeyBytes.length);
@@ -4408,7 +4415,10 @@ export class AccountingModule {
       try {
         const hexStr = tx.data['message'] as string;
         if (!hexStr || hexStr.length > 8192) continue;
-        // W10 fix: validate hex chars before parseInt to avoid NaN bytes
+        // Steelman³² warning: also reject ODD-length input. Previously
+        // a 1-char trailing match made `parseInt('a',16)===10` produce
+        // a corrupt last byte. The W10 hex-char gate doesn't catch this.
+        if (hexStr.length % 2 !== 0) continue;
         if (!/^[0-9a-fA-F]*$/.test(hexStr)) continue;
         const matches = hexStr.match(/.{1,2}/g);
         if (!matches) continue;

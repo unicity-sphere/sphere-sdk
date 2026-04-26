@@ -303,9 +303,25 @@ export function doubleSha256(data: string, inputEncoding: 'hex' | 'utf8' = 'hex'
 export const computeHash160 = hash160;
 
 /**
- * Convert hex string to Uint8Array for witness program
+ * Convert hex string to Uint8Array for witness program.
+ *
+ * Steelman³² warning: strict — reject odd-length and non-hex.
+ * `match(/../g)` silently drops a trailing odd char; `parseInt('zz',16)
+ * === NaN` silently coerces to 0. Used in publicKeyToAddress / L1
+ * address derivation; a malformed hash silently produced a wrong
+ * address with the previous behavior.
  */
 export function hash160ToBytes(hash160Hex: string): Uint8Array {
+  if (typeof hash160Hex !== 'string') {
+    throw new TypeError(`hash160ToBytes: expected string, got ${typeof hash160Hex}`);
+  }
+  if (hash160Hex.length === 0) return new Uint8Array(0);
+  if (hash160Hex.length % 2 !== 0) {
+    throw new RangeError(`hash160ToBytes: odd-length hex string (${hash160Hex.length} chars)`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(hash160Hex)) {
+    throw new RangeError('hash160ToBytes: contains non-hex characters');
+  }
   const matches = hash160Hex.match(/../g);
   if (!matches) return new Uint8Array(0);
   return Uint8Array.from(matches.map((x) => parseInt(x, 16)));

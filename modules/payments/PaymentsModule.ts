@@ -5583,13 +5583,17 @@ export class PaymentsModule {
   }
 
   /**
-   * Create SigningService from identity private key
+   * Create SigningService from identity private key.
+   *
+   * Steelman³² critical: previously decoded the privateKey hex via
+   * `match(/.{1,2}/g)` + parseInt — silent-truncation on odd-length
+   * inputs and silent NaN-coercion on non-hex chars. Used for the
+   * wallet's signing key on every transaction. Now uses the strict
+   * fromHex defined at line 554 of this file.
    */
   private async createSigningService(): Promise<SigningService> {
     const privateKeyHex = this.deps!.identity.privateKey;
-    const privateKeyBytes = new Uint8Array(
-      privateKeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
-    );
+    const privateKeyBytes = fromHex(privateKeyHex);
     return SigningService.createFromSecret(privateKeyBytes);
   }
 
@@ -5614,10 +5618,9 @@ export class PaymentsModule {
     const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509';
     const tokenType = new TokenType(Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex'));
 
-    // Convert hex pubkey to bytes
-    const pubkeyBytes = new Uint8Array(
-      pubkeyHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
-    );
+    // Convert hex pubkey to bytes — Steelman³² critical: use strict
+    // fromHex. Pubkey is attacker-controlled (peer input).
+    const pubkeyBytes = fromHex(pubkeyHex);
 
     // Create predicate reference with secp256k1 algorithm
     const addressRef = await UnmaskedPredicateReference.create(

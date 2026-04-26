@@ -142,6 +142,17 @@ describe('UxfPackage', () => {
       const typesSeq = pkgSeq.tokensByTokenType(TOKEN_TYPE_FUNGIBLE).sort();
       expect(typesBatch).toEqual(typesSeq);
       expect(typesBatch.length).toBeGreaterThan(0);
+      // Steelman³²: also pin byStateHash equivalence via the toJson
+      // round-trip (the indexes serialize through there). A future
+      // regression that broke byStateHash would diverge between batch
+      // and per-token paths. We don't assert > 0 here because the
+      // test fixture tokens may not produce a state hash; the
+      // equivalence check is the load-bearing invariant.
+      const jsonBatch = pkgBatch.toJson();
+      const jsonSeq = pkgSeq.toJson();
+      const idxBatch = JSON.parse(jsonBatch).indexes;
+      const idxSeq = JSON.parse(jsonSeq).indexes;
+      expect(idxBatch.byStateHash).toEqual(idxSeq.byStateHash);
     });
   });
 
