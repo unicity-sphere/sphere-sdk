@@ -52,6 +52,28 @@ function isSharedArrayBufferLike(buffer: ArrayBufferLike | undefined | null): bo
   return OBJECT_TO_STRING.call(buffer) === '[object SharedArrayBuffer]';
 }
 
+/**
+ * Steelman²³ critical: cross-realm safe ArrayBuffer detection.
+ *
+ * A hostile `Uint8Array` subclass can override the `.buffer` getter to
+ * return a PLAIN OBJECT with attacker-supplied byteLength and a custom
+ * `slice()` method. Pre-slice numeric validation (offset/length range)
+ * passes because byteLength is reported truthfully; the slice then
+ * returns whatever bytes the attacker chooses. The denylist runs on
+ * those bytes, but a low-entropy non-denylisted scalar still produces
+ * a deterministic attacker-known pointer-layer key.
+ *
+ * Defeat: require the source buffer to be a REAL ArrayBuffer (or SAB,
+ * which is already rejected by isSharedArrayBufferLike upstream). Use
+ * Object.prototype.toString.call (cross-realm safe) instead of
+ * `instanceof ArrayBuffer` (realm-scoped, defeats valid cross-realm
+ * inputs).
+ */
+function isPlainArrayBuffer(buffer: unknown): boolean {
+  if (buffer === undefined || buffer === null) return false;
+  return OBJECT_TO_STRING.call(buffer) === '[object ArrayBuffer]';
+}
+
 declare const _brand: unique symbol;
 
 export interface MasterPrivateKey {
@@ -251,6 +273,20 @@ export function createMasterPrivateKey(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
       'MasterPrivateKey input must not be backed by SharedArrayBuffer — ' +
         'concurrent mutation between denylist check and internal copy is a TOCTOU risk.',
+    );
+  }
+  // Steelman²³ critical: assert sourceBuffer is a REAL ArrayBuffer. A
+  // hostile TypedArray subclass with an overridden `.buffer` getter
+  // could return a plain object whose `byteLength` is a number (passes
+  // numeric range validation) and whose `slice()` returns attacker
+  // bytes. This check (via captured Object.prototype.toString) rejects
+  // any non-ArrayBuffer source — only genuine ArrayBuffer instances
+  // (across realms) pass.
+  if (!isPlainArrayBuffer(sourceBuffer)) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      'MasterPrivateKey input.buffer must be a real ArrayBuffer — ' +
+        'hostile TypedArray subclass detected (custom .buffer getter returning a non-ArrayBuffer object).',
     );
   }
   // Steelman²¹/²²: copy via the SNAPSHOTTED buffer / offset / length

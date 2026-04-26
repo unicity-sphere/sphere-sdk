@@ -10,6 +10,7 @@
  */
 
 import { UxfError } from './errors.js';
+import type { UxfErrorCode } from './errors.js';
 import type { UxfInstanceKind } from './types.js';
 
 /**
@@ -17,12 +18,16 @@ import type { UxfInstanceKind } from './types.js';
  * integer, ≥ 0, ≤ Number.MAX_SAFE_INTEGER. Used for header.representation
  * and header.semantics, which must be precision-comparable via `<`.
  *
- * Throws UxfError(SERIALIZATION_ERROR) on failure with a message
- * referencing the field name and parser context.
+ * Steelman²⁴: takes an `errorCode` parameter so callers can route the
+ * UxfError through their domain. Parsers (json.ts/ipld.ts) use
+ * 'SERIALIZATION_ERROR'; programmatic write paths (instance-chain.ts
+ * addInstance) use 'INVALID_INSTANCE_CHAIN'. Defaults to
+ * 'SERIALIZATION_ERROR' to preserve previous parse-boundary behavior.
  */
 export function assertHeaderVersionField(
   value: unknown,
   fieldLabel: string,
+  errorCode: UxfErrorCode = 'SERIALIZATION_ERROR',
 ): asserts value is number {
   if (
     typeof value !== 'number' ||
@@ -32,18 +37,22 @@ export function assertHeaderVersionField(
     value > Number.MAX_SAFE_INTEGER
   ) {
     throw new UxfError(
-      'SERIALIZATION_ERROR',
+      errorCode,
       `${fieldLabel} must be a non-negative safe integer, got ${String(value)}`,
     );
   }
 }
 
 /**
- * Maximum allowed length for header.kind strings. Bounds memory cost at
- * the parse boundary: an attacker-supplied 1MB+ kind would otherwise
- * propagate through pool storage, hash computation (slow), index
- * structures, and persistent state. 64 chars accommodates all current
- * well-known kinds plus reasonable future extensions.
+ * Maximum allowed length for header.kind strings, measured in UTF-16
+ * code units (matching `String.prototype.length` semantics).
+ *
+ * Bounds memory cost at the parse boundary: an attacker-supplied 1MB+
+ * kind would otherwise propagate through pool storage, hash computation
+ * (slow), index structures, and persistent state. 64 UTF-16 units
+ * accommodates all current well-known kinds plus reasonable future
+ * extensions. Note: 64 emoji surrogate pairs encode to 64 UTF-16 units
+ * (32 codepoints), so the cap is conservative on visible-character count.
  */
 export const MAX_KIND_LENGTH = 64;
 
@@ -53,24 +62,24 @@ export const MAX_KIND_LENGTH = 64;
  * objects, etc.; the `as UxfInstanceKind` cast at parse boundaries lies
  * unless we runtime-check.
  *
- * Steelman²² note: also enforces an upper length bound (MAX_KIND_LENGTH)
- * so attacker-supplied giant strings cannot bloat the pool / slow hash
- * computation.
+ * Steelman²² note: enforces an upper length bound (MAX_KIND_LENGTH).
+ * Steelman²⁴: takes an `errorCode` parameter — see assertHeaderVersionField.
  */
 export function assertHeaderKindField(
   value: unknown,
   fieldLabel: string,
+  errorCode: UxfErrorCode = 'SERIALIZATION_ERROR',
 ): asserts value is UxfInstanceKind {
   if (typeof value !== 'string' || value.length === 0) {
     throw new UxfError(
-      'SERIALIZATION_ERROR',
+      errorCode,
       `${fieldLabel} must be a non-empty string, got ${String(value)}`,
     );
   }
   if (value.length > MAX_KIND_LENGTH) {
     throw new UxfError(
-      'SERIALIZATION_ERROR',
-      `${fieldLabel} length ${value.length} exceeds MAX_KIND_LENGTH=${MAX_KIND_LENGTH}`,
+      errorCode,
+      `${fieldLabel} length ${value.length} (UTF-16 code units) exceeds MAX_KIND_LENGTH=${MAX_KIND_LENGTH}`,
     );
   }
 }

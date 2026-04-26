@@ -156,15 +156,17 @@ export function addInstance(
     );
   }
 
-  // Steelman²³ warning: enforce header field bounds at the programmatic
+  // Steelman²³/²⁴ warning: enforce header field bounds at the programmatic
   // entry point too — not just at JSON/IPLD parse boundaries. A caller
   // constructing a UxfElement directly (test code, future modules,
   // alternative deserializers) would otherwise bypass the parse-time
   // checks and could insert giant kind strings, non-finite versions, etc.
   // assertHeaderKindField also bounds kind length to MAX_KIND_LENGTH.
-  assertHeaderKindField(newInstance.header.kind, 'addInstance newInstance.header.kind');
-  assertHeaderVersionField(newInstance.header.semantics, 'addInstance newInstance.header.semantics');
-  assertHeaderVersionField(newInstance.header.representation, 'addInstance newInstance.header.representation');
+  // Pass 'INVALID_INSTANCE_CHAIN' so addInstance throws a consistent error
+  // code for header-validation failures (matching its other rule errors).
+  assertHeaderKindField(newInstance.header.kind, 'addInstance newInstance.header.kind', 'INVALID_INSTANCE_CHAIN');
+  assertHeaderVersionField(newInstance.header.semantics, 'addInstance newInstance.header.semantics', 'INVALID_INSTANCE_CHAIN');
+  assertHeaderVersionField(newInstance.header.representation, 'addInstance newInstance.header.representation', 'INVALID_INSTANCE_CHAIN');
 
   // Rule 2: predecessor must equal current head.
   if (newInstance.header.predecessor !== currentHeadHash) {
