@@ -553,43 +553,31 @@ export async function submitPointer(input: SubmitInput): Promise<SubmitOutcome> 
     const outcomeA = classifySideResult(resultA);
     const outcomeB = classifySideResult(resultB);
 
-    // Steelman⁴⁷ → ⁴⁸ NOTE/HIGH: if Promise.allSettled actually
-    // completed both sides BEFORE the abort signal fired (the
-    // network was faster than the deadline timer), the aggregator
-    // already holds a decided outcome — success, REQUEST_ID_EXISTS,
-    // AUTHENTICATOR_VERIFICATION_FAILED, REQUEST_ID_MISMATCH, HTTP
-    // 4xx, etc. Returning AbortError in those cases would silently
-    // drop the spec outcome:
-    //   - 'rejected'   (Row 9) → H8 v-burning would not register
-    //     and the next attempt at v=resolvedV loops on REQUEST_ID_
-    //     EXISTS forever.
-    //   - 'aggregator_rejected' (Row 12) → permanent 4xx swallowed,
-    //     caller retries unnecessarily until budget exhausted.
-    //   - 'protocol_error' (Rows 14, 15) → fail-closed signal lost.
+    // Steelman⁴⁷ → ⁴⁸ → ⁴⁹: post-allSettled abort handling.
     //
-    // The F.47 fix only treated 'success'/'exists' as "decided"; this
-    // F.48 fix expands the set to all spec-decided side outcomes.
-    // AbortError is reserved for the genuine abandonment case where
-    // at least one side is NOT decided (network_error, retry_after,
-    // backoff — i.e., classes that do require retry / abandonment).
-    if (input.abortSignal?.aborted) {
-      const isSideDecided = (t: SideOutcome['type']): boolean =>
-        t === 'success' ||
-        t === 'exists' ||
-        t === 'rejected' ||
-        t === 'aggregator_rejected' ||
-        t === 'protocol_error';
-      const aDecided = isSideDecided(outcomeA.type);
-      const bDecided = isSideDecided(outcomeB.type);
-      if (!(aDecided && bDecided)) {
-        const err = new Error('submitPointer aborted by caller');
-        err.name = 'AbortError';
-        throw err;
-      }
-      // Both sides decided before abort; fall through to combine so
-      // the spec §7.3 state machine sees the real outcome.
-    }
-
+    // The aggregator is single-authoritative per (signingPubKey, v):
+    // once a side returns SUCCESS / REQUEST_ID_EXISTS / 4xx / -3200x,
+    // that decision is durable. Throwing AbortError to "abandon" a
+    // partially-committed v silently DROPS the spec outcome and can
+    // burn v without registering H8 / Row 6/7 retry-side / etc. So
+    // the abort signal is NEVER allowed to discard a per-side
+    // outcome that the spec needs the caller to observe.
+    //
+    // The right semantics: always run combineOutcomes (so the spec
+    // §7.3 state machine sees the real classifications), and let
+    // the caller's loop handle the abort signal at its OWN level
+    // (it will see the deadlineRace rejection regardless). This
+    // means the abort race in publishOnceAtVersion does its job
+    // (releases the await early, propagates RETRY_EXHAUSTED), but
+    // the per-side outcome the aggregator already committed is
+    // surfaced via the returned SubmitOutcome — caller's bookkeeping
+    // (H8 v-burn, marker clear, BLOCKED) runs correctly.
+    //
+    // Earlier fixes in this lineage tried to short-circuit on abort
+    // when both sides looked "decided", but had a regression: an
+    // asymmetric (decided + network_error) shape would also trip
+    // AbortError and lose the decided side's H8 record. The current
+    // approach (always combine) avoids both regressions.
     return combineOutcomes(outcomeA, outcomeB, v, cidBytes, marker, isIdempotentRetryHint);
   } finally {
     // T-C1b: finally-zero — wipe all derived secrets and ciphertexts on

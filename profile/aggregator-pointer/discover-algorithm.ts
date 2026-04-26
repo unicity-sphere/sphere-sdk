@@ -126,12 +126,18 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
   const defaultDeadline =
     Date.now() + (34 + walkbackLimit) * timeoutMs * 2;
   const discoveryDeadlineMs = input.discoveryDeadlineMs ?? defaultDeadline;
+  // Steelman⁴⁹ NOTE: track the START time independent of the deadline
+  // so error messages report elapsed time correctly even when the
+  // caller supplied an external `discoveryDeadlineMs` (e.g.,
+  // reconcile's shared budget). The previous arithmetic assumed the
+  // deadline was derived from the local default.
+  const discoveryStartMs = Date.now();
 
   const checkDeadline = (): void => {
     if (Date.now() > discoveryDeadlineMs) {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.RETRY_EXHAUSTED,
-        `Discovery exceeded wall-clock deadline after ${Date.now() - (discoveryDeadlineMs - (34 + walkbackLimit) * timeoutMs * 2)}ms.`,
+        `Discovery exceeded wall-clock deadline after ${Date.now() - discoveryStartMs}ms.`,
         { currentLocalVersion },
       );
     }

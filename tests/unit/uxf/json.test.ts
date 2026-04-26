@@ -386,4 +386,24 @@ describe('packageToJson / packageFromJson', () => {
       expect(restored.instanceChains.size).toBe(0);
     });
   });
+
+  // Steelman⁴⁹ regression: ensure dangling-manifest entries are
+  // rejected at the serialize boundary instead of silently soft-failing.
+  describe('dangling manifest fail-closed (steelman⁴⁹)', () => {
+    it('packageToJson throws MISSING_ELEMENT for manifest entry whose root is absent from pool', async () => {
+      const pkg = buildPackageFromToken(makeValidToken('a1'));
+      // Forge a manifest entry that points at a hash NOT in the pool.
+      const ghostHash = '00'.repeat(32) as ContentHash;
+      (pkg.manifest.tokens as Map<string, ContentHash>).set('ghost-token-id', ghostHash);
+      const { UxfError } = await import('../../../uxf/errors.js');
+      try {
+        packageToJson(pkg);
+        throw new Error('expected packageToJson to throw');
+      } catch (e) {
+        expect(e).toBeInstanceOf(UxfError);
+        expect((e as InstanceType<typeof UxfError>).code).toBe('MISSING_ELEMENT');
+        expect(String(e)).toMatch(/ghost-token-id/);
+      }
+    });
+  });
 });

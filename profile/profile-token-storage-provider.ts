@@ -1603,7 +1603,47 @@ export class ProfileTokenStorageProvider
         );
         return;
       }
-      const remote = await this.readOperationalState();
+      // Steelman⁴⁹ WARNING: per-op timeouts so a single hung
+      // OrbitDB read/write cannot blow past the wall-clock budget
+      // unobserved. The first iteration runs unconditionally (the
+      // top-of-loop budget check passes at Date.now()===rmwStart),
+      // so without this race a hung readOperationalState would never
+      // surface to the budget guard. Each I/O is raced against the
+      // remaining budget so total runtime stays within bound.
+      const remainingBudget = (): number =>
+        Math.max(0, RMW_WALL_CLOCK_BUDGET_MS - (Date.now() - rmwStart));
+      const raceWithBudget = async <T>(p: Promise<T>, label: string): Promise<T> => {
+        const remaining = remainingBudget();
+        if (remaining === 0) {
+          throw new Error(`writeOrbitOperationalState: ${label} aborted; budget exhausted`);
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`writeOrbitOperationalState: ${label} timed out (budget ${remaining}ms)`)),
+            remaining,
+          );
+          if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+            (timer as { unref: () => void }).unref();
+          }
+        });
+        try {
+          return await Promise.race([p, timeout]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      };
+      let remote: OperationalState;
+      try {
+        remote = await raceWithBudget(this.readOperationalState(), 'readOperationalState');
+      } catch (err) {
+        // Timeout or read error — surface as event and bail (the
+        // budget guard at top-of-loop would catch this on the next
+        // iteration anyway, but propagating the timeout would push
+        // it into the outer flush catch which is less informative).
+        this.emitEvent(this.buildErrorEvent('storage:error', err));
+        return;
+      }
       const merged: OperationalState = {
         tombstones: opState.tombstones,
         sent: opState.sent,
@@ -1634,7 +1674,7 @@ export class ProfileTokenStorageProvider
       let writeFailed = false;
       for (const [key, value] of writes) {
         try {
-          await this.writeProfileKey(key, JSON.stringify(value));
+          await raceWithBudget(this.writeProfileKey(key, JSON.stringify(value)), `writeProfileKey(${key})`);
         } catch (err) {
           writeFailed = true;
           this.log(`Failed to write operational state key "${key}": ${err instanceof Error ? err.message : String(err)}`);
@@ -1650,7 +1690,7 @@ export class ProfileTokenStorageProvider
       // sibling-only entries to drift in/out of the remote view; we
       // only check that OUR entries (those we contributed) are
       // present.
-      const verify = await this.readOperationalState();
+      const verify = await raceWithBudget(this.readOperationalState(), 'verifyReadOperationalState');
       const verifyOutboxIds = new Set(verify.outbox.map((e) => (e as unknown as Record<string, unknown>).id));
       const verifyInvalidIds = new Set(verify.invalid.map((e) => (e as unknown as Record<string, unknown>).tokenId));
       const verifyMintIds = new Set(verify.mintOutbox.map((e) => (e as unknown as Record<string, unknown>).tokenId));

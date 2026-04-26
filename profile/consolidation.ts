@@ -184,38 +184,52 @@ export class ConsolidationEngine {
     // If another device wrote a different pending state in the race window, we abort.
     // Steelman⁴⁸: race the sleep against the abort signal so shutdown
     // can pre-empt the 30s wait. On signal, throw a typed error.
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (opts?.abortSignal) opts.abortSignal.removeEventListener('abort', onAbort);
-        resolve();
-      }, 30_000);
-      const onAbort = (): void => {
-        clearTimeout(timer);
-        reject(
-          Object.assign(
-            new Error('Consolidation aborted by caller (TOCTOU sleep pre-empted)'),
-            { code: 'CONSOLIDATION_ABORTED' },
-          ),
-        );
-      };
-      if (opts?.abortSignal) {
-        if (opts.abortSignal.aborted) {
+    // Steelman⁴⁹: on abort, clean up the pending state we wrote on
+    // line 177 BEFORE throwing, so subsequent consolidate() calls
+    // within PENDING_MAX_AGE_MS don't see a stale CONSOLIDATION_IN_
+    // PROGRESS from us. Best-effort: cleanup failure does not mask
+    // the abort error.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (opts?.abortSignal) opts.abortSignal.removeEventListener('abort', onAbort);
+          resolve();
+        }, 30_000);
+        const onAbort = (): void => {
           clearTimeout(timer);
           reject(
             Object.assign(
-              new Error('Consolidation aborted by caller (signal already aborted)'),
+              new Error('Consolidation aborted by caller (TOCTOU sleep pre-empted)'),
               { code: 'CONSOLIDATION_ABORTED' },
             ),
           );
-          return;
+        };
+        if (opts?.abortSignal) {
+          if (opts.abortSignal.aborted) {
+            clearTimeout(timer);
+            reject(
+              Object.assign(
+                new Error('Consolidation aborted by caller (signal already aborted)'),
+                { code: 'CONSOLIDATION_ABORTED' },
+              ),
+            );
+            return;
+          }
+          opts.abortSignal.addEventListener('abort', onAbort, { once: true });
         }
-        opts.abortSignal.addEventListener('abort', onAbort, { once: true });
+        // Don't keep Node alive for the timer — it's a wait, not work.
+        if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+          (timer as { unref: () => void }).unref();
+        }
+      });
+    } catch (abortErr) {
+      try {
+        await this.db.del(CONSOLIDATION_PENDING_KEY);
+      } catch {
+        /* best-effort cleanup; do not mask abort error */
       }
-      // Don't keep Node alive for the timer — it's a wait, not work.
-      if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
-        (timer as { unref: () => void }).unref();
-      }
-    });
+      throw abortErr;
+    }
     const readBack = await this.readPendingState();
     if (readBack && readBack.device !== deviceId) {
       this.log(

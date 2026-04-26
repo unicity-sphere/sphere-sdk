@@ -478,13 +478,19 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
   // manifest entries got rolled back. On throw, ROLL BACK both the
   // manifest entries AND the index entries we added.
   //
-  // Steelman⁴⁸ WARNING: also snapshot the pre-existing pool keys so a
-  // throw during the manifest/index loop can roll back any pool
+  // Steelman⁴⁸ WARNING: also snapshot the pre-existing pool entries
+  // so a throw during the manifest/index loop can roll back any pool
   // entries inserted by `syncPool` above. Previously the docstring
   // claimed "atomic commit" but only manifest+indexes were rolled
   // back — orphan pool elements survived (would only be reclaimed by
   // gc()). True rollback now restores pool to its pre-syncPool state.
-  const prePoolKeys = new Set<string>(pkg.pool.keys());
+  //
+  // Steelman⁴⁹ WARNING: snapshot ENTIRE pool (full Map copy), not just
+  // keys. `syncPool` does `mutablePool.clear()` then refill — if it
+  // throws after clear() but before refill (OOM, iterator error),
+  // a key-only snapshot cannot restore the pre-existing entries.
+  // The full snapshot supports clear+restore.
+  const prePoolSnapshot = new Map<ContentHash, UxfElement>(pkg.pool);
   syncPool(pkg, pool);
   const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
   const previousManifest = new Map<string, ContentHash | undefined>();
@@ -521,14 +527,17 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
       if (prev === undefined) mutableManifest.delete(tokenId);
       else mutableManifest.set(tokenId, prev);
     }
-    // Steelman⁴⁸: roll back pool inserts to satisfy the "atomic
-    // commit" docstring contract. Delete any element added by
-    // syncPool that wasn't in the pre-existing key set.
-    const mutablePool = pkg.pool as Map<ContentHash, UxfElement>;
-    for (const key of [...mutablePool.keys()]) {
-      if (!prePoolKeys.has(key)) {
-        try { mutablePool.delete(key); } catch { /* best-effort */ }
-      }
+    // Steelman⁴⁸/⁴⁹: roll back pool inserts to satisfy the "atomic
+    // commit" docstring contract. Restore from the full snapshot:
+    // clear() and re-populate with pre-existing entries. This
+    // handles the case where syncPool itself threw mid-clear (key-
+    // only delta would not reconstruct).
+    try {
+      const mutablePool = pkg.pool as Map<ContentHash, UxfElement>;
+      mutablePool.clear();
+      for (const [k, v] of prePoolSnapshot) mutablePool.set(k, v);
+    } catch {
+      /* best-effort — pool integrity already compromised, throw the original error */
     }
     throw err;
   }

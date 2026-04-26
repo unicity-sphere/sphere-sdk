@@ -77,10 +77,23 @@ export class OrbitDbAdapter implements ProfileDatabase {
    * await the same connect promise.
    */
   private connectInFlight: Promise<void> | null = null;
+  private closeInFlight: Promise<void> | null = null;
 
   // ---------- ProfileDatabase implementation ----------
 
   async connect(config: OrbitDbConfig): Promise<void> {
+    // Steelman⁴⁹ WARNING: if a close() is currently tearing down,
+    // we must wait for it to complete before we can connect again.
+    // Otherwise a fresh connect() observing connected=true (close
+    // hasn't reached connected=false yet) returns success while
+    // close is still mid-teardown, leaving caller with db=null.
+    if (this.closeInFlight) {
+      try {
+        await this.closeInFlight;
+      } catch {
+        /* close errors are best-effort; caller's connect should still proceed */
+      }
+    }
     if (this.connected) {
       return; // idempotent
     }
@@ -604,6 +617,19 @@ export class OrbitDbAdapter implements ProfileDatabase {
   }
 
   async close(): Promise<void> {
+    // Steelman⁴⁹ WARNING: dedup concurrent close() calls and let
+    // connect() await us via closeInFlight. Without this, a new
+    // connect() racing the second half of close() could observe
+    // connected=true (close hasn't reset the flag yet) and return
+    // immediately, leaving caller with stale handles.
+    if (this.closeInFlight) return this.closeInFlight;
+    this.closeInFlight = this.closeInner().finally(() => {
+      this.closeInFlight = null;
+    });
+    return this.closeInFlight;
+  }
+
+  private async closeInner(): Promise<void> {
     // Steelman⁴⁸ WARNING: if a connect() is currently in flight, await
     // it before short-circuiting. Without this, close() observes
     // connected=false (still mid-init), returns, and the eventual
