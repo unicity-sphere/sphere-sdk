@@ -120,6 +120,29 @@ describe('UxfPackage', () => {
       pkg.ingestAll([TOKEN_A, TOKEN_B]);
       expect(pkg.tokenCount).toBe(2);
     });
+
+    // Steelman³¹ regression coverage: ingestAll must populate the
+    // secondary indexes (byCoinId, byTokenType, byStateHash) the same
+    // as per-token ingest does. F.35's first attempt called
+    // updateIndexesForToken BEFORE syncPool, so the indexes silently
+    // remained empty after batch ingest.
+    it('ingestAll populates secondary indexes equivalently to per-token ingest', () => {
+      const pkgBatch = UxfPackage.create();
+      pkgBatch.ingestAll([TOKEN_A, TOKEN_B]);
+      const pkgSeq = UxfPackage.create();
+      pkgSeq.ingest(TOKEN_A);
+      pkgSeq.ingest(TOKEN_B);
+      // Same coin-id index population.
+      const idsBatch = pkgBatch.tokensByCoinId('UCT').sort();
+      const idsSeq = pkgSeq.tokensByCoinId('UCT').sort();
+      expect(idsBatch).toEqual(idsSeq);
+      expect(idsBatch.length).toBeGreaterThan(0);
+      // Same token-type index population.
+      const typesBatch = pkgBatch.tokensByTokenType(TOKEN_TYPE_FUNGIBLE).sort();
+      const typesSeq = pkgSeq.tokensByTokenType(TOKEN_TYPE_FUNGIBLE).sort();
+      expect(typesBatch).toEqual(typesSeq);
+      expect(typesBatch.length).toBeGreaterThan(0);
+    });
   });
 
   // -------------------------------------------------------------------------

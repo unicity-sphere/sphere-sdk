@@ -428,26 +428,43 @@ export function ingest(pkg: UxfPackageData, token: unknown): void {
 /**
  * Batch ingest multiple tokens.
  *
- * Steelman³⁰ warning: wrap the pool ONCE for the whole batch instead
- * of per-token. The previous loop-of-ingest meant fromMapVerified
- * (which re-hashes the entire pool) ran N times for N tokens — O(N²)
- * SHA-256 calls on the hot flush path (PaymentsModule.flushOpStateToProfile,
- * ProfileTokenStorageProvider). Now O(N): the wrap-and-verify
- * happens once; ingest mutations stay in the wrapped pool until syncPool.
+ * Steelman³⁰/³¹: wrap the pool ONCE for the whole batch (O(N) SHA-256
+ * calls instead of O(N²)) AND defer manifest + index mutations until
+ * AFTER syncPool. This fixes two F.35 regressions:
+ *
+ *   (a) Index breakage: updateIndexesForToken reads from pkg.pool,
+ *       which doesn't have the new elements until syncPool runs.
+ *       Pre-syncPool calls silently no-op'd, leaving byCoinId /
+ *       byTokenType / byStateHash empty after batch ingest. None of
+ *       the 38 UxfPackage tests asserted post-batch index content,
+ *       so the regression shipped silently.
+ *
+ *   (b) Atomicity: manifest mutations during the loop made a partial
+ *       failure leave the manifest pointing at rootHashes that DO NOT
+ *       exist in the pool yet. Now: collect (tokenId, rootHash) pairs
+ *       in a local list; commit pool + manifest + indexes only after
+ *       the loop completes.
  */
 export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
   if (tokens.length === 0) return;
   const pool = wrapPool(pkg);
-  const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
+  const newTokens: Array<{ tokenId: string; rootHash: ContentHash }> = [];
   for (const token of tokens) {
     const rootHash = deconstructToken(pool, token);
     const rootElement = pool.get(rootHash)!;
     const rootContent = rootElement.content as unknown as TokenRootContent;
-    const tokenId = rootContent.tokenId;
+    newTokens.push({ tokenId: rootContent.tokenId, rootHash });
+  }
+  // ATOMIC COMMIT: pool first (so updateIndexesForToken's pkg.pool.get
+  // returns the newly-deconstructed elements), then manifest, then
+  // indexes. If an earlier deconstructToken threw, we never reach here
+  // and the package state is unchanged.
+  syncPool(pkg, pool);
+  const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
+  for (const { tokenId, rootHash } of newTokens) {
     mutableManifest.set(tokenId, rootHash);
     updateIndexesForToken(pkg, tokenId, rootHash);
   }
-  syncPool(pkg, pool);
   (pkg.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
 }
 

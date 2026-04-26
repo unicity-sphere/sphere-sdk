@@ -58,7 +58,20 @@ function toHex(bytes: Uint8Array): string {
     .join('');
 }
 
+// Steelman³¹: strict hex decoder — see PaymentsModule.fromHex.
 function fromHex(hex: string): Uint8Array {
+  if (typeof hex !== 'string') {
+    throw new TypeError(`fromHex: expected string, got ${typeof hex}`);
+  }
+  if (hex.length === 0) {
+    throw new RangeError('fromHex: empty hex string');
+  }
+  if (hex.length % 2 !== 0) {
+    throw new RangeError(`fromHex: odd-length hex string (${hex.length} chars)`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new RangeError('fromHex: contains non-hex characters');
+  }
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
     bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
