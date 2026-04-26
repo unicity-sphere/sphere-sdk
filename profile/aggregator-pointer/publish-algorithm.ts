@@ -301,6 +301,15 @@ async function publishOnce(
             k === 'aggregator_rejected' ||
             k === 'protocol_error'
           ) {
+            // Steelman⁵¹ NOTE: substituting a spec-decided outcome
+            // here is a deliberate semantic precedence choice — the
+            // aggregator's authoritative decision (e.g. H8 v-burn,
+            // permanent 4xx) supersedes the wall-clock RETRY_
+            // EXHAUSTED. Callers branching on RETRY_EXHAUSTED for
+            // backoff scheduling will instead see the terminal class.
+            // This is correct: a v-burned version cannot be retried,
+            // and a permanent 4xx must surface as such — backoff
+            // would only mask the real failure.
             outcome = drainedOutcome;
           } else {
             // retry_side / retry_both / retry_after / retry_backoff —

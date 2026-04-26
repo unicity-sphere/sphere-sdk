@@ -1617,27 +1617,6 @@ export class ProfileTokenStorageProvider
         if (remaining === 0) {
           throw new Error(`writeOrbitOperationalState: ${label} aborted; budget exhausted`);
         }
-        // Steelman⁵⁰ WARNING: if `p` rejects AFTER timeout has
-        // already won the race, the rejection is unhandled and
-        // surfaces as UnhandledPromiseRejection. Attach a no-op
-        // catch so the orphan settlement is observed harmlessly.
-        // (We still observe the original rejection via Promise.race
-        // when `p` loses the race because Promise.race propagates
-        // it before the timeout settler — only the post-timeout
-        // case needs the orphan handler.)
-        const guarded: Promise<T> = p.catch((err) => {
-          // Re-throw so Promise.race observes the rejection if `p`
-          // loses to timeout. The catch chain in JS rebuilds a new
-          // promise — but Promise.race subscribes to the ORIGINAL
-          // `p`, not `guarded`. So we cannot use this trick directly.
-          // Instead: subscribe both. (See below.)
-          throw err;
-        });
-        // The robust approach: race the original `p` AND attach a
-        // no-op catch to it AFTER the race resolves. If timeout
-        // wins, the orphan `p` may still reject — the no-op catch
-        // ensures the rejection is observed.
-        void guarded; // placate eslint; we use the `p`-orphan handler below
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<never>((_, reject) => {
           timer = setTimeout(
@@ -1652,9 +1631,12 @@ export class ProfileTokenStorageProvider
           return await Promise.race([p, timeout]);
         } finally {
           if (timer !== undefined) clearTimeout(timer);
-          // Defensive: if `p` is still pending after race resolution,
-          // attach a no-op handler so its eventual settlement
-          // (success or rejection) is observed harmlessly.
+          // Steelman⁵⁰/⁵¹: if timeout won the race, the underlying
+          // `p` may still be pending and could eventually reject —
+          // attaching a no-op terminal handler ensures the eventual
+          // settlement is observed harmlessly (no UnhandledPromise
+          // Rejection). When `p` already settled via the race, this
+          // attach is a cheap no-op on an already-resolved promise.
           p.then(
             () => undefined,
             () => undefined,

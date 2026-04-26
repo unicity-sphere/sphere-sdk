@@ -3910,24 +3910,51 @@ export class Sphere {
   // ===========================================================================
 
   private async storeMnemonic(mnemonic: string, derivationPath?: string, basePath?: string): Promise<void> {
-    // TODO: Encrypt with user password/PIN
+    // Steelman⁵¹ CRITICAL: storeMnemonic writes 4-5 separate KV
+    // entries sequentially. If a mid-sequence write rejects (e.g.,
+    // STORAGE_LOCK_CONTENDED, IDB transaction abort, quota exceeded),
+    // the wallet would be left in a half-initialized state on disk
+    // — encrypted MNEMONIC persisted with no metadata, requiring
+    // the user to manually clear() before retrying. We treat the
+    // multi-key write as a best-effort transaction: track the keys
+    // we successfully wrote, and on any error remove them all
+    // before re-throwing. The eventual `WALLET_EXISTS=true` flag
+    // (in finalizeWalletCreation) is the durable commit; the keys
+    // here are only meaningful as a SET observed atomically by
+    // the next Sphere.load(). Best-effort cleanup honors that
+    // contract: either all-or-nothing visible to the next load.
     const encrypted = this.encrypt(mnemonic);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted);
-
-    // Store mnemonic in memory for getMnemonic()
-    this._mnemonic = mnemonic;
-    this._source = 'mnemonic';
-    this._derivationMode = 'bip32';
-
-    if (derivationPath) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
+    const writtenKeys: string[] = [];
+    const writeKey = async (key: string, value: string): Promise<void> => {
+      await this._storage.set(key, value);
+      writtenKeys.push(key);
+    };
+    try {
+      await writeKey(STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted);
+      this._mnemonic = mnemonic;
+      this._source = 'mnemonic';
+      this._derivationMode = 'bip32';
+      if (derivationPath) {
+        await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
+      }
+      const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
+      this._basePath = effectiveBasePath;
+      await writeKey(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
+      await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
+      await writeKey(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
+    } catch (writeErr) {
+      // Best-effort rollback so the next Sphere.load() does not see
+      // half-written wallet metadata. Cleanup failures are logged
+      // but do not mask the original error.
+      for (const k of writtenKeys.reverse()) {
+        try {
+          await this._storage.remove(k);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      throw writeErr;
     }
-
-    const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
-    this._basePath = effectiveBasePath;
-    await this._storage.set(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
@@ -3938,33 +3965,46 @@ export class Sphere {
     basePath?: string,
     derivationMode?: DerivationMode
   ): Promise<void> {
+    // Steelman⁵¹ CRITICAL: same multi-key-write atomicity issue as
+    // storeMnemonic — best-effort transactional rollback on any
+    // mid-sequence write failure (STORAGE_LOCK_CONTENDED, quota,
+    // IDB abort, etc.). See storeMnemonic for full rationale.
     const encrypted = this.encrypt(masterKey);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted);
-
-    // Set source and derivation mode
-    this._source = 'file';
-    this._mnemonic = null;
-
-    // Determine derivation mode from chain code if not specified
-    if (derivationMode) {
-      this._derivationMode = derivationMode;
-    } else {
-      this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
+    const writtenKeys: string[] = [];
+    const writeKey = async (key: string, value: string): Promise<void> => {
+      await this._storage.set(key, value);
+      writtenKeys.push(key);
+    };
+    try {
+      await writeKey(STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted);
+      this._source = 'file';
+      this._mnemonic = null;
+      if (derivationMode) {
+        this._derivationMode = derivationMode;
+      } else {
+        this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
+      }
+      if (chainCode) {
+        await writeKey(STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode);
+      }
+      if (derivationPath) {
+        await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
+      }
+      const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
+      this._basePath = effectiveBasePath;
+      await writeKey(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
+      await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
+      await writeKey(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
+    } catch (writeErr) {
+      for (const k of writtenKeys.reverse()) {
+        try {
+          await this._storage.remove(k);
+        } catch {
+          /* best-effort cleanup */
+        }
+      }
+      throw writeErr;
     }
-
-    if (chainCode) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode);
-    }
-
-    if (derivationPath) {
-      await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
-    }
-
-    const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
-    this._basePath = effectiveBasePath;
-    await this._storage.set(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-    await this._storage.set(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
   }
 
