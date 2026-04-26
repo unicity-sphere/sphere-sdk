@@ -206,15 +206,43 @@ async function publishOnce(
     // if the lock is gone.
     mutexHandle.assertHeld();
 
-    const outcome: SubmitOutcome = await submitPointer({
-      v,
-      cidBytes,
-      keyMaterial,
-      signer,
-      aggregatorClient,
-      marker,
-      isIdempotentRetryHint,
+    // Steelman²² warning: enforce loopDeadline INSIDE submitPointer via
+    // Promise.race so a hung network call cannot extend the actual hold
+    // beyond the gate. Without this, a hung submit holds the mutex for
+    // up to PUBLISH_REQUEST_TIMEOUT_MS × 2 past the deadline. The race
+    // throws RETRY_EXHAUSTED at the deadline boundary; the in-flight
+    // submitPointer is abandoned (its own per-side timeouts will tear
+    // it down asynchronously).
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const deadlineRace = new Promise<never>((_, reject) => {
+      const remaining = Math.max(0, loopDeadline - Date.now());
+      deadlineTimer = setTimeout(() => {
+        reject(
+          new AggregatorPointerError(
+            AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+            `publishOnce wall-clock deadline tripped during submit at v=${v}.`,
+            { v, retriesConsumed, cumulativeRetryAfterMs },
+          ),
+        );
+      }, remaining);
     });
+    let outcome: SubmitOutcome;
+    try {
+      outcome = await Promise.race([
+        submitPointer({
+          v,
+          cidBytes,
+          keyMaterial,
+          signer,
+          aggregatorClient,
+          marker,
+          isIdempotentRetryHint,
+        }),
+        deadlineRace,
+      ]);
+    } finally {
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+    }
 
     switch (outcome.kind) {
       case 'success':

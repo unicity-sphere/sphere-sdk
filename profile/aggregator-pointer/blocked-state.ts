@@ -198,16 +198,18 @@ export async function isBlocked(store: FlagStore): Promise<BlockedState> {
  * (preserves the earliest block event for diagnostics).
  */
 export async function setBlocked(store: FlagStore, reason: BlockedReason): Promise<void> {
-  // Steelman²¹ warning: 'corrupt' is a SYNTHETIC read-side reason — it is
-  // intentionally NOT in KNOWN_BLOCKED_REASONS so a persisted record with
-  // reason='corrupt' would be rejected on the next isBlocked() call,
-  // bricking the wallet from a coding error. Reject at write time so the
-  // synthetic-only contract is enforced at runtime, not just by comment.
-  if ((reason as string) === 'corrupt') {
+  // Steelman²¹/²² warning: any reason NOT in KNOWN_BLOCKED_REASONS would
+  // cause isBlocked() to throw CORRUPT on the next read — bricking the
+  // wallet from a coding error. The previous exact-string 'corrupt'
+  // guard missed case-variants ('Corrupt', 'CORRUPT'), reachable via TS
+  // `as` casts. Now reject ANYTHING the read-side wouldn't recognize,
+  // which is the actual contract: persisted reasons must round-trip.
+  if (!KNOWN_BLOCKED_REASONS.has(reason as string)) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
-      "BlockedReason 'corrupt' is a synthetic read-side reason and must not be persisted. " +
-        'Use a category-specific reason (retry_exhausted, network_timeout, etc.) instead.',
+      `BlockedReason "${String(reason)}" is not a recognized persistable reason. ` +
+        `Allowed: ${[...KNOWN_BLOCKED_REASONS].join(', ')}. ` +
+        "(The synthetic 'corrupt' reason is read-side only and must not be persisted.)",
     );
   }
   // Idempotency check: if a valid BLOCKED record exists, preserve it.

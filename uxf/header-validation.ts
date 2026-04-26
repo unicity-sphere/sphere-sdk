@@ -39,10 +39,23 @@ export function assertHeaderVersionField(
 }
 
 /**
+ * Maximum allowed length for header.kind strings. Bounds memory cost at
+ * the parse boundary: an attacker-supplied 1MB+ kind would otherwise
+ * propagate through pool storage, hash computation (slow), index
+ * structures, and persistent state. 64 chars accommodates all current
+ * well-known kinds plus reasonable future extensions.
+ */
+export const MAX_KIND_LENGTH = 64;
+
+/**
  * Assert that a value is a non-empty string suitable for use as a
  * UxfInstanceKind. JSON.parse / CBOR-decode can produce null, numbers,
  * objects, etc.; the `as UxfInstanceKind` cast at parse boundaries lies
  * unless we runtime-check.
+ *
+ * Steelman²² note: also enforces an upper length bound (MAX_KIND_LENGTH)
+ * so attacker-supplied giant strings cannot bloat the pool / slow hash
+ * computation.
  */
 export function assertHeaderKindField(
   value: unknown,
@@ -52,6 +65,12 @@ export function assertHeaderKindField(
     throw new UxfError(
       'SERIALIZATION_ERROR',
       `${fieldLabel} must be a non-empty string, got ${String(value)}`,
+    );
+  }
+  if (value.length > MAX_KIND_LENGTH) {
+    throw new UxfError(
+      'SERIALIZATION_ERROR',
+      `${fieldLabel} length ${value.length} exceeds MAX_KIND_LENGTH=${MAX_KIND_LENGTH}`,
     );
   }
 }

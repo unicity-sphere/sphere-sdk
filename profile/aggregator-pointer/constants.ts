@@ -125,22 +125,26 @@ export const FILE_LOCK_STALE_MS =
     (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2) +
   FILE_LOCK_STALE_MARGIN_MS;
 
-// Steelman²¹ note: module-load invariant. If a future contributor changes
-// any of the component constants without updating the formula, this throws
-// at import time rather than letting a silent mutex violation reach
-// production.  The check is duplicated rather than computed-and-compared
-// so that changing the formula in one place fails the assert visibly.
-{
-  const expectedHold =
-    MAX_CUMULATIVE_RETRY_AFTER_MS +
-    ATTEMPT_MAX_RETRIES_HARD_CAP *
-      (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2);
-  if (FILE_LOCK_STALE_MS < expectedHold + FILE_LOCK_STALE_MARGIN_MS) {
-    throw new Error(
-      `pointer-layer constants invariant violated: FILE_LOCK_STALE_MS=${FILE_LOCK_STALE_MS} ` +
-        `is below required minimum ${expectedHold + FILE_LOCK_STALE_MARGIN_MS} ` +
-        `(worst-case publishOnce hold ${expectedHold}ms + ${FILE_LOCK_STALE_MARGIN_MS}ms margin). ` +
-        `Update the FILE_LOCK_STALE_MS formula or lower ATTEMPT_MAX_RETRIES_HARD_CAP / PUBLISH_REQUEST_TIMEOUT_MS.`,
-    );
-  }
+// Steelman²¹/²² note: module-load invariant.
+//
+// HARDCODED minimum value below — this catches BOTH a manual override of
+// FILE_LOCK_STALE_MS *AND* drift in the formula or its component constants.
+// A computed expression like `expectedHold + margin` using the same
+// constants is tautological (always passes), only catching manual overrides.
+// The hardcoded literal forces any change to ANY component (formula or
+// constants) to fail the invariant unless this literal is also updated —
+// which requires the contributor to actively re-derive and verify the
+// safety property. Keep this in sync with the formula.
+//
+// As of F.24 with cap=10, retry_after=180s, backoff_max=4s, request_timeout=30s:
+//   expectedHold = 180_000 + 10 × (4_000 × 2 + 30_000 × 2) = 860_000ms
+//   minimum     = expectedHold + 60_000 margin = 920_000ms
+const FILE_LOCK_STALE_MS_MIN_INVARIANT = 920_000;
+if (FILE_LOCK_STALE_MS < FILE_LOCK_STALE_MS_MIN_INVARIANT) {
+  throw new Error(
+    `pointer-layer constants invariant violated: FILE_LOCK_STALE_MS=${FILE_LOCK_STALE_MS} ` +
+      `is below the safety-property minimum ${FILE_LOCK_STALE_MS_MIN_INVARIANT}ms. ` +
+      `Either fix the FILE_LOCK_STALE_MS formula, or update both the formula AND ` +
+      `the FILE_LOCK_STALE_MS_MIN_INVARIANT literal in constants.ts after re-deriving the safety property.`,
+  );
 }

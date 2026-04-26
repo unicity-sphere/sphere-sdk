@@ -192,9 +192,20 @@ export function createMasterPrivateKey(
   bytes: Uint8Array,
   network?: string,
 ): MasterPrivateKey {
-  if (bytes.length !== 32) {
+  // Steelman²² critical: snapshot ALL view properties (buffer, byteOffset,
+  // length) at the very top, BEFORE any further reads. A hostile
+  // TypedArray subclass can override these as getters that return one
+  // value on the first read and another on subsequent reads. Without
+  // snapshotting all three, the gate-check at L218 sees a benign buffer
+  // while the slice at L242 reads a different byteOffset/length and
+  // produces a wrong-sized internalBytes that bypasses the denylist
+  // (length≠32 short-circuits bytesEqual32 to false).
+  const sourceBuffer = bytes.buffer;
+  const sourceOffset = bytes.byteOffset;
+  const sourceLen = bytes.length;
+  if (sourceLen !== 32) {
     throw new RangeError(
-      `MasterPrivateKey must be exactly 32 bytes, got ${bytes.length}`,
+      `MasterPrivateKey must be exactly 32 bytes, got ${sourceLen}`,
     );
   }
   // Reject SharedArrayBuffer: a SAB-backed Uint8Array can be mutated from a
@@ -202,19 +213,9 @@ export function createMasterPrivateKey(
   // attacker could pass a benign value through the denylist gate and then
   // swap in a weak scalar (all-zero, N, …) before the copy executes.
   //
-  // Steelman¹⁹ critical #2: use cross-realm-safe detection. `instanceof`
-  // is realm-scoped — a SAB from an iframe / Worker / vm context is NOT
+  // Steelman¹⁹ critical: use cross-realm-safe detection. `instanceof` is
+  // realm-scoped — a SAB from an iframe / Worker / vm context is NOT
   // `instanceof` the local SharedArrayBuffer and would slip through.
-  //
-  // Steelman²⁰ note: snapshot `bytes.buffer` ONCE so a hostile TypedArray
-  // subclass with a `.buffer` getter can't return a benign ArrayBuffer
-  // on the gate-check and a SAB on the subsequent copy. The snapshot is
-  // used for the gate; the actual copy still goes via `new Uint8Array(bytes)`
-  // which reads `.buffer` again — but a hostile subclass returning a
-  // different buffer there would not be readable by the regular
-  // copy-by-iteration path anyway.
-  // Steelman²⁰ note: snapshot bytes.buffer once for the gate check.
-  const sourceBuffer = bytes.buffer;
   if (isSharedArrayBufferLike(sourceBuffer)) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
@@ -222,12 +223,10 @@ export function createMasterPrivateKey(
         'concurrent mutation between denylist check and internal copy is a TOCTOU risk.',
     );
   }
-  // Steelman²¹ note: copy via the SNAPSHOTTED sourceBuffer.slice rather
-  // than `new Uint8Array(bytes)`. A hostile TypedArray subclass could
-  // override the `.buffer` getter to return a benign ArrayBuffer on the
-  // gate check and a SAB on the subsequent copy.  Reading via the captured
-  // sourceBuffer reference and slicing the byte range directly defeats
-  // that bypass — the snapshotted buffer is what we validated.
+  // Steelman²¹/²²: copy via the SNAPSHOTTED buffer / offset / length
+  // (sourceBuffer.slice), not via `new Uint8Array(bytes)` which would
+  // re-read the hostile subclass's getters. Slice operates on a fresh
+  // ArrayBuffer; the resulting Uint8Array is never SAB-backed.
   //
   // Steelman remediation: the `bytes` property is a GETTER that returns a
   // defensive copy of the internal buffer. Exposing the raw Uint8Array
@@ -238,8 +237,20 @@ export function createMasterPrivateKey(
   // wipe the returned copy when done. `zeroize()` wipes the SOURCE buffer,
   // after which all future .bytes reads return zeros.
   const internalBytes = new Uint8Array(
-    sourceBuffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length),
+    sourceBuffer.slice(sourceOffset, sourceOffset + sourceLen),
   );
+  // Steelman²² critical defense-in-depth: re-assert the copy length.
+  // ArrayBuffer.slice clamps end to byteLength; if sourceOffset + sourceLen
+  // exceeds the underlying buffer, the slice is shorter. Any length
+  // mismatch here means the snapshot lied — fail closed.
+  if (internalBytes.length !== 32) {
+    safeWipe(internalBytes);
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `MasterPrivateKey internal copy length mismatch: expected 32, got ${internalBytes.length}. ` +
+        'Hostile TypedArray subclass with shifting offset/length getters is the most likely cause.',
+    );
+  }
   // Evaluate denylist BEFORE capturing isKat so both checks run on the
   // same `internalBytes` snapshot.  Zero the copy on rejection so the
   // buffer does not linger on the heap.
