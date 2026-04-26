@@ -1509,11 +1509,36 @@ export class ProfileTokenStorageProvider
    */
   private async writeOrbitOperationalState(opState: OperationalState): Promise<void> {
     const addr = this.getAddressId();
+    // Steelman⁴³ critical: each of these arrays is stored under a single
+    // OrbitDB key as a serialized whole. OrbitDB key-value is LWW per key;
+    // two processes both flushing concurrently would silently drop one
+    // process's appends. Mitigate by READING the current OrbitDB value,
+    // MERGING with our local view by primary key (idempotent union for
+    // adds), and writing the merge result. Removals are handled by the
+    // tombstone-based mechanisms already present in the SDK; this code
+    // path only reconciles ADDITIONS, which is the common multi-process
+    // race (daemon + CLI both adding outbox entries).
+    const remote = await this.readOperationalState();
+    const merged: OperationalState = {
+      tombstones: opState.tombstones,
+      sent: opState.sent,
+      history: opState.history,
+      outbox: mergeByPrimaryKey(remote.outbox, opState.outbox, 'id'),
+      invalid: mergeByPrimaryKey(remote.invalid, opState.invalid, 'tokenId'),
+      mintOutbox: mergeByPrimaryKey(remote.mintOutbox, opState.mintOutbox, 'tokenId'),
+      invalidatedNametags: Array.from(
+        new Set([
+          ...(remote.invalidatedNametags as string[]),
+          ...(opState.invalidatedNametags as string[]),
+        ]),
+      ),
+    };
+
     const writes: Array<[string, unknown]> = [
-      [`${addr}.outbox`, opState.outbox],
-      [`${addr}.invalid`, opState.invalid],
-      [`${addr}.mintOutbox`, opState.mintOutbox],
-      [`${addr}.invalidatedNametags`, opState.invalidatedNametags],
+      [`${addr}.outbox`, merged.outbox],
+      [`${addr}.invalid`, merged.invalid],
+      [`${addr}.mintOutbox`, merged.mintOutbox],
+      [`${addr}.invalidatedNametags`, merged.invalidatedNametags],
     ];
 
     for (const [key, value] of writes) {
@@ -1945,3 +1970,28 @@ export class ProfileTokenStorageProvider
 // =============================================================================
 
 // Steelman³⁵: hexToBytes consolidated to core/hex.ts (top-of-file import).
+
+/**
+ * Steelman⁴³ critical helper: merge two arrays of records by a primary
+ * key field (idempotent union — local entries override remote on
+ * conflict). Used for OrbitDB op-state writes to prevent cross-process
+ * LWW data loss when two instances flush concurrently.
+ */
+function mergeByPrimaryKey<T>(remote: T[], local: T[], keyField: string): T[] {
+  const byKey = new Map<unknown, T>();
+  for (const item of remote) {
+    if (typeof item === 'object' && item !== null) {
+      const key = (item as Record<string, unknown>)[keyField];
+      if (key !== undefined) byKey.set(key, item);
+    }
+  }
+  // Local entries override on conflict (this instance's view is more
+  // recent for a key it touched in the same flush).
+  for (const item of local) {
+    if (typeof item === 'object' && item !== null) {
+      const key = (item as Record<string, unknown>)[keyField];
+      if (key !== undefined) byKey.set(key, item);
+    }
+  }
+  return Array.from(byKey.values());
+}
