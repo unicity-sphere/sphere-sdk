@@ -11,7 +11,10 @@
 
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
-import { hexToBytesAllowEmpty as strictHexToBytesAllowEmpty } from '../../core/hex.js';
+import {
+  hexToBytes as strictHexToBytes,
+  hexToBytesAllowEmpty as strictHexToBytesAllowEmpty,
+} from '../../core/hex.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
 import { CidRefStore, type CidRef } from '../../profile/cid-ref-store.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
@@ -985,19 +988,17 @@ export class AccountingModule {
     if (!privateKeyHex) {
       throw new SphereError('Private key required for invoice creation', 'NOT_INITIALIZED');
     }
-    // Steelman³² warning: validate strictly — reject odd-length and
-    // non-hex inputs. Previously `match(/.{1,2}/g)` silently truncated
-    // odd-length and `parseInt('zz',16)===NaN` coerced to 0, producing
-    // a degenerate signing key.
-    if (privateKeyHex.length === 0 || privateKeyHex.length % 2 !== 0) {
-      throw new SphereError('Invalid private key format (length)', 'NOT_INITIALIZED');
-    }
-    if (!/^[0-9a-fA-F]+$/.test(privateKeyHex)) {
-      throw new SphereError('Invalid private key format (non-hex chars)', 'NOT_INITIALIZED');
-    }
-    const signingKeyBytes = new Uint8Array(privateKeyHex.length / 2);
-    for (let i = 0; i < privateKeyHex.length; i += 2) {
-      signingKeyBytes[i / 2] = parseInt(privateKeyHex.slice(i, i + 2), 16);
+    // Steelman³⁶: consolidated to core/hex.ts:hexToBytes via the shared
+    // import. RangeError → SphereError remap so the contract stays the
+    // same for callers (NOT_INITIALIZED on malformed identity input).
+    let signingKeyBytes: Uint8Array;
+    try {
+      signingKeyBytes = strictHexToBytes(privateKeyHex);
+    } catch (err) {
+      throw new SphereError(
+        `Invalid private key format: ${err instanceof Error ? err.message : String(err)}`,
+        'NOT_INITIALIZED',
+      );
     }
     const saltInput = new Uint8Array(signingKeyBytes.length + invoiceBytesEncoded.length);
     saltInput.set(signingKeyBytes, 0);

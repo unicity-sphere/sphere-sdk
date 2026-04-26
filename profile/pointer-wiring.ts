@@ -719,15 +719,17 @@ export async function buildProfilePointerLayer(
 // Utilities
 // =============================================================================
 
-// Steelman³⁵: thin wrapper that strips 0x prefix then delegates to
-// the consolidated core/hex.ts strict decoder. Local wrapper retained
-// because pointer-wiring callers may pass ethers-style 0x-prefixed
-// hex; core/hex.ts:hexToBytes deliberately does NOT auto-strip.
+// Steelman³⁵/³⁶: thin wrapper that strips 0x/0X prefix then delegates
+// to the consolidated core/hex.ts strict decoder. Local wrapper
+// retained because pointer-wiring callers may pass ethers-style
+// 0x-prefixed hex (case-insensitive per EIP-55); core/hex.ts:hexToBytes
+// deliberately does NOT auto-strip.
 function hexToBytes(hex: string): Uint8Array {
   if (typeof hex !== 'string') {
     throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
   }
-  const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+  const hasPrefix = hex.length >= 2 && hex[0] === '0' && (hex[1] === 'x' || hex[1] === 'X');
+  const clean = hasPrefix ? hex.slice(2) : hex;
   return strictHexToBytesCore(clean);
 }
 

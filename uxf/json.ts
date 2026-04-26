@@ -37,6 +37,7 @@ import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
 import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
+import { hexToBytesAllowEmpty } from '../core/hex.js';
 import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
 
 // ---------------------------------------------------------------------------
@@ -574,30 +575,10 @@ function deserializeContent(
   return result;
 }
 
-/**
- * Convert a hex string to Uint8Array.
- *
- * Steelman³¹ warning: strict — rejects odd-length and non-hex chars.
- * Receives attacker-controlled hex from external JSON. Empty input is
- * permitted (returns 0-byte Uint8Array) for backward compatibility
- * with empty byte-field encoding through the wire round-trip.
- */
-function hexStringToUint8Array(hex: string): Uint8Array {
-  if (typeof hex !== 'string') {
-    throw new TypeError(`hexStringToUint8Array: expected string, got ${typeof hex}`);
-  }
-  if (hex.length % 2 !== 0) {
-    throw new RangeError(`hexStringToUint8Array: odd-length hex string (${hex.length} chars)`);
-  }
-  if (hex.length > 0 && !/^[0-9a-fA-F]+$/.test(hex)) {
-    throw new RangeError('hexStringToUint8Array: contains non-hex characters');
-  }
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁶: consolidated to core/hex.ts:hexToBytesAllowEmpty (top-of-
+// file import). The wire round-trip permits empty byte-field encoding,
+// so the AllowEmpty variant is the right choice here.
+const hexStringToUint8Array = hexToBytesAllowEmpty;
 
 /** Deserialize indexes from JSON. */
 function deserializeIndexes(json: JsonPackage['indexes']): UxfIndexes {
