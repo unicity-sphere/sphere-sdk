@@ -11,6 +11,7 @@
 
 import { logger } from '../../core/logger.js';
 import { SphereError } from '../../core/errors.js';
+import { hexToBytesAllowEmpty as strictHexToBytesAllowEmpty } from '../../core/hex.js';
 import { AsyncGateMap } from '../../core/async-gate.js';
 import { CidRefStore, type CidRef } from '../../profile/cid-ref-store.js';
 import { STORAGE_KEYS_ADDRESS, INVOICE_TOKEN_TYPE_HEX, getAddressStorageKey, getAddressId } from '../../constants.js';
@@ -4411,18 +4412,15 @@ export class AccountingModule {
       if (!tx?.data?.['message']) continue;
 
       // Decode hex-encoded UTF-8 JSON message to TransferMessagePayload
+      // Steelman³² + ³⁴: use the central strictHexToBytesAllowEmpty
+      // helper — accepts empty (returns empty bytes; decoder falls
+      // through to "no payload"), rejects odd-length and non-hex.
       let payload: TransferMessagePayload | null = null;
       try {
         const hexStr = tx.data['message'] as string;
         if (!hexStr || hexStr.length > 8192) continue;
-        // Steelman³² warning: also reject ODD-length input. Previously
-        // a 1-char trailing match made `parseInt('a',16)===10` produce
-        // a corrupt last byte. The W10 hex-char gate doesn't catch this.
-        if (hexStr.length % 2 !== 0) continue;
-        if (!/^[0-9a-fA-F]*$/.test(hexStr)) continue;
-        const matches = hexStr.match(/.{1,2}/g);
-        if (!matches) continue;
-        const bytes = new Uint8Array(matches.map((b) => parseInt(b, 16)));
+        const bytes = strictHexToBytesAllowEmpty(hexStr);
+        if (bytes.length === 0) continue;
         payload = decodeTransferMessage(bytes);
       } catch {
         continue;

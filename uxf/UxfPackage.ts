@@ -474,16 +474,27 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
     previousManifest.set(tokenId, mutableManifest.get(tokenId));
   }
   const committedTokenIds: string[] = [];
+  // Steelman³⁴ warning: track the IN-FLIGHT tokenId separately so a
+  // partial throw inside updateIndexesForToken (which may have added
+  // to byTokenType but not byCoinId before throwing) is also rolled
+  // back. Without this, the failing token's partial index entries
+  // leak even though its manifest mutation IS rolled back.
+  let inFlightTokenId: string | undefined;
   try {
     for (const { tokenId, rootHash } of newTokens) {
+      inFlightTokenId = tokenId;
       mutableManifest.set(tokenId, rootHash);
       updateIndexesForToken(pkg, tokenId, rootHash);
       committedTokenIds.push(tokenId);
+      inFlightTokenId = undefined;
     }
   } catch (err) {
-    // Roll back the indexes for tokens we already committed (avoids
-    // index/manifest divergence: indexes referencing tokens whose
-    // manifest entry is about to be removed).
+    // Roll back the indexes for tokens we already committed AND for
+    // the in-flight token (whose updateIndexesForToken may have
+    // partially mutated the indexes before throwing).
+    if (inFlightTokenId !== undefined) {
+      try { removeFromIndexes(pkg.indexes, inFlightTokenId); } catch { /* best-effort */ }
+    }
     for (const tokenId of committedTokenIds) {
       try { removeFromIndexes(pkg.indexes, tokenId); } catch { /* best-effort */ }
     }
