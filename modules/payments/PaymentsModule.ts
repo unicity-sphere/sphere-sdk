@@ -70,6 +70,7 @@ import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
+import { hexToBytes as fromHex } from '../../core/hex';
 // `profile/types` is a pure types + constants module with zero runtime
 // dependencies — safe to import statically in every build. The previous
 // dynamic import was motivated by a bundle-size concern that didn't apply
@@ -542,34 +543,7 @@ function extractTokenStateKey(token: Token): string | null {
   return createTokenStateKey(tokenId, stateHash);
 }
 
-/**
- * Convert hex string to Uint8Array.
- *
- * Steelman³¹ warning: strict — rejects empty, odd-length, non-hex.
- * Previously silently truncated odd-length and coerced parseInt-NaN
- * to 0, accepting attacker-controlled wire-format bundles with
- * malformed tokenTypeHex / transferSaltHex that produced degenerate
- * outputs (potential type collisions, entropy degradation).
- */
-function fromHex(hex: string): Uint8Array {
-  if (typeof hex !== 'string') {
-    throw new TypeError(`fromHex: expected string, got ${typeof hex}`);
-  }
-  if (hex.length === 0) {
-    throw new RangeError('fromHex: empty hex string');
-  }
-  if (hex.length % 2 !== 0) {
-    throw new RangeError(`fromHex: odd-length hex string (${hex.length} chars)`);
-  }
-  if (!/^[0-9a-fA-F]+$/.test(hex)) {
-    throw new RangeError('fromHex: contains non-hex characters');
-  }
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁵: fromHex consolidated to core/hex.ts (top-of-file import).
 
 /**
  * Compute a deterministic dedup key for a pending-mint (pre-finalization)

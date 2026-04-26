@@ -363,6 +363,14 @@ export function privateKeyToAddressInfo(
 /**
  * Convert hex string to Uint8Array.
  *
+ * Steelman³⁵ note: this function permits empty input (returns 0-byte
+ * Uint8Array). For new code that should fail closed on empty inputs,
+ * prefer `core/hex.ts:hexToBytes` (strict, rejects empty). Both
+ * functions reject odd-length and non-hex chars; only the empty-input
+ * behavior differs. The dual export persists for backward compat with
+ * existing public-API consumers and internal IPNS / migration callers
+ * that legitimately accept empty hex (e.g., as a "no value" marker).
+ *
  * Rejects invalid inputs rather than silently coercing to zero bytes:
  * odd-length strings throw `RangeError`, and non-hex characters
  * throw — previously a single bad character coerced to a zero byte
