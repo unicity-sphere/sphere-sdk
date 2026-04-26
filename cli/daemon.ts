@@ -582,18 +582,59 @@ function detachDaemon(args: string[], flags: DaemonFlags): void {
     pidFile = getDefaultPidFile();
   }
 
-  // Check if already running
-  if (fs.existsSync(pidFile)) {
-    const existingPid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
-    if (isProcessAlive(existingPid)) {
-      console.error(`Daemon already running (PID ${existingPid}). Use "daemon stop" first.`);
+  // Steelman⁴³ warning: atomic create-if-not-exists via O_CREAT|O_EXCL
+  // closes the TOCTOU between the existence check and fork(). Two
+  // concurrent `cli daemon start` invocations no longer both pass
+  // the staleness check; the second gets EEXIST and aborts. The lock
+  // file is sibling to the pidFile (not the pidFile itself, since the
+  // forked child writes that with its real PID).
+  const startLock = pidFile + '.start.lock';
+  let startLockFd: number | null = null;
+  try {
+    // Pre-clean stale start.lock from a crashed previous parent (parent
+    // is short-lived; the lock should survive only milliseconds).
+    if (fs.existsSync(startLock)) {
+      try {
+        const st = fs.statSync(startLock);
+        if (Date.now() - st.mtimeMs > 30_000) {
+          fs.unlinkSync(startLock);
+        }
+      } catch { /* best-effort */ }
+    }
+    fs.mkdirSync(path.dirname(startLock), { recursive: true });
+    startLockFd = fs.openSync(startLock, 'wx', 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      console.error('Another `cli daemon start` is in progress; aborting.');
       process.exit(1);
     }
-    // Stale PID file — clean up alongside its canary file so a
-    // pre-existing forged canary doesn't outlive the unlinked pidFile.
-    fs.unlinkSync(pidFile);
-    const staleCanary = pidFile + '.canary';
-    if (fs.existsSync(staleCanary)) fs.unlinkSync(staleCanary);
+    throw err;
+  }
+
+  try {
+    // Check if already running (now safely under the start.lock)
+    if (fs.existsSync(pidFile)) {
+      const existingPid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
+      if (isProcessAlive(existingPid)) {
+        console.error(`Daemon already running (PID ${existingPid}). Use "daemon stop" first.`);
+        process.exit(1);
+      }
+      // Stale PID file — clean up alongside its canary file so a
+      // pre-existing forged canary doesn't outlive the unlinked pidFile.
+      fs.unlinkSync(pidFile);
+      const staleCanary = pidFile + '.canary';
+      if (fs.existsSync(staleCanary)) fs.unlinkSync(staleCanary);
+    }
+    // (fall through to fork/setup below; cleanup of startLock happens
+    // in the outer finally below.)
+  } finally {
+    // Release the start lock once we either aborted or are about to
+    // fork. The forked child writes the durable pidFile; concurrent
+    // `daemon start` invocations are bounded by the start.lock window.
+    if (startLockFd !== null) {
+      try { fs.closeSync(startLockFd); } catch { /* ignore */ }
+      try { fs.unlinkSync(startLock); } catch { /* ignore */ }
+    }
   }
 
   // Build child args: replace --detach with --_forked, keep everything else

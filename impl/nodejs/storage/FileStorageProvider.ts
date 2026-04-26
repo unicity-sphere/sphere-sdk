@@ -139,12 +139,19 @@ export class FileStorageProvider implements StorageProvider {
   async set(key: string, value: string): Promise<void> {
     const fullKey = this.getFullKey(key);
     this.data[fullKey] = value;
+    // Steelman⁴³: track which keys this process actually mutated, so
+    // save()'s merge step doesn't clobber unrelated keys written by
+    // another process.
+    this.mutatedKeys.add(fullKey);
+    this.removedKeys.delete(fullKey);
     await this.save();
   }
 
   async remove(key: string): Promise<void> {
     const fullKey = this.getFullKey(key);
     delete this.data[fullKey];
+    this.removedKeys.add(fullKey);
+    this.mutatedKeys.delete(fullKey);
     await this.save();
   }
 
@@ -166,8 +173,22 @@ export class FileStorageProvider implements StorageProvider {
       const keysToDelete = Object.keys(this.data).filter((k) => k.startsWith(prefix));
       for (const key of keysToDelete) {
         delete this.data[key];
+        // Steelman⁴³: track removals so save() merges them against the
+        // re-read disk snapshot. Without this, save's merge would
+        // re-introduce keys that were on disk but cleared from memory.
+        this.removedKeys.add(key);
+        this.mutatedKeys.delete(key);
       }
     } else {
+      // Full clear: also fold the on-disk keys into removedKeys.
+      try {
+        if (fs.existsSync(this.filePath)) {
+          const onDisk = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as Record<string, string>;
+          for (const k of Object.keys(onDisk)) this.removedKeys.add(k);
+        }
+      } catch { /* best-effort */ }
+      for (const k of Object.keys(this.data)) this.removedKeys.add(k);
+      this.mutatedKeys.clear();
       this.data = {};
     }
     await this.save();
@@ -207,11 +228,58 @@ export class FileStorageProvider implements StorageProvider {
     return key;
   }
 
+  /**
+   * Steelman⁴³ critical: track which keys this process has mutated
+   * since connect(), so save() can merge them ON TOP of the current
+   * on-disk snapshot. Without this, two processes each holding their
+   * own private snapshot would mutually overwrite the other's writes
+   * (last-save-wins, intermediate keys lost).
+   */
+  private mutatedKeys: Set<string> = new Set();
+  private removedKeys: Set<string> = new Set();
+  private saveInFlight: Promise<void> | null = null;
+
   private async save(): Promise<void> {
+    // Serialize concurrent saves WITHIN this process: queue them so
+    // each one re-reads the latest on-disk snapshot before writing.
+    if (this.saveInFlight) {
+      await this.saveInFlight;
+    }
+    this.saveInFlight = this.saveInner().finally(() => {
+      this.saveInFlight = null;
+    });
+    return this.saveInFlight;
+  }
+
+  private async saveInner(): Promise<void> {
     // Ensure directory exists before writing
     if (!fs.existsSync(this.dataDir)) {
       fs.mkdirSync(this.dataDir, { recursive: true });
     }
+
+    // Steelman⁴³: re-read on-disk snapshot and merge our mutations on
+    // top. Other processes' writes since our last save survive; our
+    // writes overwrite only the keys we actually touched.
+    if (!this.isTxtMode && fs.existsSync(this.filePath)) {
+      try {
+        const onDisk = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as Record<string, string>;
+        // Start from on-disk, then apply our mutations.
+        const merged: Record<string, string> = { ...onDisk };
+        for (const key of this.mutatedKeys) {
+          if (key in this.data) merged[key] = this.data[key];
+        }
+        for (const key of this.removedKeys) {
+          delete merged[key];
+        }
+        this.data = merged;
+      } catch {
+        // Disk read or JSON parse failed — proceed with in-memory data only.
+        // (Existing behavior; the corruption-rename path at L96 handles fatal cases.)
+      }
+    }
+    // Reset mutation tracking after merge.
+    this.mutatedKeys = new Set();
+    this.removedKeys = new Set();
 
     let content: string;
     if (this.isTxtMode) {

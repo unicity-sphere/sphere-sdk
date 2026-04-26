@@ -879,8 +879,16 @@ export class ProfileTokenStorageProvider
     const data = this.pendingData;
     if (!data || !this.encryptionKey) return;
 
-    // Snapshot and clear pending to avoid re-flushing the same data
-    this.pendingData = null;
+    // Snapshot and clear pending to avoid re-flushing the same data.
+    //
+    // Steelman⁴³ critical: identity-check before clearing. A concurrent
+    // save() between the capture above and this clear would set
+    // this.pendingData to NEWER data; an unconditional `= null` would
+    // clobber the new save and permanently lose its content. With the
+    // identity check, the new pendingData stays for the next flush.
+    if (this.pendingData === data) {
+      this.pendingData = null;
+    }
 
     try {
       // 1. Extract tokens and operational state

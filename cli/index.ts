@@ -183,8 +183,15 @@ function loadConfig(): CliConfig {
 }
 
 function saveConfig(config: CliConfig): void {
+  // Steelman⁴³ critical: atomic write — temp file + rename. Concurrent
+  // CLI invocations (daemon hooks + interactive) can no longer produce
+  // a partially-written or torn config.json. Note: this does not fully
+  // serialize concurrent read-modify-write at the BUSINESS level (last
+  // writer still wins), but eliminates the byte-level corruption case.
   fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+  const tmp = CONFIG_FILE + '.tmp.' + process.pid + '.' + Date.now();
+  fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+  fs.renameSync(tmp, CONFIG_FILE);
 }
 
 // =============================================================================
@@ -203,8 +210,11 @@ function loadProfiles(): ProfilesStore {
 }
 
 function saveProfiles(store: ProfilesStore): void {
+  // Steelman⁴³ critical: atomic write — see saveConfig.
   fs.mkdirSync(path.dirname(PROFILES_FILE), { recursive: true });
-  fs.writeFileSync(PROFILES_FILE, JSON.stringify(store, null, 2));
+  const tmp = PROFILES_FILE + '.tmp.' + process.pid + '.' + Date.now();
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
+  fs.renameSync(tmp, PROFILES_FILE);
 }
 
 function getProfile(name: string): WalletProfile | undefined {
@@ -3012,6 +3022,19 @@ async function main() {
           try {
             const { UxfPackage } = await import('../uxf/UxfPackage.js');
             const pkg = await UxfPackage.fromCar(new Uint8Array(bytes));
+            // Steelman⁴³ critical: verify the CAR before importing.
+            // Without this, the 42 rounds of UXF integrity hardening
+            // (instance-chain, version bounds, content-hash) are
+            // unused on the CLI import path. A malicious CAR would
+            // land in the wallet inventory unverified.
+            const verifyResult = pkg.verify();
+            if (!verifyResult.valid) {
+              const errs = verifyResult.errors.slice(0, 5).map((e) => `  - ${e.code}: ${e.message}`).join('\n');
+              console.error(
+                `Refusing to import: UXF CAR verification failed (${verifyResult.errors.length} errors).\nFirst:\n${errs}`,
+              );
+              process.exit(1);
+            }
             const assembled = pkg.assembleAll();
             txfTokens = Array.from(assembled.values()) as import('../types/txf').TxfToken[];
           } catch (err) {
@@ -3693,8 +3716,27 @@ async function main() {
           process.exit(1);
         }
 
-        if (!fs.existsSync(filePath)) {
-          console.error('File not found:', filePath);
+        // Steelman⁴³ warning: pre-validate the file. Refuse symlinks
+        // (lstat path) and cap size at 100 MiB. Without this,
+        // parse-wallet against /dev/zero or a giant symlink target
+        // OOMs the process.
+        const PARSE_WALLET_MAX_BYTES = 100 * 1024 * 1024;
+        try {
+          const lst = fs.lstatSync(filePath);
+          if (lst.isSymbolicLink()) {
+            console.error('Refusing to parse-wallet on a symlink (security risk).');
+            process.exit(1);
+          }
+          if (!lst.isFile()) {
+            console.error('parse-wallet target is not a regular file.');
+            process.exit(1);
+          }
+          if (lst.size > PARSE_WALLET_MAX_BYTES) {
+            console.error(`parse-wallet refuses files larger than ${PARSE_WALLET_MAX_BYTES} bytes (got ${lst.size}).`);
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error('File not found or unreadable:', filePath, err instanceof Error ? err.message : '');
           process.exit(1);
         }
 
@@ -3734,8 +3776,24 @@ async function main() {
           process.exit(1);
         }
 
-        if (!fs.existsSync(filePath)) {
-          console.error('File not found:', filePath);
+        // Steelman⁴³ warning: same lstat + size cap as parse-wallet.
+        const WALLET_INFO_MAX_BYTES = 100 * 1024 * 1024;
+        try {
+          const lst = fs.lstatSync(filePath);
+          if (lst.isSymbolicLink()) {
+            console.error('Refusing to wallet-info on a symlink (security risk).');
+            process.exit(1);
+          }
+          if (!lst.isFile()) {
+            console.error('wallet-info target is not a regular file.');
+            process.exit(1);
+          }
+          if (lst.size > WALLET_INFO_MAX_BYTES) {
+            console.error(`wallet-info refuses files larger than ${WALLET_INFO_MAX_BYTES} bytes (got ${lst.size}).`);
+            process.exit(1);
+          }
+        } catch (err) {
+          console.error('File not found or unreadable:', filePath, err instanceof Error ? err.message : '');
           process.exit(1);
         }
 

@@ -6,7 +6,7 @@
 
 import CryptoJS from 'crypto-js';
 import type { LegacyFileParseResult, LegacyFileParsedData } from './types';
-import { extractFromText } from '../core/utils';
+import { extractFromText, isValidPrivateKey } from '../core/utils';
 
 // =============================================================================
 // Constants
@@ -42,9 +42,15 @@ export function decryptTextFormatKey(encryptedKey: string, password: string): st
     const decrypted = CryptoJS.AES.decrypt(encryptedKey, key);
     const result = decrypted.toString(CryptoJS.enc.Utf8);
     if (!result) return null;
-    // Validate that decrypted value is a hex string (master keys are always hex).
-    // Wrong passwords produce garbage bytes that may be valid UTF-8 but not valid hex.
+    // Steelman⁴³ critical: AES-CBC has no MAC. A tampered ciphertext can
+    // decrypt to garbage that happens to be valid hex of arbitrary length.
+    // Without strict validation, the result flows into Sphere.import as a
+    // master key with no integrity guarantee. Now require:
+    //   - exactly 64 hex chars (32 bytes — BIP-32 master key length)
+    //   - within secp256k1 curve order (1 ≤ k < N)
+    if (result.length !== 64) return null;
     if (!/^[0-9a-fA-F]+$/.test(result)) return null;
+    if (!isValidPrivateKey(result)) return null;
     return result;
   } catch {
     return null;

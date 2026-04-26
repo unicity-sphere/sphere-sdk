@@ -169,9 +169,13 @@ export class ConsolidationEngine {
     };
     await this.writePendingState(pendingState);
 
-    // TOCTOU mitigation: wait briefly then read back to detect concurrent consolidation.
+    // TOCTOU mitigation: wait then read back to detect concurrent consolidation.
+    // Steelman⁴³ warning: 30s window matches real-world OrbitDB/Nostr
+    // replication lag observed in transport configs. Previously 3s
+    // was too short — two devices both proceeded past abort, both
+    // consolidated in parallel, both pinned redundant CARs.
     // If another device wrote a different pending state in the race window, we abort.
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(resolve => setTimeout(resolve, 30_000));
     const readBack = await this.readPendingState();
     if (readBack && readBack.device !== deviceId) {
       this.log(
