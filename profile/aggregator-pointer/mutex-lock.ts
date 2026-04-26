@@ -331,10 +331,12 @@ class NodeMutex implements PointerMutex {
         );
       }
       try {
-        // Steelman¹⁹ warning: staleMs raised from 8000 to FILE_LOCK_STALE_MS
-        // (240_000) so a busy publishOnce iteration cannot be considered
-        // stale by proper-lockfile mid-operation, which would let a second
-        // process take the same lock and silently violate mutual exclusion.
+        // staleMs is FILE_LOCK_STALE_MS (defined in constants.ts as the
+        // worst-case publishOnce hold + safety margin, including network
+        // round-trips). Setting it lower would let proper-lockfile reap
+        // a busy publishOnce iteration as "stale" and let a second process
+        // take the same lock — silent mutex violation.  See constants.ts
+        // for the formula and the module-load invariant that enforces it.
         fileLockRelease = await prim.acquireFileLock(this.#lockFilePath, FILE_LOCK_STALE_MS);
         break;
       } catch (err: unknown) {

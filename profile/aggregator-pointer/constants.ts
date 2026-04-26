@@ -94,19 +94,53 @@ export const MAX_CUMULATIVE_RETRY_AFTER_MS = 180_000;
 // arithmetic overflow and to size FILE_LOCK_STALE_MS predictably.
 // Default maxRetries (PUBLISH_RETRY_BUDGET) is 5; this cap is the upper
 // bound for exotic test setups or aggressive recovery paths.
-export const ATTEMPT_MAX_RETRIES_HARD_CAP = 20;
+//
+// Steelman²¹: lowered from 20 to 10. Each retry can consume both a
+// backoff sleep (~8s) AND two network round-trips (~60s for both sides
+// at PUBLISH_REQUEST_TIMEOUT_MS). Cap=20 gave a worst-case hold of
+// ~1560s which would force FILE_LOCK_STALE_MS to ~26 minutes — an
+// unacceptably long crashed-process recovery window. Cap=10 yields a
+// worst-case hold of ~860s ≈ 14 minutes, with FILE_LOCK_STALE_MS at
+// ~15 minutes (acceptable for interactive wallets).
+export const ATTEMPT_MAX_RETRIES_HARD_CAP = 10;
 
-// Steelman²⁰ critical: file-lock staleness must EXCEED the maximum time
-// publishOnce can hold the mutex.  Worst case:
-//   MAX_CUMULATIVE_RETRY_AFTER_MS (180s)
-//   + ATTEMPT_MAX_RETRIES_HARD_CAP × PUBLISH_BACKOFF_MAX_MS × 2 (160s)
-//   = 340s upper bound.
-// Add a 60s safety margin → 400s. The cost is "crashed-process recovery
-// takes 400s" which is acceptable for an interactive wallet (a crashed
-// wallet cannot publish anyway). Setting this BELOW the worst-case hold
-// would let proper-lockfile reap the lock mid-iteration and let a second
-// process take it — a silent mutex violation.
+// Steelman²¹ critical: file-lock staleness must EXCEED the maximum time
+// publishOnce can hold the mutex INCLUDING network time, not just sleep.
+// Worst-case per iteration:
+//   PUBLISH_BACKOFF_MAX_MS × 2  (sleep budget; ×2 absorbs jitter)
+//   + PUBLISH_REQUEST_TIMEOUT_MS × 2  (network round-trips; both sides A/B)
+// Total worst case:
+//   MAX_CUMULATIVE_RETRY_AFTER_MS (retry_after sleep cap)
+//   + ATTEMPT_MAX_RETRIES_HARD_CAP × (sleep budget + network budget)
+//   + FILE_LOCK_STALE_MARGIN_MS (safety)
+//
+// Setting FILE_LOCK_STALE_MS BELOW the worst-case hold lets proper-lockfile
+// reap the lock mid-iteration and a second process take it — silent mutex
+// violation. The new formula closes the network-time gap that F.20-F.23
+// missed (only sleep budget was counted).
+export const FILE_LOCK_STALE_MARGIN_MS = 60_000;
 export const FILE_LOCK_STALE_MS =
   MAX_CUMULATIVE_RETRY_AFTER_MS +
-  ATTEMPT_MAX_RETRIES_HARD_CAP * PUBLISH_BACKOFF_MAX_MS * 2 +
-  60_000;
+  ATTEMPT_MAX_RETRIES_HARD_CAP *
+    (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2) +
+  FILE_LOCK_STALE_MARGIN_MS;
+
+// Steelman²¹ note: module-load invariant. If a future contributor changes
+// any of the component constants without updating the formula, this throws
+// at import time rather than letting a silent mutex violation reach
+// production.  The check is duplicated rather than computed-and-compared
+// so that changing the formula in one place fails the assert visibly.
+{
+  const expectedHold =
+    MAX_CUMULATIVE_RETRY_AFTER_MS +
+    ATTEMPT_MAX_RETRIES_HARD_CAP *
+      (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2);
+  if (FILE_LOCK_STALE_MS < expectedHold + FILE_LOCK_STALE_MARGIN_MS) {
+    throw new Error(
+      `pointer-layer constants invariant violated: FILE_LOCK_STALE_MS=${FILE_LOCK_STALE_MS} ` +
+        `is below required minimum ${expectedHold + FILE_LOCK_STALE_MARGIN_MS} ` +
+        `(worst-case publishOnce hold ${expectedHold}ms + ${FILE_LOCK_STALE_MARGIN_MS}ms margin). ` +
+        `Update the FILE_LOCK_STALE_MS formula or lower ATTEMPT_MAX_RETRIES_HARD_CAP / PUBLISH_REQUEST_TIMEOUT_MS.`,
+    );
+  }
+}

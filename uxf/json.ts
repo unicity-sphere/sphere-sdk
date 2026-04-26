@@ -37,6 +37,7 @@ import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
 import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
 import { computeElementHash } from './hash.js';
+import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
 
 // ---------------------------------------------------------------------------
 // Type ID <-> String Tag mapping
@@ -473,35 +474,14 @@ function deserializeElement(json: JsonElement): UxfElement {
       'Element header must be an object',
     );
   }
-  // Steelman²⁰ warning: validate representation/semantics at the parse
-  // boundary, not deep inside addInstance / rebuildInstanceChainIndex.
-  // A malformed header (string, null, NaN, fractional) would otherwise
-  // sit in the pool and only surface as INVALID_INSTANCE_CHAIN much
-  // later — possibly long after the parse error became unobservable.
-  if (
-    typeof hdr.representation !== 'number' ||
-    !Number.isFinite(hdr.representation) ||
-    !Number.isInteger(hdr.representation) ||
-    hdr.representation < 0 ||
-    hdr.representation > Number.MAX_SAFE_INTEGER
-  ) {
-    throw new UxfError(
-      'SERIALIZATION_ERROR',
-      `Element header.representation must be a non-negative safe integer, got ${String(hdr.representation)}`,
-    );
-  }
-  if (
-    typeof hdr.semantics !== 'number' ||
-    !Number.isFinite(hdr.semantics) ||
-    !Number.isInteger(hdr.semantics) ||
-    hdr.semantics < 0 ||
-    hdr.semantics > Number.MAX_SAFE_INTEGER
-  ) {
-    throw new UxfError(
-      'SERIALIZATION_ERROR',
-      `Element header.semantics must be a non-negative safe integer, got ${String(hdr.semantics)}`,
-    );
-  }
+  // Steelman²⁰/²¹: validate representation/semantics/kind at the parse
+  // boundary via shared helpers (uxf/header-validation). Without this,
+  // a malformed header (string, null, NaN, fractional) sits in the pool
+  // and surfaces as INVALID_INSTANCE_CHAIN much later, far from the
+  // root cause.
+  assertHeaderVersionField(hdr.representation, 'Element header.representation');
+  assertHeaderVersionField(hdr.semantics, 'Element header.semantics');
+  assertHeaderKindField(hdr.kind, 'Element header.kind');
 
   // type: integer -> string tag
   const typeId = json.type;

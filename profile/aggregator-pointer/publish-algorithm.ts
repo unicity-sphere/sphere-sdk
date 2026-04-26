@@ -32,6 +32,7 @@ import {
   PUBLISH_BACKOFF_JITTER_HI,
   PUBLISH_BACKOFF_JITTER_LO,
   PUBLISH_BACKOFF_MAX_MS,
+  PUBLISH_REQUEST_TIMEOUT_MS,
   PUBLISH_RETRY_BUDGET,
 } from './constants.js';
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
@@ -154,10 +155,17 @@ async function publishOnce(
   // retry_after cap are each individually bounded, but an adversarial
   // aggregator alternating the two strategies could compound them.
   // A hard deadline caps the total time this function can hold the mutex.
+  //
+  // Steelman²¹ critical: include NETWORK time per iteration, not just
+  // sleep time. Each iteration can spend up to PUBLISH_REQUEST_TIMEOUT_MS
+  // per side (×2 for sides A/B). The previous formula budgeted only the
+  // backoff sleeps and silently allowed the actual hold to extend by
+  // many multiples when the aggregator was slow but didn't time out.
+  // Mirrors the FILE_LOCK_STALE_MS formula in constants.ts.
   const loopDeadline =
     Date.now() +
     MAX_CUMULATIVE_RETRY_AFTER_MS +
-    safeMaxRetries * PUBLISH_BACKOFF_MAX_MS * 2;
+    safeMaxRetries * (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2);
 
   // Steelman remediation (finding #7): read the marker ONCE before the
   // retry loop. Previously the marker was re-read on every iteration;
@@ -181,9 +189,12 @@ async function publishOnce(
 
   for (;;) {
     if (Date.now() > loopDeadline) {
+      const budgetMs =
+        MAX_CUMULATIVE_RETRY_AFTER_MS +
+        safeMaxRetries * (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2);
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.RETRY_EXHAUSTED,
-        `publishOnce exceeded wall-clock deadline after ${Date.now() - (loopDeadline - MAX_CUMULATIVE_RETRY_AFTER_MS - safeMaxRetries * PUBLISH_BACKOFF_MAX_MS * 2)}ms.`,
+        `publishOnce exceeded wall-clock deadline after ${Date.now() - (loopDeadline - budgetMs)}ms (budget ${budgetMs}ms).`,
         { v, retriesConsumed, cumulativeRetryAfterMs },
       );
     }

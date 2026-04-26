@@ -213,6 +213,7 @@ export function createMasterPrivateKey(
   // which reads `.buffer` again — but a hostile subclass returning a
   // different buffer there would not be readable by the regular
   // copy-by-iteration path anyway.
+  // Steelman²⁰ note: snapshot bytes.buffer once for the gate check.
   const sourceBuffer = bytes.buffer;
   if (isSharedArrayBufferLike(sourceBuffer)) {
     throw new AggregatorPointerError(
@@ -221,11 +222,12 @@ export function createMasterPrivateKey(
         'concurrent mutation between denylist check and internal copy is a TOCTOU risk.',
     );
   }
-  // Copy FIRST, then validate the copy — not the caller-controlled buffer.
-  // Previous order (validate bytes → copy bytes) was susceptible to
-  // TOCTOU if `bytes` was mutated between the two operations.
-  // The [_brand] field is compile-time only — TypeScript erases it and
-  // `declare const _brand` has no runtime value.
+  // Steelman²¹ note: copy via the SNAPSHOTTED sourceBuffer.slice rather
+  // than `new Uint8Array(bytes)`. A hostile TypedArray subclass could
+  // override the `.buffer` getter to return a benign ArrayBuffer on the
+  // gate check and a SAB on the subsequent copy.  Reading via the captured
+  // sourceBuffer reference and slicing the byte range directly defeats
+  // that bypass — the snapshotted buffer is what we validated.
   //
   // Steelman remediation: the `bytes` property is a GETTER that returns a
   // defensive copy of the internal buffer. Exposing the raw Uint8Array
@@ -235,7 +237,9 @@ export function createMasterPrivateKey(
   // therefore allocates a fresh 32-byte copy; callers feeding HKDF should
   // wipe the returned copy when done. `zeroize()` wipes the SOURCE buffer,
   // after which all future .bytes reads return zeros.
-  const internalBytes = new Uint8Array(bytes);
+  const internalBytes = new Uint8Array(
+    sourceBuffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length),
+  );
   // Evaluate denylist BEFORE capturing isKat so both checks run on the
   // same `internalBytes` snapshot.  Zero the copy on rejection so the
   // buffer does not linger on the heap.

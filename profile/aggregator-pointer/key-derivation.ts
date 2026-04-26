@@ -32,13 +32,38 @@ import type { Side, PointerVersion } from './types.js';
 // catch-path cleanup chain breaks. Wrap the inner fill in try/catch so
 // a hostile prototype mutation (or a Proxy on `buf`) cannot abort the
 // cleanup loop and leak SecretKey wrappers downstream.
+//
+// Steelman²¹ note: count failures and warn ONCE so a hostile environment
+// (prototype pollution attempt, exotic Proxy) is detectable in logs/
+// telemetry without flooding. The defense is silent by default but
+// observable on first failure.
 const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
+let _wipeFailures = 0;
+let _wipeWarnedOnce = false;
 function safeWipe(buf: Uint8Array | null | undefined): void {
   if (!buf) return;
   try {
     TYPED_ARRAY_FILL.call(buf, 0);
-  } catch { /* best-effort wipe; never throw out of cleanup */ }
+  } catch {
+    _wipeFailures += 1;
+    if (!_wipeWarnedOnce) {
+      _wipeWarnedOnce = true;
+      try {
+        console.warn(
+          '[uxf/aggregator-pointer] safeWipe() failed — possible prototype pollution or hostile Uint8Array. Defense-in-depth check.',
+        );
+      } catch { /* noop — environment without console */ }
+    }
+    /* best-effort wipe; never throw out of cleanup */
+  }
 }
+
+/** Test-only: read the wipe-failure counter. */
+export const __keyDerivationInternal = {
+  getWipeFailureCount(): number {
+    return _wipeFailures;
+  },
+};
 
 export interface PointerKeyMaterial {
   readonly pointerSecret: SecretKey;

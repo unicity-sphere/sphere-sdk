@@ -35,6 +35,7 @@ import type {
 import { contentHash, ELEMENT_TYPE_IDS } from './types.js';
 import { ENRICHED_SYNTHETIC_KIND } from './token-join.js';
 import { UxfError } from './errors.js';
+import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
 import {
   computeElementHash,
   prepareContentForHashing,
@@ -555,37 +556,13 @@ function decodeIpldElement(node: {
       'Invalid IPLD element header format',
     );
   }
-  // Steelman²⁰ warning: validate representation/semantics at the parse
-  // boundary. CBOR-decoded values can be anything (string, BigInt, array,
-  // null) — the `as number` cast is compile-time only. Without runtime
-  // validation, a malformed header sits in the pool until addInstance or
-  // rebuildInstanceChainIndex tries to compare it.
-  const reprRaw = hdrArray[0];
-  const semRaw = hdrArray[1];
-  if (
-    typeof reprRaw !== 'number' ||
-    !Number.isFinite(reprRaw) ||
-    !Number.isInteger(reprRaw) ||
-    reprRaw < 0 ||
-    reprRaw > Number.MAX_SAFE_INTEGER
-  ) {
-    throw new UxfError(
-      'SERIALIZATION_ERROR',
-      `IPLD element header[0] (representation) must be a non-negative safe integer, got ${String(reprRaw)}`,
-    );
-  }
-  if (
-    typeof semRaw !== 'number' ||
-    !Number.isFinite(semRaw) ||
-    !Number.isInteger(semRaw) ||
-    semRaw < 0 ||
-    semRaw > Number.MAX_SAFE_INTEGER
-  ) {
-    throw new UxfError(
-      'SERIALIZATION_ERROR',
-      `IPLD element header[1] (semantics) must be a non-negative safe integer, got ${String(semRaw)}`,
-    );
-  }
+  // Steelman²⁰/²¹: validate representation/semantics/kind at the parse
+  // boundary via shared helpers (uxf/header-validation). CBOR-decoded
+  // values can be anything (string, BigInt, array, null) — the `as number`
+  // / `as string` casts are compile-time only and silently lie.
+  assertHeaderVersionField(hdrArray[0], 'IPLD element header[0] (representation)');
+  assertHeaderVersionField(hdrArray[1], 'IPLD element header[1] (semantics)');
+  assertHeaderKindField(hdrArray[2], 'IPLD element header[2] (kind)');
 
   const predecessor = hdrArray[3];
   const predecessorHash: ContentHash | null =
