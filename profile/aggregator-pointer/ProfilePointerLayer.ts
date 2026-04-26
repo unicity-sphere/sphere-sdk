@@ -337,6 +337,10 @@ export class ProfilePointerLayer {
    * read API predictable.
    */
   async isPublishBlocked(): Promise<boolean> {
+    this.#assertNotShuttingDown('isPublishBlocked');
+    return this.#tracked(this.#isPublishBlockedInner());
+  }
+  async #isPublishBlockedInner(): Promise<boolean> {
     try {
       const state = await readBlockedState(this.#init.flagStore);
       return state.blocked;
@@ -357,6 +361,10 @@ export class ProfilePointerLayer {
    * the underlying record directly via the FlagStore.
    */
   async getBlockedState(): Promise<BlockedState> {
+    this.#assertNotShuttingDown('getBlockedState');
+    return this.#tracked(this.#getBlockedStateInner());
+  }
+  async #getBlockedStateInner(): Promise<BlockedState> {
     try {
       return await readBlockedState(this.#init.flagStore);
     } catch (err) {
@@ -383,8 +391,9 @@ export class ProfilePointerLayer {
    * @throws AggregatorPointerError(CAPABILITY_DENIED) if overrides disabled.
    */
   async clearBlocked(): Promise<void> {
+    this.#assertNotShuttingDown('clearBlocked');
     assertOperatorOverridesAllowed(this.#config, 'clearBlocked');
-    await clearBlockedFlag(this.#init.flagStore);
+    return this.#tracked(clearBlockedFlag(this.#init.flagStore));
   }
 
   // ── clearPendingMarker ───────────────────────────────────────────────────
@@ -399,7 +408,11 @@ export class ProfilePointerLayer {
    * @throws AggregatorPointerError(CAPABILITY_DENIED) if overrides disabled.
    */
   async clearPendingMarker(): Promise<void> {
+    this.#assertNotShuttingDown('clearPendingMarker');
     assertOperatorOverridesAllowed(this.#config, 'clearPendingMarker');
+    return this.#tracked(this.#clearPendingMarkerInner());
+  }
+  async #clearPendingMarkerInner(): Promise<void> {
     await clearMarker(this.#init.flagStore);
     // SET BLOCKED as documented in SPEC §13 clearPendingMarker contract.
     await setBlocked(this.#init.flagStore, 'marker_corrupt');
@@ -447,7 +460,8 @@ export class ProfilePointerLayer {
    * IPFS gateway fetches fail during recovery).
    */
   async recordCarFetchFailure(version: PointerVersion, gateway: string): Promise<void> {
-    await recordAttempt(this.#init.flagStore, version, gateway);
+    this.#assertNotShuttingDown('recordCarFetchFailure');
+    return this.#tracked(recordAttempt(this.#init.flagStore, version, gateway));
   }
 
   // ── acceptCorruptStreak ──────────────────────────────────────────────────
@@ -460,6 +474,7 @@ export class ProfilePointerLayer {
    * @throws AggregatorPointerError(CAPABILITY_DENIED) if overrides disabled.
    */
   async acceptCorruptStreak(walkbackLimit = 4096): Promise<{ walkbackUsed: number }> {
+    this.#assertNotShuttingDown('acceptCorruptStreak');
     assertOperatorOverridesAllowed(this.#config, 'acceptCorruptStreak');
     // Safety ceiling per SPEC §13.
     const capped = Math.min(walkbackLimit, 4096);
@@ -473,6 +488,7 @@ export class ProfilePointerLayer {
    * same-wallet-clustering signal. Returns '' if no probe has run.
    */
   async getProbeFingerprint(): Promise<string> {
+    this.#assertNotShuttingDown('getProbeFingerprint');
     return computeProbeFingerprint(this.#lastProbeVersions);
   }
 
@@ -480,18 +496,20 @@ export class ProfilePointerLayer {
 
   /** Low-level probe for a single version — H2 OR-predicate. */
   async probe(v: PointerVersion): Promise<boolean> {
-    return probeVersion({
+    this.#assertNotShuttingDown('probe');
+    return this.#tracked(probeVersion({
       v,
       keyMaterial: this.#init.keyMaterial,
       signer: this.#init.signer,
       aggregatorClient: this.#init.aggregatorClient,
       trustBase: this.#init.trustBase,
-    });
+    }));
   }
 
   /** Low-level classifyVersion. */
   async classify(v: PointerVersion): Promise<'VALID' | 'SEMANTICALLY_INVALID' | 'TRANSIENT_UNAVAILABLE'> {
-    return classifyVersion({
+    this.#assertNotShuttingDown('classify');
+    return this.#tracked(classifyVersion({
       v,
       keyMaterial: this.#init.keyMaterial,
       signer: this.#init.signer,
@@ -499,6 +517,6 @@ export class ProfilePointerLayer {
       trustBase: this.#init.trustBase,
       decodeCid: this.#init.decodeCid,
       fetchCar: this.#init.fetchCar,
-    });
+    }));
   }
 }

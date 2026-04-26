@@ -454,6 +454,16 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
     const rootElement = pool.get(rootHash)!;
     const rootContent = rootElement.content as unknown as TokenRootContent;
     newTokens.push({ tokenId: rootContent.tokenId, rootHash });
+    // Steelman³⁸ warning: re-check the cap AFTER each deconstruct.
+    // wrapPool only checks the EXISTING pool size; without this gate
+    // a single huge batch could bypass WRAP_POOL_MAX_SIZE entirely.
+    if (pool.size > WRAP_POOL_MAX_SIZE) {
+      throw new UxfError(
+        'INVALID_PACKAGE',
+        `ingestAll: pool size ${pool.size} exceeds WRAP_POOL_MAX_SIZE=${WRAP_POOL_MAX_SIZE} ` +
+          `mid-batch (after ${newTokens.length} of ${tokens.length} tokens). Bloat-DoS protection.`,
+      );
+    }
   }
   // ATOMIC COMMIT: pool first (so updateIndexesForToken's pkg.pool.get
   // returns the newly-deconstructed elements), then manifest, then

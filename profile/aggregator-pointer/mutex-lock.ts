@@ -287,11 +287,20 @@ class NodeMutex implements PointerMutex {
     // `timedOut` is guaranteed to be true before this handler can observe
     // a "caller already threw" state because the flag is set synchronously
     // inside the timeout callback that also enqueues the rejection.
-    void inProcessAcquirePromise.then((release) => {
-      if (timedOut) {
-        try { release(); } catch { /* noop — async-mutex release on abandoned lock */ }
-      }
-    });
+    //
+    // Steelman³⁸ warning: pass a no-op rejection handler too. Without it,
+    // a rejection from acquireInProcess (e.g., async-mutex internal error)
+    // surfaces as unhandledRejection on the void-discarded derived promise.
+    // The same `Promise.race` consumer below catches the rejection for
+    // the awaiter, so this branch is purely the cleanup fallback.
+    void inProcessAcquirePromise.then(
+      (release) => {
+        if (timedOut) {
+          try { release(); } catch { /* noop — async-mutex release on abandoned lock */ }
+        }
+      },
+      () => { /* noop — race rejection handled by Promise.race awaiter */ },
+    );
 
     // Single timer: sets `timedOut` and rejects atomically.
     let inProcessTimeoutHandle!: ReturnType<typeof setTimeout>;

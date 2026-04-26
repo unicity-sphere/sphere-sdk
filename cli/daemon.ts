@@ -198,10 +198,17 @@ function executeBash(action: BashAction, envVars: Record<string, string>, global
       resolve();
     });
 
-    // Pipe event JSON to stdin
+    // Pipe event JSON to stdin.
+    // Steelman³⁸ warning: attach an 'error' listener BEFORE writing.
+    // Without it, an EPIPE from a fast-exiting child (e.g.,
+    // command-not-found, misconfigured shell) escalates to
+    // uncaughtException → daemon process crashes mid-event-dispatch.
     if (child.stdin) {
-      child.stdin.write(envVars.SPHERE_EVENT_JSON);
-      child.stdin.end();
+      child.stdin.on('error', () => { /* swallow EPIPE etc — child exit logged separately */ });
+      try {
+        child.stdin.write(envVars.SPHERE_EVENT_JSON);
+        child.stdin.end();
+      } catch { /* sync write throws are caught here too */ }
     }
   });
 }
@@ -412,6 +419,21 @@ export async function runDaemon(
   // In forked mode, redirect stdout/stderr to log file
   if (flags._forked) {
     ensureDir(config.logFile);
+    // Steelman³⁸ warning: bounded log rotation. Without this, a daemon
+    // running for days at high event volume fills the disk and crashes.
+    // Strategy: at startup, rotate <log>→<log>.1 if size > LOG_ROTATE_BYTES
+    // (10 MiB default). Keep the previous one as <log>.1 (single
+    // rotation; older logs are dropped). Operators can wire logrotate
+    // for richer retention.
+    const LOG_ROTATE_BYTES = 10 * 1024 * 1024;
+    try {
+      const st = fs.statSync(config.logFile);
+      if (st.isFile() && st.size > LOG_ROTATE_BYTES) {
+        const prev = config.logFile + '.1';
+        try { fs.unlinkSync(prev); } catch { /* prev may not exist */ }
+        fs.renameSync(config.logFile, prev);
+      }
+    } catch { /* logFile may not exist yet */ }
     const stream = fs.createWriteStream(config.logFile, { flags: 'a' });
     logStream = stream;
     // Redirect console output to log file

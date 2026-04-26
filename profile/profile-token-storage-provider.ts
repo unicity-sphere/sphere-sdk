@@ -350,16 +350,11 @@ export class ProfileTokenStorageProvider
       this.flushTimer = null;
     }
 
-    // Flush any pending writes
-    if (this.pendingData) {
-      try {
-        await this.flushToIpfs();
-      } catch (err) {
-        this.log(`Shutdown flush failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    // Wait for in-flight flush to complete
+    // Steelman³⁸ warning: AWAIT any in-flight flush BEFORE issuing a
+    // direct flushToIpfs(). The previous order spawned two concurrent
+    // flushes; lastPinnedCid interleaved across them and the retry-cache
+    // invariant ("pinned CID matches currently flushed bytes") was
+    // violated.
     if (this.flushPromise) {
       try {
         await this.flushPromise;
@@ -368,11 +363,29 @@ export class ProfileTokenStorageProvider
       }
     }
 
-    // Unsubscribe from replication
+    // Flush any pending writes (after the in-flight flush settled)
+    if (this.pendingData) {
+      try {
+        await this.flushToIpfs();
+      } catch (err) {
+        this.log(`Shutdown flush failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Steelman³⁸ warning: unsubscribe from replication BEFORE we null
+    // out the cache, so any in-flight onReplication handler that was
+    // about to read this.lastLoadedData / lastTokenManifest sees its
+    // pre-shutdown value rather than null mid-method.
     if (this.replicationUnsub) {
       this.replicationUnsub();
       this.replicationUnsub = null;
     }
+
+    // Steelman³⁸ warning: drop in-memory snapshots so a consumer that
+    // retains a reference to this provider doesn't pin the entire
+    // token graph forever.  Mirrors what `clear()` does (line 700).
+    this.lastLoadedData = null;
+    this.lastTokenManifest = null;
 
     this.initialized = false;
     this.status = 'disconnected';
@@ -833,7 +846,13 @@ export class ProfileTokenStorageProvider
     // Set new debounced timer
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.flushPromise = this.flushToIpfs()
+      // Steelman³⁸ warning: identity-check the finally clear so an older
+      // flush settling AFTER a newer one was scheduled doesn't clobber
+      // the in-flight `flushPromise`. Without the identity check, a
+      // subsequent load() reading `if (this.flushPromise)` would see
+      // null while the new flush is still running, and read a stale
+      // snapshot.
+      const myFlush: Promise<void> = this.flushToIpfs()
         .catch((err) => {
           this.log(`Flush failed: ${err instanceof Error ? err.message : String(err)}`);
           this.emitEvent({
@@ -843,8 +862,11 @@ export class ProfileTokenStorageProvider
           });
         })
         .finally(() => {
-          this.flushPromise = null;
+          if (this.flushPromise === myFlush) {
+            this.flushPromise = null;
+          }
         });
+      this.flushPromise = myFlush;
     }, this.flushDebounceMs);
   }
 
@@ -907,11 +929,42 @@ export class ProfileTokenStorageProvider
       this.lastPinnedCid = null;
 
       // 8. Check consolidation
+      // Steelman³⁸ warning: actually invoke the consolidation engine
+      // (it already exists at profile/consolidation.ts) instead of
+      // logging "deferred to Phase 2" forever. Bundle count grew
+      // unboundedly across daemon lifetime with the previous warn-only
+      // behavior; load latency degraded O(1)→O(N).
+      //
+      // Best-effort: failures are caught and logged but do not block
+      // the flush. The consolidation engine has its own concurrent-
+      // guard (consolidation.pending key) so multi-device races are
+      // safe.
       if (await this.shouldConsolidate()) {
-        this.log(
-          `Bundle count exceeds ${CONSOLIDATION_WARNING_THRESHOLD}. ` +
-          'Consolidation deferred to Phase 2.',
-        );
+        try {
+          const { ConsolidationEngine } = await import('./consolidation.js');
+          const engine = new ConsolidationEngine(
+            this.db,
+            this.encryptionKey!,
+            this._ipfsGateways,
+          );
+          if (!(await engine.isConsolidationInProgress())) {
+            const result = await engine.consolidate();
+            if (result.consolidated) {
+              this.log(
+                `Consolidation: merged ${result.sourceBundleCount} bundles → ${result.consolidatedCid ?? 'n/a'}`,
+              );
+            } else {
+              this.log('Consolidation skipped (engine no-op)');
+            }
+          } else {
+            this.log('Consolidation skipped: another device is in progress');
+          }
+        } catch (err) {
+          // Best-effort: do not fail the flush on consolidation error.
+          this.log(
+            `Consolidation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
 
       // 9. Publish to the pointer layer for cold-start recovery.

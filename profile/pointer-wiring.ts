@@ -112,7 +112,17 @@ export type PointerWiringSkipReason =
 
 export type PointerWiringResult =
   | { readonly ok: true; readonly layer: ProfilePointerLayer }
-  | { readonly ok: false; readonly reason: PointerWiringSkipReason; readonly detail?: string };
+  | {
+      readonly ok: false;
+      readonly reason: PointerWiringSkipReason;
+      readonly detail?: string;
+      // Steelman³⁸ warning: preserve typed AggregatorPointerError code
+      // when the failure was a typed pointer-layer error. Consumers
+      // can switch on this rather than parsing the `detail` string.
+      readonly code?: string;
+      // The underlying error object, for debugging / cause chains.
+      readonly cause?: unknown;
+    };
 
 export interface PointerWiringInput {
   /** Wallet identity (provides private key + chain pubkey). */
@@ -382,6 +392,8 @@ function buildFetchAndJoin(deps: {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
         `fetchAndJoin: invalid CID bytes at v=${remoteVersion}: ${err instanceof Error ? err.message : String(err)}`,
+        undefined,
+        { cause: err },
       );
     }
 
@@ -400,6 +412,8 @@ function buildFetchAndJoin(deps: {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.CAR_UNAVAILABLE,
         `fetchAndJoin: CAR fetch failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+        undefined,
+        { cause: err },
       );
     }
 
@@ -422,6 +436,8 @@ function buildFetchAndJoin(deps: {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
         `fetchAndJoin: bundle-ref encryption failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+        undefined,
+        { cause: err },
       );
     }
 
@@ -478,6 +494,8 @@ function buildFetchAndJoin(deps: {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.PROTOCOL_ERROR,
         `fetchAndJoin: OrbitDB bundle-ref write failed for ${cidString}: ${err instanceof Error ? err.message : String(err)}`,
+        undefined,
+        { cause: err },
       );
     }
   };
@@ -702,8 +720,12 @@ export async function buildProfilePointerLayer(
     return { ok: true, layer };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
+    // Steelman³⁸: preserve typed code if the underlying error was an
+    // AggregatorPointerError so consumers can route on it.
+    const code =
+      err instanceof AggregatorPointerError ? err.code : undefined;
     logger.warn('PointerWiring', `pointer layer init failed: ${detail}`);
-    return { ok: false, reason: 'pointer_init_failed', detail };
+    return { ok: false, reason: 'pointer_init_failed', detail, code, cause: err };
   } finally {
     // Residual-risk narrowing: if we threw BEFORE the explicit
     // zeroize() above (e.g., inside derivePointerKeyMaterial or

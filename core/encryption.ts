@@ -13,6 +13,18 @@ import { logger } from './logger';
 // Types
 // =============================================================================
 
+/**
+ * Authenticated encrypted data envelope.
+ *
+ * Steelman³⁸ critical: previous version was AES-256-CBC WITHOUT a MAC,
+ * leaving ciphertext malleable to bit-flipping attacks on the storage
+ * substrate. Now an Encrypt-then-MAC construction: AES-256-CBC for
+ * confidentiality + HMAC-SHA256 over (iv || ciphertext) for integrity.
+ *
+ * Backward compatibility: records WITHOUT a `mac` field are accepted by
+ * `decrypt()` for legacy data (with a logged warning), but ALL new
+ * writes via `encrypt()` produce the authenticated form.
+ */
 export interface EncryptedData {
   /** Encrypted ciphertext (base64) */
   ciphertext: string;
@@ -21,11 +33,16 @@ export interface EncryptedData {
   /** Salt used for key derivation (hex) */
   salt: string;
   /** Algorithm identifier */
-  algorithm: 'aes-256-cbc';
+  algorithm: 'aes-256-cbc' | 'aes-256-cbc-hmac-sha256';
   /** Key derivation function */
   kdf: 'pbkdf2';
   /** Number of PBKDF2 iterations */
   iterations: number;
+  /**
+   * HMAC-SHA256 over (iv-bytes || ciphertext-bytes) — hex-encoded.
+   * Present iff algorithm === 'aes-256-cbc-hmac-sha256'.
+   */
+  mac?: string;
 }
 
 export interface EncryptionOptions {
@@ -71,12 +88,65 @@ function deriveKey(
   });
 }
 
+/**
+ * Steelman³⁸ critical: derive 512-bit material then split into 256-bit
+ * encryption key + 256-bit MAC key. Single PBKDF2 call (expensive) → two
+ * domain-separated keys. Used by the authenticated encrypt/decrypt path.
+ */
+function deriveAuthKeys(
+  password: string,
+  salt: CryptoJS.lib.WordArray,
+  iterations: number,
+): { encKey: CryptoJS.lib.WordArray; macKey: CryptoJS.lib.WordArray } {
+  const fullMaterial = CryptoJS.PBKDF2(password, salt, {
+    keySize: 2 * (KEY_SIZE / 32), // 16 32-bit words = 512 bits
+    iterations,
+    hasher: CryptoJS.algo.SHA256,
+  });
+  // Split: first 8 words (256 bits) = enc key; last 8 = mac key.
+  const words = fullMaterial.words;
+  const encKey = CryptoJS.lib.WordArray.create(words.slice(0, 8), 32);
+  const macKey = CryptoJS.lib.WordArray.create(words.slice(8, 16), 32);
+  return { encKey, macKey };
+}
+
+/**
+ * Compute HMAC-SHA256 over (iv-bytes || ciphertext-bytes).
+ * Returns hex-encoded MAC.
+ */
+function computeMac(
+  macKey: CryptoJS.lib.WordArray,
+  iv: CryptoJS.lib.WordArray,
+  ciphertext: CryptoJS.lib.WordArray,
+): string {
+  const concat = iv.clone().concat(ciphertext);
+  return CryptoJS.HmacSHA256(concat, macKey).toString(CryptoJS.enc.Hex);
+}
+
+/**
+ * Constant-time comparison of two hex strings of equal length.
+ * For MAC verification — non-constant-time `===` would leak via
+ * timing how many bytes matched.
+ */
+function constantTimeHexEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
 // =============================================================================
 // Encryption Functions
 // =============================================================================
 
 /**
- * Encrypt data with AES-256-CBC
+ * Encrypt data with AES-256-CBC + HMAC-SHA256 (Encrypt-then-MAC).
+ *
+ * Steelman³⁸ critical: previously raw AES-CBC without a MAC, which
+ * left ciphertext malleable. Now an authenticated construction.
+ *
  * @param plaintext - Data to encrypt (string or object)
  * @param password - Encryption password
  * @param options - Encryption options
@@ -95,61 +165,105 @@ export function encrypt(
   const salt = CryptoJS.lib.WordArray.random(SALT_SIZE);
   const iv = CryptoJS.lib.WordArray.random(IV_SIZE);
 
-  // Derive key from password
-  const key = deriveKey(password, salt, iterations);
+  // Derive enc + MAC keys from password (single PBKDF2, split output)
+  const { encKey, macKey } = deriveAuthKeys(password, salt, iterations);
 
   // Encrypt with AES-256-CBC
-  const encrypted = CryptoJS.AES.encrypt(data, key, {
+  const encrypted = CryptoJS.AES.encrypt(data, encKey, {
     iv,
     mode: CryptoJS.mode.CBC,
     padding: CryptoJS.pad.Pkcs7,
   });
+
+  // Compute MAC over (iv || ciphertext) — Encrypt-then-MAC.
+  const mac = computeMac(macKey, iv, encrypted.ciphertext);
 
   return {
     ciphertext: encrypted.ciphertext.toString(CryptoJS.enc.Base64),
     iv: iv.toString(CryptoJS.enc.Hex),
     salt: salt.toString(CryptoJS.enc.Hex),
-    algorithm: 'aes-256-cbc',
+    algorithm: 'aes-256-cbc-hmac-sha256',
     kdf: 'pbkdf2',
     iterations,
+    mac,
   };
 }
 
 /**
- * Decrypt AES-256-CBC encrypted data
- * @param encryptedData - Encrypted data object
- * @param password - Decryption password
+ * Decrypt AES-256-CBC[+HMAC] encrypted data.
+ *
+ * Steelman³⁸ critical: routes by `algorithm`:
+ *   - 'aes-256-cbc-hmac-sha256': verify HMAC FIRST (constant-time),
+ *     then decrypt. Fail-closed on MAC mismatch.
+ *   - 'aes-256-cbc' (legacy): decrypt without authentication, log
+ *     a one-shot warning, return result. New writes don't produce
+ *     this format — but existing on-disk records remain readable.
  */
 export function decrypt(encryptedData: EncryptedData, password: string): string {
   // Parse salt and IV
   const salt = CryptoJS.enc.Hex.parse(encryptedData.salt);
   const iv = CryptoJS.enc.Hex.parse(encryptedData.iv);
-
-  // Derive key from password
-  const key = deriveKey(password, salt, encryptedData.iterations);
-
-  // Parse ciphertext
   const ciphertext = CryptoJS.enc.Base64.parse(encryptedData.ciphertext);
 
-  // Create cipher params
-  const cipherParams = CryptoJS.lib.CipherParams.create({
-    ciphertext,
-  });
+  if (encryptedData.algorithm === 'aes-256-cbc-hmac-sha256') {
+    // Authenticated path: verify MAC, then decrypt.
+    if (typeof encryptedData.mac !== 'string') {
+      throw new SphereError(
+        'Decryption failed: authenticated record missing mac field',
+        'DECRYPTION_ERROR',
+      );
+    }
+    const { encKey, macKey } = deriveAuthKeys(password, salt, encryptedData.iterations);
+    const expectedMac = computeMac(macKey, iv, ciphertext);
+    if (!constantTimeHexEqual(expectedMac, encryptedData.mac)) {
+      throw new SphereError(
+        'Decryption failed: MAC verification failed (wrong password or tampered ciphertext)',
+        'DECRYPTION_ERROR',
+      );
+    }
+    const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext });
+    const decrypted = CryptoJS.AES.decrypt(cipherParams, encKey, {
+      iv,
+      mode: CryptoJS.mode.CBC,
+      padding: CryptoJS.pad.Pkcs7,
+    });
+    const result = decrypted.toString(CryptoJS.enc.Utf8);
+    if (!result) {
+      throw new SphereError(
+        'Decryption failed: padding error after MAC pass (corrupted record)',
+        'DECRYPTION_ERROR',
+      );
+    }
+    return result;
+  }
 
-  // Decrypt
+  // Legacy unauthenticated path. Log a one-shot warning so operators
+  // can audit how many records still need re-encryption.
+  warnLegacyUnauthenticatedOnce();
+  const key = deriveKey(password, salt, encryptedData.iterations);
+  const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext });
   const decrypted = CryptoJS.AES.decrypt(cipherParams, key, {
     iv,
     mode: CryptoJS.mode.CBC,
     padding: CryptoJS.pad.Pkcs7,
   });
-
   const result = decrypted.toString(CryptoJS.enc.Utf8);
-
   if (!result) {
     throw new SphereError('Decryption failed: invalid password or corrupted data', 'DECRYPTION_ERROR');
   }
-
   return result;
+}
+
+let _warnedLegacyUnauth = false;
+function warnLegacyUnauthenticatedOnce(): void {
+  if (_warnedLegacyUnauth) return;
+  _warnedLegacyUnauth = true;
+  logger.warn(
+    'Encryption',
+    'Decrypting legacy unauthenticated AES-CBC record. Re-encrypt at next ' +
+      'write opportunity — current ciphertext is malleable to bit-flipping ' +
+      'attacks (steelman³⁸).',
+  );
 }
 
 /**
@@ -171,28 +285,62 @@ export function decryptJson<T = unknown>(encryptedData: EncryptedData, password:
 // =============================================================================
 
 /**
- * Simple encryption using CryptoJS built-in password-based encryption
- * Suitable for localStorage where we don't need full EncryptedData metadata
+ * Steelman³⁸ critical: tagged-string format for authenticated simple
+ * encryption. Used by mnemonic + master-key persistence (Sphere.ts).
+ * Format: `v2:<base64-of-JSON-EncryptedData>` — the `v2:` prefix
+ * disambiguates from legacy CryptoJS OpenSSL-format strings (which
+ * always start with `U2FsdGVkX1` = base64 of "Salted__").
+ */
+const SIMPLE_V2_PREFIX = 'v2:';
+
+/**
+ * Authenticated password-based encryption for compact string storage.
+ * Replaces the previous CryptoJS.AES.encrypt(plaintext, password) which
+ * produced an unauthenticated CBC ciphertext susceptible to bit-flipping.
+ *
  * @param plaintext - Data to encrypt
  * @param password - Encryption password
  */
 export function encryptSimple(plaintext: string, password: string): string {
-  return CryptoJS.AES.encrypt(plaintext, password).toString();
+  const env = encrypt(plaintext, password);
+  // Prefix tells decryptSimple which path to take.  base64 of compact
+  // JSON keeps the storage small while preserving the typed envelope.
+  return SIMPLE_V2_PREFIX + btoa(JSON.stringify(env));
 }
 
 /**
- * Simple decryption
+ * Decrypt a string produced by `encryptSimple`.
+ *
+ * Steelman³⁸: routes by prefix.
+ *   - `v2:` → authenticated decrypt (MAC verified)
+ *   - legacy (no prefix) → CryptoJS OpenSSL-compatible decrypt with a
+ *     one-shot warning. New writes don't produce legacy.
+ *
  * @param ciphertext - Encrypted string
  * @param password - Decryption password
  */
 export function decryptSimple(ciphertext: string, password: string): string {
+  if (ciphertext.startsWith(SIMPLE_V2_PREFIX)) {
+    let env: EncryptedData;
+    try {
+      env = JSON.parse(atob(ciphertext.slice(SIMPLE_V2_PREFIX.length))) as EncryptedData;
+    } catch {
+      throw new SphereError('Decryption failed: malformed v2 envelope', 'DECRYPTION_ERROR');
+    }
+    if (!isEncryptedData(env)) {
+      throw new SphereError('Decryption failed: invalid v2 envelope shape', 'DECRYPTION_ERROR');
+    }
+    return decrypt(env, password);
+  }
+
+  // Legacy CryptoJS OpenSSL-format (unauthenticated). Read-only; new
+  // writes don't produce this.
+  warnLegacyUnauthenticatedOnce();
   const decrypted = CryptoJS.AES.decrypt(ciphertext, password);
   const result = decrypted.toString(CryptoJS.enc.Utf8);
-
   if (!result) {
     throw new SphereError('Decryption failed: invalid password or corrupted data', 'DECRYPTION_ERROR');
   }
-
   return result;
 }
 
@@ -251,11 +399,18 @@ export function isEncryptedData(data: unknown): data is EncryptedData {
     return false;
   }
   const obj = data as Record<string, unknown>;
+  const algorithmOk =
+    obj.algorithm === 'aes-256-cbc' ||
+    obj.algorithm === 'aes-256-cbc-hmac-sha256';
+  // Authenticated records require a `mac` field; legacy records must NOT.
+  if (obj.algorithm === 'aes-256-cbc-hmac-sha256' && typeof obj.mac !== 'string') {
+    return false;
+  }
   return (
     typeof obj.ciphertext === 'string' &&
     typeof obj.iv === 'string' &&
     typeof obj.salt === 'string' &&
-    obj.algorithm === 'aes-256-cbc' &&
+    algorithmOk &&
     obj.kdf === 'pbkdf2' &&
     typeof obj.iterations === 'number'
   );
