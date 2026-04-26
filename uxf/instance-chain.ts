@@ -156,17 +156,18 @@ export function addInstance(
     );
   }
 
-  // Steelman²³/²⁴ warning: enforce header field bounds at the programmatic
+  // Steelman²³/²⁴/²⁵ warning: enforce header field bounds at the programmatic
   // entry point too — not just at JSON/IPLD parse boundaries. A caller
   // constructing a UxfElement directly (test code, future modules,
   // alternative deserializers) would otherwise bypass the parse-time
   // checks and could insert giant kind strings, non-finite versions, etc.
   // assertHeaderKindField also bounds kind length to MAX_KIND_LENGTH.
-  // Pass 'INVALID_INSTANCE_CHAIN' so addInstance throws a consistent error
-  // code for header-validation failures (matching its other rule errors).
-  assertHeaderKindField(newInstance.header.kind, 'addInstance newInstance.header.kind', 'INVALID_INSTANCE_CHAIN');
-  assertHeaderVersionField(newInstance.header.semantics, 'addInstance newInstance.header.semantics', 'INVALID_INSTANCE_CHAIN');
-  assertHeaderVersionField(newInstance.header.representation, 'addInstance newInstance.header.representation', 'INVALID_INSTANCE_CHAIN');
+  // Single-source-of-truth error code so a future reviewer can't skew
+  // codes by editing one call but missing the others.
+  const HEADER_ERR_CODE = 'INVALID_INSTANCE_CHAIN' as const;
+  assertHeaderKindField(newInstance.header.kind, 'addInstance newInstance.header.kind', HEADER_ERR_CODE);
+  assertHeaderVersionField(newInstance.header.semantics, 'addInstance newInstance.header.semantics', HEADER_ERR_CODE);
+  assertHeaderVersionField(newInstance.header.representation, 'addInstance newInstance.header.representation', HEADER_ERR_CODE);
 
   // Rule 2: predecessor must equal current head.
   if (newInstance.header.predecessor !== currentHeadHash) {

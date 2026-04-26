@@ -16,13 +16,21 @@
 
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
-// Steelman¹⁹/²⁰: cache prototype methods at module load — defends
+// Steelman¹⁹/²⁰/²⁵: cache prototype methods at module load — defends
 // against late prototype-pollution turning every wipe / type-tag check
-// into a no-op or a leak. Both safeWipe and isSharedArrayBufferLike now
-// resolve through these captured references rather than going through
-// (potentially polluted) prototype lookups.
+// into a no-op or a leak. All security-critical operations now resolve
+// through these captured references rather than going through
+// (potentially polluted or attacker-overridden) prototype lookups.
 const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
 const OBJECT_TO_STRING = Object.prototype.toString;
+// Steelman²⁵ critical: capture ArrayBuffer.prototype.slice for use as the
+// authoritative copy mechanism. Calling this captured slice via .call()
+// requires the receiver to have the [[ArrayBufferData]] internal slot —
+// fake objects with a forged [Symbol.toStringTag]='ArrayBuffer' and a
+// custom .slice() property cannot pass through it (TypeError on missing
+// internal slot). This is the bedrock check that defeats hostile
+// TypedArray subclasses regardless of which surface property they spoof.
+const ARRAY_BUFFER_SLICE = ArrayBuffer.prototype.slice;
 function safeWipe(buf: Uint8Array | null | undefined): void {
   if (!buf) return;
   try {
@@ -53,25 +61,42 @@ function isSharedArrayBufferLike(buffer: ArrayBufferLike | undefined | null): bo
 }
 
 /**
- * Steelman²³ critical: cross-realm safe ArrayBuffer detection.
+ * Steelman²⁵ critical: authoritative ArrayBuffer detection via captured
+ * ArrayBuffer.prototype.slice.
  *
- * A hostile `Uint8Array` subclass can override the `.buffer` getter to
- * return a PLAIN OBJECT with attacker-supplied byteLength and a custom
- * `slice()` method. Pre-slice numeric validation (offset/length range)
- * passes because byteLength is reported truthfully; the slice then
- * returns whatever bytes the attacker chooses. The denylist runs on
- * those bytes, but a low-entropy non-denylisted scalar still produces
- * a deterministic attacker-known pointer-layer key.
+ * `Object.prototype.toString.call(b) === '[object ArrayBuffer]'` is
+ * forgeable — any object with `[Symbol.toStringTag] = 'ArrayBuffer'`
+ * passes. The robust check is to invoke the captured
+ * ArrayBuffer.prototype.slice on the candidate: the engine requires
+ * the receiver to have the [[ArrayBufferData]] internal slot (only
+ * real ArrayBuffer instances have it, regardless of realm). A fake
+ * object throws TypeError; a real ArrayBuffer (across realms) returns
+ * a slice. We use this as a *primitive* in copyArrayBufferRange below.
  *
- * Defeat: require the source buffer to be a REAL ArrayBuffer (or SAB,
- * which is already rejected by isSharedArrayBufferLike upstream). Use
- * Object.prototype.toString.call (cross-realm safe) instead of
- * `instanceof ArrayBuffer` (realm-scoped, defeats valid cross-realm
- * inputs).
+ * The toStringTag check is retained as a fast-path heuristic and for
+ * better error messages, but the captured-slice call is the
+ * load-bearing security check.
  */
-function isPlainArrayBuffer(buffer: unknown): boolean {
-  if (buffer === undefined || buffer === null) return false;
-  return OBJECT_TO_STRING.call(buffer) === '[object ArrayBuffer]';
+function copyArrayBufferRange(
+  buffer: unknown,
+  start: number,
+  end: number,
+): ArrayBuffer {
+  // Try the captured slice. If `buffer` lacks [[ArrayBufferData]],
+  // ARRAY_BUFFER_SLICE throws TypeError; we re-throw as PROTOCOL_ERROR.
+  try {
+    // ARRAY_BUFFER_SLICE.call(realArrayBuffer, start, end) returns a
+    // new ArrayBuffer per the spec.
+    return ARRAY_BUFFER_SLICE.call(buffer as ArrayBuffer, start, end);
+  } catch (err) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      'MasterPrivateKey input.buffer is not a real ArrayBuffer (no [[ArrayBufferData]] internal slot). ' +
+        'Hostile TypedArray subclass with a forged .buffer is the most likely cause.',
+      undefined,
+      { cause: err },
+    );
+  }
 }
 
 declare const _brand: unique symbol;
@@ -275,24 +300,16 @@ export function createMasterPrivateKey(
         'concurrent mutation between denylist check and internal copy is a TOCTOU risk.',
     );
   }
-  // Steelman²³ critical: assert sourceBuffer is a REAL ArrayBuffer. A
-  // hostile TypedArray subclass with an overridden `.buffer` getter
-  // could return a plain object whose `byteLength` is a number (passes
-  // numeric range validation) and whose `slice()` returns attacker
-  // bytes. This check (via captured Object.prototype.toString) rejects
-  // any non-ArrayBuffer source — only genuine ArrayBuffer instances
-  // (across realms) pass.
-  if (!isPlainArrayBuffer(sourceBuffer)) {
-    throw new AggregatorPointerError(
-      AggregatorPointerErrorCode.PROTOCOL_ERROR,
-      'MasterPrivateKey input.buffer must be a real ArrayBuffer — ' +
-        'hostile TypedArray subclass detected (custom .buffer getter returning a non-ArrayBuffer object).',
-    );
-  }
-  // Steelman²¹/²²: copy via the SNAPSHOTTED buffer / offset / length
-  // (sourceBuffer.slice), not via `new Uint8Array(bytes)` which would
-  // re-read the hostile subclass's getters. Slice operates on a fresh
-  // ArrayBuffer; the resulting Uint8Array is never SAB-backed.
+  // Steelman²⁵ critical: the load-bearing ArrayBuffer check happens at
+  // the slice site below (copyArrayBufferRange uses captured
+  // ArrayBuffer.prototype.slice which requires the [[ArrayBufferData]]
+  // internal slot). A toStringTag check would be forgeable and is
+  // omitted as redundant.
+  // Steelman²¹/²²/²⁵: copy via captured ArrayBuffer.prototype.slice.call
+  // on the snapshotted buffer / offset / length. `sourceBuffer.slice()`
+  // would go through prototype lookup and could be hijacked by a hostile
+  // subclass; the captured slice (copyArrayBufferRange) demands the
+  // [[ArrayBufferData]] internal slot and throws on fakes.
   //
   // Steelman remediation: the `bytes` property is a GETTER that returns a
   // defensive copy of the internal buffer. Exposing the raw Uint8Array
@@ -303,7 +320,7 @@ export function createMasterPrivateKey(
   // wipe the returned copy when done. `zeroize()` wipes the SOURCE buffer,
   // after which all future .bytes reads return zeros.
   const internalBytes = new Uint8Array(
-    sourceBuffer.slice(sourceOffset, sourceOffset + sourceLen),
+    copyArrayBufferRange(sourceBuffer, sourceOffset, sourceOffset + sourceLen),
   );
   // Steelman²² critical defense-in-depth: re-assert the copy length.
   // ArrayBuffer.slice clamps end to byteLength; if sourceOffset + sourceLen

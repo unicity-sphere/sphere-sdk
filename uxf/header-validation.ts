@@ -51,8 +51,11 @@ export function assertHeaderVersionField(
  * kind would otherwise propagate through pool storage, hash computation
  * (slow), index structures, and persistent state. 64 UTF-16 units
  * accommodates all current well-known kinds plus reasonable future
- * extensions. Note: 64 emoji surrogate pairs encode to 64 UTF-16 units
- * (32 codepoints), so the cap is conservative on visible-character count.
+ * extensions. Note on visible-character count: each non-BMP codepoint
+ * (e.g., most emoji) encodes to 2 UTF-16 units (a surrogate pair), so
+ * 32 emoji codepoints = 64 UTF-16 units, exhausting the cap. The cap
+ * is therefore conservative for non-BMP-heavy strings (fewer visible
+ * characters than the unit count for non-BMP codepoints).
  */
 export const MAX_KIND_LENGTH = 64;
 
