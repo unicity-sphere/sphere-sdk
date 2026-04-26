@@ -241,16 +241,22 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // 3. Derive deterministic database name from wallet pubkey
       //    Section 4.1: sphere-profile-<first 16 hex chars of pubkey>
       //
-      // Steelman²⁸ critical: prefer caller-supplied dbNameOverride
-      // (which was derived from a wipeable Uint8Array). Falling back to
-      // derivePublicKeyShort(config.privateKey) keeps backward compat
-      // but is a memory-safety hazard documented on OrbitDbConfig.
+      // Steelman²⁸/²⁹ critical: prefer caller-supplied dbNameOverride
+      // (derived from a wipeable Uint8Array). Falling back to
+      // derivePublicKeyShort(config.privateKey) is a memory-safety
+      // hazard documented on OrbitDbConfig. Now: require one or the
+      // other, fail closed if neither.
       let dbName: string;
       if (config.dbNameOverride) {
         dbName = config.dbNameOverride;
-      } else {
+      } else if (config.privateKey && config.privateKey.length > 0) {
         const publicKeyShort = await derivePublicKeyShort(config.privateKey);
         dbName = `sphere-profile-${publicKeyShort}`;
+      } else {
+        throw new ProfileError(
+          'ORBITDB_CONNECTION_FAILED',
+          'OrbitDbConfig requires either dbNameOverride (preferred) or privateKey (deprecated).',
+        );
       }
 
       // 4. Open (or create) the keyvalue database with access control
@@ -470,6 +476,11 @@ export class OrbitDbAdapter implements ProfileDatabase {
       // sum into a multi-GB OOM. 256 MiB is far above any legitimate
       // session payload total.
       const ALL_AGGREGATE_BYTES_CAP = 256 * 1024 * 1024;
+      // Steelman²⁹ warning: distinguish the cap-exceeded fail-stop from
+      // per-entry coercion failures via a TYPED sentinel, not via brittle
+      // substring matching on err.message. A future error message reword
+      // would silently turn the hard-stop into a continue.
+      const AGGREGATE_CAP_SENTINEL = Symbol('orbitdb-aggregate-cap-exceeded');
       let aggregateBytes = 0;
       let skippedCount = 0;
       const tryCoerce = (key: string, value: unknown): boolean => {
@@ -477,17 +488,19 @@ export class OrbitDbAdapter implements ProfileDatabase {
           const coerced = coerceToUint8Array(value);
           aggregateBytes += coerced.byteLength;
           if (aggregateBytes > ALL_AGGREGATE_BYTES_CAP) {
-            throw new ProfileError(
+            const err = new ProfileError(
               'ORBITDB_READ_FAILED',
               `all(): aggregate value bytes exceeded ${ALL_AGGREGATE_BYTES_CAP} ` +
                 `(at key="${key}"). Refusing to load further entries — possible ` +
                 `OOM attack from a malicious peer.`,
             );
+            (err as unknown as { [s: symbol]: boolean })[AGGREGATE_CAP_SENTINEL] = true;
+            throw err;
           }
           result.set(key, coerced);
           return true;
         } catch (err) {
-          if (err instanceof ProfileError && err.code === 'ORBITDB_READ_FAILED' && err.message.includes('aggregate value bytes')) {
+          if (err && typeof err === 'object' && (err as { [s: symbol]: boolean })[AGGREGATE_CAP_SENTINEL]) {
             // Hard fail-stop on aggregate cap.
             throw err;
           }

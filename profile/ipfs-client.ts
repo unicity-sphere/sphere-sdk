@@ -63,6 +63,7 @@ export async function pinToIpfs(
   timeoutMs: number = DEFAULT_PIN_TIMEOUT_MS,
 ): Promise<string> {
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  validateGatewayUrls(effectiveGateways);
   let lastError: Error | null = null;
 
   for (const gateway of effectiveGateways) {
@@ -162,24 +163,10 @@ export async function fetchFromIpfs(
   maxSizeBytes: number = DEFAULT_MAX_SIZE_BYTES,
 ): Promise<Uint8Array> {
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
-  // Steelman²⁸ warning: validate gateway URLs at the call boundary.
-  // A malformed or hostile config could include javascript:, file:,
-  // or scheme-less paths. Reject anything that isn't http(s)://.
-  for (const gateway of effectiveGateways) {
-    try {
-      const u = new URL(gateway);
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        throw new Error(
-          `IPFS gateway URL must use http:// or https://, got "${gateway}" (protocol="${u.protocol}")`,
-        );
-      }
-      if (u.username !== '' || u.password !== '') {
-        throw new Error(`IPFS gateway URL must not contain userinfo: "${gateway}"`);
-      }
-    } catch (err) {
-      throw new Error(`Invalid IPFS gateway URL "${gateway}": ${String(err)}`);
-    }
-  }
+  // Steelman²⁸/²⁹ warning: validate gateway URLs via shared helper —
+  // applies the same allowlist to fetchFromIpfs / pinToIpfs /
+  // verifyCidAccessible (previous F.33 fix only validated fetchFromIpfs).
+  validateGatewayUrls(effectiveGateways);
   let lastError: Error | null = null;
 
   for (const gateway of effectiveGateways) {
@@ -323,6 +310,7 @@ export async function verifyCidAccessible(
   timeoutMs: number = DEFAULT_VERIFY_TIMEOUT_MS,
 ): Promise<boolean> {
   const effectiveGateways = gateways.length > 0 ? gateways : [DEFAULT_IPFS_API_URL];
+  validateGatewayUrls(effectiveGateways);
 
   for (const gateway of effectiveGateways) {
     try {
@@ -345,6 +333,29 @@ export async function verifyCidAccessible(
 // =============================================================================
 // Internal helpers
 // =============================================================================
+
+/**
+ * Steelman²⁸/²⁹: shared IPFS gateway URL allowlist enforcement. Used by
+ * fetchFromIpfs / pinToIpfs / verifyCidAccessible — they MUST all
+ * route here so the allowlist applies to every code path.
+ */
+function validateGatewayUrls(gateways: readonly string[]): void {
+  for (const gateway of gateways) {
+    try {
+      const u = new URL(gateway);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+        throw new Error(
+          `IPFS gateway URL must use http:// or https://, got "${gateway}" (protocol="${u.protocol}")`,
+        );
+      }
+      if (u.username !== '' || u.password !== '') {
+        throw new Error(`IPFS gateway URL must not contain userinfo: "${gateway}"`);
+      }
+    } catch (err) {
+      throw new Error(`Invalid IPFS gateway URL "${gateway}": ${String(err)}`);
+    }
+  }
+}
 
 /**
  * Read a `ReadableStream<Uint8Array>` into a single `Uint8Array`, aborting

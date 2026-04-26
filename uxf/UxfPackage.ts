@@ -365,9 +365,16 @@ export class UxfPackage {
 /**
  * Wrap a raw UxfPackageData pool Map as an ElementPool instance.
  * Many internal functions require ElementPool rather than a plain Map.
+ *
+ * Steelman²⁸/²⁹ critical: this is a trust-boundary wrapper. The
+ * UxfPackageData may have been constructed in-memory by trusted code OR
+ * may be the post-deserialize result of attacker-supplied JSON/CAR. We
+ * use the verifying variant (fromMapVerified) to catch any
+ * key/element-hash inconsistency at the point of wrapping. Cost: one
+ * SHA-256 per element. Bounded by VERIFY_MAX_POOL_SIZE = 1M (verify.ts).
  */
 function wrapPool(pkg: UxfPackageData): ElementPool {
-  return ElementPool.fromMap(pkg.pool);
+  return ElementPool.fromMapVerified(pkg.pool);
 }
 
 /**

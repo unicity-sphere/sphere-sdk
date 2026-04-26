@@ -3629,23 +3629,27 @@ async function main() {
       case 'encrypt': {
         const [, data, passwordArg] = args;
         if (!data) {
-          console.error('Usage: encrypt <data> [password]   (omit password for interactive prompt)');
+          console.error('Usage: encrypt <data>   (password is read from stdin/prompt)');
           process.exit(1);
         }
-        // Steelman²⁸ warning: passwords on argv leak via ps -ef,
-        // /proc/<pid>/cmdline, and shell history. If supplied, mask
-        // the slot immediately and (when omitted) prompt on stderr.
-        let password = passwordArg;
+        // Steelman²⁹ critical: argv-supplied passwords are EXPOSED — they
+        // appear in `ps`, /proc/<pid>/cmdline, and shell history BEFORE
+        // this process can react. Masking the local args copy is purely
+        // cosmetic. Refuse argv passwords entirely; require interactive
+        // prompt or stdin.  Operators who need scripted use can pipe via
+        // `echo "$PASS" | cli encrypt <data>` (stdin not visible to ps).
+        let password: string;
         if (passwordArg && passwordArg !== '***') {
-          const idx = args.indexOf(passwordArg);
-          if (idx > -1) args[idx] = '***';
+          console.error(
+            'Refusing argv-supplied password: it is already exposed via ps/cmdline/history.\n' +
+              'Use interactive prompt (omit) or pipe via stdin.',
+          );
+          process.exit(1);
         }
-        if (!password) {
-          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-          password = await new Promise<string>((resolve) => {
-            rl.question('Password: ', (a) => { rl.close(); resolve(a); });
-          });
-        }
+        const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+        password = await new Promise<string>((resolve) => {
+          rl.question('Password: ', (a) => { rl.close(); resolve(a); });
+        });
         const result = encrypt(data, password);
         console.log(JSON.stringify(result, null, 2));
         break;
@@ -3654,20 +3658,20 @@ async function main() {
       case 'decrypt': {
         const [, encrypted, passwordArg] = args;
         if (!encrypted) {
-          console.error('Usage: decrypt <encrypted-json> [password]   (omit password for interactive prompt)');
+          console.error('Usage: decrypt <encrypted-json>   (password is read from stdin/prompt)');
           process.exit(1);
         }
-        let password = passwordArg;
+        let password: string;
         if (passwordArg && passwordArg !== '***') {
-          const idx = args.indexOf(passwordArg);
-          if (idx > -1) args[idx] = '***';
+          console.error(
+            'Refusing argv-supplied password: it is already exposed via ps/cmdline/history.',
+          );
+          process.exit(1);
         }
-        if (!password) {
-          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-          password = await new Promise<string>((resolve) => {
-            rl.question('Password: ', (a) => { rl.close(); resolve(a); });
-          });
-        }
+        const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+        password = await new Promise<string>((resolve) => {
+          rl.question('Password: ', (a) => { rl.close(); resolve(a); });
+        });
         const encryptedData = JSON.parse(encrypted);
         const result = decrypt(encryptedData, password);
         console.log(result);
@@ -3678,14 +3682,15 @@ async function main() {
       case 'parse-wallet': {
         const [, filePath, passwordArg] = args;
         if (!filePath) {
-          console.error('Usage: parse-wallet <file> [password]   (omit password for interactive prompt)');
+          console.error('Usage: parse-wallet <file>   (password is read from prompt for encrypted wallets)');
           process.exit(1);
         }
-        // Steelman²⁸: same masking as encrypt/decrypt above.
-        let password = passwordArg;
+        let password: string | undefined;
         if (passwordArg && passwordArg !== '***') {
-          const idx = args.indexOf(passwordArg);
-          if (idx > -1) args[idx] = '***';
+          console.error(
+            'Refusing argv-supplied password: it is already exposed via ps/cmdline/history.',
+          );
+          process.exit(1);
         }
 
         if (!fs.existsSync(filePath)) {

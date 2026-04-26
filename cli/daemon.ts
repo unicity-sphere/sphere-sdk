@@ -567,8 +567,11 @@ function detachDaemon(args: string[], flags: DaemonFlags): void {
       console.error(`Daemon already running (PID ${existingPid}). Use "daemon stop" first.`);
       process.exit(1);
     }
-    // Stale PID file
+    // Stale PID file — clean up alongside its canary file so a
+    // pre-existing forged canary doesn't outlive the unlinked pidFile.
     fs.unlinkSync(pidFile);
+    const staleCanary = pidFile + '.canary';
+    if (fs.existsSync(staleCanary)) fs.unlinkSync(staleCanary);
   }
 
   // Build child args: replace --detach with --_forked, keep everything else

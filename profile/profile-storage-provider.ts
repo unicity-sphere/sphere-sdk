@@ -555,9 +555,34 @@ export class ProfileStorageProvider implements StorageProvider {
     ) {
       this.dbStatus = 'attaching';
       try {
+        // Steelman²⁹ critical: derive dbNameOverride from wipeable
+        // Uint8Array bytes BEFORE handing off to OrbitDB. The privateKey
+        // hex string is unavoidable at this layer (identity stores it as
+        // a string), but at least the per-call derivation goes through
+        // bytes that can be zeroized. The dbName is non-secret (a public
+        // identifier in the OrbitDB peer mesh), safe to retain.
+        let dbNameOverride: string | undefined;
+        const pkHex = identityAtStart.privateKey;
+        if (pkHex && pkHex.length > 0) {
+          const pkBytes = hexToBytes(pkHex);
+          try {
+            const secp256k1Module = await import('@noble/curves/secp256k1.js' as string);
+            const pubKeyBytes: Uint8Array =
+              (secp256k1Module as { secp256k1: { getPublicKey(k: Uint8Array, c: boolean): Uint8Array } })
+                .secp256k1.getPublicKey(pkBytes, true);
+            const pubHex = Array.from(pubKeyBytes, (b) => b.toString(16).padStart(2, '0')).join('');
+            dbNameOverride = `sphere-profile-${pubHex.slice(0, 16)}`;
+          } catch {
+            // Fall back to letting OrbitDB derive — preserves backward compat
+            // when @noble/curves is unavailable.
+          } finally {
+            pkBytes.fill(0);
+          }
+        }
         await this.db.connect({
           ...orbitDbConfig,
           privateKey: identityAtStart.privateKey,
+          dbNameOverride,
         });
         this.dbStatus = 'attached';
         this.attachedChainPubkey = identityAtStart.chainPubkey ?? null;
@@ -1293,13 +1318,21 @@ export class ProfileStorageProvider implements StorageProvider {
  * Now strict: reject odd-length input and reject any non-hex character.
  */
 function hexToBytes(hex: string): Uint8Array {
+  // Steelman²⁹ warning: reject empty input — every caller in this
+  // module (setIdentity → encryption-key derivation, transport key
+  // derivation, etc.) treats empty as a programming error, never a
+  // valid value. Allowing it through silently produced a deterministic
+  // but obviously wrong key.
   if (typeof hex !== 'string') {
     throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
+  }
+  if (hex.length === 0) {
+    throw new RangeError('hexToBytes: empty hex string');
   }
   if (hex.length % 2 !== 0) {
     throw new RangeError(`hexToBytes: odd-length hex string (${hex.length} chars)`);
   }
-  if (hex.length > 0 && !/^[0-9a-fA-F]+$/.test(hex)) {
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
     throw new RangeError('hexToBytes: contains non-hex characters');
   }
   const bytes = new Uint8Array(hex.length / 2);

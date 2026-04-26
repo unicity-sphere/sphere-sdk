@@ -19,21 +19,21 @@ import type { ProfilePointerLayer } from './aggregator-pointer';
  * Configuration for connecting to an OrbitDB instance.
  * The database identity is derived from the wallet's secp256k1 key.
  *
- * Steelman²⁸ critical: passing the private key (hex string) into the
+ * Steelman²⁸/²⁹ critical: passing the private key (hex string) into the
  * OrbitDB adapter is a memory-safety hazard — JS strings are immutable
  * and cannot be wiped, leaving the master key heap-resident for the
- * session lifetime. New callers SHOULD pass `dbNameOverride` directly,
- * which the wallet computes ONCE and wipes the source bytes after.
- * The privateKey field is retained for backward compatibility but
- * marked deprecated.
+ * session lifetime. EITHER `dbNameOverride` OR `privateKey` must be
+ * provided; new callers SHOULD pass `dbNameOverride` (computed ONCE
+ * from a wipeable Uint8Array, with the bytes zeroized after derivation).
  */
 export interface OrbitDbConfig {
   /**
    * @deprecated — pass `dbNameOverride` instead. JS strings cannot be
    * zeroized, so storing the master key here leaks it to GC for the
-   * entire session.
+   * entire session. Optional: only consulted when `dbNameOverride` is
+   * not set.
    */
-  readonly privateKey: string;
+  readonly privateKey?: string;
   /**
    * Pre-computed `sphere-profile-<16-hex>` database name. When set,
    * the adapter uses this directly and IGNORES privateKey for identity

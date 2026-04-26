@@ -174,6 +174,16 @@ export function applyDelta(pkg: UxfPackageData, delta: UxfDelta): void {
       mutableChains.delete(hash);
     }
     for (const oldEntry of affectedChainEntries) {
+      // Steelman²⁹ warning: if the chain's authored HEAD itself was
+      // removed, drop the entire chain rather than silently re-electing
+      // a survivor as head. Re-electing would shift "newest authored"
+      // to whatever survived — a semantic change the caller did not
+      // request. Removing the chain forces the caller to make any
+      // re-anchoring explicit.
+      if (removedSet.has(oldEntry.head)) {
+        for (const link of oldEntry.chain) mutableChains.delete(link.hash);
+        continue;
+      }
       const remainingLinks = oldEntry.chain.filter(
         (link) => !removedSet.has(link.hash),
       );

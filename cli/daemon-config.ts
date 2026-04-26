@@ -249,13 +249,21 @@ function resolveDaemonConfigPath(explicitPath: string | undefined): {
   source: 'explicit' | 'env' | 'home' | 'cwd-legacy';
 } {
   if (explicitPath) return { path: explicitPath, source: 'explicit' };
+  // Steelman²⁹ critical: empty SPHERE_CLI_HOME or empty os.homedir()
+  // would `path.join('', '.sphere-cli', ...)` resolve to a CWD-relative
+  // path, silently bypassing the CWD-poisoning fix. Reject empty home
+  // values so the legacy-CWD branch with its loud warning ALWAYS fires
+  // for any environment without a real HOME directory.
   const envHome = process.env.SPHERE_CLI_HOME;
-  if (envHome) {
+  if (envHome && envHome.length > 0 && path.isAbsolute(envHome)) {
     return { path: path.join(envHome, 'daemon.json'), source: 'env' };
   }
-  const homeDefault = path.join(os.homedir(), '.sphere-cli', 'daemon.json');
-  if (fs.existsSync(homeDefault)) {
-    return { path: homeDefault, source: 'home' };
+  const homeDir = os.homedir();
+  if (homeDir && homeDir.length > 0 && path.isAbsolute(homeDir)) {
+    const homeDefault = path.join(homeDir, '.sphere-cli', 'daemon.json');
+    if (fs.existsSync(homeDefault)) {
+      return { path: homeDefault, source: 'home' };
+    }
   }
   // Last-resort legacy fallback. The caller will warn before consuming.
   return { path: DEFAULT_CONFIG_PATH, source: 'cwd-legacy' };

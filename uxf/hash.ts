@@ -136,15 +136,16 @@ export function prepareContentForHashing(
 
     // Hex-encoded byte fields -> Uint8Array
     //
-    // NOTE: empty-string and null produce DIFFERENT CBOR encodings
-    // (bstr(0) vs null), and therefore different content hashes. This
-    // is a known canonicalization caveat (steelman²⁸) — addressed by
-    // normalizing wire-format input at the parse boundary rather than
-    // here, since the encoding-level normalization broke wire-format
-    // round-trip tests that rely on the bytes-vs-null distinction.
-    // The mitigation chosen for now: validate at deconstruct boundary
-    // that byte-field values are either non-empty hex OR explicit null,
-    // never empty string. See deconstruct.ts validateToken / lowerHex.
+    // KNOWN CAVEAT (steelman²⁸/²⁹, deferred): empty-string ('') and
+    // null produce DIFFERENT CBOR encodings (bstr(0) vs null), and
+    // therefore different content hashes. The wire-format round-trip
+    // tests (txf-wire-roundtrip) rely on '' being preserved through
+    // CAR serialization, so the encoding-level normalization is NOT
+    // applied here. The mitigation requires either a wire-format spec
+    // bump OR a pre-deconstruct normalization pass that the SDK
+    // chooses (always-bytes vs always-null per field). Until then, any
+    // ingestor of attacker-supplied genesis-data should normalize
+    // empty-string byte fields to null at the input boundary.
     if (byteFields.has(key) && typeof value === 'string') {
       result[key] = hexToBytes(value);
       continue;
