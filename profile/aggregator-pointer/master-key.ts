@@ -369,7 +369,11 @@ export function createMasterPrivateKey(
   const instance = Object.create(null) as MasterPrivateKey;
   Object.defineProperty(instance, 'bytes', {
     get(): Uint8Array {
-      return new Uint8Array(internalBytes);
+      // Steelman²⁷: use captured Uint8Array constructor so a late
+      // `globalThis.Uint8Array = HostileSubclass` cannot inject an
+      // attacker-controlled wrapper around the master key on the
+      // hot path to HKDF (key-derivation.ts:89 reads masterKey.bytes).
+      return new UINT8_ARRAY_CTOR(internalBytes);
     },
     enumerable: true,
     configurable: false,

@@ -20,6 +20,13 @@
 
 const REDACTED = '[REDACTED SecretKey]';
 
+// Steelman²⁷: capture Uint8Array constructor at module load so SecretKey
+// copy operations cannot be hijacked by late `globalThis.Uint8Array =
+// HostileSubclass` pollution. SecretKey holds the four derived secrets
+// returned by derivePointerKeyMaterial; both the constructor's defensive
+// copy and reveal()'s outgoing copy must use the captured reference.
+const UINT8_ARRAY_CTOR = Uint8Array;
+
 export class SecretKey {
   #bytes: Uint8Array;
   #label: string;
@@ -29,7 +36,7 @@ export class SecretKey {
     if (bytes.length === 0) {
       throw new RangeError('SecretKey cannot wrap empty bytes');
     }
-    this.#bytes = new Uint8Array(bytes);
+    this.#bytes = new UINT8_ARRAY_CTOR(bytes);
     this.#label = label;
   }
 
@@ -41,7 +48,7 @@ export class SecretKey {
     if (this.#zeroized) {
       throw new Error('SecretKey already zeroized; reveal() would return zeros');
     }
-    return new Uint8Array(this.#bytes);
+    return new UINT8_ARRAY_CTOR(this.#bytes);
   }
 
   get length(): number {
