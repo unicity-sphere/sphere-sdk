@@ -47,6 +47,7 @@ import type { FullIdentity } from '../types';
 import type { StorageProvider } from '../storage/storage-provider';
 import type { OracleProvider } from '../oracle';
 import { logger } from '../core/logger';
+import { hexToBytes as strictHexToBytesCore } from '../core/hex';
 
 import type { AggregatorClient } from '@unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase.js';
@@ -718,29 +719,16 @@ export async function buildProfilePointerLayer(
 // Utilities
 // =============================================================================
 
+// Steelman³⁵: thin wrapper that strips 0x prefix then delegates to
+// the consolidated core/hex.ts strict decoder. Local wrapper retained
+// because pointer-wiring callers may pass ethers-style 0x-prefixed
+// hex; core/hex.ts:hexToBytes deliberately does NOT auto-strip.
 function hexToBytes(hex: string): Uint8Array {
-  // Steelman³⁰ warning: strict validation — reject empty (after 0x
-  // strip) and non-hex characters. Previously `parseInt('zz', 16)
-  // === NaN` silently coerced to 0, producing a zero-padded buffer
-  // for a malformed master key.
   if (typeof hex !== 'string') {
     throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
   }
   const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
-  if (clean.length === 0) {
-    throw new RangeError('hexToBytes: empty hex string');
-  }
-  if (clean.length % 2 !== 0) {
-    throw new RangeError(`hex string has odd length: ${clean.length}`);
-  }
-  if (!/^[0-9a-fA-F]+$/.test(clean)) {
-    throw new RangeError('hexToBytes: contains non-hex characters');
-  }
-  const bytes = new Uint8Array(clean.length / 2);
-  for (let i = 0; i < clean.length; i += 2) {
-    bytes[i / 2] = Number.parseInt(clean.slice(i, i + 2), 16);
-  }
-  return bytes;
+  return strictHexToBytesCore(clean);
 }
 
 // =============================================================================

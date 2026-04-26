@@ -20,6 +20,7 @@
  */
 
 import { encryptProfileValue, decryptProfileValue } from './encryption.js';
+import { hexToBytesAllowEmpty as hexToBytes } from '../core/hex.js';
 
 // =============================================================================
 // Constants
@@ -758,35 +759,9 @@ function bytesToHex(bytes: Uint8Array): string {
   return hex.join('');
 }
 
-/**
- * Convert a hex string to a Uint8Array.
- *
- * Steelman⁵ remediation: throws on malformed input (odd length, non-hex
- * chars). The previous implementation silently truncated odd-length
- * input (`len = hex.length / 2`) and coerced parseInt NaN to 0,
- * producing a wrong-size or zero-padded byte array without any
- * indication of failure. Commit I's comments at the schnorr call sites
- * (`derivePublicKeyHex`, `buildSignedEvent`, `verifyEventAuthentic`)
- * assumed throwing semantics — those assumptions are now actually
- * guaranteed by this validator.
- *
- * Throws Error if `hex.length` is odd or any character is not in
- * [0-9a-fA-F]. Empty string is treated as valid (returns empty array).
- */
-function hexToBytes(hex: string): Uint8Array {
-  if (hex.length % 2 !== 0) {
-    throw new Error(`hexToBytes: odd-length hex string (length ${hex.length})`);
-  }
-  if (!/^[0-9a-fA-F]*$/.test(hex)) {
-    throw new Error('hexToBytes: hex string contains non-hex characters');
-  }
-  const len = hex.length / 2;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁵: hexToBytes consolidated to core/hex.ts:hexToBytesAllowEmpty
+// (imported at top of file). Empty input → 0-byte Uint8Array; throws
+// RangeError on odd-length or non-hex.
 
 /**
  * Test-only export of hexToBytes for direct regression coverage of

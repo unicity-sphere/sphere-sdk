@@ -28,6 +28,7 @@
  */
 
 import { logger } from '../core/logger.js';
+import { hexToBytes } from '../core/hex.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
   TokenStorageProvider,
@@ -1818,30 +1819,4 @@ export class ProfileTokenStorageProvider
 // Utility
 // =============================================================================
 
-/**
- * Convert a hex string to Uint8Array.
- *
- * Steelman³¹ warning: strict — rejects empty, odd-length, non-hex.
- * Used to decode identity.privateKey for OrbitDB attachment; a
- * malformed identity record would have produced a wrong-but-valid
- * key with the previous silent-truncation behavior.
- */
-function hexToBytes(hex: string): Uint8Array {
-  if (typeof hex !== 'string') {
-    throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
-  }
-  if (hex.length === 0) {
-    throw new RangeError('hexToBytes: empty hex string');
-  }
-  if (hex.length % 2 !== 0) {
-    throw new RangeError(`hexToBytes: odd-length hex string (${hex.length} chars)`);
-  }
-  if (!/^[0-9a-fA-F]+$/.test(hex)) {
-    throw new RangeError('hexToBytes: contains non-hex characters');
-  }
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
-}
+// Steelman³⁵: hexToBytes consolidated to core/hex.ts (top-of-file import).
