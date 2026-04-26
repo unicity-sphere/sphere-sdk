@@ -422,9 +422,22 @@ export async function runDaemon(
     console.error = (...a: unknown[]) => { stream.write('[ERROR] ' + a.map(String).join(' ') + '\n'); };
     console.warn = (...a: unknown[]) => { stream.write('[WARN] ' + a.map(String).join(' ') + '\n'); };
 
-    // Write PID file
+    // Write PID file with mode 0o600 (owner-read/write only).
+    // Steelman²⁸ warning: world-writable PID files allow a local attacker
+    // to overwrite the PID with an arbitrary user-owned process number,
+    // turning `daemon stop` into a kill-arbitrary-process gadget.
+    //
+    // Also write a sibling canary file with the daemon's exec path +
+    // start-time token; `daemon stop` cross-validates before signaling so
+    // a stale PID that was recycled by an unrelated process is not killed.
     ensureDir(config.pidFile);
-    fs.writeFileSync(config.pidFile, String(process.pid));
+    const pidString = String(process.pid);
+    fs.writeFileSync(config.pidFile, pidString, { mode: 0o600 });
+    try { fs.chmodSync(config.pidFile, 0o600); } catch { /* best-effort */ }
+    const canaryPath = config.pidFile + '.canary';
+    const canaryToken = `${process.execPath}\n${process.pid}\n${Date.now()}\n`;
+    fs.writeFileSync(canaryPath, canaryToken, { mode: 0o600 });
+    try { fs.chmodSync(canaryPath, 0o600); } catch { /* best-effort */ }
 
     // Disconnect from parent
     if (process.disconnect) process.disconnect();
@@ -561,8 +574,23 @@ function detachDaemon(args: string[], flags: DaemonFlags): void {
   // Build child args: replace --detach with --_forked, keep everything else
   const childArgs = ['daemon', 'start', '--_forked', ...args.filter(a => a !== '--detach')];
 
+  // Steelman²⁸ warning: `fork()` runs the entry-script via Node directly
+  // (no tsx). When the CLI is invoked from source via tsx and entry is a
+  // .ts file, the child dies immediately because Node can't execute .ts
+  // — the parent reports success and writes a misleading PID file.
+  // Detect this and refuse with a clear error.
+  const entryPath = process.argv[1] ?? '';
+  if (entryPath.endsWith('.ts') || entryPath.endsWith('.tsx')) {
+    console.error(
+      `--detach requires a Node-executable entry script; got "${entryPath}" ` +
+        `which Node cannot run directly. Either install the compiled CLI ` +
+        `(npm i / npm run build) or omit --detach to run in foreground.`,
+    );
+    process.exit(1);
+  }
+
   // Fork the child process
-  const child = fork(process.argv[1], childArgs, {
+  const child = fork(entryPath, childArgs, {
     detached: true,
     stdio: 'ignore',
   });
@@ -596,10 +624,52 @@ export async function stopDaemon(args: string[]): Promise<void> {
 
   const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
 
+  if (!Number.isInteger(pid) || pid <= 0) {
+    console.error(`Refusing to signal invalid PID "${pid}" from PID file.`);
+    process.exit(1);
+  }
+
   if (!isProcessAlive(pid)) {
     console.log(`Stale PID file (process ${pid} not running). Cleaning up.`);
     fs.unlinkSync(pidFile);
+    const canaryPath = pidFile + '.canary';
+    if (fs.existsSync(canaryPath)) fs.unlinkSync(canaryPath);
     return;
+  }
+
+  // Steelman²⁸ warning: cross-validate the canary before signaling.
+  // Without this, a stale PID file whose number got recycled by an
+  // unrelated user-owned process can be SIGTERM/SIGKILL'd by daemon stop.
+  const canaryPath = pidFile + '.canary';
+  if (!fs.existsSync(canaryPath)) {
+    console.error(
+      `Refusing to signal PID ${pid}: no canary file at ${canaryPath}. ` +
+        `The PID file may be stale or attacker-supplied. Inspect manually.`,
+    );
+    process.exit(1);
+  }
+  const canary = fs.readFileSync(canaryPath, 'utf8').split('\n');
+  const [canaryExec, canaryPidStr] = canary;
+  if (canaryPidStr !== String(pid)) {
+    console.error(
+      `Refusing to signal PID ${pid}: canary file references a different PID ` +
+        `(${canaryPidStr}). Inspect ${canaryPath} manually.`,
+    );
+    process.exit(1);
+  }
+  // Best-effort: check /proc/<pid>/exe to confirm it's our daemon.
+  // Linux-only; on macOS / other this is skipped silently.
+  try {
+    const procExe = fs.readlinkSync(`/proc/${pid}/exe`);
+    if (canaryExec && procExe !== canaryExec) {
+      console.error(
+        `Refusing to signal PID ${pid}: /proc/${pid}/exe (${procExe}) does ` +
+          `not match canary execPath (${canaryExec}). Stale PID likely recycled.`,
+      );
+      process.exit(1);
+    }
+  } catch {
+    // /proc not available (non-Linux) or permission denied — skip.
   }
 
   console.log(`Stopping daemon (PID ${pid})...`);
@@ -613,8 +683,9 @@ export async function stopDaemon(args: string[]): Promise<void> {
     await sleep(200);
     if (!isProcessAlive(pid)) {
       console.log('Daemon stopped.');
-      // Clean up PID file if it still exists
+      // Clean up PID file + canary if they still exist
       if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+      if (fs.existsSync(canaryPath)) fs.unlinkSync(canaryPath);
       return;
     }
   }

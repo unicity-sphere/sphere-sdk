@@ -587,7 +587,10 @@ const FAUCET_COIN_MAP: Record<string, string> = {
  *   invoice-pay, invoice-close, invoice-cancel, invoice-transfers, swap-deposit.
  */
 async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void> {
-  console.log('Syncing...');
+  // Steelman²⁸: route progress messages to STDERR, not stdout.
+  // Many CLI commands emit JSON to stdout (e.g., `cli tokens | jq`);
+  // mixing "Syncing..." into stdout corrupts the JSON pipeline.
+  process.stderr.write('Syncing...\n');
 
   // Step 1: Always fetch pending Nostr events through the multi-address
   // transport mux. This ensures DMs (swap proposals, invoice receipts,
@@ -609,7 +612,7 @@ async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void>
     try {
       const result = await sphere.payments.receive();
       if (result.transfers?.length > 0) {
-        console.log(`  Received ${result.transfers.length} transfer(s)`);
+        process.stderr.write(`  Received ${result.transfers.length} transfer(s)\n`);
       }
     } catch {
       // Tolerated
@@ -620,14 +623,14 @@ async function ensureSync(sphere: Sphere, mode: 'nostr' | 'full'): Promise<void>
     try {
       const result = await sphere.payments.sync();
       if (result.added > 0 || result.removed > 0) {
-        console.log(`  IPFS: +${result.added} added, -${result.removed} removed`);
+        process.stderr.write(`  IPFS: +${result.added} added, -${result.removed} removed\n`);
       }
     } catch {
       // Tolerated — IPFS may be unavailable
     }
   }
 
-  console.log('  Ready.');
+  process.stderr.write('  Ready.\n');
 }
 
 // =============================================================================
@@ -2059,7 +2062,11 @@ async function main() {
       }
 
       case 'clear': {
-        if (!flags['yes'] && !flags['y']) {
+        // Steelman²⁸ critical: `flags` was never declared — every invocation
+        // of `cli clear` previously crashed with ReferenceError. The
+        // codebase convention is `args.includes('--<name>')`.
+        const skipConfirm = args.includes('--yes') || args.includes('-y');
+        if (!skipConfirm) {
           const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
           const answer = await new Promise<string>((resolve) => {
             rl.question('This will permanently delete ALL wallet data (keys, tokens, history). Type "yes" to confirm: ', (a) => { rl.close(); resolve(a.trim()); });
@@ -3620,10 +3627,24 @@ async function main() {
 
       // === ENCRYPTION ===
       case 'encrypt': {
-        const [, data, password] = args;
-        if (!data || !password) {
-          console.error('Usage: encrypt <data> <password>');
+        const [, data, passwordArg] = args;
+        if (!data) {
+          console.error('Usage: encrypt <data> [password]   (omit password for interactive prompt)');
           process.exit(1);
+        }
+        // Steelman²⁸ warning: passwords on argv leak via ps -ef,
+        // /proc/<pid>/cmdline, and shell history. If supplied, mask
+        // the slot immediately and (when omitted) prompt on stderr.
+        let password = passwordArg;
+        if (passwordArg && passwordArg !== '***') {
+          const idx = args.indexOf(passwordArg);
+          if (idx > -1) args[idx] = '***';
+        }
+        if (!password) {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+          password = await new Promise<string>((resolve) => {
+            rl.question('Password: ', (a) => { rl.close(); resolve(a); });
+          });
         }
         const result = encrypt(data, password);
         console.log(JSON.stringify(result, null, 2));
@@ -3631,10 +3652,21 @@ async function main() {
       }
 
       case 'decrypt': {
-        const [, encrypted, password] = args;
-        if (!encrypted || !password) {
-          console.error('Usage: decrypt <encrypted-json> <password>');
+        const [, encrypted, passwordArg] = args;
+        if (!encrypted) {
+          console.error('Usage: decrypt <encrypted-json> [password]   (omit password for interactive prompt)');
           process.exit(1);
+        }
+        let password = passwordArg;
+        if (passwordArg && passwordArg !== '***') {
+          const idx = args.indexOf(passwordArg);
+          if (idx > -1) args[idx] = '***';
+        }
+        if (!password) {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+          password = await new Promise<string>((resolve) => {
+            rl.question('Password: ', (a) => { rl.close(); resolve(a); });
+          });
         }
         const encryptedData = JSON.parse(encrypted);
         const result = decrypt(encryptedData, password);
@@ -3644,10 +3676,16 @@ async function main() {
 
       // === WALLET PARSING ===
       case 'parse-wallet': {
-        const [, filePath, password] = args;
+        const [, filePath, passwordArg] = args;
         if (!filePath) {
-          console.error('Usage: parse-wallet <file> [password]');
+          console.error('Usage: parse-wallet <file> [password]   (omit password for interactive prompt)');
           process.exit(1);
+        }
+        // Steelman²⁸: same masking as encrypt/decrypt above.
+        let password = passwordArg;
+        if (passwordArg && passwordArg !== '***') {
+          const idx = args.indexOf(passwordArg);
+          if (idx > -1) args[idx] = '***';
         }
 
         if (!fs.existsSync(filePath)) {
@@ -3668,8 +3706,12 @@ async function main() {
           const isEncrypted = isTextWalletEncrypted(content);
 
           if (isEncrypted && !password) {
-            console.log('Wallet is encrypted. Provide password: parse-wallet <file> <password>');
-            process.exit(0);
+            // Steelman²⁸: prompt interactively rather than refusing,
+            // so the password never appears in argv.
+            const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+            password = await new Promise<string>((resolve) => {
+              rl.question('Wallet is encrypted. Password: ', (a) => { rl.close(); resolve(a); });
+            });
           }
 
           const result = password
@@ -3721,7 +3763,10 @@ async function main() {
         const wif = hexToWIF(privateKey);
         const addressInfo = generateAddressFromMasterKey(privateKey, 0);
 
-        if (flags['unsafe-print']) {
+        // Steelman²⁸ critical: same `flags` undefined bug as `clear` —
+        // crashed on every `--unsafe-print` invocation.
+        const unsafePrint = args.includes('--unsafe-print');
+        if (unsafePrint) {
           console.log(JSON.stringify({
             privateKey,
             publicKey,

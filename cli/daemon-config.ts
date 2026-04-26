@@ -3,6 +3,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 // =============================================================================
@@ -226,10 +227,49 @@ function validateAction(action: unknown, ruleIndex: number, actionIndex: number)
 // Loading
 // =============================================================================
 
+/**
+ * Steelman²⁸ critical: resolve daemon config paths against
+ * `~/.sphere-cli/` by default, NOT the CWD. The previous default
+ * (`./.sphere-cli/daemon.json`) made `bash:` actions an arbitrary-RCE
+ * vector via CWD-poisoning: a malicious user dropped a config in any
+ * shared directory and waited for a developer to `cd` there and run
+ * `cli daemon start`. The home-relative default is safe; CWD-relative
+ * is opt-in via explicit `--config <path>` or env override.
+ *
+ * Resolution order:
+ *   1. Explicit `configPath` argument (--config <path>) — used as-is.
+ *   2. SPHERE_CLI_HOME env var — joined with `daemon.json`.
+ *   3. `~/.sphere-cli/daemon.json` (HOME-relative).
+ *   4. Legacy CWD-relative `./.sphere-cli/daemon.json` — emits a loud
+ *      stderr warning before loading; printable-character `bash:` actions
+ *      from a CWD config are now also surfaced in the warning.
+ */
+function resolveDaemonConfigPath(explicitPath: string | undefined): {
+  path: string;
+  source: 'explicit' | 'env' | 'home' | 'cwd-legacy';
+} {
+  if (explicitPath) return { path: explicitPath, source: 'explicit' };
+  const envHome = process.env.SPHERE_CLI_HOME;
+  if (envHome) {
+    return { path: path.join(envHome, 'daemon.json'), source: 'env' };
+  }
+  const homeDefault = path.join(os.homedir(), '.sphere-cli', 'daemon.json');
+  if (fs.existsSync(homeDefault)) {
+    return { path: homeDefault, source: 'home' };
+  }
+  // Last-resort legacy fallback. The caller will warn before consuming.
+  return { path: DEFAULT_CONFIG_PATH, source: 'cwd-legacy' };
+}
+
 export function loadDaemonConfig(configPath?: string): DaemonConfig {
-  const filePath = configPath || DEFAULT_CONFIG_PATH;
+  const { path: filePath, source } = resolveDaemonConfigPath(configPath);
   if (!fs.existsSync(filePath)) {
-    throw new Error(`Config file not found: ${filePath}`);
+    throw new Error(
+      `Config file not found: ${filePath}` +
+        (source === 'cwd-legacy'
+          ? ' (no config in $HOME/.sphere-cli either; pass --config <path>)'
+          : ''),
+    );
   }
 
   const raw = fs.readFileSync(filePath, 'utf8');
@@ -240,7 +280,33 @@ export function loadDaemonConfig(configPath?: string): DaemonConfig {
     throw new Error(`Invalid JSON in config file: ${filePath}`);
   }
 
-  return validateDaemonConfig(parsed);
+  const cfg = validateDaemonConfig(parsed);
+
+  // Steelman²⁸: when loading from CWD-relative legacy default, warn
+  // loudly. If the config contains bash: actions, additionally print
+  // the action commands so the operator can spot CWD-poisoning attempts.
+  if (source === 'cwd-legacy') {
+    process.stderr.write(
+      `WARNING: loading daemon config from CWD-relative path "${filePath}". ` +
+        `This is a CWD-poisoning attack vector — drop a malicious config in any ` +
+        `shared directory and wait for a developer to cd there. Move config to ` +
+        `~/.sphere-cli/daemon.json or pass --config <path> explicitly.\n`,
+    );
+    const bashActions: string[] = [];
+    for (const rule of cfg.rules) {
+      for (const action of rule.actions) {
+        if (action.type === 'bash') bashActions.push(action.command);
+      }
+    }
+    if (bashActions.length > 0) {
+      process.stderr.write(
+        `WARNING: this CWD config contains ${bashActions.length} bash action(s). ` +
+          `Review before continuing:\n${bashActions.map((c) => `  - ${c}`).join('\n')}\n`,
+      );
+    }
+  }
+
+  return cfg;
 }
 
 // =============================================================================

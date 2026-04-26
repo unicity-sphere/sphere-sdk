@@ -116,6 +116,11 @@ export function defaultLegacyWalletProbe(
 ): boolean {
   const walletPath = path.join(dataDir, walletFileName);
   try {
+    // Steelman²⁸: use lstat to refuse to probe through symlinks. A
+    // symlinked wallet.json could redirect the probe to misclassify
+    // storage mode and route writes elsewhere.
+    const lst = fs.lstatSync(walletPath);
+    if (lst.isSymbolicLink()) return false;
     const st = fs.statSync(walletPath);
     return st.isFile() && st.size > 0;
   } catch {
@@ -134,6 +139,9 @@ export function defaultLegacyWalletProbe(
 export function defaultProfileWalletProbe(dataDir: string): boolean {
   const orbitdbPath = path.join(dataDir, 'orbitdb');
   try {
+    // Steelman²⁸: refuse to probe through symlinks (see legacy probe above).
+    const lst = fs.lstatSync(orbitdbPath);
+    if (lst.isSymbolicLink()) return false;
     const st = fs.statSync(orbitdbPath);
     return st.isDirectory();
   } catch {

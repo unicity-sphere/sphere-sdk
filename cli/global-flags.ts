@@ -275,6 +275,17 @@ export function validateLeadingGlobalFlags(argv: readonly string[]): string | nu
             `Did you forget the URL?`
           );
         }
+        // Steelman²⁸: warn loudly when http:// (cleartext) is used.
+        // CIDs being fetched leak token-storage references to any
+        // network observer; tampering bytes can't substitute content
+        // (CID hash check applies) but traffic analysis remains.
+        if (entry.toLowerCase().startsWith('http://') && !process.env.SPHERE_CLI_INSECURE_GATEWAY_OK) {
+          process.stderr.write(
+            `WARNING: ${name} '${entry}' uses cleartext http:// — gateway requests ` +
+              `(including CIDs) are visible to network observers. Use https:// or set ` +
+              `SPHERE_CLI_INSECURE_GATEWAY_OK=1 to silence this warning.\n`,
+          );
+        }
       }
       i = nextI;
       continue;
