@@ -513,8 +513,8 @@ describe('Pointer Category-G integration — §10.7 CAR-unavailable operator ove
 
   // ── G6: successful acceptCarLoss republishes BEFORE advancing (H7 step 4) ─
 
-  describe('G6 — successful acceptCarLoss republishes via publish() before advancing', () => {
-    it('calls publish() exactly once during the acceptCarLoss flow', async () => {
+  describe('G6 — successful acceptCarLoss republishes before advancing', () => {
+    it('runs the publish flow exactly once during the acceptCarLoss flow', async () => {
       setOverridesPermitted();
       const { layer, flagStore, fakeAggregator } = await buildLayer({
         config: { allowOperatorOverrides: true },
@@ -533,23 +533,27 @@ describe('Pointer Category-G integration — §10.7 CAR-unavailable operator ove
         );
       }
 
-      // SPY on layer.publish to verify republish-before-advance ran. We do NOT
-      // stub the implementation — the real publish() must run so the fake
-      // aggregator records a commitment and the subsequent bookkeeping is
-      // observable.
-      const publishSpy = vi.spyOn(layer, 'publish');
-
+      // Spy on the cidProducer callback — each publish iteration invokes it
+      // exactly once. Steelman¹⁹ refactor: acceptCarLoss now calls
+      // #publishInner directly (bypassing the public publish() method's
+      // shutdown-gate to prevent mid-operation aborts), so spying on
+      // layer.publish would observe zero calls. Spying on cidProducer is a
+      // black-box behavioral assertion — independent of which public method
+      // is on the call stack.
       const cid = cidForBytes(new TextEncoder().encode('car-loss-republish'));
-      const result = await layer.acceptCarLoss(3, async () => cid.bytes);
+      const cidProducer = vi.fn(async () => cid.bytes);
+
+      const result = await layer.acceptCarLoss(3, cidProducer);
 
       // H7 step 4: republish invoked exactly once — NOT zero (no "skip
       // republish" shortcut), NOT more than once (no accidental retry loop).
-      expect(publishSpy).toHaveBeenCalledTimes(1);
+      // Exactly one cidProducer call proves a single publish iteration.
+      expect(cidProducer).toHaveBeenCalledTimes(1);
 
       // And the fake aggregator observed two submitCommitment calls (one per
-      // side A/B of the republished pointer) — proves publish() actually ran
-      // through the full §7.3 submit flow, not a stubbed no-op.
-      expect(fakeAggregator.submitCalls).toBeGreaterThanOrEqual(2);
+      // side A/B of the republished pointer) — proves the full §7.3 submit
+      // flow ran, not a stubbed no-op.
+      expect(fakeAggregator.submitCalls).toBe(2);
 
       // PublishResult shape sanity check: version advanced (>= 1) and an
       // attempt was consumed. Exact values depend on reconcile internals,

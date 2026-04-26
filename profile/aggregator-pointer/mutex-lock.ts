@@ -23,6 +23,38 @@ export interface MutexAcquireOptions {
   timeoutMs?: number;
 }
 
+/**
+ * Steelman¹⁹ warning: validate timeoutMs at the boundary. NaN, Infinity,
+ * negative values, and non-numbers all degrade to broken loops:
+ *   - NaN → setTimeout(NaN) coerces to 1ms, deadline math produces NaN,
+ *     loop never times out, tight CPU spin forever
+ *   - Infinity → setTimeout clamps to ~24.8 days, deadline never trips
+ *   - 0 / negative → deadline already past on first check, mutex never
+ *     acquired but error message is misleading
+ * Reject all of these with PROTOCOL_ERROR so misuse fails loudly.
+ */
+function validateTimeoutMs(timeoutMs: number, mutexName: string): number {
+  if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `Mutex "${mutexName}" acquire: timeoutMs must be a positive finite number, got ${String(timeoutMs)}.`,
+    );
+  }
+  return timeoutMs;
+}
+
+/**
+ * Steelman¹⁹ warning: file-lock staleness must be ≥ the maximum time
+ * the publish mutex can be held in a single critical section. publishOnce
+ * loopDeadline = MAX_CUMULATIVE_RETRY_AFTER_MS (180s) + maxRetries × 8s
+ * = ~220s upper bound. Setting staleMs to 240s ensures proper-lockfile
+ * does not consider a busy publishOnce iteration "stale" and let a
+ * second process take the same lock (silent mutex violation). The
+ * cost is that crashed-process recovery takes ~4 minutes, which is
+ * acceptable for an interactive wallet.
+ */
+const FILE_LOCK_STALE_MS = 240_000;
+
 export interface MutexHandle {
   release(): Promise<void>;
   /**
@@ -76,7 +108,7 @@ class BrowserMutex implements PointerMutex {
   }
 
   async acquire(opts?: MutexAcquireOptions): Promise<MutexHandle> {
-    const timeoutMs = opts?.timeoutMs ?? 30_000;
+    const timeoutMs = validateTimeoutMs(opts?.timeoutMs ?? 30_000, this.#lockName);
 
     return new Promise<MutexHandle>((resolve, reject) => {
       let timedOut = false;
@@ -219,7 +251,7 @@ class NodeMutex implements PointerMutex {
   }
 
   async acquire(opts?: MutexAcquireOptions): Promise<MutexHandle> {
-    const timeoutMs = opts?.timeoutMs ?? 30_000;
+    const timeoutMs = validateTimeoutMs(opts?.timeoutMs ?? 30_000, this.#lockFilePath);
     const prim = await this.#getPrimitives();
 
     // Single deadline for the entire acquire (Step 1 + Step 2 combined).
@@ -293,7 +325,11 @@ class NodeMutex implements PointerMutex {
         );
       }
       try {
-        fileLockRelease = await prim.acquireFileLock(this.#lockFilePath, 8000);
+        // Steelman¹⁹ warning: staleMs raised from 8000 to FILE_LOCK_STALE_MS
+        // (240_000) so a busy publishOnce iteration cannot be considered
+        // stale by proper-lockfile mid-operation, which would let a second
+        // process take the same lock and silently violate mutual exclusion.
+        fileLockRelease = await prim.acquireFileLock(this.#lockFilePath, FILE_LOCK_STALE_MS);
         break;
       } catch (err: unknown) {
         const code = (err as NodeJS.ErrnoException)?.code;

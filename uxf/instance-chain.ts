@@ -35,6 +35,46 @@ import { computeElementHash } from './hash.js';
  */
 export type MutableInstanceChainIndex = Map<ContentHash, InstanceChainEntry>;
 
+/**
+ * Steelman¹⁹ critical: enforce non-decreasing version fields with strict
+ * type/finite/integer checks. Bare `<` comparisons silently pass for
+ * `undefined`, `null`, `NaN`, strings, mixed BigInt/Number — every
+ * non-numeric value bypasses the gate. This helper rejects all of them
+ * with INVALID_INSTANCE_CHAIN.
+ *
+ * Both sides are validated independently — a corrupt predecessor's
+ * version is caught here too (rather than only when the next instance
+ * is added, by which point chain reconstruction may already be broken).
+ */
+function assertVersionField(
+  fieldName: 'semantics' | 'representation',
+  newValue: unknown,
+  predecessorValue: unknown,
+): void {
+  if (typeof newValue !== 'number' || !Number.isFinite(newValue) || !Number.isInteger(newValue)) {
+    throw new UxfError(
+      'INVALID_INSTANCE_CHAIN',
+      `New instance has invalid ${fieldName}=${String(newValue)} (must be a finite integer)`,
+    );
+  }
+  if (
+    typeof predecessorValue !== 'number' ||
+    !Number.isFinite(predecessorValue) ||
+    !Number.isInteger(predecessorValue)
+  ) {
+    throw new UxfError(
+      'INVALID_INSTANCE_CHAIN',
+      `Predecessor has invalid ${fieldName}=${String(predecessorValue)} (must be a finite integer) — chain head is corrupt`,
+    );
+  }
+  if (newValue < predecessorValue) {
+    throw new UxfError(
+      'INVALID_INSTANCE_CHAIN',
+      `${fieldName === 'representation' ? 'Representation' : 'Semantics'} version regression: new instance has ${newValue} but predecessor has ${predecessorValue}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
@@ -114,25 +154,19 @@ export function addInstance(
     );
   }
 
-  // Rule 3: semantics version must be >= predecessor's.
-  if (newInstance.header.semantics < currentHeadElement.header.semantics) {
-    throw new UxfError(
-      'INVALID_INSTANCE_CHAIN',
-      `Semantics version regression: new instance has ${newInstance.header.semantics} but predecessor has ${currentHeadElement.header.semantics}`,
-    );
-  }
-
+  // Steelman¹⁹ critical #5: assertNonDecreasing must NEVER use raw `<` —
+  // `undefined`, `null`, `NaN`, strings, BigInts, and other non-finite
+  // values silently bypass the check (`undefined < N === false`,
+  // `NaN < N === false`, `'1' < 1 === false`). Coerce, validate as finite
+  // integer, then compare. Non-finite values throw INVALID_INSTANCE_CHAIN
+  // — fail-closed instead of fail-open-by-coercion.
+  assertVersionField('semantics', newInstance.header.semantics, currentHeadElement.header.semantics);
   // Rule 3b (steelman¹⁸): representation must be >= predecessor's.
   // An attacker could keep semantics constant while downgrading representation,
   // silently replacing the chain head with an older-format element. Consumers
   // using the 'latest' selection strategy would then receive a downgraded
   // element without any error signal.
-  if (newInstance.header.representation < currentHeadElement.header.representation) {
-    throw new UxfError(
-      'INVALID_INSTANCE_CHAIN',
-      `Representation version regression: new instance has ${newInstance.header.representation} but predecessor has ${currentHeadElement.header.representation}`,
-    );
-  }
+  assertVersionField('representation', newInstance.header.representation, currentHeadElement.header.representation);
 
   // Insert new instance into pool.
   const newHash = pool.put(newInstance);
@@ -488,7 +522,10 @@ export function rebuildInstanceChainIndex(
 
   // Step 3: Walk from each tail to head, building chain entries.
   for (const tailHash of tails) {
-    const tailElement = pool.get(tailHash)!;
+    // Steelman¹⁹: pool.get can return undefined under corrupt state;
+    // skip the tail rather than crashing the rebuild.
+    const tailElement = pool.get(tailHash);
+    if (!tailElement) continue;
 
     // Walk forward from tail to head using successor links.
     // The chain array is ordered head -> ... -> tail, so we build in
@@ -520,25 +557,57 @@ export function rebuildInstanceChainIndex(
         if (succs.length === 1) {
           const nextHash = succs[0];
           if (visited.has(nextHash)) break; // cycle protection
-          const nextElement = pool.get(nextHash)!;
+          // Steelman¹⁹ critical #6: pool.get() returns undefined for missing
+          // hashes; the previous `!` non-null assertion would crash with
+          // TypeError on corrupt/concurrent pool states. Soft-fail by
+          // breaking the walk instead.
+          const nextElement = pool.get(nextHash);
+          if (!nextElement) break;
           // Steelman¹⁸: enforce type equality along the chain. Two elements of
           // different types that share a predecessor hash (e.g., via an attacker-
           // controlled pool insertion) would otherwise merge into a mixed-type
           // chain here.  addInstance enforces the type gate on the write path;
           // rebuild must enforce it on the read path for consistency.
-          const tailElement = pool.get(chain[chain.length - 1]?.hash ?? tailHash)!;
+          const tailLink = chain[chain.length - 1];
+          const tailLookupHash = tailLink ? tailLink.hash : tailHash;
+          const tailElement = pool.get(tailLookupHash);
+          if (!tailElement) break;
           if (nextElement.type !== tailElement.type) break;
+          // Steelman¹⁹ warning: mirror addInstance's non-decreasing
+          // representation/semantics checks here too. An attacker-planted
+          // downgraded element in the pool (via merge / external CAR
+          // ingestion that bypasses addInstance) would otherwise be
+          // silently accepted into the chain. Wrap in try/catch so a
+          // corrupt link breaks the walk gracefully rather than aborting
+          // the entire rebuild.
+          try {
+            assertVersionField('semantics', nextElement.header.semantics, tailElement.header.semantics);
+            assertVersionField('representation', nextElement.header.representation, tailElement.header.representation);
+          } catch {
+            break;
+          }
           visited.add(nextHash);
           chain.push({ hash: nextHash, kind: nextElement.header.kind });
           currentHash = nextHash;
         } else {
           // Branch: each successor starts its own sub-chain.
-          const currentElement = pool.get(currentHash)!;
+          const currentElement = pool.get(currentHash);
+          if (!currentElement) return;
           for (const nextHash of succs) {
             if (visited.has(nextHash)) continue;
-            const nextElement = pool.get(nextHash)!;
+            const nextElement = pool.get(nextHash);
+            if (!nextElement) continue;
             // Same type-equality gate for branching paths.
             if (nextElement.type !== currentElement.type) continue;
+            // Steelman¹⁹: also enforce non-decreasing version fields on
+            // branched paths. Skip silently on corrupt links rather than
+            // adding a malformed branch to the chain.
+            try {
+              assertVersionField('semantics', nextElement.header.semantics, currentElement.header.semantics);
+              assertVersionField('representation', nextElement.header.representation, currentElement.header.representation);
+            } catch {
+              continue;
+            }
             walkBranch(nextHash, nextElement.header.kind, chain);
           }
           return;

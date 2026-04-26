@@ -138,6 +138,16 @@ async function publishOnce(
   let retriesConsumed = 0;
   let cumulativeRetryAfterMs = 0;
 
+  // Steelman¹⁹ note: clamp maxRetries to prevent overflow in loopDeadline
+  // arithmetic. AttemptOptions.maxRetries has no upper bound at the type
+  // level; passing Number.MAX_SAFE_INTEGER would overflow Date.now() +
+  // (huge × 4000 × 2) to Infinity, defeating the deadline gate.
+  const ATTEMPT_MAX_RETRIES_HARD_CAP = 100;
+  const safeMaxRetries =
+    !Number.isInteger(attemptOpts.maxRetries) || attemptOpts.maxRetries < 0
+      ? PUBLISH_RETRY_BUDGET
+      : Math.min(attemptOpts.maxRetries, ATTEMPT_MAX_RETRIES_HARD_CAP);
+
   // Steelman¹⁸ wall-clock deadline: count-based budget + cumulative
   // retry_after cap are each individually bounded, but an adversarial
   // aggregator alternating the two strategies could compound them.
@@ -145,7 +155,7 @@ async function publishOnce(
   const loopDeadline =
     Date.now() +
     MAX_CUMULATIVE_RETRY_AFTER_MS +
-    attemptOpts.maxRetries * PUBLISH_BACKOFF_MAX_MS * 2;
+    safeMaxRetries * PUBLISH_BACKOFF_MAX_MS * 2;
 
   // Steelman remediation (finding #7): read the marker ONCE before the
   // retry loop. Previously the marker was re-read on every iteration;
@@ -171,7 +181,7 @@ async function publishOnce(
     if (Date.now() > loopDeadline) {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.RETRY_EXHAUSTED,
-        `publishOnce exceeded wall-clock deadline after ${Date.now() - (loopDeadline - MAX_CUMULATIVE_RETRY_AFTER_MS - attemptOpts.maxRetries * PUBLISH_BACKOFF_MAX_MS * 2)}ms.`,
+        `publishOnce exceeded wall-clock deadline after ${Date.now() - (loopDeadline - MAX_CUMULATIVE_RETRY_AFTER_MS - safeMaxRetries * PUBLISH_BACKOFF_MAX_MS * 2)}ms.`,
         { v, retriesConsumed, cumulativeRetryAfterMs },
       );
     }
@@ -248,10 +258,10 @@ async function publishOnce(
 
       case 'retry_backoff': {
         // Row 11: HTTP 5xx without Retry-After — exponential backoff + consume budget.
-        if (retriesConsumed >= attemptOpts.maxRetries) {
+        if (retriesConsumed >= safeMaxRetries) {
           throw new AggregatorPointerError(
             AggregatorPointerErrorCode.RETRY_EXHAUSTED,
-            `publish at v=${v}: exhausted retry budget (${attemptOpts.maxRetries}) on HTTP 5xx backoff.`,
+            `publish at v=${v}: exhausted retry budget (${safeMaxRetries}) on HTTP 5xx backoff.`,
             { v },
           );
         }
@@ -265,11 +275,11 @@ async function publishOnce(
         // Rows 6, 7, 8: network-level failure on one or both sides.
         // We re-submit the whole v (aggregator idempotency on per-requestId
         // ensures the already-succeeded side is a no-op REQUEST_ID_EXISTS).
-        if (retriesConsumed >= attemptOpts.maxRetries) {
+        if (retriesConsumed >= safeMaxRetries) {
           // Surface as NETWORK_ERROR — triggers the BLOCKED classifier.
           throw new AggregatorPointerError(
             AggregatorPointerErrorCode.NETWORK_ERROR,
-            `publish at v=${v}: exhausted retry budget (${attemptOpts.maxRetries}) on network-error retry.`,
+            `publish at v=${v}: exhausted retry budget (${safeMaxRetries}) on network-error retry.`,
             { v },
           );
         }
@@ -323,7 +333,29 @@ export async function publishOnceAtVersion(
   try {
     // Step 2: check BLOCKED (§10.2). A blocked wallet cannot publish until
     // CLEAR conditions are satisfied externally.
-    const blocked = await isBlocked(flagStore);
+    //
+    // Steelman¹⁹ warning: a CORRUPT blocked-state record (invalid JSON,
+    // bad shape, unrecognized reason) is a fail-closed signal — publish
+    // must NOT proceed. Surface as UNREACHABLE_RECOVERY_BLOCKED with a
+    // 'corrupt' reason so the caller's error handling treats it as a
+    // blocked state (which it logically is) rather than a separate
+    // CORRUPT classification.
+    let blocked;
+    try {
+      blocked = await isBlocked(flagStore);
+    } catch (corruptErr) {
+      if (
+        corruptErr instanceof AggregatorPointerError &&
+        corruptErr.code === AggregatorPointerErrorCode.CORRUPT
+      ) {
+        throw new AggregatorPointerError(
+          AggregatorPointerErrorCode.UNREACHABLE_RECOVERY_BLOCKED,
+          'publish refused: BLOCKED-state record is corrupt — wallet must be unblocked via operator override before publish can resume.',
+          { cause: corruptErr },
+        );
+      }
+      throw corruptErr;
+    }
     if (blocked.blocked) {
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.UNREACHABLE_RECOVERY_BLOCKED,
@@ -410,20 +442,31 @@ export async function publishOnceAtVersion(
         // Previous order (clearMarker → persistLocalVersion) meant that if
         // persistLocalVersion threw, the marker was already gone — the next
         // publish would re-target the same resolvedV and re-burn it.
-        // With this order, a persistLocalVersion failure leaves the marker
-        // intact so the next publish detects the burned version via the
-        // Case 4 OTP-safe bump and advances past it without re-burning.
+        //
+        // Steelman¹⁹ critical #4: clearMarker is now CONDITIONAL on
+        // persistLocalVersion success. F.21 made both blocks unconditional
+        // so the marker was cleared even when persistLocalVersion threw,
+        // negating the protective intent. With the gate, a persist failure
+        // leaves the marker intact; on the next publish, resolvePublishVersion
+        // detects the stale marker via Case 4 OTP-safe bump and advances past
+        // the burned version without re-burning it.
         try {
           await input.persistLocalVersion(resolvedV);
           bookkeeping.localVersionPersisted = true;
         } catch (e) {
           bookkeeping.failures.push(`persistLocalVersion threw: ${String(e)}`);
         }
-        try {
-          await clearMarker(flagStore);
-          bookkeeping.markerCleared = true;
-        } catch (e) {
-          bookkeeping.failures.push(`clearMarker threw: ${String(e)}`);
+        if (bookkeeping.localVersionPersisted) {
+          try {
+            await clearMarker(flagStore);
+            bookkeeping.markerCleared = true;
+          } catch (e) {
+            bookkeeping.failures.push(`clearMarker threw: ${String(e)}`);
+          }
+        } else {
+          bookkeeping.failures.push(
+            'clearMarker SKIPPED — persistLocalVersion failed; marker preserved so next publish can detect the burned version via Case 4 OTP-safe bump.',
+          );
         }
         // Attach diagnostics to the thrown error so the caller / UI / telemetry
         // can surface partial-failure warnings. Using `details` (the existing

@@ -46,6 +46,11 @@
  */
 
 import type { ContentHash, UxfElement } from './types';
+import {
+  ELEMENT_TYPE_INCLUSION_PROOF,
+  ELEMENT_TYPE_TOKEN_ROOT,
+  ELEMENT_TYPE_TRANSACTION,
+} from './types';
 import { computeElementHash } from './hash';
 
 // =============================================================================
@@ -113,7 +118,7 @@ function getTokenRootTxns(
   pool: ReadonlyMap<ContentHash, UxfElement>,
 ): readonly ContentHash[] | null {
   const element = pool.get(rootHash);
-  if (!element || element.type !== 'token-root') return null;
+  if (!element || element.type !== ELEMENT_TYPE_TOKEN_ROOT) return null;
   const txns = element.children.transactions;
   if (!Array.isArray(txns)) return null;
   // All entries must be ContentHash (strings) — the types allow
@@ -139,7 +144,7 @@ function countCommittedTxns(
   let n = 0;
   for (const h of txnHashes) {
     const tx = pool.get(h);
-    if (!tx || tx.type !== 'transaction') continue;
+    if (!tx || tx.type !== ELEMENT_TYPE_TRANSACTION) continue;
     const proof = tx.children.inclusionProof;
     // Steelman¹⁸: a dangling hash string (not in pool) must NOT count as
     // "committed" — an attacker could craft a transaction with
@@ -149,7 +154,7 @@ function countCommittedTxns(
     // Require the proof element to exist in the pool and be the right type.
     if (typeof proof !== 'string') continue;
     const proofEl = pool.get(proof);
-    if (!proofEl || proofEl.type !== 'inclusion-proof') continue;
+    if (!proofEl || proofEl.type !== ELEMENT_TYPE_INCLUSION_PROOF) continue;
     n++;
   }
   return n;
@@ -268,9 +273,19 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
       const commonLen = Math.min(a.txns.length, b.txns.length);
       for (let k = 0; k < commonLen; k++) {
         if (a.txns[k] === b.txns[k]) continue;
-        // Different hash at position k — OK only if same-core-
-        // different-proof (Rule 4 enrichment candidate).
-        if (sameCoreDifferentProof(a.txns[k], b.txns[k], pool)) continue;
+        // Steelman¹⁹ critical #6: sameCoreDifferentProof is the same
+        // attack surface as tryEnrichLongestWithProofs — an attacker who
+        // supplies a fake `sameCore`-pair with a fabricated inclusion-
+        // proof reference can SUPPRESS the `divergent` classification
+        // (the operator-alert outcome) and force a `longest-valid`
+        // resolution where the legitimate result was a fork. Until an
+        // oracle gate verifies the alt's inclusion-proof cryptographically,
+        // treat ANY pairwise hash mismatch as divergent.
+        //
+        // To re-enable: wire OracleProvider into resolveTokenRoot, call
+        // oracle.verifyInclusionProof on both sides of the candidate
+        // pair, and only allow the sameCoreDifferentProof exemption
+        // when both proofs verify.
         foundDivergent = true;
         break;
       }
@@ -485,7 +500,9 @@ function altProofIsStructurallyValid(
  *     are identical by genesis invariant; tail-only nametags would
  *     survive as the winner already carries them.
  */
-function tryEnrichLongestWithProofs(
+// Underscore prefix per project lint rule — function preserved for the
+// oracle-gate re-enable path but not currently called.
+function _tryEnrichLongestWithProofs(
   winner: {
     readonly rootHash: ContentHash;
     readonly txns: readonly ContentHash[];
@@ -630,9 +647,13 @@ export function isEnrichedSyntheticRoot(element: UxfElement): boolean {
 // Test-only exports
 // =============================================================================
 
+// Steelman¹⁹ warning #7: tryEnrichLongestWithProofs is intentionally NOT
+// re-exported via __internal until the oracle validation gate is wired.
+// A consumer importing it directly (test or downstream module) would
+// bypass the call-site disable and re-introduce the synthetic-root
+// injection vulnerability that disabling the call site closed.
 export const __internal = {
   getTokenRootTxns,
   countCommittedTxns,
   isPrefix,
-  tryEnrichLongestWithProofs,
 };

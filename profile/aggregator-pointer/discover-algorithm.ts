@@ -97,7 +97,27 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
     fetchCar,
   } = input;
   const timeoutMs = input.timeoutMs ?? PROBE_REQUEST_TIMEOUT_MS;
-  const walkbackLimit = input.walkbackLimit ?? DISCOVERY_CORRUPT_WALKBACK;
+  // Steelman¹⁹ warning: hard cap walkbackLimit so that arithmetic in the
+  // deadline calculation cannot overflow to Infinity (which would silently
+  // disable the deadline gate). The 4096 cap matches the SPEC §13
+  // acceptCorruptStreak documented ceiling and is enforced here as the
+  // arithmetic limit; callers passing larger values (or non-integers,
+  // negatives, NaN) get a clean PROTOCOL_ERROR rather than a stealthy
+  // unbounded deadline.
+  const WALKBACK_HARD_CEILING = 4096;
+  const requestedWalkback = input.walkbackLimit ?? DISCOVERY_CORRUPT_WALKBACK;
+  if (
+    !Number.isInteger(requestedWalkback) ||
+    requestedWalkback < 0 ||
+    requestedWalkback > WALKBACK_HARD_CEILING
+  ) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `Discovery: walkbackLimit must be an integer in [0, ${WALKBACK_HARD_CEILING}], got ${String(requestedWalkback)}.`,
+      { walkbackLimit: requestedWalkback },
+    );
+  }
+  const walkbackLimit = requestedWalkback;
   // Steelman¹⁸: bound total discovery time so the mutex is not held forever.
   // Default upper bound: phase ceilings × per-request timeout.
   //   Phase 1: log2(HARD_CEILING / INITIAL) ≈ 12 + Phase 2: 22 ≈ 34 probes

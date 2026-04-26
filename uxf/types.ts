@@ -74,6 +74,24 @@ export type UxfElementType =
   | 'smt-path';
 
 /**
+ * Steelman¹⁹: canonical UxfElementType string-literal constants.
+ * Hardcoded literals across the codebase risk silent desync on rename
+ * — reference these constants instead of bare strings.
+ */
+export const ELEMENT_TYPE_TOKEN_ROOT = 'token-root' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_GENESIS = 'genesis' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_GENESIS_DATA = 'genesis-data' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_TRANSACTION = 'transaction' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_TRANSACTION_DATA = 'transaction-data' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_INCLUSION_PROOF = 'inclusion-proof' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_AUTHENTICATOR = 'authenticator' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_UNICITY_CERTIFICATE = 'unicity-certificate' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_PREDICATE = 'predicate' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_TOKEN_STATE = 'token-state' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_TOKEN_COIN_DATA = 'token-coin-data' as const satisfies UxfElementType;
+export const ELEMENT_TYPE_SMT_PATH = 'smt-path' as const satisfies UxfElementType;
+
+/**
  * Maps UxfElementType string tags to unsigned integer type IDs.
  * Values are taken from SPECIFICATION Section 2.1.
  */

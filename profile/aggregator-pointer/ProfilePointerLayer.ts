@@ -261,7 +261,15 @@ export class ProfilePointerLayer {
   }
 
   async #recoverLatestInner(): Promise<RecoverResult | null> {
-    const discovery = await this.discoverLatestVersion();
+    // Steelman¹⁹ critical #3: call the INNER discoverLatestVersion helper
+    // directly. Going through the public method would re-run
+    // #assertNotShuttingDown — if shutdown() fires after recoverLatest's
+    // own assert passed but before this inner call, the inner assert
+    // would throw PUBLISH_BUSY mid-recovery, surfacing a confusing
+    // "called after shutdown() started" error and leaving the recover
+    // half-completed.  The OUTER recoverLatest tracking via #tracked()
+    // already covers this composite operation.
+    const discovery = await this.#discoverLatestVersionInner();
     if (discovery.validV === 0) return null;
     const cid = await this.#init.resolveRemoteCid(discovery.validV);
     return { cid, version: discovery.validV };
@@ -317,15 +325,46 @@ export class ProfilePointerLayer {
   /**
    * Query the persistent BLOCKED state (§10.2). Returns true iff
    * BLOCKED_FLAG_KEY is set.
+   *
+   * Steelman¹⁹ warning: a CORRUPT record (invalid JSON, bad shape, or
+   * unrecognized reason) is treated as BLOCKED for the purpose of read-
+   * API queries. Read APIs are pure observations — letting CORRUPT
+   * propagate would change a stable contract (always returns boolean) into
+   * a throwing API and break consumers (UIs, telemetry, the publish
+   * pre-check). The publish path still routes CORRUPT through the proper
+   * error code via `setBlocked`'s catch-and-overwrite recovery, so this
+   * wrapper does not mask the CORRUPT classification — it just keeps the
+   * read API predictable.
    */
   async isPublishBlocked(): Promise<boolean> {
-    const state = await readBlockedState(this.#init.flagStore);
-    return state.blocked;
+    try {
+      const state = await readBlockedState(this.#init.flagStore);
+      return state.blocked;
+    } catch (err) {
+      if (err instanceof AggregatorPointerError && err.code === AggregatorPointerErrorCode.CORRUPT) {
+        return true; // fail-closed: treat corrupt record as blocked
+      }
+      throw err;
+    }
   }
 
-  /** Returns the full BlockedState including reason and setAt timestamp. */
+  /**
+   * Returns the full BlockedState including reason and setAt timestamp.
+   *
+   * Steelman¹⁹ warning: on CORRUPT, returns a synthetic state with
+   * `reason='corrupt'` and `setAt=0` so callers (UIs, telemetry) get a
+   * stable shape. Operators investigating a corrupt block flag can read
+   * the underlying record directly via the FlagStore.
+   */
   async getBlockedState(): Promise<BlockedState> {
-    return readBlockedState(this.#init.flagStore);
+    try {
+      return await readBlockedState(this.#init.flagStore);
+    } catch (err) {
+      if (err instanceof AggregatorPointerError && err.code === AggregatorPointerErrorCode.CORRUPT) {
+        return { blocked: true, reason: 'corrupt', setAt: 0 };
+      }
+      throw err;
+    }
   }
 
   // ── clearBlocked ─────────────────────────────────────────────────────────
@@ -386,7 +425,13 @@ export class ProfilePointerLayer {
     // Step 1: H7 wall-clock gate.
     await assertAcceptCarLossEligible(this.#init.flagStore, version);
     // Step 2: MANDATORY republish BEFORE advance (H7 step 4).
-    const result = await this.publish(cidProducer);
+    //
+    // Steelman¹⁹ critical #3: call the INNER publish helper directly so the
+    // public method's #assertNotShuttingDown does not fire mid-acceptCarLoss
+    // if shutdown() was triggered after the outer assert but before this
+    // inner call. The outer acceptCarLoss is already tracked via #tracked();
+    // the publish work is part of the same composite operation.
+    const result = await this.#publishInner(cidProducer);
     // Step 3: clear the CAR-loss ledger for this version now that we've
     // successfully republished.
     await clearAttempts(this.#init.flagStore, version);

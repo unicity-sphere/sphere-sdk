@@ -24,6 +24,15 @@ import { type MasterPrivateKey, assertAuthorizedMasterKey } from './master-key.j
 import { SecretKey } from './secret-key.js';
 import type { Side, PointerVersion } from './types.js';
 
+// Steelman¹⁹: cache Uint8Array.prototype.fill at module load. Defends
+// against late prototype-pollution turning every secret-wipe into a
+// no-op or a leak. All wipes in this module must use safeWipe().
+const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
+function safeWipe(buf: Uint8Array | null | undefined): void {
+  if (!buf) return;
+  TYPED_ARRAY_FILL.call(buf, 0);
+}
+
 export interface PointerKeyMaterial {
   readonly pointerSecret: SecretKey;
   readonly signingSeed: SecretKey;
@@ -43,39 +52,61 @@ export interface PointerKeyMaterial {
 export function derivePointerKeyMaterial(masterKey: MasterPrivateKey): PointerKeyMaterial {
   assertAuthorizedMasterKey(masterKey);
 
-  // masterKey.bytes now returns a DEFENSIVE COPY (steelman remediation).
-  // Wipe it post-HKDF to narrow heap residue window.
+  // masterKey.bytes returns a DEFENSIVE COPY. Wipe it post-HKDF to narrow
+  // heap residue window.
   const walletPrivateKey = masterKey.bytes;
   // Declare intermediates outside the try so the catch block can zero them on
-  // any partial-derivation error path (steelman¹⁸ finding: expand() throwing
-  // mid-chain left already-derived bytes abandoned to GC without zeroing).
+  // any partial-derivation error path.
   let pointerSecretBytes: Uint8Array | null = null;
   let signingSeedBytes: Uint8Array | null = null;
   let xorSeedBytes: Uint8Array | null = null;
   let padSeedBytes: Uint8Array | null = null;
+  // Steelman¹⁹ warning #5: track each SecretKey wrapper as it's built so
+  // a constructor failure mid-sequence can zeroize the partially-built
+  // ones (each holds a defensive copy of the bare bytes).
+  const builtKeys: SecretKey[] = [];
   try {
     pointerSecretBytes = hkdf(sha256, walletPrivateKey, new Uint8Array(0), PROFILE_POINTER_HKDF_INFO, 32);
     signingSeedBytes = expand(sha256, pointerSecretBytes, SIGNING_SEED_INFO, 32);
     xorSeedBytes = expand(sha256, pointerSecretBytes, XOR_SEED_INFO, 32);
     padSeedBytes = expand(sha256, pointerSecretBytes, PAD_SEED_INFO, 32);
-    return {
-      pointerSecret: new SecretKey(pointerSecretBytes, 'pointerSecret'),
-      signingSeed: new SecretKey(signingSeedBytes, 'signingSeed'),
-      xorSeed: new SecretKey(xorSeedBytes, 'xorSeed'),
-      padSeed: new SecretKey(padSeedBytes, 'padSeed'),
-    };
+
+    // Build SecretKey wrappers SEQUENTIALLY (not via object-literal
+    // evaluation order which could short-circuit on partial throw). Each
+    // wrapper copies the bytes via SecretKey(bytes) → new Uint8Array(bytes).
+    const pointerSecret = new SecretKey(pointerSecretBytes, 'pointerSecret');
+    builtKeys.push(pointerSecret);
+    const signingSeed = new SecretKey(signingSeedBytes, 'signingSeed');
+    builtKeys.push(signingSeed);
+    const xorSeed = new SecretKey(xorSeedBytes, 'xorSeed');
+    builtKeys.push(xorSeed);
+    const padSeed = new SecretKey(padSeedBytes, 'padSeed');
+    builtKeys.push(padSeed);
+
+    // Steelman¹⁹ critical #1: SUCCESS-PATH wipe of bare buffers. Each
+    // SecretKey constructor took its own copy; the bare Uint8Arrays here
+    // are now redundant copies of derived key material that must NOT be
+    // abandoned to GC. Without this, every successful derivation leaks
+    // four 32-byte derived secrets.
+    safeWipe(pointerSecretBytes);
+    safeWipe(signingSeedBytes);
+    safeWipe(xorSeedBytes);
+    safeWipe(padSeedBytes);
+
+    return { pointerSecret, signingSeed, xorSeed, padSeed };
   } catch (err) {
-    // Zero any partially-derived buffers before re-throwing.
-    // SecretKey constructor takes ownership on the success path; these
-    // bare Uint8Arrays are only present here when an error interrupted
-    // derivation before wrapping completed.
-    pointerSecretBytes?.fill(0);
-    signingSeedBytes?.fill(0);
-    xorSeedBytes?.fill(0);
-    padSeedBytes?.fill(0);
+    // Zero any partially-derived bare buffers.
+    safeWipe(pointerSecretBytes);
+    safeWipe(signingSeedBytes);
+    safeWipe(xorSeedBytes);
+    safeWipe(padSeedBytes);
+    // Zero any SecretKey wrappers that were built before the exception.
+    for (const k of builtKeys) {
+      try { k.zeroize(); } catch { /* noop — best effort */ }
+    }
     throw err;
   } finally {
-    walletPrivateKey.fill(0);
+    safeWipe(walletPrivateKey);
   }
 }
 
@@ -116,7 +147,7 @@ export function deriveStateHashDigest(xorSeed: SecretKey, side: Side, v: Pointer
   try {
     return sha256(concat(seed, new Uint8Array([side]), be32(v), utf8('state')));
   } finally {
-    seed.fill(0);
+    safeWipe(seed);
   }
 }
 
@@ -129,7 +160,7 @@ export function deriveXorKey(xorSeed: SecretKey, side: Side, v: PointerVersion):
   try {
     return sha256(concat(seed, new Uint8Array([side]), be32(v), utf8('xor')));
   } finally {
-    seed.fill(0);
+    safeWipe(seed);
   }
 }
 
@@ -154,6 +185,6 @@ export function derivePaddingBytes(padSeed: SecretKey, v: PointerVersion, cidLen
   try {
     return expand(sha256, seed, concat(be32(v), utf8('pad')), padLength);
   } finally {
-    seed.fill(0);
+    safeWipe(seed);
   }
 }

@@ -16,6 +16,36 @@
 
 import { AggregatorPointerError, AggregatorPointerErrorCode } from './errors.js';
 
+// Steelman¹⁹: cache Uint8Array.prototype.fill at module load — defends
+// every wipe against late prototype-pollution. Late-loaded malicious
+// scripts cannot intercept .fill() calls that resolve through this
+// captured reference.
+const TYPED_ARRAY_FILL = Uint8Array.prototype.fill;
+function safeWipe(buf: Uint8Array | null | undefined): void {
+  if (!buf) return;
+  TYPED_ARRAY_FILL.call(buf, 0);
+}
+
+/**
+ * Cross-realm safe SharedArrayBuffer detection.
+ *
+ * `instanceof SharedArrayBuffer` checks only the local realm. A SAB
+ * originating from another realm (iframe, Worker, vm.runInContext,
+ * MessageChannel) is not `instanceof` the local SharedArrayBuffer and
+ * would bypass the gate. `Object.prototype.toString` returns the
+ * `[Symbol.toStringTag]` value which is `'SharedArrayBuffer'` for any
+ * SAB regardless of originating realm (per ECMAScript spec).
+ */
+function isSharedArrayBufferLike(buffer: ArrayBufferLike | undefined | null): boolean {
+  if (buffer === undefined || buffer === null) return false;
+  // Fast path: same-realm instanceof.
+  if (typeof SharedArrayBuffer !== 'undefined' && buffer instanceof SharedArrayBuffer) {
+    return true;
+  }
+  // Cross-realm fallback: toStringTag check.
+  return Object.prototype.toString.call(buffer) === '[object SharedArrayBuffer]';
+}
+
 declare const _brand: unique symbol;
 
 export interface MasterPrivateKey {
@@ -165,7 +195,11 @@ export function createMasterPrivateKey(
   // Worker between the denylist check and the internal copy (TOCTOU).  An
   // attacker could pass a benign value through the denylist gate and then
   // swap in a weak scalar (all-zero, N, …) before the copy executes.
-  if (bytes.buffer instanceof SharedArrayBuffer) {
+  //
+  // Steelman¹⁹ critical #2: use cross-realm-safe detection. `instanceof`
+  // is realm-scoped — a SAB from an iframe / Worker / vm context is NOT
+  // `instanceof` the local SharedArrayBuffer and would slip through.
+  if (isSharedArrayBufferLike(bytes.buffer)) {
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
       'MasterPrivateKey input must not be backed by SharedArrayBuffer — ' +
@@ -193,7 +227,7 @@ export function createMasterPrivateKey(
   const denied = isDenylistedMasterKey(internalBytes, network);
   const isKat = isCanonicalKatVector(internalBytes);
   if (denied) {
-    internalBytes.fill(0);
+    safeWipe(internalBytes);
     throw new AggregatorPointerError(
       AggregatorPointerErrorCode.PROTOCOL_ERROR,
       isKat
@@ -214,7 +248,7 @@ export function createMasterPrivateKey(
   });
   Object.defineProperty(instance, 'zeroize', {
     value: function zeroize(): void {
-      internalBytes.fill(0);
+      safeWipe(internalBytes);
       registry.delete(instance);
     },
     enumerable: true,
