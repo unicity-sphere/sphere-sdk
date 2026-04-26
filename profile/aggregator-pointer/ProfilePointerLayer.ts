@@ -41,6 +41,7 @@ import {
 } from './car-loss-tracker.js';
 import {
   clearBlocked as clearBlockedFlag,
+  hasUnrecognizedBlockedReason,
   isBlocked as readBlockedState,
   setBlocked,
 } from './blocked-state.js';
@@ -186,10 +187,20 @@ export class ProfilePointerLayer {
    * Node publish able to leak its proper-lockfile mutex for up to
    * 8 seconds (until proper-lockfile's stale detector reclaimed it).
    *
-   * `shutdown()` waits for all tracked operations to settle. It does
-   * NOT cancel them — cancellation would require unwinding partial
-   * publish state which is unsafe. Callers that need a hard timeout
-   * should wrap in `Promise.race([layer.shutdown(), timeoutPromise])`.
+   * `shutdown()` waits for all tracked operations to settle, with a
+   * hard internal deadline (default 30 s) so a single hung tracked
+   * promise (e.g. an aggregator-probe stuck on an unresponsive socket
+   * with no per-call timeout) cannot block the entire teardown
+   * indefinitely. Steelman⁴⁶ HIGH: previously, shutdown() relied on
+   * callers wrapping in their own Promise.race against a timeout —
+   * but no caller did, so process tear-down could hang forever.
+   *
+   * After the deadline expires, shutdown() returns; any still-tracked
+   * operations are abandoned (they may run to completion, but the
+   * surrounding storage provider can proceed with disconnect — pin/db
+   * close paths are idempotent with respect to ghost continuations).
+   * The caller can pass `{ timeoutMs: ... }` to override; pass `null`
+   * to disable the deadline (legacy behavior).
    *
    * Steelman¹⁸: sets #shuttingDown to block new operations from being
    * enqueued during the drain. Concurrent calls both participate in
@@ -197,12 +208,42 @@ export class ProfilePointerLayer {
    * Safe to call multiple times — subsequent calls drain any operations
    * enqueued after the previous shutdown() completed.
    */
-  async shutdown(): Promise<void> {
+  async shutdown(opts?: { timeoutMs?: number | null }): Promise<void> {
     this.#shuttingDown = true;
-    // Drain in a loop: new operations can complete and self-remove while
-    // we await, so re-check until the set is empty.
+    const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
+    const timeoutMs =
+      opts?.timeoutMs === null
+        ? null
+        : Math.max(0, opts?.timeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS);
+    const drainStart = Date.now();
     while (this.#inFlight.size > 0) {
-      await Promise.allSettled([...this.#inFlight]);
+      if (timeoutMs !== null) {
+        const elapsed = Date.now() - drainStart;
+        const remaining = timeoutMs - elapsed;
+        if (remaining <= 0) {
+          // Steelman⁴⁶: deadline tripped — log and return. The set may
+          // still contain promises that will eventually settle in the
+          // background; their #inFlight self-removal handler is harmless
+          // after the layer is shut down (Set.delete on absent key noops).
+          // We deliberately do NOT clear #inFlight: a caller observing
+          // it post-shutdown can still see what was abandoned.
+          break;
+        }
+        let drainTimer: ReturnType<typeof setTimeout> | undefined;
+        const timeoutPromise = new Promise<void>((resolve) => {
+          drainTimer = setTimeout(() => resolve(), remaining);
+          if (typeof drainTimer === 'object' && drainTimer !== null && 'unref' in drainTimer) {
+            (drainTimer as { unref: () => void }).unref();
+          }
+        });
+        try {
+          await Promise.race([Promise.allSettled([...this.#inFlight]), timeoutPromise]);
+        } finally {
+          if (drainTimer !== undefined) clearTimeout(drainTimer);
+        }
+      } else {
+        await Promise.allSettled([...this.#inFlight]);
+      }
     }
     // Steelman⁴⁰ note: drop the probe-fingerprint history so a consumer
     // holding a layer reference doesn't pin ~33KB of integers per
@@ -393,12 +434,31 @@ export class ProfilePointerLayer {
    * cleared automatically by recoverLatest; this method is for operator-
    * initiated recovery when automatic detection is insufficient.
    *
-   * @throws AggregatorPointerError(CAPABILITY_DENIED) if overrides disabled.
+   * Steelman⁴⁶ MEDIUM (forward-compat downgrade): when the persisted
+   * BLOCKED record is well-formed in shape but its `reason` is not
+   * recognized by this SDK build (e.g. a newer SDK wrote it and the
+   * user rolled back), allow clearing WITHOUT operator override. A
+   * recognized BLOCKED state still requires the override. This trades a
+   * small attacker-injected-unknown-reason gap (which is already gated
+   * by storage-write access — equivalent to setting any recognized
+   * reason that this SDK could clear) for a real recovery path on
+   * downgrade.
+   *
+   * @throws AggregatorPointerError(CAPABILITY_DENIED) if overrides disabled
+   *   AND the persisted reason is recognized (or there is no persisted
+   *   record at all — calling clearBlocked without a real block is a
+   *   no-op but should still respect the capability gate).
    */
   async clearBlocked(): Promise<void> {
     this.#assertNotShuttingDown('clearBlocked');
-    assertOperatorOverridesAllowed(this.#config, 'clearBlocked');
-    return this.#tracked(clearBlockedFlag(this.#init.flagStore));
+    return this.#tracked(this.#clearBlockedInner());
+  }
+  async #clearBlockedInner(): Promise<void> {
+    const isUnrecognized = await hasUnrecognizedBlockedReason(this.#init.flagStore);
+    if (!isUnrecognized) {
+      assertOperatorOverridesAllowed(this.#config, 'clearBlocked');
+    }
+    await clearBlockedFlag(this.#init.flagStore);
   }
 
   // ── clearPendingMarker ───────────────────────────────────────────────────

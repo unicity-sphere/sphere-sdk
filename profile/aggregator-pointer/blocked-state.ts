@@ -243,6 +243,49 @@ export async function clearBlocked(store: FlagStore): Promise<void> {
 }
 
 /**
+ * Steelman⁴⁶ MEDIUM: forward-compat probe.
+ *
+ * Returns `true` iff the persisted BLOCKED record exists, is well-formed
+ * in shape (blocked === true, string reason, number setAt), but the
+ * `reason` field is not in `KNOWN_BLOCKED_REASONS`. This is the canonical
+ * "downgrade footgun" shape: a newer SDK wrote a reason this build
+ * doesn't recognize, and the user has rolled back. `isBlocked()` throws
+ * CORRUPT in that case — without this probe, the only way to clear it
+ * would be `allowOperatorOverrides=true`, which most production wallets
+ * disable.
+ *
+ * Returns `false` if no record exists, the record JSON is malformed, the
+ * shape is wrong, or the reason IS recognized. The caller should still
+ * require operator override in those cases.
+ *
+ * Read-only — does not mutate any state.
+ */
+export async function hasUnrecognizedBlockedReason(store: FlagStore): Promise<boolean> {
+  let raw: string | null;
+  try {
+    raw = await store.get(BLOCKED_KEY);
+  } catch {
+    // Steelman⁴⁶: on read failure, return false so the caller's
+    // existing operator-override gate runs as before — this probe is
+    // a forward-compat affordance, not a security boundary, so a
+    // failure here MUST NOT relax authorization.
+    return false;
+  }
+  if (raw === null) return false;
+  let rec: unknown;
+  try {
+    rec = JSON.parse(raw);
+  } catch {
+    return false; // malformed JSON: caller's CORRUPT path is correct
+  }
+  const r = rec as Partial<BlockedRecord>;
+  if (r.blocked !== true || typeof r.reason !== 'string' || typeof r.setAt !== 'number') {
+    return false; // shape-malformed: caller's CORRUPT path is correct
+  }
+  return !KNOWN_BLOCKED_REASONS.has(r.reason);
+}
+
+/**
  * Set BLOCKED from an arbitrary error, using the categorical classifier.
  * Silently skips if the error does not map to a BLOCKED condition.
  *

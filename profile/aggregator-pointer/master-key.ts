@@ -168,6 +168,28 @@ const registry = new WeakSet<MasterPrivateKey>();
 /** Canonical KAT vector — accepted only when network='test-vectors' (SPEC §14.1). */
 const KAT_CANONICAL_VECTOR = new Uint8Array(32).fill(0x01);
 
+/**
+ * Steelman⁴⁶ WARNING: `Object.freeze()` on the OUTER array prevents
+ * reassigning slots, but does NOT freeze the inner `Uint8Array`
+ * contents — typed arrays' indexed `[i]` writes are not affected by
+ * frozen-object semantics in any spec-compliant JS engine. A hostile
+ * module loaded between this module and `createMasterPrivateKey`
+ * invocation could mutate `WEAK_KEY_DENYLIST_BYTES[0][0] = 0xff` and
+ * silently neutralize the all-zero rejection.
+ *
+ * The defense: at module load, snapshot the expected denylist contents
+ * as a hex fingerprint string (immutable JS primitive). Before every
+ * `isStructurallyInvalid` call, recompute the fingerprint of the live
+ * denylist and assert equality with the snapshot. If a hostile module
+ * mutated the typed-array contents, the assertion fires and we refuse
+ * to construct any master key.
+ *
+ * Note: this still does not defeat SAB-cross-realm attacks where the
+ * underlying buffer is observably mutated mid-comparison. Combined
+ * with the existing TYPED_ARRAY_FILL / OBJECT_TO_STRING captures, the
+ * surface is now: any mutation of denylist contents AT ALL trips the
+ * fingerprint check.
+ */
 const WEAK_KEY_DENYLIST_BYTES: ReadonlyArray<Uint8Array> = Object.freeze([
   // All-zero — structurally invalid secp256k1 scalar.
   new Uint8Array(32),
@@ -196,16 +218,53 @@ const WEAK_KEY_DENYLIST_BYTES: ReadonlyArray<Uint8Array> = Object.freeze([
   ]),
 ]);
 
+// Fingerprint each entry as a 64-char lowercase hex string at module
+// load. These primitive strings are immutable and become the trust
+// anchor for runtime denylist integrity.
+function bytesToHexInternal(b: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < b.length; i++) {
+    const v = b[i] ?? 0;
+    s += (v < 0x10 ? '0' : '') + v.toString(16);
+  }
+  return s;
+}
+const WEAK_KEY_DENYLIST_FINGERPRINT: ReadonlyArray<string> = Object.freeze(
+  WEAK_KEY_DENYLIST_BYTES.map((b) => bytesToHexInternal(b)),
+);
+
+function assertDenylistIntact(): void {
+  for (let i = 0; i < WEAK_KEY_DENYLIST_BYTES.length; i++) {
+    const live = WEAK_KEY_DENYLIST_BYTES[i];
+    if (!live || live.length !== 32) {
+      throw new Error('master-key: WEAK_KEY_DENYLIST integrity violation (length)');
+    }
+    if (bytesToHexInternal(live) !== WEAK_KEY_DENYLIST_FINGERPRINT[i]) {
+      throw new Error('master-key: WEAK_KEY_DENYLIST integrity violation (mutated bytes)');
+    }
+  }
+}
+
+/**
+ * Steelman⁴⁶ NOTE: previously short-circuited on first byte mismatch,
+ * leaking "first matching byte index" as a (very weak) timing channel
+ * over public denylist comparisons. XOR-accumulate over all 32 bytes
+ * is constant-time. Comparison is over PUBLIC denylist values, so the
+ * timing channel was low-impact, but constant-time costs nothing.
+ */
 function bytesEqual32(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== 32 || b.length !== 32) return false;
+  let diff = 0;
   for (let i = 0; i < 32; i++) {
-    if (a[i] !== b[i]) return false;
+    diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
   }
-  return true;
+  return diff === 0;
 }
 
 function isStructurallyInvalid(bytes: Uint8Array): boolean {
   if (bytes.length !== 32) return false;
+  // Steelman⁴⁶: trip-wire on denylist tampering BEFORE comparison.
+  assertDenylistIntact();
   for (const candidate of WEAK_KEY_DENYLIST_BYTES) {
     if (bytesEqual32(bytes, candidate)) return true;
   }

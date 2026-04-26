@@ -188,10 +188,37 @@ function saveConfig(config: CliConfig): void {
   // a partially-written or torn config.json. Note: this does not fully
   // serialize concurrent read-modify-write at the BUSINESS level (last
   // writer still wins), but eliminates the byte-level corruption case.
-  fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+  //
+  // Steelman⁴⁶ WARNING: rename without fsync is not crash-safe. On
+  // ext4/xfs with default mount options, rename can commit before
+  // the data block, leaving a zero-length config.json after a power
+  // loss. Mirror the FileStorageProvider pattern: write+fsync the
+  // temp file, then rename, then fsync the parent directory (which
+  // commits the rename itself). This matches the durable-atomic
+  // contract claimed in the function header.
+  const dir = path.dirname(CONFIG_FILE);
+  fs.mkdirSync(dir, { recursive: true });
   const tmp = CONFIG_FILE + '.tmp.' + process.pid + '.' + Date.now();
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2));
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(config, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, CONFIG_FILE);
+  // Best-effort parent-dir fsync — not all platforms (e.g., Windows)
+  // support fsync on directories; ignore errors there.
+  try {
+    const dfd = fs.openSync(dir, 'r');
+    try {
+      fs.fsyncSync(dfd);
+    } finally {
+      fs.closeSync(dfd);
+    }
+  } catch {
+    /* parent-dir fsync best-effort; rename atomicity already provided by FS */
+  }
 }
 
 // =============================================================================
@@ -211,10 +238,28 @@ function loadProfiles(): ProfilesStore {
 
 function saveProfiles(store: ProfilesStore): void {
   // Steelman⁴³ critical: atomic write — see saveConfig.
-  fs.mkdirSync(path.dirname(PROFILES_FILE), { recursive: true });
+  // Steelman⁴⁶ WARNING: durable atomic via fsync(file) + rename + fsync(dir).
+  const dir = path.dirname(PROFILES_FILE);
+  fs.mkdirSync(dir, { recursive: true });
   const tmp = PROFILES_FILE + '.tmp.' + process.pid + '.' + Date.now();
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try {
+    fs.writeSync(fd, JSON.stringify(store, null, 2));
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(tmp, PROFILES_FILE);
+  try {
+    const dfd = fs.openSync(dir, 'r');
+    try {
+      fs.fsyncSync(dfd);
+    } finally {
+      fs.closeSync(dfd);
+    }
+  } catch {
+    /* parent-dir fsync best-effort */
+  }
 }
 
 function getProfile(name: string): WalletProfile | undefined {

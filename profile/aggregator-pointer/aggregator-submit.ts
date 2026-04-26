@@ -83,6 +83,15 @@ export interface SubmitInput {
   readonly isIdempotentRetryHint?: boolean;
   /** Per-side request timeout. Defaults to PUBLISH_REQUEST_TIMEOUT_MS. */
   readonly timeoutMs?: number;
+  /**
+   * Optional cancellation signal. Steelman⁴⁶ HIGH: when the publish-loop
+   * deadline expires, callers MUST be able to cancel any in-flight HTTP
+   * submit so an abandoned promise cannot land a CID at a v that another
+   * tab has already moved past (H8 v-burning hazard). When `aborted`
+   * fires, both per-side `submitOneSide` calls reject with `AbortError`
+   * and submitPointer surfaces it as a thrown error to the caller.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 /**
@@ -191,8 +200,24 @@ async function submitOneSide(
   transactionHash: DataHash,
   authenticator: Authenticator,
   timeoutMs: number,
+  abortSignal?: AbortSignal,
 ): Promise<SubmitCommitmentResponse> {
+  // Steelman⁴⁶: fast-path — if the caller already cancelled, never even
+  // hit the wire. The aggregator client itself cannot honor AbortSignal
+  // (the SDK does not plumb it through), so this Promise.race-based
+  // cancellation is best-effort: it stops the caller from awaiting and
+  // unblocks publish-loop deadline progression. The HTTP socket may
+  // remain in flight until the per-side timeoutMs fires — that's
+  // acceptable because the now-abandoned response is no longer
+  // observed by the publish loop and no v=resolvedV state has been
+  // committed.
+  if (abortSignal?.aborted) {
+    const err = new Error('submitCommitment aborted by caller');
+    err.name = 'AbortError';
+    throw err;
+  }
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let abortListener: (() => void) | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(() => {
       const err = new Error(`submitCommitment timed out after ${timeoutMs}ms`);
@@ -200,13 +225,28 @@ async function submitOneSide(
       reject(err);
     }, timeoutMs);
   });
+  const abortPromise = abortSignal
+    ? new Promise<never>((_, reject) => {
+        abortListener = () => {
+          const err = new Error('submitCommitment aborted by caller');
+          err.name = 'AbortError';
+          reject(err);
+        };
+        abortSignal.addEventListener('abort', abortListener, { once: true });
+      })
+    : null;
   try {
-    return await Promise.race([
+    const racers: Array<Promise<SubmitCommitmentResponse>> = [
       client.submitCommitment(requestId, transactionHash, authenticator),
       timeoutPromise,
-    ]);
+    ];
+    if (abortPromise) racers.push(abortPromise);
+    return await Promise.race(racers);
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    if (abortListener && abortSignal) {
+      abortSignal.removeEventListener('abort', abortListener);
+    }
   }
 }
 
@@ -503,10 +543,21 @@ export async function submitPointer(input: SubmitInput): Promise<SubmitOutcome> 
     ]);
 
     // Submit both sides in parallel, classify each settled result per §7.3.
+    // Steelman⁴⁶: thread the caller-supplied abort signal so deadline
+    // tripping at the publish-loop level cancels the awaits here.
     const [resultA, resultB] = await Promise.allSettled([
-      submitOneSide(aggregatorClient, requestIdA, transactionHashA, authenticatorA, timeoutMs),
-      submitOneSide(aggregatorClient, requestIdB, transactionHashB, authenticatorB, timeoutMs),
+      submitOneSide(aggregatorClient, requestIdA, transactionHashA, authenticatorA, timeoutMs, input.abortSignal),
+      submitOneSide(aggregatorClient, requestIdB, transactionHashB, authenticatorB, timeoutMs, input.abortSignal),
     ]);
+
+    // After Promise.allSettled returns, if the abort signal fired during
+    // submit, prefer surfacing the abort to the caller over the spec
+    // outcome — the loop deadline is the source of truth.
+    if (input.abortSignal?.aborted) {
+      const err = new Error('submitPointer aborted by caller');
+      err.name = 'AbortError';
+      throw err;
+    }
 
     const outcomeA = classifySideResult(resultA);
     const outcomeB = classifySideResult(resultB);

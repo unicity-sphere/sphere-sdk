@@ -264,25 +264,43 @@ export class FileStorageProvider implements StorageProvider {
     // gives us cross-process mutual exclusion via O_EXCL on a sibling
     // .lock directory; stale=10s reaps locks from crashed writers.
     let releaseFileLock: (() => Promise<void>) | null = null;
+    let lockfileModule: typeof import('proper-lockfile') | null = null;
     try {
-      const lockfile = await import('proper-lockfile');
+      lockfileModule = await import('proper-lockfile');
+    } catch (err) {
+      // Module truly missing (peer-dep not installed). Steelman⁴⁶: this
+      // is the ONE case where we tolerate proceeding without the lock,
+      // because in-process saveInFlight still serializes within a
+      // single Node process; cross-process callers in setups that
+      // don't include the optional dep accept that risk by omission.
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[FileStorageProvider] proper-lockfile module unavailable; saving without cross-process lock:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    if (lockfileModule) {
       // The file may not exist yet (first save); proper-lockfile needs
       // the target to exist. Touch it first if absent.
       if (!fs.existsSync(this.filePath)) {
         try { fs.writeFileSync(this.filePath, this.isTxtMode ? '' : '{}', { flag: 'a' }); }
         catch { /* best-effort */ }
       }
-      releaseFileLock = await lockfile.lock(this.filePath, {
+      // Steelman⁴⁶ WARNING: previously, lock-acquisition failure (after
+      // 50 retries × ≤500ms) silently downgraded to lockless save —
+      // re-introducing the very race the lock was added to fix. Now
+      // we distinguish: module-not-installed (above, warn-and-proceed)
+      // vs lock-contended (here, throw). Contention beyond ~25s of
+      // retries is a real anomaly: either a sibling process has
+      // wedged its write or our stale-detection (10s) failed to reap
+      // a crashed lock. Throwing surfaces this to the caller (who can
+      // emit a typed StorageEvent and let the user retry) instead of
+      // proceeding with broken cross-process semantics.
+      releaseFileLock = await lockfileModule.lock(this.filePath, {
         stale: 10_000,
         retries: { retries: 50, minTimeout: 50, maxTimeout: 500 },
         realpath: false,
       });
-    } catch (err) {
-      // If proper-lockfile isn't available or fails, log and proceed
-      // (best-effort — we have in-process serialization via saveInFlight).
-      // Don't reject the save — the user expects their data to land.
-      // eslint-disable-next-line no-console
-      console.warn('[FileStorageProvider] file-lock unavailable; saving without cross-process lock:', err instanceof Error ? err.message : String(err));
     }
 
     try {

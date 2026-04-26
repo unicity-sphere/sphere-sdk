@@ -209,14 +209,27 @@ async function publishOnce(
     // Steelman²² warning: enforce loopDeadline INSIDE submitPointer via
     // Promise.race so a hung network call cannot extend the actual hold
     // beyond the gate. Without this, a hung submit holds the mutex for
-    // up to PUBLISH_REQUEST_TIMEOUT_MS × 2 past the deadline. The race
-    // throws RETRY_EXHAUSTED at the deadline boundary; the in-flight
-    // submitPointer is abandoned (its own per-side timeouts will tear
-    // it down asynchronously).
+    // up to PUBLISH_REQUEST_TIMEOUT_MS × 2 past the deadline.
+    //
+    // Steelman⁴⁶ HIGH: previously, when the deadline race won, the
+    // in-flight `submitPointer` was simply abandoned — it could still
+    // complete and land a CID at v=resolvedV after the mutex had been
+    // released and another tab had advanced past v (H8 v-burning
+    // hazard). Now we tie an AbortController to the deadline timer so
+    // `submitPointer` cancels its in-flight `submitOneSide` awaits the
+    // moment the deadline fires. Aborting unblocks the publish loop;
+    // any HTTP socket already on the wire remains until per-side
+    // timeoutMs fires, but its eventual response is no longer observed.
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const submitAbort = new AbortController();
     const deadlineRace = new Promise<never>((_, reject) => {
       const remaining = Math.max(0, loopDeadline - Date.now());
       deadlineTimer = setTimeout(() => {
+        try {
+          submitAbort.abort();
+        } catch {
+          /* abort never throws on a fresh controller; defense-in-depth */
+        }
         reject(
           new AggregatorPointerError(
             AggregatorPointerErrorCode.RETRY_EXHAUSTED,
@@ -237,11 +250,22 @@ async function publishOnce(
           aggregatorClient,
           marker,
           isIdempotentRetryHint,
+          abortSignal: submitAbort.signal,
         }),
         deadlineRace,
       ]);
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      // Steelman⁴⁶: ensure the controller is aborted even if Promise.race
+      // settled via submitPointer's own throw — releases the abort
+      // listener inside submitOneSide promptly.
+      if (!submitAbort.signal.aborted) {
+        try {
+          submitAbort.abort();
+        } catch {
+          /* noop */
+        }
+      }
     }
 
     switch (outcome.kind) {

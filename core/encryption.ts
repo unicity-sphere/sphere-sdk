@@ -123,33 +123,25 @@ function computeMac(
   return CryptoJS.HmacSHA256(concat, macKey).toString(CryptoJS.enc.Hex);
 }
 
-// Steelman⁴⁰ note: capture String.prototype.toLowerCase at module load
-// so a late `String.prototype.toLowerCase = () => 'AAAA'` injection
-// can't make every MAC compare as 'AAAA'-vs-'AAAA' and bypass the gate.
-// Same defense-in-depth pattern used in master-key.ts for fill/toString.
-const STRING_TO_LOWERCASE = String.prototype.toLowerCase;
-
 /**
  * Constant-time comparison of two hex strings of equal length.
- * For MAC verification — non-constant-time `===` would leak via
- * timing how many bytes matched.
  *
- * Steelman³⁹ note: canonicalizes both sides to lowercase first so
- * stored uppercase hex and computed lowercase hex compare equal.
- * The lowercasing itself is non-constant-time but operates on
- * non-secret data (the MAC, which is verified before any decryption
- * key material is touched), so the timing leak there is acceptable.
+ * Steelman⁴⁶: tightened — both sides MUST already be canonical
+ * lowercase. `computeMac` always emits lowercase hex; `isEncryptedData`
+ * rejects records whose `mac` field is not strict-lowercase. Removing
+ * runtime `toLowerCase` eliminates the V8 fast-path timing channel
+ * (lowercasing pure-ASCII-lowercase is faster than mixed-case input).
  */
 function constantTimeHexEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  const aLower = STRING_TO_LOWERCASE.call(a);
-  const bLower = STRING_TO_LOWERCASE.call(b);
   let diff = 0;
-  for (let i = 0; i < aLower.length; i++) {
-    diff |= aLower.charCodeAt(i) ^ bLower.charCodeAt(i);
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
 }
+
+const LOWERCASE_HEX_RE = /^[0-9a-f]+$/;
 
 // =============================================================================
 // Encryption Functions
@@ -245,6 +237,14 @@ export function decrypt(encryptedData: EncryptedData, password: string): string 
         'DECRYPTION_ERROR',
       );
     }
+    // Steelman⁴⁶: enforce canonical lowercase MAC at decrypt time so
+    // constantTimeHexEqual can skip runtime lowercasing.
+    if (!LOWERCASE_HEX_RE.test(encryptedData.mac)) {
+      throw new SphereError(
+        'Decryption failed: mac field must be canonical lowercase hex',
+        'DECRYPTION_ERROR',
+      );
+    }
     const { encKey, macKey } = deriveAuthKeys(password, salt, encryptedData.iterations);
     const expectedMac = computeMac(macKey, iv, ciphertext);
     if (!constantTimeHexEqual(expectedMac, encryptedData.mac)) {
@@ -271,19 +271,35 @@ export function decrypt(encryptedData: EncryptedData, password: string): string 
 
   // Legacy unauthenticated path. Log a one-shot warning so operators
   // can audit how many records still need re-encryption.
+  //
+  // Steelman⁴⁶: CryptoJS may THROW on certain malformed padding/UTF-8
+  // shapes vs RETURN empty on others. Distinguishable error modes
+  // give attackers a (weak) padding-oracle distinguisher. Normalize
+  // all failure paths to the same SphereError code+message.
   warnLegacyUnauthenticatedOnce();
-  const key = deriveKey(password, salt, encryptedData.iterations);
-  const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext });
-  const decrypted = CryptoJS.AES.decrypt(cipherParams, key, {
-    iv,
-    mode: CryptoJS.mode.CBC,
-    padding: CryptoJS.pad.Pkcs7,
-  });
-  const result = decrypted.toString(CryptoJS.enc.Utf8);
-  if (!result) {
-    throw new SphereError('Decryption failed: invalid password or corrupted data', 'DECRYPTION_ERROR');
+  try {
+    const key = deriveKey(password, salt, encryptedData.iterations);
+    const cipherParams = CryptoJS.lib.CipherParams.create({ ciphertext });
+    const decrypted = CryptoJS.AES.decrypt(cipherParams, key, {
+      iv,
+      mode: CryptoJS.mode.CBC,
+      padding: CryptoJS.pad.Pkcs7,
+    });
+    const result = decrypted.toString(CryptoJS.enc.Utf8);
+    if (!result) {
+      throw new SphereError(
+        'Decryption failed: invalid password or corrupted data',
+        'DECRYPTION_ERROR',
+      );
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof SphereError) throw err;
+    throw new SphereError(
+      'Decryption failed: invalid password or corrupted data',
+      'DECRYPTION_ERROR',
+    );
   }
-  return result;
 }
 
 let _warnedLegacyUnauth = false;
@@ -362,18 +378,47 @@ export function decryptSimple(ciphertext: string, password: string): string {
     if (!isEncryptedData(env)) {
       throw new SphereError('Decryption failed: invalid v2 envelope shape', 'DECRYPTION_ERROR');
     }
+    // Steelman⁴⁶ CRITICAL: the `v2:` prefix is the integrity claim.
+    // Refuse to honour a `v2:` envelope whose payload self-declares
+    // a non-authenticated algorithm — otherwise an attacker with
+    // storage-write access (compromised IndexedDB / hostile extension /
+    // malicious StorageProvider) could replace a real authenticated
+    // mnemonic envelope with a forged `v2:`-wrapped legacy CBC payload
+    // and exploit the unauthenticated path as a padding oracle. The
+    // legacy unauthenticated CBC path remains reachable via the
+    // prefix-less `U2FsdGVkX1...` form below — but only for strings
+    // CryptoJS itself produced before the v2 migration.
+    if (env.algorithm !== 'aes-256-cbc-hmac-sha256') {
+      throw new SphereError(
+        'Decryption failed: v2 envelope must declare authenticated algorithm',
+        'DECRYPTION_ERROR',
+      );
+    }
     return decrypt(env, password);
   }
 
   // Legacy CryptoJS OpenSSL-format (unauthenticated). Read-only; new
-  // writes don't produce this.
+  // writes don't produce this. Steelman⁴⁶: normalize all error modes
+  // to a single SphereError so CryptoJS internal throws don't leak a
+  // padding-oracle distinguisher to the caller.
   warnLegacyUnauthenticatedOnce();
-  const decrypted = CryptoJS.AES.decrypt(ciphertext, password);
-  const result = decrypted.toString(CryptoJS.enc.Utf8);
-  if (!result) {
-    throw new SphereError('Decryption failed: invalid password or corrupted data', 'DECRYPTION_ERROR');
+  try {
+    const decrypted = CryptoJS.AES.decrypt(ciphertext, password);
+    const result = decrypted.toString(CryptoJS.enc.Utf8);
+    if (!result) {
+      throw new SphereError(
+        'Decryption failed: invalid password or corrupted data',
+        'DECRYPTION_ERROR',
+      );
+    }
+    return result;
+  } catch (err) {
+    if (err instanceof SphereError) throw err;
+    throw new SphereError(
+      'Decryption failed: invalid password or corrupted data',
+      'DECRYPTION_ERROR',
+    );
   }
-  return result;
 }
 
 /**
@@ -434,8 +479,15 @@ export function isEncryptedData(data: unknown): data is EncryptedData {
   const algorithmOk =
     obj.algorithm === 'aes-256-cbc' ||
     obj.algorithm === 'aes-256-cbc-hmac-sha256';
-  // Authenticated records require a `mac` field; legacy records must NOT.
-  if (obj.algorithm === 'aes-256-cbc-hmac-sha256' && typeof obj.mac !== 'string') {
+  // Authenticated records require a `mac` field in canonical lowercase
+  // hex; legacy records must NOT have one. Steelman⁴⁶: lowercase check
+  // is a format invariant, not a runtime canonicalization, so the
+  // constant-time MAC compare can skip toLowerCase entirely.
+  if (obj.algorithm === 'aes-256-cbc-hmac-sha256') {
+    if (typeof obj.mac !== 'string' || !LOWERCASE_HEX_RE.test(obj.mac)) {
+      return false;
+    }
+  } else if ('mac' in obj && obj.mac !== undefined) {
     return false;
   }
   return (

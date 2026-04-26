@@ -82,21 +82,37 @@ async function importKey(key: Uint8Array): Promise<CryptoKey> {
  * The auth tag is appended automatically by the Web Crypto API when using
  * AES-GCM — it is included in the ArrayBuffer returned by `encrypt()`.
  *
+ * Steelman⁴⁶ WARNING: optional `aad` (additional authenticated data) binds
+ * the ciphertext to a logical context (e.g. the storage key path or a
+ * record-id hash). Without AAD, an attacker with OrbitDB write access
+ * could swap encrypted values between different record keys: each
+ * decrypts to valid plaintext, but the plaintext now belongs to the
+ * wrong record. Threading AAD through encrypt+decrypt makes such cross-
+ * record swaps fail authentication. The AAD is NOT stored alongside
+ * the ciphertext — callers must supply the same AAD on decrypt
+ * (typically by computing it from the storage path of the field).
+ *
  * @param key       - 32-byte AES-256 encryption key
  * @param plaintext - Data to encrypt
+ * @param aad       - Optional additional authenticated data (binds the
+ *                    ciphertext to a logical context). Pass `undefined`
+ *                    for legacy unbound callers.
  * @returns Encrypted bytes in the format described above
  * @throws {ProfileError} code `ENCRYPTION_FAILED` on any failure
  */
 export async function encryptProfileValue(
   key: Uint8Array,
   plaintext: Uint8Array,
+  aad?: Uint8Array,
 ): Promise<Uint8Array> {
   try {
     const iv = globalThis.crypto.getRandomValues(new Uint8Array(IV_LENGTH));
     const cryptoKey = await importKey(key);
 
+    const params: AesGcmParams = { name: 'AES-GCM', iv };
+    if (aad !== undefined) params.additionalData = aad;
     const ciphertextWithTag = await globalThis.crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
+      params,
       cryptoKey,
       plaintext,
     );
@@ -121,8 +137,14 @@ export async function encryptProfileValue(
  *
  * Expects the input format: `IV (12 bytes) || ciphertext || auth tag (16 bytes)`.
  *
+ * Steelman⁴⁶ WARNING: `aad` MUST match the AAD passed at encrypt time.
+ * Mismatched AAD fails authentication and throws DECRYPTION_FAILED —
+ * preventing cross-record ciphertext swaps. Pass `undefined` to match
+ * encrypt calls that did not supply AAD (legacy, backward-compatible).
+ *
  * @param key       - 32-byte AES-256 encryption key (must match the key used to encrypt)
  * @param encrypted - Encrypted bytes produced by {@link encryptProfileValue}
+ * @param aad       - Optional AAD; must match the value supplied to encrypt.
  * @returns Decrypted plaintext bytes
  * @throws {ProfileError} code `DECRYPTION_FAILED` on invalid key, tampered data,
  *         or malformed input
@@ -130,6 +152,7 @@ export async function encryptProfileValue(
 export async function decryptProfileValue(
   key: Uint8Array,
   encrypted: Uint8Array,
+  aad?: Uint8Array,
 ): Promise<Uint8Array> {
   if (encrypted.length < IV_LENGTH + 1) {
     throw new ProfileError(
@@ -144,8 +167,10 @@ export async function decryptProfileValue(
 
     const cryptoKey = await importKey(key);
 
+    const params: AesGcmParams = { name: 'AES-GCM', iv };
+    if (aad !== undefined) params.additionalData = aad;
     const plaintext = await globalThis.crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv },
+      params,
       cryptoKey,
       ciphertextWithTag,
     );
@@ -178,9 +203,10 @@ export async function decryptProfileValue(
 export async function encryptString(
   key: Uint8Array,
   value: string,
+  aad?: Uint8Array,
 ): Promise<Uint8Array> {
   const encoded = new TextEncoder().encode(value);
-  return encryptProfileValue(key, encoded);
+  return encryptProfileValue(key, encoded, aad);
 }
 
 /**
@@ -194,7 +220,8 @@ export async function encryptString(
 export async function decryptString(
   key: Uint8Array,
   encrypted: Uint8Array,
+  aad?: Uint8Array,
 ): Promise<string> {
-  const plaintext = await decryptProfileValue(key, encrypted);
+  const plaintext = await decryptProfileValue(key, encrypted, aad);
   return new TextDecoder().decode(plaintext);
 }

@@ -861,16 +861,32 @@ export class ProfileTokenStorageProvider
       // subsequent load() reading `if (this.flushPromise)` would see
       // null while the new flush is still running, and read a stale
       // snapshot.
+      //
+      // Steelman⁴⁶ ordering note: `this.flushPromise = myFlush` MUST
+      // be observable before the `.finally` runs, otherwise the
+      // identity check would compare against an out-of-date reference.
+      // JS semantics guarantee this (sync code in this setTimeout
+      // callback completes before any microtask), but the previous
+      // arrangement built the .finally chain before the assignment
+      // — making the dependency implicit. We now use an outer Promise
+      // box that the .finally consults, which makes the invariant
+      // explicit and immune to future refactors that might reorder
+      // the chain build.
+      const flushBox: { ref: Promise<void> | null } = { ref: null };
       const myFlush: Promise<void> = this.flushToIpfs()
         .catch((err) => {
           this.log(`Flush failed: ${err instanceof Error ? err.message : String(err)}`);
           this.emitEvent(this.buildErrorEvent('storage:error', err));
         })
         .finally(() => {
-          if (this.flushPromise === myFlush) {
+          // Compare against the boxed reference assigned after the
+          // chain is built — this fires AFTER the assignment below
+          // because .finally is microtask-deferred.
+          if (this.flushPromise === flushBox.ref) {
             this.flushPromise = null;
           }
         });
+      flushBox.ref = myFlush;
       this.flushPromise = myFlush;
     }, this.flushDebounceMs);
   }
@@ -1541,35 +1557,93 @@ export class ProfileTokenStorageProvider
     // tombstone-based mechanisms already present in the SDK; this code
     // path only reconciles ADDITIONS, which is the common multi-process
     // race (daemon + CLI both adding outbox entries).
-    const remote = await this.readOperationalState();
-    const merged: OperationalState = {
-      tombstones: opState.tombstones,
-      sent: opState.sent,
-      history: opState.history,
-      outbox: mergeByPrimaryKey(remote.outbox, opState.outbox, 'id'),
-      invalid: mergeByPrimaryKey(remote.invalid, opState.invalid, 'tokenId'),
-      mintOutbox: mergeByPrimaryKey(remote.mintOutbox, opState.mintOutbox, 'tokenId'),
-      invalidatedNametags: Array.from(
-        new Set([
-          ...(remote.invalidatedNametags as string[]),
-          ...(opState.invalidatedNametags as string[]),
-        ]),
-      ),
-    };
+    //
+    // Steelman⁴⁶ WARNING: read-merge-write is still racy across processes
+    // — between our read and the for-loop write, a sibling process can
+    // complete its own RMW cycle, and our subsequent write clobbers
+    // their merge. A pure CAS via OrbitDB OpLog op-ids is unavailable
+    // through the KV abstraction we use. As a practical mitigation,
+    // we wrap the RMW in a bounded retry loop: after writing, re-read
+    // each merged key and check that our locally-known primary keys
+    // are present in the remote state. If divergence is detected
+    // (sibling process clobbered our merge), redo the merge against
+    // the freshly-observed remote and retry up to MAX_RMW_RETRIES.
+    // After exhausting retries, log and accept lossy convergence —
+    // outbox processing is idempotent (re-reading from the token pool
+    // on next load reconstructs missing entries) so eventual
+    // consistency holds.
+    const MAX_RMW_RETRIES = 3;
+    const localOutboxIds = new Set(opState.outbox.map((e) => (e as unknown as Record<string, unknown>).id).filter((v) => v !== undefined));
+    const localInvalidIds = new Set(opState.invalid.map((e) => (e as unknown as Record<string, unknown>).tokenId).filter((v) => v !== undefined));
+    const localMintIds = new Set(opState.mintOutbox.map((e) => (e as unknown as Record<string, unknown>).tokenId).filter((v) => v !== undefined));
+    const localTags = new Set(opState.invalidatedNametags as string[]);
 
-    const writes: Array<[string, unknown]> = [
-      [`${addr}.outbox`, merged.outbox],
-      [`${addr}.invalid`, merged.invalid],
-      [`${addr}.mintOutbox`, merged.mintOutbox],
-      [`${addr}.invalidatedNametags`, merged.invalidatedNametags],
-    ];
+    let attempt = 0;
+    while (attempt <= MAX_RMW_RETRIES) {
+      const remote = await this.readOperationalState();
+      const merged: OperationalState = {
+        tombstones: opState.tombstones,
+        sent: opState.sent,
+        history: opState.history,
+        outbox: mergeByPrimaryKey(remote.outbox, opState.outbox, 'id'),
+        invalid: mergeByPrimaryKey(remote.invalid, opState.invalid, 'tokenId'),
+        mintOutbox: mergeByPrimaryKey(remote.mintOutbox, opState.mintOutbox, 'tokenId'),
+        invalidatedNametags: Array.from(
+          new Set([
+            ...(remote.invalidatedNametags as string[]),
+            ...(opState.invalidatedNametags as string[]),
+          ]),
+        ),
+      };
 
-    for (const [key, value] of writes) {
-      try {
-        await this.writeProfileKey(key, JSON.stringify(value));
-      } catch (err) {
-        this.log(`Failed to write operational state key "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      const writes: Array<[string, unknown]> = [
+        [`${addr}.outbox`, merged.outbox],
+        [`${addr}.invalid`, merged.invalid],
+        [`${addr}.mintOutbox`, merged.mintOutbox],
+        [`${addr}.invalidatedNametags`, merged.invalidatedNametags],
+      ];
+
+      let writeFailed = false;
+      for (const [key, value] of writes) {
+        try {
+          await this.writeProfileKey(key, JSON.stringify(value));
+        } catch (err) {
+          writeFailed = true;
+          this.log(`Failed to write operational state key "${key}": ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
+      if (writeFailed) return; // a write error is its own concern; don't retry
+
+      // Verification re-read: confirm our local primary keys made it
+      // into the remote state. If a sibling process clobbered our
+      // merge, redo. We tolerate eventual-consistency lag by allowing
+      // sibling-only entries to drift in/out of the remote view; we
+      // only check that OUR entries (those we contributed) are
+      // present.
+      const verify = await this.readOperationalState();
+      const verifyOutboxIds = new Set(verify.outbox.map((e) => (e as unknown as Record<string, unknown>).id));
+      const verifyInvalidIds = new Set(verify.invalid.map((e) => (e as unknown as Record<string, unknown>).tokenId));
+      const verifyMintIds = new Set(verify.mintOutbox.map((e) => (e as unknown as Record<string, unknown>).tokenId));
+      const verifyTags = new Set(verify.invalidatedNametags as string[]);
+      const allPresent =
+        Array.from(localOutboxIds).every((id) => verifyOutboxIds.has(id)) &&
+        Array.from(localInvalidIds).every((id) => verifyInvalidIds.has(id)) &&
+        Array.from(localMintIds).every((id) => verifyMintIds.has(id)) &&
+        Array.from(localTags).every((tag) => verifyTags.has(tag));
+      if (allPresent) return;
+
+      attempt++;
+      if (attempt > MAX_RMW_RETRIES) {
+        this.log(
+          `writeOrbitOperationalState: divergence persisted after ${MAX_RMW_RETRIES} retries; ` +
+            `accepting eventual consistency (outbox rebuild on next load will reconcile)`,
+        );
+        return;
+      }
+      // Brief backoff with jitter to break ties with the racing sibling.
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, 50 + Math.floor(Math.random() * 100)),
+      );
     }
   }
 
