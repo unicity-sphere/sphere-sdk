@@ -123,6 +123,12 @@ function computeMac(
   return CryptoJS.HmacSHA256(concat, macKey).toString(CryptoJS.enc.Hex);
 }
 
+// Steelman⁴⁰ note: capture String.prototype.toLowerCase at module load
+// so a late `String.prototype.toLowerCase = () => 'AAAA'` injection
+// can't make every MAC compare as 'AAAA'-vs-'AAAA' and bypass the gate.
+// Same defense-in-depth pattern used in master-key.ts for fill/toString.
+const STRING_TO_LOWERCASE = String.prototype.toLowerCase;
+
 /**
  * Constant-time comparison of two hex strings of equal length.
  * For MAC verification — non-constant-time `===` would leak via
@@ -136,8 +142,8 @@ function computeMac(
  */
 function constantTimeHexEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
-  const aLower = a.toLowerCase();
-  const bLower = b.toLowerCase();
+  const aLower = STRING_TO_LOWERCASE.call(a);
+  const bLower = STRING_TO_LOWERCASE.call(b);
   let diff = 0;
   for (let i = 0; i < aLower.length; i++) {
     diff |= aLower.charCodeAt(i) ^ bLower.charCodeAt(i);
@@ -208,6 +214,24 @@ export function encrypt(
  *     this format — but existing on-disk records remain readable.
  */
 export function decrypt(encryptedData: EncryptedData, password: string): string {
+  // Steelman⁴⁰ note: validate `iterations` BEFORE running PBKDF2.
+  // An attacker-controlled record with `iterations: 2^31` or huge
+  // values would either hang the call or coerce to something bad.
+  // The MAC eventually fails-closed but the DoS happens BEFORE MAC
+  // verify (since macKey itself requires PBKDF2). Bound it.
+  const ITERATIONS_MIN = 1000;
+  const ITERATIONS_MAX = 10_000_000;
+  if (
+    !Number.isFinite(encryptedData.iterations) ||
+    !Number.isInteger(encryptedData.iterations) ||
+    encryptedData.iterations < ITERATIONS_MIN ||
+    encryptedData.iterations > ITERATIONS_MAX
+  ) {
+    throw new SphereError(
+      `Decryption failed: iterations=${encryptedData.iterations} outside [${ITERATIONS_MIN}, ${ITERATIONS_MAX}] (DoS guard).`,
+      'DECRYPTION_ERROR',
+    );
+  }
   // Parse salt and IV
   const salt = CryptoJS.enc.Hex.parse(encryptedData.salt);
   const iv = CryptoJS.enc.Hex.parse(encryptedData.iv);

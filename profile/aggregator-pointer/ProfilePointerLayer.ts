@@ -204,6 +204,11 @@ export class ProfilePointerLayer {
     while (this.#inFlight.size > 0) {
       await Promise.allSettled([...this.#inFlight]);
     }
+    // Steelman⁴⁰ note: drop the probe-fingerprint history so a consumer
+    // holding a layer reference doesn't pin ~33KB of integers per
+    // shutdown cycle. The fingerprint API is not safe to call after
+    // shutdown anyway (#assertNotShuttingDown gates it).
+    this.#lastProbeVersions = [];
   }
 
   // ── publish ──────────────────────────────────────────────────────────────

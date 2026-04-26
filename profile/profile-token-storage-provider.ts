@@ -661,7 +661,7 @@ export class ProfileTokenStorageProvider
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      this.emitEvent({ type: 'sync:error', timestamp: Date.now(), error: errorMsg });
+      this.emitEvent(this.buildErrorEvent('sync:error', err));
       return { success: false, added: 0, removed: 0, conflicts: 0, error: errorMsg };
     }
   }
@@ -935,7 +935,15 @@ export class ProfileTokenStorageProvider
       // the flush. The consolidation engine has its own concurrent-
       // guard (consolidation.pending key) so multi-device races are
       // safe.
-      if (await this.shouldConsolidate()) {
+      //
+      // Steelman⁴⁰ warning: SKIP consolidation when shutdown is in
+      // progress. Consolidation does multiple unbounded IPFS round-trips
+      // (fetch + pin) which would block shutdown for minutes per N
+      // bundles. Without this gate, F.43's shutdown-await-flushPromise
+      // could hold up to (N × per-gateway timeout) before completing.
+      if (this.isShuttingDown) {
+        this.log('Consolidation skipped: shutdown in progress');
+      } else if (await this.shouldConsolidate()) {
         try {
           const { ConsolidationEngine } = await import('./consolidation.js');
           const engine = new ConsolidationEngine(
@@ -1020,6 +1028,12 @@ export class ProfileTokenStorageProvider
     const rawEntries = await this.db.all(BUNDLE_KEY_PREFIX);
     const result = new Map<string, UxfBundleRef>();
 
+    // Steelman⁴⁰ warning: aggregate corrupt-bundle events into a single
+    // emit so wholesale corruption (key drift after restore-from-backup,
+    // etc.) doesn't flood the consumer with N events for N bundles.
+    const corruptCids: string[] = [];
+    let firstCorruptError: unknown = null;
+
     for (const [key, value] of rawEntries) {
       const cid = key.slice(BUNDLE_KEY_PREFIX.length);
       try {
@@ -1045,16 +1059,20 @@ export class ProfileTokenStorageProvider
         const ref = JSON.parse(new TextDecoder().decode(decrypted)) as UxfBundleRef;
         result.set(cid, ref);
       } catch (err) {
-        // Steelman³⁸ warning: emit a typed CID_REF_CORRUPT event so
-        // tampering / encryption-key drift / payload corruption is
-        // OBSERVABLE to consumers. The current flow continues
-        // (skip-and-log) is correct behavior — the change is just
-        // making the failure visible. Distinct from a generic
-        // 'storage:error' so UIs can decide whether to show a banner
-        // or alert the user.
+        // Steelman³⁸/⁴⁰: log per-bundle but AGGREGATE the events into a
+        // single emit at the end of the loop so wholesale corruption
+        // doesn't flood the UI with N banners for N bundles.
         this.log(`Failed to deserialize bundle ref for ${cid}: ${err instanceof Error ? err.message : String(err)}`);
-        this.emitEvent(this.buildErrorEvent('storage:error', err, 'CID_REF_CORRUPT'));
+        corruptCids.push(cid);
+        if (firstCorruptError === null) firstCorruptError = err;
       }
+    }
+
+    if (corruptCids.length > 0) {
+      const ev = this.buildErrorEvent('storage:error', firstCorruptError, 'CID_REF_CORRUPT');
+      // Attach the full list of corrupt CIDs so consumers can react
+      // proportionally (e.g., one warning, list in details).
+      this.emitEvent({ ...ev, data: { corruptCids, count: corruptCids.length } });
     }
 
     return result;
@@ -1185,11 +1203,10 @@ export class ProfileTokenStorageProvider
       if (this.isPermanentPointerError(err)) {
         const code = (err as { code?: string }).code ?? 'UNKNOWN';
         this.log(`Pointer publish PERMANENT failure (${code}): ${msg}`);
-        this.emitEvent({
-          type: 'storage:error',
-          timestamp: Date.now(),
-          error: `Pointer publish failed: ${code}. ${msg}`,
-        });
+        // Steelman⁴⁰ warning: route through buildErrorEvent so the
+        // typed `code` is preserved as a structured event field, not
+        // just interpolated into the string message.
+        this.emitEvent(this.buildErrorEvent('storage:error', err));
       } else {
         this.log(`Pointer publish failed (transient, best-effort): ${msg}`);
       }
@@ -1229,11 +1246,8 @@ export class ProfileTokenStorageProvider
       if (this.isPermanentPointerError(err)) {
         const code = (err as { code?: string }).code ?? 'UNKNOWN';
         this.log(`Pointer recover PERMANENT failure (${code}): ${msg}`);
-        this.emitEvent({
-          type: 'storage:error',
-          timestamp: Date.now(),
-          error: `Pointer recover failed: ${code}. ${msg}`,
-        });
+        // Steelman⁴⁰ warning: route through buildErrorEvent.
+        this.emitEvent(this.buildErrorEvent('storage:error', err));
         // Do NOT fall through to IPNS on permanent integrity
         // failures — return true so the IPNS path is skipped.
         return true;
@@ -1534,11 +1548,8 @@ export class ProfileTokenStorageProvider
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Failed to write local derived cache "${key}": ${msg}`);
-      this.emitEvent({
-        type: 'storage:error',
-        timestamp: Date.now(),
-        error: `Local derived cache write failed: ${msg}`,
-      });
+      // Steelman⁴⁰ warning: route through buildErrorEvent.
+      this.emitEvent(this.buildErrorEvent('storage:error', err));
       return false;
     }
   }
@@ -1636,10 +1647,15 @@ export class ProfileTokenStorageProvider
     }
 
     if (failedKeys.length > 0) {
+      // Steelman⁴⁰ warning: aggregate event (already done; document the
+      // pattern). Single event with `code: 'LOCAL_CACHE_READ_FAILED'`
+      // and the failed keys in `data`.
       this.emitEvent({
         type: 'storage:error',
         timestamp: Date.now(),
         error: `Local derived cache read failures: ${failedKeys.join(', ')}`,
+        code: 'LOCAL_CACHE_READ_FAILED',
+        data: { failedKeys },
       });
     }
 
@@ -1665,11 +1681,8 @@ export class ProfileTokenStorageProvider
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Failed to read local cache "${key}": ${msg}`);
-      this.emitEvent({
-        type: 'storage:error',
-        timestamp: Date.now(),
-        error: `Local derived cache read failed for "${key}": ${msg}`,
-      });
+      // Steelman⁴⁰ warning: route through buildErrorEvent for typed code.
+      this.emitEvent(this.buildErrorEvent('storage:error', err, 'LOCAL_CACHE_READ_FAILED'));
       return null;
     }
   }

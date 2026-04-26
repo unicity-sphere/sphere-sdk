@@ -456,25 +456,33 @@ export class NostrReplicationBridge {
       const factory = this.config.createWebSocket ?? ((url: string) => new WebSocket(url));
       const ws = factory(this.config.relayUrl);
 
-      // Steelman³⁸ note: explicit removeEventListener cleanup of the
-      // open/error listeners after resolution. Without this, long-lived
-      // daemons that reconnect on transient relay drops accumulate orphan
-      // listeners (each holds resolve/reject closures keeping references
-      // alive). `{ once: true }` gives the same effect with less code.
+      // Steelman³⁸/⁴⁰ note: BOTH listeners must be removed when EITHER
+      // resolves. `{ once: true }` only removes the listener that fires;
+      // the other stays attached, holding closures (resolve/reject + ws)
+      // until the WebSocket is GC'd. Long-lived daemons that reconnect
+      // on transient relay drops would accumulate orphan listeners.
+      // Use named handlers + explicit removeEventListener in both paths.
       const timeout = setTimeout(() => {
+        cleanup();
         try { ws.close(); } catch { /* ignore */ }
         reject(new Error(`WebSocket connection to ${this.config.relayUrl} timed out`));
       }, CONNECT_TIMEOUT_MS);
 
-      ws.addEventListener('open', () => {
-        clearTimeout(timeout);
+      const onOpen = (): void => {
+        cleanup();
         resolve(ws);
-      }, { once: true } as AddEventListenerOptions);
-
-      ws.addEventListener('error', (ev) => {
-        clearTimeout(timeout);
+      };
+      const onError = (ev: Event): void => {
+        cleanup();
         reject(new Error(`WebSocket connection failed: ${String(ev)}`));
-      }, { once: true } as AddEventListenerOptions);
+      };
+      const cleanup = (): void => {
+        clearTimeout(timeout);
+        try { ws.removeEventListener('open', onOpen); } catch { /* ignore */ }
+        try { ws.removeEventListener('error', onError); } catch { /* ignore */ }
+      };
+      ws.addEventListener('open', onOpen);
+      ws.addEventListener('error', onError);
     });
   }
 

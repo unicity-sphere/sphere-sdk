@@ -216,10 +216,14 @@ describe('ProfileTokenStorageProvider pointer recovery (T-D6 wiring)', () => {
 
     const provider = createProvider({ db, getPointerLayer: () => pointer });
 
-    const errorEvents: string[] = [];
+    // Steelman⁴⁰: typed `code` field on the event is now load-bearing;
+    // the legacy substring-match in `evt.error` still works because
+    // the error message contains the code, but consumers should
+    // prefer the typed field.
+    const errorEvents: Array<{ error?: string; code?: string }> = [];
     provider.onEvent((evt) => {
       if (evt.type === 'storage:error') {
-        errorEvents.push(evt.error ?? '');
+        errorEvents.push({ error: evt.error, code: evt.code });
       }
     });
 
@@ -228,7 +232,7 @@ describe('ProfileTokenStorageProvider pointer recovery (T-D6 wiring)', () => {
     // stays empty).
     await expect(provider.initialize()).resolves.toBe(true);
     expect(errorEvents.length).toBe(1);
-    expect(errorEvents[0]).toContain('AGGREGATOR_POINTER_TRUST_BASE_STALE');
+    expect(errorEvents[0].code).toBe('AGGREGATOR_POINTER_TRUST_BASE_STALE');
   });
 
   it('does NOT surface events for transient pointer errors (network / unavailable)', async () => {
