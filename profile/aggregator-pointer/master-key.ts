@@ -195,17 +195,47 @@ export function createMasterPrivateKey(
   // Steelman²² critical: snapshot ALL view properties (buffer, byteOffset,
   // length) at the very top, BEFORE any further reads. A hostile
   // TypedArray subclass can override these as getters that return one
-  // value on the first read and another on subsequent reads. Without
-  // snapshotting all three, the gate-check at L218 sees a benign buffer
-  // while the slice at L242 reads a different byteOffset/length and
-  // produces a wrong-sized internalBytes that bypasses the denylist
-  // (length≠32 short-circuits bytesEqual32 to false).
+  // value on the first read and another on subsequent reads.
+  //
+  // Steelman²³ critical: VALIDATE the snapshotted offset+length BEFORE
+  // slicing. ArrayBuffer.prototype.slice clamps negative start/end via
+  // `max(byteLength + neg, 0)` — so a hostile subclass returning
+  // byteOffset=-64 on a 64-byte underlying buffer with length=32 produces
+  // slice(-64, -32) → slice(0, 32), reading the FIRST 32 bytes of the
+  // buffer (an attacker-controlled region) — length 32 passes the
+  // post-slice check. Pre-validate offset and length as non-negative
+  // safe integers AND that offset + length is within the buffer to
+  // foreclose this attack.
   const sourceBuffer = bytes.buffer;
   const sourceOffset = bytes.byteOffset;
   const sourceLen = bytes.length;
-  if (sourceLen !== 32) {
+  if (
+    !Number.isInteger(sourceOffset) ||
+    sourceOffset < 0 ||
+    sourceOffset > Number.MAX_SAFE_INTEGER
+  ) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `MasterPrivateKey input has invalid byteOffset=${String(sourceOffset)} (must be a non-negative safe integer).`,
+    );
+  }
+  if (
+    !Number.isInteger(sourceLen) ||
+    sourceLen !== 32
+  ) {
     throw new RangeError(
-      `MasterPrivateKey must be exactly 32 bytes, got ${sourceLen}`,
+      `MasterPrivateKey must be exactly 32 bytes, got ${String(sourceLen)}`,
+    );
+  }
+  if (
+    typeof sourceBuffer !== 'object' ||
+    sourceBuffer === null ||
+    typeof (sourceBuffer as ArrayBufferLike).byteLength !== 'number' ||
+    sourceOffset + sourceLen > (sourceBuffer as ArrayBufferLike).byteLength
+  ) {
+    throw new AggregatorPointerError(
+      AggregatorPointerErrorCode.PROTOCOL_ERROR,
+      `MasterPrivateKey input range [${sourceOffset}, ${sourceOffset + sourceLen}) exceeds underlying buffer byteLength.`,
     );
   }
   // Reject SharedArrayBuffer: a SAB-backed Uint8Array can be mutated from a

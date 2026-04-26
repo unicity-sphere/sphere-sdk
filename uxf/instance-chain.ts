@@ -24,6 +24,7 @@ import type {
 import { UxfError } from './errors.js';
 import { ElementPool } from './element-pool.js';
 import { computeElementHash } from './hash.js';
+import { assertHeaderKindField, assertHeaderVersionField } from './header-validation.js';
 
 // ---------------------------------------------------------------------------
 // Mutable Index Type
@@ -154,6 +155,16 @@ export function addInstance(
       `Type mismatch: new instance is '${newInstance.type}' but chain element is '${originalElement.type}'`,
     );
   }
+
+  // Steelman²³ warning: enforce header field bounds at the programmatic
+  // entry point too — not just at JSON/IPLD parse boundaries. A caller
+  // constructing a UxfElement directly (test code, future modules,
+  // alternative deserializers) would otherwise bypass the parse-time
+  // checks and could insert giant kind strings, non-finite versions, etc.
+  // assertHeaderKindField also bounds kind length to MAX_KIND_LENGTH.
+  assertHeaderKindField(newInstance.header.kind, 'addInstance newInstance.header.kind');
+  assertHeaderVersionField(newInstance.header.semantics, 'addInstance newInstance.header.semantics');
+  assertHeaderVersionField(newInstance.header.representation, 'addInstance newInstance.header.representation');
 
   // Rule 2: predecessor must equal current head.
   if (newInstance.header.predecessor !== currentHeadHash) {

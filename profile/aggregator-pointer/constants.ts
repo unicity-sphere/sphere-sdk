@@ -125,26 +125,36 @@ export const FILE_LOCK_STALE_MS =
     (PUBLISH_BACKOFF_MAX_MS * 2 + PUBLISH_REQUEST_TIMEOUT_MS * 2) +
   FILE_LOCK_STALE_MARGIN_MS;
 
-// Steelman²¹/²² note: module-load invariant.
+// Steelman²¹/²²/²³: module-load invariant — TWO-SIDED.
 //
-// HARDCODED minimum value below — this catches BOTH a manual override of
-// FILE_LOCK_STALE_MS *AND* drift in the formula or its component constants.
-// A computed expression like `expectedHold + margin` using the same
-// constants is tautological (always passes), only catching manual overrides.
-// The hardcoded literal forces any change to ANY component (formula or
-// constants) to fail the invariant unless this literal is also updated —
-// which requires the contributor to actively re-derive and verify the
-// safety property. Keep this in sync with the formula.
+// We pin a HARDCODED expected value (FILE_LOCK_STALE_MS_EXPECTED). Both
+// directions are checked:
+//
+//   (a) FILE_LOCK_STALE_MS < EXPECTED  → manual override / formula drift
+//       reduced the value below the documented safety property. Throw.
+//
+//   (b) FILE_LOCK_STALE_MS > EXPECTED  → a component constant grew
+//       (e.g., ATTEMPT_MAX_RETRIES_HARD_CAP raised) without the contributor
+//       re-deriving and updating the literal. The new value may be safe,
+//       but we want the contributor to actively re-validate. Throw.
+//
+// Together, (a) + (b) form a tripwire: ANY change to ANY component or to
+// the formula forces a coordinated update of FILE_LOCK_STALE_MS_EXPECTED
+// in this file, which forces the contributor to re-derive the safety
+// property at PR time.
 //
 // As of F.24 with cap=10, retry_after=180s, backoff_max=4s, request_timeout=30s:
 //   expectedHold = 180_000 + 10 × (4_000 × 2 + 30_000 × 2) = 860_000ms
-//   minimum     = expectedHold + 60_000 margin = 920_000ms
-const FILE_LOCK_STALE_MS_MIN_INVARIANT = 920_000;
-if (FILE_LOCK_STALE_MS < FILE_LOCK_STALE_MS_MIN_INVARIANT) {
+//   margin       = 60_000ms
+//   FILE_LOCK_STALE_MS = 920_000ms
+const FILE_LOCK_STALE_MS_EXPECTED = 920_000;
+if (FILE_LOCK_STALE_MS !== FILE_LOCK_STALE_MS_EXPECTED) {
   throw new Error(
     `pointer-layer constants invariant violated: FILE_LOCK_STALE_MS=${FILE_LOCK_STALE_MS} ` +
-      `is below the safety-property minimum ${FILE_LOCK_STALE_MS_MIN_INVARIANT}ms. ` +
-      `Either fix the FILE_LOCK_STALE_MS formula, or update both the formula AND ` +
-      `the FILE_LOCK_STALE_MS_MIN_INVARIANT literal in constants.ts after re-deriving the safety property.`,
+      `does NOT match FILE_LOCK_STALE_MS_EXPECTED=${FILE_LOCK_STALE_MS_EXPECTED}. ` +
+      `If you changed a component constant or the formula, re-derive the safety property ` +
+      `(MAX_CUMULATIVE_RETRY_AFTER_MS + ATTEMPT_MAX_RETRIES_HARD_CAP × ` +
+      `(PUBLISH_BACKOFF_MAX_MS × 2 + PUBLISH_REQUEST_TIMEOUT_MS × 2) + FILE_LOCK_STALE_MARGIN_MS) ` +
+      `and update FILE_LOCK_STALE_MS_EXPECTED in constants.ts to match.`,
   );
 }
