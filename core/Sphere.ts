@@ -3399,8 +3399,25 @@ export class Sphere {
       nametags.set(0, cleanNametag);
     }
 
-    // Persist nametag cache
-    await this.persistAddressNametags();
+    // Persist nametag cache. Steelman⁵³ WARNING: at this point Nostr
+    // already advertises @cleanNametag bound to our pubkey (step 2),
+    // so a persistence failure here would leave local-vs-relay
+    // inconsistent — the next cold load() would not see the
+    // nametag in local state. Best-effort: catch the persistence
+    // failure, surface a typed error to the caller, but do NOT
+    // throw. The relay binding remains authoritative (sync on
+    // next switchToAddress / postSwitchSync recovers the nametag
+    // via transport lookup).
+    try {
+      await this.persistAddressNametags();
+    } catch (persistErr) {
+      logger.warn(
+        'Sphere',
+        `registerNametag: relay binding succeeded for @${cleanNametag} but ` +
+          `local persistence failed (${persistErr instanceof Error ? persistErr.message : String(persistErr)}). ` +
+          `Next load() will recover via Nostr lookup.`,
+      );
+    }
 
     this.emitEvent('nametag:registered', {
       nametag: cleanNametag,
