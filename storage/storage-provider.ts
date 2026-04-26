@@ -240,6 +240,16 @@ export interface StorageEvent {
   timestamp: number;
   data?: unknown;
   error?: string;
+  /**
+   * Steelman³⁸ warning: typed error code preserved across the layer
+   * boundary so consumers can route on it (e.g., `CID_REF_CORRUPT`,
+   * `AGGREGATOR_POINTER_TRUST_BASE_STALE`). Without this, the typed
+   * pointer-layer / profile-layer error taxonomy was flattened to a
+   * `error: string` at this boundary.
+   */
+  code?: string;
+  /** The original error object for cause-chain debugging. */
+  cause?: unknown;
 }
 
 export type StorageEventCallback = (event: StorageEvent) => void;

@@ -569,7 +569,7 @@ export class ProfileTokenStorageProvider
       };
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      this.emitEvent({ type: 'storage:error', timestamp: Date.now(), error: errorMsg });
+      this.emitEvent(this.buildErrorEvent('storage:error', err));
       return {
         success: false,
         error: errorMsg,
@@ -855,11 +855,7 @@ export class ProfileTokenStorageProvider
       const myFlush: Promise<void> = this.flushToIpfs()
         .catch((err) => {
           this.log(`Flush failed: ${err instanceof Error ? err.message : String(err)}`);
-          this.emitEvent({
-            type: 'storage:error',
-            timestamp: Date.now(),
-            error: err instanceof Error ? err.message : String(err),
-          });
+          this.emitEvent(this.buildErrorEvent('storage:error', err));
         })
         .finally(() => {
           if (this.flushPromise === myFlush) {
@@ -1049,7 +1045,15 @@ export class ProfileTokenStorageProvider
         const ref = JSON.parse(new TextDecoder().decode(decrypted)) as UxfBundleRef;
         result.set(cid, ref);
       } catch (err) {
+        // Steelman³⁸ warning: emit a typed CID_REF_CORRUPT event so
+        // tampering / encryption-key drift / payload corruption is
+        // OBSERVABLE to consumers. The current flow continues
+        // (skip-and-log) is correct behavior — the change is just
+        // making the failure visible. Distinct from a generic
+        // 'storage:error' so UIs can decide whether to show a banner
+        // or alert the user.
         this.log(`Failed to deserialize bundle ref for ${cid}: ${err instanceof Error ? err.message : String(err)}`);
+        this.emitEvent(this.buildErrorEvent('storage:error', err, 'CID_REF_CORRUPT'));
       }
     }
 
@@ -1861,6 +1865,32 @@ export class ProfileTokenStorageProvider
         // Don't let event handler errors break the provider
       }
     }
+  }
+
+  /**
+   * Steelman³⁸ warning: build an event payload that preserves typed
+   * error codes (AggregatorPointerError.code, ProfileError.code,
+   * UxfError.code, SphereError.code) instead of flattening to a string.
+   * Consumers can switch on `event.code` to drive UI state.
+   */
+  private buildErrorEvent(
+    type: 'storage:error' | 'sync:error',
+    err: unknown,
+    overrideCode?: string,
+  ): StorageEvent {
+    const error = err instanceof Error ? err.message : String(err);
+    let code = overrideCode;
+    if (!code && typeof err === 'object' && err !== null) {
+      const codeField = (err as { code?: unknown }).code;
+      if (typeof codeField === 'string') code = codeField;
+    }
+    return {
+      type,
+      timestamp: Date.now(),
+      error,
+      code,
+      cause: err,
+    };
   }
 
   private log(message: string): void {

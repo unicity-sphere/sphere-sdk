@@ -456,6 +456,11 @@ export class NostrReplicationBridge {
       const factory = this.config.createWebSocket ?? ((url: string) => new WebSocket(url));
       const ws = factory(this.config.relayUrl);
 
+      // Steelman³⁸ note: explicit removeEventListener cleanup of the
+      // open/error listeners after resolution. Without this, long-lived
+      // daemons that reconnect on transient relay drops accumulate orphan
+      // listeners (each holds resolve/reject closures keeping references
+      // alive). `{ once: true }` gives the same effect with less code.
       const timeout = setTimeout(() => {
         try { ws.close(); } catch { /* ignore */ }
         reject(new Error(`WebSocket connection to ${this.config.relayUrl} timed out`));
@@ -464,12 +469,12 @@ export class NostrReplicationBridge {
       ws.addEventListener('open', () => {
         clearTimeout(timeout);
         resolve(ws);
-      });
+      }, { once: true } as AddEventListenerOptions);
 
       ws.addEventListener('error', (ev) => {
         clearTimeout(timeout);
         reject(new Error(`WebSocket connection failed: ${String(ev)}`));
-      });
+      }, { once: true } as AddEventListenerOptions);
     });
   }
 
@@ -538,7 +543,18 @@ export class NostrReplicationBridge {
       };
 
       this.ws!.addEventListener('message', onMessage);
-      this.sendJson(['EVENT', event]);
+      // Steelman³⁸ note: if sendJson throws synchronously (e.g.,
+      // ws.send on a closed socket), the message listener attached
+      // one line earlier becomes a permanent orphan. Catch the throw,
+      // remove the listener, clear the timer, and reject.
+      try {
+        this.sendJson(['EVENT', event]);
+      } catch (err) {
+        settled = true;
+        clearTimeout(timeout);
+        this.ws?.removeEventListener('message', onMessage);
+        reject(err);
+      }
     });
   }
 

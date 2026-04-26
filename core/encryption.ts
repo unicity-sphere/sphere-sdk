@@ -127,12 +127,20 @@ function computeMac(
  * Constant-time comparison of two hex strings of equal length.
  * For MAC verification — non-constant-time `===` would leak via
  * timing how many bytes matched.
+ *
+ * Steelman³⁹ note: canonicalizes both sides to lowercase first so
+ * stored uppercase hex and computed lowercase hex compare equal.
+ * The lowercasing itself is non-constant-time but operates on
+ * non-secret data (the MAC, which is verified before any decryption
+ * key material is touched), so the timing leak there is acceptable.
  */
 function constantTimeHexEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
+  const aLower = a.toLowerCase();
+  const bLower = b.toLowerCase();
   let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  for (let i = 0; i < aLower.length; i++) {
+    diff |= aLower.charCodeAt(i) ^ bLower.charCodeAt(i);
   }
   return diff === 0;
 }

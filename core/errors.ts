@@ -108,13 +108,15 @@ export type SphereErrorCode =
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
-  readonly cause?: unknown;
 
   constructor(message: string, code: SphereErrorCode, cause?: unknown) {
-    super(message);
+    // Steelman³⁸ note: forward `cause` to the native Error constructor
+    // so `err.cause` walks (Sentry, util.inspect, pino-pretty) see the
+    // chain. Previously a redeclared `readonly cause?: unknown` field
+    // shadowed the native getter, breaking standard tooling.
+    super(message, cause !== undefined ? { cause } : undefined);
     this.name = 'SphereError';
     this.code = code;
-    this.cause = cause;
   }
 }
 
