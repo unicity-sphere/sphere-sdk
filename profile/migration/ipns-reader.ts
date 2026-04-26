@@ -54,7 +54,19 @@ export const PROFILE_IPNS_HKDF_INFO = 'uxf-profile-ed25519-v1';
 /** Local-cache key: legacy IPNS sequence number (presence = legacy wallet). */
 export const LEGACY_IPNS_SEQUENCE_KEY = 'profile.ipns.sequence';
 
-/** Local-cache key: migration-done marker. Once set, migration never re-runs. */
+/**
+ * Local-cache key: migration-done marker. Once set, migration never re-runs.
+ *
+ * Steelman⁴³ note (THREAT MODEL): this marker is plain unsigned text in
+ * local storage. An attacker with filesystem access can:
+ *   - DELETE the marker to force re-migration with hostile new IPNS data;
+ *   - INJECT the marker to suppress legitimate migration.
+ * Both attacks require local filesystem access, which is a stronger threat
+ * than the SDK's general perimeter. The local-storage trust assumption is
+ * inherent to the legacy migration path; binding the marker to a HMAC-of-
+ * chainPubkey would close it but adds infrastructure (key rotation,
+ * migration-of-the-migration). Filed as a known limitation.
+ */
 export const MIGRATION_DONE_KEY = 'profile.pointer.migration.done';
 
 /** Snapshot schema version produced by the legacy IPNS writer. */

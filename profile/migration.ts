@@ -149,6 +149,25 @@ interface TransformedData {
  * ```
  */
 export class ProfileMigration {
+  // Steelman⁴³ warning: deprecated. The 6-step destructive flow merges
+  // remote IPFS data via `mergeTxfData` with NO cryptographic
+  // verification. Use `importLegacyTokens` (profile/import-from-legacy)
+  // for new integrations — it routes through the UXF verifier.
+  // This class is kept for backward-compat only.
+  private static _deprecationWarned = false;
+  constructor() {
+    if (!ProfileMigration._deprecationWarned) {
+      ProfileMigration._deprecationWarned = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[ProfileMigration] DEPRECATED: this 6-step destructive migration ' +
+          'merges remote IPFS data without cryptographic verification. ' +
+          'New code should use importLegacyTokens (profile/import-from-legacy) ' +
+          'which routes through the UXF integrity verifier.',
+      );
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Public API
   // ---------------------------------------------------------------------------

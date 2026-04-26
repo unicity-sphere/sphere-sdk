@@ -442,6 +442,17 @@ export class OrbitDbAdapter implements ProfileDatabase {
 
       // Non-trusted read → force downgrade to 'replicated'. Peer-claimed
       // 'user'/'system' tags are overridden here.
+      //
+      // Steelman⁴³/⁴⁴ DESIGN NOTE: `localAuthoredKeys` is per-INSTANCE
+      // memory. Tab A's writes that replicate to Tab B (same identity)
+      // appear as 'replicated' to B even though both tabs share the
+      // wallet identity. This is FAIL-CLOSED behavior: B does NOT grant
+      // elevated privilege based on a forged tag, just refuses to grant
+      // it without local-authored proof. Cross-tab actions that depend
+      // on `trustLocalClaim` will be downgraded — that's the safe
+      // default. A future enhancement could verify the OpLog entry's
+      // identity field against the wallet's chainPubkey to recognize
+      // sibling-tab writes; deferred until a use case justifies it.
       return decodeAndDowngradeReplicated(bytes);
     } catch (err) {
       // Steelman³ remediation: pass ProfileError through unchanged.

@@ -909,8 +909,31 @@ export class ProfileTokenStorageProvider
       const carBytes = await pkg.toCar();
 
       // 4. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
+      //
+      // Steelman⁴⁴ warning: re-validate the cached CID still represents
+      // the CURRENT bundle state before reuse. A sibling instance may
+      // have already pinned a superseding bundle; reusing the stale CID
+      // would leave a redundant ref in OrbitDB. Cross-instance check:
+      // if a NEWER bundle already exists for this address, abandon the
+      // cached CID and pin fresh.
       let cid: string;
-      if (this.lastPinnedCid) {
+      let useCachedCid = this.lastPinnedCid !== null;
+      if (useCachedCid) {
+        try {
+          const activeBundles = await this.listActiveBundles();
+          if (!activeBundles.has(this.lastPinnedCid!)) {
+            // Our cached CID is no longer active (superseded by another
+            // instance's pin or by consolidation). Re-pin from scratch.
+            useCachedCid = false;
+            this.lastPinnedCid = null;
+          }
+        } catch {
+          // Best-effort — if we can't validate, fall through to using
+          // the cached value. The OrbitDB write will reconcile via
+          // CRDT merge.
+        }
+      }
+      if (useCachedCid && this.lastPinnedCid) {
         cid = this.lastPinnedCid;
       } else {
         cid = await pinToIpfs(this._ipfsGateways, carBytes);
