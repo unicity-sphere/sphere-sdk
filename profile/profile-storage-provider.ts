@@ -579,9 +579,15 @@ export class ProfileStorageProvider implements StorageProvider {
             pkBytes.fill(0);
           }
         }
+        // Steelman³⁰ note: when dbNameOverride is set, withhold the hex
+        // privateKey from the adapter — eliminates the duplicate
+        // memory-resident copy in OrbitDbConfig. The wallet identity
+        // still holds the same hex string (FullIdentity is immutable JS
+        // string, can't be wiped), but at least we avoid making a
+        // second long-lived copy in the db config slot.
         await this.db.connect({
           ...orbitDbConfig,
-          privateKey: identityAtStart.privateKey,
+          privateKey: dbNameOverride ? undefined : identityAtStart.privateKey,
           dbNameOverride,
         });
         this.dbStatus = 'attached';

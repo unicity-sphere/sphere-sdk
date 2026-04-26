@@ -35,6 +35,23 @@ import type { FullIdentity } from '../../types';
 // =============================================================================
 
 function hexToBytes(hex: string): Uint8Array {
+  // Steelman³⁰ critical: strict validation — reject empty, odd-length,
+  // and non-hex inputs. Previously `hex.length >> 1` floored odd-length
+  // (silently dropped last char) and `parseInt('zz', 16) === NaN`
+  // silently coerced to 0, producing degenerate signing keys with no
+  // error. Same bug class as profile/profile-storage-provider.ts F.31.
+  if (typeof hex !== 'string') {
+    throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
+  }
+  if (hex.length === 0) {
+    throw new RangeError('hexToBytes: empty hex string');
+  }
+  if (hex.length % 2 !== 0) {
+    throw new RangeError(`hexToBytes: odd-length hex string (${hex.length} chars)`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new RangeError('hexToBytes: contains non-hex characters');
+  }
   const len = hex.length >> 1;
   const bytes = new Uint8Array(len);
   for (let i = 0; i < len; i++) {

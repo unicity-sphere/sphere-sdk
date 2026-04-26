@@ -366,14 +366,25 @@ export class UxfPackage {
  * Wrap a raw UxfPackageData pool Map as an ElementPool instance.
  * Many internal functions require ElementPool rather than a plain Map.
  *
- * Steelman²⁸/²⁹ critical: this is a trust-boundary wrapper. The
+ * Steelman²⁸/²⁹/³⁰: this is a trust-boundary wrapper. The
  * UxfPackageData may have been constructed in-memory by trusted code OR
  * may be the post-deserialize result of attacker-supplied JSON/CAR. We
  * use the verifying variant (fromMapVerified) to catch any
- * key/element-hash inconsistency at the point of wrapping. Cost: one
- * SHA-256 per element. Bounded by VERIFY_MAX_POOL_SIZE = 1M (verify.ts).
+ * key/element-hash inconsistency at the point of wrapping.
+ *
+ * Cost: one SHA-256 per element. Enforces WRAP_POOL_MAX_SIZE = 1M to
+ * prevent bloat-DoS — separate from verify.ts's VERIFY_MAX_POOL_SIZE
+ * which only applies inside verify().  Hot batch paths use ingestAll
+ * which wraps once for the whole batch (steelman³⁰ ingestAll fix).
  */
+const WRAP_POOL_MAX_SIZE = 1_000_000;
 function wrapPool(pkg: UxfPackageData): ElementPool {
+  if (pkg.pool.size > WRAP_POOL_MAX_SIZE) {
+    throw new UxfError(
+      'INVALID_PACKAGE',
+      `wrapPool: pool size ${pkg.pool.size} exceeds WRAP_POOL_MAX_SIZE=${WRAP_POOL_MAX_SIZE} (bloat-DoS protection)`,
+    );
+  }
   return ElementPool.fromMapVerified(pkg.pool);
 }
 
@@ -416,11 +427,28 @@ export function ingest(pkg: UxfPackageData, token: unknown): void {
 
 /**
  * Batch ingest multiple tokens.
+ *
+ * Steelman³⁰ warning: wrap the pool ONCE for the whole batch instead
+ * of per-token. The previous loop-of-ingest meant fromMapVerified
+ * (which re-hashes the entire pool) ran N times for N tokens — O(N²)
+ * SHA-256 calls on the hot flush path (PaymentsModule.flushOpStateToProfile,
+ * ProfileTokenStorageProvider). Now O(N): the wrap-and-verify
+ * happens once; ingest mutations stay in the wrapped pool until syncPool.
  */
 export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
+  if (tokens.length === 0) return;
+  const pool = wrapPool(pkg);
+  const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
   for (const token of tokens) {
-    ingest(pkg, token);
+    const rootHash = deconstructToken(pool, token);
+    const rootElement = pool.get(rootHash)!;
+    const rootContent = rootElement.content as unknown as TokenRootContent;
+    const tokenId = rootContent.tokenId;
+    mutableManifest.set(tokenId, rootHash);
+    updateIndexesForToken(pkg, tokenId, rootHash);
   }
+  syncPool(pkg, pool);
+  (pkg.envelope as { updatedAt: number }).updatedAt = Math.floor(Date.now() / 1000);
 }
 
 /**

@@ -341,18 +341,21 @@ export async function verifyCidAccessible(
  */
 function validateGatewayUrls(gateways: readonly string[]): void {
   for (const gateway of gateways) {
+    let u: URL;
     try {
-      const u = new URL(gateway);
-      if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-        throw new Error(
-          `IPFS gateway URL must use http:// or https://, got "${gateway}" (protocol="${u.protocol}")`,
-        );
-      }
-      if (u.username !== '' || u.password !== '') {
-        throw new Error(`IPFS gateway URL must not contain userinfo: "${gateway}"`);
-      }
+      u = new URL(gateway);
     } catch (err) {
-      throw new Error(`Invalid IPFS gateway URL "${gateway}": ${String(err)}`);
+      throw new Error(
+        `Invalid IPFS gateway URL "${gateway}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      throw new Error(
+        `IPFS gateway URL must use http:// or https://, got "${gateway}" (protocol="${u.protocol}")`,
+      );
+    }
+    if (u.username !== '' || u.password !== '') {
+      throw new Error(`IPFS gateway URL must not contain userinfo: "${gateway}"`);
     }
   }
 }

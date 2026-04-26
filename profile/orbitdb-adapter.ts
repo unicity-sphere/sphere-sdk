@@ -749,8 +749,25 @@ function bytesToHex(bytes: Uint8Array): string {
 
 /**
  * Convert a hex string to Uint8Array.
+ *
+ * Steelman³⁰ warning: strict validation — reject empty, odd-length,
+ * and non-hex inputs. Previously silently truncated and coerced
+ * non-hex to 0, which on the derivePublicKeyShort fallback path could
+ * shift the OrbitDB identity silently for a malformed key.
  */
 function hexToBytes(hex: string): Uint8Array {
+  if (typeof hex !== 'string') {
+    throw new TypeError(`hexToBytes: expected string, got ${typeof hex}`);
+  }
+  if (hex.length === 0) {
+    throw new RangeError('hexToBytes: empty hex string');
+  }
+  if (hex.length % 2 !== 0) {
+    throw new RangeError(`hexToBytes: odd-length hex string (${hex.length} chars)`);
+  }
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new RangeError('hexToBytes: contains non-hex characters');
+  }
   const bytes = new Uint8Array(hex.length / 2);
   for (let i = 0; i < hex.length; i += 2) {
     bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
