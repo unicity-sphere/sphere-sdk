@@ -38,6 +38,7 @@
  */
 
 import { logger } from './logger';
+import { hexToBytes as strictHexToBytes } from './hex';
 import type {
   Identity,
   FullIdentity,
@@ -411,7 +412,9 @@ const UNICITY_TOKEN_TYPE_HEX = 'f8aa13834268d29355ff12183066f0cb902003629bbc5eb9
  * Uses UnmaskedPredicateReference for stable wallet address
  */
 async function deriveL3PredicateAddress(privateKey: string): Promise<string> {
-  const secret = Buffer.from(privateKey, 'hex');
+  // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex') silently
+  // truncates odd-length and stops at first non-hex char.
+  const secret = strictHexToBytes(privateKey);
   const signingService = await SigningService.createFromSecret(secret);
 
   const tokenTypeBytes = Buffer.from(UNICITY_TOKEN_TYPE_HEX, 'hex');

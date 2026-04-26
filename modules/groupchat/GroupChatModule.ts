@@ -14,6 +14,7 @@ import {
 
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import { hexToBytes as strictHexToBytes } from '../../core/hex';
 
 import type {
   FullIdentity,
@@ -307,7 +308,7 @@ export class GroupChatModule {
     this.deps = deps;
 
     // Create key manager from identity
-    const secretKey = Buffer.from(deps.identity.privateKey, 'hex');
+    const secretKey = strictHexToBytes(deps.identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
   }
 
@@ -822,7 +823,7 @@ export class GroupChatModule {
     this.subscriptionIds = [];
 
     // Update key manager for new identity
-    const secretKey = Buffer.from(this.deps!.identity.privateKey, 'hex');
+    const secretKey = strictHexToBytes(this.deps!.identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
     if (this.groups.size === 0) {
@@ -838,7 +839,7 @@ export class GroupChatModule {
     this.ensureInitialized();
 
     if (!this.keyManager) {
-      const secretKey = Buffer.from(this.deps!.identity.privateKey, 'hex');
+      const secretKey = strictHexToBytes(this.deps!.identity.privateKey);
       this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
     }
 

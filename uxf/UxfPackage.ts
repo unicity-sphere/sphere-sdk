@@ -460,24 +460,33 @@ export function ingestAll(pkg: UxfPackageData, tokens: unknown[]): void {
   // indexes. If an earlier deconstructToken threw, we never reach here
   // and the package state is unchanged.
   //
-  // Steelman³² warning: wrap the index loop in try/catch. Today
+  // Steelman³²/³³ warning: wrap the index loop in try/catch. Today
   // updateIndexesForToken is no-throw (silent if/return on missing
   // elements), but future changes could add throws — without the
   // catch, a partial commit would leave manifest pointing at tokens
-  // whose indexes weren't built. On throw, ROLL BACK the manifest
-  // entries we just added so the caller sees an all-or-nothing batch.
+  // whose indexes weren't built AND indexes pointing at tokens whose
+  // manifest entries got rolled back. On throw, ROLL BACK both the
+  // manifest entries AND the index entries we added.
   syncPool(pkg, pool);
   const mutableManifest = pkg.manifest.tokens as Map<string, ContentHash>;
   const previousManifest = new Map<string, ContentHash | undefined>();
   for (const { tokenId } of newTokens) {
     previousManifest.set(tokenId, mutableManifest.get(tokenId));
   }
+  const committedTokenIds: string[] = [];
   try {
     for (const { tokenId, rootHash } of newTokens) {
       mutableManifest.set(tokenId, rootHash);
       updateIndexesForToken(pkg, tokenId, rootHash);
+      committedTokenIds.push(tokenId);
     }
   } catch (err) {
+    // Roll back the indexes for tokens we already committed (avoids
+    // index/manifest divergence: indexes referencing tokens whose
+    // manifest entry is about to be removed).
+    for (const tokenId of committedTokenIds) {
+      try { removeFromIndexes(pkg.indexes, tokenId); } catch { /* best-effort */ }
+    }
     // Roll back manifest mutations.
     for (const [tokenId, prev] of previousManifest) {
       if (prev === undefined) mutableManifest.delete(tokenId);

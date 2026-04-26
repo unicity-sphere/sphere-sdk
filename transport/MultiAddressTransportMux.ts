@@ -26,6 +26,7 @@ import {
 } from '@unicitylabs/nostr-js-sdk';
 import { logger } from '../core/logger';
 import { SphereError } from '../core/errors';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 
 import type { ProviderStatus, FullIdentity } from '../types';
 import type {
@@ -192,7 +193,7 @@ export class MultiAddressTransportMux {
     const existing = this.addresses.get(index);
     if (existing) {
       existing.identity = identity;
-      existing.keyManager = NostrKeyManager.fromPrivateKey(Buffer.from(identity.privateKey, 'hex'));
+      existing.keyManager = NostrKeyManager.fromPrivateKey(strictHexToBytes(identity.privateKey));
       existing.nostrPubkey = existing.keyManager.getPublicKeyHex();
       // Update pubkey mapping
       for (const [pk, idx] of this.pubkeyToIndex) {
@@ -204,7 +205,7 @@ export class MultiAddressTransportMux {
       return existing.adapter;
     }
 
-    const keyManager = NostrKeyManager.fromPrivateKey(Buffer.from(identity.privateKey, 'hex'));
+    const keyManager = NostrKeyManager.fromPrivateKey(strictHexToBytes(identity.privateKey));
     const nostrPubkey = keyManager.getPublicKeyHex();
 
     const adapter = new AddressTransportAdapter(this, index, identity, resolveDelegate);

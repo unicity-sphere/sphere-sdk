@@ -29,6 +29,7 @@ import {
 import type { BindingInfo } from '@unicitylabs/nostr-js-sdk';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { logger } from '../core/logger';
+import { hexToBytes as strictHexToBytes } from '../core/hex';
 import type { ProviderStatus, FullIdentity } from '../types';
 import { SphereError } from '../core/errors';
 import type {
@@ -444,8 +445,10 @@ export class NostrTransportProvider implements TransportProvider {
     this.lastDmEventTs = 0;
     this.fallbackDmSince = null;
 
-    // Create NostrKeyManager from private key
-    const secretKey = Buffer.from(identity.privateKey, 'hex');
+    // Create NostrKeyManager from private key.
+    // Steelman³³ warning: strict hex decode — Buffer.from(_, 'hex')
+    // silently truncates malformed inputs.
+    const secretKey = strictHexToBytes(identity.privateKey);
     this.keyManager = NostrKeyManager.fromPrivateKey(secretKey);
 
     // Use Nostr-format pubkey (32 bytes / 64 hex chars) from keyManager
