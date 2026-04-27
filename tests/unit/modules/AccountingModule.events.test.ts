@@ -777,6 +777,74 @@ describe('AccountingModule — Events', () => {
   });
 
   // -------------------------------------------------------------------------
+  // UT-EVENTS-024b: Regression — transfer arriving BEFORE its invoice is
+  // imported is buffered in the orphan ledger and attributed on import.
+  //
+  // BUG: Before this fix, a transport-memo-referenced transfer that arrived
+  // before the corresponding invoice was imported would fire
+  // invoice:unknown_reference and be permanently dropped — `getInvoiceStatus`
+  // for the now-known invoice showed `transfers: []` even though the wallet
+  // held the token.
+  //
+  // This is a real race in the swap payout flow: the escrow's `payInvoice`
+  // publishes the actual token via the wallet/transfer Nostr filter, then
+  // sends the invoice-delivery DM via the chat filter. Either delivery order
+  // is possible at the relay; if the payment arrives first, attribution is
+  // lost.
+  //
+  // FIX: when the invoice isn't in cache, _handleIncomingTransfer now writes
+  // a synthetic ref into invoiceLedger keyed by the invoiceId so that
+  // importInvoice()'s existing migration logic surfaces it on import.
+  // -------------------------------------------------------------------------
+  it('UT-EVENTS-024b: transfer arriving before invoice import is buffered and attributed on late import', async () => {
+    const lateInvoiceId = 'd'.repeat(64);
+
+    // 1. Transfer arrives FIRST — invoice not yet known to the module.
+    const transfer = makeIncomingTransfer(lateInvoiceId, 'F', '5000000');
+    mocks.payments._emit('transfer:incoming', transfer);
+    await new Promise((r) => setTimeout(r, 30));
+
+    // unknown_reference still fires (preserves backward-compat observability)
+    const unknownCalls = emitEvent.mock.calls.filter(
+      ([evt]: [string]) => evt === 'invoice:unknown_reference',
+    );
+    expect(unknownCalls.length).toBeGreaterThan(0);
+    expect(unknownCalls[0][1]).toMatchObject({ invoiceId: lateInvoiceId });
+
+    // 2. Confirm the orphan ledger has the buffered transfer entry.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orphanLedger = (module as any).invoiceLedger.get(lateInvoiceId) as Map<string, unknown>;
+    expect(orphanLedger).toBeDefined();
+    expect(orphanLedger.size).toBeGreaterThan(0);
+
+    // 3. Late-import the invoice (using the same direct-injection helper as
+    //    other tests since real importInvoice() requires crypto proofs the
+    //    test transfers can't supply). injectInvoice() preserves any pre-
+    //    existing ledger entries — mirroring the production importInvoice()
+    //    behavior at line 1675 ("if (!this.invoiceLedger.has(tokenId))").
+    injectInvoice(module, makeTerms(), lateInvoiceId);
+
+    // 4. The orphan entry must still be in the ledger after import.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ledgerAfter = (module as any).invoiceLedger.get(lateInvoiceId) as Map<string, unknown>;
+    expect(ledgerAfter.size).toBeGreaterThan(0);
+
+    // 5. The buffered ref carries the original transfer's invoice-pointing
+    //    metadata — sufficient for getInvoiceStatus to surface it once the
+    //    rest of the chain (proper coverage check) runs at status-compute
+    //    time. Asserting on the ref shape rather than a status round-trip
+    //    keeps this test focused on the buffer-vs-drop fix.
+    const firstEntry = Array.from(ledgerAfter.values())[0] as {
+      paymentDirection?: string;
+      coinId?: string;
+      amount?: string;
+    };
+    expect(firstEntry.paymentDirection).toBe('forward');
+    expect(firstEntry.coinId).toBe('UCT');
+    expect(firstEntry.amount).toBe('5000000');
+  });
+
+  // -------------------------------------------------------------------------
   // UT-EVENTS-025: invoice:over_refund_warning fires when returns exceed forwards
   // -------------------------------------------------------------------------
   it('UT-EVENTS-025: invoice:over_refund_warning fires when returned > forwarded', async () => {

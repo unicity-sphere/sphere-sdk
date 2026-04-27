@@ -2031,6 +2031,30 @@ export class AccountingModule {
   }
 
   /**
+   * Return the set of token IDs that are currently linked to the given
+   * invoice. Populated by both the on-chain `_processTokenTransactions`
+   * path (tokens with `inv:` references) and the transport-memo orphan
+   * buffering path in `_handleIncomingTransfer`.
+   *
+   * Used by callers that want to scope per-invoice operations (e.g.
+   * SwapModule.verifyPayout's L3 validation) to only the tokens that
+   * cover this invoice — avoiding false negatives when the wallet
+   * contains unrelated tokens of the same currency in unconfirmed or
+   * spent state.
+   *
+   * Returns an empty set if no tokens are currently linked.
+   */
+  getTokenIdsForInvoice(invoiceId: string): Set<string> {
+    const result = new Set<string>();
+    for (const [tokenId, invoiceIds] of this.tokenInvoiceMap) {
+      if (invoiceIds.has(invoiceId)) {
+        result.add(tokenId);
+      }
+    }
+    return result;
+  }
+
+  /**
    * Explicitly close an invoice. Only target parties may close (§8.3).
    *
    * On close:
@@ -4697,7 +4721,16 @@ export class AccountingModule {
       }
     }
 
-    // §6.2 step 2: Invoice not in local store → fire unknown_reference and return
+    // §6.2 step 2: Invoice not in local store → fire unknown_reference and
+    // BUFFER the synthetic ref so importInvoice() can attribute it later.
+    //
+    // Without buffering, transport-memo attribution is permanently lost when
+    // the actual token payment arrives BEFORE the corresponding invoice token
+    // (a real race in the swap-payout flow: escrow's payInvoice publishes the
+    // payment on the wallet/transfer Nostr filter, then sends an invoice
+    // delivery DM on the chat filter — the relay may deliver them in either
+    // order). Mirrors the proactive-indexing buffer used by
+    // _processTokenTransactions for on-chain `inv:` references.
     if (!this.invoiceTermsCache.has(invoiceId)) {
       const syntheticRef = this._buildSyntheticTransferRef(
         transfer,
@@ -4706,6 +4739,46 @@ export class AccountingModule {
         confirmed,
       );
       deps.emitEvent('invoice:unknown_reference', { invoiceId, transfer: syntheticRef });
+
+      // Buffer the synthetic ref into an orphan ledger keyed by the (yet-
+      // unknown) invoiceId. The ledger persists; on importInvoice(), the
+      // existing migration logic preserves any pre-existing ledger entries
+      // for the imported ID, so getInvoiceStatus() will see this transfer
+      // immediately after import.
+      const MAX_UNKNOWN_INVOICE_IDS = 500;
+      if (!this.invoiceLedger.has(invoiceId)) {
+        if (this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS) {
+          // Cap reached — drop this orphan. Caller would have to
+          // importInvoice() and rely on its on-chain rescan, which won't
+          // help for transport-memo-only attribution. This is a soft
+          // guarantee: under normal operation, importInvoice() runs within
+          // seconds of the transfer arriving, far below the 500-entry cap.
+          return;
+        }
+        this.invoiceLedger.set(invoiceId, new Map());
+        this.unknownLedgerCount++;
+      }
+      const orphanLedger = this.invoiceLedger.get(invoiceId)!;
+      // Key by token-id+transfer-id so duplicate event delivery doesn't
+      // create double-counted entries. Prefixed with `mt:` (memo-transport)
+      // to avoid collision with the on-chain dedup keys used elsewhere.
+      for (const token of transfer.tokens) {
+        if (!token.id) continue;
+        const orphanKey = `mt:${token.id}:${transfer.id}`;
+        if (!orphanLedger.has(orphanKey)) {
+          orphanLedger.set(orphanKey, syntheticRef);
+        }
+        // Also populate tokenInvoiceMap so downstream code (e.g.
+        // SwapModule.verifyPayout's L3 validation filter) can identify the
+        // tokens that cover this specific invoice.
+        if (!this.tokenInvoiceMap.has(token.id)) {
+          this.tokenInvoiceMap.set(token.id, new Set());
+        }
+        this.tokenInvoiceMap.get(token.id)!.add(invoiceId);
+      }
+      this.dirtyLedgerEntries.add(invoiceId);
+      this.balanceCache.delete(invoiceId);
+      await this._flushDirtyLedgerEntries();
       return;
     }
 

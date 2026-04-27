@@ -1541,14 +1541,55 @@ export class SwapModule {
       myDirectAddresses.add(addr.directAddress);
     }
 
-    let assetIndex: number;
+    // Determine the currency this party owes. The party's slot is identified
+    // by address match against the manifest, and the currency comes directly
+    // from the manifest fields — NOT from positional indexing into the
+    // invoice's assets array.
+    //
+    // Why not positional? `accounting/serialization.ts:canonicalSerialize()`
+    // sorts each target's assets by coinId hash for deterministic invoice IDs.
+    // After that sort, `assets[0]` is whichever currency happens to sort
+    // earlier — it may belong to either party. Selecting `assetIndex` by
+    // position breaks silently when the manifest's party_a_currency hashes
+    // *after* party_b_currency (the buyer ends up paying party B's currency).
+    // We instead look up the asset slot whose coinId matches our expected
+    // currency.
+    let myExpectedCurrency: string;
     if (myDirectAddresses.has(swap.manifest.party_a_address)) {
-      assetIndex = 0; // party A
+      myExpectedCurrency = swap.manifest.party_a_currency_to_change;
     } else if (myDirectAddresses.has(swap.manifest.party_b_address)) {
-      assetIndex = 1; // party B
+      myExpectedCurrency = swap.manifest.party_b_currency_to_change;
     } else {
       throw new SphereError(
         'Local wallet address does not match either party in the swap manifest',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+
+    const invoiceRefForAssetLookup = deps.accounting.getInvoice(swap.depositInvoiceId) as
+      | { terms: { targets: Array<{ address: string; assets: Array<{ coin?: [string, string] }> }> } }
+      | null;
+    if (!invoiceRefForAssetLookup) {
+      // Same SWAP_WRONG_STATE error semantics as the in-gate re-check below —
+      // caller can retry once the invoice token has been imported.
+      throw new SphereError(
+        'Deposit invoice not yet imported into accounting module',
+        'SWAP_WRONG_STATE',
+      );
+    }
+    const depositTarget = invoiceRefForAssetLookup.terms.targets[0];
+    if (!depositTarget) {
+      throw new SphereError(
+        'Deposit invoice has no targets',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+    const assetIndex = depositTarget.assets.findIndex(
+      (a) => a.coin !== undefined && coinIdsMatch(a.coin[0], myExpectedCurrency),
+    );
+    if (assetIndex < 0) {
+      throw new SphereError(
+        `No asset matching expected currency ${myExpectedCurrency} found in deposit invoice`,
         'SWAP_DEPOSIT_FAILED',
       );
     }
@@ -1824,15 +1865,40 @@ export class SwapModule {
       }
     }
 
-    // Validate L3 inclusion proofs.
-    // NOTE: validate() checks ALL wallet tokens, not only payout tokens. An unrelated
-    // invalid token should NOT cause the swap to fail — the swap's payout may be
-    // perfectly valid. We therefore do not call failPayout() here; instead we return
-    // false so the caller can retry once the unrelated token issue is resolved.
+    // Validate L3 inclusion proofs — but ONLY for tokens that cover this
+    // specific payout invoice. validate() checks the full wallet; any
+    // unrelated invalid token (e.g. a now-spent original UCT consumed by
+    // a split for some other operation, or an unrelated incoming transfer
+    // that hasn't finalized yet) would otherwise pin verifyPayout to false
+    // forever even when the payout itself is fully covered and valid.
+    //
+    // Multiple wallet tokens can share the same coinId (e.g. the original
+    // funded balance + the incoming payout); coinId-only filtering is too
+    // loose. Use accounting.getTokenIdsForInvoice() to get the exact set of
+    // tokens linked to THIS invoice and filter the invalid set to that.
     const validationResult = await deps.payments.validate();
     if (validationResult.invalid.length > 0) {
-      logger.warn(LOG_TAG, `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${validationResult.invalid.length} invalid token(s) — retry after wallet sync`);
-      return returnFalse();
+      const payoutTokenIds = (
+        deps.accounting as unknown as {
+          getTokenIdsForInvoice?: (invoiceId: string) => Set<string>;
+        }
+      ).getTokenIdsForInvoice?.(swap.payoutInvoiceId) ?? new Set<string>();
+
+      const relevantInvalid = validationResult.invalid.filter((t) =>
+        payoutTokenIds.has(t.id),
+      );
+      if (relevantInvalid.length > 0) {
+        logger.warn(
+          LOG_TAG,
+          `verifyPayout for ${swapId.slice(0, 12)}: L3 validation found ${relevantInvalid.length} invalid token(s) covering this payout invoice — retry after wallet sync`,
+        );
+        return returnFalse();
+      }
+      // Unrelated invalids are NOT a swap-blocking concern.
+      logger.debug(
+        LOG_TAG,
+        `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} unrelated invalid token(s) ignored (not linked to this payout invoice)`,
+      );
     }
 
     // All checks passed — mark payout as verified.

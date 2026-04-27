@@ -134,15 +134,43 @@ describe('SwapModule.errors', () => {
   // =========================================================================
 
   it('UT-SWAP-ERR-007: SWAP_DEPOSIT_FAILED when payInvoice rejects', async () => {
+    const depositInvoiceId = 'test-deposit-invoice-err007';
     const ref = createTestSwapRef({
       role: 'proposer',
       progress: 'announced',
       counterpartyPubkey: DEFAULT_TEST_PARTY_B_TRANSPORT_PUBKEY,
       escrowPubkey: DEFAULT_TEST_ESCROW_TRANSPORT_PUBKEY,
       escrowDirectAddress: DEFAULT_TEST_ESCROW_ADDRESS,
-      depositInvoiceId: 'test-deposit-invoice-err007',
+      depositInvoiceId,
     });
     injectSwapRef(module, ref);
+
+    // Seed the deposit invoice in the mock accounting store so the in-deposit
+    // currency-match lookup (added in SwapModule.deposit() to avoid the
+    // canonical-sort positional bug) finds a valid asset slot before
+    // payInvoice() runs. Without this seed the deposit path would short-
+    // circuit with SWAP_WRONG_STATE rather than reaching the payInvoice
+    // rejection this test is targeting.
+    const m = ref.manifest;
+    mocks.accounting._invoices.set(depositInvoiceId, {
+      invoiceId: depositInvoiceId,
+      terms: {
+        creator: ref.escrowPubkey,
+        createdAt: Date.now(),
+        targets: [
+          {
+            address: DEFAULT_TEST_ESCROW_ADDRESS,
+            assets: [
+              { coin: [m.party_a_currency_to_change, m.party_a_value_to_change] },
+              { coin: [m.party_b_currency_to_change, m.party_b_value_to_change] },
+            ],
+          },
+        ],
+      },
+      isCreator: false,
+      cancelled: false,
+      closed: false,
+    });
 
     // Make payInvoice reject
     mocks.accounting.payInvoice.mockRejectedValueOnce(new Error('Insufficient balance'));
