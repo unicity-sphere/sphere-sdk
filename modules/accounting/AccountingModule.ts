@@ -4762,15 +4762,42 @@ export class AccountingModule {
       // Key by token-id+transfer-id so duplicate event delivery doesn't
       // create double-counted entries. Prefixed with `mt:` (memo-transport)
       // to avoid collision with the on-chain dedup keys used elsewhere.
+      //
+      // CRITICAL — dedup against on-chain entries from _processTokenTransactions
+      // (which ran above as part of this same _handleIncomingTransfer call).
+      // Those entries are keyed `${tokenId}:${txIndex}::${coinId}` and represent
+      // the same logical payment. If we wrote an `mt:` entry alongside the
+      // on-chain entry, computeInvoiceStatus would iterate both and DOUBLE-COUNT
+      // the amount, breaking coverage tracking. Skip the orphan write whenever
+      // the on-chain path already attributed this token+invoice pair.
       for (const token of transfer.tokens) {
         if (!token.id) continue;
-        const orphanKey = `mt:${token.id}:${transfer.id}`;
-        if (!orphanLedger.has(orphanKey)) {
-          orphanLedger.set(orphanKey, syntheticRef);
+
+        // Detect on-chain attribution: scan the ledger for any key starting
+        // with `${token.id}:` (the on-chain dedup-key format). One match means
+        // _processTokenTransactions already wrote an entry for this token →
+        // skip the orphan write.
+        let onChainAttributed = false;
+        const tokenKeyPrefix = `${token.id}:`;
+        for (const existingKey of orphanLedger.keys()) {
+          if (
+            existingKey.startsWith(tokenKeyPrefix) &&
+            !existingKey.startsWith('mt:') // mt: keys are NOT on-chain attributions
+          ) {
+            onChainAttributed = true;
+            break;
+          }
         }
-        // Also populate tokenInvoiceMap so downstream code (e.g.
-        // SwapModule.verifyPayout's L3 validation filter) can identify the
-        // tokens that cover this specific invoice.
+
+        if (!onChainAttributed) {
+          const orphanKey = `mt:${token.id}:${transfer.id}`;
+          if (!orphanLedger.has(orphanKey)) {
+            orphanLedger.set(orphanKey, syntheticRef);
+          }
+        }
+
+        // tokenInvoiceMap is a Set, so adding the same invoiceId twice is a
+        // no-op — safe to populate unconditionally as a downstream-lookup hint.
         if (!this.tokenInvoiceMap.has(token.id)) {
           this.tokenInvoiceMap.set(token.id, new Set());
         }
