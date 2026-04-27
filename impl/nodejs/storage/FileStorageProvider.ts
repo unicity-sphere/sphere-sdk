@@ -147,6 +147,49 @@ export class FileStorageProvider implements StorageProvider {
     await this.save();
   }
 
+  /**
+   * Wave G.6: atomic multi-key write — staged into in-memory state,
+   * then flushed once via the existing save() path which holds the
+   * cross-process file lock for the entire snapshot rewrite. This
+   * gives true all-or-nothing semantics across keys: either the file
+   * rewrite succeeds and ALL entries are visible on next read, or
+   * the rewrite fails and the on-disk file is unchanged (atomic
+   * temp+rename).
+   *
+   * On in-memory error (rare; allocator), restores the previous
+   * values for any keys we'd already mutated and re-throws.
+   */
+  async setMany(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
+    if (entries.length === 0) return;
+    const previous = new Map<string, string | undefined>();
+    const fullEntries: Array<[string, string]> = [];
+    for (const [key, value] of entries) {
+      const fullKey = this.getFullKey(key);
+      fullEntries.push([fullKey, value]);
+      previous.set(fullKey, this.data[fullKey]);
+    }
+    try {
+      for (const [fullKey, value] of fullEntries) {
+        this.data[fullKey] = value;
+        this.mutatedKeys.add(fullKey);
+        this.removedKeys.delete(fullKey);
+      }
+      await this.save();
+    } catch (err) {
+      // Roll back in-memory state on save failure so the next read
+      // doesn't see a half-applied set.
+      for (const [fullKey, prev] of previous) {
+        if (prev === undefined) {
+          delete this.data[fullKey];
+          this.mutatedKeys.delete(fullKey);
+        } else {
+          this.data[fullKey] = prev;
+        }
+      }
+      throw err;
+    }
+  }
+
   async remove(key: string): Promise<void> {
     const fullKey = this.getFullKey(key);
     delete this.data[fullKey];

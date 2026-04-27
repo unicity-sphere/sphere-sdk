@@ -1558,6 +1558,23 @@ export class ProfileTokenStorageProvider
     // path only reconciles ADDITIONS, which is the common multi-process
     // race (daemon + CLI both adding outbox entries).
     //
+    // Wave G.7 deferred item rationale: a "per-entry-key" refactor
+    // (storing each outbox/invalid/mintOutbox entry under its own
+    // OrbitDB key like `${addr}.outbox.${id}`) would gain native CRDT
+    // semantics — two processes adding different entries would never
+    // conflict at the OrbitDB layer. However, the present read-merge-
+    // write + bounded retry + verify-read + per-op timeout combination
+    // (F.43, F.46, F.47, F.49) already addresses the practical
+    // same-machine multi-process race, and OrbitDB's OpLog already
+    // provides cross-device CRDT semantics via causal ordering. The
+    // refactor would be: (1) change readOperationalState to a key-
+    // prefix scan, (2) change the write path to per-entry puts, (3)
+    // add explicit tombstones for removals (OrbitDB has no native
+    // delete CRDT), (4) migrate existing single-blob data on load.
+    // Net cost is high; correctness benefit is marginal given the
+    // existing mitigations. Documented as accepted-residual until
+    // production telemetry proves otherwise.
+    //
     // Steelman⁴⁶ WARNING: read-merge-write is still racy across processes
     // — between our read and the for-loop write, a sibling process can
     // complete its own RMW cycle, and our subsequent write clobbers

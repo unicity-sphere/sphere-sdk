@@ -3927,42 +3927,43 @@ export class Sphere {
   // ===========================================================================
 
   private async storeMnemonic(mnemonic: string, derivationPath?: string, basePath?: string): Promise<void> {
-    // Steelman⁵¹ CRITICAL: storeMnemonic writes 4-5 separate KV
-    // entries sequentially. If a mid-sequence write rejects (e.g.,
-    // STORAGE_LOCK_CONTENDED, IDB transaction abort, quota exceeded),
-    // the wallet would be left in a half-initialized state on disk
-    // — encrypted MNEMONIC persisted with no metadata, requiring
-    // the user to manually clear() before retrying. We treat the
-    // multi-key write as a best-effort transaction: track the keys
-    // we successfully wrote, and on any error remove them all
-    // before re-throwing. The eventual `WALLET_EXISTS=true` flag
-    // (in finalizeWalletCreation) is the durable commit; the keys
-    // here are only meaningful as a SET observed atomically by
-    // the next Sphere.load(). Best-effort cleanup honors that
-    // contract: either all-or-nothing visible to the next load.
+    // Wave G.6: prefer the atomic setMany() path when the provider
+    // implements it (IndexedDB cross-key transaction, FileStorage
+    // file-lock-guarded snapshot rewrite). Either every key lands or
+    // none do — no rollback needed. Falls back to the F.56 best-
+    // effort transactional rollback for providers that don't.
     const encrypted = this.encrypt(mnemonic);
+    this._mnemonic = mnemonic;
+    this._source = 'mnemonic';
+    this._derivationMode = 'bip32';
+    const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
+    this._basePath = effectiveBasePath;
+    const entries: Array<[string, string]> = [
+      [STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted],
+      [STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath],
+      [STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode],
+      [STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source],
+    ];
+    if (derivationPath) {
+      entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
+    }
+    if (this._storage.setMany) {
+      await this._storage.setMany(entries);
+      return;
+    }
+    // Steelman⁵¹ CRITICAL fallback: best-effort transactional rollback.
+    // See pre-G.6 implementation for full rationale — kept verbatim
+    // for providers without setMany().
     const writtenKeys: string[] = [];
     const writeKey = async (key: string, value: string): Promise<void> => {
       await this._storage.set(key, value);
       writtenKeys.push(key);
     };
     try {
-      await writeKey(STORAGE_KEYS_GLOBAL.MNEMONIC, encrypted);
-      this._mnemonic = mnemonic;
-      this._source = 'mnemonic';
-      this._derivationMode = 'bip32';
-      if (derivationPath) {
-        await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
+      for (const [k, v] of entries) {
+        await writeKey(k, v);
       }
-      const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
-      this._basePath = effectiveBasePath;
-      await writeKey(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-      await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-      await writeKey(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
     } catch (writeErr) {
-      // Best-effort rollback so the next Sphere.load() does not see
-      // half-written wallet metadata. Cleanup failures are logged
-      // but do not mask the original error.
       for (const k of writtenKeys.reverse()) {
         try {
           await this._storage.remove(k);
@@ -3982,36 +3983,39 @@ export class Sphere {
     basePath?: string,
     derivationMode?: DerivationMode
   ): Promise<void> {
-    // Steelman⁵¹ CRITICAL: same multi-key-write atomicity issue as
-    // storeMnemonic — best-effort transactional rollback on any
-    // mid-sequence write failure (STORAGE_LOCK_CONTENDED, quota,
-    // IDB abort, etc.). See storeMnemonic for full rationale.
+    // Wave G.6: prefer setMany when available; fall back to F.56
+    // best-effort rollback otherwise.
     const encrypted = this.encrypt(masterKey);
+    this._source = 'file';
+    this._mnemonic = null;
+    if (derivationMode) {
+      this._derivationMode = derivationMode;
+    } else {
+      this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
+    }
+    const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
+    this._basePath = effectiveBasePath;
+    const entries: Array<[string, string]> = [
+      [STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted],
+      [STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath],
+      [STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode],
+      [STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source],
+    ];
+    if (chainCode) entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode]);
+    if (derivationPath) entries.splice(chainCode ? 2 : 1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
+    if (this._storage.setMany) {
+      await this._storage.setMany(entries);
+      return;
+    }
     const writtenKeys: string[] = [];
     const writeKey = async (key: string, value: string): Promise<void> => {
       await this._storage.set(key, value);
       writtenKeys.push(key);
     };
     try {
-      await writeKey(STORAGE_KEYS_GLOBAL.MASTER_KEY, encrypted);
-      this._source = 'file';
-      this._mnemonic = null;
-      if (derivationMode) {
-        this._derivationMode = derivationMode;
-      } else {
-        this._derivationMode = chainCode ? 'bip32' : 'wif_hmac';
+      for (const [k, v] of entries) {
+        await writeKey(k, v);
       }
-      if (chainCode) {
-        await writeKey(STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode);
-      }
-      if (derivationPath) {
-        await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath);
-      }
-      const effectiveBasePath = basePath ?? DEFAULT_BASE_PATH;
-      this._basePath = effectiveBasePath;
-      await writeKey(STORAGE_KEYS_GLOBAL.BASE_PATH, effectiveBasePath);
-      await writeKey(STORAGE_KEYS_GLOBAL.DERIVATION_MODE, this._derivationMode);
-      await writeKey(STORAGE_KEYS_GLOBAL.WALLET_SOURCE, this._source);
     } catch (writeErr) {
       for (const k of writtenKeys.reverse()) {
         try {

@@ -51,6 +51,23 @@ export interface StorageProvider extends BaseProvider {
   setEntry?(key: string, value: string, entryType: string): Promise<void>;
 
   /**
+   * Wave G.6: optional atomic multi-key write.
+   *
+   * Implementations that support cross-key transactions (IndexedDB,
+   * proper-lockfile-guarded file storage) commit all entries
+   * atomically — either every key is written or none are. Callers
+   * use this for invariants that span multiple keys (e.g. wallet
+   * metadata: encrypted mnemonic + base path + derivation mode +
+   * source — all four must land together so a partial-write doesn't
+   * derive the wrong identity from defaults).
+   *
+   * If the provider does not implement this, callers fall back to
+   * sequential `set()` calls with best-effort rollback on partial
+   * failure (see core/Sphere.ts storeMnemonic for the pattern).
+   */
+  setMany?(entries: ReadonlyArray<readonly [key: string, value: string]>): Promise<void>;
+
+  /**
    * Remove key
    */
   remove(key: string): Promise<void>;

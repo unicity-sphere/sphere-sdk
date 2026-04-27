@@ -143,6 +143,30 @@ export class IndexedDBStorageProvider implements StorageProvider {
     await this.idbPut({ k: fullKey, v: value });
   }
 
+  /**
+   * Wave G.6: atomic multi-key write within a single IDB transaction.
+   * Either every entry commits (`tx.oncomplete`) or every entry is
+   * rolled back (`tx.onabort` — IndexedDB auto-aborts on any per-
+   * request error). This closes the partial-write hazard for cross-
+   * key invariants like wallet metadata persistence.
+   */
+  async setMany(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
+    this.ensureConnected();
+    if (entries.length === 0) return;
+    return new Promise((resolve, reject) => {
+      const tx = this.db!.transaction(STORE_NAME, 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+      const store = tx.objectStore(STORE_NAME);
+      for (const [key, value] of entries) {
+        const fullKey = this.getFullKey(key);
+        const req = store.put({ k: fullKey, v: value });
+        req.onerror = () => reject(req.error);
+      }
+    });
+  }
+
   async remove(key: string): Promise<void> {
     this.ensureConnected();
     const fullKey = this.getFullKey(key);

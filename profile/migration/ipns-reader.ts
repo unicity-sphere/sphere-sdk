@@ -180,9 +180,21 @@ function deserializeSnapshot(bytes: Uint8Array): ProfileSnapshot {
  * Fetch the snapshot body from a CID via the `/ipfs/<cid>` gateway
  * path. Authenticity is anchored at the IPNS record's Ed25519
  * signature (verified in `resolveProfileSnapshot` below) — this fetch
- * itself does not content-address verify because legacy snapshots
- * were published via `/api/v0/add` (UnixFS-wrapped; CID does not hash
- * directly to the file bytes).
+ * itself does not content-address verify the BYTES because legacy
+ * snapshots were published via `/api/v0/add` (UnixFS-wrapped; CID
+ * does not hash directly to the file bytes).
+ *
+ * Wave G.5 deferred: full UnixFS payload content-verification (parse
+ * the CAR + dag-pb root, walk linked chunks, recompute root CID,
+ * reconstruct file bytes) requires a non-trivial UnixFS protobuf
+ * decoder. The cryptographic authentication boundary still holds
+ * via the IPNS Ed25519 signature on the (CID, sequence, validity)
+ * tuple — a hostile gateway cannot forge an IPNS record claiming an
+ * attacker-chosen CID. The residual gap is "gateway lies about the
+ * bytes at that CID"; mitigated by raw-codec verify (below) for
+ * snapshots published via raw multicodec, and by IPNS pubkey
+ * authentication for the (CID,sequence) → bytes contract. Future
+ * work: implement full UnixFS verification per the deferred item.
  */
 async function fetchFileFromIpfs(
   gateways: string[],
