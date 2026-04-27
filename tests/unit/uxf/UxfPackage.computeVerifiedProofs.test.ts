@@ -1,13 +1,37 @@
 /**
- * Wave I.5 / J: UxfPackage.computeVerifiedProofs unit tests.
+ * Wave I.5 / J / J.b: UxfPackage.computeVerifiedProofs unit tests.
  *
  * Verifies the helper that walks inclusion-proof elements across two
  * UxfPackage pools, assembles each into the SDK JSON shape, calls the
  * caller-supplied verifier, and returns the set of proof
  * ContentHashes that verified.
+ *
+ * Wave J.b — coverage fix: bypass `assembleInclusionProofForVerification`
+ * by mocking the assemble module so the verifier-success path is
+ * actually exercised. The pre-J.b tests used minimal fixtures whose
+ * children references didn't resolve, forcing assembly to throw and
+ * the helper to `continue` past the verifier call.
  */
 
 import { describe, it, expect, vi } from 'vitest';
+
+// Mock assemble.ts so assembleInclusionProofForVerification returns
+// a stub proofJson without actually walking the pool. This lets us
+// exercise the verifier-call branch deterministically.
+vi.mock('../../../uxf/assemble.js', async () => {
+  const actual = await vi.importActual<typeof import('../../../uxf/assemble.js')>(
+    '../../../uxf/assemble.js',
+  );
+  return {
+    ...actual,
+    assembleInclusionProofForVerification: vi.fn(
+      (_pool: unknown, proofHash: string) => {
+        return { stubProofForHash: proofHash };
+      },
+    ),
+  };
+});
+
 import { UxfPackage } from '../../../uxf/UxfPackage.js';
 import type { UxfPackageData, UxfElement, ContentHash } from '../../../uxf/types.js';
 
@@ -79,21 +103,30 @@ describe('UxfPackage.computeVerifiedProofs (Wave I.5 / J)', () => {
     });
 
     const verified = await target.computeVerifiedProofs(source, verifier);
-    // assembleInclusionProofForVerification will throw on our minimal
-    // elements (children refs don't resolve to real elements). The
-    // helper swallows assembly errors → verifier never called → set
-    // is empty. That's the documented "treat as unverified" path.
-    expect(verified.size).toBe(0);
-    // Verifier should NOT have been called because assembly failed.
-    expect(verifier).not.toHaveBeenCalled();
+    // Wave J.b: with assemble mocked, the verifier IS called for each
+    // proof element (combined pool of target + source).
+    expect(verifier).toHaveBeenCalledTimes(2);
+    // Verifier received the imprint hex AND the proof's ContentHash.
+    expect(verifier).toHaveBeenCalledWith({
+      proofJson: { stubProofForHash: PROOF_A },
+      transactionHash: TX_A_IMPRINT,
+      proofHash: PROOF_A,
+    });
+    expect(verifier).toHaveBeenCalledWith({
+      proofJson: { stubProofForHash: PROOF_B },
+      transactionHash: TX_B_IMPRINT,
+      proofHash: PROOF_B,
+    });
+    // Only proofA was verified (verifier returned true only for it).
+    expect(verified.has(PROOF_A)).toBe(true);
+    expect(verified.has(PROOF_B)).toBe(false);
+    expect(verified.size).toBe(1);
   });
 
   it('combines pools from this + other (cross-package dedup)', async () => {
     // Same proof element appears in both packages. The combined-pool
-    // walk should visit it ONCE (Map dedup by key). We use a
-    // permissive verifier that accepts everything; even with assembly
-    // failures the verifier should be called at most once per unique
-    // proof.
+    // walk visits it ONCE (Map dedup by key) so the verifier is
+    // called once.
     const PROOF_SHARED = 'ee'.repeat(32);
     const TX_SHARED = '0012' + 'ff'.repeat(32);
     const target = pkgWithPool(
@@ -103,11 +136,10 @@ describe('UxfPackage.computeVerifiedProofs (Wave I.5 / J)', () => {
       new Map([makeInclusionProofElement(PROOF_SHARED, TX_SHARED)]),
     );
     const verifier = vi.fn(async () => true);
-    await target.computeVerifiedProofs(source, verifier);
-    // Both pools have the shared proof; the combined map has one
-    // entry. With assembly failing the verifier isn't called, but
-    // the call count is 0 (no double-counting).
-    expect(verifier.mock.calls.length).toBeLessThanOrEqual(1);
+    const verified = await target.computeVerifiedProofs(source, verifier);
+    expect(verifier).toHaveBeenCalledTimes(1);
+    expect(verified.has(PROOF_SHARED)).toBe(true);
+    expect(verified.size).toBe(1);
   });
 
   it('verifier throw is caught and treated as not-verified (conservative)', async () => {
@@ -121,6 +153,7 @@ describe('UxfPackage.computeVerifiedProofs (Wave I.5 / J)', () => {
       throw new Error('verifier exploded');
     });
     const verified = await target.computeVerifiedProofs(source, verifier);
+    expect(verifier).toHaveBeenCalledTimes(1);
     expect(verified.size).toBe(0);
   });
 
@@ -143,6 +176,8 @@ describe('UxfPackage.computeVerifiedProofs (Wave I.5 / J)', () => {
     const verifier = vi.fn(async () => true);
     const verified = await target.computeVerifiedProofs(source, verifier);
     expect(verified.size).toBe(0);
+    // null transactionHash → element is skipped BEFORE the verifier
+    // is called.
     expect(verifier).not.toHaveBeenCalled();
   });
 });

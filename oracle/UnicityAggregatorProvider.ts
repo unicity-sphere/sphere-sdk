@@ -552,6 +552,20 @@ export class UnicityAggregatorProvider implements OracleProvider {
         ) {
           // The proof attests a DIFFERENT tx than the caller claimed
           // — replay/grafting attempt. Refuse.
+          //
+          // Wave J.b: log the mismatch at debug level. Surfaces the
+          // common bug of passing a 64-char digest hex instead of a
+          // 68-char DataHash imprint hex (a relaxed format check
+          // accepts both lengths but the byte comparison must
+          // genuinely match, so a digest-only input produces a
+          // length mismatch that's worth diagnosing).
+          logger.debug(
+            'Aggregator',
+            `verifyInclusionProof: transactionHash mismatch (input=${input.transactionHash}, ` +
+              `proof.transactionHash.imprint=${proofTxHashHex}). ` +
+              `Hint: callers must pass the SDK-encoded DataHash imprint ` +
+              `(typically 68 chars for sha2-256), not the 64-char digest.`,
+          );
           result = false;
         } else {
           const requestId = await RequestId.create(
