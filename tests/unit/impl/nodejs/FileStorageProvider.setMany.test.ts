@@ -7,7 +7,7 @@
  * prevRemoved snapshot from the prior settled state.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -98,5 +98,50 @@ describe('FileStorageProvider.setMany — Wave J.b serialization', () => {
     await provider.setMany([['b', '2']]);
     expect(await provider.get('a')).toBe('1');
     expect(await provider.get('b')).toBe('2');
+  });
+
+  // Wave M (Round 7 W1): setMany rollback path — mutatedKeys/
+  // removedKeys snapshot restoration on save() failure. A regression
+  // that broke the snapshot would leak the F.43 multi-process
+  // clobber hazard (re-introducing the bug that I.4 was supposed
+  // to fix). This test injects a save() failure and asserts:
+  //   (a) setMany rejects
+  //   (b) in-memory state is rolled back (get() returns prior values)
+  //   (c) a subsequent setMany on different keys works cleanly
+  //       — proves mutatedKeys/removedKeys aren't poisoned
+  it('rolls back in-memory state on save() failure (Wave I.4 + M.1)', async () => {
+    // Pre-populate so we have a "prior value" for one of the setMany keys.
+    await provider.set('preexisting', 'original');
+    expect(await provider.get('preexisting')).toBe('original');
+
+    // Spy on save() to fail exactly once.
+    const saveSpy = vi
+      .spyOn(provider as unknown as { save: () => Promise<void> }, 'save')
+      .mockRejectedValueOnce(new Error('injected disk-full'));
+
+    // setMany overwriting one preexisting key + adding a new one.
+    await expect(
+      provider.setMany([
+        ['preexisting', 'overwritten'],
+        ['fresh', 'newvalue'],
+      ]),
+    ).rejects.toThrow(/injected disk-full/);
+
+    // Restore the spy so subsequent setMany works.
+    saveSpy.mockRestore();
+
+    // (b) in-memory state rolled back — preexisting key still has
+    // its original value; fresh key was deleted.
+    expect(await provider.get('preexisting')).toBe('original');
+    expect(await provider.get('fresh')).toBeNull();
+
+    // (c) subsequent setMany works cleanly — proves mutatedKeys
+    // wasn't poisoned. If the rollback had failed to restore
+    // mutatedKeys, the next setMany's save would see ghost keys
+    // and either fail or write inconsistent state.
+    await provider.setMany([['next', 'value']]);
+    expect(await provider.get('next')).toBe('value');
+    // preexisting still original after the second setMany completes.
+    expect(await provider.get('preexisting')).toBe('original');
   });
 });
