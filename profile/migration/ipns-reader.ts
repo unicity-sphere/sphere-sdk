@@ -37,6 +37,7 @@ import { hexToBytes } from '../../core/crypto.js';
 import { ProfileError } from '../errors.js';
 import { logger } from '../../core/logger.js';
 import type { UxfBundleRef } from '../types.js';
+import { verifyCarAndExtractFile } from './unixfs-verify.js';
 
 // =============================================================================
 // Constants
@@ -225,6 +226,40 @@ async function fetchFileFromIpfs(
 
   for (const gateway of gateways) {
     try {
+      // Wave G.5: prefer the CAR-fetch path for ALL CIDs — works
+      // for both raw-codec (single block) and dag-pb-wrapped UnixFS
+      // files, and gives full content-address verification by
+      // walking every block in the response. Falls back to the
+      // legacy `/ipfs/<cid>` raw-bytes path on CAR-fetch failure
+      // (gateway doesn't support `?format=car`, or returned
+      // malformed CAR), preserving the IPNS-Ed25519 trust anchor
+      // for older gateways.
+      const carBytes = await tryFetchCarFromGateway(
+        gateway,
+        cid,
+        timeoutMs,
+        maxSizeBytes,
+      );
+      if (carBytes) {
+        try {
+          const reconstructed = await verifyCarAndExtractFile(carBytes, parsedCid);
+          if (reconstructed.length > maxSizeBytes) {
+            lastError = new Error(
+              `Reconstructed file ${reconstructed.length} bytes exceeds cap ${maxSizeBytes} from ${gateway}`,
+            );
+            continue;
+          }
+          return reconstructed;
+        } catch (err) {
+          // CAR-walk verification failure is a hard signal — bytes
+          // delivered by this gateway do NOT match the requested
+          // CID. Try the next gateway rather than fall back to
+          // the unverified raw path (which would defeat the gate).
+          lastError = err instanceof Error ? err : new Error(String(err));
+          continue;
+        }
+      }
+
       // Steelman² remediation: stream the body with a STREAMING cap.
       // Previous fix only checked Content-Length when present and
       // honestly declared; a gateway omitting CL or sending CL=0 then
@@ -262,7 +297,13 @@ async function fetchFileFromIpfs(
         continue;
       }
 
-      // Steelman remediation: content-address verify when we can.
+      // Wave G.5 fallback: the CAR-fetch path didn't activate (gateway
+      // doesn't support ?format=car). For raw-codec CIDs we can still
+      // verify by direct hash. For dag-pb-wrapped UnixFS we cannot
+      // verify the resolved bytes locally — the IPNS Ed25519 signature
+      // remains the trust anchor for the (CID, sequence) tuple. We log
+      // the unverified path so operators can flag gateways that don't
+      // support CAR and either upgrade them or accept the residual.
       if (isRawCodec) {
         const computed = sha256(bytes);
         const expected = parsedCid.multihash.digest;
@@ -280,6 +321,15 @@ async function fetchFileFromIpfs(
           );
           continue;
         }
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[ipns-reader] Wave G.5: gateway',
+          gateway,
+          'did not support ?format=car for UnixFS-wrapped CID',
+          cid,
+          '— falling back to unverified bytes (IPNS signature still authenticates the CID).',
+        );
       }
       return bytes;
     } catch (err) {
@@ -346,6 +396,46 @@ async function readStreamWithLimitLocal(
     offset += chunk.byteLength;
   }
   return out;
+}
+
+/**
+ * Wave G.5: try to fetch the content as a CAR via `?format=car`.
+ * Returns the CAR bytes on success, or `null` if the gateway
+ * doesn't support CAR (caller falls back to the legacy
+ * `/ipfs/<cid>` path). Also returns `null` on transport errors
+ * — the caller tries the next gateway in either case.
+ */
+async function tryFetchCarFromGateway(
+  gateway: string,
+  cid: string,
+  timeoutMs: number,
+  maxSizeBytes: number,
+): Promise<Uint8Array | null> {
+  try {
+    const url = `${gateway.replace(/\/$/, '')}/ipfs/${cid}?format=car`;
+    const response = await fetch(url, {
+      headers: { Accept: 'application/vnd.ipld.car' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return null;
+    // Accept either an explicit CAR content-type or no content-type
+    // (some gateways serve raw bytes with octet-stream). Reject
+    // text/* and application/json so we don't mis-feed an HTML
+    // error page to the CAR parser.
+    const ct = response.headers.get('content-type') ?? '';
+    if (ct && (ct.startsWith('text/') || ct.startsWith('application/json'))) {
+      return null;
+    }
+    // CAR can be larger than the file (overhead + metadata blocks),
+    // so allow up to 2× the file cap.
+    const carCapBytes = maxSizeBytes * 2;
+    const declaredLen = Number(response.headers.get('content-length') ?? '');
+    if (Number.isFinite(declaredLen) && declaredLen > carCapBytes) return null;
+    const carBytes = await readStreamWithLimitLocal(response, carCapBytes, gateway);
+    return carBytes;
+  } catch {
+    return null;
+  }
 }
 
 /**

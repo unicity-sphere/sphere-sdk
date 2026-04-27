@@ -1547,6 +1547,220 @@ export class ProfileTokenStorageProvider
    * PROFILE-ARCHITECTURE.md §10 (Q1 decision) for rationale.
    */
   private async writeOrbitOperationalState(opState: OperationalState): Promise<void> {
+    // Wave G.7: per-entry-key write path. Stages each entry under
+    // its own key (`${addr}.outbox.${id}`) and writes a tombstone
+    // for entries that were removed since the last flush. This
+    // gains native CRDT semantics — two devices adding different
+    // entries never conflict; a delete and an add on the same
+    // entry resolve via OrbitDB's OpLog ordering (last writer wins).
+    //
+    // The legacy single-blob path below stays as a one-shot
+    // migration: if the legacy blob exists, we delete it after the
+    // per-entry writes succeed so future reads see only the
+    // per-entry layout.
+    const addr = this.getAddressId();
+    return this.writeOrbitOperationalStatePerEntry(opState, addr);
+  }
+
+  /**
+   * Wave G.7: per-entry-key write path. See readOrbitOperationalState
+   * for layout description. Diffs the in-memory `opState` against
+   * the on-disk per-entry view and writes only the deltas:
+   *   - new/modified entries → put `${prefix}.${id}` = JSON(entry)
+   *   - removed entries → put `${prefix}.${id}` = JSON({ tombstoned: true, deletedAt })
+   *
+   * Tombstones are retained for `TOMBSTONE_RETENTION_MS` (30 days)
+   * and then GC'd. This is best-effort — a long-offline device
+   * coming back after >30 days could re-replicate a tombstoned
+   * entry as if it were live; the hazard is bounded by the wallet's
+   * tombstone retention policy and is acceptable given typical
+   * online cadence.
+   */
+  private async writeOrbitOperationalStatePerEntry(
+    opState: OperationalState,
+    addr: string,
+  ): Promise<void> {
+    const TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    // Compute set of live primary keys for each list.
+    const liveOutbox = new Map<string, TxfOutboxEntry>();
+    for (const e of opState.outbox) {
+      const id = (e as unknown as Record<string, unknown>).id;
+      if (typeof id === 'string' && id.length > 0) liveOutbox.set(id, e);
+    }
+    const liveInvalid = new Map<string, TxfInvalidEntry>();
+    for (const e of opState.invalid) {
+      const id = (e as unknown as Record<string, unknown>).tokenId;
+      if (typeof id === 'string' && id.length > 0) liveInvalid.set(id, e);
+    }
+    const liveMint = new Map<string, unknown>();
+    for (const e of opState.mintOutbox) {
+      const id = (e as Record<string, unknown>).tokenId;
+      if (typeof id === 'string' && id.length > 0) liveMint.set(id, e);
+    }
+
+    // Read existing per-entry keys to compute the diff.
+    const [existingOutboxKeys, existingInvalidKeys, existingMintKeys] = await Promise.all([
+      this.listExistingPerEntryKeys(`${addr}.outbox.`),
+      this.listExistingPerEntryKeys(`${addr}.invalid.`),
+      this.listExistingPerEntryKeys(`${addr}.mintOutbox.`),
+    ]);
+
+    // Apply per-entry writes for each list.
+    await this.applyPerEntryDiff(
+      `${addr}.outbox.`,
+      liveOutbox,
+      existingOutboxKeys,
+      now,
+      TOMBSTONE_RETENTION_MS,
+    );
+    await this.applyPerEntryDiff(
+      `${addr}.invalid.`,
+      liveInvalid,
+      existingInvalidKeys,
+      now,
+      TOMBSTONE_RETENTION_MS,
+    );
+    await this.applyPerEntryDiff(
+      `${addr}.mintOutbox.`,
+      liveMint,
+      existingMintKeys,
+      now,
+      TOMBSTONE_RETENTION_MS,
+    );
+
+    // invalidatedNametags stays as a single key (small Set<string>).
+    try {
+      await this.writeProfileKey(
+        `${addr}.invalidatedNametags`,
+        JSON.stringify(opState.invalidatedNametags),
+      );
+    } catch (err) {
+      this.log(`Failed to write invalidatedNametags: ${err instanceof Error ? err.message : String(err)}`);
+      this.emitEvent(this.buildErrorEvent('storage:error', err));
+    }
+
+    // Migration: if a legacy single-blob exists for any of the lists,
+    // delete it now that per-entry data is written. Best-effort.
+    for (const k of [`${addr}.outbox`, `${addr}.invalid`, `${addr}.mintOutbox`]) {
+      try {
+        const legacy = await this.db.get(k);
+        if (legacy) await this.db.del(k);
+      } catch {
+        /* best-effort migration cleanup */
+      }
+    }
+  }
+
+  /**
+   * Wave G.7: list the on-disk per-entry keys with the given prefix.
+   * Returns a Map<key, entryId> where entryId is the suffix after
+   * the prefix. Used by the diff step to detect removals.
+   */
+  private async listExistingPerEntryKeys(prefix: string): Promise<Map<string, string>> {
+    const result = new Map<string, string>();
+    try {
+      const all = await this.db.all(prefix);
+      for (const key of all.keys()) {
+        if (!key.startsWith(prefix)) continue;
+        const entryId = key.slice(prefix.length);
+        if (entryId.length > 0) result.set(key, entryId);
+      }
+    } catch (err) {
+      this.log(`listExistingPerEntryKeys(${prefix}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return result;
+  }
+
+  /**
+   * Wave G.7: apply the per-entry diff for one list:
+   *   - For each live entry, write its key (idempotent: same content
+   *     produces same OrbitDB OpLog hash, no spurious oplog growth).
+   *   - For each on-disk entryId not in the live set, write a
+   *     tombstone (or delete the entry+tombstone if its tombstone
+   *     is older than retention).
+   */
+  private async applyPerEntryDiff<T>(
+    prefix: string,
+    liveById: Map<string, T>,
+    existingKeys: Map<string, string>,
+    now: number,
+    retentionMs: number,
+  ): Promise<void> {
+    // Live entries: write each.
+    for (const [id, entry] of liveById) {
+      const key = `${prefix}${id}`;
+      try {
+        await this.writeProfileKey(key, JSON.stringify(entry));
+      } catch (err) {
+        this.log(`per-entry write ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.emitEvent(this.buildErrorEvent('storage:error', err));
+      }
+    }
+    // Removed entries: tombstone or GC.
+    for (const [key, entryId] of existingKeys) {
+      if (liveById.has(entryId)) continue;
+      // Read existing value to check whether it's already a tombstone
+      // and old enough to GC. If it's a live entry that was removed,
+      // tombstone it.
+      let existingRaw: string | null = null;
+      try {
+        existingRaw = await this.readProfileKey(key);
+      } catch {
+        existingRaw = null;
+      }
+      let isTombstone = false;
+      let deletedAt = 0;
+      if (existingRaw !== null) {
+        try {
+          const parsed = JSON.parse(existingRaw) as unknown;
+          if (
+            parsed !== null &&
+            typeof parsed === 'object' &&
+            'tombstoned' in parsed &&
+            (parsed as { tombstoned: unknown }).tombstoned === true
+          ) {
+            isTombstone = true;
+            const da = (parsed as { deletedAt?: unknown }).deletedAt;
+            deletedAt = typeof da === 'number' ? da : 0;
+          }
+        } catch {
+          /* corrupt — overwrite with fresh tombstone */
+        }
+      }
+      if (isTombstone) {
+        // GC if old enough.
+        if (deletedAt > 0 && now - deletedAt > retentionMs) {
+          try {
+            await this.db.del(key);
+          } catch {
+            /* best-effort GC */
+          }
+        }
+        continue;
+      }
+      // Live → tombstone transition.
+      try {
+        await this.writeProfileKey(
+          key,
+          JSON.stringify({ tombstoned: true, deletedAt: now }),
+        );
+      } catch (err) {
+        this.log(`per-entry tombstone ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
+        this.emitEvent(this.buildErrorEvent('storage:error', err));
+      }
+    }
+  }
+
+  /**
+   * Wave G.7 — legacy single-blob writer (preserved for reference;
+   * unused after the per-entry migration).
+   *
+   * @deprecated kept only to allow reverting the per-entry path if
+   * we hit unforeseen production issues. Not on any active code path.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  private async writeOrbitOperationalStateSingleBlob(opState: OperationalState): Promise<void> {
     const addr = this.getAddressId();
     // Steelman⁴³ critical: each of these arrays is stored under a single
     // OrbitDB key as a serialized whole. OrbitDB key-value is LWW per key;
@@ -1828,19 +2042,106 @@ export class ProfileTokenStorageProvider
   private async readOrbitOperationalState(): Promise<Omit<OperationalState, 'tombstones' | 'sent' | 'history'>> {
     const addr = this.getAddressId();
 
-    const [outbox, invalid, mintOutbox, invalidatedNametags] = await Promise.all([
-      this.readProfileKeyJson<TxfOutboxEntry[]>(`${addr}.outbox`),
-      this.readProfileKeyJson<TxfInvalidEntry[]>(`${addr}.invalid`),
-      this.readProfileKeyJson<unknown[]>(`${addr}.mintOutbox`),
+    // Wave G.7: prefer the per-entry-key layout (one OrbitDB key
+    // per outbox/invalid/mintOutbox entry, prefixed with
+    // `${addr}.outbox.`, etc.). Falls back to the legacy
+    // single-blob format on first read of a pre-G.7 wallet —
+    // migration runs on the next write.
+    //
+    // Per-entry layout gains true CRDT semantics: two devices
+    // adding different entries never conflict at the OrbitDB
+    // layer (each entry has its own LWW key resolution), and
+    // removals via tombstones replicate cleanly.
+    const [outbox, invalid, mintOutbox, invalidatedNametagsLegacy] = await Promise.all([
+      this.readPerEntryArrayWithLegacyFallback<TxfOutboxEntry>(
+        `${addr}.outbox.`,
+        `${addr}.outbox`,
+      ),
+      this.readPerEntryArrayWithLegacyFallback<TxfInvalidEntry>(
+        `${addr}.invalid.`,
+        `${addr}.invalid`,
+      ),
+      this.readPerEntryArrayWithLegacyFallback<unknown>(
+        `${addr}.mintOutbox.`,
+        `${addr}.mintOutbox`,
+      ),
+      // Invalidated nametags is a Set<string> — keep the single-key
+      // layout (cheap and the entries are tiny strings, not records).
       this.readProfileKeyJson<unknown[]>(`${addr}.invalidatedNametags`),
     ]);
 
     return {
-      outbox: outbox ?? [],
-      invalid: invalid ?? [],
-      mintOutbox: mintOutbox ?? [],
-      invalidatedNametags: invalidatedNametags ?? [],
+      outbox,
+      invalid,
+      mintOutbox,
+      invalidatedNametags: invalidatedNametagsLegacy ?? [],
     };
+  }
+
+  /**
+   * Wave G.7: per-entry-key reader with single-blob fallback.
+   *
+   * Iterates all OrbitDB keys with `prefix`, decodes each as a
+   * tombstone or live entry, returns the live entries in
+   * insertion-order-stable form. If no per-entry keys are found,
+   * falls back to reading the single-blob `legacyBlobKey` for
+   * backward compatibility with pre-G.7 wallets — the next write
+   * will migrate the data forward.
+   */
+  private async readPerEntryArrayWithLegacyFallback<T>(
+    prefix: string,
+    legacyBlobKey: string,
+  ): Promise<T[]> {
+    let entries: Map<string, Uint8Array>;
+    try {
+      entries = await this.db.all(prefix);
+    } catch (err) {
+      this.log(`per-entry read failed for prefix "${prefix}": ${err instanceof Error ? err.message : String(err)}`);
+      // Fall back to legacy on any read error.
+      const legacy = await this.readProfileKeyJson<T[]>(legacyBlobKey);
+      return legacy ?? [];
+    }
+    if (entries.size === 0) {
+      // No per-entry data — try legacy blob.
+      const legacy = await this.readProfileKeyJson<T[]>(legacyBlobKey);
+      return legacy ?? [];
+    }
+    const out: T[] = [];
+    // Stable order across devices: sort by full key.
+    const sortedKeys = [...entries.keys()].sort();
+    for (const key of sortedKeys) {
+      const decoded = await this.decodePerEntryValue<T>(key);
+      if (decoded === null) continue; // tombstone or corrupt — skip
+      out.push(decoded);
+    }
+    return out;
+  }
+
+  /**
+   * Wave G.7: decode a single per-entry value. Returns the entry
+   * payload or `null` for a tombstoned / corrupt entry.
+   *
+   * Tombstone format: `{ tombstoned: true, deletedAt: number }`.
+   * Live format: the entry value as JSON (same shape the legacy
+   * single-blob array carried).
+   */
+  private async decodePerEntryValue<T>(key: string): Promise<T | null> {
+    const raw = await this.readProfileKey(key);
+    if (raw === null) return null;
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        'tombstoned' in parsed &&
+        (parsed as { tombstoned: unknown }).tombstoned === true
+      ) {
+        return null; // tombstone — caller filters
+      }
+      return parsed as T;
+    } catch {
+      return null;
+    }
   }
 
   /**

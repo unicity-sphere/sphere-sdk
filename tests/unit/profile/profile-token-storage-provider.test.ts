@@ -844,8 +844,13 @@ describe('ProfileTokenStorageProvider', () => {
       await provider.save(txfData);
       await new Promise((r) => setTimeout(r, 200));
 
-      // Synced (OrbitDB): outbox only
-      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox`)).toBe(true);
+      // Synced (OrbitDB): outbox entry exists under per-entry key
+      // (Wave G.7 layout — `${addr}.outbox.${id}` instead of single-
+      // blob `${addr}.outbox`).
+      const outboxKeys = [...db._store.keys()].filter((k) =>
+        k.startsWith(`${EXPECTED_ADDRESS_ID}.outbox.`),
+      );
+      expect(outboxKeys.length).toBeGreaterThanOrEqual(1);
       // Synced keys must NOT contain the derived caches — those stay local
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.tombstones`)).toBe(false);
       expect(db._store.has(`${EXPECTED_ADDRESS_ID}.sent`)).toBe(false);
@@ -915,6 +920,111 @@ describe('ProfileTokenStorageProvider', () => {
       expect(loadResult.data!._tombstones).toEqual(tombstones);
       expect(loadResult.data!._outbox).toEqual(outbox);
       expect(loadResult.data!._sent).toEqual(sent);
+    });
+
+    // Wave G.7 regression — per-entry-key layout
+    it('writeOrbitOperationalState writes per-entry keys (Wave G.7)', async () => {
+      vi.useRealTimers();
+      installMockFetch(async (url: string) => {
+        if (url.includes('/api/v0/dag/put')) {
+          return new Response(JSON.stringify({ Cid: { '/': 'cid-perent' } }), { status: 200 });
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const provider = createProvider(db, { flushDebounceMs: 50 });
+      await provider.initialize();
+      const txfData = buildTxfData({ _token1: { id: '_token1' } });
+      txfData._outbox = [
+        { id: 'oA', status: 'pending', tokenId: 't1', recipient: 'alice', createdAt: 1000, data: {} },
+        { id: 'oB', status: 'pending', tokenId: 't2', recipient: 'bob',   createdAt: 1001, data: {} },
+      ];
+      txfData._invalid = [{ tokenId: 'tBad', reason: 'r', detectedAt: 999 }];
+      await provider.save(txfData);
+      await new Promise((r) => setTimeout(r, 200));
+
+      // Each outbox entry stored under its own key.
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oA`)).toBe(true);
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oB`)).toBe(true);
+      // Single-blob legacy key not present (no migration in this test).
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox`)).toBe(false);
+      // Invalid entry under per-entry key by tokenId.
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.invalid.tBad`)).toBe(true);
+      // invalidatedNametags stays as a single key (small Set<string>).
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.invalidatedNametags`)).toBe(true);
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+
+    it('removed entry becomes a tombstone in the per-entry layout (Wave G.7)', async () => {
+      vi.useRealTimers();
+      installMockFetch(async (url: string) => {
+        if (url.includes('/api/v0/dag/put')) {
+          return new Response(JSON.stringify({ Cid: { '/': 'cid-tomb' } }), { status: 200 });
+        }
+        return new Response('', { status: 404 });
+      });
+
+      const provider = createProvider(db, { flushDebounceMs: 50 });
+      await provider.initialize();
+      const txfData = buildTxfData({ _token1: { id: '_token1' } });
+      txfData._outbox = [
+        { id: 'oA', status: 'pending', tokenId: 't1', recipient: 'alice', createdAt: 1000, data: {} },
+      ];
+      await provider.save(txfData);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oA`)).toBe(true);
+
+      // Second save with empty outbox — oA should be tombstoned.
+      const txfData2 = buildTxfData({ _token1: { id: '_token1' } });
+      txfData2._outbox = [];
+      await provider.save(txfData2);
+      await new Promise((r) => setTimeout(r, 200));
+
+      // The key still exists but its content is a tombstone marker.
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.outbox.oA`)).toBe(true);
+      const encKey = getEncryptionKey();
+      const tombRaw = db._store.get(`${EXPECTED_ADDRESS_ID}.outbox.oA`)!;
+      const decoded = await decryptProfileValue(encKey, tombRaw);
+      const parsed = JSON.parse(new TextDecoder().decode(decoded));
+      expect(parsed.tombstoned).toBe(true);
+      expect(typeof parsed.deletedAt).toBe('number');
+
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+
+    it('readOrbitOperationalState falls back to legacy single-blob format (Wave G.7 migration)', async () => {
+      const encKey = getEncryptionKey();
+      const addr = EXPECTED_ADDRESS_ID;
+      // Pre-populate the legacy single-blob layout.
+      const legacyOutbox = [
+        { id: 'oLegacy', status: 'pending', tokenId: 'tL', recipient: 'eve', createdAt: 500, data: {} },
+      ];
+      db._store.set(
+        `${addr}.outbox`,
+        await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(legacyOutbox))),
+      );
+      // Add a dummy active bundle so load() goes through the full
+      // merge path (with 0 bundles, load() returns early without
+      // reading operational state).
+      const emptyCarData = new TextEncoder().encode(JSON.stringify({ tokens: [] }));
+      const cidDummy = cidForBytes(emptyCarData);
+      const dummyRef: UxfBundleRef = { cid: cidDummy, status: 'active', createdAt: 100 };
+      db._store.set(
+        `${BUNDLE_KEY_PREFIX}${cidDummy}`,
+        await encryptProfileValue(encKey, new TextEncoder().encode(JSON.stringify(dummyRef))),
+      );
+      installMockFetch(async (url: string) => {
+        if (url.includes(`/ipfs/${cidDummy}`)) {
+          return new Response(emptyCarData, { status: 200 });
+        }
+        return new Response('', { status: 404 });
+      });
+      const provider = createProvider(db);
+      await provider.initialize();
+      const loadResult = await provider.load();
+      expect(loadResult.success).toBe(true);
+      expect(loadResult.data!._outbox).toEqual(legacyOutbox);
     });
   });
 
