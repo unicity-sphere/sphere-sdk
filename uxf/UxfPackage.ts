@@ -239,9 +239,18 @@ export class UxfPackage {
    * Merge another package into this one.
    * Elements are deduplicated by content hash.
    * Manifest entries from the other package are added (or overwritten if tokenId collides).
+   *
+   * Wave G.3: optionally accepts `verifiedProofs` — a set of inclusion-
+   * proof element ContentHashes that the caller has cryptographically
+   * verified (typically via `OracleProvider.verifyInclusionProof`).
+   * When supplied, Rule 4 enrichment activates: same-core-different-
+   * proof tx pairs are lifted into a synthetic token-root only when
+   * at least one side's proof appears in the verified set. When
+   * omitted, falls back to the conservative pre-G.3 `divergent`
+   * resolution for any pairwise hash mismatch.
    */
-  merge(other: UxfPackage): this {
-    mergePkg(this.data, other.data);
+  merge(other: UxfPackage, opts?: { verifiedProofs?: ReadonlySet<string> }): this {
+    mergePkg(this.data, other.data, opts?.verifiedProofs);
     return this;
   }
 
@@ -659,7 +668,11 @@ export function removeToken(pkg: UxfPackageData, tokenId: string): void {
  *   compatibility partition and pick the majority class. Leave the
  *   refactor — just documenting.
  */
-function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
+function mergePkg(
+  target: UxfPackageData,
+  source: UxfPackageData,
+  verifiedProofs?: ReadonlySet<string>,
+): void {
   const mutablePool = target.pool as Map<ContentHash, UxfElement>;
   const mutableManifest = target.manifest.tokens as Map<string, ContentHash>;
 
@@ -716,6 +729,7 @@ function mergePkg(target: UxfPackageData, source: UxfPackageData): void {
         tokenId,
         candidates: [existingRoot, incomingRoot],
         pool: virtualPool,
+        verifiedProofs: verifiedProofs as ReadonlySet<ContentHash> | undefined,
       });
       // Rule 4: a synthetic proof-enriched TokenRoot must be
       // inserted into the pool under the resolver's returned

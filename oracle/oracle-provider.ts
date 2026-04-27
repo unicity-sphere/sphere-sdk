@@ -94,6 +94,50 @@ export interface OracleProvider extends BaseProvider {
    * Used for transfer flows with SDK TransferCommitment
    */
   waitForProofSdk?(commitment: unknown, signal?: AbortSignal): Promise<unknown>;
+
+  /**
+   * Wave G.3: cryptographic verification of an inclusion proof.
+   *
+   * Used by `uxf/token-join.ts` Rule 4 enrichment to gate the
+   * `tryEnrichLongestWithProofs` path: an attacker-supplied proof
+   * element that's structurally well-formed but cryptographically
+   * invalid (forged authenticator signature, unknown SMT root)
+   * would otherwise be lifted into a synthetic token-root and
+   * propagated as if it were genuine. The gate calls this method
+   * once per candidate proof in the merge pool and only adopts a
+   * proof element whose `(authenticator, smtPath, transactionHash,
+   * unicityCertificate)` tuple verifies against the bundled
+   * `RootTrustBase`.
+   *
+   * Implementations construct the SDK `InclusionProof` from the
+   * supplied JSON shape via `InclusionProof.fromJSON()`, then call
+   * `proof.verify(trustBase, requestId)`. Returns true iff the
+   * status is `OK`. Returns false on PATH_NOT_INCLUDED, PATH_INVALID,
+   * NOT_AUTHENTICATED, or any thrown error during reconstruction —
+   * fail-closed so a buggy proof can never be accepted.
+   *
+   * `requestId` is the SHA-256(signingPubKey || stateHashImprint)
+   * tuple expected by the aggregator; for proof elements where the
+   * caller cannot reconstruct it (because state-hash isn't carried
+   * in the proof element itself), pass `null` and the implementation
+   * falls back to deriving it from the proof's authenticator if
+   * possible — or returns false if it can't be safely derived.
+   */
+  verifyInclusionProof?(input: {
+    /**
+     * The SDK-shaped JSON for the inclusion proof. Built via
+     * `assembleInclusionProof()` from the UXF pool, so the shape is
+     * already what `InclusionProof.fromJSON()` accepts.
+     */
+    proofJson: unknown;
+    /**
+     * The transaction hash the proof attests (hex). Used to verify
+     * the proof binds to the expected tx — defends against a replay
+     * where an old valid proof is grafted onto a new tx with the
+     * same authenticator.
+     */
+    transactionHash: string;
+  }): Promise<boolean>;
 }
 
 // =============================================================================

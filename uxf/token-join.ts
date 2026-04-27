@@ -101,6 +101,23 @@ export interface ResolveInput {
   readonly candidates: readonly ContentHash[];
   /** Shared element pool — candidates dereference through here. */
   readonly pool: ReadonlyMap<ContentHash, UxfElement>;
+  /**
+   * Wave G.3: set of inclusion-proof-element ContentHashes that have
+   * been cryptographically verified by the caller (typically via
+   * `OracleProvider.verifyInclusionProof`). When provided AND the
+   * oracle gate is wired, Rule 4 enrichment activates — proved
+   * alternatives are lifted into the synthetic token-root only when
+   * their proof element appears in this set. When omitted or empty,
+   * Rule 4 falls back to `longest-valid` (the conservative
+   * resolution that was the only option pre-G.3).
+   *
+   * Determinism: keep `verifiedProofs` content stable across devices
+   * given the same trust-base. The oracle's `verifyInclusionProof`
+   * is deterministic for a fixed (proof, trustBase) — so callers
+   * sharing a trust-base produce identical sets. Cross-device
+   * agreement on the resolved root therefore holds.
+   */
+  readonly verifiedProofs?: ReadonlySet<ContentHash>;
 }
 
 // =============================================================================
@@ -265,6 +282,17 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
   // With >2 candidates we walk all pairs: any divergent pair forces
   // the whole tokenId into 'divergent' outcome (conservative; a
   // more sophisticated resolver could partition).
+  // Wave G.3: when the caller supplies `verifiedProofs`, sameCore-
+  // different-proof at a position no longer forces divergent — the
+  // pair is a legitimate Rule 4 enrichment candidate (same logical
+  // tx, different proof state). Require AT LEAST ONE side of the
+  // pair to carry a verified proof: this rejects the "fake-sameCore-
+  // with-no-real-proof" suppression attack while admitting genuine
+  // proof-state-substitution merges. Without verifiedProofs (or
+  // when neither side's proof verifies), the pre-G.3 conservative
+  // "any mismatch ⇒ divergent" behavior holds.
+  const verifiedSetForCompat: ReadonlySet<ContentHash> =
+    input.verifiedProofs ?? EMPTY_VERIFIED_PROOFS;
   let foundDivergent = false;
   for (let i = 0; i < infos.length; i++) {
     for (let j = i + 1; j < infos.length; j++) {
@@ -273,19 +301,18 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
       const commonLen = Math.min(a.txns.length, b.txns.length);
       for (let k = 0; k < commonLen; k++) {
         if (a.txns[k] === b.txns[k]) continue;
-        // Steelman¹⁹ critical #6: sameCoreDifferentProof is the same
-        // attack surface as tryEnrichLongestWithProofs — an attacker who
-        // supplies a fake `sameCore`-pair with a fabricated inclusion-
-        // proof reference can SUPPRESS the `divergent` classification
-        // (the operator-alert outcome) and force a `longest-valid`
-        // resolution where the legitimate result was a fork. Until an
-        // oracle gate verifies the alt's inclusion-proof cryptographically,
-        // treat ANY pairwise hash mismatch as divergent.
-        //
-        // To re-enable: wire OracleProvider into resolveTokenRoot, call
-        // oracle.verifyInclusionProof on both sides of the candidate
-        // pair, and only allow the sameCoreDifferentProof exemption
-        // when both proofs verify.
+        const aHash = a.txns[k];
+        const bHash = b.txns[k];
+        if (
+          verifiedSetForCompat.size > 0 &&
+          sameCoreDifferentProof(aHash, bHash, pool) &&
+          isProofVerifiedOnEitherSide(aHash, bHash, pool, verifiedSetForCompat)
+        ) {
+          // Same-core-different-proof with at least one verified
+          // proof — Rule 4 candidate, NOT divergent. Continue
+          // walking the pair.
+          continue;
+        }
         foundDivergent = true;
         break;
       }
@@ -344,23 +371,40 @@ export function resolveTokenRoot(input: ResolveInput): ResolveOutcome {
   // that position — Rule 4 synthesis produces a merged chain that
   // keeps the longer tail AND adopts the proved element on the
   // common prefix.
-  // Steelman¹⁸: tryEnrichLongestWithProofs is DISABLED pending oracle
-  // validation gate.  The enricher checks only structural well-formedness
-  // (proof element exists, has authenticator + smtPath children); it does NOT
-  // verify the authenticator signature or replay the SMT path against a known
-  // root.  An attacker controlling one bundle in a multi-source merge could
-  // supply a fabricated inclusion-proof element that passes the structural
-  // check and wins the rank (via the countCommittedTxns inflator), causing the
-  // enricher to build a synthetic token-root carrying that fake proof — a root
-  // whose hash was never signed by any real aggregator, yet verify() accepts
-  // because it only checks DAG well-formedness.
-  //
-  // To re-enable: wire an OracleProvider into resolveTokenRoot, call
-  // oracle.verifyInclusionProof(proofEl) inside tryEnrichLongestWithProofs,
-  // and return null on any cryptographic failure.  Until that gate exists,
-  // the enriched path is unreachable — Rule 4 resolves as longest-valid.
+  // Wave G.3: oracle validation gate is now wired. When the caller
+  // supplies `verifiedProofs` (a set of proof-element ContentHashes
+  // that have passed `OracleProvider.verifyInclusionProof`), Rule 4
+  // enrichment activates — proved alternatives are lifted into the
+  // synthetic token-root only when their proof element appears in
+  // the verified set. When `verifiedProofs` is omitted or empty,
+  // Rule 4 falls back to the conservative `longest-valid` resolution
+  // exactly as before — preserving the pre-G.3 behavior for callers
+  // that haven't wired the oracle yet.
+  const verifiedProofs = input.verifiedProofs ?? EMPTY_VERIFIED_PROOFS;
+  if (verifiedProofs.size > 0) {
+    const enrichResult = tryEnrichLongestWithProofs(winner, infos, pool, verifiedProofs);
+    if (enrichResult) {
+      // In the enriched outcome, ALL original candidates are
+      // superseded by the synthetic root (it has a different hash
+      // than any input). Surface the original winner alongside the
+      // pre-enrichment losers so the caller's manifest update knows
+      // every original rootHash is replaced.
+      return {
+        kind: 'enriched',
+        rootHash: enrichResult.rootHash,
+        losers: [winner.rootHash, ...losers],
+        syntheticRoot: enrichResult.syntheticRoot,
+      };
+    }
+  }
   return { kind: 'longest-valid', rootHash: winner.rootHash, losers };
 }
+
+// Frozen empty set sentinel — avoid allocating a fresh Set on every
+// resolveTokenRoot call when the caller doesn't supply verifiedProofs.
+const EMPTY_VERIFIED_PROOFS: ReadonlySet<ContentHash> = Object.freeze(
+  new Set<ContentHash>(),
+) as ReadonlySet<ContentHash>;
 
 // =============================================================================
 // Rule 4 — proof-enriched synthetic root (T-D0 audit follow-up)
@@ -462,6 +506,29 @@ function sameHeaderShape(a: UxfElement, b: UxfElement): boolean {
  * (verify.ts catches those upstream); this gate closes the
  * "attacker-crafted proof element in the pool" path.
  */
+/**
+ * Wave G.3: at least one side of a `sameCore-different-proof` pair
+ * MUST carry a proof element whose ContentHash appears in
+ * `verifiedProofs`. Used by both the compatibility-check (to allow
+ * the Rule 4 candidate to skip divergent classification) and the
+ * enrichment lift (to gate the actual proof adoption).
+ */
+function isProofVerifiedOnEitherSide(
+  aHash: ContentHash,
+  bHash: ContentHash,
+  pool: ReadonlyMap<ContentHash, UxfElement>,
+  verifiedProofs: ReadonlySet<ContentHash>,
+): boolean {
+  for (const txHash of [aHash, bHash]) {
+    const tx = pool.get(txHash);
+    if (!tx || tx.type !== ELEMENT_TYPE_TRANSACTION) continue;
+    const proofHash = (tx.children as Record<string, unknown>).inclusionProof;
+    if (typeof proofHash !== 'string') continue;
+    if (verifiedProofs.has(proofHash as ContentHash)) return true;
+  }
+  return false;
+}
+
 function altProofIsStructurallyValid(
   altElement: UxfElement,
   pool: ReadonlyMap<ContentHash, UxfElement>,
@@ -500,9 +567,7 @@ function altProofIsStructurallyValid(
  *     are identical by genesis invariant; tail-only nametags would
  *     survive as the winner already carries them.
  */
-// Underscore prefix per project lint rule — function preserved for the
-// oracle-gate re-enable path but not currently called.
-function _tryEnrichLongestWithProofs(
+function tryEnrichLongestWithProofs(
   winner: {
     readonly rootHash: ContentHash;
     readonly txns: readonly ContentHash[];
@@ -514,6 +579,7 @@ function _tryEnrichLongestWithProofs(
     readonly committedCount: number;
   }[],
   pool: ReadonlyMap<ContentHash, UxfElement>,
+  verifiedProofs: ReadonlySet<ContentHash>,
 ): { rootHash: ContentHash; syntheticRoot: UxfElement } | null {
   const winnerRoot = pool.get(winner.rootHash);
   if (!winnerRoot || winnerRoot.type !== ELEMENT_TYPE_TOKEN_ROOT) return null;
@@ -541,11 +607,20 @@ function _tryEnrichLongestWithProofs(
       //       through proof-lift into the winner's chain.
       //   (b) alt's inclusion-proof element (when present in pool)
       //       must be well-formed.
+      //   (c) Wave G.3: alt's inclusion-proof element MUST appear in
+      //       the caller-supplied verifiedProofs set. Without this
+      //       gate, an attacker who ingests one bundle in a multi-
+      //       source merge could supply a structurally-valid but
+      //       cryptographically-fake proof element and win the
+      //       enrichment lift.
       const curEl = pool.get(curHash);
       const altEl = pool.get(altHash);
       if (!curEl || !altEl) continue;
       if (!sameHeaderShape(curEl, altEl)) continue;
       if (!altProofIsStructurallyValid(altEl, pool)) continue;
+      const altProofHash = (altEl.children as Record<string, unknown>).inclusionProof;
+      if (typeof altProofHash !== 'string') continue;
+      if (!verifiedProofs.has(altProofHash as ContentHash)) continue;
 
       enrichedTxns[pos] = altHash;
       enriched = true;

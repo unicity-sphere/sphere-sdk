@@ -36,6 +36,11 @@ import { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTru
 import { Token as SdkToken } from '@unicitylabs/state-transition-sdk/lib/token/Token';
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import type { TransferCommitment as SdkTransferCommitment } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferCommitment';
+import {
+  InclusionProof as SdkInclusionProof,
+  InclusionProofVerificationStatus,
+} from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
+import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
 
 // SDK MintCommitment type - using interface to avoid generic complexity
 interface SdkMintCommitment {
@@ -199,6 +204,10 @@ export class UnicityAggregatorProvider implements OracleProvider {
   // ===========================================================================
 
   async initialize(trustBase?: RootTrustBase): Promise<void> {
+    // Wave G.3: clear the inclusion-proof cache on (re)initialize.
+    // Trust-base rotation invalidates verification results — a proof
+    // that was OK under epoch N may be PATH_INVALID under epoch N+1.
+    this.inclusionProofCache.clear();
     // Initialize SDK clients with optional API key
     this.aggregatorClient = new AggregatorClient(
       this.config.url,
@@ -445,6 +454,89 @@ export class UnicityAggregatorProvider implements OracleProvider {
       commitment as any,
       signal
     );
+  }
+
+  /**
+   * Wave G.3: cryptographic verification of an inclusion proof for
+   * the UXF Rule 4 enrichment gate.
+   *
+   * Reconstructs the SDK `InclusionProof` from the supplied JSON
+   * shape, derives the `RequestId` from the proof's authenticator
+   * (publicKey + stateHash imprint), and calls `proof.verify()`
+   * against the bundled `RootTrustBase`. Returns true ONLY on
+   * `OK` — anything else (PATH_NOT_INCLUDED / PATH_INVALID /
+   * NOT_AUTHENTICATED / thrown) returns false so a buggy or
+   * forged proof can never be lifted into a synthetic token-root.
+   *
+   * Cache: results are memoized by transactionHash since proof
+   * verification is deterministic given (proofJson, trustBase,
+   * tx). The cache is bounded; a Profile-level merge typically
+   * runs verifyInclusionProof O(N) times where N = number of
+   * unique tx-proof pairs in the merge candidates, often
+   * single-digit.
+   */
+  private inclusionProofCache: Map<string, boolean> = new Map();
+  private static INCLUSION_PROOF_CACHE_MAX = 1024;
+
+  async verifyInclusionProof(input: {
+    proofJson: unknown;
+    transactionHash: string;
+  }): Promise<boolean> {
+    if (!this.trustBase) return false;
+    // Cache key: transactionHash uniquely identifies the (tx, proof)
+    // pair within a single trust-base scope. We invalidate on
+    // trust-base rotation by clearing the cache during initialize().
+    const cacheKey = input.transactionHash;
+    const cached = this.inclusionProofCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    let result = false;
+    try {
+      const proof = SdkInclusionProof.fromJSON(input.proofJson);
+      // Without a bound authenticator, no requestId can be derived;
+      // a non-inclusion proof would lack an authenticator and is
+      // not a candidate for Rule 4 enrichment anyway. Fail-closed.
+      if (!proof.authenticator) {
+        result = false;
+      } else {
+        // Defense: bind the proof to the transactionHash the caller
+        // claims it attests. If the proof's transactionHash field
+        // is null (non-inclusion shape) or doesn't match, refuse.
+        const proofTxHashHex = proof.transactionHash
+          ? Array.from(proof.transactionHash.imprint as Uint8Array)
+              .map((b: number) => b.toString(16).padStart(2, '0'))
+              .join('')
+          : null;
+        if (proofTxHashHex === null) {
+          result = false;
+        } else if (
+          !input.transactionHash ||
+          input.transactionHash.toLowerCase() !== proofTxHashHex.toLowerCase()
+        ) {
+          // The proof attests a DIFFERENT tx than the caller claimed
+          // — replay/grafting attempt. Refuse.
+          result = false;
+        } else {
+          const requestId = await RequestId.create(
+            proof.authenticator.publicKey,
+            proof.authenticator.stateHash,
+          );
+          const status = await proof.verify(this.trustBase, requestId);
+          result = status === InclusionProofVerificationStatus.OK;
+        }
+      }
+    } catch (err) {
+      logger.debug('Aggregator', 'verifyInclusionProof failed (treated as invalid)', err);
+      result = false;
+    }
+
+    // Bound the cache; evict oldest entries on overflow.
+    if (this.inclusionProofCache.size >= UnicityAggregatorProvider.INCLUSION_PROOF_CACHE_MAX) {
+      const firstKey = this.inclusionProofCache.keys().next().value;
+      if (firstKey !== undefined) this.inclusionProofCache.delete(firstKey);
+    }
+    this.inclusionProofCache.set(cacheKey, result);
+    return result;
   }
 
   async isSpent(stateHash: string): Promise<boolean> {

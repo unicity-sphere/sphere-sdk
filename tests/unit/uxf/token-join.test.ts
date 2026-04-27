@@ -276,7 +276,7 @@ describe('resolveTokenRoot', () => {
     ).toThrow('empty candidates');
   });
 
-  it.skip('Rule 4 — enriches the longer chain when a same-position tx has a proof in a shorter chain [PENDING: tryEnrichLongestWithProofs disabled until oracle gate is wired]', () => {
+  it('Rule 4 — enriches the longer chain when a same-position tx has a proof in a shorter chain (Wave G.3 oracle gate)', () => {
     // Position 0: t0 committed in both chains (identical hash).
     // Position 1: long has unproved version (t1_unproved), short
     //   has proved version (t1_proved). Under content-addressed
@@ -354,6 +354,12 @@ describe('resolveTokenRoot', () => {
       tokenId: 'T',
       candidates: [shortRootH, longRootH],
       pool,
+      // Wave G.3: caller has cryptographically verified the proof
+      // element at HEX_PROOF_1. The resolver lifts t1_proved into
+      // the synthetic root because its inclusion-proof child is in
+      // the verified set. Without this set, the call falls through
+      // to longest-valid (covered by the next test).
+      verifiedProofs: new Set([HEX_PROOF_1]),
     });
 
     expect(outcome.kind).toBe('enriched');
@@ -372,6 +378,112 @@ describe('resolveTokenRoot', () => {
     const syntheticTxns = outcome.syntheticRoot.children.transactions;
     expect(syntheticTxns).toEqual([t0[0], t1Proved[0], t2[0]]);
     expect(outcome.syntheticRoot.type).toBe('token-root');
+  });
+
+  it('Rule 4 — falls back to divergent when verifiedProofs is omitted (steelman¹⁸ default-deny)', () => {
+    // Same fixture as the enriched test, but no verifiedProofs in
+    // the input. Must resolve as `divergent` — the conservative
+    // pre-G.3 behavior, because the resolver cannot tell whether the
+    // alt's inclusion-proof element is genuine or fabricated, so any
+    // pairwise hash mismatch (even on a sameCore-different-proof
+    // pair) is treated as a fork. Without the oracle gate, an
+    // attacker-supplied structurally-valid-but-fake proof would
+    // otherwise force `longest-valid` and bypass operator alerting.
+    const t0 = makeTransaction('0', { committed: true });
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA_1 = 'c'.repeat(64);
+    const HEX_PROOF_1 = 'd'.repeat(64);
+    const t1Unproved: PoolEntry = [
+      hexTag('tx1u'),
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'transaction',
+        content: {},
+        children: { sourceState: HEX_STATE_A, data: HEX_DATA_1, inclusionProof: null, destinationState: HEX_STATE_B },
+      },
+    ];
+    const t1Proved: PoolEntry = [
+      hexTag('tx1p'),
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'transaction',
+        content: {},
+        children: { sourceState: HEX_STATE_A, data: HEX_DATA_1, inclusionProof: HEX_PROOF_1, destinationState: HEX_STATE_B },
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1Proved[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1Unproved[0], t2[0]]);
+    const pool = buildPool(
+      t0,
+      t1Unproved,
+      t1Proved,
+      t2,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+      // verifiedProofs omitted — empty set is the default
+    });
+    expect(outcome.kind).toBe('divergent');
+  });
+
+  it('Rule 4 — does NOT enrich when verifiedProofs lacks the alt proof (forged-proof rejection)', () => {
+    // The proof is supplied in the pool but the caller's set DOES
+    // NOT include it — simulating the case where oracle.verify
+    // Inclusion Proof returned false for HEX_PROOF_1 (e.g., bad
+    // signature). The resolver MUST NOT lift the unverified proof.
+    const t0 = makeTransaction('0', { committed: true });
+    const HEX_STATE_A = 'a'.repeat(64);
+    const HEX_STATE_B = 'b'.repeat(64);
+    const HEX_DATA_1 = 'c'.repeat(64);
+    const HEX_PROOF_1 = 'd'.repeat(64);
+    const t1Unproved: PoolEntry = [
+      hexTag('tx1u'),
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'transaction',
+        content: {},
+        children: { sourceState: HEX_STATE_A, data: HEX_DATA_1, inclusionProof: null, destinationState: HEX_STATE_B },
+      },
+    ];
+    const t1Proved: PoolEntry = [
+      hexTag('tx1p'),
+      {
+        header: { representation: 1, semantics: 1, kind: 'default' as const, predecessor: null },
+        type: 'transaction',
+        content: {},
+        children: { sourceState: HEX_STATE_A, data: HEX_DATA_1, inclusionProof: HEX_PROOF_1, destinationState: HEX_STATE_B },
+      },
+    ];
+    const t2 = makeTransaction('2', { committed: false });
+    const [shortRootH, shortRoot] = makeTokenRoot('short', [t0[0], t1Proved[0]]);
+    const [longRootH, longRoot] = makeTokenRoot('long', [t0[0], t1Unproved[0], t2[0]]);
+    const pool = buildPool(
+      t0,
+      t1Unproved,
+      t1Proved,
+      t2,
+      [shortRootH, shortRoot],
+      [longRootH, longRoot],
+    );
+    const UNRELATED_PROOF = 'e'.repeat(64);
+    const outcome = resolveTokenRoot({
+      tokenId: 'T',
+      candidates: [shortRootH, longRootH],
+      pool,
+      verifiedProofs: new Set([UNRELATED_PROOF]), // doesn't cover HEX_PROOF_1
+    });
+    // verifiedProofs.size > 0 enables the sameCore exemption check,
+    // but neither side's proof is in the set, so isProofVerifiedOn
+    // EitherSide returns false → still divergent. This is the
+    // forged-proof rejection: the resolver REFUSES to lift an
+    // unverified alt even when the merge would otherwise enrich.
+    expect(outcome.kind).toBe('divergent');
   });
 
   it('Rule 4 — does NOT enrich when the shorter chain has no better-proofed tx', () => {
@@ -539,7 +651,7 @@ describe('resolveTokenRoot', () => {
     expect(outcome.kind).toBe('divergent');
   });
 
-  it.skip('Rule 4 — synthetic root carries ENRICHED_SYNTHETIC_KIND and null predecessor (steelman C1) [PENDING: tryEnrichLongestWithProofs disabled until oracle gate is wired]', async () => {
+  it('Rule 4 — synthetic root carries ENRICHED_SYNTHETIC_KIND and null predecessor (steelman C1, Wave G.3)', async () => {
     // Steelman round 2 C1: synthetic with predecessor=winner.rootHash
     // caused rebuildInstanceChainIndex (public export) to record
     // phantom instance-chain links between natural roots and
@@ -610,6 +722,7 @@ describe('resolveTokenRoot', () => {
       tokenId: 'T',
       candidates: [shortRootH, longRootH],
       pool,
+      verifiedProofs: new Set([HEX_PROOF]),
     });
     expect(outcome.kind).toBe('enriched');
     if (outcome.kind !== 'enriched') return;
@@ -627,7 +740,7 @@ describe('resolveTokenRoot', () => {
     expect(winnerEl && isEnrichedSyntheticRoot(winnerEl)).toBe(false);
   });
 
-  it.skip('Rule 4 — synthetic root is deterministic (same inputs, any order → same hash) [PENDING: tryEnrichLongestWithProofs disabled until oracle gate is wired]', () => {
+  it('Rule 4 — synthetic root is deterministic (same inputs, any order → same hash, Wave G.3)', () => {
     // Use the same scenario as the happy-path Rule 4 test above:
     // the LONG chain has an unproved t1 + extra tail; the SHORT
     // chain has a proved t1. Enrichment is a genuine fire here.
@@ -687,8 +800,9 @@ describe('resolveTokenRoot', () => {
       [longRootH, longRoot],
     );
 
-    const a = resolveTokenRoot({ tokenId: 'T', candidates: [shortRootH, longRootH], pool });
-    const b = resolveTokenRoot({ tokenId: 'T', candidates: [longRootH, shortRootH], pool });
+    const verifiedProofs = new Set([HEX_PROOF_1]);
+    const a = resolveTokenRoot({ tokenId: 'T', candidates: [shortRootH, longRootH], pool, verifiedProofs });
+    const b = resolveTokenRoot({ tokenId: 'T', candidates: [longRootH, shortRootH], pool, verifiedProofs });
     expect(a.kind).toBe('enriched');
     expect(b.kind).toBe('enriched');
     if (a.kind !== 'enriched' || b.kind !== 'enriched') return;
