@@ -84,11 +84,16 @@ describe('FileStorageProvider.setMany — Wave J.b serialization', () => {
     expect(await provider.get('k')).toBe('v');
   });
 
-  it('a failed setMany does not poison subsequent setMany on the chain', async () => {
-    // Force a save() failure by mocking the underlying save (not
-    // straightforward without DI). Instead: rely on the chain's
-    // .catch(() => undefined) — verify that AFTER an awaited
-    // setMany resolves, the next one runs cleanly.
+  it('sequential setMany calls compose cleanly via the chain', async () => {
+    // Wave K NOTE: this test asserts that two awaited setMany calls
+    // run to completion without interfering. Renamed from "does not
+    // poison" because it doesn't actually inject a failure. The
+    // poison-prevention `.catch(() => undefined)` on `setManyChain`
+    // tail is exercised indirectly by the concurrent test above
+    // (10 calls; if any failure-poisoned the chain, later calls
+    // would block forever or reject) but isn't asserted directly
+    // because vitest can't deterministically trigger a save()
+    // failure without modifying production code paths.
     await provider.setMany([['a', '1']]);
     await provider.setMany([['b', '2']]);
     expect(await provider.get('a')).toBe('1');
