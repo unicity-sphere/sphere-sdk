@@ -94,6 +94,15 @@ export interface ReconcileInput {
   readonly resolveRemoteCid: (version: PointerVersion) => Promise<Uint8Array>;
   /** Maximum reconcile attempts. Defaults to PUBLISH_RETRY_BUDGET. */
   readonly maxAttempts?: number;
+  /**
+   * Wave G.4: caller-supplied cancellation signal. Aborting unwinds
+   * the reconcile loop at the next safe checkpoint (between iterations
+   * or via the deadline race inside submit/probe). Propagated all the
+   * way down through findLatestValidVersion → probeVersion →
+   * fetchProofWithTimeout, and through publishOnceAtVersion →
+   * submitPointer → submitOneSide.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 export interface ReconcileOutcome {
@@ -154,6 +163,15 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
   const reconcileDeadlineMs = Date.now() + RECONCILE_WALL_CLOCK_BUDGET_MS;
 
   for (let attempts = 0; attempts < maxAttempts; attempts++) {
+    // Wave G.4: between-iteration abort checkpoint. The deeper RPC
+    // races also respect the signal, but checking at the iteration
+    // boundary lets us avoid starting fresh CID production /
+    // discovery work after the caller has signalled cancellation.
+    if (input.abortSignal?.aborted) {
+      const err = new Error('reconcileAndPublish aborted by caller');
+      err.name = 'AbortError';
+      throw err;
+    }
     // Step A: produce a fresh CID (may include state merged on prior conflict).
     const cidBytes = await input.cidProducer();
 
@@ -170,6 +188,7 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
       decodeCid: input.decodeCid,
       fetchCar: input.fetchCar,
       discoveryDeadlineMs: reconcileDeadlineMs,
+      abortSignal: input.abortSignal,
     });
     probeHistory.push(...discovery.probeVersions);
     const nextV = (Math.max(discovery.validV, discovery.includedV) + 1) as PointerVersion;
@@ -186,6 +205,7 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
         flagStore: input.flagStore,
         mutex: input.mutex,
         persistLocalVersion: input.persistLocalVersion,
+        abortSignal: input.abortSignal,
       },
       { maxRetries: PUBLISH_RETRY_BUDGET },
     );
@@ -217,6 +237,7 @@ export async function reconcileAndPublish(input: ReconcileInput): Promise<Reconc
       decodeCid: input.decodeCid,
       fetchCar: input.fetchCar,
       discoveryDeadlineMs: reconcileDeadlineMs,
+      abortSignal: input.abortSignal,
     });
     probeHistory.push(...rediscovery.probeVersions);
 

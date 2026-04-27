@@ -69,6 +69,13 @@ export interface DiscoverInput {
    * Provide a tighter value when the caller holds a mutex with a hard timeout.
    */
   readonly discoveryDeadlineMs?: number;
+  /**
+   * Wave G.4: caller-supplied cancellation signal. Combined with the
+   * internal deadline-driven abort, an external abort short-circuits
+   * the in-flight probe RPC immediately rather than letting it run
+   * to its per-request timeout.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 export interface DiscoverResult {
@@ -87,6 +94,24 @@ export interface DiscoverResult {
 // ── findLatestValidVersion ─────────────────────────────────────────────────
 
 export async function findLatestValidVersion(input: DiscoverInput): Promise<DiscoverResult> {
+  // Wave G.4: small wrapper that ensures the external-abort listener
+  // is removed on every exit path (success, throw, abort). Without
+  // this, a long-lived caller signal would leak a closure-reference
+  // per discovery call.
+  let cleanupExternalListener: (() => void) | undefined;
+  try {
+    return await findLatestValidVersionInner(input, (fn) => {
+      cleanupExternalListener = fn;
+    });
+  } finally {
+    if (cleanupExternalListener) cleanupExternalListener();
+  }
+}
+
+async function findLatestValidVersionInner(
+  input: DiscoverInput,
+  registerCleanup: (fn: () => void) => void,
+): Promise<DiscoverResult> {
   const {
     currentLocalVersion,
     keyMaterial,
@@ -135,6 +160,10 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
 
   const checkDeadline = (): void => {
     if (Date.now() > discoveryDeadlineMs) {
+      // Wave G.2: also abort any in-flight probe RPC. Without this,
+      // the throw below propagates immediately but a probe that's
+      // mid-RPC continues to the wire and consumes resources.
+      armDeadlineAbort();
       throw new AggregatorPointerError(
         AggregatorPointerErrorCode.RETRY_EXHAUSTED,
         `Discovery exceeded wall-clock deadline after ${Date.now() - discoveryStartMs}ms.`,
@@ -163,11 +192,71 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
     );
   }
 
+  // Wave G.2: thread an AbortController so the wall-clock deadline
+  // can cancel an in-flight probe RPC. Previously the deadline check
+  // fired only BETWEEN probes; an RPC stuck for the full
+  // PROBE_REQUEST_TIMEOUT_MS could blow past the deadline by up to
+  // that amount. The abort signal lets the deadline interrupt the
+  // active probe immediately.
+  // Wave G.4: also bridge an externally-supplied abortSignal so the
+  // caller can cancel discovery from above. If the external signal
+  // is already aborted, fail fast.
+  const discoveryAbort = new AbortController();
+  let externalDiscoveryAbortListener: (() => void) | undefined;
+  if (input.abortSignal) {
+    if (input.abortSignal.aborted) {
+      try {
+        discoveryAbort.abort();
+      } catch {
+        /* noop */
+      }
+      throw new AggregatorPointerError(
+        AggregatorPointerErrorCode.RETRY_EXHAUSTED,
+        'Discovery aborted by caller',
+        { currentLocalVersion },
+      );
+    }
+    externalDiscoveryAbortListener = (): void => {
+      try {
+        discoveryAbort.abort();
+      } catch {
+        /* noop */
+      }
+    };
+    input.abortSignal.addEventListener('abort', externalDiscoveryAbortListener, { once: true });
+    const sigCaptured = input.abortSignal;
+    const listenerCaptured = externalDiscoveryAbortListener;
+    registerCleanup(() => {
+      try {
+        sigCaptured.removeEventListener('abort', listenerCaptured);
+      } catch {
+        /* noop */
+      }
+    });
+  }
+  const armDeadlineAbort = (): void => {
+    if (Date.now() > discoveryDeadlineMs && !discoveryAbort.signal.aborted) {
+      try {
+        discoveryAbort.abort();
+      } catch {
+        /* abort() never throws on a fresh controller; defense-in-depth */
+      }
+    }
+  };
+
   const probeVersions: PointerVersion[] = [];
   const probeAndRecord = async (v: PointerVersion): Promise<boolean> => {
     checkDeadline();
     probeVersions.push(v);
-    return probeVersion({ v, keyMaterial, signer, aggregatorClient, trustBase, timeoutMs });
+    return probeVersion({
+      v,
+      keyMaterial,
+      signer,
+      aggregatorClient,
+      trustBase,
+      timeoutMs,
+      abortSignal: discoveryAbort.signal,
+    });
   };
 
   // ── Phase 1 — exponential expansion ────────────────────────────────────
@@ -246,6 +335,7 @@ export async function findLatestValidVersion(input: DiscoverInput): Promise<Disc
       decodeCid,
       fetchCar,
       timeoutMs,
+      abortSignal: discoveryAbort.signal,
     });
 
     if (status === 'VALID') {

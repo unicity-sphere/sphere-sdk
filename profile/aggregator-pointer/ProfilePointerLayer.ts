@@ -264,13 +264,31 @@ export class ProfilePointerLayer {
    * @param cidProducer  Callback that (re)produces the CID bytes. Called
    *   fresh on each reconcile iteration so the bundle may include state
    *   merged from fetchAndJoin on prior conflicts.
+   * @param opts.abortSignal  Wave G.4: caller-supplied cancellation
+   *   signal. Aborting unwinds the reconcile loop at the next safe
+   *   checkpoint (between iterations, or via the deadline race inside
+   *   submitPointer / probeVersion). The signal is propagated all the
+   *   way down through `submitOneSide` and `fetchProofWithTimeout`,
+   *   so an in-flight HTTP RPC is cancelled promptly rather than
+   *   running to its per-side timeout.
    */
-  async publish(cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
+  async publish(
+    cidProducer: () => Promise<Uint8Array>,
+    opts?: { abortSignal?: AbortSignal },
+  ): Promise<PublishResult> {
     this.#assertNotShuttingDown('publish');
-    return this.#tracked(this.#publishInner(cidProducer));
+    return this.#tracked(this.#publishInner(cidProducer, opts?.abortSignal));
   }
 
-  async #publishInner(cidProducer: () => Promise<Uint8Array>): Promise<PublishResult> {
+  async #publishInner(
+    cidProducer: () => Promise<Uint8Array>,
+    abortSignal?: AbortSignal,
+  ): Promise<PublishResult> {
+    if (abortSignal?.aborted) {
+      const err = new Error('publish aborted by caller');
+      err.name = 'AbortError';
+      throw err;
+    }
     const currentLocalVersion = await this.#init.readLocalVersion();
     const result = await reconcileAndPublish({
       cidProducer,
@@ -286,6 +304,7 @@ export class ProfilePointerLayer {
       fetchAndJoin: this.#init.fetchAndJoin,
       persistLocalVersion: this.#init.persistLocalVersion,
       resolveRemoteCid: this.#init.resolveRemoteCid,
+      abortSignal,
     });
     this.#lastProbeVersions = result.probeHistory;
     return { version: result.v, attemptsUsed: result.attemptsUsed };
@@ -301,12 +320,12 @@ export class ProfilePointerLayer {
    * latest valid version (Phase 3 winner), having classified + fetched the
    * CAR successfully.
    */
-  async recoverLatest(): Promise<RecoverResult | null> {
+  async recoverLatest(opts?: { abortSignal?: AbortSignal }): Promise<RecoverResult | null> {
     this.#assertNotShuttingDown('recoverLatest');
-    return this.#tracked(this.#recoverLatestInner());
+    return this.#tracked(this.#recoverLatestInner(opts?.abortSignal));
   }
 
-  async #recoverLatestInner(): Promise<RecoverResult | null> {
+  async #recoverLatestInner(abortSignal?: AbortSignal): Promise<RecoverResult | null> {
     // Steelman¹⁹ critical #3: call the INNER discoverLatestVersion helper
     // directly. Going through the public method would re-run
     // #assertNotShuttingDown — if shutdown() fires after recoverLatest's
@@ -315,7 +334,12 @@ export class ProfilePointerLayer {
     // "called after shutdown() started" error and leaving the recover
     // half-completed.  The OUTER recoverLatest tracking via #tracked()
     // already covers this composite operation.
-    const discovery = await this.#discoverLatestVersionInner();
+    if (abortSignal?.aborted) {
+      const err = new Error('recoverLatest aborted by caller');
+      err.name = 'AbortError';
+      throw err;
+    }
+    const discovery = await this.#discoverLatestVersionInner(undefined, abortSignal);
     if (discovery.validV === 0) return null;
     const cid = await this.#init.resolveRemoteCid(discovery.validV);
     return { cid, version: discovery.validV };
@@ -328,12 +352,23 @@ export class ProfilePointerLayer {
    * BUT Phase 3 still calls classifyVersion which DOES fetch CAR for
    * validation per SPEC §8.2 step 3). Returns { validV, includedV } per H4.
    */
-  async discoverLatestVersion(walkbackLimit?: number): Promise<DiscoverResult> {
+  async discoverLatestVersion(
+    walkbackLimit?: number,
+    opts?: { abortSignal?: AbortSignal },
+  ): Promise<DiscoverResult> {
     this.#assertNotShuttingDown('discoverLatestVersion');
-    return this.#tracked(this.#discoverLatestVersionInner(walkbackLimit));
+    return this.#tracked(this.#discoverLatestVersionInner(walkbackLimit, opts?.abortSignal));
   }
 
-  async #discoverLatestVersionInner(walkbackLimit?: number): Promise<DiscoverResult> {
+  async #discoverLatestVersionInner(
+    walkbackLimit?: number,
+    abortSignal?: AbortSignal,
+  ): Promise<DiscoverResult> {
+    if (abortSignal?.aborted) {
+      const err = new Error('discoverLatestVersion aborted by caller');
+      err.name = 'AbortError';
+      throw err;
+    }
     const currentLocalVersion = await this.#init.readLocalVersion();
     const result = await findLatestValidVersion({
       currentLocalVersion,
@@ -344,6 +379,7 @@ export class ProfilePointerLayer {
       decodeCid: this.#init.decodeCid,
       fetchCar: this.#init.fetchCar,
       walkbackLimit,
+      abortSignal,
     });
     this.#lastProbeVersions = result.probeVersions;
     return result;

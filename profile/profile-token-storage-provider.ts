@@ -2025,6 +2025,15 @@ export class ProfileTokenStorageProvider
 
   /**
    * Read a string value from an OrbitDB key, decrypting if needed.
+   *
+   * Wave G.1 — deferred follow-up: emit a typed `storage:error` event
+   * with `code: 'PROFILE_KEY_DECRYPT_FAILED'` so callers can route on
+   * decrypt failures (likely indicates: encryption key changed,
+   * key was rotated, or an attacker tampered with the ciphertext)
+   * instead of treating them indistinguishably from "key not present".
+   * The function still returns `null` to preserve the existing
+   * caller contract (a missing-or-corrupt key triggers rebuild from
+   * derived sources), but observability now distinguishes the two.
    */
   private async readProfileKey(key: string): Promise<string | null> {
     const raw = await this.db.get(key);
@@ -2036,6 +2045,10 @@ export class ProfileTokenStorageProvider
       return new TextDecoder().decode(decrypted);
     } catch (err) {
       this.log(`Failed to read/decrypt key "${key}": ${err instanceof Error ? err.message : String(err)}`);
+      const evt = this.buildErrorEvent('storage:error', err);
+      // Override the generic code with the specific decrypt-failure
+      // signal so consumers can distinguish from other storage errors.
+      this.emitEvent({ ...evt, code: 'PROFILE_KEY_DECRYPT_FAILED' });
       return null;
     }
   }

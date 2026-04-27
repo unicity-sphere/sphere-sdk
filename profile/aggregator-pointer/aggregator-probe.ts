@@ -106,13 +106,31 @@ async function buildRequestIds(
   }
 }
 
-/** Fetch an inclusion-proof response with a hard timeout. */
+/** Fetch an inclusion-proof response with a hard timeout.
+ *
+ * Wave G.2 — accepts an optional `abortSignal` so the discovery
+ * wall-clock deadline can cancel an in-flight probe (previously the
+ * deadline was checked only BETWEEN probes, so a probe whose RPC was
+ * stuck for the full `timeoutMs` could blow past the deadline by up
+ * to that amount). The signal races against the timeout; a fired
+ * abort rejects the same way as a timeout (caller's outer try/catch
+ * buckets it as 'transient' which is the correct discovery semantics
+ * — a cancelled probe is by definition unverified, not "this v is
+ * not included").
+ */
 async function fetchProofWithTimeout(
   client: AggregatorClient,
   requestId: RequestId,
   timeoutMs: number,
+  abortSignal?: AbortSignal,
 ): Promise<InclusionProof> {
+  if (abortSignal?.aborted) {
+    const err = new Error('getInclusionProof aborted by caller');
+    err.name = 'PointerProbeAborted';
+    throw err;
+  }
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  let abortListener: (() => void) | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(() => {
       const err = new Error(`getInclusionProof timed out after ${timeoutMs}ms`);
@@ -120,8 +138,20 @@ async function fetchProofWithTimeout(
       reject(err);
     }, timeoutMs);
   });
+  const abortPromise = abortSignal
+    ? new Promise<never>((_, reject) => {
+        abortListener = () => {
+          const err = new Error('getInclusionProof aborted by caller');
+          err.name = 'PointerProbeAborted';
+          reject(err);
+        };
+        abortSignal.addEventListener('abort', abortListener, { once: true });
+      })
+    : null;
   try {
-    const response = await Promise.race([client.getInclusionProof(requestId), timeoutPromise]);
+    const racers: Array<Promise<unknown>> = [client.getInclusionProof(requestId), timeoutPromise];
+    if (abortPromise) racers.push(abortPromise);
+    const response = await (Promise.race(racers) as Promise<Awaited<ReturnType<typeof client.getInclusionProof>>>);
     // Shape guard: SDK drift (rename, added envelope, nullable shape) would
     // otherwise raise an unclassified TypeError that the outer try/catch in
     // classifyVersion buckets as 'transient'. That's wrong for a permanent
@@ -143,6 +173,9 @@ async function fetchProofWithTimeout(
     return response.inclusionProof;
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    if (abortListener && abortSignal) {
+      abortSignal.removeEventListener('abort', abortListener);
+    }
   }
 }
 
@@ -155,6 +188,14 @@ export interface ProbeInput {
   readonly aggregatorClient: AggregatorClient;
   readonly trustBase: RootTrustBase;
   readonly timeoutMs?: number;
+  /**
+   * Wave G.2: caller-supplied deadline propagation. The discovery
+   * algorithm tripping its wall-clock budget passes its abort signal
+   * here; the in-flight inclusion-proof RPC is then cancelled
+   * promptly instead of waiting up to `timeoutMs` for the per-probe
+   * timeout to fire.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 /**
@@ -173,8 +214,8 @@ export async function probeVersion(input: ProbeInput): Promise<boolean> {
 
   const { reqA, reqB } = await buildRequestIds(keyMaterial, signer, v);
   const [proofA, proofB] = await Promise.all([
-    fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs),
-    fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs),
+    fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs, input.abortSignal),
+    fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs, input.abortSignal),
   ]);
 
   const [statusA, statusB] = await Promise.all([
@@ -215,6 +256,8 @@ export interface ClassifyInput {
   /** Fetches and content-address-verifies the CAR from IPFS. */
   readonly fetchCar: CarFetcher;
   readonly timeoutMs?: number;
+  /** Wave G.2: caller-supplied deadline propagation (see ProbeInput). */
+  readonly abortSignal?: AbortSignal;
 }
 
 /**
@@ -248,6 +291,7 @@ async function runDecodePhases(
   trustBase: RootTrustBase,
   decodeCid: CidDecoder,
   timeoutMs: number,
+  abortSignal?: AbortSignal,
 ): Promise<DecodePhaseOutcome> {
   // Step 1: both inclusion proofs (§8.2 step 1).
   const { reqA, reqB } = await buildRequestIds(keyMaterial, signer, v);
@@ -256,8 +300,8 @@ async function runDecodePhases(
   let proofB: InclusionProof;
   try {
     [proofA, proofB] = await Promise.all([
-      fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs),
-      fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs),
+      fetchProofWithTimeout(aggregatorClient, reqA, timeoutMs, abortSignal),
+      fetchProofWithTimeout(aggregatorClient, reqB, timeoutMs, abortSignal),
     ]);
   } catch (err) {
     // Discriminate on error class:
@@ -367,6 +411,7 @@ export async function classifyVersion(input: ClassifyInput): Promise<VersionClas
     trustBase,
     decodeCid,
     timeoutMs,
+    input.abortSignal,
   );
   if (phase12.ok === 'transient') return 'TRANSIENT_UNAVAILABLE';
   if (phase12.ok === 'semantic') return 'SEMANTICALLY_INVALID';

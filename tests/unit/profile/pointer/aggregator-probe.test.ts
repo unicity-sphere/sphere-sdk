@@ -157,6 +157,51 @@ describe('probeVersion — H2 OR-predicate (SPEC §8.1)', () => {
       probeVersion({ v: 5, keyMaterial, signer, aggregatorClient: client, trustBase }),
     ).rejects.toMatchObject({ code: AggregatorPointerErrorCode.UNTRUSTED_PROOF });
   });
+
+  // Wave G.2/G.4 regression — abortSignal propagation
+  it('rejects with AbortError when abortSignal is already aborted (steelman wave G)', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    const proofA = fakeProof(InclusionProofVerificationStatus.OK);
+    const proofB = fakeProof(InclusionProofVerificationStatus.OK);
+    const client = fakeClient([proofA, proofB]);
+    const trustBase = fakeTrustBase();
+    const ctrl = new AbortController();
+    ctrl.abort();
+    await expect(
+      probeVersion({
+        v: 1,
+        keyMaterial,
+        signer,
+        aggregatorClient: client,
+        trustBase,
+        abortSignal: ctrl.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'PointerProbeAborted' });
+  });
+
+  it('rejects when abortSignal fires during in-flight probe (steelman wave G)', async () => {
+    const { keyMaterial, signer } = await buildFixtures();
+    // Build a never-resolving InclusionProof fetch so we can test cancellation.
+    const slowClient = {
+      getInclusionProof: vi.fn(() => new Promise<never>(() => {
+        // never resolves
+      })),
+    } as unknown as AggregatorClient;
+    const trustBase = fakeTrustBase();
+    const ctrl = new AbortController();
+    const probePromise = probeVersion({
+      v: 1,
+      keyMaterial,
+      signer,
+      aggregatorClient: slowClient,
+      trustBase,
+      timeoutMs: 60_000, // long enough that the abort wins
+      abortSignal: ctrl.signal,
+    });
+    // Fire the abort after a microtask so the promise is in flight.
+    queueMicrotask(() => ctrl.abort());
+    await expect(probePromise).rejects.toMatchObject({ name: 'PointerProbeAborted' });
+  });
 });
 
 // ── classifyVersion (H1 three-way) ─────────────────────────────────────────

@@ -69,6 +69,14 @@ export interface PublishInput {
   readonly persistLocalVersion: (v: PointerVersion) => Promise<void>;
   /** Optional mutex acquisition timeout. Defaults to 30_000ms. */
   readonly mutexTimeoutMs?: number;
+  /**
+   * Wave G.4: caller-supplied cancellation signal. Combined with the
+   * publish loop's own deadline-driven `submitAbort`, an external
+   * abort short-circuits both the wait for the mutex and the submit.
+   * The signal is logically OR'd with the deadline — abort fires if
+   * EITHER the deadline trips OR the caller cancels.
+   */
+  readonly abortSignal?: AbortSignal;
 }
 
 export type PublishOutcome =
@@ -232,6 +240,29 @@ async function publishOnce(
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let deadlineFired = false;
     const submitAbort = new AbortController();
+    // Wave G.4: bridge the caller's abortSignal into submitAbort so a
+    // cancellation propagates through the same path as the deadline
+    // (cancel in-flight submitOneSide promises, drain submitPointer,
+    // and fall through the catch below).
+    let externalAbortListener: (() => void) | undefined;
+    if (input.abortSignal) {
+      if (input.abortSignal.aborted) {
+        try {
+          submitAbort.abort();
+        } catch {
+          /* noop */
+        }
+      } else {
+        externalAbortListener = (): void => {
+          try {
+            submitAbort.abort();
+          } catch {
+            /* noop */
+          }
+        };
+        input.abortSignal.addEventListener('abort', externalAbortListener, { once: true });
+      }
+    }
     const deadlineRace = new Promise<never>((_, reject) => {
       const remaining = Math.max(0, loopDeadline - Date.now());
       deadlineTimer = setTimeout(() => {
@@ -328,6 +359,16 @@ async function publishOnce(
       }
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      // Wave G.4: clean up the external abort listener so we don't
+      // hold a reference into the caller's signal after this attempt
+      // (signal could be reused by the caller for a follow-up call).
+      if (externalAbortListener && input.abortSignal) {
+        try {
+          input.abortSignal.removeEventListener('abort', externalAbortListener);
+        } catch {
+          /* noop */
+        }
+      }
       // Steelman⁴⁶: ensure the controller is aborted even if Promise.race
       // settled via submitPointer's own throw — releases the abort
       // listener inside submitOneSide promptly.
