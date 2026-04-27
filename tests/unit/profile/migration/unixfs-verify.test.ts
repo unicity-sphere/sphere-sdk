@@ -278,6 +278,61 @@ describe('verifyCarAndExtractFile (Wave G.5)', () => {
     await expect(verifyCarAndExtractFile(car, rootCid)).rejects.toThrow(/fanout-bomb/);
   });
 
+  // Wave I.1.b — diamond DAG with a legitimately-shared leaf must NOT
+  // trip the cycle detector. Two sibling intermediate nodes both link
+  // to the same leaf chunk; the path-visited set must clean up between
+  // sibling traversals.
+  it('accepts diamond-DAG sharing a deduplicated leaf across siblings', async () => {
+    const sharedLeaf = new TextEncoder().encode('shared-leaf-data');
+    const leafCid = cidForBytes(sharedLeaf, CODEC_RAW);
+
+    // Two intermediate dag-pb nodes, each linking to the same leaf.
+    const interData = encodeUnixFsFile({ blocksizes: [BigInt(sharedLeaf.length)] });
+    const interPb1 = dagPb.encode({
+      Data: interData,
+      Links: [{ Hash: leafCid, Tsize: sharedLeaf.length, Name: '' }],
+    });
+    // Use a different Tsize / Name so the two intermediate blocks
+    // hash differently and have distinct CIDs.
+    const interPb2 = dagPb.encode({
+      Data: interData,
+      Links: [{ Hash: leafCid, Tsize: sharedLeaf.length + 1, Name: '' }],
+    });
+    const interCid1 = cidForBytes(interPb1, CODEC_DAGPB);
+    const interCid2 = cidForBytes(interPb2, CODEC_DAGPB);
+    expect(interCid1.toString()).not.toBe(interCid2.toString());
+
+    // Root linking to both intermediates.
+    const rootData = encodeUnixFsFile({
+      blocksizes: [BigInt(sharedLeaf.length), BigInt(sharedLeaf.length)],
+    });
+    const rootPb = dagPb.encode({
+      Data: rootData,
+      Links: [
+        { Hash: interCid1, Tsize: sharedLeaf.length, Name: '' },
+        { Hash: interCid2, Tsize: sharedLeaf.length + 1, Name: '' },
+      ],
+    });
+    const rootCid = cidForBytes(rootPb, CODEC_DAGPB);
+
+    const car = buildCar(
+      [rootCid],
+      [
+        { cid: rootCid, bytes: rootPb },
+        { cid: interCid1, bytes: interPb1 },
+        { cid: interCid2, bytes: interPb2 },
+        { cid: leafCid, bytes: sharedLeaf },
+      ],
+    );
+
+    // Reconstructed file = leaf bytes concatenated twice (once per
+    // sibling subtree). MUST NOT throw "cycle detected".
+    const out = await verifyCarAndExtractFile(car, rootCid);
+    expect(out.length).toBe(sharedLeaf.length * 2);
+    expect(out.subarray(0, sharedLeaf.length)).toEqual(sharedLeaf);
+    expect(out.subarray(sharedLeaf.length)).toEqual(sharedLeaf);
+  });
+
   // Wave I.10: malformed Type field varint > 0xffff triggers the
   // out-of-range guard before the BigInt → Number downcast.
   it('rejects out-of-range UnixFS Type field varint', async () => {

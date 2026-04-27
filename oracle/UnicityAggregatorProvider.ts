@@ -484,15 +484,27 @@ export class UnicityAggregatorProvider implements OracleProvider {
     proofHash?: string;
   }): Promise<boolean> {
     if (!this.trustBase) return false;
-    // Wave I.6: enforce the imprint-hex length contract documented
-    // on the interface. A caller that mis-supplies a 64-char digest
-    // would otherwise silently fail every verification; this length
-    // check turns the silent failure into an explicit early-false.
-    if (typeof input.transactionHash !== 'string' || input.transactionHash.length !== 68) {
+    // Wave I.6 + Wave J: sanity-check that transactionHash looks
+    // like a DataHash imprint hex (algorithm-prefix + digest). The
+    // SDK currently emits 68 chars (sha2-256 = 2-byte prefix + 32-
+    // byte digest), but other algorithms in HashAlgorithm.js produce
+    // different imprint lengths (sha224 → 60, sha384 → 100, sha512
+    // → 132, ripemd160 → 44). Hardcoding length=68 silently rejected
+    // every non-sha256 imprint. Now check format only — non-empty
+    // even-length lowercase-hex with length >= 4 (smallest possible
+    // imprint = 1-byte multihash code + 1-byte length + 0-byte
+    // digest, fictional but lower bound). The byte-comparison at
+    // line ~545 catches genuine value mismatches.
+    if (
+      typeof input.transactionHash !== 'string' ||
+      input.transactionHash.length < 4 ||
+      input.transactionHash.length % 2 !== 0 ||
+      !/^[0-9a-f]+$/.test(input.transactionHash)
+    ) {
       logger.debug(
         'Aggregator',
-        'verifyInclusionProof: transactionHash must be 68-char DataHash imprint hex (got length=' +
-          (typeof input.transactionHash === 'string' ? input.transactionHash.length : typeof input.transactionHash) +
+        'verifyInclusionProof: transactionHash must be even-length lowercase hex (got=' +
+          (typeof input.transactionHash === 'string' ? input.transactionHash : typeof input.transactionHash) +
           ')',
       );
       return false;

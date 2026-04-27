@@ -276,6 +276,29 @@ function walkFile(
     );
   }
   pathVisited.add(cidKey);
+  // Wave I.1.b CRITICAL: ensure pathVisited is cleaned up on EVERY
+  // exit path (early returns from leaf branches, throws, normal
+  // recursion completion). Without this, two SIBLING subtrees that
+  // legitimately share a deduplicated leaf block fire a false cycle
+  // detection — diamond-DAG legitimate sharing was broken in I.9.
+  // try/finally cleanup runs on every path while preserving error
+  // propagation.
+  try {
+    walkFileInner(rootCid, blocks, depth, outBuf, outBytesSoFar, pathVisited, blockBytes);
+  } finally {
+    pathVisited.delete(cidKey);
+  }
+}
+
+function walkFileInner(
+  rootCid: CID,
+  blocks: Map<string, Uint8Array>,
+  depth: number,
+  outBuf: Uint8Array[],
+  outBytesSoFar: { total: number },
+  pathVisited: Set<string>,
+  blockBytes: Uint8Array,
+): void {
   if (rootCid.code === CODEC_RAW) {
     outBytesSoFar.total += blockBytes.length;
     if (outBytesSoFar.total > MAX_TOTAL_OUTPUT_BYTES) {
@@ -335,10 +358,8 @@ function walkFile(
     }
     walkFile(link.Hash, blocks, depth + 1, outBuf, outBytesSoFar, pathVisited);
   }
-  // Pop this node from the path-visited set after recursion returns
-  // so legitimate DAG sharing (same block referenced from sibling
-  // subtrees) is not falsely flagged as a cycle.
-  pathVisited.delete(cidKey);
+  // Pop happens in walkFile's finally — sibling subtrees can share
+  // a leaf block under different paths without false cycle detection.
 }
 
 // =============================================================================

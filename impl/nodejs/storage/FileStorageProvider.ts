@@ -159,7 +159,40 @@ export class FileStorageProvider implements StorageProvider {
    * On in-memory error (rare; allocator), restores the previous
    * values for any keys we'd already mutated and re-throws.
    */
+  /**
+   * Wave J: per-instance setMany serialization. Without this, two
+   * concurrent setMany calls on the same instance could interleave
+   * snapshot/mutate/save in a way that A's rollback leaves B's
+   * pending mutations exposed (or vice versa). Serializing the
+   * entire snapshot+mutate+save+rollback critical section gives a
+   * single-mutator invariant within the process.
+   */
+  private setManyChain: Promise<void> = Promise.resolve();
+
   async setMany(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
+    if (entries.length === 0) return;
+    // Chain onto the previous setMany so its rollback (if any)
+    // completes before we snapshot. .catch swallows so a previous
+    // rejection doesn't poison the chain for unrelated callers.
+    const prev = this.setManyChain;
+    let resolveSelf: () => void;
+    let rejectSelf: (err: unknown) => void;
+    const self = new Promise<void>((res, rej) => {
+      resolveSelf = res;
+      rejectSelf = rej;
+    });
+    this.setManyChain = self.catch(() => undefined);
+    await prev.catch(() => undefined);
+    try {
+      await this.setManyInner(entries);
+      resolveSelf!();
+    } catch (err) {
+      rejectSelf!(err);
+      throw err;
+    }
+  }
+
+  private async setManyInner(entries: ReadonlyArray<readonly [string, string]>): Promise<void> {
     if (entries.length === 0) return;
     const previous = new Map<string, string | undefined>();
     const fullEntries: Array<[string, string]> = [];
