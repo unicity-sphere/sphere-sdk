@@ -248,6 +248,21 @@ const MAX_TOTAL_OUTPUT_BYTES = 64 * 1024 * 1024; // 64 MiB hard cap
  * iteration boundary.
  */
 const MAX_LINKS_PER_NODE = 4096;
+/**
+ * Wave L: per-walk visit cap. The output-bytes cap and depth cap
+ * together don't bound CPU time when leaves carry zero content
+ * (empty raw blocks, or dag-pb leaves with `Data` absent / empty).
+ * A balanced tree with shared leaves can branch up to fanout^depth
+ * = 4096^16 ≈ 10^57 visits, each performing a dag-pb decode. Each
+ * visit is fast individually but the multiplicative cost is
+ * unbounded by the existing caps because no bytes accumulate.
+ *
+ * 100K visits is generous for legitimate use (a 64 MiB file at
+ * 256 KiB chunks is ~250 leaves; with one level of intermediate
+ * dag-pb wrappers, ~250 + 1 visits) and catches adversarial trees
+ * before they consume measurable CPU.
+ */
+const MAX_TOTAL_NODE_VISITS = 100_000;
 
 function walkFile(
   rootCid: CID,
@@ -257,7 +272,19 @@ function walkFile(
   outBytesSoFar: { total: number },
   /** Wave I.9: per-path visited set — detects cycles. */
   pathVisited: Set<string>,
+  /** Wave L: total-visit counter, shared across the entire DAG walk. */
+  visitCounter: { count: number },
 ): void {
+  // Wave L: visit-count cap before any other work. Catches the
+  // empty-leaf-amplification CPU-DoS (a balanced fanout tree where
+  // every leaf is empty bytes, so the output-bytes cap never fires
+  // but visit count blows up to fanout^depth).
+  visitCounter.count += 1;
+  if (visitCounter.count > MAX_TOTAL_NODE_VISITS) {
+    throw new Error(
+      `unixfs-verify: total visits exceeded ${MAX_TOTAL_NODE_VISITS}; refusing CPU-amplification DAG`,
+    );
+  }
   if (depth > MAX_RECURSION_DEPTH) {
     throw new Error(`unixfs-verify: recursion depth exceeded ${MAX_RECURSION_DEPTH}`);
   }
@@ -284,7 +311,7 @@ function walkFile(
   // try/finally cleanup runs on every path while preserving error
   // propagation.
   try {
-    walkFileInner(rootCid, blocks, depth, outBuf, outBytesSoFar, pathVisited, blockBytes);
+    walkFileInner(rootCid, blocks, depth, outBuf, outBytesSoFar, pathVisited, blockBytes, visitCounter);
   } finally {
     pathVisited.delete(cidKey);
   }
@@ -298,6 +325,7 @@ function walkFileInner(
   outBytesSoFar: { total: number },
   pathVisited: Set<string>,
   blockBytes: Uint8Array,
+  visitCounter: { count: number },
 ): void {
   if (rootCid.code === CODEC_RAW) {
     outBytesSoFar.total += blockBytes.length;
@@ -356,7 +384,7 @@ function walkFileInner(
         `unixfs-verify: link without Hash in block ${rootCid.toString()}`,
       );
     }
-    walkFile(link.Hash, blocks, depth + 1, outBuf, outBytesSoFar, pathVisited);
+    walkFile(link.Hash, blocks, depth + 1, outBuf, outBytesSoFar, pathVisited, visitCounter);
   }
   // Pop happens in walkFile's finally — sibling subtrees can share
   // a leaf block under different paths without false cycle detection.
@@ -422,7 +450,8 @@ export async function verifyCarAndExtractFile(
   // Walk the dag and reconstruct.
   const out: Uint8Array[] = [];
   const tracker = { total: 0 };
-  walkFile(expectedCid, blocks, 0, out, tracker, new Set<string>());
+  const visitCounter = { count: 0 };
+  walkFile(expectedCid, blocks, 0, out, tracker, new Set<string>(), visitCounter);
 
   // Concatenate.
   const result = new Uint8Array(tracker.total);

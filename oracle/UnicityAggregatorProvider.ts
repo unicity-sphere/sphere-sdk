@@ -154,8 +154,23 @@ export class UnicityAggregatorProvider implements OracleProvider {
     return this.aggregatorClient;
   }
 
-  // Cache for spent states (immutable)
+  // Cache for spent states (immutable). Wave L: capped at 4096 with
+  // delete-oldest LRU eviction to prevent unbounded growth. Spent
+  // states are immutable so caching is safe; the cap protects long-
+  // running wallet processes that observe many unique stateHashes
+  // (transfers, validate() loops, cross-wallet sync) from gradual
+  // memory bloat.
   private spentCache: Map<string, boolean> = new Map();
+  private static SPENT_CACHE_MAX = 4096;
+
+  /** Wave L: bounded cache insert. */
+  private cacheSpent(stateHash: string): void {
+    if (this.spentCache.size >= UnicityAggregatorProvider.SPENT_CACHE_MAX) {
+      const firstKey = this.spentCache.keys().next().value;
+      if (firstKey !== undefined) this.spentCache.delete(firstKey);
+    }
+    this.spentCache.set(stateHash, true);
+  }
 
   constructor(config: UnicityAggregatorProviderConfig) {
     this.config = {
@@ -414,9 +429,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
         data: { valid },
       });
 
-      // Cache spent state if spent
+      // Cache spent state if spent (Wave L: bounded with LRU eviction)
       if (response.stateHash && spent) {
-        this.spentCache.set(response.stateHash, true);
+        this.cacheSpent(response.stateHash);
       }
 
       return {
@@ -591,9 +606,13 @@ export class UnicityAggregatorProvider implements OracleProvider {
   }
 
   async isSpent(stateHash: string): Promise<boolean> {
-    // Check cache first (spent is immutable)
+    // Check cache first (spent is immutable). Wave L: LRU touch on
+    // hit so frequently-accessed stateHashes survive eviction longer.
     if (this.spentCache.has(stateHash)) {
-      return this.spentCache.get(stateHash)!;
+      const cached = this.spentCache.get(stateHash)!;
+      this.spentCache.delete(stateHash);
+      this.spentCache.set(stateHash, cached);
+      return cached;
     }
 
     this.ensureConnected();
@@ -602,9 +621,9 @@ export class UnicityAggregatorProvider implements OracleProvider {
       const response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
       const spent = response.spent ?? false;
 
-      // Cache result
+      // Cache result (Wave L: bounded with LRU eviction)
       if (spent) {
-        this.spentCache.set(stateHash, true);
+        this.cacheSpent(stateHash);
       }
 
       return spent;

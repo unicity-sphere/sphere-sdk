@@ -333,6 +333,75 @@ describe('verifyCarAndExtractFile (Wave G.5)', () => {
     expect(out.subarray(sharedLeaf.length)).toEqual(sharedLeaf);
   });
 
+  // Wave L: visit-count cap defends against empty-leaf amplification
+  // where output-bytes cap doesn't fire (every visit pushes 0 bytes).
+  it('rejects empty-leaf amplification DAG via visit-count cap', async () => {
+    // Build a balanced tree with depth 4 fanout 32 = 32^4 = ~1M visits.
+    // The visit cap fires at 100K so we don't need the full tree.
+    // Empty raw leaf — push(empty) at each visit.
+    const empty = new Uint8Array(0);
+    const leafCid = cidForBytes(empty, CODEC_RAW);
+    // Each intermediate dag-pb node has 32 links to the SAME leaf.
+    const fanout = 32;
+    const interData = encodeUnixFsFile({
+      blocksizes: new Array(fanout).fill(0n),
+    });
+    const links = new Array(fanout).fill(0).map(() => ({
+      Hash: leafCid,
+      Tsize: 0,
+      Name: '',
+    }));
+    const inter1Pb = dagPb.encode({ Data: interData, Links: links });
+    const inter1Cid = cidForBytes(inter1Pb, CODEC_DAGPB);
+    // Second-level node: 32 links to inter1.
+    const inter2Data = encodeUnixFsFile({
+      blocksizes: new Array(fanout).fill(0n),
+    });
+    const inter2Links = new Array(fanout).fill(0).map(() => ({
+      Hash: inter1Cid,
+      Tsize: 0,
+      Name: '',
+    }));
+    const inter2Pb = dagPb.encode({ Data: inter2Data, Links: inter2Links });
+    const inter2Cid = cidForBytes(inter2Pb, CODEC_DAGPB);
+    // Third-level — root.
+    const rootData = encodeUnixFsFile({
+      blocksizes: new Array(fanout).fill(0n),
+    });
+    const rootLinks = new Array(fanout).fill(0).map(() => ({
+      Hash: inter2Cid,
+      Tsize: 0,
+      Name: '',
+    }));
+    const rootPb = dagPb.encode({ Data: rootData, Links: rootLinks });
+    const rootCid = cidForBytes(rootPb, CODEC_DAGPB);
+    // Total visits: 1 + 32 + 32*32 + 32*32*32 = 32_801. Under cap.
+    // So we need 4 levels to exceed 100K. 32^4 = ~1M.
+    const inter3Data = encodeUnixFsFile({
+      blocksizes: new Array(fanout).fill(0n),
+    });
+    const inter3Links = new Array(fanout).fill(0).map(() => ({
+      Hash: rootCid,
+      Tsize: 0,
+      Name: '',
+    }));
+    const inter3Pb = dagPb.encode({ Data: inter3Data, Links: inter3Links });
+    const inter3Cid = cidForBytes(inter3Pb, CODEC_DAGPB);
+    const car = buildCar(
+      [inter3Cid],
+      [
+        { cid: inter3Cid, bytes: inter3Pb },
+        { cid: rootCid, bytes: rootPb },
+        { cid: inter2Cid, bytes: inter2Pb },
+        { cid: inter1Cid, bytes: inter1Pb },
+        { cid: leafCid, bytes: empty },
+      ],
+    );
+    await expect(verifyCarAndExtractFile(car, inter3Cid)).rejects.toThrow(
+      /total visits exceeded/,
+    );
+  });
+
   // Wave I.10: malformed Type field varint > 0xffff triggers the
   // out-of-range guard before the BigInt → Number downcast.
   it('rejects out-of-range UnixFS Type field varint', async () => {

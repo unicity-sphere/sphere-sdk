@@ -202,14 +202,30 @@ function saveConfig(config: CliConfig): void {
   // Steelman⁴⁷: include 4 random bytes so two saves within the same
   // ms in the same process can't collide on temp filename.
   const tmp = CONFIG_FILE + '.tmp.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(4).toString('hex');
+  // Wave L: track whether rename completed so we can unlink the
+  // temp file on any failure path (writeSync EIO/ENOSPC, fsync
+  // failure, etc). The random-suffix temp name means each failed
+  // attempt leaks a distinct file unless we explicitly clean up.
+  let renamed = false;
   const fd = fs.openSync(tmp, 'w', 0o600);
   try {
-    fs.writeSync(fd, JSON.stringify(config, null, 2));
-    fs.fsyncSync(fd);
+    try {
+      fs.writeSync(fd, JSON.stringify(config, null, 2));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, CONFIG_FILE);
+    renamed = true;
   } finally {
-    fs.closeSync(fd);
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
   }
-  fs.renameSync(tmp, CONFIG_FILE);
   // Best-effort parent-dir fsync — not all platforms (e.g., Windows)
   // support fsync on directories; ignore errors there.
   try {
@@ -246,14 +262,27 @@ function saveProfiles(store: ProfilesStore): void {
   fs.mkdirSync(dir, { recursive: true });
   // Steelman⁴⁷: random suffix prevents same-ms collision.
   const tmp = PROFILES_FILE + '.tmp.' + process.pid + '.' + Date.now() + '.' + crypto.randomBytes(4).toString('hex');
+  // Wave L: cleanup temp file on failure (see saveConfig).
+  let renamed = false;
   const fd = fs.openSync(tmp, 'w', 0o600);
   try {
-    fs.writeSync(fd, JSON.stringify(store, null, 2));
-    fs.fsyncSync(fd);
+    try {
+      fs.writeSync(fd, JSON.stringify(store, null, 2));
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, PROFILES_FILE);
+    renamed = true;
   } finally {
-    fs.closeSync(fd);
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
   }
-  fs.renameSync(tmp, PROFILES_FILE);
   try {
     const dfd = fs.openSync(dir, 'r');
     try {
