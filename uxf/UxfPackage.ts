@@ -255,6 +255,63 @@ export class UxfPackage {
   }
 
   /**
+   * Wave I.5: build the `verifiedProofs` set for a Rule 4-enabled
+   * merge by walking the inclusion-proof elements in this package
+   * AND in `other` (the merge candidate), assembling each into the
+   * SDK JSON shape, and asking the supplied `verifier` to validate.
+   *
+   * Returns the set of ContentHashes whose proofs verified
+   * cryptographically. Suitable for passing to `merge(other, {
+   * verifiedProofs })` to activate Rule 4 enrichment.
+   *
+   * The verifier callback is the `OracleProvider.verifyInclusionProof`
+   * signature; supplied as a callback rather than the full provider
+   * so this module stays decoupled from the oracle types.
+   *
+   * Failures (verifier throws, proof element malformed, etc.) are
+   * treated as "not verified" — the resulting set is conservative.
+   */
+  async computeVerifiedProofs(
+    other: UxfPackage,
+    verifier: (input: {
+      proofJson: unknown;
+      transactionHash: string;
+      proofHash?: string;
+    }) => Promise<boolean>,
+  ): Promise<Set<string>> {
+    const verified = new Set<string>();
+    const ELEMENT_TYPE_INCLUSION_PROOF = 'inclusion-proof' as const;
+    // Pool from both packages — same proof element may appear in
+    // either or both. Deduped by content hash naturally via Map.
+    const combinedPool = new Map<ContentHash, UxfElement>();
+    for (const [k, v] of this.data.pool) combinedPool.set(k, v);
+    for (const [k, v] of other.data.pool) combinedPool.set(k, v);
+    const { assembleInclusionProofForVerification } = await import('./assemble.js');
+    for (const [hash, el] of combinedPool) {
+      if (el.type !== ELEMENT_TYPE_INCLUSION_PROOF) continue;
+      const txHashImprintHex = (el.content as Record<string, unknown>).transactionHash;
+      if (typeof txHashImprintHex !== 'string') continue;
+      let proofJson: unknown;
+      try {
+        proofJson = assembleInclusionProofForVerification(combinedPool, hash);
+      } catch {
+        continue;
+      }
+      try {
+        const ok = await verifier({
+          proofJson,
+          transactionHash: txHashImprintHex,
+          proofHash: hash,
+        });
+        if (ok) verified.add(hash);
+      } catch {
+        /* verifier failure → not verified, conservative */
+      }
+    }
+    return verified;
+  }
+
+  /**
    * Compute the minimal delta between this package and another.
    */
   diff(other: UxfPackage): UxfDelta {

@@ -115,10 +115,19 @@ export function prepareContentForHashing(
       continue;
     }
 
-    // TransactionData nametagRefs are ContentHash[] -- convert to bytes
+    // TransactionData nametagRefs are ContentHash[] -- convert to bytes.
+    // Wave I.11: empty-string entries (which would round-trip as
+    // bstr(0), inconsistent with the Wave H byte-field rule) are
+    // rejected. ContentHash refs are always 64-char hex by spec; an
+    // empty entry is malformed input from the deconstruct boundary.
     if (type === 'transaction-data' && key === 'nametagRefs') {
       const refs = value as string[];
-      result[key] = refs.map((h) => hexToBytes(h));
+      result[key] = refs.map((h) => {
+        if (h === '') {
+          throw new UxfError('INVALID_HASH', 'nametagRefs entry must be non-empty ContentHash hex');
+        }
+        return hexToBytes(h);
+      });
       continue;
     }
 

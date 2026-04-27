@@ -481,14 +481,39 @@ export class UnicityAggregatorProvider implements OracleProvider {
   async verifyInclusionProof(input: {
     proofJson: unknown;
     transactionHash: string;
+    proofHash?: string;
   }): Promise<boolean> {
     if (!this.trustBase) return false;
-    // Cache key: transactionHash uniquely identifies the (tx, proof)
-    // pair within a single trust-base scope. We invalidate on
-    // trust-base rotation by clearing the cache during initialize().
-    const cacheKey = input.transactionHash;
+    // Wave I.6: enforce the imprint-hex length contract documented
+    // on the interface. A caller that mis-supplies a 64-char digest
+    // would otherwise silently fail every verification; this length
+    // check turns the silent failure into an explicit early-false.
+    if (typeof input.transactionHash !== 'string' || input.transactionHash.length !== 68) {
+      logger.debug(
+        'Aggregator',
+        'verifyInclusionProof: transactionHash must be 68-char DataHash imprint hex (got length=' +
+          (typeof input.transactionHash === 'string' ? input.transactionHash.length : typeof input.transactionHash) +
+          ')',
+      );
+      return false;
+    }
+    // Wave I.7: cache key composes proofHash (when supplied) with
+    // transactionHash so two distinct proofs attesting the same tx
+    // do not collide. A forged proof returning false → cached →
+    // genuine proof for same tx returns false-from-cache scenario
+    // is closed by including the proof's own ContentHash in the key.
+    const cacheKey = input.proofHash
+      ? `${input.proofHash}:${input.transactionHash}`
+      : input.transactionHash;
     const cached = this.inclusionProofCache.get(cacheKey);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      // Wave I.4-related: refresh insertion order so the cache
+      // approximates LRU semantics. Map.set on an existing key does
+      // NOT change insertion order; delete-then-set does.
+      this.inclusionProofCache.delete(cacheKey);
+      this.inclusionProofCache.set(cacheKey, cached);
+      return cached;
+    }
 
     let result = false;
     try {

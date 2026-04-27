@@ -260,6 +260,23 @@ async function fetchFileFromIpfs(
         }
       }
 
+      // Wave I.2 CRITICAL: for dag-pb (UnixFS-wrapped) CIDs, the
+      // legacy /ipfs/<cid> path CANNOT verify content-address — the
+      // CID hashes the dag-pb root, not the resolved file bytes. A
+      // hostile gateway that returns 404 for ?format=car can serve
+      // attacker-chosen bytes via the legacy path and bypass the
+      // entire G.5 verification gate. Refuse to fall through to the
+      // legacy path for dag-pb codec; rotate to the next gateway and
+      // ultimately surface BUNDLE_NOT_FOUND if no gateway delivers a
+      // verified CAR.
+      if (!isRawCodec) {
+        lastError = new Error(
+          `Gateway ${gateway} did not return a CAR for dag-pb CID ${cid}; ` +
+            `refusing legacy unverified fallback (Wave I.2 — would defeat content-address verification)`,
+        );
+        continue;
+      }
+
       // Steelman² remediation: stream the body with a STREAMING cap.
       // Previous fix only checked Content-Length when present and
       // honestly declared; a gateway omitting CL or sending CL=0 then
@@ -299,37 +316,23 @@ async function fetchFileFromIpfs(
 
       // Wave G.5 fallback: the CAR-fetch path didn't activate (gateway
       // doesn't support ?format=car). For raw-codec CIDs we can still
-      // verify by direct hash. For dag-pb-wrapped UnixFS we cannot
-      // verify the resolved bytes locally — the IPNS Ed25519 signature
-      // remains the trust anchor for the (CID, sequence) tuple. We log
-      // the unverified path so operators can flag gateways that don't
-      // support CAR and either upgrade them or accept the residual.
-      if (isRawCodec) {
-        const computed = sha256(bytes);
-        const expected = parsedCid.multihash.digest;
-        if (computed.length !== expected.length) {
-          lastError = new Error(`CID digest length mismatch from ${gateway}`);
-          continue;
-        }
-        let match = true;
-        for (let i = 0; i < computed.length; i++) {
-          if (computed[i] !== expected[i]) { match = false; break; }
-        }
-        if (!match) {
-          lastError = new Error(
-            `Content-address verify FAILED from ${gateway}: sha256(bytes) does not match CID digest`,
-          );
-          continue;
-        }
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn(
-          '[ipns-reader] Wave G.5: gateway',
-          gateway,
-          'did not support ?format=car for UnixFS-wrapped CID',
-          cid,
-          '— falling back to unverified bytes (IPNS signature still authenticates the CID).',
+      // verify by direct hash. Dag-pb codec is rejected at the gate
+      // above (Wave I.2) so this branch only runs for raw-codec.
+      const computed = sha256(bytes);
+      const expected = parsedCid.multihash.digest;
+      if (computed.length !== expected.length) {
+        lastError = new Error(`CID digest length mismatch from ${gateway}`);
+        continue;
+      }
+      let match = true;
+      for (let i = 0; i < computed.length; i++) {
+        if (computed[i] !== expected[i]) { match = false; break; }
+      }
+      if (!match) {
+        lastError = new Error(
+          `Content-address verify FAILED from ${gateway}: sha256(bytes) does not match CID digest`,
         );
+        continue;
       }
       return bytes;
     } catch (err) {

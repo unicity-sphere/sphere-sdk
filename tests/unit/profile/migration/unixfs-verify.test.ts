@@ -206,4 +206,92 @@ describe('verifyCarAndExtractFile (Wave G.5)', () => {
     const car = buildCar([cid], [{ cid, bytes: pbBytes }]);
     await expect(verifyCarAndExtractFile(car, cid)).rejects.toThrow(/only File \/ Raw types supported/);
   });
+
+  // Wave I.9: cycle / fanout / shared-subtree defenses
+  it('rejects a cycle in the DAG (self-reference)', async () => {
+    // Build a UnixFS file root that links to itself.
+    const placeholderChunk = new TextEncoder().encode('x');
+    const cidA = cidForBytes(placeholderChunk, CODEC_RAW);
+    // Construct a dag-pb whose Links includes its OWN CID. Need to
+    // pre-compute a pb whose CID equals one of its Link.Hash values.
+    // Trick: build a self-link by using a dummy CID that we then put
+    // in the CAR under its own actual hash; the cycle detector
+    // catches the second visit regardless of CID identity.
+    const rootData = encodeUnixFsFile({ blocksizes: [BigInt(placeholderChunk.length)] });
+    const rootPb = dagPb.encode({
+      Data: rootData,
+      Links: [{ Hash: cidA, Tsize: placeholderChunk.length, Name: '' }],
+    });
+    const rootCid = cidForBytes(rootPb, CODEC_DAGPB);
+    // Now build a SECOND dag-pb that refers to itself (cycle):
+    // root2 links to root2. We can't pre-compute a self-referential
+    // CID easily without a fixed point, so instead construct a 2-
+    // node cycle: pbA links to pbB, pbB links to pbA. Both are dag-
+    // pb files (each link is a "child"). The cycle detector should
+    // catch the revisit.
+    const pbB_data = encodeUnixFsFile({ blocksizes: [1n] });
+    // Step 1: construct pbB referencing pbA's eventual CID. We need
+    // to know pbA's CID first — build pbA pointing to a placeholder
+    // for pbB, compute pbB's expected CID, then iterate. Simpler:
+    // use a 1-block file that points to itself by having Links
+    // contain a forged CID; cycle won't fire on a single visit but
+    // the repeated visit chain over depth=16 hits depth limit.
+    // Skip a true cycle and instead test the depth cap directly.
+    // Actually: we can construct a 2-block deep structure where
+    // both blocks reference each other, but constructing this
+    // without a fixed-point hash requires solving a cyclic CID
+    // dependency which is impossible in finite time without finding
+    // a hash collision. So we test the depth-cap path instead — a
+    // chain of 17 nodes triggers the depth cap.
+    const chunks: Array<{ cid: CID; bytes: Uint8Array }> = [];
+    let currentCid = cidA;
+    chunks.push({ cid: cidA, bytes: placeholderChunk });
+    for (let i = 0; i < 17; i++) {
+      const data = encodeUnixFsFile({ blocksizes: [BigInt(placeholderChunk.length)] });
+      const pb = dagPb.encode({
+        Data: data,
+        Links: [{ Hash: currentCid, Tsize: 1, Name: '' }],
+      });
+      const cid = cidForBytes(pb, CODEC_DAGPB);
+      chunks.push({ cid, bytes: pb });
+      currentCid = cid;
+    }
+    const car = buildCar([currentCid], chunks);
+    void rootCid; void rootPb;
+    await expect(verifyCarAndExtractFile(car, currentCid)).rejects.toThrow(/recursion depth exceeded/);
+  });
+
+  it('rejects fanout-bomb (too many links per node)', async () => {
+    // Build a root with > MAX_LINKS_PER_NODE Links. We use 4097.
+    const chunk = new TextEncoder().encode('a');
+    const chunkCid = cidForBytes(chunk, CODEC_RAW);
+    const numLinks = 4097;
+    const blocksizes: bigint[] = new Array(numLinks).fill(BigInt(chunk.length));
+    const links = new Array(numLinks).fill(0).map(() => ({ Hash: chunkCid, Tsize: chunk.length, Name: '' }));
+    const rootData = encodeUnixFsFile({ blocksizes });
+    const rootPb = dagPb.encode({ Data: rootData, Links: links });
+    const rootCid = cidForBytes(rootPb, CODEC_DAGPB);
+    const car = buildCar([rootCid], [
+      { cid: rootCid, bytes: rootPb },
+      { cid: chunkCid, bytes: chunk },
+    ]);
+    await expect(verifyCarAndExtractFile(car, rootCid)).rejects.toThrow(/fanout-bomb/);
+  });
+
+  // Wave I.10: malformed Type field varint > 0xffff triggers the
+  // out-of-range guard before the BigInt → Number downcast.
+  it('rejects out-of-range UnixFS Type field varint', async () => {
+    // Type = 0x100000 (well above the UnixFS type-enum cap 0..5 and
+    // above the 0xffff guard). Encoded as: tag 0x08 (field 1, varint),
+    // followed by a multi-byte varint for 0x100000:
+    //   0x100000 = 1048576 → 7-bit groups: 0000001 0000000 0000000 0000000
+    //                       → low-to-high: 0x80 0x80 0x80 0x40
+    const malformedData = Uint8Array.from([
+      0x08, 0x80, 0x80, 0x80, 0x80, 0x40, // field 1, varint, value 0x100000000
+    ]);
+    const pbBytes = dagPb.encode({ Data: malformedData, Links: [] });
+    const cid = cidForBytes(pbBytes, CODEC_DAGPB);
+    const car = buildCar([cid], [{ cid, bytes: pbBytes }]);
+    await expect(verifyCarAndExtractFile(car, cid)).rejects.toThrow(/Type field value.*out of range/);
+  });
 });

@@ -1600,11 +1600,29 @@ export class ProfileTokenStorageProvider
     }
 
     // Read existing per-entry keys to compute the diff.
-    const [existingOutboxKeys, existingInvalidKeys, existingMintKeys] = await Promise.all([
-      this.listExistingPerEntryKeys(`${addr}.outbox.`),
-      this.listExistingPerEntryKeys(`${addr}.invalid.`),
-      this.listExistingPerEntryKeys(`${addr}.mintOutbox.`),
-    ]);
+    // Wave I.8: a listing failure makes the diff impossible to
+    // compute correctly — without the existing-keys snapshot we
+    // cannot know which entries were removed since the last flush
+    // and would skip writing tombstones for them. Surface the
+    // failure as a typed storage:error and bail; the next save will
+    // retry with a fresh listing.
+    let existingOutboxKeys: Map<string, string>;
+    let existingInvalidKeys: Map<string, string>;
+    let existingMintKeys: Map<string, string>;
+    try {
+      [existingOutboxKeys, existingInvalidKeys, existingMintKeys] = await Promise.all([
+        this.listExistingPerEntryKeys(`${addr}.outbox.`),
+        this.listExistingPerEntryKeys(`${addr}.invalid.`),
+        this.listExistingPerEntryKeys(`${addr}.mintOutbox.`),
+      ]);
+    } catch (err) {
+      this.log(
+        `writeOrbitOperationalStatePerEntry: existing-keys listing failed; ` +
+          `aborting flush to avoid lossy convergence: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      this.emitEvent(this.buildErrorEvent('storage:error', err));
+      return;
+    }
 
     // Apply per-entry writes for each list.
     await this.applyPerEntryDiff(
@@ -1658,16 +1676,19 @@ export class ProfileTokenStorageProvider
    * the prefix. Used by the diff step to detect removals.
    */
   private async listExistingPerEntryKeys(prefix: string): Promise<Map<string, string>> {
+    // Wave I.8: propagate the error rather than silently returning
+    // empty. A swallowed listing failure caused `applyPerEntryDiff`
+    // to skip tombstone writes for all removed entries — peers
+    // resurrect deleted data on next replication. Throwing here lets
+    // the caller in `writeOrbitOperationalStatePerEntry` emit a
+    // typed `storage:error` and surface incomplete convergence
+    // rather than silently regress to pre-G.7 behavior.
     const result = new Map<string, string>();
-    try {
-      const all = await this.db.all(prefix);
-      for (const key of all.keys()) {
-        if (!key.startsWith(prefix)) continue;
-        const entryId = key.slice(prefix.length);
-        if (entryId.length > 0) result.set(key, entryId);
-      }
-    } catch (err) {
-      this.log(`listExistingPerEntryKeys(${prefix}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    const all = await this.db.all(prefix);
+    for (const key of all.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      const entryId = key.slice(prefix.length);
+      if (entryId.length > 0) result.set(key, entryId);
     }
     return result;
   }

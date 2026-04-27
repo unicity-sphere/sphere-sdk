@@ -131,12 +131,28 @@ export interface OracleProvider extends BaseProvider {
      */
     proofJson: unknown;
     /**
-     * The transaction hash the proof attests (hex). Used to verify
-     * the proof binds to the expected tx — defends against a replay
-     * where an old valid proof is grafted onto a new tx with the
-     * same authenticator.
+     * Wave I.6: the SDK-encoded DataHash IMPRINT hex (68 chars =
+     * 2-byte algorithm prefix + 32-byte digest, as emitted by
+     * `DataHash.toJSON()` and stored verbatim in the UXF pool's
+     * `inclusion-proof.content.transactionHash`). NOT the bare 64-
+     * char content-hash digest. Implementations compare this byte-
+     * exactly against the inclusion-proof's own internal
+     * `transactionHash.imprint`; mismatch returns false (replay-
+     * grafting defense). Length must equal 68; values of other
+     * lengths are rejected as malformed input.
      */
     transactionHash: string;
+    /**
+     * Wave I.7: optional canonical proof identifier — typically the
+     * UXF pool ContentHash of the inclusion-proof element (64-char
+     * hex). When supplied, the implementation MAY include this in
+     * its result-cache key alongside `transactionHash` so two
+     * different proofs that happen to attest the same tx hash do
+     * not collide in the cache (forged-then-genuine denial-of-
+     * verification scenario). When omitted, callers accept the
+     * coarser cache keying.
+     */
+    proofHash?: string;
   }): Promise<boolean>;
 }
 

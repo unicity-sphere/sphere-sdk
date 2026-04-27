@@ -163,6 +163,15 @@ export class FileStorageProvider implements StorageProvider {
     if (entries.length === 0) return;
     const previous = new Map<string, string | undefined>();
     const fullEntries: Array<[string, string]> = [];
+    // Wave I.4 CRITICAL: snapshot the mutatedKeys / removedKeys sets
+    // BEFORE mutating so rollback can restore the EXACT pre-call
+    // state, not just delete-on-prev-undefined. Pre-existing keys
+    // that we mutated and then rolled back must NOT linger in
+    // mutatedKeys — otherwise the next save()'s merge step sees
+    // them as "locally mutated" and clobbers a sibling process's
+    // newer write (the F.43 multi-process race).
+    const prevMutated = new Set(this.mutatedKeys);
+    const prevRemoved = new Set(this.removedKeys);
     for (const [key, value] of entries) {
       const fullKey = this.getFullKey(key);
       fullEntries.push([fullKey, value]);
@@ -176,16 +185,19 @@ export class FileStorageProvider implements StorageProvider {
       }
       await this.save();
     } catch (err) {
-      // Roll back in-memory state on save failure so the next read
-      // doesn't see a half-applied set.
+      // Wave I.4: full state rollback — data, mutatedKeys, removedKeys.
+      // Anything we ADDED to mutatedKeys (and wasn't there before)
+      // must be removed; anything we DELETED from removedKeys (because
+      // it was prev-removed) must be restored.
       for (const [fullKey, prev] of previous) {
         if (prev === undefined) {
           delete this.data[fullKey];
-          this.mutatedKeys.delete(fullKey);
         } else {
           this.data[fullKey] = prev;
         }
       }
+      this.mutatedKeys = prevMutated;
+      this.removedKeys = prevRemoved;
       throw err;
     }
   }

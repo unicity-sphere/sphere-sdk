@@ -227,6 +227,29 @@ function assembleUnicityCertificate(
 // ---------------------------------------------------------------------------
 
 /**
+ * Wave I.5: public wrapper for assembling an inclusion-proof element
+ * to the SDK's `IInclusionProofJson` shape, used by
+ * `UxfPackage.computeVerifiedProofs` to feed
+ * `OracleProvider.verifyInclusionProof`.
+ *
+ * Throws on dangling references / malformed children (caller treats
+ * any throw as "not verified").
+ */
+export function assembleInclusionProofForVerification(
+  pool: ReadonlyMap<ContentHash, UxfElement>,
+  proofHash: ContentHash,
+): unknown {
+  const elementPool = ElementPool.fromMap(pool);
+  const ctx: AssemblyContext = {
+    explored: new Set<string>(),
+    instanceChains: new Map() as InstanceChainIndex,
+    strategy: STRATEGY_LATEST,
+    maxDepth: 64,
+  };
+  return assembleInclusionProof(elementPool, proofHash, ctx);
+}
+
+/**
  * Assemble an inclusion-proof element into the IInclusionProofJson shape.
  */
 function assembleInclusionProof(

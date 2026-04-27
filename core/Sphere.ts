@@ -3932,7 +3932,18 @@ export class Sphere {
     // file-lock-guarded snapshot rewrite). Either every key lands or
     // none do — no rollback needed. Falls back to the F.56 best-
     // effort transactional rollback for providers that don't.
+    //
+    // Wave I.3 CRITICAL: snapshot in-memory state BEFORE mutating
+    // and BEFORE awaiting setMany. If setMany throws (quota, IDB
+    // abort, lock-contended file write), the in-memory state was
+    // already mutated — caller's `sphere.getMnemonic()` would return
+    // an unstored mnemonic, silent divergence between live instance
+    // and disk. Restore on catch matches the F.51 fallback contract.
     const encrypted = this.encrypt(mnemonic);
+    const prevMnemonic = this._mnemonic;
+    const prevSource = this._source;
+    const prevDerivationMode = this._derivationMode;
+    const prevBasePath = this._basePath;
     this._mnemonic = mnemonic;
     this._source = 'mnemonic';
     this._derivationMode = 'bip32';
@@ -3948,7 +3959,15 @@ export class Sphere {
       entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
     }
     if (this._storage.setMany) {
-      await this._storage.setMany(entries);
+      try {
+        await this._storage.setMany(entries);
+      } catch (err) {
+        this._mnemonic = prevMnemonic;
+        this._source = prevSource;
+        this._derivationMode = prevDerivationMode;
+        this._basePath = prevBasePath;
+        throw err;
+      }
       return;
     }
     // Steelman⁵¹ CRITICAL fallback: best-effort transactional rollback.
@@ -3971,6 +3990,12 @@ export class Sphere {
           /* best-effort cleanup */
         }
       }
+      // Wave I.3: restore in-memory state on rollback so caller does
+      // not observe an unstored mnemonic via sphere.getMnemonic().
+      this._mnemonic = prevMnemonic;
+      this._source = prevSource;
+      this._derivationMode = prevDerivationMode;
+      this._basePath = prevBasePath;
       throw writeErr;
     }
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization
@@ -3985,7 +4010,15 @@ export class Sphere {
   ): Promise<void> {
     // Wave G.6: prefer setMany when available; fall back to F.56
     // best-effort rollback otherwise.
+    //
+    // Wave I.3 CRITICAL: snapshot in-memory state before mutating;
+    // restore on any failure so caller does not observe unstored
+    // master-key state (silent disk/memory divergence).
     const encrypted = this.encrypt(masterKey);
+    const prevMnemonic = this._mnemonic;
+    const prevSource = this._source;
+    const prevDerivationMode = this._derivationMode;
+    const prevBasePath = this._basePath;
     this._source = 'file';
     this._mnemonic = null;
     if (derivationMode) {
@@ -4004,7 +4037,15 @@ export class Sphere {
     if (chainCode) entries.splice(1, 0, [STORAGE_KEYS_GLOBAL.CHAIN_CODE, chainCode]);
     if (derivationPath) entries.splice(chainCode ? 2 : 1, 0, [STORAGE_KEYS_GLOBAL.DERIVATION_PATH, derivationPath]);
     if (this._storage.setMany) {
-      await this._storage.setMany(entries);
+      try {
+        await this._storage.setMany(entries);
+      } catch (err) {
+        this._mnemonic = prevMnemonic;
+        this._source = prevSource;
+        this._derivationMode = prevDerivationMode;
+        this._basePath = prevBasePath;
+        throw err;
+      }
       return;
     }
     const writtenKeys: string[] = [];
@@ -4024,6 +4065,10 @@ export class Sphere {
           /* best-effort cleanup */
         }
       }
+      this._mnemonic = prevMnemonic;
+      this._source = prevSource;
+      this._derivationMode = prevDerivationMode;
+      this._basePath = prevBasePath;
       throw writeErr;
     }
     // Note: WALLET_EXISTS is set in finalizeWalletCreation() after successful initialization

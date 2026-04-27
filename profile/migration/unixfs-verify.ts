@@ -118,6 +118,16 @@ function decodeUnixFsData(buf: Uint8Array): UnixFsData {
     if (fieldNum === 1 && wireType === 0) {
       const [v, next] = readVarint(buf, i);
       i = next;
+      // Wave I.10: bound the Type enum to known UnixFS values before
+      // BigInt → Number downcast loses precision. Known types are
+      // 0..5; anything outside that range is malformed input. The
+      // explicit check before downcast also closes the lossy
+      // conversion footgun (a 10-byte varint downcasting to a non-
+      // safe-integer that happens to compare equal to UNIXFS_TYPE_FILE
+      // via JS coercion edge cases).
+      if (v > 0xffffn) {
+        throw new Error(`UnixFS: Type field value ${v} out of range`);
+      }
       type = Number(v);
     } else if (fieldNum === 2 && wireType === 2) {
       const [lenBig, next] = readVarint(buf, i);
@@ -202,6 +212,23 @@ function verifyBlock(cid: CID, bytes: Uint8Array): void {
 }
 
 /**
+ * Wave I.1: canonical Map key for a CID. CIDv0 (base58btc `Qm...`) and
+ * CIDv1 (base32 `bafy...`) of the same digest are CRYPTOGRAPHICALLY
+ * equivalent (cid.equals() returns true) but render to different
+ * .toString() values. The blocks Map and the walkFile lookup MUST
+ * agree on a single canonical form, or a CAR carrying CIDv0 blocks
+ * would miss when looked up via a CIDv1-supplied expected CID.
+ *
+ * Canonical form: always v1 lowercase base32 string. v0 CIDs are
+ * implicitly converted via toV1() which preserves the digest.
+ */
+function canonicalCidKey(cid: CID): string {
+  // toV1() is a no-op on already-v1 CIDs; for v0 it wraps the digest
+  // into a CIDv1 with codec=dag-pb and the same multihash.
+  return cid.toV1().toString();
+}
+
+/**
  * Recursively reconstruct the file bytes anchored at `rootCid`,
  * pulling block bytes from the CAR's pre-loaded `blocks` map. Each
  * visited block has already been hash-verified against its CID by
@@ -212,6 +239,15 @@ function verifyBlock(cid: CID, bytes: Uint8Array): void {
  */
 const MAX_RECURSION_DEPTH = 16;
 const MAX_TOTAL_OUTPUT_BYTES = 64 * 1024 * 1024; // 64 MiB hard cap
+/**
+ * Wave I.9: per-DAG fanout cap. A malicious dag-pb root with N=10000
+ * Links all pointing to the same 1KB raw block (or to deep subtrees)
+ * inflates output by re-emitting child bytes per visit. The total-
+ * output cap eventually fires but only after substantial work. A
+ * fanout cap catches malformed-by-design DAGs cheaply at the link
+ * iteration boundary.
+ */
+const MAX_LINKS_PER_NODE = 4096;
 
 function walkFile(
   rootCid: CID,
@@ -219,14 +255,27 @@ function walkFile(
   depth: number,
   outBuf: Uint8Array[],
   outBytesSoFar: { total: number },
+  /** Wave I.9: per-path visited set — detects cycles. */
+  pathVisited: Set<string>,
 ): void {
   if (depth > MAX_RECURSION_DEPTH) {
     throw new Error(`unixfs-verify: recursion depth exceeded ${MAX_RECURSION_DEPTH}`);
   }
-  const blockBytes = blocks.get(rootCid.toString());
+  // Wave I.1: canonical lookup tolerates v0/v1 representation mismatch.
+  const cidKey = canonicalCidKey(rootCid);
+  const blockBytes = blocks.get(cidKey);
   if (!blockBytes) {
     throw new Error(`unixfs-verify: block ${rootCid.toString()} missing from CAR`);
   }
+  // Wave I.9: cycle detection via per-path visited set. A self-cycle
+  // or any DAG loop on the traversal path throws immediately rather
+  // than walking 16-deep before hitting the depth cap.
+  if (pathVisited.has(cidKey)) {
+    throw new Error(
+      `unixfs-verify: cycle detected at block ${rootCid.toString()}`,
+    );
+  }
+  pathVisited.add(cidKey);
   if (rootCid.code === CODEC_RAW) {
     outBytesSoFar.total += blockBytes.length;
     if (outBytesSoFar.total > MAX_TOTAL_OUTPUT_BYTES) {
@@ -271,14 +320,25 @@ function walkFile(
         `disagrees with PBNode.Links length (${node.Links.length}) at ${rootCid.toString()}`,
     );
   }
+  // Wave I.9: fanout cap.
+  if (node.Links.length > MAX_LINKS_PER_NODE) {
+    throw new Error(
+      `unixfs-verify: block ${rootCid.toString()} has ${node.Links.length} ` +
+        `links (cap ${MAX_LINKS_PER_NODE}); refusing to walk fanout-bomb`,
+    );
+  }
   for (const link of node.Links) {
     if (!link.Hash) {
       throw new Error(
         `unixfs-verify: link without Hash in block ${rootCid.toString()}`,
       );
     }
-    walkFile(link.Hash, blocks, depth + 1, outBuf, outBytesSoFar);
+    walkFile(link.Hash, blocks, depth + 1, outBuf, outBytesSoFar, pathVisited);
   }
+  // Pop this node from the path-visited set after recursion returns
+  // so legitimate DAG sharing (same block referenced from sibling
+  // subtrees) is not falsely flagged as a cycle.
+  pathVisited.delete(cidKey);
 }
 
 // =============================================================================
@@ -335,13 +395,13 @@ export async function verifyCarAndExtractFile(
         `unixfs-verify: CAR total blocks exceed ${MAX_CAR_BYTES} bytes`,
       );
     }
-    blocks.set(block.cid.toString(), block.bytes);
+    blocks.set(canonicalCidKey(block.cid), block.bytes);
   }
 
   // Walk the dag and reconstruct.
   const out: Uint8Array[] = [];
   const tracker = { total: 0 };
-  walkFile(expectedCid, blocks, 0, out, tracker);
+  walkFile(expectedCid, blocks, 0, out, tracker, new Set<string>());
 
   // Concatenate.
   const result = new Uint8Array(tracker.total);
