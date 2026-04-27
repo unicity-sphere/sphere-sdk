@@ -128,26 +128,52 @@ export function prepareContentForHashing(
       continue;
     }
 
-    // Uint8Array values pass through (e.g., reason in genesis-data)
-    if (value instanceof Uint8Array) {
-      result[key] = value;
-      continue;
+    // Wave H — null hash canonicalization.
+    //
+    // Empty byte values have multiple equivalent representations in the
+    // input — null, '' (empty-string hex), and Uint8Array(0) — but
+    // would otherwise hash to DIFFERENT bytes:
+    //   - null            → CBOR null (0xf6)
+    //   - ''              → bstr(0)   (0x40)  — via hexToBytes('')
+    //   - Uint8Array(0)   → bstr(0)   (0x40)
+    // Two compliant SDKs picking different "no value" representations
+    // for the same logical byte-field (e.g. an absent recipientDataHash)
+    // would compute different content hashes, JOIN would see phantom
+    // forks, and cross-device convergence would break.
+    //
+    // Canonical form: ALL "no value" representations of a byte-field
+    // map to CBOR null at hash time. This unifies on the smaller, more
+    // semantically-correct encoding ("absent") and matches how the SDK
+    // already treats InclusionProof.transactionHash = null. Wire
+    // serialization (json.ts, ipld.ts) is UNCHANGED — `tokenData: ''`
+    // still round-trips through CAR/JSON as `''`. Only the hash
+    // function's pre-CBOR normalization layer changes.
+    //
+    // NOTE: this is a wire-format spec change relative to pre-Wave-H
+    // behavior. Tokens whose content hashes were computed under the
+    // old (`bstr(0)` for '') scheme will hash differently after this
+    // change. The pre-mainnet posture treats this as the right time
+    // to lock in the canonical form before tokens are widely live.
+    if (byteFields.has(key)) {
+      if (typeof value === 'string') {
+        if (value.length === 0) {
+          result[key] = null;
+          continue;
+        }
+        const decoded = hexToBytes(value);
+        result[key] = decoded.length === 0 ? null : decoded;
+        continue;
+      }
     }
 
-    // Hex-encoded byte fields -> Uint8Array
-    //
-    // KNOWN CAVEAT (steelman²⁸/²⁹, deferred): empty-string ('') and
-    // null produce DIFFERENT CBOR encodings (bstr(0) vs null), and
-    // therefore different content hashes. The wire-format round-trip
-    // tests (txf-wire-roundtrip) rely on '' being preserved through
-    // CAR serialization, so the encoding-level normalization is NOT
-    // applied here. The mitigation requires either a wire-format spec
-    // bump OR a pre-deconstruct normalization pass that the SDK
-    // chooses (always-bytes vs always-null per field). Until then, any
-    // ingestor of attacker-supplied genesis-data should normalize
-    // empty-string byte fields to null at the input boundary.
-    if (byteFields.has(key) && typeof value === 'string') {
-      result[key] = hexToBytes(value);
+    // Uint8Array values: empty bytes also normalize to null for byte-
+    // fields; non-empty pass through as CBOR bstr.
+    if (value instanceof Uint8Array) {
+      if (byteFields.has(key) && value.length === 0) {
+        result[key] = null;
+        continue;
+      }
+      result[key] = value;
       continue;
     }
 

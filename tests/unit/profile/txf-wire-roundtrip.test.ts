@@ -38,14 +38,23 @@ function assertGenesisPreserved(
   const restData = restGenesis.data as Record<string, unknown>;
   const restProof = restGenesis.inclusionProof as Record<string, unknown>;
 
-  // Genesis data — every field the wire protocol expects
+  // Genesis data — every field the wire protocol expects.
+  //
+  // Wave H — null hash canonicalization: empty byte values ('' /
+  // Uint8Array(0) / null) are canonically equivalent for byte-fields
+  // at the hash boundary. The IPLD storage layer encodes the
+  // canonical form (null), so a token sent in with `tokenData: ''`
+  // round-trips back as `tokenData: null`. This is intentional and
+  // matches the SDK's `tokenData: string | null` type. Use
+  // `expectByteFieldEquivalent` for fields that may legitimately
+  // surface this normalization.
   expect(restData.tokenId).toBe(origData.tokenId);
   expect(restData.tokenType).toBe(origData.tokenType);
   expect(restData.coinData).toEqual(origData.coinData);
-  expect(restData.tokenData).toBe(origData.tokenData);
-  expect(restData.salt).toBe(origData.salt);
+  expectByteFieldEquivalent(restData.tokenData, origData.tokenData);
+  expectByteFieldEquivalent(restData.salt, origData.salt);
   expect(restData.recipient).toBe(origData.recipient);
-  expect(restData.recipientDataHash).toBe(origData.recipientDataHash);
+  expectByteFieldEquivalent(restData.recipientDataHash, origData.recipientDataHash);
   expect(restData.reason).toBe(origData.reason);
 
   // Genesis inclusion proof (required by SDK validation)
@@ -53,9 +62,23 @@ function assertGenesisPreserved(
     expect(restProof).toBeDefined();
     expect(restProof.authenticator).toEqual(origProof.authenticator);
     expect(restProof.merkleTreePath).toEqual(origProof.merkleTreePath);
-    expect(restProof.transactionHash).toBe(origProof.transactionHash);
+    expectByteFieldEquivalent(restProof.transactionHash, origProof.transactionHash);
     expect(restProof.unicityCertificate).toBe(origProof.unicityCertificate);
   }
+}
+
+/**
+ * Wave H canonical equivalence for byte-field round-trip:
+ * '' / null / Uint8Array(0) are all canonically equivalent.
+ */
+function expectByteFieldEquivalent(actual: unknown, expected: unknown): void {
+  const isEmpty = (v: unknown): boolean =>
+    v === null ||
+    v === undefined ||
+    v === '' ||
+    (v instanceof Uint8Array && v.length === 0);
+  if (isEmpty(actual) && isEmpty(expected)) return;
+  expect(actual).toBe(expected);
 }
 
 function assertStatePreserved(

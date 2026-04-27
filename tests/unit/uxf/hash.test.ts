@@ -136,6 +136,73 @@ describe('prepareContentForHashing', () => {
     expect(refs[0]).toBeInstanceOf(Uint8Array);
     expect(refs[0].length).toBe(32);
   });
+
+  // Wave H — null hash canonicalization: '' / null / Uint8Array(0)
+  // for byte-fields all canonicalize to CBOR null. Two compliant SDKs
+  // with different "no value" representations now produce identical
+  // content hashes for the same logical token.
+  describe('Wave H — empty byte-field canonicalization', () => {
+    it("normalizes '' to null for byte-fields", () => {
+      const result = prepareContentForHashing('genesis-data', {
+        tokenData: '',
+        recipient: 'DIRECT://x',
+      });
+      expect(result.tokenData).toBeNull();
+      // Non-byte fields keep their value verbatim.
+      expect(result.recipient).toBe('DIRECT://x');
+    });
+
+    it("normalizes empty Uint8Array to null for byte-fields", () => {
+      const result = prepareContentForHashing('genesis-data', {
+        recipientDataHash: new Uint8Array(0),
+      });
+      expect(result.recipientDataHash).toBeNull();
+    });
+
+    it('null already passes through as null for byte-fields', () => {
+      const result = prepareContentForHashing('genesis-data', {
+        salt: null,
+      });
+      expect(result.salt).toBeNull();
+    });
+
+    it("'' / null / Uint8Array(0) all hash identically for the same byte-field", async () => {
+      const baseInput = (val: unknown): Record<string, unknown> => ({
+        tokenId: 'aa'.repeat(32),
+        tokenType: 'bb'.repeat(32),
+        salt: 'cc'.repeat(32),
+        tokenData: val,
+        recipientDataHash: null,
+        recipient: 'DIRECT://x',
+      });
+      const a = prepareContentForHashing('genesis-data', baseInput(''));
+      const b = prepareContentForHashing('genesis-data', baseInput(null));
+      const c = prepareContentForHashing('genesis-data', baseInput(new Uint8Array(0)));
+      // All three should be deeply identical after preparation.
+      expect(a.tokenData).toBeNull();
+      expect(b.tokenData).toBeNull();
+      expect(c.tokenData).toBeNull();
+      // The whole prepared dict must be equivalent.
+      expect(a).toEqual(b);
+      expect(a).toEqual(c);
+    });
+
+    it('preserves non-empty byte-field bytes verbatim', () => {
+      const result = prepareContentForHashing('genesis-data', {
+        tokenData: '616c696365', // hex("alice")
+      });
+      expect(result.tokenData).toBeInstanceOf(Uint8Array);
+      expect((result.tokenData as Uint8Array).length).toBe(5);
+    });
+
+    it('does NOT normalize empty values for non-byte fields', () => {
+      // recipient is NOT a byte-field — preserves '' as-is.
+      const result = prepareContentForHashing('genesis-data', {
+        recipient: '',
+      });
+      expect(result.recipient).toBe('');
+    });
+  });
 });
 
 describe('prepareChildrenForHashing', () => {

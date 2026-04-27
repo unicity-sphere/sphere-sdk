@@ -57,7 +57,7 @@ interface ITokenJson {
 | `tokenId` | `genesis.data.tokenId` | hex string -> `Uint8Array(32)` | Always 64-char hex. |
 | `tokenType` | `genesis.data.tokenType` | hex string -> `Uint8Array(32)` | Always 64-char hex. Nametag tokens use type `f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509`. |
 | `coinData` | `genesis.data.coinData` | `[string, string][]` -> keep as array of `[text, text]` | In ITokenJson: `TokenCoinDataJson = [string, string][]`. May be `null` in the SDK type (`IMintTransactionDataJson.coinData: TokenCoinDataJson | null`). Nametag tokens have `coinData: []` (empty array) or `null`. For CBOR encoding, `null` should be stored as empty array `[]`. |
-| `tokenData` | `genesis.data.tokenData` | `string | null` -> `Uint8Array` (empty if null) | For fungible tokens: usually `""` or `null`. For nametag tokens: contains the nametag string data. Must handle both null and empty string as empty bytes. |
+| `tokenData` | `genesis.data.tokenData` | `string | null` -> `Uint8Array` (empty if null) | For fungible tokens: usually `""` or `null`. For nametag tokens: contains the nametag string data. **Wave H — null hash canonicalization (SPEC change):** at the hash boundary, `''`, `null`, and `Uint8Array(0)` for byte-fields are treated as canonically equivalent and encode to CBOR null (0xf6). This unifies the "no value" representation across SDKs and prevents two compliant implementations from computing different hashes for the same logical token. Wire serialization (JSON/CAR) is unchanged — what the user passes in is what comes back out, modulo the canonical normalization on round-trip. |
 | `salt` | `genesis.data.salt` | hex string -> `Uint8Array(32)` | Always 64-char hex. Never null. |
 | `recipient` | `genesis.data.recipient` | string, keep as text | `"DIRECT://..."` format (~80 chars). Never null. |
 | `recipientDataHash` | `genesis.data.recipientDataHash` | hex string -> `Uint8Array(32)` or `null` | Usually `null`. When present, 64-char hex. |
@@ -123,7 +123,7 @@ In `TxfTransaction` (sphere-sdk storage):
 | UXF Field | Source Path | Type Transformation | Edge Cases |
 |-----------|------------|---------------------|------------|
 | `predicate` | `state.predicate` or `transactions[n].data.sourceState.predicate` | hex string -> `Uint8Array` (opaque CBOR bytes) | Always present. Variable length (~340-400 hex chars). Keep as opaque bytes -- do NOT decode the CBOR predicate structure. |
-| `data` | `state.data` or `transactions[n].data.sourceState.data` | `string | null` -> `Uint8Array` (empty if null/empty string) | Usually `null` or `""` for fungible tokens. Treat both as empty `Uint8Array(0)`. |
+| `data` | `state.data` or `transactions[n].data.sourceState.data` | `string | null` -> `Uint8Array` (empty if null/empty string) | Usually `null` or `""` for fungible tokens. **Wave H:** at the hash boundary, `''`, `null`, and `Uint8Array(0)` are canonically equivalent and encode to CBOR null. See `tokenData` row for the full rationale. |
 
 #### InclusionProof (0x08)
 
