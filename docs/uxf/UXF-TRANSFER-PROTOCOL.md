@@ -285,22 +285,28 @@ Recipients indefinitely accept all of the above (see §10). Senders only emit th
 
 Inputs: `tokens: Token[]` (selected for transfer), `recipient: PeerInfo`, `transferMode: 'conservative' | 'instant'`.
 
-1. **Validate inputs**:
-   - All tokens MUST be currently owned (current-state predicate binds to sender).
-   - **v1.0 supports a single `(coinId, amount)` per `send()` call.** Sending multiple coin types from a multi-coin token in one transfer requires either multiple sequential `send()` calls or the future `sendMulti()` API (deferred — §12.2).
-   - Each selected token MUST contain the requested `coinId`. A token MAY carry multiple distinct coin types (multi-coin tokens are supported by the SDK); in that case the token will be split (step 2) so only the requested `(coinId, amount)` is delivered.
-   - Total of the requested coin's slices selected across the chosen tokens MUST sum to the requested transfer amount.
+1. **Validate inputs** — the request carries one or more `(coinId, amount)` targets:
+   - Single-coin call: `{ coinId, amount }` populated (`additionalAssets` omitted) → target list = `[{coinId, amount}]`.
+   - Multi-coin call: `{ coinId, amount, additionalAssets: [{coinId₂, amount₂}, ...] }` → target list = `[{coinId, amount}, ...additionalAssets]`.
+   - All `coinId` values across the target list MUST be distinct (no duplicates within one transfer; if the caller wants more of the same coin, they must sum into `amount`). Each `amount` MUST be > 0.
+   - All source tokens MUST be currently owned (current-state predicate binds to sender).
+   - For each target `(coinIdᵢ, amountᵢ)`: the union of source tokens MUST collectively contain at least `amountᵢ` of `coinIdᵢ`. A single source token MAY contribute to multiple targets if it carries multiple of the requested coin types.
+   - If any target's amount is uncoverable, `send()` rejects with `INSUFFICIENT_BALANCE`.
 
-2. **Compute splits** (if needed). The single split rule generalizes single-coin and multi-coin tokens uniformly: when splitting a source token to fulfill one or more requested `(coinId, amount)` entries, the split produces:
-   - **`tokenForRecipient`**: contains EXACTLY the requested `(coinId, amount)` entries — no more, no less. For v1.0 (single-coin send), this is exactly one entry; future `sendMulti()` would package multiple entries here.
-   - **`changeToken`** (formerly "residual"): contains everything left in the source token AFTER subtracting the requested entries. This includes (a) the unrequested portion of any requested coin (e.g., source had `UCT: 100`, requested `UCT: 30` → change has `UCT: 70`), (b) all non-requested coin types in the source token (e.g., source had `USDU: 50`, request was for `UCT` only → change has `USDU: 50` carried through unchanged), and (c) any other balances unrelated to the request. The change token is minted to the sender's identity.
+2. **Compute splits** (if needed). The split rule is uniform for single-coin and multi-coin transfers: when splitting a source token to fulfill one or more requested `(coinId, amount)` targets, the split produces:
+   - **`tokenForRecipient`**: contains EXACTLY the requested `(coinIdᵢ, amountᵢ)` slices that the source token contributes to. If the source token contributes to multiple targets (it carries multiple requested coin types), `tokenForRecipient` carries multiple coin entries. If it contributes to only one target, `tokenForRecipient` carries exactly one entry.
+   - **`changeToken`** (formerly "residual"): contains everything left in the source token AFTER subtracting all contributed slices. This includes (a) the unrequested portion of any requested coin (e.g., source had `UCT: 100`, target was `UCT: 30` → change has `UCT: 70`), (b) all non-requested coin types in the source token (e.g., source had `USDU: 50`, transfer was for `UCT` only → change has `USDU: 50` carried through unchanged), and (c) any other balances unrelated to any target. The change token is minted to the sender's identity.
    - **Zero-balance pruning**: when constructing the change token, coins with zero balance MUST be pruned from `coinData`. Carrying explicit zero entries inflates the token CBOR for no benefit.
 
-   The single-coin split (source `{UCT:100}`, request `(UCT, 30)` → recipient `{UCT:30}`, change `{UCT:70}`) is the trivial special case where the change carries a single coin type. The multi-coin split (source `{UCT:100, USDU:50}`, request `(UCT, 30)` → recipient `{UCT:30}`, change `{UCT:70, USDU:50}`) is the general case. From the protocol's perspective these are the same operation; the spec does NOT distinguish them.
+   **Worked examples**:
+   - **Single-coin transfer** (source `{UCT:100}`, target `(UCT, 30)`) → recipient gets `{UCT:30}`, change has `{UCT:70}`. Trivial.
+   - **Single-coin transfer from multi-coin source** (source `{UCT:100, USDU:50}`, target `(UCT, 30)`) → recipient gets `{UCT:30}`, change has `{UCT:70, USDU:50}`. The non-requested coin (USDU) is carried entirely into change.
+   - **Multi-coin transfer from multi-coin source covered by ONE token** (source `{UCT:100, USDU:50, ALPHA:1000}`, targets `(UCT, 30) + (USDU, 20)`) → recipient gets `{UCT:30, USDU:20}` (one child token bundling both contributed coins), change has `{UCT:70, USDU:30, ALPHA:1000}`.
+   - **Multi-coin transfer covered by MULTIPLE source tokens** (source A `{UCT:100}`, source B `{USDU:50}`, targets `(UCT, 30) + (USDU, 20)`) → split A into recipient-A `{UCT:30}` + change-A `{UCT:70}`; split B into recipient-B `{USDU:20}` + change-B `{USDU:30}`. The recipient receives TWO child tokens (one per source). The bundle carries both — multi-token bundles are a UXF feature.
 
    - Splits MAY be issued in instant mode (the parent's still-pending transaction does not invalidate child token identities — see the token-hash invariance note in §2.1). The `splitParent: tokenId` reference is recorded on each child for §6.1.1 cascade purposes.
 
-> **Multicoin send status (informational)**: `PaymentsModule.send()`'s current API (`TransferRequest` at `types/index.ts:123-136`) accepts a single `(coinId, amount)` per call. Sending multiple coin types in one transfer requires either repeated `send()` calls (one per coin) or a future `sendMulti()` API (deferred — §12.2). The split logic above is general enough to handle the multicoin case if/when `sendMulti()` lands; only the SDK's calling surface needs extension.
+> **Multicoin send status (current)**: `PaymentsModule.send()` supports multi-coin transfers via the optional `additionalAssets` field on `TransferRequest`. The legacy single-coin form (just `coinId` + `amount`) remains the default and is unchanged. See `docs/API.md` for the type signature and `docs/INTEGRATION.md` for usage examples. The split logic above handles both forms uniformly — no separate `sendMulti()` API is needed.
 
 3. **For each token destined to the recipient**, build a `TransferTransaction` (SDK primitive):
    - `sourceState`: token's current state.
@@ -1439,11 +1445,14 @@ The TXF wire shapes are **permanent**, not deprecated. There is no migration win
 ### 10.1 Sender side
 
 `PaymentsModule.send(...)` accepts:
+- `coinId: string`, `amount: string` — primary asset (always required; backward-compat with single-coin API).
+- `additionalAssets?: ReadonlyArray<{ coinId: string; amount: string }>` — multi-coin extension. When present, target list = `[{coinId, amount}, ...additionalAssets]`. Each entry's `coinId` MUST be distinct from `coinId` and from each other. Omitting this field preserves single-coin behavior identically to prior SDK versions.
 - `transferMode: 'instant' | 'conservative' | 'txf'` — default `'instant'`.
 - `txfFinalization: 'instant' | 'conservative'` — only applies when `transferMode === 'txf'`; default `'conservative'`.
 - `delivery: DeliveryStrategy` (UXF modes only; see §3.3.1) — default `{ kind: 'auto', inlineCapBytes: 16384 }`.
+- `allowPendingTokens?: boolean` — default `false`. Per §2.5 chain-mode opt-in.
 
-Callers that don't specify any of these get the UXF bundle behavior in instant mode with the 16 KiB auto cutoff.
+Callers that don't specify any of these get the UXF bundle behavior in instant mode with the 16 KiB auto cutoff and finalized-tokens-only selection.
 
 > **Breaking-widening note**: extending `TransferMode` from `'instant' | 'conservative'` (existing) to `'instant' | 'conservative' | 'txf'` is non-breaking for runtime code paths, but breaking for any TypeScript exhaustiveness check (`switch(mode) { case 'instant': … case 'conservative': … }` without a default arm). Affected call sites must add the `'txf'` arm explicitly. Audit will be performed in Wave T.7.
 
@@ -1502,9 +1511,16 @@ The implementation MUST include:
   - 3-hop instant-mode forward: A→B→C→D before any aggregator round-trip. D receives a token with 3 unfinalized txs. D's worker resolves all 3; status transitions `pending → valid` only after the third proof attaches.
   - Same chain, but D imports a more-finalized backup of the same `tokenId` mid-resolution. The backup's proofs short-circuit the queue.
   - Multi-coin token transferred mid-chain — verify the recipient correctly re-derives the requestId for the multi-coin parent's pending split tx.
-- **Multi-coin tokens**:
-  - A token containing `{UCT: 100, USDU: 50}` is sent for `(UCT, 30)` only. Verify residual stays at sender with `{UCT: 70, USDU: 50}`; recipient receives a child token with `(UCT, 30)`.
-  - Same, but residual is sent in a follow-up transfer to a third party.
+- **Multi-coin tokens (single-coin send from multi-coin source)**:
+  - A token containing `{UCT: 100, USDU: 50}` is sent for `(UCT, 30)` only. Verify change stays at sender with `{UCT: 70, USDU: 50}`; recipient receives a child token with `(UCT, 30)`.
+  - Same, but change is sent in a follow-up transfer to a third party.
+- **Multi-coin send (additionalAssets)**:
+  - Single multi-coin source `{UCT: 100, USDU: 50, ALPHA: 1000}` sent with `coinId='UCT', amount='30', additionalAssets=[{USDU,'20'}]`. Recipient receives one child token with `{UCT: 30, USDU: 20}`; change has `{UCT: 70, USDU: 30, ALPHA: 1000}`.
+  - Multiple sources (A `{UCT: 100}`, B `{USDU: 50}`) covering `coinId='UCT', amount='30', additionalAssets=[{USDU,'20'}]`. Recipient receives TWO child tokens (one per source); change has two tokens (`{UCT: 70}` from A, `{USDU: 30}` from B).
+  - Validation: `additionalAssets` containing duplicate `coinId` (e.g., `{UCT,'10'}` when primary is also UCT) → `send()` rejects with `INVALID_REQUEST` (no duplicate coin IDs allowed).
+  - Validation: `additionalAssets` entry with `amount: '0'` → `send()` rejects with `INVALID_AMOUNT`.
+  - Validation: insufficient balance for any one of the targets → `send()` rejects with `INSUFFICIENT_BALANCE`; the other targets are NOT partially shipped.
+  - Backward compat: single-coin call `{coinId: 'UCT', amount: '30'}` (no `additionalAssets`) produces byte-identical bundle to a v1.0-spec call → regression test against a captured fixture.
 - Token-hash invariance: take the same token in two states (proof attached vs. proof null), verify `token.id` is identical, verify CIDs differ.
 - CAR-embed delivery for small bundles (< 16 KiB); CID delivery for large bundles (> 16 KiB).
 - **Inline delivery completion semantics (§3.3.2)**:
@@ -1570,7 +1586,7 @@ The implementation MUST include:
 
 - **Bundle compression**: CARs can be sizeable for many-token bundles (especially chain-mode tokens with deep history). zstd / brotli on the inline-CAR path? Out of scope for v1.0.
 - **Multi-recipient bundles**: a single UXF bundle delivered to a Nostr group / multicast — nice to have, deferred. Would amortize CID-pin cost across N recipients and allow group-level atomic broadcasts. Open design points: per-recipient encryption envelope vs. shared symmetric key, group-membership consent.
-- **Multi-coin send in a single call**: v1.0 `PaymentsModule.send()` accepts a single `(coinId, amount)`. The split logic in §4.1 step 2 is already general enough; only a `sendMulti(targets: Array<{coinId, amount}>)` calling-surface extension is needed.
+- ~~**Multi-coin send in a single call**~~ — implemented. `PaymentsModule.send()` accepts the optional `additionalAssets: Array<{coinId, amount}>` field on `TransferRequest`; primary asset (`coinId` + `amount`) is always required for backward compatibility. The §4.1 split logic handles single-coin and multi-coin uniformly. See `docs/API.md` and `docs/INTEGRATION.md`.
 - **Conflict-resolution UI/API**: `CONFLICTING` tokens (genuinely-divergent chains) need an explicit `resolveConflict(tokenId, chosenHead)` API and UI surface. Lex-min `bundleCid` provides an automatic primary, but operator override is a planned future addition.
 - **Peer-reputation framework**: §11.4 mentions a 1-hour cooldown on bandwidth-burning peers. The reputation interface itself is out of scope here.
 

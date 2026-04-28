@@ -335,9 +335,35 @@ if (result.error) {
 | Field | Required | Description |
 |-------|----------|-------------|
 | `recipient` | Yes | `@nametag`, `DIRECT://...`, chain pubkey, or `alpha1...` address |
-| `amount` | Yes | Amount in smallest unit (string) |
-| `coinId` | Yes | Token coin ID (e.g., `'UCT'`) |
+| `amount` | Yes | Primary asset amount, in smallest unit (string) |
+| `coinId` | Yes | Primary asset coin ID (e.g., `'UCT'`) |
+| `additionalAssets` | No | Multi-coin extension. Array of `{coinId, amount}` for additional assets to deliver in the same transfer. Each entry's `coinId` must be distinct from `coinId` (the primary) and from other entries. See multi-coin example below. |
 | `memo` | No | Optional message to recipient |
+| `transferMode` | No | `'instant'` (default) or `'conservative'` — see Transfer Modes section |
+| `allowPendingTokens` | No | Default `false`. When `true`, the source-token selector may pick `pending` tokens after exhausting `valid` ones (chain mode) |
+
+**Multi-coin transfer example** (deliver UCT + USDU + ALPHA in one call):
+
+```typescript
+const result = await sphere.payments.send({
+  recipient: '@bob',
+  // Primary asset (legacy single-coin fields remain required):
+  coinId: 'UCT',
+  amount: '1000000',
+  // Additional assets — multi-coin extension:
+  additionalAssets: [
+    { coinId: 'USDU', amount: '500000' },
+    { coinId: 'ALPHA', amount: '250000' },
+  ],
+  memo: 'Multi-asset payment',
+});
+// All three asset deliveries are bundled in a single UXF transfer; the
+// recipient receives one or more child tokens carrying exactly
+// (UCT,1000000), (USDU,500000), (ALPHA,250000). All other coin balances
+// in the sender's source tokens stay with the sender as change.
+```
+
+Single-coin callers omitting `additionalAssets` behave identically to prior versions of the SDK — the field is purely additive.
 
 ### Receive Tokens
 

@@ -381,16 +381,35 @@ Used by the `tokens-import` CLI command and by any consumer implementing offline
 
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
-Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token.
+Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token. Supports both single-coin transfers (legacy API, unchanged) and multi-coin transfers (via `additionalAssets`).
 
 ```typescript
 interface TransferRequest {
+  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
+  // --- Primary asset (always required) ---
   readonly coinId: string;       // Coin type (hex string)
   readonly amount: string;       // Amount in smallest units
-  readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
+  // --- Multi-coin extension (optional, backward-compatible) ---
+  /**
+   * Additional assets to deliver in the same transfer. Each entry MUST have
+   * a coinId distinct from `coinId` (above) and from every other entry — no
+   * duplicate coin IDs within one transfer. Each amount MUST be > 0.
+   *
+   * The full target list the SDK will deliver is:
+   *   [{ coinId, amount }, ...additionalAssets]
+   *
+   * Single-coin callers omit this field; behavior is unchanged. Multi-coin
+   * callers include it; the SDK splits source tokens such that the recipient
+   * receives EXACTLY each requested (coinId, amount), with all other coin
+   * balances kept by the sender as a change token (per UXF-TRANSFER-PROTOCOL
+   * §4.1 step 2).
+   */
+  readonly additionalAssets?: ReadonlyArray<{ readonly coinId: string; readonly amount: string }>;
+  // --- Other fields (unchanged) ---
   readonly memo?: string;        // Optional message
   readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
   readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
+  readonly allowPendingTokens?: boolean;  // Default false — allow chain-mode source selection
 }
 
 type AddressMode = 'auto' | 'direct' | 'proxy';

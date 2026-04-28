@@ -58,7 +58,7 @@ const totalUsd = await sphere.payments.getFiatBalance(); // number | null (null 
 const tokens = sphere.payments.getTokens();           // individual Token[]
 const uctOnly = sphere.payments.getTokens({ coinId: 'UCT' }); // filter by coin
 
-// 5. Send tokens (L3)
+// 5. Send tokens (L3) — single-coin
 const result = await sphere.payments.send({
   recipient: '@bob',           // @nametag, DIRECT://..., chain pubkey (02...), or alpha1...
   amount: '1000000',           // in smallest unit (string)
@@ -66,9 +66,24 @@ const result = await sphere.payments.send({
   memo: 'Payment for coffee', // optional
   // transferMode: 'instant',      // default — fast, receiver resolves proofs
   // transferMode: 'conservative', // slower — sender collects all proofs first
+  // allowPendingTokens: false,    // default — only finalized tokens; true enables chain mode
 });
 // result: { id, status, tokens, tokenTransfers, error? }
 // status: 'pending' | 'submitted' | 'delivered' | 'completed' | 'failed'
+
+// 5a. Multi-coin send — deliver UCT + USDU in one call
+const multiResult = await sphere.payments.send({
+  recipient: '@bob',
+  coinId: 'UCT', amount: '1000000',           // primary asset
+  additionalAssets: [                          // additional assets (multi-coin extension)
+    { coinId: 'USDU', amount: '500000' },
+  ],
+  memo: 'Multi-asset payment',
+});
+// All assets are delivered in a single UXF bundle. The sender's source tokens
+// are split such that the recipient receives EXACTLY each requested
+// (coinId, amount); the change (unrequested portions + non-requested coins)
+// stays at the sender.
 
 // 6. Receive tokens (explicit one-shot query + optional finalization)
 const { transfers } = await sphere.payments.receive();
@@ -367,9 +382,17 @@ interface FullIdentity extends Identity {
 
 interface TransferRequest {
   recipient: string;        // @nametag, DIRECT://..., chain pubkey, alpha1...
-  amount: string;           // Amount in smallest unit
-  coinId: string;           // Token coin ID (e.g., 'UCT')
+  // Primary asset (always required; backward-compat with single-coin API):
+  coinId: string;           // Primary coin ID (e.g., 'UCT')
+  amount: string;           // Primary amount in smallest unit
+  // Multi-coin extension (optional):
+  additionalAssets?: ReadonlyArray<{ coinId: string; amount: string }>;
+                            // Each entry's coinId MUST be distinct from
+                            // primary `coinId` and from each other.
+                            // Omit for single-coin transfers.
   memo?: string;            // Optional message
+  transferMode?: 'instant' | 'conservative';  // Default 'instant'
+  allowPendingTokens?: boolean;  // Default false; enable chain-mode source selection
 }
 
 interface TransferResult {
