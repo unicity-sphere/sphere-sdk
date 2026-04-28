@@ -46,7 +46,8 @@ describe('outbox-state-machine — §7.0 table size', () => {
   it('locks the canonical row count (drift guard)', () => {
     // Counted from the §7.0 transition table:
     //   packaging→pinned, packaging→sending,                          (2)
-    //   pinned→sending, pinned→failed-transient,                      (2)
+    //   pinned→sending, pinned→failed-transient,
+    //     pinned→failed-permanent (T.4.A; permanent pin failure),     (3)
     //   sending→delivered, sending→delivered-instant,
     //     sending→failed-transient,                                   (3)
     //   delivered→expired,                                            (1)
@@ -57,8 +58,8 @@ describe('outbox-state-machine — §7.0 table size', () => {
     //   failed-permanent→finalizing (override),                       (1)
     //   finalized→expired                                             (1)
     //   ────────────────────────────────────────────────────────────
-    //   16 rows total
-    expect(ALLOWED_TRANSITIONS).toHaveLength(16);
+    //   17 rows total
+    expect(ALLOWED_TRANSITIONS).toHaveLength(17);
   });
 
   it('every row uses canonical UxfOutboxStatus values on both ends', () => {

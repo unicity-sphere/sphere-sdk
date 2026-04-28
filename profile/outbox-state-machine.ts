@@ -18,6 +18,7 @@
  *   packaging  ──serialize complete───► sending    (UXF car-mode + TXF)
  *   pinned     ──ipfs pin acknowledged─► sending
  *   pinned     ──publish-dispatch fails─► failed-transient
+ *   pinned     ──permanent pin failure ─► failed-permanent  (T.4.A; see arc-level doc)
  *
  *   sending    ──Nostr publish ack ────► delivered          (conservative)
  *   sending    ──Nostr publish ack ────► delivered-instant  (instant)
@@ -212,6 +213,14 @@ export const ALLOWED_TRANSITIONS: ReadonlyArray<AllowedTransition> = [
   // pinned → ...
   { from: 'pinned', to: 'sending', condition: { kind: 'unconditional' } },
   { from: 'pinned', to: 'failed-transient', condition: { kind: 'unconditional' } },
+  // T.4.A — permanent pin failure short-circuit. The orchestrator transitions
+  // `packaging → pinned` eagerly (when about to call IPFS pin) so that on a
+  // hard pin failure the entry can be moved straight to `failed-permanent`
+  // without spuriously claiming success. Spec §3.3.2 paragraph (pin
+  // permanently fails → `failed-permanent`); reflected in the impl plan
+  // T.4.A acceptance ("pinned → failed-permanent"). Nostr publish MUST NOT
+  // happen if pin fails — the orchestrator skips the publish on this arc.
+  { from: 'pinned', to: 'failed-permanent', condition: { kind: 'unconditional' } },
 
   // sending → ...
   { from: 'sending', to: 'delivered', condition: { kind: 'unconditional' } },

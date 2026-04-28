@@ -32,14 +32,29 @@
  *  8. {@link resolveDelivery} (T.2.C) — choose inline (`uxf-car`) or
  *     CID-by-reference (`uxf-cid`) per the caller's
  *     {@link DeliveryStrategy}.
- *  9. **IPFS pin** — when {@link resolveDelivery} returns a `cid` decision
- *     it has ALREADY invoked the injected `publishToIpfs` callback, so
- *     no extra step is needed here.
- * 10. **Stub outbox call** — emits a synthetic legacy {@link OutboxEntry}
- *     so existing tests keep their invariants. T.2.D.2 replaces this
- *     with the per-entry-key {@link UxfTransferOutboxEntry} writer.
+ *  9. **IPFS pin** (T.4.A) — for the CID branch the orchestrator
+ *     EAGERLY transitions outbox `packaging → pinned` BEFORE invoking
+ *     {@link resolveDelivery}. The resolver then calls the injected
+ *     `publishToIpfs` callback (which performs the actual pin). Pin
+ *     idempotency is delegated to the IPFS HTTP layer (Kubo's
+ *     `/api/v0/add?pin=true` and Helia's `pinning.add` are no-ops on
+ *     already-pinned CIDs — content-addressing guarantees the same
+ *     CAR maps to the same CID). On pin failure, the orchestrator
+ *     transitions `pinned → failed-permanent` (the T.4.A arc added in
+ *     this wave to §7.0) and re-throws — Nostr publish is NEVER
+ *     dispatched on the pin-failure arc (§3.3.2 invariant).
+ * 10. **Outbox bookkeeping** (T.2.D.2) — the per-entry-key
+ *     {@link UxfTransferOutboxEntry} writer threads through
+ *     {@link OutboxIntegrationHooks}. Lifecycle:
+ *       * inline:  packaging → sending → delivered.
+ *       * cid OK:  packaging → pinned → sending → delivered.
+ *       * cid err: packaging → pinned → failed-permanent (no publish).
  * 11. {@link TransportProvider.sendTokenTransfer} — publish the wire
- *     payload over the transport layer.
+ *     payload over the transport layer. For CID payloads the optional
+ *     `senderGateways` hint (sourced from {@link
+ *     ConservativeSenderDeps.senderGateways}) is stamped onto the
+ *     envelope for INFORMATIONAL purposes only (recipient walks its
+ *     own configured list per §3.3 / §9.2).
  * 12. emit `transfer:confirmed` — the orchestrator returns AFTER the
  *     event has been dispatched, so callers can serialize on the
  *     return.
@@ -50,6 +65,10 @@
  *  - §4.1  Target list semantics (multi-asset, primary slot optional).
  *  - §4.2  Sender pipeline state machine.
  *  - §3.3  Inline vs CID delivery (handled by {@link resolveDelivery}).
+ *  - §3.3.2 Pin/Nostr ordering — Nostr publish MUST NOT happen on
+ *           permanent pin failure (T.4.A invariant).
+ *  - §7.0  Outbox state machine (T.4.A `pinned → failed-permanent`
+ *          arc).
  *
  * @module modules/payments/transfer/conservative-sender
  * @internal
@@ -286,6 +305,23 @@ export interface ConservativeSenderDeps {
    *  decision is CID-bound (`force-cid`, `auto`-over-cap). When
    *  omitted, CID-bound decisions throw `IPFS_PUBLISHER_MISSING`. */
   readonly publishToIpfs?: PublishToIpfsCallback;
+  /**
+   * Optional gateway hint set the sender used to pin / make the bundle
+   * retrievable. Stamped onto the wire payload as
+   * `UxfTransferPayloadCid.senderGateways` for INFORMATIONAL purposes
+   * only (recipient walks its OWN configured list per the verified-CAR
+   * pipeline; spec §3.3 / §9.2 — sender list is unauthenticated).
+   *
+   * Sourced from the surrounding `PaymentsModule` config (the gateway
+   * list backing the `IpfsHttpClient`). Empty array when the publisher
+   * is configured without a gateway list — the field is omitted from
+   * the wire payload entirely in that case to keep the envelope tight
+   * and the canonical-order rules satisfied.
+   *
+   * Ignored for inline (`uxf-car`) deliveries — the field is part of the
+   * `uxf-cid` shape only.
+   */
+  readonly senderGateways?: ReadonlyArray<string>;
   /** Snapshot of the sender's owned token pool (validated by T.2.B). */
   readonly availableSources: () =>
     | Promise<ReadonlyArray<Token>>
@@ -620,24 +656,82 @@ export async function sendConservativeUxf(
     }
 
     // -----------------------------------------------------------------
-    // Step 8 (cont.): resolveDelivery — invokes publishToIpfs inside
-    // for any CID-bound branch.
+    // Step 8 (cont.) / 10b: T.4.A — eager transition into `pinned` for
+    // the CID branch BEFORE the IPFS pin call.
+    //
+    // The §7.0 transition table forbids `packaging → failed-permanent`
+    // and `packaging → failed-transient` (legal arcs out of `packaging`
+    // are only `pinned` and `sending`). To honour the impl plan T.4.A
+    // acceptance ("pin failure → outbox `pinned → failed-permanent`")
+    // and §3.3.2 ("on permanent pin failure, outbox transitions to
+    // `failed-permanent`"), we MUST be in `pinned` at the moment the
+    // pin call is dispatched. The arc semantics here read as:
+    //
+    //   `pinned` := "the IPFS pin step is in flight or has completed".
+    //
+    // On pin success → continue (existing flow into `sending`).
+    // On pin failure → transition `pinned → failed-permanent` (the
+    //                  T.4.A arc added in this wave to §7.0) and
+    //                  re-throw. The Nostr publish is NEVER dispatched.
+    //
+    // For inline (`uxf-car`) deliveries the pin step does not run; the
+    // `pinned` state is skipped entirely and we go straight to
+    // `packaging → sending` below.
     // -----------------------------------------------------------------
-    const delivery = await resolveDelivery({
-      strategy,
-      carBytes,
-      publishToIpfs:
-        deps.publishToIpfs ?? throwingPublishToIpfs,
-    });
+    if (wantsCidBranch && deps.outbox !== undefined) {
+      await deps.outbox.transition(transferId, { status: 'pinned' });
+    }
 
     // -----------------------------------------------------------------
-    // Step 10b: per §7.0 transition table, CID-bound delivery flows
-    // packaging → pinned (after IPFS pin acknowledged) → sending.
-    // Inline delivery skips the `pinned` state and goes straight to
-    // packaging → sending.
+    // Step 8 (cont.): resolveDelivery — invokes publishToIpfs inside
+    // for any CID-bound branch.
+    //
+    // Idempotency strategy (T.4.A note + impl plan §risks): the
+    // `publishToIpfs` callback MUST be safely re-runnable for the same
+    // CAR bytes — both Kubo's `/api/v0/add?pin=true` and Helia's
+    // `pinning.add` are idempotent at the HTTP layer (re-pinning an
+    // already-pinned CID is a no-op; the resulting CID is content-
+    // addressed so a duplicate add yields the same Hash). We rely on
+    // that property rather than issuing a separate `pin/status` query
+    // — the §3.3.2 paragraph already notes that the outbox pipeline
+    // may have pinned the bundle already, in which case the publish
+    // call here is the no-op tail of the same idempotent operation.
     // -----------------------------------------------------------------
-    if (delivery.kind === 'cid' && deps.outbox !== undefined) {
-      await deps.outbox.transition(transferId, { status: 'pinned' });
+    let delivery: Awaited<ReturnType<typeof resolveDelivery>>;
+    try {
+      delivery = await resolveDelivery({
+        strategy,
+        carBytes,
+        publishToIpfs:
+          deps.publishToIpfs ?? throwingPublishToIpfs,
+      });
+    } catch (cause) {
+      // Pin (or any resolveDelivery step) threw on the CID branch.
+      // §3.3.2 invariant: Nostr publish MUST NOT happen if pin fails.
+      // The eager `packaging → pinned` transition above means we are
+      // currently in `pinned`; the arc `pinned → failed-permanent`
+      // (T.4.A; §7.0) records the permanent failure forensically.
+      //
+      // Inline (force-inline) failures (e.g., `INLINE_CAR_TOO_LARGE`)
+      // come through this same try block but never set `pinned` because
+      // the eager transition above gates on `wantsCidBranch`. For those
+      // we leave the entry in `packaging` (existing T.2.D.2 behaviour:
+      // outer catch will surface `transfer:failed`; the entry remains
+      // forensic at `packaging`).
+      if (wantsCidBranch && deps.outbox !== undefined) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        try {
+          await deps.outbox.transition(transferId, {
+            status: 'failed-permanent',
+            error: message,
+          });
+        } catch {
+          // Outbox transition failure is informational; the underlying
+          // pin error is the primary signal. The outer catch still
+          // emits transfer:failed and re-throws the original cause.
+        }
+      }
+      throw cause;
     }
 
     // -----------------------------------------------------------------
@@ -652,6 +746,17 @@ export async function sendConservativeUxf(
               ? { nametag: deps.identity.nametag }
               : {}),
           }
+        : undefined;
+
+    // T.4.A — `senderGateways` hint stamped on the wire payload for
+    // CID-bound deliveries only. The list is INFORMATIONAL (recipient
+    // walks its own configured gateway list per §3.3 / §9.2 — sender
+    // list is unauthenticated). Empty / missing list → field omitted
+    // entirely from the envelope to keep the canonical-order output
+    // tight and avoid emitting a redundant empty array.
+    const senderGatewaysHint =
+      deps.senderGateways !== undefined && deps.senderGateways.length > 0
+        ? [...deps.senderGateways]
         : undefined;
 
     const payload: UxfTransferPayloadCar | UxfTransferPayloadCid =
@@ -674,6 +779,9 @@ export async function sendConservativeUxf(
             tokenIds,
             ...(request.memo !== undefined ? { memo: request.memo } : {}),
             ...(senderField !== undefined ? { sender: senderField } : {}),
+            ...(senderGatewaysHint !== undefined
+              ? { senderGateways: senderGatewaysHint }
+              : {}),
           };
 
     // -----------------------------------------------------------------
