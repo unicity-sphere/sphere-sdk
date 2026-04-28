@@ -295,7 +295,7 @@ T.1 lands the types, enums, key-mapping rows, and constants module. Nothing in T
 - **wave**: T.1
 - **files_touched**:
   - MODIFIED: `profile/types.ts` (`PROFILE_KEY_MAPPING`) — add `audit: { profileKey: '{addr}.audit', dynamic: true }`, add `finalization_queue: { profileKey: '{addr}.finalizationQueue', dynamic: true }`. Keep `invalidTokens` for legacy migration; add `invalid: { profileKey: '{addr}.invalid', dynamic: true }` for the multi-rep form.
-  - MODIFIED: `profile/profile-storage-provider.ts` — extend the dynamic key matcher to recognize the new `{addr}.audit.${tokenId}.${observedTokenContentHash}` and `{addr}.invalid.${tokenId}.${observedTokenContentHash}` prefixes (per-entry-key form, Wave G.7). **Pre-task check**: confirm Wave G.7 layout has actually landed before T.1.E begins (W8); if not, add a stub PR `T.0.G7-prereq` that lands the prefix-recognizer scaffolding first.
+  - MODIFIED: `profile/profile-storage-provider.ts` — extend the dynamic key matcher to recognize the new `{addr}.audit.${tokenId}.${observedTokenContentHash}` and `{addr}.invalid.${tokenId}.${observedTokenContentHash}` prefixes (per-entry-key form, Wave G.7). **Pre-task check**: T.0.G7-verify gates this; T.0.G7-fill-gaps lands the prefix-recognizer scaffolding first if needed.
   - MODIFIED: `profile/migration.ts` — pass through new keys without dropping them.
   - MODIFIED: `core/Sphere.ts` — extend `clear()` coverage so the new key-prefixes are wiped; this is via parent storage clear, not a new mapping (W46). **C6 applied.**
   - NEW: `tests/unit/profile/profile-key-mapping.test.ts` — round-trip mapping for new keys (legacy → profile and back).
@@ -874,7 +874,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/revalidate-cascaded.test.ts`.
   - NEW: `tests/unit/payments/transfer/override-audit-trail.test.ts` — **W30/W31/N4: overrideAppliedAt + transfer:override-applied event**.
 - **depends_on**: T.1.A, T.1.C, **T.1.E (C4 applied)**, T.1.F, T.3.C (writes to `_invalid`), T.5.B (manifest-cid-rewrite via T.5.B.0), T.5.B.5 (cascade-walker), T.5.C.
-- **parallel_with**: T.5.E, T.5.F.
+- **parallel_with**: (none — T.5.E and T.5.F are downstream of T.5.D; round-5 W1 fix).
 - **skill_tag**: `recipient`
 - **acceptance**:
   - **W4**: all 10 sub-cases of §6.3 `importInclusionProof()` covered by tests, including the K-1 re-queue branch (case 6).
@@ -904,7 +904,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/integration/transfer/override-applied-event.test.ts` — **W31: emit on operator override**.
   - NEW: `tests/integration/transfer/operator-override-audit-listener.test.ts` — **N4: operator override audit trail event listener**.
 - **depends_on**: T.5.B, T.5.B.5, T.5.C, T.5.D.
-- **parallel_with**: T.5.F.
+- **parallel_with**: (none — T.5.F is downstream of T.5.E; round-5 W2 fix).
 - **skill_tag**: `worker`
 - **acceptance**:
   - Event payloads exactly match spec (§9.4, §6.3 forbidden-path, §6.1.1 cascade-risk-warning, §6.3 most-recent-proof override).
@@ -1116,7 +1116,7 @@ T.7 implements `transferMode: 'txf'` (both `txfFinalization` variants), the rece
   - MODIFIED: `modules/payments/PaymentsModule.ts` — `handleIncomingTransfer()` routing: `kind: 'uxf-car' | 'uxf-cid'` → bundle-acquirer (T.3.A); legacy shape → `legacy-shape-adapter`. The two paths reach the same downstream disposition writer (T.3.C).
   - NEW: `tests/unit/payments/transfer/legacy-shape-adapter.test.ts` — `{sourceToken, transferTx}` → 1 disposition; `COMBINED_TRANSFER` with N tokens → N dispositions; `INSTANT_SPLIT` with N split outputs → N dispositions; `{token, proof}` SDK legacy → 1 disposition; instant-TXF (inclusionProof:null) → routed through finalization queue.
 - **depends_on**: T.3.B.2, T.3.C, T.5.C.
-- **parallel_with**: T.7.A, T.7.B.5, T.7.C.
+- **parallel_with**: T.7.A, T.7.C (T.7.B.5 is downstream — round-5 W3 fix).
 - **skill_tag**: `recipient`
 - **acceptance**:
   - All 4 legacy shapes produce the same set of outcomes (VALID/PENDING/PROOF_INVALID/STRUCTURAL_INVALID/NOT_OUR_CURRENT_STATE/UNSPENDABLE_BY_US/CONFLICTING) as the equivalent UXF bundle would.
@@ -1432,7 +1432,7 @@ The work decomposes into 6 parallel lanes after T.1 lands. Each lane can be staf
 | **Workers / Cascade** | T.5.B.0 → T.5.B → T.5.B.5, T.5.C → T.5.D → T.5.E → T.5.F | worker + recipient | gating for T.7.A |
 | **Tests / Fixtures / Cutover** | T.8.A → T.8.B, T.8.C → T.8.E.1/2/3 → cutover | tests | follows everything |
 
-### Critical path (longest serial chain) — 15 PRs (16 with T.0.G7-prereq)
+### Critical path (longest serial chain) — 15 PRs (16 if T.0.G7-fill-gaps triggers)
 
 ```
 T.1.A    (types)                                     [day 1-2]
@@ -1468,7 +1468,7 @@ T.7.E    (default flip)                              [day 15-16]
 T.8.D    (cutover)                                   [day 18-22]
 ```
 
-15 PR-sized merges deep on the critical path (16 if `T.0.G7-prereq` triggers fill-gaps); with parallel lanes, total wall-clock is **~18-22 days for 4 senior agents**, **~6-7 weeks for 2 senior agents**.
+15 PR-sized merges deep on the critical path (16 if `T.0.G7-fill-gaps` triggers); with parallel lanes, total wall-clock is **~18-22 days for 4 senior agents**, **~6-7 weeks for 2 senior agents**.
 
 ### Concurrency opportunities
 
@@ -1733,7 +1733,7 @@ These do not block T.1–T.8 but should be resolved before merge of the correspo
 15. **[NEW]** Spec-citation prefix on test filenames (round-1 #12): mandatory for spec-defined behavior tests (cite the §section), optional for adversarial-only tests where no normative requirement applies. Implementers follow the convention; reviewers enforce it on PRs that introduce tests.
 16. **[NEW]** `MAX_LOCK_HOLD_MS` placement (round-1 #14): lives in `profile/per-token-mutex.ts` as a co-located constant (per-strategy concern, not a global limit). The constants module `modules/payments/transfer/limits.ts` cross-references it as the per-token-mutex source-of-truth.
 17. **[NEW]** `MAX_PROOF_ERROR_RETRIES`, `MAX_SUBMIT_RETRIES`, `POLLING_WINDOW`, `MIN_POLL_ATTEMPTS` placement (round-1 #14): in `modules/payments/transfer/polling-policy.ts` (T.5.B.0). The constants module `limits.ts` re-exports them so external readers have a single source of truth for ALL transfer-related defaults.
-18. **[NEW]** T.0.G7-prereq stub task (round-1 #9): NEW PR added before T.1.E. Verifies Wave G.7 per-entry-key layout has shipped on `main`. If not, the prereq PR adds the missing scaffolding. Hard-gates T.1.E.
+18. **[NEW]** T.0.G7-verify + T.0.G7-fill-gaps tasks (round-1 #9 / round-2 W5 split): NEW PRs added before T.1.E. T.0.G7-verify is test-only (always lands); T.0.G7-fill-gaps is contingent (lands only if verify fails). Hard-gate T.1.E.
 
 Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied constraint and §13 closing paragraph; no T.1–T.8 task includes them. A future plan T.9+ will add the rescan loops on top of the storage and event plumbing landed in this plan.
 
