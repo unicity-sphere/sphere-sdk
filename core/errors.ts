@@ -167,6 +167,17 @@ export type SphereErrorCode =
    *  `OutboxWriter.write(...)` instead of update. See profile/outbox-writer.ts
    *  and UXF-TRANSFER-PROTOCOL §7. */
   | 'OUTBOX_ENTRY_NOT_FOUND'
+  // UXF Transfer / outbox CRDT merger (T.6.B) — §7.1 conflict resolution.
+  /** `mergeOutboxEntries(a, b)` called with replicas that disagree on `id`.
+   *  Per-key keyvalue semantics mean the merger should never see a pair of
+   *  records with different ids; the check is defensive against caller bugs.
+   *  See profile/outbox-merger.ts and UXF-TRANSFER-PROTOCOL §7.1. */
+  | 'OUTBOX_MERGE_ID_MISMATCH'
+  /** `mergeOutboxEntriesPair([])` called with an empty replica set. The
+   *  merger has no canonical answer for "merge zero replicas". Callers
+   *  must filter empty inputs before invoking the fold. See
+   *  profile/outbox-merger.ts. */
+  | 'OUTBOX_MERGE_EMPTY'
   /**
    * UXF Inter-Wallet Transfer T.2.A — preflight-finalize hard-failure.
    *

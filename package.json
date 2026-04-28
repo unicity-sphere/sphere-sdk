@@ -192,6 +192,7 @@
     "@typescript-eslint/parser": "^8.54.0",
     "eslint": "^9.39.2",
     "fake-indexeddb": "^6.2.5",
+    "fast-check": "^4.7.0",
     "testcontainers": "^11.11.0",
     "tsup": "^8.5.1",
     "tsx": "^4.21.0",
