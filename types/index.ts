@@ -3,6 +3,9 @@
  * Platform-independent type definitions
  */
 
+import type { AdditionalAsset } from './asset-target';
+import type { DeliveryStrategy } from './uxf-transfer';
+
 // =============================================================================
 // Provider Base Types
 // =============================================================================
@@ -118,17 +121,137 @@ export type TransferStatus =
 
 export type AddressMode = 'auto' | 'direct' | 'proxy';
 
+/**
+ * Public transfer mode — what callers pass to `payments.send({ transferMode })`.
+ *
+ * Values:
+ *  - `'instant'`      — UXF / legacy fast path; sender publishes proofs ASAP
+ *                       and the receiver finalizes its end of the chain.
+ *  - `'conservative'` — sender collects ALL inclusion proofs before
+ *                       publishing the bundle on Nostr.
+ *
+ * @remarks
+ * The `'txf'` mode (legacy single-token wire shape) lives in the INTERNAL
+ * {@link InternalTransferMode} union; it is intentionally absent from the
+ * public surface so call-sites do not have to switch on a value that is not
+ * yet routable. T.7.A lands the TXF arm; until then,
+ * `payments.send({ transferMode: 'txf' as TransferMode })` (test-only cast)
+ * rejects with `UNSUPPORTED_TRANSFER_MODE` via the
+ * `modules/payments/transfer/transfer-mode-shims.ts` per-call-site shim.
+ *
+ * Spec: §10.1 (sender-side widening; "Breaking-widening note" — the public
+ * type stays `'instant' | 'conservative'` until T.7.E flips the default).
+ */
 export type TransferMode = 'instant' | 'conservative';
 
+/**
+ * INTERNAL transfer mode — extends {@link TransferMode} with the legacy
+ * `'txf'` arm. Used inside the SDK after the per-call-site narrowing shim
+ * has run (`modules/payments/transfer/transfer-mode-shims.ts`).
+ *
+ * @internal
+ *
+ * @remarks
+ * Do NOT consume from app code. The public surface is {@link TransferMode}.
+ * This type exists ONLY so the shim can return a value that the future TXF
+ * router (T.7.A) can switch on without losing exhaustiveness. Re-exported
+ * from the main barrel because every internal arm of the SDK consumes it
+ * post-shim, but documented as `@internal` so doc generators flag it.
+ *
+ * Note N8 of `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` (§T.1.B.1).
+ */
+export type InternalTransferMode = 'instant' | 'conservative' | 'txf';
+
 export interface TransferRequest {
-  readonly coinId: string;
-  readonly amount: string;
+  /**
+   * Primary coin slot — coin id of the fungible slice. Together with
+   * {@link TransferRequest.amount} forms the request's primary entry.
+   *
+   * **Optional** as of T.1.B.1 (§10.1 widening): NFT-only sends omit both
+   * `coinId` and `amount` and rely entirely on `additionalAssets`. The
+   * §4.1 step 1 validator (T.2.B) prepends `{kind:'coin', coinId, amount}`
+   * to the target list iff BOTH fields are present and `amount > 0`.
+   *
+   * @remarks
+   * Widened from `string` to `string | undefined`. Existing single-coin
+   * callers that always pass `coinId` continue to work unchanged.
+   */
+  readonly coinId?: string;
+  /**
+   * Primary coin slot — amount in smallest unit (string-encoded big int).
+   * See {@link TransferRequest.coinId} for the optional-pair semantics.
+   *
+   * @remarks
+   * Widened from `string` to `string | undefined` per T.1.B.1.
+   */
+  readonly amount?: string;
   readonly recipient: string;
   readonly memo?: string;
   /** Address mode: 'auto' (default) uses directAddress if available, 'direct' forces DIRECT, 'proxy' forces PROXY */
   readonly addressMode?: AddressMode;
-  /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
+  /**
+   * Transfer mode: `'instant'` (default) sends via Nostr immediately,
+   * `'conservative'` collects all proofs first. The future `'txf'` arm
+   * (legacy wire shape) is gated by the per-call-site narrowing shim and
+   * NOT part of the public surface; see {@link TransferMode} for details.
+   */
   readonly transferMode?: TransferMode;
+  /**
+   * Multi-asset extension — additional coin slices and/or whole-token (NFT)
+   * targets to deliver in the same UXF bundle. Each entry is either a
+   * `{kind:'coin'}` slice or a `{kind:'nft'}` whole-token reference.
+   *
+   * - All `kind:'coin'` `coinId`s (including the primary slot) MUST be
+   *   distinct.
+   * - All `kind:'nft'` `tokenId`s MUST be distinct.
+   * - Receivers REJECT unrecognized `kind` values with `UNKNOWN_ASSET_KIND`
+   *   (forward-compat — §4.1 / §10.4).
+   *
+   * Spec: §10.1 (sender-side widening); §4.1 step 1 (target list build).
+   */
+  readonly additionalAssets?: ReadonlyArray<AdditionalAsset>;
+  /**
+   * Per §2.5 chain-mode opt-in. Default `false` — only finalized tokens
+   * are eligible as sources. When `true`, the source selector accepts
+   * pending-but-confirmed-able sources (§5.5 chain mode).
+   *
+   * @remarks
+   * Type-level only at T.1.B.1; routing is owned by T.5.B / T.5.C.
+   */
+  readonly allowPendingTokens?: boolean;
+  /**
+   * NFT cascade asymmetry warning acknowledgement — required `true` to
+   * send NFT-class targets backed by pending source tokens (§4.1 step 2).
+   * NFT cascades cost non-fungible identity (irrecoverable); coin
+   * cascades cost fungible value (replaceable). Default `false` rejects
+   * pending-NFT sends with `NFT_PENDING_REQUIRES_CONFIRMATION`.
+   */
+  readonly confirmNftPending?: boolean;
+  /**
+   * Per-call delivery override controlling inline-vs-CID UXF bundle
+   * delivery. Defaults to `{ kind: 'auto', inlineCapBytes: 16384 }` — the
+   * sender picks `uxf-car` if the assembled CAR fits, else `uxf-cid`.
+   * See {@link DeliveryStrategy} (re-exported from `./uxf-transfer`) for
+   * the full union.
+   *
+   * @remarks
+   * Type-level only at T.1.B.1; routing is owned by T.2.C / T.2.D.
+   */
+  readonly delivery?: DeliveryStrategy;
+  /**
+   * Only applies when `transferMode === 'txf'` (post-T.7.A). Selects the
+   * legacy TXF wire shape's finalization style:
+   *  - `'instant'`      — TXF-instant: receiver finalizes from a pending
+   *                       sender chain.
+   *  - `'conservative'` — TXF-conservative: full proofs before send.
+   * Default `'conservative'` (per §10.1).
+   *
+   * @remarks
+   * Ignored at T.1.B.1 (TXF arm not yet routed); the shim throws
+   * `UNSUPPORTED_TRANSFER_MODE` for any `'txf'` mode regardless of this
+   * field's value. T.7.A wires this in.
+   */
+  readonly txfFinalization?: 'instant' | 'conservative';
   /** Invoice refund address (DIRECT://) — embedded in on-chain message for return routing */
   readonly invoiceRefundAddress?: string;
   /** Invoice contact info — embedded in on-chain message for receipt/notice delivery */
@@ -680,6 +803,9 @@ export * from './payment-session';
 
 // Re-export UXF transfer wire-format types (T.1.A)
 export * from './uxf-transfer';
+
+// Re-export Asset Target / Additional Asset types (T.1.B.1)
+export * from './asset-target';
 
 // =============================================================================
 // Network Health Types
