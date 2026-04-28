@@ -190,6 +190,13 @@ export type SphereErrorCode =
    *  is released as part of throwing this error so the next caller may
    *  proceed. See profile/per-token-mutex.ts and §5.5 step 9. */
   | 'LOCK_BOUNDED_HOLD_FIRED'
+  /** `ManifestStore.upsert` exhausted its bounded CAS retry budget
+   *  (default 3 attempts) under concurrent contention. The caller may
+   *  re-invoke; persistent failures indicate hot-key contention or a
+   *  storage-backend defect that should surface to the operator rather
+   *  than be retried indefinitely. See profile/manifest-store.ts and
+   *  §5.5 step 9. */
+  | 'MANIFEST_CAS_RETRY_EXHAUSTED'
   // UXF Transfer / outbox CRDT (T.6.A) — §7 bundle-grained outbox writer.
   /** `OutboxWriter.update(id, ...)` called with an `id` that has no live
    *  UXF outbox entry — either the key never existed, or the prior value

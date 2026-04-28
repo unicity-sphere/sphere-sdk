@@ -79,9 +79,68 @@ export interface TokenManifestEntry {
   readonly conflictingHeads?: readonly ContentHash[];
   /**
    * Optional human-readable reason when `status === 'invalid'`.
-   * Reserved for future use by the oracle-integration layer.
+   * Reserved for future use by the oracle-integration layer. PA §10.11
+   * narrows this to a `DispositionReason` from `types/disposition.ts`
+   * — typed as `string` here to avoid a circular module dependency.
    */
   readonly invalidReason?: string;
+  // ---------------------------------------------------------------------------
+  // Cross-replica merge metadata (T.3.C — PA §10.11 / §5.4 normative
+  // metadata-preservation rules)
+  //
+  // All five fields are optional so unaugmented entries from earlier waves
+  // round-trip safely. They are populated by the disposition writer / manifest
+  // store on first write and merged set-OR / max-merge by the manifest store
+  // on every subsequent §5.3 [D] resolve. See `profile/manifest-store.ts`.
+  // ---------------------------------------------------------------------------
+  /**
+   * Coin-split parent reference for §6.1.1 cascade detection. Set by the
+   * sender-side splitter when a coin token is minted as the change /
+   * recipient output of a `TokenSplitBuilder` operation. Absent on
+   * non-split tokens and on every NFT (NFTs are not splittable).
+   */
+  readonly splitParent?: string;
+  /**
+   * Set-OR back-reference to the `_audit` collection record(s) this
+   * manifest entry was promoted from. Each element is an audit record
+   * key of the form `${addr}.audit.${tokenId}.${observedTokenContentHash}`.
+   *
+   * **Array form** (per §5.4 normative array-merge rule, round-9 user
+   * clarification): widening from `string | undefined` to
+   * `readonly string[] | undefined` allows multiple audit records to
+   * promote to the same canonical manifest entry — divergent audit
+   * histories across replicas legitimately produce a multi-entry array
+   * and ALL entries are preserved on merge for forensic traceability.
+   * Single-element arrays are used when there is only one promotion.
+   */
+  readonly audit_promoted_from?: readonly string[];
+  /**
+   * Lamport logical clock (§7.1 invariants). Incremented on every local
+   * write per `Lamport.bumpFor`. On §5.3 [D] merge, the post-merge
+   * Lamport is `max(left.lamport, right.lamport)` (`Lamport.merge`).
+   * Optional for migration safety — entries written before T.3.C did
+   * not carry a Lamport; readers treat absent as 0.
+   */
+  readonly lamport?: number;
+  /**
+   * Wall-clock millisecond timestamp of the most-recent inclusion-proof
+   * refresh that touched this entry (per §6.3 most-recent-proof rule).
+   * Used by the §5.3 [D] grafting path to prefer the side with the
+   * fresher proof material when both sides are otherwise identical.
+   */
+  readonly lastProofRefreshAt?: number;
+  /**
+   * CIDv1 (base32) of the bundle whose §5.3 walk produced this manifest
+   * entry. Stored for forensic provenance and as the lex-min tie-break
+   * input to `compareCidV1Binary` (per §5.3 [D-conflict]).
+   */
+  readonly bundleCid?: string;
+  /**
+   * Sender's transport pubkey (64-hex secp256k1 x-coordinate from the
+   * Nostr signing key) of the bundle that produced this entry. Forensic
+   * peer attribution; mirrors the `_invalid` / `_audit` records.
+   */
+  readonly senderTransportPubkey?: string;
 }
 
 /**
