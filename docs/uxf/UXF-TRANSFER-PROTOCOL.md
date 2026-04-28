@@ -103,8 +103,16 @@ Sender                      Aggregator                   Recipient
 
 "Chain mode" is the **situation** that arises when instant mode is composed across multiple hops: a token whose history contains two or more transactions that have not yet been finalized when the bundle is delivered. This is not a fourth `transferMode` value — it's a property of the token's transaction history at the moment of receive.
 
+**Source-side opt-in** (`allowPendingTokens`): the sender's `payments.send()` call accepts an `allowPendingTokens?: boolean` option (default `false`). When `false` (default), the source-token selector considers ONLY tokens with `manifest.status === 'valid'` (fully finalized) — chain mode never arises from local sends. When `true`, the selector MAY pick `pending` tokens to satisfy the requested amount. Selection priority is strict:
+
+1. **First, satisfy the requested amount from `valid` (finalized) tokens.** Only if the finalized inventory cannot cover the requested `(coinId, amount)` does the selector spill over to step 2.
+2. **Then, top up the shortfall from `pending` tokens** in arrival order (oldest pending first), each contributing whatever balance it has of the requested coin.
+
+The result: an `allowPendingTokens: true` send produces chain-mode transfers only when finalized funds are insufficient — never to "use pending preferentially." If after both steps the requested amount is still uncovered, `send()` rejects with `INSUFFICIENT_BALANCE` (the SDK does NOT attempt to send a partial amount).
+
 A receiver may be handed a token with K unfinalized transactions in its history (K ≥ 1) when:
 
+- The original sender used instant mode WITH `allowPendingTokens: true` and the source token was itself pending (1 or more unfinalized inherited from a chain-mode ancestor).
 - The original sender used instant mode (1 unfinalized: the latest transfer).
 - The original recipient forwarded the token in instant mode before its inherited tx finalized (now 2+ unfinalized).
 - This forwarding repeated arbitrarily many times — the chain grows.
@@ -130,13 +138,15 @@ The sender ships one Nostr `TOKEN_TRANSFER` event **per token** using the legacy
 
 ### 2.5 Mode Selection
 
-- **Default**: `transferMode: 'instant'` over UXF — minimizes UX latency, multi-token bundles.
-- **Caller override**: `PaymentsModule.send({ transferMode, txfFinalization?, delivery? })`.
+- **Default**: `transferMode: 'instant'` over UXF, `allowPendingTokens: false` — instant UXF non-chained. Minimizes UX latency; uses only finalized source tokens.
+- **Caller override**: `PaymentsModule.send({ transferMode, txfFinalization?, delivery?, allowPendingTokens? })`.
   - `transferMode: 'instant'` (default) — UXF bundle, async finalization (§2.1).
   - `transferMode: 'conservative'` — UXF bundle, full-history finalization-before-send (§2.2). Recommended for high-value transfers, escrow, swap deposits.
   - `transferMode: 'txf'` — legacy per-token wire (§2.4). Pair with `txfFinalization: 'instant' | 'conservative'` (default `'conservative'`).
+  - `allowPendingTokens: false` (default) — source-token selector considers only `valid` tokens; `INSUFFICIENT_BALANCE` if finalized funds don't cover.
+  - `allowPendingTokens: true` — selector may spill over to `pending` tokens after exhausting `valid` ones. Enables chain mode (§2.3). Selection priority is strict: finalized-first, then pending-by-age.
 - **Splits MAY be instant**: token-hash invariance under proof attachment (verified above) means split-and-mint flows can issue child tokens with status `'pending'` referencing a still-unfinalized parent. The parent's proof, when later attached, does not invalidate the child's identity. This is a **deliberate change** from the prior assumption that splits required conservative-mode finalization.
-- **Forced conservative remains** for cross-protocol bridges (e.g., into a non-UXF chain) where the destination requires finalized state. The implementation surfaces such overrides in the call result.
+- **Forced conservative remains** for cross-protocol bridges (e.g., into a non-UXF chain) where the destination requires finalized state. The implementation surfaces such overrides in the call result. `allowPendingTokens` is silently coerced to `false` in forced-conservative paths since pending tokens cannot be conservatively-shipped (their predecessor txs aren't finalized).
 
 ---
 
@@ -237,6 +247,25 @@ Publish-time rejection handling: if a `force-inline` send is attempted within th
 
 **Fetched-CAR size cap (recipient-side)**: when fetching via `kind: 'uxf-cid'`, the recipient enforces a maximum fetched-CAR size of **32 MiB** by default (configurable). Fetches whose Content-Length or running byte count exceeds the cap are aborted with `FETCHED_CAR_TOO_LARGE`. This is a DoS defense against malicious senders pinning huge CARs.
 
+#### 3.3.2 Delivery-completion semantics (normative)
+
+The sender's outbox can only mark a transfer "complete" (status `delivered` or `delivered-instant`, eligible for GC) once specific conditions are met. The recipient's "delivered" state is reached at a different point. These semantics differ between inline and CID delivery:
+
+**Inline delivery (`kind: 'uxf-car'`)**:
+- **Sender** considers the bundle delivered as soon as the Nostr publish is acknowledged by at least one configured relay (the relay durably persisted the encrypted event). The CAR bytes traveled inside the Nostr event itself; no separate IPFS persistence is required. Outbox transitions `sending → delivered` (or `delivered-instant`).
+- **Recipient** considers the bundle delivered when the Nostr event arrives, decryption succeeds, and `UxfPackage.fromCar(base64Decode(payload.carBase64))` returns successfully (i.e., the CAR parses and the root CID matches `payload.bundleCid`). No external network fetch is required.
+
+**CID delivery (`kind: 'uxf-cid'`)**:
+- **Sender** considers the bundle delivered ONLY AFTER both of the following are confirmed:
+  1. The CAR has been persisted to IPFS — the local Helia node OR an external pinning service has acknowledged the pin AND the CID is retrievable via at least one verifiable route.
+  2. The Nostr event carrying the CID reference has been acknowledged by at least one relay.
+  Both confirmations are required because either alone is insufficient: a Nostr event referencing an unpinned CID is undeliverable; a pinned CID with no Nostr notification leaves the recipient unaware. The sender's outbox MUST NOT transition `sending → delivered` (or `delivered-instant`) until both confirmations land. Implementations MAY use an intermediate `pinning` sub-state during the IPFS-persist phase (already in §7.0 transition table).
+- **Recipient** considers the bundle delivered ONLY when **physically syncing the bundle from IPFS by the CID received via Nostr**. Receiving the Nostr event alone does NOT constitute delivery — the recipient must successfully fetch the CAR from IPFS (with the §3.3.1 32 MiB cap and verified-CAR pipeline) before any state transitions occur. If the IPFS fetch fails for all configured gateways within retry budget, the bundle is NOT delivered; the recipient emits `transfer:fetch-failed` and does not acknowledge the sender. This semantics applies BOTH for instant and conservative modes.
+
+**Outbox cleanup**: a "completed" UXF bundle transfer (status `delivered` for conservative/TXF, or `finalized` for instant) MAY be safely removed from the outbox per the retention window (§7.0 `delivered → expired` transition). For CID delivery, "completed" requires BOTH the IPFS pin AND Nostr publish acknowledged — never one alone.
+
+Test cases for these semantics are enumerated in §11.2 (integration tests).
+
 ### 3.4 TXF (legacy) wire shape
 
 `'txf'` mode does NOT use `UxfTransferPayload`. The sender emits one Nostr `TOKEN_TRANSFER` event per token with the existing legacy payload shapes:
@@ -262,11 +291,16 @@ Inputs: `tokens: Token[]` (selected for transfer), `recipient: PeerInfo`, `trans
    - Each selected token MUST contain the requested `coinId`. A token MAY carry multiple distinct coin types (multi-coin tokens are supported by the SDK); in that case the token will be split (step 2) so only the requested `(coinId, amount)` is delivered.
    - Total of the requested coin's slices selected across the chosen tokens MUST sum to the requested transfer amount.
 
-2. **Compute splits** (if needed). Three split scenarios:
-   - **Single-coin amount split**: a single-coin token's balance exceeds the requested amount → split into `{tokenForRecipient, changeToken}` per existing split logic.
-   - **Multi-coin token split (transfer carries only requested coin)**: a token carries the requested coin alongside other coin types → split into `{tokenForRecipient, residualToken}`, where `tokenForRecipient` carries ONLY the requested `(coinId, amount)` and `residualToken` carries every other non-zero coin balance plus the unsent remainder (if any) of the requested coin. The residual token stays with the sender.
-   - **Zero-balance pruning**: when constructing the residual, coins with zero balance MUST be pruned from the new token's `coinData`. Carrying explicit zero entries inflates the token CBOR for no benefit.
+2. **Compute splits** (if needed). The single split rule generalizes single-coin and multi-coin tokens uniformly: when splitting a source token to fulfill one or more requested `(coinId, amount)` entries, the split produces:
+   - **`tokenForRecipient`**: contains EXACTLY the requested `(coinId, amount)` entries — no more, no less. For v1.0 (single-coin send), this is exactly one entry; future `sendMulti()` would package multiple entries here.
+   - **`changeToken`** (formerly "residual"): contains everything left in the source token AFTER subtracting the requested entries. This includes (a) the unrequested portion of any requested coin (e.g., source had `UCT: 100`, requested `UCT: 30` → change has `UCT: 70`), (b) all non-requested coin types in the source token (e.g., source had `USDU: 50`, request was for `UCT` only → change has `USDU: 50` carried through unchanged), and (c) any other balances unrelated to the request. The change token is minted to the sender's identity.
+   - **Zero-balance pruning**: when constructing the change token, coins with zero balance MUST be pruned from `coinData`. Carrying explicit zero entries inflates the token CBOR for no benefit.
+
+   The single-coin split (source `{UCT:100}`, request `(UCT, 30)` → recipient `{UCT:30}`, change `{UCT:70}`) is the trivial special case where the change carries a single coin type. The multi-coin split (source `{UCT:100, USDU:50}`, request `(UCT, 30)` → recipient `{UCT:30}`, change `{UCT:70, USDU:50}`) is the general case. From the protocol's perspective these are the same operation; the spec does NOT distinguish them.
+
    - Splits MAY be issued in instant mode (the parent's still-pending transaction does not invalidate child token identities — see the token-hash invariance note in §2.1). The `splitParent: tokenId` reference is recorded on each child for §6.1.1 cascade purposes.
+
+> **Multicoin send status (informational)**: `PaymentsModule.send()`'s current API (`TransferRequest` at `types/index.ts:123-136`) accepts a single `(coinId, amount)` per call. Sending multiple coin types in one transfer requires either repeated `send()` calls (one per coin) or a future `sendMulti()` API (deferred — §12.2). The split logic above is general enough to handle the multicoin case if/when `sendMulti()` lands; only the SDK's calling surface needs extension.
 
 3. **For each token destined to the recipient**, build a `TransferTransaction` (SDK primitive):
    - `sourceState`: token's current state.
@@ -405,6 +439,25 @@ In **TXF mode**, the outbox entry is per-token and short-lived (same lifecycle a
 ---
 
 ## 5. Recipient Flow
+
+### 5.0 Concurrency model — N parallel bundle workers
+
+Incoming bundles are processed by a **pool of parallel workers** (default `MAX_INGEST_WORKERS = 16`, configurable). When a Nostr `TOKEN_TRANSFER` event arrives, it is enqueued on a bounded ingest queue (default 256 entries) and dispatched to the next free worker.
+
+**Why parallelism is required**: a single rogue incoming bundle (e.g., one with a chain-mode token requiring K=64 unfinalized-tx finalization queue, or a `uxf-cid` bundle whose IPFS fetch is slow) would otherwise serialize behind every other legitimate bundle. With N workers, slow bundles consume a single worker each; the other N-1 continue serving fresh arrivals. This is a **DoS defense** against an attacker who deliberately crafts long-running bundles.
+
+**Worker isolation**:
+- Each worker runs §5.1–§5.3 for its assigned bundle independently. Per-tokenId mutexes (§5.5 step 9) coordinate workers when two bundles target the same `tokenId`; otherwise workers proceed in parallel.
+- Bundle-level errors (CAR parse failures, gateway timeouts) terminate the worker's processing of that bundle without affecting others. The worker returns to the dispatcher to pick up the next queued bundle.
+- The ingest queue itself is bounded: if all `MAX_INGEST_QUEUE_SIZE` (default 256) slots are occupied, new arrivals are dropped with `INGEST_QUEUE_FULL` and the sender's outbox eventually times out (`failed-transient`). This is a hard back-pressure signal — the recipient cannot keep up — and a configurable monitoring metric.
+
+**Per-worker resource caps** (each worker enforces independently):
+- §3.3.1 32 MiB fetched-CAR cap.
+- §5.2 #3 chain-depth cap.
+- §5.2 #4 unclaimed-roots cap.
+- §5.5 finalization queue depth (capped per-tokenId, not per-worker).
+
+**Bundle-internal token parallelism**: within one bundle, all token-roots are processed by the SAME worker sequentially (no inner parallelism). This keeps per-bundle ordering consistent for §5.6 idempotency invariants. Cross-bundle parallelism is the protection against rogue inputs.
 
 ### 5.1 Bundle acquisition
 
@@ -609,10 +662,50 @@ The matrix distinguishes **cryptographically broken** tokens (`PROOF_INVALID`, `
 | `VALID` | Yes | Spendable | active token pool, `manifest.status='valid'` | Wallet inventory |
 | `PENDING` | Yes | Incoming (not spendable) | active token pool, `manifest.status='pending'`, every unfinalized tx queued | Wallet inventory with "pending" badge |
 | `CONFLICTING` | Yes (winner) | Spendable iff resolved | active pool, `manifest.status='conflicting'` + `conflictingHeads[]` | Conflict-resolution view |
-| `PROOF_INVALID` | No | No | `_invalid` collection (per-entry-key `${addr}.invalid.${tokenId}`), reason='proof-invalid' | Investigation view |
+| `PROOF_INVALID` | No | No | `_invalid` collection (key form below), reason='proof-invalid' | Investigation view |
 | `STRUCTURAL_INVALID` | No | No | `_invalid` collection, reason='structural' | Investigation view |
-| `NOT_OUR_CURRENT_STATE` | No | No | `_audit` collection (`${addr}.audit.${tokenId}`), reason='not-our-state' | Audit view (off by default) |
+| `NOT_OUR_CURRENT_STATE` | No | No | `_audit` collection (key form below), reason='not-our-state' | Audit view (off by default) |
 | `UNSPENDABLE_BY_US` | No | No | `_audit` collection, reason='off-record-spend' | Audit view |
+
+**Key shapes for `_invalid` and `_audit` (multi-representation aware)**:
+
+The active pool is keyed by `tokenId` because there is at most ONE canonical disposition per token (conflicts surface via `conflictingHeads[]` on the single entry). However, the `_invalid` and `_audit` collections MUST allow MULTIPLE records per `tokenId` because:
+- The same token may be observed in multiple UXF bundles concurrently (different senders, different chains, different times) — some may be valid, some may surface as invalid for different reasons.
+- A token can be marked invalid by one bundle (e.g., bad proof) and later observed in a different bundle as `NOT_OUR_CURRENT_STATE` — both records are forensically distinct.
+- An attacker may ship multiple invalid representations of the same `tokenId` across separate bundles; each record is preserved independently.
+
+The keying scheme:
+```
+_invalid:  ${addr}.invalid.${tokenId}.${observedTokenContentHash}
+_audit:    ${addr}.audit.${tokenId}.${observedTokenContentHash}
+```
+
+Where `observedTokenContentHash` is the CID of the token-root element AS OBSERVED in the originating bundle (not a synthetic value — the actual content hash of the as-seen DAG fragment). Two distinct bundle copies of the same `tokenId` produce two distinct keys; identical bundle copies produce the same key (idempotent re-write).
+
+Each record carries enough context to reconstruct the dispositioning event:
+```typescript
+interface InvalidEntry {
+  readonly tokenId: string;
+  readonly observedTokenContentHash: ContentHash;  // disambiguator
+  readonly reason: DispositionReason;
+  readonly observedAt: number;
+  readonly bundleCid: string;       // which bundle delivered this
+  readonly senderTransportPubkey: string;  // for forensic peer attribution
+}
+
+interface AuditEntry {
+  readonly tokenId: string;
+  readonly observedTokenContentHash: ContentHash;
+  readonly auditStatus: AuditStatus;
+  readonly reason: DispositionReason;
+  readonly recordedAt: number;
+  readonly bundleCidsObserved: readonly string[];  // can accumulate across re-arrivals of same observedTokenContentHash
+  readonly promotedToManifestRef?: ContentHash;
+  readonly audit_promoted_from?: readonly string[];  // see §5.4 array-merge rule
+}
+```
+
+**Aggregation queries**: UI-level "show all bad records for tokenId X" uses a prefix scan (`${addr}.invalid.${tokenId}.*`). Per-record retention rules are unchanged from the original §5.4 retention paragraph.
 
 **Reason enum** (canonical, used in all `_invalid` and `_audit` records and in worker logs):
 
@@ -969,7 +1062,28 @@ The merge path (§5.5 last paragraph) provides an alternative: if a more-finaliz
 2. **Token CID equality** — the IPFS content-address of the serialized token. This DOES change when proofs are attached (the CBOR encoding gains the proof bytes). Both sides converge to the SAME final CID *only when they have attached the same set of proofs*.
 
 **Proof sketch**:
-1. For each unfinalized tx, the aggregator publishes its proof at most once **assuming the aggregator is not faulty** (idempotency of `getInclusionProof`). This is documented behavior of `aggregator-go`'s JSON-RPC `get_inclusion_proof` method; not yet asserted by an SDK-level regression test, but implementations SHOULD add one. If a faulty aggregator returns two structurally-different-but-both-valid proofs for the same requestId (different witness paths through the same SMT), the protocol canonicalizes by selecting the proof with the lexicographically-minimum CID. **Comparison rule** (canonical, used both here and in §5.3 [D-conflict] tie-breaking): compare CIDs as **raw CIDv1 binary form** — i.e., the multibase-decoded byte sequence. NOT base32 string comparison (which would be sensitive to multibase prefix and casing). Two CIDs are compared by `Buffer.compare(cidA.bytes, cidB.bytes)`.
+
+**Crucial invariant about unicity proofs (per the underlying state-transition protocol)**:
+- For a given `requestId`, the aggregator NEVER signs proofs for two DIFFERENT values (different `transactionHash` + `authenticator`). Single-spend at the SMT level guarantees this — if a different value were committed, it would be the canonical one and the original would be unanchored.
+- For a given `requestId` AND value (transactionHash + authenticator), MULTIPLE proofs may legitimately exist over time. The SMT grows with every BFT round; an old proof's merkle path is valid against the OLDER root, but a fresher proof against the NEWER root has identical leaf data and identical (transactionHash, authenticator) — only the witness path and the unicity certificate differ.
+- This means: same-value proofs at successive aggregator snapshots are NORMAL and EXPECTED. Implementations MUST handle "the proof I already have" being superseded by a more-recent equivalent.
+
+**Canonicalization rule (most-recent proof wins)**: when two proofs exist locally for the same `requestId` with the same (transactionHash, authenticator), the protocol prefers the **most recent** — i.e., the proof whose `unicityCertificate` was issued in the latest BFT round. Recency is determined by:
+1. The `unicityCertificate` carries a BFT round number (or equivalently, a timestamp/sequence). Higher round = more recent.
+2. If round numbers are unavailable in the certificate format, use the proof's CID with a "first-observed-locally" timestamp recorded in the manifest's `lastProofRefreshAt` field.
+
+If the local manifest already has a proof for a queue entry's requestId, and a fresh poll returns a NEWER proof for the same value, the worker:
+- Verifies the new proof against trustBase.
+- Replaces the old proof element in the pool with the new one.
+- Updates the manifest CID rewrite (per §5.5 step 5) — the token's CBOR encoding now embeds the newer proof, so its CID changes; tombstone the previous CID.
+- Does NOT alter the queue entry's status (the entry was already in `completedRequestIds`); this is purely a maintenance operation.
+
+**Forbidden** (would indicate aggregator failure): observing two proofs for the same requestId with DIFFERENT values (different transactionHash). If this ever happens, emit `transfer:security-alert` immediately — the single-spend invariant has been violated at the aggregator. The protocol does NOT auto-recover; an operator must investigate. (This is the only path that emits `transfer:security-alert` in the routine flow; per §9.4.1, all other suspect events emit `transfer:trustbase-warning` first.)
+
+**Convergence sketch**:
+1. For each requestId, both finalizers eventually retrieve some valid proof. The proofs are over IDENTICAL values (transactionHash, authenticator) — by aggregator invariant.
+2. If both finalizers retrieve at the same BFT round, the proofs are byte-identical; trivially convergent.
+3. If the finalizers retrieve at different rounds, the proofs differ in witness path + certificate but agree on value. After both run §12.3.1 profile-pointer rescan and exchange manifests, the most-recent-proof rule selects the same canonical proof on both sides; manifests converge to the same CID for the token.
 2. Both finalizers fetch each pending proof independently. Both attach byte-identical `inclusion-proof` elements to byte-identical transaction objects.
 3. The transaction's data hash (`TransferTransactionData.calculateHash()`) is unchanged — proofs are not in its preimage. So the per-tx CID changes (the encoded form is different) but the `transactionHash` referenced *by* the inclusion proof remains the same.
 4. The token's `id` is unchanged throughout. The token's CID — the content-address of its CBOR encoding — converges once both sides have the same proof set attached.
@@ -1289,7 +1403,7 @@ In-scope failure modes the protocol defends against:
 Out-of-scope failure modes (the protocol does NOT defend against; if these occur, the trust assumption is violated):
 - Aggregator signs valid proofs for transitions not in its SMT (active forgery). Detected by recipient's local trustBase verify, but only if the trustBase is up-to-date.
 - Aggregator collusion across BFT validators to rewrite history. Detection at the BFT layer is out-of-scope here; if it happens, the recipient may store a `valid` token whose chain is later contradicted by a corrected aggregator — manual operator escalation required.
-- Aggregator deliberately returns inconsistent answers to different callers (split-brain). The lex-min CID canonicalization in §6.3 handles inadvertent split-brain (different witness paths through the same SMT); deliberate split-brain on different SMT roots is a hostile-aggregator scenario and out of scope.
+- Aggregator deliberately returns inconsistent answers to different callers (split-brain). The most-recent-proof canonicalization in §6.3 handles benign multi-round divergence (proofs at different snapshots for the same value); deliberate split-brain on different SMT roots OR different values for the same requestId is a hostile-aggregator scenario and out of scope (the latter triggers `transfer:security-alert` per §6.3).
 
 **Event taxonomy**:
 - `transfer:trustbase-warning` — `NOT_AUTHENTICATED` on a proof. Most likely cause: stale local trustBase. The SDK SHOULD attempt a trustBase refresh before retrying. The protocol does NOT defend against active forgery (out of scope), so this event is treated as an operational issue rather than a security incident.
@@ -1393,6 +1507,18 @@ The implementation MUST include:
   - Same, but residual is sent in a follow-up transfer to a third party.
 - Token-hash invariance: take the same token in two states (proof attached vs. proof null), verify `token.id` is identical, verify CIDs differ.
 - CAR-embed delivery for small bundles (< 16 KiB); CID delivery for large bundles (> 16 KiB).
+- **Inline delivery completion semantics (§3.3.2)**:
+  - Sender ships an inline bundle, Nostr relay acks → outbox transitions to `delivered` (or `delivered-instant`).
+  - Sender ships an inline bundle, all configured relays reject → outbox stays at `sending`, retries; eventually `failed-transient`.
+  - Recipient receives Nostr event, decrypts, parses CAR successfully → bundle delivered, §5.3 disposition pass runs.
+  - Recipient receives Nostr event, CAR fails to parse (corrupted base64 or root-CID mismatch) → bundle rejected, no delivery acknowledgment.
+- **CID delivery completion semantics (§3.3.2)**:
+  - Sender pins CAR to IPFS successfully + Nostr relay acks → outbox transitions to `delivered`.
+  - Sender's IPFS pin succeeds but Nostr publish fails → outbox stays at `pinned`; on retry, only the Nostr publish is re-attempted (CID is already pinned).
+  - Sender's Nostr publish succeeds but IPFS pin fails (out of disk, gateway timeout) → outbox stays at `pinned`; pin is retried; on permanent pin failure, outbox transitions to `failed-permanent` even though the Nostr event was published (the CID won't resolve for the recipient).
+  - Recipient receives Nostr event with CID, all gateways fail to fetch within retry budget → `transfer:fetch-failed` emitted; bundle is NOT delivered; sender's outbox times out.
+  - Recipient receives Nostr event with CID, one gateway succeeds → CAR verified against bundleCid, bundle delivered, §5.3 runs.
+  - **Cross-mode test**: sender ships in instant mode via CID; recipient's IPFS fetch succeeds 5 minutes after Nostr event arrival → recipient's instant-mode finalization queue starts at the IPFS-fetch time, not at the Nostr-event time (per §3.3.2 "physically syncing" rule).
 - `delivery: { kind: 'force-inline' }` with an oversized bundle → expect `INLINE_CAR_TOO_LARGE` error.
 - `delivery: { kind: 'force-cid' }` with a 1-token tiny bundle → IPFS pin happens (or no-op since the outbox already pinned), recipient fetches via gateway.
 - `delivery: { kind: 'auto', inlineCapBytes: 32768 }` — 24 KiB bundle goes inline despite default cap being 16 KiB.
@@ -1444,10 +1570,37 @@ The implementation MUST include:
 
 - **Bundle compression**: CARs can be sizeable for many-token bundles (especially chain-mode tokens with deep history). zstd / brotli on the inline-CAR path? Out of scope for v1.0.
 - **Multi-recipient bundles**: a single UXF bundle delivered to a Nostr group / multicast — nice to have, deferred. Would amortize CID-pin cost across N recipients and allow group-level atomic broadcasts. Open design points: per-recipient encryption envelope vs. shared symmetric key, group-membership consent.
-- **Audit-collection promotion scanner**: a periodic re-scan that promotes `_audit` entries (`audit-not-our-state`) to `audit-promoted` if a later transfer makes them ours. State machine defined in §5.4 but the scanner itself is deferred.
-- **Multi-coin send in a single call**: v1.0 `PaymentsModule.send()` accepts a single `(coinId, amount)`. Sending multiple coin types from a multi-coin token in one transfer requires either multiple calls or a future `sendMulti()` API.
+- **Multi-coin send in a single call**: v1.0 `PaymentsModule.send()` accepts a single `(coinId, amount)`. The split logic in §4.1 step 2 is already general enough; only a `sendMulti(targets: Array<{coinId, amount}>)` calling-surface extension is needed.
 - **Conflict-resolution UI/API**: `CONFLICTING` tokens (genuinely-divergent chains) need an explicit `resolveConflict(tokenId, chosenHead)` API and UI surface. Lex-min `bundleCid` provides an automatic primary, but operator override is a planned future addition.
 - **Peer-reputation framework**: §11.4 mentions a 1-hour cooldown on bandwidth-burning peers. The reputation interface itself is out of scope here.
+
+### 12.3 Periodic rescans (two orthogonal scanner types — in-scope; design summary here, implementation deferred)
+
+The protocol relies on two periodic rescan loops to maintain consistency between local state and the canonical aggregator/profile views. Both are operator-configurable and run independently:
+
+#### 12.3.1 Profile-pointer rescan
+
+**Purpose**: detect updates to the wallet's UXF profile that landed via another instance of the same wallet (different device, recovered backup, etc.). The profile pointer is registered with the aggregator; periodically, the local instance MUST query the next pointer position to discover whether a remote update has bumped it.
+
+**Mechanism**:
+- Schedule: every `PROFILE_POINTER_RESCAN_INTERVAL` (default 30s).
+- Query: `aggregator.getNextProfilePointer(currentLocalPointerId)` — returns the next pointer in the chain, or `null` if local is the head.
+- On bump: sync the new profile CID locally, run §5.3 disposition matrix on any new tokens, merge per Wave G.3 rules into local pool/manifest. New `_invalid` / `_audit` entries are added per §5.4 keying.
+- Backoff on aggregator unavailability: exponential up to 5 min.
+
+This rescan is the primary mechanism by which the audit-collection promotion scanner (formerly listed in §12.2 as deferred) actually fires — when a remote update brings in a new transfer that makes a previously `audit-not-our-state` token ours, the rescan-driven §5.3 pass detects the new ownership and promotes per §5.4.
+
+#### 12.3.2 Per-token spent-state rescan
+
+**Purpose**: detect off-record spends. If another instance of the same wallet (sharing the private keys but not yet synced to us) has spent one of our tokens, the aggregator's SMT will show that token's current state as having a committed transition — but our local manifest still believes the token is `valid`. Without rescan, we'd attempt to spend an already-spent token and learn the truth only at next `send()`.
+
+**Mechanism**:
+- Schedule: for each token in active pool with `manifest.status === 'valid'`, query `oracle.isSpent(currentDestinationStateHash)` periodically. Default interval `TOKEN_SPENT_RESCAN_INTERVAL = 5 min` per token; cap concurrent in-flight queries at `MAX_CONCURRENT_SPENT_RESCANS` (default 4).
+- On `isSpent === true`: transition the token from active pool to `_audit` with reason='off-record-spend' (UNSPENDABLE_BY_US disposition per §5.3 [E]). Emit `token:off-record-spent` event with `{tokenId, detectedAt, suspectedSiblingInstance: boolean}` — suspected-sibling-instance is set if local outbox has no record of having spent this state, suggesting another instance with the same keys is the spender.
+- On transient errors (aggregator unavailable): backoff; retry.
+- Cache: §8 already references the Wave L LRU cache for `isSpent`. The rescan respects the cache TTL — a recently-cached `isSpent === false` doesn't force a fresh query.
+
+These two rescans are CONFIGURABLE: operators can disable either via SDK init (`{ disableProfilePointerRescan: true }` or `{ disableSpentRescan: true }`) for cost-sensitive deployments. Disabling both leaves the wallet purely event-driven (responsive to incoming bundles only).
 
 ---
 
