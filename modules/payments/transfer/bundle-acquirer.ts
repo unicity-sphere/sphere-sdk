@@ -1,13 +1,24 @@
 /**
- * Bundle acquirer — UXF Inter-Wallet Transfer recipient (T.3.A).
+ * Bundle acquirer — UXF Inter-Wallet Transfer recipient (T.3.A + T.4.B).
  *
  * Sits between the transport layer (which delivers a decoded
  * {@link UxfTransferPayload}) and the bundle verifier (T.3.A
  * `bundle-verifier.ts`). Responsibilities, in order:
  *
- *   1. **CID-mode gate (T.4.B deferred)** — if `payload.kind === 'uxf-cid'`,
- *      throw `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED`. The IPFS fetch
- *      pipeline lands in T.4.B; this module is CAR-only in T.3.
+ *   1. **CID-mode branch (T.4.B)** — if `payload.kind === 'uxf-cid'`,
+ *      delegate to {@link fetchCarByCid} (cid-fetcher.ts). The fetcher
+ *      walks the configured gateway list, stream-fetches under the
+ *      32 MiB cap, and verifies the CAR root CID matches `bundleCid`.
+ *      On success we re-enter the CAR-validation path with the fetched
+ *      bytes. On all-gateways-failure, the fetcher emits
+ *      `transfer:fetch-failed` and throws
+ *      `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` — the worker pool
+ *      treats this as TRANSIENT (W13: NO disposition record).
+ *
+ *      **Gateway list resolution** (§3.3): we use the wallet's own
+ *      configured gateway list, NOT `payload.senderGateways` (the
+ *      latter is informational only — a hostile sender could lie). The
+ *      caller passes the resolved gateway list via `options.gateways`.
  *
  *   2. **CAR root-CID extraction** — decode `payload.carBase64` to bytes
  *      and run `extractCarRootCid` (T.1.D). This catches:
@@ -56,10 +67,11 @@
  *     responsibility (T.3.E worker pool). The acquirer assumes its
  *     input has already passed back-pressure gating.
  *
- *   - **CAR-only path** — T.3.A explicitly defers `uxf-cid` to T.4.B.
- *     The `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED` code is the
- *     well-typed "not implemented yet" signal so callers can branch
- *     deterministically rather than match on a generic message.
+ *   - **CID-mode path enabled (T.4.B)**. When the caller does NOT supply
+ *     `options.gateways`, the legacy `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED`
+ *     reject path is preserved for backward-compat with callers that
+ *     have not yet wired the gateway list. New callers (post-T.4.B)
+ *     SHOULD always pass `gateways` so the CID branch works.
  *
  * Spec references:
  *   - §5.1   Bundle acquisition (CAR / CID branch + replay LRU).
@@ -86,6 +98,11 @@ import {
   verifyBundleStructure,
   type VerifiedBundle,
 } from './bundle-verifier.js';
+import {
+  fetchCarByCid,
+  type CidFetcherEmit,
+  type CidFetcherFetch,
+} from './cid-fetcher.js';
 import type { ReplayLRU } from './replay-lru.js';
 
 // =============================================================================
@@ -118,7 +135,55 @@ export function isReplayOutcome(result: AcquireBundleResult): result is ReplayOu
 }
 
 // =============================================================================
-// 2. Public API — acquireBundle
+// 2. Public types — CID-fetch wiring options (T.4.B)
+// =============================================================================
+
+/**
+ * Optional CID-fetch wiring for {@link acquireBundle}.
+ *
+ * When the incoming payload's `kind` is `'uxf-cid'`, the acquirer
+ * delegates to {@link fetchCarByCid} — but only if a non-empty
+ * `gateways` list is supplied. Without gateways we preserve the legacy
+ * T.3.A reject path (`BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED`) for
+ * backward-compat with callers that have not yet been migrated.
+ *
+ * Spec refs: §3.3 (gateway list is recipient-controlled, NOT
+ * `senderGateways`), §3.3.1 (32 MiB cap), §9.2 / W13 (transient-only
+ * failure path — no disposition record).
+ */
+export interface AcquireBundleCidOptions {
+  /**
+   * Gateway URL list, walked in order. SHOULD be the wallet's own
+   * configured list — `payload.senderGateways` is unauthenticated and
+   * ignored by this code path on principle (§3.3 hostile-sender
+   * defense).
+   */
+  readonly gateways?: ReadonlyArray<string>;
+  /**
+   * Optional fetch override (test seam). Defaults to `globalThis.fetch`.
+   */
+  readonly fetch?: CidFetcherFetch;
+  /**
+   * Optional event emitter — wired by the caller to the Sphere event
+   * bus so a `transfer:fetch-failed` event surfaces to the application
+   * when every gateway fails (§9.2).
+   */
+  readonly emit?: CidFetcherEmit;
+  /**
+   * Optional abort signal — propagates through to the streaming fetch
+   * loop. The caller (worker pool) cancels via this when shutting down.
+   */
+  readonly signal?: AbortSignal;
+  /**
+   * Optional override of the recipient-side max CAR size cap. Defaults
+   * to {@link MAX_FETCHED_CAR_BYTES} (32 MiB). Tests pass smaller
+   * values to exercise the streaming-abort path with feasible mocks.
+   */
+  readonly maxBytes?: number;
+}
+
+// =============================================================================
+// 3. Public API — acquireBundle
 // =============================================================================
 
 /**
@@ -138,12 +203,22 @@ export function isReplayOutcome(result: AcquireBundleResult): result is ReplayOu
  * @param lru           A {@link ReplayLRU} instance for short-circuit
  *                      handling. Same instance across all worker
  *                      invocations — the LRU is module-scoped.
+ * @param cidOptions    Optional T.4.B CID-fetch wiring. When supplied
+ *                      (with a non-empty `gateways` list), enables the
+ *                      `kind: 'uxf-cid'` branch. Omit to preserve the
+ *                      pre-T.4.B "CID not yet supported" reject.
  *
  * @returns A {@link VerifiedBundle} on first-time success, or a
  *          {@link ReplayOutcome} when the LRU short-circuits.
  *
  * @throws {SphereError} `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED`
- *         for `kind: 'uxf-cid'` (T.4.B will enable).
+ *         for `kind: 'uxf-cid'` when no `cidOptions.gateways` are
+ *         supplied (legacy reject path).
+ * @throws {SphereError} `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` if
+ *         every gateway in `cidOptions.gateways` failed (T.4.B; W13:
+ *         caller MUST treat as TRANSIENT, NO disposition record).
+ * @throws {SphereError} `FETCHED_CAR_TOO_LARGE` is collapsed into a
+ *         per-gateway failure reason; never escapes directly.
  * @throws {SphereError} `BUNDLE_REJECTED_MALFORMED_ENVELOPE` if
  *         `carBase64` decode fails (delegated to
  *         {@link carBase64ToBytes}).
@@ -167,40 +242,66 @@ export async function acquireBundle(
   payload: UxfTransferPayload,
   senderPubkey: string,
   lru: ReplayLRU,
+  cidOptions?: AcquireBundleCidOptions,
 ): Promise<AcquireBundleResult> {
-  // ---- Step 1: CID-mode gate (T.4.B deferred) ----
-  if (isUxfTransferPayloadCid(payload)) {
-    throw new SphereError(
-      'acquireBundle: kind="uxf-cid" delivery is not yet supported in this build ' +
-        '(T.4.B will enable IPFS-fetch path)',
-      'BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED',
-    );
-  }
+  // ---- Step 1: CID-mode branch (T.4.B) ----
+  // We obtain `carBytes` and `extractedCid` from one of two paths:
+  //   - uxf-car: base64-decode the embedded payload.
+  //   - uxf-cid: stream-fetch from a configured gateway list.
+  // Both paths converge into the same `(carBytes, extractedCid,
+  // bundleCid)` triplet, and the rest of the pipeline (LRU + verifier)
+  // runs identically. This deliberate convergence is why "force-cid on
+  // a tiny bundle still goes through CID fetch" is a no-op regression
+  // for the receiver — the CID path doesn't shortcut based on size.
+  let carBytes: Uint8Array;
+  let extractedCid: string;
 
-  // ---- Discriminator check: only uxf-car is in scope here ----
-  if (!isUxfTransferPayloadCar(payload)) {
+  if (isUxfTransferPayloadCid(payload)) {
+    if (!cidOptions || !cidOptions.gateways || cidOptions.gateways.length === 0) {
+      // Pre-T.4.B compat: caller has not wired CID-fetch yet.
+      throw new SphereError(
+        'acquireBundle: kind="uxf-cid" requires cidOptions.gateways to be ' +
+          'a non-empty list (T.4.B CID-fetch path); none supplied',
+        'BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED',
+      );
+    }
+    // The fetcher emits `transfer:fetch-failed` and throws
+    // BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT on all-gateways-fail. It
+    // also internally verifies the root CID matches `payload.bundleCid`,
+    // so no second mismatch check is needed downstream.
+    const fetched = await fetchCarByCid(payload.bundleCid, {
+      gateways: cidOptions.gateways,
+      senderTransportPubkey: senderPubkey,
+      fetch: cidOptions.fetch,
+      emit: cidOptions.emit,
+      signal: cidOptions.signal,
+      maxBytes: cidOptions.maxBytes,
+    });
+    carBytes = fetched.carBytes;
+    extractedCid = payload.bundleCid;
+  } else if (isUxfTransferPayloadCar(payload)) {
+    // ---- Step 2: CAR root-CID extraction (uxf-car path) ----
+    // `carBase64ToBytes` throws BUNDLE_REJECTED_MALFORMED_ENVELOPE on
+    // base64-alphabet violations; `extractCarRootCid` throws
+    // BUNDLE_REJECTED_INVALID_CAR or BUNDLE_REJECTED_MULTI_ROOT.
+    carBytes = carBase64ToBytes(payload.carBase64);
+    extractedCid = await extractCarRootCid(carBytes);
+
+    // ---- Step 3: Root-CID consistency (uxf-car path) ----
+    if (extractedCid !== payload.bundleCid) {
+      throw new SphereError(
+        `acquireBundle: CAR root CID ${extractedCid} does not match ` +
+          `payload.bundleCid ${payload.bundleCid}`,
+        'BUNDLE_REJECTED_ROOT_CID_MISMATCH',
+      );
+    }
+  } else {
     // Legacy / unknown shapes are routed elsewhere (T.7.B legacy adapter).
     // Reaching here means the caller mis-routed the payload.
     throw new SphereError(
-      'acquireBundle: payload is not a UXF v1.0 uxf-car envelope ' +
+      'acquireBundle: payload is not a UXF v1.0 uxf-car or uxf-cid envelope ' +
         '(legacy shapes are handled by the legacy-adapter pipeline)',
       'BUNDLE_REJECTED_MALFORMED_ENVELOPE',
-    );
-  }
-
-  // ---- Step 2: CAR root-CID extraction ----
-  // `carBase64ToBytes` throws BUNDLE_REJECTED_MALFORMED_ENVELOPE on
-  // base64-alphabet violations; `extractCarRootCid` throws
-  // BUNDLE_REJECTED_INVALID_CAR or BUNDLE_REJECTED_MULTI_ROOT.
-  const carBytes = carBase64ToBytes(payload.carBase64);
-  const extractedCid = await extractCarRootCid(carBytes);
-
-  // ---- Step 3: Root-CID consistency ----
-  if (extractedCid !== payload.bundleCid) {
-    throw new SphereError(
-      `acquireBundle: CAR root CID ${extractedCid} does not match ` +
-        `payload.bundleCid ${payload.bundleCid}`,
-      'BUNDLE_REJECTED_ROOT_CID_MISMATCH',
     );
   }
 
