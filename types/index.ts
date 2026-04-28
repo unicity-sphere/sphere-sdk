@@ -807,6 +807,9 @@ export * from './uxf-transfer';
 // Re-export Asset Target / Additional Asset types (T.1.B.1)
 export * from './asset-target';
 
+// Re-export DispositionReason / AuditStatus enums + record schemas (T.1.C)
+export * from './disposition';
+
 // =============================================================================
 // Network Health Types
 // =============================================================================
