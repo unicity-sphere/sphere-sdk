@@ -169,3 +169,16 @@ export {
 // =============================================================================
 
 export { InMemoryUxfStorage, KvUxfStorageAdapter } from './storage-adapters.js';
+
+// =============================================================================
+// Transfer Wire Format (T.1.D — encode/decode + helpers)
+// =============================================================================
+
+export {
+  encodeTransferPayload,
+  decodeTransferPayload,
+  decodeNostrEventContent,
+  extractCarRootCid,
+  carBytesToBase64,
+  carBase64ToBytes,
+} from './transfer-payload.js';
