@@ -38,6 +38,8 @@ import type {
   TxfOutboxEntry,
   TxfSentEntry,
   TxfInvalidEntry,
+  TxfAuditEntry,
+  TxfFinalizationQueueEntry,
   SaveResult,
   LoadResult,
   SyncResult,
@@ -128,6 +130,18 @@ interface OperationalState {
   history: HistoryRecord[];
   mintOutbox: unknown[];
   invalidatedNametags: unknown[];
+  /**
+   * Audit collection (T.0.G7-fill-gaps) — structurally-valid-but-
+   * unspendable tokens. Persisted via the per-entry-key writer under
+   * `${addr}.audit.<id>` keys. The `id` is treated as opaque; T.1.E
+   * narrows it to `${tokenId}.${observedTokenContentHash}`.
+   */
+  audit: TxfAuditEntry[];
+  /**
+   * Finalization queue (T.0.G7-fill-gaps) — pending chain-mode
+   * finalizations. Persisted under `${addr}.finalizationQueue.<id>`.
+   */
+  finalizationQueue: TxfFinalizationQueueEntry[];
 }
 
 // =============================================================================
@@ -1473,6 +1487,8 @@ export class ProfileTokenStorageProvider
       mintOutbox: ((data as unknown as Record<string, unknown>)._mintOutbox as unknown[]) ?? [],
       invalidatedNametags:
         ((data as unknown as Record<string, unknown>)._invalidatedNametags as unknown[]) ?? [],
+      audit: data._audit ?? [],
+      finalizationQueue: data._finalizationQueue ?? [],
     };
   }
 
@@ -1505,6 +1521,10 @@ export class ProfileTokenStorageProvider
     }
     if (opState.invalidatedNametags.length > 0) {
       (result as unknown as Record<string, unknown>)._invalidatedNametags = opState.invalidatedNametags;
+    }
+    if (opState.audit.length > 0) result._audit = opState.audit;
+    if (opState.finalizationQueue.length > 0) {
+      result._finalizationQueue = opState.finalizationQueue;
     }
 
     // Add token entries
@@ -1598,6 +1618,21 @@ export class ProfileTokenStorageProvider
       const id = (e as Record<string, unknown>).tokenId;
       if (typeof id === 'string' && id.length > 0) liveMint.set(id, e);
     }
+    // T.0.G7-fill-gaps: audit + finalizationQueue collections. Each
+    // entry is keyed by its opaque `id` field — the writer treats the
+    // value as a string and does not parse internal structure, so a
+    // future composite id form (T.1.E: `${tokenId}.${contentHash}`)
+    // works without any further plumbing.
+    const liveAudit = new Map<string, TxfAuditEntry>();
+    for (const e of opState.audit) {
+      const id = (e as unknown as Record<string, unknown>).id;
+      if (typeof id === 'string' && id.length > 0) liveAudit.set(id, e);
+    }
+    const liveFinalization = new Map<string, TxfFinalizationQueueEntry>();
+    for (const e of opState.finalizationQueue) {
+      const id = (e as unknown as Record<string, unknown>).id;
+      if (typeof id === 'string' && id.length > 0) liveFinalization.set(id, e);
+    }
 
     // Read existing per-entry keys to compute the diff.
     // Wave I.8: a listing failure makes the diff impossible to
@@ -1609,11 +1644,21 @@ export class ProfileTokenStorageProvider
     let existingOutboxKeys: Map<string, string>;
     let existingInvalidKeys: Map<string, string>;
     let existingMintKeys: Map<string, string>;
+    let existingAuditKeys: Map<string, string>;
+    let existingFinalizationKeys: Map<string, string>;
     try {
-      [existingOutboxKeys, existingInvalidKeys, existingMintKeys] = await Promise.all([
+      [
+        existingOutboxKeys,
+        existingInvalidKeys,
+        existingMintKeys,
+        existingAuditKeys,
+        existingFinalizationKeys,
+      ] = await Promise.all([
         this.listExistingPerEntryKeys(`${addr}.outbox.`),
         this.listExistingPerEntryKeys(`${addr}.invalid.`),
         this.listExistingPerEntryKeys(`${addr}.mintOutbox.`),
+        this.listExistingPerEntryKeys(`${addr}.audit.`),
+        this.listExistingPerEntryKeys(`${addr}.finalizationQueue.`),
       ]);
     } catch (err) {
       this.log(
@@ -1646,6 +1691,20 @@ export class ProfileTokenStorageProvider
       now,
       TOMBSTONE_RETENTION_MS,
     );
+    await this.applyPerEntryDiff(
+      `${addr}.audit.`,
+      liveAudit,
+      existingAuditKeys,
+      now,
+      TOMBSTONE_RETENTION_MS,
+    );
+    await this.applyPerEntryDiff(
+      `${addr}.finalizationQueue.`,
+      liveFinalization,
+      existingFinalizationKeys,
+      now,
+      TOMBSTONE_RETENTION_MS,
+    );
 
     // invalidatedNametags stays as a single key (small Set<string>).
     try {
@@ -1660,7 +1719,16 @@ export class ProfileTokenStorageProvider
 
     // Migration: if a legacy single-blob exists for any of the lists,
     // delete it now that per-entry data is written. Best-effort.
-    for (const k of [`${addr}.outbox`, `${addr}.invalid`, `${addr}.mintOutbox`]) {
+    // Includes the new audit + finalizationQueue prefixes so a future
+    // pre-per-entry layout (should one ever land in the wild) gets
+    // cleaned up automatically.
+    for (const k of [
+      `${addr}.outbox`,
+      `${addr}.invalid`,
+      `${addr}.mintOutbox`,
+      `${addr}.audit`,
+      `${addr}.finalizationQueue`,
+    ]) {
       try {
         const legacy = await this.db.get(k);
         if (legacy) await this.db.del(k);
@@ -1919,6 +1987,19 @@ export class ProfileTokenStorageProvider
             ...(opState.invalidatedNametags as string[]),
           ]),
         ),
+        // T.0.G7-fill-gaps: deprecated single-blob path is no longer
+        // on any active code path (per-entry-key writer is canonical),
+        // but the `OperationalState` shape is fully populated for type
+        // soundness. The single-blob writes below do not include the
+        // new collections — they only existed in the per-entry-key
+        // world and the migration cleanup deletes any stale single
+        // blobs at `${addr}.audit` / `${addr}.finalizationQueue`.
+        audit: mergeByPrimaryKey(remote.audit, opState.audit, 'id'),
+        finalizationQueue: mergeByPrimaryKey(
+          remote.finalizationQueue,
+          opState.finalizationQueue,
+          'id',
+        ),
       };
 
       const writes: Array<[string, unknown]> = [
@@ -2073,7 +2154,14 @@ export class ProfileTokenStorageProvider
     // adding different entries never conflict at the OrbitDB
     // layer (each entry has its own LWW key resolution), and
     // removals via tombstones replicate cleanly.
-    const [outbox, invalid, mintOutbox, invalidatedNametagsLegacy] = await Promise.all([
+    const [
+      outbox,
+      invalid,
+      mintOutbox,
+      invalidatedNametagsLegacy,
+      audit,
+      finalizationQueue,
+    ] = await Promise.all([
       this.readPerEntryArrayWithLegacyFallback<TxfOutboxEntry>(
         `${addr}.outbox.`,
         `${addr}.outbox`,
@@ -2089,6 +2177,19 @@ export class ProfileTokenStorageProvider
       // Invalidated nametags is a Set<string> — keep the single-key
       // layout (cheap and the entries are tiny strings, not records).
       this.readProfileKeyJson<unknown[]>(`${addr}.invalidatedNametags`),
+      // T.0.G7-fill-gaps: audit + finalizationQueue use the same
+      // per-entry-key layout as outbox/invalid/mintOutbox. The legacy
+      // blob fallback exists for symmetry — neither collection has
+      // ever been written as a single blob in production, but the
+      // helper costs us nothing here and keeps behaviour uniform.
+      this.readPerEntryArrayWithLegacyFallback<TxfAuditEntry>(
+        `${addr}.audit.`,
+        `${addr}.audit`,
+      ),
+      this.readPerEntryArrayWithLegacyFallback<TxfFinalizationQueueEntry>(
+        `${addr}.finalizationQueue.`,
+        `${addr}.finalizationQueue`,
+      ),
     ]);
 
     return {
@@ -2096,6 +2197,8 @@ export class ProfileTokenStorageProvider
       invalid,
       mintOutbox,
       invalidatedNametags: invalidatedNametagsLegacy ?? [],
+      audit,
+      finalizationQueue,
     };
   }
 
