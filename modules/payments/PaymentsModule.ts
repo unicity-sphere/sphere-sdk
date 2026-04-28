@@ -73,6 +73,11 @@ import {
   requireLegacyCoinSlot,
   type LegacyCoinTransferRequest,
 } from './transfer/transfer-mode-shims';
+import {
+  sendConservativeUxf,
+  type ConservativeCommitResult,
+  type ConservativeSenderDeps,
+} from './transfer/conservative-sender';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes as fromHex } from '../../core/hex';
@@ -769,6 +774,21 @@ function findBestTokenVersion(
 // Configuration
 // =============================================================================
 
+/**
+ * UXF Inter-Wallet Transfer feature flags (T.2.D.1).
+ *
+ * Controls staged enablement of the UXF send/receive pipeline. Each
+ * sub-flag defaults OFF (legacy path), and individual flags can be
+ * flipped independently for surgical rollback. See `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md`
+ * §1 "Feature flag config (replaces single boolean)".
+ */
+export interface UxfTransferFeatures {
+  /** T.2.D.1 — when `true` AND `transferMode === 'conservative'`, route
+   *  the send through the UXF wire-format orchestrator. Default `false`
+   *  (legacy single-token TXF path). */
+  readonly senderUxf?: boolean;
+}
+
 export interface PaymentsModuleConfig {
   /** Auto-sync after operations */
   autoSync?: boolean;
@@ -782,6 +802,8 @@ export interface PaymentsModuleConfig {
   debug?: boolean;
   /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
   l1?: L1PaymentsModuleConfig | null;
+  /** UXF Inter-Wallet Transfer feature flags. Default: all OFF. */
+  features?: UxfTransferFeatures;
 }
 
 // =============================================================================
@@ -838,7 +860,14 @@ export interface PaymentsModuleDependencies {
 // =============================================================================
 
 export class PaymentsModule {
-  private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1'>;
+  private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1' | 'features'>;
+  /**
+   * UXF Inter-Wallet Transfer feature flags (T.2.D.1).
+   * Frozen at construction time. Defaults: every flag OFF — `senderUxf=false`
+   * means `send()` falls through to the legacy single-token TXF path
+   * regardless of `transferMode`.
+   */
+  private readonly features: Required<UxfTransferFeatures>;
   private deps: PaymentsModuleDependencies | null = null;
 
   /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
@@ -925,6 +954,12 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
+    // T.2.D.1 — feature flags (default OFF). Frozen so accidental mutation
+    // can't enable the UXF arm at runtime (rollback safety).
+    this.features = Object.freeze({
+      senderUxf: config?.features?.senderUxf ?? false,
+    });
+
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
     // Only skip if l1 is explicitly set to null. The module is lazy — it won't
     // open a WebSocket until the first L1 operation is performed.
@@ -944,8 +979,17 @@ export class PaymentsModule {
    *
    * @returns Resolved configuration with all defaults applied.
    */
-  getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1'> {
+  getConfig(): Omit<Required<PaymentsModuleConfig>, 'l1' | 'features'> {
     return this.moduleConfig;
+  }
+
+  /**
+   * Read-only accessor for the UXF Inter-Wallet Transfer feature flags
+   * (T.2.D.1). Useful for tests and downstream tooling that needs to
+   * verify the configured rollout state.
+   */
+  getFeatures(): Readonly<Required<UxfTransferFeatures>> {
+    return this.features;
   }
 
   /**
@@ -1276,6 +1320,15 @@ export class PaymentsModule {
     // TODO(T.2.B/T.2.C/T.5.B/T.7.A): consume the new TransferRequest
     // fields once the multi-asset validator and delivery resolver land.
     const internalTransferMode = coercePartialTransferRequestMode(originalRequest);
+
+    // T.2.D.1 — UXF conservative dispatcher (feature-flag-gated).
+    // When `features.senderUxf === true` AND the request is conservative-mode,
+    // route through the new UXF wire-format orchestrator. Otherwise fall
+    // through unchanged. Keep this BEFORE any state mutation so the legacy
+    // arm sees identical pre-conditions when the flag is off.
+    if (this.features.senderUxf && internalTransferMode === 'conservative') {
+      return this.dispatchUxfConservativeSend(originalRequest);
+    }
     // T.1.B.1 — `coinId` and `amount` are now optional on the public
     // `TransferRequest`. The legacy single-coin code path below
     // dereferences both fields ubiquitously; until T.2.B lands the §4.1
@@ -5564,6 +5617,237 @@ export class PaymentsModule {
       `No binding event found. The recipient must publish their identity first.`,
       'INVALID_RECIPIENT',
     );
+  }
+
+  // ===========================================================================
+  // T.2.D.1 — UXF conservative-mode dispatcher
+  // ===========================================================================
+
+  /**
+   * UXF conservative-mode send dispatcher (T.2.D.1, flag-gated).
+   *
+   * Reached only when `features.senderUxf === true` AND
+   * `transferMode === 'conservative'`. Builds the {@link
+   * ConservativeSenderDeps} surface from the module's existing private
+   * state (oracle, transport, identity, spend planner, SDK helpers) and
+   * delegates the §4.2 sender pipeline to {@link sendConservativeUxf}.
+   *
+   * **Stub outbox writer**: this dispatcher uses the existing legacy
+   * `saveToOutbox`/`removeFromOutbox` chain so existing tests keep
+   * their invariants. T.2.D.2 replaces this with the per-entry-key
+   * UXF outbox writer.
+   *
+   * Restrictions inherited from T.1.B.1's `requireLegacyCoinSlot`:
+   *  - The request MUST carry a primary `(coinId, amount)` slot. NFT-only
+   *    and multi-asset shapes are accepted by the public type but
+   *    rejected here until T.2.B's source-selection extension lands.
+   */
+  private async dispatchUxfConservativeSend(
+    originalRequest: TransferRequest,
+  ): Promise<TransferResult> {
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
+
+    // Resolve recipient + recipient address up front so the orchestrator
+    // gets a fully-typed PeerInfo. This also serves the same identity-
+    // binding/UI affordance the legacy arm provides.
+    const peerInfo: PeerInfo | null =
+      (await this.deps!.transport.resolve?.(request.recipient)) ?? null;
+    const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+    const recipientAddress = await this.resolveRecipientAddress(
+      request.recipient,
+      request.addressMode,
+      peerInfo,
+    );
+
+    // Synthesize a PeerInfo if `transport.resolve` returned null — the
+    // orchestrator only needs `transportPubkey` and (optional) `nametag`.
+    const recipient: PeerInfo = peerInfo ?? {
+      transportPubkey: recipientPubkey,
+      chainPubkey: '',
+      l1Address: '',
+      directAddress: '',
+      timestamp: Date.now(),
+    };
+
+    // Pre-build SDK helpers reused across all commitments. (Identical
+    // to the legacy conservative arm — single signing service +
+    // single state-transition client.)
+    const signingService = await this.createSigningService();
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+      | StateTransitionClient
+      | undefined;
+    if (!stClient) {
+      throw new SphereError(
+        'State transition client not available. Oracle provider must implement getStateTransitionClient()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!trustBase) {
+      throw new SphereError(
+        'Trust base not available. Oracle provider must implement getTrustBase()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    const onChainMessage = parseInvoiceMemoForOnChain(
+      request.memo,
+      request.invoiceRefundAddress,
+      request.invoiceContact,
+    );
+
+    const transferId = crypto.randomUUID();
+    const committedOnChainTokenIds = new Set<string>();
+
+    const deps: ConservativeSenderDeps = {
+      aggregator: this.deps!.oracle,
+      transport: this.deps!.transport,
+      tokenStorage: null,
+      identity: this.deps!.identity,
+      senderTransportPubkey: this.deps!.identity.chainPubkey,
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      // T.2.D.1 keeps publishToIpfs unwired; CID-bound delivery is
+      // T.4.A's responsibility. Tests inject a real publisher.
+      availableSources: () => Array.from(this.tokens.values()),
+      transferId,
+      selectSources: async ({ request: req }) => {
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId,
+        );
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+        const planResult = this.spendPlanner.planSend(
+          { amount: req.amount ?? '0', coinId: request.coinId },
+          parsedPool,
+          this.reservationLedger,
+          this.spendQueue,
+          transferId,
+          pendingChangeAmount,
+        );
+        let splitPlan: SplitPlan;
+        if (planResult === 'queued') {
+          const queueResult = await this.spendQueue.waitForEntry(transferId);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
+        const out: Token[] = splitPlan.tokensToTransferDirectly.map(
+          (t) => t.uiToken,
+        );
+        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+        // Mark sources as transferring + persist (matches legacy semantics).
+        for (const tok of out) {
+          tok.status = 'transferring';
+          this.tokens.set(tok.id, tok);
+          this.parsedTokenCache.delete(tok.id);
+        }
+        await this.save();
+        return out;
+      },
+      preflightOptions: () => ({
+        // T.2.A wraps the existing aggregator path; for the dispatcher
+        // we fall through with a noop extractor since the legacy
+        // single-coin path's tokens are always finalized at selection.
+        // T.2.D.2 + T.5 wires the real chain extractor. The orchestrator
+        // accepts an empty chain → no-op preflight.
+        resolveRequestId: () => {
+          throw new SphereError(
+            'preflight resolveRequestId invoked unexpectedly in T.2.D.1 dispatcher',
+            'INVALID_CONFIG',
+          );
+        },
+        extractPendingChain: () => [],
+      }),
+      commitSources: async ({ sources }) => {
+        const out: ConservativeCommitResult[] = [];
+        for (const token of sources) {
+          // The legacy arm splits-then-mints for the source-to-be-split,
+          // and direct-transfers for everything else. The orchestrator's
+          // SDK-coupling boundary is THIS callback — we re-implement the
+          // direct-conservative path here verbatim to match existing
+          // behavior. Split-mode is currently unsupported by the
+          // orchestrator (T.2.D.2 widens it via OutboxWriter).
+          const commitment = await this.createSdkCommitment(
+            token,
+            recipientAddress,
+            signingService,
+            onChainMessage,
+          );
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (
+            submitResponse.status !== 'SUCCESS' &&
+            submitResponse.status !== 'REQUEST_ID_EXISTS'
+          ) {
+            throw new SphereError(
+              `Transfer commitment failed: ${submitResponse.status}`,
+              'TRANSFER_FAILED',
+            );
+          }
+          committedOnChainTokenIds.add(token.id);
+          const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+          const transferTx = commitment.toTransaction(inclusionProof);
+          // Reconstruct the recipient-token JSON shape (sourceToken +
+          // post-transfer transition) for ingestion into the bundle.
+          const tokenJson = token.sdkData
+            ? (typeof token.sdkData === 'string' ? JSON.parse(token.sdkData) : token.sdkData)
+            : null;
+          if (!tokenJson || typeof tokenJson !== 'object') {
+            throw new SphereError(
+              `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
+              'TRANSFER_FAILED',
+            );
+          }
+          const recipientTokenJson = {
+            ...(tokenJson as Record<string, unknown>),
+            transactions: [
+              ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
+              transferTx.toJSON(),
+            ],
+          };
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex =
+            requestIdBytes instanceof Uint8Array
+              ? Array.from(requestIdBytes)
+                  .map((b) => b.toString(16).padStart(2, '0'))
+                  .join('')
+              : String(requestIdBytes);
+          out.push({
+            sourceTokenId: token.id,
+            method: 'direct',
+            requestIdHex,
+            recipientTokenJson,
+          });
+          await this.removeToken(token.id, transferId);
+        }
+        return out;
+      },
+      outbox: {
+        save: async (entry, recipientPubkeyParam) => {
+          // Adapt the synthetic legacy OutboxEntry into the existing
+          // outbox chain by wrapping it in the shape `saveToOutbox`
+          // already accepts (TransferResult). The orchestrator's stub
+          // entry only carries the minimum fields the loader requires.
+          const synthResult: TransferResult = {
+            id: entry.id,
+            status: 'submitted',
+            tokens: [],
+            tokenTransfers: [],
+          };
+          await this.saveToOutbox(synthResult, recipientPubkeyParam);
+        },
+        remove: async (id) => {
+          await this.removeFromOutbox(id);
+        },
+      },
+    };
+
+    return sendConservativeUxf(originalRequest, recipient, deps);
   }
 
   /**
