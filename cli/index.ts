@@ -30,7 +30,7 @@ import { TokenValidator } from '../validation/token-validator';
 import { tokenToTxf } from '../serialization/txf-serializer';
 import type { NetworkType } from '../constants';
 import type { TransportProvider } from '../transport/transport-provider';
-import type { ProviderStatus } from '../types';
+import type { ProviderStatus, TransferMode } from '../types';
 
 const args = process.argv.slice(2);
 // Wave F.5/F.9/F.10/F.11: strip GLOBAL flags from the args array so the
@@ -2809,7 +2809,11 @@ async function main() {
           console.error('Cannot use both --instant and --conservative');
           process.exit(1);
         }
-        const transferMode = forceConservative ? 'conservative' as const : 'instant' as const;
+        // T.1.B.1 — explicit `: TransferMode` annotation per Plan §T.1.B.1.
+        // The CLI only ever produces public TransferMode values; the
+        // PaymentsModule.send() shim narrows to InternalTransferMode and
+        // rejects any future-protocol values (e.g., `'txf'` pre-T.7.A).
+        const transferMode: TransferMode = forceConservative ? 'conservative' : 'instant';
 
         // Initialize Sphere first so TokenRegistry is loaded
         const noSyncSend = args.includes('--no-sync');

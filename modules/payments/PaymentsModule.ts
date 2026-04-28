@@ -68,6 +68,11 @@ import {
 import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
+import {
+  coercePartialTransferRequestMode,
+  requireLegacyCoinSlot,
+  type LegacyCoinTransferRequest,
+} from './transfer/transfer-mode-shims';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes as fromHex } from '../../core/hex';
@@ -1255,10 +1260,32 @@ export class PaymentsModule {
    *   to pass an already-acquired reservation, skipping the planSend() critical section.
    */
   async send(
-    request: TransferRequest,
+    originalRequest: TransferRequest,
     internal?: { existingReservationId?: string; existingSplitPlan?: SplitPlan },
   ): Promise<TransferResult> {
     this.ensureInitialized();
+
+    // T.1.B.1 — narrow public TransferMode to InternalTransferMode and reject
+    // any future-protocol value (notably `'txf'`) with the typed
+    // `UNSUPPORTED_TRANSFER_MODE` error BEFORE we mutate any state. The
+    // shim is the SDK's only runtime narrow; routing the legacy TXF arm
+    // is owned by T.7.A. New TransferRequest fields (`additionalAssets`,
+    // `delivery`, `allowPendingTokens`, `confirmNftPending`,
+    // `txfFinalization`) are accepted but UNUSED at this wave — the
+    // legacy code path below remains the only routing branch.
+    // TODO(T.2.B/T.2.C/T.5.B/T.7.A): consume the new TransferRequest
+    // fields once the multi-asset validator and delivery resolver land.
+    const internalTransferMode = coercePartialTransferRequestMode(originalRequest);
+    // T.1.B.1 — `coinId` and `amount` are now optional on the public
+    // `TransferRequest`. The legacy single-coin code path below
+    // dereferences both fields ubiquitously; until T.2.B lands the §4.1
+    // step 1 multi-asset validator that picks the right routing arm,
+    // this shim verifies the primary coin slot is present and rebinds
+    // `request` to a narrowed `LegacyCoinTransferRequest` (a branded
+    // alias with `coinId: string; amount: string;`). NFT-only and
+    // multi-asset shapes are accepted by the public type but rejected
+    // here — they will become routable once T.2.B lands.
+    let request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
 
     // Track this send() so switchToAddress() waits for it via waitForPendingOperations().
     // Without this, the user can switch addresses while send() is still running,
@@ -1381,7 +1408,13 @@ export class PaymentsModule {
       const recipientNametag = peerInfo?.nametag
         || (request.recipient.startsWith('@') ? request.recipient.slice(1) : undefined);
 
-      const transferMode = request.transferMode ?? 'instant';
+      // T.1.B.1 — `internalTransferMode` was narrowed at entry (line ~1273)
+      // by the per-call-site shim. By the time we reach this branch the
+      // value is one of `'instant' | 'conservative'` (the `'txf'` arm
+      // throws synchronously in the shim until T.7.A wires it). Keep the
+      // local `transferMode` name for minimal diff against the legacy
+      // routing logic below.
+      const transferMode: 'instant' | 'conservative' = internalTransferMode === 'conservative' ? 'conservative' : 'instant';
 
       const onChainMessage = parseInvoiceMemoForOnChain(
         request.memo,
@@ -1834,10 +1867,19 @@ export class PaymentsModule {
    * @returns InstantSplitResult with timing info
    */
   async sendInstant(
-    request: TransferRequest,
+    originalRequest: TransferRequest,
     options?: InstantSplitOptions
   ): Promise<InstantSplitResult> {
     this.ensureInitialized();
+
+    // T.1.B.1 — narrow the optional-on-public-API `coinId` / `amount` to a
+    // required-string `LegacyCoinTransferRequest`. NFT-only and
+    // multi-asset shapes are accepted by the public type but not yet
+    // routable on this entry point (awaits T.2.B). The narrow runs
+    // BEFORE any state mutation. Mode narrowing is skipped here because
+    // `sendInstant()` is itself a routing target of `'instant'` mode and
+    // the public-mode → internal-mode shim has run upstream.
+    let request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
 
     const startTime = performance.now();
 
