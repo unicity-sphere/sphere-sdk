@@ -1884,28 +1884,13 @@ export class SwapModule {
         }
       ).getTokenIdsForInvoice?.(swap.payoutInvoiceId) ?? new Set<string>();
 
-      // Fail-CLOSED when we cannot prove the invalid tokens are unrelated.
-      // An empty payoutTokenIds means either:
-      //   (a) the invoice has no transfers yet (no tokens to verify), in
-      //       which case we shouldn't be here — we'd have failed coverage
-      //       earlier, OR
-      //   (b) tokenInvoiceMap is missing entries (orphan-buffered transfers
-      //       on a previous session before the rebuild fix landed; or
-      //       cache-hit synthetic-ledger entries that don't populate the
-      //       reverse map).
-      // Either way, we cannot distinguish "unrelated invalid" from "this
-      // invoice's invalid token", so the only safe response is to return
-      // unverified and let the SDK's retry path try again once the wallet
-      // catches up. The previous "filter to empty → pass" was a fail-open
-      // that masked a real verification gap.
-      if (payoutTokenIds.size === 0) {
-        logger.warn(
-          LOG_TAG,
-          `verifyPayout for ${swapId.slice(0, 12)}: validate() found ${validationResult.invalid.length} invalid token(s) but payout-invoice token set is empty — cannot prove unrelated. Returning unverified.`,
-        );
-        return returnFalse();
-      }
-
+      // Filter the validate-invalid set to tokens that are linked to THIS
+      // payout invoice via tokenInvoiceMap (populated by both
+      // _processTokenTransactions's on-chain path AND the synthetic /
+      // orphan-buffer paths after the round-1/2/3 fixes). Unrelated
+      // invalids — typically the now-spent original UCT consumed by an
+      // earlier deposit split, or unrelated incoming transfers in flight —
+      // must not block this swap's verification.
       const relevantInvalid = validationResult.invalid.filter((t) =>
         payoutTokenIds.has(t.id),
       );
@@ -1916,7 +1901,6 @@ export class SwapModule {
         );
         return returnFalse();
       }
-      // Unrelated invalids are NOT a swap-blocking concern.
       logger.debug(
         LOG_TAG,
         `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} unrelated invalid token(s) ignored (not linked to this payout invoice)`,
