@@ -58,6 +58,7 @@ import {
 } from '../types/uxf-outbox.js';
 import { decryptProfileValue, encryptProfileValue } from './encryption.js';
 import { Lamport } from './lamport.js';
+import { assertTransition } from './outbox-state-machine.js';
 import type { ProfileDatabase } from './types.js';
 
 // =============================================================================
@@ -222,6 +223,27 @@ export class OutboxWriter {
         `OutboxWriter.update: mutator must not change entry.id (got "${next.id}", expected "${id}")`,
         'VALIDATION_ERROR',
       );
+    }
+
+    // T.6.C — gate every status transition against the canonical §7.0
+    // table. Self-loops (status unchanged) are skipped so callers can use
+    // `update()` to mutate non-status fields (e.g. retry counters, error)
+    // without forcing a bogus `from===to` arc through the validator.
+    if (next.status !== existing.entry.status) {
+      assertTransition({
+        from: existing.entry.status,
+        to: next.status,
+        // The override flag is sticky (set-OR per §7.1) — a true on the
+        // NEW entry permits the `failed-permanent → finalizing` arc. The
+        // PREV entry's flag is irrelevant: the override is "applied" by
+        // the same write that performs the transition.
+        overrideApplied: next.overrideApplied === true,
+        // Per-status dual-write arcs are not currently in the table; the
+        // W43 schema-mode arcs are validated separately by
+        // `assertDualWriteArc()`. Pass `false` so any future spec
+        // revision adding a status-level dual-write row defaults safely.
+        dualWriteEnabled: false,
+      });
     }
 
     // Re-route through write() so the Lamport bump rule and
