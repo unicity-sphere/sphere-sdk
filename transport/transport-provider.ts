@@ -4,6 +4,7 @@
  */
 
 import type { BaseProvider, FullIdentity, ComposingIndicator } from '../types';
+import type { UxfTransferPayload } from '../types/uxf-transfer';
 
 // =============================================================================
 // Transport Provider Interface
@@ -364,20 +365,30 @@ export type MessageHandler = (message: IncomingMessage) => void;
 // Token Transfer Types
 // =============================================================================
 
-export interface TokenTransferPayload {
-  /** Serialized token data */
-  token: string;
-  /** Inclusion proof */
-  proof: unknown;
-  /** Optional memo */
-  memo?: string;
-  /** Sender info */
-  sender?: {
-    /** Transport-specific pubkey */
-    transportPubkey: string;
-    nametag?: string;
-  };
-}
+/**
+ * Wire payload for the Nostr `TOKEN_TRANSFER` event (kind 31113).
+ *
+ * Shape-agnostic at the transport layer — this is a tagged union of:
+ *
+ *  - {@link UxfTransferPayloadCar} (`kind: 'uxf-car'`) — inline CAR via base64
+ *  - {@link UxfTransferPayloadCid} (`kind: 'uxf-cid'`) — CID-by-reference
+ *  - {@link LegacyTokenTransferPayload} — one of four pre-UXF shapes
+ *    (Sphere TXF `{sourceToken, transferTx}`, V6 `COMBINED_TRANSFER`,
+ *    V5/V4 `INSTANT_SPLIT`, SDK `{token, proof}`).
+ *
+ * The transport layer SERIALIZES whichever shape it is handed (UXF via
+ * the canonical encoder from {@link "../uxf/transfer-payload"}, legacy via
+ * pass-through `JSON.stringify`), and DELIVERS whichever shape arrives over
+ * the wire to {@link TokenTransferHandler}. Shape discrimination is the
+ * receiver/handler's responsibility — see `PaymentsModule` (T.7.A).
+ *
+ * Re-exported from `types/uxf-transfer` (T.1.A) so all transport callers
+ * share one source of truth for the union.
+ *
+ * @see UxfTransferPayload
+ * @see LegacyTokenTransferPayload
+ */
+export type TokenTransferPayload = UxfTransferPayload;
 
 export interface IncomingTokenTransfer {
   id: string;
