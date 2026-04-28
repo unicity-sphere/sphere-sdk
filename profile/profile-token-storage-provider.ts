@@ -1670,12 +1670,21 @@ export class ProfileTokenStorageProvider
     }
 
     // Apply per-entry writes for each list.
+    //
+    // T.6.A: the outbox prefix is shared between legacy `TxfOutboxEntry`
+    // (this writer's slot) and new `UxfTransferOutboxEntry` (owned by
+    // `OutboxWriter` from `profile/outbox-writer.ts`). The legacy
+    // writer's diff MUST NOT tombstone new-shape entries — they are
+    // never in the legacy `liveOutbox` map. Pass `skipForeignSchema:
+    // true` so the diff probes each candidate-for-tombstone and skips
+    // any value carrying `_schemaVersion: 'uxf-1'`.
     await this.applyPerEntryDiff(
       `${addr}.outbox.`,
       liveOutbox,
       existingOutboxKeys,
       now,
       TOMBSTONE_RETENTION_MS,
+      /* skipForeignSchema */ true,
     );
     await this.applyPerEntryDiff(
       `${addr}.invalid.`,
@@ -1768,6 +1777,11 @@ export class ProfileTokenStorageProvider
    *   - For each on-disk entryId not in the live set, write a
    *     tombstone (or delete the entry+tombstone if its tombstone
    *     is older than retention).
+   *
+   * T.6.A: when `skipForeignSchema` is `true`, an existing value
+   * carrying `_schemaVersion: 'uxf-1'` is NOT tombstoned by this writer
+   * — it is owned by `OutboxWriter` and shares the same prefix. Used by
+   * the outbox slot only; other slots pass `false` (the default).
    */
   private async applyPerEntryDiff<T>(
     prefix: string,
@@ -1775,6 +1789,7 @@ export class ProfileTokenStorageProvider
     existingKeys: Map<string, string>,
     now: number,
     retentionMs: number,
+    skipForeignSchema: boolean = false,
   ): Promise<void> {
     // Live entries: write each.
     for (const [id, entry] of liveById) {
@@ -1800,6 +1815,7 @@ export class ProfileTokenStorageProvider
       }
       let isTombstone = false;
       let deletedAt = 0;
+      let isForeignSchema = false;
       if (existingRaw !== null) {
         try {
           const parsed = JSON.parse(existingRaw) as unknown;
@@ -1812,10 +1828,23 @@ export class ProfileTokenStorageProvider
             isTombstone = true;
             const da = (parsed as { deletedAt?: unknown }).deletedAt;
             deletedAt = typeof da === 'number' ? da : 0;
+          } else if (
+            skipForeignSchema &&
+            parsed !== null &&
+            typeof parsed === 'object' &&
+            (parsed as Record<string, unknown>)._schemaVersion === 'uxf-1'
+          ) {
+            isForeignSchema = true;
           }
         } catch {
           /* corrupt — overwrite with fresh tombstone */
         }
+      }
+      if (isForeignSchema) {
+        // T.6.A: foreign-schema entry (UXF outbox writer's slot) at
+        // the same prefix. Do NOT tombstone — it's owned by
+        // `OutboxWriter`. Skip silently.
+        continue;
       }
       if (isTombstone) {
         // GC if old enough.
@@ -2162,7 +2191,16 @@ export class ProfileTokenStorageProvider
       audit,
       finalizationQueue,
     ] = await Promise.all([
-      this.readPerEntryArrayWithLegacyFallback<TxfOutboxEntry>(
+      // T.6.A: route outbox reads through a shape-aware variant. The
+      // new `UxfTransferOutboxEntry` shape (carrying `_schemaVersion:
+      // 'uxf-1'`) lives at the same per-entry-key prefix but is
+      // structurally distinct from the legacy `TxfOutboxEntry`. The
+      // legacy `OperationalState.outbox` slot must NOT be polluted with
+      // new-shape entries — those are read via `OutboxWriter.readAll()`
+      // from `profile/outbox-writer.ts`. The filter below routes by
+      // `_schemaVersion` presence: legacy entries (no field) populate
+      // the legacy slot, new-shape entries are skipped here.
+      this.readPerEntryArrayLegacyOnly<TxfOutboxEntry>(
         `${addr}.outbox.`,
         `${addr}.outbox`,
       ),
@@ -2237,6 +2275,60 @@ export class ProfileTokenStorageProvider
       const decoded = await this.decodePerEntryValue<T>(key);
       if (decoded === null) continue; // tombstone or corrupt — skip
       out.push(decoded);
+    }
+    return out;
+  }
+
+  /**
+   * T.6.A: shape-aware variant of {@link readPerEntryArrayWithLegacyFallback}
+   * for the outbox prefix. The outbox per-entry-key namespace carries TWO
+   * distinct on-disk shapes during the migration window:
+   *
+   *   - **legacy** `TxfOutboxEntry` (pre-T.6.A, no `_schemaVersion`)
+   *   - **new** `UxfTransferOutboxEntry` (T.6.A, `_schemaVersion: 'uxf-1'`)
+   *
+   * The legacy-only reader filters out new-shape entries so the
+   * {@link OperationalState.outbox} slot continues to carry exactly the
+   * shape its consumers expect. New-shape entries are read via
+   * `OutboxWriter.readAll()` (`profile/outbox-writer.ts`) on a separate
+   * code path.
+   *
+   * The discriminator is presence of the literal `_schemaVersion: 'uxf-1'`.
+   * Any other value (missing field, unrelated string) is treated as
+   * legacy-shape — preserves backward compatibility for partial /
+   * pre-migration entries.
+   */
+  private async readPerEntryArrayLegacyOnly<T>(
+    prefix: string,
+    legacyBlobKey: string,
+  ): Promise<T[]> {
+    let entries: Map<string, Uint8Array>;
+    try {
+      entries = await this.db.all(prefix);
+    } catch (err) {
+      this.log(`per-entry read failed for prefix "${prefix}": ${err instanceof Error ? err.message : String(err)}`);
+      const legacy = await this.readProfileKeyJson<T[]>(legacyBlobKey);
+      return legacy ?? [];
+    }
+    if (entries.size === 0) {
+      const legacy = await this.readProfileKeyJson<T[]>(legacyBlobKey);
+      return legacy ?? [];
+    }
+    const out: T[] = [];
+    const sortedKeys = [...entries.keys()].sort();
+    for (const key of sortedKeys) {
+      const decoded = await this.decodePerEntryValue<unknown>(key);
+      if (decoded === null) continue; // tombstone or corrupt
+      // Skip new-shape (`uxf-1`) entries — they are owned by the
+      // T.6.A `OutboxWriter` and read separately.
+      if (
+        decoded !== null &&
+        typeof decoded === 'object' &&
+        (decoded as Record<string, unknown>)._schemaVersion === 'uxf-1'
+      ) {
+        continue;
+      }
+      out.push(decoded as T);
     }
     return out;
   }

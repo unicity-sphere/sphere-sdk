@@ -139,7 +139,15 @@ export type SphereErrorCode =
    *  from being held indefinitely under aggregator stalls (W35). The lock
    *  is released as part of throwing this error so the next caller may
    *  proceed. See profile/per-token-mutex.ts and §5.5 step 9. */
-  | 'LOCK_BOUNDED_HOLD_FIRED';
+  | 'LOCK_BOUNDED_HOLD_FIRED'
+  // UXF Transfer / outbox CRDT (T.6.A) — §7 bundle-grained outbox writer.
+  /** `OutboxWriter.update(id, ...)` called with an `id` that has no live
+   *  UXF outbox entry — either the key never existed, or the prior value
+   *  is a tombstone, or the entry is in the legacy shape (which the
+   *  writer does not mutate). Callers that need to upsert should call
+   *  `OutboxWriter.write(...)` instead of update. See profile/outbox-writer.ts
+   *  and UXF-TRANSFER-PROTOCOL §7. */
+  | 'OUTBOX_ENTRY_NOT_FOUND';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
