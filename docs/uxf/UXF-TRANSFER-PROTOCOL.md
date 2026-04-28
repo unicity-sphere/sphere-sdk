@@ -671,7 +671,15 @@ A periodic re-scan (out of scope here, deferred per §12.2) MAY transition `audi
 
 **Promotion semantics**:
 - Promotion sets `promotedToManifestRef` on the audit entry to the new manifest entry's `ContentHash` and MUST NOT delete the audit entry.
-- The corresponding active-pool manifest entry MUST set `audit_promoted_from: { auditKey: ${addr}.audit.${tokenId} }` for back-reference. This is mandatory for forensic traceability — it is set on the manifest entry whether the entry is being created fresh OR an existing entry is being updated by promotion. If a later normal §5.3 receive arrives for the same tokenId after promotion, the existing entry's `audit_promoted_from` is preserved (merged via §5.3 [D] conflict-resolution which retains historical metadata).
+- The corresponding active-pool manifest entry MUST set `audit_promoted_from: { auditKey: ${addr}.audit.${tokenId} }` for back-reference. This is mandatory for forensic traceability — it is set on the manifest entry whether the entry is being created fresh OR an existing entry is being updated by promotion.
+
+**Manifest metadata preservation across §5.3 [D] merges (normative)**: when §5.3 [D] resolves a conflict between two manifest entries for the same `tokenId` (whether via union-merge or CONFLICTING tie-break), the following metadata fields are preserved on the post-merge entry by **set-OR / max-merge** semantics regardless of which side "wins" the chain merge:
+- `audit_promoted_from` — preserved if either side has it set (forensic traceability).
+- `splitParent` — preserved if either side has it set; if both have it set with different values, that's a defect (a token cannot have two different parents); log warning and use the lexicographically-smaller value.
+- `conflictingHeads[]` — union of both sides' lists, deduplicated.
+- `lamport` — max of both sides (per §7.1 invariants).
+
+Other manifest fields (chain content, current state, status) follow the normal [D] resolution rules. Future spec extensions adding new metadata fields MUST classify each new field as either "preserved" (set-OR / max-merge) or "chain-content" (resolved per [D]).
 
 **Retention**:
 - `_invalid`: indefinite by default; user can manually `cleanupInventory()` to clear.
@@ -736,7 +744,16 @@ The finalization worker (see §6) processes each entry. For each pending tx:
 
    **Backoff schedule**: poll at 30s, 60s, 120s, 240s, then every 5 min until deadline. With `POLLING_WINDOW = 30 min`, this gives roughly 8 poll attempts within the window — comfortably above `MIN_POLL_ATTEMPTS`.
 
-   **Configuration validity rule (normative)**: `MIN_POLL_ATTEMPTS × first-backoff-interval` MUST NOT exceed `POLLING_WINDOW`, otherwise the deadline can never fire and the worker would poll forever. Implementations MUST validate this at startup and refuse to start if violated. As a hard safety net regardless of configuration, the worker SHALL also stop after `2 × POLLING_WINDOW` wall-clock time, declaring `oracle-rejected` even if MIN_POLL_ATTEMPTS was not reached — termination is guaranteed.
+   **Configuration validity rule (normative)**: the **cumulative** backoff schedule for the first MIN_POLL_ATTEMPTS polls MUST fit within POLLING_WINDOW:
+   ```
+   cumulativeBackoff = sum(backoffIntervals[0..MIN_POLL_ATTEMPTS-1])
+   REQUIRE cumulativeBackoff ≤ POLLING_WINDOW
+   ```
+   For the default schedule (30s, 60s, 120s, 240s, 300s, 300s, …) and `MIN_POLL_ATTEMPTS=5`, cumulativeBackoff = 30+60+120+240+300 = **750s = 12.5 min**. So `POLLING_WINDOW` MUST be ≥ 12.5 min. The 30-min default leaves comfortable headroom.
+
+   Implementations MUST validate this at startup and refuse to start if violated. As a hard safety net regardless of configuration, the worker SHALL also stop after `2 × POLLING_WINDOW` wall-clock time, declaring `oracle-rejected` even if MIN_POLL_ATTEMPTS was not reached — termination is guaranteed.
+
+   **Transient errors do NOT count toward MIN_POLL_ATTEMPTS**: only polls that return a verifiable proof-status (OK, PATH_NOT_INCLUDED, PATH_INVALID, NOT_AUTHENTICATED) advance the attempt counter. Network errors / 5xx responses are retried but not counted — otherwise an aggressive transient-error condition could prematurely satisfy MIN_POLL_ATTEMPTS without actually observing aggregator state.
 
 7. **On hard-fail of any queue entry** (steps 3, 4, 6 terminal hard-fail paths):
    - Mark the queue entry hard-failed with the canonical `DispositionReason`.
@@ -760,9 +777,10 @@ The finalization worker (see §6) processes each entry. For each pending tx:
 
    **Per-tokenId lock requirement**: §5.3 ingest paths and §5.5 step 9 finalization paths share a per-tokenId mutex. This prevents a race where a queue-drain is finalizing a token to `valid` while a concurrent §5.3 ingest of a divergent bundle would have produced `CONFLICTING` — without the lock, two workers could both observe an intermediate state and reach contradictory final dispositions. Implementations MAY use OrbitDB-level optimistic concurrency (compare-and-swap on the manifest entry's content hash) or an in-process lock; the choice is implementation-defined but the exclusion property is normative.
 
-   **Lock ordering for cascade (deadlock prevention)**: §6.1.1 cascade walks parent → children. To prevent AB-BA deadlocks with worker threads holding child locks while needing parent locks, the cascade rule is:
+   **Lock ordering for cascade (deadlock prevention + parent-flip protection)**: §6.1.1 cascade walks parent → children. To prevent AB-BA deadlocks with worker threads holding child locks while needing parent locks, the cascade rule is:
    - The cascading worker acquires the **parent's** lock first, identifies the children, **releases the parent's lock**, then acquires each child's lock individually (in lexicographic order of `tokenId`) to apply the cascaded `parent-rejected` marker via compare-and-swap.
-   - Implementations using compare-and-swap on manifest content hashes (rather than explicit locks) avoid this concern entirely — each child write is atomic on its own manifest entry; conflicts surface as CAS failures and retry.
+   - **Parent-flip protection (mandatory)**: under each child's lock — and inside the CAS payload computation for CAS-based implementations — the cascade worker MUST re-read the parent's manifest entry and verify the parent is still in `_invalid` with `status='invalid'`. If the parent has flipped to `valid` (e.g., a concurrent `importInclusionProof()` override resolved the parent), the cascade for that child is aborted (no-op). This prevents a stale cascade from invalidating children whose parent is no longer rejected.
+   - Implementations using compare-and-swap on manifest content hashes (rather than explicit locks) avoid the deadlock concern entirely — each child write is atomic on its own manifest entry; conflicts surface as CAS failures and retry. The parent-flip protection still applies (re-read parent inside the CAS payload computation).
 
 **Tombstone retention**: tombstoned manifest CIDs are retained for `TOMBSTONE_RETENTION_DAYS` (default 30) after the canonical CID has been stable. After that, the tombstone is GC'd to prevent unbounded manifest growth in long-lived wallets.
 
@@ -904,6 +922,8 @@ interface RevalidationResult {
 - If the child fails [B]/[C]/[E] for reasons unrelated to parent: leave it in `_invalid` with reason updated to the new disposition (e.g., 'off-record-spend' if isSpent=true now).
 
 **Transitive cascade reversal**: cascades can be transitive (A → B → C → D, with A's failure invalidating B, B's invalidation cascading to C, etc.). `revalidateCascadedChildren()` is **transitive by default**: when it successfully revalidates a child, it recursively calls itself on the revalidated child's `tokenId` to revalidate any grandchildren. Operators call the function once on the original parent; the SDK walks the dependency tree.
+
+**Cycle defense (defensive)**: token chains are append-only DAGs (parents are predecessors, children are successors), so cycles cannot arise from honest chain construction. However, `splitParent` is a manifest-side annotation that could in principle be corrupted. The implementation MUST maintain a visited set during transitive recursion and bound depth at `MAX_CHAIN_DEPTH` (default 64, matching §5.5 chain-depth bound). On detected cycle or depth-overrun, the recursion stops and returns the partial revalidation result with a `cycle-detected` warning.
 
 This is an explicit operator action; the SDK does not auto-cascade-reverse on parent override.
 
@@ -1115,6 +1135,8 @@ The outbox is persisted in OrbitDB. OrbitDB has eventual-consistency (CRDT) sema
 - Implementations that fail to follow this rule will see non-deterministic merge outcomes — the override path in §7.0 in particular depends on the override's Lamport being strictly greater than the pre-override `failed-permanent`'s Lamport.
 
 **Override stickiness**: when `payments.importInclusionProof()` (§6.3) transitions `failed-permanent → finalizing`, the writer also sets a sticky boolean flag `overrideApplied: true` on the entry. This flag survives all subsequent merges (set-OR semantics: any replica having `overrideApplied === true` causes the merged entry to have it). When `overrideApplied === true`, the active-state's `finalizing` wins against any replica's `failed-permanent` regardless of Lamport — this prevents the override being undone by a stale replica with a higher Lamport for unrelated reasons.
+
+**Dual-override case** (informational): if both replicas independently apply `importInclusionProof()` with possibly different proofs, both end up in `finalizing` with `overrideApplied = true`. The status partition rule "both active" applies → lattice + Lamport tie-break. The merged `outstandingRequestIds` and `completedRequestIds` sets reflect both override paths' updates per the set-merge rules. If the imported proofs are valid for the same requestId, they are byte-identical (per §6.3 idempotency canonicalization) and the merge is harmless. If they disagree (different requestIds, e.g., different unfinalized txs in the chain), the §5.5 finalization queue handles the divergence by resolving each requestId against aggregator-anchored truth — the protocol converges naturally.
 
 **Conflict resolution rules under replica merge:**
 
