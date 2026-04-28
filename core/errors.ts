@@ -105,7 +105,21 @@ export type SphereErrorCode =
   | 'SWAP_LIMIT_EXCEEDED'
   | 'SWAP_ALREADY_INITIALIZED'
   | 'SWAP_MODULE_DESTROYED'
-  | 'SWAP_NOT_INITIALIZED';
+  | 'SWAP_NOT_INITIALIZED'
+  // UXF Transfer / CRDT primitives (T.1.F) — §5.5 step 9, §7.1 Lamport invariants
+  /** Observed remote Lamport > 2 × max(localKnownLamports). Defends against
+   *  a malicious/buggy replica publishing an absurdly large Lamport (e.g.
+   *  near `2^53`) to force everyone past JS safe-integer range. The bound
+   *  is generous enough that legitimate divergence (e.g. one replica that
+   *  has been offline) never trips, but rejects clearly-runaway values
+   *  (W39). See profile/lamport.ts and §7.1 invariants. */
+  | 'LAMPORT_BOUND_VIOLATION'
+  /** `PerTokenMutex` strategy `'bounded-hold'` exceeded its `MAX_LOCK_HOLD_MS`
+   *  (default 5000ms) and aborted the current acquire to prevent the lock
+   *  from being held indefinitely under aggregator stalls (W35). The lock
+   *  is released as part of throwing this error so the next caller may
+   *  proceed. See profile/per-token-mutex.ts and §5.5 step 9. */
+  | 'LOCK_BOUNDED_HOLD_FIRED';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

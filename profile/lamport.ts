@@ -1,0 +1,113 @@
+/**
+ * Lamport logical clock — UXF Transfer Protocol §7.1 invariants.
+ *
+ * Used by the outbox CRDT (`UxfTransferOutboxEntry.lamport`) and the
+ * manifest writers to obtain deterministic merge tie-breaks across
+ * eventually-consistent OrbitDB replicas (e.g. desktop wallet vs.
+ * browser wallet for the same identity).
+ *
+ * **Invariants (normative)** — see `docs/uxf/UXF-TRANSFER-PROTOCOL.md` §7.1:
+ * - On every local write to an entry, the writer reads the current
+ *   `lamport` value AND the maximum `lamport` of any concurrently-observed
+ *   remote replica's view of the same entry, then writes
+ *   `lamport := max(local, observedRemotes) + 1`.
+ * - On merge, `lamport := max(replicaA.lamport, replicaB.lamport)`.
+ *
+ * **Bounds defense (W39)**: a malicious or buggy replica could publish a
+ * Lamport like `2^53` to force every honest replica past the JS
+ * safe-integer range, breaking comparisons. We reject any observed remote
+ * Lamport `> 2 × max(localKnownLamports, 1)` with `LAMPORT_BOUND_VIOLATION`.
+ * The factor-of-two slack accommodates legitimate divergence (e.g. one
+ * replica that has been offline writing locally for some time) while
+ * ruling out runaway values. The `Math.max(_, 1)` floor lets boot accept
+ * a reasonable first-remote Lamport (e.g. observing remote=1 from
+ * local=0 is fine).
+ *
+ * **Per-instance scoping**: this class holds NO module-level state. Each
+ * `Sphere` instance constructs its own `Lamport` so that destroy-recreate
+ * cycles do not bleed Lamport state across wallet incarnations.
+ */
+
+import { SphereError } from '../core/errors';
+
+/**
+ * Per-replica Lamport clock. Single-threaded (JS event-loop) usage only;
+ * the current value is mutated synchronously inside `bumpFor`.
+ */
+export class Lamport {
+  /** The most-recently written Lamport value for the entry this clock
+   *  tracks. Mutated by `bumpFor`; readable via `getCurrent`. */
+  private current: number;
+
+  /**
+   * @param initial Starting Lamport value. Default `0`. Pass the value
+   *   read from storage when re-hydrating a clock for an existing entry.
+   */
+  constructor(initial: number = 0) {
+    if (!Number.isFinite(initial) || initial < 0 || !Number.isInteger(initial)) {
+      throw new SphereError(
+        `Lamport initial must be a non-negative finite integer; got ${String(initial)}`,
+        'VALIDATION_ERROR',
+      );
+    }
+    this.current = initial;
+  }
+
+  /**
+   * CRDT merge rule: `max(a, b)`. Pure / static.
+   */
+  static merge(a: number, b: number): number {
+    return Math.max(a, b);
+  }
+
+  /**
+   * Compute the Lamport value for the next local write, given the set of
+   * remote Lamport values currently observed for the same entry. Updates
+   * this clock's internal `current` state and returns the new value.
+   *
+   * Behaviour:
+   * - `result = max(this.current, max(observedRemotes, 0)) + 1`
+   * - Empty `observedRemotes` is allowed (`getCurrent() + 1`).
+   * - Throws `LAMPORT_BOUND_VIOLATION` if any observed value is
+   *   `> 2 × max(this.current, 1)` — the W39 bounds defense.
+   */
+  bumpFor(observedRemotes: ReadonlyArray<number>): number {
+    // Guard: untrusted input. Validate every entry before computing max.
+    for (const v of observedRemotes) {
+      if (!Number.isFinite(v) || !Number.isInteger(v) || v < 0) {
+        throw new SphereError(
+          `Lamport.bumpFor: observedRemotes must be non-negative finite integers; got ${String(v)}`,
+          'VALIDATION_ERROR',
+        );
+      }
+    }
+
+    const maxObserved = observedRemotes.length === 0
+      ? 0
+      : Math.max(...observedRemotes);
+
+    // W39: bounds defense against runaway Lamports from untrusted replicas.
+    // Use `Math.max(this.current, 1)` so boot (current=0) still accepts
+    // reasonable first-remote values (1, 2) — otherwise `0 × 2 = 0` would
+    // reject every non-zero remote.
+    const bound = 2 * Math.max(this.current, 1);
+    if (maxObserved > bound) {
+      throw new SphereError(
+        `Lamport.bumpFor: observed remote Lamport ${maxObserved} exceeds 2 × max(local=${this.current}, 1) = ${bound} (W39 bounds defense)`,
+        'LAMPORT_BOUND_VIOLATION',
+      );
+    }
+
+    const next = Math.max(this.current, maxObserved) + 1;
+    this.current = next;
+    return next;
+  }
+
+  /**
+   * Returns the current Lamport value without mutating it. Useful for
+   * passing to merge / serialization paths.
+   */
+  getCurrent(): number {
+    return this.current;
+  }
+}
