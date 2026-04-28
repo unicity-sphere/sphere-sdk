@@ -465,6 +465,15 @@ export const PROFILE_KEY_MAPPING: ProfileKeyMap = {
   'invalidTokens': { profileKey: '{addr}.invalidTokens', dynamic: true },
   'invalidatedNametags': { profileKey: '{addr}.invalidatedNametags', dynamic: true },
   'tombstones': { profileKey: '{addr}.tombstones', dynamic: true },
+
+  // --- UXF inter-wallet transfer protocol per-entry-key collections
+  //     (T.0.G7-fill-gaps). Both expand at runtime into
+  //     `${addr}.<collection>.<id>` records via the per-entry-key
+  //     writer in profile-token-storage-provider.ts. The `id` form is
+  //     treated as opaque by the writer — T.1.E declares the specific
+  //     composite-id shape for `audit` (`${tokenId}.${contentHash}`).
+  'audit': { profileKey: '{addr}.audit', dynamic: true },
+  'finalizationQueue': { profileKey: '{addr}.finalizationQueue', dynamic: true },
 } as const;
 
 /**

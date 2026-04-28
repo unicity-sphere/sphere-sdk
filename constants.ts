@@ -113,6 +113,22 @@ export const STORAGE_KEYS_ADDRESS = {
   SWAP_RECORD_PREFIX: 'swap:',
   /** Lightweight index array for listing */
   SWAP_INDEX: 'swap_index',
+  // UXF inter-wallet transfer protocol storage keys (T.0.G7-fill-gaps)
+  /**
+   * Audit collection for structurally-valid-but-unspendable tokens
+   * (NOT_OUR_CURRENT_STATE / UNSPENDABLE_BY_US dispositions). Stored
+   * with composite id `${tokenId}.${observedTokenContentHash}` per
+   * PROFILE-ARCHITECTURE.md §10.10 / canonical UXF-TRANSFER-PROTOCOL §5.4.
+   * The per-entry-key writer treats the id as opaque — T.1.E declares
+   * the specific composite-id shape.
+   */
+  AUDIT: 'audit',
+  /**
+   * Finalization queue for pending chain-mode transactions, keyed by
+   * the request id. Persists across process restarts per
+   * UXF-TRANSFER-PROTOCOL §5.5.
+   */
+  FINALIZATION_QUEUE: 'finalizationQueue',
 } as const;
 
 /** @deprecated Use STORAGE_KEYS_GLOBAL and STORAGE_KEYS_ADDRESS instead */

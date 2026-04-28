@@ -282,6 +282,22 @@ export interface TxfStorageDataBase {
   _sent?: TxfSentEntry[];
   _invalid?: TxfInvalidEntry[];
   _history?: HistoryRecord[];
+  /**
+   * Audit collection for structurally-valid-but-unspendable tokens
+   * (NOT_OUR_CURRENT_STATE / UNSPENDABLE_BY_US dispositions). Each
+   * entry is persisted to its own OrbitDB key under the prefix
+   * `${addr}.audit.` per PROFILE-ARCHITECTURE.md §10.10. The
+   * per-entry-key writer treats `id` as opaque, so T.1.E can widen
+   * it to a composite `${tokenId}.${observedTokenContentHash}`
+   * without further plumbing.
+   */
+  _audit?: TxfAuditEntry[];
+  /**
+   * Finalization queue for pending chain-mode transactions, keyed by
+   * `id`. Persisted per UXF-TRANSFER-PROTOCOL §5.5 so a process
+   * restart preserves in-flight finalizations.
+   */
+  _finalizationQueue?: TxfFinalizationQueueEntry[];
   // Dynamic token entries: _<tokenId>
   [key: `_${string}`]: unknown;
 }
@@ -320,6 +336,50 @@ export interface TxfInvalidEntry {
   tokenId: string;
   reason: string;
   detectedAt: number;
+}
+
+/**
+ * Audit collection entry — a structurally valid token that the local
+ * wallet cannot currently spend (NOT_OUR_CURRENT_STATE /
+ * UNSPENDABLE_BY_US dispositions). Persisted under
+ * `${addr}.audit.${id}` keys via the per-entry-key writer.
+ *
+ * `id` is the primary key for the per-entry-key layout. It MUST be
+ * unique within the collection. T.1.E will populate it with the
+ * composite `${tokenId}.${observedTokenContentHash}` shape declared
+ * in PROFILE-ARCHITECTURE.md §10.10; this base interface keeps the
+ * field opaque so writers/readers do not need to be updated when the
+ * composite form lands.
+ */
+export interface TxfAuditEntry {
+  /** Opaque primary key. T.1.E uses `${tokenId}.${observedTokenContentHash}`. */
+  id: string;
+  tokenId: string;
+  /** Disposition tag — e.g. 'NOT_OUR_CURRENT_STATE', 'UNSPENDABLE_BY_US'. */
+  disposition: string;
+  detectedAt: number;
+  /** Optional content hash recorded at detection time. */
+  observedTokenContentHash?: string;
+  /** Optional human-readable note from the validator. */
+  note?: string;
+}
+
+/**
+ * Finalization queue entry — a pending chain-mode finalization that
+ * survives process restarts per UXF-TRANSFER-PROTOCOL §5.5.
+ * Persisted under `${addr}.finalizationQueue.${id}` keys.
+ *
+ * `id` is the request id (e.g. transfer/request id) and is the
+ * primary key for the per-entry-key layout.
+ */
+export interface TxfFinalizationQueueEntry {
+  /** Opaque request id. */
+  id: string;
+  /** Lifecycle status of the finalization request. */
+  status: string;
+  enqueuedAt: number;
+  /** Caller-supplied payload — kept opaque at the storage layer. */
+  payload?: unknown;
 }
 
 // =============================================================================
