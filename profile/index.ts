@@ -145,6 +145,28 @@ export type {
 } from './token-manifest';
 
 // =============================================================================
+// CRDT primitives — UXF Transfer Protocol §5.5 step 9 + §7.1 (T.1.F)
+// =============================================================================
+
+export { Lamport } from './lamport';
+export {
+  PerTokenMutex,
+  MAX_LOCK_HOLD_MS,
+} from './per-token-mutex';
+export type {
+  PerTokenMutexStrategy,
+  PerTokenMutexOptions,
+} from './per-token-mutex';
+export {
+  ManifestCas,
+  ManifestCasConcurrentModificationError,
+} from './manifest-cas';
+export type {
+  ManifestCasResult,
+  MinimalManifestStorage,
+} from './manifest-cas';
+
+// =============================================================================
 // Shared Factory
 // =============================================================================
 
