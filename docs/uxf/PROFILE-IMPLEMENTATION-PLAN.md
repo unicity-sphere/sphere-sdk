@@ -8,8 +8,7 @@
 > - Widen `_invalid` and `_audit` keys to multi-representation form `${addr}.{invalid,audit}.${tokenId}.${observedTokenContentHash}` (T.3).
 > - Replace the legacy per-token outbox with bundle-grained `UxfTransferOutboxEntry` per UXF-TRANSFER-PROTOCOL §7 (T.6); migration preserves `recipientNametag`.
 > - Persist the per-address finalization queue (T.5) under per-entry-key layout (Wave G.7).
-> - Implement profile-pointer rescan (default 30s) per UXF-TRANSFER-PROTOCOL §12.3.1 (T.8).
-> - Implement per-token spent-state rescan (default 5 min/token, concurrency 4) per UXF-TRANSFER-PROTOCOL §12.3.2 (T.8).
+> - **Periodic rescans (implementation deferred per [UXF-TRANSFER-PROTOCOL §12.3](UXF-TRANSFER-PROTOCOL.md))** — design summary is normative in §12.3.1 (profile-pointer rescan, default 30s) and §12.3.2 (per-token spent-state rescan, default 5 min/token, concurrency 4), but implementation is deferred to a post-T.8 wave (not part of T.1–T.8 deliverables). Coordinate with whichever follow-up wave picks them up.
 
 ---
 

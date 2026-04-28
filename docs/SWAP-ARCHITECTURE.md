@@ -5,8 +5,8 @@
 > **Barrel:** `modules/swap/index.ts`
 
 > **Transfer-protocol coordination** (per [UXF-TRANSFER-PROTOCOL](uxf/UXF-TRANSFER-PROTOCOL.md)):
-> - **Swap deposits MUST use `transferMode: 'conservative'`** (UXF-TRANSFER-PROTOCOL §2.5 explicit recommendation: "Recommended for high-value transfers, escrow, swap deposits"). Escrow's `verifyPayout()` requires finalized proofs; conservative mode awaits them before delivery.
-> - **`allowPendingTokens: false`** (default) is normative for swap deposits. Pending source tokens are incompatible with escrow — a cascade rejection (per §6.1.1) after escrow accepts the deposit would invalidate the deposit token and break swap atomicity.
+> - **Swap deposits MUST use `transferMode: 'conservative'`** — this is a **swap-architecture-internal requirement** (escrow's `verifyPayout()` requires finalized proofs to verify the deposit, which only conservative mode guarantees pre-delivery). Canonical UXF-TRANSFER-PROTOCOL §2.5 only RECOMMENDS conservative for "high-value transfers, escrow, swap deposits"; this module elevates it to a normative MUST for the swap flow specifically.
+> - **`allowPendingTokens: false`** (default) is also a swap-architecture-internal normative requirement. Pending source tokens are incompatible with escrow — a cascade rejection (per UXF-TRANSFER-PROTOCOL §6.1.1) after escrow accepts the deposit would invalidate the deposit token and break swap atomicity.
 > - **v1 swap is COIN-ONLY**: `SwapDeal` carries flat `partyACurrency` / `partyAAmount` / `partyBCurrency` / `partyBAmount` — single-coin per party. The canonical multi-asset extension (UXF-TRANSFER-PROTOCOL `additionalAssets`) is not yet leveraged for swap deals. NFT swaps and multi-asset swaps are reserved for a future protocol revision.
 > - **Cascade-asymmetry caveat for any future NFT swap**: NFT cascades are irrecoverable (non-fungible identity loss). Future NFT-swap revisions MUST require finalized NFT sources (no chain-mode for NFT swap deposits) and SHOULD include explicit operator confirmation analogous to `confirmNftPending`.
 
