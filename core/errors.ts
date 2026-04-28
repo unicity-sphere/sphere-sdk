@@ -216,7 +216,13 @@ export type SphereErrorCode =
    *  asymmetry per §4.1 step 2 "NFT cascade asymmetry warning" — NFT
    *  cascades are irrecoverable, so callers MUST acknowledge with
    *  `confirmNftPending: true` to proceed (W11). */
-  | 'NFT_PENDING_REQUIRES_CONFIRMATION';
+  | 'NFT_PENDING_REQUIRES_CONFIRMATION'
+  /** UXF Conservative-sender orchestrator (T.2.D.1) — the resolved
+   *  delivery decision is CID-bound (`force-cid` or `auto`-over-cap) but
+   *  the caller did not supply a `publishToIpfs` callback. Surfaced as a
+   *  pre-flight reject so the orchestrator does not waste work
+   *  building a CAR it cannot ship. See §3.3.1 / §T.2.D.1 acceptance. */
+  | 'IPFS_PUBLISHER_MISSING';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
