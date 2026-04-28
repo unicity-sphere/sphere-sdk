@@ -293,7 +293,36 @@ export type SphereErrorCode =
    *  the caller did not supply a `publishToIpfs` callback. Surfaced as a
    *  pre-flight reject so the orchestrator does not waste work
    *  building a CAR it cannot ship. See §3.3.1 / §T.2.D.1 acceptance. */
-  | 'IPFS_PUBLISHER_MISSING';
+  | 'IPFS_PUBLISHER_MISSING'
+  // UXF Transfer / Recipient CID fetcher (T.4.B) — §3.3, §3.3.1, §3.3.2 + §9.2.
+  // The CID-by-reference recipient path (`kind: 'uxf-cid'`) walks a configured
+  // gateway list and stream-fetches the CAR, with three distinct failure
+  // modes that the worker pool needs to discriminate from "structural"
+  // bundle rejections (which write `_invalid` records):
+  //
+  //   - `FETCHED_CAR_TOO_LARGE` — streaming fetch exceeded the recipient-side
+  //     32 MiB cap (`MAX_FETCHED_CAR_BYTES`). The fetcher aborts the reader
+  //     mid-stream — the body is NOT buffered in full before the check. This
+  //     is a DoS defense against malicious senders pinning huge CARs (§3.3.1).
+  //     Try the next gateway: a different gateway might serve the same CID
+  //     under-cap (e.g., gateway-side compression / chunking differences),
+  //     though most "huge CAR" cases are uniform across gateways.
+  //   - `BUNDLE_REJECTED_GATEWAY_CID_MISMATCH` — gateway returned a parseable
+  //     CAR whose root CID disagrees with the requested `bundleCid`. A buggy
+  //     or hostile gateway is fabricating content. Try the next gateway —
+  //     the protocol defends against gateway misbehavior by re-hashing.
+  //   - `BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT` — every gateway in the list
+  //     failed (network error, 5xx, mismatch, oversize, ...). This is a
+  //     TRANSIENT class — the worker pool wraps this in retry, NOT in a
+  //     `_invalid` disposition write. Per §9.2 / W13: "NO disposition record
+  //     written" — only the transient retry path runs. The recipient does
+  //     NOT acknowledge the sender; the sender's outbox times out at retry
+  //     deadline and may attempt CAR-embed re-delivery. The error's `cause`
+  //     carries `{ bundleCid, gatewaysAttempted, failureReasons }` for
+  //     forensic detail.
+  | 'FETCHED_CAR_TOO_LARGE'
+  | 'BUNDLE_REJECTED_GATEWAY_CID_MISMATCH'
+  | 'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

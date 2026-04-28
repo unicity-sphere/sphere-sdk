@@ -499,6 +499,7 @@ export type SphereEventType =
   | 'transfer:confirmed'
   | 'transfer:failed'
   | 'transfer:operator-alert'
+  | 'transfer:fetch-failed'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -595,6 +596,38 @@ export interface SphereEventMap {
     readonly observedTokenContentHash?: import('../uxf/types').ContentHash;
     readonly senderTransportPubkey?: string;
     readonly message: string;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.4.B — recipient gateway-fetch failure (§9.2).
+   *
+   * Emitted exactly once when the CID-by-reference fetch path
+   * (`kind: 'uxf-cid'`) has exhausted EVERY configured gateway without a
+   * verified CAR. The bundle is NOT considered delivered; per §3.3.2 +
+   * §9.2 the recipient does NOT acknowledge the sender, and per W13 NO
+   * `_invalid` / `_audit` disposition record is written — failure is
+   * transient by definition (a different gateway, or the sender's CAR-
+   * embed retry, may resolve it).
+   *
+   * Payload fields:
+   *  - `bundleCid` — the CIDv1 base32 the fetcher was asked to retrieve.
+   *  - `senderTransportPubkey` — the AUTHENTICATED Nostr signing pubkey
+   *    of the event author (NOT the unauthenticated `sender.transportPubkey`
+   *    claim from the envelope).
+   *  - `gatewaysAttempted` — every gateway URL the fetcher tried, in
+   *    order. Length matches `failureReasons.length`.
+   *  - `failureReasons` — per-gateway human-readable failure strings
+   *    (`"network: ..."`, `"http 503"`, `"car-too-large"`, `"cid-mismatch"`,
+   *    ...). Indexed identically to `gatewaysAttempted`. Useful for
+   *    operator triage; not machine-parseable.
+   *
+   * Spec refs: §3.3.2 (delivery-completion semantics), §9.2 (recipient
+   * gateway can't fetch CID), W13 (no disposition record on transient).
+   */
+  'transfer:fetch-failed': {
+    readonly bundleCid: string;
+    readonly senderTransportPubkey: string;
+    readonly gatewaysAttempted: ReadonlyArray<string>;
+    readonly failureReasons: ReadonlyArray<string>;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
