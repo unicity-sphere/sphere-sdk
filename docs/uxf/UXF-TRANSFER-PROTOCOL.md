@@ -229,7 +229,7 @@ type DeliveryStrategy =
 - `delivery: { kind: 'force-inline' }` — sender insists on inline regardless of size; if the resulting Nostr event exceeds the relay's max payload, the send fails with `INLINE_CAR_TOO_LARGE`.
 - `delivery: { kind: 'force-cid' }` — sender insists on pinning even for tiny bundles (e.g., when the receiver is known to be storage-constrained or when the operator wants every bundle indexed by CID for audit).
 
-**Hard upper bound**: regardless of `inlineCapBytes`, the implementation enforces a fixed conservative ceiling of **96 KiB** for inline CAR bytes. This is the safe default for typical Nostr relay deployments.
+**Hard upper bound**: regardless of `inlineCapBytes`, the implementation enforces a fixed conservative ceiling of **96 KiB** for inline CAR bytes. This is the safe default for typical Nostr relay deployments. If the caller provides `delivery: { kind: 'auto', inlineCapBytes: N }` with `N > 96 KiB`, the SDK MUST silently clamp `inlineCapBytes` to 96 KiB — auto mode never publishes inline above the relay-safe ceiling regardless of user override. Implementations MAY instead reject such a configuration with `INVALID_INLINE_CAP` at startup; the choice is implementation-defined but the clamp/reject behavior MUST be deterministic.
 
 > **NIP-11 relay-discovery is NOT in scope for v1.0.** A future revision MAY probe the publishing relay's NIP-11 `limitations.max_message_length` to dynamically size the ceiling, but the current `transport/NostrTransportProvider.ts` does not implement NIP-11. Implementations MUST use the fixed 96 KiB cap until the discovery extension lands (deferred — §12.2).
 
@@ -703,7 +703,13 @@ interface FinalizationQueueEntry {
   signedTransferTxBytes?: Uint8Array; // present iff this hop's tx came from the incoming bundle;
                                       // resolution falls back to the in-pool token by
                                       // (tokenId, txIndex) if absent
-  submittedAt: number;           // for backoff scheduling
+  submittedAt: number;           // wall-clock time of first successful submit;
+                                 // initialized to createdAt at queue-creation;
+                                 // updated to the actual submit time on the
+                                 // first SUCCESS / REQUEST_ID_EXISTS response.
+                                 // pollingDeadline (§5.5 step 6) MUST NOT fire
+                                 // for entries with submittedAt === createdAt
+                                 // (no submit yet).
   retryCount: number;
   source: 'sent' | 'received';   // sender's outbox vs recipient's queue
 }
@@ -994,6 +1000,8 @@ type ImportProofResult =
       | 'requestid-mismatch'      // proof's requestId doesn't match any outstanding queue entry
     };
 ```
+
+**Default values**: `allowInvalidOverride` defaults to `false` if omitted. The override is an explicit operator action that breaches the §5.6 monotonicity invariant ("invalid → ?" is normally forbidden); callers MUST set it to `true` deliberately. Silently defaulting to `true` would allow accidental invariant violations.
 
 Behavior cases:
 1. **tokenId not in pool / _invalid / _audit**: `{ ok: false, reason: 'no-such-token' }`. The SDK has no context for the proof.
