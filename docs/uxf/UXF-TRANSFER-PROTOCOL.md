@@ -451,13 +451,16 @@ Before per-token disposition, the recipient performs **bundle-level checks**. Cr
 
    Post-merge depth: if a `[D-merge]` operation produces a union token whose unfinalized-tx count exceeds MAX_CHAIN_DEPTH (because the local pool extended the chain beyond the cap), the merge proceeds but the resulting token's `manifest.status` is `pending` and a warning is logged — we trust our own pool's prior state. Only INCOMING bundles' fresh chains are capped.
 
-4. **Smuggled-roots count cap (`_audit` DoS defense)** — count only DAG elements with type-tag `token-root` that are NOT in `payload.tokenIds`. Sub-DAG dependencies (predicates, prior-state references, transactions, inclusion proofs, certificates) are NOT counted — they have different type-tags. Precise formula:
+4. **Smuggled-roots count cap (`_audit` DoS defense)** — count only DAG elements with type-tag `token-root` (or any future root-equivalent type-tag — see fail-closed rule below) that are NOT in `payload.tokenIds`. Sub-DAG dependencies (predicates, prior-state references, transactions, inclusion proofs, certificates) are NOT counted — they have different type-tags. Precise formula:
    ```
+   const ROOT_EQUIVALENT_TYPES = new Set(['token-root']);  // extend in lockstep with schema evolution
    unclaimedRoots = pool.elements.filter(e =>
-     e.type === 'token-root' && !payload.tokenIds.includes(e.tokenId)
+     ROOT_EQUIVALENT_TYPES.has(e.type) && !payload.tokenIds.includes(e.tokenId)
    ).length;
    ```
    If `unclaimedRoots > MAX_UNCLAIMED_ROOTS` (default 16), reject the entire bundle with `BUNDLE_REJECTED:too-many-unclaimed-roots`. The honest case has zero or a few unclaimed roots (sub-DAG dependencies are NOT token-roots — they're sub-elements). Without this cap, an attacker shipping 10K depth-1 unowned roots fills the recipient's `_audit` collection unboundedly via NOT_OUR_CURRENT_STATE dispositions.
+
+   **Forward-compat (fail-closed)**: if the recipient encounters a top-level DAG element with a type-tag NOT recognized by its current implementation, it MUST log a warning AND count that element toward `MAX_UNCLAIMED_ROOTS` (treat as a potentially-smuggled root by default). Spec extensions adding new root-equivalent type-tags MUST update `ROOT_EQUIVALENT_TYPES` in lockstep across implementations to avoid breaking honest senders.
 
 If any other bundle-level check fails, the entire bundle is rejected with a typed `BUNDLE_REJECTED` error; nothing is imported. This is logged and surfaced as a `transfer:rejected` event.
 
@@ -674,7 +677,7 @@ A periodic re-scan (out of scope here, deferred per §12.2) MAY transition `audi
 - The corresponding active-pool manifest entry MUST set `audit_promoted_from: { auditKey: ${addr}.audit.${tokenId} }` for back-reference. This is mandatory for forensic traceability — it is set on the manifest entry whether the entry is being created fresh OR an existing entry is being updated by promotion.
 
 **Manifest metadata preservation across §5.3 [D] merges (normative)**: when §5.3 [D] resolves a conflict between two manifest entries for the same `tokenId` (whether via union-merge or CONFLICTING tie-break), the following metadata fields are preserved on the post-merge entry by **set-OR / max-merge** semantics regardless of which side "wins" the chain merge:
-- `audit_promoted_from` — preserved if either side has it set (forensic traceability).
+- `audit_promoted_from` — type widened to `auditKey[] | undefined` (an array of audit keys, or unset). On merge, take the union of both sides' arrays (deduplicated and lex-sorted) — divergent values reflect legitimate cross-replica audit history (e.g., the same `tokenId` was promoted from different audit entries on different devices); both records are preserved for forensic traceability. Implementations writing this field for the first time MUST use the array form (single-element array if only one promotion).
 - `splitParent` — preserved if either side has it set; if both have it set with different values, that's a defect (a token cannot have two different parents); log warning and use the lexicographically-smaller value.
 - `conflictingHeads[]` — union of both sides' lists, deduplicated.
 - `lamport` — max of both sides (per §7.1 invariants).
@@ -776,6 +779,11 @@ The finalization worker (see §6) processes each entry. For each pending tx:
    - This re-running is necessary because the token's chain may have grown via merge during finalization, AND the current-state predicate may have changed if the merge added a transfer-out we authored locally.
 
    **Per-tokenId lock requirement**: §5.3 ingest paths and §5.5 step 9 finalization paths share a per-tokenId mutex. This prevents a race where a queue-drain is finalizing a token to `valid` while a concurrent §5.3 ingest of a divergent bundle would have produced `CONFLICTING` — without the lock, two workers could both observe an intermediate state and reach contradictory final dispositions. Implementations MAY use OrbitDB-level optimistic concurrency (compare-and-swap on the manifest entry's content hash) or an in-process lock; the choice is implementation-defined but the exclusion property is normative.
+
+   **Lock-vs-network-I/O hold rule**: re-running [E] involves `oracle.isSpent()` — a network round-trip that may take seconds under aggregator load. Holding the per-tokenId mutex during this RPC would serialize the entire per-token finalization queue behind one slow call. Implementations MUST follow ONE of:
+   - **CAS-based** (preferred): no lock is held; each transition is a compare-and-swap on the manifest entry's content hash. Conflicts surface as CAS failure → retry from the latest state. Works correctly across slow RPCs because no global lock is held.
+   - **Lock-with-RPC-release**: the worker acquires the lock, snapshots the relevant state, **releases the lock** before issuing `oracle.isSpent()`, then re-acquires the lock and verifies the manifest content hash is still what it snapshotted before applying the post-RPC state transition. If the hash changed (concurrent write), restart from the read step.
+   - **Lock-with-bounded-hold**: as a fallback, implementations using a strict in-process mutex MUST set `MAX_LOCK_HOLD_MS` (default 5s) and abort + retry if exceeded. Forbids unbounded lock-during-RPC.
 
    **Lock ordering for cascade (deadlock prevention + parent-flip protection)**: §6.1.1 cascade walks parent → children. To prevent AB-BA deadlocks with worker threads holding child locks while needing parent locks, the cascade rule is:
    - The cascading worker acquires the **parent's** lock first, identifies the children, **releases the parent's lock**, then acquires each child's lock individually (in lexicographic order of `tokenId`) to apply the cascaded `parent-rejected` marker via compare-and-swap.
@@ -995,6 +1003,8 @@ Behavior cases:
 4b. **tokenId is `pending`, proof doesn't match any outstanding OR completed requestId**: `{ ok: false, reason: 'requestid-mismatch' }`. The proof is for a different transition.
 5. **tokenId is in `_invalid` AND `allowInvalidOverride === true` AND the token had EXACTLY ONE hard-failed queue entry, matching the proof**: validates the proof; if OK, MOVES the token from `_invalid` back to active pool with `manifest.status='valid'` (the prior invalidation was wrong — the original aggregator response was faulty, the proof now demonstrates the correct anchored state). This is the explicit operator override of the §5.6 monotonicity invariant.
 6. **tokenId is in `_invalid` AND `allowInvalidOverride === true` AND the token had MULTIPLE hard-failed queue entries** (chain-mode case): validates the proof; if OK, MOVES the token from `_invalid` back to active pool with `manifest.status='pending'` and re-queues the K-1 remaining entries as fresh queue entries (each with `submittedAt = now`, fresh `pollingDeadline`). The token returns to the normal finalization path. The operator must then either wait for those K-1 entries to resolve OR import each of their proofs separately.
+
+   > **Important — re-queue is usually futile without the additional proofs**: the K-1 entries previously hard-failed because the aggregator never anchored their commitments (sustained PATH_NOT_INCLUDED, or REQUEST_ID_MISMATCH). Nothing about re-queueing causes the aggregator to behave differently — those entries will hard-fail again after one polling window, re-cascading the token to `_invalid`. Operators SHOULD provide proofs for ALL K-1 remaining entries via repeated `importInclusionProof()` calls (one per requestId) BEFORE expecting the token to converge to `valid`. A future `bulkImportInclusionProofs(tokenId, proofs[])` API MAY consolidate this (deferred — §12.2).
 7. **tokenId is in `_invalid` AND no override flag**: `{ ok: false, reason: 'tokenId-in-invalid' }`.
 8. **Proof verify returns `PATH_NOT_INCLUDED`**: `{ ok: false, reason: 'proof-not-anchored' }`. The proof is a valid proof of NON-existence; it doesn't help unstick.
 9. **Proof verify returns `PATH_INVALID` / `NOT_AUTHENTICATED`**: `{ ok: false, reason: 'proof-trustbase-failed' }`.
