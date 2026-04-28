@@ -126,6 +126,25 @@ export type SphereErrorCode =
   | 'BUNDLE_REJECTED_MALFORMED_ENVELOPE'
   | 'BUNDLE_REJECTED_MULTI_ROOT'
   | 'BUNDLE_REJECTED_INVALID_CAR'
+  // UXF Transfer / Delivery resolver (T.2.C) — §3.3.1 inline-cap & relay-safe ceiling.
+  // The resolver maps `(DeliveryStrategy, carBytes)` to a concrete delivery decision
+  // (inline base64 vs CID-by-reference) and surfaces TWO distinct failure modes:
+  //   - `INLINE_CAR_TOO_LARGE` — the resulting Nostr event would exceed the
+  //     relay-safe ceiling (RELAY_SAFE_CAP_BYTES = 96 KiB). Surfaces in two paths:
+  //     (a) `delivery: { kind: 'force-inline' }` with `carBytes.length > 96 KiB`
+  //         — the caller chose force-inline explicitly and must handle this branch.
+  //     (b) (future) §3.3 publish-time relay rejection in force-inline path
+  //         — out of scope for T.2.C; surfaced by the sender orchestrator.
+  //     `auto` mode never throws this code: it falls back to `uxf-cid` instead.
+  //   - `INVALID_INLINE_CAP` — `delivery: { kind: 'auto', inlineCapBytes: N }` with
+  //     `N < 1` (zero, negative, NaN, or non-finite). Per §3.3.1 normative paragraph,
+  //     implementations MAY reject undersized caps deterministically — we choose
+  //     reject (W12). Note that OVERSIZED caps (`N > 96 KiB`) are SILENTLY CLAMPED,
+  //     not rejected, because the spec mandates `auto` never publishes inline above
+  //     the relay-safe ceiling regardless of user override; clamp is the deterministic
+  //     no-surprise behavior.
+  | 'INLINE_CAR_TOO_LARGE'
+  | 'INVALID_INLINE_CAP'
   // UXF Transfer / CRDT primitives (T.1.F) — §5.5 step 9, §7.1 Lamport invariants
   /** Observed remote Lamport > 2 × max(localKnownLamports). Defends against
    *  a malicious/buggy replica publishing an absurdly large Lamport (e.g.
