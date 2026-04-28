@@ -1884,6 +1884,20 @@ export class SwapModule {
         }
       ).getTokenIdsForInvoice?.(swap.payoutInvoiceId) ?? new Set<string>();
 
+      // SECURITY: fail-CLOSED when payoutTokenIds is empty AND there are
+      // invalid tokens we can't classify. An empty set means the reverse
+      // index (tokenInvoiceMap) hasn't been rebuilt yet OR the orphan-buffer
+      // hasn't been replayed for this invoice. We cannot determine relevance,
+      // so we cannot safely fall through to "verified". The next retry tick
+      // will pick up after the rebuild/replay completes.
+      if (payoutTokenIds.size === 0) {
+        logger.warn(
+          LOG_TAG,
+          `verifyPayout for ${swapId.slice(0, 12)}: ${validationResult.invalid.length} invalid token(s) but tokenInvoiceMap is empty for this payout invoice — failing closed until reverse index rebuilds`,
+        );
+        return returnFalse();
+      }
+
       // Filter the validate-invalid set to tokens that are linked to THIS
       // payout invoice via tokenInvoiceMap (populated by both
       // _processTokenTransactions's on-chain path AND the synthetic /

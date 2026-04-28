@@ -4195,21 +4195,25 @@ export class AccountingModule {
             continue; // skip loading this entry
           }
           innerMap.set(entryKey, ref);
-          // Rebuild tokenInvoiceMap. Three key shapes can appear in the
+          // Rebuild tokenInvoiceMap. Four key shapes can appear in the
           // ledger:
           //   1. on-chain `${tokenId}:${txIndex}::${coinId}` — token id is
           //      the prefix of `ref.transferId` (positional id), with `:`
           //      separator. Original code path.
           //   2. orphan `mt:${tokenId}:${transferId}` — token id is
           //      embedded in the ENTRY KEY between the `mt:` prefix and the
-          //      next `:`, NOT in `ref.transferId` (which holds the
-          //      transport-level transfer id, no `:` at all). Without this
-          //      branch, post-restart `getTokenIdsForInvoice` returns empty
-          //      for orphan-attributed payouts, and SwapModule.verifyPayout
-          //      filters away the actual invalid token, silently passing
-          //      verification on an unverified payout.
-          //   3. provisional `provisional:${uuid}` — does not map to a real
+          //      next `:`, NOT in `ref.transferId`.
+          //   3. synthetic `synthetic:${tokenId}::${coinId}` — instant-mode
+          //      payouts. Without this branch, post-restart
+          //      `getTokenIdsForInvoice` returns empty for instant-mode
+          //      payouts and SwapModule.verifyPayout fails dangerously open.
+          //   4. provisional `provisional:${uuid}` — does not map to a real
           //      token, skip.
+          //
+          // Token IDs are validated with /^[a-f0-9]{64}$/ to defend against
+          // a corrupt-on-disk attacker who writes crafted entry keys to
+          // poison the reverse index.
+          const HEX_64 = /^[a-f0-9]{64}$/i;
           if (entryKey.startsWith('mt:')) {
             // mt:<tokenId>:<transferId> — extract tokenId between the two
             // first colons.
@@ -4217,8 +4221,19 @@ export class AccountingModule {
             const secondColon = entryKey.indexOf(':', firstColon + 1);
             if (secondColon > firstColon + 1) {
               const tokenIdFromKey = entryKey.slice(firstColon + 1, secondColon);
-              if (tokenIdFromKey.length > 0) {
+              if (HEX_64.test(tokenIdFromKey)) {
                 this._addToTokenInvoiceMap(tokenIdFromKey, invoiceId);
+              }
+            }
+          } else if (entryKey.startsWith('synthetic:')) {
+            // synthetic:<tokenId>::<coinId> — extract tokenId between the
+            // 'synthetic:' prefix and the next ':'.
+            const afterPrefix = entryKey.slice('synthetic:'.length);
+            const tokenIdEnd = afterPrefix.indexOf(':');
+            if (tokenIdEnd > 0) {
+              const tokenId = afterPrefix.slice(0, tokenIdEnd);
+              if (HEX_64.test(tokenId)) {
+                this._addToTokenInvoiceMap(tokenId, invoiceId);
               }
             }
           } else if (
@@ -4226,7 +4241,9 @@ export class AccountingModule {
             ref.transferId.includes(':')
           ) {
             const tokenIdFromRef = ref.transferId.slice(0, ref.transferId.indexOf(':'));
-            this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
+            if (HEX_64.test(tokenIdFromRef)) {
+              this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
+            }
           }
         }
       } catch (err) {
@@ -5512,6 +5529,7 @@ export class AccountingModule {
       const syntheticKey = firstTokenId
         ? `synthetic:${firstTokenId}::${syntheticRef.coinId}`
         : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      let mutated = false;
       if (!existingLedger.has(syntheticKey)) {
         // Check no real entry exists for this transfer's tokens (by tokenId prefix match).
         let hasRealEntry = false;
@@ -5527,6 +5545,7 @@ export class AccountingModule {
         }
         if (!hasRealEntry) {
           existingLedger.set(syntheticKey, { ...syntheticRef });
+          mutated = true;
         }
       }
 
@@ -5541,8 +5560,25 @@ export class AccountingModule {
         if (!tok.id) continue;
         if (!this.tokenInvoiceMap.has(tok.id)) {
           this.tokenInvoiceMap.set(tok.id, new Set());
+          mutated = true;
         }
+        const beforeSize = this.tokenInvoiceMap.get(tok.id)!.size;
         this.tokenInvoiceMap.get(tok.id)!.add(invoiceId);
+        if (this.tokenInvoiceMap.get(tok.id)!.size !== beforeSize) {
+          mutated = true;
+        }
+      }
+
+      // PERSISTENCE: synthetic-ledger entries and tokenInvoiceMap mutations
+      // must be flushed to disk. Without this, on restart both the ledger
+      // entry and the reverse map are gone — verifyPayout's reverse lookup
+      // returns empty for instant-mode payouts even though the actual swap
+      // succeeded, and the post-restart fail-closed branch (correctly) holds
+      // the swap unverified. By marking dirty here we let the next flush
+      // tick checkpoint the synthetic state alongside the on-chain state.
+      if (mutated) {
+        this.dirtyLedgerEntries.add(invoiceId);
+        this.balanceCache.delete(invoiceId);
       }
 
       // §6.2 step 6a: Matches target + asset
@@ -5755,6 +5791,7 @@ export class AccountingModule {
       const hKey = entry.tokenId
         ? `synthetic:${entry.tokenId}::${syntheticRef.coinId}`
         : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+      let hMutated = false;
       if (!hLedger.has(hKey)) {
         // Check for real entries for this specific token (scoped by tokenId, not broad coinId)
         let hasRealEntry = false;
@@ -5768,7 +5805,30 @@ export class AccountingModule {
         }
         if (!hasRealEntry) {
           hLedger.set(hKey, { ...syntheticRef });
+          hMutated = true;
         }
+      }
+
+      // Also populate tokenInvoiceMap so post-restart verifyPayout's reverse
+      // lookup sees this token as linked to the invoice (parallel to the
+      // _processInvoiceTransferEvent path).
+      if (entry.tokenId) {
+        if (!this.tokenInvoiceMap.has(entry.tokenId)) {
+          this.tokenInvoiceMap.set(entry.tokenId, new Set());
+          hMutated = true;
+        }
+        const beforeSize = this.tokenInvoiceMap.get(entry.tokenId)!.size;
+        this.tokenInvoiceMap.get(entry.tokenId)!.add(invoiceId);
+        if (this.tokenInvoiceMap.get(entry.tokenId)!.size !== beforeSize) {
+          hMutated = true;
+        }
+      }
+
+      // PERSISTENCE: same rationale as _processInvoiceTransferEvent —
+      // synthetic-ledger and tokenInvoiceMap mutations must be flushed.
+      if (hMutated) {
+        this.dirtyLedgerEntries.add(invoiceId);
+        this.balanceCache.delete(invoiceId);
       }
 
       deps.emitEvent('invoice:payment', {
