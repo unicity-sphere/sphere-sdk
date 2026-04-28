@@ -86,6 +86,7 @@ import { UxfPackage } from '../../../uxf/UxfPackage';
 import { extractCarRootCid } from '../../../uxf/transfer-payload';
 
 import { classifyToken, type TokenLike } from './classify-token';
+import type { FaultInjectionHooks } from './conservative-sender';
 import type {
   PublishToIpfsCallback,
   PublishToIpfsResult,
@@ -300,6 +301,23 @@ export interface InstantSenderDeps {
   readonly toTokenLike?: (token: Token) => TokenLike;
   /** Transfer ID override (resumed sends). */
   readonly transferId?: string;
+  /**
+   * **TEST-ONLY** fault-injection seam (T.6.E crash-recovery harness).
+   * Mirrors {@link
+   * import('./conservative-sender').ConservativeSenderDeps.__faultInject}.
+   *
+   * Hook firing points (mapped onto the §7.0 instant-mode pipeline):
+   *  - `afterOutboxCommitSending` — fires AFTER the outbox write that
+   *    sets `status='sending'`, before transport publish.
+   *  - `afterTransportAck` — fires AFTER transport ack, before the
+   *    outbox write that sets `status='delivered-instant'`.
+   *
+   * The `__` prefix marks this as a test-only seam — NOT a stable
+   * public API. See {@link FaultInjectionHooks} for full semantics.
+   *
+   * @internal Test seam only.
+   */
+  readonly __faultInject?: FaultInjectionHooks;
 }
 
 // =============================================================================
@@ -740,6 +758,12 @@ export async function sendInstantUxf(
       }
     }
 
+    // TEST-ONLY fault-injection seam: simulate process death between
+    // outbox commit and Nostr publish (§6.3 last-paragraph crash window).
+    if (deps.__faultInject?.afterOutboxCommitSending !== undefined) {
+      await deps.__faultInject.afterOutboxCommitSending();
+    }
+
     // -----------------------------------------------------------------
     // Step 12: publish via transport.
     // -----------------------------------------------------------------
@@ -756,6 +780,12 @@ export async function sendInstantUxf(
         'TRANSPORT_ERROR',
         cause,
       );
+    }
+
+    // TEST-ONLY fault-injection seam: simulate process death between
+    // transport ack and the `delivered-instant` outbox commit.
+    if (deps.__faultInject?.afterTransportAck !== undefined) {
+      await deps.__faultInject.afterTransportAck();
     }
 
     // -----------------------------------------------------------------

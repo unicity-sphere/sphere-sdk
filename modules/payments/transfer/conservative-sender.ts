@@ -307,6 +307,48 @@ export interface ConservativeSenderDeps {
   /** Transfer ID override (for resumed sends). When omitted, a new UUID
    *  is generated. */
   readonly transferId?: string;
+  /**
+   * **TEST-ONLY** fault-injection seam. The `__` prefix is intentional —
+   * this is NOT a stable public API and MUST NOT be used in production
+   * wiring. Used exclusively by the T.6.E crash-recovery harness to
+   * deterministically simulate process death between the §6.3-mandated
+   * persistence checkpoints, without resorting to sleep loops or real
+   * SIGKILLs.
+   *
+   * Hook firing points (mapped onto the §7.0 sender pipeline):
+   *  - {@link afterOutboxCommitSending} — fires AFTER the OrbitDB write
+   *    that sets `status='sending'` returns successfully, and BEFORE
+   *    {@link TransportProvider.sendTokenTransfer} is dispatched. A throw
+   *    here simulates a crash exactly at the §6.3 ordering boundary.
+   *  - {@link afterTransportAck} — fires AFTER the transport's
+   *    `sendTokenTransfer` returns successfully, and BEFORE the OrbitDB
+   *    write that sets `status='delivered'`. A throw here simulates a
+   *    crash where the recipient already saw the bundle but the sender
+   *    has not durably recorded delivery.
+   *
+   * The hooks are awaited; thrown errors propagate through the normal
+   * try/catch and trigger the `transfer:failed` path. The orchestrator
+   * does NOT swallow them — that would defeat the purpose of fault
+   * injection.
+   */
+  readonly __faultInject?: FaultInjectionHooks;
+}
+
+/**
+ * **TEST-ONLY** fault-injection hook surface. See
+ * {@link ConservativeSenderDeps.__faultInject} for semantics.
+ *
+ * Implementations typically `throw new Error('SIMULATED_CRASH')` to halt
+ * the orchestrator at a precise, deterministic checkpoint. Async hooks
+ * are awaited.
+ *
+ * @internal Test seam only.
+ */
+export interface FaultInjectionHooks {
+  /** Fires after the `sending` outbox commit, before transport publish. */
+  readonly afterOutboxCommitSending?: () => void | Promise<void>;
+  /** Fires after transport ack, before the `delivered` outbox commit. */
+  readonly afterTransportAck?: () => void | Promise<void>;
 }
 
 // =============================================================================
@@ -688,6 +730,12 @@ export async function sendConservativeUxf(
       await deps.outbox.transition(transferId, { status: 'sending' });
     }
 
+    // TEST-ONLY fault-injection seam: simulate process death between
+    // outbox commit and Nostr publish (§6.3 last-paragraph crash window).
+    if (deps.__faultInject?.afterOutboxCommitSending !== undefined) {
+      await deps.__faultInject.afterOutboxCommitSending();
+    }
+
     // -----------------------------------------------------------------
     // Step 11 (cont.): publish via transport. The PRE-PUBLISH ordering
     // invariant above means this dispatch happens AFTER the
@@ -724,6 +772,15 @@ export async function sendConservativeUxf(
         'TRANSPORT_ERROR',
         cause,
       );
+    }
+
+    // TEST-ONLY fault-injection seam: simulate process death between
+    // transport ack and the post-ack outbox transition. A crash here
+    // leaves the entry stuck in 'sending' — the worker will resume on
+    // restart, and idempotency at the recipient is guaranteed by the
+    // content-addressed bundleCid (replay-LRU dedupe per T.3.A).
+    if (deps.__faultInject?.afterTransportAck !== undefined) {
+      await deps.__faultInject.afterTransportAck();
     }
 
     // -----------------------------------------------------------------
