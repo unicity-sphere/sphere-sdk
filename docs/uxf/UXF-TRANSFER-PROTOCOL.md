@@ -451,7 +451,13 @@ Before per-token disposition, the recipient performs **bundle-level checks**. Cr
 
    Post-merge depth: if a `[D-merge]` operation produces a union token whose unfinalized-tx count exceeds MAX_CHAIN_DEPTH (because the local pool extended the chain beyond the cap), the merge proceeds but the resulting token's `manifest.status` is `pending` and a warning is logged — we trust our own pool's prior state. Only INCOMING bundles' fresh chains are capped.
 
-4. **Smuggled-roots count cap (`_audit` DoS defense)** — count token-roots in the pool that are NOT in `payload.tokenIds`. If the count exceeds `MAX_UNCLAIMED_ROOTS` (default 16), reject the entire bundle with `BUNDLE_REJECTED:too-many-unclaimed-roots`. The honest case has zero or a few unclaimed roots (sub-DAG dependencies are NOT token-roots — they're sub-elements). Without this cap, an attacker shipping 10K depth-1 unowned roots fills the recipient's `_audit` collection unboundedly via NOT_OUR_CURRENT_STATE dispositions.
+4. **Smuggled-roots count cap (`_audit` DoS defense)** — count only DAG elements with type-tag `token-root` that are NOT in `payload.tokenIds`. Sub-DAG dependencies (predicates, prior-state references, transactions, inclusion proofs, certificates) are NOT counted — they have different type-tags. Precise formula:
+   ```
+   unclaimedRoots = pool.elements.filter(e =>
+     e.type === 'token-root' && !payload.tokenIds.includes(e.tokenId)
+   ).length;
+   ```
+   If `unclaimedRoots > MAX_UNCLAIMED_ROOTS` (default 16), reject the entire bundle with `BUNDLE_REJECTED:too-many-unclaimed-roots`. The honest case has zero or a few unclaimed roots (sub-DAG dependencies are NOT token-roots — they're sub-elements). Without this cap, an attacker shipping 10K depth-1 unowned roots fills the recipient's `_audit` collection unboundedly via NOT_OUR_CURRENT_STATE dispositions.
 
 If any other bundle-level check fails, the entire bundle is rejected with a typed `BUNDLE_REJECTED` error; nothing is imported. This is logged and surfaced as a `transfer:rejected` event.
 
@@ -661,7 +667,11 @@ type AuditStatus =
                               // record is retained for forensic traceability.
 ```
 
-A periodic re-scan (out of scope here, deferred per §12.2) MAY transition `audit-not-our-state` entries to `audit-promoted` if a later transfer's chain makes the same `tokenId` bind to us at current state. Promotion sets `promotedToManifestRef` to the new manifest entry's `ContentHash` and MUST NOT delete the audit entry. The corresponding active-pool manifest entry SHOULD set `audit_promoted_from: { auditKey: ${addr}.audit.${tokenId} }` for back-reference.
+A periodic re-scan (out of scope here, deferred per §12.2) MAY transition `audit-not-our-state` entries to `audit-promoted` if a later transfer's chain makes the same `tokenId` bind to us at current state.
+
+**Promotion semantics**:
+- Promotion sets `promotedToManifestRef` on the audit entry to the new manifest entry's `ContentHash` and MUST NOT delete the audit entry.
+- The corresponding active-pool manifest entry MUST set `audit_promoted_from: { auditKey: ${addr}.audit.${tokenId} }` for back-reference. This is mandatory for forensic traceability — it is set on the manifest entry whether the entry is being created fresh OR an existing entry is being updated by promotion. If a later normal §5.3 receive arrives for the same tokenId after promotion, the existing entry's `audit_promoted_from` is preserved (merged via §5.3 [D] conflict-resolution which retains historical metadata).
 
 **Retention**:
 - `_invalid`: indefinite by default; user can manually `cleanupInventory()` to clear.
@@ -726,6 +736,8 @@ The finalization worker (see §6) processes each entry. For each pending tx:
 
    **Backoff schedule**: poll at 30s, 60s, 120s, 240s, then every 5 min until deadline. With `POLLING_WINDOW = 30 min`, this gives roughly 8 poll attempts within the window — comfortably above `MIN_POLL_ATTEMPTS`.
 
+   **Configuration validity rule (normative)**: `MIN_POLL_ATTEMPTS × first-backoff-interval` MUST NOT exceed `POLLING_WINDOW`, otherwise the deadline can never fire and the worker would poll forever. Implementations MUST validate this at startup and refuse to start if violated. As a hard safety net regardless of configuration, the worker SHALL also stop after `2 × POLLING_WINDOW` wall-clock time, declaring `oracle-rejected` even if MIN_POLL_ATTEMPTS was not reached — termination is guaranteed.
+
 7. **On hard-fail of any queue entry** (steps 3, 4, 6 terminal hard-fail paths):
    - Mark the queue entry hard-failed with the canonical `DispositionReason`.
    - **Short-circuit the chain**: per §6.1.1, ANY tx hard-fail invalidates the WHOLE token (the chain has a broken link). Immediately:
@@ -747,6 +759,10 @@ The finalization worker (see §6) processes each entry. For each pending tx:
    - This re-running is necessary because the token's chain may have grown via merge during finalization, AND the current-state predicate may have changed if the merge added a transfer-out we authored locally.
 
    **Per-tokenId lock requirement**: §5.3 ingest paths and §5.5 step 9 finalization paths share a per-tokenId mutex. This prevents a race where a queue-drain is finalizing a token to `valid` while a concurrent §5.3 ingest of a divergent bundle would have produced `CONFLICTING` — without the lock, two workers could both observe an intermediate state and reach contradictory final dispositions. Implementations MAY use OrbitDB-level optimistic concurrency (compare-and-swap on the manifest entry's content hash) or an in-process lock; the choice is implementation-defined but the exclusion property is normative.
+
+   **Lock ordering for cascade (deadlock prevention)**: §6.1.1 cascade walks parent → children. To prevent AB-BA deadlocks with worker threads holding child locks while needing parent locks, the cascade rule is:
+   - The cascading worker acquires the **parent's** lock first, identifies the children, **releases the parent's lock**, then acquires each child's lock individually (in lexicographic order of `tokenId`) to apply the cascaded `parent-rejected` marker via compare-and-swap.
+   - Implementations using compare-and-swap on manifest content hashes (rather than explicit locks) avoid this concern entirely — each child write is atomic on its own manifest entry; conflicts surface as CAS failures and retry.
 
 **Tombstone retention**: tombstoned manifest CIDs are retained for `TOMBSTONE_RETENTION_DAYS` (default 30) after the canonical CID has been stable. After that, the tombstone is GC'd to prevent unbounded manifest growth in long-lived wallets.
 
@@ -887,6 +903,8 @@ interface RevalidationResult {
 - If the parent is still invalid: leave the child in `_invalid`.
 - If the child fails [B]/[C]/[E] for reasons unrelated to parent: leave it in `_invalid` with reason updated to the new disposition (e.g., 'off-record-spend' if isSpent=true now).
 
+**Transitive cascade reversal**: cascades can be transitive (A → B → C → D, with A's failure invalidating B, B's invalidation cascading to C, etc.). `revalidateCascadedChildren()` is **transitive by default**: when it successfully revalidates a child, it recursively calls itself on the revalidated child's `tokenId` to revalidate any grandchildren. Operators call the function once on the original parent; the SDK walks the dependency tree.
+
 This is an explicit operator action; the SDK does not auto-cascade-reverse on parent override.
 
 **Cascade-risk warning to caller**: an instant-mode split issued from a still-pending parent inherits the parent's cascade risk. The SDK MUST surface this to the caller in two ways:
@@ -973,6 +991,7 @@ UI surfaces stuck-pending tokens after a configurable timeout (default 7 days) s
 | `MIN_POLL_ATTEMPTS` | 5 | Per-requestId poll-side | Floor before deadline can fire |
 | Outbox `retryDeadline` | 24 hours | Per-outbox-entry | Total transient-retry budget for delivery |
 | UI stuck-pending surface | 7 days | Per-token | Surface to operator for manual proof import — applies ONLY to tokens still in `pending` status, NOT to tokens already in `_invalid` (those are protocol-declared terminal failures, not stuck) |
+| Cascade-stuck surface | n/a (manual) | Per-token | A child token cascaded to `_invalid` with reason='parent-rejected' is NOT surfaced by the stuck-pending timer. The operator must invoke `revalidateCascadedChildren(parentTokenId)` after using `importInclusionProof` to override the parent. The SDK SHOULD provide a UI affordance "X cascaded children — revalidate?" whenever a parent is overridden. |
 
 A token can transition to `_invalid` via §6.1 within ~30 min of submit (if the aggregator's response is decisive), well before the 7-day stuck-pending UI fires. The two timers serve different semantic states: protocol-defined failure (terminal) vs. UI-surfaced limbo (still finalizable in principle).
 
@@ -1024,7 +1043,12 @@ interface UxfTransferOutboxEntry {
   /** Timestamps. */
   readonly createdAt: number;
   readonly updatedAt: number;
-  /** Lamport timestamp for CRDT tie-breaking on simultaneous writes. */
+  /** Lamport logical clock for CRDT tie-breaking. MUST use the standard
+   *  Lamport-clock rule on every local mutation:
+   *    on local write: lamport = max(localLamport, observedRemoteLamports) + 1
+   *    on merge:       lamport = max(replicaA.lamport, replicaB.lamport)
+   *  Without this rule, per-replica counters are not comparable and the
+   *  CRDT tie-breaks in §7.1 are non-deterministic across replicas. */
   readonly lamport: number;
   /** Error info if failed. */
   readonly error?: string;
@@ -1084,10 +1108,18 @@ The `finalized` over `failed-permanent` ordering rule still applies among hard-t
 
 The outbox is persisted in OrbitDB. OrbitDB has eventual-consistency (CRDT) semantics across replicas (e.g., desktop wallet + browser wallet for the same identity). The keyvalue store has only per-key `put`/`get`/`del` primitives; cross-key atomicity is NOT provided by the adapter (`profile/orbitdb-adapter.ts:331-378`).
 
+**Lamport clock invariants (normative)**:
+- `lamport: number` is a Lamport logical clock per `UxfTransferOutboxEntry`. It is NOT a wall-clock timestamp and NOT a per-replica monotonic counter — those are not comparable across replicas.
+- On every local write to an entry, the writer reads the current `lamport` value AND the maximum `lamport` of any concurrently-observed remote replica's view of the same entry, then writes `lamport := max(local, observedRemotes) + 1`.
+- On merge, `lamport := max(replicaA.lamport, replicaB.lamport)` (this is the natural CRDT max-merge consistent with the writer rule).
+- Implementations that fail to follow this rule will see non-deterministic merge outcomes — the override path in §7.0 in particular depends on the override's Lamport being strictly greater than the pre-override `failed-permanent`'s Lamport.
+
+**Override stickiness**: when `payments.importInclusionProof()` (§6.3) transitions `failed-permanent → finalizing`, the writer also sets a sticky boolean flag `overrideApplied: true` on the entry. This flag survives all subsequent merges (set-OR semantics: any replica having `overrideApplied === true` causes the merged entry to have it). When `overrideApplied === true`, the active-state's `finalizing` wins against any replica's `failed-permanent` regardless of Lamport — this prevents the override being undone by a stale replica with a higher Lamport for unrelated reasons.
+
 **Conflict resolution rules under replica merge:**
 
 1. **Status field — three-way partition with override-aware tie-break:**
-   - If both replicas are **hard-terminal**: prefer `finalized` over any other; among `failed-permanent | expired`, prefer `failed-permanent`. Tie-break by Lamport timestamp (higher wins — the more-recent decision sticks). EXCEPTION (override case): if one replica is in `finalizing` (active) with a Lamport strictly later than the other replica's `failed-permanent`, the `finalizing` replica wins. This is the operator-override path: `payments.importInclusionProof()` with `allowInvalidOverride` increments Lamport and transitions `failed-permanent → finalizing`; this transition MUST survive merge against a stale remote replica.
+   - If both replicas are **hard-terminal**: prefer `finalized` over any other; among `failed-permanent | expired`, prefer `failed-permanent`. Tie-break by Lamport timestamp (higher wins — the more-recent decision sticks). EXCEPTION (override case): if one replica is in `finalizing` (active) with `overrideApplied === true`, that replica wins regardless of Lamport against the other replica's `failed-permanent`. The override flag is sticky and survives merge (set-OR), so a wallet that has performed `importInclusionProof()` keeps the override even if a remote replica's Lamport runs ahead for unrelated reasons.
    - If both are **active**: prefer the more-advanced state per the lattice `packaging < pinned < sending < {delivered, delivered-instant} < finalizing`. Among `delivered` and `delivered-instant` (siblings — different finalization modes for the same send), tie-break by Lamport timestamp; the higher Lamport wins because the more-recently-decided mode reflects the actual outcome.
    - If one is **active** and the other is **soft-terminal** (`failed-transient`): active wins. A replica still progressing should not be overwritten by another replica's transient failure.
    - If one is **active** and the other is **hard-terminal**: hard-terminal wins (subject to the override exception above).
