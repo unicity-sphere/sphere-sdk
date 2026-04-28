@@ -64,6 +64,8 @@ import {
   STORAGE_KEYS_GLOBAL,
   TIMEOUTS,
 } from '../constants';
+import { isUxfTransferPayload } from '../types/uxf-transfer';
+import { encodeTransferPayload, decodeTransferPayload } from '../uxf/transfer-payload';
 
 // =============================================================================
 // Configuration
@@ -590,9 +592,32 @@ export class NostrTransportProvider implements TransportProvider {
   ): Promise<string> {
     this.ensureReady();
 
-    // Create encrypted token transfer event
-    // Content must have "token_transfer:" prefix for nostr-js-sdk compatibility
-    const content = 'token_transfer:' + JSON.stringify(payload);
+    // T.2.E — shape-agnostic outbound serialization.
+    //
+    // Two valid serialization paths exist for the `TokenTransferPayload`
+    // tagged union (`types/uxf-transfer`):
+    //
+    //   1. UXF v1.0 envelopes (`kind === 'uxf-car' | 'uxf-cid'`) and the
+    //      four legacy shapes recognized by `isLegacyTokenTransferPayload`:
+    //      use the canonical, byte-deterministic encoder from T.1.D so that
+    //      every legitimate envelope on the wire is identical across
+    //      sender runs (important for content-addressed audit and replay
+    //      detection — §5.6).
+    //   2. Anything else (custom test payloads, callers that bypass the
+    //      `as unknown as TokenTransferPayload` cast already used by
+    //      `PaymentsModule` for partially-built shapes): fall through to
+    //      `JSON.stringify`. This preserves backward compatibility with
+    //      the pre-T.2.E behavior — no caller currently exercises this
+    //      path, but the safety valve is critical to avoid breaking the
+    //      legacy chain split during the migration wave.
+    //
+    // Content must have "token_transfer:" prefix for nostr-js-sdk
+    // compatibility — preserved verbatim from the pre-T.2.E implementation
+    // and matched by `stripContentPrefix()` on the receive side.
+    const serialized = isUxfTransferPayload(payload)
+      ? encodeTransferPayload(payload)
+      : JSON.stringify(payload);
+    const content = 'token_transfer:' + serialized;
 
     // IMPORTANT: kind 31113 is a Parameterized Replaceable Event (NIP-01).
     // The relay keeps only the LATEST event per (pubkey, kind, d-tag).
@@ -1411,9 +1436,32 @@ export class NostrTransportProvider implements TransportProvider {
   private async handleTokenTransfer(event: NostrEvent): Promise<void> {
     if (!this.identity) return;
 
-    // Decrypt content
+    // Decrypt content (the `token_transfer:` prefix is stripped inside
+    // `decryptContent` → `stripContentPrefix`, so by the time we get
+    // `content` it's a plain JSON document — no extra trimming required
+    // here).
     const content = await this.decryptContent(event.content, event.pubkey);
-    const payload = JSON.parse(content) as TokenTransferPayload;
+
+    // T.2.E — shape-agnostic inbound parsing.
+    //
+    // `decodeTransferPayload` (T.1.D) is structurally paranoid: it parses
+    // the JSON, runs `isUxfTransferPayload`, and either returns a typed
+    // union value or throws `BUNDLE_REJECTED_MALFORMED_ENVELOPE`. The
+    // outer `handleEvent` switch catches this error and logs at debug
+    // level — same fail-soft behavior as the pre-T.2.E `JSON.parse` path,
+    // which would have thrown `SyntaxError` on bad bytes.
+    //
+    // The handler downstream (PaymentsModule) discriminates by shape:
+    // `kind === 'uxf-car' | 'uxf-cid'` routes to the new UXF receive
+    // path (T.7.A), absence of `kind` routes to the legacy adapter
+    // (existing four-shape `processTokenTransfer` flow).
+    //
+    // Note that `decodeTransferPayload` deliberately collapses every
+    // failure mode (non-JSON, wrong type, missing fields, unknown
+    // discriminator) to a single error code so we don't have to fan-out
+    // here — the receiver's idempotency layer (§5.6) treats every kind
+    // of malformed envelope the same way: drop and move on.
+    const payload = decodeTransferPayload(content);
 
     const transfer: IncomingTokenTransfer = {
       id: event.id,
