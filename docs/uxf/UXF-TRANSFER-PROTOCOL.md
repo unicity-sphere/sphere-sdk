@@ -289,6 +289,17 @@ Inputs: `tokens: Token[]` (selected for transfer), `recipient: PeerInfo`, `trans
 
 - A **coin token** is a token with non-empty `coinData` carrying one or more `(coinId, amount)` entries. Coin tokens MAY be split: the SDK's `TokenSplitBuilder` consumes the source via burn-then-mint and produces N new outputs, each with a fresh `tokenId`. The builder enforces (a) every output has non-empty `coinData`, (b) the union of output coin types equals the parent's coin types exactly (no dropping a coin type), (c) per-coin amounts are conserved across outputs.
 - An **NFT token** is a token with empty / null `coinData`, distinguished solely by its unique `tokenId`. NFT tokens CANNOT be split (the split builder rejects empty-coinData inputs). NFT tokens are transferred WHOLE via `TransferTransaction` — the source `tokenId`, `tokenType`, and identity data are preserved verbatim; only the current-state predicate changes.
+
+**Class predicate (normative)** — implementations MUST use exactly this rule to classify a token at runtime:
+
+```
+isNft(token: Token): boolean =
+  token.coins === null || token.coins === undefined || token.coins.length === 0
+```
+
+where `token.coins` is the post-prune list of fungible coin entries. Implementations MUST prune zero-amount entries (`amount === '0'`) from `coinData` at ingest time (deserialization from CAR or storage) so that the class predicate is stable. A token with `coinData: [{coinId, amount: '0'}]` MUST be normalized to `coinData: []` before the class check fires. This avoids the ambiguous case where `[{amount: '0'}]` could be classified inconsistently across implementations.
+
+> **Note on common NFT patterns**: this protocol's NFT model is "empty coinData" — distinct from the Ethereum-NFT-as-balance-of-1 pattern (where `coinData: [{coinId: <NFT-id>, amount: '1'}]` represents the NFT). Tokens following the Ethereum pattern are CLASSIFIED AS COINS by this protocol's predicate (non-empty coinData) and transferred via split, not whole-token. If a future revision adds explicit support for the Ethereum-style pattern, it would require a new asset kind discriminator (e.g., `kind: 'erc1155-balance'`) extending the union per §10.4.
 - **No mixed-asset tokens**: this protocol does NOT permit a single token to carry both a non-empty `coinData` AND a separable "NFT identity." Every token's `tokenId` is unique by construction, but the protocol treats a token as one OR the other, not both. A future protocol revision MAY introduce a primitive that preserves `tokenId` while modifying `coinData`; until then, attempts to model mixed-asset tokens are out of scope.
 
 This canonical model has direct consequences for §4.1 below: NFT transfers are always whole-token (no split, no change); coin transfers may split but never produce empty-coinData outputs; the two operations cannot be combined on a single source token.
@@ -1488,7 +1499,7 @@ The TXF wire shapes are **permanent**, not deprecated. There is no migration win
 ### 10.1 Sender side
 
 `PaymentsModule.send(...)` accepts:
-- `coinId: string`, `amount: string` — primary asset (always required; backward-compat with single-coin API).
+- `coinId: string`, `amount: string` — primary coin slot. Required by the type for v1.0 backward compatibility; the implementation wave widens the type to `coinId?: string; amount?: string;`. Post-widening, NFT-only sends omit both fields. Until the widening releases, NFT-only sends are not expressible against the v1.0 type signature (per §4.1 — there is no valid placeholder).
 - `additionalAssets?: ReadonlyArray<AdditionalAsset>` — multi-asset extension where `AdditionalAsset = {kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. When present, target list construction follows §4.1 step 1 (primary coin slot prepended if both `coinId` and `amount` are present; additionalAssets appended verbatim). Distinct-coin and distinct-NFT-tokenId rules apply. Receivers reject unrecognized `kind` values with `UNKNOWN_ASSET_KIND` (forward-compat). Omitting this field preserves single-coin behavior identically to prior SDK versions.
 - `confirmNftPending?: boolean` — default `false`. Required = `true` to send NFT-class targets backed by pending source tokens (per §4.1 step 2 cascade asymmetry warning). The flag exists to ensure callers explicitly acknowledge that a cascaded NFT is irrecoverable — there is no fungible replacement for an NFT identity.
 - `transferMode: 'instant' | 'conservative' | 'txf'` — default `'instant'`.
@@ -1526,7 +1537,14 @@ Per §7.2: existing per-token outbox entries are migrated to bundle-grained on f
 
 ### 10.4 Capability detection (informational only)
 
-The identity binding event (NIP-related) MAY include a `wireProtocols` array describing which wire shapes the peer's wallet supports — e.g., `['uxf-car', 'uxf-cid', 'txf']`. The sender's UI MAY warn when a UXF-only-aware recipient receives a `'txf'` send, or when a TXF-only recipient is targeted with a UXF send. The SDK NEVER auto-coerces the mode based on this hint — the caller's `transferMode` choice is authoritative.
+The identity binding event (NIP-related) MAY include capability hints describing which wire shapes and asset kinds the peer's wallet supports:
+
+- `wireProtocols: string[]` — supported wire shapes, e.g., `['uxf-car', 'uxf-cid', 'txf']`.
+- `assetKinds: string[]` — supported `additionalAssets` discriminator values, e.g., `['coin']` (v1.0), `['coin', 'nft']` (current), or `['coin', 'nft', 'voucher']` (future). v1.0 wallets that pre-date this hint omit it entirely; receivers reading an absent `assetKinds` SHOULD assume `['coin']` for safety.
+
+The sender's UI MAY warn when a UXF-only-aware recipient receives a `'txf'` send, or when a recipient's `assetKinds` set doesn't include kinds the sender is about to ship. The SDK NEVER auto-coerces the mode or strips entries based on this hint — the caller's `transferMode` and `additionalAssets` choices are authoritative.
+
+**Forward-compat reject (recipient-side, normative)**: regardless of any capability hint, receivers MUST reject `additionalAssets` entries with unrecognized `kind` values via `UNKNOWN_ASSET_KIND`. The reject rule is the actual interop guarantee; the capability hint is an informational early-warning. Senders targeting an older protocol version SHOULD consult the recipient's `assetKinds` to pre-empt likely rejections, but a reject from the receiver remains authoritative if the hint was missing or stale.
 
 ---
 

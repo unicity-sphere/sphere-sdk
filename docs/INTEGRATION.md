@@ -341,6 +341,7 @@ if (result.error) {
 | `memo` | No | Optional message to recipient |
 | `transferMode` | No | `'instant'` (default) or `'conservative'` — see Transfer Modes section |
 | `allowPendingTokens` | No | Default `false`. When `true`, the source-token selector may pick `pending` tokens after exhausting `valid` ones (chain mode) |
+| `confirmNftPending` | Conditionally | Default `false`. Required `true` when sending NFT entries with `allowPendingTokens: true` AND any NFT source has unfinalized predecessor txs. Without it, the call rejects with `NFT_PENDING_REQUIRES_CONFIRMATION`. NFT cascades are irrecoverable (no fungible replacement) — see "Pending NFT cascade caveat" below. |
 
 **Multi-coin transfer example** (deliver UCT + USDU + ALPHA in one call):
 
@@ -384,7 +385,7 @@ const result = await sphere.payments.send({
 //     current state's predicate changes to bind to @bob.
 ```
 
-**NFT-only transfer** (no coin component): the type signature retains `coinId`/`amount` as required for v1.0 backward compatibility; the implementation wave widens them to optional. Until that wave lands, NFT-only sends include a small primary coin slice as a placeholder (or wait for the type-widening release). Once optional, NFT-only sends omit the primary slot entirely:
+**NFT-only transfer** (no coin component): the type signature retains `coinId`/`amount` as required for v1.0 backward compatibility; the implementation wave widens them to optional. **Until the widening releases, NFT-only sends are not expressible against the v1.0 type signature** — defer to the widening release. Do NOT fabricate a placeholder coin slice (any non-zero amount would silently transfer real coin value; the spec abolishes the placeholder convention per UXF-TRANSFER-PROTOCOL §4.1 — coin amounts MUST be > 0 with no exceptions). Once optional, NFT-only sends omit the primary slot entirely:
 
 ```typescript
 // Post-widening (NFT-only):
