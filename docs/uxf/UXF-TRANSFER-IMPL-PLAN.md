@@ -132,7 +132,9 @@ Each task lists `id, title, wave, files_touched, depends_on, parallel_with, skil
 
 ### T.0 — Pre-T.1 prerequisites
 
-#### T.0.G7-prereq — Wave G.7 per-entry-key layout verified on `main`
+> **Round-2 W5 split**: the original single T.0.G7-prereq carried a 5x scope-creep risk (80→400 LOC if G.7 is incomplete). Split into T.0.G7-verify (test-only, fails fast) and T.0.G7-fill-gaps (conditional, lands only if verify fails). Honest about the worst case.
+
+#### T.0.G7-verify — Wave G.7 per-entry-key layout verified on `main` (test-only)
 
 - **wave**: T.0 (prerequisite, lands BEFORE T.1)
 - **files_touched**:
@@ -140,16 +142,32 @@ Each task lists `id, title, wave, files_touched, depends_on, parallel_with, skil
     - `profile/profile-token-storage-provider.ts` exposes the per-entry-key writer used at runtime to expand `{addr}.outbox` → `${addr}.outbox.${id}` (and similarly for `audit`, `invalid`, `finalizationQueue`).
     - `profile/profile-storage-provider.ts`'s dynamic-key matcher recognizes prefix-scan queries `${addr}.outbox.*`.
     - Round-trip a synthetic per-entry-key record and prove it survives the OrbitDB → KV translation.
-  - If any assertion fails, the test exposes the gap; T.1.E cannot merge until they pass on `main`.
 - **depends_on**: (none — this is the entry point)
 - **parallel_with**: (lands first; serialized)
 - **skill_tag**: `storage`
 - **acceptance**:
-  - All 4 prefix-scan key shapes (`{addr}.outbox.*`, `{addr}.audit.*`, `{addr}.invalid.*`, `{addr}.finalizationQueue.*`) pass round-trip via the existing Wave G.7 layout, OR a stub PR documents the missing pieces and lands them inside this task.
-  - The test file documents the canonical per-entry-key contract for downstream tasks (T.1.E references this contract by file path).
+  - If all 4 prefix-scan key shapes (`{addr}.outbox.*`, `{addr}.audit.*`, `{addr}.invalid.*`, `{addr}.finalizationQueue.*`) pass round-trip on `main`: this task lands the test only.
+  - If any fail: this task fails CI and `T.0.G7-fill-gaps` becomes a hard prerequisite for T.1.E.
 - **est_loc**: 80
-- **risks**: if Wave G.7 is INCOMPLETE on `main` (per-entry-key writer exists for outbox but not for the new collections), this task expands to add the missing writers — could blow out from 80 LOC to ~400 LOC.
+- **risks**: low — pure verification; either passes (T.0.G7-fill-gaps not needed) or fails clearly.
 - **spec_refs**: §7 (outbox key shape); PROFILE-ARCHITECTURE.md §10.12.
+
+#### T.0.G7-fill-gaps — Land missing per-entry-key writers (conditional)
+
+- **wave**: T.0 (prerequisite, lands ONLY if T.0.G7-verify fails)
+- **files_touched** (estimated; exact files depend on what verify exposes):
+  - MODIFIED: `profile/profile-token-storage-provider.ts` — extend per-entry-key writer to cover any missing collections (`audit`, `invalid` multi-rep, `finalizationQueue`).
+  - MODIFIED: `profile/profile-storage-provider.ts` — extend dynamic-key matcher to recognize new prefixes.
+  - NEW: `tests/unit/profile/per-entry-key-writers.test.ts` — round-trip tests per missing writer.
+- **depends_on**: T.0.G7-verify (with FAIL outcome).
+- **parallel_with**: (none — must merge before T.1.E).
+- **skill_tag**: `storage`
+- **acceptance**:
+  - All 4 prefix-scan key shapes pass round-trip after this task.
+  - Re-running T.0.G7-verify on the same commit passes.
+- **est_loc**: 0–400 (CONDITIONAL — only LOC if verify fails). Range = 0 (best case: G.7 complete) to ~400 (worst case: 4 collections missing writers).
+- **risks**: blocks T.1.E if it triggers; could add 1–3 days to the critical path under worst case.
+- **spec_refs**: §7; PROFILE-ARCHITECTURE.md §10.12.
 
 ---
 
@@ -282,7 +300,7 @@ T.1 lands the types, enums, key-mapping rows, and constants module. Nothing in T
   - MODIFIED: `tests/unit/profile/profile-storage-provider.test.ts` — extend the per-address scoping cases to cover `audit` and `finalization_queue`.
   - NEW: `tests/unit/core/Sphere.clear.test.ts` (extension) — assert the new key-prefixes are cleared on `Sphere.clear()`.
   - NEW: `profile/types.ts` doc comment block — explicit note that `Sphere.clear()` reaches these via parent storage clear, not via the mapping table (W46, prevents future "mapping is incomplete" confusion).
-- **depends_on**: T.1.A, T.1.C, **T.0.G7-prereq** (Wave G.7 per-entry-key layout — hard dep, not a soft pre-task check; see W8/round-1-#9).
+- **depends_on**: T.1.A, T.1.C, **T.0.G7-verify** (must pass) AND **T.0.G7-fill-gaps if verify failed** (conditional). See round-2 W5 split.
 - **parallel_with**: T.1.B.1, T.1.D.
 - **skill_tag**: `storage`
 - **acceptance**:
@@ -715,6 +733,27 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
 
 ---
 
+#### T.5.B.0.5 — OrbitDB-write-fairness ADR + cap (NEW per round-2 W8)
+
+- **wave**: T.5 (lands BEFORE T.5.C's design is frozen)
+- **files_touched**:
+  - NEW: `docs/uxf/ADR-005-orbitdb-write-fairness.md` (~50 LOC) — decision record on `MAX_CONCURRENT_ORBITDB_WRITES` cap value + fairness-queue strategy. Default proposed: 8 (half of MAX_INGEST_WORKERS to leave OrbitDB headroom for replication merges); revisit-criteria section requires re-eval if T.8.E.1 load test shows >50% queue depth at the cap.
+  - MODIFIED: `modules/payments/transfer/limits.ts` — add `MAX_CONCURRENT_ORBITDB_WRITES = 8` constant.
+  - NEW: `profile/orbitdb-write-fairness.ts` (~30 LOC) — fairness-queue stub (round-robin across pending writers; bounded concurrent in-flight count). T.5.B / T.5.C / T.6.A all consume this primitive.
+- **depends_on**: T.5.B.0 (manifest-cid-rewrite needs the fairness queue available to call into).
+- **parallel_with**: T.5.B (after T.5.B.0 lands).
+- **skill_tag**: `crdt`
+- **acceptance**:
+  - ADR documents the choice + revisit criteria.
+  - `MAX_CONCURRENT_ORBITDB_WRITES` is exported from `limits.ts`.
+  - Fairness-queue stub passes basic round-robin unit tests.
+  - T.8.E.1 load test gates verify the cap is appropriate; if wrong, ADR revisit triggered.
+- **est_loc**: 80
+- **risks**: cap too low → bottleneck under load; too high → OrbitDB merge thrashing. ADR's load-test gate catches both before T.8.D cutover.
+- **spec_refs**: PROFILE-ARCHITECTURE.md §10.
+
+---
+
 #### T.5.B — Sender-side finalization worker
 
 - **wave**: T.5
@@ -730,8 +769,8 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/§5.5-pollingDeadline-propagation.test.ts` — **W17**: pollingDeadline propagation to T.5.B's polling loop in outbox path.
   - NEW: `tests/unit/payments/transfer/§5.5-2x-window-safety-net.test.ts` — **W26**: 2× POLLING_WINDOW safety net via deterministic clock.
 - **depends_on**: T.1.A, T.1.C, T.1.F, T.5.A, T.5.B.0, T.6.A.
-- **parallel_with**: T.5.C (peers — both consume T.5.B.0 + T.5.B.5), T.5.F.
-  - **Note**: T.5.B.5 is NOT a peer of T.5.B; T.5.B.5 depends on T.5.B (cascade walker is a downstream concern of the sender worker that needs cascade hooks integrated).
+- **parallel_with**: T.5.C (peers — both consume T.5.B.0 from a common ancestor; T.5.C also consumes T.5.B.5 which itself depends on T.5.B), T.5.F.
+  - **Note**: T.5.B.5 is NOT a peer of T.5.B — T.5.B.5 depends on T.5.B (cascade walker is downstream of the sender worker that needs cascade hooks integrated). T.5.B and T.5.C share T.5.B.0 only.
 - **skill_tag**: `worker`
 - **acceptance**:
   - Configuration validity rule (§5.5 step 6 paragraph "Configuration validity rule (normative)") validated at startup; cumulative backoff for the first MIN_POLL_ATTEMPTS polls ≤ POLLING_WINDOW.
@@ -745,7 +784,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - **W14**: per-aggregator concurrency cap default 16 enforced.
   - **W17**: `pollingDeadline` propagation to outbox path explicit test.
   - On hard-fail, **delegate cascade to T.5.B.5 walker (C3 applied: T.5.B no longer owns cascade — it's a consumer of T.5.B.5)**.
-- **est_loc**: 1180 (was 1100; +80 for C10/C12/C13/W14/W16/W17/W26 tests).
+- **est_loc**: 1580 (was 1180; +400 per round-2 W7 — restoring 1:1.5 impl:test ratio for race-lost / conflicting-proofs / retry / trustbase deterministic-clock tests).
 - **risks**: subtle deadline-vs-attempt-count interaction — every state transition has a directed test; deterministic-clock test harness used throughout.
 - **spec_refs**: §6.1, §5.5 step 5–6, §6.3.
 
@@ -797,9 +836,14 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
 - **depends_on**: T.1.A, T.1.C, T.1.E (`finalization_queue` key), T.1.F, T.3.B.1, T.3.B.2, T.3.C, T.3.D, T.5.B.0 (polling-policy + manifest-cid-rewrite — peer dep, NOT through T.5.B), T.5.B.5 (cascade walker — recipient worker invokes cascade on hard-fail, must depend on the walker).
 - **parallel_with**: T.5.B (both consume T.5.B.0 directly), T.5.D.
 
-  **Acceptance addendum (C3 fix)**: on hard-fail of any queue entry for a `tokenId`, the recipient worker MUST invoke T.5.B.5 cascade-walker (per-class: coin → splitParent walk; NFT → outbox-driven `transfer:cascade-failed` event for downstream recipients of the same `tokenId`). Tests:
-   - `recipient-cascade-on-hard-fail.test.ts` — hard-fail fires cascade walker.
-   - `recipient-cascade-coin-vs-nft.test.ts` — class-disjoint cascade paths exercised.
+  **Acceptance addendum (C3 fix, refined per round-2 W4)**: on hard-fail of any queue entry for a `tokenId`, the recipient worker MUST invoke T.5.B.5 cascade-walker. Recipient-side cascade semantics (clarified):
+   - **Coin path**: a recipient who has not split or forwarded the received token has no `splitParent` references locally — the coin-class walk is a NO-OP (zero children). This is the typical case (recipient just received it). The walk is required only for chain-mode recipients who themselves split the received token in instant mode before resolution.
+   - **NFT path**: the recipient invokes the outbox-driven notification only if THEY have an outbox entry forwarding the failed-NFT to a further downstream recipient. Pure-receive (no forward) → no notification fires.
+   - **Self-invalidation**: in BOTH classes, the recipient's own copy of the token transitions to `_invalid` (reason='oracle-rejected' or 'race-lost' per source).
+   Tests:
+   - `recipient-cascade-on-hard-fail.test.ts` — hard-fail self-invalidates the received token.
+   - `recipient-cascade-no-children.test.ts` — pure-receive case (no local splits/forwards) → coin walk is no-op; NFT notification empty.
+   - `recipient-cascade-with-forward.test.ts` — recipient who forwarded the received NFT in instant mode emits `transfer:cascade-failed` for the further-downstream recipient.
 - **skill_tag**: `worker`
 - **acceptance**:
   - K queue entries per K-deep chain-mode token; transition `pending → valid` only after all K resolve successfully.
@@ -809,7 +853,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - **C12**: race-lost detected via poll-mismatch path.
   - **W5**: step-9 `revaluate(tokenId, identity, oracle)` entry-point on disposition-engine.
   - **W15**: §5.6 idempotency invariant — replay with different proof but same transactionHash converges.
-- **est_loc**: 1240 (was 1140; +100 for W5/W15 tests + revaluate entry-point).
+- **est_loc**: 1740 (was 1240; +500 per round-2 W7 — restoring 1:1.5 impl:test ratio for queue-drain / re-evaluator / cascade-on-hard-fail / step-9 atomic update tests).
 - **risks**: locking semantics under concurrent ingest + finalization on same tokenId — exhaustive state-machine test with deterministic interleavings.
 - **spec_refs**: §5.5, §5.6, §6.2.
 
@@ -1269,7 +1313,7 @@ T.8 ships the informational `wireProtocols` field on the identity binding event,
   - MODIFIED: `cli/index.ts`, `modules/accounting/AccountingModule.ts` — final pass to remove legacy fall-through code.
   - NEW: `docs/uxf/UXF-TRANSFER-CUTOVER-RUNBOOK.md` — operator guide for cutover, including back-out procedure (revert this PR + run `tools/restore-legacy-outbox.ts` from T.6.D.2).
   - **W33**: ADR appendix in cutover runbook listing every export/function/type slated for deletion (legacy_outbox decoder, legacy TXF send fast path, etc.).
-- **depends_on**: T.7.C, T.7.E (default flip), T.6.D.2 (restore script ready), T.8.A (regression assertion still passing).
+- **depends_on**: T.7.C, T.7.E (default flip), T.6.D.2 (restore script ready), T.8.A (regression assertion still passing), **external-acks-received** (NON-CODE GATE: agentsphere maintainer ack on `onIntent` widening + sphere app maintainer ack + openclaw-unicity maintainer ack — round-2 W6). CI validates each ack via a tracking-issue closed-state check before allowing merge.
 - **parallel_with**: T.8.B, T.8.C, T.8.E.1/2/3.
 - **skill_tag**: `cli-cleanup`
 - **acceptance**:
@@ -1379,7 +1423,7 @@ The work decomposes into 6 parallel lanes after T.1 lands. Each lane can be staf
 | **Workers / Cascade** | T.5.B.0 → T.5.B → T.5.B.5, T.5.C → T.5.D → T.5.E → T.5.F | worker + recipient | gating for T.7.A |
 | **Tests / Fixtures / Cutover** | T.8.A → T.8.B, T.8.C → T.8.E.1/2/3 → cutover | tests | follows everything |
 
-### Critical path (longest serial chain) — 13 PRs
+### Critical path (longest serial chain) — 15 PRs (16 with T.0.G7-prereq)
 
 ```
 T.1.A    (types)                                     [day 1-2]
@@ -1410,10 +1454,10 @@ T.7.B    (legacy adapter)                            [day 14-15 in parallel]
   ↓
 T.7.E    (default flip)                              [day 15-16]
   ↓
-T.8.D    (cutover)                                   [day 16-18]
+T.8.D    (cutover)                                   [day 18-22]
 ```
 
-13 PR-sized merges deep on the critical path; with parallel lanes, total wall-clock is **~16-18 days for 4 senior agents**, **~5-6 weeks for 2 senior agents**.
+15 PR-sized merges deep on the critical path (16 if `T.0.G7-prereq` triggers fill-gaps); with parallel lanes, total wall-clock is **~18-22 days for 4 senior agents**, **~6-7 weeks for 2 senior agents**.
 
 ### Concurrency opportunities
 
@@ -1608,7 +1652,7 @@ The 8 booleans + tri-state outbox naively allow 768 combinations. Most are nonse
 - `txfOptIn: true` AND `typesWidening: false` — TXF mode is part of the widened TransferMode enum.
 - `outbox: 'uxf'` AND `senderUxf: false` — UXF-only outbox requires UXF sender.
 
-T.1.B.1 implements `validateFeatures(features): void` (throws on invalid combo) and the unit test `tests/unit/core/feature-validation.test.ts` enumerates ALL 7 valid configurations + every blacklisted invalid combination.
+**`validateFeatures` semantics — strict whitelist (round-2 steelman C2)**: T.1.B.1's `validateFeatures(features): void` throws `INVALID_FEATURE_COMBINATION` for **any** setting that does not exactly match one of V0–V7 (strict whitelist, NOT blacklist). The 8 explicit invalid combinations listed above are illustrative — they document the *reasoning* for the whitelist's exclusions but are not the only rejected cases. The 753 unenumerated combinations all fail validation, by construction. The unit test `tests/unit/core/feature-validation.test.ts` enumerates: (a) ALL 8 valid configurations (V0–V7) → pass; (b) 8 explicit invalid combinations → throw; (c) at least 10 randomly-sampled non-V combinations (e.g., V1 + `txfOptIn:true` + `outbox:'dual-write'`) → throw with the canonical error code.
 
 ### §7.B Dual-write mode (formalized in §7.0 outbox state machine — W43)
 
@@ -1671,8 +1715,8 @@ These do not block T.1–T.8 but should be resolved before merge of the correspo
 8. **[NEW]** T.5.B.5 — cascade walker visited-set sharing across worker threads — **W32** clarified per-call-stack scope, but for a single Sphere instance with multiple workers, two cascades from different parents may visit a shared child. Confirm: per-call-stack visited-set + per-tokenId mutex (T.1.F) prevents double-cascade; document the proof in T.5.B.5 inline.
 9. **[NEW]** T.5.F — trustBase refresh storm — debounce + cool-down for refresh; confirm rate limit on aggregator side; coordinate with aggregator team.
 10. **[NEW]** T.7.C.5 — external-repo coordination — proactive notification to agentsphere + sphere app maintainers about the `schemaVersion` field. Track ack from each downstream maintainer before T.8.D. **Steelman round 1 #10**: T.7.C.5 itself is documentation + a schemaVersion field; the actual external migration is unsolved and must NOT block T.8.D's coordination gate.
-11. **[NEW]** T.5.B / T.5.C test-LoC ratios are below 1:1.5 baseline for crypto / CRDT code (round-1 #6). Either bump test budgets (T.5.B: +400 LOC for race-lost / conflicting-proofs / retry / trustbase explicit deterministic-clock tests; T.5.C: +500 LOC for queue-drain / re-evaluator / cascade-on-hard-fail / step-9 atomic update) or split test files into separate sub-tasks. Implementers MUST keep impl:test ratio ≥ 1:1.2 on critical-path tasks; revisit at code-review time.
-12. **[NEW]** Cross-tokenId disk-I/O contention not modeled (round-1 #8). Add `MAX_CONCURRENT_ORBITDB_WRITES` global cap to `limits.ts` + a fairness queue, OR document that OrbitDB is internally serialized (cite source). Implementer must verify under load test in T.8.E.1.
+11. **[RESOLVED]** ~~T.5.B / T.5.C test-LoC ratios~~ — round-2 W7: T.5.B est_loc bumped 1180 → 1580 (+400); T.5.C bumped 1240 → 1740 (+500). 1:1.5 impl:test ratio restored for both critical-path tasks.
+12. **[NEW — actionable, not punted]** Cross-tokenId disk-I/O contention (round-1 #8 / round-2 W8). Add a NEW pre-T.5.C task: `T.5.B.0.5 — OrbitDB-write-fairness ADR + cap` (~80 LOC: 1 ADR doc + `MAX_CONCURRENT_ORBITDB_WRITES` constant in `limits.ts` + a fairness-queue stub). Lands BEFORE T.5.C's design is frozen. T.8.E.1 load test then verifies the cap value; if cap is wrong, revisit per ADR's revisit-criteria section.
 13. **[NEW]** Per-feature flag invalid-combination matrix is now enumerated in §7.A (round-1 #5 / #7); `validateFeatures(features)` is a T.1.B.1 deliverable. Steelman should verify each combo's effect on a stale wallet (e.g., V3 → V2 rollback during dual-write).
 14. **[NEW]** T.6.D.2 byte-identity definition (round-1 #13): "byte-identical" excludes `lamport`, `observedAt` timestamps, `_schemaVersion`, sentinel keys. Implementers test against the explicit field-list, not raw byte equality.
 15. **[NEW]** Spec-citation prefix on test filenames (round-1 #12): mandatory for spec-defined behavior tests (cite the §section), optional for adversarial-only tests where no normative requirement applies. Implementers follow the convention; reviewers enforce it on PRs that introduce tests.
@@ -1738,7 +1782,7 @@ Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied cons
 | T.8.E.2 | Compatibility test suite | T.8 | tests | 600 |  |
 | T.8.E.3 | Adversarial test suite | T.8 | tests | 1100 |  |
 
-**Total**: 49 tasks (was 38; +11 from C2/C3/C5/C7/W1/W2/W3/W10/W41 splits and new tasks), ~26,400 LOC including tests (was ~22,500), **13 critical-path tasks** (was ~18 — corrected count).
+**Total**: 50 tasks (was 38; +12 from C2/C3/C5/C7/W1/W2/W3/W10/W41 splits and new tasks, plus T.0.G7-prereq), ~26,500 LOC including tests (was ~22,500), **15 critical-path tasks** (16 if T.0.G7-prereq triggers fill-gaps).
 
 **Tasks added/split (delta from v1)**:
 - Split: T.1.B → T.1.B.1 + T.1.B.2 (W1)
