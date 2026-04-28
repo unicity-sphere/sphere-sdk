@@ -59,9 +59,13 @@ T.2 (sender              T.3 (recipient ingest  T.6 (outbox refactor  T.8.tests-
 
 ### Critical path (longest serial chain) — VERIFIED
 
-The architect computed the real longest serial chain (15 PRs):
+The architect computed the real longest serial chain (15 PRs in T.1–T.8; 16 with T.0.G7-verify always landing as a small test-only PR; 17 worst case if T.0.G7-fill-gaps also triggers):
 
 ```
+T.0.G7-verify  (Wave G.7 layout verification, always lands)
+  ↓
+[T.0.G7-fill-gaps if verify failed]                       (conditional)
+  ↓
 T.1.A  (UxfTransferPayload + DeliveryStrategy)
   ↓
 T.1.B  (TransferMode/TransferRequest widening — split into B.1+B.2)
@@ -93,7 +97,7 @@ T.7.E  (default-mode flip)
 T.8.D  (production cutover)
 ```
 
-That's **15 PRs** wall-clock (counted: T.1.A, T.1.B, T.1.E, T.1.F, T.6.A, T.6.B, T.5.A, T.5.B, T.5.B.5, T.5.C, T.5.D, T.7.A, T.7.B, T.7.E, T.8.D). With 4 senior agents working in parallel on independent lanes, total is **~18–22 days**. With 2 agents, **~6–7 weeks**.
+That's **16 PRs** wall-clock (counted: T.0.G7-verify, T.1.A, T.1.B, T.1.E, T.1.F, T.6.A, T.6.B, T.5.A, T.5.B, T.5.B.5, T.5.C, T.5.D, T.7.A, T.7.B, T.7.E, T.8.D), or **17** if T.0.G7-fill-gaps triggers. With 4 senior agents working in parallel on independent lanes, total is **~18–22 days**. With 2 agents, **~6–7 weeks**.
 
 > Note: prior plan cited a 10-PR critical path which omitted T.1.E, T.1.F, T.5.B.5, and T.7.B. The 15-PR chain is the correct figure; §3 parallelization map and the appendix are aligned to it.
 
