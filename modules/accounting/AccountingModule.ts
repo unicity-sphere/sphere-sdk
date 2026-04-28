@@ -4842,9 +4842,13 @@ export class AccountingModule {
           // entries before the next event re-checks. Bounded total per
           // invoice: MAX_ORPHAN_ENTRIES_PER_INVOICE strictly.
           if (mtEntryCount >= MAX_ORPHAN_ENTRIES_PER_INVOICE) {
-            // Cap reached — drop remaining tokens but still update the
-            // tokenInvoiceMap below so verifyPayout's reverse lookup stays
-            // consistent for the tokens we DID write.
+            // Cap reached — drop remaining tokens entirely. Tokens already
+            // processed earlier in this loop iteration retain BOTH their
+            // ledger entry and their tokenInvoiceMap entry; subsequent
+            // tokens (which would have been dropped from the ledger anyway)
+            // get NEITHER. This means verifyPayout's reverse lookup on a
+            // capped-out token returns empty → its new fail-closed branch
+            // returns unverified, which is the safer outcome under DOS.
             break;
           }
           const orphanKey = `mt:${token.id}:${transfer.id}`;
