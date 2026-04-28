@@ -126,6 +126,37 @@ export type SphereErrorCode =
   | 'BUNDLE_REJECTED_MALFORMED_ENVELOPE'
   | 'BUNDLE_REJECTED_MULTI_ROOT'
   | 'BUNDLE_REJECTED_INVALID_CAR'
+  // UXF transfer protocol error codes (T.3.A — bundle acquirer + verifier).
+  // The recipient-side bundle pipeline surfaces these structural rejections
+  // before any per-token disposition is computed (§5.1, §5.2):
+  //
+  //   - `BUNDLE_REJECTED_ROOT_CID_MISMATCH` — `payload.bundleCid` did not
+  //     match the CARv1 root CID we extracted from `payload.carBase64`. The
+  //     sender lied about which CID their CAR represents (or the CAR was
+  //     swapped in transit). §5.2 #1.
+  //   - `BUNDLE_REJECTED_CHAIN_DEPTH_EXCEEDED` — at least one CLAIMED token
+  //     (advertised in `payload.tokenIds`) carries an unfinalized-tx chain
+  //     deeper than `MAX_CHAIN_DEPTH` (default 64). The whole bundle is
+  //     rejected. Unclaimed/smuggled roots exceeding the cap are silently
+  //     dropped, NOT escalated to this error (§5.2 #3 two-tier rule).
+  //   - `BUNDLE_REJECTED_UNCLAIMED_ROOT_COUNT_EXCEEDED` — the bundle's pool
+  //     contains more than `MAX_UNCLAIMED_ROOTS` (default 16) `token-root`
+  //     elements that are NOT enumerated in `payload.tokenIds`. Includes
+  //     elements with unknown type-tags as a fail-closed defense (§5.2 #4).
+  //   - `BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED` — `kind: 'uxf-cid'`
+  //     payload arrived but the IPFS fetch path is not enabled in this
+  //     build (T.4.B will land it). Surfaced so callers can distinguish a
+  //     real failure from a deliberate not-implemented branch.
+  | 'BUNDLE_REJECTED_ROOT_CID_MISMATCH'
+  | 'BUNDLE_REJECTED_CHAIN_DEPTH_EXCEEDED'
+  | 'BUNDLE_REJECTED_UNCLAIMED_ROOT_COUNT_EXCEEDED'
+  | 'BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED'
+  // Generic structural rejection — used by the bundle verifier when
+  // `pkg.verify()` reports any non-multi-root structural failure (cycle,
+  // hash mismatch, missing element, type-tag mismatch, ...). The originating
+  // `UxfVerificationIssue[]` is forwarded as `cause` so callers retain
+  // forensic detail without exploding the SphereErrorCode taxonomy.
+  | 'BUNDLE_REJECTED_VERIFY_FAILED'
   // UXF Transfer / Delivery resolver (T.2.C) — §3.3.1 inline-cap & relay-safe ceiling.
   // The resolver maps `(DeliveryStrategy, carBytes)` to a concrete delivery decision
   // (inline base64 vs CID-by-reference) and surfaces TWO distinct failure modes:
