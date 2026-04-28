@@ -216,11 +216,16 @@ export class AccountingModule {
    * the unknown-ledger cap, after which legitimate orphan transfers (out-of-
    * order delivery for real swaps) are silently dropped at the cap-check.
    *
-   * Eviction sweep runs on each `_handleIncomingTransfer` invocation and
-   * removes entries older than UNKNOWN_LEDGER_TTL_MS that never graduated
-   * to a real invoice import.
+   * Round-5 perf: gated by `unknownLedgerNextSweepMs` to amortize the
+   * sweep cost. The naive every-call sweep is O(N) where N=cap=500;
+   * combined with the per-token cleanup loop inside the sweep it became
+   * O(N×M) on every transfer under flood. Now we sweep at most every
+   * `UNKNOWN_LEDGER_SWEEP_INTERVAL_MS` (60s) UNLESS the cap is currently
+   * full, in which case we sweep on each call (the only path that can
+   * actually drop a legitimate orphan).
    */
   private unknownLedgerFirstSeen: Map<string, number> = new Map();
+  private unknownLedgerNextSweepMs: number = 0;
 
   /** W17: Tracks whether tokenScanState has been mutated since last flush. */
   private tokenScanDirty = false;
@@ -4550,7 +4555,7 @@ export class AccountingModule {
         // "synthetic:{transportTransferId}::{coinId}" — match by coinId + direction.
         for (const [existingKey, existingRef] of ledger) {
           if (
-            existingKey.startsWith('synthetic:') &&
+            (existingKey.startsWith('synthetic:') || existingKey.startsWith('synthetic-tx:')) &&
             existingRef.coinId === coinId &&
             existingRef.paymentDirection === paymentDirection
           ) {
@@ -4793,17 +4798,21 @@ export class AccountingModule {
     // order). Mirrors the proactive-indexing buffer used by
     // _processTokenTransactions for on-chain `inv:` references.
     if (!this.invoiceTermsCache.has(invoiceId)) {
-      // W2 (round-4): wrap the orphan-buffer block in withInvoiceGate so
-      // two concurrent _handleIncomingTransfer calls for the same unknown
-      // invoiceId can't each compute mtEntryCount independently and
-      // overshoot the per-invoice cap. The gate serializes the cap check
-      // with the ledger mutation.
+      // W2 (round-4) + round-5 reentrancy fix: serialize the orphan
+      // cap-check + ledger mutation under withInvoiceGate. The previous
+      // round-4 attempt called `_processInvoiceTransferEvent` from inside
+      // the gate when the invoice graduated mid-flight — that callee
+      // re-acquires the SAME gate and AsyncGateMap throws REENTRANT_GATE
+      // (non-reentrant by contract, see core/async-gate.ts). Round-5
+      // pattern: do the cache re-check INSIDE the gate, but if the
+      // invoice graduated, EXIT the gate (don't recurse), then re-enter
+      // _handleIncomingTransfer's normal path on the outside. The
+      // graduated-invoice path will go through `_processInvoiceTransferEvent`
+      // which acquires its own gate — no nesting.
+      let gracefullyGraduated = false;
       await this.withInvoiceGate(invoiceId, async () => {
-        // Re-check: the gate may have been acquired AFTER another caller
-        // imported the invoice (now in invoiceTermsCache) — fall through
-        // to the normal path in that case.
         if (this.invoiceTermsCache.has(invoiceId)) {
-          await this._processInvoiceTransferEvent(transfer, invoiceId, paymentDirection, confirmed);
+          gracefullyGraduated = true;
           return;
         }
       const syntheticRef = this._buildSyntheticTransferRef(
@@ -4834,8 +4843,17 @@ export class AccountingModule {
       // This defends against the orphan-flood DoS — without TTL, an
       // attacker can permanently exhaust the 500-entry cap with garbage
       // memo invoiceIds, dropping legitimate orphan transfers forever.
+      //
+      // Round-5 perf: skip the sweep when (a) it ran recently (60s ago)
+      // AND (b) the cap is not full. Under flood (cap full), every call
+      // sweeps so legitimate transfers can land. Under normal traffic,
+      // sweeps are amortized across 60s windows.
+      const UNKNOWN_LEDGER_SWEEP_INTERVAL_MS = 60_000;
       const nowMs = Date.now();
-      if (this.unknownLedgerFirstSeen.size > 0) {
+      const capFull = this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS;
+      const sweepDue = nowMs >= this.unknownLedgerNextSweepMs;
+      if (this.unknownLedgerFirstSeen.size > 0 && (capFull || sweepDue)) {
+        this.unknownLedgerNextSweepMs = nowMs + UNKNOWN_LEDGER_SWEEP_INTERVAL_MS;
         const expiredIds: string[] = [];
         for (const [unkId, firstSeen] of this.unknownLedgerFirstSeen) {
           if (nowMs - firstSeen > UNKNOWN_LEDGER_TTL_MS) {
@@ -4950,6 +4968,14 @@ export class AccountingModule {
       this.balanceCache.delete(invoiceId);
       await this._flushDirtyLedgerEntries();
       });
+      // Round-5 reentrancy fix: if the invoice graduated WHILE we held the
+      // orphan gate, dispatch to the normal path AFTER releasing the gate.
+      // Calling `_processInvoiceTransferEvent` inside the gate would
+      // re-acquire the same lock and AsyncGateMap would throw
+      // REENTRANT_GATE per its non-reentrant contract.
+      if (gracefullyGraduated) {
+        await this._processInvoiceTransferEvent(transfer, invoiceId, paymentDirection, confirmed);
+      }
       return;
     }
 
@@ -5593,7 +5619,10 @@ export class AccountingModule {
       const firstTokenId = transfer.tokens.find((t) => t.id)?.id;
       const syntheticKey = firstTokenId
         ? `synthetic:${firstTokenId}::${syntheticRef.coinId}`
-        : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+        // Round-5 fix: distinct prefix `synthetic-tx:` so the rebuild
+        // parser doesn't mis-attribute the transferId (a 64-hex Nostr
+        // event id) to tokenInvoiceMap as if it were a tokenId.
+        : `synthetic-tx:${syntheticRef.transferId}::${syntheticRef.coinId}`;
       let mutated = false;
       if (!existingLedger.has(syntheticKey)) {
         // Check no real entry exists for this transfer's tokens (by tokenId prefix match).
@@ -5855,7 +5884,10 @@ export class AccountingModule {
       // history record and matches the token ID used in the transfer event.
       const hKey = entry.tokenId
         ? `synthetic:${entry.tokenId}::${syntheticRef.coinId}`
-        : `synthetic:${syntheticRef.transferId}::${syntheticRef.coinId}`;
+        // Round-5 fix: distinct prefix `synthetic-tx:` so the rebuild
+        // parser doesn't mis-attribute the transferId (a 64-hex Nostr
+        // event id) to tokenInvoiceMap as if it were a tokenId.
+        : `synthetic-tx:${syntheticRef.transferId}::${syntheticRef.coinId}`;
       let hMutated = false;
       if (!hLedger.has(hKey)) {
         // Check for real entries for this specific token (scoped by tokenId, not broad coinId)
