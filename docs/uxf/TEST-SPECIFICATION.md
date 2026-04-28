@@ -6,6 +6,8 @@
 **Source directory:** `uxf/`
 **Test directory:** `tests/unit/uxf/`
 
+> **Scope**: package-layer tests only (DAG round-trip, CDDL constraints, CAR/JSON encoders, verify(), merge(), GC). Transfer-protocol tests — recipient-side disposition matrix (§5.3 [A]–[F]), finalization workers, outbox CRDT, chain-mode merge, multi-asset send, NFT-class detection, periodic rescans, etc. — live in [UXF-TRANSFER-PROTOCOL §11](UXF-TRANSFER-PROTOCOL.md) and land in implementation waves T.3 / T.5 / T.6 / T.8.
+
 This document specifies every test case required to achieve full coverage of the UXF module. Each test case follows the format:
 
 ```

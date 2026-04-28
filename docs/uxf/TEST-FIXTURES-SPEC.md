@@ -5,6 +5,8 @@
 
 This document defines mock token data for testing UXF deconstruction (`deconstructToken`) and reassembly (`assembleToken`) round-trips. Each mock token is specified with enough field detail for unambiguous TypeScript implementation.
 
+> **Transfer-protocol fixture categories** (planned for Wave T.3+ per [UXF-TRANSFER-PROTOCOL §11](UXF-TRANSFER-PROTOCOL.md)): finalized bundle (all proofs attached), unfinalized instant-mode bundle (one or more `inclusionProof: null` transactions), chain-mode bundle with K=2/3/4 unfinalized hops, multi-coin bundle, NFT bundle (empty `coinData`), mixed coin+NFT bundle, multi-root CAR (rejection fixture). These complement the package-layer fixtures here and exercise the §5.3 disposition matrix and §11.4 adversarial seeds.
+
 ---
 
 ## Conventions

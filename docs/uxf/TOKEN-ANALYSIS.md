@@ -1,5 +1,16 @@
 # Unicity Token Data Structure Deep Analysis for UXF
 
+> **Transfer-protocol token-class predicate** (per [UXF-TRANSFER-PROTOCOL §4.1](UXF-TRANSFER-PROTOCOL.md) canonical asset model):
+>
+> ```typescript
+> isNft(token: Token): boolean =
+>   token.coins === null || token.coins === undefined || token.coins.length === 0
+> ```
+>
+> where `token.coins` is the post-prune list (zero-amount entries normalized to `[]` at ingest). Coin tokens (non-empty coinData) and NFT tokens (empty coinData) are class-disjoint at the protocol level — no token carries both. Coin tokens may be split via `TokenSplitBuilder` (each output gets a fresh `tokenId`); NFT tokens are transferred whole-token only (preserving `tokenId`).
+>
+> **Token identity invariance**: `token.id` derives from `genesis.data.tokenId` and is IMMUTABLE across proof attachment. Attaching an inclusion proof changes the token's *CBOR serialization* (and therefore its CID) but never `token.id`. The `_invalid` and `_audit` collections key by `(tokenId, observedTokenContentHash)` to disambiguate multiple representations of the same `tokenId`.
+
 ## 1. Token Field-by-Field Decomposition
 
 The canonical token JSON structure (ITokenJson / TXF v2.0) has five top-level fields. What follows is a field-by-field analysis based on the actual SDK source and sphere-sdk usage patterns.

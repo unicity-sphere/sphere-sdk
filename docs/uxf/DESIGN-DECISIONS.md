@@ -219,3 +219,65 @@ uxf/
 | UxfStorageAdapter | Phase 2 | Replaces TxfStorageData for persistence |
 | Wallet metadata in envelope | Phase 2 | _outbox, _tombstones, etc. |
 | HAMT sharding for large pools | Phase 2 | Only needed at >10K elements |
+
+---
+
+## Inter-Wallet Transfer Protocol Decisions
+
+> Cross-reference: [UXF-TRANSFER-PROTOCOL.md](UXF-TRANSFER-PROTOCOL.md) is the canonical spec for the decisions below. Older decisions in this document that conflict (notably Decision 2 "UXF does not depend on PaymentsModule" and Decision 6 last-writer-wins for proofs) are SUPERSEDED for the inter-wallet transfer flow.
+
+### Decision 10: Aggregator Threat Model — Faulty, Never Hostile
+
+The protocol assumes the L3 aggregator may be **faulty** (drops submissions, returns transient errors, briefly returns inconsistent state across nodes) but **never hostile** (does not actively forge proofs or collude with validators to rewrite history). Out-of-scope failure modes (active forgery, validator collusion, deliberate split-brain on different SMT roots) are NOT defended against.
+
+**Rationale**: defending against active forgery requires multi-aggregator consensus / fraud proofs — fundamentally different architecture. The current Unicity BFT layer is the trust anchor; if it is compromised, no application-layer protocol can compensate. Stating the boundary explicitly avoids accidental claims of stronger guarantees.
+
+**Implication**: poll-side `NOT_AUTHENTICATED` emits `transfer:trustbase-warning` (likely stale local trustBase), not `transfer:security-alert` (reserved for sustained-after-refresh failures in conservative mode — the rare case that breaches the threat boundary).
+
+### Decision 11: Class-Disjoint Asset Model (NFT vs Coin)
+
+Tokens classified at runtime as either **coin** (non-empty `coinData`) or **NFT** (empty/null `coinData` after zero-amount pruning). The two classes are **disjoint** — no token carries both fungible balances and a separable NFT identity. Coin tokens may be split via burn-then-mint (each output gets a fresh `tokenId`); NFT tokens cannot be split (the SDK's `TokenSplitBuilder` rejects empty-coinData inputs).
+
+**Rationale**: verified against `@unicitylabs/state-transition-sdk` source — there is no SDK primitive that produces a child token with the original `tokenId` while modifying `coinData`. Mixed-asset extraction (e.g., "send the NFT identity but leave the coins behind") is unimplementable on the current SDK. Class-disjointness aligns the protocol with what the SDK actually supports.
+
+**Implication**: NFT transfers are always whole-token (no split, no change); coin transfers may split. NFT cascades on chain-mode hard-fail are irrecoverable (non-fungible identity loss); the `confirmNftPending` flag forces explicit operator acknowledgment before sending pending-source NFTs.
+
+### Decision 12: Most-Recent-Proof Canonicalization
+
+Same `requestId` + same value (transactionHash + authenticator) can have **multiple valid proofs** across successive aggregator BFT rounds — the SMT grows with every round, so witness paths and `unicityCertificate` differ even though the proven leaf is identical. The protocol canonicalizes by selecting the proof from the **latest BFT round** (ties broken by first-observed-locally timestamp).
+
+**Rationale**: rejected lex-min-CID-as-canonical rule for proofs (which still applies to divergent-chain tie-breaks at §5.3 [D-conflict]) because it is meaningless for proofs — the value is the same; only the BFT-round metadata differs. Latest-round wins is the operationally correct rule. Supersedes Decision 6 ("last-writer-wins") for proof elements specifically.
+
+**Implication**: when a fresher proof arrives for an already-attached requestId (via merge or rescan), the local manifest entry is updated to the newer proof; the old proof element is tombstoned. Two proofs for the same `requestId` with **different values** is the explicit single-spend violation that triggers `transfer:security-alert` (out-of-scope per Decision 10).
+
+### Decision 13: Bundle Ingest Concurrency (16-Worker Default)
+
+Incoming UXF bundles are processed by a pool of `MAX_INGEST_WORKERS = 16` (configurable) parallel workers with a bounded ingest queue (default 256 entries). Per-tokenId mutexes coordinate cross-worker conflicts on the same `tokenId`.
+
+**Rationale**: a single rogue bundle (chain-mode token with K=64 unfinalized txs, slow-IPFS `uxf-cid` fetch, etc.) would otherwise serialize behind every other legitimate bundle, creating a DoS vector. With N workers, slow bundles consume one worker each; the other N−1 continue serving fresh arrivals.
+
+### Decision 14: `_audit` as a New Collection
+
+`NOT_OUR_CURRENT_STATE` and `UNSPENDABLE_BY_US` dispositions land in a NEW `_audit` collection (Wave T.3) — distinct from the existing `invalidTokens` (now `_invalid`) which holds cryptographically broken records.
+
+**Rationale**: structurally valid tokens we just can't spend (e.g., a token whose current state binds to a sibling instance with the same keys) are forensically distinct from cryptographically broken tokens. `_audit` is operationally promotable — a later transfer that makes the token ours triggers a periodic-rescan-driven promotion to active inventory; `_invalid` is terminal absent operator override.
+
+**Implication**: both collections use multi-representation keys: `${addr}.invalid.${tokenId}.${observedTokenContentHash}` and `${addr}.audit.${tokenId}.${observedTokenContentHash}`. The same `tokenId` may have multiple records (one per observed bundle).
+
+### Decision 15: Outbox CRDT — Three-Tier Partition + Override Stickiness
+
+The outbox state machine partitions states into three tiers for CRDT merge: **active** (worker progressing), **soft-terminal** (`failed-transient` — could resume), **hard-terminal** (`finalized | failed-permanent | expired`). Active beats soft-terminal; hard-terminal beats both — except when the active replica has `overrideApplied: true` (set by `payments.importInclusionProof()` operator override), which makes active `finalizing` win against `failed-permanent` regardless of Lamport.
+
+**Rationale**: rejected the simpler "monotonic LWW" because the state graph is not a total order (sibling terminal states `finalized` / `failed-permanent` / `failed-transient` would have no canonical winner). Override-stickiness prevents a stale replica's higher-Lamport `failed-permanent` from silently undoing an operator's recovery action.
+
+### Decision 16: Two-Set commitmentRequestIds (outstanding + completed)
+
+Outbox entries track instant-mode commitment requestIds in TWO sets: `outstandingRequestIds` (still being polled / submitted) and `completedRequestIds` (proof attached or hard-failed). On CRDT merge: `outstanding := union(A_outstanding, B_outstanding) - union(A_completed, B_completed)`.
+
+**Rationale**: rejected the simpler set-union form because it would re-add finalized requestIds to the outstanding pool whenever a stale replica merges, triggering re-submission. The two-set form preserves the "completed never un-completes" invariant.
+
+### Decision 17: Decision 2 ("UXF does not depend on PaymentsModule") Superseded for Transfer Flow
+
+The original Decision 2 stated UXF library is independent of PaymentsModule, with `UxfStorageAdapter` deferred to Phase 2. The inter-wallet transfer protocol (UXF-TRANSFER-PROTOCOL.md §4–§7) ties bundle construction, outbox state machine, and finalization workers directly to `PaymentsModule.send()`. The OrbitDB-backed Profile (PROFILE-ARCHITECTURE.md §10) is now the storage backbone for the transfer flow, NOT a future-phase `UxfStorageAdapter`.
+
+**Implication**: Decision 2 still holds for the UXF *package layer* (CAR / DAG / element decomposition is independent of PaymentsModule), but the *transfer protocol layer* is part of PaymentsModule.

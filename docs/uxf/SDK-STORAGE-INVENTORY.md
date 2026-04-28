@@ -277,12 +277,18 @@ The `TransportStorageAdapter` interface (lines 75-78 of `NostrTransportProvider.
 
 | Storage Key | Data Shape |
 |---|---|
-| `sphere_{addressId}_pending_transfers` | JSON: pending transfer objects |
-| `sphere_{addressId}_outbox` | JSON: outbox transfer objects |
+| `sphere_{addressId}_pending_transfers` | JSON: pending transfer objects (LEGACY) |
+| `sphere_{addressId}_outbox` | JSON: outbox transfer objects (LEGACY — to be migrated to bundle-grained `UxfTransferOutboxEntry` per [UXF-TRANSFER-PROTOCOL §7](UXF-TRANSFER-PROTOCOL.md)) |
+| `{addr}.outbox.${id}` (OrbitDB Profile, per-entry-key per Wave G.7) | NEW — `UxfTransferOutboxEntry` (bundle-grained for UXF modes; per-token for TXF mode). See UXF-TRANSFER-PROTOCOL §7 schema. |
+| `{addr}.audit.${tokenId}.${observedTokenContentHash}` (OrbitDB Profile) | NEW (Wave T.3) — `_audit` collection: `NOT_OUR_CURRENT_STATE` and `UNSPENDABLE_BY_US` dispositions. Multi-representation aware (same tokenId may have multiple records). |
+| `{addr}.invalid.${tokenId}.${observedTokenContentHash}` (OrbitDB Profile) | Widened (Wave T.3) — `_invalid` collection key form changed from single-record-per-tokenId to multi-representation form. |
+| Per-address finalization queue (OrbitDB Profile, per-entry-key) | NEW (Wave T.5) — `FinalizationQueueEntry` per pending transaction in chain-mode tokens. See UXF-TRANSFER-PROTOCOL §5.5. |
+| `bundleCid` LRU (in-memory, default 256) | NEW (Wave T.3) — replay-defense optimization. See UXF-TRANSFER-PROTOCOL §5.1. |
+| Tombstoned manifest CIDs (`TOMBSTONE_RETENTION_DAYS = 30`) | NEW (Wave T.5) — see UXF-TRANSFER-PROTOCOL §5.5 step 5. |
 
-Additionally, `_outbox` and `_mintOutbox` are stored inside the TXF data (see item 4).
+Additionally, `_outbox` and `_mintOutbox` are stored inside the TXF data (see item 4) — LEGACY; migrated one-way per UXF-TRANSFER-PROTOCOL §7.2 once bundle-grained outbox lands.
 
-**Criticality:** CRITICAL. Represents in-flight operations.
+**Criticality:** CRITICAL. Represents in-flight operations and forensic disposition state.
 
 ---
 

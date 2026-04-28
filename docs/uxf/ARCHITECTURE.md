@@ -2,6 +2,8 @@
 
 ## Sphere SDK -- Universal eXchange Format Module
 
+> **Status note**: this document describes the original Phase 1/2 architecture of the UXF *package layer* (decomposition, hashing, manifest, indexes, merge/diff/verify, storage adapter API surface). The **inter-wallet transfer protocol** that consumes UXF bundles — including transfer modes (instant/conservative/txf), multi-asset send (`additionalAssets`), canonical NFT model (class-disjoint coin/NFT), chain mode + `allowPendingTokens`, bundle-ingest worker pool (16-worker default), outbox state machine + CRDT invariants, `_audit` collection, periodic rescans, error model, and threat boundary — lives in the canonical [UXF-TRANSFER-PROTOCOL.md](UXF-TRANSFER-PROTOCOL.md). This document remains authoritative for package-layer concerns (CAR encoding, element taxonomy, content hashing) but is SUPERSEDED by UXF-TRANSFER-PROTOCOL on transfer-flow topics. Decision 2 ("UXF does not depend on PaymentsModule") still holds for the package layer; for the transfer flow, see [DESIGN-DECISIONS Decision 17](DESIGN-DECISIONS.md). The Profile architecture ([PROFILE-ARCHITECTURE.md](PROFILE-ARCHITECTURE.md) §10) is now the storage backbone for the transfer flow, replacing the deferred `UxfStorageAdapter` framing here.
+
 ---
 
 ## 1. Module Structure

@@ -1405,93 +1405,157 @@ The IPFS Kubo node can be extended with a **Unicity token semantic plugin** that
 
 **Kubo remains trustless.** The semantic plugin improves storage hygiene by filtering out garbage, but does not change the trust model. All data stored by Kubo is self-authenticated via content hashing — clients always verify independently. The plugin is a quality filter, not a trust authority.
 
-### 10.11 Token Manifest: Status and Invalid Tokens
+### 10.11 Token Manifest: Status, Dispositions, and Off-Balance Collections
 
-The **token manifest** (derived, wallet-level — see Section 10.2.2) is NOT a simple `tokenId → rootHash` map. It includes token validity status derived from oracle checks and chain validation:
+> **Canonical reference**: this section aligns with `docs/uxf/UXF-TRANSFER-PROTOCOL.md` §5.3 (decision matrix), §5.4 (storage outcomes), §8 (status mapping). When this section disagrees with the canonical, the canonical wins; this section MUST be re-aligned.
+
+The **token manifest** (derived, wallet-level — see Section 10.2.2) is NOT a simple `tokenId → rootHash` map. It carries the token's status (per the canonical four-value enum) plus metadata fields required for cross-replica CRDT merge.
 
 ```typescript
 interface ManifestEntry {
-  rootHash: ContentHash;           // root of the primary (valid) DAG
+  rootHash: ContentHash;             // root CID of the canonical DAG for this tokenId
   status: 'valid' | 'invalid' | 'conflicting' | 'pending';
-  conflictingHeads?: ContentHash[];  // alternative DAGs (for investigation/history)
-  invalidReason?: string;            // why the token is invalid (if applicable)
+  conflictingHeads?: ContentHash[];  // alternative DAG roots when status='conflicting'
+  invalidReason?: DispositionReason; // canonical enum (see UXF-TRANSFER-PROTOCOL §5.4)
+  // Cross-replica merge metadata (per UXF-TRANSFER-PROTOCOL §5.4 normative
+  // metadata-preservation rule; set-OR / max-merge across §5.3 [D] merges):
+  splitParent?: string;              // for cascade detection (§6.1.1)
+  audit_promoted_from?: string[];    // back-reference to _audit entries (set-OR merge)
+  lamport: number;                   // logical clock per UXF-TRANSFER-PROTOCOL §7.1
+  lastProofRefreshAt?: number;       // most-recent-proof rule (§6.3)
 }
 
-// Derived manifest:
 Map<tokenId, ManifestEntry>
 ```
 
-**Token status in the manifest:**
+**Token status enum** (canonical four-value; per UXF-TRANSFER-PROTOCOL §8):
 
-| Status | Meaning | Counts in balance? | Action |
-|---|---|---|---|
-| `valid` | Chain validated, proofs correct | Yes (if owned + unspent) | Normal operation |
-| `invalid` | Chain broken, mismatched proof, or double-spend detected | **No** | Kept for investigation, removable by GC |
-| `conflicting` | Two alternative DAGs exist for same tokenId | **No** | Oracle decides winner during finalization |
-| `pending` | Last transaction awaiting proof from oracle | **No** (until finalized) | Submit to oracle to finalize |
+| Status | Meaning | Counts in balance? |
+|---|---|---|
+| `valid` | All txs in chain finalized; oracle.isSpent === false | Yes (spendable) |
+| `pending` | One or more txs unfinalized; queued for finalization (see UXF-TRANSFER-PROTOCOL §5.5) | Incoming-only (not spendable) |
+| `conflicting` | Genuinely-divergent chains for the same tokenId; lex-min `bundleCid` wins primary, others in `conflictingHeads[]` | Spendable iff resolved |
+| `invalid` | Cryptographically broken OR oracle hard-rejected | No |
 
-**Invalid tokens are preserved in the pool** for investigation and debugging. They are:
-- Visible in a "conflicts/invalid" view in the UI
-- Excluded from balance calculations
-- Removable via `cleanupInventory()`
-- Useful for detecting double-spend attempts, rogue instances, or sync issues
+**Recipient dispositions** (per UXF-TRANSFER-PROTOCOL §5.3 [A]–[F] decision matrix) map to manifest status as follows:
 
-**Conflicting tokens:** When two DAG versions exist with divergent transactions spending the same state, both are kept:
+| Disposition | manifest.status | Storage location |
+|---|---|---|
+| `VALID` | `valid` | active token pool |
+| `PENDING` | `pending` | active token pool, finalization queue entries per unfinalized tx |
+| `CONFLICTING` | `conflicting` | active token pool, `conflictingHeads[]` populated |
+| `PROOF_INVALID` | `invalid` (reason ∈ {`auth-invalid`, `continuity-broken`, `proof-invalid`}) | `_invalid` collection |
+| `STRUCTURAL_INVALID` | `invalid` (reason ∈ {`structural`, `predicate-eval`, `proof-throw`}) | `_invalid` collection |
+| `NOT_OUR_CURRENT_STATE` | (not in manifest) | `_audit` collection |
+| `UNSPENDABLE_BY_US` | (not in manifest) | `_audit` collection |
+
+**Two off-balance collections** — multi-representation aware (the same `tokenId` MAY appear in multiple records, one per observed bundle):
+
+- **`_invalid`** — cryptographically broken tokens. Key form: `${addr}.invalid.${tokenId}.${observedTokenContentHash}`. Each record carries `bundleCid`, sender pubkey, and reason for forensic attribution.
+- **`_audit`** — structurally valid tokens we just can't spend (NOT in the legacy `invalidTokens` collection). NEW in Wave T.3 — MUST be added to `PROFILE_KEY_MAPPING` alongside `invalidTokens`. Key form: `${addr}.audit.${tokenId}.${observedTokenContentHash}`. Records carry `auditStatus: 'audit-not-our-state' | 'audit-off-record-spend' | 'audit-promoted'` and (when promoted) `promotedToManifestRef`.
+
+**DispositionReason enum** (canonical; per UXF-TRANSFER-PROTOCOL §5.4):
+```typescript
+type DispositionReason =
+  // Cryptographic / structural failures (→ _invalid):
+  | 'structural' | 'predicate-eval' | 'auth-invalid' | 'continuity-broken'
+  | 'proof-invalid' | 'proof-throw'
+  // Aggregator-driven failures (→ _invalid):
+  | 'oracle-rejected' | 'belief-divergence' | 'parent-rejected' | 'race-lost'
+  // Audit-only (→ _audit):
+  | 'not-our-state' | 'off-record-spend'
+  // Transport / IPFS (transient):
+  | 'gateway-fetch-failed';
+```
+
+**Conflicting tokens** — when [D-conflict] surfaces a genuinely divergent chain (e.g., a faulty aggregator signed two valid proofs for different transactionHashes — explicitly out-of-scope per §9.4.1 threat model), the recipient does NOT wait for oracle resolution. The tie-break is deterministic: the bundle with the **lex-min `bundleCid` (raw CIDv1 binary form, not base32 string)** wins primary; the loser is recorded as a `conflictingHeads[]` entry. Aggregator response later evicts the loser if available; otherwise an explicit `resolveConflict(tokenId, chosenHead)` operator override applies.
+
 ```
 manifest:
   tokenId_x → {
-    rootHash: hash_R3a,           // the version we're trying to finalize
+    rootHash: hash_lex_min,              // primary (lex-min bundleCid)
     status: 'conflicting',
-    conflictingHeads: [hash_R3b], // the other version
+    conflictingHeads: [hash_loser, ...], // every divergent head
+    lamport: <Lamport-clock value>,
   }
 ```
 
-After oracle resolution (one version gets a valid proof, the other gets a mismatched proof), the winner becomes `valid` and the loser becomes `invalid`.
+Cascade rule: when an `invalid` disposition fires for a tokenId due to chain hard-fail, all tokens with `splitParent === <this tokenId>` cascade to invalid with reason='parent-rejected' (per UXF-TRANSFER-PROTOCOL §6.1.1). NFT cascades are irrecoverable (non-fungible identity); see canonical §4.1 NFT cascade asymmetry warning + `confirmNftPending` flag.
 
-### 10.12 Outbox: In-Flight Transfer Tracking via CIDs
+### 10.12 Outbox: In-Flight Transfer Tracking
 
-The outbox tracks UXF bundles currently being sent to recipients. Each entry references the **CID of the UXF bundle** being transferred:
+> **Canonical reference**: this section aligns with `docs/uxf/UXF-TRANSFER-PROTOCOL.md` §7 (`UxfTransferOutboxEntry`), §7.0 (state-transition table), §7.1 (CRDT invariants), §7.2 (legacy migration). The canonical §7 is the source of truth; if this section diverges, re-align here.
+
+The outbox tracks UXF bundles (and TXF-mode per-token transfers) currently in flight. The schema is **bundle-grained for UXF modes** and **per-token for TXF mode**:
 
 ```typescript
-interface OutboxEntry {
-  /** Unique transfer identifier */
-  id: string;
-  /** CID of the UXF CAR file containing the tokens being sent */
-  bundleCid: string;
-  /** Token IDs included in this bundle */
-  tokenIds: string[];
-  /** Recipient identifier (@nametag, DIRECT address, pubkey) */
-  recipient: string;
-  /** Delivery status */
-  status: 'packaging' | 'pinned' | 'sending' | 'delivered' | 'confirmed' | 'failed';
-  /** How the bundle is being delivered */
-  deliveryMethod: 'car-over-nostr' | 'cid-over-nostr';
-  /** Timestamps */
-  createdAt: number;
-  updatedAt: number;
-  /** Error info if failed */
-  error?: string;
-  /** Retry count */
-  retryCount: number;
+interface UxfTransferOutboxEntry {
+  readonly id: string;                                       // UUID
+  readonly bundleCid: string;                                // CAR root CID (or synthetic 'txf-<tokenId>' for legacy)
+  readonly tokenIds: readonly string[];
+  readonly deliveryMethod: 'car-over-nostr' | 'cid-over-nostr' | 'txf-legacy';
+  readonly recipient: string;                                // @nametag / DIRECT:// / pubkey / alpha1...
+  readonly recipientTransportPubkey: string;
+  readonly mode: 'conservative' | 'instant' | 'txf';         // canonical TransferMode
+  readonly status:
+    | 'packaging'           // building UXF bundle (UXF modes only)
+    | 'pinned'              // CAR pinned to IPFS (CID-mode only)
+    | 'sending'             // Nostr publish in progress
+    | 'delivered'           // Nostr publish acked (conservative/txf terminal)
+    | 'delivered-instant'   // Nostr publish acked; instant mode awaits finalization
+    | 'finalizing'          // finalization worker running
+    | 'finalized'           // proof attached locally; instant terminal
+    | 'failed-transient'    // delivery or finalization failed; retry pending
+    | 'failed-permanent';   // unrecoverable (oracle rejection, race-lost, etc.)
+  // Two-set form for instant-mode CRDT merge (per UXF-TRANSFER-PROTOCOL §7.1):
+  readonly outstandingRequestIds?: readonly string[];
+  readonly completedRequestIds?: readonly string[];
+  readonly memo?: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly lamport: number;                                  // logical clock; max(local, observed) + 1
+  readonly overrideApplied?: boolean;                        // sticky flag (set-OR merge); see §7.1
+  readonly error?: string;
+  readonly submitRetryCount: number;
+  readonly proofErrorCount: number;
+  readonly retryDeadline?: number;
+  readonly pollingDeadline?: number;
 }
 ```
 
-**Outbox lifecycle:**
+**Outbox state machine** (per canonical §7.0):
 ```
-1. packaging  — building UXF bundle with selected tokens
-2. pinned     — CAR pinned to IPFS, CID obtained
-3. sending    — Nostr event published (CAR bytes or CID)
-4. delivered  — recipient acknowledged receipt
-5. confirmed  — recipient finalized tokens (oracle confirmed)
-6. failed     — delivery failed (retry or abort)
+packaging  ──pin/encode complete──► [pinned] (CID-mode only)
+packaging  ──serialize complete───► sending  (CAR-mode + TXF)
+pinned     ──ipfs pin acknowledged─► sending
+pinned     ──publish-dispatch fails─► failed-transient
+sending    ──Nostr publish ack ────► delivered          (conservative/TXF)
+sending    ──Nostr publish ack ────► delivered-instant  (instant)
+sending    ──publish error ────────► failed-transient
+delivered  ──retention window ─────► expired (terminal: removed)
+delivered-instant ──worker starts──► finalizing
+finalizing ──all proofs attached──► finalized
+finalizing ──any tx hard-fail ─────► failed-permanent (per §6.1.1 short-circuit)
+finalizing ──transient budget ─────► failed-transient
+failed-transient ──manual retry────► sending
+failed-transient ──cap ────────────► failed-permanent
+failed-permanent ──importInclusionProof override──► finalizing
+finalized       ──retention window►  expired
+failed-permanent (terminal except via override)
 ```
 
-The outbox is stored in **OrbitDB** (`{addr}.outbox`), encrypted. This allows:
-- Multi-device visibility of in-flight transfers
-- Retry after app crash (CID is preserved, just re-send the Nostr event)
-- Tracking delivery status across devices
+**State partition for CRDT merge** (per canonical §7.1):
+- **Active**: `packaging`, `pinned`, `sending`, `delivered`, `delivered-instant`, `finalizing`.
+- **Soft-terminal**: `failed-transient` (loses to active on merge).
+- **Hard-terminal**: `expired`, `finalized`, `failed-permanent`.
 
-Once a transfer is confirmed, the outbox entry can be cleaned up. The sent tokens remain in the pool as `previously owned` (archived) with the destination derived from the transaction predicate.
+Override stickiness: `overrideApplied: true` (set via `payments.importInclusionProof()` operator override) makes active `finalizing` win against `failed-permanent` regardless of Lamport.
+
+**Storage location**: PROFILE-ARCHITECTURE declares the static OrbitDB key as `{addr}.outbox`; the runtime per-entry-key writer (Wave G.7 layout) expands this to `${addr}.outbox.${id}` for cross-device visibility and multi-process safety. Implementations MUST use the per-entry form at runtime; the static key is a schema declaration only.
+
+The outbox lives alongside a **per-address finalization queue** (per canonical §5.5) that persists one entry per pending transaction in chain-mode tokens. Both survive process restart; both replicate via OrbitDB CRDT. Spend protection is NOT bookkeeping — the aggregator's `requestId` invariant is the trust anchor. A replica race on the same source state hits `REQUEST_ID_MISMATCH` at the aggregator; the loser's outbox entry transitions to `failed-permanent` with reason='race-lost'.
+
+Once a transfer reaches a terminal state (`finalized` for instant, `delivered` then GC for conservative, `expired` after retention window), the outbox entry is removed. Sent tokens remain in the pool as archived; per canonical §6.1.1 the cascade rule fires automatically if any chain-mode tx hard-fails.
 
 ---
 

@@ -5,6 +5,8 @@
 **Date:** 2026-03-26
 **Authors:** Unicity Labs
 
+> **Scope**: this document covers the UXF *package format* (DAG / CBOR / CAR encoding, element type taxonomy, content hashing, merge / verify / GC). It is the LAYER consumed by the inter-wallet transfer protocol. For the wire-level inter-wallet **transfer protocol** (transfer modes, multi-asset send, NFT model, error model, recipient decision matrix, outbox state machine, periodic rescans), see the canonical [UXF-TRANSFER-PROTOCOL.md](UXF-TRANSFER-PROTOCOL.md). When the two specs disagree on a topic that touches both layers, UXF-TRANSFER-PROTOCOL is authoritative for the transfer flow; this document is authoritative for the package-format invariants (single-root CARs, depth/pool caps, content-hashing, etc.).
+
 ---
 
 ## Table of Contents

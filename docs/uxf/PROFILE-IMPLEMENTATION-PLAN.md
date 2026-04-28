@@ -3,6 +3,14 @@
 **Status:** Validated -- pending steelman
 **Date:** 2026-03-30
 
+> **Transfer-protocol coordination note**: several integration points require coordination with the inter-wallet transfer protocol implementation waves (T.1–T.8 per [UXF-TRANSFER-PROTOCOL §13](UXF-TRANSFER-PROTOCOL.md)):
+> - Add `_audit` to `PROFILE_KEY_MAPPING` alongside `invalidTokens` (T.3).
+> - Widen `_invalid` and `_audit` keys to multi-representation form `${addr}.{invalid,audit}.${tokenId}.${observedTokenContentHash}` (T.3).
+> - Replace the legacy per-token outbox with bundle-grained `UxfTransferOutboxEntry` per UXF-TRANSFER-PROTOCOL §7 (T.6); migration preserves `recipientNametag`.
+> - Persist the per-address finalization queue (T.5) under per-entry-key layout (Wave G.7).
+> - Implement profile-pointer rescan (default 30s) per UXF-TRANSFER-PROTOCOL §12.3.1 (T.8).
+> - Implement per-token spent-state rescan (default 5 min/token, concurrency 4) per UXF-TRANSFER-PROTOCOL §12.3.2 (T.8).
+
 ---
 
 ## Implementation Plan: UXF Profile System

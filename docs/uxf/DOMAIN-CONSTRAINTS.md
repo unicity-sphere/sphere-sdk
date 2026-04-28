@@ -5,6 +5,8 @@
 
 This document captures every domain-specific constraint and pitfall that a generic TypeScript developer would miss when implementing UXF token decomposition and reassembly. It is derived from direct examination of the SDK type definitions, sphere-sdk serialization code, and the UXF specification.
 
+> **Transfer-protocol implication**: `TransferTransaction.inclusionProof` may be `null` for instant-mode (unfinalized) transactions per [UXF-TRANSFER-PROTOCOL §2.1](UXF-TRANSFER-PROTOCOL.md). The package format MUST preserve this null value on round-trip — null is a valid encoded value, not "missing field." Decoders MUST treat `inclusionProof: null` as "transaction is unfinalized, awaits proof attachment via §5.5 finalization queue." The token's class (NFT vs coin per §4.1 canonical asset model) is determined at runtime from `coinData.length === 0` after zero-amount pruning at ingest.
+
 ---
 
 ## 1. ITokenJson Field Mapping to UXF Elements

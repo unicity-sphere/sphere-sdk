@@ -4,6 +4,13 @@
 **Precedes:** PROFILE-ARCHITECTURE.md §4 (OrbitDB integration); POINTER-SPEC.md §10.2.3 (originated-tag discipline)
 **Supersedes:** the implicit `(key, encryptedBytes)` OpLog schema from PROFILE-ARCHITECTURE.md §4.2.
 
+> **Transfer-related storage cross-references**: the OpLog persists the outbox + finalization queue used by the inter-wallet transfer protocol. For the canonical schemas, see [UXF-TRANSFER-PROTOCOL.md](UXF-TRANSFER-PROTOCOL.md):
+> - **Outbox** (§7) — `UxfTransferOutboxEntry` bundle-grained schema; three-tier status partition (active / soft-terminal / hard-terminal); Lamport-clock CRDT (`max(local, observed)+1`); `outstandingRequestIds` / `completedRequestIds` two-set form; `overrideApplied` sticky flag. Static key `{addr}.outbox`; runtime per-entry-key form `${addr}.outbox.${id}` (Wave G.7 layout).
+> - **`_invalid` collection** (§5.4) — multi-representation key `${addr}.invalid.${tokenId}.${observedTokenContentHash}`. Same `tokenId` may have multiple records (one per observed bundle).
+> - **`_audit` collection** (§5.4 — NEW Wave T.3) — `${addr}.audit.${tokenId}.${observedTokenContentHash}`. Stores `NOT_OUR_CURRENT_STATE` and `UNSPENDABLE_BY_US` dispositions with `audit_promoted_from` back-reference for promotion.
+> - **Token statuses** (§8) — canonical four-value enum `valid | invalid | conflicting | pending`.
+> - **Manifest metadata across [D] merges** (§5.4 normative rule) — `audit_promoted_from`, `splitParent`, `conflictingHeads[]`, `lamport` use set-OR / max-merge across replicas.
+
 ---
 
 ## §1 Motivation

@@ -862,6 +862,7 @@ logger.configure({
 ## Next Steps
 
 - [API Reference](./API.md) - Full API documentation
-- [Integration Guide](./INTEGRATION.md) - Advanced integration patterns
-- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration
+- [Integration Guide](./INTEGRATION.md) - Advanced integration patterns (multi-coin / NFT bundles via `additionalAssets`, chain mode, `confirmNftPending`)
+- [UXF Transfer Protocol](./uxf/UXF-TRANSFER-PROTOCOL.md) - Authoritative wire-protocol spec (transfer modes, multi-asset send, NFT model, error model, recipient decision matrix)
+- [IPFS Storage Guide](./IPFS-STORAGE.md) - IPFS/IPNS token sync configuration (legacy)
 - [Browser Quick Start](./QUICKSTART-BROWSER.md) - For web applications

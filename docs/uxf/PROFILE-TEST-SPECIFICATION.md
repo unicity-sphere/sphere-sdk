@@ -7,6 +7,8 @@ Each test file covers a single module with full branch and error-path coverage.
 **Pattern:** follows existing UXF test conventions (see `tests/unit/uxf/errors.test.ts`, `tests/unit/uxf/hash.test.ts`)
 **Location:** `tests/unit/profile/`
 
+> **Transfer-protocol coordination** (planned for Wave T.3+): tests for transfer-protocol-driven storage features land here when the implementation lands. Specifically: per-token spent-state rescan (default 5 min/token, `MAX_CONCURRENT_SPENT_RESCANS=4`) per [UXF-TRANSFER-PROTOCOL §12.3.2](UXF-TRANSFER-PROTOCOL.md); profile-pointer rescan (30s default) per §12.3.1; `_audit` collection promotion semantics (`audit-promoted` transition with `promotedToManifestRef`) per §5.4; multi-representation `_invalid` / `_audit` keys; manifest metadata preservation across [D] merges (`audit_promoted_from`, `splitParent`, `conflictingHeads[]`, `lamport`); Lamport-clock CRDT invariants per §7.1; outbox state-machine transitions per §7.0; `overrideApplied` sticky flag persistence.
+
 ---
 
 ## 1. profile/errors.test.ts (~7 tests)

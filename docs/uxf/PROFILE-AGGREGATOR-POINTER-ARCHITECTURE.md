@@ -6,6 +6,7 @@
 **Companion spec:** [`docs/uxf/PROFILE-AGGREGATOR-POINTER-SPEC.md`](./PROFILE-AGGREGATOR-POINTER-SPEC.md) — v3.4, canonical owner of byte-level formulas, algorithms, and error codes. The spec is authoritative; this document narrates.
 **Related:**
 - [`docs/uxf/PROFILE-ARCHITECTURE.md`](./PROFILE-ARCHITECTURE.md) §2.3 (multi-bundle model), §7.6 (migration), §2.1 (global-keys model)
+- [`docs/uxf/UXF-TRANSFER-PROTOCOL.md`](./UXF-TRANSFER-PROTOCOL.md) — the inter-wallet transfer protocol that consumes the pointer mechanism via §12.3.1 **profile-pointer rescan** (default 30s; queries the aggregator for the next pointer position to detect sibling-instance updates) and §12.3.2 **per-token spent-state rescan** (default 5 min/token, concurrency 4; detects off-record spends). The pointer architecture here is the LAYER consumed; UXF-TRANSFER-PROTOCOL is the consumer.
 - [`state-transition-sdk`](https://github.com/unicitylabs/state-transition-sdk) — all cryptographic primitives are consumed from this SDK wherever possible (§4.6)
 
 ---

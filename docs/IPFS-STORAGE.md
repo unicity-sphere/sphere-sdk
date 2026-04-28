@@ -2,6 +2,8 @@
 
 Cross-platform HTTP-based IPFS/IPNS token storage for the Sphere SDK. Works in both browser and Node.js with no additional dependencies.
 
+> **Status note**: this document describes the **legacy IPFS-IPNS-per-wallet flow** for token-data backup. New deployments use the Profile + bundle-CID model per [PROFILE-ARCHITECTURE.md](uxf/PROFILE-ARCHITECTURE.md) §10.10 and the wire-format definitions in [UXF-TRANSFER-PROTOCOL.md](uxf/UXF-TRANSFER-PROTOCOL.md) §3.3. Bundle CIDs are content-addressed and immutable — IPNS is reserved for the wallet's PROFILE pointer (per [PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md](uxf/PROFILE-AGGREGATOR-POINTER-ARCHITECTURE.md)), not for individual bundles. Inline UXF delivery (`uxf-car`) does not use IPFS at all (the CAR bytes travel inside the Nostr event); only `uxf-cid` delivery requires an IPFS pin. The TXF merge rules + IPNS-chain logic in this document apply to legacy storage only.
+
 ## Overview
 
 The IPFS Storage Provider backs up wallet token data to IPFS (InterPlanetary File System) using IPNS (InterPlanetary Name System) for mutable references. It uses standard HTTP APIs — no Helia, no libp2p DHT, no extra packages required.

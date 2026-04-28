@@ -1764,5 +1764,6 @@ npm run cli -- daemon start --event transfer:incoming --action auto-receive
 - [Node.js Quick Start](./QUICKSTART-NODEJS.md) — SDK integration guide for Node.js applications
 - [Browser Quick Start](./QUICKSTART-BROWSER.md) — SDK integration guide for web applications
 - [API Reference](./API.md) — Full API documentation
-- [IPFS Storage Guide](./IPFS-STORAGE.md) — IPFS/IPNS token sync and recovery
+- [UXF Transfer Protocol](./uxf/UXF-TRANSFER-PROTOCOL.md) — Authoritative wire-protocol spec; multi-coin / NFT-bundle / chain-mode transfers are SDK-only today (not yet exposed in the CLI `send` command)
+- [IPFS Storage Guide](./IPFS-STORAGE.md) — IPFS/IPNS token sync and recovery (legacy)
 - [Connect Protocol](./CONNECT.md) — dApp-to-wallet RPC integration

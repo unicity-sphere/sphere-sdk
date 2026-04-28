@@ -6,6 +6,8 @@
 
 This document defines the ordered, parallelism-maximized work plan for implementing the UXF (Universal eXchange Format) module within sphere-sdk.
 
+> **Scope**: this plan covers the UXF *package layer* (WU-01..WU-17 — types, hashing, deconstruct, reassemble, CAR, JSON, verify). The **inter-wallet transfer protocol** waves (T.1–T.8) that CONSUME this package layer are tracked separately in [UXF-TRANSFER-PROTOCOL §13](UXF-TRANSFER-PROTOCOL.md). Specifically, `UxfPackage.fromCar` / `UxfPackage.toCar` / `UxfPackage.merge` are the primary consumers (see UXF-TRANSFER-PROTOCOL §4.1 bundle construction, §5.1 recipient ingest, §5.6 chain-mode merge). **WU-09 (verify) acceptance MUST include the multi-root-CAR rejection rule** (UXF-TRANSFER-PROTOCOL §5.2 #1: single-root MUST; multi-root MUST be rejected) — this is normative for the transfer protocol's `bundleCid` integrity guarantee.
+
 ---
 
 ## Dependency Graph

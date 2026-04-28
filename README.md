@@ -6,7 +6,7 @@ A modular TypeScript SDK for Unicity wallet operations supporting both Layer 1 (
 
 - **Wallet Management** - BIP39/BIP32 key derivation, AES-256 encryption
 - **L1 Payments** - ALPHA blockchain transactions via Fulcrum WebSocket
-- **L3 Payments** - Token transfers with state transition proofs, concurrent-send safety (SpendQueue)
+- **L3 Payments** - Single-coin, multi-coin, and NFT-bundle token transfers with state-transition proofs; instant/conservative transfer modes; chain-mode opt-in (`allowPendingTokens`); concurrent-send safety (SpendQueue). See [UXF-TRANSFER-PROTOCOL](docs/uxf/UXF-TRANSFER-PROTOCOL.md) for the wire-protocol spec.
 - **Invoicing / Accounting** - On-chain invoice lifecycle with payment attribution, auto-return, privacy-preserving hashed invoice IDs
 - **Token Swaps** - P2P atomic swaps via escrow with DM-based negotiation protocol
 - **Payment Requests** - Request payments with async response tracking
@@ -34,6 +34,7 @@ Choose your platform:
 | **Node.js** | [QUICKSTART-NODEJS.md](docs/QUICKSTART-NODEJS.md) | SDK + `ws` | IPFS sync (built-in) |
 | **CLI** | See below | SDK + `tsx` | - |
 | **dApp integration** | [CONNECT.md](docs/CONNECT.md) | SDK only | Sphere extension |
+| **Wire protocol spec** | [UXF-TRANSFER-PROTOCOL.md](docs/uxf/UXF-TRANSFER-PROTOCOL.md) | — | Authoritative inter-wallet transfer spec (transfer modes, multi-asset, NFT model, chain mode, error model) |
 
 ## CLI (Command Line Interface)
 
@@ -151,12 +152,14 @@ console.log('Assets:', assets);
 const balance = await sphere.payments.getBalance();
 console.log('Total USD:', balance); // number | null
 
-// Send tokens
+// Send tokens (single-coin)
 const result = await sphere.payments.send({
   recipient: '@alice',
   amount: '1000000',
   coinId: 'UCT',
 });
+// For multi-coin or coin+NFT bundles, see `additionalAssets` in docs/INTEGRATION.md
+// or the wire-protocol spec at docs/uxf/UXF-TRANSFER-PROTOCOL.md §4.1.
 
 // Derive additional addresses
 const addr1 = sphere.deriveAddress(1);

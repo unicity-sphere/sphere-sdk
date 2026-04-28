@@ -1,8 +1,10 @@
 # Token Spend Queue Architecture
 
-**Status:** Proposal — v1.0
+**Status:** Implemented — v1.0 (single-coin scope). Multi-asset extension is spec'd but not yet implemented (see "Multi-asset / NFT extension" note below).
 **Date:** 2026-03-12
 **Scope:** `PaymentsModule` concurrency safety for `send()` / `sendInstant()`
+
+> **Multi-asset / NFT extension (planned)**: the canonical [UXF-TRANSFER-PROTOCOL §4.1](uxf/UXF-TRANSFER-PROTOCOL.md) extends `TransferRequest` with `additionalAssets: AdditionalAsset[]` (discriminated union of `{kind:'coin', coinId, amount}` and `{kind:'nft', tokenId}`). The data structures in this doc — `ReservationEntry.coinId: string`, `QueueEntry.coinId: string` + `amount: bigint`, and `pendingChangeAmount` (a scalar) — assume a single-coin-per-call API and are NOT widened to multi-asset yet. The implementation wave that lands multi-asset send (paired with `additionalAssets`) MUST also widen these to track per-`(coinId, amount)` reservations and per-`tokenId` whole-token (NFT) reservations atomically (all-or-nothing per `send()` call). NFT reservations are existence-based, not amount-based — a coin token cannot satisfy an NFT target even on tokenId match (per the canonical asset model: NFT = empty `coinData`, class-disjoint from coin). The chain-mode opt-in (`allowPendingTokens`) likewise requires queue-side support: finalized-first selection, with pending tokens spilled over only after exhausting valid inventory. Until the implementation lands, this doc describes the single-coin-only behavior.
 
 ---
 
