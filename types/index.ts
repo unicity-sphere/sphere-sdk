@@ -522,6 +522,10 @@ export type SphereEventType =
   | 'transfer:failed'
   | 'transfer:operator-alert'
   | 'transfer:fetch-failed'
+  | 'transfer:cascade-failed'
+  | 'transfer:trustbase-warning'
+  | 'transfer:security-alert'
+  | 'transfer:proof-superseded'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -678,6 +682,113 @@ export interface SphereEventMap {
     readonly senderTransportPubkey: string;
     readonly gatewaysAttempted: ReadonlyArray<string>;
     readonly failureReasons: ReadonlyArray<string>;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.5.B / T.5.B.5 — cascade-failed signal
+   * (§6.1.1).
+   *
+   * Emitted by the sender-side finalization worker (T.5.B) on hard-fail
+   * of a queue entry whose token had outgoing outbox bundles in instant
+   * mode. The actual cascade walk lives in T.5.B.5; T.5.B raises the
+   * INTENT to cascade by emitting this event with the failing token's
+   * id, the failure reason (so the walker knows the §6.1.1 race-lost
+   * skip rule applies), and the outbox id so consumers (test harnesses,
+   * the walker itself) can correlate.
+   *
+   * The race-lost reason intentionally short-circuits the cascade per
+   * §6.1.1's "race-lost special case" rule — a worker that hard-fails
+   * with `reason: 'race-lost'` MUST NOT emit this event. Tests pin the
+   * absence of the event for race-lost.
+   *
+   * Spec refs: §6.1.1 (cascade rule), §6.1 (sender-side worker error
+   * model), §5.4 / `DispositionReason` enum.
+   */
+  'transfer:cascade-failed': {
+    readonly outboxId: string;
+    readonly tokenId: string;
+    readonly bundleCid: string;
+    readonly recipientTransportPubkey: string;
+    readonly reason: import('./disposition').DispositionReason;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.5.B / T.5.C / T.5.F — trustBase
+   * staleness warning (§6.1, §9.4.1).
+   *
+   * Emitted when an inclusion proof's verifier returns
+   * `NOT_AUTHENTICATED` — the proof's validator signatures don't verify
+   * against the local trustBase. The most likely cause is a stale local
+   * trustBase (per §9.4.1's threat model — active forgery is out of
+   * scope). Consumers SHOULD attempt a trustBase refresh; the worker
+   * retries up to `MAX_PROOF_ERROR_RETRIES` and then hard-fails with
+   * reason='proof-invalid'.
+   *
+   * Distinct from `transfer:security-alert`: trustbase-warning is the
+   * routine "your local trustBase is stale" signal; security-alert is
+   * reserved for the explicitly out-of-scope cases (e.g. two distinct
+   * proofs for the same requestId with disagreeing values).
+   *
+   * Spec refs: §6.1 (NOT_AUTHENTICATED row), §9.4.1 (threat boundary).
+   */
+  'transfer:trustbase-warning': {
+    readonly tokenId: string;
+    readonly requestId: string;
+    readonly outboxId?: string;
+    readonly bundleCid?: string;
+    readonly attempt: number;
+    readonly message: string;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.5.B / T.5.C — single-spend invariant
+   * violation alert (§6.3, C10).
+   *
+   * Reserved for the §6.3 "forbidden case": observing two proofs for
+   * the SAME `requestId` with DIFFERENT `(transactionHash,
+   * authenticator)` values. The aggregator's single-spend invariant
+   * guarantees this never happens in a non-faulty deployment; if it
+   * does, the trust boundary may have been violated and operators must
+   * investigate.
+   *
+   * The protocol does NOT auto-recover — the worker REFUSES to merge
+   * the conflicting proof and emits this event so the operator is
+   * notified. Per §6.3, this is the ONLY routine path that emits
+   * `transfer:security-alert`; all other suspect events emit
+   * `transfer:trustbase-warning` first.
+   *
+   * Spec refs: §6.3 (most-recent-proof rule + forbidden case).
+   */
+  'transfer:security-alert': {
+    readonly tokenId: string;
+    readonly requestId: string;
+    readonly outboxId?: string;
+    readonly attachedTransactionHash: string;
+    readonly observedTransactionHash: string;
+    readonly attachedAuthenticator?: string;
+    readonly observedAuthenticator?: string;
+    readonly message: string;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.5.B / T.5.C — most-recent-proof
+   * superseded notification (§6.3, W16).
+   *
+   * Emitted when a fresh poll returns a NEWER proof for an
+   * already-attached requestId (same `(transactionHash, authenticator)`,
+   * different unicityCertificate / round). The worker replaces the old
+   * proof and tombstones the previous CID per §6.3's most-recent-proof
+   * canonicalization rule. This event lets observability layers track
+   * the maintenance operation.
+   *
+   * Distinct from `transfer:security-alert`: superseded means SAME
+   * value (legitimate same-proof-newer-snapshot); security-alert means
+   * DIFFERENT value (forbidden).
+   *
+   * Spec refs: §6.3 (most-recent-proof rule).
+   */
+  'transfer:proof-superseded': {
+    readonly tokenId: string;
+    readonly requestId: string;
+    readonly outboxId?: string;
+    readonly previousCid: string;
+    readonly newCid: string;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;

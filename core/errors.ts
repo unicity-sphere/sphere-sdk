@@ -370,7 +370,20 @@ export type SphereErrorCode =
    * finalized are processed normally (the deferred behavior is gated by
    * unfinalized-tx presence, not by the `mode` field alone).
    */
-  | 'BUNDLE_REJECTED_INSTANT_MODE_NOT_YET_SUPPORTED';
+  | 'BUNDLE_REJECTED_INSTANT_MODE_NOT_YET_SUPPORTED'
+  /**
+   * UXF Inter-Wallet Transfer T.5.B — sender-side finalization worker
+   * polling-policy validation failure (§5.5 step 6 normative
+   * configuration validity rule).
+   *
+   * Thrown at construction by `FinalizationWorkerSender` when the
+   * cumulative backoff for the first `MIN_POLL_ATTEMPTS` polls exceeds
+   * `POLLING_WINDOW_MS`. Spec mandates implementations refuse to start
+   * if the rule is violated — otherwise the deadline could fire before
+   * the minimum attempts are observed, deferring termination to the
+   * 2× hard safety net for every queue entry.
+   */
+  | 'INVALID_POLLING_POLICY';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
