@@ -208,6 +208,20 @@ export class AccountingModule {
   /** Count of unknown (not in invoiceTermsCache) invoice IDs in the ledger. */
   private unknownLedgerCount = 0;
 
+  /**
+   * Per-unknown-invoice first-seen timestamp for TTL eviction.
+   *
+   * W1 (steelman round-4): without TTL, an attacker who can deliver 500
+   * inbound transfers with synthesized memo invoiceIds permanently exhausts
+   * the unknown-ledger cap, after which legitimate orphan transfers (out-of-
+   * order delivery for real swaps) are silently dropped at the cap-check.
+   *
+   * Eviction sweep runs on each `_handleIncomingTransfer` invocation and
+   * removes entries older than UNKNOWN_LEDGER_TTL_MS that never graduated
+   * to a real invoice import.
+   */
+  private unknownLedgerFirstSeen: Map<string, number> = new Map();
+
   /** W17: Tracks whether tokenScanState has been mutated since last flush. */
   private tokenScanDirty = false;
 
@@ -1649,6 +1663,9 @@ export class AccountingModule {
     // W11: Decrement unknown count if this invoice was previously indexed as unknown
     if (this.invoiceLedger.has(tokenId) && !this.invoiceTermsCache.has(tokenId)) {
       this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
+      // W1 (round-4): also clear the first-seen timestamp — this invoice
+      // graduated, no longer a TTL eviction candidate.
+      this.unknownLedgerFirstSeen.delete(tokenId);
     }
     this.invoiceTermsCache.set(tokenId, terms);
     this._addToHashIndex(tokenId);
@@ -4776,6 +4793,19 @@ export class AccountingModule {
     // order). Mirrors the proactive-indexing buffer used by
     // _processTokenTransactions for on-chain `inv:` references.
     if (!this.invoiceTermsCache.has(invoiceId)) {
+      // W2 (round-4): wrap the orphan-buffer block in withInvoiceGate so
+      // two concurrent _handleIncomingTransfer calls for the same unknown
+      // invoiceId can't each compute mtEntryCount independently and
+      // overshoot the per-invoice cap. The gate serializes the cap check
+      // with the ledger mutation.
+      await this.withInvoiceGate(invoiceId, async () => {
+        // Re-check: the gate may have been acquired AFTER another caller
+        // imported the invoice (now in invoiceTermsCache) — fall through
+        // to the normal path in that case.
+        if (this.invoiceTermsCache.has(invoiceId)) {
+          await this._processInvoiceTransferEvent(transfer, invoiceId, paymentDirection, confirmed);
+          return;
+        }
       const syntheticRef = this._buildSyntheticTransferRef(
         transfer,
         invoiceId,
@@ -4790,6 +4820,7 @@ export class AccountingModule {
       // for the imported ID, so getInvoiceStatus() will see this transfer
       // immediately after import.
       const MAX_UNKNOWN_INVOICE_IDS = 500;
+      const UNKNOWN_LEDGER_TTL_MS = 30 * 60 * 1000; // 30 min
       // Per-invoice entry cap — defends against unbounded growth within a
       // single unknown invoice id. Without this, a relay redelivering the
       // same logical payment with different transport `transfer.id` values
@@ -4797,6 +4828,38 @@ export class AccountingModule {
       // disk on every dirty-flush. 50 is generous: real swap deposits use
       // ≤2 transfers per invoice; partial-fill payouts ≤handful.
       const MAX_ORPHAN_ENTRIES_PER_INVOICE = 50;
+
+      // W1 (round-4) TTL eviction sweep: remove unknown-ledger entries
+      // that haven't graduated to a real invoice import within the TTL.
+      // This defends against the orphan-flood DoS — without TTL, an
+      // attacker can permanently exhaust the 500-entry cap with garbage
+      // memo invoiceIds, dropping legitimate orphan transfers forever.
+      const nowMs = Date.now();
+      if (this.unknownLedgerFirstSeen.size > 0) {
+        const expiredIds: string[] = [];
+        for (const [unkId, firstSeen] of this.unknownLedgerFirstSeen) {
+          if (nowMs - firstSeen > UNKNOWN_LEDGER_TTL_MS) {
+            expiredIds.push(unkId);
+          }
+        }
+        for (const expiredId of expiredIds) {
+          if (!this.invoiceTermsCache.has(expiredId) && this.invoiceLedger.has(expiredId)) {
+            this.invoiceLedger.delete(expiredId);
+            this.unknownLedgerCount = Math.max(0, this.unknownLedgerCount - 1);
+            // Sweep tokenInvoiceMap entries that pointed only at this orphan
+            // invoice (otherwise verifyPayout's reverse lookup would still
+            // see a stale association even after the ledger is gone).
+            for (const [tokenId, invoiceSet] of this.tokenInvoiceMap) {
+              if (invoiceSet.has(expiredId)) {
+                invoiceSet.delete(expiredId);
+                if (invoiceSet.size === 0) this.tokenInvoiceMap.delete(tokenId);
+              }
+            }
+          }
+          this.unknownLedgerFirstSeen.delete(expiredId);
+        }
+      }
+
       if (!this.invoiceLedger.has(invoiceId)) {
         if (this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS) {
           // Cap reached — drop this orphan. Caller would have to
@@ -4808,6 +4871,7 @@ export class AccountingModule {
         }
         this.invoiceLedger.set(invoiceId, new Map());
         this.unknownLedgerCount++;
+        this.unknownLedgerFirstSeen.set(invoiceId, nowMs);
       }
       const orphanLedger = this.invoiceLedger.get(invoiceId)!;
       // Per-invoice entry cap — once reached, drop further `mt:` orphans
@@ -4885,6 +4949,7 @@ export class AccountingModule {
       this.dirtyLedgerEntries.add(invoiceId);
       this.balanceCache.delete(invoiceId);
       await this._flushDirtyLedgerEntries();
+      });
       return;
     }
 

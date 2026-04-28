@@ -660,6 +660,20 @@ export function getCoinIdByName(name: string): string | undefined {
  * If the input is a short symbol, resolves it via the TokenRegistry.
  * Returns the input unchanged if it's already a hash coinId or unknown.
  *
+ * @public
+ *
+ * @remarks
+ * Heuristic: inputs matching `length <= 20 && /^[A-Za-z0-9]+$/` are treated
+ * as symbolic names and looked up in the registry. Long inputs, hyphenated
+ * inputs ("TOKEN-123"), or dotted inputs ("BTC.CASH") pass through unchanged.
+ *
+ * **Stability:** This function depends on `TokenRegistry` content. Adding a
+ * new symbol that shadows a previously-unknown short alphanumeric coinId
+ * changes normalization semantics retroactively. Consumers building stable
+ * keys against this output should be aware that registry growth is a
+ * non-breaking change *for unknown inputs* but a breaking change *for inputs
+ * that newly resolve*.
+ *
  * @param coinId - A symbolic name or hash coinId.
  * @returns The canonical hash coinId, or the original string if not resolvable.
  */
@@ -677,6 +691,15 @@ export function normalizeCoinId(coinId: string): string {
  *
  * Handles mixed-format comparisons: "BTC" vs hash coinId, or two hash coinIds.
  * Both values are normalized to hash coinIds via the TokenRegistry before comparison.
+ *
+ * @public
+ *
+ * @remarks
+ * Reflexive byte-equality short-circuit comes first; otherwise both sides
+ * are normalized via {@link normalizeCoinId} and compared. Inherits the
+ * registry-dependence caveat from `normalizeCoinId`. Two distinct symbols
+ * that both fail to resolve will compare unequal even if they're semantic
+ * aliases — register them as aliases in `TokenRegistry` for matching.
  *
  * @param a - First coin identifier (symbol or hash coinId).
  * @param b - Second coin identifier (symbol or hash coinId).

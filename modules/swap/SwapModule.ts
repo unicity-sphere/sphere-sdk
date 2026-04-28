@@ -1554,14 +1554,36 @@ export class SwapModule {
     // *after* party_b_currency (the buyer ends up paying party B's currency).
     // We instead look up the asset slot whose coinId matches our expected
     // currency.
+    // SECURITY (W4): if the local wallet has BOTH party_a_address AND
+    // party_b_address (legitimate via address rotation, OR a hostile
+    // manifest crafted to point both parties at the same address), the
+    // first branch wins silently and the wallet always deposits as party
+    // A. Reject this ambiguity loudly rather than guessing.
+    const matchesPartyA = myDirectAddresses.has(swap.manifest.party_a_address);
+    const matchesPartyB = myDirectAddresses.has(swap.manifest.party_b_address);
+    if (matchesPartyA && matchesPartyB) {
+      throw new SphereError(
+        'Ambiguous party identity: local wallet matches both party_a_address and party_b_address',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
     let myExpectedCurrency: string;
-    if (myDirectAddresses.has(swap.manifest.party_a_address)) {
+    if (matchesPartyA) {
       myExpectedCurrency = swap.manifest.party_a_currency_to_change;
-    } else if (myDirectAddresses.has(swap.manifest.party_b_address)) {
+    } else if (matchesPartyB) {
       myExpectedCurrency = swap.manifest.party_b_currency_to_change;
     } else {
       throw new SphereError(
         'Local wallet address does not match either party in the swap manifest',
+        'SWAP_DEPOSIT_FAILED',
+      );
+    }
+    // SECURITY (W3 prereq): assert manifest's expected currency is non-empty
+    // before lookup — coinIdsMatch('', '') would return true and select
+    // slot 0 unconditionally on a malformed manifest.
+    if (!myExpectedCurrency || myExpectedCurrency === '') {
+      throw new SphereError(
+        'Manifest currency_to_change is empty for this party',
         'SWAP_DEPOSIT_FAILED',
       );
     }
@@ -1592,6 +1614,20 @@ export class SwapModule {
         `No asset matching expected currency ${myExpectedCurrency} found in deposit invoice`,
         'SWAP_DEPOSIT_FAILED',
       );
+    }
+    // SECURITY (W3): findIndex returns the first match. If the invoice has
+    // two slots that both coinIdsMatch the manifest currency (degenerate
+    // / malicious manifest where party_a_currency_to_change equals
+    // party_b_currency_to_change normalized form), wallet would pay into
+    // slot 0 unconditionally. Reject ambiguity loudly.
+    for (let i = assetIndex + 1; i < depositTarget.assets.length; i += 1) {
+      const a = depositTarget.assets[i];
+      if (a?.coin !== undefined && coinIdsMatch(a.coin[0], myExpectedCurrency)) {
+        throw new SphereError(
+          `Ambiguous asset match in deposit invoice: slots ${assetIndex} and ${i} both match currency ${myExpectedCurrency}`,
+          'SWAP_DEPOSIT_FAILED',
+        );
+      }
     }
 
     return this.withSwapGate(swapId, async () => {
