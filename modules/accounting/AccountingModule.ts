@@ -4794,9 +4794,11 @@ export class AccountingModule {
       }
       const orphanLedger = this.invoiceLedger.get(invoiceId)!;
       // Per-invoice entry cap — once reached, drop further `mt:` orphans
-      // for this invoiceId. Pre-existing on-chain entries in the same
-      // ledger don't count (they're under different key prefix and indicate
-      // the invoice was already attributed via the proper path).
+      // for this invoiceId. The counter is also re-checked INSIDE the
+      // per-token loop below: a single transfer can carry many tokens, so
+      // a hostile burst could otherwise bypass the cap by overshooting in
+      // one event. We use a mutable local counter rather than rescanning
+      // the keys per token (O(N²) at the cap value).
       let mtEntryCount = 0;
       for (const k of orphanLedger.keys()) {
         if (k.startsWith('mt:')) mtEntryCount++;
@@ -4835,9 +4837,20 @@ export class AccountingModule {
         }
 
         if (!onChainAttributed) {
+          // Re-check the cap inside the loop. A single transfer carrying
+          // N tokens would otherwise bypass the cap by writing all N
+          // entries before the next event re-checks. Bounded total per
+          // invoice: MAX_ORPHAN_ENTRIES_PER_INVOICE strictly.
+          if (mtEntryCount >= MAX_ORPHAN_ENTRIES_PER_INVOICE) {
+            // Cap reached — drop remaining tokens but still update the
+            // tokenInvoiceMap below so verifyPayout's reverse lookup stays
+            // consistent for the tokens we DID write.
+            break;
+          }
           const orphanKey = `mt:${token.id}:${transfer.id}`;
           if (!orphanLedger.has(orphanKey)) {
             orphanLedger.set(orphanKey, syntheticRef);
+            mtEntryCount++;
           }
         }
 
