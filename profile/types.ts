@@ -405,6 +405,34 @@ export type ProfileKeyMap = Readonly<Record<string, ProfileKeyMapEntry>>;
  *
  * Global keys map directly. Per-address keys use `{addr}` as a placeholder
  * that is replaced at runtime with the actual address ID.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * SCHEMA-vs-RUNTIME contract for per-entry-key collections (W46)
+ * ─────────────────────────────────────────────────────────────────────────
+ * `PROFILE_KEY_MAPPING` declares LOGICAL keys (a static schema). The
+ * per-entry-key collections — `outbox`, `mintOutbox`, `audit`, `invalid`,
+ * `finalizationQueue` — expand at runtime into composite keys of the form
+ * `${addr}.<collection>.${id}` (and, for multi-rep collections like
+ * `invalid` and `audit`, further composite ids of the form
+ * `${tokenId}.${observedTokenContentHash}`). The static `outbox` /
+ * `audit` / `invalid` / etc. logical keys NEVER appear at runtime — they
+ * are emitted by the per-entry-key writer in
+ * `profile-token-storage-provider.ts` and consumed by the matching reader.
+ *
+ * **`Sphere.clear()` reaches per-entry-key collections via parent
+ * storage clear (prefix-scan-and-delete), NOT via the mapping table.**
+ * This is intentional: adding new per-entry-key collections does NOT
+ * require touching `Sphere.clear()`. The path is
+ *   Sphere.clear() -> StorageProvider.clear() -> wipe ALL `${addr}.*`
+ *   keys (including all `${addr}.<collection>.${id}` per-entry records)
+ *
+ * The legacy `invalidTokens` entry is retained for the one-way migration
+ * window (see `profile/migration.ts::migrateInvalidTokensToPerEntryKey`);
+ * it converts each legacy single-record entry into a per-entry-key form
+ * `${addr}.invalid.${tokenId}.legacy-${tokenId}` (synthetic
+ * `observedTokenContentHash`). The migration is additive — it never
+ * overwrites a real per-entry-key entry that may have been written by a
+ * later wave (T.3.B, etc.) before the migration ran.
  */
 export const PROFILE_KEY_MAPPING: ProfileKeyMap = {
   // --- Global identity keys ---
@@ -462,17 +490,36 @@ export const PROFILE_KEY_MAPPING: ProfileKeyMap = {
 
   // --- Per-address operational keys (stored in OrbitDB due to criticality) ---
   'mintOutbox': { profileKey: '{addr}.mintOutbox', dynamic: true },
+  /**
+   * @deprecated Legacy single-blob form retained for one-way migration
+   * (see profile/migration.ts::migrateInvalidTokensToPerEntryKey). New
+   * writes go to the per-entry-key prefix below (`invalid`). This entry
+   * SHOULD be removed in T.8.D once the migration window closes.
+   */
   'invalidTokens': { profileKey: '{addr}.invalidTokens', dynamic: true },
   'invalidatedNametags': { profileKey: '{addr}.invalidatedNametags', dynamic: true },
   'tombstones': { profileKey: '{addr}.tombstones', dynamic: true },
 
   // --- UXF inter-wallet transfer protocol per-entry-key collections
-  //     (T.0.G7-fill-gaps). Both expand at runtime into
+  //     (T.0.G7-fill-gaps + T.1.E). Each entry expands at runtime into
   //     `${addr}.<collection>.<id>` records via the per-entry-key
   //     writer in profile-token-storage-provider.ts. The `id` form is
   //     treated as opaque by the writer — T.1.E declares the specific
-  //     composite-id shape for `audit` (`${tokenId}.${contentHash}`).
+  //     composite-id shapes:
+  //       - `audit`:   `${tokenId}.${observedTokenContentHash}`
+  //       - `invalid`: `${tokenId}.${observedTokenContentHash}`
+  //                    (legacy `invalidTokens` migrates to
+  //                    `${tokenId}.legacy-${tokenId}`)
+  //       - `finalizationQueue`: `${requestId}` (single-rep)
+  //
+  // These static keys NEVER appear at runtime on their own — the writer
+  // expands them into per-entry-key composites. The mapping is here so
+  // (a) reverse-lookups and (b) tooling that scans the schema know the
+  // collection exists. `Sphere.clear()` reaches every per-entry-key
+  // record via parent-storage prefix wipe (W46) — see the contract
+  // block at the top of this constant.
   'audit': { profileKey: '{addr}.audit', dynamic: true },
+  'invalid': { profileKey: '{addr}.invalid', dynamic: true },
   'finalizationQueue': { profileKey: '{addr}.finalizationQueue', dynamic: true },
 } as const;
 
