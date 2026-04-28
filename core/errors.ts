@@ -147,7 +147,28 @@ export type SphereErrorCode =
    *  writer does not mutate). Callers that need to upsert should call
    *  `OutboxWriter.write(...)` instead of update. See profile/outbox-writer.ts
    *  and UXF-TRANSFER-PROTOCOL §7. */
-  | 'OUTBOX_ENTRY_NOT_FOUND';
+  | 'OUTBOX_ENTRY_NOT_FOUND'
+  /**
+   * UXF Inter-Wallet Transfer T.2.A — preflight-finalize hard-failure.
+   *
+   * Thrown by `modules/payments/transfer/preflight-finalize.ts` when the
+   * sender attempts to walk a source token's pending-transaction history
+   * (conservative-mode preflight, §2.2 / §13 Wave T.2) and the aggregator
+   * surfaces a non-transient rejection on any tx in that chain. The
+   * `cause` carries `{ tokenId, requestId, reason }` where `reason` is one
+   * of the canonical 14 `DispositionReason` strings (§6.1 mapping):
+   *  - `'belief-divergence'`  ← `AUTHENTICATOR_VERIFICATION_FAILED` at submit
+   *  - `'client-error'`       ← `REQUEST_ID_MISMATCH` at submit
+   *  - `'oracle-rejected'`    ← sustained `PATH_NOT_INCLUDED` past polling window
+   *  - `'proof-invalid'`      ← exhausted `PATH_INVALID` / `NOT_AUTHENTICATED`
+   *  - `'race-lost'`          ← proof's transactionHash mismatches local
+   *
+   * T.2.D.1 (conservative-sender orchestrator) catches this and re-throws
+   * `INSUFFICIENT_BALANCE` with `reason='source-cascade-failed'` per the
+   * §13 Wave T.2 acceptance — preflight itself stays purely descriptive so
+   * the typed cause is forensically preserved up the stack.
+   */
+  | 'SOURCE_CHAIN_HARD_FAIL';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
