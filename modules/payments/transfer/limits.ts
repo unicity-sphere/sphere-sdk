@@ -25,6 +25,9 @@
  *          BINARY representation of the CID, NOT the base32 string).
  * - §6.1   `MAX_CONCURRENT_POLLS_PER_TOKEN`,
  *          `MAX_CONCURRENT_POLLS_PER_AGGREGATOR`.
+ * - §5.5   step 6 polling policy: `POLLING_WINDOW_MS`,
+ *          `MIN_POLL_ATTEMPTS`, `BACKOFF_SCHEDULE_MS` — consumed by the
+ *          shared `polling-policy.ts` module (T.5.B.0).
  *
  * @packageDocumentation
  */
@@ -106,6 +109,45 @@ export const INGEST_QUEUE_SIZE = 256;
  * `INGEST_QUEUE_FULL_PER_TOKEN`. (§5.0 / round-2 W7.)
  */
 export const INGEST_QUEUE_PER_TOKEN_CAP = 16;
+
+/**
+ * Polling-window for finalization queue entries (§5.5 step 6). The
+ * worker concludes the aggregator never anchored a commitment and
+ * marks the queue entry hard-failed (`oracle-rejected`) once
+ *   (a) `now - submittedAt >= POLLING_WINDOW_MS`, AND
+ *   (b) the worker has completed at least `MIN_POLL_ATTEMPTS` polls.
+ * Spec default is 30 minutes.
+ */
+export const POLLING_WINDOW_MS = 30 * 60 * 1000;
+
+/**
+ * Minimum number of polls that MUST be observed before the
+ * polling-window deadline can declare a hard-fail (§5.5 step 6). This
+ * prevents a fast-clock-skew or aggressive-backoff path from declaring
+ * a hard-fail prematurely. Only polls that returned a verifiable
+ * proof-status (OK, PATH_NOT_INCLUDED, PATH_INVALID, NOT_AUTHENTICATED)
+ * advance this counter — transient errors do NOT.
+ */
+export const MIN_POLL_ATTEMPTS = 5;
+
+/**
+ * Default backoff schedule (in ms) for finalization-queue polling
+ * (§5.5 step 6 — "30s, 60s, 120s, 240s, then every 5 min until
+ * deadline"). Values for indices ≥ length cap at the last entry
+ * (`getBackoffMs` in `polling-policy.ts`).
+ *
+ * Configuration validity rule (§5.5 step 6, normative):
+ *   sum(BACKOFF_SCHEDULE_MS[0..MIN_POLL_ATTEMPTS-1]) ≤ POLLING_WINDOW_MS
+ * For these defaults: 30 + 60 + 120 + 240 + 300 = **750s = 12.5 min**,
+ * comfortably below the 30-min window.
+ */
+export const BACKOFF_SCHEDULE_MS: ReadonlyArray<number> = [
+  30_000,
+  60_000,
+  120_000,
+  240_000,
+  300_000,
+];
 
 // =============================================================================
 // 2. clampInlineCap — §3.3.1 inline-cap normalization
