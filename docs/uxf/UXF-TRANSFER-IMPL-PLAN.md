@@ -152,7 +152,9 @@ Each task lists `id, title, wave, files_touched, depends_on, parallel_with, skil
 - **risks**: low — pure verification; either passes (T.0.G7-fill-gaps not needed) or fails clearly.
 - **spec_refs**: §7 (outbox key shape); PROFILE-ARCHITECTURE.md §10.12.
 
-#### T.0.G7-fill-gaps — Land missing per-entry-key writers (conditional)
+#### T.0.G7-fill-gaps — Land missing per-entry-key writers (CONTINGENT — only materializes if T.0.G7-verify fails)
+
+> **Round-3 N1 semantics**: this task is CONTINGENT. If T.0.G7-verify passes (all 4 prefix-scan key shapes already work on `main`), T.0.G7-fill-gaps is dropped from the schedule entirely — implementers proceed directly from T.0.G7-verify to T.1.E. If T.0.G7-verify fails, T.0.G7-fill-gaps becomes a hard prerequisite for T.1.E and adds 1–3 days to the critical path. The dep edge `T.1.E depends_on T.0.G7-fill-gaps` is conditional in CI/scheduling — it materializes only when verify reports FAIL.
 
 - **wave**: T.0 (prerequisite, lands ONLY if T.0.G7-verify fails)
 - **files_touched** (estimated; exact files depend on what verify exposes):
@@ -739,7 +741,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
 - **files_touched**:
   - NEW: `docs/uxf/ADR-005-orbitdb-write-fairness.md` (~50 LOC) — decision record on `MAX_CONCURRENT_ORBITDB_WRITES` cap value + fairness-queue strategy. Default proposed: 8 (half of MAX_INGEST_WORKERS to leave OrbitDB headroom for replication merges); revisit-criteria section requires re-eval if T.8.E.1 load test shows >50% queue depth at the cap.
   - MODIFIED: `modules/payments/transfer/limits.ts` — add `MAX_CONCURRENT_ORBITDB_WRITES = 8` constant.
-  - NEW: `profile/orbitdb-write-fairness.ts` (~30 LOC) — fairness-queue stub (round-robin across pending writers; bounded concurrent in-flight count). T.5.B / T.5.C / T.6.A all consume this primitive.
+  - NEW: `profile/orbitdb-write-fairness.ts` (~30 LOC) — fairness-queue stub (round-robin across pending writers; bounded concurrent in-flight count). **T.5.B and T.5.C consume this primitive** (added explicitly to their depends_on); T.6.A landed earlier in the chain and uses unmediated OrbitDB writes. A follow-up T.6.A-fairness-wrap task is OPTIONAL and not on the critical path — exists only if T.8.E.1 load test shows T.6.A's outbox writes contending with T.5.B/T.5.C's worker writes.
 - **depends_on**: T.5.B.0 (manifest-cid-rewrite needs the fairness queue available to call into).
 - **parallel_with**: T.5.B (after T.5.B.0 lands).
 - **skill_tag**: `crdt`
@@ -769,8 +771,8 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/§5.5-pollingDeadline-propagation.test.ts` — **W17**: pollingDeadline propagation to T.5.B's polling loop in outbox path.
   - NEW: `tests/unit/payments/transfer/§5.5-2x-window-safety-net.test.ts` — **W26**: 2× POLLING_WINDOW safety net via deterministic clock.
 - **depends_on**: T.1.A, T.1.C, T.1.F, T.5.A, T.5.B.0, T.6.A.
-- **parallel_with**: T.5.C (peers — both consume T.5.B.0 from a common ancestor; T.5.C also consumes T.5.B.5 which itself depends on T.5.B), T.5.F.
-  - **Note**: T.5.B.5 is NOT a peer of T.5.B — T.5.B.5 depends on T.5.B (cascade walker is downstream of the sender worker that needs cascade hooks integrated). T.5.B and T.5.C share T.5.B.0 only.
+- **parallel_with**: T.5.F (only — see note below).
+  - **Note (round-3 fix)**: T.5.B and T.5.C are NOT peers. T.5.C transitively depends on T.5.B via T.5.B.5 (`T.5.C depends_on T.5.B.5; T.5.B.5 depends_on T.5.B`). The serial chain `T.5.B → T.5.B.5 → T.5.C` is the correct ordering, matching §1 critical-path. Do not run T.5.C in parallel with T.5.B.
 - **skill_tag**: `worker`
 - **acceptance**:
   - Configuration validity rule (§5.5 step 6 paragraph "Configuration validity rule (normative)") validated at startup; cumulative backoff for the first MIN_POLL_ATTEMPTS polls ≤ POLLING_WINDOW.
@@ -833,7 +835,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/finalization-queue.test.ts`, `finalization-worker-recipient.test.ts` — single-tx PENDING; chain-mode K=3; queue-drain re-runs [B]/[D]/[E]; concurrent ingest while queue is draining; merge-path (§5.5 last paragraph) with grafted proofs.
   - NEW: `tests/unit/payments/transfer/§5.6-idempotency-invariant.test.ts` — **W15 adversarial: replay with different proof, same transactionHash, must converge**.
   - NEW: `tests/unit/payments/transfer/disposition-engine-revaluate.test.ts` — **W5: step-9 re-evaluator entry-point**.
-- **depends_on**: T.1.A, T.1.C, T.1.E (`finalization_queue` key), T.1.F, T.3.B.1, T.3.B.2, T.3.C, T.3.D, T.5.B.0 (polling-policy + manifest-cid-rewrite — peer dep, NOT through T.5.B), T.5.B.5 (cascade walker — recipient worker invokes cascade on hard-fail, must depend on the walker).
+- **depends_on**: T.1.A, T.1.C, T.1.E (`finalization_queue` key), T.1.F, T.3.B.1, T.3.B.2, T.3.C, T.3.D, T.5.B.0 (polling-policy + manifest-cid-rewrite — peer dep, NOT through T.5.B), **T.5.B.0.5 (fairness queue — recipient consumes per ADR-005, round-3 fix)**, T.5.B.5 (cascade walker — recipient worker invokes cascade on hard-fail, must depend on the walker).
 - **parallel_with**: T.5.B (both consume T.5.B.0 directly), T.5.D.
 
   **Acceptance addendum (C3 fix, refined per round-2 W4)**: on hard-fail of any queue entry for a `tokenId`, the recipient worker MUST invoke T.5.B.5 cascade-walker. Recipient-side cascade semantics (clarified):
@@ -1313,7 +1315,13 @@ T.8 ships the informational `wireProtocols` field on the identity binding event,
   - MODIFIED: `cli/index.ts`, `modules/accounting/AccountingModule.ts` — final pass to remove legacy fall-through code.
   - NEW: `docs/uxf/UXF-TRANSFER-CUTOVER-RUNBOOK.md` — operator guide for cutover, including back-out procedure (revert this PR + run `tools/restore-legacy-outbox.ts` from T.6.D.2).
   - **W33**: ADR appendix in cutover runbook listing every export/function/type slated for deletion (legacy_outbox decoder, legacy TXF send fast path, etc.).
-- **depends_on**: T.7.C, T.7.E (default flip), T.6.D.2 (restore script ready), T.8.A (regression assertion still passing), **external-acks-received** (NON-CODE GATE: agentsphere maintainer ack on `onIntent` widening + sphere app maintainer ack + openclaw-unicity maintainer ack — round-2 W6). CI validates each ack via a tracking-issue closed-state check before allowing merge.
+- **depends_on**: T.7.C, T.7.E (default flip), T.6.D.2 (restore script ready), T.8.A (regression assertion still passing), **external-acks-received** (NON-CODE GATE: agentsphere maintainer ack on `onIntent` widening + sphere app maintainer ack + openclaw-unicity maintainer ack — round-2 W6).
+
+  **CI mechanism (round-3 W2)**: a new GitHub Actions workflow `.github/workflows/external-acks-gate.yml` runs as a required check on the T.8.D PR. It uses `gh issue list --state closed --search "label:uxf-transfer-v1-ack repo:unicity-sphere/agentsphere"` (and same for sphere-app, openclaw-unicity) — fails the PR check if any of the three tracking issues is still open. Tracking issues:
+  - `unicity-sphere/agentsphere#NN` (label `uxf-transfer-v1-ack`)
+  - `unicity-sphere/sphere#NN` (label `uxf-transfer-v1-ack`)
+  - `unicity-sphere/openclaw-unicity#NN` (label `uxf-transfer-v1-ack`)
+  T.8.D PR description must reference these three issues; CI verifies all are closed before allowing merge.
 - **parallel_with**: T.8.B, T.8.C, T.8.E.1/2/3.
 - **skill_tag**: `cli-cleanup`
 - **acceptance**:
@@ -1453,6 +1461,8 @@ T.7.A    (TXF sender)                                [day 14-15]
 T.7.B    (legacy adapter)                            [day 14-15 in parallel]
   ↓
 T.7.E    (default flip)                              [day 15-16]
+  ↓
+[external-acks gate + soak/smoke window]             [day 16-18 buffer — round-3 W2]
   ↓
 T.8.D    (cutover)                                   [day 18-22]
 ```
@@ -1732,6 +1742,8 @@ Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied cons
 
 | ID | Title | Wave | Skill | Est LoC | Critical-path? |
 |---|---|---|---|---|---|
+| T.0.G7-verify | Wave G.7 layout verification | T.0 | storage | 80 | YES |
+| T.0.G7-fill-gaps | Land missing per-entry-key writers (conditional) | T.0 | storage | 0–400 | YES (if triggers) |
 | T.1.A | UxfTransferPayload + DeliveryStrategy | T.1 | types | 220 | YES |
 | T.1.B.1 | TransferMode/Request widening + shims | T.1 | types | 320 | YES |
 | T.1.B.2 | Audit shim removal (post-T.7.C) | T.7 | cleanup | 80 |  |
@@ -1755,9 +1767,10 @@ Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied cons
 | T.4.B | Recipient verified-CAR fetch | T.4 | recipient | 600 |  |
 | T.5.A | Instant-sender orchestrator | T.5 | sender | 880 | YES |
 | T.5.B.0 | Manifest-CID-rewrite + polling-policy | T.5 | worker | 380 |  |
-| T.5.B | Sender finalization worker | T.5 | worker | 1180 | YES |
+| T.5.B.0.5 | OrbitDB-write-fairness ADR + cap | T.5 | crdt | 80 |  |
+| T.5.B | Sender finalization worker | T.5 | worker | 1580 | YES |
 | T.5.B.5 | Cascade walker (per-class) | T.5 | recipient | 540 | YES |
-| T.5.C | Recipient finalization worker | T.5 | worker | 1240 | YES |
+| T.5.C | Recipient finalization worker | T.5 | worker | 1740 | YES |
 | T.5.D | importInclusionProof + revalidate | T.5 | recipient | 1120 | YES |
 | T.5.E | Trustbase / security-alert / override events | T.5 | worker | 360 |  |
 | T.5.F | trustBase staleness + refresh | T.5 | worker | 360 |  |
@@ -1782,7 +1795,7 @@ Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied cons
 | T.8.E.2 | Compatibility test suite | T.8 | tests | 600 |  |
 | T.8.E.3 | Adversarial test suite | T.8 | tests | 1100 |  |
 
-**Total**: 50 tasks (was 38; +12 from C2/C3/C5/C7/W1/W2/W3/W10/W41 splits and new tasks, plus T.0.G7-prereq), ~26,500 LOC including tests (was ~22,500), **15 critical-path tasks** (16 if T.0.G7-prereq triggers fill-gaps).
+**Total**: 52 tasks (was 38; +14 from all splits + new tasks: T.0.G7-verify, T.0.G7-fill-gaps (conditional), T.5.B.0.5, T.7.B.5, T.7.C.5, T.5.F, T.6.D.2, plus pairs from C2/W1/W2/W3/W10), ~27,500 LOC including tests (was ~22,500), **15 critical-path tasks** (16 if T.0.G7-fill-gaps triggers).
 
 **Tasks added/split (delta from v1)**:
 - Split: T.1.B → T.1.B.1 + T.1.B.2 (W1)
@@ -1795,7 +1808,7 @@ Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied cons
 - New: T.7.B.5 (nametag re-resolution, C9)
 - New: T.7.C.5 (ConnectHost coordination, C5)
 
-Critical-path tasks marked YES form the 13-PR longest serial chain detailed in §1 and §3.
+Critical-path tasks marked YES form the 15-PR longest serial chain detailed in §1 and §3 (16 PRs if T.0.G7-fill-gaps triggers).
 
 ---
 
