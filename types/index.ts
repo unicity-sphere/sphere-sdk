@@ -681,6 +681,9 @@ export * from './payment-session';
 // Re-export UXF transfer wire-format types (T.1.A)
 export * from './uxf-transfer';
 
+// Re-export DispositionReason / AuditStatus enums + record schemas (T.1.C)
+export * from './disposition';
+
 // =============================================================================
 // Network Health Types
 // =============================================================================
