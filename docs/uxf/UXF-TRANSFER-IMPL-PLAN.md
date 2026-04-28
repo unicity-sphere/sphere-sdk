@@ -697,7 +697,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/instant-sender.test.ts` — single-tx instant; chain-mode (allowPendingTokens=true) with K=3 inherited unfinalized; NFT instant with `confirmNftPending=true`.
   - NEW: `tests/unit/payments/transfer/§4.1-step2-confirmNftPending-rejection.test.ts` — **W11: replicate the §4.1 step 2 acceptance row at T.5.A**.
 - **depends_on**: T.1.A, T.1.B.1, T.1.C, T.1.D, T.2.B, T.2.C, T.6.A, T.6.B.
-- **parallel_with**: T.5.B.0, T.5.B, T.5.C (after their deps), T.5.D (after its deps).
+- **parallel_with**: T.5.B.0 (peer — both depend on T.6.A/T.6.B). T.5.B / T.5.B.5 / T.5.C / T.5.D are downstream of T.5.A (T.5.B `depends_on T.5.A`); they are NOT peers.
 - **skill_tag**: `sender`
 - **acceptance**:
   - Outbox entry created with `status='delivered-instant'` after Nostr ack; `outstandingRequestIds` populated with all unfinalized commitment IDs (NEW one + inherited K-1).
@@ -836,7 +836,7 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/§5.6-idempotency-invariant.test.ts` — **W15 adversarial: replay with different proof, same transactionHash, must converge**.
   - NEW: `tests/unit/payments/transfer/disposition-engine-revaluate.test.ts` — **W5: step-9 re-evaluator entry-point**.
 - **depends_on**: T.1.A, T.1.C, T.1.E (`finalization_queue` key), T.1.F, T.3.B.1, T.3.B.2, T.3.C, T.3.D, T.5.B.0 (polling-policy + manifest-cid-rewrite — peer dep, NOT through T.5.B), **T.5.B.0.5 (fairness queue — recipient consumes per ADR-005, round-3 fix)**, T.5.B.5 (cascade walker — recipient worker invokes cascade on hard-fail, must depend on the walker).
-- **parallel_with**: T.5.B (both consume T.5.B.0 directly), T.5.D.
+- **parallel_with**: T.5.D (peers — both downstream of T.5.B.5). NOT T.5.B (transitively dependent via T.5.B.5; round-3 critical fix mirror — round-4 C1).
 
   **Acceptance addendum (C3 fix, refined per round-2 W4)**: on hard-fail of any queue entry for a `tokenId`, the recipient worker MUST invoke T.5.B.5 cascade-walker. Recipient-side cascade semantics (clarified):
    - **Coin path**: a recipient who has not split or forwarded the received token has no `splitParent` references locally — the coin-class walk is a NO-OP (zero children). This is the typical case (recipient just received it). The walk is required only for chain-mode recipients who themselves split the received token in instant mode before resolution.
@@ -1313,6 +1313,7 @@ T.8 ships the informational `wireProtocols` field on the identity binding event,
 - **files_touched**:
   - MODIFIED: `modules/payments/PaymentsModule.ts` — remove the legacy single-coin code paths. The flag-gated dispatcher becomes unconditional (gated only on the `transferMode` value).
   - MODIFIED: `cli/index.ts`, `modules/accounting/AccountingModule.ts` — final pass to remove legacy fall-through code.
+  - NEW: `.github/workflows/external-acks-gate.yml` (~50 LOC) — round-4 W1: GitHub Actions workflow implementing the external-acks gate; uses `gh issue list --state closed` against the three tracking-issue labels. Fails the T.8.D PR until all three external maintainers close their `uxf-transfer-v1-ack`-labeled issues.
   - NEW: `docs/uxf/UXF-TRANSFER-CUTOVER-RUNBOOK.md` — operator guide for cutover, including back-out procedure (revert this PR + run `tools/restore-legacy-outbox.ts` from T.6.D.2).
   - **W33**: ADR appendix in cutover runbook listing every export/function/type slated for deletion (legacy_outbox decoder, legacy TXF send fast path, etc.).
 - **depends_on**: T.7.C, T.7.E (default flip), T.6.D.2 (restore script ready), T.8.A (regression assertion still passing), **external-acks-received** (NON-CODE GATE: agentsphere maintainer ack on `onIntent` widening + sphere app maintainer ack + openclaw-unicity maintainer ack — round-2 W6).
@@ -1720,7 +1721,7 @@ These do not block T.1–T.8 but should be resolved before merge of the correspo
 3. **[RESOLVED]** ~~T.6.B — Lamport-clock initialization on schema migration~~ — `0` is safe (any subsequent local write bumps to `max(observed) + 1`); documented in T.6.D inline.
 4. **[RESOLVED]** ~~T.5.C — Per-tokenId mutex strategy choice~~ — T.1.F implements all 3 strategies (CAS preferred, lock-with-RPC-release fallback, lock-with-bounded-hold last resort — W34); T.5.C selects via config.
 5. **[RESOLVED]** ~~T.7.A — instant-TXF + chain-mode forwarder semantics~~ — T.7.A explicit test for forwarder-dies-mid-chain in TXF mode; per-token outbox carries inherited `outstandingRequestIds`.
-6. **[STILL OPEN]** T.8.A — fixture regen process — establish: who can regenerate, on what occasion, with what ADR template. **Steelman pass should clarify.**
+6. **[RESOLVED]** ~~T.8.A — fixture regen process~~ — round-4 N1 resolution: T.8.A's implementing PR includes an inline ADR (in the test file's header comment) declaring: (a) the SDK version + commit hash that produced the fixture, (b) deterministic salt + timestamp + mnemonic used, (c) regen-trigger criteria — fixture is regenerated ONLY if a) the canonical bundle's wire format changes (rare; would require a separate spec change) OR b) a critical SDK upgrade requires it (e.g., state-transition-sdk major bump). Regeneration PRs require sign-off from the spec-owner (currently vladimir.rogojin@blockyinnovations.com). Routine PR authors do NOT regenerate the fixture; mismatches signal an unintended wire-format break.
 7. **[RESOLVED]** ~~T.8.E — CI runtime budget~~ — split via W10 into T.8.E.1/2/3; adversarial suite runs nightly + on PRs touching `modules/payments/transfer/`.
 8. **[NEW]** T.5.B.5 — cascade walker visited-set sharing across worker threads — **W32** clarified per-call-stack scope, but for a single Sphere instance with multiple workers, two cascades from different parents may visit a shared child. Confirm: per-call-stack visited-set + per-tokenId mutex (T.1.F) prevents double-cascade; document the proof in T.5.B.5 inline.
 9. **[NEW]** T.5.F — trustBase refresh storm — debounce + cool-down for refresh; confirm rate limit on aggregator side; coordinate with aggregator team.
