@@ -273,6 +273,26 @@ export interface TokenTransferDetail {
   readonly splitGroupId?: string;
   /** Nostr event ID (for split transfers delivered via Nostr) */
   readonly nostrEventId?: string;
+  /**
+   * Coin-class split provenance (UXF C11). Set ONLY for coin children
+   * (the recipient's freshly-minted token plus any change tokens the
+   * sender retained). NEVER set for NFT direct transfers — those
+   * preserve `tokenId` and have no split parent.
+   *
+   *  - `tokenId` — the parent (source) token whose burn produced this
+   *    child's mint.
+   *  - `status`  — `'pending'` while the parent's commit-transition is
+   *    awaiting an inclusion proof; `'valid'` once the worker attaches
+   *    the proof (T.5.B). The recipient cascades this status onto the
+   *    received child until the parent finalizes (§6.1.1).
+   *
+   * Spec refs: UXF impl-plan C11 (class-disjoint splitParent rule),
+   * §6.1.1 (cascade semantics).
+   */
+  readonly splitParent?: {
+    readonly tokenId: string;
+    readonly status: 'pending' | 'valid';
+  };
 }
 
 export interface TransferResult {
@@ -497,6 +517,8 @@ export interface TrackedAddress extends TrackedAddressEntry {
 export type SphereEventType =
   | 'transfer:incoming'
   | 'transfer:confirmed'
+  | 'transfer:submitted'
+  | 'transfer:cascade-risk-warning'
   | 'transfer:failed'
   | 'transfer:operator-alert'
   | 'payment_request:incoming'
@@ -571,6 +593,34 @@ export type SphereEventType =
 export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
   'transfer:confirmed': TransferResult;
+  /**
+   * Instant-mode UXF send acked by the relay (T.5.A). Distinct from
+   * `transfer:confirmed` (which fires only after inclusion proofs land
+   * locally — that is `transfer:finalized` in spec language but mapped
+   * onto the existing `transfer:confirmed` event by T.5.B's worker once
+   * proofs are attached). The status carried here is `'submitted'`:
+   * the bundle has reached the recipient, but the source-token proofs
+   * have not yet been polled.
+   *
+   * Spec refs: §2.1 (instant mode definition), §6.1 (sender-side
+   * finalization worker — runs after this event fires).
+   */
+  'transfer:submitted': TransferResult;
+  /**
+   * Diagnostic warning emitted by the instant-mode sender when a
+   * recipient is fed a freshly-minted child whose source token is still
+   * pending (per §6.1.1 cascade rule). The recipient's wallet may need
+   * to wait for the sender's source proofs before the child resolves.
+   *
+   * Spec refs: §6.1.1 (cascade rule — "pending source → pending child").
+   */
+  'transfer:cascade-risk-warning': {
+    readonly transferId: string;
+    readonly bundleCid: string;
+    readonly recipientTransportPubkey: string;
+    readonly pendingSourceTokenIds: ReadonlyArray<string>;
+    readonly freshlyMintedChildTokenIds: ReadonlyArray<string>;
+  };
   'transfer:failed': TransferResult;
   /**
    * Operator-level alert raised when the §5.3 / §6.1 disposition path

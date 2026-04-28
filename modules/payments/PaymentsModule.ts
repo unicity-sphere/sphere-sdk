@@ -78,6 +78,12 @@ import {
   type ConservativeCommitResult,
   type ConservativeSenderDeps,
 } from './transfer/conservative-sender';
+import {
+  sendInstantUxf,
+  type InstantCommitResult,
+  type InstantSenderDeps,
+} from './transfer/instant-sender';
+import { classifyToken as classifyTokenLike } from './transfer/classify-token';
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes as fromHex } from '../../core/hex';
@@ -1328,6 +1334,13 @@ export class PaymentsModule {
     // arm sees identical pre-conditions when the flag is off.
     if (this.features.senderUxf && internalTransferMode === 'conservative') {
       return this.dispatchUxfConservativeSend(originalRequest);
+    }
+    // T.5.A — UXF instant dispatcher (same feature flag).
+    // When `features.senderUxf === true` AND the request is instant-mode,
+    // route through the new UXF instant orchestrator. Falls through to
+    // the legacy single-token TXF path otherwise.
+    if (this.features.senderUxf && internalTransferMode === 'instant') {
+      return this.dispatchUxfInstantSend(originalRequest);
     }
     // T.1.B.1 — `coinId` and `amount` are now optional on the public
     // `TransferRequest`. The legacy single-coin code path below
@@ -5848,6 +5861,254 @@ export class PaymentsModule {
     };
 
     return sendConservativeUxf(originalRequest, recipient, deps);
+  }
+
+  // ===========================================================================
+  // T.5.A — UXF instant-mode dispatcher
+  // ===========================================================================
+
+  /**
+   * UXF instant-mode send dispatcher (T.5.A, flag-gated).
+   *
+   * Reached only when `features.senderUxf === true` AND
+   * `transferMode === 'instant'`. Mirrors {@link
+   * dispatchUxfConservativeSend} structurally, but delegates to {@link
+   * sendInstantUxf} which DOES NOT await inclusion proofs before
+   * publishing — proofs are filled in by T.5.B's sender-side
+   * finalization worker (deferred to a future wave).
+   *
+   * Restrictions inherited from {@link requireLegacyCoinSlot}:
+   *  - The request MUST carry a primary `(coinId, amount)` slot until
+   *    the multi-asset source-selection extension lands.
+   */
+  private async dispatchUxfInstantSend(
+    originalRequest: TransferRequest,
+  ): Promise<TransferResult> {
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
+
+    const peerInfo: PeerInfo | null =
+      (await this.deps!.transport.resolve?.(request.recipient)) ?? null;
+    const recipientPubkey = this.resolveTransportPubkey(request.recipient, peerInfo);
+    const recipientAddress = await this.resolveRecipientAddress(
+      request.recipient,
+      request.addressMode,
+      peerInfo,
+    );
+
+    const recipient: PeerInfo = peerInfo ?? {
+      transportPubkey: recipientPubkey,
+      chainPubkey: '',
+      l1Address: '',
+      directAddress: '',
+      timestamp: Date.now(),
+    };
+
+    const signingService = await this.createSigningService();
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as
+      | StateTransitionClient
+      | undefined;
+    if (!stClient) {
+      throw new SphereError(
+        'State transition client not available. Oracle provider must implement getStateTransitionClient()',
+        'AGGREGATOR_ERROR',
+      );
+    }
+
+    const onChainMessage = parseInvoiceMemoForOnChain(
+      request.memo,
+      request.invoiceRefundAddress,
+      request.invoiceContact,
+    );
+
+    const transferId = crypto.randomUUID();
+
+    // Derive the address-scoped outbox key prefix per
+    // PROFILE-ARCHITECTURE §10.12. Falls back to the chainPubkey itself
+    // when the wallet has no DIRECT address (test paths).
+    const directForId = this.deps!.identity.directAddress;
+    const addressId =
+      typeof directForId === 'string' && directForId.length > 0
+        ? computeAddressId(directForId)
+        : this.deps!.identity.chainPubkey;
+
+    const deps: InstantSenderDeps = {
+      aggregator: this.deps!.oracle,
+      transport: this.deps!.transport,
+      tokenStorage: null,
+      identity: this.deps!.identity,
+      addressId,
+      senderTransportPubkey: this.deps!.identity.chainPubkey,
+      emit: (type, data) => this.deps!.emitEvent(type, data),
+      availableSources: () => Array.from(this.tokens.values()),
+      transferId,
+      selectSources: async ({ request: req }) => {
+        const parsedPool = await this.spendPlanner.buildParsedPool(
+          Array.from(this.tokens.values()),
+          request.coinId,
+        );
+        let pendingChangeAmount = 0n;
+        for (const [, t] of this.tokens) {
+          if (t.coinId === request.coinId && t.status === 'transferring') {
+            pendingChangeAmount += BigInt(t.amount || '0');
+          }
+        }
+        const planResult = this.spendPlanner.planSend(
+          { amount: req.amount ?? '0', coinId: request.coinId },
+          parsedPool,
+          this.reservationLedger,
+          this.spendQueue,
+          transferId,
+          pendingChangeAmount,
+        );
+        let splitPlan: SplitPlan;
+        if (planResult === 'queued') {
+          const queueResult = await this.spendQueue.waitForEntry(transferId);
+          splitPlan = queueResult.splitPlan;
+        } else {
+          splitPlan = planResult.splitPlan;
+        }
+        const out: Token[] = splitPlan.tokensToTransferDirectly.map(
+          (t) => t.uiToken,
+        );
+        if (splitPlan.tokenToSplit) out.push(splitPlan.tokenToSplit.uiToken);
+        for (const tok of out) {
+          tok.status = 'transferring';
+          this.tokens.set(tok.id, tok);
+          this.parsedTokenCache.delete(tok.id);
+        }
+        await this.save();
+        return out;
+      },
+      commitSources: async ({ sources }) => {
+        const out: InstantCommitResult[] = [];
+        for (const token of sources) {
+          // Submit the commitment WITHOUT awaiting the inclusion
+          // proof — the canonical instant-mode pipeline.
+          const commitment = await this.createSdkCommitment(
+            token,
+            recipientAddress,
+            signingService,
+            onChainMessage,
+          );
+          const submitResponse = await stClient.submitTransferCommitment(commitment);
+          if (
+            submitResponse.status !== 'SUCCESS' &&
+            submitResponse.status !== 'REQUEST_ID_EXISTS'
+          ) {
+            throw new SphereError(
+              `Transfer commitment failed: ${submitResponse.status}`,
+              'TRANSFER_FAILED',
+            );
+          }
+          // The transfer transaction goes on the bundle WITHOUT a
+          // proof — the recipient's reader walks the chain when
+          // proofs land.
+          const transferTxJson = {
+            data: commitment.toJSON(),
+            inclusionProof: null,
+          };
+          const tokenJson = token.sdkData
+            ? typeof token.sdkData === 'string'
+              ? JSON.parse(token.sdkData)
+              : token.sdkData
+            : null;
+          if (!tokenJson || typeof tokenJson !== 'object') {
+            throw new SphereError(
+              `Token ${token.id} missing sdkData; cannot ingest into UXF bundle`,
+              'TRANSFER_FAILED',
+            );
+          }
+          const recipientTokenJson = {
+            ...(tokenJson as Record<string, unknown>),
+            transactions: [
+              ...(((tokenJson as { transactions?: unknown[] }).transactions) ?? []),
+              transferTxJson,
+            ],
+          };
+          const requestIdBytes = commitment.requestId;
+          const requestIdHex =
+            requestIdBytes instanceof Uint8Array
+              ? Array.from(requestIdBytes)
+                  .map((b) => b.toString(16).padStart(2, '0'))
+                  .join('')
+              : String(requestIdBytes);
+
+          // Class discrimination per C11. Read sdkData's coinData to
+          // route NFTs (whole-token transfer; no splitParent) vs
+          // coins (splitParent set on the child).
+          const sourceTokenLike = {
+            id: token.id,
+            coins: (() => {
+              try {
+                const parsed = JSON.parse(
+                  typeof token.sdkData === 'string'
+                    ? token.sdkData
+                    : JSON.stringify(token.sdkData ?? {}),
+                ) as {
+                  genesis?: {
+                    data?: {
+                      coinData?: ReadonlyArray<readonly [string, string]> | null;
+                    };
+                  };
+                };
+                const cd = parsed?.genesis?.data?.coinData;
+                if (!Array.isArray(cd) || cd.length === 0) return null;
+                const coins = cd
+                  .filter(
+                    (e): e is readonly [string, string] =>
+                      Array.isArray(e) && e.length === 2 &&
+                      typeof e[0] === 'string' && typeof e[1] === 'string',
+                  )
+                  .map(([cid, amt]) => ({ coinId: cid, amount: BigInt(amt) }))
+                  .filter((c) => c.amount > 0n);
+                return coins.length > 0 ? coins : null;
+              } catch {
+                return [{ coinId: token.coinId, amount: BigInt(token.amount || '0') }];
+              }
+            })(),
+          };
+          const tokenClass = classifyTokenLike(sourceTokenLike);
+
+          if (tokenClass === 'coin') {
+            out.push({
+              sourceTokenId: token.id,
+              method: 'direct',
+              requestIdHex,
+              recipientTokenJson,
+              tokenClass: 'coin',
+              splitParentTokenId: token.id,
+            });
+          } else {
+            out.push({
+              sourceTokenId: token.id,
+              method: 'direct',
+              requestIdHex,
+              recipientTokenJson,
+              tokenClass: 'nft',
+            });
+          }
+        }
+        return out;
+      },
+      // markSourcePending — production wiring would mark sources
+      // 'pending' here. The existing legacy path's spendPlanner
+      // already sets `status='transferring'`; T.5.B will pivot the
+      // status to the canonical 'pending' enum once the worker lands.
+      markSourcePending: async () => {
+        // No-op for T.5.A — selectSources above already marks sources
+        // `transferring` in the local cache.
+      },
+      // outbox — T.5.A leaves the writer unwired in the dispatcher.
+      // Production wiring lands in the next wave once the per-address
+      // OutboxWriter integration ships. Tests inject the recorder.
+      outbox: undefined,
+      // onTriggerFinalization — T.5.B will land the worker. The
+      // dispatcher injects no-op for now; the orchestrator swallows
+      // any throw, so the omission is safe.
+      onTriggerFinalization: undefined,
+    };
+
+    return sendInstantUxf(originalRequest, recipient, deps);
   }
 
   /**
