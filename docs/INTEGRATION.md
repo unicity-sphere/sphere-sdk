@@ -400,7 +400,7 @@ await sphere.payments.send({
 
 **NFT model** (canonical, per UXF-TRANSFER-PROTOCOL §4.1): an NFT is a token with empty/null `coinData`, transferred whole-token. NFT and coin tokens are class-disjoint — no single token carries both. NFT transfers preserve the source `tokenId`; coin transfers split via mint, producing fresh `tokenId`s for recipient and change.
 
-**Pending NFT cascade caveat**: when `allowPendingTokens: true` is combined with NFT targets, you MUST also pass `confirmNftPending: true` to acknowledge the cascade-asymmetry risk. A cascaded coin can be recovered with fungible value from elsewhere; a cascaded NFT identity is irrecoverable.
+**Pending NFT cascade caveat**: when `allowPendingTokens: true` is set AND any NFT target's source has unfinalized predecessor txs in its history, you MUST pass `confirmNftPending: true` to acknowledge the cascade-asymmetry risk (otherwise the call rejects with `NFT_PENDING_REQUIRES_CONFIRMATION`). Finalized (valid) NFT sources do NOT require the confirmation even with `allowPendingTokens: true` — the requirement is gated on the NFT source actually being pending. A cascaded coin can be recovered with fungible value from elsewhere; a cascaded NFT identity is irrecoverable.
 
 Single-coin callers omitting `additionalAssets` behave identically to prior versions of the SDK — the field is purely additive.
 
