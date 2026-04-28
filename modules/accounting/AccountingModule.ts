@@ -5530,6 +5530,21 @@ export class AccountingModule {
         }
       }
 
+      // ALSO populate tokenInvoiceMap for every token in the transfer so the
+      // reverse lookup (verifyPayout's `getTokenIdsForInvoice` filter) sees
+      // these tokens as linked to this invoice. Without this, instant-mode
+      // payouts (no on-chain TXF transactions yet) end up with an empty
+      // payoutTokenIds set, and verifyPayout's fail-closed branch returns
+      // unverified — silently failing legitimate swap payouts that happen to
+      // route through the synthetic-ledger path.
+      for (const tok of transfer.tokens) {
+        if (!tok.id) continue;
+        if (!this.tokenInvoiceMap.has(tok.id)) {
+          this.tokenInvoiceMap.set(tok.id, new Set());
+        }
+        this.tokenInvoiceMap.get(tok.id)!.add(invoiceId);
+      }
+
       // §6.2 step 6a: Matches target + asset
       deps.emitEvent('invoice:payment', {
         invoiceId,
