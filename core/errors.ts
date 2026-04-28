@@ -139,7 +139,36 @@ export type SphereErrorCode =
    *  from being held indefinitely under aggregator stalls (W35). The lock
    *  is released as part of throwing this error so the next caller may
    *  proceed. See profile/per-token-mutex.ts and §5.5 step 9. */
-  | 'LOCK_BOUNDED_HOLD_FIRED';
+  | 'LOCK_BOUNDED_HOLD_FIRED'
+  // UXF Transfer / Multi-asset target validation (T.2.B) — §4.1 step 1 + 2,
+  // §11.2 validation rejection cases. The validator at
+  // `modules/payments/transfer/target-validator.ts` is the SINGLE source of
+  // truth; every error below surfaces at validation time as a `SphereError`.
+  /** `validateTargets()` was called with no primary `(coinId, amount)` slot
+   *  AND no `additionalAssets` entries (W22). The request carries nothing to
+   *  send. See §4.1 step 1 "If `targetList.length === 0` → EMPTY_TRANSFER".
+   */
+  | 'EMPTY_TRANSFER'
+  /** Structural rejection of the request shape: duplicate `coinId` across
+   *  primary + `additionalAssets`, duplicate NFT `tokenId`, partial primary
+   *  slot (only one of `coinId`/`amount` set), or otherwise malformed
+   *  request. Distinct from `INVALID_AMOUNT` (numeric) and `EMPTY_TRANSFER`
+   *  (no targets). See §4.1 step 1 prose and §11.2 validation rejections. */
+  | 'INVALID_REQUEST'
+  /** A coin-target's `amount` is not a positive integer string (`<= 0`,
+   *  fractional, non-numeric, or negative). See §4.1 step 1 "Each `kind:
+   *  'coin'` entry's `amount` MUST be > 0". */
+  | 'INVALID_AMOUNT'
+  /** An `additionalAssets` entry's `kind` discriminator is neither `'coin'`
+   *  nor `'nft'`. Forward-compat reject rule per §4.1 step 1
+   *  "Discriminator forward-compat" / §10.4. */
+  | 'UNKNOWN_ASSET_KIND'
+  /** A `kind: 'nft'` target's source token has unfinalized predecessor txs
+   *  (status pending) AND `confirmNftPending: false` (default). NFT cascade
+   *  asymmetry per §4.1 step 2 "NFT cascade asymmetry warning" — NFT
+   *  cascades are irrecoverable, so callers MUST acknowledge with
+   *  `confirmNftPending: true` to proceed (W11). */
+  | 'NFT_PENDING_REQUIRES_CONFIRMATION';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
