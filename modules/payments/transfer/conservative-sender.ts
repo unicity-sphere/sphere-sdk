@@ -74,7 +74,7 @@ import type {
   TransferRequest,
   TransferResult,
 } from '../../../types';
-import type { OutboxEntry } from '../../../types/txf';
+import type { UxfTransferOutboxEntry } from '../../../types/uxf-outbox';
 import type {
   DeliveryStrategy,
   UxfTransferPayloadCar,
@@ -172,22 +172,79 @@ export type PreflightOptionsFn = (params: {
 }) => Omit<PreflightFinalizeOptions, 'aggregator'>;
 
 /**
- * Optional outbox writer hook. Production wiring (the dispatcher in
- * `PaymentsModule.send()`) writes the synthetic legacy {@link
- * OutboxEntry} via the existing single-flight chain
- * (`saveToOutbox`/`removeFromOutbox`). Tests typically inject an inline
- * recorder.
+ * Outbox integration hooks (T.2.D.2). Production wiring threads an
+ * {@link OutboxWriter} through these callbacks; tests typically inject
+ * inline spies.
  *
- * The orchestrator's contract is "write a synthetic entry to the
- * outbox" — the per-entry-key {@link UxfTransferOutboxEntry} writer is
- * T.2.D.2's job and is NOT exercised here.
+ * The orchestrator drives the §7.0 lifecycle for the entry it owns:
+ *
+ *   1. {@link create} — write a fresh entry with `status: 'packaging'`
+ *      AFTER the bundle CID is derived (steps 5-7 of the pipeline).
+ *      The entry id is the orchestrator's transferId. Implementations
+ *      typically wrap {@link OutboxWriter.write}.
+ *   2. {@link transition} — apply a status change (and optional
+ *      forensic fields like `error`). The implementation wraps
+ *      {@link OutboxWriter.update}, which gates every transition
+ *      against the §7.0 state-machine validator (T.6.C).
+ *
+ * **Pre-publish persistence ordering** (§6.3 last paragraph): the
+ * orchestrator awaits {@link transition} into `'sending'` BEFORE
+ * dispatching the Nostr publish. A crash in between leaves the entry
+ * in `'sending'`, which the recovery worker treats as "republish on
+ * restart" — recipient idempotency is guaranteed by content-addressing
+ * the bundle CID.
  */
-export interface OutboxStubHooks {
-  /** Persist the (legacy-shaped) outbox entry just before
-   *  publishing the wire payload. */
-  readonly save: (entry: OutboxEntry, recipientPubkey: string) => Promise<void>;
-  /** Remove the outbox entry after a successful publish. */
-  readonly remove: (entryId: string) => Promise<void>;
+export interface OutboxIntegrationHooks {
+  /**
+   * Persist a freshly-created entry. The orchestrator builds the full
+   * payload (no `_schemaVersion` / `lamport` — those are stamped by
+   * the writer) and calls this hook exactly once per send attempt.
+   *
+   * @param entry  Outbox entry shape; status is always `'packaging'`
+   *               on create and includes all required fields per
+   *               {@link UxfTransferOutboxEntry}.
+   */
+  readonly create: (entry: OutboxCreateInput) => Promise<void>;
+  /**
+   * Apply a status transition (and optionally other forensic fields)
+   * to an existing entry. Implementations route through
+   * {@link OutboxWriter.update}, which validates the arc against the
+   * §7.0 transition table — illegal transitions throw
+   * `INVALID_OUTBOX_TRANSITION`.
+   *
+   * @param id      Outbox entry id (the orchestrator's transferId).
+   * @param patch   Partial mutation. The mutator-style shape is a
+   *                tuple of `(prev) => next` semantics realized at the
+   *                callsite as `Partial<UxfTransferOutboxEntry>` —
+   *                callers fold these onto the existing entry.
+   */
+  readonly transition: (id: string, patch: OutboxTransitionPatch) => Promise<void>;
+}
+
+/**
+ * Input shape for {@link OutboxIntegrationHooks.create}. Mirrors
+ * {@link OutboxWriter.write}'s `OutboxWriteInput` — every field of
+ * {@link UxfTransferOutboxEntry} except the writer-stamped
+ * (`_schemaVersion`, `lamport`) ones, with `updatedAt` optional.
+ */
+export type OutboxCreateInput = Omit<
+  UxfTransferOutboxEntry,
+  '_schemaVersion' | 'lamport'
+>;
+
+/**
+ * Patch shape for {@link OutboxIntegrationHooks.transition}. The
+ * orchestrator only mutates the small set of fields required by the
+ * §7.0 state machine; production wiring folds the patch via
+ * `OutboxWriter.update` so the validator gate fires.
+ */
+export interface OutboxTransitionPatch {
+  /** Required — the §7.0 destination state. */
+  readonly status: UxfTransferOutboxEntry['status'];
+  /** Optional forensic field — set on `failed-transient` arcs. */
+  readonly error?: string;
+  /** Optional — bumped by the worker on submit retries. */
+  readonly submitRetryCount?: number;
 }
 
 /**
@@ -239,9 +296,10 @@ export interface ConservativeSenderDeps {
   readonly preflightOptions: PreflightOptionsFn;
   /** Submits commitments + awaits proofs for the selected sources. */
   readonly commitSources: CommitSourcesFn;
-  /** Optional outbox writer hooks — defaults to no-op when absent (the
-   *  test path); production wires the real per-entry-key chain. */
-  readonly outbox?: OutboxStubHooks;
+  /** Optional outbox writer hooks — defaults to no-op when absent
+   *  (test convenience). Production wires the real per-entry-key
+   *  {@link OutboxWriter} (T.6.A) through {@link OutboxIntegrationHooks}. */
+  readonly outbox?: OutboxIntegrationHooks;
   /** Optional projection of `Token` → `TokenLike` for the validator. The
    *  default projection inspects `sdkData` opportunistically; tests can
    *  inject a richer projection. */
@@ -331,44 +389,54 @@ function defaultTokenLike(token: Token): TokenLike {
 }
 
 /**
- * Build the synthetic legacy {@link OutboxEntry} for the stub-outbox
- * step (T.2.D.1 acceptance: "Stub outbox writer: synthetic legacy
- * entry created so existing tests pass; T.2.D.2 replaces with real
- * per-entry-key writes").
+ * Build the initial {@link UxfTransferOutboxEntry} payload (T.2.D.2 —
+ * replaces D.1 stub). Status is always `'packaging'` on create per the
+ * §7.0 initial state; the orchestrator transitions through the
+ * lifecycle via {@link OutboxIntegrationHooks.transition}.
  *
- * The entry is intentionally minimal — every field present is
- * unambiguously derivable from the orchestrator's local state. Fields
- * that the legacy outbox shape carries but the UXF pipeline cannot
- * provide (`salt`, `commitmentJson`) are populated with stable
- * placeholders so the consuming `loadOutbox` path doesn't crash.
+ * The `deliveryMethod` reflects how the bundle was actually shipped:
+ *  - `'car-over-nostr'` for inline (`uxf-car`) delivery.
+ *  - `'cid-over-nostr'` for CID-bound (`uxf-cid`) delivery.
+ *  - `'txf-legacy'` is reserved for the §7.2 migration path; the UXF
+ *    sender never emits it.
  *
  * @internal
  */
-function buildSyntheticOutboxEntry(params: {
+function buildOutboxCreateInput(params: {
   readonly transferId: string;
-  readonly results: ReadonlyArray<ConservativeCommitResult>;
-  readonly recipientPubkey: string;
+  readonly bundleCid: string;
+  readonly tokenIds: ReadonlyArray<string>;
+  readonly recipientIdentifier: string;
+  readonly recipientTransportPubkey: string;
   readonly recipientNametag: string | undefined;
-  readonly request: TransferRequest;
+  readonly memo: string | undefined;
+  readonly deliveryMethod: 'car-over-nostr' | 'cid-over-nostr';
   readonly now: number;
-}): OutboxEntry {
-  // STUB: T.2.D.2 replaces this with the per-entry-key
-  // UxfTransferOutboxEntry writer. The shape below mirrors the legacy
-  // OutboxEntry contract just well enough to keep existing
-  // PaymentsModule tests green.
-  const firstResult = params.results[0];
-  return {
+}): OutboxCreateInput {
+  const base: OutboxCreateInput = {
     id: params.transferId,
-    status: 'submitted',
-    sourceTokenId: firstResult?.sourceTokenId ?? '',
-    salt: '',
-    commitmentJson: '',
-    recipientPubkey: params.recipientPubkey,
-    recipientNametag: params.recipientNametag,
-    amount: typeof params.request.amount === 'string' ? params.request.amount : '0',
+    bundleCid: params.bundleCid,
+    tokenIds: params.tokenIds,
+    deliveryMethod: params.deliveryMethod,
+    recipient: params.recipientIdentifier,
+    recipientTransportPubkey: params.recipientTransportPubkey,
+    mode: 'conservative',
+    status: 'packaging',
     createdAt: params.now,
     updatedAt: params.now,
+    submitRetryCount: 0,
+    proofErrorCount: 0,
   };
+  // Splice optional fields only when defined — explicit `undefined`
+  // muddies CRDT diffs and bloats the on-disk encoding.
+  let out: OutboxCreateInput = base;
+  if (params.recipientNametag !== undefined) {
+    out = { ...out, recipientNametag: params.recipientNametag };
+  }
+  if (params.memo !== undefined) {
+    out = { ...out, memo: params.memo };
+  }
+  return out;
 }
 
 // =============================================================================
@@ -518,6 +586,43 @@ export async function sendConservativeUxf(
         'IPFS_PUBLISHER_MISSING',
       );
     }
+    // -----------------------------------------------------------------
+    // Step 10a (T.2.D.2): create UXF outbox entry with
+    // status='packaging' AS SOON AS the bundle CID is known. The entry
+    // identifies the recipient + bundleCid + token list before any
+    // transport / IPFS work so a crash here leaves a forensic record.
+    // -----------------------------------------------------------------
+    const tokenIds = orderedResults.map((r) => r.sourceTokenId);
+
+    // Decide the delivery method up-front using the SAME predicate as
+    // resolveDelivery's CID-branch decision (`wantsCidBranch` above).
+    // The two are byte-equivalent — if `wantsCidBranch === true` the
+    // resolver invokes publishToIpfs and returns a `cid` decision; if
+    // false, the resolver returns `inline`. We can therefore stamp the
+    // outbox `deliveryMethod` BEFORE calling resolveDelivery and trust
+    // that the post-delivery branch matches.
+    const predictedDeliveryMethod: 'car-over-nostr' | 'cid-over-nostr' =
+      wantsCidBranch ? 'cid-over-nostr' : 'car-over-nostr';
+
+    if (deps.outbox !== undefined) {
+      const createInput = buildOutboxCreateInput({
+        transferId,
+        bundleCid,
+        tokenIds,
+        recipientIdentifier: request.recipient,
+        recipientTransportPubkey: recipient.transportPubkey,
+        recipientNametag: recipient.nametag,
+        memo: typeof request.memo === 'string' ? request.memo : undefined,
+        deliveryMethod: predictedDeliveryMethod,
+        now,
+      });
+      await deps.outbox.create(createInput);
+    }
+
+    // -----------------------------------------------------------------
+    // Step 8 (cont.): resolveDelivery — invokes publishToIpfs inside
+    // for any CID-bound branch.
+    // -----------------------------------------------------------------
     const delivery = await resolveDelivery({
       strategy,
       carBytes,
@@ -526,17 +631,18 @@ export async function sendConservativeUxf(
     });
 
     // -----------------------------------------------------------------
-    // Step 9 (no-op here): IPFS pin already happened inside
-    // resolveDelivery for any CID-bound branch. The orchestrator does
-    // NOT re-pin.
+    // Step 10b: per §7.0 transition table, CID-bound delivery flows
+    // packaging → pinned (after IPFS pin acknowledged) → sending.
+    // Inline delivery skips the `pinned` state and goes straight to
+    // packaging → sending.
     // -----------------------------------------------------------------
+    if (delivery.kind === 'cid' && deps.outbox !== undefined) {
+      await deps.outbox.transition(transferId, { status: 'pinned' });
+    }
 
     // -----------------------------------------------------------------
-    // Step 11: build the wire envelope. (Step 10 — outbox stub —
-    // happens just before transport.sendTokenTransfer so a crash
-    // between persist + send leaves a forensic record.)
+    // Step 11: build the wire envelope.
     // -----------------------------------------------------------------
-    const tokenIds = orderedResults.map((r) => r.sourceTokenId);
     const senderTransportPubkey = deps.senderTransportPubkey;
     const senderField =
       senderTransportPubkey !== undefined
@@ -571,24 +677,21 @@ export async function sendConservativeUxf(
           };
 
     // -----------------------------------------------------------------
-    // Step 10: stub outbox writer (synthetic legacy entry). T.2.D.2
-    // replaces this with the per-entry-key UxfTransferOutboxEntry
-    // writer.
+    // Step 10c (PRE-PUBLISH PERSISTENCE ORDERING — §6.3 last paragraph,
+    // T.2.D.2 INVARIANT): the OrbitDB write that sets status='sending'
+    // MUST be committed before the Nostr publish is dispatched. A
+    // crash between OrbitDB commit and Nostr publish leaves the
+    // worker re-publishing on restart (idempotent — same bundleCid →
+    // same content-addressed payload).
     // -----------------------------------------------------------------
-    const outboxEntry = buildSyntheticOutboxEntry({
-      transferId,
-      results: orderedResults,
-      recipientPubkey: recipient.transportPubkey,
-      recipientNametag: recipient.nametag,
-      request,
-      now,
-    });
     if (deps.outbox !== undefined) {
-      await deps.outbox.save(outboxEntry, recipient.transportPubkey);
+      await deps.outbox.transition(transferId, { status: 'sending' });
     }
 
     // -----------------------------------------------------------------
-    // Step 11 (cont.): publish via transport.
+    // Step 11 (cont.): publish via transport. The PRE-PUBLISH ordering
+    // invariant above means this dispatch happens AFTER the
+    // 'sending' commit has hit OrbitDB.
     // -----------------------------------------------------------------
     result.status = 'submitted';
     try {
@@ -601,6 +704,21 @@ export async function sendConservativeUxf(
       );
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
+      // §7.0 arc: sending → failed-transient. Best-effort — if the
+      // outbox transition itself fails we still surface the underlying
+      // transport error to the caller.
+      if (deps.outbox !== undefined) {
+        try {
+          await deps.outbox.transition(transferId, {
+            status: 'failed-transient',
+            error: message,
+          });
+        } catch {
+          // Outbox transition failure is informational at this point;
+          // the caller's transfer:failed event + thrown SphereError
+          // remain the primary signals.
+        }
+      }
       throw new SphereError(
         `sendConservativeUxf: transport.sendTokenTransfer failed: ${message}`,
         'TRANSPORT_ERROR',
@@ -608,14 +726,18 @@ export async function sendConservativeUxf(
       );
     }
 
-    // After-publish bookkeeping.
+    // -----------------------------------------------------------------
+    // After-publish bookkeeping: §7.0 arc sending → delivered. The
+    // entry stays in the outbox until the retention window expires
+    // (delivered → expired) — the orchestrator does NOT delete it.
+    // -----------------------------------------------------------------
     if (deps.outbox !== undefined) {
       try {
-        await deps.outbox.remove(transferId);
+        await deps.outbox.transition(transferId, { status: 'delivered' });
       } catch {
-        // The wire publish succeeded; outbox cleanup is best-effort.
-        // T.2.D.2 hardens this with a CRDT-safe writer that survives
-        // partial failures.
+        // The wire publish succeeded; outbox post-write is best-effort.
+        // The merger / retention path repairs lingering 'sending'
+        // entries on next read.
       }
     }
 

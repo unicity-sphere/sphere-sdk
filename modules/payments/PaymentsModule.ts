@@ -5828,21 +5828,32 @@ export class PaymentsModule {
         return out;
       },
       outbox: {
-        save: async (entry, recipientPubkeyParam) => {
-          // Adapt the synthetic legacy OutboxEntry into the existing
-          // outbox chain by wrapping it in the shape `saveToOutbox`
-          // already accepts (TransferResult). The orchestrator's stub
-          // entry only carries the minimum fields the loader requires.
+        // T.2.D.2 — orchestrator drives §7.0 via create/transition.
+        // Until the per-entry-key OutboxWriter (T.6.A) is fully wired
+        // to a ProfileDatabase in PaymentsModule (T.6.D, follow-up),
+        // this adapter folds the new hooks onto the legacy
+        // saveToOutbox / removeFromOutbox chain so existing tests keep
+        // their invariants:
+        //   - create (status=packaging): persist legacy synthetic entry.
+        //   - transition (status=delivered): drop legacy entry.
+        //   - transition (other states): no-op (legacy outbox is
+        //     bundle-grained-on-create, terminal-on-removal only).
+        create: async (entry) => {
           const synthResult: TransferResult = {
             id: entry.id,
             status: 'submitted',
             tokens: [],
             tokenTransfers: [],
           };
-          await this.saveToOutbox(synthResult, recipientPubkeyParam);
+          await this.saveToOutbox(synthResult, entry.recipientTransportPubkey);
         },
-        remove: async (id) => {
-          await this.removeFromOutbox(id);
+        transition: async (id, patch) => {
+          if (patch.status === 'delivered') {
+            await this.removeFromOutbox(id);
+          }
+          // 'pinned' / 'sending' / 'failed-transient' carry no legacy
+          // state mutation — the new schema's intermediate states are
+          // tracked exclusively by the (forthcoming) OutboxWriter.
         },
       },
     };
