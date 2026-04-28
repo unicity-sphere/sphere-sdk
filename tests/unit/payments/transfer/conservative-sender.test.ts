@@ -574,23 +574,25 @@ describe('sendConservativeUxf — transport rejection propagates as TRANSPORT_ER
 });
 
 // =============================================================================
-// 8. Outbox stub hooks invoked
+// 8. Outbox integration hooks invoked (T.2.D.2 — replaces D.1 stub)
 // =============================================================================
 
-describe('sendConservativeUxf — outbox stub invocation', () => {
-  it('calls outbox.save BEFORE sendTokenTransfer and outbox.remove after', async () => {
+describe('sendConservativeUxf — outbox integration invocation', () => {
+  it('calls outbox.create BEFORE sendTokenTransfer and reaches delivered after', async () => {
     const source = makeToken('tok-1', TOKEN_A);
     const commitResult = makeCommitResult({
       sourceTokenId: 'tok-1',
       fixture: TOKEN_A,
     });
     const order: string[] = [];
-    const save = vi.fn().mockImplementation(async () => {
-      order.push('save');
+    const create = vi.fn().mockImplementation(async () => {
+      order.push('create');
     });
-    const remove = vi.fn().mockImplementation(async () => {
-      order.push('remove');
-    });
+    const transition = vi
+      .fn()
+      .mockImplementation(async (_id: string, patch: { status: string }) => {
+        order.push(`transition:${patch.status}`);
+      });
 
     const transport = makeTransportStub();
     const origSend = transport.sendTokenTransfer;
@@ -606,14 +608,19 @@ describe('sendConservativeUxf — outbox stub invocation', () => {
       availableSources: () => [source],
       selectSources: async () => [source],
       commitSources: async () => [commitResult],
-      outbox: { save, remove },
+      outbox: { create, transition },
     });
 
     await sendConservativeUxf(basicRequest(), makePeerInfo(), deps);
 
-    expect(save).toHaveBeenCalledOnce();
-    expect(remove).toHaveBeenCalledOnce();
-    expect(order).toEqual(['save', 'send', 'remove']);
+    expect(create).toHaveBeenCalledOnce();
+    // packaging → sending (pre-publish) → delivered (post-ack) for inline.
+    expect(order).toEqual([
+      'create',
+      'transition:sending',
+      'send',
+      'transition:delivered',
+    ]);
   });
 });
 
