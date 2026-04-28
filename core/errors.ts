@@ -199,6 +199,28 @@ export type SphereErrorCode =
    *  and UXF-TRANSFER-PROTOCOL §7. */
   | 'OUTBOX_ENTRY_NOT_FOUND'
   /**
+   * UXF Inter-Wallet Transfer T.6.C — outbox state-machine validator hard-fail.
+   *
+   * Thrown by `profile/outbox-state-machine.ts` (and threaded through
+   * `OutboxWriter.update`) when a caller attempts a `status` transition that
+   * is not present in the §7.0 canonical transition table, or that requires
+   * a side-channel condition (`overrideApplied`, `dualWriteEnabled`) that
+   * was not supplied. The validator's transition table is the SINGLE source
+   * of truth — disallowed moves never silently succeed.
+   *
+   * Surfaces in three sub-cases (cause carries `{ from, to, reason }`):
+   *  - `'no-such-arc'`        — `(from, to)` is not in the §7.0 table.
+   *  - `'override-required'`  — `failed-permanent → finalizing` without
+   *                             `overrideApplied: true` (operator escape
+   *                             hatch per §7.0 last paragraph).
+   *  - `'dual-write-disabled'` — schema-mode `legacy ↔ uxf` arc attempted
+   *                              while `dualWriteEnabled !== true` (§7.B /
+   *                              W43 — migration-window only).
+   *
+   * See profile/outbox-state-machine.ts and UXF-TRANSFER-PROTOCOL §7.0.
+   */
+  | 'INVALID_OUTBOX_TRANSITION'
+  /**
    * UXF Inter-Wallet Transfer T.2.A — preflight-finalize hard-failure.
    *
    * Thrown by `modules/payments/transfer/preflight-finalize.ts` when the
