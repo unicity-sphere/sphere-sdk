@@ -293,7 +293,24 @@ export type SphereErrorCode =
    *  the caller did not supply a `publishToIpfs` callback. Surfaced as a
    *  pre-flight reject so the orchestrator does not waste work
    *  building a CAR it cannot ship. See §3.3.1 / §T.2.D.1 acceptance. */
-  | 'IPFS_PUBLISHER_MISSING';
+  | 'IPFS_PUBLISHER_MISSING'
+  /**
+   * UXF Inter-Wallet Transfer T.3.B.1 — per-element verifier surfaced a
+   * SHAPE-LEVEL failure (parser threw, malformed authenticator, missing
+   * required pool reference, inconsistent imprint). The verifiers in
+   * `modules/payments/transfer/{predicate-evaluator,authenticator-verifier,
+   * proof-verifier}.ts` raise this code when the SDK call they wrap
+   * unexpectedly throws.
+   *
+   * Distinct from `BUNDLE_REJECTED_VERIFY_FAILED` (bundle-level §5.2 #1)
+   * because the per-element verifiers operate after structural verify
+   * already passed — a throw here means a defect inside an element that
+   * the bundle-level pkg.verify() did not catch (e.g., ECDSA primitive
+   * raised on malformed signature bytes the structural type-check waved
+   * through). The decision-matrix walker in T.3.B.2 maps a STRUCTURAL_INVALID
+   * to `DispositionReason: 'structural'` per §5.3 [A].
+   */
+  | 'STRUCTURAL_INVALID';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
