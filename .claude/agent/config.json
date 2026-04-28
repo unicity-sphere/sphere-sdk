@@ -1,0 +1,19 @@
+{
+  "agent_nametag": "claude-sphere-sdk",
+  "owner_npub": "",
+  "owner_nametag": "",
+  "notification_url": "",
+  "group": {
+    "name": "UNICITY_DEV_AGENTS",
+    "id": "unicity-dev-agents-testnet",
+    "relays": [
+      "wss://nostr-relay.testnet.unicity.network"
+    ]
+  },
+  "dep_tracking": {
+    "enabled": true,
+    "selected_deps": [
+      "state-transition-sdk"
+    ]
+  }
+}

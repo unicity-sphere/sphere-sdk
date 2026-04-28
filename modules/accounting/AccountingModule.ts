@@ -4250,11 +4250,23 @@ export class AccountingModule {
           } else if (entryKey.startsWith('synthetic:')) {
             // synthetic:<tokenId>::<coinId> — extract tokenId between the
             // 'synthetic:' prefix and the next ':'.
+            //
+            // Round-5 migration guard: round-4 BUGGY builds wrote keys
+            // `synthetic:${transferId}::${coinId}` where transferId is a
+            // Nostr event id (also 64-hex). Those entries also have
+            // `ref.transferId === parsed_tokenId`. Round-5+ builds use
+            // the distinct `synthetic-tx:` prefix for the transferId
+            // fallback, so legitimate `synthetic:` entries always have
+            // `ref.transferId !== parsed_tokenId` (the ref carries the
+            // raw transport id, not a tokenId-shaped value). Skip
+            // entries that match the bug fingerprint to avoid polluting
+            // tokenInvoiceMap with Nostr event ids on first reload after
+            // upgrade.
             const afterPrefix = entryKey.slice('synthetic:'.length);
             const tokenIdEnd = afterPrefix.indexOf(':');
             if (tokenIdEnd > 0) {
               const tokenId = afterPrefix.slice(0, tokenIdEnd);
-              if (HEX_64.test(tokenId)) {
+              if (HEX_64.test(tokenId) && ref.transferId !== tokenId) {
                 this._addToTokenInvoiceMap(tokenId, invoiceId);
               }
             }
@@ -4853,6 +4865,12 @@ export class AccountingModule {
       const capFull = this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS;
       const sweepDue = nowMs >= this.unknownLedgerNextSweepMs;
       if (this.unknownLedgerFirstSeen.size > 0 && (capFull || sweepDue)) {
+        // Round-5 audit fix (TTL busy-loop): always advance the next-sweep
+        // window AND specifically when capFull found nothing evictable —
+        // without this, capFull forces O(N) scan on every transfer
+        // forever. The sweep cadence + cap-full is bounded by O(500)
+        // per call (small constant), but advancing the next-sweep
+        // window keeps it amortized.
         this.unknownLedgerNextSweepMs = nowMs + UNKNOWN_LEDGER_SWEEP_INTERVAL_MS;
         const expiredIds: string[] = [];
         for (const [unkId, firstSeen] of this.unknownLedgerFirstSeen) {
