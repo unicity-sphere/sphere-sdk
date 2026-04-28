@@ -337,7 +337,7 @@ if (result.error) {
 | `recipient` | Yes | `@nametag`, `DIRECT://...`, chain pubkey, or `alpha1...` address |
 | `amount` | Yes | Primary asset amount, in smallest unit (string) |
 | `coinId` | Yes | Primary asset coin ID (e.g., `'UCT'`) |
-| `additionalAssets` | No | Multi-coin extension. Array of `{coinId, amount}` for additional assets to deliver in the same transfer. Each entry's `coinId` must be distinct from `coinId` (the primary) and from other entries. See multi-coin example below. |
+| `additionalAssets` | No | Multi-asset extension. Array of additional assets — each entry is either a fungible coin (`{kind:'coin', coinId, amount}`) or a whole-token / NFT reference (`{kind:'nft', tokenId}`). All `coinId`s (including the primary) must be distinct; all `tokenId`s in NFT entries must be distinct. See examples below. |
 | `memo` | No | Optional message to recipient |
 | `transferMode` | No | `'instant'` (default) or `'conservative'` — see Transfer Modes section |
 | `allowPendingTokens` | No | Default `false`. When `true`, the source-token selector may pick `pending` tokens after exhausting `valid` ones (chain mode) |
@@ -350,10 +350,10 @@ const result = await sphere.payments.send({
   // Primary asset (legacy single-coin fields remain required):
   coinId: 'UCT',
   amount: '1000000',
-  // Additional assets — multi-coin extension:
+  // Additional assets — multi-coin via discriminated union:
   additionalAssets: [
-    { coinId: 'USDU', amount: '500000' },
-    { coinId: 'ALPHA', amount: '250000' },
+    { kind: 'coin', coinId: 'USDU', amount: '500000' },
+    { kind: 'coin', coinId: 'ALPHA', amount: '250000' },
   ],
   memo: 'Multi-asset payment',
 });
@@ -361,6 +361,41 @@ const result = await sphere.payments.send({
 // recipient receives one or more child tokens carrying exactly
 // (UCT,1000000), (USDU,500000), (ALPHA,250000). All other coin balances
 // in the sender's source tokens stay with the sender as change.
+```
+
+**Mixed coin + NFT transfer example** (deliver UCT + a specific NFT):
+
+```typescript
+const result = await sphere.payments.send({
+  recipient: '@bob',
+  // Primary asset is always a coin (backward-compat slot):
+  coinId: 'UCT',
+  amount: '1000000',
+  // Additional assets can mix coins and NFTs:
+  additionalAssets: [
+    { kind: 'nft', tokenId: '0xabc123...the-nft-token-id...' },
+  ],
+  memo: 'Coin + NFT bundle',
+});
+// The recipient receives:
+//   - One or more child tokens carrying (UCT, 1000000) (split from sender's
+//     coin tokens as usual);
+//   - The NFT token transferred whole — its tokenId stays the same; only its
+//     current state's predicate changes to bind to @bob.
+```
+
+**NFT-only transfer** (no coin component): the legacy `coinId`/`amount` fields are still required for backward compatibility, but if the caller has no fungible component to ship, they pass a placeholder of `coinId: ''` (empty string) and `amount: '0'`; the SDK treats this as "no primary fungible target" and only ships the NFT(s) in `additionalAssets`. Validation: if `coinId === ''` AND `additionalAssets` is empty or absent, the call is rejected with `EMPTY_TRANSFER`.
+
+```typescript
+// Send a single NFT only:
+await sphere.payments.send({
+  recipient: '@bob',
+  coinId: '',                     // placeholder — no primary coin
+  amount: '0',                    // placeholder
+  additionalAssets: [
+    { kind: 'nft', tokenId: '0xabc123...' },
+  ],
+});
 ```
 
 Single-coin callers omitting `additionalAssets` behave identically to prior versions of the SDK — the field is purely additive.

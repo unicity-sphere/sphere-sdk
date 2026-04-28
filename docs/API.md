@@ -381,36 +381,50 @@ Used by the `tokens-import` CLI command and by any consumer implementing offline
 
 #### `send(request: TransferRequest): Promise<TransferResult>`
 
-Send tokens to a recipient. Automatically splits tokens when the exact amount is not available as a single token. Supports both single-coin transfers (legacy API, unchanged) and multi-coin transfers (via `additionalAssets`).
+Send assets to a recipient. Automatically splits source tokens when the exact amount is not available as a single token. Supports single-coin (legacy API, unchanged), multi-coin, and mixed coin+NFT transfers via the `additionalAssets` extension.
 
 ```typescript
 interface TransferRequest {
   readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
-  // --- Primary asset (always required) ---
+  // --- Primary asset (always a coin; required for backward compatibility) ---
   readonly coinId: string;       // Coin type (hex string)
   readonly amount: string;       // Amount in smallest units
-  // --- Multi-coin extension (optional, backward-compatible) ---
+  // --- Multi-asset extension (optional, additive) ---
   /**
-   * Additional assets to deliver in the same transfer. Each entry MUST have
-   * a coinId distinct from `coinId` (above) and from every other entry — no
-   * duplicate coin IDs within one transfer. Each amount MUST be > 0.
+   * Additional assets to deliver in the same transfer. Each entry is either
+   * a fungible coin or a whole-token (NFT) reference. The full target list
+   * the SDK will deliver is:
+   *   [{ kind: 'coin', coinId, amount }, ...additionalAssets]
+   * (the primary coinId/amount above is implicitly the first 'coin' entry.)
    *
-   * The full target list the SDK will deliver is:
-   *   [{ coinId, amount }, ...additionalAssets]
-   *
-   * Single-coin callers omit this field; behavior is unchanged. Multi-coin
-   * callers include it; the SDK splits source tokens such that the recipient
-   * receives EXACTLY each requested (coinId, amount), with all other coin
-   * balances kept by the sender as a change token (per UXF-TRANSFER-PROTOCOL
-   * §4.1 step 2).
+   * Validation:
+   *   - All 'coin' entries (including the primary) MUST have distinct coinId
+   *     values. Duplicates are rejected with INVALID_REQUEST.
+   *   - All 'nft' entries MUST have distinct tokenId values. Duplicates are
+   *     rejected with INVALID_REQUEST.
+   *   - Each 'coin' entry's amount MUST be > 0.
+   *   - The sender's pool MUST have sufficient coverage for every entry
+   *     (sufficient coin balance for 'coin' entries; the specific tokenId
+   *     present and owned for 'nft' entries). Insufficient coverage on any
+   *     entry rejects the WHOLE call with INSUFFICIENT_BALANCE — partial
+   *     shipment is never attempted.
    */
-  readonly additionalAssets?: ReadonlyArray<{ readonly coinId: string; readonly amount: string }>;
+  readonly additionalAssets?: ReadonlyArray<AdditionalAsset>;
   // --- Other fields (unchanged) ---
   readonly memo?: string;        // Optional message
   readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
   readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
   readonly allowPendingTokens?: boolean;  // Default false — allow chain-mode source selection
 }
+
+/**
+ * Discriminated union — an additional asset is either a fungible coin or a
+ * whole-token (NFT) reference. The protocol is asset-kind agnostic; future
+ * asset kinds can be added here.
+ */
+type AdditionalAsset =
+  | { readonly kind: 'coin'; readonly coinId: string; readonly amount: string }
+  | { readonly kind: 'nft'; readonly tokenId: string };
 
 type AddressMode = 'auto' | 'direct' | 'proxy';
 type TransferMode = 'instant' | 'conservative';
