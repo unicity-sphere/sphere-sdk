@@ -106,7 +106,26 @@ export type SphereErrorCode =
   | 'SWAP_LIMIT_EXCEEDED'
   | 'SWAP_ALREADY_INITIALIZED'
   | 'SWAP_MODULE_DESTROYED'
-  | 'SWAP_NOT_INITIALIZED';
+  | 'SWAP_NOT_INITIALIZED'
+  // UXF transfer protocol error codes (T.1.D — bundle envelope decode failures).
+  // The protocol surfaces three structurally-distinct failure modes that callers
+  // and the receive worker must distinguish:
+  //   - `BUNDLE_REJECTED_MALFORMED_ENVELOPE` — the outer Nostr-content JSON
+  //     could not be parsed, was not a plain object, lacked required fields,
+  //     carried a wrong version literal, or otherwise failed structural
+  //     validation against `isUxfTransferPayload` (§3.1, §5.0).
+  //   - `BUNDLE_REJECTED_MULTI_ROOT` — `extractCarRootCid` saw a CAR with more
+  //     than one root, which the verifier rejects per Wave G.5 / §5.2 #1.
+  //   - `BUNDLE_REJECTED_INVALID_CAR` — `extractCarRootCid` failed to parse the
+  //     CAR bytes (truncated, corrupt header, unknown framing). Distinct from
+  //     `MULTI_ROOT` because the latter is a parseable-but-policy-rejected CAR.
+  //
+  // Cryptographic verification (signatures, proofs, root-CID-vs-bundleCid match)
+  // is delegated to `pkg.verify()` (T.3.A) and surfaces other codes; T.1.D's
+  // helpers are envelope-level only.
+  | 'BUNDLE_REJECTED_MALFORMED_ENVELOPE'
+  | 'BUNDLE_REJECTED_MULTI_ROOT'
+  | 'BUNDLE_REJECTED_INVALID_CAR';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
