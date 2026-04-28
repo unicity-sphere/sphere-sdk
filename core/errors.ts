@@ -339,7 +339,38 @@ export type SphereErrorCode =
   //     forensic detail.
   | 'FETCHED_CAR_TOO_LARGE'
   | 'BUNDLE_REJECTED_GATEWAY_CID_MISMATCH'
-  | 'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT';
+  | 'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT'
+  /**
+   * UXF Inter-Wallet Transfer T.3.B.2 — instant-mode soft-rejection.
+   *
+   * The §5.3 disposition engine refuses to walk a bundle whose advertised
+   * `mode` is `'instant'` AND whose pool contains at least one transaction
+   * lacking an inclusion proof. Per the T.3 deferred-handling note in
+   * `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` §13 / §T.5 wave plan, instant-mode
+   * receive (with the recipient-side finalization queue) does not land
+   * until the T.5.C finalization worker is wired. Until then, the engine
+   * surfaces this typed soft-error so the worker pool (T.3.E) can drop
+   * the bundle with a clean rejection path — no disposition record is
+   * written, the sender's outbox times out, and re-delivery as a
+   * conservative-mode bundle remains possible.
+   *
+   * **Why a SOFT error, not a per-token disposition**: a bundle whose
+   * `mode` field claims `'instant'` is structurally well-formed; the
+   * decision to defer is a CAPABILITY GATE on the recipient side, not a
+   * structural / cryptographic failure of the bundle's contents. Routing
+   * this through the disposition matrix (e.g. as STRUCTURAL_INVALID)
+   * would produce false-positive `_invalid` records the operator would
+   * then have to clear by hand once T.5.C lands.
+   *
+   * **Detection**: the engine inspects the supplied `mode` field AND
+   * walks the token's transaction chain. If `mode === 'instant'` AND any
+   * tx has `inclusionProof === null`, it throws this error. Conservative
+   * mode bundles with all-finalized chains follow the regular [A]-[F]
+   * matrix; instant-mode bundles whose chains are coincidentally fully
+   * finalized are processed normally (the deferred behavior is gated by
+   * unfinalized-tx presence, not by the `mode` field alone).
+   */
+  | 'BUNDLE_REJECTED_INSTANT_MODE_NOT_YET_SUPPORTED';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
