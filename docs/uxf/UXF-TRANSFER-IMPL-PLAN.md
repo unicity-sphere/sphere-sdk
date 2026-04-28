@@ -59,7 +59,7 @@ T.2 (sender              T.3 (recipient ingest  T.6 (outbox refactor  T.8.tests-
 
 ### Critical path (longest serial chain) — VERIFIED
 
-The architect computed the real longest serial chain (13 PRs):
+The architect computed the real longest serial chain (15 PRs):
 
 ```
 T.1.A  (UxfTransferPayload + DeliveryStrategy)
@@ -93,9 +93,9 @@ T.7.E  (default-mode flip)
 T.8.D  (production cutover)
 ```
 
-That's **13 PRs** wall-clock. With 4 senior agents working in parallel on independent lanes, total is **~16–18 days**. With 2 agents, **~5–6 weeks**.
+That's **15 PRs** wall-clock (counted: T.1.A, T.1.B, T.1.E, T.1.F, T.6.A, T.6.B, T.5.A, T.5.B, T.5.B.5, T.5.C, T.5.D, T.7.A, T.7.B, T.7.E, T.8.D). With 4 senior agents working in parallel on independent lanes, total is **~18–22 days**. With 2 agents, **~6–7 weeks**.
 
-> Note: prior plan cited a 10-PR critical path which omitted T.1.E, T.1.F, T.5.B.5, and T.7.B. The 13-PR chain is the correct figure; §3 parallelization map and the appendix are aligned to it.
+> Note: prior plan cited a 10-PR critical path which omitted T.1.E, T.1.F, T.5.B.5, and T.7.B. The 15-PR chain is the correct figure; §3 parallelization map and the appendix are aligned to it.
 
 ### Feature flag config (replaces single boolean)
 
@@ -129,6 +129,29 @@ Per-feature flags allow staged enablement and surgical rollback (revert one flag
 ## §2 Wave breakdown (T.1 through T.8)
 
 Each task lists `id, title, wave, files_touched, depends_on, parallel_with, skill_tag, acceptance, est_loc, risks, spec_refs`. `est_loc` is a senior-eng estimate including tests.
+
+### T.0 — Pre-T.1 prerequisites
+
+#### T.0.G7-prereq — Wave G.7 per-entry-key layout verified on `main`
+
+- **wave**: T.0 (prerequisite, lands BEFORE T.1)
+- **files_touched**:
+  - `tests/unit/profile/wave-g7-prereq.test.ts` (NEW, ~80 LOC) — assertions that:
+    - `profile/profile-token-storage-provider.ts` exposes the per-entry-key writer used at runtime to expand `{addr}.outbox` → `${addr}.outbox.${id}` (and similarly for `audit`, `invalid`, `finalizationQueue`).
+    - `profile/profile-storage-provider.ts`'s dynamic-key matcher recognizes prefix-scan queries `${addr}.outbox.*`.
+    - Round-trip a synthetic per-entry-key record and prove it survives the OrbitDB → KV translation.
+  - If any assertion fails, the test exposes the gap; T.1.E cannot merge until they pass on `main`.
+- **depends_on**: (none — this is the entry point)
+- **parallel_with**: (lands first; serialized)
+- **skill_tag**: `storage`
+- **acceptance**:
+  - All 4 prefix-scan key shapes (`{addr}.outbox.*`, `{addr}.audit.*`, `{addr}.invalid.*`, `{addr}.finalizationQueue.*`) pass round-trip via the existing Wave G.7 layout, OR a stub PR documents the missing pieces and lands them inside this task.
+  - The test file documents the canonical per-entry-key contract for downstream tasks (T.1.E references this contract by file path).
+- **est_loc**: 80
+- **risks**: if Wave G.7 is INCOMPLETE on `main` (per-entry-key writer exists for outbox but not for the new collections), this task expands to add the missing writers — could blow out from 80 LOC to ~400 LOC.
+- **spec_refs**: §7 (outbox key shape); PROFILE-ARCHITECTURE.md §10.12.
+
+---
 
 ### T.1 — Wire-format types (foundation)
 
@@ -259,7 +282,7 @@ T.1 lands the types, enums, key-mapping rows, and constants module. Nothing in T
   - MODIFIED: `tests/unit/profile/profile-storage-provider.test.ts` — extend the per-address scoping cases to cover `audit` and `finalization_queue`.
   - NEW: `tests/unit/core/Sphere.clear.test.ts` (extension) — assert the new key-prefixes are cleared on `Sphere.clear()`.
   - NEW: `profile/types.ts` doc comment block — explicit note that `Sphere.clear()` reaches these via parent storage clear, not via the mapping table (W46, prevents future "mapping is incomplete" confusion).
-- **depends_on**: T.1.A, T.1.C.
+- **depends_on**: T.1.A, T.1.C, **T.0.G7-prereq** (Wave G.7 per-entry-key layout — hard dep, not a soft pre-task check; see W8/round-1-#9).
 - **parallel_with**: T.1.B.1, T.1.D.
 - **skill_tag**: `storage`
 - **acceptance**:
@@ -707,7 +730,8 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/§5.5-pollingDeadline-propagation.test.ts` — **W17**: pollingDeadline propagation to T.5.B's polling loop in outbox path.
   - NEW: `tests/unit/payments/transfer/§5.5-2x-window-safety-net.test.ts` — **W26**: 2× POLLING_WINDOW safety net via deterministic clock.
 - **depends_on**: T.1.A, T.1.C, T.1.F, T.5.A, T.5.B.0, T.6.A.
-- **parallel_with**: T.5.C, T.5.B.5 (after this lands), T.5.F.
+- **parallel_with**: T.5.C (peers — both consume T.5.B.0 + T.5.B.5), T.5.F.
+  - **Note**: T.5.B.5 is NOT a peer of T.5.B; T.5.B.5 depends on T.5.B (cascade walker is a downstream concern of the sender worker that needs cascade hooks integrated).
 - **skill_tag**: `worker`
 - **acceptance**:
   - Configuration validity rule (§5.5 step 6 paragraph "Configuration validity rule (normative)") validated at startup; cumulative backoff for the first MIN_POLL_ATTEMPTS polls ≤ POLLING_WINDOW.
@@ -770,8 +794,12 @@ T.5 is the largest wave. It implements §2.1 instant-mode bundle construction, �
   - NEW: `tests/unit/payments/transfer/finalization-queue.test.ts`, `finalization-worker-recipient.test.ts` — single-tx PENDING; chain-mode K=3; queue-drain re-runs [B]/[D]/[E]; concurrent ingest while queue is draining; merge-path (§5.5 last paragraph) with grafted proofs.
   - NEW: `tests/unit/payments/transfer/§5.6-idempotency-invariant.test.ts` — **W15 adversarial: replay with different proof, same transactionHash, must converge**.
   - NEW: `tests/unit/payments/transfer/disposition-engine-revaluate.test.ts` — **W5: step-9 re-evaluator entry-point**.
-- **depends_on**: T.1.A, T.1.C, T.1.E (`finalization_queue` key), T.1.F, T.3.B.1, T.3.B.2, T.3.C, T.3.D, T.5.B (polling-policy + manifest-cid-rewrite from T.5.B.0).
-- **parallel_with**: T.5.B.5, T.5.D.
+- **depends_on**: T.1.A, T.1.C, T.1.E (`finalization_queue` key), T.1.F, T.3.B.1, T.3.B.2, T.3.C, T.3.D, T.5.B.0 (polling-policy + manifest-cid-rewrite — peer dep, NOT through T.5.B), T.5.B.5 (cascade walker — recipient worker invokes cascade on hard-fail, must depend on the walker).
+- **parallel_with**: T.5.B (both consume T.5.B.0 directly), T.5.D.
+
+  **Acceptance addendum (C3 fix)**: on hard-fail of any queue entry for a `tokenId`, the recipient worker MUST invoke T.5.B.5 cascade-walker (per-class: coin → splitParent walk; NFT → outbox-driven `transfer:cascade-failed` event for downstream recipients of the same `tokenId`). Tests:
+   - `recipient-cascade-on-hard-fail.test.ts` — hard-fail fires cascade walker.
+   - `recipient-cascade-coin-vs-nft.test.ts` — class-disjoint cascade paths exercised.
 - **skill_tag**: `worker`
 - **acceptance**:
   - K queue entries per K-deep chain-mode token; transition `pending → valid` only after all K resolve successfully.
@@ -1115,6 +1143,14 @@ T.7 implements `transferMode: 'txf'` (both `txfFinalization` variants), the rece
 - **est_loc**: 220.
 - **risks**: external-repo breakage — proactively notify agentsphere + sphere app maintainers; release-note entry.
 - **spec_refs**: §10.1, docs/CONNECT.md.
+
+> **⚠️ T.7.C.5 is a documentation + schema-version task, NOT an end-to-end implementation task** (round-1 steelman finding #10). The **actual external-repo migration** (agentsphere, sphere app, openclaw-unicity, third-party dApps) is unsolved by this task — only documented. Concrete tracking item for T.8.D blocker:
+>
+> - **agentsphere**: PR landing the widened `onIntent` callback shape — required before T.8.D.
+> - **sphere app**: PR landing the widened `onIntent` callback shape — required before T.8.D.
+> - **openclaw-unicity**: ditto (if used).
+>
+> Without external acks, T.8.D removes legacy code while external integrators still rely on the old `onIntent` shape. Add to T.8.D depends_on a non-code "external-acks-received" gating note: "T.8.D MUST NOT merge until at least the agentsphere + sphere app maintainers have ack'd the widened type shape." Until then, T.8.D is BLOCKED on coordination, not on plan implementation.
 
 ---
 
@@ -1547,6 +1583,33 @@ interface UxfTransferFeatures {
 
 Per-feature flags allow staged enablement and surgical rollback (revert one flag, not all). See W42.
 
+#### Valid feature-flag combinations (round-1 steelman finding #5)
+
+The 8 booleans + tri-state outbox naively allow 768 combinations. Most are nonsensical (e.g., `senderUxf: true` with `outbox: 'legacy'` would write UXF bundles but persist outbox entries that can't represent them). `Sphere.init()` MUST validate the combination and throw `INVALID_FEATURE_COMBINATION` for any invalid setting at startup. The **valid configurations** are:
+
+| # | Name | Settings | Use |
+|---|---|---|---|
+| V0 | Pre-T.1 (legacy)         | all false | Pre-feature-branch baseline |
+| V1 | Types-widened, runtime legacy | `typesWidening: true`; rest false | Post-T.1 default; safe for production |
+| V2 | Sender opt-in (testnet)  | V1 + `senderUxf: true`, `outbox: 'dual-write'` | Sender writes UXF; outbox dual-writes |
+| V3 | Sender + recipient opt-in | V2 + `recipientUxf: true` | Both ends UXF; outbox dual-writes |
+| V4 | + CID delivery            | V3 + `cidDelivery: true` | Adds large-bundle CID path |
+| V5 | + Instant mode            | V4 + `instantMode: true` | Adds async finalization workers |
+| V6 | + TXF opt-in              | V5 + `txfOptIn: true` | Allows `transferMode: 'txf'` |
+| V7 | Cutover                  | V6 + `defaultModeIsUxf: true`, `outbox: 'uxf'` | Default = UXF; legacy outbox cleared |
+
+**Invalid combinations** that `Sphere.init()` MUST reject:
+- `senderUxf: true` AND `outbox: 'legacy'` — sender writes can't be represented in legacy outbox.
+- `recipientUxf: true` AND `outbox: 'legacy'` — recipient writes can't be represented.
+- `instantMode: true` AND `senderUxf: false` — instant mode requires UXF sender.
+- `instantMode: true` AND `recipientUxf: false` — instant mode requires UXF recipient (chain-mode finalization).
+- `cidDelivery: true` AND `senderUxf: false` — CID delivery requires UXF sender.
+- `defaultModeIsUxf: true` AND ANY of (senderUxf, recipientUxf, instantMode) is false — cutover requires full UXF on both sides.
+- `txfOptIn: true` AND `typesWidening: false` — TXF mode is part of the widened TransferMode enum.
+- `outbox: 'uxf'` AND `senderUxf: false` — UXF-only outbox requires UXF sender.
+
+T.1.B.1 implements `validateFeatures(features): void` (throws on invalid combo) and the unit test `tests/unit/core/feature-validation.test.ts` enumerates ALL 7 valid configurations + every blacklisted invalid combination.
+
 ### §7.B Dual-write mode (formalized in §7.0 outbox state machine — W43)
 
 During the T.6.D migration window (post-T.6.A, pre-T.8.D), the outbox can be operated in **dual-write mode** with formalized state-machine arcs (T.6.C):
@@ -1607,7 +1670,15 @@ These do not block T.1–T.8 but should be resolved before merge of the correspo
 7. **[RESOLVED]** ~~T.8.E — CI runtime budget~~ — split via W10 into T.8.E.1/2/3; adversarial suite runs nightly + on PRs touching `modules/payments/transfer/`.
 8. **[NEW]** T.5.B.5 — cascade walker visited-set sharing across worker threads — **W32** clarified per-call-stack scope, but for a single Sphere instance with multiple workers, two cascades from different parents may visit a shared child. Confirm: per-call-stack visited-set + per-tokenId mutex (T.1.F) prevents double-cascade; document the proof in T.5.B.5 inline.
 9. **[NEW]** T.5.F — trustBase refresh storm — debounce + cool-down for refresh; confirm rate limit on aggregator side; coordinate with aggregator team.
-10. **[NEW]** T.7.C.5 — external-repo coordination — proactive notification to agentsphere + sphere app maintainers about the `schemaVersion` field. Track ack from each downstream maintainer before T.8.D.
+10. **[NEW]** T.7.C.5 — external-repo coordination — proactive notification to agentsphere + sphere app maintainers about the `schemaVersion` field. Track ack from each downstream maintainer before T.8.D. **Steelman round 1 #10**: T.7.C.5 itself is documentation + a schemaVersion field; the actual external migration is unsolved and must NOT block T.8.D's coordination gate.
+11. **[NEW]** T.5.B / T.5.C test-LoC ratios are below 1:1.5 baseline for crypto / CRDT code (round-1 #6). Either bump test budgets (T.5.B: +400 LOC for race-lost / conflicting-proofs / retry / trustbase explicit deterministic-clock tests; T.5.C: +500 LOC for queue-drain / re-evaluator / cascade-on-hard-fail / step-9 atomic update) or split test files into separate sub-tasks. Implementers MUST keep impl:test ratio ≥ 1:1.2 on critical-path tasks; revisit at code-review time.
+12. **[NEW]** Cross-tokenId disk-I/O contention not modeled (round-1 #8). Add `MAX_CONCURRENT_ORBITDB_WRITES` global cap to `limits.ts` + a fairness queue, OR document that OrbitDB is internally serialized (cite source). Implementer must verify under load test in T.8.E.1.
+13. **[NEW]** Per-feature flag invalid-combination matrix is now enumerated in §7.A (round-1 #5 / #7); `validateFeatures(features)` is a T.1.B.1 deliverable. Steelman should verify each combo's effect on a stale wallet (e.g., V3 → V2 rollback during dual-write).
+14. **[NEW]** T.6.D.2 byte-identity definition (round-1 #13): "byte-identical" excludes `lamport`, `observedAt` timestamps, `_schemaVersion`, sentinel keys. Implementers test against the explicit field-list, not raw byte equality.
+15. **[NEW]** Spec-citation prefix on test filenames (round-1 #12): mandatory for spec-defined behavior tests (cite the §section), optional for adversarial-only tests where no normative requirement applies. Implementers follow the convention; reviewers enforce it on PRs that introduce tests.
+16. **[NEW]** `MAX_LOCK_HOLD_MS` placement (round-1 #14): lives in `profile/per-token-mutex.ts` as a co-located constant (per-strategy concern, not a global limit). The constants module `modules/payments/transfer/limits.ts` cross-references it as the per-token-mutex source-of-truth.
+17. **[NEW]** `MAX_PROOF_ERROR_RETRIES`, `MAX_SUBMIT_RETRIES`, `POLLING_WINDOW`, `MIN_POLL_ATTEMPTS` placement (round-1 #14): in `modules/payments/transfer/polling-policy.ts` (T.5.B.0). The constants module `limits.ts` re-exports them so external readers have a single source of truth for ALL transfer-related defaults.
+18. **[NEW]** T.0.G7-prereq stub task (round-1 #9): NEW PR added before T.1.E. Verifies Wave G.7 per-entry-key layout has shipped on `main`. If not, the prereq PR adds the missing scaffolding. Hard-gates T.1.E.
 
 Periodic rescans (§12.3) are explicitly **deferred** per the user-supplied constraint and §13 closing paragraph; no T.1–T.8 task includes them. A future plan T.9+ will add the rescan loops on top of the storage and event plumbing landed in this plan.
 
