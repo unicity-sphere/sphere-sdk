@@ -779,10 +779,11 @@ type DispositionReason =
   | 'proof-invalid'        // [C](3) inclusionProof verify failed (PATH_INVALID, NOT_AUTHENTICATED, or PATH_NOT_INCLUDED at receive)
   | 'proof-throw'          // [C](3) proof verify threw / orphan dep
   // Aggregator-driven failures (→ _invalid)
-  | 'oracle-rejected'      // §6.1 REQUEST_ID_MISMATCH at submit OR sustained PATH_NOT_INCLUDED past polling window
+  | 'oracle-rejected'      // §6.1 sustained PATH_NOT_INCLUDED past polling window (commitment never anchored)
   | 'belief-divergence'    // §6.1 AUTHENTICATOR_VERIFICATION_FAILED at submit (local crypto passed, aggregator's didn't)
-  | 'parent-rejected'      // §6.1.1 cascade — parent token was hard-failed
-  | 'race-lost'            // §7.1 two-replica race lost; OUTBOX_RACE_LOST at submit
+  | 'client-error'         // §6.1 REQUEST_ID_MISMATCH at submit (client computed requestId incorrectly)
+  | 'parent-rejected'      // §6.1.1 cascade — parent split-token was hard-failed (coin splits only; NFTs don't have splitParent)
+  | 'race-lost'            // §6.1 / §7.1 race-loser detected via REQUEST_ID_EXISTS on submit + transactionHash mismatch on poll
   // Audit-only (→ _audit, not invalid)
   | 'not-our-state'        // [B] / [B'] current-state predicate doesn't bind to us
   | 'off-record-spend'     // [E] oracle.isSpent=true on finalized chain
@@ -791,7 +792,7 @@ type DispositionReason =
 ```
 
 **Reason → storage location mapping**:
-- `structural | predicate-eval | auth-invalid | continuity-broken | proof-invalid | proof-throw | oracle-rejected | belief-divergence | parent-rejected | race-lost` → `_invalid`
+- `structural | predicate-eval | auth-invalid | continuity-broken | proof-invalid | proof-throw | oracle-rejected | belief-divergence | client-error | parent-rejected | race-lost` → `_invalid`
 - `not-our-state | off-record-spend` → `_audit`
 - `gateway-fetch-failed` → no storage (transient; retried by gateway-walking logic)
 
@@ -874,12 +875,14 @@ The finalization worker (see §6) processes each entry. For each pending tx:
 2. Compute `commitmentRequestId` locally from `(signedTx, sourceState)`. This MUST match the queue entry's stored value (defensive consistency check).
 3. **Submit the commitment** to the aggregator (if not previously submitted by this worker). The submit endpoint returns one of (per `SubmitCommitmentResponse.js`):
    - `SUCCESS` — commitment accepted; will be anchored in a forthcoming SMT snapshot. Proceed to step 4.
-   - `REQUEST_ID_EXISTS` — this exact commitment was already submitted (idempotent; we previously asked, the aggregator already has it). Proceed to step 4.
-   - `REQUEST_ID_MISMATCH` — the requestId is registered, but bound to a **different** transactionHash. This is the canonical **double-spend signal**: the source state already has a different transition committed. NOT a transient error. Mark the queue entry hard-failed (reason='oracle-rejected') and proceed to step 6.
+   - `REQUEST_ID_EXISTS` — a commitment for this `requestId` already exists at the aggregator. Note that `requestId = SHA-256(publicKey ‖ stateHash.imprint)` per `RequestId.js` — it does NOT include `transactionHash`, so two different transitions over the same source state share the same `requestId`. `REQUEST_ID_EXISTS` therefore could mean EITHER (a) our own previous submit (idempotent retry, common case) OR (b) someone else's race-winning submit (race-loser case). Proceed to step 4 to resolve the ambiguity by polling — the proof retrieved there carries the canonical `transactionHash`, which we compare to ours to determine which case it is.
    - `AUTHENTICATOR_VERIFICATION_FAILED` — the aggregator's crypto check rejected the authenticator. Local crypto passed, aggregator's didn't — `'belief-divergence'`. Mark the queue entry hard-failed.
+   - `REQUEST_ID_MISMATCH` — per the SDK docstring this means "Request identifier did not match the payload" — i.e., the client sent an inconsistent `(requestId, sourceState, transactionHash)` tuple. This is a CLIENT BUG, not a double-spend signal. Mark the queue entry hard-failed (reason='client-error') and emit an operator alert; the client computed the requestId incorrectly.
    - Transient (network, 5xx): increment `submitRetryCount`; back off; retry. Bounded by `MAX_SUBMIT_RETRIES` (default 5).
 4. **Poll `aggregator.getInclusionProof(commitmentRequestId)`** until a terminal status is observed:
-   - `verify() === OK` — proof is anchored; proceed to step 5.
+   - `verify() === OK` — proof is anchored. **Now compare the returned proof's `transactionHash` to our local `transactionHash`** (the one we just submitted or are tracking):
+     - **Match**: the anchored commitment is ours. Idempotent success. Proceed to step 5.
+     - **Mismatch**: the anchored commitment is someone else's — a race-winner submitted a different transition over the same source state before us. We are the race-loser. Mark the queue entry hard-failed (reason='race-lost'). The source token is genuinely valid (the race-winner's tx is on-chain); cascade does NOT fire (per §6.1.1 — race-lost is a special case where no children are invalidated). The local outbox entry transitions to `failed-permanent` with error code `OUTBOX_RACE_LOST`.
    - `verify() === PATH_NOT_INCLUDED` — this is **a verifiable proof of non-existence at the polled snapshot** (the aggregator's BFT-signed merkle proof that no commitment is registered at this requestId in the current SMT root). This is **not a hard error**; it means "not yet anchored." Continue polling. Treat as terminal-rejected only after sustained PATH_NOT_INCLUDED across the polling window (see step 6).
    - `verify() === PATH_INVALID` — the proof structure is malformed (truncated, mis-shaped). Likely faulty aggregator OR transport corruption. Increment `proofErrorCount`; retry up to `MAX_PROOF_ERROR_RETRIES` (default 3); then mark hard-failed (reason='proof-invalid').
    - `verify() === NOT_AUTHENTICATED` — the proof's validator signatures don't verify against the local trustBase. Emit `transfer:trustbase-warning` (most likely stale trustBase per §9.4.1; active forgery is out of scope). The SDK SHOULD attempt a trustBase refresh before retrying. Increment `proofErrorCount`; retry up to MAX_PROOF_ERROR_RETRIES; then mark hard-failed (reason='proof-invalid').
@@ -984,19 +987,21 @@ Trigger: outbox entry with `status: 'delivered-instant'` and one or more outstan
 
 **Error model** (canonical, per `@unicitylabs/state-transition-sdk`):
 
-Submit-side responses (`SubmitCommitmentStatus`):
+Submit-side responses (`SubmitCommitmentStatus`). **Critical**: `requestId = SHA-256(publicKey ‖ stateHash.imprint)` per `RequestId.js` — does NOT include `transactionHash`. Two different transitions over the same source state have IDENTICAL `requestId`; race-lost detection therefore cannot use submit-side codes alone — it requires polling for the anchored proof and comparing `transactionHash`.
+
 | Response | Meaning | Worker action |
 |---|---|---|
 | `SUCCESS` | Commitment accepted; will be anchored shortly | Proceed to poll |
-| `REQUEST_ID_EXISTS` | Same commitment already submitted | Proceed to poll (idempotent) |
-| `REQUEST_ID_MISMATCH` | requestId bound to a different transactionHash | **Hard-fail (double-spend signal)**; reason='oracle-rejected' |
+| `REQUEST_ID_EXISTS` | A commitment for this `requestId` already exists. Could be (a) our own retry (idempotent) OR (b) race-winner's submit | Proceed to poll; the proof returned in step 4 carries the canonical `transactionHash`, which we compare to ours to disambiguate |
 | `AUTHENTICATOR_VERIFICATION_FAILED` | Aggregator's crypto check failed | **Hard-fail**; reason='belief-divergence' |
+| `REQUEST_ID_MISMATCH` | Per SDK docstring "Request identifier did not match the payload" — client sent inconsistent `(requestId, sourceState, transactionHash)` tuple | **Hard-fail**; reason='client-error'. Operator alert (client computed requestId incorrectly) |
 | 5xx / network error | Transient | Retry with backoff up to `MAX_SUBMIT_RETRIES` |
 
 Poll-side proof-verify outcomes (`InclusionProofVerificationStatus`):
 | Status | Meaning | Worker action |
 |---|---|---|
-| `OK` | Proof verifies; commitment anchored | Attach proof per §5.5 step 5 |
+| `OK` AND proof's `transactionHash` matches local | Our commitment is anchored. Idempotent success | Attach proof per §5.5 step 5 |
+| `OK` AND proof's `transactionHash` mismatches local | **Race-loser case**: a different transition over our source state was anchored | **Hard-fail**; reason='race-lost'. Cascade does NOT fire (source token is genuinely valid; the race-winner's tx is on-chain and the recipient never got our bundle) |
 | `PATH_NOT_INCLUDED` | Verifiable proof of non-existence at this snapshot | **Continue polling** within window |
 | `PATH_INVALID` | Proof structurally malformed | Retry up to `MAX_PROOF_ERROR_RETRIES`, then hard-fail; reason='proof-invalid' |
 | `NOT_AUTHENTICATED` | Validator sigs don't verify against local trustBase | Emit `transfer:trustbase-warning` (likely stale local trustBase per the §9.4.1 threat model — active forgery is out of scope); retry after refreshing trustBase; if still failing, hard-fail with reason='proof-invalid' |
@@ -1012,20 +1017,29 @@ For each pending requestId in outbox.commitmentRequestIds:
      STRUCTURAL_INVALID for the queue entry.
 
    submit commitment to aggregator:
-     SUCCESS / REQUEST_ID_EXISTS → continue to poll.
-     REQUEST_ID_MISMATCH        → hard-fail, reason='oracle-rejected'.
-                                  (Source state has a different
-                                  transition committed — local belief
-                                  diverged from canonical chain.)
+     SUCCESS / REQUEST_ID_EXISTS → continue to poll. (Both cases require
+                                  the post-poll transactionHash compare;
+                                  EXISTS could be our retry OR a race-
+                                  winner's submit.)
      AUTHENTICATOR_VERIFICATION_FAILED →
                                   hard-fail, reason='belief-divergence'.
+     REQUEST_ID_MISMATCH        → hard-fail, reason='client-error'.
+                                  (CLIENT BUG: we sent an inconsistent
+                                  (requestId, sourceState, transactionHash)
+                                  tuple. Operator alert.)
      transient                  → retry up to MAX_SUBMIT_RETRIES.
 
    poll loop (until pollingDeadline = entry.submittedAt + POLLING_WINDOW;
                minimum MIN_POLL_ATTEMPTS polls before deadline can fire):
      fetchInclusionProof(requestId).verify(trustBase, requestId):
-       OK                       → attach proof per §5.5 step 5;
-                                  remove queue entry; done.
+       OK                       → compare proof.transactionHash to local:
+                                  match    → attach proof per §5.5 step 5;
+                                             remove queue entry; done.
+                                  mismatch → race-lost. Hard-fail,
+                                             reason='race-lost'. Cascade
+                                             does NOT fire (source token
+                                             is genuinely valid; we just
+                                             lost the submit-race).
        PATH_NOT_INCLUDED        → keep polling (this is a fresh proof
                                   that the commitment is NOT YET in the
                                   SMT — bounded transient).
@@ -1062,12 +1076,28 @@ For each pending requestId in outbox.commitmentRequestIds:
 
 #### 6.1.1 Cascade on hard-rejection
 
-When a queue entry hard-fails (retries exhausted), the token is marked invalid. **Locally derived child tokens** of this token (splits / forwards the sender minted in instant mode while this token was still pending) are now also invalid — their parent's chain is dead. The worker MUST:
+When a queue entry hard-fails (retries exhausted), the failing token is marked invalid. **Cascade behavior depends on the token's class** (per §4.1 canonical asset model — class-disjoint coin vs NFT):
 
-1. Identify all locally-stored tokens whose chain references this `tokenId` as a parent split (look up `splitParent` field on the manifest).
+**Coin-token splits** — split-cascade via `splitParent` reference:
+
+When a coin token was previously split via `TokenSplitBuilder` (which mints fresh `tokenId`s for the recipient + change outputs), the children carry a `splitParent: tokenId` reference on their manifest. If the split-parent's chain hard-fails, the children are derived from a non-existent parent state and are also invalid. The worker MUST:
+
+1. Identify all locally-stored tokens whose manifest has `splitParent === <this failing tokenId>`.
 2. Cascade `manifest.status = 'invalid'` (reason='parent-rejected') to each child.
-3. Move each cascaded child to `_invalid` with reason='parent-rejected', `parentTokenId: <this token's id>`.
-4. Emit `transfer:cascade-failed` for any outgoing bundles in the outbox that reference the cascaded children — best-effort notification to downstream recipients (delivery is informational; the recipient will independently arrive at the same `'invalid'` disposition via their own §5.3 [C](3) check when their workers poll the aggregator for the failed tx).
+3. Move each cascaded child to `_invalid` with reason='parent-rejected', `parentTokenId: <this failing tokenId>`.
+4. Emit `transfer:cascade-failed` for any outgoing bundles in the outbox that reference the cascaded children — best-effort notification to downstream recipients (delivery is informational; recipients will independently arrive at the same disposition via their own §5.3 [C](3) check when workers poll the aggregator for the failed tx).
+
+**NFT tokens** — NO splitParent cascade (NFTs are not splittable):
+
+NFT tokens (empty/null `coinData`) cannot be split — `TokenSplitBuilder` rejects empty-coinData inputs. NFT transfers are whole-token state-transitions: the recipient gets the SAME `tokenId` with new current state. There are no "child tokens" to cascade to. The cascade rule for NFTs is therefore:
+
+1. The failing NFT itself is marked `invalid` and moved to `_invalid` (reason='oracle-rejected' or 'race-lost' or whichever applies).
+2. **Outbox-driven downstream notification**: every outbox entry that shipped this NFT to a recipient (in instant mode, before finalization) is examined. For each, emit `transfer:cascade-failed` with the recipient's pubkey and the NFT's tokenId. This is best-effort — downstream recipients independently arrive at the same `invalid` disposition via their own §5.3 [C](3) check when their workers resolve the failing predecessor tx.
+3. **NO splitParent walk** — NFTs do not have `splitParent` set; the field is ignored for NFT-class tokens.
+
+**Race-lost special case** (per §6.1 step 4):
+
+When a token's queue entry hard-fails with reason=`'race-lost'` (race-winner's transaction is anchored, ours isn't), the cascade does NOT fire — the source token is genuinely valid (the race-winner's tx is on-chain), and the recipient never received our bundle. Only the outbox entry transitions to `failed-permanent`; the source token's local state is untouched. This is unique to race-lost; all other hard-fail reasons trigger the cascade per the rules above.
 
 Cascade is **monotonic** by default. A cascaded `invalid` disposition cannot be reversed automatically. **Operator-explicit reversal path** for the case where the aggregator later returns a valid proof for the parent's tx (which it shouldn't, given the threat model — but operationally this can happen if the aggregator was transiently faulty and the cascade fired prematurely):
 
@@ -1103,7 +1133,7 @@ Optional gate: callers MAY pass `requireParentFinalized: true` to `send()`; the 
 #### 6.1.2 Outbox terminal states
 
 - `finalized` — every proof attached cleanly.
-- `failed-permanent` — any of: submit-side `REQUEST_ID_MISMATCH` / `AUTHENTICATOR_VERIFICATION_FAILED`, sustained `PATH_NOT_INCLUDED` past polling window, retry-exhausted `PATH_INVALID` / `NOT_AUTHENTICATED`, or two-replica `OUTBOX_RACE_LOST`. Operator may inspect via `_invalid` records and decide whether to escalate.
+- `failed-permanent` — any of: submit-side `AUTHENTICATOR_VERIFICATION_FAILED` (belief-divergence) or `REQUEST_ID_MISMATCH` (client-error), sustained `PATH_NOT_INCLUDED` past polling window (oracle-rejected), retry-exhausted `PATH_INVALID` / `NOT_AUTHENTICATED` (proof-invalid), or poll-side `OK` with mismatching transactionHash (race-lost via `OUTBOX_RACE_LOST`). Operator may inspect via `_invalid` records and decide whether to escalate.
 - `failed-transient` — transient errors exhausted the retry budget. Worker stops; operator MAY trigger manual retry via `payments.retryFinalize(outboxEntryId)`.
 
 ### 6.2 Recipient-side finalization worker
@@ -1150,7 +1180,7 @@ If the local manifest already has a proof for a queue entry's requestId, and a f
 5. Both manifests update `tokenId → newCid` and set `status='valid'` once all unfinalized txs in the chain are resolved AND the [E] re-run confirms `oracle.isSpent === false`.
 6. Subsequent `pkg.merge` between the two pools dedupes via Wave G.3 (identical content → identical CID); the merge is a no-op.
 
-**Failure mode (aggregator hard-rejects a commitment)**: both finalizers see the same hard-rejection signal (per §6.1 error model — `REQUEST_ID_MISMATCH` at submit, or sustained `PATH_NOT_INCLUDED` over the polling window). Both mark the token `invalid` per §6.1. Convergent on the invalid disposition. The token stays in `_invalid` on both sides.
+**Failure mode (commitment never anchored)**: both finalizers see the same eventual signal (per §6.1 error model — sustained `PATH_NOT_INCLUDED` over the polling window resolves to reason='oracle-rejected'; or post-poll `OK`-with-mismatching-transactionHash resolves to reason='race-lost'). Both mark the token's queue entry `failed-permanent` per §6.1. The dispositions converge across replicas — both reach the same outcome (oracle-rejected, race-lost, or invalid via §6.1.1 cascade) given the same canonical aggregator state.
 
 **Asymmetric-knowledge mode (one side has more proofs than the other, no network)**: as long as the more-knowledgeable copy reaches the lagging side via any channel (a second Nostr delivery, a backup import, an IPFS pull) the merge is monotonic — proofs accumulate. Convergence does not require both sides to ever reach the aggregator.
 
@@ -1186,7 +1216,7 @@ Behavior cases:
 5. **tokenId is in `_invalid` AND `allowInvalidOverride === true` AND the token had EXACTLY ONE hard-failed queue entry, matching the proof**: validates the proof; if OK, MOVES the token from `_invalid` back to active pool with `manifest.status='valid'` (the prior invalidation was wrong — the original aggregator response was faulty, the proof now demonstrates the correct anchored state). This is the explicit operator override of the §5.6 monotonicity invariant.
 6. **tokenId is in `_invalid` AND `allowInvalidOverride === true` AND the token had MULTIPLE hard-failed queue entries** (chain-mode case): validates the proof; if OK, MOVES the token from `_invalid` back to active pool with `manifest.status='pending'` and re-queues the K-1 remaining entries as fresh queue entries (each with `submittedAt = now`, fresh `pollingDeadline`). The token returns to the normal finalization path. The operator must then either wait for those K-1 entries to resolve OR import each of their proofs separately.
 
-   > **Important — re-queue is usually futile without the additional proofs**: the K-1 entries previously hard-failed because the aggregator never anchored their commitments (sustained PATH_NOT_INCLUDED, or REQUEST_ID_MISMATCH). Nothing about re-queueing causes the aggregator to behave differently — those entries will hard-fail again after one polling window, re-cascading the token to `_invalid`. Operators SHOULD provide proofs for ALL K-1 remaining entries via repeated `importInclusionProof()` calls (one per requestId) BEFORE expecting the token to converge to `valid`. A future `bulkImportInclusionProofs(tokenId, proofs[])` API MAY consolidate this (deferred — §12.2).
+   > **Important — re-queue is usually futile without the additional proofs**: the K-1 entries previously hard-failed because the aggregator never anchored their commitments (sustained PATH_NOT_INCLUDED) or because they lost a race (poll-side OK with mismatching transactionHash). Nothing about re-queueing causes the aggregator to behave differently — those entries will hard-fail again after one polling window, re-cascading the token to `_invalid`. Operators SHOULD provide proofs for ALL K-1 remaining entries via repeated `importInclusionProof()` calls (one per requestId) BEFORE expecting the token to converge to `valid`. A future `bulkImportInclusionProofs(tokenId, proofs[])` API MAY consolidate this (deferred — §12.2).
 7. **tokenId is in `_invalid` AND no override flag**: `{ ok: false, reason: 'tokenId-in-invalid' }`.
 8. **Proof verify returns `PATH_NOT_INCLUDED`**: `{ ok: false, reason: 'proof-not-anchored' }`. The proof is a valid proof of NON-existence; it doesn't help unstick.
 9. **Proof verify returns `PATH_INVALID` / `NOT_AUTHENTICATED`**: `{ ok: false, reason: 'proof-trustbase-failed' }`.
@@ -1345,9 +1375,9 @@ The outbox is persisted in OrbitDB. OrbitDB has eventual-consistency (CRDT) sema
 5. **`error` field:** the replica with the more-advanced `status` wins; among equal-status replicas, the earlier Lamport timestamp wins (the first-decided error is preserved).
 6. **`lamport` timestamp:** max-merge.
 
-**Spend protection** comes from the aggregator's `requestId` invariant, NOT from the outbox. A replica rollback that re-creates an outbox entry for an already-transferred source state will hit `REQUEST_ID_MISMATCH` at the next aggregator submission (the requestId is bound to the prior committed transactionHash). The worker hard-fails with reason='oracle-rejected'; the outbox correctly records that this re-attempt failed. The source token's actual on-chain state is untouched.
+**Spend protection** comes from the aggregator's `requestId` invariant. A replica rollback that re-creates an outbox entry for an already-transferred source state will hit `REQUEST_ID_EXISTS` at the next aggregator submission; the worker then polls and discovers the race-loser case (proof's `transactionHash` ≠ local) and marks the entry `failed-permanent` with reason='race-lost'. The outbox correctly records the failed re-attempt; the source token's on-chain state is untouched.
 
-**Two-replica race on `send()` from same source state**: replicas A and B simultaneously fire `send()` from the same source token. Each generates a fresh-random salt → different `transactionHash` but identical `requestId`. Both submit to the aggregator. First-arriving wins SUCCESS; second gets `REQUEST_ID_MISMATCH`. Loser's outbox entry transitions to `failed-permanent` with a distinguished error code `OUTBOX_RACE_LOST` (reason=`'race-lost'`). The cascade rule (§6.1.1) does NOT fire for `race-lost` — the source token is genuinely valid; the loser's `send()` simply lost the race and the recipient never got a bundle.
+**Two-replica race on `send()` from same source state**: replicas A and B simultaneously fire `send()` from the same source token. Each generates a fresh-random salt → different `transactionHash` but **identical `requestId`** (since `requestId = SHA-256(publicKey ‖ stateHash.imprint)` excludes `transactionHash`). Both submit to the aggregator. First-arriving wins `SUCCESS`; the second's submit returns `REQUEST_ID_EXISTS` (NOT `_MISMATCH`). The second's worker then polls `getInclusionProof(requestId)` and compares the returned proof's `transactionHash` to its local one — they differ, identifying the race-loser. The loser's outbox entry transitions to `failed-permanent` with error code `OUTBOX_RACE_LOST` (reason=`'race-lost'`). The cascade rule (§6.1.1) does NOT fire for `race-lost` — the source token is genuinely valid (the race-winner's tx is on-chain); the loser's `send()` simply lost the race and the recipient never got a bundle.
 
 ### 7.2 Migration from legacy outbox
 
@@ -1393,11 +1423,12 @@ The on-chain spent state is checked via `oracle.isSpent(stateHash)` — a single
 - Retry via outbox `failed-transient` state with exponential backoff up to a hard cap (default 24 hours).
 - After cap: `failed-permanent`. Local bookkeeping is updated to reflect that the bundle did not reach the recipient.
 
-**Why double-spend is impossible at the protocol level**: the aggregator enforces single-spend at the SMT level via the `requestId` invariant. The requestId is `Hash(publicKey, sourceStateHash)` — deterministic given a (sender pubkey, source state). Two different signed transitions from the same source state produce DIFFERENT `transactionHash` values but the SAME `requestId`. The aggregator's submit endpoint detects this:
+**Why double-spend is impossible at the protocol level**: the aggregator enforces single-spend at the SMT level via the `requestId` invariant. Per `RequestId.js`, the requestId is `SHA-256(publicKey ‖ sourceStateHash.imprint)` — deterministic given (sender pubkey, source state) and **excluding `transactionHash`**. Two different signed transitions from the same source state therefore produce DIFFERENT `transactionHash` values but the SAME `requestId`. The aggregator anchors at most ONE transition per requestId; subsequent submits for the same requestId return `REQUEST_ID_EXISTS` (NOT `_MISMATCH` — `_MISMATCH` is reserved for malformed-payload errors). The sender's worker resolves the double-spend at the polling step:
 
-- If the original commitment was accepted, it is now bound to its `transactionHash` at the requestId. A fresh `send()` from the same source state generates a new `transactionHash` (different salt, different recipient, etc.). When the sender submits the new commitment, the aggregator returns `REQUEST_ID_MISMATCH` — the requestId exists but with a different transactionHash — explicitly the double-spend detector. The sender's worker hard-fails with reason='oracle-rejected'.
-- If the original commitment was NEVER accepted (the aggregator dropped the submission), the new send succeeds normally. The first transfer never happened on-chain.
-- If the sender retries the EXACT same commitment (same salt, same transactionHash), the aggregator returns `REQUEST_ID_EXISTS` (idempotent re-submission); the worker proceeds to poll.
+- If the sender's original commitment was the one anchored, polling returns the proof with our `transactionHash`; idempotent success.
+- If a competing commitment was anchored first (race-loser case OR the sender's local state diverged from canonical chain — "belief divergence"), polling returns the proof with a DIFFERENT `transactionHash`. The sender's worker compares and detects the mismatch, marking the queue entry `failed-permanent` with reason='race-lost'.
+- If the original commitment was never accepted (aggregator dropped the submission), polling returns `PATH_NOT_INCLUDED` until the polling window expires; worker eventually marks the entry hard-failed with reason='oracle-rejected'.
+- If the sender's retry uses the EXACT same `(salt, transactionHash)`, polling returns the proof with matching `transactionHash` — idempotent.
 
 In no case can the sender create two valid commitments for the same source state. Local outbox state is bookkeeping and cannot violate this invariant. The aggregator's single-spend invariant is the trust anchor.
 
@@ -1431,8 +1462,9 @@ A queue entry transitions to terminal hard-fail through one of these paths (per 
 
 | Path | Trigger | Reason |
 |---|---|---|
-| Submit-side `REQUEST_ID_MISMATCH` | Source state already has a different transition committed | `oracle-rejected` (canonical double-spend signal) |
+| Submit-side `REQUEST_ID_MISMATCH` | Client bug — sent inconsistent `(requestId, sourceState, transactionHash)` tuple | `client-error` (operator alert) |
 | Submit-side `AUTHENTICATOR_VERIFICATION_FAILED` | Aggregator rejected our crypto | `belief-divergence` |
+| Poll-side `OK` with mismatching transactionHash | Race-winner's transition was anchored; we are the race-loser | `race-lost` (cascade does NOT fire — source token is genuinely valid) |
 | Poll-side sustained `PATH_NOT_INCLUDED` over POLLING_WINDOW | Commitment was never anchored | `oracle-rejected` |
 | Poll-side `PATH_INVALID` after retries | Proof structurally malformed | `proof-invalid` |
 | Poll-side `NOT_AUTHENTICATED` after retries | Stale local trustBase (per §9.4.1; active forgery out of scope) | `proof-invalid` (also: `transfer:trustbase-warning`) |
@@ -1638,10 +1670,11 @@ The implementation MUST include:
 - Recipient's local clock skewed by 30 days → finalization worker still runs (no clock-dependent guards).
 - Chain-mode forwarder dies mid-chain: the token's queue carries entries for the predecessor's pending tx; finalization still completes via the local worker (predecessor's signedTx is in the bundle the forwarder received).
 - Forged authenticator on an unfinalized tx (tx claims to be signed by previous owner but isn't) → §5.3 [C](1) ECDSA verify fails → `PROOF_INVALID`. **Critical**: this MUST be detected at receive, not deferred to aggregator-poll time.
-- **Bandwidth-burning peer**: malicious sender forwards a 10-deep chain where tx #3's commitment was hard-failed at the aggregator (REQUEST_ID_MISMATCH on submit). Recipient's worker hits the hard-fail at tx #3; per §6.1 short-circuit, the WHOLE token is marked invalid immediately and other queue entries are cancelled. Test verifies (a) the bundle is processed correctly, (b) the chain-depth cap fires for bundles with >64 unfinalized txs in the *claimed* tokenIds (smuggled deep roots are silently dropped per §5.2 #3 — separately tested).
+- **Bandwidth-burning peer**: malicious sender forwards a 10-deep chain where tx #3's commitment never anchored (sustained PATH_NOT_INCLUDED at recipient's worker). Recipient's worker hits the hard-fail at tx #3 after the polling window; per §6.1 short-circuit, the WHOLE token is marked invalid immediately and other queue entries are cancelled. Test verifies (a) the bundle is processed correctly, (b) the chain-depth cap fires for bundles with >64 unfinalized txs in the *claimed* tokenIds (smuggled deep roots are silently dropped per §5.2 #3 — separately tested).
 - **Peer-reputation cooldown (deferred)**: assertion that the recipient applies a 1-hour silent-drop window for further bundles from a peer that recently shipped a hard-failing chain — DEFERRED per §12.2 (peer-reputation framework not in T.1-T.8). Add this test only when the framework lands.
 - **Faulty-aggregator path (intermittent PATH_NOT_INCLUDED)**: aggregator returns PATH_NOT_INCLUDED transiently (e.g., across an aggregator-node-restart). Worker keeps polling; eventually one poll returns OK and the token finalizes correctly. Verify that the worker DOES NOT terminate on first PATH_NOT_INCLUDED (it's the not-yet status, not a hard-fail).
-- **Aggregator hard-rejection at submit**: REQUEST_ID_MISMATCH returned (double-spend signal). Worker hard-fails immediately; token to `_invalid` with reason='oracle-rejected'; cascade fires on locally-derived children.
+- **Race-lost detection (poll-side)**: two replicas submit different transitions over the same source state. Both get `SUCCESS` or `REQUEST_ID_EXISTS` at submit. The race-loser's poll returns `OK` with a `transactionHash` that doesn't match its local one. Worker hard-fails with reason='race-lost'; cascade does NOT fire (the source token is genuinely valid).
+- **Client-error at submit (REQUEST_ID_MISMATCH)**: simulate a buggy client that computes requestId incorrectly. Aggregator returns REQUEST_ID_MISMATCH. Worker hard-fails with reason='client-error'; emits operator alert; cascade does NOT fire (the source token is unaffected — no transition was registered).
 - **Sustained PATH_NOT_INCLUDED past polling window**: simulate aggregator that persistently returns PATH_NOT_INCLUDED for the entire 30-min window. Worker hard-fails with reason='oracle-rejected' after the deadline.
 - **Conservative-mode post-send PATH_INVALID**: hard-fail with reason='proof-invalid' after retries.
 - **Conservative-mode post-send NOT_AUTHENTICATED**: emit `transfer:trustbase-warning`; attempt trustBase refresh; if still failing, hard-fail and emit `transfer:security-alert` (sustained-after-refresh case only).
@@ -1654,7 +1687,7 @@ The implementation MUST include:
 
 ### 12.1 Resolved
 
-- **Refund / reversal protocol on aggregator rejection**: NOT needed. The hard-rejection signals are `REQUEST_ID_MISMATCH` (at submit) or sustained `PATH_NOT_INCLUDED` over the polling window — see §6.1 error model. In either case, the transaction is treated as if it never happened — the source token is still in its prior valid state. Both sender and recipient mark the *attempted* transition as invalid, but the underlying token is unchanged. No reversal flow required. (Per-history-tx invalidations propagate up to the whole-token level; see §6.1.1 cascade rule + §6.3 failure mode.)
+- **Refund / reversal protocol on aggregator rejection**: NOT needed. The hard-rejection signals are sustained `PATH_NOT_INCLUDED` over the polling window (oracle-rejected — commitment never anchored) or poll-side `OK` with mismatching transactionHash (race-lost — a different transition won the submit-race). See §6.1 error model. In both cases, the transaction OUR worker tried to anchor never made it on-chain — the source token's actual state is whatever the canonical aggregator chain shows (either unchanged for oracle-rejected, or transitioned by the race-winner for race-lost). Both sender and recipient mark the *attempted* transition as invalid; the underlying token's true on-chain state is unchanged from the wallet's perspective. No reversal flow required. (Per-history-tx invalidations propagate up to the whole-token level; see §6.1.1 cascade rule + §6.3 failure mode.)
 - **Aggregator-driven inbound discovery**: NOT possible. The aggregator never holds the full transaction — only its commitment. A recipient who never received the Nostr/UXF delivery cannot reconstruct the token from the aggregator alone. Existing payment-request + reconciliation flows are the recovery path.
 
 ### 12.2 Deferred
