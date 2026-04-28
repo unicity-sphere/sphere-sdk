@@ -229,12 +229,11 @@ type DeliveryStrategy =
 - `delivery: { kind: 'force-inline' }` — sender insists on inline regardless of size; if the resulting Nostr event exceeds the relay's max payload, the send fails with `INLINE_CAR_TOO_LARGE`.
 - `delivery: { kind: 'force-cid' }` — sender insists on pinning even for tiny bundles (e.g., when the receiver is known to be storage-constrained or when the operator wants every bundle indexed by CID for audit).
 
-**Hard upper bound**: regardless of `inlineCapBytes`, the implementation enforces a relay-safe ceiling. The ceiling is determined at send-time by:
+**Hard upper bound**: regardless of `inlineCapBytes`, the implementation enforces a fixed conservative ceiling of **96 KiB** for inline CAR bytes. This is the safe default for typical Nostr relay deployments.
 
-1. Probing the recipient's primary relay's NIP-11 `limitations.max_message_length` field. If the relay advertises one, that's the ceiling minus envelope overhead (~256 bytes).
-2. If NIP-11 is unavailable or doesn't advertise the limit: a conservative default of **96 KiB**.
+> **NIP-11 relay-discovery is NOT in scope for v1.0.** A future revision MAY probe the publishing relay's NIP-11 `limitations.max_message_length` to dynamically size the ceiling, but the current `transport/NostrTransportProvider.ts` does not implement NIP-11. Implementations MUST use the fixed 96 KiB cap until the discovery extension lands (deferred — §12.2).
 
-Above the ceiling, `force-inline` is rejected up-front with `INLINE_CAR_TOO_LARGE` before the bundle is built. If a `force-inline` send IS attempted within the local ceiling but the relay still rejects on publish (NIP-11 absent or stale), the publish failure is treated as `failed-transient` and the worker MAY auto-fall-back to CID delivery on retry — only if the caller's `delivery` strategy was `auto`. `force-inline` callers see the failure surfaced.
+Publish-time rejection handling: if a `force-inline` send is attempted within the 96 KiB cap but the chosen relay still rejects on publish (relay-specific limit lower than the default, or temporary capacity issue), the publish failure is treated as `failed-transient` (§7.0). For `delivery: 'auto'` senders, the worker auto-falls-back to `uxf-cid` on retry. For `delivery: 'force-inline'` senders, the failure surfaces — the caller chose force-inline explicitly and must handle the relay-rejection branch.
 
 **Fetched-CAR size cap (recipient-side)**: when fetching via `kind: 'uxf-cid'`, the recipient enforces a maximum fetched-CAR size of **32 MiB** by default (configurable). Fetches whose Content-Length or running byte count exceeds the cap are aborted with `FETCHED_CAR_TOO_LARGE`. This is a DoS defense against malicious senders pinning huge CARs.
 
@@ -399,7 +398,7 @@ The outbox's primary purpose is to guarantee **eventual delivery** despite inter
 
 In **conservative mode**, the outbox entry's lifecycle is short: created at step 6, marked `delivered` at step 8, optionally garbage-collected immediately or retained for a configurable window for delivery acknowledgments.
 
-In **instant mode**, the outbox entry persists until finalization completes for **every** transaction the sender contributed to the chain (typically 1, but K if the sender forwarded a chain-mode token). It carries the list of `commitmentRequestIds` so the async finalizer knows which proofs to fetch and re-submit if the aggregator returns `PATH_NOT_INCLUDED` transiently.
+In **instant mode**, the outbox entry persists until finalization completes for **every** transaction the sender contributed to the chain (typically 1, but K if the sender forwarded a chain-mode token). It carries `outstandingRequestIds` and `completedRequestIds` so the async finalizer knows which proofs to fetch (per §6.1 error model). Sustained `PATH_NOT_INCLUDED` across the polling window is treated as terminal hard-fail; transient `PATH_NOT_INCLUDED` (a single snapshot before anchor) just means "keep polling."
 
 In **TXF mode**, the outbox entry is per-token and short-lived (same lifecycle as conservative-UXF, but with `deliveryMethod: 'txf-legacy'` and `bundleCid: 'txf-' + tokenId`). Instant-TXF entries follow the instant-UXF lifecycle but at per-token granularity.
 
@@ -446,9 +445,13 @@ Before per-token disposition, the recipient performs **bundle-level checks**. Cr
    - Depth cap (default 4096) and pool size cap (default 1M elements) — DoS bounds.
    Crypto checks (signatures, proofs) are NOT performed at this stage.
 2. **Token ID claim consistency** — `payload.tokenIds` is advisory. The recipient MUST process every token-root element in the pool (subset, equal, or superset of `tokenIds`). Token-roots not in `tokenIds` are still subject to §5.3 ownership filtering at [B] — they are not "smuggled in" because [B] rejects anything whose current state doesn't bind to us.
-3. **Chain-depth cap** — for every token-root in the pool, count unfinalized transactions. If any exceeds `MAX_CHAIN_DEPTH` (default 64), reject the entire bundle with `BUNDLE_REJECTED:chain-depth-exceeded`. (DoS defense — prevents 1000-tx-deep histories.)
+3. **Chain-depth cap (per-token, with smuggling defense)** — apply `MAX_CHAIN_DEPTH` (default 64 unfinalized txs) per-token, with the following two-tier rule to prevent griefing-via-smuggled-roots:
+   - For every token-root in `payload.tokenIds` (the sender's claim): if depth > MAX_CHAIN_DEPTH, **reject the entire bundle** with `BUNDLE_REJECTED:chain-depth-exceeded`. The sender claimed it; the sender is responsible.
+   - For every token-root in the pool but NOT in `payload.tokenIds` (smuggled): if depth > MAX_CHAIN_DEPTH, **silently drop that token-root** from processing. The legitimate claimed tokens are still processed normally. This prevents an attacker from griefing a legitimate transfer by attaching a deep unclaimed root.
 
-If any bundle-level check fails, the entire bundle is rejected with a typed `BUNDLE_REJECTED` error; nothing is imported. This is logged and surfaced as a `transfer:rejected` event.
+   Post-merge depth: if a `[D-merge]` operation produces a union token whose unfinalized-tx count exceeds MAX_CHAIN_DEPTH (because the local pool extended the chain beyond the cap), the merge proceeds but the resulting token's `manifest.status` is `pending` and a warning is logged — we trust our own pool's prior state. Only INCOMING bundles' fresh chains are capped.
+
+If any other bundle-level check fails, the entire bundle is rejected with a typed `BUNDLE_REJECTED` error; nothing is imported. This is logged and surfaced as a `transfer:rejected` event.
 
 ### 5.3 Per-token disposition — THE DECISION MATRIX
 
@@ -499,12 +502,26 @@ For each token-root element in pool:
 │              └─ FAIL → disposition: PROOF_INVALID and stop.
 │          (3) If inclusionProof present → verify against trustBase
 │              (full crypto: leaf hash, merkle path, validator signatures
-│              on the unicityCertificate).
-│              ├─ verify OK → mark this tx FINALIZED.
-│              ├─ verify FAILS (PATH_INVALID / NOT_AUTHENTICATED) →
-│              │   disposition: PROOF_INVALID and stop.
+│              on the unicityCertificate). Outcomes per
+│              InclusionProofVerificationStatus:
+│              ├─ OK → mark this tx FINALIZED.
+│              ├─ PATH_INVALID → disposition: PROOF_INVALID
+│              │   (reason='proof-invalid') and stop. (Proof structure
+│              │   malformed.)
+│              ├─ NOT_AUTHENTICATED → disposition: PROOF_INVALID
+│              │   (reason='proof-invalid') and stop. (Validator
+│              │   signatures don't verify against trustBase. Note:
+│              │   this is also a transfer:security-alert event —
+│              │   the sender attached a forged proof, OR our
+│              │   trustBase is stale.)
+│              ├─ PATH_NOT_INCLUDED → disposition: PROOF_INVALID
+│              │   (reason='proof-invalid') and stop. (Sender claimed
+│              │   the proof anchors the tx, but the proof is in fact
+│              │   a verifiable proof of NON-existence. The sender
+│              │   lied or the proof is stale.)
 │              └─ verify THROWS / proof element references missing
-│                  dependency → disposition: STRUCTURAL_INVALID and stop.
+│                  dependency → disposition: STRUCTURAL_INVALID
+│                  (reason='proof-throw') and stop.
 │          (4) If inclusionProof === null → mark this tx UNFINALIZED.
 │        After the sweep:
 │          unfinalizedCount = number of txs with no proof
@@ -521,17 +538,31 @@ For each token-root element in pool:
 │        │   chain-mode merge case where one side has more finalized
 │        │   transactions than the other (proof grafting is monotonic).
 │        │   ├─ Resolved (one chain is a strict prefix or extension of
-│        │   │   the other) → continue to [E] with the union token.
-│        │   │   (recompute unfinalizedCount on the union)
+│        │   │   the other) → continue to [B'] (re-run ownership check
+│        │   │   on the union token — the merged chain may have changed
+│        │   │   who owns the current state).
 │        │   └─ Genuinely divergent (both chains contain different
 │        │       transactions from the same source state — should be
 │        │       impossible with a non-faulty aggregator, but we plan
 │        │       for it):
-│        │       Tie-break: lex-min `bundleCid` wins primary; loser
-│        │       stored as a `conflictingHeads[]` entry on the manifest.
-│        │       disposition: CONFLICTING (terminal until operator or
-│        │       aggregator response evicts the loser).
+│        │       Tie-break: lex-min `bundleCid` (compared as raw
+│        │       CIDv1 binary form, NOT base32 string) wins primary;
+│        │       loser stored as a `conflictingHeads[]` entry on the
+│        │       manifest. disposition: CONFLICTING (terminal until
+│        │       operator or aggregator response evicts the loser).
 │        └─ NO → continue to [E] with the new token.
+│
+├─[B']─ Re-run ownership check on merged token (after [D-merge] only)
+│        After resolveTokenRoot produced a union token, the union may
+│        contain transactions our pool's prior copy didn't include —
+│        possibly including a transfer-out we authored. Re-evaluate the
+│        current-state predicate on the union's terminal state.
+│        ├─ FAIL (current state of merged chain doesn't bind to us;
+│        │   e.g., the merge surfaced a transfer-out we already did) →
+│        │   disposition: NOT_OUR_CURRENT_STATE
+│        │   (move to _audit; the pre-merge entry, if any, is also
+│        │   superseded — the merge represents a more-canonical view)
+│        └─ PASS → continue to [E].
 │
 ├─[E]─ Spent-check + finalization terminal
 │        If unfinalizedCount > 0:
@@ -576,16 +607,29 @@ The matrix distinguishes **cryptographically broken** tokens (`PROOF_INVALID`, `
 
 ```typescript
 type DispositionReason =
-  | 'structural'         // [A] orphan ref / type-tag / hash mismatch / throw
-  | 'predicate-eval'     // [B] predicate evaluation threw
-  | 'auth-invalid'       // [C](1) ECDSA verify failed
-  | 'continuity-broken'  // [C](2) source-state continuity broken
-  | 'proof-invalid'      // [C](3) inclusionProof verify failed
-  | 'proof-throw'        // [C](3) proof verify threw / orphan dep
-  | 'oracle-rejected'    // §5.5 step 5 / §6.1 PATH_NOT_INCLUDED hard-error
-  | 'not-our-state'      // [B] current-state predicate doesn't bind to us
-  | 'off-record-spend';  // [E] oracle.isSpent=true on finalized chain
+  // Structural / cryptographic failures (→ _invalid)
+  | 'structural'           // [A] orphan ref / type-tag / hash mismatch / throw
+  | 'predicate-eval'       // [B] predicate evaluation threw
+  | 'auth-invalid'         // [C](1) ECDSA verify failed
+  | 'continuity-broken'    // [C](2) source-state continuity broken
+  | 'proof-invalid'        // [C](3) inclusionProof verify failed (PATH_INVALID, NOT_AUTHENTICATED, or PATH_NOT_INCLUDED at receive)
+  | 'proof-throw'          // [C](3) proof verify threw / orphan dep
+  // Aggregator-driven failures (→ _invalid)
+  | 'oracle-rejected'      // §6.1 REQUEST_ID_MISMATCH at submit OR sustained PATH_NOT_INCLUDED past polling window
+  | 'belief-divergence'    // §6.1 AUTHENTICATOR_VERIFICATION_FAILED at submit (local crypto passed, aggregator's didn't)
+  | 'parent-rejected'      // §6.1.1 cascade — parent token was hard-failed
+  | 'race-lost'            // §7.1 two-replica race lost; OUTBOX_RACE_LOST at submit
+  // Audit-only (→ _audit, not invalid)
+  | 'not-our-state'        // [B] / [B'] current-state predicate doesn't bind to us
+  | 'off-record-spend'     // [E] oracle.isSpent=true on finalized chain
+  // Transport / IPFS failures (recoverable; usually transient)
+  | 'gateway-fetch-failed';// §9.2 all gateways failed to serve the bundle CAR
 ```
+
+**Reason → storage location mapping**:
+- `structural | predicate-eval | auth-invalid | continuity-broken | proof-invalid | proof-throw | oracle-rejected | belief-divergence | parent-rejected | race-lost` → `_invalid`
+- `not-our-state | off-record-spend` → `_audit`
+- `gateway-fetch-failed` → no storage (transient; retried by gateway-walking logic)
 
 **Distinguishing forensics from audit**:
 - `_invalid` — cryptographically broken tokens. The chain is bad; investigation typically points to a forged proof, a corrupted bundle, or a malicious sender.
@@ -593,19 +637,29 @@ type DispositionReason =
 
 **`_audit` is a NEW collection** introduced by this protocol. It does not exist in the codebase prior to Wave T.3 and MUST be added to `PROFILE_KEY_MAPPING` alongside the existing `invalidTokens` key.
 
-**`_audit` state transitions**:
+**`_audit` record schema and state transitions**:
 
 ```typescript
+interface AuditEntry {
+  readonly tokenId: string;
+  readonly auditStatus: AuditStatus;
+  readonly reason: DispositionReason;
+  readonly recordedAt: number;
+  readonly bundleCidsObserved: readonly string[];  // for forensic traceability
+  /** Set on promotion — explicit pointer to the new active-pool manifest entry. */
+  readonly promotedToManifestRef?: ContentHash;
+}
+
 type AuditStatus =
   | 'audit-not-our-state'     // disposition: NOT_OUR_CURRENT_STATE
   | 'audit-off-record-spend'  // disposition: UNSPENDABLE_BY_US
   | 'audit-promoted';         // a later transfer made the token ours;
-                              // the audit entry is retained as cross-reference,
-                              // a fresh manifest entry is created in the
-                              // active pool with status='valid'
+                              // promotedToManifestRef points to the new
+                              // active-pool manifest entry. The audit
+                              // record is retained for forensic traceability.
 ```
 
-A periodic re-scan (out of scope here, deferred per §12.2) MAY transition `audit-not-our-state` entries to `audit-promoted` if a later transfer's chain makes the same `tokenId` bind to us at current state. Promotion MUST NOT delete the audit entry — it cross-references the new active-pool manifest entry for forensic traceability.
+A periodic re-scan (out of scope here, deferred per §12.2) MAY transition `audit-not-our-state` entries to `audit-promoted` if a later transfer's chain makes the same `tokenId` bind to us at current state. Promotion sets `promotedToManifestRef` to the new manifest entry's `ContentHash` and MUST NOT delete the audit entry. The corresponding active-pool manifest entry SHOULD set `audit_promoted_from: { auditKey: ${addr}.audit.${tokenId} }` for back-reference.
 
 **Retention**:
 - `_invalid`: indefinite by default; user can manually `cleanupInventory()` to clear.
@@ -636,23 +690,57 @@ The finalization worker (see §6) processes each entry. For each pending tx:
 
 1. Resolve `signedTransferTxBytes`: prefer the queue-entry field, fall back to the in-pool token at `(tokenId, txIndex)`. If neither has it, mark the queue entry `STRUCTURAL_INVALID` (reason='structural') and remove. The token transitions to `invalid`.
 2. Compute `commitmentRequestId` locally from `(signedTx, sourceState)`. This MUST match the queue entry's stored value (defensive consistency check).
-3. If the worker has not yet seen evidence the commitment was submitted: submit it to the aggregator. The aggregator's submit endpoint is idempotent — submitting an already-known commitment returns immediately. (Re-submission also covers the faulty-aggregator case where the aggregator dropped the first submission; see §6.1 retry-on-belief rule.)
-4. Poll `aggregator.getInclusionProof(commitmentRequestId)` until a proof is returned or a hard error (`PATH_NOT_INCLUDED`, `PATH_INVALID`) is observed.
-5. **On proof retrieval (atomic transaction in OrbitDB)**:
+3. **Submit the commitment** to the aggregator (if not previously submitted by this worker). The submit endpoint returns one of (per `SubmitCommitmentResponse.js`):
+   - `SUCCESS` — commitment accepted; will be anchored in a forthcoming SMT snapshot. Proceed to step 4.
+   - `REQUEST_ID_EXISTS` — this exact commitment was already submitted (idempotent; we previously asked, the aggregator already has it). Proceed to step 4.
+   - `REQUEST_ID_MISMATCH` — the requestId is registered, but bound to a **different** transactionHash. This is the canonical **double-spend signal**: the source state already has a different transition committed. NOT a transient error. Mark the queue entry hard-failed (reason='oracle-rejected') and proceed to step 6.
+   - `AUTHENTICATOR_VERIFICATION_FAILED` — the aggregator's crypto check rejected the authenticator. Local crypto passed, aggregator's didn't — `'belief-divergence'`. Mark the queue entry hard-failed.
+   - Transient (network, 5xx): increment `submitRetryCount`; back off; retry. Bounded by `MAX_SUBMIT_RETRIES` (default 5).
+4. **Poll `aggregator.getInclusionProof(commitmentRequestId)`** until a terminal status is observed:
+   - `verify() === OK` — proof is anchored; proceed to step 5.
+   - `verify() === PATH_NOT_INCLUDED` — this is **a verifiable proof of non-existence at the polled snapshot** (the aggregator's BFT-signed merkle proof that no commitment is registered at this requestId in the current SMT root). This is **not a hard error**; it means "not yet anchored." Continue polling. Treat as terminal-rejected only after sustained PATH_NOT_INCLUDED across the polling window (see step 6).
+   - `verify() === PATH_INVALID` — the proof structure is malformed (truncated, mis-shaped). Likely faulty aggregator OR transport corruption. Increment `proofErrorCount`; retry up to `MAX_PROOF_ERROR_RETRIES` (default 3); then mark hard-failed (reason='proof-invalid').
+   - `verify() === NOT_AUTHENTICATED` — the proof's validator signatures don't verify against the local trustBase. **Security event** (§9.4): emit `transfer:security-alert`. Increment `proofErrorCount`; retry; then mark hard-failed (reason='proof-invalid').
+   - Transient (network, 5xx): back off; retry. Bounded by polling window.
+5. **On proof retrieval** (`verify() === OK`):
    - The proof element is content-hashed and added to the pool.
    - The pending transaction's `inclusionProof` child is updated from `null` to the new proof's ContentHash.
    - **Token identity does NOT change.** Per the audit in §2.1, `token.id` derives from `genesis.data.tokenId` and is immutable; `TransferTransactionData.calculateHash()` excludes the inclusion proof from the data hash. What DOES change is the *CBOR serialization* of the token (the proof bytes are now present), and therefore its *content-address (CID)*.
    - **Manifest CID rewrite** (introduced in this protocol, Wave T.5 — NOT Wave H, which is unrelated null-hash canonicalization): the OrbitDB profile manifest entry for this `tokenId` is updated to point at the new CID. The previous (proof-less) CID is **tombstoned** in the manifest so older copies are not re-served from peer caches.
    - Queue entry removed.
-   - All four updates (pool write, manifest CID rewrite, tombstone insert, queue removal) happen in a single OrbitDB transaction — partial application across crashes is impossible.
-6. **On hard error (`PATH_NOT_INCLUDED` / `PATH_INVALID`)**: the spec's threat model treats the aggregator as **faulty, never hostile** — but a faulty aggregator can still return wrong errors. Hard-rejection is a **strong hint, not authoritative**:
-   - Increment a `hardErrorCount` on the queue entry.
-   - If `hardErrorCount < MAX_HARD_ERROR_RETRIES` (default 3): re-submit the commitment + re-poll. (Retry-on-belief: per §6.1, the worker keeps retrying as long as the local cryptographic checks pass — the sender / forwarder believes the commitment is valid.)
-   - If `hardErrorCount >= MAX_HARD_ERROR_RETRIES`: mark the entry hard-failed, transition the token to `manifest.status='invalid'` (reason='oracle-rejected'), move to `_invalid`. Already-attached proofs from K-1 successful queue entries are kept on the now-invalid token (forensic value); only the manifest's *primary* CID is tombstoned. Queue is fully cleared for this `tokenId`.
-7. **On transient error**: increment retry count, back off, retry.
-8. **Queue-drain → status transition (atomic)**: when the worker finishes processing a queue entry, it MUST atomically check (within the same OrbitDB transaction): "are there any remaining queue entries for this `tokenId` that are NOT in a terminal-success state?"
-   - If NO remaining + no hard-failed entries: transition `manifest.status: pending → ?`. Re-run [E] (oracle.isSpent on the now-finalized current state) to choose between `'valid'` and `'unspendable'`. Re-run [D] merge-check against any new pool arrivals that landed during finalization. Re-emit `transfer:incoming` with `confirmed: true` if `valid`.
-   - If hard-failed entries exist: terminal `invalid` per step 6.
+
+   **Crash-safe write order (NOT a single OrbitDB transaction — OrbitDB's keyvalue store has no multi-key atomicity primitive):** the four writes happen in a fixed order with each step idempotent on replay:
+   ```
+   (1) pool write proof element        ← content-addressed; re-write is no-op
+   (2) manifest CID rewrite            ← idempotent; same input → same output
+   (3) tombstone insert                ← additive; duplicate insert is no-op
+   (4) queue-entry removal LAST        ← presence/absence is the durability anchor
+   ```
+   If a crash interrupts between (1) and (4), the queue entry is still present on restart; the worker re-runs steps (1)-(4); each step is idempotent so the result converges. Implementation MUST follow the order; reordering breaks crash safety.
+
+6. **Polling-window terminal**: each queue entry has a `pollingDeadline = createdAt + POLLING_WINDOW` (default 30 minutes). If `verify() === PATH_NOT_INCLUDED` is sustained across the entire polling window — i.e., every poll within the window returned PATH_NOT_INCLUDED with no OK ever observed — the worker concludes the commitment was rejected (the aggregator never anchored it; no point in continuing). Mark the queue entry hard-failed (reason='oracle-rejected').
+
+   **Why a window, not a count**: PATH_NOT_INCLUDED is a *fresh proof of non-existence at a snapshot* — perfectly valid, just not the result we wanted. The aggregator's SLA guarantees commitments are anchored within bounded time (typically <1 BFT round = ~1s). A 30-minute sustained absence is overwhelming evidence the commitment was dropped or rejected.
+
+7. **On hard-fail of any queue entry** (steps 3, 4, 6 terminal hard-fail paths):
+   - Mark the queue entry hard-failed with the canonical `DispositionReason`.
+   - **Short-circuit the chain**: per §6.1.1, ANY tx hard-fail invalidates the WHOLE token (the chain has a broken link). Immediately:
+     - Cancel polling for ALL other queue entries of this `tokenId` (no point continuing).
+     - Mark `manifest.status='invalid'` with the failing entry's reason.
+     - Move the token to `_invalid` collection.
+     - Cascade per §6.1.1 to locally-derived child tokens.
+   - Already-attached proofs from earlier-resolved queue entries are kept on the now-invalid token's CBOR (forensic value); the manifest's *primary* CID is tombstoned.
+   - Queue fully cleared for this `tokenId`.
+
+8. **On transient error (network, 5xx, etc.)**: increment retry count, back off, retry. Bounded by polling window for poll-side; bounded by `MAX_SUBMIT_RETRIES` for submit-side.
+
+9. **Queue-drain → status transition**: when a queue entry completes successfully (step 5), the worker checks: "are there any remaining queue entries for this `tokenId` that are NOT in terminal-success?"
+   - If NO remaining + no hard-failed entries: re-run **[B]** (current-state predicate target — the merged chain may have changed who owns the token), then re-run **[D]** merge-check against any new pool arrivals that landed during finalization, then re-run **[E]** (oracle.isSpent on the now-finalized current state) to choose between `'valid'` and `'unspendable'`. The transition path:
+     - [B] fails (token's current state no longer binds to us) → move to `_audit`, reason='not-our-state'. Manifest entry removed.
+     - [D] surfaces a CONFLICTING merge → `manifest.status='conflicting'` with `conflictingHeads[]`.
+     - [E] returns isSpent=true → move to `_audit`, reason='off-record-spend'. Manifest entry removed.
+     - All pass → `manifest.status='valid'`. Re-emit `transfer:incoming` with `confirmed: true`.
+   - This re-running is necessary because the token's chain may have grown via merge during finalization, AND the current-state predicate may have changed if the merge added a transfer-out we authored locally.
 
 **Tombstone retention**: tombstoned manifest CIDs are retained for `TOMBSTONE_RETENTION_DAYS` (default 30) after the canonical CID has been stable. After that, the tombstone is GC'd to prevent unbounded manifest growth in long-lived wallets.
 
@@ -685,9 +773,29 @@ A worker may need to resolve **multiple unfinalized transactions per token** (ch
 
 Trigger: outbox entry with `status: 'delivered-instant'` and one or more outstanding `commitmentRequestIds`. The list MAY contain entries for transactions the sender did not author (chain-mode forwards inherit a list of unfinalized inbound txs that the sender now also has an interest in resolving, since the token won't transition to `valid` locally until they're done).
 
-**Threat model**: the aggregator is **faulty, never hostile**. It may drop submissions, return transient errors, or even briefly return wrong hard-errors — but it will not collude to poison the token pool. The worker's strategy is therefore: trust the local cryptographic checks, persist the belief that "if our checks pass, the commitment IS valid," and re-submit until the aggregator agrees or the retry budget is exhausted.
+**Threat model**: the aggregator is **faulty, never hostile** (see §9.4 for the explicit threat-boundary). The worker's strategy is therefore: trust the local cryptographic checks, persist the belief that "if our checks pass, the commitment IS valid," and re-submit / re-poll until the aggregator agrees or a bounded budget is exhausted.
 
-Loop (default poll: 30s with exponential backoff up to 5 min):
+**Error model** (canonical, per `@unicitylabs/state-transition-sdk`):
+
+Submit-side responses (`SubmitCommitmentStatus`):
+| Response | Meaning | Worker action |
+|---|---|---|
+| `SUCCESS` | Commitment accepted; will be anchored shortly | Proceed to poll |
+| `REQUEST_ID_EXISTS` | Same commitment already submitted | Proceed to poll (idempotent) |
+| `REQUEST_ID_MISMATCH` | requestId bound to a different transactionHash | **Hard-fail (double-spend signal)**; reason='oracle-rejected' |
+| `AUTHENTICATOR_VERIFICATION_FAILED` | Aggregator's crypto check failed | **Hard-fail**; reason='belief-divergence' |
+| 5xx / network error | Transient | Retry with backoff up to `MAX_SUBMIT_RETRIES` |
+
+Poll-side proof-verify outcomes (`InclusionProofVerificationStatus`):
+| Status | Meaning | Worker action |
+|---|---|---|
+| `OK` | Proof verifies; commitment anchored | Attach proof per §5.5 step 5 |
+| `PATH_NOT_INCLUDED` | Verifiable proof of non-existence at this snapshot | **Continue polling** within window |
+| `PATH_INVALID` | Proof structurally malformed | Retry up to `MAX_PROOF_ERROR_RETRIES`, then hard-fail; reason='proof-invalid' |
+| `NOT_AUTHENTICATED` | Validator sigs don't verify against trustBase | Emit `transfer:security-alert`; retry, then hard-fail; reason='proof-invalid' |
+| 5xx / network error | Transient | Retry with backoff |
+
+Loop (default poll interval: 30s with exponential backoff up to 5 min; polling window: 30 min default):
 
 ```
 For each pending requestId in outbox.commitmentRequestIds:
@@ -695,30 +803,52 @@ For each pending requestId in outbox.commitmentRequestIds:
    re-verify locally: ECDSA authenticator + source-state continuity +
      commitmentRequestId derivation. If any fails → terminal
      STRUCTURAL_INVALID for the queue entry.
-   submit commitment to aggregator (idempotent — re-submission of an
-     already-known commitment is a no-op).
-   try fetchInclusionProof(requestId):
-     proof.verify(trustBase, requestId):
-       OK → attach proof atomically per §5.5 step 5 (token.id unchanged;
-            only CID changes). Remove requestId from outbox.
-       PATH_INVALID / NOT_AUTHENTICATED →
-            log a security note (the proof itself is well-formed but
-            doesn't verify against trustBase — possible forged proof OR
-            faulty aggregator). Increment hardErrorCount. If <
-            MAX_HARD_ERROR_RETRIES (default 3): retry. If >=: mark
-            queue entry hard-failed.
-       PATH_NOT_INCLUDED →
-            aggregator says the commitment isn't in the SMT. Increment
-            hardErrorCount. If < MAX_HARD_ERROR_RETRIES: re-submit the
-            commitment (the aggregator may have dropped it) and re-poll.
-            If >=: mark queue entry hard-failed.
-     no response (transient) →
-            increment retryCount; reschedule with backoff.
-   if all requestIds for tokenId are resolved AND no hard-failed entries:
+
+   submit commitment to aggregator:
+     SUCCESS / REQUEST_ID_EXISTS → continue to poll.
+     REQUEST_ID_MISMATCH        → hard-fail, reason='oracle-rejected'.
+                                  (Source state has a different
+                                  transition committed — local belief
+                                  diverged from canonical chain.)
+     AUTHENTICATOR_VERIFICATION_FAILED →
+                                  hard-fail, reason='belief-divergence'.
+     transient                  → retry up to MAX_SUBMIT_RETRIES.
+
+   poll loop (until pollingDeadline = entry.createdAt + POLLING_WINDOW):
+     fetchInclusionProof(requestId).verify(trustBase, requestId):
+       OK                       → attach proof per §5.5 step 5;
+                                  remove queue entry; done.
+       PATH_NOT_INCLUDED        → keep polling (this is a fresh proof
+                                  that the commitment is NOT YET in the
+                                  SMT — bounded transient).
+       PATH_INVALID             → emit security note; retry up to
+                                  MAX_PROOF_ERROR_RETRIES. If exhausted:
+                                  hard-fail, reason='proof-invalid'.
+       NOT_AUTHENTICATED        → emit transfer:security-alert; retry
+                                  similarly. Hard-fail same.
+       transient                → backoff; retry.
+
+   if poll loop exits because pollingDeadline reached AND only ever saw
+     PATH_NOT_INCLUDED:
+       hard-fail, reason='oracle-rejected'.
+       (Sustained PATH_NOT_INCLUDED across the window = aggregator
+       never anchored this commitment.)
+
+   on hard-fail of ANY queue entry for this tokenId:
+     short-circuit: cancel polling for all other queue entries of
+       this tokenId (chain is dead);
+     mark token 'invalid' with the failing reason;
+     move to _invalid;
+     cascade to locally-derived children per §6.1.1.
+
+   if all requestIds for tokenId resolved OK:
+     re-run [B], [D], [E] per §5.5 step 9;
      transition outbox entry to 'finalized'.
-   if any requestId is hard-failed (retries exhausted):
-     transition outbox entry to 'failed-permanent', cascade per §6.1.1.
 ```
+
+**Per-token parallelism**: the worker MAY poll multiple `commitmentRequestIds` of the same token concurrently, bounded by `MAX_CONCURRENT_POLLS_PER_TOKEN` (default 4). Concurrent polling reduces wall-clock latency for chain-mode tokens but should not flood a single aggregator endpoint.
+
+**Per-aggregator concurrency**: the worker MAY enforce a global cap on in-flight polls per aggregator endpoint (default 16) to prevent the worker itself from DoS-ing the aggregator under a wide chain-mode burst.
 
 #### 6.1.1 Cascade on hard-rejection
 
@@ -731,10 +861,16 @@ When a queue entry hard-fails (retries exhausted), the token is marked invalid. 
 
 Cascade is **monotonic** — a cascaded `invalid` disposition cannot be reversed even if the aggregator later somehow returns a valid proof for the parent's tx (which it shouldn't, given the threat model — but if it does, the operator must explicitly re-import the bundle).
 
+**Cascade-risk warning to caller**: an instant-mode split issued from a still-pending parent inherits the parent's cascade risk. The SDK MUST surface this to the caller in two ways:
+1. The `send()` result includes `splitParent: { tokenId, status: 'pending' | 'valid' }` whenever the result includes a freshly-minted child token. Callers can inspect `splitParent.status === 'pending'` and decide whether to gate their UX on parent finalization.
+2. The SDK emits `transfer:cascade-risk-warning` events when a downstream send is composed from a still-pending parent: `{ childTokenId, parentTokenId, parentStatus }`.
+
+Optional gate: callers MAY pass `requireParentFinalized: true` to `send()`; the SDK will reject with `PARENT_NOT_FINALIZED` if any source token has unfinalized chain history. Default: `false` (instant splits are allowed).
+
 #### 6.1.2 Outbox terminal states
 
 - `finalized` — every proof attached cleanly.
-- `failed-permanent` — any oracle hard-rejection after `MAX_HARD_ERROR_RETRIES`. Operator may inspect via `_invalid` records and decide whether to escalate.
+- `failed-permanent` — any of: submit-side `REQUEST_ID_MISMATCH` / `AUTHENTICATOR_VERIFICATION_FAILED`, sustained `PATH_NOT_INCLUDED` past polling window, retry-exhausted `PATH_INVALID` / `NOT_AUTHENTICATED`, or two-replica `OUTBOX_RACE_LOST`. Operator may inspect via `_invalid` records and decide whether to escalate.
 - `failed-transient` — transient errors exhausted the retry budget. Worker stops; operator MAY trigger manual retry via `payments.retryFinalize(outboxEntryId)`.
 
 ### 6.2 Recipient-side finalization worker
@@ -753,18 +889,49 @@ The merge path (§5.5 last paragraph) provides an alternative: if a more-finaliz
 2. **Token CID equality** — the IPFS content-address of the serialized token. This DOES change when proofs are attached (the CBOR encoding gains the proof bytes). Both sides converge to the SAME final CID *only when they have attached the same set of proofs*.
 
 **Proof sketch**:
-1. For each unfinalized tx, the aggregator publishes its proof at most once **assuming the aggregator is not faulty** (idempotency of `getInclusionProof`). This is documented behavior of `aggregator-go`'s JSON-RPC `get_inclusion_proof` method; not yet asserted by an SDK-level regression test, but implementations SHOULD add one. If a faulty aggregator returns two structurally-different-but-both-valid proofs for the same requestId (different witness paths through the same SMT), the protocol canonicalizes by selecting the proof with the lexicographically-minimum CID — this is the byte-identical proof both finalizers will keep after merge.
+1. For each unfinalized tx, the aggregator publishes its proof at most once **assuming the aggregator is not faulty** (idempotency of `getInclusionProof`). This is documented behavior of `aggregator-go`'s JSON-RPC `get_inclusion_proof` method; not yet asserted by an SDK-level regression test, but implementations SHOULD add one. If a faulty aggregator returns two structurally-different-but-both-valid proofs for the same requestId (different witness paths through the same SMT), the protocol canonicalizes by selecting the proof with the lexicographically-minimum CID. **Comparison rule** (canonical, used both here and in §5.3 [D-conflict] tie-breaking): compare CIDs as **raw CIDv1 binary form** — i.e., the multibase-decoded byte sequence. NOT base32 string comparison (which would be sensitive to multibase prefix and casing). Two CIDs are compared by `Buffer.compare(cidA.bytes, cidB.bytes)`.
 2. Both finalizers fetch each pending proof independently. Both attach byte-identical `inclusion-proof` elements to byte-identical transaction objects.
 3. The transaction's data hash (`TransferTransactionData.calculateHash()`) is unchanged — proofs are not in its preimage. So the per-tx CID changes (the encoded form is different) but the `transactionHash` referenced *by* the inclusion proof remains the same.
 4. The token's `id` is unchanged throughout. The token's CID — the content-address of its CBOR encoding — converges once both sides have the same proof set attached.
 5. Both manifests update `tokenId → newCid` and set `status='valid'` once all unfinalized txs in the chain are resolved AND the [E] re-run confirms `oracle.isSpent === false`.
 6. Subsequent `pkg.merge` between the two pools dedupes via Wave G.3 (identical content → identical CID); the merge is a no-op.
 
-**Failure mode (aggregator hard-rejects a commitment)**: both finalizers retry up to `MAX_HARD_ERROR_RETRIES`, then mark the token `invalid` per §6.1. Convergent on the invalid disposition. The token stays in `_invalid` on both sides.
+**Failure mode (aggregator hard-rejects a commitment)**: both finalizers see the same hard-rejection signal (per §6.1 error model — `REQUEST_ID_MISMATCH` at submit, or sustained `PATH_NOT_INCLUDED` over the polling window). Both mark the token `invalid` per §6.1. Convergent on the invalid disposition. The token stays in `_invalid` on both sides.
 
 **Asymmetric-knowledge mode (one side has more proofs than the other, no network)**: as long as the more-knowledgeable copy reaches the lagging side via any channel (a second Nostr delivery, a backup import, an IPFS pull) the merge is monotonic — proofs accumulate. Convergence does not require both sides to ever reach the aggregator.
 
-**Stuck-PENDING escape hatch**: if neither side reaches the aggregator AND they don't reach each other, the token is `PENDING` indefinitely. The SDK exposes `payments.importInclusionProof(tokenId, proofBytes)` which validates the proof against the trustBase; if it matches an outstanding queue entry's requestId, it is grafted in (same atomic update as §5.5 step 5). UI surfaces stuck-pending tokens after a configurable timeout (default 7 days) so the operator can paste in a proof obtained out-of-band.
+**Stuck-PENDING escape hatch**: if neither side reaches the aggregator AND they don't reach each other, the token is `PENDING` indefinitely. The SDK exposes:
+
+```typescript
+function importInclusionProof(
+  tokenId: string,
+  proofBytes: Uint8Array,
+  options?: { allowInvalidOverride?: boolean }
+): ImportProofResult;
+
+type ImportProofResult =
+  | { ok: true; transition: 'pending-still' | 'pending→valid' | 'pending→unspendable' }
+  | { ok: false; reason:
+      | 'no-such-token'           // tokenId not in our pool, _invalid, or _audit
+      | 'tokenId-already-valid'   // token is already manifest.status='valid'; idempotent no-op
+      | 'tokenId-in-invalid'      // token is in _invalid; requires allowInvalidOverride
+      | 'proof-trustbase-failed'  // proof.verify(trustBase) returned not-OK
+      | 'proof-not-anchored'      // verify returned PATH_NOT_INCLUDED — proof shows non-existence
+      | 'requestid-mismatch'      // proof's requestId doesn't match any outstanding queue entry
+    };
+```
+
+Behavior cases:
+1. **tokenId not in pool / _invalid / _audit**: `{ ok: false, reason: 'no-such-token' }`. The SDK has no context for the proof.
+2. **tokenId is `valid`**: `{ ok: true, transition: 'pending-still' }` — idempotent no-op. The proof was already attached.
+3. **tokenId is `pending`, proof matches an outstanding queue entry's requestId**: validates against trustBase; if `verify() === OK`, grafts in per §5.5 step 5. May trigger queue drain → `pending → valid` (or `pending → unspendable` if isSpent re-check returns true).
+4. **tokenId is `pending`, proof doesn't match any outstanding requestId**: `{ ok: false, reason: 'requestid-mismatch' }`. The proof is for a different transition.
+5. **tokenId is in `_invalid` AND `allowInvalidOverride === true`**: validates the proof; if OK, MOVES the token from `_invalid` back to active pool with `manifest.status='valid'` (the prior invalidation was wrong — the original aggregator response was faulty, the proof now demonstrates the correct anchored state). This is the explicit operator override of the §5.6 monotonicity invariant.
+6. **tokenId is in `_invalid` AND no override flag**: `{ ok: false, reason: 'tokenId-in-invalid' }`.
+7. **Proof verify returns `PATH_NOT_INCLUDED`**: `{ ok: false, reason: 'proof-not-anchored' }`. The proof is a valid proof of NON-existence; it doesn't help unstick.
+8. **Proof verify returns `PATH_INVALID` / `NOT_AUTHENTICATED`**: `{ ok: false, reason: 'proof-trustbase-failed' }`.
+
+UI surfaces stuck-pending tokens after a configurable timeout (default 7 days) so the operator can paste in a proof obtained out-of-band. The 7-day timer DOES reset on any successful state transition (e.g., partial graft of K-1 of K queue entries restarts the clock for the remaining one).
 
 **Crash recovery**: outbox + finalization queue are persisted to OrbitDB; both survive process restart. After restart, the worker resumes polling. The atomic-update rule in §5.5 step 5 ensures no double-attach. Pre-publish persistence ordering: the OrbitDB write that sets `status: 'sending'` (or `'delivered-instant'`) MUST be committed before the Nostr publish is dispatched; if the crash lands between OrbitDB commit and Nostr publish, the worker re-publishes on restart (idempotent for the recipient — bundleCid is content-addressed; same input → same bundle).
 
@@ -801,19 +968,32 @@ interface UxfTransferOutboxEntry {
     | 'finalized'                    // proof attached locally; instant mode terminal
     | 'failed-transient'             // delivery or finalization failed; retry pending
     | 'failed-permanent';            // unrecoverable (oracle rejection, etc.)
-  /** Instant-mode commitment requestIds to finalize (by sender's worker). */
-  readonly commitmentRequestIds?: readonly string[];
+  /** Instant-mode commitment requestIds, partitioned into outstanding
+   *  (still being polled / submitted) and completed (proof attached or
+   *  hard-failed). Two-set form is required for CRDT merge semantics
+   *  per §7.1 — set-union on the merged single list would re-add
+   *  finalized requestIds to the outstanding pool and trigger
+   *  re-submission. */
+  readonly outstandingRequestIds?: readonly string[];
+  readonly completedRequestIds?: readonly string[];
   /** Memo. */
   readonly memo?: string;
   /** Timestamps. */
   readonly createdAt: number;
   readonly updatedAt: number;
+  /** Lamport timestamp for CRDT tie-breaking on simultaneous writes. */
+  readonly lamport: number;
   /** Error info if failed. */
   readonly error?: string;
-  /** Retry count. */
-  readonly retryCount: number;
+  /** Retry counters. */
+  readonly submitRetryCount: number;
+  readonly proofErrorCount: number;
   /** Soft deadline for transient retry abandonment. */
   readonly retryDeadline?: number;
+  /** Polling deadline for instant-mode finalization. After this time,
+   *  sustained PATH_NOT_INCLUDED transitions the entry to failed-permanent
+   *  with reason='oracle-rejected'. */
+  readonly pollingDeadline?: number;
 }
 ```
 
@@ -821,7 +1001,7 @@ The outbox is stored in **OrbitDB**. PROFILE-ARCHITECTURE.md §10.12 declares th
 
 ### 7.0 Status transition table
 
-Outbox entries follow this state machine. Transitions outside the table are forbidden (in particular: `finalized → sending` MUST never happen on a CRDT merge — see §7.2 OrbitDB invariants).
+Outbox entries follow this state machine. Transitions outside the table are forbidden.
 
 ```
 Initial: packaging
@@ -829,33 +1009,52 @@ Initial: packaging
   packaging  ──pin/encode complete──► [pinned]  (UXF cid-mode only; UXF car-mode skips this)
   packaging  ──serialize complete───► sending   (UXF car-mode + TXF)
   pinned     ──ipfs pin acknowledged─► sending
+  pinned     ──publish-dispatch fails─► failed-transient   (post-pin transport failure)
 
   sending    ──Nostr publish ack ────► delivered          (conservative UXF, conservative TXF)
   sending    ──Nostr publish ack ────► delivered-instant  (instant UXF, instant TXF)
   sending    ──publish error ────────► failed-transient
 
-  delivered  ──garbage-collected────► (terminal: removed)
+  delivered  ──retention window expires─► expired (terminal: removed)
   delivered-instant ──worker starts──► finalizing
   finalizing ──all proofs attached──► finalized
-  finalizing ──hard-error budget ────► failed-permanent
+  finalizing ──any tx hard-fail ─────► failed-permanent  (per §6.1.1 short-circuit)
   finalizing ──transient budget ─────► failed-transient
 
   failed-transient ──manual retry────► sending
   failed-transient ──cap ────────────► failed-permanent
+  failed-permanent ──importInclusionProof ack► finalizing  (operator escape-hatch override)
 
-  finalized       ──garbage-collected► (terminal: removed)
-  failed-permanent (terminal — operator inspection only)
+  finalized       ──retention window expires► expired (terminal: removed)
+  expired (terminal: garbage-collected)
+  failed-permanent (terminal except via the import-proof override)
 ```
+
+State partition (used by §7.1 CRDT merge rule):
+- **Active** (worker may still progress): `packaging`, `pinned`, `sending`, `delivered`, `delivered-instant`, `finalizing`.
+- **Terminal** (no further worker progress without operator action): `expired`, `finalized`, `failed-permanent`, `failed-transient`.
+
+> Note: `failed-transient` is technically eligible for `manual retry → sending`, but it is treated as **terminal** for CRDT merge purposes (a replica with `failed-transient` is "more decisively known" than one in mid-progress). Manual retry is an operator action and creates a new transition that supersedes the merge result.
 
 ### 7.1 OrbitDB CRDT invariants
 
-The outbox is persisted in OrbitDB. OrbitDB has eventual-consistency (CRDT) semantics across replicas (e.g., desktop wallet + browser wallet for the same identity). To prevent state-machine corruption under replica merge:
+The outbox is persisted in OrbitDB. OrbitDB has eventual-consistency (CRDT) semantics across replicas (e.g., desktop wallet + browser wallet for the same identity). The keyvalue store has only per-key `put`/`get`/`del` primitives; cross-key atomicity is NOT provided by the adapter (`profile/orbitdb-adapter.ts:331-378`).
 
-- `status` updates use a **monotonic state machine** as the LWW resolution rule. The transition graph above defines the partial order; on replica merge, the *more advanced* state wins. (E.g., `delivered-instant` > `sending`; `finalized` > `delivered-instant`.)
-- `commitmentRequestIds` is naturally idempotent (set semantics) — replica merge unions the sets.
-- `retryCount` and `hardErrorCount` use max-merge across replicas (CRDT G-counter shape).
-- `error` field is overwritten by the most recent status-advancing replica.
-- Spend protection comes from the aggregator (which enforces single-spend at the SMT level), not from the outbox. A replica rollback that re-creates an outbox entry for an already-transferred source state will fail at the next aggregator submission with `PATH_NOT_INCLUDED`, and the worker's `MAX_HARD_ERROR_RETRIES` budget will then surface the failure. The outbox is bookkeeping, NOT a spend lock.
+**Conflict resolution rules under replica merge:**
+
+1. **Status field — partition then ordered:**
+   - If both replicas are in **terminal** states: prefer `finalized` over any `failed-*`. If both terminals are `failed-*`, prefer `failed-permanent` over `failed-transient`. Tie-break by Lamport timestamp (lower wins; the earlier-decided terminal sticks).
+   - If one is **terminal** and one is **active**: terminal wins.
+   - If both are **active**: prefer the more-advanced state per the lattice `packaging < pinned < sending < {delivered, delivered-instant} < finalizing`. Among `delivered` and `delivered-instant` (siblings — different finalization modes for the same send), tie-break by Lamport timestamp; the earlier write wins because the mode was a caller decision and doesn't change mid-flight.
+2. **`outstandingRequestIds` set:** merge as `union(replica_A_outstanding, replica_B_outstanding) - union(replica_A_completed, replica_B_completed)`. This prevents finalized requestIds from being re-added by a stale replica. Set-union alone would re-trigger submissions.
+3. **`completedRequestIds` set:** merge as straight `union(replica_A_completed, replica_B_completed)` — completed never un-completes.
+4. **`submitRetryCount`, `proofErrorCount`:** max-merge (CRDT G-counter shape).
+5. **`error` field:** the replica with the more-advanced `status` wins; among equal-status replicas, the earlier Lamport timestamp wins (the first-decided error is preserved).
+6. **`lamport` timestamp:** max-merge.
+
+**Spend protection** comes from the aggregator's `requestId` invariant, NOT from the outbox. A replica rollback that re-creates an outbox entry for an already-transferred source state will hit `REQUEST_ID_MISMATCH` at the next aggregator submission (the requestId is bound to the prior committed transactionHash). The worker hard-fails with reason='oracle-rejected'; the outbox correctly records that this re-attempt failed. The source token's actual on-chain state is untouched.
+
+**Two-replica race on `send()` from same source state**: replicas A and B simultaneously fire `send()` from the same source token. Each generates a fresh-random salt → different `transactionHash` but identical `requestId`. Both submit to the aggregator. First-arriving wins SUCCESS; second gets `REQUEST_ID_MISMATCH`. Loser's outbox entry transitions to `failed-permanent` with a distinguished error code `OUTBOX_RACE_LOST` (reason=`'race-lost'`). The cascade rule (§6.1.1) does NOT fire for `race-lost` — the source token is genuinely valid; the loser's `send()` simply lost the race and the recipient never got a bundle.
 
 ### 7.2 Migration from legacy outbox
 
@@ -901,11 +1100,13 @@ The on-chain spent state is checked via `oracle.isSpent(stateHash)` — a single
 - Retry via outbox `failed-transient` state with exponential backoff up to a hard cap (default 24 hours).
 - After cap: `failed-permanent`. Local bookkeeping is updated to reflect that the bundle did not reach the recipient.
 
-**Why double-spend is impossible at the protocol level**: the aggregator enforces single-spend at the SMT level. Once a commitment for source state S has been accepted, the aggregator will reject any subsequent commitment from S with `PATH_NOT_INCLUDED`. The local outbox status is bookkeeping; it does NOT gate spend protection. If the sender's `failed-permanent` recovery path attempts a fresh `send()` from the same source token (e.g., to a different recipient because the original delivery failed), one of two things happens:
-1. The original commitment WAS accepted by the aggregator → the new send will fail at submission time with `PATH_NOT_INCLUDED`. The sender's worker treats this per §6.1 (retries up to budget, then `failed-permanent`). The token is genuinely already-transferred.
-2. The original commitment was NEVER accepted → the new send succeeds normally. The first transfer never happened on-chain.
+**Why double-spend is impossible at the protocol level**: the aggregator enforces single-spend at the SMT level via the `requestId` invariant. The requestId is `Hash(publicKey, sourceStateHash)` — deterministic given a (sender pubkey, source state). Two different signed transitions from the same source state produce DIFFERENT `transactionHash` values but the SAME `requestId`. The aggregator's submit endpoint detects this:
 
-In neither case is double-spend possible. The aggregator's single-spend invariant is the trust anchor; outbox state cannot violate it.
+- If the original commitment was accepted, it is now bound to its `transactionHash` at the requestId. A fresh `send()` from the same source state generates a new `transactionHash` (different salt, different recipient, etc.). When the sender submits the new commitment, the aggregator returns `REQUEST_ID_MISMATCH` — the requestId exists but with a different transactionHash — explicitly the double-spend detector. The sender's worker hard-fails with reason='oracle-rejected'.
+- If the original commitment was NEVER accepted (the aggregator dropped the submission), the new send succeeds normally. The first transfer never happened on-chain.
+- If the sender retries the EXACT same commitment (same salt, same transactionHash), the aggregator returns `REQUEST_ID_EXISTS` (idempotent re-submission); the worker proceeds to poll.
+
+In no case can the sender create two valid commitments for the same source state. Local outbox state is bookkeeping and cannot violate this invariant. The aggregator's single-spend invariant is the trust anchor.
 
 For **conservative mode** with delivery failure post-acceptance: the on-chain commitment exists (token is spent according to the aggregator), but the recipient never learned. Recovery options:
 - Re-send the same UXF bundle (same CID — idempotent at the recipient).
@@ -931,21 +1132,49 @@ For **instant mode** with delivery failure: same recovery — the sender's local
 
 **Threat-model note**: encrypted Nostr DMs already disclose the recipient's pubkey to anyone who wants to attempt delivery, so silent-drop is NOT motivated by hiding online presence. The reason for not surfacing rejection acknowledgments is to avoid amplifying spam — an attacker probing for live recipients via crafted bundles. Legitimate senders whose payload is rejected for content reasons (e.g., capability mismatch, force-cid bundle that fails to fetch) DO surface a typed error to the application layer; only spam-policy rejections are silent.
 
-### 9.4 Aggregator hard-rejection (PATH_NOT_INCLUDED / PATH_INVALID)
+### 9.4 Aggregator rejection — terminal hard-fail
 
-The aggregator rejected a commitment. Per §6.1 retry-on-belief, the worker retries up to `MAX_HARD_ERROR_RETRIES` (default 3) before treating the rejection as terminal. After the budget is exhausted:
+A queue entry transitions to terminal hard-fail through one of these paths (per §6.1):
 
-- The specific failing transaction is marked invalid (reason='oracle-rejected').
-- Per §6.1.1 cascade rule, locally-derived child tokens of this token are also marked `'invalid'` with reason='parent-rejected'.
+| Path | Trigger | Reason |
+|---|---|---|
+| Submit-side `REQUEST_ID_MISMATCH` | Source state already has a different transition committed | `oracle-rejected` (canonical double-spend signal) |
+| Submit-side `AUTHENTICATOR_VERIFICATION_FAILED` | Aggregator rejected our crypto | `belief-divergence` |
+| Poll-side sustained `PATH_NOT_INCLUDED` over POLLING_WINDOW | Commitment was never anchored | `oracle-rejected` |
+| Poll-side `PATH_INVALID` after retries | Proof structurally malformed | `proof-invalid` |
+| Poll-side `NOT_AUTHENTICATED` after retries | Validator sigs forged or trustBase stale | `proof-invalid` (also: `transfer:security-alert`) |
+
+After hard-fail:
+- The specific failing transaction is marked invalid with the canonical reason.
+- Per §6.1.1 cascade rule, locally-derived child tokens of this token are also marked `'invalid'` with reason=`'parent-rejected'`.
 - The **source token (parent)** is untouched — the failed transition is treated as if it never happened. The aggregator's single-spend invariant means the token remains in its prior valid state in the original owner's pool.
 
 **No refund / reversal protocol is needed** (per §12.1).
 
 **Mode-specific severity**:
-- **Instant mode**: this is a routine outcome — the sender shipped before knowing the aggregator's verdict. The sender / recipient simply mark the attempted transfer invalid and move on. No security implications.
-- **Conservative mode**: the sender retrieved the proof BEFORE shipping the bundle. A `PATH_NOT_INCLUDED` at the recipient side after a conservative-mode delivery means EITHER (a) the proof was forged (sender malicious or buggy), OR (b) the aggregator's state has changed since the proof was issued (validator dispute / BFT fork — extremely unusual). This is a `transfer:security-alert` event, NOT a routine no-op. The recipient surfaces it for operator review.
+- **Instant mode**: a hard-fail is a routine outcome of optimistic shipping — the sender went before knowing the aggregator's verdict. No security implications unless reason ∈ {`belief-divergence`, `proof-invalid`}.
+- **Conservative mode**: the sender retrieved a proof BEFORE shipping the bundle. A poll-side `NOT_AUTHENTICATED` or `PATH_INVALID` at the recipient side after conservative delivery means EITHER (a) the proof was forged (sender malicious or buggy), OR (b) the aggregator's BFT-signed state changed since the proof was issued (validator dispute — see §9.4.1 threat boundary). This is a `transfer:security-alert` event regardless of mode — operator inspection required.
 
-For the chain-mode case, only the specific failing tx is invalidated and the cascade rule fires for downstream children. Finalization for other unfinalized txs in the same token's chain continues independently — but the moment any tx hard-fails, the WHOLE token is invalid (the chain has a broken link), so the other queue entries are cleared per §5.5 step 6.
+#### 9.4.1 Threat boundary (faulty vs hostile)
+
+The protocol assumes the aggregator is **faulty, never hostile**. Faulty means:
+- May drop submissions (transient → retry).
+- May return transient errors (5xx, network hiccups → retry).
+- May briefly return inconsistent state (e.g., `PATH_NOT_INCLUDED` on a poll for a commitment another peer just got `OK` for, due to not-yet-replicated state across aggregator nodes → keep polling within the window).
+
+In-scope failure modes the protocol defends against:
+- Aggregator drops or delays a submission. Worker retries; eventually anchored or POLLING_WINDOW expires.
+- Aggregator briefly returns wrong errors (one node out of date). Worker retries; consistent answer eventually.
+- Aggregator is unavailable. Worker keeps retrying within transient budget; UI surfaces stuck-PENDING after 7 days; operator can paste in a proof out-of-band via `payments.importInclusionProof`.
+
+Out-of-scope failure modes (the protocol does NOT defend against; if these occur, the trust assumption is violated):
+- Aggregator signs valid proofs for transitions not in its SMT (active forgery). Detected by recipient's local trustBase verify, but only if the trustBase is up-to-date.
+- Aggregator collusion across BFT validators to rewrite history. Detection at the BFT layer is out-of-scope here; if it happens, the recipient may store a `valid` token whose chain is later contradicted by a corrected aggregator — manual operator escalation required.
+- Aggregator deliberately returns inconsistent answers to different callers (split-brain). The lex-min CID canonicalization in §6.3 handles inadvertent split-brain (different witness paths through the same SMT); deliberate split-brain on different SMT roots is a hostile-aggregator scenario and out of scope.
+
+The `transfer:security-alert` event is emitted whenever the worker observes a signal consistent with the out-of-scope failure modes (e.g., `NOT_AUTHENTICATED` on a proof, or two structurally-different valid proofs for the same requestId). The event is informational — the protocol does not auto-recover; an operator must investigate.
+
+For the chain-mode case, only the specific failing tx is the trigger, but the cascade rule (§6.1.1) and the §5.5 step 7 short-circuit ensure the WHOLE token is invalidated immediately upon any chain link's hard-fail.
 
 ### 9.5 Sender restarts mid-finalization
 
@@ -1071,9 +1300,12 @@ The implementation MUST include:
 - Recipient's local clock skewed by 30 days → finalization worker still runs (no clock-dependent guards).
 - Chain-mode forwarder dies mid-chain: the token's queue carries entries for the predecessor's pending tx; finalization still completes via the local worker (predecessor's signedTx is in the bundle the forwarder received).
 - Forged authenticator on an unfinalized tx (tx claims to be signed by previous owner but isn't) → §5.3 [C](1) ECDSA verify fails → `PROOF_INVALID`. **Critical**: this MUST be detected at receive, not deferred to aggregator-poll time.
-- **Bandwidth-burning peer**: malicious sender forwards a 10-deep chain where tx #3's commitment was rejected at the aggregator. Recipient's worker hits `PATH_NOT_INCLUDED` after 3 retries on tx #3, marks token invalid. Test verifies (a) the bundle is processed correctly, (b) the recipient applies a peer-reputation penalty (configurable cooldown, e.g., 1-hour silent-drop window for further bundles from that pubkey), (c) chain-depth cap fires for bundles with >64 unfinalized txs.
-- **Faulty-aggregator path**: aggregator returns `PATH_NOT_INCLUDED` for a commit the sender's local crypto verifies as valid → worker re-submits up to `MAX_HARD_ERROR_RETRIES`; if the aggregator eventually accepts (intermittent fault) → token finalizes correctly; if all retries exhausted → token marked invalid with reason='oracle-rejected'.
-- **Conservative-mode post-send PATH_NOT_INCLUDED** (security event): test that the recipient emits `transfer:security-alert` rather than treating it as a routine no-op.
+- **Bandwidth-burning peer**: malicious sender forwards a 10-deep chain where tx #3's commitment was hard-failed at the aggregator (REQUEST_ID_MISMATCH on submit). Recipient's worker hits the hard-fail at tx #3; per §6.1 short-circuit, the WHOLE token is marked invalid immediately and other queue entries are cancelled. Test verifies (a) the bundle is processed correctly, (b) the chain-depth cap fires for bundles with >64 unfinalized txs in the *claimed* tokenIds (smuggled deep roots are silently dropped per §5.2 #3 — separately tested).
+- **Peer-reputation cooldown (deferred)**: assertion that the recipient applies a 1-hour silent-drop window for further bundles from a peer that recently shipped a hard-failing chain — DEFERRED per §12.2 (peer-reputation framework not in T.1-T.8). Add this test only when the framework lands.
+- **Faulty-aggregator path (intermittent PATH_NOT_INCLUDED)**: aggregator returns PATH_NOT_INCLUDED transiently (e.g., across an aggregator-node-restart). Worker keeps polling; eventually one poll returns OK and the token finalizes correctly. Verify that the worker DOES NOT terminate on first PATH_NOT_INCLUDED (it's the not-yet status, not a hard-fail).
+- **Aggregator hard-rejection at submit**: REQUEST_ID_MISMATCH returned (double-spend signal). Worker hard-fails immediately; token to `_invalid` with reason='oracle-rejected'; cascade fires on locally-derived children.
+- **Sustained PATH_NOT_INCLUDED past polling window**: simulate aggregator that persistently returns PATH_NOT_INCLUDED for the entire 30-min window. Worker hard-fails with reason='oracle-rejected' after the deadline.
+- **Conservative-mode post-send PATH_INVALID / NOT_AUTHENTICATED** (security event): test that the recipient emits `transfer:security-alert` rather than treating it as a routine no-op.
 - **OrbitDB CRDT replica merge**: simulate two replicas writing different `status` updates for the same outbox entry concurrently — verify monotonic-state-machine LWW resolution (more-advanced state wins), no `finalized → sending` regressions.
 - **Stuck-PENDING escape**: token is `pending` for >7 days; operator pastes in a proof via `payments.importInclusionProof()` → proof grafts in, token transitions to `valid`.
 
@@ -1083,7 +1315,7 @@ The implementation MUST include:
 
 ### 12.1 Resolved
 
-- **Refund / reversal protocol on aggregator rejection**: NOT needed. If the aggregator rejects a commitment submission (`PATH_NOT_INCLUDED`), the transaction is treated as if it never happened — the source token is still in its prior valid state. Both sender and recipient mark the *attempted* transition as invalid, but the underlying token is unchanged. No reversal flow required. (Per-history-tx invalidations propagate up to the whole-token level; see §5.5 step 5 + §6.3 failure mode.)
+- **Refund / reversal protocol on aggregator rejection**: NOT needed. The hard-rejection signals are `REQUEST_ID_MISMATCH` (at submit) or sustained `PATH_NOT_INCLUDED` over the polling window — see §6.1 error model. In either case, the transaction is treated as if it never happened — the source token is still in its prior valid state. Both sender and recipient mark the *attempted* transition as invalid, but the underlying token is unchanged. No reversal flow required. (Per-history-tx invalidations propagate up to the whole-token level; see §6.1.1 cascade rule + §6.3 failure mode.)
 - **Aggregator-driven inbound discovery**: NOT possible. The aggregator never holds the full transaction — only its commitment. A recipient who never received the Nostr/UXF delivery cannot reconstruct the token from the aggregator alone. Existing payment-request + reconciliation flows are the recovery path.
 
 ### 12.2 Deferred
@@ -1102,7 +1334,7 @@ The implementation MUST include:
 The implementation will land in waves:
 
 - **Wave T.1** — Wire-format types. `UxfTransferPayload` discriminated union, `DeliveryStrategy`, `transferMode: 'instant' | 'conservative' | 'txf'`, `txfFinalization: 'instant' | 'conservative'`, payload encode/decode helpers, unit tests. Audit and update existing `TransferMode` exhaustiveness checks (breaking-widening per §10.1). Add `_audit` collection key to `PROFILE_KEY_MAPPING`. Define `DispositionReason` and `AuditStatus` enums.
-- **Wave T.2** — Sender bundle construction for **conservative mode** (UXF wire) + CAR-embed delivery with the 16 KiB default cap + `force-inline` / `force-cid` / custom `inlineCapBytes` per-call overrides. NIP-11 relay-discovery for the inline ceiling. Conservative ships first because the chain has no unfinalized tail when it goes out. Sender also walks the source token's history and finalizes any inherited pending txs before bundle build.
+- **Wave T.2** — Sender bundle construction for **conservative mode** (UXF wire) + CAR-embed delivery with the 16 KiB default cap + `force-inline` / `force-cid` / custom `inlineCapBytes` per-call overrides. Fixed conservative 96 KiB hard ceiling; NIP-11 relay-discovery is deferred per §12.2. Publish-time relay-rejection auto-falls-back to CID for `delivery: 'auto'`. Conservative ships first because the chain has no unfinalized tail when it goes out. Sender also walks the source token's history and finalizes any inherited pending txs before bundle build.
 - **Wave T.3** — Recipient bundle ingest + decision matrix + storage outcomes. Implements §5.3 [A]–[F] including:
   - Throw-path → STRUCTURAL_INVALID escapes at every branch.
   - Mandatory ECDSA authenticator verification at [C](1) — full crypto, not deferred.
@@ -1120,10 +1352,10 @@ The implementation will land in waves:
   - Manifest-CID-rewrite is **NEW** in this wave (NOT Wave H — Wave H is unrelated null-hash canonicalization).
   - Tombstone retention (default 30 days post-canonical-stable).
   - Merge-path enrichment: arriving a more-finalized copy of an existing pending token grafts proofs in (Wave G.3 rule 4 extension).
-  - Retry-on-belief loop in §6.1: hard-rejections retried up to `MAX_HARD_ERROR_RETRIES` because the aggregator may be faulty (not hostile).
+  - Retry-on-belief loop in §6.1: submit-side transient errors retried up to `MAX_SUBMIT_RETRIES`; poll-side `PATH_NOT_INCLUDED` polled until `POLLING_WINDOW` (default 30 min); poll-side `PATH_INVALID` / `NOT_AUTHENTICATED` retried up to `MAX_PROOF_ERROR_RETRIES`.
   - Cascade-on-hard-rejection per §6.1.1.
   - `payments.importInclusionProof()` API for the stuck-PENDING escape hatch.
-  - `transfer:security-alert` event for conservative-mode post-send PATH_NOT_INCLUDED.
+  - `transfer:security-alert` event emitted on poll-side `PATH_INVALID` / `NOT_AUTHENTICATED` (proof structurally malformed or validator sigs forged).
 - **Wave T.6** — Outbox refactor. Bundle-grained `UxfTransferOutboxEntry` for UXF modes, per-token entries for TXF mode. Status transition table per §7.0. OrbitDB CRDT invariants per §7.1 (monotonic LWW). Migration from the legacy per-token `OutboxEntry` preserving `recipientNametag`. Crash-recovery tests covering mid-chain restart with pre-publish persistence ordering.
 - **Wave T.7** — TXF mode as explicit opt-in: `transferMode: 'txf'` + `txfFinalization` routes to the per-token Nostr event pipeline (both conservative and instant variants). Sender outbox uses the new schema with `deliveryMethod: 'txf-legacy'`. Receiver-side adapter routes the three legacy shapes (`{sourceToken, transferTx}`, `COMBINED_TRANSFER`, `INSTANT_SPLIT`) through the §5.3 decision matrix per-token (one event → ONE OR MORE disposition records); merges into OrbitDB profile when enabled. Inbound shape with `inclusionProof: null` is recognized as instant-TXF.
 - **Wave T.8** — Capability hint surfacing (informational `wireProtocols` field in identity binding) + UI warnings + the `INLINE_CAR_TOO_LARGE` / `FETCHED_CAR_TOO_LARGE` error paths. Peer-reputation cooldown (deferred — design only). Integration / compatibility / adversarial tests covering chain mode, multi-coin tokens, faulty-aggregator paths, OrbitDB CRDT merge, stuck-PENDING escape, security-alert events.
