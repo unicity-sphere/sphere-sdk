@@ -498,6 +498,7 @@ export type SphereEventType =
   | 'transfer:incoming'
   | 'transfer:confirmed'
   | 'transfer:failed'
+  | 'transfer:operator-alert'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -571,6 +572,30 @@ export interface SphereEventMap {
   'transfer:incoming': IncomingTransfer;
   'transfer:confirmed': TransferResult;
   'transfer:failed': TransferResult;
+  /**
+   * Operator-level alert raised when the §5.3 / §6.1 disposition path
+   * surfaces a condition that warrants human attention but is NOT a
+   * normal `transfer:failed` (e.g. C13: `'client-error'` reason from
+   * `REQUEST_ID_MISMATCH` indicates a CLIENT BUG — the wallet computed
+   * an inconsistent `(requestId, sourceState, transactionHash)` tuple).
+   *
+   * The payload is intentionally minimal so the event surface stays
+   * stable across the §6.1 error model evolution: `code` carries the
+   * `DispositionReason` that triggered the alert, `tokenId` (when
+   * available) lets operators correlate to a specific token, and
+   * `bundleCid` ties back to the originating UXF bundle.
+   *
+   * Spec refs: §6.1 (sender-side finalization error model),
+   * §5.4 / `DispositionReason` enum.
+   */
+  'transfer:operator-alert': {
+    readonly code: import('./disposition').DispositionReason;
+    readonly tokenId?: string;
+    readonly bundleCid?: string;
+    readonly observedTokenContentHash?: import('../uxf/types').ContentHash;
+    readonly senderTransportPubkey?: string;
+    readonly message: string;
+  };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
   'payment_request:rejected': IncomingPaymentRequest;

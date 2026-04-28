@@ -167,6 +167,29 @@ export type {
 } from './manifest-cas';
 
 // =============================================================================
+// Disposition writer + manifest store — UXF Transfer Protocol §5.4 (T.3.C)
+// =============================================================================
+
+export {
+  ManifestStore,
+  CAS_MAX_RETRIES,
+  mergeManifestEntry,
+} from './manifest-store';
+export type { ManifestStoreOptions } from './manifest-store';
+
+export {
+  DispositionWriter,
+  invalidKeyFor,
+  auditKeyFor,
+  mergeAuditEntry,
+} from './disposition-writer';
+export type {
+  DispositionWriterOptions,
+  DispositionPerEntryStorage,
+  DispositionEventEmitter,
+} from './disposition-writer';
+
+// =============================================================================
 // Shared Factory
 // =============================================================================
 

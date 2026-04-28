@@ -286,6 +286,98 @@ export interface AuditEntry {
 }
 
 // =============================================================================
+// 4. DispositionRecord — discriminated union (T.3.C)
+// =============================================================================
+
+/**
+ * Subset of {@link ManifestEntry} fields the `DispositionWriter` accepts
+ * from upstream (decision-matrix walker, conflict merger). The writer
+ * stamps `lamport`, `bundleCid`, `senderTransportPubkey`, and
+ * `lastProofRefreshAt` itself when writing through the manifest store —
+ * upstream callers should NOT set those fields on the delta because they
+ * are merged set-OR / max-merge by the store on every write.
+ */
+export type ManifestEntryDelta = Pick<
+  ManifestEntry,
+  'rootHash' | 'status' | 'conflictingHeads' | 'invalidReason' | 'splitParent'
+>;
+
+/**
+ * Discriminated record of one §5.3 disposition outcome for a single
+ * `tokenId` observed in an incoming UXF bundle. The `DispositionWriter`
+ * routes each variant to its appropriate OrbitDB collection per §5.4:
+ *  - `VALID` / `PENDING` / `CONFLICTING` → manifest store (active pool).
+ *  - `INVALID`                            → `_invalid` per-entry-key.
+ *  - `AUDIT`                              → `_audit` per-entry-key.
+ *
+ * The five-variant shape mirrors §5.3 [F] terminal dispositions (with
+ * `PROOF_INVALID` / `STRUCTURAL_INVALID` collapsed under the single
+ * `INVALID` discriminator — they differ only in the `reason` field, not
+ * in storage routing per §5.4).
+ *
+ * **Provenance fields**. Every variant carries `bundleCid` and
+ * `senderTransportPubkey` so the writer can stamp them on whichever
+ * collection it routes to. They are forensic-mandatory for `_invalid`
+ * and `_audit` records (per §5.4 record schema) and informational on
+ * manifest entries (per PA §10.11 augmentation).
+ *
+ * @see UXF-TRANSFER-PROTOCOL §5.3 (decision matrix, dispositions)
+ * @see UXF-TRANSFER-PROTOCOL §5.4 (storage outcomes / routing)
+ * @see PROFILE-ARCHITECTURE §10.11 (manifest entry shape)
+ */
+export type DispositionRecord =
+  | {
+      readonly disposition: 'VALID';
+      readonly tokenId: string;
+      readonly observedTokenContentHash: ContentHash;
+      readonly bundleCid: string;
+      readonly senderTransportPubkey: string;
+      /** The manifest delta to upsert; the writer fills in cross-replica
+       *  merge metadata (`lamport`, `audit_promoted_from`, etc.) itself. */
+      readonly manifest: ManifestEntryDelta;
+    }
+  | {
+      readonly disposition: 'PENDING';
+      readonly tokenId: string;
+      readonly observedTokenContentHash: ContentHash;
+      readonly bundleCid: string;
+      readonly senderTransportPubkey: string;
+      readonly manifest: ManifestEntryDelta;
+    }
+  | {
+      readonly disposition: 'CONFLICTING';
+      readonly tokenId: string;
+      readonly observedTokenContentHash: ContentHash;
+      readonly bundleCid: string;
+      readonly senderTransportPubkey: string;
+      readonly manifest: ManifestEntryDelta;
+      /**
+       * Every distinct chain-head hash observed for this `tokenId` so
+       * far. Length is always ≥ 2 by definition of CONFLICTING. The
+       * primary head is `manifest.rootHash`; this list MAY contain it
+       * (the writer dedups + sorts on merge).
+       */
+      readonly conflictingHeads: readonly ContentHash[];
+    }
+  | {
+      readonly disposition: 'INVALID';
+      readonly tokenId: string;
+      readonly observedTokenContentHash: ContentHash;
+      readonly bundleCid: string;
+      readonly senderTransportPubkey: string;
+      readonly reason: DispositionReason;
+    }
+  | {
+      readonly disposition: 'AUDIT';
+      readonly tokenId: string;
+      readonly observedTokenContentHash: ContentHash;
+      readonly bundleCid: string;
+      readonly senderTransportPubkey: string;
+      readonly auditStatus: AuditStatus;
+      readonly reason: DispositionReason;
+    };
+
+// =============================================================================
 // 4. ManifestEntry re-export — PA §10.11 / canonical source
 // =============================================================================
 
