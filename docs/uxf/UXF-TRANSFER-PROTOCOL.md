@@ -1319,6 +1319,7 @@ Initial: packaging
   packaging  ──serialize complete───► sending   (UXF car-mode + TXF)
   pinned     ──ipfs pin acknowledged─► sending
   pinned     ──publish-dispatch fails─► failed-transient   (post-pin transport failure)
+  pinned     ──permanent pin failure─► failed-permanent   (T.4.A; pin permanently rejected — Nostr publish never fires)
 
   sending    ──Nostr publish ack ────► delivered          (conservative UXF, conservative TXF)
   sending    ──Nostr publish ack ────► delivered-instant  (instant UXF, instant TXF)
