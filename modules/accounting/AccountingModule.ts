@@ -4195,9 +4195,36 @@ export class AccountingModule {
             continue; // skip loading this entry
           }
           innerMap.set(entryKey, ref);
-          // Rebuild tokenInvoiceMap — only for positional entries (tokenId:txIndex format).
-          // Provisional entries (provisional:uuid) don't map to real tokens.
-          if (!ref.transferId.startsWith('provisional:') && ref.transferId.includes(':')) {
+          // Rebuild tokenInvoiceMap. Three key shapes can appear in the
+          // ledger:
+          //   1. on-chain `${tokenId}:${txIndex}::${coinId}` — token id is
+          //      the prefix of `ref.transferId` (positional id), with `:`
+          //      separator. Original code path.
+          //   2. orphan `mt:${tokenId}:${transferId}` — token id is
+          //      embedded in the ENTRY KEY between the `mt:` prefix and the
+          //      next `:`, NOT in `ref.transferId` (which holds the
+          //      transport-level transfer id, no `:` at all). Without this
+          //      branch, post-restart `getTokenIdsForInvoice` returns empty
+          //      for orphan-attributed payouts, and SwapModule.verifyPayout
+          //      filters away the actual invalid token, silently passing
+          //      verification on an unverified payout.
+          //   3. provisional `provisional:${uuid}` — does not map to a real
+          //      token, skip.
+          if (entryKey.startsWith('mt:')) {
+            // mt:<tokenId>:<transferId> — extract tokenId between the two
+            // first colons.
+            const firstColon = entryKey.indexOf(':');
+            const secondColon = entryKey.indexOf(':', firstColon + 1);
+            if (secondColon > firstColon + 1) {
+              const tokenIdFromKey = entryKey.slice(firstColon + 1, secondColon);
+              if (tokenIdFromKey.length > 0) {
+                this._addToTokenInvoiceMap(tokenIdFromKey, invoiceId);
+              }
+            }
+          } else if (
+            !ref.transferId.startsWith('provisional:') &&
+            ref.transferId.includes(':')
+          ) {
             const tokenIdFromRef = ref.transferId.slice(0, ref.transferId.indexOf(':'));
             this._addToTokenInvoiceMap(tokenIdFromRef, invoiceId);
           }
@@ -4746,6 +4773,13 @@ export class AccountingModule {
       // for the imported ID, so getInvoiceStatus() will see this transfer
       // immediately after import.
       const MAX_UNKNOWN_INVOICE_IDS = 500;
+      // Per-invoice entry cap — defends against unbounded growth within a
+      // single unknown invoice id. Without this, a relay redelivering the
+      // same logical payment with different transport `transfer.id` values
+      // could accumulate arbitrarily many `mt:` entries, each persisted to
+      // disk on every dirty-flush. 50 is generous: real swap deposits use
+      // ≤2 transfers per invoice; partial-fill payouts ≤handful.
+      const MAX_ORPHAN_ENTRIES_PER_INVOICE = 50;
       if (!this.invoiceLedger.has(invoiceId)) {
         if (this.unknownLedgerCount >= MAX_UNKNOWN_INVOICE_IDS) {
           // Cap reached — drop this orphan. Caller would have to
@@ -4759,6 +4793,17 @@ export class AccountingModule {
         this.unknownLedgerCount++;
       }
       const orphanLedger = this.invoiceLedger.get(invoiceId)!;
+      // Per-invoice entry cap — once reached, drop further `mt:` orphans
+      // for this invoiceId. Pre-existing on-chain entries in the same
+      // ledger don't count (they're under different key prefix and indicate
+      // the invoice was already attributed via the proper path).
+      let mtEntryCount = 0;
+      for (const k of orphanLedger.keys()) {
+        if (k.startsWith('mt:')) mtEntryCount++;
+      }
+      if (mtEntryCount >= MAX_ORPHAN_ENTRIES_PER_INVOICE) {
+        return;
+      }
       // Key by token-id+transfer-id so duplicate event delivery doesn't
       // create double-counted entries. Prefixed with `mt:` (memo-transport)
       // to avoid collision with the on-chain dedup keys used elsewhere.

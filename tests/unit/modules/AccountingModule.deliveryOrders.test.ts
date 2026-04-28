@@ -473,4 +473,58 @@ describe('AccountingModule — payment/invoice delivery ordering', () => {
     const firstId = '0'.repeat(64);
     expect(ledgerEntries(module, firstId)).toHaveLength(1);
   }, 15_000);
+
+  // -------------------------------------------------------------------------
+  // UT-DELIVERY-060 — orphan-buffer entries must repopulate `tokenInvoiceMap`
+  // on wallet reload. Previously the rebuild loop only handled on-chain
+  // `${transferId}::${coinId}` keys; `mt:${tokenId}:${transferId}` orphan
+  // entries were silently skipped, so post-restart `getTokenIdsForInvoice`
+  // returned an empty set for orphan-attributed payouts. SwapModule.verifyPayout
+  // then filtered away the actual invalid token and silently returned
+  // `payoutVerified:true` for an unverified payout — a fail-open verification
+  // bug. This test pins the behavior down.
+  // -------------------------------------------------------------------------
+  it('UT-DELIVERY-060: tokenInvoiceMap is rebuilt for `mt:` orphan keys on load()', async () => {
+    const invoiceId = '6'.repeat(64);
+
+    // Phase 1: orphan-buffer a transfer (no invoice imported yet).
+    const transfer = makeIncomingTransfer(invoiceId, 'F', '5000000');
+    mocks.payments._emit('transfer:incoming', transfer);
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Confirm the orphan was buffered AND the reverse map points at it.
+    expect(ledgerEntries(module, invoiceId)).toHaveLength(1);
+    expect(tokenInvoiceMapEntriesFor(module, invoiceId)).toBe(1);
+
+    // Capture the tokenId so we can assert reverse-map state across reload.
+    const tokenId = transfer.tokens[0]!.id;
+
+    // Phase 2: simulate a wallet reload — destroy the module and re-construct
+    // it against the same persisted storage, then call load(). The reload
+    // path is what the rebuild fix lives in; the bug was that this branch
+    // populated invoiceLedger but skipped tokenInvoiceMap for `mt:` keys.
+    await module.destroy();
+
+    const reloaded = createTestAccountingModule({ storage: mocks.storage });
+    await reloaded.module.load();
+
+    // The orphan must still be in the ledger (storage round-trip).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const reloadedLedger = (reloaded.module as any).invoiceLedger.get(invoiceId) as
+      | Map<string, unknown>
+      | undefined;
+    expect(reloadedLedger).toBeDefined();
+    expect(reloadedLedger!.size).toBeGreaterThan(0);
+
+    // CRITICAL: tokenInvoiceMap must have been REBUILT for the `mt:` entry.
+    // Before the fix this returned 0 because the rebuild loop only handled
+    // on-chain `${transferId}:` keys.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tokenMap = (reloaded.module as any).tokenInvoiceMap as Map<string, Set<string>>;
+    const set = tokenMap.get(tokenId);
+    expect(set).toBeDefined();
+    expect(set!.has(invoiceId)).toBe(true);
+
+    reloaded.module.destroy();
+  });
 });
