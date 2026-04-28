@@ -593,7 +593,7 @@ For each token-root element in pool:
 │
 └─[F]─ Final disposition recorded; storage action per §5.4. PENDING
        tokens transition to VALID/UNSPENDABLE_BY_US automatically when
-       finalization completes (§5.5 step 7), at which point the [E]
+       finalization completes (§5.5 step 9), at which point the [E]
        spent-check runs and the [D] merge-check is re-run against any
        new arrivals.
 ```
@@ -812,7 +812,7 @@ All of the following are **idempotent and convergent**; nothing requires special
 
 **Idempotency invariant (MUST)**: the disposition of a token MUST never regress. Specifically:
 - A `valid`/`archived` token MUST NEVER transition back to `pending` on receive — replay of an older copy is a no-op for status.
-- A `pending` token's queue entries can only be REMOVED (proof attached, hard-failed) — never re-added for the same tx index unless §5.5 step 8's re-run found a new merge that added the tx.
+- A `pending` token's queue entries can only be REMOVED (proof attached, hard-failed) — never re-added for the same tx index unless §5.5 step 9's re-run found a new merge that added the tx.
 - An `invalid` token MUST NEVER transition out of `_invalid` — a later valid copy of the same `tokenId` is treated as `CONFLICTING` (and stored with the conflicting-heads list) but the existing invalid disposition is preserved for forensics.
 
 ---
@@ -1208,7 +1208,7 @@ PROFILE-ARCHITECTURE.md §10.11 defines statuses `valid | invalid | conflicting 
 | NOT_OUR_CURRENT_STATE | (audit only) | `_audit` collection (NEW — Wave T.3), reason='not-our-state' |
 | UNSPENDABLE_BY_US | (audit only) | `_audit` collection, reason='off-record-spend' |
 
-The on-chain spent state is checked via `oracle.isSpent(stateHash)` — a single round-trip per finalized arriving token (cached per Wave L's bounded LRU at `oracle/UnicityAggregatorProvider.ts:158-172,608-634`). For chain-mode tokens, the spent check is **deferred** until all unfinalized txs are resolved (running it earlier would be meaningless — `isSpent` of an unproven destination state is undefined). When finalization completes (§5.5 step 8), the worker re-runs [E] before transitioning the token from `pending` to terminal.
+The on-chain spent state is checked via `oracle.isSpent(stateHash)` — a single round-trip per finalized arriving token (cached per Wave L's bounded LRU at `oracle/UnicityAggregatorProvider.ts:158-172,608-634`). For chain-mode tokens, the spent check is **deferred** until all unfinalized txs are resolved (running it earlier would be meaningless — `isSpent` of an unproven destination state is undefined). When finalization completes (§5.5 step 9), the worker re-runs [E] before transitioning the token from `pending` to terminal.
 
 ---
 
