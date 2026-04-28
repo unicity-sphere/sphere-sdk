@@ -678,6 +678,9 @@ export * from './instant-split';
 // Re-export payment session types
 export * from './payment-session';
 
+// Re-export UXF transfer wire-format types (T.1.A)
+export * from './uxf-transfer';
+
 // =============================================================================
 // Network Health Types
 // =============================================================================
