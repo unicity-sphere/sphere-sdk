@@ -684,3 +684,315 @@ describe('ProfileMigration', () => {
     });
   });
 });
+
+// =============================================================================
+// T.1.E: migrateInvalidTokensToPerEntryKey
+//
+// Covers:
+//   - Legacy fixture wallet: load fixture, run migration, verify per-entry
+//     keys exist and legacy blob is deleted.
+//   - Idempotency: re-running on a clean (already-migrated) wallet is a
+//     no-op with `migrated: false`.
+//   - Additivity: an existing per-entry-key entry at the composite key
+//     is NOT overwritten — the migration only fills synthetic legacy keys
+//     for entries that have no real per-entry-key record yet.
+// =============================================================================
+
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { migrateInvalidTokensToPerEntryKey } from '../../../profile/migration';
+import type { ProfileDatabase, OrbitDbConfig } from '../../../profile/types';
+
+interface FixtureSnapshot {
+  readonly address_id: string;
+  readonly encryption: string;
+  readonly entries: ReadonlyArray<{ key: string; value: string }>;
+}
+
+function loadFixture(): FixtureSnapshot {
+  const path = join(
+    __dirname,
+    '..',
+    '..',
+    'fixtures',
+    'wallets',
+    'legacy-invalidTokens-pre-T1E',
+    'profile-snapshot.json',
+  );
+  const raw = readFileSync(path, 'utf-8');
+  return JSON.parse(raw) as FixtureSnapshot;
+}
+
+function createMockProfileDb(): ProfileDatabase & { _store: Map<string, Uint8Array> } {
+  const store = new Map<string, Uint8Array>();
+  return {
+    _store: store,
+    async connect(_c: OrbitDbConfig) {},
+    async put(k: string, v: Uint8Array) {
+      store.set(k, v);
+    },
+    async get(k: string) {
+      return store.get(k) ?? null;
+    },
+    async del(k: string) {
+      store.delete(k);
+    },
+    async all(prefix?: string) {
+      const result = new Map<string, Uint8Array>();
+      for (const [k, v] of store) {
+        if (!prefix || k.startsWith(prefix)) result.set(k, v);
+      }
+      return result;
+    },
+    async close() {},
+    onReplication() {
+      return () => {};
+    },
+    isConnected() {
+      return true;
+    },
+  } as ProfileDatabase & { _store: Map<string, Uint8Array> };
+}
+
+function loadFixtureIntoDb(
+  db: ProfileDatabase & { _store: Map<string, Uint8Array> },
+  fixture: FixtureSnapshot,
+): void {
+  for (const entry of fixture.entries) {
+    db._store.set(entry.key, new TextEncoder().encode(entry.value));
+  }
+}
+
+describe('migrateInvalidTokensToPerEntryKey (T.1.E)', () => {
+  describe('legacy fixture migration', () => {
+    it('migrates each legacy entry to per-entry-key form', async () => {
+      const fixture = loadFixture();
+      const db = createMockProfileDb();
+      loadFixtureIntoDb(db, fixture);
+
+      const result = await migrateInvalidTokensToPerEntryKey(
+        db,
+        fixture.address_id,
+      );
+
+      expect(result.migrated).toBe(true);
+      expect(result.entriesMigrated).toBe(2);
+      expect(result.entriesSkippedPreexisting).toBe(0);
+      expect(result.entriesSkippedMalformed).toBe(0);
+
+      // Per-entry keys exist with synthetic legacy-<tokenId> id.
+      const expectedKeyA = `${fixture.address_id}.invalid.tokA.legacy-tokA`;
+      const expectedKeyB = `${fixture.address_id}.invalid.tokB.legacy-tokB`;
+      expect(db._store.has(expectedKeyA)).toBe(true);
+      expect(db._store.has(expectedKeyB)).toBe(true);
+
+      // Legacy blob deleted.
+      expect(db._store.has(`${fixture.address_id}.invalidTokens`)).toBe(false);
+    });
+
+    it('preserves the original entry payload in each per-entry-key record', async () => {
+      const fixture = loadFixture();
+      const db = createMockProfileDb();
+      loadFixtureIntoDb(db, fixture);
+
+      await migrateInvalidTokensToPerEntryKey(db, fixture.address_id);
+
+      const recA = db._store.get(`${fixture.address_id}.invalid.tokA.legacy-tokA`);
+      expect(recA).toBeDefined();
+      const parsed = JSON.parse(new TextDecoder().decode(recA!));
+      expect(parsed).toMatchObject({
+        tokenId: 'tokA',
+        reason: 'corrupt',
+        detectedAt: 1000,
+      });
+    });
+  });
+
+  describe('idempotency', () => {
+    it('returns migrated=false when no legacy blob exists', async () => {
+      const db = createMockProfileDb();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+
+      const result = await migrateInvalidTokensToPerEntryKey(db, addr);
+      expect(result.migrated).toBe(false);
+      expect(result.entriesMigrated).toBe(0);
+    });
+
+    it('re-running after migration is a no-op', async () => {
+      const fixture = loadFixture();
+      const db = createMockProfileDb();
+      loadFixtureIntoDb(db, fixture);
+
+      // First run: actually migrates.
+      const first = await migrateInvalidTokensToPerEntryKey(
+        db,
+        fixture.address_id,
+      );
+      expect(first.migrated).toBe(true);
+      expect(first.entriesMigrated).toBe(2);
+
+      // Second run: no legacy blob remains → no-op.
+      const second = await migrateInvalidTokensToPerEntryKey(
+        db,
+        fixture.address_id,
+      );
+      expect(second.migrated).toBe(false);
+      expect(second.entriesMigrated).toBe(0);
+
+      // Per-entry-key records still present.
+      expect(
+        db._store.has(`${fixture.address_id}.invalid.tokA.legacy-tokA`),
+      ).toBe(true);
+    });
+  });
+
+  describe('additivity (anti-overwrite)', () => {
+    it('does NOT overwrite an existing per-entry-key record at the synthetic legacy key', async () => {
+      // Scenario from §risks paragraph: a wallet has a stale `invalidTokens`
+      // legacy blob AND an existing per-entry-key record at the synthetic
+      // legacy composite (e.g. someone re-imported the legacy blob after a
+      // partial migration). The migration MUST NOT overwrite the existing
+      // per-entry-key record.
+      const fixture = loadFixture();
+      const db = createMockProfileDb();
+      loadFixtureIntoDb(db, fixture);
+
+      // Pre-populate the synthetic legacy composite with a "real" record
+      // (simulating something that was placed there earlier).
+      const preExistingKey = `${fixture.address_id}.invalid.tokA.legacy-tokA`;
+      const preExistingValue = JSON.stringify({
+        tokenId: 'tokA',
+        reason: 'pre-existing-do-not-overwrite',
+        detectedAt: 99999,
+      });
+      db._store.set(preExistingKey, new TextEncoder().encode(preExistingValue));
+
+      const result = await migrateInvalidTokensToPerEntryKey(
+        db,
+        fixture.address_id,
+      );
+
+      // tokA was skipped (already present); tokB migrated.
+      expect(result.migrated).toBe(true);
+      expect(result.entriesMigrated).toBe(1);
+      expect(result.entriesSkippedPreexisting).toBe(1);
+
+      // Pre-existing record preserved verbatim.
+      const after = db._store.get(preExistingKey);
+      expect(after).toBeDefined();
+      const parsed = JSON.parse(new TextDecoder().decode(after!));
+      expect(parsed.reason).toBe('pre-existing-do-not-overwrite');
+      expect(parsed.detectedAt).toBe(99999);
+
+      // tokB still migrated successfully.
+      expect(
+        db._store.has(`${fixture.address_id}.invalid.tokB.legacy-tokB`),
+      ).toBe(true);
+    });
+
+    it('does NOT overwrite a real composite-id per-entry-key (simulating T.3.B run before migration)', async () => {
+      // Scenario: a real per-entry-key record was written at a real
+      // composite id (e.g. `${tokenId}.cidReal`) by T.3.B BEFORE the
+      // T.1.E migration ran. The migration's synthetic legacy key uses
+      // `legacy-<tokenId>` which CANNOT collide with a real content
+      // hash (which never starts with the literal `legacy-`). This
+      // test verifies the orthogonality: the migration writes the
+      // synthetic key without touching the real composite key.
+      const fixture = loadFixture();
+      const db = createMockProfileDb();
+      loadFixtureIntoDb(db, fixture);
+
+      // Pre-populate a real composite key for tokA — the migration's
+      // synthetic legacy key uses `tokA.legacy-tokA` so it doesn't
+      // collide.
+      const realKey = `${fixture.address_id}.invalid.tokA.cidRealAbc123`;
+      const realValue = JSON.stringify({
+        tokenId: 'tokA',
+        reason: 'real-disposition',
+        observedTokenContentHash: 'cidRealAbc123',
+        detectedAt: 12345,
+      });
+      db._store.set(realKey, new TextEncoder().encode(realValue));
+
+      const result = await migrateInvalidTokensToPerEntryKey(
+        db,
+        fixture.address_id,
+      );
+
+      expect(result.migrated).toBe(true);
+      expect(result.entriesMigrated).toBe(2); // both legacy entries migrated
+      expect(result.entriesSkippedPreexisting).toBe(0);
+
+      // Real composite-id record untouched.
+      const after = db._store.get(realKey);
+      expect(after).toBeDefined();
+      const parsed = JSON.parse(new TextDecoder().decode(after!));
+      expect(parsed.reason).toBe('real-disposition');
+      expect(parsed.observedTokenContentHash).toBe('cidRealAbc123');
+
+      // Synthetic legacy key for tokA also written.
+      expect(
+        db._store.has(`${fixture.address_id}.invalid.tokA.legacy-tokA`),
+      ).toBe(true);
+    });
+  });
+
+  describe('error handling', () => {
+    it('skips malformed entries without aborting the migration', async () => {
+      const db = createMockProfileDb();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+
+      // Mixed valid + malformed entries.
+      const blob = JSON.stringify([
+        { tokenId: 'good1', reason: 'r', detectedAt: 1 },
+        null,
+        { reason: 'no-token-id' }, // missing tokenId
+        { tokenId: '', reason: 'empty' }, // empty tokenId
+        { tokenId: 'good2', reason: 'r', detectedAt: 2 },
+      ]);
+      db._store.set(`${addr}.invalidTokens`, new TextEncoder().encode(blob));
+
+      const result = await migrateInvalidTokensToPerEntryKey(db, addr);
+
+      expect(result.migrated).toBe(true);
+      expect(result.entriesMigrated).toBe(2);
+      expect(result.entriesSkippedMalformed).toBe(3);
+
+      // Both good entries written.
+      expect(db._store.has(`${addr}.invalid.good1.legacy-good1`)).toBe(true);
+      expect(db._store.has(`${addr}.invalid.good2.legacy-good2`)).toBe(true);
+      // Legacy blob deleted.
+      expect(db._store.has(`${addr}.invalidTokens`)).toBe(false);
+    });
+
+    it('throws on a corrupt (non-JSON) legacy blob; does NOT delete it', async () => {
+      const db = createMockProfileDb();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+      // Garbage bytes that fail JSON.parse.
+      db._store.set(
+        `${addr}.invalidTokens`,
+        new TextEncoder().encode('{not valid json'),
+      );
+
+      await expect(
+        migrateInvalidTokensToPerEntryKey(db, addr),
+      ).rejects.toThrow(/Failed to decode legacy invalidTokens/);
+
+      // Legacy blob NOT deleted — operator can investigate.
+      expect(db._store.has(`${addr}.invalidTokens`)).toBe(true);
+    });
+
+    it('handles empty array gracefully (migrated, no entries written)', async () => {
+      const db = createMockProfileDb();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+      db._store.set(`${addr}.invalidTokens`, new TextEncoder().encode('[]'));
+
+      const result = await migrateInvalidTokensToPerEntryKey(db, addr);
+
+      expect(result.migrated).toBe(true);
+      expect(result.entriesMigrated).toBe(0);
+      // Legacy blob removed.
+      expect(db._store.has(`${addr}.invalidTokens`)).toBe(false);
+    });
+  });
+});

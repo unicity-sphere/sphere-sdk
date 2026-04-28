@@ -182,4 +182,120 @@ describe('Sphere.clear()', () => {
       expect(storage.connect).toHaveBeenCalled();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // T.1.E — per-entry-key collections coverage (W46)
+  //
+  // Verifies that Sphere.clear() reaches per-entry-key collections (audit,
+  // invalid, finalizationQueue) via parent storage clear (a full-prefix
+  // wipe), NOT via the PROFILE_KEY_MAPPING table. The contract is:
+  // `Sphere.clear()` → `StorageProvider.clear()` → wipes ALL keys including
+  // composite per-entry-key forms (`${addr}.<collection>.${id}` and
+  // multi-rep `${addr}.<collection>.${tokenId}.${contentHash}`).
+  // ---------------------------------------------------------------------------
+
+  describe('T.1.E per-entry-key collection coverage (W46)', () => {
+    it("clears all '{addr}.audit.<id>' per-entry records", async () => {
+      const storage = createMockStorage();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+      // Pre-populate composite per-entry-key audit records of the
+      // multi-rep form `${tokenId}.${observedTokenContentHash}`.
+      await storage.set(`${addr}.audit.token1.cidA`, '{"id":"token1.cidA"}');
+      await storage.set(`${addr}.audit.token2.cidB`, '{"id":"token2.cidB"}');
+      // Sanity: keys exist before clear.
+      expect(await storage.has(`${addr}.audit.token1.cidA`)).toBe(true);
+
+      await Sphere.clear(storage);
+
+      // After clear, ALL audit per-entry-key records are gone.
+      expect(storage.clear).toHaveBeenCalled();
+      const remaining = (await storage.keys()).filter((k) =>
+        k.startsWith(`${addr}.audit.`),
+      );
+      expect(remaining).toHaveLength(0);
+    });
+
+    it("clears all '{addr}.invalid.<id>' per-entry records (multi-rep)", async () => {
+      const storage = createMockStorage();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+      // Multi-rep composite ids: `${tokenId}.${observedTokenContentHash}`.
+      await storage.set(
+        `${addr}.invalid.token1.cidA`,
+        '{"id":"token1.cidA"}',
+      );
+      await storage.set(
+        `${addr}.invalid.token2.legacy-token2`, // synthetic legacy id
+        '{"id":"token2.legacy-token2"}',
+      );
+      expect(await storage.has(`${addr}.invalid.token1.cidA`)).toBe(true);
+
+      await Sphere.clear(storage);
+
+      const remaining = (await storage.keys()).filter((k) =>
+        k.startsWith(`${addr}.invalid.`),
+      );
+      expect(remaining).toHaveLength(0);
+    });
+
+    it("clears all '{addr}.finalizationQueue.<id>' per-entry records", async () => {
+      const storage = createMockStorage();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+      await storage.set(`${addr}.finalizationQueue.req1`, '{"id":"req1"}');
+      await storage.set(`${addr}.finalizationQueue.req2`, '{"id":"req2"}');
+      expect(await storage.has(`${addr}.finalizationQueue.req1`)).toBe(true);
+
+      await Sphere.clear(storage);
+
+      const remaining = (await storage.keys()).filter((k) =>
+        k.startsWith(`${addr}.finalizationQueue.`),
+      );
+      expect(remaining).toHaveLength(0);
+    });
+
+    it('clears mixed entries across all 3 new prefixes in one call', async () => {
+      const storage = createMockStorage();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+
+      // Populate the 3 prefixes simultaneously (the realistic case).
+      await storage.set(`${addr}.audit.t1.h1`, 'a1');
+      await storage.set(`${addr}.audit.t2.h2`, 'a2');
+      await storage.set(`${addr}.invalid.t3.h3`, 'i1');
+      await storage.set(`${addr}.invalid.t4.legacy-t4`, 'i2');
+      await storage.set(`${addr}.finalizationQueue.r1`, 'f1');
+      await storage.set(`${addr}.finalizationQueue.r2`, 'f2');
+
+      // Add a non-target key to ensure clear() does its full wipe (the
+      // mock storage.clear() wipes everything, matching real behaviour).
+      await storage.set('mnemonic', 'unrelated-key');
+
+      const beforeKeys = await storage.keys();
+      // 6 per-entry + 1 unrelated = 7
+      expect(beforeKeys).toHaveLength(7);
+
+      await Sphere.clear(storage);
+
+      const afterKeys = await storage.keys();
+      expect(afterKeys).toHaveLength(0);
+    });
+
+    it('does NOT depend on PROFILE_KEY_MAPPING — pure prefix wipe', async () => {
+      // The contract: Sphere.clear() doesn't look up entries in the
+      // mapping table. It calls StorageProvider.clear() which is a full
+      // wipe regardless of schema. Verify by populating a key shape
+      // that has NO mapping table entry — it MUST still be wiped.
+      const storage = createMockStorage();
+      const addr = 'DIRECT_aabbcc_ddeeff';
+      // A hypothetical future per-entry-key collection not yet in the
+      // mapping table — the clear path MUST still reach it.
+      await storage.set(`${addr}.futureCollection.id1`, 'data1');
+      await storage.set(`${addr}.futureCollection.id2`, 'data2');
+
+      await Sphere.clear(storage);
+
+      const remaining = (await storage.keys()).filter((k) =>
+        k.startsWith(`${addr}.futureCollection.`),
+      );
+      expect(remaining).toHaveLength(0);
+    });
+  });
 });

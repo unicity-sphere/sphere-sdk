@@ -1157,6 +1157,19 @@ export class Sphere {
    * Removes wallet keys, per-address data, and optionally token storage.
    * Does NOT affect application-level data stored outside the SDK.
    *
+   * **W46 — per-entry-key collections coverage (T.1.E):**
+   * Per-entry-key collections (outbox, mintOutbox, audit, invalid,
+   * finalizationQueue) live under composite keys of the form
+   * `${addr}.<collection>.${id}` (and, for multi-rep collections,
+   * further composite ids `${tokenId}.${observedTokenContentHash}`).
+   * `clear()` reaches them via the parent `StorageProvider.clear()`
+   * call below — a full prefix-scan-and-delete on the underlying
+   * KV — NOT via `PROFILE_KEY_MAPPING` lookup. This is intentional:
+   * adding a new per-entry-key collection requires zero changes to
+   * `Sphere.clear()`. The mapping table declares the LOGICAL schema;
+   * runtime keys are always reached by prefix wipe. See
+   * `profile/types.ts` PROFILE_KEY_MAPPING contract block.
+   *
    * @param storageOrOptions - StorageProvider (backward compatible) or options object
    *
    * @example

@@ -221,6 +221,53 @@ describe('ProfileStorageProvider', () => {
       // Should not be in either db or cache
       expect(db._store.has('ipfs_seq_something')).toBe(false);
     });
+
+    // -----------------------------------------------------------------------
+    // T.1.E: audit / invalid / finalizationQueue per-address scoping.
+    // These three are SCHEMA declarations for per-entry-key collections —
+    // the runtime per-entry-key writer in ProfileTokenStorageProvider
+    // expands them into `${addr}.<collection>.<id>` records via direct
+    // db.put. Here we exercise the legacy-key matcher path, which must
+    // recognize the static entry name and scope it under the current
+    // address. The static key itself (`{addr}.audit` etc.) does NOT
+    // appear at runtime under normal operation — that's enforced by
+    // the per-entry-key writer; this test only verifies the matcher
+    // contract for the schema declaration.
+    // -----------------------------------------------------------------------
+
+    it("per-address key 'audit' (without prefix) translates to '{addr}.audit'", async () => {
+      await provider.set('audit', 'audit-data');
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.audit`)).toBe(true);
+    });
+
+    it("per-address key 'audit' with explicit prefix translates correctly", async () => {
+      await provider.set(`${EXPECTED_ADDRESS_ID}_audit`, 'audit-data');
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.audit`)).toBe(true);
+    });
+
+    it("per-address key 'finalizationQueue' (without prefix) translates to '{addr}.finalizationQueue'", async () => {
+      await provider.set('finalizationQueue', 'fq-data');
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.finalizationQueue`)).toBe(true);
+    });
+
+    it("per-address key 'finalizationQueue' with explicit prefix translates correctly", async () => {
+      await provider.set(`${EXPECTED_ADDRESS_ID}_finalizationQueue`, 'fq-data');
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.finalizationQueue`)).toBe(true);
+    });
+
+    it("per-address key 'invalid' (without prefix) translates to '{addr}.invalid'", async () => {
+      await provider.set('invalid', 'inv-data');
+      expect(db._store.has(`${EXPECTED_ADDRESS_ID}.invalid`)).toBe(true);
+    });
+
+    it('audit / invalid / finalizationQueue round-trip via get()', async () => {
+      await provider.set('audit', 'a-val');
+      await provider.set('invalid', 'i-val');
+      await provider.set('finalizationQueue', 'f-val');
+      expect(await provider.get('audit')).toBe('a-val');
+      expect(await provider.get('invalid')).toBe('i-val');
+      expect(await provider.get('finalizationQueue')).toBe('f-val');
+    });
   });
 
   // =========================================================================
