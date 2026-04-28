@@ -285,7 +285,15 @@ Recipients indefinitely accept all of the above (see §10). Senders only emit th
 
 Inputs: `tokens: Token[]` (selected for transfer), `recipient: PeerInfo`, `transferMode: 'conservative' | 'instant'`.
 
-1. **Validate inputs** — the request carries one or more **asset targets**, each of which is either a fungible coin slice or a whole-token (NFT) reference. The protocol is asset-kind agnostic; the same machinery handles both.
+**Canonical asset model** (per the underlying Unicity state-transition SDK; verified against `@unicitylabs/state-transition-sdk` `lib/transaction/split/TokenSplitBuilder.js`, `lib/transaction/TransferTransactionData.d.ts`, `lib/token/Token.d.ts`):
+
+- A **coin token** is a token with non-empty `coinData` carrying one or more `(coinId, amount)` entries. Coin tokens MAY be split: the SDK's `TokenSplitBuilder` consumes the source via burn-then-mint and produces N new outputs, each with a fresh `tokenId`. The builder enforces (a) every output has non-empty `coinData`, (b) the union of output coin types equals the parent's coin types exactly (no dropping a coin type), (c) per-coin amounts are conserved across outputs.
+- An **NFT token** is a token with empty / null `coinData`, distinguished solely by its unique `tokenId`. NFT tokens CANNOT be split (the split builder rejects empty-coinData inputs). NFT tokens are transferred WHOLE via `TransferTransaction` — the source `tokenId`, `tokenType`, and identity data are preserved verbatim; only the current-state predicate changes.
+- **No mixed-asset tokens**: this protocol does NOT permit a single token to carry both a non-empty `coinData` AND a separable "NFT identity." Every token's `tokenId` is unique by construction, but the protocol treats a token as one OR the other, not both. A future protocol revision MAY introduce a primitive that preserves `tokenId` while modifying `coinData`; until then, attempts to model mixed-asset tokens are out of scope.
+
+This canonical model has direct consequences for §4.1 below: NFT transfers are always whole-token (no split, no change); coin transfers may split but never produce empty-coinData outputs; the two operations cannot be combined on a single source token.
+
+1. **Validate inputs** — the request carries one or more **asset targets**, each of which is either a fungible coin slice or a whole-token (NFT) reference.
 
    ```typescript
    type AssetTarget =
@@ -294,44 +302,54 @@ Inputs: `tokens: Token[]` (selected for transfer), `recipient: PeerInfo`, `trans
    ```
 
    The target list is constructed from the `TransferRequest`:
-   - Primary slot (`coinId` + `amount`): always a coin entry. If `coinId === ''` AND `amount === '0'`, treat as a placeholder (no primary fungible target — used for NFT-only sends). Otherwise prepend `{ kind: 'coin', coinId, amount }` to the target list.
+   - Primary slot (`coinId` + `amount`): both fields are OPTIONAL. If both are present, prepend `{ kind: 'coin', coinId, amount }` to the target list. If both are absent, the request has no primary entry. (Note: the `coinId` and `amount` fields remain *required by the type* in the SDK's TransferRequest declaration for backward compatibility with v1.0 callers; semantically they are optional from the protocol's perspective, and the implementation wave will extend the type to optional fields explicitly.)
    - `additionalAssets`: each entry's `kind` discriminator selects between coin and NFT shapes; appended to the target list verbatim.
-   - Resulting `targetList = [primaryIfNotPlaceholder, ...additionalAssets]`.
+   - Resulting `targetList = [primaryIfPresent, ...additionalAssets]`.
 
    Validation:
-   - If `targetList.length === 0` (placeholder primary AND no additionalAssets) → `EMPTY_TRANSFER` rejection.
-   - All `kind: 'coin'` entries' `coinId` values MUST be distinct. Duplicates → `INVALID_REQUEST` (the caller should sum into one amount).
+   - If `targetList.length === 0` → `EMPTY_TRANSFER` rejection.
+   - `additionalAssets === undefined` and `additionalAssets === []` are semantically identical (both reduce the target list to `[primaryIfPresent]`).
+   - **Discriminator forward-compat**: receivers MUST reject any `additionalAssets` entry whose `kind` is not in the union recognized by the implementation (`UNKNOWN_ASSET_KIND`). Silent skip would change transfer semantics. Senders MUST NOT include unrecognized kinds when targeting a recipient who advertises an older protocol version.
+   - All `kind: 'coin'` entries' `coinId` values MUST be distinct, INCLUDING the primary slot's `coinId` if present. Duplicates → `INVALID_REQUEST` (the caller should sum into one entry — typically the primary).
    - All `kind: 'nft'` entries' `tokenId` values MUST be distinct. Duplicates → `INVALID_REQUEST` (cannot transfer the same NFT twice in one call).
-   - Each `kind: 'coin'` entry's `amount` MUST be > 0.
+   - Each `kind: 'coin'` entry's `amount` MUST be > 0 (no exceptions; no placeholder convention).
    - All source tokens MUST be currently owned (current-state predicate binds to sender).
-   - **Coin-target coverage**: for each `kind: 'coin'` target `(coinIdᵢ, amountᵢ)`: the union of source tokens MUST collectively contain at least `amountᵢ` of `coinIdᵢ`. A single source token MAY contribute to multiple coin targets if it carries multiple of the requested coin types.
-   - **NFT-target coverage**: for each `kind: 'nft'` target `{tokenId}`: the sender's pool MUST contain a token with that exact `tokenId` whose current state binds to the sender. A token can satisfy at most one NFT target (the same physical token cannot be in two targets).
-   - **Non-overlap rule**: a single source token MAY be cited as the source for both coin slices AND NFT-target carriage (it might contain both a non-empty `coinData` and an NFT-class identity). In that case, the split logic (step 2) produces a recipient-bound token bundling the contributed coin slices PLUS the NFT identity; change carries any unrequested coin remainder.
+   - **Coin-target coverage**: for each `kind: 'coin'` target `(coinIdᵢ, amountᵢ)`: the union of coin source tokens MUST collectively contain at least `amountᵢ` of `coinIdᵢ`. A single coin source token MAY contribute to multiple coin targets if it carries multiple of the requested coin types.
+   - **NFT-target coverage**: for each `kind: 'nft'` target `{tokenId}`: the sender's pool MUST contain an NFT token (empty/null coinData) with that exact `tokenId` whose current state binds to the sender. If a token with the requested `tokenId` exists but has non-empty coinData (i.e., it's a coin token, not an NFT), reject with `INSUFFICIENT_BALANCE` reason='nft-not-owned' — coin tokens cannot satisfy NFT targets.
+   - **Asset-class disjointness**: NFT and coin source tokens are disjoint sets — a single source token contributes to either coin targets OR an NFT target, never both.
    - If any target is uncoverable, `send()` rejects with `INSUFFICIENT_BALANCE`. Partial shipment is never attempted.
 
-2. **Compute splits** (if needed). The split rule is uniform across single-coin, multi-coin, NFT, and mixed coin+NFT transfers. For each source token cited by the target list, the split produces:
-   - **`tokenForRecipient`**: contains EXACTLY the contributions this source token makes to the target list:
-     - For each `kind: 'coin'` target the source contributes to: include the slice `(coinIdᵢ, amountᵢ)` in the recipient token's `coinData`.
-     - For each `kind: 'nft'` target satisfied by this source: the recipient token IS the NFT — it preserves the source's `tokenId`, `tokenType`, `data`, and other identity-relevant fields. The recipient token's current state binds to the recipient identity.
-   - **`changeToken`**: contains everything left in the source token AFTER subtracting all contributed slices. This includes (a) the unrequested portion of any contributed coin (e.g., source had `UCT: 100`, target was `(UCT, 30)` → change has `UCT: 70`), (b) all non-contributed coin types in the source (e.g., source had `USDU: 50`, transfer didn't ask for USDU → change carries `USDU: 50`), and (c) NFT-class identity ONLY IF the source token's identity is NOT being transferred to the recipient (i.e., this source was cited only for fungible coverage; its NFT identity stays at sender). The change token is minted to the sender's identity.
-   - **Whole-token transfer special case**: when a source token has no `coinData` to remain at sender AND its NFT identity is being transferred, there is no change token — the source state-transitions whole to the recipient (no split). This is the typical NFT-only flow.
-   - **Mixed source case**: a source carrying both fungibles AND an NFT identity, where ONLY the NFT identity is being transferred (no coin slice contribution): the recipient gets the NFT (with empty `coinData`), the change keeps all the coins. Conversely, if a source carrying both is cited only for a coin slice (no NFT target): the recipient gets a coin-only child token (no NFT identity), the change keeps the NFT identity AND the unrequested coin remainder.
-   - **Zero-balance pruning**: when constructing either the recipient or change token, coins with zero balance MUST be pruned from `coinData`. Carrying explicit zero entries inflates the token CBOR for no benefit.
-   - **Identity preservation on NFT transfer**: the NFT's `tokenId`, `tokenType`, and identity-relevant `data` fields are preserved verbatim across the transfer transaction. Only the current-state predicate changes.
+2. **Compute splits / build transfer transactions**. The protocol has TWO independent operations, applied per source token:
+
+   **NFT source (empty-coinData token, satisfies one `kind: 'nft'` target)**: build a `TransferTransaction` that state-transitions the source whole to the recipient. The recipient receives a token with the SAME `tokenId`, `tokenType`, and identity data as the source — only the current-state predicate changes. No split. No change token.
+
+   **Coin source (non-empty-coinData token, contributes slices to one or more `kind: 'coin'` targets)**: apply the SDK's `TokenSplitBuilder`:
+   - **`tokenForRecipient`**: contains EXACTLY the slices this source token contributes to the target list. If the source contributes to multiple coin targets (it carries multiple requested coin types), `tokenForRecipient` carries multiple coin entries. The recipient token has a FRESH `tokenId` (split mints a new token).
+   - **`changeToken`**: contains everything left in the source AFTER subtracting all contributed slices: (a) the unrequested portion of any contributed coin, (b) all non-requested coin types in the source. The change token has a FRESH `tokenId` and is minted to the sender's identity.
+   - **Builder invariants enforced** (per `TokenSplitBuilder.js`):
+     - Every output MUST have non-empty `coinData`. The protocol satisfies this by construction: `tokenForRecipient` carries at least one slice (it satisfies a coin target); `changeToken` carries the remainder (non-empty unless the source's contributed slices exactly equal its total, in which case there is no change token at all — a `TokenSplitBuilder` operation with a single output equivalent to the source's amounts ).
+     - Output coin types ⊆ parent coin types; per-coin sums conserved.
+   - **Whole-source-amount special case**: if a coin source's total balance for a coin equals the requested slice, AND the source carries no other coin types (i.e., the slice consumes the source entirely), the SDK MAY use a single state-transition (no split, no change) instead of a split-with-change. Implementation-defined optimization.
+
+   **Source-class enforcement**: the implementation MUST verify each source token's class (NFT vs coin) BEFORE building transactions. Citing an NFT source for a coin target (or vice versa) is a programming error and SHOULD be caught at validation (§4.1 step 1) — but the per-source operation here is a final guard.
 
    **Worked examples**:
-   - **Single-coin transfer** (source `{UCT:100}`, target `(coin, UCT, 30)`) → recipient gets coin-only child `{UCT:30}`; change `{UCT:70}`. Trivial.
-   - **Single-coin transfer from multi-coin source** (source `{UCT:100, USDU:50}`, target `(coin, UCT, 30)`) → recipient `{UCT:30}`, change `{UCT:70, USDU:50}`. The non-requested coin (USDU) is carried entirely into change.
-   - **Multi-coin transfer covered by ONE source** (source `{UCT:100, USDU:50, ALPHA:1000}`, targets `(coin, UCT, 30) + (coin, USDU, 20)`) → recipient `{UCT:30, USDU:20}` (one child token bundling both contributed coins), change `{UCT:70, USDU:30, ALPHA:1000}`.
-   - **Multi-coin transfer covered by MULTIPLE sources** (source A `{UCT:100}`, source B `{USDU:50}`, targets `(coin, UCT, 30) + (coin, USDU, 20)`) → split A → recipient-A `{UCT:30}` + change-A `{UCT:70}`; split B → recipient-B `{USDU:20}` + change-B `{USDU:30}`. The recipient gets TWO child tokens (one per source); both ride in the same UXF bundle.
-   - **NFT-only transfer** (source NFT-token `Tᴺ` with no coinData, target `(nft, tokenId=Tᴺ.id)`) → no split; the source state-transitions whole to recipient. No change token. This is the cheapest NFT flow.
-   - **NFT transfer from mixed source** (source NFT-token `Tᴺ` with `coinData={UCT:50}`, target `(nft, tokenId=Tᴺ.id)` only) → recipient gets NFT child `Tᴺ' = (tokenId=Tᴺ.id, coinData={})`, change has fresh coin-only token `{UCT:50}`. The NFT identity is preserved on the recipient side; the coins stay with sender.
-   - **Mixed coin + NFT transfer** (sources A `{UCT:100}` and NFT-token `B` with empty coinData; targets `(coin, UCT, 30) + (nft, tokenId=B.id)`) → split A → recipient-A `{UCT:30}` + change-A `{UCT:70}`; transfer B whole → recipient-B `B'` (preserved id, current state now binds to recipient). Recipient gets two child tokens; bundle carries both. Change is one token (`{UCT:70}`).
-   - **Coin + NFT from a single mixed source** (source `S` with `coinData={UCT:100}` AND NFT-class identity `tokenId=Sᴺ.id`; targets `(coin, UCT, 30) + (nft, tokenId=Sᴺ.id)`) → recipient gets ONE child carrying both `{UCT:30}` AND the NFT identity `Sᴺ.id` (single token bundling coin + NFT); change has fresh coin-only token `{UCT:70}`.
+   - **Single-coin transfer** (source `{UCT:100}`, target `(coin, UCT, 30)`) → split: recipient `{UCT:30}` (fresh tokenId), change `{UCT:70}` (fresh tokenId).
+   - **Single-coin transfer from multi-coin source** (source `{UCT:100, USDU:50}`, target `(coin, UCT, 30)`) → split: recipient `{UCT:30}`, change `{UCT:70, USDU:50}`. Non-requested USDU carried entirely into change.
+   - **Multi-coin transfer covered by ONE source** (source `{UCT:100, USDU:50, ALPHA:1000}`, targets `(coin, UCT, 30) + (coin, USDU, 20)`) → split: recipient `{UCT:30, USDU:20}`, change `{UCT:70, USDU:30, ALPHA:1000}`.
+   - **Multi-coin transfer covered by MULTIPLE sources** (source A `{UCT:100}`, source B `{USDU:50}`, targets `(coin, UCT, 30) + (coin, USDU, 20)`) → split A: recipient-A `{UCT:30}` + change-A `{UCT:70}`; split B: recipient-B `{USDU:20}` + change-B `{USDU:30}`. Recipient gets TWO child tokens; bundle carries both.
+   - **NFT-only transfer** (source NFT-token `Tᴺ` with empty coinData, target `(nft, tokenId=Tᴺ.id)`) → whole-token state-transition: recipient gets `Tᴺ'` with `tokenId=Tᴺ.id` preserved, coinData still empty, current state binds to recipient. No split, no change token.
+   - **Mixed coin + NFT bundle (separate sources)** (source A `{UCT:100}`, NFT source B with empty coinData; targets `(coin, UCT, 30) + (nft, tokenId=B.id)`) → split A: recipient-A `{UCT:30}` + change-A `{UCT:70}`; whole-transfer B: recipient-B `B'` (preserved id). Recipient gets two child tokens; bundle carries both. Change is one token `{UCT:70}`.
+
+   **NOT supported** (do not appear in the worked examples; would require a future protocol primitive):
+   - Extracting an NFT identity from a coin-bearing source while leaving coins behind. The current SDK split mints fresh `tokenId`s, breaking identity preservation; whole-token transfer of such a source ships the coins along with the NFT.
+   - Combining a coin slice and an NFT identity into a single recipient token. Each source's transaction is independent; coin slices and NFT identities arrive as separate tokens.
 
    - Splits MAY be issued in instant mode (the parent's still-pending transaction does not invalidate child token identities — see the token-hash invariance note in §2.1). The `splitParent: tokenId` reference is recorded on each child for §6.1.1 cascade purposes.
 
-> **Multi-asset send status (current)**: `PaymentsModule.send()` supports single-coin (legacy), multi-coin, NFT, and mixed coin+NFT transfers via the optional `additionalAssets: AdditionalAsset[]` field on `TransferRequest`, where `AdditionalAsset` is a discriminated union `{kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. The legacy single-coin form (just `coinId` + `amount`) remains unchanged. See `docs/API.md` for the type signature and `docs/INTEGRATION.md` for usage examples. The protocol is asset-kind agnostic; future asset kinds extend the union.
+   **NFT cascade asymmetry warning** (operational, not a protocol error): when `allowPendingTokens: true` is combined with NFT targets, a pending NFT source CAN be transferred in chain mode. If the source's predecessor tx hard-fails, §6.1.1 cascade marks the recipient's NFT invalid. **Coin cascades cost fungible value (replaceable from elsewhere); NFT cascades cost non-fungible identity (irrecoverable — no other peer can produce the same `tokenId`)**. Implementations SHOULD warn the caller when an NFT target is satisfied by a pending source — the caller MAY pass `confirmNftPending: true` to acknowledge the risk explicitly. (Defaults: `confirmNftPending: false`; sending pending NFTs without explicit acknowledgement → `NFT_PENDING_REQUIRES_CONFIRMATION` rejection.)
+
+> **Multi-asset send status (current)**: `PaymentsModule.send()` supports single-coin (legacy), multi-coin, NFT-only, and mixed coin+NFT transfers via the optional `additionalAssets: AdditionalAsset[]` field on `TransferRequest`, where `AdditionalAsset` is a discriminated union `{kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. The protocol enforces NFT/coin disjointness — every source token belongs to exactly one class. NFT transfers are always whole-token (no split, no change); coin transfers may split. See `docs/API.md` for the type signature and `docs/INTEGRATION.md` for usage examples. The protocol is asset-kind agnostic at the discriminator level; future asset kinds extend the union (subject to forward-compat reject rule above).
 
 3. **For each token destined to the recipient**, build a `TransferTransaction` (SDK primitive):
    - `sourceState`: token's current state.
@@ -1471,7 +1489,8 @@ The TXF wire shapes are **permanent**, not deprecated. There is no migration win
 
 `PaymentsModule.send(...)` accepts:
 - `coinId: string`, `amount: string` — primary asset (always required; backward-compat with single-coin API).
-- `additionalAssets?: ReadonlyArray<AdditionalAsset>` — multi-asset extension where `AdditionalAsset = {kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. When present, target list construction follows §4.1 step 1 (primary coin slot prepended unless placeholder; additionalAssets appended verbatim). Distinct-coin and distinct-NFT-tokenId rules apply. Omitting this field preserves single-coin behavior identically to prior SDK versions.
+- `additionalAssets?: ReadonlyArray<AdditionalAsset>` — multi-asset extension where `AdditionalAsset = {kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. When present, target list construction follows §4.1 step 1 (primary coin slot prepended if both `coinId` and `amount` are present; additionalAssets appended verbatim). Distinct-coin and distinct-NFT-tokenId rules apply. Receivers reject unrecognized `kind` values with `UNKNOWN_ASSET_KIND` (forward-compat). Omitting this field preserves single-coin behavior identically to prior SDK versions.
+- `confirmNftPending?: boolean` — default `false`. Required = `true` to send NFT-class targets backed by pending source tokens (per §4.1 step 2 cascade asymmetry warning). The flag exists to ensure callers explicitly acknowledge that a cascaded NFT is irrecoverable — there is no fungible replacement for an NFT identity.
 - `transferMode: 'instant' | 'conservative' | 'txf'` — default `'instant'`.
 - `txfFinalization: 'instant' | 'conservative'` — only applies when `transferMode === 'txf'`; default `'conservative'`.
 - `delivery: DeliveryStrategy` (UXF modes only; see §3.3.1) — default `{ kind: 'auto', inlineCapBytes: 16384 }`.
@@ -1542,21 +1561,23 @@ The implementation MUST include:
 - **Multi-coin send (additionalAssets, all coin entries)**:
   - Single multi-coin source `{UCT: 100, USDU: 50, ALPHA: 1000}` sent with `coinId='UCT', amount='30', additionalAssets=[{kind:'coin', coinId:'USDU', amount:'20'}]`. Recipient receives one child token with `{UCT: 30, USDU: 20}`; change has `{UCT: 70, USDU: 30, ALPHA: 1000}`.
   - Multiple sources (A `{UCT: 100}`, B `{USDU: 50}`) covering `coinId='UCT', amount='30', additionalAssets=[{kind:'coin', coinId:'USDU', amount:'20'}]`. Recipient receives TWO child tokens (one per source); change has two tokens (`{UCT: 70}` from A, `{USDU: 30}` from B).
-- **NFT-only send**:
-  - Source: NFT-token `T` (tokenId=`0xabc`, empty coinData), owned by sender. Request: `coinId: '', amount: '0', additionalAssets: [{kind: 'nft', tokenId: '0xabc'}]`. Recipient receives `T'` (preserved tokenId/tokenType/data; current state binds to recipient). No change token (whole-token transfer).
-  - Source: NFT-token `T` with `coinData={UCT:50}`, owned by sender. Same NFT-only request → recipient gets NFT child with empty coinData; change has fresh coin-only token `{UCT:50}`.
-- **Mixed coin + NFT send**:
-  - Sources A `{UCT:100}` and NFT-token `B` (empty coinData). Request: `coinId:'UCT', amount:'30', additionalAssets:[{kind:'nft', tokenId:B.id}]`. Recipient receives two child tokens: one carries `{UCT:30}` from A, one carries the NFT identity from B. Change has one token `{UCT:70}` (no change for the NFT source — whole-token transferred).
-  - Single mixed source `S` with `coinData={UCT:100}` AND NFT identity `tokenId=Sᴺ`. Request: `coinId:'UCT', amount:'30', additionalAssets:[{kind:'nft', tokenId:Sᴺ}]`. Recipient receives ONE child token carrying both `{UCT:30}` and NFT identity `Sᴺ` (combined transfer); change has coin-only token `{UCT:70}`.
+- **NFT-only send** (NFT = token with empty/null coinData):
+  - Source: NFT-token `T` (tokenId=`0xabc`, empty coinData), owned by sender. Request omits primary `coinId`/`amount`; `additionalAssets: [{kind: 'nft', tokenId: '0xabc'}]`. Recipient receives `T'` with the SAME tokenId; coinData still empty; current state binds to recipient. No split, no change token (whole-token state-transition).
+  - Multiple NFTs: request omits primary; `additionalAssets: [{kind:'nft', tokenId:T1}, {kind:'nft', tokenId:T2}]`. Bundle carries two whole-token transfer transactions; recipient gets both NFTs with original tokenIds preserved.
+- **Mixed coin + NFT send** (separate sources only):
+  - Source A `{UCT:100}` (coin token) + source B (NFT-token, empty coinData). Request: `coinId:'UCT', amount:'30', additionalAssets:[{kind:'nft', tokenId:B.id}]`. Split A: recipient-A `{UCT:30}` (fresh tokenId) + change-A `{UCT:70}` (fresh tokenId). Whole-transfer B: recipient-B `B'` with preserved tokenId. Bundle carries both; recipient receives two child tokens.
 - **Validation rejections**:
   - `additionalAssets` containing duplicate `coinId` (e.g., `{kind:'coin', coinId:'UCT', amount:'10'}` when primary is also UCT) → `INVALID_REQUEST`.
   - `additionalAssets` containing duplicate NFT `tokenId` → `INVALID_REQUEST` (cannot transfer same NFT twice).
   - `additionalAssets` coin entry with `amount: '0'` → `INVALID_AMOUNT`.
+  - `additionalAssets` entry with unrecognized `kind` (e.g., a future `'voucher'` shipped to a v1 receiver) → `UNKNOWN_ASSET_KIND` (forward-compat reject rule).
   - Insufficient coin balance for any coin target → `INSUFFICIENT_BALANCE`; no partial shipment.
-  - NFT not in sender's pool → `INSUFFICIENT_BALANCE` (with reason='nft-not-owned').
-  - NFT in pool but current-state predicate doesn't bind to sender → `INSUFFICIENT_BALANCE` (same reason; treats as non-owned for spending purposes).
-  - Empty transfer (placeholder primary `coinId:'', amount:'0'` AND empty/missing additionalAssets) → `EMPTY_TRANSFER`.
-- **Backward compat**: single-coin call `{coinId: 'UCT', amount: '30'}` (no `additionalAssets`) produces byte-identical bundle to a v1.0-spec call → regression test against a captured fixture.
+  - NFT not in sender's pool → `INSUFFICIENT_BALANCE` reason='nft-not-owned'.
+  - NFT in pool but current-state predicate doesn't bind to sender → `INSUFFICIENT_BALANCE` reason='nft-not-owned'.
+  - **NFT target's source is a coin token (non-empty coinData)** rather than an NFT token → `INSUFFICIENT_BALANCE` reason='nft-not-owned'. Coin tokens cannot satisfy NFT targets even if `tokenId` matches; the protocol enforces class disjointness (per §4.1 canonical asset model).
+  - Empty transfer (no primary AND empty/missing additionalAssets) → `EMPTY_TRANSFER`.
+  - **Pending NFT without confirmation**: `allowPendingTokens: true` + NFT target whose source has unfinalized predecessor txs + `confirmNftPending: false` (default) → `NFT_PENDING_REQUIRES_CONFIRMATION`. With `confirmNftPending: true`, the send proceeds; cascade asymmetry warning applies.
+- **Backward compat**: single-coin call `{coinId: 'UCT', amount: '30'}` (no `additionalAssets`) produces byte-identical bundle to a v1.0-spec call → regression test against a captured fixture. **Implementation note**: the fixture MUST be generated from a tagged commit (specify the tag in the test) with deterministic salt, deterministic timestamp, and a recorded mnemonic; committed under `tests/fixtures/uxf-v1-single-coin/`. The byte-identical assertion is gated on the fixture's existence.
 - Token-hash invariance: take the same token in two states (proof attached vs. proof null), verify `token.id` is identical, verify CIDs differ.
 - CAR-embed delivery for small bundles (< 16 KiB); CID delivery for large bundles (> 16 KiB).
 - **Inline delivery completion semantics (§3.3.2)**:
@@ -1622,9 +1643,10 @@ The implementation MUST include:
 
 - **Bundle compression**: CARs can be sizeable for many-token bundles (especially chain-mode tokens with deep history). zstd / brotli on the inline-CAR path? Out of scope for v1.0.
 - **Multi-recipient bundles**: a single UXF bundle delivered to a Nostr group / multicast — nice to have, deferred. Would amortize CID-pin cost across N recipients and allow group-level atomic broadcasts. Open design points: per-recipient encryption envelope vs. shared symmetric key, group-membership consent.
-- ~~**Multi-coin / multi-asset send in a single call**~~ — implemented. `PaymentsModule.send()` accepts the optional `additionalAssets: AdditionalAsset[]` field on `TransferRequest` where `AdditionalAsset = {kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. Primary asset (`coinId` + `amount`) is always required for backward compatibility (use placeholder `''`/`'0'` for NFT-only sends). The §4.1 split logic handles single-coin, multi-coin, NFT, and mixed coin+NFT uniformly. See `docs/API.md` and `docs/INTEGRATION.md`.
+- ~~**Multi-coin / multi-asset send in a single call**~~ — implemented (in spec). `PaymentsModule.send()` accepts the optional `additionalAssets: AdditionalAsset[]` field on `TransferRequest` where `AdditionalAsset = {kind:'coin', coinId, amount} | {kind:'nft', tokenId}`. The primary `coinId`/`amount` slot is OPTIONAL (semantically; the type retains them for backward compatibility, with the implementation wave widening them to optional fields). NFT and coin source tokens are class-disjoint per §4.1 canonical asset model — no mixed-asset tokens. NFT transfers are whole-token; coin transfers may split. See `docs/API.md` and `docs/INTEGRATION.md`.
+- **Mixed-asset tokens (single token carrying coins + NFT identity simultaneously)**: NOT supported in v1. Would require a new SDK primitive (e.g., a "split-with-id-carry" operation that preserves `tokenId` while modifying `coinData`). Reserve for a future protocol revision if a real use case emerges.
 - **Conflict-resolution UI/API**: `CONFLICTING` tokens (genuinely-divergent chains) need an explicit `resolveConflict(tokenId, chosenHead)` API and UI surface. Lex-min `bundleCid` provides an automatic primary, but operator override is a planned future addition.
-- **Peer-reputation framework**: §11.4 mentions a 1-hour cooldown on bandwidth-burning peers. The reputation interface itself is out of scope here.
+- **Peer-reputation framework**: §11.4 mentions a 1-hour cooldown on bandwidth-burning peers. The reputation interface itself is out of scope here. Note: peer-reputation rises in operational importance once NFTs are in scope — a peer who delivers a forged or cascade-prone NFT chain can corrupt the recipient's collection in a way coin damage cannot (NFTs are non-fungible / non-replaceable). Reserve a future protocol revision for per-peer trust scores or signed NFT-receipt acknowledgements.
 
 ### 12.3 Periodic rescans (two orthogonal scanner types — in-scope; design summary here, implementation deferred)
 

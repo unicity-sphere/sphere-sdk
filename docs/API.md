@@ -386,41 +386,66 @@ Send assets to a recipient. Automatically splits source tokens when the exact am
 ```typescript
 interface TransferRequest {
   readonly recipient: string;    // @nametag, hex pubkey, DIRECT://, PROXY://, or alpha1... address
-  // --- Primary asset (always a coin; required for backward compatibility) ---
+  // --- Primary asset (legacy single-coin slot) ---
+  /**
+   * Primary coin asset. Both `coinId` and `amount` are semantically OPTIONAL
+   * but retain non-optional types in this signature for backward compatibility
+   * with v1.0 callers. The implementation wave will widen the type to
+   * `coinId?: string; amount?: string;` — at that point, NFT-only sends omit
+   * both fields. Until then, single-coin callers MUST provide both; multi-asset
+   * callers using NFT-only entries should still provide a coin slot OR wait
+   * for the type widening.
+   */
   readonly coinId: string;       // Coin type (hex string)
-  readonly amount: string;       // Amount in smallest units
+  readonly amount: string;       // Amount in smallest units (> 0)
   // --- Multi-asset extension (optional, additive) ---
   /**
    * Additional assets to deliver in the same transfer. Each entry is either
    * a fungible coin or a whole-token (NFT) reference. The full target list
    * the SDK will deliver is:
    *   [{ kind: 'coin', coinId, amount }, ...additionalAssets]
-   * (the primary coinId/amount above is implicitly the first 'coin' entry.)
+   * (the primary coinId/amount above is the first 'coin' entry when present.)
+   *
+   * Asset model (per UXF-TRANSFER-PROTOCOL §4.1 canonical):
+   *   - A coin token has non-empty coinData; may be split.
+   *   - An NFT token has empty/null coinData; transferred whole only.
+   *   - No mixed tokens — every source belongs to exactly one class.
    *
    * Validation:
-   *   - All 'coin' entries (including the primary) MUST have distinct coinId
-   *     values. Duplicates are rejected with INVALID_REQUEST.
-   *   - All 'nft' entries MUST have distinct tokenId values. Duplicates are
-   *     rejected with INVALID_REQUEST.
+   *   - All 'coin' entries (including primary) MUST have distinct coinId.
+   *     Duplicates → INVALID_REQUEST.
+   *   - All 'nft' entries MUST have distinct tokenId. Duplicates →
+   *     INVALID_REQUEST.
    *   - Each 'coin' entry's amount MUST be > 0.
-   *   - The sender's pool MUST have sufficient coverage for every entry
-   *     (sufficient coin balance for 'coin' entries; the specific tokenId
-   *     present and owned for 'nft' entries). Insufficient coverage on any
-   *     entry rejects the WHOLE call with INSUFFICIENT_BALANCE — partial
-   *     shipment is never attempted.
+   *   - Forward-compat: receivers REJECT entries with unrecognized `kind`
+   *     (UNKNOWN_ASSET_KIND).
+   *   - Sufficient coverage required for every entry; insufficient any →
+   *     INSUFFICIENT_BALANCE on the WHOLE call. NFT not in pool / not
+   *     owned → INSUFFICIENT_BALANCE reason='nft-not-owned'. NFT target's
+   *     source has non-empty coinData (i.e., it's a coin token, not an NFT)
+   *     → 'nft-not-owned' too.
+   *   - Empty target list → EMPTY_TRANSFER.
    */
   readonly additionalAssets?: ReadonlyArray<AdditionalAsset>;
-  // --- Other fields (unchanged) ---
-  readonly memo?: string;        // Optional message
-  readonly addressMode?: AddressMode;  // 'auto' | 'direct' | 'proxy'
-  readonly transferMode?: TransferMode;  // 'instant' | 'conservative'
-  readonly allowPendingTokens?: boolean;  // Default false — allow chain-mode source selection
+  // --- Other fields ---
+  readonly memo?: string;
+  readonly addressMode?: AddressMode;
+  readonly transferMode?: TransferMode;
+  readonly allowPendingTokens?: boolean;  // Default false
+  /**
+   * Required = true to send NFT-class targets backed by pending source tokens.
+   * NFT cascades are irrecoverable (non-fungible identity); the flag forces
+   * the caller to acknowledge the risk explicitly. Default false; pending NFT
+   * without confirmation → NFT_PENDING_REQUIRES_CONFIRMATION.
+   */
+  readonly confirmNftPending?: boolean;
 }
 
 /**
  * Discriminated union — an additional asset is either a fungible coin or a
- * whole-token (NFT) reference. The protocol is asset-kind agnostic; future
- * asset kinds can be added here.
+ * whole-token (NFT) reference. Future asset kinds extend the union; receivers
+ * reject unrecognized kinds at runtime (UNKNOWN_ASSET_KIND) to preserve
+ * transfer semantics.
  */
 type AdditionalAsset =
   | { readonly kind: 'coin'; readonly coinId: string; readonly amount: string }

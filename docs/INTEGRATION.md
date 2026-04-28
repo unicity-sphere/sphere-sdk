@@ -384,19 +384,22 @@ const result = await sphere.payments.send({
 //     current state's predicate changes to bind to @bob.
 ```
 
-**NFT-only transfer** (no coin component): the legacy `coinId`/`amount` fields are still required for backward compatibility, but if the caller has no fungible component to ship, they pass a placeholder of `coinId: ''` (empty string) and `amount: '0'`; the SDK treats this as "no primary fungible target" and only ships the NFT(s) in `additionalAssets`. Validation: if `coinId === ''` AND `additionalAssets` is empty or absent, the call is rejected with `EMPTY_TRANSFER`.
+**NFT-only transfer** (no coin component): the type signature retains `coinId`/`amount` as required for v1.0 backward compatibility; the implementation wave widens them to optional. Until that wave lands, NFT-only sends include a small primary coin slice as a placeholder (or wait for the type-widening release). Once optional, NFT-only sends omit the primary slot entirely:
 
 ```typescript
-// Send a single NFT only:
+// Post-widening (NFT-only):
 await sphere.payments.send({
   recipient: '@bob',
-  coinId: '',                     // placeholder — no primary coin
-  amount: '0',                    // placeholder
+  // coinId / amount omitted — NFT-only:
   additionalAssets: [
     { kind: 'nft', tokenId: '0xabc123...' },
   ],
 });
 ```
+
+**NFT model** (canonical, per UXF-TRANSFER-PROTOCOL §4.1): an NFT is a token with empty/null `coinData`, transferred whole-token. NFT and coin tokens are class-disjoint — no single token carries both. NFT transfers preserve the source `tokenId`; coin transfers split via mint, producing fresh `tokenId`s for recipient and change.
+
+**Pending NFT cascade caveat**: when `allowPendingTokens: true` is combined with NFT targets, you MUST also pass `confirmNftPending: true` to acknowledge the cascade-asymmetry risk. A cascaded coin can be recovered with fungible value from elsewhere; a cascaded NFT identity is irrecoverable.
 
 Single-coin callers omitting `additionalAssets` behave identically to prior versions of the SDK — the field is purely additive.
 

@@ -91,18 +91,22 @@ const mixedResult = await sphere.payments.send({
   memo: 'Coin + NFT bundle',
 });
 
-// 5c. NFT-only send — no fungible component
-const nftResult = await sphere.payments.send({
-  recipient: '@bob',
-  coinId: '', amount: '0',                     // placeholder: no primary coin
-  additionalAssets: [
-    { kind: 'nft', tokenId: '0xabc123...' },
-  ],
-});
-// All assets in a single UXF bundle. Source tokens are split such that the
-// recipient receives EXACTLY each requested asset (coin slices and/or whole
-// NFTs); change (unrequested coin remainders + non-requested coins/NFTs)
-// stays at the sender.
+// 5c. NFT-only send — once the implementation wave widens coinId/amount to
+//     optional, this becomes:
+//
+//     const nftResult = await sphere.payments.send({
+//       recipient: '@bob',
+//       additionalAssets: [{ kind: 'nft', tokenId: '0xabc123...' }],
+//     });
+//
+//     Until then, NFT-only sends require a small primary coin slice or wait
+//     for the widening release.
+
+// All assets ride in a single UXF bundle. Coin sources are split via mint
+// (recipient + change get fresh tokenIds); NFT sources are transferred
+// whole-token (recipient gets the original tokenId preserved). Coin and NFT
+// source tokens are class-disjoint per the canonical model — no single token
+// carries both.
 
 // 6. Receive tokens (explicit one-shot query + optional finalization)
 const { transfers } = await sphere.payments.receive();
@@ -401,24 +405,35 @@ interface FullIdentity extends Identity {
 
 interface TransferRequest {
   recipient: string;        // @nametag, DIRECT://..., chain pubkey, alpha1...
-  // Primary asset slot (always a coin; backward-compat with single-coin API):
+  // Primary coin slot — type retains required for v1.0 backward compat;
+  // implementation wave widens to optional (coinId?, amount?).
   coinId: string;           // Primary coin ID (e.g., 'UCT')
-                            // Use coinId: '' + amount: '0' as placeholder
-                            // when sending NFT-only (no fungible primary).
-  amount: string;           // Primary amount in smallest unit
+  amount: string;           // Primary amount in smallest unit (> 0)
   // Multi-asset extension (optional):
   additionalAssets?: ReadonlyArray<AdditionalAsset>;
                             // Each entry is either a coin or an NFT.
                             // All coinIds (including primary) MUST be distinct.
                             // All NFT tokenIds MUST be distinct.
+                            // Receivers REJECT unrecognized `kind` values
+                            // (forward-compat).
   memo?: string;            // Optional message
   transferMode?: 'instant' | 'conservative';  // Default 'instant'
-  allowPendingTokens?: boolean;  // Default false; enable chain-mode source selection
+  allowPendingTokens?: boolean;  // Default false; chain-mode source selection
+  confirmNftPending?: boolean;   // Default false; required true if any NFT
+                                 // target is backed by a pending source token
+                                 // (NFT cascades are irrecoverable).
 }
 
 type AdditionalAsset =
   | { kind: 'coin'; coinId: string; amount: string }   // fungible
   | { kind: 'nft';  tokenId: string };                 // whole-token / NFT
+
+// Canonical asset model:
+//   - Coin token: non-empty coinData; may be split via burn-then-mint
+//     (each output gets a fresh tokenId).
+//   - NFT token:  empty/null coinData; transferred whole-token only
+//     (preserves tokenId, tokenType, identity data).
+// Coin and NFT tokens are class-disjoint — no mixed-asset tokens.
 
 interface TransferResult {
   readonly id: string;
