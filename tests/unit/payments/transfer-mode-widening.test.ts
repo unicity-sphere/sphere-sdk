@@ -1,28 +1,29 @@
 /**
- * Transfer Mode widening — narrowing shim tests (T.1.B.1).
+ * Transfer Mode widening — narrowing shim tests (T.1.B.1; trimmed by
+ * T.1.B.2 to match the residual shim surface).
  *
  * Covers the two pillars of the §T.1.B.1 acceptance:
- *  1. The runtime narrowing shim (`narrowTransferMode`,
- *     `assertConservativeOrInstant`, `coercePartialTransferRequestMode`)
- *     produces the documented {@link InternalTransferMode} values for the
- *     public {@link TransferMode} inputs and rejects `'txf'` (and any
- *     other unknown string smuggled in via a `TransferMode` cast) with
- *     the typed `UNSUPPORTED_TRANSFER_MODE` error.
+ *  1. The runtime narrowing shim (`narrowTransferMode`) produces the
+ *     documented {@link InternalTransferMode} values for the public
+ *     {@link TransferMode} inputs and rejects unknown strings smuggled
+ *     in via a `TransferMode` cast with the typed
+ *     `UNSUPPORTED_TRANSFER_MODE` error.
  *  2. The compile-time TransferRequest widening — verified via a
  *     `satisfies` block that the seven new optional fields
  *     (`coinId?`, `amount?`, `additionalAssets?`, `allowPendingTokens?`,
  *     `confirmNftPending?`, `delivery?`, `txfFinalization?`) all type-check.
  *
- * Spec references: Plan §T.1.B.1 acceptance criteria (every bullet).
+ * Spec references: Plan §T.1.B.1 acceptance criteria (every bullet
+ * touching the residual `narrowTransferMode` shim and the public type
+ * widening). The removed shims (`defaultTransferMode`,
+ * `assertConservativeOrInstant`, `coercePartialTransferRequestMode`)
+ * lived only for the T.1.B.1 → T.7.C transition and have no remaining
+ * surface to test post-T.1.B.2.
  */
 
 import { describe, it, expect, expectTypeOf } from 'vitest';
 import {
-  DEFAULT_TRANSFER_MODE,
-  defaultTransferMode,
   narrowTransferMode,
-  assertConservativeOrInstant,
-  coercePartialTransferRequestMode,
 } from '../../../modules/payments/transfer/transfer-mode-shims';
 import { isSphereError } from '../../../core/errors';
 import type {
@@ -51,9 +52,10 @@ describe('narrowTransferMode', () => {
   });
 
   it('returns the SDK default ("instant") when called with `undefined`', () => {
+    // T.1.B.2 — `DEFAULT_TRANSFER_MODE` and `defaultTransferMode` were
+    // removed; the default is now an internal constant of the shim
+    // module, asserted indirectly via the `undefined` input contract.
     expect(narrowTransferMode(undefined)).toBe('instant');
-    expect(DEFAULT_TRANSFER_MODE).toBe('instant');
-    expect(defaultTransferMode()).toBe('instant');
   });
 
   it('passes "txf" through as a valid InternalTransferMode (post-T.7.A)', () => {
@@ -92,53 +94,11 @@ describe('narrowTransferMode', () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// Runtime narrowing — `assertConservativeOrInstant`
-// ---------------------------------------------------------------------------
-
-describe('assertConservativeOrInstant', () => {
-  it('passes through "instant" and "conservative"', () => {
-    expect(assertConservativeOrInstant('instant')).toBe('instant');
-    expect(assertConservativeOrInstant('conservative')).toBe('conservative');
-  });
-
-  it('throws UNSUPPORTED_TRANSFER_MODE for "txf"', () => {
-    let captured: unknown = null;
-    try {
-      assertConservativeOrInstant('txf' as InternalTransferMode);
-      expect.fail('expected SphereError, got no throw');
-    } catch (err) {
-      captured = err;
-    }
-    expect(isSphereError(captured)).toBe(true);
-    if (isSphereError(captured)) {
-      expect(captured.code).toBe('UNSUPPORTED_TRANSFER_MODE');
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Runtime narrowing — `coercePartialTransferRequestMode`
-// ---------------------------------------------------------------------------
-
-describe('coercePartialTransferRequestMode', () => {
-  it('reads `transferMode` off a partial request and narrows it', () => {
-    expect(coercePartialTransferRequestMode({ transferMode: 'instant' })).toBe('instant');
-    expect(coercePartialTransferRequestMode({ transferMode: 'conservative' })).toBe('conservative');
-    expect(coercePartialTransferRequestMode({})).toBe('instant');
-    expect(coercePartialTransferRequestMode({ transferMode: undefined })).toBe('instant');
-  });
-
-  it('passes "txf" cast onto the request field through (post-T.7.A)', () => {
-    // T.7.A — the legacy TXF arm is wired; the shim no longer rejects.
-    // Routing is gated by `features.senderUxf === true` inside
-    // PaymentsModule.send (the dispatcher delegates to the txf-sender
-    // orchestrator).
-    expect(
-      coercePartialTransferRequestMode({ transferMode: 'txf' as TransferMode }),
-    ).toBe('txf');
-  });
-});
+// T.1.B.2 — the per-call-site narrowings `assertConservativeOrInstant`
+// and `coercePartialTransferRequestMode` were removed once production
+// callers (T.7.C) pass `transferMode` explicitly, so the dispatcher can
+// invoke `narrowTransferMode` directly. Their tests are dropped with the
+// shims they covered.
 
 // ---------------------------------------------------------------------------
 // Compile-time widening — `TransferRequest` accepts the seven new optional fields

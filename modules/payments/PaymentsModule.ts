@@ -69,7 +69,7 @@ import { TokenRegistry } from '../../registry';
 import { logger } from '../../core/logger';
 import { SphereError } from '../../core/errors';
 import {
-  coercePartialTransferRequestMode,
+  narrowTransferMode,
   requireLegacyCoinSlot,
   type LegacyCoinTransferRequest,
 } from './transfer/transfer-mode-shims';
@@ -1648,7 +1648,11 @@ export class PaymentsModule {
     // legacy code path below remains the only routing branch.
     // TODO(T.2.B/T.2.C/T.5.B/T.7.A): consume the new TransferRequest
     // fields once the multi-asset validator and delivery resolver land.
-    const internalTransferMode = coercePartialTransferRequestMode(originalRequest);
+    //
+    // T.1.B.2 — call `narrowTransferMode` directly; the per-call-site
+    // alias `coercePartialTransferRequestMode` was removed once T.7.C
+    // migrated production callers to pass `transferMode` explicitly.
+    const internalTransferMode = narrowTransferMode(originalRequest.transferMode);
 
     // T.2.D.1 — UXF conservative dispatcher (feature-flag-gated).
     // When `features.senderUxf === true` AND the request is conservative-mode,
@@ -1671,9 +1675,9 @@ export class PaymentsModule {
     // cast — the public type still excludes `'txf'`), route through the
     // legacy TXF orchestrator. The orchestrator branches internally on
     // `txfFinalization` (default `'conservative'` per §10.1) to pick the
-    // §4.4.1 vs §4.4.2 sequence. The narrowing shim
-    // (`coercePartialTransferRequestMode`) now passes `'txf'` through
-    // post-T.7.A — the dispatcher is the new routing point.
+    // §4.4.1 vs §4.4.2 sequence. The narrowing shim (`narrowTransferMode`)
+    // passes `'txf'` through post-T.7.A — the dispatcher is the routing
+    // point.
     if (this.features.senderUxf && internalTransferMode === 'txf') {
       const txfFinalization: 'conservative' | 'instant' =
         originalRequest.txfFinalization === 'instant' ? 'instant' : 'conservative';
