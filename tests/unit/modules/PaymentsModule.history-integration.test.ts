@@ -845,7 +845,16 @@ describe('History deduplication — integration flows', () => {
   // ===========================================================================
 
   describe('resolveSenderInfo', () => {
-    it('should resolve nametag and address from transport', async () => {
+    // T.7.B.5 / C9 — `resolveSenderInfo` now delegates to the
+    // `nametag-reresolver` module, which always returns a
+    // `senderNametagSource` discriminator alongside the optional
+    // `senderAddress` / `senderNametag`. The old "empty object on
+    // failure" contract is replaced with `{ senderNametagSource:
+    // 'untrusted-payload' }`. See
+    // `modules/payments/transfer/nametag-reresolver.ts` for the
+    // full contract.
+
+    it('should resolve nametag and address from transport (binding-event source)', async () => {
       const ctx = setupModule('alice');
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const mod = ctx.module as any;
@@ -853,9 +862,10 @@ describe('History deduplication — integration flows', () => {
       const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
       expect(info.senderNametag).toBe('alice');
       expect(info.senderAddress).toBe('DIRECT://sender');
+      expect(info.senderNametagSource).toBe('binding-event');
     });
 
-    it('should return empty object when transport throws', async () => {
+    it('should drop nametag/address with untrusted-payload source when transport throws', async () => {
       const ctx = setupModule();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (ctx.transport as any).resolveTransportPubkeyInfo = vi.fn().mockRejectedValue(new Error('network error'));
@@ -863,10 +873,12 @@ describe('History deduplication — integration flows', () => {
       const mod = ctx.module as any;
 
       const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info).toEqual({});
+      expect(info.senderNametag).toBeUndefined();
+      expect(info.senderAddress).toBeUndefined();
+      expect(info.senderNametagSource).toBe('untrusted-payload');
     });
 
-    it('should return empty object when transport lacks resolveTransportPubkeyInfo', async () => {
+    it('should drop nametag/address with untrusted-payload source when transport lacks resolveTransportPubkeyInfo', async () => {
       const ctx = setupModule();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       delete (ctx.transport as any).resolveTransportPubkeyInfo;
@@ -874,10 +886,12 @@ describe('History deduplication — integration flows', () => {
       const mod = ctx.module as any;
 
       const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info).toEqual({});
+      expect(info.senderNametag).toBeUndefined();
+      expect(info.senderAddress).toBeUndefined();
+      expect(info.senderNametagSource).toBe('untrusted-payload');
     });
 
-    it('should return empty object when resolveTransportPubkeyInfo returns null', async () => {
+    it('should drop nametag/address with untrusted-payload source when resolveTransportPubkeyInfo returns null', async () => {
       const ctx = setupModule();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (ctx.transport as any).resolveTransportPubkeyInfo = vi.fn().mockResolvedValue(null);
@@ -885,7 +899,9 @@ describe('History deduplication — integration flows', () => {
       const mod = ctx.module as any;
 
       const info = await mod.resolveSenderInfo(SENDER_TRANSPORT_PUBKEY);
-      expect(info).toEqual({});
+      expect(info.senderNametag).toBeUndefined();
+      expect(info.senderAddress).toBeUndefined();
+      expect(info.senderNametagSource).toBe('untrusted-payload');
     });
   });
 
