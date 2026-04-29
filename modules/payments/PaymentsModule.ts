@@ -95,6 +95,20 @@ import {
   type IngestWorkerPoolOptions,
   type UxfV1Payload,
 } from './transfer/ingest-worker-pool';
+// T.5.D — operator escape hatch (`importInclusionProof` +
+// `revalidateCascadedChildren`). Class types only; the wiring layer
+// (Sphere bootstrap) constructs the runtime instances and installs them
+// via the dedicated install* methods below.
+import {
+  InclusionProofImporter,
+  type ImportInclusionProofCallOptions,
+  type ImportProofResult,
+  type ImportableInclusionProof,
+} from './transfer/import-inclusion-proof';
+import {
+  RevalidateCascadedRunner,
+  type RevalidationResult,
+} from './transfer/revalidate-cascaded';
 
 /**
  * Narrow guard for the UXF v1.0 wire shapes accepted by the
@@ -1330,6 +1344,122 @@ export class PaymentsModule {
     }
     this.ingestPool =
       pool instanceof IngestWorkerPool ? pool : new IngestWorkerPool(pool);
+  }
+
+  // ===========================================================================
+  // T.5.D — Operator escape-hatch (`importInclusionProof` +
+  // `revalidateCascadedChildren`). The wiring layer (Sphere bootstrap)
+  // installs the importer + runner via the two `install*` methods below;
+  // the public API methods then delegate to whichever is installed.
+  //
+  // Both are NULL until installed — the public methods throw
+  // `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if invoked before installation,
+  // which surfaces a clear error in environments where the legacy code
+  // paths run without the UXF-aware infrastructure.
+  // ===========================================================================
+
+  /** @internal — set by `installInclusionProofImporter()`. */
+  private inclusionProofImporter: InclusionProofImporter | null = null;
+  /** @internal — set by `installRevalidateCascadedRunner()`. */
+  private revalidateCascadedRunner: RevalidateCascadedRunner | null = null;
+
+  /**
+   * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
+   * hatch). Idempotent — a second call replaces the previous importer.
+   *
+   * The Sphere bootstrap layer constructs the importer with the
+   * production-wired manifest store, disposition storage, finalization
+   * queue scanner, proof verifier, graft callback, override callback,
+   * and event emitter. Tests inject a fully-mocked importer.
+   */
+  installInclusionProofImporter(importer: InclusionProofImporter): void {
+    this.inclusionProofImporter = importer;
+  }
+
+  /**
+   * Install the operator cascade-revalidation runner (T.5.D consumer of
+   * T.5.B.5 cascade walker). Idempotent — a second call replaces the
+   * previous runner.
+   */
+  installRevalidateCascadedRunner(runner: RevalidateCascadedRunner): void {
+    this.revalidateCascadedRunner = runner;
+  }
+
+  /**
+   * §6.3 stuck-PENDING escape hatch — accept an inclusion proof from
+   * outside the normal aggregator path and apply it to local state.
+   *
+   * The caller MUST set `allowInvalidOverride: true` to flip a token
+   * from `_invalid` back to the active pool — silent default would
+   * breach the §5.6 monotonicity invariant. The override is sticky
+   * across CRDT merges (`overrideApplied: true` survives every future
+   * merge) and emits `transfer:override-applied` for the operator
+   * console's audit trail.
+   *
+   * The 10 sub-cases of §6.3 are implemented in
+   * `transfer/import-inclusion-proof.ts` (T.5.D).
+   *
+   * @param addr     Address scope.
+   * @param tokenId  Canonical token id.
+   * @param proof    Operator-supplied inclusion proof descriptor.
+   * @param options  Optional `{ allowInvalidOverride, operatorPubkey,
+   *                  currentTime }`.
+   *
+   * @throws SphereError `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if the
+   *   importer has not been installed. Callers SHOULD NOT silently
+   *   no-op on this — surface it to the operator console.
+   */
+  async importInclusionProof(
+    addr: string,
+    tokenId: string,
+    proof: ImportableInclusionProof,
+    options?: ImportInclusionProofCallOptions,
+  ): Promise<ImportProofResult> {
+    if (this.inclusionProofImporter === null) {
+      throw new SphereError(
+        'PaymentsModule.importInclusionProof: inclusion-proof importer not installed. ' +
+          'Call installInclusionProofImporter() during bootstrap.',
+        'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED',
+      );
+    }
+    return this.inclusionProofImporter.importInclusionProof(
+      addr,
+      tokenId,
+      proof,
+      options,
+    );
+  }
+
+  /**
+   * §6.1.1 operator-explicit cascade reversal — re-validate every
+   * cascaded child of `parentTokenId` after the operator has flipped
+   * the parent via {@link importInclusionProof}.
+   *
+   * Transitive: when a child re-validates, the runner recurses into
+   * the child's children. Bounded depth (`MAX_CHAIN_DEPTH` = 64) and
+   * per-call-stack visited-set defend against corrupted-manifest
+   * cycles (W32).
+   *
+   * The actual cascade walk semantics live in T.5.B.5
+   * (`transfer/cascade-walker.ts`); this method delegates to a
+   * dedicated runner (`transfer/revalidate-cascaded.ts`) that consumes
+   * the cascade walker's manifest-scanner contract.
+   *
+   * @throws SphereError `OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED` if the
+   *   runner has not been installed.
+   */
+  async revalidateCascadedChildren(
+    addr: string,
+    parentTokenId: string,
+  ): Promise<RevalidationResult> {
+    if (this.revalidateCascadedRunner === null) {
+      throw new SphereError(
+        'PaymentsModule.revalidateCascadedChildren: revalidate-cascaded runner not installed. ' +
+          'Call installRevalidateCascadedRunner() during bootstrap.',
+        'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED',
+      );
+    }
+    return this.revalidateCascadedRunner.run(addr, parentTokenId);
   }
 
   /**
