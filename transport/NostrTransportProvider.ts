@@ -27,6 +27,10 @@ import {
   isReadReceipt,
 } from '@unicitylabs/nostr-js-sdk';
 import type { BindingInfo } from '@unicitylabs/nostr-js-sdk';
+import {
+  SUPPORTED_WIRE_PROTOCOLS,
+  SUPPORTED_ASSET_KINDS,
+} from './transport-provider';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { logger } from '../core/logger';
 import { hexToBytes as strictHexToBytes } from '../core/hex';
@@ -893,6 +897,11 @@ export class NostrTransportProvider implements TransportProvider {
   /**
    * Convert a BindingInfo (from nostr-js-sdk) to PeerInfo (sphere-sdk type).
    * Computes PROXY address from nametag if available.
+   *
+   * T.8.B — When a nametag is resolved we additionally do a best-effort
+   * query for the peer's capability-bearing identity binding event (lives
+   * on a different d-tag than the nametag binding). Capability hints are
+   * informational only and the lookup never throws on failure.
    */
   private async bindingInfoToPeerInfo(binding: BindingInfo, nametag?: string): Promise<PeerInfo> {
     const nametagValue = nametag || binding.nametag;
@@ -909,6 +918,11 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
+    // T.8.B — Best-effort capability hint enrichment. Upstream BindingInfo
+    // is lossy w.r.t. wireProtocols / assetKinds; query the predictable
+    // per-pubkey identity binding event to recover them. Failure is silent.
+    const capabilities = await this.fetchCapabilityHints(binding.transportPubkey);
+
     return {
       nametag: nametagValue,
       transportPubkey: binding.transportPubkey,
@@ -917,7 +931,81 @@ export class NostrTransportProvider implements TransportProvider {
       directAddress: binding.directAddress || '',
       proxyAddress,
       timestamp: binding.timestamp,
+      ...capabilities,
     };
+  }
+
+  /**
+   * T.8.B — Extract capability hints (`wireProtocols`, `assetKinds`) from
+   * a binding event's raw JSON content.
+   *
+   * Returns an object whose keys are present ONLY when the corresponding
+   * field appeared in the parsed content. This preserves the W20 absent vs
+   * empty distinction at the type level: a missing key on the returned
+   * object means "field absent on the wire" (for `assetKinds` callers
+   * default to `['coin']` per W20); an EMPTY array means "field present
+   * but empty" (informational quirk, no W20 default).
+   */
+  private extractCapabilityHints(rawContent: unknown): {
+    wireProtocols?: ReadonlyArray<string>;
+    assetKinds?: ReadonlyArray<string>;
+  } {
+    if (!rawContent || typeof rawContent !== 'object') return {};
+    const content = rawContent as Record<string, unknown>;
+    const out: {
+      wireProtocols?: ReadonlyArray<string>;
+      assetKinds?: ReadonlyArray<string>;
+    } = {};
+    const wp = content.wire_protocols;
+    if (Array.isArray(wp)) {
+      out.wireProtocols = wp.filter((v): v is string => typeof v === 'string');
+    }
+    const ak = content.asset_kinds;
+    if (Array.isArray(ak)) {
+      out.assetKinds = ak.filter((v): v is string => typeof v === 'string');
+    }
+    return out;
+  }
+
+  /**
+   * T.8.B — Best-effort fetch of capability hints for a peer.
+   *
+   * Queries the predictable per-pubkey identity binding event (the one
+   * `publishIdentityBindingWithCapabilities` writes) and returns the hints
+   * extracted from its content. Returns an empty object on any failure
+   * (relay error, no event, parse error). Capability hints are
+   * informational and MUST NOT block resolution.
+   */
+  private async fetchCapabilityHints(transportPubkey: string): Promise<{
+    wireProtocols?: ReadonlyArray<string>;
+    assetKinds?: ReadonlyArray<string>;
+  }> {
+    try {
+      const events = await this.queryEvents({
+        kinds: [EVENT_KINDS.NAMETAG_BINDING],
+        authors: [transportPubkey],
+        limit: 5,
+      });
+      if (events.length === 0) return {};
+      // Newest-first; pick the first event whose content carries either
+      // capability field. Older entries authored by the same pubkey may
+      // pre-date T.8.B and lack the fields entirely.
+      const sorted = [...events].sort((a, b) => b.created_at - a.created_at);
+      for (const event of sorted) {
+        try {
+          const content = JSON.parse(event.content) as Record<string, unknown>;
+          const hints = this.extractCapabilityHints(content);
+          if (hints.wireProtocols !== undefined || hints.assetKinds !== undefined) {
+            return hints;
+          }
+        } catch {
+          // Skip unparseable events.
+        }
+      }
+      return {};
+    } catch {
+      return {};
+    }
   }
 
   /**
@@ -941,6 +1029,8 @@ export class NostrTransportProvider implements TransportProvider {
 
     try {
       const content = JSON.parse(bindingEvent.content);
+      // T.8.B — Capability hints from the same content blob (when present).
+      const capabilities = this.extractCapabilityHints(content);
 
       return {
         nametag: content.nametag || undefined,
@@ -950,6 +1040,7 @@ export class NostrTransportProvider implements TransportProvider {
         directAddress: content.direct_address || '',
         proxyAddress: content.proxy_address || undefined,
         timestamp: bindingEvent.created_at * 1000,
+        ...capabilities,
       };
     } catch {
       return {
@@ -992,6 +1083,8 @@ export class NostrTransportProvider implements TransportProvider {
     for (const [pubkey, event] of byAuthor) {
       try {
         const content = JSON.parse(event.content);
+        // T.8.B — Capability hints from the same event content (when present).
+        const capabilities = this.extractCapabilityHints(content);
         results.push({
           nametag: content.nametag || undefined,
           transportPubkey: pubkey,
@@ -1000,6 +1093,7 @@ export class NostrTransportProvider implements TransportProvider {
           directAddress: content.direct_address || '',
           proxyAddress: content.proxy_address || undefined,
           timestamp: event.created_at * 1000,
+          ...capabilities,
         });
       } catch {
         // Skip unparseable events
@@ -1108,6 +1202,20 @@ export class NostrTransportProvider implements TransportProvider {
 
         if (success) {
           logger.debug('Nostr', 'Published identity binding with Unicity ID:', nametag, 'for pubkey:', nostrPubkey.slice(0, 16) + '...');
+
+          // T.8.B — Additionally publish a no-nametag identity binding event
+          // carrying capability hints (wireProtocols + assetKinds, §10.4).
+          // The nametag binding above uses a different d-tag (hashedNametag)
+          // so the two events coexist; capability hints live on the
+          // predictable per-pubkey d-tag and remain queryable via
+          // resolveTransportPubkeyInfo() even when the nametag is unknown
+          // to the caller. We pass the nametag through so the per-pubkey
+          // event also carries the plaintext nametag — without this,
+          // `resolveTransportPubkeyInfo` (most-recent-author wins) would
+          // return `nametag: undefined` after this event lands.
+          await this.publishIdentityBindingWithCapabilities(
+            chainPubkey, l1Address, directAddress, nametag, proxyAddr.toString(),
+          );
         }
         return success;
       } catch (error) {
@@ -1120,17 +1228,91 @@ export class NostrTransportProvider implements TransportProvider {
       }
     }
 
-    // No nametag — delegate to nostr-js-sdk for base identity binding
-    const success = await this.nostrClient!.publishIdentityBinding({
-      publicKey: chainPubkey,
-      l1Address,
-      directAddress,
-    });
+    // No nametag — publish our own identity binding event so we can include
+    // T.8.B capability hints (the upstream SDK's IdentityBindingParams type
+    // does not surface wireProtocols / assetKinds, so we construct the event
+    // ourselves; the d-tag formula is identical so this is wire-compatible
+    // with older consumers that ignore the extra fields).
+    const success = await this.publishIdentityBindingWithCapabilities(
+      chainPubkey, l1Address, directAddress,
+    );
 
     if (success) {
       logger.debug('Nostr', 'Published identity binding (no Unicity ID) for pubkey:', nostrPubkey.slice(0, 16) + '...');
     }
     return success;
+  }
+
+  /**
+   * T.8.B — Publish a base identity binding event (no nametag) carrying
+   * capability hints in the JSON content.
+   *
+   * Uses the same d-tag formula as the upstream nostr-js-sdk
+   * createIdentityBindingEvent (`SHA256('unicity:identity:' + nostrPubkey)`)
+   * so this event participates in the same parameterized-replaceable slot
+   * (kind 30078 — APP_DATA). Older readers that parse only the four
+   * canonical fields (`public_key`, `l1_address`, `direct_address`,
+   * `proxy_address`) ignore the additional `wire_protocols` and
+   * `asset_kinds` arrays — forward-compatible by construction.
+   *
+   * Spec refs: §10.4 (capability hints), W20 (assetKinds default).
+   */
+  private async publishIdentityBindingWithCapabilities(
+    chainPubkey: string,
+    l1Address: string,
+    directAddress: string,
+    nametag?: string,
+    proxyAddress?: string,
+  ): Promise<boolean> {
+    const nostrPubkey = this.getNostrPubkey();
+    const dTag = bytesToHex(
+      sha256Noble(new TextEncoder().encode('unicity:identity:' + nostrPubkey)),
+    );
+
+    const content: Record<string, unknown> = {
+      public_key: chainPubkey,
+      l1_address: l1Address,
+      direct_address: directAddress,
+      // T.8.B — capability hints (§10.4). Snake_case to match the upstream
+      // content schema convention.
+      wire_protocols: [...SUPPORTED_WIRE_PROTOCOLS],
+      asset_kinds: [...SUPPORTED_ASSET_KINDS],
+    };
+    // T.8.B — preserve the nametag-bearing identity's `nametag` /
+    // `proxy_address` fields on the per-pubkey binding so `resolveTransportPubkeyInfo`
+    // (most-recent-by-author) does not return `nametag: undefined` after
+    // this event lands. Without this, the no-nametag binding would shadow
+    // the nametag-binding's metadata for pubkey-based reverse lookups.
+    if (nametag) content.nametag = nametag;
+    if (proxyAddress) content.proxy_address = proxyAddress;
+
+    // Mirror the upstream's `t` tag indexing so reverse-lookup by address
+    // continues to work. We hash with the same upstream helper to stay in
+    // lock-step with NametagUtils.hashAddressForTag().
+    const { NametagUtils } = await import('@unicitylabs/nostr-js-sdk');
+    const tags: string[][] = [['d', dTag]];
+    if (chainPubkey) {
+      tags.push(['t', NametagUtils.hashAddressForTag(chainPubkey)]);
+    }
+    if (l1Address) {
+      tags.push(['t', NametagUtils.hashAddressForTag(l1Address)]);
+    }
+    if (directAddress) {
+      tags.push(['t', NametagUtils.hashAddressForTag(directAddress)]);
+    }
+
+    const event = await this.createEvent(
+      EVENT_KINDS.NAMETAG_BINDING,
+      JSON.stringify(content),
+      tags,
+    );
+    try {
+      await this.publishEvent(event);
+      return true;
+    } catch (err) {
+      logger.warn('Nostr', 'Failed to publish identity binding with capabilities:', err);
+      return false;
+    }
   }
 
   // Track broadcast subscriptions

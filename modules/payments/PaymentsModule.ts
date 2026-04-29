@@ -45,6 +45,7 @@ import type {
   IncomingPaymentRequest as TransportPaymentRequest,
   IncomingPaymentRequestResponse as TransportPaymentRequestResponse,
 } from '../../transport';
+import { DEFAULT_ASSET_KINDS_WHEN_ABSENT } from '../../transport/transport-provider';
 import type { OracleProvider } from '../../oracle';
 import type { PriceProvider } from '../../price';
 import type {
@@ -1653,6 +1654,18 @@ export class PaymentsModule {
     // alias `coercePartialTransferRequestMode` was removed once T.7.C
     // migrated production callers to pass `transferMode` explicitly.
     const internalTransferMode = narrowTransferMode(originalRequest.transferMode);
+
+    // T.8.B — Capability hint surface check (§10.4, W20).
+    // BEFORE any dispatcher, consult the resolved peer's capability hints.
+    // Mismatches emit `transfer:capability-warning` and proceed unchanged —
+    // we DO NOT auto-strip NFT entries, DO NOT downgrade the wire format,
+    // and DO NOT block the send. The actual interop guarantee comes from
+    // the receiver's T.2.B `UNKNOWN_ASSET_KIND` reject rule. Failure to
+    // resolve the peer here is non-fatal (the dispatcher will resolve
+    // again and surface its own typed error).
+    await this.maybeEmitCapabilityWarning(originalRequest, internalTransferMode).catch((err) => {
+      logger.warn('PaymentsModule', 'Capability warning check failed (informational, ignoring):', err);
+    });
 
     // T.2.D.1 — UXF conservative dispatcher (feature-flag-gated).
     // When `features.senderUxf === true` AND the request is conservative-mode,
@@ -6019,6 +6032,125 @@ export class PaymentsModule {
       `No binding event found. The recipient must publish their identity first.`,
       'INVALID_RECIPIENT',
     );
+  }
+
+  // ===========================================================================
+  // T.8.B — Capability hint surfacing (UXF §10.4 + W20)
+  // ===========================================================================
+
+  /**
+   * Compute the outbound asset kinds carried by a `TransferRequest`.
+   *
+   * Folds the primary `(coinId, amount)` slot (when present) and every
+   * `additionalAssets` entry into the deduplicated set of `'coin' | 'nft' | …`
+   * tokens that will ride in the outbound bundle. Future asset kinds (added
+   * post-v1.0) are passed through verbatim — the receiver's T.2.B
+   * `UNKNOWN_ASSET_KIND` rule polices what's actually accepted.
+   */
+  private computeOutboundAssetKinds(request: TransferRequest): ReadonlyArray<string> {
+    const kinds = new Set<string>();
+    if (request.coinId && request.amount) {
+      kinds.add('coin');
+    }
+    if (request.additionalAssets && request.additionalAssets.length > 0) {
+      for (const asset of request.additionalAssets) {
+        if (asset && typeof asset === 'object' && typeof asset.kind === 'string') {
+          kinds.add(asset.kind);
+        }
+      }
+    }
+    return Array.from(kinds);
+  }
+
+  /**
+   * Map the resolved transfer mode to the canonical wire-protocol label
+   * advertised in identity binding events (per §10.4 / T.8.B).
+   *
+   * Mapping (mirrors the dispatcher routing in `send()`):
+   *   - UXF conservative + features.senderUxf  → `'uxf-car'`  (CAR-embed)
+   *   - UXF instant       + features.senderUxf  → `'uxf-cid'`  (CID-by-ref)
+   *   - explicit `'txf'`  + features.senderUxf  → `'txf'`     (legacy TXF)
+   *   - any mode          + !features.senderUxf → `'txf'`     (legacy single-token)
+   */
+  private resolveOutboundWireProtocol(mode: 'instant' | 'conservative' | 'txf'): string {
+    if (!this.features.senderUxf) return 'txf';
+    if (mode === 'conservative') return 'uxf-car';
+    if (mode === 'instant') return 'uxf-cid';
+    return 'txf';
+  }
+
+  /**
+   * T.8.B — Pre-send capability hint check.
+   *
+   * Resolves the recipient via the transport, inspects the binding event's
+   * capability hints, and emits `transfer:capability-warning` when the
+   * outbound bundle's asset kinds or wire protocol are not advertised by
+   * the peer. **DOES NOT** auto-strip, auto-coerce, or block the send —
+   * the warning is informational and the actual interop guarantee comes
+   * from the receiver's T.2.B `UNKNOWN_ASSET_KIND` reject rule and the
+   * §10.4 forward-compat behaviour.
+   *
+   * W20: if the peer's binding event is silent about `assetKinds`, treat
+   * the peer as `['coin']` (older v1.0 wallet pre-dating NFTs). Any
+   * outbound NFT entry will then trigger a warning.
+   *
+   * Failure modes (all silent — capability hints are best-effort):
+   *  - Resolve returns null (unknown peer): skip the check entirely.
+   *  - Both `wireProtocols` and `assetKinds` absent: skip emission unless
+   *    an outbound asset kind is OUTSIDE the W20 default `['coin']`.
+   *  - Resolve throws: caller logs and continues (see `send()`).
+   */
+  private async maybeEmitCapabilityWarning(
+    request: TransferRequest,
+    mode: 'instant' | 'conservative' | 'txf',
+  ): Promise<void> {
+    const transport = this.deps?.transport;
+    if (!transport?.resolve) return;
+
+    let peerInfo: PeerInfo | null;
+    try {
+      peerInfo = (await transport.resolve(request.recipient)) ?? null;
+    } catch {
+      // Resolve failures aren't capability concerns — let the dispatcher
+      // surface its own typed error.
+      return;
+    }
+    if (!peerInfo) return;
+
+    const outboundAssetKinds = this.computeOutboundAssetKinds(request);
+    const outboundWireProtocol = this.resolveOutboundWireProtocol(mode);
+
+    // W20: assetKinds absent on the wire ⇒ assume ['coin']. We preserve
+    // the empty-array case (peer present but explicitly empty) as-is so
+    // diagnostics distinguish "older peer" from "explicitly empty".
+    const recipientAssetKinds: ReadonlyArray<string> = peerInfo.assetKinds
+      ?? DEFAULT_ASSET_KINDS_WHEN_ABSENT;
+    const recipientWireProtocols = peerInfo.wireProtocols;
+
+    const advertisedKinds = new Set(recipientAssetKinds);
+    const mismatchedAssetKinds = outboundAssetKinds.filter(k => !advertisedKinds.has(k));
+
+    // wireProtocolMismatch fires only when hints were PRESENT and the
+    // outbound protocol is not in the set. Absent hints make NO claim.
+    let wireProtocolMismatch = false;
+    if (recipientWireProtocols !== undefined) {
+      const advertisedWP = new Set(recipientWireProtocols);
+      wireProtocolMismatch = !advertisedWP.has(outboundWireProtocol);
+    }
+
+    if (mismatchedAssetKinds.length === 0 && !wireProtocolMismatch) {
+      return; // Everything advertised — nothing to warn about.
+    }
+
+    this.deps!.emitEvent('transfer:capability-warning', {
+      recipientTransportPubkey: peerInfo.transportPubkey,
+      recipientAssetKinds,
+      recipientWireProtocols,
+      outboundAssetKinds,
+      outboundWireProtocol,
+      mismatchedAssetKinds,
+      wireProtocolMismatch,
+    });
   }
 
   // ===========================================================================
