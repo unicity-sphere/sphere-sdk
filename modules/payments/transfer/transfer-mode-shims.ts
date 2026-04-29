@@ -72,16 +72,24 @@ export const defaultTransferMode = (): TransferMode => DEFAULT_TRANSFER_MODE;
  * - `undefined`        → {@link DEFAULT_TRANSFER_MODE}.
  * - `'instant'`        → `'instant'`.
  * - `'conservative'`   → `'conservative'`.
- * - `'txf'` (pre-T.7.A, only reachable via `as TransferMode` cast in
- *   tests or untyped JS callers) → throws `SphereError(UNSUPPORTED_TRANSFER_MODE)`.
+ * - `'txf'` (post-T.7.A, only reachable via `as TransferMode` cast — the
+ *   public type intentionally omits it) → `'txf'`. The dispatcher in
+ *   {@link import('../PaymentsModule').PaymentsModule.send} routes the
+ *   value to the legacy TXF orchestrator via T.7.A.
  * - any other string  → throws `SphereError(UNSUPPORTED_TRANSFER_MODE)`.
  *
- * SHIM: removed in T.1.B.2 once T.7.C migrates call-sites — but this
- * particular function is the residual guard kept post-cleanup (see file
- * header). Most other helpers in this file disappear entirely.
+ * SHIM: kept post-T.1.B.2 cleanup as the residual runtime guard against
+ * future protocol versions adding modes the SDK has not yet routed (see
+ * file header).
+ *
+ * **Pre/post-T.7.A note**: prior to T.7.A this function rejected `'txf'`
+ * with `UNSUPPORTED_TRANSFER_MODE`. T.7.A landed the wire orchestrator
+ * (`txf-sender.ts`) and the dispatcher branch in PaymentsModule, so
+ * `'txf'` now passes through identically to `'instant'` and
+ * `'conservative'`.
  *
  * @throws SphereError code=`UNSUPPORTED_TRANSFER_MODE` for any value that
- *         narrows to neither `'instant'` nor `'conservative'`.
+ *         is not one of the three known {@link InternalTransferMode} arms.
  */
 export function narrowTransferMode(
   mode: TransferMode | undefined,
@@ -93,23 +101,19 @@ export function narrowTransferMode(
   // of `TransferMode`, so the assignment is type-sound.
   if (mode === 'instant' || mode === 'conservative') return mode;
 
-  // The two narrow-down rejection branches: `'txf'` (planned, pre-T.7.A)
-  // and "anything else" (untyped callers passing a future protocol value).
-  // Both surface as one canonical error code so UI / tests can match a
-  // single string. The runtime check is paranoid — TypeScript's public
-  // type only includes `'instant' | 'conservative'`, but a pure JS caller
-  // (or a test using `as TransferMode`) can still smuggle in any string.
+  // T.7.A — the legacy `'txf'` arm is now wired. The dispatcher in
+  // PaymentsModule routes it to `txf-sender.sendTxfUxf` based on the
+  // request's `txfFinalization` field (default 'conservative'). The
+  // shim itself is value-pass-through; the runtime check is paranoid
+  // because TypeScript's public type still excludes `'txf'` (a pure JS
+  // caller or a test using `as TransferMode` can smuggle in any string).
   if ((mode as InternalTransferMode) === 'txf') {
-    throw new SphereError(
-      "TXF transfer mode is not yet implemented; awaits T.7.A. Pass " +
-      "{ transferMode: 'instant' } or omit the field to use the default.",
-      'UNSUPPORTED_TRANSFER_MODE',
-    );
+    return 'txf';
   }
 
   throw new SphereError(
     `Unsupported transferMode value: ${JSON.stringify(mode)}. ` +
-    "Allowed values: 'instant', 'conservative'.",
+    "Allowed values: 'instant', 'conservative', 'txf'.",
     'UNSUPPORTED_TRANSFER_MODE',
   );
 }

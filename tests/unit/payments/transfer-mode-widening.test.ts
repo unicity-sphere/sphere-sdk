@@ -24,7 +24,7 @@ import {
   assertConservativeOrInstant,
   coercePartialTransferRequestMode,
 } from '../../../modules/payments/transfer/transfer-mode-shims';
-import { isSphereError, type SphereErrorCode } from '../../../core/errors';
+import { isSphereError } from '../../../core/errors';
 import type {
   AdditionalAsset,
   AssetTarget,
@@ -56,25 +56,17 @@ describe('narrowTransferMode', () => {
     expect(defaultTransferMode()).toBe('instant');
   });
 
-  it('rejects "txf" (only reachable via cast) with UNSUPPORTED_TRANSFER_MODE', () => {
-    // The cast models a pure-JS caller / a test-time forced value; pre-T.7.A
-    // there is no production code path that produces `'txf'` against the
-    // public type. The shim is the runtime guard against this.
-    let captured: unknown = null;
-    try {
-      narrowTransferMode('txf' as TransferMode);
-      expect.fail('expected SphereError, got no throw');
-    } catch (err) {
-      captured = err;
-    }
-    expect(isSphereError(captured)).toBe(true);
-    if (isSphereError(captured)) {
-      const code: SphereErrorCode = captured.code;
-      expect(code).toBe('UNSUPPORTED_TRANSFER_MODE');
-      // Message mentions T.7.A so future maintainers find the planned
-      // unblocking task without grepping the spec.
-      expect(captured.message).toMatch(/T\.7\.A/);
-    }
+  it('passes "txf" through as a valid InternalTransferMode (post-T.7.A)', () => {
+    // Pre-T.7.A this case threw `UNSUPPORTED_TRANSFER_MODE`. T.7.A
+    // landed the legacy TXF orchestrator (`txf-sender.ts`) and the
+    // dispatcher branch in PaymentsModule, so the shim now passes the
+    // value through. The cast models a pure-JS caller / a test-time
+    // forced value — TypeScript's public `TransferMode` type still
+    // omits `'txf'`. The dispatcher gates the actual routing on
+    // `features.senderUxf === true`.
+    const out = narrowTransferMode('txf' as TransferMode);
+    expect(out).toBe('txf');
+    expectTypeOf(out).toEqualTypeOf<InternalTransferMode>();
   });
 
   it('rejects an arbitrary unknown string with UNSUPPORTED_TRANSFER_MODE', () => {
@@ -137,18 +129,14 @@ describe('coercePartialTransferRequestMode', () => {
     expect(coercePartialTransferRequestMode({ transferMode: undefined })).toBe('instant');
   });
 
-  it('rejects "txf" cast onto the request field', () => {
-    let captured: unknown = null;
-    try {
-      coercePartialTransferRequestMode({ transferMode: 'txf' as TransferMode });
-      expect.fail('expected SphereError, got no throw');
-    } catch (err) {
-      captured = err;
-    }
-    expect(isSphereError(captured)).toBe(true);
-    if (isSphereError(captured)) {
-      expect(captured.code).toBe('UNSUPPORTED_TRANSFER_MODE');
-    }
+  it('passes "txf" cast onto the request field through (post-T.7.A)', () => {
+    // T.7.A — the legacy TXF arm is wired; the shim no longer rejects.
+    // Routing is gated by `features.senderUxf === true` inside
+    // PaymentsModule.send (the dispatcher delegates to the txf-sender
+    // orchestrator).
+    expect(
+      coercePartialTransferRequestMode({ transferMode: 'txf' as TransferMode }),
+    ).toBe('txf');
   });
 });
 
