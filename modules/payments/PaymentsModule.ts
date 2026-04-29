@@ -1653,6 +1653,17 @@ export class PaymentsModule {
     // T.1.B.2 — call `narrowTransferMode` directly; the per-call-site
     // alias `coercePartialTransferRequestMode` was removed once T.7.C
     // migrated production callers to pass `transferMode` explicitly.
+    //
+    // T.7.E (default-mode flip) — when `originalRequest.transferMode` is
+    // `undefined`, the shim returns `'instant'` per §2.5 ("Default:
+    // `transferMode: 'instant'` over UXF"). The string value is the same
+    // as the historical default; the SEMANTIC flip is in the dispatcher
+    // below: with `features.senderUxf === true` the default routes to
+    // `dispatchUxfInstantSend` (UXF instant). Pre-T.7.E the equivalent
+    // default was "instant over legacy TXF" (the staged-rollout fall-
+    // through that T.8.D removes). Callers who need the legacy single-
+    // token TXF wire format MUST pass `transferMode: 'txf'` explicitly
+    // (and have `features.senderUxf` ON — see T.7.A's typed reject).
     const internalTransferMode = narrowTransferMode(originalRequest.transferMode);
 
     // T.8.B — Capability hint surface check (§10.4, W20).
@@ -1679,6 +1690,15 @@ export class PaymentsModule {
     // When `features.senderUxf === true` AND the request is instant-mode,
     // route through the new UXF instant orchestrator. Falls through to
     // the legacy single-token TXF path otherwise.
+    //
+    // T.7.E — this is the post-flip "default" arm: when the caller omitted
+    // `transferMode`, `narrowTransferMode(undefined)` returned `'instant'`,
+    // which lands here when `senderUxf` is ON. So `payments.send({
+    // recipient, coinId, amount })` with the flag on is now routed
+    // through `instant-sender` → emits a UXF bundle (`uxf-cid` wire
+    // shape per §3.1). The fall-through to the legacy single-token path
+    // when `senderUxf` is OFF is the staged-rollout escape hatch removed
+    // by T.8.D.
     if (this.features.senderUxf && internalTransferMode === 'instant') {
       return this.dispatchUxfInstantSend(originalRequest);
     }

@@ -60,9 +60,17 @@ import type {
 } from '../../../types';
 
 // =============================================================================
-// Module-private default — not exported. The historical SDK default is
-// 'instant'; flipping it is the work of T.7.E (UXF cutover), at which point
-// the constant migrates to the dispatcher and this file shrinks again.
+// Module-private default — not exported. Post T.7.E (the "default-mode flip"),
+// the SDK default is `'instant'` over UXF, NOT `'instant'` over legacy TXF.
+// The string value is unchanged — `'instant'` — but the **semantic meaning**
+// is now: route through the UXF instant-sender (`instant-sender.ts`) when
+// `features.senderUxf === true` (which becomes the default in T.8.D's
+// production cutover). When `features.senderUxf === false` (the staged-
+// rollout state), the value still narrows to `'instant'` and the legacy
+// single-token TXF path runs — this is the temporary back-compat fall-
+// through removed by T.8.D.
+//
+// Spec ref: §2.5 ("Default: `transferMode: 'instant'` over UXF").
 // =============================================================================
 
 const DEFAULT_TRANSFER_MODE: TransferMode = 'instant';
@@ -81,19 +89,27 @@ const DEFAULT_TRANSFER_MODE: TransferMode = 'instant';
  * {@link InternalTransferMode}, applying the SDK default and rejecting any
  * value that is not yet routed.
  *
- * - `undefined`        → `'instant'` (historical SDK default).
+ * - `undefined`        → `'instant'` — post T.7.E this means "instant over
+ *   UXF" per §2.5 (semantic flip; literal value unchanged). Routing is
+ *   chosen by the dispatcher in
+ *   {@link import('../PaymentsModule').PaymentsModule.send}: when
+ *   `features.senderUxf === true`, the value lands in
+ *   {@link import('./instant-sender').sendInstantUxf}. When the flag is
+ *   `false` (staged-rollout state, removed by T.8.D), the value still
+ *   narrows to `'instant'` and the legacy single-token TXF path runs.
  * - `'instant'`        → `'instant'`.
  * - `'conservative'`   → `'conservative'`.
  * - `'txf'` (only reachable via `as TransferMode` cast — the public type
- *   intentionally omits it) → `'txf'`. The dispatcher in
- *   {@link import('../PaymentsModule').PaymentsModule.send} routes the
- *   value to the legacy TXF orchestrator (`txf-sender.ts`).
+ *   intentionally omits it) → `'txf'`. The dispatcher routes the value to
+ *   the legacy TXF orchestrator (`txf-sender.ts`).
  * - any other string  → throws `SphereError(UNSUPPORTED_TRANSFER_MODE)`.
  *
  * SHIM (residual, post T.1.B.2). reason: "TXF arm narrowing + UNKNOWN-mode
  * guard; the only conversion between the public TransferMode union and the
- * internal one. T.7.E may move this into the dispatcher when the default
- * flips to UXF."
+ * internal one. T.7.E preserves this shim — only the SEMANTIC meaning of
+ * the default changes (legacy-TXF instant → UXF instant). T.8.D moves the
+ * narrowing into the dispatcher once the legacy single-token path is
+ * removed entirely."
  *
  * @internal
  *
@@ -103,7 +119,15 @@ const DEFAULT_TRANSFER_MODE: TransferMode = 'instant';
 export function narrowTransferMode(
   mode: TransferMode | undefined,
 ): InternalTransferMode {
-  // Default — historical SDK behavior (`request.transferMode ?? 'instant'`).
+  // Default — post T.7.E "instant over UXF" per §2.5. The literal value is
+  // unchanged (`'instant'`); the semantic flip is owned by the dispatcher
+  // in `PaymentsModule.send()`: with `features.senderUxf === true` the
+  // value routes to `sendInstantUxf`. The narrowing shim cannot itself
+  // pick the wire format — that is `senderUxf`'s job — so the contract
+  // remains: `undefined` → `'instant'`. Callers that need the legacy
+  // wire-shape MUST pass `transferMode: 'txf'` explicitly (and flip
+  // `features.senderUxf` ON for the TXF orchestrator to be reachable per
+  // T.7.A's typed reject).
   if (mode === undefined) return DEFAULT_TRANSFER_MODE;
 
   // Public values pass through. `InternalTransferMode` is a strict superset
