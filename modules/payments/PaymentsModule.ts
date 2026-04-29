@@ -109,6 +109,7 @@ import {
   RevalidateCascadedRunner,
   type RevalidationResult,
 } from './transfer/revalidate-cascaded';
+import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 
 /**
  * Narrow guard for the UXF v1.0 wire shapes accepted by the
@@ -839,6 +840,62 @@ export interface UxfTransferFeatures {
    * they remain on the legacy adapter path.
    */
   readonly recipientUxf?: boolean;
+  /**
+   * T.7.B — when `true` AND a legacy-shape adapter has been installed
+   * via {@link installLegacyShapeAdapter}, every inbound legacy event
+   * (Sphere TXF, V6 `COMBINED_TRANSFER`, V5/V4 `INSTANT_SPLIT`, SDK
+   * legacy `{token, proof}`) is decomposed into N synthetic
+   * disposition records and written through the T.3.C disposition
+   * writer alongside the existing legacy storage path. Instant-TXF
+   * arrivals (any tx with `inclusionProof: null`) are enqueued on the
+   * recipient finalization queue (T.5.C) — same chain-mode semantics
+   * as instant-UXF.
+   *
+   * Default `false` (legacy storage only — no OrbitDB profile writes
+   * for legacy events). Independent of {@link recipientUxf}: a wallet
+   * MAY enable UXF v1.0 ingest without legacy adaptation, or vice
+   * versa. See §10.2 single-pipeline convergence guarantee.
+   */
+  readonly recipientLegacyAdapter?: boolean;
+}
+
+/**
+ * T.7.B — legacy-shape adapter runner. Owned by the bootstrap layer
+ * (Sphere) and installed via {@link PaymentsModule.installLegacyShapeAdapter}.
+ *
+ * The runner is the single injection point that captures every
+ * dependency `adaptLegacyShape` needs (predicate evaluator,
+ * authenticator verifier, proof verifier, oracle, manifest reader,
+ * finalization-queue enqueuer, disposition writer). Keeping the
+ * dependency graph behind a single interface avoids bloating
+ * `PaymentsModuleDependencies` with seven new fields.
+ *
+ * **Contract**:
+ *  - `processLegacy` MUST NOT throw under normal operation; failures
+ *    are routed into the disposition pipeline as `STRUCTURAL_INVALID`
+ *    records by the adapter itself. A throw out of `processLegacy`
+ *    is logged by the module and treated as a no-op for that event.
+ *  - The runner is responsible for routing every returned
+ *    `DispositionRecord` through the T.3.C disposition writer; the
+ *    module does NOT inspect the records itself.
+ *  - The runner SHOULD enqueue instant-TXF entries on the recipient
+ *    finalization queue (T.5.C) when the adapter detects them.
+ */
+export interface LegacyShapeAdapterRunner {
+  /**
+   * Process one inbound legacy event end-to-end. The implementation
+   * builds a `LegacyShapeAdapterInput`, calls `adaptLegacyShape`, and
+   * routes the resulting `DispositionRecord[]` through the T.3.C
+   * writer.
+   *
+   * @param payload   The decoded legacy payload (one of four shapes).
+   * @param senderTransportPubkey  The AUTHENTICATED Nostr signing
+   *                               pubkey of the event author.
+   */
+  processLegacy(
+    payload: unknown,
+    senderTransportPubkey: string,
+  ): Promise<void>;
 }
 
 export interface PaymentsModuleConfig {
@@ -941,6 +998,29 @@ export class PaymentsModule {
    */
   private ingestPool: IngestWorkerPool | null = null;
 
+  /**
+   * Recipient-side legacy-shape adapter runner (T.7.B).
+   *
+   * Invoked by `handleIncomingTransfer` for every event whose payload
+   * matches one of the four §3.4 legacy shapes (Sphere TXF, V6
+   * `COMBINED_TRANSFER`, V5/V4 `INSTANT_SPLIT`, SDK legacy `{token,
+   * proof}`). The runner is responsible for ALL of:
+   *  - decomposing the event into per-token entries,
+   *  - calling `adaptLegacyShape` with all required disposition-engine
+   *    hooks pre-wired,
+   *  - routing each returned `DispositionRecord` through the T.3.C
+   *    {@link DispositionWriter},
+   *  - enqueueing instant-TXF entries on the recipient finalization
+   *    queue (T.5.C).
+   *
+   * `null` until the bootstrap layer (Sphere) installs a runner via
+   * {@link installLegacyShapeAdapter}. When `null` AND
+   * `features.recipientLegacyAdapter === true`, the module logs a
+   * warning per arrival but does NOT route through the adapter (graceful
+   * degradation: the pre-existing legacy storage path still runs).
+   */
+  private legacyShapeAdapterRunner: LegacyShapeAdapterRunner | null = null;
+
   /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
   readonly l1: L1PaymentsModule | null;
 
@@ -1030,6 +1110,8 @@ export class PaymentsModule {
     this.features = Object.freeze({
       senderUxf: config?.features?.senderUxf ?? false,
       recipientUxf: config?.features?.recipientUxf ?? false,
+      // T.7.B — legacy-shape adapter routing flag (default OFF).
+      recipientLegacyAdapter: config?.features?.recipientLegacyAdapter ?? false,
     });
 
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
@@ -1460,6 +1542,26 @@ export class PaymentsModule {
       );
     }
     return this.revalidateCascadedRunner.run(addr, parentTokenId);
+  }
+
+  /**
+   * Install the recipient-side legacy-shape adapter runner (T.7.B).
+   *
+   * When `features.recipientLegacyAdapter === true` AND a runner is
+   * installed, every inbound legacy event is routed through the runner
+   * BEFORE the existing legacy storage path runs. The two paths are
+   * additive: the runner produces dispositions for the OrbitDB profile
+   * (T.3.C); the existing path continues to populate the legacy token
+   * storage. Both observe the same event from the same transport
+   * subscription.
+   *
+   * Idempotent: a second call replaces the previous runner.
+   *
+   * **No-op when `features.recipientLegacyAdapter === false`** — the
+   * runner is dormant and the legacy path runs alone.
+   */
+  installLegacyShapeAdapter(runner: LegacyShapeAdapterRunner): void {
+    this.legacyShapeAdapterRunner = runner;
   }
 
   /**
@@ -7013,6 +7115,42 @@ export class PaymentsModule {
         logger.warn('Payments', 'handleIncomingTransfer: ingest pool rejected bundle', err);
       }
       return;
+    }
+
+    // T.7.B — legacy-shape adapter routing. When the flag is on AND a
+    // runner has been installed, route the legacy event through the
+    // adapter BEFORE the legacy storage path runs. The two paths are
+    // additive: the adapter produces dispositions for the OrbitDB
+    // profile (T.3.C disposition writer); the legacy path below
+    // continues to populate the legacy token storage. Failures inside
+    // the runner are logged but do NOT abort the legacy path — both
+    // pipelines must converge to the same outcome per §10.2.
+    if (
+      this.features.recipientLegacyAdapter &&
+      this.legacyShapeAdapterRunner !== null &&
+      isLegacyTokenTransferPayload(transfer.payload)
+    ) {
+      try {
+        await this.legacyShapeAdapterRunner.processLegacy(
+          transfer.payload,
+          transfer.senderTransportPubkey,
+        );
+      } catch (err) {
+        // The runner's contract specifies "MUST NOT throw under normal
+        // operation" — a throw indicates a wiring bug. We log and
+        // continue to the legacy path so the receiver still records
+        // the token in its legacy storage.
+        logger.warn(
+          'Payments',
+          'handleIncomingTransfer: legacy-shape adapter runner threw',
+          err,
+        );
+      }
+      // Note: deliberately falling through to the legacy storage path
+      // below. The adapter writes to the OrbitDB profile; the legacy
+      // path writes to the per-address token storage. Both must run
+      // for §10.2 single-pipeline convergence to hold across the
+      // transition window.
     }
 
     try {
