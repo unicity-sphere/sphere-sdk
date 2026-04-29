@@ -129,6 +129,16 @@ export interface TransferRequest {
   readonly addressMode?: AddressMode;
   /** Transfer mode: 'instant' (default) sends via Nostr immediately, 'conservative' collects all proofs first */
   readonly transferMode?: TransferMode;
+  /**
+   * When true, source-token selection MAY include unconfirmed/pending tokens
+   * (chain-mode source selection). Default false (only finalized tokens).
+   *
+   * Forced-conservative coercion: When the receiver flow is bridged to an
+   * external escrow (e.g., swap deposit invoices), this flag is silently
+   * coerced to `false` by the bridging caller. The coercion is surfaced via
+   * `TransferResult.overrides`. See AccountingModule.payInvoice().
+   */
+  readonly allowPendingTokens?: boolean;
   /** Invoice refund address (DIRECT://) — embedded in on-chain message for return routing */
   readonly invoiceRefundAddress?: string;
   /** Invoice contact info — embedded in on-chain message for receipt/notice delivery */
@@ -158,6 +168,17 @@ export interface TransferResult {
   readonly tokens: Token[];
   /** Per-token transfer details — one entry per source token consumed */
   readonly tokenTransfers: TokenTransferDetail[];
+  /**
+   * Caller-visible record of silent overrides applied by intermediary modules
+   * to the original request. Each entry is a stable, machine-readable token
+   * (e.g., 'allowPendingTokens-coerced-to-false'). Surfaced when the SDK
+   * silently overrides a caller-supplied flag — for example, when an invoice
+   * payment bridging to escrow forces conservative source selection.
+   *
+   * When no overrides apply, the field is either omitted or an empty array.
+   * Backward-compatible with consumers that ignore unknown TransferResult fields.
+   */
+  readonly overrides?: ReadonlyArray<string>;
   error?: string;
 }
 

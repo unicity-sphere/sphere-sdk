@@ -748,6 +748,26 @@ export interface PayInvoiceParams {
    * `contacts[0].address → refundAddress → senderAddress → null`
    */
   readonly contact?: { address: string; url?: string };
+  /**
+   * When true, request source-token selection that MAY include unconfirmed
+   * tokens (chain-mode). Forwarded verbatim to PaymentsModule.send() for
+   * non-escrow invoice flows.
+   *
+   * §2.5 forced-conservative coercion (T.7.D / W21): when the invoice is
+   * bridged to an external escrow (registered via
+   * `markInvoiceEscrowBridged()`), this flag is silently coerced to `false`
+   * regardless of the caller's value. The coercion is surfaced via
+   * `TransferResult.overrides = ['allowPendingTokens-coerced-to-false']`.
+   *
+   * Rationale: escrow flows depend on payout verifiability and dispute-safe
+   * settlement. Pending source tokens introduce a finalization race window
+   * that can leave the escrow holding tokens whose ancestry is contested.
+   * Forcing conservative source selection guarantees every deposit-bearing
+   * token is fully finalized before the escrow takes custody.
+   *
+   * Defaults to `false` when omitted.
+   */
+  readonly allowPendingTokens?: boolean;
 }
 
 /**
