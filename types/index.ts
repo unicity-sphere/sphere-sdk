@@ -528,6 +528,7 @@ export type SphereEventType =
   | 'transfer:security-alert'
   | 'transfer:proof-superseded'
   | 'transfer:override-applied'
+  | 'transfer:capability-warning'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -859,6 +860,54 @@ export interface SphereEventMap {
     readonly overrideAppliedBy?: string;
     readonly previousReason: import('./disposition').DispositionReason;
     readonly transition: 'invalid→valid' | 'invalid→pending';
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.8.B — capability hint mismatch (§10.4).
+   *
+   * Emitted by the sender BEFORE a UXF send when the resolved recipient's
+   * identity-binding-event capability hints (`wireProtocols`, `assetKinds`)
+   * indicate the recipient may not understand the bundle being shipped.
+   *
+   * The event is INFORMATIONAL ONLY: the sender DOES NOT auto-strip
+   * unsupported asset kinds, DOES NOT downgrade the wire format, and
+   * proceeds to publish the bundle unchanged. The actual interop
+   * guarantee comes from the receiver's T.2.B `UNKNOWN_ASSET_KIND`
+   * reject rule and the §10.4 forward-compat behaviour.
+   *
+   * Per W20: when the binding event is SILENT about `assetKinds`, the
+   * peer is treated as `['coin']` (older v1.0 wallet pre-dating NFTs).
+   * In that case, an outbound NFT entry triggers this warning.
+   *
+   * Payload fields:
+   *  - `recipientTransportPubkey` — authenticated Nostr signing pubkey
+   *    of the resolved peer (NOT a self-claimed envelope field).
+   *  - `recipientAssetKinds` — the hint as observed (or the W20 default
+   *    `['coin']` when absent). Empty array means hints were present
+   *    but explicitly empty (informational quirk).
+   *  - `recipientWireProtocols` — observed wire protocol hints. Absent
+   *    on the wire ⇒ `undefined` here (no W20 default for this field).
+   *  - `outboundAssetKinds` — the kinds present in the outbound bundle
+   *    (subset of `'coin' | 'nft'` for v1.0).
+   *  - `outboundWireProtocol` — the wire format the sender intends to
+   *    use for this bundle (`'uxf-car' | 'uxf-cid' | 'txf'`).
+   *  - `mismatchedAssetKinds` — kinds in `outboundAssetKinds` NOT
+   *    advertised by the peer. Triggers the warning when non-empty.
+   *  - `wireProtocolMismatch` — `true` when `outboundWireProtocol` is
+   *    NOT in `recipientWireProtocols` (and hints were present). When
+   *    hints are absent the field is `false` (no negative claim).
+   *
+   * Spec refs: §10.4 (capability hints — informational), W20 (assetKinds
+   * absent ⇒ default ['coin']), T.2.B (receiver-side UNKNOWN_ASSET_KIND
+   * reject — the actual interop guarantee).
+   */
+  'transfer:capability-warning': {
+    readonly recipientTransportPubkey: string;
+    readonly recipientAssetKinds: ReadonlyArray<string>;
+    readonly recipientWireProtocols?: ReadonlyArray<string>;
+    readonly outboundAssetKinds: ReadonlyArray<string>;
+    readonly outboundWireProtocol: string;
+    readonly mismatchedAssetKinds: ReadonlyArray<string>;
+    readonly wireProtocolMismatch: boolean;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
