@@ -766,7 +766,228 @@ export async function processDisposition(
 }
 
 // =============================================================================
-// 4. Re-exports (for caller convenience)
+// 4. revaluate — §5.5 step 9 entry point (W5)
+// =============================================================================
+
+/**
+ * Input for {@link revaluate} — the §5.5 step 9 "queue-drain → status
+ * transition" re-evaluator.
+ *
+ * Distinct from {@link DispositionEngineInput} because the re-evaluation
+ * runs against the recipient's MERGED LOCAL state, not against an
+ * incoming bundle:
+ *  - There is no `bundleCid` / `senderTransportPubkey` for the merged
+ *    chain (the merge may have folded multiple bundles together — there
+ *    is no canonical "originating" bundle for the merged state). The
+ *    caller passes through the `bundleCidForProvenance` that should be
+ *    stamped on the resulting manifest delta if VALID/PENDING is
+ *    surfaced; production wires this to the most-recent-arrived
+ *    bundle's CID.
+ *  - The `mode` discriminator does not gate (re-evaluation by definition
+ *    runs after every queue entry resolved successfully — there are no
+ *    unfinalized txs left). The hook stays for hydration parity.
+ *  - The hooks set is the [B] / [D] / [E] subset; the [A] / [C]
+ *    cryptographic checks already passed at first ingest and the chain
+ *    content has only ACCRUED proofs since (monotonic-graft invariant
+ *    per §5.6) — the merger never invalidates a previously-valid
+ *    proof.
+ */
+export interface DispositionRevaluateInput {
+  // ---- Pool / token context ----
+  readonly tokenRootHash: ContentHash;
+  readonly pool: ReadonlyMap<ContentHash, UxfElement>;
+  /** Provenance to stamp on the resulting manifest delta (if any).
+   *  Production passes the most-recent-arrived bundle's CID. */
+  readonly bundleCidForProvenance: string;
+  /** Provenance to stamp on the resulting manifest delta (if any). */
+  readonly senderTransportPubkeyForProvenance: string;
+  // ---- Recipient identity ----
+  readonly ourPubkey: Uint8Array;
+  // ---- Injected hooks (subset of full DispositionEngineInput) ----
+  readonly hydrateChain: HydrateChainFn;
+  readonly readLocalManifest: ReadLocalManifestFn;
+  readonly evaluatePredicate: EvaluatePredicateFn;
+  readonly oracleIsSpent: OracleIsSpentFn;
+}
+
+/**
+ * Re-evaluate a token's §5.3 disposition after its finalization queue
+ * has fully drained — the §5.5 step 9 "queue-drain → status transition"
+ * entry point (W5).
+ *
+ * Distinct from {@link processDisposition}:
+ *  - Skips [A] hydration-throw routing → STRUCTURAL_INVALID is still
+ *    surfaced on hydration failure but every other [A]/[C] cryptographic
+ *    check is OMITTED — the chain has only accrued proofs since first
+ *    ingest, and the §5.6 monotonic-graft invariant guarantees any
+ *    previously-valid proof remains valid.
+ *  - Re-runs [B] (current-state predicate target), [D] (conflict check
+ *    against the local manifest), and [E] (oracle.isSpent on the
+ *    now-finalized current state). These are exactly the three checks
+ *    §5.5 step 9 mandates re-running.
+ *  - Returns either:
+ *     - `VALID`        — all checks pass.
+ *     - `AUDIT('not-our-state')` — [B] surfaces NOT_OUR_CURRENT_STATE.
+ *     - `CONFLICTING`  — [D] surfaces a CONFLICTING merge.
+ *     - `AUDIT('off-record-spend')` — [E] returns isSpent=true.
+ *     - `INVALID('structural')` / `'predicate-eval'` — defensive
+ *       routing for hook throws.
+ *
+ * The re-evaluator NEVER returns `PENDING` — by §5.5 step 9 invariant,
+ * the queue is fully drained before invocation. If the caller invokes
+ * with un-drained queue entries, the residual unfinalized txs in the
+ * chain would surface PENDING in {@link processDisposition} but we
+ * route to STRUCTURAL_INVALID here (caller bug — must drain first).
+ *
+ * **Pure routing** — the function performs NO storage writes; the
+ * caller (T.5.C worker) routes the returned `DispositionRecord` to the
+ * disposition writer (T.3.C). The returned record's `bundleCid` /
+ * `senderTransportPubkey` are taken from the input's provenance fields.
+ */
+export async function revaluate(
+  input: DispositionRevaluateInput,
+): Promise<DispositionRecord> {
+  // Adapter: most of the §5.3 routing helpers above expect a
+  // `bundleCid` + `senderTransportPubkey` shape; the re-evaluator
+  // synthesizes one from its provenance fields. (Re-using the same
+  // builders keeps the reason-string set canonical.)
+  const provenance = {
+    bundleCid: input.bundleCidForProvenance,
+    senderTransportPubkey: input.senderTransportPubkeyForProvenance,
+  } as const;
+
+  // ---- Step 1: hydrate the chain. Hydration throw → STRUCTURAL_INVALID.
+  let chain: HydratedChain;
+  try {
+    chain = await input.hydrateChain(input.tokenRootHash, input.pool);
+  } catch {
+    return structuralInvalid(provenance, '', input.tokenRootHash, 'structural');
+  }
+
+  if (typeof chain.tokenId !== 'string' || chain.tokenId.length === 0) {
+    return structuralInvalid(provenance, '', input.tokenRootHash, 'structural');
+  }
+
+  // §5.5 step 9 invariant: caller MUST have drained the queue. Defensive
+  // check: if any tx still lacks a proof, route to STRUCTURAL_INVALID
+  // — the caller is buggy, not the chain.
+  const unfinalizedCount = chain.chain.reduce(
+    (acc, tx) => acc + (tx.inclusionProof === null ? 1 : 0),
+    0,
+  );
+  if (unfinalizedCount > 0) {
+    return structuralInvalid(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'structural',
+    );
+  }
+
+  // ---- Step 5 [B]: predicate evaluation against current state.
+  let predicateResult;
+  try {
+    predicateResult = await input.evaluatePredicate(
+      chain.currentStatePredicate,
+      input.ourPubkey,
+    );
+  } catch {
+    return structuralInvalid(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'predicate-eval',
+    );
+  }
+  if (!predicateResult.ok) {
+    return structuralInvalid(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'predicate-eval',
+    );
+  }
+  if (!predicateResult.bindsToUs) {
+    return audit(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'not-our-state',
+    );
+  }
+
+  // ---- Step 6 [D]: conflict check against the local manifest.
+  let localManifest: ManifestEntryDelta | undefined;
+  try {
+    localManifest = await input.readLocalManifest(chain.tokenId);
+  } catch {
+    return structuralInvalid(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'structural',
+    );
+  }
+
+  const newHead = chainHeadHash(chain);
+  if (
+    localManifest !== undefined &&
+    localManifest.rootHash !== newHead &&
+    localManifest.status !== 'invalid'
+  ) {
+    const incomingConflicts = localManifest.conflictingHeads ?? [];
+    const conflictingHeads: ContentHash[] = [
+      localManifest.rootHash,
+      ...incomingConflicts,
+    ];
+    return conflictingDisposition(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      {
+        rootHash: newHead,
+        status: 'conflicting',
+        conflictingHeads,
+      },
+      conflictingHeads,
+    );
+  }
+
+  // ---- Step 7 [E]: spent-check on the now-finalized current state.
+  let isSpent: boolean;
+  try {
+    isSpent = await input.oracleIsSpent(chain.currentDestinationStateHash);
+  } catch {
+    return structuralInvalid(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'structural',
+    );
+  }
+  if (isSpent) {
+    return audit(
+      provenance,
+      chain.tokenId,
+      input.tokenRootHash,
+      'off-record-spend',
+    );
+  }
+
+  return manifestDisposition(
+    provenance,
+    chain.tokenId,
+    input.tokenRootHash,
+    'VALID',
+    {
+      rootHash: newHead,
+      status: 'valid',
+    },
+  );
+}
+
+// =============================================================================
+// 5. Re-exports (for caller convenience)
 // =============================================================================
 
 export type { ContentHash, UxfElement } from '../../../uxf/types.js';
