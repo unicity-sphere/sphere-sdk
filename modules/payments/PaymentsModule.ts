@@ -90,6 +90,22 @@ import {
   type TxfSenderDeps,
 } from './transfer/txf-sender';
 import { classifyToken as classifyTokenLike } from './transfer/classify-token';
+import {
+  IngestWorkerPool,
+  type IngestWorkerPoolOptions,
+  type UxfV1Payload,
+} from './transfer/ingest-worker-pool';
+
+/**
+ * Narrow guard for the UXF v1.0 wire shapes accepted by the
+ * {@link IngestWorkerPool}. Legacy shapes have no `kind` field; v1.0
+ * shapes carry `kind: 'uxf-car' | 'uxf-cid'`.
+ */
+function isUxfV1Payload(value: unknown): value is UxfV1Payload {
+  if (value === null || typeof value !== 'object') return false;
+  const kind = (value as { kind?: unknown }).kind;
+  return kind === 'uxf-car' || kind === 'uxf-cid';
+}
 import { parseInvoiceMemoForOnChain } from '../accounting/memo.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { hexToBytes as fromHex } from '../../core/hex';
@@ -799,6 +815,16 @@ export interface UxfTransferFeatures {
    *  the send through the UXF wire-format orchestrator. Default `false`
    *  (legacy single-token TXF path). */
   readonly senderUxf?: boolean;
+  /**
+   * T.3.E — when `true`, route incoming UXF v1.0 bundles (`kind` of
+   * `'uxf-car'` or `'uxf-cid'`) through the {@link IngestWorkerPool}
+   * (§5.0 N parallel workers + W7 per-tokenId fairness +
+   * W23 bundle-internal sequential). Default `false` (legacy
+   * single-threaded `handleIncomingTransfer` path). Legacy V4/V5/V6
+   * shapes (no `kind` field) bypass the pool regardless of this flag —
+   * they remain on the legacy adapter path.
+   */
+  readonly recipientUxf?: boolean;
 }
 
 export interface PaymentsModuleConfig {
@@ -881,6 +907,25 @@ export class PaymentsModule {
    */
   private readonly features: Required<UxfTransferFeatures>;
   private deps: PaymentsModuleDependencies | null = null;
+
+  /**
+   * Recipient-side ingest worker pool (T.3.E §5.0).
+   *
+   * When `features.recipientUxf === true` AND a pool has been wired via
+   * {@link installIngestWorkerPool}, incoming UXF v1.0 bundles
+   * (`kind: 'uxf-car' | 'uxf-cid'`) are enqueued onto this pool's
+   * bounded queue and dispatched across N=16 parallel workers. Legacy
+   * shapes (V4/V5/V6/`{token,proof}`) bypass the pool regardless of
+   * the feature flag.
+   *
+   * `null` until the caller (Sphere bootstrap) installs a pool — the
+   * pool itself depends on the disposition engine + writer wiring,
+   * which is built one layer up. Default `null` means UXF v1.0 bundles
+   * are dropped with a warning when `recipientUxf` is on but no pool
+   * is installed (graceful degradation — the flag should not silently
+   * route to a stub).
+   */
+  private ingestPool: IngestWorkerPool | null = null;
 
   /** L1 (ALPHA blockchain) payments sub-module (null if disabled) */
   readonly l1: L1PaymentsModule | null;
@@ -970,6 +1015,7 @@ export class PaymentsModule {
     // can't enable the UXF arm at runtime (rollback safety).
     this.features = Object.freeze({
       senderUxf: config?.features?.senderUxf ?? false,
+      recipientUxf: config?.features?.recipientUxf ?? false,
     });
 
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
@@ -1260,6 +1306,33 @@ export class PaymentsModule {
   }
 
   /**
+   * Install the recipient-side ingest worker pool (T.3.E §5.0).
+   *
+   * Idempotent: a second call replaces the previous pool, destroying it
+   * first. The bootstrap layer (Sphere) calls this once after wiring up
+   * the disposition engine + writer; subsequent calls are reserved for
+   * test harnesses.
+   *
+   * **No-op when `features.recipientUxf === false`** — the pool sits
+   * unused and the legacy `handleIncomingTransfer` path runs for every
+   * arrival. Installing a pool is cheap (no workers spin up until
+   * `IngestWorkerPool`'s constructor runs); the gate is the flag.
+   *
+   * @param pool A pre-constructed {@link IngestWorkerPool} OR a
+   *             {@link IngestWorkerPoolOptions} object (the module
+   *             constructs the pool itself in the latter case).
+   */
+  installIngestWorkerPool(pool: IngestWorkerPool | IngestWorkerPoolOptions): void {
+    if (this.ingestPool) {
+      // Fire-and-forget destroy — caller is replacing the pool, so
+      // they don't care about prior worker drainage timing.
+      void this.ingestPool.destroy().catch(() => undefined);
+    }
+    this.ingestPool =
+      pool instanceof IngestWorkerPool ? pool : new IngestWorkerPool(pool);
+  }
+
+  /**
    * Cleanup all subscriptions, polling jobs, and pending resolvers.
    *
    * Should be called when the wallet is being shut down or the module is
@@ -1299,6 +1372,14 @@ export class PaymentsModule {
 
     if (this.l1) {
       this.l1.destroy();
+    }
+
+    // T.3.E — destroy the ingest worker pool. Fire-and-forget per the
+    // module's destroy() contract (synchronous return). Workers drain
+    // in the background; queued bundles reject with `MODULE_DESTROYED`.
+    if (this.ingestPool) {
+      void this.ingestPool.destroy().catch(() => undefined);
+      this.ingestPool = null;
     }
   }
 
@@ -6784,6 +6865,24 @@ export class PaymentsModule {
     // Ensure load() has completed so dedup checks see all persisted tokens.
     if (!this.loaded && this.loadedPromise) {
       await this.loadedPromise;
+    }
+
+    // T.3.E — UXF v1.0 routing gate. Bundles with an explicit `kind`
+    // discriminator (`'uxf-car'` or `'uxf-cid'`) are first-class UXF
+    // arrivals; route them to the ingest worker pool when the flag is
+    // on AND a pool has been installed. Legacy shapes (no `kind` field)
+    // fall through to the legacy adapter path below regardless of the
+    // flag — they never enter the pool.
+    if (this.features.recipientUxf && this.ingestPool && isUxfV1Payload(transfer.payload)) {
+      try {
+        await this.ingestPool.enqueue(transfer.payload, transfer.senderTransportPubkey);
+      } catch (err) {
+        // INGEST_QUEUE_FULL / INGEST_QUEUE_FULL_PER_TOKEN — already
+        // emitted via the typed event bus inside the pool. We log here
+        // for traceability; the sender's outbox will time out.
+        logger.warn('Payments', 'handleIncomingTransfer: ingest pool rejected bundle', err);
+      }
+      return;
     }
 
     try {
