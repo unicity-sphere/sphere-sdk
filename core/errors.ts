@@ -383,7 +383,40 @@ export type SphereErrorCode =
    * the minimum attempts are observed, deferring termination to the
    * 2× hard safety net for every queue entry.
    */
-  | 'INVALID_POLLING_POLICY';
+  | 'INVALID_POLLING_POLICY'
+  /**
+   * UXF Inter-Wallet Transfer T.3.E — recipient-side ingest worker pool
+   * back-pressure (§5.0).
+   *
+   * The pool maintains a bounded queue (default `INGEST_QUEUE_SIZE = 256`)
+   * that buffers verified bundles between the transport's `onIncomingTransfer`
+   * callback and the N=16 worker fan-out. When every queue slot is occupied,
+   * the next arrival is REJECTED at the door and the sender's outbox
+   * eventually times out (transient-class). The pool emits
+   * `transfer:ingest-queue-full` simultaneously so operators see the
+   * back-pressure signal in real time.
+   *
+   * Per §5.0: this is "a hard back-pressure signal — the recipient cannot
+   * keep up." Distinct from {@link INGEST_QUEUE_FULL_PER_TOKEN}: that is
+   * fairness across token-ids; THIS is total-queue saturation.
+   */
+  | 'INGEST_QUEUE_FULL'
+  /**
+   * UXF Inter-Wallet Transfer T.3.E / W7 — per-tokenId fairness cap inside
+   * the recipient ingest queue (§5.0).
+   *
+   * To prevent an attacker (or buggy peer) from monopolizing the queue with
+   * bundles all targeting the same `tokenId`, the pool counts queue entries
+   * by their claimed token-ids and rejects further arrivals once any one
+   * id has accumulated `INGEST_QUEUE_PER_TOKEN_CAP` (default 16) pending
+   * bundles. Other tokens continue to enqueue normally; only the hot
+   * tokenId is gated.
+   *
+   * Counting rule: an enqueued bundle increments every claimed token-id's
+   * counter; rejection fires if ANY claimed id is over-cap. Workers
+   * decrement the counters when dequeueing.
+   */
+  | 'INGEST_QUEUE_FULL_PER_TOKEN';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

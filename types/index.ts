@@ -522,6 +522,7 @@ export type SphereEventType =
   | 'transfer:failed'
   | 'transfer:operator-alert'
   | 'transfer:fetch-failed'
+  | 'transfer:ingest-queue-full'
   | 'transfer:cascade-failed'
   | 'transfer:trustbase-warning'
   | 'transfer:security-alert'
@@ -682,6 +683,38 @@ export interface SphereEventMap {
     readonly senderTransportPubkey: string;
     readonly gatewaysAttempted: ReadonlyArray<string>;
     readonly failureReasons: ReadonlyArray<string>;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.3.E — recipient ingest queue overflow
+   * (§5.0 / W7).
+   *
+   * Emitted by `IngestWorkerPool.enqueue()` when the back-pressure cap
+   * fires. Two distinct causes share this event for operator-monitoring
+   * purposes:
+   *
+   *   - `'queue-full'`            — the global `INGEST_QUEUE_SIZE`
+   *                                 (default 256) cap is exhausted; ANY
+   *                                 incoming bundle is rejected until
+   *                                 workers drain the queue.
+   *   - `'queue-full-per-token'`  — at least one of the bundle's
+   *                                 claimed token-ids has already
+   *                                 accumulated `INGEST_QUEUE_PER_TOKEN_CAP`
+   *                                 (default 16) pending entries; the
+   *                                 hot tokenId is gated, others continue
+   *                                 to enqueue.
+   *
+   * Per §5.0 the recipient does NOT acknowledge the sender on either
+   * cause; the sender's outbox times out (transient-class). The
+   * `tokenIds` field is populated only for the per-token variant — the
+   * specific id(s) over-cap.
+   */
+  'transfer:ingest-queue-full': {
+    readonly cause: 'queue-full' | 'queue-full-per-token';
+    readonly senderTransportPubkey: string;
+    readonly bundleCid: string;
+    readonly queueSize: number;
+    readonly capacity: number;
+    readonly tokenIds?: ReadonlyArray<string>;
   };
   /**
    * UXF Inter-Wallet Transfer T.5.B / T.5.B.5 — cascade-failed signal
