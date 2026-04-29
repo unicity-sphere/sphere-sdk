@@ -2204,9 +2204,24 @@ export class SwapModule {
     readonly senderNametag?: string;
     readonly timestamp?: number;
   }): void {
+    // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+    // log every non-prefixed JSON DM that mentions invoice_delivery —
+    // helps confirm the SDK saw the DM at all before parseSwapDM rejects.
+    if (dm.content.startsWith('{') && dm.content.includes('"invoice_delivery"')) {
+      logger.warn(LOG_TAG,
+        `diag_swap_dm_arrived sender=${dm.senderPubkey.slice(0, 16)} length=${dm.content.length}`);
+    }
     // Parse the DM into a typed discriminated union (returns null for non-swap DMs)
     const parsed = parseSwapDM(dm.content);
-    if (!parsed) return;
+    if (!parsed) {
+      // Round-5 diag: explicit log when an invoice_delivery DM was parsed away.
+      if (dm.content.startsWith('{') && dm.content.includes('"invoice_delivery"')) {
+        logger.warn(LOG_TAG,
+          `diag_swap_dm_parse_rejected sender=${dm.senderPubkey.slice(0, 16)} ` +
+          `prefix=${dm.content.slice(0, 80)}`);
+      }
+      return;
+    }
 
     // Wrap everything in a promise chain — NEVER propagate errors from DM handler
     void (async () => {
@@ -2722,16 +2737,43 @@ export class SwapModule {
               // invoice_delivery (§12.4.2 + §12.4.3)
               // ---------------------------------------------------------------
               case 'invoice_delivery': {
-                if (!swapId) return;
+                // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+                // log every invoice_delivery DM at every gate. Asymmetric
+                // observation — proposer side received the invoice and
+                // deposited, acceptor side never had the invoice in
+                // accounting. Need to know: did the DM arrive?
+                // pass `isFromExpectedEscrow`? was importInvoice called?
+                logger.warn(LOG_TAG,
+                  `diag_invoice_delivery_received swap_id=${swapId?.slice(0, 16)} sender=${dm.senderPubkey.slice(0, 16)} ` +
+                  `invoice_type=${msg.invoice_type} invoice_id=${msg.invoice_id?.slice(0, 16)}`);
+                if (!swapId) {
+                  logger.warn(LOG_TAG, 'diag_invoice_delivery_dropped reason=no_swap_id');
+                  return;
+                }
                 const swap = this.swaps.get(swapId);
-                if (!swap) return;
+                if (!swap) {
+                  logger.warn(LOG_TAG,
+                    `diag_invoice_delivery_dropped reason=swap_not_in_map swap_id=${swapId.slice(0, 16)} ` +
+                    `known_swap_ids_count=${this.swaps.size}`);
+                  return;
+                }
 
                 // Verify escrow sender
-                if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) return;
+                if (!this.isFromExpectedEscrow(dm.senderPubkey, swap)) {
+                  logger.warn(LOG_TAG,
+                    `diag_invoice_delivery_dropped reason=not_expected_escrow swap_id=${swapId.slice(0, 16)} ` +
+                    `sender=${dm.senderPubkey.slice(0, 16)} ` +
+                    `expected_escrow_pubkey=${swap.escrowPubkey?.slice(0, 16)} ` +
+                    `expected_escrow_addr=${swap.escrowDirectAddress?.slice(0, 24)}`);
+                  return;
+                }
 
                 const deps = this.deps!;
 
                 if (msg.invoice_type === 'deposit') {
+                  logger.warn(LOG_TAG,
+                    `diag_invoice_delivery_proceeding_to_import swap_id=${swapId.slice(0, 16)} ` +
+                    `progress=${swap.progress} invoice_id=${(msg.invoice_id ?? '').slice(0, 16)}`);
                   // §12.4.2: Deposit invoice delivery
                   await this.withSwapGate(swapId, async () => {
                     // Skip terminal swaps — late delivery after cancel/fail creates orphan invoices.
@@ -2739,6 +2781,8 @@ export class SwapModule {
 
                     try {
                       await deps.accounting.importInvoice(msg.invoice_token);
+                      logger.warn(LOG_TAG,
+                        `diag_invoice_imported swap_id=${swapId.slice(0, 16)} invoice_id=${(msg.invoice_id ?? '').slice(0, 16)} type=deposit`);
                     } catch (err) {
                       if (err instanceof SphereError && err.code === 'INVOICE_ALREADY_EXISTS') {
                         // Benign: invoice was already imported (relay re-delivery or
