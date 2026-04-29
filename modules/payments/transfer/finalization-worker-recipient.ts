@@ -139,6 +139,7 @@ import type {
   SphereEventType,
 } from '../../../types';
 import { SphereError } from '../../../core/errors';
+import type { TrustBaseStaleness } from './trustbase-staleness';
 
 // Re-export the shared adapter types for caller convenience. The
 // worker's contracts mirror T.5.B by design; production wiring
@@ -288,6 +289,20 @@ export interface FinalizationWorkerRecipientOptions {
   readonly signal?: AbortSignal;
   /** Aggregator endpoint identifier. Defaults to `'default'`. */
   readonly aggregatorId?: string;
+  /**
+   * Optional trustBase staleness ledger (T.5.F / W41). When supplied,
+   * the worker invokes {@link TrustBaseStaleness.refreshTrustBase} on
+   * the FIRST `NOT_AUTHENTICATED` observation and retries the poll
+   * within the same window. A SECOND `NOT_AUTHENTICATED` after a
+   * successful refresh escalates: the worker emits
+   * `transfer:security-alert` and hard-fails with
+   * `reason: 'proof-invalid'` immediately (per §9.4.1 two-strike).
+   *
+   * If omitted, the worker preserves T.5.C's original behavior:
+   * `NOT_AUTHENTICATED` retries up to `maxProofErrorRetries` then
+   * hard-fails with `reason: 'proof-invalid'` (no security-alert).
+   */
+  readonly trustBaseStaleness?: TrustBaseStaleness;
 }
 
 // =============================================================================
@@ -438,6 +453,7 @@ export class FinalizationWorkerRecipient {
     | 'rpc-release'
     | 'bounded-hold';
   private readonly aggregatorId: string;
+  private readonly trustBaseStaleness: TrustBaseStaleness | undefined;
   private running = false;
   private stopRequested = false;
   private loopPromise: Promise<void> | null = null;
@@ -465,6 +481,7 @@ export class FinalizationWorkerRecipient {
     this.pollingWindowMs = options.caps?.pollingWindowMs ?? POLLING_WINDOW_MS;
     this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'cas';
     this.aggregatorId = options.aggregatorId ?? 'default';
+    this.trustBaseStaleness = options.trustBaseStaleness;
 
     if (
       !Number.isFinite(this.perAggregator) ||
@@ -861,6 +878,14 @@ export class FinalizationWorkerRecipient {
     const tokenSemaphore = this.options.getPerTokenSemaphore(args.tokenId);
     let attempts = 0;
     let proofErrorRetries = 0;
+    // T.5.F two-strike accounting — counts NOT_AUTHENTICATED
+    // observations made in THIS poll loop. The first strike triggers a
+    // (debounced) refresh and a retry. The second strike escalates to
+    // security-alert. Local accounting protects against races where a
+    // sibling worker's refresh bumps the global tag before THIS worker
+    // has had a chance to retry with the refreshed trustBase.
+    let localNotAuthStrikes = 0;
+    let localRefreshAppliedSinceFirstStrike = false;
 
     const releaseAgg = await this.perAggregatorSemaphore.acquire();
     let releaseTok: (() => void) | null = null;
@@ -974,6 +999,11 @@ export class FinalizationWorkerRecipient {
             });
           }
 
+          // T.5.F: an authenticated proof landed — reset the staleness
+          // counter so the next first-strike refreshes again.
+          if (this.trustBaseStaleness !== undefined) {
+            this.trustBaseStaleness.recordAuthenticatedOk(this.aggregatorId);
+          }
           return { kind: 'success', newCid: pollOutcome.newCid };
         }
 
@@ -1004,6 +1034,65 @@ export class FinalizationWorkerRecipient {
               pollOutcome.error ??
               'NOT_AUTHENTICATED — proof verifier rejected validator signatures (likely stale local trustBase per §9.4.1)',
           });
+
+          // T.5.F: two-strike escalation when the staleness ledger is
+          // wired. First strike → emit warning, refresh, retry. Second
+          // strike (only if a refresh has been applied since strike 1)
+          // → emit security-alert + hard-fail.
+          if (this.trustBaseStaleness !== undefined) {
+            localNotAuthStrikes++;
+            // Inform the ledger so its `isTrustBaseStale` /
+            // `lastNotAuthenticatedAt` diagnostics stay accurate.
+            this.trustBaseStaleness.recordNotAuthenticated(
+              this.aggregatorId,
+            );
+
+            if (
+              localNotAuthStrikes >= 2 &&
+              localRefreshAppliedSinceFirstStrike
+            ) {
+              const message = `NOT_AUTHENTICATED persisted after trustBase refresh (strike ${localNotAuthStrikes}): queue entry ${args.entryId} — escalating to security-alert per §9.4.1`;
+              this.options.emit('transfer:security-alert', {
+                tokenId: args.tokenId,
+                requestId: args.requestId,
+                attachedTransactionHash: '',
+                observedTransactionHash: args.ctx.transactionHash,
+                attachedAuthenticator: '',
+                observedAuthenticator: args.ctx.authenticator,
+                message,
+              });
+              return {
+                kind: 'hard-fail',
+                reason: 'proof-invalid',
+                skipCascade: false,
+                message,
+              };
+            }
+
+            // First strike (or retry after a failed refresh) — kick
+            // the refresh (debounced per aggregator) and retry. The
+            // refresh is awaited so the next poll uses the new
+            // trustBase. A failed refresh outcome is treated as
+            // transient: do NOT mark "applied since strike 1"; the
+            // next strike will trigger another refresh attempt.
+            const refresh = await this.trustBaseStaleness.refreshTrustBase(
+              this.aggregatorId,
+              this.options.signal,
+            );
+            if (
+              refresh.kind === 'applied' ||
+              refresh.kind === 'no-change'
+            ) {
+              localRefreshAppliedSinceFirstStrike = true;
+            }
+            // Do NOT advance proofErrorRetries on the staleness path.
+            // The polling-window safety net + signal abort keep the
+            // loop bounded.
+            continue;
+          }
+
+          // No staleness ledger wired — preserve T.5.C's original
+          // budgeted retry behavior.
           proofErrorRetries++;
           if (proofErrorRetries >= this.maxProofErrorRetries) {
             return {
