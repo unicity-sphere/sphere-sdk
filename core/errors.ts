@@ -418,17 +418,207 @@ export type SphereErrorCode =
    */
   | 'INGEST_QUEUE_FULL_PER_TOKEN';
 
+// ===========================================================================
+// W40 — SphereError redaction layer (T.8.C)
+// ===========================================================================
+//
+// Some error paths (notably the §5.5 / §6.1 finalization worker's
+// REQUEST_ID_MISMATCH client-error branch) place a forensically-useful
+// `cause` on the thrown SphereError that contains raw signed-transaction
+// bytes (`signedTransferTxBytes`) or related signed authenticator/commitment
+// payloads. Those bytes are submission-only secrets — re-emitting them in a
+// log line, a UI surface, or an outgoing telemetry packet would let any
+// observer replay the commitment under our key.
+//
+// The redaction layer below intercepts every `SphereError` constructor call
+// and walks the supplied `cause` ONCE (eagerly, at construction time), deep-
+// cloning it into a redacted view in which any field whose name appears in
+// `REDACTED_FIELDS` is replaced by an opaque marker:
+//
+//     `[REDACTED: <field>(<n>-bytes)]`        for `Uint8Array` values
+//     `[REDACTED: <field>]`                    for any other value type
+//
+// The redacted view is what `error.cause` and `error.context` expose; the
+// original `cause` is NOT retained on the error. Callers that wish to
+// preserve forensic detail must redact at *construction* — by the time
+// the SphereError exists, the original bytes are already gone.
+//
+// **Why eager** — a lazy access-time redaction (computing on first read)
+// would still hold the original bytes alive on the error instance, defeating
+// the point if a logger walks the prototype chain or the GC pressure spikes
+// before the first read. Eager redaction also means the marker is stable
+// across `JSON.stringify(err.cause)`, `util.inspect(err)`, and the
+// `error.cause` property walks done by Sentry / pino-pretty / Node's own
+// error formatter.
+//
+// **Why a constant list** — adding a redaction target is a deliberate API
+// decision that should land in this file, not be configurable per call.
+// Drift between throw-sites would defeat the defense.
+
+/**
+ * Field names whose values are eagerly redacted from any SphereError
+ * `cause` (deep walk). Keep in lockstep with §5.5 step 1 and §6.1 forensic
+ * payload conventions.
+ *
+ * Currently:
+ *  - `signedTransferTxBytes`  — see §5.5 `FinalizationQueueEntry` and the
+ *    finalization-worker-sender `REQUEST_ID_MISMATCH` client-error path
+ *    (§6.1, C12/C13). The bytes are the signed transfer transaction body
+ *    submitted to the aggregator; replay would re-execute the transition.
+ *  - `signedCommitmentBytes`  — generic submission payload field used by
+ *    aggregator-client wrappers; redacted defensively for the same reason
+ *    even though no current call site emits it on a SphereError cause.
+ *  - `rawAuthenticator`       — the signed authenticator structure
+ *    submitted alongside a commitment; treated as equally-sensitive.
+ *
+ * Adding a name here is a deliberate API decision — drift between throw
+ * sites defeats the defense. New names land here AND in
+ * `tests/unit/payments/transfer/sphere-error-redaction.test.ts`.
+ */
+export const REDACTED_FIELDS: ReadonlyArray<string> = Object.freeze([
+  'signedTransferTxBytes',
+  'signedCommitmentBytes',
+  'rawAuthenticator',
+]);
+
+const REDACTED_FIELDS_SET: ReadonlySet<string> = new Set(REDACTED_FIELDS);
+
+/**
+ * Recursively deep-clone `value`, replacing any property whose KEY appears
+ * in {@link REDACTED_FIELDS} with a marker string. Cycle-safe via a
+ * `WeakMap` visited set; recursion depth is bounded by `MAX_REDACT_DEPTH`
+ * (defense against an attacker-controlled deeply-nested cause).
+ *
+ * Behavior:
+ *  - Primitive `value` (string/number/boolean/null/undefined/bigint/symbol)
+ *    → returned as-is.
+ *  - `Uint8Array` (or any `ArrayBufferView`) at the TOP level → returned
+ *    as-is. Redaction is FIELD-NAME-driven; a bare buffer doesn't carry
+ *    a name, so we leave it alone. Buffers nested under a redacted-name
+ *    field ARE redacted (and reported with byte length).
+ *  - `Error` instance → returned as-is (Error chains traverse via the
+ *    native `cause` getter, not our walker; we don't deep-clone Error
+ *    instances because Sentry/pino want the original prototype).
+ *  - Plain `Array` → mapped element-by-element, preserving array-ness.
+ *  - Plain object → property-by-property; keys in {@link REDACTED_FIELDS}
+ *    are replaced with a redaction marker. Other keys recurse.
+ *  - Recursion exceeds `MAX_REDACT_DEPTH` → that subtree becomes the
+ *    string `'[REDACTED: depth-cap]'`. This is a defense against a
+ *    pathological attacker-built cause; honest call sites don't approach
+ *    the cap (default 32 levels).
+ */
+const MAX_REDACT_DEPTH = 32;
+
+function redactionMarkerFor(field: string, value: unknown): string {
+  if (value instanceof Uint8Array) {
+    return `[REDACTED: ${field}(${value.byteLength}-bytes)]`;
+  }
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    'byteLength' in value &&
+    typeof (value as { byteLength: unknown }).byteLength === 'number'
+  ) {
+    return `[REDACTED: ${field}(${(value as { byteLength: number }).byteLength}-bytes)]`;
+  }
+  if (typeof value === 'string') {
+    return `[REDACTED: ${field}(${value.length}-chars)]`;
+  }
+  return `[REDACTED: ${field}]`;
+}
+
+function redactValue(
+  value: unknown,
+  visited: WeakMap<object, unknown>,
+  depth: number,
+): unknown {
+  if (depth > MAX_REDACT_DEPTH) return '[REDACTED: depth-cap]';
+  if (value === null || value === undefined) return value;
+  const t = typeof value;
+  if (t !== 'object' && t !== 'function') return value; // primitive
+
+  // Errors are passed through untouched (consumers expect prototype
+  // identity preserved); their own .cause walks via the native getter.
+  if (value instanceof Error) return value;
+
+  // Buffers / typed arrays at the top level are passed through; only
+  // fields named in REDACTED_FIELDS get the marker treatment. Top-level
+  // bare buffers occasionally appear in tests of generic SphereError
+  // shapes — leaving them alone keeps existing forensic-cause shapes
+  // intact unless the caller embeds them under a redacted-name key.
+  if (value instanceof Uint8Array) return value;
+
+  if (typeof value === 'object') {
+    const obj = value as object;
+    const memo = visited.get(obj);
+    if (memo !== undefined) return memo;
+
+    if (Array.isArray(obj)) {
+      const out: unknown[] = [];
+      visited.set(obj, out);
+      for (let i = 0; i < obj.length; i++) {
+        out.push(redactValue(obj[i], visited, depth + 1));
+      }
+      return out;
+    }
+
+    // Plain object: iterate own enumerable string keys.
+    const out: Record<string, unknown> = {};
+    visited.set(obj, out);
+    for (const key of Object.keys(obj)) {
+      const v = (obj as Record<string, unknown>)[key];
+      if (REDACTED_FIELDS_SET.has(key)) {
+        out[key] = redactionMarkerFor(key, v);
+      } else {
+        out[key] = redactValue(v, visited, depth + 1);
+      }
+    }
+    return out;
+  }
+
+  return value;
+}
+
+/**
+ * Deep-redact a `cause` value before it is attached to a `SphereError`.
+ *
+ * Exported for tests and for any caller that wants to pre-redact a value
+ * before logging it independently of throwing. Production code should
+ * rely on the `SphereError` constructor's automatic redaction rather than
+ * calling this directly.
+ */
+export function redactCause(cause: unknown): unknown {
+  if (cause === undefined) return undefined;
+  return redactValue(cause, new WeakMap<object, unknown>(), 0);
+}
+
 export class SphereError extends Error {
   readonly code: SphereErrorCode;
 
+  /**
+   * Eagerly-redacted forensic payload, read-only. Field names listed in
+   * {@link REDACTED_FIELDS} are replaced with opaque markers. The original
+   * `cause` (if any) is NOT retained on the instance — by the time this
+   * error exists, the original bytes are already gone.
+   *
+   * Aliased to the native `Error.cause` getter so Sentry / pino /
+   * `util.inspect` / explicit `error.cause` reads all see the SAME redacted
+   * view.
+   */
+  readonly context: unknown;
+
   constructor(message: string, code: SphereErrorCode, cause?: unknown) {
-    // Steelman³⁸ note: forward `cause` to the native Error constructor
-    // so `err.cause` walks (Sentry, util.inspect, pino-pretty) see the
-    // chain. Previously a redeclared `readonly cause?: unknown` field
-    // shadowed the native getter, breaking standard tooling.
-    super(message, cause !== undefined ? { cause } : undefined);
+    const redacted = redactCause(cause);
+    // Steelman³⁸ note: forward `redacted` (NOT the raw cause) to the native
+    // Error constructor so `err.cause` walks (Sentry, util.inspect,
+    // pino-pretty) see the redacted chain. Previously a redeclared
+    // `readonly cause?: unknown` field shadowed the native getter, breaking
+    // standard tooling. After T.8.C the native cause IS the redacted
+    // payload; the `context` accessor below points at the same value.
+    super(message, redacted !== undefined ? { cause: redacted } : undefined);
     this.name = 'SphereError';
     this.code = code;
+    this.context = redacted;
   }
 }
 
