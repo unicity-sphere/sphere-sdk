@@ -167,6 +167,29 @@ export class AccountingModule {
   private frozenBalances: Map<string, FrozenInvoiceBalances> = new Map();
 
   // ---------------------------------------------------------------------------
+  // T.7.D / W21: Forced-conservative coercion for escrow-bridged invoices
+  // ---------------------------------------------------------------------------
+  //
+  // When a higher-level orchestrator (e.g. SwapModule) routes a payInvoice()
+  // through a deposit invoice owned by an external escrow, the orchestrator
+  // marks the invoice via `markInvoiceEscrowBridged(invoiceId)`. Subsequent
+  // `payInvoice(invoiceId, …)` calls then silently coerce
+  // `allowPendingTokens` to `false` (§2.5 last paragraph) regardless of the
+  // caller's value, surfacing the override via TransferResult.overrides.
+  //
+  // Not persisted: the set is rebuilt on each session by the orchestrator
+  // when it rehydrates its own state (e.g. SwapModule.load() repopulates
+  // invoiceToSwapIndex). This avoids cross-module storage coupling.
+  private escrowBridgedInvoices: Set<string> = new Set();
+
+  /**
+   * Override marker emitted in TransferResult.overrides whenever
+   * `payInvoice()` silently coerces `allowPendingTokens=true` to `false`
+   * because the invoice is bridged to escrow.
+   */
+  static readonly OVERRIDE_FORCED_CONSERVATIVE = 'allowPendingTokens-coerced-to-false';
+
+  // ---------------------------------------------------------------------------
   // Auto-return settings (in-memory, persisted via storage)
   // ---------------------------------------------------------------------------
 
@@ -2289,6 +2312,51 @@ export class AccountingModule {
     });
   }
 
+  // ===========================================================================
+  // T.7.D / W21: Escrow-bridged invoice registry (public API for orchestrators)
+  // ===========================================================================
+
+  /**
+   * Mark an invoice as bridged to an external escrow flow.
+   *
+   * Higher-level orchestrators (SwapModule, future P2P trading flows) call
+   * this when they receive a deposit invoice from an escrow service. From
+   * that moment on, any caller-supplied `allowPendingTokens=true` on
+   * `payInvoice(invoiceId, …)` is silently coerced to `false` per §2.5 last
+   * paragraph, and `TransferResult.overrides` carries the
+   * `'allowPendingTokens-coerced-to-false'` marker so callers can audit the
+   * coercion.
+   *
+   * Idempotent: re-marking an already-marked invoice is a no-op.
+   *
+   * @param invoiceId - The invoice token ID to mark as escrow-bridged.
+   */
+  markInvoiceEscrowBridged(invoiceId: string): void {
+    this.escrowBridgedInvoices.add(invoiceId);
+  }
+
+  /**
+   * Remove the escrow-bridged marker for an invoice (e.g., after the swap
+   * reaches a terminal state and no further payInvoice() calls should be
+   * coerced). Idempotent.
+   *
+   * @param invoiceId - The invoice token ID to unmark.
+   */
+  unmarkInvoiceEscrowBridged(invoiceId: string): void {
+    this.escrowBridgedInvoices.delete(invoiceId);
+  }
+
+  /**
+   * Whether the given invoice is currently registered as bridged to an
+   * external escrow flow. Exposed primarily for tests and audit tooling.
+   *
+   * @param invoiceId - The invoice token ID to check.
+   * @returns `true` if the invoice is escrow-bridged.
+   */
+  isInvoiceEscrowBridged(invoiceId: string): boolean {
+    return this.escrowBridgedInvoices.has(invoiceId);
+  }
+
   /**
    * Pay an invoice — send tokens referencing the given invoice (§2.1, §8.5).
    *
@@ -2298,10 +2366,20 @@ export class AccountingModule {
    * 3. Auto-populates contact info from identity.directAddress if not provided.
    * 4. Calls PaymentsModule.send().
    *
+   * §2.5 forced-conservative coercion (T.7.D / W21):
+   *   When the invoice has been marked escrow-bridged (see
+   *   `markInvoiceEscrowBridged()`), a caller-supplied
+   *   `params.allowPendingTokens = true` is silently coerced to `false`
+   *   before being forwarded to `payments.send()`. The returned
+   *   `TransferResult` carries `overrides: ['allowPendingTokens-coerced-to-false']`
+   *   so callers can audit the coercion. Non-escrow invoice flows pass the
+   *   flag through verbatim and surface no override marker.
+   *
    * @param invoiceId - The invoice token ID.
    * @param params    - Pay parameters: targetIndex, assetIndex?, amount?, freeText?,
-   *                    refundAddress?, contact?.
-   * @returns TransferResult from PaymentsModule.send().
+   *                    refundAddress?, contact?, allowPendingTokens?.
+   * @returns TransferResult from PaymentsModule.send(), with `overrides`
+   *          augmented when forced-conservative coercion was applied.
    *
    * @throws {SphereError} `INVOICE_NOT_FOUND` — invoice token not found locally.
    * @throws {SphereError} `INVOICE_TERMINATED` — invoice is CLOSED or CANCELLED.
@@ -2454,10 +2532,24 @@ export class AccountingModule {
       // §4.4: Build transport memo
       const memo = buildInvoiceMemo(invoiceId, 'F', params.freeText);
 
+      // §2.5 (T.7.D / W21): forced-conservative coercion when the invoice
+      // bridges to an external escrow. We compute `effectiveAllowPending`
+      // and a `coerced` flag here — the flag drives the override marker
+      // appended to the eventual TransferResult below. Coercion is silent:
+      // we do NOT throw, we do NOT log a warning by default (debug mode
+      // logs at info level so audit traces still capture it).
+      const requestedAllowPending = params.allowPendingTokens === true;
+      const isEscrowBridged = this.escrowBridgedInvoices.has(invoiceId);
+      const coerced = requestedAllowPending && isEscrowBridged;
+      const effectiveAllowPending = coerced ? false : requestedAllowPending;
+
       if (this.config.debug) {
         logger.debug(
           LOG_TAG,
-          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}`,
+          `payInvoice(${invoiceId}) → target=${target.address} coinId=${coinId} amount=${sendAmount}` +
+            (coerced
+              ? ' [forced-conservative: allowPendingTokens coerced from true to false (escrow-bridged invoice)]'
+              : ''),
         );
       }
 
@@ -2474,6 +2566,7 @@ export class AccountingModule {
         transferMode: 'instant',
         invoiceRefundAddress: params.refundAddress,
         invoiceContact: effectiveContact,
+        allowPendingTokens: effectiveAllowPending,
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2512,6 +2605,22 @@ export class AccountingModule {
           this.dirtyLedgerEntries.add(invoiceId);
           // Invalidate balance cache for this invoice
           this.balanceCache.delete(invoiceId);
+        }
+
+        // T.7.D / W21: surface the forced-conservative coercion to the caller
+        // by appending the override marker to TransferResult.overrides without
+        // mutating any other field. Preserves backward compatibility with
+        // callers that ignore the field.
+        if (coerced) {
+          const existingOverrides = result.overrides ?? [];
+          const marker = AccountingModule.OVERRIDE_FORCED_CONSERVATIVE;
+          // Idempotent: do not append the marker if a downstream layer already
+          // added it (e.g. a future PaymentsModule that performs its own
+          // coercion). Set semantics — order is informational.
+          const merged = existingOverrides.includes(marker)
+            ? existingOverrides
+            : [...existingOverrides, marker];
+          return { ...result, overrides: merged };
         }
 
         return result;

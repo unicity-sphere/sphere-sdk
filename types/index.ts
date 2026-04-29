@@ -215,8 +215,13 @@ export interface TransferRequest {
    * are eligible as sources. When `true`, the source selector accepts
    * pending-but-confirmed-able sources (§5.5 chain mode).
    *
+   * Forced-conservative coercion (T.7.D): When the receiver flow is bridged to
+   * an external escrow (e.g., swap deposit invoices), this flag is silently
+   * coerced to `false` by the bridging caller. The coercion is surfaced via
+   * `TransferResult.overrides`. See AccountingModule.payInvoice().
+   *
    * @remarks
-   * Type-level only at T.1.B.1; routing is owned by T.5.B / T.5.C.
+   * Routing is owned by T.5.B / T.5.C.
    */
   readonly allowPendingTokens?: boolean;
   /**
@@ -301,6 +306,17 @@ export interface TransferResult {
   readonly tokens: Token[];
   /** Per-token transfer details — one entry per source token consumed */
   readonly tokenTransfers: TokenTransferDetail[];
+  /**
+   * Caller-visible record of silent overrides applied by intermediary modules
+   * to the original request. Each entry is a stable, machine-readable token
+   * (e.g., 'allowPendingTokens-coerced-to-false'). Surfaced when the SDK
+   * silently overrides a caller-supplied flag — for example, when an invoice
+   * payment bridging to escrow forces conservative source selection.
+   *
+   * When no overrides apply, the field is either omitted or an empty array.
+   * Backward-compatible with consumers that ignore unknown TransferResult fields.
+   */
+  readonly overrides?: ReadonlyArray<string>;
   error?: string;
 }
 
