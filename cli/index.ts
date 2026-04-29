@@ -2810,9 +2810,16 @@ async function main() {
           process.exit(1);
         }
         // T.1.B.1 — explicit `: TransferMode` annotation per Plan §T.1.B.1.
+        // T.7.C — production call-site migration: this CLI `send` is one of the
+        // explicitly-tracked production call-sites that MUST pass `transferMode`
+        // explicitly to `payments.send()` so the audit shim removal (T.1.B.2)
+        // can prove no implicit-default consumers remain. The ternary below is
+        // the explicit form — `--instant` / `--conservative` flags map 1:1 to
+        // the two public-mode values, with `--instant` as the unflagged default.
         // The CLI only ever produces public TransferMode values; the
         // PaymentsModule.send() shim narrows to InternalTransferMode and
-        // rejects any future-protocol values (e.g., `'txf'` pre-T.7.A).
+        // rejects any future-protocol values (e.g., `'txf'` not exposed via
+        // CLI flags — see T.7.A's `as TransferMode` test-only cast).
         const transferMode: TransferMode = forceConservative ? 'conservative' : 'instant';
 
         // Initialize Sphere first so TokenRegistry is loaded

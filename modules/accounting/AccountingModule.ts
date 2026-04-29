@@ -2462,11 +2462,16 @@ export class AccountingModule {
       }
 
       // §5.9: Apply 60-second timeout to send() within the gate (matches returnInvoicePayment)
+      // T.7.C — pass `transferMode: 'instant'` explicitly per §10.1. The default is already
+      // `'instant'` at the PaymentsModule layer, but every production call-site of
+      // `payments.send()` MUST be explicit so the audit shim removal (T.1.B.2) can prove
+      // there are no implicit-default consumers when the type-level default flips later.
       const sendPromise = deps.payments.send({
         recipient: target.address,
         amount: sendAmount,
         coinId,
         memo,
+        transferMode: 'instant',
         invoiceRefundAddress: params.refundAddress,
         invoiceContact: effectiveContact,
       });
@@ -2707,11 +2712,14 @@ export class AccountingModule {
       }
 
       // §5.9: Apply 60-second timeout to send() within the gate
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site
+      // migration). Same rationale as the payInvoice site at the top of the gate.
       const sendPromise = deps.payments.send({
         recipient: senderAddress,
         amount: params.amount,
         coinId,
         memo,
+        transferMode: 'instant',
       });
 
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -3652,7 +3660,8 @@ export class AccountingModule {
           try {
             // Steelman fix: Wrap send() with 60s timeout, matching Fix 3 pattern in
             // _executeTerminationReturns. Without this, a hung send holds the gate indefinitely.
-            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+            const arSendPromise = deps.payments.send({ recipient, amount, coinId, memo, transferMode: 'instant' });
             let arSendTimer: ReturnType<typeof setTimeout> | undefined;
             const arSendTimeout = new Promise<never>((_, reject) => {
               arSendTimer = setTimeout(
@@ -3816,7 +3825,8 @@ export class AccountingModule {
             // BUG-002 Fix 3: Wrap send() in Promise.race with 60s timeout, matching
             // returnInvoicePayment() pattern. Without this, a hung send blocks all
             // subsequent returns and holds the invoice gate indefinitely.
-            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo });
+            // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+            const sendPromise = deps.payments.send({ recipient, amount, coinId, memo, transferMode: 'instant' });
             let sendTimer: ReturnType<typeof setTimeout> | undefined;
             const sendTimeoutPromise = new Promise<never>((_, reject) => {
               sendTimer = setTimeout(
@@ -4131,11 +4141,16 @@ export class AccountingModule {
       }
 
       try {
+        // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
+        // Crash-recovery replays a previously-intended auto-return; the original intent's
+        // wire shape was 'instant' (no other mode is selected by AccountingModule today),
+        // so explicit re-statement keeps the replay byte-equivalent post-default-flip.
         const result = await deps.payments.send({
           recipient: entry.recipient,
           amount: entry.amount,
           coinId: entry.coinId,
           memo: entry.memo,
+          transferMode: 'instant',
         });
 
         const returnTransferId = result.id;
@@ -5809,11 +5824,13 @@ export class AccountingModule {
     // (causing duplicate payment on crash recovery).
     try {
       // Steelman fix: Wrap send() with 60s timeout for consistency with all other send paths.
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site migration).
       const evtSendPromise = deps.payments.send({
         recipient: sendParams.returnTo,
         amount: sendParams.amount,
         coinId: sendParams.coinId,
         memo: sendParams.memo,
+        transferMode: 'instant',
       });
       let evtSendTimer: ReturnType<typeof setTimeout> | undefined;
       const evtSendTimeout = new Promise<never>((_, reject) => {
