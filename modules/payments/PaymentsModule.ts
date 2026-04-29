@@ -3251,11 +3251,20 @@ export class PaymentsModule {
 
     try {
       // Send the payment
+      // T.7.C — explicit `transferMode: 'instant'` per §10.1 (production call-site
+      // migration). This recursive call into `this.send()` is the
+      // PaymentsModule-internal recursion site listed in the T.7.C task spec
+      // (along with the AccountingModule + CLI sites). The outer
+      // `payPaymentRequest()` API does not currently expose a transferMode knob
+      // to callers, so the wire shape is fixed at `'instant'` (the default for
+      // unflagged production today). If `payPaymentRequest()` ever gains a
+      // mode parameter, plumb it through here.
       const result = await this.send({
         coinId: request.coinId,
         amount: request.amount,
         recipient: request.senderPubkey,
         memo: memo || request.message,
+        transferMode: 'instant',
       });
 
       // Mark as paid and send response with transfer ID
