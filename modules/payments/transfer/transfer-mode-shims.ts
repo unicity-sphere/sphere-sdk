@@ -1,32 +1,55 @@
 /**
- * Transfer Mode shims — UXF Inter-Wallet Transfer (T.1.B.1)
+ * Transfer Mode shims — UXF Inter-Wallet Transfer (T.1.B.2 residue).
  *
- * This module is the SINGLE PLACE in the SDK that performs runtime narrowing
- * of the public {@link TransferMode} union to the internal
- * {@link InternalTransferMode} union. Every call-site that `tsc --strict`
- * flags during the T.1 widening calls into this module — no other module
- * does the narrow itself, no `as any` casts are introduced anywhere in
- * production code. Tests may still construct a synthetic `'txf' as
- * TransferMode` to verify the shim's negative path.
+ * Post T.1.B.2 cleanup the file holds ONLY internal-only narrowings that
+ * can never be supplanted by call-site discipline. Every shim that was
+ * removable once T.7.C migrated production call-sites to pass an explicit
+ * `transferMode` has been deleted; what remains is documented below with
+ * an explicit `reason: "..."` marker so a future reviewer can see at a
+ * glance why the symbol is still here.
  *
  * Spec references:
  * - §10.1 (Backward Compatibility — sender side; "Breaking-widening note").
- * - Plan §T.1.B.1 (this task) and §T.1.B.2 (the cleanup task that removes
- *   shims after T.7.C migrates the production call-sites).
+ * - Plan §T.1.B.1 (initial widening) and §T.1.B.2 (this audit/cleanup).
  *
  * @internal
  *
  * @remarks
- * Removal schedule (T.1.B.2 — see plan §6.D):
- *  - {@link narrowTransferMode}                — KEEP (residual; T.7.A wires the TXF arm; the shim is the runtime guard against
- *                                                future protocol versions adding modes the SDK has not yet routed).
- *  - {@link defaultTransferMode}               — REMOVE in T.7.E (default flips from "instant over legacy TXF" to "instant over UXF";
- *                                                the constant migrates to the dispatcher).
- *  - {@link assertConservativeOrInstant}       — REMOVE in T.1.B.2 (post-T.7.C call-sites pass `transferMode` explicitly).
- *  - {@link coercePartialTransferRequestMode}  — REMOVE in T.1.B.2 (sphere/agentsphere repos migrate; coercion is no longer needed).
+ * Residual schedule (post T.1.B.2):
+ *  - {@link narrowTransferMode}          — KEEP. reason: "TXF arm + UNKNOWN-mode
+ *                                          guard; the public TransferMode union
+ *                                          intentionally excludes 'txf', the
+ *                                          internal union includes it. The shim
+ *                                          is the single point of runtime
+ *                                          conversion. T.7.E may inline this
+ *                                          into the dispatcher when the default
+ *                                          flips to UXF, but only after every
+ *                                          surface that consumes
+ *                                          InternalTransferMode is gone."
+ *  - {@link requireLegacyCoinSlot}       — KEEP. reason: "INTERNAL-only
+ *                                          coin-slot narrowing; the public
+ *                                          TransferRequest widened coinId/amount
+ *                                          to optional in T.1.B.1 but the
+ *                                          legacy single-coin path still
+ *                                          dereferences both fields. T.2.B is
+ *                                          the future task that retires this
+ *                                          shim once the multi-asset validator
+ *                                          becomes the routing primitive."
+ *  - {@link LegacyCoinTransferRequest}   — KEEP. reason: "Brand for the
+ *                                          requireLegacyCoinSlot output;
+ *                                          retired by T.2.B together with the
+ *                                          shim itself."
  *
- * The shim file is intentionally TINY and DOC-HEAVY so the next reviewer
- * understands why every line is here and which task removes it.
+ * Removed by T.1.B.2 (this commit):
+ *  - DEFAULT_TRANSFER_MODE export    → demoted to module-private const
+ *                                       referenced by narrowTransferMode only.
+ *  - defaultTransferMode             → unused outside the shim's own tests.
+ *  - assertConservativeOrInstant     → unused in production after T.7.C wired
+ *                                       the dispatcher's exhaustive switch.
+ *  - coercePartialTransferRequestMode→ replaced by direct
+ *                                       `narrowTransferMode(req.transferMode)`
+ *                                       at the single PaymentsModule.send()
+ *                                       entry point.
  */
 
 import { SphereError } from '../../../core/errors';
@@ -37,31 +60,20 @@ import type {
 } from '../../../types';
 
 // =============================================================================
-// 1. Default mode — single source of truth
+// Module-private default — not exported. The historical SDK default is
+// 'instant'; flipping it is the work of T.7.E (UXF cutover), at which point
+// the constant migrates to the dispatcher and this file shrinks again.
 // =============================================================================
 
-/**
- * The SDK-wide default `transferMode`. Until T.7.E flips this to UXF, it
- * stays at `'instant'` — the historical SDK default. T.1.B.1 introduces
- * NO behavior change.
- *
- * Exported as a constant (not inlined into every call-site) so the eventual
- * flip is one diff hunk, not a sweep.
- *
- * @internal
- */
-export const DEFAULT_TRANSFER_MODE: TransferMode = 'instant';
-
-/**
- * Alias of {@link DEFAULT_TRANSFER_MODE} that future call-sites can import
- * by domain name. Distinct alias to make grep-for-removal easy in T.7.E.
- *
- * @internal
- */
-export const defaultTransferMode = (): TransferMode => DEFAULT_TRANSFER_MODE;
+const DEFAULT_TRANSFER_MODE: TransferMode = 'instant';
 
 // =============================================================================
-// 2. The narrow-or-throw shim
+// Residual shim 1: narrow-or-throw (TXF arm + UNKNOWN-mode guard)
+// reason: "Public TransferMode excludes 'txf' but InternalTransferMode
+//          includes it; the shim is the single runtime narrow used by the
+//          dispatcher in PaymentsModule.send(). Also rejects unknown
+//          strings smuggled in by pure-JS callers with the typed
+//          UNSUPPORTED_TRANSFER_MODE error."
 // =============================================================================
 
 /**
@@ -69,24 +81,21 @@ export const defaultTransferMode = (): TransferMode => DEFAULT_TRANSFER_MODE;
  * {@link InternalTransferMode}, applying the SDK default and rejecting any
  * value that is not yet routed.
  *
- * - `undefined`        → {@link DEFAULT_TRANSFER_MODE}.
+ * - `undefined`        → `'instant'` (historical SDK default).
  * - `'instant'`        → `'instant'`.
  * - `'conservative'`   → `'conservative'`.
- * - `'txf'` (post-T.7.A, only reachable via `as TransferMode` cast — the
- *   public type intentionally omits it) → `'txf'`. The dispatcher in
+ * - `'txf'` (only reachable via `as TransferMode` cast — the public type
+ *   intentionally omits it) → `'txf'`. The dispatcher in
  *   {@link import('../PaymentsModule').PaymentsModule.send} routes the
- *   value to the legacy TXF orchestrator via T.7.A.
+ *   value to the legacy TXF orchestrator (`txf-sender.ts`).
  * - any other string  → throws `SphereError(UNSUPPORTED_TRANSFER_MODE)`.
  *
- * SHIM: kept post-T.1.B.2 cleanup as the residual runtime guard against
- * future protocol versions adding modes the SDK has not yet routed (see
- * file header).
+ * SHIM (residual, post T.1.B.2). reason: "TXF arm narrowing + UNKNOWN-mode
+ * guard; the only conversion between the public TransferMode union and the
+ * internal one. T.7.E may move this into the dispatcher when the default
+ * flips to UXF."
  *
- * **Pre/post-T.7.A note**: prior to T.7.A this function rejected `'txf'`
- * with `UNSUPPORTED_TRANSFER_MODE`. T.7.A landed the wire orchestrator
- * (`txf-sender.ts`) and the dispatcher branch in PaymentsModule, so
- * `'txf'` now passes through identically to `'instant'` and
- * `'conservative'`.
+ * @internal
  *
  * @throws SphereError code=`UNSUPPORTED_TRANSFER_MODE` for any value that
  *         is not one of the three known {@link InternalTransferMode} arms.
@@ -101,7 +110,7 @@ export function narrowTransferMode(
   // of `TransferMode`, so the assignment is type-sound.
   if (mode === 'instant' || mode === 'conservative') return mode;
 
-  // T.7.A — the legacy `'txf'` arm is now wired. The dispatcher in
+  // T.7.A — the legacy `'txf'` arm is wired. The dispatcher in
   // PaymentsModule routes it to `txf-sender.sendTxfUxf` based on the
   // request's `txfFinalization` field (default 'conservative'). The
   // shim itself is value-pass-through; the runtime check is paranoid
@@ -119,59 +128,11 @@ export function narrowTransferMode(
 }
 
 // =============================================================================
-// 3. Per-call-site narrowing helpers
-// =============================================================================
-
-/**
- * Assert that `mode` is one of the two PUBLIC {@link TransferMode} values
- * (i.e., post-narrow result is NOT `'txf'`). Use at sites that today only
- * route `'instant'` or `'conservative'` and would otherwise need a manual
- * exhaustive switch with a default arm.
- *
- * Returns the narrowed value as a tighter type for downstream use.
- *
- * SHIM: removed in T.1.B.2 once T.7.C migrates call-sites and the
- * dispatcher in `PaymentsModule.send()` knows about the `'txf'` arm. Until
- * then, every site that used to switch on `'instant' | 'conservative'`
- * exhaustively can call this to keep that exhaustiveness.
- *
- * @internal
- *
- * @throws SphereError code=`UNSUPPORTED_TRANSFER_MODE` if `mode` is `'txf'`.
- */
-export function assertConservativeOrInstant(
-  mode: InternalTransferMode,
-): TransferMode {
-  if (mode === 'instant' || mode === 'conservative') return mode;
-  throw new SphereError(
-    `TXF transfer mode is not yet implemented; awaits T.7.A. ` +
-    `(observed internal mode: ${JSON.stringify(mode)})`,
-    'UNSUPPORTED_TRANSFER_MODE',
-  );
-}
-
-/**
- * One-shot helper for `PaymentsModule.send()` and any other entry point
- * that takes a {@link TransferRequest}: narrows the request's `transferMode`
- * field, returning the {@link InternalTransferMode}. Identical to
- * `narrowTransferMode(request.transferMode)`; exists as a named helper so
- * the call-site reads as `coercePartialTransferRequestMode(request)`
- * rather than projecting the field manually.
- *
- * SHIM: removed in T.1.B.2 once `PaymentsModule.send()` is the only
- * external entry point that consumes `transferMode` and post-T.7.C
- * call-sites set it explicitly.
- *
- * @internal
- */
-export function coercePartialTransferRequestMode(
-  request: Pick<TransferRequest, 'transferMode'>,
-): InternalTransferMode {
-  return narrowTransferMode(request.transferMode);
-}
-
-// =============================================================================
-// 4. Legacy single-coin slot narrow (post-T.1.B.1 widening of `coinId`/`amount`)
+// Residual shim 2: legacy single-coin slot narrow (post T.1.B.1 widening)
+// reason: "INTERNAL-only coin-slot narrowing; the public TransferRequest
+//          widened coinId/amount to optional but the legacy single-coin
+//          path still dereferences both fields. T.2.B retires this when
+//          the multi-asset validator becomes the routing primitive."
 // =============================================================================
 
 /**
@@ -182,6 +143,11 @@ export function coercePartialTransferRequestMode(
  * optional-chain errors. This branded type lets a SINGLE shim call
  * convert the public `TransferRequest` into a request that the legacy
  * routing logic can consume directly.
+ *
+ * SHIM (residual, post T.1.B.2). reason: "Brand for the
+ * {@link requireLegacyCoinSlot} output; retired by T.2.B together with
+ * the shim itself once the multi-asset validator becomes the routing
+ * primitive."
  *
  * @internal
  */
@@ -196,11 +162,11 @@ export type LegacyCoinTransferRequest = TransferRequest & {
  * T.2.B lands the §4.1 step 1 multi-asset validator, the legacy path is
  * the only routing branch and it cannot run without `(coinId, amount)`.
  *
- * SHIM: removed in T.2.B once the multi-asset target validator becomes
- * the entry routing primitive. Until then, calling this shim at
- * `PaymentsModule.send()` entry replaces a sweep of per-line `as string`
- * casts and `request.coinId!` non-null assertions with a single typed
- * runtime guard.
+ * SHIM (residual, post T.1.B.2). reason: "INTERNAL-only coin-slot
+ * narrowing; the public TransferRequest widened coinId/amount to
+ * optional in T.1.B.1 but the legacy single-coin path still dereferences
+ * both fields. T.2.B retires this once the §4.1 step 1 multi-asset
+ * validator becomes the routing primitive."
  *
  * Acceptable T.1.B.1 reject code:
  *  - `'VALIDATION_ERROR'` — the existing generic validation code. The
