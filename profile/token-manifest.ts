@@ -141,6 +141,43 @@ export interface TokenManifestEntry {
    * peer attribution; mirrors the `_invalid` / `_audit` records.
    */
   readonly senderTransportPubkey?: string;
+  // ---------------------------------------------------------------------------
+  // Operator override audit trail (T.5.D — W30 / W31 / N4)
+  //
+  // Set by `payments.importInclusionProof({ allowInvalidOverride: true })`
+  // (§6.3 cases 5/6 — the operator-explicit reversal of the §5.6
+  // monotonicity invariant). The override flag is sticky across CRDT merges
+  // (set-OR for the boolean; max-merge for the timestamp; lex-min tie-break
+  // for the operator pubkey when both sides set it). Once set on any
+  // replica, the flag persists through every future merge so a wallet that
+  // has performed an operator override keeps the override even when a
+  // remote replica's lamport runs ahead.
+  //
+  // The pair `(overrideAppliedAt, overrideAppliedBy)` is the durable audit
+  // trail surfaced to the operator console alongside the
+  // `transfer:override-applied` event.
+  // ---------------------------------------------------------------------------
+  /**
+   * `true` iff this entry has been re-validated via an operator
+   * `importInclusionProof({ allowInvalidOverride: true })` call. Sticky:
+   * once set on any replica, the merged entry retains it (set-OR per §7.1).
+   */
+  readonly overrideApplied?: boolean;
+  /**
+   * Wall-clock millisecond timestamp of the most-recent override write
+   * (`Date.now()` at the call site). When two replicas independently apply
+   * the override, the merged entry takes the later timestamp (max-merge —
+   * mirrors the `lastProofRefreshAt` rule).
+   */
+  readonly overrideAppliedAt?: number;
+  /**
+   * Operator pubkey (hex; the wallet's chain pubkey at override time) that
+   * authored the override. When two replicas independently apply the
+   * override, the merged entry preserves the lex-min pubkey (deterministic
+   * across replicas without requiring a coordinator). Optional — callers
+   * that do not pass an operator pubkey leave the field absent.
+   */
+  readonly overrideAppliedBy?: string;
 }
 
 /**

@@ -527,6 +527,7 @@ export type SphereEventType =
   | 'transfer:trustbase-warning'
   | 'transfer:security-alert'
   | 'transfer:proof-superseded'
+  | 'transfer:override-applied'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -822,6 +823,42 @@ export interface SphereEventMap {
     readonly outboxId?: string;
     readonly previousCid: string;
     readonly newCid: string;
+  };
+  /**
+   * UXF Inter-Wallet Transfer T.5.D — operator override applied (§6.3 +
+   * W30 / W31 / N4).
+   *
+   * Emitted exactly once per successful
+   * `payments.importInclusionProof({ allowInvalidOverride: true })` call
+   * that flips a token from `_invalid` back to the active pool. Carries
+   * the durable audit trail recorded on the manifest entry:
+   *
+   *   - `overrideAppliedAt` — wall-clock millisecond timestamp.
+   *   - `overrideAppliedBy` — operator pubkey (hex), if supplied at the
+   *                           call site. Optional.
+   *   - `previousReason`    — the {@link DispositionReason} the entry
+   *                           carried in `_invalid` BEFORE the override.
+   *                           Useful for forensic correlation.
+   *   - `transition`        — `'invalid→valid'` for case 5 (single
+   *                           hard-failed queue entry; manifest flipped
+   *                           to `'valid'`) or `'invalid→pending'` for
+   *                           case 6 (K-1 re-queue; manifest flipped to
+   *                           `'pending'` until the remaining entries
+   *                           resolve).
+   *
+   * The event is informational — operator consoles surface it
+   * prominently because it represents an explicit breach of the §5.6
+   * monotonicity invariant ("invalid → ?" is normally forbidden).
+   *
+   * Spec refs: §6.3 (stuck-PENDING escape), W31 (event), N4 (audit
+   * listener).
+   */
+  'transfer:override-applied': {
+    readonly tokenId: string;
+    readonly overrideAppliedAt: number;
+    readonly overrideAppliedBy?: string;
+    readonly previousReason: import('./disposition').DispositionReason;
+    readonly transition: 'invalid→valid' | 'invalid→pending';
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;

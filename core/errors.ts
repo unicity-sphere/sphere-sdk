@@ -416,7 +416,23 @@ export type SphereErrorCode =
    * counter; rejection fires if ANY claimed id is over-cap. Workers
    * decrement the counters when dequeueing.
    */
-  | 'INGEST_QUEUE_FULL_PER_TOKEN';
+  | 'INGEST_QUEUE_FULL_PER_TOKEN'
+  /**
+   * UXF Inter-Wallet Transfer T.5.D — operator escape-hatch wiring missing.
+   *
+   * `PaymentsModule.importInclusionProof()` and
+   * `PaymentsModule.revalidateCascadedChildren()` require the bootstrap
+   * layer to install an {@link InclusionProofImporter} and a
+   * {@link RevalidateCascadedRunner} respectively. When the operator
+   * invokes either method without the corresponding `install*` having
+   * been called, the module surfaces this code rather than silently
+   * no-op-ing — the operator console MUST report the misconfiguration.
+   *
+   * Distinct from `MODULE_NOT_AVAILABLE` (which signals an entire
+   * sub-module is disabled). This code signals a SPECIFIC integration
+   * point inside an otherwise-functional payments module.
+   */
+  | 'OPERATOR_ESCAPE_HATCH_NOT_CONFIGURED';
 
 export class SphereError extends Error {
   readonly code: SphereErrorCode;

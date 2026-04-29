@@ -200,6 +200,37 @@ export function mergeManifestEntry(
   void compareCidsBinary;
 
   // ---------------------------------------------------------------------------
+  // Operator-override audit trail (T.5.D — W30 / W31 / N4)
+  //
+  //   - `overrideApplied`     — set-OR (§7.1 stickiness; mirrors the outbox
+  //                             `overrideApplied` semantics).
+  //   - `overrideAppliedAt`   — max-merge (most-recent override wins).
+  //   - `overrideAppliedBy`   — lex-min when both sides set it (deterministic
+  //                             across replicas); preserve-if-set otherwise.
+  // ---------------------------------------------------------------------------
+  const overrideApplied =
+    prev.overrideApplied === true || next.overrideApplied === true
+      ? true
+      : undefined;
+  const overrideAppliedAt = maxOpt(
+    prev.overrideAppliedAt,
+    next.overrideAppliedAt,
+  );
+  let overrideAppliedBy: string | undefined;
+  if (prev.overrideAppliedBy === undefined) {
+    overrideAppliedBy = next.overrideAppliedBy;
+  } else if (next.overrideAppliedBy === undefined) {
+    overrideAppliedBy = prev.overrideAppliedBy;
+  } else if (prev.overrideAppliedBy === next.overrideAppliedBy) {
+    overrideAppliedBy = prev.overrideAppliedBy;
+  } else {
+    overrideAppliedBy =
+      prev.overrideAppliedBy < next.overrideAppliedBy
+        ? prev.overrideAppliedBy
+        : next.overrideAppliedBy;
+  }
+
+  // ---------------------------------------------------------------------------
   // Assemble. Omit undefined fields so the on-disk shape stays minimal.
   // ---------------------------------------------------------------------------
   const merged: TokenManifestEntry = stripUndefined({
@@ -213,6 +244,9 @@ export function mergeManifestEntry(
     lastProofRefreshAt,
     bundleCid,
     senderTransportPubkey,
+    overrideApplied,
+    overrideAppliedAt,
+    overrideAppliedBy,
   });
   return merged;
 }
