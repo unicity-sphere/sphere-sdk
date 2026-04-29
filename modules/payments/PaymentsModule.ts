@@ -110,6 +110,10 @@ import {
   type RevalidationResult,
 } from './transfer/revalidate-cascaded';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
+import {
+  resolveSenderInfoViaBinding,
+  type ReresolvedNametagSource,
+} from './transfer/nametag-reresolver';
 
 /**
  * Narrow guard for the UXF v1.0 wire shapes accepted by the
@@ -5257,26 +5261,51 @@ export class PaymentsModule {
 
   /**
    * Best-effort resolve sender's DIRECT address and nametag from their transport pubkey.
-   * Returns empty object if transport doesn't support resolution or lookup fails.
+   *
+   * **C9 nametag re-resolution defense (T.7.B.5).** Per UXF transfer
+   * protocol §3.1, §5.6, §9.3, the unauthenticated `payload.sender.nametag`
+   * MUST NOT be displayed in UI without re-resolving against the
+   * AUTHENTICATED Nostr signing pubkey via the identity-binding registry.
+   * This method is a thin wrapper over
+   * {@link resolveSenderInfoViaBinding} (in `./transfer/nametag-reresolver`)
+   * which centralizes that policy. The optional `payloadSenderNametag`
+   * parameter is accepted for forward-compat with the UXF outer envelope
+   * but is NEVER trusted directly — it is logged for forensic correlation
+   * with the binding-attested result.
+   *
+   * Returns:
+   *   - `senderAddress` — the binding event's `directAddress`, or
+   *     `undefined` if no binding event exists.
+   *   - `senderNametag` — the BINDING-ATTESTED nametag, or `undefined`
+   *     if no binding event exists OR the binding event registers
+   *     pubkey-only (no nametag). NEVER returns the payload claim.
+   *   - `senderNametagSource` — `'binding-event'` when a binding was
+   *     found (regardless of whether it had a nametag),
+   *     `'untrusted-payload'` when the lookup failed. Used by callers
+   *     that want to differentiate "known peer (no nametag)" from
+   *     "unknown sender" in the UI.
+   *
+   * @param senderTransportPubkey - The AUTHENTICATED Nostr signing
+   *                                pubkey of the sender. Verified by
+   *                                the relay; safe to use as the
+   *                                lookup key.
+   * @param payloadSenderNametag - The unauthenticated nametag claim
+   *                               from `payload.sender.nametag` (if
+   *                               any). Accepted but never trusted.
    */
-  private async resolveSenderInfo(senderTransportPubkey: string): Promise<{
+  private async resolveSenderInfo(
+    senderTransportPubkey: string,
+    payloadSenderNametag?: string,
+  ): Promise<{
     senderAddress?: string;
     senderNametag?: string;
+    senderNametagSource: ReresolvedNametagSource;
   }> {
-    try {
-      if (this.deps?.transport?.resolveTransportPubkeyInfo) {
-        const peerInfo = await this.deps.transport.resolveTransportPubkeyInfo(senderTransportPubkey);
-        if (peerInfo) {
-          return {
-            senderAddress: peerInfo.directAddress || undefined,
-            senderNametag: peerInfo.nametag || undefined,
-          };
-        }
-      }
-    } catch {
-      // Best-effort: ignore resolution failures
-    }
-    return {};
+    return resolveSenderInfoViaBinding(
+      senderTransportPubkey,
+      payloadSenderNametag,
+      this.deps?.transport,
+    );
   }
 
   /**
