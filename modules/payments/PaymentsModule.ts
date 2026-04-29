@@ -4515,6 +4515,157 @@ export class PaymentsModule {
   }
 
   /**
+   * Mint a fungible token directly to this wallet (genesis mint).
+   *
+   * Useful for test setups that need to seed a wallet with specific token
+   * balances WITHOUT depending on the testnet faucet HTTP service. The
+   * resulting token has the canonical CoinId bytes (passed in `coinIdHex`)
+   * — when those bytes match a registered symbol in the TokenRegistry,
+   * the token shows up under the symbol's name (e.g. "UCT"). There is no
+   * cryptographic restriction on which key may issue a given CoinId; the
+   * aggregator records the mint regardless of issuer identity.
+   *
+   * The flow:
+   *   1. Generate a random TokenId.
+   *   2. Build TokenCoinData with [(coinId, amount)].
+   *   3. Build MintTransactionData with recipient = self (UnmaskedPredicate
+   *      from this wallet's signing service).
+   *   4. Submit MintCommitment to the aggregator.
+   *   5. Wait for the inclusion proof.
+   *   6. Construct an SDK Token via Token.mint().
+   *   7. Convert to wallet Token format and call addToken().
+   *
+   * @param coinIdHex - 64-char lowercase hex CoinId. Must match the bytes
+   *   used by the registered symbol if you want the wallet to recognize
+   *   the token as that symbol (e.g. UCT's coinId from the public registry).
+   * @param amount - Amount in smallest units (multiply by 10^decimals
+   *   when converting from human values).
+   * @returns Result with the resulting wallet Token and its on-chain id.
+   */
+  async mintFungibleToken(
+    coinIdHex: string,
+    amount: bigint,
+  ): Promise<{ success: true; token: Token; tokenId: string } | { success: false; error: string }> {
+    this.ensureInitialized();
+
+    const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
+    if (!stClient) {
+      return { success: false, error: 'State transition client not available' };
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const trustBase = (this.deps!.oracle as any).getTrustBase?.();
+    if (!trustBase) {
+      return { success: false, error: 'Trust base not available' };
+    }
+
+    try {
+      const signingService = await this.createSigningService();
+      const { TokenId } = await import('@unicitylabs/state-transition-sdk/lib/token/TokenId');
+      const { TokenCoinData } = await import('@unicitylabs/state-transition-sdk/lib/token/fungible/TokenCoinData');
+      const { UnmaskedPredicateReference } = await import('@unicitylabs/state-transition-sdk/lib/predicate/embedded/UnmaskedPredicateReference');
+
+      // Use the same token-type prefix the wider SDK uses for fungible
+      // genesis (see InvoiceTokenType / NametagMinter conventions). This
+      // keeps the sdkData shape compatible with the rest of PaymentsModule.
+      const tokenTypeBytes = fromHex('f8aa13834268d29355ff12183066f0cb902003629bbc5eb9ef0efbe397867509');
+      const tokenType = new TokenType(tokenTypeBytes);
+
+      // Random tokenId — each mint produces a unique token.
+      const tokenIdBytes = new Uint8Array(32);
+      crypto.getRandomValues(tokenIdBytes);
+      const tokenId = new TokenId(tokenIdBytes);
+
+      const coinIdBytes = fromHex(coinIdHex);
+      const coinId = new CoinId(coinIdBytes);
+      const coinData = TokenCoinData.create([[coinId, amount]]);
+
+      // Recipient = self via UnmaskedPredicateReference → DirectAddress.
+      const addressRef = await UnmaskedPredicateReference.create(
+        tokenType,
+        signingService.algorithm,
+        signingService.publicKey,
+        HashAlgorithm.SHA256,
+      );
+      const ownerAddress = await addressRef.toAddress();
+
+      // Random salt — uniqueness gate for the mint commitment.
+      const salt = new Uint8Array(32);
+      crypto.getRandomValues(salt);
+
+      const mintData = await MintTransactionData.create(
+        tokenId,
+        tokenType,
+        null,            // tokenData: no metadata
+        coinData,        // fungible coin data
+        ownerAddress,    // recipient = self
+        salt,
+        null,            // recipientDataHash
+        null,            // reason: null (genesis, no burn predecessor)
+      );
+
+      const commitment = await MintCommitment.create(mintData);
+
+      // Submit with retry — REQUEST_ID_EXISTS counts as success (idempotent).
+      const MAX_RETRIES = 3;
+      let lastStatus: string | undefined;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        const response = await stClient.submitMintCommitment(commitment);
+        lastStatus = response.status;
+        if (response.status === 'SUCCESS' || response.status === 'REQUEST_ID_EXISTS') break;
+        if (attempt === MAX_RETRIES) {
+          return { success: false, error: `Mint submit failed after ${MAX_RETRIES} attempts: ${response.status}` };
+        }
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+      if (lastStatus !== 'SUCCESS' && lastStatus !== 'REQUEST_ID_EXISTS') {
+        return { success: false, error: `Mint submit failed: ${lastStatus}` };
+      }
+
+      const inclusionProof = await waitInclusionProof(trustBase, stClient, commitment);
+      const genesisTransaction = commitment.toTransaction(inclusionProof);
+
+      // Build the token state with an UnmaskedPredicate so this wallet
+      // owns the token (predicate verification matches signingService).
+      const predicate = await UnmaskedPredicate.create(
+        tokenId,
+        tokenType,
+        signingService,
+        HashAlgorithm.SHA256,
+        salt,
+      );
+      const tokenState = new TokenState(predicate, null);
+      const sdkToken = await SdkToken.mint(trustBase, tokenState, genesisTransaction);
+
+      // Convert to wallet Token and add it. addToken does the persistence
+      // + cache + tombstone bookkeeping.
+      const tokenIdHex = tokenId.toJSON();
+      const symbol = this.getCoinSymbol(coinIdHex);
+      const name = this.getCoinName(coinIdHex);
+      const decimals = this.getCoinDecimals(coinIdHex);
+      const iconUrl = this.getCoinIconUrl(coinIdHex);
+      const uiToken: Token = {
+        id: tokenIdHex,
+        coinId: coinIdHex,
+        symbol,
+        name,
+        decimals,
+        ...(iconUrl !== undefined ? { iconUrl } : {}),
+        amount: amount.toString(),
+        status: 'confirmed',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        sdkData: JSON.stringify(sdkToken.toJSON()),
+      };
+      await this.addToken(uiToken);
+
+      return { success: true, token: uiToken, tokenId: tokenIdHex };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `Local mint failed: ${msg}` };
+    }
+  }
+
+  /**
    * Check if a nametag is available for minting
    * @param nametag - The nametag to check (e.g., "alice" or "@alice")
    */
