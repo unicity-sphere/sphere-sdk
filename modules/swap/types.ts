@@ -756,6 +756,14 @@ export interface SwapModuleDependencies {
     getInvoiceStatus(invoiceId: string): unknown;
     /** Send payment referencing an invoice */
     payInvoice(invoiceId: string, params: unknown): Promise<TransferResult>;
+    /**
+     * Reverse index: token IDs linked to a given invoice. Used by
+     * verifyPayout to scope L3 validate() results to only relevant tokens
+     * (a wallet may hold tokens of the same currency that belong to other
+     * invoices). Optional for backward compat — when undefined, the swap
+     * module's reverse-lookup fail-closed branch will trigger.
+     */
+    getTokenIdsForInvoice?(invoiceId: string): Set<string>;
     /** Subscribe to invoice events (returns unsubscribe function) */
     on<T extends SphereEventType>(type: T, handler: (data: SphereEventMap[T]) => void): () => void;
   };

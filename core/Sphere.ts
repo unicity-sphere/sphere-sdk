@@ -2539,6 +2539,13 @@ export class Sphere {
             getInvoice: (id: string) => acctForSwap.getInvoice(id),
             getInvoiceStatus: (id: string) => acctForSwap.getInvoiceStatus(id),
             payInvoice: (id: string, params: unknown) => acctForSwap.payInvoice(id, params as Parameters<typeof acctForSwap.payInvoice>[1]),
+            // 2026-04-30 FIX (verifyPayout reverse-index gap): expose
+            // getTokenIdsForInvoice on the accounting proxy. SwapModule's
+            // verifyPayout uses this to scope L3 validate() results to only
+            // the tokens that cover the payout invoice — without it, every
+            // call falls through to `new Set()` (empty), and verifyPayout's
+            // fail-closed branch fires forever even when the payout is fine.
+            getTokenIdsForInvoice: (id: string) => acctForSwap.getTokenIdsForInvoice(id),
             on: onForSwap,
           },
           payments: { validate: () => payments.validate() },
@@ -4363,6 +4370,11 @@ export class Sphere {
             getInvoice: (id: string) => acctForSwap.getInvoice(id),
             getInvoiceStatus: (id: string) => acctForSwap.getInvoiceStatus(id),
             payInvoice: (id: string, params: unknown) => acctForSwap.payInvoice(id, params as Parameters<typeof acctForSwap.payInvoice>[1]),
+            // 2026-04-30 FIX (verifyPayout reverse-index gap): see fix at
+            // first wiring site (line ~2536) for full rationale. Symmetric
+            // patch — the per-address swap initialize must also expose
+            // getTokenIdsForInvoice so verifyPayout can scope L3 results.
+            getTokenIdsForInvoice: (id: string) => acctForSwap.getTokenIdsForInvoice(id),
             on: onForSwap,
           },
           payments: { validate: () => paymentsForSwap.validate() },
