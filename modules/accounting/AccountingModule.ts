@@ -2093,6 +2093,65 @@ export class AccountingModule {
         result.add(tokenId);
       }
     }
+
+    // 2026-04-30 FIX (verifyPayout reverse-index gap): also derive token IDs
+    // from the authoritative invoiceLedger entries. The reverse index
+    // (tokenInvoiceMap) is a CACHE populated incrementally by various paths;
+    // the LEDGER is the source of truth. Several edge cases can leave the
+    // cache stale relative to the ledger — most importantly the hash-keyed
+    // orphan path (when payout tokens arrive ahead of importInvoice and the
+    // on-chain `inv:` reference is the privacy-preserving HASH of the
+    // invoice id). Deriving from the ledger as a fallback closes the gap
+    // without requiring every population path to be perfect, and keeps
+    // verifyPayout's reverse-lookup robust.
+    //
+    // Ledger entry keys encode the tokenId in three forms (matching the
+    // rebuild parser at line ~4220):
+    //   1. on-chain `${tokenId}:${txIndex}::${coinId}` — token id is the
+    //      prefix before `:`
+    //   2. orphan `mt:${tokenId}:${transferId}` — token id between `mt:`
+    //      and the next `:`
+    //   3. synthetic `synthetic:${tokenId}::${coinId}` — token id between
+    //      `synthetic:` and `::`
+    // We extract using the same token-id validator (HEX_64) to defend
+    // against corrupt-on-disk attacker writing crafted entry keys.
+    const HEX_64 = /^[a-f0-9]{64}$/i;
+    const ledger = this.invoiceLedger.get(invoiceId);
+    if (ledger) {
+      for (const entryKey of ledger.keys()) {
+        let extractedTokenId: string | null = null;
+        if (entryKey.startsWith('mt:')) {
+          // mt:<tokenId>:<transferId>
+          const rest = entryKey.slice(3);
+          const colonIdx = rest.indexOf(':');
+          if (colonIdx > 0) {
+            extractedTokenId = rest.slice(0, colonIdx);
+          }
+        } else if (entryKey.startsWith('synthetic:')) {
+          // synthetic:<tokenId>::<coinId>
+          const rest = entryKey.slice('synthetic:'.length);
+          const dblColonIdx = rest.indexOf('::');
+          if (dblColonIdx > 0) {
+            extractedTokenId = rest.slice(0, dblColonIdx);
+          }
+        } else if (entryKey.startsWith('synthetic-tx:') || entryKey.startsWith('provisional:')) {
+          // synthetic-tx: keys carry a transport UUID (not a token id) —
+          // by design (round-5 fix). provisional: keys map to no real token.
+          // Skip both.
+          continue;
+        } else {
+          // on-chain `<tokenId>:<txIndex>::<coinId>`
+          const colonIdx = entryKey.indexOf(':');
+          if (colonIdx > 0) {
+            extractedTokenId = entryKey.slice(0, colonIdx);
+          }
+        }
+        if (extractedTokenId && HEX_64.test(extractedTokenId)) {
+          result.add(extractedTokenId);
+        }
+      }
+    }
+
     return result;
   }
 
