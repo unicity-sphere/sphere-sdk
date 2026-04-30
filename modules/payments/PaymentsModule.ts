@@ -110,6 +110,10 @@ import {
   RevalidateCascadedRunner,
   type RevalidationResult,
 } from './transfer/revalidate-cascaded';
+// Phase 8 steelman post-cutover — sending-recovery worker. The bootstrap
+// layer (Sphere) wires an instance via `installSendingRecoveryWorker()`;
+// the module starts/stops it gated on `features.recoveryWorker`.
+import { SendingRecoveryWorker } from './transfer/sending-recovery-worker';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
 import {
   resolveSenderInfoViaBinding,
@@ -836,6 +840,20 @@ export interface UxfTransferFeatures {
    *  (legacy single-token TXF path). */
   readonly senderUxf?: boolean;
   /**
+   * Phase 8 steelman post-cutover — when `true`, instantiate and start
+   * `SendingRecoveryWorker` in {@link PaymentsModule.initialize}; stop
+   * it in {@link PaymentsModule.destroy}. The worker periodically
+   * re-publishes outbox entries left in `'sending'` after a crash
+   * between OrbitDB commit and Nostr publish ack (closes the gap
+   * documented in `conservative-sender.ts` lines 212 / 886 / 903).
+   *
+   * Default `false` — the worker requires an injected republish hook
+   * the bootstrap layer wires explicitly. Existing tests are
+   * unaffected; integration / soak environments flip this on after
+   * staging the hook.
+   */
+  readonly recoveryWorker?: boolean;
+  /**
    * T.3.E — when `true`, route incoming UXF v1.0 bundles (`kind` of
    * `'uxf-car'` or `'uxf-cid'`) through the {@link IngestWorkerPool}
    * (§5.0 N parallel workers + W7 per-tokenId fairness +
@@ -1117,6 +1135,8 @@ export class PaymentsModule {
       recipientUxf: config?.features?.recipientUxf ?? false,
       // T.7.B — legacy-shape adapter routing flag (default OFF).
       recipientLegacyAdapter: config?.features?.recipientLegacyAdapter ?? false,
+      // Phase 8 steelman post-cutover — sending-recovery worker (default OFF).
+      recoveryWorker: config?.features?.recoveryWorker ?? false,
     });
 
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
@@ -1277,6 +1297,17 @@ export class PaymentsModule {
 
     // Subscribe to storage provider events (push-based sync)
     this.subscribeToStorageEvents();
+
+    // Phase 8 steelman post-cutover — start the sending-recovery worker
+    // when both (a) the gate is on AND (b) a worker has been installed
+    // by the bootstrap layer. Default `features.recoveryWorker = false`
+    // makes this a no-op for existing tests / consumers; flipping the
+    // flag without installing a worker is also a no-op (forensic warning
+    // omitted intentionally — the bootstrap is the single install point
+    // and a missing install is a deployment-config bug, not a hot path).
+    if (this.features.recoveryWorker && this.sendingRecoveryWorker !== null) {
+      this.sendingRecoveryWorker.start();
+    }
   }
 
   /**
@@ -1449,6 +1480,8 @@ export class PaymentsModule {
   private inclusionProofImporter: InclusionProofImporter | null = null;
   /** @internal — set by `installRevalidateCascadedRunner()`. */
   private revalidateCascadedRunner: RevalidateCascadedRunner | null = null;
+  /** @internal — set by `installSendingRecoveryWorker()`. Phase 8 steelman. */
+  private sendingRecoveryWorker: SendingRecoveryWorker | null = null;
 
   /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
@@ -1470,6 +1503,38 @@ export class PaymentsModule {
    */
   installRevalidateCascadedRunner(runner: RevalidateCascadedRunner): void {
     this.revalidateCascadedRunner = runner;
+  }
+
+  /**
+   * Phase 8 steelman post-cutover — install the sending-recovery
+   * worker. Idempotent: a second call stops the previous worker
+   * (await its in-flight scan) and swaps in the new instance. If
+   * `features.recoveryWorker` is `true`, the next `initialize()` call
+   * starts the new worker; if the module is already initialized, the
+   * worker is started immediately.
+   *
+   * The bootstrap layer (Sphere) constructs the worker with a closure
+   * over the production transport + outbox + republish payload
+   * builder. Tests inject a fully-mocked worker.
+   *
+   * **No-op when `features.recoveryWorker === false`** — installing is
+   * cheap (no scan loop runs until `start()`); the gate is the flag.
+   */
+  installSendingRecoveryWorker(worker: SendingRecoveryWorker): void {
+    // Stop the previous worker without blocking the install. We
+    // intentionally do not await here — callers may be hot-swapping
+    // workers under test, and the worker's stop() is documented as
+    // "best-effort, never throws". Errors are swallowed.
+    if (this.sendingRecoveryWorker !== null) {
+      void this.sendingRecoveryWorker.stop().catch(() => undefined);
+    }
+    this.sendingRecoveryWorker = worker;
+    // If the module is already initialized AND the gate is on, start
+    // the new worker immediately. Otherwise, the next initialize()
+    // call will start it (see initialize() body).
+    if (this.deps !== null && this.features.recoveryWorker) {
+      worker.start();
+    }
   }
 
   /**
@@ -1617,6 +1682,15 @@ export class PaymentsModule {
     if (this.ingestPool) {
       void this.ingestPool.destroy().catch(() => undefined);
       this.ingestPool = null;
+    }
+
+    // Phase 8 steelman post-cutover — stop the sending-recovery worker.
+    // Fire-and-forget for consistency with the rest of `destroy()`'s
+    // synchronous contract; the worker's `stop()` awaits its in-flight
+    // scan internally and never throws.
+    if (this.sendingRecoveryWorker) {
+      void this.sendingRecoveryWorker.stop().catch(() => undefined);
+      this.sendingRecoveryWorker = null;
     }
   }
 
