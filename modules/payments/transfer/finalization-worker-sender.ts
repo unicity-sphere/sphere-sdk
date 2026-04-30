@@ -19,6 +19,13 @@
  *    `transfer:cascade-failed` so the T.5.B.5 walker can fan the
  *    invalidation out to children / downstream recipients.
  *
+ * **Phase 8 refactor**: the §6.1 submit / poll / attach cycle was
+ * extracted into {@link runFinalizationCycle} (in
+ * `finalization-worker-base.ts`) — the sender and recipient workers
+ * share a single driver. This file now owns ONLY the sender-side
+ * concerns: outbox iteration, two-set CRDT updates, sender-side cascade
+ * emission, `transfer:confirmed` emission.
+ *
  * **Concurrency caps** (W14):
  *   - Per-aggregator: at most `MAX_CONCURRENT_POLLS_PER_AGGREGATOR` (16)
  *     in-flight aggregator calls across all entries (default 16). The
@@ -51,24 +58,6 @@
  * so T.5.B.5's cascade walker can fan out to children / downstream
  * outbox entries.
  *
- * **§6.1 mapping table** (verbatim):
- *
- * | Aggregator response                       | Disposition / action                                   |
- * |-------------------------------------------|--------------------------------------------------------|
- * | submit `SUCCESS`                          | proceed to poll                                        |
- * | submit `REQUEST_ID_EXISTS`                | proceed to poll (race ambiguity resolved at poll-side) |
- * | submit `AUTHENTICATOR_VERIFICATION_FAILED`| hard-fail, reason='belief-divergence' (cascade)        |
- * | submit `REQUEST_ID_MISMATCH`              | hard-fail, reason='client-error' (NO cascade — C12/C13)|
- * | submit transient (network / 5xx)          | retry up to MAX_SUBMIT_RETRIES                         |
- * | poll `OK` + tx-hash matches local         | SUCCESS — attach proof per §5.5 step 5                 |
- * | poll `OK` + tx-hash mismatches local      | hard-fail, reason='race-lost' (NO cascade — §6.1.1)    |
- * | poll `PATH_NOT_INCLUDED`                  | continue polling within window                         |
- * | poll `PATH_INVALID` (after retries)       | hard-fail, reason='proof-invalid' (cascade)            |
- * | poll `NOT_AUTHENTICATED` (after retries)  | trustbase-warning + hard-fail, reason='proof-invalid'  |
- * | poll transient (network / 5xx)            | retry; bounded by polling window                       |
- * | window exceeded + MIN_POLL_ATTEMPTS done  | hard-fail, reason='oracle-rejected' (cascade)          |
- * | 2× window safety net                      | hard-fail, reason='oracle-rejected' (cascade) (W26)    |
- *
  * @packageDocumentation
  */
 
@@ -79,21 +68,17 @@ import {
 } from './limits';
 import {
   validatePollingPolicy,
-  isPollingTimedOut,
   getBackoffMs,
   MIN_POLL_ATTEMPTS,
 } from './polling-policy';
 import { getAggregatorSemaphore } from './aggregator-semaphores';
 import {
-  performManifestCidRewrite,
   type FinalizationQueueAdapter,
-  type ManifestCidRewriteContext,
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
 } from './manifest-cid-rewrite';
 import { ManifestCas } from '../../../profile/manifest-cas';
 import type { PerTokenMutex } from '../../../profile/per-token-mutex';
-import type { ContentHash } from '../../../uxf/types';
 import type { DispositionReason } from '../../../types/disposition';
 import type {
   SphereEventMap,
@@ -106,270 +91,49 @@ import type {
 } from '../../../types/uxf-outbox';
 import { SphereError } from '../../../core/errors';
 import type { TrustBaseStaleness } from './trustbase-staleness';
+import {
+  attachProofUnderMutex,
+  runFinalizationCycle,
+  type AnchoredProofDescriptor,
+  type CycleResult,
+  type FinalizationAggregatorClient,
+  type HardFailOutcome,
+  type PollOutcome,
+  type PoolReadAdapter,
+  type RequestContext,
+  type RequestContextResolver,
+  type Semaphore,
+  type SubmitOutcome,
+  type SubmitOutcomeKind,
+  type PollOutcomeKind,
+} from './finalization-worker-base';
+
+// Re-export the shared adapter types so existing callers (tests and
+// wiring code) can keep importing them from this module path. These are
+// the SAME types used by {@link FinalizationWorkerRecipient}; production
+// wiring instantiates the same fakes.
+export type {
+  AnchoredProofDescriptor,
+  FinalizationAggregatorClient,
+  PollOutcome,
+  PollOutcomeKind,
+  PoolReadAdapter,
+  RequestContext,
+  RequestContextResolver,
+  Semaphore,
+  SubmitOutcome,
+  SubmitOutcomeKind,
+};
+
+// Re-export the {@link CountingSemaphore} class from the shared base —
+// it is the canonical default {@link Semaphore} implementation and is
+// consumed by the aggregator-semaphores registry + tests via this module
+// path.
+export { CountingSemaphore } from './finalization-worker-base';
 
 // =============================================================================
-// 1. Aggregator response shapes — narrow, framework-neutral
+// 1. Outbox writer surface — narrow shape over T.6.A's OutboxWriter
 // =============================================================================
-
-/**
- * Submit-side response classification, per §6.1's
- * `SubmitCommitmentStatus` enum from the underlying state-transition
- * SDK. The worker's caller adapts the SDK's enum (or any other source
- * of truth) to one of these discriminator strings.
- *
- *  - `'SUCCESS'`                           — commitment accepted; will
- *                                            be anchored shortly.
- *  - `'REQUEST_ID_EXISTS'`                 — a commitment for this
- *                                            requestId already exists.
- *                                            Could be (a) our retry
- *                                            (idempotent) OR (b) a
- *                                            race-winner's submit. The
- *                                            ambiguity is resolved at
- *                                            poll-side via tx-hash
- *                                            compare.
- *  - `'AUTHENTICATOR_VERIFICATION_FAILED'` — aggregator's crypto check
- *                                            failed → belief-divergence.
- *  - `'REQUEST_ID_MISMATCH'`               — client sent inconsistent
- *                                            (requestId, sourceState,
- *                                            transactionHash) tuple →
- *                                            client-error (operator
- *                                            alert).
- *  - `'TRANSIENT'`                         — network / 5xx; retry.
- */
-export type SubmitOutcomeKind =
-  | 'SUCCESS'
-  | 'REQUEST_ID_EXISTS'
-  | 'AUTHENTICATOR_VERIFICATION_FAILED'
-  | 'REQUEST_ID_MISMATCH'
-  | 'TRANSIENT';
-
-/**
- * Submit-side response carried back from the injected aggregator
- * adapter. `error` is forensic — surfaced into the outbox `error`
- * field so operators can triage.
- */
-export interface SubmitOutcome {
-  readonly kind: SubmitOutcomeKind;
-  readonly error?: string;
-}
-
-/**
- * Poll-side proof verification status, per §6.1's
- * `InclusionProofVerificationStatus` enum. The verifier collapses the
- * SDK enum into this narrow union.
- *
- *  - `'OK'`                — proof is anchored; caller compares
- *                            tx-hash to our local one to resolve
- *                            race-loser ambiguity.
- *  - `'PATH_NOT_INCLUDED'` — proof of NON-existence at this snapshot
- *                            (verifiable). Continue polling.
- *  - `'PATH_INVALID'`      — proof is structurally malformed.
- *  - `'NOT_AUTHENTICATED'` — proof's validator sigs don't verify
- *                            against local trustBase (likely stale).
- *  - `'TRANSIENT'`         — network / 5xx; retry.
- */
-export type PollOutcomeKind =
-  | 'OK'
-  | 'PATH_NOT_INCLUDED'
-  | 'PATH_INVALID'
-  | 'NOT_AUTHENTICATED'
-  | 'TRANSIENT';
-
-/**
- * Anchored-proof descriptor returned by a successful poll. The narrow
- * shape is chosen so the worker can reason about §6.1 race-detection
- * (transactionHash compare) and §6.3 most-recent-proof / security-alert
- * (transactionHash + authenticator compare) without coupling to the
- * SDK's `InclusionProof` class.
- *
- * The `proof` field is opaque — the worker passes it through to the
- * 4-step write orchestrator which forwards it to the pool adapter. No
- * part of the worker introspects it.
- */
-export interface AnchoredProofDescriptor {
-  /**
-   * SDK-encoded transactionHash imprint hex (matches what the
-   * `OracleProvider.verifyInclusionProof` adapter accepts and what
-   * `inclusion-proof.content.transactionHash` carries in the UXF
-   * pool). 68 hex chars (2-byte algorithm prefix + 32-byte digest).
-   */
-  readonly transactionHash: string;
-  /** Authenticator hex — used for §6.3 same-value-vs-different-value
-   *  resolution alongside transactionHash. */
-  readonly authenticator: string;
-  /** BFT round number / equivalent recency signal. Higher = more
-   *  recent. Optional: when absent, the worker falls back to first-
-   *  observed timestamp ordering. Per §6.3. */
-  readonly roundNumber?: number;
-  /** Opaque proof descriptor forwarded to the pool adapter. */
-  readonly proof: unknown;
-}
-
-/**
- * Result of a poll attempt. Discriminated on `kind`. `OK` carries the
- * anchored proof descriptor + the proof's CID as it would land in the
- * pool — the worker uses this to compute the manifest's new rootHash.
- *
- * The worker treats only `kind ∈ {OK, PATH_NOT_INCLUDED, PATH_INVALID,
- * NOT_AUTHENTICATED}` as advancing the §5.5 step 6 attempt counter;
- * `TRANSIENT` does NOT advance it (per the spec).
- */
-export type PollOutcome =
-  | {
-      readonly kind: 'OK';
-      readonly proof: AnchoredProofDescriptor;
-      /**
-       * The new content hash the token will resolve to once `proof`
-       * is attached. Caller computes this upstream — it is the §5.5
-       * step 5 "manifest CID rewrite" target.
-       */
-      readonly newCid: ContentHash;
-    }
-  | {
-      readonly kind:
-        | 'PATH_NOT_INCLUDED'
-        | 'PATH_INVALID'
-        | 'NOT_AUTHENTICATED'
-        | 'TRANSIENT';
-      readonly error?: string;
-    };
-
-// =============================================================================
-// 2. Injected adapters — keep the worker decoupled from the SDK
-// =============================================================================
-
-/**
- * Resolves a queue entry's `signedTx` for re-verification + submit.
- *
- * Per §6.1 (and §5.5 step 1) the worker first attempts to read the
- * signed-tx bytes from the outbox entry's queue-entry storage; failing
- * that, it falls back to looking up the in-pool token by
- * `(tokenId, txIndex)`. Production wires this to the per-address
- * pool / queue stores; tests inject inline recorders.
- */
-export interface RequestContextResolver {
-  /**
-   * Look up the local context for one outstanding requestId.
-   *
-   * Returns `null` if the worker should treat the requestId as
-   * unresolvable — the worker hard-fails the outbox entry with
-   * reason='structural' (no signedTx → no submit possible).
-   */
-  resolve(input: {
-    readonly addressId: string;
-    readonly outboxId: string;
-    readonly tokenId: string;
-    readonly requestId: string;
-  }): Promise<RequestContext | null>;
-}
-
-/**
- * Per-requestId context the worker needs to (a) re-verify, (b) submit,
- * (c) compare transactionHash on poll, and (d) compute the manifest
- * CID rewrite target.
- */
-export interface RequestContext {
-  /** Local transactionHash imprint (68-char hex). The poll-side
-   *  race-loser detection compares this against the proof's. */
-  readonly transactionHash: string;
-  /** Local authenticator (hex). Used for §6.3 same-value vs
-   *  different-value resolution. */
-  readonly authenticator: string;
-  /**
-   * Pre-existing manifest content hash for this token (the proof-less
-   * version). Becomes the §5.5 step 5 CAS precondition AND the
-   * tombstone subject. May be `undefined` for the genesis case (no
-   * prior manifest entry).
-   */
-  readonly previousCid?: ContentHash;
-  /**
-   * Tombstone-aware CAS-extras that the worker carries forward into
-   * the new manifest entry on attach. The 4-step write orchestrator
-   * combines `newCid` with this object to form the next entry.
-   */
-  readonly nextEntryRest: Pick<
-    NonNullable<ManifestCidRewriteContext['nextEntryRest']>,
-    'status' | 'conflictingHeads' | 'invalidReason'
-  >;
-}
-
-/**
- * Aggregator surface the worker calls into. The narrow shape lets us
- * test the worker without instantiating `UnicityAggregatorProvider`.
- *
- * The `aggregatorId` parameter is the per-aggregator semaphore key —
- * different aggregator endpoints share the budget under the same key
- * only if explicitly configured. Defaults to `'default'`.
- */
-export interface FinalizationAggregatorClient {
-  /**
-   * Submit the commitment for `requestId`. Returns one of the canonical
-   * `SubmitOutcomeKind` discriminators per §6.1's submit-side table.
-   *
-   * The worker honors `signal.aborted` between submit and poll; throws
-   * are caught and treated as `TRANSIENT`.
-   */
-  submit(input: {
-    readonly addressId: string;
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly aggregatorId?: string;
-    readonly signal?: AbortSignal;
-  }): Promise<SubmitOutcome>;
-
-  /**
-   * Poll the aggregator for an inclusion proof. Returns one of the
-   * canonical `PollOutcomeKind` discriminators per §6.1's poll-side
-   * table; on `'OK'` carries the anchored proof descriptor.
-   */
-  poll(input: {
-    readonly addressId: string;
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly aggregatorId?: string;
-    readonly signal?: AbortSignal;
-  }): Promise<PollOutcome>;
-}
-
-/**
- * Concurrency-cap primitive the worker uses for both per-aggregator
- * (W14, default 16) and per-token (default 4) caps. The caller injects
- * a real semaphore (live wallet) or a counting fake (tests).
- */
-export interface Semaphore {
-  /** Acquire a permit; returns a release function. */
-  acquire(): Promise<() => void>;
-  /** Defensively expose current available permits. Optional;
-   *  test-only fakes use this for assertions. */
-  readonly available?: number;
-}
-
-/**
- * Pool adapter extension — over the §5.5 step 5 base contract — that
- * exposes (a) the currently-attached proof descriptor for a requestId
- * and (b) a same-value vs different-value comparator. Used by the
- * §6.3 most-recent-proof / security-alert paths (W16, C10).
- *
- * The base {@link PoolWriteAdapter} contract is `attachProof` /
- * `isProofAttached`; this extension adds `getAttachedProof` so the
- * worker can detect "fresher proof for already-attached requestId"
- * without re-decoding pool elements.
- */
-export interface PoolReadAdapter {
-  /**
-   * Retrieve the currently-attached anchored proof descriptor for
-   * `(tokenId, requestId)`, if any. Returns `null` if no proof is
-   * attached at this requestId.
-   *
-   * Implementations MAY back this with the same store as
-   * {@link PoolWriteAdapter}; the read surface is split out so tests
-   * can mock attachment + retrieval independently.
-   */
-  getAttachedProof(
-    tokenId: string,
-    requestId: string,
-  ): Promise<AnchoredProofDescriptor | null>;
-}
 
 /**
  * Outbox writer surface — narrow shape over T.6.A's
@@ -395,7 +159,7 @@ export interface FinalizationOutboxWriter {
 }
 
 // =============================================================================
-// 3. Worker construction options
+// 2. Worker construction options
 // =============================================================================
 
 /**
@@ -520,34 +284,8 @@ export interface FinalizationWorkerSenderOptions {
 }
 
 // =============================================================================
-// 4. Internal types — disposition + per-entry processing result
+// 3. Per-entry processing result
 // =============================================================================
-
-/**
- * Per-requestId hard-fail outcome carrying the disposition reason and
- * a flag for the cascade walker (T.5.B.5). `'race-lost'` skips the
- * cascade per §6.1.1; every other terminal reason fires it.
- *
- * @internal
- */
-interface HardFailOutcome {
-  readonly kind: 'hard-fail';
-  readonly reason: DispositionReason;
-  /** Per §6.1.1 race-lost special case — TRUE when the cascade walker
-   *  should NOT be triggered. */
-  readonly skipCascade: boolean;
-  /** Forensic message persisted on the outbox entry's `error` field. */
-  readonly message: string;
-}
-
-/** @internal */
-interface SuccessOutcome {
-  readonly kind: 'success';
-  readonly newCid: ContentHash;
-}
-
-/** @internal */
-type RequestOutcome = SuccessOutcome | HardFailOutcome;
 
 /**
  * Result of one full `processOne(entry)` pass. Aggregates the
@@ -575,42 +313,7 @@ export interface ProcessOneResult {
 }
 
 // =============================================================================
-// 5. Internal helpers
-// =============================================================================
-
-/**
- * `transactionHash` and `authenticator` equality are byte-exact; we
- * lower-case both sides defensively in case the producer used a
- * different case-mode. (Hex is canonically lowercase but the spec is
- * not normative on that point — defensive equality avoids spurious
- * security-alerts on case-mismatch.)
- *
- * @internal
- */
-function sameProofValue(
-  a: { readonly transactionHash: string; readonly authenticator: string },
-  b: { readonly transactionHash: string; readonly authenticator: string },
-): boolean {
-  return (
-    a.transactionHash.toLowerCase() === b.transactionHash.toLowerCase() &&
-    a.authenticator.toLowerCase() === b.authenticator.toLowerCase()
-  );
-}
-
-/**
- * `transactionHash` equality only (byte-exact, lowercase). Used by
- * the §6.1 race-loser detection. Authenticator differences do NOT
- * imply race-lost — only different transactionHash matters at the
- * race step.
- *
- * @internal
- */
-function sameTransactionHash(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase();
-}
-
-// =============================================================================
-// 6. FinalizationWorkerSender
+// 4. FinalizationWorkerSender
 // =============================================================================
 
 /**
@@ -958,12 +661,13 @@ export class FinalizationWorkerSender {
   }
 
   // ===========================================================================
-  // 6.1. Per-requestId processing — submit + poll loop
+  // 4.1. Per-requestId processing — delegates to runFinalizationCycle
   // ===========================================================================
 
   /**
-   * Submit + poll one requestId per §6.1. Acquires the per-aggregator
-   * AND per-token semaphores around the aggregator calls.
+   * Drive one requestId through the §6.1 cycle by composing a
+   * {@link FinalizationCycleContext} that targets the sender-side
+   * persistence (manifest-CID-rewrite + outbox queue-entry removal).
    *
    * @internal
    */
@@ -981,512 +685,62 @@ export class FinalizationWorkerSender {
      * SURVIVING wall-clock deadline, not a fresh-from-now() one.
      */
     readonly pollStartedAt: number;
-  }): Promise<RequestOutcome> {
-    const { outboxId, tokenId, requestId } = args;
-    const ctxResolved = await this.options.resolver.resolve({
+  }): Promise<CycleResult> {
+    void args.recipientTransportPubkey; // forensic only; not consumed by cycle
+    const { outboxId, tokenId, requestId, bundleCid } = args;
+    const perTokenSemaphore = this.options.getPerTokenSemaphore(tokenId);
+
+    return await runFinalizationCycle({
       addressId: this.options.addressId,
-      outboxId,
       tokenId,
       requestId,
-    });
-    if (ctxResolved === null) {
-      return {
-        kind: 'hard-fail',
-        reason: 'structural',
-        skipCascade: false,
-        message: `STRUCTURAL_INVALID: no signedTx for requestId ${requestId} (outbox=${outboxId})`,
-      };
-    }
-
-    // Submit phase — bounded by maxSubmitRetries on TRANSIENT.
-    const submitResult = await this.runSubmitPhase(args);
-    if (submitResult.kind === 'hard-fail') return submitResult;
-
-    // Poll phase. W26 cross-restart fix (steelman post-cutover): the
-    // deadline anchor is the PERSISTED `pollStartedAt` from the outbox
-    // entry, NOT a fresh `now()`. Otherwise a token stuck PENDING
-    // across many restarts polls indefinitely with a fresh 60-min
-    // window each time, voiding §5.5 step 6's W26 guarantee.
-    const startedAt = args.pollStartedAt;
-    const tokenSemaphore = this.options.getPerTokenSemaphore(tokenId);
-    let attempts = 0;
-    let proofErrorRetries = 0;
-    // T.5.F two-strike accounting — counts NOT_AUTHENTICATED
-    // observations made in THIS poll loop. The first strike triggers a
-    // (debounced) refresh and a retry. The second strike escalates to
-    // security-alert. Local accounting protects against races where a
-    // sibling worker's refresh bumps the global tag before THIS worker
-    // has had a chance to retry with the refreshed trustBase.
-    let localNotAuthStrikes = 0;
-    let localRefreshAppliedSinceFirstStrike = false;
-
-    // Acquire per-aggregator + per-token permits for the full poll loop
-    // for this requestId. Production wiring uses these as DoS-defense
-    // budgets; keeping them for the full poll loop matches the spec's
-    // "MAX_CONCURRENT_POLLS_PER_TOKEN" framing (concurrent requestIds
-    // of the SAME token).
-    const releaseAgg = await this.perAggregatorSemaphore.acquire();
-    let releaseTok: (() => void) | null = null;
-    try {
-      releaseTok = await tokenSemaphore.acquire();
-
-      for (;;) {
-        if (this.options.signal?.aborted === true || this.stopRequested) {
-          return {
-            kind: 'hard-fail',
-            reason: 'structural',
-            skipCascade: false,
-            message: `worker aborted while polling requestId ${requestId}`,
-          };
-        }
-
-        const timeout = isPollingTimedOut(
-          startedAt,
-          this.options.now(),
-          attempts,
-        );
-        if (timeout.timedOut) {
-          return {
-            kind: 'hard-fail',
-            reason: 'oracle-rejected',
-            skipCascade: false,
-            message: `oracle-rejected (${timeout.reason}): requestId ${requestId} not anchored within ${timeout.reason === 'safety-net-fired' ? '2× ' : ''}polling window (attempts=${attempts})`,
-          };
-        }
-
-        // Backoff BEFORE poll — the schedule starts with 30s, so the
-        // first poll is delayed by `getBackoffMs(0)`. The deterministic
-        // sleep primitive is a no-op in tests with a fake clock.
-        await this.options.sleep(
-          getBackoffMs(attempts),
-          this.options.signal,
-        );
-
-        let pollOutcome: PollOutcome;
-        try {
-          pollOutcome = await this.options.aggregator.poll({
-            addressId: this.options.addressId,
-            tokenId,
-            requestId,
-            aggregatorId: this.aggregatorId,
-            signal: this.options.signal,
-          });
-        } catch (err) {
-          // Treat as TRANSIENT — does NOT advance attempt counter.
-          // Loop continues; safety net + max-iter caps eventually
-          // converge.
-          const message =
-            err instanceof Error ? err.message : String(err);
-          pollOutcome = {
-            kind: 'TRANSIENT',
-            error: `poll threw: ${message}`,
-          };
-        }
-
-        if (pollOutcome.kind === 'TRANSIENT') {
-          // Spec rule: TRANSIENT does not count toward MIN_POLL_ATTEMPTS.
-          continue;
-        }
-
-        // Verifiable proof-status — advances attempts.
-        attempts++;
-
-        if (pollOutcome.kind === 'OK') {
-          // §6.1 race-loser detection.
-          if (
-            !sameTransactionHash(
-              pollOutcome.proof.transactionHash,
-              ctxResolved.transactionHash,
-            )
-          ) {
-            return {
-              kind: 'hard-fail',
-              reason: 'race-lost',
-              skipCascade: true,
-              message: `OUTBOX_RACE_LOST: requestId ${requestId} anchored with mismatching transactionHash (local=${ctxResolved.transactionHash} aggregator=${pollOutcome.proof.transactionHash})`,
-            };
-          }
-
-          // §6.3 most-recent-proof / security-alert.
-          const securityAlert = await this.checkProofConflict({
-            tokenId,
-            requestId,
-            outboxId,
-            local: ctxResolved,
-            anchored: pollOutcome.proof,
-          });
-          if (securityAlert.kind === 'security-alert') {
-            return {
-              kind: 'hard-fail',
-              reason: 'belief-divergence',
-              skipCascade: false,
-              message: securityAlert.message,
-            };
-          }
-
-          // SUCCESS — attach proof via the §5.5 step 5 4-step write
-          // order (under the per-tokenId mutex).
-          await this.attachProofUnderMutex({
-            tokenId,
-            requestId,
-            outboxId,
-            proof: pollOutcome.proof,
-            newCid: pollOutcome.newCid,
-            previousCid: ctxResolved.previousCid,
-            nextEntryRest: ctxResolved.nextEntryRest,
-            superseded: securityAlert.kind === 'superseded',
-          });
-
-          if (securityAlert.kind === 'superseded') {
-            // The §6.3 superseded path: the manifest CID rewrite
-            // already tombstoned the prior CID via step 3 of the
-            // 4-step write order. Emit `transfer:proof-superseded`
-            // with the prior CID (= ctxResolved.previousCid, which is
-            // the manifest's pre-rewrite root for this requestId
-            // under the resolver's current view).
-            this.options.emit('transfer:proof-superseded', {
-              tokenId,
-              requestId,
-              outboxId,
-              previousCid: ctxResolved.previousCid ?? '',
-              newCid: pollOutcome.newCid,
-            });
-          }
-
-          // T.5.F: an authenticated proof landed — reset the staleness
-          // counter so the next first-strike refreshes again.
-          if (this.trustBaseStaleness !== undefined) {
-            this.trustBaseStaleness.recordAuthenticatedOk(this.aggregatorId);
-          }
-          return { kind: 'success', newCid: pollOutcome.newCid };
-        }
-
-        if (pollOutcome.kind === 'PATH_NOT_INCLUDED') {
-          // Continue polling within window.
-          continue;
-        }
-
-        if (pollOutcome.kind === 'PATH_INVALID') {
-          proofErrorRetries++;
-          if (proofErrorRetries >= this.maxProofErrorRetries) {
-            return {
-              kind: 'hard-fail',
-              reason: 'proof-invalid',
-              skipCascade: false,
-              message: `PATH_INVALID after ${proofErrorRetries} retries: requestId=${requestId}${pollOutcome.error ? ` (${pollOutcome.error})` : ''}`,
-            };
-          }
-          continue;
-        }
-
-        if (pollOutcome.kind === 'NOT_AUTHENTICATED') {
-          // Emit trustbase-warning on every observation. Operators see
-          // the trail in the order it happens; T.5.F's escalation logic
-          // runs AFTER the warning so the security-alert always
-          // carries a corresponding warning.
-          this.options.emit('transfer:trustbase-warning', {
-            tokenId,
-            requestId,
-            outboxId,
-            bundleCid: args.bundleCid,
-            attempt: attempts,
-            message:
-              pollOutcome.error ??
-              'NOT_AUTHENTICATED — proof verifier rejected validator signatures (likely stale local trustBase per §9.4.1)',
-          });
-
-          // T.5.F: two-strike escalation when the staleness ledger is
-          // wired. First strike → emit warning, refresh, retry. Second
-          // strike (only if a refresh has been applied since strike 1)
-          // → emit security-alert + hard-fail.
-          if (this.trustBaseStaleness !== undefined) {
-            localNotAuthStrikes++;
-            // Inform the ledger so its `isTrustBaseStale` /
-            // `lastNotAuthenticatedAt` diagnostics stay accurate
-            // (operators may query it independently).
-            this.trustBaseStaleness.recordNotAuthenticated(
-              this.aggregatorId,
-            );
-
-            if (
-              localNotAuthStrikes >= 2 &&
-              localRefreshAppliedSinceFirstStrike
-            ) {
-              const message = `NOT_AUTHENTICATED persisted after trustBase refresh (strike ${localNotAuthStrikes}): requestId=${requestId} — escalating to security-alert per §9.4.1`;
-              this.options.emit('transfer:security-alert', {
-                tokenId,
-                requestId,
-                outboxId,
-                attachedTransactionHash: '',
-                observedTransactionHash: ctxResolved.transactionHash,
-                attachedAuthenticator: '',
-                observedAuthenticator: ctxResolved.authenticator,
-                message,
-              });
-              return {
-                kind: 'hard-fail',
-                reason: 'proof-invalid',
-                skipCascade: false,
-                message,
-              };
-            }
-
-            // First strike (or retry after a failed refresh) — kick
-            // the refresh (debounced per aggregator) and retry. The
-            // refresh is awaited so the next poll uses the new
-            // trustBase. A failed refresh outcome is treated as
-            // transient: do NOT mark "applied since strike 1"; the
-            // next strike will trigger another refresh attempt.
-            const refresh = await this.trustBaseStaleness.refreshTrustBase(
-              this.aggregatorId,
-              this.options.signal,
-            );
-            if (
-              refresh.kind === 'applied' ||
-              refresh.kind === 'no-change'
-            ) {
-              localRefreshAppliedSinceFirstStrike = true;
-            }
-            // Do NOT advance proofErrorRetries on the staleness path.
-            // The polling-window safety net + signal abort keep the
-            // loop bounded.
-            continue;
-          }
-
-          // No staleness ledger wired — preserve T.5.B's original
-          // budgeted retry behavior.
-          proofErrorRetries++;
-          if (proofErrorRetries >= this.maxProofErrorRetries) {
-            return {
-              kind: 'hard-fail',
-              reason: 'proof-invalid',
-              skipCascade: false,
-              message: `NOT_AUTHENTICATED after ${proofErrorRetries} retries: requestId=${requestId} (likely stale trustBase per §9.4.1)`,
-            };
-          }
-          continue;
-        }
-      }
-    } finally {
-      if (releaseTok !== null) releaseTok();
-      releaseAgg();
-    }
-  }
-
-  // ===========================================================================
-  // 6.2. Submit phase
-  // ===========================================================================
-
-  /**
-   * Run the §6.1 submit phase for one requestId. Returns either a
-   * hard-fail outcome (terminal at submit-side: belief-divergence /
-   * client-error) OR `null` to indicate "submit succeeded, proceed to
-   * poll".
-   *
-   * @internal
-   */
-  private async runSubmitPhase(args: {
-    readonly outboxId: string;
-    readonly tokenId: string;
-    readonly requestId: string;
-  }): Promise<{ kind: 'submitted' } | HardFailOutcome> {
-    let attempts = 0;
-    let lastError: string | undefined;
-    while (attempts <= this.maxSubmitRetries) {
-      if (this.options.signal?.aborted === true || this.stopRequested) {
-        return {
-          kind: 'hard-fail',
-          reason: 'structural',
-          skipCascade: false,
-          message: `worker aborted before submit for requestId ${args.requestId}`,
-        };
-      }
-      let outcome: SubmitOutcome;
-      try {
-        outcome = await this.options.aggregator.submit({
+      outboxId,
+      bundleCid,
+      // Sender uses `requestId X` / `requestId=X` formatting.
+      subjectPhrase: `requestId ${requestId}`,
+      subjectEqPhrase: `requestId=${requestId}`,
+      structuralInvalidMessage: `STRUCTURAL_INVALID: no signedTx for requestId ${requestId} (outbox=${outboxId})`,
+      resolver: this.options.resolver,
+      aggregator: this.options.aggregator,
+      poolRead: this.options.poolRead,
+      perAggregatorSemaphore: this.perAggregatorSemaphore,
+      perTokenSemaphore,
+      pollStartedAt: args.pollStartedAt,
+      emit: this.options.emit,
+      now: this.options.now,
+      sleep: this.options.sleep,
+      signal: this.options.signal,
+      isStopped: () => this.stopRequested,
+      maxSubmitRetries: this.maxSubmitRetries,
+      maxProofErrorRetries: this.maxProofErrorRetries,
+      aggregatorId: this.aggregatorId,
+      trustBaseStaleness: this.trustBaseStaleness,
+      attachProof: async (attachArgs) => {
+        await attachProofUnderMutex({
           addressId: this.options.addressId,
-          tokenId: args.tokenId,
-          requestId: args.requestId,
-          aggregatorId: this.aggregatorId,
-          signal: this.options.signal,
-        });
-      } catch (err) {
-        outcome = {
-          kind: 'TRANSIENT',
-          error: err instanceof Error ? err.message : String(err),
-        };
-      }
-
-      if (outcome.kind === 'SUCCESS' || outcome.kind === 'REQUEST_ID_EXISTS') {
-        // SUCCESS / EXISTS both proceed to poll. EXISTS could be our
-        // retry OR a race-winner's submit — disambiguated at poll-side.
-        return { kind: 'submitted' };
-      }
-      if (outcome.kind === 'AUTHENTICATOR_VERIFICATION_FAILED') {
-        return {
-          kind: 'hard-fail',
-          reason: 'belief-divergence',
-          skipCascade: false,
-          message: `belief-divergence: aggregator rejected authenticator for requestId ${args.requestId}${outcome.error ? ` (${outcome.error})` : ''}`,
-        };
-      }
-      if (outcome.kind === 'REQUEST_ID_MISMATCH') {
-        // C12 / C13 — CLIENT BUG. Hard-fail with reason='client-error'.
-        // Operator alert via `transfer:operator-alert`. NO cascade per
-        // §6.1.1 (client-error is not in the §6.1.1 cascade set).
-        this.options.emit('transfer:operator-alert', {
-          code: 'client-error',
-          tokenId: args.tokenId,
-          message: `REQUEST_ID_MISMATCH on submit: client computed an inconsistent (requestId, sourceState, transactionHash) tuple for requestId ${args.requestId}${outcome.error ? ` (${outcome.error})` : ''}`,
-        });
-        return {
-          kind: 'hard-fail',
-          reason: 'client-error',
-          skipCascade: true,
-          message: `client-error: REQUEST_ID_MISMATCH on submit for requestId ${args.requestId}${outcome.error ? ` (${outcome.error})` : ''}`,
-        };
-      }
-      // TRANSIENT
-      lastError = outcome.error;
-      attempts++;
-      if (attempts > this.maxSubmitRetries) break;
-      // Reuse the polling-policy's backoff schedule for submit retries —
-      // matches §6.1's "back off; retry. Bounded by MAX_SUBMIT_RETRIES"
-      // wording.
-      await this.options.sleep(getBackoffMs(attempts - 1), this.options.signal);
-    }
-    return {
-      kind: 'hard-fail',
-      reason: 'oracle-rejected',
-      skipCascade: false,
-      message: `submit transient retries exhausted (max=${this.maxSubmitRetries}) for requestId ${args.requestId}${lastError ? ` last error: ${lastError}` : ''}`,
-    };
-  }
-
-  // ===========================================================================
-  // 6.3. §6.3 most-recent-proof / security-alert
-  // ===========================================================================
-
-  /**
-   * Resolves the §6.3 most-recent-proof / security-alert decision for a
-   * fresh poll's `OK` outcome.
-   *
-   * Returns:
-   *  - `'fresh'`       — no prior proof attached at this requestId; the
-   *                       worker proceeds straight to attach.
-   *  - `'superseded'`  — a prior proof IS attached, with the SAME
-   *                       `(transactionHash, authenticator)` and an
-   *                       OLDER round number. The worker replaces +
-   *                       tombstones the previous CID per §6.3.
-   *  - `'attached-newer'` — a prior proof IS attached and is at least
-   *                       as new as this one. The worker treats this
-   *                       as a no-op replacement (idempotent) — the
-   *                       same-value + newer-round-already-here case.
-   *  - `'security-alert'` — a prior proof IS attached, with a DIFFERENT
-   *                       `(transactionHash, authenticator)` — the
-   *                       §6.3 forbidden case. Worker emits
-   *                       `transfer:security-alert` and refuses to
-   *                       merge.
-   *
-   * @internal
-   */
-  private async checkProofConflict(args: {
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly outboxId: string;
-    readonly local: { readonly transactionHash: string; readonly authenticator: string };
-    readonly anchored: AnchoredProofDescriptor;
-  }): Promise<
-    | { kind: 'fresh' }
-    | { kind: 'superseded' }
-    | { kind: 'attached-newer' }
-    | { kind: 'security-alert'; message: string }
-  > {
-    const attached = await this.options.poolRead.getAttachedProof(
-      args.tokenId,
-      args.requestId,
-    );
-    if (attached === null) return { kind: 'fresh' };
-
-    if (!sameProofValue(attached, args.anchored)) {
-      // §6.3 forbidden — emit security-alert and refuse merge.
-      const message = `transfer:security-alert: two proofs for the same requestId disagree on (transactionHash, authenticator) — single-spend invariant violated at aggregator. tokenId=${args.tokenId} requestId=${args.requestId}`;
-      this.options.emit('transfer:security-alert', {
-        tokenId: args.tokenId,
-        requestId: args.requestId,
-        outboxId: args.outboxId,
-        attachedTransactionHash: attached.transactionHash,
-        observedTransactionHash: args.anchored.transactionHash,
-        attachedAuthenticator: attached.authenticator,
-        observedAuthenticator: args.anchored.authenticator,
-        message,
-      });
-      return { kind: 'security-alert', message };
-    }
-
-    // Same-value — choose the more recent.
-    const attachedRound = attached.roundNumber ?? 0;
-    const anchoredRound = args.anchored.roundNumber ?? 0;
-    if (anchoredRound > attachedRound) {
-      // Need previous CID to tombstone; we don't have it here cheaply,
-      // so we synthesize from the manifest CAS in the attach step. Use
-      // the attached requestId's existing entry hash as the tombstone
-      // subject when we attach.
-      return { kind: 'superseded' };
-    }
-    return { kind: 'attached-newer' };
-  }
-
-  // ===========================================================================
-  // 6.4. Attach via §5.5 step 5 4-step write — under per-token mutex
-  // ===========================================================================
-
-  /**
-   * Wraps the §5.5 step 5 orchestrator with the §5.5 step 9 per-tokenId
-   * mutex. The attach is the only place the worker writes to the
-   * manifest, so this is the only place the mutex is acquired.
-   *
-   * @internal
-   */
-  private async attachProofUnderMutex(args: {
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly outboxId: string;
-    readonly proof: AnchoredProofDescriptor;
-    readonly newCid: ContentHash;
-    readonly previousCid?: ContentHash;
-    readonly nextEntryRest: RequestContext['nextEntryRest'];
-    readonly superseded: boolean;
-  }): Promise<void> {
-    await this.options.perTokenMutex.acquire(
-      args.tokenId,
-      async () => {
-        const ctx: ManifestCidRewriteContext = {
-          addr: this.options.addressId,
-          tokenId: args.tokenId,
-          proofToAttach: {
-            requestId: args.requestId,
-            roundNumber: args.proof.roundNumber ?? 0,
-            proof: args.proof.proof,
-            timestamp: this.options.now(),
-          },
-          newCid: args.newCid,
-          previousCid: args.previousCid,
-          nextEntryRest: args.nextEntryRest,
-          queueEntryRequestId: args.requestId,
+          tokenId,
+          requestId,
+          proof: attachArgs.proof,
+          newCid: attachArgs.newCid,
+          previousCid: attachArgs.previousCid,
+          nextEntryRest: attachArgs.nextEntryRest,
+          // Sender: queueEntryRequestId IS the requestId. The 4-step
+          // write's queue removal targets the requestId-keyed entry.
+          queueEntryRequestId: requestId,
           pool: this.options.pool,
           manifestCas: this.options.manifestCas,
           tombstones: this.options.tombstones,
           queue: this.options.queue,
-        };
-        await performManifestCidRewrite(ctx);
+          perTokenMutex: this.options.perTokenMutex,
+          perTokenMutexStrategy: this.perTokenMutexStrategy,
+          now: this.options.now,
+        });
       },
-      { strategy: this.perTokenMutexStrategy },
-    );
+    });
   }
 
   // ===========================================================================
-  // 6.5. Hard-fail handling — cascade-failed event + transfer:confirmed
+  // 4.2. Hard-fail handling — cascade-failed event + transfer:confirmed
   // ===========================================================================
 
   /**
@@ -1531,6 +785,7 @@ export class FinalizationWorkerSender {
    * @internal
    */
   private emitTransferConfirmed(entry: UxfTransferOutboxEntry): void {
+    void entry;
     const result: TransferResult = {
       id: entry.id,
       status: 'completed',
@@ -1541,7 +796,7 @@ export class FinalizationWorkerSender {
   }
 
   // ===========================================================================
-  // 6.6. Scan loop
+  // 4.3. Scan loop
   // ===========================================================================
 
   /**
@@ -1575,60 +830,6 @@ export class FinalizationWorkerSender {
       } catch {
         // Sleep aborts via signal — fall through to loop check.
       }
-    }
-  }
-}
-
-// =============================================================================
-// 7. Convenience: counting semaphore (test + production fallback)
-// =============================================================================
-
-/**
- * Simple in-memory counting semaphore conforming to the
- * {@link Semaphore} contract. Useful as a default for both production
- * (single-process) and tests.
- *
- * Permits are acquired in FIFO order. Released permits are immediately
- * available to the next waiter.
- */
-export class CountingSemaphore implements Semaphore {
-  private permits: number;
-  private readonly waiters: Array<() => void> = [];
-
-  constructor(maxConcurrent: number) {
-    if (!Number.isFinite(maxConcurrent) || maxConcurrent <= 0) {
-      throw new SphereError(
-        `CountingSemaphore: maxConcurrent must be > 0; got ${maxConcurrent}`,
-        'VALIDATION_ERROR',
-      );
-    }
-    this.permits = maxConcurrent;
-  }
-
-  get available(): number {
-    return this.permits;
-  }
-
-  async acquire(): Promise<() => void> {
-    if (this.permits > 0) {
-      this.permits--;
-      return () => this.release();
-    }
-    // Wait for a permit.
-    return new Promise<() => void>((resolve) => {
-      this.waiters.push(() => {
-        this.permits--;
-        resolve(() => this.release());
-      });
-    });
-  }
-
-  private release(): void {
-    this.permits++;
-    const next = this.waiters.shift();
-    if (next !== undefined) {
-      // Re-enter immediately; permit is consumed by `next` synchronously.
-      next();
     }
   }
 }
