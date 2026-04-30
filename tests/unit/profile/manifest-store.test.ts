@@ -169,7 +169,11 @@ describe('mergeManifestEntry — §5.4 metadata-preservation rules', () => {
     expect(mergeManifestEntry(prev, next).splitParent).toBe('parent-a');
   });
 
-  it('chain-content fields (rootHash, status) taken from next', () => {
+  it('chain-content fields (rootHash, status) taken from chain winner — next when lex-min', () => {
+    // prev='prev-root...' vs next='next-root...'. With no bundleCids set,
+    // the symmetric defense-in-depth fallback picks lex-min on rootHash.
+    // 'next-root...' < 'prev-root...' (since 'n' < 'p' in ASCII), so `next`
+    // wins — same outcome as the old "next always wins" rule on these inputs.
     const prev = makeEntry({
       rootHash: ch('prev-root'.padEnd(64, '0')),
       status: 'valid',
@@ -183,16 +187,58 @@ describe('mergeManifestEntry — §5.4 metadata-preservation rules', () => {
     expect(merged.status).toBe('pending');
   });
 
-  it('lex-min tie-break comparator is unused on chain-content (upstream owns it)', () => {
-    // The `compareCidsBinary` arg is an injection point for future logic
-    // — today, mergeManifestEntry takes chain-content from `next` and
-    // does not need the comparator. Verify that supplying a stub doesn't
-    // affect output.
+  it('defense-in-depth: rootHash divergence is resolved symmetrically via the comparator', () => {
+    // The `compareCidsBinary` arg drives the symmetric tie-break when
+    // `prev.rootHash !== next.rootHash` and no bundleCid is available.
+    // With a stub that always returns 1 (a > b), the second arg is the
+    // lex-min winner — i.e., `next` here.
     const stub = (): -1 | 0 | 1 => 1;
     const prev = makeEntry({ rootHash: ch('a'.repeat(64)) });
     const next = makeEntry({ rootHash: ch('b'.repeat(64)) });
     const merged = mergeManifestEntry(prev, next, stub);
     expect(merged.rootHash).toBe(ch('b'.repeat(64)));
+  });
+
+  it('mergeManifestEntry(A, B).rootHash === mergeManifestEntry(B, A).rootHash on divergent rootHash inputs', () => {
+    // Symmetry property — the steelman defense. Without the symmetric
+    // fallback, the persisted rootHash would flip-flop between replicas
+    // depending on whose merge ran first. Test all three branches of the
+    // tie-break ladder.
+
+    // Branch 1: both sides have bundleCid → lex-min bundleCid wins.
+    const a1 = makeEntry({
+      rootHash: ch('aa'.repeat(32)),
+      bundleCid: 'zzz-cid',
+    });
+    const b1 = makeEntry({
+      rootHash: ch('bb'.repeat(32)),
+      bundleCid: 'aaa-cid',
+    });
+    const ab1 = mergeManifestEntry(a1, b1);
+    const ba1 = mergeManifestEntry(b1, a1);
+    expect(ab1.rootHash).toBe(ba1.rootHash);
+    expect(ab1.bundleCid).toBe(ba1.bundleCid);
+    expect(ab1.bundleCid).toBe('aaa-cid'); // lex-min wins
+    expect(ab1.rootHash).toBe(ch('bb'.repeat(32))); // rootHash from same side
+
+    // Branch 2: only one side has bundleCid → that side wins symmetrically.
+    const a2 = makeEntry({
+      rootHash: ch('aa'.repeat(32)),
+      bundleCid: 'some-cid',
+    });
+    const b2 = makeEntry({ rootHash: ch('bb'.repeat(32)) });
+    const ab2 = mergeManifestEntry(a2, b2);
+    const ba2 = mergeManifestEntry(b2, a2);
+    expect(ab2.rootHash).toBe(ba2.rootHash);
+    expect(ab2.rootHash).toBe(ch('aa'.repeat(32))); // a2 wins (has bundleCid)
+
+    // Branch 3: neither side has bundleCid → lex-min rootHash wins.
+    const a3 = makeEntry({ rootHash: ch('aa'.repeat(32)) });
+    const b3 = makeEntry({ rootHash: ch('bb'.repeat(32)) });
+    const ab3 = mergeManifestEntry(a3, b3);
+    const ba3 = mergeManifestEntry(b3, a3);
+    expect(ab3.rootHash).toBe(ba3.rootHash);
+    expect(ab3.rootHash).toBe(ch('aa'.repeat(32))); // lex-min
   });
 });
 
@@ -268,11 +314,13 @@ describe('ManifestStore.upsert', () => {
   });
 
   it('CAS retries once on cas-mismatch then succeeds', async () => {
-    // Initial state: an entry exists.
+    // Initial state: an entry exists. We want `next` to win the symmetric
+    // tie-break so the assertion below remains meaningful — pick prev with
+    // a lex-greater rootHash than next.
     storage.setRaw(
       ADDR,
       TOKEN_A,
-      makeEntry({ rootHash: ch('a'.repeat(64)), lamport: 1 }),
+      makeEntry({ rootHash: ch('c'.repeat(64)), lamport: 1 }),
     );
 
     // Inject a one-shot ManifestCasConcurrentModificationError on the
@@ -285,6 +333,7 @@ describe('ManifestStore.upsert', () => {
     });
 
     const result = await store.upsert(ADDR, TOKEN_A, next);
+    // 'b'×64 < 'c'×64 → next wins under lex-min defense-in-depth.
     expect(result.rootHash).toBe(ch('b'.repeat(64)));
     expect(storage.writeCount).toBe(1); // one successful, one threw
     // Read count: at least 2 (one per attempt).
@@ -422,7 +471,7 @@ describe('lex-min tie-break (upstream-decision contract)', () => {
     const storage = new FakeStorage();
     const store = new ManifestStore({ storage, lamport: new Lamport() });
 
-    // Initial: prev came from a HIGHER bundleCid (the loser).
+    // Initial: prev came from a HIGHER bundleCid (the loser, lex-greater).
     storage.setRaw(
       ADDR,
       TOKEN_A,
@@ -430,13 +479,15 @@ describe('lex-min tie-break (upstream-decision contract)', () => {
         rootHash: ch('loser-root'.padEnd(64, '0')),
         status: 'conflicting',
         conflictingHeads: [ch('loser-root'.padEnd(64, '0'))],
-        bundleCid: 'bafy-loser',
+        bundleCid: 'bafy-z-loser',
         lamport: 1,
       }),
     );
 
     // Upstream §5.3 [D] picked the lex-min winner and stamps the
-    // manifest delta with the winner's rootHash + bundleCid.
+    // manifest delta with the winner's rootHash + bundleCid. With the
+    // T.3.C defense-in-depth fallback, the merge ALSO picks lex-min
+    // bundleCid locally — both paths converge on the same winner.
     const winnerDelta = makeEntry({
       rootHash: ch('winner-root'.padEnd(64, '0')),
       status: 'conflicting',
@@ -444,13 +495,13 @@ describe('lex-min tie-break (upstream-decision contract)', () => {
         ch('winner-root'.padEnd(64, '0')),
         ch('loser-root'.padEnd(64, '0')),
       ],
-      bundleCid: 'bafy-winner',
+      bundleCid: 'bafy-a-winner', // lex-min wins
     });
 
     const result = await store.upsert(ADDR, TOKEN_A, winnerDelta);
     // Winner survives in chain-content fields.
     expect(result.rootHash).toBe(ch('winner-root'.padEnd(64, '0')));
-    expect(result.bundleCid).toBe('bafy-winner');
+    expect(result.bundleCid).toBe('bafy-a-winner');
     // Loser preserved in conflictingHeads via set-OR merge.
     expect(result.conflictingHeads).toEqual([
       ch('loser-root'.padEnd(64, '0')),

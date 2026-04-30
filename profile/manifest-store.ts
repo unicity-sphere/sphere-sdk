@@ -92,9 +92,14 @@ export interface ManifestStoreOptions {
  * rules. Pure / deterministic — no side effects, no clock mutation.
  *
  * **Field merge semantics** (per §5.4):
- *  - `rootHash` — taken from `next` (the chain merger has already
- *    decided which side wins; lex-min `bundleCid` if conflicting).
- *  - `status`   — taken from `next` (post-decision).
+ *  - `rootHash` — taken from `next` when `prev.rootHash === next.rootHash`
+ *    (canonical path: conflict-merger stamped the winner as `next`). On
+ *    divergence, defense-in-depth symmetric tie-break: lex-min
+ *    `bundleCid` if either side carries it; lex-min `rootHash` otherwise.
+ *    Ensures `mergeManifestEntry(A, B) === mergeManifestEntry(B, A)`
+ *    even if a future caller bypasses `conflict-merger` (T.3.D).
+ *  - `status`   — taken from the chain-content winner (per the rootHash
+ *    selection above). When rootHashes match, that's `next`.
  *  - `invalidReason` — preserved if either side has it set; on
  *    divergence, prefer `next` (the latest signal).
  *  - `splitParent` — preserved if either side has it set. On
@@ -170,34 +175,41 @@ export function mergeManifestEntry(
   }
 
   // ---------------------------------------------------------------------------
-  // Chain-content fields — taken from `next` (the post-§5.3 [D] decision)
+  // Chain-content fields — symmetric defense-in-depth tie-break on divergence.
+  //
+  // **Canonical path**: the §5.3 [D-conflict] tie-break (lex-min bundleCid) is
+  // performed UPSTREAM by the conflict merger (T.3.D) when picking which side's
+  // chain-content wins. The merger has richer logic (chain-prefix detection,
+  // delta direction, etc.) and stamps the winner as `next`. By the time
+  // `mergeManifestEntry` sees a stamped `next`, that decision has been made.
+  //
+  // **Fallback path** (this block): when `prev.rootHash !== next.rootHash`,
+  // re-merge symmetrically so `mergeManifestEntry(A, B) === mergeManifestEntry(B, A)`
+  // even if a future caller bypasses `conflict-merger`. Without this, replicas
+  // could flip-flop the persisted `rootHash` between two values and never
+  // converge. See steelman post-cutover review of T.3.C / T.3.D contract.
+  //
+  // The `compareCidsBinary` arg is the SAME comparator §5.3 [D-conflict] uses
+  // (`compareCidV1Binary`); tests inject a deterministic stub. The comparator
+  // is invoked via `safeCompareSymmetric` which falls back to plain string
+  // compare on parse failure (legacy hex rootHash, malformed bundleCid) — still
+  // symmetric, still deterministic across replicas.
   // ---------------------------------------------------------------------------
-  const rootHash: ContentHash = next.rootHash;
-  const status = next.status;
-  const invalidReason = next.invalidReason ?? prev.invalidReason;
+  const chainSrc: TokenManifestEntry =
+    prev.rootHash === next.rootHash
+      ? next
+      : pickChainWinnerSymmetric(prev, next, compareCidsBinary);
+  const otherSrc: TokenManifestEntry = chainSrc === next ? prev : next;
 
-  // bundleCid / senderTransportPubkey: prefer `next` (the chain-winning
-  // side stamped them) but fall back to `prev` if `next` did not set
-  // them. If both are set and differ (the usual case for §5.3 [D]
-  // conflict merge), the chain-winning side already has the lex-min
-  // bundleCid — `next` should reflect that decision.
-  const bundleCid = next.bundleCid ?? prev.bundleCid;
+  const rootHash: ContentHash = chainSrc.rootHash;
+  const status = chainSrc.status;
+  const invalidReason = chainSrc.invalidReason ?? otherSrc.invalidReason;
+
+  // bundleCid / senderTransportPubkey: take from the chain winner; fall back
+  // to the other side if the winner did not stamp them.
+  const bundleCid = chainSrc.bundleCid ?? otherSrc.bundleCid;
   const senderTransportPubkey =
-    next.senderTransportPubkey ?? prev.senderTransportPubkey;
-
-  // ---------------------------------------------------------------------------
-  // Lex-min tie-break note
-  // ---------------------------------------------------------------------------
-  // The §5.3 [D-conflict] tie-break (lex-min bundleCid) is performed
-  // UPSTREAM by the conflict merger (T.3.D) when picking which side's
-  // chain-content wins. By the time `mergeManifestEntry` sees `next`,
-  // that decision has been made. The `compareCidsBinary` comparator
-  // is therefore unused on the chain-content axis here; it exists to
-  // let upstream callers (and tests) inject a deterministic
-  // comparator when constructing a conflicting-heads delta. We keep
-  // the parameter on the public signature so future logic that needs
-  // the comparator (e.g. resolving `bundleCid` divergence) can use it.
-  void compareCidsBinary;
+    chainSrc.senderTransportPubkey ?? otherSrc.senderTransportPubkey;
 
   // ---------------------------------------------------------------------------
   // Operator-override audit trail (T.5.D — W30 / W31 / N4)
@@ -444,6 +456,66 @@ function maxOpt(a: number | undefined, b: number | undefined): number | undefine
   if (a === undefined) return b;
   if (b === undefined) return a;
   return Math.max(a, b);
+}
+
+/**
+ * Defense-in-depth chain-content winner pick when `prev.rootHash !==
+ * next.rootHash`. Symmetric in `(prev, next)` so replicas converge to the
+ * same persisted entry regardless of which side called the merge first.
+ *
+ * **Selection order** (each step is symmetric on its own):
+ *   1. Both sides have `bundleCid` → lex-min `bundleCid` wins (§5.3
+ *      [D-conflict] rule).
+ *   2. Exactly one side has `bundleCid` → that side wins (more chain
+ *      evidence; symmetric — outcome doesn't depend on arg order).
+ *   3. Neither side has `bundleCid` → lex-min `rootHash` wins (last-resort
+ *      tie-break; still symmetric across replicas).
+ *
+ * The canonical path runs `conflict-merger` (T.3.D) upstream and stamps the
+ * winner as `next`; this fallback is defense-in-depth for callers that
+ * bypass the conflict-merger.
+ */
+function pickChainWinnerSymmetric(
+  prev: TokenManifestEntry,
+  next: TokenManifestEntry,
+  compareCidsBinary: (a: string, b: string) => -1 | 0 | 1,
+): TokenManifestEntry {
+  // 1) Both sides have bundleCid → lex-min wins.
+  if (prev.bundleCid !== undefined && next.bundleCid !== undefined) {
+    const cmp = safeCompareSymmetric(
+      prev.bundleCid,
+      next.bundleCid,
+      compareCidsBinary,
+    );
+    return cmp <= 0 ? prev : next;
+  }
+  // 2) Exactly one side has bundleCid → that side wins (symmetric).
+  if (prev.bundleCid !== undefined) return prev;
+  if (next.bundleCid !== undefined) return next;
+  // 3) Neither has bundleCid → tie-break on rootHash itself.
+  const cmp = safeCompareSymmetric(prev.rootHash, next.rootHash, compareCidsBinary);
+  return cmp <= 0 ? prev : next;
+}
+
+/**
+ * Invoke `compareCidsBinary` with a fallback to plain string comparison if
+ * parsing fails (e.g. legacy hex rootHash, malformed CID, test stub passing
+ * non-CID strings). Plain string compare is still symmetric and
+ * deterministic across replicas — what matters is that both replicas reach
+ * the same answer for the same inputs, regardless of arg order.
+ */
+function safeCompareSymmetric(
+  a: string,
+  b: string,
+  compareCidsBinary: (x: string, y: string) => -1 | 0 | 1,
+): number {
+  try {
+    return compareCidsBinary(a, b);
+  } catch {
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  }
 }
 
 /**
