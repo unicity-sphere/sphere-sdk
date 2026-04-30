@@ -586,14 +586,21 @@ export class FinalizationWorkerRecipient {
     const results = settled.map((r, i) => {
       if (r.status === 'fulfilled') return r.value;
       const entry = entries[i]!;
+      // Steelman recursion fix: capture FULL stack via err.stack so
+      // postmortem analysis can distinguish a genuine oracle rejection
+      // from an internal worker bug. Prefix with "WORKER-INTERNAL:" so
+      // operators grep'ing logs can spot the mis-attribution.
+      const errMsg =
+        r.reason instanceof Error
+          ? `WORKER-INTERNAL: ${r.reason.stack ?? r.reason.message}`
+          : `WORKER-INTERNAL: ${String(r.reason)}`;
       return {
         entry,
         outcome: {
           kind: 'hard-fail' as const,
           reason: 'oracle-rejected' as DispositionReason,
           skipCascade: false,
-          message:
-            r.reason instanceof Error ? r.reason.message : String(r.reason),
+          message: errMsg,
         },
       };
     });

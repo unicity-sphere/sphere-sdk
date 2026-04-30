@@ -817,14 +817,25 @@ export class FinalizationWorkerSender {
       if (r.status === 'fulfilled') return r.value;
       // An unhandled throw in processRequestId — should be impossible
       // (every code path returns a typed outcome) but defensively map
-      // to a transient hard-fail so the worker retries on the next
-      // scan instead of dropping the requestId.
+      // to a hard-fail so the worker doesn't drop the requestId.
+      // Steelman recursion fix: 'oracle-rejected' is the closest existing
+      // DispositionReason match — the actual aggregator may have already
+      // rejected upstream and this throw is the symptom, OR this is an
+      // internal worker bug (e.g. resolver throw). Capture the FULL
+      // stack via err.stack so postmortem analysis can distinguish the
+      // two cases. Operators MUST grep `transfer:cascade-failed` /
+      // worker logs for "WORKER-INTERNAL:" to spot mis-attributed
+      // internal bugs vs genuine oracle rejections.
       const requestId = pending[i]!;
+      const errMsg =
+        r.reason instanceof Error
+          ? `WORKER-INTERNAL: ${r.reason.stack ?? r.reason.message}`
+          : `WORKER-INTERNAL: ${String(r.reason)}`;
       const outcome: HardFailOutcome = {
         kind: 'hard-fail',
         reason: 'oracle-rejected',
         skipCascade: false,
-        message: r.reason instanceof Error ? r.reason.message : String(r.reason),
+        message: errMsg,
       };
       return { requestId, outcome };
     });

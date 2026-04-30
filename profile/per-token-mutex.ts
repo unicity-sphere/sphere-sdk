@@ -39,6 +39,7 @@
  */
 
 import { SphereError } from '../core/errors';
+import { logger } from '../core/logger';
 
 /**
  * Default upper bound on lock-hold time for the `'bounded-hold'` strategy.
@@ -159,12 +160,24 @@ export class PerTokenMutex {
           }, timeoutMs);
         });
         // Race fn vs timeout. Whichever settles first wins.
-        // Steelman fix: install a no-op .catch on fnPromise so a late
+        // Steelman fix: install a logging .catch on fnPromise so a late
         // rejection from the detached fn (after timeout fires) does not
         // surface as an unhandled-rejection / process exit. fn's contract
         // (per JSDoc) is cancellation-aware OR idempotent under overlap.
+        // Steelman recursion fix: surface the silenced rejection via
+        // logger.warn so operators can observe disk-full / quota-exceeded
+        // / corrupted-state failures that fire on the detached fn after
+        // the timeout has already returned. Without this, catastrophic
+        // post-timeout failures vanish silently.
         const fnPromise = fn();
-        fnPromise.catch(() => undefined);
+        fnPromise.catch((err) => {
+          logger.warn(
+            'PerTokenMutex',
+            `bounded-hold tokenId=${tokenId} detached fn rejected after timeout: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        });
         return await Promise.race([fnPromise, timeoutPromise]);
       } finally {
         if (timer !== undefined) clearTimeout(timer);

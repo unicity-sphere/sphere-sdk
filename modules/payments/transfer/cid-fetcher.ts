@@ -308,15 +308,20 @@ interface FetchOneGatewayArgs {
  * @internal
  */
 /**
- * Steelman fix: per-gateway wall-clock cap. Without this, a hostile
+ * Steelman fix: per-gateway IDLE timeout. Without this, a hostile
  * gateway can drip-feed bytes at any rate beneath the streaming cap
  * and stall a worker for hours (the worker's outer `signal` is the
- * long-lived destroy signal, not a per-fetch deadline). Default 60s
- * per gateway is generous for a 32 MiB transfer over any realistic
- * link; configurable per call via the not-yet-exposed
- * `perGatewayTimeoutMs` option.
+ * long-lived destroy signal, not a per-fetch deadline).
+ *
+ * Steelman recursion fix: this is an IDLE timeout, refreshed on every
+ * chunk read — a slow-but-honest gateway streaming at 100 KB/s over a
+ * mobile link to fetch a 32 MiB CAR (5+ minutes total wall-clock) will
+ * keep refreshing the timer with each chunk, while a true drip-feed
+ * (no progress for >60s) still trips it. Earlier (wall-clock-from-
+ * fetch-start) variant would have killed legitimate slow fetches near
+ * the cap; idle-timer is the correct shape per the steelman feedback.
  */
-const DEFAULT_PER_GATEWAY_TIMEOUT_MS = 60_000;
+const DEFAULT_PER_GATEWAY_IDLE_TIMEOUT_MS = 60_000;
 
 async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcome> {
   const { url, bundleCid, maxBytes, fetchImpl, signal: callerSignal } = args;
@@ -337,10 +342,18 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
       callerSignal.addEventListener('abort', onCallerAbort, { once: true });
     }
   }
-  // Per-gateway wall-clock timeout — see DEFAULT_PER_GATEWAY_TIMEOUT_MS.
-  const perGatewayTimer: ReturnType<typeof setTimeout> = setTimeout(() => {
+  // Per-gateway IDLE timeout — see DEFAULT_PER_GATEWAY_IDLE_TIMEOUT_MS.
+  // Refreshed in the streaming-read loop on every chunk read; trips
+  // only when the gateway has produced no progress for the idle window.
+  let perGatewayTimer: ReturnType<typeof setTimeout> = setTimeout(() => {
     controller.abort();
-  }, DEFAULT_PER_GATEWAY_TIMEOUT_MS);
+  }, DEFAULT_PER_GATEWAY_IDLE_TIMEOUT_MS);
+  const refreshIdleTimer = (): void => {
+    clearTimeout(perGatewayTimer);
+    perGatewayTimer = setTimeout(() => {
+      controller.abort();
+    }, DEFAULT_PER_GATEWAY_IDLE_TIMEOUT_MS);
+  };
 
   let response: Response;
   try {
@@ -382,7 +395,7 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
     const parsed = Number(contentLengthHeader);
     if (Number.isFinite(parsed) && parsed > maxBytes) {
       callerSignal?.removeEventListener('abort', onCallerAbort);
-    clearTimeout(perGatewayTimer);
+      clearTimeout(perGatewayTimer);
       controller.abort();
       try {
         await response.body?.cancel();
@@ -422,6 +435,11 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
         );
       }
       const { value, done } = await reader.read();
+      // Refresh the idle timer on every read (chunk OR done signal).
+      // A slow-but-honest gateway making any forward progress keeps
+      // resetting the deadline; a drip-feed that stalls for >60s
+      // trips the timer via controller.abort().
+      refreshIdleTimer();
       if (done) break;
       if (!value) continue;
       const chunkBytes = value.byteLength;
