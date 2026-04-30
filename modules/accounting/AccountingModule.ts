@@ -1709,13 +1709,9 @@ export class AccountingModule {
           migratedTokens++;
         }
       }
-      // 2026-04-30 DIAG: bump to warn level so we can confirm migration runs.
-      logger.warn(
-        LOG_TAG,
-        `importInvoice MIGRATION: invoice=${tokenId.slice(0, 16)} hashedKey=${hashedKey.slice(0, 16)} ` +
-          `migrated_ledger_entries=${this.invoiceLedger.get(tokenId)?.size ?? 0} ` +
-          `migrated_tokenInvoiceMap_entries=${migratedTokens}`,
-      );
+      if (migratedTokens > 0) {
+        logger.debug(LOG_TAG, `Migrated ${migratedTokens} tokenInvoiceMap entries from hash-keyed to real ID: ${tokenId.slice(0, 16)}...`);
+      }
     }
 
     if (!this.invoiceLedger.has(tokenId)) {
@@ -2154,26 +2150,6 @@ export class AccountingModule {
           result.add(extractedTokenId);
         }
       }
-    }
-
-    // 2026-04-30 DIAG: when called by SwapModule.verifyPayout's reverse
-    // lookup and the result is empty, dump enough state to diagnose the gap.
-    if (result.size === 0) {
-      const ledgerKeys = ledger ? Array.from(ledger.keys()) : [];
-      const tokenInvoiceEntries: Array<[string, string[]]> = [];
-      for (const [tk, ids] of this.tokenInvoiceMap) {
-        if (tokenInvoiceEntries.length < 20) {
-          tokenInvoiceEntries.push([tk.slice(0, 16), Array.from(ids).map((s) => s.slice(0, 16))]);
-        }
-      }
-      logger.warn(
-        LOG_TAG,
-        `getTokenIdsForInvoice EMPTY for ${invoiceId.slice(0, 16)}... ` +
-          `ledger_size=${ledger?.size ?? 0} ` +
-          `ledger_keys=${JSON.stringify(ledgerKeys.slice(0, 6))} ` +
-          `tokenInvoiceMap_total=${this.tokenInvoiceMap.size} ` +
-          `tokenInvoiceMap_sample=${JSON.stringify(tokenInvoiceEntries.slice(0, 6))}`,
-      );
     }
 
     return result;
@@ -4548,15 +4524,6 @@ export class AccountingModule {
       // SHA-256(invoiceId) (privacy-preserving). resolveInvoiceRef tries
       // direct match first, then hash index.
       const invoiceId = this.resolveInvoiceRef(memoRef) ?? memoRef;
-      // 2026-04-30 DIAG: trace inv: ref resolution for debugging
-      // tokenInvoiceMap reverse-index gap.
-      logger.warn(
-        LOG_TAG,
-        `_processTokenTransactions tx[${i}] for token ${tokenId.slice(0, 16)}... ` +
-          `inv_ref=${memoRef.slice(0, 16)} ` +
-          `resolved_to=${invoiceId.slice(0, 16)} ` +
-          `is_hash=${memoRef !== invoiceId}`,
-      );
 
       // Proactive indexing: index invoice-referencing transactions so that
       // when an invoice is later imported via importInvoice(), its transfer
@@ -4730,11 +4697,6 @@ export class AccountingModule {
           this.tokenInvoiceMap.set(tokenId, new Set());
         }
         this.tokenInvoiceMap.get(tokenId)!.add(invoiceId);
-        // 2026-04-30 DIAG: trace tokenInvoiceMap population
-        logger.warn(
-          LOG_TAG,
-          `tokenInvoiceMap POPULATED: token=${tokenId.slice(0, 16)} -> invoice=${invoiceId.slice(0, 16)}`,
-        );
       }
 
       // (watermark advancement moved to top of loop body — W23-R2 fix)
