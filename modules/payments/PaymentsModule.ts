@@ -1862,20 +1862,8 @@ export class PaymentsModule {
         splitPlan = internal.existingSplitPlan;
       } else {
         // ── Coin symbol → coinId resolution ────────────────────────────────────
-        // Swap manifests store currencies as short symbols (e.g. "ETH", "BTC")
-        // while token storage uses 64/68-char hex coinIds. If no tokens match
-        // the literal coinId, attempt to resolve via the token registry.
-        const resolvedCoinId = (() => {
-          const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
-          if (!literalMatch && request.coinId.length <= 20) {
-            const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
-            if (def?.id) return def.id;
-          }
-          return request.coinId;
-        })();
-        if (resolvedCoinId !== request.coinId) {
-          request = { ...request, coinId: resolvedCoinId };
-        }
+        // Delegate to the shared helper (see `resolveCoinIdSymbol`).
+        request = requireLegacyCoinSlot(this.resolveCoinIdSymbol(request));
 
         // ── Spend Queue: Pre-parse token pool (async, before critical section) ──
         const parsedPool = await this.spendPlanner.buildParsedPool(
@@ -2436,18 +2424,8 @@ export class PaymentsModule {
 
       // ── Spend Queue: reserve tokens (same path as send()) ──
       reservationId = crypto.randomUUID();
-      // Symbol → coinId resolution (same logic as send())
-      const resolvedCoinIdForSplit = (() => {
-        const literalMatch = Array.from(this.tokens.values()).some(t => t.coinId === request.coinId);
-        if (!literalMatch && request.coinId.length <= 20) {
-          const def = TokenRegistry.getInstance().getDefinitionBySymbol(request.coinId);
-          if (def?.id) return def.id;
-        }
-        return request.coinId;
-      })();
-      if (resolvedCoinIdForSplit !== request.coinId) {
-        request = { ...request, coinId: resolvedCoinIdForSplit };
-      }
+      // Symbol → coinId resolution — delegate to shared helper.
+      request = requireLegacyCoinSlot(this.resolveCoinIdSymbol(request));
       const parsedPool = await this.spendPlanner.buildParsedPool(
         Array.from(this.tokens.values()),
         request.coinId
@@ -6248,6 +6226,92 @@ export class PaymentsModule {
   }
 
   // ===========================================================================
+  // Symbol → canonical hex coinId resolution (shared by all dispatchers)
+  // ===========================================================================
+
+  /**
+   * Resolve a short ticker symbol (e.g. `'UCT'`) to the canonical 64/68-char
+   * hex `coinId` used by token storage and `validateTargets`.
+   *
+   * Background: swap manifests and public callers may pass a human-readable
+   * symbol such as `'UCT'` or `'USDU'` in `request.coinId`, whereas the
+   * internal token map stores tokens under the hex coin identifier produced
+   * by the aggregator.  When the literal value finds no match in the in-
+   * memory token pool, and the value is short enough to be a symbol (≤ 20
+   * characters), the method falls back to the {@link TokenRegistry} singleton
+   * to attempt a symbol → id lookup.  If that also fails the original value
+   * is returned unchanged (the downstream validator will produce an
+   * informative error).
+   *
+   * Multi-asset awareness: the primary `coinId` field AND each `kind: 'coin'`
+   * entry inside `additionalAssets` are resolved independently.  NFT entries
+   * (`kind: 'nft'`) carry a `tokenId`, not a `coinId`, and are left untouched.
+   *
+   * **Must be called BEFORE {@link requireLegacyCoinSlot}** so the narrowing
+   * shim sees the canonical hex value and does not re-widen it.
+   *
+   * This is the single canonical implementation of the pattern that the legacy
+   * `instantSplitSend` arm previously inlined at two call-sites (lines
+   * ~1868 and ~2440).  Those sites now delegate here so the logic lives in one
+   * place.
+   */
+  private resolveCoinIdSymbol(request: TransferRequest): TransferRequest {
+    // ── Primary coinId slot ───────────────────────────────────────────────────
+    const rawCoinId = request.coinId;
+    let resolvedCoinId = rawCoinId;
+    if (rawCoinId !== undefined && rawCoinId !== null) {
+      const literalMatch = Array.from(this.tokens.values()).some(
+        (t) => t.coinId === rawCoinId,
+      );
+      if (!literalMatch && rawCoinId.length <= 20) {
+        const def = TokenRegistry.getInstance().getDefinitionBySymbol(rawCoinId);
+        if (def?.id) {
+          resolvedCoinId = def.id;
+        }
+      }
+    }
+
+    // ── additionalAssets coin entries ─────────────────────────────────────────
+    let resolvedAdditional: TransferRequest['additionalAssets'] =
+      request.additionalAssets;
+    if (request.additionalAssets && request.additionalAssets.length > 0) {
+      const mapped = request.additionalAssets.map((asset) => {
+        if (asset.kind !== 'coin') return asset; // NFT entries: untouched
+        const raw = asset.coinId;
+        const litMatch = Array.from(this.tokens.values()).some(
+          (t) => t.coinId === raw,
+        );
+        if (!litMatch && raw.length <= 20) {
+          const def = TokenRegistry.getInstance().getDefinitionBySymbol(raw);
+          if (def?.id) {
+            return { ...asset, coinId: def.id };
+          }
+        }
+        return asset;
+      });
+      // Only allocate a new array if something actually changed.
+      const changed = mapped.some(
+        (a, i) => a !== request.additionalAssets![i],
+      );
+      if (changed) {
+        resolvedAdditional = mapped as TransferRequest['additionalAssets'];
+      }
+    }
+
+    // Return the original object when nothing changed (avoids spurious spread).
+    if (resolvedCoinId === rawCoinId && resolvedAdditional === request.additionalAssets) {
+      return request;
+    }
+    return {
+      ...request,
+      ...(resolvedCoinId !== rawCoinId ? { coinId: resolvedCoinId } : {}),
+      ...(resolvedAdditional !== request.additionalAssets
+        ? { additionalAssets: resolvedAdditional }
+        : {}),
+    };
+  }
+
+  // ===========================================================================
   // T.2.D.1 — UXF conservative-mode dispatcher
   // ===========================================================================
 
@@ -6273,7 +6337,10 @@ export class PaymentsModule {
   private async dispatchUxfConservativeSend(
     originalRequest: TransferRequest,
   ): Promise<TransferResult> {
-    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
+    // ── Symbol → hex coinId resolution (must run BEFORE requireLegacyCoinSlot) ─
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(
+      this.resolveCoinIdSymbol(originalRequest),
+    );
 
     // Resolve recipient + recipient address up front so the orchestrator
     // gets a fully-typed PeerInfo. This also serves the same identity-
@@ -6510,7 +6577,10 @@ export class PaymentsModule {
   private async dispatchUxfInstantSend(
     originalRequest: TransferRequest,
   ): Promise<TransferResult> {
-    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
+    // ── Symbol → hex coinId resolution (must run BEFORE requireLegacyCoinSlot) ─
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(
+      this.resolveCoinIdSymbol(originalRequest),
+    );
 
     const peerInfo: PeerInfo | null =
       (await this.deps!.transport.resolve?.(request.recipient)) ?? null;
@@ -6764,7 +6834,10 @@ export class PaymentsModule {
     originalRequest: TransferRequest,
     txfFinalization: TxfFinalization,
   ): Promise<TransferResult> {
-    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(originalRequest);
+    // ── Symbol → hex coinId resolution (must run BEFORE requireLegacyCoinSlot) ─
+    const request: LegacyCoinTransferRequest = requireLegacyCoinSlot(
+      this.resolveCoinIdSymbol(originalRequest),
+    );
 
     // Resolve recipient up front so the orchestrator gets a fully-typed
     // PeerInfo. Identical pattern to the UXF dispatchers.
