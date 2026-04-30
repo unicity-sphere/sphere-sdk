@@ -307,13 +307,25 @@ interface FetchOneGatewayArgs {
  *
  * @internal
  */
+/**
+ * Steelman fix: per-gateway wall-clock cap. Without this, a hostile
+ * gateway can drip-feed bytes at any rate beneath the streaming cap
+ * and stall a worker for hours (the worker's outer `signal` is the
+ * long-lived destroy signal, not a per-fetch deadline). Default 60s
+ * per gateway is generous for a 32 MiB transfer over any realistic
+ * link; configurable per call via the not-yet-exposed
+ * `perGatewayTimeoutMs` option.
+ */
+const DEFAULT_PER_GATEWAY_TIMEOUT_MS = 60_000;
+
 async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcome> {
   const { url, bundleCid, maxBytes, fetchImpl, signal: callerSignal } = args;
 
   // Compose the abort controller: we want to abort the network when
-  // EITHER the caller cancels OR our own size cap fires. Forwarding
-  // both signals to the same `controller.abort()` keeps the underlying
-  // `fetch()` honest (cancels in-flight TCP read).
+  // EITHER the caller cancels OR our own size cap fires OR our
+  // per-gateway wall-clock timeout fires. Forwarding all three signals
+  // to the same `controller.abort()` keeps the underlying `fetch()`
+  // honest (cancels in-flight TCP read).
   const controller = new AbortController();
   const onCallerAbort = (): void => {
     controller.abort();
@@ -325,12 +337,17 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
       callerSignal.addEventListener('abort', onCallerAbort, { once: true });
     }
   }
+  // Per-gateway wall-clock timeout — see DEFAULT_PER_GATEWAY_TIMEOUT_MS.
+  const perGatewayTimer: ReturnType<typeof setTimeout> = setTimeout(() => {
+    controller.abort();
+  }, DEFAULT_PER_GATEWAY_TIMEOUT_MS);
 
   let response: Response;
   try {
     response = await fetchImpl(url, { signal: controller.signal });
   } catch (cause) {
     callerSignal?.removeEventListener('abort', onCallerAbort);
+    clearTimeout(perGatewayTimer);
     if (callerSignal?.aborted) {
       throw makeAbortError('fetchCarByCid: aborted by caller during fetch');
     }
@@ -340,6 +357,7 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
   // 4xx / 5xx / 3xx-no-redirect — gateway said no.
   if (!response.ok) {
     callerSignal?.removeEventListener('abort', onCallerAbort);
+    clearTimeout(perGatewayTimer);
     // Drain the body off the wire (best-effort; defensive against
     // some server impls that hold the connection open). Cancel
     // explicitly so we don't leak the reader.
@@ -364,6 +382,7 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
     const parsed = Number(contentLengthHeader);
     if (Number.isFinite(parsed) && parsed > maxBytes) {
       callerSignal?.removeEventListener('abort', onCallerAbort);
+    clearTimeout(perGatewayTimer);
       controller.abort();
       try {
         await response.body?.cancel();
@@ -381,6 +400,7 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
   const body = response.body;
   if (!body) {
     callerSignal?.removeEventListener('abort', onCallerAbort);
+    clearTimeout(perGatewayTimer);
     return { ok: false, reason: 'no response body' };
   }
   const reader = body.getReader();
@@ -424,6 +444,7 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
     }
   } finally {
     callerSignal?.removeEventListener('abort', onCallerAbort);
+    clearTimeout(perGatewayTimer);
   }
 
   if (oversize) {

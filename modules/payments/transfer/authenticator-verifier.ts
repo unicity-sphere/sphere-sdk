@@ -179,7 +179,20 @@ export async function verifyAuthenticator(
     // .bytes`. We MUST NOT re-derive the preimage from raw fields
     // lest we desync from the SDK's signing convention.
     const result = await authenticator.verify(transactionHash);
-    return { ok: true, valid: Boolean(result) };
+    // Steelman fix: SDK contract is `Promise<boolean>`. Strict-equality
+    // check rather than `Boolean(result)` — a defective SDK returning
+    // truthy non-boolean would otherwise silently accept forged
+    // signatures. Anything other than literal `true`/`false` surfaces
+    // as a structural defect upstream.
+    if (result === true) return { ok: true, valid: true };
+    if (result === false) return { ok: true, valid: false };
+    return {
+      ok: false,
+      threw: true,
+      error: new TypeError(
+        `authenticator.verify returned non-boolean (${typeof result}); SDK contract violation`,
+      ),
+    };
   } catch (error: unknown) {
     return { ok: false, threw: true, error };
   }

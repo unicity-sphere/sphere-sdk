@@ -147,10 +147,21 @@ export async function evaluatePredicateBindsToUs(
     // promise produces the same `ok: false` outcome as a sync throw.
     const result = await predicate.isOwner(ourPubkey);
 
-    // Coerce defensively — see remarks on no-silent-coercion. The SDK
-    // contract is boolean; any non-boolean truthy value rides through
-    // as the boolean its truthiness implies.
-    return { ok: true, bindsToUs: Boolean(result) };
+    // Steelman fix: SDK contract is `Promise<boolean>`. Strict-equality
+    // check rather than `Boolean(result)` coercion — a defective or
+    // compromised SDK returning truthy non-boolean (1, {}, "false"-string,
+    // an unawaited inner Promise) would otherwise silently grant
+    // ownership. Anything other than literal `true` or `false` surfaces
+    // as a structural defect.
+    if (result === true) return { ok: true, bindsToUs: true };
+    if (result === false) return { ok: true, bindsToUs: false };
+    return {
+      ok: false,
+      threw: true,
+      error: new TypeError(
+        `predicate.isOwner returned non-boolean (${typeof result}); SDK contract violation`,
+      ),
+    };
   } catch (error: unknown) {
     return { ok: false, threw: true, error };
   }

@@ -158,13 +158,17 @@ describe('encodeTransferPayload / decodeTransferPayload — round-trip', () => {
   });
 
   it('round-trips a `uxf-car` payload with no optional fields', () => {
+    // Steelman update: structural validation now rejects empty carBase64
+    // (T.8.E.* hardening — see types/uxf-transfer.ts isUxfTransferPayloadCar).
+    // Use a 1-byte placeholder to satisfy the non-empty constraint while
+    // still exercising the "no optional fields" round-trip semantics.
     const minimal: UxfTransferPayloadCar = {
       kind: 'uxf-car',
       version: '1.0',
       mode: 'instant',
       bundleCid: SAMPLE_CID,
       tokenIds: [],
-      carBase64: '',
+      carBase64: 'AA==',
     };
     expect(decodeTransferPayload(encodeTransferPayload(minimal))).toEqual(minimal);
   });

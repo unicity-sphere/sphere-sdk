@@ -93,6 +93,37 @@ export const MAX_PER_SENDER = 64;
  */
 export const MAX_SENDERS = 32;
 
+/**
+ * Steelman fix: canonicalize sender pubkey before keying the LRU
+ * buckets. Without this, casing variants ('AB...' vs 'ab...') of the
+ * SAME hex string would route the same logical sender into separate
+ * buckets, defeating the Note N5 isolation guarantee.
+ *
+ * We deliberately do NOT enforce a strict 64-hex format here — tests
+ * and synthetic harnesses pass opaque short strings as sender ids.
+ * Production wiring is responsible for passing the AUTHENTICATED Nostr
+ * signing pubkey (the `pubkey` field of the Nostr event after signature
+ * validation), NOT the unauthenticated `payload.sender.transportPubkey`
+ * claim. Casing-normalization defends against UI-layer / decoder
+ * variants that uppercase the hex; the Note N5 isolation guarantee
+ * holds because the same authenticated bytes always lowercase to the
+ * same key.
+ */
+function canonicalSenderPubkey(senderPubkey: string): string {
+  if (typeof senderPubkey !== 'string') {
+    throw new TypeError('ReplayLRU: senderPubkey must be a string');
+  }
+  if (senderPubkey.length === 0) {
+    throw new TypeError('ReplayLRU: senderPubkey must be a non-empty string');
+  }
+  // Hex-style strings are case-folded to lowercase. Non-hex strings
+  // (synthetic test ids like 'sender_a') pass through unchanged.
+  if (/^[0-9a-fA-F]+$/.test(senderPubkey)) {
+    return senderPubkey.toLowerCase();
+  }
+  return senderPubkey;
+}
+
 // =============================================================================
 // 2. Public API — ReplayLRU
 // =============================================================================
@@ -153,6 +184,7 @@ export class ReplayLRU {
    * extra paranoia.
    */
   has(senderPubkey: string, bundleCid: string): boolean {
+    senderPubkey = canonicalSenderPubkey(senderPubkey);
     const bucket = this.buckets.get(senderPubkey);
     if (!bucket) return false;
     return bucket.has(bundleCid);
@@ -175,6 +207,7 @@ export class ReplayLRU {
    * it to the back (the "most recent" position).
    */
   add(senderPubkey: string, bundleCid: string): void {
+    senderPubkey = canonicalSenderPubkey(senderPubkey);
     let bucket = this.buckets.get(senderPubkey);
     if (bucket) {
       // Sender already tracked — refresh sender-level recency by

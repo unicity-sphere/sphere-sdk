@@ -575,9 +575,28 @@ export class FinalizationWorkerRecipient {
     // Per-tokenId concurrency cap is enforced by the per-token semaphore
     // inside processQueueEntry; the per-aggregator semaphore is shared
     // globally.
-    const results = await Promise.all(
+    // Steelman fix: Promise.allSettled (was Promise.all). With Promise.all,
+    // a single processQueueEntry throw aborts the parent fold while the
+    // other in-flight calls continue running orphaned, holding semaphores
+    // and mutating state with their results discarded. allSettled lets
+    // every entry reach a structured outcome.
+    const settled = await Promise.allSettled(
       entries.map((e) => this.processQueueEntry(e)),
     );
+    const results = settled.map((r, i) => {
+      if (r.status === 'fulfilled') return r.value;
+      const entry = entries[i]!;
+      return {
+        entry,
+        outcome: {
+          kind: 'hard-fail' as const,
+          reason: 'oracle-rejected' as DispositionReason,
+          skipCascade: false,
+          message:
+            r.reason instanceof Error ? r.reason.message : String(r.reason),
+        },
+      };
+    });
 
     let successCount = 0;
     let hardFailCount = 0;

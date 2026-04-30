@@ -579,10 +579,27 @@ function redactValue(
     }
 
     // Plain object: iterate own enumerable string keys.
+    // Steelman fix: a hostile cause supplied via a Proxy with a
+    // throwing getter (or any object that raises on property access)
+    // would propagate the throw out of the SphereError constructor
+    // itself, masking the original error context. Wrap every property
+    // read in try/catch and substitute a marker on throw.
     const out: Record<string, unknown> = {};
     visited.set(obj, out);
-    for (const key of Object.keys(obj)) {
-      const v = (obj as Record<string, unknown>)[key];
+    let keys: string[];
+    try {
+      keys = Object.keys(obj);
+    } catch {
+      return '[REDACTED: keys-threw]';
+    }
+    for (const key of keys) {
+      let v: unknown;
+      try {
+        v = (obj as Record<string, unknown>)[key];
+      } catch {
+        out[key] = '[REDACTED: getter-threw]';
+        continue;
+      }
       if (REDACTED_FIELDS_SET.has(key)) {
         out[key] = redactionMarkerFor(key, v);
       } else {

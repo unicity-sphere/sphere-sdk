@@ -152,26 +152,33 @@ describe('verifyAuthenticator — defensive arg validation', () => {
   });
 });
 
-describe('verifyAuthenticator — boolean-coercion safety', () => {
-  it('coerces 1 to true', async () => {
+describe('verifyAuthenticator — strict boolean enforcement (steelman)', () => {
+  // Steelman fix: SDK contract is `Promise<boolean>`. A defective SDK
+  // returning truthy non-boolean would otherwise silently accept
+  // forged signatures. Anything other than literal true/false surfaces
+  // as a structural defect so the disposition matrix can route to
+  // STRUCTURAL_INVALID.
+  it('rejects truthy non-boolean (1) as structural defect', async () => {
     const result = await verifyAuthenticator(
       authenticatorReturningNonBoolean(1),
       FAKE_DATAHASH,
     );
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.valid).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.threw).toBe(true);
+      expect(result.error).toBeInstanceOf(TypeError);
     }
   });
 
-  it('coerces 0 to false', async () => {
+  it('rejects falsy non-boolean (0) as structural defect', async () => {
     const result = await verifyAuthenticator(
       authenticatorReturningNonBoolean(0),
       FAKE_DATAHASH,
     );
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.valid).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.threw).toBe(true);
+      expect(result.error).toBeInstanceOf(TypeError);
     }
   });
 });

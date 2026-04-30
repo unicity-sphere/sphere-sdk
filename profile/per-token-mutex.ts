@@ -159,7 +159,13 @@ export class PerTokenMutex {
           }, timeoutMs);
         });
         // Race fn vs timeout. Whichever settles first wins.
-        return await Promise.race([fn(), timeoutPromise]);
+        // Steelman fix: install a no-op .catch on fnPromise so a late
+        // rejection from the detached fn (after timeout fires) does not
+        // surface as an unhandled-rejection / process exit. fn's contract
+        // (per JSDoc) is cancellation-aware OR idempotent under overlap.
+        const fnPromise = fn();
+        fnPromise.catch(() => undefined);
+        return await Promise.race([fnPromise, timeoutPromise]);
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }

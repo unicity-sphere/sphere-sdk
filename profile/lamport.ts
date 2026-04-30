@@ -82,9 +82,14 @@ export class Lamport {
       }
     }
 
-    const maxObserved = observedRemotes.length === 0
-      ? 0
-      : Math.max(...observedRemotes);
+    // Steelman fix: `Math.max(...arr)` throws RangeError on very large
+    // arrays (typically >65k–125k entries depending on the engine). A
+    // hostile replica feeding a million Lamports would DoS the merger
+    // before the W39 bound check runs. reduce avoids the spread.
+    let maxObserved = 0;
+    for (const v of observedRemotes) {
+      if (v > maxObserved) maxObserved = v;
+    }
 
     // W39: bounds defense against runaway Lamports from untrusted replicas.
     // Use `Math.max(this.current, 1)` so boot (current=0) still accepts

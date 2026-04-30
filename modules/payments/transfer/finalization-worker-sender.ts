@@ -795,7 +795,14 @@ export class FinalizationWorkerSender {
     const primaryTokenId = working.tokenIds[0] ?? working.id;
 
     const pending = outstanding.filter((r) => !completed.has(r));
-    const settled = await Promise.all(
+    // Steelman fix: Promise.allSettled (was Promise.all). With Promise.all,
+    // a single processRequestId throw aborts the parent fold while the
+    // other in-flight promises continue running orphaned — they hold
+    // semaphores, mutate state, but their results are discarded. allSettled
+    // lets every requestId's processing reach a structured outcome we can
+    // inspect (success vs hard-fail vs unhandled throw), so the worker can
+    // release semaphores and emit the right per-id event for each.
+    const settledRaw = await Promise.allSettled(
       pending.map((requestId) =>
         this.processRequestId({
           outboxId: working.id,
@@ -806,6 +813,21 @@ export class FinalizationWorkerSender {
         }).then((outcome) => ({ requestId, outcome })),
       ),
     );
+    const settled = settledRaw.map((r, i) => {
+      if (r.status === 'fulfilled') return r.value;
+      // An unhandled throw in processRequestId — should be impossible
+      // (every code path returns a typed outcome) but defensively map
+      // to a transient hard-fail so the worker retries on the next
+      // scan instead of dropping the requestId.
+      const requestId = pending[i]!;
+      const outcome: HardFailOutcome = {
+        kind: 'hard-fail',
+        reason: 'oracle-rejected',
+        skipCascade: false,
+        message: r.reason instanceof Error ? r.reason.message : String(r.reason),
+      };
+      return { requestId, outcome };
+    });
 
     const successes: string[] = [];
     const failures: Array<{ requestId: string; outcome: HardFailOutcome }> = [];

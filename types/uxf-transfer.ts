@@ -275,7 +275,16 @@ export function isUxfTransferPayloadCar(value: unknown): value is UxfTransferPay
   // `modules/payments/transfer/limits.ts` (kept literal here to keep
   // `types/uxf-transfer.ts` a leaf module without an inward dep).
   if (value.tokenIds.length > 256) return false;
+  // Steelman fix: validate every entry is a non-empty string. Without
+  // this, `tokenIds: [null, 42, {}]` passes structural validation and
+  // downstream `${tokenId}` coercion produces 'null' / 'undefined' /
+  // '[object Object]' that pollute per-token counters and disposition
+  // keys.
+  for (const t of value.tokenIds) {
+    if (typeof t !== 'string' || t.length === 0) return false;
+  }
   if (typeof value.carBase64 !== 'string') return false;
+  if (value.carBase64.length === 0) return false;
   return true;
 }
 
@@ -293,6 +302,14 @@ export function isUxfTransferPayloadCid(value: unknown): value is UxfTransferPay
   if (!Array.isArray(value.tokenIds)) return false;
   // Defense-in-depth tokenIds cap; see `isUxfTransferPayloadCar`.
   if (value.tokenIds.length > 256) return false;
+  for (const t of value.tokenIds) {
+    if (typeof t !== 'string' || t.length === 0) return false;
+  }
+  // Steelman fix: forward-compat — a 'uxf-cid' payload must NOT carry
+  // an inline `carBase64`. The two shapes are mutually exclusive on the
+  // wire. Reject hostile shapes like {kind:'uxf-cid', carBase64:'...'}
+  // that would otherwise pass both narrowed guards in succession.
+  if ('carBase64' in value) return false;
   return true;
 }
 

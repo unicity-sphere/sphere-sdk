@@ -157,37 +157,46 @@ describe('evaluatePredicateBindsToUs — defensive arg validation', () => {
   });
 });
 
-describe('evaluatePredicateBindsToUs — boolean-coercion safety', () => {
-  it('coerces truthy non-boolean to true', async () => {
+describe('evaluatePredicateBindsToUs — strict boolean enforcement (steelman)', () => {
+  // Steelman fix: SDK contract is `Promise<boolean>`. A defective or
+  // compromised SDK returning truthy non-boolean (1, {}, "false"-string,
+  // unawaited inner Promise) MUST surface as a structural defect rather
+  // than be silently coerced — otherwise a bad SDK release could grant
+  // ownership of every token. Anything other than literal true/false
+  // routes to {ok: false, threw: true, error: TypeError}.
+  it('rejects truthy non-boolean (1) as structural defect', async () => {
     const result = await evaluatePredicateBindsToUs(
       predicateReturningTruthyNonBoolean(1),
       PUBKEY_33,
     );
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.bindsToUs).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.threw).toBe(true);
+      expect(result.error).toBeInstanceOf(TypeError);
     }
   });
 
-  it('coerces falsy non-boolean to false', async () => {
+  it('rejects falsy non-boolean (0) as structural defect', async () => {
     const result = await evaluatePredicateBindsToUs(
       predicateReturningTruthyNonBoolean(0),
       PUBKEY_33,
     );
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.bindsToUs).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.threw).toBe(true);
+      expect(result.error).toBeInstanceOf(TypeError);
     }
   });
 
-  it('coerces null to false', async () => {
+  it('rejects null as structural defect', async () => {
     const result = await evaluatePredicateBindsToUs(
       predicateReturningTruthyNonBoolean(null),
       PUBKEY_33,
     );
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.bindsToUs).toBe(false);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.threw).toBe(true);
+      expect(result.error).toBeInstanceOf(TypeError);
     }
   });
 });

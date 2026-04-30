@@ -107,7 +107,31 @@ export function encodeTransferPayload(payload: UxfTransferPayload): string {
  *         failure mode (non-JSON, wrong type, missing fields, unknown
  *         kind, wrong version literal, ...).
  */
+/**
+ * Hard upper bound on the post-decrypt Nostr event content length before
+ * `JSON.parse` runs. Defends against a hostile relay sending a 64 MiB
+ * "valid JSON" event whose JSON parsing would allocate the full string
+ * AND the parsed AST before any size-aware downstream check could fire.
+ *
+ * Sized at 8 MiB = `RELAY_SAFE_CAP_BYTES (96 KiB)` × generous slack for
+ * future protocol growth. Larger than the inline-CAR cap (16 KiB) by
+ * orders of magnitude, so legitimate inline payloads are unaffected.
+ * CID-mode payloads are tiny (<1 KiB) so trivially under cap.
+ */
+const MAX_DECODE_CONTENT_BYTES = 8 * 1024 * 1024;
+
 export function decodeTransferPayload(content: string): UxfTransferPayload {
+  // Steelman fix: bound input size BEFORE JSON.parse to prevent a hostile
+  // relay from triggering OOM via oversized event content. JS string
+  // length is UTF-16 code units, but the byte cost of JSON.parse +
+  // resulting AST is at least linear in length — so a length-based cap
+  // suffices.
+  if (content.length > MAX_DECODE_CONTENT_BYTES) {
+    throw new SphereError(
+      `decodeTransferPayload: content length ${content.length} exceeds MAX_DECODE_CONTENT_BYTES=${MAX_DECODE_CONTENT_BYTES}`,
+      'BUNDLE_REJECTED_MALFORMED_ENVELOPE',
+    );
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(content);
@@ -188,9 +212,28 @@ export async function extractCarRootCid(
       'BUNDLE_REJECTED_MULTI_ROOT',
     );
   }
+  // Steelman fix: protocol §3.1 mandates CIDv1 base32 (`b...`). Reject
+  // CIDv0 (`Qm...` base58) explicitly — a hostile sender that publishes
+  // a v0-rooted CAR with `payload.bundleCid: "Qm..."` would otherwise
+  // pass the equality check downstream. Forward-compat: also reject any
+  // future CID version we don't yet recognize as v1.
+  const root = roots[0];
+  if (root.version !== 1) {
+    throw new SphereError(
+      `extractCarRootCid: CAR root must be CIDv1; got CIDv${root.version}`,
+      'BUNDLE_REJECTED_INVALID_CAR',
+    );
+  }
   // `CID#toString()` defaults to multibase base32 for CIDv1 — exactly the
-  // wire form the protocol mandates.
-  return roots[0].toString();
+  // wire form the protocol mandates. Verify the prefix as defense-in-depth.
+  const cidStr = root.toString();
+  if (!cidStr.startsWith('b')) {
+    throw new SphereError(
+      `extractCarRootCid: expected base32 multibase prefix 'b'; got '${cidStr.slice(0, 1)}'`,
+      'BUNDLE_REJECTED_INVALID_CAR',
+    );
+  }
+  return cidStr;
 }
 
 // =============================================================================
