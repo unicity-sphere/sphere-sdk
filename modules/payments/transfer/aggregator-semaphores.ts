@@ -37,7 +37,7 @@ import { MAX_CONCURRENT_POLLS_PER_AGGREGATOR } from './limits';
 import {
   CountingSemaphore,
   type Semaphore,
-} from './finalization-worker-sender';
+} from './finalization-worker-base';
 
 // =============================================================================
 // 1. Process-global registry

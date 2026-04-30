@@ -7,6 +7,13 @@
  * `finalization-worker-sender.ts`) but driven from the per-address
  * {@link FinalizationQueue} rather than the outbox.
  *
+ * **Phase 8 refactor**: the §6.1 submit / poll / attach cycle was
+ * extracted into {@link runFinalizationCycle} (in
+ * `finalization-worker-base.ts`) — the sender and recipient workers
+ * share a single driver. This file now owns ONLY the recipient-side
+ * concerns: queue iteration, the §5.6 merge-path graft check (recipient
+ * only), §5.5 step 9 re-evaluation, recipient-side cascade emission.
+ *
  * **Key differences from T.5.B**:
  *
  *  1. **Driver**: T.5.B reads outbox entries with
@@ -47,11 +54,7 @@
  *     no-op at step 1, the manifest CAS at step 2 sees its own newCid
  *     and returns `cas-mismatch` (which {@link
  *     performManifestCidRewrite} translates to "already applied"),
- *     step 3 / 4 are similarly idempotent. A different proof for the
- *     same `transactionHash` (e.g. newer-round equivalent) is a
- *     §6.3 most-recent-proof case — same value (since
- *     transactionHash + authenticator match) means tombstone-and-
- *     replace.
+ *     step 3 / 4 are similarly idempotent.
  *
  *  5. **Merge-path proof grafting**: when a more-finalized UXF copy
  *     of the same token arrives (§5.6 third bullet), its proofs are
@@ -59,32 +62,14 @@
  *     conflict merger), NOT by this worker. The worker observes the
  *     merge by polling its own queue: a queue entry whose
  *     corresponding proof is now present in the pool can be REMOVED
- *     without an aggregator round-trip. This is implemented by the
- *     graft-detection path in {@link processQueueEntry}: before
- *     issuing the submit, the worker checks the pool via
- *     `poolRead.getAttachedProof`; if a matching proof is already
- *     present, the worker fast-paths to "remove queue entry" and
- *     skips the aggregator entirely.
+ *     without an aggregator round-trip. This is implemented BEFORE
+ *     calling the shared cycle driver via {@link checkMergePathGraft}.
  *
  *  6. **Per-tokenId mutex (T.1.F) coordination**: the §5.5 step 9
  *     re-run is acquired under the per-tokenId mutex with
  *     CAS-default strategy (W34); the manifest-CID-rewrite is
  *     wrapped in the same mutex on each individual queue-entry
  *     attach (matches the T.5.B sender worker behavior).
- *
- * **§5.5 step 1-9 mapping** (verbatim, this implementation):
- *
- *  | Spec step | Implementation method                                      |
- *  |-----------|------------------------------------------------------------|
- *  | 1 resolve | {@link RequestContextResolver} via injection (mirror T.5.B)|
- *  | 2 derive  | implicit — caller's adapter computes commitmentRequestId   |
- *  | 3 submit  | {@link runSubmitPhase} (re-uses §6.1 mapping table)        |
- *  | 4 poll    | {@link runPollPhase}                                       |
- *  | 5 attach  | {@link attachProofUnderMutex} → {@link performManifestCidRewrite} |
- *  | 6 deadline| {@link isPollingTimedOut} (shared polling-policy)          |
- *  | 7 hard-fail short-circuit | {@link processQueueEntry} cancels siblings + cascades |
- *  | 8 transient backoff | {@link runSubmitPhase} / {@link runPollPhase} reuse {@link getBackoffMs} |
- *  | 9 queue-drain re-run [B][D][E] | {@link maybeFinalizeToken} acquires per-token mutex + invokes {@link revaluate} |
  *
  * Spec references:
  *  - §5.5 — per-token finalization
@@ -104,28 +89,31 @@ import {
 } from './limits';
 import {
   validatePollingPolicy,
-  isPollingTimedOut,
   getBackoffMs,
   MIN_POLL_ATTEMPTS,
 } from './polling-policy';
 import { getAggregatorSemaphore } from './aggregator-semaphores';
 import {
-  performManifestCidRewrite,
   type FinalizationQueueAdapter,
-  type ManifestCidRewriteContext,
   type PoolWriteAdapter,
   type TombstoneWriteAdapter,
 } from './manifest-cid-rewrite';
-import type {
-  AnchoredProofDescriptor,
-  FinalizationAggregatorClient,
-  PollOutcome,
-  PoolReadAdapter,
-  RequestContext,
-  RequestContextResolver,
-  Semaphore,
-  SubmitOutcome,
-} from './finalization-worker-sender';
+import {
+  attachProofUnderMutex,
+  runFinalizationCycle,
+  sameProofValue,
+  type AnchoredProofDescriptor,
+  type FinalizationAggregatorClient,
+  type HardFailOutcome,
+  type PollOutcome,
+  type PoolReadAdapter,
+  type RequestContext,
+  type RequestContextResolver,
+  type Semaphore,
+  type SubmitOutcome,
+  type SubmitOutcomeKind,
+  type PollOutcomeKind,
+} from './finalization-worker-base';
 import type { CascadeWalker } from './cascade-walker';
 import type { FinalizationQueue, FinalizationQueueEntry } from './finalization-queue';
 import { revaluate, type DispositionRevaluateInput } from './disposition-engine';
@@ -149,11 +137,13 @@ export type {
   AnchoredProofDescriptor,
   FinalizationAggregatorClient,
   PollOutcome,
+  PollOutcomeKind,
   PoolReadAdapter,
   RequestContext,
   RequestContextResolver,
   Semaphore,
   SubmitOutcome,
+  SubmitOutcomeKind,
 };
 
 // =============================================================================
@@ -316,41 +306,14 @@ export interface FinalizationWorkerRecipientOptions {
 // 4. Internal types — disposition + per-entry processing result
 // =============================================================================
 
-/**
- * Per-queue-entry hard-fail outcome. Mirror of T.5.B's
- * {@link HardFailOutcome} — race-lost skips cascade per §6.1.1; every
- * other terminal reason fires it.
- *
- * @internal
- */
-interface HardFailOutcome {
-  readonly kind: 'hard-fail';
-  readonly reason: DispositionReason;
-  /** Per §6.1.1 race-lost special case — TRUE when the cascade walker
-   *  should NOT be triggered. */
-  readonly skipCascade: boolean;
-  /** Forensic message persisted on the disposition record. */
-  readonly message: string;
-}
-
-/** @internal */
-interface SuccessOutcome {
-  readonly kind: 'success';
-  /** The new content hash the token resolves to once the proof is
-   *  attached. */
-  readonly newCid: ContentHash;
-}
-
-/** @internal */
+/** Merge-path graft outcome — recipient-only, distinct from the
+ *  shared cycle outcomes. */
 interface MergePathOutcome {
   /** Merge-path graft: the proof was already attached by ingest
    *  pipeline before the worker reached it. The queue entry was
    *  removed without an aggregator round-trip. */
   readonly kind: 'merge-path-graft';
 }
-
-/** @internal */
-type RequestOutcome = SuccessOutcome | HardFailOutcome | MergePathOutcome;
 
 /**
  * Result of one full {@link processQueueEntry} pass. The worker
@@ -403,39 +366,7 @@ export interface ProcessOneTokenResult {
 }
 
 // =============================================================================
-// 5. Helpers — shared with T.5.B (kept private to this module to avoid
-//              an extra public API surface; identical logic for parity)
-// =============================================================================
-
-/**
- * Equality on `(transactionHash, authenticator)` — the §6.3
- * same-value-vs-different-value resolver. Lowercased for defensive
- * case-insensitive compare.
- *
- * @internal
- */
-function sameProofValue(
-  a: { readonly transactionHash: string; readonly authenticator: string },
-  b: { readonly transactionHash: string; readonly authenticator: string },
-): boolean {
-  return (
-    a.transactionHash.toLowerCase() === b.transactionHash.toLowerCase() &&
-    a.authenticator.toLowerCase() === b.authenticator.toLowerCase()
-  );
-}
-
-/**
- * `transactionHash` equality only. Used by the §6.1 race-loser
- * detection.
- *
- * @internal
- */
-function sameTransactionHash(a: string, b: string): boolean {
-  return a.toLowerCase() === b.toLowerCase();
-}
-
-// =============================================================================
-// 6. FinalizationWorkerRecipient
+// 5. FinalizationWorkerRecipient
 // =============================================================================
 
 /**
@@ -536,7 +467,7 @@ export class FinalizationWorkerRecipient {
   }
 
   // ===========================================================================
-  // 6.1. Per-tokenId driver
+  // 5.1. Per-tokenId driver
   // ===========================================================================
 
   /**
@@ -675,7 +606,7 @@ export class FinalizationWorkerRecipient {
   }
 
   // ===========================================================================
-  // 6.2. Per-queue-entry processing
+  // 5.2. Per-queue-entry processing
   // ===========================================================================
 
   /**
@@ -730,6 +661,109 @@ export class FinalizationWorkerRecipient {
     // remove the queue entry. This is the W15 idempotency optimization:
     // a re-arrival of a more-finalized copy carries the proof, and we
     // skip the aggregator round-trip.
+    const graft = await this.checkMergePathGraft(entry, ctxResolved);
+    if (graft !== null) {
+      return {
+        entryId: entry.entryId,
+        tokenId: entry.tokenId,
+        outcome: graft,
+      };
+    }
+
+    // Run the §6.1 cycle via the shared driver. The cycle handles
+    // submit + poll + race-loser detection + §6.3 conflict + attach
+    // (the side-specific attach closure performs the manifest-CID-
+    // rewrite under the per-tokenId mutex with `entryId` as the queue-
+    // removal key).
+    const perTokenSemaphore = this.options.getPerTokenSemaphore(entry.tokenId);
+    const cycle = await runFinalizationCycle({
+      addressId: this.options.addressId,
+      tokenId: entry.tokenId,
+      requestId: entry.commitmentRequestId,
+      bundleCid: entry.bundleCid,
+      // Recipient: NO outboxId — the recipient queue entries are not
+      // outbox-resident. Events emitted from the cycle omit the
+      // optional `outboxId` field accordingly.
+      // Recipient uses `queue entry X` formatting (no `=` separator
+      // even in the EqPhrase slot — this matches the pre-refactor
+      // recipient messages byte-for-byte).
+      subjectPhrase: `queue entry ${entry.entryId}`,
+      subjectEqPhrase: `queue entry ${entry.entryId}`,
+      structuralInvalidMessage: `STRUCTURAL_INVALID: no signedTx for queue entry ${entry.entryId} (tokenId=${entry.tokenId})`,
+      resolver: this.options.resolver,
+      aggregator: this.options.aggregator,
+      poolRead: this.options.poolRead,
+      perAggregatorSemaphore: this.perAggregatorSemaphore,
+      perTokenSemaphore,
+      // W26 cross-restart fix: use the queue entry's PERSISTED
+      // `submittedAt` as the deadline anchor, NOT a fresh `now()`.
+      // Otherwise the §5.5 step 6 hard safety net (2 ×
+      // POLLING_WINDOW_MS) restarts on every worker re-entry, letting
+      // a token poll indefinitely across crash/restart cycles.
+      pollStartedAt: entry.submittedAt,
+      emit: this.options.emit,
+      now: this.options.now,
+      sleep: this.options.sleep,
+      signal: this.options.signal,
+      isStopped: () => this.stopRequested,
+      maxSubmitRetries: this.maxSubmitRetries,
+      maxProofErrorRetries: this.maxProofErrorRetries,
+      aggregatorId: this.aggregatorId,
+      trustBaseStaleness: this.trustBaseStaleness,
+      attachProof: async (attachArgs) => {
+        await attachProofUnderMutex({
+          addressId: this.options.addressId,
+          tokenId: entry.tokenId,
+          requestId: entry.commitmentRequestId,
+          proof: attachArgs.proof,
+          newCid: attachArgs.newCid,
+          previousCid: attachArgs.previousCid,
+          nextEntryRest: attachArgs.nextEntryRest,
+          // Recipient: queueEntryRequestId IS the queue entry's id.
+          // The 4-step write's queue removal targets the entry-keyed
+          // slot.
+          queueEntryRequestId: entry.entryId,
+          pool: this.options.pool,
+          manifestCas: this.options.manifestCas,
+          tombstones: this.options.tombstones,
+          queue: this.options.queueAdapter,
+          perTokenMutex: this.options.perTokenMutex,
+          perTokenMutexStrategy: this.perTokenMutexStrategy,
+          now: this.options.now,
+        });
+      },
+    });
+
+    return {
+      entryId: entry.entryId,
+      tokenId: entry.tokenId,
+      outcome: cycle,
+    };
+  }
+
+  // ===========================================================================
+  // 5.3. Merge-path graft check (recipient-only)
+  // ===========================================================================
+
+  /**
+   * §5.6 merge-path graft detection. Performed BEFORE submit so we can
+   * fast-path queue removals when the ingest pipeline already grafted
+   * in the proof.
+   *
+   * Returns:
+   *  - `null` — no graft applies, caller proceeds to the shared cycle.
+   *  - `{kind: 'merge-path-graft'}` — proof present + matching value;
+   *    queue entry removed.
+   *  - `HardFailOutcome` — proof present + DIFFERENT value
+   *    (`belief-divergence`). The §6.3 security-alert is emitted from
+   *    here.
+   *
+   * @internal
+   */
+  private async checkMergePathGraft(
+    entry: FinalizationQueueEntry,
+    ctxResolved: RequestContext,
+  ): Promise<MergePathOutcome | HardFailOutcome | null> {
     let attachedProof: AnchoredProofDescriptor | null;
     try {
       attachedProof = await this.options.poolRead.getAttachedProof(
@@ -740,537 +774,42 @@ export class FinalizationWorkerRecipient {
       // Treat read failure as "no proof attached" — fall through to
       // submit / poll. The next worker pass re-tries the read; the
       // §5.6 idempotency ensures eventual convergence.
-      attachedProof = null;
+      return null;
     }
-    if (attachedProof !== null) {
-      if (sameProofValue(attachedProof, ctxResolved)) {
-        // Merge-path graft — proof already present + same value.
-        // Remove the queue entry; we're done.
-        await this.options.queueStore.remove(
-          this.options.addressId,
-          entry.entryId,
-        );
-        return {
-          entryId: entry.entryId,
-          tokenId: entry.tokenId,
-          outcome: { kind: 'merge-path-graft' },
-        };
-      }
-      // Different value at the same requestId. §6.3 forbidden case.
-      // The §6.3 security-alert path is the SAME as T.5.B; we mirror
-      // its emission and treat as belief-divergence hard-fail.
-      this.options.emit('transfer:security-alert', {
-        tokenId: entry.tokenId,
-        requestId: entry.commitmentRequestId,
-        attachedTransactionHash: attachedProof.transactionHash,
-        observedTransactionHash: ctxResolved.transactionHash,
-        attachedAuthenticator: attachedProof.authenticator,
-        observedAuthenticator: ctxResolved.authenticator,
-        message: `transfer:security-alert: pre-existing proof for queue entry ${entry.entryId} disagrees with our (transactionHash, authenticator)`,
-      });
-      return {
-        entryId: entry.entryId,
-        tokenId: entry.tokenId,
-        outcome: {
-          kind: 'hard-fail',
-          reason: 'belief-divergence',
-          skipCascade: false,
-          message: `pre-existing proof at requestId ${entry.commitmentRequestId} disagrees on (transactionHash, authenticator)`,
-        },
-      };
+    if (attachedProof === null) return null;
+
+    if (sameProofValue(attachedProof, ctxResolved)) {
+      // Merge-path graft — proof already present + same value.
+      // Remove the queue entry; we're done.
+      await this.options.queueStore.remove(
+        this.options.addressId,
+        entry.entryId,
+      );
+      return { kind: 'merge-path-graft' };
     }
 
-    // Submit phase.
-    const submitResult = await this.runSubmitPhase({
-      entryId: entry.entryId,
+    // Different value at the same requestId. §6.3 forbidden case.
+    // The §6.3 security-alert path is the SAME as T.5.B; we mirror
+    // its emission and treat as belief-divergence hard-fail.
+    this.options.emit('transfer:security-alert', {
       tokenId: entry.tokenId,
       requestId: entry.commitmentRequestId,
+      attachedTransactionHash: attachedProof.transactionHash,
+      observedTransactionHash: ctxResolved.transactionHash,
+      attachedAuthenticator: attachedProof.authenticator,
+      observedAuthenticator: ctxResolved.authenticator,
+      message: `transfer:security-alert: pre-existing proof for queue entry ${entry.entryId} disagrees with our (transactionHash, authenticator)`,
     });
-    if (submitResult.kind === 'hard-fail') {
-      return {
-        entryId: entry.entryId,
-        tokenId: entry.tokenId,
-        outcome: submitResult,
-      };
-    }
-
-    // Poll phase. W26 cross-restart fix (steelman post-cutover): use
-    // the queue entry's PERSISTED `submittedAt` as the deadline anchor,
-    // NOT a fresh `now()`. Otherwise the §5.5 step 6 hard safety net
-    // (2 × POLLING_WINDOW_MS) restarts on every worker re-entry,
-    // letting a token poll indefinitely across crash/restart cycles.
-    //
-    // {@link FinalizationQueueEntry.submittedAt} is initialized to
-    // `createdAt` at queue-creation and updated to the actual submit
-    // time on first SUCCESS / REQUEST_ID_EXISTS — both values predate
-    // any restart, so passing it through preserves the W26 guarantee.
-    const pollResult = await this.runPollPhase({
-      entryId: entry.entryId,
-      bundleCid: entry.bundleCid,
-      tokenId: entry.tokenId,
-      requestId: entry.commitmentRequestId,
-      ctx: ctxResolved,
-      pollStartedAt: entry.submittedAt,
-    });
-    return {
-      entryId: entry.entryId,
-      tokenId: entry.tokenId,
-      outcome: pollResult,
-    };
-  }
-
-  // ===========================================================================
-  // 6.3. Submit phase (mirrors T.5.B)
-  // ===========================================================================
-
-  /**
-   * §6.1 submit table. Returns either `{kind:'submitted'}` to indicate
-   * "proceed to poll" or a hard-fail outcome.
-   *
-   * @internal
-   */
-  private async runSubmitPhase(args: {
-    readonly entryId: string;
-    readonly tokenId: string;
-    readonly requestId: string;
-  }): Promise<{ kind: 'submitted' } | HardFailOutcome> {
-    let attempts = 0;
-    let lastError: string | undefined;
-    while (attempts <= this.maxSubmitRetries) {
-      if (this.options.signal?.aborted === true || this.stopRequested) {
-        return {
-          kind: 'hard-fail',
-          reason: 'structural',
-          skipCascade: false,
-          message: `worker aborted before submit for queue entry ${args.entryId}`,
-        };
-      }
-      let outcome: SubmitOutcome;
-      try {
-        outcome = await this.options.aggregator.submit({
-          addressId: this.options.addressId,
-          tokenId: args.tokenId,
-          requestId: args.requestId,
-          aggregatorId: this.aggregatorId,
-          signal: this.options.signal,
-        });
-      } catch (err) {
-        outcome = {
-          kind: 'TRANSIENT',
-          error: err instanceof Error ? err.message : String(err),
-        };
-      }
-
-      if (outcome.kind === 'SUCCESS' || outcome.kind === 'REQUEST_ID_EXISTS') {
-        return { kind: 'submitted' };
-      }
-      if (outcome.kind === 'AUTHENTICATOR_VERIFICATION_FAILED') {
-        return {
-          kind: 'hard-fail',
-          reason: 'belief-divergence',
-          skipCascade: false,
-          message: `belief-divergence: aggregator rejected authenticator for queue entry ${args.entryId}${outcome.error ? ` (${outcome.error})` : ''}`,
-        };
-      }
-      if (outcome.kind === 'REQUEST_ID_MISMATCH') {
-        // Same C12/C13 path as T.5.B — emit operator alert, NO cascade.
-        this.options.emit('transfer:operator-alert', {
-          code: 'client-error',
-          tokenId: args.tokenId,
-          message: `REQUEST_ID_MISMATCH on submit: client computed an inconsistent (requestId, sourceState, transactionHash) tuple for queue entry ${args.entryId}${outcome.error ? ` (${outcome.error})` : ''}`,
-        });
-        return {
-          kind: 'hard-fail',
-          reason: 'client-error',
-          skipCascade: true,
-          message: `client-error: REQUEST_ID_MISMATCH on submit for queue entry ${args.entryId}${outcome.error ? ` (${outcome.error})` : ''}`,
-        };
-      }
-      // TRANSIENT.
-      lastError = outcome.error;
-      attempts++;
-      if (attempts > this.maxSubmitRetries) break;
-      await this.options.sleep(getBackoffMs(attempts - 1), this.options.signal);
-    }
     return {
       kind: 'hard-fail',
-      reason: 'oracle-rejected',
+      reason: 'belief-divergence',
       skipCascade: false,
-      message: `submit transient retries exhausted (max=${this.maxSubmitRetries}) for queue entry ${args.entryId}${lastError ? ` last error: ${lastError}` : ''}`,
+      message: `pre-existing proof at requestId ${entry.commitmentRequestId} disagrees on (transactionHash, authenticator)`,
     };
   }
 
   // ===========================================================================
-  // 6.4. Poll phase (mirrors T.5.B)
-  // ===========================================================================
-
-  /**
-   * §6.1 poll table. Backoff + window per shared polling-policy.
-   *
-   * On `OK + transactionHash matches`: invokes the §5.5 step 5 attach
-   * sequence under the per-tokenId mutex.
-   *
-   * On `OK + transactionHash mismatches`: race-lost (§6.1 step 4 /
-   * §6.1.1 race-lost EXCEPTION) — hard-fail with skipCascade=true.
-   *
-   * @internal
-   */
-  private async runPollPhase(args: {
-    readonly entryId: string;
-    readonly bundleCid: string;
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly ctx: RequestContext;
-    /**
-     * Persisted poll-loop deadline anchor (W26 cross-restart fix).
-     * Caller supplies `entry.submittedAt` (initialized to `createdAt`
-     * at queue-creation) so the §5.5 step 6 hard safety net survives
-     * worker crash/restart. See {@link processQueueEntry}.
-     */
-    readonly pollStartedAt: number;
-  }): Promise<RequestOutcome> {
-    const startedAt = args.pollStartedAt;
-    const tokenSemaphore = this.options.getPerTokenSemaphore(args.tokenId);
-    let attempts = 0;
-    let proofErrorRetries = 0;
-    // T.5.F two-strike accounting — counts NOT_AUTHENTICATED
-    // observations made in THIS poll loop. The first strike triggers a
-    // (debounced) refresh and a retry. The second strike escalates to
-    // security-alert. Local accounting protects against races where a
-    // sibling worker's refresh bumps the global tag before THIS worker
-    // has had a chance to retry with the refreshed trustBase.
-    let localNotAuthStrikes = 0;
-    let localRefreshAppliedSinceFirstStrike = false;
-
-    const releaseAgg = await this.perAggregatorSemaphore.acquire();
-    let releaseTok: (() => void) | null = null;
-    try {
-      releaseTok = await tokenSemaphore.acquire();
-
-      for (;;) {
-        if (this.options.signal?.aborted === true || this.stopRequested) {
-          return {
-            kind: 'hard-fail',
-            reason: 'structural',
-            skipCascade: false,
-            message: `worker aborted while polling queue entry ${args.entryId}`,
-          };
-        }
-
-        const timeout = isPollingTimedOut(
-          startedAt,
-          this.options.now(),
-          attempts,
-        );
-        if (timeout.timedOut) {
-          return {
-            kind: 'hard-fail',
-            reason: 'oracle-rejected',
-            skipCascade: false,
-            message: `oracle-rejected (${timeout.reason}): queue entry ${args.entryId} not anchored within ${timeout.reason === 'safety-net-fired' ? '2× ' : ''}polling window (attempts=${attempts})`,
-          };
-        }
-
-        await this.options.sleep(
-          getBackoffMs(attempts),
-          this.options.signal,
-        );
-
-        let pollOutcome: PollOutcome;
-        try {
-          pollOutcome = await this.options.aggregator.poll({
-            addressId: this.options.addressId,
-            tokenId: args.tokenId,
-            requestId: args.requestId,
-            aggregatorId: this.aggregatorId,
-            signal: this.options.signal,
-          });
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          pollOutcome = {
-            kind: 'TRANSIENT',
-            error: `poll threw: ${message}`,
-          };
-        }
-
-        if (pollOutcome.kind === 'TRANSIENT') {
-          // Spec rule: TRANSIENT does not advance attempts.
-          continue;
-        }
-
-        attempts++;
-
-        if (pollOutcome.kind === 'OK') {
-          // §6.1 race-loser detection.
-          if (
-            !sameTransactionHash(
-              pollOutcome.proof.transactionHash,
-              args.ctx.transactionHash,
-            )
-          ) {
-            return {
-              kind: 'hard-fail',
-              reason: 'race-lost',
-              skipCascade: true,
-              message: `OUTBOX_RACE_LOST: queue entry ${args.entryId} anchored with mismatching transactionHash (local=${args.ctx.transactionHash} aggregator=${pollOutcome.proof.transactionHash})`,
-            };
-          }
-
-          // §6.3 most-recent-proof / security-alert.
-          const securityAlert = await this.checkProofConflict({
-            tokenId: args.tokenId,
-            requestId: args.requestId,
-            entryId: args.entryId,
-            local: args.ctx,
-            anchored: pollOutcome.proof,
-          });
-          if (securityAlert.kind === 'security-alert') {
-            return {
-              kind: 'hard-fail',
-              reason: 'belief-divergence',
-              skipCascade: false,
-              message: securityAlert.message,
-            };
-          }
-
-          // Attach proof via the §5.5 step 5 4-step write order under
-          // the per-tokenId mutex.
-          await this.attachProofUnderMutex({
-            tokenId: args.tokenId,
-            requestId: args.requestId,
-            entryId: args.entryId,
-            proof: pollOutcome.proof,
-            newCid: pollOutcome.newCid,
-            previousCid: args.ctx.previousCid,
-            nextEntryRest: args.ctx.nextEntryRest,
-          });
-
-          if (securityAlert.kind === 'superseded') {
-            this.options.emit('transfer:proof-superseded', {
-              tokenId: args.tokenId,
-              requestId: args.requestId,
-              previousCid: args.ctx.previousCid ?? '',
-              newCid: pollOutcome.newCid,
-            });
-          }
-
-          // T.5.F: an authenticated proof landed — reset the staleness
-          // counter so the next first-strike refreshes again.
-          if (this.trustBaseStaleness !== undefined) {
-            this.trustBaseStaleness.recordAuthenticatedOk(this.aggregatorId);
-          }
-          return { kind: 'success', newCid: pollOutcome.newCid };
-        }
-
-        if (pollOutcome.kind === 'PATH_NOT_INCLUDED') {
-          continue;
-        }
-
-        if (pollOutcome.kind === 'PATH_INVALID') {
-          proofErrorRetries++;
-          if (proofErrorRetries >= this.maxProofErrorRetries) {
-            return {
-              kind: 'hard-fail',
-              reason: 'proof-invalid',
-              skipCascade: false,
-              message: `PATH_INVALID after ${proofErrorRetries} retries: queue entry ${args.entryId}${pollOutcome.error ? ` (${pollOutcome.error})` : ''}`,
-            };
-          }
-          continue;
-        }
-
-        if (pollOutcome.kind === 'NOT_AUTHENTICATED') {
-          this.options.emit('transfer:trustbase-warning', {
-            tokenId: args.tokenId,
-            requestId: args.requestId,
-            bundleCid: args.bundleCid,
-            attempt: attempts,
-            message:
-              pollOutcome.error ??
-              'NOT_AUTHENTICATED — proof verifier rejected validator signatures (likely stale local trustBase per §9.4.1)',
-          });
-
-          // T.5.F: two-strike escalation when the staleness ledger is
-          // wired. First strike → emit warning, refresh, retry. Second
-          // strike (only if a refresh has been applied since strike 1)
-          // → emit security-alert + hard-fail.
-          if (this.trustBaseStaleness !== undefined) {
-            localNotAuthStrikes++;
-            // Inform the ledger so its `isTrustBaseStale` /
-            // `lastNotAuthenticatedAt` diagnostics stay accurate.
-            this.trustBaseStaleness.recordNotAuthenticated(
-              this.aggregatorId,
-            );
-
-            if (
-              localNotAuthStrikes >= 2 &&
-              localRefreshAppliedSinceFirstStrike
-            ) {
-              const message = `NOT_AUTHENTICATED persisted after trustBase refresh (strike ${localNotAuthStrikes}): queue entry ${args.entryId} — escalating to security-alert per §9.4.1`;
-              this.options.emit('transfer:security-alert', {
-                tokenId: args.tokenId,
-                requestId: args.requestId,
-                attachedTransactionHash: '',
-                observedTransactionHash: args.ctx.transactionHash,
-                attachedAuthenticator: '',
-                observedAuthenticator: args.ctx.authenticator,
-                message,
-              });
-              return {
-                kind: 'hard-fail',
-                reason: 'proof-invalid',
-                skipCascade: false,
-                message,
-              };
-            }
-
-            // First strike (or retry after a failed refresh) — kick
-            // the refresh (debounced per aggregator) and retry. The
-            // refresh is awaited so the next poll uses the new
-            // trustBase. A failed refresh outcome is treated as
-            // transient: do NOT mark "applied since strike 1"; the
-            // next strike will trigger another refresh attempt.
-            const refresh = await this.trustBaseStaleness.refreshTrustBase(
-              this.aggregatorId,
-              this.options.signal,
-            );
-            if (
-              refresh.kind === 'applied' ||
-              refresh.kind === 'no-change'
-            ) {
-              localRefreshAppliedSinceFirstStrike = true;
-            }
-            // Do NOT advance proofErrorRetries on the staleness path.
-            // The polling-window safety net + signal abort keep the
-            // loop bounded.
-            continue;
-          }
-
-          // No staleness ledger wired — preserve T.5.C's original
-          // budgeted retry behavior.
-          proofErrorRetries++;
-          if (proofErrorRetries >= this.maxProofErrorRetries) {
-            return {
-              kind: 'hard-fail',
-              reason: 'proof-invalid',
-              skipCascade: false,
-              message: `NOT_AUTHENTICATED after ${proofErrorRetries} retries: queue entry ${args.entryId} (likely stale trustBase per §9.4.1)`,
-            };
-          }
-          continue;
-        }
-      }
-    } finally {
-      if (releaseTok !== null) releaseTok();
-      releaseAgg();
-    }
-  }
-
-  // ===========================================================================
-  // 6.5. §6.3 most-recent-proof / security-alert (mirrors T.5.B)
-  // ===========================================================================
-
-  /**
-   * Resolve the §6.3 fresh / superseded / attached-newer / security-
-   * alert decision when a poll returns `OK`.
-   *
-   * @internal
-   */
-  private async checkProofConflict(args: {
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly entryId: string;
-    readonly local: { readonly transactionHash: string; readonly authenticator: string };
-    readonly anchored: AnchoredProofDescriptor;
-  }): Promise<
-    | { kind: 'fresh' }
-    | { kind: 'superseded' }
-    | { kind: 'attached-newer' }
-    | { kind: 'security-alert'; message: string }
-  > {
-    let attached: AnchoredProofDescriptor | null;
-    try {
-      attached = await this.options.poolRead.getAttachedProof(
-        args.tokenId,
-        args.requestId,
-      );
-    } catch {
-      // Treat read failure as fresh — the attach orchestrator's
-      // step 1 idempotency is the safety net.
-      return { kind: 'fresh' };
-    }
-    if (attached === null) return { kind: 'fresh' };
-
-    if (!sameProofValue(attached, args.anchored)) {
-      const message = `transfer:security-alert: two proofs for the same requestId disagree on (transactionHash, authenticator) — single-spend invariant violated. tokenId=${args.tokenId} requestId=${args.requestId}`;
-      this.options.emit('transfer:security-alert', {
-        tokenId: args.tokenId,
-        requestId: args.requestId,
-        attachedTransactionHash: attached.transactionHash,
-        observedTransactionHash: args.anchored.transactionHash,
-        attachedAuthenticator: attached.authenticator,
-        observedAuthenticator: args.anchored.authenticator,
-        message,
-      });
-      return { kind: 'security-alert', message };
-    }
-
-    const attachedRound = attached.roundNumber ?? 0;
-    const anchoredRound = args.anchored.roundNumber ?? 0;
-    if (anchoredRound > attachedRound) return { kind: 'superseded' };
-    return { kind: 'attached-newer' };
-  }
-
-  // ===========================================================================
-  // 6.6. Attach via §5.5 step 5 4-step write — under per-tokenId mutex
-  // ===========================================================================
-
-  /**
-   * Wraps the §5.5 step 5 orchestrator with the §5.5 step 9
-   * per-tokenId mutex (CAS-default per W34).
-   *
-   * @internal
-   */
-  private async attachProofUnderMutex(args: {
-    readonly tokenId: string;
-    readonly requestId: string;
-    readonly entryId: string;
-    readonly proof: AnchoredProofDescriptor;
-    readonly newCid: ContentHash;
-    readonly previousCid?: ContentHash;
-    readonly nextEntryRest: RequestContext['nextEntryRest'];
-  }): Promise<void> {
-    await this.options.perTokenMutex.acquire(
-      args.tokenId,
-      async () => {
-        const ctx: ManifestCidRewriteContext = {
-          addr: this.options.addressId,
-          tokenId: args.tokenId,
-          proofToAttach: {
-            requestId: args.requestId,
-            roundNumber: args.proof.roundNumber ?? 0,
-            proof: args.proof.proof,
-            timestamp: this.options.now(),
-          },
-          newCid: args.newCid,
-          previousCid: args.previousCid,
-          nextEntryRest: args.nextEntryRest,
-          // The 4-step write's "queueEntryRequestId" is the queue
-          // entry's id (matches FinalizationQueueAdapter contract).
-          queueEntryRequestId: args.entryId,
-          pool: this.options.pool,
-          manifestCas: this.options.manifestCas,
-          tombstones: this.options.tombstones,
-          queue: this.options.queueAdapter,
-        };
-        await performManifestCidRewrite(ctx);
-      },
-      { strategy: this.perTokenMutexStrategy },
-    );
-  }
-
-  // ===========================================================================
-  // 6.7. §5.5 step 9 re-evaluator (W5)
+  // 5.4. §5.5 step 9 re-evaluator (W5)
   // ===========================================================================
 
   /**
@@ -1357,7 +896,7 @@ export class FinalizationWorkerRecipient {
   }
 
   // ===========================================================================
-  // 6.8. Hard-fail cascade (delegates to T.5.B.5)
+  // 5.5. Hard-fail cascade (delegates to T.5.B.5)
   // ===========================================================================
 
   /**
@@ -1388,6 +927,7 @@ export class FinalizationWorkerRecipient {
     readonly observedTokenContentHash: ContentHash;
     readonly bundleCid: string;
   }): Promise<boolean> {
+    void args.message;
     // (1) Self-invalidation: write INVALID disposition for the
     // recipient's own copy.
     try {
@@ -1456,7 +996,7 @@ export class FinalizationWorkerRecipient {
   }
 
   // ===========================================================================
-  // 6.9. transfer:incoming (confirmed:true) emission helper
+  // 5.6. transfer:incoming (confirmed:true) emission helper
   // ===========================================================================
 
   /**
@@ -1480,7 +1020,7 @@ export class FinalizationWorkerRecipient {
   }
 
   // ===========================================================================
-  // 6.10. observedHashFor — synthesize the observedTokenContentHash for
+  // 5.7. observedHashFor — synthesize the observedTokenContentHash for
   //        the §5.4 disposition record key
   // ===========================================================================
 
@@ -1503,7 +1043,7 @@ export class FinalizationWorkerRecipient {
   }
 
   // ===========================================================================
-  // 6.11. Scan loop (mirrors T.5.B's stub — production drives via
+  // 5.8. Scan loop (mirrors T.5.B's stub — production drives via
   //         `processOneToken`)
   // ===========================================================================
 
@@ -1526,7 +1066,7 @@ export class FinalizationWorkerRecipient {
 }
 
 // =============================================================================
-// 7. mapDispositionToTerminal — disposition record → terminal kind
+// 6. mapDispositionToTerminal — disposition record → terminal kind
 // =============================================================================
 
 /**
