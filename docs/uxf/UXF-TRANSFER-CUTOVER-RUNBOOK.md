@@ -17,8 +17,9 @@ it merges:
   for surgical per-flag revert; new code MUST NOT branch on them.
 - `tools/restore-legacy-outbox.ts` is the **only** supported back-out path for
   already-migrated wallets.
-- `.github/workflows/external-acks-gate.yml` gates merge on three external
-  integrator acks (agentsphere, sphere app, openclaw-unicity).
+- `.github/workflows/external-acks-gate.yml` gates merge on the configured
+  external integrator acks (sphere app + openclaw-unicity at PR-prep time;
+  see § Pre-cutover checklist for the live list).
 
 Companion to `UXF-TRANSFER-IMPL-PLAN.md` §T.8.D. Assumes Waves T.1–T.8.C are
 shipped and T.8.E.{1,2,3} suites are green on `main`.
@@ -57,21 +58,27 @@ before clicking "Squash and merge" on the T.8.D PR.
       tests covered. Suite runs in < 8 minutes; flake rate < 0.5% over the
       last 5 nightly runs.
 
-### External integrator acks (3 required)
+### External integrator acks
 
-- [ ] `unicity-sphere/agentsphere` — issue with label `uxf-transfer-v1-ack`
-      is **closed**. Verifies the `onIntent` callback widening
+> **Repo audit at PR-prep time** (after the original plan was written):
+> `unicity-sphere/agentsphere` does NOT exist as a real GitHub repo.
+> Plan §T.8.D listed it as a 3rd ack target, but the audit found only
+> 2 confirmed sphere-sdk consumers in active development. The 3rd ack
+> can be added to the workflow's `REPOS` list if/when an `agentsphere`
+> repo materializes.
+
+- [ ] [`unicity-sphere/sphere#302`](https://github.com/unicity-sphere/sphere/issues/302)
+      — issue with label `uxf-transfer-v1-ack` is **closed**.
+      Verifies the wallet UI host widened the `onIntent` callback
       (`schemaVersion` 4th argument) per `CONNECT-HOST-MIGRATION-NOTE.md`.
-- [ ] `unicity-sphere/sphere` — issue with label `uxf-transfer-v1-ack` is
-      **closed**. Verifies the wallet UI host widened the same callback.
-- [ ] `unicity-sphere/openclaw-unicity` — issue with label
-      `uxf-transfer-v1-ack` is **closed**. Verifies any third-party host
-      using `ConnectHost` has migrated.
+- [ ] [`unicitynetwork/openclaw-unicity#8`](https://github.com/unicitynetwork/openclaw-unicity/issues/8)
+      — issue with label `uxf-transfer-v1-ack` is **closed**. Verifies
+      the openclaw-unicity plugin migrated.
 
 Verify with the same command CI uses:
 
 ```bash
-for repo in unicity-sphere/agentsphere unicity-sphere/sphere unicity-sphere/openclaw-unicity; do
+for repo in unicity-sphere/sphere unicitynetwork/openclaw-unicity; do
   echo "=== $repo ==="
   gh issue list --state closed --search "label:uxf-transfer-v1-ack" --repo "$repo"
 done
@@ -435,21 +442,24 @@ the T.8.D PR. The workflow uses `gh` to query each repo:
 gh issue list \
   --state closed \
   --search "label:uxf-transfer-v1-ack" \
-  --repo unicity-sphere/agentsphere
-# (and same for sphere, openclaw-unicity)
+  --repo unicity-sphere/sphere
+# (and same for unicitynetwork/openclaw-unicity)
 ```
 
-If any of the three queries returns an empty list, the workflow **fails**
-and the PR cannot be merged. The check re-runs on PR sync, so closing the
-upstream issue automatically unblocks merge.
+If any query returns an empty list, the workflow **fails** and the PR
+cannot be merged. The check re-runs on PR sync, so closing the upstream
+issue automatically unblocks merge.
 
 ### Tracking issues
 
-| Repo | Label | Purpose |
-| --- | --- | --- |
-| `unicity-sphere/agentsphere` | `uxf-transfer-v1-ack` | Agent host widened `onIntent` callback (`schemaVersion` 4th arg). |
-| `unicity-sphere/sphere` | `uxf-transfer-v1-ack` | Wallet UI host widened `onIntent` callback. |
-| `unicity-sphere/openclaw-unicity` | `uxf-transfer-v1-ack` | Third-party Connect host migrated. |
+| Repo | Issue | Label | Purpose |
+| --- | --- | --- | --- |
+| [`unicity-sphere/sphere`](https://github.com/unicity-sphere/sphere/issues/302) | #302 | `uxf-transfer-v1-ack` | Wallet UI host widened `onIntent` callback (`schemaVersion` 4th arg). |
+| [`unicitynetwork/openclaw-unicity`](https://github.com/unicitynetwork/openclaw-unicity/issues/8) | #8 | `uxf-transfer-v1-ack` | OpenClaw plugin migrated. |
+
+> Plan §T.8.D listed `unicity-sphere/agentsphere` as a 3rd ack target,
+> but at PR-prep time that repo doesn't exist yet. If/when it lands,
+> append it to the workflow's `REPOS` list and add a row here.
 
 ### Pre-merge verification
 

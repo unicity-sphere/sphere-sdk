@@ -93,15 +93,18 @@ feature flag defaults, removes legacy single-coin TXF code paths.
 
 ## External-acks gate
 
-CI workflow `.github/workflows/external-acks-gate.yml` enforces all 3
+CI workflow `.github/workflows/external-acks-gate.yml` enforces these
 maintainer tracking issues are CLOSED with label `uxf-transfer-v1-ack`:
 
-- [ ] `unicity-sphere/agentsphere#NN` — agentsphere maintainer ack
-- [ ] `unicity-sphere/sphere#NN` — sphere app maintainer ack
-- [ ] `unicity-sphere/openclaw-unicity#NN` — openclaw-unicity ack
+- [ ] [unicity-sphere/sphere#302](https://github.com/unicity-sphere/sphere/issues/302) — sphere app maintainer ack
+- [ ] [unicitynetwork/openclaw-unicity#8](https://github.com/unicitynetwork/openclaw-unicity/issues/8) — openclaw-unicity ack
+
+(Plan originally listed `unicity-sphere/agentsphere` as a 3rd ack
+target, but that repo doesn't exist yet. If/when it lands, append it
+to the workflow's `REPOS` list per the workflow header docs.)
 
 Required secret: `EXTERNAL_ACKS_TOKEN` (fine-grained PAT, `Issues:
-Read` on the 3 upstream repos).
+Read` on the 2 upstream repos).
 
 ## What changes
 

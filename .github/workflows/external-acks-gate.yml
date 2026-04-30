@@ -12,10 +12,12 @@
 #   `uxf-transfer-v1-ack`. The maintainer closes the issue once their repo
 #   has shipped the widened callback. This workflow asserts all 3 are closed.
 #
-# Tracking issues:
-#   - unicity-sphere/agentsphere       (label: uxf-transfer-v1-ack)
-#   - unicity-sphere/sphere            (label: uxf-transfer-v1-ack)
-#   - unicity-sphere/openclaw-unicity  (label: uxf-transfer-v1-ack)
+# Tracking issues (corrected from plan after repo audit at PR-prep time —
+# `agentsphere` doesn't yet exist as a real GitHub repo so it's not in the
+# active gate; if/when it lands, follow the "Adding a 4th external repo"
+# instructions below):
+#   - unicity-sphere/sphere            (label: uxf-transfer-v1-ack) — issue #302
+#   - unicitynetwork/openclaw-unicity  (label: uxf-transfer-v1-ack) — issue #8
 #
 # Triggering model (label-gated):
 #   The job runs only when the PR carries the `t8d-cutover` label. This keeps
@@ -25,14 +27,14 @@
 #
 # Required secret:
 #   EXTERNAL_ACKS_TOKEN — a fine-grained PAT (or GitHub App token) with
-#   `Issues: Read` scope on the three upstream repos listed above. The default
+#   `Issues: Read` scope on the upstream repos listed above. The default
 #   `GITHUB_TOKEN` is scoped to THIS repo only and cannot read issues in other
 #   repos; passing it would surface as a 404, not an auth error, which is hard
 #   to debug. Configure under: Settings → Secrets and variables → Actions.
 #
-# Adding a 4th external repo:
+# Adding another external repo:
 #   1. Add the new tracking issue (label `uxf-transfer-v1-ack`) in that repo.
-#   2. Append `unicity-sphere/<repo>` to the `REPOS` list in the gate step.
+#   2. Append `<owner>/<repo>` to the `REPOS` list in the gate step.
 #   3. Ensure EXTERNAL_ACKS_TOKEN has `Issues: Read` on the new repo.
 #   4. Update the T.8.D PR description to reference the new tracking issue.
 
@@ -59,21 +61,20 @@ jobs:
         run: |
           if [ -z "${EXTERNAL_ACKS_TOKEN:-}" ]; then
             echo "::error::EXTERNAL_ACKS_TOKEN secret is not set."
-            echo "::error::This gate queries closed issues in unicity-sphere/{agentsphere,sphere,openclaw-unicity}."
+            echo "::error::This gate queries closed issues in the configured external repos."
             echo "::error::Configure a fine-grained PAT with 'Issues: Read' on those repos."
             echo "::error::Settings → Secrets and variables → Actions → New repository secret"
             exit 1
           fi
 
-      - name: Check all 3 external repos have a closed uxf-transfer-v1-ack issue
+      - name: Check external repos have a closed uxf-transfer-v1-ack issue
         env:
           GH_TOKEN: ${{ secrets.EXTERNAL_ACKS_TOKEN }}
         run: |
           set -euo pipefail
           REPOS=(
-            "unicity-sphere/agentsphere"
             "unicity-sphere/sphere"
-            "unicity-sphere/openclaw-unicity"
+            "unicitynetwork/openclaw-unicity"
           )
           missing=()
           for repo in "${REPOS[@]}"; do
@@ -95,4 +96,4 @@ jobs:
             echo "::error::T.8.D cutover blocked — ${#missing[@]} external repo(s) missing acks: ${missing[*]}"
             exit 1
           fi
-          echo "All 3 external repos have signed off — T.8.D cutover gate passed."
+          echo "All ${#REPOS[@]} external repos have signed off — T.8.D cutover gate passed."
