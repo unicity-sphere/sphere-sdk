@@ -90,6 +90,28 @@ Required steps:
    README in a single commit. Reference the ADR in the commit
    message.
 
+## Bump history
+
+### v2 — SMT path encoding: bigint → 32-byte bstr (fix for 256-bit overflow)
+
+`uxf/hash.ts:prepareSmtSegments` was encoding SMT path values as native
+`BigInt`, which `@ipld/dag-cbor` (cborg) attempted to write as CBOR uint.
+cborg caps uint at uint64 (2^64−1) and throws
+"encountered BigInt larger than allowable range" for real testnet 256-bit
+paths. The original comment claimed "CBOR tag 2 bignum" but
+`@ipld/dag-cbor` / the IPLD data model does not support bignum tags.
+
+Fix (see `uxf/hash.ts::bigIntTo32Bytes`): encode the 256-bit SMT path as
+a fixed-width 32-byte big-endian `Uint8Array` (CBOR bstr). This is
+deterministic, IPLD-native, and matches the SPEC CDDL
+`segments: [* [bstr, bstr]]`. TOKEN_A's mock paths (`0`, `1`,
+`9999999999999999999`) were previously encoded as 1–8 CBOR uint bytes;
+they are now encoded as 32 CBOR bstr bytes each, growing the fixture from
+2408 to 2499 bytes.
+
+`_marker` bumped to `T.2.D.REFERENCE.SNAPSHOT.v2`. ADR documented inline
+in `uxf/hash.ts` (bigIntTo32Bytes comment) and in the commit message.
+
 ## File inventory
 
 - `manifest.json` — inputs needed to reproduce the bundle, plus the

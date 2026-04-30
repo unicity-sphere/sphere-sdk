@@ -109,22 +109,57 @@ describe('prepareContentForHashing', () => {
     expect(result.reason).toBe(reason);
   });
 
-  it('converts SmtPath segments data to bytes and path to BigInt', () => {
+  it('converts SmtPath segments data to bytes and path to 32-byte bstr', () => {
     const result = prepareContentForHashing('smt-path', {
       segments: [{ data: 'aabb', path: '42' }],
     });
-    const segments = result.segments as Array<{ data: Uint8Array | null; path: bigint }>;
+    const segments = result.segments as Array<{ data: Uint8Array | null; path: Uint8Array }>;
     expect(segments[0].data).toEqual(new Uint8Array([0xaa, 0xbb]));
-    expect(segments[0].path).toBe(BigInt(42));
+    // path=42 encoded as 32-byte big-endian bstr
+    const expectedPath = new Uint8Array(32);
+    expectedPath[31] = 42;
+    expect(segments[0].path).toBeInstanceOf(Uint8Array);
+    expect(segments[0].path).toEqual(expectedPath);
   });
 
   it('handles SmtPath segments with null data', () => {
     const result = prepareContentForHashing('smt-path', {
       segments: [{ data: null, path: '0' }],
     });
-    const segments = result.segments as Array<{ data: Uint8Array | null; path: bigint }>;
+    const segments = result.segments as Array<{ data: Uint8Array | null; path: Uint8Array }>;
     expect(segments[0].data).toBeNull();
-    expect(segments[0].path).toBe(BigInt(0));
+    // path=0 encoded as 32 zero bytes
+    expect(segments[0].path).toBeInstanceOf(Uint8Array);
+    expect(segments[0].path).toEqual(new Uint8Array(32));
+  });
+
+  it('encodes a full 256-bit SMT path as 32-byte bstr without throwing', () => {
+    // The maximum 256-bit value: 2^256 - 1
+    const max256 = (2n ** 256n - 1n).toString();
+    const result = prepareContentForHashing('smt-path', {
+      segments: [{ data: null, path: max256 }],
+    });
+    const segments = result.segments as Array<{ data: Uint8Array | null; path: Uint8Array }>;
+    expect(segments[0].path).toBeInstanceOf(Uint8Array);
+    expect(segments[0].path).toHaveLength(32);
+    // All 32 bytes should be 0xff
+    expect(segments[0].path).toEqual(new Uint8Array(32).fill(0xff));
+  });
+
+  it('256-bit SMT path round-trips through dag-cbor encode without throwing', async () => {
+    // Real testnet SMT paths can be 256-bit. dag-cbor must not throw.
+    const { encode } = await import('@ipld/dag-cbor');
+    const realTestnetPath = (2n ** 255n + 12345n).toString(); // >2^64-1
+    const result = prepareContentForHashing('smt-path', {
+      root: 'ab'.repeat(32),
+      segments: [{ data: 'cd'.repeat(32), path: realTestnetPath }],
+    });
+    // Must not throw "encountered BigInt larger than allowable range"
+    expect(() => encode(result)).not.toThrow();
+    // Output must be deterministic
+    const encoded1 = encode(result);
+    const encoded2 = encode(result);
+    expect(encoded1).toEqual(encoded2);
   });
 
   it('converts transaction-data nametagRefs to byte arrays', () => {

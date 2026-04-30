@@ -94,8 +94,9 @@ const BYTE_FIELDS: Readonly<Record<UxfElementType, ReadonlySet<string>>> = {
  *
  * Special handling:
  * - SmtPath `segments[].data`: hex -> bytes (or null -> null)
- * - SmtPath `segments[].path`: decimal bigint string -> BigInt
- *   (dag-cbor encodes BigInt natively via CBOR tag 2)
+ * - SmtPath `segments[].path`: decimal bigint string -> 32-byte big-endian
+ *   Uint8Array (CBOR bstr). @ipld/dag-cbor does NOT support CBOR tag 2
+ *   bignum; encode as fixed-width bstr per SPEC CDDL `segments [* [bstr, bstr]]`.
  * - `reason` in GenesisDataContent: already Uint8Array | null, pass through
  * - null values: pass through for CBOR null encoding
  */
@@ -194,19 +195,51 @@ export function prepareContentForHashing(
 }
 
 /**
+ * Convert a non-negative bigint to a fixed-width 32-byte big-endian Uint8Array.
+ *
+ * SMT path values are 256-bit integers (DOMAIN-CONSTRAINTS §2.3 / SPEC §293).
+ * @ipld/dag-cbor encodes CBOR via cborg which does NOT support CBOR tag 2
+ * (bignum) — BigInt values larger than uint64 (2^64-1) throw
+ * "encountered BigInt larger than allowable range". Encoding as a fixed
+ * 32-byte bstr is deterministic, IPLD-native (bytes are first-class in
+ * the IPLD data model), and preserves the full 256-bit value range.
+ *
+ * See SPECIFICATION §11 CDDL: `segments: [* [bstr, bstr]]` — both data
+ * and path are bstr.
+ */
+function bigIntTo32Bytes(b: bigint): Uint8Array {
+  if (b < 0n) {
+    throw new UxfError('INVALID_HASH', `SMT path must be non-negative: ${b}`);
+  }
+  const buf = new Uint8Array(32);
+  let v = b;
+  for (let i = 31; i >= 0; i--) {
+    buf[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  if (v !== 0n) {
+    throw new UxfError('INVALID_HASH', `SMT path exceeds 256 bits: ${b}`);
+  }
+  return buf;
+}
+
+/**
  * Prepare SmtPath segments for CBOR encoding.
  *
  * - `data`: hex string -> Uint8Array, null -> null
- * - `path`: decimal bigint string -> BigInt (CBOR tag 2 bignum)
+ * - `path`: decimal bigint string -> 32-byte big-endian Uint8Array (CBOR bstr)
+ *
+ * SMT paths are 256-bit integers; encoding as a fixed 32-byte bstr is
+ * deterministic and fully IPLD-compatible (SPEC §11 CDDL: segments [* [bstr, bstr]]).
  */
 function prepareSmtSegments(
   segments: ReadonlyArray<{ readonly data: string; readonly path: string }>,
-): Array<{ data: Uint8Array | null; path: bigint }> {
+): Array<{ data: Uint8Array | null; path: Uint8Array }> {
   return segments.map((seg) => ({
     data: seg.data === null || seg.data === undefined
       ? null
       : hexToBytes(seg.data as string),
-    path: BigInt(seg.path),
+    path: bigIntTo32Bytes(BigInt(seg.path)),
   }));
 }
 

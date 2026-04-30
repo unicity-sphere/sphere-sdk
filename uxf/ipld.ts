@@ -631,7 +631,7 @@ function decodeIpldContent(
     } else if (Array.isArray(value)) {
       result[key] = decodeIpldContentArray(type, key, value);
     } else if (typeof value === 'bigint') {
-      // BigInt from dag-cbor (e.g., smt-path segment path) -> decimal string
+      // BigInt from dag-cbor (kept for forward-compat, not produced by current encoder)
       result[key] = value.toString();
     } else if (value === null) {
       result[key] = null;
@@ -651,13 +651,29 @@ function decodeIpldContentArray(
   key: string,
   value: unknown[],
 ): unknown[] {
-  // smt-path segments: array of { data: Uint8Array|null, path: BigInt }
+  // smt-path segments: array of { data: Uint8Array|null, path: Uint8Array }
+  // `path` is stored as a fixed-width 32-byte big-endian bstr (see hash.ts
+  // bigIntTo32Bytes). Decode back to a decimal bigint string for the SDK layer.
   if (type === 'smt-path' && key === 'segments') {
     return value.map((seg) => {
-      const s = seg as { data: Uint8Array | null; path: bigint };
+      const s = seg as { data: Uint8Array | null; path: Uint8Array | bigint };
+      let pathStr: string;
+      if (s.path instanceof Uint8Array) {
+        // Decode 32-byte big-endian bstr -> decimal bigint string
+        let v = 0n;
+        for (const byte of s.path) {
+          v = (v << 8n) | BigInt(byte);
+        }
+        pathStr = v.toString();
+      } else if (typeof s.path === 'bigint') {
+        // Legacy: path was stored as bigint in earlier builds (pre-fix)
+        pathStr = s.path.toString();
+      } else {
+        pathStr = String(s.path);
+      }
       return {
         data: s.data instanceof Uint8Array ? bytesToHex(s.data) : s.data,
-        path: typeof s.path === 'bigint' ? s.path.toString() : String(s.path),
+        path: pathStr,
       };
     });
   }
