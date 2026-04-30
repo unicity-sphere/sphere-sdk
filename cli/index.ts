@@ -3773,7 +3773,6 @@ async function main() {
         // cosmetic. Refuse argv passwords entirely; require interactive
         // prompt or stdin.  Operators who need scripted use can pipe via
         // `echo "$PASS" | cli encrypt <data>` (stdin not visible to ps).
-        let password: string;
         if (passwordArg && passwordArg !== '***') {
           console.error(
             'Refusing argv-supplied password: it is already exposed via ps/cmdline/history.\n' +
@@ -3782,7 +3781,7 @@ async function main() {
           process.exit(1);
         }
         const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-        password = await new Promise<string>((resolve) => {
+        const password = await new Promise<string>((resolve) => {
           rl.question('Password: ', (a) => { rl.close(); resolve(a); });
         });
         const result = encrypt(data, password);
@@ -3796,7 +3795,6 @@ async function main() {
           console.error('Usage: decrypt <encrypted-json>   (password is read from stdin/prompt)');
           process.exit(1);
         }
-        let password: string;
         if (passwordArg && passwordArg !== '***') {
           console.error(
             'Refusing argv-supplied password: it is already exposed via ps/cmdline/history.',
@@ -3804,7 +3802,7 @@ async function main() {
           process.exit(1);
         }
         const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
-        password = await new Promise<string>((resolve) => {
+        const password = await new Promise<string>((resolve) => {
           rl.question('Password: ', (a) => { rl.close(); resolve(a); });
         });
         const encryptedData = JSON.parse(encrypted);
