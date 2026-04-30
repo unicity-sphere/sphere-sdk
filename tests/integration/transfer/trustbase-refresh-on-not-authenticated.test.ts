@@ -358,7 +358,10 @@ function buildRecipientWithStaleness(args: {
     dispositionWriter,
     revaluateHooks,
     emit: events.emit,
-    now: () => Date.now(),
+    // Anchor at the queue-entry fixture's `submittedAt` so the W26
+    // cross-restart safety net does not trip on the wide gap between
+    // 2023-fixed `submittedAt` and `Date.now()`.
+    now: () => 1700000000000,
     sleep: async () => undefined,
     caps: { maxProofErrorRetries: args.maxProofErrorRetries ?? 5 },
     trustBaseStaleness: args.staleness,

@@ -577,7 +577,11 @@ export function buildWorker(args: {
     dispositionWriter,
     revaluateHooks,
     emit: events.emit,
-    now: args.nowFn ?? (() => Date.now()),
+    // Default `now` matches the queue-entry fixture's `submittedAt`
+    // (1700000000000) so the W26 cross-restart safety net does not
+    // trip on default-built harnesses. Tests that need to advance the
+    // clock pass an explicit `nowFn`.
+    now: args.nowFn ?? (() => 1700000000000),
     sleep: args.sleepFn ?? (async () => undefined),
     caps: {
       maxSubmitRetries: args.maxSubmitRetries ?? 5,

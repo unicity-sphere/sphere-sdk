@@ -125,6 +125,17 @@ export function mergeOutboxEntries(
   const retryDeadline = winnerEntry.retryDeadline ?? a.retryDeadline ?? b.retryDeadline;
   const pollingDeadline = winnerEntry.pollingDeadline ?? a.pollingDeadline ?? b.pollingDeadline;
 
+  // pollStartedAt is the deadline ANCHOR for the W26 safety net. If both
+  // replicas stamped it (concurrent first-poll on different hosts), the
+  // EARLIER value wins — moving the anchor forward would extend the
+  // termination window, defeating the cross-restart guarantee. Set-once
+  // semantics in practice (workers stamp on first observation only); the
+  // min() defends against a writer bug or a race window between replicas.
+  const pollStartedAt =
+    a.pollStartedAt !== undefined && b.pollStartedAt !== undefined
+      ? Math.min(a.pollStartedAt, b.pollStartedAt)
+      : (a.pollStartedAt ?? b.pollStartedAt);
+
   // Build the merged entry. We assemble the object with its keys in the
   // schema-declared order to match the writer's serialization.
   const merged: UxfTransferOutboxEntry = {
@@ -154,6 +165,7 @@ export function mergeOutboxEntries(
     proofErrorCount: errorMerge.proofErrorCount,
     ...(retryDeadline !== undefined ? { retryDeadline } : {}),
     ...(pollingDeadline !== undefined ? { pollingDeadline } : {}),
+    ...(pollStartedAt !== undefined ? { pollStartedAt } : {}),
   };
 
   return merged;

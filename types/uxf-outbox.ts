@@ -265,6 +265,28 @@ export interface UxfTransferOutboxEntry {
    *  this time, sustained PATH_NOT_INCLUDED transitions the entry to
    *  `failed-permanent` with reason='oracle-rejected'. */
   readonly pollingDeadline?: number;
+
+  /**
+   * Wall-clock millisecond timestamp of the FIRST poll-loop entry
+   * for this outbox entry. Anchors the {@link isPollingTimedOut}
+   * deadline (§5.5 step 6) and the W26 hard safety net
+   * (`2 × POLLING_WINDOW_MS` from this stamp).
+   *
+   * **Steelman post-cutover invariant (W26 cross-restart persistence)**:
+   * the finalization worker MUST persist this on first poll iteration
+   * and MUST use the persisted value (NOT `now()`) on every subsequent
+   * pass — including after crash/restart. Recapturing `now()` per
+   * `runRequestPipeline` invocation voids the §5.5 step 6 termination
+   * guarantee: a token stuck PENDING across many restarts would poll
+   * indefinitely with a fresh 60-min window each time.
+   *
+   * Optional with `undefined` semantics on the first observation; the
+   * worker stamps it via `outbox.update()` BEFORE the first poll.
+   * Once set, the field is monotonic — never overwritten on retry.
+   * Mirror of {@link FinalizationQueueEntry.submittedAt} on the
+   * recipient side.
+   */
+  readonly pollStartedAt?: number;
 }
 
 // =============================================================================

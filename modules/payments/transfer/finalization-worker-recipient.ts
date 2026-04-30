@@ -108,6 +108,7 @@ import {
   getBackoffMs,
   MIN_POLL_ATTEMPTS,
 } from './polling-policy';
+import { getAggregatorSemaphore } from './aggregator-semaphores';
 import {
   performManifestCidRewrite,
   type FinalizationQueueAdapter,
@@ -254,8 +255,14 @@ export interface FinalizationWorkerRecipientOptions {
   readonly manifestCas: ManifestCas;
   /** Tombstone adapter (§5.5 step 5 step 3). */
   readonly tombstones: TombstoneWriteAdapter;
-  /** Per-aggregator semaphore (W14, default 16). Caller-shared. */
-  readonly perAggregatorSemaphore: Semaphore;
+  /**
+   * Per-aggregator semaphore (W14, default 16). Optional — when omitted,
+   * the worker falls back to the process-global registry in
+   * {@link getAggregatorSemaphore} keyed on `aggregatorId`. Tests
+   * inject explicit semaphores for deterministic isolation; production
+   * MUST omit this field so the cap is enforced process-globally.
+   */
+  readonly perAggregatorSemaphore?: Semaphore;
   /** Factory for per-tokenId semaphores. */
   readonly getPerTokenSemaphore: (tokenId: string) => Semaphore;
   /** Per-tokenId mutex (T.1.F). */
@@ -472,7 +479,13 @@ export class FinalizationWorkerRecipient {
     }
 
     this.options = options;
-    this.perAggregatorSemaphore = options.perAggregatorSemaphore;
+    this.aggregatorId = options.aggregatorId ?? 'default';
+    // W14 steelman post-cutover: fall back to the process-global
+    // per-aggregator semaphore registry when the caller doesn't inject
+    // one. See `aggregator-semaphores.ts` for the rationale.
+    this.perAggregatorSemaphore =
+      options.perAggregatorSemaphore ??
+      getAggregatorSemaphore(this.aggregatorId);
     this.perAggregator =
       options.caps?.perAggregator ?? MAX_CONCURRENT_POLLS_PER_AGGREGATOR;
     this.perToken = options.caps?.perToken ?? MAX_CONCURRENT_POLLS_PER_TOKEN;
@@ -480,7 +493,6 @@ export class FinalizationWorkerRecipient {
     this.maxProofErrorRetries = options.caps?.maxProofErrorRetries ?? 3;
     this.pollingWindowMs = options.caps?.pollingWindowMs ?? POLLING_WINDOW_MS;
     this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'cas';
-    this.aggregatorId = options.aggregatorId ?? 'default';
     this.trustBaseStaleness = options.trustBaseStaleness;
 
     if (
@@ -782,13 +794,23 @@ export class FinalizationWorkerRecipient {
       };
     }
 
-    // Poll phase.
+    // Poll phase. W26 cross-restart fix (steelman post-cutover): use
+    // the queue entry's PERSISTED `submittedAt` as the deadline anchor,
+    // NOT a fresh `now()`. Otherwise the §5.5 step 6 hard safety net
+    // (2 × POLLING_WINDOW_MS) restarts on every worker re-entry,
+    // letting a token poll indefinitely across crash/restart cycles.
+    //
+    // {@link FinalizationQueueEntry.submittedAt} is initialized to
+    // `createdAt` at queue-creation and updated to the actual submit
+    // time on first SUCCESS / REQUEST_ID_EXISTS — both values predate
+    // any restart, so passing it through preserves the W26 guarantee.
     const pollResult = await this.runPollPhase({
       entryId: entry.entryId,
       bundleCid: entry.bundleCid,
       tokenId: entry.tokenId,
       requestId: entry.commitmentRequestId,
       ctx: ctxResolved,
+      pollStartedAt: entry.submittedAt,
     });
     return {
       entryId: entry.entryId,
@@ -899,8 +921,15 @@ export class FinalizationWorkerRecipient {
     readonly tokenId: string;
     readonly requestId: string;
     readonly ctx: RequestContext;
+    /**
+     * Persisted poll-loop deadline anchor (W26 cross-restart fix).
+     * Caller supplies `entry.submittedAt` (initialized to `createdAt`
+     * at queue-creation) so the §5.5 step 6 hard safety net survives
+     * worker crash/restart. See {@link processQueueEntry}.
+     */
+    readonly pollStartedAt: number;
   }): Promise<RequestOutcome> {
-    const startedAt = this.options.now();
+    const startedAt = args.pollStartedAt;
     const tokenSemaphore = this.options.getPerTokenSemaphore(args.tokenId);
     let attempts = 0;
     let proofErrorRetries = 0;
