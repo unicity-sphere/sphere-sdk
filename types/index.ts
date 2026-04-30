@@ -545,6 +545,7 @@ export type SphereEventType =
   | 'transfer:proof-superseded'
   | 'transfer:override-applied'
   | 'transfer:capability-warning'
+  | 'transfer:recovery-republished'
   | 'payment_request:incoming'
   | 'payment_request:accepted'
   | 'payment_request:rejected'
@@ -924,6 +925,34 @@ export interface SphereEventMap {
     readonly outboundWireProtocol: string;
     readonly mismatchedAssetKinds: ReadonlyArray<string>;
     readonly wireProtocolMismatch: boolean;
+  };
+  /**
+   * UXF Inter-Wallet Transfer Phase 8 steelman post-cutover —
+   * sending-recovery worker has re-published a stuck-in-`'sending'`
+   * outbox entry and successfully transitioned it forward.
+   *
+   * Fired by `SendingRecoveryWorker` (gated behind
+   * `features.recoveryWorker`) after a re-publish callback succeeded
+   * AND the §7.0 `sending → delivered{,-instant}` transition committed.
+   *
+   * Payload fields:
+   *  - `outboxId` — the outbox entry id whose status advanced.
+   *  - `bundleCid` — content-addressed bundle CID (preserved across
+   *    re-publish; the recipient's replay-LRU short-circuits dupes).
+   *  - `tokenIds` — the bundle's genesis token ids.
+   *  - `mode` — the entry's transfer mode (drives the target status).
+   *  - `targetStatus` — the §7.0 status the entry advanced to.
+   *  - `recoveredAt` — wall-clock ms timestamp of the recovery.
+   *
+   * Idempotent re-publish contract: §6.3 / T.3.A.
+   */
+  'transfer:recovery-republished': {
+    readonly outboxId: string;
+    readonly bundleCid: string;
+    readonly tokenIds: ReadonlyArray<string>;
+    readonly mode: 'conservative' | 'instant' | 'txf';
+    readonly targetStatus: 'delivered' | 'delivered-instant';
+    readonly recoveredAt: number;
   };
   'payment_request:incoming': IncomingPaymentRequest;
   'payment_request:accepted': IncomingPaymentRequest;
