@@ -851,12 +851,11 @@ export async function sendConservativeUxf(
     // -----------------------------------------------------------------
     result.status = 'submitted';
     try {
-      // The transport's TokenTransferPayload type is the legacy shape;
-      // the `unknown` cast is the documented bridge until T.2.E widens
-      // it to a tagged union (see plan §T.2.E).
+      // T.2.E widened TokenTransferPayload to UxfTransferPayload; pass
+      // the typed payload directly.
       await deps.transport.sendTokenTransfer(
         recipient.transportPubkey,
-        payload as unknown as TokenTransferPayload,
+        payload,
       );
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);

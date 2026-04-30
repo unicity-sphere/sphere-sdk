@@ -707,7 +707,7 @@ export async function sendTxfUxf(
       try {
         await deps.transport.sendTokenTransfer(
           recipient.transportPubkey,
-          payload as unknown as TokenTransferPayload,
+          payload,
         );
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);

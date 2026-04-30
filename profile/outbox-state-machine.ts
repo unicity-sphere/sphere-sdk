@@ -60,8 +60,8 @@
  *
  * If a future spec revision tightens the arc semantics (e.g. allow only
  * forward `legacy → uxf` once the migration is in flight), revisit this
- * module. TODO(W43): reconfirm against the final §7.B paragraph before T.6.D
- * lands.
+ * module. T.6.D landed both arcs as documented; the post-cutover follow-up
+ * may narrow this once the dual-write window closes.
  *
  * @module profile/outbox-state-machine
  *

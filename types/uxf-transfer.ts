@@ -270,6 +270,11 @@ export function isUxfTransferPayloadCar(value: unknown): value is UxfTransferPay
   if (value.mode !== 'conservative' && value.mode !== 'instant') return false;
   if (typeof value.bundleCid !== 'string' || value.bundleCid.length === 0) return false;
   if (!Array.isArray(value.tokenIds)) return false;
+  // Defense-in-depth: cap advisory tokenIds length to bound per-bundle
+  // memory during ingest. Mirrors `MAX_CLAIMED_TOKEN_IDS = 256` in
+  // `modules/payments/transfer/limits.ts` (kept literal here to keep
+  // `types/uxf-transfer.ts` a leaf module without an inward dep).
+  if (value.tokenIds.length > 256) return false;
   if (typeof value.carBase64 !== 'string') return false;
   return true;
 }
@@ -286,6 +291,8 @@ export function isUxfTransferPayloadCid(value: unknown): value is UxfTransferPay
   if (value.mode !== 'conservative' && value.mode !== 'instant') return false;
   if (typeof value.bundleCid !== 'string' || value.bundleCid.length === 0) return false;
   if (!Array.isArray(value.tokenIds)) return false;
+  // Defense-in-depth tokenIds cap; see `isUxfTransferPayloadCar`.
+  if (value.tokenIds.length > 256) return false;
   return true;
 }
 

@@ -72,6 +72,22 @@ export const MAX_FETCHED_CAR_BYTES = 32 * 1024 * 1024;
 export const MAX_UNCLAIMED_ROOTS = 16;
 
 /**
+ * Per-bundle cap on the size of `payload.tokenIds` (the advisory claimed
+ * tokens list, §3.1). Defends against a hostile sender shipping
+ * `tokenIds: [<10000+ entries>]` to balloon per-tokenId queue counters
+ * before the bundle reaches `MAX_UNCLAIMED_ROOTS` enforcement. Rejected
+ * structurally by the runtime guards (`isUxfTransferPayloadCar` /
+ * `isUxfTransferPayloadCid`) before the worker pool ever sees the
+ * payload — so the rejection surfaces as `BUNDLE_REJECTED_MALFORMED_
+ * ENVELOPE` rather than a queue-saturation event.
+ *
+ * Default 256 — comfortably above realistic transfer sizes (T.8.E.1's
+ * 100-token integration tests pass) while bounding worst-case memory
+ * during decode and pool counter mutation.
+ */
+export const MAX_CLAIMED_TOKEN_IDS = 256;
+
+/**
  * Per-token cap on unfinalized transactions in a chain. Claimed tokens
  * exceeding this depth reject the bundle entirely; smuggled roots exceeding
  * this depth are silently dropped. (§5.2 #3 two-tier rule.)

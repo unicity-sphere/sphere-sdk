@@ -85,6 +85,14 @@ export class PerTokenMutex {
    *   timeout; on timeout, the lock is released immediately and
    *   `LOCK_BOUNDED_HOLD_FIRED` is thrown.
    *
+   * **`'bounded-hold'` cancellation contract**: when the timeout fires,
+   * the original `fn()` continues running in the background and the
+   * NEXT caller acquires the lock. `fn` MUST therefore be cancellation-
+   * aware (e.g. honour an injected `AbortSignal`) OR idempotent under
+   * overlap, otherwise two concurrent `fn` bodies may execute against
+   * the same `tokenId`. The CAS-based path (default for §5.5 step 9)
+   * sidesteps this concern entirely.
+   *
    * @returns `fn`'s resolved value, OR rejects with whatever `fn`
    *   rejected with (or `LOCK_BOUNDED_HOLD_FIRED` for the bounded-hold
    *   timeout case).

@@ -96,6 +96,18 @@ export type ManifestCasResult =
 
 /**
  * Compare-and-swap helper over manifest entries.
+ *
+ * **CAS strength depends on the injected storage.** This class enforces
+ * the read-then-conditional-write protocol locally — but the swap is
+ * truly atomic only if the underlying `MinimalManifestStorage` raises
+ * `ManifestCasConcurrentModificationError` (or sets `__manifestCasConflict:
+ * true` on a thrown error) when its backend detects a write race between
+ * our read and our write. If the storage adapter is purely optimistic
+ * (last-writer-wins, no conflict detection), CAS reduces to last-write-
+ * wins and ultimate convergence relies on the §7.1 CRDT merger's Lamport
+ * tie-break in `outbox-merger`. The `ProfileTokenStorageProvider` /
+ * `OrbitDbAdapter` adapter T.5.C wires up SHOULD raise the typed error
+ * on log-replay conflict; verify when wiring.
  */
 export class ManifestCas {
   constructor(private readonly storage: MinimalManifestStorage) {}
