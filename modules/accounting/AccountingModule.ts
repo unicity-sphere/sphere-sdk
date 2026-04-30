@@ -4575,6 +4575,36 @@ export class AccountingModule {
             break; // one-for-one — remove only one synthetic per on-chain entry
           }
         }
+        // 2026-04-30 FIX (basic-roundtrip flake investigation):
+        // Also remove matching ORPHAN (mt:) entries. The orphan-buffer
+        // path writes `mt:${tokenId}:${transferId}` when a transport memo
+        // arrives BEFORE the on-chain rescan finds the same payment. The
+        // existing orphan-write-time dedup (line ~4944) skips writing
+        // an mt: entry IF an on-chain entry already exists, but the
+        // REVERSE direction (mt: written first, on-chain arrives later)
+        // had no cleanup — both entries persisted, causing double-
+        // attribution. Symptom in live e2e: payout invoice showed
+        // coveredAmount=20 (expected 10) with surplusAmount=10, gating
+        // verifyPayout's `allConfirmed` check forever because the mt:
+        // entry never gets `confirmed: true`.
+        //
+        // Match by tokenId prefix in the key — `mt:${tokenId}:*` — since
+        // the mt: key encodes the SAME tokenId we're now writing
+        // on-chain. coinId + direction are also matched as defense in
+        // depth (a wallet shouldn't have two different mt: entries for
+        // the same tokenId+coinId+direction, but defensive programming
+        // is cheap here).
+        const mtPrefix = `mt:${tokenId}:`;
+        for (const [existingKey, existingRef] of ledger) {
+          if (
+            existingKey.startsWith(mtPrefix) &&
+            existingRef.coinId === coinId &&
+            existingRef.paymentDirection === paymentDirection
+          ) {
+            keysToDelete.push(existingKey);
+            break; // one-for-one — remove only one mt: per on-chain entry
+          }
+        }
         for (const pKey of keysToDelete) {
           ledger.delete(pKey);
         }
