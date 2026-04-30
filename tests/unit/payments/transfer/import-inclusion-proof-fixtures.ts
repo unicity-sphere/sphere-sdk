@@ -21,6 +21,8 @@ import {
   type ImportableInclusionProof,
   type ProofVerifier,
 } from '../../../../modules/payments/transfer/import-inclusion-proof';
+import { PerTokenMutex } from '../../../../profile/per-token-mutex';
+import type { PerTokenMutexStrategy } from '../../../../profile/per-token-mutex';
 import {
   RevalidateCascadedRunner,
   type ChildRevalidationVerdict,
@@ -246,11 +248,39 @@ export interface ImporterHarness {
   readonly verifyCalls: ImportableInclusionProof[];
   readonly graftCalls: GraftCallRecord[];
   readonly overrideCalls: OverrideCallRecord[];
+  /**
+   * The per-tokenId mutex injected into the importer. Tests that need
+   * to assert serialization (concurrent `importInclusionProof` on the
+   * same `tokenId`) read the in-flight state via `mutex.isLocked` /
+   * `mutex.size` and select the strategy they want via the
+   * `mutexStrategy` builder option.
+   */
+  readonly mutex: PerTokenMutex;
 }
 
 export function buildImporterHarness(args: {
   readonly verifyResult?: ProofVerifyStatus;
   readonly verifyImpl?: ProofVerifier;
+  /**
+   * Optional pre-built mutex — caller sharing the mutex across multiple
+   * harnesses (e.g. recipient + importer in the same Sphere) provides
+   * one. Defaults to a fresh per-harness mutex.
+   */
+  readonly mutex?: PerTokenMutex;
+  /**
+   * Optional override of the mutex strategy. Default `'cas'` (matches
+   * production wiring per W34). Tests that want strict serialization
+   * to assert ordering pass `'rpc-release'` or `'bounded-hold'`.
+   */
+  readonly mutexStrategy?: PerTokenMutexStrategy;
+  /**
+   * Optional override of the verify callback's behaviour to allow
+   * tests to install a delay (e.g. via `vi.fakeTimers`) so the
+   * concurrency window for serialization assertions is observable.
+   * The wrapped fn is invoked AFTER `verifyResult` / `verifyImpl`
+   * resolve, before returning to the importer.
+   */
+  readonly verifyHook?: (proof: ImportableInclusionProof) => Promise<void>;
 } = {}): ImporterHarness {
   const manifest = makeFakeManifestStorage();
   const manifestStore = new ManifestStore({
@@ -265,16 +295,19 @@ export function buildImporterHarness(args: {
 
   const verifyDefault: ProofVerifier = async (proof) => {
     verifyCalls.push(proof);
+    if (args.verifyHook) await args.verifyHook(proof);
     return args.verifyResult ?? 'OK';
   };
   const verifyProof: ProofVerifier = args.verifyImpl
     ? async (p) => {
         verifyCalls.push(p);
+        if (args.verifyHook) await args.verifyHook(p);
         return args.verifyImpl!(p);
       }
     : verifyDefault;
 
   const recorders = makeRecorders();
+  const mutex = args.mutex ?? new PerTokenMutex();
 
   const opts: ImportInclusionProofOptions = {
     manifestStore,
@@ -285,6 +318,8 @@ export function buildImporterHarness(args: {
     overrideCallback: recorders.overrideCallback,
     emit: events.emit,
     now: () => 1700000000000,
+    perTokenMutex: mutex,
+    perTokenMutexStrategy: args.mutexStrategy ?? 'cas',
   };
 
   return {
@@ -297,6 +332,7 @@ export function buildImporterHarness(args: {
     verifyCalls,
     graftCalls: recorders.graftCalls,
     overrideCalls: recorders.overrideCalls,
+    mutex,
   };
 }
 

@@ -84,6 +84,10 @@ import {
   invalidKeyFor,
   type DispositionPerEntryStorage,
 } from '../../../profile/disposition-writer';
+import {
+  PerTokenMutex,
+  type PerTokenMutexStrategy,
+} from '../../../profile/per-token-mutex';
 import type { ProofVerifyStatus } from './proof-verifier';
 
 // =============================================================================
@@ -331,6 +335,34 @@ export interface ImportInclusionProofOptions {
   readonly emit: ImportProofEventEmitter;
   /** Wall-clock supplier. Default `Date.now`. Tests inject a deterministic clock. */
   readonly now?: () => number;
+  /**
+   * Per-tokenId mutex used to serialize concurrent
+   * `importInclusionProof()` invocations targeting the same `tokenId`.
+   * Without this, two operator overrides on the same tokenId race —
+   * both read state, both pass the case-5/6 split, both call
+   * `applyOverride`, corrupting the manifest's audit trail OR
+   * re-queuing duplicate entries.
+   *
+   * Defaults to a per-instance {@link PerTokenMutex} if omitted —
+   * production callers SHOULD share a single instance with the
+   * recipient/sender finalization workers so all paths that touch a
+   * tokenId serialize against the same mutex (matches the T.5.B / T.5.C
+   * wiring).
+   */
+  readonly perTokenMutex?: PerTokenMutex;
+  /**
+   * Strategy passed to `perTokenMutex.acquire`. Default `'cas'` (W34).
+   * The CAS strategy is the no-serialization pass-through — the mutex
+   * is used only for telemetry / inflight tracking; manifest-level
+   * mutual exclusion is provided by `ManifestCas` inside the override
+   * callback. Concurrent `importInclusionProof` calls on the same
+   * `tokenId` therefore still race against each other in the read-
+   * decide phase, but the write-phase CAS guarantees correctness.
+   * Callers that need strict serialization (e.g. operator UIs that
+   * want a single-flight guarantee) can pass `'rpc-release'` or
+   * `'bounded-hold'`.
+   */
+  readonly perTokenMutexStrategy?: PerTokenMutexStrategy;
 }
 
 /**
@@ -370,10 +402,19 @@ export interface ImportInclusionProofCallOptions {
 export class InclusionProofImporter {
   private readonly opts: ImportInclusionProofOptions;
   private readonly defaultNow: () => number;
+  private readonly perTokenMutex: PerTokenMutex;
+  private readonly perTokenMutexStrategy: PerTokenMutexStrategy;
 
   constructor(options: ImportInclusionProofOptions) {
     this.opts = options;
     this.defaultNow = options.now ?? (() => Date.now());
+    // Default to a fresh per-instance mutex so callers that don't
+    // share one with the finalization workers still get serialization
+    // for concurrent imports against the same instance. Production
+    // wiring SHOULD inject the same `PerTokenMutex` used by T.5.B /
+    // T.5.C so all paths touching a tokenId serialize together.
+    this.perTokenMutex = options.perTokenMutex ?? new PerTokenMutex();
+    this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'cas';
   }
 
   /**
@@ -389,6 +430,37 @@ export class InclusionProofImporter {
     tokenId: string,
     proof: ImportableInclusionProof,
     callOptions: ImportInclusionProofCallOptions = {},
+  ): Promise<ImportProofResult> {
+    // T.5.D steelman post-cutover: serialize the entire read-decide-write
+    // sequence under the per-tokenId mutex. Without this, two concurrent
+    // operator overrides on the same tokenId race — both read state, both
+    // pass case-5/6 split, both call `applyOverride`, corrupting the
+    // manifest's audit trail OR re-queuing duplicate entries. The default
+    // CAS strategy from T.1.F is the no-serialization pass-through —
+    // ManifestCas inside the override callback handles concurrent writes;
+    // the mutex is for telemetry / inflight tracking and gives callers
+    // who pass `'rpc-release'` / `'bounded-hold'` strict single-flight.
+    return this.perTokenMutex.acquire(
+      tokenId,
+      () => this._importInclusionProofUnderMutex(addr, tokenId, proof, callOptions),
+      { strategy: this.perTokenMutexStrategy },
+    );
+  }
+
+  /**
+   * @internal
+   *
+   * The full §6.3 case-walker, executed under the per-tokenId mutex
+   * (see {@link importInclusionProof}). All sub-cases (1, 2, 3, 4a, 4b,
+   * 5, 6, 7, 8, 9) read-decide-write inside this body so that two
+   * concurrent invocations on the same `tokenId` cannot interleave
+   * their decisions.
+   */
+  private async _importInclusionProofUnderMutex(
+    addr: string,
+    tokenId: string,
+    proof: ImportableInclusionProof,
+    callOptions: ImportInclusionProofCallOptions,
   ): Promise<ImportProofResult> {
     const allowInvalidOverride = callOptions.allowInvalidOverride === true;
     const now = callOptions.currentTime ?? this.defaultNow();
