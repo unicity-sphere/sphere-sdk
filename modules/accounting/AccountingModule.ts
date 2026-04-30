@@ -5619,6 +5619,33 @@ export class AccountingModule {
 
     // §6.2 step 4: Forward payment — index already updated by _processTokenTransactions above.
 
+    // 2026-04-30 FIX (verifyPayout reverse-index gap): populate tokenInvoiceMap
+    // BEFORE the closed-invoice early-return below. Without this, instant-mode
+    // payouts (split tokens, no on-chain TXF transactions) that arrive AFTER
+    // the invoice is already closed never get linked to the invoice in the
+    // reverse index — and SwapModule.verifyPayout's getTokenIdsForInvoice
+    // returns empty, triggering its fail-closed branch forever. The reverse
+    // index is a hygiene concern that must be maintained even on terminal
+    // invoices, since callers query it to verify post-close payouts.
+    {
+      let preCloseMutated = false;
+      for (const tok of transfer.tokens) {
+        if (!tok.id) continue;
+        if (!this.tokenInvoiceMap.has(tok.id)) {
+          this.tokenInvoiceMap.set(tok.id, new Set());
+          preCloseMutated = true;
+        }
+        const beforeSize = this.tokenInvoiceMap.get(tok.id)!.size;
+        this.tokenInvoiceMap.get(tok.id)!.add(invoiceId);
+        if (this.tokenInvoiceMap.get(tok.id)!.size !== beforeSize) {
+          preCloseMutated = true;
+        }
+      }
+      if (preCloseMutated) {
+        this.dirtyLedgerEntries.add(invoiceId);
+      }
+    }
+
     // §6.2 step 5: Terminal invoice — fire payment event but skip balance events
     if (this.cancelledInvoices.has(invoiceId) || this.closedInvoices.has(invoiceId)) {
       deps.emitEvent('invoice:payment', {
@@ -5899,6 +5926,27 @@ export class AccountingModule {
         }
       });
       return;
+    }
+
+    // 2026-04-30 FIX (verifyPayout reverse-index gap): symmetric fix to the
+    // one in _processInvoiceTransferEvent — populate tokenInvoiceMap BEFORE
+    // the closed-invoice early-return so instant-mode payouts arriving via
+    // history:updated also get linked to the payout invoice in the reverse
+    // index. See _processInvoiceTransferEvent fix for the full rationale.
+    if (entry.tokenId) {
+      let preCloseMutated = false;
+      if (!this.tokenInvoiceMap.has(entry.tokenId)) {
+        this.tokenInvoiceMap.set(entry.tokenId, new Set());
+        preCloseMutated = true;
+      }
+      const beforeSize = this.tokenInvoiceMap.get(entry.tokenId)!.size;
+      this.tokenInvoiceMap.get(entry.tokenId)!.add(invoiceId);
+      if (this.tokenInvoiceMap.get(entry.tokenId)!.size !== beforeSize) {
+        preCloseMutated = true;
+      }
+      if (preCloseMutated) {
+        this.dirtyLedgerEntries.add(invoiceId);
+      }
     }
 
     if (this.cancelledInvoices.has(invoiceId) || this.closedInvoices.has(invoiceId)) {
