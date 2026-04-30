@@ -829,53 +829,67 @@ function findBestTokenVersion(
 /**
  * UXF Inter-Wallet Transfer feature flags (T.2.D.1).
  *
- * Controls staged enablement of the UXF send/receive pipeline. Each
- * sub-flag defaults OFF (legacy path), and individual flags can be
- * flipped independently for surgical rollback. See `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md`
- * §1 "Feature flag config (replaces single boolean)".
+ * Controls staged enablement of the UXF send/receive pipeline. T.8.D
+ * part 1 of 2 (production cutover, this release) flipped every flag's
+ * default from `false` → `true`. Legacy paths remain available by
+ * passing explicit `features: { senderUxf: false, ... }`; legacy code
+ * removal is T.8.D part 2 of 2 (gated on testnet soak).
+ *
+ * Cross-version interop: a sender with `senderUxf: true` emits UXF v1.0
+ * wire shapes (`uxf-cid` / `uxf-car`); a receiver running an older SDK
+ * without UXF ingest can NOT decode them. Pin a shared SDK version
+ * across senders/receivers during the transition, OR set the relevant
+ * flag(s) to `false` explicitly to preserve the legacy path.
+ *
+ * See `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` §1 "Feature flag config" and
+ * §T.8.D production cutover.
  */
 export interface UxfTransferFeatures {
-  /** T.2.D.1 — when `true` AND `transferMode === 'conservative'`, route
-   *  the send through the UXF wire-format orchestrator. Default `false`
-   *  (legacy single-token TXF path). */
+  /** T.2.D.1 / T.5.A — when `true` (default), route conservative-mode
+   *  AND instant-mode (the public default) sends through the UXF
+   *  wire-format orchestrators. Set `false` to fall through to the
+   *  legacy single-token TXF path (rollback escape hatch). */
   readonly senderUxf?: boolean;
   /**
-   * Phase 8 steelman post-cutover — when `true`, instantiate and start
-   * `SendingRecoveryWorker` in {@link PaymentsModule.initialize}; stop
-   * it in {@link PaymentsModule.destroy}. The worker periodically
+   * Phase 8 steelman post-cutover — when `true` (default), instantiate
+   * and start `SendingRecoveryWorker` in {@link PaymentsModule.initialize};
+   * stop it in {@link PaymentsModule.destroy}. The worker periodically
    * re-publishes outbox entries left in `'sending'` after a crash
    * between OrbitDB commit and Nostr publish ack (closes the gap
    * documented in `conservative-sender.ts` lines 212 / 886 / 903).
    *
-   * Default `false` — the worker requires an injected republish hook
-   * the bootstrap layer wires explicitly. Existing tests are
-   * unaffected; integration / soak environments flip this on after
-   * staging the hook.
+   * The worker is a no-op until a republish hook is injected by the
+   * bootstrap layer (`installSendingRecoveryRepublishHook`); the flag
+   * does NOT itself drive any send traffic. Set `false` to suppress
+   * worker installation entirely (e.g. for unit tests that count timers).
    */
   readonly recoveryWorker?: boolean;
   /**
-   * T.3.E — when `true`, route incoming UXF v1.0 bundles (`kind` of
-   * `'uxf-car'` or `'uxf-cid'`) through the {@link IngestWorkerPool}
-   * (§5.0 N parallel workers + W7 per-tokenId fairness +
-   * W23 bundle-internal sequential). Default `false` (legacy
-   * single-threaded `handleIncomingTransfer` path). Legacy V4/V5/V6
-   * shapes (no `kind` field) bypass the pool regardless of this flag —
-   * they remain on the legacy adapter path.
+   * T.3.E — when `true` (default), route incoming UXF v1.0 bundles
+   * (`kind` of `'uxf-car'` or `'uxf-cid'`) through the
+   * {@link IngestWorkerPool} (§5.0 N parallel workers + W7 per-tokenId
+   * fairness + W23 bundle-internal sequential). Set `false` to fall
+   * back to the legacy single-threaded `handleIncomingTransfer` path.
+   * Legacy V4/V5/V6 shapes (no `kind` field) bypass the pool regardless
+   * of this flag — they remain on the legacy adapter path.
    */
   readonly recipientUxf?: boolean;
   /**
-   * T.7.B — when `true` AND a legacy-shape adapter has been installed
-   * via {@link installLegacyShapeAdapter}, every inbound legacy event
-   * (Sphere TXF, V6 `COMBINED_TRANSFER`, V5/V4 `INSTANT_SPLIT`, SDK
-   * legacy `{token, proof}`) is decomposed into N synthetic
-   * disposition records and written through the T.3.C disposition
-   * writer alongside the existing legacy storage path. Instant-TXF
-   * arrivals (any tx with `inclusionProof: null`) are enqueued on the
-   * recipient finalization queue (T.5.C) — same chain-mode semantics
-   * as instant-UXF.
+   * T.7.B — when `true` (default) AND a legacy-shape adapter has been
+   * installed via {@link installLegacyShapeAdapter}, every inbound
+   * legacy event (Sphere TXF, V6 `COMBINED_TRANSFER`, V5/V4
+   * `INSTANT_SPLIT`, SDK legacy `{token, proof}`) is decomposed into N
+   * synthetic disposition records and written through the T.3.C
+   * disposition writer alongside the existing legacy storage path.
+   * Instant-TXF arrivals (any tx with `inclusionProof: null`) are
+   * enqueued on the recipient finalization queue (T.5.C) — same
+   * chain-mode semantics as instant-UXF.
    *
-   * Default `false` (legacy storage only — no OrbitDB profile writes
-   * for legacy events). Independent of {@link recipientUxf}: a wallet
+   * Default-ON is REQUIRED for cross-version interop with senders that
+   * still emit legacy wire shapes (i.e. anyone who has not yet upgraded
+   * to T.8.D-cutover SDK). Set `false` only if you are confident no
+   * peer can send legacy shapes (legacy storage path still runs as a
+   * fallback regardless). Independent of {@link recipientUxf}: a wallet
    * MAY enable UXF v1.0 ingest without legacy adaptation, or vice
    * versa. See §10.2 single-pipeline convergence guarantee.
    */
@@ -934,7 +948,9 @@ export interface PaymentsModuleConfig {
   debug?: boolean;
   /** L1 (ALPHA blockchain) configuration. Set to null to explicitly disable L1. */
   l1?: L1PaymentsModuleConfig | null;
-  /** UXF Inter-Wallet Transfer feature flags. Default: all OFF. */
+  /** UXF Inter-Wallet Transfer feature flags. Default: all ON
+   *  (T.8.D part 1 of 2). Pass explicit `false` per-flag to fall back
+   *  to the legacy code path for that surface. */
   features?: UxfTransferFeatures;
 }
 
@@ -995,9 +1011,11 @@ export class PaymentsModule {
   private readonly moduleConfig: Omit<Required<PaymentsModuleConfig>, 'l1' | 'features'>;
   /**
    * UXF Inter-Wallet Transfer feature flags (T.2.D.1).
-   * Frozen at construction time. Defaults: every flag OFF — `senderUxf=false`
-   * means `send()` falls through to the legacy single-token TXF path
-   * regardless of `transferMode`.
+   * Frozen at construction time. Defaults (T.8.D part 1 of 2): every flag
+   * ON — `senderUxf=true` makes `send({transferMode:'instant'})` route
+   * through the UXF instant-sender; legacy paths remain available by
+   * passing explicit `features: { senderUxf: false, ... }`. Legacy
+   * removal is T.8.D part 2 of 2 (gated on testnet soak).
    */
   private readonly features: Required<UxfTransferFeatures>;
   private deps: PaymentsModuleDependencies | null = null;
@@ -1128,15 +1146,43 @@ export class PaymentsModule {
       debug: config?.debug ?? false,
     };
 
-    // T.2.D.1 — feature flags (default OFF). Frozen so accidental mutation
-    // can't enable the UXF arm at runtime (rollback safety).
+    // T.8.D part 1 of 2 — UXF feature flags now default ON (production
+    // cutover, no legacy code path removal). The four flags moved from
+    // default-OFF → default-ON in this release; legacy paths remain
+    // available by passing explicit `features: { senderUxf: false, ... }`
+    // and will be removed in T.8.D part 2 of 2 after testnet soak.
+    //
+    // Cross-version interop caveat: a sender with `senderUxf: true` emits
+    // UXF v1.0 wire shapes (`uxf-cid` / `uxf-car`); a receiver running an
+    // older SDK without UXF ingest will not be able to decode them. Pin a
+    // shared SDK version across senders/receivers during the transition,
+    // OR set `senderUxf: false` explicitly to preserve legacy wire-shape
+    // emission. See `docs/uxf/UXF-TRANSFER-IMPL-PLAN.md` §T.8.D.
+    //
+    // Frozen so accidental mutation can't toggle behavior at runtime.
     this.features = Object.freeze({
-      senderUxf: config?.features?.senderUxf ?? false,
-      recipientUxf: config?.features?.recipientUxf ?? false,
-      // T.7.B — legacy-shape adapter routing flag (default OFF).
-      recipientLegacyAdapter: config?.features?.recipientLegacyAdapter ?? false,
-      // Phase 8 steelman post-cutover — sending-recovery worker (default OFF).
-      recoveryWorker: config?.features?.recoveryWorker ?? false,
+      // T.5.A — instant-mode UXF sender. Default-ON: `payments.send({})`
+      // (or `transferMode: 'instant'`) routes through the new UXF
+      // instant-sender, emitting a `uxf-cid` bundle by default.
+      senderUxf: config?.features?.senderUxf ?? true,
+      // T.3.E — recipient-side ingest worker pool. Default-ON: incoming
+      // UXF v1.0 bundles (`kind: 'uxf-car' | 'uxf-cid'`) enqueue onto the
+      // bounded pool. Legacy V4/V5/V6/`{token,proof}` shapes still
+      // bypass the pool regardless of this flag.
+      recipientUxf: config?.features?.recipientUxf ?? true,
+      // T.7.B — legacy-shape adapter routing flag. Default-ON for
+      // cross-version interop with old senders: inbound legacy events
+      // (Sphere TXF / V6 / V5 / SDK legacy) are decomposed into
+      // `DispositionRecord` synthetic entries and routed through the
+      // T.3.C disposition writer. MUST stay ON if any peer in the
+      // transition window emits legacy wire shapes.
+      recipientLegacyAdapter: config?.features?.recipientLegacyAdapter ?? true,
+      // Phase 8 steelman post-cutover — sending-recovery worker.
+      // Default-ON: catches outbox entries stuck in `'sending'` after a
+      // crash between OrbitDB commit and Nostr publish ack and re-publishes
+      // them idempotently. The worker still no-ops until a republish hook
+      // is wired by the bootstrap layer.
+      recoveryWorker: config?.features?.recoveryWorker ?? true,
     });
 
     // Initialize L1 sub-module by default (L1PaymentsModule has default electrumUrl).
@@ -1300,11 +1346,12 @@ export class PaymentsModule {
 
     // Phase 8 steelman post-cutover — start the sending-recovery worker
     // when both (a) the gate is on AND (b) a worker has been installed
-    // by the bootstrap layer. Default `features.recoveryWorker = false`
-    // makes this a no-op for existing tests / consumers; flipping the
-    // flag without installing a worker is also a no-op (forensic warning
-    // omitted intentionally — the bootstrap is the single install point
-    // and a missing install is a deployment-config bug, not a hot path).
+    // by the bootstrap layer. After T.8.D part 1 of 2 the gate defaults
+    // to `true`; the start is still no-op when no worker is installed
+    // (forensic warning omitted intentionally — the bootstrap is the
+    // single install point and a missing install is a deployment-config
+    // bug, not a hot path). Tests that count timers can opt out via
+    // `features: { recoveryWorker: false }`.
     if (this.features.recoveryWorker && this.sendingRecoveryWorker !== null) {
       this.sendingRecoveryWorker.start();
     }

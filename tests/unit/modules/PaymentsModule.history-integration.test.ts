@@ -379,7 +379,16 @@ function setupModule(senderNametag?: string): TestContext {
     emitEvent: vi.fn(),
   };
 
-  const module = createPaymentsModule({ debug: false });
+  // T.8.D part 1 of 2 — UXF flags now default-ON. This suite mocks the
+  // legacy V6 send pipeline (TokenSplitCalculator, addToHistory bypass);
+  // routing through the new UXF sender would skip those mocks and fail
+  // on `validateTargets` against an empty live source pool. Pin the
+  // legacy path explicitly so the SENT-history-entry assertions still
+  // hold against the V6 wire shape.
+  const module = createPaymentsModule({
+    debug: false,
+    features: { senderUxf: false },
+  });
   module.initialize(deps);
 
   return { module, deps, historyStore, transport };
