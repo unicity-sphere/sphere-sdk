@@ -83,6 +83,7 @@ import {
   getBackoffMs,
   MIN_POLL_ATTEMPTS,
 } from './polling-policy';
+import { getAggregatorSemaphore } from './aggregator-semaphores';
 import {
   performManifestCidRewrite,
   type FinalizationQueueAdapter,
@@ -447,10 +448,16 @@ export interface FinalizationWorkerSenderOptions {
   /** Finalization queue adapter (§5.5 step 5 step 4). */
   readonly queue: FinalizationQueueAdapter;
   /**
-   * Per-aggregator semaphore (W14, default 16). Caller-shared so
-   * multiple workers can share the budget across the SDK.
+   * Per-aggregator semaphore (W14, default 16). Optional — when omitted,
+   * the worker falls back to the process-global registry in
+   * {@link getAggregatorSemaphore} keyed on `aggregatorId`. Tests
+   * inject explicit semaphores for deterministic isolation; production
+   * MUST omit this field so the cap is enforced process-globally
+   * (otherwise a multi-Sphere-instance client trivially bypasses W14
+   * — see steelman post-cutover note in
+   * `aggregator-semaphores.ts`).
    */
-  readonly perAggregatorSemaphore: Semaphore;
+  readonly perAggregatorSemaphore?: Semaphore;
   /**
    * Factory for per-tokenId semaphores. Worker calls
    * `getPerTokenSemaphore(tokenId)` and uses the returned semaphore
@@ -651,7 +658,15 @@ export class FinalizationWorkerSender {
     }
 
     this.options = options;
-    this.perAggregatorSemaphore = options.perAggregatorSemaphore;
+    this.aggregatorId = options.aggregatorId ?? 'default';
+    // W14 steelman post-cutover: if the caller didn't inject a
+    // semaphore, consume from the process-global registry keyed on
+    // `aggregatorId`. Per-Sphere-instance semaphores trivially bypass
+    // the cap when a client spins up multiple Sphere objects against
+    // the same aggregator.
+    this.perAggregatorSemaphore =
+      options.perAggregatorSemaphore ??
+      getAggregatorSemaphore(this.aggregatorId);
     this.perAggregator =
       options.caps?.perAggregator ?? MAX_CONCURRENT_POLLS_PER_AGGREGATOR;
     this.perToken =
@@ -662,7 +677,6 @@ export class FinalizationWorkerSender {
       options.caps?.pollingWindowMs ?? POLLING_WINDOW_MS;
     this.perTokenMutexStrategy =
       options.perTokenMutexStrategy ?? 'cas';
-    this.aggregatorId = options.aggregatorId ?? 'default';
     this.trustBaseStaleness = options.trustBaseStaleness;
 
     if (
@@ -774,6 +788,31 @@ export class FinalizationWorkerSender {
       }));
     }
 
+    // W26 cross-restart persistence (steelman post-cutover fix). The
+    // poll-loop deadline anchor MUST survive crash/restart — otherwise
+    // the worker re-enters with `startedAt = now()` on every restart,
+    // resetting the 60-min hard safety net. A token stuck PENDING
+    // across many restarts would poll indefinitely, voiding §5.5
+    // step 6's W26 termination guarantee.
+    //
+    // Stamp `pollStartedAt` ONCE on first poll-loop entry. Subsequent
+    // passes (including post-restart) read the persisted value and
+    // pass it to {@link isPollingTimedOut} as the deadline anchor.
+    // Mutator runs under the outbox writer's self-loop guard
+    // (status unchanged → state-machine validator skipped), so the
+    // write is safe at any `finalizing` lamport.
+    if (working.pollStartedAt === undefined) {
+      working = await this.options.outbox.update(working.id, (prev) => ({
+        ...prev,
+        pollStartedAt: prev.pollStartedAt ?? this.options.now(),
+        updatedAt: this.options.now(),
+      }));
+    }
+    // Type-narrow for the per-requestId loop. `pollStartedAt` is
+    // guaranteed by the stamp above.
+    const persistedPollStartedAt =
+      working.pollStartedAt ?? this.options.now();
+
     // Step 2: process each outstanding requestId. The §6.1 spec
     // permits per-token parallelism bounded by
     // `MAX_CONCURRENT_POLLS_PER_TOKEN`; the per-aggregator semaphore
@@ -810,6 +849,7 @@ export class FinalizationWorkerSender {
           recipientTransportPubkey: working.recipientTransportPubkey,
           tokenId: primaryTokenId,
           requestId,
+          pollStartedAt: persistedPollStartedAt,
         }).then((outcome) => ({ requestId, outcome })),
       ),
     );
@@ -933,6 +973,14 @@ export class FinalizationWorkerSender {
     readonly recipientTransportPubkey: string;
     readonly tokenId: string;
     readonly requestId: string;
+    /**
+     * Persisted poll-loop deadline anchor (W26 cross-restart fix).
+     * Caller stamps this on the entry's first poll iteration via
+     * `outbox.update()`; subsequent calls (including post-restart)
+     * pass the persisted value so the W26 hard safety net is a
+     * SURVIVING wall-clock deadline, not a fresh-from-now() one.
+     */
+    readonly pollStartedAt: number;
   }): Promise<RequestOutcome> {
     const { outboxId, tokenId, requestId } = args;
     const ctxResolved = await this.options.resolver.resolve({
@@ -954,8 +1002,12 @@ export class FinalizationWorkerSender {
     const submitResult = await this.runSubmitPhase(args);
     if (submitResult.kind === 'hard-fail') return submitResult;
 
-    // Poll phase.
-    const startedAt = this.options.now();
+    // Poll phase. W26 cross-restart fix (steelman post-cutover): the
+    // deadline anchor is the PERSISTED `pollStartedAt` from the outbox
+    // entry, NOT a fresh `now()`. Otherwise a token stuck PENDING
+    // across many restarts polls indefinitely with a fresh 60-min
+    // window each time, voiding §5.5 step 6's W26 guarantee.
+    const startedAt = args.pollStartedAt;
     const tokenSemaphore = this.options.getPerTokenSemaphore(tokenId);
     let attempts = 0;
     let proofErrorRetries = 0;
