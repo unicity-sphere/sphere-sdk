@@ -22,13 +22,27 @@
  * are fetched, deserialized from CAR, and merged into a single UxfPackage
  * before reassembling into TxfStorageDataBase format.
  *
+ * **Internal architecture (Phase 8 facade refactor):** the implementation is
+ * split into four sub-modules under `profile/profile-token-storage/`:
+ *   - `LifecycleManager` — connect / disconnect / initialize / shutdown,
+ *     plus cold-start recovery (aggregator pointer + IPNS migration).
+ *   - `FlushScheduler` — debounced write-behind buffer + IPFS publish.
+ *   - `BundleIndex` — `listBundles`, `addBundle`, `shouldConsolidate`,
+ *     `refreshKnownBundles` over the `tokens.bundle.*` namespace.
+ *   - `HistoryStore` — the five `*HistoryEntry` / `*History` methods.
+ *
+ * The class below is a **thin facade** that owns the shared state, holds
+ * one instance of each sub-module, and delegates each public method to
+ * the appropriate sub-module. The public API (and private field names
+ * tests reach into via `as any`, e.g. `initialized`, `encryptionKey`,
+ * `_ipfsGateways`) is byte-identical to the pre-refactor version.
+ *
  * @see PROFILE-ARCHITECTURE.md Section 2.3 (Multi-Bundle Model)
  * @see PROFILE-ARCHITECTURE.md Section 5.3 (Token Storage Flow)
  * @module profile/profile-token-storage-provider
  */
 
 import { logger } from '../core/logger.js';
-import { hexToBytes } from '../core/hex.js';
 import type { ProviderStatus, FullIdentity } from '../types/index.js';
 import type {
   TokenStorageProvider,
@@ -49,18 +63,14 @@ import type {
   StorageProvider,
 } from '../storage/storage-provider.js';
 import {
-  type UxfBundleRef,
   type ProfileTokenStorageProviderOptions,
-  computeAddressId,
 } from './types.js';
 import type { ProfileDatabase } from './orbitdb-adapter.js';
-import { ProfileError } from './errors.js';
 import {
   encryptProfileValue,
   decryptProfileValue,
-  deriveProfileEncryptionKey,
 } from './encryption.js';
-import { pinToIpfs, fetchFromIpfs } from './ipfs-client.js';
+import { fetchFromIpfs } from './ipfs-client.js';
 import {
   deriveSentFromArchived,
   deriveHistoryFromArchived,
@@ -70,79 +80,22 @@ import {
   deriveStructuralManifest,
   type TokenManifest,
 } from './token-manifest.js';
-import { buildLocalEntry, decodeEntry } from './oplog-entry.js';
-import { CID } from 'multiformats/cid';
-
-/**
- * Pointer-layer error codes that indicate a permanent integrity /
- * configuration problem. These MUST be surfaced to the user rather
- * than silently swallowed — either the wallet is poisoned (marker
- * corrupt, streak of corrupt versions), the aggregator rotated its
- * trust base (SDK upgrade needed), the wallet was rejected (v-burn
- * that will never succeed again), or we hit an integrity-class
- * failure (untrusted proof, security origin mismatch).
- *
- * Unknown / missing codes default to TRANSIENT (see
- * `isPermanentPointerError`) — "keep running and retry" is safer
- * than "break the wallet" when classification is ambiguous.
- */
-const PERMANENT_POINTER_ERROR_CODES: ReadonlySet<string> = new Set([
-  'AGGREGATOR_POINTER_UNREACHABLE_RECOVERY_BLOCKED',
-  'AGGREGATOR_POINTER_REJECTED',
-  'AGGREGATOR_POINTER_UNTRUSTED_PROOF',
-  'AGGREGATOR_POINTER_TRUST_BASE_STALE',
-  'AGGREGATOR_POINTER_MARKER_CORRUPT',
-  'AGGREGATOR_POINTER_CORRUPT_STREAK',
-  'AGGREGATOR_POINTER_AGGREGATOR_REJECTED',
-  'SECURITY_ORIGIN_MISMATCH',
-  'AGGREGATOR_POINTER_CAPABILITY_DENIED',
-  'AGGREGATOR_POINTER_UNSUPPORTED_RUNTIME',
-  'AGGREGATOR_POINTER_PROTOCOL_ERROR',
-]);
+import {
+  BundleIndex,
+  BUNDLE_KEY_PREFIX,
+  FlushScheduler,
+  HistoryStore,
+  LifecycleManager,
+  type OperationalState,
+  type ProfileTokenStorageHost,
+} from './profile-token-storage/index.js';
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-/** OrbitDB key prefix for UXF bundle references. */
-const BUNDLE_KEY_PREFIX = 'tokens.bundle.';
-
 /** Default write-behind debounce interval in milliseconds. */
 const DEFAULT_FLUSH_DEBOUNCE_MS = 2000;
-
-/** Threshold for logging a consolidation warning. */
-const CONSOLIDATION_WARNING_THRESHOLD = 3;
-
-// =============================================================================
-// Operational State Shape
-// =============================================================================
-
-/**
- * Operational state extracted from TxfStorageDataBase.
- * These fields are stored as separate OrbitDB keys rather than
- * inside the UXF bundle.
- */
-interface OperationalState {
-  tombstones: TxfTombstone[];
-  outbox: TxfOutboxEntry[];
-  sent: TxfSentEntry[];
-  invalid: TxfInvalidEntry[];
-  history: HistoryRecord[];
-  mintOutbox: unknown[];
-  invalidatedNametags: unknown[];
-  /**
-   * Audit collection (T.0.G7-fill-gaps) — structurally-valid-but-
-   * unspendable tokens. Persisted via the per-entry-key writer under
-   * `${addr}.audit.<id>` keys. The `id` is treated as opaque; T.1.E
-   * narrows it to `${tokenId}.${observedTokenContentHash}`.
-   */
-  audit: TxfAuditEntry[];
-  /**
-   * Finalization queue (T.0.G7-fill-gaps) — pending chain-mode
-   * finalizations. Persisted under `${addr}.finalizationQueue.<id>`.
-   */
-  finalizationQueue: TxfFinalizationQueueEntry[];
-}
 
 // =============================================================================
 // ProfileTokenStorageProvider
@@ -222,6 +175,12 @@ export class ProfileTokenStorageProvider
   // so we don't attempt the delete on every save.
   private legacyKeysCleaned = false;
 
+  // --- Sub-modules (Phase 8 facade refactor) ---
+  private readonly bundleIndex: BundleIndex;
+  private readonly historyStore: HistoryStore;
+  private readonly lifecycleManager: LifecycleManager;
+  private readonly flushScheduler: FlushScheduler;
+
   constructor(
     private readonly db: ProfileDatabase,
     encryptionKey: Uint8Array | null,
@@ -240,6 +199,119 @@ export class ProfileTokenStorageProvider
     if (encryptionKey) {
       this.encryptionKey = encryptionKey;
     }
+
+    // Wire sub-modules. The host adapter exposes the facade's mutable
+    // state through getter/setter methods so each seam can read /
+    // write the source of truth without an `as any` escape hatch.
+    const host = this.makeHost();
+    this.bundleIndex = new BundleIndex(host);
+    this.historyStore = new HistoryStore(host);
+    this.lifecycleManager = new LifecycleManager(host, this.bundleIndex);
+    this.flushScheduler = new FlushScheduler(host, this.bundleIndex, this.lifecycleManager);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Host adapter — exposes facade-private state to the sub-modules.
+  //
+  // Every getter/setter mutates a field on `this` so the facade remains
+  // the single source of truth. Tests reach into `(provider as any).
+  // initialized` / `(provider as any).encryptionKey` directly; those
+  // field names live here unchanged.
+  // ---------------------------------------------------------------------------
+
+  private makeHost(): ProfileTokenStorageHost {
+    // Arrow functions capture the enclosing `this`, so all delegations
+    // route back to the facade without a `bind()` per call.  The
+    // `readonly` slots on the interface are immutable-by-construction
+    // (db / ipfsGateways / options / localCache / flushDebounceMs /
+    // eventCallbacks never change after construction), so we read them
+    // once here and snapshot — no need for live getters.
+    return {
+      db: this.db,
+      ipfsGateways: this._ipfsGateways,
+      options: this.options,
+      localCache: this.localCache,
+      flushDebounceMs: this.flushDebounceMs,
+      eventCallbacks: this.eventCallbacks,
+      // Lifecycle state
+      getStatus: () => this.status,
+      setStatus: (s) => {
+        this.status = s;
+      },
+      getInitialized: () => this.initialized,
+      setInitialized: (b) => {
+        this.initialized = b;
+      },
+      getIsShuttingDown: () => this.isShuttingDown,
+      setIsShuttingDown: (b) => {
+        this.isShuttingDown = b;
+      },
+      getIdentity: () => this.identity,
+      setIdentityState: (id) => {
+        this.identity = id;
+      },
+      getEncryptionKey: () => this.encryptionKey,
+      setEncryptionKey: (k) => {
+        this.encryptionKey = k;
+      },
+      getComputedAddressId: () => this.addressId,
+      setComputedAddressId: (id) => {
+        this.addressId = id;
+      },
+      getReplicationUnsub: () => this.replicationUnsub,
+      setReplicationUnsub: (fn) => {
+        this.replicationUnsub = fn;
+      },
+      // Flush state
+      getPendingData: () => this.pendingData,
+      setPendingData: (d) => {
+        this.pendingData = d;
+      },
+      getFlushTimer: () => this.flushTimer,
+      setFlushTimer: (t) => {
+        this.flushTimer = t;
+      },
+      getFlushPromise: () => this.flushPromise,
+      setFlushPromise: (p) => {
+        this.flushPromise = p;
+      },
+      getLastPinnedCid: () => this.lastPinnedCid,
+      setLastPinnedCid: (c) => {
+        this.lastPinnedCid = c;
+      },
+      // Bundle index state
+      getKnownBundleCids: () => this.knownBundleCids,
+      setKnownBundleCids: (s) => {
+        this.knownBundleCids = s;
+      },
+      // Last-loaded snapshot
+      getLastLoadedData: () => this.lastLoadedData,
+      setLastLoadedData: (d) => {
+        this.lastLoadedData = d;
+      },
+      getLastTokenManifest: () => this.lastTokenManifest,
+      setLastTokenManifest: (m) => {
+        this.lastTokenManifest = m;
+      },
+      // Address-scoped key prefix
+      getAddressId: () => this.getAddressId(),
+      // Logging / events
+      log: (msg) => this.log(msg),
+      emitEvent: (e) => this.emitEvent(e),
+      buildErrorEvent: (type, err, code) => this.buildErrorEvent(type, err, code),
+      // OrbitDB key helpers
+      writeProfileKey: (key, value) => this.writeProfileKey(key, value),
+      readProfileKey: (key) => this.readProfileKey(key),
+      readProfileKeyJson: (key) => this.readProfileKeyJson(key),
+      // Flush coordination
+      flushToIpfs: () => this.flushScheduler.flushToIpfs(),
+      // TXF adapter helpers
+      extractTokensFromTxfData: (data) => this.extractTokensFromTxfData(data),
+      extractOperationalState: (data) => this.extractOperationalState(data),
+      // Operational state persistence
+      writeOrbitOperationalState: (opState) => this.writeOrbitOperationalState(opState),
+      writeLocalDerivedCache: (opState) => this.writeLocalDerivedCache(opState),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -267,22 +339,7 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   setIdentity(identity: FullIdentity): void {
-    this.identity = identity;
-
-    // Derive encryption key from the private key if not already provided
-    if (!this.encryptionKey) {
-      try {
-        const privKeyBytes = hexToBytes(identity.privateKey);
-        this.encryptionKey = deriveProfileEncryptionKey(privKeyBytes);
-      } catch (err) {
-        this.log(`Failed to derive encryption key: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    // Compute the short address ID for per-address key scoping
-    if (identity.directAddress) {
-      this.addressId = computeAddressId(identity.directAddress);
-    }
+    this.lifecycleManager.setIdentity(identity);
   }
 
   // ---------------------------------------------------------------------------
@@ -290,120 +347,11 @@ export class ProfileTokenStorageProvider
   // ---------------------------------------------------------------------------
 
   async initialize(): Promise<boolean> {
-    if (this.initialized) return true;
-
-    if (!this.identity) {
-      this.log('Cannot initialize: no identity set');
-      return false;
-    }
-
-    this.status = 'connecting';
-
-    try {
-      // Ensure OrbitDB is connected
-      if (!this.db.isConnected()) {
-        this.log('OrbitDB not connected; skipping bundle load until connected');
-        this.status = 'connected';
-        this.initialized = true;
-        return true;
-      }
-
-      // Load known bundle CIDs from OrbitDB
-      await this.refreshKnownBundles();
-
-      // COLD-START RECOVERY: if OrbitDB has no bundles locally, this
-      // is likely a fresh device (wallet re-imported from mnemonic
-      // after a wipe). Rebuild the active bundle set without waiting
-      // for a live peer.
-      //
-      // Priority (T-D6 / T-D6b):
-      //   (1) aggregator pointer layer — authoritative source of
-      //       truth. On a successful recoverLatest the CID is
-      //       trust-verified via inclusion proof + CAR content-
-      //       address verify. Lands as a new bundle ref that the
-      //       next JOIN pass assembles.
-      //   (2) one-shot legacy IPNS → pointer migration. Only fires
-      //       if the local cache carries a legacy `profile.ipns.
-      //       sequence` key and no `profile.pointer.migration.done`
-      //       marker. Reads the legacy IPNS snapshot ONE TIME,
-      //       hydrates the bundle set into OrbitDB, and stamps the
-      //       marker so subsequent loads go straight to the pointer
-      //       path. New wallets (no IPNS history) skip this entirely.
-      if (this.knownBundleCids.size === 0) {
-        const pointerRecovered = await this.recoverFromAggregatorPointerBestEffort();
-        if (!pointerRecovered) {
-          await this.runLegacyIpnsMigrationBestEffort();
-        }
-      }
-
-      // Subscribe to OrbitDB replication events for real-time sync
-      this.replicationUnsub = this.db.onReplication(() => {
-        this.handleReplication().catch((err) => {
-          this.log(`Replication handler error: ${err instanceof Error ? err.message : String(err)}`);
-        });
-      });
-
-      this.status = 'connected';
-      this.initialized = true;
-      this.log(`Initialized with ${this.knownBundleCids.size} known bundle(s)`);
-      return true;
-    } catch (err) {
-      this.status = 'error';
-      this.log(`Initialization failed: ${err instanceof Error ? err.message : String(err)}`);
-      return false;
-    }
+    return this.lifecycleManager.initialize(() => this.handleReplication());
   }
 
   async shutdown(): Promise<void> {
-    if (this.isShuttingDown) return;
-    this.isShuttingDown = true;
-
-    // Cancel debounce timer
-    if (this.flushTimer !== null) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-
-    // Steelman³⁸ warning: AWAIT any in-flight flush BEFORE issuing a
-    // direct flushToIpfs(). The previous order spawned two concurrent
-    // flushes; lastPinnedCid interleaved across them and the retry-cache
-    // invariant ("pinned CID matches currently flushed bytes") was
-    // violated.
-    if (this.flushPromise) {
-      try {
-        await this.flushPromise;
-      } catch {
-        // best-effort
-      }
-    }
-
-    // Flush any pending writes (after the in-flight flush settled)
-    if (this.pendingData) {
-      try {
-        await this.flushToIpfs();
-      } catch (err) {
-        this.log(`Shutdown flush failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-
-    // Steelman³⁸ warning: unsubscribe from replication BEFORE we null
-    // out the cache, so any in-flight onReplication handler that was
-    // about to read this.lastLoadedData / lastTokenManifest sees its
-    // pre-shutdown value rather than null mid-method.
-    if (this.replicationUnsub) {
-      this.replicationUnsub();
-      this.replicationUnsub = null;
-    }
-
-    // Steelman³⁸ warning: drop in-memory snapshots so a consumer that
-    // retains a reference to this provider doesn't pin the entire
-    // token graph forever.  Mirrors what `clear()` does (line 700).
-    this.lastLoadedData = null;
-    this.lastTokenManifest = null;
-
-    this.initialized = false;
-    this.status = 'disconnected';
-    this.isShuttingDown = false;
+    await this.lifecycleManager.shutdown();
   }
 
   // ---------------------------------------------------------------------------
@@ -428,20 +376,10 @@ export class ProfileTokenStorageProvider
 
     this.emitEvent({ type: 'storage:saving', timestamp });
 
-    // Any new save() invalidates the lastPinnedCid retry cache
-    // unconditionally. A reference-identity check is insufficient: a
-    // caller that mutates the same object in place and re-calls save()
-    // would otherwise leave a stale CID pinned. The only safe policy
-    // is "fresh save → re-pin from scratch". The tiny cost (one extra
-    // pin on legitimate retries with identical content) is worth the
-    // correctness guarantee that the pinned CID always matches the
-    // currently flushed bytes.
-    this.lastPinnedCid = null;
-    this.pendingData = data;
+    // Track lastLoadedData here on the facade so subsequent load()
+    // calls return the in-flight data without an OrbitDB round-trip.
     this.lastLoadedData = data;
-
-    // Schedule debounced flush
-    this.scheduleFlush();
+    this.flushScheduler.enqueueSave(data);
 
     this.emitEvent({ type: 'storage:saved', timestamp, data: { debounced: true } });
 
@@ -491,7 +429,7 @@ export class ProfileTokenStorageProvider
 
     try {
       // 1. List all active bundles from OrbitDB
-      const activeBundles = await this.listActiveBundles();
+      const activeBundles = await this.bundleIndex.listActiveBundles();
 
       if (activeBundles.size === 0) {
         // No bundles -- return empty data
@@ -616,7 +554,7 @@ export class ProfileTokenStorageProvider
     try {
       // Refresh bundle list from OrbitDB
       const previousCids = new Set(this.knownBundleCids);
-      await this.refreshKnownBundles();
+      await this.bundleIndex.refreshKnownBundles();
 
       // Determine new and removed bundles
       const newCids: string[] = [];
@@ -783,651 +721,66 @@ export class ProfileTokenStorageProvider
   }
 
   // ---------------------------------------------------------------------------
-  // History operations
+  // History operations — delegated to HistoryStore
   // ---------------------------------------------------------------------------
 
   async addHistoryEntry(entry: HistoryRecord): Promise<void> {
-    const entries = await this.getHistoryEntries();
-
-    // Upsert by dedupKey
-    const existingIdx = entries.findIndex((e) => e.dedupKey === entry.dedupKey);
-    if (existingIdx >= 0) {
-      entries[existingIdx] = entry;
-    } else {
-      entries.push(entry);
-    }
-
-    // Sort by timestamp descending
-    entries.sort((a, b) => b.timestamp - a.timestamp);
-
-    await this.writeProfileKey(
-      `${this.getAddressId()}.transactionHistory`,
-      JSON.stringify(entries),
-    );
+    return this.historyStore.addHistoryEntry(entry);
   }
 
   async getHistoryEntries(): Promise<HistoryRecord[]> {
-    const raw = await this.readProfileKey(`${this.getAddressId()}.transactionHistory`);
-    if (!raw) return [];
-    try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
+    return this.historyStore.getHistoryEntries();
   }
 
   async hasHistoryEntry(dedupKey: string): Promise<boolean> {
-    const entries = await this.getHistoryEntries();
-    return entries.some((e) => e.dedupKey === dedupKey);
+    return this.historyStore.hasHistoryEntry(dedupKey);
   }
 
   async clearHistory(): Promise<void> {
-    try {
-      await this.db.del(`${this.getAddressId()}.transactionHistory`);
-    } catch {
-      // best-effort
-    }
+    return this.historyStore.clearHistory();
   }
 
   async importHistoryEntries(entries: HistoryRecord[]): Promise<number> {
-    const existing = await this.getHistoryEntries();
-    const existingKeys = new Set(existing.map((e) => e.dedupKey));
-    let imported = 0;
-
-    for (const entry of entries) {
-      if (!existingKeys.has(entry.dedupKey)) {
-        existing.push(entry);
-        existingKeys.add(entry.dedupKey);
-        imported++;
-      }
-    }
-
-    if (imported > 0) {
-      existing.sort((a, b) => b.timestamp - a.timestamp);
-      await this.writeProfileKey(
-        `${this.getAddressId()}.transactionHistory`,
-        JSON.stringify(existing),
-      );
-    }
-
-    return imported;
+    return this.historyStore.importHistoryEntries(entries);
   }
 
   // ===========================================================================
-  // Private: Write-behind buffer
+  // Private: BundleIndex back-channels (preserved for tests that reach into
+  // the facade via `(provider as unknown as { addBundle: ... }).addBundle`).
+  //
+  // These shims preserve the pre-refactor private surface byte-for-byte —
+  // the facade keeps the same private method names, with the implementation
+  // delegated to `BundleIndex`. SDK consumers MUST go through the public
+  // API; these are documented as test-only back-channels.
   // ===========================================================================
 
-  private scheduleFlush(): void {
-    if (this.isShuttingDown) return;
-
-    // Clear any existing timer
-    if (this.flushTimer !== null) {
-      clearTimeout(this.flushTimer);
-    }
-
-    // Set new debounced timer
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = null;
-      // Steelman³⁸ warning: identity-check the finally clear so an older
-      // flush settling AFTER a newer one was scheduled doesn't clobber
-      // the in-flight `flushPromise`. Without the identity check, a
-      // subsequent load() reading `if (this.flushPromise)` would see
-      // null while the new flush is still running, and read a stale
-      // snapshot.
-      //
-      // Steelman⁴⁶ ordering note: `this.flushPromise = myFlush` MUST
-      // be observable before the `.finally` runs, otherwise the
-      // identity check would compare against an out-of-date reference.
-      // JS semantics guarantee this (sync code in this setTimeout
-      // callback completes before any microtask), but the previous
-      // arrangement built the .finally chain before the assignment
-      // — making the dependency implicit. We now use an outer Promise
-      // box that the .finally consults, which makes the invariant
-      // explicit and immune to future refactors that might reorder
-      // the chain build.
-      const flushBox: { ref: Promise<void> | null } = { ref: null };
-      const myFlush: Promise<void> = this.flushToIpfs()
-        .catch((err) => {
-          this.log(`Flush failed: ${err instanceof Error ? err.message : String(err)}`);
-          this.emitEvent(this.buildErrorEvent('storage:error', err));
-        })
-        .finally(() => {
-          // Compare against the boxed reference assigned after the
-          // chain is built — this fires AFTER the assignment below
-          // because .finally is microtask-deferred.
-          if (this.flushPromise === flushBox.ref) {
-            this.flushPromise = null;
-          }
-        });
-      flushBox.ref = myFlush;
-      this.flushPromise = myFlush;
-    }, this.flushDebounceMs);
+  private async addBundle(
+    cid: string,
+    ref: import('./types.js').UxfBundleRef,
+  ): Promise<void> {
+    return this.bundleIndex.addBundle(cid, ref);
   }
 
-  private async flushToIpfs(): Promise<void> {
-    const data = this.pendingData;
-    if (!data || !this.encryptionKey) return;
-
-    // Snapshot and clear pending to avoid re-flushing the same data.
-    //
-    // Steelman⁴³ critical: identity-check before clearing. A concurrent
-    // save() between the capture above and this clear would set
-    // this.pendingData to NEWER data; an unconditional `= null` would
-    // clobber the new save and permanently lose its content. With the
-    // identity check, the new pendingData stays for the next flush.
-    if (this.pendingData === data) {
-      this.pendingData = null;
-    }
-
-    try {
-      // 1. Extract tokens and operational state
-      const tokens = this.extractTokensFromTxfData(data);
-      const opState = this.extractOperationalState(data);
-
-      // 2. Build UXF package
-      const { UxfPackage } = await import('../uxf/UxfPackage.js');
-      const pkg = UxfPackage.create();
-
-      // Ingest all token objects
-      const tokenValues = [...tokens.values()];
-      if (tokenValues.length > 0) {
-        pkg.ingestAll(tokenValues);
-      }
-
-      // 3. Export to CAR (unencrypted — see class doc)
-      const carBytes = await pkg.toCar();
-
-      // 4. Pin to IPFS (reuse last pinned CID on retry to avoid duplicate pins)
-      //
-      // Steelman⁴⁴ warning: re-validate the cached CID still represents
-      // the CURRENT bundle state before reuse. A sibling instance may
-      // have already pinned a superseding bundle; reusing the stale CID
-      // would leave a redundant ref in OrbitDB. Cross-instance check:
-      // if a NEWER bundle already exists for this address, abandon the
-      // cached CID and pin fresh.
-      let cid: string;
-      let useCachedCid = this.lastPinnedCid !== null;
-      if (useCachedCid) {
-        try {
-          const activeBundles = await this.listActiveBundles();
-          if (!activeBundles.has(this.lastPinnedCid!)) {
-            // Our cached CID is no longer active (superseded by another
-            // instance's pin or by consolidation). Re-pin from scratch.
-            useCachedCid = false;
-            this.lastPinnedCid = null;
-          }
-        } catch {
-          // Best-effort — if we can't validate, fall through to using
-          // the cached value. The OrbitDB write will reconcile via
-          // CRDT merge.
-        }
-      }
-      if (useCachedCid && this.lastPinnedCid) {
-        cid = this.lastPinnedCid;
-      } else {
-        cid = await pinToIpfs(this._ipfsGateways, carBytes);
-        this.lastPinnedCid = cid;
-      }
-
-      // 6. Write bundle ref to OrbitDB
-      const bundleRef: UxfBundleRef = {
-        cid,
-        status: 'active',
-        createdAt: Math.floor(Date.now() / 1000),
-        tokenCount: tokens.size,
-      };
-      await this.addBundle(cid, bundleRef);
-
-      // 7. Write operational state:
-      //    - synced portion to OrbitDB (outbox, mintOutbox, etc.)
-      //    - derived portion to local cache (tombstones, sent, history)
-      // The derived-cache write is best-effort. A failure is surfaced
-      // via storage:error AND via the boolean return; we log here so
-      // flush telemetry records it alongside the CID.
-      await this.writeOrbitOperationalState(opState);
-      const derivedOk = await this.writeLocalDerivedCache(opState);
-      if (!derivedOk) {
-        this.log(`Derived-cache write failed; next load will rebuild from pool`);
-      }
-
-      // Clear the pinned CID tracker after successful OrbitDB write
-      this.lastPinnedCid = null;
-
-      // 8. Check consolidation
-      // Steelman³⁸ warning: actually invoke the consolidation engine
-      // (it already exists at profile/consolidation.ts) instead of
-      // logging "deferred to Phase 2" forever. Bundle count grew
-      // unboundedly across daemon lifetime with the previous warn-only
-      // behavior; load latency degraded O(1)→O(N).
-      //
-      // Best-effort: failures are caught and logged but do not block
-      // the flush. The consolidation engine has its own concurrent-
-      // guard (consolidation.pending key) so multi-device races are
-      // safe.
-      //
-      // Steelman⁴⁰ warning: SKIP consolidation when shutdown is in
-      // progress. Consolidation does multiple unbounded IPFS round-trips
-      // (fetch + pin) which would block shutdown for minutes per N
-      // bundles. Without this gate, F.43's shutdown-await-flushPromise
-      // could hold up to (N × per-gateway timeout) before completing.
-      if (this.isShuttingDown) {
-        this.log('Consolidation skipped: shutdown in progress');
-      } else if (await this.shouldConsolidate()) {
-        try {
-          const { ConsolidationEngine } = await import('./consolidation.js');
-          const engine = new ConsolidationEngine(
-            this.db,
-            this.encryptionKey!,
-            this._ipfsGateways,
-          );
-          if (!(await engine.isConsolidationInProgress())) {
-            const result = await engine.consolidate();
-            if (result.consolidated) {
-              this.log(
-                `Consolidation: merged ${result.sourceBundleCount} bundles → ${result.consolidatedCid ?? 'n/a'}`,
-              );
-            } else {
-              this.log('Consolidation skipped (engine no-op)');
-            }
-          } else {
-            this.log('Consolidation skipped: another device is in progress');
-          }
-        } catch (err) {
-          // Best-effort: do not fail the flush on consolidation error.
-          this.log(
-            `Consolidation failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      }
-
-      // 9. Publish to the pointer layer for cold-start recovery.
-      //    Best-effort: the CAR is already pinned and the OrbitDB
-      //    bundle ref is already written, so a failed publish only
-      //    delays cold-start recovery for this flush — subsequent
-      //    flushes retry. IPNS is no longer published (T-D6c) —
-      //    the one-shot migration reader is the only remaining
-      //    legacy touchpoint and it's read-only.
-      await this.publishAggregatorPointerBestEffort(cid);
-
-      this.emitEvent({
-        type: 'storage:saved',
-        timestamp: Date.now(),
-        data: { cid, tokenCount: tokens.size },
-      });
-    } catch (err) {
-      // On failure, re-queue the data so it is not lost
-      if (!this.pendingData) {
-        this.pendingData = data;
-      }
-      throw err;
-    }
+  private async listBundles(): Promise<Map<string, import('./types.js').UxfBundleRef>> {
+    return this.bundleIndex.listBundles();
   }
 
-  // ===========================================================================
-  // Private: Bundle management (WU-P07 inlined)
-  // ===========================================================================
-
-  /**
-   * List all bundle refs from OrbitDB, filtered to active status.
-   */
-  private async listActiveBundles(): Promise<Map<string, UxfBundleRef>> {
-    const allBundles = await this.listBundles();
-    const active = new Map<string, UxfBundleRef>();
-    for (const [cid, ref] of allBundles) {
-      if (ref.status === 'active') {
-        active.set(cid, ref);
-      }
-    }
-    return active;
+  private async listActiveBundles(): Promise<
+    Map<string, import('./types.js').UxfBundleRef>
+  > {
+    return this.bundleIndex.listActiveBundles();
   }
 
-  /**
-   * List all bundle refs from OrbitDB (all statuses).
-   *
-   * Bundle refs are written as system-stamped envelopes by
-   * `addBundle` (T-D11). Legacy wallets may have raw-bytes entries
-   * (pre-envelope writes) — we detect those by attempting the
-   * structured decode first, falling back to treating the stored
-   * bytes as the encrypted payload directly. On the fallback path
-   * the entry acts as a `v=0` legacy entry under the oplog-schema
-   * contract (synthetic `originated='system'` at read time via the
-   * adapter's legacy-wrapping).
-   */
-  private async listBundles(): Promise<Map<string, UxfBundleRef>> {
-    const rawEntries = await this.db.all(BUNDLE_KEY_PREFIX);
-    const result = new Map<string, UxfBundleRef>();
-
-    // Steelman⁴⁰ warning: aggregate corrupt-bundle events into a single
-    // emit so wholesale corruption (key drift after restore-from-backup,
-    // etc.) doesn't flood the consumer with N events for N bundles.
-    const corruptCids: string[] = [];
-    let firstCorruptError: unknown = null;
-
-    for (const [key, value] of rawEntries) {
-      const cid = key.slice(BUNDLE_KEY_PREFIX.length);
-      try {
-        // Extract the encrypted payload from either a stamped
-        // envelope (new path, T-D11) or the raw bytes (legacy). A
-        // successful envelope decode whose `v===1` wins; anything
-        // else — decode throws, or `v===0` legacy sentinel — falls
-        // through to treating `value` as the raw encrypted payload.
-        let encryptedPayload: Uint8Array = value;
-        try {
-          const envelope = decodeEntry(value);
-          if (envelope.v === 1) {
-            encryptedPayload = envelope.payload;
-          }
-        } catch {
-          // Not an envelope — raw-bytes legacy write. Use `value`
-          // directly.
-        }
-
-        const decrypted = this.encryptionKey
-          ? await decryptProfileValue(this.encryptionKey, encryptedPayload)
-          : encryptedPayload;
-        const ref = JSON.parse(new TextDecoder().decode(decrypted)) as UxfBundleRef;
-        result.set(cid, ref);
-      } catch (err) {
-        // Steelman³⁸/⁴⁰: log per-bundle but AGGREGATE the events into a
-        // single emit at the end of the loop so wholesale corruption
-        // doesn't flood the UI with N banners for N bundles.
-        this.log(`Failed to deserialize bundle ref for ${cid}: ${err instanceof Error ? err.message : String(err)}`);
-        corruptCids.push(cid);
-        if (firstCorruptError === null) firstCorruptError = err;
-      }
-    }
-
-    if (corruptCids.length > 0) {
-      const ev = this.buildErrorEvent('storage:error', firstCorruptError, 'CID_REF_CORRUPT');
-      // Steelman⁴¹ note: cap the inline-listed CIDs at 100 entries.
-      // For wholesale corruption (1000+ bundles) the unbounded list
-      // could bloat downstream loggers and JSON serialization. The
-      // `count` field is always exact; `truncated` flags when the
-      // list was clipped.
-      const CORRUPT_CIDS_PREVIEW_CAP = 100;
-      const truncated = corruptCids.length > CORRUPT_CIDS_PREVIEW_CAP;
-      this.emitEvent({
-        ...ev,
-        data: {
-          corruptCids: truncated ? corruptCids.slice(0, CORRUPT_CIDS_PREVIEW_CAP) : corruptCids,
-          truncated,
-          count: corruptCids.length,
-        },
-      });
-    }
-
-    return result;
-  }
-
-  /**
-   * Write a bundle ref to OrbitDB under a system-stamped envelope
-   * (T-D11 W11). Bundle events are system-generated cache-index
-   * writes; they are NOT user-actions (they reflect a token-pool
-   * flush produced by the wallet itself, not a user intent to
-   * commit tokens). Stamping `originated='system'` means peers
-   * replicating the ref see it as a replicated system event after
-   * the orbitdb-adapter's read-time downgrade, not a forged user
-   * action.
-   *
-   * If the underlying adapter lacks `putEntry` (very old code paths
-   * or test stubs), fall back to `db.put` of raw encrypted bytes —
-   * readers auto-wrap raw writes as legacy entries (`v=0`, synthetic
-   * `type='cache_index'`, `originated='system'`), so the semantic
-   * outcome is identical and replication remains safe.
-   */
-  private async addBundle(cid: string, ref: UxfBundleRef): Promise<void> {
-    const serialized = new TextEncoder().encode(JSON.stringify(ref));
-    const encryptedPayload = this.encryptionKey
-      ? await encryptProfileValue(this.encryptionKey, serialized)
-      : serialized;
-
-    const key = BUNDLE_KEY_PREFIX + cid;
-    if (typeof this.db.putEntry === 'function') {
-      const envelope = buildLocalEntry({
-        type: 'cache_index',
-        originated: 'system',
-        payload: encryptedPayload,
-      });
-      await this.db.putEntry(key, envelope);
-    } else {
-      await this.db.put(key, encryptedPayload);
-      // Mark locally-authored on the fallback path too, so any
-      // downstream `getEntry` consumer that consults
-      // `localAuthoredKeys` sees this write as local rather than
-      // force-downgrading it to 'replicated'. Mirrors the
-      // convention in profile/profile-storage-provider.ts:writeEnvelope.
-      const markHook = (this.db as { markLocallyAuthored?: (k: string) => void }).markLocallyAuthored;
-      if (typeof markHook === 'function') {
-        markHook.call(this.db, key);
-      }
-    }
-    this.knownBundleCids.add(cid);
-  }
-
-  /**
-   * Check if the number of active bundles exceeds the consolidation threshold.
-   * Logs a warning but does NOT perform consolidation (deferred to Phase 2).
-   */
-  private async shouldConsolidate(): Promise<boolean> {
-    const active = await this.listActiveBundles();
-    return active.size > CONSOLIDATION_WARNING_THRESHOLD;
-  }
-
-  /**
-   * Refresh the local set of known bundle CIDs from OrbitDB.
-   */
   private async refreshKnownBundles(): Promise<void> {
-    const bundles = await this.listActiveBundles();
-    this.knownBundleCids = new Set(bundles.keys());
+    return this.bundleIndex.refreshKnownBundles();
+  }
+
+  private async shouldConsolidate(): Promise<boolean> {
+    return this.bundleIndex.shouldConsolidate();
   }
 
   // ===========================================================================
-  // Private: aggregator pointer layer (cold-start recovery — primary channel)
-  // ===========================================================================
-
-  /**
-   * Classify a pointer-layer error as TRANSIENT (retry on next flush
-   * / cold-start, no user action needed) or PERMANENT (user / operator
-   * must intervene — wallet state is poisoned or aggregator rotation
-   * requires SDK update). Used to decide whether to silently swallow
-   * the error or surface it via a `storage:error` event.
-   *
-   * Non-exhaustive — unknown codes default to TRANSIENT on the premise
-   * that "keep running and retry" is safer than "break the wallet".
-   * Add to PERMANENT_POINTER_ERROR_CODES below when a new permanent
-   * failure mode is introduced.
-   */
-  private isPermanentPointerError(err: unknown): boolean {
-    if (!err || typeof err !== 'object') return false;
-    const code = (err as { code?: unknown }).code;
-    if (typeof code !== 'string') return false;
-    return PERMANENT_POINTER_ERROR_CODES.has(code);
-  }
-
-  /**
-   * Publish the just-flushed CID to the aggregator pointer layer.
-   *
-   * TRANSIENT failures (NETWORK_ERROR, CAR_UNAVAILABLE, PUBLISH_BUSY,
-   * CONFLICT, RETRY_EXHAUSTED, CAR_*_TIMEOUT, CAR_TOO_LARGE,
-   * CAR_UNEXPECTED_ENCODING) are silently logged — the CAR is already
-   * pinned and the OrbitDB bundle ref is already written, so the
-   * next flush can retry the publish.
-   *
-   * PERMANENT failures (UNREACHABLE_RECOVERY_BLOCKED, REJECTED,
-   * UNTRUSTED_PROOF, TRUST_BASE_STALE, MARKER_CORRUPT, CORRUPT_STREAK,
-   * SECURITY_ORIGIN_MISMATCH, CAPABILITY_DENIED, UNSUPPORTED_RUNTIME,
-   * PROTOCOL_ERROR, AGGREGATOR_REJECTED) are surfaced via a
-   * `storage:error` event with the error code in the payload. The UI
-   * can then prompt the user (upgrade SDK on TRUST_BASE_STALE, enter
-   * recovery on UNREACHABLE_RECOVERY_BLOCKED, etc.). Without this
-   * surface, permanent failures are retried forever on every flush —
-   * accumulating CAR pins (cost) and OrbitDB refs (bloat) with no
-   * anchor.
-   *
-   * Semantic note: `cidProducer` returns the SAME CID on retry — we
-   * are anchoring THIS flush's bundle. If a publish-conflict triggers
-   * `fetchAndJoin`, the remote bundle is merged as a separate ref and
-   * our CID still anchors our local contribution at the next version.
-   */
-  private async publishAggregatorPointerBestEffort(cidString: string): Promise<void> {
-    const pointer = this._options?.getPointerLayer?.() ?? null;
-    if (!pointer) return;
-
-    try {
-      const cidBytes = CID.parse(cidString).bytes;
-      const result = await pointer.publish(async () => cidBytes);
-      this.log(
-        `Pointer publish ok: cid=${cidString} version=${result.version} attempts=${result.attemptsUsed}`,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (this.isPermanentPointerError(err)) {
-        const code = (err as { code?: string }).code ?? 'UNKNOWN';
-        this.log(`Pointer publish PERMANENT failure (${code}): ${msg}`);
-        // Steelman⁴⁰ warning: route through buildErrorEvent so the
-        // typed `code` is preserved as a structured event field, not
-        // just interpolated into the string message.
-        this.emitEvent(this.buildErrorEvent('storage:error', err));
-      } else {
-        this.log(`Pointer publish failed (transient, best-effort): ${msg}`);
-      }
-    }
-  }
-
-  /**
-   * Try to rebuild the local bundle set from the aggregator pointer
-   * layer's last valid CID. Returns `true` iff a bundle ref was
-   * recorded (caller should skip the IPNS fallback). Returns `false`
-   * when the pointer has no anchor yet or transiently failed — the
-   * caller falls through to IPNS.
-   *
-   * PERMANENT failures (TRUST_BASE_STALE, UNTRUSTED_PROOF,
-   * SECURITY_ORIGIN_MISMATCH, PROTOCOL_ERROR, UNSUPPORTED_RUNTIME,
-   * UNREACHABLE_RECOVERY_BLOCKED) indicate integrity problems — a
-   * silent fallthrough to IPNS would be a downgrade attack surface.
-   * These are surfaced via `storage:error` AND return `true` so the
-   * IPNS fallback does NOT fire. The bundle set may be empty; the
-   * next flush can seed fresh anchors once the operator has fixed
-   * the underlying problem.
-   *
-   * Content-address verify: `recoverLatest()` internally goes through
-   * discovery → classifyVersion (which fetches + verifies the CAR
-   * hash) → resolveRemoteCid. By the time we have the CID bytes here
-   * they have been trust-verified end-to-end.
-   */
-  private async recoverFromAggregatorPointerBestEffort(): Promise<boolean> {
-    const pointer = this._options?.getPointerLayer?.() ?? null;
-    if (!pointer) return false;
-
-    let recovered: { readonly cid: Uint8Array; readonly version: number } | null;
-    try {
-      recovered = await pointer.recoverLatest();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (this.isPermanentPointerError(err)) {
-        const code = (err as { code?: string }).code ?? 'UNKNOWN';
-        this.log(`Pointer recover PERMANENT failure (${code}): ${msg}`);
-        // Steelman⁴⁰ warning: route through buildErrorEvent.
-        this.emitEvent(this.buildErrorEvent('storage:error', err));
-        // Do NOT fall through to IPNS on permanent integrity
-        // failures — return true so the IPNS path is skipped.
-        return true;
-      }
-      this.log(`Pointer recover failed (transient, best-effort): ${msg}`);
-      return false;
-    }
-
-    if (!recovered) {
-      this.log('Pointer recover: no anchor published yet');
-      return false;
-    }
-
-    try {
-      const cidString = CID.decode(recovered.cid).toString();
-      // Idempotent: if the bundle already exists locally, this is a
-      // no-op. Token count is unknown from the pointer alone — the
-      // next flush re-counts.
-      await this.addBundle(cidString, {
-        cid: cidString,
-        status: 'active',
-        createdAt: Math.floor(Date.now() / 1000),
-      });
-      this.log(
-        `Pointer recover ok: cid=${cidString} version=${recovered.version}`,
-      );
-      // recoverLatest() succeeded and we certified the pointer
-      // anchor. Even if addBundle failed transiently (handled via
-      // the throw path below), the pointer layer has successfully
-      // identified this wallet's state — IPNS fallback would only
-      // add noise. Return true on success; throw on addBundle error.
-      return true;
-    } catch (err) {
-      // A post-recoverLatest error (most likely addBundle / OrbitDB
-      // write failure). Treat as transient — the next flush /
-      // reconnect will retry and the pointer anchor is already known
-      // to be VALID. Fall back to IPNS? No: pointer already certified
-      // the anchor; IPNS can only return something less trusted.
-      const msg = err instanceof Error ? err.message : String(err);
-      this.log(`Pointer recover: addBundle failed post-recover: ${msg}`);
-      return true;
-    }
-  }
-
-  // ===========================================================================
-  // Private: one-shot IPNS → pointer migration (T-D6b)
-  // ===========================================================================
-
-  /**
-   * Run the legacy IPNS → pointer migration if the wallet pre-dates
-   * the pointer layer. No-op for fresh wallets or wallets that have
-   * already migrated. Never throws — any failure logs and returns,
-   * leaving subsequent flushes to seed the anchor via the pointer
-   * layer directly.
-   *
-   * See profile/migration/ipns-reader.ts for the legacy detection
-   * heuristic and the one-shot orchestrator. This wrapper binds the
-   * migration's `onBundle` callback to `this.addBundle` so the
-   * imported refs respect the provider's encryption conventions.
-   */
-  private async runLegacyIpnsMigrationBestEffort(): Promise<void> {
-    if (!this.identity || this._ipfsGateways.length === 0) return;
-    if (!this.localCache) return;
-
-    try {
-      const { runIpnsToPointerMigration } = await import(
-        './migration/ipns-reader.js'
-      );
-      const result = await runIpnsToPointerMigration({
-        localCache: {
-          get: (k) => this.localCache!.get(k),
-          set: (k, v) => this.localCache!.set(k, v),
-        },
-        privateKeyHex: this.identity.privateKey,
-        gateways: this._ipfsGateways,
-        onBundle: async (cid, ref) => this.addBundle(cid, ref),
-        log: (msg) => this.log(msg),
-      });
-      if (result.migrated) {
-        this.log(
-          `Legacy IPNS → pointer migration: imported ${result.bundlesImported} bundles`,
-        );
-      } else if (result.skipped === 'not-legacy') {
-        // Fresh install post-pointer — expected silent no-op.
-      } else {
-        this.log(
-          `Legacy migration skipped: ${result.skipped ?? 'transient-failure'}`,
-        );
-      }
-    } catch (err) {
-      this.log(
-        `Legacy IPNS migration threw: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
-
-  // ===========================================================================
-  // Private: TXF adapter (WU-P08 inlined)
+  // Private: TXF adapter (extract / build)
   // ===========================================================================
 
   /**
@@ -1877,57 +1230,8 @@ export class ProfileTokenStorageProvider
    * @deprecated kept only to allow reverting the per-entry path if
    * we hit unforeseen production issues. Not on any active code path.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private async writeOrbitOperationalStateSingleBlob(opState: OperationalState): Promise<void> {
     const addr = this.getAddressId();
-    // Steelman⁴³ critical: each of these arrays is stored under a single
-    // OrbitDB key as a serialized whole. OrbitDB key-value is LWW per key;
-    // two processes both flushing concurrently would silently drop one
-    // process's appends. Mitigate by READING the current OrbitDB value,
-    // MERGING with our local view by primary key (idempotent union for
-    // adds), and writing the merge result. Removals are handled by the
-    // tombstone-based mechanisms already present in the SDK; this code
-    // path only reconciles ADDITIONS, which is the common multi-process
-    // race (daemon + CLI both adding outbox entries).
-    //
-    // Wave G.7 deferred item rationale: a "per-entry-key" refactor
-    // (storing each outbox/invalid/mintOutbox entry under its own
-    // OrbitDB key like `${addr}.outbox.${id}`) would gain native CRDT
-    // semantics — two processes adding different entries would never
-    // conflict at the OrbitDB layer. However, the present read-merge-
-    // write + bounded retry + verify-read + per-op timeout combination
-    // (F.43, F.46, F.47, F.49) already addresses the practical
-    // same-machine multi-process race, and OrbitDB's OpLog already
-    // provides cross-device CRDT semantics via causal ordering. The
-    // refactor would be: (1) change readOperationalState to a key-
-    // prefix scan, (2) change the write path to per-entry puts, (3)
-    // add explicit tombstones for removals (OrbitDB has no native
-    // delete CRDT), (4) migrate existing single-blob data on load.
-    // Net cost is high; correctness benefit is marginal given the
-    // existing mitigations. Documented as accepted-residual until
-    // production telemetry proves otherwise.
-    //
-    // Steelman⁴⁶ WARNING: read-merge-write is still racy across processes
-    // — between our read and the for-loop write, a sibling process can
-    // complete its own RMW cycle, and our subsequent write clobbers
-    // their merge. A pure CAS via OrbitDB OpLog op-ids is unavailable
-    // through the KV abstraction we use. As a practical mitigation,
-    // we wrap the RMW in a bounded retry loop: after writing, re-read
-    // each merged key and check that our locally-known primary keys
-    // are present in the remote state. If divergence is detected
-    // (sibling process clobbered our merge), redo the merge against
-    // the freshly-observed remote and retry up to MAX_RMW_RETRIES.
-    //
-    // Steelman⁴⁷ MEDIUM: bound the retry loop with a wall-clock
-    // budget. Each retry can hit slow OrbitDB+IPFS roundtrips; on
-    // degraded networks the 3 retries can occupy the flush hot path
-    // for tens of seconds, blocking shutdown drain. After the budget
-    // expires, log and surface a `storage:error` event so callers
-    // know convergence was incomplete (the previous "outbox rebuild
-    // on next load" reassurance was incorrect — the loader rebuilds
-    // tombstones/sent/history but reads outbox/invalid/mintOutbox
-    // directly from OrbitDB, so a clobbered entry IS lost until
-    // the originating flow re-adds it via a fresh save).
     const MAX_RMW_RETRIES = 3;
     const RMW_WALL_CLOCK_BUDGET_MS = 10_000;
     const rmwStart = Date.now();
@@ -1938,7 +1242,6 @@ export class ProfileTokenStorageProvider
 
     let attempt = 0;
     while (attempt <= MAX_RMW_RETRIES) {
-      // Steelman⁴⁷: wall-clock guard.
       if (Date.now() - rmwStart > RMW_WALL_CLOCK_BUDGET_MS) {
         this.log(
           `writeOrbitOperationalState: wall-clock budget ${RMW_WALL_CLOCK_BUDGET_MS}ms exceeded ` +
@@ -1952,13 +1255,6 @@ export class ProfileTokenStorageProvider
         );
         return;
       }
-      // Steelman⁴⁹ WARNING: per-op timeouts so a single hung
-      // OrbitDB read/write cannot blow past the wall-clock budget
-      // unobserved. The first iteration runs unconditionally (the
-      // top-of-loop budget check passes at Date.now()===rmwStart),
-      // so without this race a hung readOperationalState would never
-      // surface to the budget guard. Each I/O is raced against the
-      // remaining budget so total runtime stays within bound.
       const remainingBudget = (): number =>
         Math.max(0, RMW_WALL_CLOCK_BUDGET_MS - (Date.now() - rmwStart));
       const raceWithBudget = async <T>(p: Promise<T>, label: string): Promise<T> => {
@@ -1980,12 +1276,6 @@ export class ProfileTokenStorageProvider
           return await Promise.race([p, timeout]);
         } finally {
           if (timer !== undefined) clearTimeout(timer);
-          // Steelman⁵⁰/⁵¹: if timeout won the race, the underlying
-          // `p` may still be pending and could eventually reject —
-          // attaching a no-op terminal handler ensures the eventual
-          // settlement is observed harmlessly (no UnhandledPromise
-          // Rejection). When `p` already settled via the race, this
-          // attach is a cheap no-op on an already-resolved promise.
           p.then(
             () => undefined,
             () => undefined,
@@ -1996,10 +1286,6 @@ export class ProfileTokenStorageProvider
       try {
         remote = await raceWithBudget(this.readOperationalState(), 'readOperationalState');
       } catch (err) {
-        // Timeout or read error — surface as event and bail (the
-        // budget guard at top-of-loop would catch this on the next
-        // iteration anyway, but propagating the timeout would push
-        // it into the outer flush catch which is less informative).
         this.emitEvent(this.buildErrorEvent('storage:error', err));
         return;
       }
@@ -2016,13 +1302,6 @@ export class ProfileTokenStorageProvider
             ...(opState.invalidatedNametags as string[]),
           ]),
         ),
-        // T.0.G7-fill-gaps: deprecated single-blob path is no longer
-        // on any active code path (per-entry-key writer is canonical),
-        // but the `OperationalState` shape is fully populated for type
-        // soundness. The single-blob writes below do not include the
-        // new collections — they only existed in the per-entry-key
-        // world and the migration cleanup deletes any stale single
-        // blobs at `${addr}.audit` / `${addr}.finalizationQueue`.
         audit: mergeByPrimaryKey(remote.audit, opState.audit, 'id'),
         finalizationQueue: mergeByPrimaryKey(
           remote.finalizationQueue,
@@ -2038,11 +1317,6 @@ export class ProfileTokenStorageProvider
         [`${addr}.invalidatedNametags`, merged.invalidatedNametags],
       ];
 
-      // Steelman⁴⁷ MEDIUM: abort the loop on the first write failure
-      // so the remaining keys are not committed in isolation, leaving
-      // OrbitDB inconsistent. Surface the error and return without
-      // retrying — write errors are likely environmental and will be
-      // corrected by the next flush; partial commits would not.
       let writeFailed = false;
       for (const [key, value] of writes) {
         try {
@@ -2056,15 +1330,6 @@ export class ProfileTokenStorageProvider
       }
       if (writeFailed) return;
 
-      // Verification re-read: confirm our local primary keys made it
-      // into the remote state. If a sibling process clobbered our
-      // merge, redo. We tolerate eventual-consistency lag by allowing
-      // sibling-only entries to drift in/out of the remote view; we
-      // only check that OUR entries (those we contributed) are
-      // present.
-      // Steelman⁵⁰ WARNING: symmetry with the read above — the
-      // verify-read must surface as storage:error and bail rather
-      // than escape into the outer flush handler.
       let verify: OperationalState;
       try {
         verify = await raceWithBudget(this.readOperationalState(), 'verifyReadOperationalState');
@@ -2089,11 +1354,6 @@ export class ProfileTokenStorageProvider
           `writeOrbitOperationalState: divergence persisted after ${MAX_RMW_RETRIES} retries; ` +
             `surfacing storage:error — sibling-clobbered entries are lost until next flush.`,
         );
-        // Steelman⁴⁷: corrected the misleading "outbox rebuild on next
-        // load" comment — readers actually pull outbox/invalid/
-        // mintOutbox directly from OrbitDB, so a clobbered entry is
-        // gone until its originator re-saves. Surface as event so
-        // callers can react.
         this.emitEvent(
           this.buildErrorEvent(
             'storage:error',
@@ -2102,7 +1362,6 @@ export class ProfileTokenStorageProvider
         );
         return;
       }
-      // Brief backoff with jitter to break ties with the racing sibling.
       await new Promise<void>((resolve) =>
         setTimeout(resolve, 50 + Math.floor(Math.random() * 100)),
       );
@@ -2173,16 +1432,6 @@ export class ProfileTokenStorageProvider
   private async readOrbitOperationalState(): Promise<Omit<OperationalState, 'tombstones' | 'sent' | 'history'>> {
     const addr = this.getAddressId();
 
-    // Wave G.7: prefer the per-entry-key layout (one OrbitDB key
-    // per outbox/invalid/mintOutbox entry, prefixed with
-    // `${addr}.outbox.`, etc.). Falls back to the legacy
-    // single-blob format on first read of a pre-G.7 wallet —
-    // migration runs on the next write.
-    //
-    // Per-entry layout gains true CRDT semantics: two devices
-    // adding different entries never conflict at the OrbitDB
-    // layer (each entry has its own LWW key resolution), and
-    // removals via tombstones replicate cleanly.
     const [
       outbox,
       invalid,
@@ -2191,15 +1440,6 @@ export class ProfileTokenStorageProvider
       audit,
       finalizationQueue,
     ] = await Promise.all([
-      // T.6.A: route outbox reads through a shape-aware variant. The
-      // new `UxfTransferOutboxEntry` shape (carrying `_schemaVersion:
-      // 'uxf-1'`) lives at the same per-entry-key prefix but is
-      // structurally distinct from the legacy `TxfOutboxEntry`. The
-      // legacy `OperationalState.outbox` slot must NOT be polluted with
-      // new-shape entries — those are read via `OutboxWriter.readAll()`
-      // from `profile/outbox-writer.ts`. The filter below routes by
-      // `_schemaVersion` presence: legacy entries (no field) populate
-      // the legacy slot, new-shape entries are skipped here.
       this.readPerEntryArrayLegacyOnly<TxfOutboxEntry>(
         `${addr}.outbox.`,
         `${addr}.outbox`,
@@ -2212,14 +1452,7 @@ export class ProfileTokenStorageProvider
         `${addr}.mintOutbox.`,
         `${addr}.mintOutbox`,
       ),
-      // Invalidated nametags is a Set<string> — keep the single-key
-      // layout (cheap and the entries are tiny strings, not records).
       this.readProfileKeyJson<unknown[]>(`${addr}.invalidatedNametags`),
-      // T.0.G7-fill-gaps: audit + finalizationQueue use the same
-      // per-entry-key layout as outbox/invalid/mintOutbox. The legacy
-      // blob fallback exists for symmetry — neither collection has
-      // ever been written as a single blob in production, but the
-      // helper costs us nothing here and keeps behaviour uniform.
       this.readPerEntryArrayWithLegacyFallback<TxfAuditEntry>(
         `${addr}.audit.`,
         `${addr}.audit`,
@@ -2432,9 +1665,6 @@ export class ProfileTokenStorageProvider
     }
 
     if (failedKeys.length > 0) {
-      // Steelman⁴⁰ warning: aggregate event (already done; document the
-      // pattern). Single event with `code: 'LOCAL_CACHE_READ_FAILED'`
-      // and the failed keys in `data`.
       this.emitEvent({
         type: 'storage:error',
         timestamp: Date.now(),
@@ -2466,7 +1696,6 @@ export class ProfileTokenStorageProvider
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`Failed to read local cache "${key}": ${msg}`);
-      // Steelman⁴⁰ warning: route through buildErrorEvent for typed code.
       this.emitEvent(this.buildErrorEvent('storage:error', err, 'LOCAL_CACHE_READ_FAILED'));
       return null;
     }
@@ -2601,7 +1830,7 @@ export class ProfileTokenStorageProvider
   }
 
   // ===========================================================================
-  // Private: Replication handler (WU-P12 inlined)
+  // Private: Replication handler
   // ===========================================================================
 
   /**
@@ -2611,7 +1840,7 @@ export class ProfileTokenStorageProvider
   private async handleReplication(): Promise<void> {
     try {
       const previousCids = new Set(this.knownBundleCids);
-      await this.refreshKnownBundles();
+      await this.bundleIndex.refreshKnownBundles();
 
       // Check if any new bundle CIDs appeared
       let hasNew = false;
@@ -2712,8 +1941,6 @@ export class ProfileTokenStorageProvider
 // =============================================================================
 // Utility
 // =============================================================================
-
-// Steelman³⁵: hexToBytes consolidated to core/hex.ts (top-of-file import).
 
 /**
  * Steelman⁴³ critical helper: merge two arrays of records by a primary
