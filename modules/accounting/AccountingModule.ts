@@ -1692,6 +1692,26 @@ export class AccountingModule {
         this.balanceCache.delete(hashedKey);
         logger.debug(LOG_TAG, `Migrated ${orphanedLedger.size} ledger entries from hash-keyed to real ID: ${tokenId.slice(0, 16)}...`);
       }
+      // 2026-04-30 FIX (verifyPayout reverse-index gap): tokenInvoiceMap also
+      // needs migration. _processTokenTransactions runs BEFORE importInvoice
+      // when payout tokens arrive ahead of the invoice-delivery DM (a real
+      // race in instant-mode swap payouts). At that point the on-chain `inv:`
+      // reference is the privacy-preserving HASH of the invoice id, so the
+      // tokenInvoiceMap entry gets populated with the hash. Without this
+      // migration, getTokenIdsForInvoice(realInvoiceId) returns empty —
+      // SwapModule.verifyPayout's reverse lookup fails closed indefinitely.
+      // Symmetric to the invoiceLedger migration above.
+      let migratedTokens = 0;
+      for (const [, invoiceSet] of this.tokenInvoiceMap) {
+        if (invoiceSet.has(hashedKey)) {
+          invoiceSet.delete(hashedKey);
+          invoiceSet.add(tokenId);
+          migratedTokens++;
+        }
+      }
+      if (migratedTokens > 0) {
+        logger.debug(LOG_TAG, `Migrated ${migratedTokens} tokenInvoiceMap entries from hash-keyed to real ID: ${tokenId.slice(0, 16)}...`);
+      }
     }
 
     if (!this.invoiceLedger.has(tokenId)) {
