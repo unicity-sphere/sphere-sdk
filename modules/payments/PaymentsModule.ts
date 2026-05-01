@@ -6746,8 +6746,18 @@ export class PaymentsModule {
           // The transfer transaction goes on the bundle WITHOUT a
           // proof — the recipient's reader walks the chain when
           // proofs land.
+          //
+          // Use commitment.toJSON().transactionData (NOT commitment.toJSON())
+          // because TransferCommitment.toJSON() returns
+          // { authenticator, requestId, transactionData } — a Commitment
+          // envelope — whereas the UXF deconstruct code expects `tx.data`
+          // to be the flat TransferTransactionData shape
+          // { sourceState, recipient, salt, recipientDataHash, message, nametags }.
+          // Passing the commitment envelope causes every scalar field to be
+          // `undefined`, which @ipld/dag-cbor rejects at encode time with
+          // "undefined is not supported by the IPLD Data Model".
           const transferTxJson = {
-            data: commitment.toJSON(),
+            data: commitment.toJSON().transactionData,
             inclusionProof: null,
           };
           const tokenJson = token.sdkData

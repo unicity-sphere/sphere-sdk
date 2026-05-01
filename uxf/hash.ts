@@ -108,6 +108,15 @@ export function prepareContentForHashing(
   const result: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(content)) {
+    // IPLD Data Model does not support `undefined`. Absent keys and
+    // `null` keys are distinct in CBOR; an `undefined` field is an
+    // upstream producer bug (e.g. wrong wrapper level in commitment JSON).
+    // Strip it here rather than forwarding a value that @ipld/dag-cbor
+    // will reject at encode time. The defensive layer guards against
+    // future regressions regardless of which producer is at fault.
+    if (value === undefined) {
+      continue;
+    }
     // SmtPath segments require special per-segment handling
     if (type === 'smt-path' && key === 'segments') {
       result[key] = prepareSmtSegments(
