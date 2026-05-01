@@ -78,11 +78,22 @@ import {
   getTokenIds,
   makeProviders,
   makeTempDirs,
-  POLL_INTERVAL_MS,
   rand,
   requestFaucet,
   TEST_COINS,
 } from './helpers';
+
+/**
+ * Local poll cadence (overrides the shared POLL_INTERVAL_MS=1000ms from
+ * helpers.ts). 250 ms means a healthy-relay run resolves each phase
+ * within at most 250 ms of the underlying state being ready, instead
+ * of up to 1 s of polling latency. The polling cost (4 Hz against
+ * in-memory state checks + an occasional `receive()` call) is
+ * negligible. The cadence does NOT change the timeout ceilings — those
+ * stay at 240 s — so the trade-off is "fast on healthy, generous on
+ * degraded".
+ */
+const POLL_INTERVAL_MS = 250;
 import type { TokenTransferPayload } from '../../transport/transport-provider';
 import type { TransferResult } from '../../types';
 
