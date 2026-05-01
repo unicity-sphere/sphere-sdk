@@ -95,7 +95,10 @@ import {
   IngestWorkerPool,
   type IngestWorkerPoolOptions,
   type UxfV1Payload,
+  type ProcessTokenFn,
 } from './transfer/ingest-worker-pool';
+import { ReplayLRU } from './transfer/replay-lru';
+import { PerTokenMutex } from '../../profile/per-token-mutex';
 // T.5.D — operator escape hatch (`importInclusionProof` +
 // `revalidateCascadedChildren`). Class types only; the wiring layer
 // (Sphere bootstrap) constructs the runtime instances and installs them
@@ -1354,6 +1357,126 @@ export class PaymentsModule {
     // `features: { recoveryWorker: false }`.
     if (this.features.recoveryWorker && this.sendingRecoveryWorker !== null) {
       this.sendingRecoveryWorker.start();
+    }
+
+    // T.3.E — auto-install a default IngestWorkerPool when recipientUxf
+    // is on AND the bootstrap layer has not already wired a custom pool.
+    //
+    // After T.8.D part 1 flipped features.recipientUxf to default-ON,
+    // incoming UXF v1 bundles routed to the gate at handleIncomingTransfer
+    // line 7506 found `this.ingestPool === null` and fell through to the
+    // legacy arm, which does not recognize `kind: 'uxf-car'/'uxf-cid'`
+    // wire shapes — every UXF event was dropped with "Unknown transfer
+    // payload format".
+    //
+    // The default processToken closure mirrors the legacy receive arm
+    // (lines ~7750-7800): assemble → validateToken → parseTokenInfo →
+    // build Token → addToken → addToHistory → emit transfer:incoming.
+    // It captures `this` via closure so it shares all the same per-address
+    // state as the rest of the module.
+    //
+    // Consumer-installed pools (via installIngestWorkerPool()) win: the
+    // check `!this.ingestPool` preserves that contract. Calling
+    // installIngestWorkerPool() AFTER initialize() replaces the
+    // auto-installed pool (existing idempotent replace logic handles it).
+    if (this.features.recipientUxf && !this.ingestPool) {
+      const lru = new ReplayLRU();
+      const mutex = new PerTokenMutex();
+
+      const processToken: ProcessTokenFn = async (tokenRoot, verified, ctx) => {
+        try {
+          // 1. Reassemble the SDK-shaped token JSON from the verified bundle.
+          const tokenData: unknown = verified.pkg.assemble(tokenRoot.tokenId);
+
+          // 2. Validate via oracle — mirrors legacy arm line ~7744.
+          const validation = await this.deps!.oracle.validateToken(tokenData);
+          if (!validation.valid) {
+            logger.warn('Payments', 'Received invalid UXF token', {
+              tokenId: tokenRoot.tokenId.slice(0, 16),
+            });
+            return;
+          }
+
+          // 3. Parse + build wallet Token — mirrors legacy arm lines ~7751-7768.
+          const tokenInfo = await parseTokenInfo(tokenData);
+          const sdkDataStr = typeof tokenData === 'string'
+            ? tokenData
+            : JSON.stringify(tokenData);
+          const token: Token = {
+            id: tokenInfo.tokenId ?? crypto.randomUUID(),
+            coinId: tokenInfo.coinId,
+            symbol: tokenInfo.symbol,
+            name: tokenInfo.name,
+            decimals: tokenInfo.decimals,
+            iconUrl: tokenInfo.iconUrl,
+            amount: tokenInfo.amount,
+            status: 'confirmed',
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            sdkData: sdkDataStr,
+          };
+
+          // 4. addToken() deduplicates (tombstone check + stateHash check)
+          //    and persists via save() — mirrors legacy arm line ~7772.
+          const added = await this.addToken(token);
+          const senderInfo = await this.resolveSenderInfo(ctx.senderTransportPubkey);
+
+          if (added) {
+            // 5. Record history entry — mirrors legacy arm lines ~7776-7787.
+            const incomingTokenId = extractTokenIdFromSdkData(token.sdkData);
+            await this.addToHistory({
+              type: 'RECEIVED',
+              amount: token.amount,
+              coinId: token.coinId,
+              symbol: token.symbol,
+              timestamp: Date.now(),
+              senderPubkey: ctx.senderTransportPubkey,
+              ...senderInfo,
+              memo: ctx.payload.memo,
+              tokenId: incomingTokenId || token.id,
+            });
+
+            // 6. Emit transfer:incoming — mirrors legacy arm lines ~7789-7798.
+            const incomingTransfer: IncomingTransfer = {
+              id: ctx.bundleCid,
+              senderPubkey: ctx.senderTransportPubkey,
+              senderNametag: senderInfo.senderNametag,
+              tokens: [token],
+              memo: ctx.payload.memo,
+              receivedAt: Date.now(),
+            };
+            this.deps!.emitEvent('transfer:incoming', incomingTransfer);
+            logger.debug(
+              'Payments',
+              `UXF token received: ${token.id}, ${token.amount} ${token.symbol}`,
+            );
+          } else {
+            logger.debug(
+              'Payments',
+              `UXF duplicate token ignored: ${token.id}, ${token.amount} ${token.symbol}`,
+            );
+          }
+        } catch (err) {
+          logger.error('Payments', 'Default UXF processToken failed', {
+            tokenId: tokenRoot.tokenId.slice(0, 16),
+            err,
+          });
+          // Re-throw so the pool aborts this token only (per-token error
+          // isolation is the pool's responsibility per §5.0 W23).
+          throw err;
+        }
+      };
+
+      this.ingestPool = new IngestWorkerPool({
+        lru,
+        perTokenMutex: mutex,
+        processToken,
+        emit: (event, payload) => this.deps!.emitEvent(event, payload),
+      });
+      logger.debug(
+        'Payments',
+        'Default IngestWorkerPool auto-installed (recipientUxf default-on)',
+      );
     }
   }
 
