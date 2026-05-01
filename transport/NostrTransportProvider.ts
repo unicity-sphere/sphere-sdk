@@ -195,6 +195,14 @@ export class NostrTransportProvider implements TransportProvider {
    * Suppress event subscriptions — unsubscribe wallet/chat filters
    * but keep the connection alive for resolve/identity-binding operations.
    * Used when MultiAddressTransportMux takes over event handling.
+   *
+   * Stops application-level keepalive ping timers on the bare connection.
+   * After suppression this NostrClient has zero active subscriptions; the
+   * connection is retained only as an outbound resolve()/identity-binding
+   * channel. Application pings on a subscription-free connection have been
+   * empirically observed to elicit no relay response, causing
+   * `appears stale` flapping every ~45 s. OS-level TCP keepalive maintains
+   * connection liveness; we don't need application-level pings here.
    */
   suppressSubscriptions(): void {
     if (!this.nostrClient) return;
@@ -212,9 +220,34 @@ export class NostrTransportProvider implements TransportProvider {
       this.mainSubscriptionId = null;
     }
 
+    this.stopApplicationPingsOnBareClient();
+
     // Prevent re-subscription on reconnect by marking subscriptions as suppressed
     this._subscriptionsSuppressed = true;
     logger.debug('Nostr', 'Subscriptions suppressed — mux handles event routing');
+  }
+
+  /**
+   * Stop the bare NostrClient's per-relay application-level keepalive
+   * ping timers. Reaches into NostrClient internals via a structural cast
+   * because `stopPingTimer(url)` and `relays` are declared `private` in
+   * @unicitylabs/nostr-js-sdk. An upstream PR adding a public
+   * `stopAllPingTimers()` would let us drop this cast.
+   *
+   * Called from `suppressSubscriptions()` and from the post-reconnect path
+   * in `setIdentity` when suppression is active — every fresh NostrClient
+   * starts its own ping timers on connect, so we must re-stop them after
+   * each replacement.
+   */
+  private stopApplicationPingsOnBareClient(): void {
+    if (!this.nostrClient) return;
+    const internals = this.nostrClient as unknown as {
+      relays: Map<string, unknown>;
+      stopPingTimer(url: string): void;
+    };
+    for (const url of internals.relays.keys()) {
+      internals.stopPingTimer(url);
+    }
   }
 
   // Flag to prevent re-subscription after suppressSubscriptions()
@@ -269,6 +302,11 @@ export class NostrTransportProvider implements TransportProvider {
           this.subscribeToEvents().catch((err) => {
             logger.error('Nostr', 'Failed to re-subscribe after reconnect:', err);
           });
+          // The reconnected socket starts a fresh ping timer; under
+          // suppression we don't want it (see suppressSubscriptions()).
+          if (this._subscriptionsSuppressed) {
+            this.stopApplicationPingsOnBareClient();
+          }
         },
       });
 
@@ -488,6 +526,11 @@ export class NostrTransportProvider implements TransportProvider {
         },
         onReconnected: (url) => {
           logger.debug('Nostr', 'NostrClient reconnected to relay:', url);
+          // Mirror the primary listener: under suppression, the
+          // reconnected socket's fresh ping timer is unwanted.
+          if (this._subscriptionsSuppressed) {
+            this.stopApplicationPingsOnBareClient();
+          }
         },
       });
 
@@ -501,6 +544,12 @@ export class NostrTransportProvider implements TransportProvider {
         ),
       ]);
       await this.subscribeToEvents();
+      // The fresh NostrClient started its own ping timers on connect.
+      // If subscriptions were suppressed (mux owns event routing), the
+      // bare client should not ping — see suppressSubscriptions() docstring.
+      if (this._subscriptionsSuppressed) {
+        this.stopApplicationPingsOnBareClient();
+      }
       oldClient.disconnect();
     } else if (this.isConnected()) {
       // Already connected with right key, just subscribe
