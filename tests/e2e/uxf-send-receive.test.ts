@@ -100,9 +100,20 @@ const SKIP = process.env.NO_TESTNET === '1' || process.env.RUN_UXF_E2E !== '1';
 /** UCT smoke is opt-in even when RUN_UXF_E2E=1; UCT amounts overflow uint64. */
 const UCT_SMOKE_DISABLED = process.env.RUN_UCT_SMOKE !== '1';
 
-const FAUCET_TOPUP_MS = 120_000;
-const TRANSFER_RECV_MS = 90_000;
-const FINALIZE_MS = 120_000;
+// Timeouts deliberately generous. The Unicity testnet relay's read path
+// has been observed to fluctuate between healthy (<200 ms EOSE) and
+// degraded (10-25 s EOSE, sometimes never), which cascades into faucet
+// failures (the faucet's own resolve-the-recipient-pubkey step uses the
+// same relay) and slow nametag-binding propagation. We pad each phase
+// to outlast the longest degraded window seen so far. See diagnostic at
+// /tmp/unicity-testnet-relay-outage.md for evidence.
+const FAUCET_TOPUP_MS = 240_000;
+const TRANSFER_RECV_MS = 180_000;
+const FINALIZE_MS = 180_000;
+const PEER_RESOLVE_MS = 240_000;
+/** Faucet HTTP retries on per-call failures (e.g. faucet-side relay flap). */
+const FAUCET_HTTP_RETRIES = 3;
+const FAUCET_RETRY_DELAY_MS = 5_000;
 
 // Primary test coin: USDU (6 decimals). Faucet drops 1000 USDU = 1e9
 // smallest units, well below uint64.
@@ -277,10 +288,26 @@ async function topUpCoin(
   minAmount: bigint,
   timeoutMs: number,
 ): Promise<bigint> {
-  const faucet = await requestFaucet(nametag, faucetName, faucetAmount);
-  if (!faucet.success) {
+  // Retry the faucet HTTP call on per-call failures. The faucet's own
+  // server-side nametag resolve flaps when the testnet relay is slow,
+  // returning `success:false` with a message like
+  // "Nametag resolution unavailable: Nostr relay disconnected". A
+  // bounded retry usually clears it once the relay's read path recovers.
+  let lastErr: string | undefined;
+  for (let attempt = 1; attempt <= FAUCET_HTTP_RETRIES; attempt++) {
+    const faucet = await requestFaucet(nametag, faucetName, faucetAmount);
+    if (faucet.success) { lastErr = undefined; break; }
+    lastErr = faucet.message;
+    if (attempt < FAUCET_HTTP_RETRIES) {
+      console.warn(
+        `  Faucet ${symbol} attempt ${attempt}/${FAUCET_HTTP_RETRIES} failed: ${faucet.message}; retrying in ${FAUCET_RETRY_DELAY_MS / 1000}s`,
+      );
+      await new Promise((r) => setTimeout(r, FAUCET_RETRY_DELAY_MS));
+    }
+  }
+  if (lastErr !== undefined) {
     console.warn(
-      `  Faucet ${symbol} request failed (continuing — may already be funded): ${faucet.message}`,
+      `  Faucet ${symbol} all ${FAUCET_HTTP_RETRIES} attempts failed (continuing — may already be funded): ${lastErr}`,
     );
   }
   const start = performance.now();
@@ -293,7 +320,8 @@ async function topUpCoin(
     await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
   }
   throw new Error(
-    `Faucet top-up timed out: have ${confirmed} confirmed ${symbol}, need >= ${minAmount}`,
+    `Faucet top-up timed out after ${(timeoutMs / 1000).toFixed(0)}s: have ${confirmed} confirmed ${symbol}, need >= ${minAmount}` +
+      (lastErr ? ` (last faucet error: ${lastErr})` : ''),
   );
 }
 
@@ -352,7 +380,7 @@ describe('UXF Send/Receive — real Unicity testnet (Phase 9 gap closure)', () =
 
       // Wait for Bob's nametag binding event to propagate before sending.
       console.log(`[S1] waiting for @${bobTag} to be resolvable...`);
-      await waitForPeerResolvable(a.sphere, bobTag, 60_000);
+      await waitForPeerResolvable(a.sphere, bobTag, PEER_RESOLVE_MS);
 
       const aHook = captureSentPayloads(a.sphere);
       const primaryCoinId = resolveCoinId(a.sphere, PRIMARY_SYMBOL);
@@ -392,7 +420,7 @@ describe('UXF Send/Receive — real Unicity testnet (Phase 9 gap closure)', () =
       expect(bBalance.total).toBeGreaterThanOrEqual(1000n);
 
       // Bob can re-spend the received tokens
-      await waitForPeerResolvable(b.sphere, aliceTag, 60_000);
+      await waitForPeerResolvable(b.sphere, aliceTag, PEER_RESOLVE_MS);
       const bobPrimaryCoinId = resolveCoinId(b.sphere, PRIMARY_SYMBOL);
       const reSendResult = await b.sphere.payments.send({
         recipient: `@${aliceTag}`,
@@ -436,7 +464,7 @@ describe('UXF Send/Receive — real Unicity testnet (Phase 9 gap closure)', () =
       a.sphere.on('transfer:confirmed', (r) => { confirmed.push(r); });
 
       console.log(`[S2] waiting for @${bobTag} to be resolvable...`);
-      await waitForPeerResolvable(a.sphere, bobTag, 60_000);
+      await waitForPeerResolvable(a.sphere, bobTag, PEER_RESOLVE_MS);
 
       const primaryCoinId = resolveCoinId(a.sphere, PRIMARY_SYMBOL);
       const aHook = captureSentPayloads(a.sphere);
@@ -480,7 +508,7 @@ describe('UXF Send/Receive — real Unicity testnet (Phase 9 gap closure)', () =
 
       const bBefore = getBalance(b.sphere, PRIMARY_SYMBOL);
       expect(bBefore.total).toBeGreaterThanOrEqual(500n);
-      await waitForPeerResolvable(b.sphere, aliceTag, 60_000);
+      await waitForPeerResolvable(b.sphere, aliceTag, PEER_RESOLVE_MS);
       const bobPrimaryCoinId = resolveCoinId(b.sphere, PRIMARY_SYMBOL);
       const reSpend = await b.sphere.payments.send({
         recipient: `@${aliceTag}`,
@@ -533,7 +561,7 @@ describe('UXF Send/Receive — real Unicity testnet (Phase 9 gap closure)', () =
       );
 
       console.log(`[S3] waiting for @${bobTag} to be resolvable...`);
-      await waitForPeerResolvable(a.sphere, bobTag, 60_000);
+      await waitForPeerResolvable(a.sphere, bobTag, PEER_RESOLVE_MS);
 
       const primaryCoinId = resolveCoinId(a.sphere, PRIMARY_SYMBOL);
       const secondaryCoinId = resolveCoinId(a.sphere, SECONDARY_SYMBOL);
@@ -602,7 +630,7 @@ describe('UXF Send/Receive — real Unicity testnet (Phase 9 gap closure)', () =
       console.log(`\n[S4] Alice=@${aliceTag} Bob=@${bobTag} (UCT, expected CBOR overflow)`);
       await topUpCoin(a.sphere, aliceTag, 'UCT', 'unicity', 100, 5_000n, FAUCET_TOPUP_MS);
 
-      await waitForPeerResolvable(a.sphere, bobTag, 60_000);
+      await waitForPeerResolvable(a.sphere, bobTag, PEER_RESOLVE_MS);
       const uctCoinId = resolveCoinId(a.sphere, 'UCT');
       let threw: unknown = null;
       try {

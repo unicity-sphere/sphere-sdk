@@ -2094,7 +2094,20 @@ export class NostrTransportProvider implements TransportProvider {
     }
   }
 
-  private async queryEvents(filterObj: NostrFilter): Promise<NostrEvent[]> {
+  /**
+   * Default upper bound for `queryEvents` REQ→EOSE wait. Was 15 s historically
+   * but real-network testnet runs (Phase 9 e2e) repeatedly observed the relay
+   * fluctuating between healthy (<200 ms EOSE) and degraded (10-25 s EOSE,
+   * sometimes never EOSE). 60 s pushes the timeout past every degraded
+   * sample we've captured while still failing fast on real "no such event"
+   * queries. Override per call via the second argument.
+   */
+  private static readonly DEFAULT_QUERY_TIMEOUT_MS = 60000;
+
+  private async queryEvents(
+    filterObj: NostrFilter,
+    timeoutMs: number = NostrTransportProvider.DEFAULT_QUERY_TIMEOUT_MS,
+  ): Promise<NostrEvent[]> {
     if (!this.nostrClient || !this.nostrClient.isConnected()) {
       throw new SphereError('No connected relays', 'TRANSPORT_ERROR');
     }
@@ -2116,9 +2129,9 @@ export class NostrTransportProvider implements TransportProvider {
         if (subId) {
           try { client.unsubscribe(subId); } catch { /* disconnected */ }
         }
-        logger.warn('Nostr', `queryEvents timed out after 15s, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
+        logger.warn('Nostr', `queryEvents timed out after ${timeoutMs}ms, returning ${events.length} event(s)`, { kinds: filterObj.kinds, limit: filterObj.limit });
         resolve(events);
-      }, 15000);
+      }, timeoutMs);
 
       const settle = () => {
         if (settled) return;
