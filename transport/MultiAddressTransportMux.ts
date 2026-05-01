@@ -311,7 +311,18 @@ export class MultiAddressTransportMux {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16,
-        pingIntervalMs: 15000,
+        // pingIntervalMs intentionally raised. The 15 s interval combined with
+        // the SDK's no-filter `['REQ','ping',{limit:1}]` keepalive trick has
+        // been observed to false-positive on real testnet under uneven relay
+        // response timing — the relay floods events to a no-filter sub but
+        // occasional 30+ s gaps in that flood (rate-limit / backend hiccup)
+        // race the 30 s stale threshold. The Mux already runs its own
+        // application-layer chat-event health check (see
+        // `[Mux] No chat events for X — re-subscribing` in this file), so
+        // we don't rely on NostrClient's stale-detect for liveness — we
+        // raise the interval to push the false-positive past any realistic
+        // run, while keeping the timer in place as a defense-in-depth signal.
+        pingIntervalMs: 60000,
       });
 
       this.nostrClient.addConnectionListener({

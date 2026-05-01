@@ -279,7 +279,13 @@ export class NostrTransportProvider implements TransportProvider {
         autoReconnect: this.config.autoReconnect,
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
-        pingIntervalMs: 15000, // 15 second keepalive pings (more aggressive to prevent drops)
+        // 60 s keepalive — the SDK's no-filter `['REQ','ping',{limit:1}]`
+        // trick false-positives at 15 s on real testnet under uneven relay
+        // timing. After Mux takeover suppressSubscriptions stops these
+        // timers entirely (see `stopApplicationPingsOnBareClient`); 60 s
+        // covers the brief pre-suppress window AND any reconnect that
+        // re-establishes the timer before suppression re-runs.
+        pingIntervalMs: 60000,
       });
 
       // Add connection event listener for logging
