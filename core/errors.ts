@@ -295,6 +295,13 @@ export type SphereErrorCode =
    *  building a CAR it cannot ship. See §3.3.1 / §T.2.D.1 acceptance. */
   | 'IPFS_PUBLISHER_MISSING'
   /**
+   * UXF Inter-Wallet Transfer T.4.A — a CID delivery branch was selected
+   * (force-cid or auto-over-cap) but no `publishToIpfs` callback was
+   * supplied AND the CAR exceeds the relay-safe inline ceiling. An IPFS
+   * provider must be configured to send bundles of this size. See §3.3.1
+   * / approach γ inline-fallback. */
+  | 'IPFS_PUBLISHER_REQUIRED'
+  /**
    * UXF Inter-Wallet Transfer T.3.B.1 — per-element verifier surfaced a
    * SHAPE-LEVEL failure (parser threw, malformed authenticator, missing
    * required pool reference, inconsistent imprint). The verifiers in

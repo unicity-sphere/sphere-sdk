@@ -147,7 +147,11 @@ describe('§11.2 — force-cid with a tiny 1-token bundle', () => {
     expect(events.count('transfer:confirmed')).toBe(1);
   });
 
-  it('force-cid without publishToIpfs callback → IPFS_PUBLISHER_MISSING (pre-publish reject)', async () => {
+  it('force-cid without publishToIpfs callback → falls back to uxf-car inline (approach γ)', async () => {
+    // Approach γ: when force-cid is requested but no IPFS publisher is
+    // wired, and the bundle fits within RELAY_SAFE_CAP_BYTES (96 KiB),
+    // the resolver falls back to uxf-car inline delivery rather than
+    // throwing. This lets callers without IPFS still send small bundles.
     const idHex = `aa${'2'.padStart(2, '0')}${'0'.repeat(60)}`;
     const source = makeToken({
       id: idHex,
@@ -162,7 +166,7 @@ describe('§11.2 — force-cid with a tiny 1-token bundle', () => {
       identity: makeIdentity(),
       senderTransportPubkey: BOB_TRANSPORT_PUBKEY,
       emit: events.emit,
-      // publishToIpfs intentionally omitted.
+      // publishToIpfs intentionally omitted → triggers CAR-inline fallback.
       availableSources: () => [source],
       selectSources: async () => [source],
       preflightOptions: () => ({
@@ -190,14 +194,15 @@ describe('§11.2 — force-cid with a tiny 1-token bundle', () => {
       delivery: { kind: 'force-cid' },
     };
 
-    let caughtCode: string | undefined;
-    try {
-      await sendConservativeUxf(request, makePeerInfo(), deps);
-    } catch (err) {
-      caughtCode = (err as { code?: string }).code;
-    }
-    expect(caughtCode).toBe('IPFS_PUBLISHER_MISSING');
-    expect(transport._calls).toHaveLength(0);
-    expect(events.count('transfer:failed')).toBe(1);
+    const result = await sendConservativeUxf(request, makePeerInfo(), deps);
+
+    // Should succeed via CAR-inline fallback (not throw).
+    expect(result.status).toBe('completed');
+    // Wire payload must be uxf-car (inline fallback applied).
+    expect(transport._calls).toHaveLength(1);
+    const payload = transport._calls[0].payload as UxfTransferPayloadCar | UxfTransferPayloadCid;
+    expect(payload.kind).toBe('uxf-car');
+    expect(events.count('transfer:confirmed')).toBe(1);
+    expect(events.count('transfer:failed')).toBe(0);
   });
 });

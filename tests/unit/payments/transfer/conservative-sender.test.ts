@@ -23,8 +23,10 @@
  *    `INLINE_CAR_TOO_LARGE` (delegated from {@link resolveDelivery}).
  *  - Relay rejection during `sendTokenTransfer` → propagates as
  *    `TRANSPORT_ERROR` with the underlying cause preserved.
- *  - CID-bound delivery without `publishToIpfs` → throws
- *    `IPFS_PUBLISHER_MISSING` pre-publish.
+ *  - CID-bound delivery without `publishToIpfs` + small bundle →
+ *    falls back to `uxf-car` inline (approach γ).
+ *  - CID-bound delivery without `publishToIpfs` + oversized bundle →
+ *    throws `IPFS_PUBLISHER_REQUIRED`.
  *  - `transfer:failed` event emitted on any throw.
  */
 
@@ -502,27 +504,62 @@ describe('sendConservativeUxf — force-inline relay-safe ceiling', () => {
 });
 
 // =============================================================================
-// 6. CID-bound delivery without publishToIpfs — IPFS_PUBLISHER_MISSING
+// 6. CAR-inline fallback and IPFS_PUBLISHER_REQUIRED (approach γ)
 // =============================================================================
 
-describe('sendConservativeUxf — IPFS_PUBLISHER_MISSING pre-flight', () => {
-  it('rejects force-cid without publishToIpfs', async () => {
+describe('sendConservativeUxf — CAR-inline fallback when publishToIpfs absent', () => {
+  it('force-cid + no publisher + small bundle → falls back to uxf-car inline', async () => {
+    // Approach γ: when force-cid is requested but no publisher is wired,
+    // and the bundle fits within RELAY_SAFE_CAP_BYTES, the resolver
+    // silently falls back to uxf-car inline delivery.
     const source = makeToken('tok-1', TOKEN_A);
     const commitResult = makeCommitResult({
       sourceTokenId: 'tok-1',
       fixture: TOKEN_A,
     });
-    const { deps } = makeDeps({
+    const { deps, transport } = makeDeps({
       availableSources: () => [source],
       selectSources: async () => [source],
       commitSources: async () => [commitResult],
       publishToIpfs: undefined,
     });
 
+    const result = await sendConservativeUxf(
+      basicRequest({ delivery: { kind: 'force-cid' } }),
+      makePeerInfo(),
+      deps,
+    );
+
+    // Should succeed with inline (uxf-car) delivery.
+    expect(result.status).toBe('completed');
+    expect(transport._calls).toHaveLength(1);
+    const payload = transport._calls[0].payload as UxfTransferPayloadCar;
+    expect(payload.kind).toBe('uxf-car');
+  });
+
+  it('auto + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
+    // Build a bundle exceeding RELAY_SAFE_CAP_BYTES (96 KiB).
+    // Each TOKEN_A fixture is ~0.9 KiB; 120 tokens ≈ 110 KiB.
+    const N = 120;
+    const sources = Array.from({ length: N }, (_, i) => makeToken(`tok-${i}`, TOKEN_A));
+    const commitResults = sources.map((s, i) =>
+      makeCommitResult({
+        sourceTokenId: s.id,
+        fixture: TOKEN_A,
+        rewriteTokenId: i.toString(16).padStart(64, '0'),
+      }),
+    );
+    const { deps } = makeDeps({
+      availableSources: () => sources,
+      selectSources: async () => sources,
+      commitSources: async () => commitResults,
+      publishToIpfs: undefined,
+    });
+
     let caught: unknown;
     try {
       await sendConservativeUxf(
-        basicRequest({ delivery: { kind: 'force-cid' } }),
+        basicRequest({ delivery: { kind: 'auto' } }),
         makePeerInfo(),
         deps,
       );
@@ -532,7 +569,7 @@ describe('sendConservativeUxf — IPFS_PUBLISHER_MISSING pre-flight', () => {
     if (!isSphereError(caught)) {
       throw new Error(`expected SphereError; got ${String(caught)}`);
     }
-    expect(caught.code).toBe('IPFS_PUBLISHER_MISSING');
+    expect(caught.code).toBe('IPFS_PUBLISHER_REQUIRED');
   });
 });
 

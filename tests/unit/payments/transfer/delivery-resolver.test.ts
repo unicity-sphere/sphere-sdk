@@ -446,6 +446,73 @@ describe('resolveDelivery — IPFS failure propagation', () => {
 });
 
 // =============================================================================
+// 8a. CAR-inline fallback (approach γ) — publishToIpfs absent
+// =============================================================================
+
+describe('resolveDelivery — CAR-inline fallback when publishToIpfs absent', () => {
+  it('auto + no publisher + small bundle → falls back to inline (uxf-car)', async () => {
+    // Bundle > 16 KiB (CID branch) but <= RELAY_SAFE_CAP_BYTES (96 KiB).
+    // Without a publisher the resolver must fall back to inline delivery.
+    const carBytes = makeCarBytes(MAX_INLINE_CAR_BYTES + 1);
+    const decision = await resolveDelivery({
+      strategy: { kind: 'auto' },
+      carBytes,
+      // publishToIpfs intentionally absent
+    });
+    expect(decision.kind).toBe('inline');
+    if (decision.kind === 'inline') {
+      expect(decision.carBase64).toBe(carBytesToBase64(carBytes));
+    }
+  });
+
+  it('force-cid + no publisher + small bundle → falls back to inline', async () => {
+    const carBytes = makeCarBytes(1024); // tiny bundle, force-cid still triggers CID branch
+    const decision = await resolveDelivery({
+      strategy: { kind: 'force-cid' },
+      carBytes,
+      // publishToIpfs intentionally absent
+    });
+    expect(decision.kind).toBe('inline');
+    if (decision.kind === 'inline') {
+      expect(decision.carBase64).toBe(carBytesToBase64(carBytes));
+    }
+  });
+
+  it('auto + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
+    // Bundle > RELAY_SAFE_CAP_BYTES — cannot fit in a Nostr event.
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
+    await expect(
+      resolveDelivery({
+        strategy: { kind: 'auto' },
+        carBytes,
+        // publishToIpfs intentionally absent
+      }),
+    ).rejects.toMatchObject({ code: 'IPFS_PUBLISHER_REQUIRED' });
+  });
+
+  it('force-cid + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
+    await expect(
+      resolveDelivery({
+        strategy: { kind: 'force-cid' },
+        carBytes,
+        // publishToIpfs intentionally absent
+      }),
+    ).rejects.toMatchObject({ code: 'IPFS_PUBLISHER_REQUIRED' });
+  });
+
+  it('auto + no publisher + bundle at exact RELAY_SAFE_CAP_BYTES boundary → inline', async () => {
+    const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES); // boundary: <= falls back to inline
+    const decision = await resolveDelivery({
+      strategy: { kind: 'auto' },
+      carBytes,
+      // publishToIpfs intentionally absent
+    });
+    expect(decision.kind).toBe('inline');
+  });
+});
+
+// =============================================================================
 // 8. Forward-compat / extension-point sanity checks
 // =============================================================================
 

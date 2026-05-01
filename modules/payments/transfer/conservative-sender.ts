@@ -103,11 +103,12 @@ import { UxfPackage } from '../../../uxf/UxfPackage';
 import { extractCarRootCid } from '../../../uxf/transfer-payload';
 
 import type { TokenLike } from './classify-token';
-import type {
-  PublishToIpfsCallback,
-  PublishToIpfsResult,
-} from './delivery-resolver';
+import type { PublishToIpfsCallback } from './delivery-resolver';
 import { resolveDelivery } from './delivery-resolver';
+import {
+  MAX_INLINE_CAR_BYTES,
+  RELAY_SAFE_CAP_BYTES,
+} from './limits';
 import {
   preflightFinalize,
   type PreflightFinalizeOptions,
@@ -650,19 +651,39 @@ export async function sendConservativeUxf(
     // payload; CID → publishToIpfs invoked here.
     // -----------------------------------------------------------------
     const strategy: DeliveryStrategy = request.delivery ?? { kind: 'auto' };
+    // `wantsCidBranch` mirrors the CID-vs-inline decision that
+    // `resolveDelivery` will make. For `auto` mode we use
+    // `MAX_INLINE_CAR_BYTES` (16 KiB) as the default cap — the same
+    // constant the resolver uses — so the two predicates stay in sync.
+    // (The former code used `Number.POSITIVE_INFINITY` which caused the
+    // pre-flight to never fire for default-auto bundles while the resolver
+    // still routed them to the CID branch and threw IPFS_PUBLISHER_MISSING.)
     const wantsCidBranch =
       strategy.kind === 'force-cid' ||
       (strategy.kind === 'auto' &&
         carBytes.byteLength >
-          (strategy.inlineCapBytes ?? Number.POSITIVE_INFINITY));
+          (strategy.inlineCapBytes ?? MAX_INLINE_CAR_BYTES));
     if (wantsCidBranch && deps.publishToIpfs === undefined) {
-      // Pre-flight reject: if we KNOW we'll need IPFS but no publisher
-      // is wired, fail fast with a clear error rather than letting the
-      // resolver throw a generic message after the work has been done.
-      throw new SphereError(
-        'sendConservativeUxf: delivery strategy requires CID delivery but no publishToIpfs callback was supplied',
-        'IPFS_PUBLISHER_MISSING',
-      );
+      // Pre-flight reject: bundle needs CID delivery, no publisher is
+      // wired, and the bundle is too large for the CAR-inline fallback
+      // in resolveDelivery (approach γ). Fail fast here rather than
+      // letting resolveDelivery surface a generic error after all the
+      // work has already been done.
+      //
+      // When the bundle is <= RELAY_SAFE_CAP_BYTES, resolveDelivery's
+      // carInlineFallback() will silently downgrade to `uxf-car` inline
+      // delivery — so we only hard-fail when inline is impossible.
+      if (carBytes.byteLength > RELAY_SAFE_CAP_BYTES) {
+        throw new SphereError(
+          'sendConservativeUxf: delivery strategy requires CID delivery, no publishToIpfs' +
+            ` callback was supplied, and the CAR (${carBytes.byteLength} bytes) exceeds` +
+            ` the relay-safe inline ceiling of ${RELAY_SAFE_CAP_BYTES} bytes.` +
+            ' Configure an IPFS provider to send large bundles.',
+          'IPFS_PUBLISHER_REQUIRED',
+        );
+      }
+      // Bundle fits within RELAY_SAFE_CAP_BYTES: resolveDelivery will
+      // apply the CAR-inline fallback transparently. No pre-flight throw.
     }
     // -----------------------------------------------------------------
     // Step 10a (T.2.D.2): create UXF outbox entry with
@@ -744,8 +765,13 @@ export async function sendConservativeUxf(
       delivery = await resolveDelivery({
         strategy,
         carBytes,
-        publishToIpfs:
-          deps.publishToIpfs ?? throwingPublishToIpfs,
+        // `publishToIpfs` is optional: when absent resolveDelivery
+        // applies the CAR-inline fallback (approach γ) for bundles
+        // <= RELAY_SAFE_CAP_BYTES, or throws IPFS_PUBLISHER_REQUIRED
+        // for oversized bundles. The pre-flight above already caught
+        // the oversized-without-publisher case, so the REQUIRED error
+        // is defense-in-depth here.
+        publishToIpfs: deps.publishToIpfs,
       });
     } catch (cause) {
       // Pin (or any resolveDelivery step) threw on the CID branch.
@@ -981,18 +1007,3 @@ function cryptoRandomUUID(): string {
   );
 }
 
-/**
- * Fallback `publishToIpfs` callback used when the caller passes no
- * `publishToIpfs` and the resolver UNEXPECTEDLY tries to invoke it
- * (e.g., a bundle slipped just over the cap after the pre-flight
- * check). The pre-flight guard above catches the typical case; this
- * exists as a defense-in-depth backstop.
- *
- * @internal
- */
-const throwingPublishToIpfs: PublishToIpfsCallback = async (): Promise<PublishToIpfsResult> => {
-  throw new SphereError(
-    'sendConservativeUxf: resolveDelivery requested CID delivery but no publishToIpfs callback was supplied',
-    'IPFS_PUBLISHER_MISSING',
-  );
-};

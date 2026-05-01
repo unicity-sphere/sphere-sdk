@@ -171,8 +171,22 @@ export interface ResolveDeliveryOptions {
   readonly strategy: DeliveryStrategy;
   /** The assembled CAR bytes whose delivery is being decided. */
   readonly carBytes: Uint8Array;
-  /** IPFS publisher; called on every CID-bound branch. */
-  readonly publishToIpfs: PublishToIpfsCallback;
+  /**
+   * IPFS publisher; called on every CID-bound branch.
+   *
+   * **Optional** — when absent the resolver applies a CAR-inline fallback
+   * for `auto` and `force-cid` CID branches:
+   *  - `carBytes.byteLength <= RELAY_SAFE_CAP_BYTES` → falls back to
+   *    `uxf-car` inline delivery so callers without an IPFS provider still
+   *    work for reasonably-sized bundles (approach γ).
+   *  - `carBytes.byteLength > RELAY_SAFE_CAP_BYTES` → throws
+   *    `IPFS_PUBLISHER_REQUIRED` — the bundle is too large for inline
+   *    Nostr delivery and an IPFS provider must be configured.
+   *
+   * Note: the `force-inline` branch ignores this field entirely (it
+   * never calls the publisher).
+   */
+  readonly publishToIpfs?: PublishToIpfsCallback;
   /** Optional telemetry sink (silent-clamp emissions only). */
   readonly emitTelemetry?: EmitTelemetryCallback;
 }
@@ -209,13 +223,23 @@ export interface ResolveDeliveryOptions {
  * **Side effects**: invokes `publishToIpfs` on every CID branch (which
  * MAY perform I/O). Invokes `emitTelemetry` at most once per call, and
  * only for the silent-clamp path. Throws synchronously for invalid caps;
- * throws asynchronously (via Promise rejection) for `INLINE_CAR_TOO_LARGE`
- * and any error propagated from `publishToIpfs`.
+ * throws asynchronously (via Promise rejection) for `INLINE_CAR_TOO_LARGE`,
+ * `IPFS_PUBLISHER_REQUIRED`, and any error propagated from `publishToIpfs`.
+ *
+ * **CAR-inline fallback** (approach γ): when `publishToIpfs` is absent and
+ * a CID branch would be selected, the resolver falls back to `uxf-car`
+ * (inline delivery) if `carBytes.byteLength <= RELAY_SAFE_CAP_BYTES`.
+ * This lets callers without an IPFS provider still send reasonably-sized
+ * bundles. Bundles exceeding `RELAY_SAFE_CAP_BYTES` without a publisher
+ * throw `IPFS_PUBLISHER_REQUIRED`.
  *
  * @throws {SphereError} `INVALID_INLINE_CAP` — auto mode with cap < 1 or
  *         non-finite (NaN, ±Infinity).
  * @throws {SphereError} `INLINE_CAR_TOO_LARGE` — force-inline mode with
  *         `carBytes.length > RELAY_SAFE_CAP_BYTES`.
+ * @throws {SphereError} `IPFS_PUBLISHER_REQUIRED` — CID branch selected
+ *         (force-cid or auto-over-cap) but `publishToIpfs` is absent AND
+ *         `carBytes.byteLength > RELAY_SAFE_CAP_BYTES`.
  *
  * @see DeliveryStrategy in `types/uxf-transfer.ts`
  * @see clampInlineCap in `modules/payments/transfer/limits.ts`
@@ -229,6 +253,14 @@ export async function resolveDelivery(
     case 'force-cid': {
       // Always pin, regardless of size. Caller's explicit choice — e.g.,
       // audit-by-CID or storage-constrained recipient (§3.3.1).
+      //
+      // No-publisher fallback (approach γ): if no IPFS publisher is wired,
+      // fall back to inline when the bundle fits within the relay-safe
+      // ceiling. Throw IPFS_PUBLISHER_REQUIRED if the bundle is too large
+      // for inline delivery.
+      if (publishToIpfs === undefined) {
+        return carInlineFallback(carBytes, 'force-cid');
+      }
       const { cid } = await publishToIpfs(carBytes);
       return { kind: 'cid', cid, shouldPin: true };
     }
@@ -264,6 +296,13 @@ export async function resolveDelivery(
       }
 
       // Bundle exceeds the (possibly-clamped) inline cap → CID branch.
+      //
+      // No-publisher fallback (approach γ): if no IPFS publisher is wired,
+      // fall back to inline when the bundle fits within the relay-safe
+      // ceiling. Throw IPFS_PUBLISHER_REQUIRED if too large.
+      if (publishToIpfs === undefined) {
+        return carInlineFallback(carBytes, 'auto');
+      }
       const { cid } = await publishToIpfs(carBytes);
       return { kind: 'cid', cid, shouldPin: true };
     }
@@ -286,8 +325,43 @@ export async function resolveDelivery(
 }
 
 // =============================================================================
-// 3. Internal — auto-cap normalization
+// 3. Internal helpers
 // =============================================================================
+
+/**
+ * CAR-inline fallback for CID branches without a publisher (approach γ).
+ *
+ * When a CID delivery branch is selected (`force-cid` or `auto`-over-cap)
+ * but no `publishToIpfs` callback is wired, this helper attempts to fall
+ * back to inline (`uxf-car`) delivery:
+ *
+ *  - `carBytes.byteLength <= RELAY_SAFE_CAP_BYTES` → returns an inline
+ *    decision so the sender can still deliver without IPFS.
+ *  - `carBytes.byteLength > RELAY_SAFE_CAP_BYTES` → throws
+ *    `IPFS_PUBLISHER_REQUIRED` (the bundle is too large for inline Nostr
+ *    delivery; the caller must configure an IPFS publisher).
+ *
+ * The `strategyKind` argument is used only for the error message to give
+ * the operator a clear signal about which branch triggered the fallback.
+ *
+ * @internal
+ */
+function carInlineFallback(
+  carBytes: Uint8Array,
+  strategyKind: 'force-cid' | 'auto',
+): DeliveryDecision {
+  if (carBytes.byteLength <= RELAY_SAFE_CAP_BYTES) {
+    // Bundle fits within the relay-safe ceiling → inline fallback.
+    return { kind: 'inline', carBase64: carBytesToBase64(carBytes) };
+  }
+  throw new SphereError(
+    `resolveDelivery: ${strategyKind} strategy selected CID delivery but no publishToIpfs` +
+      ` callback was supplied and the CAR (${carBytes.byteLength} bytes) exceeds the` +
+      ` relay-safe inline ceiling of ${RELAY_SAFE_CAP_BYTES} bytes.` +
+      ' Configure an IPFS provider to send large bundles.',
+    'IPFS_PUBLISHER_REQUIRED',
+  );
+}
 
 /**
  * Validate and normalize the caller-supplied `inlineCapBytes` for `auto`
