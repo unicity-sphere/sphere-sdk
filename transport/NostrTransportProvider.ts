@@ -240,6 +240,16 @@ export class NostrTransportProvider implements TransportProvider {
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16, // exponential backoff cap
         pingIntervalMs: 15000, // 15 second keepalive pings (more aggressive to prevent drops)
+        // Bump query timeout from the SDK default of 5s to 20s.
+        // Real-world testnet observation (2026-05-01): under transient
+        // relay overload, kind:30078 (nametag binding) queries take 5-7s
+        // to return EVENT messages, even though the binding is on the
+        // relay. The default 5s timeout fires before the event arrives,
+        // resolveNametag returns null, and downstream sendDM throws
+        // INVALID_RECIPIENT — causing every np.propose_deal to fail. 20s
+        // gives the slow path enough headroom to complete while still
+        // bailing reasonably fast on a truly broken relay.
+        queryTimeoutMs: 20000,
       });
 
       // Add connection event listener for logging
@@ -464,6 +474,7 @@ export class NostrTransportProvider implements TransportProvider {
         reconnectIntervalMs: this.config.reconnectDelay,
         maxReconnectIntervalMs: this.config.reconnectDelay * 16,
         pingIntervalMs: 15000, // 15 second keepalive pings
+        queryTimeoutMs: 20000, // see same option above for rationale
       });
 
       // Add connection event listener
