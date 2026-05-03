@@ -405,26 +405,34 @@ const sourceLocks = new Map<string, Promise<void>>();
  * Wave 6 steelman fix: runtime guard. The export was previously
  * advisory-only ("MUST NOT" in JSDoc) — a production consumer doing
  * `import * as instantSender` could still invoke it and clear locks
- * mid-flight, re-opening the double-spend window. We now throw when
- * `process.env.NODE_ENV === 'production'` unless the explicit
- * `SPHERE_ALLOW_TEST_RESET=1` opt-in is set (for deliberate test
- * harnesses running in production-flag mode). The guard is permissive
- * everywhere else (`development`, `test`, undefined NODE_ENV) so
- * vitest's default test environment is unaffected.
+ * mid-flight, re-opening the double-spend window.
+ *
+ * Wave 7 steelman fix: FAIL-CLOSED. The Wave 6 guard fired only when
+ * `NODE_ENV === 'production'`. In browser bundles where `process` is
+ * stripped, `typeof process === 'undefined'` evaluated false-y for the
+ * outer condition and the reset proceeded — the exact attack the
+ * function exists to prevent. The guard is now allow-list: reset is
+ * forbidden by default everywhere, and only succeeds when the runtime
+ * is provably a test environment (NODE_ENV explicitly === 'test', or
+ * `SPHERE_ALLOW_TEST_RESET=1` for deliberate test harnesses).
  *
  * @internal
  */
 export function __resetSourceLocksForTesting(): void {
-  if (
+  // Fail-closed: production / browser / unknown environments all reject.
+  // Test environments must opt in. Browser bundles strip `process`, so
+  // absence-of-process means "not in a test runner" — denying reset is
+  // safer than the alternative.
+  const isTestEnv =
     typeof process !== 'undefined' &&
-    process.env?.NODE_ENV === 'production' &&
-    !process.env?.SPHERE_ALLOW_TEST_RESET
-  ) {
+    (process.env?.NODE_ENV === 'test' ||
+      process.env?.SPHERE_ALLOW_TEST_RESET === '1');
+  if (!isTestEnv) {
     throw new Error(
-      '__resetSourceLocksForTesting MUST NOT be called in production. ' +
+      '__resetSourceLocksForTesting is only available in test environments. ' +
         'Clearing locks mid-flight re-opens the same-process double-spend ' +
-        'window the lock exists to close. Set SPHERE_ALLOW_TEST_RESET=1 ' +
-        'to bypass (testing only).',
+        'window the lock exists to close. Set NODE_ENV=test or ' +
+        'SPHERE_ALLOW_TEST_RESET=1 to enable (testing only).',
     );
   }
   sourceLocks.clear();

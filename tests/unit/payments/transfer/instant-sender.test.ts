@@ -1249,17 +1249,25 @@ describe('__resetSourceLocksForTesting — Wave 5 steelman fix #171', () => {
 });
 
 // =============================================================================
-// 14. Wave 6 steelman fix — __resetSourceLocksForTesting production guard
+// 14. Wave 7 steelman fix — __resetSourceLocksForTesting fail-closed guard
 // =============================================================================
 //
-// The Wave 5 export was advisory-only ("MUST NOT" in JSDoc). A production
-// consumer using `import * as instantSender` could still call it at runtime,
-// clearing locks mid-flight and re-opening the same-process double-spend
-// window. The Wave 6 fix adds a runtime guard: the function throws when
-// `process.env.NODE_ENV === 'production'` unless the explicit
-// `SPHERE_ALLOW_TEST_RESET=1` opt-in is set.
+// Wave 5 exported the function as advisory-only ("MUST NOT" in JSDoc). A
+// production consumer using `import * as instantSender` could still call it
+// at runtime, clearing locks mid-flight and re-opening the same-process
+// double-spend window.
+//
+// Wave 6 added a runtime guard that fired only when NODE_ENV === 'production'.
+// In browser bundles where `process` is stripped, `typeof process ===
+// 'undefined'` evaluated false-y for the guard's outer condition and the
+// reset proceeded — the exact attack the function exists to prevent.
+//
+// Wave 7 inverts the polarity: FAIL-CLOSED. Reset is forbidden by default
+// everywhere and only succeeds when the runtime is provably a test
+// environment (NODE_ENV === 'test', or SPHERE_ALLOW_TEST_RESET === '1' as
+// an explicit opt-in for prod-flag test harnesses).
 
-describe('__resetSourceLocksForTesting — Wave 6 production guard', () => {
+describe('__resetSourceLocksForTesting — Wave 7 fail-closed guard', () => {
   // Save and restore the env across each test so we don't leak into
   // subsequent suites.
   const savedNodeEnv = process.env.NODE_ENV;
@@ -1278,28 +1286,46 @@ describe('__resetSourceLocksForTesting — Wave 6 production guard', () => {
     }
   });
 
-  it('throws when NODE_ENV === "production"', () => {
-    process.env.NODE_ENV = 'production';
-    delete process.env.SPHERE_ALLOW_TEST_RESET;
-    expect(() => __resetSourceLocksForTesting()).toThrow(
-      /MUST NOT be called in production/,
-    );
-  });
-
   it('succeeds when NODE_ENV === "test" (default vitest env)', () => {
     process.env.NODE_ENV = 'test';
     delete process.env.SPHERE_ALLOW_TEST_RESET;
     expect(() => __resetSourceLocksForTesting()).not.toThrow();
   });
 
-  it('succeeds when NODE_ENV is undefined', () => {
-    delete process.env.NODE_ENV;
+  it('throws when NODE_ENV === "production" (no opt-in)', () => {
+    process.env.NODE_ENV = 'production';
     delete process.env.SPHERE_ALLOW_TEST_RESET;
-    expect(() => __resetSourceLocksForTesting()).not.toThrow();
+    expect(() => __resetSourceLocksForTesting()).toThrow(
+      /only available in test environments/,
+    );
   });
 
-  it('succeeds when NODE_ENV === "production" + SPHERE_ALLOW_TEST_RESET === "1" (escape hatch)', () => {
+  it('throws when NODE_ENV is undefined (fail-closed)', () => {
+    delete process.env.NODE_ENV;
+    delete process.env.SPHERE_ALLOW_TEST_RESET;
+    expect(() => __resetSourceLocksForTesting()).toThrow(
+      /only available in test environments/,
+    );
+  });
+
+  it('throws when NODE_ENV === "development" (fail-closed)', () => {
+    process.env.NODE_ENV = 'development';
+    delete process.env.SPHERE_ALLOW_TEST_RESET;
+    expect(() => __resetSourceLocksForTesting()).toThrow(
+      /only available in test environments/,
+    );
+  });
+
+  it('succeeds when SPHERE_ALLOW_TEST_RESET === "1" regardless of NODE_ENV (escape hatch)', () => {
     process.env.NODE_ENV = 'production';
+    process.env.SPHERE_ALLOW_TEST_RESET = '1';
+    expect(() => __resetSourceLocksForTesting()).not.toThrow();
+
+    delete process.env.NODE_ENV;
+    process.env.SPHERE_ALLOW_TEST_RESET = '1';
+    expect(() => __resetSourceLocksForTesting()).not.toThrow();
+
+    process.env.NODE_ENV = 'development';
     process.env.SPHERE_ALLOW_TEST_RESET = '1';
     expect(() => __resetSourceLocksForTesting()).not.toThrow();
   });

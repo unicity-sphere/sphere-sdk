@@ -1641,13 +1641,19 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
     expect(data.message).toMatch(/5 consecutive over-size cycle/);
   });
 
-  // Wave 6 steelman fix — single-cycle flap suppression.
-  it('Wave 6: single-cycle flap (streak=1) does NOT emit recovery alert', async () => {
-    // Reproduces the warning scenario: writer flaps over→under each
-    // cycle. With Wave 5 power-of-two backoff alone, this would emit
-    // 2 alerts/cycle (alert at streak=1 + recovery at 1→0). With the
-    // Wave 6 MIN_RECOVERY_ALERT_STREAK=4 threshold, the recovery is
-    // suppressed for streak=1; only the truncation alert fires.
+  // Wave 7 steelman fix — emit-if-emitted recovery semantics.
+  it('Wave 7: single-cycle flap (streak=1) emits paired alert AND recovery', async () => {
+    // Wave 6 introduced MIN_RECOVERY_ALERT_STREAK=4 to suppress noise
+    // from single-cycle flaps. That left the streak=2 case dangling:
+    // `isPowerOfTwo(2)` fired a failure alert but the recovery was
+    // suppressed (`2 < 4`), leaving operator pager scripts with a
+    // dangling page.
+    //
+    // Wave 7 retired the constant in favour of "emit-if-emitted":
+    // recovery fires iff a failure alert was actually emitted in the
+    // current streak. Because `isPowerOfTwo(1) === true` always emits
+    // a failure alert at streak=1, the matching recovery alert MUST
+    // also fire — pager scripts always see resolution.
     const stubEntry: UxfTransferOutboxEntry = {
       ...makeOutboxEntry({ id: 'stub-finalized' }),
       status: 'finalized',
@@ -1724,15 +1730,27 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
         data.message.includes('under SCAN_LIST_HARD_GUARD again')
       );
     });
-    // No recovery alerts despite multiple over→under transitions
-    // (each streak resets at length 1, below MIN threshold).
-    expect(recoveryAlerts.length).toBe(0);
+    const truncationAlerts = events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('readAllNew returned')
+      );
+    });
+    // Each over→under transition emitted both a failure alert (at
+    // streak=1) AND a recovery alert. Counts pair within ±1: the
+    // poll-loop may stop mid-cycle (after an over read but before its
+    // matching under-recovery).
+    expect(recoveryAlerts.length).toBeGreaterThanOrEqual(1);
+    expect(Math.abs(recoveryAlerts.length - truncationAlerts.length)).toBeLessThanOrEqual(1);
   });
 
-  // Wave 6 — readAllNew throws recovery threshold.
-  it('Wave 6: read-failure recovery alert suppressed for short streaks (< 4)', async () => {
-    // Fail twice (streak=2, alert fires at streak=1), then succeed.
-    // Recovery alert MUST be suppressed because streak < MIN=4.
+  // Wave 7 — readAllNew throws emit-if-emitted recovery.
+  it('Wave 7: short read-failure streak fires alert AND paired recovery (emit-if-emitted)', async () => {
+    // Fail twice (alerts at streak=1 and streak=2), then succeed.
+    // Wave 6 suppressed recovery because `2 < MIN=4`; Wave 7 fires
+    // recovery because the streak emitted a failure alert.
     const stubEntry: UxfTransferOutboxEntry = {
       ...makeOutboxEntry({ id: 'stub-finalized' }),
       status: 'finalized',
@@ -1807,11 +1825,16 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
         data.message.includes('readAllNew recovered')
       );
     });
-    expect(recoveryAlerts.length).toBe(0);
+    // Wave 7: a failure alert fired at streak=1 (then again at
+    // streak=2 by power-of-two), so recovery MUST fire on next
+    // success.
+    expect(recoveryAlerts.length).toBe(1);
+    const data = recoveryAlerts[0].data as { message?: string };
+    expect(data.message).toMatch(/2 consecutive failure/);
   });
 
-  // Wave 6 — read-failure recovery alert fires for sustained streak (>= 4).
-  it('Wave 6: read-failure recovery alert fires for sustained streak (>= 4)', async () => {
+  // Wave 7 — sustained streak still fires (regression safety).
+  it('Wave 7: read-failure recovery alert fires for sustained streak (>= 4)', async () => {
     const stubEntry: UxfTransferOutboxEntry = {
       ...makeOutboxEntry({ id: 'stub-finalized' }),
       status: 'finalized',

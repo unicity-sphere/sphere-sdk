@@ -244,26 +244,38 @@ describe('Wave 5 R1 — recipient `_recipientRequestContextMap` extraction (RUNT
     expect(reqIdHex.length).toBe(68); // 0000 algo prefix + 32-byte hex
   });
 
-  it('NEW CODE PATH SUCCEEDS: authenticator extractable from data.authenticator (Wave 5 sender embed)', async () => {
+  it('HELPER FIXTURE ONLY: synthetic bundle exposes data.authenticator (legacy fixture; production senders do NOT embed)', async () => {
+    // Wave 7 hygiene: this test exercises the test-only helper
+    // `buildRealisticTransferTxJson()`, which constructs a bundle by
+    // hand-mounting `data.authenticator`. It is NOT representative of
+    // production behaviour: Wave 6 reverted Wave 5's sender-side embed
+    // because the IPLD wire format (deconstructTransferData →
+    // assembleTransactionData) does not preserve any
+    // `data.authenticator` field. Real production bundles round-tripped
+    // through the UXF pool always have `authenticator` absent at the
+    // recipient, and the recipient deliberately stores `authenticator
+    // = ''` in its queue entry. The §6.1 race-lost binding is
+    // transactionHash-only; canonicalAuthenticatorEquals returns
+    // 'match' on empty side, degrading the §6.3 most-recent-proof
+    // metadata compare without rejecting valid proofs.
+    //
+    // The assertions below verify only that the helper itself is
+    // self-consistent, not that production extracts the field.
     const { transferTxJson, expectedAuthenticatorJson } = await buildRealisticTransferTxJson();
 
-    // The recipient extracts data.authenticator (Wave 5 sender added this).
     const dataObj = transferTxJson.data;
     const rawAuth = (dataObj as Record<string, unknown>).authenticator;
     expect(rawAuth).toBeDefined();
     expect(rawAuth).not.toBeNull();
     expect(typeof rawAuth).toBe('object');
 
-    // Round-trip via Authenticator.fromJSON to canonicalize key order.
     const { Authenticator } = await import(
       '@unicitylabs/state-transition-sdk/lib/api/Authenticator'
     );
     const authObj = Authenticator.fromJSON(rawAuth);
     const canonicalAuthJson = JSON.stringify(authObj.toJSON());
 
-    // Byte-equality with the sender's canonical JSON.
     expect(canonicalAuthJson).toBe(expectedAuthenticatorJson);
-    // It's NOT the empty string (the Wave 2 bug populated authenticator='').
     expect(canonicalAuthJson.length).toBeGreaterThan(50);
   });
 
@@ -862,6 +874,148 @@ describe('Wave 6 critical — dispositionWriter fallback status-flip ctx retenti
 
     // Ctx MUST be cleaned up after persistence succeeds.
     expect(recipientFinalizationContext.has(tokenId)).toBe(false);
+  });
+
+  it('Wave 7 hygiene: clearSaveFailureStreak() wipes per-tokenId entries', async () => {
+    // The closure-local `saveFailureStreak` Map accumulates entries
+    // for tokens that hit save() failures and never reach success.
+    // If the token leaves the wallet (tombstone, address switch),
+    // the entry is orphaned. Wave 7 exposes a `clearSaveFailureStreak`
+    // callback the PaymentsModule.destroy() path invokes so the Map
+    // doesn't outlive the recipient context map.
+    const tokenIds = ['tok-cleanup-1', 'tok-cleanup-2', 'tok-cleanup-3'];
+    const emit = vi.fn();
+
+    // Build with a long sequence of failures to populate the streak.
+    const harness = makeFallbackBuilder({
+      saveImpl: vi.fn().mockRejectedValue(new Error('disk full')),
+      emit,
+      tokenId: tokenIds[0],
+      localTokenId: 'local-cleanup-1',
+    });
+    // Drive multiple failures so the Map accumulates.
+    for (let i = 0; i < 3; i++) {
+      await harness.built.dispositionWriter.write('addr-test', {
+        tokenId: tokenIds[0],
+        disposition: 'VALID',
+      } as never);
+    }
+
+    // The Map is closure-local; we can't observe its size directly.
+    // But we CAN observe the alert pattern — power-of-two boundaries
+    // (1, 2). Then clear, then drive again: the streak resets to 0
+    // and a new failure-1 alert fires.
+    const alertsBefore = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    ).length;
+    expect(alertsBefore).toBeGreaterThanOrEqual(2);
+
+    // Invoke the new cleanup callback.
+    expect(typeof harness.built.clearSaveFailureStreak).toBe('function');
+    harness.built.clearSaveFailureStreak();
+
+    // Re-seed the context (the writer deletes ctx ONLY on save success;
+    // since save kept throwing, ctx is still present per Wave 6 design).
+    expect(harness.recipientFinalizationContext.has(tokenIds[0])).toBe(true);
+
+    // Drive one more failure — the streak counter for this token was
+    // wiped, so this is "first" again and an alert fires.
+    emit.mockClear();
+    await harness.built.dispositionWriter.write('addr-test', {
+      tokenId: tokenIds[0],
+      disposition: 'VALID',
+    } as never);
+    const alertsAfter = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    ).length;
+    // Streak counter reset → first failure of new streak hits power-
+    // of-two boundary (1) → alert fires.
+    expect(alertsAfter).toBe(1);
+  });
+
+  it('Wave 7 CAS: rollback skips when concurrent mutation supplants `updatedFallback`', async () => {
+    // Wave 6 rolled back the in-memory `tokens.set(localTokenId, stored)`
+    // unconditionally on save() failure. If a concurrent mutation
+    // landed during the await window — replacing our updated value
+    // with a newer one — the rollback would clobber it. Wave 7 adds
+    // CAS: only restore `stored` when the current Map value is still
+    // our updated value.
+    //
+    // Reproduce by injecting a concurrent mutation inside the
+    // simulated save() throw — the save promise rejects only after
+    // we've installed a competing token shape.
+    const tokenId = 'tok-fb-cas-001';
+    const localTokenId = 'local-fb-cas-001';
+    const emit = vi.fn();
+
+    let tokensRef: Map<string, import('../../../types').Token> | null = null;
+
+    // saveImpl that mutates `tokens` to a third value before throwing.
+    const concurrentToken: import('../../../types').Token = {
+      id: localTokenId,
+      coinId: 'UCT',
+      symbol: 'UCT',
+      name: 'Unicity',
+      decimals: 8,
+      // Sentinel value the rollback MUST NOT clobber.
+      amount: 'CONCURRENT-WINS',
+      sdkData: '{"concurrent":true}',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const saveImpl = vi.fn().mockImplementation(async () => {
+      // Simulate a concurrent path winning during the await.
+      tokensRef!.set(localTokenId, concurrentToken);
+      throw new Error('disk full (after concurrent mutation)');
+    });
+
+    const harness = makeFallbackBuilder({
+      saveImpl,
+      emit,
+      tokenId,
+      localTokenId,
+    });
+    tokensRef = harness.tokens;
+
+    await harness.built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    // The CAS rollback compared `tokens.get(localTokenId)` vs our
+    // `updatedFallback` — they differed (concurrent mutation), so
+    // the rollback was skipped. Concurrent mutation is preserved.
+    const final = harness.tokens.get(localTokenId);
+    expect(final).toBeDefined();
+    expect(final?.amount).toBe('CONCURRENT-WINS');
+    expect(final?.sdkData).toBe('{"concurrent":true}');
+  });
+
+  it('Wave 7 CAS: rollback proceeds when no concurrent mutation occurred', async () => {
+    // Counter-test: the normal case where save() throws and no
+    // concurrent path interfered. CAS observes our `updatedFallback`
+    // is still current → rolls back to `stored` so the retry sees
+    // `status === 'pending'` and re-enters the fallback block.
+    const tokenId = 'tok-fb-cas-002';
+    const localTokenId = 'local-fb-cas-002';
+    const emit = vi.fn();
+
+    const harness = makeFallbackBuilder({
+      saveImpl: vi.fn().mockRejectedValue(new Error('disk full')),
+      emit,
+      tokenId,
+      localTokenId,
+    });
+
+    await harness.built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    const final = harness.tokens.get(localTokenId);
+    expect(final).toBeDefined();
+    expect(final?.status).toBe('pending');
   });
 
   it('FALLBACK: power-of-two save-failure backoff applies on the fallback path', async () => {

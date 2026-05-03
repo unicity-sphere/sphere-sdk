@@ -171,20 +171,19 @@ function isPowerOfTwoRecipient(n: number): boolean {
   return n > 0 && (n & (n - 1)) === 0;
 }
 
-/**
- * Minimum streak length for emitting a recovery alert.
- *
- * Wave 6 steelman fix (mirror of sender-side fix): the Wave 5
- * power-of-two backoff fires a recovery info alert on every transition
- * from streak >= 1 → 0. A misconfigured store that flaps over→under
- * each cycle would otherwise produce two alerts per cycle (alert at
- * streak=1 + recovery at streak=0). The threshold suppresses noise for
- * single-cycle blips; sustained failures (4+ cycles) still emit
- * recovery as before.
- *
- * @internal
- */
-const MIN_RECOVERY_ALERT_STREAK = 4;
+// Wave 6 introduced MIN_RECOVERY_ALERT_STREAK (= 4) on the recipient
+// side as a mirror of the sender fix. Wave 7 retired the constant: at
+// streak=2 an `isPowerOfTwoRecipient(2)` failure alert fired, but the
+// matching recovery transition (`2 → 0`) was suppressed by `2 < 4`,
+// leaving the operator's page-on-alert / clear-on-recovery script with
+// a dangling page.
+//
+// The Wave 7 rule is "emit recovery iff a failure alert was emitted in
+// THIS streak". Each counter pairs with a `*EmittedAtStreak` watermark
+// that records the streak depth at which the most recent failure alert
+// fired (0 ⇒ no failure alert this streak). Recovery emits when streak
+// transitions non-zero → zero AND the watermark is non-zero. Watermark
+// resets together with the counter.
 
 // =============================================================================
 // 1. Disposition writer surface — narrow shape over T.3.C
@@ -476,6 +475,14 @@ export class FinalizationWorkerRecipient {
    */
   private scanReadFailureStreak = 0;
   /**
+   * Wave 7: emit-if-emitted watermark for the read-failure counter.
+   * See sender-side {@link
+   * FinalizationWorkerSender#scanReadFailureEmittedAtStreak} for the
+   * rationale. 0 ⇒ no failure alert in the current streak.
+   * @internal
+   */
+  private scanReadFailureEmittedAtStreak = 0;
+  /**
    * Wave 5 steelman: consecutive over-size truncation counter for
    * exponential alert backoff. Same rationale as the sender worker's
    * `scanOversizeStreak` — a persistently-misconfigured queue store
@@ -485,6 +492,12 @@ export class FinalizationWorkerRecipient {
    * @internal
    */
   private scanOversizeStreak = 0;
+  /**
+   * Wave 7: emit-if-emitted watermark for the over-size counter.
+   * See {@link scanReadFailureEmittedAtStreak} doc.
+   * @internal
+   */
+  private scanOversizeEmittedAtStreak = 0;
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6).
@@ -1243,19 +1256,20 @@ export class FinalizationWorkerRecipient {
                 `overruns: ${this.scanOversizeStreak}). Inspect the ` +
                 `finalization queue for unbounded growth (missing tombstone GC?).`,
             });
+            // Wave 7 emit-if-emitted watermark.
+            this.scanOversizeEmittedAtStreak = this.scanOversizeStreak;
           }
           workingList = all.slice(0, RECIPIENT_SCAN_LIST_HARD_GUARD);
         } else if (this.scanOversizeStreak > 0) {
           // Recovery: queueStore is now within budget.
           //
-          // Wave 6 steelman fix: only emit a recovery info alert when
-          // the streak reached MIN_RECOVERY_ALERT_STREAK. Single-cycle
-          // flaps (1→0) would otherwise emit a recovery alert every
-          // flap because `isPowerOfTwo(1) === true` already emitted
-          // the failure alert — operators get two alerts per cycle.
-          // Threshold suppresses noise for trivial blips; sustained
-          // failures still emit recovery. Counter resets unconditionally.
-          if (this.scanOversizeStreak >= MIN_RECOVERY_ALERT_STREAK) {
+          // Wave 7 steelman fix: emit-if-emitted (mirror of sender-side
+          // fix). Wave 6's `MIN_RECOVERY_ALERT_STREAK = 4` left a gap
+          // at streak=2-3 where a failure alert fired but recovery was
+          // suppressed, leaving pager scripts with a dangling page.
+          // Recovery now emits iff a failure alert was emitted in this
+          // streak.
+          if (this.scanOversizeEmittedAtStreak > 0) {
             this.options.emit('transfer:operator-alert', {
               code: 'structural',
               message:
@@ -1265,12 +1279,14 @@ export class FinalizationWorkerRecipient {
             });
           }
           this.scanOversizeStreak = 0;
+          this.scanOversizeEmittedAtStreak = 0;
         }
 
         // Successful read — emit recovery info if we were in a streak.
-        // Wave 6 steelman fix: same threshold gate as oversize recovery.
+        // Wave 7 steelman fix: emit-if-emitted gating (see oversize
+        // path above).
         if (this.scanReadFailureStreak > 0) {
-          if (this.scanReadFailureStreak >= MIN_RECOVERY_ALERT_STREAK) {
+          if (this.scanReadFailureEmittedAtStreak > 0) {
             this.options.emit('transfer:operator-alert', {
               code: 'structural',
               message:
@@ -1279,6 +1295,7 @@ export class FinalizationWorkerRecipient {
             });
           }
           this.scanReadFailureStreak = 0;
+          this.scanReadFailureEmittedAtStreak = 0;
         }
 
         // Group by tokenId. The queue can hold K entries per K-deep
@@ -1324,6 +1341,8 @@ export class FinalizationWorkerRecipient {
               `FinalizationWorkerRecipient.scanLoop: queueStore.list threw ` +
               `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
           });
+          // Wave 7 emit-if-emitted watermark.
+          this.scanReadFailureEmittedAtStreak = this.scanReadFailureStreak;
         }
       }
 

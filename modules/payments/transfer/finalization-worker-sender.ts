@@ -225,22 +225,18 @@ function isPowerOfTwo(n: number): boolean {
   return n > 0 && (n & (n - 1)) === 0;
 }
 
-/**
- * Minimum streak length for emitting a recovery alert.
- *
- * Wave 6 steelman fix: the Wave 5 power-of-two backoff fires a recovery
- * info alert on every transition from streak >= 1 → 0. A misconfigured
- * writer that flaps over→under each cycle therefore produces two alerts
- * per cycle (alert at streak=1 + recovery at streak=0), because
- * `isPowerOfTwo(1) === true`. The fix: suppress recovery alerts unless
- * the streak reached at least this threshold — single-cycle blips no
- * longer generate noise. Threshold is exclusive of the original alert
- * boundary at 1; recovery only fires for genuine sustained failures
- * (4+ cycles).
- *
- * @internal
- */
-const MIN_RECOVERY_ALERT_STREAK = 4;
+// Wave 6 introduced MIN_RECOVERY_ALERT_STREAK (= 4) to suppress noise from
+// single-cycle flaps. Wave 7 retired the constant: at streak=2 an
+// `isPowerOfTwo(2)` failure alert fired, but the matching recovery
+// transition (`2 → 0`) was suppressed by `2 < 4`, leaving the operator's
+// page-on-alert / clear-on-recovery script with a dangling page.
+//
+// The Wave 7 rule is "emit recovery iff a failure alert was emitted in
+// THIS streak". Each counter pairs with a `*EmittedAtStreak` watermark
+// that records the streak depth at which the most recent failure alert
+// fired (0 ⇒ no failure alert this streak). Recovery emits when streak
+// transitions non-zero → zero AND the watermark is non-zero. Watermark
+// resets together with the counter.
 
 // =============================================================================
 // 2. Worker construction options
@@ -476,6 +472,14 @@ export class FinalizationWorkerSender {
    */
   private scanReadFailureStreak = 0;
   /**
+   * Wave 7: streak depth at which the most recent failure alert fired
+   * for the read-failure counter (0 ⇒ no failure alert in the current
+   * streak). Used by the recovery transition to decide "emit-if-
+   * emitted" — a recovery alert fires only if a failure alert was
+   * actually delivered, so paged operators always see resolution.
+   */
+  private scanReadFailureEmittedAtStreak = 0;
+  /**
    * Wave 5 steelman: consecutive over-size truncation counter for
    * exponential alert backoff. A persistently-misconfigured writer
    * (no tombstone GC, runaway slot recovery) would otherwise fire a
@@ -486,6 +490,13 @@ export class FinalizationWorkerSender {
    * reset the counter.
    */
   private scanOversizeStreak = 0;
+  /**
+   * Wave 7: streak depth at which the most recent failure alert fired
+   * for the over-size counter (0 ⇒ no failure alert in the current
+   * streak). Pairs with `scanOversizeStreak` for the emit-if-emitted
+   * recovery rule (see {@link scanReadFailureEmittedAtStreak} doc).
+   */
+  private scanOversizeEmittedAtStreak = 0;
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6
@@ -1092,20 +1103,29 @@ export class FinalizationWorkerSender {
                 `${this.scanOversizeStreak}). Inspect the outbox writer for unbounded ` +
                 `growth (missing tombstone GC?).`,
             });
+            // Wave 7 emit-if-emitted: record that a failure alert
+            // fired at this streak depth so the recovery transition
+            // can decide whether to emit resolution.
+            this.scanOversizeEmittedAtStreak = this.scanOversizeStreak;
           }
           workingList = all.slice(0, SCAN_LIST_HARD_GUARD);
         } else if (this.scanOversizeStreak > 0) {
           // Recovery: writer is now within budget.
           //
-          // Wave 6 steelman fix: only emit a recovery info alert when
-          // the streak reached MIN_RECOVERY_ALERT_STREAK. Single-cycle
-          // flaps (streak 1→0) would otherwise emit a recovery alert
-          // every flap because `isPowerOfTwo(1) === true` already
-          // emitted the failure alert — operators get two alerts per
-          // cycle (alert+recovery) for trivial blips. The threshold
-          // suppresses noise; sustained failures (4+ cycles) still
-          // emit recovery as before. Counter resets unconditionally.
-          if (this.scanOversizeStreak >= MIN_RECOVERY_ALERT_STREAK) {
+          // Wave 7 steelman fix: emit-if-emitted. Wave 6's
+          // `MIN_RECOVERY_ALERT_STREAK = 4` left a gap at streak=2-3
+          // where `isPowerOfTwo(2)` fired a failure alert but the
+          // recovery transition was suppressed (`2 < 4`), leaving
+          // pager scripts with a dangling page. The new rule emits
+          // recovery iff a failure alert was actually emitted in
+          // THIS streak (`scanOversizeEmittedAtStreak > 0`).
+          // Sub-alert blips (streak < 1 boundary impossible; streak=1
+          // always alerts so any non-zero streak transition emitted
+          // at least one alert) — wait, streak=1 ALWAYS alerts due
+          // to `isPowerOfTwo(1)`, so single-cycle flaps DO get a
+          // recovery now. That's correct behaviour: if we paged on
+          // streak=1, we must clear on recovery.
+          if (this.scanOversizeEmittedAtStreak > 0) {
             this.options.emit('transfer:operator-alert', {
               code: 'structural',
               message:
@@ -1114,14 +1134,15 @@ export class FinalizationWorkerSender {
             });
           }
           this.scanOversizeStreak = 0;
+          this.scanOversizeEmittedAtStreak = 0;
         }
 
         // Successful read — emit recovery info if we were in a streak.
-        // Wave 6 steelman fix: same threshold gate as the oversize
-        // recovery — see comment above. Single-cycle blips would
-        // otherwise produce 2 alerts/cycle when flapping.
+        // Wave 7 steelman fix: emit-if-emitted gating (see oversize
+        // path above). Recovery emits iff a failure alert fired in
+        // this streak.
         if (this.scanReadFailureStreak > 0) {
-          if (this.scanReadFailureStreak >= MIN_RECOVERY_ALERT_STREAK) {
+          if (this.scanReadFailureEmittedAtStreak > 0) {
             this.options.emit('transfer:operator-alert', {
               code: 'structural',
               message:
@@ -1130,6 +1151,7 @@ export class FinalizationWorkerSender {
             });
           }
           this.scanReadFailureStreak = 0;
+          this.scanReadFailureEmittedAtStreak = 0;
         }
 
         // Filter to entries the worker should drive. `delivered-instant`
@@ -1177,6 +1199,8 @@ export class FinalizationWorkerSender {
               `FinalizationWorkerSender.scanLoop: readAllNew threw ` +
               `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
           });
+          // Wave 7 emit-if-emitted watermark.
+          this.scanReadFailureEmittedAtStreak = this.scanReadFailureStreak;
         }
       }
 

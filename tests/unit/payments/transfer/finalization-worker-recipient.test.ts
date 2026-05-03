@@ -744,14 +744,19 @@ describe('FinalizationWorkerRecipient — RECIPIENT_SCAN_LIST_HARD_GUARD truncat
   });
 });
 
-describe('FinalizationWorkerRecipient — Wave 6 recovery alert threshold', () => {
-  // Reproduces the warning scenario from Wave 5 steelman: a misconfigured
-  // queueStore that flaps over→under each cycle would emit 2 alerts/cycle
-  // (alert at streak=1 + recovery at 1→0). With Wave 6's
-  // MIN_RECOVERY_ALERT_STREAK=4 threshold, single-cycle blips no longer
-  // emit recovery alerts.
+describe('FinalizationWorkerRecipient — Wave 7 emit-if-emitted recovery semantics', () => {
+  // Wave 6 introduced MIN_RECOVERY_ALERT_STREAK=4 to suppress noise from
+  // single-cycle flaps. That left streak=2-3 cases dangling: a failure
+  // alert would fire (`isPowerOfTwo(2) === true`) but the recovery alert
+  // was suppressed because `2 < 4`, leaving operator pager scripts with
+  // a dangling page.
+  //
+  // Wave 7 retired the constant: recovery emits iff a failure alert
+  // was actually emitted in the current streak. Watermark
+  // `*EmittedAtStreak` records the streak depth at the most recent
+  // failure alert (0 ⇒ no alert this streak).
 
-  it('Wave 6: single-cycle flap (streak=1) does NOT emit oversize recovery alert', async () => {
+  it('Wave 7: single-cycle flap (streak=1) emits paired alert AND recovery', async () => {
     const harness = buildWorker({ sleepFn: yieldingSleep });
     const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
       '../../../../modules/payments/transfer/finalization-worker-recipient'
@@ -790,10 +795,22 @@ describe('FinalizationWorkerRecipient — Wave 6 recovery alert threshold', () =
         data.message.includes('under RECIPIENT_SCAN_LIST_HARD_GUARD again')
       );
     });
-    expect(recoveryAlerts.length).toBe(0);
+    const truncationAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('queueStore.list returned')
+      );
+    });
+    // Each over→under transition emits both a failure alert (at
+    // streak=1, since `isPowerOfTwo(1) === true`) AND a recovery
+    // alert. Counts pair: recovery fires exactly when truncation fired.
+    expect(recoveryAlerts.length).toBeGreaterThanOrEqual(1);
+    expect(recoveryAlerts.length).toBe(truncationAlerts.length);
   });
 
-  it('Wave 6: oversize recovery alert fires for sustained streak (>= 4)', async () => {
+  it('Wave 7: oversize recovery alert fires for sustained streak (>= 4)', async () => {
     const harness = buildWorker({ sleepFn: yieldingSleep });
     const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
       '../../../../modules/payments/transfer/finalization-worker-recipient'
@@ -837,7 +854,11 @@ describe('FinalizationWorkerRecipient — Wave 6 recovery alert threshold', () =
     expect(data.message).toMatch(/5 consecutive over-size cycle/);
   });
 
-  it('Wave 6: read-failure recovery alert suppressed for short streaks (< 4)', async () => {
+  it('Wave 7: short read-failure streak fires alert AND paired recovery', async () => {
+    // Fail twice (alerts at streak=1 and streak=2 by power-of-two),
+    // then succeed. Wave 6 suppressed recovery because `2 < MIN=4`,
+    // leaving pager scripts with a dangling page. Wave 7 fires
+    // recovery because a failure alert was emitted in this streak.
     const harness = buildWorker({ sleepFn: yieldingSleep });
     const readCalls = { count: 0 };
     harness.queueStore.list = (async () => {
@@ -864,10 +885,12 @@ describe('FinalizationWorkerRecipient — Wave 6 recovery alert threshold', () =
         data.message.includes('queueStore.list recovered')
       );
     });
-    expect(recoveryAlerts.length).toBe(0);
+    expect(recoveryAlerts.length).toBe(1);
+    const data = recoveryAlerts[0].data as { message?: string };
+    expect(data.message).toMatch(/2 consecutive failure/);
   });
 
-  it('Wave 6: read-failure recovery alert fires for sustained streak (>= 4)', async () => {
+  it('Wave 7: read-failure recovery alert fires for sustained streak (>= 4)', async () => {
     const harness = buildWorker({ sleepFn: yieldingSleep });
     const readCalls = { count: 0 };
     harness.queueStore.list = (async () => {

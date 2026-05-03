@@ -1687,17 +1687,36 @@ export class PaymentsModule {
                   //      (state.predicate).publicKey`), and
                   //      `sourceStateHash = txData.sourceState.calculateHash()`.
                   //
-                  //   3. `authenticator` — the sender's authenticator
-                  //      from the bundled `data.authenticator` (the
-                  //      sender embeds it for the unfinalized case so
-                  //      the recipient can mirror the §6.3 byte-equality
-                  //      compare). If the bundle does not carry it
-                  //      (legacy bundles, downgrade scenarios) we fall
-                  //      back to empty string and emit `transfer:
-                  //      operator-alert` — the §6.3 conflict check is
-                  //      degraded for that entry but §6.1 race-lost
-                  //      still works (only `transactionHash` matters
-                  //      for race-lost).
+                  //   3. `authenticator` — by design EMPTY (`''`) on the
+                  //      queue entry. Wave 6 reverted Wave 5's sender-
+                  //      side embed: the IPLD wire format
+                  //      (deconstructTransferData → assembleTransactionData)
+                  //      does NOT preserve any `data.authenticator` field,
+                  //      so the embed was dead code (the recipient always
+                  //      observed `undefined`). The queue-entry
+                  //      `authenticator` is therefore metadata-only —
+                  //      `canonicalAuthenticatorEquals` (import-inclusion-
+                  //      proof.ts) returns `'match'` when one side is
+                  //      empty, so the §6.3 binding compare degrades to
+                  //      `transactionHash`-only without rejecting valid
+                  //      proofs.
+                  //
+                  //      Defense layout:
+                  //        - §6.1 race-lost: keyed by `transactionHash`
+                  //          alone — fully unaffected by the empty
+                  //          authenticator.
+                  //        - §6.3 most-recent-proof: compares the
+                  //          aggregator-served authenticator on the
+                  //          ATTACHED proof vs the aggregator-served
+                  //          authenticator on the OBSERVED poll — both
+                  //          come from the aggregator, never from the
+                  //          queue entry. Empty queue authenticator is
+                  //          benign.
+                  //        - Forged-authenticator defense is provided by
+                  //          trust-base verification: the proof verifier
+                  //          rejects unauthentic proofs with
+                  //          `PATH_INVALID` / `NOT_AUTHENTICATED` BEFORE
+                  //          the binding compare runs.
                   try {
                     // (a) Canonical transactionHash imprint hex (matches
                     //     the aggregator's stored value).
@@ -2161,6 +2180,10 @@ export class PaymentsModule {
         });
         this._recipientFinalizationQueue = built.queue;
         this.finalizationWorkerRecipient = built.worker;
+        // Wave 7 hygiene: retain the streak-cleanup callback so destroy()
+        // can wipe the closure-local `saveFailureStreak` Map alongside
+        // the other context maps.
+        this._recipientSaveFailureStreakClear = built.clearSaveFailureStreak;
         this.finalizationWorkerRecipient.start();
         logger.debug(
           'Payments',
@@ -2456,6 +2479,16 @@ export class PaymentsModule {
    * @internal
    */
   private _recipientFinalizationQueue: FinalizationQueue | null = null;
+
+  /**
+   * Wave 7 hygiene — callback returned by
+   * `buildDefaultFinalizationWorkerRecipient` that clears the closure-
+   * local `saveFailureStreak` Map. Invoked from {@link destroy} so the
+   * streak doesn't outlive the recipient finalization context.
+   *
+   * @internal
+   */
+  private _recipientSaveFailureStreakClear: (() => void) | null = null;
 
   /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
@@ -2772,6 +2805,20 @@ export class PaymentsModule {
     this._senderRequestContextMap.clear();
     this._recipientRequestContextMap.clear();
     this._recipientFinalizationContext.clear();
+    // Wave 7 hygiene — wipe the recipient worker's save-failure streak
+    // so per-tokenId entries don't outlive the context map. Otherwise a
+    // long-running wallet that fails save() and then loses the token
+    // (tombstone, address switch, manual delete) would accumulate dead
+    // streak entries indefinitely.
+    if (this._recipientSaveFailureStreakClear !== null) {
+      try {
+        this._recipientSaveFailureStreakClear();
+      } catch {
+        // The clearer is `Map.clear()` — non-throwing in practice — but
+        // swallow defensively so destroy() stays total.
+      }
+      this._recipientSaveFailureStreakClear = null;
+    }
   }
 
   // ===========================================================================
@@ -9867,6 +9914,15 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
   worker: FinalizationWorkerRecipient;
   queue: FinalizationQueue;
   dispositionWriter: FinalizationDispositionWriter;
+  /**
+   * Wave 7 hygiene: clears the closure-local `saveFailureStreak` Map.
+   * The streak entries are otherwise per-tokenId and only cleaned on
+   * save success — so a token that fails save then leaves the wallet
+   * (tombstone, deletion, address switch) leaves a dead streak entry.
+   * destroy() and similar instance-cleanup paths invoke this to keep
+   * the closure's memory bounded.
+   */
+  clearSaveFailureStreak: () => void;
 } {
   const {
     addressId,
@@ -10215,7 +10271,17 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
               // never re-attempting save() and never emitting an
               // alert. The retry path needs a clean 'pending' slate to
               // re-flip and retry persistence.
-              tokens.set(ctx.localTokenId, stored);
+              //
+              // Wave 7 steelman fix — compare-and-set rollback. While
+              // we awaited save(), a concurrent path (another finalize,
+              // a tombstone, a manual edit) may have replaced our
+              // `updatedFallback` value with a different mutation. If
+              // we blindly write `stored` back we clobber that work.
+              // CAS: only restore if our update is still the current
+              // value; otherwise leave the concurrent mutation alone.
+              if (tokens.get(ctx.localTokenId) === updatedFallback) {
+                tokens.set(ctx.localTokenId, stored);
+              }
               const saveMsg = `Task #151: save() after status flip threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
               logger.warn('Payments', saveMsg);
               // Wave 4 fix — emit operator-alert when persistence fails.
@@ -10353,7 +10419,12 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     ...(signal !== undefined ? { signal } : {}),
   });
 
-  return { worker, queue, dispositionWriter };
+  return {
+    worker,
+    queue,
+    dispositionWriter,
+    clearSaveFailureStreak: () => saveFailureStreak.clear(),
+  };
 }
 
 // =============================================================================
