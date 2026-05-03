@@ -348,4 +348,99 @@ describe('AccountingModule.payInvoice() — provisional reservation (BUG-002 Fix
     // After payInvoice, balanceCache for this invoice should be invalidated
     expect(mod.balanceCache.has(INVOICE_ID)).toBe(false);
   });
+
+  // UT-PAY-PROV-008
+  // Durability test: the provisional ledger entry must reach disk BEFORE
+  // payInvoice returns. Without this guarantee, a crash between `send()`
+  // returning to the caller and the next deferred-flush trigger would lose
+  // the provisional entry, allowing a recovery-time recompute to re-issue
+  // the same payment as a distinct second on-chain transferId — producing
+  // over-coverage on the receiver. Regression coverage for the audit's #1
+  // hypothesis on Carol's payout-invoice over-coverage in the multi-trader
+  // e2e (escrow-service crash-recovery audit, May 2026).
+  it('UT-PAY-PROV-008: provisional entry is flushed to storage before payInvoice returns', async () => {
+    const terms = makeTerms();
+    const { module, mocks } = createTestAccountingModule();
+    mocks.payments._tokens = [makeInvoiceToken(terms)];
+    await module.load();
+
+    // Snapshot storage.set call count before payInvoice — load() may have
+    // written some bookkeeping entries during initialization.
+    const setCallsBefore = mocks.storage.set.mock.calls.length;
+
+    const result = await module.payInvoice(INVOICE_ID, {
+      targetIndex: 0,
+      assetIndex: 0,
+    });
+
+    // Storage MUST have been written to during the payInvoice call — specifically,
+    // the inv_ledger:{invoiceId} entry containing the provisional forward ref.
+    const setCallsDuring = mocks.storage.set.mock.calls.slice(setCallsBefore);
+    const ledgerWrites = setCallsDuring.filter(([key]) =>
+      typeof key === 'string' && key.includes(`inv_ledger:${INVOICE_ID}`),
+    );
+    expect(ledgerWrites.length).toBeGreaterThanOrEqual(1);
+
+    // The persisted entry must contain the provisional reference. Read the
+    // most recent ledger write and confirm the provisional entry is present.
+    const lastLedgerWrite = ledgerWrites[ledgerWrites.length - 1]!;
+    const persistedJson = lastLedgerWrite[1] as string;
+    const persistedEntries = JSON.parse(persistedJson) as Record<string, InvoiceTransferRef>;
+    const provisionalKey = `provisional:${result.id}::UCT`;
+    expect(persistedEntries[provisionalKey]).toBeDefined();
+    expect(persistedEntries[provisionalKey]!.amount).toBe('1000');
+    expect(persistedEntries[provisionalKey]!.paymentDirection).toBe('forward');
+
+    // After payInvoice returns, _drainFlushPromise must be a no-op — the chain
+    // is already empty because the flush completed inline before return.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = module as any;
+    expect(mod._flushPromise).toBeNull();
+    // dirtyLedgerEntries should be empty (cleared by the flush)
+    expect(mod.dirtyLedgerEntries.size).toBe(0);
+  });
+
+  // UT-PAY-PROV-009
+  // Durability error-propagation test: if the inline flush's `storage.set`
+  // rejects (disk full, EIO, locked DB), `payInvoice` MUST reject — not return
+  // success while `dirtyLedgerEntries` stays populated. Earlier review feedback
+  // flagged a bug where the flush's `.catch(...log...)` silently swallowed the
+  // storage rejection: `payInvoice` returned success, but the on-disk durability
+  // claim was a lie. The exact crash window the durability fix aims to close
+  // would have been reopened the moment a storage error coincided with an OS
+  // crash. This test pins the corrected behavior.
+  it('UT-PAY-PROV-009: payInvoice REJECTS when inline flush storage write fails', async () => {
+    const terms = makeTerms();
+    const { module, mocks } = createTestAccountingModule();
+    mocks.payments._tokens = [makeInvoiceToken(terms)];
+    await module.load();
+
+    // Reject the FIRST `inv_ledger:` storage write that occurs during payInvoice.
+    // We must let earlier load()-time writes (and any pre-payInvoice setup writes)
+    // pass through — only fail the per-invoice ledger persistence.
+    const realSet = mocks.storage.set.getMockImplementation();
+    let rejected = false;
+    mocks.storage.set.mockImplementation((key: string, value: string): Promise<void> => {
+      if (!rejected && key.includes(`inv_ledger:${INVOICE_ID}`)) {
+        rejected = true;
+        return Promise.reject(new Error('mock storage failure: disk full'));
+      }
+      // Delegate to the real backing-map implementation for everything else
+      return realSet ? realSet(key, value) : Promise.resolve();
+    });
+
+    // payInvoice MUST reject — not silently return success. The rejection may
+    // surface either as the original storage error OR as the SDK's
+    // STORAGE_ERROR post-flush detection, depending on whether
+    // `_flushDirtyLedgerEntries` propagated or swallowed the rejection.
+    await expect(
+      module.payInvoice(INVOICE_ID, { targetIndex: 0, assetIndex: 0 }),
+    ).rejects.toThrow(/disk full|storage failure|STORAGE_ERROR|failed to persist/i);
+
+    // After rejection, the in-memory provisional is still marked dirty so a
+    // subsequent payInvoice or process restart can retry the flush. No silent loss.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = module as any;
+    expect(mod.dirtyLedgerEntries.has(INVOICE_ID)).toBe(true);
+  });
 });
