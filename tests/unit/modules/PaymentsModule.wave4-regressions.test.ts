@@ -297,10 +297,15 @@ describe('Wave 5 R1 — recipient `_recipientRequestContextMap` extraction (RUNT
     // detector. Both are 68-char hex strings but their content differs.
     expect(txHashImprintHex).not.toBe(reqIdHex);
 
-    // Critical invariant: `authenticator !== ''`. The Wave 2 bug
-    // populated authenticator with the empty string. The R2 fix's
-    // canonicalAuthenticatorEquals requires both sides to parse — the
-    // empty string fails parse and triggers `queue-entry-incomplete`.
+    // Wave 5 invariant (kept for historical context): the synthetic
+    // `expectedAuthenticatorJson` produced by the test fixture is non-
+    // empty when constructed directly via SDK primitives. NOTE: in the
+    // REAL UXF round-trip the authenticator is dropped by the IPLD
+    // pool (see Section I below: "Wave 6 — REAL UXF round-trip"). The
+    // Wave 6 recipient extraction therefore stores `authenticator = ''`
+    // deliberately, and the importer's canonicalAuthenticatorEquals
+    // returns `'match'` on empty queue-entry, degrading to
+    // transactionHash-only binding (the load-bearing check).
     expect(authJson).not.toBe('');
     expect(authJson.length).toBeGreaterThan(50);
   });
@@ -404,14 +409,18 @@ describe('Wave 4 R3 — dispositionWriter emits operator-alert on failure paths'
     // The save-after-status-flip path also writes to disk; if it fails
     // the in-memory mutation is lost on next reload. Operators need
     // visibility.
-    const pattern = /save\(\)\s*after\s*status\s*flip\s*threw[\s\S]{0,400}emit\(\s*'transfer:operator-alert'/;
+    // Window widened in Wave 6 — the fix added power-of-two backoff
+    // streak tracking + comment lines between the saveMsg log and the
+    // emit() call.
+    const pattern = /save\(\)\s*after\s*status\s*flip\s*threw[\s\S]{0,1600}emit\(\s*'transfer:operator-alert'/;
     expect(src.match(pattern)).not.toBeNull();
   });
 
   it('emits transfer:operator-alert when save() throws after finalization', () => {
     // Window expanded to 800 chars for Wave 5 — the fix added comment
     // lines between the saveMsg log and the emit() call.
-    const pattern = /save\(\)\s*after\s*finalization\s*threw[\s\S]{0,800}emit\(\s*'transfer:operator-alert'/;
+    // Wave 6 — further widened for the saveFailureStreak backoff block.
+    const pattern = /save\(\)\s*after\s*finalization\s*threw[\s\S]{0,1600}emit\(\s*'transfer:operator-alert'/;
     expect(src.match(pattern)).not.toBeNull();
   });
 });
@@ -667,7 +676,7 @@ describe('Wave 5 runtime — dispositionWriter ctx retention on save failure', (
     expect(recipientFinalizationContext.has(tokenId)).toBe(false);
   });
 
-  it('multiple save() throws on same tokenId → operator-alert each time, ctx still retained', async () => {
+  it('multiple save() throws on same tokenId → power-of-two backoff (Wave 6), ctx still retained', async () => {
     const tokenId = 'tok-003';
     const localTokenId = 'local-003';
     const emit = vi.fn();
@@ -680,7 +689,10 @@ describe('Wave 5 runtime — dispositionWriter ctx retention on save failure', (
       localTokenId,
     });
 
-    // Three retries — each one fails and must retain ctx + emit alert.
+    // Wave 6 backoff: alerts only at power-of-two boundaries.
+    // Three retries → alerts at attempts 1 and 2 (streak = 1, 2 are
+    // powers of two). Attempt 3 (streak = 3) is NOT a power of two
+    // and must be silenced.
     for (let i = 0; i < 3; i++) {
       await built.dispositionWriter.write('addr-test', {
         tokenId,
@@ -691,9 +703,679 @@ describe('Wave 5 runtime — dispositionWriter ctx retention on save failure', (
     const alertCalls = emit.mock.calls.filter(
       (call) => call[0] === 'transfer:operator-alert',
     );
-    expect(alertCalls.length).toBe(3);
+    expect(alertCalls.length).toBe(2);
 
     // Ctx MUST still be retained after multiple failures.
     expect(recipientFinalizationContext.has(tokenId)).toBe(true);
+  });
+});
+
+// =============================================================================
+// G. Wave 6 critical — fallback status-flip path delete-before-save fix
+// =============================================================================
+//
+// The Wave 5 fix moved `delete(tokenId)` inside the try block on the MAIN
+// success path (stClient/trustBase available). The FALLBACK path (when
+// stClient/trustBase are missing) had the OLD bug: delete BEFORE save().
+// If save() threw on the fallback path, ctx was already removed (no retry
+// possible) AND the in-memory token flipped to 'confirmed' while storage
+// still showed 'pending' — token permanently stuck on next reload.
+//
+// This block drives `buildDefaultFinalizationWorkerRecipient` with
+// `getStateTransitionClient: () => undefined` to force the fallback path,
+// then asserts the same retain-on-throw / delete-on-success contract.
+
+describe('Wave 6 critical — dispositionWriter fallback status-flip ctx retention', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let buildDefaultFinalizationWorkerRecipient: any;
+
+  beforeAll(async () => {
+    const mod = await import('../../../modules/payments/PaymentsModule');
+    buildDefaultFinalizationWorkerRecipient = (
+      mod as unknown as { buildDefaultFinalizationWorkerRecipient: unknown }
+    ).buildDefaultFinalizationWorkerRecipient;
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeFallbackBuilder(opts: {
+    saveImpl: () => Promise<void>;
+    emit: ReturnType<typeof vi.fn>;
+    tokenId: string;
+    localTokenId: string;
+  }) {
+    const tokens = new Map<string, import('../../../types').Token>();
+    tokens.set(opts.localTokenId, {
+      id: opts.localTokenId,
+      coinId: 'UCT',
+      symbol: 'UCT',
+      name: 'Unicity',
+      decimals: 8,
+      amount: '100',
+      sdkData: '{}',
+      status: 'pending',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    const recipientFinalizationContext = new Map<string, unknown>();
+    recipientFinalizationContext.set(opts.tokenId, {
+      localTokenId: opts.localTokenId,
+      sourceTokenJson: { stub: 'src' },
+      lastTxJson: { stub: 'lastTx' },
+      requestIdHex: '00'.repeat(34),
+    });
+
+    const oracle = {
+      getProof: vi.fn().mockResolvedValue({ proof: { stub: 'proof' } }),
+      validateToken: vi.fn().mockResolvedValue({ valid: true }),
+      getStateTransitionClient: vi.fn().mockReturnValue({}),
+      getAggregatorClient: vi.fn().mockReturnValue({}),
+      waitForProofSdk: vi.fn(),
+    };
+
+    const built = buildDefaultFinalizationWorkerRecipient({
+      addressId: 'addr-test',
+      oracle,
+      recipientRequestContextMap: new Map(),
+      recipientFinalizationContext,
+      tokens,
+      finalizeTransferToken: vi.fn().mockResolvedValue({
+        toJSON: () => ({ stub: 'finalized-token' }),
+      }),
+      // Force the FALLBACK path — stClient/trustBase missing.
+      getStateTransitionClient: () => undefined,
+      getTrustBase: () => undefined,
+      save: opts.saveImpl,
+      emit: opts.emit,
+    });
+
+    return { built, tokens, recipientFinalizationContext };
+  }
+
+  it('FALLBACK: save() throws → ctx retained (Wave 6 critical fix)', async () => {
+    const tokenId = 'tok-fb-001';
+    const localTokenId = 'local-fb-001';
+    const emit = vi.fn();
+    const saveErr = new Error('disk full');
+
+    const { built, recipientFinalizationContext, tokens } = makeFallbackBuilder({
+      saveImpl: vi.fn().mockRejectedValue(saveErr),
+      emit,
+      tokenId,
+      localTokenId,
+    });
+
+    await built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    // Operator-alert MUST fire on save failure (first attempt = streak 1
+    // = power-of-two boundary).
+    const alertCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    );
+    expect(alertCalls.length).toBeGreaterThanOrEqual(1);
+    expect(alertCalls[0][1]).toMatchObject({
+      code: 'structural',
+      tokenId: localTokenId,
+    });
+
+    // Ctx MUST be retained — the Wave 6 critical invariant. Without
+    // this, a save() throw on the fallback path made the token
+    // permanently stuck (ctx gone, in-memory mutation lost on reload).
+    expect(recipientFinalizationContext.has(tokenId)).toBe(true);
+
+    // Wave 6 critical fix: in-memory token is rolled back to 'pending'
+    // on save failure so the retry path can re-enter the
+    // `status === 'pending'` guard. Without rollback, the second
+    // retry would observe `status === 'confirmed'` and skip the
+    // entire fallback block — never re-attempting save().
+    expect(tokens.get(localTokenId)?.status).toBe('pending');
+  });
+
+  it('FALLBACK: save() succeeds → ctx deleted', async () => {
+    const tokenId = 'tok-fb-002';
+    const localTokenId = 'local-fb-002';
+    const emit = vi.fn();
+
+    const { built, recipientFinalizationContext } = makeFallbackBuilder({
+      saveImpl: vi.fn().mockResolvedValue(undefined),
+      emit,
+      tokenId,
+      localTokenId,
+    });
+
+    await built.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+
+    // No operator-alert on the success path.
+    const alertCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    );
+    expect(alertCalls.length).toBe(0);
+
+    // Ctx MUST be cleaned up after persistence succeeds.
+    expect(recipientFinalizationContext.has(tokenId)).toBe(false);
+  });
+
+  it('FALLBACK: power-of-two save-failure backoff applies on the fallback path', async () => {
+    const tokenId = 'tok-fb-003';
+    const localTokenId = 'local-fb-003';
+    const emit = vi.fn();
+    const saveErr = new Error('disk full');
+
+    const { built, recipientFinalizationContext } = makeFallbackBuilder({
+      saveImpl: vi.fn().mockRejectedValue(saveErr),
+      emit,
+      tokenId,
+      localTokenId,
+    });
+
+    // Three retries on same tokenId → alerts at streak=1 and streak=2
+    // (powers of two), silenced at streak=3.
+    for (let i = 0; i < 3; i++) {
+      await built.dispositionWriter.write('addr-test', {
+        tokenId,
+        disposition: 'VALID',
+      } as never);
+    }
+
+    const alertCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    );
+    expect(alertCalls.length).toBe(2);
+
+    // Ctx still retained after all retries.
+    expect(recipientFinalizationContext.has(tokenId)).toBe(true);
+  });
+});
+
+// =============================================================================
+// H. Wave 6 — saveFailureStreak backoff (independent counters per tokenId)
+// =============================================================================
+
+describe('Wave 6 — dispositionWriter save-failure backoff', () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let buildDefaultFinalizationWorkerRecipient: any;
+
+  beforeAll(async () => {
+    const mod = await import('../../../modules/payments/PaymentsModule');
+    buildDefaultFinalizationWorkerRecipient = (
+      mod as unknown as { buildDefaultFinalizationWorkerRecipient: unknown }
+    ).buildDefaultFinalizationWorkerRecipient;
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function makeSharedBuilder(opts: {
+    saveImpl: () => Promise<void>;
+    emit: ReturnType<typeof vi.fn>;
+    seedTokens: ReadonlyArray<{ tokenId: string; localTokenId: string }>;
+  }) {
+    const tokens = new Map<string, import('../../../types').Token>();
+    const recipientFinalizationContext = new Map<string, unknown>();
+    for (const seed of opts.seedTokens) {
+      tokens.set(seed.localTokenId, {
+        id: seed.localTokenId,
+        coinId: 'UCT',
+        symbol: 'UCT',
+        name: 'Unicity',
+        decimals: 8,
+        amount: '100',
+        sdkData: '{}',
+        status: 'pending',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      recipientFinalizationContext.set(seed.tokenId, {
+        localTokenId: seed.localTokenId,
+        sourceTokenJson: { stub: 'src' },
+        lastTxJson: { stub: 'lastTx' },
+        requestIdHex: '00'.repeat(34),
+      });
+    }
+
+    const oracle = {
+      getProof: vi.fn().mockResolvedValue({ proof: { stub: 'proof' } }),
+      validateToken: vi.fn().mockResolvedValue({ valid: true }),
+      getStateTransitionClient: vi.fn().mockReturnValue({}),
+      getAggregatorClient: vi.fn().mockReturnValue({}),
+      waitForProofSdk: vi.fn(),
+    };
+
+    return buildDefaultFinalizationWorkerRecipient({
+      addressId: 'addr-test',
+      oracle,
+      recipientRequestContextMap: new Map(),
+      recipientFinalizationContext,
+      tokens,
+      finalizeTransferToken: vi.fn().mockResolvedValue({
+        toJSON: () => ({ stub: 'finalized-token' }),
+      }),
+      getStateTransitionClient: () => ({} as unknown as never),
+      getTrustBase: () => ({}),
+      save: opts.saveImpl,
+      emit: opts.emit,
+    });
+  }
+
+  it('save() throws repeatedly on same tokenId → alerts only at power-of-two boundaries (1, 2, 4, 8)', async () => {
+    const tokenId = 'tok-streak-001';
+    const localTokenId = 'local-streak-001';
+    const emit = vi.fn();
+    const saveErr = new Error('disk full');
+
+    const built = makeSharedBuilder({
+      saveImpl: vi.fn().mockRejectedValue(saveErr),
+      emit,
+      seedTokens: [{ tokenId, localTokenId }],
+    });
+
+    // 8 attempts → alerts at attempts 1, 2, 4, 8 = 4 alerts.
+    for (let i = 0; i < 8; i++) {
+      await built.dispositionWriter.write('addr-test', {
+        tokenId,
+        disposition: 'VALID',
+      } as never);
+    }
+
+    const alertCalls = emit.mock.calls.filter(
+      (call) => call[0] === 'transfer:operator-alert',
+    );
+    expect(alertCalls.length).toBe(4);
+  });
+
+  it('save() throws → succeeds → throws again → streak resets, alert fires on first throw of new streak', async () => {
+    const tokenId = 'tok-streak-002';
+    const localTokenId = 'local-streak-002';
+    const emit = vi.fn();
+    const saveErr = new Error('disk full');
+
+    // Toggle save: throw, throw, succeed, throw
+    let callCount = 0;
+    const saveImpl = vi.fn().mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 3) return; // succeeds
+      throw saveErr;
+    });
+
+    const built = makeSharedBuilder({
+      saveImpl,
+      emit,
+      seedTokens: [{ tokenId, localTokenId }],
+    });
+
+    // Attempt 1 → throw, streak=1, alert
+    // Attempt 2 → throw, streak=2, alert
+    // Attempt 3 → success, streak resets to 0, ctx deleted
+    // (After ctx deleted, subsequent disposition writes early-return
+    //  on the "no finalization context" branch — re-seed before next
+    //  failure.)
+    for (let i = 0; i < 3; i++) {
+      await built.dispositionWriter.write('addr-test', {
+        tokenId,
+        disposition: 'VALID',
+      } as never);
+    }
+    expect(emit.mock.calls.filter((c) => c[0] === 'transfer:operator-alert').length).toBe(2);
+
+    // Streak reset semantic: simulate a NEW finalization round on the
+    // same tokenId (re-seed ctx + token to pending) and assert the
+    // first failure fires an alert (streak counter was reset on the
+    // prior success). We re-build the worker so the ctx map is fresh.
+    const emit2 = vi.fn();
+    const built2 = makeSharedBuilder({
+      saveImpl: vi.fn().mockRejectedValue(saveErr),
+      emit: emit2,
+      seedTokens: [{ tokenId, localTokenId }],
+    });
+    await built2.dispositionWriter.write('addr-test', {
+      tokenId,
+      disposition: 'VALID',
+    } as never);
+    // Fresh streak in fresh builder → first failure = streak=1 = alert.
+    expect(emit2.mock.calls.filter((c) => c[0] === 'transfer:operator-alert').length).toBe(1);
+  });
+
+  it('different tokenIds have independent counters — saveFailureStreak keyed per token', async () => {
+    const tokenIdA = 'tok-streak-A';
+    const localTokenIdA = 'local-streak-A';
+    const tokenIdB = 'tok-streak-B';
+    const localTokenIdB = 'local-streak-B';
+    const emit = vi.fn();
+    const saveErr = new Error('disk full');
+
+    const built = makeSharedBuilder({
+      saveImpl: vi.fn().mockRejectedValue(saveErr),
+      emit,
+      seedTokens: [
+        { tokenId: tokenIdA, localTokenId: localTokenIdA },
+        { tokenId: tokenIdB, localTokenId: localTokenIdB },
+      ],
+    });
+
+    // Alternate A, A, A, B — A's streak is 3 (alerts at 1,2 only),
+    // B's first attempt is streak=1 (independent counter, alerts).
+    await built.dispositionWriter.write('addr-test', { tokenId: tokenIdA, disposition: 'VALID' } as never);
+    await built.dispositionWriter.write('addr-test', { tokenId: tokenIdA, disposition: 'VALID' } as never);
+    await built.dispositionWriter.write('addr-test', { tokenId: tokenIdA, disposition: 'VALID' } as never);
+    await built.dispositionWriter.write('addr-test', { tokenId: tokenIdB, disposition: 'VALID' } as never);
+
+    const alertCalls = emit.mock.calls.filter((c) => c[0] === 'transfer:operator-alert');
+    // A: alerts at streak 1, 2 = 2 alerts.
+    // B: alert at streak 1 = 1 alert.
+    // Total = 3 alerts.
+    expect(alertCalls.length).toBe(3);
+
+    const alertsForA = alertCalls.filter((c) => (c[1] as { tokenId?: string }).tokenId === localTokenIdA);
+    const alertsForB = alertCalls.filter((c) => (c[1] as { tokenId?: string }).tokenId === localTokenIdB);
+    expect(alertsForA.length).toBe(2);
+    expect(alertsForB.length).toBe(1);
+  });
+});
+
+// =============================================================================
+// I. Wave 6 — REAL UXF round-trip pipeline test (closes Wave 5 dead-code regression)
+// =============================================================================
+//
+// This is the meta-fix for the Wave 5 regression. The Wave 5 byte-pattern
+// + synthetic test gave false confidence: it built `transferTxJson`
+// directly and ran the recipient extraction on it. It NEVER round-tripped
+// through `pkg.ingestAll → pkg.toCar → UxfPackage.fromCar → pkg.assemble`.
+//
+// In production the bundle is handed to `pkg.ingestAll(...)` which calls
+// `deconstructTransferData` (uxf/deconstruct.ts:486-512). That function
+// only deconstructs the explicit fields {recipient, salt, recipientDataHash,
+// message, nametagRefs} — `data.authenticator` is silently DROPPED from
+// the IPLD pool. On the recipient side `pkg.assemble(tokenId)` calls
+// `assembleTransactionData` (uxf/assemble.ts:361-398) which returns ONLY
+// {sourceState, recipient, salt, recipientDataHash, message, nametags}.
+//
+// Therefore `lastTxJson.data.authenticator` is `undefined` for EVERY
+// production bundle, and the Wave 5 sender-side embed was dead code.
+//
+// Wave 6 fix: degrade gracefully. The recipient sets `authenticator = ''`
+// deliberately and `canonicalAuthenticatorEquals` treats empty queue-
+// entry as `'match'`. The §6.1 race-lost binding is via `transactionHash`
+// (load-bearing); §6.3 most-recent-proof binding compares aggregator-
+// returned authenticators on both sides — the queue entry's is metadata
+// only.
+
+describe('Wave 6 — REAL UXF round-trip: pkg.ingestAll → toCar → fromCar → assemble', () => {
+  it('proves the dead-code: round-trip drops `data.authenticator` from the IPLD pool', async () => {
+    const { transferTxJson } = await buildRealisticTransferTxJson();
+
+    // Confirm the input transferTxJson DOES carry data.authenticator
+    // (Wave 5 sender-embed shape).
+    expect(transferTxJson.data.authenticator).toBeDefined();
+    expect(typeof transferTxJson.data.authenticator).toBe('object');
+
+    // Build a containing token JSON. Use TOKEN_B as the template (it has
+    // a non-empty transactions[] array) and replace the only transaction
+    // with a hand-built one that carries `data.authenticator`. The
+    // token's tokenId and predicates are taken from TOKEN_B — we only
+    // inspect transaction[0].data post-round-trip.
+    const { TOKEN_B } = await import('../../fixtures/uxf-mock-tokens');
+    const tokenJson: Record<string, unknown> = JSON.parse(JSON.stringify(TOKEN_B));
+
+    // Replace transactions[0].data — preserving TOKEN_B's sourceState
+    // shape so the IPLD instance-chain check is satisfied. The crucial
+    // additional field is `authenticator` (the Wave 5 sender embed).
+    const txArr = tokenJson.transactions as Record<string, unknown>[];
+    const origData = txArr[0]!.data as Record<string, unknown>;
+    txArr[0] = {
+      data: {
+        ...origData,
+        // Wave 5 sender embed (pre-Wave-6 fix). We assert this is
+        // dropped on round-trip.
+        authenticator: transferTxJson.data.authenticator,
+      },
+      inclusionProof: txArr[0]!.inclusionProof,
+    };
+
+    // Round-trip via ingestAll → toCar → fromCar → assemble.
+    const { UxfPackage } = await import('../../../uxf/UxfPackage');
+    const pkg = UxfPackage.create();
+    pkg.ingestAll([tokenJson]);
+    const carBytes = await pkg.toCar();
+    const restored = await UxfPackage.fromCar(carBytes);
+    const tokenId = (
+      (tokenJson.genesis as Record<string, unknown>).data as Record<string, unknown>
+    ).tokenId as string;
+    const reassembled = restored.assemble(tokenId) as Record<string, unknown>;
+
+    const reassembledTxs = reassembled.transactions as Record<string, unknown>[];
+    expect(reassembledTxs.length).toBe(1);
+    const reassembledData = reassembledTxs[0]!.data as Record<string, unknown>;
+
+    // PROOF OF DEAD-CODE: data.authenticator is DROPPED by the IPLD
+    // round-trip. This is the bug Wave 5 missed — its byte-pattern
+    // test built transferTxJson standalone and never observed this drop.
+    expect(reassembledData.authenticator).toBeUndefined();
+
+    // The other fields ARE preserved by the IPLD round-trip.
+    expect(reassembledData.recipient).toBe(origData.recipient);
+    expect(reassembledData.salt).toBe(origData.salt);
+  });
+
+  it('Wave 6 recipient extraction: transactionHash + requestId derivable from round-tripped data', async () => {
+    // Build a token whose sourceState IS the SDK-built canonical state
+    // from buildRealisticTransferTxJson — so PredicateEngineService can
+    // recover the sender's publicKey.
+    const { transferTxJson, expectedTransactionHash, expectedRequestIdHex } =
+      await buildRealisticTransferTxJson();
+
+    const { TOKEN_B } = await import('../../fixtures/uxf-mock-tokens');
+    const tokenJson: Record<string, unknown> = JSON.parse(JSON.stringify(TOKEN_B));
+    const txArr = tokenJson.transactions as Record<string, unknown>[];
+    txArr[0] = {
+      data: {
+        sourceState: (transferTxJson.data as Record<string, unknown>).sourceState,
+        recipient: (transferTxJson.data as Record<string, unknown>).recipient,
+        salt: (transferTxJson.data as Record<string, unknown>).salt,
+        recipientDataHash:
+          (transferTxJson.data as Record<string, unknown>).recipientDataHash ?? null,
+        message: (transferTxJson.data as Record<string, unknown>).message ?? null,
+        nametags: [],
+      },
+      inclusionProof: null,
+    };
+
+    const { UxfPackage } = await import('../../../uxf/UxfPackage');
+    const pkg = UxfPackage.create();
+    pkg.ingestAll([tokenJson]);
+    const carBytes = await pkg.toCar();
+    const restored = await UxfPackage.fromCar(carBytes);
+    const tokenId = (
+      (tokenJson.genesis as Record<string, unknown>).data as Record<string, unknown>
+    ).tokenId as string;
+    const reassembled = restored.assemble(tokenId) as Record<string, unknown>;
+
+    const reassembledTxs = reassembled.transactions as Record<string, unknown>[];
+    const reassembledData = reassembledTxs[0]!.data as Record<string, unknown>;
+
+    // Run the Wave 6 recipient extraction logic on the ROUND-TRIPPED data.
+    const txData = await TransferTransactionData.fromJSON(reassembledData);
+    const txHashImprintHex = (await txData.calculateHash()).toJSON();
+    const senderPredicate = await PredicateEngineService.createPredicate(
+      txData.sourceState.predicate,
+    );
+    const senderPubkey = (senderPredicate as unknown as { publicKey: Uint8Array })
+      .publicKey;
+    const sourceStateHash = await txData.sourceState.calculateHash();
+    const reqIdObj = await RequestId.create(senderPubkey, sourceStateHash);
+    const reqIdHex = reqIdObj.toJSON();
+
+    // The transactionHash + requestId ARE derivable from the round-
+    // tripped data — they survive because sourceState + recipient +
+    // salt + recipientDataHash + nametags all round-trip intact and
+    // that's everything the canonical hash needs.
+    expect(txHashImprintHex).toBe(expectedTransactionHash);
+    expect(txHashImprintHex.length).toBe(68);
+    expect(reqIdHex).toBe(expectedRequestIdHex);
+    expect(reqIdHex.length).toBe(68);
+
+    // The authenticator is ABSENT by design after round-trip. Wave 6
+    // sets the queue entry's authenticator to '' and the importer's
+    // canonicalAuthenticatorEquals treats this as 'match' (degrade to
+    // transactionHash-only binding).
+    expect(reassembledData.authenticator).toBeUndefined();
+  });
+
+  it('importInclusionProof: empty queue-entry authenticator → graft applied (Wave 6 graceful degradation)', async () => {
+    // Drive importInclusionProof end-to-end with the production state:
+    // queue entry has `authenticator: ''` (the post-round-trip state).
+    // The importer must succeed via transactionHash-only binding.
+    const {
+      InclusionProofImporter,
+    } = await import('../../../modules/payments/transfer/import-inclusion-proof');
+
+    const TOKEN_HEX = 'aa'.repeat(32);
+    const REQ_ID = 'rq-wave6';
+    const TX_HASH = '0000' + 'ab'.repeat(32);
+
+    const manifestEntries = new Map<string, unknown>();
+    manifestEntries.set(`addr1:${TOKEN_HEX}`, {
+      tokenId: TOKEN_HEX,
+      status: 'pending',
+      rootHash: 'aa'.repeat(32),
+      bundleCid: '',
+      senderTransportPubkey: '',
+      cidEpoch: 0,
+      lamport: 0,
+    });
+
+    let graftCalled = false;
+    const importer = new InclusionProofImporter({
+      manifestStore: {
+        readEntry: async (_addr: string, tid: string) =>
+          manifestEntries.get(`${_addr}:${tid}`) as never,
+      },
+      dispositionStorage: {
+        readRecord: async () => undefined,
+        writeRecord: async () => undefined,
+        deleteRecord: async () => undefined,
+      } as never,
+      queueScanner: {
+        lookupByTokenId: async () => [
+          {
+            entryId: 'e1',
+            tokenId: TOKEN_HEX,
+            commitmentRequestId: REQ_ID,
+            transactionHash: TX_HASH,
+            authenticator: '', // production state post-round-trip
+            txIndex: 0,
+            status: 'pending' as const,
+          },
+        ],
+      },
+      verifyProof: async () => 'OK' as const,
+      graftCallback: {
+        graft: async () => {
+          graftCalled = true;
+        },
+      },
+      overrideCallback: {
+        applyOverride: async () => undefined,
+      },
+      emit: () => undefined,
+    });
+
+    const result = await importer.importInclusionProof('addr1', TOKEN_HEX, {
+      requestId: REQ_ID,
+      transactionHash: TX_HASH,
+      authenticator: 'any-authenticator-from-aggregator-anchored-proof',
+      proof: { stub: true },
+    });
+
+    // CRITICAL: with the Wave 6 fix the import succeeds — the empty
+    // queue-entry authenticator degrades to transactionHash-only
+    // binding (the load-bearing check).
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.transition).toBe('pending→valid');
+    }
+    expect(graftCalled).toBe(true);
+  });
+
+  it('importInclusionProof: empty queue-entry authenticator + transactionHash MISMATCH → proof-binding-mismatch', async () => {
+    // The transactionHash check is load-bearing. Even with the Wave 6
+    // graceful degradation for authenticator, a transactionHash mismatch
+    // MUST fail the binding.
+    const {
+      InclusionProofImporter,
+    } = await import('../../../modules/payments/transfer/import-inclusion-proof');
+
+    const TOKEN_HEX = 'bb'.repeat(32);
+    const REQ_ID = 'rq-wave6-tx-mm';
+
+    const manifestEntries = new Map<string, unknown>();
+    manifestEntries.set(`addr1:${TOKEN_HEX}`, {
+      tokenId: TOKEN_HEX,
+      status: 'pending',
+      rootHash: 'bb'.repeat(32),
+      bundleCid: '',
+      senderTransportPubkey: '',
+      cidEpoch: 0,
+      lamport: 0,
+    });
+
+    let graftCalled = false;
+    const importer = new InclusionProofImporter({
+      manifestStore: {
+        readEntry: async (_addr: string, tid: string) =>
+          manifestEntries.get(`${_addr}:${tid}`) as never,
+      },
+      dispositionStorage: {
+        readRecord: async () => undefined,
+        writeRecord: async () => undefined,
+        deleteRecord: async () => undefined,
+      } as never,
+      queueScanner: {
+        lookupByTokenId: async () => [
+          {
+            entryId: 'e1',
+            tokenId: TOKEN_HEX,
+            commitmentRequestId: REQ_ID,
+            transactionHash: '0000' + 'ab'.repeat(32),
+            authenticator: '',
+            txIndex: 0,
+            status: 'pending' as const,
+          },
+        ],
+      },
+      verifyProof: async () => 'OK' as const,
+      graftCallback: {
+        graft: async () => {
+          graftCalled = true;
+        },
+      },
+      overrideCallback: {
+        applyOverride: async () => undefined,
+      },
+      emit: () => undefined,
+    });
+
+    const result = await importer.importInclusionProof('addr1', TOKEN_HEX, {
+      requestId: REQ_ID,
+      // Different transactionHash (load-bearing check binds).
+      transactionHash: '0000' + 'cd'.repeat(32),
+      authenticator: 'whatever',
+      proof: { stub: true },
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('proof-binding-mismatch');
+    }
+    expect(graftCalled).toBe(false);
   });
 });

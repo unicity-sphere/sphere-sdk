@@ -28,7 +28,7 @@
  *  - Feature flag OFF: legacy path runs unchanged (export-shape anchor).
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   sendInstantUxf,
@@ -1245,5 +1245,62 @@ describe('__resetSourceLocksForTesting — Wave 5 steelman fix #171', () => {
       // Don't care — A's pipeline may complete or error; the test asserts
       // only on B's prompt completion.
     }
+  });
+});
+
+// =============================================================================
+// 14. Wave 6 steelman fix — __resetSourceLocksForTesting production guard
+// =============================================================================
+//
+// The Wave 5 export was advisory-only ("MUST NOT" in JSDoc). A production
+// consumer using `import * as instantSender` could still call it at runtime,
+// clearing locks mid-flight and re-opening the same-process double-spend
+// window. The Wave 6 fix adds a runtime guard: the function throws when
+// `process.env.NODE_ENV === 'production'` unless the explicit
+// `SPHERE_ALLOW_TEST_RESET=1` opt-in is set.
+
+describe('__resetSourceLocksForTesting — Wave 6 production guard', () => {
+  // Save and restore the env across each test so we don't leak into
+  // subsequent suites.
+  const savedNodeEnv = process.env.NODE_ENV;
+  const savedAllowReset = process.env.SPHERE_ALLOW_TEST_RESET;
+
+  afterEach(() => {
+    if (savedNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = savedNodeEnv;
+    }
+    if (savedAllowReset === undefined) {
+      delete process.env.SPHERE_ALLOW_TEST_RESET;
+    } else {
+      process.env.SPHERE_ALLOW_TEST_RESET = savedAllowReset;
+    }
+  });
+
+  it('throws when NODE_ENV === "production"', () => {
+    process.env.NODE_ENV = 'production';
+    delete process.env.SPHERE_ALLOW_TEST_RESET;
+    expect(() => __resetSourceLocksForTesting()).toThrow(
+      /MUST NOT be called in production/,
+    );
+  });
+
+  it('succeeds when NODE_ENV === "test" (default vitest env)', () => {
+    process.env.NODE_ENV = 'test';
+    delete process.env.SPHERE_ALLOW_TEST_RESET;
+    expect(() => __resetSourceLocksForTesting()).not.toThrow();
+  });
+
+  it('succeeds when NODE_ENV is undefined', () => {
+    delete process.env.NODE_ENV;
+    delete process.env.SPHERE_ALLOW_TEST_RESET;
+    expect(() => __resetSourceLocksForTesting()).not.toThrow();
+  });
+
+  it('succeeds when NODE_ENV === "production" + SPHERE_ALLOW_TEST_RESET === "1" (escape hatch)', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.SPHERE_ALLOW_TEST_RESET = '1';
+    expect(() => __resetSourceLocksForTesting()).not.toThrow();
   });
 });

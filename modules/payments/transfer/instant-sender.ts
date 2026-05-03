@@ -402,9 +402,31 @@ const sourceLocks = new Map<string, Promise<void>>();
  * normally — they do not get rejected. Lock-promises themselves are
  * forgotten (the holder's release is a no-op against the absent slot).
  *
+ * Wave 6 steelman fix: runtime guard. The export was previously
+ * advisory-only ("MUST NOT" in JSDoc) — a production consumer doing
+ * `import * as instantSender` could still invoke it and clear locks
+ * mid-flight, re-opening the double-spend window. We now throw when
+ * `process.env.NODE_ENV === 'production'` unless the explicit
+ * `SPHERE_ALLOW_TEST_RESET=1` opt-in is set (for deliberate test
+ * harnesses running in production-flag mode). The guard is permissive
+ * everywhere else (`development`, `test`, undefined NODE_ENV) so
+ * vitest's default test environment is unaffected.
+ *
  * @internal
  */
 export function __resetSourceLocksForTesting(): void {
+  if (
+    typeof process !== 'undefined' &&
+    process.env?.NODE_ENV === 'production' &&
+    !process.env?.SPHERE_ALLOW_TEST_RESET
+  ) {
+    throw new Error(
+      '__resetSourceLocksForTesting MUST NOT be called in production. ' +
+        'Clearing locks mid-flight re-opens the same-process double-spend ' +
+        'window the lock exists to close. Set SPHERE_ALLOW_TEST_RESET=1 ' +
+        'to bypass (testing only).',
+    );
+  }
   sourceLocks.clear();
 }
 

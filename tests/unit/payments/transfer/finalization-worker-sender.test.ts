@@ -1550,9 +1550,13 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
     expect(truncationAlerts.length).toBeLessThanOrEqual(maxExpected);
   });
 
-  it('emits a recovery info-alert on first under-cap read after a streak', async () => {
-    // Custom writer toggles between over-cap and under-cap to simulate
-    // the queue store recovering after tombstone GC catches up.
+  it('emits a recovery info-alert on first under-cap read after a sustained streak (>= 4)', async () => {
+    // Wave 6 fix: recovery alerts only fire when the failure streak
+    // reached MIN_RECOVERY_ALERT_STREAK (=4). Single-cycle blips no
+    // longer emit recovery — see the dedicated test below.
+    //
+    // This test uses a 5-cycle streak so MIN is satisfied and the
+    // recovery alert still fires.
     const stubEntry: UxfTransferOutboxEntry = {
       ...makeOutboxEntry({ id: 'stub-finalized' }),
       status: 'finalized',
@@ -1561,9 +1565,9 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
       { length: SCAN_LIST_HARD_GUARD + 1 },
       (_, i) => ({ ...stubEntry, id: `stub-${i}` }),
     );
-    // Three explicit phases:
-    //   call 1, 2 → oversize (streak grows to 2)
-    //   call 3+   → under-cap (recovery alert fires once on call 3)
+    // Phases:
+    //   call 1..5 → oversize (streak grows to 5)
+    //   call 6+   → under-cap (recovery alert fires once on call 6)
     const readCalls = { count: 0 };
     const writer: FinalizationOutboxWriter = {
       async readOne(_id) {
@@ -1574,8 +1578,180 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
       },
       async readAllNew() {
         readCalls.count += 1;
-        if (readCalls.count <= 2) return oversizeBatch;
+        if (readCalls.count <= 5) return oversizeBatch;
         return [] as UxfTransferOutboxEntry[];
+      },
+    };
+
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 1,
+      maxEntriesPerScan: 100,
+    });
+
+    worker.start();
+    try {
+      await waitForCondition(() => readCalls.count >= 7, 5_000);
+    } finally {
+      await worker.stop();
+    }
+    const recoveryAlerts = events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('under SCAN_LIST_HARD_GUARD again')
+      );
+    });
+    // Exactly one recovery alert with the 5-cycle streak count.
+    expect(recoveryAlerts.length).toBe(1);
+    const data = recoveryAlerts[0].data as { message?: string };
+    expect(data.message).toMatch(/5 consecutive over-size cycle/);
+  });
+
+  // Wave 6 steelman fix — single-cycle flap suppression.
+  it('Wave 6: single-cycle flap (streak=1) does NOT emit recovery alert', async () => {
+    // Reproduces the warning scenario: writer flaps over→under each
+    // cycle. With Wave 5 power-of-two backoff alone, this would emit
+    // 2 alerts/cycle (alert at streak=1 + recovery at 1→0). With the
+    // Wave 6 MIN_RECOVERY_ALERT_STREAK=4 threshold, the recovery is
+    // suppressed for streak=1; only the truncation alert fires.
+    const stubEntry: UxfTransferOutboxEntry = {
+      ...makeOutboxEntry({ id: 'stub-finalized' }),
+      status: 'finalized',
+    };
+    const oversizeBatch: UxfTransferOutboxEntry[] = Array.from(
+      { length: SCAN_LIST_HARD_GUARD + 1 },
+      (_, i) => ({ ...stubEntry, id: `stub-${i}` }),
+    );
+    const readCalls = { count: 0 };
+    const writer: FinalizationOutboxWriter = {
+      async readOne(_id) {
+        return null;
+      },
+      async update(_id, _mutator) {
+        throw new Error('not used in this test');
+      },
+      async readAllNew() {
+        readCalls.count += 1;
+        // Alternating: cycle 1=over, 2=under, 3=over, 4=under, ...
+        return readCalls.count % 2 === 1 ? oversizeBatch : [];
+      },
+    };
+
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 1,
+      maxEntriesPerScan: 100,
+    });
+
+    worker.start();
+    try {
+      // Run for ~10 cycles to exercise multiple flaps.
+      await waitForCondition(() => readCalls.count >= 10, 5_000);
+    } finally {
+      await worker.stop();
+    }
+    const recoveryAlerts = events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('under SCAN_LIST_HARD_GUARD again')
+      );
+    });
+    // No recovery alerts despite multiple over→under transitions
+    // (each streak resets at length 1, below MIN threshold).
+    expect(recoveryAlerts.length).toBe(0);
+  });
+
+  // Wave 6 — readAllNew throws recovery threshold.
+  it('Wave 6: read-failure recovery alert suppressed for short streaks (< 4)', async () => {
+    // Fail twice (streak=2, alert fires at streak=1), then succeed.
+    // Recovery alert MUST be suppressed because streak < MIN=4.
+    const stubEntry: UxfTransferOutboxEntry = {
+      ...makeOutboxEntry({ id: 'stub-finalized' }),
+      status: 'finalized',
+    };
+    const readCalls = { count: 0 };
+    const writer: FinalizationOutboxWriter = {
+      async readOne(_id) {
+        return null;
+      },
+      async update(_id, _mutator) {
+        throw new Error('not used in this test');
+      },
+      async readAllNew() {
+        readCalls.count += 1;
+        if (readCalls.count <= 2) {
+          throw new Error('backend offline');
+        }
+        // Return a tiny under-cap list so the loop sleeps quickly.
+        return [stubEntry];
       },
     };
 
@@ -1628,13 +1804,89 @@ describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (
       const data = e.data as { message?: string };
       return (
         typeof data.message === 'string' &&
-        data.message.includes('under SCAN_LIST_HARD_GUARD again')
+        data.message.includes('readAllNew recovered')
       );
     });
-    // Exactly one recovery alert when we transition from over-cap to
-    // under-cap, with the consecutive-overrun count.
+    expect(recoveryAlerts.length).toBe(0);
+  });
+
+  // Wave 6 — read-failure recovery alert fires for sustained streak (>= 4).
+  it('Wave 6: read-failure recovery alert fires for sustained streak (>= 4)', async () => {
+    const stubEntry: UxfTransferOutboxEntry = {
+      ...makeOutboxEntry({ id: 'stub-finalized' }),
+      status: 'finalized',
+    };
+    const readCalls = { count: 0 };
+    const writer: FinalizationOutboxWriter = {
+      async readOne(_id) {
+        return null;
+      },
+      async update(_id, _mutator) {
+        throw new Error('not used in this test');
+      },
+      async readAllNew() {
+        readCalls.count += 1;
+        if (readCalls.count <= 4) {
+          throw new Error('backend offline');
+        }
+        return [stubEntry];
+      },
+    };
+
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 1,
+      maxEntriesPerScan: 100,
+    });
+
+    worker.start();
+    try {
+      await waitForCondition(() => readCalls.count >= 6, 5_000);
+    } finally {
+      await worker.stop();
+    }
+    const recoveryAlerts = events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('readAllNew recovered')
+      );
+    });
     expect(recoveryAlerts.length).toBe(1);
     const data = recoveryAlerts[0].data as { message?: string };
-    expect(data.message).toMatch(/2 consecutive over-size cycle/);
+    expect(data.message).toMatch(/4 consecutive failure/);
   });
 });

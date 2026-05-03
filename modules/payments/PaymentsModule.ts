@@ -215,7 +215,6 @@ import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/I
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
 import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
-import { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
 import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
@@ -1733,64 +1732,38 @@ export class PaymentsModule {
                     const reqIdObj = await RequestId.create(senderPubkey, sourceStateHash);
                     const reqIdHex = reqIdObj.toJSON();
 
-                    // (c) Authenticator. The unfinalized bundle now
-                    //     carries the sender's authenticator under
-                    //     `data.authenticator` (Wave 5 fix: sender adds
-                    //     it at line ~7763). Recipient extracts and
-                    //     stringifies with the SAME canonical key order
-                    //     as the sender (Authenticator.toJSON +
-                    //     JSON.stringify) so §6.3 byte-equality holds.
-                    let authenticatorJsonStr = '';
-                    const lastDataObj = lastTxJson.data as Record<string, unknown> | undefined;
-                    const rawAuthenticator = lastDataObj?.authenticator;
-                    if (
-                      rawAuthenticator !== undefined &&
-                      rawAuthenticator !== null &&
-                      typeof rawAuthenticator === 'object'
-                    ) {
-                      try {
-                        // Round-trip through Authenticator.fromJSON →
-                        // .toJSON() to canonicalize the key order
-                        // (avoids a key-order mismatch with the
-                        // aggregator-returned proof's authenticator).
-                        const authObj = Authenticator.fromJSON(rawAuthenticator);
-                        authenticatorJsonStr = JSON.stringify(authObj.toJSON());
-                      } catch (authErr) {
-                        logger.warn(
-                          'Payments',
-                          'Wave 5 fix: bundle data.authenticator present but failed to parse — §6.3 conflict check degraded for this entry',
-                          { err: authErr instanceof Error ? authErr.message : String(authErr) },
-                        );
-                        // Fallback: stringify as-is so we at least have
-                        // SOMETHING for byte-equality. Better than the
-                        // empty-string Wave 4 silent dead-code outcome.
-                        try {
-                          authenticatorJsonStr = JSON.stringify(rawAuthenticator);
-                        } catch {
-                          authenticatorJsonStr = '';
-                        }
-                      }
-                    } else {
-                      // Bundle does not carry the sender's authenticator
-                      // (legacy bundles, or sender on a pre-Wave-5
-                      // build). §6.3 byte-equality is degraded for this
-                      // entry but §6.1 race-lost still functions.
-                      // Surface an operator-alert so the degradation is
-                      // visible — far better than the silent dead-code
-                      // outcome from Wave 4.
-                      const tokenIdShort = tokenRoot.tokenId.slice(0, 16);
-                      this.deps!.emitEvent('transfer:operator-alert', {
-                        code: 'structural',
-                        tokenId: tokenRoot.tokenId,
-                        message:
-                          `Wave 5 R1: instant-mode UXF bundle for tokenId=${tokenIdShort} ` +
-                          `does not carry sender's authenticator under ` +
-                          `lastTx.data.authenticator. §6.3 same-value-vs-` +
-                          `different-value proof comparison will be ` +
-                          `degraded for requestId=${reqIdHex.slice(0, 16)} — ` +
-                          `the §6.1 race-lost compare still functions.`,
-                      });
-                    }
+                    // (c) Authenticator — by design ABSENT at ingest time.
+                    //
+                    // Wave 6: the §6.3 binding compare's queue-entry
+                    // `authenticator` field is metadata-only. The IPLD
+                    // wire format (deconstructTransferData →
+                    // assembleTransactionData) does NOT preserve any
+                    // `data.authenticator` field — only the canonical
+                    // {recipient, salt, recipientDataHash, message,
+                    // nametagRefs} pass through. Wave 5's sender-side
+                    // embed was therefore dead code (the recipient
+                    // always saw `undefined`). We degrade gracefully
+                    // here:
+                    //
+                    //   - `transactionHash` byte equality (§6.1 race-lost
+                    //     and §6.3 forbidden-case binding) is the
+                    //     load-bearing check; we already populate it
+                    //     above.
+                    //   - `authenticator` is best-effort defense-in-
+                    //     depth; the §6.3 most-recent-proof check
+                    //     compares the ATTACHED proof's authenticator
+                    //     vs the OBSERVED poll's authenticator — both
+                    //     come from the AGGREGATOR, not from the queue
+                    //     entry. Leaving the queue entry's authenticator
+                    //     null is therefore safe.
+                    //
+                    // `canonicalAuthenticatorEquals` (import-inclusion-
+                    // proof.ts) returns `'match'` when the queue side
+                    // is empty/null so the importInclusionProof
+                    // operator path remains usable. Production bundles
+                    // never carry `data.authenticator`; what's load-
+                    // bearing is `transactionHash`.
+                    const authenticatorJsonStr = '';
 
                     pendingFinalizationCtx = {
                       sourceTokenJson,
@@ -7874,24 +7847,32 @@ export class PaymentsModule {
           // `undefined`, which @ipld/dag-cbor rejects at encode time with
           // "undefined is not supported by the IPLD Data Model".
           //
-          // Wave 5 R1 — additionally embed the sender's authenticator
-          // under `data.authenticator` so the recipient (line ~1644)
-          // can populate `_recipientRequestContextMap` with a real
-          // canonical authenticator JSON for §6.3 byte-equality.
-          // `TransferTransactionData.fromJSON` only checks for the 6
-          // required keys via the `in` operator (see
-          // node_modules/@unicitylabs/state-transition-sdk/lib/
-          // transaction/TransferTransactionData.js:65) and ignores
-          // additional keys, so this extra field is forward/backward
-          // compatible with all SDK versions.
+          // Wave 6 — DO NOT embed `data.authenticator`. The Wave 5 attempt
+          // to add `authenticator` under `data` was dead code in production:
+          // the bundle is handed to `pkg.ingestAll(...)` which calls
+          // `deconstructTransferData` (uxf/deconstruct.ts:486-512). That
+          // function only deconstructs the explicit fields {recipient, salt,
+          // recipientDataHash, message, nametagRefs} — `authenticator` is
+          // silently dropped from the IPLD pool. On the recipient side,
+          // `pkg.assemble(tokenId)` calls `assembleTransactionData`
+          // (uxf/assemble.ts:361-398) which returns ONLY {sourceState,
+          // recipient, salt, recipientDataHash, message, nametags}, so
+          // `lastTxJson.data.authenticator` is undefined for EVERY round-
+          // tripped bundle.
+          //
+          // The Wave 5 byte-pattern + synthetic test passed because it
+          // never round-tripped through `pkg.ingestAll → pkg.toCar →
+          // UxfPackage.fromCar → pkg.assemble`. We degrade gracefully
+          // instead of extending the IPLD wire format: §6.1 race-lost
+          // only depends on `transactionHash` (load-bearing), and §6.3
+          // most-recent-proof compare uses the AGGREGATOR-returned
+          // authenticator on both sides — the queue entry's authenticator
+          // is metadata only. The recipient sets `authenticator = null`
+          // and `canonicalAuthenticatorEquals` degrades to
+          // transactionHash-only binding (the load-bearing check).
           const commitmentJson = commitment.toJSON();
           const transferTxJson = {
-            data: {
-              ...commitmentJson.transactionData,
-              // Wave 5: sender embeds its authenticator for the
-              // recipient's §6.3 same-value-vs-different-value compare.
-              authenticator: commitmentJson.authenticator,
-            },
+            data: commitmentJson.transactionData,
             inclusionProof: null,
           };
           const tokenJson = token.sdkData
@@ -10154,6 +10135,18 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
   // leak is bounded because `recipientFinalizationContext` is a
   // per-instance Map cleared on `destroy()` and on successful
   // finalization.
+  //
+  // Wave 6 steelman fix — alert flood backoff for save() failures.
+  // If save() persistently fails (disk-full, quota), emitting an alert
+  // on every retry would flood operators. Track a per-tokenId streak
+  // and emit only at power-of-two boundaries (1, 2, 4, 8, …); reset
+  // on save success. Per-token keying ensures distinct tokens have
+  // independent counters. This Map is local to the builder — one
+  // counter per `buildDefaultFinalizationWorkerRecipient` invocation,
+  // matching the lifecycle of the `recipientFinalizationContext` Map.
+  const saveFailureStreak = new Map<string, number>();
+  const isPowerOfTwoBackoff = (n: number): boolean =>
+    n > 0 && (n & (n - 1)) === 0;
   const dispositionWriter: FinalizationDispositionWriter = {
     async write(_addr, record) {
       if (record.disposition !== 'VALID') {
@@ -10202,20 +10195,46 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
               updatedAt: Date.now(),
             };
             tokens.set(ctx.localTokenId, updatedFallback);
-            recipientFinalizationContext.delete(tokenId);
             try {
               await save();
+              // Wave 6 critical fix — only delete ctx after persistence
+              // succeeds. The previous (Wave 2/4) ordering deleted
+              // before save(), so a save() throw left ctx removed (no
+              // retry possible) AND in-memory token flipped to
+              // 'confirmed' while storage still showed 'pending'. On
+              // reload the in-memory mutation is lost → token stuck
+              // forever. Now mirrors the main success path below.
+              recipientFinalizationContext.delete(tokenId);
+              saveFailureStreak.delete(ctx.localTokenId);
             } catch (saveErr) {
+              // Wave 6 critical fix — roll back the in-memory mutation
+              // so retries can re-enter the `status === 'pending'`
+              // guard above. Without this rollback, after the first
+              // save() throw the in-memory token shows 'confirmed' and
+              // the second retry skips the entire fallback block —
+              // never re-attempting save() and never emitting an
+              // alert. The retry path needs a clean 'pending' slate to
+              // re-flip and retry persistence.
+              tokens.set(ctx.localTokenId, stored);
               const saveMsg = `Task #151: save() after status flip threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
               logger.warn('Payments', saveMsg);
               // Wave 4 fix — emit operator-alert when persistence fails.
               // Local Token state was mutated in-memory but didn't
               // round-trip to disk; operators need to know.
-              emit('transfer:operator-alert', {
-                code: 'structural',
-                tokenId: ctx.localTokenId,
-                message: saveMsg,
-              });
+              // Wave 6 fix — power-of-two backoff so a permanent
+              // disk-full failure doesn't flood operators with one
+              // alert per retry. Streak keyed by tokenId so distinct
+              // tokens accumulate independently.
+              const prev = saveFailureStreak.get(ctx.localTokenId) ?? 0;
+              const next = prev + 1;
+              saveFailureStreak.set(ctx.localTokenId, next);
+              if (isPowerOfTwoBackoff(next)) {
+                emit('transfer:operator-alert', {
+                  code: 'structural',
+                  tokenId: ctx.localTokenId,
+                  message: `${saveMsg} (consecutive save failures: ${next})`,
+                });
+              }
             }
           }
           return;
@@ -10252,6 +10271,8 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
           // payments.receive({finalize:true})) can re-attempt. This
           // matches the outer-catch retention promise below.
           recipientFinalizationContext.delete(tokenId);
+          // Wave 6 fix — reset save-failure backoff on success.
+          saveFailureStreak.delete(ctx.localTokenId);
           logger.debug(
             'Payments',
             `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
@@ -10265,11 +10286,18 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
           // Wave 5 fix — ctx is intentionally NOT deleted here so a
           // retry path can pick it back up; consistent with the
           // outer-catch retention promise.
-          emit('transfer:operator-alert', {
-            code: 'structural',
-            tokenId: ctx.localTokenId,
-            message: saveMsg,
-          });
+          // Wave 6 fix — power-of-two backoff so a permanent disk-full
+          // failure doesn't flood operators. Streak keyed by tokenId.
+          const prev = saveFailureStreak.get(ctx.localTokenId) ?? 0;
+          const next = prev + 1;
+          saveFailureStreak.set(ctx.localTokenId, next);
+          if (isPowerOfTwoBackoff(next)) {
+            emit('transfer:operator-alert', {
+              code: 'structural',
+              tokenId: ctx.localTokenId,
+              message: `${saveMsg} (consecutive save failures: ${next})`,
+            });
+          }
         }
       } catch (err) {
         const errMsg = `Task #151: dispositionWriter finalization failed for ${tokenId.slice(0, 16)} — ${err instanceof Error ? err.message : String(err)}`;

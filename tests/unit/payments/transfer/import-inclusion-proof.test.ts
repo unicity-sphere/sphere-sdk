@@ -935,85 +935,109 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
       expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
     });
 
-    // (c) Empty queue-entry authenticator → 'queue-entry-incomplete' +
-    //     warning. Forensic — surfaces upstream writer regression
-    //     (PaymentsModule recipient queue path writing `''`).
-    it('CASE 3 (#W4-2): pending + EMPTY queue authenticator → reason="queue-entry-incomplete" + warning', async () => {
+    // (c) Empty queue-entry authenticator — Wave 6 update:
+    //
+    //     Previously (Wave 4) treated empty queue-entry authenticator as
+    //     a forensic regression and returned `'queue-entry-incomplete'`.
+    //     Wave 6 corrected the semantics: the IPLD wire format
+    //     (deconstructTransferData → assembleTransactionData) does NOT
+    //     preserve `data.authenticator`, so EVERY production bundle's
+    //     recipient queue entry has empty authenticator. The §6.3
+    //     binding decision degrades to `transactionHash`-only (the
+    //     load-bearing check); the operator-supplied proof is grafted
+    //     when transactionHash matches.
+    it('CASE 3 (Wave 6): pending + EMPTY queue authenticator → degrades to transactionHash-only binding, graft applied', async () => {
       const h = buildImporterHarness();
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      try {
-        h.manifest.entries.set(`${ADDR}:${tk('t-empty-q')}`, manifestEntryFor({
-          status: 'pending',
-        }));
-        h.queue.entries.push(queueEntryFor({
-          tokenId: tk('t-empty-q'),
-          commitmentRequestId: 'rq-empty-q',
-          status: 'pending',
+      h.manifest.entries.set(`${ADDR}:${tk('t-empty-q')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-empty-q'),
+        commitmentRequestId: 'rq-empty-q',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: '', // production state post-IPLD-round-trip
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-empty-q'),
+        proofFor({
+          requestId: 'rq-empty-q',
           transactionHash: '0000' + 'ab'.repeat(32),
-          authenticator: '', // pre-fix queue regression
-        }));
-        const result = await h.importer.importInclusionProof(
-          ADDR,
-          tk('t-empty-q'),
-          proofFor({
-            requestId: 'rq-empty-q',
-            transactionHash: '0000' + 'ab'.repeat(32),
-            authenticator: 'authn-anything',
-          }),
-        );
-        expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
-        expect(h.graftCalls.length).toBe(0);
-        // Operator alert: console.warn must fire exactly once with the
-        // tokenId + requestId in the message.
-        expect(warnSpy).toHaveBeenCalledTimes(1);
-        const msg = warnSpy.mock.calls[0]?.join(' ') ?? '';
-        expect(msg).toContain('empty authenticator');
-        expect(msg).toContain('rq-empty-q');
-      } finally {
-        warnSpy.mockRestore();
-      }
+          authenticator: 'authn-anything',
+        }),
+      );
+      // Empty queue-entry authenticator no longer fails — graft proceeds
+      // because transactionHash byte-equal compare succeeds. The single
+      // outstanding requestId resolves on this proof so the transition
+      // is `pending→valid`.
+      expect(result).toEqual({ ok: true, transition: 'pending→valid' });
+      expect(h.graftCalls.length).toBe(1);
     });
 
-    it('CASE 5 (#W4-2): _invalid + EMPTY queue authenticator → reason="queue-entry-incomplete" + warning, override NOT applied', async () => {
+    it('CASE 3 (Wave 6): pending + EMPTY queue authenticator + transactionHash MISMATCH → reason="proof-binding-mismatch"', async () => {
       const h = buildImporterHarness();
-      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      try {
-        h.disposition.entries.set(
-          `${ADDR}.invalid.${tk('t-empty-inv')}.${'aa'.repeat(32)}`,
-          invalidEntryFor({ tokenId: tk('t-empty-inv'), reason: 'oracle-rejected' }),
-        );
-        h.manifest.entries.set(`${ADDR}:${tk('t-empty-inv')}`, manifestEntryFor({
-          status: 'invalid',
-          invalidReason: 'oracle-rejected',
-          rootHashHex: 'aa'.repeat(32),
-        }));
-        h.queue.entries.push(queueEntryFor({
-          tokenId: tk('t-empty-inv'),
-          commitmentRequestId: 'rq-empty-inv',
-          status: 'hard-fail',
+      h.manifest.entries.set(`${ADDR}:${tk('t-empty-q-tx-mm')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-empty-q-tx-mm'),
+        commitmentRequestId: 'rq-empty-q-tx-mm',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: '', // production state post-IPLD-round-trip
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-empty-q-tx-mm'),
+        proofFor({
+          requestId: 'rq-empty-q-tx-mm',
+          // Different transactionHash (load-bearing check still binds).
+          transactionHash: '0000' + 'cd'.repeat(32),
+          authenticator: 'whatever',
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+      expect(h.graftCalls.length).toBe(0);
+    });
+
+    it('CASE 5 (Wave 6): _invalid + EMPTY queue authenticator → degrades to transactionHash-only binding, override applied', async () => {
+      const h = buildImporterHarness();
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tk('t-empty-inv')}.${'aa'.repeat(32)}`,
+        invalidEntryFor({ tokenId: tk('t-empty-inv'), reason: 'oracle-rejected' }),
+      );
+      h.manifest.entries.set(`${ADDR}:${tk('t-empty-inv')}`, manifestEntryFor({
+        status: 'invalid',
+        invalidReason: 'oracle-rejected',
+        rootHashHex: 'aa'.repeat(32),
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-empty-inv'),
+        commitmentRequestId: 'rq-empty-inv',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ee'.repeat(32),
+        authenticator: '', // production state post-IPLD-round-trip
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-empty-inv'),
+        proofFor({
+          requestId: 'rq-empty-inv',
           transactionHash: '0000' + 'ee'.repeat(32),
-          authenticator: '', // pre-fix queue regression
-        }));
-        const result = await h.importer.importInclusionProof(
-          ADDR,
-          tk('t-empty-inv'),
-          proofFor({
-            requestId: 'rq-empty-inv',
-            transactionHash: '0000' + 'ee'.repeat(32),
-            authenticator: 'whatever',
-          }),
-          { allowInvalidOverride: true },
-        );
-        expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
-        // §5.6 monotonicity: override callback NOT invoked, no event.
-        expect(h.overrideCalls.length).toBe(0);
-        expect(
-          h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
-        ).toBe(0);
-        expect(warnSpy).toHaveBeenCalledTimes(1);
-      } finally {
-        warnSpy.mockRestore();
-      }
+          authenticator: 'whatever',
+        }),
+        { allowInvalidOverride: true },
+      );
+      // Wave 6: empty queue authenticator degrades to transactionHash-
+      // only binding; override callback IS invoked, audit event IS
+      // emitted. The §5.6 monotonicity invariant breach is the
+      // operator's explicit decision (allowInvalidOverride: true).
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(h.overrideCalls.length).toBe(1);
+      expect(
+        h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
+      ).toBe(1);
     });
 
     // (d) transactionHash byte-equal still works case-insensitively.

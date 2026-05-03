@@ -744,6 +744,162 @@ describe('FinalizationWorkerRecipient — RECIPIENT_SCAN_LIST_HARD_GUARD truncat
   });
 });
 
+describe('FinalizationWorkerRecipient — Wave 6 recovery alert threshold', () => {
+  // Reproduces the warning scenario from Wave 5 steelman: a misconfigured
+  // queueStore that flaps over→under each cycle would emit 2 alerts/cycle
+  // (alert at streak=1 + recovery at 1→0). With Wave 6's
+  // MIN_RECOVERY_ALERT_STREAK=4 threshold, single-cycle blips no longer
+  // emit recovery alerts.
+
+  it('Wave 6: single-cycle flap (streak=1) does NOT emit oversize recovery alert', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
+      '../../../../modules/payments/transfer/finalization-worker-recipient'
+    );
+    const oversizeBatch = Array.from(
+      { length: RECIPIENT_SCAN_LIST_HARD_GUARD + 1 },
+      (_, i) => ({
+        tokenId: `synth-${i}`,
+        entryId: `entry-synth-${i}`,
+        commitmentRequestId: `req-synth-${i}`,
+        submittedAt: 1700000000000,
+        inclusionProof: null,
+        txIndex: 0,
+      }),
+    );
+    const readCalls = { count: 0 };
+    harness.queueStore.list = (async () => {
+      readCalls.count += 1;
+      // Alternating: cycle 1=over, 2=under, 3=over, 4=under, ...
+      return readCalls.count % 2 === 1 ? oversizeBatch : [];
+    }) as typeof harness.queueStore.list;
+    harness.worker.processOneToken = (async () =>
+      undefined) as typeof harness.worker.processOneToken;
+
+    harness.worker.start();
+    try {
+      await waitFor(() => readCalls.count >= 10, 5_000);
+    } finally {
+      await harness.worker.stop();
+    }
+    const recoveryAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('under RECIPIENT_SCAN_LIST_HARD_GUARD again')
+      );
+    });
+    expect(recoveryAlerts.length).toBe(0);
+  });
+
+  it('Wave 6: oversize recovery alert fires for sustained streak (>= 4)', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
+      '../../../../modules/payments/transfer/finalization-worker-recipient'
+    );
+    const oversizeBatch = Array.from(
+      { length: RECIPIENT_SCAN_LIST_HARD_GUARD + 1 },
+      (_, i) => ({
+        tokenId: `synth-${i}`,
+        entryId: `entry-synth-${i}`,
+        commitmentRequestId: `req-synth-${i}`,
+        submittedAt: 1700000000000,
+        inclusionProof: null,
+        txIndex: 0,
+      }),
+    );
+    const readCalls = { count: 0 };
+    harness.queueStore.list = (async () => {
+      readCalls.count += 1;
+      // Phases: cycles 1..5 over (streak grows to 5), then under-cap.
+      return readCalls.count <= 5 ? oversizeBatch : [];
+    }) as typeof harness.queueStore.list;
+    harness.worker.processOneToken = (async () =>
+      undefined) as typeof harness.worker.processOneToken;
+
+    harness.worker.start();
+    try {
+      await waitFor(() => readCalls.count >= 7, 5_000);
+    } finally {
+      await harness.worker.stop();
+    }
+    const recoveryAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('under RECIPIENT_SCAN_LIST_HARD_GUARD again')
+      );
+    });
+    expect(recoveryAlerts.length).toBe(1);
+    const data = recoveryAlerts[0].data as { message?: string };
+    expect(data.message).toMatch(/5 consecutive over-size cycle/);
+  });
+
+  it('Wave 6: read-failure recovery alert suppressed for short streaks (< 4)', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const readCalls = { count: 0 };
+    harness.queueStore.list = (async () => {
+      readCalls.count += 1;
+      if (readCalls.count <= 2) {
+        throw new Error('backend offline');
+      }
+      return [];
+    }) as typeof harness.queueStore.list;
+    harness.worker.processOneToken = (async () =>
+      undefined) as typeof harness.worker.processOneToken;
+
+    harness.worker.start();
+    try {
+      await waitFor(() => readCalls.count >= 4, 5_000);
+    } finally {
+      await harness.worker.stop();
+    }
+    const recoveryAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('queueStore.list recovered')
+      );
+    });
+    expect(recoveryAlerts.length).toBe(0);
+  });
+
+  it('Wave 6: read-failure recovery alert fires for sustained streak (>= 4)', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const readCalls = { count: 0 };
+    harness.queueStore.list = (async () => {
+      readCalls.count += 1;
+      if (readCalls.count <= 4) {
+        throw new Error('backend offline');
+      }
+      return [];
+    }) as typeof harness.queueStore.list;
+    harness.worker.processOneToken = (async () =>
+      undefined) as typeof harness.worker.processOneToken;
+
+    harness.worker.start();
+    try {
+      await waitFor(() => readCalls.count >= 6, 5_000);
+    } finally {
+      await harness.worker.stop();
+    }
+    const recoveryAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('queueStore.list recovered')
+      );
+    });
+    expect(recoveryAlerts.length).toBe(1);
+    const data = recoveryAlerts[0].data as { message?: string };
+    expect(data.message).toMatch(/4 consecutive failure/);
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void NEW_CID;
 void RACE_TX_HASH;

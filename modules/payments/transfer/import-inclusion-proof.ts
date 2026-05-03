@@ -764,25 +764,15 @@ export class InclusionProofImporter {
       proof.authenticator,
       target.authenticator,
     );
-    if (authnCmp === 'queue-entry-empty') {
-      // (Wave 4) The recipient queue worker pre-fix wrote
-      // `authenticator: ''` on enqueue (PaymentsModule.ts:1840). Surface
-      // a distinct reason + alert so the operator console can route to
-      // manual triage. Future entries written after the upstream fix
-      // will carry the canonical form.
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[importInclusionProof] queue entry has empty authenticator — ' +
-          'regression in upstream queue writer (PaymentsModule recipient ' +
-          'queue path). Refusing to degrade binding compare. ' +
-          `tokenId=${tokenId} requestId=${proof.requestId}`,
-      );
-      return { ok: false, reason: 'queue-entry-incomplete' };
-    }
     if (authnCmp === 'mismatch') {
       return { ok: false, reason: 'proof-binding-mismatch' };
     }
     // authnCmp === 'match' — fall through to the lifecycle decision.
+    // Wave 6: when the queue entry's authenticator is empty (the
+    // production case post-IPLD-round-trip), `canonicalAuthenticator
+    // Equals` returns `'match'` and the binding decision is carried
+    // by `transactionHash` byte equality alone — the load-bearing
+    // check.
 
     if (target.status === 'attached') {
       return { ok: true, transition: 'pending-still' }; // case 4a
@@ -912,20 +902,13 @@ export class InclusionProofImporter {
       proof.authenticator,
       resolvingEntry.authenticator,
     );
-    if (authnCmpInvalid === 'queue-entry-empty') {
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[importInclusionProof] hard-failed queue entry has empty ' +
-          'authenticator — regression in upstream queue writer. Refusing ' +
-          'to apply override. ' +
-          `tokenId=${tokenId} requestId=${proof.requestId}`,
-      );
-      return { ok: false, reason: 'queue-entry-incomplete' };
-    }
     if (authnCmpInvalid === 'mismatch') {
       return { ok: false, reason: 'proof-binding-mismatch' };
     }
     // authnCmpInvalid === 'match' — proceed with case-5/6 decision.
+    // Wave 6: empty queue-entry `authenticator` (the production
+    // post-IPLD-round-trip state) returns `'match'`; the binding
+    // decision is carried by `transactionHash` byte equality alone.
 
     // Case 5 vs case 6 split: count OTHER hard-failed entries that
     // still need a proof. If zero → case 5; if ≥ 1 → case 6 (chain
@@ -1152,19 +1135,25 @@ interface CanonicalAuthenticatorJson {
  *
  * Discriminated outcome of {@link canonicalAuthenticatorEquals}.
  *
- *  - `'match'`           — both sides represent the same authenticator
- *                          (canonical form when JSON, byte-equal when
- *                          plain hex).
+ *  - `'match'`           — either both sides represent the same
+ *                          authenticator (canonical form when JSON,
+ *                          byte-equal when plain hex), OR the queue
+ *                          entry's authenticator is empty/null. The
+ *                          empty-queue case is the EXPECTED state in
+ *                          production: the IPLD wire format
+ *                          (deconstructTransferData →
+ *                          assembleTransactionData) does NOT preserve
+ *                          any `data.authenticator` field, so the
+ *                          recipient extraction path stores `''`
+ *                          deliberately (see
+ *                          PaymentsModule.ts ~line 1771). We degrade
+ *                          to transactionHash-only binding (the load-
+ *                          bearing check) rather than refuse every
+ *                          legitimate proof.
  *  - `'mismatch'`        — both sides parsed but represent different
  *                          authenticators.
- *  - `'queue-entry-empty'` — the queue-entry side is empty/missing/
- *                          whitespace-only. This is forensic — the
- *                          recipient queue worker's pre-fix data path
- *                          wrote `authenticator: ''` on enqueue. We
- *                          surface a distinct reason rather than
- *                          silently rejecting via length-mismatch.
  */
-type CanonicalAuthenticatorCmp = 'match' | 'mismatch' | 'queue-entry-empty';
+type CanonicalAuthenticatorCmp = 'match' | 'mismatch';
 
 /**
  * @internal
@@ -1213,21 +1202,44 @@ function tryParseCanonicalAuthenticator(
 /**
  * @internal
  *
- * Canonical authenticator equality. The §6.3 binding compare must be
- * INSENSITIVE to JSON object key order — `Authenticator.toJSON()` emits
- * `{algorithm, publicKey, signature, stateHash}` while the SDK's
- * `IAuthenticatorJson` interface declares
- * `{publicKey, algorithm, signature, stateHash}`. Two semantically-
- * identical authenticators serialized by different code paths (sender's
- * commitJson, aggregator's response, recipient's `Transaction.toJSON()`)
- * produce DIFFERENT byte strings — naive `hexEqualsIgnoreCase` reports
- * mismatch and the importer rejects every legitimate proof.
+ * Canonical authenticator equality. The §6.3 binding compare for the
+ * queue entry vs an operator-supplied proof MUST be INSENSITIVE to JSON
+ * object key order — `Authenticator.toJSON()` emits `{algorithm,
+ * publicKey, signature, stateHash}` while the SDK's `IAuthenticatorJson`
+ * interface declares `{publicKey, algorithm, signature, stateHash}`.
+ * Two semantically-identical authenticators serialized by different
+ * code paths (sender's commitJson, aggregator's response, recipient's
+ * `Transaction.toJSON()`) produce DIFFERENT byte strings — naive
+ * `hexEqualsIgnoreCase` reports mismatch and the importer would reject
+ * every legitimate proof.
+ *
+ * **Load-bearing vs metadata.** The §6.3 most-recent-proof / single-
+ * spend forbidden-case check actually compares the ATTACHED proof's
+ * authenticator vs the OBSERVED poll's authenticator — both come from
+ * the AGGREGATOR. The QUEUE-ENTRY's authenticator is metadata-only;
+ * the load-bearing binding is `transactionHash` (which the call site
+ * compares via {@link hexEqualsIgnoreCase} — see
+ * `_handlePendingPath` and `_handleInvalidPath`).
+ *
+ * **Empty queue-entry is the EXPECTED state.** The IPLD wire format
+ * (`deconstructTransferData` → `assembleTransactionData` in
+ * `uxf/deconstruct.ts` and `uxf/assemble.ts`) does NOT preserve any
+ * `authenticator` field on `transferTransactionData` round-trip
+ * through `pkg.toCar() → UxfPackage.fromCar() → pkg.assemble()`. The
+ * recipient's `_recipientRequestContextMap` queue entry therefore
+ * stores `authenticator: ''` deliberately (see
+ * `PaymentsModule.ts` ~line 1771). Returning a distinct
+ * `'queue-entry-empty'` outcome and refusing the import would make
+ * EVERY round-tripped bundle hit `proof-binding-mismatch` — exactly
+ * the dead-code regression Wave 6 closes. Empty queue-entry therefore
+ * degrades to `'match'`: the importer relies on `transactionHash`
+ * byte equality (the load-bearing check) for the binding decision.
  *
  * Resolution rules (in order):
- *  1. Empty/null/whitespace queue-entry side → `'queue-entry-empty'`
- *     (forensic; routes operator to manual triage).
- *  2. Empty/null/whitespace proof side → `'mismatch'` (operator
- *     supplied no authenticator; cannot bind).
+ *  1. Empty/null/whitespace queue-entry side → `'match'` (degrade to
+ *     transactionHash-only binding; see paragraph above).
+ *  2. Empty/null/whitespace proof side (with non-empty queue side) →
+ *     `'mismatch'` (operator supplied no authenticator; cannot bind).
  *  3. Both sides parse as canonical JSON → field-wise compare:
  *     `publicKey`, `signature`, `stateHash` are case-insensitive hex
  *     (their on-the-wire form is hex regardless of upper/lower);
@@ -1240,16 +1252,20 @@ function tryParseCanonicalAuthenticator(
  *
  * NOTE: `transactionHash` (the other half of the §155 bind triple) IS
  * always plain hex on every path — it stays on `hexEqualsIgnoreCase`
- * at the call site.
+ * at the call site, and that compare IS load-bearing (it must match
+ * for the import to succeed).
  */
 function canonicalAuthenticatorEquals(
   proofAuthn: string | null | undefined,
   queueAuthn: string | null | undefined,
 ): CanonicalAuthenticatorCmp {
-  // Empty queue-entry — forensic regression marker (Wave 4 #2).
+  // Empty queue-entry — the EXPECTED state in production (the IPLD
+  // wire format does not preserve `data.authenticator`). Degrade to
+  // transactionHash-only binding; the call site already enforces
+  // `transactionHash` byte equality (load-bearing).
   const queueEmpty =
     typeof queueAuthn !== 'string' || queueAuthn.trim().length === 0;
-  if (queueEmpty) return 'queue-entry-empty';
+  if (queueEmpty) return 'match';
   const proofEmpty =
     typeof proofAuthn !== 'string' || proofAuthn.trim().length === 0;
   if (proofEmpty) return 'mismatch';

@@ -225,6 +225,23 @@ function isPowerOfTwo(n: number): boolean {
   return n > 0 && (n & (n - 1)) === 0;
 }
 
+/**
+ * Minimum streak length for emitting a recovery alert.
+ *
+ * Wave 6 steelman fix: the Wave 5 power-of-two backoff fires a recovery
+ * info alert on every transition from streak >= 1 → 0. A misconfigured
+ * writer that flaps over→under each cycle therefore produces two alerts
+ * per cycle (alert at streak=1 + recovery at streak=0), because
+ * `isPowerOfTwo(1) === true`. The fix: suppress recovery alerts unless
+ * the streak reached at least this threshold — single-cycle blips no
+ * longer generate noise. Threshold is exclusive of the original alert
+ * boundary at 1; recovery only fires for genuine sustained failures
+ * (4+ cycles).
+ *
+ * @internal
+ */
+const MIN_RECOVERY_ALERT_STREAK = 4;
+
 // =============================================================================
 // 2. Worker construction options
 // =============================================================================
@@ -1078,25 +1095,40 @@ export class FinalizationWorkerSender {
           }
           workingList = all.slice(0, SCAN_LIST_HARD_GUARD);
         } else if (this.scanOversizeStreak > 0) {
-          // Recovery: writer is now within budget. Emit a single info
-          // alert with the recovery count and reset.
-          this.options.emit('transfer:operator-alert', {
-            code: 'structural',
-            message:
-              `FinalizationWorkerSender.scanLoop: readAllNew under SCAN_LIST_HARD_GUARD ` +
-              `again after ${this.scanOversizeStreak} consecutive over-size cycle(s).`,
-          });
+          // Recovery: writer is now within budget.
+          //
+          // Wave 6 steelman fix: only emit a recovery info alert when
+          // the streak reached MIN_RECOVERY_ALERT_STREAK. Single-cycle
+          // flaps (streak 1→0) would otherwise emit a recovery alert
+          // every flap because `isPowerOfTwo(1) === true` already
+          // emitted the failure alert — operators get two alerts per
+          // cycle (alert+recovery) for trivial blips. The threshold
+          // suppresses noise; sustained failures (4+ cycles) still
+          // emit recovery as before. Counter resets unconditionally.
+          if (this.scanOversizeStreak >= MIN_RECOVERY_ALERT_STREAK) {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message:
+                `FinalizationWorkerSender.scanLoop: readAllNew under SCAN_LIST_HARD_GUARD ` +
+                `again after ${this.scanOversizeStreak} consecutive over-size cycle(s).`,
+            });
+          }
           this.scanOversizeStreak = 0;
         }
 
         // Successful read — emit recovery info if we were in a streak.
+        // Wave 6 steelman fix: same threshold gate as the oversize
+        // recovery — see comment above. Single-cycle blips would
+        // otherwise produce 2 alerts/cycle when flapping.
         if (this.scanReadFailureStreak > 0) {
-          this.options.emit('transfer:operator-alert', {
-            code: 'structural',
-            message:
-              `FinalizationWorkerSender.scanLoop: readAllNew recovered after ` +
-              `${this.scanReadFailureStreak} consecutive failure(s).`,
-          });
+          if (this.scanReadFailureStreak >= MIN_RECOVERY_ALERT_STREAK) {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message:
+                `FinalizationWorkerSender.scanLoop: readAllNew recovered after ` +
+                `${this.scanReadFailureStreak} consecutive failure(s).`,
+            });
+          }
           this.scanReadFailureStreak = 0;
         }
 

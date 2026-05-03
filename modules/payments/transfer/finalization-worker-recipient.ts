@@ -171,6 +171,21 @@ function isPowerOfTwoRecipient(n: number): boolean {
   return n > 0 && (n & (n - 1)) === 0;
 }
 
+/**
+ * Minimum streak length for emitting a recovery alert.
+ *
+ * Wave 6 steelman fix (mirror of sender-side fix): the Wave 5
+ * power-of-two backoff fires a recovery info alert on every transition
+ * from streak >= 1 → 0. A misconfigured store that flaps over→under
+ * each cycle would otherwise produce two alerts per cycle (alert at
+ * streak=1 + recovery at streak=0). The threshold suppresses noise for
+ * single-cycle blips; sustained failures (4+ cycles) still emit
+ * recovery as before.
+ *
+ * @internal
+ */
+const MIN_RECOVERY_ALERT_STREAK = 4;
+
 // =============================================================================
 // 1. Disposition writer surface — narrow shape over T.3.C
 // =============================================================================
@@ -1231,26 +1246,38 @@ export class FinalizationWorkerRecipient {
           }
           workingList = all.slice(0, RECIPIENT_SCAN_LIST_HARD_GUARD);
         } else if (this.scanOversizeStreak > 0) {
-          // Recovery: queueStore is now within budget. Single info
-          // alert with the recovery count, then reset.
-          this.options.emit('transfer:operator-alert', {
-            code: 'structural',
-            message:
-              `FinalizationWorkerRecipient.scanLoop: queueStore.list under ` +
-              `RECIPIENT_SCAN_LIST_HARD_GUARD again after ` +
-              `${this.scanOversizeStreak} consecutive over-size cycle(s).`,
-          });
+          // Recovery: queueStore is now within budget.
+          //
+          // Wave 6 steelman fix: only emit a recovery info alert when
+          // the streak reached MIN_RECOVERY_ALERT_STREAK. Single-cycle
+          // flaps (1→0) would otherwise emit a recovery alert every
+          // flap because `isPowerOfTwo(1) === true` already emitted
+          // the failure alert — operators get two alerts per cycle.
+          // Threshold suppresses noise for trivial blips; sustained
+          // failures still emit recovery. Counter resets unconditionally.
+          if (this.scanOversizeStreak >= MIN_RECOVERY_ALERT_STREAK) {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message:
+                `FinalizationWorkerRecipient.scanLoop: queueStore.list under ` +
+                `RECIPIENT_SCAN_LIST_HARD_GUARD again after ` +
+                `${this.scanOversizeStreak} consecutive over-size cycle(s).`,
+            });
+          }
           this.scanOversizeStreak = 0;
         }
 
         // Successful read — emit recovery info if we were in a streak.
+        // Wave 6 steelman fix: same threshold gate as oversize recovery.
         if (this.scanReadFailureStreak > 0) {
-          this.options.emit('transfer:operator-alert', {
-            code: 'structural',
-            message:
-              `FinalizationWorkerRecipient.scanLoop: queueStore.list ` +
-              `recovered after ${this.scanReadFailureStreak} consecutive failure(s).`,
-          });
+          if (this.scanReadFailureStreak >= MIN_RECOVERY_ALERT_STREAK) {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message:
+                `FinalizationWorkerRecipient.scanLoop: queueStore.list ` +
+                `recovered after ${this.scanReadFailureStreak} consecutive failure(s).`,
+            });
+          }
           this.scanReadFailureStreak = 0;
         }
 
