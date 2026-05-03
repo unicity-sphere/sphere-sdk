@@ -867,3 +867,312 @@ describe('sendInstantUxf — feature-flag dispatcher anchor', () => {
     expect(typeof sendInstantUxf).toBe('function');
   });
 });
+
+// =============================================================================
+// 12. Wave 4 steelman fix #171 — per-source lock prevents same-process
+//     double-spend window introduced by Wave 3's deferred-mark fix.
+// =============================================================================
+
+describe('sendInstantUxf — per-source lock (Wave 4 #171)', () => {
+  it('two parallel sends with OVERLAPPING source tokenIds — second waits for first; no concurrent commit/publish/mark', async () => {
+    // Single shared source tokenId — both sends pick it.
+    const sharedSource = makeToken('tok-shared', TOKEN_A);
+
+    // Track event ordering across both sends to assert serialization.
+    const eventTimeline: Array<{ send: 'A' | 'B'; phase: string }> = [];
+
+    // Latches for send A so we can pin its position in the pipeline
+    // while send B attempts to acquire the lock.
+    let releaseSendACommit: (() => void) | null = null;
+    const sendACommitGate = new Promise<void>((resolve) => {
+      releaseSendACommit = resolve;
+    });
+
+    function makeCommitFor(label: 'A' | 'B'): InstantCommitResult {
+      return makeCommitResult({
+        sourceTokenId: 'tok-shared',
+        fixture: TOKEN_A,
+        rewriteTokenId: ('aa' + label).padEnd(64, 'a'),
+        requestIdHex: `req-${label}`,
+      });
+    }
+
+    // Send A: hangs in commitSources until we let it through.
+    const sendADeps = makeDeps({
+      availableSources: () => [sharedSource],
+      selectSources: async () => [sharedSource],
+      commitSources: async () => {
+        eventTimeline.push({ send: 'A', phase: 'commit-start' });
+        await sendACommitGate;
+        eventTimeline.push({ send: 'A', phase: 'commit-end' });
+        return [makeCommitFor('A')];
+      },
+      markSourcePending: async () => {
+        eventTimeline.push({ send: 'A', phase: 'mark-pending' });
+      },
+    });
+
+    // Send B: would race A to the same source.
+    const sendBDeps = makeDeps({
+      availableSources: () => [sharedSource],
+      selectSources: async () => {
+        eventTimeline.push({ send: 'B', phase: 'select' });
+        return [sharedSource];
+      },
+      commitSources: async () => {
+        eventTimeline.push({ send: 'B', phase: 'commit-start' });
+        return [makeCommitFor('B')];
+      },
+      markSourcePending: async () => {
+        eventTimeline.push({ send: 'B', phase: 'mark-pending' });
+      },
+    });
+
+    // Kick off A. It will reach commit-start and block.
+    const sendAPromise = sendInstantUxf(basicRequest(), makePeerInfo(), sendADeps.deps);
+
+    // Wait until A is provably inside its commit. (Microtask drain.)
+    await new Promise((r) => setTimeout(r, 10));
+    expect(eventTimeline.find((e) => e.send === 'A' && e.phase === 'commit-start')).toBeDefined();
+
+    // Kick off B. It will block at lock acquisition because A holds it.
+    const sendBPromise = sendInstantUxf(basicRequest(), makePeerInfo(), sendBDeps.deps);
+
+    // Wait a tick — B should NOT have started its commit because the
+    // lock is held by A.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(
+      eventTimeline.find((e) => e.send === 'B' && e.phase === 'commit-start'),
+    ).toBeUndefined();
+
+    // Now release A. It will commit, transport, mark, and release the
+    // lock. B should then proceed.
+    releaseSendACommit!();
+
+    await Promise.all([sendAPromise, sendBPromise]);
+
+    // Assert serial order: A's mark-pending precedes B's commit-start.
+    const aMarkIdx = eventTimeline.findIndex(
+      (e) => e.send === 'A' && e.phase === 'mark-pending',
+    );
+    const bCommitIdx = eventTimeline.findIndex(
+      (e) => e.send === 'B' && e.phase === 'commit-start',
+    );
+    expect(aMarkIdx).toBeGreaterThanOrEqual(0);
+    expect(bCommitIdx).toBeGreaterThanOrEqual(0);
+    expect(aMarkIdx).toBeLessThan(bCommitIdx);
+
+    // Both sends got distinct transport publishes (the orchestrator
+    // does NOT veto B — that is the aggregator's job in production).
+    // The point of the lock is SERIALIZATION, not rejection.
+    expect(sendADeps.transport._calls).toHaveLength(1);
+    expect(sendBDeps.transport._calls).toHaveLength(1);
+  });
+
+  it('two parallel sends with DISJOINT source tokenIds — both proceed concurrently (no serialization)', async () => {
+    const sourceA = makeToken('tok-a', TOKEN_A);
+    const sourceB = makeToken('tok-b', TOKEN_A);
+
+    const eventTimeline: Array<{ send: 'A' | 'B'; phase: string }> = [];
+
+    // Both sends hang at commit-start until BOTH have entered. If the
+    // lock serialized them, only one would reach commit-start before
+    // the other completed, and this Promise.all would deadlock.
+    let resolveBothInCommit: (() => void) | null = null;
+    const bothInCommit = new Promise<void>((resolve) => {
+      resolveBothInCommit = resolve;
+    });
+    let countInCommit = 0;
+    const enterCommit = (label: 'A' | 'B') => {
+      eventTimeline.push({ send: label, phase: 'commit-start' });
+      countInCommit++;
+      if (countInCommit === 2 && resolveBothInCommit) {
+        resolveBothInCommit();
+      }
+      return bothInCommit;
+    };
+
+    const sendADeps = makeDeps({
+      availableSources: () => [sourceA],
+      selectSources: async () => [sourceA],
+      commitSources: async () => {
+        await enterCommit('A');
+        return [
+          makeCommitResult({
+            sourceTokenId: 'tok-a',
+            fixture: TOKEN_A,
+            rewriteTokenId: 'aa'.padEnd(64, 'a'),
+            requestIdHex: 'req-a',
+          }),
+        ];
+      },
+    });
+
+    const sendBDeps = makeDeps({
+      availableSources: () => [sourceB],
+      selectSources: async () => [sourceB],
+      commitSources: async () => {
+        await enterCommit('B');
+        return [
+          makeCommitResult({
+            sourceTokenId: 'tok-b',
+            fixture: TOKEN_A,
+            rewriteTokenId: 'bb'.padEnd(64, 'b'),
+            requestIdHex: 'req-b',
+          }),
+        ];
+      },
+    });
+
+    // Both sends should reach commit concurrently — bothInCommit only
+    // resolves when BOTH have entered.
+    const [resA, resB] = await Promise.all([
+      sendInstantUxf(basicRequest(), makePeerInfo(), sendADeps.deps),
+      sendInstantUxf(basicRequest(), makePeerInfo(), sendBDeps.deps),
+    ]);
+
+    expect(resA.status).toBe('submitted');
+    expect(resB.status).toBe('submitted');
+    // Both reached commit-start phase (rendezvous succeeded → no
+    // serialization).
+    expect(
+      eventTimeline.filter((e) => e.phase === 'commit-start'),
+    ).toHaveLength(2);
+  });
+
+  it('transport throws → lock released, source NOT marked pending (preserves Wave 3 deferred-mark)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const markedTokens: Token[] = [];
+    const { deps: depsA, transport: transportA } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+      markSourcePending: async (t) => {
+        markedTokens.push(t);
+      },
+    });
+    transportA._failNextSendWith = new Error('relay rejected');
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(basicRequest(), makePeerInfo(), depsA);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    // Wave 3 deferred-mark contract: source was NOT marked pending.
+    expect(markedTokens).toHaveLength(0);
+
+    // Wave 4 invariant: lock was released (else next send would block
+    // forever). Verify by running a fresh send on the same source.
+    const { deps: depsB, transport: transportB } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+    });
+    const result = await sendInstantUxf(basicRequest(), makePeerInfo(), depsB);
+    expect(result.status).toBe('submitted');
+    expect(transportB._calls).toHaveLength(1);
+  });
+
+  it('successful send → lock released after markSourcePending; subsequent send on same source proceeds', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    let markCalledAt = 0;
+    const { deps: depsA } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+      markSourcePending: async () => {
+        markCalledAt = Date.now();
+      },
+    });
+
+    const r1 = await sendInstantUxf(basicRequest(), makePeerInfo(), depsA);
+    expect(r1.status).toBe('submitted');
+    expect(markCalledAt).toBeGreaterThan(0);
+
+    // Second send on the SAME source — would deadlock if lock leaked.
+    const { deps: depsB, transport: transportB } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+    });
+    const r2 = await sendInstantUxf(basicRequest(), makePeerInfo(), depsB);
+    expect(r2.status).toBe('submitted');
+    expect(transportB._calls).toHaveLength(1);
+  });
+
+  it('lock held >timeout → emits warning + auto-releases (force-release path)', async () => {
+    const source = makeToken('tok-stuck', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-stuck',
+      fixture: TOKEN_A,
+    });
+
+    // Capture console.warn output to assert on the warning.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    // Send A: hangs forever in commitSources. The lock timeout (50ms in
+    // this test) should force-release.
+    let releaseA: (() => void) | null = null;
+    const aGate = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const { deps: depsA } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => {
+        await aGate;
+        return [commitResult];
+      },
+      __sourceLockMaxHoldMs: 50,
+    });
+
+    // Don't await — just kick off and let it hang.
+    const aPromise = sendInstantUxf(basicRequest(), makePeerInfo(), depsA);
+
+    // Wait long enough for the timeout to fire (50ms + grace).
+    await new Promise((r) => setTimeout(r, 120));
+
+    // The force-release warning should have been emitted.
+    expect(warnSpy).toHaveBeenCalled();
+    const warnCall = warnSpy.mock.calls.find((c) =>
+      String(c[0]).includes('source lock for tokenId=tok-stuck'),
+    );
+    expect(warnCall).toBeDefined();
+
+    // Now a second send on the SAME source should proceed (lock was
+    // force-released).
+    const { deps: depsB, transport: transportB } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+      __sourceLockMaxHoldMs: 50,
+    });
+    const r2 = await sendInstantUxf(basicRequest(), makePeerInfo(), depsB);
+    expect(r2.status).toBe('submitted');
+    expect(transportB._calls).toHaveLength(1);
+
+    // Clean up A. (Its outer Promise is still alive; release the gate
+    // so it completes its own pipeline. We don't care about the result —
+    // the test asserts on the lock's behavior, not A's outcome.)
+    releaseA!();
+    try {
+      await aPromise;
+    } catch {
+      // Don't care — A may or may not throw depending on whether its
+      // commit completes after the force-release. Both are acceptable
+      // for this test's assertions.
+    }
+
+    warnSpy.mockRestore();
+  });
+});

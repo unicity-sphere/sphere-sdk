@@ -283,8 +283,32 @@ export interface CascadeWalkerOptions {
  *                          parent had been re-validated via
  *                          `importInclusionProof()` between the
  *                          cascade trigger and the child write.
- *  - `cycleDefenseFired` — number of times the cycle / depth-overrun
- *                          defense prevented further recursion.
+ *  - `cycleDefenseFired` — number of times the depth-overrun /
+ *                          true-cycle defense prevented further
+ *                          recursion. **Wave 4 steelman split**: this
+ *                          counter no longer conflates DAG-join skips
+ *                          (legitimate "same child visited twice via
+ *                          different paths") with corruption-class
+ *                          cycles. It increments ONLY on
+ *                          `depth >= MAX_CHAIN_DEPTH` (an acyclic
+ *                          coin-split graph cannot legitimately reach
+ *                          this depth — the underlying manifest is
+ *                          corrupted or contains a true cycle).
+ *                          Operator dashboards SHOULD treat any
+ *                          non-zero value here as a forensic signal.
+ *  - `dagJoinSkipped`    — number of times a child was skipped because
+ *                          it was already in the per-walk `visited`
+ *                          set without depth-overrun. **Wave 4 split**:
+ *                          this is normal DAG behavior — a coin-split
+ *                          can reach the same descendant via multiple
+ *                          parent paths, and the second arrival is
+ *                          correctly suppressed to avoid duplicate
+ *                          cascades. A non-zero value here is NOT a
+ *                          forensic signal; it's expected on graphs
+ *                          with shared descendants. Surface it in the
+ *                          operator dashboard separately so true
+ *                          corruption alerts (`cycleDefenseFired`)
+ *                          aren't drowned in normal traffic.
  *  - `silentNotified` — number of outbox entries with non-instant
  *                       transfer mode for which `transfer:cascade-failed`
  *                       was emitted with `silent: true`. These are the
@@ -316,6 +340,12 @@ export interface CascadeResult {
   readonly outboxNotified: number;
   readonly parentFlipAborted: number;
   readonly cycleDefenseFired: number;
+  /**
+   * Wave 4 steelman: legitimate DAG-join skips. See the
+   * {@link CascadeResult.cycleDefenseFired} JSDoc above for the
+   * rationale on splitting this out of the cycle counter.
+   */
+  readonly dagJoinSkipped: number;
   readonly silentNotified: number;
   readonly scannerErrors: number;
 }
@@ -436,6 +466,18 @@ export class CascadeWalker {
     const visited = new Set<string>();
     visited.add(parentTokenId);
 
+    // Wave 4 steelman: separate `ancestors` set tracks the active
+    // recursion path (root -> ... -> currentTokenId). A child landing
+    // back inside `ancestors` is a TRUE cycle (graph corruption); a
+    // child landing in `visited` but NOT `ancestors` is a legitimate
+    // DAG-join (the child was reached and cascaded via another path
+    // earlier in this walk; the second arrival is correctly suppressed
+    // as redundant work). The two cases warrant different operator
+    // signals — see CascadeResult.cycleDefenseFired vs dagJoinSkipped
+    // JSDoc.
+    const ancestors = new Set<string>();
+    ancestors.add(parentTokenId);
+
     const counters = mutableCounters();
 
     await this._walkCoinChildren(
@@ -443,6 +485,7 @@ export class CascadeWalker {
       parentTokenId,
       reason,
       visited,
+      ancestors,
       0, // initial depth
       counters,
     );
@@ -469,6 +512,7 @@ export class CascadeWalker {
     currentTokenId: string,
     rootReason: DispositionReason,
     visited: Set<string>,
+    ancestors: Set<string>,
     depth: number,
     counters: MutableCounters,
   ): Promise<void> {
@@ -550,7 +594,28 @@ export class CascadeWalker {
       // still the breaker) while letting transient parent-flip aborts
       // be re-attempted on the next worker pass.
       if (visited.has(childTokenId)) {
-        counters.cycleDefenseFired++;
+        // Wave 4 steelman: discriminate true cycle from legitimate
+        // DAG-join. If `childTokenId` is in `ancestors`, walking into
+        // it would re-enter an active recursion frame — that's a true
+        // cycle (graph corruption: a descendant claims a `splitParent`
+        // that resolves back to one of its own ancestors). If it's in
+        // `visited` but NOT `ancestors`, we already cascaded this child
+        // via another path earlier in this walk — a legitimate
+        // DAG-join, normal for graphs with shared descendants.
+        //
+        // The two cases warrant different operator signals:
+        //   - cycleDefenseFired → forensic alert (corruption suspected)
+        //   - dagJoinSkipped    → diagnostic only (expected behavior)
+        //
+        // We still emit the cycle warning event for forensic visibility
+        // (the historic `kind: 'cycle'` label is preserved verbatim
+        // for callers wired to the existing signal); the counter
+        // discriminates.
+        if (ancestors.has(childTokenId)) {
+          counters.cycleDefenseFired++;
+        } else {
+          counters.dagJoinSkipped++;
+        }
         this._emitCycleWarning({
           addr,
           parentTokenId: currentTokenId,
@@ -616,14 +681,25 @@ export class CascadeWalker {
       }
 
       // Recurse into the child's children (transitive cascade).
-      await this._walkCoinChildren(
-        addr,
-        childTokenId,
-        rootReason,
-        visited,
-        depth + 1,
-        counters,
-      );
+      // Push `childTokenId` onto the ancestors set for the duration of
+      // the recursive call so a descendant pointing back at it would
+      // be classified as a true cycle. Pop in `finally` so concurrent
+      // siblings (later iterations of this for-loop) don't see the
+      // ancestor tag.
+      ancestors.add(childTokenId);
+      try {
+        await this._walkCoinChildren(
+          addr,
+          childTokenId,
+          rootReason,
+          visited,
+          ancestors,
+          depth + 1,
+          counters,
+        );
+      } finally {
+        ancestors.delete(childTokenId);
+      }
     }
   }
 
@@ -924,6 +1000,8 @@ interface MutableCounters {
   outboxNotified: number;
   parentFlipAborted: number;
   cycleDefenseFired: number;
+  /** Wave 4 steelman: DAG-join skips, distinct from true cycles. */
+  dagJoinSkipped: number;
   silentNotified: number;
   scannerErrors: number;
 }
@@ -935,6 +1013,7 @@ function mutableCounters(): MutableCounters {
     outboxNotified: 0,
     parentFlipAborted: 0,
     cycleDefenseFired: 0,
+    dagJoinSkipped: 0,
     silentNotified: 0,
     scannerErrors: 0,
   };
@@ -947,6 +1026,7 @@ function freezeCounters(c: MutableCounters): CascadeResult {
     outboxNotified: c.outboxNotified,
     parentFlipAborted: c.parentFlipAborted,
     cycleDefenseFired: c.cycleDefenseFired,
+    dagJoinSkipped: c.dagJoinSkipped,
     silentNotified: c.silentNotified,
     scannerErrors: c.scannerErrors,
   };
@@ -958,6 +1038,7 @@ const EMPTY_RESULT: CascadeResult = Object.freeze({
   outboxNotified: 0,
   parentFlipAborted: 0,
   cycleDefenseFired: 0,
+  dagJoinSkipped: 0,
   silentNotified: 0,
   scannerErrors: 0,
 });

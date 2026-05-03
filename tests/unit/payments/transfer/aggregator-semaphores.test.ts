@@ -122,9 +122,89 @@ describe('canonicalizeAggregatorId — URL form collapsing', () => {
     );
   });
 
-  it('drops query string and fragment', () => {
-    expect(canonicalizeAggregatorId('https://agg?foo=bar#frag')).toBe(
+  it('preserves query string (routing-sensitive endpoints)', () => {
+    // Wave 4 steelman: query strings carry routing/auth info for
+    // some deployments. Two URLs differing ONLY in query MUST stay
+    // distinct so they don't share the W14 16-permit budget.
+    expect(canonicalizeAggregatorId('https://agg?token=abc')).not.toBe(
       canonicalizeAggregatorId('https://agg'),
+    );
+    expect(canonicalizeAggregatorId('https://agg?token=abc')).not.toBe(
+      canonicalizeAggregatorId('https://agg?token=xyz'),
+    );
+  });
+
+  it('drops fragment (#frag is client-side only per RFC 3986)', () => {
+    expect(canonicalizeAggregatorId('https://agg#frag')).toBe(
+      canonicalizeAggregatorId('https://agg'),
+    );
+    expect(canonicalizeAggregatorId('https://agg?token=abc#frag')).toBe(
+      canonicalizeAggregatorId('https://agg?token=abc'),
+    );
+  });
+
+  it('strips user-info (no creds in canonical key, log-safe)', () => {
+    // Wave 4 steelman: credentials in the canonical key (a) leak via
+    // any log that includes the id, and (b) artificially split two
+    // callers hitting the same backend through different auth keys
+    // — doubling the per-aggregator concurrency budget. Auth belongs
+    // at the transport layer, not the rate-budget key.
+    expect(canonicalizeAggregatorId('https://user:pass@agg')).toBe(
+      canonicalizeAggregatorId('https://agg'),
+    );
+    expect(canonicalizeAggregatorId('https://user@agg')).toBe(
+      canonicalizeAggregatorId('https://agg'),
+    );
+    // Critical: the canonical form MUST NOT contain credentials.
+    const canonical = canonicalizeAggregatorId('https://alice:s3cret@agg');
+    expect(canonical).not.toContain('alice');
+    expect(canonical).not.toContain('s3cret');
+  });
+
+  it('handles IPv6 hosts with port (preserves brackets, lowercases host)', () => {
+    // IPv6 literals MUST be re-bracketed in the canonical form so
+    // `host:port` parsing stays unambiguous. `[::1]:8080` and
+    // `[::1]:8080` (different case in the host) collapse together.
+    const a = canonicalizeAggregatorId('http://[::1]:8080');
+    const b = canonicalizeAggregatorId('http://[::1]:8080/');
+    expect(a).toBe(b);
+    // IPv6 stays distinct from a colon-bearing non-IPv6 id (defense
+    // against canonical-collision via missing brackets).
+    expect(a).not.toBe(canonicalizeAggregatorId('http://1:8080'));
+    // Brackets MUST be present in the canonical output.
+    expect(a).toContain('[::1]');
+    expect(a).toContain(':8080');
+  });
+
+  it('IPv6 default-port stripping (drops :80 / :443)', () => {
+    expect(canonicalizeAggregatorId('http://[::1]:80')).toBe(
+      canonicalizeAggregatorId('http://[::1]'),
+    );
+    expect(canonicalizeAggregatorId('https://[2001:db8::1]:443/')).toBe(
+      canonicalizeAggregatorId('https://[2001:db8::1]'),
+    );
+  });
+
+  it('collapses trailing-dot DNS forms (host. == host)', () => {
+    // DNS resolves `agg.example.` and `agg.example` to the same
+    // authority. Treat them as one registry slot.
+    expect(canonicalizeAggregatorId('https://agg.example.')).toBe(
+      canonicalizeAggregatorId('https://agg.example'),
+    );
+    expect(canonicalizeAggregatorId('https://agg.example./v2/rpc')).toBe(
+      canonicalizeAggregatorId('https://agg.example/v2/rpc'),
+    );
+  });
+
+  it('punycode IDN forms not double-encoded', () => {
+    // `URL` already encodes IDN to xn-- punycode; we only lowercase
+    // ASCII, leaving the punycode untouched. Sanity: an already-
+    // punycode input round-trips to itself (no double encoding).
+    const punycoded = canonicalizeAggregatorId('https://xn--bcher-kva.example');
+    expect(punycoded).toContain('xn--bcher-kva.example');
+    // Trailing-dot collapse still applies on punycode forms.
+    expect(canonicalizeAggregatorId('https://xn--bcher-kva.example.')).toBe(
+      canonicalizeAggregatorId('https://xn--bcher-kva.example'),
     );
   });
 
@@ -182,12 +262,45 @@ describe('aggregator-semaphores — URL canonicalization (#159)', () => {
     expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
   });
 
-  it("query/fragment differences collapse to the same key", () => {
-    const a = getAggregatorSemaphore('https://agg?foo=bar');
-    const b = getAggregatorSemaphore('https://agg#frag');
-    const c = getAggregatorSemaphore('https://agg');
-    expect(a).toBe(b);
-    expect(b).toBe(c);
+  it("fragment-only differences collapse, query stays distinct (Wave 4)", () => {
+    // Fragment is purely client-side (RFC 3986 §3.5) → MUST collapse.
+    const fragment = getAggregatorSemaphore('https://agg#frag');
+    const bare = getAggregatorSemaphore('https://agg');
+    expect(fragment).toBe(bare);
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
+
+    // Query string carries routing/auth → MUST stay distinct.
+    const queryA = getAggregatorSemaphore('https://agg?token=abc');
+    const queryB = getAggregatorSemaphore('https://agg?token=xyz');
+    expect(queryA).not.toBe(queryB);
+    expect(queryA).not.toBe(bare);
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(3);
+  });
+
+  it("user-info differences collapse to the same key (no creds in key)", () => {
+    // Two callers hitting the same backend with different credentials
+    // share the rate budget for that backend. Credentials are stripped
+    // from the canonical key.
+    const withCreds = getAggregatorSemaphore('https://alice:s3cret@agg');
+    const withoutCreds = getAggregatorSemaphore('https://agg');
+    expect(withCreds).toBe(withoutCreds);
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
+  });
+
+  it("IPv6 + port distinct from non-IPv6 colon forms", () => {
+    // Sanity: `[::1]:8080` MUST NOT collide with hosts that happen
+    // to contain colons or with non-IPv6 forms missing brackets.
+    const v6 = getAggregatorSemaphore('http://[::1]:8080');
+    const v6alt = getAggregatorSemaphore('http://[::1]:8080/');
+    expect(v6).toBe(v6alt);
+    const v4 = getAggregatorSemaphore('http://192.0.2.1:8080');
+    expect(v6).not.toBe(v4);
+  });
+
+  it("trailing-dot DNS forms collapse to the same key", () => {
+    const dotted = getAggregatorSemaphore('https://agg.example./v2/rpc');
+    const undotted = getAggregatorSemaphore('https://agg.example/v2/rpc');
+    expect(dotted).toBe(undotted);
     expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
   });
 

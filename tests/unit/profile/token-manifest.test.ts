@@ -10,7 +10,9 @@ import { describe, it, expect } from 'vitest';
 import {
   deriveStructuralManifest,
   conflictingTokenIds,
+  isConflictingStatus,
   type TokenManifest,
+  type TokenManifestEntry,
 } from '../../../profile/token-manifest';
 import type { UxfPackage } from '../../../uxf/UxfPackage';
 import type {
@@ -164,6 +166,89 @@ describe('deriveStructuralManifest', () => {
     expect(entry?.status).toBe('conflicting');
     expect(entry?.conflictingHeads?.length).toBe(3);
     expect([...(entry?.conflictingHeads ?? [])].sort()).toEqual(['headA', 'headB', 'headD']);
+  });
+
+  // -------------------------------------------------------------------------
+  // (Wave 4 steelman regression #3) — `'pending-conflicting'` is a UI-visible
+  // conflict status. The Wave 3 fix introduced the new status but
+  // `conflictingTokenIds()` was still filtering on `=== 'conflicting'` only,
+  // silently hiding pending-conflicting tokens from operators.
+  //
+  // These tests pin the post-fix behaviour: the helper and the
+  // `conflictingTokenIds()` consumer treat the two statuses symmetrically.
+  // Worker-drain logic that DOES need to distinguish them is exercised in
+  // `tests/unit/payments/transfer/disposition-engine.test.ts` instead.
+  // -------------------------------------------------------------------------
+
+  it('isConflictingStatus() returns true for both conflicting and pending-conflicting', () => {
+    expect(isConflictingStatus('conflicting')).toBe(true);
+    expect(isConflictingStatus('pending-conflicting')).toBe(true);
+  });
+
+  it('isConflictingStatus() returns false for valid / pending / invalid', () => {
+    expect(isConflictingStatus('valid')).toBe(false);
+    expect(isConflictingStatus('pending')).toBe(false);
+    expect(isConflictingStatus('invalid')).toBe(false);
+  });
+
+  it('conflictingTokenIds() surfaces tokens with status="pending-conflicting"', () => {
+    // Build a manifest that contains every status. Use a synthetic Map
+    // because deriveStructuralManifest() never produces pending /
+    // pending-conflicting / invalid (those are oracle/runtime statuses
+    // emitted by disposition-engine, not by the structural pass).
+    const manifest: TokenManifest = new Map<string, TokenManifestEntry>([
+      ['valid', { rootHash: 'r0' as ContentHash, status: 'valid' }],
+      ['pending', { rootHash: 'r1' as ContentHash, status: 'pending' }],
+      [
+        'conflicting',
+        {
+          rootHash: 'r2' as ContentHash,
+          status: 'conflicting',
+          conflictingHeads: ['headX' as ContentHash, 'headY' as ContentHash],
+        },
+      ],
+      [
+        'pending-conflicting',
+        {
+          rootHash: 'r3' as ContentHash,
+          status: 'pending-conflicting',
+          conflictingHeads: ['headP' as ContentHash, 'headQ' as ContentHash],
+        },
+      ],
+      [
+        'invalid',
+        {
+          rootHash: 'r4' as ContentHash,
+          status: 'invalid',
+          invalidReason: 'structural',
+        },
+      ],
+    ]);
+
+    const ids = conflictingTokenIds(manifest);
+    // Both kinds of conflict are surfaced, in insertion order (Map
+    // iteration is insertion-order in ECMA262).
+    expect(ids).toEqual(['conflicting', 'pending-conflicting']);
+    // Defensive — neither valid/pending/invalid leak into the result.
+    expect(ids).not.toContain('valid');
+    expect(ids).not.toContain('pending');
+    expect(ids).not.toContain('invalid');
+  });
+
+  it('conflictingTokenIds() — pending-conflicting alone still surfaces', () => {
+    // Edge case: a wallet that has ONLY pending-conflicting entries (no
+    // resolved conflicts yet) must still see them.
+    const manifest: TokenManifest = new Map<string, TokenManifestEntry>([
+      [
+        'tokenA',
+        {
+          rootHash: 'rA' as ContentHash,
+          status: 'pending-conflicting',
+          conflictingHeads: ['hA' as ContentHash, 'hB' as ContentHash],
+        },
+      ],
+    ]);
+    expect(conflictingTokenIds(manifest)).toEqual(['tokenA']);
   });
 
   it('does NOT mis-attribute sibling heads across tokens that share a mid-chain hash', () => {

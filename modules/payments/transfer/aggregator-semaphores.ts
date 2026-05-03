@@ -206,11 +206,33 @@ const aggregatorSemaphores = new Map<string, RejectableSemaphore>();
  * cap exactly the way the per-instance bug bypassed it before.
  *
  * Rules applied:
- *   - Lowercase the host.
+ *   - Lowercase the host (with IPv6 and punycode awareness — `URL`
+ *     already normalizes punycode via the IDN spec; we only down-case
+ *     ASCII to avoid double-encoding xn-- forms).
+ *   - Preserve IPv6 literal brackets (`[::1]:8080` stays distinct
+ *     from `1:8080`).
+ *   - Collapse the trailing-dot DNS form (`agg.example.` →
+ *     `agg.example`) — both spell the same authority in the DNS
+ *     resolution semantics.
  *   - Strip trailing slashes from the path (but keep a single `/` for
  *     a bare-root URL — `https://agg/` becomes `https://agg`).
  *   - Drop the default port (`:80` for `http`, `:443` for `https`).
- *   - Drop the query string and fragment.
+ *   - **Preserve the query string** — Wave 4 steelman fix: routing-
+ *     sensitive deployments use `?token=abc` for authentication or
+ *     traffic shaping; collapsing two distinct `?token=…` URLs to the
+ *     same key would let them share a 16-permit semaphore and bypass
+ *     the W14 cap from the OPPOSITE direction.
+ *   - Drop the fragment (`#frag`) — RFC 3986 §3.5 makes fragments
+ *     purely client-side; they never reach the aggregator and can't
+ *     discriminate endpoints.
+ *   - **Strip user-info (`user:pass@`)** — Wave 4 steelman fix: a
+ *     plaintext password landing inside the registry key (and any
+ *     log-line that incorporates the canonical id) is a credential
+ *     leak with no upside. Endpoints that genuinely need credentials
+ *     should pass them via the rpcCall headers; the canonical key is
+ *     authority-only. Two URLs that differ ONLY in user-info still
+ *     collapse to the same semaphore (which is correct: same host
+ *     == same backend rate budget).
  *
  * Non-URL strings (the `'default'` sentinel, test fixtures like
  * `'shared-aggregator'`) and URLs that fail to parse are returned
@@ -235,7 +257,23 @@ export function canonicalizeAggregatorId(id: string): string {
   try {
     const u = new URL(trimmed);
     const protocol = u.protocol.toLowerCase();
-    const host = u.hostname.toLowerCase();
+    // `URL.hostname` normalizes IPv6 brackets out and yields the bare
+    // host inside (`[::1]` → `::1`). We re-bracket it below when
+    // formatting hostport so the canonical form is RFC-3986-shaped
+    // and lookups stay distinct from non-IPv6 IDs that happen to
+    // contain colons. Punycode is already encoded by `URL` — we only
+    // lowercase ASCII so xn-- prefixes aren't disturbed (they're
+    // already lowercase by construction).
+    let hostname = u.hostname.toLowerCase();
+    const isIpv6 = hostname.includes(':');
+    // DNS treats `host.` and `host` as equivalent at lookup time.
+    // Strip a single trailing dot so the two spellings collapse to
+    // the same registry slot. (Multiple trailing dots are not
+    // RFC-valid; we still trim once for forgiveness.) Skip for IPv6
+    // (no DNS-style trailing dot ever applies).
+    if (!isIpv6 && hostname.endsWith('.') && hostname.length > 1) {
+      hostname = hostname.slice(0, -1);
+    }
     let port = u.port;
     // Strip default ports.
     if (
@@ -249,16 +287,24 @@ export function canonicalizeAggregatorId(id: string): string {
     // Strip trailing slashes from the path. A bare path of `/`
     // canonicalizes to empty so `https://agg` and `https://agg/`
     // hash the same.
-    let path = u.pathname.replace(/\/+$/, '');
-    if (path === '') path = '';
-    const hostport = port ? `${host}:${port}` : host;
-    // Username/password (rare in aggregator URLs) preserved
-    // verbatim — they can carry an API token in some deployments.
-    let userinfo = '';
-    if (u.username || u.password) {
-      userinfo = u.password ? `${u.username}:${u.password}@` : `${u.username}@`;
-    }
-    return `${protocol}//${userinfo}${hostport}${path}`;
+    const path = u.pathname.replace(/\/+$/, '');
+    // Re-bracket IPv6 literals: `URL` strips the brackets when parsing
+    // `hostname` but expects them back for serialization. Without the
+    // brackets, `host:port` becomes ambiguous (`::1:8080` parses as
+    // host = "::1", port = "8080" only by lookahead).
+    const hostFormatted = isIpv6 ? `[${hostname}]` : hostname;
+    const hostport = port ? `${hostFormatted}:${port}` : hostFormatted;
+    // Wave 4 steelman: PRESERVE query, DROP fragment, STRIP user-info.
+    // - `u.search` includes the leading `?` and is empty if no query.
+    // - `u.hash` is dropped entirely (client-side only per RFC 3986 §3.5).
+    // - `u.username` / `u.password` are intentionally NOT included —
+    //   credentials in the canonical key would (a) leak to logs that
+    //   include the id, and (b) artificially split two callers hitting
+    //   the same backend through different auth credentials, doubling
+    //   the per-aggregator concurrency. Auth belongs in the request
+    //   transport layer, not in the rate-budget key.
+    const query = u.search;
+    return `${protocol}//${hostport}${path}${query}`;
   } catch (err) {
     logger.warn(
       'AggregatorSemaphore',

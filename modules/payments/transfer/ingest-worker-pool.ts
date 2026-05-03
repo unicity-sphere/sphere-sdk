@@ -386,7 +386,12 @@ export class IngestWorkerPool {
   constructor(options: IngestWorkerPoolOptions) {
     this.lru = options.lru;
     this.perTokenMutex = options.perTokenMutex;
-    this.mutexStrategy = options.mutexStrategy ?? 'cas';
+    // Wave 4 steelman: default to 'rpc-release' for consistency with
+    // import-inclusion-proof, finalization-worker-sender, and
+    // finalization-worker-recipient. The 'cas' default required a
+    // CAS-based ManifestCas to be wired for serialization to engage;
+    // 'rpc-release' is correct without extra wiring.
+    this.mutexStrategy = options.mutexStrategy ?? 'rpc-release';
     this.processToken = options.processToken;
     this.emit = options.emit;
     this.cidOptions = options.cidOptions;

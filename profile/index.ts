@@ -137,6 +137,7 @@ export {
 export {
   deriveStructuralManifest,
   conflictingTokenIds,
+  isConflictingStatus,
 } from './token-manifest';
 export type {
   TokenManifest,

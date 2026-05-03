@@ -1562,10 +1562,17 @@ export class PaymentsModule {
           // hasNullProof === true so the recipient worker can rebuild
           // the SDK Token once the proof lands and flip status →
           // 'confirmed'.
+          // Wave 4 fix — also stash the canonical transactionHash + authenticator
+          // so the recipient `_recipientRequestContextMap` carries values that
+          // match the aggregator's proof on §6.1 race-lost compare. Wave 2
+          // populated the map with the requestId (wrong) which made every
+          // successful poll fire race-lost.
           let pendingFinalizationCtx: {
             sourceTokenJson: unknown;
             lastTxJson: Record<string, unknown>;
             requestIdHex: string;
+            transactionHash: string;
+            authenticator: string;
           } | null = null;
 
           if (txArray.length > 0) {
@@ -1655,10 +1662,44 @@ export class PaymentsModule {
                         : (typeof (reqIdBytes as { toJSON?: () => string }).toJSON === 'function'
                             ? (reqIdBytes as { toJSON: () => string }).toJSON()
                             : String(reqIdBytes));
+
+                    // Wave 4 fix — derive the canonical transactionHash imprint
+                    // hex (mirrors the sender at line ~7759). Both sides MUST
+                    // use the same value or the §6.1 race-lost detector at
+                    // finalization-worker-base.ts:824 fires on every successful
+                    // poll. Before this fix the recipient stored the requestId
+                    // as `transactionHash` — guaranteed-different from the
+                    // proof's tx-data-hash.
+                    let txHashImprintHex: string;
+                    try {
+                      const txDataHash = await commitment.transactionData.calculateHash();
+                      txHashImprintHex = txDataHash.toJSON();
+                    } catch (hashErr) {
+                      logger.warn(
+                        'Payments',
+                        `Wave 4 fix: failed to derive recipient transactionHash for requestId ${reqIdHex.slice(0, 16)} — race-lost detection degraded (falling back to requestId).`,
+                        { err: hashErr instanceof Error ? hashErr.message : String(hashErr) },
+                      );
+                      txHashImprintHex = reqIdHex;
+                    }
+
+                    // Wave 4 fix — extract canonical authenticator JSON. The
+                    // sender uses `JSON.stringify(commitment.toJSON()
+                    // .authenticator)` (line ~7779). The recipient mirrors
+                    // exactly so §6.3 same-value vs different-value proof
+                    // resolution byte-equality holds.
+                    const commitJson = (commitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
+                    const authenticatorJsonStr =
+                      commitJson?.authenticator !== undefined && commitJson.authenticator !== null
+                        ? JSON.stringify(commitJson.authenticator)
+                        : '';
+
                     pendingFinalizationCtx = {
                       sourceTokenJson,
                       lastTxJson,
                       requestIdHex: reqIdHex,
+                      transactionHash: txHashImprintHex,
+                      authenticator: authenticatorJsonStr,
                     };
                   } catch (commitErr) {
                     logger.warn(
@@ -1809,10 +1850,19 @@ export class PaymentsModule {
                 // already has the commitment from the sender), but the
                 // resolver still needs to surface a non-null
                 // RequestContext.
+                //
+                // Wave 4 fix — populate with the REAL canonical
+                // transactionHash + authenticator derived from the
+                // SDK commitment in pendingFinalizationCtx. Previously
+                // both fields were filled with the requestId / empty
+                // string, which made §6.1 fire race-lost on every
+                // successful aggregator poll (because the proof's
+                // transactionHash is the tx-data-hash imprint, not the
+                // requestId).
                 if (!this._recipientRequestContextMap.has(reqId)) {
                   this._recipientRequestContextMap.set(reqId, {
-                    transactionHash: reqId,
-                    authenticator: '',
+                    transactionHash: pCtx.transactionHash,
+                    authenticator: pCtx.authenticator,
                     nextEntryRest: { status: 'valid' as const },
                   });
                 }
@@ -1830,14 +1880,17 @@ export class PaymentsModule {
                 // not yet exercised by this default; the entry-id
                 // composite (`${tokenId}:${txIndex}`) reserves the
                 // shape for future K>1 wiring.
+                // Wave 4 fix — populate with canonical transactionHash +
+                // authenticator from pendingFinalizationCtx (real values
+                // derived from the SDK commitment), NOT requestId / empty.
                 const entry: FinalizationQueueEntry = {
                   entryId: entryIdFor(tokenIdForQueue, txArray.length - 1),
                   tokenId: tokenIdForQueue,
                   bundleCid: ctx.bundleCid, // outer ctx = ProcessTokenContext
                   txIndex: txArray.length - 1,
                   commitmentRequestId: reqId,
-                  transactionHash: reqId,
-                  authenticator: '',
+                  transactionHash: pCtx.transactionHash,
+                  authenticator: pCtx.authenticator,
                   submittedAt: Date.now(),
                   createdAt: Date.now(),
                   submitRetryCount: 0,
@@ -9550,6 +9603,17 @@ export function buildDefaultFinalizationWorkerSender(opts: {
             }
           | null
           | undefined;
+        // Wave 4 fix — classify path-non-inclusion (transactionHash === null)
+        // BEFORE constructing the OK descriptor. Per SDK semantics a proof
+        // with `transactionHash: null` is a cryptographic proof of NON-
+        // inclusion at this SMT snapshot, not a successful proof. Treat as
+        // PATH_NOT_INCLUDED so the worker continues polling within the
+        // window (§6.1) instead of triggering race-lost when the OK
+        // descriptor's transactionHash falls back to the requestId
+        // (different from the local 68-char imprint by construction).
+        if (proofJson !== null && proofJson !== undefined && proofJson.transactionHash === null) {
+          return { kind: 'PATH_NOT_INCLUDED' };
+        }
         const proofTxHash =
           proofJson !== null && proofJson !== undefined && typeof proofJson.transactionHash === 'string'
             ? proofJson.transactionHash
@@ -9559,11 +9623,11 @@ export function buildDefaultFinalizationWorkerSender(opts: {
             ? JSON.stringify(proofJson.authenticator)
             : '';
         // Fallback for path-non-inclusion proofs (transactionHash is null
-        // by spec). We surface the requestId as a sentinel so existing
-        // resolution paths don't break, but a `null` proofTxHash typically
-        // means PATH_NOT_INCLUDED which the worker treats as a hard-fail
-        // before the §6.1 race-lost compare runs. The fallback ensures
-        // the descriptor remains a valid string for type safety.
+        // by spec). The Wave 4 early-return above already classifies
+        // those as PATH_NOT_INCLUDED, so this fallback handles only the
+        // degenerate case where proofJson is null/undefined entirely
+        // (which should not happen given the upstream shape validation,
+        // but keeps the descriptor a valid string for type safety).
         const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
           transactionHash: proofTxHash ?? proof.requestId,
           authenticator: proofAuthenticator,
@@ -9813,6 +9877,21 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
           | { transactionHash?: string | null; authenticator?: unknown }
           | null
           | undefined;
+        // Wave 4 fix — if the aggregator returned an inclusion-proof shape
+        // with `transactionHash === null`, that is the SDK's canonical
+        // path-non-inclusion proof (a cryptographic proof that the
+        // requestId is NOT in the SMT at this snapshot). Treat as
+        // PATH_NOT_INCLUDED so the worker keeps polling within the
+        // window instead of taking the OK branch — which would then
+        // (a) descriptor.transactionHash falls back to requestId and
+        // (b) §6.1 race-lost fires because the local context has the
+        // canonical 68-char imprint, not the requestId. This was the
+        // regression introduced by Wave 1 #157 (shape validation
+        // accepting null transactionHash) combined with Wave 2 #151
+        // (recipient worker bootstrap).
+        if (proofJson !== null && proofJson !== undefined && proofJson.transactionHash === null) {
+          return { kind: 'PATH_NOT_INCLUDED' };
+        }
         const proofTxHash =
           proofJson !== null && proofJson !== undefined && typeof proofJson.transactionHash === 'string'
             ? proofJson.transactionHash
@@ -9924,6 +10003,19 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
   };
 
   // ---- DispositionWriter — load-bearing finalization callback --------
+  //
+  // Wave 4 fix — every error path emits `transfer:operator-alert` so the
+  // local Token doesn't silently stay 'pending' forever when the
+  // recipient finalization fails. The previous Wave 2 implementation
+  // swallowed errors in the catch block, which combined with the
+  // race-lost regression made stuck tokens invisible to operators.
+  //
+  // Design choice: ctx is intentionally NOT removed on failure — that
+  // way a subsequent retry (e.g. via payments.receive({finalize:true})
+  // or a manual disposition replay) can pick up the same context. The
+  // leak is bounded because `recipientFinalizationContext` is a
+  // per-instance Map cleared on `destroy()` and on successful
+  // finalization.
   const dispositionWriter: FinalizationDispositionWriter = {
     async write(_addr, record) {
       if (record.disposition !== 'VALID') {
@@ -9941,10 +10033,16 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
       try {
         const proof = await oracle.getProof(ctx.requestIdHex);
         if (proof === null || proof === undefined) {
-          logger.warn(
-            'Payments',
-            `Task #151: dispositionWriter VALID but oracle.getProof returned null for ${tokenId.slice(0, 16)}`,
-          );
+          const msg = `Task #151: dispositionWriter VALID but oracle.getProof returned null for ${tokenId.slice(0, 16)} (requestId=${ctx.requestIdHex.slice(0, 16)})`;
+          logger.warn('Payments', msg);
+          // Wave 4 fix — surface to operators. proof-throw is the
+          // closest existing DispositionReason for "we expected a proof
+          // and the aggregator gave us nothing".
+          emit('transfer:operator-alert', {
+            code: 'proof-throw',
+            tokenId: ctx.localTokenId,
+            message: msg,
+          });
           return;
         }
         const patchedLastTxJson = {
@@ -9970,10 +10068,16 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
             try {
               await save();
             } catch (saveErr) {
-              logger.warn(
-                'Payments',
-                `Task #151: save() after status flip threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`,
-              );
+              const saveMsg = `Task #151: save() after status flip threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
+              logger.warn('Payments', saveMsg);
+              // Wave 4 fix — emit operator-alert when persistence fails.
+              // Local Token state was mutated in-memory but didn't
+              // round-trip to disk; operators need to know.
+              emit('transfer:operator-alert', {
+                code: 'structural',
+                tokenId: ctx.localTokenId,
+                message: saveMsg,
+              });
             }
           }
           return;
@@ -10004,10 +10108,16 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
         try {
           await save();
         } catch (saveErr) {
-          logger.warn(
-            'Payments',
-            `Task #151: save() after finalization threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`,
-          );
+          const saveMsg = `Task #151: save() after finalization threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
+          logger.warn('Payments', saveMsg);
+          // Wave 4 fix — emit operator-alert. The Token was finalized
+          // and flipped to 'confirmed' in-memory, but persistence
+          // failed; on the next reload the in-memory mutation is lost.
+          emit('transfer:operator-alert', {
+            code: 'structural',
+            tokenId: ctx.localTokenId,
+            message: saveMsg,
+          });
         }
         recipientFinalizationContext.delete(tokenId);
         logger.debug(
@@ -10015,11 +10125,23 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
           `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
         );
       } catch (err) {
+        const errMsg = `Task #151: dispositionWriter finalization failed for ${tokenId.slice(0, 16)} — ${err instanceof Error ? err.message : String(err)}`;
         logger.warn(
           'Payments',
-          `Task #151: dispositionWriter finalization failed for ${tokenId.slice(0, 16)}`,
+          errMsg,
           { err: err instanceof Error ? err.message : String(err) },
         );
+        // Wave 4 fix — operator-alert on any unhandled finalization
+        // error. Without this the local Token stays 'pending' forever
+        // and the leak (`recipientFinalizationContext` entry retained
+        // for retry) is invisible. We deliberately keep the ctx in
+        // the Map so an external retry path (e.g. another disposition
+        // write) can re-attempt.
+        emit('transfer:operator-alert', {
+          code: 'proof-throw',
+          tokenId: ctx.localTokenId,
+          message: errMsg,
+        });
       }
     },
   };

@@ -145,6 +145,32 @@ export type {
   SubmitOutcomeKind,
 };
 
+/**
+ * Wave 4 steelman: hard upper bound on the size of a single
+ * `queueStore.list()` result the recipient scan loop will accept
+ * without alerting. Same rationale as
+ * {@link SCAN_LIST_HARD_GUARD} in `finalization-worker-sender.ts`.
+ *
+ * Sized at 16384. The finalization queue holds at most one entry
+ * per (tokenId, txIndex) tuple; a healthy address rarely exceeds
+ * a few hundred entries even under heavy chain-mode load.
+ *
+ * The scan loop truncates to this cap and emits a structural alert;
+ * progress on the first {@link RECIPIENT_SCAN_LIST_HARD_GUARD}
+ * entries continues.
+ *
+ * @internal
+ */
+export const RECIPIENT_SCAN_LIST_HARD_GUARD = 16384;
+
+/**
+ * Power-of-two helper for the exponential alert backoff.
+ * @internal
+ */
+function isPowerOfTwoRecipient(n: number): boolean {
+  return n > 0 && (n & (n - 1)) === 0;
+}
+
 // =============================================================================
 // 1. Disposition writer surface — narrow shape over T.3.C
 // =============================================================================
@@ -426,6 +452,14 @@ export class FinalizationWorkerRecipient {
    *  and the loop don't race the same token. Guards the per-tokenId
    *  mutex from holding two budgets concurrently for the same key. */
   private readonly inFlightTokens: Set<string> = new Set();
+  /**
+   * Wave 4 steelman: consecutive `queueStore.list()` failure counter
+   * for exponential alert backoff. Same rationale as the sender
+   * worker's {@link FinalizationWorkerSender#scanReadFailureStreak}.
+   *
+   * @internal
+   */
+  private scanReadFailureStreak = 0;
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6).
@@ -454,7 +488,12 @@ export class FinalizationWorkerRecipient {
     this.maxSubmitRetries = options.caps?.maxSubmitRetries ?? 5;
     this.maxProofErrorRetries = options.caps?.maxProofErrorRetries ?? 3;
     this.pollingWindowMs = options.caps?.pollingWindowMs ?? POLLING_WINDOW_MS;
-    this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'cas';
+    // Wave 4 steelman: default to 'rpc-release' for consistency with
+    // import-inclusion-proof and ingest-worker-pool. The 'cas' default
+    // silently lost serialization for callers that didn't wire a
+    // CAS-based ManifestCas; 'rpc-release' is correct without extra
+    // wiring.
+    this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'rpc-release';
     this.trustBaseStaleness = options.trustBaseStaleness;
     this.scanIntervalMs = options.scanIntervalMs ?? 30_000;
     this.maxTokensPerScan = options.maxTokensPerScan ?? 100;
@@ -1153,12 +1192,44 @@ export class FinalizationWorkerRecipient {
       let processed = 0;
       try {
         const all = await this.options.queueStore.list(this.options.addressId);
+        // Wave 4 steelman: defensive size guard. The queueStore
+        // contract (FinalizationQueue.list, see finalization-queue.ts
+        // §3) returns the full per-address list; a misconfigured
+        // backend (no tombstone GC, runaway corrupt-slot recovery)
+        // could OOM the worker on a degenerate dataset. Truncate +
+        // alert if the list exceeds RECIPIENT_SCAN_LIST_HARD_GUARD;
+        // forward progress on the first cap entries continues.
+        let workingList: ReadonlyArray<typeof all[number]> = all;
+        if (all.length > RECIPIENT_SCAN_LIST_HARD_GUARD) {
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            message:
+              `FinalizationWorkerRecipient.scanLoop: queueStore.list returned ` +
+              `${all.length} entries (queue contract: <= ` +
+              `${RECIPIENT_SCAN_LIST_HARD_GUARD}); truncating to first ` +
+              `${RECIPIENT_SCAN_LIST_HARD_GUARD} to avoid OOM. Inspect the ` +
+              `finalization queue for unbounded growth (missing tombstone GC?).`,
+          });
+          workingList = all.slice(0, RECIPIENT_SCAN_LIST_HARD_GUARD);
+        }
+
+        // Successful read — emit recovery info if we were in a streak.
+        if (this.scanReadFailureStreak > 0) {
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            message:
+              `FinalizationWorkerRecipient.scanLoop: queueStore.list ` +
+              `recovered after ${this.scanReadFailureStreak} consecutive failure(s).`,
+          });
+          this.scanReadFailureStreak = 0;
+        }
+
         // Group by tokenId. The queue can hold K entries per K-deep
         // chain-mode token; one `processOneToken` call drives all
         // entries for that token.
         const tokenIds: string[] = [];
         const seen = new Set<string>();
-        for (const e of all) {
+        for (const e of workingList) {
           if (seen.has(e.tokenId)) continue;
           if (this.inFlightTokens.has(e.tokenId)) continue;
           seen.add(e.tokenId);
@@ -1184,13 +1255,19 @@ export class FinalizationWorkerRecipient {
           }
         }
       } catch (err) {
-        // queueStore.list failure — emit and back off. The next pass
-        // retries.
-        const msg = err instanceof Error ? err.message : String(err);
-        this.options.emit('transfer:operator-alert', {
-          code: 'structural',
-          message: `FinalizationWorkerRecipient.scanLoop: queueStore.list threw: ${msg}`,
-        });
+        // Wave 4 steelman: exponential backoff. First failure emits;
+        // subsequent failures emit at power-of-two boundaries only.
+        // Reset on next success.
+        this.scanReadFailureStreak += 1;
+        if (isPowerOfTwoRecipient(this.scanReadFailureStreak)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            message:
+              `FinalizationWorkerRecipient.scanLoop: queueStore.list threw ` +
+              `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
+          });
+        }
       }
 
       if (processed === 0) {

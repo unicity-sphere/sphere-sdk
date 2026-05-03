@@ -319,11 +319,148 @@ export interface InstantSenderDeps {
    * @internal Test seam only.
    */
   readonly __faultInject?: FaultInjectionHooks;
+  /**
+   * **TEST-ONLY** override for the source-lock max-hold timeout (Wave 4
+   * #171 fix). Defaults to 60_000ms in production; tests override to
+   * a smaller value to exercise the force-release path without
+   * burning real wall-clock seconds.
+   *
+   * @internal Test seam only.
+   */
+  readonly __sourceLockMaxHoldMs?: number;
 }
 
 // =============================================================================
 // 2. Internal helpers
 // =============================================================================
+
+/**
+ * Per-source in-memory lock registry — Wave 4 steelman fix #171 issue 1.
+ *
+ * **The race we close.** Wave 3's fix (#170) deferred `markSourcePending`
+ * until AFTER `transport.sendTokenTransfer` succeeds. That eliminates the
+ * "transport-fails-leaving-stuck-pending" failure mode, but introduces a
+ * *same-process* double-spend window: two parallel `sendInstantUxf` calls
+ * in the SAME Sphere instance may both observe sources as
+ * `confirmed`/non-pending, both pass selection, both publish via
+ * transport, and only THEN race to call `markSourcePending`. The
+ * recipient receives BOTH bundles; the aggregator rejects the second
+ * commitment as duplicate-spend; the sender's outbox holds one
+ * `delivered-instant` and one entry that must transition to
+ * `failed-permanent`.
+ *
+ * **The fix.** Acquire a per-tokenId mutex on every selected source
+ * BEFORE source selection completes, hold it across the entire
+ * selection→commit→transport→mark sequence, and release in `finally`.
+ * Concurrent sends sharing any source token serialize through the lock;
+ * sends with disjoint sources proceed concurrently as before.
+ *
+ * **Deadlock prevention.** Locks are acquired in lex-sorted order of
+ * tokenId so two concurrent sends sharing tokens always agree on
+ * acquisition order. Without the sort, send A (tokens [X, Y]) and send B
+ * (tokens [Y, X]) could each hold one lock and wait forever for the
+ * other.
+ *
+ * **Liveness floor.** A 60-second max-hold timeout fires if a lock is
+ * held longer (e.g. transport hangs forever); the lock is force-released
+ * with a `console.warn` so a stuck send cannot wedge unrelated future
+ * sends. The original send still throws/recovers per its own error path.
+ *
+ * **Same-token-set re-entry.** A user genuinely sending the same source
+ * twice in parallel (split mode for huge balances) is serialized by the
+ * lock — by design. Document this if surfaced to API consumers.
+ *
+ * Spec refs: §6.1 sender-side semantics; §7.1 CRDT invariants (no
+ * commitment may be observed by two outbox entries with overlapping
+ * source-token sets).
+ *
+ * @internal
+ */
+const sourceLocks = new Map<string, Promise<void>>();
+
+/** Default max-hold for any single source lock. Configurable via the
+ *  `LOCK_MAX_HOLD_MS` parameter for testability. */
+const DEFAULT_LOCK_MAX_HOLD_MS = 60_000;
+
+/**
+ * Acquire locks on every supplied tokenId in lex-sorted order. Returns
+ * a `release()` function that callers MUST invoke in `finally`.
+ *
+ * Each lock entry is a `Promise<void>` that resolves when the holder
+ * releases. Subsequent acquirers loop until the slot is empty,
+ * re-attempting after each prior holder's release. The
+ * `Map.has`+`await`+`Map.set` sequence is safe because every
+ * micro-tick between awaits checks the slot afresh — and ALL set
+ * operations occur on the SAME microtask the await resumes on.
+ *
+ * @param tokenIds - sources to lock. Duplicates are deduped via Set.
+ * @param maxHoldMs - liveness timeout. Defaults to {@link
+ *                    DEFAULT_LOCK_MAX_HOLD_MS}.
+ *
+ * @internal
+ */
+async function acquireSourceLocks(
+  tokenIds: ReadonlyArray<string>,
+  maxHoldMs: number = DEFAULT_LOCK_MAX_HOLD_MS,
+): Promise<() => void> {
+  const sortedIds = [...new Set(tokenIds)].sort();
+  const releases: Array<() => void> = [];
+  for (const tokenId of sortedIds) {
+    // Wait until the slot is empty. Each iteration awaits the prior
+    // holder, then re-checks; if a third caller raced in we loop again.
+    while (sourceLocks.has(tokenId)) {
+      try {
+        await sourceLocks.get(tokenId);
+      } catch {
+        // Prior holder rejected its lock-promise (it shouldn't, but
+        // defense-in-depth). Loop and re-check.
+      }
+    }
+    let releaseFn!: () => void;
+    const lockPromise = new Promise<void>((resolve) => {
+      releaseFn = resolve;
+    });
+    sourceLocks.set(tokenId, lockPromise);
+
+    // Per-lock liveness timer. If `release()` hasn't fired within
+    // `maxHoldMs`, force-release with a warning so unrelated future
+    // sends can proceed.
+    let released = false;
+    const timer = setTimeout(() => {
+      if (!released && sourceLocks.get(tokenId) === lockPromise) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `sendInstantUxf: source lock for tokenId=${tokenId} held >${maxHoldMs}ms; ` +
+            'force-releasing. The originating send may still complete its own error path, ' +
+            'but unrelated future sends can now proceed.',
+        );
+        sourceLocks.delete(tokenId);
+        releaseFn();
+      }
+    }, maxHoldMs);
+    // The timer must NOT keep the Node.js event loop alive — pure
+    // best-effort liveness, never a blocker for graceful shutdown.
+    if (typeof timer === 'object' && timer !== null && 'unref' in timer) {
+      (timer as { unref: () => void }).unref();
+    }
+
+    releases.push(() => {
+      released = true;
+      clearTimeout(timer);
+      // Only delete if the slot still references our lock-promise — a
+      // force-release timer may have already evicted us.
+      if (sourceLocks.get(tokenId) === lockPromise) {
+        sourceLocks.delete(tokenId);
+      }
+      releaseFn();
+    });
+  }
+  return () => {
+    for (const release of releases) {
+      release();
+    }
+  };
+}
 
 /**
  * Sort by source tokenId, lex-ascending. Same rule the
@@ -537,6 +674,19 @@ export async function sendInstantUxf(
     tokenTransfers: [],
   };
 
+  // Wave 4 #171 fix — per-source lock release fn, bound after selection.
+  // MUST be invoked in `finally` regardless of success/failure to prevent
+  // a stuck send from wedging unrelated future sends sharing the same
+  // sources. Bound late because we don't know which sources to lock until
+  // `selectSources` returns; the selection→lock window is safe because it
+  // contains no observable external mutations (no transport publish, no
+  // aggregator commit), so even if two sends pick the same set in
+  // parallel, exactly one will acquire the lock first and complete the
+  // commit/publish/mark sequence atomically — the second blocks at the
+  // lock and, on resume, sees the now-pending sources rejected by either
+  // the aggregator (duplicate-spend) or the spend planner (excluded from
+  // selection).
+  let releaseSourceLocks: (() => void) | null = null;
   try {
     // -----------------------------------------------------------------
     // Step 1: validate target list (T.2.B — §4.1 step 1+2). W11
@@ -565,6 +715,18 @@ export async function sendInstantUxf(
       );
     }
     result.tokens = [...selected];
+
+    // -----------------------------------------------------------------
+    // Step 2.5 (Wave 4 #171 fix): acquire per-source in-memory locks.
+    // Held across the entire commit→transport→mark sequence to close
+    // the same-process double-spend window introduced by Wave 3's
+    // deferred-mark fix (#170). Locks released in the outer `finally`.
+    // -----------------------------------------------------------------
+    const sourceTokenIds = selected.map((t) => t.id);
+    releaseSourceLocks = await acquireSourceLocks(
+      sourceTokenIds,
+      deps.__sourceLockMaxHoldMs,
+    );
 
     // -----------------------------------------------------------------
     // Step 3: skip preflight finalize. Instant mode permits unfinalized
@@ -981,6 +1143,14 @@ export async function sendInstantUxf(
     result.error = err instanceof Error ? err.message : String(err);
     deps.emit('transfer:failed', result as TransferResult);
     throw err;
+  } finally {
+    // Wave 4 #171 fix: release per-source locks regardless of success
+    // or failure. Bound to `null` until selection completes; if we
+    // threw before locks were acquired (e.g. validateTargets rejection,
+    // empty selection) there is nothing to release.
+    if (releaseSourceLocks !== null) {
+      releaseSourceLocks();
+    }
   }
 }
 

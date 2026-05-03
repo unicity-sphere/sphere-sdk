@@ -13,7 +13,7 @@
  *    any event (no state mutation).
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   ADDR,
@@ -753,5 +753,394 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     expect(
       h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
     ).toBe(0);
+  });
+
+  // ===========================================================================
+  // (Wave 4 regression #2) canonicalAuthenticatorEquals coverage
+  //
+  // §155's byte-equal binding compare on `authenticator` was wrong.
+  // `authenticator` is JSON-encoded on most production paths and JSON
+  // object key order is NOT canonical. Two semantically-identical
+  // authenticators emitted by different serializers (sender's commitJson
+  // vs aggregator's response vs recipient's `Transaction.toJSON()`) can
+  // produce different bytes — naive `hexEqualsIgnoreCase` reports
+  // `proof-binding-mismatch` for every legitimate proof. The fix uses a
+  // canonical compare that parses both sides and compares fields by
+  // value.
+  // ===========================================================================
+  describe('Wave 4 #2: canonicalAuthenticatorEquals binding compare', () => {
+    // (a) Two semantically-identical authenticators with different JSON
+    //     key orders → ACCEPTED.
+    it('CASE 3 (#W4-2): pending + same authenticator with permuted JSON key order → ACCEPTED', async () => {
+      const h = buildImporterHarness();
+      // Aggregator-style key order: {algorithm, publicKey, signature, stateHash}
+      const queueAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '02' + 'aa'.repeat(32),
+        signature: '11'.repeat(64),
+        stateHash: '0000' + 'cc'.repeat(32),
+      });
+      // SDK-interface-style key order:
+      // {publicKey, algorithm, signature, stateHash} — different bytes,
+      // SAME semantic value.
+      const proofAuthn = JSON.stringify({
+        publicKey: '02' + 'aa'.repeat(32),
+        algorithm: 'secp256k1',
+        signature: '11'.repeat(64),
+        stateHash: '0000' + 'cc'.repeat(32),
+      });
+      // Sanity check: the byte strings DIFFER (so the regression would
+      // hit `hexEqualsIgnoreCase` length-mismatch / string-inequality).
+      expect(queueAuthn).not.toBe(proofAuthn);
+      h.manifest.entries.set(`${ADDR}:${tk('t-keyorder')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-keyorder'),
+        commitmentRequestId: 'rq-keyorder',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: queueAuthn,
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-keyorder'),
+        proofFor({
+          requestId: 'rq-keyorder',
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: proofAuthn,
+        }),
+      );
+      expect(result).toEqual({ ok: true, transition: 'pending→valid' });
+      expect(h.graftCalls.length).toBe(1);
+    });
+
+    it('CASE 5 (#W4-2): _invalid + same authenticator with permuted JSON key order → ACCEPTED override', async () => {
+      const h = buildImporterHarness();
+      const queueAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '02' + 'bb'.repeat(32),
+        signature: '22'.repeat(64),
+        stateHash: '0000' + 'dd'.repeat(32),
+      });
+      const proofAuthn = JSON.stringify({
+        publicKey: '02' + 'bb'.repeat(32),
+        signature: '22'.repeat(64),
+        algorithm: 'secp256k1',
+        stateHash: '0000' + 'dd'.repeat(32),
+      });
+      expect(queueAuthn).not.toBe(proofAuthn);
+      h.disposition.entries.set(
+        `${ADDR}.invalid.${tk('t-key-inv')}.${'aa'.repeat(32)}`,
+        invalidEntryFor({ tokenId: tk('t-key-inv'), reason: 'oracle-rejected' }),
+      );
+      h.manifest.entries.set(`${ADDR}:${tk('t-key-inv')}`, manifestEntryFor({
+        status: 'invalid',
+        invalidReason: 'oracle-rejected',
+        rootHashHex: 'aa'.repeat(32),
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-key-inv'),
+        commitmentRequestId: 'rq-key-inv',
+        status: 'hard-fail',
+        transactionHash: '0000' + 'ee'.repeat(32),
+        authenticator: queueAuthn,
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-key-inv'),
+        proofFor({
+          requestId: 'rq-key-inv',
+          transactionHash: '0000' + 'ee'.repeat(32),
+          authenticator: proofAuthn,
+        }),
+        { allowInvalidOverride: true },
+      );
+      expect(result).toEqual({ ok: true, transition: 'invalid→valid' });
+      expect(h.overrideCalls.length).toBe(1);
+    });
+
+    // (b) Different-content authenticators → REJECTED.
+    it('CASE 3 (#W4-2): pending + DIFFERENT authenticator content (different signature) → REJECTED', async () => {
+      const h = buildImporterHarness();
+      const queueAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '02' + 'aa'.repeat(32),
+        signature: '11'.repeat(64),
+        stateHash: '0000' + 'cc'.repeat(32),
+      });
+      // Different signature — semantically distinct authenticator.
+      const proofAuthn = JSON.stringify({
+        publicKey: '02' + 'aa'.repeat(32),
+        algorithm: 'secp256k1',
+        signature: '99'.repeat(64),
+        stateHash: '0000' + 'cc'.repeat(32),
+      });
+      h.manifest.entries.set(`${ADDR}:${tk('t-diff-sig')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-diff-sig'),
+        commitmentRequestId: 'rq-diff-sig',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: queueAuthn,
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-diff-sig'),
+        proofFor({
+          requestId: 'rq-diff-sig',
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: proofAuthn,
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+      expect(h.graftCalls.length).toBe(0);
+    });
+
+    it('CASE 3 (#W4-2): pending + DIFFERENT publicKey → REJECTED', async () => {
+      const h = buildImporterHarness();
+      const queueAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '02' + 'aa'.repeat(32),
+        signature: '11'.repeat(64),
+        stateHash: '0000' + 'cc'.repeat(32),
+      });
+      const proofAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '03' + 'aa'.repeat(32), // different prefix
+        signature: '11'.repeat(64),
+        stateHash: '0000' + 'cc'.repeat(32),
+      });
+      h.manifest.entries.set(`${ADDR}:${tk('t-diff-pk')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-diff-pk'),
+        commitmentRequestId: 'rq-diff-pk',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: queueAuthn,
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-diff-pk'),
+        proofFor({
+          requestId: 'rq-diff-pk',
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: proofAuthn,
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+    });
+
+    // (c) Empty queue-entry authenticator → 'queue-entry-incomplete' +
+    //     warning. Forensic — surfaces upstream writer regression
+    //     (PaymentsModule recipient queue path writing `''`).
+    it('CASE 3 (#W4-2): pending + EMPTY queue authenticator → reason="queue-entry-incomplete" + warning', async () => {
+      const h = buildImporterHarness();
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        h.manifest.entries.set(`${ADDR}:${tk('t-empty-q')}`, manifestEntryFor({
+          status: 'pending',
+        }));
+        h.queue.entries.push(queueEntryFor({
+          tokenId: tk('t-empty-q'),
+          commitmentRequestId: 'rq-empty-q',
+          status: 'pending',
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: '', // pre-fix queue regression
+        }));
+        const result = await h.importer.importInclusionProof(
+          ADDR,
+          tk('t-empty-q'),
+          proofFor({
+            requestId: 'rq-empty-q',
+            transactionHash: '0000' + 'ab'.repeat(32),
+            authenticator: 'authn-anything',
+          }),
+        );
+        expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
+        expect(h.graftCalls.length).toBe(0);
+        // Operator alert: console.warn must fire exactly once with the
+        // tokenId + requestId in the message.
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        const msg = warnSpy.mock.calls[0]?.join(' ') ?? '';
+        expect(msg).toContain('empty authenticator');
+        expect(msg).toContain('rq-empty-q');
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('CASE 5 (#W4-2): _invalid + EMPTY queue authenticator → reason="queue-entry-incomplete" + warning, override NOT applied', async () => {
+      const h = buildImporterHarness();
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        h.disposition.entries.set(
+          `${ADDR}.invalid.${tk('t-empty-inv')}.${'aa'.repeat(32)}`,
+          invalidEntryFor({ tokenId: tk('t-empty-inv'), reason: 'oracle-rejected' }),
+        );
+        h.manifest.entries.set(`${ADDR}:${tk('t-empty-inv')}`, manifestEntryFor({
+          status: 'invalid',
+          invalidReason: 'oracle-rejected',
+          rootHashHex: 'aa'.repeat(32),
+        }));
+        h.queue.entries.push(queueEntryFor({
+          tokenId: tk('t-empty-inv'),
+          commitmentRequestId: 'rq-empty-inv',
+          status: 'hard-fail',
+          transactionHash: '0000' + 'ee'.repeat(32),
+          authenticator: '', // pre-fix queue regression
+        }));
+        const result = await h.importer.importInclusionProof(
+          ADDR,
+          tk('t-empty-inv'),
+          proofFor({
+            requestId: 'rq-empty-inv',
+            transactionHash: '0000' + 'ee'.repeat(32),
+            authenticator: 'whatever',
+          }),
+          { allowInvalidOverride: true },
+        );
+        expect(result).toEqual({ ok: false, reason: 'queue-entry-incomplete' });
+        // §5.6 monotonicity: override callback NOT invoked, no event.
+        expect(h.overrideCalls.length).toBe(0);
+        expect(
+          h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
+        ).toBe(0);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    // (d) transactionHash byte-equal still works case-insensitively.
+    //     Regression-pinning — make sure the canonical-authenticator
+    //     change did not accidentally generalize transactionHash
+    //     compare beyond hex.
+    it('CASE 3 (#W4-2): pending + transactionHash hex case-insensitive → ACCEPTED', async () => {
+      const h = buildImporterHarness();
+      const sharedAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '02' + 'aa'.repeat(32),
+        signature: '33'.repeat(64),
+        stateHash: '0000' + 'ee'.repeat(32),
+      });
+      h.manifest.entries.set(`${ADDR}:${tk('t-tx-case')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-tx-case'),
+        commitmentRequestId: 'rq-tx-case',
+        status: 'pending',
+        // queue stores upper-case hex for transactionHash...
+        transactionHash: '0000' + 'AB'.repeat(32),
+        authenticator: sharedAuthn,
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-tx-case'),
+        proofFor({
+          requestId: 'rq-tx-case',
+          // ...proof brings lower-case; SAME bytes → MATCH.
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: sharedAuthn,
+        }),
+      );
+      expect(result).toEqual({ ok: true, transition: 'pending→valid' });
+      expect(h.graftCalls.length).toBe(1);
+    });
+
+    it('CASE 3 (#W4-2): pending + transactionHash DIFFERENT bytes (case-insensitive cmp still fires) → REJECTED', async () => {
+      const h = buildImporterHarness();
+      const sharedAuthn = JSON.stringify({
+        algorithm: 'secp256k1',
+        publicKey: '02' + 'aa'.repeat(32),
+        signature: '33'.repeat(64),
+        stateHash: '0000' + 'ee'.repeat(32),
+      });
+      h.manifest.entries.set(`${ADDR}:${tk('t-tx-diff')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-tx-diff'),
+        commitmentRequestId: 'rq-tx-diff',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: sharedAuthn,
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-tx-diff'),
+        proofFor({
+          requestId: 'rq-tx-diff',
+          // Truly different bytes — must REJECT regardless of case-cmp.
+          transactionHash: '0000' + 'CD'.repeat(32),
+          authenticator: sharedAuthn,
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+    });
+
+    // (e) Mixed shapes — one side JSON, the other opaque hex/text.
+    //     Refusal is the safe choice (re-encoding could silently accept
+    //     attacker-shaped opaque bytes that "look like" canonical JSON).
+    it('CASE 3 (#W4-2): pending + JSON queue authn vs opaque proof authn → REJECTED', async () => {
+      const h = buildImporterHarness();
+      h.manifest.entries.set(`${ADDR}:${tk('t-mixed')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-mixed'),
+        commitmentRequestId: 'rq-mixed',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: JSON.stringify({
+          algorithm: 'secp256k1',
+          publicKey: '02' + 'aa'.repeat(32),
+          signature: '11'.repeat(64),
+          stateHash: '0000' + 'cc'.repeat(32),
+        }),
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-mixed'),
+        proofFor({
+          requestId: 'rq-mixed',
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: 'opaquehexnotjson',
+        }),
+      );
+      expect(result).toEqual({ ok: false, reason: 'proof-binding-mismatch' });
+    });
+
+    // (f) Backward-compat: both sides are plain hex blobs (legacy /
+    //     test paths). canonicalAuthenticatorEquals falls back to
+    //     hexEqualsIgnoreCase.
+    it('CASE 3 (#W4-2 fallback): both sides plain hex (case-insensitive equal) → ACCEPTED', async () => {
+      const h = buildImporterHarness();
+      h.manifest.entries.set(`${ADDR}:${tk('t-hex-fb')}`, manifestEntryFor({
+        status: 'pending',
+      }));
+      h.queue.entries.push(queueEntryFor({
+        tokenId: tk('t-hex-fb'),
+        commitmentRequestId: 'rq-hex-fb',
+        status: 'pending',
+        transactionHash: '0000' + 'ab'.repeat(32),
+        authenticator: 'AUTHn-X',
+      }));
+      const result = await h.importer.importInclusionProof(
+        ADDR,
+        tk('t-hex-fb'),
+        proofFor({
+          requestId: 'rq-hex-fb',
+          transactionHash: '0000' + 'ab'.repeat(32),
+          authenticator: 'authN-x',
+        }),
+      );
+      expect(result).toEqual({ ok: true, transition: 'pending→valid' });
+    });
   });
 });

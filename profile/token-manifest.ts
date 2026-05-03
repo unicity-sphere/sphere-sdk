@@ -331,13 +331,46 @@ export function deriveStructuralManifest(pkg: UxfPackage): TokenManifest {
 }
 
 /**
- * Return just the tokenIds with `conflicting` status. Convenience for
+ * Predicate: does the given status represent a token with multiple
+ * observed chain heads (i.e. a conflict that the operator should see)?
+ *
+ * Returns `true` for both `'conflicting'` (post-merge, fully-resolved
+ * conflict) AND `'pending-conflicting'` (Wave 3 steelman — conflict
+ * detected while a finalization worker was still draining the prior
+ * pending head). UI / visibility consumers MUST treat the two
+ * symmetrically: from the operator's perspective both indicate "two or
+ * more heads exist, oracle resolution / queue drain pending".
+ *
+ * Worker-drain logic and writer paths that need to distinguish between
+ * "conflict-merge can run now" and "wait for the worker first" must
+ * still switch on the literal status (see
+ * `modules/payments/transfer/disposition-engine.ts`).
+ *
+ * @param s — a `TokenManifestStatus` value.
+ * @returns `true` iff `s ∈ {'conflicting', 'pending-conflicting'}`.
+ */
+export function isConflictingStatus(s: TokenManifestStatus): boolean {
+  return s === 'conflicting' || s === 'pending-conflicting';
+}
+
+/**
+ * Return just the tokenIds with a conflicting status — that includes
+ * BOTH `'conflicting'` (resolved-conflict head) and `'pending-conflicting'`
+ * (in-flight-finalization conflict, Wave 3 steelman). Convenience for
  * UI "show me conflicts" views and for alerting.
+ *
+ * The pending-conflicting case is included so that operators see EVERY
+ * token whose head set is ambiguous, regardless of whether the
+ * conflict-merger has had a chance to run yet. Hiding pending-conflicting
+ * tokens here would silently mask conflicts that haven't yet been
+ * promoted to the canonical `'conflicting'` status — exactly the class
+ * of conflict the operator most needs to know about (a worker is still
+ * working on a head we now suspect is wrong).
  */
 export function conflictingTokenIds(manifest: TokenManifest): string[] {
   const out: string[] = [];
   for (const [tokenId, entry] of manifest) {
-    if (entry.status === 'conflicting') out.push(tokenId);
+    if (isConflictingStatus(entry.status)) out.push(tokenId);
   }
   return out;
 }

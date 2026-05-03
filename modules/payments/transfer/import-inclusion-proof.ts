@@ -346,7 +346,19 @@ export type ImportProofResult =
         // distinct reason routes the operator to manual triage rather
         // than silently picking `matching[0]` (which would risk
         // applying the proof against the wrong queue entry).
-        | 'requestid-ambiguous';
+        | 'requestid-ambiguous'
+        // (Wave 4 steelman, regression #2) Queue entry's `authenticator`
+        // field is empty/missing, so the §6.3 binding compare cannot be
+        // performed. This is FORENSIC — production queue entries always
+        // carry the canonical authenticator hex/JSON. Empty fields are
+        // observed when a writer bug or a pre-fix data path creates an
+        // entry with `authenticator: ''`. The importer refuses rather
+        // than degrading binding compare to "always pass" or "always
+        // fail" under length-mismatch (which would silently re-classify
+        // every legitimate proof as `proof-binding-mismatch`). The
+        // operator is alerted via `console.warn` and routed to manual
+        // triage. Fix the upstream writer; do not paper over here.
+        | 'queue-entry-incomplete';
     };
 
 // =============================================================================
@@ -731,12 +743,46 @@ export class InclusionProofImporter {
     // tokenId + an outstanding requestId could otherwise paste any
     // aggregator-anchored proof sharing that requestId and graft a
     // different transaction onto the live queue entry.
-    if (
-      !hexEqualsIgnoreCase(proof.transactionHash, target.transactionHash) ||
-      !hexEqualsIgnoreCase(proof.authenticator, target.authenticator)
-    ) {
+    //
+    // (Wave 4 regression #2) The §155 byte-equal `hexEqualsIgnoreCase`
+    // for `authenticator` was wrong — `authenticator` is a JSON-encoded
+    // object on most paths (sender's commitJson, aggregator response,
+    // recipient's Transaction.toJSON()) and JSON object key order is
+    // NOT canonical. Two semantically-identical authenticator objects
+    // emitted by different serializers (sender vs aggregator vs
+    // recipient) can produce different byte strings → spurious
+    // `proof-binding-mismatch`. Use `canonicalAuthenticatorEquals`
+    // which parses both sides as `IAuthenticatorJson` and compares
+    // canonical fields when both sides are JSON, and falls back to
+    // case-insensitive byte-equal compare when both sides are plain
+    // hex. `transactionHash` IS plain hex on every path so it keeps
+    // `hexEqualsIgnoreCase`.
+    if (!hexEqualsIgnoreCase(proof.transactionHash, target.transactionHash)) {
       return { ok: false, reason: 'proof-binding-mismatch' };
     }
+    const authnCmp = canonicalAuthenticatorEquals(
+      proof.authenticator,
+      target.authenticator,
+    );
+    if (authnCmp === 'queue-entry-empty') {
+      // (Wave 4) The recipient queue worker pre-fix wrote
+      // `authenticator: ''` on enqueue (PaymentsModule.ts:1840). Surface
+      // a distinct reason + alert so the operator console can route to
+      // manual triage. Future entries written after the upstream fix
+      // will carry the canonical form.
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[importInclusionProof] queue entry has empty authenticator — ' +
+          'regression in upstream queue writer (PaymentsModule recipient ' +
+          'queue path). Refusing to degrade binding compare. ' +
+          `tokenId=${tokenId} requestId=${proof.requestId}`,
+      );
+      return { ok: false, reason: 'queue-entry-incomplete' };
+    }
+    if (authnCmp === 'mismatch') {
+      return { ok: false, reason: 'proof-binding-mismatch' };
+    }
+    // authnCmp === 'match' — fall through to the lifecycle decision.
 
     if (target.status === 'attached') {
       return { ok: true, transition: 'pending-still' }; // case 4a
@@ -856,12 +902,30 @@ export class InclusionProofImporter {
     // anchored proof sharing that requestId and flip
     // `_invalid → valid` (case 5) or trigger a K-1 re-queue (case 6)
     // bound to a different transaction.
-    if (
-      !hexEqualsIgnoreCase(proof.transactionHash, resolvingEntry.transactionHash) ||
-      !hexEqualsIgnoreCase(proof.authenticator, resolvingEntry.authenticator)
-    ) {
+    //
+    // (Wave 4 regression #2) See the pending path's longer note.
+    // `transactionHash` is plain hex; `authenticator` may be JSON.
+    if (!hexEqualsIgnoreCase(proof.transactionHash, resolvingEntry.transactionHash)) {
       return { ok: false, reason: 'proof-binding-mismatch' };
     }
+    const authnCmpInvalid = canonicalAuthenticatorEquals(
+      proof.authenticator,
+      resolvingEntry.authenticator,
+    );
+    if (authnCmpInvalid === 'queue-entry-empty') {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[importInclusionProof] hard-failed queue entry has empty ' +
+          'authenticator — regression in upstream queue writer. Refusing ' +
+          'to apply override. ' +
+          `tokenId=${tokenId} requestId=${proof.requestId}`,
+      );
+      return { ok: false, reason: 'queue-entry-incomplete' };
+    }
+    if (authnCmpInvalid === 'mismatch') {
+      return { ok: false, reason: 'proof-binding-mismatch' };
+    }
+    // authnCmpInvalid === 'match' — proceed with case-5/6 decision.
 
     // Case 5 vs case 6 split: count OTHER hard-failed entries that
     // still need a proof. If zero → case 5; if ≥ 1 → case 6 (chain
@@ -1062,6 +1126,161 @@ function hexEqualsIgnoreCase(
   // locale-invariant; the canonical hex alphabet [0-9a-fA-F] doesn't
   // contain any locale-sensitive code points.
   return a.toLowerCase() === b.toLowerCase();
+}
+
+/**
+ * @internal
+ *
+ * Canonical four-key shape of the SDK's `IAuthenticatorJson` (mirrors
+ * `@unicitylabs/state-transition-sdk/lib/api/Authenticator.d.ts`).
+ *
+ * The interface is duplicated here rather than imported from the SDK
+ * to avoid a runtime dependency on the SDK's `Authenticator` class for
+ * what is effectively a JSON shape check. Keeping the structural
+ * declaration co-located also makes the canonicalization rule visible
+ * at the call site.
+ */
+interface CanonicalAuthenticatorJson {
+  readonly publicKey: string;
+  readonly algorithm: string;
+  readonly signature: string;
+  readonly stateHash: string;
+}
+
+/**
+ * @internal
+ *
+ * Discriminated outcome of {@link canonicalAuthenticatorEquals}.
+ *
+ *  - `'match'`           — both sides represent the same authenticator
+ *                          (canonical form when JSON, byte-equal when
+ *                          plain hex).
+ *  - `'mismatch'`        — both sides parsed but represent different
+ *                          authenticators.
+ *  - `'queue-entry-empty'` — the queue-entry side is empty/missing/
+ *                          whitespace-only. This is forensic — the
+ *                          recipient queue worker's pre-fix data path
+ *                          wrote `authenticator: ''` on enqueue. We
+ *                          surface a distinct reason rather than
+ *                          silently rejecting via length-mismatch.
+ */
+type CanonicalAuthenticatorCmp = 'match' | 'mismatch' | 'queue-entry-empty';
+
+/**
+ * @internal
+ *
+ * Parse an authenticator string. Returns the parsed canonical-shape
+ * JSON object if the input is a JSON-encoded `IAuthenticatorJson`;
+ * returns `null` otherwise (the caller falls back to byte-equal hex
+ * compare for non-JSON inputs).
+ *
+ * The parser is conservative — it ONLY recognizes the canonical
+ * four-key shape (`publicKey`, `algorithm`, `signature`, `stateHash`,
+ * all strings). Unknown shapes return `null` so the caller treats
+ * them as opaque hex strings.
+ */
+function tryParseCanonicalAuthenticator(
+  raw: string,
+): CanonicalAuthenticatorJson | null {
+  // Fast-path: JSON-encoded objects always start with `{` after any
+  // leading whitespace. Anything else is opaque hex/text.
+  const trimmed = raw.trimStart();
+  if (trimmed.length === 0 || trimmed[0] !== '{') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object') return null;
+  const obj = parsed as Record<string, unknown>;
+  if (
+    typeof obj.publicKey !== 'string' ||
+    typeof obj.algorithm !== 'string' ||
+    typeof obj.signature !== 'string' ||
+    typeof obj.stateHash !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    publicKey: obj.publicKey,
+    algorithm: obj.algorithm,
+    signature: obj.signature,
+    stateHash: obj.stateHash,
+  };
+}
+
+/**
+ * @internal
+ *
+ * Canonical authenticator equality. The §6.3 binding compare must be
+ * INSENSITIVE to JSON object key order — `Authenticator.toJSON()` emits
+ * `{algorithm, publicKey, signature, stateHash}` while the SDK's
+ * `IAuthenticatorJson` interface declares
+ * `{publicKey, algorithm, signature, stateHash}`. Two semantically-
+ * identical authenticators serialized by different code paths (sender's
+ * commitJson, aggregator's response, recipient's `Transaction.toJSON()`)
+ * produce DIFFERENT byte strings — naive `hexEqualsIgnoreCase` reports
+ * mismatch and the importer rejects every legitimate proof.
+ *
+ * Resolution rules (in order):
+ *  1. Empty/null/whitespace queue-entry side → `'queue-entry-empty'`
+ *     (forensic; routes operator to manual triage).
+ *  2. Empty/null/whitespace proof side → `'mismatch'` (operator
+ *     supplied no authenticator; cannot bind).
+ *  3. Both sides parse as canonical JSON → field-wise compare:
+ *     `publicKey`, `signature`, `stateHash` are case-insensitive hex
+ *     (their on-the-wire form is hex regardless of upper/lower);
+ *     `algorithm` is a string identifier compared case-sensitively
+ *     (the SDK emits canonical lower-case but never relies on this).
+ *  4. Exactly one side parses as JSON, the other does not → `'mismatch'`
+ *     (operator passed an authenticator in a different form than the
+ *     queue carries; we cannot canonicalize across shapes safely).
+ *  5. Neither parses as JSON → fall back to {@link hexEqualsIgnoreCase}.
+ *
+ * NOTE: `transactionHash` (the other half of the §155 bind triple) IS
+ * always plain hex on every path — it stays on `hexEqualsIgnoreCase`
+ * at the call site.
+ */
+function canonicalAuthenticatorEquals(
+  proofAuthn: string | null | undefined,
+  queueAuthn: string | null | undefined,
+): CanonicalAuthenticatorCmp {
+  // Empty queue-entry — forensic regression marker (Wave 4 #2).
+  const queueEmpty =
+    typeof queueAuthn !== 'string' || queueAuthn.trim().length === 0;
+  if (queueEmpty) return 'queue-entry-empty';
+  const proofEmpty =
+    typeof proofAuthn !== 'string' || proofAuthn.trim().length === 0;
+  if (proofEmpty) return 'mismatch';
+  const proofParsed = tryParseCanonicalAuthenticator(proofAuthn);
+  const queueParsed = tryParseCanonicalAuthenticator(queueAuthn);
+  if (proofParsed !== null && queueParsed !== null) {
+    // Field-wise canonical compare. publicKey / signature / stateHash
+    // are hex; algorithm is a short identifier string.
+    if (proofParsed.algorithm !== queueParsed.algorithm) return 'mismatch';
+    if (!hexEqualsIgnoreCase(proofParsed.publicKey, queueParsed.publicKey)) {
+      return 'mismatch';
+    }
+    if (!hexEqualsIgnoreCase(proofParsed.signature, queueParsed.signature)) {
+      return 'mismatch';
+    }
+    if (!hexEqualsIgnoreCase(proofParsed.stateHash, queueParsed.stateHash)) {
+      return 'mismatch';
+    }
+    return 'match';
+  }
+  if (proofParsed === null && queueParsed === null) {
+    // Both opaque — fall back to legacy byte-equal hex compare. This
+    // covers tests / pre-canonical paths where authenticator is a
+    // plain hex blob.
+    return hexEqualsIgnoreCase(proofAuthn, queueAuthn) ? 'match' : 'mismatch';
+  }
+  // Exactly one side is JSON, the other is opaque — we cannot bridge
+  // the shapes without re-encoding, and re-encoding would silently
+  // accept attacker-shaped opaque bytes that "look like" the canonical
+  // JSON. Refuse with `'mismatch'`.
+  return 'mismatch';
 }
 
 // =============================================================================

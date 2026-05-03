@@ -160,8 +160,49 @@ export interface FinalizationOutboxWriter {
    * Production wires this to {@link OutboxWriter.readAllNew}; tests
    * that drive `processOne()` directly may omit it (the scan loop
    * then becomes a no-op-sleep stub).
+   *
+   * **Writer contract (Wave 4 steelman, OOM defense)**: implementations
+   * MUST return a BOUNDED list — the worker's scan loop materializes
+   * the full result before truncating to `maxEntriesPerScan`, so an
+   * unbounded writer (e.g. one that ignores tombstones / forgot to
+   * cap a paged scan) would OOM the worker on a degenerate dataset.
+   * Production writers SHOULD cap at {@link SCAN_LIST_HARD_GUARD}
+   * entries per call. The scan loop has a defensive truncation that
+   * trims oversize lists and emits an `transfer:operator-alert`
+   * instead of crashing, but writers should not rely on that defense
+   * — it logs as a misconfiguration alert.
    */
   readAllNew?(): Promise<ReadonlyArray<UxfTransferOutboxEntry>>;
+}
+
+/**
+ * Wave 4 steelman: hard upper bound on the size of a single
+ * `readAllNew()` result the scan loop will accept without alerting.
+ *
+ * Sized at 16384 — comfortably above any realistic outbox in
+ * production (a busy wallet rarely exceeds a few hundred concurrent
+ * `delivered-instant` entries; the expected steady-state size is
+ * bounded by `MAX_CONCURRENT_POLLS_PER_AGGREGATOR` × token count
+ * across all in-flight transfers). Anything larger is symptomatic
+ * of a broken writer (no tombstone GC) or a deliberate stress test.
+ *
+ * The scan loop truncates to this cap and emits a structural alert;
+ * progress on the first {@link SCAN_LIST_HARD_GUARD} entries continues.
+ *
+ * @internal
+ */
+export const SCAN_LIST_HARD_GUARD = 16384;
+
+/**
+ * Power-of-two helper for the exponential alert backoff. Returns
+ * true for n in {1, 2, 4, 8, 16, 32, 64, 128, …}. Bit trick:
+ * a power of two has exactly one bit set, so `n & (n - 1) === 0`
+ * (provided n > 0).
+ *
+ * @internal
+ */
+function isPowerOfTwo(n: number): boolean {
+  return n > 0 && (n & (n - 1)) === 0;
 }
 
 // =============================================================================
@@ -385,6 +426,18 @@ export class FinalizationWorkerSender {
    *  (e.g. PaymentsModule's synchronous send path at line ~7556) and
    *  the loop don't race the same entry through `processOne`. */
   private readonly inFlight: Set<string> = new Set();
+  /**
+   * Wave 4 steelman: consecutive `readAllNew()` failure counter for
+   * exponential alert backoff. A permanent backend failure would
+   * otherwise emit `transfer:operator-alert` every scan iteration —
+   * 60+ alerts/min on a 1s scan interval, drowning the operator.
+   *
+   * Strategy: emit on every power-of-two boundary (1, 2, 4, 8, 16,
+   * 32, 64, 128, …) so the alert rate decays geometrically. On the
+   * first successful read after failures, emit an info alert with
+   * the recovery count and reset the counter.
+   */
+  private scanReadFailureStreak = 0;
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6
@@ -421,8 +474,14 @@ export class FinalizationWorkerSender {
     this.maxProofErrorRetries = options.caps?.maxProofErrorRetries ?? 3;
     this.pollingWindowMs =
       options.caps?.pollingWindowMs ?? POLLING_WINDOW_MS;
+    // Wave 4 steelman: default to 'rpc-release' for consistency with
+    // import-inclusion-proof (Wave 1 #153 flip) and ingest-worker-pool.
+    // The 'cas' default required callers to wire a CAS-based ManifestCas
+    // for serialization to actually engage; users who omitted that
+    // detail silently lost per-token mutual exclusion. 'rpc-release'
+    // is the always-correct default — no extra wiring required.
     this.perTokenMutexStrategy =
-      options.perTokenMutexStrategy ?? 'cas';
+      options.perTokenMutexStrategy ?? 'rpc-release';
     this.trustBaseStaleness = options.trustBaseStaleness;
     this.scanIntervalMs = options.scanIntervalMs ?? 30_000;
     this.maxEntriesPerScan = options.maxEntriesPerScan ?? 100;
@@ -919,6 +978,27 @@ export class FinalizationWorkerSender {
    *     (no sleep) — drains backlogs without latency.
    *  5. Otherwise sleeps `scanIntervalMs` before the next pass.
    *
+   * **Wave 4 steelman fixes**:
+   *
+   *  - **OOM defense / writer contract** — `readAllNew()` is contractually
+   *    obligated to return a BOUNDED enumeration (see
+   *    {@link FinalizationOutboxWriter.readAllNew} JSDoc). The default
+   *    profile-backed writer caps at ~1024 entries per OrbitDB partition;
+   *    a misconfigured writer returning an unbounded list would OOM the
+   *    worker before reaching the truncation check at step 2. We add a
+   *    defensive `entries.length > SCAN_LIST_HARD_GUARD` check that
+   *    truncates and emits a forensic alert — the worker keeps running
+   *    on the first {@link maxEntriesPerScan} entries so progress is
+   *    not entirely blocked, but the operator gets a loud signal.
+   *
+   *  - **Alert flood backoff** — a permanent `readAllNew()` failure (e.g.
+   *    a corrupted underlying OrbitDB store) would otherwise emit
+   *    `transfer:operator-alert` every iteration. We now track a
+   *    consecutive-failure counter and emit alerts only at power-of-two
+   *    boundaries (1, 2, 4, 8, 16, 32, …) so the rate decays
+   *    geometrically. On recovery we emit one final info alert with
+   *    the recovery count and reset the counter.
+   *
    * Loop terminates when {@link stop} is called or the construction-
    * supplied `signal` aborts.
    *
@@ -938,12 +1018,41 @@ export class FinalizationWorkerSender {
       let processed = 0;
       try {
         const all = await readAllNew.call(this.options.outbox);
+        // Wave 4 steelman: defensive size guard. The writer contract
+        // (see FinalizationOutboxWriter.readAllNew JSDoc) requires a
+        // bounded list; if a misconfigured writer returns more than
+        // SCAN_LIST_HARD_GUARD entries, alert + truncate so the worker
+        // can keep making progress without OOM.
+        let workingList: ReadonlyArray<UxfTransferOutboxEntry> = all;
+        if (all.length > SCAN_LIST_HARD_GUARD) {
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            message:
+              `FinalizationWorkerSender.scanLoop: readAllNew returned ${all.length} ` +
+              `entries (writer contract: <= ${SCAN_LIST_HARD_GUARD}); truncating to ` +
+              `first ${SCAN_LIST_HARD_GUARD} to avoid OOM. Inspect the outbox writer ` +
+              `for unbounded growth (missing tombstone GC?).`,
+          });
+          workingList = all.slice(0, SCAN_LIST_HARD_GUARD);
+        }
+
+        // Successful read — emit recovery info if we were in a streak.
+        if (this.scanReadFailureStreak > 0) {
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            message:
+              `FinalizationWorkerSender.scanLoop: readAllNew recovered after ` +
+              `${this.scanReadFailureStreak} consecutive failure(s).`,
+          });
+          this.scanReadFailureStreak = 0;
+        }
+
         // Filter to entries the worker should drive. `delivered-instant`
         // is the default arrival state for instant-mode sends;
         // `finalizing` is the in-progress state we recover after a
         // crash mid-`processOne`.
         const candidates: UxfTransferOutboxEntry[] = [];
-        for (const e of all) {
+        for (const e of workingList) {
           if (e.status !== 'delivered-instant' && e.status !== 'finalizing') {
             continue;
           }
@@ -971,13 +1080,19 @@ export class FinalizationWorkerSender {
           }
         }
       } catch (err) {
-        // readAllNew failure — emit and back off. The next pass retries
-        // the read.
-        const msg = err instanceof Error ? err.message : String(err);
-        this.options.emit('transfer:operator-alert', {
-          code: 'structural',
-          message: `FinalizationWorkerSender.scanLoop: readAllNew threw: ${msg}`,
-        });
+        // Wave 4 steelman: exponential backoff on consecutive failures.
+        // The first failure always emits; subsequent failures emit only
+        // at power-of-two boundaries. Reset on next success.
+        this.scanReadFailureStreak += 1;
+        if (isPowerOfTwo(this.scanReadFailureStreak)) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.options.emit('transfer:operator-alert', {
+            code: 'structural',
+            message:
+              `FinalizationWorkerSender.scanLoop: readAllNew threw ` +
+              `(consecutive failures: ${this.scanReadFailureStreak}): ${msg}`,
+          });
+        }
       }
 
       if (processed === 0) {
