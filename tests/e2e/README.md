@@ -88,6 +88,8 @@ For reference, this is what each suite declares it needs:
 | `profile-token-persistence.test.ts` | nostr, aggregator, ipfs | Profile active tokens |
 | `swap-continuous.test.ts` | nostr, aggregator | Full swap lifecycle (also opt-in via RUN_CONTINUOUS_TESTS) |
 | `uxf-send-receive.test.ts` | nostr, aggregator, ipfs | UXF transfer (also opt-in via RUN_UXF_E2E) |
+| `migrate-to-profile-conservation.test.ts` | nostr, aggregator, ipfs | migrate-to-profile token conservation (opt-in via RUN_MIGRATION_E2E) |
+| `profile-export-roundtrip.test.ts` | nostr, aggregator, ipfs | Whole-Profile export/import CAR round-trip (opt-in via RUN_PROFILE_EXPORT_E2E) |
 | `pointer-roundtrip.test.ts` | aggregator, nostr | Pointer-layer round-trip |
 | `network-health.test.ts` | (none) | Tests SDK's own check; runs unconditionally |
 

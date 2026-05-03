@@ -1270,6 +1270,111 @@ export class ProfileStorageProvider implements StorageProvider {
   }
 
   // ===========================================================================
+  // Raw Encrypted Round-Trip (Wave 9 — profile-export/import)
+  // ===========================================================================
+
+  /**
+   * Read the ENCRYPTED OrbitDB envelope payload for a key WITHOUT
+   * decryption. Returns a base64-encoded ciphertext string suitable
+   * for round-tripping through `setEncryptedRaw`. Returns null when
+   * the key is absent or stored cache-only / excluded.
+   *
+   * The whole point of this method is to defeat the "decrypt-on-read,
+   * leak-into-CAR" mnemonic-leak path closed in Wave 9 critical #1.
+   * `profile-export` must NOT see plaintext for identity-class keys
+   * (`mnemonic`, `master_key`, `chain_code`, ...) — the snapshot CAR
+   * is supposed to carry encrypted bytes only, decryptable solely
+   * by a wallet sharing the source's master key (and therefore
+   * mnemonic). This entry point bypasses the in-cache plaintext
+   * shadow that `set()` populates and reads the OrbitDB ciphertext
+   * envelope directly.
+   *
+   * Cache-only keys (price cache, registry cache) and excluded keys
+   * (IPFS state) return null — they are never written to OrbitDB.
+   *
+   * @param key - The legacy (caller-facing) key name, same shape as
+   *              passed to `get()` / `set()`.
+   * @returns Base64-encoded encrypted bytes, or null when absent.
+   * @throws ProfileError when OrbitDB is not connected (the export
+   *         path requires durable backing — refusing here forces
+   *         the caller to surface the error rather than silently
+   *         emit a snapshot with missing identity entries).
+   */
+  async getEncryptedRaw(key: string): Promise<string | null> {
+    const translated = translateKey(key, this.addressId);
+    if (translated.excluded) return null;
+    if (translated.cacheOnly) return null;
+    if (!this.dbConnected) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `getEncryptedRaw("${redactProfileKey(translated.profileKey)}") requires OrbitDB to be attached.`,
+      );
+    }
+    const encrypted = await this.readEnvelopePayload(translated.profileKey);
+    if (encrypted === null) return null;
+    // Encode as base64 so the export's snapshot.entries[i].value (string)
+    // can carry the ciphertext bytes through dag-cbor (which also
+    // accepts strings, but we keep the value field as a string to match
+    // the existing schema and avoid silently shifting it to byte-string
+    // type).
+    return Buffer.from(encrypted).toString('base64');
+  }
+
+  /**
+   * Write a previously-extracted encrypted envelope payload back to
+   * OrbitDB without re-encryption. The destination wallet's master
+   * key MUST match the source's (verified by the importer's
+   * `expectedChainPubkey` check), or the ciphertext will be
+   * unreadable on subsequent `get()` calls — but this method does
+   * NOT verify decryptability, since the import path runs before the
+   * destination's storage has settled.
+   *
+   * Local-cache plaintext is intentionally NOT populated here: the
+   * destination's `get()` will fall through to OrbitDB and decrypt
+   * fresh on first read. Populating cache with the ciphertext would
+   * defeat the cache (it'd pretend to be plaintext and fail callers
+   * with corrupted bytes).
+   *
+   * @param key   - Legacy key name (same shape as `set()`).
+   * @param value - Base64-encoded encrypted bytes from `getEncryptedRaw`.
+   */
+  async setEncryptedRaw(key: string, value: string): Promise<void> {
+    const translated = translateKey(key, this.addressId);
+    if (translated.excluded) return;
+    if (translated.cacheOnly) {
+      // Cache-only keys have no OrbitDB backing — write the value
+      // verbatim to local cache so `get()` returns it. The "value"
+      // here is a base64 string (ciphertext form) which is wrong
+      // semantics for a cache-only key, so refuse loudly.
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `setEncryptedRaw refuses cache-only key "${redactProfileKey(translated.profileKey)}" — ` +
+          `cache-only keys are not encrypted and must be replayed via set().`,
+      );
+    }
+    if (!this.dbConnected) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `setEncryptedRaw("${redactProfileKey(translated.profileKey)}") requires OrbitDB to be attached.`,
+      );
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = Uint8Array.from(Buffer.from(value, 'base64'));
+    } catch (err) {
+      throw new ProfileError(
+        'PROFILE_NOT_INITIALIZED',
+        `setEncryptedRaw: value is not valid base64: ${err instanceof Error ? err.message : String(err)}`,
+        err,
+      );
+    }
+    // Reuse the writeEnvelope path so the OpLog envelope wrapper is
+    // identical to a normal write — `cache_index` is the safe
+    // conservative classification (matches set()'s default).
+    await this.writeEnvelope(translated.profileKey, bytes, 'cache_index');
+  }
+
+  // ===========================================================================
   // Private Helpers: Encryption
   // ===========================================================================
 

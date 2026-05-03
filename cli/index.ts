@@ -1811,6 +1811,12 @@ FILE I/O (offline token transfer / backup):
     Formats: .uxf|.car (content-addressed CAR); .txf|.json (TXF JSON array)
     Auto-detected from file extension on export and from content on import.
 
+  profile-export <file> [options]   Export the WHOLE Profile (KV + bundles) as a CAR
+  profile-import <file> [options]   Import a Profile snapshot CAR into the current wallet
+    --force                         Overwrite a non-empty destination Profile (import)
+    --allow-different-identity      Skip chainPubkey identity check (import)
+    --max-size <bytes>              Override the 1 GiB CAR size cap
+
 LEGACY → PROFILE MIGRATION:
   migrate-to-profile --legacy-dir <path>
                                     Import legacy wallet tokens into current Profile
@@ -3203,6 +3209,237 @@ async function main() {
           // entries cause a non-zero exit. Use exitCode (not exit())
           // so cleanup below still runs.
           process.exitCode = 2;
+        }
+
+        await syncAfterWrite(sphere);
+        await closeSphere();
+        break;
+      }
+
+      case 'profile-export': {
+        // Whole-profile snapshot export. Produces a single CAR file
+        // carrying every KV entry + every UXF bundle CAR + (optional)
+        // structural manifest from the running Profile. The output is
+        // wallet-key-only readable: encrypted entries stay encrypted.
+        const outFile = args[1];
+        if (!outFile) {
+          console.error('Usage: profile-export <file> [options]');
+          console.error('  file: output path (typically .car)');
+          console.error('');
+          console.error('Options:');
+          console.error('  --max-size <bytes>     Hard cap on the output CAR (default: 1 GiB)');
+          console.error('');
+          console.error('Notes:');
+          console.error('  - Encrypted KV entries are preserved verbatim — destination must');
+          console.error('    share the same wallet master key (mnemonic) to decrypt them.');
+          console.error('  - Every active + superseded bundle CAR is embedded; missing bundles');
+          console.error('    (whose CAR cannot be fetched from local IPFS) are logged + skipped.');
+          process.exit(1);
+        }
+
+        const maxSizeIdx = args.indexOf('--max-size');
+        const maxSizeBytes = maxSizeIdx >= 0
+          ? parseInt(args[maxSizeIdx + 1] ?? '', 10)
+          : undefined;
+        if (maxSizeIdx >= 0 && (!Number.isFinite(maxSizeBytes ?? NaN) || (maxSizeBytes ?? 0) <= 0)) {
+          console.error(`Invalid --max-size: ${args[maxSizeIdx + 1] ?? '(missing)'}`);
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        const { exportProfile } = await import('../profile/profile-export.js');
+
+        // Reach the underlying storage / token storage instances. We
+        // require Profile-mode here — the export format embeds OrbitDB
+        // bundle refs that legacy wallets don't have.
+        const storage = sphere.getStorage();
+        const tokenStorage = sphere.getTokenStorage();
+        if (!tokenStorage) {
+          console.error('No token storage configured — profile-export requires a Profile-mode wallet.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Cast to ProfileTokenStorageProvider — the export helper
+        // narrows internally and surfaces a friendly error if the
+        // provider is the wrong shape.
+        const ptsp =
+          tokenStorage as unknown as import('../profile/profile-token-storage-provider.js').ProfileTokenStorageProvider;
+
+        if (!sphere.identity?.chainPubkey) {
+          console.error('Wallet identity not initialized — cannot export.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        const config = loadConfig();
+
+        try {
+          console.log('\nExporting Profile snapshot...');
+          const result = await exportProfile({
+            storage,
+            tokenStorage: ptsp,
+            chainPubkey: sphere.identity.chainPubkey,
+            network: config.network,
+            ...(maxSizeBytes ? { maxSizeBytes } : {}),
+          });
+
+          fs.writeFileSync(path.resolve(outFile), result.carBytes);
+          console.log(`\n✓ Profile exported`);
+          console.log(`  File:              ${outFile}`);
+          console.log(`  Size:              ${result.carBytes.byteLength} bytes`);
+          console.log(`  KV entries:        ${result.entryCount}`);
+          console.log(`  Bundles embedded:  ${result.bundlesEmbedded}`);
+          if (result.bundlesMissing > 0) {
+            console.log(`  Bundles missing:   ${result.bundlesMissing} (CAR fetch failed; logged above)`);
+          }
+          console.log(`  Root CID:          ${result.rootCid}`);
+        } catch (err) {
+          console.error(`\nExport failed: ${err instanceof Error ? err.message : String(err)}`);
+          await closeSphere();
+          process.exit(1);
+        }
+
+        await closeSphere();
+        break;
+      }
+
+      case 'profile-import': {
+        // Restore a Profile from a `profile-export` CAR. Refuses to
+        // clobber a non-empty destination unless --force; refuses to
+        // import a snapshot whose chainPubkey doesn't match the
+        // running wallet unless --allow-different-identity.
+        const inFile = args[1];
+        if (!inFile) {
+          console.error('Usage: profile-import <file> [options]');
+          console.error('  file: input path (CAR file produced by `profile-export`)');
+          console.error('');
+          console.error('Options:');
+          console.error('  --force                            Overwrite a non-empty destination Profile');
+          console.error('  --allow-different-identity         Skip the chainPubkey identity check');
+          console.error('                                     (use only when intentionally re-keying)');
+          console.error('  --understand-overwrite-risk        Required when both --force AND');
+          console.error('                                     --allow-different-identity are set');
+          console.error('                                     (Wave 9 hazard gate; data is irrecoverable)');
+          console.error('  --max-size <bytes>                 Hard cap on the input file (default: 256 MiB)');
+          process.exit(1);
+        }
+
+        const force = args.includes('--force');
+        const allowDifferentIdentity = args.includes('--allow-different-identity');
+        const understandOverwriteRisk = args.includes('--understand-overwrite-risk');
+        const maxSizeIdx = args.indexOf('--max-size');
+        // Wave 9 fix: align CLI default with profile-export's
+        // DEFAULT_MAX_SNAPSHOT_BYTES (256 MiB) — unboundedly large
+        // snapshot CARs are bot/DoS-shaped.
+        const MAX_IMPORT_BYTES_DEFAULT = 256 * 1024 * 1024; // 256 MiB
+        const maxSizeBytes = maxSizeIdx >= 0
+          ? parseInt(args[maxSizeIdx + 1] ?? '', 10)
+          : MAX_IMPORT_BYTES_DEFAULT;
+        if (!Number.isFinite(maxSizeBytes) || maxSizeBytes <= 0) {
+          console.error(`Invalid --max-size: ${args[maxSizeIdx + 1] ?? '(missing)'}`);
+          process.exit(1);
+        }
+
+        // Read the CAR.
+        let bytes: Buffer;
+        try {
+          const stat = fs.statSync(path.resolve(inFile));
+          if (stat.size > maxSizeBytes) {
+            console.error(
+              `Refusing to read "${inFile}": ${stat.size} bytes exceeds ` +
+                `the ${maxSizeBytes}-byte import limit.`,
+            );
+            process.exit(1);
+          }
+          bytes = fs.readFileSync(path.resolve(inFile));
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'ENOENT') console.error(`File not found: "${inFile}"`);
+          else if (code === 'EACCES') console.error(`Permission denied: "${inFile}"`);
+          else console.error(`Failed to read file: "${inFile}"`);
+          process.exit(1);
+        }
+        if (bytes.length === 0) {
+          console.error(`Refusing to import empty file: "${inFile}"`);
+          process.exit(1);
+        }
+
+        const { parseProfileSnapshot } = await import('../profile/profile-export.js');
+        const { importProfile } = await import('../profile/profile-import.js');
+
+        let parsed;
+        try {
+          parsed = await parseProfileSnapshot(new Uint8Array(bytes));
+        } catch (err) {
+          console.error(`Failed to parse snapshot CAR: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        const sphere = await getSphere();
+        const storage = sphere.getStorage();
+        const tokenStorage = sphere.getTokenStorage();
+        if (!tokenStorage) {
+          console.error('No token storage configured — profile-import requires a Profile-mode wallet.');
+          await closeSphere();
+          process.exit(1);
+        }
+        const ptsp =
+          tokenStorage as unknown as import('../profile/profile-token-storage-provider.js').ProfileTokenStorageProvider;
+
+        // Wave 9 fix #6: refuse to import without a loaded wallet
+        // identity. The previous behaviour silently skipped the
+        // chainPubkey check when sphere.identity was undefined,
+        // letting any snapshot land into an uninitialised wallet.
+        if (!sphere.identity?.chainPubkey) {
+          console.error('Wallet identity not loaded — run `init` or load the wallet before importing.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        // Wave 9 fix #6 hazard gate: refuse the dangerous combination
+        // unless the user explicitly acknowledges it.
+        if (force && allowDifferentIdentity && !understandOverwriteRisk) {
+          console.error('');
+          console.error('⚠️  WARNING: --force + --allow-different-identity will OVERWRITE this wallet');
+          console.error('              with the identity from the snapshot. Lost data is unrecoverable.');
+          console.error('              Continue only if you have your mnemonic backed up.');
+          console.error('');
+          console.error('  Re-run with --understand-overwrite-risk to confirm.');
+          await closeSphere();
+          process.exit(1);
+        }
+
+        try {
+          console.log(`\nImporting Profile snapshot from "${inFile}"...`);
+          console.log(`  Snapshot version:  ${parsed.snapshot.version}`);
+          console.log(`  Snapshot pubkey:   ${parsed.snapshot.chainPubkey}`);
+          console.log(`  Snapshot network:  ${parsed.snapshot.network}`);
+          console.log(`  Snapshot entries:  ${parsed.snapshot.entries.length}`);
+          console.log(`  Embedded bundles:  ${parsed.snapshot.bundles.length}`);
+
+          const result = await importProfile({
+            storage,
+            tokenStorage: ptsp,
+            snapshot: parsed.snapshot,
+            bundleCars: parsed.bundleCars,
+            expectedChainPubkey: sphere.identity.chainPubkey,
+            force,
+            allowDifferentIdentity,
+            ...(understandOverwriteRisk ? { acknowledgeOverwriteRisk: true } : {}),
+          });
+
+          console.log(`\n✓ Profile imported`);
+          console.log(`  KV entries replayed:    ${result.entriesReplayed}`);
+          console.log(`  Bundles pinned:         ${result.bundlesPinned}`);
+          if (result.bundlesFailed > 0) {
+            console.log(`  Bundles pin-failed:     ${result.bundlesFailed} (refs registered; will retry via sync)`);
+          }
+          console.log(`  Bundle refs restored:   ${result.bundleRefsRestored}`);
+        } catch (err) {
+          console.error(`\nImport failed: ${err instanceof Error ? err.message : String(err)}`);
+          await closeSphere();
+          process.exit(1);
         }
 
         await syncAfterWrite(sphere);
@@ -6230,6 +6467,8 @@ function getCompletionCommands(): CompletionCommand[] {
     { name: 'receive', description: 'Check for incoming transfers', flags: ['--finalize', '--no-sync'] },
     { name: 'tokens-export', description: 'Export owned tokens to a file (TXF/JSON or UXF/CAR)', flags: ['--format', '--coin', '--ids', '--all', '--include-unconfirmed'] },
     { name: 'tokens-import', description: 'Import tokens from a file (auto-detects TXF/JSON or UXF/CAR)', flags: ['--format'] },
+    { name: 'profile-export', description: 'Export the whole Profile (KV + bundle CARs + manifest) into a single CAR file', flags: ['--max-size'] },
+    { name: 'profile-import', description: 'Import a profile-export CAR file into the current wallet', flags: ['--force', '--allow-different-identity', '--understand-overwrite-risk', '--max-size'] },
     { name: 'migrate-to-profile', description: 'Import legacy wallet tokens into the current Profile (non-destructive, re-runnable)', flags: ['--legacy-dir', '--legacy-tokens', '--dry-run', '--delete-legacy', '--no-verify'] },
     { name: 'history', description: 'Show transaction history' },
     { name: 'addresses', description: 'List tracked addresses' },
