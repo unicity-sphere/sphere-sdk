@@ -460,6 +460,16 @@ export class FinalizationWorkerRecipient {
    * @internal
    */
   private scanReadFailureStreak = 0;
+  /**
+   * Wave 5 steelman: consecutive over-size truncation counter for
+   * exponential alert backoff. Same rationale as the sender worker's
+   * `scanOversizeStreak` — a persistently-misconfigured queue store
+   * (no tombstone GC) was firing the alert on every cycle. Power-of-
+   * two boundaries only; recovery info on first under-cap read.
+   *
+   * @internal
+   */
+  private scanOversizeStreak = 0;
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6).
@@ -1199,18 +1209,38 @@ export class FinalizationWorkerRecipient {
         // could OOM the worker on a degenerate dataset. Truncate +
         // alert if the list exceeds RECIPIENT_SCAN_LIST_HARD_GUARD;
         // forward progress on the first cap entries continues.
+        //
+        // Wave 5 steelman fix #2: alert flood backoff (mirrors the
+        // sender). A permanent overrun was firing the alert every
+        // cycle; rate-limit via power-of-two boundaries with a
+        // recovery info on first under-cap read.
         let workingList: ReadonlyArray<typeof all[number]> = all;
         if (all.length > RECIPIENT_SCAN_LIST_HARD_GUARD) {
+          this.scanOversizeStreak += 1;
+          if (isPowerOfTwoRecipient(this.scanOversizeStreak)) {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message:
+                `FinalizationWorkerRecipient.scanLoop: queueStore.list returned ` +
+                `${all.length} entries (queue contract: <= ` +
+                `${RECIPIENT_SCAN_LIST_HARD_GUARD}); truncating to first ` +
+                `${RECIPIENT_SCAN_LIST_HARD_GUARD} to avoid OOM (consecutive ` +
+                `overruns: ${this.scanOversizeStreak}). Inspect the ` +
+                `finalization queue for unbounded growth (missing tombstone GC?).`,
+            });
+          }
+          workingList = all.slice(0, RECIPIENT_SCAN_LIST_HARD_GUARD);
+        } else if (this.scanOversizeStreak > 0) {
+          // Recovery: queueStore is now within budget. Single info
+          // alert with the recovery count, then reset.
           this.options.emit('transfer:operator-alert', {
             code: 'structural',
             message:
-              `FinalizationWorkerRecipient.scanLoop: queueStore.list returned ` +
-              `${all.length} entries (queue contract: <= ` +
-              `${RECIPIENT_SCAN_LIST_HARD_GUARD}); truncating to first ` +
-              `${RECIPIENT_SCAN_LIST_HARD_GUARD} to avoid OOM. Inspect the ` +
-              `finalization queue for unbounded growth (missing tombstone GC?).`,
+              `FinalizationWorkerRecipient.scanLoop: queueStore.list under ` +
+              `RECIPIENT_SCAN_LIST_HARD_GUARD again after ` +
+              `${this.scanOversizeStreak} consecutive over-size cycle(s).`,
           });
-          workingList = all.slice(0, RECIPIENT_SCAN_LIST_HARD_GUARD);
+          this.scanOversizeStreak = 0;
         }
 
         // Successful read — emit recovery info if we were in a streak.

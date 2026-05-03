@@ -28,6 +28,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import {
   CountingSemaphore,
   FinalizationWorkerSender,
+  SCAN_LIST_HARD_GUARD,
   type AnchoredProofDescriptor,
   type FinalizationAggregatorClient,
   type FinalizationOutboxWriter,
@@ -1428,5 +1429,212 @@ describe('FinalizationWorkerSender — separate proof-error counters (Wave 3 #2)
     expect(h.aggregator.pollCalls).toBe(3);
     // The PATH_INVALID counter — independent of NOT_AUTHENTICATED's
     // earlier observation — reaches budget on poll 3.
+  });
+});
+
+// =============================================================================
+// Wave 5 steelman fix #2 — SCAN_LIST_HARD_GUARD truncation alert backoff
+// =============================================================================
+
+describe('FinalizationWorkerSender — SCAN_LIST_HARD_GUARD truncation backoff (Wave 5)', () => {
+  /**
+   * Build a harness whose `readAllNew()` returns N entries every cycle.
+   * We assert the loop emits a truncation alert ONLY at power-of-two
+   * cycle boundaries (1, 2, 4, 8, …) and NOT on every cycle.
+   */
+  function buildOversizeHarness(args: { readonly listSize: number }): {
+    readonly worker: FinalizationWorkerSender;
+    readonly events: ReturnType<typeof makeEventRecorder>;
+    readonly readCalls: { count: number };
+  } {
+    // Synthesize `listSize` minimal entries — they don't need to be
+    // valid for the loop to materialize them and hit the truncation
+    // branch, but we DO need the truncation slice to consist of
+    // entries that won't trip processOne errors. We supply a single
+    // fake entry slot and replicate it; its `status` is `finalized`
+    // so the loop's filter rejects it (no processOne calls).
+    const stubEntry: UxfTransferOutboxEntry = {
+      ...makeOutboxEntry({ id: 'stub-finalized' }),
+      status: 'finalized',
+    };
+    const entries: UxfTransferOutboxEntry[] = Array.from(
+      { length: args.listSize },
+      (_, i) => ({ ...stubEntry, id: `stub-${i}` }),
+    );
+
+    const readCalls = { count: 0 };
+    const writer: FinalizationOutboxWriter = {
+      async readOne(_id) {
+        return null;
+      },
+      async update(_id, _mutator) {
+        throw new Error('not used in this test');
+      },
+      async readAllNew() {
+        readCalls.count += 1;
+        return entries;
+      },
+    };
+
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 1,
+      maxEntriesPerScan: 100,
+    });
+
+    return { worker, events, readCalls };
+  }
+
+  it('truncation alert fires only at power-of-two cycle boundaries on permanent overrun', async () => {
+    // Use a small over-cap multiplier so the test is fast — the cap
+    // is 16384, list size = 16385 just barely exceeds it. The slice
+    // truncates to 16384 entries, all stub-finalized so the loop
+    // filter discards them and goes to sleep promptly.
+    const h = buildOversizeHarness({ listSize: SCAN_LIST_HARD_GUARD + 1 });
+    h.worker.start();
+    try {
+      // Wait until at least 8 read cycles have completed. With
+      // scanIntervalMs=1 + sleep clamp 5ms this is well under 1s.
+      await waitForCondition(() => h.readCalls.count >= 8, 5_000);
+    } finally {
+      await h.worker.stop();
+    }
+    const truncationAlerts = h.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('truncating to first')
+      );
+    });
+    // Across N cycles (N >= 8), alerts fire only on power-of-two
+    // boundaries: 1, 2, 4, 8 → at most 4 alerts. The exact upper
+    // bound is `floor(log2(readCalls)) + 1`. We assert
+    // strict-bounded: alerts < readCalls (the original bug).
+    expect(truncationAlerts.length).toBeGreaterThanOrEqual(1);
+    expect(truncationAlerts.length).toBeLessThan(h.readCalls.count);
+    // Stronger: alerts should be at most floor(log2(readCalls)) + 1.
+    const maxExpected = Math.floor(Math.log2(h.readCalls.count)) + 1;
+    expect(truncationAlerts.length).toBeLessThanOrEqual(maxExpected);
+  });
+
+  it('emits a recovery info-alert on first under-cap read after a streak', async () => {
+    // Custom writer toggles between over-cap and under-cap to simulate
+    // the queue store recovering after tombstone GC catches up.
+    const stubEntry: UxfTransferOutboxEntry = {
+      ...makeOutboxEntry({ id: 'stub-finalized' }),
+      status: 'finalized',
+    };
+    const oversizeBatch: UxfTransferOutboxEntry[] = Array.from(
+      { length: SCAN_LIST_HARD_GUARD + 1 },
+      (_, i) => ({ ...stubEntry, id: `stub-${i}` }),
+    );
+    // Three explicit phases:
+    //   call 1, 2 → oversize (streak grows to 2)
+    //   call 3+   → under-cap (recovery alert fires once on call 3)
+    const readCalls = { count: 0 };
+    const writer: FinalizationOutboxWriter = {
+      async readOne(_id) {
+        return null;
+      },
+      async update(_id, _mutator) {
+        throw new Error('not used in this test');
+      },
+      async readAllNew() {
+        readCalls.count += 1;
+        if (readCalls.count <= 2) return oversizeBatch;
+        return [] as UxfTransferOutboxEntry[];
+      },
+    };
+
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 1,
+      maxEntriesPerScan: 100,
+    });
+
+    worker.start();
+    try {
+      await waitForCondition(() => readCalls.count >= 4, 5_000);
+    } finally {
+      await worker.stop();
+    }
+    const recoveryAlerts = events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('under SCAN_LIST_HARD_GUARD again')
+      );
+    });
+    // Exactly one recovery alert when we transition from over-cap to
+    // under-cap, with the consecutive-overrun count.
+    expect(recoveryAlerts.length).toBe(1);
+    const data = recoveryAlerts[0].data as { message?: string };
+    expect(data.message).toMatch(/2 consecutive over-size cycle/);
   });
 });

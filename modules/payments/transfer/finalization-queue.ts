@@ -450,6 +450,20 @@ export class FinalizationQueue {
    * The order is implementation-defined; consumers that need a stable
    * order (e.g. lex-min-by-tokenId for cascade ordering) MUST sort
    * downstream.
+   *
+   * **Wave 5 steelman writer contract (NORMATIVE).** Production
+   * implementations MUST keep the live-entry count BOUNDED by the
+   * number of in-flight finalizations across all tokenIds for the
+   * address, plus a tombstone-GC slack of at most a few thousand. A
+   * queue store that ignores tombstone GC and grows without bound
+   * will materialize the full result here BEFORE the recipient
+   * worker's defensive truncation can run, OOM-ing at materialization
+   * time. The recipient worker truncates oversize results at
+   * `RECIPIENT_SCAN_LIST_HARD_GUARD` (16384) entries and rate-limits
+   * the alert via power-of-two backoff; deployments that need
+   * unbounded enumeration MUST switch to a paged / async-iterable
+   * surface (see TODO on `FinalizationOutboxWriter.readAllNew` for
+   * the cross-cutting plan).
    */
   async list(
     addr: string,

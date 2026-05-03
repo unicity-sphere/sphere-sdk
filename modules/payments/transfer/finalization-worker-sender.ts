@@ -166,9 +166,29 @@ export interface FinalizationOutboxWriter {
    * the full result before truncating to `maxEntriesPerScan`, so an
    * unbounded writer (e.g. one that ignores tombstones / forgot to
    * cap a paged scan) would OOM the worker on a degenerate dataset.
+   *
+   * **Hard upper bound (NORMATIVE)**: Production writers MUST NOT
+   * return more than `SCAN_LIST_HARD_GUARD * 2` entries from a single
+   * `readAllNew()` call. A writer that materializes 100M entries
+   * before returning will OOM the worker at MATERIALIZATION TIME,
+   * BEFORE the scan loop's defensive truncation can run. The hard
+   * upper bound exists so a healthy writer's worst-case spike
+   * (immediately before a tombstone-GC pass) still fits in a single
+   * post-truncation slice without crashing.
+   *
+   * **Stream-mode escape hatch (TODO, future-compat)**: For deployments
+   * that genuinely need unbounded outbox enumeration (multi-million-
+   * entry historical archives), a future protocol revision will add an
+   * `AsyncIterable` overload to this method so the scan loop can pull
+   * one page at a time without ever holding the full set in memory.
+   * Until then, very large outboxes MUST be paged at the writer layer
+   * with a server-side filter (e.g. `status === 'delivered-instant'`)
+   * that bounds the result.
+   *
    * Production writers SHOULD cap at {@link SCAN_LIST_HARD_GUARD}
    * entries per call. The scan loop has a defensive truncation that
    * trims oversize lists and emits an `transfer:operator-alert`
+   * (rate-limited via power-of-two backoff per Wave 5 steelman fix)
    * instead of crashing, but writers should not rely on that defense
    * — it logs as a misconfiguration alert.
    */
@@ -438,6 +458,17 @@ export class FinalizationWorkerSender {
    * the recovery count and reset the counter.
    */
   private scanReadFailureStreak = 0;
+  /**
+   * Wave 5 steelman: consecutive over-size truncation counter for
+   * exponential alert backoff. A persistently-misconfigured writer
+   * (no tombstone GC, runaway slot recovery) would otherwise fire a
+   * `transfer:operator-alert` on EVERY scan iteration — same alert
+   * flood failure mode as the read-failure streak. Truncation alerts
+   * are now emitted only at power-of-two boundaries (1, 2, 4, 8, …);
+   * on the first under-cap read we emit a recovery info alert and
+   * reset the counter.
+   */
+  private scanOversizeStreak = 0;
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6
@@ -1023,17 +1054,39 @@ export class FinalizationWorkerSender {
         // bounded list; if a misconfigured writer returns more than
         // SCAN_LIST_HARD_GUARD entries, alert + truncate so the worker
         // can keep making progress without OOM.
+        //
+        // Wave 5 steelman fix #2: alert flood backoff. A permanent
+        // overrun (broken tombstone GC) was firing the alert on EVERY
+        // cycle — drowning the operator under the same failure mode
+        // we already fixed for the read-throws path. Track a
+        // consecutive-overrun counter and emit only at power-of-two
+        // boundaries; emit a single recovery alert on first
+        // under-cap read.
         let workingList: ReadonlyArray<UxfTransferOutboxEntry> = all;
         if (all.length > SCAN_LIST_HARD_GUARD) {
+          this.scanOversizeStreak += 1;
+          if (isPowerOfTwo(this.scanOversizeStreak)) {
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message:
+                `FinalizationWorkerSender.scanLoop: readAllNew returned ${all.length} ` +
+                `entries (writer contract: <= ${SCAN_LIST_HARD_GUARD}); truncating to ` +
+                `first ${SCAN_LIST_HARD_GUARD} to avoid OOM (consecutive overruns: ` +
+                `${this.scanOversizeStreak}). Inspect the outbox writer for unbounded ` +
+                `growth (missing tombstone GC?).`,
+            });
+          }
+          workingList = all.slice(0, SCAN_LIST_HARD_GUARD);
+        } else if (this.scanOversizeStreak > 0) {
+          // Recovery: writer is now within budget. Emit a single info
+          // alert with the recovery count and reset.
           this.options.emit('transfer:operator-alert', {
             code: 'structural',
             message:
-              `FinalizationWorkerSender.scanLoop: readAllNew returned ${all.length} ` +
-              `entries (writer contract: <= ${SCAN_LIST_HARD_GUARD}); truncating to ` +
-              `first ${SCAN_LIST_HARD_GUARD} to avoid OOM. Inspect the outbox writer ` +
-              `for unbounded growth (missing tombstone GC?).`,
+              `FinalizationWorkerSender.scanLoop: readAllNew under SCAN_LIST_HARD_GUARD ` +
+              `again after ${this.scanOversizeStreak} consecutive over-size cycle(s).`,
           });
-          workingList = all.slice(0, SCAN_LIST_HARD_GUARD);
+          this.scanOversizeStreak = 0;
         }
 
         // Successful read — emit recovery info if we were in a streak.

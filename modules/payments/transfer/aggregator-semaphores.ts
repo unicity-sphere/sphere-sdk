@@ -217,11 +217,20 @@ const aggregatorSemaphores = new Map<string, RejectableSemaphore>();
  *   - Strip trailing slashes from the path (but keep a single `/` for
  *     a bare-root URL — `https://agg/` becomes `https://agg`).
  *   - Drop the default port (`:80` for `http`, `:443` for `https`).
- *   - **Preserve the query string** — Wave 4 steelman fix: routing-
- *     sensitive deployments use `?token=abc` for authentication or
- *     traffic shaping; collapsing two distinct `?token=…` URLs to the
- *     same key would let them share a 16-permit semaphore and bypass
- *     the W14 cap from the OPPOSITE direction.
+ *   - **Strip the query string** — Wave 5 steelman fix #3: many
+ *     deployments encode credentials in the query (`?token=…`,
+ *     `?api_key=…`, `?signature=…`) — preserving them in the canonical
+ *     key leaks via every log line that includes the id, exactly the
+ *     same failure mode the user-info strip closes. Routing-sensitive
+ *     deployments that previously relied on query for endpoint
+ *     discrimination MUST migrate to host or path segregation
+ *     (`/v2/eu/`, `eu.aggregator.example`); auth-via-query MUST move
+ *     into request headers. This is a deliberately conservative
+ *     default — Option A in the steelman task — chosen because no
+ *     known caller in the SDK or its operator runbooks uses query for
+ *     routing today, and the cost of a credential leak via log
+ *     scraping (e.g. shared-tenant log aggregation, LLM telemetry)
+ *     dominates the cost of forcing routing-via-path.
  *   - Drop the fragment (`#frag`) — RFC 3986 §3.5 makes fragments
  *     purely client-side; they never reach the aggregator and can't
  *     discriminate endpoints.
@@ -294,8 +303,13 @@ export function canonicalizeAggregatorId(id: string): string {
     // host = "::1", port = "8080" only by lookahead).
     const hostFormatted = isIpv6 ? `[${hostname}]` : hostname;
     const hostport = port ? `${hostFormatted}:${port}` : hostFormatted;
-    // Wave 4 steelman: PRESERVE query, DROP fragment, STRIP user-info.
-    // - `u.search` includes the leading `?` and is empty if no query.
+    // Wave 5 steelman fix #3: STRIP query, DROP fragment, STRIP user-info.
+    // - `u.search` is intentionally NOT included — many deployments use
+    //   `?token=`/`?api_key=`/`?signature=` for authentication; preserving
+    //   it leaks credentials into every log that prints the canonical id,
+    //   the same failure mode the user-info strip closes. Routing-
+    //   sensitive deployments MUST migrate to host or path segregation;
+    //   auth-via-query MUST move into request headers.
     // - `u.hash` is dropped entirely (client-side only per RFC 3986 §3.5).
     // - `u.username` / `u.password` are intentionally NOT included —
     //   credentials in the canonical key would (a) leak to logs that
@@ -303,8 +317,7 @@ export function canonicalizeAggregatorId(id: string): string {
     //   the same backend through different auth credentials, doubling
     //   the per-aggregator concurrency. Auth belongs in the request
     //   transport layer, not in the rate-budget key.
-    const query = u.search;
-    return `${protocol}//${hostport}${path}${query}`;
+    return `${protocol}//${hostport}${path}`;
   } catch (err) {
     logger.warn(
       'AggregatorSemaphore',

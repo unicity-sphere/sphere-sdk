@@ -28,10 +28,11 @@
  *  - Feature flag OFF: legacy path runs unchanged (export-shape anchor).
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   sendInstantUxf,
+  __resetSourceLocksForTesting,
   type InstantCommitResult,
   type InstantSenderDeps,
   type InstantOutboxHooks,
@@ -273,6 +274,14 @@ function basicRequest(overrides: Partial<TransferRequest> = {}): TransferRequest
 function statusesOf(records: ReadonlyArray<{ status: UxfOutboxStatus }>): UxfOutboxStatus[] {
   return records.map((r) => r.status);
 }
+
+// Wave 5 steelman fix #171 — `sourceLocks` is a module-level singleton. A
+// hung/leaked lock from a prior test (e.g. an async dep that resolved on a
+// later microtask than expected) would wedge a subsequent test that picks
+// the same tokenId fixture. Reset before every case for hermetic isolation.
+beforeEach(() => {
+  __resetSourceLocksForTesting();
+});
 
 // =============================================================================
 // 2. Happy path — 1-token instant send, default delivery (inline)
@@ -1174,5 +1183,67 @@ describe('sendInstantUxf — per-source lock (Wave 4 #171)', () => {
     }
 
     warnSpy.mockRestore();
+  });
+});
+
+// =============================================================================
+// 13. Wave 5 steelman fix #171 — __resetSourceLocksForTesting hermetic reset
+// =============================================================================
+
+describe('__resetSourceLocksForTesting — Wave 5 steelman fix #171', () => {
+  it('clears any in-flight locks so a subsequent send on the same tokenId proceeds without waiting', async () => {
+    // Send A holds the lock indefinitely (commitSources never resolves).
+    // Without the reset hook, send B would wait for the 60s force-release
+    // timer or wedge the test. With the reset hook, the lock is cleared
+    // immediately and B proceeds on the next acquire.
+    const sharedSource = makeToken('tok-reset-shared', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-reset-shared',
+      fixture: TOKEN_A,
+    });
+
+    let neverResolve: (() => void) | null = null;
+    const hangGate = new Promise<void>((resolve) => {
+      neverResolve = resolve;
+    });
+    const { deps: depsA } = makeDeps({
+      availableSources: () => [sharedSource],
+      selectSources: async () => [sharedSource],
+      commitSources: async () => {
+        await hangGate;
+        return [commitResult];
+      },
+    });
+    // Kick off send A — it acquires the lock and hangs in commitSources.
+    const aPromise = sendInstantUxf(basicRequest(), makePeerInfo(), depsA);
+
+    // Yield once so A reaches the point where it holds the lock.
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Force-clear the lock map. Send B should now proceed without waiting.
+    __resetSourceLocksForTesting();
+
+    const { deps: depsB, transport: transportB } = makeDeps({
+      availableSources: () => [sharedSource],
+      selectSources: async () => [sharedSource],
+      commitSources: async () => [commitResult],
+    });
+    const start = Date.now();
+    const r2 = await sendInstantUxf(basicRequest(), makePeerInfo(), depsB);
+    const elapsed = Date.now() - start;
+
+    expect(r2.status).toBe('submitted');
+    expect(transportB._calls).toHaveLength(1);
+    // B completed promptly — no 60s wait on A's lock.
+    expect(elapsed).toBeLessThan(1_000);
+
+    // Clean up A.
+    neverResolve!();
+    try {
+      await aPromise;
+    } catch {
+      // Don't care — A's pipeline may complete or error; the test asserts
+      // only on B's prompt completion.
+    }
   });
 });

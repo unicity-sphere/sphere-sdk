@@ -122,24 +122,39 @@ describe('canonicalizeAggregatorId — URL form collapsing', () => {
     );
   });
 
-  it('preserves query string (routing-sensitive endpoints)', () => {
-    // Wave 4 steelman: query strings carry routing/auth info for
-    // some deployments. Two URLs differing ONLY in query MUST stay
-    // distinct so they don't share the W14 16-permit budget.
-    expect(canonicalizeAggregatorId('https://agg?token=abc')).not.toBe(
+  it('strips query string (Wave 5 steelman: prevents credential leak via logs)', () => {
+    // Wave 5 steelman fix #3: query strings often carry credentials
+    // (?token=, ?api_key=, ?signature=). Preserving them in the
+    // canonical id leaks creds via any log line that prints the id —
+    // the same failure mode the user-info strip already closes. Two
+    // URLs differing ONLY in query MUST collapse to the same key.
+    // Routing-via-query is unsupported; deployments must use host/path
+    // segregation or move auth to headers.
+    expect(canonicalizeAggregatorId('https://agg?token=abc')).toBe(
       canonicalizeAggregatorId('https://agg'),
     );
-    expect(canonicalizeAggregatorId('https://agg?token=abc')).not.toBe(
+    expect(canonicalizeAggregatorId('https://agg?token=abc')).toBe(
       canonicalizeAggregatorId('https://agg?token=xyz'),
     );
+    // Critical: the canonical form MUST NOT contain query-string creds.
+    const canonical = canonicalizeAggregatorId(
+      'https://agg?api_key=secret-key-12345&signature=deadbeef',
+    );
+    expect(canonical).not.toContain('secret-key-12345');
+    expect(canonical).not.toContain('deadbeef');
+    expect(canonical).not.toContain('api_key');
+    expect(canonical).not.toContain('signature');
+    expect(canonical).not.toContain('?');
   });
 
   it('drops fragment (#frag is client-side only per RFC 3986)', () => {
     expect(canonicalizeAggregatorId('https://agg#frag')).toBe(
       canonicalizeAggregatorId('https://agg'),
     );
+    // Wave 5 steelman: with query stripped, `?token=abc#frag` collapses
+    // to the same canonical key as a bare `https://agg`.
     expect(canonicalizeAggregatorId('https://agg?token=abc#frag')).toBe(
-      canonicalizeAggregatorId('https://agg?token=abc'),
+      canonicalizeAggregatorId('https://agg'),
     );
   });
 
@@ -262,19 +277,23 @@ describe('aggregator-semaphores — URL canonicalization (#159)', () => {
     expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
   });
 
-  it("fragment-only differences collapse, query stays distinct (Wave 4)", () => {
+  it("fragment AND query-string differences collapse (Wave 5 steelman)", () => {
     // Fragment is purely client-side (RFC 3986 §3.5) → MUST collapse.
     const fragment = getAggregatorSemaphore('https://agg#frag');
     const bare = getAggregatorSemaphore('https://agg');
     expect(fragment).toBe(bare);
     expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
 
-    // Query string carries routing/auth → MUST stay distinct.
+    // Wave 5 steelman fix #3: query string is now stripped (was
+    // preserved in Wave 4) — `?token=`/`?api_key=` etc. carry
+    // credentials in many deployments and would leak via logs that
+    // print the canonical id. Two URLs that differ ONLY in query
+    // collapse to the SAME semaphore.
     const queryA = getAggregatorSemaphore('https://agg?token=abc');
     const queryB = getAggregatorSemaphore('https://agg?token=xyz');
-    expect(queryA).not.toBe(queryB);
-    expect(queryA).not.toBe(bare);
-    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(3);
+    expect(queryA).toBe(queryB);
+    expect(queryA).toBe(bare);
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(1);
   });
 
   it("user-info differences collapse to the same key (no creds in key)", () => {

@@ -684,6 +684,66 @@ describe('FinalizationWorkerRecipient — scanLoop (#168)', () => {
   });
 });
 
+// =============================================================================
+// Wave 5 steelman fix #2 — RECIPIENT_SCAN_LIST_HARD_GUARD truncation backoff
+// =============================================================================
+
+describe('FinalizationWorkerRecipient — RECIPIENT_SCAN_LIST_HARD_GUARD truncation backoff (Wave 5)', () => {
+  it('truncation alert fires only at power-of-two cycle boundaries on permanent overrun', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    // Stub `queueStore.list` to return SCAN_LIST_HARD_GUARD + 1
+    // synthetic entries every cycle. We use the recipient's exposed
+    // constant via a probe import below.
+    const { RECIPIENT_SCAN_LIST_HARD_GUARD } = await import(
+      '../../../../modules/payments/transfer/finalization-worker-recipient'
+    );
+    const stubEntries = Array.from(
+      { length: RECIPIENT_SCAN_LIST_HARD_GUARD + 1 },
+      (_, i) =>
+        // Use a tokenId outside any active address scope so the
+        // worker's filter / inFlight guard never invokes processOneToken.
+        // We only assert on the truncation alert pattern.
+        ({
+          tokenId: `synth-${i}`,
+          entryId: `entry-synth-${i}`,
+          commitmentRequestId: `req-synth-${i}`,
+          submittedAt: 1700000000000,
+          inclusionProof: null,
+          txIndex: 0,
+        }),
+    );
+    const readCalls = { count: 0 };
+    // Hijack `list` to return our oversize batch.
+    harness.queueStore.list = (async () => {
+      readCalls.count += 1;
+      return stubEntries;
+    }) as typeof harness.queueStore.list;
+    // Make processOneToken a no-op so the loop just iterates fast.
+    harness.worker.processOneToken = (async () => undefined) as typeof harness.worker.processOneToken;
+
+    harness.worker.start();
+    try {
+      await waitFor(() => readCalls.count >= 8, 5_000);
+    } finally {
+      await harness.worker.stop();
+    }
+    const truncationAlerts = harness.events.events.filter((e) => {
+      if (e.type !== 'transfer:operator-alert') return false;
+      const data = e.data as { message?: string };
+      return (
+        typeof data.message === 'string' &&
+        data.message.includes('truncating to first')
+      );
+    });
+    // Strict-bounded: alerts < readCalls (the original bug fired
+    // every cycle).
+    expect(truncationAlerts.length).toBeGreaterThanOrEqual(1);
+    expect(truncationAlerts.length).toBeLessThan(readCalls.count);
+    const maxExpected = Math.floor(Math.log2(readCalls.count)) + 1;
+    expect(truncationAlerts.length).toBeLessThanOrEqual(maxExpected);
+  });
+});
+
 // Suppress unused-import warnings for this block.
 void NEW_CID;
 void RACE_TX_HASH;

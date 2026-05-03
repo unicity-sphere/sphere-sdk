@@ -210,6 +210,10 @@ describe('§6.1.1 cascade — scanner-error surfacing', () => {
     expect(harness.scannerErrors[0].phase).toBe('find-outbox-entries');
     expect(harness.scannerErrors[0].tokenId).toBe(C1);
     expect(harness.scannerErrors[0].error).toBe(boom);
+    // Wave 5 steelman fix #4: the addr field MUST identify the
+    // originating wallet/address. Previously this was '' which
+    // made multi-address operator alerting impossible.
+    expect(harness.scannerErrors[0].addr).toBe(ADDR);
   });
 
   it('NFT path outbox scanner throw → scannerErrors increments', async () => {
@@ -243,6 +247,8 @@ describe('§6.1.1 cascade — scanner-error surfacing', () => {
     expect(harness.scannerErrors).toHaveLength(1);
     expect(harness.scannerErrors[0].phase).toBe('find-outbox-entries');
     expect(harness.scannerErrors[0].tokenId).toBe(NFT);
+    // Wave 5 steelman fix #4: addr threaded from the caller's frame.
+    expect(harness.scannerErrors[0].addr).toBe(ADDR);
   });
 
   it('onScannerError callback throwing does NOT abort the cascade', async () => {

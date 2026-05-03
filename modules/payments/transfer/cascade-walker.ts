@@ -671,6 +671,7 @@ export class CascadeWalker {
 
       counters.cascaded++;
       const tally = await this._emitCascadeFailedForOutboxEntries(
+        addr,
         childTokenId,
         rootReason,
       );
@@ -857,10 +858,14 @@ export class CascadeWalker {
     parentTokenId: string,
     rootReason: DispositionReason,
   ): Promise<CascadeResult> {
-    void addr; // outbox is address-scoped at construction time; the
-    //         scanner here is for the active sender's outbox.
+    // Wave 5 steelman fix #4: thread `addr` into outbox-scanner
+    // failure surfacing so multi-address operator alerts can be
+    // attributed correctly. The outbox scanner itself is
+    // address-scoped at construction; addr threading is for the
+    // `onScannerError` callback's payload.
     const counters = mutableCounters();
     const tally = await this._emitCascadeFailedForOutboxEntries(
+      addr,
       parentTokenId,
       rootReason,
     );
@@ -901,6 +906,7 @@ export class CascadeWalker {
    * @internal
    */
   private async _emitCascadeFailedForOutboxEntries(
+    addr: string,
     tokenId: string,
     rootReason: DispositionReason,
   ): Promise<{
@@ -916,8 +922,14 @@ export class CascadeWalker {
       // failures: increment counter, invoke callback, log breadcrumb.
       // Skip notification for THIS tokenId; the cascade walk continues
       // for other children.
+      //
+      // Wave 5 steelman fix #4: thread `addr` from the caller's
+      // walk frame so operators wiring `onScannerError` can attribute
+      // the failure to the originating wallet/address. Previously this
+      // emitted `addr: ''` which made multi-address operator alerting
+      // (e.g. "which sub-account's outbox is flaking?") impossible.
       this._emitScannerError({
-        addr: '', // outbox scanner is address-scoped at construction
+        addr,
         tokenId,
         phase: 'find-outbox-entries',
         error: err,

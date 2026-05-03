@@ -370,6 +370,16 @@ export interface InstantSenderDeps {
  * twice in parallel (split mode for huge balances) is serialized by the
  * lock — by design. Document this if surfaced to API consumers.
  *
+ * **Process-global state — Wave 5 steelman fix #171.** The `sourceLocks`
+ * map is a MODULE-LEVEL singleton. Two `Sphere` instances running in the
+ * same process share this map. In production this is benign: each wallet's
+ * source tokenIds are HD-derived from a unique master key, so cross-wallet
+ * collision is cryptographically improbable (the chance of a collision is
+ * the chance of a public-key collision in the BIP-32 derivation tree).
+ * Tests that drive multiple Sphere instances against fixed string tokenIds
+ * MUST call {@link __resetSourceLocksForTesting} between cases to prevent
+ * state bleed across tests; production callers MUST NOT invoke it.
+ *
  * Spec refs: §6.1 sender-side semantics; §7.1 CRDT invariants (no
  * commitment may be observed by two outbox entries with overlapping
  * source-token sets).
@@ -377,6 +387,26 @@ export interface InstantSenderDeps {
  * @internal
  */
 const sourceLocks = new Map<string, Promise<void>>();
+
+/**
+ * Test-only escape hatch — clear the process-global {@link sourceLocks}
+ * map. Wave 5 steelman fix #171: tests that exercise the lock behavior
+ * (or otherwise touch `acquireSourceLocks`) MUST invoke this in
+ * `beforeEach` so a hung/leaked lock from a prior test cannot wedge a
+ * subsequent one. Production code MUST NOT call this — clearing locks
+ * mid-flight would re-open the same-process double-spend window the
+ * lock exists to close.
+ *
+ * Pending acquirers that are awaiting a cleared lock-promise will loop
+ * once and observe the empty slot on the next microtask, then proceed
+ * normally — they do not get rejected. Lock-promises themselves are
+ * forgotten (the holder's release is a no-op against the absent slot).
+ *
+ * @internal
+ */
+export function __resetSourceLocksForTesting(): void {
+  sourceLocks.clear();
+}
 
 /** Default max-hold for any single source lock. Configurable via the
  *  `LOCK_MAX_HOLD_MS` parameter for testability. */

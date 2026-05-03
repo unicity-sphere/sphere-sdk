@@ -214,6 +214,9 @@ import { MintTransactionData } from '@unicitylabs/state-transition-sdk/lib/trans
 import { waitInclusionProof } from '@unicitylabs/state-transition-sdk/lib/util/InclusionProofUtils';
 import { InclusionProof } from '@unicitylabs/state-transition-sdk/lib/transaction/InclusionProof';
 import { TransferTransactionData } from '@unicitylabs/state-transition-sdk/lib/transaction/TransferTransactionData';
+import { RequestId } from '@unicitylabs/state-transition-sdk/lib/api/RequestId';
+import { Authenticator } from '@unicitylabs/state-transition-sdk/lib/api/Authenticator';
+import { PredicateEngineService } from '@unicitylabs/state-transition-sdk/lib/predicate/PredicateEngineService';
 import type { IAddress } from '@unicitylabs/state-transition-sdk/lib/address/IAddress';
 import type { StateTransitionClient } from '@unicitylabs/state-transition-sdk/lib/StateTransitionClient';
 import type { RootTrustBase } from '@unicitylabs/state-transition-sdk/lib/bft/RootTrustBase';
@@ -1641,58 +1644,153 @@ export class PaymentsModule {
                   tokenData = { ...assembledJson, state: recipientState.toJSON() };
                   tokenStatus = 'pending';
 
-                  // Task #151 — derive the requestId so the recipient
-                  // worker can poll the aggregator for the proof. The
-                  // commitment is reconstructible from the lastTx data;
-                  // `TransferCommitment.fromJSON(lastTxJson)` works even
-                  // when `inclusionProof: null` because the SDK only
-                  // requires the commitment-shape fields (requestId is
-                  // computed from `(signedTx, sourceState)` per
-                  // RequestId.js).
+                  // Wave 5 fix — Task #151 / R1 (dead-code).
+                  //
+                  // Wave 4 R1 attempted to mirror the sender wiring by
+                  // calling `TransferCommitment.fromJSON(lastTxJson)`.
+                  // That ALWAYS throws: `lastTxJson` has the
+                  // TransferTransaction shape `{data, inclusionProof}`
+                  // (see line ~7759 where the SENDER builds the bundle:
+                  // `transferTxJson = { data: commitment.toJSON()
+                  // .transactionData, inclusionProof: null }`), NOT the
+                  // TransferCommitment shape `{requestId,
+                  // transactionData, authenticator}` that `fromJSON`
+                  // requires. `TransferCommitment.isJSON` returns false
+                  // and `fromJSON` raises `InvalidJsonStructureError`.
+                  // The outer try/catch silently swallowed the throw,
+                  // `pendingFinalizationCtx` stayed null, the entire
+                  // downstream wire-up was dead code at runtime, and
+                  // §6.1 race-lost still fired on every successful
+                  // recipient poll (because `_recipientRequestContextMap`
+                  // never received a real entry).
+                  //
+                  // The correct derivation paths:
+                  //
+                  //   1. `transactionHash` — the canonical 68-char SDK
+                  //      DataHash imprint hex of the transfer-tx-data.
+                  //      The aggregator anchors EXACTLY this value in
+                  //      `proof.transactionHash` (see
+                  //      `StateTransitionClient.submitTransferCommitment`:
+                  //      `client.submitCommitment(commitment.requestId,
+                  //      await commitment.transactionData.calculateHash(),
+                  //      commitment.authenticator)`). We compute it
+                  //      directly from `txData.calculateHash().toJSON()`
+                  //      — `txData` was already parsed via
+                  //      `TransferTransactionData.fromJSON(lastTxJson.data)`
+                  //      at line ~1591, so this path is independent of
+                  //      `inclusionProof: null`.
+                  //
+                  //   2. `requestId` — `RequestId.create(senderPublicKey,
+                  //      sourceStateHash)` (matches
+                  //      `TransferCommitment.create`). The recipient
+                  //      derives `senderPublicKey` from the source-state
+                  //      predicate (`PredicateEngineService.createPredicate
+                  //      (state.predicate).publicKey`), and
+                  //      `sourceStateHash = txData.sourceState.calculateHash()`.
+                  //
+                  //   3. `authenticator` — the sender's authenticator
+                  //      from the bundled `data.authenticator` (the
+                  //      sender embeds it for the unfinalized case so
+                  //      the recipient can mirror the §6.3 byte-equality
+                  //      compare). If the bundle does not carry it
+                  //      (legacy bundles, downgrade scenarios) we fall
+                  //      back to empty string and emit `transfer:
+                  //      operator-alert` — the §6.3 conflict check is
+                  //      degraded for that entry but §6.1 race-lost
+                  //      still works (only `transactionHash` matters
+                  //      for race-lost).
                   try {
-                    const commitment = await TransferCommitment.fromJSON(
-                      lastTxJson as unknown,
+                    // (a) Canonical transactionHash imprint hex (matches
+                    //     the aggregator's stored value).
+                    const txDataHash = await txData.calculateHash();
+                    const txHashImprintHex = txDataHash.toJSON();
+
+                    // (b) Canonical requestId. The source-state predicate
+                    //     was already loaded via `sourceToken.state.predicate`,
+                    //     but we use the SDK's `PredicateEngineService` for
+                    //     symmetry and to extract `publicKey` cleanly.
+                    const senderPredicate = await PredicateEngineService.createPredicate(
+                      txData.sourceState.predicate,
                     );
-                    const reqIdBytes = commitment.requestId;
-                    const reqIdHex =
-                      reqIdBytes instanceof Uint8Array
-                        ? Array.from(reqIdBytes)
-                            .map((b) => b.toString(16).padStart(2, '0'))
-                            .join('')
-                        : (typeof (reqIdBytes as { toJSON?: () => string }).toJSON === 'function'
-                            ? (reqIdBytes as { toJSON: () => string }).toJSON()
-                            : String(reqIdBytes));
-
-                    // Wave 4 fix — derive the canonical transactionHash imprint
-                    // hex (mirrors the sender at line ~7759). Both sides MUST
-                    // use the same value or the §6.1 race-lost detector at
-                    // finalization-worker-base.ts:824 fires on every successful
-                    // poll. Before this fix the recipient stored the requestId
-                    // as `transactionHash` — guaranteed-different from the
-                    // proof's tx-data-hash.
-                    let txHashImprintHex: string;
-                    try {
-                      const txDataHash = await commitment.transactionData.calculateHash();
-                      txHashImprintHex = txDataHash.toJSON();
-                    } catch (hashErr) {
-                      logger.warn(
-                        'Payments',
-                        `Wave 4 fix: failed to derive recipient transactionHash for requestId ${reqIdHex.slice(0, 16)} — race-lost detection degraded (falling back to requestId).`,
-                        { err: hashErr instanceof Error ? hashErr.message : String(hashErr) },
+                    // The DefaultPredicate base class exposes a
+                    // `publicKey: Uint8Array` getter (see
+                    // node_modules/@unicitylabs/state-transition-sdk/lib/
+                    // predicate/embedded/DefaultPredicate.d.ts). The
+                    // `IPredicate` interface that `createPredicate`
+                    // returns does NOT declare `publicKey` (it's only on
+                    // `MaskedPredicate`/`UnmaskedPredicate` concrete
+                    // classes), so we narrow via runtime check + cast.
+                    const senderPubkey = (senderPredicate as unknown as { publicKey?: Uint8Array }).publicKey;
+                    if (!(senderPubkey instanceof Uint8Array) || senderPubkey.length === 0) {
+                      const engineStr = String(
+                        (senderPredicate as unknown as { engine?: unknown }).engine ?? 'unknown',
                       );
-                      txHashImprintHex = reqIdHex;
+                      throw new Error(
+                        `Sender predicate (engine=${engineStr}) does not expose a publicKey — cannot derive recipient requestId for instant-mode finalization`,
+                      );
                     }
+                    const sourceStateHash = await txData.sourceState.calculateHash();
+                    const reqIdObj = await RequestId.create(senderPubkey, sourceStateHash);
+                    const reqIdHex = reqIdObj.toJSON();
 
-                    // Wave 4 fix — extract canonical authenticator JSON. The
-                    // sender uses `JSON.stringify(commitment.toJSON()
-                    // .authenticator)` (line ~7779). The recipient mirrors
-                    // exactly so §6.3 same-value vs different-value proof
-                    // resolution byte-equality holds.
-                    const commitJson = (commitment as { toJSON?: () => { authenticator?: unknown } }).toJSON?.();
-                    const authenticatorJsonStr =
-                      commitJson?.authenticator !== undefined && commitJson.authenticator !== null
-                        ? JSON.stringify(commitJson.authenticator)
-                        : '';
+                    // (c) Authenticator. The unfinalized bundle now
+                    //     carries the sender's authenticator under
+                    //     `data.authenticator` (Wave 5 fix: sender adds
+                    //     it at line ~7763). Recipient extracts and
+                    //     stringifies with the SAME canonical key order
+                    //     as the sender (Authenticator.toJSON +
+                    //     JSON.stringify) so §6.3 byte-equality holds.
+                    let authenticatorJsonStr = '';
+                    const lastDataObj = lastTxJson.data as Record<string, unknown> | undefined;
+                    const rawAuthenticator = lastDataObj?.authenticator;
+                    if (
+                      rawAuthenticator !== undefined &&
+                      rawAuthenticator !== null &&
+                      typeof rawAuthenticator === 'object'
+                    ) {
+                      try {
+                        // Round-trip through Authenticator.fromJSON →
+                        // .toJSON() to canonicalize the key order
+                        // (avoids a key-order mismatch with the
+                        // aggregator-returned proof's authenticator).
+                        const authObj = Authenticator.fromJSON(rawAuthenticator);
+                        authenticatorJsonStr = JSON.stringify(authObj.toJSON());
+                      } catch (authErr) {
+                        logger.warn(
+                          'Payments',
+                          'Wave 5 fix: bundle data.authenticator present but failed to parse — §6.3 conflict check degraded for this entry',
+                          { err: authErr instanceof Error ? authErr.message : String(authErr) },
+                        );
+                        // Fallback: stringify as-is so we at least have
+                        // SOMETHING for byte-equality. Better than the
+                        // empty-string Wave 4 silent dead-code outcome.
+                        try {
+                          authenticatorJsonStr = JSON.stringify(rawAuthenticator);
+                        } catch {
+                          authenticatorJsonStr = '';
+                        }
+                      }
+                    } else {
+                      // Bundle does not carry the sender's authenticator
+                      // (legacy bundles, or sender on a pre-Wave-5
+                      // build). §6.3 byte-equality is degraded for this
+                      // entry but §6.1 race-lost still functions.
+                      // Surface an operator-alert so the degradation is
+                      // visible — far better than the silent dead-code
+                      // outcome from Wave 4.
+                      const tokenIdShort = tokenRoot.tokenId.slice(0, 16);
+                      this.deps!.emitEvent('transfer:operator-alert', {
+                        code: 'structural',
+                        tokenId: tokenRoot.tokenId,
+                        message:
+                          `Wave 5 R1: instant-mode UXF bundle for tokenId=${tokenIdShort} ` +
+                          `does not carry sender's authenticator under ` +
+                          `lastTx.data.authenticator. §6.3 same-value-vs-` +
+                          `different-value proof comparison will be ` +
+                          `degraded for requestId=${reqIdHex.slice(0, 16)} — ` +
+                          `the §6.1 race-lost compare still functions.`,
+                      });
+                    }
 
                     pendingFinalizationCtx = {
                       sourceTokenJson,
@@ -1701,15 +1799,34 @@ export class PaymentsModule {
                       transactionHash: txHashImprintHex,
                       authenticator: authenticatorJsonStr,
                     };
-                  } catch (commitErr) {
+                  } catch (deriveErr) {
+                    // Hard failure to derive the canonical values. The
+                    // recipient worker cannot finalize this token; we
+                    // surface this as `transfer:operator-alert` (NOT a
+                    // silent log) per Wave 5 R1: silent dead-code is
+                    // exactly the bug we are closing.
+                    const errMsg = deriveErr instanceof Error ? deriveErr.message : String(deriveErr);
                     logger.warn(
                       'Payments',
-                      'Task #151: failed to derive requestId for instant-mode token; recipient worker will not finalize',
+                      'Wave 5 R1: failed to derive recipient finalization context (transactionHash + requestId)',
                       {
                         tokenId: tokenRoot.tokenId.slice(0, 16),
-                        err: commitErr instanceof Error ? commitErr.message : String(commitErr),
+                        err: errMsg,
                       },
                     );
+                    try {
+                      this.deps!.emitEvent('transfer:operator-alert', {
+                        code: 'structural',
+                        tokenId: tokenRoot.tokenId,
+                        message:
+                          `Wave 5 R1 hard-fail: cannot derive recipient ` +
+                          `finalization context for tokenId=${tokenRoot.tokenId.slice(0, 16)} — ` +
+                          `recipient worker will not enqueue this token. ` +
+                          `Cause: ${errMsg}`,
+                      });
+                    } catch {
+                      // emitter unavailable — diagnostic only path
+                    }
                   }
                 }
               } catch (finalizeErr) {
@@ -7756,8 +7873,25 @@ export class PaymentsModule {
           // Passing the commitment envelope causes every scalar field to be
           // `undefined`, which @ipld/dag-cbor rejects at encode time with
           // "undefined is not supported by the IPLD Data Model".
+          //
+          // Wave 5 R1 — additionally embed the sender's authenticator
+          // under `data.authenticator` so the recipient (line ~1644)
+          // can populate `_recipientRequestContextMap` with a real
+          // canonical authenticator JSON for §6.3 byte-equality.
+          // `TransferTransactionData.fromJSON` only checks for the 6
+          // required keys via the `in` operator (see
+          // node_modules/@unicitylabs/state-transition-sdk/lib/
+          // transaction/TransferTransactionData.js:65) and ignores
+          // additional keys, so this extra field is forward/backward
+          // compatible with all SDK versions.
+          const commitmentJson = commitment.toJSON();
           const transferTxJson = {
-            data: commitment.toJSON().transactionData,
+            data: {
+              ...commitmentJson.transactionData,
+              // Wave 5: sender embeds its authenticator for the
+              // recipient's §6.3 same-value-vs-different-value compare.
+              authenticator: commitmentJson.authenticator,
+            },
             inclusionProof: null,
           };
           const tokenJson = token.sdkData
@@ -9748,7 +9882,11 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     data: import('../../types').SphereEventMap[T],
   ) => void;
   readonly signal?: AbortSignal;
-}): { worker: FinalizationWorkerRecipient; queue: FinalizationQueue } {
+}): {
+  worker: FinalizationWorkerRecipient;
+  queue: FinalizationQueue;
+  dispositionWriter: FinalizationDispositionWriter;
+} {
   const {
     addressId,
     oracle,
@@ -10107,23 +10245,32 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
         tokens.set(ctx.localTokenId, updated);
         try {
           await save();
+          // Wave 5 fix — only delete ctx after persistence succeeds.
+          // If save() threw, the in-memory mutation is lost on next
+          // reload AND the ctx must be retained so an external retry
+          // path (e.g. another disposition write or
+          // payments.receive({finalize:true})) can re-attempt. This
+          // matches the outer-catch retention promise below.
+          recipientFinalizationContext.delete(tokenId);
+          logger.debug(
+            'Payments',
+            `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
+          );
         } catch (saveErr) {
           const saveMsg = `Task #151: save() after finalization threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`;
           logger.warn('Payments', saveMsg);
           // Wave 4 fix — emit operator-alert. The Token was finalized
           // and flipped to 'confirmed' in-memory, but persistence
           // failed; on the next reload the in-memory mutation is lost.
+          // Wave 5 fix — ctx is intentionally NOT deleted here so a
+          // retry path can pick it back up; consistent with the
+          // outer-catch retention promise.
           emit('transfer:operator-alert', {
             code: 'structural',
             tokenId: ctx.localTokenId,
             message: saveMsg,
           });
         }
-        recipientFinalizationContext.delete(tokenId);
-        logger.debug(
-          'Payments',
-          `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
-        );
       } catch (err) {
         const errMsg = `Task #151: dispositionWriter finalization failed for ${tokenId.slice(0, 16)} — ${err instanceof Error ? err.message : String(err)}`;
         logger.warn(
@@ -10178,7 +10325,7 @@ export function buildDefaultFinalizationWorkerRecipient(opts: {
     ...(signal !== undefined ? { signal } : {}),
   });
 
-  return { worker, queue };
+  return { worker, queue, dispositionWriter };
 }
 
 // =============================================================================
