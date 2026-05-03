@@ -137,6 +137,21 @@ export interface ReresolvedNametag {
   readonly nametag: string | null;
   /** Provenance discriminator — see {@link ReresolvedNametagSource}. */
   readonly source: ReresolvedNametagSource;
+  /**
+   * The {@link PeerInfo} snapshot the binding registry returned for
+   * `senderPubkey`, or `null` when no binding event was found / the
+   * lookup failed. Surfaced so callers needing additional fields
+   * (e.g. `directAddress`) can read them from the SAME snapshot that
+   * supplied `nametag` — eliminating the TOCTOU window where a
+   * relay-side actor could splice the nametag from snapshot T0 with
+   * the address from snapshot T1.
+   *
+   * Wave 3 / steelman: when both the nametag and the address are
+   * needed, callers MUST consume them from this single `peerInfo`
+   * rather than re-querying `resolveTransportPubkeyInfo` separately.
+   * See `resolveSenderInfoViaBinding` for the canonical pattern.
+   */
+  readonly peerInfo: PeerInfo | null;
 }
 
 // =============================================================================
@@ -220,14 +235,14 @@ export async function reresolveNametag(
   // silently downgrading to `null` (the payload nametag is dropped
   // either way).
   if (typeof senderPubkey !== 'string' || senderPubkey.length === 0) {
-    return { nametag: null, source: 'untrusted-payload' };
+    return { nametag: null, source: 'untrusted-payload', peerInfo: null };
   }
 
   if (!transport || typeof transport.resolveTransportPubkeyInfo !== 'function') {
     // Transport does not implement the binding lookup. Per
     // contract, do NOT trust the payload claim. Caller's UI will
     // render "Unknown sender" or the pubkey.
-    return { nametag: null, source: 'untrusted-payload' };
+    return { nametag: null, source: 'untrusted-payload', peerInfo: null };
   }
 
   let peerInfo: PeerInfo | null;
@@ -236,7 +251,7 @@ export async function reresolveNametag(
   } catch {
     // Transport / network error. Best-effort C9 defense:
     // refuse to display payload nametag.
-    return { nametag: null, source: 'untrusted-payload' };
+    return { nametag: null, source: 'untrusted-payload', peerInfo: null };
   }
 
   if (peerInfo === null) {
@@ -244,7 +259,7 @@ export async function reresolveNametag(
     // either brand new, never registered a nametag, or the relay
     // is partitioned. In all three cases the safe answer is the
     // same: do NOT display the payload claim.
-    return { nametag: null, source: 'untrusted-payload' };
+    return { nametag: null, source: 'untrusted-payload', peerInfo: null };
   }
 
   // Binding event found. The nametag (if any) is binding-attested.
@@ -255,11 +270,18 @@ export async function reresolveNametag(
   // succeed at the registry lookup — downstream UIs can use the
   // distinction to render e.g. "(known peer, no nametag)" vs
   // "(unknown sender)".
+  //
+  // Wave 3 / steelman: also surface the FULL `peerInfo` snapshot so
+  // callers (notably `resolveSenderInfoViaBinding`) read both the
+  // nametag and the directAddress from the SAME registry response,
+  // eliminating the TOCTOU window where two consecutive
+  // `resolveTransportPubkeyInfo` calls could see different values
+  // (relay cache poisoning / mid-flight re-publication).
   const bindingNametag = peerInfo.nametag;
   if (typeof bindingNametag === 'string' && bindingNametag.length > 0) {
-    return { nametag: bindingNametag, source: 'binding-event' };
+    return { nametag: bindingNametag, source: 'binding-event', peerInfo };
   }
-  return { nametag: null, source: 'binding-event' };
+  return { nametag: null, source: 'binding-event', peerInfo };
 }
 
 // =============================================================================
@@ -301,20 +323,26 @@ export async function resolveSenderInfoViaBinding(
     transport,
   );
 
-  // For the address slot, query the binding event a second time to
-  // get the directAddress. We avoid re-querying when the nametag
-  // resolver already failed (source === 'untrusted-payload') —
-  // there is no binding event to read addresses from in that case.
+  // Wave 3 / steelman fix (TOCTOU): read `directAddress` from the
+  // SAME `peerInfo` snapshot that supplied `nametag`. The previous
+  // implementation called `resolveTransportPubkeyInfo` a SECOND time
+  // for the address — a relay-side actor could return different
+  // PeerInfo between the two calls, splicing `nametag: 'alice'` from
+  // snapshot T0 with `directAddress: K_attacker` from snapshot T1
+  // (cache poison / flapping binding). The single-snapshot read
+  // closes that window: if the registry returned (nametag, address)
+  // together, the receiver consumes them together; if it returned
+  // a snapshot without the address (pubkey-only binding), the
+  // receiver leaves `senderAddress` undefined rather than running
+  // a second query that could see a fresher, conflicting answer.
   let senderAddress: string | undefined;
-  if (reresolved.source === 'binding-event' && transport?.resolveTransportPubkeyInfo) {
-    try {
-      const peerInfo = await transport.resolveTransportPubkeyInfo(senderTransportPubkey);
-      if (peerInfo && typeof peerInfo.directAddress === 'string' && peerInfo.directAddress.length > 0) {
-        senderAddress = peerInfo.directAddress;
-      }
-    } catch {
-      // Best-effort: ignore address resolution failures.
-    }
+  if (
+    reresolved.source === 'binding-event' &&
+    reresolved.peerInfo !== null &&
+    typeof reresolved.peerInfo.directAddress === 'string' &&
+    reresolved.peerInfo.directAddress.length > 0
+  ) {
+    senderAddress = reresolved.peerInfo.directAddress;
   }
 
   return {

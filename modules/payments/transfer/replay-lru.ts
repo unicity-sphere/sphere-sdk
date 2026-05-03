@@ -34,26 +34,51 @@
  *     added beyond the cap, the **oldest entry within that sender's
  *     bucket** is evicted. Critically: NEVER evicts another sender's
  *     entry.
- *   - **Global sender-bucket cap** (`maxSenders`, default 32): caps the
- *     number of distinct sender pubkeys we track simultaneously to bound
- *     memory. When we exceed this and a NEW sender appears, the
+ *   - **Global sender-bucket cap** (`maxSenders`, default 256): caps
+ *     the number of distinct sender pubkeys we track simultaneously to
+ *     bound memory. When we exceed this and a NEW sender appears, the
  *     **least-recently-active sender's entire sub-bucket** is dropped.
- *     This still satisfies N5: no honest sender's entries are evicted by
- *     a hostile sender's activity unless the hostile sender is faster
- *     than ALL the honest senders combined — and even then, the eviction
- *     is whole-bucket, not entry-by-entry, so a single hostile sender
- *     cannot starve any specific honest sender's bucket while that
- *     sender is also producing traffic.
+ *
+ *     **Steelman fix #170 — sender churn DoS hardening (Option A).**
+ *     The original default (32) was vulnerable to cross-sender bucket
+ *     eviction by sender churn: a hostile actor can churn 33+ throwaway
+ *     transport pubkeys (cheap — Nostr signing keys are ephemeral) and
+ *     evict an honest sender's *whole* bucket. The honest sender's next
+ *     legitimate replay then re-runs the full §5.2 verifier (CAR-parse,
+ *     `pkg.verify()`) — exactly the attack Note N5 was meant to prevent.
+ *
+ *     Option A (chosen): increase the sender cap aggressively to 256.
+ *     Memory cost is bounded — at the new defaults, worst case is
+ *     `256 * 64 = 16384` entries × ~60-byte CID strings ≈ 960 KiB
+ *     resident, plus per-Map overhead. That is acceptable for an
+ *     interactive wallet whose entire process commonly holds >64 MiB
+ *     for token state and IndexedDB caches anyway. Senders we
+ *     legitimately interact with in any wall-clock window almost never
+ *     exceed a handful (a single user has perhaps tens of recurring
+ *     correspondents); 256 simply raises the cost-of-eviction far above
+ *     what an attacker can sustain on Nostr without saturating their
+ *     own publish pipeline.
+ *
+ *     We considered Option B (split into trusted-recently-seen and
+ *     untrusted-overflow buckets, where senders graduate to "trusted"
+ *     only after at least one successful verified-bundle observation)
+ *     and rejected it for now: the implementation cost (a separate
+ *     graduation tracker, dedicated overflow pool, and a different
+ *     eviction policy across the two pools) is non-trivial, and Option
+ *     A's straightforward cap raise solves the same attack at a memory
+ *     cost the wallet can afford. If future telemetry shows the 256
+ *     cap is regularly saturated by genuine traffic, Option B becomes
+ *     the right next move.
  *
  *   The two-tier policy (per-sender LRU within bucket, LRU across
  *   buckets at the sender-pubkey granularity) ensures the worst-case
  *   memory is bounded by `maxSenders * maxPerSender` entries.
  *
  * Memory bound (defaults):
- *   `maxSenders * maxPerSender = 32 * 64 = 2048` entries — safely above
- *   the spec's `REPLAY_LRU_SIZE` of 256 (the protocol's _flat_ target)
- *   without being unboundedly expensive. Each entry is a CID string
- *   (typically ~60 bytes), so worst case is ~120 KiB resident.
+ *   `maxSenders * maxPerSender = 256 * 64 = 16384` entries — well above
+ *   the spec's `REPLAY_LRU_SIZE` of 256 (the protocol's _flat_ target).
+ *   Each entry is a CID string (typically ~60 bytes), so worst case is
+ *   ~960 KiB resident — comfortably bounded.
  *
  * Thread safety:
  *   This implementation is single-threaded (Node.js / browser microtask
@@ -90,8 +115,17 @@ export const MAX_PER_SENDER = 64;
  * dropped to make room (the dropped sender's entries simply cease to
  * short-circuit on replay, which is correct per §5.6 — replay re-runs
  * §5.2 idempotently).
+ *
+ * **Steelman fix #170 — set to 256 (was 32).** A hostile actor can
+ * cheaply churn `maxSenders + 1` ephemeral Nostr transport pubkeys and
+ * evict an honest sender's whole bucket; the honest sender's next
+ * replay then re-runs the §5.2 verifier — exactly the attack Note N5
+ * was meant to prevent. Raising the cap to 256 multiplies the attacker's
+ * key-churn cost by 8× while keeping worst-case memory at ~960 KiB
+ * (256 × 64 entries × ~60-byte CID strings). See the module-level docs
+ * for the Option A vs Option B trade-off rationale.
  */
-export const MAX_SENDERS = 32;
+export const MAX_SENDERS = 256;
 
 /**
  * Steelman fix: canonicalize sender pubkey before keying the LRU

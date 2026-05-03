@@ -36,6 +36,70 @@ import {
 export { POLLING_WINDOW_MS, MIN_POLL_ATTEMPTS, BACKOFF_SCHEDULE_MS };
 
 // =============================================================================
+// 0. Wave 3 steelman fix — clock-skew defense
+// =============================================================================
+
+/**
+ * Hard ceiling on the number of poll attempts a single queue entry
+ * may accumulate, regardless of wall-clock readings. Acts as a
+ * **secondary safety net** alongside the W26 2× wall-clock ceiling so
+ * that a backwards-stepping or stalled wall-clock cannot prevent
+ * termination. Both safety nets must fail simultaneously for polling
+ * to continue indefinitely.
+ *
+ * Sizing rationale: with the spec defaults (BACKOFF tail-clamps at
+ * 300s after 5 entries) reaching 60 minutes (W26's safety net) takes
+ * ~12-14 honest attempts. We pick **200** to give a comfortable
+ * 14× margin over the natural attempt count — far enough that a
+ * legitimate slow aggregator never trips it, but small enough that a
+ * pathological clock-skew loop terminates within minutes of CPU work.
+ *
+ * The constant is exported so production wiring and tests can both
+ * reference the canonical value. See {@link isPollingTimedOut}.
+ */
+export const MAX_POLL_ATTEMPTS_HARD_CEILING = 200;
+
+/**
+ * Monotonic-clock helper. Returns `performance.now()` (a high-
+ * resolution monotonic clock unaffected by wall-clock adjustments such
+ * as NTP backwards-steps, host suspend/resume, or container clock
+ * drift) when available, falling back to `Date.now()` only on
+ * environments that lack `performance` (very old runtimes / non-
+ * standard sandboxes).
+ *
+ * **Why callers SHOULD use this**: `Date.now()` deltas are unsafe for
+ * timeout enforcement under any scenario where the OS clock can move
+ * backwards or pause:
+ *   - NTP correction stepping backwards by minutes;
+ *   - Host suspend/resume losing wall-clock progress;
+ *   - Containers booted from a snapshotted image where the clock
+ *     hasn't yet been re-synced.
+ * Each of these can make `now - startedAt` negative, freezing the
+ * elapsed counter at 0 (per the defensive coercion in
+ * {@link isPollingTimedOut}) and letting the worker poll past the W26
+ * hard safety net indefinitely. `performance.now()` is monotonic by
+ * specification — it never moves backwards.
+ *
+ * Pure read; no side effects.
+ *
+ * @returns A monotonic-millisecond timestamp suitable for elapsed-time
+ *          subtraction. Compare ONLY against values from the same
+ *          source (do not mix `getMonotonicNowMs()` and `Date.now()`
+ *          in the same calculation — their epochs are incomparable).
+ */
+export function getMonotonicNowMs(): number {
+  // Defensive `typeof` check — Node 16+ and all modern browsers
+  // provide `performance` globally, but we MUST NOT crash if a
+  // non-standard sandbox lacks it. Falling back to `Date.now()`
+  // restores the previous (skew-vulnerable) behavior gracefully; the
+  // attempt-count secondary safety net still bounds termination.
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+// =============================================================================
 // 1. Validity rule
 // =============================================================================
 
@@ -150,6 +214,12 @@ export function getBackoffMs(attemptIndex: number): number {
  *  - `'safety-net-fired'`              — §5.5 step 6's hard safety net:
  *      `now - startedAt >= 2 * POLLING_WINDOW_MS`, regardless of
  *      attempts — guarantees termination.
+ *  - `'attempt-ceiling-fired'`         — Wave 3 steelman secondary
+ *      safety net: `attempts >= MAX_POLL_ATTEMPTS_HARD_CEILING`,
+ *      regardless of wall-clock. Defends against backwards-step /
+ *      stalled wall-clock scenarios (NTP correction, host suspend/
+ *      resume, container clock drift) where the elapsed coercion to 0
+ *      would otherwise let polling run indefinitely.
  *  - `'window-exceeded'`               — RESERVED for future variants
  *      where the deadline alone (without attempts) terminates. Not
  *      currently emitted by this implementation; declared so the union
@@ -159,6 +229,7 @@ export type PollingTimedOutReason =
   | 'continue'
   | 'attempts-met-and-window-exceeded'
   | 'safety-net-fired'
+  | 'attempt-ceiling-fired'
   | 'window-exceeded';
 
 /** Result of {@link isPollingTimedOut}. */
@@ -172,9 +243,20 @@ export interface IsPollingTimedOutResult {
 /**
  * Decide whether a polling loop should terminate per §5.5 step 6.
  *
- * Two termination conditions, evaluated in priority order:
+ * Three termination conditions, evaluated in priority order:
  *
- *  1. **Hard safety net (W26)** — if `(now - startedAt) >=
+ *  1. **Attempt-count ceiling (Wave 3 steelman secondary safety net)**
+ *     — if `attempts >= MAX_POLL_ATTEMPTS_HARD_CEILING`, terminate
+ *     regardless of wall-clock. This safety net is independent of the
+ *     clock entirely, so a wall-clock that's been NTP-corrected
+ *     backwards, paused by suspend/resume, or otherwise stalled cannot
+ *     prevent termination. Both this AND the W26 wall-clock safety net
+ *     would have to fail simultaneously (i.e., the worker polls fewer
+ *     than `MAX_POLL_ATTEMPTS_HARD_CEILING` times AND the wall-clock
+ *     reads less than 2× the window) to allow indefinite polling.
+ *     Evaluated FIRST so it short-circuits any clock-derived path.
+ *
+ *  2. **Hard wall-clock safety net (W26)** — if `(now - startedAt) >=
  *     2 * POLLING_WINDOW_MS`, terminate regardless of attempts. The
  *     protocol mandates: *"As a hard safety net regardless of
  *     configuration, the worker SHALL also stop after 2 ×
@@ -182,29 +264,34 @@ export interface IsPollingTimedOutResult {
  *     if MIN_POLL_ATTEMPTS was not reached — termination is
  *     guaranteed."* Default firing time: **60 minutes**.
  *
- *  2. **Normal termination** — `attempts >= MIN_POLL_ATTEMPTS` AND
+ *  3. **Normal termination** — `attempts >= MIN_POLL_ATTEMPTS` AND
  *     `(now - startedAt) >= POLLING_WINDOW_MS`. Both conditions are
  *     necessary; either alone keeps polling.
  *
  * Pure function. No side effects. The clock is dependency-injected via
  * the `now` parameter so callers can run deterministic-clock fault
- * injection in tests.
+ * injection in tests. Callers SHOULD pass a monotonic-clock value via
+ * {@link getMonotonicNowMs} to defeat wall-clock skew at the source —
+ * the attempt-count ceiling is a backstop, not a substitute.
  *
  * **Edge cases**:
  *  - `now < startedAt` (negative elapsed) — treated as `elapsed = 0`;
- *    never timed out. Defensive against caller clock drift; does not
- *    swallow a genuine zero-duration poll budget (callers using a
- *    finite POLLING_WINDOW_MS will eventually exit normally).
+ *    the wall-clock branches never declare timeout. The attempt-count
+ *    ceiling will eventually terminate the poll loop independently.
  *  - `attempts < 0` — coerced to `0` for the comparison; no early
  *    termination.
  *  - `attempts === MIN_POLL_ATTEMPTS` exactly AND elapsed exactly
  *    equals `POLLING_WINDOW_MS` — terminates (`>=` semantics).
+ *  - `attempts === MAX_POLL_ATTEMPTS_HARD_CEILING` exactly — terminates
+ *    via the attempt-count ceiling (`>=` semantics).
  *
- * @param startedAt Wall-clock ms timestamp of the most-recent successful
- *                  submit (NOT the queue-entry `createdAt` — see §5.5
- *                  step 6 rationale).
- * @param now       Current wall-clock ms timestamp. Caller-supplied so
- *                  unit tests can advance time deterministically.
+ * @param startedAt Timestamp (preferably monotonic — see
+ *                  {@link getMonotonicNowMs}) of the most-recent
+ *                  successful submit (NOT the queue-entry `createdAt`
+ *                  — see §5.5 step 6 rationale).
+ * @param now       Current timestamp. Caller-supplied so unit tests
+ *                  can advance time deterministically. SHOULD come
+ *                  from the same clock source as `startedAt`.
  * @param attempts  Count of polls that returned a verifiable
  *                  proof-status. Transient errors do NOT count.
  * @returns `{ timedOut, reason }`.
@@ -224,12 +311,22 @@ export function isPollingTimedOut(
   const attemptsClamped =
     Number.isFinite(attempts) && attempts > 0 ? attempts : 0;
 
-  // (1) Hard safety net — fires regardless of attempts.
+  // (1) Wave 3 steelman secondary safety net — fires from attempt
+  // count alone, independent of any clock reading. Evaluated first so
+  // a backwards-stepping or stalled wall-clock cannot defer this
+  // termination. Termination is guaranteed if EITHER this OR the wall-
+  // clock safety net fires; both must remain unfired indefinitely for
+  // the poll loop to run forever.
+  if (attemptsClamped >= MAX_POLL_ATTEMPTS_HARD_CEILING) {
+    return { timedOut: true, reason: 'attempt-ceiling-fired' };
+  }
+
+  // (2) Hard wall-clock safety net — fires regardless of attempts.
   if (elapsed >= safetyNetMs) {
     return { timedOut: true, reason: 'safety-net-fired' };
   }
 
-  // (2) Normal termination — both conditions required.
+  // (3) Normal termination — both conditions required.
   if (attemptsClamped >= MIN_POLL_ATTEMPTS && elapsed >= windowMs) {
     return { timedOut: true, reason: 'attempts-met-and-window-exceeded' };
   }

@@ -79,7 +79,9 @@ describe('reresolveNametag — happy path', () => {
       transport,
     );
 
-    expect(result).toEqual({ nametag: 'alice', source: 'binding-event' });
+    expect(result).toMatchObject({ nametag: 'alice', source: 'binding-event' });
+    expect(result.peerInfo).not.toBeNull();
+    expect(result.peerInfo?.nametag).toBe('alice');
   });
 
   it('queries the registry by the AUTHENTICATED senderPubkey, not the payload claim', async () => {
@@ -119,13 +121,13 @@ describe('reresolveNametag — forged-payload defense (C9)', () => {
   it('binding nametag wins even when payload nametag is empty', async () => {
     const transport = makeTransport(async () => peerInfo({ nametag: 'bob' }));
     const result = await reresolveNametag(SENDER_PUBKEY, '', transport);
-    expect(result).toEqual({ nametag: 'bob', source: 'binding-event' });
+    expect(result).toMatchObject({ nametag: 'bob', source: 'binding-event' });
   });
 
   it('binding nametag wins even when payload nametag is undefined', async () => {
     const transport = makeTransport(async () => peerInfo({ nametag: 'bob' }));
     const result = await reresolveNametag(SENDER_PUBKEY, undefined, transport);
-    expect(result).toEqual({ nametag: 'bob', source: 'binding-event' });
+    expect(result).toMatchObject({ nametag: 'bob', source: 'binding-event' });
   });
 });
 
@@ -225,7 +227,7 @@ describe('reresolveNametag — exception safety', () => {
 
     await expect(
       reresolveNametag(SENDER_PUBKEY, 'alice', transport),
-    ).resolves.toEqual({ nametag: null, source: 'untrusted-payload' });
+    ).resolves.toMatchObject({ nametag: null, source: 'untrusted-payload' });
   });
 
   it('does not throw when transport throws null', async () => {
@@ -237,7 +239,7 @@ describe('reresolveNametag — exception safety', () => {
 
     await expect(
       reresolveNametag(SENDER_PUBKEY, 'alice', transport),
-    ).resolves.toEqual({ nametag: null, source: 'untrusted-payload' });
+    ).resolves.toMatchObject({ nametag: null, source: 'untrusted-payload' });
   });
 });
 
@@ -323,5 +325,103 @@ describe('resolveSenderInfoViaBinding', () => {
     expect(result.senderAddress).toBeUndefined();
     expect(result.senderNametag).toBeUndefined();
     expect(result.senderNametagSource).toBe('untrusted-payload');
+  });
+});
+
+// =============================================================================
+// 8. Wave 3 / steelman: TOCTOU defense — single PeerInfo snapshot
+// =============================================================================
+
+describe('resolveSenderInfoViaBinding — single-snapshot TOCTOU defense', () => {
+  it('reads nametag and directAddress from the SAME peerInfo snapshot', async () => {
+    // The previous implementation called `resolveTransportPubkeyInfo`
+    // TWICE: once for nametag, once for directAddress. A relay-side
+    // actor could splice (nametag T0, directAddress T1) into the
+    // result. Wave 3 fix: single call, both fields read from one
+    // snapshot.
+    const fn = vi.fn(async () =>
+      peerInfo({ nametag: 'alice', directAddress: 'DIRECT://alice-real' }),
+    );
+    const transport: NametagResolver = { resolveTransportPubkeyInfo: fn };
+
+    const result = await resolveSenderInfoViaBinding(
+      SENDER_PUBKEY,
+      'alice',
+      transport,
+    );
+
+    expect(result.senderNametag).toBe('alice');
+    expect(result.senderAddress).toBe('DIRECT://alice-real');
+    expect(result.senderNametagSource).toBe('binding-event');
+    // Critical regression: only ONE call to the registry. Two calls
+    // re-open the TOCTOU window.
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to splice nametag + address from different snapshots', async () => {
+    // Simulate the attack: each call returns a different snapshot
+    // (different directAddress). With the fix in place, only the
+    // FIRST snapshot is read; the attacker's second snapshot never
+    // gets a chance to substitute its address.
+    let callCount = 0;
+    const fn = vi.fn(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return peerInfo({ nametag: 'alice', directAddress: 'DIRECT://alice-real' });
+      }
+      // Hypothetical post-TOCTOU snapshot from a hostile relay.
+      return peerInfo({ nametag: 'alice', directAddress: 'DIRECT://attacker' });
+    });
+    const transport: NametagResolver = { resolveTransportPubkeyInfo: fn };
+
+    const result = await resolveSenderInfoViaBinding(
+      SENDER_PUBKEY,
+      'alice',
+      transport,
+    );
+
+    // Address MUST come from the same snapshot as nametag — the
+    // first-snapshot value, NOT the attacker's second snapshot.
+    expect(result.senderAddress).toBe('DIRECT://alice-real');
+    expect(result.senderAddress).not.toBe('DIRECT://attacker');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT call the registry a second time even when address is needed', async () => {
+    const fn = vi.fn(async () =>
+      peerInfo({ nametag: 'bob', directAddress: 'DIRECT://bob' }),
+    );
+    const transport: NametagResolver = { resolveTransportPubkeyInfo: fn };
+
+    await resolveSenderInfoViaBinding(SENDER_PUBKEY, undefined, transport);
+
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('peerInfo is null when binding lookup fails', async () => {
+    const transport = makeTransport(async () => null);
+    const result = await reresolveNametag(SENDER_PUBKEY, 'alice', transport);
+    expect(result.peerInfo).toBeNull();
+  });
+
+  it('peerInfo is null when binding lookup throws', async () => {
+    const transport = makeTransport(async () => {
+      throw new Error('network failure');
+    });
+    const result = await reresolveNametag(SENDER_PUBKEY, 'alice', transport);
+    expect(result.peerInfo).toBeNull();
+  });
+
+  it('peerInfo carries the same snapshot when binding succeeds', async () => {
+    const snapshot = peerInfo({
+      nametag: 'alice',
+      directAddress: 'DIRECT://alice',
+    });
+    const transport = makeTransport(async () => snapshot);
+
+    const result = await reresolveNametag(SENDER_PUBKEY, 'alice', transport);
+
+    expect(result.peerInfo).toBe(snapshot);
+    expect(result.peerInfo?.directAddress).toBe('DIRECT://alice');
   });
 });

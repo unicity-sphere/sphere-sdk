@@ -465,17 +465,22 @@ describe('resolveDelivery — CAR-inline fallback when publishToIpfs absent', ()
     }
   });
 
-  it('force-cid + no publisher + small bundle → falls back to inline', async () => {
+  // **Steelman fix (Wave 3) — force-cid privacy regression hardening.**
+  // Earlier behavior: `force-cid` + no publisher silently downgraded to
+  // inline delivery for any bundle <= RELAY_SAFE_CAP_BYTES. That defeats
+  // the point of force-cid (which signals an explicit privacy intent —
+  // CID-only, no inline relay leak). The resolver now hard-fails with
+  // `FORCE_CID_NO_PUBLISHER` regardless of bundle size; the caller must
+  // wire a publisher or pick a different strategy.
+  it('force-cid + no publisher + small bundle → throws FORCE_CID_NO_PUBLISHER (no silent downgrade)', async () => {
     const carBytes = makeCarBytes(1024); // tiny bundle, force-cid still triggers CID branch
-    const decision = await resolveDelivery({
-      strategy: { kind: 'force-cid' },
-      carBytes,
-      // publishToIpfs intentionally absent
-    });
-    expect(decision.kind).toBe('inline');
-    if (decision.kind === 'inline') {
-      expect(decision.carBase64).toBe(carBytesToBase64(carBytes));
-    }
+    await expect(
+      resolveDelivery({
+        strategy: { kind: 'force-cid' },
+        carBytes,
+        // publishToIpfs intentionally absent
+      }),
+    ).rejects.toMatchObject({ code: 'FORCE_CID_NO_PUBLISHER' });
   });
 
   it('auto + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
@@ -490,7 +495,9 @@ describe('resolveDelivery — CAR-inline fallback when publishToIpfs absent', ()
     ).rejects.toMatchObject({ code: 'IPFS_PUBLISHER_REQUIRED' });
   });
 
-  it('force-cid + no publisher + oversized bundle → throws IPFS_PUBLISHER_REQUIRED', async () => {
+  it('force-cid + no publisher + oversized bundle → throws FORCE_CID_NO_PUBLISHER', async () => {
+    // Steelman Wave 3: force-cid hard-fails regardless of size — the
+    // failure code is the privacy-intent code, not the size-cap code.
     const carBytes = makeCarBytes(RELAY_SAFE_CAP_BYTES + 1);
     await expect(
       resolveDelivery({
@@ -498,7 +505,7 @@ describe('resolveDelivery — CAR-inline fallback when publishToIpfs absent', ()
         carBytes,
         // publishToIpfs intentionally absent
       }),
-    ).rejects.toMatchObject({ code: 'IPFS_PUBLISHER_REQUIRED' });
+    ).rejects.toMatchObject({ code: 'FORCE_CID_NO_PUBLISHER' });
   });
 
   it('auto + no publisher + bundle at exact RELAY_SAFE_CAP_BYTES boundary → inline', async () => {

@@ -120,6 +120,14 @@ export interface CascadeManifestScanner {
    * (stale results merely defer cascade work to a subsequent worker
    * pass; missing results are forensically recoverable via the operator
    * `revalidateCascadedChildren()` path).
+   *
+   * **Failure semantics**: a thrown error is NOT swallowed. The walker
+   * increments {@link CascadeResult.scannerErrors}, invokes
+   * {@link CascadeWalkerOptions.onScannerError} with
+   * `phase: 'find-children'`, logs to `console.warn`, and aborts the
+   * branch (children below `parentTokenId` remain un-cascaded for THIS
+   * pass). The operator's `revalidateCascadedChildren()` path is the
+   * recovery channel.
    */
   findChildren(
     addr: string,
@@ -179,6 +187,33 @@ export interface CascadeCycleWarning {
 }
 
 /**
+ * Scanner-error warning shape passed to
+ * {@link CascadeWalkerOptions.onScannerError}.
+ *
+ *  - `phase: 'find-children'` — `manifestScanner.findChildren()` threw.
+ *    The cascade walk for that branch aborted with no further recursion;
+ *    children below that node remain un-cascaded. Operators may invoke
+ *    `revalidateCascadedChildren()` later to recover the missed branch.
+ *  - `phase: 'find-outbox-entries'` — `outboxScanner.findEntriesByTokenId()`
+ *    threw. The outbox notification for `tokenId` was skipped; the
+ *    cascade walk continued for OTHER children. Operators may inspect
+ *    the outbox manually to identify shipments that did not receive a
+ *    `transfer:cascade-failed` event.
+ *
+ * The walker increments the {@link CascadeResult.scannerErrors} counter
+ * AND invokes this callback on every such error so operators can wire
+ * alerts. Critical because cascade is the load-bearing defense against
+ * parent-recipient-rejected token spending — silent scanner failures
+ * leave child tokens marked `valid` while their parent is `_invalid`.
+ */
+export interface CascadeScannerError {
+  readonly addr: string;
+  readonly tokenId: string;
+  readonly phase: 'find-children' | 'find-outbox-entries';
+  readonly error: unknown;
+}
+
+/**
  * Construction options for {@link CascadeWalker}. All external
  * dependencies are injected so unit tests can drive the walker against
  * deterministic fakes without spinning up OrbitDB or the outbox store.
@@ -203,6 +238,18 @@ export interface CascadeWalkerOptions {
    * tests to assert the W32 invariant fires.
    */
   readonly onCycleDetected?: (warning: CascadeCycleWarning) => void;
+  /**
+   * Optional callback invoked when an injected scanner throws
+   * (`manifestScanner.findChildren()` or
+   * `outboxScanner.findEntriesByTokenId()`). Defaults to a no-op; the
+   * walker still increments {@link CascadeResult.scannerErrors} and
+   * logs to `console.warn`. Operators wire this to push to their alert
+   * pipeline because a swallowed scanner error means a child remained
+   * `valid` while its parent flipped to `_invalid` — a security-critical
+   * regression that the receiver-side cascade is the load-bearing
+   * defense against.
+   */
+  readonly onScannerError?: (error: CascadeScannerError) => void;
   /**
    * Optional override of the chain-depth bound. Defaults to
    * {@link MAX_CHAIN_DEPTH} (64). Tests use a small value to exercise
@@ -250,6 +297,18 @@ export interface CascadeWalkerOptions {
  *                       `nftNotified + outboxNotified` and break out
  *                       silent-vs-instant via this counter when the UI
  *                       split matters. Issue #167.
+ *  - `scannerErrors`  — number of times an injected scanner
+ *                       (`findChildren` / `findEntriesByTokenId`) threw
+ *                       and the walker had to abort that branch /
+ *                       outbox-notification. Surface this counter +
+ *                       wire {@link CascadeWalkerOptions.onScannerError}
+ *                       to alerting; a non-zero value is a forensic
+ *                       signal that the cascade is incomplete and the
+ *                       operator should run
+ *                       `revalidateCascadedChildren()` against the
+ *                       parent. Critical because cascade is the
+ *                       load-bearing defense against
+ *                       parent-recipient-rejected token spending.
  */
 export interface CascadeResult {
   readonly cascaded: number;
@@ -258,6 +317,7 @@ export interface CascadeResult {
   readonly parentFlipAborted: number;
   readonly cycleDefenseFired: number;
   readonly silentNotified: number;
+  readonly scannerErrors: number;
 }
 
 // =============================================================================
@@ -432,11 +492,36 @@ export class CascadeWalker {
         addr,
         currentTokenId,
       );
-    } catch {
-      // Defensive: if the scanner throws (e.g. transient backend error),
-      // we abort this branch rather than letting the failure abort the
-      // whole cascade. The operator's `revalidateCascadedChildren()`
-      // path can recover later if needed.
+    } catch (err) {
+      // CRITICAL — surface scanner errors. Cascade is the load-bearing
+      // defense against parent-recipient-rejected token spending; a
+      // silently-swallowed `findChildren` failure leaves child tokens
+      // marked `valid` while the parent is `_invalid`. We:
+      //   1. Increment `scannerErrors` so the caller sees a non-zero
+      //      result and can decide to retry / alert.
+      //   2. Invoke `onScannerError` so operators can wire their alert
+      //      pipeline to this signal directly.
+      //   3. Log to `console.warn` as a last-resort breadcrumb.
+      //   4. Abort THIS branch (children below `currentTokenId` won't be
+      //      cascaded). The operator's `revalidateCascadedChildren()`
+      //      path is the recovery channel.
+      counters.scannerErrors++;
+      this._emitScannerError({
+        addr,
+        tokenId: currentTokenId,
+        phase: 'find-children',
+        error: err,
+      });
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[cascade-walker] findChildren failed for',
+          { addr, tokenId: currentTokenId },
+          err,
+        );
+      } catch {
+        // ignore logging failures
+      }
       return;
     }
 
@@ -451,6 +536,19 @@ export class CascadeWalker {
     for (const childTokenId of sortedChildren) {
       // Cycle defense: skip already-visited tokens. Per §6.1.1:
       // "MUST maintain a visited set during transitive recursion".
+      // Cycles are defended primarily via the cascade ROOT being added
+      // to `visited` at function entry — descendants walking back to
+      // the root will see it in `visited`. We DO NOT mark the child
+      // here; we mark only AFTER a successful cascade write (below).
+      // Rationale: if `_cascadeChildWithParentFlipCheck` returns
+      // `'parent-flipped'`, the child has NOT been mutated. Marking it
+      // visited here would mean a re-cascade in a SUBSEQUENT walker
+      // pass (after the parent flips back to `_invalid` again) would
+      // skip this child within the same walk lifetime — leaving it
+      // permanently uncascaded for this pass. Moving the mark after
+      // the successful write keeps cycle defense intact (the root is
+      // still the breaker) while letting transient parent-flip aborts
+      // be re-attempted on the next worker pass.
       if (visited.has(childTokenId)) {
         counters.cycleDefenseFired++;
         this._emitCycleWarning({
@@ -462,7 +560,6 @@ export class CascadeWalker {
         });
         continue;
       }
-      visited.add(childTokenId);
 
       // Apply the cascade to this child. The CAS payload computation
       // re-reads the parent (W27 parent-flip protection); on parent
@@ -481,18 +578,32 @@ export class CascadeWalker {
         // Do NOT recurse — the parent is no longer rejected, so the
         // child's children's cascade would be stale too. Skip the
         // whole subtree.
+        // Critically: we do NOT add `childTokenId` to `visited` here.
+        // If the parent flips back to `_invalid` later (e.g. operator
+        // override revoked, or another cascade event re-fires the
+        // rejection), the next walker pass MUST be free to re-attempt
+        // the cascade on this child. Cycle defense is preserved by
+        // the root membership in `visited`.
         continue;
       }
       if (writeResult === 'no-entry' || writeResult === 'cas-exhausted') {
         // No-op for missing entries; CAS-exhausted means contention
         // we can't resolve in this pass — operator will need to
         // re-trigger via `revalidateCascadedChildren()` if they want
-        // to fix this branch.
+        // to fix this branch. Same rationale as parent-flipped: don't
+        // mark visited (we want subsequent passes to re-attempt).
         continue;
       }
 
       // Successfully cascaded — count it and emit cascade-failed for
-      // any outbox entries referencing this child.
+      // any outbox entries referencing this child. Now safe to mark
+      // visited: the child has been mutated to `_invalid`, so any
+      // re-walk in this pass (e.g. via a corrupted-cycle path) would
+      // be a no-op (the idempotency branch in `_cascadeChildWithParentFlipCheck`
+      // would short-circuit). Marking it here also prevents redundant
+      // work for legitimate DAG joins.
+      visited.add(childTokenId);
+
       counters.cascaded++;
       const tally = await this._emitCascadeFailedForOutboxEntries(
         childTokenId,
@@ -500,6 +611,9 @@ export class CascadeWalker {
       );
       counters.outboxNotified += tally.emitted;
       counters.silentNotified += tally.silent;
+      if (tally.scannerError) {
+        counters.scannerErrors++;
+      }
 
       // Recurse into the child's children (transitive cascade).
       await this._walkCoinChildren(
@@ -676,6 +790,9 @@ export class CascadeWalker {
     );
     counters.nftNotified = tally.emitted;
     counters.silentNotified += tally.silent;
+    if (tally.scannerError) {
+      counters.scannerErrors++;
+    }
     return freezeCounters(counters);
   }
 
@@ -710,14 +827,36 @@ export class CascadeWalker {
   private async _emitCascadeFailedForOutboxEntries(
     tokenId: string,
     rootReason: DispositionReason,
-  ): Promise<{ readonly emitted: number; readonly silent: number }> {
+  ): Promise<{
+    readonly emitted: number;
+    readonly silent: number;
+    readonly scannerError: boolean;
+  }> {
     let entries: ReadonlyArray<UxfTransferOutboxEntry>;
     try {
       entries = await this.options.outboxScanner.findEntriesByTokenId(tokenId);
-    } catch {
-      // Defensive: if the scanner throws, skip notification rather
-      // than aborting the whole cascade.
-      return { emitted: 0, silent: 0 };
+    } catch (err) {
+      // Surface outbox scanner failures alongside manifest scanner
+      // failures: increment counter, invoke callback, log breadcrumb.
+      // Skip notification for THIS tokenId; the cascade walk continues
+      // for other children.
+      this._emitScannerError({
+        addr: '', // outbox scanner is address-scoped at construction
+        tokenId,
+        phase: 'find-outbox-entries',
+        error: err,
+      });
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[cascade-walker] findEntriesByTokenId failed for',
+          { tokenId },
+          err,
+        );
+      } catch {
+        // ignore logging failures
+      }
+      return { emitted: 0, silent: 0, scannerError: true };
     }
 
     let emitted = 0;
@@ -753,13 +892,24 @@ export class CascadeWalker {
       emitted++;
       if (!isInstant) silent++;
     }
-    return { emitted, silent };
+    return { emitted, silent, scannerError: false };
   }
 
   /** @internal */
   private _emitCycleWarning(warning: CascadeCycleWarning): void {
     if (this.options.onCycleDetected !== undefined) {
       this.options.onCycleDetected(warning);
+    }
+  }
+
+  /** @internal */
+  private _emitScannerError(error: CascadeScannerError): void {
+    if (this.options.onScannerError !== undefined) {
+      try {
+        this.options.onScannerError(error);
+      } catch {
+        // Callback failures must not abort the cascade. Defensive.
+      }
     }
   }
 }
@@ -775,6 +925,7 @@ interface MutableCounters {
   parentFlipAborted: number;
   cycleDefenseFired: number;
   silentNotified: number;
+  scannerErrors: number;
 }
 
 function mutableCounters(): MutableCounters {
@@ -785,6 +936,7 @@ function mutableCounters(): MutableCounters {
     parentFlipAborted: 0,
     cycleDefenseFired: 0,
     silentNotified: 0,
+    scannerErrors: 0,
   };
 }
 
@@ -796,6 +948,7 @@ function freezeCounters(c: MutableCounters): CascadeResult {
     parentFlipAborted: c.parentFlipAborted,
     cycleDefenseFired: c.cycleDefenseFired,
     silentNotified: c.silentNotified,
+    scannerErrors: c.scannerErrors,
   };
 }
 
@@ -806,6 +959,7 @@ const EMPTY_RESULT: CascadeResult = Object.freeze({
   parentFlipAborted: 0,
   cycleDefenseFired: 0,
   silentNotified: 0,
+  scannerErrors: 0,
 });
 
 /**

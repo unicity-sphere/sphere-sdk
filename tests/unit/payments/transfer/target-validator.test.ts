@@ -428,8 +428,61 @@ describe('validateTargets — INSUFFICIENT_BALANCE reason="nft-not-owned"', () =
       () => validateTargets(req, sources),
       'INSUFFICIENT_BALANCE',
     );
-    const cause = (err as Error & { cause?: { reason?: string } }).cause;
+    const cause = (err as Error & { cause?: { reason?: string; cause?: string } })
+      .cause;
     expect(cause?.reason).toBe('nft-not-owned');
+  });
+
+  // Wave 3 steelman fix #170 issue 4 — the 'not-bound' disambiguation
+  // branch in `findNftSource` was dead code before the fix because
+  // `partitionSources` dropped tokens with `ownedBySender === false`
+  // BEFORE the candidate walk. Passing the unfiltered availableSources
+  // list to `findNftSource` lets the branch fire — users who attempt
+  // to send a token they own a different copy of now see the correct
+  // `cause: 'not-bound'` disambiguator instead of `'not-found'`.
+  it('surfaces cause="not-bound" disambiguator when NFT exists with ownedBySender=false (#170 issue 4)', () => {
+    const req: TransferRequest = {
+      recipient: '@bob',
+      coinId: 'UCT',
+      amount: '1',
+      additionalAssets: [{ kind: 'nft', tokenId: '0xabc' }],
+    };
+    // The token exists in the pool but the current-state predicate
+    // does NOT bind to sender (ownedBySender=false).
+    const sources = [
+      coinToken('A', [['UCT', 100n]]),
+      nftToken('0xabc', { ownedBySender: false }),
+    ];
+    const err = expectSphereCode(
+      () => validateTargets(req, sources),
+      'INSUFFICIENT_BALANCE',
+    );
+    const cause = (err as Error & {
+      cause?: { reason?: string; cause?: string };
+    }).cause;
+    expect(cause?.reason).toBe('nft-not-owned');
+    // Post-fix: the disambiguator MUST be 'not-bound' (not 'not-found')
+    // — the token is in the pool, just not bound to sender.
+    expect(cause?.cause).toBe('not-bound');
+  });
+
+  it('still surfaces cause="not-found" when NFT really is absent (#170 issue 4 — regression)', () => {
+    const req: TransferRequest = {
+      recipient: '@bob',
+      coinId: 'UCT',
+      amount: '1',
+      additionalAssets: [{ kind: 'nft', tokenId: '0xMISSING' }],
+    };
+    const sources = [coinToken('A', [['UCT', 100n]])];
+    const err = expectSphereCode(
+      () => validateTargets(req, sources),
+      'INSUFFICIENT_BALANCE',
+    );
+    const cause = (err as Error & {
+      cause?: { reason?: string; cause?: string };
+    }).cause;
+    expect(cause?.reason).toBe('nft-not-owned');
+    expect(cause?.cause).toBe('not-found');
   });
 
   // §11.2 case 8 — NFT target's source is a coin token.

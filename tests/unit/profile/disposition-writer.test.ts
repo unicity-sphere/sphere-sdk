@@ -24,6 +24,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   DispositionWriter,
+  MAX_AUDIT_BUNDLE_CIDS,
   auditKeyFor,
   invalidKeyFor,
   mergeAuditEntry,
@@ -57,10 +58,12 @@ import type { ContentHash } from '../../../uxf/types.js';
 const ADDR = 'DIRECT_aabbcc_ddeeff';
 const TOKEN_A = '0xtokenA';
 const TOKEN_B = '0xtokenB';
-const HASH_X = 'x'.repeat(64);
-const HASH_Y = 'y'.repeat(64);
-const ROOT = 'r'.repeat(64);
-const ROOT_2 = 's'.repeat(64);
+// Wave 3 steelman: writer now validates observedTokenContentHash is canonical
+// 64-char hex. Fixture constants therefore must be lowercase hex characters.
+const HASH_X = '12'.repeat(32);
+const HASH_Y = '34'.repeat(32);
+const ROOT = 'ab'.repeat(32);
+const ROOT_2 = 'cd'.repeat(32);
 const SENDER_PUBKEY = 'a'.repeat(64);
 const BUNDLE_CID_1 = 'bafy-bundle-1';
 const BUNDLE_CID_2 = 'bafy-bundle-2';
@@ -363,7 +366,12 @@ describe('DispositionWriter — INVALID disposition', () => {
         ADDR,
         invalidRecord({
           reason,
-          observedTokenContentHash: ch(reason.padEnd(64, '0')),
+          // Wave 3 steelman: writer validates 64-char hex; map the
+          // reason string to a canonical hex representation by replacing
+          // non-hex chars with '0'.
+          observedTokenContentHash: ch(
+            reason.toLowerCase().replace(/[^0-9a-f]/g, '0').padEnd(64, '0'),
+          ),
         }),
       );
       expect(recorder.events).toHaveLength(0);
@@ -945,5 +953,259 @@ describe('DispositionWriter.promoteAuditEntry — transactional invariant (#164)
     );
     expect(merged.auditStatus).toBe('audit-promoted');
     expect(merged.promotionPending).toBeUndefined();
+  });
+});
+
+// =============================================================================
+// 9. (Wave 3 steelman) bundleCidsObserved cap — DoS defense
+//
+// UXF bundle CIDs are content-addressed. A hostile sender varying CAR
+// padding mints distinct CIDs while triggering the same
+// (tokenId, observedTokenContentHash) audit observation; without a cap,
+// the on-disk audit blob grows linearly with attacker-controlled input.
+// `MAX_AUDIT_BUNDLE_CIDS` (32) bounds the cosmetic CID inventory; the
+// auditStatus / reason verdict is unaffected.
+// =============================================================================
+
+describe('mergeAuditEntry — bundleCidsObserved cap (Wave 3 steelman)', () => {
+  it('caps bundleCidsObserved at MAX_AUDIT_BUNDLE_CIDS', () => {
+    // Seed the existing record with N >> cap unique CIDs.
+    const N = MAX_AUDIT_BUNDLE_CIDS * 4;
+    const seed: string[] = Array.from({ length: N }, (_, i) =>
+      `bafy-cid-${String(i).padStart(6, '0')}`,
+    );
+    const prev: AuditEntry = {
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      auditStatus: 'audit-not-our-state',
+      reason: 'not-our-state',
+      recordedAt: 1_000,
+      bundleCidsObserved: seed,
+    };
+    const merged = mergeAuditEntry(
+      prev,
+      auditRecord({ bundleCid: 'bafy-cid-NEW' }),
+      9_999,
+    );
+    expect(merged.bundleCidsObserved.length).toBe(MAX_AUDIT_BUNDLE_CIDS);
+  });
+
+  it('cap retains the lex-min subset (deterministic across replicas)', () => {
+    // Build a randomized seed that spans below + above the cap when sorted.
+    const seed = ['z', 'y', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+      .concat(Array.from({ length: MAX_AUDIT_BUNDLE_CIDS }, (_, i) =>
+        `m-${String(i).padStart(3, '0')}`,
+      ));
+    const prev: AuditEntry = {
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      auditStatus: 'audit-not-our-state',
+      reason: 'not-our-state',
+      recordedAt: 1_000,
+      bundleCidsObserved: seed,
+    };
+    const merged = mergeAuditEntry(
+      prev,
+      auditRecord({ bundleCid: 'never-included-very-late-zzz' }),
+      9_999,
+    );
+    expect(merged.bundleCidsObserved.length).toBe(MAX_AUDIT_BUNDLE_CIDS);
+    // The merged set is sorted ASC and truncated to the first N — every
+    // entry should be lex-≤ every entry that did NOT make the cut.
+    const cidsArr = [...merged.bundleCidsObserved];
+    const sorted = [...cidsArr].sort();
+    expect(cidsArr).toEqual(sorted);
+    // The very late string should NOT have made the cap.
+    expect(cidsArr).not.toContain('never-included-very-late-zzz');
+  });
+
+  it('writer-level: 100 distinct re-arrivals leave bundleCidsObserved bounded', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const writer = makeWriter(perEntry, manifest, () => {});
+    for (let i = 0; i < 100; i++) {
+      await writer.write(
+        ADDR,
+        auditRecord({ bundleCid: `bafy-burst-${String(i).padStart(4, '0')}` }),
+      );
+    }
+    const key = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const stored = perEntry.store.get(key) as AuditEntry;
+    expect(stored.bundleCidsObserved.length).toBe(MAX_AUDIT_BUNDLE_CIDS);
+    // auditStatus / reason were NOT corrupted by the cap.
+    expect(stored.auditStatus).toBe('audit-not-our-state');
+    expect(stored.reason).toBe('not-our-state');
+  });
+
+  it('cap applies even when seed is exactly at the cap (no off-by-one)', () => {
+    const seed: string[] = Array.from({ length: MAX_AUDIT_BUNDLE_CIDS }, (_, i) =>
+      `bafy-${String(i).padStart(4, '0')}`,
+    );
+    const prev: AuditEntry = {
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      auditStatus: 'audit-not-our-state',
+      reason: 'not-our-state',
+      recordedAt: 1_000,
+      bundleCidsObserved: seed,
+    };
+    // A new arrival with a CID lex-greater than every seeded CID — it
+    // would be truncated.
+    const merged = mergeAuditEntry(
+      prev,
+      auditRecord({ bundleCid: 'zzzz-over-cap' }),
+      9_999,
+    );
+    expect(merged.bundleCidsObserved.length).toBe(MAX_AUDIT_BUNDLE_CIDS);
+    expect(merged.bundleCidsObserved).not.toContain('zzzz-over-cap');
+  });
+});
+
+// =============================================================================
+// 10. (Wave 3 steelman) Empty-tokenId routing — invalid-orphan / audit-orphan
+// =============================================================================
+
+describe('Empty tokenId routes to invalid-orphan / audit-orphan keyspace', () => {
+  it('invalidKeyFor("") returns ${addr}.invalid-orphan.${hash}', () => {
+    const k = invalidKeyFor(ADDR, '', ch(HASH_X));
+    expect(k).toBe(`${ADDR}.invalid-orphan.${HASH_X}`);
+    // Non-empty tokenId still uses the canonical 4-segment key.
+    const k2 = invalidKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    expect(k2).toBe(`${ADDR}.invalid.${TOKEN_A}.${HASH_X}`);
+  });
+
+  it('auditKeyFor("") returns ${addr}.audit-orphan.${hash}', () => {
+    const k = auditKeyFor(ADDR, '', ch(HASH_X));
+    expect(k).toBe(`${ADDR}.audit-orphan.${HASH_X}`);
+    const k2 = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    expect(k2).toBe(`${ADDR}.audit.${TOKEN_A}.${HASH_X}`);
+  });
+
+  it('two distinct empty-tokenId orphan records cannot collide with real-tokenId records', () => {
+    // Even when observedTokenContentHash is the same, the orphan and
+    // real keyspaces are disjoint.
+    const orphanKey = invalidKeyFor(ADDR, '', ch(HASH_X));
+    const realKey = invalidKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    expect(orphanKey).not.toBe(realKey);
+    // The orphan keyspace also doesn't bleed into the audit keyspace.
+    const auditOrphanKey = auditKeyFor(ADDR, '', ch(HASH_X));
+    expect(orphanKey).not.toBe(auditOrphanKey);
+  });
+
+  it('writeInvalid with empty tokenId routes to invalid-orphan keyspace', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const writer = makeWriter(perEntry, manifest, () => {});
+    await writer.write(
+      ADDR,
+      invalidRecord({ tokenId: '', observedTokenContentHash: ch(HASH_X) }),
+    );
+    const orphanKey = invalidKeyFor(ADDR, '', ch(HASH_X));
+    expect(orphanKey).toContain('invalid-orphan');
+    expect(perEntry.store.has(orphanKey)).toBe(true);
+    // Real-tokenId key path absent — orphan and real keyspaces disjoint.
+    const realKey = `${ADDR}.invalid..${HASH_X}`; // pre-fix collision shape
+    expect(perEntry.store.has(realKey)).toBe(false);
+  });
+
+  it('writeAudit with empty tokenId routes to audit-orphan keyspace', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const writer = makeWriter(perEntry, manifest, () => {});
+    await writer.write(
+      ADDR,
+      auditRecord({ tokenId: '', observedTokenContentHash: ch(HASH_X) }),
+    );
+    const orphanKey = auditKeyFor(ADDR, '', ch(HASH_X));
+    expect(orphanKey).toContain('audit-orphan');
+    expect(perEntry.store.has(orphanKey)).toBe(true);
+  });
+
+  it('two empty-tokenId invalid writes with the same hash do NOT corrupt a real-tokenId record', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const writer = makeWriter(perEntry, manifest, () => {});
+
+    // Step 1: write a real-tokenId invalid record.
+    await writer.write(
+      ADDR,
+      invalidRecord({
+        tokenId: TOKEN_A,
+        observedTokenContentHash: ch(HASH_X),
+        bundleCid: 'bafy-real-attacked-target',
+      }),
+    );
+    // Step 2: write two empty-tokenId records under the SAME observed
+    // content hash (the attack scenario from the steelman finding).
+    await writer.write(
+      ADDR,
+      invalidRecord({
+        tokenId: '',
+        observedTokenContentHash: ch(HASH_X),
+        bundleCid: 'bafy-orphan-1',
+        reason: 'structural',
+      }),
+    );
+    await writer.write(
+      ADDR,
+      invalidRecord({
+        tokenId: '',
+        observedTokenContentHash: ch(HASH_X),
+        bundleCid: 'bafy-orphan-2',
+        reason: 'structural',
+      }),
+    );
+    // Real record survives untouched.
+    const realKey = invalidKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const real = perEntry.store.get(realKey) as InvalidEntry | undefined;
+    expect(real).toBeDefined();
+    expect(real?.bundleCid).toBe('bafy-real-attacked-target');
+    expect(real?.tokenId).toBe(TOKEN_A);
+    // Orphan records are isolated under their own keyspace.
+    const orphanKey = invalidKeyFor(ADDR, '', ch(HASH_X));
+    const orphan = perEntry.store.get(orphanKey) as InvalidEntry | undefined;
+    expect(orphan).toBeDefined();
+    expect(orphan?.tokenId).toBe('');
+    // The two orphan writes do collapse onto the same orphan key — that
+    // is by design (idempotent for legitimate re-arrival; the latest
+    // write wins for forensic snapshot). Critically, neither overwrote
+    // the real record.
+  });
+
+  it('rejects non-canonical observedTokenContentHash with VALIDATION_ERROR', async () => {
+    const perEntry = new FakePerEntryStorage();
+    const manifest = new FakeManifestStorage();
+    const writer = makeWriter(perEntry, manifest, () => {});
+
+    // 64 chars but not hex (contains 'g').
+    const bogus = 'g'.repeat(64);
+    await expect(
+      writer.write(
+        ADDR,
+        invalidRecord({
+          observedTokenContentHash: ch(bogus),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // Wrong length — too short.
+    await expect(
+      writer.write(
+        ADDR,
+        invalidRecord({
+          observedTokenContentHash: ch('ab'.repeat(16)),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+
+    // Same checks on the audit path.
+    await expect(
+      writer.write(
+        ADDR,
+        auditRecord({
+          observedTokenContentHash: ch(bogus),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
   });
 });

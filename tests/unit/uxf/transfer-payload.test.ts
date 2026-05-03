@@ -519,6 +519,59 @@ describe('extractCarRootCid', () => {
       }
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Steelman Wave 3 — header-only fast path
+  // -------------------------------------------------------------------------
+  it('extracts root CID from a large CAR using header-only fast path', async () => {
+    // Build a large CAR that contains many additional blocks beyond the
+    // root. The fast path reads only the first ~4 KiB so it must succeed
+    // regardless of how many trailing blocks are present.
+    const rootPayload = new Uint8Array([0xaa, 0xbb, 0xcc]);
+    const rootCid = buildCid(rootPayload);
+    const { writer, out } = CarWriter.create([rootCid]);
+    const chunks: Uint8Array[] = [];
+    const collect = (async () => {
+      for await (const c of out) chunks.push(c);
+    })();
+    await writer.put({ cid: rootCid, bytes: rootPayload });
+    // Pile on trailing blocks. Each block is small (~512B) so 200 of
+    // them push the total CAR size to ~100 KiB — comfortably above the
+    // 4 KiB header probe slice. The fast path MUST still return the
+    // correct root without scanning every block.
+    for (let i = 0; i < 200; i++) {
+      const filler = new Uint8Array(512);
+      for (let j = 0; j < filler.length; j++) filler[j] = (i + j) & 0xff;
+      const fillerCid = buildCid(filler);
+      await writer.put({ cid: fillerCid, bytes: filler });
+    }
+    await writer.close();
+    await collect;
+
+    let total = 0;
+    for (const c of chunks) total += c.byteLength;
+    const carBytes = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      carBytes.set(c, off);
+      off += c.byteLength;
+    }
+
+    expect(carBytes.byteLength).toBeGreaterThan(4 * 1024);
+    const cidStr = await extractCarRootCid(carBytes);
+    expect(cidStr).toBe(rootCid.toString());
+  });
+
+  it('falls back to full reader when fast-path probe is insufficient', async () => {
+    // Standard small valid single-root CAR — the fast path will succeed
+    // here too, but this test specifically exercises the size threshold:
+    // CARs smaller than the probe size skip the fast path entirely and
+    // hit the slow path. We assert behaviour parity (same CID returned).
+    const { bytes, rootCids } = await buildCar([new Uint8Array([0x01])]);
+    expect(bytes.byteLength).toBeLessThan(4 * 1024);
+    const cidStr = await extractCarRootCid(bytes);
+    expect(cidStr).toBe(rootCids[0].toString());
+  });
 });
 
 // =============================================================================

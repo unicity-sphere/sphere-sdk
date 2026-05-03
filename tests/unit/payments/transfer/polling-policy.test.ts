@@ -12,8 +12,10 @@ import {
   POLLING_WINDOW_MS,
   MIN_POLL_ATTEMPTS,
   BACKOFF_SCHEDULE_MS,
+  MAX_POLL_ATTEMPTS_HARD_CEILING,
   validatePollingPolicy,
   getBackoffMs,
+  getMonotonicNowMs,
   isPollingTimedOut,
 } from '../../../../modules/payments/transfer/polling-policy';
 
@@ -201,6 +203,176 @@ describe('polling-policy — isPollingTimedOut', () => {
     const r = isPollingTimedOut(0, 35 * minute, -3);
     expect(r.timedOut).toBe(false);
     expect(r.reason).toBe('continue');
+  });
+});
+
+// =============================================================================
+// 4b. Wave 3 steelman — clock-skew defense
+// =============================================================================
+//
+// Wall-clock subtraction (`now - startedAt`) is unsafe under any scenario
+// where the OS clock can move backwards: NTP correction stepping back,
+// host suspend/resume, container clock drift. The previous
+// `isPollingTimedOut` implementation defensively coerced negative
+// elapsed to 0 (correct as a guard against garbage inputs), but in
+// doing so it ALSO let a backwards-stepped clock prevent W26 wall-
+// clock termination indefinitely.
+//
+// The fix layers two defenses:
+//   1. `getMonotonicNowMs()` — caller-side helper for a monotonic
+//      clock source unaffected by wall-clock changes. Callers SHOULD
+//      use this instead of `Date.now()`.
+//   2. `MAX_POLL_ATTEMPTS_HARD_CEILING` — secondary safety net that
+//      terminates polling based on attempt COUNT alone, independent
+//      of any clock reading. Even if a caller accidentally uses
+//      Date.now() AND the clock is stalled, the iteration ceiling
+//      eventually fires.
+//
+// Both must remain unfired simultaneously to allow indefinite polling.
+
+describe('polling-policy — Wave 3 clock-skew defense', () => {
+  const minute = 60 * 1000;
+
+  describe('MAX_POLL_ATTEMPTS_HARD_CEILING constant', () => {
+    it('is defined as a positive integer', () => {
+      expect(typeof MAX_POLL_ATTEMPTS_HARD_CEILING).toBe('number');
+      expect(MAX_POLL_ATTEMPTS_HARD_CEILING).toBeGreaterThan(0);
+      expect(Number.isInteger(MAX_POLL_ATTEMPTS_HARD_CEILING)).toBe(true);
+    });
+
+    it('is comfortably above MIN_POLL_ATTEMPTS so the normal-termination path is reachable first', () => {
+      // The attempt-count ceiling MUST NOT undercut the normal
+      // termination path; otherwise the worker would always trip
+      // the secondary safety net before satisfying the §5.5 step 6
+      // attempts-met-and-window-exceeded check.
+      expect(MAX_POLL_ATTEMPTS_HARD_CEILING).toBeGreaterThan(MIN_POLL_ATTEMPTS);
+      // 14× margin sanity check — keeps the secondary safety net
+      // reasonably permissive without inflating it to "never fires".
+      expect(MAX_POLL_ATTEMPTS_HARD_CEILING).toBeGreaterThanOrEqual(
+        MIN_POLL_ATTEMPTS * 10,
+      );
+    });
+  });
+
+  describe('getMonotonicNowMs', () => {
+    it('returns a finite number', () => {
+      const t = getMonotonicNowMs();
+      expect(Number.isFinite(t)).toBe(true);
+    });
+
+    it('is monotonically non-decreasing across consecutive calls', () => {
+      // The exact source (performance.now vs Date.now fallback)
+      // doesn't matter — both should be non-decreasing across two
+      // consecutive synchronous calls in any reasonable runtime.
+      const a = getMonotonicNowMs();
+      const b = getMonotonicNowMs();
+      expect(b).toBeGreaterThanOrEqual(a);
+    });
+  });
+
+  describe('isPollingTimedOut — attempt-count secondary safety net', () => {
+    it('terminates when attempts >= MAX_POLL_ATTEMPTS_HARD_CEILING regardless of wall-clock', () => {
+      // Pin the attempt-ceiling reason — fires from attempt count
+      // alone with `now === startedAt` (zero elapsed).
+      const r = isPollingTimedOut(0, 0, MAX_POLL_ATTEMPTS_HARD_CEILING);
+      expect(r.timedOut).toBe(true);
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
+
+    it('terminates when attempts >> ceiling even when wall-clock stepped backwards', () => {
+      // Simulated NTP backwards-step scenario: `now < startedAt` →
+      // elapsed coerces to 0. The wall-clock branches CAN'T fire.
+      // The attempt-count secondary safety net MUST still terminate.
+      const startedAt = 10_000_000;
+      const nowAfterBackwardsStep = 5_000_000; // 5,000s in the past
+      const r = isPollingTimedOut(
+        startedAt,
+        nowAfterBackwardsStep,
+        MAX_POLL_ATTEMPTS_HARD_CEILING + 50,
+      );
+      expect(r.timedOut).toBe(true);
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
+
+    it('terminates when attempts == ceiling exactly (>= semantics)', () => {
+      const r = isPollingTimedOut(0, 0, MAX_POLL_ATTEMPTS_HARD_CEILING);
+      expect(r.timedOut).toBe(true);
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
+
+    it('does NOT terminate when attempts is one below ceiling and clock is stalled', () => {
+      // Just below the ceiling AND wall-clock is exactly at startedAt
+      // (stalled) AND attempts is below MIN_POLL_ATTEMPTS path's
+      // window requirement.
+      const r = isPollingTimedOut(
+        1000,
+        1000, // elapsed = 0
+        MAX_POLL_ATTEMPTS_HARD_CEILING - 1,
+      );
+      expect(r.timedOut).toBe(false);
+      expect(r.reason).toBe('continue');
+    });
+
+    it('attempt-ceiling fires before normal-termination when both would qualify', () => {
+      // With both window-exceeded AND attempt count >= ceiling, the
+      // attempt-ceiling branch wins (evaluated first).
+      const r = isPollingTimedOut(
+        0,
+        100 * minute,
+        MAX_POLL_ATTEMPTS_HARD_CEILING + 5,
+      );
+      expect(r.timedOut).toBe(true);
+      // Could be either 'attempt-ceiling-fired' OR 'safety-net-fired'
+      // depending on priority; the documented order is attempt-ceiling
+      // FIRST so a clock-skew attacker can't suppress termination.
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
+  });
+
+  describe('isPollingTimedOut — wall-clock skew scenarios', () => {
+    it('worker still terminates when wall-clock steps backwards mid-poll (simulated)', () => {
+      // Setup: poll started at t=10_000_000. After legitimate work,
+      // attempts has reached MIN_POLL_ATTEMPTS but the OS clock has
+      // been NTP-stepped to 1 hour BEFORE startedAt. Wall-clock branches
+      // are forever out of reach (elapsed coerces to 0).
+      const startedAt = 10_000_000;
+      const stalledNow = startedAt - 60 * minute;
+
+      // Below the attempt ceiling — no termination yet.
+      let r = isPollingTimedOut(startedAt, stalledNow, MIN_POLL_ATTEMPTS + 1);
+      expect(r.timedOut).toBe(false);
+
+      // Continue polling; eventually attempts cross the hard ceiling.
+      r = isPollingTimedOut(startedAt, stalledNow, MAX_POLL_ATTEMPTS_HARD_CEILING);
+      expect(r.timedOut).toBe(true);
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
+
+    it('host-suspend resume scenario: clock paused, attempts continue accruing', () => {
+      // Suspend: clock pauses at startedAt+5s, resumes after some
+      // wall-time but the runtime may see `now === pauseTime`. The
+      // worker continues polling and accumulates attempts until the
+      // ceiling fires.
+      const startedAt = 1_000_000;
+      const pausedNow = startedAt + 5_000;
+      const r = isPollingTimedOut(
+        startedAt,
+        pausedNow,
+        MAX_POLL_ATTEMPTS_HARD_CEILING,
+      );
+      expect(r.timedOut).toBe(true);
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
+
+    it('container clock drift: now starts at 0, stays at 0; attempt-ceiling rescues termination', () => {
+      // Pathological: container booted from snapshot, clock returns
+      // 0 indefinitely. Without the attempt-count safety net, the
+      // worker would poll forever (elapsed coerces to 0 → no wall-
+      // clock termination ever).
+      const r = isPollingTimedOut(0, 0, MAX_POLL_ATTEMPTS_HARD_CEILING);
+      expect(r.timedOut).toBe(true);
+      expect(r.reason).toBe('attempt-ceiling-fired');
+    });
   });
 });
 

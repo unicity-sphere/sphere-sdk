@@ -273,25 +273,128 @@ describe('FinalizationQueue — validation', () => {
 });
 
 describe('FinalizationQueue — corrupt slot handling', () => {
-  it('corrupt JSON treated as absent', async () => {
+  it('corrupt JSON treated as absent + alert + auto-delete', async () => {
     const storage = makeFakeStorage();
-    const q = new FinalizationQueue({ storage });
-    storage.map.set(keyFor(ADDR, 'corrupt'), '{not json');
+    const alerts: Array<{ key: string; entryId: string; rawSnippet: string }> = [];
+    const q = new FinalizationQueue({
+      storage,
+      onCorruptSlot: ({ key, entryId, rawSnippet }) => {
+        alerts.push({ key, entryId, rawSnippet });
+      },
+    });
+    const corruptKey = keyFor(ADDR, 'corrupt');
+    storage.map.set(corruptKey, '{not json');
     const got = await q.get(ADDR, 'corrupt');
     expect(got).toBeUndefined();
+    expect(alerts.length).toBe(1);
+    expect(alerts[0]!.key).toBe(corruptKey);
+    expect(alerts[0]!.entryId).toBe('corrupt');
+    expect(alerts[0]!.rawSnippet).toBe('{not json');
+    // Slot was auto-deleted so a subsequent add() can rewrite it.
+    expect(storage.map.has(corruptKey)).toBe(false);
     const all = await q.list(ADDR);
     expect(all.length).toBe(0);
   });
 
-  it('value missing required fields treated as absent', async () => {
+  it('value missing required fields treated as absent + alert + delete', async () => {
     const storage = makeFakeStorage();
-    const q = new FinalizationQueue({ storage });
+    let alertCalls = 0;
+    const q = new FinalizationQueue({
+      storage,
+      onCorruptSlot: () => {
+        alertCalls++;
+      },
+    });
+    const malformedKey = keyFor(ADDR, 'malformed');
     storage.map.set(
-      keyFor(ADDR, 'malformed'),
+      malformedKey,
       JSON.stringify({ entryId: 'x', tokenId: 'y' }),
     );
     const got = await q.get(ADDR, 'malformed');
     expect(got).toBeUndefined();
+    expect(alertCalls).toBe(1);
+    expect(storage.map.has(malformedKey)).toBe(false);
+  });
+
+  it('list() alerts and deletes corrupt slots inline', async () => {
+    const storage = makeFakeStorage();
+    const alerts: string[] = [];
+    const q = new FinalizationQueue({
+      storage,
+      onCorruptSlot: ({ entryId }) => {
+        alerts.push(entryId);
+      },
+    });
+    const live = makeEntry({ entryId: 'live' });
+    await q.add(ADDR, live);
+    storage.map.set(keyFor(ADDR, 'broken-1'), 'not-json');
+    storage.map.set(keyFor(ADDR, 'broken-2'), JSON.stringify({ ok: true }));
+    const listed = await q.list(ADDR);
+    expect(listed.map((e) => e.entryId)).toEqual(['live']);
+    expect(alerts.sort()).toEqual(['broken-1', 'broken-2']);
+    // Both corrupt slots auto-deleted.
+    expect(storage.map.has(keyFor(ADDR, 'broken-1'))).toBe(false);
+    expect(storage.map.has(keyFor(ADDR, 'broken-2'))).toBe(false);
+  });
+
+  it('gcTombstones alerts + deletes corrupt slots, returns deletion count', async () => {
+    const storage = makeFakeStorage();
+    let alertCount = 0;
+    const q = new FinalizationQueue({
+      storage,
+      onCorruptSlot: () => {
+        alertCount++;
+      },
+    });
+    storage.map.set(keyFor(ADDR, 'broken-1'), '{');
+    storage.map.set(keyFor(ADDR, 'broken-2'), '12345');
+    const summary = await q.gcTombstones(ADDR);
+    expect(summary.deleted).toBe(2);
+    expect(alertCount).toBe(2);
+    expect(storage.map.has(keyFor(ADDR, 'broken-1'))).toBe(false);
+    expect(storage.map.has(keyFor(ADDR, 'broken-2'))).toBe(false);
+  });
+
+  it('corrupt-slot handler omitted → still auto-deletes (no throw)', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({ storage });
+    const k = keyFor(ADDR, 'broken');
+    storage.map.set(k, 'garbage');
+    const got = await q.get(ADDR, 'broken');
+    expect(got).toBeUndefined();
+    expect(storage.map.has(k)).toBe(false);
+  });
+
+  it('handler that throws does not break GC', async () => {
+    const storage = makeFakeStorage();
+    const q = new FinalizationQueue({
+      storage,
+      onCorruptSlot: () => {
+        throw new Error('handler boom');
+      },
+    });
+    const k = keyFor(ADDR, 'broken');
+    storage.map.set(k, '{');
+    const summary = await q.gcTombstones(ADDR);
+    expect(summary.deleted).toBe(1);
+    expect(storage.map.has(k)).toBe(false);
+  });
+
+  it('large corrupt blob is truncated to 512 chars in the alert', async () => {
+    const storage = makeFakeStorage();
+    let raw: string | undefined;
+    const q = new FinalizationQueue({
+      storage,
+      onCorruptSlot: ({ rawSnippet }) => {
+        raw = rawSnippet;
+      },
+    });
+    const big = 'x'.repeat(1000);
+    storage.map.set(keyFor(ADDR, 'big'), big);
+    await q.get(ADDR, 'big');
+    expect(raw).toBeDefined();
+    expect(raw!.length).toBe(512 + 1); // 512 chars + ellipsis
+    expect(raw!.endsWith('…')).toBe(true);
   });
 
   it('parseQueueValue distinguishes absent / tombstone / entry', () => {

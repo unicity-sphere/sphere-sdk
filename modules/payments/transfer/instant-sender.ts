@@ -779,14 +779,26 @@ export async function sendInstantUxf(
       );
     }
 
-    // Mark sources `pending` locally before we publish — if the
-    // publish succeeds and we crash before bookkeeping, the worker
-    // (T.5.B) still picks up the outbox entry and resumes.
-    if (deps.markSourcePending !== undefined) {
-      for (const src of selected) {
-        await deps.markSourcePending(src);
-      }
-    }
+    // INVARIANT (post-Wave-3 steelman fix #170 — Option A):
+    // `markSourcePending` is DEFERRED until AFTER `transport.sendTokenTransfer`
+    // returns success. Previously the marker fired before publish, so a
+    // transport throw left sources stuck in `pending` forever — the outer
+    // catch emitted `transfer:failed` but never unmarked, and a
+    // sending-recovery-worker pickup that bypassed the cause of the
+    // original failure could double-publish proofs into a transition the
+    // recipient never received.
+    //
+    // The window between outbox `sending` and transport ack is now
+    // observed-pending only via the OUTBOX state — the recovery worker
+    // still resumes correctly from `sending` because it re-runs the
+    // pipeline including `markSourcePending`. Crash-after-ack-before-mark
+    // is covered by the symmetric resume path: the sources stay
+    // `confirmed`/non-pending, which correctly reflects local state until
+    // the worker picks the outbox up; the worker re-marks idempotently
+    // (production wiring of `markSourcePending` is an idempotent setter
+    // — re-marking an already-pending token is a no-op).
+    //
+    // Spec refs: §6.3 sender-side ordering, §7.1 CRDT invariants.
 
     // TEST-ONLY fault-injection seam: simulate process death between
     // outbox commit and Nostr publish (§6.3 last-paragraph crash window).
@@ -810,6 +822,19 @@ export async function sendInstantUxf(
         'TRANSPORT_ERROR',
         cause,
       );
+    }
+
+    // -----------------------------------------------------------------
+    // Step 12.5: mark sources `pending` AFTER transport ack (Option A).
+    // The publish is durable on the relay; from this point onward the
+    // recipient will receive the bundle, so the sender's local sources
+    // MUST be locked into `pending` to prevent a parallel send from
+    // double-spending the same token.
+    // -----------------------------------------------------------------
+    if (deps.markSourcePending !== undefined) {
+      for (const src of selected) {
+        await deps.markSourcePending(src);
+      }
     }
 
     // TEST-ONLY fault-injection seam: simulate process death between
@@ -925,9 +950,28 @@ export async function sendInstantUxf(
           bundleCid,
           outstandingRequestIds,
         });
-      } catch {
+      } catch (cause) {
         // Worker registry hiccups MUST NOT fail the send. T.5.B's
         // worker picks up orphan delivered-instant entries on boot.
+        //
+        // BUT: emit `transfer:finalization-trigger-failed` so that
+        // operators / telemetry can observe the failure. A wallet that
+        // never reboots before the worker's poll cycle would otherwise
+        // leave the entry at `delivered-instant` indefinitely with NO
+        // signal — the silent-swallow steelman gap (#170 issue 2).
+        try {
+          deps.emit('transfer:finalization-trigger-failed', {
+            addressId: deps.addressId,
+            outboxId: transferId,
+            bundleCid,
+            outstandingRequestIds,
+            message: cause instanceof Error ? cause.message : String(cause),
+          });
+        } catch {
+          // Defense-in-depth: if the emit itself throws (synchronous
+          // listener error), do not propagate — the send has succeeded
+          // and the swallow contract is the priority.
+        }
       }
     }
 

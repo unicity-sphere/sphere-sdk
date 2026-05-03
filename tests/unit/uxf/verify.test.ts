@@ -748,4 +748,89 @@ describe('verify', () => {
       expect(result.stats.instanceChainsChecked).toBe(2);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Steelman Wave 3 — per-element BYTE cap during re-hash
+  // -------------------------------------------------------------------------
+  describe('per-element size cap', () => {
+    it('rejects an element whose content+children exceeds VERIFY_MAX_ELEMENT_BYTES', () => {
+      // Build an element with an oversized `tokenData` byte field (hex
+      // string). The cap measures the dag-cbor encoded size of
+      // content+children combined; 200 KiB of tokenData decodes to
+      // 100 KiB of bytes, comfortably above the 64 KiB cap.
+      //
+      // We use `genesis-data.tokenData` because it is a BYTE_FIELD
+      // (encoded as CBOR bstr, no per-byte hex overhead), giving us
+      // an honest size measurement. We compute the hash off the
+      // element itself so the hash key matches — the cap MUST fire
+      // before the recompute, not because of a hash mismatch.
+      const oversizedTokenDataHex = 'ab'.repeat(110_000); // 220 KB hex → 110 KB bstr
+      const el = makeElement('genesis-data', {
+        tokenId: 'b1'.repeat(32),
+        tokenType: '00'.repeat(32),
+        coinData: [['UCT', '1000']],
+        tokenData: oversizedTokenDataHex,
+        salt: 'c1'.repeat(32),
+        recipient: 'DIRECT://test',
+        recipientDataHash: null,
+        reason: null,
+      });
+      const elHash = computeElementHash(el);
+
+      const pool = new Map<ContentHash, UxfElement>();
+      pool.set(elHash, el);
+
+      const manifest = new Map<string, ContentHash>();
+      // Make an arbitrary tokenId in the manifest pointing nowhere — the
+      // cap check runs over the WHOLE pool, independent of manifest
+      // reachability. The MISSING_ELEMENT for the manifest entry is a
+      // separate error we ignore here.
+      manifest.set('aa'.repeat(32), elHash);
+
+      const pkg = makePackage(manifest, pool);
+      const result = verify(pkg);
+
+      expect(result.valid).toBe(false);
+      const oversizeErr = result.errors.find(
+        (e) =>
+          e.code === 'INVALID_PACKAGE' &&
+          /VERIFY_MAX_ELEMENT_BYTES/.test(e.message),
+      );
+      expect(oversizeErr).toBeDefined();
+      expect(oversizeErr?.elementHash).toBe(elHash);
+    });
+
+    it('accepts an element whose content+children fits within the cap', () => {
+      // A modestly-sized element well under the 64 KiB cap should
+      // verify normally (no INVALID_PACKAGE error from the size cap).
+      const moderateTokenDataHex = 'cd'.repeat(1_000); // 2 KB hex → 1 KB bstr
+      const el = makeElement('genesis-data', {
+        tokenId: 'd1'.repeat(32),
+        tokenType: '00'.repeat(32),
+        coinData: [['UCT', '1000']],
+        tokenData: moderateTokenDataHex,
+        salt: 'c1'.repeat(32),
+        recipient: 'DIRECT://test',
+        recipientDataHash: null,
+        reason: null,
+      });
+      const elHash = computeElementHash(el);
+
+      const pool = new Map<ContentHash, UxfElement>();
+      pool.set(elHash, el);
+
+      const manifest = new Map<string, ContentHash>();
+      manifest.set('aa'.repeat(32), elHash);
+
+      const pkg = makePackage(manifest, pool);
+      const result = verify(pkg);
+
+      const oversizeErr = result.errors.find(
+        (e) =>
+          e.code === 'INVALID_PACKAGE' &&
+          /VERIFY_MAX_ELEMENT_BYTES/.test(e.message),
+      );
+      expect(oversizeErr).toBeUndefined();
+    });
+  });
 });

@@ -257,8 +257,34 @@ describe('syntheticBundleCidFor', () => {
     );
   });
 
-  it('uses "no-token" placeholder when tokenId is empty', () => {
-    expect(syntheticBundleCidFor('sphere-txf', '', null)).toContain('no-token');
+  it('produces stable, bounded-length output when tokenId is empty (#170 issue 6)', () => {
+    // Post #170-issue-6: tokenId is hashed (SHA-256 hex) before
+    // inclusion. The "no-token" literal is no longer visible in the
+    // output — we verify stability + bounded length + the canonical
+    // `legacy-${shape}-` prefix invariant instead. Two distinct
+    // empty-tokenId calls MUST produce byte-equal output (idempotent
+    // for the structural-invalid path).
+    const a = syntheticBundleCidFor('sphere-txf', '', null);
+    const b = syntheticBundleCidFor('sphere-txf', '', null);
+    expect(a).toBe(b);
+    expect(a.startsWith('legacy-sphere-txf-')).toBe(true);
+    // SHA-256 hex digest is exactly 64 chars; total length:
+    // 'legacy-sphere-txf-' (18) + 64 = 82.
+    expect(a.length).toBe(18 + 64);
+  });
+
+  it('hashes tokenId so attacker-crafted CID prefixes cannot masquerade (#170 issue 6)', () => {
+    // The pre-fix code emitted `legacy-sphere-txf-${tokenId}`, so a
+    // tokenId of `bafyrei...` would yield `legacy-sphere-txf-bafyrei...`
+    // that pattern-matches as a real CID in forensic logs. After the
+    // fix the tokenId is SHA-256-hashed, so no attacker-controlled
+    // bytes appear verbatim in the synthetic CID output.
+    const malicious = 'bafyreigh2akiscaildkrbzv3nqxk3xiy5o4hqz';
+    const out = syntheticBundleCidFor('sphere-txf', malicious, null);
+    expect(out.startsWith('legacy-sphere-txf-')).toBe(true);
+    // The malicious tokenId MUST NOT appear in the output literally.
+    expect(out).not.toContain(malicious);
+    expect(out.length).toBe(18 + 64);
   });
 });
 

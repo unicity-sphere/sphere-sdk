@@ -230,6 +230,36 @@ export const TOMBSTONE_RETENTION_MS =
   TOMBSTONE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 /**
+ * Telemetry callback invoked when {@link FinalizationQueue} encounters
+ * a corrupt slot — a key whose JSON parses to neither a valid live
+ * entry nor a valid tombstone. The default behavior in addition to
+ * this callback is to delete the corrupt slot so that a subsequent
+ * `add()` can rewrite it cleanly (otherwise a corrupt slot would
+ * silently mask the entry forever, causing the worker to think the
+ * queue is drained and prematurely flip the token to `valid`).
+ *
+ * Steelman fix (Wave 3 #8): the prior implementation silently dropped
+ * corrupt slots from `list()` / `gcTombstones()` / `get()`, which
+ * caused both a disk-leak and a worker premature-flip on drain. The
+ * callback lets the worker's host emit a `transfer:operator-alert` so
+ * operators can investigate the corruption source (replication merge
+ * conflict, partial write, byte-flip).
+ */
+export type FinalizationQueueCorruptSlotHandler = (info: {
+  /** The full storage key carrying the corrupt value. */
+  readonly key: string;
+  /** Parsed `addr` (the prefix-strip target). */
+  readonly addr: string;
+  /** Parsed `entryId` (everything after `${addr}.finalizationQueue.`). */
+  readonly entryId: string;
+  /**
+   * The raw value as read from storage. Truncated to 512 chars so
+   * operator alerts don't carry potentially-large blobs.
+   */
+  readonly rawSnippet: string;
+}) => void;
+
+/**
  * Construction options for {@link FinalizationQueue}.
  */
 export interface FinalizationQueueOptions {
@@ -241,6 +271,15 @@ export interface FinalizationQueueOptions {
   /** Tombstone retention window override (ms). Default
    *  {@link TOMBSTONE_RETENTION_MS}. */
   readonly tombstoneRetentionMs?: number;
+  /**
+   * Optional handler invoked for every corrupt slot the wrapper
+   * encounters during `get` / `list` / `gcTombstones` / `lookupByTokenId`.
+   * Production wiring emits a `transfer:operator-alert` so the
+   * corruption is visible to operators; tests inject recorders to
+   * assert the handler was called. When `null` / omitted, corrupt
+   * slots are still deleted but no alert is surfaced.
+   */
+  readonly onCorruptSlot?: FinalizationQueueCorruptSlotHandler;
 }
 
 /**
@@ -259,12 +298,14 @@ export class FinalizationQueue {
   private readonly storage: FinalizationQueueStorage;
   private readonly now: () => number;
   private readonly tombstoneRetentionMs: number;
+  private readonly onCorruptSlot: FinalizationQueueCorruptSlotHandler | undefined;
 
   constructor(options: FinalizationQueueOptions) {
     this.storage = options.storage;
     this.now = options.now ?? (() => Date.now());
     this.tombstoneRetentionMs =
       options.tombstoneRetentionMs ?? TOMBSTONE_RETENTION_MS;
+    this.onCorruptSlot = options.onCorruptSlot;
     if (
       !Number.isFinite(this.tombstoneRetentionMs) ||
       this.tombstoneRetentionMs < 0
@@ -273,6 +314,46 @@ export class FinalizationQueue {
         `FinalizationQueue: tombstoneRetentionMs must be non-negative finite; got ${this.tombstoneRetentionMs}`,
         'VALIDATION_ERROR',
       );
+    }
+  }
+
+  /**
+   * Apply the corrupt-slot policy: invoke the operator-alert handler
+   * (if registered) AND best-effort delete the corrupt slot so a
+   * subsequent `add()` can rewrite it. Delete failures are swallowed
+   * — the call site is already an error path.
+   *
+   * @internal
+   */
+  private async handleCorruptSlot(
+    addr: string,
+    key: string,
+    raw: string,
+  ): Promise<void> {
+    const entryId = key.startsWith(prefixFor(addr))
+      ? key.slice(prefixFor(addr).length)
+      : key;
+    if (this.onCorruptSlot !== undefined) {
+      try {
+        this.onCorruptSlot({
+          key,
+          addr,
+          entryId,
+          // Truncate the raw blob before surfacing — operator alerts
+          // shouldn't carry potentially-large attacker-controlled
+          // payloads (e.g., a megabyte-of-binary-garbage corruption).
+          rawSnippet: raw.length > 512 ? `${raw.slice(0, 512)}…` : raw,
+        });
+      } catch {
+        // Handler must not block GC; swallow.
+      }
+    }
+    try {
+      await this.storage.deleteKey(key);
+    } catch {
+      // Best-effort — a delete failure leaves the slot in place.
+      // The next pass will re-visit and re-attempt deletion. The
+      // operator alert above remains the authoritative signal.
     }
   }
 
@@ -336,6 +417,14 @@ export class FinalizationQueue {
   /**
    * Read a single entry by id. Returns `undefined` for absent or
    * tombstoned slots.
+   *
+   * Steelman fix (Wave 3 #8): a slot whose JSON parses to neither a
+   * valid live entry nor a valid tombstone is corrupt — the prior
+   * implementation silently returned `undefined`, leaking storage and
+   * masking the corruption. The wrapper now invokes the
+   * {@link FinalizationQueueOptions.onCorruptSlot} handler (so an
+   * operator alert can be raised) AND best-effort deletes the slot
+   * so a subsequent `add()` rewrites it cleanly.
    */
   async get(
     addr: string,
@@ -343,10 +432,15 @@ export class FinalizationQueue {
   ): Promise<FinalizationQueueEntry | undefined> {
     validateAddr(addr);
     validateEntryId(entryId);
-    const raw = await this.storage.readKey(keyFor(addr, entryId));
+    const key = keyFor(addr, entryId);
+    const raw = await this.storage.readKey(key);
     if (raw === null) return undefined;
     const parsed = parseQueueValue(raw);
-    if (parsed.kind === 'tombstone' || parsed.kind === 'absent') return undefined;
+    if (parsed.kind === 'tombstone') return undefined;
+    if (parsed.kind === 'absent') {
+      await this.handleCorruptSlot(addr, key, raw);
+      return undefined;
+    }
     return parsed.entry;
   }
 
@@ -372,8 +466,17 @@ export class FinalizationQueue {
       const raw = await this.storage.readKey(key);
       if (raw === null) continue;
       const parsed = parseQueueValue(raw);
-      if (parsed.kind !== 'entry') continue;
-      out.push(parsed.entry);
+      if (parsed.kind === 'entry') {
+        out.push(parsed.entry);
+        continue;
+      }
+      if (parsed.kind === 'tombstone') continue;
+      // Steelman fix (Wave 3 #8): corrupt slot — alert + delete.
+      // Without this the worker's "queue-drained → flip token to
+      // valid" check fires PREMATURELY because the corrupt entry is
+      // invisible. Deleting on each visit ensures a subsequent
+      // `add()` (e.g., from replay) can rewrite the slot.
+      await this.handleCorruptSlot(addr, key, raw);
     }
     return out;
   }
@@ -428,6 +531,15 @@ export class FinalizationQueue {
       const raw = await this.storage.readKey(key);
       if (raw === null) continue;
       const parsed = parseQueueValue(raw);
+      if (parsed.kind === 'absent') {
+        // Steelman fix (Wave 3 #8): corrupt slot encountered during
+        // GC — surface via operator-alert and delete. The delete is
+        // counted toward `deleted` so operators can correlate the
+        // alert count to the GC summary.
+        await this.handleCorruptSlot(addr, key, raw);
+        deleted++;
+        continue;
+      }
       if (parsed.kind !== 'tombstone') continue;
       if (now - parsed.tombstone.deletedAt <= this.tombstoneRetentionMs) {
         continue;
@@ -710,18 +822,96 @@ function validateEntry(entry: FinalizationQueueEntry): void {
 // =============================================================================
 
 /**
- * Encode a `Uint8Array` to base64. We avoid `Buffer` to keep the
- * module browser-safe; the SDK targets both Node and browser runtimes.
+ * Steelman fix (Wave 3 #9): explicit feature-detection of `btoa`/`atob`
+ * at module-load time, with a Node-`Buffer` fallback when both are
+ * absent. Pre-fix code assumed `globalThis.btoa` / `globalThis.atob`
+ * were always available, which is true for browser + Node ≥18 — but a
+ * Node ≤16 host (or a stripped runtime) would fail at first
+ * `signedTransferTxBytes` round-trip with an opaque
+ * `TypeError: globalThis.btoa is not a function`. The fallback uses
+ * `Buffer.from(...).toString('base64')` so the wrapper functions on
+ * any environment that has either WebCrypto-style codecs OR Node's
+ * `Buffer`. If neither exists, we throw at module-load with a clear
+ * message naming the offending environment so the failure surfaces
+ * synchronously at import-time rather than at first queue mutation.
+ */
+type Base64Codec = {
+  readonly bytesToBase64: (bytes: Uint8Array) => string;
+  readonly base64ToBytes: (b64: string) => Uint8Array;
+};
+
+const base64Codec: Base64Codec = (() => {
+  const g = globalThis as {
+    btoa?: (s: string) => string;
+    atob?: (s: string) => string;
+    Buffer?: {
+      from(value: string, encoding?: string): { toString(encoding: string): string };
+      from(value: Uint8Array): { toString(encoding: string): string };
+    };
+  };
+  if (typeof g.btoa === 'function' && typeof g.atob === 'function') {
+    const btoa = g.btoa;
+    const atob = g.atob;
+    return {
+      bytesToBase64(bytes: Uint8Array): string {
+        let bin = '';
+        for (let i = 0; i < bytes.length; i++) {
+          bin += String.fromCharCode(bytes[i]);
+        }
+        return btoa(bin);
+      },
+      base64ToBytes(b64: string): Uint8Array {
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) {
+          out[i] = bin.charCodeAt(i);
+        }
+        return out;
+      },
+    };
+  }
+  // Node.js fallback — Node ≤16 lacks `globalThis.btoa` / `atob` on
+  // older line-up but always has `Buffer`. This branch keeps the
+  // wrapper working there too.
+  if (typeof g.Buffer !== 'undefined' && g.Buffer !== null) {
+    const Buffer = g.Buffer;
+    return {
+      bytesToBase64(bytes: Uint8Array): string {
+        return Buffer.from(bytes).toString('base64');
+      },
+      base64ToBytes(b64: string): Uint8Array {
+        // Buffer extends Uint8Array, so we copy into a plain
+        // `Uint8Array` to avoid the subclass leaking through the
+        // wrapper's typed surface.
+        const buf = Buffer.from(b64, 'base64');
+        const view = buf as unknown as Uint8Array;
+        return new Uint8Array(view);
+      },
+    };
+  }
+  // Neither codec available — fail at module load with a clear
+  // message so the offending environment is identifiable.
+  const runtimeId =
+    typeof process !== 'undefined' && typeof process.version === 'string'
+      ? `node ${process.version}`
+      : typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string'
+        ? `browser '${navigator.userAgent}'`
+        : 'unknown runtime';
+  throw new SphereError(
+    `FinalizationQueue: no base64 codec available in this runtime (${runtimeId}); expected globalThis.btoa/atob (browser, Node ≥18) or Node Buffer. signedTransferTxBytes round-trip is unavailable — upgrade Node to ≥18 or run in a browser environment.`,
+    'NOT_INITIALIZED',
+  );
+})();
+
+/**
+ * Encode a `Uint8Array` to base64. Routes through the module-init
+ * codec so the wrapper works on browser, Node ≥18, and Node ≤16
+ * runtimes (the last via `Buffer`).
  *
  * @internal
  */
 function bytesToBase64(bytes: Uint8Array): string {
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i]);
-  }
-  // `btoa` is browser-native; Node 18+ also exposes it.
-  return globalThis.btoa(bin);
+  return base64Codec.bytesToBase64(bytes);
 }
 
 /**
@@ -731,10 +921,5 @@ function bytesToBase64(bytes: Uint8Array): string {
  * @internal
  */
 function base64ToBytes(b64: string): Uint8Array {
-  const bin = globalThis.atob(b64);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) {
-    out[i] = bin.charCodeAt(i);
-  }
-  return out;
+  return base64Codec.base64ToBytes(b64);
 }

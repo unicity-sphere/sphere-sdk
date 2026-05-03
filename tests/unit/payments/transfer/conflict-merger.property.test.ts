@@ -180,6 +180,7 @@ const STATUSES: ReadonlyArray<TokenManifestStatus> = [
   'valid',
   'pending',
   'conflicting',
+  'pending-conflicting',
   'invalid',
 ];
 
@@ -249,6 +250,16 @@ function arbEntry(): fc.Arbitrary<TokenManifestEntry> {
       lastProofRefreshAt: arbProofRefresh,
       bundleCid: arbBundleCid,
       senderTransportPubkey: arbPubkey,
+      // Operator-override audit triple (W3.5 fix coverage).
+      overrideApplied: fc.option(fc.constant(true), { nil: undefined }),
+      overrideAppliedAt: fc.option(
+        fc.integer({ min: 0, max: 1_000_000_000 }),
+        { nil: undefined },
+      ),
+      overrideAppliedBy: fc.option(
+        fc.constantFrom('op-aaaa', 'op-bbbb', 'op-cccc'),
+        { nil: undefined },
+      ),
     })
     .map((rec) => {
       // Suppress the unrealistic (status !== 'invalid', invalidReason !==
@@ -274,6 +285,13 @@ function arbEntry(): fc.Arbitrary<TokenManifestEntry> {
         ...(rec.senderTransportPubkey !== undefined
           ? { senderTransportPubkey: rec.senderTransportPubkey }
           : {}),
+        ...(rec.overrideApplied === true ? { overrideApplied: true } : {}),
+        ...(rec.overrideAppliedAt !== undefined
+          ? { overrideAppliedAt: rec.overrideAppliedAt }
+          : {}),
+        ...(rec.overrideAppliedBy !== undefined
+          ? { overrideAppliedBy: rec.overrideAppliedBy }
+          : {}),
       };
       return entry;
     });
@@ -295,6 +313,9 @@ interface MergeProjection {
   lastProofRefreshAt: number | undefined;
   bundleCid: string | undefined;
   senderTransportPubkey: string | undefined;
+  overrideApplied: boolean | undefined;
+  overrideAppliedAt: number | undefined;
+  overrideAppliedBy: string | undefined;
   superseded: ReadonlyArray<ContentHash>;
 }
 
@@ -311,6 +332,9 @@ function projection(result: MergeConflictingHeadsResult): MergeProjection {
     lastProofRefreshAt: result.merged.lastProofRefreshAt,
     bundleCid: result.merged.bundleCid,
     senderTransportPubkey: result.merged.senderTransportPubkey,
+    overrideApplied: result.merged.overrideApplied,
+    overrideAppliedAt: result.merged.overrideAppliedAt,
+    overrideAppliedBy: result.merged.overrideAppliedBy,
     // `superseded` is a list whose ELEMENT set is what matters for
     // semantic equivalence; sort here to make ordering not mask
     // legitimate convergence wins.
@@ -400,31 +424,47 @@ describe('mergeConflictingHeads property tests (W2 steelman #166)', () => {
       );
     });
 
-    it('rootHash is associative when all three entries share the same rootHash (identical-no-op fold)', () => {
+    it('rootHash AND status are associative when all three entries share the same rootHash (identical-no-op fold)', () => {
       // Restricted associativity: when the three replicas all carry the
       // SAME rootHash (the steady-state CRDT-fold case in the wild —
       // every replica converged on the same chain), every pairwise
       // merge is identical-no-op and the rootHash output is trivially
       // associative.
       //
-      // KNOWN LIMITATION (out of scope for #166): when the three
-      // entries have DIFFERENT rootHashes that are partially prefix-
-      // related and partially divergent (e.g., `short ⊂ long`,
-      // `forkA` divergent from both), the chain-content selection is
-      // path-dependent — `merge(merge(short, long), forkA)` can yield
-      // `long` while `merge(short, merge(long, forkA))` yields `forkA`
-      // (the inner divergent-conflict picks `forkA` by lex-min
-      // rootHash, which then prefix-extends with `short`). This is a
-      // semilattice-shape bug in the merger that requires a separate
-      // resolution rule (e.g., the "transitive supremum" of the
-      // candidate set across all three rootHashes simultaneously
-      // rather than left-associated pairwise). Filed as a follow-up;
-      // gossip-level convergence is preserved in practice because
-      // every replica eventually sees every chain head and the
-      // commutative pairwise property (#166 fix) drives them to the
-      // same set, with the divergent-conflict branch's
-      // `conflictingHeads` array surfacing the alternative chains for
-      // the operator to disambiguate.
+      // **Status associativity (W3.4 fix)**: `mergeStatus` now uses a
+      // total-order rank `invalid > conflicting > pending > valid` and
+      // is therefore associative INDEPENDENT of which side is "winner".
+      // We assert it here.
+      //
+      // KNOWN LIMITATION (chain-content associativity, F2 — documented,
+      // not fixed): when the three entries have DIFFERENT rootHashes
+      // that are partially prefix-related and partially divergent
+      // (e.g., `short ⊂ long`, `forkA` divergent from both), the
+      // chain-content selection is path-dependent — `merge(merge(short,
+      // long), forkA)` can yield `long` while `merge(short, merge(long,
+      // forkA))` yields `forkA` (the inner divergent-conflict picks
+      // `forkA` by lex-min rootHash, which then prefix-extends with
+      // `short`). This is a semilattice-shape bug in the merger that
+      // requires a separate resolution rule — the "transitive supremum"
+      // of the candidate set across all three rootHashes simultaneously
+      // rather than left-associated pairwise resolveTokenRoot calls.
+      // Restructuring the merger to take an N-way candidate set is too
+      // invasive for the W3 steelman fix loop; gossip-level convergence
+      // is preserved in practice because every replica eventually sees
+      // every chain head and the commutative pairwise property (#166
+      // fix) drives them to the same set, with the divergent-conflict
+      // branch's `conflictingHeads` array surfacing the alternative
+      // chains for the operator to disambiguate.
+      //
+      // Reproducer (kept here for future fix work):
+      //   prev = { rootHash: shortRootH, ... }
+      //   next = { rootHash: longRootH, ... }
+      //   third = { rootHash: forkARootH, ... }
+      //   merge(merge(prev, next), third).merged.rootHash === longRootH
+      //   merge(prev, merge(next, third)).merged.rootHash === forkARootH
+      // The inner merge(next, third) is divergent and picks forkA by
+      // lex-min rootHash; that then prefix-extends with prev=short
+      // (since forkA is also a prefix-extension of short via tx0).
       fc.assert(
         fc.property(arbEntry(), arbEntry(), arbEntry(), (a0, b0, c0) => {
           const sharedRoot = a0.rootHash;
@@ -436,24 +476,8 @@ describe('mergeConflictingHeads property tests (W2 steelman #166)', () => {
           const lp = projection(left);
           const rp = projection(right);
           expect(lp.rootHash).toBe(rp.rootHash);
-          // KNOWN OUT-OF-SCOPE FINDING: `mergeStatus` returns the
-          // metadata-winner's status when neither side is 'invalid' /
-          // 'conflicting'. Since the winner picker depends on metadata
-          // tiebreaks, a fold of three identical-rootHash entries can
-          // produce different statuses depending on associativity
-          // grouping (e.g., (a⊕b)⊕c picks `a`'s status while
-          // a⊕(b⊕c) picks `c`'s status when their metadata tiebreak
-          // chains are inverted). True CRDT-style associativity requires
-          // a total-order on `TokenManifestStatus` (e.g., invalid >
-          // conflicting > pending > valid). Filed as a follow-up on
-          // §5.6 / §7.1; #166's fix targets the chain-content + lex-min
-          // metadata-winner axis only. We therefore skip the status
-          // assertion here and rely on the dedicated 'invalid'-monotonic
-          // test below.
-          //
-          // expect(lp.status).toBe(rp.status);
-          void lp;
-          void rp;
+          // Status now associative under the total-order rule (F3+F4 fix).
+          expect(lp.status).toBe(rp.status);
         }),
         { numRuns: 200 },
       );
@@ -461,19 +485,16 @@ describe('mergeConflictingHeads property tests (W2 steelman #166)', () => {
   });
 
   describe('status monotonicity (§5.6)', () => {
-    it("merge propagates 'invalid' from either side (non-divergent branches)", () => {
-      // KNOWN OUT-OF-SCOPE BUG (not part of #166): in the divergent-
-      // conflict branch, the merger hardcodes `status: 'conflicting'`
-      // even when one side is `'invalid'`. Per §5.6 the merged status
-      // SHOULD be `'invalid'` (monotonic-pin). The fix lives in a
-      // separate steelman ticket; here we restrict the property to
-      // non-divergent branches so it remains green while still
-      // exercising the §5.6 invariant on identical-no-op and prefix-
-      // extension-merge.
+    it("merge propagates 'invalid' from either side across ALL branches (W3.3 fix)", () => {
+      // §5.6 monotonic-pin invariant: 'invalid' is sticky and MUST NOT
+      // regress under any merge branch — including the divergent-
+      // conflict branch. Previously the divergent branch hardcoded
+      // `status: 'conflicting'` and this property had to skip that
+      // branch; the W3.3 fix replaced the hardcode with `mergeStatus`
+      // so 'invalid' now sticks even on a divergent chain pair.
       fc.assert(
         fc.property(arbEntry(), arbEntry(), (a, b) => {
           const r = runMerge(a, b);
-          if (r.decision === 'genuinely-divergent-conflict') return;
           if (a.status === 'invalid' || b.status === 'invalid') {
             expect(r.merged.status).toBe('invalid');
           }
@@ -493,15 +514,19 @@ describe('mergeConflictingHeads property tests (W2 steelman #166)', () => {
           //     (both retain the highest-severity status).
           //  2. The merger detected a divergent-conflict and stamped
           //     'conflicting' itself.
-          // Property: if either input is 'conflicting' OR the decision
-          // is 'genuinely-divergent-conflict', the output MUST be
-          // 'conflicting'.
+          // (Wave 3 steelman) `pending-conflicting` is also a conflict-
+          // class status (rank-equal to `conflicting`); both members
+          // count as "conflict" for this property.
           if (
             a.status === 'conflicting' ||
+            a.status === 'pending-conflicting' ||
             b.status === 'conflicting' ||
+            b.status === 'pending-conflicting' ||
             r.decision === 'genuinely-divergent-conflict'
           ) {
-            expect(r.merged.status).toBe('conflicting');
+            expect(['conflicting', 'pending-conflicting']).toContain(
+              r.merged.status,
+            );
           }
         }),
         { numRuns: 200 },
@@ -572,6 +597,86 @@ describe('mergeConflictingHeads property tests (W2 steelman #166)', () => {
           // Same elements, possibly different orders within the array
           // — sort and compare.
           expect([...ab.superseded].sort()).toEqual([...ba.superseded].sort());
+        }),
+        { numRuns: 200 },
+      );
+    });
+  });
+
+  describe('operator-override audit triple (§6.3 / §7.0, W3.5 fix)', () => {
+    it('overrideApplied is set-OR (sticky once set on either side)', () => {
+      fc.assert(
+        fc.property(arbEntry(), arbEntry(), (a, b) => {
+          const r = runMerge(a, b);
+          const expected =
+            a.overrideApplied === true || b.overrideApplied === true
+              ? true
+              : undefined;
+          expect(r.merged.overrideApplied).toBe(expected);
+        }),
+        { numRuns: 200 },
+      );
+    });
+
+    it('overrideAppliedAt is max-merge', () => {
+      fc.assert(
+        fc.property(arbEntry(), arbEntry(), (a, b) => {
+          const r = runMerge(a, b);
+          const aV = a.overrideAppliedAt;
+          const bV = b.overrideAppliedAt;
+          if (aV === undefined && bV === undefined) {
+            expect(r.merged.overrideAppliedAt).toBeUndefined();
+          } else {
+            const expected = Math.max(aV ?? 0, bV ?? 0);
+            expect(r.merged.overrideAppliedAt).toBe(expected);
+          }
+        }),
+        { numRuns: 200 },
+      );
+    });
+
+    it('overrideAppliedBy is lex-min when both sides set, present-beats-absent otherwise', () => {
+      fc.assert(
+        fc.property(arbEntry(), arbEntry(), (a, b) => {
+          const r = runMerge(a, b);
+          const aV = a.overrideAppliedBy;
+          const bV = b.overrideAppliedBy;
+          let expected: string | undefined;
+          if (aV === undefined && bV === undefined) expected = undefined;
+          else if (aV === undefined) expected = bV;
+          else if (bV === undefined) expected = aV;
+          else expected = aV <= bV ? aV : bV;
+          expect(r.merged.overrideAppliedBy).toBe(expected);
+        }),
+        { numRuns: 200 },
+      );
+    });
+
+    it('override triple is commutative under prev/next swap', () => {
+      fc.assert(
+        fc.property(arbEntry(), arbEntry(), (a, b) => {
+          const ab = runMerge(a, b);
+          const ba = runMerge(b, a);
+          expect(ab.merged.overrideApplied).toBe(ba.merged.overrideApplied);
+          expect(ab.merged.overrideAppliedAt).toBe(ba.merged.overrideAppliedAt);
+          expect(ab.merged.overrideAppliedBy).toBe(ba.merged.overrideAppliedBy);
+        }),
+        { numRuns: 200 },
+      );
+    });
+
+    it('override triple is associative across all branches', () => {
+      fc.assert(
+        fc.property(arbEntry(), arbEntry(), arbEntry(), (a, b, c) => {
+          const left = runMerge(runMerge(a, b).merged, c);
+          const right = runMerge(a, runMerge(b, c).merged);
+          expect(left.merged.overrideApplied).toBe(right.merged.overrideApplied);
+          expect(left.merged.overrideAppliedAt).toBe(
+            right.merged.overrideAppliedAt,
+          );
+          expect(left.merged.overrideAppliedBy).toBe(
+            right.merged.overrideAppliedBy,
+          );
         }),
         { numRuns: 200 },
       );

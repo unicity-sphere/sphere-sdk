@@ -536,6 +536,7 @@ export type SphereEventType =
   | 'transfer:submitted'
   | 'transfer:cascade-risk-warning'
   | 'transfer:failed'
+  | 'transfer:finalization-trigger-failed'
   | 'transfer:operator-alert'
   | 'transfer:fetch-failed'
   | 'transfer:ingest-queue-full'
@@ -647,6 +648,40 @@ export interface SphereEventMap {
     readonly freshlyMintedChildTokenIds: ReadonlyArray<string>;
   };
   'transfer:failed': TransferResult;
+  /**
+   * UXF Inter-Wallet Transfer T.5.A / T.7.A — sender-side finalization
+   * trigger callback failed (Wave 3 steelman fix #170 issue 2).
+   *
+   * The instant-mode sender registers each `delivered-instant` outbox
+   * entry with its finalization-worker registry via the `onTriggerFinalization`
+   * callback. Production wiring may surface a non-fatal error from the
+   * registry (worker not yet available, transient registry hiccup);
+   * historically the orchestrator swallowed those throws silently
+   * because the publish has already completed and re-throwing would
+   * pollute the success path.
+   *
+   * Silent swallow has an observability gap: a wallet that never reboots
+   * after the trigger failure will keep the outbox entry at
+   * `delivered-instant` indefinitely (the worker never picks it up).
+   * This event surfaces that gap so operator dashboards / telemetry
+   * pick up the failure without breaking the success-path contract.
+   *
+   * Spec refs: §6.1 (sender-side worker error model), §6.3 (resume on
+   * boot — orphan `delivered-instant` entries).
+   */
+  'transfer:finalization-trigger-failed': {
+    /** Per-address outbox key prefix (`${addr}.outbox.`). */
+    readonly addressId: string;
+    /** Outbox entry id (the transferId). */
+    readonly outboxId: string;
+    /** Bundle CID (forensic — same value persisted on the outbox entry).
+     *  Empty string for legacy TXF mode (no bundle CID). */
+    readonly bundleCid: string;
+    /** Outstanding requestIds the worker would have polled. */
+    readonly outstandingRequestIds: ReadonlyArray<string>;
+    /** Human-readable failure reason. */
+    readonly message: string;
+  };
   /**
    * Operator-level alert raised when the §5.3 / §6.1 disposition path
    * surfaces a condition that warrants human attention but is NOT a

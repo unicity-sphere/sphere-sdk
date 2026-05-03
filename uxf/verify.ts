@@ -24,6 +24,8 @@ import type {
   InstanceChainEntry,
 } from './types.js';
 import { computeElementHash } from './hash.js';
+import { encode as dagCborEncode } from '@ipld/dag-cbor';
+import { VERIFY_MAX_ELEMENT_BYTES } from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Expected child element types (for type consistency checks)
@@ -117,7 +119,42 @@ export function verify(pkg: UxfPackageData): UxfVerificationResult {
       },
     };
   }
+  // Steelman Wave 3 warning: per-element BYTE cap, not just per-element
+  // count. VERIFY_MAX_POOL_SIZE bounds N (count) but N × per-element-bytes
+  // is the true memory pressure. A 100k-element pool of 100 KiB elements
+  // fits the count cap but is 10 GB total. Re-encode each element's
+  // content+children sub-tree once and reject before re-hashing if any
+  // single element exceeds VERIFY_MAX_ELEMENT_BYTES.
   for (const [hash, element] of pkg.pool) {
+    let elementSizeBytes: number;
+    try {
+      // We measure the size of the element's content+children sub-tree
+      // (the data blobs that drive memory cost). Header is bounded
+      // size (small fixed schema) so excluded from the cap window.
+      const probe = dagCborEncode({
+        content: element.content,
+        children: element.children,
+      });
+      elementSizeBytes = probe.byteLength;
+    } catch {
+      // dag-cbor encode failure here means the element is structurally
+      // unencodable — let computeElementHash below produce the precise
+      // error.
+      elementSizeBytes = 0;
+    }
+    if (elementSizeBytes > VERIFY_MAX_ELEMENT_BYTES) {
+      errors.push({
+        code: 'INVALID_PACKAGE',
+        message:
+          `Element ${hash} content+children size ${elementSizeBytes} bytes ` +
+          `exceeds VERIFY_MAX_ELEMENT_BYTES=${VERIFY_MAX_ELEMENT_BYTES} ` +
+          `(per-element bloat-DoS protection).`,
+        elementHash: hash,
+      });
+      // Skip the recompute for oversized elements — re-hashing a 100 MiB
+      // body burns CPU we explicitly refuse to spend.
+      continue;
+    }
     const recomputed = computeElementHash(element);
     if (recomputed !== hash) {
       errors.push({

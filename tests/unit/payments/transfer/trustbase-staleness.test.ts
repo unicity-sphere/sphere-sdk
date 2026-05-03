@@ -435,3 +435,74 @@ describe('TrustBaseStaleness — clock injection', () => {
     }
   });
 });
+
+// =============================================================================
+// 10. Wave 3 / steelman: advisory-only contract for isTrustBaseStale
+// =============================================================================
+
+describe('TrustBaseStaleness — isTrustBaseStale is ADVISORY-ONLY (Wave 3)', () => {
+  // The steelman finding: `isTrustBaseStale()` is passive. No path
+  // refuses to accept an OK once the flag flips to true. The protocol
+  // §9.4.1 contract is INTENTIONAL (Option A): the worker's two-strike
+  // OK/NOT_AUTHENTICATED branch — NOT this advisory flag — owns
+  // escalation. These tests pin that contract behaviorally so a future
+  // refactor cannot accidentally promote the flag into a verification
+  // gate without the spec-revision discussion the docstring requires.
+
+  it('flips to true after threshold strikes — diagnostic only', () => {
+    const s = new TrustBaseStaleness({
+      refresher: noopRefresher(),
+      notAuthenticatedStaleThreshold: 1,
+    });
+    expect(s.isTrustBaseStale()).toBe(false);
+    s.recordNotAuthenticated();
+    expect(s.isTrustBaseStale()).toBe(true);
+  });
+
+  it('does NOT cause `recordNotAuthenticated` to throw or block', () => {
+    const s = new TrustBaseStaleness({
+      refresher: noopRefresher(),
+      notAuthenticatedStaleThreshold: 1,
+    });
+    s.recordNotAuthenticated();
+    // Stale flag is up. The class still records subsequent strikes
+    // and answers them — it's purely a counter + diagnostic, not a
+    // gate.
+    expect(() => s.recordNotAuthenticated()).not.toThrow();
+    expect(s.isTrustBaseStale()).toBe(true);
+  });
+
+  it('does NOT prevent recordAuthenticatedOk from clearing the counter', () => {
+    // The advisory contract: isTrustBaseStale() is forensic. An
+    // authenticated OK clears the flag — a refresh that hasn't yet
+    // applied does NOT block the OK from being accepted.
+    const s = new TrustBaseStaleness({
+      refresher: noopRefresher(),
+      notAuthenticatedStaleThreshold: 1,
+    });
+    s.recordNotAuthenticated();
+    expect(s.isTrustBaseStale()).toBe(true);
+    s.recordAuthenticatedOk();
+    expect(s.isTrustBaseStale()).toBe(false);
+  });
+
+  it('source carries the advisory-only docstring (anchored to spec §9.4.1)', async () => {
+    // Anchor test for the docstring rationale. If a future refactor
+    // changes the advisory semantics, this test fails and forces a
+    // protocol-revision review.
+    //
+    // We read the source file directly because we want to assert on
+    // the comment block, not on runtime behavior.
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const src = await fs.readFile(
+      path.resolve(
+        __dirname,
+        '../../../../modules/payments/transfer/trustbase-staleness.ts',
+      ),
+      'utf8',
+    );
+    expect(src).toMatch(/ADVISORY-ONLY \(Wave 3 \/ steelman\)/);
+    expect(src).toMatch(/§9\.4\.1/);
+  });
+});

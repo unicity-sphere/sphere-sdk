@@ -473,8 +473,16 @@ async function fetchOneGateway(args: FetchOneGatewayArgs): Promise<GatewayOutcom
   // serve a CAR larger than the cap, and rejecting early avoids one
   // round-trip's worth of bytes. We do NOT trust it as a substitute
   // for the streaming counter — a hostile gateway might lie low and
-  // serve a bigger body anyway. The streaming counter is the
-  // authoritative cap.
+  // serve a bigger body anyway.
+  //
+  // **Steelman fix (Wave 3) — semantic clarification.** A missing OR
+  // zero `content-length` header means "unknown size" (HTTP/1.1
+  // chunked transfer or HTTP/2 streams omit the header entirely; some
+  // proxies report 0 to mean "unknown"). In BOTH cases we DO NOT
+  // early-bail — we proceed to the streaming read, where the running
+  // `byteCounter` against `maxBytes` is the authoritative cap. The
+  // streaming counter alone enforces the cap; the Content-Length
+  // check below is a fast-path optimisation, not a security gate.
   const contentLengthHeader = response.headers.get('content-length');
   if (contentLengthHeader !== null) {
     const parsed = Number(contentLengthHeader);
@@ -692,20 +700,80 @@ function isAbortError(err: unknown): boolean {
 }
 
 /**
+ * Hard cap on how many characters we allow in a single rendered error
+ * string. A hostile gateway can return a multi-megabyte HTML body that
+ * winds up wrapped in a fetch-layer Error; we trim aggressively so that
+ * the `failureReasons` array stays a small, log-friendly payload.
+ *
+ * @internal
+ */
+const MAX_REASON_LENGTH = 200;
+
+/**
  * Render an unknown thrown value as a one-line string for the
  * `failureReasons` log. Avoids stringifying full stacks (those are
  * preserved in the SphereError's `cause` chain for debug consumers).
  *
+ * **Steelman fix (Wave 3): log-injection / dashboard-XSS hardening.**
+ * `stringifyError` is invoked with raw exception messages from network
+ * errors (e.g. `Error: 4xx body: <attacker-controlled HTML>`) — a hostile
+ * gateway can plant arbitrary content in those strings which then surfaces
+ * via the `transfer:fetch-failed` event payload. Operator dashboards that
+ * render that payload without escaping would expose log-injection or
+ * stored-XSS attack vectors.
+ *
+ * Defense:
+ *   1. Truncate to {@link MAX_REASON_LENGTH} (~200) characters with a
+ *      trailing `…` marker so log readers see the truncation.
+ *   2. Strip ASCII / Unicode control characters (`\x00-\x1F`, `\x7F-\x9F`)
+ *      to prevent newline / carriage-return injection that splits log
+ *      records.
+ *   3. Strip HTML/XML angle brackets and ampersand (`<`, `>`, `&`) so a
+ *      naive HTML-rendering operator dashboard does not interpret the
+ *      payload as markup.
+ *
+ * **Diagnostic strings, NOT HTML-safe.** Even after sanitization, the
+ * resulting reasons are PLAIN TEXT — consumers MUST escape via the host
+ * dashboard's standard HTML-escape pipeline before rendering. The
+ * sanitization here is defense-in-depth (catching naive renderers), not
+ * a license to skip standard escaping.
+ *
  * @internal
  */
 function stringifyError(err: unknown): string {
+  let raw: string;
   if (err instanceof Error) {
-    return err.message || err.name;
+    raw = err.message || err.name;
+  } else if (typeof err === 'string') {
+    raw = err;
+  } else {
+    try {
+      raw = JSON.stringify(err);
+    } catch {
+      raw = String(err);
+    }
   }
-  if (typeof err === 'string') return err;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
+  return sanitizeReasonString(raw);
+}
+
+/**
+ * Apply the sanitize-and-truncate rules described on
+ * {@link stringifyError}. Exported under `@internal` JSDoc only — the
+ * function is module-private so test files import it via the source path.
+ *
+ * @internal
+ */
+function sanitizeReasonString(raw: string): string {
+  // Drop control characters and HTML markup characters in a single pass.
+  // We use String.fromCharCode replacement (rather than Unicode property
+  // escapes) so the regex stays portable across Node 18+ and the browser
+  // runtimes we support.
+  const stripped = raw.replace(
+    // eslint-disable-next-line no-control-regex
+    /[\x00-\x1F\x7F-\x9F<>&]/g,
+    '',
+  );
+  if (stripped.length <= MAX_REASON_LENGTH) return stripped;
+  // Reserve 1 char for the truncation marker `…`.
+  return `${stripped.slice(0, MAX_REASON_LENGTH - 1)}…`;
 }

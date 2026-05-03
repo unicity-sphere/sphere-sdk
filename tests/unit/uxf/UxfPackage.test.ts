@@ -530,4 +530,141 @@ describe('UxfPackage', () => {
       expect(ids).toContain(tokenId(TOKEN_B));
     });
   });
+
+  // -------------------------------------------------------------------------
+  // Steelman Wave 3 — fromCar per-block caps (count + bytes)
+  // -------------------------------------------------------------------------
+  describe('fromCar — bloat-DoS caps', () => {
+    /**
+     * Build a hostile CAR with a real (parseable) envelope + manifest
+     * pair, then flood with `extraTiny` tiny non-element blocks AND/OR
+     * with one oversized block. The envelope/manifest are required so
+     * importFromCar's preamble succeeds and we reach the for-await
+     * loop where the per-block caps fire.
+     */
+    async function buildHostileCar(opts: {
+      extraTinyCount?: number;
+      injectOversized?: boolean;
+    }): Promise<Uint8Array> {
+      const { CarWriter } = await import('@ipld/car/writer');
+      const { CID } = await import('multiformats');
+      const { encode: dagCborEncode } = await import('@ipld/dag-cbor');
+      const { sha256 } = await import('@noble/hashes/sha2.js');
+
+      const cidFromBytes = (bytes: Uint8Array): CID => {
+        const hash = sha256(bytes);
+        const digestBytes = new Uint8Array(2 + hash.length);
+        digestBytes[0] = 0x12;
+        digestBytes[1] = hash.length;
+        digestBytes.set(hash, 2);
+        return CID.createV1(0x71, {
+          code: 0x12,
+          size: hash.length,
+          digest: hash,
+          bytes: digestBytes,
+        } as never);
+      };
+
+      // Build a minimal valid manifest block (no tokens — empty
+      // manifest is fine, importFromCar reaches the blocks() loop
+      // regardless).
+      const manifestNode = { tokens: {} as Record<string, CID> };
+      const manifestBytes = dagCborEncode(manifestNode);
+      const manifestCid = cidFromBytes(manifestBytes);
+
+      // Build a minimal valid envelope referencing the manifest CID.
+      const envelopeNode = {
+        version: '1.0.0',
+        createdAt: 1700000000,
+        updatedAt: 1700000001,
+        manifest: manifestCid,
+      };
+      const envelopeBytes = dagCborEncode(envelopeNode);
+      const envelopeCid = cidFromBytes(envelopeBytes);
+
+      const { writer, out } = CarWriter.create([envelopeCid]);
+      const chunks: Uint8Array[] = [];
+      const collectPromise = (async () => {
+        for await (const chunk of out) chunks.push(chunk);
+      })();
+      await writer.put({ cid: envelopeCid, bytes: envelopeBytes });
+      await writer.put({ cid: manifestCid, bytes: manifestBytes });
+
+      if (opts.injectOversized) {
+        // 128 KiB block — well above CAR_IMPORT_MAX_BLOCK_BYTES (64 KiB).
+        const oversized = new Uint8Array(128 * 1024);
+        for (let i = 0; i < oversized.length; i++) oversized[i] = i & 0xff;
+        const blockBytes = dagCborEncode({ blob: oversized });
+        const blockCid = cidFromBytes(blockBytes);
+        await writer.put({ cid: blockCid, bytes: blockBytes });
+      }
+
+      const N = opts.extraTinyCount ?? 0;
+      if (N > 0) {
+        // Emit distinct VALID UXF token-state elements via the real
+        // encoder so each block (a) decodes via `decodeIpldElement`,
+        // (b) hash-verifies vs its CID, and (c) is structurally
+        // non-malformed. Without this the loop body would throw
+        // SERIALIZATION_ERROR on the first garbage block long before
+        // reaching the count cap.
+        const { elementToIpldBlock } = await import('../../../uxf/ipld.js');
+        for (let i = 0; i < N; i++) {
+          // Unique 64-char hex per element so each maps to a distinct CID.
+          const counter = i.toString(16).padStart(8, '0');
+          const predicateHex = (counter + '00'.repeat(28)).slice(0, 64);
+          const el: UxfElement = {
+            header: {
+              representation: 1,
+              semantics: 1,
+              kind: 'default',
+              predecessor: null,
+            },
+            type: 'token-state',
+            content: { predicate: predicateHex, data: null },
+            children: {},
+          };
+          const block = elementToIpldBlock(el);
+          await writer.put({ cid: block.cid, bytes: block.bytes });
+        }
+      }
+      await writer.close();
+      await collectPromise;
+
+      let total = 0;
+      for (const c of chunks) total += c.byteLength;
+      const carBytes = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        carBytes.set(c, off);
+        off += c.byteLength;
+      }
+      return carBytes;
+    }
+
+    it('rejects a CAR whose block count exceeds CAR_IMPORT_MAX_BLOCK_COUNT', async () => {
+      // 10_005 extra tiny blocks + envelope + manifest = 10_007 total —
+      // exceeds CAR_IMPORT_MAX_BLOCK_COUNT (10_000).
+      const carBytes = await buildHostileCar({ extraTinyCount: 10_005 });
+
+      await expect(UxfPackage.fromCar(carBytes)).rejects.toThrow(UxfError);
+      try {
+        await UxfPackage.fromCar(carBytes);
+      } catch (e) {
+        expect((e as UxfError).code).toBe('INVALID_PACKAGE');
+        expect((e as UxfError).message).toContain('CAR_IMPORT_MAX_BLOCK_COUNT');
+      }
+    }, 30_000);
+
+    it('rejects a CAR whose single block exceeds CAR_IMPORT_MAX_BLOCK_BYTES', async () => {
+      const carBytes = await buildHostileCar({ injectOversized: true });
+
+      await expect(UxfPackage.fromCar(carBytes)).rejects.toThrow(UxfError);
+      try {
+        await UxfPackage.fromCar(carBytes);
+      } catch (e) {
+        expect((e as UxfError).code).toBe('INVALID_PACKAGE');
+        expect((e as UxfError).message).toContain('CAR_IMPORT_MAX_BLOCK_BYTES');
+      }
+    });
+  });
 });

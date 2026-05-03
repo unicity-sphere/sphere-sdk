@@ -23,6 +23,7 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from './import-inclusion-proof-fixtures';
 
 describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
@@ -33,7 +34,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     const h = buildImporterHarness();
     const result = await h.importer.importInclusionProof(
       ADDR,
-      'unknown-token-zzz',
+      tk('unknown-token-zzz'),
       proofFor({ requestId: 'rq-foo' }),
     );
     expect(result).toEqual({ ok: false, reason: 'no-such-token' });
@@ -47,12 +48,12 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 2: token already valid → transition="pending-still"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-already-valid`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-already-valid')}`, manifestEntryFor({
       status: 'valid',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-already-valid',
+      tk('t-already-valid'),
       proofFor({ requestId: 'rq-foo' }),
     );
     expect(result).toEqual({ ok: true, transition: 'pending-still' });
@@ -67,17 +68,17 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 3: pending + outstanding requestId → graft → "pending→valid" (last)', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-pending`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-pending')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-pending',
+      tokenId: tk('t-pending'),
       commitmentRequestId: 'rq-3a',
       status: 'pending',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-pending',
+      tk('t-pending'),
       proofFor({ requestId: 'rq-3a' }),
     );
     expect(result).toEqual({ ok: true, transition: 'pending→valid' });
@@ -92,16 +93,16 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
 
   it('CASE 3: pending + outstanding requestId AND more remaining → "pending-still"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-pending2`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-pending2')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(
-      queueEntryFor({ tokenId: 't-pending2', commitmentRequestId: 'rq-3a', status: 'pending' }),
-      queueEntryFor({ tokenId: 't-pending2', commitmentRequestId: 'rq-3b', status: 'pending', txIndex: 1 }),
+      queueEntryFor({ tokenId: tk('t-pending2'), commitmentRequestId: 'rq-3a', status: 'pending' }),
+      queueEntryFor({ tokenId: tk('t-pending2'), commitmentRequestId: 'rq-3b', status: 'pending', txIndex: 1 }),
     );
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-pending2',
+      tk('t-pending2'),
       proofFor({ requestId: 'rq-3a' }),
     );
     expect(result).toEqual({ ok: true, transition: 'pending-still' });
@@ -113,17 +114,17 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 4a: pending + already-attached → transition="pending-still"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-attached`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-attached')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-attached',
+      tokenId: tk('t-attached'),
       commitmentRequestId: 'rq-attached',
       status: 'attached', // §5.5 step 5 between 1-3 done and 4 removal
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-attached',
+      tk('t-attached'),
       proofFor({ requestId: 'rq-attached' }),
     );
     expect(result).toEqual({ ok: true, transition: 'pending-still' });
@@ -135,17 +136,17 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 4b: pending + requestId mismatch → reason="requestid-mismatch"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-mismatch`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-mismatch')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-mismatch',
+      tokenId: tk('t-mismatch'),
       commitmentRequestId: 'rq-some-other',
       status: 'pending',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-mismatch',
+      tk('t-mismatch'),
       proofFor({ requestId: 'rq-NOT-HERE' }),
     );
     expect(result).toEqual({ ok: false, reason: 'requestid-mismatch' });
@@ -159,24 +160,24 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     const h = buildImporterHarness();
     // Invalid record exists.
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-bad')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-bad'), reason: 'oracle-rejected' }),
     );
     // Manifest carries a stale rootHash so the importer's invalid
     // lookup uses the right key.
-    h.manifest.entries.set(`${ADDR}:t-bad`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-bad')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-bad',
+      tokenId: tk('t-bad'),
       commitmentRequestId: 'rq-bad',
       status: 'hard-fail',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      tk('t-bad'),
       proofFor({ requestId: 'rq-bad' }),
       { allowInvalidOverride: true, currentTime: 1700000001000, operatorPubkey: 'op-pk-1' },
     );
@@ -194,7 +195,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     );
     expect(oe.length).toBe(1);
     expect(oe[0]!.data).toEqual({
-      tokenId: 't-bad',
+      tokenId: tk('t-bad'),
       overrideAppliedAt: 1700000001000,
       overrideAppliedBy: 'op-pk-1',
       previousReason: 'oracle-rejected',
@@ -208,10 +209,10 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   it('CASE 6: _invalid + allowInvalidOverride + multiple hard-fail → "invalid→pending"', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-chain.${'bb'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-chain', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-chain')}.${'bb'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-chain'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-chain`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-chain')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'bb'.repeat(32),
@@ -219,13 +220,13 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     // 3 hard-failed queue entries — proof targets the first; remaining
     // 2 should be re-queued.
     h.queue.entries.push(
-      queueEntryFor({ tokenId: 't-chain', commitmentRequestId: 'rq-c0', txIndex: 0, status: 'hard-fail' }),
-      queueEntryFor({ tokenId: 't-chain', commitmentRequestId: 'rq-c1', txIndex: 1, status: 'hard-fail' }),
-      queueEntryFor({ tokenId: 't-chain', commitmentRequestId: 'rq-c2', txIndex: 2, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-chain'), commitmentRequestId: 'rq-c0', txIndex: 0, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-chain'), commitmentRequestId: 'rq-c1', txIndex: 1, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-chain'), commitmentRequestId: 'rq-c2', txIndex: 2, status: 'hard-fail' }),
     );
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-chain',
+      tk('t-chain'),
       proofFor({ requestId: 'rq-c0' }),
       { allowInvalidOverride: true, currentTime: 1700000002000 },
     );
@@ -254,22 +255,22 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   it('CASE 7: _invalid + no override flag → reason="tokenId-in-invalid"', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-bad')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-bad'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-bad`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-bad')}`, manifestEntryFor({
       status: 'invalid',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-bad',
+      tokenId: tk('t-bad'),
       commitmentRequestId: 'rq-bad',
       status: 'hard-fail',
     }));
     // Default: allowInvalidOverride = false.
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad',
+      tk('t-bad'),
       proofFor({ requestId: 'rq-bad' }),
     );
     expect(result).toEqual({ ok: false, reason: 'tokenId-in-invalid' });
@@ -285,17 +286,17 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 8: PATH_NOT_INCLUDED → reason="proof-not-anchored"', async () => {
     const h = buildImporterHarness({ verifyResult: 'PATH_NOT_INCLUDED' });
-    h.manifest.entries.set(`${ADDR}:t-noinclusion`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-noinclusion')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-noinclusion',
+      tokenId: tk('t-noinclusion'),
       commitmentRequestId: 'rq-nope',
       status: 'pending',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-noinclusion',
+      tk('t-noinclusion'),
       proofFor({ requestId: 'rq-nope' }),
     );
     expect(result).toEqual({ ok: false, reason: 'proof-not-anchored' });
@@ -306,16 +307,16 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     const h = buildImporterHarness({ verifyResult: 'PATH_NOT_INCLUDED' });
     // Invalid token; even with override flag, bad proof MUST NOT flip it.
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-bad-pna.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-bad-pna' }),
+      `${ADDR}.invalid.${tk('t-bad-pna')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-bad-pna') }),
     );
-    h.manifest.entries.set(`${ADDR}:t-bad-pna`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-bad-pna')}`, manifestEntryFor({
       status: 'invalid',
       rootHashHex: 'aa'.repeat(32),
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad-pna',
+      tk('t-bad-pna'),
       proofFor({ requestId: 'rq-anything' }),
       { allowInvalidOverride: true },
     );
@@ -328,17 +329,17 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 9: PATH_INVALID → reason="proof-trustbase-failed"', async () => {
     const h = buildImporterHarness({ verifyResult: 'PATH_INVALID' });
-    h.manifest.entries.set(`${ADDR}:t-bad-proof`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-bad-proof')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-bad-proof',
+      tokenId: tk('t-bad-proof'),
       commitmentRequestId: 'rq-bad',
       status: 'pending',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-bad-proof',
+      tk('t-bad-proof'),
       proofFor({ requestId: 'rq-bad' }),
     );
     expect(result).toEqual({ ok: false, reason: 'proof-trustbase-failed' });
@@ -346,12 +347,12 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
 
   it('CASE 9: NOT_AUTHENTICATED → reason="proof-trustbase-failed"', async () => {
     const h = buildImporterHarness({ verifyResult: 'NOT_AUTHENTICATED' });
-    h.manifest.entries.set(`${ADDR}:t-not-auth`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-not-auth')}`, manifestEntryFor({
       status: 'pending',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-not-auth',
+      tk('t-not-auth'),
       proofFor({ requestId: 'rq-x' }),
     );
     expect(result).toEqual({ ok: false, reason: 'proof-trustbase-failed' });
@@ -359,12 +360,12 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
 
   it('CASE 9: THROWN → reason="proof-trustbase-failed"', async () => {
     const h = buildImporterHarness({ verifyResult: 'THROWN' });
-    h.manifest.entries.set(`${ADDR}:t-thrown`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-thrown')}`, manifestEntryFor({
       status: 'pending',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-thrown',
+      tk('t-thrown'),
       proofFor({ requestId: 'rq-x' }),
     );
     expect(result).toEqual({ ok: false, reason: 'proof-trustbase-failed' });
@@ -376,12 +377,12 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('address scoping: entries for ADDR_ALT do not satisfy a lookup for ADDR', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR_ALT}:t-shared`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR_ALT}:${tk('t-shared')}`, manifestEntryFor({
       status: 'valid',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-shared',
+      tk('t-shared'),
       proofFor({ requestId: 'rq-x' }),
     );
     // ADDR has no entry → case 1.
@@ -395,11 +396,11 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE 3 (#155): pending + transactionHash mismatch → reason="proof-binding-mismatch"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-tx-mismatch`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-tx-mismatch')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-tx-mismatch',
+      tokenId: tk('t-tx-mismatch'),
       commitmentRequestId: 'rq-tx',
       status: 'pending',
       transactionHash: '0000' + 'aa'.repeat(32),
@@ -407,7 +408,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-tx-mismatch',
+      tk('t-tx-mismatch'),
       proofFor({
         requestId: 'rq-tx',
         // Different transactionHash — same requestId.
@@ -422,11 +423,11 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
 
   it('CASE 3 (#155): pending + authenticator mismatch → reason="proof-binding-mismatch"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-auth-mismatch`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-auth-mismatch')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-auth-mismatch',
+      tokenId: tk('t-auth-mismatch'),
       commitmentRequestId: 'rq-auth',
       status: 'pending',
       transactionHash: '0000' + 'aa'.repeat(32),
@@ -434,7 +435,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-auth-mismatch',
+      tk('t-auth-mismatch'),
       proofFor({
         requestId: 'rq-auth',
         transactionHash: '0000' + 'aa'.repeat(32),
@@ -447,11 +448,11 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
 
   it('CASE 3 (#155): pending + case-different but byte-equal hex → graft accepted', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-case`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-case')}`, manifestEntryFor({
       status: 'pending',
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-case',
+      tokenId: tk('t-case'),
       commitmentRequestId: 'rq-case',
       status: 'pending',
       transactionHash: '0000' + 'AB'.repeat(32),
@@ -459,7 +460,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-case',
+      tk('t-case'),
       proofFor({
         requestId: 'rq-case',
         // Same bytes, different case — must compare equal.
@@ -481,16 +482,16 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   it('CASE 5 (#155): _invalid + requestId match but transactionHash mismatch → reason="proof-binding-mismatch"', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-evil.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-evil', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-evil')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-evil'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-evil`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-evil')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-evil',
+      tokenId: tk('t-evil'),
       commitmentRequestId: 'rq-evil',
       status: 'hard-fail',
       transactionHash: '0000' + 'aa'.repeat(32),
@@ -498,7 +499,7 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-evil',
+      tk('t-evil'),
       proofFor({
         // Attacker brings a different proof (different transaction)
         // that happens to share the requestId.
@@ -525,20 +526,20 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
   // ---------------------------------------------------------------------------
   it('CASE invalid-record-missing (#165): manifest=invalid + no _invalid record → reason="invalid-record-missing"', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-orphan`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-orphan')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     // NB: no disposition entry written — structurally inconsistent.
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-orphan',
+      tokenId: tk('t-orphan'),
       commitmentRequestId: 'rq-orphan',
       status: 'hard-fail',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-orphan',
+      tk('t-orphan'),
       proofFor({ requestId: 'rq-orphan' }),
       { allowInvalidOverride: true },
     );
@@ -551,19 +552,19 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
 
   it('CASE invalid-record-missing (#165): allowSyntheticInvalidEntry=true falls back to synthesis', async () => {
     const h = buildImporterHarness();
-    h.manifest.entries.set(`${ADDR}:t-orphan-ok`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-orphan-ok')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-orphan-ok',
+      tokenId: tk('t-orphan-ok'),
       commitmentRequestId: 'rq-orphan-ok',
       status: 'hard-fail',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-orphan-ok',
+      tk('t-orphan-ok'),
       proofFor({ requestId: 'rq-orphan-ok' }),
       {
         allowInvalidOverride: true,
@@ -585,27 +586,27 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     // the synthesized one.
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-paired.${'aa'.repeat(32)}`,
+      `${ADDR}.invalid.${tk('t-paired')}.${'aa'.repeat(32)}`,
       invalidEntryFor({
-        tokenId: 't-paired',
+        tokenId: tk('t-paired'),
         reason: 'oracle-rejected',
         bundleCid: 'bafy-real',
         senderTransportPubkey: 'pk-real',
       }),
     );
-    h.manifest.entries.set(`${ADDR}:t-paired`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-paired')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-paired',
+      tokenId: tk('t-paired'),
       commitmentRequestId: 'rq-paired',
       status: 'hard-fail',
     }));
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-paired',
+      tk('t-paired'),
       proofFor({ requestId: 'rq-paired' }),
       { allowInvalidOverride: true },
     );
@@ -614,5 +615,143 @@ describe('§6.3 importInclusionProof — 10 sub-cases (W4)', () => {
     // Real provenance preserved — not the empty-string synthesis.
     expect(h.overrideCalls[0]!.previousInvalidEntry.bundleCid).toBe('bafy-real');
     expect(h.overrideCalls[0]!.previousInvalidEntry.senderTransportPubkey).toBe('pk-real');
+  });
+
+  // ---------------------------------------------------------------------------
+  // (Wave 3 steelman) invalid-tokenid — reject non-canonical tokenIds before
+  // any storage probe. An attacker shaping a tokenId like `"../"` could
+  // otherwise probe `_invalid` storage at an attacker-controlled key on a
+  // backend that doesn't enforce key shape, then mis-apply the override
+  // against a colliding sentinel-keyed record.
+  // ---------------------------------------------------------------------------
+  it('Wave 3 steelman: non-hex tokenId is rejected with reason="invalid-tokenid"', async () => {
+    const h = buildImporterHarness();
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      '../',
+      proofFor({ requestId: 'rq-anything' }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'invalid-tokenid' });
+    // The reject fires BEFORE any storage probe — verifyProof / queue
+    // scan / disposition read are NOT touched.
+    expect(h.verifyCalls.length).toBe(0);
+    expect(h.graftCalls.length).toBe(0);
+    expect(h.overrideCalls.length).toBe(0);
+    expect(h.events.events.length).toBe(0);
+  });
+
+  it('Wave 3 steelman: tokenId with wrong length is rejected', async () => {
+    const h = buildImporterHarness();
+    // 32 hex chars instead of 64.
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      'ab'.repeat(16),
+      proofFor({ requestId: 'rq' }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'invalid-tokenid' });
+  });
+
+  it('Wave 3 steelman: empty tokenId is rejected', async () => {
+    const h = buildImporterHarness();
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      '',
+      proofFor({ requestId: 'rq' }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'invalid-tokenid' });
+  });
+
+  it('Wave 3 steelman: 64-char hex tokenId (canonical form) passes the validation gate', async () => {
+    // Mixed case is allowed (case-insensitive validation).
+    const h = buildImporterHarness();
+    const id = 'AB'.repeat(32);
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      id,
+      proofFor({ requestId: 'rq' }),
+    );
+    // No manifest entry → CASE 1 'no-such-token' (not 'invalid-tokenid').
+    expect(result).toEqual({ ok: false, reason: 'no-such-token' });
+  });
+
+  // ---------------------------------------------------------------------------
+  // (Wave 3 steelman) requestid-ambiguous — defensive guard against a
+  // queue scanner returning >1 matching entry for the same
+  // (tokenId, commitmentRequestId). Production code paths cannot produce
+  // duplicates, but a writer bug or CRDT concurrent-add could surface
+  // them; silently picking matching[0] would risk applying the proof to
+  // the wrong entry. Surface the ambiguity instead.
+  // ---------------------------------------------------------------------------
+  it('Wave 3 steelman: pending path — duplicate (tokenId, requestId) → reason="requestid-ambiguous"', async () => {
+    const h = buildImporterHarness();
+    const tid = tk('t-amb');
+    h.manifest.entries.set(`${ADDR}:${tid}`, manifestEntryFor({
+      status: 'pending',
+    }));
+    // Two queue entries with IDENTICAL (tokenId, commitmentRequestId).
+    h.queue.entries.push(
+      queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-dup',
+        status: 'pending',
+        txIndex: 0,
+      }),
+      queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-dup',
+        status: 'pending',
+        txIndex: 1, // distinct entry, same routing key
+      }),
+    );
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      tid,
+      proofFor({ requestId: 'rq-dup' }),
+    );
+    expect(result).toEqual({ ok: false, reason: 'requestid-ambiguous' });
+    // Importer refuses to graft against an ambiguous match.
+    expect(h.graftCalls.length).toBe(0);
+    expect(h.overrideCalls.length).toBe(0);
+  });
+
+  it('Wave 3 steelman: invalid path — duplicate (tokenId, requestId) → reason="requestid-ambiguous"', async () => {
+    const h = buildImporterHarness();
+    const tid = tk('t-amb-inv');
+    h.disposition.entries.set(
+      `${ADDR}.invalid.${tid}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tid, reason: 'oracle-rejected' }),
+    );
+    h.manifest.entries.set(`${ADDR}:${tid}`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'oracle-rejected',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    h.queue.entries.push(
+      queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-dup-inv',
+        status: 'hard-fail',
+        txIndex: 0,
+      }),
+      queueEntryFor({
+        tokenId: tid,
+        commitmentRequestId: 'rq-dup-inv',
+        status: 'hard-fail',
+        txIndex: 1,
+      }),
+    );
+    const result = await h.importer.importInclusionProof(
+      ADDR,
+      tid,
+      proofFor({ requestId: 'rq-dup-inv' }),
+      { allowInvalidOverride: true },
+    );
+    expect(result).toEqual({ ok: false, reason: 'requestid-ambiguous' });
+    // Override callback NOT invoked — the §5.6 monotonicity invariant
+    // is preserved and the operator gets a distinct reason for triage.
+    expect(h.overrideCalls.length).toBe(0);
+    expect(
+      h.events.events.filter((e) => e.type === 'transfer:override-applied').length,
+    ).toBe(0);
   });
 });

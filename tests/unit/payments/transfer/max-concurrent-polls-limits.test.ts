@@ -229,3 +229,95 @@ describe('FinalizationWorkerSender — concurrency caps (W14)', () => {
     });
   });
 });
+
+// =============================================================================
+// 4. Wave 3 #6 — head-pointer compaction under heavy contention
+// =============================================================================
+
+describe('CountingSemaphore — head-pointer waiter queue (Wave 3 #6)', () => {
+  it('1000+ waiters drain in FIFO order', async () => {
+    // Pre-fix `Array.shift()` is O(n) per release; with 1000+ waiters
+    // a release wave is O(n²) total. The post-fix head-pointer
+    // strategy is amortized O(1) per dequeue. This test asserts FIFO
+    // ordering across a 1000-waiter drain — the bug would surface as
+    // either an ordering violation OR a stack-blowing performance
+    // collapse on slow runners.
+    const sem = new CountingSemaphore(1);
+    const r0 = await sem.acquire();
+    const N = 1000;
+    const observed: number[] = [];
+    const completions: Array<Promise<void>> = [];
+    for (let i = 0; i < N; i++) {
+      completions.push(
+        sem.acquire().then((release) => {
+          observed.push(i);
+          release();
+        }),
+      );
+    }
+    expect(sem.available).toBe(0);
+    // Confirm waiterCount reflects the queue size (this surface is
+    // exposed for telemetry / test assertions specifically).
+    expect((sem as unknown as { waiterCount: number }).waiterCount).toBe(N);
+
+    // Release the initial permit — the chain reaction wakes every
+    // waiter in order. Each waiter releases its own permit before
+    // exiting, so the chain runs synchronously (queue is drained).
+    r0();
+    await Promise.all(completions);
+
+    expect(observed.length).toBe(N);
+    for (let i = 0; i < N; i++) {
+      expect(observed[i]).toBe(i);
+    }
+    expect((sem as unknown as { waiterCount: number }).waiterCount).toBe(0);
+    expect(sem.available).toBeGreaterThanOrEqual(1);
+  });
+
+  it('compaction runs under sustained churn — internal array stays bounded', async () => {
+    // Beyond 32 dequeues with 2x consumed-vs-live, the implementation
+    // slices off the consumed prefix. We can't directly observe the
+    // backing array length, but `waiterCount` lets us assert the live
+    // queue is correctly sized after a long sequence of pushes/pops.
+    const sem = new CountingSemaphore(1);
+    const r0 = await sem.acquire();
+    // Push 200 waiters.
+    const completions: Array<Promise<void>> = [];
+    for (let i = 0; i < 200; i++) {
+      completions.push(sem.acquire().then((rel) => rel()));
+    }
+    expect(
+      (sem as unknown as { waiterCount: number }).waiterCount,
+    ).toBe(200);
+    r0();
+    await Promise.all(completions);
+    expect(
+      (sem as unknown as { waiterCount: number }).waiterCount,
+    ).toBe(0);
+  });
+
+  it('head-pointer drain preserves correctness when interleaved with new pushes', async () => {
+    // Acquire / release / re-acquire pattern that exercises the
+    // compaction path while new waiters arrive between drains.
+    const sem = new CountingSemaphore(2);
+    const acquired: Array<() => void> = [];
+    acquired.push(await sem.acquire());
+    acquired.push(await sem.acquire());
+    const queued: Array<{ idx: number; promise: Promise<() => void> }> = [];
+    for (let i = 0; i < 50; i++) {
+      queued.push({ idx: i, promise: sem.acquire() });
+    }
+    // Drain in interleaved batches to push the head pointer past 32.
+    for (let i = 0; i < 50; i++) {
+      acquired[i % 2]!();
+      const next = await queued[i]!.promise;
+      acquired[i % 2] = next;
+    }
+    // Final cleanup.
+    for (const r of acquired) r();
+    expect(sem.available).toBeGreaterThanOrEqual(2);
+    expect(
+      (sem as unknown as { waiterCount: number }).waiterCount,
+    ).toBe(0);
+  });
+});

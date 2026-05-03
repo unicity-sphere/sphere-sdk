@@ -151,6 +151,15 @@ export type SphereErrorCode =
   | 'BUNDLE_REJECTED_CHAIN_DEPTH_EXCEEDED'
   | 'BUNDLE_REJECTED_UNCLAIMED_ROOT_COUNT_EXCEEDED'
   | 'BUNDLE_REJECTED_CID_MODE_NOT_YET_SUPPORTED'
+  // Recipient-side authoritative inline-CAR size cap. The sender enforces
+  // `clampInlineCap` against `RELAY_SAFE_CAP_BYTES = 96 KiB` before
+  // inlining, but that's a politeness layer. Without recipient
+  // enforcement, a hostile sender can ship a 6 MiB base64 payload
+  // (~4.5 MiB CAR), bypassing the cap entirely and forcing the recipient
+  // to base64-decode and CAR-parse a multi-megabyte blob. Surfaces from
+  // `bundle-acquirer.ts` Step 2 when `payload.carBase64.length` exceeds
+  // the cap. Steelman fix #170. */
+  | 'BUNDLE_REJECTED_INLINE_CAP_EXCEEDED'
   // Generic structural rejection — used by the bundle verifier when
   // `pkg.verify()` reports any non-multi-root structural failure (cycle,
   // hash mismatch, missing element, type-tag mismatch, ...). The originating
@@ -301,6 +310,17 @@ export type SphereErrorCode =
    * provider must be configured to send bundles of this size. See §3.3.1
    * / approach γ inline-fallback. */
   | 'IPFS_PUBLISHER_REQUIRED'
+  /**
+   * UXF Inter-Wallet Transfer (steelman Wave 3) — the caller explicitly
+   * selected `force-cid` delivery (privacy / audit-by-CID intent) but no
+   * `publishToIpfs` callback was supplied. The resolver REFUSES to
+   * silently downgrade to inline because that would leak the CAR to the
+   * relay — a privacy regression vs the caller's explicit choice. The
+   * caller must either (a) wire an IPFS publisher or (b) switch to
+   * `auto` / `force-inline` if the inline leak is acceptable. Distinct
+   * from `IPFS_PUBLISHER_REQUIRED` (which fires only when the bundle is
+   * physically too large for inline delivery). */
+  | 'FORCE_CID_NO_PUBLISHER'
   /**
    * UXF Inter-Wallet Transfer T.3.B.1 — per-element verifier surfaced a
    * SHAPE-LEVEL failure (parser threw, malformed authenticator, missing

@@ -13,6 +13,43 @@
  * coin entry. Coin and NFT tokens are class-disjoint per the canonical
  * model — no token carries both.
  *
+ * # ⚠ INVARIANT — NORMALIZE-BEFORE-CLASSIFY (Wave 3 steelman fix #170 issue 8)
+ *
+ * `classifyToken` is **PURE on its projection input**. Its correctness
+ * depends on the caller having already pruned zero-amount coin entries
+ * from `coins[]`. The classifier itself does NOT prune (the comment on
+ * `classifyToken` notes this; the file-level comment now elevates it to
+ * a load-bearing invariant for cascade-walker / disposition-engine
+ * consumers):
+ *
+ *   - **A token with `coinData = [["UCT", "0"]]` (single zero-amount
+ *     entry) is semantically an NFT** — the zero-amount entry contributes
+ *     no fungible balance. But if the projection is constructed without
+ *     pruning (e.g. `Array.isArray(coinData) && coinData.length > 0` check
+ *     used at instant-sender.ts:391, conservative-sender.ts:391, txf-sender.ts:375),
+ *     the resulting `TokenLike.coins` may carry the `[{coinId: "UCT",
+ *     amount: 0n}]` entry — `coins.length > 0`, so `classifyToken` returns
+ *     `'coin'`. The SDK class-based view (which drops zero entries at
+ *     ingest time per §4.1) would consider it an NFT — class disjointness
+ *     is now violated downstream.
+ *
+ *   - **Mitigation**: every cascade walker / disposition path MUST run
+ *     `normalizeCoinData()` BEFORE calling `classifyToken`. The
+ *     target-validator partition already does this defensively (see
+ *     `partitionSources` line 173). Cascade-walker, disposition-engine,
+ *     and disposition writer paths inherit the invariant via projections
+ *     that filter `c.amount > 0n` (instant-sender / conservative-sender /
+ *     txf-sender's `defaultTokenLike` already do this; legacy-shape-
+ *     adapter projections route through normalizeCoinData transitively
+ *     via the validator).
+ *
+ *   - **Auditing rule**: search for callers of `classifyToken(...)` and
+ *     verify each call-site's input has either:
+ *       (a) flowed through `normalizeCoinData()` directly, OR
+ *       (b) been built via a projection that filters zero-amount entries.
+ *     A `classifyToken(t)` on a raw `TokenLike` whose projection rule is
+ *     unknown is a CORRECTNESS BUG, not a hot-path optimization.
+ *
  * @remarks
  * Every consumer of the canonical predicate routes through this module:
  *  - `target-validator.ts`     — §4.1 step 1 source-class enforcement.

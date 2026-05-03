@@ -406,12 +406,21 @@ export function validateTargets(
   }
 
   // 5b. NFT coverage — exact tokenId match in NFT-class sources, with
-  //     class disjointness guard. `findNftSource` looks at ALL sources
-  //     (coin or NFT) so it can disambiguate the rejection cause
-  //     (not-found vs class-mismatch vs not-bound).
+  //     class disjointness guard. `findNftSource` looks at the
+  //     UNFILTERED `availableSources` (incl. tokens with
+  //     `ownedBySender === false`) so it can disambiguate the rejection
+  //     cause (not-found vs class-mismatch vs not-bound).
+  //
+  // Steelman fix (#170 issue 4): the prior code passed
+  // `[...coinSources, ...nftSources]` here, but `partitionSources`
+  // already drops `ownedBySender === false` candidates — so the
+  // `not-bound` branch in `findNftSource` was dead code. Users sent
+  // tokens they own a different copy of saw `cause: 'not-found'` for
+  // an NFT they could see in their wallet via another address. Passing
+  // the raw pool restores the disambiguation contract.
   const matchedNftSources = new Map<string, TokenLike>();
   for (const nt of nftTargets) {
-    const src = findNftSource(nt.tokenId, [...coinSources, ...nftSources]);
+    const src = findNftSource(nt.tokenId, availableSources);
     matchedNftSources.set(nt.tokenId, src);
   }
 

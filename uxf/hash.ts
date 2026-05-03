@@ -317,8 +317,23 @@ export function computeElementHash(element: UxfElement): ContentHash {
       : null,
   ];
 
-  // Map string type tag to integer type ID
+  // Map string type tag to integer type ID.
+  //
+  // Steelman Wave 3 — domain-separation safety. Hash domain separation
+  // between element types relies on `typeId` being a known integer in
+  // `ELEMENT_TYPE_IDS`. If a future schema change adds a new element
+  // type without updating the map (or a hostile producer fabricates an
+  // unknown `element.type`), `typeId === undefined` would be encoded
+  // by dag-cbor as CBOR `undefined` — collapsing every unrecognized
+  // type into the same hash bucket and creating a collision class
+  // across all unrecognized types. Fail-closed at the boundary.
   const typeId = ELEMENT_TYPE_IDS[element.type];
+  if (typeId === undefined) {
+    throw new UxfError(
+      'INVALID_HASH',
+      `Unknown element type: ${String(element.type)}`,
+    );
+  }
 
   // Prepare content: hex byte fields -> Uint8Array
   const preparedContent = prepareContentForHashing(

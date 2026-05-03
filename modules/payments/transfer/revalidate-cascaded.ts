@@ -92,12 +92,25 @@ export type ChildRevalidationVerdict =
     };
 
 /**
- * Re-validator callback contract. Production wires this to a thin
- * coordinator that:
+ * Re-validator callback contract.
+ *
+ * **CONTRACT — parent re-read inside the validator's CAS.** Concurrent
+ * worker actions (or a reverted `importInclusionProof()` override) can
+ * flip the parent's manifest entry back to `'invalid'` between the
+ * runner's pre-loop parent-validity check and the validator's mutation.
+ * This module performs a fresh `manifestStore.readEntry()` on the
+ * parent **immediately before** invoking the validator for each child
+ * (defense-in-depth — see {@link RevalidateCascadedRunner._walkChildren}),
+ * but the validator itself MUST also re-read the parent INSIDE its CAS
+ * payload computation and abort with `'parent-still-invalid'` if the
+ * parent is no longer `'valid'`. Otherwise a TOCTOU race lets a
+ * concurrent re-invalidation slip past both gates.
+ *
+ * Production wires this to a thin coordinator that:
  *   1. Reads the parent's CURRENT manifest entry to confirm
  *      `status === 'valid'` (the operator override may have flipped
  *      it back, or a concurrent worker action may have re-invalidated
- *      it).
+ *      it). MUST happen INSIDE the CAS payload, NOT before.
  *   2. Re-runs §5.3 [B] (predicate evaluator), [C] (chain-validator),
  *      [E] (oracle.isSpent) against the child token.
  *   3. On pass: moves the child from `_invalid` back to the active
@@ -305,19 +318,6 @@ export class RevalidateCascadedRunner {
     // across replicas (matches the cascade walker's ordering rule).
     const sortedChildren = [...children].sort();
 
-    // Confirm the PARENT is currently valid — this is the gate that
-    // distinguishes "operator just flipped the parent via
-    // importInclusionProof" (parent valid → cascade reversal can fire)
-    // from "stale revalidation request" (parent still invalid → no-op
-    // for every child). Defense-in-depth against the operator
-    // double-invoking after a half-rolled-back override.
-    const parentEntry = await this.opts.manifestStore.readEntry(
-      addr,
-      currentTokenId,
-    );
-    const parentIsValid =
-      parentEntry !== undefined && parentEntry.status === 'valid';
-
     for (const childTokenId of sortedChildren) {
       // Cycle defense: skip already-visited tokens. Per §6.1.1:
       // "MUST maintain a visited set during transitive recursion".
@@ -363,6 +363,29 @@ export class RevalidateCascadedRunner {
 
       counters.checked++;
 
+      // RE-READ the parent FRESH for each child. The parent's status
+      // can flip mid-loop:
+      //   - A concurrent worker may re-invalidate the parent (e.g.
+      //     T.5.B sees a fresh oracle-rejected disposition arriving
+      //     after the operator's importInclusionProof override).
+      //   - The operator may invoke importInclusionProof again with
+      //     a different verdict on the parent.
+      //   - Recursion: when we descend into a successfully revalidated
+      //     child to walk grandchildren, we re-enter `_walkChildren`
+      //     with `currentTokenId = childTokenId`; that recursive frame
+      //     reads the child-as-parent fresh here too (defense against
+      //     stale state from the prior frame's perspective).
+      // Defense-in-depth: the validator also MUST re-read the parent
+      // inside its CAS (see {@link ChildRevalidator}'s contract). This
+      // pre-loop read is a cheap roundtrip-saver; the CAS read is the
+      // authoritative gate.
+      const parentEntry = await this.opts.manifestStore.readEntry(
+        addr,
+        currentTokenId,
+      );
+      const parentIsValid =
+        parentEntry !== undefined && parentEntry.status === 'valid';
+
       // If the parent isn't currently valid, every cascaded child
       // remains parent-rejected. Don't bother running the validator
       // — the verdict is determined and we save a roundtrip per
@@ -373,7 +396,8 @@ export class RevalidateCascadedRunner {
       }
 
       // Parent is valid; ask the validator whether this specific
-      // child re-passes [B]/[C]/[E].
+      // child re-passes [B]/[C]/[E]. The validator MUST re-read the
+      // parent INSIDE its CAS — see {@link ChildRevalidator}.
       const verdict = await this.opts.revalidateChild({
         addr,
         parentTokenId: currentTokenId,
@@ -386,7 +410,9 @@ export class RevalidateCascadedRunner {
           counters.revalidated++;
           // Transitive cascade reversal — the child is now valid, so
           // its OWN children (grandchildren of the original parent)
-          // may revalidate too. Recurse.
+          // may revalidate too. Recurse. The recursive frame re-reads
+          // the child (now grandparent) fresh inside its own loop, so
+          // a flip of THAT entry mid-grandchildren-walk is caught.
           await this._walkChildren(
             addr,
             childTokenId,
@@ -397,9 +423,9 @@ export class RevalidateCascadedRunner {
           break;
         case 'parent-still-invalid':
           // Race: the parent flipped back to `invalid` between our
-          // read above and the validator's read. Treat as still-
-          // invalid; do NOT recurse (the cascade is still in force
-          // for the subtree).
+          // pre-loop read above and the validator's CAS read. Treat
+          // as still-invalid; do NOT recurse (the cascade is still in
+          // force for the subtree).
           counters.stillInvalid++;
           break;
         case 'still-invalid-other':

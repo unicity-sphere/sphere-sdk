@@ -145,6 +145,9 @@
  * @packageDocumentation
  */
 
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+
 import { SphereError } from '../../../core/errors';
 import {
   isLegacyTokenTransferPayload,
@@ -644,6 +647,16 @@ export function classifyLegacyShape(value: unknown): LegacyShape | null {
  * tooling pattern-matches on it to distinguish legacy-shape arrivals
  * from UXF arrivals at the `_invalid` / `_audit` collection level.
  *
+ * Steelman fix (#170 issue 6): tokenId is now hashed (SHA-256, hex)
+ * BEFORE inclusion. The prior implementation used `tokenId` verbatim.
+ * A malicious legacy-shape sender could craft a tokenId byte-equal to
+ * a CID prefix (e.g. starting `bafyrei...`), producing a synthetic
+ * CID like `legacy-sphere-txf-bafyrei...` that masquerades as a real
+ * bundle CID in forensic logs. Hashing makes the synthetic CID
+ * provenance unambiguous: `legacy-${shape}-` always precedes a
+ * 64-char SHA-256 hex digest of the tokenId, never the tokenId
+ * itself.
+ *
  * @internal
  */
 export function syntheticBundleCidFor(
@@ -651,14 +664,16 @@ export function syntheticBundleCidFor(
   tokenId: string,
   index: number | null,
 ): string {
-  // Note: shape comes from a closed string-literal union; tokenId is
-  // already validated; index is a small int. No injection / overflow
-  // surface.
-  const sanitizedTokenId = tokenId.length > 0 ? tokenId : 'no-token';
+  // Hash the tokenId portion to a fixed 64-char SHA-256 hex digest.
+  // This bounds length regardless of attacker-supplied tokenId AND
+  // prevents masquerade attacks where a crafted tokenId mimics a real
+  // CID prefix in forensic output.
+  const tidForHash = tokenId.length > 0 ? tokenId : 'no-token';
+  const hashedTid = bytesToHex(sha256(new TextEncoder().encode(tidForHash)));
   if (index === null) {
-    return `legacy-${shape}-${sanitizedTokenId}`;
+    return `legacy-${shape}-${hashedTid}`;
   }
-  return `legacy-${shape}-${sanitizedTokenId}-${index}`;
+  return `legacy-${shape}-${hashedTid}-${index}`;
 }
 
 /**
@@ -668,18 +683,26 @@ export function syntheticBundleCidFor(
  * `_invalid` write is idempotent at the storage layer.
  *
  * The 64-char width matches the canonical SHA-256 hex form of the
- * real `observedTokenContentHash` field; the `00...legacy-${tag}`
- * prefix is impossible to collide with a real token-content-hash
- * (real hashes are uniformly distributed).
+ * real `observedTokenContentHash` field.
+ *
+ * Steelman fix (#170 issue 5): the prior implementation padded the
+ * seed string to 64 chars with `'0'`s and truncated longer seeds via
+ * `.slice(0, 64)`. Two distinct seeds whose first 64 chars matched
+ * would collide. Today's seed list is closed (`'extract-throw'`,
+ * `'extract-empty'`, `bad-entry-${i}`) so the literal-set is
+ * collision-resistant in practice — but a future refactor that lets
+ * `tag` flow from a payload field would let an attacker craft a tag
+ * whose first 64 chars match an honest synthetic hash, allowing
+ * `_invalid` records to collide. Hashing the seed via SHA-256
+ * eliminates the truncation surface entirely; collision-resistance
+ * is now equivalent to the underlying hash function.
  *
  * @internal
  */
 function syntheticObservedHash(tag: string, shape: LegacyShape): ContentHash {
   const seed = `legacy-${shape}-${tag}`;
-  // Pad to 64 chars; truncate if seed is longer (defensive — seed is
-  // bounded by our own literal strings).
-  const padded = (seed + '0'.repeat(64)).slice(0, 64);
-  return padded as ContentHash;
+  const digest = bytesToHex(sha256(new TextEncoder().encode(seed)));
+  return digest as ContentHash;
 }
 
 // =============================================================================

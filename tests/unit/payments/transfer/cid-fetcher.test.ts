@@ -772,3 +772,151 @@ describe('fetchCarByCid — total wall-clock cap (steelman #161)', () => {
     expect((caught as Error).name).toBe('AbortError');
   });
 });
+
+// =============================================================================
+// 9. Hostile error message sanitization (steelman Wave 3 #170)
+// =============================================================================
+//
+// The fetcher captures network-error messages verbatim into the per-gateway
+// `failureReasons` array, which is then surfaced via the
+// `transfer:fetch-failed` event payload. A hostile gateway can plant
+// arbitrary content in those messages (e.g. by returning an HTTP error
+// whose body becomes the underlying fetch error's message). The fetcher
+// MUST sanitize before logging:
+//
+//   1. Truncate to ~200 chars so logs stay compact.
+//   2. Strip ASCII / Unicode control characters (`\x00-\x1F`, `\x7F-\x9F`)
+//      to prevent newline / CR injection that splits log records.
+//   3. Strip HTML/XML angle brackets and ampersand (`<`, `>`, `&`) so a
+//      naive HTML-rendering operator dashboard does not interpret the
+//      payload as markup.
+//
+// These tests force per-gateway failures with hostile error messages and
+// then inspect the `failureReasons` event payload to confirm sanitation.
+
+describe('fetchCarByCid — error message sanitization (steelman #170)', () => {
+  it('truncates very long error messages to ~200 chars with a … marker', async () => {
+    // Build an error whose `.message` exceeds the truncation cap. The
+    // sanitizer should slice to MAX_REASON_LENGTH-1 chars and append `…`.
+    const longMessage = 'A'.repeat(5000); // 5 KiB of A's
+    const fetchImpl: CidFetcherFetch = vi.fn(async () => {
+      throw new Error(longMessage);
+    });
+    const cap = makeEmitCapture();
+    let caught: unknown;
+    try {
+      await fetchCarByCid('bafylong', {
+        gateways: ['https://gw.example'],
+        senderTransportPubkey: SENDER,
+        fetch: fetchImpl,
+        emit: cap.emit,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) throw new Error('expected SphereError');
+    expect(cap.events).toHaveLength(1);
+    const payload = cap.events[0].payload as SphereEventMap['transfer:fetch-failed'];
+    expect(payload.failureReasons).toHaveLength(1);
+    const reason = payload.failureReasons[0];
+    // Reason is short and ends with the truncation marker.
+    expect(reason.length).toBeLessThanOrEqual(220); // 200 + small prefix slack
+    expect(reason).toContain('…');
+    // The original 5000-char message must NOT have leaked through verbatim.
+    expect(reason.length).toBeLessThan(longMessage.length);
+  });
+
+  it('strips ASCII control characters from error messages', async () => {
+    // Newlines / CR / NUL / DEL would otherwise split log records or
+    // poison terminal output. The sanitizer drops them all.
+    const hostile = `injection-${String.fromCharCode(0)}\n\rline-break-${String.fromCharCode(0x7f)}-${String.fromCharCode(0x9f)}`;
+    const fetchImpl: CidFetcherFetch = vi.fn(async () => {
+      throw new Error(hostile);
+    });
+    const cap = makeEmitCapture();
+    try {
+      await fetchCarByCid('bafyctrl', {
+        gateways: ['https://gw.example'],
+        senderTransportPubkey: SENDER,
+        fetch: fetchImpl,
+        emit: cap.emit,
+      });
+    } catch {
+      /* expected */
+    }
+    expect(cap.events).toHaveLength(1);
+    const payload = cap.events[0].payload as SphereEventMap['transfer:fetch-failed'];
+    const reason = payload.failureReasons[0];
+    // No control chars survive in the rendered reason.
+    expect(reason).not.toContain('\n');
+    expect(reason).not.toContain('\r');
+    expect(reason).not.toContain('\x00');
+    expect(reason).not.toContain('\x7f');
+    expect(reason).not.toContain('\x9f');
+    // The non-control words remain.
+    expect(reason).toContain('injection-');
+    expect(reason).toContain('line-break-');
+  });
+
+  it('strips HTML angle brackets and ampersand from error messages', async () => {
+    // A hostile gateway returning `<script>alert(1)</script>` in its
+    // body would otherwise wind up as a verbatim error string. The
+    // sanitizer drops `<`, `>`, and `&` so a naive HTML-rendering
+    // dashboard cannot interpret the payload as markup.
+    const hostile = 'Error: 4xx body: <script>alert(1)</script> &bad;';
+    const fetchImpl: CidFetcherFetch = vi.fn(async () => {
+      throw new Error(hostile);
+    });
+    const cap = makeEmitCapture();
+    try {
+      await fetchCarByCid('bafyhtml', {
+        gateways: ['https://gw.example'],
+        senderTransportPubkey: SENDER,
+        fetch: fetchImpl,
+        emit: cap.emit,
+      });
+    } catch {
+      /* expected */
+    }
+    expect(cap.events).toHaveLength(1);
+    const payload = cap.events[0].payload as SphereEventMap['transfer:fetch-failed'];
+    const reason = payload.failureReasons[0];
+    expect(reason).not.toContain('<');
+    expect(reason).not.toContain('>');
+    expect(reason).not.toContain('&');
+    // Word remnants survive minus the markup chars.
+    expect(reason).toContain('script');
+    expect(reason).toContain('alert(1)');
+  });
+
+  it('combined hostile message: long + control + HTML markup gets fully sanitized', async () => {
+    // End-to-end: verify the full pipeline (truncate + strip controls +
+    // strip markup) runs as a single pass.
+    const prefix = '<img src=x onerror=alert(1)>\n\r\x00';
+    const middle = 'B'.repeat(500); // pushes total > 200
+    const suffix = '&malformed;</script>';
+    const hostile = `${prefix}${middle}${suffix}`;
+    const fetchImpl: CidFetcherFetch = vi.fn(async () => {
+      throw new Error(hostile);
+    });
+    const cap = makeEmitCapture();
+    try {
+      await fetchCarByCid('bafycombo', {
+        gateways: ['https://gw.example'],
+        senderTransportPubkey: SENDER,
+        fetch: fetchImpl,
+        emit: cap.emit,
+      });
+    } catch {
+      /* expected */
+    }
+    expect(cap.events).toHaveLength(1);
+    const payload = cap.events[0].payload as SphereEventMap['transfer:fetch-failed'];
+    const reason = payload.failureReasons[0];
+    // No markup or control bytes anywhere.
+    expect(reason).not.toMatch(/[<>&]/);
+    expect(reason).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    // Truncated.
+    expect(reason.length).toBeLessThanOrEqual(220);
+  });
+});

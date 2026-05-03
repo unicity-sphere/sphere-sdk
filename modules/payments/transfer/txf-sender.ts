@@ -113,6 +113,46 @@ import { validateTargets } from './target-validator';
 export type TxfFinalization = 'conservative' | 'instant';
 
 /**
+ * Per-token outcome attached to {@link SphereError.cause} on partial-success
+ * failure (Wave 3 steelman fix #170 issue 7).
+ *
+ * The TXF orchestrator publishes per-token sequentially; a failure on
+ * token N+1 leaves tokens 0..N in their successful terminal state. The
+ * caller historically had no way to distinguish `"all failed"` from
+ * `"some succeeded, one failed"` without inspecting `tokenTransfers`
+ * length vs. selected count. Surfacing structured per-token outcomes on
+ * the thrown SphereError's `cause` lets callers recover partial state
+ * deterministically.
+ */
+export interface TxfPerTokenOutcome {
+  readonly sourceTokenId: string;
+  readonly status: 'delivered' | 'delivered-instant' | 'failed';
+  /** Bundle CID synthesized for this token's outbox entry. */
+  readonly bundleCid: string;
+  /** Per-token outbox entry id. */
+  readonly outboxId: string;
+  /** Failure message (only set when `status === 'failed'`). */
+  readonly error?: string;
+}
+
+/**
+ * Cause payload attached to {@link SphereError} on partial-success TXF
+ * failure. Always carries:
+ *  - `kind: 'txf-partial-success'` — discriminator.
+ *  - `outcomes`: per-token list (one entry per attempted source).
+ *  - `failedTokenId` / `failedIndex`: the failing token's id / loop index.
+ *  - `successCount` / `failureCount`: aggregated counts for quick UI checks.
+ */
+export interface TxfPartialSuccessCause {
+  readonly kind: 'txf-partial-success';
+  readonly outcomes: ReadonlyArray<TxfPerTokenOutcome>;
+  readonly failedTokenId: string;
+  readonly failedIndex: number;
+  readonly successCount: number;
+  readonly failureCount: number;
+}
+
+/**
  * Result of committing a single source token under TXF semantics.
  * Returned by the caller-supplied {@link TxfCommitSourcesFn}.
  *
@@ -632,7 +672,13 @@ export async function sendTxfUxf(
     const pendingSourceTokenIds: string[] = [];
     const freshlyMintedChildTokenIds: string[] = [];
 
-    for (const r of orderedResults) {
+    // Per-token outcomes — populated as the loop progresses. On
+    // partial-success failure, attached to SphereError.cause as a
+    // {@link TxfPartialSuccessCause} payload (#170 issue 7).
+    const perTokenOutcomes: TxfPerTokenOutcome[] = [];
+
+    for (let loopIdx = 0; loopIdx < orderedResults.length; loopIdx++) {
+      const r = orderedResults[loopIdx];
       // Per-token entry id: derived from the base transferId + the
       // source tokenId. Two reasons:
       //  1. Resume-after-crash idempotency — same inputs → same ids.
@@ -725,10 +771,42 @@ export async function sendTxfUxf(
             // underlying transport error is the primary signal.
           }
         }
+
+        // Record the failed outcome and attach the structured per-token
+        // payload to the thrown SphereError's cause (#170 issue 7).
+        perTokenOutcomes.push({
+          sourceTokenId: r.sourceTokenId,
+          status: 'failed',
+          bundleCid,
+          outboxId: entryId,
+          error: message,
+        });
+        const successCount = perTokenOutcomes.filter(
+          (o) => o.status !== 'failed',
+        ).length;
+        const failureCount = perTokenOutcomes.length - successCount;
+        const partialCause: TxfPartialSuccessCause = {
+          kind: 'txf-partial-success',
+          outcomes: [...perTokenOutcomes],
+          failedTokenId: r.sourceTokenId,
+          failedIndex: loopIdx,
+          successCount,
+          failureCount,
+        };
+        // Wrap so consumers walking `err.cause` see BOTH the original
+        // transport throw (via `partialCause.originalCause`) and the
+        // structured per-token payload (via the discriminator).
+        const wrapped: TxfPartialSuccessCause & { readonly originalCause: unknown } = {
+          ...partialCause,
+          originalCause: cause,
+        };
         throw new SphereError(
-          `sendTxfUxf: transport.sendTokenTransfer failed for token ${r.sourceTokenId}: ${message}`,
+          `sendTxfUxf: transport.sendTokenTransfer failed for token ${r.sourceTokenId}: ${message}` +
+            (successCount > 0
+              ? ` (partial success: ${successCount}/${orderedResults.length} tokens already delivered)`
+              : ''),
           'TRANSPORT_ERROR',
-          cause,
+          wrapped,
         );
       }
 
@@ -744,6 +822,14 @@ export async function sendTxfUxf(
           buildOutboxRecord(baseArgs, terminalStatus, Date.now()),
         );
       }
+
+      // Record the per-token success outcome (#170 issue 7).
+      perTokenOutcomes.push({
+        sourceTokenId: r.sourceTokenId,
+        status: terminalStatus === 'delivered' ? 'delivered' : 'delivered-instant',
+        bundleCid,
+        outboxId: entryId,
+      });
 
       // 4f: collect cascade-risk warning data (instant only — coin
       // sources where the source itself is pending).
@@ -790,9 +876,21 @@ export async function sendTxfUxf(
             bundleCid,
             outstandingRequestIds,
           });
-        } catch {
+        } catch (cause) {
           // Worker registry hiccups MUST NOT fail the send. T.5.B's
           // worker picks up orphan delivered-instant entries on boot.
+          // Emit the trigger-failed event for telemetry (#170 issue 2).
+          try {
+            deps.emit('transfer:finalization-trigger-failed', {
+              addressId: deps.addressId,
+              outboxId: entryId,
+              bundleCid,
+              outstandingRequestIds,
+              message: cause instanceof Error ? cause.message : String(cause),
+            });
+          } catch {
+            // Defense-in-depth — the send has already succeeded.
+          }
         }
       }
     }

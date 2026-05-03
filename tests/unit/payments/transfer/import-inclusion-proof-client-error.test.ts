@@ -27,29 +27,30 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from './import-inclusion-proof-fixtures';
 
 describe('§6.3 importInclusionProof — C13 client-error reason path', () => {
   it('case 5 with reason=client-error → previousReason="client-error" propagated', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-c13.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-c13', reason: 'client-error' }),
+      `${ADDR}.invalid.${tk('t-c13')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-c13'), reason: 'client-error' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-c13`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-c13')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'client-error',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-c13',
+      tokenId: tk('t-c13'),
       commitmentRequestId: 'rq-c13',
       status: 'hard-fail',
     }));
 
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-c13',
+      tk('t-c13'),
       proofFor({ requestId: 'rq-c13' }),
       { allowInvalidOverride: true, currentTime: 1700000003000, operatorPubkey: 'op-c13' },
     );
@@ -82,22 +83,22 @@ describe('§6.3 importInclusionProof — C13 client-error reason path', () => {
   it('case 6 with reason=client-error: K-1 re-queue + previousReason propagation', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-c13-chain.${'bb'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-c13-chain', reason: 'client-error' }),
+      `${ADDR}.invalid.${tk('t-c13-chain')}.${'bb'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-c13-chain'), reason: 'client-error' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-c13-chain`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-c13-chain')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'client-error',
       rootHashHex: 'bb'.repeat(32),
     }));
     h.queue.entries.push(
-      queueEntryFor({ tokenId: 't-c13-chain', commitmentRequestId: 'rq-cc-0', txIndex: 0, status: 'hard-fail' }),
-      queueEntryFor({ tokenId: 't-c13-chain', commitmentRequestId: 'rq-cc-1', txIndex: 1, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-c13-chain'), commitmentRequestId: 'rq-cc-0', txIndex: 0, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-c13-chain'), commitmentRequestId: 'rq-cc-1', txIndex: 1, status: 'hard-fail' }),
     );
 
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-c13-chain',
+      tk('t-c13-chain'),
       proofFor({ requestId: 'rq-cc-0' }),
       { allowInvalidOverride: true },
     );
@@ -113,16 +114,16 @@ describe('§6.3 importInclusionProof — C13 client-error reason path', () => {
   it('case 7 (no override) with reason=client-error: tokenId-in-invalid', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-c13-no-ov.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-c13-no-ov', reason: 'client-error' }),
+      `${ADDR}.invalid.${tk('t-c13-no-ov')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-c13-no-ov'), reason: 'client-error' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-c13-no-ov`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-c13-no-ov')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'client-error',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-c13-no-ov',
+      tokenId: tk('t-c13-no-ov'),
       commitmentRequestId: 'rq-x',
       status: 'hard-fail',
     }));
@@ -132,7 +133,7 @@ describe('§6.3 importInclusionProof — C13 client-error reason path', () => {
     // reason.
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-c13-no-ov',
+      tk('t-c13-no-ov'),
       proofFor({ requestId: 'rq-x' }),
     );
     expect(result).toEqual({ ok: false, reason: 'tokenId-in-invalid' });

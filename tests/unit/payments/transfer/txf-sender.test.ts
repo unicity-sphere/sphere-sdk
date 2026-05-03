@@ -791,6 +791,116 @@ describe('sendTxfUxf — per-token outbox isolation', () => {
     expect(tok001Final.status).toBe('delivered');
     expect(tok001Final.error).toBeUndefined();
   });
+
+  // ===========================================================================
+  // Wave 3 steelman fix #170 issue 7 — partial-success per-token outcomes
+  // attached to SphereError.cause so callers can distinguish "all failed"
+  // from "some succeeded, one failed" without scraping outbox or
+  // tokenTransfers length.
+  // ===========================================================================
+  it('attaches structured per-token outcomes to SphereError.cause on partial success (#170 issue 7)', async () => {
+    const { tokens, results } = makeNTokens(3);
+    const { deps, transport } = makeDeps({
+      availableSources: () => tokens,
+      selectSources: async () => tokens,
+      commitSources: async () => results,
+    });
+    // Fail the publish for the second token (tok-002).
+    transport._failOnTokenIdContaining = 'tok-002';
+
+    let captured: unknown = null;
+    try {
+      await sendTxfUxf(
+        basicRequest({ amount: '3000000' }),
+        makePeerInfo(),
+        deps,
+        'conservative',
+      );
+      expect.fail('expected throw, got resolved promise');
+    } catch (err) {
+      captured = err;
+    }
+    if (!isSphereError(captured)) {
+      throw new Error(`expected SphereError; got ${String(captured)}`);
+    }
+    expect(captured.code).toBe('TRANSPORT_ERROR');
+
+    // The cause must carry the structured discriminator + outcomes list.
+    const cause = (captured as Error & {
+      cause?: {
+        kind?: string;
+        outcomes?: ReadonlyArray<{
+          sourceTokenId: string;
+          status: string;
+          bundleCid: string;
+          outboxId: string;
+          error?: string;
+        }>;
+        failedTokenId?: string;
+        failedIndex?: number;
+        successCount?: number;
+        failureCount?: number;
+        originalCause?: unknown;
+      };
+    }).cause;
+    expect(cause).toBeDefined();
+    expect(cause?.kind).toBe('txf-partial-success');
+    expect(cause?.failedTokenId).toBe('tok-002');
+    expect(cause?.failedIndex).toBe(1);
+    expect(cause?.successCount).toBe(1);
+    expect(cause?.failureCount).toBe(1);
+    expect(cause?.outcomes).toHaveLength(2);
+    // Sorted lex by sourceTokenId — tok-001 (delivered) comes first.
+    expect(cause?.outcomes?.[0].sourceTokenId).toBe('tok-001');
+    expect(cause?.outcomes?.[0].status).toBe('delivered');
+    expect(cause?.outcomes?.[0].error).toBeUndefined();
+    expect(cause?.outcomes?.[1].sourceTokenId).toBe('tok-002');
+    expect(cause?.outcomes?.[1].status).toBe('failed');
+    expect(cause?.outcomes?.[1].error).toBeDefined();
+    // Original transport throw is preserved alongside.
+    expect(cause?.originalCause).toBeDefined();
+  });
+
+  it('first-token failure → outcomes contains only the failure (no success list)', async () => {
+    const { tokens, results } = makeNTokens(3);
+    const { deps, transport } = makeDeps({
+      availableSources: () => tokens,
+      selectSources: async () => tokens,
+      commitSources: async () => results,
+    });
+    transport._failOnTokenIdContaining = 'tok-001';
+
+    let captured: unknown = null;
+    try {
+      await sendTxfUxf(
+        basicRequest({ amount: '3000000' }),
+        makePeerInfo(),
+        deps,
+        'conservative',
+      );
+      expect.fail('expected throw');
+    } catch (err) {
+      captured = err;
+    }
+    if (!isSphereError(captured)) {
+      throw new Error(`expected SphereError; got ${String(captured)}`);
+    }
+    const cause = (captured as Error & {
+      cause?: {
+        kind?: string;
+        outcomes?: ReadonlyArray<{ status: string }>;
+        failedIndex?: number;
+        successCount?: number;
+        failureCount?: number;
+      };
+    }).cause;
+    expect(cause?.kind).toBe('txf-partial-success');
+    expect(cause?.failedIndex).toBe(0);
+    expect(cause?.successCount).toBe(0);
+    expect(cause?.failureCount).toBe(1);
+    expect(cause?.outcomes).toHaveLength(1);
+    expect(cause?.outcomes?.[0].status).toBe('failed');
+  });
 });
 
 // =============================================================================

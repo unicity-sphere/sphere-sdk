@@ -796,6 +796,66 @@ describe('sendInstantUxf — transport rejection', () => {
     const failed = events.filter((e) => e.type === 'transfer:failed');
     expect(failed).toHaveLength(1);
   });
+
+  // ===========================================================================
+  // Wave 3 steelman fix #170 issue 1 — Option A: defer markSourcePending
+  // until AFTER transport ack so a transport failure does NOT leave sources
+  // stuck in `pending`.
+  // ===========================================================================
+  it('does NOT call markSourcePending when transport fails (#170 issue 1)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const markedTokens: Token[] = [];
+    const { deps, transport } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+      markSourcePending: async (tok) => {
+        markedTokens.push(tok);
+      },
+    });
+    transport._failNextSendWith = new Error('relay rejected');
+
+    let caught: unknown;
+    try {
+      await sendInstantUxf(basicRequest(), makePeerInfo(), deps);
+    } catch (err) {
+      caught = err;
+    }
+    if (!isSphereError(caught)) {
+      throw new Error(`expected SphereError; got ${String(caught)}`);
+    }
+    expect(caught.code).toBe('TRANSPORT_ERROR');
+    // Pre-fix: markSourcePending fired BEFORE transport publish, so
+    // `markedTokens` would have length 1 even after transport throw.
+    // Post-fix (Option A): markSourcePending is DEFERRED until after
+    // transport ack, so a failed publish leaves the source unmarked.
+    expect(markedTokens).toHaveLength(0);
+  });
+
+  it('does call markSourcePending when transport succeeds (#170 issue 1 — happy path regression)', async () => {
+    const source = makeToken('tok-1', TOKEN_A);
+    const commitResult = makeCommitResult({
+      sourceTokenId: 'tok-1',
+      fixture: TOKEN_A,
+    });
+    const markedTokens: Token[] = [];
+    const { deps } = makeDeps({
+      availableSources: () => [source],
+      selectSources: async () => [source],
+      commitSources: async () => [commitResult],
+      markSourcePending: async (tok) => {
+        markedTokens.push(tok);
+      },
+    });
+
+    const result = await sendInstantUxf(basicRequest(), makePeerInfo(), deps);
+    expect(result.status).toBe('submitted');
+    expect(markedTokens).toEqual([source]);
+  });
 });
 
 // =============================================================================

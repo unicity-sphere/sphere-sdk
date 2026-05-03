@@ -237,6 +237,37 @@ export class TrustBaseStaleness {
    *
    * The check is pure; it does NOT trigger a refresh.
    *
+   * **ADVISORY-ONLY (Wave 3 / steelman).** This flag is forensic /
+   * diagnostic. It does NOT short-circuit any verification path:
+   *
+   *   - The protocol's authentication invariant is the AGGREGATOR's
+   *     atomicity guarantee — every proof returned by the aggregator
+   *     carries a UnicityCertificate that the recipient verifies
+   *     against the trust base in `verifyInclusionProof()`. A proof
+   *     that PASSES that verification IS authoritative for the
+   *     state it attests, regardless of whether some prior poll
+   *     returned NOT_AUTHENTICATED on a different requestId.
+   *   - The two-strike escalation owned by the workers
+   *     ({@link FinalizationWorkerSender} / {@link FinalizationWorkerRecipient})
+   *     enforces the §9.4.1 contract: ONE NOT_AUTHENTICATED triggers
+   *     refresh + retry; the SECOND consecutive NOT_AUTHENTICATED on
+   *     the same requestId after a successful refresh hard-fails
+   *     with `proof-invalid`. That escalation runs at the OK / NOT_-
+   *     AUTHENTICATED decision point, NOT off this advisory flag.
+   *   - Refusing OK results process-globally while `notAuthenticatedCount
+   *     >= threshold` would cross-contaminate UNRELATED tokens: a
+   *     transient NOT_AUTHENTICATED on token A from a relay glitch
+   *     would block legitimate, cryptographically-verified OK
+   *     results on tokens B/C/D until refresh applied. The protocol
+   *     deliberately does NOT take that trade.
+   *
+   * If a future protocol revision tightens this contract (e.g., spec
+   * adds "no OK accepted until refresh applies"), the change goes in
+   * the worker's OK-branch — NOT here. This method's contract stays
+   * advisory.
+   *
+   * Spec references: §9.4.1 "Two-strike NOT_AUTHENTICATED escalation".
+   *
    * @param aggregatorId — defaults to `'default'` to match the workers'
    *                       default aggregator key.
    */

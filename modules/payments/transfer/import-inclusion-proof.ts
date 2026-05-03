@@ -328,7 +328,25 @@ export type ImportProofResult =
         // audit trail loses forensic value. Operators that explicitly
         // accept the synthesized provenance pass
         // `allowSyntheticInvalidEntry: true` to override.
-        | 'invalid-record-missing';
+        | 'invalid-record-missing'
+        // (Wave 3 steelman) Operator supplied a tokenId that is not the
+        // canonical 64-char-hex form. Combined with `_findInvalidEntry`'s
+        // sentinel-fallback content hash for non-hex tokenIds, an
+        // attacker shaping a tokenId like `"../"` could probe `_invalid`
+        // storage at deterministic keys and collide with future records
+        // on backends that don't validate key shape. The importer
+        // refuses non-canonical tokenIds at entry — well-formed wallet
+        // calls always pass 64-hex.
+        | 'invalid-tokenid'
+        // (Wave 3 steelman) Operator's queue scan returned more than one
+        // entry with the same `commitmentRequestId` for this tokenId.
+        // Production code paths cannot produce duplicates under
+        // normal operation; either a writer bug or a CRDT
+        // concurrent-add has produced an ambiguous state. Surfacing a
+        // distinct reason routes the operator to manual triage rather
+        // than silently picking `matching[0]` (which would risk
+        // applying the proof against the wrong queue entry).
+        | 'requestid-ambiguous';
     };
 
 // =============================================================================
@@ -427,6 +445,21 @@ export interface ImportInclusionProofCallOptions {
 }
 
 // =============================================================================
+// 3.5 Constants
+// =============================================================================
+
+/**
+ * Canonical lowercase 64-char-hex regex for a tokenId — the spec form
+ * (BYTE_FIELDS) all wallet code paths produce. Used at the importer entry
+ * point to reject malformed operator input (steelman finding, Wave 3).
+ *
+ * Why both cases match: the importer also accepts upper-case hex (case-
+ * insensitive comparison everywhere downstream — see `hexEqualsIgnoreCase`),
+ * so the entry-point check is permissive on case but strict on shape.
+ */
+const CANONICAL_TOKEN_ID_RE = /^[0-9a-f]{64}$/i;
+
+// =============================================================================
 // 4. InclusionProofImporter
 // =============================================================================
 
@@ -472,6 +505,27 @@ export class InclusionProofImporter {
     proof: ImportableInclusionProof,
     callOptions: ImportInclusionProofCallOptions = {},
   ): Promise<ImportProofResult> {
+    // (Wave 3 steelman) Reject non-canonical tokenIds at the very entry
+    // point — BEFORE any storage probe (manifest read, _invalid read,
+    // _audit read). Why this matters:
+    //
+    //   `_findInvalidEntry` falls back to a sentinel content hash (32
+    //   bytes of zero hex) when the manifest does not surface an
+    //   observed hash. For canonical tokenIds (64-hex), this is benign
+    //   because the keys are well-formed and the sentinel produces a
+    //   deterministic miss. But for an attacker-shaped tokenId like
+    //   `"../"`, the composed key
+    //   `${addr}.invalid.../.${'00'.repeat(32)}` becomes attacker-
+    //   controlled and may collide with other records on a storage
+    //   backend that doesn't enforce key shape — yielding a fetched
+    //   record that the importer would then mis-apply via override.
+    //
+    // Canonical wallet code never produces non-hex tokenIds; the guard
+    // is engineering-defense against operator scripts forwarding
+    // unsanitized input.
+    if (typeof tokenId !== 'string' || !CANONICAL_TOKEN_ID_RE.test(tokenId)) {
+      return { ok: false, reason: 'invalid-tokenid' };
+    }
     // T.5.D steelman post-cutover (#153): serialize the entire
     // read-decide-write sequence under the per-tokenId mutex. Without
     // this, two concurrent operator overrides on the same tokenId
@@ -647,6 +701,19 @@ export class InclusionProofImporter {
       return { ok: false, reason: 'requestid-mismatch' }; // case 4b
     }
 
+    // (Wave 3 steelman) Defensive ambiguity check. Production code paths
+    // never produce two queue entries with the same
+    // `(tokenId, commitmentRequestId)` — the finalization queue
+    // de-duplicates on enqueue. But a writer bug or a CRDT
+    // concurrent-add could surface duplicates; if so, picking
+    // `matching[0]` arbitrarily would risk applying the proof to the
+    // wrong entry (different transactionHash bound triple, different
+    // status). Surfacing a distinct reason routes the operator to
+    // manual triage rather than silently committing.
+    if (matching.length > 1) {
+      return { ok: false, reason: 'requestid-ambiguous' };
+    }
+
     // Hit. Decide between case 4a (already attached — completed entry
     // present, OR `attached` lifecycle status — both indicate the proof
     // was already grafted) and case 3 (live outstanding entry — graft
@@ -766,6 +833,16 @@ export class InclusionProofImporter {
       // hard-failed entries. Per §6.3 we cannot apply the override
       // because we do not know what to flip.
       return { ok: false, reason: 'requestid-mismatch' };
+    }
+
+    // (Wave 3 steelman) Mirror the pending path's ambiguity guard. Two
+    // hard-failed queue entries sharing
+    // `(tokenId, commitmentRequestId)` would force an arbitrary
+    // `matching[0]!` pick — and on the override path that risks
+    // committing the case-3-K-1-re-queue or the `invalid→valid` flip
+    // against the wrong entry. Refuse and let the operator triage.
+    if (matching.length > 1) {
+      return { ok: false, reason: 'requestid-ambiguous' };
     }
 
     const resolvingEntry = matching[0]!;

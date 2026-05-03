@@ -386,11 +386,22 @@ export function mergeConflictingHeads(
     heads.delete(winnerEntry.rootHash);
     const conflictingHeads = [...heads].sort() as readonly ContentHash[];
 
+    // Status: §5.6 monotonic invariant — when one side is already
+    // `'invalid'` (e.g., a prior off-band hard-fail signal), that
+    // pinned status MUST NOT regress to `'conflicting'` even when the
+    // chain pair is genuinely divergent. `mergeStatus` enforces the
+    // `invalid > conflicting > pending > valid` total order; for two
+    // non-invalid sides on this branch the result is `'conflicting'`,
+    // matching the prior hardcoded value. (Steelman fix W3.3.)
+    const status = mergeStatus(
+      mergeStatus(prev.status, next.status),
+      'conflicting',
+    );
     const merged = mergeMetadataPreserving(
       winnerEntry,
       loserEntry,
       winnerEntry.rootHash,
-      'conflicting',
+      status,
       conflictingHeads,
       compareCids,
     );
@@ -627,6 +638,30 @@ function mergeMetadataPreserving(
   // regresses; the reason MUST be preserved alongside.
   const invalidReason = winner.invalidReason ?? loser.invalidReason;
 
+  // Operator-override audit triple (§6.3 / §7.0, T.5.D — W30/W31/N4).
+  // Sticky per §7.1: once any replica sets `overrideApplied: true`,
+  // every future merge preserves it. Steelman fix W3.5 — previously
+  // these fields were dropped on `mergeMetadataPreserving`, breaking
+  // §6.3 cases 5/6 cross-replica convergence.
+  //
+  //  - `overrideApplied`   — set-OR (boolean OR; sticky `true`).
+  //  - `overrideAppliedAt` — max-merge (most-recent override wall-clock).
+  //  - `overrideAppliedBy` — lex-min on tie (deterministic operator
+  //                          attribution when both replicas
+  //                          independently authored the override).
+  const overrideApplied =
+    winner.overrideApplied === true || loser.overrideApplied === true
+      ? true
+      : undefined;
+  const overrideAppliedAt = maxOpt(
+    winner.overrideAppliedAt,
+    loser.overrideAppliedAt,
+  );
+  const overrideAppliedBy = mergeOverrideBy(
+    winner.overrideAppliedBy,
+    loser.overrideAppliedBy,
+  );
+
   // Assemble. Use stripUndefined to keep the on-disk shape minimal
   // (mirrors `profile/manifest-store.ts` mergeManifestEntry — entries
   // with audit_promoted_from = undefined would otherwise serialize as
@@ -642,6 +677,9 @@ function mergeMetadataPreserving(
     lastProofRefreshAt,
     bundleCid,
     senderTransportPubkey,
+    overrideApplied,
+    overrideAppliedAt,
+    overrideAppliedBy,
   });
 }
 
@@ -783,30 +821,79 @@ function pickMetadataWinnerSide(
 /**
  * Merge two statuses per the §5.6 monotonic invariant.
  *
- * Rules:
- *   - If either side is `'invalid'`, the merged status is `'invalid'`
- *     (no regression out of `_invalid` is permitted per §5.6).
- *   - If either side is `'conflicting'` (and neither is `'invalid'`),
- *     prefer `'conflicting'` — it surfaces the highest-severity
- *     observable status to the UI.
- *   - Otherwise prefer the winner's status. Typical case: winner is
- *     `'valid'` or `'pending'`; loser is the opposite.
+ * **Total order (steelman fix W3.4 — associativity)**:
+ *   `invalid > conflicting > pending > valid`
+ *
+ * The merged status is the higher-precedence of the two inputs,
+ * INDEPENDENT of which side is "winner". This makes the merge a pure
+ * function of the multiset `{winnerStatus, loserStatus}` and therefore
+ * commutative AND associative by construction — `mergeStatus(merge(a,b), c)`
+ * always equals `mergeStatus(a, merge(b,c))` for any 3-way grouping.
+ *
+ * Rationale per status:
+ *   - `'invalid'`     — sticky per §5.6 monotonic-pin invariant (no
+ *                       regression out of `_invalid` is permitted).
+ *   - `'conflicting'` — surfaces the highest-severity observable status
+ *                       to the UI; preserved unless dominated by `'invalid'`.
+ *   - `'pending'`     — promoted over `'valid'` because it signals the
+ *                       caller still has work to do (oracle finalization,
+ *                       proof fetch). Demoting back to `'valid'` is the
+ *                       [E] re-run's job (§5.5 step 9), not the merger's.
+ *   - `'valid'`       — base case; only survives when both inputs are valid.
+ *
+ * **Why total-order beats winner-takes-status (W9 audit)**: the previous
+ * implementation returned `winnerStatus` for the no-invalid no-conflicting
+ * case. Winner selection is itself a function of bundleCid / rootHash /
+ * Lamport tie-breaks, which can flip across associativity groupings.
+ * `merge(merge(a-pending, b-valid), c-valid)` and `merge(a-pending,
+ * merge(b-valid, c-valid))` could land different "winners" and hence
+ * different statuses. The total-order rule eliminates the dependency.
  *
  * Note: this helper does NOT decide between `'valid'` and `'pending'`
  * after a merge that drops unfinalized txs — that decision lives in
  * the [E] re-run (oracle.isSpent + finalizationQueue scan) which is
- * the caller's responsibility per §5.5 step 9. The merger preserves
- * whatever the winner carries.
+ * the caller's responsibility per §5.5 step 9. The merger reflects the
+ * higher-severity of the two inputs.
  */
 function mergeStatus(
   winnerStatus: TokenManifestStatus,
   loserStatus: TokenManifestStatus,
 ): TokenManifestStatus {
-  if (winnerStatus === 'invalid' || loserStatus === 'invalid') return 'invalid';
-  if (winnerStatus === 'conflicting' || loserStatus === 'conflicting') {
-    return 'conflicting';
+  const wRank = statusRank(winnerStatus);
+  const lRank = statusRank(loserStatus);
+  if (wRank > lRank) return winnerStatus;
+  if (lRank > wRank) return loserStatus;
+  // Same-rank tie. (Wave 3 steelman) `'conflicting'` and
+  // `'pending-conflicting'` share rank 2; without an explicit tie-break
+  // the function would return `winnerStatus`, breaking commutativity
+  // (the property tests and the cross-replica convergence guarantee).
+  // Resolve by lex-min on the literal string — deterministic across
+  // replicas, breaks the same way regardless of argument order.
+  return winnerStatus <= loserStatus ? winnerStatus : loserStatus;
+}
+
+/**
+ * Total-order rank for {@link TokenManifestStatus}: higher number = higher
+ * precedence on merge. See {@link mergeStatus} for the rationale.
+ *
+ * (Wave 3 steelman) `'pending-conflicting'` ranks identically to
+ * `'conflicting'` — the merger treats both as conflict-resolved heads
+ * whose lex-min tie-break wins primary `rootHash`. Distinguishing the
+ * two is the job of the worker / writer that recognizes in-flight
+ * finalization and decides whether to drain the queue first.
+ */
+function statusRank(s: TokenManifestStatus): number {
+  switch (s) {
+    case 'invalid':
+      return 3;
+    case 'conflicting':
+    case 'pending-conflicting':
+      return 2;
+    case 'pending':
+      return 1;
+    case 'valid':
+      return 0;
   }
-  return winnerStatus;
 }
 
 /**
@@ -858,6 +945,21 @@ function maxOpt(
   if (a === undefined) return b;
   if (b === undefined) return a;
   return Math.max(a, b);
+}
+
+/**
+ * Merge two `overrideAppliedBy` operator-pubkey strings: lex-min when
+ * both are set, present-beats-absent otherwise. Mirrors §7.1 Rule 2
+ * tie-break on the operator pubkey field.
+ */
+function mergeOverrideBy(
+  a: string | undefined,
+  b: string | undefined,
+): string | undefined {
+  if (a === undefined && b === undefined) return undefined;
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return a <= b ? a : b;
 }
 
 /**

@@ -27,22 +27,23 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from './import-inclusion-proof-fixtures';
 
 describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)', () => {
   it('W30 + W31: case 5 success carries overrideAppliedAt + overrideAppliedBy', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-w30.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-w30', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-w30')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-w30'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-w30`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-w30')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-w30',
+      tokenId: tk('t-w30'),
       commitmentRequestId: 'rq-w30',
       status: 'hard-fail',
     }));
@@ -51,7 +52,7 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
     const operator = '02deadbeef'.repeat(3) + 'fe';
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-w30',
+      tk('t-w30'),
       proofFor({ requestId: 'rq-w30' }),
       { allowInvalidOverride: true, currentTime: ts, operatorPubkey: operator },
     );
@@ -68,7 +69,7 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
     );
     expect(oe.length).toBe(1);
     expect(oe[0]!.data).toEqual({
-      tokenId: 't-w30',
+      tokenId: tk('t-w30'),
       overrideAppliedAt: ts,
       overrideAppliedBy: operator,
       previousReason: 'oracle-rejected',
@@ -79,24 +80,24 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
   it('W30: case 6 success carries overrideAppliedAt + overrideAppliedBy + transition=invalid→pending', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-w30-chain.${'bb'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-w30-chain', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-w30-chain')}.${'bb'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-w30-chain'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-w30-chain`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-w30-chain')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'bb'.repeat(32),
     }));
     h.queue.entries.push(
-      queueEntryFor({ tokenId: 't-w30-chain', commitmentRequestId: 'rq-cc-0', txIndex: 0, status: 'hard-fail' }),
-      queueEntryFor({ tokenId: 't-w30-chain', commitmentRequestId: 'rq-cc-1', txIndex: 1, status: 'hard-fail' }),
-      queueEntryFor({ tokenId: 't-w30-chain', commitmentRequestId: 'rq-cc-2', txIndex: 2, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-w30-chain'), commitmentRequestId: 'rq-cc-0', txIndex: 0, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-w30-chain'), commitmentRequestId: 'rq-cc-1', txIndex: 1, status: 'hard-fail' }),
+      queueEntryFor({ tokenId: tk('t-w30-chain'), commitmentRequestId: 'rq-cc-2', txIndex: 2, status: 'hard-fail' }),
     );
 
     const ts = 1700000999999;
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't-w30-chain',
+      tk('t-w30-chain'),
       proofFor({ requestId: 'rq-cc-1' }),
       { allowInvalidOverride: true, currentTime: ts, operatorPubkey: 'op-2' },
     );
@@ -137,16 +138,16 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
       async () => {
         const h = buildImporterHarness();
         h.disposition.entries.set(
-          `${ADDR}.invalid.t.${'aa'.repeat(32)}`,
-          invalidEntryFor({ tokenId: 't' }),
+          `${ADDR}.invalid.${tk('t')}.${'aa'.repeat(32)}`,
+          invalidEntryFor({ tokenId: tk('t') }),
         );
-        h.manifest.entries.set(`${ADDR}:t`, manifestEntryFor({
+        h.manifest.entries.set(`${ADDR}:${tk('t')}`, manifestEntryFor({
           status: 'invalid',
           rootHashHex: 'aa'.repeat(32),
         }));
         await h.importer.importInclusionProof(
           ADDR,
-          't',
+          tk('t'),
           proofFor({ requestId: 'rq-x' }),
         );
         expect(
@@ -157,16 +158,16 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
       async () => {
         const h = buildImporterHarness({ verifyResult: 'PATH_NOT_INCLUDED' });
         h.disposition.entries.set(
-          `${ADDR}.invalid.t.${'aa'.repeat(32)}`,
-          invalidEntryFor({ tokenId: 't' }),
+          `${ADDR}.invalid.${tk('t')}.${'aa'.repeat(32)}`,
+          invalidEntryFor({ tokenId: tk('t') }),
         );
-        h.manifest.entries.set(`${ADDR}:t`, manifestEntryFor({
+        h.manifest.entries.set(`${ADDR}:${tk('t')}`, manifestEntryFor({
           status: 'invalid',
           rootHashHex: 'aa'.repeat(32),
         }));
         await h.importer.importInclusionProof(
           ADDR,
-          't',
+          tk('t'),
           proofFor({ requestId: 'rq-x' }),
           { allowInvalidOverride: true },
         );
@@ -178,16 +179,16 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
       async () => {
         const h = buildImporterHarness({ verifyResult: 'PATH_INVALID' });
         h.disposition.entries.set(
-          `${ADDR}.invalid.t.${'aa'.repeat(32)}`,
-          invalidEntryFor({ tokenId: 't' }),
+          `${ADDR}.invalid.${tk('t')}.${'aa'.repeat(32)}`,
+          invalidEntryFor({ tokenId: tk('t') }),
         );
-        h.manifest.entries.set(`${ADDR}:t`, manifestEntryFor({
+        h.manifest.entries.set(`${ADDR}:${tk('t')}`, manifestEntryFor({
           status: 'invalid',
           rootHashHex: 'aa'.repeat(32),
         }));
         await h.importer.importInclusionProof(
           ADDR,
-          't',
+          tk('t'),
           proofFor({ requestId: 'rq-x' }),
           { allowInvalidOverride: true },
         );
@@ -202,22 +203,22 @@ describe('§6.3 importInclusionProof — override audit trail (W30 / W31 / N4)',
   it('W30: callsite without operatorPubkey omits the field but stamps timestamp', async () => {
     const h = buildImporterHarness();
     h.disposition.entries.set(
-      `${ADDR}.invalid.t.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t')}`, manifestEntryFor({
       status: 'invalid',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't',
+      tokenId: tk('t'),
       commitmentRequestId: 'rq-x',
       status: 'hard-fail',
     }));
     const ts = 1700000777777;
     const result = await h.importer.importInclusionProof(
       ADDR,
-      't',
+      tk('t'),
       proofFor({ requestId: 'rq-x' }),
       { allowInvalidOverride: true, currentTime: ts },
     );

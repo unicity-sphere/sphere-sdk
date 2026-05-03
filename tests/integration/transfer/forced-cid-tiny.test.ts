@@ -147,11 +147,16 @@ describe('§11.2 — force-cid with a tiny 1-token bundle', () => {
     expect(events.count('transfer:confirmed')).toBe(1);
   });
 
-  it('force-cid without publishToIpfs callback → falls back to uxf-car inline (approach γ)', async () => {
-    // Approach γ: when force-cid is requested but no IPFS publisher is
-    // wired, and the bundle fits within RELAY_SAFE_CAP_BYTES (96 KiB),
-    // the resolver falls back to uxf-car inline delivery rather than
-    // throwing. This lets callers without IPFS still send small bundles.
+  it('force-cid without publishToIpfs callback → throws FORCE_CID_NO_PUBLISHER (steelman Wave 3 — privacy hardening)', async () => {
+    // **Steelman fix (Wave 3) — force-cid privacy regression hardening.**
+    // Earlier behavior was to silently fall back to uxf-car inline
+    // delivery for bundles that fit within RELAY_SAFE_CAP_BYTES. That
+    // defeated the entire point of force-cid: the caller chose CID
+    // because they did NOT want the bundle inlined on the relay
+    // (privacy intent — the relay would otherwise see the bundle
+    // bytes). The orchestrator now hard-fails with
+    // `FORCE_CID_NO_PUBLISHER`. Callers must wire a publisher or pick a
+    // different strategy.
     const idHex = `aa${'2'.padStart(2, '0')}${'0'.repeat(60)}`;
     const source = makeToken({
       id: idHex,
@@ -166,7 +171,8 @@ describe('§11.2 — force-cid with a tiny 1-token bundle', () => {
       identity: makeIdentity(),
       senderTransportPubkey: BOB_TRANSPORT_PUBKEY,
       emit: events.emit,
-      // publishToIpfs intentionally omitted → triggers CAR-inline fallback.
+      // publishToIpfs intentionally omitted → MUST hard-fail rather
+      // than silently falling back.
       availableSources: () => [source],
       selectSources: async () => [source],
       preflightOptions: () => ({
@@ -194,15 +200,12 @@ describe('§11.2 — force-cid with a tiny 1-token bundle', () => {
       delivery: { kind: 'force-cid' },
     };
 
-    const result = await sendConservativeUxf(request, makePeerInfo(), deps);
+    await expect(
+      sendConservativeUxf(request, makePeerInfo(), deps),
+    ).rejects.toMatchObject({ code: 'FORCE_CID_NO_PUBLISHER' });
 
-    // Should succeed via CAR-inline fallback (not throw).
-    expect(result.status).toBe('completed');
-    // Wire payload must be uxf-car (inline fallback applied).
-    expect(transport._calls).toHaveLength(1);
-    const payload = transport._calls[0].payload as UxfTransferPayloadCar | UxfTransferPayloadCid;
-    expect(payload.kind).toBe('uxf-car');
-    expect(events.count('transfer:confirmed')).toBe(1);
-    expect(events.count('transfer:failed')).toBe(0);
+    // No transport call should have been made (we hard-fail at pre-flight).
+    expect(transport._calls).toHaveLength(0);
+    expect(events.count('transfer:confirmed')).toBe(0);
   });
 });

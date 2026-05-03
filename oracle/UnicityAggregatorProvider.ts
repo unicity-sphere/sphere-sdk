@@ -740,20 +740,45 @@ export class UnicityAggregatorProvider implements OracleProvider {
 
     this.ensureConnected();
 
+    // Wave 3 / steelman: do NOT fail-open on RPC failure. The previous
+    // behaviour (`return false`) opened a double-spend window when the
+    // aggregator was network-partitioned or a relay-MitM dropped the
+    // isSpent request: the recipient would treat an unverifiable state
+    // as "confirmed unspent" and accept the proof. We now PROPAGATE the
+    // failure as a typed `AGGREGATOR_ERROR` so callers can distinguish
+    // "verified unspent (aggregator said no)" from "couldn't check".
+    //
+    // Important caching contract: we still cache only `spent: true`
+    // (immutable). Confirmed `false` is NOT cached because the answer
+    // can change at any moment when the owner spends the state. A
+    // throw here is NEVER cached — the next call retries the RPC.
+    //
+    // The disposition-engine's [E] hook (`oracleIsSpent`) already wraps
+    // the call in try/catch and routes throws to STRUCTURAL_INVALID per
+    // §5.3 [A] (see modules/payments/transfer/disposition-engine.ts:786
+    // and :1020), so this change is non-breaking for the production
+    // path and turns a silent fail-open into a deterministic
+    // structural rejection that a later bundle can recover from.
+    let response: RpcSpentResponse;
     try {
-      const response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
-      const spent = response.spent ?? false;
-
-      // Cache result (Wave L: bounded with LRU eviction)
-      if (spent) {
-        this.cacheSpent(stateHash);
-      }
-
-      return spent;
+      response = await this.rpcCall<RpcSpentResponse>('isSpent', { stateHash });
     } catch (error) {
-      logger.warn('Aggregator', 'isSpent check failed, assuming unspent', error);
-      return false;
+      const cause = error instanceof Error ? error.message : String(error);
+      logger.warn('Aggregator', 'isSpent RPC failed; refusing to fail-open', error);
+      throw new SphereError(
+        `isSpent: aggregator RPC failed (${cause})`,
+        'AGGREGATOR_ERROR',
+        error,
+      );
     }
+    const spent = response.spent ?? false;
+
+    // Cache result (Wave L: bounded with LRU eviction)
+    if (spent) {
+      this.cacheSpent(stateHash);
+    }
+
+    return spent;
   }
 
   async getTokenState(tokenId: string): Promise<TokenState | null> {

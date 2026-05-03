@@ -27,6 +27,8 @@
  */
 
 import { CarReader } from '@ipld/car';
+import { bytesReader, readHeader } from '@ipld/car/decoder';
+import { CID } from 'multiformats/cid';
 import { Buffer } from 'buffer';
 
 import { SphereError } from '../core/errors.js';
@@ -39,6 +41,7 @@ import {
   type UxfTransferPayloadCar,
   type UxfTransferPayloadCid,
 } from '../types/uxf-transfer.js';
+import { EXTRACT_CAR_ROOT_HEADER_PROBE_BYTES } from './limits.js';
 
 // =============================================================================
 // 1. Public API — encodeTransferPayload
@@ -192,20 +195,57 @@ export function decodeNostrEventContent(eventContent: string): UxfTransferPayloa
 export async function extractCarRootCid(
   carBytes: Uint8Array,
 ): Promise<string> {
-  let reader: CarReader;
-  try {
-    reader = await CarReader.fromBytes(carBytes);
-  } catch (cause) {
-    throw new SphereError(
-      'extractCarRootCid: CAR bytes did not parse',
-      'BUNDLE_REJECTED_INVALID_CAR',
-      cause,
-    );
+  // Steelman Wave 3 — header-only fast path. The CAR root CID lives in
+  // the CAR header (the dag-cbor `{ version, roots }` block at the
+  // start). `CarReader.fromBytes` decodes the entire CAR (every block
+  // header indexed) just to expose `getRoots()`, which is O(N) on
+  // hostile padding (a 32 MiB CAR with thousands of dummy blocks
+  // forces a full scan).
+  //
+  // Use the low-level `decoder.readHeader` against a small leading
+  // slice to avoid touching the data section at all. On failure (e.g.
+  // a CARv2 whose data offset exceeds the probe slice), fall back to
+  // the full reader path. Per `@ipld/car` `decoder.js`, the V1 header
+  // is `{ length-varint, dag-cbor { version, roots } }` and fits in
+  // hundreds of bytes for any well-formed CAR — so 4 KiB is generous.
+  let roots: readonly CID[] | undefined;
+  let fastPathError: unknown;
+  if (carBytes.byteLength > EXTRACT_CAR_ROOT_HEADER_PROBE_BYTES) {
+    const probe = carBytes.subarray(0, EXTRACT_CAR_ROOT_HEADER_PROBE_BYTES);
+    try {
+      const reader = bytesReader(probe);
+      const header = await readHeader(reader);
+      const headerRoots = (header as { roots?: CID[] }).roots;
+      if (Array.isArray(headerRoots)) {
+        roots = headerRoots;
+      }
+    } catch (err) {
+      // Probe failure can mean: probe too small for a CARv2, malformed
+      // header, etc. Fall through to the slow path which gives a
+      // canonical error class.
+      fastPathError = err;
+    }
   }
-  // `getRoots()` is technically synchronous in the current `@ipld/car`
-  // implementation but is exposed as a Promise-returning API; await for
-  // forward-compat.
-  const roots = await reader.getRoots();
+
+  if (roots === undefined) {
+    let reader: CarReader;
+    try {
+      reader = await CarReader.fromBytes(carBytes);
+    } catch (cause) {
+      throw new SphereError(
+        'extractCarRootCid: CAR bytes did not parse',
+        'BUNDLE_REJECTED_INVALID_CAR',
+        // Prefer the fast-path failure if we have one — it's the more
+        // precise diagnostic on a header-level error.
+        fastPathError ?? cause,
+      );
+    }
+    // `getRoots()` is technically synchronous in the current `@ipld/car`
+    // implementation but is exposed as a Promise-returning API; await for
+    // forward-compat.
+    roots = await reader.getRoots();
+  }
+
   if (roots.length !== 1) {
     throw new SphereError(
       `extractCarRootCid: expected single-root CAR, found ${roots.length}`,

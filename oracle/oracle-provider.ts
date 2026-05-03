@@ -49,7 +49,20 @@ export interface OracleProvider extends BaseProvider {
   validateToken(tokenData: unknown): Promise<ValidationResult>;
 
   /**
-   * Check if token state is spent
+   * Check if token state is spent.
+   *
+   * **Throws on RPC failure** — implementations MUST NOT fail-open
+   * (returning `false` on a network/transport error opens a double-
+   * spend window). On any RPC / network failure the call MUST throw
+   * (typically a `SphereError` with code `'AGGREGATOR_ERROR'`). The
+   * boolean return value carries cryptographically-verified state
+   * only:
+   *   - `true`  — aggregator confirmed the state has been spent.
+   *   - `false` — aggregator confirmed the state is unspent.
+   *
+   * Callers (notably the disposition-engine `[E]` hook) treat a
+   * throw as STRUCTURAL_INVALID per §5.3 [A] and re-evaluate when a
+   * later bundle arrives.
    */
   isSpent(stateHash: string): Promise<boolean>;
 

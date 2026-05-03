@@ -335,6 +335,168 @@ describe('SendingRecoveryWorker', () => {
     expect(transitions[0].id).toBe('stuck');
   });
 
+  // ===========================================================================
+  // Wave 3 steelman regression — concurrency races
+  // ===========================================================================
+  //
+  // The recovery worker's previous `recoverOne` impl called `republish()`
+  // BEFORE checking the entry was still in `'sending'`, then unconditionally
+  // emitted `transfer:recovery-republished` even when the post-republish
+  // CAS no-op'd. A concurrent process advancing the entry to
+  // `delivered-instant` between the scan snapshot and `recoverOne()` would:
+  //   (a) trigger a duplicate Nostr publish (wasted relay traffic), and
+  //   (b) emit a false-success event that downstream subscribers
+  //       interpret as proof of recovery.
+  //
+  // The fix re-reads the entry under the writer's CAS path BEFORE calling
+  // republish (skip if status changed), AND moves `emitRepublished` inside
+  // the mutator's success branch (gate emit on actual transition).
+  describe('Wave 3 — concurrency race against in-flight status change', () => {
+    it('skips republish if entry advanced to delivered-instant before scan handles it', async () => {
+      const stuckEntry = makeEntry({
+        id: 'race-advance-instant',
+        mode: 'instant',
+        status: 'sending',
+        updatedAt: 1_000,
+      });
+      const outboxFixture = makeFakeOutbox([stuckEntry]);
+
+      // Simulate a concurrent process: between the worker's first
+      // `readAllNew()` (snapshot) and its second `readAllNew()` (pre-
+      // republish CAS check), advance the entry to `delivered-instant`.
+      let snapshotReadCount = 0;
+      const baseReadAll = outboxFixture.outbox.readAllNew;
+      const racingOutbox: Pick<typeof outboxFixture.outbox, 'readAllNew' | 'update'> = {
+        async readAllNew() {
+          snapshotReadCount += 1;
+          // First read = scan snapshot (returns the stuck entry).
+          // Subsequent reads (pre-republish CAS) see advanced status.
+          if (snapshotReadCount === 1) {
+            return baseReadAll();
+          }
+          const entries = outboxFixture.entries();
+          // Mutate the live store to reflect the concurrent advance.
+          const live = entries.get('race-advance-instant');
+          if (live !== undefined && live.status === 'sending') {
+            entries.set('race-advance-instant', {
+              ...live,
+              status: 'delivered-instant',
+            });
+          }
+          return baseReadAll();
+        },
+        update: outboxFixture.outbox.update,
+      };
+
+      const republish = vi.fn<RepublishFn>().mockResolvedValue(undefined);
+      const recorder = makeEventRecorder();
+
+      const worker = new SendingRecoveryWorker({
+        outbox: racingOutbox,
+        republish,
+        emit: recorder.emit,
+        logger: { warn: () => undefined, info: () => undefined },
+        now: () => 1_000_000,
+      });
+
+      const attempted = await worker.runScanCycle();
+
+      // The scan saw 1 stuck entry, but the pre-republish CAS check
+      // discovered the entry had already advanced — republish MUST NOT
+      // have fired, and no recovery event MUST have been emitted.
+      expect(attempted).toBe(1);
+      expect(republish).not.toHaveBeenCalled();
+      const recoveryEvents = recorder.events.filter(
+        (e) => e.type === 'transfer:recovery-republished',
+      );
+      expect(recoveryEvents).toHaveLength(0);
+      // The state-machine transition recorder should be empty — no
+      // false self-loop write either.
+      expect(outboxFixture.transitions()).toEqual([]);
+    });
+
+    it('does not emit recovery-republished when CAS no-ops on status change post-republish', async () => {
+      // Variant where the entry advances DURING `republish()` (between
+      // the pre-flight CAS check and the post-republish CAS write).
+      // The republish call DOES go out (the worker observed `'sending'`
+      // when it pre-checked), but the post-write CAS hits the
+      // already-advanced status and self-loops. No emit must fire.
+      const stuckEntry = makeEntry({
+        id: 'race-advance-mid-republish',
+        status: 'sending',
+        updatedAt: 1_000,
+      });
+      const outboxFixture = makeFakeOutbox([stuckEntry]);
+      const recorder = makeEventRecorder();
+
+      // Hand-rolled republish: when called, mutates the outbox to
+      // simulate a concurrent advance.
+      const republish: RepublishFn = async (): Promise<void> => {
+        const entries = outboxFixture.entries();
+        const live = entries.get('race-advance-mid-republish');
+        if (live !== undefined && live.status === 'sending') {
+          entries.set('race-advance-mid-republish', {
+            ...live,
+            status: 'delivered',
+          });
+        }
+      };
+
+      const worker = new SendingRecoveryWorker({
+        outbox: outboxFixture.outbox,
+        republish,
+        emit: recorder.emit,
+        logger: { warn: () => undefined, info: () => undefined },
+        now: () => 1_000_000,
+      });
+
+      await worker.runScanCycle();
+
+      // Post-republish, the writer CAS'd against the advanced status
+      // and returned `prev` unchanged. The transitions array picks up
+      // self-loops only when status changes — should be empty.
+      expect(outboxFixture.transitions()).toEqual([]);
+      // CRITICAL: no false-success emit even though the publish path
+      // ran. The fix gates the emit on the actual write transition.
+      const recoveryEvents = recorder.events.filter(
+        (e) => e.type === 'transfer:recovery-republished',
+      );
+      expect(recoveryEvents).toHaveLength(0);
+    });
+
+    it('emits recovery-republished exactly once when CAS actually transitions', async () => {
+      // Sanity: the happy path still emits. This pins that the fix
+      // narrows the emit, NOT silences it entirely.
+      const stuckEntry = makeEntry({
+        id: 'happy-path',
+        status: 'sending',
+        updatedAt: 1_000,
+      });
+      const outboxFixture = makeFakeOutbox([stuckEntry]);
+      const republish = vi.fn<RepublishFn>().mockResolvedValue(undefined);
+      const recorder = makeEventRecorder();
+
+      const worker = new SendingRecoveryWorker(
+        makeDeps({
+          outboxFixture,
+          republish,
+          emit: recorder.emit,
+          nowMs: 1_000_000,
+        }),
+      );
+
+      await worker.runScanCycle();
+
+      const recoveryEvents = recorder.events.filter(
+        (e) => e.type === 'transfer:recovery-republished',
+      );
+      expect(recoveryEvents).toHaveLength(1);
+      expect(outboxFixture.transitions()).toEqual([
+        { id: 'happy-path', from: 'sending', to: 'delivered' },
+      ]);
+    });
+  });
+
   it('stop() awaits the in-flight scan cycle', async () => {
     const stuckEntry = makeEntry({ id: 'in-flight', updatedAt: 1_000 });
     const outboxFixture = makeFakeOutbox([stuckEntry]);

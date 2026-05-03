@@ -105,14 +105,32 @@ export function mergeOutboxEntries(
   // replicas should agree on these — they describe the bundle, not the
   // mutable lifecycle — but if a writer bug ever produces divergent
   // shape fields, the active/hard-terminal winner is the canonical view.
-  const winnerEntry =
-    statusMerge.winner === 'a'
-      ? a
-      : statusMerge.winner === 'b'
-        ? b
-        : a.status === 'finalizing' && a.overrideApplied === true
-          ? a
-          : b;
+  //
+  // **Override arc shape selection (steelman fix W3.2)**. When
+  // `statusMerge.winner === 'override'`, the merged status is `finalizing`
+  // (Rule 2 stickiness). The previous implementation picked the side where
+  // `status === 'finalizing' && overrideApplied === true` were co-located
+  // — but `overrideApplied` is set-OR-merged (§7.1 Rule 2), so the flag
+  // may legitimately live on the `failed-permanent` side while the
+  // `finalizing` status lives on the other side. In that case the previous
+  // rule fell through to `b` regardless, taking shape fields (bundleCid,
+  // tokenIds, recipient) from the `failed-permanent` side and diverging
+  // from the canonical winner. The fix below selects the `finalizing`
+  // side regardless of where the flag stamped — this matches Rule 2's
+  // intent: the override arc's winner IS the `finalizing` replica's
+  // entry.
+  //
+  // **Equal-status content-stable tie-break (steelman fix W3.2 cont'd)**.
+  // When both sides share the same `(id, status, lamport)` triple — the
+  // common case for two replicas of the same outbox entry — the
+  // status-merge's `winner = 'a'` selection is position-based and would
+  // flip the shape pick under input swap. To keep shape commutative
+  // (`merge(a, b)` and `merge(b, a)` produce the same `bundleCid`,
+  // `tokenIds`, `recipient`), we pick the winner-side's shape ONLY when
+  // it differs in lifecycle from the loser; when both sides are
+  // genuinely equal in lifecycle, we fall back to a content-stable
+  // tiebreak via {@link pickShapeBySwapStableTiebreak}.
+  const winnerEntry = pickWinnerEntryForShape(a, b, statusMerge.winner);
 
   // recipientNametag may be unset on one side; carry-through if either
   // side has it (informational, UI-only).
@@ -201,6 +219,96 @@ export function mergeOutboxEntriesPair(
     acc = mergeOutboxEntries(acc, entries[i]!);
   }
   return acc;
+}
+
+// =============================================================================
+// 3. Internal helpers — shape selection
+// =============================================================================
+
+/**
+ * Pick the entry whose shape fields (`bundleCid`, `tokenIds`, `recipient`,
+ * `recipientTransportPubkey`, `mode`, `deliveryMethod`) seed the merged
+ * record. Shape fields describe the bundle and SHOULD agree across
+ * replicas; this helper handles divergence (writer-bug or partial-state
+ * propagation) deterministically.
+ *
+ * Algorithm:
+ *
+ *   1. If `statusMerge.winner === 'override'`, pick the side whose
+ *      status is `'finalizing'` (Rule 2 override stickiness — the
+ *      `overrideApplied` flag is set-OR-merged so it may live on the
+ *      `failed-permanent` side, but the canonical winner of the arc is
+ *      the `finalizing` replica regardless).
+ *   2. If the two sides differ in lifecycle (status, lamport, or
+ *      override flag), the status-merge winner side carries the
+ *      canonical view — return it.
+ *   3. Otherwise the two sides are lifecycle-equivalent; fall through
+ *      to a content-stable tiebreak that is invariant under input swap:
+ *      lex-min `bundleCid`, then lex-min `recipient`, then lex-min over
+ *      JSON-stringified `tokenIds`.
+ *
+ * The content-stable tiebreak is what makes shape fields commutative
+ * across `merge(a, b)` vs `merge(b, a)` when both replicas describe the
+ * same outbox entry but disagree on shape (a writer bug). Without it,
+ * the position-based `winner = 'a'` from the per-partition tie-breakers
+ * (e.g., `mergeBothSoftTerminal`) would silently pick whichever side
+ * happened to be passed first — non-commutative.
+ */
+function pickWinnerEntryForShape(
+  a: UxfTransferOutboxEntry,
+  b: UxfTransferOutboxEntry,
+  winner: 'a' | 'b' | 'override',
+): UxfTransferOutboxEntry {
+  if (winner === 'override') {
+    // The override arc fires on `(failed-permanent, finalizing)` w/
+    // set-OR-true override flag. Pick the `finalizing` side regardless
+    // of where the flag stamped.
+    return a.status === 'finalizing' ? a : b;
+  }
+  // For 'a' / 'b' winner: ONLY when the two sides have different statuses
+  // is the winner content-determined (the partition lattice and hard-
+  // terminal/active rules pick deterministically by status content). In
+  // every other case the per-partition tie-breakers
+  // (`mergeBothSoftTerminal` / `mergeBothActive` / `mergeBothHardTerminal`)
+  // intentionally drop Lamport for associativity (see those functions'
+  // doc-comments) and fall through to lex-min `id`. With both replicas
+  // sharing the same `id` (the orchestrator rejects mismatched ids),
+  // that tie-breaker reduces to "return 'a'" — which IS position-based
+  // and would flip shape selection under input swap.
+  //
+  // To keep shape commutative, we use the position-based winner ONLY
+  // when statuses differ; for same-status pairs we apply a content-
+  // stable tiebreak (lex-min `bundleCid` → lex-min `recipient` →
+  // lex-min `tokenIds`) that is invariant under input order.
+  if (a.status !== b.status) {
+    return winner === 'a' ? a : b;
+  }
+  // Same status; position-based winner is non-commutative. Fall back to
+  // content-stable tiebreak.
+  return pickShapeBySwapStableTiebreak(a, b);
+}
+
+/**
+ * Content-stable shape tiebreak: lex-min `bundleCid` → lex-min
+ * `recipient` → lex-min over `JSON.stringify(tokenIds)`. Returns whichever
+ * input — `a` or `b` — is "smaller" by the chain. The chain is total
+ * (every input has a defined `bundleCid` per `UxfTransferOutboxEntry`'s
+ * required-field schema) and order-independent (`min(x, y)` is the same
+ * function regardless of which arg is first), so the resulting shape is
+ * invariant under input swap. The only fully-tied case is when every
+ * field on the chain is identical, in which case `a` and `b` produce the
+ * same shape and the choice is irrelevant.
+ */
+function pickShapeBySwapStableTiebreak(
+  a: UxfTransferOutboxEntry,
+  b: UxfTransferOutboxEntry,
+): UxfTransferOutboxEntry {
+  if (a.bundleCid !== b.bundleCid) return a.bundleCid < b.bundleCid ? a : b;
+  if (a.recipient !== b.recipient) return a.recipient < b.recipient ? a : b;
+  const aTokenIds = JSON.stringify([...a.tokenIds].sort());
+  const bTokenIds = JSON.stringify([...b.tokenIds].sort());
+  if (aTokenIds !== bTokenIds) return aTokenIds < bTokenIds ? a : b;
+  return a;
 }
 
 // Re-export the audit_promoted_from helper at the orchestrator's import

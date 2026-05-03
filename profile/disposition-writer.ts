@@ -64,6 +64,42 @@ import { ManifestStore } from './manifest-store.js';
 import type { TokenManifestEntry } from './token-manifest.js';
 
 // =============================================================================
+// 0. Constants — local caps
+// =============================================================================
+
+/**
+ * Maximum number of bundle CIDs preserved in an audit record's
+ * `bundleCidsObserved` field (steelman finding, Wave 3).
+ *
+ * **Why a cap is needed.** UXF bundle CIDs are content-addressed — any byte
+ * change in the CAR re-mints a distinct CID. A hostile sender can vary CAR
+ * padding and re-deliver the same `(tokenId, observedTokenContentHash)`
+ * audit observation indefinitely; without a cap, each arrival appends a
+ * fresh string to `bundleCidsObserved`, re-allocates the array, and
+ * re-sorts. The on-disk audit blob grows linearly with attacker-controlled
+ * input — an unbounded write amplifier and a forensic-storage DoS.
+ *
+ * **Behaviour at the cap.** The first 32 CIDs (lex-sorted) are retained;
+ * subsequent observations are silently dropped from this list. The
+ * `auditStatus` and `reason` fields are NOT affected — the record's
+ * forensic verdict survives intact, only the cosmetic CID inventory is
+ * truncated.
+ *
+ * **Why 32 and lex-min.** 32 is comfortably above realistic re-arrival
+ * counts (a non-adversarial sender shipping the same audit observation
+ * twice across replicas is the common case; 32 covers a long tail of
+ * legitimate re-deliveries). Lex-min selection (`unionBundleCids` already
+ * sorts) is deterministic across replicas — every wallet that has seen the
+ * same N CIDs converges on the same first-32 set, so cross-replica merges
+ * via OrbitDB stay convergent.
+ *
+ * Local constant rather than `modules/payments/transfer/limits.ts` because
+ * this cap is internal to `disposition-writer` and not part of the
+ * protocol-level limit surface that limits.ts curates.
+ */
+export const MAX_AUDIT_BUNDLE_CIDS = 32;
+
+// =============================================================================
 // 1. Public types
 // =============================================================================
 
@@ -125,8 +161,30 @@ export interface DispositionWriterOptions {
 // =============================================================================
 
 /**
+ * Canonical 64-char-hex regex for a SHA-256 digest (lower OR upper case).
+ * Used to validate `observedTokenContentHash` at the writer's entry point —
+ * a malformed hash would otherwise produce keys with attacker-shaped
+ * suffixes that could collide with future records on storage backends
+ * that don't enforce key shape (steelman finding, Wave 3).
+ */
+const CANONICAL_CONTENT_HASH_RE = /^[0-9a-f]{64}$/i;
+
+/**
  * Compose the `_invalid` per-entry key per §5.4:
  *   `${addr}.invalid.${tokenId}.${observedTokenContentHash}`
+ *
+ * **Empty-tokenId routing** (steelman finding, Wave 3). When `tokenId` is
+ * the empty string — the engine's "unknown tokenId" sentinel for
+ * hydration-throw STRUCTURAL_INVALID records — the key would otherwise be
+ * `${addr}.invalid..${observedTokenContentHash}` (double dot). Two
+ * unrelated hydration failures whose `observedTokenContentHash` happens
+ * to collide (e.g. an attacker shipping crafted token-roots whose hash
+ * matches a legitimate one) would write to the SAME key, overwriting
+ * each other's forensic records. Routing empty-tokenId entries to a
+ * separate keyspace `${addr}.invalid-orphan.${observedTokenContentHash}`
+ * isolates them from real-tokenId records — colliding hashes still
+ * overwrite within the orphan space (no worse than today) but cannot
+ * corrupt non-orphan records.
  *
  * Exposed for tests + the audit-promotion path (which needs to read the
  * audit record by key when promoting).
@@ -136,19 +194,56 @@ export function invalidKeyFor(
   tokenId: string,
   observedTokenContentHash: ContentHash,
 ): string {
+  if (tokenId === '') {
+    return `${addr}.invalid-orphan.${observedTokenContentHash}`;
+  }
   return `${addr}.invalid.${tokenId}.${observedTokenContentHash}`;
 }
 
 /**
  * Compose the `_audit` per-entry key per §5.4:
  *   `${addr}.audit.${tokenId}.${observedTokenContentHash}`
+ *
+ * **Empty-tokenId routing** mirrors {@link invalidKeyFor} — a
+ * structurally-defective audit record (no tokenId surfaced from
+ * hydration) lands under
+ * `${addr}.audit-orphan.${observedTokenContentHash}` to avoid
+ * double-dot key collisions across distinct failures whose observed
+ * hash collides.
  */
 export function auditKeyFor(
   addr: string,
   tokenId: string,
   observedTokenContentHash: ContentHash,
 ): string {
+  if (tokenId === '') {
+    return `${addr}.audit-orphan.${observedTokenContentHash}`;
+  }
   return `${addr}.audit.${tokenId}.${observedTokenContentHash}`;
+}
+
+/**
+ * Validate `observedTokenContentHash` is a canonical 64-char hex SHA-256
+ * digest (steelman finding, Wave 3). Throws VALIDATION_ERROR with a
+ * helpful message if it isn't — engineering-error guard against an
+ * upstream defect that lets an attacker-shaped (e.g. path-injection)
+ * hash flow through to storage keys.
+ *
+ * The disposition engine ALREADY produces hashes via
+ * `pkg.computeContentHash` / `contentHash()`, so in normal operation
+ * this never fires. The guard exists to fail closed on programmer error
+ * (synthesizing a sentinel hash, not running the canonical validator).
+ */
+function assertCanonicalContentHash(
+  hash: ContentHash,
+  context: string,
+): void {
+  if (!CANONICAL_CONTENT_HASH_RE.test(hash)) {
+    throw new SphereError(
+      `${context}: observedTokenContentHash must be 64-char hex (got "${hash}")`,
+      'VALIDATION_ERROR',
+    );
+  }
 }
 
 // =============================================================================
@@ -431,6 +526,14 @@ export class DispositionWriter {
     addr: string,
     record: Extract<DispositionRecord, { disposition: 'INVALID' }>,
   ): Promise<void> {
+    // (Wave 3 steelman) Validate the disambiguator at the writer entry
+    // point — a malformed hash would otherwise flow into the storage key
+    // and could collide with crafted lookups on backends that don't
+    // enforce key shape.
+    assertCanonicalContentHash(
+      record.observedTokenContentHash,
+      'DispositionWriter.writeInvalid',
+    );
     const key = invalidKeyFor(
       addr,
       record.tokenId,
@@ -451,6 +554,12 @@ export class DispositionWriter {
     addr: string,
     record: Extract<DispositionRecord, { disposition: 'AUDIT' }>,
   ): Promise<void> {
+    // (Wave 3 steelman) Validate the disambiguator at the writer entry
+    // point. Mirrors `writeInvalid` — see `assertCanonicalContentHash`.
+    assertCanonicalContentHash(
+      record.observedTokenContentHash,
+      'DispositionWriter.writeAudit',
+    );
     const key = auditKeyFor(
       addr,
       record.tokenId,
@@ -458,10 +567,12 @@ export class DispositionWriter {
     );
     // Audit records are MULTI-OBSERVATION accumulators — re-arrival of
     // the same `(tokenId, observedTokenContentHash)` adds the new
-    // bundleCid to the `bundleCidsObserved` list (deduplicated, append-
-    // only) and preserves any prior `auditStatus` (e.g. 'audit-promoted'
-    // must not regress to 'audit-not-our-state' just because a fresh
-    // observation rolled in). See §5.4.
+    // bundleCid to the `bundleCidsObserved` list (deduplicated, sorted,
+    // capped at MAX_AUDIT_BUNDLE_CIDS) and preserves any prior
+    // `auditStatus` (e.g. 'audit-promoted' must not regress to
+    // 'audit-not-our-state' just because a fresh observation rolled in).
+    // See §5.4. Beyond the cap, observations are silently dropped from
+    // the CID inventory; auditStatus / reason are unaffected.
     const existing = await this.storage.readRecord<AuditEntry>(key);
     const merged = mergeAuditEntry(existing, record, this.now());
     await this.storage.writeRecord<AuditEntry>(key, merged);
@@ -604,7 +715,16 @@ function unionBundleCids(
   const set = new Set<string>();
   if (a) for (const v of a) set.add(v);
   for (const v of b) set.add(v);
-  return [...set].sort();
+  // Sort lex-min so the cap selection (slice 0..MAX_AUDIT_BUNDLE_CIDS) is
+  // deterministic across replicas: every wallet that has observed the same
+  // N CIDs converges on the same first-MAX_AUDIT_BUNDLE_CIDS set, keeping
+  // cross-replica audit-merge convergent. See `MAX_AUDIT_BUNDLE_CIDS`
+  // JSDoc above for the steelman rationale (DoS via padding-varied CIDs).
+  const sorted = [...set].sort();
+  if (sorted.length <= MAX_AUDIT_BUNDLE_CIDS) {
+    return sorted;
+  }
+  return sorted.slice(0, MAX_AUDIT_BUNDLE_CIDS);
 }
 
 function stripUndefinedShallow<T extends object>(value: T): T {

@@ -253,10 +253,48 @@ export class SendingRecoveryWorker {
   /**
    * Attempt to recover a single stuck entry. Best-effort: any throw is
    * logged and counted toward `maxRetries`; the loop continues.
+   *
+   * **Wave 3 steelman fix — concurrency race**: a concurrent process
+   * (e.g. another sending path, a manual transition, the merger) MAY
+   * advance the entry past `'sending'` between the scan-cycle's
+   * `readAllNew()` snapshot and this method's invocation. Without a
+   * pre-republish status check, the worker would:
+   *   1. Re-publish a payload that was already delivered (duplicate
+   *      Nostr publish — wasteful but recipient-side LRU saves us);
+   *   2. CAS-fail in `transitionToDelivered` (the mutator returns
+   *      `prev` unchanged because `prev.status !== 'sending'`);
+   *   3. STILL fire `emitRepublished` — falsely claiming a recovery
+   *      that never happened.
+   *
+   * Fix: pre-check status against the live outbox BEFORE calling
+   * `republish`. If the entry has advanced, skip silently — there is
+   * nothing to recover. The post-republish CAS in
+   * `transitionToDelivered` then reports back whether the write
+   * actually transitioned, gating the event emission.
    */
   private async recoverOne(entry: UxfTransferOutboxEntry): Promise<void> {
+    // Pre-flight: re-read the current entry state. If a concurrent
+    // mutator advanced it past `'sending'` since our scan snapshot, do
+    // nothing. The freshly-published recipient already saw the original
+    // bundle; we MUST NOT re-publish.
+    let liveEntry: UxfTransferOutboxEntry | undefined;
     try {
-      await this.deps.republish(entry);
+      const all = await this.deps.outbox.readAllNew();
+      liveEntry = all.find((e) => e.id === entry.id);
+    } catch (err) {
+      this.warn('pre-republish readAllNew failed; skipping entry', {
+        outboxId: entry.id,
+        err: errMessage(err),
+      });
+      return;
+    }
+    if (liveEntry === undefined || liveEntry.status !== 'sending') {
+      // Entry advanced (or vanished) — nothing to recover.
+      return;
+    }
+
+    try {
+      await this.deps.republish(liveEntry);
     } catch (err) {
       const count = (this.failureCounts.get(entry.id) ?? 0) + 1;
       this.failureCounts.set(entry.id, count);
@@ -274,26 +312,48 @@ export class SendingRecoveryWorker {
 
     // Success path — transition to delivered / delivered-instant.
     this.failureCounts.delete(entry.id);
-    await this.transitionToDelivered(entry);
+    await this.transitionToDelivered(liveEntry);
   }
 
   /**
    * Apply the post-republish `sending → delivered{,-instant}` arc and
    * emit the recovery event. Guards against the entry having already
    * advanced (e.g. a concurrent call): if the entry is no longer in
-   * `'sending'`, the transition is skipped silently.
+   * `'sending'`, the transition is skipped silently AND the emit is
+   * suppressed — see Wave 3 steelman fix below.
+   *
+   * **Wave 3 steelman fix — false-success emit**: the previous
+   * implementation called `emitRepublished` unconditionally after the
+   * `update()` call. If the mutator's CAS detected `prev.status !==
+   * 'sending'` and returned `prev` unchanged, the emit still fired —
+   * falsely reporting a recovery that did nothing. The emit MUST be
+   * gated on the actual write transitioning status. We track the
+   * "did-transition" flag in a closure variable inside the mutator so
+   * it reflects the value at the moment of the CAS, not whatever the
+   * scan snapshot saw.
    */
   private async transitionToDelivered(
     entry: UxfTransferOutboxEntry,
   ): Promise<void> {
     const targetStatus =
       entry.mode === 'instant' ? 'delivered-instant' : 'delivered';
+    let didTransition = false;
     try {
       await this.deps.outbox.update(entry.id, (prev) => {
-        if (prev.status !== 'sending') return prev;
+        if (prev.status !== 'sending') {
+          // CAS guard — concurrent advance; do not transition, do not
+          // emit. The write becomes a no-op self-loop and the writer's
+          // status-validator skips the transition table check.
+          return prev;
+        }
+        didTransition = true;
         return { ...prev, status: targetStatus };
       });
-      this.emitRepublished(entry, targetStatus);
+      // Emit ONLY if the CAS actually applied the transition. Suppresses
+      // the false-success signal previously fired on concurrent races.
+      if (didTransition) {
+        this.emitRepublished(entry, targetStatus);
+      }
     } catch (err) {
       // Transition rejected (state-machine validator) or write error —
       // forensic only. The wire publish already succeeded; the merger /
@@ -342,21 +402,47 @@ export class SendingRecoveryWorker {
     }
   }
 
-  /** Schedule the next scan via recursive setTimeout. */
+  /**
+   * Schedule the next scan via recursive setTimeout.
+   *
+   * **Wave 3 steelman fix — microtask drain race**: the previous
+   * implementation invoked `runScanCycle()` and THEN assigned
+   * `this.scanInFlight = cycle.then(...)`. Between those two statements
+   * a microtask boundary exists (the promise constructor returns
+   * synchronously, but `.then(...)` chains scheduling is microtask-
+   * driven). If `stop()` is called inside that microtask window — or
+   * if the test harness flushes microtasks between the invocation and
+   * the assignment — `stop()` observes `scanInFlight === null` and
+   * returns immediately while a cycle is mid-flight. Late writes from
+   * the in-flight cycle then arrive AFTER the caller believed the
+   * worker had drained.
+   *
+   * Fix: assign `this.scanInFlight` SYNCHRONOUSLY, in the same
+   * statement that creates the promise, BEFORE any microtask boundary
+   * exists. We use an IIFE so the assignment captures the same Promise
+   * reference that the cycle's `.finally()` continuation observes —
+   * `stop()` cannot ever observe `null` while a cycle is running.
+   */
   private scheduleNext(): void {
     if (!this.running) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      const cycle = this.runScanCycle().catch((err) => {
-        this.warn('unexpected scan-cycle throw', { err: errMessage(err) });
-      });
-      // Adapt to Promise<void> — runScanCycle returns Promise<number>
-      // but the in-flight tracker only needs completion semantics.
-      this.scanInFlight = cycle.then(() => undefined);
+      // SYNCHRONOUS assignment — no microtask boundary between cycle
+      // creation and the in-flight tracker being populated. The IIFE
+      // captures the cycle's full lifecycle (run + reschedule) into a
+      // single Promise<void> reference so `stop()` always observes a
+      // non-null `scanInFlight` for the duration of the cycle.
+      this.scanInFlight = (async (): Promise<void> => {
+        try {
+          await this.runScanCycle();
+        } catch (err) {
+          this.warn('unexpected scan-cycle throw', { err: errMessage(err) });
+        }
+      })();
       // Re-arm only after the cycle settles; this is what guarantees
       // no overlapping iterations even if a single scan runs longer
       // than `intervalMs` (rare but possible under outbox contention).
-      void cycle.finally(() => {
+      void this.scanInFlight.finally(() => {
         this.scanInFlight = null;
         this.scheduleNext();
       });

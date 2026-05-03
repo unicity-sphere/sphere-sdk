@@ -42,6 +42,10 @@ import {
   prepareChildrenForHashing,
   hexToBytes,
 } from './hash.js';
+import {
+  CAR_IMPORT_MAX_BLOCK_COUNT,
+  CAR_IMPORT_MAX_BLOCK_BYTES,
+} from './limits.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -413,10 +417,52 @@ export async function importFromCar(car: Uint8Array): Promise<UxfPackageData> {
   nonElementCids.add(envelopeCid.toString());
   nonElementCids.add(manifestCid.toString());
 
-  // Read all blocks and decode elements
+  // Read all blocks and decode elements.
+  //
+  // Steelman Wave 3 — fail-closed per-block caps (count + bytes).
+  //
+  // `WRAP_POOL_MAX_SIZE` (UxfPackage.ts) only fires AFTER the entire
+  // CAR has been streamed into `pool`. A 32 MiB CAR with ~800k tiny
+  // dag-cbor blocks bypasses every existing cap until the post-import
+  // wrap. Cap two dimensions at the source-of-bloat:
+  //
+  //   1. Per-block COUNT (`CAR_IMPORT_MAX_BLOCK_COUNT`): rejects
+  //      tiny-block-flooding attacks well before they materialise as
+  //      Map insertions.
+  //   2. Per-block BYTES (`CAR_IMPORT_MAX_BLOCK_BYTES`): rejects
+  //      single-large-block attacks (a 100 MiB block whose decode
+  //      blows the heap before reaching pool).
+  //
+  // Counts ALL blocks (including envelope + manifest) so a hostile
+  // CAR can't sneak past by burning the count budget on non-element
+  // blocks.
   const pool = new Map<ContentHash, UxfElement>();
+  let blockCount = 0;
 
   for await (const block of reader.blocks()) {
+    blockCount += 1;
+    if (blockCount > CAR_IMPORT_MAX_BLOCK_COUNT) {
+      // Free partial pool before throwing — V8 will GC eventually but
+      // the explicit clear keeps memory pressure low for the catching
+      // caller (e.g. a relay handling many concurrent imports).
+      pool.clear();
+      throw new UxfError(
+        'INVALID_PACKAGE',
+        `CAR block count exceeds CAR_IMPORT_MAX_BLOCK_COUNT=${CAR_IMPORT_MAX_BLOCK_COUNT} ` +
+          `(bloat-DoS protection: hostile CARs may flood with tiny blocks under the ` +
+          `per-element-count pool cap).`,
+      );
+    }
+    if (block.bytes.byteLength > CAR_IMPORT_MAX_BLOCK_BYTES) {
+      pool.clear();
+      throw new UxfError(
+        'INVALID_PACKAGE',
+        `CAR block ${block.cid.toString()} size ${block.bytes.byteLength} bytes ` +
+          `exceeds CAR_IMPORT_MAX_BLOCK_BYTES=${CAR_IMPORT_MAX_BLOCK_BYTES} ` +
+          `(per-block bloat-DoS protection).`,
+      );
+    }
+
     const cidStr = block.cid.toString();
     if (nonElementCids.has(cidStr)) {
       continue;

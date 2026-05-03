@@ -330,6 +330,156 @@ describe('§6.1.1 revalidateCascadedChildren', () => {
     expect(h.callsByChild).not.toContain(GGC);
   });
 
+  it('parent flip-back mid-loop → fresh parent state read per child (steelman #170)', async () => {
+    // Steelman fix: previously the runner read the parent ONCE before
+    // the children loop and re-used `parentIsValid` for every child
+    // (and grandchild). If a concurrent worker flipped the parent
+    // back to `invalid` during the iteration, every subsequent child
+    // would still be fed to the validator with stale `parentIsValid=true`.
+    //
+    // The fix re-reads the parent FRESH inside the loop body, ahead of
+    // each child's validator call. This test:
+    //   1. Sets parent = `valid` and three cascaded children C1, C2, C3.
+    //   2. After C1's validator runs, flips parent → `invalid`.
+    //   3. Asserts: C2 and C3 see the flipped parent and short-circuit
+    //      via the `!parentIsValid` branch — `stillInvalid` increments
+    //      WITHOUT invoking the validator.
+    const PARENT = 'p';
+    const C1 = 'c1';
+    const C2 = 'c2';
+    const C3 = 'c3';
+
+    let flipDone = false;
+    const h = buildRevalidatorHarness({
+      verdicts: new Map([
+        [C1, { kind: 'revalidated' }],
+        [C2, { kind: 'revalidated' }],
+        [C3, { kind: 'revalidated' }],
+      ]),
+      beforeVerdict: ({ childTokenId, manifest }) => {
+        // Right after C1's validator call, flip parent to invalid.
+        // Subsequent reads of PARENT will see status='invalid', so
+        // C2/C3 must short-circuit before invoking the validator.
+        if (childTokenId === C1 && !flipDone) {
+          const cur = manifest.entries.get(`${ADDR}:${PARENT}`)!;
+          manifest.entries.set(`${ADDR}:${PARENT}`, {
+            ...cur,
+            status: 'invalid',
+            invalidReason: 'oracle-rejected',
+          });
+          flipDone = true;
+        }
+      },
+    });
+
+    h.manifest.entries.set(`${ADDR}:${PARENT}`, manifestEntryFor({
+      status: 'valid',
+      rootHashHex: 'aa'.repeat(32),
+    }));
+    for (const [tid, hex] of [
+      [C1, 'b1'.repeat(32)],
+      [C2, 'b2'.repeat(32)],
+      [C3, 'b3'.repeat(32)],
+    ] as const) {
+      h.manifest.entries.set(`${ADDR}:${tid}`, manifestEntryFor({
+        status: 'invalid',
+        invalidReason: 'parent-rejected',
+        splitParent: PARENT,
+        rootHashHex: hex,
+      }));
+    }
+
+    const r = await h.runner.run(ADDR, PARENT);
+
+    // All three children inspected (the `wasParentRejected` filter
+    // accepts them all).
+    expect(r.checked).toBe(3);
+    // Only C1 was revalidated — C2/C3 short-circuited via the fresh
+    // per-child parent-read seeing the flip-back.
+    expect(r.revalidated).toBe(1);
+    expect(r.stillInvalid).toBe(2);
+    // Critically: the validator was invoked ONLY for C1. Without the
+    // per-child fresh parent-read, the loop would have invoked
+    // validator for C2 and C3 too (using stale `parentIsValid=true`).
+    expect(h.callsByChild).toEqual([C1]);
+  });
+
+  it('grandchildren get fresh parent state per recursive frame (steelman #170)', async () => {
+    // Steelman: the runner's recursion into a successfully-revalidated
+    // child reuses the SAME `_walkChildren` recursion. The recursive
+    // frame's `currentTokenId` is the child (now grandparent of the
+    // walk's root). The fresh-parent-read MUST happen against the
+    // grandparent for each grandchild — not against the original root.
+    //
+    // Setup: PARENT (valid) → C (cascaded) → GC1, GC2, GC3 (cascaded).
+    // After C revalidates, recursion descends. Before GC2's validator
+    // call, flip C back to `invalid`. GC2/GC3 must short-circuit.
+    const PARENT = 'p';
+    const C = 'c';
+    const GC1 = 'gc1';
+    const GC2 = 'gc2';
+    const GC3 = 'gc3';
+
+    let cFlipped = false;
+    const h = buildRevalidatorHarness({
+      verdicts: new Map([
+        [C, { kind: 'revalidated' }],
+        [GC1, { kind: 'revalidated' }],
+        [GC2, { kind: 'revalidated' }],
+        [GC3, { kind: 'revalidated' }],
+      ]),
+      beforeVerdict: ({ childTokenId, manifest }) => {
+        if (childTokenId === GC1 && !cFlipped) {
+          // Flip C back to invalid AFTER GC1's validator has been
+          // invoked but BEFORE GC2/GC3 are processed.
+          const cur = manifest.entries.get(`${ADDR}:${C}`)!;
+          manifest.entries.set(`${ADDR}:${C}`, {
+            ...cur,
+            status: 'invalid',
+            invalidReason: 'parent-rejected',
+            splitParent: PARENT,
+          });
+          cFlipped = true;
+        }
+      },
+    });
+
+    h.manifest.entries.set(`${ADDR}:${PARENT}`, manifestEntryFor({
+      status: 'valid',
+      rootHashHex: '01'.repeat(32),
+    }));
+    h.manifest.entries.set(`${ADDR}:${C}`, manifestEntryFor({
+      status: 'invalid',
+      invalidReason: 'parent-rejected',
+      splitParent: PARENT,
+      rootHashHex: '02'.repeat(32),
+    }));
+    for (const [tid, hex] of [
+      [GC1, '03'.repeat(32)],
+      [GC2, '04'.repeat(32)],
+      [GC3, '05'.repeat(32)],
+    ] as const) {
+      h.manifest.entries.set(`${ADDR}:${tid}`, manifestEntryFor({
+        status: 'invalid',
+        invalidReason: 'parent-rejected',
+        splitParent: C,
+        rootHashHex: hex,
+      }));
+    }
+
+    const r = await h.runner.run(ADDR, PARENT);
+
+    // C revalidated; GC1 revalidated (before C-flip);
+    // GC2 and GC3 short-circuited (saw C as invalid).
+    expect(r.checked).toBe(4); // C + GC1 + GC2 + GC3
+    expect(r.revalidated).toBe(2); // C + GC1
+    expect(r.stillInvalid).toBe(2); // GC2 + GC3
+    // Validator called only for C and GC1. GC2 and GC3 short-circuited
+    // because the recursive frame's per-child parent-read saw C
+    // flipped back to invalid.
+    expect(h.callsByChild).toEqual([C, GC1]);
+  });
+
   it('per-call-stack visited-set isolation (W32)', async () => {
     // Two independent revalidations against different parents must not
     // share visited-set state.

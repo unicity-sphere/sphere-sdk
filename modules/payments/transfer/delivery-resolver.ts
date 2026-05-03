@@ -237,9 +237,16 @@ export interface ResolveDeliveryOptions {
  *         non-finite (NaN, ±Infinity).
  * @throws {SphereError} `INLINE_CAR_TOO_LARGE` — force-inline mode with
  *         `carBytes.length > RELAY_SAFE_CAP_BYTES`.
- * @throws {SphereError} `IPFS_PUBLISHER_REQUIRED` — CID branch selected
- *         (force-cid or auto-over-cap) but `publishToIpfs` is absent AND
- *         `carBytes.byteLength > RELAY_SAFE_CAP_BYTES`.
+ * @throws {SphereError} `FORCE_CID_NO_PUBLISHER` — `force-cid` strategy
+ *         selected but `publishToIpfs` is absent. Steelman Wave 3:
+ *         `force-cid` carries an explicit privacy intent and MUST NOT
+ *         be silently downgraded to inline delivery. The caller must
+ *         either wire a publisher or switch strategy.
+ * @throws {SphereError} `IPFS_PUBLISHER_REQUIRED` — auto mode CID branch
+ *         selected but `publishToIpfs` is absent AND
+ *         `carBytes.byteLength > RELAY_SAFE_CAP_BYTES`. (force-cid no
+ *         longer routes here — it raises `FORCE_CID_NO_PUBLISHER`
+ *         regardless of size.)
  *
  * @see DeliveryStrategy in `types/uxf-transfer.ts`
  * @see clampInlineCap in `modules/payments/transfer/limits.ts`
@@ -254,12 +261,29 @@ export async function resolveDelivery(
       // Always pin, regardless of size. Caller's explicit choice — e.g.,
       // audit-by-CID or storage-constrained recipient (§3.3.1).
       //
-      // No-publisher fallback (approach γ): if no IPFS publisher is wired,
-      // fall back to inline when the bundle fits within the relay-safe
-      // ceiling. Throw IPFS_PUBLISHER_REQUIRED if the bundle is too large
-      // for inline delivery.
+      // **Steelman fix (Wave 3) — privacy regression hardening.** Earlier
+      // revisions silently downgraded `force-cid` to inline delivery via
+      // `carInlineFallback` when no `publishToIpfs` was wired AND the
+      // CAR fit within `RELAY_SAFE_CAP_BYTES`. That defeated the entire
+      // point of `force-cid`: the caller chose CID precisely BECAUSE
+      // they did NOT want the bundle inlined on the relay (privacy
+      // intent — the relay would otherwise see the bundle bytes).
+      //
+      // We now treat "force-cid + no publisher" as a HARD ERROR
+      // (`FORCE_CID_NO_PUBLISHER`) rather than a silent downgrade. The
+      // caller must either wire an IPFS publisher or, if the inline
+      // leak is acceptable, switch to `auto` / `force-inline` so the
+      // intent is explicit at the call site.
       if (publishToIpfs === undefined) {
-        return carInlineFallback(carBytes, 'force-cid');
+        throw new SphereError(
+          `resolveDelivery: force-cid strategy explicitly requires a` +
+            ` publishToIpfs callback. The resolver REFUSES to silently` +
+            ` downgrade to inline delivery because force-cid signals a` +
+            ` privacy intent (the caller does NOT want the bundle inlined` +
+            ` on the relay). Wire an IPFS publisher or switch to` +
+            ` 'auto' / 'force-inline' if inline delivery is acceptable.`,
+          'FORCE_CID_NO_PUBLISHER',
+        );
       }
       const { cid } = await publishToIpfs(carBytes);
       return { kind: 'cid', cid, shouldPin: true };
@@ -299,9 +323,11 @@ export async function resolveDelivery(
       //
       // No-publisher fallback (approach γ): if no IPFS publisher is wired,
       // fall back to inline when the bundle fits within the relay-safe
-      // ceiling. Throw IPFS_PUBLISHER_REQUIRED if too large.
+      // ceiling. Throw IPFS_PUBLISHER_REQUIRED if too large. (Note:
+      // `force-cid` does NOT reach this fallback per the steelman Wave 3
+      // privacy fix — see the `force-cid` case above.)
       if (publishToIpfs === undefined) {
-        return carInlineFallback(carBytes, 'auto');
+        return carInlineFallback(carBytes);
       }
       const { cid } = await publishToIpfs(carBytes);
       return { kind: 'cid', cid, shouldPin: true };
@@ -329,33 +355,34 @@ export async function resolveDelivery(
 // =============================================================================
 
 /**
- * CAR-inline fallback for CID branches without a publisher (approach γ).
+ * CAR-inline fallback for the `auto`-over-cap CID branch without a
+ * publisher (approach γ).
  *
- * When a CID delivery branch is selected (`force-cid` or `auto`-over-cap)
- * but no `publishToIpfs` callback is wired, this helper attempts to fall
- * back to inline (`uxf-car`) delivery:
+ * When `auto` mode would route a bundle through CID delivery (because it
+ * exceeds the inline cap) but no `publishToIpfs` callback is wired, this
+ * helper falls back to inline (`uxf-car`) delivery:
  *
  *  - `carBytes.byteLength <= RELAY_SAFE_CAP_BYTES` → returns an inline
- *    decision so the sender can still deliver without IPFS.
+ *    decision so the sender can still deliver without IPFS. `auto` mode
+ *    expresses no privacy preference, so the relay-leak is acceptable.
  *  - `carBytes.byteLength > RELAY_SAFE_CAP_BYTES` → throws
  *    `IPFS_PUBLISHER_REQUIRED` (the bundle is too large for inline Nostr
  *    delivery; the caller must configure an IPFS publisher).
  *
- * The `strategyKind` argument is used only for the error message to give
- * the operator a clear signal about which branch triggered the fallback.
+ * **Steelman fix (Wave 3).** The `force-cid` branch no longer routes
+ * through this helper — see the `force-cid` case in `resolveDelivery`,
+ * which raises `FORCE_CID_NO_PUBLISHER` directly. `force-cid` signals an
+ * explicit privacy intent that MUST NOT be silently downgraded.
  *
  * @internal
  */
-function carInlineFallback(
-  carBytes: Uint8Array,
-  strategyKind: 'force-cid' | 'auto',
-): DeliveryDecision {
+function carInlineFallback(carBytes: Uint8Array): DeliveryDecision {
   if (carBytes.byteLength <= RELAY_SAFE_CAP_BYTES) {
     // Bundle fits within the relay-safe ceiling → inline fallback.
     return { kind: 'inline', carBase64: carBytesToBase64(carBytes) };
   }
   throw new SphereError(
-    `resolveDelivery: ${strategyKind} strategy selected CID delivery but no publishToIpfs` +
+    `resolveDelivery: auto strategy selected CID delivery but no publishToIpfs` +
       ` callback was supplied and the CAR (${carBytes.byteLength} bytes) exceeds the` +
       ` relay-safe inline ceiling of ${RELAY_SAFE_CAP_BYTES} bytes.` +
       ' Configure an IPFS provider to send large bundles.',

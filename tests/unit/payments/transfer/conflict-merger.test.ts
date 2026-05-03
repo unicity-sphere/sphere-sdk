@@ -388,7 +388,15 @@ describe('mergeConflictingHeads — prefix-extension-merge', () => {
     expect(out.merged.lamport).toBe(5); // max
   });
 
-  it('preserves the winner status and unions audit_promoted_from', () => {
+  it('preserves the higher-precedence status and unions audit_promoted_from', () => {
+    // W3.4 fix: `mergeStatus` now uses a total order
+    //   `invalid > conflicting > pending > valid`
+    // independent of which side is "winner". Previously this test asserted
+    // that the winner-side's status (`'valid'`) survived even when the
+    // loser side was `'pending'`. Per the new associative rule, `'pending'`
+    // dominates `'valid'` because it signals work-still-pending (oracle
+    // finalization / proof fetch); the demotion back to `'valid'` is the
+    // [E] re-run's job, not the merger's.
     const [t0H, t0] = makeTransaction('0', { committed: true });
     const [t1H, t1] = makeTransaction('1', { committed: true });
 
@@ -419,7 +427,7 @@ describe('mergeConflictingHeads — prefix-extension-merge', () => {
     });
 
     expect(out.decision).toBe('prefix-extension-merge');
-    expect(out.merged.status).toBe('valid'); // winner side
+    expect(out.merged.status).toBe('pending'); // pending > valid (W3.4)
     expect(out.merged.audit_promoted_from).toEqual([
       'DIRECT_aaa.audit.tok1.h_short',
       'DIRECT_bbb.audit.tok1.h_long',

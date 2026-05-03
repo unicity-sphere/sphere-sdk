@@ -568,10 +568,25 @@ export async function runFinalizationCycle(
     requestId: ctx.requestId,
   });
   if (ctxResolved === null) {
+    // Steelman fix (Wave 3 #5): a missing signedTx for a queue entry
+    // means we cannot submit and cannot reason about whether this
+    // requestId raced with a sibling. Cascading on this hard-fail
+    // would propagate "structural" terminal status to descendant
+    // tokens despite the worker having no evidence the cascade is
+    // warranted — the failure mode is closer to `race-lost` (we have
+    // no proof the chain is dead) than to `proof-invalid`. Skip the
+    // cascade and emit an operator-alert so the missing-signedTx
+    // condition is visible to the operator (it usually indicates a
+    // mid-write crash or a partial-replication state).
+    ctx.emit('transfer:operator-alert', {
+      code: 'structural',
+      tokenId: ctx.tokenId,
+      message: ctx.structuralInvalidMessage,
+    });
     return {
       kind: 'hard-fail',
       reason: 'structural',
-      skipCascade: false,
+      skipCascade: true,
       message: ctx.structuralInvalidMessage,
     };
   }
@@ -595,9 +610,24 @@ export async function runFinalizationCycle(
 export async function runSubmitPhase(
   ctx: FinalizationCycleContext,
 ): Promise<{ kind: 'submitted' } | HardFailOutcome> {
+  // Steelman fix (Wave 3 #1): retry-budget interpretation.
+  //
+  // Pre-fix loop was `while (attempts <= maxSubmitRetries)` plus a
+  // redundant `if (attempts > maxSubmitRetries) break` after the
+  // post-failure increment. The `<=` form ran N+1 iterations, encoding
+  // "1 initial attempt + N retries". The redundant break was dead code
+  // under that interpretation but obscured the off-by-one.
+  //
+  // Switching to `attempts < maxSubmitRetries` makes the budget mean
+  // "max attempts INCLUDING the first" — matches the field name
+  // `submitRetryCount` (a counter, NOT a "retries-on-top-of-initial"
+  // budget), matches the spec's "Bounded by MAX_SUBMIT_RETRIES" wording
+  // (the value bounds the total attempts), and removes the dead break.
+  // The default `MAX_SUBMIT_RETRIES = 5` therefore yields up to 5 calls
+  // total (per the spec's §13.2 budget table).
   let attempts = 0;
   let lastError: string | undefined;
-  while (attempts <= ctx.maxSubmitRetries) {
+  while (attempts < ctx.maxSubmitRetries) {
     if (ctx.signal?.aborted === true || ctx.isStopped()) {
       return {
         kind: 'hard-fail',
@@ -651,10 +681,10 @@ export async function runSubmitPhase(
         message: `client-error: REQUEST_ID_MISMATCH on submit for ${ctx.subjectPhrase}${outcome.error ? ` (${outcome.error})` : ''}`,
       };
     }
-    // TRANSIENT
+    // TRANSIENT — count this failed attempt and (if budget remains) back off.
     lastError = outcome.error;
     attempts++;
-    if (attempts > ctx.maxSubmitRetries) break;
+    if (attempts >= ctx.maxSubmitRetries) break;
     // Reuse the polling-policy's backoff schedule for submit retries —
     // matches §6.1's "back off; retry. Bounded by MAX_SUBMIT_RETRIES"
     // wording.
@@ -690,7 +720,16 @@ export async function runPollPhase(
 ): Promise<CycleResult> {
   const startedAt = ctx.pollStartedAt;
   let attempts = 0;
-  let proofErrorRetries = 0;
+  // Steelman fix (Wave 3 #2): split the previously-shared
+  // `proofErrorRetries` counter into two independent budgets so a
+  // PATH_INVALID burst cannot silently consume the NOT_AUTHENTICATED
+  // budget (and vice versa). Each starts at zero and is bounded by
+  // `maxProofErrorRetries`. Hard-fail messages attribute exhaustion to
+  // the actual triggering error type — operators can now distinguish
+  // "stuck in PATH_INVALID" from "stuck in NOT_AUTHENTICATED" from the
+  // emitted message alone.
+  let pathInvalidRetries = 0;
+  let notAuthenticatedRetries = 0;
   // T.5.F two-strike accounting — counts NOT_AUTHENTICATED
   // observations made in THIS poll loop. The first strike triggers a
   // (debounced) refresh and a retry. The second strike escalates to
@@ -734,6 +773,22 @@ export async function runPollPhase(
       // first poll is delayed by `getBackoffMs(0)`. The deterministic
       // sleep primitive is a no-op in tests with a fake clock.
       await ctx.sleep(getBackoffMs(attempts), ctx.signal);
+
+      // Steelman fix (Wave 3 #3): re-check abort/stop signals
+      // immediately after the sleep returns, BEFORE issuing the next
+      // poll. `ctx.sleep` may resolve normally even when the signal
+      // aborted mid-sleep (depending on the injected primitive's
+      // signal-handling); without an explicit re-check we'd issue an
+      // aggregator call AFTER the worker was told to shut down. The
+      // top-of-loop abort check only catches subsequent iterations.
+      if (ctx.signal?.aborted || ctx.isStopped()) {
+        return {
+          kind: 'hard-fail',
+          reason: 'structural',
+          skipCascade: false,
+          message: `worker aborted while polling ${ctx.subjectPhrase}`,
+        };
+      }
 
       let pollOutcome: PollOutcome;
       try {
@@ -831,13 +886,13 @@ export async function runPollPhase(
       }
 
       if (pollOutcome.kind === 'PATH_INVALID') {
-        proofErrorRetries++;
-        if (proofErrorRetries >= ctx.maxProofErrorRetries) {
+        pathInvalidRetries++;
+        if (pathInvalidRetries >= ctx.maxProofErrorRetries) {
           return {
             kind: 'hard-fail',
             reason: 'proof-invalid',
             skipCascade: false,
-            message: `PATH_INVALID after ${proofErrorRetries} retries: ${ctx.subjectEqPhrase}${pollOutcome.error ? ` (${pollOutcome.error})` : ''}`,
+            message: `PATH_INVALID after ${pathInvalidRetries} retries: ${ctx.subjectEqPhrase}${pollOutcome.error ? ` (${pollOutcome.error})` : ''}`,
           };
         }
         continue;
@@ -917,13 +972,13 @@ export async function runPollPhase(
 
         // No staleness ledger wired — preserve the original budgeted
         // retry behavior.
-        proofErrorRetries++;
-        if (proofErrorRetries >= ctx.maxProofErrorRetries) {
+        notAuthenticatedRetries++;
+        if (notAuthenticatedRetries >= ctx.maxProofErrorRetries) {
           return {
             kind: 'hard-fail',
             reason: 'proof-invalid',
             skipCascade: false,
-            message: `NOT_AUTHENTICATED after ${proofErrorRetries} retries: ${ctx.subjectEqPhrase} (likely stale trustBase per §9.4.1)`,
+            message: `NOT_AUTHENTICATED after ${notAuthenticatedRetries} retries: ${ctx.subjectEqPhrase} (likely stale trustBase per §9.4.1)`,
           };
         }
         continue;
@@ -971,13 +1026,56 @@ export async function checkProofConflict(
   | { kind: 'attached-newer' }
   | { kind: 'security-alert'; message: string }
 > {
+  // Steelman fix (Wave 3 #4): the prior implementation swallowed any
+  // `getAttachedProof` exception and fell through to `{kind:'fresh'}`.
+  // That was unsafe — a transient read failure could mask a §6.3
+  // conflict (different-value attached proof) and silently merge a
+  // poll's anchored proof on top of it, voiding the security-alert
+  // contract. Conservative recovery: retry once with a short backoff;
+  // if the read still throws, emit `transfer:operator-alert` so the
+  // failure is visible AND fall through to `{kind:'fresh'}`. The
+  // operator alert is the load-bearing change — without it the failure
+  // was invisible.
   let attached: AnchoredProofDescriptor | null;
   try {
     attached = await ctx.poolRead.getAttachedProof(ctx.tokenId, ctx.requestId);
-  } catch {
-    // Treat read failure as fresh — the attach orchestrator's
-    // step 1 idempotency is the safety net.
-    return { kind: 'fresh' };
+  } catch (firstErr) {
+    // Backoff + retry once. Use a small fixed delay independent of the
+    // poll-loop schedule — we're recovering a single read, not a poll.
+    await ctx.sleep(getBackoffMs(0), ctx.signal);
+    if (ctx.signal?.aborted === true || ctx.isStopped()) {
+      // Worker was asked to stop during the backoff — surface as
+      // security-alert-equivalent operator alert AND fall back to
+      // `fresh`. The caller's downstream attach orchestrator's
+      // step 1 idempotency is the last-line safety net.
+      ctx.emit('transfer:operator-alert', {
+        code: 'structural',
+        tokenId: ctx.tokenId,
+        message: `getAttachedProof read failed and worker aborted before retry — §6.3 conflict check skipped for ${ctx.subjectPhrase}: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}`,
+      });
+      return { kind: 'fresh' };
+    }
+    try {
+      attached = await ctx.poolRead.getAttachedProof(
+        ctx.tokenId,
+        ctx.requestId,
+      );
+    } catch (secondErr) {
+      // Two consecutive failures — emit operator-alert so the read
+      // failure is visible to operators. Falling back to `fresh` is
+      // the conservative default: the §5.5 step 5 attach orchestrator's
+      // step 1 idempotency is the safety net for a same-value double-
+      // attach. A different-value attached-proof scenario WILL miss
+      // its security-alert in this branch — but the operator-alert
+      // surfaces the read failure so the operator can manually
+      // reconcile.
+      ctx.emit('transfer:operator-alert', {
+        code: 'structural',
+        tokenId: ctx.tokenId,
+        message: `getAttachedProof read failed twice for ${ctx.subjectPhrase} — §6.3 conflict check could not run; falling back to attach-as-fresh. first=${firstErr instanceof Error ? firstErr.message : String(firstErr)} second=${secondErr instanceof Error ? secondErr.message : String(secondErr)}`,
+      });
+      return { kind: 'fresh' };
+    }
   }
   if (attached === null) return { kind: 'fresh' };
 
@@ -1075,10 +1173,32 @@ export async function attachProofUnderMutex(args: {
  *
  * Permits are acquired in FIFO order. Released permits are immediately
  * available to the next waiter.
+ *
+ * Steelman fix (Wave 3 #6): waiter queue uses a head-pointer index
+ * rather than `Array.shift()`. Under heavy contention with the worker
+ * pool's W14/W26 caps (16 / 4 permits) and N pending requestIds,
+ * `Array.shift()` is O(n) per release — the V8 implementation moves
+ * every remaining element down one slot. With 1000+ pending waiters
+ * this dominates release latency and hurts steady-state throughput.
+ *
+ * Strategy: keep waiters in a contiguous array; advance a `head`
+ * index instead of mutating the array on dequeue. Periodically (when
+ * `head` exceeds 32 AND consumes more than half of the array's length)
+ * compact via `slice(head)` so memory does not grow unboundedly. The
+ * compaction threshold is tuned so steady-state operation amortizes
+ * compaction cost to O(1) per release while keeping the live working
+ * set bounded.
  */
 export class CountingSemaphore implements Semaphore {
   private permits: number;
-  private readonly waiters: Array<() => void> = [];
+  /**
+   * FIFO queue of waiters. Drained via {@link head} to avoid the O(n)
+   * cost of `Array.shift()`. Live waiters are at indices
+   * `[head, waiters.length)`.
+   */
+  private waiters: Array<() => void> = [];
+  /** Index of the next live waiter; `undefined` slots before this. */
+  private head = 0;
 
   constructor(maxConcurrent: number) {
     if (!Number.isFinite(maxConcurrent) || maxConcurrent <= 0) {
@@ -1092,6 +1212,14 @@ export class CountingSemaphore implements Semaphore {
 
   get available(): number {
     return this.permits;
+  }
+
+  /**
+   * Number of waiters currently parked on `this.waiters`. Exposed for
+   * tests asserting the semaphore is correctly compacting under load.
+   */
+  get waiterCount(): number {
+    return this.waiters.length - this.head;
   }
 
   async acquire(): Promise<() => void> {
@@ -1127,11 +1255,32 @@ export class CountingSemaphore implements Semaphore {
 
   private release(): void {
     this.permits++;
-    const next = this.waiters.shift();
+    const next = this.shiftWaiter();
     if (next !== undefined) {
       // Re-enter immediately; permit is consumed by `next` synchronously.
       next();
     }
+  }
+
+  /**
+   * Dequeue the head waiter without `Array.shift()`'s O(n) cost.
+   * Returns `undefined` if the queue is empty.
+   *
+   * Compaction: when `head > 32` AND `head*2 > waiters.length`, slice
+   * off the consumed prefix. The threshold ensures we don't pay for
+   * compaction on light traffic (head growing to a small number is
+   * fine — V8 will collect later) while keeping the worst-case live
+   * memory bound at 2x the active waiter count under sustained churn.
+   */
+  private shiftWaiter(): (() => void) | undefined {
+    if (this.head >= this.waiters.length) return undefined;
+    const next = this.waiters[this.head];
+    this.head++;
+    if (this.head > 32 && this.head * 2 > this.waiters.length) {
+      this.waiters = this.waiters.slice(this.head);
+      this.head = 0;
+    }
+    return next;
   }
 }
 

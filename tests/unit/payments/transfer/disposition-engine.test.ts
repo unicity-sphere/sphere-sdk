@@ -1238,3 +1238,95 @@ describe('chainHeadHash uses last tx destinationState (#162)', () => {
     }
   });
 });
+
+// =============================================================================
+// (Wave 3 steelman) PENDING + new chain head → 'pending-conflicting'
+//
+// When the local manifest is in `pending` state (in-flight T.5.C
+// finalization worker tracking the queue entries), and a new bundle
+// arrives with a different chain head, the engine's CONFLICTING
+// disposition must NOT clobber the pending state with status='conflicting'
+// — the worker would otherwise continue finalizing the previous chain
+// (rootHash X) while the manifest declares a different head (rootHash Y)
+// authoritative. Distinguish via 'pending-conflicting' so downstream
+// reconciliation can drain the queue first.
+// =============================================================================
+
+describe('Wave 3 steelman: PENDING + conflicting head → pending-conflicting', () => {
+  it('emits CONFLICTING with status="pending-conflicting" when local was pending', async () => {
+    const localManifest: ManifestEntryDelta = {
+      rootHash: ALT_HEAD_HASH,
+      status: 'pending',
+    };
+    const result = await processDisposition(
+      buildInput({
+        chain: chain({ txs: [tx({ hasProof: true })] }),
+        localManifest,
+      }),
+    );
+    expect(result.disposition).toBe('CONFLICTING');
+    if (result.disposition === 'CONFLICTING') {
+      // The new manifest delta carries the new pending-conflicting status.
+      expect(result.manifest.status).toBe('pending-conflicting');
+      // Both heads surface in conflictingHeads.
+      expect(result.conflictingHeads).toContain(ALT_HEAD_HASH);
+    }
+  });
+
+  it('emits CONFLICTING with status="conflicting" when local was valid (default path)', async () => {
+    const localManifest: ManifestEntryDelta = {
+      rootHash: ALT_HEAD_HASH,
+      status: 'valid',
+    };
+    const result = await processDisposition(
+      buildInput({
+        chain: chain({ txs: [tx({ hasProof: true })] }),
+        localManifest,
+      }),
+    );
+    expect(result.disposition).toBe('CONFLICTING');
+    if (result.disposition === 'CONFLICTING') {
+      expect(result.manifest.status).toBe('conflicting');
+    }
+  });
+
+  it('emits CONFLICTING with status="conflicting" when local was conflicting (no escalation)', async () => {
+    const localManifest: ManifestEntryDelta = {
+      rootHash: ALT_HEAD_HASH,
+      status: 'conflicting',
+      conflictingHeads: ['00000000000000000000000000000000000000000000000000000000000000aa' as ContentHash],
+    };
+    const result = await processDisposition(
+      buildInput({
+        chain: chain({ txs: [tx({ hasProof: true })] }),
+        localManifest,
+      }),
+    );
+    expect(result.disposition).toBe('CONFLICTING');
+    if (result.disposition === 'CONFLICTING') {
+      expect(result.manifest.status).toBe('conflicting');
+    }
+  });
+});
+
+// =============================================================================
+// (Wave 3 steelman) Empty-tokenId hydration failure surfaces with empty
+// `tokenId` field — the writer routes this to the `invalid-orphan`
+// keyspace (covered by `disposition-writer.test.ts`); here we just pin
+// the engine's contract that a hydration throw produces a record with
+// `tokenId === ''` and observedTokenContentHash === input root.
+// =============================================================================
+
+describe('Wave 3 steelman: hydration throw produces empty-tokenId STRUCTURAL_INVALID', () => {
+  it('hydration throw → tokenId is empty string', async () => {
+    const result = await processDisposition(
+      buildInput({ hydrateThrow: new Error('CBOR parse failed') }),
+    );
+    expect(result.disposition).toBe('INVALID');
+    if (result.disposition === 'INVALID') {
+      expect(result.tokenId).toBe('');
+      expect(result.observedTokenContentHash).toBe(TOKEN_ROOT_HASH);
+      expect(result.reason).toBe('structural');
+    }
+  });
+});

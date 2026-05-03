@@ -50,11 +50,30 @@ import type {
  *                    Oracle resolution is required to determine the winner.
  * - `invalid`      — chain is structurally broken (not yet detected in
  *                    this implementation; reserved for future use).
+ * - `pending-conflicting` (Wave 3 steelman) — a conflicting head arrived
+ *                    while the existing entry was already in `pending`
+ *                    state with an in-flight finalization worker tracking
+ *                    its queue entries. The fresh CONFLICTING write
+ *                    cannot blindly clobber the pending state because
+ *                    the worker would continue finalizing the previous
+ *                    chain (rootHash X) while the manifest now declares
+ *                    a different head (rootHash Y) authoritative — when
+ *                    the worker's proofs land, it would write against
+ *                    a stale view. `pending-conflicting` defers the
+ *                    full conflict-merge until the worker drains its
+ *                    queue (or its caller invalidates the entries
+ *                    explicitly); downstream conflict-merger code
+ *                    treats `pending-conflicting` like `conflicting`
+ *                    for read purposes (both heads are surfaced) but
+ *                    the manifest writer / worker reconciliation path
+ *                    can recognize the in-flight finalization and avoid
+ *                    the data race.
  */
 export type TokenManifestStatus =
   | 'valid'
   | 'pending'
   | 'conflicting'
+  | 'pending-conflicting'
   | 'invalid';
 
 export interface TokenManifestEntry {

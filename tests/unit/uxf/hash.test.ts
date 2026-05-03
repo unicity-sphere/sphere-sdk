@@ -440,4 +440,60 @@ describe('computeElementHash', () => {
     // change the hash algorithm.
     expect(hash).toBe('e4e0b32c46a99bf781e7c6e3cde42993b5fa72bf1b00184d8c8018d1b8cca730');
   });
+
+  // -------------------------------------------------------------------------
+  // Steelman Wave 3 — domain-separation safety: refuse to silently hash
+  // an element whose `type` is missing from ELEMENT_TYPE_IDS. Without
+  // this gate, dag-cbor would encode `typeId: undefined` for every
+  // unrecognized type, collapsing them into one collision class.
+  // -------------------------------------------------------------------------
+  it('refuses to hash an element with an unknown type tag', () => {
+    // Forge an element with a type that does NOT exist in ELEMENT_TYPE_IDS.
+    // Cast through `unknown` since the public type is a string union;
+    // simulates a future schema add or a hostile producer.
+    const el = {
+      header: {
+        representation: 1,
+        semantics: 1,
+        kind: 'default',
+        predecessor: null,
+      },
+      type: 'definitely-not-a-real-element-type' as unknown as UxfElement['type'],
+      content: { foo: 'bar' },
+      children: {},
+    } as UxfElement;
+
+    expect(() => computeElementHash(el)).toThrow(UxfError);
+    try {
+      computeElementHash(el);
+    } catch (e) {
+      expect((e as UxfError).code).toBe('INVALID_HASH');
+      expect((e as UxfError).message).toContain('Unknown element type');
+      expect((e as UxfError).message).toContain('definitely-not-a-real-element-type');
+    }
+  });
+
+  it('refuses to hash an element whose type is undefined entirely', () => {
+    // Adversarial shape: `type` field is missing or undefined. dag-cbor
+    // would produce CBOR `undefined` for the typeId — same collision
+    // class as any other unknown type.
+    const el = {
+      header: {
+        representation: 1,
+        semantics: 1,
+        kind: 'default',
+        predecessor: null,
+      },
+      // type intentionally omitted via cast
+      content: {},
+      children: {},
+    } as unknown as UxfElement;
+
+    expect(() => computeElementHash(el)).toThrow(UxfError);
+    try {
+      computeElementHash(el);
+    } catch (e) {
+      expect((e as UxfError).code).toBe('INVALID_HASH');
+    }
+  });
 });

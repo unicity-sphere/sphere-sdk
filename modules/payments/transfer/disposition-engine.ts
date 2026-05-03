@@ -752,13 +752,39 @@ export async function processDisposition(
       localManifest.rootHash,
       ...incomingConflicts,
     ];
+
+    // (Wave 3 steelman) Pending + conflicting head race.
+    //
+    // If the local manifest is already in `pending` state, an in-flight
+    // T.5.C finalization worker is tracking the queue entries for the
+    // existing head (rootHash X). Blindly writing a CONFLICTING entry
+    // with the new head (rootHash Y) clobbers the pending state — but
+    // the worker continues polling the aggregator for X's requestIds.
+    // When proofs land, the worker writes against a manifest that now
+    // claims Y is the authoritative head and X is in `conflictingHeads`.
+    // The result is a stale write that races the conflict-merger.
+    //
+    // Defer full conflict-merge by emitting a distinct
+    // `'pending-conflicting'` status. Downstream conflict-merger code
+    // reads it the same as `'conflicting'` (both heads are surfaced)
+    // but worker / manifest-writer paths can recognize the in-flight
+    // finalization and either:
+    //  - drain the queue first, then transition to plain `conflicting`
+    //  - or invalidate the worker's tracked entries on demand
+    //
+    // The `'pending-conflicting'` status is purely manifest-state —
+    // the disposition discriminator stays `CONFLICTING` so the writer
+    // routes to the active pool's conflict resolution path.
+    const conflictingStatus: 'conflicting' | 'pending-conflicting' =
+      localManifest.status === 'pending' ? 'pending-conflicting' : 'conflicting';
+
     return conflictingDisposition(
       input,
       chain.tokenId,
       input.tokenRootHash,
       {
         rootHash: newHead,
-        status: 'conflicting',
+        status: conflictingStatus,
         conflictingHeads,
       },
       conflictingHeads,
@@ -1003,13 +1029,20 @@ export async function revaluate(
       localManifest.rootHash,
       ...incomingConflicts,
     ];
+    // (Wave 3 steelman) Mirror the `processDisposition` pending-
+    // conflicting routing. By spec §5.5 step 9 invariant the queue is
+    // drained before revaluate runs — but a caller bug or a CRDT merge
+    // arriving mid-revaluate could surface a residual `pending` status,
+    // and the same race rationale applies.
+    const conflictingStatus: 'conflicting' | 'pending-conflicting' =
+      localManifest.status === 'pending' ? 'pending-conflicting' : 'conflicting';
     return conflictingDisposition(
       provenance,
       chain.tokenId,
       input.tokenRootHash,
       {
         rootHash: newHead,
-        status: 'conflicting',
+        status: conflictingStatus,
         conflictingHeads,
       },
       conflictingHeads,

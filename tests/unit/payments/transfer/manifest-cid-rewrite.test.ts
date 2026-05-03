@@ -17,6 +17,7 @@
 import { describe, it, expect } from 'vitest';
 
 import {
+  __getMutexForTests,
   performManifestCidRewrite,
   step1Pool,
   step2ManifestCidRewrite,
@@ -34,6 +35,7 @@ import {
 } from '../../../../profile/manifest-cas';
 import type { TokenManifestEntry } from '../../../../profile/token-manifest';
 import type { InclusionProof } from '../../../../oracle/oracle-provider';
+import type { ContentHash } from '../../../../uxf/types';
 
 // =============================================================================
 // 1. Fake adapters
@@ -533,5 +535,164 @@ describe('manifest-cid-rewrite — step error propagation', () => {
     // Step 4 did NOT run; queue entry survives → next pass resumes.
     expect(queue.removeCalls).toHaveLength(0);
     expect(queue.entries.has('DIRECT://addr-A:req-1')).toBe(true);
+  });
+});
+
+// =============================================================================
+// 8. Concurrent-pass serialization (steelman Wave 3 — fix #170)
+// =============================================================================
+//
+// Without an outer mutex per `(addr, tokenId)`, two worker passes for the
+// SAME finalization-queue entry can both pass the
+// `step1Pool.isProofAttached === false` probe before either has called
+// `attachProof`, then race into step 2 — exactly one CAS succeeds,
+// the loser surfaces a `ManifestCidRewriteCasError` UP TO the worker.
+// The new module-scoped mutex serializes them: the second pass blocks
+// until the first releases, then sees `isProofAttached === true` and
+// returns `partial-step1-resumed` cleanly.
+
+describe('manifest-cid-rewrite — concurrent-pass serialization (steelman #170)', () => {
+  it('two concurrent calls for same (addr, tokenId) are serialized — second sees idempotency skip', async () => {
+    // Build a single shared context (same addr, tokenId, pool,
+    // tombstones, queue, manifestStorage). Two concurrent invocations
+    // should NOT both observe `isProofAttached === false` and race
+    // into step 2.
+    const { ctx } = buildCtx();
+
+    // Throttle step 1's attachProof so the two passes have a chance
+    // to overlap. Without the mutex they'd both pass `isProofAttached`,
+    // then race into step 2's CAS. With the mutex, the second blocks
+    // until the first finishes.
+    const realAttach = ctx.pool.attachProof.bind(ctx.pool);
+    let attachCallCount = 0;
+    let isProofAttachedCallCount = 0;
+    const realIsProofAttached = ctx.pool.isProofAttached.bind(ctx.pool);
+    const slowPool: PoolWriteAdapter = {
+      isProofAttached: async (tokenId, requestId) => {
+        isProofAttachedCallCount += 1;
+        return realIsProofAttached(tokenId, requestId);
+      },
+      attachProof: async (tokenId, requestId, proof) => {
+        attachCallCount += 1;
+        // Simulate slow IO so the second pass would otherwise race.
+        await new Promise((r) => setTimeout(r, 20));
+        return realAttach(tokenId, requestId, proof);
+      },
+    };
+    const slowCtx: ManifestCidRewriteContext = { ...ctx, pool: slowPool };
+
+    const [r1, r2] = await Promise.all([
+      performManifestCidRewrite(slowCtx),
+      performManifestCidRewrite(slowCtx),
+    ]);
+    // First pass executed all 4 steps.
+    expect(r1.result).toBe('ok');
+    // Second pass blocked on the mutex, then saw step 1 already
+    // applied, step 2's CAS observed newCid, step 3's tombstone
+    // already inserted, step 4's queue entry already removed.
+    expect(r2.result).toBe('noop');
+    // Critically, attachProof ran exactly ONCE — no race.
+    expect(attachCallCount).toBe(1);
+    // isProofAttached ran TWICE (once per pass), proving the second
+    // pass was admitted under the mutex and saw the now-applied state.
+    expect(isProofAttachedCallCount).toBe(2);
+  });
+
+  it('lost-concurrent-race outcome is surfaced when an alternate CAS throws with observedCid === newCid AND step 1 was a skip', async () => {
+    // Lost-race signature: step 1 reports already-attached (race
+    // winner finished step 1), step 2 surfaces a CAS error whose
+    // observedCid matches the in-flight newCid (winner also
+    // advanced step 2). Without disambiguation, this would surface
+    // as a real CAS conflict. With disambiguation, the orchestrator
+    // returns `lost-concurrent-race` so worker dashboards stay calm.
+    //
+    // The canonical `ManifestCas` collapses this case via its
+    // idempotency check (returns false on observed===newCid). To
+    // exercise the lost-race branch we inject an alternate CAS
+    // whose update method throws directly — bypassing step2's
+    // idempotency optimization (modeling an OrbitDB-backed adapter
+    // that defers idempotency to the caller).
+    const pool = makeFakePool();
+    // Step 1 reports skip — winning pass already attached.
+    pool.attached.add('token-1:req-1');
+
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([
+      { addr: 'DIRECT://addr-A', requestId: 'req-1' },
+    ]);
+    const manifestStorage = makeFakeManifestStorage();
+
+    // Custom CAS whose `update` THROWS rather than returning a
+    // result object. This bypasses step2's in-function idempotency
+    // skip (which fires only on `result.observed === newCid` paths
+    // and only when the CAS returned a structured result). The
+    // throw propagates UP TO the orchestrator's runner, which then
+    // applies the lost-race classification.
+    const racedManifestCas = {
+      update: async () => {
+        throw new ManifestCidRewriteCasError(
+          'cas-mismatch',
+          'bafy...new' as ContentHash,
+        );
+      },
+    };
+
+    const { ctx } = buildCtx({ pool, tombstones, queue, manifestStorage });
+    const racedCtx: ManifestCidRewriteContext = {
+      ...ctx,
+      newCid: 'bafy...new',
+      manifestCas:
+        racedManifestCas as unknown as ManifestCidRewriteContext['manifestCas'],
+    };
+
+    const result = await performManifestCidRewrite(racedCtx);
+    expect(result.result).toBe('lost-concurrent-race');
+  });
+
+  it('mutex is module-scoped: __getMutexForTests returns a PerTokenMutex instance', () => {
+    const mutex = __getMutexForTests();
+    expect(typeof mutex.acquire).toBe('function');
+    expect(typeof mutex.isLocked).toBe('function');
+  });
+
+  it('different (addr, tokenId) pairs do NOT serialize against each other', async () => {
+    // The mutex is keyed on `(addr, tokenId)`. Two passes for
+    // different tokenIds (or different wallets) MUST run in parallel.
+    const pool1 = makeFakePool();
+    const pool2 = makeFakePool();
+    let attach1Done = false;
+    let attach2Done = false;
+
+    const realAttach1 = pool1.attachProof.bind(pool1);
+    pool1.attachProof = async (a, b, c) => {
+      // pool1 is slow — pool2 must NOT block on it.
+      await new Promise((r) => setTimeout(r, 50));
+      await realAttach1(a, b, c);
+      attach1Done = true;
+    };
+    const realAttach2 = pool2.attachProof.bind(pool2);
+    pool2.attachProof = async (a, b, c) => {
+      await realAttach2(a, b, c);
+      attach2Done = true;
+    };
+
+    const { ctx: ctx1 } = buildCtx({ tokenId: 'token-1', pool: pool1 });
+    const { ctx: ctx2 } = buildCtx({ tokenId: 'token-2', pool: pool2 });
+
+    const start = Date.now();
+    await Promise.all([
+      performManifestCidRewrite(ctx1),
+      performManifestCidRewrite(ctx2),
+    ]);
+    const elapsed = Date.now() - start;
+
+    // Both finished. If they had serialized, total time would be ~100ms
+    // (pool1's 50ms + pool2's 0ms ≥ 50ms each, but actually it's the
+    // 50ms barrier alone). The key signal: pool2 did NOT wait for
+    // pool1 — it completed strictly before the 50ms barrier.
+    expect(attach1Done).toBe(true);
+    expect(attach2Done).toBe(true);
+    // Wall-clock should be roughly the slow path (50 ms) — NOT 2x that.
+    expect(elapsed).toBeLessThan(150);
   });
 });

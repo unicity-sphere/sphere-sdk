@@ -425,9 +425,18 @@ function sortByTokenIdAsc<T extends { readonly sourceTokenId: string }>(
  * @internal
  */
 function defaultTokenLike(token: Token): TokenLike {
+  // Steelman fix (#170 issue 3): match the instant-sender's projection
+  // exactly. Walk `transactions[]` to detect any unfinalized predecessor
+  // (`inclusionProof: null`) so the W11 `confirmNftPending` check fires
+  // BEFORE preflight finalize attempts to clear the chain. Even though
+  // conservative mode runs preflight, the validator must see the
+  // pre-finalize pending state so the user receives the irrecoverable-
+  // cascade warning before the SDK touches the network.
+  const fallbackPending = token.status === 'transferring' || token.status === 'submitted';
   const fallback: TokenLike = {
     id: token.id,
     coins: [{ coinId: token.coinId, amount: BigInt(token.amount || '0') }],
+    pending: fallbackPending,
   };
   if (typeof token.sdkData !== 'string' || token.sdkData.length === 0) {
     return fallback;
@@ -440,6 +449,7 @@ function defaultTokenLike(token: Token): TokenLike {
           coinData?: ReadonlyArray<readonly [string, string]> | null;
         };
       };
+      transactions?: ReadonlyArray<{ inclusionProof?: unknown } | unknown>;
     };
     const genData = parsed?.genesis?.data;
     const tokenId =
@@ -447,6 +457,23 @@ function defaultTokenLike(token: Token): TokenLike {
         ? genData.tokenId
         : token.id;
     const coinData = genData?.coinData;
+
+    // §4.1 step 2 — pending iff any transaction lacks an inclusion proof.
+    let pending = fallbackPending;
+    if (Array.isArray(parsed?.transactions)) {
+      for (const tx of parsed.transactions) {
+        if (
+          tx !== null &&
+          typeof tx === 'object' &&
+          ('inclusionProof' in (tx as Record<string, unknown>)) &&
+          (tx as { inclusionProof?: unknown }).inclusionProof === null
+        ) {
+          pending = true;
+          break;
+        }
+      }
+    }
+
     if (Array.isArray(coinData) && coinData.length > 0) {
       const coins = coinData
         .filter(
@@ -458,10 +485,14 @@ function defaultTokenLike(token: Token): TokenLike {
         )
         .map(([coinId, amount]) => ({ coinId, amount: BigInt(amount) }))
         .filter((c) => c.amount > 0n);
-      return { id: tokenId, coins: coins.length > 0 ? coins : null };
+      return {
+        id: tokenId,
+        coins: coins.length > 0 ? coins : null,
+        pending,
+      };
     }
     // Empty/null coinData → NFT.
-    return { id: tokenId, coins: null };
+    return { id: tokenId, coins: null, pending };
   } catch {
     return fallback;
   }
@@ -664,15 +695,34 @@ export async function sendConservativeUxf(
         carBytes.byteLength >
           (strategy.inlineCapBytes ?? MAX_INLINE_CAR_BYTES));
     if (wantsCidBranch && deps.publishToIpfs === undefined) {
-      // Pre-flight reject: bundle needs CID delivery, no publisher is
-      // wired, and the bundle is too large for the CAR-inline fallback
-      // in resolveDelivery (approach γ). Fail fast here rather than
-      // letting resolveDelivery surface a generic error after all the
-      // work has already been done.
+      // Pre-flight reject: bundle needs CID delivery and no publisher
+      // is wired. Fail fast here rather than letting `resolveDelivery`
+      // surface the error after all the work has already been done.
       //
-      // When the bundle is <= RELAY_SAFE_CAP_BYTES, resolveDelivery's
-      // carInlineFallback() will silently downgrade to `uxf-car` inline
-      // delivery — so we only hard-fail when inline is impossible.
+      // **Steelman fix (Wave 3) — privacy regression hardening.** The
+      // resolver now distinguishes two no-publisher cases:
+      //
+      //   - `force-cid` + no publisher (any size) → hard-fail with
+      //     `FORCE_CID_NO_PUBLISHER`. The caller's explicit privacy
+      //     intent (CID-only, no inline leak) cannot be silently
+      //     downgraded.
+      //   - `auto`-over-cap + no publisher → fall back to inline if
+      //     the bundle fits within `RELAY_SAFE_CAP_BYTES` (approach γ);
+      //     hard-fail with `IPFS_PUBLISHER_REQUIRED` if not.
+      //
+      // Mirror those branches at pre-flight so the orchestrator does
+      // not waste cycles building a CAR it cannot ship.
+      if (strategy.kind === 'force-cid') {
+        throw new SphereError(
+          'sendConservativeUxf: force-cid strategy explicitly requires a' +
+            ' publishToIpfs callback. The orchestrator REFUSES to silently' +
+            ' downgrade to inline delivery because force-cid signals a' +
+            ' privacy intent (the caller does NOT want the bundle inlined' +
+            " on the relay). Wire an IPFS publisher or switch to 'auto' /" +
+            " 'force-inline' if inline delivery is acceptable.",
+          'FORCE_CID_NO_PUBLISHER',
+        );
+      }
       if (carBytes.byteLength > RELAY_SAFE_CAP_BYTES) {
         throw new SphereError(
           'sendConservativeUxf: delivery strategy requires CID delivery, no publishToIpfs' +
@@ -682,8 +732,9 @@ export async function sendConservativeUxf(
           'IPFS_PUBLISHER_REQUIRED',
         );
       }
-      // Bundle fits within RELAY_SAFE_CAP_BYTES: resolveDelivery will
-      // apply the CAR-inline fallback transparently. No pre-flight throw.
+      // auto-over-cap + bundle fits within RELAY_SAFE_CAP_BYTES:
+      // resolveDelivery will apply the CAR-inline fallback transparently.
+      // No pre-flight throw.
     }
     // -----------------------------------------------------------------
     // Step 10a (T.2.D.2): create UXF outbox entry with

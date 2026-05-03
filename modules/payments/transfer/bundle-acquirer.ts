@@ -103,7 +103,42 @@ import {
   type CidFetcherEmit,
   type CidFetcherFetch,
 } from './cid-fetcher.js';
+import { RELAY_SAFE_CAP_BYTES } from './limits.js';
 import type { ReplayLRU } from './replay-lru.js';
+
+// =============================================================================
+// 1.5. Steelman fix #170 — recipient-side inline-CAR size cap
+// =============================================================================
+
+/**
+ * Maximum size (in characters) of the `carBase64` string in a `kind: 'uxf-car'`
+ * payload that the recipient will accept.
+ *
+ * **Why a recipient-side cap exists:** the sender enforces
+ * `clampInlineCap` against `RELAY_SAFE_CAP_BYTES = 96 KiB` before
+ * inlining a CAR. But the cap is only authoritative if the RECIPIENT
+ * also enforces it. Without recipient-side enforcement, a hostile
+ * sender (or a mis-configured one) can ship a 6 MiB base64 payload
+ * (~4.5 MiB CAR) inline, bypassing the relay-safe cap entirely. The
+ * recipient then base64-decodes the entire blob and runs CAR parse on
+ * it — both expensive operations the cap was supposed to prevent.
+ *
+ * **Authoritative bound:** the recipient's check here is the canonical
+ * enforcement point. The sender's clamp is a politeness layer for the
+ * relay; the recipient's check is a defense.
+ *
+ * **Computation:** base64 inflates 4 bytes → 3 bytes (ratio 4/3). For a
+ * raw byte cap of `RELAY_SAFE_CAP_BYTES` (96 KiB = 98304 bytes), the
+ * base64 string is at most `ceil(98304 * 4 / 3) = 131072` characters
+ * (with possible trailing `=` padding adding up to 2 bytes more). We
+ * add a small slack (16 bytes) to absorb whitespace / padding without
+ * false-positives on legitimately-sized bundles.
+ *
+ * Effective cap: `ceil(RELAY_SAFE_CAP_BYTES * 4/3) + slack`.
+ */
+const INLINE_BASE64_SLACK_BYTES = 16;
+export const RECIPIENT_MAX_INLINE_CARBASE64_LENGTH =
+  Math.ceil((RELAY_SAFE_CAP_BYTES * 4) / 3) + INLINE_BASE64_SLACK_BYTES;
 
 // =============================================================================
 // 1. Public types — discriminated outcome
@@ -187,6 +222,67 @@ export interface AcquireBundleCidOptions {
 // =============================================================================
 
 /**
+ * Steelman fix #170 — per-`(senderPubkey, bundleCid)` in-flight latch
+ * for concurrent verify coalescing.
+ *
+ * **Bug:** the `lru.has(...)` short-circuit at Step 4 runs BEFORE
+ * verification; `lru.add(...)` at Step 7 runs AFTER. Two concurrent
+ * worker calls receiving the SAME `(senderPubkey, bundleCid)` both
+ * observe `has === false`, both run the full §5.2 pipeline (CAR
+ * parse, hash recompute, `pkg.verify()`). Wasted CPU; an attacker can
+ * amplify by republishing the same bundle to two relays the recipient
+ * subscribes to.
+ *
+ * **Fix:** a module-scoped `Map` keyed by `${senderPubkey}|${bundleCid}`
+ * holds the in-flight verification promise. On entry, `acquireBundle`
+ * checks the map; if a promise exists for this key, it returns the
+ * SAME promise (so both callers share the result). The entry is
+ * removed via `.finally()` once the promise settles — but only AFTER
+ * the LRU has been marked, so subsequent calls hit the LRU
+ * short-circuit instead of restarting verify.
+ *
+ * **Latch lifetime ordering** (critical):
+ *
+ *   1. acquireBundle() runs `doVerify()` which, on success, calls
+ *      `lru.add(...)` BEFORE returning the verified bundle.
+ *   2. The `.finally()` registered on the inflight promise runs AFTER
+ *      `doVerify()` has already returned — i.e., AFTER `lru.add` ran.
+ *   3. The `.finally()` removes the latch entry from the map.
+ *   4. A subsequent `acquireBundle` call observes `lru.has(...) === true`
+ *      and short-circuits via the ReplayOutcome path. NO restart of
+ *      verification.
+ *
+ * If `doVerify` throws (any rejection path), the LRU is NOT marked
+ * (Step 7 only runs on success). `.finally()` still removes the latch.
+ * A retry then runs `doVerify` afresh — which is the desired behavior:
+ * a hostile sender shipping a malformed bundle should not have their
+ * failure cached as "verified" and recurring re-arrivals SHOULD re-try
+ * §5.2 in case the next arrival is well-formed.
+ *
+ * **Memory bound:** the map is bounded by the number of *concurrently
+ * in-flight* verifications. The worker pool fan-out caps this at
+ * MAX_INGEST_WORKERS = 16, so the map never exceeds ~16 entries plus
+ * a transient burst window during finalization. No leak even under
+ * pathological concurrency: each entry self-removes via `.finally()`.
+ *
+ * **Per-process scope is correct:** the LRU is per-process; latch
+ * coalescing is also per-process. Two separate Sphere instances in the
+ * same Node process would each have their own `acquireBundle` import,
+ * which means each gets its own module-scoped map. That is fine —
+ * separate Sphere instances don't share an LRU either.
+ */
+const inflight = new Map<string, Promise<AcquireBundleResult>>();
+
+/**
+ * Test-only: clear all inflight latches. Production code must never
+ * call this. Tests use it between assertions to avoid cross-test
+ * leakage when a fixture deliberately holds a verify promise open.
+ */
+export function __clearInflightForTests(): void {
+  inflight.clear();
+}
+
+/**
  * Acquire and verify a bundle from a `UxfTransferPayload`.
  *
  * @param payload       The decoded outer envelope (from
@@ -244,6 +340,58 @@ export async function acquireBundle(
   lru: ReplayLRU,
   cidOptions?: AcquireBundleCidOptions,
 ): Promise<AcquireBundleResult> {
+  // ---- Step 0: per-(sender, bundleCid) inflight latch ----
+  // Coalesce concurrent verify calls with the same key. See module-level
+  // `inflight` doc for the latch lifetime rationale (note: latch is
+  // released via .finally AFTER doAcquireBundle has already called
+  // lru.add, so subsequent callers hit the LRU short-circuit rather than
+  // restarting verification).
+  //
+  // We key on `senderPubkey` (the AUTHENTICATED Nostr signing pubkey,
+  // per the @param doc above) and `payload.bundleCid` (the sender's
+  // claim — verified later in Step 3 against the CAR root). Using the
+  // claim here is safe because: (a) on mismatch, doAcquireBundle throws
+  // BUNDLE_REJECTED_ROOT_CID_MISMATCH, the latch is released without
+  // marking the LRU, and a re-arrival will retry; (b) the latch only
+  // affects parallel calls *during* this verify — it does not poison
+  // any post-verify state.
+  //
+  // The latch is only engaged for UXF v1.0 payload shapes that carry a
+  // `bundleCid`. Legacy shapes (no `bundleCid`) fall through directly to
+  // doAcquireBundle, which rejects them as
+  // BUNDLE_REJECTED_MALFORMED_ENVELOPE — there is no benefit in
+  // coalescing rejections of unrecognized shapes.
+  if (!isUxfTransferPayloadCar(payload) && !isUxfTransferPayloadCid(payload)) {
+    return doAcquireBundle(payload, senderPubkey, lru, cidOptions);
+  }
+  const latchKey = `${senderPubkey}|${payload.bundleCid}`;
+  const existing = inflight.get(latchKey);
+  if (existing) {
+    return existing;
+  }
+  const promise = doAcquireBundle(payload, senderPubkey, lru, cidOptions).finally(() => {
+    // Remove the latch only AFTER doAcquireBundle resolves/rejects.
+    // For success: doAcquireBundle has already called lru.add(), so the
+    // next `acquireBundle` for the same key hits the LRU short-circuit.
+    // For failure: the LRU is unchanged; a re-arrival will retry §5.2
+    // afresh (intended — failures must not poison legitimate retries).
+    inflight.delete(latchKey);
+  });
+  inflight.set(latchKey, promise);
+  return promise;
+}
+
+/**
+ * The verification body. Extracted from {@link acquireBundle} so the
+ * latch wrapper does not have to inline 60+ lines of pipeline. All
+ * documented behavior of `acquireBundle` lives here.
+ */
+async function doAcquireBundle(
+  payload: UxfTransferPayload,
+  senderPubkey: string,
+  lru: ReplayLRU,
+  cidOptions?: AcquireBundleCidOptions,
+): Promise<AcquireBundleResult> {
   // ---- Step 1: CID-mode branch (T.4.B) ----
   // We obtain `carBytes` and `extractedCid` from one of two paths:
   //   - uxf-car: base64-decode the embedded payload.
@@ -267,8 +415,27 @@ export async function acquireBundle(
     }
     // The fetcher emits `transfer:fetch-failed` and throws
     // BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT on all-gateways-fail. It
-    // also internally verifies the root CID matches `payload.bundleCid`,
-    // so no second mismatch check is needed downstream.
+    // ALSO internally verifies the root CID matches `payload.bundleCid`.
+    //
+    // **Steelman fix (Wave 3) — defense-in-depth re-extract.** Even
+    // though `fetchCarByCid` performs an internal `extractCarRootCid`
+    // equality check, we re-extract the CID here at the bundle-acquirer
+    // boundary so the recipient pipeline does NOT trust the fetcher's
+    // internal verification. Two scenarios this catches:
+    //
+    //   1. A future refactor that bypasses or loosens the fetcher's
+    //      CID-equality check (e.g. a debug code path that swallows
+    //      the mismatch outcome and forwards the bytes anyway).
+    //   2. A loose comparison creeping in at the fetcher boundary
+    //      (TS strict mode catches `===` regression but a `String()`
+    //      coercion cast could still hide a real mismatch).
+    //
+    // The fetcher's per-gateway check stays in place (so we still walk
+    // to the next gateway on a mismatch); the boundary check below is
+    // the canonical authority for "extractedCid actually came from
+    // these bytes". Cost: one extra CARv1 header parse per delivered
+    // bundle — negligible vs the streaming fetch + bundle verification
+    // that follow.
     const fetched = await fetchCarByCid(payload.bundleCid, {
       gateways: cidOptions.gateways,
       senderTransportPubkey: senderPubkey,
@@ -278,9 +445,44 @@ export async function acquireBundle(
       maxBytes: cidOptions.maxBytes,
     });
     carBytes = fetched.carBytes;
-    extractedCid = payload.bundleCid;
+    // Re-extract from the bytes (NOT trusting the fetcher's claim).
+    // `extractCarRootCid` throws BUNDLE_REJECTED_INVALID_CAR /
+    // BUNDLE_REJECTED_MULTI_ROOT — correct surface-level errors at
+    // this boundary because the fetcher has already delivered bytes
+    // claimed to be a valid CAR; if they aren't, the recipient sees
+    // the same error code as the uxf-car branch.
+    extractedCid = await extractCarRootCid(carBytes);
+    if (extractedCid !== payload.bundleCid) {
+      // The fetcher's internal check was bypassed somehow — surface
+      // the same mismatch error the uxf-car path uses so downstream
+      // telemetry / disposition logic stays uniform across both
+      // branches.
+      throw new SphereError(
+        `acquireBundle: defense-in-depth CID re-check failed — ` +
+          `CAR root CID ${extractedCid} does not match payload.bundleCid ` +
+          `${payload.bundleCid} (fetcher's internal verification was bypassed)`,
+        'BUNDLE_REJECTED_ROOT_CID_MISMATCH',
+      );
+    }
   } else if (isUxfTransferPayloadCar(payload)) {
-    // ---- Step 2: CAR root-CID extraction (uxf-car path) ----
+    // ---- Step 2: recipient-side inline-CAR size cap (steelman #170) ----
+    // Authoritative enforcement of the §3.3.1 inline-CAR cap at the
+    // recipient. The sender's `clampInlineCap` is a politeness layer for
+    // the relay; the recipient is the SINGLE SOURCE OF TRUTH for
+    // refusing oversized inline payloads. See module-level
+    // `RECIPIENT_MAX_INLINE_CARBASE64_LENGTH` doc for the math behind
+    // the bound (96 KiB raw → ~131072 base64 chars + slack). A hostile
+    // sender shipping carBase64 above this cap is rejected BEFORE we
+    // base64-decode (we never allocate a multi-megabyte buffer for
+    // their attack).
+    if (payload.carBase64.length > RECIPIENT_MAX_INLINE_CARBASE64_LENGTH) {
+      throw new SphereError(
+        `acquireBundle: carBase64 length ${payload.carBase64.length} exceeds ` +
+          `recipient inline cap ${RECIPIENT_MAX_INLINE_CARBASE64_LENGTH} (raw cap ` +
+          `${RELAY_SAFE_CAP_BYTES} bytes); use kind="uxf-cid" for larger bundles`,
+        'BUNDLE_REJECTED_INLINE_CAP_EXCEEDED',
+      );
+    }
     // `carBase64ToBytes` throws BUNDLE_REJECTED_MALFORMED_ENVELOPE on
     // base64-alphabet violations; `extractCarRootCid` throws
     // BUNDLE_REJECTED_INVALID_CAR or BUNDLE_REJECTED_MULTI_ROOT.

@@ -659,7 +659,9 @@ describe('FinalizationWorkerSender — transient retries', () => {
 
     expect(result.terminal).toBe('failed-permanent');
     expect(result.firstHardFailReason).toBe('oracle-rejected');
-    expect(h.aggregator.submitCalls).toBe(3); // 1 initial + 2 retries
+    // Wave 3 #1 fix: `maxSubmitRetries` now bounds total submit
+    // attempts (was: initial+retries). With max=2 → exactly 2 calls.
+    expect(h.aggregator.submitCalls).toBe(2);
   });
 });
 
@@ -791,7 +793,7 @@ describe('FinalizationWorkerSender — already-terminal entries', () => {
 // =============================================================================
 
 describe('FinalizationWorkerSender — resolver null path', () => {
-  it('resolver returning null → structural hard-fail', async () => {
+  it('resolver returning null → structural hard-fail (skip cascade + operator-alert)', async () => {
     const resolver: RequestContextResolver = {
       async resolve() {
         return null;
@@ -802,9 +804,21 @@ describe('FinalizationWorkerSender — resolver null path', () => {
 
     expect(result.terminal).toBe('failed-permanent');
     expect(result.firstHardFailReason).toBe('structural');
-    // structural hard-fail does NOT skip cascade per §6.1.1 (only race-lost
-    // and client-error skip cascade).
-    expect(result.cascadeFailedEmitted).toBe(true);
+    // Wave 3 #5 fix: when the resolver returns null we have NO evidence
+    // the chain is dead — cascading would propagate `structural` to
+    // descendant tokens despite no proof of finalization failure.
+    // Treat similarly to race-lost (skip cascade) and emit an
+    // operator-alert so the missing-signedTx is visible.
+    expect(result.cascadeFailedEmitted).toBe(false);
+    const alerts = h.events.events.filter(
+      (e) => e.type === 'transfer:operator-alert',
+    );
+    expect(alerts.length).toBeGreaterThanOrEqual(1);
+    expect(
+      alerts.some(
+        (a) => (a.data as { code?: string }).code === 'structural',
+      ),
+    ).toBe(true);
   });
 });
 
@@ -1347,5 +1361,72 @@ describe('FinalizationWorkerSender — scanLoop (#168)', () => {
     } finally {
       await worker2.stop();
     }
+  });
+});
+
+// =============================================================================
+// 21. Wave 3 #2 — separate PATH_INVALID / NOT_AUTHENTICATED counters
+// =============================================================================
+
+describe('FinalizationWorkerSender — separate proof-error counters (Wave 3 #2)', () => {
+  it('PATH_INVALID burst then NOT_AUTHENTICATED uses fresh budget', async () => {
+    // Pre-fix behavior: a shared `proofErrorRetries` counter let a
+    // PATH_INVALID burst eat the NOT_AUTHENTICATED budget, so the
+    // first NOT_AUTHENTICATED would immediately exhaust the counter
+    // and hard-fail. With the post-fix split counters, each error
+    // type owns its own budget.
+    //
+    // Sequence with maxProofErrorRetries=2:
+    //   poll 1: PATH_INVALID → pathInvalidRetries=1 (under budget)
+    //   poll 2: NOT_AUTHENTICATED → notAuthenticatedRetries=1
+    //   poll 3: NOT_AUTHENTICATED → notAuthenticatedRetries=2 → hard-fail
+    // Pre-fix: poll 2 would have been counter=2 → immediate hard-fail.
+    const pollSequence: ReadonlyArray<PollOutcome> = [
+      { kind: 'PATH_INVALID', error: 'malformed-1' },
+      { kind: 'NOT_AUTHENTICATED', error: 'stale-1' },
+      { kind: 'NOT_AUTHENTICATED', error: 'stale-2' },
+    ];
+    const aggregator = makeFakeAggregator({
+      submit: async () => ({ kind: 'SUCCESS' }),
+      pollSequence,
+    });
+    const h = buildWorker({ aggregator, maxProofErrorRetries: 2 });
+    const result = await h.worker.processOne(makeOutboxEntry());
+
+    expect(result.terminal).toBe('failed-permanent');
+    expect(result.firstHardFailReason).toBe('proof-invalid');
+    // 3 polls reached BEFORE hard-fail → counter independence is the
+    // load-bearing assertion. Pre-fix: the shared counter would have
+    // capped at 2 polls (PATH_INVALID then a single NOT_AUTHENTICATED)
+    // because the counter pre-fix incremented to budget after the
+    // 2nd verifiable observation.
+    expect(h.aggregator.pollCalls).toBe(3);
+    // Trail of trustbase-warnings: one per NOT_AUTHENTICATED (=2 in
+    // this sequence). Confirms that the NOT_AUTHENTICATED branch ran
+    // its own budget twice rather than being immediately exhausted.
+    const warnings = h.events.events.filter(
+      (e) => e.type === 'transfer:trustbase-warning',
+    );
+    expect(warnings.length).toBe(2);
+  });
+
+  it('NOT_AUTHENTICATED burst then PATH_INVALID uses fresh budget', async () => {
+    const pollSequence: ReadonlyArray<PollOutcome> = [
+      { kind: 'NOT_AUTHENTICATED', error: 'stale-1' },
+      { kind: 'PATH_INVALID', error: 'malformed-1' },
+      { kind: 'PATH_INVALID', error: 'malformed-2' },
+    ];
+    const aggregator = makeFakeAggregator({
+      submit: async () => ({ kind: 'SUCCESS' }),
+      pollSequence,
+    });
+    const h = buildWorker({ aggregator, maxProofErrorRetries: 2 });
+    const result = await h.worker.processOne(makeOutboxEntry());
+
+    expect(result.terminal).toBe('failed-permanent');
+    expect(result.firstHardFailReason).toBe('proof-invalid');
+    expect(h.aggregator.pollCalls).toBe(3);
+    // The PATH_INVALID counter — independent of NOT_AUTHENTICATED's
+    // earlier observation — reaches budget on poll 3.
   });
 });

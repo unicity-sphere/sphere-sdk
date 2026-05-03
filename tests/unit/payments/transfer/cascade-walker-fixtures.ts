@@ -13,6 +13,7 @@ import {
   type CascadeOutboxScanner,
   type CascadeWalkerOptions,
   type CascadeCycleWarning,
+  type CascadeScannerError,
   type ClassifyTokenLookup,
 } from '../../../../modules/payments/transfer/cascade-walker';
 import {
@@ -214,6 +215,7 @@ export interface WalkerHarness {
   readonly scanner: CascadeManifestScanner;
   readonly outbox: FakeOutboxScanner;
   readonly cycleWarnings: CascadeCycleWarning[];
+  readonly scannerErrors: CascadeScannerError[];
 }
 
 export function buildWalker(args: {
@@ -222,12 +224,27 @@ export function buildWalker(args: {
   readonly classes?: Record<string, 'coin' | 'nft'>;
   readonly classifyToken?: ClassifyTokenLookup;
   readonly maxDepth?: number;
+  /**
+   * Optional override of the manifest scanner. When provided, it
+   * REPLACES the default `makeFakeManifestScanner(storage)` — useful
+   * for tests that need `findChildren` to throw deterministically.
+   */
+  readonly manifestScanner?: CascadeManifestScanner;
+  /**
+   * Optional override of the outbox scanner. When provided, REPLACES
+   * the default in-memory fake — useful for tests that need
+   * `findEntriesByTokenId` to throw deterministically.
+   */
+  readonly outboxScanner?: CascadeOutboxScanner;
 } = {}): WalkerHarness {
   const storage = args.storage ?? makeFakeManifestStorage();
-  const scanner = makeFakeManifestScanner(storage);
+  const defaultScanner = makeFakeManifestScanner(storage);
+  const scanner = args.manifestScanner ?? defaultScanner;
   const outbox = args.outbox ?? makeFakeOutboxScanner();
+  const outboxScanner = args.outboxScanner ?? outbox;
   const events = makeEventRecorder();
   const cycleWarnings: CascadeCycleWarning[] = [];
+  const scannerErrors: CascadeScannerError[] = [];
   const manifestCas = new ManifestCas(storage);
   const classifyTokenLookup =
     args.classifyToken ?? makeFakeClassifyLookup(args.classes ?? {});
@@ -235,15 +252,16 @@ export function buildWalker(args: {
   const opts: CascadeWalkerOptions = {
     manifestScanner: scanner,
     manifestCas,
-    outboxScanner: outbox,
+    outboxScanner,
     classifyToken: classifyTokenLookup,
     emit: events.emit,
     onCycleDetected: (w) => cycleWarnings.push(w),
+    onScannerError: (e) => scannerErrors.push(e),
     maxDepth: args.maxDepth,
   };
   const walker = new CascadeWalker(opts);
 
-  return { walker, events, storage, scanner, outbox, cycleWarnings };
+  return { walker, events, storage, scanner, outbox, cycleWarnings, scannerErrors };
 }
 
 export {
@@ -252,5 +270,6 @@ export {
   type CascadeManifestScanner,
   type CascadeOutboxScanner,
   type CascadeCycleWarning,
+  type CascadeScannerError,
   type ClassifyTokenLookup,
 };

@@ -30,6 +30,7 @@ import {
   manifestEntryFor,
   proofFor,
   queueEntryFor,
+  tk,
 } from './import-inclusion-proof-fixtures';
 
 describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutover)', () => {
@@ -55,23 +56,23 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     });
 
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-race.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-race', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-race')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-race'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-race`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-race')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-race',
+      tokenId: tk('t-race'),
       commitmentRequestId: 'rq-race',
       status: 'hard-fail',
     }));
 
     const p1 = h.importer.importInclusionProof(
       ADDR,
-      't-race',
+      tk('t-race'),
       proofFor({ requestId: 'rq-race' }),
       { allowInvalidOverride: true, currentTime: 1700000000001, operatorPubkey: 'op-A' },
     );
@@ -81,13 +82,13 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     // awaits the manifest read again) before reaching `verifyProof`.
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(verifyEntries).toBe(1);
-    expect(h.mutex.isLocked('t-race')).toBe(true);
+    expect(h.mutex.isLocked(tk('t-race'))).toBe(true);
 
     // Kick off p2 while p1 is blocked. Under rpc-release, p2's verify
     // MUST NOT enter until p1 releases the mutex.
     const p2 = h.importer.importInclusionProof(
       ADDR,
-      't-race',
+      tk('t-race'),
       proofFor({ requestId: 'rq-race' }),
       { allowInvalidOverride: true, currentTime: 1700000000002, operatorPubkey: 'op-B' },
     );
@@ -119,7 +120,7 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     expect(h.overrideCalls[1]!.operatorPubkey).toBe('op-B');
 
     // Mutex is fully drained.
-    expect(h.mutex.isLocked('t-race')).toBe(false);
+    expect(h.mutex.isLocked(tk('t-race'))).toBe(false);
     expect(h.mutex.size()).toBe(0);
   });
 
@@ -142,7 +143,8 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
       },
     });
 
-    for (const tok of ['t-A', 't-B']) {
+    for (const tokLabel of ['t-A', 't-B']) {
+      const tok = tk(tokLabel);
       h.disposition.entries.set(
         `${ADDR}.invalid.${tok}.${'aa'.repeat(32)}`,
         invalidEntryFor({ tokenId: tok, reason: 'oracle-rejected' }),
@@ -161,14 +163,14 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
 
     const pA = h.importer.importInclusionProof(
       ADDR,
-      't-A',
-      proofFor({ requestId: 'rq-t-A' }),
+      tk('t-A'),
+      proofFor({ requestId: `rq-${tk('t-A')}` }),
       { allowInvalidOverride: true, operatorPubkey: 'op-A' },
     );
     const pB = h.importer.importInclusionProof(
       ADDR,
-      't-B',
-      proofFor({ requestId: 'rq-t-B' }),
+      tk('t-B'),
+      proofFor({ requestId: `rq-${tk('t-B')}` }),
       { allowInvalidOverride: true, operatorPubkey: 'op-B' },
     );
     // Flush microtasks — both should reach verifyProof immediately.
@@ -205,33 +207,33 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     });
 
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-default.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-default', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-default')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-default'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-default`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-default')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-default',
+      tokenId: tk('t-default'),
       commitmentRequestId: 'rq-default-c',
       status: 'hard-fail',
     }));
 
     const p1 = h.importer.importInclusionProof(
       ADDR,
-      't-default',
+      tk('t-default'),
       proofFor({ requestId: 'rq-default-c' }),
       { allowInvalidOverride: true, operatorPubkey: 'op-A' },
     );
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(verifyEntries).toBe(1);
-    expect(h.mutex.isLocked('t-default')).toBe(true);
+    expect(h.mutex.isLocked(tk('t-default'))).toBe(true);
 
     const p2 = h.importer.importInclusionProof(
       ADDR,
-      't-default',
+      tk('t-default'),
       proofFor({ requestId: 'rq-default-c' }),
       { allowInvalidOverride: true, operatorPubkey: 'op-B' },
     );
@@ -274,29 +276,29 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
     });
 
     h.disposition.entries.set(
-      `${ADDR}.invalid.t-cas.${'aa'.repeat(32)}`,
-      invalidEntryFor({ tokenId: 't-cas', reason: 'oracle-rejected' }),
+      `${ADDR}.invalid.${tk('t-cas')}.${'aa'.repeat(32)}`,
+      invalidEntryFor({ tokenId: tk('t-cas'), reason: 'oracle-rejected' }),
     );
-    h.manifest.entries.set(`${ADDR}:t-cas`, manifestEntryFor({
+    h.manifest.entries.set(`${ADDR}:${tk('t-cas')}`, manifestEntryFor({
       status: 'invalid',
       invalidReason: 'oracle-rejected',
       rootHashHex: 'aa'.repeat(32),
     }));
     h.queue.entries.push(queueEntryFor({
-      tokenId: 't-cas',
+      tokenId: tk('t-cas'),
       commitmentRequestId: 'rq-cas',
       status: 'hard-fail',
     }));
 
     const p1 = h.importer.importInclusionProof(
       ADDR,
-      't-cas',
+      tk('t-cas'),
       proofFor({ requestId: 'rq-cas' }),
       { allowInvalidOverride: true, operatorPubkey: 'op-A' },
     );
     const p2 = h.importer.importInclusionProof(
       ADDR,
-      't-cas',
+      tk('t-cas'),
       proofFor({ requestId: 'rq-cas' }),
       { allowInvalidOverride: true, operatorPubkey: 'op-B' },
     );
@@ -343,16 +345,16 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
 
     for (const h of [h1, h2]) {
       h.disposition.entries.set(
-        `${ADDR}.invalid.t-shared.${'aa'.repeat(32)}`,
-        invalidEntryFor({ tokenId: 't-shared', reason: 'oracle-rejected' }),
+        `${ADDR}.invalid.${tk('t-shared')}.${'aa'.repeat(32)}`,
+        invalidEntryFor({ tokenId: tk('t-shared'), reason: 'oracle-rejected' }),
       );
-      h.manifest.entries.set(`${ADDR}:t-shared`, manifestEntryFor({
+      h.manifest.entries.set(`${ADDR}:${tk('t-shared')}`, manifestEntryFor({
         status: 'invalid',
         invalidReason: 'oracle-rejected',
         rootHashHex: 'aa'.repeat(32),
       }));
       h.queue.entries.push(queueEntryFor({
-        tokenId: 't-shared',
+        tokenId: tk('t-shared'),
         commitmentRequestId: 'rq-shared',
         status: 'hard-fail',
       }));
@@ -360,17 +362,17 @@ describe('§6.3 importInclusionProof — per-tokenId mutex (steelman post-cutove
 
     const p1 = h1.importer.importInclusionProof(
       ADDR,
-      't-shared',
+      tk('t-shared'),
       proofFor({ requestId: 'rq-shared' }),
       { allowInvalidOverride: true, operatorPubkey: 'op-1' },
     );
     for (let i = 0; i < 20; i++) await Promise.resolve();
     expect(verifyEntries).toBe(1);
-    expect(sharedMutex.isLocked('t-shared')).toBe(true);
+    expect(sharedMutex.isLocked(tk('t-shared'))).toBe(true);
 
     const p2 = h2.importer.importInclusionProof(
       ADDR,
-      't-shared',
+      tk('t-shared'),
       proofFor({ requestId: 'rq-shared' }),
       { allowInvalidOverride: true, operatorPubkey: 'op-2' },
     );

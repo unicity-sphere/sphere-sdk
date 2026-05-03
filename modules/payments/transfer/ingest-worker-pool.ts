@@ -519,8 +519,28 @@ export class IngestWorkerPool {
       resolveSettled,
       rejectSettled,
     };
-    this.queue.push(entry);
+
+    // Steelman fix #170 — increment per-token counters BEFORE pushing to
+    // the queue. If the increment throws (today's implementation only
+    // does `Map.set` and `Map.get`, neither throws under normal use, but
+    // a future refactor adding async/CAS/persistence COULD throw), an
+    // ordering of (push -> increment) would leave an orphan queue entry:
+    // a worker would later dequeue it, run, hit `decrementPerTokenCounters`
+    // in its `finally`, and corrupt the counter map by decrementing a
+    // counter that was never incremented. The (increment -> push) order
+    // is safe in both directions: if increment throws, the entry is never
+    // queued; if increment succeeds, decrement is guaranteed to balance.
+    //
+    // **Critical invariant**: NO `await` may be inserted between the cap
+    // check (Step 2) and this increment, NOR between this increment and
+    // the queue push. JS run-to-completion guarantees synchronous
+    // execution between the cap-read and the counter-write — adding an
+    // await opens a yield window where another caller could pass the cap
+    // check on stale data. If you find yourself wanting to add an
+    // `await` here, hoist it out to a separate phase or guard with a
+    // lock.
     this.incrementPerTokenCounters(claimedTokenIds);
+    this.queue.push(entry);
 
     this.logEmit('debug', 'IngestWorkerPool: enqueued bundle', {
       bundleCid: payload.bundleCid,
@@ -620,9 +640,11 @@ export class IngestWorkerPool {
         // processBundle is expected to swallow per-bundle errors via
         // its own routing (W13 transient vs hard reject). If an error
         // escapes, log it loudly — it's a programmer-error path.
+        // Steelman fix #170 — W40 alignment: redact bundleCid to first
+        // 16 hex chars in public log payloads.
         this.logEmit('error', 'IngestWorkerPool: worker caught unexpected error', {
           workerIndex,
-          bundleCid: entry.payload.bundleCid,
+          bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
           err: errorToShape(err),
         });
         // Resolve the caller's enqueue promise — the pool's contract
@@ -787,10 +809,14 @@ export class IngestWorkerPool {
     if (isSphereError(err) && err.code === 'BUNDLE_REJECTED_FETCH_FAILED_TRANSIENT') {
       // W13: NO disposition record. The cid-fetcher already emitted
       // `transfer:fetch-failed`; we just log here for traceability.
+      // Steelman fix #170 — W40 alignment: redact senderTransportPubkey
+      // to first 8 hex chars and bundleCid to first 16 chars at WARN/INFO
+      // log sites so public log shipping does not correlate sender
+      // identities or whole content addresses.
       this.logEmit('info', 'IngestWorkerPool: gateway-fetch transient (W13)', {
         workerIndex,
-        bundleCid: entry.payload.bundleCid,
-        senderTransportPubkey: entry.senderTransportPubkey,
+        bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+        senderPubkeyPrefix: redactSenderPubkey(entry.senderTransportPubkey),
       });
       return;
     }
@@ -800,7 +826,7 @@ export class IngestWorkerPool {
     ) {
       this.logEmit('warn', 'IngestWorkerPool: instant-mode soft-reject (acquire)', {
         workerIndex,
-        bundleCid: entry.payload.bundleCid,
+        bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
       });
       return;
     }
@@ -808,10 +834,12 @@ export class IngestWorkerPool {
     // record at the bundle level — the bundle was either malformed
     // (no token-root we could disposition) or the acquirer threw
     // before any token was identified.
+    // Steelman fix #170 — W40 alignment: redact public-log sender
+    // pubkey/bundleCid identifiers to non-correlatable prefixes.
     this.logEmit('warn', 'IngestWorkerPool: hard bundle rejection', {
       workerIndex,
-      bundleCid: entry.payload.bundleCid,
-      senderTransportPubkey: entry.senderTransportPubkey,
+      bundleCidPrefix: redactBundleCid(entry.payload.bundleCid),
+      senderPubkeyPrefix: redactSenderPubkey(entry.senderTransportPubkey),
       err: errorToShape(err),
     });
   }
@@ -920,4 +948,40 @@ function errorToShape(err: unknown): Readonly<Record<string, unknown>> {
     return { name: err.name, message: err.message };
   }
   return { value: String(err) };
+}
+
+/**
+ * Steelman fix #170 — W40 log redaction.
+ *
+ * Public log shipping (operators tail JSON logs into observability
+ * pipelines that may be readable by parties without need-to-know) MUST
+ * NOT correlate full sender transport pubkeys nor full bundleCids.
+ * Redact at the emission site so even an in-process logger that defaults
+ * to `JSON.stringify` cannot leak the full identifier.
+ *
+ * `redactSenderPubkey` returns the first 8 hex chars (32 bits of entropy
+ * — enough to grep / correlate during incident response, not enough to
+ * trivially link two log lines back to the same Nostr identity).
+ *
+ * `redactBundleCid` returns the first 16 chars of the CIDv1 base32
+ * string, which keeps the multibase prefix and a few discriminating bits
+ * for grep without revealing the whole content address.
+ *
+ * Both helpers are tolerant of inputs shorter than the requested prefix
+ * length (returns the whole string in that case) and handle non-string
+ * inputs defensively (returns `'<missing>'`) so a broken caller cannot
+ * crash the log pipeline. Tests pin the exact prefix lengths.
+ */
+function redactSenderPubkey(senderPubkey: unknown): string {
+  if (typeof senderPubkey !== 'string' || senderPubkey.length === 0) {
+    return '<missing>';
+  }
+  return senderPubkey.slice(0, 8);
+}
+
+function redactBundleCid(bundleCid: unknown): string {
+  if (typeof bundleCid !== 'string' || bundleCid.length === 0) {
+    return '<missing>';
+  }
+  return bundleCid.slice(0, 16);
 }

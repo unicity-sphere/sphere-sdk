@@ -628,6 +628,16 @@ export class FinalizationWorkerSender {
     // requestId tokenId mapping, but the worker only needs the cap as
     // a DoS-defense, not a correctness primitive — using the first id
     // is a conservative under-approximation.
+    //
+    // FIXME (Wave 3 #7 — deferred): for multi-asset bundles the
+    // per-token semaphore is keyed only on `tokenIds[0]`, so tokens
+    // 2..N bypass the cap entirely. The fix is to acquire a separate
+    // permit for EVERY tokenId in `entry.tokenIds`, releasing all
+    // when done — taken in deterministic (lex-sorted) order to
+    // prevent deadlock between two concurrent multi-asset entries
+    // that share at least two tokens. Deferred to keep this Wave 3
+    // change set narrowly scoped to base + queue per the parallel-
+    // agent claim boundary (sender owned by another stream).
     const primaryTokenId = working.tokenIds[0] ?? working.id;
 
     const pending = outstanding.filter((r) => !completed.has(r));

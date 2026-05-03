@@ -360,6 +360,19 @@ export function buildRevalidatorHarness(args: {
   readonly verdicts?: ReadonlyMap<string, ChildRevalidationVerdict>;
   readonly defaultVerdict?: ChildRevalidationVerdict;
   readonly maxDepth?: number;
+  /**
+   * Optional pre-validator hook invoked BEFORE the verdict is computed.
+   * Tests use this to deterministically interleave a parent-flip
+   * mid-loop (so the runner's per-child fresh parent-read sees the
+   * flipped state). Receives the manifest store reference so the test
+   * can mutate the parent entry.
+   */
+  readonly beforeVerdict?: (args: {
+    readonly addr: string;
+    readonly parentTokenId: string;
+    readonly childTokenId: string;
+    readonly manifest: FakeManifestStorage;
+  }) => void;
 } = {}): RevalidatorHarness {
   const manifest = makeFakeManifestStorage();
   const manifestStore = new ManifestStore({
@@ -377,6 +390,14 @@ export function buildRevalidatorHarness(args: {
     const verdict =
       verdicts.get(a.childTokenId) ??
       args.defaultVerdict ?? { kind: 'parent-still-invalid' };
+    if (args.beforeVerdict !== undefined) {
+      args.beforeVerdict({
+        addr: a.addr,
+        parentTokenId: a.parentTokenId,
+        childTokenId: a.childTokenId,
+        manifest,
+      });
+    }
     // Mirror production semantics: the validator OWNS the manifest
     // mutation. On `'revalidated'`, flip the child entry to status='valid'
     // (preserve splitParent for transitive walking). On
@@ -483,6 +504,29 @@ export function auditEntryFor(
     promotedToManifestRef: overrides.promotedToManifestRef,
     audit_promoted_from: overrides.audit_promoted_from,
   };
+}
+
+/**
+ * Map a human-readable test label to a canonical 64-char-hex tokenId
+ * (Wave 3 steelman: the importer rejects non-hex tokenIds at entry to
+ * `importInclusionProof`). This helper is the test-side equivalent of
+ * the upstream wallet code that lower-cases the SDK tokenId before
+ * passing it to the importer.
+ *
+ * Behavior:
+ *  - Lowercases the label.
+ *  - Replaces any non-hex character with '0'.
+ *  - Right-pads with '0' until length is 64.
+ *  - If the input is already 64-char hex, returns it unchanged.
+ *
+ * The mapping is deterministic but not cryptographically meaningful —
+ * it exists purely so tests can use mnemonic labels (`'t-bad'`,
+ * `'t-pending'`, etc.) and still satisfy the production tokenId shape.
+ */
+export function tk(label: string): string {
+  if (/^[0-9a-f]{64}$/i.test(label)) return label;
+  const cleaned = label.toLowerCase().replace(/[^0-9a-f]/g, '0');
+  return cleaned.padEnd(64, '0').slice(0, 64);
 }
 
 export function proofFor(

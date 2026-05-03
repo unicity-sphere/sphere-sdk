@@ -1373,7 +1373,14 @@ The outbox is persisted in OrbitDB. OrbitDB has eventual-consistency (CRDT) sema
 2. **`outstandingRequestIds` set:** merge as `union(replica_A_outstanding, replica_B_outstanding) - union(replica_A_completed, replica_B_completed)`. This prevents finalized requestIds from being re-added by a stale replica. Set-union alone would re-trigger submissions.
 3. **`completedRequestIds` set:** merge as straight `union(replica_A_completed, replica_B_completed)` — completed never un-completes.
 4. **`submitRetryCount`, `proofErrorCount`:** max-merge (CRDT G-counter shape).
-5. **`error` field:** the replica with the more-advanced `status` wins; among equal-status replicas, the earlier Lamport timestamp wins (the first-decided error is preserved).
+5. **`error` field:** strictly-associative CRDT join in the lattice `undefined < string`:
+   - Both `undefined` → `undefined`.
+   - Exactly one defined → the defined string (error stickiness).
+   - Both defined → **lex-min of the error string** (deterministic tie-break).
+
+   **Rationale.** Earlier drafts of this rule used "more-advanced status wins; equal-status → earlier Lamport wins." That formulation is not associative under 3-way merges: pairwise-merged Lamports become `max(a, b)`, which obliterates the original "earlier" timestamp and produces different `merge(merge(a,b),c)` vs `merge(a,merge(b,c))` outcomes for the surviving error string. The status-takes-error variant has the same problem when intermediate winners differ across merge groupings. The lex-min rule is purely a function of the multiset `{a.error, b.error}` and is therefore commutative AND associative by construction. It honors the spec's INTENT ("first-decided error is preserved" — usually only one replica records an error per cascade) with one narrow trade-off: when two replicas independently set distinct error strings, the lex-min string survives instead of the temporally-earlier one. This is the standard CRDT lattice resolution.
+
+   Empty string `""` is treated as "present" (a defined value), not coalesced to `undefined` — writers MUST never persist `""` if they mean "no error".
 6. **`lamport` timestamp:** max-merge.
 
 **Spend protection** comes from the aggregator's `requestId` invariant. A replica rollback that re-creates an outbox entry for an already-transferred source state will hit `REQUEST_ID_EXISTS` at the next aggregator submission; the worker then polls and discovers the race-loser case (proof's `transactionHash` ≠ local) and marks the entry `failed-permanent` with reason='race-lost'. The outbox correctly records the failed re-attempt; the source token's on-chain state is untouched.

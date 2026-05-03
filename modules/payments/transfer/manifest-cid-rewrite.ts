@@ -30,6 +30,7 @@
 
 import type { ContentHash } from '../../../uxf/types';
 import type { ManifestCas } from '../../../profile/manifest-cas';
+import { PerTokenMutex } from '../../../profile/per-token-mutex';
 import type { TokenManifestEntry } from '../../../profile/token-manifest';
 import type { InclusionProof } from '../../../oracle/oracle-provider';
 
@@ -199,6 +200,15 @@ export interface ManifestCidRewriteContext {
  *  - `'noop'` — every step was already applied (queue entry already
  *    removed). Caller's worker pass picked up a finalization that
  *    finished on a previous pass; no work to do.
+ *  - `'lost-concurrent-race'` — TWO concurrent worker passes both
+ *    crossed the `step1Pool.isProofAttached === false` boundary
+ *    before the mutex was added. After the mutex was added (steelman
+ *    Wave 3) the canonical outcome of a lost concurrent race is the
+ *    second caller observing `step1Pool` as already-applied (returns
+ *    `partial-step1-resumed`); this discriminator is reserved for the
+ *    rare case where the race is detected at a deeper layer and we
+ *    want to surface "the other worker beat us" without false-alarming
+ *    the operator dashboards as a real CAS conflict.
  *
  * The discriminator exposes which boundary the previous crash landed
  * at — useful for telemetry, fault-injection assertions, and for the
@@ -210,7 +220,8 @@ export type ManifestCidRewriteResult = {
     | 'partial-step1-resumed'
     | 'partial-step2-resumed'
     | 'partial-step3-resumed'
-    | 'noop';
+    | 'noop'
+    | 'lost-concurrent-race';
 };
 
 // =============================================================================
@@ -382,9 +393,71 @@ export class ManifestCidRewriteCasError extends Error {
 }
 
 /**
- * Run the §5.5 step 5 4-step write sequence in order. Each step is
- * separately exported (above) so fault-injection tests can interpose
- * at any boundary; this function is the production entry point.
+ * Module-scoped per-`(addr, tokenId)` mutex used by
+ * {@link performManifestCidRewrite}.
+ *
+ * **Steelman fix (Wave 3) — concurrent-pass serialization.** Without an
+ * outer mutex, two worker passes for the SAME finalization-queue entry
+ * can BOTH pass the `step1Pool.isProofAttached === false` probe before
+ * either has called `attachProof`. They then race into
+ * `step2ManifestCidRewrite` where exactly one CAS succeeds; the loser
+ * surfaces a `ManifestCidRewriteCasError` UP TO the worker's outer
+ * retry loop. Operator dashboards then see what looks like a real
+ * concurrent-modification conflict, when in fact it's two passes of the
+ * SAME wallet's worker chasing the same queue entry — false-alarm noise.
+ *
+ * The mutex is keyed by `(addr, tokenId)` (not just `tokenId`) because
+ * the same `tokenId` MAY appear under different wallet addresses in the
+ * finalization queue (the worker pool is wallet-scoped per address).
+ * `bounded-hold` strategy with a generous timeout (60 s) is correct
+ * here — finalization writes are bounded by storage IO; if any single
+ * step exceeds the bound, releasing the lock and surfacing the timeout
+ * is preferable to an indefinite hang.
+ *
+ * **Per-process scope is correct.** Multiple Sphere instances in the
+ * same process each import their own copy of this module bundle (no
+ * shared state); two processes opening the same OrbitDB store rely on
+ * OrbitDB's CAS for cross-process serialization (which is exactly what
+ * step 2's CAS already provides). The in-process mutex addresses the
+ * common case: two worker passes inside the same Sphere instance.
+ *
+ * @internal
+ */
+const moduleMutex = new PerTokenMutex();
+
+/**
+ * Composite key the {@link moduleMutex} is keyed under. The mutex
+ * accepts a single string; we synthesise one from `(addr, tokenId)` so
+ * concurrent rewrites of the same `tokenId` under different wallet
+ * addresses (the worker pool runs per-address) don't serialize
+ * unnecessarily.
+ *
+ * Uses a delimiter that cannot appear in either component (newline) so
+ * the key is unambiguous: a `tokenId` may contain a colon but never a
+ * literal newline.
+ *
+ * @internal
+ */
+function makeMutexKey(addr: string, tokenId: string): string {
+  return `${addr}\n${tokenId}`;
+}
+
+/**
+ * Bounded-hold timeout for the per-`(addr, tokenId)` mutex around
+ * {@link performManifestCidRewrite}. 60 s is generous for a 4-step
+ * storage IO sequence; if any single step exceeds it, releasing the
+ * lock so the next worker can retry is preferable to letting the
+ * worker pool block indefinitely on a stuck step.
+ *
+ * @internal
+ */
+const REWRITE_MUTEX_TIMEOUT_MS = 60_000;
+
+/**
+ * Run the §5.5 step 5 4-step write sequence in order, serialized per
+ * `(addr, tokenId)` via {@link moduleMutex}. Each step is separately
+ * exported (above) so fault-injection tests can interpose at any
+ * boundary; this function is the production entry point.
  *
  * **Crash recovery semantics** (W25): if a crash interrupts between
  * any two steps, the queue entry is still present on restart, the
@@ -393,17 +466,92 @@ export class ManifestCidRewriteCasError extends Error {
  * method — converging to the same final state without duplicate
  * writes.
  *
+ * **Concurrent-pass serialization** (steelman Wave 3): two concurrent
+ * worker passes for the same `(addr, tokenId)` are now serialized by
+ * the module-scoped mutex. The first pass executes the 4-step
+ * sequence; the second pass blocks until the first releases the lock,
+ * then re-runs each step's idempotency probe — which detects "already
+ * applied" and returns the appropriate `partial-stepN-resumed` /
+ * `noop` discriminator WITHOUT producing a `ManifestCidRewriteCasError`
+ * or the `lost-concurrent-race` outcome.
+ *
+ * If a CAS conflict still surfaces under the mutex (e.g. an external
+ * writer ran between the two passes), the orchestrator translates it
+ * into the `lost-concurrent-race` discriminator IFF the observed CID
+ * matches the in-flight `newCid` — otherwise the conflict is a real
+ * external-modification fault and bubbles as
+ * `ManifestCidRewriteCasError`. This keeps operator-dashboard alerts
+ * focused on TRUE conflicts.
+ *
  * **Step ordering is normative** — reordering breaks crash safety.
  *
  * @throws {@link ManifestCidRewriteCasError} on unrecoverable step-2
- *   CAS failure (observed CID is neither `previousCid` nor `newCid`).
- *   Caller is expected to re-read state and retry.
+ *   CAS failure (observed CID is neither `previousCid` nor `newCid`,
+ *   AND the conflict was NOT a same-pass concurrent-race coalescable
+ *   into the `lost-concurrent-race` outcome). Caller is expected to
+ *   re-read state and retry.
  */
 export async function performManifestCidRewrite(
   ctx: ManifestCidRewriteContext,
 ): Promise<ManifestCidRewriteResult> {
+  const key = makeMutexKey(ctx.addr, ctx.tokenId);
+  return moduleMutex.acquire(
+    key,
+    () => runManifestCidRewriteSteps(ctx),
+    {
+      strategy: 'bounded-hold',
+      timeoutMs: REWRITE_MUTEX_TIMEOUT_MS,
+    },
+  );
+}
+
+/**
+ * Inner step runner — invoked under the module mutex by
+ * {@link performManifestCidRewrite}. Exposed as a separate function so
+ * the mutex acquire / release boundary stays a single line and the
+ * step orchestration logic remains a flat sequence (easier to reason
+ * about under crash injection).
+ *
+ * @internal
+ */
+async function runManifestCidRewriteSteps(
+  ctx: ManifestCidRewriteContext,
+): Promise<ManifestCidRewriteResult> {
   const wroteStep1 = await step1Pool(ctx);
-  const wroteStep2 = await step2ManifestCidRewrite(ctx);
+  let wroteStep2: boolean;
+  try {
+    wroteStep2 = await step2ManifestCidRewrite(ctx);
+  } catch (cause) {
+    // **Lost-race vs real CAS conflict (steelman Wave 3).** Inside the
+    // same process, the module mutex prevents concurrent passes from
+    // racing, so a CAS error here MUST come from an external writer
+    // (different process / different Sphere instance) OR from a
+    // custom `ManifestCas` that doesn't perform the in-process
+    // idempotency skip on `observed === newCid`.
+    //
+    // Sub-cases:
+    //
+    //   1. Observed CID matches the in-flight `newCid` AND step 1
+    //      reported skip → another writer already applied steps 1 and
+    //      2. Surface as `lost-concurrent-race` so the worker
+    //      dashboard treats this as benign rather than a real
+    //      conflict alert. Note: the canonical `ManifestCas`
+    //      already collapses this case to a `false` return inside
+    //      `step2ManifestCidRewrite`, so this branch fires only
+    //      when an alternative CAS implementation throws on
+    //      `observed === newCid`.
+    //   2. Anything else → real conflict, re-throw the
+    //      `ManifestCidRewriteCasError` for the worker's retry loop.
+    if (
+      !wroteStep1 &&
+      cause instanceof ManifestCidRewriteCasError &&
+      cause.casReason === 'cas-mismatch' &&
+      cause.observedCid === ctx.newCid
+    ) {
+      return { result: 'lost-concurrent-race' };
+    }
+    throw cause;
+  }
   const wroteStep3 = await step3Tombstone(ctx);
   const wroteStep4 = await step4RemoveQueueEntry(ctx);
 
@@ -426,4 +574,15 @@ export async function performManifestCidRewrite(
   // No step wrote — every step was already applied. The previous
   // worker pass finished cleanly; this pass is a pure replay.
   return { result: 'noop' };
+}
+
+/**
+ * Test-only utility — returns the module-scoped mutex so concurrent-
+ * race tests can probe `isLocked(key)` between mutex steps. Production
+ * code must NEVER call this; the mutex is intentionally module-private.
+ *
+ * @internal
+ */
+export function __getMutexForTests(): PerTokenMutex {
+  return moduleMutex;
 }

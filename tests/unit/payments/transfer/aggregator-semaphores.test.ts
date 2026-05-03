@@ -217,3 +217,177 @@ describe('aggregator-semaphores — URL canonicalization (#159)', () => {
     expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(2);
   });
 });
+
+// =============================================================================
+// Wave 3 steelman — bounded registry (LRU eviction) + reset-rejects-pending
+// =============================================================================
+//
+// Two tightly-related defenses landed together:
+//
+//  (A) The process-global registry MUST be size-bounded. A caller
+//      synthesizing distinct `aggregatorId` strings (random fixture
+//      endpoints, misconfigured production deployments generating a
+//      new ID per request) would otherwise leak Semaphore instances
+//      forever. The registry now caps at 32 entries and evicts via
+//      LRU touch order.
+//
+//  (B) `__resetAggregatorSemaphoresForTesting` MUST reject every
+//      pending `acquire()` waiter, not just clear the Map. A test
+//      that crashed mid-acquire (assertion failure inside an
+//      `acquire().then(...)` chain) would otherwise leave the
+//      awaiting promise dangling forever, holding closures that
+//      pinned the test's outer scope and blocked vitest teardown.
+
+describe('aggregator-semaphores — Wave 3 LRU eviction', () => {
+  beforeEach(() => {
+    __resetAggregatorSemaphoresForTesting();
+  });
+
+  it('registry stays bounded under unique-key pressure', () => {
+    // Insert way more keys than the cap; the registry MUST stay at
+    // its cap, not balloon to N. We don't assert the exact cap value
+    // here (it's an implementation detail) — only the bounded property.
+    for (let i = 0; i < 200; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    const size = __aggregatorSemaphoreRegistrySizeForTesting();
+    expect(size).toBeLessThanOrEqual(32);
+    expect(size).toBeGreaterThan(0);
+  });
+
+  it('LRU eviction: oldest untouched key is evicted first', () => {
+    // Fill the registry to capacity with deterministic IDs.
+    const cap = 32;
+    for (let i = 0; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Capture the FIRST inserted (LRU) semaphore for identity-comparison.
+    const firstSemaphore = getAggregatorSemaphore('https://agg-0.example/');
+    // Touching `agg-0` here moves it to MRU end. To exercise the
+    // "oldest untouched key evicted" path we need a key that was
+    // inserted EARLIER and NOT touched. Restart with a fresh registry.
+    __resetAggregatorSemaphoresForTesting();
+
+    for (let i = 0; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    // Capture identities for the oldest and a middle entry.
+    const oldestSem = getAggregatorSemaphore('https://agg-0.example/');
+    // ^^ This call ALSO touches the key; reset and re-insert from scratch.
+    __resetAggregatorSemaphoresForTesting();
+    for (let i = 0; i < cap; i++) {
+      getAggregatorSemaphore(`https://agg-${i}.example/`);
+    }
+    // Without touching anything, push one new key — this MUST evict
+    // the LRU (`agg-0`).
+    getAggregatorSemaphore('https://agg-newest.example/');
+
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Re-fetching `agg-0` returns a NEW semaphore (the prior one was
+    // evicted). The newest key is still resident.
+    const reFetched = getAggregatorSemaphore('https://agg-0.example/');
+    // The new fetch MUST be a fresh instance — not the original.
+    expect(reFetched).not.toBe(oldestSem);
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+  });
+
+  it('LRU touch keeps a frequently-accessed key resident', () => {
+    const cap = 32;
+    // Insert one "hot" key and many "cold" keys.
+    const hotSem = getAggregatorSemaphore('https://agg-hot.example/');
+    for (let i = 0; i < cap - 1; i++) {
+      getAggregatorSemaphore(`https://agg-cold-${i}.example/`);
+    }
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(cap);
+
+    // Touch hot many times — keeps it MRU. Push new keys that should
+    // evict cold keys, NOT hot.
+    for (let i = 0; i < 50; i++) {
+      getAggregatorSemaphore('https://agg-hot.example/'); // touch hot
+      getAggregatorSemaphore(`https://agg-pressure-${i}.example/`); // push new
+    }
+
+    // Hot semaphore identity preserved across pressure waves.
+    const stillHot = getAggregatorSemaphore('https://agg-hot.example/');
+    expect(stillHot).toBe(hotSem);
+  });
+});
+
+describe('aggregator-semaphores — Wave 3 reset rejects pending waiters', () => {
+  beforeEach(() => {
+    __resetAggregatorSemaphoresForTesting();
+  });
+
+  it('reset rejects every pending acquire() promise with a known error', async () => {
+    const sem = getAggregatorSemaphore('https://reset-test.example/');
+
+    // Drain all permits so subsequent acquires must wait.
+    const releases: Array<() => void> = [];
+    for (let i = 0; i < MAX_CONCURRENT_POLLS_PER_AGGREGATOR; i++) {
+      releases.push(await sem.acquire());
+    }
+    expect(sem.available).toBe(0);
+
+    // Start a few pending acquires that will WAIT for permits.
+    const pendingCount = 3;
+    const pendingResults: Array<Promise<unknown>> = [];
+    for (let i = 0; i < pendingCount; i++) {
+      pendingResults.push(
+        sem.acquire().then(
+          () => ({ resolved: true }),
+          (err: Error) => ({ rejected: true, message: err.message }),
+        ),
+      );
+    }
+
+    // Yield once to let the pending acquires reach the waiter list.
+    await Promise.resolve();
+
+    // Reset the registry — pending waiters MUST reject.
+    __resetAggregatorSemaphoresForTesting();
+
+    const settled = await Promise.all(pendingResults);
+    for (const result of settled) {
+      expect(result).toMatchObject({ rejected: true });
+      // Sentinel error message lets callers distinguish reset from
+      // other rejection sources.
+      expect((result as { message: string }).message).toContain(
+        'semaphore reset for testing',
+      );
+    }
+
+    // Cleanup: release the permits we held (no-op against the
+    // discarded inner semaphore, but clean for clarity).
+    for (const r of releases) r();
+  });
+
+  it('reset followed by re-fetch returns a fresh semaphore with full permits', async () => {
+    const sem1 = getAggregatorSemaphore('https://reset-fresh.example/');
+
+    // Drain permits.
+    const releases: Array<() => void> = [];
+    for (let i = 0; i < MAX_CONCURRENT_POLLS_PER_AGGREGATOR; i++) {
+      releases.push(await sem1.acquire());
+    }
+    expect(sem1.available).toBe(0);
+
+    // Reset, then re-fetch — same key, fresh semaphore.
+    __resetAggregatorSemaphoresForTesting();
+    const sem2 = getAggregatorSemaphore('https://reset-fresh.example/');
+
+    expect(sem2).not.toBe(sem1);
+    expect(sem2.available).toBe(MAX_CONCURRENT_POLLS_PER_AGGREGATOR);
+
+    for (const r of releases) r();
+  });
+
+  it('reset with no pending waiters is a clean no-op', () => {
+    // Sanity: reset MUST NOT throw when there are no pending waiters.
+    getAggregatorSemaphore('https://no-waiters.example/');
+    expect(() => __resetAggregatorSemaphoresForTesting()).not.toThrow();
+    expect(__aggregatorSemaphoreRegistrySizeForTesting()).toBe(0);
+  });
+});
