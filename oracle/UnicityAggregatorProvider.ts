@@ -75,7 +75,18 @@ interface RpcSubmitResponse {
   requestId?: string;
 }
 
+/**
+ * Response shape from the aggregator's `get_inclusion_proof` RPC.
+ * The aggregator returns `{ inclusionProof: { authenticator, merkleTreePath,
+ * transactionHash, unicityCertificate } }` — the historical Sphere wrapper
+ * incorrectly looked for a top-level `proof` field, so every poll returned
+ * null and instant-mode finalization never converged. Both fields are now
+ * accepted (proof for legacy / mainnet shapes, inclusionProof for testnet).
+ */
 interface RpcProofResponse {
+  /** Canonical aggregator shape (testnet, current). */
+  inclusionProof?: unknown;
+  /** Historical / fallback shape — kept for compatibility. */
   proof?: unknown;
   roundNumber?: number;
 }
@@ -343,14 +354,17 @@ export class UnicityAggregatorProvider implements OracleProvider {
     try {
       const response = await this.rpcCall<RpcProofResponse>('get_inclusion_proof', { requestId });
 
-      if (!response.proof) {
+      // The aggregator returns `inclusionProof` (canonical, current);
+      // some legacy / mock responders use `proof`. Accept either.
+      const proof = response.inclusionProof ?? response.proof;
+      if (!proof) {
         return null;
       }
 
       return {
         requestId,
         roundNumber: response.roundNumber ?? 0,
-        proof: response.proof,
+        proof,
         timestamp: Date.now(),
       };
     } catch (error) {
