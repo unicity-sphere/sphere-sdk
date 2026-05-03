@@ -231,7 +231,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
         requestId = commitment.requestId?.toString() ?? response.status;
       } else {
         // Fallback to RPC for simple commitment objects
-        const response = await this.rpcCall<RpcSubmitResponse>('submitCommitment', {
+        const response = await this.rpcCall<RpcSubmitResponse>('submit_commitment', {
           sourceToken: commitment.sourceToken,
           recipient: commitment.recipient,
           salt: Array.from(commitment.salt),
@@ -307,7 +307,7 @@ export class UnicityAggregatorProvider implements OracleProvider {
     this.ensureConnected();
 
     try {
-      const response = await this.rpcCall<RpcProofResponse>('getInclusionProof', { requestId });
+      const response = await this.rpcCall<RpcProofResponse>('get_inclusion_proof', { requestId });
 
       if (!response.proof) {
         return null;

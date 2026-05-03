@@ -1,0 +1,151 @@
+/**
+ * Unit tests asserting that UnicityAggregatorProvider.getProof() and
+ * submitCommitment() (non-SDK fallback path) send the correct JSON-RPC
+ * method names to the aggregator transport.
+ *
+ * Regression test for the bug where camelCase method names were used
+ * instead of the snake_case names the testnet aggregator requires:
+ *   - 'getInclusionProof' → 'get_inclusion_proof'
+ *   - 'submitCommitment'  → 'submit_commitment'  (non-SDK fallback only)
+ *
+ * The canonical method names are defined in:
+ *   @unicitylabs/state-transition-sdk/lib/api/AggregatorClient.js
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { UnicityAggregatorProvider } from '../../../oracle/UnicityAggregatorProvider';
+
+// ─── Mock fetch globally ──────────────────────────────────────────────────────
+
+type FetchCall = { method: string; params: unknown };
+
+function makeMockFetch(responseBody: unknown = { result: {} }) {
+  const calls: FetchCall[] = [];
+  const mockFetch = vi.fn(async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(init.body as string) as { method: string; params: unknown };
+    calls.push({ method: body.method, params: body.params });
+    return {
+      ok: true,
+      json: async () => responseBody,
+    };
+  });
+  return { mockFetch, calls };
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+describe('UnicityAggregatorProvider — JSON-RPC wire method names', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  describe('getProof()', () => {
+    it('sends method "get_inclusion_proof" (snake_case, NOT "getInclusionProof")', async () => {
+      const { mockFetch, calls } = makeMockFetch({ result: {} });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      await provider.getProof('test-request-id');
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].method).toBe('get_inclusion_proof');
+      // Must NOT be the camelCase name that the aggregator rejects with -32601.
+      expect(calls[0].method).not.toBe('getInclusionProof');
+    });
+
+    it('includes requestId in params', async () => {
+      const { mockFetch, calls } = makeMockFetch({ result: {} });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const testId = 'abc123-request-id';
+      await provider.getProof(testId);
+
+      expect(calls).toHaveLength(1);
+      expect((calls[0].params as { requestId: string }).requestId).toBe(testId);
+    });
+
+    it('returns null when aggregator returns empty result (proof not yet available)', async () => {
+      const { mockFetch } = makeMockFetch({ result: {} });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('no-proof-yet');
+      expect(result).toBeNull();
+    });
+
+    it('returns null (not throw) when aggregator returns JSON-RPC error', async () => {
+      // Simulates the old 'getInclusionProof' behaviour: -32601 Method not found.
+      const { mockFetch } = makeMockFetch({
+        result: null,
+        error: { code: -32601, message: 'Method not found' },
+      });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      const result = await provider.getProof('any-id');
+      // getProof swallows errors and returns null so the caller can retry.
+      expect(result).toBeNull();
+    });
+  });
+
+  describe('submitCommitment() — non-SDK fallback path', () => {
+    it('sends method "submit_commitment" (snake_case, NOT "submitCommitment")', async () => {
+      const { mockFetch, calls } = makeMockFetch({ result: { requestId: 'rpc-req-1' } });
+      global.fetch = mockFetch as unknown as typeof fetch;
+
+      const provider = new UnicityAggregatorProvider({
+        url: 'https://test.example/',
+        timeout: 1000,
+        skipVerification: true,
+      });
+      (provider as unknown as { status: string }).status = 'connected';
+
+      // Pass a plain (non-SDK) commitment object to force the RPC fallback.
+      // isSdkTransferCommitment() returns false when requestId.toString is absent.
+      const plainCommitment = {
+        sourceToken: 'tok',
+        recipient: 'rec',
+        salt: new Uint8Array([1, 2, 3]),
+        data: null,
+      };
+
+      await provider.submitCommitment(plainCommitment as Parameters<typeof provider.submitCommitment>[0]);
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].method).toBe('submit_commitment');
+      expect(calls[0].method).not.toBe('submitCommitment');
+    });
+  });
+});
