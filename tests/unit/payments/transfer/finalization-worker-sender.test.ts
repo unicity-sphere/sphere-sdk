@@ -889,3 +889,463 @@ describe('FinalizationWorkerSender — concurrency primitive (CountingSemaphore)
     expect(() => new CountingSemaphore(NaN)).toThrow(/must be > 0/);
   });
 });
+
+// =============================================================================
+// 16. scanLoop production scheduler (#168)
+// =============================================================================
+
+/**
+ * Build a sender harness whose outbox writer exposes `readAllNew` so the
+ * scan loop has real work to drive. The fake outbox is backed by a Map
+ * keyed by id; `readAllNew()` returns its values.
+ */
+function buildScanHarness(args: {
+  readonly initialEntries?: ReadonlyArray<UxfTransferOutboxEntry>;
+  readonly aggregator?: ReturnType<typeof makeFakeAggregator>;
+  readonly scanIntervalMs?: number;
+  readonly maxEntriesPerScan?: number;
+  readonly processOneOverride?: (
+    entry: UxfTransferOutboxEntry,
+  ) => Promise<void>;
+} = {}): {
+  readonly worker: FinalizationWorkerSender;
+  readonly outboxMap: Map<string, UxfTransferOutboxEntry>;
+  readonly events: ReturnType<typeof makeEventRecorder>;
+  readonly processedIds: string[];
+} {
+  const outboxMap = new Map<string, UxfTransferOutboxEntry>();
+  for (const e of args.initialEntries ?? []) outboxMap.set(e.id, e);
+
+  const writer: FinalizationOutboxWriter = {
+    async readOne(id) {
+      return outboxMap.get(id) ?? null;
+    },
+    async update(id, mutator) {
+      const prev = outboxMap.get(id);
+      if (!prev) throw new Error(`no entry ${id}`);
+      const next = mutator(prev);
+      outboxMap.set(id, next);
+      return next;
+    },
+    async readAllNew() {
+      return Array.from(outboxMap.values());
+    },
+  };
+
+  const aggregator = args.aggregator ?? makeFakeAggregator();
+  const resolver = makeFakeResolver();
+  const pool = makeFakePool();
+  const poolRead = makeFakePoolRead();
+  const tombstones = makeFakeTombstones();
+  // Seed queue with EVERY outstanding requestId across initial entries
+  // so the manifest-CID-rewrite's `hasEntry` check passes during the
+  // 4-step write.
+  const queueSeed: Array<{ addr: string; requestId: string }> = [];
+  for (const e of args.initialEntries ?? []) {
+    for (const r of e.outstandingRequestIds ?? []) {
+      queueSeed.push({ addr: ADDR, requestId: r });
+    }
+  }
+  if (queueSeed.length === 0) {
+    queueSeed.push({ addr: ADDR, requestId: REQUEST_ID });
+  }
+  const queue = makeFakeQueue(queueSeed);
+  const events = makeEventRecorder();
+  const manifestStorage = makeFakeManifestStorage([
+    {
+      addr: ADDR,
+      tokenId: TOKEN_ID,
+      entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+    },
+  ]);
+  const manifestCas = new ManifestCas(manifestStorage);
+  const mutex = new PerTokenMutex();
+  const processedIds: string[] = [];
+
+  const worker = new FinalizationWorkerSender({
+    addressId: ADDR,
+    outbox: writer,
+    aggregator,
+    resolver,
+    pool,
+    poolRead,
+    manifestCas,
+    tombstones,
+    queue,
+    perAggregatorSemaphore: new CountingSemaphore(16),
+    getPerTokenSemaphore: () => new CountingSemaphore(4),
+    perTokenMutex: mutex,
+    perTokenMutexStrategy: 'cas',
+    emit: events.emit,
+    now: () => Date.now(),
+    sleep: (ms: number) =>
+      new Promise<void>((resolve) => setTimeout(resolve, Math.min(ms, 5))),
+    scanIntervalMs: args.scanIntervalMs ?? 5,
+    maxEntriesPerScan: args.maxEntriesPerScan ?? 100,
+  });
+
+  // Spy on processOne to record which ids the loop touched. After the
+  // override (or fallback to no-op), we mark the outbox entry as
+  // 'finalized' so the scan loop's filter (`status === 'delivered-instant'
+  // || 'finalizing'`) skips it on the next pass — preventing tight
+  // re-fire loops in tests with overrides that don't drive real state.
+  const originalProcessOne = worker.processOne.bind(worker);
+  worker.processOne = async (entry) => {
+    processedIds.push(entry.id);
+    if (args.processOneOverride !== undefined) {
+      let threw: unknown;
+      try {
+        await args.processOneOverride(entry);
+      } catch (err) {
+        threw = err;
+      }
+      // Force the entry to a terminal status so the loop doesn't re-fire.
+      const cur = outboxMap.get(entry.id);
+      if (cur !== undefined) {
+        outboxMap.set(entry.id, { ...cur, status: 'finalized' });
+      }
+      if (threw !== undefined) throw threw;
+      return {
+        outboxId: entry.id,
+        tokenIds: entry.tokenIds,
+        successCount: 1,
+        hardFailCount: 0,
+        cascadeFailedEmitted: false,
+        terminal: 'finalized',
+      };
+    }
+    return originalProcessOne(entry);
+  };
+
+  return { worker, outboxMap, events, processedIds };
+}
+
+function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs = 1000,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const tick = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - start > timeoutMs) {
+        return reject(new Error('waitForCondition timed out'));
+      }
+      setTimeout(tick, 5);
+    };
+    tick();
+  });
+}
+
+describe('FinalizationWorkerSender — scanLoop (#168)', () => {
+  it('processes a delivered-instant entry within scanIntervalMs', async () => {
+    const entry = makeOutboxEntry({ id: 'outbox-scan-1' });
+    const h = buildScanHarness({
+      initialEntries: [entry],
+      processOneOverride: async () => undefined,
+    });
+    h.worker.start();
+    try {
+      await waitForCondition(() => h.processedIds.includes('outbox-scan-1'));
+      expect(h.processedIds).toContain('outbox-scan-1');
+    } finally {
+      await h.worker.stop();
+    }
+  });
+
+  it('processes ten queued entries', async () => {
+    // Use processOneOverride: a no-op marks each entry processed and
+    // flips its status to 'finalized' (via the harness wrapper) so the
+    // loop terminates rather than re-firing forever. We assert the
+    // loop *visited* every entry; correctness of the §6.1 cycle is
+    // exercised by the other tests in this file.
+    const entries: UxfTransferOutboxEntry[] = [];
+    for (let i = 0; i < 10; i++) {
+      entries.push(
+        makeOutboxEntry({
+          id: `outbox-scan-${i}`,
+          outstandingRequestIds: [`req-${i}`],
+        }),
+      );
+    }
+    const h = buildScanHarness({
+      initialEntries: entries,
+      processOneOverride: async () => undefined,
+    });
+    h.worker.start();
+    try {
+      await waitForCondition(() => {
+        const unique = new Set(h.processedIds);
+        return unique.size === 10;
+      }, 3000);
+      const unique = new Set(h.processedIds);
+      expect(unique.size).toBe(10);
+    } finally {
+      await h.worker.stop();
+    }
+  });
+
+  it('continues on processOne throw — other entries still process', async () => {
+    const entries = [
+      makeOutboxEntry({ id: 'outbox-throw' }),
+      makeOutboxEntry({ id: 'outbox-ok-1' }),
+      makeOutboxEntry({ id: 'outbox-ok-2' }),
+    ];
+    const h = buildScanHarness({
+      initialEntries: entries,
+      processOneOverride: async (entry) => {
+        if (entry.id === 'outbox-throw') {
+          throw new Error('synthetic throw');
+        }
+      },
+    });
+    h.worker.start();
+    try {
+      await waitForCondition(
+        () =>
+          h.processedIds.includes('outbox-ok-1') &&
+          h.processedIds.includes('outbox-ok-2'),
+      );
+      expect(h.processedIds).toContain('outbox-ok-1');
+      expect(h.processedIds).toContain('outbox-ok-2');
+      // The thrown entry was attempted and the loop emitted an alert.
+      expect(h.processedIds).toContain('outbox-throw');
+      const alerts = h.events.events.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBeGreaterThan(0);
+    } finally {
+      await h.worker.stop();
+    }
+  });
+
+  it('stop() during scan exits cleanly within ~scanIntervalMs', async () => {
+    const entry = makeOutboxEntry({ id: 'outbox-stop' });
+    const h = buildScanHarness({
+      initialEntries: [entry],
+      scanIntervalMs: 50,
+      processOneOverride: async () => undefined,
+    });
+    h.worker.start();
+    expect(h.worker.isRunning()).toBe(true);
+    const start = Date.now();
+    await h.worker.stop();
+    const elapsed = Date.now() - start;
+    expect(h.worker.isRunning()).toBe(false);
+    // Should exit within a small multiple of scanIntervalMs (allow
+    // generous slack for CI jitter).
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('manualScan: true → loop is sleep-only stub', async () => {
+    const entry = makeOutboxEntry({ id: 'outbox-manual' });
+    const outboxMap = new Map<string, UxfTransferOutboxEntry>([[entry.id, entry]]);
+    const writer: FinalizationOutboxWriter = {
+      async readOne(id) {
+        return outboxMap.get(id) ?? null;
+      },
+      async update(id, mutator) {
+        const prev = outboxMap.get(id)!;
+        const next = mutator(prev);
+        outboxMap.set(id, next);
+        return next;
+      },
+      async readAllNew() {
+        return Array.from(outboxMap.values());
+      },
+    };
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 5,
+      manualScan: true,
+    });
+    const processedIds: string[] = [];
+    const originalProcessOne = worker.processOne.bind(worker);
+    worker.processOne = async (e) => {
+      processedIds.push(e.id);
+      return originalProcessOne(e);
+    };
+    worker.start();
+    try {
+      await new Promise((r) => setTimeout(r, 50));
+      // manualScan stub never invokes processOne.
+      expect(processedIds.length).toBe(0);
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  it('rejects scanIntervalMs <= 0', () => {
+    const entry = makeOutboxEntry();
+    expect(() =>
+      buildScanHarness({ initialEntries: [entry], scanIntervalMs: 0 }),
+    ).toThrow(/scanIntervalMs/);
+    expect(() =>
+      buildScanHarness({ initialEntries: [entry], scanIntervalMs: -1 }),
+    ).toThrow(/scanIntervalMs/);
+  });
+
+  it('rejects maxEntriesPerScan <= 0', () => {
+    const entry = makeOutboxEntry();
+    expect(() =>
+      buildScanHarness({ initialEntries: [entry], maxEntriesPerScan: 0 }),
+    ).toThrow(/maxEntriesPerScan/);
+  });
+
+  it('skips entry already in flight (concurrent processOne + scan)', async () => {
+    // Build a scan harness whose READ enumerator stays "live" but which
+    // we can stretch via a custom slow processOne override. The test
+    // verifies the loop's `inFlight` filter prevents double-processing
+    // the same outbox id when an external caller is already mid-flight.
+    const entry = makeOutboxEntry({ id: 'outbox-concurrent' });
+    const outboxMap = new Map<string, UxfTransferOutboxEntry>([[entry.id, entry]]);
+    const writer: FinalizationOutboxWriter = {
+      async readOne(id) {
+        return outboxMap.get(id) ?? null;
+      },
+      async update(id, mutator) {
+        const prev = outboxMap.get(id)!;
+        const next = mutator(prev);
+        outboxMap.set(id, next);
+        return next;
+      },
+      async readAllNew() {
+        return Array.from(outboxMap.values());
+      },
+    };
+    const events = makeEventRecorder();
+    const aggregator = makeFakeAggregator();
+    const resolver = makeFakeResolver();
+    const pool = makeFakePool();
+    const poolRead = makeFakePoolRead();
+    const tombstones = makeFakeTombstones();
+    const queue = makeFakeQueue([{ addr: ADDR, requestId: REQUEST_ID }]);
+    const manifestStorage = makeFakeManifestStorage([
+      {
+        addr: ADDR,
+        tokenId: TOKEN_ID,
+        entry: { rootHash: PREVIOUS_CID, status: 'pending' },
+      },
+    ]);
+    const manifestCas = new ManifestCas(manifestStorage);
+    const mutex = new PerTokenMutex();
+    const worker = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      perTokenMutexStrategy: 'cas',
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 5,
+    });
+
+    // Wrap the resolver to add a 50ms delay on first use, simulating a
+    // slow aggregator / network. This stretches processOne enough for
+    // the scan loop to observe `inFlight` and skip the entry.
+    let resolveCount = 0;
+    const slowResolver: RequestContextResolver = {
+      async resolve(input) {
+        resolveCount++;
+        if (resolveCount === 1) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        return resolver.resolve(input);
+      },
+    };
+    // Re-wire by replacing the inner resolver via a one-shot closure.
+    // Since we already built the worker, we instead retry: build with
+    // slowResolver from the start.
+    const worker2 = new FinalizationWorkerSender({
+      addressId: ADDR,
+      outbox: writer,
+      aggregator,
+      resolver: slowResolver,
+      pool,
+      poolRead,
+      manifestCas,
+      tombstones,
+      queue,
+      perAggregatorSemaphore: new CountingSemaphore(16),
+      getPerTokenSemaphore: () => new CountingSemaphore(4),
+      perTokenMutex: mutex,
+      perTokenMutexStrategy: 'cas',
+      emit: events.emit,
+      now: () => Date.now(),
+      sleep: (ms: number) =>
+        new Promise<void>((r) => setTimeout(r, Math.min(ms, 5))),
+      scanIntervalMs: 5,
+    });
+    void worker;
+
+    const processedIds: string[] = [];
+    const orig = worker2.processOne.bind(worker2);
+    worker2.processOne = async (e) => {
+      processedIds.push(e.id);
+      return orig(e);
+    };
+
+    // Kick off external processOne BEFORE start() so it grabs the
+    // inFlight slot; the slow resolver holds the cycle ~50ms.
+    const externalP = worker2.processOne(entry);
+    worker2.start();
+    try {
+      // Wait for external call to register.
+      await waitForCondition(() => processedIds.length >= 1, 1000);
+      // Loop tries to scan; the inFlight Set should cause it to skip
+      // processing the same entry. Let the loop tick a few times.
+      await new Promise((r) => setTimeout(r, 30));
+      // External call still in flight → loop has NOT added another
+      // processedIds entry.
+      const beforeWait = processedIds.length;
+      expect(beforeWait).toBe(1);
+      // Let external complete; status flips to finalized so subsequent
+      // loop ticks skip on status filter.
+      const result = await externalP;
+      void result;
+    } finally {
+      await worker2.stop();
+    }
+  });
+});

@@ -283,6 +283,27 @@ export interface AuditEntry {
    * symmetric traceability.
    */
   readonly audit_promoted_from?: string;
+  /**
+   * Two-phase promotion marker (steelman finding #164).
+   *
+   * Set to `true` BEFORE the manifest write in
+   * `DispositionWriter.promoteAuditEntry`, and cleared (deleted) when:
+   *   - the manifest write succeeds and `auditStatus` flips to
+   *     `'audit-promoted'`, OR
+   *   - the manifest write fails before completing (rollback marker).
+   *
+   * The marker exists to make promotion **transactional under crash**:
+   * if the process dies between the manifest write and the audit-status
+   * write, a subsequent retry / merge can detect the in-flight state and
+   * either finalize (if the manifest write is observed to have succeeded
+   * via `audit_promoted_from` reverse-pointer) or roll back (if not).
+   *
+   * **Invariant**: `promotionPending: true` is incompatible with
+   * `auditStatus === 'audit-promoted'`. The two states are mutually
+   * exclusive — the marker is the "in-flight" lifecycle stage between
+   * `audit-not-our-state` / `audit-off-record-spend` and `audit-promoted`.
+   */
+  readonly promotionPending?: boolean;
 }
 
 // =============================================================================

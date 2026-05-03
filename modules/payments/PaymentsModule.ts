@@ -131,11 +131,28 @@ import {
   type SubmitOutcome,
   type PollOutcome,
 } from './transfer/finalization-worker-sender';
-// Task #151 — type import only. The recipient worker is not currently
-// auto-instantiated (see `finalizationWorkerRecipient` field doc); the
-// import keeps the field's typed reference accurate so future wiring
-// only needs to add the construction path.
-import type { FinalizationWorkerRecipient } from './transfer/finalization-worker-recipient';
+// Task #151 — wired. The recipient worker is auto-instantiated in
+// initialize() with lightweight in-memory adapters (see
+// `buildDefaultFinalizationWorkerRecipient` at the bottom of this file).
+// processToken enqueues PENDING entries on the instant-mode receive
+// path; the worker drives §6.1 polling and a dispositionWriter that
+// flips local Token status to 'confirmed' once the proof lands.
+import {
+  FinalizationWorkerRecipient,
+  type FinalizationDispositionWriter,
+  type RevaluateHooksProvider,
+} from './transfer/finalization-worker-recipient';
+import {
+  FinalizationQueue,
+  entryIdFor,
+  type FinalizationQueueEntry,
+} from './transfer/finalization-queue';
+import {
+  CascadeWalker,
+  type CascadeManifestScanner,
+  type CascadeOutboxScanner,
+  type ClassifyTokenLookup,
+} from './transfer/cascade-walker';
 import { ManifestCas, type MinimalManifestStorage } from '../../profile/manifest-cas';
 import { contentHash, type ContentHash } from '../../uxf/types';
 import { isLegacyTokenTransferPayload } from '../../types/uxf-transfer';
@@ -973,6 +990,35 @@ export interface LegacyShapeAdapterRunner {
   ): Promise<void>;
 }
 
+/**
+ * Task #151 — per-tokenId finalization context stashed by the default
+ * processToken closure on instant-mode receive. Consumed by the
+ * recipient finalization worker's dispositionWriter callback to
+ * rebuild the locally-stored Token with the attached proof.
+ *
+ * Lifecycle:
+ *  - WRITE: processToken closure (instant path), once per token.
+ *  - READ:  dispositionWriter VALID branch, after the worker has
+ *           polled the aggregator and called the pool's attachProof.
+ *  - DELETE: same dispositionWriter branch on success.
+ *
+ * @internal
+ */
+interface RecipientFinalizationContext {
+  /** Local Token id (from `addToken`); used to find Bob's stored
+   *  pending Token by `this.tokens.get(localTokenId)`. */
+  readonly localTokenId: string;
+  /** SDK source token JSON (state N-1) — needed to re-run
+   *  `finalizeTransferToken` once the proof lands. */
+  readonly sourceTokenJson: unknown;
+  /** Last-tx JSON from the bundle (carries `inclusionProof: null`).
+   *  The dispositionWriter callback patches this to use the actual
+   *  proof returned by the aggregator before re-running finalization. */
+  readonly lastTxJson: Record<string, unknown>;
+  /** Aggregator request id hex used to look up the proof. */
+  readonly requestIdHex: string;
+}
+
 export interface PaymentsModuleConfig {
   /** Auto-sync after operations */
   autoSync?: boolean;
@@ -1512,6 +1558,15 @@ export class PaymentsModule {
           // Working variables updated by the finalization block.
           let tokenData: unknown = assembledJson;
           let tokenStatus: Token['status'] = 'confirmed';
+          // Task #151 — recipient finalization context, populated when
+          // hasNullProof === true so the recipient worker can rebuild
+          // the SDK Token once the proof lands and flip status →
+          // 'confirmed'.
+          let pendingFinalizationCtx: {
+            sourceTokenJson: unknown;
+            lastTxJson: Record<string, unknown>;
+            requestIdHex: string;
+          } | null = null;
 
           if (txArray.length > 0) {
             const stClient = this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined;
@@ -1573,11 +1628,48 @@ export class PaymentsModule {
                   //      the correct owner predicate).
                   //    - Store as status='pending'; oracle validation is
                   //      deferred per spec §5.3 [E] (unfinalizedCount > 0).
-                  //    The finalization worker (§5.5 / T.5.C) is responsible
-                  //    for attaching the proof and re-running [B]/[E] once
-                  //    the aggregator returns it.
+                  //    - Stash a finalization context so the recipient
+                  //      worker (Task #151) can rebuild the SDK Token
+                  //      once the aggregator returns the proof.
                   tokenData = { ...assembledJson, state: recipientState.toJSON() };
                   tokenStatus = 'pending';
+
+                  // Task #151 — derive the requestId so the recipient
+                  // worker can poll the aggregator for the proof. The
+                  // commitment is reconstructible from the lastTx data;
+                  // `TransferCommitment.fromJSON(lastTxJson)` works even
+                  // when `inclusionProof: null` because the SDK only
+                  // requires the commitment-shape fields (requestId is
+                  // computed from `(signedTx, sourceState)` per
+                  // RequestId.js).
+                  try {
+                    const commitment = await TransferCommitment.fromJSON(
+                      lastTxJson as unknown,
+                    );
+                    const reqIdBytes = commitment.requestId;
+                    const reqIdHex =
+                      reqIdBytes instanceof Uint8Array
+                        ? Array.from(reqIdBytes)
+                            .map((b) => b.toString(16).padStart(2, '0'))
+                            .join('')
+                        : (typeof (reqIdBytes as { toJSON?: () => string }).toJSON === 'function'
+                            ? (reqIdBytes as { toJSON: () => string }).toJSON()
+                            : String(reqIdBytes));
+                    pendingFinalizationCtx = {
+                      sourceTokenJson,
+                      lastTxJson,
+                      requestIdHex: reqIdHex,
+                    };
+                  } catch (commitErr) {
+                    logger.warn(
+                      'Payments',
+                      'Task #151: failed to derive requestId for instant-mode token; recipient worker will not finalize',
+                      {
+                        tokenId: tokenRoot.tokenId.slice(0, 16),
+                        err: commitErr instanceof Error ? commitErr.message : String(commitErr),
+                      },
+                    );
+                  }
                 }
               } catch (finalizeErr) {
                 // If recipient-side finalization fails unexpectedly, fall
@@ -1676,6 +1768,108 @@ export class PaymentsModule {
               'Payments',
               `UXF token received: ${token.id}, ${token.amount} ${token.symbol}`,
             );
+
+            // Task #151 — Enqueue PENDING entries for the recipient
+            // finalization worker. This is the "missing wire" fixed
+            // by #151: previously the instant-mode receive path stored
+            // the token as `'pending'` but never enqueued it for
+            // proof-attachment, so the token stayed in `'pending'`
+            // forever and re-spend phases failed with
+            // SEND_INSUFFICIENT_BALANCE.
+            //
+            // The enqueue is a best-effort fire-and-forget: a missing
+            // queue (no recipientUxf or test stub without oracle) is
+            // a no-op. The worker's processOneToken is also fire-and-
+            // forget — errors propagate through `transfer:operator-
+            // alert` events, never throw out of processToken.
+            if (
+              tokenStatus === 'pending' &&
+              pendingFinalizationCtx !== null &&
+              this._recipientFinalizationQueue !== null &&
+              this.finalizationWorkerRecipient !== null
+            ) {
+              try {
+                const tokenIdForQueue = incomingTokenId ?? token.id;
+                const pCtx = pendingFinalizationCtx;
+                const reqId = pCtx.requestIdHex;
+
+                // Stash the finalization context for the dispositionWriter
+                // VALID branch.
+                this._recipientFinalizationContext.set(tokenIdForQueue, {
+                  localTokenId: token.id,
+                  sourceTokenJson: pCtx.sourceTokenJson,
+                  lastTxJson: pCtx.lastTxJson,
+                  requestIdHex: reqId,
+                });
+
+                // Stash the resolver context so the worker's
+                // RequestContextResolver can find the (transactionHash,
+                // authenticator) pair on the §6.1 race-lost compare.
+                // The recipient never re-submits (the aggregator
+                // already has the commitment from the sender), but the
+                // resolver still needs to surface a non-null
+                // RequestContext.
+                if (!this._recipientRequestContextMap.has(reqId)) {
+                  this._recipientRequestContextMap.set(reqId, {
+                    transactionHash: reqId,
+                    authenticator: '',
+                    nextEntryRest: { status: 'valid' as const },
+                  });
+                }
+
+                const addrId = (() => {
+                  const directAddr = this.deps!.identity.directAddress;
+                  return typeof directAddr === 'string' && directAddr.length > 0
+                    ? computeAddressId(directAddr)
+                    : this.deps!.identity.chainPubkey;
+                })();
+
+                // Enqueue one entry per unfinalized tx. Today the
+                // default closure handles only the LAST tx (instant
+                // mode is K=1). Chain-mode (K>1) instant tokens are
+                // not yet exercised by this default; the entry-id
+                // composite (`${tokenId}:${txIndex}`) reserves the
+                // shape for future K>1 wiring.
+                const entry: FinalizationQueueEntry = {
+                  entryId: entryIdFor(tokenIdForQueue, txArray.length - 1),
+                  tokenId: tokenIdForQueue,
+                  bundleCid: ctx.bundleCid, // outer ctx = ProcessTokenContext
+                  txIndex: txArray.length - 1,
+                  commitmentRequestId: reqId,
+                  transactionHash: reqId,
+                  authenticator: '',
+                  submittedAt: Date.now(),
+                  createdAt: Date.now(),
+                  submitRetryCount: 0,
+                  proofErrorCount: 0,
+                  status: 'pending',
+                  source: 'received',
+                };
+                await this._recipientFinalizationQueue.add(addrId, entry);
+
+                // Fire-and-forget drive of the worker. The worker
+                // handles its own concurrency caps + per-token mutex.
+                const worker = this.finalizationWorkerRecipient;
+                void worker
+                  .processOneToken(tokenIdForQueue)
+                  .catch((werr) => {
+                    logger.debug(
+                      'Payments',
+                      `Task #151: recipient worker.processOneToken threw for ${tokenIdForQueue.slice(0, 16)}: ${werr instanceof Error ? werr.message : String(werr)}`,
+                    );
+                  });
+              } catch (enqErr) {
+                // Enqueue failure is non-fatal — the token is still
+                // stored as 'pending' and the user can re-trigger via
+                // payments.receive({ finalize: true }) on the legacy
+                // path.
+                logger.warn(
+                  'Payments',
+                  `Task #151: failed to enqueue PENDING finalization entry for ${tokenRoot.tokenId.slice(0, 16)}`,
+                  { err: enqErr instanceof Error ? enqErr.message : String(enqErr) },
+                );
+              }
+            }
           } else {
             logger.debug(
               'Payments',
@@ -1759,6 +1953,75 @@ export class PaymentsModule {
         logger.debug(
           'Payments',
           'Default FinalizationWorkerSender auto-installed (senderUxf default-on)',
+        );
+      }
+    }
+
+    // Task #151 — auto-install the recipient-side finalization worker
+    // when `recipientUxf` is on AND `finalizationWorker` is on AND no
+    // consumer has already installed one via
+    // `installFinalizationWorkerRecipient()`.
+    //
+    // The auto-installed worker uses lightweight in-memory adapters
+    // (FinalizationQueue + manifestCas + tombstones + pool + queue +
+    // stub revaluateHooks/cascadeWalker). Its dispositionWriter is
+    // wired back to PaymentsModule via the
+    // `_recipientFinalizationContext` map: when the worker writes a
+    // VALID disposition for a tokenId, PaymentsModule rebuilds the SDK
+    // Token via `finalizeTransferToken` and overwrites the locally-
+    // stored Token's sdkData + flips status to 'confirmed'.
+    //
+    // This is the minimum production-ready harness that closes the
+    // S2 e2e loop (Bob receives instant tokens → re-spends them).
+    // Bootstrap layers (Sphere) MAY override via
+    // `installFinalizationWorkerRecipient()` for a full §5.5 / §6.2
+    // implementation backed by Profile + OrbitDB.
+    //
+    // FIXME(#151): the in-memory queue + finalization context map are
+    // NOT persisted across `Sphere.destroy()` and process restart.
+    // Recovery on next launch requires either a manifest scan or an
+    // external re-trigger (operator escape-hatch). The Profile-backed
+    // FinalizationQueue (T.5.C / Wave G.7) deferred to a future wave
+    // closes this gap.
+    if (
+      this.features.recipientUxf &&
+      this.features.finalizationWorker &&
+      !this.finalizationWorkerRecipient
+    ) {
+      const aggregatorClient = this.deps!.oracle.getAggregatorClient?.();
+      if (aggregatorClient === null || aggregatorClient === undefined) {
+        logger.debug(
+          'Payments',
+          'FinalizationWorkerRecipient auto-install skipped: oracle has no getAggregatorClient()',
+        );
+      } else {
+        const directAddr = this.deps!.identity.directAddress;
+        const recipientAddressId =
+          typeof directAddr === 'string' && directAddr.length > 0
+            ? computeAddressId(directAddr)
+            : this.deps!.identity.chainPubkey;
+        const built = buildDefaultFinalizationWorkerRecipient({
+          addressId: recipientAddressId,
+          oracle: this.deps!.oracle,
+          recipientRequestContextMap: this._recipientRequestContextMap,
+          recipientFinalizationContext: this._recipientFinalizationContext,
+          tokens: this.tokens,
+          finalizeTransferToken: (sourceToken, lastTx, stClient, trustBase) =>
+            this.finalizeTransferToken(sourceToken, lastTx, stClient, trustBase),
+          getStateTransitionClient: () =>
+            this.deps!.oracle.getStateTransitionClient?.() as StateTransitionClient | undefined,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          getTrustBase: () => (this.deps!.oracle as any).getTrustBase?.(),
+          save: () => this.save(),
+          emit: (type, data) => this.deps!.emitEvent(type, data),
+          signal: this._workerAbortController.signal,
+        });
+        this._recipientFinalizationQueue = built.queue;
+        this.finalizationWorkerRecipient = built.worker;
+        this.finalizationWorkerRecipient.start();
+        logger.debug(
+          'Payments',
+          'Default FinalizationWorkerRecipient auto-installed (recipientUxf default-on)',
         );
       }
     }
@@ -1941,23 +2204,38 @@ export class PaymentsModule {
   /**
    * @internal — auto-installed FinalizationWorkerRecipient. Task #151.
    *
-   * Populated only when the bootstrap layer injects a fully-wired
-   * recipient harness via `installFinalizationWorkerRecipient()`. The
-   * default `IngestWorkerPool` processToken closure (lines ~1422-1662)
-   * does NOT enqueue pending tokens into a `FinalizationQueue` today,
-   * so even an auto-instantiated recipient worker would have no work
-   * to drive — wiring the harness end-to-end requires (a) a
-   * per-address FinalizationQueue store, (b) processToken enqueueing
-   * into it on the instant-mode pending branch, (c) dispositionWriter
-   * (T.3.C), (d) revaluateHooks (RevaluateHooksProvider), (e) the
-   * CascadeWalker. Those dependencies are NOT yet exposed at this
-   * layer, so the auto-install path remains stubbed pending the
-   * recipient-side harness wiring (deferred to a future wave that
-   * also closes task #163 on legacy-shape-adapter requireing
-   * enqueueFinalization).
+   * Auto-instantiated in `initialize()` when `recipientUxf` is on AND
+   * `finalizationWorker` is on AND no consumer-installed worker is
+   * present. The default harness uses lightweight in-memory adapters
+   * (FinalizationQueue, manifestCas, tombstones, pool, queue) plus a
+   * stub revaluateHooks that always says VALID and a custom
+   * dispositionWriter that flips the local Token's status from
+   * `'pending'` to `'confirmed'` once the proof is attached.
+   *
+   * The default harness IS NOT a complete §5.5 / §6.2 implementation:
+   *  - revaluateHooks short-circuits the [B]/[D]/[E] re-run.
+   *  - cascadeWalker is a no-op (no children scan, no NFT routing).
+   *  - manifestCas/tombstones/pool are in-memory with no replication.
+   *
+   * It IS sufficient to drive the end-to-end e2e instant-mode receive
+   * cycle: Bob's pending tokens transition to confirmed when the
+   * aggregator returns proofs, unblocking the re-spend phase.
+   *
+   * Bootstrap layers (Sphere) MAY override this default by calling
+   * `installFinalizationWorkerRecipient()` BEFORE `initialize()` (the
+   * `!this.finalizationWorkerRecipient` check preserves that contract)
+   * or AFTER `initialize()` (the install method stops the previous
+   * worker and starts the new one).
+   *
+   * TODO(#151-followup): persist the recipient queue + finalization
+   * context across restarts via ProfileTokenStorageProvider's per-
+   * entry-key layout. Today, on `Sphere.destroy()` and process restart,
+   * pending tokens stay in `_recipientFinalizationContext` only until
+   * the process exits; recovery requires a manifest scan or external
+   * re-trigger.
    *
    * See `tests/unit/payments/transfer/finalization-worker-recipient-fixtures.ts`
-   * for the full surface this worker requires.
+   * for the full production surface this worker requires.
    */
   private finalizationWorkerRecipient: FinalizationWorkerRecipient | null = null;
   /**
@@ -1992,6 +2270,49 @@ export class PaymentsModule {
    * @internal
    */
   private readonly _senderRequestContextMap: Map<string, RequestContext> = new Map();
+
+  /**
+   * Task #151 — Per-requestId context map for the recipient-side
+   * finalization worker resolver. Populated by the default processToken
+   * closure on instant-mode receive (where the bundle's last tx has
+   * `inclusionProof: null`). Mirrors {@link _senderRequestContextMap}
+   * but keyed on the bundle's commitmentRequestId.
+   *
+   * @internal
+   */
+  private readonly _recipientRequestContextMap: Map<string, RequestContext> = new Map();
+
+  /**
+   * Task #151 — Per-tokenId finalization context for the recipient
+   * worker. When processToken sees an instant-mode token (last tx has
+   * `inclusionProof: null`), it stores the source-token JSON, the last
+   * transferred-tx JSON, and the recipient predicate / state so that
+   * once the proof lands the worker can rebuild a fully-finalized SDK
+   * Token via {@link finalizeTransferToken} and overwrite the locally-
+   * stored Token with `status: 'confirmed'` so subsequent re-spend
+   * paths can pick it up.
+   *
+   * **In-memory only** — TODO(#151-followup): persist across restarts
+   * by wiring through ProfileTokenStorageProvider's per-entry-key layout
+   * so a wallet that crashes mid-finalization recovers the queue +
+   * context on next launch.
+   *
+   * @internal
+   */
+  private readonly _recipientFinalizationContext: Map<
+    string,
+    RecipientFinalizationContext
+  > = new Map();
+
+  /**
+   * Task #151 — In-memory FinalizationQueue used by the auto-installed
+   * recipient worker. Wired through `buildDefaultFinalizationWorkerRecipient`
+   * to a Map-backed storage adapter. See `_recipientFinalizationContext`
+   * for the persistence caveat (in-memory only).
+   *
+   * @internal
+   */
+  private _recipientFinalizationQueue: FinalizationQueue | null = null;
 
   /**
    * Install the operator inclusion-proof importer (T.5.D, §6.3 escape
@@ -2296,16 +2617,18 @@ export class PaymentsModule {
       void this.finalizationWorkerSender.stop().catch(() => undefined);
       this.finalizationWorkerSender = null;
     }
-    // Task #151 — stop the recipient-side finalization worker if one was
-    // installed. Fire-and-forget; mirrors the sender path. NULL today
-    // (no auto-install path; bootstrap-injected only).
+    // Task #151 — stop the recipient-side finalization worker.
+    // Fire-and-forget; mirrors the sender path.
     if (this.finalizationWorkerRecipient) {
       void this.finalizationWorkerRecipient.stop().catch(() => undefined);
       this.finalizationWorkerRecipient = null;
     }
+    this._recipientFinalizationQueue = null;
     // Clear in-memory outbox and context maps (no persistent side-effects).
     this._senderOutboxMap.clear();
     this._senderRequestContextMap.clear();
+    this._recipientRequestContextMap.clear();
+    this._recipientFinalizationContext.clear();
   }
 
   // ===========================================================================
@@ -9310,6 +9633,430 @@ export function buildDefaultFinalizationWorkerSender(opts: {
     // above also respects the signal for pending timers.
     ...(signal !== undefined ? { signal } : {}),
   });
+}
+
+// =============================================================================
+// Task #151 — Default FinalizationWorkerRecipient factory
+// =============================================================================
+
+/**
+ * Build the default auto-installed {@link FinalizationWorkerRecipient}
+ * for {@link PaymentsModule.initialize}.
+ *
+ * Uses lightweight in-memory adapters for the
+ * pool/manifest/tombstone/queue 4-step write order (no OrbitDB
+ * required). Sufficient to drive the §6.1 cycle to completion and
+ * flip Bob's pending tokens to confirmed once the proof lands.
+ *
+ * Bypasses the full §5.5 step 9 [B]/[D]/[E] re-evaluation: the
+ * stub revaluateHooks build always says VALID. The real production
+ * harness (bootstrap-injected) plugs in proper hydrateChain /
+ * evaluatePredicate / oracleIsSpent against the local manifest.
+ *
+ * The dispositionWriter callback is the load-bearing path: when the
+ * worker writes a VALID disposition (which our stub revaluator
+ * always does on success), the callback rebuilds the SDK Token via
+ * `finalizeTransferToken`, overwrites the locally-stored Token's
+ * sdkData, and flips status to `'confirmed'`.
+ *
+ * @internal — exported only for unit-test access.
+ */
+export function buildDefaultFinalizationWorkerRecipient(opts: {
+  readonly addressId: string;
+  readonly oracle: import('../../oracle').OracleProvider;
+  readonly recipientRequestContextMap: Map<string, RequestContext>;
+  readonly recipientFinalizationContext: Map<string, RecipientFinalizationContext>;
+  readonly tokens: Map<string, Token>;
+  readonly finalizeTransferToken: (
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sourceToken: SdkToken<any>,
+    transferTx: TransferTransaction,
+    stClient: StateTransitionClient,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    trustBase: any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ) => Promise<SdkToken<any>>;
+  readonly getStateTransitionClient: () => StateTransitionClient | undefined;
+  readonly getTrustBase: () => unknown;
+  readonly save: () => Promise<void>;
+  readonly emit: <T extends import('../../types').SphereEventType>(
+    type: T,
+    data: import('../../types').SphereEventMap[T],
+  ) => void;
+  readonly signal?: AbortSignal;
+}): { worker: FinalizationWorkerRecipient; queue: FinalizationQueue } {
+  const {
+    addressId,
+    oracle,
+    recipientRequestContextMap,
+    recipientFinalizationContext,
+    tokens,
+    finalizeTransferToken,
+    getStateTransitionClient,
+    getTrustBase,
+    save,
+    emit,
+    signal,
+  } = opts;
+
+  // ---- In-memory FinalizationQueue (T.5.C / Wave G.7 stub) -----------
+  const queueMap = new Map<string, string>();
+  const queueStorage = {
+    async readKey(key: string): Promise<string | null> {
+      return queueMap.has(key) ? (queueMap.get(key) ?? null) : null;
+    },
+    async writeKey(key: string, value: string): Promise<void> {
+      queueMap.set(key, value);
+    },
+    async listByPrefix(prefix: string): Promise<Map<string, string>> {
+      const out = new Map<string, string>();
+      for (const [k] of queueMap) {
+        if (k.startsWith(prefix)) out.set(k, k.slice(prefix.length));
+      }
+      return out;
+    },
+    async deleteKey(key: string): Promise<void> {
+      queueMap.delete(key);
+    },
+  };
+  const queue = new FinalizationQueue({ storage: queueStorage });
+
+  const queueAdapter = {
+    async hasEntry(addr: string, requestId: string): Promise<boolean> {
+      return queue.hasEntry(addr, requestId);
+    },
+    async removeEntry(addr: string, requestId: string): Promise<void> {
+      await queue.remove(addr, requestId);
+    },
+  };
+
+  // ---- Resolver: pulls per-requestId context populated at enqueue ----
+  const resolver: RequestContextResolver = {
+    async resolve(input) {
+      return recipientRequestContextMap.get(input.requestId) ?? null;
+    },
+  };
+
+  // ---- Pool / poolRead — track attached proofs per (tokenId, reqId) --
+  const proofAttached = new Set<string>();
+  const poolProofs = new Map<
+    string,
+    import('./transfer/finalization-worker-base').AnchoredProofDescriptor
+  >();
+  const pool = {
+    async isProofAttached(tokenId: string, reqId: string): Promise<boolean> {
+      return proofAttached.has(`${tokenId}:${reqId}`);
+    },
+    async attachProof(tokenId: string, reqId: string): Promise<void> {
+      proofAttached.add(`${tokenId}:${reqId}`);
+    },
+  };
+  const poolRead = {
+    async getAttachedProof(
+      tokenId: string,
+      reqId: string,
+    ): Promise<
+      import('./transfer/finalization-worker-base').AnchoredProofDescriptor | null
+    > {
+      return poolProofs.get(`${tokenId}:${reqId}`) ?? null;
+    },
+  };
+
+  // ---- ManifestCas + tombstones — in-memory ---------------------------
+  const manifestEntries = new Map<
+    string,
+    import('../../profile/token-manifest').TokenManifestEntry
+  >();
+  const manifestStorage: MinimalManifestStorage = {
+    async readEntry(addr, tokenId) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async writeEntry(addr, tokenId, entry) {
+      manifestEntries.set(`${addr}:${tokenId}`, entry);
+    },
+  };
+  const manifestCas = new ManifestCas(manifestStorage);
+  const placeholderRootHash = contentHash('00'.repeat(32));
+
+  const tombstoneSet = new Set<string>();
+  const tombstones = {
+    async hasTombstone(tokenId: string, cid: ContentHash): Promise<boolean> {
+      return tombstoneSet.has(`${tokenId}:${cid}`);
+    },
+    async insertTombstone(tokenId: string, cid: ContentHash): Promise<void> {
+      tombstoneSet.add(`${tokenId}:${cid}`);
+    },
+  };
+
+  // ---- Aggregator client ---------------------------------------------
+  const aggregatorClient = {
+    async submit(_input: {
+      readonly addressId: string;
+      readonly tokenId: string;
+      readonly requestId: string;
+      readonly signedTx: unknown;
+    }): Promise<SubmitOutcome> {
+      return { kind: 'REQUEST_ID_EXISTS' };
+    },
+    async poll(input: {
+      readonly addressId: string;
+      readonly tokenId: string;
+      readonly requestId: string;
+      readonly signedTx: unknown;
+    }): Promise<PollOutcome> {
+      try {
+        const proof = await oracle.getProof(input.requestId);
+        if (proof === null || proof === undefined) {
+          return { kind: 'TRANSIENT' };
+        }
+        const proofJson = proof.proof as
+          | { transactionHash?: string | null; authenticator?: unknown }
+          | null
+          | undefined;
+        const proofTxHash =
+          proofJson !== null && proofJson !== undefined && typeof proofJson.transactionHash === 'string'
+            ? proofJson.transactionHash
+            : null;
+        const proofAuthenticator =
+          proofJson !== null && proofJson !== undefined && proofJson.authenticator !== undefined && proofJson.authenticator !== null
+            ? JSON.stringify(proofJson.authenticator)
+            : '';
+        const descriptor: import('./transfer/finalization-worker-base').AnchoredProofDescriptor = {
+          transactionHash: proofTxHash ?? proof.requestId,
+          authenticator: proofAuthenticator,
+          roundNumber: proof.roundNumber,
+          proof: proof.proof,
+        };
+        poolProofs.set(`${input.tokenId}:${input.requestId}`, descriptor);
+        if (!manifestEntries.has(`${addressId}:${input.tokenId}`)) {
+          manifestEntries.set(`${addressId}:${input.tokenId}`, {
+            rootHash: placeholderRootHash,
+            status: 'pending',
+          });
+        }
+        const newCid = contentHash(
+          input.requestId.replace(/[^0-9a-f]/gi, '').padStart(64, '0').slice(0, 64),
+        );
+        return { kind: 'OK', proof: descriptor, newCid };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { kind: 'TRANSIENT', error: `oracle.getProof threw: ${message}` };
+      }
+    },
+  };
+
+  // ---- Per-token semaphores + per-token mutex ------------------------
+  const perTokenSemaphores = new Map<string, CountingSemaphore>();
+  const getPerTokenSemaphore = (tokenId: string): CountingSemaphore => {
+    let sem = perTokenSemaphores.get(tokenId);
+    if (sem === undefined) {
+      sem = new CountingSemaphore(4);
+      perTokenSemaphores.set(tokenId, sem);
+    }
+    return sem;
+  };
+  const perTokenMutex = new PerTokenMutex();
+
+  // ---- Stub CascadeWalker (no children scan, no NFT routing) ---------
+  const cascadeManifestScanner: CascadeManifestScanner = {
+    async readEntry(addr, tokenId) {
+      return manifestEntries.get(`${addr}:${tokenId}`);
+    },
+    async findChildren(_addr, _parentTokenId) {
+      return [];
+    },
+  };
+  const cascadeOutboxScanner: CascadeOutboxScanner = {
+    async findEntriesByTokenId() {
+      return [];
+    },
+  };
+  const classifyTokenLookup: ClassifyTokenLookup = async () => null;
+  const cascadeWalker = new CascadeWalker({
+    manifestScanner: cascadeManifestScanner,
+    manifestCas,
+    outboxScanner: cascadeOutboxScanner,
+    classifyToken: classifyTokenLookup,
+    emit,
+  });
+
+  // ---- Stub revaluateHooks (always VALID) ----------------------------
+  const ourPubkey = new Uint8Array(33);
+  ourPubkey[0] = 0x02;
+  const revaluateHooks: RevaluateHooksProvider = {
+    async buildRevaluateInput(_addr, tokenId) {
+      const newHead = contentHash(('11'.repeat(32)).slice(0, 64));
+      return {
+        tokenRootHash: newHead,
+        pool: new Map(),
+        bundleCidForProvenance: 'task-151-stub',
+        senderTransportPubkeyForProvenance: '',
+        ourPubkey,
+        async hydrateChain() {
+          return {
+            tokenId,
+            tokenRootHash: newHead,
+            chain: [
+              {
+                sourceState: 's0',
+                destinationState: 's1',
+                authenticator: { stub: true },
+                transactionHash: { stub: true },
+                inclusionProof: { stub: true },
+                requestId: { stub: true },
+              },
+            ],
+            currentStatePredicate: { stub: true },
+            currentDestinationStateHash: 'stub-state-head',
+          };
+        },
+        async readLocalManifest() {
+          return undefined;
+        },
+        async evaluatePredicate() {
+          return { ok: true, bindsToUs: true };
+        },
+        async oracleIsSpent() {
+          return false;
+        },
+      };
+    },
+  };
+
+  // ---- DispositionWriter — load-bearing finalization callback --------
+  const dispositionWriter: FinalizationDispositionWriter = {
+    async write(_addr, record) {
+      if (record.disposition !== 'VALID') {
+        return;
+      }
+      const tokenId = record.tokenId;
+      const ctx = recipientFinalizationContext.get(tokenId);
+      if (ctx === undefined) {
+        logger.debug(
+          'Payments',
+          `Task #151: VALID disposition for ${tokenId.slice(0, 16)} but no finalization context`,
+        );
+        return;
+      }
+      try {
+        const proof = await oracle.getProof(ctx.requestIdHex);
+        if (proof === null || proof === undefined) {
+          logger.warn(
+            'Payments',
+            `Task #151: dispositionWriter VALID but oracle.getProof returned null for ${tokenId.slice(0, 16)}`,
+          );
+          return;
+        }
+        const patchedLastTxJson = {
+          ...ctx.lastTxJson,
+          inclusionProof: proof.proof,
+        };
+        const stClient = getStateTransitionClient();
+        const trustBase = getTrustBase();
+        if (stClient === undefined || trustBase === null || trustBase === undefined) {
+          logger.warn(
+            'Payments',
+            `Task #151: dispositionWriter VALID but stClient/trustBase missing for ${tokenId.slice(0, 16)} — falling back to status flip without re-finalization`,
+          );
+          const stored = tokens.get(ctx.localTokenId);
+          if (stored !== undefined && stored.status === 'pending') {
+            const updatedFallback: Token = {
+              ...stored,
+              status: 'confirmed',
+              updatedAt: Date.now(),
+            };
+            tokens.set(ctx.localTokenId, updatedFallback);
+            recipientFinalizationContext.delete(tokenId);
+            try {
+              await save();
+            } catch (saveErr) {
+              logger.warn(
+                'Payments',
+                `Task #151: save() after status flip threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`,
+              );
+            }
+          }
+          return;
+        }
+        const lastTx = await TransferTransaction.fromJSON(patchedLastTxJson);
+        const sourceToken = await SdkToken.fromJSON(ctx.sourceTokenJson);
+        const finalizedToken = await finalizeTransferToken(
+          sourceToken,
+          lastTx,
+          stClient,
+          trustBase,
+        );
+        const stored = tokens.get(ctx.localTokenId);
+        if (stored === undefined) {
+          logger.debug(
+            'Payments',
+            `Task #151: local Token ${ctx.localTokenId.slice(0, 16)} disappeared before finalization`,
+          );
+          return;
+        }
+        const updated: Token = {
+          ...stored,
+          sdkData: JSON.stringify(finalizedToken.toJSON()),
+          status: 'confirmed',
+          updatedAt: Date.now(),
+        };
+        tokens.set(ctx.localTokenId, updated);
+        try {
+          await save();
+        } catch (saveErr) {
+          logger.warn(
+            'Payments',
+            `Task #151: save() after finalization threw: ${saveErr instanceof Error ? saveErr.message : String(saveErr)}`,
+          );
+        }
+        recipientFinalizationContext.delete(tokenId);
+        logger.debug(
+          'Payments',
+          `Task #151: token ${ctx.localTokenId.slice(0, 16)} finalized via recipient worker`,
+        );
+      } catch (err) {
+        logger.warn(
+          'Payments',
+          `Task #151: dispositionWriter finalization failed for ${tokenId.slice(0, 16)}`,
+          { err: err instanceof Error ? err.message : String(err) },
+        );
+      }
+    },
+  };
+
+  const worker = new FinalizationWorkerRecipient({
+    addressId,
+    queueStore: queue,
+    queueAdapter,
+    aggregator: aggregatorClient,
+    resolver,
+    pool,
+    poolRead,
+    manifestCas,
+    tombstones,
+    getPerTokenSemaphore,
+    perTokenMutex,
+    cascadeWalker,
+    dispositionWriter,
+    revaluateHooks,
+    emit,
+    now: () => Date.now(),
+    sleep: (ms: number, abortSignal?: AbortSignal) =>
+      new Promise<void>((resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(new Error('aborted'));
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        abortSignal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('aborted'));
+        });
+      }),
+    ...(signal !== undefined ? { signal } : {}),
+  });
+
+  return { worker, queue };
 }
 
 // =============================================================================

@@ -761,6 +761,37 @@ export interface SphereEventMap {
     readonly bundleCid: string;
     readonly recipientTransportPubkey: string;
     readonly reason: import('./disposition').DispositionReason;
+    /**
+     * Outbox entry's transfer mode at cascade time.
+     *
+     * - `'instant'` (the default when omitted) — the live finalization
+     *   path. Receiver-side reconciliation may still recover (e.g. via
+     *   `revalidateCascadedChildren()`).
+     * - `'conservative'` / `'txf'` — shipped via the eager-finalization
+     *   path: the bundle was committed before publish, so the source
+     *   token is now forensically irrecoverable for the recipient.
+     *   Sender-side UI MUST surface this as a hard error (the user
+     *   thought the transfer succeeded; the cascade just told us it
+     *   silently failed).
+     *
+     * **NFT class implication.** NFTs preserve their `tokenId` across
+     * transfers — no `splitParent` walk recovers them. A conservative
+     * NFT cascade is therefore the canonical "lost-NFT" signal; the UI
+     * should treat it as terminal and prompt the operator to contact
+     * the recipient out-of-band.
+     */
+    readonly mode?: 'instant' | 'conservative' | 'txf';
+    /**
+     * `true` iff this cascade-failed event corresponds to a non-instant
+     * outbox entry that the historic walker would have silently dropped.
+     * UI consumers MUST render `silent: true` events as hard errors
+     * (with copy distinct from instant-mode cascade-failed) — see the
+     * `mode` field for the rationale.
+     *
+     * Omitted (treated as `false`) when the event came from an instant-
+     * mode entry.
+     */
+    readonly silent?: boolean;
   };
   /**
    * UXF Inter-Wallet Transfer T.5.B / T.5.C / T.5.F — trustBase

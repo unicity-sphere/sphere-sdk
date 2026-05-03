@@ -238,7 +238,13 @@ describe('§6.1.1 cascade — coin-class splitParent walk', () => {
     expect(outboxIdsEmitted).toEqual(['ob-c1', 'ob-c2']);
   });
 
-  it('skips outbox entries whose mode is not instant (cascade only fires on instant)', async () => {
+  it('emits cascade-failed for non-instant outbox entries with silent:true (issue #167)', async () => {
+    // Issue #167: historic behaviour silently dropped cascade-failed
+    // events for non-instant outbox entries, leaving the recipient with
+    // no signal that a forensically irrecoverable transfer happened.
+    // The new contract: emit the event for ALL non-finalized/non-expired
+    // entries; non-instant entries get `silent: true` and `mode: <mode>`
+    // discriminators so UI can render a hard-error path.
     const PARENT = 'p';
     const CHILD = 'c';
 
@@ -288,11 +294,29 @@ describe('§6.1.1 cascade — coin-class splitParent walk', () => {
     );
 
     expect(result.cascaded).toBe(1);
-    expect(result.outboxNotified).toBe(1); // only the instant entry
-    const ids = harness.events.events
-      .filter((e) => e.type === 'transfer:cascade-failed')
-      .map((e) => (e.data as { outboxId: string }).outboxId);
-    expect(ids).toEqual(['ob-instant']);
+    expect(result.outboxNotified).toBe(2); // BOTH entries notified
+    expect(result.silentNotified).toBe(1); // conservative is silent
+
+    const cascadeEvents = harness.events.events.filter(
+      (e) => e.type === 'transfer:cascade-failed',
+    );
+    expect(cascadeEvents).toHaveLength(2);
+
+    const byId = new Map<string, { mode?: string; silent?: boolean }>();
+    for (const e of cascadeEvents) {
+      const data = e.data as {
+        readonly outboxId: string;
+        readonly mode?: string;
+        readonly silent?: boolean;
+      };
+      byId.set(data.outboxId, { mode: data.mode, silent: data.silent });
+    }
+
+    expect(byId.get('ob-instant')).toEqual({ mode: 'instant', silent: undefined });
+    expect(byId.get('ob-conservative')).toEqual({
+      mode: 'conservative',
+      silent: true,
+    });
   });
 
   it('idempotency: running cascade twice does not double-count or re-write', async () => {

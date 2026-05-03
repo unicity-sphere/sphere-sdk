@@ -518,3 +518,176 @@ describe('FinalizationWorkerRecipient — validation', () => {
     ).toThrow();
   });
 });
+
+// =============================================================================
+// scanLoop production scheduler (#168)
+// =============================================================================
+
+function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const tick = (): void => {
+      if (predicate()) return resolve();
+      if (Date.now() - start > timeoutMs) {
+        return reject(new Error('waitFor timed out'));
+      }
+      setTimeout(tick, 5);
+    };
+    tick();
+  });
+}
+
+/**
+ * Real-yielding sleep so the scan loop's `safeSleep(0)` cooperative
+ * yield actually gives the event loop a turn — required for `await
+ * setTimeout` macrotasks (waitFor's polling, test deadlines) to fire.
+ * `async () => undefined` is microtask-only and starves the loop into a
+ * tight spin.
+ */
+const yieldingSleep = (ms: number): Promise<void> =>
+  new Promise((r) => setTimeout(r, Math.min(ms, 5)));
+
+describe('FinalizationWorkerRecipient — scanLoop (#168)', () => {
+  it('processes a queued token within scanIntervalMs', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const entry = makeQueueEntry();
+    await seedQueue(harness, [entry]);
+
+    const processedTokenIds: string[] = [];
+    const original = harness.worker.processOneToken.bind(harness.worker);
+    harness.worker.processOneToken = async (id) => {
+      processedTokenIds.push(id);
+      return original(id);
+    };
+
+    harness.worker.start();
+    try {
+      await waitFor(() => processedTokenIds.includes(TOKEN_ID), 2000);
+      expect(processedTokenIds).toContain(TOKEN_ID);
+    } finally {
+      await harness.worker.stop();
+    }
+  });
+
+  it('processes ten tokens', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const entries = [];
+    for (let i = 0; i < 10; i++) {
+      entries.push(
+        makeQueueEntry({
+          tokenId: `token-${i}`,
+          entryId: entryIdFor(`token-${i}`, 0),
+          commitmentRequestId: `req-${i}`,
+        }),
+      );
+    }
+    await seedQueue(harness, entries);
+
+    const processedTokenIds = new Set<string>();
+    const original = harness.worker.processOneToken.bind(harness.worker);
+    harness.worker.processOneToken = async (id) => {
+      processedTokenIds.add(id);
+      return original(id);
+    };
+
+    harness.worker.start();
+    try {
+      await waitFor(() => processedTokenIds.size === 10, 3000);
+      expect(processedTokenIds.size).toBe(10);
+    } finally {
+      await harness.worker.stop();
+    }
+  });
+
+  it('continues on processOneToken throw — other tokens still process', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const entries = [
+      makeQueueEntry({
+        tokenId: 'token-throw',
+        entryId: entryIdFor('token-throw', 0),
+        commitmentRequestId: 'req-throw',
+      }),
+      makeQueueEntry({
+        tokenId: 'token-ok-1',
+        entryId: entryIdFor('token-ok-1', 0),
+        commitmentRequestId: 'req-ok-1',
+      }),
+      makeQueueEntry({
+        tokenId: 'token-ok-2',
+        entryId: entryIdFor('token-ok-2', 0),
+        commitmentRequestId: 'req-ok-2',
+      }),
+    ];
+    await seedQueue(harness, entries);
+
+    const processedTokenIds = new Set<string>();
+    const original = harness.worker.processOneToken.bind(harness.worker);
+    harness.worker.processOneToken = async (id) => {
+      processedTokenIds.add(id);
+      if (id === 'token-throw') throw new Error('synthetic');
+      return original(id);
+    };
+
+    harness.worker.start();
+    try {
+      await waitFor(
+        () =>
+          processedTokenIds.has('token-ok-1') &&
+          processedTokenIds.has('token-ok-2'),
+        3000,
+      );
+      expect(processedTokenIds.has('token-ok-1')).toBe(true);
+      expect(processedTokenIds.has('token-ok-2')).toBe(true);
+      expect(processedTokenIds.has('token-throw')).toBe(true);
+      const alerts = harness.events.events.filter(
+        (e) => e.type === 'transfer:operator-alert',
+      );
+      expect(alerts.length).toBeGreaterThan(0);
+    } finally {
+      await harness.worker.stop();
+    }
+  });
+
+  it('stop() during scan exits cleanly', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const entry = makeQueueEntry();
+    await seedQueue(harness, [entry]);
+
+    harness.worker.start();
+    expect(harness.worker.isRunning()).toBe(true);
+    const start = Date.now();
+    await harness.worker.stop();
+    const elapsed = Date.now() - start;
+    expect(harness.worker.isRunning()).toBe(false);
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  it('default loop drives processOneToken (manualScan: false default)', async () => {
+    const harness = buildWorker({ sleepFn: yieldingSleep });
+    const entry = makeQueueEntry();
+    await seedQueue(harness, [entry]);
+
+    const processedTokenIds: string[] = [];
+    const original = harness.worker.processOneToken.bind(harness.worker);
+    harness.worker.processOneToken = async (id) => {
+      processedTokenIds.push(id);
+      return original(id);
+    };
+
+    harness.worker.start();
+    try {
+      await waitFor(() => processedTokenIds.length > 0, 2000);
+      expect(processedTokenIds.length).toBeGreaterThan(0);
+    } finally {
+      await harness.worker.stop();
+    }
+  });
+});
+
+// Suppress unused-import warnings for this block.
+void NEW_CID;
+void RACE_TX_HASH;
+void makeFakeAggregator;
+void makeFakePoolRead;
+void makeProof;
+

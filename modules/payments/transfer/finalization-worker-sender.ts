@@ -68,7 +68,6 @@ import {
 } from './limits';
 import {
   validatePollingPolicy,
-  getBackoffMs,
   MIN_POLL_ATTEMPTS,
 } from './polling-policy';
 import { getAggregatorSemaphore } from './aggregator-semaphores';
@@ -156,6 +155,13 @@ export interface FinalizationOutboxWriter {
     id: string,
     mutator: (prev: UxfTransferOutboxEntry) => UxfTransferOutboxEntry,
   ): Promise<UxfTransferOutboxEntry>;
+  /**
+   * Optional: enumerate all outbox entries for the scan loop (#168).
+   * Production wires this to {@link OutboxWriter.readAllNew}; tests
+   * that drive `processOne()` directly may omit it (the scan loop
+   * then becomes a no-op-sleep stub).
+   */
+  readAllNew?(): Promise<ReadonlyArray<UxfTransferOutboxEntry>>;
 }
 
 // =============================================================================
@@ -256,6 +262,35 @@ export interface FinalizationWorkerSenderOptions {
   /** Optional override of the §6.1 caps. */
   readonly caps?: FinalizationWorkerCaps;
   /**
+   * Scan-loop tick interval (ms). On every iteration the worker:
+   *  1. Reads all outbox entries via `outbox.readAllNew()` (skipped
+   *     when the writer doesn't expose it).
+   *  2. Filters those at `'delivered-instant'` / `'finalizing'`.
+   *  3. Calls {@link processOne} for each, isolated by per-entry
+   *     try/catch.
+   *  4. If at least one entry was processed, immediately re-scans
+   *     (no sleep) — drains backlogs without latency.
+   *  5. Otherwise, sleeps `scanIntervalMs` before the next pass.
+   *
+   * Default: 30_000 (30 seconds). Tests typically override down to
+   * a small value (e.g. 1ms) to exercise the loop deterministically.
+   */
+  readonly scanIntervalMs?: number;
+  /**
+   * Cap on entries processed per scan cycle before yielding for a
+   * sleep. Defaults to 100 — protects against CPU pegging when the
+   * outbox holds an enormous backlog. After the cap is hit the loop
+   * sleeps `scanIntervalMs` before re-entering.
+   */
+  readonly maxEntriesPerScan?: number;
+  /**
+   * Opt-out: when `true`, `start()` activates a stub scan loop (sleep-
+   * only, identical to the pre-#168 behavior). Useful for tests that
+   * probe `isRunning()` without driving real work. Default `false` —
+   * production wires the real scan loop.
+   */
+  readonly manualScan?: boolean;
+  /**
    * Optional cancellation signal. The worker honors `signal.aborted`
    * between aggregator calls and aborts in-flight aggregator calls
    * via the same signal.
@@ -339,9 +374,17 @@ export class FinalizationWorkerSender {
   private readonly perTokenMutexStrategy: 'cas' | 'rpc-release' | 'bounded-hold';
   private readonly aggregatorId: string;
   private readonly trustBaseStaleness: TrustBaseStaleness | undefined;
+  private readonly scanIntervalMs: number;
+  private readonly maxEntriesPerScan: number;
+  private readonly manualScan: boolean;
   private running = false;
   private stopRequested = false;
   private loopPromise: Promise<void> | null = null;
+  /** In-flight `processOne` invocations, keyed by outbox id. The scan
+   *  loop skips entries already being driven so an external caller
+   *  (e.g. PaymentsModule's synchronous send path at line ~7556) and
+   *  the loop don't race the same entry through `processOne`. */
+  private readonly inFlight: Set<string> = new Set();
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6
@@ -381,6 +424,27 @@ export class FinalizationWorkerSender {
     this.perTokenMutexStrategy =
       options.perTokenMutexStrategy ?? 'cas';
     this.trustBaseStaleness = options.trustBaseStaleness;
+    this.scanIntervalMs = options.scanIntervalMs ?? 30_000;
+    this.maxEntriesPerScan = options.maxEntriesPerScan ?? 100;
+    this.manualScan = options.manualScan ?? false;
+    if (
+      !Number.isFinite(this.scanIntervalMs) ||
+      this.scanIntervalMs <= 0
+    ) {
+      throw new SphereError(
+        `FinalizationWorkerSender: scanIntervalMs must be > 0; got ${this.scanIntervalMs}`,
+        'VALIDATION_ERROR',
+      );
+    }
+    if (
+      !Number.isFinite(this.maxEntriesPerScan) ||
+      this.maxEntriesPerScan <= 0
+    ) {
+      throw new SphereError(
+        `FinalizationWorkerSender: maxEntriesPerScan must be > 0; got ${this.maxEntriesPerScan}`,
+        'VALIDATION_ERROR',
+      );
+    }
 
     if (
       !Number.isFinite(this.perAggregator) ||
@@ -448,6 +512,36 @@ export class FinalizationWorkerSender {
    *       `transfer:cascade-failed` per (tokenId × outboxId).
    */
   async processOne(
+    entry: UxfTransferOutboxEntry,
+  ): Promise<ProcessOneResult> {
+    // De-dup against the scan loop. If another caller (loop OR
+    // external) is mid-flight on this id, return a "in-progress"
+    // sentinel so we don't double-process. The peer-mutate guard
+    // inside the per-id flow (status check + writer self-loop) is
+    // resilient to interleaving but spending two semaphore-budgets
+    // on the same outbox id wastes headroom.
+    if (this.inFlight.has(entry.id)) {
+      return {
+        outboxId: entry.id,
+        tokenIds: entry.tokenIds,
+        successCount: 0,
+        hardFailCount: 0,
+        cascadeFailedEmitted: false,
+        terminal: 'in-progress',
+      };
+    }
+    this.inFlight.add(entry.id);
+    try {
+      return await this.processOneLocked(entry);
+    } finally {
+      this.inFlight.delete(entry.id);
+    }
+  }
+
+  /** Internal worker for {@link processOne}. The wrapper guards against
+   *  double-processing via {@link inFlight}; this method assumes the
+   *  caller has already taken that slot. */
+  private async processOneLocked(
     entry: UxfTransferOutboxEntry,
   ): Promise<ProcessOneResult> {
     // Refresh the entry from the writer to read the canonical lamport.
@@ -800,36 +894,109 @@ export class FinalizationWorkerSender {
   // ===========================================================================
 
   /**
-   * Long-running scan loop. Each iteration:
-   *  1. Reads all outbox entries via the writer's `readAllNew()` —
-   *     skipping legacy shapes.
+   * Long-running scan loop (#168 production scheduler). Each iteration:
+   *  1. Reads all outbox entries via the writer's `readAllNew()`. If
+   *     the writer doesn't expose it (narrow test surface), the loop
+   *     degrades to a sleep-only stub so `start()`/`stop()` lifecycle
+   *     tests still pass.
    *  2. Filters entries with `status === 'delivered-instant'` (or
-   *     `'finalizing'` from a previously interrupted iteration).
-   *  3. For each entry, calls {@link processOne}.
-   *  4. Sleeps for one backoff interval before the next iteration.
+   *     `'finalizing'` from a previously interrupted iteration) AND
+   *     not currently in {@link inFlight}.
+   *  3. For each entry up to `maxEntriesPerScan`, calls
+   *     {@link processOne} with per-entry try/catch — one bad entry
+   *     can't poison the whole worker.
+   *  4. If at least one entry was processed, immediately re-scans
+   *     (no sleep) — drains backlogs without latency.
+   *  5. Otherwise sleeps `scanIntervalMs` before the next pass.
    *
    * Loop terminates when {@link stop} is called or the construction-
-   * supplied `signal` aborts. All errors thrown by `processOne` are
-   * caught + logged via emit; the loop is intentionally fail-safe so
-   * one bad entry can't poison the whole worker.
+   * supplied `signal` aborts.
    *
    * @internal
    */
   private async scanLoop(): Promise<void> {
     while (!this.stopRequested && this.options.signal?.aborted !== true) {
-      try {
-        // Read entries via the writer; production wires a thin wrapper
-        // that calls `outboxWriter.readAllNew()`. Because the
-        // `FinalizationOutboxWriter` interface is intentionally narrow
-        // (`readOne` + `update`), the scan loop is a stub — production
-        // tests `processOne` directly via {@link processOne}.
-        // The full scan-loop is exercised by integration tests at
-        // T.8.E; here we sleep then iterate so the worker stays alive
-        // for tests that probe `isRunning()`.
-        await this.options.sleep(getBackoffMs(0), this.options.signal);
-      } catch {
-        // Sleep aborts via signal — fall through to loop check.
+      // Manual-scan opt-out OR writer doesn't expose readAllNew →
+      // fall back to the pre-#168 sleep-only stub so
+      // `start()`/`stop()`/`isRunning()` lifecycle tests keep working.
+      const readAllNew = this.options.outbox.readAllNew;
+      if (this.manualScan || typeof readAllNew !== 'function') {
+        await this.safeSleep(this.scanIntervalMs);
+        continue;
       }
+
+      let processed = 0;
+      try {
+        const all = await readAllNew.call(this.options.outbox);
+        // Filter to entries the worker should drive. `delivered-instant`
+        // is the default arrival state for instant-mode sends;
+        // `finalizing` is the in-progress state we recover after a
+        // crash mid-`processOne`.
+        const candidates: UxfTransferOutboxEntry[] = [];
+        for (const e of all) {
+          if (e.status !== 'delivered-instant' && e.status !== 'finalizing') {
+            continue;
+          }
+          if (this.inFlight.has(e.id)) continue;
+          candidates.push(e);
+          if (candidates.length >= this.maxEntriesPerScan) break;
+        }
+
+        for (const entry of candidates) {
+          if (this.stopRequested) break;
+          if (this.options.signal?.aborted) break;
+          try {
+            await this.processOne(entry);
+            processed += 1;
+          } catch (err) {
+            // processOne's surface is total-by-design (Promise.allSettled
+            // inside). A throw here is genuinely unexpected; emit a
+            // forensic alert and continue with the next entry — the
+            // loop is the safety net for crashes, not a perpetuator.
+            const msg = err instanceof Error ? err.message : String(err);
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              message: `FinalizationWorkerSender.scanLoop: processOne threw for outbox=${entry.id}: ${msg}`,
+            });
+          }
+        }
+      } catch (err) {
+        // readAllNew failure — emit and back off. The next pass retries
+        // the read.
+        const msg = err instanceof Error ? err.message : String(err);
+        this.options.emit('transfer:operator-alert', {
+          code: 'structural',
+          message: `FinalizationWorkerSender.scanLoop: readAllNew threw: ${msg}`,
+        });
+      }
+
+      if (processed === 0) {
+        // No work this cycle → sleep the full interval. Backlog drains
+        // (processed > 0) re-enter immediately.
+        await this.safeSleep(this.scanIntervalMs);
+      } else {
+        // Cooperative yield so other tasks get a turn even when the
+        // backlog never empties. Keeps the loop fair without adding
+        // throughput latency.
+        await this.safeSleep(0);
+      }
+    }
+  }
+
+  /**
+   * Wrap `options.sleep` so abort exceptions don't escape the loop.
+   * The worker's signal contract is "abort terminates pending sleep
+   * via reject"; the loop's outer `while` checks `signal.aborted` to
+   * exit cleanly.
+   *
+   * @internal
+   */
+  private async safeSleep(ms: number): Promise<void> {
+    try {
+      await this.options.sleep(ms, this.options.signal);
+    } catch {
+      // Sleep aborted via signal — fall through; loop condition
+      // re-evaluates and exits.
     }
   }
 }

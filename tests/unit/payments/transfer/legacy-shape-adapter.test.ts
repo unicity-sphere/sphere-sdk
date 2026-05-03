@@ -578,10 +578,12 @@ describe('Instant-TXF — inclusionProof:null routes through finalization queue'
     ]);
   });
 
-  it('skips enqueueing when no enqueueFinalization hook is supplied', async () => {
-    // Per the adapter contract: PENDING dispositions surface even when
-    // no queue hook is wired (graceful degradation for pre-T.5.C
-    // receivers and tests).
+  it('throws MISSING_FINALIZATION_QUEUE when no enqueueFinalization hook is supplied (#163)', async () => {
+    // Per #163 / §4.4.2 / §5.5: an instant-TXF chain (any
+    // `inclusionProof: null`) MUST be routed through the per-address
+    // finalization queue. Without an enqueuer wired, the adapter
+    // refuses to write a PENDING disposition — that would leave the
+    // recipient permanently stuck (no worker tracking).
     const payload = {
       sourceToken: { id: TOKEN_A },
       transferTx: { tx: 'y' },
@@ -602,15 +604,13 @@ describe('Instant-TXF — inclusionProof:null routes through finalization queue'
       currentStatePredicate: { kind: 'predicate' },
       currentDestinationStateHash: STATE_HEAD,
     };
-    // No enqueueFinalization in the input — only PENDING surfaces.
-    const out = await adaptLegacyShape(buildInput(payload, [entry]));
-    expect(out).toHaveLength(1);
-    expect(out[0].disposition).toBe('PENDING');
-    // Defensive: confirm the absence of enqueue is not coupled to the
-    // disposition's correctness.
+    // No enqueueFinalization in the input — adapter throws.
+    await expect(
+      adaptLegacyShape(buildInput(payload, [entry])),
+    ).rejects.toThrow(/MISSING_FINALIZATION_QUEUE|finalization queue|enqueueFinalization/i);
   });
 
-  it('skips enqueueing when addr is missing', async () => {
+  it('throws MISSING_FINALIZATION_QUEUE when addr is missing for unfinalized chain (#163)', async () => {
     const payload = {
       sourceToken: { id: TOKEN_A },
       transferTx: { tx: 'y' },
@@ -632,16 +632,45 @@ describe('Instant-TXF — inclusionProof:null routes through finalization queue'
       currentDestinationStateHash: STATE_HEAD,
     };
     const enqueue = vi.fn<FinalizationQueueEnqueuer>(async () => undefined);
-    const out = await adaptLegacyShape(
-      buildInput(payload, [entry], {
-        enqueueFinalization: enqueue,
-        addr: undefined,
-      }),
-    );
-    expect(out).toHaveLength(1);
-    expect(out[0].disposition).toBe('PENDING');
-    // No enqueue without addr — the hook is never invoked.
+    await expect(
+      adaptLegacyShape(
+        buildInput(payload, [entry], {
+          enqueueFinalization: enqueue,
+          addr: undefined,
+        }),
+      ),
+    ).rejects.toThrow(/MISSING_FINALIZATION_QUEUE|finalization queue|addr/i);
+    // The enqueue hook is never called — we throw before reaching it.
     expect(enqueue).not.toHaveBeenCalled();
+  });
+
+  it('does NOT throw when chain is fully finalized and no enqueuer wired', async () => {
+    // Inverse of the throw cases: a chain with NO unfinalized txs is
+    // safe to process without an enqueuer. Used by tests / pre-T.5.C
+    // deployments that pin senders to conservative TXF.
+    const payload = {
+      sourceToken: { id: TOKEN_A },
+      transferTx: { tx: 'y' },
+    } as unknown as LegacyTokenTransferPayload;
+    const entry: LegacyTokenEntry = {
+      tokenId: TOKEN_A,
+      observedTokenContentHash: HASH_A,
+      chain: [
+        {
+          sourceState: 's0',
+          destinationState: 's1',
+          authenticator: { kind: 'auth' },
+          transactionHash: { kind: 'txh' },
+          inclusionProof: { kind: 'proof' }, // <-- FULLY FINALIZED
+          requestId: 'req-1',
+        },
+      ],
+      currentStatePredicate: { kind: 'predicate' },
+      currentDestinationStateHash: STATE_HEAD,
+    };
+    const out = await adaptLegacyShape(buildInput(payload, [entry]));
+    expect(out).toHaveLength(1);
+    expect(out[0].disposition).toBe('VALID');
   });
 
   it('best-effort: a per-entry enqueue throw does NOT abort the rest', async () => {
@@ -857,7 +886,11 @@ describe('§10.2 single-pipeline convergence — same shape outcomes', () => {
       currentStatePredicate: { kind: 'predicate' },
       currentDestinationStateHash: STATE_HEAD,
     };
-    const out = await adaptLegacyShape(buildInput(payload, [entry]));
+    // Per #163: instant-TXF chains require a wired enqueuer.
+    const enqueue: FinalizationQueueEnqueuer = async () => undefined;
+    const out = await adaptLegacyShape(
+      buildInput(payload, [entry], { enqueueFinalization: enqueue }),
+    );
     expect(out).toHaveLength(1);
     expect(out[0].disposition).toBe('PENDING');
   });

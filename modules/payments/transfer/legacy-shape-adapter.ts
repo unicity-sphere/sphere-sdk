@@ -110,11 +110,19 @@
  *     `PaymentsModule` to the same per-element verifier modules
  *     (T.3.B.1) the UXF flow uses.
  *
- *   - `enqueueFinalization` (optional): a `FinalizationQueue.add`
- *     thunk used to enqueue instant-TXF entries. When `null` /
- *     `undefined`, the adapter still emits `PENDING` dispositions but
- *     does NOT enqueue — this is a safety valve for pre-T.5.C
- *     receivers and tests; production wiring MUST supply an enqueuer.
+ *   - `enqueueFinalization` (REQUIRED for instant-TXF chains): a
+ *     `FinalizationQueue.add` thunk used to enqueue instant-TXF
+ *     entries. When `null` / `undefined`, the adapter REFUSES to write
+ *     a PENDING disposition for any chain with unfinalized txs and
+ *     throws `MISSING_FINALIZATION_QUEUE` instead — without a wired
+ *     enqueuer the manifest entry would stay `pending` forever with
+ *     no worker tracking, leaving the recipient permanently stuck.
+ *     For chains that are fully finalized (no `inclusionProof: null`
+ *     entries), the enqueuer is genuinely optional and MAY be omitted.
+ *     Pre-T.5.C deployments that cannot accept instant-TXF arrivals
+ *     must configure senders for conservative TXF
+ *     (`txfFinalization: 'conservative'`) — which guarantees the
+ *     adapter only sees fully-finalized chains.
  *
  *   - `now`: wall-clock provider; default `Date.now()`. Tests inject a
  *     deterministic clock so timestamps stay reproducible.
@@ -348,11 +356,15 @@ export interface LegacyShapeAdapterInput {
   /** Disposition-engine hook — local manifest reader. */
   readonly readLocalManifest: ReadLocalManifestFn;
   /**
-   * Optional finalization-queue enqueuer. Supplied when wiring T.5.C;
-   * tests / pre-T.5.C receivers MAY omit, in which case instant-TXF
-   * entries surface as `PENDING` dispositions WITHOUT enqueueing
-   * (allowed per acceptance — the test asserts dispositions converge,
-   * the queue side-effect is verified by separate tests).
+   * Finalization-queue enqueuer. REQUIRED whenever an instant-TXF
+   * chain (any tx with `inclusionProof: null`) might arrive — the
+   * adapter throws `MISSING_FINALIZATION_QUEUE` if it sees an
+   * unfinalized chain without an enqueuer (and matching `addr`)
+   * because writing a PENDING disposition WITHOUT worker tracking
+   * leaves the recipient permanently stuck. May be omitted only when
+   * the caller can guarantee every arriving chain is fully finalized
+   * (e.g., the sender side is pinned to `txfFinalization:
+   * 'conservative'`).
    */
   readonly enqueueFinalization?: FinalizationQueueEnqueuer;
   /** Wall-clock supplier; default `Date.now`. */
@@ -500,12 +512,31 @@ export async function adaptLegacyShape(
     // surfaces PENDING in this case.
     const unfinalizedCount = countUnfinalized(entry.chain);
 
-    if (
-      unfinalizedCount > 0 &&
-      input.enqueueFinalization !== undefined &&
-      typeof input.addr === 'string' &&
-      input.addr.length > 0
-    ) {
+    if (unfinalizedCount > 0) {
+      // CRITICAL (#163): if we'd write a PENDING disposition without a
+      // finalization-queue enqueuer wired, the recipient would never
+      // drain the unfinalized txs — the manifest entry would stay
+      // `pending` forever with no worker tracking. Refuse the write
+      // at the adapter boundary instead. The only safe way to
+      // gracefully degrade is for the caller to ensure no instant-TXF
+      // chains can arrive (configure senders for conservative TXF).
+      if (
+        input.enqueueFinalization === undefined ||
+        typeof input.addr !== 'string' ||
+        input.addr.length === 0
+      ) {
+        throw new SphereError(
+          'adaptLegacyShape: chain has unfinalized txs (inclusionProof:null) ' +
+            'but no enqueueFinalization callback / addr was provided; ' +
+            'recipient cannot resolve PENDING state. Per §4.4.2 / §5.5, ' +
+            'instant-TXF arrivals MUST be routed through the per-address ' +
+            'chain-mode finalization queue. Wire FinalizationQueue.add as ' +
+            '`enqueueFinalization` and pass the per-address profile prefix ' +
+            'as `addr`. Pre-T.5.C deployments that cannot accept instant-TXF ' +
+            'arrivals must configure senders for conservative TXF instead.',
+          'MISSING_FINALIZATION_QUEUE',
+        );
+      }
       // Enqueue ONE finalization-queue entry per unfinalized tx. The
       // worker consumes them per §5.5; on full drain, §5.5 step 9
       // re-runs [B]/[D]/[E] via `revaluate`.

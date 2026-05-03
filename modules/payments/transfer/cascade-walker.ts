@@ -16,9 +16,14 @@
  *    `transfer:cascade-failed` is emitted for any outbox entry that
  *    referenced the cascaded children.
  *  - **NFT path**: NO `splitParent` walk (NFTs preserve `tokenId` and
- *    are never split). Outbox entries that shipped this NFT in instant
- *    mode are examined — one `transfer:cascade-failed` per
- *    (recipient-pubkey, tokenId).
+ *    are never split). Outbox entries that shipped this NFT are
+ *    examined — one `transfer:cascade-failed` per (recipient-pubkey,
+ *    tokenId). Per issue #167, NON-instant outbox entries (conservative
+ *    / txf) are now ALSO emitted with `mode: 'conservative'|'txf'` and
+ *    `silent: true` so UI consumers can render the irrecoverable
+ *    "lost-NFT" hard-error path. Historic behaviour silently dropped
+ *    these — leaving the user with a token they thought succeeded but
+ *    which had in fact shipped silently.
  *
  * **Race-lost EXCEPTION (§6.1.1)** — when `reason === 'race-lost'` the
  * cascade does NOT fire. The source token is genuinely valid (the
@@ -233,6 +238,18 @@ export interface CascadeWalkerOptions {
  *                          cascade trigger and the child write.
  *  - `cycleDefenseFired` — number of times the cycle / depth-overrun
  *                          defense prevented further recursion.
+ *  - `silentNotified` — number of outbox entries with non-instant
+ *                       transfer mode for which `transfer:cascade-failed`
+ *                       was emitted with `silent: true`. These are the
+ *                       conservative / txf cascades that the historic
+ *                       walker dropped silently — the count is
+ *                       INCLUDED in `nftNotified` / `outboxNotified` as
+ *                       appropriate (it is a discriminator overlay, not
+ *                       a separate counter), so callers reasoning about
+ *                       total events emitted SHOULD use
+ *                       `nftNotified + outboxNotified` and break out
+ *                       silent-vs-instant via this counter when the UI
+ *                       split matters. Issue #167.
  */
 export interface CascadeResult {
   readonly cascaded: number;
@@ -240,6 +257,7 @@ export interface CascadeResult {
   readonly outboxNotified: number;
   readonly parentFlipAborted: number;
   readonly cycleDefenseFired: number;
+  readonly silentNotified: number;
 }
 
 // =============================================================================
@@ -476,11 +494,12 @@ export class CascadeWalker {
       // Successfully cascaded — count it and emit cascade-failed for
       // any outbox entries referencing this child.
       counters.cascaded++;
-      const emittedCount = await this._emitCascadeFailedForOutboxEntries(
+      const tally = await this._emitCascadeFailedForOutboxEntries(
         childTokenId,
         rootReason,
       );
-      counters.outboxNotified += emittedCount;
+      counters.outboxNotified += tally.emitted;
+      counters.silentNotified += tally.silent;
 
       // Recurse into the child's children (transitive cascade).
       await this._walkCoinChildren(
@@ -626,8 +645,20 @@ export class CascadeWalker {
   /**
    * NFT-path cascade. Per §6.1.1: NFTs preserve `tokenId` and are NEVER
    * split, so there are no `splitParent` children to walk. The walker
-   * examines outbox entries that shipped this NFT in instant mode and
-   * emits `transfer:cascade-failed` per (recipient-pubkey, tokenId).
+   * examines outbox entries that shipped this NFT and emits
+   * `transfer:cascade-failed` per (recipient-pubkey, tokenId).
+   *
+   * **Issue #167 — conservative NFT must not be silent.** Historic
+   * behaviour dropped `mode !== 'instant'` outbox entries with no event,
+   * which left conservative NFT cascades indistinguishable from "no
+   * outstanding shipments." For NFTs that is the canonical "lost-NFT"
+   * signal — the sender shipped a one-of-a-kind token, the recipient
+   * never finalized, and the source token is now forensically
+   * irrecoverable. We now emit cascade-failed with `mode: 'conservative'`
+   * (or `'txf'`) and `silent: true` so the UI can render a hard-error
+   * distinct from instant-mode cascade failures. The counts roll up
+   * into `nftNotified`; the `silentNotified` discriminator carries the
+   * silent-mode subtotal.
    *
    * @internal
    */
@@ -639,10 +670,12 @@ export class CascadeWalker {
     void addr; // outbox is address-scoped at construction time; the
     //         scanner here is for the active sender's outbox.
     const counters = mutableCounters();
-    counters.nftNotified = await this._emitCascadeFailedForOutboxEntries(
+    const tally = await this._emitCascadeFailedForOutboxEntries(
       parentTokenId,
       rootReason,
     );
+    counters.nftNotified = tally.emitted;
+    counters.silentNotified += tally.silent;
     return freezeCounters(counters);
   }
 
@@ -651,13 +684,21 @@ export class CascadeWalker {
   // ===========================================================================
 
   /**
-   * Find every instant-mode outbox entry that shipped `tokenId` and
-   * emit `transfer:cascade-failed` for each. Returns the count of
-   * events emitted.
+   * Find every outbox entry that shipped `tokenId` and emit
+   * `transfer:cascade-failed` for each. Returns the count of events
+   * emitted, broken out by `silent`-discriminator.
+   *
+   * Emits with discriminators:
+   *  - `mode: 'instant'`, `silent` omitted — live finalization-path
+   *    cascade. Receiver-side reconciliation may still recover.
+   *  - `mode: 'conservative'` (or `'txf'`), `silent: true` — cascades
+   *    on entries that finalized before publish. Historic behaviour
+   *    dropped these silently (issue #167); they are now emitted so UI
+   *    consumers can render a hard-error distinct from instant-mode.
+   *    Receiver-side reconciliation cannot recover (the bundle is
+   *    already on the wire / on-chain).
    *
    * Filters out:
-   *  - entries whose `mode !== 'instant'` (conservative + txf modes
-   *    cannot cascade — they finalize before publish).
    *  - entries whose `status` is hard-terminal already (`finalized`,
    *    `expired`) — emitting cascade-failed for an already-finalized
    *    entry would be misleading; the receiver already has a cleanly
@@ -669,31 +710,50 @@ export class CascadeWalker {
   private async _emitCascadeFailedForOutboxEntries(
     tokenId: string,
     rootReason: DispositionReason,
-  ): Promise<number> {
+  ): Promise<{ readonly emitted: number; readonly silent: number }> {
     let entries: ReadonlyArray<UxfTransferOutboxEntry>;
     try {
       entries = await this.options.outboxScanner.findEntriesByTokenId(tokenId);
     } catch {
       // Defensive: if the scanner throws, skip notification rather
       // than aborting the whole cascade.
-      return 0;
+      return { emitted: 0, silent: 0 };
     }
 
     let emitted = 0;
+    let silent = 0;
     for (const e of entries) {
-      if (e.mode !== 'instant') continue;
+      // Drop hard-terminal statuses regardless of mode — emitting
+      // cascade-failed for a finalized entry would be misleading.
       if (e.status === 'finalized' || e.status === 'expired') continue;
 
-      this.options.emit('transfer:cascade-failed', {
-        outboxId: e.id,
-        tokenId,
-        bundleCid: e.bundleCid,
-        recipientTransportPubkey: e.recipientTransportPubkey,
-        reason: rootReason,
-      });
+      const isInstant = e.mode === 'instant';
+      // For non-instant entries, mark the event as silent so UI can
+      // render a distinct (hard-error) notification — issue #167.
+      const eventPayload = isInstant
+        ? {
+            outboxId: e.id,
+            tokenId,
+            bundleCid: e.bundleCid,
+            recipientTransportPubkey: e.recipientTransportPubkey,
+            reason: rootReason,
+            mode: 'instant' as const,
+          }
+        : {
+            outboxId: e.id,
+            tokenId,
+            bundleCid: e.bundleCid,
+            recipientTransportPubkey: e.recipientTransportPubkey,
+            reason: rootReason,
+            mode: e.mode,
+            silent: true,
+          };
+
+      this.options.emit('transfer:cascade-failed', eventPayload);
       emitted++;
+      if (!isInstant) silent++;
     }
-    return emitted;
+    return { emitted, silent };
   }
 
   /** @internal */
@@ -714,6 +774,7 @@ interface MutableCounters {
   outboxNotified: number;
   parentFlipAborted: number;
   cycleDefenseFired: number;
+  silentNotified: number;
 }
 
 function mutableCounters(): MutableCounters {
@@ -723,6 +784,7 @@ function mutableCounters(): MutableCounters {
     outboxNotified: 0,
     parentFlipAborted: 0,
     cycleDefenseFired: 0,
+    silentNotified: 0,
   };
 }
 
@@ -733,6 +795,7 @@ function freezeCounters(c: MutableCounters): CascadeResult {
     outboxNotified: c.outboxNotified,
     parentFlipAborted: c.parentFlipAborted,
     cycleDefenseFired: c.cycleDefenseFired,
+    silentNotified: c.silentNotified,
   };
 }
 
@@ -742,6 +805,7 @@ const EMPTY_RESULT: CascadeResult = Object.freeze({
   outboxNotified: 0,
   parentFlipAborted: 0,
   cycleDefenseFired: 0,
+  silentNotified: 0,
 });
 
 /**

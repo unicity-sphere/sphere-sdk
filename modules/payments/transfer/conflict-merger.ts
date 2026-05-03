@@ -295,17 +295,34 @@ export function mergeConflictingHeads(
   // receive case and the most common merger invocation.
   // ---------------------------------------------------------------------------
   if (prev.rootHash === next.rootHash) {
+    // The chain-content sides are identical, so the chain decision is
+    // a no-op — but METADATA fields (bundleCid, splitParent, status,
+    // etc.) can disagree across the two sides. Pick the metadata-
+    // winner side DETERMINISTICALLY and ORDER-INDEPENDENTLY (lex-min
+    // bundleCid → present-beats-absent → lex-min rootHash) so that
+    // replicas observing `(A, B)` and `(B, A)` produce IDENTICAL
+    // merged entries. A naive `prev` pick would let bundleCid /
+    // splitParent / senderTransportPubkey / status flip-flop based on
+    // arrival order, breaking §5.4 cross-replica convergence.
+    const metaWinnerSide = pickMetadataWinnerSide(prev, next, compareCids);
+    const winnerEntry = metaWinnerSide === 'prev' ? prev : next;
+    const loserEntry = metaWinnerSide === 'prev' ? next : prev;
     // Status: §5.6 monotonic invariant — if either side has been
     // marked `'invalid'` (e.g., one replica observed an off-band
     // hard-fail signal), that status MUST NOT regress on idempotent
     // receive. Same logic for `'conflicting'` (a prior conflict
     // surfaced by another sibling head we haven't merged yet stays
-    // visible to the UI).
-    const status = mergeStatus(prev.status, next.status);
+    // visible to the UI). `mergeStatus` is symmetric on the
+    // 'invalid'/'conflicting' branches and falls back to the winner
+    // side's status on ties — order-independent given a deterministic
+    // winner selection above.
+    const status = mergeStatus(winnerEntry.status, loserEntry.status);
     const merged = mergeMetadataPreserving(
-      prev,
-      next,
-      // Chain-content fields: prev wins (they are identical anyway).
+      winnerEntry,
+      loserEntry,
+      // Chain-content fields: identical on both sides; either rootHash
+      // works (we use prev.rootHash for byte-stability with prior
+      // versions of this function).
       prev.rootHash,
       status,
       // For identical-no-op, conflictingHeads should NOT include the
@@ -413,12 +430,26 @@ export function mergeConflictingHeads(
   let winnerRootHash: ContentHash;
 
   if (outcome.kind === 'enriched') {
-    // Synthetic root — neither prev nor next. Use `next` as the
-    // metadata winner (newer provenance; this matches §5.4's "next
-    // takes chain-content" doctrine because the freshness side
-    // contributed the new proof material that drove enrichment).
-    winnerEntry = next;
-    loserEntry = prev;
+    // Synthetic root — neither prev nor next. The chain-content slot
+    // (`winnerRootHash`) is the resolver's synthetic root, but the
+    // METADATA-merge winner side must be picked DETERMINISTICALLY and
+    // ORDER-INDEPENDENTLY: a naive pick of `next` produces asymmetric
+    // results across replicas that received the same two manifests in
+    // opposite arrival orders (replica X with `(prev=A, next=B)` and
+    // replica Y with `(prev=B, next=A)` would diverge on `bundleCid`
+    // / `senderTransportPubkey` / `splitParent` etc., breaking
+    // cross-device convergence after gossip).
+    //
+    // The deterministic order-independent rule mirrors the divergent-
+    // conflict tie-break (§5.3 [D-conflict]):
+    //   1. Prefer side with lex-min `bundleCid` (binary CIDv1 compare).
+    //   2. Side with `bundleCid` beats side without one.
+    //   3. Tiebreak: lex-min `rootHash` (deterministic 64-char hex).
+    // This is the canonical "metadata winner" rule for cases where the
+    // resolver's chain-content winner is not one of the inputs.
+    const metaWinnerSide = pickMetadataWinnerSide(prev, next, compareCids);
+    winnerEntry = metaWinnerSide === 'prev' ? prev : next;
+    loserEntry = metaWinnerSide === 'prev' ? next : prev;
     winnerRootHash = outcome.rootHash;
   } else if (outcome.rootHash === prev.rootHash) {
     winnerEntry = prev;
@@ -432,12 +463,14 @@ export function mergeConflictingHeads(
     // Defensive: the resolver returned a rootHash that is neither
     // prev nor next and not a synthetic-root case. This shouldn't
     // happen — a `'single'`/`'longest-valid'` outcome MUST point at
-    // one of the input candidates. Fall back to treating `next` as
-    // the winner; the merger remains deterministic and the test
-    // suite's invariants still hold (chain-content side from `next`,
-    // metadata-merge per §5.4).
-    winnerEntry = next;
-    loserEntry = prev;
+    // one of the input candidates. Use the same deterministic
+    // order-independent metadata-winner rule as the enriched branch
+    // so the merger remains symmetric under input swap (otherwise a
+    // naive `next`-winner pick would diverge across replicas that
+    // observe the same pair in opposite order).
+    const metaWinnerSide = pickMetadataWinnerSide(prev, next, compareCids);
+    winnerEntry = metaWinnerSide === 'prev' ? prev : next;
+    loserEntry = metaWinnerSide === 'prev' ? next : prev;
     winnerRootHash = outcome.rootHash;
   }
 
@@ -480,9 +513,14 @@ export function mergeConflictingHeads(
   // (the synthetic root displaced both originals).
   const superseded: ContentHash[] = [];
   if (outcome.kind === 'enriched') {
-    // Both inputs are displaced.
-    superseded.push(prev.rootHash);
-    if (next.rootHash !== prev.rootHash) superseded.push(next.rootHash);
+    // Both inputs are displaced. Sort so the array shape is order-
+    // independent under prev/next swap (otherwise replicas observing
+    // the same pair in opposite arrival orders would emit different
+    // `superseded` arrays — semantically equivalent but byte-distinct).
+    const both = new Set<ContentHash>([prev.rootHash, next.rootHash]);
+    for (const h of [...both].sort() as ContentHash[]) {
+      superseded.push(h);
+    }
   } else {
     // Pull from the resolver's `losers` array, which is already
     // de-duped against the winner. Restrict to {prev.rootHash,
@@ -638,16 +676,108 @@ function pickDivergentWinner(
     if (cmp > 0) return 'next';
     // Equal bundleCids on a divergent pair shouldn't happen (the
     // bundleCid IS content-addressed; identical bundleCids ⇒ identical
-    // bundles ⇒ identical chains). Fall through to rootHash compare
-    // for defense-in-depth.
+    // bundles ⇒ identical chains). Fall through to the next tier for
+    // defense-in-depth.
   }
   if (prevCid !== undefined && nextCid === undefined) return 'prev';
   if (nextCid !== undefined && prevCid === undefined) return 'next';
 
-  // Neither side has a bundleCid — fall back to rootHash lex-min.
-  // ContentHash strings are 64-char lowercase hex; standard `<` is
-  // deterministic and identical across replicas.
-  return prev.rootHash <= next.rootHash ? 'prev' : 'next';
+  // Neither side has a bundleCid (or both bundleCids tied) — fall back
+  // to lex-min on `rootHash`. ContentHash strings are 64-char lowercase
+  // hex; standard `<` is deterministic and identical across replicas.
+  if (prev.rootHash < next.rootHash) return 'prev';
+  if (prev.rootHash > next.rootHash) return 'next';
+
+  // Same rootHash AND same/no bundleCid (this picker is also called
+  // for the identical-no-op metadata-winner pick). The two entries can
+  // STILL disagree on `senderTransportPubkey`, `splitParent`,
+  // `lamport`, etc. — replicas observing the same `(prev, next)` pair
+  // in opposite orders MUST still produce the same merged metadata,
+  // so we extend the tiebreak chain. The full chain is:
+  //   bundleCid → rootHash → senderTransportPubkey → splitParent
+  //     → lamport → lastProofRefreshAt
+  // (present-beats-absent, then lex-min for strings, then numerical-
+  // min for numbers — all deterministic, all order-independent.)
+  const psp = prev.senderTransportPubkey;
+  const nsp = next.senderTransportPubkey;
+  if (psp !== undefined && nsp !== undefined) {
+    if (psp < nsp) return 'prev';
+    if (psp > nsp) return 'next';
+  } else if (psp !== undefined) {
+    return 'prev';
+  } else if (nsp !== undefined) {
+    return 'next';
+  }
+
+  const psp2 = prev.splitParent;
+  const nsp2 = next.splitParent;
+  if (psp2 !== undefined && nsp2 !== undefined) {
+    if (psp2 < nsp2) return 'prev';
+    if (psp2 > nsp2) return 'next';
+  } else if (psp2 !== undefined) {
+    return 'prev';
+  } else if (nsp2 !== undefined) {
+    return 'next';
+  }
+
+  const pl = prev.lamport;
+  const nl = next.lamport;
+  if (pl !== undefined && nl !== undefined) {
+    if (pl < nl) return 'prev';
+    if (pl > nl) return 'next';
+  } else if (pl !== undefined) {
+    return 'prev';
+  } else if (nl !== undefined) {
+    return 'next';
+  }
+
+  const pp = prev.lastProofRefreshAt;
+  const np = next.lastProofRefreshAt;
+  if (pp !== undefined && np !== undefined) {
+    if (pp < np) return 'prev';
+    if (pp > np) return 'next';
+  } else if (pp !== undefined) {
+    return 'prev';
+  } else if (np !== undefined) {
+    return 'next';
+  }
+
+  // Fully tied across every tiebreak axis we have — the two entries
+  // are semantically equivalent for metadata-merge purposes (every
+  // field in the projection produces the same output regardless of
+  // which side we treat as winner). Return 'prev' deterministically;
+  // either choice produces identical merged output.
+  return 'prev';
+}
+
+/**
+ * Pick the deterministic order-independent "metadata winner side"
+ * between two manifest entries. Used by the prefix-extension merger
+ * for the `'enriched'` outcome branch (where the chain-content winner
+ * is a synthetic root not equal to either input) and the defensive
+ * fallback (where the resolver returned an unrecognized rootHash).
+ *
+ * The rule is intentionally identical to {@link pickDivergentWinner}
+ * — both contexts need the same canonical "which side's bundleCid /
+ * senderTransportPubkey / splitParent should the merged entry inherit"
+ * answer. Replicating the rule (rather than calling
+ * {@link pickDivergentWinner} directly) keeps the two call sites
+ * semantically named for the operator scanning the code; the impl is
+ * shared.
+ *
+ * **Why this MUST be order-independent**: when replica X receives
+ * `(prev=A, next=B)` and replica Y receives `(prev=B, next=A)`, both
+ * MUST produce the same merged entry (by rootHash AND every metadata
+ * field). A naive pick of `next` would let the bundleCid / pubkey
+ * fields flip-flop based on arrival order, defeating the §5.4 cross-
+ * replica convergence guarantee.
+ */
+function pickMetadataWinnerSide(
+  prev: TokenManifestEntry,
+  next: TokenManifestEntry,
+  compareCids: CidComparator,
+): 'prev' | 'next' {
+  return pickDivergentWinner(prev, next, compareCids);
 }
 
 /**

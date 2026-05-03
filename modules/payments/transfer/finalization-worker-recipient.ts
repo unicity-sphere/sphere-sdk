@@ -89,7 +89,6 @@ import {
 } from './limits';
 import {
   validatePollingPolicy,
-  getBackoffMs,
   MIN_POLL_ATTEMPTS,
 } from './polling-policy';
 import { getAggregatorSemaphore } from './aggregator-semaphores';
@@ -282,6 +281,30 @@ export interface FinalizationWorkerRecipientOptions {
   readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Optional override of the §6.1 caps. */
   readonly caps?: FinalizationWorkerRecipientCaps;
+  /**
+   * Scan-loop tick interval (ms). On every iteration the worker:
+   *  1. Reads all queue entries via `queueStore.list(addressId)`.
+   *  2. Groups them by tokenId and calls {@link processOneToken} for
+   *     each group, isolated by per-token try/catch.
+   *  3. If at least one token was processed, immediately re-scans
+   *     (no sleep) — drains backlogs without latency.
+   *  4. Otherwise, sleeps `scanIntervalMs` before the next pass.
+   *
+   * Default: 30_000 (30 seconds). Tests typically override down to
+   * a small value (e.g. 1ms) to exercise the loop deterministically.
+   */
+  readonly scanIntervalMs?: number;
+  /**
+   * Cap on tokens processed per scan cycle. Defaults to 100 — guards
+   * against CPU pegging when the queue holds an enormous backlog.
+   */
+  readonly maxTokensPerScan?: number;
+  /**
+   * Opt-out: when `true`, `start()` activates a stub scan loop (sleep-
+   * only). Useful for tests that probe `isRunning()` without driving
+   * real work. Default `false` — production wires the real scan loop.
+   */
+  readonly manualScan?: boolean;
   /** Optional cancellation signal. */
   readonly signal?: AbortSignal;
   /** Aggregator endpoint identifier. Defaults to `'default'`. */
@@ -392,9 +415,17 @@ export class FinalizationWorkerRecipient {
     | 'bounded-hold';
   private readonly aggregatorId: string;
   private readonly trustBaseStaleness: TrustBaseStaleness | undefined;
+  private readonly scanIntervalMs: number;
+  private readonly maxTokensPerScan: number;
+  private readonly manualScan: boolean;
   private running = false;
   private stopRequested = false;
   private loopPromise: Promise<void> | null = null;
+  /** In-flight `processOneToken` invocations, keyed by tokenId. The
+   *  scan loop skips tokens already being driven so an external caller
+   *  and the loop don't race the same token. Guards the per-tokenId
+   *  mutex from holding two budgets concurrently for the same key. */
+  private readonly inFlightTokens: Set<string> = new Set();
 
   /**
    * Validate the polling-policy at construction (§5.5 step 6 step 6).
@@ -425,6 +456,27 @@ export class FinalizationWorkerRecipient {
     this.pollingWindowMs = options.caps?.pollingWindowMs ?? POLLING_WINDOW_MS;
     this.perTokenMutexStrategy = options.perTokenMutexStrategy ?? 'cas';
     this.trustBaseStaleness = options.trustBaseStaleness;
+    this.scanIntervalMs = options.scanIntervalMs ?? 30_000;
+    this.maxTokensPerScan = options.maxTokensPerScan ?? 100;
+    this.manualScan = options.manualScan ?? false;
+    if (
+      !Number.isFinite(this.scanIntervalMs) ||
+      this.scanIntervalMs <= 0
+    ) {
+      throw new SphereError(
+        `FinalizationWorkerRecipient: scanIntervalMs must be > 0; got ${this.scanIntervalMs}`,
+        'VALIDATION_ERROR',
+      );
+    }
+    if (
+      !Number.isFinite(this.maxTokensPerScan) ||
+      this.maxTokensPerScan <= 0
+    ) {
+      throw new SphereError(
+        `FinalizationWorkerRecipient: maxTokensPerScan must be > 0; got ${this.maxTokensPerScan}`,
+        'VALIDATION_ERROR',
+      );
+    }
 
     if (
       !Number.isFinite(this.perAggregator) ||
@@ -493,6 +545,33 @@ export class FinalizationWorkerRecipient {
         'VALIDATION_ERROR',
       );
     }
+    // De-dup: if the scan loop (or a prior external caller) is already
+    // driving this token, skip — return an in-progress sentinel.
+    if (this.inFlightTokens.has(tokenId)) {
+      return {
+        tokenId,
+        entriesProcessed: 0,
+        successCount: 0,
+        hardFailCount: 0,
+        mergePathGraftCount: 0,
+        cascadeInvoked: false,
+        terminal: 'in-progress',
+      };
+    }
+    this.inFlightTokens.add(tokenId);
+    try {
+      return await this.processOneTokenLocked(tokenId);
+    } finally {
+      this.inFlightTokens.delete(tokenId);
+    }
+  }
+
+  /** Internal worker for {@link processOneToken}. The wrapper guards
+   *  against double-processing via {@link inFlightTokens}; this method
+   *  assumes the caller has already taken that slot. */
+  private async processOneTokenLocked(
+    tokenId: string,
+  ): Promise<ProcessOneTokenResult> {
     const entries = await this.options.queueStore.lookupByTokenId(
       this.options.addressId,
       tokenId,
@@ -1048,19 +1127,91 @@ export class FinalizationWorkerRecipient {
   // ===========================================================================
 
   /**
-   * Long-running scan loop. Production wires the loop to the queue's
-   * `list()` method; here we maintain a stub that sleeps until stop is
-   * requested so `start()`/`stop()` work end-to-end in tests.
+   * Long-running scan loop (#168 production scheduler). Each iteration:
+   *  1. Reads all queue entries via `queueStore.list(addressId)`.
+   *  2. Groups them by tokenId; for each unique tokenId not currently
+   *     in {@link inFlightTokens}, calls {@link processOneToken} with
+   *     per-token try/catch.
+   *  3. If at least one token was processed, immediately re-scans
+   *     (no sleep) — drains backlogs without latency.
+   *  4. Otherwise sleeps `scanIntervalMs` before the next pass.
+   *
+   * Loop terminates when {@link stop} is called or the construction-
+   * supplied `signal` aborts.
    *
    * @internal
    */
   private async scanLoop(): Promise<void> {
     while (!this.stopRequested && this.options.signal?.aborted !== true) {
-      try {
-        await this.options.sleep(getBackoffMs(0), this.options.signal);
-      } catch {
-        // signal aborted — fall through to loop check.
+      // Manual-scan opt-out → fall back to a sleep-only stub so
+      // `start()`/`stop()`/`isRunning()` lifecycle tests keep working.
+      if (this.manualScan) {
+        await this.safeSleep(this.scanIntervalMs);
+        continue;
       }
+
+      let processed = 0;
+      try {
+        const all = await this.options.queueStore.list(this.options.addressId);
+        // Group by tokenId. The queue can hold K entries per K-deep
+        // chain-mode token; one `processOneToken` call drives all
+        // entries for that token.
+        const tokenIds: string[] = [];
+        const seen = new Set<string>();
+        for (const e of all) {
+          if (seen.has(e.tokenId)) continue;
+          if (this.inFlightTokens.has(e.tokenId)) continue;
+          seen.add(e.tokenId);
+          tokenIds.push(e.tokenId);
+          if (tokenIds.length >= this.maxTokensPerScan) break;
+        }
+
+        for (const tokenId of tokenIds) {
+          if (this.stopRequested) break;
+          if (this.options.signal?.aborted) break;
+          try {
+            await this.processOneToken(tokenId);
+            processed += 1;
+          } catch (err) {
+            // processOneToken should be total (allSettled inside) but
+            // a throw here is forensic-only; emit and continue.
+            const msg = err instanceof Error ? err.message : String(err);
+            this.options.emit('transfer:operator-alert', {
+              code: 'structural',
+              tokenId,
+              message: `FinalizationWorkerRecipient.scanLoop: processOneToken threw for tokenId=${tokenId}: ${msg}`,
+            });
+          }
+        }
+      } catch (err) {
+        // queueStore.list failure — emit and back off. The next pass
+        // retries.
+        const msg = err instanceof Error ? err.message : String(err);
+        this.options.emit('transfer:operator-alert', {
+          code: 'structural',
+          message: `FinalizationWorkerRecipient.scanLoop: queueStore.list threw: ${msg}`,
+        });
+      }
+
+      if (processed === 0) {
+        await this.safeSleep(this.scanIntervalMs);
+      } else {
+        // Cooperative yield while draining a backlog.
+        await this.safeSleep(0);
+      }
+    }
+  }
+
+  /**
+   * Wrap `options.sleep` so abort exceptions don't escape the loop.
+   *
+   * @internal
+   */
+  private async safeSleep(ms: number): Promise<void> {
+    try {
+      await this.options.sleep(ms, this.options.signal);
+    } catch {
+      // Sleep aborted via signal — fall through.
     }
   }
 }

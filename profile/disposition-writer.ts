@@ -227,7 +227,47 @@ export class DispositionWriter {
    * Promote an `_audit` record to the active pool (per §5.4 promotion
    * semantics).
    *
-   * Effects:
+   * **Transactional invariant** (steelman finding #164):
+   *
+   * Promotion is a **two-phase operation** with crash recovery, because
+   * it spans two independent storage backends (the per-entry-key audit
+   * collection and the CAS-protected manifest store). The invariant the
+   * implementation must preserve across crashes / retries:
+   *
+   *   For any audit record `A` at key `auditKey`:
+   *     - `A.auditStatus === 'audit-promoted'`  iff
+   *       the manifest entry at `(addr, tokenId)` has `auditKey` in its
+   *       `audit_promoted_from` set.
+   *
+   * The two writes are NOT a single atomic op, so we use a
+   * `promotionPending` marker on the audit record to make the in-flight
+   * state observable and recoverable:
+   *
+   *   Phase 1 (pre-write marker):  A.promotionPending = true
+   *   Phase 2 (manifest write):    manifest.audit_promoted_from ⊇ {auditKey}
+   *   Phase 3 (post-write commit): A.auditStatus = 'audit-promoted',
+   *                                A.promotionPending = undefined,
+   *                                A.promotedToManifestRef = manifestEntry.rootHash
+   *
+   * Recovery (executed on retry / re-entry of `promoteAuditEntry`):
+   *   - If `A.auditStatus === 'audit-promoted'` already → no-op
+   *     (idempotent; a prior call succeeded).
+   *   - If `A.promotionPending === true` AND the manifest already
+   *     contains `auditKey` in `audit_promoted_from` → Phase 3 only
+   *     (a prior call crashed between Phase 2 and Phase 3; finish it).
+   *   - If `A.promotionPending === true` AND the manifest does NOT
+   *     contain `auditKey` → roll forward by retrying Phase 2 + Phase 3
+   *     (a prior call crashed before Phase 2 succeeded).
+   *   - Else (steady state) → execute Phases 1 → 2 → 3.
+   *
+   * If the Phase 2 manifest write throws, we explicitly clear the
+   * `promotionPending` marker (Phase 1 rollback) so a future retry sees
+   * a clean state instead of mistaking a never-started promotion for an
+   * in-flight one. Best-effort: if the rollback also fails, the worst
+   * case is a stale marker that the recovery branch above will resolve
+   * on the next attempt by inspecting the manifest.
+   *
+   * Effects on success:
    *   1. The audit record at
    *      `${addr}.audit.${tokenId}.${observedTokenContentHash}` is
    *      updated in place: `auditStatus: 'audit-promoted'`,
@@ -275,23 +315,93 @@ export class DispositionWriter {
       );
     }
 
-    // Step 1: write the manifest first. If this fails (CAS exhaustion
-    // etc.), we have NOT yet mutated the audit record — the caller can
-    // retry without leaving the system in a half-promoted state.
-    await this.manifestStore.addAuditPromotedFrom(
-      addr,
-      tokenId,
-      [auditKey],
-      manifestEntry,
-    );
+    // ---------------------------------------------------------------
+    // Recovery / idempotency branches (see invariant above).
+    // ---------------------------------------------------------------
 
-    // Step 2: stamp the audit record. The manifest's `rootHash` is the
+    // Branch A: already promoted. CAS-style no-op — promotion is
+    // idempotent on a per-`auditKey` basis. Multiple concurrent callers
+    // that race past the read-existing point will both submit Phase 2 +
+    // Phase 3 writes, and the manifest store's set-OR semantics on
+    // `audit_promoted_from` make those duplicate writes converge to the
+    // same fixed point. The audit record's `auditStatus` field is
+    // monotonic (`audit-promoted` is terminal per §5.4), so the only
+    // way to land here is "a prior call already won the race".
+    if (existing.auditStatus === 'audit-promoted') {
+      return;
+    }
+
+    // Branch B: promotionPending marker observed. A prior call started
+    // promotion but did not reach Phase 3. Inspect the manifest to
+    // determine whether Phase 2 succeeded.
+    if (existing.promotionPending === true) {
+      const manifestNow = await this.manifestStore.readEntry(addr, tokenId);
+      const promotedFrom = manifestNow?.audit_promoted_from;
+      if (
+        promotedFrom !== undefined &&
+        promotedFrom.includes(auditKey)
+      ) {
+        // Phase 2 succeeded; just finalize Phase 3.
+        const ref = manifestNow?.rootHash ?? manifestEntry.rootHash;
+        const promoted: AuditEntry = stripUndefinedShallow({
+          ...existing,
+          auditStatus: 'audit-promoted',
+          promotedToManifestRef: ref,
+          promotionPending: undefined,
+        });
+        await this.storage.writeRecord<AuditEntry>(auditKey, promoted);
+        return;
+      }
+      // Phase 2 was never observed to succeed. Fall through to the
+      // steady-state path: re-attempt Phase 2 + Phase 3. The
+      // `promotionPending` marker is already set, so we skip Phase 1.
+    } else {
+      // Branch C: steady state. Phase 1 — set the marker BEFORE the
+      // manifest write so a crash between this write and the manifest
+      // write is recoverable via Branch B.
+      const marked: AuditEntry = stripUndefinedShallow({
+        ...existing,
+        promotionPending: true,
+      });
+      await this.storage.writeRecord<AuditEntry>(auditKey, marked);
+    }
+
+    // Phase 2: manifest write. On failure, attempt to clear the marker
+    // (best-effort; see invariant doc above).
+    try {
+      await this.manifestStore.addAuditPromotedFrom(
+        addr,
+        tokenId,
+        [auditKey],
+        manifestEntry,
+      );
+    } catch (manifestErr) {
+      // Roll back the Phase 1 marker so the next retry sees a clean
+      // pre-promotion state instead of mistaking this as in-flight.
+      try {
+        const rolledBack: AuditEntry = stripUndefinedShallow({
+          ...existing,
+          promotionPending: undefined,
+        });
+        await this.storage.writeRecord<AuditEntry>(auditKey, rolledBack);
+      } catch {
+        // Marker-rollback failed. Worst case: a stale `promotionPending`
+        // remains; the next retry's Branch B path will inspect the
+        // manifest, see no reverse-pointer, and re-attempt Phase 2.
+        // This is the design: we intentionally degrade to "retry, don't
+        // lose data".
+      }
+      throw manifestErr;
+    }
+
+    // Phase 3: stamp the audit record. The manifest's `rootHash` is the
     // pointer the spec calls `promotedToManifestRef`.
-    const promoted: AuditEntry = {
+    const promoted: AuditEntry = stripUndefinedShallow({
       ...existing,
       auditStatus: 'audit-promoted',
       promotedToManifestRef: manifestEntry.rootHash,
-    };
+      promotionPending: undefined,
+    });
     await this.storage.writeRecord<AuditEntry>(auditKey, promoted);
   }
 
@@ -438,6 +548,13 @@ export class DispositionWriter {
  *    of existing + the incoming `bundleCid`.
  *  - `promotedToManifestRef` / `audit_promoted_from` — preserved from
  *    existing.
+ *  - `promotionPending` — preserved from existing (steelman finding
+ *    #164). A re-arrival of the same observation MUST NOT clear an
+ *    in-flight promotion marker; recovery is the responsibility of
+ *    `DispositionWriter.promoteAuditEntry`, not the merge path.
+ *    However, if `existing.auditStatus === 'audit-promoted'`,
+ *    `promotionPending` is dropped — the post-promotion invariant
+ *    forbids both being set simultaneously.
  */
 export function mergeAuditEntry(
   existing: AuditEntry | undefined,
@@ -455,6 +572,17 @@ export function mergeAuditEntry(
     [incoming.bundleCid],
   );
 
+  // Mutual-exclusion invariant: 'audit-promoted' and `promotionPending`
+  // cannot both be set. If the merged status is terminal, drop any
+  // pending marker (defensive — post-promotion we never want a stale
+  // marker to confuse recovery).
+  const promotionPending: true | undefined =
+    auditStatus === 'audit-promoted'
+      ? undefined
+      : existing?.promotionPending === true
+        ? true
+        : undefined;
+
   const merged: AuditEntry = {
     tokenId: incoming.tokenId,
     observedTokenContentHash: incoming.observedTokenContentHash,
@@ -464,6 +592,7 @@ export function mergeAuditEntry(
     bundleCidsObserved,
     promotedToManifestRef: existing?.promotedToManifestRef,
     audit_promoted_from: existing?.audit_promoted_from,
+    promotionPending,
   };
   return stripUndefinedShallow(merged);
 }

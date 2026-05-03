@@ -69,18 +69,30 @@ const ch = (s: string): ContentHash => s as ContentHash;
 
 class FakePerEntryStorage implements DispositionPerEntryStorage {
   readonly store = new Map<string, unknown>();
+  /** When set, the next call to writeRecord throws this error and clears the hook. */
+  failNextWriteWith: Error | null = null;
+  writeCallCount = 0;
 
   async readRecord<T>(key: string): Promise<T | undefined> {
     return this.store.get(key) as T | undefined;
   }
 
   async writeRecord<T>(key: string, value: T): Promise<void> {
+    this.writeCallCount++;
+    if (this.failNextWriteWith) {
+      const err = this.failNextWriteWith;
+      this.failNextWriteWith = null;
+      throw err;
+    }
     this.store.set(key, value);
   }
 }
 
 class FakeManifestStorage implements MinimalManifestStorage {
   readonly store = new Map<string, TokenManifestEntry>();
+  /** When set, the next call to writeEntry throws this error and clears the hook. */
+  failNextWriteWith: Error | null = null;
+  writeCallCount = 0;
 
   private k(addr: string, tokenId: string): string {
     return `${addr}|${tokenId}`;
@@ -91,6 +103,12 @@ class FakeManifestStorage implements MinimalManifestStorage {
   }
 
   async writeEntry(addr: string, tokenId: string, entry: TokenManifestEntry): Promise<void> {
+    this.writeCallCount++;
+    if (this.failNextWriteWith) {
+      const err = this.failNextWriteWith;
+      this.failNextWriteWith = null;
+      throw err;
+    }
     this.store.set(this.k(addr, tokenId), entry);
   }
 
@@ -659,5 +677,273 @@ describe('Cross-token isolation', () => {
     expect(keyA).not.toBe(keyB);
     expect(perEntry.store.has(keyA)).toBe(true);
     expect(perEntry.store.has(keyB)).toBe(true);
+  });
+});
+
+// =============================================================================
+// 8. Transactional promotion (steelman finding #164)
+//
+// promoteAuditEntry is a two-phase operation that spans two storage backends
+// (per-entry-key audit + CAS manifest). The invariant under crash / failure:
+//
+//   audit.auditStatus === 'audit-promoted'
+//   IFF
+//   manifest.audit_promoted_from contains auditKey
+//
+// `promotionPending: true` is the in-flight marker that bridges the two
+// writes and lets a later retry / merge recover deterministically.
+// =============================================================================
+
+describe('DispositionWriter.promoteAuditEntry — transactional invariant (#164)', () => {
+  let perEntry: FakePerEntryStorage;
+  let manifest: FakeManifestStorage;
+  let writer: DispositionWriter;
+
+  beforeEach(() => {
+    perEntry = new FakePerEntryStorage();
+    manifest = new FakeManifestStorage();
+    writer = makeWriter(perEntry, manifest, () => {});
+  });
+
+  it('manifest write fails → audit retains pre-promotion auditStatus, no stale promotionPending marker', async () => {
+    await writer.write(ADDR, auditRecord());
+    const auditKey = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const manifestEntry: TokenManifestEntry = {
+      rootHash: ch(ROOT),
+      status: 'valid',
+    };
+
+    // Inject a manifest write failure for the next write.
+    manifest.failNextWriteWith = new Error('simulated manifest write failure');
+
+    await expect(
+      writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry),
+    ).rejects.toThrow(/simulated manifest write failure/);
+
+    // Audit retains pre-promotion auditStatus AND the promotionPending
+    // marker has been rolled back (best-effort cleanup).
+    const audit = perEntry.store.get(auditKey) as AuditEntry;
+    expect(audit.auditStatus).toBe('audit-not-our-state');
+    expect(audit.promotionPending).toBeUndefined();
+
+    // Manifest never got the reverse-pointer.
+    const manifestAfter = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(manifestAfter).toBeUndefined();
+  });
+
+  it('manifest write fails, then retry succeeds → invariant holds (audit-promoted + reverse-pointer)', async () => {
+    await writer.write(ADDR, auditRecord());
+    const auditKey = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const manifestEntry: TokenManifestEntry = {
+      rootHash: ch(ROOT),
+      status: 'valid',
+    };
+
+    // First attempt fails on manifest write.
+    manifest.failNextWriteWith = new Error('first attempt fails');
+    await expect(
+      writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry),
+    ).rejects.toThrow();
+
+    // Retry — succeeds.
+    await writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry);
+
+    const audit = perEntry.store.get(auditKey) as AuditEntry;
+    expect(audit.auditStatus).toBe('audit-promoted');
+    expect(audit.promotedToManifestRef).toBe(ch(ROOT));
+    expect(audit.promotionPending).toBeUndefined();
+
+    const manifestAfter = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(manifestAfter?.audit_promoted_from).toEqual([auditKey]);
+  });
+
+  it('manifest write succeeds, audit Phase-3 write fails → next call recovers (Branch B finalize)', async () => {
+    await writer.write(ADDR, auditRecord());
+    const auditKey = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const manifestEntry: TokenManifestEntry = {
+      rootHash: ch(ROOT),
+      status: 'valid',
+    };
+
+    // Calls to writeRecord during promoteAuditEntry:
+    //   1. Phase 1 — set promotionPending=true (succeed)
+    //   2. Phase 3 — set audit-promoted (we make this fail)
+    let writeCount = 0;
+    const origWrite = perEntry.writeRecord.bind(perEntry);
+    perEntry.writeRecord = async <T>(key: string, value: T) => {
+      writeCount++;
+      if (writeCount === 2) {
+        throw new Error('simulated audit Phase-3 write failure');
+      }
+      await origWrite(key, value);
+    };
+
+    await expect(
+      writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry),
+    ).rejects.toThrow(/simulated audit Phase-3 write failure/);
+
+    // Mid-state: manifest has reverse-pointer, audit still has
+    // promotionPending=true and pre-promotion auditStatus.
+    const auditMid = perEntry.store.get(auditKey) as AuditEntry;
+    expect(auditMid.auditStatus).toBe('audit-not-our-state');
+    expect(auditMid.promotionPending).toBe(true);
+    const manifestMid = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(manifestMid?.audit_promoted_from).toEqual([auditKey]);
+
+    // Restore writeRecord to a normal-functioning impl, then retry.
+    perEntry.writeRecord = origWrite;
+    await writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry);
+
+    // Recovered: audit-promoted, no pending marker, manifest unchanged
+    // (set-OR with existing auditKey is a no-op).
+    const auditAfter = perEntry.store.get(auditKey) as AuditEntry;
+    expect(auditAfter.auditStatus).toBe('audit-promoted');
+    expect(auditAfter.promotionPending).toBeUndefined();
+    expect(auditAfter.promotedToManifestRef).toBe(ch(ROOT));
+    const manifestAfter = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(manifestAfter?.audit_promoted_from).toEqual([auditKey]);
+  });
+
+  it('Branch B fall-through: manifest write succeeded but audit Phase-3 failed AND a re-arrival happened → write path preserves promotionPending', async () => {
+    // Seed an audit record AND simulate the mid-state: manifest already
+    // has the reverse-pointer, audit has promotionPending=true. This
+    // state arises when Phase 2 succeeded but Phase 3 failed.
+    await writer.write(ADDR, auditRecord());
+    const auditKey = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const manifestEntry: TokenManifestEntry = {
+      rootHash: ch(ROOT),
+      status: 'valid',
+    };
+
+    // Drive into mid-state by failing Phase 3.
+    let writeCount = 0;
+    const origWrite = perEntry.writeRecord.bind(perEntry);
+    perEntry.writeRecord = async <T>(key: string, value: T) => {
+      writeCount++;
+      if (writeCount === 2) throw new Error('Phase-3 fail');
+      await origWrite(key, value);
+    };
+    await expect(
+      writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry),
+    ).rejects.toThrow();
+    perEntry.writeRecord = origWrite;
+
+    // Now a re-arrival with a fresh bundleCid lands via writeAudit.
+    await writer.write(
+      ADDR,
+      auditRecord({ bundleCid: BUNDLE_CID_2 }),
+    );
+
+    // The merge MUST preserve `promotionPending: true` — recovery is
+    // the responsibility of the next promotion call, not the merger.
+    const auditAfterMerge = perEntry.store.get(auditKey) as AuditEntry;
+    expect(auditAfterMerge.promotionPending).toBe(true);
+    expect(auditAfterMerge.auditStatus).toBe('audit-not-our-state');
+    expect(auditAfterMerge.bundleCidsObserved).toContain(BUNDLE_CID_1);
+    expect(auditAfterMerge.bundleCidsObserved).toContain(BUNDLE_CID_2);
+
+    // Now call promoteAuditEntry again — it should observe the marker
+    // AND the manifest reverse-pointer, then complete Phase 3.
+    await writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry);
+    const auditFinal = perEntry.store.get(auditKey) as AuditEntry;
+    expect(auditFinal.auditStatus).toBe('audit-promoted');
+    expect(auditFinal.promotionPending).toBeUndefined();
+  });
+
+  it('idempotency: a second promoteAuditEntry call against an already-promoted record is a no-op', async () => {
+    await writer.write(ADDR, auditRecord());
+    const auditKey = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const manifestEntry: TokenManifestEntry = {
+      rootHash: ch(ROOT),
+      status: 'valid',
+    };
+
+    await writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry);
+
+    // Snapshot writes-so-far counts.
+    const auditWritesBefore = perEntry.writeCallCount;
+    const manifestWritesBefore = manifest.writeCallCount;
+
+    // Second call: should observe Branch A (already promoted) and return.
+    await writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry);
+
+    // No additional writes to either backend.
+    expect(perEntry.writeCallCount).toBe(auditWritesBefore);
+    expect(manifest.writeCallCount).toBe(manifestWritesBefore);
+
+    const auditFinal = perEntry.store.get(auditKey) as AuditEntry;
+    expect(auditFinal.auditStatus).toBe('audit-promoted');
+    expect(auditFinal.promotionPending).toBeUndefined();
+  });
+
+  it('concurrent promotion attempts: exactly one wins, audit ends in audit-promoted, no double-promotion', async () => {
+    await writer.write(ADDR, auditRecord());
+    const auditKey = auditKeyFor(ADDR, TOKEN_A, ch(HASH_X));
+    const manifestEntry: TokenManifestEntry = {
+      rootHash: ch(ROOT),
+      status: 'valid',
+    };
+
+    // Issue two promoteAuditEntry calls concurrently. Both observe
+    // existing.auditStatus !== 'audit-promoted' (race past the guard),
+    // both run Phase 1+2+3. The set-OR semantics on
+    // `manifest.audit_promoted_from` make the duplicate writes converge.
+    const [r1, r2] = await Promise.allSettled([
+      writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry),
+      writer.promoteAuditEntry(ADDR, TOKEN_A, ch(HASH_X), manifestEntry),
+    ]);
+    // Both should succeed (they're idempotent).
+    expect(r1.status).toBe('fulfilled');
+    expect(r2.status).toBe('fulfilled');
+
+    const auditFinal = perEntry.store.get(auditKey) as AuditEntry;
+    expect(auditFinal.auditStatus).toBe('audit-promoted');
+    expect(auditFinal.promotionPending).toBeUndefined();
+    expect(auditFinal.promotedToManifestRef).toBe(ch(ROOT));
+
+    // Manifest's audit_promoted_from contains exactly [auditKey] (no dup).
+    const manifestFinal = await manifest.readEntry(ADDR, TOKEN_A);
+    expect(manifestFinal?.audit_promoted_from).toEqual([auditKey]);
+  });
+
+  it('mergeAuditEntry preserves promotionPending across re-arrival (does not clear in-flight marker)', async () => {
+    const prev: AuditEntry = {
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      auditStatus: 'audit-not-our-state',
+      reason: 'not-our-state',
+      recordedAt: 1_000,
+      bundleCidsObserved: [BUNDLE_CID_1],
+      promotionPending: true,
+    };
+    const merged = mergeAuditEntry(
+      prev,
+      auditRecord({ bundleCid: BUNDLE_CID_2 }),
+      9_999,
+    );
+    expect(merged.promotionPending).toBe(true);
+    expect(merged.bundleCidsObserved).toEqual([BUNDLE_CID_1, BUNDLE_CID_2]);
+  });
+
+  it('mergeAuditEntry drops promotionPending when status is audit-promoted (mutual exclusion)', async () => {
+    const prev: AuditEntry = {
+      tokenId: TOKEN_A,
+      observedTokenContentHash: ch(HASH_X),
+      auditStatus: 'audit-promoted',
+      reason: 'not-our-state',
+      recordedAt: 1_000,
+      bundleCidsObserved: [BUNDLE_CID_1],
+      // Defensive: even if a stale `promotionPending: true` somehow
+      // co-existed with `audit-promoted` on disk, the merge MUST drop
+      // it to enforce the post-promotion invariant.
+      promotionPending: true,
+    };
+    const merged = mergeAuditEntry(
+      prev,
+      auditRecord({ bundleCid: BUNDLE_CID_2 }),
+      9_999,
+    );
+    expect(merged.auditStatus).toBe('audit-promoted');
+    expect(merged.promotionPending).toBeUndefined();
   });
 });

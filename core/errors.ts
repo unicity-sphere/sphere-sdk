@@ -379,6 +379,30 @@ export type SphereErrorCode =
    */
   | 'BUNDLE_REJECTED_INSTANT_MODE_NOT_YET_SUPPORTED'
   /**
+   * UXF Inter-Wallet Transfer T.7.B — legacy-shape adapter received an
+   * instant-TXF chain (one or more transactions with `inclusionProof:
+   * null`) but the caller did not wire a finalization-queue enqueuer
+   * (`enqueueFinalization` was `undefined`/`null`, or `addr` was
+   * missing).
+   *
+   * Per §4.4.2 / §5.5, instant-TXF arrivals MUST be routed through the
+   * per-address chain-mode finalization queue so the recipient worker
+   * can drain pending transactions and re-run §5.3 [B]/[D]/[E]. Without
+   * a wired enqueuer, a `PENDING` disposition would be written to the
+   * manifest with NO worker tracking — permanently stuck. We refuse to
+   * write the disposition and throw at the adapter boundary instead.
+   *
+   * **Resolution**: callers MUST pass a `FinalizationQueueEnqueuer`
+   * AND an `addr` whenever instant-TXF chains may arrive (i.e., for
+   * any production recipient pipeline). Pre-T.5.C deployments that
+   * cannot accept instant-TXF arrivals should configure their senders
+   * to use `txfFinalization: 'conservative'`. Tests that intentionally
+   * exercise legacy adapter paths without an enqueuer should ensure
+   * every chain has fully-finalized transactions (no `inclusionProof:
+   * null`).
+   */
+  | 'MISSING_FINALIZATION_QUEUE'
+  /**
    * UXF Inter-Wallet Transfer T.5.B — sender-side finalization worker
    * polling-policy validation failure (§5.5 step 6 normative
    * configuration validity rule).

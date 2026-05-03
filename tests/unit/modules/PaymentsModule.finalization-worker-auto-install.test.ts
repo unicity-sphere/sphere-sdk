@@ -18,6 +18,9 @@ import {
 import {
   FinalizationWorkerSender,
 } from '../../../modules/payments/transfer/finalization-worker-sender';
+import {
+  FinalizationWorkerRecipient,
+} from '../../../modules/payments/transfer/finalization-worker-recipient';
 import type { FullIdentity } from '../../../types';
 import type { StorageProvider } from '../../../storage';
 import type { TransportProvider } from '../../../transport';
@@ -299,5 +302,114 @@ describe('PaymentsModule — FinalizationWorkerSender auto-install (Phase 9.6.D)
     expect(mockWorker.start).toHaveBeenCalled();
 
     module.destroy();
+  });
+});
+
+// =============================================================================
+// Task #151 — FinalizationWorkerRecipient auto-install
+// =============================================================================
+
+describe('PaymentsModule — FinalizationWorkerRecipient auto-install (Task #151)', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('auto-instantiates a FinalizationWorkerRecipient when recipientUxf defaults to true and oracle has getAggregatorClient', () => {
+    const module = createPaymentsModule();
+    module.initialize({
+      identity: makeIdentity(),
+      storage: makeStorage(),
+      transport: makeTransport(),
+      oracle: makeOracleWithAggregator(),
+      emitEvent: vi.fn(),
+    });
+
+    const worker = (module as unknown as { finalizationWorkerRecipient: unknown })
+      .finalizationWorkerRecipient;
+    expect(worker).not.toBeNull();
+    expect(worker).toBeInstanceOf(FinalizationWorkerRecipient);
+    expect((worker as FinalizationWorkerRecipient).isRunning()).toBe(true);
+
+    module.destroy();
+  });
+
+  it('does NOT construct a recipient worker when features.recipientUxf is false', () => {
+    const module = createPaymentsModule({ features: { recipientUxf: false } });
+    module.initialize({
+      identity: makeIdentity(),
+      storage: makeStorage(),
+      transport: makeTransport(),
+      oracle: makeOracleWithAggregator(),
+      emitEvent: vi.fn(),
+    });
+
+    expect(
+      (module as unknown as { finalizationWorkerRecipient: unknown })
+        .finalizationWorkerRecipient,
+    ).toBeNull();
+
+    module.destroy();
+  });
+
+  it('skips recipient auto-install when oracle.getAggregatorClient() is absent/null', () => {
+    const module = createPaymentsModule();
+    module.initialize({
+      identity: makeIdentity(),
+      storage: makeStorage(),
+      transport: makeTransport(),
+      oracle: makeOracleWithoutAggregator(),
+      emitEvent: vi.fn(),
+    });
+
+    expect(
+      (module as unknown as { finalizationWorkerRecipient: unknown })
+        .finalizationWorkerRecipient,
+    ).toBeNull();
+
+    module.destroy();
+  });
+
+  it('stops the auto-installed recipient worker on module.destroy()', () => {
+    const module = createPaymentsModule();
+    module.initialize({
+      identity: makeIdentity(),
+      storage: makeStorage(),
+      transport: makeTransport(),
+      oracle: makeOracleWithAggregator(),
+      emitEvent: vi.fn(),
+    });
+
+    const worker = (module as unknown as {
+      finalizationWorkerRecipient: FinalizationWorkerRecipient;
+    }).finalizationWorkerRecipient!;
+    expect(worker).toBeInstanceOf(FinalizationWorkerRecipient);
+
+    const stopSpy = vi.spyOn(worker, 'stop');
+    module.destroy();
+
+    expect(stopSpy).toHaveBeenCalled();
+    expect(
+      (module as unknown as { finalizationWorkerRecipient: unknown })
+        .finalizationWorkerRecipient,
+    ).toBeNull();
+  });
+
+  it('exposes the worker AbortSignal via getWorkerAbortSignal()', () => {
+    const module = createPaymentsModule();
+    module.initialize({
+      identity: makeIdentity(),
+      storage: makeStorage(),
+      transport: makeTransport(),
+      oracle: makeOracleWithAggregator(),
+      emitEvent: vi.fn(),
+    });
+
+    const sig = module.getWorkerAbortSignal();
+    expect(sig).toBeDefined();
+    expect(sig?.aborted).toBe(false);
+
+    module.destroy();
+    // After destroy, the signal is gone.
+    expect(module.getWorkerAbortSignal()).toBeUndefined();
   });
 });
